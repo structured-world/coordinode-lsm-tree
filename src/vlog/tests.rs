@@ -242,3 +242,93 @@ fn recovery_keeps_the_blob_copy_the_manifest_checksum_names() {
         "the losing copy is reported as an orphan for the caller to sweep: {orphans:?}",
     );
 }
+
+/// Ranking a duplicate needs its digest, and a read that fails for reasons
+/// outside the file — a refused mount, an exhausted allocator — is not a
+/// mismatch. Scoring it as one drops the authoritative copy to the filename
+/// tiebreak, and when that copy carries the alternate spelling the stale
+/// canonical file wins and the healthy one is deleted as an orphan: permanent
+/// loss from a fault a retry would clear.
+#[test]
+#[expect(clippy::expect_used, reason = "test code")]
+fn a_refused_digest_read_does_not_decide_the_blob_duplicate() {
+    use crate::fs::{Fault, FaultFs, FaultOp, FaultRule, Fs, MemFs};
+    use crate::io::ErrorKind;
+
+    let memfs = MemFs::new();
+    let fault = FaultFs::new(memfs.clone());
+    let injector = fault.injector();
+    let fs: Arc<dyn Fs> = Arc::new(fault);
+    let blobs = std::path::absolute("/blobs").expect("absolute");
+    memfs.create_dir_all(&blobs).expect("mkdir");
+
+    let mut writer = crate::vlog::BlobFileWriter::new(
+        crate::SequenceNumberCounter::default(),
+        &blobs,
+        0,
+        None,
+        Arc::clone(&fs),
+    )
+    .expect("writer");
+    for i in 0..20u32 {
+        writer
+            .write(
+                format!("k{i:04}").as_bytes(),
+                u64::from(i) + 1,
+                &[b'v'; 128],
+            )
+            .expect("write");
+    }
+    assert_eq!(writer.finish().expect("finish").len(), 1, "one blob file");
+
+    // The AUTHORITATIVE copy takes the alternate spelling; the canonical name
+    // holds a rotted twin. Only the digest can tell them apart.
+    let canonical = blobs.join("0");
+    let mut bytes = Vec::new();
+    std::io::Read::read_to_end(
+        &mut memfs
+            .open(&canonical, &crate::fs::FsOpenOptions::new().read(true))
+            .expect("open"),
+        &mut bytes,
+    )
+    .expect("read");
+    let checksum = Checksum::from_raw(
+        crate::file::checksum_from_with_overrides(&*fs, &canonical, 0, &[]).expect("digest"),
+    );
+    let authoritative = blobs.join("00");
+    memfs.rename(&canonical, &authoritative).expect("rename");
+    let mut rotted = bytes;
+    let Some(byte) = rotted.get_mut(64) else {
+        panic!("the written blob reaches the flipped offset");
+    };
+    *byte ^= 0xFF;
+    let mut f = memfs
+        .open(
+            &canonical,
+            &crate::fs::FsOpenOptions::new().write(true).create_new(true),
+        )
+        .expect("create twin");
+    std::io::Write::write_all(&mut f, &rotted).expect("write twin");
+    drop(f);
+
+    // Refuse the SECOND open of the authoritative copy. The first is the
+    // recovery walk reading its meta section; the second is the digest read
+    // that ranks it against the twin — so the fault lands exactly on the
+    // comparison, not before it.
+    injector.arm(
+        FaultRule::new(FaultOp::Open, Fault::Error(ErrorKind::PermissionDenied))
+            .on_path(authoritative.display().to_string())
+            .skip(1),
+    );
+    let result = recover_blob_files(&blobs, &[(0, checksum, 0)], 0, None, &fs);
+    injector.clear();
+
+    assert!(
+        matches!(result, Err(crate::Error::Io(ref e)) if e.kind() == ErrorKind::PermissionDenied),
+        "a refused digest read must surface, not hand the id to the stale copy",
+    );
+    assert!(
+        memfs.exists(&authoritative).expect("stat"),
+        "the healthy copy must still be on disk for the retry",
+    );
+}

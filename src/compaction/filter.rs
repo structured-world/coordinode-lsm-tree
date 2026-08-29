@@ -122,7 +122,6 @@ impl AccessorShared<'_> {
 
         accessor.get(
             self.opts.tree_id,
-            self.blobs_folder,
             user_key,
             vhandle,
             &self.opts.config.cache,

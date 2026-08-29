@@ -34,11 +34,20 @@ use core::sync::atomic::AtomicBool;
 /// breaks a remaining tie. That is a deterministic answer rather than a correct
 /// one, but it beats letting directory order decide, and the surviving copy's
 /// damage still surfaces on the read that meets it.
+///
+/// # Errors
+///
+/// Propagates an ENVIRONMENTAL failure while reading a copy's digest. The rank
+/// below would otherwise read "could not be determined" as "does not match" and
+/// fall through to the filename tiebreak — and if the unreadable copy is the
+/// authoritative one under an alternate spelling, the stale canonical file wins
+/// and the healthy one is deleted as an orphan. A retryable fault must never
+/// decide that.
 fn dedupe_blob_sightings(
     fs: &Arc<dyn Fs>,
     blob_files: &mut Vec<BlobFile>,
     orphaned: &mut Vec<PathBuf>,
-) {
+) -> crate::Result<()> {
     let mut kept: crate::HashMap<BlobFileId, usize> = crate::HashMap::default();
     let mut duplicates = false;
     for (idx, bf) in blob_files.iter().enumerate() {
@@ -47,30 +56,41 @@ fn dedupe_blob_sightings(
         }
     }
     if !duplicates {
-        return;
+        return Ok(());
     }
 
     // Score each sighting: a matching digest wins outright, then the canonical
     // spelling, then first-seen. `checksum_from_with_overrides` re-reads the
     // file, so this runs ONLY on the rare id that was seen twice.
-    let rank = |bf: &BlobFile| -> u8 {
-        let digest_matches =
-            crate::file::checksum_from_with_overrides(&**fs, &bf.0.path, bf.0.live_data_start, &[])
-                .is_ok_and(|d| Checksum::from_raw(d) == bf.0.checksum);
-        if digest_matches {
-            return 0;
+    let rank = |bf: &BlobFile| -> crate::Result<u8> {
+        let digest = match crate::file::checksum_from_with_overrides(
+            &**fs,
+            &bf.0.path,
+            bf.0.live_data_start,
+            &[],
+        ) {
+            Ok(d) => Some(d),
+            // A fault in the ENVIRONMENT says nothing about which copy the
+            // manifest named, and guessing costs the loser its file.
+            Err(e) if e.is_environmental() => return Err(e),
+            // A read that fails on the BYTES is evidence: this copy cannot be
+            // the intact one the manifest digested.
+            Err(_) => None,
+        };
+        if digest.is_some_and(|d| Checksum::from_raw(d) == bf.0.checksum) {
+            return Ok(0);
         }
         // Rebuilt rather than string-compared: `file_name` is `&OsStr` with
         // `std` and `&str` without it, and the join answers both.
         let canonical = bf.0.path.parent().is_some_and(|dir| {
             dir.join(alloc::string::ToString::to_string(&bf.id())) == *bf.0.path
         });
-        if canonical { 1 } else { 2 }
+        Ok(if canonical { 1 } else { 2 })
     };
 
     let mut best: crate::HashMap<BlobFileId, (u8, usize)> = crate::HashMap::default();
     for (idx, bf) in blob_files.iter().enumerate() {
-        let score = rank(bf);
+        let score = rank(bf)?;
         match best.get(&bf.id()) {
             Some(&(prev, _)) if prev <= score => {}
             _ => {
@@ -94,6 +114,7 @@ fn dedupe_blob_sightings(
         idx += 1;
         keep
     });
+    Ok(())
 }
 
 pub fn recover_blob_files(
@@ -206,7 +227,14 @@ pub fn recover_blob_files(
             let file: Arc<dyn crate::fs::FsFile> = Arc::from(file);
             let file_accessor = if let Some(dt) = descriptor_table.cloned() {
                 let global_id = (tree_id, blob_file_id).into();
-                pending_cache_inserts.push((dt.clone(), global_id, file.clone()));
+                // The path rides along so deduplication can drop the handles of
+                // the sightings it discards.
+                pending_cache_inserts.push((
+                    dt.clone(),
+                    global_id,
+                    blob_file_path.clone(),
+                    file.clone(),
+                ));
                 FileAccessor::DescriptorTable {
                     table: dt,
                     fs: fs.clone(),
@@ -249,15 +277,22 @@ pub fn recover_blob_files(
     // authoritative blob and make reads fail. The manifest's checksum covers
     // the live suffix of the copy it named, so it decides; the losers are
     // orphans, which the caller sweeps.
-    dedupe_blob_sightings(fs, &mut blob_files, &mut orphaned_blob_files);
+    dedupe_blob_sightings(fs, &mut blob_files, &mut orphaned_blob_files)?;
 
     if blob_files.len() < ids.len() {
         return Err(crate::Error::Unrecoverable);
     }
 
-    // All blobs parsed successfully — commit FDs to the descriptor cache.
-    for (dt, global_id, file) in pending_cache_inserts {
-        dt.insert_for_blob_file(global_id, file);
+    // All blobs parsed successfully — commit FDs to the descriptor cache. The
+    // pending inserts hold one entry per SIGHTING, all under the same
+    // `GlobalTableId`, so inserting them blindly would leave the cache holding
+    // whichever handle came last — possibly the copy just discarded. Keep only
+    // the handle whose path survived deduplication.
+    let retained: crate::HashSet<PathBuf> = blob_files.iter().map(|bf| bf.0.path.clone()).collect();
+    for (dt, global_id, path, file) in pending_cache_inserts {
+        if retained.contains(&path) {
+            dt.insert_for_blob_file(global_id, file);
+        }
     }
 
     log::debug!("Successfully recovered {} blob files", blob_files.len());

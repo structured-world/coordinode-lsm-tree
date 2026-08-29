@@ -9,7 +9,7 @@ pub mod ingest;
 #[doc(hidden)]
 pub use gc::{FragmentationEntry, FragmentationMap};
 
-use crate::path::{Path, PathBuf};
+use crate::path::PathBuf;
 use crate::tree::inner::{FlushGuard, VersionsWriteGuard};
 use crate::{
     Cache, Config, Memtable, ScanSinceEvent, SeqNo, TableId, TreeId, UserKey, UserValue,
@@ -45,7 +45,6 @@ impl IterGuard for Guard {
         if pred(&kv.key.user_key) {
             resolve_value_handle(
                 self.tree.id(),
-                self.tree.blobs_folder.as_path(),
                 &self.tree.index.config.cache,
                 &self.version,
                 kv,
@@ -82,7 +81,6 @@ impl IterGuard for Guard {
     fn into_inner(self) -> crate::Result<(UserKey, UserValue)> {
         resolve_value_handle(
             self.tree.id(),
-            self.tree.blobs_folder.as_path(),
             &self.tree.index.config.cache,
             &self.version,
             self.kv?,
@@ -99,7 +97,6 @@ impl IterGuard for Guard {
 
 fn resolve_value_handle(
     tree_id: TreeId,
-    blobs_folder: &Path,
     cache: &Cache,
     version: &Version,
     item: InternalValue,
@@ -117,13 +114,7 @@ fn resolve_value_handle(
             a
         };
 
-        match accessor.get(
-            tree_id,
-            blobs_folder,
-            &item.key.user_key,
-            &vptr.vhandle,
-            cache,
-        ) {
+        match accessor.get(tree_id, &item.key.user_key, &vptr.vhandle, cache) {
             Ok(Some(v)) => {
                 let k = item.key.user_key;
                 Ok((k, v))
@@ -221,7 +212,6 @@ impl BlobTree {
 
         let (_, v) = resolve_value_handle(
             self.id(),
-            self.blobs_folder.as_path(),
             &self.index.config.cache,
             &super_version.version,
             item,
@@ -263,7 +253,6 @@ impl BlobTree {
                 let seqno = entry.key.seqno;
                 let (key, value) = resolve_value_handle(
                     self.id(),
-                    self.blobs_folder.as_path(),
                     &self.index.config.cache,
                     version,
                     entry,
@@ -304,7 +293,6 @@ impl BlobTree {
                 let seqno = entry.key.seqno;
                 let (key, value) = resolve_value_handle(
                     self.id(),
-                    self.blobs_folder.as_path(),
                     &self.index.config.cache,
                     version,
                     entry,
@@ -1252,7 +1240,6 @@ impl AbstractTree for BlobTree {
                 }
                 let (_, v) = resolve_value_handle(
                     self.id(),
-                    self.blobs_folder.as_path(),
                     &self.index.config.cache,
                     &super_version.version,
                     item,
