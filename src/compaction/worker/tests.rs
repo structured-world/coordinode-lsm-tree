@@ -2379,6 +2379,76 @@ fn space_gate_for_merge_narrows_a_full_run_that_exceeds_free() -> crate::Result<
     Ok(())
 }
 
+/// A retry over an ALREADY restricted input must never hand it a lower bound.
+/// The boundary list is built from the whole block index, punched prefix
+/// included, so an early boundary can sit below the restriction a previous run
+/// committed. Reopening there would make the manifest claim the SST serves its
+/// own punched prefix again: reads land in the zeros, and rows the earlier
+/// slice output already owns are served twice.
+#[test]
+fn a_retry_never_lowers_an_existing_restriction() -> crate::Result<()> {
+    use core::sync::atomic::Ordering;
+
+    let dir = tempfile::tempdir()?;
+    let mem = crate::fs::MemFs::with_capacity(u64::MAX);
+    let reopened = tight_space_crash_and_reopen(
+        dir.path(),
+        Arc::new(mem.clone()),
+        |used| mem.set_capacity(used + used / 4),
+        || mem.punched_bytes(),
+    )?;
+    let (restricted_id, committed_bound) = {
+        let version = reopened.current_version();
+        let Some(table) = version
+            .iter_tables()
+            .find(|t| t.restrict_lower_bound().is_some())
+        else {
+            panic!("the crashed tight-space slice must leave a restricted table");
+        };
+        let Some(bound) = table.restrict_lower_bound().cloned() else {
+            panic!("the table was selected by having a restriction bound");
+        };
+        (table.id(), bound)
+    };
+    drop(reopened);
+
+    // Re-run the pass over that restricted input, crashing after its own first
+    // slice so the retry's restriction is what survives to be inspected.
+    let config = Config::new(
+        dir.path(),
+        SequenceNumberCounter::default(),
+        SequenceNumberCounter::default(),
+    )
+    .data_block_size_policy(BlockSizePolicy::all(512))
+    .with_shared_fs(Arc::new(mem));
+    let failpoint = config.fail_tight_after_first_slice.clone();
+    let tree = match config.open()? {
+        crate::AnyTree::Standard(t) => t,
+        crate::AnyTree::Blob(_) => panic!("expected Standard tree"),
+    };
+    tree.update_runtime_config(|c| {
+        c.storage_admission_check = true;
+        c.tight_space_compaction = true;
+    })?;
+    failpoint.store(true, Ordering::SeqCst);
+    let _ = tree.major_compact(64 * 1024 * 1024, 0);
+
+    let version = tree.current_version();
+    let Some(after) = version.get_table(restricted_id) else {
+        panic!("the retry must still hold the restricted input, not consume it");
+    };
+    let Some(bound) = after.restrict_lower_bound() else {
+        panic!("a table that was restricted can never come back unrestricted");
+    };
+    // Default comparator: the fixture's keys order lexicographically.
+    assert!(
+        bound.as_ref() >= committed_bound.as_ref(),
+        "a retry must not serve a prefix an earlier slice already punched: \
+         bound went from {committed_bound:?} to {bound:?}",
+    );
+    Ok(())
+}
+
 /// A backend that cannot report free space reads as physically unbounded, so
 /// on a quota-only deployment the LOGICAL limit is the only thing that rejects
 /// a merge. Deriving the slice budget from the physical probe alone then leaves

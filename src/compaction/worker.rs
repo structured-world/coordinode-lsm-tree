@@ -1271,7 +1271,23 @@ fn run_tight_space_compaction(
                     // prefix rows' authoritative copies live in the slice
                     // output) — so the restricted SST stays compactable and is
                     // eventually retired through the normal path.
-                    let restricted = view.reopen_restricted(boundary.clone()).map_err(rollback)?;
+                    // A restriction only ever RISES. The boundaries were built
+                    // from the whole block index, punched prefix included, so an
+                    // input a previous run already restricted can be handed a
+                    // boundary BELOW its committed bound; reopening there would
+                    // republish the SST as serving its own punched prefix, whose
+                    // reads land in the zeros and whose rows the earlier slice
+                    // output already owns.
+                    let bound = match view.restrict_lower_bound() {
+                        Some(committed)
+                            if comparator.compare(committed, boundary)
+                                == core::cmp::Ordering::Greater =>
+                        {
+                            committed.clone()
+                        }
+                        _ => boundary.clone(),
+                    };
+                    let restricted = view.reopen_restricted(bound).map_err(rollback)?;
                     restricted_pairs.push((view.id(), restricted.clone()));
                     next_views.push(restricted);
                 }
