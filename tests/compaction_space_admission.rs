@@ -831,12 +831,15 @@ fn a_finely_sliced_tight_space_compaction_completes() -> lsm_tree::Result<()> {
     })?;
     tree.major_compact(64 * 1024 * 1024, 0)?;
 
-    for i in (0..2_000u64).step_by(97) {
+    // EVERY key, not a sample: a filter that answers "absent" for a key it
+    // holds makes the point read return nothing, and one such key in a
+    // thousand is exactly what a sampled probe walks past.
+    for i in 0..2_000u64 {
         assert_eq!(
             tree.get(format!("key{i:08}").as_bytes(), lsm_tree::SeqNo::MAX)?
                 .as_deref(),
             Some(&[0xCDu8; 64][..]),
-            "every key must survive the finely sliced rewrite",
+            "key {i} must survive the finely sliced rewrite",
         );
     }
     Ok(())
