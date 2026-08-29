@@ -2310,6 +2310,39 @@ fn space_gate_for_merge_narrows_a_full_run_that_exceeds_free() -> crate::Result<
     Ok(())
 }
 
+/// A restricted view's metadata still counts the punched-out prefix. The
+/// planner's numerator raises that table's lower bound to the restriction, so
+/// a denominator taken from the whole file reports a FULL-keyspace query as
+/// selecting less than everything.
+#[test]
+fn full_range_selectivity_is_one_over_a_restricted_view() -> crate::Result<()> {
+    let dir = tempfile::tempdir()?;
+    let mem = crate::fs::MemFs::with_capacity(u64::MAX);
+    let reopened = tight_space_crash_and_reopen(
+        dir.path(),
+        Arc::new(mem.clone()),
+        |used| mem.set_capacity(used + used / 4),
+        || mem.punched_bytes(),
+    )?;
+    {
+        let version = reopened.current_version();
+        assert!(
+            version
+                .iter_tables()
+                .any(|t| t.restrict_lower_bound().is_some()),
+            "the crashed tight-space slice must leave a restricted table",
+        );
+    }
+
+    let card = reopened.approximate_range_cardinality::<&[u8], _>(.., crate::SeqNo::MAX)?;
+    assert!(
+        (card.selectivity - 1.0).abs() < 1e-9,
+        "a full-keyspace query selects everything the snapshot sees, got {}",
+        card.selectivity,
+    );
+    Ok(())
+}
+
 /// A tight-space slice leaves a RESTRICTED input whose `file_size` still
 /// describes the punched original, prefix included. Sizing an ordinary merge by
 /// that obsolete figure stalls a compaction whose real output — the live suffix

@@ -1372,7 +1372,12 @@ impl AbstractTree for Tree {
             if table.seqno_visibility(seqno) == crate::table::SeqnoVisibility::None {
                 continue;
             }
-            total_rows = total_rows.saturating_add(table.metadata.item_count);
+            // What this VIEW serves, not what the file holds: a tight-space
+            // restricted table's metadata still counts the punched-out prefix
+            // its replacement now owns, while the numerator below starts at the
+            // restriction — so charging the prefix here would report a
+            // full-keyspace query as selecting a fraction of the tree.
+            total_rows = total_rows.saturating_add(table.live_item_count()?);
             if !table
                 .metadata
                 .key_range
