@@ -723,13 +723,26 @@ struct TableCandidate {
     fidelity: Fidelity,
     fs: Arc<dyn crate::fs::Fs>,
     path: PathBuf,
+    /// Whether this file's whole-file digest equals the one the committed
+    /// manifest records for its id. `false` also covers "cannot be compared":
+    /// no clean manifest, or a RESTRICTED table, whose entry holds the
+    /// live-suffix digest that this whole-file hash never reproduces.
+    matches_manifest: bool,
 }
 
 /// Records `candidate` for `id`, keeping the BETTER of the existing and the new
 /// copy: a COMPLETE recovery replaces a lossy salvage, so an intact duplicate in
-/// a later-scanned folder supersedes an earlier lossy one. Two completes are
-/// equivalent for the rebuilt manifest — which needs only one readable copy per
-/// id — so the first-seen stays.
+/// a later-scanned folder supersedes an earlier lossy one.
+///
+/// Two COMPLETE copies are not interchangeable either. Both open, both are
+/// self-consistent, and they can still hold DIFFERENT generations — a prior
+/// repair that retained a noncanonical copy while its cleanup left the older
+/// canonical file behind produces exactly that. Adopting the first-seen would
+/// re-stamp a fresh checksum over the stale bytes, and every surviving handle
+/// would then resolve against the wrong generation. The copy whose digest
+/// matches the committed manifest wins; with none to compare against (no clean
+/// manifest, or a restricted table whose entry digests only its live suffix)
+/// they really are equivalent and the first-seen stays.
 ///
 /// Two LOSSY copies are NOT equivalent. Damaged copies of one table in two
 /// routed folders salvage independently, and one can recover far more of it
@@ -749,7 +762,14 @@ fn keep_best_candidate(
     candidate: TableCandidate,
 ) -> Option<TableCandidate> {
     let keeps_existing = match map.get(&id) {
-        // An existing COMPLETE copy is never displaced.
+        // Two completes: only the manifest can say which generation this id
+        // is, so a copy that reproduces its digest displaces one that does
+        // not. Neither matching (or nothing to match against) keeps the
+        // incumbent, which is the previous first-seen rule.
+        Some(existing) if existing.fidelity.is_complete() && candidate.fidelity.is_complete() => {
+            existing.matches_manifest || !candidate.matches_manifest
+        }
+        // An existing COMPLETE copy is never displaced by a lossy one.
         Some(existing) if existing.fidelity.is_complete() => true,
         // A COMPLETE newcomer displaces a lossy incumbent.
         Some(_) if candidate.fidelity.is_complete() => false,
@@ -857,6 +877,7 @@ fn same_physical_file(
 fn discard_duplicate(
     loser: TableCandidate,
     unreadable_files: &mut Vec<(PathBuf, String)>,
+    redundant_unreadable: &mut crate::HashSet<PathBuf>,
     discard_after_commit: &mut Vec<(Arc<dyn crate::fs::Fs>, PathBuf, String)>,
 ) {
     let TableCandidate {
@@ -865,6 +886,10 @@ fn discard_duplicate(
     drop(table); // release the open file handle
     let reason = "duplicate table id superseded by another copy";
     discard_after_commit.push((fs, path.clone(), reason.to_string()));
+    // Reported, but NOT a loss: the copy that displaced it holds the same id,
+    // so nothing needs replaying. Counting it would answer `FullHistory` and
+    // send an external WAL over a tree that lost nothing.
+    redundant_unreadable.insert(path.clone());
     unreadable_files.push((path, reason.to_string()));
 }
 
@@ -890,6 +915,7 @@ fn discard_duplicate(
 fn keep_salvaged_replacement(
     map: &mut crate::HashMap<TableId, TableCandidate>,
     unreadable_files: &mut Vec<(PathBuf, String)>,
+    redundant_unreadable: &mut crate::HashSet<PathBuf>,
     discard_after_commit: &mut Vec<(Arc<dyn crate::fs::Fs>, PathBuf, String)>,
     swap_after_commit: &mut Vec<(Arc<dyn crate::fs::Fs>, PathBuf, PathBuf, bool)>,
     id: TableId,
@@ -912,6 +938,7 @@ fn keep_salvaged_replacement(
     record_best(
         map,
         unreadable_files,
+        redundant_unreadable,
         discard_after_commit,
         swap_after_commit,
         id,
@@ -919,6 +946,8 @@ fn keep_salvaged_replacement(
         Fidelity::Salvaged,
         fs,
         table_path,
+        // A salvage's copy is a fresh file the manifest never digested.
+        false,
     )
 }
 
@@ -930,6 +959,7 @@ fn keep_salvaged_replacement(
 fn record_best(
     map: &mut crate::HashMap<TableId, TableCandidate>,
     unreadable_files: &mut Vec<(PathBuf, String)>,
+    redundant_unreadable: &mut crate::HashSet<PathBuf>,
     discard_after_commit: &mut Vec<(Arc<dyn crate::fs::Fs>, PathBuf, String)>,
     // Queued swaps, so a candidate that LOSES here takes its own swap with it:
     // a replacement the rebuilt manifest does not reference must not be renamed
@@ -943,12 +973,14 @@ fn record_best(
     fidelity: Fidelity,
     fs: &Arc<dyn crate::fs::Fs>,
     path: &std::path::Path,
+    matches_manifest: bool,
 ) -> crate::Result<()> {
     let candidate = TableCandidate {
         table,
         fidelity,
         fs: Arc::clone(fs),
         path: path.to_path_buf(),
+        matches_manifest,
     };
     if let Some(loser) = keep_best_candidate(map, id, candidate) {
         // If the displaced copy physically ALIASES the kept one (same directory
@@ -986,7 +1018,12 @@ fn record_best(
         if is_alias {
             return Ok(());
         }
-        discard_duplicate(loser, unreadable_files, discard_after_commit);
+        discard_duplicate(
+            loser,
+            unreadable_files,
+            redundant_unreadable,
+            discard_after_commit,
+        );
     }
     Ok(())
 }
@@ -2429,6 +2466,7 @@ fn recover_blob_files(
     // extent allocation gets wrong (reporting a punched file whole, whose
     // handles then dereference the hole).
     committed_frontiers: Option<&crate::HashMap<crate::vlog::BlobFileId, u64>>,
+    committed_checksums: Option<&crate::HashMap<crate::vlog::BlobFileId, crate::Checksum>>,
 ) -> crate::Result<BlobRecovery> {
     let blobs_folder = config.path.join(crate::file::BLOBS_FOLDER);
     let mut blob_files: Vec<crate::vlog::BlobFile> = Vec::new();
@@ -2618,20 +2656,55 @@ fn recover_blob_files(
                 }
             }
             if group.len() > 1 {
+                // Opening cleanly proves a copy is SELF-consistent, never that
+                // it is the one the manifest named: two copies of an id can
+                // both be whole and hold different generations, and adopting
+                // the wrong one re-stamps a fresh checksum over stale bytes
+                // that existing SST handles then resolve against. When the
+                // committed digest survived, it decides.
+                let committed = committed_checksums.and_then(|m| m.get(&blob_id).copied());
+                let mut authoritative = None;
                 let mut whole = None;
                 for (k, candidate) in group.iter().enumerate() {
-                    match opens_cleanly(blob_id, &candidate.1) {
-                        Ok(()) => {
-                            whole = Some(k);
-                            break;
+                    if let Some(expected) = committed
+                        && authoritative.is_none()
+                    {
+                        let frontier = match resolve_frontier(blob_id, &candidate.1)? {
+                            BlobFrontier::Whole => Some(0),
+                            BlobFrontier::Punched(f) => Some(f),
+                            // Nothing live is left to digest.
+                            BlobFrontier::FullyConsumed => None,
+                        };
+                        if let Some(frontier) = frontier {
+                            match compute_table_checksum_from(&*config.fs, &candidate.1, frontier) {
+                                Ok(d) if crate::Checksum::from_raw(d) == expected => {
+                                    authoritative = Some(k);
+                                    continue;
+                                }
+                                // A fault in the ENVIRONMENT decides nothing
+                                // and the decision here costs the loser its
+                                // file; a digest that simply differs, or a
+                                // read that fails on the bytes, both mean
+                                // "not the manifest's copy".
+                                Err(e) if is_environmental(&e) => return Err(e),
+                                Ok(_) | Err(_) => {}
+                            }
                         }
-                        // Not evidence about these bytes, and the choice it
-                        // would steer decides which copy survives.
-                        Err(e) if is_environmental(&e) => return Err(e),
-                        Err(_) => {}
+                    }
+                    if whole.is_none() {
+                        match opens_cleanly(blob_id, &candidate.1) {
+                            Ok(()) => whole = Some(k),
+                            // Not evidence about these bytes, and the choice it
+                            // would steer decides which copy survives.
+                            Err(e) if is_environmental(&e) => return Err(e),
+                            Err(_) => {}
+                        }
                     }
                 }
-                if let Some(k) = whole {
+                // The manifest's own copy first; without one (no clean
+                // manifest, or none of the copies reproduces its digest) an
+                // intact copy still beats a salvage of a damaged leader.
+                if let Some(k) = authoritative.or(whole) {
                     group.swap(0, k);
                 }
             }
@@ -3388,6 +3461,11 @@ struct CommittedManifest {
     /// re-derives it — and where a backend that cannot attribute zeros to a
     /// hole re-derives it WRONG, reporting a punched file whole.
     blob_frontiers: crate::HashMap<crate::vlog::BlobFileId, u64>,
+    /// The committed digest of each blob file's LIVE SUFFIX. Two copies of one
+    /// id can both be self-consistent and still differ; only this says which
+    /// one the manifest named, and re-stamping a fresh checksum over the other
+    /// would leave existing SST handles resolving to the wrong generation.
+    blob_checksums: crate::HashMap<crate::vlog::BlobFileId, crate::Checksum>,
 }
 
 #[cfg(feature = "std")]
@@ -3591,6 +3669,7 @@ fn sweep_superseded_by_committed_manifest(
         tables: referenced_tables,
         restrictions: recovery.restrictions,
         blob_frontiers: recovery.blob_restrictions,
+        blob_checksums: recovery.blob_file_ids.iter().copied().collect(),
     }))
 }
 
@@ -4119,12 +4198,35 @@ fn scan_table_folders(
                 .as_ref()
                 .map_or(ManifestRestriction::Unknown, |m| m.restriction_of(table_id));
 
+            // This file's whole-file digest, computed ONCE: the duplicate
+            // verdict below and the recovery further down both need it. A
+            // RESTRICTED table's manifest entry digests only its live suffix,
+            // which this never reproduces, so `matches_manifest` stays false
+            // (uncomparable) rather than reading as a mismatch.
+            let own_digest = match compute_table_checksum(&*folder_fs, &table_path) {
+                Ok(c) => Ok(crate::Checksum::from_raw(c)),
+                // A fault in the ENVIRONMENT is not evidence about these bytes.
+                Err(e) if is_environmental(&e) => return Err(e),
+                Err(e) => Err(e),
+            };
+            let matches_manifest = own_digest.as_ref().is_ok_and(|d| {
+                manifest_referenced
+                    .as_ref()
+                    .is_some_and(|m| m.tables.get(&table_id).is_some_and(|t| t.checksum == *d))
+            });
+
             // Skip a duplicate id ONLY when we already hold a COMPLETE copy — a
             // duplicate cannot improve on it. A previously-seen LOSSY salvage does
             // NOT skip: this copy is still evaluated and may supersede it.
+            //
+            // "Complete" is not enough on its own: two complete copies can hold
+            // different generations, and the manifest says which one this id
+            // is. A copy that reproduces its digest is evaluated even against a
+            // complete incumbent, so it can displace one that does not.
             if let Some(existing) = recovered_by_id
                 .get(&table_id)
                 .filter(|c| c.fidelity.is_complete())
+                .filter(|c| c.matches_manifest || !matches_manifest)
             {
                 // If this path physically ALIASES the retained copy (a symlink /
                 // junction / case-insensitive alias resolving to the same directory
@@ -4145,11 +4247,11 @@ fn scan_table_folders(
                 // would file a rotting duplicate as healthy and leave
                 // `unreadable == 0` over a failing disk, so verify this copy on
                 // its own bytes before choosing.
-                let verdict = match compute_table_checksum(&*folder_fs, &table_path) {
-                    Ok(c) => Table::recover(repair_recover_params(
+                let verdict = match own_digest {
+                    Ok(digest) => Table::recover(repair_recover_params(
                         config,
                         table_path.clone(),
-                        crate::Checksum::from_raw(c),
+                        digest,
                         table_id,
                         folder_fs.clone(),
                         manifest_global_seqno,
@@ -4239,26 +4341,27 @@ fn scan_table_folders(
             // would then delete. Table::recover would fail on the same bytes, so
             // skip it; block salvage opens with a placeholder digest and drops
             // only the unreadable blocks.
-            let recovered = match compute_table_checksum(&*folder_fs, &table_path) {
-                Ok(c) => Table::recover(repair_recover_params(
+            // Whether THIS file is the one the committed manifest digested.
+            // Two complete copies of an id can hold different generations, and
+            // this is the only thing that tells them apart. A RESTRICTED
+            // table's entry digests its live suffix, which a whole-file hash
+            // never reproduces, so it stays `false` (uncomparable) rather than
+            // wrongly reading as a mismatch.
+            // The digest was taken above, before the duplicate verdict needed
+            // it. An ENVIRONMENTAL hashing failure already propagated there; a
+            // read that failed on the BYTES (a bad data sector, a corrupt
+            // trailer) is folded into the recover Result so the
+            // structural-failure salvage arm below recovers the intact blocks
+            // (or records it unreadable with salvage off).
+            let recovered = match own_digest {
+                Ok(digest) => Table::recover(repair_recover_params(
                     config,
                     table_path.clone(),
-                    crate::Checksum::from_raw(c),
+                    digest,
                     table_id,
                     folder_fs.clone(),
                     manifest_global_seqno,
                 )),
-                // A TRANSIENT read (flaky I/O) while hashing is retryable:
-                // recording it unreadable commits a manifest without the
-                // still-in-place file, which the next open's orphan cleanup then
-                // deletes — permanent loss from a one-shot failure. Propagate it
-                // so a retry re-reads the table, mirroring the recover arms below.
-                Err(e) if is_environmental(&e) => return Err(e),
-                // A PERSISTENT read failure (a bad data sector, a corrupt trailer)
-                // is genuine damage but does not doom the whole table: fold it into
-                // the recover Result so the structural-failure salvage arm below
-                // recovers the intact blocks (or records it unreadable with salvage
-                // off).
                 Err(e) => Err(e),
             };
 
@@ -4498,6 +4601,7 @@ fn scan_table_folders(
                             record_best(
                                 &mut recovered_by_id,
                                 &mut unreadable_files,
+                                &mut redundant_unreadable,
                                 &mut discard_after_commit,
                                 &mut swap_after_commit,
                                 table_id,
@@ -4509,6 +4613,7 @@ fn scan_table_folders(
                                 },
                                 &folder_fs,
                                 &table_path,
+                                matches_manifest,
                             )?;
                         }
                         RepairKeepDecision::Drop(reason) => {
@@ -4579,6 +4684,7 @@ fn scan_table_folders(
                                     keep_salvaged_replacement(
                                         &mut recovered_by_id,
                                         &mut unreadable_files,
+                                        &mut redundant_unreadable,
                                         &mut discard_after_commit,
                                         &mut swap_after_commit,
                                         table_id,
@@ -4643,6 +4749,7 @@ fn scan_table_folders(
                             record_best(
                                 &mut recovered_by_id,
                                 &mut unreadable_files,
+                                &mut redundant_unreadable,
                                 &mut discard_after_commit,
                                 &mut swap_after_commit,
                                 table_id,
@@ -4654,6 +4761,7 @@ fn scan_table_folders(
                                 },
                                 &folder_fs,
                                 &table_path,
+                                matches_manifest,
                             )?;
                         }
                         // `Salvage` is unreachable with the flag off, but a
@@ -4772,6 +4880,7 @@ fn scan_table_folders(
                             keep_salvaged_replacement(
                                 &mut recovered_by_id,
                                 &mut unreadable_files,
+                                &mut redundant_unreadable,
                                 &mut discard_after_commit,
                                 &mut swap_after_commit,
                                 table_id,
@@ -4996,6 +5105,7 @@ fn rebuild_from_scan(
             &mut published_blob_replacements,
             &referenced_blob_ids,
             manifest_referenced.as_ref().map(|m| &m.blob_frontiers),
+            manifest_referenced.as_ref().map(|m| &m.blob_checksums),
         )?;
         unreadable_files.extend(recovery.unreadable);
         excluded_files.extend(recovery.excluded);

@@ -7291,7 +7291,8 @@ fn blob_recovery_discards_a_file_whose_metadata_id_disagrees() -> crate::Result<
 
     let config = blob_validation_config(Arc::clone(&memfs));
     let mut published = super::PublishedBlobReplacements::new(&config);
-    let recovery = super::recover_blob_files(&config, &mut published, &(0..10).collect(), None)?;
+    let recovery =
+        super::recover_blob_files(&config, &mut published, &(0..10).collect(), None, None)?;
     published.disarm();
     assert!(
         recovery.files.is_empty(),
@@ -7719,7 +7720,8 @@ fn blob_recovery_derives_the_frontier_of_a_punched_blob_file() -> crate::Result<
     .with_shared_fs(memfs);
 
     let mut published = super::PublishedBlobReplacements::new(&config);
-    let recovery = super::recover_blob_files(&config, &mut published, &(0..10).collect(), None)?;
+    let recovery =
+        super::recover_blob_files(&config, &mut published, &(0..10).collect(), None, None)?;
     published.disarm();
     let (files, unreadable) = (recovery.files, recovery.unreadable);
     assert!(
@@ -8227,7 +8229,8 @@ fn blob_recovery_queues_the_drop_of_a_fully_punched_blob_file() -> crate::Result
 
     let config = blob_validation_config(Arc::clone(&memfs));
     let mut published = super::PublishedBlobReplacements::new(&config);
-    let recovery = super::recover_blob_files(&config, &mut published, &(0..10).collect(), None)?;
+    let recovery =
+        super::recover_blob_files(&config, &mut published, &(0..10).collect(), None, None)?;
     published.disarm();
     assert!(
         recovery.unreadable.is_empty(),
@@ -9320,8 +9323,13 @@ fn blob_recovery_keeps_a_file_whose_zeroed_tail_follows_live_frames() -> crate::
 
     let config = blob_validation_config(Arc::clone(&memfs));
     let mut replacements_guard = super::PublishedBlobReplacements::new(&config);
-    let recovery =
-        super::recover_blob_files(&config, &mut replacements_guard, &(0..10).collect(), None)?;
+    let recovery = super::recover_blob_files(
+        &config,
+        &mut replacements_guard,
+        &(0..10).collect(),
+        None,
+        None,
+    )?;
     replacements_guard.disarm();
     assert!(
         memfs.exists(&path)?,
@@ -11617,11 +11625,13 @@ fn a_displaced_salvage_drops_its_queued_swap() -> crate::Result<()> {
     let mut unreadable = Vec::new();
     let mut discard = Vec::new();
     let mut swaps = Vec::new();
+    let mut redundant = crate::HashSet::default();
 
     // The salvage of the damaged copy queues its swap...
     super::keep_salvaged_replacement(
         &mut map,
         &mut unreadable,
+        &mut redundant,
         &mut discard,
         &mut swaps,
         0,
@@ -11636,6 +11646,7 @@ fn a_displaced_salvage_drops_its_queued_swap() -> crate::Result<()> {
     super::record_best(
         &mut map,
         &mut unreadable,
+        &mut redundant,
         &mut discard,
         &mut swaps,
         0,
@@ -11643,6 +11654,7 @@ fn a_displaced_salvage_drops_its_queued_swap() -> crate::Result<()> {
         super::Fidelity::Complete,
         &fs,
         &dir.join("intact"),
+        false,
     )?;
     assert!(
         swaps.is_empty(),
@@ -11708,6 +11720,7 @@ fn the_most_complete_lossy_duplicate_is_kept() -> crate::Result<()> {
             fidelity: super::Fidelity::Salvaged,
             fs: Arc::clone(&fs),
             path: thin_path.clone(),
+            matches_manifest: false,
         },
     );
     assert!(
@@ -11722,6 +11735,7 @@ fn the_most_complete_lossy_duplicate_is_kept() -> crate::Result<()> {
             fidelity: super::Fidelity::Salvaged,
             fs: Arc::clone(&fs),
             path: full_path.clone(),
+            matches_manifest: false,
         },
     ) else {
         panic!("the second sighting displaces one of the two");
@@ -14435,7 +14449,8 @@ fn blob_recovery_discards_a_persistently_unreadable_blob_file() -> crate::Result
     .with_shared_fs(memfs.clone());
 
     let mut published = super::PublishedBlobReplacements::new(&config);
-    let recovery = super::recover_blob_files(&config, &mut published, &(0..10).collect(), None)?;
+    let recovery =
+        super::recover_blob_files(&config, &mut published, &(0..10).collect(), None, None)?;
     published.disarm();
     let (files, unreadable, discard) = (recovery.files, recovery.unreadable, recovery.discard);
     assert!(files.is_empty(), "nothing recoverable");
@@ -14486,7 +14501,8 @@ fn blob_recovery_discards_a_duplicate_blob_id() -> crate::Result<()> {
     .with_shared_fs(memfs.clone());
 
     let mut published = super::PublishedBlobReplacements::new(&config);
-    let recovery = super::recover_blob_files(&config, &mut published, &(0..10).collect(), None)?;
+    let recovery =
+        super::recover_blob_files(&config, &mut published, &(0..10).collect(), None, None)?;
     published.disarm();
     let (files, unreadable, excluded, discard) = (
         recovery.files,
@@ -14579,6 +14595,7 @@ fn blob_recovery_propagates_a_transient_checksum_failure() -> crate::Result<()> 
         &config,
         &mut super::PublishedBlobReplacements::new(&config),
         &(0..10).collect(),
+        None,
         None,
     );
     assert!(
@@ -16588,6 +16605,177 @@ fn a_salvaged_blob_is_reported_even_when_its_original_cannot_be_removed() -> cra
                 |(_, note)| note.contains("records salvaged") && note.contains("NOT removed")
             ),
         "the note says what was recovered AND that the original is still there: {report:?}",
+    );
+    Ok(())
+}
+
+/// Two copies of one blob id can BOTH open cleanly and still hold different
+/// generations — a prior repair retained the noncanonical authoritative copy
+/// while its cleanup left an older canonical file behind. Adopting the first
+/// self-consistent copy hands the id to the stale bytes and re-stamps a fresh
+/// checksum over them, so existing SST handles resolve against the wrong
+/// generation. A surviving manifest records which copy it named; that decides.
+#[test]
+fn the_manifest_checksum_picks_the_blob_copy_not_directory_order() -> crate::Result<()> {
+    use crate::fs::{Fs, MemFs};
+    use crate::{AbstractTree, Config, KvSeparationOptions, SequenceNumberCounter};
+    use std::io::Write;
+    use std::sync::Arc;
+
+    let memfs = Arc::new(MemFs::new());
+    let stale_root = std::path::absolute("/db_blob_pick_stale")?;
+    let live_root = std::path::absolute("/db_blob_pick_live")?;
+    let config = |root: &std::path::Path| {
+        Config::new(
+            root,
+            SequenceNumberCounter::default(),
+            SequenceNumberCounter::default(),
+        )
+        .with_shared_fs(memfs.clone())
+        .with_kv_separation(Some(
+            KvSeparationOptions::default().separation_threshold(16),
+        ))
+    };
+    let stale_value = alloc::vec![b's'; 64];
+    let live_value = alloc::vec![b'L'; 64];
+
+    // Two independent trees, each holding blob file id 0 with DIFFERENT bytes.
+    // Both files are perfectly valid; only a digest tells them apart.
+    for (root, value) in [(&stale_root, &stale_value), (&live_root, &live_value)] {
+        let tree = match config(root).open()? {
+            crate::AnyTree::Blob(t) => t,
+            crate::AnyTree::Standard(_) => panic!("expected blob tree"),
+        };
+        tree.insert(b"k", value.clone(), 1);
+        tree.flush_active_memtable(0)?;
+    }
+
+    // In the LIVE tree: move the authoritative copy to the noncanonical
+    // spelling of its own id and drop the other tree's generation under the
+    // canonical name. The manifest still names the copy now called `00`.
+    let blobs = live_root.join(crate::file::BLOBS_FOLDER);
+    let canonical = blobs.join("0");
+    memfs.rename(&canonical, &blobs.join("00"))?;
+    {
+        let mut bytes = Vec::new();
+        std::io::Read::read_to_end(
+            &mut memfs.open(
+                &stale_root.join(crate::file::BLOBS_FOLDER).join("0"),
+                &crate::fs::FsOpenOptions::new().read(true),
+            )?,
+            &mut bytes,
+        )?;
+        let mut f = memfs.open(
+            &canonical,
+            &crate::fs::FsOpenOptions::new().write(true).create_new(true),
+        )?;
+        f.write_all(&bytes)?;
+    }
+
+    config(&live_root).repair()?;
+
+    let tree = match config(&live_root).open()? {
+        crate::AnyTree::Blob(t) => t,
+        crate::AnyTree::Standard(_) => panic!("expected blob tree"),
+    };
+    assert_eq!(
+        tree.get(b"k", crate::MAX_SEQNO)?.as_deref(),
+        Some(live_value.as_slice()),
+        "the copy the manifest named must win over the canonical spelling",
+    );
+    Ok(())
+}
+
+/// The table twin of the blob rule: two copies of one table id can BOTH be
+/// complete and self-consistent while holding different generations — a prior
+/// repair that retained a noncanonical copy while its cleanup left the older
+/// canonical file behind. Keeping the first-seen adopts the stale bytes and
+/// records a fresh checksum for them, so surviving handles resolve against the
+/// wrong generation. The committed manifest says which copy is the id.
+#[test]
+fn the_manifest_checksum_picks_the_table_copy_not_scan_order() -> crate::Result<()> {
+    use crate::config::LevelRoute;
+    use crate::fs::{Fs, MemFs};
+    use crate::{AbstractTree, Config, SequenceNumberCounter};
+    use std::io::Write;
+    use std::sync::Arc;
+
+    let memfs = Arc::new(MemFs::new());
+    let stale_root = std::path::absolute("/db_table_pick_stale")?;
+    let live_root = std::path::absolute("/db_table_pick_live")?;
+    let cold = std::path::absolute("/cold_table_pick")?;
+
+    // Two independent trees holding table id 0 with DIFFERENT values. Both
+    // files are complete and open cleanly; only a digest tells them apart.
+    for (root, value) in [(&stale_root, "stale"), (&live_root, "live")] {
+        let tree = match Config::new(
+            root,
+            SequenceNumberCounter::default(),
+            SequenceNumberCounter::default(),
+        )
+        .with_shared_fs(memfs.clone())
+        .open()?
+        {
+            crate::AnyTree::Standard(t) => t,
+            crate::AnyTree::Blob(_) => panic!("expected Standard tree"),
+        };
+        tree.insert(b"k", value.as_bytes(), 1);
+        tree.flush_active_memtable(0)?;
+    }
+
+    // The live tree's own copy moves to a routed folder — scanned AFTER the
+    // primary — and the stale generation takes the primary path. Scan order
+    // now favours the wrong one.
+    let cold_tables = cold.join("tables");
+    memfs.create_dir_all(&cold_tables)?;
+    let primary = live_root.join("tables").join("0");
+    memfs.rename(&primary, &cold_tables.join("0"))?;
+    {
+        let mut bytes = Vec::new();
+        std::io::Read::read_to_end(
+            &mut memfs.open(
+                &stale_root.join("tables").join("0"),
+                &crate::fs::FsOpenOptions::new().read(true),
+            )?,
+            &mut bytes,
+        )?;
+        let mut f = memfs.open(
+            &primary,
+            &crate::fs::FsOpenOptions::new().write(true).create_new(true),
+        )?;
+        f.write_all(&bytes)?;
+    }
+
+    let config = || {
+        let route_fs: Arc<dyn Fs> = memfs.clone();
+        Config::new(
+            &live_root,
+            SequenceNumberCounter::default(),
+            SequenceNumberCounter::default(),
+        )
+        .with_shared_fs(memfs.clone())
+        .level_routes(vec![LevelRoute {
+            levels: 0..2,
+            path: cold.clone(),
+            fs: route_fs,
+        }])
+    };
+    let report = config().repair()?;
+    // The displaced copy is reported, but it costs no coverage: the id it
+    // duplicated is retained, so an external WAL has nothing to replay.
+    assert!(
+        report.lost_coverage.is_empty() && report.unknowable_losses.is_empty(),
+        "a superseded duplicate is not lost coverage: {report:?}",
+    );
+
+    let tree = match config().open()? {
+        crate::AnyTree::Standard(t) => t,
+        crate::AnyTree::Blob(_) => panic!("expected Standard tree"),
+    };
+    assert_eq!(
+        tree.get(b"k", crate::MAX_SEQNO)?.as_deref(),
+        Some(&b"live"[..]),
+        "the copy the manifest named must win over the one scanned first",
     );
     Ok(())
 }
