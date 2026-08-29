@@ -1513,6 +1513,70 @@ fn reopen_restricted_carries_the_live_suffix_digest() -> crate::Result<()> {
     )
 }
 
+/// The twelve single-letter keys the restriction-accounting tests write, four
+/// per data block.
+fn twelve_letter_items() -> Vec<crate::InternalValue> {
+    (b'a'..=b'l')
+        .map(|c| crate::InternalValue::from_components([c], b"v", 0, crate::ValueType::Value))
+        .collect()
+}
+
+/// A restriction landing on a block's LAST key leaves nearly that whole block
+/// dead: the view serves only its keys `>= bound`, and the rows below belong to
+/// the output table that superseded the punched prefix. Counting the straddling
+/// block whole reports those rows twice while both live in one version.
+#[test]
+fn live_item_count_drops_the_straddling_block_rows_below_the_bound() -> crate::Result<()> {
+    // `rotate_every == Some(4)` gives blocks [a..d] [e..h] [i..l]; "h" is the
+    // LAST key of the middle one, so the view serves h..l = 5 of its 12 entries
+    // and only ONE of the straddling block's four.
+    test_with_table(
+        &twelve_letter_items(),
+        |table| {
+            let restricted = table.with_restriction(crate::UserKey::from(&b"h"[..]));
+            assert!(
+                restricted.punch_offset_for(b"h")? > 0,
+                "the fixture must punch a real prefix, not the degenerate whole file",
+            );
+            assert_eq!(
+                5,
+                restricted.live_item_count()?,
+                "a zone-mapped view counts the straddling block's live suffix, \
+                 not its whole row count",
+            );
+            Ok(())
+        },
+        Some(4),
+        Some(|w: Writer| w.use_zone_map(true)),
+    )
+}
+
+/// Without a zone map the count is apportioned over data bytes, but the
+/// straddling block is still counted exactly: apportioning it whole credited
+/// the view with every row below the bound.
+#[test]
+fn live_item_count_apportions_only_the_blocks_above_the_straddling_one() -> crate::Result<()> {
+    test_with_table(
+        &twelve_letter_items(),
+        |table| {
+            let restricted = table.with_restriction(crate::UserKey::from(&b"h"[..]));
+            let live = restricted.live_item_count()?;
+            // Exact for the straddling block (1 entry), apportioned by bytes
+            // above it (~4 entries) — so within a block's granularity of the
+            // true 5, and well below the 8 that counting the straddling block
+            // whole reports.
+            assert!(
+                (4..=6).contains(&live),
+                "apportioning above the straddling block must land near the \
+                 5 live entries, got {live}",
+            );
+            Ok(())
+        },
+        Some(4),
+        Some(|x| x),
+    )
+}
+
 #[test]
 fn punch_offset_for_locates_the_first_block_reaching_a_key() -> crate::Result<()> {
     let items = [

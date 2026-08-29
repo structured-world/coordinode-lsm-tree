@@ -378,7 +378,7 @@ pub(crate) type VerbatimCopy = (
     alloc::vec::Vec<u32>,
 );
 
-/// Outcome of [`Table::derive_restriction_bound`] — the CONSERVATIVE
+/// Outcome of [`Table::conservative_restriction`] — the CONSERVATIVE
 /// punch-geometry classification for a punched SST whose exact
 /// `.restrict-bound` sidecar is not trustworthy.
 #[cfg(feature = "std")]
@@ -399,7 +399,7 @@ pub(crate) enum DerivedRestriction {
     IrregularPunch,
 }
 
-/// Verdict of [`Table::has_punched_data_block`] — whether any zeroed
+/// Verdict of [`Table::punch_geometry`] — whether any zeroed
 /// data-block run carries the physical hole that proves a tight-space
 /// reclaim.
 #[cfg(feature = "std")]
@@ -3905,7 +3905,7 @@ impl Table {
         }
     }
 
-    /// The GREEDY counterpart of [`derive_restriction_bound`](Self::derive_restriction_bound)
+    /// The GREEDY counterpart of [`conservative_restriction`](Self::conservative_restriction)
     /// for RESURRECTION mode: returns the FIRST (lowest) key of the first
     /// readable block after the LAST zeroed one, so restricting to it keeps the
     /// WHOLE straddling block — resurrecting its sub-bound keys — while still
@@ -7941,12 +7941,13 @@ impl Table {
     /// summing the raw metadata counts those entries twice.
     ///
     /// Exact when the table carries a zone map (per-block row counts); without
-    /// one the count is apportioned by the live data-byte fraction, which is
-    /// the same granularity every other estimate over this table uses.
+    /// one the blocks above the straddling one are apportioned by data bytes,
+    /// which is the same granularity every other estimate over this table uses.
     ///
     /// # Errors
     ///
-    /// Propagates the index lookup of the restriction bound.
+    /// Propagates the index lookup of the restriction bound and the read of the
+    /// straddling block.
     pub(crate) fn live_item_count(&self) -> crate::Result<u64> {
         let Some(bound) = self.restrict_lower_bound() else {
             return Ok(self.metadata.item_count);
@@ -7955,11 +7956,19 @@ impl Table {
         if punch == 0 {
             return Ok(self.metadata.item_count);
         }
+        // Nothing below the straddling block survives, and the restriction can
+        // reach past every block (then the whole data region is dead).
+        let Some((straddle_end, straddle_live)) = self.straddling_block_live(punch, bound)? else {
+            return Ok(0);
+        };
         if !self.zone_map.is_empty() {
-            let mut rows = 0u64;
+            let mut rows = straddle_live;
             for handle in self.block_index.iter() {
                 let handle = handle?;
-                if *handle.offset() < punch {
+                // `<=` skips the straddling block: it is counted exactly above,
+                // and its recorded row count covers the dead rows below the
+                // bound too.
+                if *handle.offset() <= punch {
                     continue;
                 }
                 if let Some(col) = self
@@ -7973,21 +7982,61 @@ impl Table {
             return Ok(rows);
         }
         let Some(last) = self.block_index.iter().next_back() else {
-            return Ok(0);
+            return Ok(straddle_live);
         };
         let data_end = {
             let last = last?;
             *last.offset() + u64::from(last.size())
         };
-        // A punch past the data section cannot be reasoned about; keep the
-        // recorded count rather than inventing a smaller one.
-        let Some(live) = data_end.checked_sub(punch).filter(|_| data_end > 0) else {
+        // A straddling block reaching past the data section cannot be reasoned
+        // about; keep the recorded count rather than inventing a smaller one.
+        let Some(above) = data_end.checked_sub(straddle_end).filter(|_| data_end > 0) else {
             return Ok(self.metadata.item_count);
         };
-        Ok(u64::try_from(
-            u128::from(self.metadata.item_count) * u128::from(live) / u128::from(data_end),
+        let apportioned = u64::try_from(
+            u128::from(self.metadata.item_count) * u128::from(above) / u128::from(data_end),
         )
-        .unwrap_or(self.metadata.item_count))
+        .unwrap_or(self.metadata.item_count);
+        Ok(straddle_live + apportioned)
+    }
+
+    /// The block at `punch` STRADDLES the restriction: it is the first whose
+    /// last key reaches `bound`, so the view serves only its entries
+    /// `>= bound`. Returns its end offset and that live count.
+    ///
+    /// Every block below it is dead in full and every block above is live in
+    /// full, so it is the only one whose rows have to be counted rather than
+    /// read off the index — and a bound landing on a block's last key (what a
+    /// tight-space slice commonly produces) makes almost all of its rows dead.
+    ///
+    /// `None` when no block starts at `punch`: the restriction reaches past the
+    /// last key, so the whole data region is superseded.
+    ///
+    /// # Errors
+    ///
+    /// Propagates the block-index walk and the read of the straddling block.
+    fn straddling_block_live(&self, punch: u64, bound: &[u8]) -> crate::Result<Option<(u64, u64)>> {
+        for handle in self.block_index.iter() {
+            let handle = handle?;
+            if *handle.offset() != punch {
+                continue;
+            }
+            let end = punch + u64::from(handle.size());
+            // A wholly delete-masked columnar block serves no keys at all.
+            let Some(block) = self.load_data_block(handle.as_ref())? else {
+                return Ok(Some((end, 0)));
+            };
+            let data = &block.inner.data;
+            let cmp = &*self.comparator;
+            let mut live = 0u64;
+            for item in block.iter(self.comparator.clone()) {
+                if item.compare_key(bound, data, cmp) != core::cmp::Ordering::Less {
+                    live += 1;
+                }
+            }
+            return Ok(Some((end, live)));
+        }
+        Ok(None)
     }
 
     /// The same digest for a restriction this VIEW does not carry yet: the

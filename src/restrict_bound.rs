@@ -148,7 +148,7 @@ pub fn write(
 }
 
 /// Atomically publishes already-encoded sidecar `content` beside `table_path`
-/// through the synced `temp + rename` protocol [`write`] uses. Also the
+/// through the synced `temp + rename` protocol [`write()`] uses. Also the
 /// re-publish path for raw bytes captured from an existing sidecar, which must
 /// land verbatim — they are already serialized (and possibly encrypted).
 ///
