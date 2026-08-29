@@ -1455,6 +1455,30 @@ impl Table {
         self.metadata.file_size
     }
 
+    /// The bytes this VIEW can contribute to a merge output: the whole file for
+    /// a normal table, or `[punch_offset, end)` for a tight-space RESTRICTED
+    /// view. Its punched prefix is superseded — the merge never reads it and
+    /// never rewrites it — so charging a space gate the original `file_size`
+    /// stalls a compaction whose real output fits the headroom.
+    ///
+    /// # Errors
+    ///
+    /// Propagates a restricted view's punch-offset lookup.
+    #[cfg_attr(
+        not(feature = "std"),
+        allow(
+            dead_code,
+            reason = "merge-output sizing; its compaction consumer is std-gated, so unused under no_std"
+        )
+    )]
+    pub(crate) fn live_file_size(&self) -> crate::Result<u64> {
+        let size = self.file_size();
+        // The punch offset is a data-block offset inside this same file, so the
+        // subtraction cannot underflow; falling back to the whole size keeps a
+        // space gate conservative if the two ever disagreed.
+        Ok(size.checked_sub(self.punch_offset()?).unwrap_or(size))
+    }
+
     /// The on-disk ROLE of this table's data blocks: a columnar segment's
     /// writer seals them as [`BlockType::Columnar`], a row-major one as
     /// [`BlockType::Data`]. Scrub / heal walks pass this as the expected type

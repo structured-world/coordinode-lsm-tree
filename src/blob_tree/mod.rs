@@ -485,7 +485,7 @@ impl AbstractTree for BlobTree {
             // the min-volume free) keeps the status from reporting tight when the
             // SST and blob outputs each fit their own volume — see the gate's
             // two-layer model.
-            let sst_need = crate::storage_stats::full_compaction_demand_bytes(&version);
+            let sst_need = crate::storage_stats::full_compaction_demand_bytes(&version)?;
             // `saturating_sub`: `level_count >= 1` always (the clamp only guards a
             // degenerate zero-level config) → the last level index.
             let sst_dest_level = self.index.config.level_count.saturating_sub(1);

@@ -443,20 +443,37 @@ pub(crate) fn table_on_disk_bytes(table: &crate::table::Table) -> crate::Result<
 }
 
 /// The transient-output bound a full compaction's space check uses: the largest
-/// level's on-disk size (the `full_compaction_bytes` gauge figure), an upper
-/// bound on a single merge's input set. `0` for an empty tree.
+/// level's live size (the `full_compaction_bytes` gauge figure), an upper bound
+/// on a single merge's input set. `0` for an empty tree.
+///
+/// Live, not `Level::size`: a tight-space-RESTRICTED table's `file_size` still
+/// describes the punched original, and charging that superseded prefix to the
+/// output would report the tree as tight — and the gate would stall an ordinary
+/// merge — while the real output fits.
 ///
 /// This is the DEMAND. The destination VOLUME is a separate concern: a full
 /// compaction writes its output to the last configured level
 /// (`level_count - 1`), not to whichever level is currently largest, so callers
 /// pass the last level as the destination to the per-volume space check (the two
 /// differ only under tiered routing, where they can be different filesystems).
-pub(crate) fn full_compaction_demand_bytes(version: &Version) -> u64 {
-    version
-        .iter_levels()
-        .map(crate::version::Level::size)
-        .max()
-        .unwrap_or(0)
+///
+/// # Errors
+///
+/// Propagates a restricted table's punch-offset lookup.
+pub(crate) fn full_compaction_demand_bytes(version: &Version) -> crate::Result<u64> {
+    let mut largest = 0u64;
+    for level in version.iter_levels() {
+        // A level's live size: a sum of on-disk byte counts, bounded by the
+        // filesystem capacity, so it cannot overflow u64.
+        let mut size = 0u64;
+        for run in level.iter() {
+            for table in run.iter() {
+                size += table.live_file_size()?;
+            }
+        }
+        largest = largest.max(size);
+    }
+    Ok(largest)
 }
 
 /// Computes [`StorageStats`] from a live version's table + blob-file metadata.
@@ -562,7 +579,7 @@ pub(crate) fn compute_storage_stats(
     // A full compaction's transient output is bounded by its input set; the
     // largest single merge is bounded by the largest level's on-disk size, so
     // that is the free space a full compaction needs.
-    let full_compaction_bytes = full_compaction_demand_bytes(version);
+    let full_compaction_bytes = full_compaction_demand_bytes(version)?;
     // A minimal (tight) space-reclaiming merge needs only the reserved working
     // floor to make forward progress.
     let tight_compaction_bytes = crate::tree::MIN_RESERVED_HEADROOM;

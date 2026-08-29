@@ -366,7 +366,9 @@ pub fn space_fits_two_layer(
 /// space is checked per destination volume (SST output volume + primary blob
 /// volume, combined onto one budget when they share a filesystem).
 ///
-/// The SST bound is `Σ input file_size`; the blob bound is the physical on-disk
+/// The SST bound is `Σ input live_file_size` (a tight-space-restricted input
+/// contributes only its live suffix — the punched prefix is superseded and never
+/// rewritten); the blob bound is the physical on-disk
 /// size of the stale blob files selected for relocation. This is a best-effort
 /// estimate: a merge operator / compaction filter that *grows* values can still
 /// write more than the inputs, so a mid-merge `ENOSPC` remains possible — that
@@ -411,8 +413,7 @@ fn space_gate_for_merge(
             .table_ids
             .iter()
             .filter_map(|&id| version.get_table(id))
-            .map(Table::file_size)
-            .sum();
+            .try_fold(0u64, |acc, t| t.live_file_size().map(|size| acc + size))?;
         let blob_sigma: u64 = match &opts.config.kv_separation_opts {
             Some(blob_opts) => pick_blob_files_to_rewrite(&p.table_ids, version, blob_opts)?
                 .iter()
@@ -435,7 +436,7 @@ fn space_gate_for_merge(
     // Constrained: try the run-adjacent narrowing candidates in ascending SST
     // size and run the first that fits the full two-layer budget. Skip only when
     // none fit (a truly-too-big single merge is the opt-in tight-space domain).
-    for narrowed in narrow_merge_candidates(version, payload) {
+    for narrowed in narrow_merge_candidates(version, payload)? {
         if fits(&narrowed)? {
             return Ok(SpaceGate::Narrowed(narrowed));
         }
@@ -444,8 +445,9 @@ fn space_gate_for_merge(
 }
 
 /// The run-adjacent table-pair narrowing candidates for a too-large merge,
-/// sorted by combined SST `file_size` ascending, each preserving the merge's
-/// destination.
+/// sorted by combined SST `live_file_size` ascending (the same measure the gate
+/// charges, so a restricted input's superseded prefix does not distort the
+/// order), each preserving the merge's destination.
 ///
 /// Narrowing is only safe within a single run (key-sorted, non-overlapping
 /// tables): a run-adjacent pair is always a valid, reclaiming merge, and the
@@ -464,7 +466,7 @@ fn space_gate_for_merge(
 fn narrow_merge_candidates(
     version: &Version,
     payload: &CompactionPayload,
-) -> Vec<CompactionPayload> {
+) -> crate::Result<Vec<CompactionPayload>> {
     // The single run that holds every payload table (if any).
     let Some(run) = version
         .iter_levels()
@@ -476,7 +478,7 @@ fn narrow_merge_candidates(
                 .all(|id| run.iter().any(|t| t.id() == *id))
         })
     else {
-        return Vec::new();
+        return Ok(Vec::new());
     };
 
     let run_tables: Vec<&Table> = run.iter().collect();
@@ -488,7 +490,7 @@ fn narrow_merge_candidates(
         }
         // Two on-disk file sizes; the sum is bounded by filesystem capacity and
         // cannot overflow u64.
-        let combined = a.file_size() + b.file_size();
+        let combined = a.live_file_size()? + b.live_file_size()?;
         candidates.push((
             combined,
             CompactionPayload {
@@ -500,7 +502,7 @@ fn narrow_merge_candidates(
         ));
     }
     candidates.sort_by_key(|(combined, _)| *combined);
-    candidates.into_iter().map(|(_, p)| p).collect()
+    Ok(candidates.into_iter().map(|(_, p)| p).collect())
 }
 
 fn pick_run_indexes(run: &Run<Table>, to_compact: &[TableId]) -> Option<(usize, usize)> {

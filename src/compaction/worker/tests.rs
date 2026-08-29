@@ -2073,7 +2073,10 @@ fn narrow_merge_candidates_for_full_run_are_adjacent_pairs_sorted_ascending() ->
         .flat_map(|level| level.iter())
         .find(|run| run.len() >= 3)
         .expect("a bottom-level run with >= 3 tables");
-    let ordered: Vec<(TableId, u64)> = run.iter().map(|t| (t.id(), t.file_size())).collect();
+    let ordered: Vec<(TableId, u64)> = run
+        .iter()
+        .map(|t| Ok((t.id(), t.live_file_size()?)))
+        .collect::<crate::Result<_>>()?;
 
     let payload = Input {
         table_ids: ordered.iter().map(|(id, _)| *id).collect(),
@@ -2082,7 +2085,7 @@ fn narrow_merge_candidates_for_full_run_are_adjacent_pairs_sorted_ascending() ->
         target_size: 64 * 1024 * 1024,
     };
 
-    let candidates = super::narrow_merge_candidates(&version, &payload);
+    let candidates = super::narrow_merge_candidates(&version, &payload)?;
 
     // One candidate per run-adjacent pair, each exactly two tables on the
     // payload's destination.
@@ -2096,14 +2099,16 @@ fn narrow_merge_candidates_for_full_run_are_adjacent_pairs_sorted_ascending() ->
         assert_eq!(c.dest_level, 6, "destination preserved");
     }
 
-    let combined = |c: &Input| -> u64 {
+    let combined = |c: &Input| -> crate::Result<u64> {
         c.table_ids
             .iter()
             .filter_map(|id| version.get_table(*id))
-            .map(Table::file_size)
-            .sum()
+            .try_fold(0u64, |acc, t| t.live_file_size().map(|size| acc + size))
     };
-    let sums: Vec<u64> = candidates.iter().map(combined).collect();
+    let sums: Vec<u64> = candidates
+        .iter()
+        .map(combined)
+        .collect::<crate::Result<_>>()?;
 
     // Sorted ascending: the gate tries the smallest-Σ pair first, then larger
     // ones (a larger pair with fewer blob rewrites can fit where the smallest
@@ -2303,6 +2308,70 @@ fn space_gate_for_merge_narrows_a_full_run_that_exceeds_free() -> crate::Result<
     }
 
     Ok(())
+}
+
+/// A tight-space slice leaves a RESTRICTED input whose `file_size` still
+/// describes the punched original, prefix included. Sizing an ordinary merge by
+/// that obsolete figure stalls a compaction whose real output — the live suffix
+/// — fits the headroom, and after a restart without tight-space mode there is
+/// nothing left to unstick it.
+#[test]
+fn space_gate_sizes_a_restricted_input_by_its_live_suffix() -> crate::Result<()> {
+    let dir = tempfile::tempdir()?;
+    let mem = crate::fs::MemFs::with_capacity(u64::MAX);
+    let reopened = tight_space_crash_and_reopen(
+        dir.path(),
+        Arc::new(mem.clone()),
+        |used| mem.set_capacity(used + used / 4),
+        || mem.punched_bytes(),
+    )?;
+    let crate::AnyTree::Standard(tree) = reopened else {
+        panic!("expected Standard tree");
+    };
+    // Physical free space is put out of the way so the logical quota alone
+    // governs the gate's verdict.
+    mem.set_capacity(u64::MAX);
+
+    let version = tree.current_version();
+    let Some(restricted) = version
+        .iter_tables()
+        .find(|t| t.restrict_lower_bound().is_some())
+    else {
+        panic!("the crashed tight-space slice must leave a restricted table");
+    };
+    let live = restricted.live_file_size()?;
+    assert!(
+        live < restricted.file_size(),
+        "the fixture's input must carry a punched, superseded prefix",
+    );
+
+    let payload = Input {
+        table_ids: core::iter::once(restricted.id()).collect(),
+        dest_level: 6,
+        canonical_level: 6,
+        target_size: 64 * 1024 * 1024,
+    };
+    // Headroom that fits the live suffix EXACTLY and not the original size.
+    let used = crate::storage_stats::compute_used_bytes(&version)?;
+    tree.update_runtime_config(|c| {
+        c.storage_admission_check = true;
+        c.tight_space_compaction = false;
+        c.storage_limit_bytes = Some(used + live);
+    })?;
+
+    let opts = super::Options::from_tree(
+        &tree,
+        Arc::new(crate::compaction::major::Strategy::new(64 * 1024 * 1024)),
+    );
+    match super::space_gate_for_merge(&version, &opts, &payload)? {
+        super::SpaceGate::Run => Ok(()),
+        super::SpaceGate::Narrowed(_) => {
+            panic!("expected Run, got Narrowed (a single-table merge cannot narrow)")
+        }
+        super::SpaceGate::Skip => {
+            panic!("expected Run, got Skip (the punched prefix was charged to the output)")
+        }
+    }
 }
 
 /// Every compaction-produced table must inherit the tree's shared deletion pause

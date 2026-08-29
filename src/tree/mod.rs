@@ -523,7 +523,7 @@ impl AbstractTree for Tree {
             // blob relocation. Using the per-volume gate (not `available >=
             // full_compaction_bytes` against the min-volume free) keeps the status
             // from reporting tight when a routed merge would actually be admitted.
-            let sst_need = crate::storage_stats::full_compaction_demand_bytes(&version);
+            let sst_need = crate::storage_stats::full_compaction_demand_bytes(&version)?;
             // `saturating_sub`: `level_count >= 1` always, so this is the last
             // level index; the clamp only guards a degenerate zero-level config.
             let sst_dest_level = self.0.config.level_count.saturating_sub(1);
