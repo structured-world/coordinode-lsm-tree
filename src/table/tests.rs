@@ -1521,6 +1521,80 @@ fn twelve_letter_items() -> Vec<crate::InternalValue> {
         .collect()
 }
 
+/// The reconcile gates must share ONE decode per live block. Each of them used
+/// to walk the table itself, so a single reconcile re-read and re-decoded every
+/// block once per gate and repair time grew with the gate count; the combined
+/// pass reads each block exactly once, no matter how many gates consume it.
+#[test]
+fn reconcile_gates_read_each_block_once() -> crate::Result<()> {
+    use crate::fs::{FaultFs, Fs, MemFs};
+
+    // `rotate_every == Some(4)` gives three data blocks over the twelve keys.
+    const BLOCKS: usize = 3;
+
+    let mem = MemFs::new();
+    let faulty = std::sync::Arc::new(FaultFs::new(mem));
+    let injector = faulty.injector();
+    let root = std::path::absolute("/reconcile_pass")?;
+    faulty.create_dir_all(&root)?;
+    let path = root.join("table");
+
+    {
+        let mut writer = Writer::new(path.clone(), 0, 0, faulty.clone())?.use_zone_map(true);
+        for (idx, item) in twelve_letter_items().iter().enumerate() {
+            if idx % 4 == 0 {
+                writer.spill_block()?;
+            }
+            writer.write(item.clone())?;
+        }
+        let Some((_, checksum)) = writer.finish()? else {
+            panic!("the fixture writes twelve entries");
+        };
+        let mut params = test_recover_params(path, checksum);
+        params.fs = faulty;
+        let table = Table::recover(params)?;
+        assert_eq!(
+            table.block_index.iter().count(),
+            BLOCKS,
+            "the fixture must have three data blocks",
+        );
+
+        // Baseline: the whole family, each gate walking the table itself, the
+        // way the repair and scrub chains used to call them.
+        injector.clear();
+        table.verify_kv_checksums()?;
+        table.verify_seqno_bounds()?;
+        table.verify_block_entry_counts()?;
+        table.verify_zone_map()?;
+        table.verify_locator()?;
+        table.verify_filter(None)?;
+        table.verify_point_read_reachability()?;
+        table.verify_metadata_bounds(false)?;
+        let individual = injector.read_count();
+
+        // The same family on ONE decode of each block.
+        injector.clear();
+        let combined_result = table.verify_reconcile_gates(None, false);
+        assert!(
+            combined_result.is_ok(),
+            "the combined pass must accept a healthy table: {:?}",
+            combined_result.map_err(|(gate, e)| (gate, e.to_string())),
+        );
+        let combined = injector.read_count();
+
+        // Measured on this fixture: 18 reads for the eight separate walks
+        // against 6 for the combined pass (three data blocks plus the section
+        // reads, which happen once either way). The margin grows with the
+        // block count, since only the per-block half is multiplied.
+        assert!(
+            combined > 0 && individual >= combined * 2,
+            "the whole family on one pass must cost far less than eight \
+             separate walks: combined {combined} reads against {individual}",
+        );
+    }
+    Ok(())
+}
+
 /// A restriction landing on a block's LAST key leaves nearly that whole block
 /// dead: the view serves only its keys `>= bound`, and the rows below belong to
 /// the output table that superseded the punched prefix. Counting the straddling

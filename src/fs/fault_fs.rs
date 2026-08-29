@@ -267,6 +267,11 @@ pub struct FaultInjector {
     /// mode a component synced its files at (e.g. a salvage writer honouring
     /// `Config::sync_mode`), which the pass-through delegation cannot show.
     sync_log: spin::Mutex<Vec<(PathBuf, SyncMode)>>,
+    /// Positional reads served, counted whether or not a rule matched — the
+    /// pass-through delegation is otherwise invisible, so a test that cares
+    /// about how MUCH a path reads (a verification walking each block once
+    /// rather than once per gate) has nothing to assert on.
+    reads: core::sync::atomic::AtomicUsize,
 }
 
 impl FaultInjector {
@@ -284,12 +289,27 @@ impl FaultInjector {
         self.rules.lock().push(rule);
     }
 
-    /// Removes all armed rules AND the recorded sync observations, resetting the
-    /// injector so a later phase cannot see state (rules or `sync_modes_for`
-    /// entries) recorded before the `clear()`.
+    /// Records one positional read. Called on every `read_at`, matched or not.
+    pub(crate) fn count_read(&self) {
+        self.reads
+            .fetch_add(1, core::sync::atomic::Ordering::Relaxed);
+    }
+
+    /// Positional reads served since the injector was created (or since the
+    /// last [`Self::clear`]). Lets a test assert how much a path READS, not
+    /// just what it does when a read fails.
+    #[must_use]
+    pub fn read_count(&self) -> usize {
+        self.reads.load(core::sync::atomic::Ordering::Relaxed)
+    }
+
+    /// Removes all armed rules AND the recorded observations (sync modes and
+    /// the read count), resetting the injector so a later phase cannot see
+    /// state recorded before the `clear()`.
     pub fn clear(&self) {
         self.rules.lock().clear();
         self.sync_log.lock().clear();
+        self.reads.store(0, core::sync::atomic::Ordering::Relaxed);
     }
 
     /// Records one file-level mode-carrying sync observation (see
@@ -691,6 +711,7 @@ impl FsFile for FaultFile {
     }
 
     fn read_at(&self, buf: &mut [u8], offset: u64) -> io::Result<usize> {
+        self.injector.count_read();
         if let Some(Fault::Error(kind)) = self.injector.check_read_at(Some(&self.path), offset) {
             return Err(fault_error(kind, FaultOp::ReadAt));
         }
