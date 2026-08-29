@@ -6280,6 +6280,11 @@ fn publish_repaired_manifest(
     // miss it. Drop all `edits-*` — none belong to the fresh snapshot. Runs
     // only on a PROVEN commit (like every cleanup below): a recorded
     // post-commit error skips it, and the retry finishes the sweep.
+    //
+    // No directory fsync here, unlike the blob sweep below. Recovery replays
+    // only the LIVE snapshot's log, so an entry a power loss resurrects is
+    // never read; the next open recognizes it as an orphan log and sweeps it
+    // again. Nothing observes the window, so the barrier would buy nothing.
     if post_commit_error.is_none() {
         match config.fs.read_dir(&config.path) {
             Ok(dirents) => {
@@ -6413,13 +6418,11 @@ fn publish_repaired_manifest(
     // sweep, and a sweep that fails there fails the open. Remove them here and
     // propagate, so a repair that reports success leaves an openable tree.
     if post_commit_error.is_none() {
+        let mut removed_dir: Option<std::path::PathBuf> = None;
         for path in unreferenced_blob_files {
-            // Through the shared helper, so the directory entry's removal is
-            // made DURABLE: a power loss after this repair reports success
-            // would otherwise restore the entry and hand the next open the very
-            // orphan this removal exists to prevent.
-            match discard_unreferenced(&*config.fs, &path, config.sync_mode) {
-                Ok(()) => {}
+            match config.fs.remove_file(&path) {
+                Ok(()) => removed_dir = path.parent().map(std::path::Path::to_path_buf),
+                Err(e) if e.kind() == crate::io::ErrorKind::NotFound => {}
                 Err(e) => {
                     log::error!(
                         "repair: cannot remove the unreferenced blob file {} ({e}); \
@@ -6427,10 +6430,26 @@ fn publish_repaired_manifest(
                          open must remove, and that removal would hit the same error",
                         path.display(),
                     );
-                    post_commit_error = Some(e);
+                    post_commit_error = Some(e.into());
                     break;
                 }
             }
+        }
+        // ONE sync for the batch, mirroring `remove_published_blob_replacements`:
+        // the entries all live in the same directory, and without it a power
+        // loss after this repair reports success can restore them, handing the
+        // next open the very orphans these removals exist to prevent.
+        if let Some(dir) = removed_dir
+            && post_commit_error.is_none()
+            && let Err(e) = config.fs.sync_directory_with(&dir, config.sync_mode)
+        {
+            log::error!(
+                "repair: cannot make the removal of unreferenced blob files durable \
+                 in {} ({e}); failing the repair: a power loss would restore them \
+                 as orphans the next open must sweep",
+                dir.display(),
+            );
+            post_commit_error = Some(e.into());
         }
     }
 
