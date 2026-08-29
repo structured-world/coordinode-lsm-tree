@@ -341,14 +341,24 @@ fn infer_blob_tree(db_dir: &std::path::Path) -> std::io::Result<bool> {
         if !entry.path().is_file() {
             continue;
         }
-        // The blob recovery path parses the file NAME as the id, so a name that
-        // does not parse is not a blob file, whatever else it may be.
-        if entry
+        // The name is not the evidence. Blob recovery parses the NAME as the
+        // id, so a name that does not parse is certainly not a blob file, but
+        // one that does may still be unrelated junk (an operator backup called
+        // `0`). Only a file the blob reader can actually parse proves the tree
+        // is blob-backed.
+        if !entry
             .file_name()
             .to_str()
             .is_some_and(|n| n.parse::<u64>().is_ok())
         {
-            return Ok(true);
+            continue;
+        }
+        match lsm_tree::inspect::is_blob_file(&entry.path()) {
+            Ok(true) => return Ok(true),
+            Ok(false) => {}
+            // An unreadable candidate leaves the scan unable to answer, the
+            // same as an unreadable directory above.
+            Err(e) => return Err(std::io::Error::other(e.to_string())),
         }
     }
     Ok(false)

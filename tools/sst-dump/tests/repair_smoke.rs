@@ -211,57 +211,6 @@ fn an_empty_blobs_dir_does_not_make_a_standard_tree_a_blob_tree()
     Ok(())
 }
 
-/// A regular file under `blobs/` is not automatically a blob artifact: a
-/// `.DS_Store`, a backup marker or operator notes are files too. Treating any
-/// of them as evidence rebuilds a standard store as a blob one, and no later
-/// repair can undo that.
-#[test]
-fn a_non_blob_file_under_blobs_does_not_make_a_standard_tree_a_blob_tree()
--> Result<(), Box<dyn std::error::Error>> {
-    let dir = tempfile::tempdir()?;
-
-    {
-        let tree = Config::new(
-            dir.path(),
-            SequenceNumberCounter::default(),
-            SequenceNumberCounter::default(),
-        )
-        .open()?;
-        for i in 0u64..50 {
-            tree.insert(format!("key-{i:06}"), format!("value-{i}"), 1 + i);
-        }
-        tree.flush_active_memtable(0)?;
-    }
-    std::fs::create_dir_all(dir.path().join("blobs"))?;
-    std::fs::write(dir.path().join("blobs").join(".DS_Store"), b"finder junk")?;
-    nuke_manifest(dir.path())?;
-
-    let out = Command::new(SST_DUMP_BIN)
-        .arg(dir.path())
-        .arg("repair")
-        .output()?;
-    assert!(
-        out.status.success(),
-        "repair should exit 0, stderr: {}",
-        String::from_utf8_lossy(&out.stderr),
-    );
-
-    // A blob rebuild makes the standard open fail with a type mismatch.
-    let tree = Config::new(
-        dir.path(),
-        SequenceNumberCounter::default(),
-        SequenceNumberCounter::default(),
-    )
-    .open()?;
-    for i in 0u64..50 {
-        assert_eq!(
-            tree.get(format!("key-{i:06}"), MAX_SEQNO)?.as_deref(),
-            Some(format!("value-{i}").as_bytes()),
-        );
-    }
-    Ok(())
-}
-
 /// An unreadable `blobs/` means the scan could not ANSWER, not that the tree is
 /// standard. Publishing a tree type on that guess is unrecoverable, so the
 /// command must stop and let the operator retry or state the type.
@@ -304,5 +253,56 @@ fn an_unreadable_blobs_dir_stops_the_repair_instead_of_guessing()
         "the operator is told how to proceed: {}",
         String::from_utf8_lossy(&out.stderr),
     );
+    Ok(())
+}
+
+/// The name is not the evidence: a file under `blobs/` whose name PARSES as a
+/// blob id (an operator's backup called `0`, say) is still not a blob file.
+/// Inferring from the name alone publishes a blob manifest over a standard
+/// store, and every later standard open then fails with a type mismatch while
+/// the committed manifest looks clean, so no repair will touch it.
+#[test]
+fn a_numeric_non_blob_file_does_not_make_a_standard_tree_a_blob_tree()
+-> Result<(), Box<dyn std::error::Error>> {
+    let dir = tempfile::tempdir()?;
+
+    {
+        let tree = Config::new(
+            dir.path(),
+            SequenceNumberCounter::default(),
+            SequenceNumberCounter::default(),
+        )
+        .open()?;
+        for i in 0u64..50 {
+            tree.insert(format!("key-{i:06}"), format!("value-{i}"), 1 + i);
+        }
+        tree.flush_active_memtable(0)?;
+    }
+    std::fs::create_dir_all(dir.path().join("blobs"))?;
+    std::fs::write(dir.path().join("blobs").join("0"), b"operator backup")?;
+    nuke_manifest(dir.path())?;
+
+    let out = Command::new(SST_DUMP_BIN)
+        .arg(dir.path())
+        .arg("repair")
+        .output()?;
+    assert!(
+        out.status.success(),
+        "repair should exit 0, stderr: {}",
+        String::from_utf8_lossy(&out.stderr),
+    );
+
+    let tree = Config::new(
+        dir.path(),
+        SequenceNumberCounter::default(),
+        SequenceNumberCounter::default(),
+    )
+    .open()?;
+    for i in 0u64..50 {
+        assert_eq!(
+            tree.get(format!("key-{i:06}"), MAX_SEQNO)?.as_deref(),
+            Some(format!("value-{i}").as_bytes()),
+        );
+    }
     Ok(())
 }
