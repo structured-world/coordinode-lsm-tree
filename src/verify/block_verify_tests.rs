@@ -2010,7 +2010,7 @@ fn arbitrate_by_framing_keeps_a_codec_confirmed_by_another_region() -> crate::Re
             data.pos() + data.len(),
             cap,
         ),
-        Some(false),
+        CodecVerdict::Rejected,
         "the rotted trailer makes the data region reject on its own",
     );
     assert_eq!(
@@ -2059,12 +2059,12 @@ fn codec_confirms_region_skips_a_block_whose_declared_length_exceeds_the_cap() -
             end,
             cap_for_test()
         ),
-        Some(true),
+        CodecVerdict::Informative,
         "under the real cap the block is read and confirms the codec",
     );
     assert_eq!(
         codec_confirms_region(probe.as_ref(), ScrubEcc::Scheme(real), start, end, 16),
-        None,
+        CodecVerdict::NoEvidence,
         "a declared length past the cap must yield NO evidence rather than a read",
     );
     Ok(())
@@ -2202,7 +2202,7 @@ fn arbitrate_by_framing_rejects_a_split_verdict_with_no_codec_confirmation() -> 
             data.pos() + data.len(),
             cap,
         ),
-        None,
+        CodecVerdict::NoEvidence,
         "no clean block, so the codec cannot be judged — the premise of this test",
     );
     assert_eq!(
@@ -2211,6 +2211,154 @@ fn arbitrate_by_framing_rejects_a_split_verdict_with_no_codec_confirmation() -> 
         "one region framed and the other did not, with nothing to confirm the \
          codec — accepting here walks a healthy region with the wrong trailer \
          length and reports corruption that is not there",
+    );
+    Ok(())
+}
+
+/// A DEGENERATE match must not override a rejection. An impostor reproduces the
+/// all-zero parity of a uniform region, so a region full of such blocks
+/// "confirms" it while proving nothing about which codec wrote them. Letting
+/// that outrank a healthy region's explicit disagreement accepts the impostor,
+/// and the walk then recomputes the wrong parity across that healthy region and
+/// reports corruption that is not there.
+#[cfg(feature = "page_ecc")]
+#[test]
+fn arbitrate_by_framing_rejects_when_only_a_degenerate_region_agrees() -> crate::Result<()> {
+    use crate::fs::{Fs, FsOpenOptions, StdFs};
+    use crate::table::block::EccParams;
+
+    const LEN: u32 = 4096;
+    let real = EccParams::RS_4_2;
+    let impostor = EccParams::try_new(2, 1)?;
+
+    // Healthy region: only the real codec reproduces this trailer.
+    let discriminating = discriminating_payload(LEN);
+    let discriminating_parity =
+        crate::ecc::encode_parity(&discriminating, 4, 2).expect("RS(4,2) encodes");
+    // Degenerate region: identical shards, so both codecs emit the same parity.
+    let degenerate = vec![0xABu8; LEN as usize];
+    let degenerate_parity = crate::ecc::encode_parity(&degenerate, 4, 2).expect("RS(4,2) encodes");
+    assert!(
+        degenerate_parity.iter().all(|b| *b == 0),
+        "the degenerate region's trailer must be all-zero, which is what makes \
+         its agreement uninformative",
+    );
+
+    let dir = tempfile::tempdir()?;
+    let path = dir.path().join("degenerate-vs-healthy.sst");
+    write_block_archive(
+        &path,
+        &[
+            ("data", vec![(discriminating, discriminating_parity)]),
+            ("tli", vec![(degenerate, degenerate_parity)]),
+        ],
+    )?;
+
+    let mut probe = StdFs.open(&path, &FsOpenOptions::new().read(true))?;
+    let sfa_reader = crate::sfa::Reader::from_reader(&mut probe)?;
+    let toc = sfa_reader.toc();
+    let cap = block_data_length_cap(0);
+
+    let tli = toc.section(b"tli").expect("the fixture has a tli section");
+    assert_eq!(
+        codec_confirms_region(
+            probe.as_ref(),
+            ScrubEcc::Scheme(impostor),
+            tli.pos(),
+            tli.pos() + tli.len(),
+            cap,
+        ),
+        CodecVerdict::Degenerate,
+        "the impostor agrees with the all-zero region — the premise of this test",
+    );
+    assert_eq!(
+        arbitrate_by_framing(probe.as_ref(), toc, ScrubEcc::Scheme(impostor), 0, cap),
+        Some(false),
+        "the healthy region disagreed, and only a degenerate region agreed",
+    );
+    assert_eq!(
+        arbitrate_by_framing(probe.as_ref(), toc, ScrubEcc::Scheme(real), 0, cap),
+        Some(true),
+        "the real codec reproduces the healthy region's trailer",
+    );
+    Ok(())
+}
+
+/// The index TAIL mirror is its own region. The writer emits it so one damaged
+/// index copy cannot take the other down, and it is written under the SAME
+/// codec — so when the data region offers no clean block and the head's trailer
+/// is the damaged one, the intact tail still speaks for the codec. Leaving it
+/// out rejects the descriptor, marks ECC unrecognized and skips the very
+/// sections whose damage the walk was supposed to report.
+#[cfg(feature = "page_ecc")]
+#[test]
+fn arbitrate_by_framing_consults_the_tli_tail_mirror() -> crate::Result<()> {
+    use crate::fs::{Fs, FsOpenOptions, StdFs};
+    use crate::table::block::{EccParams, Header};
+
+    const LEN: u32 = 4096;
+    let real = EccParams::RS_4_2;
+
+    let data_payload = discriminating_payload(LEN);
+    let data_parity = crate::ecc::encode_parity(&data_payload, 4, 2).expect("RS(4,2) encodes");
+    // Head index copy: clean payload, ROTTED trailer.
+    let head = discriminating_payload(LEN / 2);
+    let mut head_parity = crate::ecc::encode_parity(&head, 4, 2).expect("RS(4,2) encodes");
+    *head_parity.first_mut().expect("non-empty trailer") ^= 0xFF;
+    // Tail mirror: intact, under the same codec.
+    let tail = discriminating_payload(LEN / 2);
+    let tail_parity = crate::ecc::encode_parity(&tail, 4, 2).expect("RS(4,2) encodes");
+
+    let dir = tempfile::tempdir()?;
+    let path = dir.path().join("tail-mirror.sst");
+    write_block_archive(
+        &path,
+        &[
+            ("data", vec![(data_payload, data_parity)]),
+            ("tli", vec![(head, head_parity)]),
+            ("tli_tail", vec![(tail, tail_parity)]),
+        ],
+    )?;
+
+    // Break the DATA payload's checksum so that region offers no evidence,
+    // leaving the two index copies to decide.
+    let data_pos = {
+        let mut probe = StdFs.open(&path, &FsOpenOptions::new().read(true))?;
+        let reader = crate::sfa::Reader::from_reader(&mut probe)?;
+        reader
+            .toc()
+            .section(b"data")
+            .expect("the fixture has a data section")
+            .pos()
+    };
+    {
+        let mut f = StdFs.open(&path, &FsOpenOptions::new().write(true))?;
+        f.seek(SeekFrom::Start(data_pos + Header::MIN_LEN as u64))?;
+        f.write_all(&[0xFF])?;
+    }
+
+    let mut probe = StdFs.open(&path, &FsOpenOptions::new().read(true))?;
+    let sfa_reader = crate::sfa::Reader::from_reader(&mut probe)?;
+    let toc = sfa_reader.toc();
+    let cap = block_data_length_cap(0);
+
+    let tli = toc.section(b"tli").expect("the fixture has a tli section");
+    assert_eq!(
+        codec_confirms_region(
+            probe.as_ref(),
+            ScrubEcc::Scheme(real),
+            tli.pos(),
+            tli.pos() + tli.len(),
+            cap,
+        ),
+        CodecVerdict::Rejected,
+        "the head's rotted trailer rejects on its own — the premise of this test",
+    );
+    assert_eq!(
+        arbitrate_by_framing(probe.as_ref(), toc, ScrubEcc::Scheme(real), 0, cap),
+        Some(true),
+        "the intact tail mirror confirms the codec, so the descriptor survives \
+         and the walk gets to report the head's damaged trailer",
     );
     Ok(())
 }

@@ -1180,7 +1180,15 @@ fn arbitrate_by_framing(
         let end = entry.pos().checked_add(entry.len())?;
         Some((core::cmp::max(entry.pos(), floor), end))
     };
-    let regions = [region(b"data", data_start), region(b"tli", 0)];
+    // `tli_tail` counts as its own region: the writer emits it precisely so one
+    // damaged index copy cannot take the other down with it, and it is written
+    // under the SAME codec — so an intact tail can still speak for the codec
+    // when the head's trailer is the damaged one.
+    let regions = [
+        region(b"data", data_start),
+        region(b"tli", 0),
+        region(b"tli_tail", 0),
+    ];
     let (mut judged, mut framed_any, mut framed_all) = (false, false, true);
     for (start, end) in regions.into_iter().flatten() {
         if let Some(verdict) = scheme_frames_region(file, scheme, start, end) {
@@ -1195,19 +1203,41 @@ fn arbitrate_by_framing(
     if !framed_any {
         return Some(false);
     }
-    // A region CONFIRMS when every clean block in it matches, and REJECTS when
-    // any clean block does not. A confirming region wins outright: the codec it
-    // proves is the writer's, and a region that rejected alongside it holds
-    // damage — which is the block walk's finding to report, not grounds to
-    // discard the descriptor and skip the section it lives in.
-    let mut rejected = false;
+    // Weigh what each region says about the CODEC. Neither answer is absolute:
+    // a match proves the codec only where the codecs do not coincide, and a
+    // mismatch proves a wrong codec only where the bytes are not damaged. So
+    // the two are ranked by what they can actually prove.
+    let (mut informative, mut rejected, mut degenerate) = (false, false, false);
     for (start, end) in regions.into_iter().flatten() {
         match codec_confirms_region(file, scheme, start, end, payload_cap) {
-            Some(true) => return Some(true),
-            Some(false) => rejected = true,
-            // No clean block to judge on; try the next region.
-            None => {}
+            CodecVerdict::Informative => informative = true,
+            CodecVerdict::Degenerate => degenerate = true,
+            CodecVerdict::Rejected => rejected = true,
+            CodecVerdict::NoEvidence => {}
         }
+    }
+    // An INFORMATIVE match settles it, even against a rejection elsewhere: the
+    // rejecting region holds damage, which is the block walk's finding to
+    // report rather than grounds to discard the descriptor and skip the section
+    // holding it. This is also what lets a healthy `tli_tail` speak for a
+    // damaged head — the mirrors carry the same content under the same codec.
+    if informative {
+        return Some(true);
+    }
+    // A rejection now outranks any surviving match, because every match left is
+    // DEGENERATE — the codecs coincide on that data, so it proves nothing about
+    // which one wrote it. Letting it override would accept an impostor that
+    // matched an all-zero-parity region while disagreeing with a healthy one,
+    // and the walk would then recompute the wrong parity across that healthy
+    // region and report corruption that is not there.
+    if rejected {
+        return Some(false);
+    }
+    // Only degenerate matches, and nothing disagreed: the candidate reproduces
+    // every trailer looked at. Which of the coinciding codecs wrote them cannot
+    // be told apart here, and does not matter — they agree on these bytes.
+    if degenerate {
+        return Some(true);
     }
     // Nothing confirmed the codec: no clean block anywhere, or a build without
     // the ECC codecs. Then the framing has to carry the verdict alone, and it
@@ -1224,7 +1254,38 @@ fn arbitrate_by_framing(
     if !framed_all {
         return Some(false);
     }
-    Some(!rejected)
+    Some(true)
+}
+
+/// What one region can say about a candidate ECC codec.
+///
+/// Ranked by what the evidence actually proves, which is why the arbitration
+/// does not simply count matches against mismatches.
+#[cfg(feature = "std")]
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+enum CodecVerdict {
+    /// Every clean block matched, and at least one match was over a NON-ZERO
+    /// trailer. Zero parity is what identical shards produce under XOR and
+    /// Reed-Solomon alike, so only a non-zero match distinguishes the codec
+    /// that wrote it from one that merely coincides with it.
+    Informative,
+    /// Every clean block matched, but only over all-zero trailers. Consistent
+    /// with the candidate, and equally consistent with any codec that coincides
+    /// on that data.
+    #[cfg_attr(
+        not(feature = "page_ecc"),
+        expect(
+            dead_code,
+            reason = "only the parity recomputation distinguishes a degenerate match, and it needs the ECC codecs"
+        )
+    )]
+    Degenerate,
+    /// A clean block's trailer disagreed with parity recomputed under the
+    /// candidate.
+    Rejected,
+    /// Nothing to judge on: no checksum-clean block, or a build without the ECC
+    /// codecs.
+    NoEvidence,
 }
 
 /// Whether the candidate's CODEC — not merely its trailer length — matches the
@@ -1234,15 +1295,17 @@ fn arbitrate_by_framing(
 /// Evidence comes ONLY from checksum-clean payloads: a rotted payload
 /// legitimately disagrees with its original trailer, and counting that as
 /// "wrong codec" would let damage discard a correct descriptor and hide the
-/// damage itself behind a skipped walk. `None` means no clean block was found
-/// to judge on (or this build has no ECC codecs) — inconclusive, not a verdict.
+/// damage itself behind a skipped walk.
 ///
 /// EVERY clean block must match, because a single match proves less than it
 /// looks: schemes coincide on degenerate payloads (identical shards make both
 /// XOR and Reed-Solomon emit all-zero parity), so an impostor can match the
-/// first block and diverge on the next. A lone mismatch is not a verdict
-/// either — it is what a damaged trailer looks like — which is why a region
-/// that rejects loses to one that confirms.
+/// first block and diverge on the next — or on the ninth, which is why the
+/// whole region is scanned rather than a prefix of it.
+///
+/// A match over a NON-ZERO trailer is what separates the codec that wrote it
+/// from one that merely coincides, so the two are reported apart: only the
+/// former outranks a rejection elsewhere.
 ///
 /// `payload_cap` bounds what an untrusted `data_length` may make this read: the
 /// header it comes from is not yet verified here, and a forged one paired with
@@ -1255,13 +1318,14 @@ fn codec_confirms_region(
     start: u64,
     end: u64,
     payload_cap: u64,
-) -> Option<bool> {
+) -> CodecVerdict {
     // `Off` carries no trailer, and framing already settled it: a
-    // parity-bearing table cannot frame with no trailer at all.
+    // parity-bearing table cannot frame with no trailer at all. Nothing
+    // coincides with "no parity", so the answer is conclusive.
     let params = match scheme {
-        ScrubEcc::Off => return Some(true),
+        ScrubEcc::Off => return CodecVerdict::Informative,
         ScrubEcc::Scheme(params) => params,
-        ScrubEcc::Unrecognized => return Some(false),
+        ScrubEcc::Unrecognized => return CodecVerdict::Rejected,
     };
     #[cfg(not(feature = "page_ecc"))]
     {
@@ -1269,7 +1333,7 @@ fn codec_confirms_region(
         // so a same-length impostor is behaviourally identical to the real
         // scheme here and there is nothing to confirm.
         let _ = (file, params, start, end, payload_cap);
-        None
+        CodecVerdict::NoEvidence
     }
     #[cfg(feature = "page_ecc")]
     {
@@ -1284,6 +1348,7 @@ fn codec_confirms_region(
         // reaches.
         let mut offset = start;
         let mut judged = false;
+        let mut informative = false;
         while offset < end {
             let remaining = end - offset;
             let want =
@@ -1313,9 +1378,17 @@ fn codec_confirms_region(
             if parity_len > MAX_BLOCK_DATA_LENGTH {
                 break;
             }
-            let payload_at = offset.checked_add(header_len)?;
-            let trailer_at = payload_at.checked_add(u64::from(header.data_length))?;
-            let next = trailer_at.checked_add(parity_len)?;
+            // An offset that overflows is a forged geometry, not evidence: stop
+            // walking rather than judging the codec on it.
+            let Some(payload_at) = offset.checked_add(header_len) else {
+                break;
+            };
+            let Some(trailer_at) = payload_at.checked_add(u64::from(header.data_length)) else {
+                break;
+            };
+            let Some(next) = trailer_at.checked_add(parity_len) else {
+                break;
+            };
             if next > end {
                 break;
             }
@@ -1346,13 +1419,21 @@ fn codec_confirms_region(
                     // impostor slip past a degenerate block whose parity both
                     // codecs agree on.
                     if fresh.as_deref() != Some(&trailer[..]) {
-                        return Some(false);
+                        return CodecVerdict::Rejected;
                     }
+                    // A match over an all-zero trailer is what identical shards
+                    // produce under either codec, so it carries no information
+                    // about which one wrote it. Only a non-zero one does.
+                    informative |= trailer.iter().any(|b| *b != 0);
                 }
             }
             offset = next;
         }
-        if judged { Some(true) } else { None }
+        match (judged, informative) {
+            (true, true) => CodecVerdict::Informative,
+            (true, false) => CodecVerdict::Degenerate,
+            (false, _) => CodecVerdict::NoEvidence,
+        }
     }
 }
 
