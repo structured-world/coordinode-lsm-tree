@@ -1459,6 +1459,11 @@ fn codec_confirms_region(
             ) && payload_size > 0
                 && trailer_size > 0
             {
+                // A read that fails contributes nothing and is not propagated:
+                // the walk itself reads these bytes again and reports what it
+                // finds. Skipping a block here can only cost the EXPLANATION
+                // for a mismatch, never the descriptor, since no outcome of
+                // this scan changes which scheme the walk uses.
                 let payload = crate::file::read_exact(file, payload_at, payload_size);
                 let trailer = crate::file::read_exact(file, trailer_at, trailer_size);
                 if let (Ok(payload), Ok(trailer)) = (payload, trailer)
