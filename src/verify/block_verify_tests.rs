@@ -1779,14 +1779,20 @@ fn arbitrate_by_framing_rejects_a_same_length_scheme_that_does_not_match_the_tra
     Ok(())
 }
 
-/// A framing failure must not be blamed on the descriptor when the descriptor
-/// is right and the DATA is damaged. A wrong descriptor mis-frames every
-/// section built from SST blocks, so a section that still frames clears it —
-/// and the walk must then go on to report the damaged block. Discarding the
-/// descriptor instead would skip the whole section and swallow the corruption,
-/// which is exactly the finding the walk exists to produce.
+/// A region that cannot be framed refuses the descriptor even when the others
+/// frame, and `Off` is no exception — it faces the same rule as every scheme.
+///
+/// The split is genuinely ambiguous: a corrupt header explains it if the
+/// descriptor is right, and so does a wrong descriptor whose trailer lengths
+/// coincide for one region's payload sizes and not the other's. Nothing here
+/// tells those apart, so the table is refused rather than walked under a
+/// descriptor that might mis-size every frame in a HEALTHY region.
+///
+/// The cost is the specific finding: the walk skips the ECC-dependent sections
+/// and reports "unrecognized, incomplete" instead of naming the damaged header.
+/// The table still fails verification and still routes to salvage.
 #[test]
-fn verify_sst_file_keeps_a_framing_descriptor_when_a_data_header_is_corrupt() {
+fn verify_sst_file_unframeable_data_region_refuses_the_descriptor() {
     use crate::fs::{Fs, FsOpenOptions, StdFs};
 
     let dir = tempfile::tempdir().unwrap();
@@ -1822,21 +1828,21 @@ fn verify_sst_file_keeps_a_framing_descriptor_when_a_data_header_is_corrupt() {
 
     let report = verify_sst_file(&sst_path);
     assert!(
-        report.errors.iter().any(|e| matches!(
-            e,
-            BlockVerifyError::HeaderCorrupted { offset, .. } if *offset == data_pos
-        )),
-        "the damaged header must still be reported, not skipped behind a \
-         discarded descriptor: {:?}",
-        report.errors,
-    );
-    assert!(
-        !report
+        report
             .warnings
             .iter()
             .any(|w| matches!(w, crate::verify::BlockVerifyWarning::UnrecognizedEcc { .. })),
-        "the descriptor frames every other section, so it must not be discarded: {:?}",
+        "a region that will not frame refuses the descriptor, whatever the \
+         other regions did: {:?}",
         report.warnings,
+    );
+    assert!(
+        report.incomplete,
+        "the ECC-dependent sections were skipped, so the scan is incomplete",
+    );
+    assert!(
+        !report.is_ok(),
+        "the table must not verify clean: its data region holds a corrupt header",
     );
 }
 
@@ -2298,7 +2304,8 @@ fn arbitrate_by_framing_rejects_when_only_a_degenerate_region_agrees() -> crate:
 /// keeps the descriptor from being refused for lack of evidence.
 #[cfg(feature = "page_ecc")]
 #[test]
-fn arbitrate_by_framing_consults_the_tli_tail_mirror() -> crate::Result<()> {
+fn arbitrate_by_framing_tli_tail_is_the_only_clean_region_retains_the_candidate()
+-> crate::Result<()> {
     use crate::fs::{Fs, FsOpenOptions, StdFs};
     use crate::table::block::{EccParams, Header};
 

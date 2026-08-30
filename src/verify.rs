@@ -1200,51 +1200,35 @@ fn arbitrate_by_framing(
     if !judged {
         return None;
     }
-    if !framed_any {
+    // EVERY judged region must frame, and no codec match may excuse one that
+    // does not. A region framing while another does not is either damage in the
+    // second (the descriptor is right) or a descriptor whose trailer lengths
+    // coincide for one region's payload sizes and not the other's — RS(4,2) and
+    // XOR(2,1) agree on many lengths, not all. A match cannot break that tie: it
+    // says the candidate is CONSISTENT with the bytes it read, never that it is
+    // the codec that wrote them, so it is no answer to a region that could not
+    // be framed at all.
+    if !framed_any || !framed_all {
         return Some(false);
     }
-    // ONE mismatching clean block anywhere refuses the candidate.
+    // Framing holds everywhere. ONE mismatching clean block now refuses the
+    // candidate, for the same reason: a match cannot outrank a mismatch,
+    // because the encoders are linear transforms and same-length schemes
+    // reproduce each other's trailer on some payloads while diverging on
+    // others — not only the obvious all-zero case identical shards produce.
     //
-    // A match cannot outrank a mismatch, however solid it looks. The encoders
-    // are linear transforms, so same-length schemes reproduce each other's
-    // trailer on some payloads and diverge on others — not only the obvious
-    // all-zero case that identical shards produce. So a match is evidence that
-    // the candidate is CONSISTENT with those bytes, never that it is the codec
-    // that wrote them, and it cannot answer a region that positively disagrees.
-    //
-    // The cost is a real one, taken deliberately: a table whose trailer is
-    // merely ROTTED is refused here too, so the walk skips its ECC-dependent
-    // sections and reports "unrecognized, incomplete" instead of naming the
-    // damaged block. That table still fails its verification and still routes
-    // to salvage; the reason is just less specific. The opposite error is worse
-    // by a wide margin — accepting an impostor makes the walk recompute parity
+    // The cost is real and taken deliberately: a table whose trailer is merely
+    // ROTTED is refused here too, so the walk skips its ECC-dependent sections
+    // and reports "unrecognized, incomplete" instead of naming the damaged
+    // block. That table still fails its verification and still routes to
+    // salvage; the reason is just less specific. The opposite error is worse by
+    // a wide margin — accepting an impostor makes the walk recompute parity
     // under the wrong codec and report corruption on a HEALTHY table, which
     // rewrites intact data.
-    let mut confirmed = false;
     for (start, end) in regions.into_iter().flatten() {
-        match codec_confirms_region(file, scheme, start, end, payload_cap) {
-            CodecVerdict::Rejected => return Some(false),
-            CodecVerdict::Confirmed => confirmed = true,
-            CodecVerdict::NoEvidence => {}
+        if codec_confirms_region(file, scheme, start, end, payload_cap) == CodecVerdict::Rejected {
+            return Some(false);
         }
-    }
-    if confirmed {
-        return Some(true);
-    }
-    // Nothing confirmed the codec: no clean block anywhere, or a build without
-    // the ECC codecs. Then the framing has to carry the verdict alone, and it
-    // only carries it when EVERY judged region framed.
-    //
-    // A split verdict is ambiguous without the codec: one region framing while
-    // another does not is either damage in the second (the descriptor is right)
-    // or a descriptor whose trailer lengths happen to coincide for one region's
-    // payload sizes and not the other's — RS(4,2) and XOR(2,1) agree on many
-    // lengths, not all. Guessing "right" there makes the walk consume the wrong
-    // trailer length across a HEALTHY region and report corruption that is not
-    // there, which is the more destructive way to be wrong: it routes an intact
-    // table to salvage. Fail to unrecognized instead.
-    if !framed_all {
-        return Some(false);
     }
     Some(true)
 }
@@ -1260,6 +1244,13 @@ enum CodecVerdict {
     /// candidate. Says the candidate is CONSISTENT with these bytes — not that
     /// it is the codec that wrote them, since same-length schemes reproduce
     /// each other's trailer on some payloads.
+    #[cfg_attr(
+        not(feature = "page_ecc"),
+        expect(
+            dead_code,
+            reason = "recomputing parity is what produces a match, and it needs the ECC codecs"
+        )
+    )]
     Confirmed,
     /// A clean block's trailer disagreed with parity recomputed under the
     /// candidate.
@@ -1302,11 +1293,13 @@ fn codec_confirms_region(
     end: u64,
     payload_cap: u64,
 ) -> CodecVerdict {
-    // `Off` carries no trailer, and framing already settled it: a
-    // parity-bearing table cannot frame with no trailer at all. Nothing
-    // coincides with "no parity", so the answer is conclusive.
+    // `Off` carries no trailer, so there is nothing to recompute — framing
+    // decides it, and a parity-bearing table cannot frame with no trailer at
+    // all. Reporting no evidence rather than a confirmation keeps it under the
+    // caller's framing rules, the split-verdict refusal included; claiming a
+    // confirmation would exempt `Off` from a check every other scheme faces.
     let params = match scheme {
-        ScrubEcc::Off => return CodecVerdict::Confirmed,
+        ScrubEcc::Off => return CodecVerdict::NoEvidence,
         ScrubEcc::Scheme(params) => params,
         ScrubEcc::Unrecognized => return CodecVerdict::Rejected,
     };
