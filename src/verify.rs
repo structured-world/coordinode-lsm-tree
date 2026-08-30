@@ -1148,13 +1148,25 @@ enum ScrubEcc {
     Unrecognized,
 }
 
-/// Judges a candidate ECC descriptor against the SST's own block framing.
+/// Judges a candidate ECC descriptor against the SST's own blocks.
 ///
-/// Tries the DATA section first, from `data_start` so a restricted view's
-/// punched prefix is excluded, and falls back to the top-level index when the
-/// data region has no frames to judge (both are SST blocks, which carry no
-/// `block_flags` byte and so take their parity sizing from this descriptor).
-/// `None` when neither region can arbitrate.
+/// Two questions, because framing answers only the first:
+///
+/// 1. **Does it frame?** A descriptor that mis-states the scheme derives the
+///    wrong trailer length and mis-frames EVERY section built from SST blocks.
+///    Both the data region (from `data_start`, so a restricted view's punched
+///    prefix stays out) and the top-level index are tried, and framing ANYWHERE
+///    clears the descriptor: a section that does not frame while another does is
+///    damaged data, not a wrong descriptor, and must stay the block walk's
+///    finding rather than being swallowed as a descriptor problem.
+/// 2. **Is it the right codec?** Framing pins the trailer LENGTH only, and
+///    distinct schemes share lengths — RS(4,2) and XOR(2,1) agree on every
+///    payload whose `ceil(N/4)` and `ceil(N/2)` are both even. Accepting a
+///    same-length impostor makes the walk recompute parity under the wrong
+///    codec and report `EccParityMismatch` on a healthy table, so the trailer
+///    bytes themselves have the last word.
+///
+/// `None` when no region holds frames to judge.
 #[cfg(feature = "std")]
 fn arbitrate_by_framing(
     file: &dyn crate::fs::FsFile,
@@ -1167,13 +1179,129 @@ fn arbitrate_by_framing(
         let end = entry.pos().checked_add(entry.len())?;
         Some((core::cmp::max(entry.pos(), floor), end))
     };
-    if let Some((start, end)) = region(b"data", data_start)
-        && let Some(verdict) = scheme_frames_region(file, scheme, start, end)
-    {
-        return Some(verdict);
+    let regions = [region(b"data", data_start), region(b"tli", 0)];
+    let mut framed_anywhere = None;
+    for (start, end) in regions.into_iter().flatten() {
+        if let Some(verdict) = scheme_frames_region(file, scheme, start, end) {
+            framed_anywhere = Some(framed_anywhere.unwrap_or(false) || verdict);
+        }
     }
-    let (start, end) = region(b"tli", 0)?;
-    scheme_frames_region(file, scheme, start, end)
+    if !framed_anywhere? {
+        return Some(false);
+    }
+    for (start, end) in regions.into_iter().flatten() {
+        match codec_confirms_region(file, scheme, start, end) {
+            // The trailer bytes match parity recomputed under the candidate:
+            // it is the codec the writer used.
+            Some(true) => return Some(true),
+            Some(false) => return Some(false),
+            // No checksum-clean block to judge on; try the next region.
+            None => {}
+        }
+    }
+    // Framed, but nothing could confirm the codec (no clean block, or a build
+    // without the ECC codecs). Nothing downstream recomputes parity in that
+    // case either, so the framed descriptor stands.
+    Some(true)
+}
+
+/// Whether the candidate's CODEC — not merely its trailer length — matches the
+/// bytes: parity recomputed over a block's payload must equal the trailer the
+/// writer stored.
+///
+/// Evidence comes ONLY from checksum-clean payloads: a rotted payload
+/// legitimately disagrees with its original trailer, and counting that as
+/// "wrong codec" would let damage discard a correct descriptor and hide the
+/// damage itself behind a skipped walk. `None` means no clean block was found
+/// to judge on (or this build has no ECC codecs) — inconclusive, not a verdict.
+///
+/// One matching block settles it: a wrong codec cannot reproduce the stored
+/// parity, while a right one fails only on blocks that are themselves damaged.
+#[cfg(feature = "std")]
+fn codec_confirms_region(
+    file: &dyn crate::fs::FsFile,
+    scheme: ScrubEcc,
+    start: u64,
+    end: u64,
+) -> Option<bool> {
+    // `Off` carries no trailer, and framing already settled it: a
+    // parity-bearing table cannot frame with no trailer at all.
+    let params = match scheme {
+        ScrubEcc::Off => return Some(true),
+        ScrubEcc::Scheme(params) => params,
+        ScrubEcc::Unrecognized => return Some(false),
+    };
+    #[cfg(not(feature = "page_ecc"))]
+    {
+        // No codecs to recompute with. The walk cannot recompute parity either,
+        // so a same-length impostor is behaviourally identical to the real
+        // scheme here and there is nothing to confirm.
+        let _ = (file, params, start, end);
+        None
+    }
+    #[cfg(feature = "page_ecc")]
+    {
+        use crate::table::block::Header;
+
+        // A handful of blocks is plenty: the first clean one decides, and a
+        // table whose whole prefix is damaged has bigger findings coming from
+        // the walk itself.
+        const MAX_BLOCKS: usize = 8;
+        let mut offset = start;
+        let mut judged = false;
+        for _ in 0..MAX_BLOCKS {
+            if offset >= end {
+                break;
+            }
+            let remaining = end - offset;
+            let want =
+                usize::try_from(remaining).map_or(Header::MAX_LEN, |r| r.min(Header::MAX_LEN));
+            let Ok(buf) = crate::file::read_exact(file, offset, want) else {
+                break;
+            };
+            let Ok(header) = Header::decode_from(&mut &buf[..]) else {
+                break;
+            };
+            let header_len = Header::header_len(header.block_type) as u64;
+            let parity_bytes = crate::table::block::expected_parity_len(header.data_length, params);
+            let parity_len = u64::from(parity_bytes);
+            let payload_at = offset.checked_add(header_len)?;
+            let trailer_at = payload_at.checked_add(u64::from(header.data_length))?;
+            let next = trailer_at.checked_add(parity_len)?;
+            if next > end {
+                break;
+            }
+            if let (Ok(payload_size), Ok(trailer_size)) = (
+                usize::try_from(header.data_length),
+                usize::try_from(parity_bytes),
+            ) && payload_size > 0
+                && trailer_size > 0
+            {
+                let payload = crate::file::read_exact(file, payload_at, payload_size);
+                let trailer = crate::file::read_exact(file, trailer_at, trailer_size);
+                if let (Ok(payload), Ok(trailer)) = (payload, trailer)
+                    // Only a checksum-clean payload is evidence about the codec.
+                    && Checksum::from_raw(crate::hash::hash128(&payload)) == header.checksum
+                {
+                    judged = true;
+                    let fresh = match params {
+                        crate::table::block::EccParams::Secded => {
+                            Some(crate::secded::encode_block_parity(&payload))
+                        }
+                        crate::table::block::EccParams::Shard { .. } => {
+                            let (ds, ps) = params.as_shards();
+                            crate::ecc::encode_parity(&payload, ds, ps).ok()
+                        }
+                    };
+                    if fresh.as_deref() == Some(&trailer[..]) {
+                        return Some(true);
+                    }
+                }
+            }
+            offset = next;
+        }
+        if judged { Some(false) } else { None }
+    }
 }
 
 /// Whether `scheme` sizes an SST block region's frames CONSISTENTLY: walking

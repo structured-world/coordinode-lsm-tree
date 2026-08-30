@@ -1672,3 +1672,159 @@ fn verify_sst_file_lone_recognized_mirror_that_frames_stays_authoritative() {
         "a descriptor-only forge on one mirror must not condemn a healthy table",
     );
 }
+
+/// Framing pins the trailer LENGTH, never the codec. RS(4,2) and XOR(2,1)
+/// derive the SAME parity length for any payload whose `ceil(N/4)` and
+/// `ceil(N/2)` are both even, so a mirror re-stamped from one to the other
+/// frames perfectly. Accepting the impostor makes the walk recompute parity
+/// under the wrong codec and report `EccParityMismatch` on a healthy table, so
+/// the arbitration must go on to the trailer BYTES: both schemes frame, only
+/// the real one confirms.
+#[cfg(feature = "page_ecc")]
+#[test]
+fn arbitrate_by_framing_rejects_a_same_length_scheme_that_does_not_match_the_trailer()
+-> crate::Result<()> {
+    use crate::coding::Encode;
+    use crate::fs::{Fs, FsOpenOptions, StdFs};
+    use crate::table::block::{BlockType, EccParams, Header, expected_parity_len};
+
+    let real = EccParams::RS_4_2;
+    let impostor = EccParams::try_new(2, 1)?;
+    // The collision this test exists for: pick a payload length the two schemes
+    // size identically, so framing alone cannot separate them.
+    const DATA_LENGTH: u32 = 4096;
+    assert_eq!(
+        expected_parity_len(DATA_LENGTH, real),
+        expected_parity_len(DATA_LENGTH, impostor),
+        "the fixture must exercise a length collision, or it proves nothing",
+    );
+
+    // Period 251: it divides neither shard size (1024 under RS(4,2), 2048 under
+    // XOR(2,1)), so the shards differ from each other. A uniform payload makes
+    // every shard identical, and BOTH codecs then emit all-zero parity — which
+    // would let the impostor pass for the wrong reason.
+    let payload: Vec<u8> = (0..DATA_LENGTH).map(|i| (i % 251) as u8).collect();
+    let parity = crate::ecc::encode_parity(&payload, 4, 2).expect("RS(4,2) encodes the fixture");
+    let header = Header {
+        checksum: Checksum::from_raw(crate::hash::hash128(&payload)),
+        data_length: DATA_LENGTH,
+        uncompressed_length: DATA_LENGTH,
+        ..Header::test_dummy(BlockType::Data)
+    };
+
+    let mut archive_bytes: Vec<u8> = Vec::new();
+    {
+        let mut writer = crate::sfa::Writer::from_writer(std::io::Cursor::new(&mut archive_bytes));
+        writer.start("data").unwrap();
+        writer.write_all(&header.encode_into_vec()).unwrap();
+        writer.write_all(&payload).unwrap();
+        writer.write_all(&parity).unwrap();
+        writer.finish().unwrap();
+    }
+
+    let dir = tempfile::tempdir()?;
+    let fs = StdFs;
+    let path = dir.path().join("rs42.sst");
+    {
+        let mut f = fs.open(
+            &path,
+            &FsOpenOptions::new().write(true).create(true).truncate(true),
+        )?;
+        f.write_all(&archive_bytes)?;
+    }
+
+    let mut probe = fs.open(&path, &FsOpenOptions::new().read(true))?;
+    let sfa_reader = crate::sfa::Reader::from_reader(&mut probe)?;
+    let toc = sfa_reader.toc();
+    let entry = toc
+        .section(b"data")
+        .expect("the fixture has a data section");
+    let (start, end) = (entry.pos(), entry.pos() + entry.len());
+
+    // Both schemes frame the section: that is exactly the blind spot.
+    assert_eq!(
+        scheme_frames_region(probe.as_ref(), ScrubEcc::Scheme(real), start, end),
+        Some(true),
+        "the real scheme must frame its own block",
+    );
+    assert_eq!(
+        scheme_frames_region(probe.as_ref(), ScrubEcc::Scheme(impostor), start, end),
+        Some(true),
+        "the same-length impostor frames identically — framing cannot separate them",
+    );
+
+    // The trailer bytes separate them.
+    assert_eq!(
+        arbitrate_by_framing(probe.as_ref(), toc, ScrubEcc::Scheme(real), 0),
+        Some(true),
+        "the scheme whose parity matches the trailer is authoritative",
+    );
+    assert_eq!(
+        arbitrate_by_framing(probe.as_ref(), toc, ScrubEcc::Scheme(impostor), 0),
+        Some(false),
+        "a same-length scheme whose parity does NOT match must fail safe, or the \
+         walk recomputes parity under it and condemns a healthy table",
+    );
+    Ok(())
+}
+
+/// A framing failure must not be blamed on the descriptor when the descriptor
+/// is right and the DATA is damaged. A wrong descriptor mis-frames every
+/// section built from SST blocks, so a section that still frames clears it —
+/// and the walk must then go on to report the damaged block. Discarding the
+/// descriptor instead would skip the whole section and swallow the corruption,
+/// which is exactly the finding the walk exists to produce.
+#[test]
+fn verify_sst_file_keeps_a_framing_descriptor_when_a_data_header_is_corrupt() {
+    use crate::fs::{Fs, FsOpenOptions, StdFs};
+
+    let dir = tempfile::tempdir().unwrap();
+    populate_tree(dir.path(), 200);
+    let sst_path = pick_first_sst_path(dir.path());
+
+    // One mirror's descriptor goes to an unknown kind, so the surviving
+    // recognized copy has to be arbitrated rather than trusted outright.
+    crate::test_forge::forge_tail_meta_value(&sst_path, b"descriptor#page_ecc", &[9, 0, 0, 0])
+        .unwrap();
+
+    // Corrupt the FIRST data block's header in place: the data region no longer
+    // frames, while every other section still does.
+    let fs = StdFs;
+    let data_pos = {
+        let mut probe = fs
+            .open(&sst_path, &FsOpenOptions::new().read(true))
+            .unwrap();
+        let reader = crate::sfa::Reader::from_reader(&mut probe).unwrap();
+        reader
+            .toc()
+            .section(b"data")
+            .expect("the SST has a data section")
+            .pos()
+    };
+    {
+        let mut f = fs
+            .open(&sst_path, &FsOpenOptions::new().write(true))
+            .unwrap();
+        f.seek(SeekFrom::Start(data_pos)).unwrap();
+        f.write_all(&[0xFFu8; 16]).unwrap();
+    }
+
+    let report = verify_sst_file(&sst_path);
+    assert!(
+        report.errors.iter().any(|e| matches!(
+            e,
+            BlockVerifyError::HeaderCorrupted { offset, .. } if *offset == data_pos
+        )),
+        "the damaged header must still be reported, not skipped behind a \
+         discarded descriptor: {:?}",
+        report.errors,
+    );
+    assert!(
+        !report
+            .warnings
+            .iter()
+            .any(|w| matches!(w, crate::verify::BlockVerifyWarning::UnrecognizedEcc { .. })),
+        "the descriptor frames every other section, so it must not be discarded: {:?}",
+        report.warnings,
+    );
+}
