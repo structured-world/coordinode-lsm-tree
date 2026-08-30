@@ -620,17 +620,47 @@ fn verify_sst_file_flags_diverging_mirrors_behind_an_unrecognized_ecc() {
     );
 }
 
-/// A table whose BOTH meta mirrors advertise an UNRECOGNIZED ECC descriptor (they
-/// agree, so no divergence) cannot have its ECC-bearing SST sections walked: the
-/// parity-trailer length is underivable, so the block walk SKIPS the data blocks
-/// entirely. The scan verified NOTHING about the data, so the report must be
-/// INCOMPLETE and `is_ok()` must be false — a clean verdict would falsely claim
-/// the data verified. The unrecognized-ECC warning is still recorded.
+/// A table that REALLY carries parity and whose both meta mirrors advertise an
+/// unrecognized ECC descriptor (they agree, so no divergence) cannot have its
+/// ECC-bearing sections walked: the trailer length is underivable, and the one
+/// remaining candidate — `Off` — cannot frame a file whose blocks each carry a
+/// trailer. The walk SKIPS those sections, so the report must be INCOMPLETE and
+/// `is_ok()` false; a clean verdict would falsely claim the data verified.
+///
+/// The parity is what makes this table unreadable rather than the descriptors:
+/// on a parity-LESS table the same forge is survivable, because `Off` frames it
+/// end to end.
+#[cfg(feature = "page_ecc")]
 #[test]
 fn verify_sst_file_reports_incomplete_when_ecc_is_unrecognized_in_both_mirrors() {
+    use crate::table::Writer;
+    use crate::table::block::EccParams;
+
     let dir = tempfile::tempdir().unwrap();
-    populate_tree(dir.path(), 200);
-    let sst_path = pick_first_sst_path(dir.path());
+    let sst_path = dir.path().join("t");
+
+    let mut writer = Writer::new(
+        sst_path.clone(),
+        0,
+        0,
+        std::sync::Arc::new(crate::fs::StdFs),
+    )
+    .unwrap()
+    .use_ecc(Some(EccParams::RS_4_2));
+    for i in 0u64..200 {
+        writer
+            .write(crate::InternalValue::from_components(
+                format!("key-{i:05}").into_bytes(),
+                format!("value-{i:05}").into_bytes(),
+                i + 1,
+                crate::ValueType::Value,
+            ))
+            .unwrap();
+    }
+    assert!(
+        writer.finish().unwrap().is_some(),
+        "the fixture is non-empty"
+    );
 
     // Sanity: intact file verifies clean.
     let report = verify_sst_file(&sst_path);
@@ -1673,17 +1703,81 @@ fn verify_sst_file_lone_recognized_mirror_that_frames_stays_authoritative() {
     );
 }
 
+/// BOTH mirrors reading as unknown kinds does not make a table unreadable.
+/// `Off` is a descriptor like any other — it frames the blocks or it does not —
+/// and most tables carry no parity at all, so it is tried before giving up.
+/// Without it such a table is skipped section by section and, if it carries
+/// range tombstones salvage cannot re-emit, dropped outright: a total loss of
+/// its key range over two bytes that say nothing about the data.
+#[test]
+fn verify_sst_file_both_mirrors_unrecognized_falls_back_to_off() {
+    use crate::table::Writer;
+
+    let dir = tempfile::tempdir().unwrap();
+    let path = dir.path().join("t");
+
+    let mut writer = Writer::new(path.clone(), 0, 0, std::sync::Arc::new(crate::fs::StdFs))
+        .unwrap()
+        .use_ecc(None);
+    for i in 0u64..200 {
+        writer
+            .write(crate::InternalValue::from_components(
+                format!("key-{i:05}").into_bytes(),
+                format!("value-{i:05}").into_bytes(),
+                i + 1,
+                crate::ValueType::Value,
+            ))
+            .unwrap();
+    }
+    assert!(
+        writer.finish().unwrap().is_some(),
+        "the fixture is non-empty"
+    );
+
+    let report = verify_sst_file(&path);
+    assert!(
+        report.is_ok(),
+        "an intact parity-less table must verify clean: {:?}",
+        report.errors,
+    );
+
+    // Both mirrors go to unknown kinds, so no recognized descriptor survives.
+    crate::test_forge::forge_mid_meta_value(&path, b"descriptor#page_ecc", &[9, 0, 0, 0]).unwrap();
+    crate::test_forge::forge_tail_meta_value(&path, b"descriptor#page_ecc", &[8, 0, 0, 0]).unwrap();
+
+    let report = verify_sst_file(&path);
+    assert!(
+        report.errors.is_empty(),
+        "the blocks are untouched: {:?}",
+        report.errors,
+    );
+    assert!(
+        !report
+            .warnings
+            .iter()
+            .any(|w| matches!(w, crate::verify::BlockVerifyWarning::UnrecognizedEcc { .. })),
+        "the file frames without a trailer, which answers the question the \
+         descriptors no longer can: {:?}",
+        report.warnings,
+    );
+    assert!(
+        !report.incomplete,
+        "every section was walked, so nothing is left unverified — the whole \
+         point of trying `Off` rather than giving up",
+    );
+}
+
 /// Framing pins the trailer LENGTH, never the codec. RS(4,2) and XOR(2,1)
 /// derive the SAME parity length for any payload whose `ceil(N/4)` and
 /// `ceil(N/2)` are both even, so a mirror re-stamped from one to the other
-/// frames perfectly. Accepting the impostor makes the walk recompute parity
-/// under the wrong codec and report `EccParityMismatch` on a healthy table, so
-/// the arbitration must go on to the trailer BYTES: both schemes frame, only
-/// the real one confirms.
+/// frames perfectly and the descriptor is KEPT — the walk needs the length, and
+/// the length is right.
+///
+/// What the codec question answers is only which explanation to print: the
+/// impostor disagrees with the trailer bytes, the real scheme reproduces them.
 #[cfg(feature = "page_ecc")]
 #[test]
-fn arbitrate_by_framing_rejects_a_same_length_scheme_that_does_not_match_the_trailer()
--> crate::Result<()> {
+fn codec_disagrees_everywhere_same_length_scheme_is_flagged_but_not_refused() -> crate::Result<()> {
     use crate::coding::Encode;
     use crate::fs::{Fs, FsOpenOptions, StdFs};
     use crate::table::block::{BlockType, EccParams, Header, expected_parity_len};
@@ -1752,29 +1846,31 @@ fn arbitrate_by_framing_rejects_a_same_length_scheme_that_does_not_match_the_tra
         "the same-length impostor frames identically — framing cannot separate them",
     );
 
-    // The trailer bytes separate them.
+    // BOTH are kept: the length is what the walk needs, and both get it right.
+    // Refusing the impostor here would skip every ECC-bearing section, and a
+    // table carrying range tombstones is then excluded outright.
+    let cap = block_data_length_cap(0);
     assert_eq!(
-        arbitrate_by_framing(
-            probe.as_ref(),
-            toc,
-            ScrubEcc::Scheme(real),
-            0,
-            block_data_length_cap(0),
-        ),
+        arbitrate_by_framing(probe.as_ref(), toc, ScrubEcc::Scheme(real), 0),
         Some(true),
-        "the scheme whose parity matches the trailer is authoritative",
+        "the real scheme sizes its own blocks",
     );
     assert_eq!(
-        arbitrate_by_framing(
-            probe.as_ref(),
-            toc,
-            ScrubEcc::Scheme(impostor),
-            0,
-            block_data_length_cap(0),
-        ),
-        Some(false),
-        "a same-length scheme whose parity does NOT match must fail safe, or the \
-         walk recomputes parity under it and condemns a healthy table",
+        arbitrate_by_framing(probe.as_ref(), toc, ScrubEcc::Scheme(impostor), 0),
+        Some(true),
+        "the impostor sizes them identically, so the walk can still proceed — \
+         refusing it would cost the whole table for a parity question",
+    );
+
+    // The trailer bytes separate them, and that difference is reported.
+    assert!(
+        !codec_disagrees_everywhere(probe.as_ref(), toc, ScrubEcc::Scheme(real), 0, cap),
+        "the real scheme reproduces the trailer, so nothing is suspect",
+    );
+    assert!(
+        codec_disagrees_everywhere(probe.as_ref(), toc, ScrubEcc::Scheme(impostor), 0, cap),
+        "the impostor reproduces no trailer — the signature of a mis-identified \
+         scheme, which is what the operator is told",
     );
     Ok(())
 }
@@ -1906,13 +2002,13 @@ fn discriminating_payload(len: u32) -> Vec<u8> {
 /// One matching block is not proof of the codec: schemes COINCIDE on degenerate
 /// payloads. A uniform block makes every shard identical, and both RS(4,2) and
 /// XOR(2,1) then emit all-zero parity — so an impostor matches it and diverges
-/// on the next block. The arbitration must keep sampling: every clean block has
-/// to match, or a table walked under the impostor reports `EccParityMismatch`
-/// on healthy later blocks.
+/// on the next block. The region is therefore scanned to its end: stopping at
+/// the first match would call the impostor confirmed and leave the operator
+/// without the one hint that explains the mismatches the walk is about to
+/// report.
 #[cfg(feature = "page_ecc")]
 #[test]
-fn arbitrate_by_framing_rejects_an_impostor_that_matches_only_a_degenerate_block()
--> crate::Result<()> {
+fn codec_confirms_region_keeps_scanning_past_a_degenerate_block() -> crate::Result<()> {
     use crate::fs::{Fs, FsOpenOptions, StdFs};
     use crate::table::block::EccParams;
 
@@ -1953,35 +2049,41 @@ fn arbitrate_by_framing_rejects_an_impostor_that_matches_only_a_degenerate_block
     let toc = sfa_reader.toc();
     let cap = block_data_length_cap(0);
 
+    let data = toc
+        .section(b"data")
+        .expect("the fixture has a data section");
+    let (start, end) = (data.pos(), data.pos() + data.len());
+
     assert_eq!(
-        arbitrate_by_framing(probe.as_ref(), toc, ScrubEcc::Scheme(real), 0, cap),
-        Some(true),
+        codec_confirms_region(probe.as_ref(), ScrubEcc::Scheme(real), start, end, cap),
+        CodecVerdict::Confirmed,
         "the real codec reproduces both trailers",
     );
     assert_eq!(
-        arbitrate_by_framing(probe.as_ref(), toc, ScrubEcc::Scheme(impostor), 0, cap),
-        Some(false),
-        "the impostor agrees only on the degenerate block — accepting it there \
-         makes the walk condemn the healthy second block",
+        codec_confirms_region(probe.as_ref(), ScrubEcc::Scheme(impostor), start, end, cap),
+        CodecVerdict::Rejected,
+        "the impostor agrees only on the degenerate block, and a scan that \
+         stopped there would call it confirmed",
+    );
+    assert!(
+        codec_disagrees_everywhere(probe.as_ref(), toc, ScrubEcc::Scheme(impostor), 0, cap),
+        "with the region rejecting and nothing confirming, the descriptor is \
+         reported as suspect",
     );
     Ok(())
 }
 
-/// A rotted trailer refuses the candidate even though another region agrees
-/// with it. Agreement cannot answer positive disagreement: same-length schemes
-/// reproduce each other's trailer on some payloads, so the agreeing region may
-/// be a coincidence while the disagreeing one is real.
+/// A rotted trailer is damage, not a verdict on the descriptor. The table keeps
+/// its scheme, the walk reads the section, and the damaged block is named as
+/// `EccParityMismatch` — which parity may still repair. Refusing the descriptor
+/// here would skip the section instead, and a table carrying range tombstones
+/// would then be excluded outright over one damaged trailer.
 ///
-/// The cost is deliberate. This table's trailer is merely damaged, and the walk
-/// now skips its ECC-dependent sections and reports "unrecognized, incomplete"
-/// rather than naming the block. It still fails verification and still routes
-/// to salvage — only the reason is less specific. The opposite error would
-/// accept an impostor and report corruption on HEALTHY data, which rewrites
-/// intact tables.
+/// It is not reported as suspect either: another region reproduces the trailer,
+/// so the scheme is not the explanation for this one.
 #[cfg(feature = "page_ecc")]
 #[test]
-fn arbitrate_by_framing_rejects_a_rotted_trailer_despite_another_region_agreeing()
--> crate::Result<()> {
+fn rotted_trailer_keeps_the_descriptor_and_is_not_reported_suspect() -> crate::Result<()> {
     use crate::fs::{Fs, FsOpenOptions, StdFs};
     use crate::table::block::EccParams;
 
@@ -2027,9 +2129,15 @@ fn arbitrate_by_framing_rejects_a_rotted_trailer_despite_another_region_agreeing
         "the rotted trailer makes the data region reject on its own",
     );
     assert_eq!(
-        arbitrate_by_framing(probe.as_ref(), toc, ScrubEcc::Scheme(real), 0, cap),
-        Some(false),
-        "the other region's agreement does not answer this one's disagreement",
+        arbitrate_by_framing(probe.as_ref(), toc, ScrubEcc::Scheme(real), 0),
+        Some(true),
+        "damage does not change the trailer LENGTH, so the walk can still read \
+         the section and name the damaged block",
+    );
+    assert!(
+        !codec_disagrees_everywhere(probe.as_ref(), toc, ScrubEcc::Scheme(real), 0, cap),
+        "a region that reproduces the trailer rules the scheme out as the \
+         explanation, leaving the mismatch reported as what it is: damage",
     );
     Ok(())
 }
@@ -2090,12 +2198,12 @@ fn cap_for_test() -> u64 {
 
 /// "Every clean block matches" cannot be delivered by a bounded prefix. An
 /// impostor that agrees on a run of degenerate blocks and diverges past the
-/// bound would be confirmed, and the walk would then report that divergence as
-/// damage on an otherwise healthy table. Nine blocks: eight uniform (the two
-/// codecs agree on those) and a ninth that discriminates.
+/// bound would read as confirmed, and the mismatches the walk goes on to report
+/// would lose the one hint that explains them. Nine blocks: eight uniform (the
+/// two codecs agree on those) and a ninth that discriminates.
 #[cfg(feature = "page_ecc")]
 #[test]
-fn arbitrate_by_framing_rejects_an_impostor_that_diverges_past_a_prefix() -> crate::Result<()> {
+fn codec_confirms_region_scans_past_a_degenerate_prefix() -> crate::Result<()> {
     use crate::fs::{Fs, FsOpenOptions, StdFs};
     use crate::table::block::EccParams;
 
@@ -2131,31 +2239,33 @@ fn arbitrate_by_framing_rejects_an_impostor_that_diverges_past_a_prefix() -> cra
     let toc = sfa_reader.toc();
     let cap = block_data_length_cap(0);
 
+    let data = toc
+        .section(b"data")
+        .expect("the fixture has a data section");
+    let (start, end) = (data.pos(), data.pos() + data.len());
+
     assert_eq!(
-        arbitrate_by_framing(probe.as_ref(), toc, ScrubEcc::Scheme(real), 0, cap),
-        Some(true),
+        codec_confirms_region(probe.as_ref(), ScrubEcc::Scheme(real), start, end, cap),
+        CodecVerdict::Confirmed,
         "the real codec reproduces every trailer",
     );
     assert_eq!(
-        arbitrate_by_framing(probe.as_ref(), toc, ScrubEcc::Scheme(impostor), 0, cap),
-        Some(false),
-        "the impostor diverges on the ninth block — a sample that stops earlier \
-         confirms it and leaves the walk to condemn a healthy table",
+        codec_confirms_region(probe.as_ref(), ScrubEcc::Scheme(impostor), start, end, cap),
+        CodecVerdict::Rejected,
+        "the impostor diverges on the ninth block, which a sample stopping \
+         earlier would never see",
     );
     Ok(())
 }
 
-/// With no codec confirmation available — a build without the ECC codecs, or a
-/// region with no checksum-clean block — the framing has to carry the verdict
-/// alone, and it only carries it when EVERY judged region framed. A split
-/// verdict is ambiguous: either the non-framing region is damaged, or the
-/// descriptor's trailer lengths coincide for one region's payload sizes and not
-/// the other's. Guessing "right" makes the walk consume the wrong trailer length
-/// across a HEALTHY region and report corruption that is not there, so a split
-/// must fail safe to unrecognized.
+/// Framing carries the verdict, and it only carries it when EVERY judged region
+/// framed. A split verdict says the descriptor sizes one region's blocks and
+/// not another's, and a length that is wrong ANYWHERE is not a length the walk
+/// can advance on: it consumes the wrong trailer across that region and reports
+/// corruption that is not there. So a split fails safe to unrecognized.
 #[cfg(feature = "page_ecc")]
 #[test]
-fn arbitrate_by_framing_rejects_a_split_verdict_with_no_codec_confirmation() -> crate::Result<()> {
+fn arbitrate_by_framing_rejects_a_split_verdict() -> crate::Result<()> {
     use crate::fs::{Fs, FsOpenOptions, StdFs};
     use crate::table::block::{EccParams, Header};
 
@@ -2215,27 +2325,28 @@ fn arbitrate_by_framing_rejects_a_split_verdict_with_no_codec_confirmation() -> 
             cap,
         ),
         CodecVerdict::NoEvidence,
-        "no clean block, so the codec cannot be judged — the premise of this test",
+        "no clean block, so the codec has nothing to say here either",
     );
     assert_eq!(
-        arbitrate_by_framing(probe.as_ref(), toc, ScrubEcc::Scheme(real), 0, cap),
+        arbitrate_by_framing(probe.as_ref(), toc, ScrubEcc::Scheme(real), 0),
         Some(false),
-        "one region framed and the other did not, with nothing to confirm the \
-         codec — accepting here walks a healthy region with the wrong trailer \
-         length and reports corruption that is not there",
+        "one region framed and the other did not — accepting here walks a \
+         region with the wrong trailer length and reports corruption that is \
+         not there",
     );
     Ok(())
 }
 
-/// A DEGENERATE match must not override a rejection. An impostor reproduces the
-/// all-zero parity of a uniform region, so a region full of such blocks
-/// "confirms" it while proving nothing about which codec wrote them. Letting
-/// that outrank a healthy region's explicit disagreement accepts the impostor,
-/// and the walk then recomputes the wrong parity across that healthy region and
-/// reports corruption that is not there.
+/// A single agreement silences the report even when it proves nothing: an
+/// impostor reproduces the all-zero parity of a uniform region, so such a
+/// region "confirms" any codec. The claim the warning makes is "no trailer
+/// anywhere is reproduced, which is what a mis-identified scheme looks like",
+/// and one reproduced trailer, informative or not, is enough to make that claim
+/// false. A mixed picture stays unreported rather than being narrated as a
+/// scheme problem the operator would then chase.
 #[cfg(feature = "page_ecc")]
 #[test]
-fn arbitrate_by_framing_rejects_when_only_a_degenerate_region_agrees() -> crate::Result<()> {
+fn codec_disagrees_everywhere_is_silenced_by_any_agreement() -> crate::Result<()> {
     use crate::fs::{Fs, FsOpenOptions, StdFs};
     use crate::table::block::EccParams;
 
@@ -2283,16 +2394,15 @@ fn arbitrate_by_framing_rejects_when_only_a_degenerate_region_agrees() -> crate:
         CodecVerdict::Confirmed,
         "the impostor agrees with the all-zero region — the premise of this test",
     );
-    assert_eq!(
-        arbitrate_by_framing(probe.as_ref(), toc, ScrubEcc::Scheme(impostor), 0, cap),
-        Some(false),
-        "one region agreed and another positively disagreed — agreement never \
-         answers disagreement, whatever the trailer looked like",
+    assert!(
+        !codec_disagrees_everywhere(probe.as_ref(), toc, ScrubEcc::Scheme(impostor), 0, cap),
+        "one region disagreed and another agreed, so the report's claim does \
+         not hold and it stays silent",
     );
     assert_eq!(
-        arbitrate_by_framing(probe.as_ref(), toc, ScrubEcc::Scheme(real), 0, cap),
+        arbitrate_by_framing(probe.as_ref(), toc, ScrubEcc::Scheme(real), 0),
         Some(true),
-        "the real codec reproduces the healthy region's trailer",
+        "the real scheme sizes both regions",
     );
     Ok(())
 }
@@ -2300,12 +2410,11 @@ fn arbitrate_by_framing_rejects_when_only_a_degenerate_region_agrees() -> crate:
 /// The index TAIL mirror is its own region, and it can be the ONLY one able to
 /// speak. The writer emits it so a damaged index copy cannot take the other
 /// down, and it is written under the same codec — so when neither the data
-/// region nor the head offers a checksum-clean block, the intact tail is what
-/// keeps the descriptor from being refused for lack of evidence.
+/// region nor the head offers a checksum-clean block, the tail is the only
+/// place the codec question can be answered at all.
 #[cfg(feature = "page_ecc")]
 #[test]
-fn arbitrate_by_framing_tli_tail_is_the_only_clean_region_retains_the_candidate()
--> crate::Result<()> {
+fn codec_disagrees_everywhere_consults_the_tli_tail_mirror() -> crate::Result<()> {
     use crate::fs::{Fs, FsOpenOptions, StdFs};
     use crate::table::block::{EccParams, Header};
 
@@ -2318,9 +2427,11 @@ fn arbitrate_by_framing_tli_tail_is_the_only_clean_region_retains_the_candidate(
     // evidence either way.
     let head = discriminating_payload(LEN / 2);
     let head_parity = crate::ecc::encode_parity(&head, 4, 2).expect("RS(4,2) encodes");
-    // Tail mirror: intact, under the same codec.
+    // Tail mirror: payload intact, trailer rotted — the one region left with
+    // something to say.
     let tail = discriminating_payload(LEN / 2);
-    let tail_parity = crate::ecc::encode_parity(&tail, 4, 2).expect("RS(4,2) encodes");
+    let mut tail_parity = crate::ecc::encode_parity(&tail, 4, 2).expect("RS(4,2) encodes");
+    *tail_parity.first_mut().expect("the trailer is non-empty") ^= 0xFF;
 
     let dir = tempfile::tempdir()?;
     let path = dir.path().join("tail-mirror.sst");
@@ -2374,43 +2485,38 @@ fn arbitrate_by_framing_tli_tail_is_the_only_clean_region_retains_the_candidate(
         "the head offers nothing to judge on — the premise of this test",
     );
     assert_eq!(
-        arbitrate_by_framing(probe.as_ref(), toc, ScrubEcc::Scheme(real), 0, cap),
+        arbitrate_by_framing(probe.as_ref(), toc, ScrubEcc::Scheme(real), 0),
         Some(true),
-        "the intact tail mirror is the only region able to speak, and it \
-         confirms the codec",
+        "every region frames, so the descriptor stands whatever the trailers say",
+    );
+    assert!(
+        codec_disagrees_everywhere(probe.as_ref(), toc, ScrubEcc::Scheme(real), 0, cap),
+        "only the tail mirror had anything to say, so a region set omitting it \
+         would report nothing at all",
     );
     Ok(())
 }
 
-/// The descriptor sizes EVERY block-format section, not the three the
-/// arbitration used to look at. An impostor whose parity coincides in `data`
-/// and both index mirrors can still disagree with a section left out of the
-/// list — and the walk, having accepted it, recomputes that section's parity
-/// under the wrong codec and reports corruption on healthy blocks.
+/// The descriptor sizes EVERY block-format section, not the three a hand-kept
+/// list would have named. `range_tombstones` is written under the same
+/// descriptor and sits outside the mirrors, so a region set that omits it
+/// leaves the operator without the one hint that explains this table's
+/// mismatches.
 #[cfg(feature = "page_ecc")]
 #[test]
-fn arbitrate_by_framing_impostor_disagreeing_outside_the_mirrors_is_rejected() -> crate::Result<()>
-{
+fn codec_disagrees_everywhere_consults_sections_outside_the_mirrors() -> crate::Result<()> {
     use crate::fs::{Fs, FsOpenOptions, StdFs};
-    use crate::table::block::EccParams;
+    use crate::table::block::{EccParams, Header};
 
     const LEN: u32 = 4096;
-    let real = EccParams::RS_4_2;
     let impostor = EccParams::try_new(2, 1)?;
 
-    // Uniform payloads: identical shards, so both codecs emit the same parity
-    // and the impostor sails through these three.
-    let agreeing = vec![0xABu8; LEN as usize];
-    let agreeing_parity = crate::ecc::encode_parity(&agreeing, 4, 2).expect("RS(4,2) encodes");
-    assert_eq!(
-        agreeing_parity,
-        crate::ecc::encode_parity(&agreeing, 2, 1).expect("XOR(2,1) encodes"),
-        "the three mirror-ish regions must be ones the codecs agree on, or the \
-         impostor never reaches the section under test",
-    );
+    // The data region's payload checksum is broken below, so it says nothing
+    // and cannot silence the report before the section under test is reached.
+    let silent = discriminating_payload(LEN);
+    let silent_parity = crate::ecc::encode_parity(&silent, 4, 2).expect("RS(4,2) encodes");
 
-    // `range_tombstones` is written under the same descriptor and was outside
-    // the old list. Its shards differ, so only the real codec matches it.
+    // `range_tombstones` discriminates: only the real codec matches it.
     let discriminating = discriminating_payload(LEN);
     let discriminating_parity =
         crate::ecc::encode_parity(&discriminating, 4, 2).expect("RS(4,2) encodes");
@@ -2420,15 +2526,28 @@ fn arbitrate_by_framing_impostor_disagreeing_outside_the_mirrors_is_rejected() -
     write_block_archive(
         &path,
         &[
-            ("data", vec![(agreeing.clone(), agreeing_parity.clone())]),
-            ("tli", vec![(agreeing.clone(), agreeing_parity.clone())]),
-            ("tli_tail", vec![(agreeing, agreeing_parity)]),
+            ("data", vec![(silent, silent_parity)]),
             (
                 "range_tombstones",
                 vec![(discriminating, discriminating_parity)],
             ),
         ],
     )?;
+
+    let data_pos = {
+        let mut probe = StdFs.open(&path, &FsOpenOptions::new().read(true))?;
+        let reader = crate::sfa::Reader::from_reader(&mut probe)?;
+        reader
+            .toc()
+            .section(b"data")
+            .expect("the fixture has a data section")
+            .pos()
+    };
+    {
+        let mut f = StdFs.open(&path, &FsOpenOptions::new().write(true))?;
+        f.seek(SeekFrom::Start(data_pos + Header::MIN_LEN as u64))?;
+        f.write_all(&[0xFF])?;
+    }
 
     let mut probe = StdFs.open(&path, &FsOpenOptions::new().read(true))?;
     let sfa_reader = crate::sfa::Reader::from_reader(&mut probe)?;
@@ -2438,6 +2557,9 @@ fn arbitrate_by_framing_impostor_disagreeing_outside_the_mirrors_is_rejected() -
     let rt = toc
         .section(b"range_tombstones")
         .expect("the fixture has a range_tombstones section");
+    let data = toc
+        .section(b"data")
+        .expect("the fixture has a data section");
     assert_eq!(
         codec_confirms_region(
             probe.as_ref(),
@@ -2447,18 +2569,23 @@ fn arbitrate_by_framing_impostor_disagreeing_outside_the_mirrors_is_rejected() -
             cap,
         ),
         CodecVerdict::Rejected,
-        "the section outside the old list is the only one that disagrees — the \
+        "the section outside the mirrors is the only one that disagrees — the \
          premise of this test",
     );
     assert_eq!(
-        arbitrate_by_framing(probe.as_ref(), toc, ScrubEcc::Scheme(impostor), 0, cap),
-        Some(false),
-        "a section the descriptor sizes must be consulted wherever it sits",
+        codec_confirms_region(
+            probe.as_ref(),
+            ScrubEcc::Scheme(impostor),
+            data.pos(),
+            data.pos() + data.len(),
+            cap,
+        ),
+        CodecVerdict::NoEvidence,
+        "and the data region says nothing, so it cannot silence the report",
     );
-    assert_eq!(
-        arbitrate_by_framing(probe.as_ref(), toc, ScrubEcc::Scheme(real), 0, cap),
-        Some(true),
-        "the real codec reproduces every section's trailer",
+    assert!(
+        codec_disagrees_everywhere(probe.as_ref(), toc, ScrubEcc::Scheme(impostor), 0, cap),
+        "a section the descriptor sizes is consulted wherever it sits",
     );
     Ok(())
 }

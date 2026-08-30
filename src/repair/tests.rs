@@ -6417,31 +6417,40 @@ fn repair_with_salvage_preserves_the_file_name_id_over_a_forged_tail_meta_id() -
     Ok(())
 }
 
+/// Leaves the SST in the state where the out-of-band walk cannot size its
+/// blocks: no descriptor it can apply, and none derivable from the file.
+///
+/// The tail always goes to a non-canonical value (`kind == 0` with non-zero
+/// reserved bytes). What the mid mirror needs is whichever descriptor cannot
+/// frame THIS file, since the walk falls back on any it can derive from the
+/// data: for a parity-less fixture that is RS(4,2) (its trailers do not exist),
+/// and for one that really carries parity it is a second non-canonical value,
+/// which leaves only `Off` to try and `Off` cannot frame a parity-bearing file.
 fn forge_unrecognized_ecc_descriptor(path: &std::path::Path) -> crate::Result<()> {
     use crate::coding::{Decode, Encode};
     use crate::table::block::Header;
 
     let mut bytes = std::fs::read(path)?;
-    let sections: Vec<(u64, u64)> = {
+    let sections: Vec<(u64, bool)> = {
         let mut f = std::fs::File::open(path)?;
         let reader = match crate::sfa::Reader::from_reader(&mut f) {
             Ok(r) => r,
             Err(e) => panic!("reading the SFA trailer failed: {e:?}"),
         };
-        [b"meta".as_slice(), b"meta_mid".as_slice()]
+        [(b"meta".as_slice(), true), (b"meta_mid".as_slice(), false)]
             .iter()
-            .map(|name| {
+            .map(|(name, is_tail)| {
                 let Some(entry) = reader.toc().iter().find(|e| e.name() == *name) else {
                     panic!(
                         "the SST must carry a {} section",
                         String::from_utf8_lossy(name)
                     );
                 };
-                (entry.pos(), entry.len())
+                (entry.pos(), *is_tail)
             })
             .collect()
     };
-    for (pos, _len) in sections {
+    for (pos, is_tail) in sections {
         let block_off = usize::try_from(pos).unwrap_or(usize::MAX);
         let Some(block) = bytes.get(block_off..) else {
             panic!("meta block within the file");
@@ -6473,8 +6482,15 @@ fn forge_unrecognized_ecc_descriptor(path: &std::path::Path) -> crate::Result<()
             let Some(value) = payload.get_mut(val_at + 1..val_at + 5) else {
                 panic!("descriptor value within the payload");
             };
-            assert_ne!(value, [0u8, 8, 2, 1], "descriptor not already forged");
-            value.copy_from_slice(&[0u8, 8, 2, 1]);
+            // `[0, 8, 2, 1]` is non-canonical (`kind == 0` with non-zero
+            // reserved bytes); `[3, 4, 2, 0]` is RS(4,2).
+            let forged = if is_tail || value.iter().any(|b| *b != 0) {
+                [0u8, 8, 2, 1]
+            } else {
+                [3u8, 4, 2, 0]
+            };
+            assert_ne!(value, forged, "descriptor not already forged");
+            value.copy_from_slice(&forged);
         }
         let new_checksum = crate::Checksum::from_raw(crate::hash::hash128(
             bytes.get(payload_range).unwrap_or(&[]),
