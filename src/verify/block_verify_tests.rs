@@ -1837,12 +1837,12 @@ fn codec_disagrees_everywhere_same_length_scheme_is_flagged_but_not_refused() ->
 
     // Both schemes frame the section: that is exactly the blind spot.
     assert_eq!(
-        scheme_frames_region(probe.as_ref(), ScrubEcc::Scheme(real), start, end),
+        scheme_frames_region(probe.as_ref(), ScrubEcc::Scheme(real), start, end)?,
         Some(true),
         "the real scheme must frame its own block",
     );
     assert_eq!(
-        scheme_frames_region(probe.as_ref(), ScrubEcc::Scheme(impostor), start, end),
+        scheme_frames_region(probe.as_ref(), ScrubEcc::Scheme(impostor), start, end)?,
         Some(true),
         "the same-length impostor frames identically — framing cannot separate them",
     );
@@ -1852,12 +1852,12 @@ fn codec_disagrees_everywhere_same_length_scheme_is_flagged_but_not_refused() ->
     // table carrying range tombstones is then excluded outright.
     let cap = block_data_length_cap(0);
     assert_eq!(
-        arbitrate_by_framing(probe.as_ref(), toc, ScrubEcc::Scheme(real), 0),
+        arbitrate_by_framing(probe.as_ref(), toc, ScrubEcc::Scheme(real), 0)?,
         Some(true),
         "the real scheme sizes its own blocks",
     );
     assert_eq!(
-        arbitrate_by_framing(probe.as_ref(), toc, ScrubEcc::Scheme(impostor), 0),
+        arbitrate_by_framing(probe.as_ref(), toc, ScrubEcc::Scheme(impostor), 0)?,
         Some(true),
         "the impostor sizes them identically, so the walk can still proceed — \
          refusing it would cost the whole table for a parity question",
@@ -1941,6 +1941,66 @@ fn verify_sst_file_unframeable_data_region_refuses_the_descriptor() {
         !report.is_ok(),
         "the table must not verify clean: its data region holds a corrupt header",
     );
+}
+
+/// A region that could not be READ is not a region that agreed. Framing decides
+/// which descriptor the walk uses, so silently dropping an unreadable region
+/// lets the remaining ones carry the verdict — and if the dropped one is the
+/// one that would have refused, a transient failure here plus a successful
+/// retry in the walk reports corruption across a HEALTHY table.
+///
+/// The fixture puts the refusing region FIRST so the injected failure lands on
+/// it: `data` carries no parity (RS(4,2) cannot frame it) while `tli` does.
+#[cfg(feature = "page_ecc")]
+#[test]
+fn arbitrate_by_framing_propagates_an_unreadable_region() -> crate::Result<()> {
+    use crate::fs::{Fault, FaultFs, FaultOp, FaultRule, Fs, FsOpenOptions, StdFs};
+    use crate::io::ErrorKind;
+    use crate::table::block::EccParams;
+
+    const LEN: u32 = 4096;
+    let real = EccParams::RS_4_2;
+
+    let bare = discriminating_payload(LEN);
+    let framed = discriminating_payload(LEN);
+    let framed_parity = crate::ecc::encode_parity(&framed, 4, 2).expect("RS(4,2) encodes");
+
+    let dir = tempfile::tempdir()?;
+    let path = dir.path().join("unreadable-region.sst");
+    write_block_archive(
+        &path,
+        &[
+            ("data", vec![(bare, Vec::new())]),
+            ("tli", vec![(framed, framed_parity)]),
+        ],
+    )?;
+
+    let mut plain = StdFs.open(&path, &FsOpenOptions::new().read(true))?;
+    let sfa_reader = crate::sfa::Reader::from_reader(&mut plain)?;
+    let toc = sfa_reader.toc();
+
+    // Readable, the first region refuses: the verdict the fault must not erase.
+    assert_eq!(
+        arbitrate_by_framing(plain.as_ref(), toc, ScrubEcc::Scheme(real), 0)?,
+        Some(false),
+        "the parity-less data region cannot frame under RS(4,2) — the premise \
+         of this test",
+    );
+
+    // The first read of that region now fails. Dropping it would leave `tli`
+    // framing alone and the descriptor accepted.
+    let fault = FaultFs::new(StdFs);
+    let injector = fault.injector();
+    injector.arm(FaultRule::new(FaultOp::ReadAt, Fault::Error(ErrorKind::Other)).once());
+    let faulted = fault.open(&path, &FsOpenOptions::new().read(true))?;
+    let verdict = arbitrate_by_framing(faulted.as_ref(), toc, ScrubEcc::Scheme(real), 0);
+    injector.clear();
+    assert!(
+        verdict.is_err(),
+        "an unread region must surface as a read failure, not as a region that \
+         had nothing to say: got {verdict:?}",
+    );
+    Ok(())
 }
 
 /// One synthetic block: its payload and the parity trailer stored after it.
@@ -2132,7 +2192,7 @@ fn rotted_trailer_keeps_the_descriptor_and_is_not_reported_suspect() -> crate::R
         "the rotted trailer makes the data region reject on its own",
     );
     assert_eq!(
-        arbitrate_by_framing(probe.as_ref(), toc, ScrubEcc::Scheme(real), 0),
+        arbitrate_by_framing(probe.as_ref(), toc, ScrubEcc::Scheme(real), 0)?,
         Some(true),
         "damage does not change the trailer LENGTH, so the walk can still read \
          the section and name the damaged block",
@@ -2330,7 +2390,7 @@ fn arbitrate_by_framing_rejects_a_split_verdict() -> crate::Result<()> {
         "no clean block, so the codec has nothing to say here either",
     );
     assert_eq!(
-        arbitrate_by_framing(probe.as_ref(), toc, ScrubEcc::Scheme(real), 0),
+        arbitrate_by_framing(probe.as_ref(), toc, ScrubEcc::Scheme(real), 0)?,
         Some(false),
         "one region framed and the other did not — accepting here walks a \
          region with the wrong trailer length and reports corruption that is \
@@ -2402,7 +2462,7 @@ fn codec_disagrees_everywhere_is_silenced_by_any_agreement() -> crate::Result<()
          not hold and it stays silent",
     );
     assert_eq!(
-        arbitrate_by_framing(probe.as_ref(), toc, ScrubEcc::Scheme(real), 0),
+        arbitrate_by_framing(probe.as_ref(), toc, ScrubEcc::Scheme(real), 0)?,
         Some(true),
         "the real scheme sizes both regions",
     );
@@ -2487,7 +2547,7 @@ fn codec_disagrees_everywhere_consults_the_tli_tail_mirror() -> crate::Result<()
         "the head offers nothing to judge on — the premise of this test",
     );
     assert_eq!(
-        arbitrate_by_framing(probe.as_ref(), toc, ScrubEcc::Scheme(real), 0),
+        arbitrate_by_framing(probe.as_ref(), toc, ScrubEcc::Scheme(real), 0)?,
         Some(true),
         "every region frames, so the descriptor stands whatever the trailers say",
     );

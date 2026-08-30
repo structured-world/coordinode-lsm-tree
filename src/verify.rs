@@ -1269,26 +1269,32 @@ fn descriptor_sized_regions(toc: &crate::sfa::Toc, data_start: u64) -> Vec<(u64,
 /// section it is responsible for, the frames must tile each one exactly.
 ///
 /// This is the only question that can refuse a descriptor, because the trailer
-/// length is the only thing the block walk cannot proceed without. `None` when
-/// no region holds frames to judge.
+/// length is the only thing the block walk cannot proceed without. `Ok(None)`
+/// when no region holds frames to judge.
+///
+/// A region that cannot be READ aborts the whole arbitration with `Err` rather
+/// than dropping out of it: it may be the one region that would refuse this
+/// descriptor, and the remaining ones must not decide in its absence. The
+/// caller turns that into an unreadable-file finding, which is what an I/O
+/// failure is — never a verdict about the data.
 #[cfg(feature = "std")]
 fn arbitrate_by_framing(
     file: &dyn crate::fs::FsFile,
     toc: &crate::sfa::Toc,
     scheme: ScrubEcc,
     data_start: u64,
-) -> Option<bool> {
+) -> crate::io::Result<Option<bool>> {
     let regions = descriptor_sized_regions(toc, data_start);
     let (mut judged, mut framed_any, mut framed_all) = (false, false, true);
     for &(start, end) in &regions {
-        if let Some(verdict) = scheme_frames_region(file, scheme, start, end) {
+        if let Some(verdict) = scheme_frames_region(file, scheme, start, end)? {
             judged = true;
             framed_any |= verdict;
             framed_all &= verdict;
         }
     }
     if !judged {
-        return None;
+        return Ok(None);
     }
     // EVERY judged region must frame, and no codec match may excuse one that
     // does not. A region framing while another does not is either damage in the
@@ -1299,13 +1305,13 @@ fn arbitrate_by_framing(
     // the codec that wrote them, so it is no answer to a region that could not
     // be framed at all.
     if !framed_any || !framed_all {
-        return Some(false);
+        return Ok(Some(false));
     }
     // Framing holds everywhere, so the descriptor is kept. The CODEC question —
     // whether this scheme is the one that computed the trailers, or merely one
     // that sizes them the same — is asked separately and never refuses the
     // descriptor. See `codec_disagrees_everywhere` for why.
-    Some(true)
+    Ok(Some(true))
 }
 
 /// Whether the candidate's codec disagrees with EVERY trailer it could be
@@ -1560,26 +1566,33 @@ fn codec_confirms_region(
 /// under a correct descriptor still frames and stays the block walk's finding
 /// rather than being reported as a descriptor problem.
 ///
-/// `None` when the region holds no frames to judge (empty, or entirely below a
-/// restricted table's punch offset) — the caller then has nothing to arbitrate
+/// `Ok(None)` when the region holds no frames to judge (empty, or entirely below
+/// a restricted table's punch offset) — the caller then has nothing to arbitrate
 /// on and keeps its existing verdict.
+///
+/// A read failure is an `Err`, never `Ok(None)`. The two are opposites: one
+/// region having nothing to say is normal, while one that could not be READ may
+/// be the very region that would have refused this descriptor, and dropping it
+/// lets the others carry the verdict. A transient failure here followed by a
+/// successful retry in the walk would then report corruption across a healthy
+/// table.
 #[cfg(feature = "std")]
 fn scheme_frames_region(
     file: &dyn crate::fs::FsFile,
     scheme: ScrubEcc,
     start: u64,
     end: u64,
-) -> Option<bool> {
+) -> crate::io::Result<Option<bool>> {
     use crate::table::block::Header;
 
     let params = match scheme {
         ScrubEcc::Off => None,
         ScrubEcc::Scheme(params) => Some(params),
         // Not a candidate: an unrecognized descriptor derives no trailer length.
-        ScrubEcc::Unrecognized => return None,
+        ScrubEcc::Unrecognized => return Ok(None),
     };
     if end <= start {
-        return None;
+        return Ok(None);
     }
     let mut offset = start;
     let mut framed = 0usize;
@@ -1587,18 +1600,14 @@ fn scheme_frames_region(
         let remaining = end - offset;
         if remaining < Header::MIN_LEN as u64 {
             // A tail too short to hold a header: the frames did not tile.
-            return Some(false);
+            return Ok(Some(false));
         }
         // A `remaining` past `usize` is certainly past a header, so it clamps
         // to the same bound the fitting case does.
         let want = usize::try_from(remaining).map_or(Header::MAX_LEN, |r| r.min(Header::MAX_LEN));
-        let Ok(buf) = crate::file::read_exact(file, offset, want) else {
-            // The region cannot be read at all; that is not the descriptor's
-            // fault, so it arbitrates nothing.
-            return None;
-        };
+        let buf = crate::file::read_exact(file, offset, want)?;
         let Ok(header) = Header::decode_from(&mut &buf[..]) else {
-            return Some(false);
+            return Ok(Some(false));
         };
         let parity_len = params.map_or(0, |p| {
             u64::from(crate::table::block::expected_parity_len(
@@ -1610,19 +1619,19 @@ fn scheme_frames_region(
             .checked_add(u64::from(header.data_length))
             .and_then(|n| n.checked_add(parity_len))
         else {
-            return Some(false);
+            return Ok(Some(false));
         };
         let Some(next) = offset.checked_add(frame) else {
-            return Some(false);
+            return Ok(Some(false));
         };
         if next > end {
-            return Some(false);
+            return Ok(Some(false));
         }
         offset = next;
         framed += 1;
     }
     // `offset == end` here: the loop only exits by reaching it or returning.
-    if framed == 0 { None } else { Some(true) }
+    Ok(if framed == 0 { None } else { Some(true) })
 }
 
 /// Best-effort read of the per-SST ECC state from an SST file's meta
@@ -1770,7 +1779,7 @@ fn read_ecc_params_out_of_band(
         // Decide by the DATA: the descriptor that actually SIZES the blocks is
         // the one the writer used. One that does not frame them fails safe.
         [one] if unrecognized_seen => Some(
-            match arbitrate_by_framing(probe.as_ref(), toc, *one, data_start) {
+            match arbitrate_by_framing(probe.as_ref(), toc, *one, data_start)? {
                 Some(false) => ScrubEcc::Unrecognized,
                 // Framed cleanly, or nothing to frame: keep the recognized copy.
                 Some(true) | None => *one,
@@ -1791,7 +1800,7 @@ fn read_ecc_params_out_of_band(
         // then EXCLUDED outright, because salvage cannot re-emit them. Reading
         // the sizing off the data costs one framing pass and saves that table.
         [] if unrecognized_seen => Some(
-            match arbitrate_by_framing(probe.as_ref(), toc, ScrubEcc::Off, data_start) {
+            match arbitrate_by_framing(probe.as_ref(), toc, ScrubEcc::Off, data_start)? {
                 Some(true) => {
                     // Framing says the blocks carry no parity, which is enough
                     // to walk them. It says nothing about the descriptors, and
