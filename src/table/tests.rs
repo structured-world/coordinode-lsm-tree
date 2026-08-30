@@ -5882,7 +5882,7 @@ fn write_columnar_batch_accounts_tombstones_seqno_bounds_and_restart_locator() -
 /// `(forged_separator, real_last_key]` to the wrong block. The pass must refuse
 /// the table and name the separator gate, not merely fail somewhere.
 #[test]
-fn reconcile_gates_reject_a_lowered_tli_separator_naming_the_separator_gate() -> crate::Result<()> {
+fn reconcile_gates_lowered_tli_separator_rejects_with_separators_gate() -> crate::Result<()> {
     let dir = tempdir()?;
     let file = dir.path().join("t");
 
@@ -5930,7 +5930,7 @@ fn reconcile_gates_reject_a_lowered_tli_separator_naming_the_separator_gate() ->
 /// block checksum — the block-level walk reads that clean — and the pass must
 /// name THAT gate, not merely fail somewhere.
 #[test]
-fn reconcile_gates_reject_a_stale_kv_footer_naming_the_per_kv_gate() -> crate::Result<()> {
+fn reconcile_gates_stale_kv_footer_rejects_with_kv_checksums_gate() -> crate::Result<()> {
     use crate::runtime_config::{ChecksumAlgorithm, KvChecksumPolicy};
 
     let dir = tempdir()?;
