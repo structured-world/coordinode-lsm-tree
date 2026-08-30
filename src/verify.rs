@@ -1382,11 +1382,13 @@ enum CodecVerdict {
         )
     )]
     Confirmed,
-    /// Clean blocks were judged, none of their trailers matched, and at least
-    /// one disagreed.
+    /// The region was inspected to its END, at least one clean trailer
+    /// disagreed, and none matched. Completeness is part of the claim: a
+    /// traversal cut short says nothing about the blocks behind the cut.
     Rejected,
-    /// Nothing to judge on: no checksum-clean block, or a build without the ECC
-    /// codecs.
+    /// Nothing to judge on: no checksum-clean block, a build without the ECC
+    /// codecs, or a traversal that stopped before the region's end without
+    /// finding a match.
     NoEvidence,
 }
 
@@ -1406,7 +1408,10 @@ enum CodecVerdict {
 ///
 /// Which is why the whole region is scanned rather than exited at the first
 /// verdict of either kind: a match can sit behind any run of mismatches, and
-/// missing it turns ordinary scattered rot into a scheme accusation.
+/// missing it turns ordinary scattered rot into a scheme accusation. For the
+/// same reason a traversal that STOPS early (an unreadable or undecodable
+/// header, a length past a cap, frames that stop tiling) reports no evidence
+/// rather than a rejection — the blocks behind the cut were never asked.
 ///
 /// A match is still not proof of the codec, only consistency with these bytes:
 /// the encoders are linear transforms, so same-length schemes reproduce each
@@ -1456,6 +1461,11 @@ fn codec_confirms_region(
         let mut offset = start;
         let mut matched = false;
         let mut mismatched = false;
+        // Every `break` below leaves blocks BEHIND it uninspected, and a
+        // trailer this scheme reproduces may be among them. The negative answer
+        // is a claim about the whole region, so it is only available when the
+        // traversal reached the end.
+        let mut complete = false;
         while offset < end {
             let remaining = end - offset;
             let want =
@@ -1537,14 +1547,16 @@ fn codec_confirms_region(
                 }
             }
             offset = next;
+            complete = offset >= end;
         }
-        // A match outranks any number of mismatches. Scattered mismatches beside
-        // a reproduced trailer are rot under a CORRECT descriptor, and reporting
-        // the scheme for them would send the operator recompacting a table whose
-        // descriptor is right.
+        // A match outranks any number of mismatches, and needs no completeness:
+        // one reproduced trailer is positive evidence wherever it was found.
+        // Scattered mismatches beside it are rot under a CORRECT descriptor, and
+        // reporting the scheme for them would send the operator recompacting a
+        // table whose descriptor is right.
         if matched {
             CodecVerdict::Confirmed
-        } else if mismatched {
+        } else if mismatched && complete {
             CodecVerdict::Rejected
         } else {
             CodecVerdict::NoEvidence

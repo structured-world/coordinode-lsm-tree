@@ -637,8 +637,8 @@ fn run_verify(path: &std::path::Path, verbose: bool) -> ExitCode {
                 path.display(),
             ),
             BlockVerifyWarning::EccCodecSuspect { table_id, path } => println!(
-                "  [warning] EccCodecSuspect: table {table_id} at {}: the parity \
-                 mismatches above match no trailer at all, which looks like a \
+                "  [warning] EccCodecSuspect: table {table_id} at {}: the reported \
+                 parity mismatches match no trailer at all, which looks like a \
                  mis-identified scheme rather than rot; recompact to re-stamp it \
                  before suspecting the hardware",
                 path.display(),

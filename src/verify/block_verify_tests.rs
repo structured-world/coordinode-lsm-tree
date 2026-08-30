@@ -2136,6 +2136,84 @@ fn codec_confirms_region_keeps_scanning_past_a_mismatch() -> crate::Result<()> {
     Ok(())
 }
 
+/// A scan that STOPPED is not a scan that found nothing. "No trailer anywhere
+/// is reproduced" can only be said about a region that was inspected to its
+/// end, so a traversal cut short — an unreadable or undecodable header, a
+/// length past the cap, frames that stop tiling — leaves the question
+/// unanswered rather than answered in the negative. Otherwise a mismatch before
+/// the cut plus a matching trailer beyond it reads as a mis-identified scheme,
+/// and the operator recompacts a table whose descriptor is right.
+#[cfg(feature = "page_ecc")]
+#[test]
+fn codec_confirms_region_reports_no_evidence_when_the_scan_stops_early() -> crate::Result<()> {
+    use crate::coding::Decode;
+    use crate::fs::{Fs, FsOpenOptions, StdFs};
+    use crate::table::block::{EccParams, Header};
+
+    const LEN: u32 = 4096;
+    let impostor = EccParams::try_new(2, 1)?;
+
+    // Block 1 mismatches under the impostor, block 2 (uniform) matches it.
+    let discriminating = discriminating_payload(LEN);
+    let discriminating_parity =
+        crate::ecc::encode_parity(&discriminating, 4, 2).expect("RS(4,2) encodes");
+    let degenerate = vec![0xABu8; LEN as usize];
+    let degenerate_parity = crate::ecc::encode_parity(&degenerate, 4, 2).expect("RS(4,2) encodes");
+
+    let dir = tempfile::tempdir()?;
+    let path = dir.path().join("truncated-scan.sst");
+    write_block_archive(
+        &path,
+        &[(
+            "data",
+            vec![
+                (discriminating, discriminating_parity.clone()),
+                (degenerate, degenerate_parity),
+            ],
+        )],
+    )?;
+
+    let (start, end, second_at) = {
+        let mut probe = StdFs.open(&path, &FsOpenOptions::new().read(true))?;
+        let reader = crate::sfa::Reader::from_reader(&mut probe)?;
+        let data = reader
+            .toc()
+            .section(b"data")
+            .expect("the fixture has a data section");
+        let head = crate::file::read_exact(probe.as_ref(), data.pos(), Header::MAX_LEN)?;
+        let header = Header::decode_from(&mut &head[..])?;
+        let frame = Header::header_len(header.block_type) as u64
+            + u64::from(header.data_length)
+            + discriminating_parity.len() as u64;
+        (data.pos(), data.pos() + data.len(), data.pos() + frame)
+    };
+
+    // The second block's header no longer decodes, so the scan stops after the
+    // first — the one that mismatches.
+    {
+        let mut f = StdFs.open(&path, &FsOpenOptions::new().write(true))?;
+        f.seek(SeekFrom::Start(second_at))?;
+        f.write_all(&[0xFFu8; 16])?;
+    }
+
+    let mut probe = StdFs.open(&path, &FsOpenOptions::new().read(true))?;
+    let sfa_reader = crate::sfa::Reader::from_reader(&mut probe)?;
+    let toc = sfa_reader.toc();
+    let cap = block_data_length_cap(0);
+
+    assert_eq!(
+        codec_confirms_region(probe.as_ref(), ScrubEcc::Scheme(impostor), start, end, cap),
+        CodecVerdict::NoEvidence,
+        "the region was not inspected to its end, so it cannot say the scheme \
+         reproduces nothing",
+    );
+    assert!(
+        !codec_disagrees_everywhere(probe.as_ref(), toc, ScrubEcc::Scheme(impostor), 0, cap),
+        "and no diagnosis is reported off a truncated probe",
+    );
+    Ok(())
+}
+
 /// A rotted trailer is damage, not a verdict on the descriptor. The table keeps
 /// its scheme, the walk reads the section, and the damaged block is named as
 /// `EccParityMismatch` — which parity may still repair. Refusing the descriptor
