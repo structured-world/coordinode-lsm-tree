@@ -541,6 +541,22 @@ pub enum BlockVerifyWarning {
         /// On-disk path of the SST.
         path: PathBuf,
     },
+
+    /// NEITHER meta mirror holds a readable ECC descriptor, and the blocks were
+    /// walked under a parity-less layout READ OFF THE FILE: they frame end to
+    /// end with no trailer, which a parity-bearing table cannot do.
+    ///
+    /// So this table verified completely — unlike [`Self::UnrecognizedEcc`],
+    /// nothing was skipped — but what is on disk is still malformed, and only a
+    /// rewrite re-stamps a canonical descriptor. Until then the table has no
+    /// recorded scheme to recover under, and the next reader must infer the
+    /// layout again.
+    EccDescriptorsUnreadable {
+        /// Table the warning applies to.
+        table_id: TableId,
+        /// On-disk path of the SST.
+        path: PathBuf,
+    },
 }
 
 /// Aggregated result of a per-block scrub run.
@@ -1151,19 +1167,40 @@ pub(crate) fn verify_sst_file_with_context(
 
     // Explain the parity mismatches the walk just reported, when the evidence
     // says they are a mis-identified scheme rather than rot. Gated on those
-    // mismatches EXISTING: a warning on an otherwise-clean report would grade
-    // the table degraded on its own (`has_warnings()`), which is a verdict this
-    // diagnostic has no business changing.
-    if probe.codec_suspect
+    // mismatches EXISTING for two reasons: a warning on an otherwise-clean
+    // report would grade the table degraded on its own (`has_warnings()`),
+    // which is a verdict this diagnostic has no business changing, and the
+    // probe re-reads a whole region, which no healthy table should pay for.
+    if let Some(scheme @ ScrubEcc::Scheme(_)) = probe.ecc
         && report
             .errors
             .iter()
             .any(|e| matches!(e, BlockVerifyError::EccParityMismatch { .. }))
+        && codec_suspect_for(
+            &**fs,
+            path,
+            scheme,
+            data_start,
+            block_data_length_cap(max_enc_overhead),
+        )
     {
         report.warnings.push(BlockVerifyWarning::EccCodecSuspect {
             table_id,
             path: path.to_path_buf(),
         });
+    }
+
+    // The blocks verified, but the descriptors that should have described them
+    // did not: the layout was read off the file instead. Recorded so the table
+    // is rewritten under a canonical descriptor rather than passing as clean
+    // and leaving every future reader to infer it again.
+    if probe.descriptors_unreadable {
+        report
+            .warnings
+            .push(BlockVerifyWarning::EccDescriptorsUnreadable {
+                table_id,
+                path: path.to_path_buf(),
+            });
     }
 
     report
@@ -1293,8 +1330,10 @@ fn arbitrate_by_framing(
 /// whether parity can be RE-verified, which is a diagnostic property.
 ///
 /// Scattered mismatches are what rot looks like; a mismatch on every clean
-/// block in every section is what a mis-identified scheme looks like. Only the
-/// latter is reported, and only alongside the mismatches the walk itself found.
+/// block in every section, with not one trailer reproduced, is what a
+/// mis-identified scheme looks like. Only the latter is reported, and only
+/// alongside the mismatches the walk itself found — see [`codec_suspect_for`],
+/// which is where that gate and the cost of asking at all are handled.
 #[cfg(feature = "std")]
 fn codec_disagrees_everywhere(
     file: &dyn crate::fs::FsFile,
@@ -1325,8 +1364,8 @@ fn codec_disagrees_everywhere(
 #[cfg(feature = "std")]
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
 enum CodecVerdict {
-    /// Every clean block's trailer matched parity recomputed under the
-    /// candidate. Says the candidate is CONSISTENT with these bytes — not that
+    /// At least one clean block's trailer matched parity recomputed under the
+    /// candidate. Says the candidate is CONSISTENT with those bytes — not that
     /// it is the codec that wrote them, since same-length schemes reproduce
     /// each other's trailer on some payloads.
     #[cfg_attr(
@@ -1337,8 +1376,8 @@ enum CodecVerdict {
         )
     )]
     Confirmed,
-    /// A clean block's trailer disagreed with parity recomputed under the
-    /// candidate.
+    /// Clean blocks were judged, none of their trailers matched, and at least
+    /// one disagreed.
     Rejected,
     /// Nothing to judge on: no checksum-clean block, or a build without the ECC
     /// codecs.
@@ -1354,18 +1393,20 @@ enum CodecVerdict {
 /// "wrong codec" would let damage discard a correct descriptor and hide the
 /// damage itself behind a skipped walk.
 ///
-/// EVERY clean block must match, because a single match proves less than it
-/// looks: schemes coincide on degenerate payloads (identical shards make both
-/// XOR and Reed-Solomon emit all-zero parity), so an impostor can match the
-/// first block and diverge on the next — or on the ninth, which is why the
-/// whole region is scanned rather than a prefix of it.
+/// ONE clean block that matches is enough to confirm, and no number of
+/// mismatches outranks it. The question this answers is the report's claim —
+/// that the scheme reproduces NO trailer — so a reproduced trailer refutes it
+/// outright, while mismatches beside one are rot under a CORRECT descriptor.
 ///
-/// A match is never treated as proof of the codec, only as consistency with
-/// these bytes: the encoders are linear transforms, so same-length schemes
-/// reproduce each other's trailer on some payloads (all-zero parity from
-/// identical shards is merely the most obvious case). A mismatch, by contrast,
-/// is positive disagreement — which is why one anywhere makes the region
-/// reject, even though the reader never lets that refuse the descriptor.
+/// Which is why the whole region is scanned rather than exited at the first
+/// verdict of either kind: a match can sit behind any run of mismatches, and
+/// missing it turns ordinary scattered rot into a scheme accusation.
+///
+/// A match is still not proof of the codec, only consistency with these bytes:
+/// the encoders are linear transforms, so same-length schemes reproduce each
+/// other's trailer on some payloads (all-zero parity from identical shards is
+/// merely the most obvious case). That is why a confirmation is only ever used
+/// to STAY SILENT, never to endorse a descriptor.
 ///
 /// `payload_cap` bounds what an untrusted `data_length` may make this read: the
 /// header it comes from is not yet verified here, and a forged one paired with
@@ -1401,15 +1442,14 @@ fn codec_confirms_region(
     {
         use crate::table::block::Header;
 
-        // The WHOLE region, not a sample. A bounded prefix cannot deliver
-        // "every clean block matches": an impostor that agrees on the first few
-        // degenerate blocks and diverges past the bound would be confirmed, and
-        // the walk would then report the divergence as damage. A mismatch exits
-        // immediately, so only the CONFIRMING case pays for the full pass — and
-        // only on the mixed-descriptor branch, which a healthy table never
-        // reaches.
+        // The WHOLE region, not a sample, and no early exit on either verdict:
+        // the one match that refutes the report can sit behind any run of
+        // mismatches. The cost is bounded by WHEN this runs — only after the
+        // walk has already reported a parity mismatch, so a healthy table never
+        // pays for it.
         let mut offset = start;
-        let mut judged = false;
+        let mut matched = false;
+        let mut mismatched = false;
         while offset < end {
             let remaining = end - offset;
             let want =
@@ -1470,7 +1510,6 @@ fn codec_confirms_region(
                     // Only a checksum-clean payload is evidence about the codec.
                     && Checksum::from_raw(crate::hash::hash128(&payload)) == header.checksum
                 {
-                    judged = true;
                     let fresh = match params {
                         crate::table::block::EccParams::Secded => {
                             Some(crate::secded::encode_block_parity(&payload))
@@ -1480,19 +1519,27 @@ fn codec_confirms_region(
                             crate::ecc::encode_parity(&payload, ds, ps).ok()
                         }
                     };
-                    // One mismatching clean block ends it for this region.
-                    // Returning on the first MATCH instead would let an
-                    // impostor slip past a degenerate block whose parity both
-                    // codecs agree on.
-                    if fresh.as_deref() != Some(&trailer[..]) {
-                        return CodecVerdict::Rejected;
+                    // Neither answer ends the region: the claim being tested is
+                    // that the scheme reproduces NO trailer, so a match anywhere
+                    // refutes it and a mismatch anywhere is only one more block
+                    // that does not.
+                    if fresh.as_deref() == Some(&trailer[..]) {
+                        matched = true;
+                    } else {
+                        mismatched = true;
                     }
                 }
             }
             offset = next;
         }
-        if judged {
+        // A match outranks any number of mismatches. Scattered mismatches beside
+        // a reproduced trailer are rot under a CORRECT descriptor, and reporting
+        // the scheme for them would send the operator recompacting a table whose
+        // descriptor is right.
+        if matched {
             CodecVerdict::Confirmed
+        } else if mismatched {
+            CodecVerdict::Rejected
         } else {
             CodecVerdict::NoEvidence
         }
@@ -1619,9 +1666,6 @@ fn read_ecc_params_out_of_band(
     // are read; when two decodable copies disagree in ANY way the probe
     // fails safe with `Unrecognized` (skip the ECC-dependent sections with a
     // warning) — nothing out-of-band can tell which copy is legitimate.
-    let payload_cap = block_data_length_cap(
-        encryption.map_or(0, crate::encryption::EncryptionProvider::max_overhead),
-    );
     let mut unrecognized_seen = false;
     let mut recognized: Vec<ScrubEcc> = Vec::new();
     // The FULL decoded mirrors: a tail re-stamped to another internally-consistent
@@ -1704,6 +1748,10 @@ fn read_ecc_params_out_of_band(
         [a, b] => a != b,
         _ => false,
     };
+    // Set when the layout below is INFERRED from the file because neither
+    // persisted descriptor could be read. The table walks and verifies, but
+    // what is on disk is still malformed and must be re-stamped.
+    let mut descriptors_unreadable = false;
     let ecc = match recognized.as_slice() {
         // Two decodable copies that agree: trustworthy.
         [a, b] if a == b => Some(*a),
@@ -1744,27 +1792,58 @@ fn read_ecc_params_out_of_band(
         // the sizing off the data costs one framing pass and saves that table.
         [] if unrecognized_seen => Some(
             match arbitrate_by_framing(probe.as_ref(), toc, ScrubEcc::Off, data_start) {
-                Some(true) => ScrubEcc::Off,
+                Some(true) => {
+                    // Framing says the blocks carry no parity, which is enough
+                    // to walk them. It says nothing about the descriptors, and
+                    // both of those are still unreadable on disk.
+                    descriptors_unreadable = true;
+                    ScrubEcc::Off
+                }
                 Some(false) | None => ScrubEcc::Unrecognized,
             },
         ),
         [..] => None,
     };
-    // Diagnostic only, and computed only for a scheme the walk will actually
-    // apply: does that scheme disagree with EVERY trailer it can be judged
-    // against? See `codec_disagrees_everywhere` for why this never refuses the
-    // descriptor.
-    let codec_suspect = match ecc {
-        Some(scheme @ ScrubEcc::Scheme(_)) => {
-            codec_disagrees_everywhere(probe.as_ref(), toc, scheme, data_start, payload_cap)
-        }
-        _ => false,
-    };
     Ok(EccProbe {
         ecc,
         mirrors_diverge,
-        codec_suspect,
+        descriptors_unreadable,
     })
+}
+
+/// Whether the scheme the walk applied disagrees with EVERY trailer it can be
+/// judged against, for a table whose walk ALREADY reported a parity mismatch.
+///
+/// Deliberately not computed by the probe. Its confirming path reads, hashes
+/// and recomputes parity for a whole region, and the walk then reads the same
+/// bytes again — so asking it up front would put an extra data-section pass on
+/// every scrub of every healthy ECC table, to produce a diagnostic that can only
+/// ever be shown beside a mismatch. Asked here, only tables that already have
+/// one pay, and the answer is the same.
+///
+/// A read failure yields no diagnosis rather than an error: the walk's findings
+/// stand on their own, and this only annotates them.
+#[cfg(feature = "std")]
+fn codec_suspect_for(
+    fs: &dyn crate::fs::Fs,
+    path: &std::path::Path,
+    scheme: ScrubEcc,
+    data_start: u64,
+    payload_cap: u64,
+) -> bool {
+    let Ok(mut probe) = fs.open(path, &crate::fs::FsOpenOptions::new().read(true)) else {
+        return false;
+    };
+    let Ok(sfa_reader) = crate::sfa::Reader::from_reader(&mut probe) else {
+        return false;
+    };
+    codec_disagrees_everywhere(
+        probe.as_ref(),
+        sfa_reader.toc(),
+        scheme,
+        data_start,
+        payload_cap,
+    )
 }
 
 /// The data-walk start offset for a possibly-RESTRICTED SST verified
@@ -2015,12 +2094,11 @@ fn extent_is_zeroed(file: &dyn crate::fs::FsFile, start: u64, end: u64) -> bool 
 struct EccProbe {
     ecc: Option<ScrubEcc>,
     mirrors_diverge: bool,
-    /// The arbitrated scheme sizes the blocks but reproduces NONE of their
-    /// parity: the signature of a mis-identified codec rather than of rot,
-    /// which is scattered. Purely a diagnostic — it never changes which scheme
-    /// the walk uses, and it is surfaced only alongside the parity mismatches
-    /// the walk itself reports, so it cannot change a verdict either.
-    codec_suspect: bool,
+    /// Neither persisted descriptor could be read, and the parity-less layout
+    /// in `ecc` was INFERRED from the file's own framing. The walk is complete
+    /// and the payloads verify, but the descriptors on disk are still malformed
+    /// and only a rewrite re-stamps them.
+    descriptors_unreadable: bool,
 }
 
 struct PerFileScan {

@@ -632,11 +632,12 @@ fn verify_sst_file_flags_diverging_mirrors_behind_an_unrecognized_ecc() {
 /// end to end.
 #[cfg(feature = "page_ecc")]
 #[test]
-fn verify_sst_file_reports_incomplete_when_ecc_is_unrecognized_in_both_mirrors() {
+fn verify_sst_file_reports_incomplete_when_ecc_is_unrecognized_in_both_mirrors() -> crate::Result<()>
+{
     use crate::table::Writer;
     use crate::table::block::EccParams;
 
-    let dir = tempfile::tempdir().unwrap();
+    let dir = tempfile::tempdir()?;
     let sst_path = dir.path().join("t");
 
     let mut writer = Writer::new(
@@ -644,23 +645,17 @@ fn verify_sst_file_reports_incomplete_when_ecc_is_unrecognized_in_both_mirrors()
         0,
         0,
         std::sync::Arc::new(crate::fs::StdFs),
-    )
-    .unwrap()
+    )?
     .use_ecc(Some(EccParams::RS_4_2));
     for i in 0u64..200 {
-        writer
-            .write(crate::InternalValue::from_components(
-                format!("key-{i:05}").into_bytes(),
-                format!("value-{i:05}").into_bytes(),
-                i + 1,
-                crate::ValueType::Value,
-            ))
-            .unwrap();
+        writer.write(crate::InternalValue::from_components(
+            format!("key-{i:05}").into_bytes(),
+            format!("value-{i:05}").into_bytes(),
+            i + 1,
+            crate::ValueType::Value,
+        ))?;
     }
-    assert!(
-        writer.finish().unwrap().is_some(),
-        "the fixture is non-empty"
-    );
+    assert!(writer.finish()?.is_some(), "the fixture is non-empty");
 
     // Sanity: intact file verifies clean.
     let report = verify_sst_file(&sst_path);
@@ -677,8 +672,7 @@ fn verify_sst_file_reports_incomplete_when_ecc_is_unrecognized_in_both_mirrors()
         &sst_path,
         b"descriptor#page_ecc",
         &[9, 0, 0, 0],
-    )
-    .unwrap();
+    )?;
 
     let report = verify_sst_file(&sst_path);
     assert!(
@@ -702,6 +696,7 @@ fn verify_sst_file_reports_incomplete_when_ecc_is_unrecognized_in_both_mirrors()
         "the unrecognized-ECC warning must still be recorded: {:?}",
         report.warnings,
     );
+    Ok(())
 }
 
 /// Tree-level regression for the merged report: `verify_block_checksums` folds
@@ -1710,29 +1705,23 @@ fn verify_sst_file_lone_recognized_mirror_that_frames_stays_authoritative() {
 /// range tombstones salvage cannot re-emit, dropped outright: a total loss of
 /// its key range over two bytes that say nothing about the data.
 #[test]
-fn verify_sst_file_both_mirrors_unrecognized_falls_back_to_off() {
+fn verify_sst_file_both_mirrors_unrecognized_falls_back_to_off() -> crate::Result<()> {
     use crate::table::Writer;
 
-    let dir = tempfile::tempdir().unwrap();
+    let dir = tempfile::tempdir()?;
     let path = dir.path().join("t");
 
-    let mut writer = Writer::new(path.clone(), 0, 0, std::sync::Arc::new(crate::fs::StdFs))
-        .unwrap()
-        .use_ecc(None);
+    let mut writer =
+        Writer::new(path.clone(), 0, 0, std::sync::Arc::new(crate::fs::StdFs))?.use_ecc(None);
     for i in 0u64..200 {
-        writer
-            .write(crate::InternalValue::from_components(
-                format!("key-{i:05}").into_bytes(),
-                format!("value-{i:05}").into_bytes(),
-                i + 1,
-                crate::ValueType::Value,
-            ))
-            .unwrap();
+        writer.write(crate::InternalValue::from_components(
+            format!("key-{i:05}").into_bytes(),
+            format!("value-{i:05}").into_bytes(),
+            i + 1,
+            crate::ValueType::Value,
+        ))?;
     }
-    assert!(
-        writer.finish().unwrap().is_some(),
-        "the fixture is non-empty"
-    );
+    assert!(writer.finish()?.is_some(), "the fixture is non-empty");
 
     let report = verify_sst_file(&path);
     assert!(
@@ -1742,8 +1731,8 @@ fn verify_sst_file_both_mirrors_unrecognized_falls_back_to_off() {
     );
 
     // Both mirrors go to unknown kinds, so no recognized descriptor survives.
-    crate::test_forge::forge_mid_meta_value(&path, b"descriptor#page_ecc", &[9, 0, 0, 0]).unwrap();
-    crate::test_forge::forge_tail_meta_value(&path, b"descriptor#page_ecc", &[8, 0, 0, 0]).unwrap();
+    crate::test_forge::forge_mid_meta_value(&path, b"descriptor#page_ecc", &[9, 0, 0, 0])?;
+    crate::test_forge::forge_tail_meta_value(&path, b"descriptor#page_ecc", &[8, 0, 0, 0])?;
 
     let report = verify_sst_file(&path);
     assert!(
@@ -1765,6 +1754,18 @@ fn verify_sst_file_both_mirrors_unrecognized_falls_back_to_off() {
         "every section was walked, so nothing is left unverified — the whole \
          point of trying `Off` rather than giving up",
     );
+    // Framing answered how to READ the blocks. It did not make either
+    // descriptor valid, and passing the table as clean would leave the next
+    // reader to infer the layout all over again.
+    assert!(
+        report.warnings.iter().any(|w| matches!(
+            w,
+            crate::verify::BlockVerifyWarning::EccDescriptorsUnreadable { .. }
+        )),
+        "the inferred layout must not hide the malformed descriptors: {:?}",
+        report.warnings,
+    );
+    Ok(())
 }
 
 /// Framing pins the trailer LENGTH, never the codec. RS(4,2) and XOR(2,1)
@@ -1999,16 +2000,18 @@ fn discriminating_payload(len: u32) -> Vec<u8> {
         .collect()
 }
 
-/// One matching block is not proof of the codec: schemes COINCIDE on degenerate
-/// payloads. A uniform block makes every shard identical, and both RS(4,2) and
-/// XOR(2,1) then emit all-zero parity — so an impostor matches it and diverges
-/// on the next block. The region is therefore scanned to its end: stopping at
-/// the first match would call the impostor confirmed and leave the operator
-/// without the one hint that explains the mismatches the walk is about to
-/// report.
+/// A mismatch does not end the region. The report's claim is that the scheme
+/// reproduces NO trailer, so one that it does reproduce refutes it — wherever
+/// it sits. Stopping at the first mismatch would call ordinary scattered rot a
+/// mis-identified scheme and send the operator recompacting a table whose
+/// descriptor is right.
+///
+/// The fixture puts the mismatch FIRST: a block only the real codec reproduces,
+/// then a uniform one whose shards are identical under either split, so both
+/// codecs emit its all-zero parity.
 #[cfg(feature = "page_ecc")]
 #[test]
-fn codec_confirms_region_keeps_scanning_past_a_degenerate_block() -> crate::Result<()> {
+fn codec_confirms_region_keeps_scanning_past_a_mismatch() -> crate::Result<()> {
     use crate::fs::{Fs, FsOpenOptions, StdFs};
     use crate::table::block::EccParams;
 
@@ -2016,17 +2019,17 @@ fn codec_confirms_region_keeps_scanning_past_a_degenerate_block() -> crate::Resu
     let real = EccParams::RS_4_2;
     let impostor = EccParams::try_new(2, 1)?;
 
-    // Block 1: uniform, so its shards are identical under either split.
+    // Block 2: uniform, so its shards are identical under either split.
     let degenerate = vec![0xABu8; LEN as usize];
     let degenerate_parity = crate::ecc::encode_parity(&degenerate, 4, 2).expect("RS(4,2) encodes");
     assert_eq!(
         degenerate_parity,
         crate::ecc::encode_parity(&degenerate, 2, 1).expect("XOR(2,1) encodes"),
-        "the fixture's first block must be one the two codecs agree on, or it \
-         does not exercise the early-return trap",
+        "the fixture's second block must be one the two codecs agree on, or the \
+         scan has no later match to find",
     );
 
-    // Block 2: shards differ, so only the real codec reproduces its trailer.
+    // Block 1: shards differ, so only the real codec reproduces its trailer.
     let discriminating = discriminating_payload(LEN);
     let discriminating_parity =
         crate::ecc::encode_parity(&discriminating, 4, 2).expect("RS(4,2) encodes");
@@ -2038,8 +2041,8 @@ fn codec_confirms_region_keeps_scanning_past_a_degenerate_block() -> crate::Resu
         &[(
             "data",
             vec![
-                (degenerate, degenerate_parity),
                 (discriminating, discriminating_parity),
+                (degenerate, degenerate_parity),
             ],
         )],
     )?;
@@ -2061,14 +2064,14 @@ fn codec_confirms_region_keeps_scanning_past_a_degenerate_block() -> crate::Resu
     );
     assert_eq!(
         codec_confirms_region(probe.as_ref(), ScrubEcc::Scheme(impostor), start, end, cap),
-        CodecVerdict::Rejected,
-        "the impostor agrees only on the degenerate block, and a scan that \
-         stopped there would call it confirmed",
+        CodecVerdict::Confirmed,
+        "the second block's trailer IS reproduced, and a scan that stopped at \
+         the first mismatch would never see it",
     );
     assert!(
-        codec_disagrees_everywhere(probe.as_ref(), toc, ScrubEcc::Scheme(impostor), 0, cap),
-        "with the region rejecting and nothing confirming, the descriptor is \
-         reported as suspect",
+        !codec_disagrees_everywhere(probe.as_ref(), toc, ScrubEcc::Scheme(impostor), 0, cap),
+        "one reproduced trailer refutes the report's claim, so a table whose \
+         mismatches are ordinary rot is not blamed on its scheme",
     );
     Ok(())
 }
@@ -2196,19 +2199,18 @@ fn cap_for_test() -> u64 {
     block_data_length_cap(0)
 }
 
-/// "Every clean block matches" cannot be delivered by a bounded prefix. An
-/// impostor that agrees on a run of degenerate blocks and diverges past the
-/// bound would read as confirmed, and the mismatches the walk goes on to report
-/// would lose the one hint that explains them. Nine blocks: eight uniform (the
-/// two codecs agree on those) and a ninth that discriminates.
+/// The one trailer that refutes the report can sit at the END of a long run of
+/// mismatches, so nothing short of the whole region will do. Nine blocks: eight
+/// that only the real codec reproduces, and a ninth that is uniform, whose
+/// identical shards make both codecs emit the same all-zero parity.
 #[cfg(feature = "page_ecc")]
 #[test]
-fn codec_confirms_region_scans_past_a_degenerate_prefix() -> crate::Result<()> {
+fn codec_confirms_region_scans_past_a_run_of_mismatches() -> crate::Result<()> {
     use crate::fs::{Fs, FsOpenOptions, StdFs};
     use crate::table::block::EccParams;
 
     const LEN: u32 = 4096;
-    const DEGENERATE_RUN: usize = 8;
+    const MISMATCH_RUN: usize = 8;
     let real = EccParams::RS_4_2;
     let impostor = EccParams::try_new(2, 1)?;
 
@@ -2217,18 +2219,18 @@ fn codec_confirms_region_scans_past_a_degenerate_prefix() -> crate::Result<()> {
     assert_eq!(
         degenerate_parity,
         crate::ecc::encode_parity(&degenerate, 2, 1).expect("XOR(2,1) encodes"),
-        "the run must be one the two codecs agree on, or it does not reach past \
-         the old bound",
+        "the LAST block must be one the two codecs agree on, or there is no \
+         match at the far end to find",
     );
 
     let discriminating = discriminating_payload(LEN);
     let discriminating_parity =
         crate::ecc::encode_parity(&discriminating, 4, 2).expect("RS(4,2) encodes");
 
-    let mut blocks: Vec<SyntheticBlock> = (0..DEGENERATE_RUN)
-        .map(|_| (degenerate.clone(), degenerate_parity.clone()))
+    let mut blocks: Vec<SyntheticBlock> = (0..MISMATCH_RUN)
+        .map(|_| (discriminating.clone(), discriminating_parity.clone()))
         .collect();
-    blocks.push((discriminating, discriminating_parity));
+    blocks.push((degenerate, degenerate_parity));
 
     let dir = tempfile::tempdir()?;
     let path = dir.path().join("nine-blocks.sst");
@@ -2251,9 +2253,9 @@ fn codec_confirms_region_scans_past_a_degenerate_prefix() -> crate::Result<()> {
     );
     assert_eq!(
         codec_confirms_region(probe.as_ref(), ScrubEcc::Scheme(impostor), start, end, cap),
-        CodecVerdict::Rejected,
-        "the impostor diverges on the ninth block, which a sample stopping \
-         earlier would never see",
+        CodecVerdict::Confirmed,
+        "the ninth block's trailer IS reproduced, and a scan that gave up over \
+         the eight before it would never reach the evidence",
     );
     Ok(())
 }
