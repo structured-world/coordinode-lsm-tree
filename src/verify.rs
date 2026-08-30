@@ -1181,13 +1181,18 @@ fn arbitrate_by_framing(
         Some((core::cmp::max(entry.pos(), floor), end))
     };
     let regions = [region(b"data", data_start), region(b"tli", 0)];
-    let mut framed_anywhere = None;
+    let (mut judged, mut framed_any, mut framed_all) = (false, false, true);
     for (start, end) in regions.into_iter().flatten() {
         if let Some(verdict) = scheme_frames_region(file, scheme, start, end) {
-            framed_anywhere = Some(framed_anywhere.unwrap_or(false) || verdict);
+            judged = true;
+            framed_any |= verdict;
+            framed_all &= verdict;
         }
     }
-    if !framed_anywhere? {
+    if !judged {
+        return None;
+    }
+    if !framed_any {
         return Some(false);
     }
     // A region CONFIRMS when every clean block in it matches, and REJECTS when
@@ -1204,10 +1209,21 @@ fn arbitrate_by_framing(
             None => {}
         }
     }
-    // Framed, and nothing could confirm the codec: no clean block anywhere, or
-    // a build without the ECC codecs — where nothing downstream recomputes
-    // parity either, so a same-length impostor is behaviourally identical and
-    // the framed descriptor stands.
+    // Nothing confirmed the codec: no clean block anywhere, or a build without
+    // the ECC codecs. Then the framing has to carry the verdict alone, and it
+    // only carries it when EVERY judged region framed.
+    //
+    // A split verdict is ambiguous without the codec: one region framing while
+    // another does not is either damage in the second (the descriptor is right)
+    // or a descriptor whose trailer lengths happen to coincide for one region's
+    // payload sizes and not the other's — RS(4,2) and XOR(2,1) agree on many
+    // lengths, not all. Guessing "right" there makes the walk consume the wrong
+    // trailer length across a HEALTHY region and report corruption that is not
+    // there, which is the more destructive way to be wrong: it routes an intact
+    // table to salvage. Fail to unrecognized instead.
+    if !framed_all {
+        return Some(false);
+    }
     Some(!rejected)
 }
 

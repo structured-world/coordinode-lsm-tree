@@ -1699,11 +1699,10 @@ fn arbitrate_by_framing_rejects_a_same_length_scheme_that_does_not_match_the_tra
         "the fixture must exercise a length collision, or it proves nothing",
     );
 
-    // Period 251: it divides neither shard size (1024 under RS(4,2), 2048 under
-    // XOR(2,1)), so the shards differ from each other. A uniform payload makes
-    // every shard identical, and BOTH codecs then emit all-zero parity — which
-    // would let the impostor pass for the wrong reason.
-    let payload: Vec<u8> = (0..DATA_LENGTH).map(|i| (i % 251) as u8).collect();
+    // Shards that differ from each other: a uniform payload makes every shard
+    // identical, and BOTH codecs then emit all-zero parity — which would let the
+    // impostor pass for the wrong reason.
+    let payload = discriminating_payload(DATA_LENGTH);
     let parity = crate::ecc::encode_parity(&payload, 4, 2).expect("RS(4,2) encodes the fixture");
     let header = Header {
         checksum: Checksum::from_raw(crate::hash::hash128(&payload)),
@@ -2130,6 +2129,88 @@ fn arbitrate_by_framing_rejects_an_impostor_that_diverges_past_a_prefix() -> cra
         Some(false),
         "the impostor diverges on the ninth block — a sample that stops earlier \
          confirms it and leaves the walk to condemn a healthy table",
+    );
+    Ok(())
+}
+
+/// With no codec confirmation available — a build without the ECC codecs, or a
+/// region with no checksum-clean block — the framing has to carry the verdict
+/// alone, and it only carries it when EVERY judged region framed. A split
+/// verdict is ambiguous: either the non-framing region is damaged, or the
+/// descriptor's trailer lengths coincide for one region's payload sizes and not
+/// the other's. Guessing "right" makes the walk consume the wrong trailer length
+/// across a HEALTHY region and report corruption that is not there, so a split
+/// must fail safe to unrecognized.
+#[cfg(feature = "page_ecc")]
+#[test]
+fn arbitrate_by_framing_rejects_a_split_verdict_with_no_codec_confirmation() -> crate::Result<()> {
+    use crate::fs::{Fs, FsOpenOptions, StdFs};
+    use crate::table::block::{EccParams, Header};
+
+    const LEN: u32 = 4096;
+    let real = EccParams::RS_4_2;
+
+    let payload = discriminating_payload(LEN);
+    let parity = crate::ecc::encode_parity(&payload, 4, 2).expect("RS(4,2) encodes");
+    // The second region's trailer is the WRONG length for this scheme, so its
+    // frames cannot tile the section.
+    let other = discriminating_payload(LEN / 2);
+    let short_parity = vec![0u8; 8];
+
+    let dir = tempfile::tempdir()?;
+    let path = dir.path().join("split.sst");
+    write_block_archive(
+        &path,
+        &[
+            ("data", vec![(payload, parity)]),
+            ("tli", vec![(other, short_parity)]),
+        ],
+    )?;
+
+    // Break the data block's payload checksum WITHOUT touching its framing, so
+    // the region still frames but offers no clean block to judge the codec on.
+    let data_pos = {
+        let mut probe = StdFs.open(&path, &FsOpenOptions::new().read(true))?;
+        let reader = crate::sfa::Reader::from_reader(&mut probe)?;
+        reader
+            .toc()
+            .section(b"data")
+            .expect("the fixture has a data section")
+            .pos()
+    };
+    {
+        let mut f = StdFs.open(&path, &FsOpenOptions::new().write(true))?;
+        // 0xFF differs from this payload's first byte (the pattern starts at 0),
+        // so the write actually changes the checksummed bytes.
+        f.seek(SeekFrom::Start(data_pos + Header::MIN_LEN as u64))?;
+        f.write_all(&[0xFF])?;
+    }
+
+    let mut probe = StdFs.open(&path, &FsOpenOptions::new().read(true))?;
+    let sfa_reader = crate::sfa::Reader::from_reader(&mut probe)?;
+    let toc = sfa_reader.toc();
+    let cap = block_data_length_cap(0);
+
+    let data = toc
+        .section(b"data")
+        .expect("the fixture has a data section");
+    assert_eq!(
+        codec_confirms_region(
+            probe.as_ref(),
+            ScrubEcc::Scheme(real),
+            data.pos(),
+            data.pos() + data.len(),
+            cap,
+        ),
+        None,
+        "no clean block, so the codec cannot be judged — the premise of this test",
+    );
+    assert_eq!(
+        arbitrate_by_framing(probe.as_ref(), toc, ScrubEcc::Scheme(real), 0, cap),
+        Some(false),
+        "one region framed and the other did not, with nothing to confirm the \
+         codec — accepting here walks a healthy region with the wrong trailer \
+         length and reports corruption that is not there",
     );
     Ok(())
 }
