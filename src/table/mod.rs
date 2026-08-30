@@ -422,6 +422,8 @@ pub(crate) enum PunchProbe {
 #[cfg(feature = "std")]
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
 pub(crate) enum ReconcileGate {
+    /// Index separators against the addressed blocks' decoded last keys.
+    Separators,
     /// Per-KV footer digests.
     KvChecksums,
     /// Recorded seqno bounds against the decoded entries.
@@ -3312,17 +3314,6 @@ impl Table {
                     .iter(self.comparator.clone())
                     .map(|i| i.materialize(part.as_slice()))
                     .collect();
-                if frame_blocks {
-                    let punch = self.punch_offset()?;
-                    for k in &part_keyed {
-                        // Punched prefix blocks of a restricted view decode to
-                        // zeros; skip their separator cross-check (they are dead).
-                        if k.offset().0 < punch {
-                            continue;
-                        }
-                        self.verify_separator_matches_block(k)?;
-                    }
-                }
                 // The TLI's top-level SEPARATOR for this partition must equal the
                 // partition's LAST data-block separator. `frames_tile_section`
                 // and the per-block separator checks ignore the top-level keys,
@@ -3366,46 +3357,7 @@ impl Table {
             }
             if frame_blocks {
                 self.verify_handles_frame_blocks(&handles, data_section.pos(), data_section.len())?;
-                let punch = self.punch_offset()?;
-                for k in &keyed {
-                    // Punched prefix blocks of a restricted view decode to zeros;
-                    // skip their separator cross-check (they are dead).
-                    if k.offset().0 < punch {
-                        continue;
-                    }
-                    self.verify_separator_matches_block(k)?;
-                }
             }
-        }
-        Ok(())
-    }
-
-    /// Confirms a leaf index entry's SEPARATOR (its `end_key`) equals the
-    /// addressed data block's actual decoded last key. A forged separator
-    /// re-stamped to another still-sorted value passes the mirror comparison
-    /// and section tiling (both ignore the keys), yet the index binary
-    /// search routes keys in `(forged_separator, real_last_key]` to the wrong
-    /// block — `point_read` then misses existing keys. The in-memory
-    /// reachability probe does not catch this on the heal path (the live
-    /// table keeps its correct recovery-time index), so the disk-fresh
-    /// separator must be checked against the block's decoded final key here.
-    #[cfg(feature = "std")]
-    fn verify_separator_matches_block(&self, keyed: &KeyedBlockHandle) -> crate::Result<()> {
-        let block_handle = BlockHandle::new(keyed.offset(), keyed.size());
-        let entries = self.decode_block_entries(&block_handle)?;
-        let Some(last) = entries.last() else {
-            return Err(crate::Error::InvalidHeader(
-                "tli separator addresses a data block that decodes to zero entries",
-            ));
-        };
-        if self
-            .comparator
-            .compare(keyed.end_key().as_ref(), last.key.user_key.as_ref())
-            != core::cmp::Ordering::Equal
-        {
-            return Err(crate::Error::InvalidHeader(
-                "tli separator does not match the addressed block's decoded last key",
-            ));
         }
         Ok(())
     }
@@ -3470,6 +3422,118 @@ impl Table {
         pos.checked_add(len) == Some(at)
     }
 
+    /// Reads the disk-fresh leaf SEPARATORS: each live data block's offset
+    /// mapped to the `end_key` the on-disk index records for it. `None` for a
+    /// table whose index carries no entries at all.
+    ///
+    /// Tail-first with head fallback, mirroring recovery ([`Self::read_tli`]):
+    /// the next open trusts that copy, so it is the one the separators must be
+    /// judged from. Mirror EQUALITY is not this reader's job —
+    /// [`Self::verify_tli_mirrors`] establishes it, along with the section
+    /// tiling, the binary-index pointers and (when partitioned) the top-level
+    /// partition boundaries.
+    ///
+    /// Blocks below the punch offset are left out: a restricted view's punched
+    /// prefix decodes to zeros, so those separators are dead and the walk skips
+    /// their blocks too.
+    ///
+    /// # Errors
+    ///
+    /// Propagates the index reads, and rejects an index partition that decodes
+    /// to zero entries.
+    #[cfg(feature = "std")]
+    fn read_tli_separators(
+        &self,
+        file: &dyn crate::fs::FsFile,
+        regions: &regions::ParsedRegions,
+    ) -> crate::Result<crate::HashMap<u64, UserKey>> {
+        let punch = self.punch_offset()?;
+        let head = Self::read_tli(
+            regions,
+            file,
+            self.metadata.id,
+            self.metadata.index_block_compression,
+            self.encryption.as_deref(),
+            self.metadata.ecc_params,
+        )?;
+        let mut separators = crate::HashMap::default();
+        let mut collect = |idx: &IndexBlock| -> crate::Result<()> {
+            for keyed in idx.iter(self.comparator.clone()) {
+                let keyed = keyed.materialize(idx.as_slice());
+                if keyed.offset().0 < punch {
+                    continue;
+                }
+                separators.insert(keyed.offset().0, keyed.end_key().clone());
+            }
+            Ok(())
+        };
+        if regions.index.is_some() {
+            // Partitioned: the top level addresses index partitions, and the
+            // partitions address the data blocks whose separators are wanted.
+            let tops: Vec<BlockHandle> = head
+                .iter(self.comparator.clone())
+                .map(|i| *i.materialize(head.as_slice()).as_ref())
+                .collect();
+            for top in tops {
+                let part = Self::read_tli_at(
+                    file,
+                    top,
+                    self.metadata.id,
+                    self.metadata.index_block_compression,
+                    self.encryption.as_deref(),
+                    self.metadata.ecc_params,
+                )?;
+                collect(&part)?;
+            }
+        } else {
+            collect(&head)?;
+        }
+        Ok(separators)
+    }
+
+    /// Confirms a data block's decoded LAST key equals the separator the
+    /// on-disk index records for it. A forged separator re-stamped to another
+    /// still-sorted value passes the mirror comparison and the section tiling
+    /// (both ignore the keys), yet the index binary search then routes keys in
+    /// `(forged_separator, real_last_key]` to the wrong block and `point_read`
+    /// misses them after reopen.
+    ///
+    /// Judged on the walk's decode, and paired BOTH ways: a live block the
+    /// index does not address is as much corruption as an addressed block whose
+    /// contents disagree, and only the pairing catches the first.
+    ///
+    /// # Errors
+    ///
+    /// [`crate::Error::InvalidHeader`] when the block has no separator, decodes
+    /// to zero entries, or disagrees with its separator.
+    #[cfg(feature = "std")]
+    fn check_block_separator(
+        &self,
+        separators: &crate::HashMap<u64, UserKey>,
+        block: &DecodedBlock,
+    ) -> crate::Result<()> {
+        let Some(separator) = separators.get(&block.handle.offset().0) else {
+            return Err(crate::Error::InvalidHeader(
+                "a live data block carries no tli separator",
+            ));
+        };
+        let Some(last) = block.entries.last() else {
+            return Err(crate::Error::InvalidHeader(
+                "tli separator addresses a data block that decodes to zero entries",
+            ));
+        };
+        if self
+            .comparator
+            .compare(separator.as_ref(), last.key.user_key.as_ref())
+            != core::cmp::Ordering::Equal
+        {
+            return Err(crate::Error::InvalidHeader(
+                "tli separator does not match the addressed block's decoded last key",
+            ));
+        }
+        Ok(())
+    }
+
     /// Runs the whole semantic cross-check family on ONE disk-fresh decode per
     /// live data block.
     ///
@@ -3513,6 +3577,9 @@ impl Table {
         // EVERY block, so releasing early means walking again per section,
         // which is the cost this pass exists to remove.
         let (file, regions) = self.open_sections().map_err(tag(G::SeqnoBounds))?;
+        let separators = self
+            .read_tli_separators(&*file, &regions)
+            .map_err(tag(G::Separators))?;
         let seqno_bounds = self
             .read_seqno_bounds_section(&*file, &regions)
             .map_err(tag(G::SeqnoBounds))?;
@@ -3546,6 +3613,7 @@ impl Table {
             .map_err(tag(G::MetadataBounds))?;
 
         // Per-block state the gates carry across the walk.
+        let mut separators_checked = 0usize;
         let mut seqno_checked = 0usize;
         let mut zone_checked = 0usize;
         let mut locator_seen: crate::HashSet<Vec<u8>> = crate::HashSet::default();
@@ -3555,6 +3623,17 @@ impl Table {
         // produced it is recorded here and paired with it after the walk.
         let mut failed: Option<ReconcileGate> = None;
         let walk = self.for_each_live_block(|block| {
+            // First, as the standalone separator pass ran before every other
+            // gate in both callers' chains.
+            if let Err(e) = self.check_block_separator(&separators, block) {
+                failed = Some(G::Separators);
+                return Err(e);
+            }
+            let Some(next) = separators_checked.checked_add(1) else {
+                failed = Some(G::Separators);
+                return Err(crate::Error::InvalidHeader("tli separators"));
+            };
+            separators_checked = next;
             if let Some(algo) = kv_algo
                 && let Err(e) = Self::check_block_kv_checksums(algo, block)
             {
@@ -3616,6 +3695,19 @@ impl Table {
         }
 
         // Finalizers: the counts the per-block checks accumulated.
+        //
+        // The separator pairing closes the other direction: the per-block half
+        // rejects a live block the index does not address, this rejects a live
+        // separator no walked block claimed. The standalone pass could express
+        // neither — it walked the index side alone.
+        if separators_checked != separators.len() {
+            return Err((
+                G::Separators,
+                crate::Error::InvalidHeader(
+                    "the index carries separators for blocks it does not hold",
+                ),
+            ));
+        }
         let punch = self.punch_offset().map_err(tag(G::SeqnoBounds))?;
         if let Some(map) = &seqno_bounds
             && seqno_checked != map.live_len(punch)
@@ -5356,12 +5448,14 @@ impl Table {
         Ok(())
     }
 
-    /// Decodes one data block's entries (row or columnar) into
-    /// [`InternalValue`]s, for the semantic cross-check gates. Reads the
-    /// block DISK-FRESH ([`Self::load_block_from_disk`]): the gates judge
-    /// the file being reconciled, and a pristine copy cached before an
-    /// on-disk alteration must not stand in for the altered bytes.
-    #[cfg(feature = "std")]
+    /// Decodes ONE data block's entries (row or columnar) into
+    /// [`InternalValue`]s, disk-fresh ([`Self::load_block_from_disk`]).
+    ///
+    /// Test-only: the cross-check gates consume the walk's shared decode
+    /// ([`Self::for_each_live_block`]) rather than decoding a block apiece.
+    /// What is left is fixtures that need one named block's contents to build
+    /// a forgery from.
+    #[cfg(all(feature = "std", test))]
     fn decode_block_entries(
         &self,
         block_handle: &BlockHandle,

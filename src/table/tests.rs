@@ -5875,6 +5875,55 @@ fn write_columnar_batch_accounts_tombstones_seqno_bounds_and_restart_locator() -
     Ok(())
 }
 
+/// The index SEPARATOR cross-check is a gate of the reconcile pass, fed from
+/// the walk's decode. A separator lowered in BOTH mirrors keeps the handle list
+/// sorted, the mirrors equal and the section tiling intact — every byte-level
+/// and structural check reads clean — yet the binary search then routes keys in
+/// `(forged_separator, real_last_key]` to the wrong block. The pass must refuse
+/// the table and name the separator gate, not merely fail somewhere.
+#[test]
+fn reconcile_gates_reject_a_lowered_tli_separator_naming_the_separator_gate() -> crate::Result<()> {
+    let dir = tempdir()?;
+    let file = dir.path().join("t");
+
+    // Small blocks so the table has several data blocks (the forge lowers the
+    // first block's separator and needs a next one to stay below).
+    let mut writer = Writer::new(file.clone(), 0, 0, Arc::new(StdFs))?.use_data_block_size(128);
+    for i in 0u64..64 {
+        writer.write(crate::InternalValue::from_components(
+            alloc::format!("key-{i:04}").into_bytes(),
+            alloc::format!("v{i:04}").into_bytes(),
+            i + 1,
+            crate::ValueType::Value,
+        ))?;
+    }
+    let (_, checksum) = writer.finish()?.expect("table written");
+
+    let table = recover_test_table(&file, checksum)?;
+    if let Err((gate, e)) = table.verify_reconcile_gates(None, false) {
+        panic!("intact separators must pass every gate, {gate:?} refused it: {e}");
+    }
+
+    crate::test_forge::forge_tli_mirrors_lower_first_separator(&file, 0, None)?;
+
+    let table = recover_test_table(&file, checksum)?;
+    let result = table.verify_reconcile_gates(None, false);
+    assert!(
+        matches!(
+            result,
+            Err((
+                crate::table::ReconcileGate::Separators,
+                crate::Error::InvalidHeader(
+                    "tli separator does not match the addressed block's decoded last key"
+                )
+            ))
+        ),
+        "a lowered separator must be rejected by the separator gate, got {:?}",
+        result.map_err(|(gate, e)| (gate, e.to_string())),
+    );
+    Ok(())
+}
+
 /// The per-KV gate is fed from the entries the walk materialized rather than
 /// decoding the block a second time for itself. It must still catch a footer
 /// whose stored digest no longer matches the entry bytes behind a re-stamped

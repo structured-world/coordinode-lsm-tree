@@ -950,6 +950,7 @@ fn refresh_healed_checksum(
     if let Err((gate, e)) = table.verify_reconcile_gates(tree.prefix_extractor().as_ref(), true) {
         use crate::table::ReconcileGate as G;
         let what = match gate {
+            G::Separators => "an index separator cross-check failure",
             G::KvChecksums => "a per-KV verification failure",
             G::SeqnoBounds => "a seqno-bounds cross-check failure",
             G::BlockEntryCounts => "a block entry-count mismatch",
