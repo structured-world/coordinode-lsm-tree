@@ -1006,7 +1006,8 @@ pub(crate) fn verify_sst_file_with_context(
     // skip the walk.
     let mut ecc_unrecognized = false;
     let provider = encryption.map(|e| &**e);
-    let probe = match read_ecc_params_out_of_band(&**fs, path, provider, known_table_id) {
+    let probe = match read_ecc_params_out_of_band(&**fs, path, provider, known_table_id, data_start)
+    {
         Ok(p) => p,
         // Real file-open / SFA-trailer failure — preserve the underlying error
         // rather than collapsing it into the undeterminable message below.
@@ -1147,6 +1148,113 @@ enum ScrubEcc {
     Unrecognized,
 }
 
+/// Judges a candidate ECC descriptor against the SST's own block framing.
+///
+/// Tries the DATA section first, from `data_start` so a restricted view's
+/// punched prefix is excluded, and falls back to the top-level index when the
+/// data region has no frames to judge (both are SST blocks, which carry no
+/// `block_flags` byte and so take their parity sizing from this descriptor).
+/// `None` when neither region can arbitrate.
+#[cfg(feature = "std")]
+fn arbitrate_by_framing(
+    file: &dyn crate::fs::FsFile,
+    toc: &crate::sfa::Toc,
+    scheme: ScrubEcc,
+    data_start: u64,
+) -> Option<bool> {
+    let region = |name: &[u8], floor: u64| -> Option<(u64, u64)> {
+        let entry = toc.section(name)?;
+        let end = entry.pos().checked_add(entry.len())?;
+        Some((core::cmp::max(entry.pos(), floor), end))
+    };
+    if let Some((start, end)) = region(b"data", data_start)
+        && let Some(verdict) = scheme_frames_region(file, scheme, start, end)
+    {
+        return Some(verdict);
+    }
+    let (start, end) = region(b"tli", 0)?;
+    scheme_frames_region(file, scheme, start, end)
+}
+
+/// Whether `scheme` sizes an SST block region's frames CONSISTENTLY: walking
+/// `[start, end)`, every header must decode and the frames must tile the region
+/// exactly.
+///
+/// This is what tells a legitimate ECC descriptor from a forged one. The walk
+/// advances by `header_len + data_length + parity_len(data_length, scheme)`, so
+/// a descriptor that mis-states the scheme lands the next read INSIDE the
+/// previous frame: the bytes there are payload or parity, not a header. A
+/// descriptor that frames the region end to end is the one the writer used.
+///
+/// It judges LAYOUT, not integrity: no checksum is verified, so a rotted block
+/// under a correct descriptor still frames and stays the block walk's finding
+/// rather than being reported as a descriptor problem.
+///
+/// `None` when the region holds no frames to judge (empty, or entirely below a
+/// restricted table's punch offset) — the caller then has nothing to arbitrate
+/// on and keeps its existing verdict.
+#[cfg(feature = "std")]
+fn scheme_frames_region(
+    file: &dyn crate::fs::FsFile,
+    scheme: ScrubEcc,
+    start: u64,
+    end: u64,
+) -> Option<bool> {
+    use crate::table::block::Header;
+
+    let params = match scheme {
+        ScrubEcc::Off => None,
+        ScrubEcc::Scheme(params) => Some(params),
+        // Not a candidate: an unrecognized descriptor derives no trailer length.
+        ScrubEcc::Unrecognized => return None,
+    };
+    if end <= start {
+        return None;
+    }
+    let mut offset = start;
+    let mut framed = 0usize;
+    while offset < end {
+        let remaining = end - offset;
+        if remaining < Header::MIN_LEN as u64 {
+            // A tail too short to hold a header: the frames did not tile.
+            return Some(false);
+        }
+        // A `remaining` past `usize` is certainly past a header, so it clamps
+        // to the same bound the fitting case does.
+        let want = usize::try_from(remaining).map_or(Header::MAX_LEN, |r| r.min(Header::MAX_LEN));
+        let Ok(buf) = crate::file::read_exact(file, offset, want) else {
+            // The region cannot be read at all; that is not the descriptor's
+            // fault, so it arbitrates nothing.
+            return None;
+        };
+        let Ok(header) = Header::decode_from(&mut &buf[..]) else {
+            return Some(false);
+        };
+        let parity_len = params.map_or(0, |p| {
+            u64::from(crate::table::block::expected_parity_len(
+                header.data_length,
+                p,
+            ))
+        });
+        let Some(frame) = (Header::header_len(header.block_type) as u64)
+            .checked_add(u64::from(header.data_length))
+            .and_then(|n| n.checked_add(parity_len))
+        else {
+            return Some(false);
+        };
+        let Some(next) = offset.checked_add(frame) else {
+            return Some(false);
+        };
+        if next > end {
+            return Some(false);
+        }
+        offset = next;
+        framed += 1;
+    }
+    // `offset == end` here: the loop only exits by reaching it or returning.
+    if framed == 0 { None } else { Some(true) }
+}
+
 /// Best-effort read of the per-SST ECC state from an SST file's meta
 /// descriptor, for the out-of-band scrub (no live `Table` to consult).
 ///
@@ -1169,6 +1277,11 @@ fn read_ecc_params_out_of_band(
     path: &std::path::Path,
     encryption: Option<&dyn crate::encryption::EncryptionProvider>,
     known_table_id: Option<crate::TableId>,
+    // Where the DATA walk starts: `0` normally, the punch offset for a
+    // restricted view. The framing arbitration below reads the same region the
+    // block walk will, so a punched prefix (which reads as zeros and frames as
+    // nothing) must be excluded from it too.
+    data_start: u64,
 ) -> std::io::Result<EccProbe> {
     let mut probe = fs.open(path, &crate::fs::FsOpenOptions::new().read(true))?;
     let sfa_reader = crate::sfa::Reader::from_reader(&mut probe)
@@ -1271,13 +1384,27 @@ fn read_ecc_params_out_of_band(
         // Two decodable copies that DISAGREE: one is forged/rotted and the
         // probe cannot tell which — fail safe.
         [_, _] => Some(ScrubEcc::Unrecognized),
-        // One decodable recognized copy: a lone unrecognized sibling does
-        // not override it (a descriptor-only forge must not condemn a
-        // healthy table whose mirror still holds the valid descriptor).
-        // A genuinely newer-scheme table with the OTHER mirror re-stamped to a
-        // recognized value would mis-size parity here; disambiguating the two by
-        // the block data (rather than trusting one descriptor) is tracked in
-        // issue #582.
+        // One decodable recognized copy with an UNRECOGNIZED sibling. Two
+        // scenarios are indistinguishable at the descriptor level, so neither
+        // answer is safe by itself: a healthy table whose one descriptor was
+        // re-stamped to an unknown kind (trusting the recognized copy is right —
+        // condemning it is terminal for a range-tombstone SST, which salvage
+        // cannot re-emit), or a table on a scheme this build does not know whose
+        // OTHER mirror was re-stamped to a recognized value (trusting it walks
+        // the blocks with the wrong parity sizing and condemns healthy data).
+        //
+        // Decide by the DATA: the descriptor that actually frames the blocks is
+        // the one the writer used. One that does not frame them fails safe.
+        [one] if unrecognized_seen => Some(
+            match arbitrate_by_framing(probe.as_ref(), toc, *one, data_start) {
+                Some(false) => ScrubEcc::Unrecognized,
+                // Framed cleanly, or nothing to frame: keep the recognized copy.
+                Some(true) | None => *one,
+            },
+        ),
+        // One decodable recognized copy, its sibling missing or undecodable.
+        // Nothing to arbitrate against, and a framing check here would only
+        // downgrade a genuinely corrupt table's block findings to a skip.
         [one] => Some(*one),
         [] if unrecognized_seen => Some(ScrubEcc::Unrecognized),
         [..] => None,

@@ -1557,3 +1557,118 @@ fn verify_checksum_with_throttle_does_not_sleep_after_last_sst() {
          last table: took {elapsed:?} with a {throttle:?} throttle",
     );
 }
+
+/// A table whose real parity is RS(4,2) but whose surviving RECOGNIZED mirror
+/// says ECC is off must NOT be walked under that descriptor. One mirror
+/// re-stamped to an unrecognized kind and the other to `Off` leaves exactly one
+/// recognized copy, and trusting it sizes every frame without its parity
+/// trailer: the walk then reads parity bytes as the next block header and
+/// condemns a healthy table. The descriptor must be judged against the block
+/// framing it implies, and a descriptor that does not frame the data must fail
+/// safe to unrecognized (skip the ECC-dependent sections, report incomplete).
+#[cfg(feature = "page_ecc")]
+#[test]
+fn verify_sst_file_lone_recognized_mirror_that_misframes_falls_back_to_unrecognized() {
+    use crate::table::Writer;
+    use crate::table::block::EccParams;
+
+    let dir = tempfile::tempdir().unwrap();
+    let path = dir.path().join("t");
+
+    let mut writer = Writer::new(path.clone(), 0, 0, std::sync::Arc::new(crate::fs::StdFs))
+        .unwrap()
+        .use_ecc(Some(EccParams::RS_4_2));
+    for i in 0u64..200 {
+        writer
+            .write(crate::InternalValue::from_components(
+                format!("key-{i:05}").into_bytes(),
+                format!("value-{i:05}").into_bytes(),
+                i + 1,
+                crate::ValueType::Value,
+            ))
+            .unwrap();
+    }
+    assert!(
+        writer.finish().unwrap().is_some(),
+        "the fixture is non-empty"
+    );
+
+    // Sanity: the intact table verifies clean under its real descriptor.
+    let report = verify_sst_file(&path);
+    assert!(
+        report.is_ok(),
+        "an intact RS(4,2) table must verify clean: {:?}",
+        report.errors,
+    );
+
+    // The MID mirror keeps a recognized descriptor, but a FORGED one: `Off`.
+    // The tail goes to an unrecognized kind, so arbitration sees exactly one
+    // recognized copy and no full-metadata divergence (the comparison masks the
+    // ECC fields when a mirror is unrecognized).
+    // `[kind, data_shards, parity_shards, granularity]`: kind 0 with the
+    // reserved bytes zeroed is the canonical `Off`, kind 9 is unknown.
+    crate::test_forge::forge_mid_meta_value(&path, b"descriptor#page_ecc", &[0, 0, 0, 0]).unwrap();
+    crate::test_forge::forge_tail_meta_value(&path, b"descriptor#page_ecc", &[9, 0, 0, 0]).unwrap();
+
+    let report = verify_sst_file(&path);
+    assert!(
+        report.errors.is_empty(),
+        "the blocks are healthy — a mis-framing descriptor must not be trusted \
+         into reporting them corrupt: {:?}",
+        report.errors,
+    );
+    assert!(
+        report
+            .warnings
+            .iter()
+            .any(|w| matches!(w, crate::verify::BlockVerifyWarning::UnrecognizedEcc { .. })),
+        "the descriptor that does not frame the data must fail safe to \
+         unrecognized: {:?}",
+        report.warnings,
+    );
+    assert!(
+        report.incomplete,
+        "the ECC-dependent sections were skipped, so the scan is incomplete",
+    );
+}
+
+/// The other side of the same arbitration: a HEALTHY table whose one meta
+/// mirror had its ECC descriptor re-stamped to an unknown kind must keep being
+/// walked under the surviving valid descriptor. Condemning it would be
+/// terminal for a range-tombstone SST, which salvage cannot re-emit — and the
+/// framing check exists to separate this case from the mis-framing one, not to
+/// fail both.
+#[test]
+fn verify_sst_file_lone_recognized_mirror_that_frames_stays_authoritative() {
+    let dir = tempfile::tempdir().unwrap();
+    populate_tree(dir.path(), 200);
+    let sst_path = pick_first_sst_path(dir.path());
+
+    let report = verify_sst_file(&sst_path);
+    assert!(
+        report.is_ok(),
+        "intact SST must be clean: {:?}",
+        report.errors,
+    );
+
+    // Only the TAIL descriptor is forged to an unknown kind; `meta_mid` keeps
+    // the real one, which frames the blocks.
+    crate::test_forge::forge_tail_meta_value(&sst_path, b"descriptor#page_ecc", &[9, 0, 0, 0])
+        .unwrap();
+
+    let report = verify_sst_file(&sst_path);
+    assert!(
+        report.errors.is_empty(),
+        "the surviving descriptor frames the data, so the walk must proceed \
+         under it: {:?}",
+        report.errors,
+    );
+    assert!(
+        !report.incomplete,
+        "the data blocks were walked, so the scan is complete",
+    );
+    assert!(
+        report.is_ok(),
+        "a descriptor-only forge on one mirror must not condemn a healthy table",
+    );
+}
