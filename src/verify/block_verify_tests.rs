@@ -2076,3 +2076,60 @@ fn codec_confirms_region_skips_a_block_whose_declared_length_exceeds_the_cap() -
 fn cap_for_test() -> u64 {
     block_data_length_cap(0)
 }
+
+/// "Every clean block matches" cannot be delivered by a bounded prefix. An
+/// impostor that agrees on a run of degenerate blocks and diverges past the
+/// bound would be confirmed, and the walk would then report that divergence as
+/// damage on an otherwise healthy table. Nine blocks: eight uniform (the two
+/// codecs agree on those) and a ninth that discriminates.
+#[cfg(feature = "page_ecc")]
+#[test]
+fn arbitrate_by_framing_rejects_an_impostor_that_diverges_past_a_prefix() -> crate::Result<()> {
+    use crate::fs::{Fs, FsOpenOptions, StdFs};
+    use crate::table::block::EccParams;
+
+    const LEN: u32 = 4096;
+    const DEGENERATE_RUN: usize = 8;
+    let real = EccParams::RS_4_2;
+    let impostor = EccParams::try_new(2, 1)?;
+
+    let degenerate = vec![0xABu8; LEN as usize];
+    let degenerate_parity = crate::ecc::encode_parity(&degenerate, 4, 2).expect("RS(4,2) encodes");
+    assert_eq!(
+        degenerate_parity,
+        crate::ecc::encode_parity(&degenerate, 2, 1).expect("XOR(2,1) encodes"),
+        "the run must be one the two codecs agree on, or it does not reach past \
+         the old bound",
+    );
+
+    let discriminating = discriminating_payload(LEN);
+    let discriminating_parity =
+        crate::ecc::encode_parity(&discriminating, 4, 2).expect("RS(4,2) encodes");
+
+    let mut blocks: Vec<SyntheticBlock> = (0..DEGENERATE_RUN)
+        .map(|_| (degenerate.clone(), degenerate_parity.clone()))
+        .collect();
+    blocks.push((discriminating, discriminating_parity));
+
+    let dir = tempfile::tempdir()?;
+    let path = dir.path().join("nine-blocks.sst");
+    write_block_archive(&path, &[("data", blocks)])?;
+
+    let mut probe = StdFs.open(&path, &FsOpenOptions::new().read(true))?;
+    let sfa_reader = crate::sfa::Reader::from_reader(&mut probe)?;
+    let toc = sfa_reader.toc();
+    let cap = block_data_length_cap(0);
+
+    assert_eq!(
+        arbitrate_by_framing(probe.as_ref(), toc, ScrubEcc::Scheme(real), 0, cap),
+        Some(true),
+        "the real codec reproduces every trailer",
+    );
+    assert_eq!(
+        arbitrate_by_framing(probe.as_ref(), toc, ScrubEcc::Scheme(impostor), 0, cap),
+        Some(false),
+        "the impostor diverges on the ninth block — a sample that stops earlier \
+         confirms it and leaves the walk to condemn a healthy table",
+    );
+    Ok(())
+}

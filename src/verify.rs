@@ -1259,15 +1259,16 @@ fn codec_confirms_region(
     {
         use crate::table::block::Header;
 
-        // A bounded sample: enough for a mismatch to surface past a degenerate
-        // block, without turning arbitration into a second full walk.
-        const MAX_BLOCKS: usize = 8;
+        // The WHOLE region, not a sample. A bounded prefix cannot deliver
+        // "every clean block matches": an impostor that agrees on the first few
+        // degenerate blocks and diverges past the bound would be confirmed, and
+        // the walk would then report the divergence as damage. A mismatch exits
+        // immediately, so only the CONFIRMING case pays for the full pass — and
+        // only on the mixed-descriptor branch, which a healthy table never
+        // reaches.
         let mut offset = start;
         let mut judged = false;
-        for _ in 0..MAX_BLOCKS {
-            if offset >= end {
-                break;
-            }
+        while offset < end {
             let remaining = end - offset;
             let want =
                 usize::try_from(remaining).map_or(Header::MAX_LEN, |r| r.min(Header::MAX_LEN));
@@ -1287,6 +1288,15 @@ fn codec_confirms_region(
             let header_len = Header::header_len(header.block_type) as u64;
             let parity_bytes = crate::table::block::expected_parity_len(header.data_length, params);
             let parity_len = u64::from(parity_bytes);
+            // The trailer needs its own bound, and not because of the payload:
+            // a high-amplification scheme derives one from a SMALL payload. A
+            // forged `RS(1, 255)` descriptor turns a payload well inside the cap
+            // into a parity length near `u32::MAX`, so the read below would
+            // reserve gigabytes before any check could report the forgery. The
+            // walk applies the same cap; no real configuration exceeds it.
+            if parity_len > MAX_BLOCK_DATA_LENGTH {
+                break;
+            }
             let payload_at = offset.checked_add(header_len)?;
             let trailer_at = payload_at.checked_add(u64::from(header.data_length))?;
             let next = trailer_at.checked_add(parity_len)?;
