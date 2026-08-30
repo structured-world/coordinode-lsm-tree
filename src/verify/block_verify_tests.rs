@@ -1961,14 +1961,21 @@ fn arbitrate_by_framing_rejects_an_impostor_that_matches_only_a_degenerate_block
     Ok(())
 }
 
-/// A damaged trailer is not evidence about the CODEC. When the data region's
-/// only block has a rotted trailer, the region rejects — but another region
-/// that confirms the same codec settles it, and the descriptor must survive so
-/// the walk reports the damaged block as `EccParityMismatch` instead of
-/// skipping the section that holds it.
+/// A rotted trailer refuses the candidate even though another region agrees
+/// with it. Agreement cannot answer positive disagreement: same-length schemes
+/// reproduce each other's trailer on some payloads, so the agreeing region may
+/// be a coincidence while the disagreeing one is real.
+///
+/// The cost is deliberate. This table's trailer is merely damaged, and the walk
+/// now skips its ECC-dependent sections and reports "unrecognized, incomplete"
+/// rather than naming the block. It still fails verification and still routes
+/// to salvage — only the reason is less specific. The opposite error would
+/// accept an impostor and report corruption on HEALTHY data, which rewrites
+/// intact tables.
 #[cfg(feature = "page_ecc")]
 #[test]
-fn arbitrate_by_framing_keeps_a_codec_confirmed_by_another_region() -> crate::Result<()> {
+fn arbitrate_by_framing_rejects_a_rotted_trailer_despite_another_region_agreeing()
+-> crate::Result<()> {
     use crate::fs::{Fs, FsOpenOptions, StdFs};
     use crate::table::block::EccParams;
 
@@ -2015,9 +2022,8 @@ fn arbitrate_by_framing_keeps_a_codec_confirmed_by_another_region() -> crate::Re
     );
     assert_eq!(
         arbitrate_by_framing(probe.as_ref(), toc, ScrubEcc::Scheme(real), 0, cap),
-        Some(true),
-        "another region confirms the codec, so the descriptor survives and the \
-         walk gets to report the damaged block",
+        Some(false),
+        "the other region's agreement does not answer this one's disagreement",
     );
     Ok(())
 }
@@ -2059,7 +2065,7 @@ fn codec_confirms_region_skips_a_block_whose_declared_length_exceeds_the_cap() -
             end,
             cap_for_test()
         ),
-        CodecVerdict::Informative,
+        CodecVerdict::Confirmed,
         "under the real cap the block is read and confirms the codec",
     );
     assert_eq!(
@@ -2268,13 +2274,14 @@ fn arbitrate_by_framing_rejects_when_only_a_degenerate_region_agrees() -> crate:
             tli.pos() + tli.len(),
             cap,
         ),
-        CodecVerdict::Degenerate,
+        CodecVerdict::Confirmed,
         "the impostor agrees with the all-zero region — the premise of this test",
     );
     assert_eq!(
         arbitrate_by_framing(probe.as_ref(), toc, ScrubEcc::Scheme(impostor), 0, cap),
         Some(false),
-        "the healthy region disagreed, and only a degenerate region agreed",
+        "one region agreed and another positively disagreed — agreement never \
+         answers disagreement, whatever the trailer looked like",
     );
     assert_eq!(
         arbitrate_by_framing(probe.as_ref(), toc, ScrubEcc::Scheme(real), 0, cap),
@@ -2284,12 +2291,11 @@ fn arbitrate_by_framing_rejects_when_only_a_degenerate_region_agrees() -> crate:
     Ok(())
 }
 
-/// The index TAIL mirror is its own region. The writer emits it so one damaged
-/// index copy cannot take the other down, and it is written under the SAME
-/// codec — so when the data region offers no clean block and the head's trailer
-/// is the damaged one, the intact tail still speaks for the codec. Leaving it
-/// out rejects the descriptor, marks ECC unrecognized and skips the very
-/// sections whose damage the walk was supposed to report.
+/// The index TAIL mirror is its own region, and it can be the ONLY one able to
+/// speak. The writer emits it so a damaged index copy cannot take the other
+/// down, and it is written under the same codec — so when neither the data
+/// region nor the head offers a checksum-clean block, the intact tail is what
+/// keeps the descriptor from being refused for lack of evidence.
 #[cfg(feature = "page_ecc")]
 #[test]
 fn arbitrate_by_framing_consults_the_tli_tail_mirror() -> crate::Result<()> {
@@ -2301,10 +2307,10 @@ fn arbitrate_by_framing_consults_the_tli_tail_mirror() -> crate::Result<()> {
 
     let data_payload = discriminating_payload(LEN);
     let data_parity = crate::ecc::encode_parity(&data_payload, 4, 2).expect("RS(4,2) encodes");
-    // Head index copy: clean payload, ROTTED trailer.
+    // Head index copy: its payload checksum is broken below, so it offers no
+    // evidence either way.
     let head = discriminating_payload(LEN / 2);
-    let mut head_parity = crate::ecc::encode_parity(&head, 4, 2).expect("RS(4,2) encodes");
-    *head_parity.first_mut().expect("non-empty trailer") ^= 0xFF;
+    let head_parity = crate::ecc::encode_parity(&head, 4, 2).expect("RS(4,2) encodes");
     // Tail mirror: intact, under the same codec.
     let tail = discriminating_payload(LEN / 2);
     let tail_parity = crate::ecc::encode_parity(&tail, 4, 2).expect("RS(4,2) encodes");
@@ -2320,20 +2326,26 @@ fn arbitrate_by_framing_consults_the_tli_tail_mirror() -> crate::Result<()> {
         ],
     )?;
 
-    // Break the DATA payload's checksum so that region offers no evidence,
-    // leaving the two index copies to decide.
-    let data_pos = {
+    // Break the DATA and HEAD payload checksums so neither offers evidence,
+    // leaving the tail mirror as the only region that can speak.
+    let (data_pos, tli_pos) = {
         let mut probe = StdFs.open(&path, &FsOpenOptions::new().read(true))?;
         let reader = crate::sfa::Reader::from_reader(&mut probe)?;
-        reader
-            .toc()
-            .section(b"data")
-            .expect("the fixture has a data section")
-            .pos()
+        let toc = reader.toc();
+        (
+            toc.section(b"data")
+                .expect("the fixture has a data section")
+                .pos(),
+            toc.section(b"tli")
+                .expect("the fixture has a tli section")
+                .pos(),
+        )
     };
     {
         let mut f = StdFs.open(&path, &FsOpenOptions::new().write(true))?;
         f.seek(SeekFrom::Start(data_pos + Header::MIN_LEN as u64))?;
+        f.write_all(&[0xFF])?;
+        f.seek(SeekFrom::Start(tli_pos + Header::MIN_LEN as u64))?;
         f.write_all(&[0xFF])?;
     }
 
@@ -2351,14 +2363,14 @@ fn arbitrate_by_framing_consults_the_tli_tail_mirror() -> crate::Result<()> {
             tli.pos() + tli.len(),
             cap,
         ),
-        CodecVerdict::Rejected,
-        "the head's rotted trailer rejects on its own — the premise of this test",
+        CodecVerdict::NoEvidence,
+        "the head offers nothing to judge on — the premise of this test",
     );
     assert_eq!(
         arbitrate_by_framing(probe.as_ref(), toc, ScrubEcc::Scheme(real), 0, cap),
         Some(true),
-        "the intact tail mirror confirms the codec, so the descriptor survives \
-         and the walk gets to report the head's damaged trailer",
+        "the intact tail mirror is the only region able to speak, and it \
+         confirms the codec",
     );
     Ok(())
 }
