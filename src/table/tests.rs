@@ -753,11 +753,16 @@ fn metadata_bounds_accept_a_legacy_bitmap_when_digest_authenticated() -> crate::
         Table::recover(params)?
     };
     assert!(
-        table.verify_metadata_bounds(false).is_err(),
+        matches!(
+            table.verify_reconcile_gates(None, false),
+            Err((crate::table::ReconcileGate::MetadataBounds, _))
+        ),
         "repair (no matching digest) keeps failing closed on the \
          unauthenticatable legacy bitmap",
     );
-    table.verify_metadata_bounds(true)?;
+    if let Err((gate, e)) = table.verify_reconcile_gates(None, true) {
+        panic!("an authenticated digest accepts the legacy bitmap, {gate:?} refused it: {e}");
+    }
     Ok(())
 }
 
@@ -1519,6 +1524,77 @@ fn twelve_letter_items() -> Vec<crate::InternalValue> {
     (b'a'..=b'l')
         .map(|c| crate::InternalValue::from_components([c], b"v", 0, crate::ValueType::Value))
         .collect()
+}
+
+/// Reads a whole reconcile costs on a table of `blocks` four-entry data blocks,
+/// counted at the filesystem. The table carries a zone map so the section-level
+/// gates take part too. On a REAL on-disk file: the claim is about what a
+/// reconcile costs in I/O, so the medium it is measured on should be the one it
+/// runs against.
+fn reconcile_read_count(blocks: usize) -> crate::Result<(usize, usize)> {
+    use crate::fs::{FaultFs, StdFs};
+
+    let dir = tempfile::tempdir()?;
+    let faulty = std::sync::Arc::new(FaultFs::new(StdFs));
+    let injector = faulty.injector();
+    let path = dir.path().join("table");
+
+    let mut writer = Writer::new(path.clone(), 0, 0, faulty.clone())?.use_zone_map(true);
+    for idx in 0..blocks * 4 {
+        if idx % 4 == 0 {
+            writer.spill_block()?;
+        }
+        writer.write(crate::InternalValue::from_components(
+            alloc::format!("key{idx:04}").into_bytes(),
+            b"v".as_slice(),
+            0,
+            crate::ValueType::Value,
+        ))?;
+    }
+    let Some((_, checksum)) = writer.finish()? else {
+        panic!("the fixture writes entries");
+    };
+    let mut params = test_recover_params(path, checksum);
+    params.fs = faulty;
+    let table = Table::recover(params)?;
+    assert_eq!(
+        table.block_index.iter().count(),
+        blocks,
+        "the fixture must produce one data block per four entries",
+    );
+
+    injector.clear();
+    if let Err((gate, e)) = table.verify_reconcile_gates(None, false) {
+        panic!("a healthy table must pass every gate, {gate:?} refused it: {e}");
+    }
+    Ok((injector.read_count(), injector.open_count()))
+}
+
+/// The reconcile gates must share ONE read of each live block. Each of them
+/// used to walk the table itself, so a reconcile re-read and re-decoded every
+/// block once per gate and repair time grew with the gate count.
+///
+/// Asserted as a SLOPE: doubling the blocks must cost exactly one extra read
+/// per added block. A per-gate walk would charge one per gate per block, so
+/// the old shape cannot satisfy this no matter what the constant term is.
+#[test]
+fn reconcile_gates_read_each_block_once() -> crate::Result<()> {
+    let (small, small_opens) = reconcile_read_count(3)?;
+    let (large, large_opens) = reconcile_read_count(6)?;
+    assert_eq!(
+        large - small,
+        3,
+        "three more blocks must cost three more reads, got {small} then {large}",
+    );
+    // The sections are read through ONE lent handle, so the whole pass opens
+    // the file once however many sections it consults and however many blocks
+    // it walks. A reader that opens for itself makes this the section count.
+    assert_eq!(
+        (small_opens, large_opens),
+        (1, 1),
+        "a reconcile must open the table once",
+    );
+    Ok(())
 }
 
 /// A restriction landing on a block's LAST key leaves nearly that whole block
@@ -5186,7 +5262,9 @@ fn columnar_zone_map_records_per_column_stats_and_round_trips() -> crate::Result
 
     // The writer's per-column map and the verifier's re-derivation agree, so the
     // forgery cross-check accepts the honest table.
-    table.verify_zone_map()?;
+    if let Err((gate, e)) = table.verify_reconcile_gates(None, false) {
+        panic!("the honest columnar table must pass every gate, {gate:?} refused it: {e}");
+    }
     Ok(())
 }
 
@@ -5797,6 +5875,103 @@ fn write_columnar_batch_accounts_tombstones_seqno_bounds_and_restart_locator() -
     Ok(())
 }
 
+/// The index SEPARATOR cross-check is a gate of the reconcile pass, fed from
+/// the walk's decode. A separator lowered in BOTH mirrors keeps the handle list
+/// sorted, the mirrors equal and the section tiling intact — every byte-level
+/// and structural check reads clean — yet the binary search then routes keys in
+/// `(forged_separator, real_last_key]` to the wrong block. The pass must refuse
+/// the table and name the separator gate, not merely fail somewhere.
+#[test]
+fn reconcile_gates_lowered_tli_separator_rejects_with_separators_gate() -> crate::Result<()> {
+    let dir = tempdir()?;
+    let file = dir.path().join("t");
+
+    // Small blocks so the table has several data blocks (the forge lowers the
+    // first block's separator and needs a next one to stay below).
+    let mut writer = Writer::new(file.clone(), 0, 0, Arc::new(StdFs))?.use_data_block_size(128);
+    for i in 0u64..64 {
+        writer.write(crate::InternalValue::from_components(
+            alloc::format!("key-{i:04}").into_bytes(),
+            alloc::format!("v{i:04}").into_bytes(),
+            i + 1,
+            crate::ValueType::Value,
+        ))?;
+    }
+    let (_, checksum) = writer.finish()?.expect("table written");
+
+    let table = recover_test_table(&file, checksum)?;
+    if let Err((gate, e)) = table.verify_reconcile_gates(None, false) {
+        panic!("intact separators must pass every gate, {gate:?} refused it: {e}");
+    }
+
+    crate::test_forge::forge_tli_mirrors_lower_first_separator(&file, 0, None)?;
+
+    let table = recover_test_table(&file, checksum)?;
+    let result = table.verify_reconcile_gates(None, false);
+    assert!(
+        matches!(
+            result,
+            Err((
+                crate::table::ReconcileGate::Separators,
+                crate::Error::InvalidHeader(
+                    "tli separator does not match the addressed block's decoded last key"
+                )
+            ))
+        ),
+        "a lowered separator must be rejected by the separator gate, got {:?}",
+        result.map_err(|(gate, e)| (gate, e.to_string())),
+    );
+    Ok(())
+}
+
+/// The per-KV gate is fed from the entries the walk materialized rather than
+/// decoding the block a second time for itself. It must still catch a footer
+/// whose stored digest no longer matches the entry bytes behind a re-stamped
+/// block checksum — the block-level walk reads that clean — and the pass must
+/// name THAT gate, not merely fail somewhere.
+#[test]
+fn reconcile_gates_stale_kv_footer_rejects_with_kv_checksums_gate() -> crate::Result<()> {
+    use crate::runtime_config::{ChecksumAlgorithm, KvChecksumPolicy};
+
+    let dir = tempdir()?;
+    let file = dir.path().join("t");
+
+    // Uncompressed: the forge patches the payload in place.
+    let mut writer = Writer::new(file.clone(), 0, 0, Arc::new(StdFs))?
+        .use_kv_checksums(KvChecksumPolicy::AllLevels, ChecksumAlgorithm::Xxh3_64);
+    for i in 0u64..40 {
+        writer.write(crate::InternalValue::from_components(
+            alloc::format!("key-{i:04}").into_bytes(),
+            alloc::format!("v{i:04}").into_bytes(),
+            i + 1,
+            crate::ValueType::Value,
+        ))?;
+    }
+    let (_, checksum) = writer.finish()?.expect("table written");
+
+    let table = recover_test_table(&file, checksum)?;
+    if let Err((gate, e)) = table.verify_reconcile_gates(None, false) {
+        panic!("an intact footer must pass every gate, {gate:?} refused it: {e}");
+    }
+
+    crate::test_forge::forge_stale_kv_footer(&file)?;
+
+    let table = recover_test_table(&file, checksum)?;
+    let result = table.verify_reconcile_gates(None, false);
+    assert!(
+        matches!(
+            result,
+            Err((
+                crate::table::ReconcileGate::KvChecksums,
+                crate::Error::ChecksumMismatch { .. }
+            ))
+        ),
+        "a stale per-KV footer must be rejected by the per-KV gate, got {:?}",
+        result.map_err(|(gate, e)| (gate, e.to_string())),
+    );
+    Ok(())
+}
+
 /// `verify_locator` must reject a locator re-stamped to resolve a key to a
 /// block OTHER than the one holding its newest version: every byte-level
 /// check reads clean, but `point_read_inner` trusts the answer and can return
@@ -5830,7 +6005,9 @@ fn verify_locator_rejects_a_redirected_key_mapping() -> crate::Result<()> {
 
     let table = recover_test_table(&file, checksum)?;
     // Intact locator verifies clean.
-    table.verify_locator()?;
+    if let Err((gate, e)) = table.verify_reconcile_gates(None, false) {
+        panic!("an intact locator must pass every gate, {gate:?} refused it: {e}");
+    }
 
     // Rebuild the SAME ribbon (same key set, same widths → byte-identical
     // length) but redirect the FIRST key to a DIFFERENT block ordinal.
@@ -5862,10 +6039,17 @@ fn verify_locator_rejects_a_redirected_key_mapping() -> crate::Result<()> {
     crate::test_forge::forge_replace_section_payload(&file, b"locator", &forged, None)?;
 
     let table = recover_test_table(&file, checksum)?;
-    let result = table.verify_locator();
+    let result = table.verify_reconcile_gates(None, false);
     assert!(
-        matches!(result, Err(crate::Error::InvalidHeader(_))),
-        "a redirected locator must be rejected, got {result:?}",
+        matches!(
+            result,
+            Err((
+                crate::table::ReconcileGate::Locator,
+                crate::Error::InvalidHeader(_)
+            ))
+        ),
+        "a redirected locator must be rejected by the locator gate, got {:?}",
+        result.map_err(|(gate, e)| (gate, e.to_string())),
     );
     Ok(())
 }

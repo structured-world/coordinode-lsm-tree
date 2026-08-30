@@ -893,21 +893,6 @@ fn refresh_healed_checksum(
         );
     }
 
-    // The walk verifies raw block checksums but never DECODES entries, so a
-    // stale per-KV footer behind a re-stamped block checksum still reads
-    // clean at the block level. Footer-bearing tables get the per-KV
-    // verification too before the digest is trusted (a table without
-    // footers makes this a no-op).
-    if let Err(e) = table.verify_kv_checksums() {
-        return refuse(
-            alloc::format!(
-                "digest mismatch with a per-KV verification failure ({e}); the \
-             manifest digest was not refreshed"
-            ),
-            definitive(&e),
-        );
-    }
-
     // The `linked_blob_files` section carries no per-section checksum and
     // the walk can only validate its SHAPE, so a flipped blob id passes it.
     // Cross-check the recorded ids against the table's own indirection
@@ -936,80 +921,6 @@ fn refresh_healed_checksum(
         );
     }
 
-    // The seqno_bounds block is checksum-clean to the walk even when its
-    // payload was re-stamped to another structurally valid map, and
-    // scan_since_seqno trusts it to SKIP blocks. Cross-check every recorded
-    // range against the blocks' decoded entries (a no-op without the
-    // section) before trusting the digest.
-    if let Err(e) = table.verify_seqno_bounds() {
-        return refuse(
-            alloc::format!(
-                "digest mismatch with a seqno-bounds cross-check failure ({e}); \
-             the manifest digest was not refreshed"
-            ),
-            definitive(&e),
-        );
-    }
-
-    // The walk verifies only the outer frame, so a checksum-clean block whose
-    // trailer declares more entries than it decodes reads clean; full-decode
-    // every block and confirm the counts match before trusting the digest,
-    // or restamping would legitimize a silently-truncated tail.
-    if let Err(e) = table.verify_block_entry_counts() {
-        return refuse(
-            alloc::format!(
-                "digest mismatch with a block entry-count mismatch ({e}); \
-             the manifest digest was not refreshed"
-            ),
-            definitive(&e),
-        );
-    }
-
-    // The zone_map block is checksum-clean to the walk even when its payload
-    // was re-stamped to another structurally valid map, and a predicate scan
-    // trusts its min/max to SKIP blocks. Cross-check every recorded range
-    // against the blocks' decoded key ranges (a no-op without the section)
-    // before trusting the digest.
-    if let Err(e) = table.verify_zone_map() {
-        return refuse(
-            alloc::format!(
-                "digest mismatch with a zone-map cross-check failure ({e}); \
-             the manifest digest was not refreshed"
-            ),
-            definitive(&e),
-        );
-    }
-
-    // The locator block is checksum-clean to the walk even when re-stamped to
-    // resolve a key to a block other than its newest-version block, and
-    // point_read trusts its answer. Cross-check every key's mapping against
-    // its decoded newest-version block (a no-op without the section) before
-    // trusting the digest.
-    if let Err(e) = table.verify_locator() {
-        return refuse(
-            alloc::format!(
-                "digest mismatch with a locator cross-check failure ({e}); \
-             the manifest digest was not refreshed"
-            ),
-            definitive(&e),
-        );
-    }
-
-    // The filter block is checksum-clean to the walk even when its payload
-    // was re-stamped to another parseable filter, and check_bloom trusts it
-    // to SKIP point reads — a key made into a false negative silently
-    // disappears from every read. Probe every decoded key against the
-    // on-disk filter (a no-op without one) before trusting the digest.
-    if let Err(e) = table.verify_filter(tree.prefix_extractor().as_ref()) {
-        return refuse(
-            alloc::format!(
-                "digest mismatch with a filter cross-check failure ({e}); \
-             the manifest digest was not refreshed"
-            ),
-            definitive(&e),
-        );
-    }
-
     // The block_layout block is checksum-clean to the walk even when a
     // cumulative end was re-stamped to another structurally valid value, and
     // the partial range-read path trusts it to bound decompression — a
@@ -1026,34 +937,33 @@ fn refresh_healed_checksum(
         );
     }
 
-    // A data block's embedded hash / binary index is checksum-clean to the
-    // walk even when a bucket was re-stamped to MARKER_FREE, yet point_read
-    // trusts it and returns None for the affected keys. Probe every decoded
-    // key through the full point-read path before trusting the digest.
-    if let Err(e) = table.verify_point_read_reachability() {
-        return refuse(
-            alloc::format!(
-                "digest mismatch with a point-read reachability failure ({e}); \
-             the manifest digest was not refreshed"
-            ),
-            definitive(&e),
-        );
-    }
-
-    // Both meta mirrors re-stamped CONSISTENTLY pass the mirror comparison,
-    // yet run selection trusts the recorded key range to route reads AROUND
-    // this table — a narrowed range silently hides real keys and the range
-    // tombstones that mask older tables. Cross-check the recorded bounds
-    // against the decoded contents before trusting the digest.
+    // The semantic cross-checks that need the block CONTENTS, run on ONE
+    // decode of each live block instead of a full pass each. Every one of them
+    // catches a section that is checksum-clean to the out-of-band walk yet
+    // lies about the entries, and each keeps its own wording so a refusal
+    // still names what disagreed.
+    //
     // `true`: this is the attributable branch — the pre-heal digest matched
     // the manifest, authenticating every byte outside this pass's data-block
     // corrections, the bitmap section included. A legacy table without
     // `descriptor#delete_bitmap_hash` must still reconcile here.
-    if let Err(e) = table.verify_metadata_bounds(true) {
+    if let Err((gate, e)) = table.verify_reconcile_gates(tree.prefix_extractor().as_ref(), true) {
+        use crate::table::ReconcileGate as G;
+        let what = match gate {
+            G::Separators => "an index separator cross-check failure",
+            G::KvChecksums => "a per-KV verification failure",
+            G::SeqnoBounds => "a seqno-bounds cross-check failure",
+            G::BlockEntryCounts => "a block entry-count mismatch",
+            G::ZoneMap => "a zone-map cross-check failure",
+            G::Locator => "a locator cross-check failure",
+            G::Filter => "a filter cross-check failure",
+            G::PointReadReachability => "a point-read reachability failure",
+            G::MetadataBounds => "a metadata-bounds cross-check failure",
+        };
         return refuse(
             alloc::format!(
-                "digest mismatch with a metadata-bounds cross-check failure ({e}); \
-             the manifest digest was not refreshed"
+                "digest mismatch with {what} ({e}); the manifest digest was \
+                 not refreshed"
             ),
             definitive(&e),
         );

@@ -1176,20 +1176,6 @@ fn block_verify_verdict(
         // self-describing meta blocks must not mask the skipped data /
         // index sections.
         BlockVerifyVerdict::DegradedUnscanned
-    } else if is_corruption(table.verify_kv_checksums())? {
-        // The walk verifies raw block checksums but never DECODES entries,
-        // so a stale per-KV footer behind a re-stamped block checksum still
-        // reads clean at the block level. Footer-bearing tables must pass
-        // the per-KV verification (a no-op without footers) BEFORE the
-        // degradation arms below: a forged footer also leaves the parity
-        // trailer mismatched, and grading that "parity-only degradation"
-        // would let the keep-decision retain a table with a KNOWN-stale
-        // entry digest. The salvage row path validates footers and drops
-        // the forged block, so route it there. (Runs after the
-        // unrecognized-ECC arm: the live table opened under its OWN
-        // recovered descriptor, but an out-of-band unrecognized descriptor
-        // already means nothing about the data was verified.)
-        BlockVerifyVerdict::Corrupt
     } else if is_corruption(table.verify_blob_links())? {
         // Same reasoning for the blob-link list: the section carries no
         // per-section checksum, so the walk can only validate its SHAPE — a
@@ -1211,42 +1197,6 @@ fn block_verify_verdict(
         // hidden block is recovered (or reported dropped), never silently
         // missing from an apparently complete copy.
         BlockVerifyVerdict::Corrupt
-    } else if is_corruption(table.verify_seqno_bounds())? {
-        // The seqno_bounds block is checksum-clean to the walk even when
-        // its payload was re-stamped to another structurally valid map, and
-        // scan_since_seqno trusts it to SKIP blocks — keeping the table
-        // would silently omit live entries from every seqno-scoped scan.
-        // Salvage re-derives the bounds from the re-emitted entries.
-        BlockVerifyVerdict::Corrupt
-    } else if is_corruption(table.verify_block_entry_counts())? {
-        // The out-of-band walk verifies only the outer frame and the per-KV
-        // gate is a no-op without footers, so a checksum-clean block whose
-        // trailer declares more entries than it decodes (a valid prefix, a
-        // malformed tail) grades clean while a later scan silently omits the
-        // tail. Full-decode every block; a count mismatch routes the table
-        // through salvage (whose row path drops the under-decoding block).
-        BlockVerifyVerdict::Corrupt
-    } else if is_corruption(table.verify_zone_map())? {
-        // A checksum-clean zone_map re-stamped to another structurally valid
-        // map would let a predicate scan skip blocks its forged min/max
-        // excludes, silently omitting matching rows. Diverging stats are
-        // corruption; salvage re-derives the zone map from the re-emitted
-        // blocks.
-        BlockVerifyVerdict::Corrupt
-    } else if is_corruption(table.verify_locator())? {
-        // A checksum-clean locator re-stamped to resolve a key to a block
-        // other than its newest-version block would make point_read return a
-        // stale value without falling back to the sorted index. A mapping
-        // that disagrees with the decoded blocks is corruption; salvage
-        // rebuilds the locator from the re-emitted entries.
-        BlockVerifyVerdict::Corrupt
-    } else if is_corruption(table.verify_filter(config.prefix_extractor.as_ref()))? {
-        // A checksum-clean filter re-stamped to another parseable filter
-        // makes check_bloom silently skip point reads for any key turned
-        // into a false negative. An existing key the filter reports as
-        // definitely absent is corruption; salvage rebuilds the filter from
-        // the re-emitted keys.
-        BlockVerifyVerdict::Corrupt
     } else if is_corruption(table.verify_block_layout())? {
         // A checksum-clean block_layout re-stamped to another structurally
         // valid boundary set mis-maps the partial range-read path's
@@ -1254,20 +1204,37 @@ fn block_verify_verdict(
         // disagree with the frames' actual inner blocks are corruption;
         // salvage re-derives the layout when re-encoding.
         BlockVerifyVerdict::Corrupt
-    } else if is_corruption(table.verify_point_read_reachability())? {
-        // A checksum-clean embedded hash / binary index re-stamped to hide a
-        // key (a MARKER_FREE bucket, a misdirected offset) makes point_read
-        // miss existing data. Keys the block decodes but point_read cannot
-        // retrieve are corruption; salvage re-emits the block with fresh
-        // indexes.
-        BlockVerifyVerdict::Corrupt
-    } else if is_corruption(table.verify_metadata_bounds(false))? {
-        // Both meta mirrors re-stamped CONSISTENTLY pass the mirror
-        // comparison, yet run selection trusts the recorded key range — a
-        // narrowed range hides real keys (and the range tombstones masking
-        // older tables). Bounds that disagree with the decoded contents are
-        // corruption; salvage re-derives the metadata from the re-emitted
-        // entries.
+    } else if is_corruption(
+        table
+            .verify_reconcile_gates(config.prefix_extractor.as_ref(), false)
+            .map_err(|(_, e)| e),
+    )? {
+        // The semantic cross-checks, all on ONE decode of each live block.
+        // Every one of them catches a section that is checksum-clean to the
+        // out-of-band walk yet lies about the entries, and every one routes
+        // the table to salvage, which rebuilds the section from the re-emitted
+        // data:
+        //
+        // - per-KV footers: a stale digest behind a re-stamped block checksum.
+        //   Graded BEFORE the degradation arms below — a forged footer also
+        //   leaves the parity trailer mismatched, and grading that as
+        //   "parity-only degradation" would retain a table with a KNOWN-stale
+        //   entry digest.
+        // - seqno bounds: re-stamped to another structurally valid map, which
+        //   `scan_since_seqno` trusts to SKIP blocks.
+        // - entry counts: a valid prefix followed by a malformed tail decodes
+        //   short while the trailer still declares the full count.
+        // - zone map: forged min/max let a predicate scan skip blocks holding
+        //   matching rows.
+        // - locator: re-stamped to resolve a key to a block other than its
+        //   newest-version one, so point_read returns a stale value without
+        //   falling back to the sorted index.
+        // - filter: an existing key turned into a false negative disappears
+        //   from every read.
+        // - point-read reachability: a hidden hash bucket or a misdirected
+        //   offset makes point_read miss data the block still decodes.
+        // - metadata bounds: a narrowed key range hides real keys (and the
+        //   range tombstones masking older tables) from run selection.
         BlockVerifyVerdict::Corrupt
     } else if !report.is_ok() {
         // Parity-ONLY rot: every payload checksum verified clean, only the

@@ -2645,11 +2645,15 @@ fn heal_in_place_does_not_restamp_over_a_forged_data_block_count() -> crate::Res
 /// key: both mirrors re-encoded with the first block's separator lowered to
 /// a truncated prefix stay equal, sorted, and section-tiling — yet after
 /// reopen the index binary search routes keys in `(forged_separator,
-/// real_last_key]` to the wrong block, so `point_read` misses existing
-/// keys. The in-memory point-read reachability gate does not catch this on
-/// the heal path (the live table keeps its correct recovery-time index), so
-/// the disk-fresh separator must be cross-checked against the addressed
-/// block's decoded final key.
+/// real_last_key]` to the wrong block, so `point_read` misses existing keys.
+///
+/// What refuses it here is the ATTRIBUTION rule, not a cross-check: the forge
+/// landed before this pass, so the pre-heal digest already disagreed with the
+/// manifest and the mismatch is not attributable to any correction this pass
+/// made. The gate chain (separators included) is only reached on the
+/// attributable branch, which a pre-existing forge can never satisfy — so this
+/// pins the attribution guard, and the separator cross-check itself is pinned
+/// against the reconcile pass directly in the table tests.
 #[test]
 fn heal_in_place_does_not_restamp_over_a_forged_tli_separator() -> crate::Result<()> {
     let dir = tempfile::tempdir()?;

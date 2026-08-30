@@ -1171,30 +1171,9 @@ impl DataBlock {
         comparator: crate::comparator::SharedComparator,
         expected_algo: Option<crate::runtime_config::ChecksumAlgorithm>,
     ) -> crate::Result<()> {
-        use super::block::{BlockType, ParsedItem, kv_checksum};
+        use super::block::ParsedItem;
 
-        let split = kv_checksum::split_full(footer_wrapped)?;
-
-        // Cross-check the footer's self-described algorithm against the
-        // per-SST descriptor when provided. A mismatch means the tag was
-        // flipped (writer bug / corruption); verifying under the wrong
-        // algorithm could otherwise pass against forged digests.
-        if let Some(expected) = expected_algo
-            && split.algo != expected
-        {
-            return Err(crate::Error::InvalidTrailer);
-        }
-
-        // The scrub only verifies Data blocks. The caller loads raw Data
-        // blocks, so a non-Data header here is corruption or a caller bug:
-        // reject it rather than coerce `block_type = Data`, which would verify
-        // a non-Data payload as if it were Data and defeat the scrub.
-        if header.block_type != BlockType::Data {
-            return Err(crate::Error::InvalidTag((
-                "BlockType",
-                header.block_type.into(),
-            )));
-        }
+        let mut probe = KvDigestProbe::open(footer_wrapped, header, expected_algo)?;
 
         // Decode the inner slice through the standard data-block path. Reuse
         // the real header (Copy) but present the inner slice as a consistent
@@ -1203,7 +1182,7 @@ impl DataBlock {
         // matches its bytes (the type gate then passes and no field lies).
         let mut inner_header = header;
         inner_header.block_flags &= !super::block::header::block_flags::KV_CHECKSUM_FOOTER;
-        let inner_len = split.inner.len();
+        let inner_len = probe.inner_len();
         #[expect(
             clippy::cast_possible_truncation,
             reason = "split.inner is a prefix of the footered payload, which fits u32"
@@ -1221,29 +1200,125 @@ impl DataBlock {
         });
         let inner_data = inner.inner.data.clone();
 
-        let mut idx = 0usize;
         for parsed in inner.try_iter(comparator)? {
-            let item = parsed.materialize(&inner_data);
-            // Read the stored digest on demand from the borrowed footer bytes
-            // (no owned Vec<u64> materialization — see `SplitFull`).
-            let stored = split.digest(idx).ok_or(crate::Error::InvalidTrailer)?;
-            let recomputed = kv_checksum::kv_digest(&item, split.algo)
-                .ok_or(crate::Error::FeatureUnsupported("kv-checksum-algorithm"))?;
-            if recomputed != stored {
-                return Err(crate::Error::ChecksumMismatch {
-                    got: crate::Checksum::from_raw(u128::from(recomputed)),
-                    expected: crate::Checksum::from_raw(u128::from(stored)),
-                });
-            }
-            idx += 1;
+            probe.observe(&parsed.materialize(&inner_data))?;
         }
+        probe.finish()
+    }
+}
 
-        if idx != split.count() {
-            // Footer claims a different entry count than the inner block
-            // decoded — structural inconsistency, not a content mismatch.
+/// Verifies entries against a block's per-KV digest footer, one entry at a
+/// time and in scan order.
+///
+/// Fed either by decoding the block ([`DataBlock::verify_kv_checked`]) or from
+/// entries a caller has ALREADY decoded (the reconcile walk, which materializes
+/// each block once for every gate). Both feed the same rule, so the gate does
+/// not pay a second decode of a block the walk just decoded.
+#[cfg_attr(
+    not(feature = "std"),
+    expect(
+        dead_code,
+        reason = "core+alloc per-KV scrub; the verify/scrub consumers are std-gated"
+    )
+)]
+pub(crate) struct KvDigestProbe<'a> {
+    /// The split footer: the digest array, borrowed rather than expanded.
+    split: super::block::kv_checksum::SplitFull<'a>,
+    /// How many entries have been observed, which is also the next digest's
+    /// index in scan order.
+    seen: usize,
+}
+
+#[cfg_attr(
+    not(feature = "std"),
+    expect(
+        dead_code,
+        reason = "core+alloc per-KV scrub; the verify/scrub consumers are std-gated"
+    )
+)]
+impl<'a> KvDigestProbe<'a> {
+    /// Splits `footer_wrapped`'s per-KV footer and runs the checks that judge
+    /// the footer itself, before any entry is looked at.
+    ///
+    /// # Errors
+    ///
+    /// - [`crate::Error::InvalidTrailer`] when the footer is malformed, or its
+    ///   self-described algorithm diverges from `expected_algo` (the per-SST
+    ///   `descriptor#kv_checksum` algorithm). A flipped tag would otherwise let
+    ///   the verification run under the wrong algorithm and silently pass.
+    ///   `None` skips that cross-check, leaving the footer authoritative.
+    /// - [`crate::Error::InvalidTag`] when the block is not a Data block. Only
+    ///   Data blocks carry per-KV footers, so a non-Data header is corruption
+    ///   or a caller bug: rejecting beats coercing the type, which would verify
+    ///   a non-Data payload as if it were Data.
+    pub(crate) fn open(
+        footer_wrapped: &'a Slice,
+        header: super::block::Header,
+        expected_algo: Option<crate::runtime_config::ChecksumAlgorithm>,
+    ) -> crate::Result<Self> {
+        let split = super::block::kv_checksum::split_full(footer_wrapped)?;
+        if let Some(expected) = expected_algo
+            && split.algo != expected
+        {
             return Err(crate::Error::InvalidTrailer);
         }
+        if header.block_type != super::block::BlockType::Data {
+            return Err(crate::Error::InvalidTag((
+                "BlockType",
+                header.block_type.into(),
+            )));
+        }
+        Ok(Self { split, seen: 0 })
+    }
+
+    /// Length of the footer-stripped inner payload, for a caller that decodes
+    /// the block itself.
+    pub(crate) fn inner_len(&self) -> usize {
+        self.split.inner.len()
+    }
+
+    /// Checks the next entry in scan order against its stored digest.
+    ///
+    /// # Errors
+    ///
+    /// - [`crate::Error::InvalidTrailer`] when the footer holds no digest for
+    ///   this position (it claims fewer entries than the block decodes to).
+    /// - [`crate::Error::FeatureUnsupported`] when the footer's algorithm is
+    ///   not compiled into this build.
+    /// - [`crate::Error::ChecksumMismatch`] when the recomputed
+    ///   logical-content digest disagrees with the stored one.
+    pub(crate) fn observe(&mut self, item: &crate::InternalValue) -> crate::Result<()> {
+        // Read the stored digest on demand from the borrowed footer bytes
+        // (no owned Vec<u64> materialization — see `SplitFull`).
+        let stored = self
+            .split
+            .digest(self.seen)
+            .ok_or(crate::Error::InvalidTrailer)?;
+        let recomputed = super::block::kv_checksum::kv_digest(item, self.split.algo)
+            .ok_or(crate::Error::FeatureUnsupported("kv-checksum-algorithm"))?;
+        if recomputed != stored {
+            return Err(crate::Error::ChecksumMismatch {
+                got: crate::Checksum::from_raw(u128::from(recomputed)),
+                expected: crate::Checksum::from_raw(u128::from(stored)),
+            });
+        }
+        self.seen += 1;
         Ok(())
+    }
+
+    /// Judges the entry count once every entry has been observed.
+    ///
+    /// # Errors
+    ///
+    /// [`crate::Error::InvalidTrailer`] when the footer claims a different
+    /// entry count than the block decoded to — structural inconsistency, not a
+    /// content mismatch.
+    pub(crate) fn finish(self) -> crate::Result<()> {
+        if self.seen == self.split.count() {
+            Ok(())
+        } else {
+            Err(crate::Error::InvalidTrailer)
+        }
     }
 }
 

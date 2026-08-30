@@ -12,6 +12,38 @@ use alloc::sync::Arc;
 use tempfile::tempdir;
 use test_log::test;
 
+/// Runs the whole reconcile family and returns the error, asserting it came
+/// from the gate under test.
+///
+/// The gates share one decode of each block, so they are driven together; this
+/// keeps each test pinning BOTH its own failure message and the fact that the
+/// combined pass still routes that forgery to the right check.
+#[cfg(feature = "std")]
+fn reconcile_error(
+    table: &Table,
+    expected: crate::table::ReconcileGate,
+    prefix_extractor: Option<&Arc<dyn crate::prefix::PrefixExtractor>>,
+) -> crate::Error {
+    match table.verify_reconcile_gates(prefix_extractor, false) {
+        Ok(()) => panic!("the forgery must be rejected, the reconcile pass accepted it"),
+        Err((gate, e)) => {
+            assert_eq!(gate, expected, "the wrong gate rejected the table: {e}");
+            e
+        }
+    }
+}
+
+/// Asserts the whole reconcile family accepts an honest table.
+#[cfg(feature = "std")]
+fn reconcile_clean(
+    table: &Table,
+    prefix_extractor: Option<&Arc<dyn crate::prefix::PrefixExtractor>>,
+) {
+    if let Err((gate, e)) = table.verify_reconcile_gates(prefix_extractor, false) {
+        panic!("an honest table must pass every gate, {gate:?} refused it: {e}");
+    }
+}
+
 /// Rot in a frame's length field is caught by the header CRC, after which the
 /// consumed lengths cannot locate the next frame: the salvage walk resyncs at
 /// the next magic instead of stopping. But the resync magic may be an original
@@ -1777,10 +1809,14 @@ fn verify_point_read_reachability_rejects_a_cross_block_seqno_inversion() -> cra
     crate::test_forge::forge_raise_data_block_first_seqno(&source, block1_off, 3)?;
 
     let table = open(source, &fs)?;
-    let result = table.verify_point_read_reachability();
+    let err = reconcile_error(
+        &table,
+        crate::table::ReconcileGate::PointReadReachability,
+        None,
+    );
     assert!(
-        matches!(&result, Err(crate::Error::InvalidHeader(msg)) if msg.contains("out of order")),
-        "a cross-block seqno inversion must be rejected, got {result:?}",
+        matches!(&err, crate::Error::InvalidHeader(msg) if msg.contains("out of order")),
+        "a cross-block seqno inversion must be rejected, got {err:?}",
     );
     Ok(())
 }
@@ -1984,8 +2020,8 @@ fn verify_locator_rejects_a_slot_hint_pointing_at_an_older_version() -> crate::R
     ))?;
     assert!(writer.finish()?.is_some(), "source SST is non-empty");
 
-    // Sanity: the honest locator passes the gate.
-    open(source.clone(), &fs)?.verify_locator()?;
+    // Sanity: the honest locator passes the gates.
+    reconcile_clean(&open(source.clone(), &fs)?, None);
 
     // Rebuild the locator with key-a's slot pushed to head 1 (the older
     // version); key-b / key-c keep their honest heads (2 / 3). block_id 0
@@ -2002,9 +2038,7 @@ fn verify_locator_rejects_a_slot_hint_pointing_at_an_older_version() -> crate::R
     )?;
 
     let table = open(source, &fs)?;
-    let Err(err) = table.verify_locator() else {
-        panic!("a slot hint pointing at an older version must fail the gate");
-    };
+    let err = reconcile_error(&table, crate::table::ReconcileGate::Locator, None);
     assert!(
         matches!(
             err,
@@ -2050,8 +2084,8 @@ fn verify_locator_rejects_a_no_answer_locator() -> crate::Result<()> {
     }
     assert!(writer.finish()?.is_some(), "source SST is non-empty");
 
-    // Sanity: the honest locator passes the gate.
-    open(source.clone(), &fs)?.verify_locator()?;
+    // Sanity: the honest locator passes the gates.
+    reconcile_clean(&open(source.clone(), &fs)?, None);
 
     // Rebuild the locator so key-c resolves to an OUT-OF-RANGE block id: the
     // handle lookup fails and `locate_block` yields no answer for that decoded
@@ -2069,9 +2103,7 @@ fn verify_locator_rejects_a_no_answer_locator() -> crate::Result<()> {
     )?;
 
     let table = open(source, &fs)?;
-    let Err(err) = table.verify_locator() else {
-        panic!("a locator that gives no answer for a decoded key must fail the gate");
-    };
+    let err = reconcile_error(&table, crate::table::ReconcileGate::Locator, None);
     assert!(
         matches!(
             err,
@@ -2123,12 +2155,14 @@ fn verify_filter_rejects_missing_prefix_hashes() -> crate::Result<()> {
 
     let table = open(source, &fs)?;
     // Without an extractor the gate only probes complete keys and passes.
-    table.verify_filter(None)?;
+    reconcile_clean(&table, None);
     // WITH the extractor it probes each key's prefix hash, which the filter
     // never indexed — a false negative on an existing key's prefix.
-    let Err(err) = table.verify_filter(Some(&extractor)) else {
-        panic!("a filter missing the prefix hashes must fail the gate");
-    };
+    let err = reconcile_error(
+        &table,
+        crate::table::ReconcileGate::Filter,
+        Some(&extractor),
+    );
     assert!(
         matches!(
             err,
@@ -2188,16 +2222,18 @@ fn verify_point_read_reachability_rejects_a_bucket_redirected_to_an_older_versio
     assert!(writer.finish()?.is_some(), "source SST is non-empty");
 
     // Sanity: the intact table passes the reachability gate.
-    open(source.clone(), &fs)?.verify_point_read_reachability()?;
+    reconcile_clean(&open(source.clone(), &fs)?, None);
 
     // Redirect the conflicting bucket to binary-index pos 1 — the second
     // restart head, holding the OLDER (seqno 1) version.
     crate::test_forge::forge_hash_index_bucket(&source, b"key-a", 1, None)?;
 
     let table = open(source, &fs)?;
-    let Err(err) = table.verify_point_read_reachability() else {
-        panic!("a bucket redirected to an older version must fail the gate");
-    };
+    let err = reconcile_error(
+        &table,
+        crate::table::ReconcileGate::PointReadReachability,
+        None,
+    );
     assert!(
         matches!(
             err,
@@ -2773,9 +2809,7 @@ fn verify_metadata_bounds_rejects_a_hidden_delete_bitmap() -> crate::Result<()> 
     crate::test_forge::forge_section_omitted(&source, b"delete_bitmap")?;
 
     let table = open(source, &fs)?;
-    let Err(err) = table.verify_metadata_bounds(false) else {
-        panic!("a hidden delete_bitmap with a recorded count > 0 must be rejected");
-    };
+    let err = reconcile_error(&table, crate::table::ReconcileGate::MetadataBounds, None);
     assert!(
         matches!(err, crate::Error::InvalidHeader(msg) if msg.contains("delete_bitmap count disagrees")),
         "the rejection must name the delete_bitmap count mismatch, got {err:?}",
@@ -2820,9 +2854,7 @@ fn verify_metadata_bounds_rejects_an_equal_cardinality_delete_bitmap_substitutio
     crate::test_forge::forge_delete_bitmap_substitute(&source, 0, &[6, 21, 41])?;
 
     let table = open(source, &fs)?;
-    let Err(err) = table.verify_metadata_bounds(false) else {
-        panic!("an equal-cardinality bitmap substitution must be rejected by the content hash");
-    };
+    let err = reconcile_error(&table, crate::table::ReconcileGate::MetadataBounds, None);
     assert!(
         matches!(err, crate::Error::InvalidHeader(msg) if msg.contains("delete_bitmap contents disagree")),
         "the rejection must name the delete_bitmap content-hash mismatch, got {err:?}",
@@ -3101,9 +3133,7 @@ fn verify_metadata_bounds_rejects_a_zero_count_with_a_live_bitmap() -> crate::Re
     )?;
 
     let table = open(source, &fs)?;
-    let Err(err) = table.verify_metadata_bounds(false) else {
-        panic!("a recorded count of 0 with a present non-empty bitmap must be rejected");
-    };
+    let err = reconcile_error(&table, crate::table::ReconcileGate::MetadataBounds, None);
     assert!(
         matches!(err, crate::Error::InvalidHeader(msg) if msg.contains("delete_bitmap count disagrees")),
         "the rejection must name the delete_bitmap count mismatch, got {err:?}",
@@ -3198,9 +3228,7 @@ fn verify_seqno_bounds_rejects_a_present_empty_map_on_a_nonempty_table() -> crat
     crate::test_forge::forge_seqno_bounds_empty(&source, 0)?;
 
     let table = open(source, &fs)?;
-    let Err(err) = table.verify_seqno_bounds() else {
-        panic!("an empty seqno_bounds on a table with data blocks must be rejected");
-    };
+    let err = reconcile_error(&table, crate::table::ReconcileGate::SeqnoBounds, None);
     assert!(
         matches!(
             err,
@@ -3336,9 +3364,7 @@ fn verify_filter_rejects_a_present_empty_full_filter() -> crate::Result<()> {
     crate::test_forge::forge_filter_empty(&source, 0)?;
 
     let table = open(source, &fs)?;
-    let Err(err) = table.verify_filter(None) else {
-        panic!("an empty full filter on a table with data blocks must be rejected");
-    };
+    let err = reconcile_error(&table, crate::table::ReconcileGate::Filter, None);
     assert!(
         matches!(
             err,
@@ -3380,9 +3406,7 @@ fn verify_filter_rejects_an_empty_partition_for_an_existing_key() -> crate::Resu
     crate::test_forge::forge_filter_first_partition_empty(&source)?;
 
     let table = open(source, &fs)?;
-    let Err(err) = table.verify_filter(None) else {
-        panic!("an empty filter partition covering an existing key must be rejected");
-    };
+    let err = reconcile_error(&table, crate::table::ReconcileGate::Filter, None);
     assert!(
         matches!(
             err,
@@ -3422,9 +3446,7 @@ fn verify_zone_map_rejects_a_present_empty_map_on_a_nonempty_table() -> crate::R
     crate::test_forge::forge_zone_map_empty(&source, 0)?;
 
     let table = open(source, &fs)?;
-    let Err(err) = table.verify_zone_map() else {
-        panic!("an empty zone_map on a table with data blocks must be rejected");
-    };
+    let err = reconcile_error(&table, crate::table::ReconcileGate::ZoneMap, None);
     assert!(
         matches!(
             err,
@@ -3464,9 +3486,7 @@ fn verify_zone_map_rejects_a_forged_synthetic_column_id() -> crate::Result<()> {
     crate::test_forge::forge_zone_map_column_id(&source, 0)?;
 
     let table = open(source, &fs)?;
-    let Err(err) = table.verify_zone_map() else {
-        panic!("a non-zero synthetic column id must be rejected");
-    };
+    let err = reconcile_error(&table, crate::table::ReconcileGate::ZoneMap, None);
     assert!(
         matches!(err, crate::Error::InvalidHeader(msg) if msg.contains("zone_map synthetic column")),
         "the rejection must name the synthetic column identity, got {err:?}",
@@ -3504,9 +3524,7 @@ fn verify_zone_map_rejects_a_forged_columnar_column_id() -> crate::Result<()> {
     crate::test_forge::forge_zone_map_column_id(&source, 0)?;
 
     let table = open(source, &fs)?;
-    let Err(err) = table.verify_zone_map() else {
-        panic!("a forged columnar column id must be rejected");
-    };
+    let err = reconcile_error(&table, crate::table::ReconcileGate::ZoneMap, None);
     assert!(
         matches!(err, crate::Error::InvalidHeader(msg) if msg.contains("per-column statistics")),
         "the rejection must name the columnar per-column mismatch, got {err:?}",
@@ -3556,7 +3574,7 @@ fn salvaged_columnar_table_keeps_per_column_zone_statistics() -> crate::Result<(
     assert!(table.has_zone_map(), "the salvaged copy carries a zone map");
     // The per-column stats the copy-through recorded must equal what the
     // verifier re-derives from each decoded columnar block.
-    table.verify_zone_map()?;
+    reconcile_clean(&table, None);
     Ok(())
 }
 
@@ -3652,9 +3670,7 @@ fn verify_metadata_bounds_rejects_a_raised_seqno_min_on_a_range_tombstone_table(
     crate::test_forge::forge_meta_value_both_mirrors(&source, b"seqno#min", &5u64.to_le_bytes())?;
 
     let table = open(source, &fs)?;
-    let Err(err) = table.verify_metadata_bounds(false) else {
-        panic!("a seqno#min above the real minimum must be rejected even with range tombstones");
-    };
+    let err = reconcile_error(&table, crate::table::ReconcileGate::MetadataBounds, None);
     assert!(
         matches!(
             err,
@@ -3728,9 +3744,7 @@ fn verify_metadata_bounds_keeps_a_real_weak_tombstone_matching_the_rt_sentinel()
     crate::test_forge::forge_meta_value_both_mirrors(&source, b"seqno#min", &4u64.to_le_bytes())?;
 
     let table = open(source, &fs)?;
-    let Err(err) = table.verify_metadata_bounds(false) else {
-        panic!("a seqno#min above a real weak tombstone matching the RT sentinel must be rejected");
-    };
+    let err = reconcile_error(&table, crate::table::ReconcileGate::MetadataBounds, None);
     assert!(
         matches!(
             err,
@@ -3777,9 +3791,7 @@ fn verify_metadata_bounds_rejects_a_range_tombstone_count_mismatch() -> crate::R
     crate::test_forge::forge_section_omitted(&source, b"range_tombstones")?;
 
     let table = open(source, &fs)?;
-    let Err(err) = table.verify_metadata_bounds(false) else {
-        panic!("a range_tombstones count mismatch must be rejected");
-    };
+    let err = reconcile_error(&table, crate::table::ReconcileGate::MetadataBounds, None);
     assert!(
         matches!(
             err,
@@ -5001,9 +5013,11 @@ fn verify_point_read_reachability_rejects_a_reordered_columnar_block() -> crate:
     std::fs::write(&source, &bytes)?;
 
     let table = open(source, &fs)?;
-    let Err(err) = table.verify_point_read_reachability() else {
-        panic!("a reordered columnar block must be rejected, not declared clean");
-    };
+    let err = reconcile_error(
+        &table,
+        crate::table::ReconcileGate::PointReadReachability,
+        None,
+    );
     assert!(
         matches!(
             err,
@@ -10218,9 +10232,7 @@ fn verify_metadata_bounds_keeps_a_lone_weak_tombstone_matching_the_rt_sentinel()
     crate::test_forge::forge_meta_value_both_mirrors(&source, b"seqno#min", &9u64.to_le_bytes())?;
 
     let table = open(source, &fs)?;
-    let Err(err) = table.verify_metadata_bounds(false) else {
-        panic!("a seqno#min above the table's only real entry must be rejected");
-    };
+    let err = reconcile_error(&table, crate::table::ReconcileGate::MetadataBounds, None);
     assert!(
         matches!(
             err,

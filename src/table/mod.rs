@@ -417,6 +417,134 @@ pub(crate) enum PunchProbe {
     Unproven,
 }
 
+/// Which semantic cross-check a combined reconcile pass tripped on, so the
+/// caller keeps its own per-gate wording instead of one generic message.
+#[cfg(feature = "std")]
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+pub(crate) enum ReconcileGate {
+    /// Index separators against the addressed blocks' decoded last keys.
+    Separators,
+    /// Per-KV footer digests.
+    KvChecksums,
+    /// Recorded seqno bounds against the decoded entries.
+    SeqnoBounds,
+    /// Declared entry count against the decoded one.
+    BlockEntryCounts,
+    /// Recorded zone map against the decoded statistics.
+    ZoneMap,
+    /// Recorded locator against the decoded newest-version blocks.
+    Locator,
+    /// Filter against the decoded keys (and their prefixes).
+    Filter,
+    /// In-block indexes and the global sort order.
+    PointReadReachability,
+    /// Recorded metadata bounds against the decoded contents.
+    MetadataBounds,
+}
+
+/// The recorded metadata a reconcile judges, plus the accumulators the block
+/// walk fills for it: read and seeded once, then compared in `finish`.
+#[cfg(feature = "std")]
+pub(crate) struct MetaBoundsProbe {
+    /// The disk-fresh meta whose bounds are on trial.
+    meta: crate::table::meta::ParsedMeta,
+    /// The recorded range tombstones, whose spans the key range must cover.
+    tombstones: Option<Vec<crate::range_tombstone::RangeTombstone>>,
+    /// `(start, seqno)` of the synthetic RT-only sentinel entry, excluded from
+    /// the KV seqno maximum exactly once.
+    sentinel: Option<(UserKey, SeqNo)>,
+    /// Whether that exclusion has already happened.
+    sentinel_excluded: bool,
+    /// Whether this is a tight-space restricted view, which relaxes the
+    /// item-count equality to a subset check.
+    restricted: bool,
+    /// Blocks the index lists, punched prefix included.
+    block_count: u64,
+    /// Whether the caller already authenticated this file against a matching
+    /// manifest digest.
+    bitmap_digest_authenticated: bool,
+    /// Entries the live blocks decoded to.
+    count: u64,
+    /// First and last decoded user key over the live suffix.
+    first_key: Option<UserKey>,
+    last_key: Option<UserKey>,
+    /// Lowest and highest decoded seqno over the live suffix.
+    seqno_lo: Option<SeqNo>,
+    seqno_hi: Option<SeqNo>,
+}
+
+/// The on-disk filter state one reconcile needs, so the probe reads the
+/// section (and each partition) once no matter how many blocks it checks.
+#[cfg(feature = "std")]
+pub(crate) struct FilterProbe<'a> {
+    /// The table being judged, for its comparator and id.
+    table: &'a Table,
+    /// The file the sections are read from, lent by the pass that opened it
+    /// and borrowed across the walk for the partition reads.
+    file: &'a dyn crate::fs::FsFile,
+    /// Codec / encryption / ECC context every filter block decodes under.
+    transform: crate::table::block::BlockTransform<'a>,
+    /// The partition index, when the filter is partitioned.
+    index: Option<IndexBlock>,
+    /// The single filter block, when it is not.
+    full: Option<crate::table::filter::block::FilterBlock>,
+    /// Partitions already read, keyed by file offset: one read each.
+    partitions: alloc::collections::BTreeMap<u64, crate::table::filter::block::FilterBlock>,
+    /// The last key probed, so a key's older versions are not re-probed
+    /// across a block boundary.
+    prev_key: Option<Vec<u8>>,
+    /// The extractor whose prefixes a full filter must also report present.
+    prefix_extractor: Option<alloc::sync::Arc<dyn crate::prefix::PrefixExtractor>>,
+}
+
+#[cfg(feature = "std")]
+impl FilterProbe<'_> {
+    /// Probes one decoded block's keys against the filter.
+    ///
+    /// # Errors
+    ///
+    /// [`crate::Error::InvalidHeader`] when the filter reports an existing key
+    /// (or its prefix) as definitely absent, or a partition is missing / empty
+    /// for a key that exists.
+    fn check_block(&mut self, block: &DecodedBlock) -> crate::Result<()> {
+        Table::check_filter_block(self, block)
+    }
+}
+
+/// One live data block, decoded ONCE for every cross-check gate that needs its
+/// contents, from [`Table::for_each_live_block`].
+///
+/// Each gate used to walk the whole table itself, so a single reconcile decoded
+/// every block seven to nine times and the decode dominates a repair's cost.
+/// Materializing the block's row view, its columnar batch and its entries here
+/// hands the SAME decode to all of them.
+// Compiled under no_std alongside `verify_kv_checksums`, which walks with it
+// and is itself dead there (the verify / scrub callers are std-gated).
+#[cfg_attr(
+    not(feature = "std"),
+    expect(
+        dead_code,
+        reason = "gate-only decode; the verify/scrub consumers are std-gated"
+    )
+)]
+pub(crate) struct DecodedBlock {
+    /// Where the block lives, as the block index records it.
+    pub(crate) handle: BlockHandle,
+    /// The block exactly as it came off disk, per-KV footer INTACT. The row
+    /// view below strips the footer, so the per-KV digest gate needs these
+    /// bytes rather than the stripped ones.
+    pub(crate) raw: Block,
+    /// The row-major view. `None` on a columnar table, whose rows are
+    /// reconstructed from `batch` instead.
+    pub(crate) row: Option<DataBlock>,
+    /// The columnar batch this block decoded to, for the per-column statistics
+    /// only a columnar table records. `None` on a row table.
+    #[cfg(feature = "columnar")]
+    pub(crate) batch: Option<crate::table::columnar::ColumnBatch>,
+    /// The block's entries in block order, materialized once.
+    pub(crate) entries: Vec<InternalValue>,
+}
+
 /// Everything one pass over the data blocks can say about a tight-space
 /// reclaim, from [`Table::punch_geometry`].
 ///
@@ -735,7 +863,7 @@ impl Table {
     // which is itself dead there (the verify/scrub caller is std-gated).
     #[cfg_attr(
         not(feature = "std"),
-        allow(
+        expect(
             dead_code,
             reason = "gate-only loader; the verify/scrub consumers are std-gated"
         )
@@ -2863,28 +2991,45 @@ impl Table {
         // Descriptor declares this SST footer-bearing, and an SST is
         // homogeneous — every data block carries a footer under `expected_algo`.
         // A restricted view's punched prefix blocks are dead and read as zeros,
-        // so skip them (only the live suffix is footer-verified).
-        let punch = self.punch_offset()?;
-        for handle in self.block_index.iter() {
-            let handle = handle?;
-            let block_handle = BlockHandle::new(handle.offset(), handle.size());
-            if block_handle.offset().0 < punch {
-                continue;
-            }
-            // Load the RAW block (footer intact) — do NOT route through
-            // `load_data_block`, which strips the footer via `from_loaded` —
-            // and DISK-FRESH: a pristine copy cached before an on-disk
-            // re-stamp would otherwise pass this gate for a file whose
-            // stale footer no longer matches its altered value bytes.
-            let block = self.load_block_from_disk(&block_handle, BlockType::Data)?;
-            DataBlock::verify_kv_checked(
-                &block.data,
-                block.header,
-                self.comparator.clone(),
-                Some(expected_algo),
-            )?;
+        // so the walk skips them (only the live suffix is footer-verified).
+        self.for_each_live_block(|block| Self::check_block_kv_checksums(expected_algo, block))
+    }
+
+    /// The per-block half of [`Self::verify_kv_checksums`], so the combined
+    /// reconcile pass runs it on the shared decode.
+    ///
+    /// Reads the footer off the RAW block (footer intact: the row view strips
+    /// it) and judges the entries the walk ALREADY materialized from that same
+    /// block. The bytes are disk-fresh, so a pristine copy cached before an
+    /// on-disk re-stamp cannot stand in for a file whose stale footer no longer
+    /// matches its altered value bytes.
+    ///
+    /// Fed from `block.entries` rather than through `verify_kv_checked`, which
+    /// decodes and materializes the block for itself: on a footer-bearing table
+    /// that would decode every block twice, and the read count would not show
+    /// it — the second decode reads no additional bytes off the disk. Taking no
+    /// comparator is what keeps it that way: decoding a data block needs one,
+    /// so this cannot re-decode even by mistake.
+    #[cfg_attr(
+        not(feature = "std"),
+        expect(
+            dead_code,
+            reason = "per-KV gate half; the verify/scrub consumers are std-gated"
+        )
+    )]
+    fn check_block_kv_checksums(
+        expected_algo: crate::runtime_config::types::ChecksumAlgorithm,
+        block: &DecodedBlock,
+    ) -> crate::Result<()> {
+        let mut probe = crate::table::data_block::KvDigestProbe::open(
+            &block.raw.data,
+            block.raw.header,
+            Some(expected_algo),
+        )?;
+        for item in &block.entries {
+            probe.observe(item)?;
         }
-        Ok(())
+        probe.finish()
     }
 
     /// Cross-checks the recorded `linked_blob_files` section against the
@@ -3169,17 +3314,6 @@ impl Table {
                     .iter(self.comparator.clone())
                     .map(|i| i.materialize(part.as_slice()))
                     .collect();
-                if frame_blocks {
-                    let punch = self.punch_offset()?;
-                    for k in &part_keyed {
-                        // Punched prefix blocks of a restricted view decode to
-                        // zeros; skip their separator cross-check (they are dead).
-                        if k.offset().0 < punch {
-                            continue;
-                        }
-                        self.verify_separator_matches_block(k)?;
-                    }
-                }
                 // The TLI's top-level SEPARATOR for this partition must equal the
                 // partition's LAST data-block separator. `frames_tile_section`
                 // and the per-block separator checks ignore the top-level keys,
@@ -3223,46 +3357,7 @@ impl Table {
             }
             if frame_blocks {
                 self.verify_handles_frame_blocks(&handles, data_section.pos(), data_section.len())?;
-                let punch = self.punch_offset()?;
-                for k in &keyed {
-                    // Punched prefix blocks of a restricted view decode to zeros;
-                    // skip their separator cross-check (they are dead).
-                    if k.offset().0 < punch {
-                        continue;
-                    }
-                    self.verify_separator_matches_block(k)?;
-                }
             }
-        }
-        Ok(())
-    }
-
-    /// Confirms a leaf index entry's SEPARATOR (its `end_key`) equals the
-    /// addressed data block's actual decoded last key. A forged separator
-    /// re-stamped to another still-sorted value passes the mirror comparison
-    /// and section tiling (both ignore the keys), yet the index binary
-    /// search routes keys in `(forged_separator, real_last_key]` to the wrong
-    /// block — `point_read` then misses existing keys. The in-memory
-    /// reachability probe does not catch this on the heal path (the live
-    /// table keeps its correct recovery-time index), so the disk-fresh
-    /// separator must be checked against the block's decoded final key here.
-    #[cfg(feature = "std")]
-    fn verify_separator_matches_block(&self, keyed: &KeyedBlockHandle) -> crate::Result<()> {
-        let block_handle = BlockHandle::new(keyed.offset(), keyed.size());
-        let entries = self.decode_block_entries(&block_handle)?;
-        let Some(last) = entries.last() else {
-            return Err(crate::Error::InvalidHeader(
-                "tli separator addresses a data block that decodes to zero entries",
-            ));
-        };
-        if self
-            .comparator
-            .compare(keyed.end_key().as_ref(), last.key.user_key.as_ref())
-            != core::cmp::Ordering::Equal
-        {
-            return Err(crate::Error::InvalidHeader(
-                "tli separator does not match the addressed block's decoded last key",
-            ));
         }
         Ok(())
     }
@@ -3327,319 +3422,531 @@ impl Table {
         pos.checked_add(len) == Some(at)
     }
 
-    /// Cross-checks the recorded `seqno_bounds` section against the ACTUAL
-    /// per-block seqno ranges derived from decoding every data block's
-    /// entries. The section's block is checksum-clean to the out-of-band
-    /// walk even when its PAYLOAD was re-stamped to another structurally
-    /// valid map, and `scan_since_seqno` trusts it to SKIP blocks — a forged
-    /// range silently omits a block's live entries from every CDC /
-    /// incremental scan. Every recorded block must exist, every data block
-    /// must be recorded, and each recorded range must equal the decoded one.
-    /// A no-op for tables without the section.
+    /// Reads the disk-fresh leaf SEPARATORS: each live data block's offset
+    /// mapped to the `end_key` the on-disk index records for it. `None` for a
+    /// table whose index carries no entries at all.
+    ///
+    /// Tail-first with head fallback, mirroring recovery ([`Self::read_tli`]):
+    /// the next open trusts that copy, so it is the one the separators must be
+    /// judged from. Mirror EQUALITY is not this reader's job —
+    /// [`Self::verify_tli_mirrors`] establishes it, along with the section
+    /// tiling, the binary-index pointers and (when partitioned) the top-level
+    /// partition boundaries.
+    ///
+    /// Blocks below the punch offset are left out: a restricted view's punched
+    /// prefix decodes to zeros, so those separators are dead and the walk skips
+    /// their blocks too.
     ///
     /// # Errors
     ///
-    /// [`crate::Error::InvalidHeader`] when the recorded map disagrees with
-    /// the decoded entries; any I/O / decode error from the full scan.
+    /// Propagates the index reads, and rejects an index partition that decodes
+    /// to zero entries.
     #[cfg(feature = "std")]
-    pub(crate) fn verify_seqno_bounds(&self) -> crate::Result<()> {
-        use crate::table::block::ParsedItem as _;
-
-        // Re-read the section FROM DISK: the in-memory map was loaded at
-        // recover time, so an on-disk re-stamp after the open (the very
-        // forge this check exists for) would be invisible to it. Unlike the
-        // best-effort recover load, an unreadable section here is an error —
-        // the callers are deciding whether to trust the file's bytes.
-        let mut file = self.fs.open(&self.path, &FsOpenOptions::new().read(true))?;
-        let trailer = crate::sfa::Reader::from_reader(&mut file)?;
-        let regions = regions::ParsedRegions::parse_from_toc(trailer.toc())?;
-        let Some(sb_handle) = regions.seqno_bounds else {
-            return Ok(());
-        };
-        let seqno_bounds = {
-            let block = Block::from_file(
-                &*file,
-                sb_handle,
-                crate::table::block::BlockIdentity {
-                    table_id: self.metadata.id,
-                    block_type: BlockType::SeqnoBounds,
-                    dict_id: 0,
-                    window_log: 0,
-                },
-                &{
-                    let t = match self.encryption.as_deref() {
-                        Some(enc) => crate::table::block::BlockTransform::Encrypted(enc),
-                        None => crate::table::block::BlockTransform::PLAIN,
-                    };
-                    if let Some(ecc) = self.metadata.ecc_params {
-                        t.with_ecc(ecc)
-                    } else {
-                        t
-                    }
-                },
-            )?;
-            if block.header.block_type != BlockType::SeqnoBounds {
-                return Err(crate::Error::InvalidTag((
-                    "BlockType",
-                    block.header.block_type.into(),
-                )));
-            }
-            crate::table::seqno_bounds::SeqnoBoundsMap::decode(&block.data)?
-        };
-        // No early return on an empty map: a PRESENT-but-empty section on a
-        // table with data blocks is a forgery (every writer emits one entry per
-        // block). The per-block loop below rejects it — the first block's
-        // `bounds_for` returns `None` — while a genuinely empty table (no data
-        // blocks) still passes, since the loop runs zero times and `checked`
-        // equals the empty map's length.
-        // Skip a restricted view's punched (dead) prefix blocks; count only the
-        // LIVE seqno_bounds entries below so the cross-check covers the suffix.
+    fn read_tli_separators(
+        &self,
+        file: &dyn crate::fs::FsFile,
+        regions: &regions::ParsedRegions,
+    ) -> crate::Result<crate::HashMap<u64, UserKey>> {
         let punch = self.punch_offset()?;
-        let mut checked = 0usize;
-        for handle in self.block_index.iter() {
-            let handle = handle?;
-            let block_handle = BlockHandle::new(handle.offset(), handle.size());
-            if block_handle.offset().0 < punch {
-                continue;
-            }
-            let Some(recorded) = seqno_bounds.bounds_for(block_handle.offset().0) else {
-                return Err(crate::Error::InvalidHeader(
-                    "seqno_bounds is missing a data block's entry",
-                ));
-            };
-            let derived = {
-                #[cfg(feature = "columnar")]
-                if self.metadata.columnar {
-                    let block = self.load_block_from_disk(&block_handle, BlockType::Columnar)?;
-                    let batch = crate::table::columnar::ColumnBatch::decode(&block.data)?;
-                    let entries = crate::table::columnar::column_batch_to_entries(&batch)?;
-                    let mut seqnos = entries.iter().map(|e| e.key.seqno);
-                    let Some(first) = seqnos.next() else {
-                        return Err(crate::Error::InvalidHeader(
-                            "columnar data block decodes to zero rows",
-                        ));
-                    };
-                    Some(seqnos.fold((first, first), |(lo, hi), s| (lo.min(s), hi.max(s))))
-                } else {
-                    None
+        let head = Self::read_tli(
+            regions,
+            file,
+            self.metadata.id,
+            self.metadata.index_block_compression,
+            self.encryption.as_deref(),
+            self.metadata.ecc_params,
+        )?;
+        let mut separators = crate::HashMap::default();
+        let mut collect = |idx: &IndexBlock| -> crate::Result<()> {
+            for keyed in idx.iter(self.comparator.clone()) {
+                let keyed = keyed.materialize(idx.as_slice());
+                if keyed.offset().0 < punch {
+                    continue;
                 }
-                #[cfg(not(feature = "columnar"))]
-                None::<(SeqNo, SeqNo)>
-            };
-            let derived = if let Some(d) = derived {
-                d
-            } else {
-                let block = self.load_block_from_disk(&block_handle, BlockType::Data)?;
-                let data_block =
-                    DataBlock::from_loaded(block, self.metadata.kv_checksum_algo.is_some())?;
-                let mut seqnos = data_block
-                    .try_iter(self.comparator.clone())?
-                    .map(|p| p.seqno());
-                let Some(first) = seqnos.next() else {
-                    return Err(crate::Error::InvalidHeader(
-                        "row data block decodes to zero entries",
+                separators.insert(keyed.offset().0, keyed.end_key().clone());
+            }
+            Ok(())
+        };
+        if regions.index.is_some() {
+            // Partitioned: the top level addresses index partitions, and the
+            // partitions address the data blocks whose separators are wanted.
+            let tops: Vec<BlockHandle> = head
+                .iter(self.comparator.clone())
+                .map(|i| *i.materialize(head.as_slice()).as_ref())
+                .collect();
+            for top in tops {
+                let part = Self::read_tli_at(
+                    file,
+                    top,
+                    self.metadata.id,
+                    self.metadata.index_block_compression,
+                    self.encryption.as_deref(),
+                    self.metadata.ecc_params,
+                )?;
+                collect(&part)?;
+            }
+        } else {
+            collect(&head)?;
+        }
+        Ok(separators)
+    }
+
+    /// Confirms a data block's decoded LAST key equals the separator the
+    /// on-disk index records for it. A forged separator re-stamped to another
+    /// still-sorted value passes the mirror comparison and the section tiling
+    /// (both ignore the keys), yet the index binary search then routes keys in
+    /// `(forged_separator, real_last_key]` to the wrong block and `point_read`
+    /// misses them after reopen.
+    ///
+    /// Judged on the walk's decode, and paired BOTH ways: a live block the
+    /// index does not address is as much corruption as an addressed block whose
+    /// contents disagree, and only the pairing catches the first.
+    ///
+    /// # Errors
+    ///
+    /// [`crate::Error::InvalidHeader`] when the block has no separator, decodes
+    /// to zero entries, or disagrees with its separator.
+    #[cfg(feature = "std")]
+    fn check_block_separator(
+        &self,
+        separators: &crate::HashMap<u64, UserKey>,
+        block: &DecodedBlock,
+    ) -> crate::Result<()> {
+        let Some(separator) = separators.get(&block.handle.offset().0) else {
+            return Err(crate::Error::InvalidHeader(
+                "a live data block carries no tli separator",
+            ));
+        };
+        let Some(last) = block.entries.last() else {
+            return Err(crate::Error::InvalidHeader(
+                "tli separator addresses a data block that decodes to zero entries",
+            ));
+        };
+        if self
+            .comparator
+            .compare(separator.as_ref(), last.key.user_key.as_ref())
+            != core::cmp::Ordering::Equal
+        {
+            return Err(crate::Error::InvalidHeader(
+                "tli separator does not match the addressed block's decoded last key",
+            ));
+        }
+        Ok(())
+    }
+
+    /// Runs the whole semantic cross-check family on ONE disk-fresh decode per
+    /// live data block.
+    ///
+    /// Each gate used to walk the table itself, so a reconcile decoded every
+    /// block seven to nine times and every gate added another full pass. Here
+    /// the sections are read once, the blocks are decoded once, and each
+    /// block feeds every per-block check before the next block is read.
+    ///
+    /// The gates run in the order the callers' own chains use, so a table with
+    /// a single defect reports the same gate — and the same message — as
+    /// before. `Err` names the gate that tripped, so a caller can keep its own
+    /// per-gate wording.
+    ///
+    /// # Errors
+    ///
+    /// The failing gate and its error. Section reads and block decodes surface
+    /// as the error of the gate that needed them.
+    #[cfg(feature = "std")]
+    pub(crate) fn verify_reconcile_gates(
+        &self,
+        prefix_extractor: Option<&alloc::sync::Arc<dyn crate::prefix::PrefixExtractor>>,
+        bitmap_digest_authenticated: bool,
+    ) -> Result<(), (ReconcileGate, crate::Error)> {
+        use ReconcileGate as G;
+        let tag = |gate: G| move |e: crate::Error| (gate, e);
+
+        // Sections first: every gate that has one reads it before the walk, so
+        // a forged section fails without decoding a single block.
+        let kv_algo = self.metadata.kv_checksum_algo;
+        // One open and one TOC parse for the whole pass: every section below is
+        // read from the SAME on-disk image, so the gates cannot disagree about
+        // which bytes they are judging.
+        //
+        // The sections stay live for the whole walk, where the gate-by-gate
+        // shape held one at a time. That is a peak of their SUM rather than
+        // their max, bounded by what an open table already pins permanently
+        // (`Inner` holds the seqno bounds, zone map, locator and filter
+        // simultaneously for its whole lifetime), so the increment is one extra
+        // copy of resident data for the duration of one table's pass. Dropping
+        // any of them mid-walk is not available: every one is consulted on
+        // EVERY block, so releasing early means walking again per section,
+        // which is the cost this pass exists to remove.
+        let (file, regions) = self.open_sections().map_err(tag(G::SeqnoBounds))?;
+        let separators = self
+            .read_tli_separators(&*file, &regions)
+            .map_err(tag(G::Separators))?;
+        let seqno_bounds = self
+            .read_seqno_bounds_section(&*file, &regions)
+            .map_err(tag(G::SeqnoBounds))?;
+        let zone_map = self
+            .read_zone_map_section(&*file, &regions)
+            .map_err(tag(G::ZoneMap))?;
+        let zone_map = match zone_map {
+            // A PRESENT-but-empty map on a table with data blocks is a forgery;
+            // the standalone gate rejects it before its walk, so do it here.
+            Some(map) if map.is_empty() => {
+                if self.block_index.iter().next().is_some() {
+                    return Err((
+                        G::ZoneMap,
+                        crate::Error::InvalidHeader(
+                            "zone_map section is present but empty on a table with data blocks",
+                        ),
                     ));
+                }
+                None
+            }
+            other => other,
+        };
+        let locator = self
+            .read_locator_section(&*file, &regions)
+            .map_err(tag(G::Locator))?;
+        let mut filter = self
+            .filter_probe(&*file, &regions, prefix_extractor)
+            .map_err(tag(G::Filter))?;
+        let mut meta = self
+            .meta_bounds_probe(&*file, &regions, bitmap_digest_authenticated)
+            .map_err(tag(G::MetadataBounds))?;
+
+        // Per-block state the gates carry across the walk.
+        let mut separators_checked = 0usize;
+        let mut seqno_checked = 0usize;
+        let mut zone_checked = 0usize;
+        let mut locator_seen: crate::HashSet<Vec<u8>> = crate::HashSet::default();
+        let mut prev_internal: Option<(UserKey, SeqNo)> = None;
+
+        // The walk's closure returns the plain engine error, so the gate that
+        // produced it is recorded here and paired with it after the walk.
+        let mut failed: Option<ReconcileGate> = None;
+        let walk = self.for_each_live_block(|block| {
+            // First, as the standalone separator pass ran before every other
+            // gate in both callers' chains.
+            if let Err(e) = self.check_block_separator(&separators, block) {
+                failed = Some(G::Separators);
+                return Err(e);
+            }
+            let Some(next) = separators_checked.checked_add(1) else {
+                failed = Some(G::Separators);
+                return Err(crate::Error::InvalidHeader("tli separators"));
+            };
+            separators_checked = next;
+            if let Some(algo) = kv_algo
+                && let Err(e) = Self::check_block_kv_checksums(algo, block)
+            {
+                failed = Some(G::KvChecksums);
+                return Err(e);
+            }
+            if let Some(map) = &seqno_bounds {
+                if let Err(e) = Self::check_block_seqno_bounds(map, block) {
+                    failed = Some(G::SeqnoBounds);
+                    return Err(e);
+                }
+                let Some(next) = seqno_checked.checked_add(1) else {
+                    failed = Some(G::SeqnoBounds);
+                    return Err(crate::Error::InvalidHeader("seqno_bounds"));
                 };
-                seqnos.fold((first, first), |(lo, hi), s| (lo.min(s), hi.max(s)))
-            };
-            if derived != recorded {
-                return Err(crate::Error::InvalidHeader(
-                    "seqno_bounds disagrees with the block's decoded entries",
-                ));
+                seqno_checked = next;
             }
-            checked = checked
-                .checked_add(1)
-                .ok_or(crate::Error::InvalidHeader("seqno_bounds"))?;
+            if let Err(e) = Self::check_block_entry_count(block) {
+                failed = Some(G::BlockEntryCounts);
+                return Err(e);
+            }
+            if let Some(map) = &zone_map {
+                if let Err(e) = Self::check_block_zone_entry(map, block) {
+                    failed = Some(G::ZoneMap);
+                    return Err(e);
+                }
+                let Some(next) = zone_checked.checked_add(1) else {
+                    failed = Some(G::ZoneMap);
+                    return Err(crate::Error::InvalidHeader("zone_map"));
+                };
+                zone_checked = next;
+            }
+            if let Some(locator) = &locator
+                && let Err(e) = self.check_block_locator(locator, &mut locator_seen, block)
+            {
+                failed = Some(G::Locator);
+                return Err(e);
+            }
+            if let Some(probe) = &mut filter
+                && let Err(e) = probe.check_block(block)
+            {
+                failed = Some(G::Filter);
+                return Err(e);
+            }
+            if let Err(e) = self.check_block_reachability(&mut prev_internal, block) {
+                failed = Some(G::PointReadReachability);
+                return Err(e);
+            }
+            if let Err(e) = Self::observe_meta_bounds(&mut meta, block) {
+                failed = Some(G::MetadataBounds);
+                return Err(e);
+            }
+            Ok(())
+        });
+        if let Err(e) = walk {
+            // An untagged failure came from the walk itself (an index read, a
+            // block read, a decode), which is the entry-count gate's own job.
+            return Err((failed.unwrap_or(G::BlockEntryCounts), e));
         }
-        // Every recorded entry matched some walked block (offsets are unique
-        // on both sides), so equal counts mean the map records EXACTLY the
-        // table's blocks — a forged extra entry cannot hide among them.
-        if checked != seqno_bounds.live_len(punch) {
-            return Err(crate::Error::InvalidHeader(
-                "seqno_bounds carries entries for blocks the index does not hold",
+
+        // Finalizers: the counts the per-block checks accumulated.
+        //
+        // The separator pairing closes the other direction: the per-block half
+        // rejects a live block the index does not address, this rejects a live
+        // separator no walked block claimed. The standalone pass could express
+        // neither — it walked the index side alone.
+        if separators_checked != separators.len() {
+            return Err((
+                G::Separators,
+                crate::Error::InvalidHeader(
+                    "the index carries separators for blocks it does not hold",
+                ),
             ));
         }
-        Ok(())
-    }
-
-    /// Fully DECODES every data block and checks its entry count against the
-    /// trailer's declared item count. The out-of-band walk verifies only the
-    /// outer frame, and `verify_kv_checksums` is a no-op for a footer-less
-    /// SST, so a checksum- and parity-consistent block with a valid prefix
-    /// followed by a malformed entry is otherwise graded clean: the entry
-    /// decoder turns a mid-stream parse failure into an ordinary end of
-    /// iteration, so a later scan silently omits the malformed tail. Decoding
-    /// to fewer (or more) entries than the trailer declares is corruption.
-    /// Covers both row-major and columnar blocks.
-    ///
-    /// # Errors
-    ///
-    /// [`crate::Error::InvalidHeader`] when a block decodes to a different
-    /// entry count than its trailer declares; any I/O / decode error from the
-    /// full scan.
-    #[cfg(feature = "std")]
-    pub(crate) fn verify_block_entry_counts(&self) -> crate::Result<()> {
-        // A restricted view's punched prefix blocks are dead (read as zeros);
-        // only its live suffix blocks are entry-count-verified.
-        let punch = self.punch_offset()?;
-        for handle in self.block_index.iter() {
-            let handle = handle?;
-            let block_handle = BlockHandle::new(handle.offset(), handle.size());
-            if block_handle.offset().0 < punch {
-                continue;
-            }
-            #[cfg(feature = "columnar")]
-            if self.metadata.columnar {
-                let block = self.load_block_from_disk(&block_handle, BlockType::Columnar)?;
-                // `column_batch_to_entries` fully materializes the rows, so a
-                // malformed batch fails here rather than truncating silently.
-                let batch = crate::table::columnar::ColumnBatch::decode(&block.data)?;
-                let entries = crate::table::columnar::column_batch_to_entries(&batch)?;
-                if entries.len() != batch.row_count as usize {
-                    return Err(crate::Error::InvalidHeader(
-                        "columnar block decodes to fewer rows than its batch declares",
-                    ));
-                }
-                continue;
-            }
-            let block = self.load_block_from_disk(&block_handle, BlockType::Data)?;
-            let data_block =
-                DataBlock::from_loaded(block, self.metadata.kv_checksum_algo.is_some())?;
-            let declared = data_block.len();
-            let decoded = data_block.try_iter(self.comparator.clone())?.count();
-            if decoded != declared {
-                return Err(crate::Error::InvalidHeader(
-                    "data block decodes to fewer entries than its trailer declares",
-                ));
-            }
+        let punch = self.punch_offset().map_err(tag(G::SeqnoBounds))?;
+        if let Some(map) = &seqno_bounds
+            && seqno_checked != map.live_len(punch)
+        {
+            return Err((
+                G::SeqnoBounds,
+                crate::Error::InvalidHeader(
+                    "seqno_bounds carries entries for blocks the index does not hold",
+                ),
+            ));
         }
-        Ok(())
+        if let Some(map) = &zone_map
+            && zone_checked != map.live_len(punch)
+        {
+            return Err((
+                G::ZoneMap,
+                crate::Error::InvalidHeader(
+                    "zone_map carries entries for blocks the index does not hold",
+                ),
+            ));
+        }
+        self.finish_meta_bounds(meta)
+            .map_err(tag(G::MetadataBounds))
     }
 
-    /// Cross-checks the recorded `zone_map` section against the ACTUAL
-    /// per-block statistics derived from decoding every data block. The
-    /// section's block is checksum-clean to the out-of-band walk even when
-    /// its PAYLOAD was re-stamped to another structurally valid map, and
-    /// `columnar_scan` trusts its min/max to SKIP blocks — a forged range
-    /// silently omits matching rows. A row block records one synthetic column
-    /// (whole-block key range + row count); a columnar block records one entry
-    /// per stored column, re-derived from the decoded batch. Every block must
-    /// be recorded and its recorded stats must equal the decoded ones. A no-op
-    /// for tables without the section.
+    /// Opens the file and parses its TOC: the pair every reconcile section read
+    /// works from. Done ONCE per pass and lent to each reader, so a reconcile
+    /// costs one open and one TOC parse instead of one per section, and every
+    /// gate judges the SAME on-disk image rather than up to five successive
+    /// ones.
     ///
     /// # Errors
     ///
-    /// [`crate::Error::InvalidHeader`] when the recorded map disagrees with
-    /// the decoded blocks; any I/O / decode error from the full scan.
+    /// Propagates the file open, the SFA trailer read and the TOC parse.
     #[cfg(feature = "std")]
-    pub(crate) fn verify_zone_map(&self) -> crate::Result<()> {
-        // Re-read the section FROM DISK: the in-memory map is best-effort at
-        // recover time, so an on-disk re-stamp after the open is invisible to
-        // it. An unreadable section is an error here (the caller is deciding
-        // whether to trust the file's bytes), unlike the best-effort load.
+    fn open_sections(
+        &self,
+    ) -> crate::Result<(
+        alloc::boxed::Box<dyn crate::fs::FsFile>,
+        regions::ParsedRegions,
+    )> {
         let mut file = self.fs.open(&self.path, &FsOpenOptions::new().read(true))?;
         let trailer = crate::sfa::Reader::from_reader(&mut file)?;
         let regions = regions::ParsedRegions::parse_from_toc(trailer.toc())?;
-        let Some(zm_handle) = regions.zone_map else {
-            return Ok(());
-        };
-        let zone_map = {
-            let block = Block::from_file(
-                &*file,
-                zm_handle,
-                crate::table::block::BlockIdentity {
-                    table_id: self.metadata.id,
-                    block_type: BlockType::ZoneMap,
-                    dict_id: 0,
-                    window_log: 0,
-                },
-                &{
-                    let t = match self.encryption.as_deref() {
-                        Some(enc) => crate::table::block::BlockTransform::Encrypted(enc),
-                        None => crate::table::block::BlockTransform::PLAIN,
-                    };
-                    if let Some(ecc) = self.metadata.ecc_params {
-                        t.with_ecc(ecc)
-                    } else {
-                        t
-                    }
-                },
-            )?;
-            if block.header.block_type != BlockType::ZoneMap {
-                return Err(crate::Error::InvalidTag((
-                    "BlockType",
-                    block.header.block_type.into(),
-                )));
-            }
-            crate::table::zone_map::ZoneMap::decode(&block.data)?
-        };
-        // The writer emits one zone-map entry per data block whenever the
-        // section exists, so a PRESENT-but-empty map on a table with data blocks
-        // is a forgery — e.g. a delete_bitmap relabeled and re-roled to an empty
-        // zone_map, which drops the deletion metadata while every semantic gate
-        // (tiling, block role, parsed deletion state) still passes. Reject it,
-        // as the other rebuildable-section checks do.
-        if zone_map.is_empty() {
-            if self.block_index.iter().next().is_some() {
-                return Err(crate::Error::InvalidHeader(
-                    "zone_map section is present but empty on a table with data blocks",
-                ));
-            }
-            return Ok(());
-        }
-        // A restricted view's punched prefix blocks are DEAD (never read), and
-        // the zone_map still carries their entries (the file is punched, not
-        // rewritten). Skip those blocks and count only the LIVE zone_map entries
-        // below, so the cross-check authenticates exactly the suffix.
-        let punch = self.punch_offset()?;
-        let mut checked = 0usize;
-        for handle in self.block_index.iter() {
-            let handle = handle?;
-            let block_handle = BlockHandle::new(handle.offset(), handle.size());
-            if block_handle.offset().0 < punch {
-                continue;
-            }
-            let Some(recorded) = zone_map.columns_for(block_handle.offset().0) else {
-                return Err(crate::Error::InvalidHeader(
-                    "zone_map is missing a data block's entry",
-                ));
-            };
-            // Authenticate the recorded entry against the block's ACTUAL decoded
-            // statistics. A columnar block records one entry per stored column,
-            // re-derived here by the SAME function the writer used, so any
-            // divergence (a re-stamped range, an added / dropped column, a
-            // flipped id) is a forgery. A row block records a single synthetic
-            // whole-block key range (checked in `verify_row_block_zone_entry`).
-            #[cfg(feature = "columnar")]
-            if self.metadata.columnar {
-                let block = self.load_block_from_disk(&block_handle, BlockType::Columnar)?;
-                let batch = crate::table::columnar::ColumnBatch::decode(&block.data)?;
-                if batch.row_count == 0 {
-                    return Err(crate::Error::InvalidHeader(
-                        "columnar data block decodes to zero rows",
-                    ));
-                }
-                if recorded != batch.zone_stats().as_slice() {
-                    return Err(crate::Error::InvalidHeader(
-                        "zone_map disagrees with the columnar block's per-column statistics",
-                    ));
-                }
-            } else {
-                self.verify_row_block_zone_entry(recorded, &block_handle)?;
-            }
-            #[cfg(not(feature = "columnar"))]
-            self.verify_row_block_zone_entry(recorded, &block_handle)?;
+        Ok((file, regions))
+    }
 
-            checked = checked
-                .checked_add(1)
-                .ok_or(crate::Error::InvalidHeader("zone_map"))?;
+    /// Reads the `seqno_bounds` section FROM DISK, or `None` when the table
+    /// has none.
+    ///
+    /// Disk-fresh on purpose: the in-memory map was loaded at recover time, so
+    /// an on-disk re-stamp after the open — the very forge this gate exists
+    /// for — would be invisible to it. Unlike the best-effort recover load, an
+    /// unreadable section is an error here: the callers are deciding whether to
+    /// trust the file's bytes.
+    ///
+    /// # Errors
+    ///
+    /// Propagates the section decode, and rejects a block that does not carry
+    /// the seqno-bounds role.
+    #[cfg(feature = "std")]
+    fn read_seqno_bounds_section(
+        &self,
+        file: &dyn crate::fs::FsFile,
+        regions: &regions::ParsedRegions,
+    ) -> crate::Result<Option<crate::table::seqno_bounds::SeqnoBoundsMap>> {
+        let Some(sb_handle) = regions.seqno_bounds else {
+            return Ok(None);
+        };
+        let block = Block::from_file(
+            file,
+            sb_handle,
+            crate::table::block::BlockIdentity {
+                table_id: self.metadata.id,
+                block_type: BlockType::SeqnoBounds,
+                dict_id: 0,
+                window_log: 0,
+            },
+            &self.section_transform(),
+        )?;
+        if block.header.block_type != BlockType::SeqnoBounds {
+            return Err(crate::Error::InvalidTag((
+                "BlockType",
+                block.header.block_type.into(),
+            )));
         }
-        if checked != zone_map.live_len(punch) {
+        Ok(Some(crate::table::seqno_bounds::SeqnoBoundsMap::decode(
+            &block.data,
+        )?))
+    }
+
+    /// The encryption / ECC context the uncompressed side sections decode
+    /// under. Every reconcile section read builds the same one.
+    #[cfg(feature = "std")]
+    fn section_transform(&self) -> crate::table::block::BlockTransform<'_> {
+        let t = match self.encryption.as_deref() {
+            Some(enc) => crate::table::block::BlockTransform::Encrypted(enc),
+            None => crate::table::block::BlockTransform::PLAIN,
+        };
+        if let Some(ecc) = self.metadata.ecc_params {
+            t.with_ecc(ecc)
+        } else {
+            t
+        }
+    }
+
+    /// The recorded per-block seqno range must equal the one the block's
+    /// decoded entries span.
+    #[cfg(feature = "std")]
+    fn check_block_seqno_bounds(
+        recorded_map: &crate::table::seqno_bounds::SeqnoBoundsMap,
+        block: &DecodedBlock,
+    ) -> crate::Result<()> {
+        let Some(recorded) = recorded_map.bounds_for(block.handle.offset().0) else {
             return Err(crate::Error::InvalidHeader(
-                "zone_map carries entries for blocks the index does not hold",
+                "seqno_bounds is missing a data block's entry",
+            ));
+        };
+        let mut seqnos = block.entries.iter().map(|e| e.key.seqno);
+        let Some(first) = seqnos.next() else {
+            return Err(crate::Error::InvalidHeader(
+                "data block decodes to zero entries",
+            ));
+        };
+        let derived = seqnos.fold((first, first), |(lo, hi), s| (lo.min(s), hi.max(s)));
+        if derived != recorded {
+            return Err(crate::Error::InvalidHeader(
+                "seqno_bounds disagrees with the block's decoded entries",
             ));
         }
         Ok(())
+    }
+
+    /// Checks a block's declared entry count against the DECODED one. The
+    /// out-of-band walk verifies only the outer frame, and `verify_kv_checksums`
+    /// is a no-op for a footer-less SST, so a checksum- and parity-consistent
+    /// block with a valid prefix followed by a malformed entry is otherwise
+    /// graded clean: the entry decoder turns a mid-stream parse failure into an
+    /// ordinary end of iteration, so a later scan silently omits the malformed
+    /// tail. Decoding to fewer (or more) entries than the trailer declares is
+    /// corruption. Covers both row-major and columnar blocks.
+    ///
+    /// # Errors
+    ///
+    /// [`crate::Error::InvalidHeader`] when the block decodes to a different
+    /// entry count than its trailer declares.
+    #[cfg(feature = "std")]
+    fn check_block_entry_count(block: &DecodedBlock) -> crate::Result<()> {
+        #[cfg(feature = "columnar")]
+        if let Some(batch) = &block.batch {
+            // The entries were fully materialized by the walk, so a malformed
+            // batch already failed there rather than truncating silently.
+            if block.entries.len() != batch.row_count as usize {
+                return Err(crate::Error::InvalidHeader(
+                    "columnar block decodes to fewer rows than its batch declares",
+                ));
+            }
+            return Ok(());
+        }
+        let Some(row) = &block.row else {
+            return Ok(());
+        };
+        if block.entries.len() != row.len() {
+            return Err(crate::Error::InvalidHeader(
+                "data block decodes to fewer entries than its trailer declares",
+            ));
+        }
+        Ok(())
+    }
+
+    /// Reads the `zone_map` section FROM DISK, or `None` when the table has
+    /// none. Disk-fresh for the same reason as the seqno bounds: the in-memory
+    /// map is best-effort at recover time, so an on-disk re-stamp after the
+    /// open is invisible to it.
+    ///
+    /// # Errors
+    ///
+    /// Propagates the section decode, and rejects a block that does not carry
+    /// the zone-map role.
+    #[cfg(feature = "std")]
+    fn read_zone_map_section(
+        &self,
+        file: &dyn crate::fs::FsFile,
+        regions: &regions::ParsedRegions,
+    ) -> crate::Result<Option<crate::table::zone_map::ZoneMap>> {
+        let Some(zm_handle) = regions.zone_map else {
+            return Ok(None);
+        };
+        let block = Block::from_file(
+            file,
+            zm_handle,
+            crate::table::block::BlockIdentity {
+                table_id: self.metadata.id,
+                block_type: BlockType::ZoneMap,
+                dict_id: 0,
+                window_log: 0,
+            },
+            &self.section_transform(),
+        )?;
+        if block.header.block_type != BlockType::ZoneMap {
+            return Err(crate::Error::InvalidTag((
+                "BlockType",
+                block.header.block_type.into(),
+            )));
+        }
+        Ok(Some(crate::table::zone_map::ZoneMap::decode(&block.data)?))
+    }
+
+    /// The recorded zone-map entry must match the one the block's decoded
+    /// contents produce. A columnar block records
+    /// one entry per stored column, re-derived by the SAME function the writer
+    /// used, so any divergence (a re-stamped range, an added / dropped column,
+    /// a flipped id) is a forgery; a row block records a single synthetic
+    /// whole-block key range.
+    #[cfg(feature = "std")]
+    fn check_block_zone_entry(
+        recorded_map: &crate::table::zone_map::ZoneMap,
+        block: &DecodedBlock,
+    ) -> crate::Result<()> {
+        let Some(recorded) = recorded_map.columns_for(block.handle.offset().0) else {
+            return Err(crate::Error::InvalidHeader(
+                "zone_map is missing a data block's entry",
+            ));
+        };
+        #[cfg(feature = "columnar")]
+        if let Some(batch) = &block.batch {
+            if batch.row_count == 0 {
+                return Err(crate::Error::InvalidHeader(
+                    "columnar data block decodes to zero rows",
+                ));
+            }
+            if recorded != batch.zone_stats().as_slice() {
+                return Err(crate::Error::InvalidHeader(
+                    "zone_map disagrees with the columnar block's per-column statistics",
+                ));
+            }
+            return Ok(());
+        }
+        Self::verify_row_block_zone_entry(recorded, block)
     }
 
     /// Cross-checks a ROW data block's recorded zone-map entry: it must be
@@ -3652,13 +3959,12 @@ impl Table {
     /// the id to a consumer value-column id would let
     /// [`ColumnRangePredicate::can_skip_block`](crate::table::columnar_predicate::ColumnRangePredicate::can_skip_block)
     /// read those key bounds as value-column statistics and skip blocks holding
-    /// matching rows. Split out of [`Self::verify_zone_map`] so the columnar
-    /// path can authenticate its per-column entry instead.
+    /// matching rows. Split out of [`Self::check_block_zone_entry`] so the
+    /// columnar path can authenticate its per-column entry instead.
     #[cfg(feature = "std")]
     fn verify_row_block_zone_entry(
-        &self,
         recorded: &[crate::table::zone_map::ColumnStats],
-        block_handle: &BlockHandle,
+        block: &DecodedBlock,
     ) -> crate::Result<()> {
         let [col] = recorded else {
             return Err(crate::Error::InvalidHeader(
@@ -3671,39 +3977,20 @@ impl Table {
                  writer's whole-block column (id / type / codec / null)",
             ));
         }
-        let (min_key, max_key, rows) = self.zone_stats_from_row_block(block_handle)?;
-        if col.min != min_key || col.max != max_key || col.row_count as usize != rows {
+        let (Some(first), Some(last)) = (block.entries.first(), block.entries.last()) else {
+            return Err(crate::Error::InvalidHeader(
+                "row data block decodes to zero entries",
+            ));
+        };
+        if col.min != first.key.user_key.as_ref()
+            || col.max != last.key.user_key.as_ref()
+            || col.row_count as usize != block.entries.len()
+        {
             return Err(crate::Error::InvalidHeader(
                 "zone_map disagrees with the block's decoded key range or row count",
             ));
         }
         Ok(())
-    }
-
-    /// Derives `(min_user_key, max_user_key, row_count)` from a decoded ROW
-    /// data block, for the [`Self::verify_zone_map`] cross-check.
-    #[cfg(feature = "std")]
-    fn zone_stats_from_row_block(
-        &self,
-        block_handle: &BlockHandle,
-    ) -> crate::Result<(Vec<u8>, Vec<u8>, usize)> {
-        use crate::table::block::ParsedItem as _;
-        let block = self.load_block_from_disk(block_handle, BlockType::Data)?;
-        let data_block = DataBlock::from_loaded(block, self.metadata.kv_checksum_algo.is_some())?;
-        let entries: Vec<_> = data_block
-            .try_iter(self.comparator.clone())?
-            .map(|p| p.materialize(data_block.as_slice()))
-            .collect();
-        let (Some(first), Some(last)) = (entries.first(), entries.last()) else {
-            return Err(crate::Error::InvalidHeader(
-                "row data block decodes to zero entries",
-            ));
-        };
-        Ok((
-            first.key.user_key.to_vec(),
-            last.key.user_key.to_vec(),
-            entries.len(),
-        ))
     }
 
     /// Publishes this table's tight-space restriction lower bound to its
@@ -3972,38 +4259,30 @@ impl Table {
         Ok(None)
     }
 
-    /// Cross-checks the recorded `locator` section against the ACTUAL
-    /// key → newest-version-block mapping derived from decoding every data
-    /// block. A checksum- and parity-consistent forged locator is accepted by
-    /// the out-of-band walk on its block role alone, but `point_read_inner`
-    /// trusts its answer and reads the addressed block directly: a locator
-    /// redirected from a key's newest-version block to a LATER block holding
-    /// an OLDER version returns that stale value without falling back to the
-    /// sorted index. A correctly-built locator answers every in-table key
-    /// with the block holding its newest version (the FIRST block covering
-    /// it, since blocks are sorted by key then descending seqno), so any key
-    /// whose locator answer points at a different block is corruption. A
-    /// no-op for tables without the section.
+    /// Reads the `locator` section FROM DISK and pairs it with the ordinal →
+    /// handle map (the writer's `block_id` order is the index order), mirroring
+    /// the open path. `None` when the table has no locator.
+    ///
+    /// Read from the file rather than taken from the open table because a
+    /// checksum- and parity-consistent forged locator is accepted by the
+    /// out-of-band walk on its block role alone, while `point_read_inner`
+    /// trusts its answer and reads the addressed block directly.
     ///
     /// # Errors
     ///
-    /// [`crate::Error::InvalidHeader`] when a key's locator answer disagrees
-    /// with its decoded newest-version block; any I/O / decode error from the
-    /// full scan.
+    /// Propagates the section decode and the index walk, and rejects a block
+    /// that does not carry the locator role.
     #[cfg(feature = "std")]
-    pub(crate) fn verify_locator(&self) -> crate::Result<()> {
-        // Re-read the section FROM DISK and pair it with the ordinal → handle
-        // map (the writer's block_id order == index order), mirroring the open
-        // path. An unreadable section is an error here (the caller is deciding
-        // whether to trust the bytes), unlike the best-effort open load.
-        let mut file = self.fs.open(&self.path, &FsOpenOptions::new().read(true))?;
-        let trailer = crate::sfa::Reader::from_reader(&mut file)?;
-        let regions = regions::ParsedRegions::parse_from_toc(trailer.toc())?;
+    fn read_locator_section(
+        &self,
+        file: &dyn crate::fs::FsFile,
+        regions: &regions::ParsedRegions,
+    ) -> crate::Result<Option<crate::table::locator::LoadedLocator>> {
         let Some(loc_handle) = regions.locator else {
-            return Ok(());
+            return Ok(None);
         };
         let block = Block::from_file(
-            &*file,
+            file,
             loc_handle,
             crate::table::block::BlockIdentity {
                 table_id: self.metadata.id,
@@ -4011,17 +4290,7 @@ impl Table {
                 dict_id: 0,
                 window_log: 0,
             },
-            &{
-                let t = match self.encryption.as_deref() {
-                    Some(enc) => crate::table::block::BlockTransform::Encrypted(enc),
-                    None => crate::table::block::BlockTransform::PLAIN,
-                };
-                if let Some(ecc) = self.metadata.ecc_params {
-                    t.with_ecc(ecc)
-                } else {
-                    t
-                }
-            },
+            &self.section_transform(),
         )?;
         if block.header.block_type != BlockType::Locator {
             return Err(crate::Error::InvalidTag((
@@ -4034,53 +4303,36 @@ impl Table {
             .iter()
             .map(|r| r.map(|kbh| *kbh.as_ref()))
             .collect::<crate::Result<Vec<_>>>()?;
-        let locator = crate::table::locator::LoadedLocator::new(block.data, blocks);
+        Ok(Some(crate::table::locator::LoadedLocator::new(
+            block.data, blocks,
+        )))
+    }
 
-        // Walk blocks in index (block_id) order; the FIRST time a user key
-        // appears is its newest version, so that block is the locator's
-        // expected answer. `seen` dedups across blocks (a key's older
-        // versions in later blocks must not overwrite the expectation).
-        let mut seen: crate::HashSet<Vec<u8>> = crate::HashSet::default();
-        // A restricted view's punched prefix blocks are dead; skip them. Their
-        // keys are superseded, so a suffix key's newest version is in the suffix,
-        // and reads never consult the locator's prefix answers.
-        let punch = self.punch_offset()?;
-        for handle in self.block_index.iter() {
-            let handle = handle?;
-            let block_handle = BlockHandle::new(handle.offset(), handle.size());
-            if block_handle.offset().0 < punch {
-                continue;
-            }
-            // Load the disk-fresh row block once so a `Restart` / `Entry`
-            // slot hint can be probed against it below. Columnar blocks carry
-            // no in-block slot semantics (rows are reconstructed on load), so
-            // there the locator is per-block and only the block-id is checked.
-            #[cfg(feature = "columnar")]
-            let row_block = if self.metadata.columnar {
-                None
-            } else {
-                Some(DataBlock::from_loaded(
-                    self.load_block_from_disk(&block_handle, BlockType::Data)?,
-                    self.metadata.kv_checksum_algo.is_some(),
-                )?)
-            };
-            #[cfg(not(feature = "columnar"))]
-            let row_block = Some(DataBlock::from_loaded(
-                self.load_block_from_disk(&block_handle, BlockType::Data)?,
-                self.metadata.kv_checksum_algo.is_some(),
-            )?);
-            // Reuse the already-loaded row block for row tables (its entries
-            // are what `decode_block_entries` would re-decode); only the
-            // columnar path needs the separate reconstruction decode.
-            use crate::table::block::ParsedItem as _;
-            let entries: Vec<InternalValue> = match row_block.as_ref() {
-                Some(block) => block
-                    .try_iter(self.comparator.clone())?
-                    .map(|p| p.materialize(block.as_slice()))
-                    .collect(),
-                None => self.decode_block_entries(&block_handle)?,
-            };
-            for entry in entries {
+    /// Cross-checks the recorded `locator` section against the ACTUAL
+    /// key → newest-version-block mapping the decode yields. A locator
+    /// redirected from a key's newest-version block to a LATER block holding an
+    /// OLDER version returns that stale value without falling back to the
+    /// sorted index, so any key whose locator answer points at a different
+    /// block than the decode does is corruption.
+    ///
+    /// `seen` carries ACROSS blocks: the first block holding a user key holds
+    /// its newest version (blocks are sorted by key then descending seqno), so
+    /// that block is the locator's expected answer and a later block's older
+    /// versions must not overwrite the expectation.
+    #[cfg(feature = "std")]
+    fn check_block_locator(
+        &self,
+        locator: &crate::table::locator::LoadedLocator,
+        seen: &mut crate::HashSet<Vec<u8>>,
+        block: &DecodedBlock,
+    ) -> crate::Result<()> {
+        {
+            let block_handle = block.handle;
+            // Columnar blocks carry no in-block slot semantics (rows are
+            // reconstructed on load), so there the locator is per-block and
+            // only the block-id is checked.
+            let row_block = block.row.as_ref();
+            for entry in &block.entries {
                 let user_key = entry.key.user_key.to_vec();
                 if !seen.insert(user_key.clone()) {
                     continue;
@@ -4114,7 +4366,7 @@ impl Table {
                 // the key, which is `entry` here since `located` == this
                 // block). A `None` hint (per-block precision) has no slot to
                 // validate.
-                if let (Some((slot, is_entry)), Some(block)) = (hint, row_block.as_ref()) {
+                if let (Some((slot, is_entry)), Some(block)) = (hint, row_block) {
                     let found = block.point_read_at_slot(
                         slot,
                         is_entry,
@@ -4142,98 +4394,52 @@ impl Table {
     }
 
     /// Confirms every decoded key is RETRIEVABLE through its own block's
-    /// in-block indexes, judged on the DISK-FRESH bytes. A data block's
-    /// embedded HASH INDEX is checksum-clean to the out-of-band walk even
-    /// when a bucket was re-stamped to `MARKER_FREE`: the sequential decode
-    /// gates still see every entry, but `point_read` trusts the index and
-    /// returns `None` for the affected keys. Each block is re-read from the
-    /// file and probed through ITS OWN `point_read` — the table-level probe
-    /// this replaces went through the recovery-time in-memory index and the
-    /// block cache, so a pristine cached copy masked the on-disk forge.
-    /// Filter, locator, and TLI misdirection have their own disk-fresh
-    /// gates (`verify_filter`, `verify_locator`, `verify_tli_mirrors`).
-    /// Columnar blocks carry no in-block key index (rows are reconstructed
-    /// on load), so they have nothing to probe.
+    /// in-block indexes, and that the internal-key sort order holds.
     ///
-    /// # Errors
+    /// Judged on the DISK-FRESH bytes the walk decoded. A data block's embedded
+    /// HASH INDEX is checksum-clean to the out-of-band walk even when a bucket
+    /// was re-stamped to `MARKER_FREE`: the sequential decode gates still see
+    /// every entry, but `point_read` trusts the index and returns `None` for
+    /// the affected keys. Each block is probed through ITS OWN `point_read` —
+    /// the table-level probe this replaces went through the recovery-time
+    /// in-memory index and the block cache, so a pristine cached copy masked
+    /// the on-disk forge. Filter, locator and TLI misdirection have their own
+    /// disk-fresh gates.
     ///
-    /// [`crate::Error::InvalidHeader`] when a decoded key is not retrievable
-    /// from its block; any I/O / decode error from the full scan.
+    /// A columnar block has no in-block key index to probe (rows are
+    /// reconstructed on load), but the GLOBAL order (user key ASC, then seqno
+    /// DESC per key) is still an invariant the read path relies on:
+    /// `column_batch_match_entries` binary-searches the key column assuming it
+    /// is sorted, so a checksum-restamped block with reordered keys — which
+    /// every other columnar check tolerates — would make point reads miss a key
+    /// or return a stale version.
+    ///
+    /// `prev_internal` carries the last decoded internal key ACROSS blocks,
+    /// which is what makes the order check global rather than per-block: a
+    /// restamped later block must not raise the seqno of a key that also ends
+    /// the preceding block, since both would decode and probe cleanly on their
+    /// own while a later compaction persisted the stale version.
     #[cfg(feature = "std")]
-    pub(crate) fn verify_point_read_reachability(&self) -> crate::Result<()> {
-        use crate::table::block::ParsedItem as _;
-        // Columnar blocks carry no in-block key index to probe, but the GLOBAL
-        // internal-key sort order (user key ASC, then seqno DESC per key) is still
-        // an invariant the read path relies on: `column_batch_match_entries`
-        // binary-searches the key column assuming it is sorted, so a
-        // checksum-restamped block with reordered keys — which every other
-        // columnar check (count / zone-bound comparisons) tolerates — would make
-        // point reads miss a key or return a stale version. Enforce the order over
-        // the live suffix (the punched prefix is dead); there is no point_read to
-        // run, so this is the only order gate for a columnar table.
-        #[cfg(feature = "columnar")]
-        if self.metadata.columnar {
-            let punch = self.punch_offset()?;
-            let mut prev_internal: Option<(UserKey, SeqNo)> = None;
-            for handle in self.block_index.iter() {
-                let handle = handle?;
-                let block_handle = BlockHandle::new(handle.offset(), handle.size());
-                if block_handle.offset().0 < punch {
-                    continue;
-                }
-                for entry in self.decode_block_entries(&block_handle)? {
-                    if let Some((pk, ps)) = &prev_internal {
-                        let out_of_order = match self.comparator.compare(&entry.key.user_key, pk) {
-                            core::cmp::Ordering::Greater => false,
-                            core::cmp::Ordering::Less => true,
-                            core::cmp::Ordering::Equal => entry.key.seqno >= *ps,
-                        };
-                        if out_of_order {
-                            return Err(crate::Error::InvalidHeader(
-                                "columnar entries are out of order (a user key decreased, or an \
-                                 equal key's seqno did not strictly decrease) across the walk",
-                            ));
-                        }
-                    }
-                    prev_internal = Some((entry.key.user_key.clone(), entry.key.seqno));
-                }
-            }
-            return Ok(());
-        }
-        // The internal-key sort order (user key ASC, then seqno DESC per key) is
-        // a GLOBAL invariant across the whole table, not just within a block.
-        // Carry the last decoded internal key ACROSS block boundaries so a
-        // checksum-restamped later block cannot raise the seqno of a key that
-        // also ends the preceding block: both blocks would decode and probe
-        // cleanly on their own, yet after reopen the index seeks the first block
-        // and a later compaction could persist the stale (lower-seqno) version.
-        // A restricted view's punched prefix blocks are dead; skip them. The
-        // global sort order still holds across the LIVE suffix, so `prev_internal`
-        // simply starts at the first live block.
-        let punch = self.punch_offset()?;
-        let mut prev_internal: Option<(UserKey, SeqNo)> = None;
-        for handle in self.block_index.iter() {
-            let handle = handle?;
-            let block_handle = BlockHandle::new(handle.offset(), handle.size());
-            if block_handle.offset().0 < punch {
-                continue;
-            }
-            let block = self.load_block_from_disk(&block_handle, BlockType::Data)?;
-            let data_block =
-                DataBlock::from_loaded(block, self.metadata.kv_checksum_algo.is_some())?;
+    fn check_block_reachability(
+        &self,
+        prev_internal: &mut Option<(UserKey, SeqNo)>,
+        block: &DecodedBlock,
+    ) -> crate::Result<()> {
+        {
             // A block whose keys all resolve through its HASH index never
             // exercises the binary index in the probes below, yet range
             // seeks still trust it — authenticate the pointers directly.
-            data_block.verify_binary_index()?;
-            let entries: Vec<InternalValue> = data_block
-                .try_iter(self.comparator.clone())?
-                .map(|p| p.materialize(data_block.as_slice()))
-                .collect();
+            // A columnar block has no in-block index to probe: rows are
+            // reconstructed on load, so only the sort order is enforced there.
+            if let Some(data_block) = &block.row {
+                data_block.verify_binary_index()?;
+            }
+            let data_block = block.row.as_ref();
             // A key's versions are adjacent within the block (sorted by key
             // then descending seqno), so the FIRST occurrence is the newest
             // and one probe per distinct key suffices.
             let mut prev_key: Option<UserKey> = None;
-            for entry in entries {
+            for entry in block.entries.iter().cloned() {
                 // Enforce the global sort order on EVERY entry (before the
                 // per-key dedup below), tracking the previous entry across block
                 // boundaries: the user key must strictly increase, or (for the
@@ -4245,14 +4451,26 @@ impl Table {
                         core::cmp::Ordering::Equal => entry.key.seqno >= *ps,
                     };
                     if out_of_order {
-                        return Err(crate::Error::InvalidHeader(
+                        // Same invariant, but the two block layouts report it
+                        // in their own words: a columnar table has no
+                        // point_read to fall back on, so its message names the
+                        // layout that produced the disorder.
+                        return Err(crate::Error::InvalidHeader(if data_block.is_some() {
                             "data-block entries are out of order (a user key decreased, or an \
-                             equal key's seqno did not strictly decrease) across the walk",
-                        ));
+                             equal key's seqno did not strictly decrease) across the walk"
+                        } else {
+                            "columnar entries are out of order (a user key decreased, or an \
+                             equal key's seqno did not strictly decrease) across the walk"
+                        }));
                     }
                 }
-                prev_internal = Some((entry.key.user_key.clone(), entry.key.seqno));
+                *prev_internal = Some((entry.key.user_key.clone(), entry.key.seqno));
 
+                // Columnar blocks have no in-block index, so the sort-order
+                // enforcement above is the whole check for them.
+                let Some(data_block) = data_block else {
+                    continue;
+                };
                 if prev_key
                     .as_ref()
                     .is_some_and(|p| crate::comparator::same_user_key(p, &entry.key.user_key))
@@ -4304,75 +4522,41 @@ impl Table {
         self.rebuildable_section_degraded
     }
 
-    /// Probes every decoded data key against the on-disk `filter` section:
-    /// each key the table holds must be reported as POSSIBLY PRESENT. A
+    /// Reads the `filter` section and everything a probe of it needs, so the
+    /// combined reconcile pass builds the state once and then probes it with
+    /// the shared decode. `None` for a table without a filter.
+    ///
+    /// Read from the file rather than taken from the open table because a
     /// checksum- and parity-consistent forged filter is accepted by the
-    /// out-of-band walk on its framing and role alone — the walk never
-    /// probes it — but `check_bloom` trusts it to SKIP point reads, so a key
-    /// made into a false negative silently disappears from every read. A
-    /// false positive is unprovable (it is the filter's normal error mode),
-    /// but a false NEGATIVE on an existing key is corruption by
-    /// construction. A no-op for tables without a filter.
+    /// out-of-band walk on its framing and role alone — the walk never probes
+    /// it — while `check_bloom` trusts it to SKIP point reads.
     ///
     /// # Errors
     ///
-    /// [`crate::Error::InvalidHeader`] when the filter reports an existing
-    /// key as definitely absent; any I/O / decode error from the full scan.
+    /// Propagates the section reads, and rejects a present-but-empty filter on
+    /// a table that has data blocks.
     #[cfg(feature = "std")]
-    pub(crate) fn verify_filter(
-        &self,
+    fn filter_probe<'a>(
+        &'a self,
+        file: &'a dyn crate::fs::FsFile,
+        regions: &regions::ParsedRegions,
         prefix_extractor: Option<&alloc::sync::Arc<dyn crate::prefix::PrefixExtractor>>,
-    ) -> crate::Result<()> {
+    ) -> crate::Result<Option<FilterProbe<'a>>> {
         // Re-read the filter FROM DISK: the open path PINS the filter (or
         // its partition index) in memory at recover time, so an on-disk
         // re-stamp after the open (the very forge this check exists for)
         // would be invisible to `check_bloom`. An unreadable filter is an
         // error here (the caller is deciding whether to trust the bytes),
         // unlike the read path's permissive empty-payload sentinel.
-        let mut file = self.fs.open(&self.path, &FsOpenOptions::new().read(true))?;
-        let trailer = crate::sfa::Reader::from_reader(&mut file)?;
-        let regions = regions::ParsedRegions::parse_from_toc(trailer.toc())?;
         if regions.filter.is_none() && regions.filter_tli.is_none() {
-            return Ok(());
+            return Ok(None);
         }
-        let filter_transform = {
-            let t = match self.encryption.as_deref() {
-                Some(enc) => crate::table::block::BlockTransform::Encrypted(enc),
-                None => crate::table::block::BlockTransform::PLAIN,
-            };
-            if let Some(ecc) = self.metadata.ecc_params {
-                t.with_ecc(ecc)
-            } else {
-                t
-            }
-        };
-        let load_filter_block =
-            |handle: BlockHandle| -> crate::Result<crate::table::filter::block::FilterBlock> {
-                let block = Block::from_file(
-                    &*file,
-                    handle,
-                    crate::table::block::BlockIdentity {
-                        table_id: self.metadata.id,
-                        block_type: BlockType::Filter,
-                        dict_id: 0,
-                        window_log: 0,
-                    },
-                    &filter_transform,
-                )?;
-                if block.header.block_type != BlockType::Filter {
-                    return Err(crate::Error::InvalidTag((
-                        "BlockType",
-                        block.header.block_type.into(),
-                    )));
-                }
-                Ok(crate::table::filter::block::FilterBlock::new(block))
-            };
-
+        let filter_transform = self.section_transform();
         // Partitioned mode: the partition index maps a key to its filter
         // block. Loaded from disk for the same reason as the filter itself.
         let filter_index = if let Some(idx_handle) = regions.filter_tli {
             let block = Block::from_file(
-                &*file,
+                file,
                 idx_handle,
                 crate::table::block::BlockIdentity {
                     table_id: self.metadata.id,
@@ -4407,7 +4591,10 @@ impl Table {
             None
         };
         let full_filter = if filter_index.is_none() {
-            regions.filter.map(load_filter_block).transpose()?
+            regions
+                .filter
+                .map(|h| Self::load_filter_block(file, &filter_transform, self.metadata.id, h))
+                .transpose()?
         } else {
             None
         };
@@ -4428,29 +4615,37 @@ impl Table {
             ));
         }
 
-        // Partition blocks are shared by many keys; memoize by file offset so
-        // the probe loop reads each partition once.
-        let mut partitions: alloc::collections::BTreeMap<
-            u64,
-            crate::table::filter::block::FilterBlock,
-        > = alloc::collections::BTreeMap::new();
+        // A restricted view's punched prefix blocks decode to zeros; the walk
+        // skips them. Their keys are superseded, so the live filter is only
+        // obligated to report the suffix keys present.
+        Ok(Some(FilterProbe {
+            table: self,
+            file,
+            transform: filter_transform,
+            index: filter_index,
+            full: full_filter,
+            // Partition blocks are shared by many keys; memoized by file offset
+            // so the probe reads each partition once.
+            partitions: alloc::collections::BTreeMap::new(),
+            prev_key: None,
+            prefix_extractor: prefix_extractor.cloned(),
+        }))
+    }
 
-        // A restricted view's punched prefix blocks decode to zeros; skip them.
-        // Their keys are superseded, so the live filter is only obligated to
-        // report the suffix keys present.
-        let punch = self.punch_offset()?;
-        let mut prev_key: Option<Vec<u8>> = None;
-        for handle in self.block_index.iter() {
-            let handle = handle?;
-            let block_handle = BlockHandle::new(handle.offset(), handle.size());
-            if block_handle.offset().0 < punch {
-                continue;
-            }
-            let entries = self.decode_block_entries(&block_handle)?;
-            for entry in entries {
+    /// Every key the block decodes must be reported POSSIBLY PRESENT by the
+    /// on-disk filter. A false positive is unprovable (it is the filter's
+    /// normal error mode), but a false NEGATIVE on an existing key is
+    /// corruption by construction: it silently disappears the key from every
+    /// read that consults the filter first.
+    #[cfg(feature = "std")]
+    fn check_filter_block(probe: &mut FilterProbe<'_>, block: &DecodedBlock) -> crate::Result<()> {
+        {
+            let table = probe.table;
+            for entry in block.entries.iter().cloned() {
                 // Blocks are sorted by key then descending seqno, so a key's
                 // older versions are always adjacent — one probe per key.
-                if prev_key
+                if probe
+                    .prev_key
                     .as_deref()
                     .is_some_and(|p| crate::comparator::same_user_key(p, &entry.key.user_key))
                 {
@@ -4458,8 +4653,8 @@ impl Table {
                 }
                 let user_key = entry.key.user_key.to_vec();
                 let key_hash = crate::hash::hash64(&user_key);
-                let maybe_present = if let Some(idx) = &filter_index {
-                    let mut iter = idx.iter(self.comparator.clone());
+                let maybe_present = if let Some(idx) = &probe.index {
+                    let mut iter = idx.iter(table.comparator.clone());
                     iter.seek(&user_key, crate::seqno::MAX_SEQNO);
                     let Some(part_handle) = iter.next() else {
                         // A key past the last partition is a definite miss on
@@ -4469,10 +4664,15 @@ impl Table {
                         ));
                     };
                     let part_handle = part_handle.materialize(idx.as_slice()).into_inner();
-                    let filter = match partitions.entry(part_handle.offset().0) {
+                    let filter = match probe.partitions.entry(part_handle.offset().0) {
                         alloc::collections::btree_map::Entry::Occupied(e) => e.into_mut(),
                         alloc::collections::btree_map::Entry::Vacant(e) => {
-                            e.insert(load_filter_block(part_handle)?)
+                            e.insert(Self::load_filter_block(
+                                probe.file,
+                                &probe.transform,
+                                table.metadata.id,
+                                part_handle,
+                            )?)
                         }
                     };
                     // The partition index only addresses partitions the writer
@@ -4488,7 +4688,7 @@ impl Table {
                         ));
                     }
                     filter.maybe_contains_hash(key_hash)?
-                } else if let Some(filter) = &full_filter {
+                } else if let Some(filter) = &probe.full {
                     filter.maybe_contains_hash(key_hash)?
                 } else {
                     true
@@ -4508,7 +4708,7 @@ impl Table {
                 // filters stay conservative (their prefix probe is
                 // deliberately best-effort), so this runs only for a full
                 // filter with a configured extractor.
-                if let (Some(filter), Some(extractor)) = (&full_filter, prefix_extractor) {
+                if let (Some(filter), Some(extractor)) = (&probe.full, &probe.prefix_extractor) {
                     for prefix in extractor.prefixes(&user_key) {
                         let prefix_hash = crate::hash::hash64(prefix);
                         if !filter.maybe_contains_hash(prefix_hash)? {
@@ -4518,74 +4718,79 @@ impl Table {
                         }
                     }
                 }
-                prev_key = Some(user_key);
+                probe.prev_key = Some(user_key);
             }
+            Ok(())
         }
-        Ok(())
     }
 
-    /// Cross-checks the recorded metadata BOUNDS against the table's decoded
-    /// contents. Both meta mirrors re-stamped CONSISTENTLY (fresh checksums
-    /// and parity) pass every byte-level check and the mirror comparison,
-    /// yet run selection trusts `key#min`/`key#max` to route reads AROUND
-    /// this table — a narrowed range silently hides real keys (and the range
-    /// tombstones that mask older tables). Checks, against the ON-DISK meta:
-    /// - the recorded key range COVERS the decoded first/last data keys and
-    ///   every recorded range tombstone's bounds (covers, not equals: the
-    ///   writer legitimately widens the range over tombstone-only spans);
-    /// - the recorded `item_count` equals the decoded entry count (the
-    ///   tombstone sentinel is an on-disk entry counted on both sides);
-    /// - the recorded `data_block_count` equals the indexed block count
-    ///   ([`Table::scan`] hands it to the compaction scanner, which stops
-    ///   after that many blocks — a smaller forge drops the tail);
-    /// - the disk-fresh per-KV footer descriptor matches the recovery-time
-    ///   one (a re-stamped `None` would misread footer bytes as the trailer
-    ///   after reopen);
-    /// - for tables WITHOUT a range-tombstone sentinel, the recorded
-    ///   `seqno#min` is at or below the decoded minimum and `seqno#kv_max`
-    ///   is at or above the decoded maximum (a raised min / lowered max
-    ///   hides visible versions from snapshot reads). RT-bearing tables skip
-    ///   this: the writer records the KV range EXCLUDING the sentinel's
-    ///   synthetic RT-derived seqno, so the decoded range legitimately
-    ///   differs — and those tables are already gated by the fail-closed
-    ///   deletion-metadata attribution rule.
+    /// Reads one filter block (full or partition) from the already-open file,
+    /// rejecting a block that does not carry the filter role.
+    #[cfg(feature = "std")]
+    fn load_filter_block(
+        file: &dyn crate::fs::FsFile,
+        transform: &crate::table::block::BlockTransform<'_>,
+        table_id: crate::TableId,
+        handle: BlockHandle,
+    ) -> crate::Result<crate::table::filter::block::FilterBlock> {
+        let block = Block::from_file(
+            file,
+            handle,
+            crate::table::block::BlockIdentity {
+                table_id,
+                block_type: BlockType::Filter,
+                dict_id: 0,
+                window_log: 0,
+            },
+            transform,
+        )?;
+        if block.header.block_type != BlockType::Filter {
+            return Err(crate::Error::InvalidTag((
+                "BlockType",
+                block.header.block_type.into(),
+            )));
+        }
+        Ok(crate::table::filter::block::FilterBlock::new(block))
+    }
+
+    /// Reads the meta (and range-tombstone) sections the bounds check judges
+    /// against, and seeds the accumulators the walk fills, so the combined
+    /// reconcile pass builds the state once and feeds it the shared decode.
     ///
-    /// # Errors
+    /// Read from the file rather than taken from the open table because both
+    /// meta mirrors re-stamped CONSISTENTLY (fresh checksums and parity) pass
+    /// every byte-level check and the mirror comparison, while run selection
+    /// trusts `key#min`/`key#max` to route reads AROUND this table — a narrowed
+    /// range silently hides real keys (and the range tombstones that mask older
+    /// tables).
     ///
-    /// [`crate::Error::InvalidHeader`] when the recorded bounds disagree
-    /// with the decoded contents; any I/O / decode error from the full scan.
     /// `bitmap_digest_authenticated`: whether the caller has ALREADY
     /// authenticated this file's bytes — bitmap section included — against a
     /// matching manifest digest (the directly attributable heal path: the
     /// pre-heal digest probed equal, so the file differs solely by that
     /// pass's corrections). Only then may a LEGACY table whose bitmap
     /// carries no `descriptor#delete_bitmap_hash` pass; repair has no such
-    /// digest and must keep failing closed on it. The flag drives the
-    /// delete-bitmap gate below, which exists only on columnar builds
-    /// (a positional delete bitmap is a columnar-layout section).
+    /// digest and must keep failing closed on it. Carried on the probe for the
+    /// delete-bitmap gate in [`Self::finish_meta_bounds`], which exists only on
+    /// columnar builds (a positional delete bitmap is a columnar-layout
+    /// section).
+    ///
+    /// # Errors
+    ///
+    /// Propagates the section reads and rejects a disk-fresh meta that
+    /// disagrees with the recovery-time descriptor.
     #[cfg(feature = "std")]
-    #[cfg_attr(
-        not(feature = "columnar"),
-        expect(
-            unused_variables,
-            reason = "the delete-bitmap gate it drives is columnar-only"
-        )
-    )]
-    pub(crate) fn verify_metadata_bounds(
+    fn meta_bounds_probe(
         &self,
+        file: &dyn crate::fs::FsFile,
+        regions: &regions::ParsedRegions,
         bitmap_digest_authenticated: bool,
-    ) -> crate::Result<()> {
-        // Re-read the meta FROM DISK: the in-memory copy was parsed at
-        // recover time, so an on-disk re-stamp after the open (the very
-        // forge this check exists for) would be invisible to it.
-        let mut file = self.fs.open(&self.path, &FsOpenOptions::new().read(true))?;
-        let trailer = crate::sfa::Reader::from_reader(&mut file)?;
-        let regions = regions::ParsedRegions::parse_from_toc(trailer.toc())?;
+    ) -> crate::Result<MetaBoundsProbe> {
         // Tail-first with MID fallback, mirroring recovery: the next open
         // trusts the same copy, and a table living off its intact MID mirror
         // (unreadable forged tail) must be judged by THAT copy's bounds.
         let meta = match crate::table::meta::ParsedMeta::load_with_handle(
-            &*file,
+            file,
             &regions.metadata,
             Some(self.metadata.id),
             self.encryption.as_deref(),
@@ -4596,7 +4801,7 @@ impl Table {
                     return Err(tail_err);
                 };
                 crate::table::meta::ParsedMeta::load_with_handle(
-                    &*file,
+                    file,
                     &mid_handle,
                     Some(self.metadata.id),
                     self.encryption.as_deref(),
@@ -4628,7 +4833,7 @@ impl Table {
         // check further down.
         let tombstones = if let Some(rt_handle) = regions.range_tombstones {
             let block = Block::from_file(
-                &*file,
+                file,
                 rt_handle,
                 crate::table::block::BlockIdentity {
                     table_id: self.metadata.id,
@@ -4636,17 +4841,7 @@ impl Table {
                     dict_id: 0,
                     window_log: 0,
                 },
-                &{
-                    let t = match self.encryption.as_deref() {
-                        Some(enc) => crate::table::block::BlockTransform::Encrypted(enc),
-                        None => crate::table::block::BlockTransform::PLAIN,
-                    };
-                    if let Some(ecc) = self.metadata.ecc_params {
-                        t.with_ecc(ecc)
-                    } else {
-                        t
-                    }
-                },
+                &self.section_transform(),
             )?;
             if block.header.block_type != BlockType::RangeTombstone {
                 return Err(crate::Error::InvalidTag((
@@ -4686,7 +4881,6 @@ impl Table {
             .filter(|_| meta.item_count == 1)
             .and_then(crate::range_tombstone::RangeTombstone::sentinel)
             .map(|(k, s)| (k.clone(), s));
-        let mut sentinel_excluded = false;
 
         // A restricted (tight-space) view's `[0, punch)` prefix blocks are
         // punched to zeros: the index still LISTS them (so counting index
@@ -4695,34 +4889,55 @@ impl Table {
         // without decoding, and aggregate entries / keys / seqnos over the live
         // suffix only. `meta.item_count` describes the whole table, so its
         // exact-equality check relaxes to a subset check for a restricted view.
-        let punch = self.punch_offset()?;
         let restricted = self.restrict_lower_bound().is_some();
-        let mut count: u64 = 0;
+        // `data_block_count` describes the WHOLE table, punched prefix
+        // included, so it is counted off the index itself — no decode.
         let mut block_count: u64 = 0;
-        let mut first_key: Option<UserKey> = None;
-        let mut last_key: Option<UserKey> = None;
-        let mut seqno_lo: Option<SeqNo> = None;
-        let mut seqno_hi: Option<SeqNo> = None;
         for handle in self.block_index.iter() {
-            let handle = handle?;
-            let block_handle = BlockHandle::new(handle.offset(), handle.size());
+            handle?;
             block_count = block_count
                 .checked_add(1)
                 .ok_or(crate::Error::InvalidHeader("meta bounds"))?;
-            if block_handle.offset().0 < punch {
-                continue;
-            }
-            let entries = self.decode_block_entries(&block_handle)?;
-            count = count
+        }
+        Ok(MetaBoundsProbe {
+            meta,
+            tombstones,
+            sentinel,
+            sentinel_excluded: false,
+            restricted,
+            block_count,
+            bitmap_digest_authenticated,
+            count: 0,
+            first_key: None,
+            last_key: None,
+            seqno_lo: None,
+            seqno_hi: None,
+        })
+    }
+
+    /// Accumulates the decoded entry count, key range and seqno range that
+    /// [`Self::finish_meta_bounds`] judges the recorded bounds against.
+    #[cfg(feature = "std")]
+    fn observe_meta_bounds(probe: &mut MetaBoundsProbe, block: &DecodedBlock) -> crate::Result<()> {
+        {
+            let sentinel = probe.sentinel.clone();
+            let count = &mut probe.count;
+            let first_key = &mut probe.first_key;
+            let last_key = &mut probe.last_key;
+            let seqno_lo = &mut probe.seqno_lo;
+            let seqno_hi = &mut probe.seqno_hi;
+            let sentinel_excluded = &mut probe.sentinel_excluded;
+            let entries = &block.entries;
+            *count = count
                 .checked_add(entries.len() as u64)
                 .ok_or(crate::Error::InvalidHeader("meta bounds"))?;
             if first_key.is_none() {
-                first_key = entries.first().map(|e| e.key.user_key.clone());
+                *first_key = entries.first().map(|e| e.key.user_key.clone());
             }
             if let Some(last) = entries.last() {
-                last_key = Some(last.key.user_key.clone());
+                *last_key = Some(last.key.user_key.clone());
             }
-            for entry in &entries {
+            for entry in entries {
                 let s = entry.key.seqno;
                 // The MINIMUM counts every decoded entry, sentinel included.
                 // `seqno#min` is written over range tombstones as well as KV
@@ -4733,22 +4948,73 @@ impl Table {
                 // that starts at a one-entry table's sole key, the table's only
                 // real seqno looks synthetic, drops out, and leaves nothing to
                 // contradict a raised `seqno#min`.
-                seqno_lo = Some(seqno_lo.map_or(s, |lo| lo.min(s)));
+                *seqno_lo = Some(seqno_lo.map_or(s, |lo| lo.min(s)));
                 // The MAXIMUM must still skip the synthetic sentinel (once):
                 // `seqno#kv_max` excludes range tombstones, so an RT-only
                 // table's sentinel seqno legitimately sits above it.
-                if !sentinel_excluded
+                if !*sentinel_excluded
                     && let Some((sentinel_key, sentinel_seqno)) = &sentinel
                     && s == *sentinel_seqno
                     && entry.key.value_type == crate::ValueType::WeakTombstone
                     && entry.key.user_key.as_ref() == sentinel_key.as_ref()
                 {
-                    sentinel_excluded = true;
+                    *sentinel_excluded = true;
                     continue;
                 }
-                seqno_hi = Some(seqno_hi.map_or(s, |hi| hi.max(s)));
+                *seqno_hi = Some(seqno_hi.map_or(s, |hi| hi.max(s)));
             }
+            Ok(())
         }
+    }
+
+    /// Judges the recorded metadata BOUNDS against everything the walk
+    /// accumulated. Checks, against the ON-DISK meta:
+    /// - the recorded key range COVERS the decoded first/last data keys and
+    ///   every recorded range tombstone's bounds (covers, not equals: the
+    ///   writer legitimately widens the range over tombstone-only spans);
+    /// - the recorded `item_count` equals the decoded entry count (the
+    ///   tombstone sentinel is an on-disk entry counted on both sides);
+    /// - the recorded `data_block_count` equals the indexed block count
+    ///   ([`Table::scan`] hands it to the compaction scanner, which stops
+    ///   after that many blocks — a smaller forge drops the tail);
+    /// - the disk-fresh per-KV footer descriptor matches the recovery-time
+    ///   one (a re-stamped `None` would misread footer bytes as the trailer
+    ///   after reopen);
+    /// - for tables WITHOUT a range-tombstone sentinel, the recorded
+    ///   `seqno#min` is at or below the decoded minimum and `seqno#kv_max`
+    ///   is at or above the decoded maximum (a raised min / lowered max
+    ///   hides visible versions from snapshot reads). RT-bearing tables skip
+    ///   this: the writer records the KV range EXCLUDING the sentinel's
+    ///   synthetic RT-derived seqno, so the decoded range legitimately
+    ///   differs — and those tables are already gated by the fail-closed
+    ///   deletion-metadata attribution rule.
+    ///
+    /// # Errors
+    ///
+    /// [`crate::Error::InvalidHeader`] when the recorded bounds disagree with
+    /// the decoded contents.
+    #[cfg(feature = "std")]
+    #[cfg_attr(
+        not(feature = "columnar"),
+        expect(
+            unused_variables,
+            reason = "the delete-bitmap gate the authentication flag drives is columnar-only"
+        )
+    )]
+    fn finish_meta_bounds(&self, probe: MetaBoundsProbe) -> crate::Result<()> {
+        let MetaBoundsProbe {
+            meta,
+            tombstones,
+            restricted,
+            block_count,
+            bitmap_digest_authenticated,
+            count,
+            first_key,
+            last_key,
+            seqno_lo,
+            seqno_hi,
+            ..
+        } = probe;
         if restricted {
             // The live suffix is a subset of the whole table `meta` describes;
             // it must not decode to MORE entries than the recorded whole-table
@@ -4975,17 +5241,7 @@ impl Table {
                     dict_id: 0,
                     window_log: 0,
                 },
-                &{
-                    let t = match self.encryption.as_deref() {
-                        Some(enc) => crate::table::block::BlockTransform::Encrypted(enc),
-                        None => crate::table::block::BlockTransform::PLAIN,
-                    };
-                    if let Some(ecc) = self.metadata.ecc_params {
-                        t.with_ecc(ecc)
-                    } else {
-                        t
-                    }
-                },
+                &self.section_transform(),
             )?;
             if block.header.block_type != BlockType::BlockLayout {
                 return Err(crate::Error::InvalidTag((
@@ -5107,12 +5363,99 @@ impl Table {
         Ok(())
     }
 
-    /// Decodes one data block's entries (row or columnar) into
-    /// [`InternalValue`]s, for the semantic cross-check gates. Reads the
-    /// block DISK-FRESH ([`Self::load_block_from_disk`]): the gates judge
-    /// the file being reconciled, and a pristine copy cached before an
-    /// on-disk alteration must not stand in for the altered bytes.
-    #[cfg(feature = "std")]
+    /// Walks the LIVE data blocks once, decoding each DISK-FRESH, and hands
+    /// every gate the same [`DecodedBlock`].
+    ///
+    /// A restricted view's punched prefix blocks are dead (they read as zeros),
+    /// so the walk starts at the punch offset — every gate skipped them
+    /// individually before, with the same reasoning.
+    ///
+    /// # Errors
+    ///
+    /// Propagates the index walk, the punch-offset lookup, the block read and
+    /// the decode, plus whatever `check` returns.
+    #[cfg_attr(
+        not(feature = "std"),
+        expect(
+            dead_code,
+            reason = "gate-only walk; the verify/scrub consumers are std-gated"
+        )
+    )]
+    fn for_each_live_block<F>(&self, mut check: F) -> crate::Result<()>
+    where
+        F: FnMut(&DecodedBlock) -> crate::Result<()>,
+    {
+        use crate::table::block::ParsedItem as _;
+
+        let punch = self.punch_offset()?;
+        for handle in self.block_index.iter() {
+            let handle = handle?;
+            let handle = BlockHandle::new(handle.offset(), handle.size());
+            if handle.offset().0 < punch {
+                continue;
+            }
+
+            // Keep the block as it came off disk (`raw`) and derive the views
+            // from a CLONE: `from_loaded` strips the per-KV footer, and the
+            // digest gate needs the footered bytes. A `Block` clone is a
+            // header copy plus a refcount bump on the payload, not a copy.
+            #[cfg(feature = "columnar")]
+            let (raw, row, batch) = if self.metadata.columnar {
+                let raw = self.load_block_from_disk(&handle, BlockType::Columnar)?;
+                let batch = crate::table::columnar::ColumnBatch::decode(&raw.data)?;
+                (raw, None, Some(batch))
+            } else {
+                let raw = self.load_block_from_disk(&handle, BlockType::Data)?;
+                let row =
+                    DataBlock::from_loaded(raw.clone(), self.metadata.kv_checksum_algo.is_some())?;
+                (raw, Some(row), None)
+            };
+            #[cfg(not(feature = "columnar"))]
+            let (raw, row) = {
+                let raw = self.load_block_from_disk(&handle, BlockType::Data)?;
+                let row =
+                    DataBlock::from_loaded(raw.clone(), self.metadata.kv_checksum_algo.is_some())?;
+                (raw, Some(row))
+            };
+
+            // Materialize the entries from whichever view this table has. The
+            // columnar reconstruction is the same one `decode_block_entries`
+            // performs, so a malformed batch still fails here rather than
+            // truncating silently.
+            let entries: Vec<InternalValue> = match &row {
+                Some(block) => block
+                    .try_iter(self.comparator.clone())?
+                    .map(|p| p.materialize(block.as_slice()))
+                    .collect(),
+                #[cfg(feature = "columnar")]
+                None => match &batch {
+                    Some(batch) => crate::table::columnar::column_batch_to_entries(batch)?,
+                    None => Vec::new(),
+                },
+                #[cfg(not(feature = "columnar"))]
+                None => Vec::new(),
+            };
+
+            check(&DecodedBlock {
+                handle,
+                raw,
+                row,
+                #[cfg(feature = "columnar")]
+                batch,
+                entries,
+            })?;
+        }
+        Ok(())
+    }
+
+    /// Decodes ONE data block's entries (row or columnar) into
+    /// [`InternalValue`]s, disk-fresh ([`Self::load_block_from_disk`]).
+    ///
+    /// Test-only: the cross-check gates consume the walk's shared decode
+    /// ([`Self::for_each_live_block`]) rather than decoding a block apiece.
+    /// What is left is fixtures that need one named block's contents to build
+    /// a forgery from.
+    #[cfg(all(feature = "std", test))]
     fn decode_block_entries(
         &self,
         block_handle: &BlockHandle,
