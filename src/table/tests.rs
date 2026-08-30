@@ -5875,6 +5875,54 @@ fn write_columnar_batch_accounts_tombstones_seqno_bounds_and_restart_locator() -
     Ok(())
 }
 
+/// The per-KV gate is fed from the entries the walk materialized rather than
+/// decoding the block a second time for itself. It must still catch a footer
+/// whose stored digest no longer matches the entry bytes behind a re-stamped
+/// block checksum — the block-level walk reads that clean — and the pass must
+/// name THAT gate, not merely fail somewhere.
+#[test]
+fn reconcile_gates_reject_a_stale_kv_footer_naming_the_per_kv_gate() -> crate::Result<()> {
+    use crate::runtime_config::{ChecksumAlgorithm, KvChecksumPolicy};
+
+    let dir = tempdir()?;
+    let file = dir.path().join("t");
+
+    // Uncompressed: the forge patches the payload in place.
+    let mut writer = Writer::new(file.clone(), 0, 0, Arc::new(StdFs))?
+        .use_kv_checksums(KvChecksumPolicy::AllLevels, ChecksumAlgorithm::Xxh3_64);
+    for i in 0u64..40 {
+        writer.write(crate::InternalValue::from_components(
+            alloc::format!("key-{i:04}").into_bytes(),
+            alloc::format!("v{i:04}").into_bytes(),
+            i + 1,
+            crate::ValueType::Value,
+        ))?;
+    }
+    let (_, checksum) = writer.finish()?.expect("table written");
+
+    let table = recover_test_table(&file, checksum)?;
+    if let Err((gate, e)) = table.verify_reconcile_gates(None, false) {
+        panic!("an intact footer must pass every gate, {gate:?} refused it: {e}");
+    }
+
+    crate::test_forge::forge_stale_kv_footer(&file)?;
+
+    let table = recover_test_table(&file, checksum)?;
+    let result = table.verify_reconcile_gates(None, false);
+    assert!(
+        matches!(
+            result,
+            Err((
+                crate::table::ReconcileGate::KvChecksums,
+                crate::Error::ChecksumMismatch { .. }
+            ))
+        ),
+        "a stale per-KV footer must be rejected by the per-KV gate, got {:?}",
+        result.map_err(|(gate, e)| (gate, e.to_string())),
+    );
+    Ok(())
+}
+
 /// `verify_locator` must reject a locator re-stamped to resolve a key to a
 /// block OTHER than the one holding its newest version: every byte-level
 /// check reads clean, but `point_read_inner` trusts the answer and can return

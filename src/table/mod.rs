@@ -2990,16 +2990,24 @@ impl Table {
         // homogeneous — every data block carries a footer under `expected_algo`.
         // A restricted view's punched prefix blocks are dead and read as zeros,
         // so the walk skips them (only the live suffix is footer-verified).
-        self.for_each_live_block(|block| self.check_block_kv_checksums(expected_algo, block))
+        self.for_each_live_block(|block| Self::check_block_kv_checksums(expected_algo, block))
     }
 
     /// The per-block half of [`Self::verify_kv_checksums`], so the combined
     /// reconcile pass runs it on the shared decode.
     ///
-    /// Verifies the RAW block (footer intact): the row view strips the footer,
-    /// and the bytes are disk-fresh, so a pristine copy cached before an
+    /// Reads the footer off the RAW block (footer intact: the row view strips
+    /// it) and judges the entries the walk ALREADY materialized from that same
+    /// block. The bytes are disk-fresh, so a pristine copy cached before an
     /// on-disk re-stamp cannot stand in for a file whose stale footer no longer
     /// matches its altered value bytes.
+    ///
+    /// Fed from `block.entries` rather than through `verify_kv_checked`, which
+    /// decodes and materializes the block for itself: on a footer-bearing table
+    /// that would decode every block twice, and the read count would not show
+    /// it — the second decode reads no additional bytes off the disk. Taking no
+    /// comparator is what keeps it that way: decoding a data block needs one,
+    /// so this cannot re-decode even by mistake.
     #[cfg_attr(
         not(feature = "std"),
         expect(
@@ -3008,16 +3016,18 @@ impl Table {
         )
     )]
     fn check_block_kv_checksums(
-        &self,
         expected_algo: crate::runtime_config::types::ChecksumAlgorithm,
         block: &DecodedBlock,
     ) -> crate::Result<()> {
-        DataBlock::verify_kv_checked(
+        let mut probe = crate::table::data_block::KvDigestProbe::open(
             &block.raw.data,
             block.raw.header,
-            self.comparator.clone(),
             Some(expected_algo),
-        )
+        )?;
+        for item in &block.entries {
+            probe.observe(item)?;
+        }
+        probe.finish()
     }
 
     /// Cross-checks the recorded `linked_blob_files` section against the
@@ -3492,6 +3502,16 @@ impl Table {
         // One open and one TOC parse for the whole pass: every section below is
         // read from the SAME on-disk image, so the gates cannot disagree about
         // which bytes they are judging.
+        //
+        // The sections stay live for the whole walk, where the gate-by-gate
+        // shape held one at a time. That is a peak of their SUM rather than
+        // their max, bounded by what an open table already pins permanently
+        // (`Inner` holds the seqno bounds, zone map, locator and filter
+        // simultaneously for its whole lifetime), so the increment is one extra
+        // copy of resident data for the duration of one table's pass. Dropping
+        // any of them mid-walk is not available: every one is consulted on
+        // EVERY block, so releasing early means walking again per section,
+        // which is the cost this pass exists to remove.
         let (file, regions) = self.open_sections().map_err(tag(G::SeqnoBounds))?;
         let seqno_bounds = self
             .read_seqno_bounds_section(&*file, &regions)
@@ -3536,7 +3556,7 @@ impl Table {
         let mut failed: Option<ReconcileGate> = None;
         let walk = self.for_each_live_block(|block| {
             if let Some(algo) = kv_algo
-                && let Err(e) = self.check_block_kv_checksums(algo, block)
+                && let Err(e) = Self::check_block_kv_checksums(algo, block)
             {
                 failed = Some(G::KvChecksums);
                 return Err(e);
