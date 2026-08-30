@@ -1175,22 +1175,42 @@ fn arbitrate_by_framing(
     data_start: u64,
     payload_cap: u64,
 ) -> Option<bool> {
-    let region = |name: &[u8], floor: u64| -> Option<(u64, u64)> {
-        let entry = toc.section(name)?;
-        let end = entry.pos().checked_add(entry.len())?;
-        Some((core::cmp::max(entry.pos(), floor), end))
-    };
-    // `tli_tail` counts as its own region: the writer emits it precisely so one
-    // damaged index copy cannot take the other down with it, and it is written
-    // under the SAME codec — so an intact tail can still speak for the codec
-    // when the head's trailer is the damaged one.
-    let regions = [
-        region(b"data", data_start),
-        region(b"tli", 0),
-        region(b"tli_tail", 0),
-    ];
+    // EVERY section the descriptor sizes, taken from the TOC rather than a
+    // hand-kept list — a section left out is one an impostor can be wrong about
+    // for free, and the walk would then report its healthy blocks as corrupt.
+    // That is all block-format sections except the self-describing ones: `meta`
+    // and `meta_mid` carry a `block_flags` byte and derive their own parity, so
+    // the descriptor says nothing about them and framing them under it would
+    // mis-size every one of their blocks.
+    //
+    // Both index mirrors are in for the same reason the writer emits two: one
+    // damaged copy must not take the other down, and both are written under the
+    // same codec, so an intact `tli_tail` can still speak when the head is the
+    // damaged one.
+    let mut regions: Vec<(u64, u64)> = Vec::new();
+    for entry in toc.iter() {
+        let Some(roles) = expected_section_roles(entry.name()) else {
+            continue;
+        };
+        if roles
+            .iter()
+            .any(|role| crate::table::block::Header::has_block_flags(*role))
+        {
+            continue;
+        }
+        let Some(end) = entry.pos().checked_add(entry.len()) else {
+            continue;
+        };
+        // Only the data section has a punched prefix to skip.
+        let floor = if entry.name() == b"data" {
+            data_start
+        } else {
+            0
+        };
+        regions.push((core::cmp::max(entry.pos(), floor), end));
+    }
     let (mut judged, mut framed_any, mut framed_all) = (false, false, true);
-    for (start, end) in regions.into_iter().flatten() {
+    for &(start, end) in &regions {
         if let Some(verdict) = scheme_frames_region(file, scheme, start, end) {
             judged = true;
             framed_any |= verdict;
@@ -1225,7 +1245,7 @@ fn arbitrate_by_framing(
     // a wide margin — accepting an impostor makes the walk recompute parity
     // under the wrong codec and report corruption on a HEALTHY table, which
     // rewrites intact data.
-    for (start, end) in regions.into_iter().flatten() {
+    for &(start, end) in &regions {
         if codec_confirms_region(file, scheme, start, end, payload_cap) == CodecVerdict::Rejected {
             return Some(false);
         }

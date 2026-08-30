@@ -2381,3 +2381,84 @@ fn arbitrate_by_framing_tli_tail_is_the_only_clean_region_retains_the_candidate(
     );
     Ok(())
 }
+
+/// The descriptor sizes EVERY block-format section, not the three the
+/// arbitration used to look at. An impostor whose parity coincides in `data`
+/// and both index mirrors can still disagree with a section left out of the
+/// list — and the walk, having accepted it, recomputes that section's parity
+/// under the wrong codec and reports corruption on healthy blocks.
+#[cfg(feature = "page_ecc")]
+#[test]
+fn arbitrate_by_framing_impostor_disagreeing_outside_the_mirrors_is_rejected() -> crate::Result<()>
+{
+    use crate::fs::{Fs, FsOpenOptions, StdFs};
+    use crate::table::block::EccParams;
+
+    const LEN: u32 = 4096;
+    let real = EccParams::RS_4_2;
+    let impostor = EccParams::try_new(2, 1)?;
+
+    // Uniform payloads: identical shards, so both codecs emit the same parity
+    // and the impostor sails through these three.
+    let agreeing = vec![0xABu8; LEN as usize];
+    let agreeing_parity = crate::ecc::encode_parity(&agreeing, 4, 2).expect("RS(4,2) encodes");
+    assert_eq!(
+        agreeing_parity,
+        crate::ecc::encode_parity(&agreeing, 2, 1).expect("XOR(2,1) encodes"),
+        "the three mirror-ish regions must be ones the codecs agree on, or the \
+         impostor never reaches the section under test",
+    );
+
+    // `range_tombstones` is written under the same descriptor and was outside
+    // the old list. Its shards differ, so only the real codec matches it.
+    let discriminating = discriminating_payload(LEN);
+    let discriminating_parity =
+        crate::ecc::encode_parity(&discriminating, 4, 2).expect("RS(4,2) encodes");
+
+    let dir = tempfile::tempdir()?;
+    let path = dir.path().join("outside-mirrors.sst");
+    write_block_archive(
+        &path,
+        &[
+            ("data", vec![(agreeing.clone(), agreeing_parity.clone())]),
+            ("tli", vec![(agreeing.clone(), agreeing_parity.clone())]),
+            ("tli_tail", vec![(agreeing, agreeing_parity)]),
+            (
+                "range_tombstones",
+                vec![(discriminating, discriminating_parity)],
+            ),
+        ],
+    )?;
+
+    let mut probe = StdFs.open(&path, &FsOpenOptions::new().read(true))?;
+    let sfa_reader = crate::sfa::Reader::from_reader(&mut probe)?;
+    let toc = sfa_reader.toc();
+    let cap = block_data_length_cap(0);
+
+    let rt = toc
+        .section(b"range_tombstones")
+        .expect("the fixture has a range_tombstones section");
+    assert_eq!(
+        codec_confirms_region(
+            probe.as_ref(),
+            ScrubEcc::Scheme(impostor),
+            rt.pos(),
+            rt.pos() + rt.len(),
+            cap,
+        ),
+        CodecVerdict::Rejected,
+        "the section outside the old list is the only one that disagrees — the \
+         premise of this test",
+    );
+    assert_eq!(
+        arbitrate_by_framing(probe.as_ref(), toc, ScrubEcc::Scheme(impostor), 0, cap),
+        Some(false),
+        "a section the descriptor sizes must be consulted wherever it sits",
+    );
+    assert_eq!(
+        arbitrate_by_framing(probe.as_ref(), toc, ScrubEcc::Scheme(real), 0, cap),
+        Some(true),
+        "the real codec reproduces every section's trailer",
+    );
+    Ok(())
+}
