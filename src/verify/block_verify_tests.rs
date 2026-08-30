@@ -1755,12 +1755,24 @@ fn arbitrate_by_framing_rejects_a_same_length_scheme_that_does_not_match_the_tra
 
     // The trailer bytes separate them.
     assert_eq!(
-        arbitrate_by_framing(probe.as_ref(), toc, ScrubEcc::Scheme(real), 0),
+        arbitrate_by_framing(
+            probe.as_ref(),
+            toc,
+            ScrubEcc::Scheme(real),
+            0,
+            block_data_length_cap(0),
+        ),
         Some(true),
         "the scheme whose parity matches the trailer is authoritative",
     );
     assert_eq!(
-        arbitrate_by_framing(probe.as_ref(), toc, ScrubEcc::Scheme(impostor), 0),
+        arbitrate_by_framing(
+            probe.as_ref(),
+            toc,
+            ScrubEcc::Scheme(impostor),
+            0,
+            block_data_length_cap(0),
+        ),
         Some(false),
         "a same-length scheme whose parity does NOT match must fail safe, or the \
          walk recomputes parity under it and condemns a healthy table",
@@ -1827,4 +1839,240 @@ fn verify_sst_file_keeps_a_framing_descriptor_when_a_data_header_is_corrupt() {
         "the descriptor frames every other section, so it must not be discarded: {:?}",
         report.warnings,
     );
+}
+
+/// One synthetic block: its payload and the parity trailer stored after it.
+/// Parity is supplied rather than derived so a test can store a DAMAGED
+/// trailer, which is what separates a wrong codec from a rotted block.
+#[cfg(feature = "page_ecc")]
+type SyntheticBlock = (Vec<u8>, Vec<u8>);
+
+/// Writes a synthetic SFA archive: for each named section, a run of data blocks
+/// carrying `(payload, parity)` exactly as given.
+#[cfg(feature = "page_ecc")]
+fn write_block_archive(
+    path: &std::path::Path,
+    sections: &[(&str, Vec<SyntheticBlock>)],
+) -> crate::Result<()> {
+    use crate::coding::Encode;
+    use crate::fs::{Fs, FsOpenOptions, StdFs};
+    use crate::table::block::{BlockType, Header};
+
+    let mut archive_bytes: Vec<u8> = Vec::new();
+    {
+        let mut writer = crate::sfa::Writer::from_writer(std::io::Cursor::new(&mut archive_bytes));
+        for (name, blocks) in sections {
+            writer.start(*name).unwrap();
+            for (payload, parity) in blocks {
+                #[expect(
+                    clippy::cast_possible_truncation,
+                    reason = "test payloads are kilobytes"
+                )]
+                let header = Header {
+                    checksum: Checksum::from_raw(crate::hash::hash128(payload)),
+                    data_length: payload.len() as u32,
+                    uncompressed_length: payload.len() as u32,
+                    ..Header::test_dummy(BlockType::Data)
+                };
+                writer.write_all(&header.encode_into_vec()).unwrap();
+                writer.write_all(payload).unwrap();
+                writer.write_all(parity).unwrap();
+            }
+        }
+        writer.finish().unwrap();
+    }
+    let mut f = StdFs.open(
+        path,
+        &FsOpenOptions::new().write(true).create(true).truncate(true),
+    )?;
+    f.write_all(&archive_bytes)?;
+    Ok(())
+}
+
+/// A payload whose shards all differ, so the codecs cannot coincide on it.
+/// Period 251 divides neither shard size under RS(4,2) nor under XOR(2,1).
+#[cfg(feature = "page_ecc")]
+fn discriminating_payload(len: u32) -> Vec<u8> {
+    (0..len)
+        .map(|i| u8::try_from(i % 251).expect("the modulus keeps every value below 256"))
+        .collect()
+}
+
+/// One matching block is not proof of the codec: schemes COINCIDE on degenerate
+/// payloads. A uniform block makes every shard identical, and both RS(4,2) and
+/// XOR(2,1) then emit all-zero parity — so an impostor matches it and diverges
+/// on the next block. The arbitration must keep sampling: every clean block has
+/// to match, or a table walked under the impostor reports `EccParityMismatch`
+/// on healthy later blocks.
+#[cfg(feature = "page_ecc")]
+#[test]
+fn arbitrate_by_framing_rejects_an_impostor_that_matches_only_a_degenerate_block()
+-> crate::Result<()> {
+    use crate::fs::{Fs, FsOpenOptions, StdFs};
+    use crate::table::block::EccParams;
+
+    const LEN: u32 = 4096;
+    let real = EccParams::RS_4_2;
+    let impostor = EccParams::try_new(2, 1)?;
+
+    // Block 1: uniform, so its shards are identical under either split.
+    let degenerate = vec![0xABu8; LEN as usize];
+    let degenerate_parity = crate::ecc::encode_parity(&degenerate, 4, 2).expect("RS(4,2) encodes");
+    assert_eq!(
+        degenerate_parity,
+        crate::ecc::encode_parity(&degenerate, 2, 1).expect("XOR(2,1) encodes"),
+        "the fixture's first block must be one the two codecs agree on, or it \
+         does not exercise the early-return trap",
+    );
+
+    // Block 2: shards differ, so only the real codec reproduces its trailer.
+    let discriminating = discriminating_payload(LEN);
+    let discriminating_parity =
+        crate::ecc::encode_parity(&discriminating, 4, 2).expect("RS(4,2) encodes");
+
+    let dir = tempfile::tempdir()?;
+    let path = dir.path().join("two-blocks.sst");
+    write_block_archive(
+        &path,
+        &[(
+            "data",
+            vec![
+                (degenerate, degenerate_parity),
+                (discriminating, discriminating_parity),
+            ],
+        )],
+    )?;
+
+    let mut probe = StdFs.open(&path, &FsOpenOptions::new().read(true))?;
+    let sfa_reader = crate::sfa::Reader::from_reader(&mut probe)?;
+    let toc = sfa_reader.toc();
+    let cap = block_data_length_cap(0);
+
+    assert_eq!(
+        arbitrate_by_framing(probe.as_ref(), toc, ScrubEcc::Scheme(real), 0, cap),
+        Some(true),
+        "the real codec reproduces both trailers",
+    );
+    assert_eq!(
+        arbitrate_by_framing(probe.as_ref(), toc, ScrubEcc::Scheme(impostor), 0, cap),
+        Some(false),
+        "the impostor agrees only on the degenerate block — accepting it there \
+         makes the walk condemn the healthy second block",
+    );
+    Ok(())
+}
+
+/// A damaged trailer is not evidence about the CODEC. When the data region's
+/// only block has a rotted trailer, the region rejects — but another region
+/// that confirms the same codec settles it, and the descriptor must survive so
+/// the walk reports the damaged block as `EccParityMismatch` instead of
+/// skipping the section that holds it.
+#[cfg(feature = "page_ecc")]
+#[test]
+fn arbitrate_by_framing_keeps_a_codec_confirmed_by_another_region() -> crate::Result<()> {
+    use crate::fs::{Fs, FsOpenOptions, StdFs};
+    use crate::table::block::EccParams;
+
+    const LEN: u32 = 4096;
+    let real = EccParams::RS_4_2;
+
+    // The data block's payload is clean but its stored trailer is rotted.
+    let payload = discriminating_payload(LEN);
+    let mut rotted = crate::ecc::encode_parity(&payload, 4, 2).expect("RS(4,2) encodes");
+    *rotted.first_mut().expect("the trailer is non-empty") ^= 0xFF;
+
+    // A second region carries a healthy block under the same codec.
+    let healthy = discriminating_payload(LEN / 2);
+    let healthy_parity = crate::ecc::encode_parity(&healthy, 4, 2).expect("RS(4,2) encodes");
+
+    let dir = tempfile::tempdir()?;
+    let path = dir.path().join("rotted-trailer.sst");
+    write_block_archive(
+        &path,
+        &[
+            ("data", vec![(payload, rotted)]),
+            ("tli", vec![(healthy, healthy_parity)]),
+        ],
+    )?;
+
+    let mut probe = StdFs.open(&path, &FsOpenOptions::new().read(true))?;
+    let sfa_reader = crate::sfa::Reader::from_reader(&mut probe)?;
+    let toc = sfa_reader.toc();
+    let cap = block_data_length_cap(0);
+
+    let data = toc
+        .section(b"data")
+        .expect("the fixture has a data section");
+    assert_eq!(
+        codec_confirms_region(
+            probe.as_ref(),
+            ScrubEcc::Scheme(real),
+            data.pos(),
+            data.pos() + data.len(),
+            cap,
+        ),
+        Some(false),
+        "the rotted trailer makes the data region reject on its own",
+    );
+    assert_eq!(
+        arbitrate_by_framing(probe.as_ref(), toc, ScrubEcc::Scheme(real), 0, cap),
+        Some(true),
+        "another region confirms the codec, so the descriptor survives and the \
+         walk gets to report the damaged block",
+    );
+    Ok(())
+}
+
+/// An untrusted `data_length` must not size an allocation. The header is not
+/// verified when the arbitration reads it, so a forged one paired with a
+/// re-stamped TOC could ask for gigabytes; past the cap the block is simply no
+/// evidence. Driven with a tiny cap so the bound itself is what is pinned,
+/// rather than needing a multi-gigabyte fixture to reach the real one.
+#[cfg(feature = "page_ecc")]
+#[test]
+fn codec_confirms_region_skips_a_block_whose_declared_length_exceeds_the_cap() -> crate::Result<()>
+{
+    use crate::fs::{Fs, FsOpenOptions, StdFs};
+    use crate::table::block::EccParams;
+
+    const LEN: u32 = 4096;
+    let real = EccParams::RS_4_2;
+    let payload = discriminating_payload(LEN);
+    let parity = crate::ecc::encode_parity(&payload, 4, 2).expect("RS(4,2) encodes");
+
+    let dir = tempfile::tempdir()?;
+    let path = dir.path().join("capped.sst");
+    write_block_archive(&path, &[("data", vec![(payload, parity)])])?;
+
+    let mut probe = StdFs.open(&path, &FsOpenOptions::new().read(true))?;
+    let sfa_reader = crate::sfa::Reader::from_reader(&mut probe)?;
+    let data = sfa_reader
+        .toc()
+        .section(b"data")
+        .expect("the fixture has a data section");
+    let (start, end) = (data.pos(), data.pos() + data.len());
+
+    assert_eq!(
+        codec_confirms_region(
+            probe.as_ref(),
+            ScrubEcc::Scheme(real),
+            start,
+            end,
+            cap_for_test()
+        ),
+        Some(true),
+        "under the real cap the block is read and confirms the codec",
+    );
+    assert_eq!(
+        codec_confirms_region(probe.as_ref(), ScrubEcc::Scheme(real), start, end, 16),
+        None,
+        "a declared length past the cap must yield NO evidence rather than a read",
+    );
+    Ok(())
+}
+
+/// The production payload cap, for tests that contrast it with a tiny one.
+#[cfg(feature = "page_ecc")]
+fn cap_for_test() -> u64 {
+    block_data_length_cap(0)
 }

@@ -1173,6 +1173,7 @@ fn arbitrate_by_framing(
     toc: &crate::sfa::Toc,
     scheme: ScrubEcc,
     data_start: u64,
+    payload_cap: u64,
 ) -> Option<bool> {
     let region = |name: &[u8], floor: u64| -> Option<(u64, u64)> {
         let entry = toc.section(name)?;
@@ -1189,20 +1190,25 @@ fn arbitrate_by_framing(
     if !framed_anywhere? {
         return Some(false);
     }
+    // A region CONFIRMS when every clean block in it matches, and REJECTS when
+    // any clean block does not. A confirming region wins outright: the codec it
+    // proves is the writer's, and a region that rejected alongside it holds
+    // damage — which is the block walk's finding to report, not grounds to
+    // discard the descriptor and skip the section it lives in.
+    let mut rejected = false;
     for (start, end) in regions.into_iter().flatten() {
-        match codec_confirms_region(file, scheme, start, end) {
-            // The trailer bytes match parity recomputed under the candidate:
-            // it is the codec the writer used.
+        match codec_confirms_region(file, scheme, start, end, payload_cap) {
             Some(true) => return Some(true),
-            Some(false) => return Some(false),
-            // No checksum-clean block to judge on; try the next region.
+            Some(false) => rejected = true,
+            // No clean block to judge on; try the next region.
             None => {}
         }
     }
-    // Framed, but nothing could confirm the codec (no clean block, or a build
-    // without the ECC codecs). Nothing downstream recomputes parity in that
-    // case either, so the framed descriptor stands.
-    Some(true)
+    // Framed, and nothing could confirm the codec: no clean block anywhere, or
+    // a build without the ECC codecs — where nothing downstream recomputes
+    // parity either, so a same-length impostor is behaviourally identical and
+    // the framed descriptor stands.
+    Some(!rejected)
 }
 
 /// Whether the candidate's CODEC — not merely its trailer length — matches the
@@ -1215,14 +1221,24 @@ fn arbitrate_by_framing(
 /// damage itself behind a skipped walk. `None` means no clean block was found
 /// to judge on (or this build has no ECC codecs) — inconclusive, not a verdict.
 ///
-/// One matching block settles it: a wrong codec cannot reproduce the stored
-/// parity, while a right one fails only on blocks that are themselves damaged.
+/// EVERY clean block must match, because a single match proves less than it
+/// looks: schemes coincide on degenerate payloads (identical shards make both
+/// XOR and Reed-Solomon emit all-zero parity), so an impostor can match the
+/// first block and diverge on the next. A lone mismatch is not a verdict
+/// either — it is what a damaged trailer looks like — which is why a region
+/// that rejects loses to one that confirms.
+///
+/// `payload_cap` bounds what an untrusted `data_length` may make this read: the
+/// header it comes from is not yet verified here, and a forged one paired with
+/// a re-stamped TOC could otherwise ask for a multi-gigabyte allocation and
+/// take the process down instead of reporting corruption.
 #[cfg(feature = "std")]
 fn codec_confirms_region(
     file: &dyn crate::fs::FsFile,
     scheme: ScrubEcc,
     start: u64,
     end: u64,
+    payload_cap: u64,
 ) -> Option<bool> {
     // `Off` carries no trailer, and framing already settled it: a
     // parity-bearing table cannot frame with no trailer at all.
@@ -1236,16 +1252,15 @@ fn codec_confirms_region(
         // No codecs to recompute with. The walk cannot recompute parity either,
         // so a same-length impostor is behaviourally identical to the real
         // scheme here and there is nothing to confirm.
-        let _ = (file, params, start, end);
+        let _ = (file, params, start, end, payload_cap);
         None
     }
     #[cfg(feature = "page_ecc")]
     {
         use crate::table::block::Header;
 
-        // A handful of blocks is plenty: the first clean one decides, and a
-        // table whose whole prefix is damaged has bigger findings coming from
-        // the walk itself.
+        // A bounded sample: enough for a mismatch to surface past a degenerate
+        // block, without turning arbitration into a second full walk.
         const MAX_BLOCKS: usize = 8;
         let mut offset = start;
         let mut judged = false;
@@ -1262,6 +1277,13 @@ fn codec_confirms_region(
             let Ok(header) = Header::decode_from(&mut &buf[..]) else {
                 break;
             };
+            // The header is not verified yet, so its `data_length` is untrusted:
+            // a forged one paired with a re-stamped TOC would otherwise size the
+            // read below. The walk applies the same cap before trusting a
+            // length; past it this block is no evidence, not a huge allocation.
+            if u64::from(header.data_length) > payload_cap {
+                break;
+            }
             let header_len = Header::header_len(header.block_type) as u64;
             let parity_bytes = crate::table::block::expected_parity_len(header.data_length, params);
             let parity_len = u64::from(parity_bytes);
@@ -1293,14 +1315,18 @@ fn codec_confirms_region(
                             crate::ecc::encode_parity(&payload, ds, ps).ok()
                         }
                     };
-                    if fresh.as_deref() == Some(&trailer[..]) {
-                        return Some(true);
+                    // One mismatching clean block ends it for this region.
+                    // Returning on the first MATCH instead would let an
+                    // impostor slip past a degenerate block whose parity both
+                    // codecs agree on.
+                    if fresh.as_deref() != Some(&trailer[..]) {
+                        return Some(false);
                     }
                 }
             }
             offset = next;
         }
-        if judged { Some(false) } else { None }
+        if judged { Some(true) } else { None }
     }
 }
 
@@ -1524,7 +1550,15 @@ fn read_ecc_params_out_of_band(
         // Decide by the DATA: the descriptor that actually frames the blocks is
         // the one the writer used. One that does not frame them fails safe.
         [one] if unrecognized_seen => Some(
-            match arbitrate_by_framing(probe.as_ref(), toc, *one, data_start) {
+            match arbitrate_by_framing(
+                probe.as_ref(),
+                toc,
+                *one,
+                data_start,
+                block_data_length_cap(
+                    encryption.map_or(0, crate::encryption::EncryptionProvider::max_overhead),
+                ),
+            ) {
                 Some(false) => ScrubEcc::Unrecognized,
                 // Framed cleanly, or nothing to frame: keep the recognized copy.
                 Some(true) | None => *one,
