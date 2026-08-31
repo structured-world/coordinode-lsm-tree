@@ -282,15 +282,6 @@ where
         self.build_subtree(1, 0, self.leaves.len());
     }
 
-    /// Number of source slots `n` originally supplied (not `cap`).
-    ///
-    /// Reflects the *capacity* of the tournament; some slots may be
-    /// exhausted (`None`) at any given moment.
-    #[inline]
-    pub fn slots(&self) -> usize {
-        self.n_sources
-    }
-
     /// Whether every slot is exhausted (no present leaves).
     #[expect(
         clippy::inline_always,

@@ -139,11 +139,18 @@ fn build_max_cmp<C: UserComparator + Clone>(comparator: C) -> MaxCmp<C> {
 /// end is still walking toward. With `active` empty, any parked head wins,
 /// which is how the two directions hand over the last items of a range.
 ///
+/// `vacated` is the merger-maintained list of slots emptied in `active` since
+/// its last (re)initialization — the only slots that can hold a parked leaf.
+/// Scanning it instead of every slot keeps a mixed-end step O(log n) while no
+/// source has run dry (the list is empty) and O(exhausted) after, instead of
+/// paying O(sources) per emitted item.
+///
 /// `cmp` is the active direction's ordering, so "ahead" reads the same way in
 /// both: `Less` under the min-tree, `Less` under the reversed max-tree.
 fn pick_parked<A, O, C>(
     active: &LoserTree<MergerEntry, A>,
     other: Option<&LoserTree<MergerEntry, O>>,
+    vacated: &[usize],
     cmp: &C,
 ) -> Option<usize>
 where
@@ -152,19 +159,22 @@ where
     C: crate::loser_tree::EntryComparator<MergerEntry>,
 {
     let other = other?;
-    if other.is_empty() {
+    if vacated.is_empty() || other.is_empty() {
         return None;
     }
 
     let winner = active.winner_slot().and_then(|slot| active.peek_slot(slot));
 
     let mut best: Option<(usize, &MergerEntry)> = None;
-    for slot in 0..active.slots() {
-        // Only a slot this direction cannot refill itself: one still holding a
-        // leaf here will produce it through the tournament as usual.
-        if active.peek_slot(slot).is_some() {
-            continue;
-        }
+    for &slot in vacated {
+        // A vacated slot stays empty in `active` until the next full
+        // (re)initialization, which rebuilds this list.
+        debug_assert!(
+            active.peek_slot(slot).is_none(),
+            "vacated slot holds a leaf in the active tournament"
+        );
+        // Nothing parked for it RIGHT NOW; the opposite direction may still
+        // buffer one later (its next full refill), so the entry stays listed.
         let Some(parked) = other.peek_slot(slot) else {
             continue;
         };
@@ -221,6 +231,15 @@ pub struct SeekingMerger<S: MergeSource, C: UserComparator + Clone> {
     forward_primed: bool,
     /// Mirror of `forward_primed` for the backward direction.
     backward_primed: bool,
+    /// Slots emptied in `forward_tree` without a refill since its last full
+    /// (re)initialization: source exhausted or errored forward, or the leaf
+    /// taken by the backward direction. Only these can hold a parked leaf, so
+    /// `pick_parked` scans this list instead of every slot. Rebuilt on each
+    /// forward (re)initialization; entries are never removed in between — a
+    /// vacated slot cannot refill outside a full init.
+    forward_vacated: Vec<usize>,
+    /// Mirror of `forward_vacated` for `backward_tree`.
+    backward_vacated: Vec<usize>,
 }
 
 impl<S: MergeSource, C: UserComparator + Clone> SeekingMerger<S, C> {
@@ -240,6 +259,8 @@ impl<S: MergeSource, C: UserComparator + Clone> SeekingMerger<S, C> {
             pending_backward_error: None,
             forward_primed: false,
             backward_primed: false,
+            forward_vacated: Vec::new(),
+            backward_vacated: Vec::new(),
         }
     }
 
@@ -251,6 +272,8 @@ impl<S: MergeSource, C: UserComparator + Clone> SeekingMerger<S, C> {
             forward_tree,
             backward_tree,
             pending_forward_error,
+            forward_vacated,
+            backward_vacated,
             ..
         } = self;
         let n = *n_sources;
@@ -271,12 +294,20 @@ impl<S: MergeSource, C: UserComparator + Clone> SeekingMerger<S, C> {
                     pending_forward_error.get_or_insert(e);
                     None
                 }
-                None => backward_tree.as_mut().and_then(|bt| bt.take_slot(i)),
+                None => {
+                    let migrated = backward_tree.as_mut().and_then(|bt| bt.take_slot(i));
+                    if migrated.is_some() {
+                        // The take emptied the backward slot without a refill.
+                        backward_vacated.push(i);
+                    }
+                    migrated
+                }
             }
         };
-        if let Some(tree) = forward_tree {
+        let tree = if let Some(tree) = forward_tree {
             // Retained storage (post-reseek): refill in place, no allocation.
-            tree.refill_with(pull);
+            tree.refill_with(&mut pull);
+            tree
         } else {
             // First use: build the tournament (one-time allocation).
             let mut initial: Vec<Option<MergerEntry>> = Vec::with_capacity(n);
@@ -284,8 +315,12 @@ impl<S: MergeSource, C: UserComparator + Clone> SeekingMerger<S, C> {
                 initial.push(pull(i));
             }
             let cmp = build_min_cmp(comparator.clone());
-            *forward_tree = Some(LoserTree::build(initial, cmp));
-        }
+            forward_tree.insert(LoserTree::build(initial, cmp))
+        };
+        // A full (re)initialization re-derives which slots stand empty; between
+        // inits the list only grows at the vacate sites.
+        forward_vacated.clear();
+        forward_vacated.extend((0..n).filter(|&i| tree.peek_slot(i).is_none()));
     }
 
     fn initialize_backward(&mut self) {
@@ -296,6 +331,8 @@ impl<S: MergeSource, C: UserComparator + Clone> SeekingMerger<S, C> {
             forward_tree,
             backward_tree,
             pending_backward_error,
+            forward_vacated,
+            backward_vacated,
             ..
         } = self;
         let n = *n_sources;
@@ -313,19 +350,29 @@ impl<S: MergeSource, C: UserComparator + Clone> SeekingMerger<S, C> {
                     pending_backward_error.get_or_insert(e);
                     None
                 }
-                None => forward_tree.as_mut().and_then(|ft| ft.take_slot(i)),
+                None => {
+                    let migrated = forward_tree.as_mut().and_then(|ft| ft.take_slot(i));
+                    if migrated.is_some() {
+                        // The take emptied the forward slot without a refill.
+                        forward_vacated.push(i);
+                    }
+                    migrated
+                }
             }
         };
-        if let Some(tree) = backward_tree {
-            tree.refill_with(pull);
+        let tree = if let Some(tree) = backward_tree {
+            tree.refill_with(&mut pull);
+            tree
         } else {
             let mut initial: Vec<Option<MergerEntry>> = Vec::with_capacity(n);
             for i in 0..n {
                 initial.push(pull(i));
             }
             let cmp = build_max_cmp(comparator.clone());
-            *backward_tree = Some(LoserTree::build(initial, cmp));
-        }
+            backward_tree.insert(LoserTree::build(initial, cmp))
+        };
+        backward_vacated.clear();
+        backward_vacated.extend((0..n).filter(|&i| tree.peek_slot(i).is_none()));
     }
 }
 
@@ -350,6 +397,8 @@ impl<S: MergeSource + crate::reseek::Reseekable, C: UserComparator + Clone>
         }
         self.forward_primed = false;
         self.backward_primed = false;
+        self.forward_vacated.clear();
+        self.backward_vacated.clear();
         self.pending_forward_error = None;
         self.pending_backward_error = None;
     }
@@ -388,6 +437,8 @@ impl<S: MergeSource, C: UserComparator + Clone> Iterator for SeekingMerger<S, C>
             backward_tree,
             pending_forward_error,
             comparator,
+            forward_vacated,
+            backward_vacated,
             ..
         } = self;
         let tree = forward_tree.as_mut()?;
@@ -409,9 +460,12 @@ impl<S: MergeSource, C: UserComparator + Clone> Iterator for SeekingMerger<S, C>
         if let Some(slot) = pick_parked(
             tree,
             backward_tree.as_ref(),
+            forward_vacated,
             &build_min_cmp(comparator.clone()),
         ) && let Some(entry) = backward_tree.as_mut().and_then(|bt| bt.take_slot(slot))
         {
+            // The claim emptied the backward slot without a refill.
+            backward_vacated.push(slot);
             return Some(Ok(entry.value));
         }
         let source = tree.winner_slot()?;
@@ -436,6 +490,7 @@ impl<S: MergeSource, C: UserComparator + Clone> Iterator for SeekingMerger<S, C>
                 // (matches the init-path semantic).
                 let old = tree.pop_min()?;
                 pending_forward_error.get_or_insert(e);
+                forward_vacated.push(source);
                 Some(Ok(old.value))
             }
             None => {
@@ -444,6 +499,7 @@ impl<S: MergeSource, C: UserComparator + Clone> Iterator for SeekingMerger<S, C>
                 // `pick_parked` above, on the step where it sorts ahead of
                 // this tournament's own winner.
                 let old = tree.pop_min()?;
+                forward_vacated.push(source);
                 Some(Ok(old.value))
             }
         }
@@ -485,6 +541,8 @@ impl<S: CoherentMergeSource, C: UserComparator + Clone> DoubleEndedIterator
             backward_tree,
             pending_backward_error,
             comparator,
+            forward_vacated,
+            backward_vacated,
             ..
         } = self;
         let tree = backward_tree.as_mut()?;
@@ -493,9 +551,12 @@ impl<S: CoherentMergeSource, C: UserComparator + Clone> DoubleEndedIterator
         if let Some(slot) = pick_parked(
             tree,
             forward_tree.as_ref(),
+            backward_vacated,
             &build_max_cmp(comparator.clone()),
         ) && let Some(entry) = forward_tree.as_mut().and_then(|ft| ft.take_slot(slot))
         {
+            // The claim emptied the forward slot without a refill.
+            forward_vacated.push(slot);
             return Some(Ok(entry.value));
         }
         let source = tree.winner_slot()?;
@@ -515,10 +576,12 @@ impl<S: CoherentMergeSource, C: UserComparator + Clone> DoubleEndedIterator
             Some(Err(e)) => {
                 let old = tree.pop_min()?;
                 pending_backward_error.get_or_insert(e);
+                backward_vacated.push(source);
                 Some(Ok(old.value))
             }
             None => {
                 let old = tree.pop_min()?;
+                backward_vacated.push(source);
                 Some(Ok(old.value))
             }
         }
