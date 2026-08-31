@@ -538,6 +538,14 @@ impl<I: DoubleEndedIterator<Item = crate::Result<InternalValue>>> DoubleEndedIte
     for PrefetchScan<I>
 {
     fn next_back(&mut self) -> Option<Self::Item> {
+        // Latch the shared armed state here too: read-ahead stays forward-only
+        // (no fill from this end), but once a reverse guard has resolved there
+        // is nothing left for later guards to report, and without the latch
+        // every one of them would carry a counted reference (an atomic bump on
+        // emit, an atomic store on resolve) for no effect.
+        if !self.armed {
+            self.armed = self.state.armed();
+        }
         // `buf` holds the EARLIEST remaining items (they were pulled off the
         // front), so the back of the scan is still inside `inner` until `inner`
         // runs out; only then does the buffer's own back become the last item.
