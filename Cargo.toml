@@ -14,7 +14,7 @@ exclude = ["tools/compare-rocksdb", "tools/db_bench", "tools/sst-dump"]
 
 [package]
 name = "coordinode-lsm-tree"
-description = "Embedded LSM-tree storage engine: BuRR filters, zstd dictionary compression, MVCC, range tombstones, merge operators, K/V separation, AES-256-GCM at rest."
+description = "Pure-Rust embedded LSM-tree storage engine, no C/C++ FFI: MVCC snapshots, BuRR filters, zstd dictionary compression, columnar PAX blocks, AES-256-GCM at rest, per-block ECC with self-healing, compaction on a near-full disk, and no_std support."
 license = "Apache-2.0"
 version = "5.8.0"
 edition = "2024"
@@ -25,7 +25,13 @@ repository = "https://github.com/structured-world/coordinode-lsm-tree"
 homepage = "https://github.com/structured-world/coordinode-lsm-tree"
 documentation = "https://docs.rs/coordinode-lsm-tree"
 keywords = ["lsm-tree", "storage", "database", "embedded", "key-value"]
-categories = ["data-structures", "database-implementations", "no-std", "compression"]
+categories = [
+    "database-implementations",
+    "data-structures",
+    "no-std",
+    "compression",
+    "embedded",
+]
 
 [package.metadata.docs.rs]
 # Build the docs.rs page with every feature enabled so the rendered
