@@ -11,6 +11,22 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 
 ## [Unreleased]
 
+## [5.8.0](https://github.com/structured-world/coordinode-lsm-tree/compare/v5.7.0...v5.8.0) - 2026-08-31
+
+### Added
+
+- *(salvage)* total recovery for SSTs and blob files with in-place ECC autoheal ([#588](https://github.com/structured-world/coordinode-lsm-tree/pull/588))
+- *(columnar)* tree-level projected columnar scan ([#567](https://github.com/structured-world/coordinode-lsm-tree/pull/567))
+
+### Fixed
+
+- *(verify)* judge a lone recognized ECC descriptor by the block framing ([#592](https://github.com/structured-world/coordinode-lsm-tree/pull/592))
+
+### Performance
+
+- *(table)* one block-read primitive, and fold the block-layout check into the reconcile walk ([#595](https://github.com/structured-world/coordinode-lsm-tree/pull/595))
+- *(verify)* run the reconcile gates on one decode per block ([#590](https://github.com/structured-world/coordinode-lsm-tree/pull/590))
+
 ## [5.7.0](https://github.com/structured-world/coordinode-lsm-tree/compare/v5.6.0...v5.7.0) - 2026-06-27
 
 ### Added
