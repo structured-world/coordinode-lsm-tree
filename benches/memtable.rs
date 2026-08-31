@@ -88,6 +88,131 @@ fn memtable_get_miss(c: &mut Criterion) {
     });
 }
 
+/// splitmix64 step — deterministic key material so the arms below measure the
+/// same key population in every process (nanoid arms rebuild a different
+/// random memtable per run, which swings their numbers by ±50% run to run).
+fn splitmix64(state: &mut u64) -> u64 {
+    *state = state.wrapping_add(0x9E37_79B9_7F4A_7C15);
+    let mut z = *state;
+    z = (z ^ (z >> 30)).wrapping_mul(0xBF58_476D_1CE4_E5B9);
+    z = (z ^ (z >> 27)).wrapping_mul(0x94D0_49BB_1331_11EB);
+    z ^ (z >> 31)
+}
+
+/// Cap on retained per-op samples for the percentile report: enough volume for
+/// a meaningful P999 while bounding memory (Criterion drives these micro-ops
+/// through millions of iterations).
+const PCT_SAMPLE_CAP: usize = 1_000_000;
+
+/// Reports per-op tail latency (P50/P99/P999) to stderr — Criterion's summary
+/// only surfaces mean/CI.
+fn report_percentiles(label: &str, mut samples: Vec<std::time::Duration>) {
+    if samples.is_empty() {
+        return;
+    }
+    samples.sort_unstable();
+    let pick =
+        |per_mille: usize| samples[(samples.len() * per_mille / 1000).min(samples.len() - 1)];
+    eprintln!(
+        "  [{label}] n={} P50={:?} P99={:?} P999={:?}",
+        samples.len(),
+        pick(500),
+        pick(990),
+        pick(999),
+    );
+}
+
+/// Point-lookup cost averaged over 10 000 distinct resident keys, so a single
+/// key's placement in the (per-process random) tower structure cannot dominate
+/// the measurement the way it does in `memtable get`.
+fn memtable_get_many(c: &mut Criterion) {
+    let memtable = Memtable::new(0, default_cmp());
+    let mut s = 0x1234_5678_9ABC_DEF0u64;
+    let mut probes = Vec::new();
+
+    for i in 0..1_000_000u64 {
+        let key = format!("abc_{:016x}", splitmix64(&mut s));
+        if i % 100 == 0 {
+            probes.push(key.clone());
+        }
+        memtable.insert(InternalValue::from_components(
+            key.as_bytes(),
+            vec![1, 2, 3],
+            0,
+            lsm_tree::ValueType::Value,
+        ));
+    }
+
+    let mut i = 0usize;
+    c.bench_function("memtable get many", |b| {
+        // Per-op timing so the percentile report sees individual lookups, not
+        // only Criterion's aggregate.
+        let mut samples = Vec::new();
+        b.iter_custom(|iters| {
+            let mut total = std::time::Duration::ZERO;
+            for _ in 0..iters {
+                let key = &probes[i % probes.len()];
+                i += 1;
+                let t = std::time::Instant::now();
+                let found = memtable.get(key.as_bytes(), MAX_SEQNO).is_some();
+                let elapsed = t.elapsed();
+                assert!(found);
+                total += elapsed;
+                if samples.len() < PCT_SAMPLE_CAP {
+                    samples.push(elapsed);
+                }
+            }
+            total
+        });
+        report_percentiles("get many", std::mem::take(&mut samples));
+    });
+}
+
+/// Miss cost averaged over 10 000 distinct absent keys (same population trick
+/// as `memtable get many`; the `zzz_` prefix guarantees a miss).
+fn memtable_get_miss_many(c: &mut Criterion) {
+    let memtable = Memtable::new(0, default_cmp());
+    let mut s = 0x1234_5678_9ABC_DEF0u64;
+
+    for _ in 0..1_000_000u64 {
+        let key = format!("abc_{:016x}", splitmix64(&mut s));
+        memtable.insert(InternalValue::from_components(
+            key.as_bytes(),
+            vec![],
+            0,
+            lsm_tree::ValueType::Value,
+        ));
+    }
+
+    let probes: Vec<String> = (0..10_000)
+        .map(|_| format!("abc_{:016x}", splitmix64(&mut s)))
+        .collect();
+
+    let mut i = 0usize;
+    c.bench_function("memtable get miss many", |b| {
+        // Per-op timing so the percentile report sees individual lookups, not
+        // only Criterion's aggregate.
+        let mut samples = Vec::new();
+        b.iter_custom(|iters| {
+            let mut total = std::time::Duration::ZERO;
+            for _ in 0..iters {
+                let key = &probes[i % probes.len()];
+                i += 1;
+                let t = std::time::Instant::now();
+                let found = memtable.get(key.as_bytes(), MAX_SEQNO).is_some();
+                let elapsed = t.elapsed();
+                assert!(!found);
+                total += elapsed;
+                if samples.len() < PCT_SAMPLE_CAP {
+                    samples.push(elapsed);
+                }
+            }
+            total
+        });
+        report_percentiles("get miss many", std::mem::take(&mut samples));
+    });
+}
+
 fn memtable_highest_seqno(c: &mut Criterion) {
     c.bench_function("memtable highest seqno", |b| {
         let memtable = Memtable::new(0, default_cmp());
@@ -112,6 +237,8 @@ criterion_group!(
     memtable_get_hit,
     memtable_get_snapshot,
     memtable_get_miss,
+    memtable_get_many,
+    memtable_get_miss_many,
     memtable_highest_seqno
 );
 criterion_main!(benches);

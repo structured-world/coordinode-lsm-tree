@@ -1135,3 +1135,42 @@ mod merge_operator_tests {
         Ok(())
     }
 }
+
+/// Regression: reverse iteration must detect the key boundary by key IDENTITY,
+/// not by bytewise `<` on the user keys. Under a comparator whose order differs
+/// from byte order (reverse-lexicographic here), the previous entry of a
+/// DIFFERENT key sorts bytewise-higher, so the old bytewise check classified it
+/// as "same key" and silently skipped it — a reverse scan dropped rows.
+#[test]
+#[expect(clippy::expect_used, reason = "test assertion")]
+fn mvcc_stream_reverse_scan_custom_comparator_emits_every_key() -> crate::Result<()> {
+    struct ReverseComparator;
+    impl crate::comparator::UserComparator for ReverseComparator {
+        fn name(&self) -> &'static str {
+            "reverse-test"
+        }
+        fn compare(&self, a: &[u8], b: &[u8]) -> core::cmp::Ordering {
+            b.cmp(a)
+        }
+    }
+
+    // Comparator-ascending order for reverse-lex: "b" sorts before "a".
+    let vec = [
+        InternalValue::from_components("b", "vb", 1, ValueType::Value),
+        InternalValue::from_components("a", "va", 1, ValueType::Value),
+    ];
+
+    let iter = Box::new(vec.iter().cloned().map(Ok));
+    let iter =
+        MvccStream::new_with_comparator(iter, None, alloc::sync::Arc::new(ReverseComparator));
+    let backwards = iter.rev().collect::<crate::Result<Vec<_>>>()?;
+
+    assert_eq!(
+        2,
+        backwards.len(),
+        "reverse scan must emit both keys, got {backwards:?}"
+    );
+    assert_eq!(b"a", &*backwards.first().expect("len checked").key.user_key);
+    assert_eq!(b"b", &*backwards.get(1).expect("len checked").key.user_key);
+    Ok(())
+}

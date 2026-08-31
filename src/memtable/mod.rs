@@ -11,7 +11,7 @@ use crate::comparator::SharedComparator;
 use crate::key::InternalKey;
 use crate::range_tombstone::RangeTombstone;
 use crate::{
-    UserKey, ValueType,
+    UserKey,
     value::{InternalValue, SeqNo},
 };
 #[cfg(not(feature = "std"))]
@@ -172,18 +172,10 @@ impl Memtable {
         // abcdef -> 6
         // abcdef -> 5
         //
-        let lower_bound = InternalKey::new(key, seqno - 1, ValueType::Value);
-
-        let cmp = self.comparator.as_ref();
-
-        let mut iter = self.items.range(lower_bound..).take_while(|entry| {
-            cmp.compare(entry.user_key_bytes(), key) == core::cmp::Ordering::Equal
-        });
-
-        iter.next().map(|entry| InternalValue {
-            key: entry.key(),
-            value: entry.value(),
-        })
+        // Borrowed-parts point lookup: no `InternalKey` bound is built, so the
+        // probe key is never copied (the old `range(lower_bound..)` path
+        // heap-copied `key` into a fresh bound per probed memtable).
+        self.items.point_get(key, seqno - 1)
     }
 
     /// Gets approximate size of memtable in bytes.

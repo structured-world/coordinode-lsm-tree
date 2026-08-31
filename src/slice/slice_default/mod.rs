@@ -27,6 +27,13 @@ impl Slice {
         Self(ByteView::new(&[]))
     }
 
+    /// Wraps an existing [`ByteView`] without copying (e.g. a zero-copy view
+    /// into an arena block).
+    #[must_use]
+    pub(crate) fn from_view(view: ByteView) -> Self {
+        Self(view)
+    }
+
     #[doc(hidden)]
     #[must_use]
     pub unsafe fn builder_unzeroed(len: usize) -> Builder {

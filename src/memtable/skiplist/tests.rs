@@ -521,3 +521,30 @@ fn concurrent_insert_and_iter_no_sigbus() {
     // The key assertion is that no SIGBUS/panic occurred during iteration.
     let _ = reads;
 }
+
+/// A reconstructed key is a zero-copy view into the arena block; the view's
+/// reference must keep the block's bytes alive even after the whole map (and
+/// its arena) is dropped. Uses a key longer than the inline threshold so the
+/// view actually shares the block, and a second map to give a use-after-free
+/// a chance to scribble over recycled memory before the assertion.
+#[test]
+fn key_view_after_map_drop_remains_valid() {
+    let long_key = vec![0xA5u8; 64];
+    let map = new_map();
+    map.insert(&make_key(&long_key, 1), &make_value(b"payload"));
+
+    #[expect(
+        clippy::expect_used,
+        reason = "test inserts one entry before reading it"
+    )]
+    let key = map.iter().next().expect("one entry").key();
+    drop(map);
+
+    // Recycle allocator pages with a fresh map full of different bytes.
+    let other = new_map();
+    for i in 0..100u64 {
+        other.insert(&make_key(&[0x5Au8; 64], i), &make_value(&[0xFFu8; 128]));
+    }
+
+    assert_eq!(&*key.user_key, long_key.as_slice());
+}

@@ -1112,6 +1112,24 @@ impl AbstractTree for BlobTree {
                 table_writer.use_zstd_dictionary(self.index.config.zstd_dictionary.clone());
         }
 
+        // Parallel block compression for the flush writer, mirroring the
+        // standard tree's flush: engaged only when the per-block transform does
+        // real CPU work (codec / encryption / page ECC). See the standard
+        // flush for why this is safe wherever the host runs the flush (the
+        // pipeline's help-first drain, see `parallel_compressor`).
+        #[cfg(feature = "std")]
+        {
+            let transform_does_work = data_block_compression != crate::CompressionType::None
+                || self.index.config.encryption.is_some()
+                || self.index.config.page_ecc;
+            if transform_does_work {
+                table_writer = table_writer.use_parallel_compression(
+                    self.index.config.compaction_pool.clone(),
+                    self.index.config.compaction_threads,
+                );
+            }
+        }
+
         #[expect(
             clippy::expect_used,
             reason = "cannot create blob tree without defining kv separation options"
@@ -1373,7 +1391,7 @@ impl AbstractTree for BlobTree {
     }
 
     fn get<K: AsRef<[u8]>>(&self, key: K, seqno: SeqNo) -> crate::Result<Option<crate::UserValue>> {
-        let super_version = self.index.get_version_for_snapshot(seqno);
+        let super_version = self.index.snapshot_for_read(seqno);
         self.resolve_key(&super_version, key.as_ref(), seqno)
     }
 
@@ -1392,7 +1410,7 @@ impl AbstractTree for BlobTree {
             return Ok(Vec::new());
         }
 
-        let super_version = self.index.get_version_for_snapshot(seqno);
+        let super_version = self.index.snapshot_for_read(seqno);
         let comparator = self.index.config.comparator.as_ref();
 
         // For small batches, use the simple per-key path

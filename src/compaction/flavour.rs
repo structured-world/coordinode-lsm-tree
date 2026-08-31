@@ -63,9 +63,11 @@ pub(super) fn prepare_table_writer(
     opts: &Options,
     payload: &CompactionPayload,
     // When false, the writer compresses blocks serially. Used by parallel
-    // sub-compactions, which already run on the compaction pool: re-submitting
-    // block compression to the same pool from a pool thread would deadlock
-    // (the draining thread parks on a worker slot that can't be scheduled).
+    // sub-compactions, which already run on the compaction pool: with N ranges
+    // occupying the pool's N workers, submitting block jobs there mostly
+    // degrades to the pipeline's inline help path anyway (extra queue traffic
+    // for no extra parallelism — no longer a deadlock since the help-first
+    // drain, but not a win either without spare workers).
     block_parallel: bool,
     // The compaction-filter transform counter shared with the filter adapter
     // (`Some` iff a filter is instantiated for this run). Lineage is stamped
@@ -236,8 +238,9 @@ pub(super) fn prepare_table_writer(
     // Parallel block compression: hand the (per-tree or caller-shared) pool to
     // the writer so its CPU-bound transform work runs on worker threads while
     // writes stay ordered. None / single-thread leaves the serial path.
-    // Skipped for sub-compaction writers (block_parallel = false), which already
-    // occupy a pool thread and would deadlock re-submitting to the same pool.
+    // Skipped for sub-compaction writers (block_parallel = false), which
+    // already occupy the pool's workers — see the `block_parallel` parameter
+    // note on `prepare_table_writer`.
     #[cfg(feature = "std")]
     let table_writer = if block_parallel {
         table_writer.use_parallel_compression(

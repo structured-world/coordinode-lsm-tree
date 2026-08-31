@@ -45,6 +45,39 @@ pub struct SuperVersion {
     pub(crate) seqno: SeqNo,
 }
 
+/// A borrowed-or-owned [`SuperVersion`] for the duration of one read.
+///
+/// A point read at or beyond the latest installed version does not need its
+/// own copy of the snapshot: the mirrored latest [`SuperVersion`] is the one
+/// `get_version_for_snapshot` would return, and holding the `arc-swap` load
+/// guard keeps it alive without the history lock or the clone (two `Arc`
+/// bumps plus a [`Version`] clone per call). Historical snapshot reads still
+/// clone out of the locked history, which this wraps as `Owned`.
+///
+/// Short-lived by design: a guard held across a long scan would delay the
+/// mirror's writers, so iterators keep cloning; this type serves the point
+/// lookups. The mirror needs `arc-swap`, so under no-std only `Owned` exists
+/// and every read clones, as before.
+pub enum SnapshotRef {
+    /// The latest installed snapshot, pinned by the mirror's load guard.
+    #[cfg(feature = "std")]
+    Latest(arc_swap::Guard<Arc<SuperVersion>>),
+    /// A historical snapshot cloned out of the locked version history.
+    Owned(SuperVersion),
+}
+
+impl core::ops::Deref for SnapshotRef {
+    type Target = SuperVersion;
+
+    fn deref(&self) -> &SuperVersion {
+        match self {
+            #[cfg(feature = "std")]
+            Self::Latest(guard) => guard,
+            Self::Owned(version) => version,
+        }
+    }
+}
+
 pub struct SuperVersions {
     versions: VecDeque<SuperVersion>,
 
@@ -67,6 +100,19 @@ pub struct SuperVersions {
     /// appending (`Config::manifest_log_rotate_bytes`, default 1 MiB). Immutable
     /// for the tree's life.
     log_rotate_bytes: u64,
+
+    /// Cached size of the current `edits-{snapshot_id}` log in bytes. `None`
+    /// until first measured (a recovered log may be non-empty) or after an
+    /// append error left the on-disk size uncertain. Kept exact by adding each
+    /// appended record's size: every install runs under the version write
+    /// lock, so this history is the log's only writer. Saves an `open` +
+    /// `seek` syscall pair on every flush / compaction install.
+    log_bytes: Option<u64>,
+
+    /// Reusable payload-assembly buffer for edit appends — the scratch
+    /// `edit_log::append_edit` documents as reusable; allocating it per
+    /// install defeated that.
+    edit_scratch: Vec<u8>,
 
     /// Lock-free mirror of the latest (back) `SuperVersion`, shared with the
     /// `Tree` so a point read at `MAX_SEQNO` can load the current snapshot
@@ -115,6 +161,8 @@ impl SuperVersions {
             sync_mode,
             snapshot_id,
             log_rotate_bytes,
+            log_bytes: None,
+            edit_scratch: Vec::new(),
         }
     }
 
@@ -321,11 +369,38 @@ impl SuperVersions {
     ) -> crate::Result<()> {
         let log_path = tree_path.join(format!("edits-{}", self.snapshot_id));
 
-        if edit_log::log_size(fs, &log_path)? < self.log_rotate_bytes {
+        // Cached log size when available; measure once otherwise (fresh open
+        // with a recovered log, or after an append error of unknown extent).
+        let log_size = if let Some(n) = self.log_bytes {
+            n
+        } else {
+            let n = edit_log::log_size(fs, &log_path)?;
+            self.log_bytes = Some(n);
+            n
+        };
+
+        if log_size < self.log_rotate_bytes {
             // Common path: append the delta and fsync. No snapshot rewrite.
             let edit = next.diff(prior)?;
-            let mut scratch = Vec::new();
-            return edit_log::append_edit(fs, &log_path, &edit, &mut scratch, self.sync_mode);
+            match edit_log::append_edit(
+                fs,
+                &log_path,
+                &edit,
+                &mut self.edit_scratch,
+                self.sync_mode,
+            ) {
+                Ok(appended) => {
+                    self.log_bytes = Some(log_size + appended);
+                    return Ok(());
+                }
+                Err(e) => {
+                    // A failed append may have written a partial record; the
+                    // on-disk size is unknown, so drop the cache and re-measure
+                    // on the next install.
+                    self.log_bytes = None;
+                    return Err(e);
+                }
+            }
         }
 
         // Rotation: write `next` as a fresh full snapshot and repoint CURRENT.
@@ -340,6 +415,9 @@ impl SuperVersions {
             self.sync_mode,
         )?;
         self.snapshot_id = next.id();
+        // The new generation starts with an empty log (created lazily on the
+        // first append).
+        self.log_bytes = Some(0);
 
         // The durable commit point of a rotation is the CURRENT repoint inside
         // `persist_version` above — past it, the rotation has SUCCEEDED. Deleting

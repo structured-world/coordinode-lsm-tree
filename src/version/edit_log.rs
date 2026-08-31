@@ -32,6 +32,10 @@ use std::io::{Seek, SeekFrom};
 /// acknowledges the flush / compaction. `scratch` is reused for payload
 /// assembly across calls (no per-edit heap allocation after warm-up).
 ///
+/// Returns the appended record's on-disk size in bytes (framing header +
+/// payload), so the caller can keep its cached log size exact without a
+/// re-measuring `open` + `seek` per install.
+///
 /// # Errors
 ///
 /// Returns an I/O error if the open, write, or fsync fails, or a framing error
@@ -42,7 +46,7 @@ pub fn append_edit(
     edit: &VersionEdit,
     scratch: &mut Vec<u8>,
     sync_mode: SyncMode,
-) -> crate::Result<()> {
+) -> crate::Result<u64> {
     let mut file = fs
         .open(
             path,
@@ -51,7 +55,9 @@ pub fn append_edit(
         .map_err(crate::Error::from)?;
     edit.append_to(&mut file, scratch)?;
     file.sync_all_with(sync_mode).map_err(crate::Error::from)?;
-    Ok(())
+    // `append_to` leaves the encoded payload in `scratch`; the framing header
+    // (u32 len + u64 XXH3) precedes it on disk.
+    Ok((super::framing::FRAME_HEADER_LEN + scratch.len()) as u64)
 }
 
 /// Replays the durable prefix of the log at `path`. An absent log is an empty

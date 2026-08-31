@@ -51,11 +51,15 @@ const UNSET: u32 = 0;
 // +12  u32  (reserved)    — padding for alignment
 // +16  u64  seqno         — sequence number
 // +24  [u32; height]      — tower: next-pointers per level (AtomicU32)
+// +24+4×height  [u8; key_len] — user_key bytes (same allocation, so the key
+//                              shares the header's cache line for the common
+//                              height-1/2 node; `key_offset` still addresses
+//                              it like any arena span)
 //
 // Values are stored in a separate heap-backed Vec so that large values
 // don't bloat the arena and cause exhaustion.
 //
-// Total: 24 + 4 × height   (always 4-byte aligned)
+// Total: 24 + 4 × height + key_len   (always 4-byte aligned)
 
 // Layout offsets — only OFF_HEIGHT and OFF_TOWER are used by name in code;
 // the rest are accessed via array slicing in the node_*() accessors.
@@ -448,33 +452,34 @@ impl SkipMap {
     ) -> u32 {
         let key_bytes: &[u8] = &key.user_key;
 
-        // Allocate key data in the arena.
-        #[expect(
-            clippy::expect_used,
-            reason = "arena capacity is fixed; exhaustion is fatal"
-        )]
-        let key_offset = self
-            .arena
-            .alloc(key_bytes.len() as u32, 1)
-            .expect("arena exhausted (key data)");
-        // SAFETY: key_offset was just allocated with size key_bytes.len();
-        // exclusive access before publish.
-        unsafe {
-            self.arena
-                .get_bytes_mut(key_offset, key_bytes.len() as u32)
-                .copy_from_slice(key_bytes);
-        }
-
-        // Store value in the lock-free segmented store.
-        let value_idx = self.values.append(value);
-
-        // Allocate the node header + tower.
+        // One arena allocation carries the node header, the tower AND the key
+        // bytes (key right after the tower). Two separate allocations would
+        // cost a second CAS loop on the bump cursor per insert, and would let
+        // the key land a block away from the metadata the search reads right
+        // before it — with a typical height of 1-2 the key starts at +28/+32,
+        // on the same cache line as the header `compare_key` just loaded.
         let n_size = node_size(height);
         #[expect(
             clippy::expect_used,
             reason = "arena capacity is fixed; exhaustion is fatal"
         )]
-        let node = self.arena.alloc(n_size, 4).expect("arena exhausted (node)");
+        let node = self
+            .arena
+            .alloc(n_size + key_bytes.len() as u32, 4)
+            .expect("arena exhausted (node)");
+        let key_offset = node + n_size;
+        if !key_bytes.is_empty() {
+            // SAFETY: key_offset..+len is within the allocation made above;
+            // exclusive access before publish.
+            unsafe {
+                self.arena
+                    .get_bytes_mut(key_offset, key_bytes.len() as u32)
+                    .copy_from_slice(key_bytes);
+            }
+        }
+
+        // Store value in the lock-free segmented store.
+        let value_idx = self.values.append(value);
 
         // Write immutable metadata using direct byte offsets matching the
         // node layout comment above.  The arena guarantees 24+ bytes at `node`.
@@ -654,8 +659,24 @@ impl SkipMap {
         unsafe { self.arena.get_bytes(off, len) }
     }
 
-    /// Reconstructs the [`InternalKey`] for `node` (allocates a new `Slice`).
+    /// Reconstructs the [`InternalKey`] for `node`.
+    ///
+    /// Zero-copy on the default `Slice` backend: the user key is a refcounted
+    /// view into the arena block that stores it (inline for short keys), so no
+    /// allocation or byte copy happens per reconstructed key. The `bytes`
+    /// backend cannot view foreign allocations and copies, as before.
     fn node_internal_key(&self, node: u32) -> InternalKey {
+        #[cfg(not(feature = "bytes_1"))]
+        // SAFETY: key_offset/key_len were written during alloc_node and the
+        // node is only reachable after its publishing CAS (happens-before);
+        // published key bytes are never rewritten.
+        let user_key: UserKey = UserKey::from_view(unsafe {
+            self.arena.get_view(
+                self.node_key_offset(node),
+                u32::from(self.node_key_len(node)),
+            )
+        });
+        #[cfg(feature = "bytes_1")]
         let user_key: UserKey = self.node_user_key_bytes(node).into();
         let seqno = self.node_seqno(node);
         let vt = self.node_value_type(node);
@@ -740,9 +761,35 @@ impl SkipMap {
 
     /// Compares the key stored at `node` with `target` using the pluggable
     /// `UserComparator` for `user_key` ordering, then seqno DESC.
+    #[inline]
     fn compare_key(&self, node: u32, target: &InternalKey) -> CmpOrdering {
-        let node_uk = self.node_user_key_bytes(node);
-        let target_uk: &[u8] = &target.user_key;
+        self.compare_key_parts(node, &target.user_key, target.seqno)
+    }
+
+    /// [`Self::compare_key`] against a borrowed `(user_key, seqno)` pair, so
+    /// point lookups can search without materializing an [`InternalKey`]
+    /// (which would heap-copy the probe key on the slice backend).
+    #[expect(
+        clippy::indexing_slicing,
+        reason = "metadata is exactly OFF_TOWER (24) bytes by construction"
+    )]
+    #[expect(
+        clippy::expect_used,
+        reason = "infallible: fixed-width slices always convert to arrays"
+    )]
+    fn compare_key_parts(&self, node: u32, target_uk: &[u8], target_seqno: SeqNo) -> CmpOrdering {
+        // One metadata read serves key offset, key length AND (on the equal
+        // branch) the seqno: every field split into its own accessor would
+        // re-resolve the arena block pointer (an extra Acquire load + branch)
+        // per field, and this comparison runs O(log n) times per insert/lookup.
+        // SAFETY: `node` is reachable via skiplist links only after its
+        // publishing CAS, so the metadata header is fully written.
+        let m = unsafe { self.meta(node) };
+        let key_off = u32::from_ne_bytes(m[0..4].try_into().expect("4 bytes"));
+        let key_len = u32::from(u16::from_ne_bytes(m[8..10].try_into().expect("2 bytes")));
+        // SAFETY: key_offset/key_len were written during alloc_node; the key
+        // bytes are immutable once the node is published.
+        let node_uk = unsafe { self.arena.get_bytes(key_off, key_len) };
 
         // Hot path: for the default byte-ordering comparator, compare the user
         // keys with a direct `slice::cmp` (inlines to `memcmp`) instead of the
@@ -758,8 +805,8 @@ impl SkipMap {
         match uk_ord {
             CmpOrdering::Equal => {
                 // Reverse seqno: higher seqno sorts first.
-                let node_seq = self.node_seqno(node);
-                target.seqno.cmp(&node_seq)
+                let node_seq = u64::from_ne_bytes(m[16..24].try_into().expect("8 bytes"));
+                target_seqno.cmp(&node_seq)
             }
             other => other,
         }
@@ -770,9 +817,32 @@ impl SkipMap {
     /// Ordering: `(user_key via comparator, Reverse(seqno))`.  `value_type` is
     /// intentionally excluded — it is not part of `InternalKey::Ord` or
     /// [`InternalKey::compare_with`], and `(user_key, seqno)` is unique per entry.
+    #[expect(
+        clippy::indexing_slicing,
+        reason = "metadata is exactly OFF_TOWER (24) bytes by construction"
+    )]
+    #[expect(
+        clippy::expect_used,
+        reason = "infallible: fixed-width slices always convert to arrays"
+    )]
     fn compare_nodes(&self, a: u32, b: u32) -> CmpOrdering {
-        let a_uk = self.node_user_key_bytes(a);
-        let b_uk = self.node_user_key_bytes(b);
+        // Single metadata read per node — see `compare_key` for why the fields
+        // are not read through the per-field accessors here.
+        // SAFETY: both nodes are published skiplist nodes; their metadata
+        // headers were fully written before their publishing CAS.
+        let (ma, mb) = unsafe { (self.meta(a), self.meta(b)) };
+        let a_off = u32::from_ne_bytes(ma[0..4].try_into().expect("4 bytes"));
+        let a_len = u32::from(u16::from_ne_bytes(ma[8..10].try_into().expect("2 bytes")));
+        let b_off = u32::from_ne_bytes(mb[0..4].try_into().expect("4 bytes"));
+        let b_len = u32::from(u16::from_ne_bytes(mb[8..10].try_into().expect("2 bytes")));
+        // SAFETY: key spans were written during alloc_node and are immutable
+        // once the nodes are published.
+        let (a_uk, b_uk) = unsafe {
+            (
+                self.arena.get_bytes(a_off, a_len),
+                self.arena.get_bytes(b_off, b_len),
+            )
+        };
         // Same direct-`slice::cmp` fast path as `compare_key` for the default
         // comparator (avoids the `dyn` vtable call per comparison).
         let uk_ord = if self.is_lexicographic {
@@ -782,8 +852,8 @@ impl SkipMap {
         };
         match uk_ord {
             CmpOrdering::Equal => {
-                let a_seq = self.node_seqno(a);
-                let b_seq = self.node_seqno(b);
+                let a_seq = u64::from_ne_bytes(ma[16..24].try_into().expect("8 bytes"));
+                let b_seq = u64::from_ne_bytes(mb[16..24].try_into().expect("8 bytes"));
                 b_seq.cmp(&a_seq) // reverse seqno
             }
             other => other,
@@ -862,7 +932,13 @@ impl SkipMap {
     }
 
     /// Finds the first node whose key >= `target`, or UNSET.
+    #[inline]
     fn seek_ge(&self, target: &InternalKey) -> u32 {
+        self.seek_ge_parts(&target.user_key, target.seqno)
+    }
+
+    /// [`Self::seek_ge`] against a borrowed `(user_key, seqno)` pair.
+    fn seek_ge_parts(&self, target_uk: &[u8], target_seqno: SeqNo) -> u32 {
         let mut node = self.head;
         let list_h = self.height.load(Ordering::Acquire);
 
@@ -872,7 +948,7 @@ impl SkipMap {
                 if next == UNSET {
                     break;
                 }
-                if self.compare_key(next, target) == CmpOrdering::Less {
+                if self.compare_key_parts(next, target_uk, target_seqno) == CmpOrdering::Less {
                     node = next;
                 } else {
                     break;
@@ -881,6 +957,29 @@ impl SkipMap {
         }
 
         self.next_at(node, 0)
+    }
+
+    /// Point lookup: the entry for `key` with the highest seqno `<= max_seqno`,
+    /// or `None` if no version of `key` is visible.
+    ///
+    /// Searches with borrowed `(key, seqno)` parts — no [`InternalKey`] bound is
+    /// materialized, so the probe key is never copied and nothing allocates.
+    /// The found entry's key IS materialized, as a zero-copy view on the slice
+    /// backend (see [`Self::node_internal_key`]).
+    pub fn point_get(&self, key: &[u8], max_seqno: SeqNo) -> Option<InternalValue> {
+        let node = self.seek_ge_parts(key, max_seqno);
+        if node == UNSET {
+            return None;
+        }
+        // Key identity is byte equality (see `comparator::same_user_key`), so
+        // no comparator dispatch is needed to reject a different key.
+        if !crate::comparator::same_user_key(self.node_user_key_bytes(node), key) {
+            return None;
+        }
+        Some(InternalValue {
+            key: self.node_internal_key(node),
+            value: self.node_value(node),
+        })
     }
 
     /// Finds the first node whose key > `target`, or UNSET.
@@ -1042,13 +1141,6 @@ impl Entry<'_> {
     /// Reconstructs the [`InternalKey`] (allocates a new `Slice` for `user_key`).
     pub fn key(&self) -> InternalKey {
         self.map.node_internal_key(self.node)
-    }
-
-    /// Returns a borrowed reference to the raw `user_key` bytes stored in
-    /// the arena.  This is cheaper than [`key()`](Self::key) when only the
-    /// `user_key` is needed (avoids allocating a new `Slice`).
-    pub fn user_key_bytes(&self) -> &[u8] {
-        self.map.node_user_key_bytes(self.node)
     }
 
     /// Reconstructs the value (allocates a new `Slice`).

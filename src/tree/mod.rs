@@ -373,33 +373,7 @@ impl AbstractTree for Tree {
     }
 
     fn get_internal_entry(&self, key: &[u8], seqno: SeqNo) -> crate::Result<Option<InternalValue>> {
-        // Lock-free fast path: when reading at or beyond the latest installed
-        // version (always the case for MAX_SEQNO, and the common case), the
-        // mirrored latest SuperVersion is exactly what `get_version_for_snapshot`
-        // would return (it yields the latest iff `latest.seqno < seqno`), so
-        // load it without taking the history RwLock or cloning a deque entry.
-        // Recent inserts stay visible because they mutate the shared
-        // `active_memtable` behind a stable Arc; the back only changes on
-        // flush / compaction, which refresh this mirror under the write lock.
-        //
-        // std-only: the mirror needs `arc-swap` (not no_std). Under no-std we
-        // skip straight to the history RwLock path below.
-        #[cfg(feature = "std")]
-        {
-            let latest = self.latest_super_version.load();
-            if seqno > latest.seqno {
-                return Self::get_internal_entry_from_version(
-                    &latest,
-                    key,
-                    seqno,
-                    self.config.comparator.as_ref(),
-                );
-            }
-        }
-
-        // Historical snapshot read (seqno <= latest.seqno): consult the locked
-        // version history for the correct point-in-time SuperVersion.
-        let super_version = self.version_history.read().get_version_for_snapshot(seqno);
+        let super_version = self.snapshot_for_read(seqno);
 
         Self::get_internal_entry_from_version(
             &super_version,
@@ -893,6 +867,27 @@ impl AbstractTree for Tree {
         #[cfg(zstd_any)]
         {
             table_writer = table_writer.use_zstd_dictionary(self.config.zstd_dictionary.clone());
+        }
+
+        // Parallel block compression for the flush writer, on the same pool the
+        // compaction writers use. Engaged only when the per-block transform does
+        // real CPU work (a codec, encryption, or page ECC): with the identity
+        // transform the pipeline's owned buffer + queue hop per block buys
+        // nothing over the serial reusable-buffer path. Safe wherever the host
+        // runs this flush — even on a thread of an injected pool — because the
+        // pipeline's help-first drain executes queued jobs inline instead of
+        // waiting on a saturated pool (see `parallel_compressor`).
+        #[cfg(feature = "std")]
+        {
+            let transform_does_work = data_block_compression != crate::CompressionType::None
+                || self.config.encryption.is_some()
+                || self.config.page_ecc;
+            if transform_does_work {
+                table_writer = table_writer.use_parallel_compression(
+                    self.config.compaction_pool.clone(),
+                    self.config.compaction_threads,
+                );
+            }
         }
 
         // Set range tombstones BEFORE writing KV items so that if MultiWriter
@@ -1564,7 +1559,7 @@ impl AbstractTree for Tree {
     fn get<K: AsRef<[u8]>>(&self, key: K, seqno: SeqNo) -> crate::Result<Option<UserValue>> {
         let key = key.as_ref();
 
-        let super_version = self.version_history.read().get_version_for_snapshot(seqno);
+        let super_version = self.snapshot_for_read(seqno);
 
         Self::resolve_or_passthrough(
             &super_version,
@@ -1582,7 +1577,7 @@ impl AbstractTree for Tree {
     ) -> crate::Result<Option<crate::PinnableSlice>> {
         let key = key.as_ref();
 
-        let super_version = self.version_history.read().get_version_for_snapshot(seqno);
+        let super_version = self.snapshot_for_read(seqno);
 
         Self::resolve_or_passthrough_pinned(
             &super_version,
@@ -1602,7 +1597,7 @@ impl AbstractTree for Tree {
         keys: impl IntoIterator<Item = K>,
         seqno: SeqNo,
     ) -> crate::Result<Vec<Option<UserValue>>> {
-        let super_version = self.get_version_for_snapshot(seqno);
+        let super_version = self.snapshot_for_read(seqno);
         let comparator = self.config.comparator.as_ref();
         let merge_operator = self.config.merge_operator.as_ref();
 
@@ -3719,6 +3714,37 @@ impl Tree {
 
     pub(crate) fn get_version_for_snapshot(&self, seqno: SeqNo) -> SuperVersion {
         self.version_history.read().get_version_for_snapshot(seqno)
+    }
+
+    /// The snapshot for one point read, without a clone when it is the latest.
+    ///
+    /// Lock-free fast path: when reading at or beyond the latest installed
+    /// version (always the case for `MAX_SEQNO`, and the common case), the
+    /// mirrored latest [`SuperVersion`] is exactly what `get_version_for_snapshot`
+    /// would return (it yields the latest iff `latest.seqno < seqno`), so
+    /// load it without taking the history `RwLock` or cloning a deque entry.
+    /// Recent inserts stay visible because they mutate the shared
+    /// `active_memtable` behind a stable Arc; the back only changes on
+    /// flush / compaction, which refresh this mirror under the write lock.
+    ///
+    /// Historical snapshot reads (seqno <= latest.seqno) consult the locked
+    /// version history for the correct point-in-time [`SuperVersion`].
+    ///
+    /// Point reads only: a guard held across a long scan would delay the
+    /// mirror's writers, so iterators keep their own clones. no-std has no
+    /// mirror (`arc-swap` is std-only) and always clones out of the locked
+    /// history, as before.
+    pub(crate) fn snapshot_for_read(&self, seqno: SeqNo) -> crate::version::SnapshotRef {
+        use crate::version::SnapshotRef;
+
+        #[cfg(feature = "std")]
+        {
+            let latest = self.latest_super_version.load();
+            if seqno > latest.seqno {
+                return SnapshotRef::Latest(latest);
+            }
+        }
+        SnapshotRef::Owned(self.version_history.read().get_version_for_snapshot(seqno))
     }
 
     /// Normalizes a user-provided range into owned `Bound<Slice>` values.

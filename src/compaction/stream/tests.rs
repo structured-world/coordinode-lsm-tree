@@ -1169,3 +1169,35 @@ mod merge_operator_tests {
         Ok(())
     }
 }
+
+/// Regression: the "is the peeked entry a different key?" check used a bytewise
+/// `>` on the user keys instead of key identity. Under a comparator whose order
+/// differs from byte order (reverse-lexicographic here), a following DIFFERENT
+/// key sorts bytewise-lower, so the old check classified it as "same key": a
+/// `WeakTombstone` head then saw the other key's `Value` as its annihilation
+/// partner and was dropped, resurrecting older versions below.
+#[test]
+#[expect(clippy::unwrap_used, reason = "test assertion")]
+fn compaction_stream_custom_comparator_weak_tombstone_not_annihilated_across_keys()
+-> crate::Result<()> {
+    // Comparator-ascending order for reverse-lex: "b" sorts before "a".
+    let vec = vec![
+        InternalValue::from_components("b", "", 999, ValueType::WeakTombstone),
+        InternalValue::from_components("a", "va", 998, ValueType::Value),
+    ];
+
+    let iter = vec.iter().cloned().map(Ok);
+    let mut iter = CompactionStream::new(iter, 1_000);
+
+    // The weak tombstone has NO same-key value after it — it must survive.
+    let first = iter.next().unwrap()?;
+    assert_eq!(first.key.value_type, ValueType::WeakTombstone);
+    assert_eq!(&*first.key.user_key, b"b");
+
+    let second = iter.next().unwrap()?;
+    assert_eq!(second.key.value_type, ValueType::Value);
+    assert_eq!(&*second.key.user_key, b"a");
+
+    iter_closed!(iter);
+    Ok(())
+}

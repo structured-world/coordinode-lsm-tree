@@ -473,7 +473,14 @@ impl<'a, I: Iterator<Item = Item>, F: StreamFilter + 'a> Iterator for Compaction
                         .expect_err("should be error")));
                 };
 
-                if peeked.key.user_key > head.key.user_key {
+                // Key boundary = DIFFERENT key, by identity (byte equality),
+                // not by bytewise `>`: the input is comparator order, so
+                // `peeked` is never an earlier key than `head` — but under a
+                // custom comparator a different key may sort bytewise-lower,
+                // and a bytewise `>` classified it as "same key" (a
+                // WeakTombstone head then annihilated against the OTHER key's
+                // value). Byte equality is also cheaper (length short-circuit).
+                if !crate::comparator::same_user_key(&peeked.key.user_key, &head.key.user_key) {
                     if head.is_tombstone() && self.evict_tombstones {
                         self.note_transform();
                         continue;

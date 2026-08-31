@@ -474,6 +474,150 @@ impl ByteView {
         view
     }
 
+    /// Allocates a shared heap region compatible with [`ByteView`]'s long
+    /// representation and returns the DATA base pointer (just past the
+    /// refcount header). The region starts with a reference count of 1,
+    /// owned by the caller; release it with
+    /// [`shared_heap_release`](Self::shared_heap_release).
+    ///
+    /// The contents are **uninitialized**; the caller must fully initialize
+    /// every byte it later exposes through a view. Views into the region are
+    /// created with [`view_of_shared`](Self::view_of_shared), each holding
+    /// its own reference; the allocation is freed when the last reference
+    /// (owner or view) goes away.
+    ///
+    /// This is what lets an arena hand out zero-copy [`ByteView`]s over its
+    /// blocks: the block IS a byteview heap region, so a view over a
+    /// key/value span is a refcount bump instead of an allocate-and-copy.
+    ///
+    /// # Panics
+    ///
+    /// Panics on a zero `data_len` (a zero-sized heap region has no data to
+    /// view) and aborts on allocation failure, like every other allocating
+    /// constructor here.
+    pub(crate) fn alloc_shared_heap(data_len: u32) -> *mut u8 {
+        assert!(data_len > 0, "shared heap region must have data");
+
+        const HEADER_SIZE: usize = core::mem::size_of::<HeapAllocationHeader>();
+        const ALIGNMENT: usize = core::mem::align_of::<HeapAllocationHeader>();
+
+        let total_size = HEADER_SIZE + data_len as usize;
+        #[expect(
+            clippy::expect_used,
+            reason = "layout arithmetic cannot fail for u32 sizes"
+        )]
+        let layout = alloc::alloc::Layout::from_size_align(total_size, ALIGNMENT)
+            .expect("valid layout for shared heap region");
+
+        // SAFETY: layout is non-zero (header + data_len > 0).
+        let heap_ptr = unsafe { alloc::alloc::alloc(layout) };
+        if heap_ptr.is_null() {
+            alloc::alloc::handle_alloc_error(layout);
+        }
+
+        // SAFETY: heap_ptr points at a fresh allocation large enough for the
+        // header.
+        unsafe {
+            let heap_region = &*heap_ptr.cast::<HeapAllocationHeader>();
+            heap_region.ref_count.store(1, Ordering::Release);
+            heap_ptr.add(HEADER_SIZE)
+        }
+    }
+
+    /// Releases one reference to a shared heap region created by
+    /// [`alloc_shared_heap`](Self::alloc_shared_heap), freeing it when this
+    /// was the last one. `data_base` is the pointer that
+    /// `alloc_shared_heap` returned; `data_len` its argument.
+    ///
+    /// # Safety
+    ///
+    /// `data_base` / `data_len` must come from `alloc_shared_heap`, and the
+    /// caller must own the reference being released.
+    pub(crate) unsafe fn shared_heap_release(data_base: *const u8, data_len: u32) {
+        const HEADER_SIZE: usize = core::mem::size_of::<HeapAllocationHeader>();
+        const ALIGNMENT: usize = core::mem::align_of::<HeapAllocationHeader>();
+
+        // SAFETY: data_base came from alloc_shared_heap, so the header lives
+        // right below it.
+        let heap_ptr = unsafe { data_base.sub(HEADER_SIZE) };
+        let heap_region = unsafe { &*heap_ptr.cast::<HeapAllocationHeader>() };
+
+        if heap_region.ref_count.fetch_sub(1, Ordering::AcqRel) != 1 {
+            return;
+        }
+
+        let total_size = HEADER_SIZE + data_len as usize;
+        #[expect(
+            clippy::expect_used,
+            reason = "layout arithmetic cannot fail for u32 sizes"
+        )]
+        let layout = alloc::alloc::Layout::from_size_align(total_size, ALIGNMENT)
+            .expect("valid layout for shared heap region");
+        // SAFETY: last reference gone; the allocation was made with this
+        // exact layout.
+        unsafe {
+            alloc::alloc::dealloc(heap_ptr.cast_mut(), layout);
+        }
+    }
+
+    /// A view of `len` bytes at `offset` within a shared heap region created
+    /// by [`alloc_shared_heap`](Self::alloc_shared_heap).
+    ///
+    /// Short spans are inlined (no reference taken); longer spans share the
+    /// region's refcount, exactly like [`slice`](Self::slice) does for an
+    /// ordinary long byteview, so no bytes are copied and nothing allocates.
+    ///
+    /// # Safety
+    ///
+    /// - `data_base` / `data_len` must come from `alloc_shared_heap`, and the
+    ///   region must hold at least one live reference for the duration of
+    ///   this call.
+    /// - `offset + len` must be within `data_len`, and those bytes must be
+    ///   fully initialized and never written again while any view exists.
+    pub(crate) unsafe fn view_of_shared(
+        data_base: *const u8,
+        offset: u32,
+        len: u32,
+        data_len: u32,
+    ) -> Self {
+        const HEADER_SIZE: usize = core::mem::size_of::<HeapAllocationHeader>();
+
+        debug_assert!(
+            offset.checked_add(len).is_some_and(|end| end <= data_len),
+            "view_of_shared: span {offset}+{len} out of region {data_len}"
+        );
+
+        // SAFETY: caller guarantees the span is in-bounds and initialized.
+        let bytes =
+            unsafe { core::slice::from_raw_parts(data_base.add(offset as usize), len as usize) };
+
+        if len as usize <= INLINE_SIZE {
+            return Self::new(bytes);
+        }
+
+        // SAFETY: data_base came from alloc_shared_heap; the header lives
+        // right below it and holds a live reference per the caller contract.
+        let heap_ptr = unsafe { data_base.sub(HEADER_SIZE) };
+        let heap_region = unsafe { &*heap_ptr.cast::<HeapAllocationHeader>() };
+        heap_region.ref_count.fetch_add(1, Ordering::Release);
+
+        let mut prefix = [0u8; PREFIX_SIZE];
+        #[expect(clippy::indexing_slicing, reason = "len > INLINE_SIZE >= PREFIX_SIZE")]
+        prefix.copy_from_slice(&bytes[..PREFIX_SIZE]);
+
+        Self {
+            trailer: Trailer {
+                long: ManuallyDrop::new(LongRepr {
+                    len,
+                    prefix,
+                    heap: heap_ptr,
+                    original_len: data_len,
+                    offset,
+                }),
+            },
+        }
+    }
+
     unsafe fn data_ptr(&self) -> *const u8 {
         const HEADER_SIZE: usize = core::mem::size_of::<HeapAllocationHeader>();
 

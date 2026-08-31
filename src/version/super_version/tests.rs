@@ -25,6 +25,8 @@ fn test_super_versions(versions: Vec<SuperVersion>) -> SuperVersions {
         sync_mode: SyncMode::Normal,
         snapshot_id: 0,
         log_rotate_bytes: 1024 * 1024,
+        log_bytes: None,
+        edit_scratch: Vec::new(),
         #[cfg(feature = "std")]
         latest,
     }
