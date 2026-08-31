@@ -22,13 +22,16 @@ const TAG_ROW: u8 = 3;
 #[derive(Clone)]
 enum Item {
     Block(Block),
-    /// A separated value, carrying the user key it belongs to. The cache key is
-    /// the blob file id plus the offset, which identifies a POSITION, not a
-    /// record: a corrupt index entry can point two different keys at the same
-    /// position. The direct read catches that (the reader compares the key it
-    /// was asked for against the one stored in the record), so the cached path
-    /// keeps the key and compares it too, rather than trusting the position.
-    Blob(crate::UserKey, UserValue),
+    /// A separated value, carrying everything about the handle that the cache
+    /// key does not: the user key it belongs to and the record's on-disk size.
+    ///
+    /// The cache key is the blob file id plus the offset, which identifies a
+    /// POSITION, not a record. A corrupt index entry can name that position
+    /// with a different key, or with the right key and the wrong size. A direct
+    /// read rejects both (the reader compares the key it was asked for AND the
+    /// declared size against the record header), so the cached path keeps the
+    /// same two fields and compares them, rather than trusting the position.
+    Blob(crate::UserKey, u32, UserValue),
     /// A resolved point-read result for one user key in one (immutable) SST: the
     /// newest version found there. The full key is carried in `key.user_key` so a
     /// hash collision on the cache key is caught (verified on lookup) rather than
@@ -85,7 +88,9 @@ impl Weighter<CacheKey, Item> for BlockWeighter {
                 (Header::header_len(b.header.block_type) as u64)
                     + u64::from(b.header.uncompressed_length)
             }
-            Blob(key, b) => (key.len() + b.len()) as u64,
+            // Key + value; the size field is an inline scalar. The prefetch's
+            // admission budget charges itself the same way, so the two agree.
+            Blob(key, _, b) => (key.len() + b.len()) as u64,
             // Key bytes + value bytes + a fixed term for the InternalKey scalars
             // (seqno + value_type) and the entry's own bookkeeping.
             Item::Row(iv) => iv.key.user_key.len() as u64 + iv.value.len() as u64 + 16,
@@ -348,8 +353,10 @@ impl Cache {
         );
     }
 
-    /// Caches a separated value under its position, together with `user_key` so
-    /// a lookup can prove the entry belongs to the key it is asked about.
+    /// Caches a separated value under its position, together with the two
+    /// fields the position does not carry (`user_key` and the handle's declared
+    /// on-disk size) so a lookup can prove the entry belongs to the handle it
+    /// is asked about.
     #[doc(hidden)]
     pub fn insert_blob(
         &self,
@@ -360,7 +367,7 @@ impl Cache {
     ) {
         self.data.insert(
             (TAG_BLOB, vlog_id, vhandle.blob_file_id, vhandle.offset).into(),
-            Item::Blob(user_key.into(), value),
+            Item::Blob(user_key.into(), vhandle.on_disk_size, value),
         );
     }
 
@@ -381,15 +388,16 @@ impl Cache {
         self.data.contains(&key)
     }
 
-    /// The cached value for `vhandle`, but only if it belongs to `user_key`.
+    /// The cached value for `vhandle`, but only if it belongs to that exact
+    /// handle: same `user_key` and same declared on-disk size.
     ///
     /// The cache key is a POSITION in a blob file, and a corrupt index entry
-    /// can point a second key at a position that already holds another key's
-    /// value. The reader catches that on a direct read by comparing the key it
-    /// was asked for against the one in the record; this comparison is how the
-    /// cached path reaches the same verdict instead of serving whatever sits at
-    /// the offset. A mismatch reads as a miss, so the caller does the real read
-    /// and gets the real error.
+    /// can name that position with a different key, or with the right key and
+    /// the wrong size. The reader rejects both on a direct read, comparing what
+    /// it was asked for against the record header; these comparisons are how
+    /// the cached path reaches the same verdict instead of serving whatever
+    /// sits at the offset. A mismatch reads as a miss, so the caller does the
+    /// real read and gets the real error.
     #[doc(hidden)]
     #[must_use]
     pub fn get_blob(
@@ -401,7 +409,11 @@ impl Cache {
         let key: CacheKey = (TAG_BLOB, vlog_id, vhandle.blob_file_id, vhandle.offset).into();
 
         match self.data.get(&key)? {
-            Item::Blob(cached_key, blob) if &*cached_key == user_key => Some(blob),
+            Item::Blob(cached_key, cached_size, blob)
+                if &*cached_key == user_key && cached_size == vhandle.on_disk_size =>
+            {
+                Some(blob)
+            }
             Item::Blob(..) => None,
             Item::Block(_) | Item::Row(_) => unreachable!("invalid cache item"),
             #[cfg(feature = "zstd")]

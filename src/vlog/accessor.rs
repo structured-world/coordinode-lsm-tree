@@ -135,7 +135,10 @@ impl<'a> Accessor<'a> {
             let Ok(record) = crate::vlog::blob_file::reader::record_len(key.len(), vhandle) else {
                 return false;
             };
-            read_bytes = read_bytes.saturating_add(record as u64);
+            // Plain add: a window holds at most `u16::MAX` records and
+            // `record_len` caps each at the 256 MiB value limit plus its
+            // header, so the running total cannot approach `u64::MAX`.
+            read_bytes += record as u64;
             *len = record;
             true
         });
@@ -173,21 +176,33 @@ impl<'a> Accessor<'a> {
             // reading through the gap, and the whole span still fits one read.
             //
             // Offsets come from a `BlobIndirection` decoded out of an SST value,
-            // so they are on-disk data and not to be trusted to be sane:
-            // `record_len` bounds a record's length but nothing bounds where it
-            // claims to start. Saturating adds keep a rotted offset near
-            // `u64::MAX` from wrapping `span_end` below `span_start`, which
-            // would turn the span length into an enormous read request.
+            // so they are on-disk data: `record_len` bounds a record's length,
+            // but nothing bounds where it claims to start. An end that does not
+            // fit a `u64` is a handle no writer produced, so it is rejected
+            // rather than clamped. Clamping would be worse than wrong here: a
+            // saturated `span_end + max_gap` compares as "nothing is too far
+            // away", which merges the span across a gap of any size.
             let mut end = start + 1;
-            let mut span_end = first.offset.saturating_add(first_len as u64);
+            let Some(mut span_end) = first.offset.checked_add(first_len as u64) else {
+                start += 1;
+                continue;
+            };
             while end < items.len() {
                 #[expect(clippy::indexing_slicing, reason = "end < items.len() by the loop")]
                 let (_, next, next_len) = items[end];
-                if next.blob_file_id != file_id || next.offset > span_end.saturating_add(max_gap) {
+                let within_gap = span_end
+                    .checked_add(max_gap)
+                    .is_some_and(|reach| next.offset <= reach);
+                if next.blob_file_id != file_id || !within_gap {
                     break;
                 }
-                let next_end = next.offset.saturating_add(next_len as u64);
-                if next_end.saturating_sub(first.offset) > max_read as u64 {
+                let Some(next_end) = next.offset.checked_add(next_len as u64) else {
+                    break;
+                };
+                // `items` is sorted by offset, so `next.offset >= first.offset`
+                // and this end is at or past the span's start.
+                debug_assert!(next_end >= first.offset);
+                if next_end - first.offset > max_read as u64 {
                     break;
                 }
                 span_end = span_end.max(next_end);
@@ -241,7 +256,11 @@ impl<'a> Accessor<'a> {
             return;
         };
 
-        let Ok(span_len) = usize::try_from(span_end.saturating_sub(span_start)) else {
+        // `span_end` was built as the maximum record end in the span, and every
+        // one of those is at or past `span_start` (the span's own first
+        // offset, in a slice sorted by offset), so the span is never negative.
+        debug_assert!(span_end >= span_start);
+        let Ok(span_len) = usize::try_from(span_end - span_start) else {
             return;
         };
         let Ok(span) = crate::file::read_exact(file.as_ref(), span_start, span_len) else {
@@ -269,9 +288,10 @@ impl<'a> Accessor<'a> {
             if *admit_budget == 0 {
                 return;
             }
-            // Offsets came from the span walk above, so these are in range;
-            // guard anyway rather than index, since a handle is on-disk data.
-            let Ok(rel) = usize::try_from(vhandle.offset.saturating_sub(span_start)) else {
+            // Every record in the span is at or past its start: the slice is
+            // sorted by offset and `span_start` is its first one.
+            debug_assert!(vhandle.offset >= span_start);
+            let Ok(rel) = usize::try_from(vhandle.offset - span_start) else {
                 continue;
             };
             let Some(record_end) = rel.checked_add(len) else {
@@ -287,12 +307,20 @@ impl<'a> Accessor<'a> {
                 span.slice(rel..record_end)
             };
             if let Ok(value) = reader.parse_record(key, &vhandle, &record) {
-                // Charged against the DECODED length, which is what the cache
-                // weighs. Budgeting on the on-disk length instead would let a
-                // compressed blob file admit several times the cache's
-                // capacity from one window, evicting everything else to hold
-                // values the scan has not reached yet.
-                *admit_budget = admit_budget.saturating_sub(value.len() as u64);
+                // Checked BEFORE inserting, against the full weight the cache
+                // charges (key as well as value), and against the DECODED
+                // length rather than the on-disk one: a compressed blob file
+                // stores less than the cache accounts for, so budgeting on
+                // what was read would admit several times the capacity from
+                // one window and evict everything else to hold values the scan
+                // has not reached yet. Deducting after the fact would let the
+                // last value of a window exceed the bound by its own size.
+                let weight = (key.len() + value.len()) as u64;
+                if weight > *admit_budget {
+                    *admit_budget = 0;
+                    return;
+                }
+                *admit_budget -= weight;
                 cache.insert_blob(tree_id, &vhandle, key, value);
             }
         }

@@ -50,3 +50,39 @@ fn a_blob_lookup_under_a_conflicting_key_misses_rather_than_serving_the_other_va
         "a conflicting key must not be served the value at that offset",
     );
 }
+
+/// The key is not the only thing a direct read checks: `Reader::parse_record`
+/// also rejects a handle whose declared `on_disk_size` disagrees with the size
+/// in the record header. A corrupt handle can name the right key at the right
+/// offset and still be wrong about the size, so the cached path has to compare
+/// that too or it serves a value the reader would have refused.
+#[test]
+fn a_blob_lookup_with_a_conflicting_size_misses_rather_than_serving_the_value() {
+    use crate::vlog::ValueHandle;
+
+    let cache = Cache::with_capacity_bytes(1024 * 1024);
+    let stored = ValueHandle {
+        blob_file_id: 7,
+        offset: 4096,
+        on_disk_size: 5,
+    };
+
+    cache.insert_blob(0, &stored, b"key", crate::UserValue::from(&b"value"[..]));
+
+    assert_eq!(
+        cache.get_blob(0, &stored, b"key").as_deref(),
+        Some(&b"value"[..]),
+        "the handle it was stored under must still hit",
+    );
+
+    // Same file, same offset, same key, different declared size: the reader
+    // would reject this handle, so the cache must not answer for it.
+    let conflicting = ValueHandle {
+        on_disk_size: 9,
+        ..stored
+    };
+    assert!(
+        cache.get_blob(0, &conflicting, b"key").is_none(),
+        "a handle declaring a different size must not be served the cached value",
+    );
+}
