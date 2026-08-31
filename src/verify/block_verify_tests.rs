@@ -2145,7 +2145,7 @@ fn codec_confirms_region_keeps_scanning_past_a_mismatch() -> crate::Result<()> {
 /// and the operator recompacts a table whose descriptor is right.
 #[cfg(feature = "page_ecc")]
 #[test]
-fn codec_confirms_region_reports_no_evidence_when_the_scan_stops_early() -> crate::Result<()> {
+fn codec_confirms_region_scan_stops_early_reports_incomplete() -> crate::Result<()> {
     use crate::coding::Decode;
     use crate::fs::{Fs, FsOpenOptions, StdFs};
     use crate::table::block::{EccParams, Header};
@@ -2210,6 +2210,60 @@ fn codec_confirms_region_reports_no_evidence_when_the_scan_stops_early() -> crat
     assert!(
         !codec_disagrees_everywhere(probe.as_ref(), toc, ScrubEcc::Scheme(impostor), 0, cap),
         "and no diagnosis is reported off a truncated probe",
+    );
+    Ok(())
+}
+
+/// An EMPTY region was not cut short — there was nothing to cut. Reporting it
+/// as unfinished would let one zero-length section silence the diagnosis for
+/// the whole table, and such a section is not exotic: a restricted view whose
+/// punch offset reaches the end of the data section produces exactly that.
+#[cfg(feature = "page_ecc")]
+#[test]
+fn codec_confirms_region_empty_region_reports_no_evidence() -> crate::Result<()> {
+    use crate::fs::{Fs, FsOpenOptions, StdFs};
+    use crate::table::block::EccParams;
+
+    const LEN: u32 = 4096;
+    let real = EccParams::RS_4_2;
+
+    // `data` rejects: clean payload, rotted trailer.
+    let payload = discriminating_payload(LEN);
+    let mut rotted = crate::ecc::encode_parity(&payload, 4, 2).expect("RS(4,2) encodes");
+    *rotted.first_mut().expect("the trailer is non-empty") ^= 0xFF;
+
+    let dir = tempfile::tempdir()?;
+    let path = dir.path().join("empty-region.sst");
+    write_block_archive(
+        &path,
+        &[("data", vec![(payload, rotted)]), ("filter", Vec::new())],
+    )?;
+
+    let mut probe = StdFs.open(&path, &FsOpenOptions::new().read(true))?;
+    let sfa_reader = crate::sfa::Reader::from_reader(&mut probe)?;
+    let toc = sfa_reader.toc();
+    let cap = block_data_length_cap(0);
+
+    let filter = toc
+        .section(b"filter")
+        .expect("the fixture has a filter section");
+    assert_eq!(filter.len(), 0, "the fixture's filter section is empty");
+    assert_eq!(
+        codec_confirms_region(
+            probe.as_ref(),
+            ScrubEcc::Scheme(real),
+            filter.pos(),
+            filter.pos() + filter.len(),
+            cap,
+        ),
+        CodecVerdict::NoEvidence,
+        "an empty region holds nothing to judge, which is not the same as a \
+         traversal that stopped",
+    );
+    assert!(
+        codec_disagrees_everywhere(probe.as_ref(), toc, ScrubEcc::Scheme(real), 0, cap),
+        "so it leaves the answer to the regions that do hold blocks, instead of \
+         silencing the whole table",
     );
     Ok(())
 }

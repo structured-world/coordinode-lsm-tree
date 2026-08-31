@@ -1484,7 +1484,13 @@ fn codec_confirms_region(
         // trailer this scheme reproduces may be among them. The negative answer
         // is a claim about the whole region, so it is only available when the
         // traversal reached the end.
-        let mut complete = false;
+        //
+        // Seeded from the bounds rather than `false`: an EMPTY region was not
+        // cut short, there was nothing to cut. Calling it unfinished would let
+        // one zero-length section silence the diagnosis for the whole table,
+        // and a restricted view whose punch offset reaches the end of the data
+        // section produces exactly that.
+        let mut complete = offset >= end;
         while offset < end {
             let remaining = end - offset;
             let want =
