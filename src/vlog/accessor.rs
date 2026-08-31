@@ -119,16 +119,23 @@ impl<'a> Accessor<'a> {
         // letting it anchor a span would widen the read for no gain. The record
         // length is computed once here and carried, so the span walk below and
         // the parse both use the one definition without recomputing it.
+        //
+        // This caps the READ, in on-disk bytes. It is not the admission budget:
+        // a compressed blob file stores less than the cache will charge for the
+        // decoded value, so a highly compressible window would pass a check made
+        // here and still admit many times the cache's capacity. The admission
+        // budget is enforced in `warm_span`, against the weight the cache
+        // actually sees.
         let half = capacity / 2;
-        let mut kept_bytes: u64 = 0;
+        let mut read_bytes: u64 = 0;
         items.retain_mut(|(key, vhandle, len)| {
-            if kept_bytes >= half || cache.contains_blob(tree_id, vhandle) {
+            if read_bytes >= half || cache.contains_blob(tree_id, vhandle) {
                 return false;
             }
             let Ok(record) = crate::vlog::blob_file::reader::record_len(key.len(), vhandle) else {
                 return false;
             };
-            kept_bytes += record as u64;
+            read_bytes = read_bytes.saturating_add(record as u64);
             *len = record;
             true
         });
@@ -152,23 +159,34 @@ impl<'a> Accessor<'a> {
             items.sort_unstable_by_key(key);
         }
 
+        // What this prefetch may still admit, in the weight the cache charges.
+        // Spans stop being warmed once it runs out.
+        let mut admit_budget = half;
+
         let mut start = 0;
-        while start < items.len() {
+        while start < items.len() && admit_budget > 0 {
             #[expect(clippy::indexing_slicing, reason = "start < items.len() by the loop")]
             let (_, first, first_len) = items[start];
             let file_id = first.blob_file_id;
 
             // Extend the span while the next record is close enough to be worth
             // reading through the gap, and the whole span still fits one read.
+            //
+            // Offsets come from a `BlobIndirection` decoded out of an SST value,
+            // so they are on-disk data and not to be trusted to be sane:
+            // `record_len` bounds a record's length but nothing bounds where it
+            // claims to start. Saturating adds keep a rotted offset near
+            // `u64::MAX` from wrapping `span_end` below `span_start`, which
+            // would turn the span length into an enormous read request.
             let mut end = start + 1;
-            let mut span_end = first.offset + first_len as u64;
+            let mut span_end = first.offset.saturating_add(first_len as u64);
             while end < items.len() {
                 #[expect(clippy::indexing_slicing, reason = "end < items.len() by the loop")]
                 let (_, next, next_len) = items[end];
-                if next.blob_file_id != file_id || next.offset > span_end + max_gap {
+                if next.blob_file_id != file_id || next.offset > span_end.saturating_add(max_gap) {
                     break;
                 }
-                let next_end = next.offset + next_len as u64;
+                let next_end = next.offset.saturating_add(next_len as u64);
                 if next_end.saturating_sub(first.offset) > max_read as u64 {
                     break;
                 }
@@ -179,7 +197,14 @@ impl<'a> Accessor<'a> {
             if end - start >= 2
                 && let Some(span) = items.get(start..end)
             {
-                self.warm_span(tree_id, span, first.offset, span_end, cache);
+                self.warm_span(
+                    tree_id,
+                    span,
+                    first.offset,
+                    span_end,
+                    cache,
+                    &mut admit_budget,
+                );
             }
             start = end;
         }
@@ -188,6 +213,10 @@ impl<'a> Accessor<'a> {
     /// Reads one coalesced span and parses every record it covers into the
     /// cache. Any failure returns early: those values stay cold and the read
     /// walk fetches them normally.
+    ///
+    /// `admit_budget` is how many bytes of cache weight this prefetch may still
+    /// hand over, decremented by what each value actually weighs, and stopping
+    /// the walk when it runs out.
     fn warm_span(
         &self,
         tree_id: TreeId,
@@ -195,6 +224,7 @@ impl<'a> Accessor<'a> {
         span_start: u64,
         span_end: u64,
         cache: &Cache,
+        admit_budget: &mut u64,
     ) {
         let Some((_, first, _)) = records.first() else {
             return;
@@ -211,7 +241,7 @@ impl<'a> Accessor<'a> {
             return;
         };
 
-        let Ok(span_len) = usize::try_from(span_end - span_start) else {
+        let Ok(span_len) = usize::try_from(span_end.saturating_sub(span_start)) else {
             return;
         };
         let Ok(span) = crate::file::read_exact(file.as_ref(), span_start, span_len) else {
@@ -236,9 +266,12 @@ impl<'a> Accessor<'a> {
         let aliases_input = matches!(blob_file.0.meta.compression, crate::CompressionType::None);
 
         for &(key, vhandle, len) in records {
+            if *admit_budget == 0 {
+                return;
+            }
             // Offsets came from the span walk above, so these are in range;
             // guard anyway rather than index, since a handle is on-disk data.
-            let Ok(rel) = usize::try_from(vhandle.offset - span_start) else {
+            let Ok(rel) = usize::try_from(vhandle.offset.saturating_sub(span_start)) else {
                 continue;
             };
             let Some(record_end) = rel.checked_add(len) else {
@@ -254,6 +287,12 @@ impl<'a> Accessor<'a> {
                 span.slice(rel..record_end)
             };
             if let Ok(value) = reader.parse_record(key, &vhandle, &record) {
+                // Charged against the DECODED length, which is what the cache
+                // weighs. Budgeting on the on-disk length instead would let a
+                // compressed blob file admit several times the cache's
+                // capacity from one window, evicting everything else to hold
+                // values the scan has not reached yet.
+                *admit_budget = admit_budget.saturating_sub(value.len() as u64);
                 cache.insert_blob(tree_id, &vhandle, value);
             }
         }

@@ -3387,8 +3387,8 @@ impl Tree {
 
         // One buffer per cold block, in (table, block) order.
         //
-        // Left uninitialized on purpose: `read_blocks_batched` fills every
-        // buffer completely or reports an error, and the error path below
+        // SAFETY: left uninitialized on purpose. `read_blocks_batched` fills
+        // every buffer completely or reports an error, and the error path below
         // returns WITHOUT decoding, so no byte is ever read before it is
         // written. Zeroing them first would memset exactly the bytes the read
         // is about to overwrite, once per cold block. Same contract, and the
