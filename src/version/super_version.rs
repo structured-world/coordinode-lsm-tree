@@ -58,7 +58,7 @@ pub struct SuperVersion {
 /// mirror's writers, so iterators keep cloning; this type serves the point
 /// lookups. The mirror needs `arc-swap`, so under no-std only `Owned` exists
 /// and every read clones, as before.
-pub(crate) enum SnapshotRef {
+pub enum SnapshotRef {
     /// The latest installed snapshot, pinned by the mirror's load guard.
     #[cfg(feature = "std")]
     Latest(arc_swap::Guard<Arc<SuperVersion>>),

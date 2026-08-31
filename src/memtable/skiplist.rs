@@ -654,8 +654,24 @@ impl SkipMap {
         unsafe { self.arena.get_bytes(off, len) }
     }
 
-    /// Reconstructs the [`InternalKey`] for `node` (allocates a new `Slice`).
+    /// Reconstructs the [`InternalKey`] for `node`.
+    ///
+    /// Zero-copy on the default `Slice` backend: the user key is a refcounted
+    /// view into the arena block that stores it (inline for short keys), so no
+    /// allocation or byte copy happens per reconstructed key. The `bytes`
+    /// backend cannot view foreign allocations and copies, as before.
     fn node_internal_key(&self, node: u32) -> InternalKey {
+        #[cfg(not(feature = "bytes_1"))]
+        // SAFETY: key_offset/key_len were written during alloc_node and the
+        // node is only reachable after its publishing CAS (happens-before);
+        // published key bytes are never rewritten.
+        let user_key: UserKey = UserKey::from_view(unsafe {
+            self.arena.get_view(
+                self.node_key_offset(node),
+                u32::from(self.node_key_len(node)),
+            )
+        });
+        #[cfg(feature = "bytes_1")]
         let user_key: UserKey = self.node_user_key_bytes(node).into();
         let seqno = self.node_seqno(node);
         let vt = self.node_value_type(node);

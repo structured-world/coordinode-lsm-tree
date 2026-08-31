@@ -3698,16 +3698,16 @@ impl Tree {
     /// The snapshot for one point read, without a clone when it is the latest.
     ///
     /// Lock-free fast path: when reading at or beyond the latest installed
-    /// version (always the case for MAX_SEQNO, and the common case), the
-    /// mirrored latest SuperVersion is exactly what `get_version_for_snapshot`
+    /// version (always the case for `MAX_SEQNO`, and the common case), the
+    /// mirrored latest [`SuperVersion`] is exactly what `get_version_for_snapshot`
     /// would return (it yields the latest iff `latest.seqno < seqno`), so
-    /// load it without taking the history RwLock or cloning a deque entry.
+    /// load it without taking the history `RwLock` or cloning a deque entry.
     /// Recent inserts stay visible because they mutate the shared
     /// `active_memtable` behind a stable Arc; the back only changes on
     /// flush / compaction, which refresh this mirror under the write lock.
     ///
     /// Historical snapshot reads (seqno <= latest.seqno) consult the locked
-    /// version history for the correct point-in-time SuperVersion.
+    /// version history for the correct point-in-time [`SuperVersion`].
     ///
     /// Point reads only: a guard held across a long scan would delay the
     /// mirror's writers, so iterators keep their own clones. no-std has no

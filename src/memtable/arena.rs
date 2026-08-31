@@ -175,6 +175,41 @@ impl Arena {
         unsafe { core::slice::from_raw_parts(ptr.add(off), len as usize) }
     }
 
+    /// Returns a zero-copy [`ByteView`](crate::byteview::ByteView) of `len`
+    /// bytes at the encoded `offset`.
+    ///
+    /// Short spans are inlined; longer spans share the backing block's
+    /// refcount, so no bytes are copied and nothing allocates. The view keeps
+    /// the block alive even after the arena drops.
+    ///
+    /// # Safety
+    ///
+    /// Same contract as [`get_bytes`](Self::get_bytes): the range must have
+    /// been allocated and fully initialised, with happens-before established,
+    /// and its bytes must never be written again.
+    ///
+    /// The `bytes` slice backend cannot wrap a foreign view, so this only
+    /// compiles for the default backend.
+    #[cfg(not(feature = "bytes_1"))]
+    pub unsafe fn get_view(&self, offset: u32, len: u32) -> crate::byteview::ByteView {
+        let (ptr, off) = unsafe { self.decode(offset) };
+        debug_assert!(
+            off + len as usize <= BLOCK_SIZE as usize,
+            "get_view: off={off} + len={len} exceeds BLOCK_SIZE={BLOCK_SIZE} (offset={offset})",
+        );
+        // `off` fits u32: it is masked to BLOCK_SHIFT bits by decode.
+        #[expect(
+            clippy::cast_possible_truncation,
+            reason = "off < BLOCK_SIZE <= u32::MAX"
+        )]
+        // SAFETY: `ptr` is the data base of a live shared heap region (the
+        // arena holds a reference for its whole lifetime); the caller
+        // guarantees the span is allocated, initialised and immutable.
+        unsafe {
+            crate::byteview::ByteView::view_of_shared(ptr, off as u32, len, BLOCK_SIZE)
+        }
+    }
+
     /// Returns an exclusive reference to `len` bytes at the encoded `offset`.
     ///
     /// # Safety
@@ -259,45 +294,37 @@ impl Arena {
     )]
     fn ensure_block(&self, idx: usize) {
         if self.blocks[idx].load(Ordering::Acquire).is_null() {
-            // Allocate with explicit 4-byte alignment so that AtomicU32
-            // accesses within the block are correctly aligned on all targets.
-            let layout = Self::block_layout();
-
-            // Blocks are NOT zeroed (`alloc`, not `alloc_zeroed`): like
-            // RocksDB's arena (`new char[]`, deliberately uninitialized), the
-            // skiplist fully initializes every node — header, key/value fields,
-            // and all `[0, height)` tower slots — BEFORE the node is published
-            // (linked via a release CAS), and the head sentinel's tower is
-            // explicitly UNSET-initialized at creation. No reader ever observes
-            // an unwritten byte, so eager zeroing is pure waste (the 64 MiB
-            // bzero-per-flush this used to pay). Lazy page-faulting still
-            // zero-fills only the pages actually touched, at the OS level.
-            // SAFETY: layout is non-zero (BLOCK_SIZE > 0). Visibility: the CAS
-            // below (AcqRel) makes the block pointer (and the writes the caller
-            // makes into it before publishing a node) visible to readers.
-            let raw = unsafe { alloc::alloc::alloc(layout) };
-            if raw.is_null() {
-                alloc::alloc::handle_alloc_error(layout);
-            }
+            // Each block is a byteview shared-heap region (refcount header +
+            // BLOCK_SIZE data bytes, 8-byte aligned — more than the 4 bytes
+            // AtomicU32 tower pointers need). The stored pointer is the DATA
+            // base, so every offset computation below is unchanged; the
+            // header is what lets `get_view` hand out zero-copy ByteViews
+            // over node keys and values, each holding its own reference so
+            // the block outlives the arena if a view does.
+            //
+            // Blocks are NOT zeroed: like RocksDB's arena (`new char[]`,
+            // deliberately uninitialized), the skiplist fully initializes
+            // every node — header, key/value fields, and all `[0, height)`
+            // tower slots — BEFORE the node is published (linked via a
+            // release CAS), and the head sentinel's tower is explicitly
+            // UNSET-initialized at creation. No reader ever observes an
+            // unwritten byte, so eager zeroing is pure waste. Lazy
+            // page-faulting still zero-fills only the pages actually
+            // touched, at the OS level.
+            let raw = crate::byteview::ByteView::alloc_shared_heap(BLOCK_SIZE);
 
             // CAS null → raw.  If another thread won, free our block.
             if self.blocks[idx]
                 .compare_exchange(ptr::null_mut(), raw, Ordering::AcqRel, Ordering::Acquire)
                 .is_err()
             {
-                // SAFETY: raw was just allocated with `layout`.
+                // SAFETY: raw was just allocated as a BLOCK_SIZE shared heap
+                // region and holds only our own reference.
                 unsafe {
-                    alloc::alloc::dealloc(raw, layout);
+                    crate::byteview::ByteView::shared_heap_release(raw, BLOCK_SIZE);
                 }
             }
         }
-    }
-
-    /// Layout for arena blocks: `BLOCK_SIZE` bytes with 4-byte alignment
-    /// (required for `AtomicU32` tower pointers).
-    fn block_layout() -> alloc::alloc::Layout {
-        // SAFETY: BLOCK_SIZE > 0 and align (4) is a power of two.
-        unsafe { alloc::alloc::Layout::from_size_align_unchecked(BLOCK_SIZE as usize, 4) }
     }
 }
 
@@ -309,14 +336,16 @@ impl Default for Arena {
 
 impl Drop for Arena {
     fn drop(&mut self) {
-        let layout = Self::block_layout();
         for block in &*self.blocks {
             let ptr = block.load(Ordering::Relaxed);
             if !ptr.is_null() {
-                // SAFETY: `ptr` was allocated for this arena using `block_layout()`,
-                // so deallocating with the same layout is valid.
+                // SAFETY: `ptr` is the data base of a BLOCK_SIZE shared heap
+                // region allocated by ensure_block; this releases the arena's
+                // own reference. Outstanding views (ByteViews handed out by
+                // get_view) each hold their own reference, so the block stays
+                // alive until the last of them drops.
                 unsafe {
-                    alloc::alloc::dealloc(ptr, layout);
+                    crate::byteview::ByteView::shared_heap_release(ptr, BLOCK_SIZE);
                 }
             }
         }
