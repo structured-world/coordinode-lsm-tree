@@ -134,10 +134,64 @@ fn bench_try_recover_all_subsets_fail(c: &mut Criterion) {
     group.finish();
 }
 
+fn bench_clean_read(c: &mut Criterion) {
+    // The path EVERY ECC-protected block read takes: frame in, checksum
+    // matches, payload served. This is where the verify must be
+    // allocation-free — recovery (benched above) runs only on a mismatch.
+    use lsm_tree::fs::{Fs, FsOpenOptions, MemFs};
+    use lsm_tree::table::BlockHandle;
+    use lsm_tree::table::block::{
+        Block, BlockIdentity, BlockOffset, BlockTransform, BlockType, EccParams,
+    };
+
+    let mut group = c.benchmark_group("ecc/clean_read");
+    let schemes: &[(&str, EccParams)] =
+        &[("secded", EccParams::SECDED), ("rs_4_2", EccParams::RS_4_2)];
+    for &(label, params) in schemes {
+        for &size in SIZES {
+            let payload = deterministic_payload(size);
+            let transform = BlockTransform::PLAIN.with_ecc(params);
+            let identity = BlockIdentity {
+                table_id: 0,
+                block_type: BlockType::Data,
+                dict_id: 0,
+                window_log: 0,
+            };
+
+            let fs = MemFs::new();
+            let path = format!("/bench-{label}-{size}");
+            let mut file = fs
+                .open(
+                    std::path::Path::new(&path),
+                    &FsOpenOptions::new().write(true).create(true).read(true),
+                )
+                .expect("open mem file");
+            let header =
+                Block::write_into(&mut file, &payload, identity, &transform).expect("write block");
+            // `on_disk_size_with` sizes the frame under the block's ACTUAL
+            // scheme; the plain `on_disk_size` assumes the legacy RS(4,2)
+            // layout for flagged blocks.
+            let on_disk = header.on_disk_size_with(Some(params));
+            let handle = BlockHandle::new(BlockOffset(0), on_disk);
+
+            group.throughput(Throughput::Bytes(size as u64));
+            group.bench_with_input(BenchmarkId::new(label, size), &handle, |b, &handle| {
+                b.iter(|| {
+                    let block = Block::from_file(&*file, handle, identity, &transform)
+                        .expect("clean read succeeds");
+                    std::hint::black_box(block);
+                });
+            });
+        }
+    }
+    group.finish();
+}
+
 criterion_group!(
     benches,
     bench_encode_parity,
     bench_try_recover_first_subset,
     bench_try_recover_all_subsets_fail,
+    bench_clean_read,
 );
 criterion_main!(benches);
