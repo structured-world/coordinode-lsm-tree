@@ -57,11 +57,18 @@
 /// **V5 is the ONLY supported on-disk format.** The engine neither reads
 /// nor migrates pre-V5 layouts: there are no legacy decode paths, no
 /// upgrade tooling, and no backward-compat variations anywhere in the
-/// codebase. Discriminants 1–4 are reserved history — opening a tree that
-/// carries one fails with [`crate::Error::InvalidVersion`] at the manifest
-/// gate. The same single-format rule applies to every subsidiary format
-/// (blob frames, manifest layout): each has exactly one readable shape,
-/// the one the current writer emits.
+/// codebase. Discriminants 1–4 are reserved history: opening a tree that
+/// carries one always fails, at whichever gate notices first, and which error
+/// comes back depends on which that is. A V1 directory is caught by its
+/// `version` marker file in `Tree::open` before any manifest is read. Later
+/// pre-V5 manifests are usually caught earlier still, by the Blocks manifest
+/// reader: their framing is not the one it decodes, so they fail at the
+/// footer rather than at a version field. This `TryFrom` is the gate for the
+/// remaining shape: a manifest that frames like the current one but declares
+/// a version this engine does not write, which fails with
+/// [`crate::Error::InvalidVersion`]. The same single-format rule
+/// applies to every subsidiary format (blob frames, manifest layout): each has
+/// exactly one readable shape, the one the current writer emits.
 ///
 /// The retired discriminants are reserved as NUMBERS, not as names: this enum
 /// carries no `V1`–`V4` variants. Keeping them as deprecated stubs would add
@@ -70,10 +77,16 @@
 /// layout the engine deliberately cannot read. A caller matching on this enum
 /// should be matching what the writer emits, and that is one shape.
 ///
-/// Adopting a pre-V5 database is a CONVERSION, not a compatibility mode: the
-/// offline migration tool (#580) owns every legacy decoder and rewrites the
-/// tree into V5. Recovery, salvage, patrol scrub and verify stay V5-only by
-/// construction, so no legacy shape is ever reachable from the live engine.
+/// This crate offers no upgrade path and plans none: a pre-V5 database is not
+/// adopted, converted or repaired here — it fails at the format gate above and
+/// stays that way. That is a statement about THIS engine, not about the data:
+/// the store is still readable by the engine that wrote it, which is where a
+/// conversion would have to happen.
+///
+/// What the refusal buys is that recovery, salvage, patrol scrub and verify
+/// have no second layout to reason about: every one of them can assume the
+/// shape the current writer emits, with no branch for a shape it might also
+/// have to accept.
 #[derive(Copy, Clone, Debug, Eq, PartialEq)]
 pub enum FormatVersion {
     /// Two on-disk changes shipped together in this format version

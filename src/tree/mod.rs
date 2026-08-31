@@ -3780,8 +3780,26 @@ impl Tree {
         // Check for old version
         if config.fs.exists(&config.path.join("version"))? {
             log::error!(
-                "It looks like you are trying to open a V1 database - the database needs a manual migration, however a migration tool is not provided, as V1 is extremely outdated."
+                "refusing to open: this directory has a `version` marker file, which only the \
+                 retired V1 layout wrote. V5 is the only on-disk format THIS engine decodes, and \
+                 it ships no conversion tooling. If the directory is a V1 database the data is \
+                 not lost: open it with the engine that wrote it, or convert it there. If the \
+                 file is unrelated to this store, move it aside and retry"
             );
+            // The marker's contents are deliberately not read: no legacy
+            // decode path exists to act on them, so parsing it could only
+            // change the wording of this error. That makes the presence of
+            // the file evidence, not proof, hence "has a marker" rather than
+            // "is a V1 database", and the second escape hatch for a directory
+            // that merely happens to carry the name.
+            //
+            // Scoped to this engine on purpose. The operator reads this line
+            // while deciding what to do with the directory, and "no conversion
+            // path" full stop would read as "unrecoverable" — which is wrong,
+            // and the opposite of what the repair gate documents (an
+            // unsupported version needs offline conversion or a matching
+            // binary; see `is_repairable_open_error`).
+            //
             // Literal discriminant: V1 is a retired format and FormatVersion
             // carries no legacy variants (V5-only contract).
             return Err(crate::Error::InvalidVersion(1));
@@ -4333,8 +4351,9 @@ impl Tree {
 
             // V5 is the only variant `FormatVersion` can decode to (the
             // engine reads exactly one on-disk format, no legacy paths), so
-            // a pre-V5 manifest already failed decode_from with
-            // InvalidVersion. This match stays as the explicit gate the
+            // anything else already failed above: on its framing if the
+            // manifest is not shaped like the current one, on the version
+            // field if it is. This match stays as the explicit gate the
             // format contract documents — and as the compile-time hook that
             // forces a review of the open path when a new variant is added.
             match manifest.version {

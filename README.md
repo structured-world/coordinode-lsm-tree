@@ -9,23 +9,14 @@
 [![dependency status](https://deps.rs/repo/github/structured-world/coordinode-lsm-tree/status.svg)](https://deps.rs/repo/github/structured-world/coordinode-lsm-tree)
 [![License](https://img.shields.io/badge/license-Apache--2.0-blue)](#license)
 
-LSM-tree storage engine in Rust. Embedded library; provides keyed point reads, prefix and range scans, MVCC snapshots, compaction, and a block cache. No write-ahead log: durability is the caller's responsibility. Built for [CoordiNode](https://github.com/structured-world/coordinode); usable standalone.
+Embedded LSM-tree storage engine in **pure Rust**: no C or C++ dependency, no build toolchain beyond cargo, and `no_std`-capable down to bare metal. Point reads, prefix and range scans, MVCC snapshots, compaction and a block cache, plus what its peers leave to you: encryption at rest, per-block ECC that repairs bit-rot on read, columnar blocks, change-data-capture that survives compaction, and compaction that still completes on a near-full disk (opt-in, Linux).
 
-## Status
-
-On-disk format version **V5** — the ONLY supported format. The engine carries no legacy decode paths, no backward-compat variations, and no in-place upgrade: a pre-V5 database fails to open with `InvalidVersion`. Versioning is single-monotonic: every breaking format change bumps to the next version with explicit migration notes. Conversion of pre-V5 databases is planned as standalone migration tooling, kept strictly outside the live engine.
+No write-ahead log: durability is the caller's responsibility. Built for [CoordiNode](https://github.com/structured-world/coordinode); usable standalone.
 
 ## Quick start
 
 ```sh
-cargo add coordinode-lsm-tree@5.7
-```
-
-or add it to `Cargo.toml` directly:
-
-```toml
-[dependencies]
-coordinode-lsm-tree = "5.7"
+cargo add coordinode-lsm-tree
 ```
 
 ```rust
@@ -75,6 +66,7 @@ tree.flush_active_memtable(0)?;
 - Major compaction (full force flush + merge).
 - Optional compaction filters for custom logic during compactions.
 - Merge-aware compaction resolves operands lazily.
+- Optional **tight-space compaction**: a merge that cannot fit the usual transient headroom is rewritten one key-range slice at a time, reclaiming each consumed input in place by punching holes, so it completes on a disk far smaller than the data it rewrites — where the space-admission gate would otherwise skip the merge and leave the disk full. Opt-in, Linux filesystems with `fallocate(PUNCH_HOLE)`; see [docs/tight-space-compaction.md](docs/tight-space-compaction.md).
 
 ### Storage & encoding
 
@@ -111,7 +103,7 @@ tree.flush_active_memtable(0)?;
 
 - 100% stable Rust, MSRV 1.92.
 - `no_std` + `alloc` support: the core engine (read / write / compaction / recovery over the injected `Fs`) compiles without `std`; std-only conveniences (threaded fan-out, system clock, the std filesystem backend) stay behind the `std` feature.
-- No FFI: zstd via [`structured-zstd`](https://github.com/structured-world/structured-zstd) (pure-Rust), LZ4 via `lz4_flex`, AES via `aes-gcm`.
+- No C or C++ dependency: zstd via [`structured-zstd`](https://github.com/structured-world/structured-zstd) (pure-Rust), LZ4 via `lz4_flex`, AES via `aes-gcm`. Nothing to build with `cc`, nothing to bind with `bindgen`.
 - Pluggable `Fs` trait: back the engine on the standard filesystem, on `io_uring`, on an in-memory `MemFs`, or on a custom implementation.
 - Pluggable `CompressionProvider` for third-party codecs.
 
@@ -130,12 +122,13 @@ workload needs; for throughput / latency see [Benchmarks](#benchmarks).
 | Per-block ECC + self-heal | ✅ | no | no | no |
 | Columnar (PAX) blocks | ✅ | no | no | no |
 | CDC surviving compaction | ✅ (data-block grain) | WAL tail only | no | no |
+| Compaction on a near-full disk | ✅ opt-in (slice-wise hole-punch reclaim, Linux) | no (needs full headroom) | no | n/a (no compaction) |
 | Built-in durability / WAL | external (caller-owned) | ✅ | ✅ | ✅ |
 | Pluggable FS / `io_uring` | ✅ | no | no | no |
 
 RocksDB is the closest peer in data model and feature breadth, but it is a C++
 library reached over FFI; this engine targets the same LSM capabilities in pure
-Rust: no C/C++ toolchain, `no_std`-capable, no FFI audit surface. sled and redb
+Rust: no C or C++ dependency, no build toolchain, `no_std`-capable. sled and redb
 are pure-Rust but different shapes: sled is log-structured and pre-1.0; redb is a
 read-optimised B+tree. [Fjall](https://github.com/fjall-rs/fjall) is a
 higher-level key-value store built on `fjall-rs/lsm-tree`, the engine this crate
@@ -148,8 +141,8 @@ Reach for this engine when you want:
 
 - a **write-optimised** embedded store (LSM beats a B+tree on write-heavy and
   ingest workloads);
-- **pure Rust, no C/C++ toolchain** (cross-compilation, `no_std` targets,
-  reproducible builds, no FFI to audit);
+- **pure Rust, no C or C++ dependency** (cross-compilation, `no_std` targets,
+  reproducible builds, no third-party C inside the trust boundary);
 - **integrity / compliance** built in: checksums end to end, optional encryption
   at rest and per-block ECC with on-read self-healing;
 - **change-data-capture** that survives compaction (`scan_since_seqno`);
@@ -226,9 +219,9 @@ All optional. The default build (`std` + `parallel`) is the minimal core: no com
 
 ## Benchmarks
 
-CI runs [`db_bench`](tools/db_bench) on every push to `main` and on pull requests. Results from `main` are published to the [benchmark dashboard](https://structured-world.github.io/coordinode-lsm-tree/dev/bench/). PRs regressing performance by more than 15% trigger an alert; more than 25% fails CI.
+CI runs [`db_bench`](tools/db_bench) on every push to `main`, and publishes the results to the [benchmark dashboard](https://structured-world.github.io/coordinode-lsm-tree/dev/bench/). A `main` run regressing performance by more than 15% is flagged on the dashboard; any run, dispatched ones included, is flagged in its own comment. The flag is advisory and never fails the job: neither trigger sits on the merge path, so a failure could only redden `main` after a change has landed, or fail a measurement someone asked for voluntarily.
 
-Flamegraphs are generated on every merge to `main` from instrumented `db_bench` runs and published under `flamegraphs/<commit-sha>/flamegraph.svg` on [gh-pages](https://structured-world.github.io/coordinode-lsm-tree/).
+Pull requests are deliberately not auto-benchmarked: the bench host is serialised across the whole repository, so every PR push would queue behind it. Measure a branch on demand with the workflow's manual dispatch instead: those runs do not touch the dashboard's `main` series.
 
 Local Criterion microbenchmarks:
 
@@ -251,7 +244,21 @@ cargo run --release --features flamegraph -- \
 | Tool | Use |
 |------|-----|
 | [`tools/db_bench`](tools/db_bench) | RocksDB-compatible benchmark suite, also drives the CI perf dashboard. |
-| [`tools/sst-dump`](tools/sst-dump) | Inspect / verify a single SST file out-of-band. Subcommands: `verify` (walk every block, check per-block XXH3, exit non-zero on corruption), `properties` (print the SST's stored metadata: id, key range, KV / tombstone counts, block counts, compression, timestamp), `hex <offset>` (raw hex dump of a region with optional `Header` decode; useful for inspecting a specific offset flagged by `verify --verbose`), `index-dump` (print TLI entries: end_key + offset + size + seqno per pointed-at block; useful for diagnosing range-read fan-out), `dump` (stream every KV entry to stdout with optional `--from` / `--to` / `--max=N` / `--keys-only` filters; full-index SSTs only), `filter-stats` (print BuRR filter sizing: section bytes, layer count, item count, approximate bits-per-key; single-block filters only, partitioned filters not yet supported), `salvage <dest>` (block-salvage a corrupt SST into a fresh file at `<dest>`: re-emit every block that passes its checksum, dropping and reporting the corrupt ones, so a single bad block costs only its own key range instead of the whole file). |
+| [`tools/sst-dump`](tools/sst-dump) | Inspect, verify and rescue SSTs out-of-band, without ever opening a `Tree`. The inspection commands read one SST and need no manifest; `repair` is the exception, taking a whole database directory and rebuilding its `MANIFEST`. See its [subcommands](#sst-dump-subcommands) below. |
+
+<a id="sst-dump-subcommands"></a>
+
+| `sst-dump` subcommand | What it does |
+|---|---|
+| `verify` | Walks every block and checks its per-block XXH3; exits non-zero on corruption. `--verbose` reports each finding individually instead of a count plus the first three. |
+| `properties` | Prints the SST's stored metadata: id, key range, KV / tombstone counts, block counts, compression, timestamp. |
+| `index-dump` | Prints the top-level index: `end_key` + offset + size + seqno per pointed-at block. Useful for diagnosing range-read fan-out. |
+| `dump` | Streams every KV entry to stdout, with optional `--from` / `--to` / `--max=N` / `--keys-only`. Full-index SSTs only. |
+| `hex <offset>` | Raw hex dump of a region, with an optional `Header` decode — for inspecting an offset that `verify --verbose` flagged. |
+| `dump-block <offset>` | Decodes one block at `offset` and prints its header and framing. The forensic step past `hex`. Add `--reconstruct-aad --table-id <id>` to also print an encrypted block's AAD (the id is not stored in the file, so it has to be supplied). |
+| `filter-stats` | Prints BuRR filter sizing: section bytes, layer count, item count, approximate bits per key. Single-block filters only; partitioned-filter tables are not covered. |
+| `salvage <dest>` | Block-salvages a corrupt SST into a fresh file: every block that passes its checksum is re-emitted, the corrupt ones are dropped and reported. A bad block costs its own key range instead of the whole file. |
+| `repair` | Rebuilds a missing or corrupt `MANIFEST` from the SSTs on disk (the path argument is the DB **directory**, not one SST). It repairs with the default comparator and no encryption, so a tree written with either has to go through the library `Config::repair` API with its real config instead: reading those SSTs with the wrong config would write a manifest around the tables that happened to decode. `--salvage` additionally block-salvages tables that fail whole-file recovery; committing a replacement renames it onto the original's path, overwriting the damaged bytes, so copy the directory first if they are wanted for forensics. |
 
 ## Data integrity & durability
 
