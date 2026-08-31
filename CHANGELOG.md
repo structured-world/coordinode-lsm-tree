@@ -11,6 +11,17 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 
 ## [Unreleased]
 
+## [5.8.1](https://github.com/structured-world/coordinode-lsm-tree/compare/v5.8.0...v5.8.1) - 2026-08-31
+
+### Documentation
+
+- finalise the README and scope the no-conversion claim ([#596](https://github.com/structured-world/coordinode-lsm-tree/pull/596))
+
+### Performance
+
+- cut hot-path allocations across point reads, memtable and scans ([#601](https://github.com/structured-world/coordinode-lsm-tree/pull/601))
+- *(vlog)* read a scan's separated values ahead in coalesced runs ([#599](https://github.com/structured-world/coordinode-lsm-tree/pull/599))
+
 ## [5.8.0](https://github.com/structured-world/coordinode-lsm-tree/compare/v5.7.0...v5.8.0) - 2026-08-31
 
 ### Added
