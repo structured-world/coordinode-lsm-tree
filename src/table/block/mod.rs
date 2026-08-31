@@ -951,6 +951,14 @@ impl Block {
 
             #[cfg(zstd_any)]
             CompressionType::Zstd(_) => {
+                // Decompress straight into the Slice allocation, skipping the
+                // zero-fill and the Vec -> Slice copy. SAFETY: the same
+                // precondition as the lz4 arm — every caller verifies the
+                // payload against the header checksum BEFORE reaching here, so
+                // the frame is intact and the decoder's back-references only
+                // target already-written positions. The length equality below
+                // rejects a short fill, so no uninitialized byte survives into
+                // the frozen Slice.
                 #[expect(unsafe_code, reason = "fill an uninitialized Slice via decompress")]
                 let mut builder =
                     unsafe { Slice::builder_unzeroed(header.uncompressed_length as usize) };

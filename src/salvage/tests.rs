@@ -3302,7 +3302,7 @@ fn verify_block_layout_rejects_a_present_empty_map_on_a_nonempty_table() -> crat
 /// re-read every data block to get it.
 #[cfg(feature = "zstd")]
 #[test]
-fn reconcile_gates_reject_a_shifted_block_layout_boundary() -> crate::Result<()> {
+fn reconcile_gates_with_a_shifted_block_layout_boundary_reject_it() -> crate::Result<()> {
     let dir = tempdir()?;
     let source = dir.path().join("source");
     let fs: Arc<dyn Fs> = Arc::new(StdFs);
