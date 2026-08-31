@@ -161,9 +161,10 @@ impl BlockLayoutMap {
             .count()
     }
 
-    /// Recorded block offsets, ascending. Test-only enumeration helper.
-    /// Its sole caller is the zstd large-block roundtrip test, so it is gated
-    /// to that feature to stay dead-code-clean in every other test build.
+    /// Recorded block offsets, ascending. Test-only enumeration helper, gated
+    /// to zstd because that is the only build where the section it enumerates
+    /// is written at all: the large-block roundtrip test walks it, and so does
+    /// the forge that rewrites one of its recorded boundaries.
     #[cfg(all(test, feature = "zstd"))]
     pub(crate) fn offsets(&self) -> Vec<u64> {
         self.entries.iter().map(|(o, _)| *o).collect()

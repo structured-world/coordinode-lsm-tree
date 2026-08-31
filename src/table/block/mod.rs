@@ -908,7 +908,7 @@ impl Block {
     /// disagrees with that length, and
     /// [`crate::Error::ZstdDictMismatch`] when the block names a dictionary
     /// the transform does not carry.
-    fn decompress_payload(
+    pub(crate) fn decompress_payload(
         header: &Header,
         payload: Slice,
         transform: &BlockTransform<'_>,

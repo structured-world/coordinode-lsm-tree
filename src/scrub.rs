@@ -959,6 +959,7 @@ fn refresh_healed_checksum(
             G::Filter => "a filter cross-check failure",
             G::PointReadReachability => "a point-read reachability failure",
             G::MetadataBounds => "a metadata-bounds cross-check failure",
+            G::BlockLayout => "a block-layout cross-check failure",
         };
         return refuse(
             alloc::format!(

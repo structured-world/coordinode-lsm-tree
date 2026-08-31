@@ -3287,6 +3287,70 @@ fn verify_block_layout_rejects_a_present_empty_map_on_a_nonempty_table() -> crat
     Ok(())
 }
 
+/// A recorded boundary that no longer marks where an inner zstd block ends
+/// must be rejected BY NAME, and by the reconcile walk rather than a pass of
+/// its own.
+///
+/// The forged section stays checksum-clean and structurally plausible: the ends
+/// are still strictly increasing and still finish at the block's uncompressed
+/// length, so every cheap check passes. Only decoding the frame reveals that an
+/// interior boundary moved — and the partial range-read path bounds its
+/// decompression by exactly that boundary, so believing it silently omits keys.
+///
+/// Driven through `verify_reconcile_gates` because that is where the check now
+/// lives: it reuses the frame the walk already read, where the standalone pass
+/// re-read every data block to get it.
+#[cfg(feature = "zstd")]
+#[test]
+fn reconcile_gates_reject_a_shifted_block_layout_boundary() -> crate::Result<()> {
+    let dir = tempdir()?;
+    let source = dir.path().join("source");
+    let fs: Arc<dyn Fs> = Arc::new(StdFs);
+
+    // 256 KiB blocks at zstd L19: each data block splits into several inner
+    // zstd blocks, which is the only shape that carries a block_layout.
+    let mut writer = Writer::new(source.clone(), 0, 0, Arc::clone(&fs))?
+        .use_data_block_size(256 * 1024)
+        .use_data_block_compression(crate::CompressionType::Zstd(19));
+    for i in 0u64..20_000 {
+        writer.write(InternalValue::from_components(
+            format!("key-{i:012}").into_bytes(),
+            format!("value-{i:08}-payload").into_bytes(),
+            1,
+            ValueType::Value,
+        ))?;
+    }
+    assert!(writer.finish()?.is_some(), "source SST is non-empty");
+
+    // Sanity: the untouched table reconciles clean, so the failure below is
+    // the forgery and not the fixture.
+    let table = open(source.clone(), &fs)?;
+    assert!(
+        table.verify_reconcile_gates(None, false).is_ok(),
+        "the intact multi-inner-block table must reconcile clean",
+    );
+    drop(table);
+
+    crate::test_forge::forge_block_layout_shifted_end(&source, 0)?;
+
+    let table = open(source, &fs)?;
+    let Err((gate, err)) = table.verify_reconcile_gates(None, false) else {
+        panic!("a boundary that does not match the frame's inner blocks must be rejected");
+    };
+    assert!(
+        matches!(gate, crate::table::ReconcileGate::BlockLayout),
+        "the failure must be attributed to the block-layout gate, got {gate:?}",
+    );
+    assert!(
+        matches!(
+            err,
+            crate::Error::InvalidHeader("block_layout disagrees with the frames' inner blocks")
+        ),
+        "the rejection names the frame disagreement, got {err:?}",
+    );
+    Ok(())
+}
+
 /// `verify_block_layout` must run the present-but-empty rejection on builds
 /// WITHOUT zstd too. The function used to return `Ok(())` for the whole
 /// non-zstd build before reading the section, so a columnar SST with positional
