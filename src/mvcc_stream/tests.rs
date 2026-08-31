@@ -597,6 +597,40 @@ fn mvcc_stream_weak_tombstone_multi_keys() -> crate::Result<()> {
     Ok(())
 }
 
+/// `DoubleEndedIterator` requires that the two ends meet in the middle exactly
+/// once: every item comes out of one end or the other, and none comes out of
+/// both. Taking one item off the front and then draining from the back is the
+/// smallest walk that mixes the directions, and it used to lose the entry that
+/// the forward step had left parked in the front peek slot.
+#[test]
+#[expect(clippy::unwrap_used, reason = "test assertion")]
+fn one_forward_step_then_a_backward_drain_yields_every_key() -> crate::Result<()> {
+    let vec = stream![
+        "a", "", "V", //
+        "b", "", "V", //
+        "c", "", "V", //
+        "d", "", "V", //
+        "e", "", "V",
+    ];
+
+    let mut iter = MvccStream::new(Box::new(vec.into_iter().map(Ok)), None);
+
+    let mut seen = vec![iter.next().unwrap()?.key.user_key];
+    while let Some(item) = iter.next_back() {
+        seen.push(item?.key.user_key);
+    }
+    seen.sort_unstable();
+
+    let keys: Vec<&[u8]> = seen.iter().map(|k| &**k).collect();
+    assert_eq!(
+        keys,
+        [b"a".as_ref(), b"b", b"c", b"d", b"e"],
+        "an entry was dropped between the two ends",
+    );
+
+    Ok(())
+}
+
 #[allow(clippy::doc_markdown, clippy::unnecessary_wraps)]
 mod merge_operator_tests {
     use super::*;

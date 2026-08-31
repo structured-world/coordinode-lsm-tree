@@ -176,6 +176,14 @@ where
             .map(|(_, slot)| slot.value.clone())
     }
 
+    /// Whether `key` is resident, without cloning the value or touching the
+    /// frequency counter. For a caller that only wants to know whether it has
+    /// to fetch, `get`/`peek` would clone the value (an atomic bump on a
+    /// refcounted payload) just to drop it again.
+    fn contains(&self, hash: u64, key: &K) -> bool {
+        self.map.find(hash, |(k, _)| k == key).is_some()
+    }
+
     fn len(&self) -> usize {
         self.map.len()
     }
@@ -400,6 +408,9 @@ pub struct ShardedCache<K, V, W, S> {
     weighter: W,
     hasher: S,
     capacity: u64,
+    /// One shard's byte capacity: the heaviest entry that can stay resident.
+    /// Anything heavier is refused at insert (see [`Self::max_entry_weight`]).
+    per_shard_capacity: u64,
 }
 
 impl<K, V, W, S> ShardedCache<K, V, W, S>
@@ -442,7 +453,15 @@ where
             weighter,
             hasher,
             capacity,
+            per_shard_capacity: per_shard_cap,
         }
+    }
+
+    /// The heaviest entry this cache can actually keep: one shard's capacity.
+    /// Heavier inserts are refused (see [`Self::insert_with_priority`]);
+    /// callers producing large entries can skip building them entirely.
+    pub fn max_entry_weight(&self) -> u64 {
+        self.per_shard_capacity
     }
 
     /// Hashes `key` once and resolves both the owning shard and the hash that
@@ -482,6 +501,12 @@ where
         shard.read().peek(h, key)
     }
 
+    /// Whether `key` is resident, without cloning it out or counting a hit.
+    pub fn contains(&self, key: &K) -> bool {
+        let (h, shard) = self.locate(key);
+        shard.read().contains(h, key)
+    }
+
     /// Inserts or replaces `key` at [`Priority::Normal`], evicting as needed to
     /// stay within capacity.
     pub fn insert(&self, key: K, value: V) {
@@ -493,6 +518,12 @@ where
     /// churn (see the enum docs).
     pub fn insert_with_priority(&self, key: K, value: V, priority: Priority) {
         let weight = self.weighter.weight(&key, &value);
+        // An entry heavier than its shard can never stay resident: admitting it
+        // would evict the shard's whole population and then be evicted itself.
+        // Refuse it at the door instead of paying that churn.
+        if weight > self.per_shard_capacity {
+            return;
+        }
         let (h, shard) = self.locate(&key);
         shard.write().insert(h, key, value, weight, priority);
     }

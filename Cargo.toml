@@ -327,6 +327,12 @@ path = "benches/tight_space.rs"
 required-features = []
 
 [[bench]]
+name = "blob_scan_prefetch"
+harness = false
+path = "benches/blob_scan_prefetch.rs"
+required-features = []
+
+[[bench]]
 name = "memtable"
 harness = false
 path = "benches/memtable.rs"

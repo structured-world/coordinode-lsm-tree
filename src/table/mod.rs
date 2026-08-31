@@ -6515,11 +6515,10 @@ impl Table {
                 continue;
             }
             let handle = *block_handle.as_ref();
-            if self
-                .cache
-                .get_block(self.global_id(), handle.offset())
-                .is_none()
-            {
+            // Presence only: `get_block` would clone the block out to be
+            // dropped a line later, and count a cache hit for a block this
+            // plan is deciding NOT to read.
+            if !self.cache.has_block(self.global_id(), handle.offset()) {
                 handles.push(handle);
             }
             while p < passing.len() {
@@ -6543,7 +6542,7 @@ impl Table {
 
     /// Decodes blocks read by the level prewarm into the cache (`buffers[i]` is
     /// the on-disk bytes of `handles[i]`, both from [`Table::plan_prewarm`]).
-    pub(crate) fn decode_prewarmed(&self, handles: &[BlockHandle], buffers: &[Vec<u8>]) {
+    pub(crate) fn decode_prewarmed(&self, handles: &[BlockHandle], buffers: &[&[u8]]) {
         crate::table::util::decode_prewarmed_blocks(
             self.global_id(),
             &self.cache,

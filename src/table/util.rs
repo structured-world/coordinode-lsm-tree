@@ -262,7 +262,7 @@ pub fn decode_prewarmed_blocks(
     table_id: GlobalTableId,
     cache: &Cache,
     handles: &[BlockHandle],
-    buffers: &[Vec<u8>],
+    buffers: &[&[u8]],
     block_type: BlockType,
     compression: CompressionType,
     encryption: Option<&dyn EncryptionProvider>,
@@ -307,7 +307,7 @@ pub fn decode_prewarmed_blocks(
         // decrypt helpers), so the cached block is byte-identical to what the
         // read walk would produce. A decode error (e.g. a block needing a re-read
         // recovery) just leaves it uncached for the walk to read authoritatively.
-        let mut reader = crate::io::Cursor::new(buf.as_slice());
+        let mut reader = crate::io::Cursor::new(&buf[..]);
         if let Ok(block) = Block::from_reader(&mut reader, identity, &transform)
             && block.header.block_type == block_type
         {

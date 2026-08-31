@@ -282,19 +282,6 @@ where
         self.build_subtree(1, 0, self.leaves.len());
     }
 
-    /// Number of source slots `n` originally supplied (not `cap`).
-    ///
-    /// Reflects the *capacity* of the tournament; some slots may be
-    /// exhausted (`None`) at any given moment.
-    #[inline]
-    #[expect(
-        dead_code,
-        reason = "part of the slot-set protocol, used by future callers"
-    )]
-    pub fn slots(&self) -> usize {
-        self.n_sources
-    }
-
     /// Whether every slot is exhausted (no present leaves).
     #[expect(
         clippy::inline_always,
@@ -461,6 +448,26 @@ where
         self.active -= 1;
         self.replay(slot);
         Some(taken)
+    }
+
+    /// The leaf buffered for `slot`, without removing it or disturbing the
+    /// tournament. `None` when the slot is exhausted or out of range.
+    ///
+    /// Companion to [`take_slot`](Self::take_slot): the seeking merger looks
+    /// before it takes, because whether the opposite tournament's buffered leaf
+    /// should be claimed depends on how it ORDERS against this tournament's own
+    /// winner, not merely on it being there. O(1).
+    #[expect(
+        clippy::indexing_slicing,
+        reason = "slot is checked < self.leaves.len() before indexing"
+    )]
+    pub fn peek_slot(&self, slot: usize) -> Option<&E> {
+        if slot >= self.leaves.len() || self.present[slot] == 0 {
+            return None;
+        }
+        // SAFETY: present[slot] != 0 (just checked above).
+        #[expect(unsafe_code, reason = "see safety")]
+        Some(unsafe { self.leaves[slot].assume_init_ref() })
     }
 
     // ---------- internals ----------

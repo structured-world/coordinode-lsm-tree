@@ -582,18 +582,52 @@ fn read_blocks_batched_across_files_via_ring() -> io::Result<()> {
             crate::fs::BlockRead {
                 file: f0.as_ref(),
                 offset: 10,
-                buf: &mut b0,
+                buf: crate::fs::BlockBuf::new(&mut b0),
             },
             crate::fs::BlockRead {
                 file: f1.as_ref(),
                 offset: 20,
-                buf: &mut b1,
+                buf: crate::fs::BlockBuf::new(&mut b1),
             },
         ];
         fs.read_blocks_batched(&mut reqs)?;
     }
     assert_eq!(b0, [10, 11, 12, 13]);
     assert_eq!(b1, [rev[20], rev[21], rev[22], rev[23]]);
+    Ok(())
+}
+
+/// A request whose destination arrives partly filled must resume at
+/// `offset + filled` on the ring path too: the SQE's pointer and length
+/// already describe the unfilled suffix, so submitting the original offset
+/// would duplicate the block's first bytes into that suffix.
+#[test]
+fn read_blocks_batched_partly_filled_request_resumes_via_ring() -> io::Result<()> {
+    let Some(fs) = try_io_uring() else {
+        return Ok(());
+    };
+    let dir = tempfile::tempdir()?;
+    let opts = FsOpenOptions::new().write(true).create(true).read(true);
+    let mut file = fs.open(&dir.path().join("resume.bin"), &opts)?;
+    file.write_all(&(0..=255u8).collect::<Vec<_>>())?;
+    file.sync_all()?;
+    assert!(file.backing_fd().is_some(), "io_uring file exposes its fd");
+
+    // Block = bytes 10..18; the first 3 are already in the destination, so the
+    // ring owes bytes 13..18 into the suffix.
+    let mut buf = [0u8; 8];
+    {
+        let mut dst = crate::fs::BlockBuf::new(&mut buf);
+        dst.append(&[10, 11, 12]);
+        let mut reqs = vec![crate::fs::BlockRead {
+            file: file.as_ref(),
+            offset: 10,
+            buf: dst,
+        }];
+        fs.read_blocks_batched(&mut reqs)?;
+        assert!(reqs[0].buf.is_full(), "the request is completed, not short");
+    }
+    assert_eq!(buf, [10, 11, 12, 13, 14, 15, 16, 17]);
     Ok(())
 }
 
@@ -646,12 +680,12 @@ fn read_blocks_batched_short_read_at_eof_errors() -> io::Result<()> {
             crate::fs::BlockRead {
                 file: file.as_ref(),
                 offset: 0,
-                buf: &mut short,
+                buf: crate::fs::BlockBuf::new(&mut short),
             },
             crate::fs::BlockRead {
                 file: file.as_ref(),
                 offset: 4,
-                buf: &mut ok,
+                buf: crate::fs::BlockBuf::new(&mut ok),
             },
         ];
         match fs.read_blocks_batched(&mut reqs) {
@@ -691,12 +725,12 @@ fn read_blocks_batched_fallback_short_read_errors() -> io::Result<()> {
             crate::fs::BlockRead {
                 file: uring_file.as_ref(),
                 offset: 0,
-                buf: &mut b0,
+                buf: crate::fs::BlockBuf::new(&mut b0),
             },
             crate::fs::BlockRead {
                 file: std_file.as_ref(),
                 offset: 0,
-                buf: &mut b1,
+                buf: crate::fs::BlockBuf::new(&mut b1),
             },
         ];
         match fs.read_blocks_batched(&mut reqs) {
@@ -737,12 +771,12 @@ fn read_blocks_batched_falls_back_for_non_uring_file() -> io::Result<()> {
             crate::fs::BlockRead {
                 file: uring_file.as_ref(),
                 offset: 10,
-                buf: &mut b0,
+                buf: crate::fs::BlockBuf::new(&mut b0),
             },
             crate::fs::BlockRead {
                 file: std_file.as_ref(),
                 offset: 20,
-                buf: &mut b1,
+                buf: crate::fs::BlockBuf::new(&mut b1),
             },
         ];
         fs.read_blocks_batched(&mut reqs)?;

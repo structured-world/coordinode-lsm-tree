@@ -3235,6 +3235,13 @@ impl Tree {
         let mut covered: Vec<CoveredKey> = Vec::new();
         let mut not_covered: Vec<(usize, u64)> = Vec::new();
 
+        // One pair of buffers reused across the run's tables, cleared per
+        // table. Each is consumed before the next table fills it, so a fresh
+        // Vec per table would only re-allocate the capacity the previous one
+        // just released — once per table on a batched read path.
+        let mut batch: Vec<(&[u8], u64)> = Vec::new();
+        let mut batch_keys: Vec<(usize, u64)> = Vec::new();
+
         let mut i = 0;
         while i < remaining.len() {
             let (idx, hash) = remaining[i];
@@ -3254,8 +3261,8 @@ impl Tree {
             // keys for one table form a contiguous slice; one `batch_get` drains
             // them with a single block decode for co-located keys.
             let table_id = table.id();
-            let mut batch: Vec<(&[u8], u64)> = Vec::new();
-            let mut batch_keys: Vec<(usize, u64)> = Vec::new();
+            batch.clear();
+            batch_keys.clear();
             while i < remaining.len() {
                 let (jdx, jhash) = remaining[i];
                 if skip(jdx) {
@@ -3273,8 +3280,14 @@ impl Tree {
                 }
             }
 
-            for ((kidx, khash), item) in batch_keys.into_iter().zip(table.batch_get(&batch, seqno)?)
-            {
+            // `drain`, not `into_iter`: the buffer is reused by the next table,
+            // so its capacity has to survive the walk. The lint assumes the
+            // vector is dead afterwards, which is exactly what this is not.
+            #[expect(
+                clippy::iter_with_drain,
+                reason = "buffer is reused across tables; into_iter would consume it"
+            )]
+            for ((kidx, khash), item) in batch_keys.drain(..).zip(table.batch_get(&batch, seqno)?) {
                 covered.push((kidx, khash, item));
             }
         }
@@ -3319,6 +3332,9 @@ impl Tree {
             Arc<dyn crate::fs::FsFile>,
             Vec<crate::table::BlockHandle>,
         )> = Vec::new();
+        // Reused across the level's tables, cleared per table: `plan_prewarm`
+        // reads it and returns before the next table fills it.
+        let mut batch: Vec<(&[u8], u64)> = Vec::new();
         for run in level.iter() {
             let mut i = 0;
             while i < remaining.len() {
@@ -3329,7 +3345,7 @@ impl Tree {
                     continue;
                 };
                 let table_id = table.id();
-                let mut batch: Vec<(&[u8], u64)> = Vec::new();
+                batch.clear();
                 while i < remaining.len() {
                     let (jdx, jhash) = remaining[i];
                     let jkey = keys[jdx].as_ref();
@@ -3370,25 +3386,29 @@ impl Tree {
         }
 
         // One buffer per cold block, in (table, block) order.
+        //
+        // One buffer per cold block, in (table, block) order.
         let mut all_buffers: Vec<Vec<u8>> = planned
             .iter()
             .flat_map(|(_, _, handles)| handles.iter().map(|h| vec![0u8; h.size() as usize]))
             .collect();
-        // (table index, offset) per buffer, so each request borrows the right file.
-        let flat: Vec<(usize, u64)> = planned
-            .iter()
-            .enumerate()
-            .flat_map(|(ti, (_, _, handles))| handles.iter().map(move |h| (ti, *h.offset())))
-            .collect();
 
         {
-            let mut reqs: Vec<crate::fs::BlockRead<'_>> = flat
+            // Paired directly with the plan rather than through a parallel
+            // (table index, offset) vector: `all_buffers` is already in
+            // (table, block) order, so zipping the two walks needs no third
+            // collection to remember which file each buffer belongs to.
+            let mut bufs = all_buffers.iter_mut();
+            let mut reqs: Vec<crate::fs::BlockRead<'_>> = planned
                 .iter()
-                .zip(all_buffers.iter_mut())
-                .map(|(&(ti, offset), buf)| crate::fs::BlockRead {
-                    file: planned[ti].1.as_ref(),
+                .flat_map(|(_, file, handles)| {
+                    handles.iter().map(move |h| (file.as_ref(), *h.offset()))
+                })
+                .zip(&mut bufs)
+                .map(|((file, offset), buf)| crate::fs::BlockRead {
+                    file,
                     offset,
-                    buf: buf.as_mut_slice(),
+                    buf: crate::fs::BlockBuf::new(&mut buf[..]),
                 })
                 .collect();
             // Best-effort: a batched-read failure just leaves the blocks for the
@@ -3396,7 +3416,19 @@ impl Tree {
             if fs.read_blocks_batched(&mut reqs).is_err() {
                 return false;
             }
+            // Independently of what the call returned: an implementation that
+            // reported success without filling a request leaves it short, and
+            // a block decoded from a buffer nobody wrote would be decoded from
+            // whatever the allocation held.
+            if !reqs.iter().all(|r| r.buf.is_full()) {
+                return false;
+            }
         }
+
+        // Views, not owned copies: the decode reads these bytes and builds its
+        // own block out of them, so staging them into an owning type would copy
+        // every block a second time.
+        let all_buffers: Vec<&[u8]> = all_buffers.iter().map(Vec::as_slice).collect();
 
         // Decode each table's blocks (its contiguous slice of all_buffers).
         let mut k = 0;
@@ -3428,6 +3460,10 @@ impl Tree {
         comparator: &dyn crate::comparator::UserComparator,
     ) -> crate::Result<Vec<BlockTask<'a>>> {
         let mut tasks: Vec<BlockTask<'a>> = Vec::new();
+        // Reused across the level's tables, cleared per table: both are read by
+        // the plan below and are done with before the next table fills them.
+        let mut batch: Vec<(&[u8], u64)> = Vec::new();
+        let mut batch_idx: Vec<usize> = Vec::new();
         for run in level.iter() {
             let mut i = 0;
             while i < remaining.len() {
@@ -3438,8 +3474,8 @@ impl Tree {
                     continue;
                 };
                 let table_id = table.id();
-                let mut batch: Vec<(&[u8], u64)> = Vec::new();
-                let mut batch_idx: Vec<usize> = Vec::new();
+                batch.clear();
+                batch_idx.clear();
                 while i < remaining.len() {
                     let (jdx, jhash) = remaining[i];
                     let jkey = keys[jdx].as_ref();
@@ -3556,10 +3592,19 @@ impl Tree {
                 .map(|(t, buf)| crate::fs::BlockRead {
                     file: t.file.as_ref(),
                     offset: *t.handle.offset(),
-                    buf: buf.as_mut_slice(),
+                    buf: crate::fs::BlockBuf::new(&mut buf[..]),
                 })
                 .collect();
             fs.read_blocks_batched(&mut reqs)?;
+            // An implementation that reported success without filling a request
+            // leaves it short; refuse to decode a block out of bytes it never
+            // wrote.
+            if !reqs.iter().all(|r| r.buf.is_full()) {
+                return Err(crate::Error::Io(crate::io::Error::new(
+                    crate::io::ErrorKind::UnexpectedEof,
+                    "read_blocks_batched reported success on an unfilled block",
+                )));
+            }
         }
 
         for (task, buf) in chunk.iter().zip(buffers.iter()) {

@@ -22,7 +22,16 @@ const TAG_ROW: u8 = 3;
 #[derive(Clone)]
 enum Item {
     Block(Block),
-    Blob(UserValue),
+    /// A separated value, carrying everything about the handle that the cache
+    /// key does not: the user key it belongs to and the record's on-disk size.
+    ///
+    /// The cache key is the blob file id plus the offset, which identifies a
+    /// POSITION, not a record. A corrupt index entry can name that position
+    /// with a different key, or with the right key and the wrong size. A direct
+    /// read rejects both (the reader compares the key it was asked for AND the
+    /// declared size against the record header), so the cached path keeps the
+    /// same two fields and compares them, rather than trusting the position.
+    Blob(crate::UserKey, u32, UserValue),
     /// A resolved point-read result for one user key in one (immutable) SST: the
     /// newest version found there. The full key is carried in `key.user_key` so a
     /// hash collision on the cache key is caught (verified on lookup) rather than
@@ -79,7 +88,9 @@ impl Weighter<CacheKey, Item> for BlockWeighter {
                 (Header::header_len(b.header.block_type) as u64)
                     + u64::from(b.header.uncompressed_length)
             }
-            Blob(b) => b.len() as u64,
+            // Key + value; the size field is an inline scalar. The prefetch's
+            // admission budget charges itself the same way, so the two agree.
+            Blob(key, _, b) => (key.len() + b.len()) as u64,
             // Key bytes + value bytes + a fixed term for the InternalKey scalars
             // (seqno + value_type) and the entry's own bookkeeping.
             Item::Row(iv) => iv.key.user_key.len() as u64 + iv.value.len() as u64 + 16,
@@ -204,6 +215,14 @@ impl Cache {
         self.data.capacity()
     }
 
+    /// The heaviest entry this cache can actually keep resident: one shard's
+    /// capacity. Heavier inserts are refused by the cache; callers that would
+    /// build such an entry (e.g. the scan read-ahead) can skip the work.
+    #[must_use]
+    pub(crate) fn max_entry_weight(&self) -> u64 {
+        self.data.max_entry_weight()
+    }
+
     #[doc(hidden)]
     #[must_use]
     pub fn get_block(&self, id: GlobalTableId, offset: BlockOffset) -> Option<Block> {
@@ -211,21 +230,24 @@ impl Cache {
 
         Some(match self.data.get(&key)? {
             Item::Block(block) => block,
-            Item::Blob(_) | Item::Row(_) => unreachable!("invalid cache item"),
+            Item::Blob(..) | Item::Row(_) => unreachable!("invalid cache item"),
             #[cfg(feature = "zstd")]
             Item::PartialBlock(_) => unreachable!("invalid cache item"),
         })
     }
 
     /// Whether a full (non-partial) data block is already resident for `offset`.
+    ///
     /// The partial-tier reader uses this to bail out (let the normal cached path
-    /// serve) once a block has been promoted to a full resident block.
-    #[cfg(feature = "zstd")]
+    /// serve) once a block has been promoted to a full resident block, and the
+    /// batched prewarm to tell a cold block from one it would re-read for
+    /// nothing. Neither wants the block itself, so this answers without cloning
+    /// it out and without counting a hit for a read that never happens.
     #[doc(hidden)]
     #[must_use]
     pub fn has_block(&self, id: GlobalTableId, offset: BlockOffset) -> bool {
         let key: CacheKey = (TAG_BLOCK, id.tree_id(), id.table_id(), *offset).into();
-        self.data.peek(&key).is_some()
+        self.data.contains(&key)
     }
 
     /// Reads the cached partial-tier entry for `offset` (resume state + access
@@ -339,34 +361,72 @@ impl Cache {
         );
     }
 
+    /// Caches a separated value under its position, together with the two
+    /// fields the position does not carry (`user_key` and the handle's declared
+    /// on-disk size) so a lookup can prove the entry belongs to the handle it
+    /// is asked about.
     #[doc(hidden)]
     pub fn insert_blob(
         &self,
         vlog_id: crate::TreeId,
         vhandle: &crate::vlog::ValueHandle,
+        user_key: &[u8],
         value: UserValue,
     ) {
         self.data.insert(
             (TAG_BLOB, vlog_id, vhandle.blob_file_id, vhandle.offset).into(),
-            Item::Blob(value),
+            Item::Blob(user_key.into(), vhandle.on_disk_size, value),
         );
     }
 
+    /// Whether a separated value is already cached.
+    ///
+    /// For a caller deciding whether it has to read, not what the value is:
+    /// [`get_blob`](Self::get_blob) would clone the value out (an atomic bump
+    /// on the refcounted payload) and count a cache hit for a read that never
+    /// happens, skewing the eviction policy toward entries nobody consumed.
+    #[doc(hidden)]
+    #[must_use]
+    pub fn contains_blob(
+        &self,
+        vlog_id: crate::TreeId,
+        vhandle: &crate::vlog::ValueHandle,
+    ) -> bool {
+        let key: CacheKey = (TAG_BLOB, vlog_id, vhandle.blob_file_id, vhandle.offset).into();
+        self.data.contains(&key)
+    }
+
+    /// The cached value for `vhandle`, but only if it belongs to that exact
+    /// handle: same `user_key` and same declared on-disk size.
+    ///
+    /// The cache key is a POSITION in a blob file, and a corrupt index entry
+    /// can name that position with a different key, or with the right key and
+    /// the wrong size. The reader rejects both on a direct read, comparing what
+    /// it was asked for against the record header; these comparisons are how
+    /// the cached path reaches the same verdict instead of serving whatever
+    /// sits at the offset. A mismatch reads as a miss, so the caller does the
+    /// real read and gets the real error.
     #[doc(hidden)]
     #[must_use]
     pub fn get_blob(
         &self,
         vlog_id: crate::TreeId,
         vhandle: &crate::vlog::ValueHandle,
+        user_key: &[u8],
     ) -> Option<UserValue> {
         let key: CacheKey = (TAG_BLOB, vlog_id, vhandle.blob_file_id, vhandle.offset).into();
 
-        Some(match self.data.get(&key)? {
-            Item::Blob(blob) => blob,
+        match self.data.get(&key)? {
+            Item::Blob(cached_key, cached_size, blob)
+                if &*cached_key == user_key && cached_size == vhandle.on_disk_size =>
+            {
+                Some(blob)
+            }
+            Item::Blob(..) => None,
             Item::Block(_) | Item::Row(_) => unreachable!("invalid cache item"),
             #[cfg(feature = "zstd")]
             Item::PartialBlock(_) => unreachable!("invalid cache item"),
-        })
+        }
     }
 }
 

@@ -23,6 +23,55 @@ use std::io::{Cursor, Read};
 // definition site) and shared by this reader.
 use super::writer::MAX_DECOMPRESSION_SIZE;
 
+/// The exact on-disk span a blob record occupies: header + key + on-disk value.
+///
+/// One definition shared by the single read in [`Reader::get`] and by the
+/// prefetcher that coalesces several adjacent records into one read, so the two
+/// can never disagree about where a record ends.
+///
+/// # Errors
+///
+/// Returns [`crate::Error::InvalidHeader`] for a key longer than the writer's
+/// `u16` limit (a caller cannot inflate the computed read that way), and
+/// [`crate::Error::DecompressedSizeTooLarge`] when the record would exceed the
+/// 256 MiB value cap plus its header / key overhead.
+pub fn record_len(key_len: usize, vhandle: &ValueHandle) -> crate::Result<usize> {
+    // Enforce the same key-length constraint as the writer (u16::MAX)
+    // so that a caller cannot inflate the computed read size.
+    if key_len > u16::MAX as usize {
+        return Err(crate::Error::InvalidHeader("Blob"));
+    }
+
+    let add_size = (BLOB_HEADER_LEN as u64) + (key_len as u64);
+
+    // Validate the full on-disk read size (header + key + value) against the limit.
+    // Allow header+key overhead on top of the data cap.
+    // NOTE: A separate `on_disk_size > MAX` check is mathematically redundant here
+    // because `total > MAX + overhead` already implies `on_disk_size > MAX`.
+    // 256 MiB cap plus a small (≤ header + u16 key) overhead — bounded well
+    // within u64 (see the `add_size < u32::MAX` note below), so a plain add
+    // cannot overflow.
+    let max_total_read_size = (MAX_DECOMPRESSION_SIZE as u64) + add_size;
+
+    // on_disk_size is u32 and add_size < u32::MAX, so this cannot overflow u64.
+    let total_read_size = u64::from(vhandle.on_disk_size) + add_size;
+
+    if total_read_size > max_total_read_size {
+        return Err(crate::Error::DecompressedSizeTooLarge {
+            declared: total_read_size,
+            limit: max_total_read_size,
+        });
+    }
+
+    // After the cap check, total_read_size <= ~256 MiB + overhead, which fits
+    // in usize on all supported platforms (>= 32-bit).
+    #[expect(
+        clippy::cast_possible_truncation,
+        reason = "bounded to MAX_DECOMPRESSION_SIZE + overhead by the check above"
+    )]
+    Ok(total_read_size as usize)
+}
+
 /// Reads a single blob from a blob file
 pub struct Reader<'a> {
     blob_file: &'a BlobFile,
@@ -55,50 +104,39 @@ impl<'a> Reader<'a> {
         self
     }
 
-    #[expect(
-        clippy::too_many_lines,
-        reason = "blob read/validation path is kept in one function so error handling and size checks stay co-located"
-    )]
     pub fn get(&self, key: &'a [u8], vhandle: &'a ValueHandle) -> crate::Result<UserValue> {
         debug_assert_eq!(vhandle.blob_file_id, self.blob_file.id());
 
-        // Enforce the same key-length constraint as the writer (u16::MAX)
-        // so that a caller cannot inflate the computed read size.
-        if key.len() > u16::MAX as usize {
-            return Err(crate::Error::InvalidHeader("Blob"));
-        }
+        let read_len = record_len(key.len(), vhandle)?;
+        let record = crate::file::read_exact(self.file, vhandle.offset, read_len)?;
 
-        let add_size = (BLOB_HEADER_LEN as u64) + (key.len() as u64);
+        self.parse_record(key, vhandle, &record)
+    }
 
-        // Validate the full on-disk read size (header + key + value) against the limit.
-        // Allow header+key overhead on top of the data cap.
-        // NOTE: A separate `on_disk_size > MAX` check is mathematically redundant here
-        // because `total > MAX + overhead` already implies `on_disk_size > MAX`.
-        // 256 MiB cap plus a small (≤ header + u16 key) overhead — bounded well
-        // within u64 (see the `add_size < u32::MAX` note below), so a plain add
-        // cannot overflow.
-        let max_total_read_size = (MAX_DECOMPRESSION_SIZE as u64) + add_size;
-
-        // on_disk_size is u32 and add_size < u32::MAX, so this cannot overflow u64.
-        let total_read_size = u64::from(vhandle.on_disk_size) + add_size;
-
-        if total_read_size > max_total_read_size {
-            return Err(crate::Error::DecompressedSizeTooLarge {
-                declared: total_read_size,
-                limit: max_total_read_size,
-            });
-        }
-
-        // After the cap check, total_read_size <= ~256 MiB + overhead, which fits
-        // in usize on all supported platforms (>= 32-bit).
-        #[expect(
-            clippy::cast_possible_truncation,
-            reason = "bounded to MAX_DECOMPRESSION_SIZE + overhead by the check above"
-        )]
-        let read_len = total_read_size as usize;
-
-        let value = crate::file::read_exact(self.file, vhandle.offset, read_len)?;
-
+    /// Parses one blob record out of bytes already read from the file.
+    ///
+    /// `record` must be exactly the [`record_len`] bytes that start at
+    /// `vhandle.offset`. Splitting this out of [`get`](Self::get) lets a caller
+    /// that read several adjacent records in ONE read serve each of them from
+    /// its slice of that buffer: the validation below is identical either way,
+    /// so a prefetched value is byte-for-byte what a direct read would return.
+    ///
+    /// # Errors
+    ///
+    /// Returns the same header / checksum / decompression errors as
+    /// [`get`](Self::get); a caller that prefetched speculatively should treat
+    /// them as "leave this one to the read path" rather than as fatal.
+    #[expect(
+        clippy::too_many_lines,
+        reason = "blob validation path is kept in one function so error handling and size checks stay co-located"
+    )]
+    pub fn parse_record(
+        &self,
+        key: &[u8],
+        vhandle: &ValueHandle,
+        record: &crate::Slice,
+    ) -> crate::Result<UserValue> {
+        let value = record;
         let mut reader = Cursor::new(&value[..]);
 
         let mut magic = [0u8; 4];
