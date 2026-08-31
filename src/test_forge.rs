@@ -455,6 +455,17 @@ pub fn forge_tail_meta_value(
     forge_meta_value_in_section(path, b"meta", key, forged_value)
 }
 
+/// As [`forge_tail_meta_value`], but on the EARLY `meta_mid` mirror. Lets a
+/// test give the two mirrors DIFFERENT forged values, which is what arbitration
+/// between them is judged on.
+pub fn forge_mid_meta_value(
+    path: &std::path::Path,
+    key: &[u8],
+    forged_value: &[u8],
+) -> crate::Result<()> {
+    forge_meta_value_in_section(path, b"meta_mid", key, forged_value)
+}
+
 /// As [`forge_tail_meta_value`], but applied to BOTH meta mirrors (`meta`
 /// and `meta_mid`) so the copies stay CONSISTENT with each other: the mirror
 /// comparison passes and only a cross-check of the decoded field against the

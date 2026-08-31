@@ -346,10 +346,10 @@ fn infer_blob_tree(db_dir: &std::path::Path) -> std::io::Result<bool> {
         // one that does may still be unrelated junk (an operator backup called
         // `0`). Only a file the blob reader can actually parse proves the tree
         // is blob-backed.
-        if !entry
+        if entry
             .file_name()
             .to_str()
-            .is_some_and(|n| n.parse::<u64>().is_ok())
+            .is_none_or(|n| n.parse::<u64>().is_err())
         {
             continue;
         }
@@ -634,6 +634,20 @@ fn run_verify(path: &std::path::Path, verbose: bool) -> ExitCode {
             BlockVerifyWarning::ParityUnverifiable { table_id, path } => println!(
                 "  [warning] ParityUnverifiable: table {table_id} at {}: recognized \
                  ECC scheme but this build carries no ECC codecs; parity not verified",
+                path.display(),
+            ),
+            BlockVerifyWarning::EccCodecSuspect { table_id, path } => println!(
+                "  [warning] EccCodecSuspect: table {table_id} at {}: the reported \
+                 parity mismatches match no trailer at all, which looks like a \
+                 mis-identified scheme rather than rot; recompact to re-stamp it \
+                 before suspecting the hardware",
+                path.display(),
+            ),
+            BlockVerifyWarning::EccDescriptorsUnreadable { table_id, path } => println!(
+                "  [warning] EccDescriptorsUnreadable: table {table_id} at {}: \
+                 neither ECC descriptor is readable; the blocks were walked under \
+                 a parity-less layout read off the file itself, so they verified, \
+                 but only a rewrite re-stamps a valid descriptor",
                 path.display(),
             ),
             // `BlockVerifyWarning` is `#[non_exhaustive]` upstream; surface

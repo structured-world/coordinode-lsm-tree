@@ -620,17 +620,42 @@ fn verify_sst_file_flags_diverging_mirrors_behind_an_unrecognized_ecc() {
     );
 }
 
-/// A table whose BOTH meta mirrors advertise an UNRECOGNIZED ECC descriptor (they
-/// agree, so no divergence) cannot have its ECC-bearing SST sections walked: the
-/// parity-trailer length is underivable, so the block walk SKIPS the data blocks
-/// entirely. The scan verified NOTHING about the data, so the report must be
-/// INCOMPLETE and `is_ok()` must be false — a clean verdict would falsely claim
-/// the data verified. The unrecognized-ECC warning is still recorded.
+/// A table that REALLY carries parity and whose both meta mirrors advertise an
+/// unrecognized ECC descriptor (they agree, so no divergence) cannot have its
+/// ECC-bearing sections walked: the trailer length is underivable, and the one
+/// remaining candidate — `Off` — cannot frame a file whose blocks each carry a
+/// trailer. The walk SKIPS those sections, so the report must be INCOMPLETE and
+/// `is_ok()` false; a clean verdict would falsely claim the data verified.
+///
+/// The parity is what makes this table unreadable rather than the descriptors:
+/// on a parity-LESS table the same forge is survivable, because `Off` frames it
+/// end to end.
+#[cfg(feature = "page_ecc")]
 #[test]
-fn verify_sst_file_reports_incomplete_when_ecc_is_unrecognized_in_both_mirrors() {
-    let dir = tempfile::tempdir().unwrap();
-    populate_tree(dir.path(), 200);
-    let sst_path = pick_first_sst_path(dir.path());
+fn verify_sst_file_reports_incomplete_when_ecc_is_unrecognized_in_both_mirrors() -> crate::Result<()>
+{
+    use crate::table::Writer;
+    use crate::table::block::EccParams;
+
+    let dir = tempfile::tempdir()?;
+    let sst_path = dir.path().join("t");
+
+    let mut writer = Writer::new(
+        sst_path.clone(),
+        0,
+        0,
+        std::sync::Arc::new(crate::fs::StdFs),
+    )?
+    .use_ecc(Some(EccParams::RS_4_2));
+    for i in 0u64..200 {
+        writer.write(crate::InternalValue::from_components(
+            format!("key-{i:05}").into_bytes(),
+            format!("value-{i:05}").into_bytes(),
+            i + 1,
+            crate::ValueType::Value,
+        ))?;
+    }
+    assert!(writer.finish()?.is_some(), "the fixture is non-empty");
 
     // Sanity: intact file verifies clean.
     let report = verify_sst_file(&sst_path);
@@ -647,8 +672,7 @@ fn verify_sst_file_reports_incomplete_when_ecc_is_unrecognized_in_both_mirrors()
         &sst_path,
         b"descriptor#page_ecc",
         &[9, 0, 0, 0],
-    )
-    .unwrap();
+    )?;
 
     let report = verify_sst_file(&sst_path);
     assert!(
@@ -672,6 +696,7 @@ fn verify_sst_file_reports_incomplete_when_ecc_is_unrecognized_in_both_mirrors()
         "the unrecognized-ECC warning must still be recorded: {:?}",
         report.warnings,
     );
+    Ok(())
 }
 
 /// Tree-level regression for the merged report: `verify_block_checksums` folds
@@ -1556,4 +1581,1295 @@ fn verify_checksum_with_throttle_does_not_sleep_after_last_sst() {
         "a single-SST scrub must not sleep the inter-SST throttle after the \
          last table: took {elapsed:?} with a {throttle:?} throttle",
     );
+}
+
+/// A table whose real parity is RS(4,2) but whose surviving RECOGNIZED mirror
+/// says ECC is off must NOT be walked under that descriptor. One mirror
+/// re-stamped to an unrecognized kind and the other to `Off` leaves exactly one
+/// recognized copy, and trusting it sizes every frame without its parity
+/// trailer: the walk then reads parity bytes as the next block header and
+/// condemns a healthy table. The descriptor must be judged against the block
+/// framing it implies, and a descriptor that does not frame the data must fail
+/// safe to unrecognized (skip the ECC-dependent sections, report incomplete).
+#[cfg(feature = "page_ecc")]
+#[test]
+fn verify_sst_file_lone_recognized_mirror_that_misframes_falls_back_to_unrecognized() {
+    use crate::table::Writer;
+    use crate::table::block::EccParams;
+
+    let dir = tempfile::tempdir().unwrap();
+    let path = dir.path().join("t");
+
+    let mut writer = Writer::new(path.clone(), 0, 0, std::sync::Arc::new(crate::fs::StdFs))
+        .unwrap()
+        .use_ecc(Some(EccParams::RS_4_2));
+    for i in 0u64..200 {
+        writer
+            .write(crate::InternalValue::from_components(
+                format!("key-{i:05}").into_bytes(),
+                format!("value-{i:05}").into_bytes(),
+                i + 1,
+                crate::ValueType::Value,
+            ))
+            .unwrap();
+    }
+    assert!(
+        writer.finish().unwrap().is_some(),
+        "the fixture is non-empty"
+    );
+
+    // Sanity: the intact table verifies clean under its real descriptor.
+    let report = verify_sst_file(&path);
+    assert!(
+        report.is_ok(),
+        "an intact RS(4,2) table must verify clean: {:?}",
+        report.errors,
+    );
+
+    // The MID mirror keeps a recognized descriptor, but a FORGED one: `Off`.
+    // The tail goes to an unrecognized kind, so arbitration sees exactly one
+    // recognized copy and no full-metadata divergence (the comparison masks the
+    // ECC fields when a mirror is unrecognized).
+    // `[kind, data_shards, parity_shards, granularity]`: kind 0 with the
+    // reserved bytes zeroed is the canonical `Off`, kind 9 is unknown.
+    crate::test_forge::forge_mid_meta_value(&path, b"descriptor#page_ecc", &[0, 0, 0, 0]).unwrap();
+    crate::test_forge::forge_tail_meta_value(&path, b"descriptor#page_ecc", &[9, 0, 0, 0]).unwrap();
+
+    let report = verify_sst_file(&path);
+    assert!(
+        report.errors.is_empty(),
+        "the blocks are healthy — a mis-framing descriptor must not be trusted \
+         into reporting them corrupt: {:?}",
+        report.errors,
+    );
+    assert!(
+        report
+            .warnings
+            .iter()
+            .any(|w| matches!(w, crate::verify::BlockVerifyWarning::UnrecognizedEcc { .. })),
+        "the descriptor that does not frame the data must fail safe to \
+         unrecognized: {:?}",
+        report.warnings,
+    );
+    assert!(
+        report.incomplete,
+        "the ECC-dependent sections were skipped, so the scan is incomplete",
+    );
+}
+
+/// The other side of the same arbitration: a HEALTHY table whose one meta
+/// mirror had its ECC descriptor re-stamped to an unknown kind must keep being
+/// walked under the surviving valid descriptor. Condemning it would be
+/// terminal for a range-tombstone SST, which salvage cannot re-emit — and the
+/// framing check exists to separate this case from the mis-framing one, not to
+/// fail both.
+#[test]
+fn verify_sst_file_lone_recognized_mirror_that_frames_stays_authoritative() {
+    let dir = tempfile::tempdir().unwrap();
+    populate_tree(dir.path(), 200);
+    let sst_path = pick_first_sst_path(dir.path());
+
+    let report = verify_sst_file(&sst_path);
+    assert!(
+        report.is_ok(),
+        "intact SST must be clean: {:?}",
+        report.errors,
+    );
+
+    // Only the TAIL descriptor is forged to an unknown kind; `meta_mid` keeps
+    // the real one, which frames the blocks.
+    crate::test_forge::forge_tail_meta_value(&sst_path, b"descriptor#page_ecc", &[9, 0, 0, 0])
+        .unwrap();
+
+    let report = verify_sst_file(&sst_path);
+    assert!(
+        report.errors.is_empty(),
+        "the surviving descriptor frames the data, so the walk must proceed \
+         under it: {:?}",
+        report.errors,
+    );
+    assert!(
+        !report.incomplete,
+        "the data blocks were walked, so the scan is complete",
+    );
+    assert!(
+        report.is_ok(),
+        "a descriptor-only forge on one mirror must not condemn a healthy table",
+    );
+}
+
+/// BOTH mirrors reading as unknown kinds does not make a table unreadable.
+/// `Off` is a descriptor like any other — it frames the blocks or it does not —
+/// and most tables carry no parity at all, so it is tried before giving up.
+/// Without it such a table is skipped section by section and, if it carries
+/// range tombstones salvage cannot re-emit, dropped outright: a total loss of
+/// its key range over two bytes that say nothing about the data.
+#[test]
+fn verify_sst_file_both_mirrors_unrecognized_falls_back_to_off() -> crate::Result<()> {
+    use crate::table::Writer;
+
+    let dir = tempfile::tempdir()?;
+    let path = dir.path().join("t");
+
+    let mut writer =
+        Writer::new(path.clone(), 0, 0, std::sync::Arc::new(crate::fs::StdFs))?.use_ecc(None);
+    for i in 0u64..200 {
+        writer.write(crate::InternalValue::from_components(
+            format!("key-{i:05}").into_bytes(),
+            format!("value-{i:05}").into_bytes(),
+            i + 1,
+            crate::ValueType::Value,
+        ))?;
+    }
+    assert!(writer.finish()?.is_some(), "the fixture is non-empty");
+
+    let report = verify_sst_file(&path);
+    assert!(
+        report.is_ok(),
+        "an intact parity-less table must verify clean: {:?}",
+        report.errors,
+    );
+
+    // Both mirrors go to unknown kinds, so no recognized descriptor survives.
+    crate::test_forge::forge_mid_meta_value(&path, b"descriptor#page_ecc", &[9, 0, 0, 0])?;
+    crate::test_forge::forge_tail_meta_value(&path, b"descriptor#page_ecc", &[8, 0, 0, 0])?;
+
+    let report = verify_sst_file(&path);
+    assert!(
+        report.errors.is_empty(),
+        "the blocks are untouched: {:?}",
+        report.errors,
+    );
+    assert!(
+        !report
+            .warnings
+            .iter()
+            .any(|w| matches!(w, crate::verify::BlockVerifyWarning::UnrecognizedEcc { .. })),
+        "the file frames without a trailer, which answers the question the \
+         descriptors no longer can: {:?}",
+        report.warnings,
+    );
+    assert!(
+        !report.incomplete,
+        "every section was walked, so nothing is left unverified — the whole \
+         point of trying `Off` rather than giving up",
+    );
+    // Framing answered how to READ the blocks. It did not make either
+    // descriptor valid, and passing the table as clean would leave the next
+    // reader to infer the layout all over again.
+    assert!(
+        report.warnings.iter().any(|w| matches!(
+            w,
+            crate::verify::BlockVerifyWarning::EccDescriptorsUnreadable { .. }
+        )),
+        "the inferred layout must not hide the malformed descriptors: {:?}",
+        report.warnings,
+    );
+    Ok(())
+}
+
+/// Framing pins the trailer LENGTH, never the codec. RS(4,2) and XOR(2,1)
+/// derive the SAME parity length for any payload whose `ceil(N/4)` and
+/// `ceil(N/2)` are both even, so a mirror re-stamped from one to the other
+/// frames perfectly and the descriptor is KEPT — the walk needs the length, and
+/// the length is right.
+///
+/// What the codec question answers is only which explanation to print: the
+/// impostor disagrees with the trailer bytes, the real scheme reproduces them.
+#[cfg(feature = "page_ecc")]
+#[test]
+fn codec_disagrees_everywhere_same_length_scheme_is_flagged_but_not_refused() -> crate::Result<()> {
+    use crate::coding::Encode;
+    use crate::fs::{Fs, FsOpenOptions, StdFs};
+    use crate::table::block::{BlockType, EccParams, Header, expected_parity_len};
+
+    let real = EccParams::RS_4_2;
+    let impostor = EccParams::try_new(2, 1)?;
+    // The collision this test exists for: pick a payload length the two schemes
+    // size identically, so framing alone cannot separate them.
+    const DATA_LENGTH: u32 = 4096;
+    assert_eq!(
+        expected_parity_len(DATA_LENGTH, real),
+        expected_parity_len(DATA_LENGTH, impostor),
+        "the fixture must exercise a length collision, or it proves nothing",
+    );
+
+    // Shards that differ from each other: a uniform payload makes every shard
+    // identical, and BOTH codecs then emit all-zero parity — which would let the
+    // impostor pass for the wrong reason.
+    let payload = discriminating_payload(DATA_LENGTH);
+    let parity = crate::ecc::encode_parity(&payload, 4, 2).expect("RS(4,2) encodes the fixture");
+    let header = Header {
+        checksum: Checksum::from_raw(crate::hash::hash128(&payload)),
+        data_length: DATA_LENGTH,
+        uncompressed_length: DATA_LENGTH,
+        ..Header::test_dummy(BlockType::Data)
+    };
+
+    let mut archive_bytes: Vec<u8> = Vec::new();
+    {
+        let mut writer = crate::sfa::Writer::from_writer(std::io::Cursor::new(&mut archive_bytes));
+        writer.start("data").unwrap();
+        writer.write_all(&header.encode_into_vec()).unwrap();
+        writer.write_all(&payload).unwrap();
+        writer.write_all(&parity).unwrap();
+        writer.finish().unwrap();
+    }
+
+    let dir = tempfile::tempdir()?;
+    let fs = StdFs;
+    let path = dir.path().join("rs42.sst");
+    {
+        let mut f = fs.open(
+            &path,
+            &FsOpenOptions::new().write(true).create(true).truncate(true),
+        )?;
+        f.write_all(&archive_bytes)?;
+    }
+
+    let mut probe = fs.open(&path, &FsOpenOptions::new().read(true))?;
+    let sfa_reader = crate::sfa::Reader::from_reader(&mut probe)?;
+    let toc = sfa_reader.toc();
+    let entry = toc
+        .section(b"data")
+        .expect("the fixture has a data section");
+    let (start, end) = (entry.pos(), entry.pos() + entry.len());
+
+    // Both schemes frame the section: that is exactly the blind spot.
+    assert_eq!(
+        scheme_frames_region(probe.as_ref(), ScrubEcc::Scheme(real), start, end)?,
+        Some(true),
+        "the real scheme must frame its own block",
+    );
+    assert_eq!(
+        scheme_frames_region(probe.as_ref(), ScrubEcc::Scheme(impostor), start, end)?,
+        Some(true),
+        "the same-length impostor frames identically — framing cannot separate them",
+    );
+
+    // BOTH are kept: the length is what the walk needs, and both get it right.
+    // Refusing the impostor here would skip every ECC-bearing section, and a
+    // table carrying range tombstones is then excluded outright.
+    let cap = block_data_length_cap(0);
+    assert_eq!(
+        arbitrate_by_framing(probe.as_ref(), toc, ScrubEcc::Scheme(real), 0)?,
+        Some(true),
+        "the real scheme sizes its own blocks",
+    );
+    assert_eq!(
+        arbitrate_by_framing(probe.as_ref(), toc, ScrubEcc::Scheme(impostor), 0)?,
+        Some(true),
+        "the impostor sizes them identically, so the walk can still proceed — \
+         refusing it would cost the whole table for a parity question",
+    );
+
+    // The trailer bytes separate them, and that difference is reported.
+    assert!(
+        !codec_disagrees_everywhere(probe.as_ref(), toc, ScrubEcc::Scheme(real), 0, cap),
+        "the real scheme reproduces the trailer, so nothing is suspect",
+    );
+    assert!(
+        codec_disagrees_everywhere(probe.as_ref(), toc, ScrubEcc::Scheme(impostor), 0, cap),
+        "the impostor reproduces no trailer — the signature of a mis-identified \
+         scheme, which is what the operator is told",
+    );
+    Ok(())
+}
+
+/// A region that cannot be framed refuses the descriptor even when the others
+/// frame, and `Off` is no exception — it faces the same rule as every scheme.
+///
+/// The split is genuinely ambiguous: a corrupt header explains it if the
+/// descriptor is right, and so does a wrong descriptor whose trailer lengths
+/// coincide for one region's payload sizes and not the other's. Nothing here
+/// tells those apart, so the table is refused rather than walked under a
+/// descriptor that might mis-size every frame in a HEALTHY region.
+///
+/// The cost is the specific finding: the walk skips the ECC-dependent sections
+/// and reports "unrecognized, incomplete" instead of naming the damaged header.
+/// The table still fails verification and still routes to salvage.
+#[test]
+fn verify_sst_file_unframeable_data_region_refuses_the_descriptor() {
+    use crate::fs::{Fs, FsOpenOptions, StdFs};
+
+    let dir = tempfile::tempdir().unwrap();
+    populate_tree(dir.path(), 200);
+    let sst_path = pick_first_sst_path(dir.path());
+
+    // One mirror's descriptor goes to an unknown kind, so the surviving
+    // recognized copy has to be arbitrated rather than trusted outright.
+    crate::test_forge::forge_tail_meta_value(&sst_path, b"descriptor#page_ecc", &[9, 0, 0, 0])
+        .unwrap();
+
+    // Corrupt the FIRST data block's header in place: the data region no longer
+    // frames, while every other section still does.
+    let fs = StdFs;
+    let data_pos = {
+        let mut probe = fs
+            .open(&sst_path, &FsOpenOptions::new().read(true))
+            .unwrap();
+        let reader = crate::sfa::Reader::from_reader(&mut probe).unwrap();
+        reader
+            .toc()
+            .section(b"data")
+            .expect("the SST has a data section")
+            .pos()
+    };
+    {
+        let mut f = fs
+            .open(&sst_path, &FsOpenOptions::new().write(true))
+            .unwrap();
+        f.seek(SeekFrom::Start(data_pos)).unwrap();
+        f.write_all(&[0xFFu8; 16]).unwrap();
+    }
+
+    let report = verify_sst_file(&sst_path);
+    assert!(
+        report
+            .warnings
+            .iter()
+            .any(|w| matches!(w, crate::verify::BlockVerifyWarning::UnrecognizedEcc { .. })),
+        "a region that will not frame refuses the descriptor, whatever the \
+         other regions did: {:?}",
+        report.warnings,
+    );
+    assert!(
+        report.incomplete,
+        "the ECC-dependent sections were skipped, so the scan is incomplete",
+    );
+    assert!(
+        !report.is_ok(),
+        "the table must not verify clean: its data region holds a corrupt header",
+    );
+}
+
+/// A region that could not be READ is not a region that agreed. Framing decides
+/// which descriptor the walk uses, so silently dropping an unreadable region
+/// lets the remaining ones carry the verdict — and if the dropped one is the
+/// one that would have refused, a transient failure here plus a successful
+/// retry in the walk reports corruption across a HEALTHY table.
+///
+/// The fixture puts the refusing region FIRST so the injected failure lands on
+/// it: `data` carries no parity (RS(4,2) cannot frame it) while `tli` does.
+#[cfg(feature = "page_ecc")]
+#[test]
+fn arbitrate_by_framing_propagates_an_unreadable_region() -> crate::Result<()> {
+    use crate::fs::{Fault, FaultFs, FaultOp, FaultRule, Fs, FsOpenOptions, StdFs};
+    use crate::io::ErrorKind;
+    use crate::table::block::EccParams;
+
+    const LEN: u32 = 4096;
+    let real = EccParams::RS_4_2;
+
+    let bare = discriminating_payload(LEN);
+    let framed = discriminating_payload(LEN);
+    let framed_parity = crate::ecc::encode_parity(&framed, 4, 2).expect("RS(4,2) encodes");
+
+    let dir = tempfile::tempdir()?;
+    let path = dir.path().join("unreadable-region.sst");
+    write_block_archive(
+        &path,
+        &[
+            ("data", vec![(bare, Vec::new())]),
+            ("tli", vec![(framed, framed_parity)]),
+        ],
+    )?;
+
+    let mut plain = StdFs.open(&path, &FsOpenOptions::new().read(true))?;
+    let sfa_reader = crate::sfa::Reader::from_reader(&mut plain)?;
+    let toc = sfa_reader.toc();
+
+    // Readable, the first region refuses: the verdict the fault must not erase.
+    assert_eq!(
+        arbitrate_by_framing(plain.as_ref(), toc, ScrubEcc::Scheme(real), 0)?,
+        Some(false),
+        "the parity-less data region cannot frame under RS(4,2) — the premise \
+         of this test",
+    );
+
+    // The first read of that region now fails. Dropping it would leave `tli`
+    // framing alone and the descriptor accepted.
+    let fault = FaultFs::new(StdFs);
+    let injector = fault.injector();
+    injector.arm(FaultRule::new(FaultOp::ReadAt, Fault::Error(ErrorKind::Other)).once());
+    let faulted = fault.open(&path, &FsOpenOptions::new().read(true))?;
+    let verdict = arbitrate_by_framing(faulted.as_ref(), toc, ScrubEcc::Scheme(real), 0);
+    injector.clear();
+    assert!(
+        verdict.is_err(),
+        "an unread region must surface as a read failure, not as a region that \
+         had nothing to say: got {verdict:?}",
+    );
+    Ok(())
+}
+
+/// One synthetic block: its payload and the parity trailer stored after it.
+/// Parity is supplied rather than derived so a test can store a DAMAGED
+/// trailer, which is what separates a wrong codec from a rotted block.
+#[cfg(feature = "page_ecc")]
+type SyntheticBlock = (Vec<u8>, Vec<u8>);
+
+/// Writes a synthetic SFA archive: for each named section, a run of data blocks
+/// carrying `(payload, parity)` exactly as given.
+#[cfg(feature = "page_ecc")]
+fn write_block_archive(
+    path: &std::path::Path,
+    sections: &[(&str, Vec<SyntheticBlock>)],
+) -> crate::Result<()> {
+    use crate::coding::Encode;
+    use crate::fs::{Fs, FsOpenOptions, StdFs};
+    use crate::table::block::{BlockType, Header};
+
+    let mut archive_bytes: Vec<u8> = Vec::new();
+    {
+        let mut writer = crate::sfa::Writer::from_writer(std::io::Cursor::new(&mut archive_bytes));
+        for (name, blocks) in sections {
+            writer.start(*name).unwrap();
+            for (payload, parity) in blocks {
+                #[expect(
+                    clippy::cast_possible_truncation,
+                    reason = "test payloads are kilobytes"
+                )]
+                let header = Header {
+                    checksum: Checksum::from_raw(crate::hash::hash128(payload)),
+                    data_length: payload.len() as u32,
+                    uncompressed_length: payload.len() as u32,
+                    ..Header::test_dummy(BlockType::Data)
+                };
+                writer.write_all(&header.encode_into_vec()).unwrap();
+                writer.write_all(payload).unwrap();
+                writer.write_all(parity).unwrap();
+            }
+        }
+        writer.finish().unwrap();
+    }
+    let mut f = StdFs.open(
+        path,
+        &FsOpenOptions::new().write(true).create(true).truncate(true),
+    )?;
+    f.write_all(&archive_bytes)?;
+    Ok(())
+}
+
+/// A payload whose shards all differ, so the codecs cannot coincide on it.
+/// Period 251 divides neither shard size under RS(4,2) nor under XOR(2,1).
+#[cfg(feature = "page_ecc")]
+fn discriminating_payload(len: u32) -> Vec<u8> {
+    (0..len)
+        .map(|i| u8::try_from(i % 251).expect("the modulus keeps every value below 256"))
+        .collect()
+}
+
+/// A mismatch does not end the region. The report's claim is that the scheme
+/// reproduces NO trailer, so one that it does reproduce refutes it — wherever
+/// it sits. Stopping at the first mismatch would call ordinary scattered rot a
+/// mis-identified scheme and send the operator recompacting a table whose
+/// descriptor is right.
+///
+/// The fixture puts the mismatch FIRST: a block only the real codec reproduces,
+/// then a uniform one whose shards are identical under either split, so both
+/// codecs emit its all-zero parity.
+#[cfg(feature = "page_ecc")]
+#[test]
+fn codec_confirms_region_keeps_scanning_past_a_mismatch() -> crate::Result<()> {
+    use crate::fs::{Fs, FsOpenOptions, StdFs};
+    use crate::table::block::EccParams;
+
+    const LEN: u32 = 4096;
+    let real = EccParams::RS_4_2;
+    let impostor = EccParams::try_new(2, 1)?;
+
+    // Block 2: uniform, so its shards are identical under either split.
+    let degenerate = vec![0xABu8; LEN as usize];
+    let degenerate_parity = crate::ecc::encode_parity(&degenerate, 4, 2).expect("RS(4,2) encodes");
+    assert_eq!(
+        degenerate_parity,
+        crate::ecc::encode_parity(&degenerate, 2, 1).expect("XOR(2,1) encodes"),
+        "the fixture's second block must be one the two codecs agree on, or the \
+         scan has no later match to find",
+    );
+
+    // Block 1: shards differ, so only the real codec reproduces its trailer.
+    let discriminating = discriminating_payload(LEN);
+    let discriminating_parity =
+        crate::ecc::encode_parity(&discriminating, 4, 2).expect("RS(4,2) encodes");
+
+    let dir = tempfile::tempdir()?;
+    let path = dir.path().join("two-blocks.sst");
+    write_block_archive(
+        &path,
+        &[(
+            "data",
+            vec![
+                (discriminating, discriminating_parity),
+                (degenerate, degenerate_parity),
+            ],
+        )],
+    )?;
+
+    let mut probe = StdFs.open(&path, &FsOpenOptions::new().read(true))?;
+    let sfa_reader = crate::sfa::Reader::from_reader(&mut probe)?;
+    let toc = sfa_reader.toc();
+    let cap = block_data_length_cap(0);
+
+    let data = toc
+        .section(b"data")
+        .expect("the fixture has a data section");
+    let (start, end) = (data.pos(), data.pos() + data.len());
+
+    assert_eq!(
+        codec_confirms_region(probe.as_ref(), ScrubEcc::Scheme(real), start, end, cap),
+        CodecVerdict::Confirmed,
+        "the real codec reproduces both trailers",
+    );
+    assert_eq!(
+        codec_confirms_region(probe.as_ref(), ScrubEcc::Scheme(impostor), start, end, cap),
+        CodecVerdict::Confirmed,
+        "the second block's trailer IS reproduced, and a scan that stopped at \
+         the first mismatch would never see it",
+    );
+    assert!(
+        !codec_disagrees_everywhere(probe.as_ref(), toc, ScrubEcc::Scheme(impostor), 0, cap),
+        "one reproduced trailer refutes the report's claim, so a table whose \
+         mismatches are ordinary rot is not blamed on its scheme",
+    );
+    Ok(())
+}
+
+/// A scan that STOPPED is not a scan that found nothing. "No trailer anywhere
+/// is reproduced" can only be said about a region that was inspected to its
+/// end, so a traversal cut short — an unreadable or undecodable header, a
+/// length past the cap, frames that stop tiling — leaves the question
+/// unanswered rather than answered in the negative. Otherwise a mismatch before
+/// the cut plus a matching trailer beyond it reads as a mis-identified scheme,
+/// and the operator recompacts a table whose descriptor is right.
+#[cfg(feature = "page_ecc")]
+#[test]
+fn codec_confirms_region_scan_stops_early_reports_incomplete() -> crate::Result<()> {
+    use crate::coding::Decode;
+    use crate::fs::{Fs, FsOpenOptions, StdFs};
+    use crate::table::block::{EccParams, Header};
+
+    const LEN: u32 = 4096;
+    let impostor = EccParams::try_new(2, 1)?;
+
+    // Block 1 mismatches under the impostor, block 2 (uniform) matches it.
+    let discriminating = discriminating_payload(LEN);
+    let discriminating_parity =
+        crate::ecc::encode_parity(&discriminating, 4, 2).expect("RS(4,2) encodes");
+    let degenerate = vec![0xABu8; LEN as usize];
+    let degenerate_parity = crate::ecc::encode_parity(&degenerate, 4, 2).expect("RS(4,2) encodes");
+
+    let dir = tempfile::tempdir()?;
+    let path = dir.path().join("truncated-scan.sst");
+    write_block_archive(
+        &path,
+        &[(
+            "data",
+            vec![
+                (discriminating, discriminating_parity.clone()),
+                (degenerate, degenerate_parity),
+            ],
+        )],
+    )?;
+
+    let (start, end, second_at) = {
+        let mut probe = StdFs.open(&path, &FsOpenOptions::new().read(true))?;
+        let reader = crate::sfa::Reader::from_reader(&mut probe)?;
+        let data = reader
+            .toc()
+            .section(b"data")
+            .expect("the fixture has a data section");
+        let head = crate::file::read_exact(probe.as_ref(), data.pos(), Header::MAX_LEN)?;
+        let header = Header::decode_from(&mut &head[..])?;
+        let frame = Header::header_len(header.block_type) as u64
+            + u64::from(header.data_length)
+            + discriminating_parity.len() as u64;
+        (data.pos(), data.pos() + data.len(), data.pos() + frame)
+    };
+
+    // The second block's header no longer decodes, so the scan stops after the
+    // first — the one that mismatches.
+    {
+        let mut f = StdFs.open(&path, &FsOpenOptions::new().write(true))?;
+        f.seek(SeekFrom::Start(second_at))?;
+        f.write_all(&[0xFFu8; 16])?;
+    }
+
+    let mut probe = StdFs.open(&path, &FsOpenOptions::new().read(true))?;
+    let sfa_reader = crate::sfa::Reader::from_reader(&mut probe)?;
+    let toc = sfa_reader.toc();
+    let cap = block_data_length_cap(0);
+
+    assert_eq!(
+        codec_confirms_region(probe.as_ref(), ScrubEcc::Scheme(impostor), start, end, cap),
+        CodecVerdict::Incomplete,
+        "the region was not inspected to its end, so it cannot say the scheme \
+         reproduces nothing",
+    );
+    assert!(
+        !codec_disagrees_everywhere(probe.as_ref(), toc, ScrubEcc::Scheme(impostor), 0, cap),
+        "and no diagnosis is reported off a truncated probe",
+    );
+    Ok(())
+}
+
+/// An EMPTY region was not cut short — there was nothing to cut. Reporting it
+/// as unfinished would let one zero-length section silence the diagnosis for
+/// the whole table, and such a section is not exotic: a restricted view whose
+/// punch offset reaches the end of the data section produces exactly that.
+#[cfg(feature = "page_ecc")]
+#[test]
+fn codec_confirms_region_empty_region_reports_no_evidence() -> crate::Result<()> {
+    use crate::fs::{Fs, FsOpenOptions, StdFs};
+    use crate::table::block::EccParams;
+
+    const LEN: u32 = 4096;
+    let real = EccParams::RS_4_2;
+
+    // `data` rejects: clean payload, rotted trailer.
+    let payload = discriminating_payload(LEN);
+    let mut rotted = crate::ecc::encode_parity(&payload, 4, 2).expect("RS(4,2) encodes");
+    *rotted.first_mut().expect("the trailer is non-empty") ^= 0xFF;
+
+    let dir = tempfile::tempdir()?;
+    let path = dir.path().join("empty-region.sst");
+    write_block_archive(
+        &path,
+        &[("data", vec![(payload, rotted)]), ("filter", Vec::new())],
+    )?;
+
+    let mut probe = StdFs.open(&path, &FsOpenOptions::new().read(true))?;
+    let sfa_reader = crate::sfa::Reader::from_reader(&mut probe)?;
+    let toc = sfa_reader.toc();
+    let cap = block_data_length_cap(0);
+
+    let filter = toc
+        .section(b"filter")
+        .expect("the fixture has a filter section");
+    assert_eq!(filter.len(), 0, "the fixture's filter section is empty");
+    assert_eq!(
+        codec_confirms_region(
+            probe.as_ref(),
+            ScrubEcc::Scheme(real),
+            filter.pos(),
+            filter.pos() + filter.len(),
+            cap,
+        ),
+        CodecVerdict::NoEvidence,
+        "an empty region holds nothing to judge, which is not the same as a \
+         traversal that stopped",
+    );
+    assert!(
+        codec_disagrees_everywhere(probe.as_ref(), toc, ScrubEcc::Scheme(real), 0, cap),
+        "so it leaves the answer to the regions that do hold blocks, instead of \
+         silencing the whole table",
+    );
+    Ok(())
+}
+
+/// The table-wide claim needs EVERY region, so one region's rejection cannot
+/// speak over another region the probe never finished reading. A rotted trailer
+/// in one section beside a section whose scan stopped short is exactly the
+/// mixture that would blame a correct codec: the trailer it reproduces may sit
+/// behind the cut.
+#[cfg(feature = "page_ecc")]
+#[test]
+fn codec_disagrees_everywhere_is_silenced_by_a_region_it_could_not_finish() -> crate::Result<()> {
+    use crate::fs::{Fs, FsOpenOptions, StdFs};
+    use crate::table::block::EccParams;
+
+    const LEN: u32 = 4096;
+    let real = EccParams::RS_4_2;
+
+    // `data`: clean payload, rotted trailer — a complete scan that rejects.
+    let payload = discriminating_payload(LEN);
+    let mut rotted = crate::ecc::encode_parity(&payload, 4, 2).expect("RS(4,2) encodes");
+    *rotted.first_mut().expect("the trailer is non-empty") ^= 0xFF;
+
+    // `tli`: its only header is corrupted below, so the scan stops at once.
+    let other = discriminating_payload(LEN / 2);
+    let other_parity = crate::ecc::encode_parity(&other, 4, 2).expect("RS(4,2) encodes");
+
+    let dir = tempfile::tempdir()?;
+    let path = dir.path().join("mixed-regions.sst");
+    write_block_archive(
+        &path,
+        &[
+            ("data", vec![(payload, rotted)]),
+            ("tli", vec![(other, other_parity)]),
+        ],
+    )?;
+
+    let tli_pos = {
+        let mut probe = StdFs.open(&path, &FsOpenOptions::new().read(true))?;
+        let reader = crate::sfa::Reader::from_reader(&mut probe)?;
+        reader
+            .toc()
+            .section(b"tli")
+            .expect("the fixture has a tli section")
+            .pos()
+    };
+    {
+        let mut f = StdFs.open(&path, &FsOpenOptions::new().write(true))?;
+        f.seek(SeekFrom::Start(tli_pos))?;
+        f.write_all(&[0xFFu8; 16])?;
+    }
+
+    let mut probe = StdFs.open(&path, &FsOpenOptions::new().read(true))?;
+    let sfa_reader = crate::sfa::Reader::from_reader(&mut probe)?;
+    let toc = sfa_reader.toc();
+    let cap = block_data_length_cap(0);
+
+    let data = toc
+        .section(b"data")
+        .expect("the fixture has a data section");
+    let tli = toc.section(b"tli").expect("the fixture has a tli section");
+    assert_eq!(
+        codec_confirms_region(
+            probe.as_ref(),
+            ScrubEcc::Scheme(real),
+            data.pos(),
+            data.pos() + data.len(),
+            cap,
+        ),
+        CodecVerdict::Rejected,
+        "the rotted trailer makes the fully-scanned region reject — one half of \
+         the premise",
+    );
+    assert_eq!(
+        codec_confirms_region(
+            probe.as_ref(),
+            ScrubEcc::Scheme(real),
+            tli.pos(),
+            tli.pos() + tli.len(),
+            cap,
+        ),
+        CodecVerdict::Incomplete,
+        "and the other region was never finished — the other half",
+    );
+    assert!(
+        !codec_disagrees_everywhere(probe.as_ref(), toc, ScrubEcc::Scheme(real), 0, cap),
+        "an unfinished region leaves the table-wide claim unavailable, whatever \
+         a finished one found",
+    );
+    Ok(())
+}
+
+/// A rotted trailer is damage, not a verdict on the descriptor. The table keeps
+/// its scheme, the walk reads the section, and the damaged block is named as
+/// `EccParityMismatch` — which parity may still repair. Refusing the descriptor
+/// here would skip the section instead, and a table carrying range tombstones
+/// would then be excluded outright over one damaged trailer.
+///
+/// It is not reported as suspect either: another region reproduces the trailer,
+/// so the scheme is not the explanation for this one.
+#[cfg(feature = "page_ecc")]
+#[test]
+fn rotted_trailer_keeps_the_descriptor_and_is_not_reported_suspect() -> crate::Result<()> {
+    use crate::fs::{Fs, FsOpenOptions, StdFs};
+    use crate::table::block::EccParams;
+
+    const LEN: u32 = 4096;
+    let real = EccParams::RS_4_2;
+
+    // The data block's payload is clean but its stored trailer is rotted.
+    let payload = discriminating_payload(LEN);
+    let mut rotted = crate::ecc::encode_parity(&payload, 4, 2).expect("RS(4,2) encodes");
+    *rotted.first_mut().expect("the trailer is non-empty") ^= 0xFF;
+
+    // A second region carries a healthy block under the same codec.
+    let healthy = discriminating_payload(LEN / 2);
+    let healthy_parity = crate::ecc::encode_parity(&healthy, 4, 2).expect("RS(4,2) encodes");
+
+    let dir = tempfile::tempdir()?;
+    let path = dir.path().join("rotted-trailer.sst");
+    write_block_archive(
+        &path,
+        &[
+            ("data", vec![(payload, rotted)]),
+            ("tli", vec![(healthy, healthy_parity)]),
+        ],
+    )?;
+
+    let mut probe = StdFs.open(&path, &FsOpenOptions::new().read(true))?;
+    let sfa_reader = crate::sfa::Reader::from_reader(&mut probe)?;
+    let toc = sfa_reader.toc();
+    let cap = block_data_length_cap(0);
+
+    let data = toc
+        .section(b"data")
+        .expect("the fixture has a data section");
+    assert_eq!(
+        codec_confirms_region(
+            probe.as_ref(),
+            ScrubEcc::Scheme(real),
+            data.pos(),
+            data.pos() + data.len(),
+            cap,
+        ),
+        CodecVerdict::Rejected,
+        "the rotted trailer makes the data region reject on its own",
+    );
+    assert_eq!(
+        arbitrate_by_framing(probe.as_ref(), toc, ScrubEcc::Scheme(real), 0)?,
+        Some(true),
+        "damage does not change the trailer LENGTH, so the walk can still read \
+         the section and name the damaged block",
+    );
+    assert!(
+        !codec_disagrees_everywhere(probe.as_ref(), toc, ScrubEcc::Scheme(real), 0, cap),
+        "a region that reproduces the trailer rules the scheme out as the \
+         explanation, leaving the mismatch reported as what it is: damage",
+    );
+    Ok(())
+}
+
+/// An untrusted `data_length` must not size an allocation. The header is not
+/// verified when the arbitration reads it, so a forged one paired with a
+/// re-stamped TOC could ask for gigabytes; past the cap the traversal stops
+/// instead, which is one of the ways a region ends up only partly inspected.
+/// Driven with a tiny cap so the bound itself is what is pinned, rather than
+/// needing a multi-gigabyte fixture to reach the real one.
+#[cfg(feature = "page_ecc")]
+#[test]
+fn codec_confirms_region_skips_a_block_whose_declared_length_exceeds_the_cap() -> crate::Result<()>
+{
+    use crate::fs::{Fs, FsOpenOptions, StdFs};
+    use crate::table::block::EccParams;
+
+    const LEN: u32 = 4096;
+    let real = EccParams::RS_4_2;
+    let payload = discriminating_payload(LEN);
+    let parity = crate::ecc::encode_parity(&payload, 4, 2).expect("RS(4,2) encodes");
+
+    let dir = tempfile::tempdir()?;
+    let path = dir.path().join("capped.sst");
+    write_block_archive(&path, &[("data", vec![(payload, parity)])])?;
+
+    let mut probe = StdFs.open(&path, &FsOpenOptions::new().read(true))?;
+    let sfa_reader = crate::sfa::Reader::from_reader(&mut probe)?;
+    let data = sfa_reader
+        .toc()
+        .section(b"data")
+        .expect("the fixture has a data section");
+    let (start, end) = (data.pos(), data.pos() + data.len());
+
+    assert_eq!(
+        codec_confirms_region(
+            probe.as_ref(),
+            ScrubEcc::Scheme(real),
+            start,
+            end,
+            cap_for_test()
+        ),
+        CodecVerdict::Confirmed,
+        "under the real cap the block is read and confirms the codec",
+    );
+    assert_eq!(
+        codec_confirms_region(probe.as_ref(), ScrubEcc::Scheme(real), start, end, 16),
+        CodecVerdict::Incomplete,
+        "a declared length past the cap stops the traversal instead of sizing a \
+         read, and a stopped traversal answers nothing about the region",
+    );
+    Ok(())
+}
+
+/// The production payload cap, for tests that contrast it with a tiny one.
+#[cfg(feature = "page_ecc")]
+fn cap_for_test() -> u64 {
+    block_data_length_cap(0)
+}
+
+/// The one trailer that refutes the report can sit at the END of a long run of
+/// mismatches, so nothing short of the whole region will do. Nine blocks: eight
+/// that only the real codec reproduces, and a ninth that is uniform, whose
+/// identical shards make both codecs emit the same all-zero parity.
+#[cfg(feature = "page_ecc")]
+#[test]
+fn codec_confirms_region_scans_past_a_run_of_mismatches() -> crate::Result<()> {
+    use crate::fs::{Fs, FsOpenOptions, StdFs};
+    use crate::table::block::EccParams;
+
+    const LEN: u32 = 4096;
+    const MISMATCH_RUN: usize = 8;
+    let real = EccParams::RS_4_2;
+    let impostor = EccParams::try_new(2, 1)?;
+
+    let degenerate = vec![0xABu8; LEN as usize];
+    let degenerate_parity = crate::ecc::encode_parity(&degenerate, 4, 2).expect("RS(4,2) encodes");
+    assert_eq!(
+        degenerate_parity,
+        crate::ecc::encode_parity(&degenerate, 2, 1).expect("XOR(2,1) encodes"),
+        "the LAST block must be one the two codecs agree on, or there is no \
+         match at the far end to find",
+    );
+
+    let discriminating = discriminating_payload(LEN);
+    let discriminating_parity =
+        crate::ecc::encode_parity(&discriminating, 4, 2).expect("RS(4,2) encodes");
+
+    let mut blocks: Vec<SyntheticBlock> = (0..MISMATCH_RUN)
+        .map(|_| (discriminating.clone(), discriminating_parity.clone()))
+        .collect();
+    blocks.push((degenerate, degenerate_parity));
+
+    let dir = tempfile::tempdir()?;
+    let path = dir.path().join("nine-blocks.sst");
+    write_block_archive(&path, &[("data", blocks)])?;
+
+    let mut probe = StdFs.open(&path, &FsOpenOptions::new().read(true))?;
+    let sfa_reader = crate::sfa::Reader::from_reader(&mut probe)?;
+    let toc = sfa_reader.toc();
+    let cap = block_data_length_cap(0);
+
+    let data = toc
+        .section(b"data")
+        .expect("the fixture has a data section");
+    let (start, end) = (data.pos(), data.pos() + data.len());
+
+    assert_eq!(
+        codec_confirms_region(probe.as_ref(), ScrubEcc::Scheme(real), start, end, cap),
+        CodecVerdict::Confirmed,
+        "the real codec reproduces every trailer",
+    );
+    assert_eq!(
+        codec_confirms_region(probe.as_ref(), ScrubEcc::Scheme(impostor), start, end, cap),
+        CodecVerdict::Confirmed,
+        "the ninth block's trailer IS reproduced, and a scan that gave up over \
+         the eight before it would never reach the evidence",
+    );
+    Ok(())
+}
+
+/// Framing carries the verdict, and it only carries it when EVERY judged region
+/// framed. A split verdict says the descriptor sizes one region's blocks and
+/// not another's, and a length that is wrong ANYWHERE is not a length the walk
+/// can advance on: it consumes the wrong trailer across that region and reports
+/// corruption that is not there. So a split fails safe to unrecognized.
+#[cfg(feature = "page_ecc")]
+#[test]
+fn arbitrate_by_framing_rejects_a_split_verdict() -> crate::Result<()> {
+    use crate::fs::{Fs, FsOpenOptions, StdFs};
+    use crate::table::block::{EccParams, Header};
+
+    const LEN: u32 = 4096;
+    let real = EccParams::RS_4_2;
+
+    let payload = discriminating_payload(LEN);
+    let parity = crate::ecc::encode_parity(&payload, 4, 2).expect("RS(4,2) encodes");
+    // The second region's trailer is the WRONG length for this scheme, so its
+    // frames cannot tile the section.
+    let other = discriminating_payload(LEN / 2);
+    let short_parity = vec![0u8; 8];
+
+    let dir = tempfile::tempdir()?;
+    let path = dir.path().join("split.sst");
+    write_block_archive(
+        &path,
+        &[
+            ("data", vec![(payload, parity)]),
+            ("tli", vec![(other, short_parity)]),
+        ],
+    )?;
+
+    // Break the data block's payload checksum WITHOUT touching its framing, so
+    // the region still frames but offers no clean block to judge the codec on.
+    let data_pos = {
+        let mut probe = StdFs.open(&path, &FsOpenOptions::new().read(true))?;
+        let reader = crate::sfa::Reader::from_reader(&mut probe)?;
+        reader
+            .toc()
+            .section(b"data")
+            .expect("the fixture has a data section")
+            .pos()
+    };
+    {
+        let mut f = StdFs.open(&path, &FsOpenOptions::new().write(true))?;
+        // 0xFF differs from this payload's first byte (the pattern starts at 0),
+        // so the write actually changes the checksummed bytes.
+        f.seek(SeekFrom::Start(data_pos + Header::MIN_LEN as u64))?;
+        f.write_all(&[0xFF])?;
+    }
+
+    let mut probe = StdFs.open(&path, &FsOpenOptions::new().read(true))?;
+    let sfa_reader = crate::sfa::Reader::from_reader(&mut probe)?;
+    let toc = sfa_reader.toc();
+    let cap = block_data_length_cap(0);
+
+    let data = toc
+        .section(b"data")
+        .expect("the fixture has a data section");
+    assert_eq!(
+        codec_confirms_region(
+            probe.as_ref(),
+            ScrubEcc::Scheme(real),
+            data.pos(),
+            data.pos() + data.len(),
+            cap,
+        ),
+        CodecVerdict::NoEvidence,
+        "no clean block, so the codec has nothing to say here either",
+    );
+    assert_eq!(
+        arbitrate_by_framing(probe.as_ref(), toc, ScrubEcc::Scheme(real), 0)?,
+        Some(false),
+        "one region framed and the other did not — accepting here walks a \
+         region with the wrong trailer length and reports corruption that is \
+         not there",
+    );
+    Ok(())
+}
+
+/// A single agreement silences the report even when it proves nothing: an
+/// impostor reproduces the all-zero parity of a uniform region, so such a
+/// region "confirms" any codec. The claim the warning makes is "no trailer
+/// anywhere is reproduced, which is what a mis-identified scheme looks like",
+/// and one reproduced trailer, informative or not, is enough to make that claim
+/// false. A mixed picture stays unreported rather than being narrated as a
+/// scheme problem the operator would then chase.
+#[cfg(feature = "page_ecc")]
+#[test]
+fn codec_disagrees_everywhere_is_silenced_by_any_agreement() -> crate::Result<()> {
+    use crate::fs::{Fs, FsOpenOptions, StdFs};
+    use crate::table::block::EccParams;
+
+    const LEN: u32 = 4096;
+    let real = EccParams::RS_4_2;
+    let impostor = EccParams::try_new(2, 1)?;
+
+    // Healthy region: only the real codec reproduces this trailer.
+    let discriminating = discriminating_payload(LEN);
+    let discriminating_parity =
+        crate::ecc::encode_parity(&discriminating, 4, 2).expect("RS(4,2) encodes");
+    // Degenerate region: identical shards, so both codecs emit the same parity.
+    let degenerate = vec![0xABu8; LEN as usize];
+    let degenerate_parity = crate::ecc::encode_parity(&degenerate, 4, 2).expect("RS(4,2) encodes");
+    assert!(
+        degenerate_parity.iter().all(|b| *b == 0),
+        "the degenerate region's trailer must be all-zero, which is what makes \
+         its agreement uninformative",
+    );
+
+    let dir = tempfile::tempdir()?;
+    let path = dir.path().join("degenerate-vs-healthy.sst");
+    write_block_archive(
+        &path,
+        &[
+            ("data", vec![(discriminating, discriminating_parity)]),
+            ("tli", vec![(degenerate, degenerate_parity)]),
+        ],
+    )?;
+
+    let mut probe = StdFs.open(&path, &FsOpenOptions::new().read(true))?;
+    let sfa_reader = crate::sfa::Reader::from_reader(&mut probe)?;
+    let toc = sfa_reader.toc();
+    let cap = block_data_length_cap(0);
+
+    let tli = toc.section(b"tli").expect("the fixture has a tli section");
+    assert_eq!(
+        codec_confirms_region(
+            probe.as_ref(),
+            ScrubEcc::Scheme(impostor),
+            tli.pos(),
+            tli.pos() + tli.len(),
+            cap,
+        ),
+        CodecVerdict::Confirmed,
+        "the impostor agrees with the all-zero region — the premise of this test",
+    );
+    assert!(
+        !codec_disagrees_everywhere(probe.as_ref(), toc, ScrubEcc::Scheme(impostor), 0, cap),
+        "one region disagreed and another agreed, so the report's claim does \
+         not hold and it stays silent",
+    );
+    assert_eq!(
+        arbitrate_by_framing(probe.as_ref(), toc, ScrubEcc::Scheme(real), 0)?,
+        Some(true),
+        "the real scheme sizes both regions",
+    );
+    Ok(())
+}
+
+/// The index TAIL mirror is its own region, and it can be the ONLY one able to
+/// speak. The writer emits it so a damaged index copy cannot take the other
+/// down, and it is written under the same codec — so when neither the data
+/// region nor the head offers a checksum-clean block, the tail is the only
+/// place the codec question can be answered at all.
+#[cfg(feature = "page_ecc")]
+#[test]
+fn codec_disagrees_everywhere_consults_the_tli_tail_mirror() -> crate::Result<()> {
+    use crate::fs::{Fs, FsOpenOptions, StdFs};
+    use crate::table::block::{EccParams, Header};
+
+    const LEN: u32 = 4096;
+    let real = EccParams::RS_4_2;
+
+    let data_payload = discriminating_payload(LEN);
+    let data_parity = crate::ecc::encode_parity(&data_payload, 4, 2).expect("RS(4,2) encodes");
+    // Head index copy: its payload checksum is broken below, so it offers no
+    // evidence either way.
+    let head = discriminating_payload(LEN / 2);
+    let head_parity = crate::ecc::encode_parity(&head, 4, 2).expect("RS(4,2) encodes");
+    // Tail mirror: payload intact, trailer rotted — the one region left with
+    // something to say.
+    let tail = discriminating_payload(LEN / 2);
+    let mut tail_parity = crate::ecc::encode_parity(&tail, 4, 2).expect("RS(4,2) encodes");
+    *tail_parity.first_mut().expect("the trailer is non-empty") ^= 0xFF;
+
+    let dir = tempfile::tempdir()?;
+    let path = dir.path().join("tail-mirror.sst");
+    write_block_archive(
+        &path,
+        &[
+            ("data", vec![(data_payload, data_parity)]),
+            ("tli", vec![(head, head_parity)]),
+            ("tli_tail", vec![(tail, tail_parity)]),
+        ],
+    )?;
+
+    // Break the DATA and HEAD payload checksums so neither offers evidence,
+    // leaving the tail mirror as the only region that can speak.
+    let (data_pos, tli_pos) = {
+        let mut probe = StdFs.open(&path, &FsOpenOptions::new().read(true))?;
+        let reader = crate::sfa::Reader::from_reader(&mut probe)?;
+        let toc = reader.toc();
+        (
+            toc.section(b"data")
+                .expect("the fixture has a data section")
+                .pos(),
+            toc.section(b"tli")
+                .expect("the fixture has a tli section")
+                .pos(),
+        )
+    };
+    {
+        let mut f = StdFs.open(&path, &FsOpenOptions::new().write(true))?;
+        f.seek(SeekFrom::Start(data_pos + Header::MIN_LEN as u64))?;
+        f.write_all(&[0xFF])?;
+        f.seek(SeekFrom::Start(tli_pos + Header::MIN_LEN as u64))?;
+        f.write_all(&[0xFF])?;
+    }
+
+    let mut probe = StdFs.open(&path, &FsOpenOptions::new().read(true))?;
+    let sfa_reader = crate::sfa::Reader::from_reader(&mut probe)?;
+    let toc = sfa_reader.toc();
+    let cap = block_data_length_cap(0);
+
+    let tli = toc.section(b"tli").expect("the fixture has a tli section");
+    assert_eq!(
+        codec_confirms_region(
+            probe.as_ref(),
+            ScrubEcc::Scheme(real),
+            tli.pos(),
+            tli.pos() + tli.len(),
+            cap,
+        ),
+        CodecVerdict::NoEvidence,
+        "the head offers nothing to judge on — the premise of this test",
+    );
+    assert_eq!(
+        arbitrate_by_framing(probe.as_ref(), toc, ScrubEcc::Scheme(real), 0)?,
+        Some(true),
+        "every region frames, so the descriptor stands whatever the trailers say",
+    );
+    assert!(
+        codec_disagrees_everywhere(probe.as_ref(), toc, ScrubEcc::Scheme(real), 0, cap),
+        "only the tail mirror had anything to say, so a region set omitting it \
+         would report nothing at all",
+    );
+    Ok(())
+}
+
+/// The descriptor sizes EVERY block-format section, not the three a hand-kept
+/// list would have named. `range_tombstones` is written under the same
+/// descriptor and sits outside the mirrors, so a region set that omits it
+/// leaves the operator without the one hint that explains this table's
+/// mismatches.
+#[cfg(feature = "page_ecc")]
+#[test]
+fn codec_disagrees_everywhere_consults_sections_outside_the_mirrors() -> crate::Result<()> {
+    use crate::fs::{Fs, FsOpenOptions, StdFs};
+    use crate::table::block::{EccParams, Header};
+
+    const LEN: u32 = 4096;
+    let impostor = EccParams::try_new(2, 1)?;
+
+    // The data region's payload checksum is broken below, so it says nothing
+    // and cannot silence the report before the section under test is reached.
+    let silent = discriminating_payload(LEN);
+    let silent_parity = crate::ecc::encode_parity(&silent, 4, 2).expect("RS(4,2) encodes");
+
+    // `range_tombstones` discriminates: only the real codec matches it.
+    let discriminating = discriminating_payload(LEN);
+    let discriminating_parity =
+        crate::ecc::encode_parity(&discriminating, 4, 2).expect("RS(4,2) encodes");
+
+    let dir = tempfile::tempdir()?;
+    let path = dir.path().join("outside-mirrors.sst");
+    write_block_archive(
+        &path,
+        &[
+            ("data", vec![(silent, silent_parity)]),
+            (
+                "range_tombstones",
+                vec![(discriminating, discriminating_parity)],
+            ),
+        ],
+    )?;
+
+    let data_pos = {
+        let mut probe = StdFs.open(&path, &FsOpenOptions::new().read(true))?;
+        let reader = crate::sfa::Reader::from_reader(&mut probe)?;
+        reader
+            .toc()
+            .section(b"data")
+            .expect("the fixture has a data section")
+            .pos()
+    };
+    {
+        let mut f = StdFs.open(&path, &FsOpenOptions::new().write(true))?;
+        f.seek(SeekFrom::Start(data_pos + Header::MIN_LEN as u64))?;
+        f.write_all(&[0xFF])?;
+    }
+
+    let mut probe = StdFs.open(&path, &FsOpenOptions::new().read(true))?;
+    let sfa_reader = crate::sfa::Reader::from_reader(&mut probe)?;
+    let toc = sfa_reader.toc();
+    let cap = block_data_length_cap(0);
+
+    let rt = toc
+        .section(b"range_tombstones")
+        .expect("the fixture has a range_tombstones section");
+    let data = toc
+        .section(b"data")
+        .expect("the fixture has a data section");
+    assert_eq!(
+        codec_confirms_region(
+            probe.as_ref(),
+            ScrubEcc::Scheme(impostor),
+            rt.pos(),
+            rt.pos() + rt.len(),
+            cap,
+        ),
+        CodecVerdict::Rejected,
+        "the section outside the mirrors is the only one that disagrees — the \
+         premise of this test",
+    );
+    assert_eq!(
+        codec_confirms_region(
+            probe.as_ref(),
+            ScrubEcc::Scheme(impostor),
+            data.pos(),
+            data.pos() + data.len(),
+            cap,
+        ),
+        CodecVerdict::NoEvidence,
+        "and the data region says nothing, so it cannot silence the report",
+    );
+    assert!(
+        codec_disagrees_everywhere(probe.as_ref(), toc, ScrubEcc::Scheme(impostor), 0, cap),
+        "a section the descriptor sizes is consulted wherever it sits",
+    );
+    Ok(())
 }
