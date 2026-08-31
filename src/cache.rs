@@ -215,6 +215,14 @@ impl Cache {
         self.data.capacity()
     }
 
+    /// The heaviest entry this cache can actually keep resident: one shard's
+    /// capacity. Heavier inserts are refused by the cache; callers that would
+    /// build such an entry (e.g. the scan read-ahead) can skip the work.
+    #[must_use]
+    pub(crate) fn max_entry_weight(&self) -> u64 {
+        self.data.max_entry_weight()
+    }
+
     #[doc(hidden)]
     #[must_use]
     pub fn get_block(&self, id: GlobalTableId, offset: BlockOffset) -> Option<Block> {

@@ -55,6 +55,25 @@ fn replace_adjusts_weight_in_place() {
     assert_eq!(c.weight(), 30);
 }
 
+/// An entry heavier than one shard's capacity can never stay resident: letting
+/// it in evicts the shard's whole population and then the entry itself goes.
+/// It must be refused at the door, leaving the resident set untouched.
+#[test]
+fn oversized_entry_is_rejected_without_evicting_residents() {
+    // 800 bytes over 8 shards = 100 bytes per shard.
+    let c = byte_cache(800);
+    for k in 0..20u64 {
+        c.insert(k, vec![0u8; 30]);
+    }
+    let before = c.weight();
+    assert!(before > 0);
+
+    // Heavier than any shard (100), lighter than the whole cache (800).
+    c.insert(1000, vec![0u8; 150]);
+    assert_eq!(c.get(&1000), None, "an uncacheable entry is not admitted");
+    assert_eq!(c.weight(), before, "the resident set is untouched");
+}
+
 #[test]
 fn eviction_keeps_resident_under_capacity() {
     let c = byte_cache(1_000);

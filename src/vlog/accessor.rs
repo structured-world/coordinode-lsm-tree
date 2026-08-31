@@ -303,6 +303,13 @@ impl<'a> Accessor<'a> {
                 // has not reached yet. Deducting after the fact would let the
                 // last value of a window exceed the bound by its own size.
                 let weight = (key.len() + value.len()) as u64;
+                // A value heavier than one cache shard can never stay
+                // resident (the cache refuses it), so inserting it would
+                // spend admission budget on nothing. Skip it and keep
+                // warming the span's other records.
+                if weight > cache.max_entry_weight() {
+                    continue;
+                }
                 if weight > *admit_budget {
                     *admit_budget = 0;
                     return;
