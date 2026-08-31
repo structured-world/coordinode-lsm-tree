@@ -326,19 +326,46 @@ impl<S: MergeSource, C: UserComparator + Clone> Iterator for SeekingMerger<S, C>
                 return Some(Err(e));
             }
         }
-        // Single mut borrow on the tree field — split-borrow with
+        // Single mut borrow per tree field — split-borrow with
         // self.sources is OK because they're disjoint struct fields.
-        let tree = self.forward_tree.as_mut()?;
+        let Self {
+            sources,
+            forward_tree,
+            backward_tree,
+            pending_forward_error,
+            ..
+        } = self;
+        let tree = forward_tree.as_mut()?;
         // winner_slot returns the source index directly (by
         // construction every MergerEntry's `source` field equals
         // its slot index). Avoids a separate peek_min call. None
         // means the tournament is exhausted.
+        // When this tournament is spent, every source is drained
+        // forward. Whatever the BACKWARD one still holds is therefore
+        // all that remains of the range, and it belongs to whichever
+        // end asks next — this one. Adopt those buffered heads and
+        // carry on; `take_slot` MOVES each, so none can be emitted
+        // from both ends.
+        //
+        // The trigger is this tournament running dry, not a single
+        // source doing so: a source can be exhausted forward while the
+        // backward walk is still stepping toward its buffered head, and
+        // claiming it then would yield it twice. Nothing left on this
+        // side is the point where the other end can no longer have a
+        // claim.
+        if tree.is_empty() {
+            let other = backward_tree.as_mut()?;
+            if other.is_empty() {
+                return None;
+            }
+            tree.refill_with(|slot| other.take_slot(slot));
+        }
         let source = tree.winner_slot()?;
         #[expect(
             clippy::indexing_slicing,
             reason = "source index < n_sources by construction"
         )]
-        let next_pull = MergeSource::next(&mut self.sources[source]);
+        let next_pull = MergeSource::next(&mut sources[source]);
         match next_pull {
             Some(Ok(next_value)) => {
                 let old = tree.replace_min(MergerEntry {
@@ -354,14 +381,13 @@ impl<S: MergeSource, C: UserComparator + Clone> Iterator for SeekingMerger<S, C>
                 // get_or_insert preserves the FIRST queued error
                 // (matches the init-path semantic).
                 let old = tree.pop_min()?;
-                self.pending_forward_error.get_or_insert(e);
+                pending_forward_error.get_or_insert(e);
                 Some(Ok(old.value))
             }
             None => {
-                // Source exhausted forward. Do NOT migrate from
-                // backward_tree here — the buffered backward value
-                // still legitimately belongs to backward direction.
-                // Migration only happens at INIT.
+                // Source exhausted forward: drop its slot. Anything the
+                // backward tournament buffers for it stays there until
+                // this tournament empties out (see `winner_slot` above).
                 let old = tree.pop_min()?;
                 Some(Ok(old.value))
             }
@@ -396,13 +422,32 @@ impl<S: CoherentMergeSource, C: UserComparator + Clone> DoubleEndedIterator
                 return Some(Err(e));
             }
         }
-        let tree = self.backward_tree.as_mut()?;
+        // Split-borrow, as in `next()`: the two tournaments and the sources are
+        // disjoint fields, and the exhausted-source arm below needs all three.
+        let Self {
+            sources,
+            forward_tree,
+            backward_tree,
+            pending_backward_error,
+            ..
+        } = self;
+        let tree = backward_tree.as_mut()?;
+        // Mirror of `next()`: once this tournament is spent, the heads the
+        // FORWARD one still buffers are the remainder of the range and this
+        // end is the one asking for them.
+        if tree.is_empty() {
+            let other = forward_tree.as_mut()?;
+            if other.is_empty() {
+                return None;
+            }
+            tree.refill_with(|slot| other.take_slot(slot));
+        }
         let source = tree.winner_slot()?;
         #[expect(
             clippy::indexing_slicing,
             reason = "source index < n_sources by construction"
         )]
-        let next_pull = MergeSource::next_back(&mut self.sources[source]);
+        let next_pull = MergeSource::next_back(&mut sources[source]);
         match next_pull {
             Some(Ok(next_value)) => {
                 let old = tree.replace_min(MergerEntry {
@@ -413,7 +458,7 @@ impl<S: CoherentMergeSource, C: UserComparator + Clone> DoubleEndedIterator
             }
             Some(Err(e)) => {
                 let old = tree.pop_min()?;
-                self.pending_backward_error.get_or_insert(e);
+                pending_backward_error.get_or_insert(e);
                 Some(Ok(old.value))
             }
             None => {

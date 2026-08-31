@@ -620,3 +620,82 @@ fn backward_refill_error_yields_buffered_then_err_on_next_call() {
     assert!(m.next_back().unwrap().is_err());
     assert!(m.next_back().is_none());
 }
+
+/// A `DoubleEndedIterator` must let its two ends meet in the middle exactly
+/// once. The merger keeps a separate tournament per direction over the SAME
+/// sources, so a value already pulled into the forward tournament is no longer
+/// in its source: once that source runs dry backward, the backward walk has to
+/// pick that buffered value up, or it is never emitted from either end.
+#[test]
+fn forward_step_then_backward_drain_yields_every_item() {
+    let cmp = comparator::default_comparator();
+    let a = VecSource::new(
+        [
+            make_iv(b"a", 0),
+            make_iv(b"c", 0),
+            make_iv(b"e", 0),
+            make_iv(b"g", 0),
+        ],
+        cmp.clone(),
+    );
+    let b = VecSource::new(
+        [
+            make_iv(b"b", 0),
+            make_iv(b"d", 0),
+            make_iv(b"f", 0),
+            make_iv(b"h", 0),
+        ],
+        cmp.clone(),
+    );
+    let mut m = SeekingMerger::new(alloc::vec![a, b], cmp);
+
+    let mut keys = alloc::vec![k(&m.next().unwrap().unwrap())];
+    while let Some(item) = m.next_back() {
+        keys.push(k(&item.unwrap()));
+    }
+    keys.sort();
+
+    assert_eq!(
+        keys,
+        ["a", "b", "c", "d", "e", "f", "g", "h"],
+        "an item was stranded between the two tournaments",
+    );
+}
+
+/// The mirror: a backward step buffers a value in the backward tournament, and
+/// a forward drain has to pick it up once its source runs dry forward.
+#[test]
+fn backward_step_then_forward_drain_yields_every_item() {
+    let cmp = comparator::default_comparator();
+    let a = VecSource::new(
+        [
+            make_iv(b"a", 0),
+            make_iv(b"c", 0),
+            make_iv(b"e", 0),
+            make_iv(b"g", 0),
+        ],
+        cmp.clone(),
+    );
+    let b = VecSource::new(
+        [
+            make_iv(b"b", 0),
+            make_iv(b"d", 0),
+            make_iv(b"f", 0),
+            make_iv(b"h", 0),
+        ],
+        cmp.clone(),
+    );
+    let mut m = SeekingMerger::new(alloc::vec![a, b], cmp);
+
+    let mut keys = alloc::vec![k(&m.next_back().unwrap().unwrap())];
+    for item in &mut m {
+        keys.push(k(&item.unwrap()));
+    }
+    keys.sort();
+
+    assert_eq!(
+        keys,
+        ["a", "b", "c", "d", "e", "f", "g", "h"],
+        "an item was stranded between the two tournaments",
+    );
+}
