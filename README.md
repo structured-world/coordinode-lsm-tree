@@ -9,7 +9,7 @@
 [![dependency status](https://deps.rs/repo/github/structured-world/coordinode-lsm-tree/status.svg)](https://deps.rs/repo/github/structured-world/coordinode-lsm-tree)
 [![License](https://img.shields.io/badge/license-Apache--2.0-blue)](#license)
 
-Embedded LSM-tree storage engine in **pure Rust**: no C or C++ dependency, no build toolchain beyond cargo, and `no_std`-capable down to bare metal. Point reads, prefix and range scans, MVCC snapshots, compaction and a block cache, plus what its peers leave to you: encryption at rest, per-block ECC that repairs bit-rot on read, columnar blocks, change-data-capture that survives compaction, and compaction that still completes on a near-full disk.
+Embedded LSM-tree storage engine in **pure Rust**: no C or C++ dependency, no build toolchain beyond cargo, and `no_std`-capable down to bare metal. Point reads, prefix and range scans, MVCC snapshots, compaction and a block cache, plus what its peers leave to you: encryption at rest, per-block ECC that repairs bit-rot on read, columnar blocks, change-data-capture that survives compaction, and compaction that still completes on a near-full disk (opt-in, Linux).
 
 No write-ahead log: durability is the caller's responsibility. Built for [CoordiNode](https://github.com/structured-world/coordinode); usable standalone.
 
@@ -122,7 +122,7 @@ workload needs; for throughput / latency see [Benchmarks](#benchmarks).
 | Per-block ECC + self-heal | ✅ | no | no | no |
 | Columnar (PAX) blocks | ✅ | no | no | no |
 | CDC surviving compaction | ✅ (data-block grain) | WAL tail only | no | no |
-| Compaction on a near-full disk | ✅ (slice-wise, hole-punch reclaim) | no (needs full headroom) | no | n/a (no compaction) |
+| Compaction on a near-full disk | ✅ opt-in (slice-wise hole-punch reclaim, Linux) | no (needs full headroom) | no | n/a (no compaction) |
 | Built-in durability / WAL | external (caller-owned) | ✅ | ✅ | ✅ |
 | Pluggable FS / `io_uring` | ✅ | no | no | no |
 
@@ -244,7 +244,7 @@ cargo run --release --features flamegraph -- \
 | Tool | Use |
 |------|-----|
 | [`tools/db_bench`](tools/db_bench) | RocksDB-compatible benchmark suite, also drives the CI perf dashboard. |
-| [`tools/sst-dump`](tools/sst-dump) | Inspect, verify and rescue SSTs out-of-band, without ever opening a `Tree`. The inspection commands read one SST and need no manifest; `repair` is the exception, taking a whole database directory and writing it a new one. See its [subcommands](#sst-dump-subcommands) below. |
+| [`tools/sst-dump`](tools/sst-dump) | Inspect, verify and rescue SSTs out-of-band, without ever opening a `Tree`. The inspection commands read one SST and need no manifest; `repair` is the exception, taking a whole database directory and rebuilding its `MANIFEST`. See its [subcommands](#sst-dump-subcommands) below. |
 
 <a id="sst-dump-subcommands"></a>
 
