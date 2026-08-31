@@ -154,7 +154,8 @@ enum ParkedCache {
 /// its last (re)initialization — the only slots that can hold a parked leaf.
 /// `cache` memoizes the scan's best candidate: the parked set changes only at
 /// discrete events (a slot vacates, the opposite direction steps, a claim, a
-/// full refill), all of which reset the cache to `None`, so a long drain in
+/// full refill), all of which reset the cache to [`ParkedCache::Stale`], so a
+/// long drain in
 /// one direction pays the O(exhausted) scan once and an O(1) comparison per
 /// item after — not the scan per item. An ORDERED structure over the parked
 /// heads would not do better: it only pays off when the scan repeats, and the
