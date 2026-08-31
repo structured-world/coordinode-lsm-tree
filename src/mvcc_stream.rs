@@ -335,7 +335,13 @@ impl<I: DoubleEndedIterator<Item = crate::Result<InternalValue>>> DoubleEndedIte
                 }
             };
 
-            if prev.key.user_key < tail.key.user_key {
+            // Key boundary = DIFFERENT key, by identity (byte equality), not by
+            // bytewise `<`: the merger already yields comparator order, so
+            // `prev` is never a later key than `tail` — but under a custom
+            // comparator a different key may sort bytewise-higher, and a
+            // bytewise `<` here classified it as "same key" and dropped it.
+            // Byte equality is also cheaper (length short-circuit, no ordering).
+            if !crate::comparator::same_user_key(&prev.key.user_key, &tail.key.user_key) {
                 // `tail` is the newest entry for this key — boundary reached.
                 // Only merge if the newest entry is a MergeOperand.
                 if has_merge_op
