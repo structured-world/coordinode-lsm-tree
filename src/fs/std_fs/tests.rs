@@ -285,17 +285,17 @@ fn fs_read_blocks_batched_across_files() -> io::Result<()> {
             crate::fs::BlockRead {
                 file: f0.as_ref(),
                 offset: 10,
-                buf: crate::fs::BlockBuf::from_init(&mut b0),
+                buf: crate::fs::BlockBuf::new(&mut b0),
             },
             crate::fs::BlockRead {
                 file: f1.as_ref(),
                 offset: 20,
-                buf: crate::fs::BlockBuf::from_init(&mut b1),
+                buf: crate::fs::BlockBuf::new(&mut b1),
             },
             crate::fs::BlockRead {
                 file: f0.as_ref(),
                 offset: 0,
-                buf: crate::fs::BlockBuf::from_init(&mut b2),
+                buf: crate::fs::BlockBuf::new(&mut b2),
             },
         ];
         fs.read_blocks_batched(&mut reqs)?;
@@ -340,7 +340,7 @@ fn fs_read_blocks_batched_short_read_at_eof_errors() -> io::Result<()> {
         let mut reqs = vec![crate::fs::BlockRead {
             file: file.as_ref(),
             offset: 0,
-            buf: crate::fs::BlockBuf::from_init(&mut buf),
+            buf: crate::fs::BlockBuf::new(&mut buf),
         }];
         let err = fs.read_blocks_batched(&mut reqs).unwrap_err();
         assert_eq!(err.kind(), io::ErrorKind::UnexpectedEof);

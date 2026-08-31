@@ -582,12 +582,12 @@ fn read_blocks_batched_across_files_via_ring() -> io::Result<()> {
             crate::fs::BlockRead {
                 file: f0.as_ref(),
                 offset: 10,
-                buf: &mut b0,
+                buf: crate::fs::BlockBuf::new(&mut b0),
             },
             crate::fs::BlockRead {
                 file: f1.as_ref(),
                 offset: 20,
-                buf: &mut b1,
+                buf: crate::fs::BlockBuf::new(&mut b1),
             },
         ];
         fs.read_blocks_batched(&mut reqs)?;
@@ -646,12 +646,12 @@ fn read_blocks_batched_short_read_at_eof_errors() -> io::Result<()> {
             crate::fs::BlockRead {
                 file: file.as_ref(),
                 offset: 0,
-                buf: &mut short,
+                buf: crate::fs::BlockBuf::new(&mut short),
             },
             crate::fs::BlockRead {
                 file: file.as_ref(),
                 offset: 4,
-                buf: &mut ok,
+                buf: crate::fs::BlockBuf::new(&mut ok),
             },
         ];
         match fs.read_blocks_batched(&mut reqs) {
@@ -691,12 +691,12 @@ fn read_blocks_batched_fallback_short_read_errors() -> io::Result<()> {
             crate::fs::BlockRead {
                 file: uring_file.as_ref(),
                 offset: 0,
-                buf: &mut b0,
+                buf: crate::fs::BlockBuf::new(&mut b0),
             },
             crate::fs::BlockRead {
                 file: std_file.as_ref(),
                 offset: 0,
-                buf: &mut b1,
+                buf: crate::fs::BlockBuf::new(&mut b1),
             },
         ];
         match fs.read_blocks_batched(&mut reqs) {
@@ -737,12 +737,12 @@ fn read_blocks_batched_falls_back_for_non_uring_file() -> io::Result<()> {
             crate::fs::BlockRead {
                 file: uring_file.as_ref(),
                 offset: 10,
-                buf: &mut b0,
+                buf: crate::fs::BlockBuf::new(&mut b0),
             },
             crate::fs::BlockRead {
                 file: std_file.as_ref(),
                 offset: 20,
-                buf: &mut b1,
+                buf: crate::fs::BlockBuf::new(&mut b1),
             },
         ];
         fs.read_blocks_batched(&mut reqs)?;
