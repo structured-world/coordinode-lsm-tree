@@ -15,7 +15,9 @@ use lsm_tree::{
 /// accidentally compare equal.
 fn value_for(i: usize) -> Vec<u8> {
     let mut v = format!("value-{i:06}-").into_bytes();
-    v.resize(400, b'a'.wrapping_add((i % 17) as u8));
+    // `i % 17` is 0..=16, so the byte conversion is exact.
+    let fill = u8::try_from(i % 17).unwrap_or(0);
+    v.resize(400, b'a'.wrapping_add(fill));
     v
 }
 

@@ -21,7 +21,7 @@ use lsm_tree::{
 };
 use std::time::{Duration, Instant};
 
-const KEYS: u64 = 20_000;
+const KEYS: usize = 20_000;
 /// Comfortably over the 1 KiB default separation threshold is not needed: the
 /// bench sets the threshold to 1, and a few hundred bytes per value is the size
 /// where per-value read overhead dominates, which is what read-ahead targets.
@@ -65,6 +65,39 @@ fn scan_all(tree: &AnyTree) -> usize {
     n
 }
 
+/// Reports the tail of a set of per-scan durations.
+///
+/// Criterion's own estimate is a central one, and read-ahead is a change to
+/// how a scan does its I/O: the interesting question is not only whether the
+/// typical scan got faster but whether the slow ones did. Nearest-rank, so
+/// every reported value is a scan that actually happened.
+fn report_tail(name: &str, mut samples: Vec<Duration>) {
+    if samples.is_empty() {
+        return;
+    }
+    samples.sort_unstable();
+
+    let at = |q: f64| -> Duration {
+        #[expect(
+            clippy::cast_possible_truncation,
+            clippy::cast_sign_loss,
+            clippy::cast_precision_loss,
+            reason = "rank is clamped into 0..samples.len(), which is a bench-sized count"
+        )]
+        let rank = ((samples.len() as f64 * q).ceil() as usize).clamp(1, samples.len()) - 1;
+        samples.get(rank).copied().unwrap_or_default()
+    };
+
+    println!(
+        "{name}: scans={} p50={:?} p99={:?} p999={:?} max={:?}",
+        samples.len(),
+        at(0.50),
+        at(0.99),
+        at(0.999),
+        samples.last().copied().unwrap_or_default(),
+    );
+}
+
 fn bench_scan(c: &mut Criterion) {
     let dir = tempfile::tempdir().expect("tempdir");
     populate(dir.path()).expect("populate");
@@ -73,6 +106,10 @@ fn bench_scan(c: &mut Criterion) {
     group.sample_size(20);
 
     for (name, window) in [("prefetch_off", 0u16), ("prefetch_on", 64)] {
+        // Every scan of this arm, across all of Criterion's iterations, so the
+        // tail is drawn from the whole run rather than one batch.
+        let mut samples: Vec<Duration> = Vec::new();
+
         group.bench_function(name, |b| {
             b.iter_custom(|iters| {
                 let mut total = Duration::ZERO;
@@ -83,13 +120,18 @@ fn bench_scan(c: &mut Criterion) {
 
                     let start = Instant::now();
                     let n = scan_all(&tree);
-                    total += start.elapsed();
+                    let elapsed = start.elapsed();
 
-                    assert_eq!(n as u64, KEYS, "scan must cover the whole tree");
+                    assert_eq!(n, KEYS, "scan must cover the whole tree");
+
+                    samples.push(elapsed);
+                    total += elapsed;
                 }
                 total
             });
         });
+
+        report_tail(name, samples);
     }
 
     group.finish();
