@@ -33,6 +33,9 @@ pub struct Guard {
     tree: crate::BlobTree,
     version: Version,
     kv: crate::Result<InternalValue>,
+    /// Present when this guard came from a scan that can read ahead; resolving
+    /// a value through it is what arms that read-ahead.
+    prefetch: Option<Arc<ScanPrefetch>>,
 }
 
 impl IterGuard for Guard {
@@ -43,6 +46,9 @@ impl IterGuard for Guard {
         let kv = self.kv?;
 
         if pred(&kv.key.user_key) {
+            if let Some(p) = &self.prefetch {
+                p.note_resolved();
+            }
             resolve_value_handle(
                 self.tree.id(),
                 &self.tree.index.config.cache,
@@ -79,6 +85,9 @@ impl IterGuard for Guard {
     }
 
     fn into_inner(self) -> crate::Result<(UserKey, UserValue)> {
+        if let Some(p) = &self.prefetch {
+            p.note_resolved();
+        }
         resolve_value_handle(
             self.tree.id(),
             &self.tree.index.config.cache,
@@ -312,6 +321,36 @@ impl BlobTree {
 
 impl crate::abstract_tree::sealed::Sealed for BlobTree {}
 
+/// Wasted bytes between two blob records worth reading through to merge their
+/// reads. One record's header plus a short key is under a hundred bytes, so a
+/// gap this size means the records are effectively adjacent: the skipped bytes
+/// cost less than the second read's setup would.
+const PREFETCH_MAX_GAP: u64 = 4 * 1_024;
+
+/// Cap on a single coalesced prefetch read. Bounds the transient buffer a scan
+/// holds regardless of how large the configured window is or how big the values
+/// in it turn out to be.
+const PREFETCH_MAX_READ: usize = 4 * 1_024 * 1_024;
+
+impl BlobTree {
+    /// Read-ahead state for one scan, seeded from the tree's configuration.
+    fn scan_prefetch_state(&self) -> Arc<ScanPrefetch> {
+        let window = self
+            .index
+            .config
+            .kv_separation_opts
+            .as_ref()
+            .map_or(0, |o| o.scan_prefetch as usize);
+
+        Arc::new(ScanPrefetch {
+            resolving: core::sync::atomic::AtomicBool::new(false),
+            window,
+            max_gap: PREFETCH_MAX_GAP,
+            max_read: PREFETCH_MAX_READ,
+        })
+    }
+}
+
 /// Maps a raw merge-pipeline item into a KV-separated iterator guard that
 /// resolves the blob handle lazily against `version`.
 fn blob_guard(
@@ -323,7 +362,190 @@ fn blob_guard(
         tree: tree.clone(),
         version: version.clone(),
         kv: item,
+        prefetch: None,
     })
+}
+
+/// Whether a scan's caller is actually resolving separated values, shared
+/// between the scan iterator and the guards it has handed out.
+///
+/// A guard resolves its value only if the caller asks: `key()` never touches
+/// the blob file, and `into_inner_if` can reject an item on its key first.
+/// Reading ahead unconditionally would therefore charge a key-only scan for
+/// values nobody wants. So the guards report the first resolution, and only
+/// then does the iterator start reading ahead: a scan that never asks for a
+/// value never pays, and one that asks for every value pays a solo read just
+/// for the first.
+pub(crate) struct ScanPrefetch {
+    resolving: core::sync::atomic::AtomicBool,
+    /// How many upcoming items to gather per read-ahead.
+    window: usize,
+    /// Wasted bytes between two records worth swallowing to merge their reads.
+    max_gap: u64,
+    /// Cap on one coalesced read.
+    max_read: usize,
+}
+
+impl ScanPrefetch {
+    /// Records that the caller resolved a value, arming the read-ahead.
+    pub(crate) fn note_resolved(&self) {
+        self.resolving
+            .store(true, core::sync::atomic::Ordering::Relaxed);
+    }
+
+    /// Whether the next item should come from a read-ahead window. A zero
+    /// window is checked here so a disabled knob costs one load per item
+    /// instead of an empty refill.
+    fn armed(&self) -> bool {
+        self.window > 0 && self.resolving.load(core::sync::atomic::Ordering::Relaxed)
+    }
+}
+
+/// A KV-separated scan that reads its upcoming values ahead in coalesced runs.
+///
+/// Sits between the merge pipeline and the guards: it buffers a window of
+/// upcoming items, warms their blobs through
+/// [`Accessor::prefetch`](crate::vlog::Accessor::prefetch), and hands them out
+/// one at a time. Guards resolve exactly as they always did, and hit the cache
+/// instead of the disk.
+struct PrefetchScan<I> {
+    inner: I,
+    /// Items pulled from the FRONT of `inner` and not yet handed out.
+    buf: alloc::collections::VecDeque<crate::Result<InternalValue>>,
+    /// Set once `inner` has yielded its last item from the back, which is when
+    /// reverse iteration has to start draining `buf` instead.
+    inner_back_done: bool,
+    /// Latched copy of [`ScanPrefetch::armed`]. The shared flag only ever goes
+    /// false to true, so once this iterator has seen it there is no reason to
+    /// keep loading the atomic for every item it yields.
+    armed: bool,
+    state: Arc<ScanPrefetch>,
+    tree: crate::BlobTree,
+    version: Version,
+}
+
+impl<I: Iterator<Item = crate::Result<InternalValue>>> PrefetchScan<I> {
+    /// Pulls the next window into `buf` and warms the values it points at.
+    fn fill(&mut self) {
+        // Sized here rather than at construction: a scan that never resolves a
+        // value never refills, and should not pay for a window it will not use.
+        // After the first refill the capacity persists, so this is a no-op.
+        self.buf.reserve(self.state.window);
+        for _ in 0..self.state.window {
+            match self.inner.next() {
+                Some(item) => self.buf.push_back(item),
+                None => break,
+            }
+        }
+
+        // Decode the handles of the items that actually carry one. A window is
+        // usually all-indirection or all-inline (separation is by value size),
+        // so this is either the whole window or nothing. Sized up front: the
+        // window is the only allocation a refill makes, and `prefetch` filters
+        // and sorts it in place rather than building its own copy.
+        //
+        // The indirection is decoded from a BORROWED view of the value. Cloning
+        // it would bump a refcount per item on the scan's hottest loop, for a
+        // cursor that is dropped three lines later.
+        let mut handles: Vec<(&[u8], crate::vlog::ValueHandle, usize)> =
+            Vec::with_capacity(self.buf.len());
+        for item in &self.buf {
+            let Ok(kv) = item else { continue };
+            if !kv.key.value_type.is_indirection() {
+                continue;
+            }
+            let mut cursor = crate::io::Cursor::new(&kv.value[..]);
+            let Ok(vptr) = BlobIndirection::decode_from(&mut cursor) else {
+                continue;
+            };
+            handles.push((&kv.key.user_key, vptr.vhandle, 0));
+        }
+
+        if handles.len() < 2 {
+            return;
+        }
+
+        let accessor = {
+            let a = Accessor::new(&self.version.blob_files);
+            #[cfg(zstd_any)]
+            let a = a.with_dict(
+                self.tree
+                    .index
+                    .config
+                    .kv_separation_opts
+                    .as_ref()
+                    .and_then(|o| o.zstd_dictionary.as_deref()),
+            );
+            a
+        };
+
+        accessor.prefetch(
+            self.tree.id(),
+            &mut handles,
+            &self.tree.index.config.cache,
+            self.state.max_gap,
+            self.state.max_read,
+        );
+    }
+
+    fn guard(&self, item: crate::Result<InternalValue>) -> IterGuardImpl {
+        IterGuardImpl::Blob(Guard {
+            tree: self.tree.clone(),
+            version: self.version.clone(),
+            kv: item,
+            // Only until the read-ahead is armed. The guards exist to report
+            // the FIRST resolution; once that has happened there is nothing
+            // left to report, so handing every later guard a counted reference
+            // would be an atomic bump per item of the scan for no effect.
+            prefetch: if self.armed {
+                None
+            } else {
+                Some(self.state.clone())
+            },
+        })
+    }
+}
+
+impl<I: Iterator<Item = crate::Result<InternalValue>>> Iterator for PrefetchScan<I> {
+    type Item = IterGuardImpl;
+
+    fn next(&mut self) -> Option<Self::Item> {
+        if self.buf.is_empty() {
+            if !self.armed {
+                self.armed = self.state.armed();
+            }
+            if self.armed {
+                self.fill();
+            }
+        }
+
+        let item = match self.buf.pop_front() {
+            Some(item) => item,
+            None => self.inner.next()?,
+        };
+        Some(self.guard(item))
+    }
+}
+
+impl<I: DoubleEndedIterator<Item = crate::Result<InternalValue>>> DoubleEndedIterator
+    for PrefetchScan<I>
+{
+    fn next_back(&mut self) -> Option<Self::Item> {
+        // `buf` holds the EARLIEST remaining items (they were pulled off the
+        // front), so the back of the scan is still inside `inner` until `inner`
+        // runs out; only then does the buffer's own back become the last item.
+        // Read-ahead stays a forward-only optimization: a reverse scan walks
+        // `inner` directly and reads its values one at a time, as before.
+        if !self.inner_back_done {
+            if let Some(item) = self.inner.next_back() {
+                return Some(self.guard(item));
+            }
+            self.inner_back_done = true;
+        }
+
+        let item = self.buf.pop_back()?;
+        Some(self.guard(item))
+    }
 }
 
 /// Wraps a [`SeekableTreeIter`](crate::range::SeekableTreeIter) over the index
@@ -564,8 +786,8 @@ impl AbstractTree for BlobTree {
 
         let range = prefix_to_range(prefix_bytes);
 
-        Box::new(
-            crate::Tree::create_internal_range_with_prefix_hash(
+        Box::new(PrefetchScan {
+            inner: crate::Tree::create_internal_range_with_prefix_hash(
                 super_version.clone(),
                 &range,
                 seqno,
@@ -573,15 +795,14 @@ impl AbstractTree for BlobTree {
                 None, // BlobTree does not use merge operators for prefix scans
                 self.index.config.comparator.clone(),
                 prefix_hash,
-            )
-            .map(move |kv| {
-                IterGuardImpl::Blob(Guard {
-                    tree: tree.clone(),
-                    version: super_version.version.clone(),
-                    kv,
-                })
-            }),
-        )
+            ),
+            buf: alloc::collections::VecDeque::new(),
+            inner_back_done: false,
+            armed: false,
+            state: self.scan_prefetch_state(),
+            version: super_version.version,
+            tree,
+        })
     }
 
     fn range<K: AsRef<[u8]>, R: RangeBounds<K>>(
@@ -592,24 +813,24 @@ impl AbstractTree for BlobTree {
     ) -> Box<dyn DoubleEndedIterator<Item = IterGuardImpl> + Send + 'static> {
         let super_version = self.index.get_version_for_snapshot(seqno);
         let tree = self.clone();
+        let state = self.scan_prefetch_state();
 
-        Box::new(
-            crate::Tree::create_internal_range(
+        Box::new(PrefetchScan {
+            inner: crate::Tree::create_internal_range(
                 super_version.clone(),
                 &range,
                 seqno,
                 index,
                 None,
                 self.index.config.comparator.clone(),
-            )
-            .map(move |kv| {
-                IterGuardImpl::Blob(Guard {
-                    tree: tree.clone(),
-                    version: super_version.version.clone(),
-                    kv,
-                })
-            }),
-        )
+            ),
+            buf: alloc::collections::VecDeque::new(),
+            inner_back_done: false,
+            armed: false,
+            state,
+            version: super_version.version,
+            tree,
+        })
     }
 
     fn range_seekable<K: AsRef<[u8]>, R: RangeBounds<K>>(

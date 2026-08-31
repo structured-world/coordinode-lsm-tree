@@ -176,6 +176,14 @@ where
             .map(|(_, slot)| slot.value.clone())
     }
 
+    /// Whether `key` is resident, without cloning the value or touching the
+    /// frequency counter. For a caller that only wants to know whether it has
+    /// to fetch, `get`/`peek` would clone the value (an atomic bump on a
+    /// refcounted payload) just to drop it again.
+    fn contains(&self, hash: u64, key: &K) -> bool {
+        self.map.find(hash, |(k, _)| k == key).is_some()
+    }
+
     fn len(&self) -> usize {
         self.map.len()
     }
@@ -480,6 +488,12 @@ where
     pub fn peek(&self, key: &K) -> Option<V> {
         let (h, shard) = self.locate(key);
         shard.read().peek(h, key)
+    }
+
+    /// Whether `key` is resident, without cloning it out or counting a hit.
+    pub fn contains(&self, key: &K) -> bool {
+        let (h, shard) = self.locate(key);
+        shard.read().contains(h, key)
     }
 
     /// Inserts or replaces `key` at [`Priority::Normal`], evicting as needed to

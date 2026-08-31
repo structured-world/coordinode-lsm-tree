@@ -255,6 +255,13 @@ pub struct KvSeparationOptions {
     #[doc(hidden)]
     pub age_cutoff: f32,
 
+    /// How many upcoming values a scan reads ahead in one coalesced batch.
+    ///
+    /// `0` disables read-ahead. See
+    /// [`scan_prefetch`](KvSeparationOptions::scan_prefetch).
+    #[doc(hidden)]
+    pub scan_prefetch: u16,
+
     /// Pre-trained zstd dictionary for blob-file dictionary compression.
     ///
     /// Required when `compression` is [`CompressionType::ZstdDict`].
@@ -278,6 +285,8 @@ impl Default for KvSeparationOptions {
 
             staleness_threshold: 0.25,
             age_cutoff: 0.25,
+
+            scan_prefetch: 64,
 
             #[cfg(zstd_any)]
             zstd_dictionary: None,
@@ -317,6 +326,26 @@ impl KvSeparationOptions {
     #[must_use]
     pub fn separation_threshold(mut self, bytes: u32) -> Self {
         self.separation_threshold = bytes;
+        self
+    }
+
+    /// Sets how many upcoming values a scan reads ahead in one batch.
+    ///
+    /// A scan resolves separated values one at a time, and each is its own read
+    /// of a few hundred bytes. Values sit in the blob file in the order the
+    /// flush wrote them, which is key order, so a scan's next values are
+    /// usually its immediate on-disk neighbours: reading a window of them at
+    /// once collapses that stream of small reads into a few large ones.
+    ///
+    /// Read-ahead starts only once the scan's caller resolves a value, so a
+    /// scan that reads keys alone never pays for it. Larger windows amortize
+    /// better on long scans; smaller ones waste less on a scan that stops
+    /// early. `0` disables it.
+    ///
+    /// Defaults to 64.
+    #[must_use]
+    pub fn scan_prefetch(mut self, items: u16) -> Self {
+        self.scan_prefetch = items;
         self
     }
 

@@ -218,14 +218,17 @@ impl Cache {
     }
 
     /// Whether a full (non-partial) data block is already resident for `offset`.
+    ///
     /// The partial-tier reader uses this to bail out (let the normal cached path
-    /// serve) once a block has been promoted to a full resident block.
-    #[cfg(feature = "zstd")]
+    /// serve) once a block has been promoted to a full resident block, and the
+    /// batched prewarm to tell a cold block from one it would re-read for
+    /// nothing. Neither wants the block itself, so this answers without cloning
+    /// it out and without counting a hit for a read that never happens.
     #[doc(hidden)]
     #[must_use]
     pub fn has_block(&self, id: GlobalTableId, offset: BlockOffset) -> bool {
         let key: CacheKey = (TAG_BLOCK, id.tree_id(), id.table_id(), *offset).into();
-        self.data.peek(&key).is_some()
+        self.data.contains(&key)
     }
 
     /// Reads the cached partial-tier entry for `offset` (resume state + access
@@ -350,6 +353,23 @@ impl Cache {
             (TAG_BLOB, vlog_id, vhandle.blob_file_id, vhandle.offset).into(),
             Item::Blob(value),
         );
+    }
+
+    /// Whether a separated value is already cached.
+    ///
+    /// For a caller deciding whether it has to read, not what the value is:
+    /// [`get_blob`](Self::get_blob) would clone the value out (an atomic bump
+    /// on the refcounted payload) and count a cache hit for a read that never
+    /// happens, skewing the eviction policy toward entries nobody consumed.
+    #[doc(hidden)]
+    #[must_use]
+    pub fn contains_blob(
+        &self,
+        vlog_id: crate::TreeId,
+        vhandle: &crate::vlog::ValueHandle,
+    ) -> bool {
+        let key: CacheKey = (TAG_BLOB, vlog_id, vhandle.blob_file_id, vhandle.offset).into();
+        self.data.contains(&key)
     }
 
     #[doc(hidden)]
