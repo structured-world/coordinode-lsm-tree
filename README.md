@@ -13,7 +13,7 @@ LSM-tree storage engine in Rust. Embedded library; provides keyed point reads, p
 
 ## Status
 
-On-disk format version **V5** — the ONLY supported format. The engine carries no legacy decode paths, no backward-compat variations, and no in-place upgrade: a pre-V5 database fails to open with `InvalidVersion`, and no conversion tooling is planned. Versioning is single-monotonic: every breaking format change bumps to the next version with explicit migration notes.
+On-disk format version **V5** — the ONLY supported format. The engine carries no legacy decode paths, no backward-compat variations, and no in-place upgrade: a pre-V5 database fails to open with `InvalidVersion`, and this crate ships no conversion tooling and plans none (such a store stays readable by the engine that wrote it). Versioning is single-monotonic: every breaking format change bumps to the next version with explicit migration notes.
 
 ## Quick start
 

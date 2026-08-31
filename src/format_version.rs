@@ -72,12 +72,16 @@
 /// layout the engine deliberately cannot read. A caller matching on this enum
 /// should be matching what the writer emits, and that is one shape.
 ///
-/// There is no upgrade path and none is planned. A pre-V5 database is not
-/// adopted, converted or repaired by this crate — it fails at the format gate
-/// above and stays that way. That is what keeps recovery, salvage, patrol
-/// scrub and verify free of a second layout to reason about: every one of them
-/// can assume the shape the current writer emits, with no branch for a shape
-/// it might also have to accept.
+/// This crate offers no upgrade path and plans none: a pre-V5 database is not
+/// adopted, converted or repaired here — it fails at the format gate above and
+/// stays that way. That is a statement about THIS engine, not about the data:
+/// the store is still readable by the engine that wrote it, which is where a
+/// conversion would have to happen.
+///
+/// What the refusal buys is that recovery, salvage, patrol scrub and verify
+/// have no second layout to reason about: every one of them can assume the
+/// shape the current writer emits, with no branch for a shape it might also
+/// have to accept.
 #[derive(Copy, Clone, Debug, Eq, PartialEq)]
 pub enum FormatVersion {
     /// Two on-disk changes shipped together in this format version

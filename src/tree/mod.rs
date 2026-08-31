@@ -3780,8 +3780,17 @@ impl Tree {
         // Check for old version
         if config.fs.exists(&config.path.join("version"))? {
             log::error!(
-                "this directory holds a V1 database, which this engine cannot read: V5 is the only supported on-disk format and no conversion path exists"
+                "this directory holds a V1 database, which THIS engine cannot read: V5 is the only \
+                 on-disk format it decodes, and it ships no conversion tooling. The data is not \
+                 lost — open it with the engine that wrote it, or convert it there"
             );
+            // Scoped to this engine on purpose. The operator reads this line
+            // while deciding what to do with the directory, and "no conversion
+            // path" full stop would read as "unrecoverable" — which is wrong,
+            // and the opposite of what the repair gate documents (an
+            // unsupported version needs offline conversion or a matching
+            // binary; see `is_repairable_open_error`).
+            //
             // Literal discriminant: V1 is a retired format and FormatVersion
             // carries no legacy variants (V5-only contract).
             return Err(crate::Error::InvalidVersion(1));
