@@ -337,10 +337,16 @@ impl KvSeparationOptions {
     /// usually its immediate on-disk neighbours: reading a window of them at
     /// once collapses that stream of small reads into a few large ones.
     ///
-    /// Read-ahead starts only once the scan's caller resolves a value, so a
-    /// scan that reads keys alone never pays for it. Larger windows amortize
-    /// better on long scans; smaller ones waste less on a scan that stops
-    /// early. `0` disables it.
+    /// Read-ahead starts only once the scan's caller resolves a value
+    /// unconditionally, so a scan that reads keys alone never pays for it, and
+    /// neither does one that decides per key whether the value is worth
+    /// reading. Larger windows amortize better on long scans; smaller ones
+    /// waste less on a scan that stops early. `0` disables it.
+    ///
+    /// Applies to the sequential scans: `iter`, `range`, `prefix` and
+    /// `batch_range_scan`. NOT to the seekable iterator, where a seek would
+    /// throw away whatever was read ahead, and which exists for jumping around
+    /// rather than walking a run.
     ///
     /// Defaults to 64.
     #[must_use]

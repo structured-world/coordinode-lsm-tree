@@ -876,10 +876,15 @@ impl AbstractTree for BlobTree {
         let intervals = intervals
             .into_iter()
             .map(|r| crate::tree::range_to_user_bounds(&r));
-        Box::new(
-            crate::range::BatchRangeScan::new(inner, intervals)
-                .map(move |item| blob_guard(&tree, &version, item)),
-        )
+        Box::new(PrefetchScan {
+            inner: crate::range::BatchRangeScan::new(inner, intervals),
+            buf: alloc::collections::VecDeque::new(),
+            inner_back_done: false,
+            armed: false,
+            state: self.scan_prefetch_state(),
+            version,
+            tree,
+        })
     }
 
     fn tombstone_count(&self) -> u64 {
