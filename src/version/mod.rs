@@ -38,6 +38,7 @@ mod super_version;
 pub use blob_file_list::BlobFileList;
 pub use persist::persist_version;
 pub use run::Run;
+pub(crate) use super_version::SnapshotRef;
 pub use super_version::{SuperVersion, SuperVersions};
 
 use crate::TreeType;

@@ -45,6 +45,39 @@ pub struct SuperVersion {
     pub(crate) seqno: SeqNo,
 }
 
+/// A borrowed-or-owned [`SuperVersion`] for the duration of one read.
+///
+/// A point read at or beyond the latest installed version does not need its
+/// own copy of the snapshot: the mirrored latest [`SuperVersion`] is the one
+/// `get_version_for_snapshot` would return, and holding the `arc-swap` load
+/// guard keeps it alive without the history lock or the clone (two `Arc`
+/// bumps plus a [`Version`] clone per call). Historical snapshot reads still
+/// clone out of the locked history, which this wraps as `Owned`.
+///
+/// Short-lived by design: a guard held across a long scan would delay the
+/// mirror's writers, so iterators keep cloning; this type serves the point
+/// lookups. The mirror needs `arc-swap`, so under no-std only `Owned` exists
+/// and every read clones, as before.
+pub(crate) enum SnapshotRef {
+    /// The latest installed snapshot, pinned by the mirror's load guard.
+    #[cfg(feature = "std")]
+    Latest(arc_swap::Guard<Arc<SuperVersion>>),
+    /// A historical snapshot cloned out of the locked version history.
+    Owned(SuperVersion),
+}
+
+impl core::ops::Deref for SnapshotRef {
+    type Target = SuperVersion;
+
+    fn deref(&self) -> &SuperVersion {
+        match self {
+            #[cfg(feature = "std")]
+            Self::Latest(guard) => guard,
+            Self::Owned(version) => version,
+        }
+    }
+}
+
 pub struct SuperVersions {
     versions: VecDeque<SuperVersion>,
 

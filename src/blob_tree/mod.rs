@@ -1373,7 +1373,7 @@ impl AbstractTree for BlobTree {
     }
 
     fn get<K: AsRef<[u8]>>(&self, key: K, seqno: SeqNo) -> crate::Result<Option<crate::UserValue>> {
-        let super_version = self.index.get_version_for_snapshot(seqno);
+        let super_version = self.index.snapshot_for_read(seqno);
         self.resolve_key(&super_version, key.as_ref(), seqno)
     }
 
@@ -1392,7 +1392,7 @@ impl AbstractTree for BlobTree {
             return Ok(Vec::new());
         }
 
-        let super_version = self.index.get_version_for_snapshot(seqno);
+        let super_version = self.index.snapshot_for_read(seqno);
         let comparator = self.index.config.comparator.as_ref();
 
         // For small batches, use the simple per-key path
