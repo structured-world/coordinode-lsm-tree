@@ -498,11 +498,13 @@ impl<I: Iterator<Item = crate::Result<InternalValue>>> PrefetchScan<I> {
             tree: self.tree.clone(),
             version: self.version.clone(),
             kv: item,
-            // Only until the read-ahead is armed. The guards exist to report
-            // the FIRST resolution; once that has happened there is nothing
-            // left to report, so handing every later guard a counted reference
-            // would be an atomic bump per item of the scan for no effect.
-            prefetch: if self.armed {
+            // Only until the read-ahead is armed, and never with the window
+            // disabled. The guards exist to report the FIRST resolution; once
+            // that has happened (or can change nothing, because a zero window
+            // ignores it), handing every guard a counted reference would be an
+            // atomic bump per item of the scan for no effect, plus an atomic
+            // store when the guard resolves.
+            prefetch: if self.armed || self.state.window == 0 {
                 None
             } else {
                 Some(self.state.clone())
