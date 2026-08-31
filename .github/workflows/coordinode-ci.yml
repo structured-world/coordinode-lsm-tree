@@ -177,7 +177,7 @@ jobs:
           # source code — skipping the real validation on a PR that
           # touches only those files would defeat the purpose of the
           # required-check gate.
-          CODE_RE='^(src/|tests/|benches/|examples/|test_fixture/|build\.rs$|Cargo\.toml$|Cargo\.lock$|tools/|\.github/workflows/coordinode-ci\.yml$|rust-toolchain(\.toml)?$|\.cargo/|\.config/nextest\.toml$|\.rustfmt\.toml$|clippy\.toml$)'
+          CODE_RE='^(src/|tests/|benches/|examples/|test_fixture/|build\.rs$|Cargo\.toml$|Cargo\.lock$|tools/|fuzz/|\.github/workflows/coordinode-ci\.yml$|rust-toolchain(\.toml)?$|\.cargo/|\.config/nextest\.toml$|\.rustfmt\.toml$|clippy\.toml$)'
           if printf '%s\n' "$CHANGED" | grep -qE "$CODE_RE"; then
             emit_and_exit "true" "code paths affected — running real CI"
           else
@@ -226,7 +226,20 @@ jobs:
         if: needs.changes.outputs.code != 'false'
       - name: Format
         if: needs.changes.outputs.code != 'false'
-        run: cargo fmt --all -- --check
+        # `--all` covers the workspace MEMBERS only. The tool and fuzz crates
+        # are `workspace.exclude`d, so nothing checked their formatting and one
+        # of them had drifted to the pre-2024 import order unnoticed.
+        #
+        # rustfmt is invoked on their sources directly rather than through
+        # `cargo fmt`: the tool crates carry their own `[workspace]` but the
+        # fuzz crates do not, so `cargo metadata` refuses to run inside them.
+        # rustfmt reads `.rustfmt.toml` by walking UP from each file, which is
+        # the same config the workspace gate uses.
+        run: |
+          set -euo pipefail
+          cargo fmt --all -- --check
+          find tools fuzz -name '*.rs' -not -path '*/target/*' -print0 \
+            | xargs -0 rustfmt --check --
       - name: Clippy (strict)
         if: needs.changes.outputs.code != 'false'
         # `--all-targets` lints tests + benches too, not just the lib; without

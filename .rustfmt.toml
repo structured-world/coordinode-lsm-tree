@@ -1,3 +1,15 @@
+# Every crate here is on edition 2024, but rustfmt reads only this file when it
+# is invoked DIRECTLY (rust-analyzer, format-on-save, `rustfmt src/foo.rs`) and
+# would otherwise fall back to 2015. `cargo fmt` passes the manifest's edition
+# and so agrees with 2024 already; pinning both keys makes every other caller
+# agree too, instead of reshaping files the CI gate then demands back.
+#
+# The two are separate: `edition` picks the GRAMMAR the file is parsed under
+# (2024 syntax such as `unsafe extern` blocks), `style_edition` picks the
+# formatting rules applied to it.
+edition = "2024"
+style_edition = "2024"
+
 reorder_imports = true
 # group_imports = "StdExternalCrate"
 # imports_granularity = "crate"
