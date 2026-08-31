@@ -2203,13 +2203,101 @@ fn codec_confirms_region_reports_no_evidence_when_the_scan_stops_early() -> crat
 
     assert_eq!(
         codec_confirms_region(probe.as_ref(), ScrubEcc::Scheme(impostor), start, end, cap),
-        CodecVerdict::NoEvidence,
+        CodecVerdict::Incomplete,
         "the region was not inspected to its end, so it cannot say the scheme \
          reproduces nothing",
     );
     assert!(
         !codec_disagrees_everywhere(probe.as_ref(), toc, ScrubEcc::Scheme(impostor), 0, cap),
         "and no diagnosis is reported off a truncated probe",
+    );
+    Ok(())
+}
+
+/// The table-wide claim needs EVERY region, so one region's rejection cannot
+/// speak over another region the probe never finished reading. A rotted trailer
+/// in one section beside a section whose scan stopped short is exactly the
+/// mixture that would blame a correct codec: the trailer it reproduces may sit
+/// behind the cut.
+#[cfg(feature = "page_ecc")]
+#[test]
+fn codec_disagrees_everywhere_is_silenced_by_a_region_it_could_not_finish() -> crate::Result<()> {
+    use crate::fs::{Fs, FsOpenOptions, StdFs};
+    use crate::table::block::EccParams;
+
+    const LEN: u32 = 4096;
+    let real = EccParams::RS_4_2;
+
+    // `data`: clean payload, rotted trailer — a complete scan that rejects.
+    let payload = discriminating_payload(LEN);
+    let mut rotted = crate::ecc::encode_parity(&payload, 4, 2).expect("RS(4,2) encodes");
+    *rotted.first_mut().expect("the trailer is non-empty") ^= 0xFF;
+
+    // `tli`: its only header is corrupted below, so the scan stops at once.
+    let other = discriminating_payload(LEN / 2);
+    let other_parity = crate::ecc::encode_parity(&other, 4, 2).expect("RS(4,2) encodes");
+
+    let dir = tempfile::tempdir()?;
+    let path = dir.path().join("mixed-regions.sst");
+    write_block_archive(
+        &path,
+        &[
+            ("data", vec![(payload, rotted)]),
+            ("tli", vec![(other, other_parity)]),
+        ],
+    )?;
+
+    let tli_pos = {
+        let mut probe = StdFs.open(&path, &FsOpenOptions::new().read(true))?;
+        let reader = crate::sfa::Reader::from_reader(&mut probe)?;
+        reader
+            .toc()
+            .section(b"tli")
+            .expect("the fixture has a tli section")
+            .pos()
+    };
+    {
+        let mut f = StdFs.open(&path, &FsOpenOptions::new().write(true))?;
+        f.seek(SeekFrom::Start(tli_pos))?;
+        f.write_all(&[0xFFu8; 16])?;
+    }
+
+    let mut probe = StdFs.open(&path, &FsOpenOptions::new().read(true))?;
+    let sfa_reader = crate::sfa::Reader::from_reader(&mut probe)?;
+    let toc = sfa_reader.toc();
+    let cap = block_data_length_cap(0);
+
+    let data = toc
+        .section(b"data")
+        .expect("the fixture has a data section");
+    let tli = toc.section(b"tli").expect("the fixture has a tli section");
+    assert_eq!(
+        codec_confirms_region(
+            probe.as_ref(),
+            ScrubEcc::Scheme(real),
+            data.pos(),
+            data.pos() + data.len(),
+            cap,
+        ),
+        CodecVerdict::Rejected,
+        "the rotted trailer makes the fully-scanned region reject — one half of \
+         the premise",
+    );
+    assert_eq!(
+        codec_confirms_region(
+            probe.as_ref(),
+            ScrubEcc::Scheme(real),
+            tli.pos(),
+            tli.pos() + tli.len(),
+            cap,
+        ),
+        CodecVerdict::Incomplete,
+        "and the other region was never finished — the other half",
+    );
+    assert!(
+        !codec_disagrees_everywhere(probe.as_ref(), toc, ScrubEcc::Scheme(real), 0, cap),
+        "an unfinished region leaves the table-wide claim unavailable, whatever \
+         a finished one found",
     );
     Ok(())
 }
@@ -2285,9 +2373,10 @@ fn rotted_trailer_keeps_the_descriptor_and_is_not_reported_suspect() -> crate::R
 
 /// An untrusted `data_length` must not size an allocation. The header is not
 /// verified when the arbitration reads it, so a forged one paired with a
-/// re-stamped TOC could ask for gigabytes; past the cap the block is simply no
-/// evidence. Driven with a tiny cap so the bound itself is what is pinned,
-/// rather than needing a multi-gigabyte fixture to reach the real one.
+/// re-stamped TOC could ask for gigabytes; past the cap the traversal stops
+/// instead, which is one of the ways a region ends up only partly inspected.
+/// Driven with a tiny cap so the bound itself is what is pinned, rather than
+/// needing a multi-gigabyte fixture to reach the real one.
 #[cfg(feature = "page_ecc")]
 #[test]
 fn codec_confirms_region_skips_a_block_whose_declared_length_exceeds_the_cap() -> crate::Result<()>
@@ -2325,8 +2414,9 @@ fn codec_confirms_region_skips_a_block_whose_declared_length_exceeds_the_cap() -
     );
     assert_eq!(
         codec_confirms_region(probe.as_ref(), ScrubEcc::Scheme(real), start, end, 16),
-        CodecVerdict::NoEvidence,
-        "a declared length past the cap must yield NO evidence rather than a read",
+        CodecVerdict::Incomplete,
+        "a declared length past the cap stops the traversal instead of sizing a \
+         read, and a stopped traversal answers nothing about the region",
     );
     Ok(())
 }

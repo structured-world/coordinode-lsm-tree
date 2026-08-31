@@ -1352,10 +1352,17 @@ fn codec_disagrees_everywhere(
     let mut judged = false;
     for &(start, end) in &regions {
         match codec_confirms_region(file, scheme, start, end, payload_cap) {
-            // One region agreeing is enough to make this not a wrong-scheme
-            // signature: a wrong codec does not reproduce a trailer it did not
-            // write, except where the codecs coincide on that data.
-            CodecVerdict::Confirmed => return false,
+            // Two different reasons to stay silent, one answer.
+            //
+            // AGREEMENT refutes the claim outright: a wrong codec does not
+            // reproduce a trailer it did not write, except where the codecs
+            // coincide on that data.
+            //
+            // An UNFINISHED region takes the claim off the table instead,
+            // whatever the finished ones found: the trailer this scheme
+            // reproduces may be the one behind the cut, and "reproduces none of
+            // them" cannot be said over a part of the file nobody read.
+            CodecVerdict::Confirmed | CodecVerdict::Incomplete => return false,
             CodecVerdict::Rejected => judged = true,
             CodecVerdict::NoEvidence => {}
         }
@@ -1386,9 +1393,21 @@ enum CodecVerdict {
     /// disagreed, and none matched. Completeness is part of the claim: a
     /// traversal cut short says nothing about the blocks behind the cut.
     Rejected,
-    /// Nothing to judge on: no checksum-clean block, a build without the ECC
-    /// codecs, or a traversal that stopped before the region's end without
-    /// finding a match.
+    /// The traversal stopped before the region's end and found no match on the
+    /// way. Distinct from [`Self::NoEvidence`] because the two do not compose
+    /// the same way: a region with nothing to judge leaves the others to
+    /// decide, while one that was never finished may hide the very trailer that
+    /// would refute the table-wide claim, so it takes the claim off the table.
+    #[cfg_attr(
+        not(feature = "page_ecc"),
+        expect(
+            dead_code,
+            reason = "the traversal that can stop short is the parity recomputation, which needs the ECC codecs"
+        )
+    )]
+    Incomplete,
+    /// The region was inspected to its end and held nothing to judge on: no
+    /// checksum-clean block, or a build without the ECC codecs.
     NoEvidence,
 }
 
@@ -1556,7 +1575,9 @@ fn codec_confirms_region(
         // table whose descriptor is right.
         if matched {
             CodecVerdict::Confirmed
-        } else if mismatched && complete {
+        } else if !complete {
+            CodecVerdict::Incomplete
+        } else if mismatched {
             CodecVerdict::Rejected
         } else {
             CodecVerdict::NoEvidence
