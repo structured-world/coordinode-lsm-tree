@@ -137,16 +137,19 @@ jobs:
           tool: customBiggerIsBetter
           output-file-path: benchmark-results.json
           github-token: ${{ steps.bot-token.outputs.token }}
-          # Push results to gh-pages only on main (not PRs)
+          # The dashboard series is the history of main, so only a push to
+          # main extends it. A manual dispatch measures a branch and is
+          # compared against that series without joining it.
           auto-push: ${{ github.event_name == 'push' && github.ref == 'refs/heads/main' }}
-          # On PRs, comment with comparison against baseline
+          # Comment the comparison on the commit that regressed.
           comment-on-alert: true
           alert-comment-cc-users: "@polaz"
-          # 15% regression = alert, 25% = fail (shared runners have high variance)
+          # A run 15% below the series is flagged. Advisory, not a gate:
+          # these are shared runners, and one slow run is not a regression
+          # on its own. fail-threshold is deliberately unset -- it would be
+          # dead config while nothing fails the job.
           alert-threshold: "115%"
-          fail-threshold: "125%"
-          fail-on-alert: ${{ github.event_name == 'pull_request' }}
-          # Store data for PRs without pushing (compare only)
+          fail-on-alert: false
           save-data-file: ${{ github.event_name == 'push' && github.ref == 'refs/heads/main' }}
           benchmark-data-dir-path: dev/bench
 

@@ -178,9 +178,14 @@ enum Command {
     /// which an empty or operator-created directory does not establish.
     Repair {
         /// Block-salvage SSTs that fail whole-file recovery instead of leaving
-        /// them out: the corrupt original is quarantined and a fresh SST with
-        /// its recoverable blocks takes its place. A salvaged table may be
-        /// missing the key ranges of its corrupt blocks (a last-resort option).
+        /// them out: a fresh SST carrying the recoverable blocks takes the
+        /// corrupt original's place. A salvaged table may be missing the key
+        /// ranges of its corrupt blocks (a last-resort option).
+        ///
+        /// The original is DESTROYED when the replacement is committed: the
+        /// commit renames the replacement onto the original's own path, so
+        /// the damaged bytes are overwritten in place and kept nowhere. Copy
+        /// the directory first if they are wanted for forensics.
         #[arg(long)]
         salvage: bool,
 

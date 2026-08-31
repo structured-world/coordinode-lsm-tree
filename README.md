@@ -219,7 +219,7 @@ All optional. The default build (`std` + `parallel`) is the minimal core: no com
 
 ## Benchmarks
 
-CI runs [`db_bench`](tools/db_bench) on every push to `main`, and publishes the results to the [benchmark dashboard](https://structured-world.github.io/coordinode-lsm-tree/dev/bench/). A run regressing performance by more than 15% raises an alert; more than 25% fails the job.
+CI runs [`db_bench`](tools/db_bench) on every push to `main`, and publishes the results to the [benchmark dashboard](https://structured-world.github.io/coordinode-lsm-tree/dev/bench/). A run regressing performance by more than 15% is flagged on the dashboard and in the run's comment. The flag is advisory: shared runners vary enough that a single slow run is not on its own a regression, so it never fails the job.
 
 Pull requests are deliberately not auto-benchmarked: the bench host is serialised across the whole repository, so every PR push would queue behind it. Measure a branch on demand with the workflow's manual dispatch instead — those runs do not touch the dashboard's `main` series.
 
@@ -255,10 +255,10 @@ cargo run --release --features flamegraph -- \
 | `index-dump` | Prints the top-level index: `end_key` + offset + size + seqno per pointed-at block. Useful for diagnosing range-read fan-out. |
 | `dump` | Streams every KV entry to stdout, with optional `--from` / `--to` / `--max=N` / `--keys-only`. Full-index SSTs only. |
 | `hex <offset>` | Raw hex dump of a region, with an optional `Header` decode — for inspecting an offset that `verify --verbose` flagged. |
-| `dump-block <offset>` | Decodes one block at `offset` and prints its header, framing and (for encrypted blocks) the reconstructed AAD. The forensic step past `hex`. |
+| `dump-block <offset>` | Decodes one block at `offset` and prints its header and framing. The forensic step past `hex`. Add `--reconstruct-aad --table-id <id>` to also print an encrypted block's AAD (the id is not stored in the file, so it has to be supplied). |
 | `filter-stats` | Prints BuRR filter sizing: section bytes, layer count, item count, approximate bits per key. Single-block filters only; partitioned-filter tables are not covered. |
 | `salvage <dest>` | Block-salvages a corrupt SST into a fresh file: every block that passes its checksum is re-emitted, the corrupt ones are dropped and reported. A bad block costs its own key range instead of the whole file. |
-| `repair` | Rebuilds a missing or corrupt `MANIFEST` from the SSTs on disk (the path argument is the DB **directory**, not one SST). `--salvage` additionally block-salvages tables that fail whole-file recovery, quarantining the corrupt original. |
+| `repair` | Rebuilds a missing or corrupt `MANIFEST` from the SSTs on disk (the path argument is the DB **directory**, not one SST). It repairs with the default comparator and no encryption, so a tree written with either has to go through the library `Config::repair` API with its real config instead: reading those SSTs with the wrong config would write a manifest around the tables that happened to decode. `--salvage` additionally block-salvages tables that fail whole-file recovery; committing a replacement renames it onto the original's path, overwriting the damaged bytes, so copy the directory first if they are wanted for forensics. |
 
 ## Data integrity & durability
 

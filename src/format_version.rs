@@ -57,11 +57,16 @@
 /// **V5 is the ONLY supported on-disk format.** The engine neither reads
 /// nor migrates pre-V5 layouts: there are no legacy decode paths, no
 /// upgrade tooling, and no backward-compat variations anywhere in the
-/// codebase. Discriminants 1–4 are reserved history — opening a tree that
-/// carries one fails with [`crate::Error::InvalidVersion`], at whichever gate
-/// sees the format first: a V1 directory is caught by its `version` marker
-/// file before any manifest is read, while V2–V4 are caught by this enum's
-/// `TryFrom` while the manifest is being decoded. The same single-format rule
+/// codebase. Discriminants 1–4 are reserved history: opening a tree that
+/// carries one always fails, at whichever gate notices first, and which error
+/// comes back depends on which that is. A V1 directory is caught by its
+/// `version` marker file in `Tree::open` before any manifest is read. Later
+/// pre-V5 manifests are usually caught earlier still, by the Blocks manifest
+/// reader: their framing is not the one it decodes, so they fail at the
+/// footer rather than at a version field. This `TryFrom` is the gate for the
+/// remaining shape: a manifest that frames like the current one but declares
+/// a version this engine does not write, which fails with
+/// [`crate::Error::InvalidVersion`]. The same single-format rule
 /// applies to every subsidiary format (blob frames, manifest layout): each has
 /// exactly one readable shape, the one the current writer emits.
 ///
