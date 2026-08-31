@@ -528,11 +528,15 @@ fn concurrent_insert_and_iter_no_sigbus() {
 /// view actually shares the block, and a second map to give a use-after-free
 /// a chance to scribble over recycled memory before the assertion.
 #[test]
-fn key_view_outlives_the_dropped_map() {
+fn key_view_after_map_drop_remains_valid() {
     let long_key = vec![0xA5u8; 64];
     let map = new_map();
     map.insert(&make_key(&long_key, 1), &make_value(b"payload"));
 
+    #[expect(
+        clippy::expect_used,
+        reason = "test inserts one entry before reading it"
+    )]
     let key = map.iter().next().expect("one entry").key();
     drop(map);
 
