@@ -58,10 +58,12 @@
 /// nor migrates pre-V5 layouts: there are no legacy decode paths, no
 /// upgrade tooling, and no backward-compat variations anywhere in the
 /// codebase. Discriminants 1–4 are reserved history — opening a tree that
-/// carries one fails with [`crate::Error::InvalidVersion`] at the manifest
-/// gate. The same single-format rule applies to every subsidiary format
-/// (blob frames, manifest layout): each has exactly one readable shape,
-/// the one the current writer emits.
+/// carries one fails with [`crate::Error::InvalidVersion`], at whichever gate
+/// sees the format first: a V1 directory is caught by its `version` marker
+/// file before any manifest is read, while V2–V4 are caught by this enum's
+/// `TryFrom` while the manifest is being decoded. The same single-format rule
+/// applies to every subsidiary format (blob frames, manifest layout): each has
+/// exactly one readable shape, the one the current writer emits.
 ///
 /// The retired discriminants are reserved as NUMBERS, not as names: this enum
 /// carries no `V1`–`V4` variants. Keeping them as deprecated stubs would add
@@ -71,11 +73,11 @@
 /// should be matching what the writer emits, and that is one shape.
 ///
 /// There is no upgrade path and none is planned. A pre-V5 database is not
-/// adopted, converted or repaired by this crate — it fails at the manifest
-/// gate and stays that way. That is what keeps recovery, salvage, patrol scrub
-/// and verify free of a second layout to reason about: every one of them can
-/// assume the shape the current writer emits, with no branch for a shape it
-/// might also have to accept.
+/// adopted, converted or repaired by this crate — it fails at the format gate
+/// above and stays that way. That is what keeps recovery, salvage, patrol
+/// scrub and verify free of a second layout to reason about: every one of them
+/// can assume the shape the current writer emits, with no branch for a shape
+/// it might also have to accept.
 #[derive(Copy, Clone, Debug, Eq, PartialEq)]
 pub enum FormatVersion {
     /// Two on-disk changes shipped together in this format version
