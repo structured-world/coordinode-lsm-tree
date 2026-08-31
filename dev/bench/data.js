@@ -1,5 +1,5 @@
 window.BENCHMARK_DATA = {
-  "lastUpdate": 1788210510935,
+  "lastUpdate": 1788214187370,
   "repoUrl": "https://github.com/structured-world/coordinode-lsm-tree",
   "entries": {
     "lsm-tree db_bench": [
@@ -20700,6 +20700,84 @@ window.BENCHMARK_DATA = {
             "value": 669005.1115937657,
             "unit": "ops/sec",
             "extra": "P50: 1.3us | P99: 4.5us | P99.9: 6.8us\nthreads: 1 | elapsed: 0.30s | num: 200000 | iterations: 3"
+          }
+        ]
+      },
+      {
+        "commit": {
+          "author": {
+            "email": "mail@polaz.com",
+            "name": "Dmitry Prudnikov",
+            "username": "polaz"
+          },
+          "committer": {
+            "email": "noreply@github.com",
+            "name": "GitHub",
+            "username": "web-flow"
+          },
+          "distinct": true,
+          "id": "7f49eea765f3bde87117b4f399120ed4083fb504",
+          "message": "perf(vlog): read a scan's separated values ahead in coalesced runs (#599)\n\nA scan over KV-separated data fetched one value per read, so it issued a\nfew\nhundred bytes of I/O per row and waited for each. Values land in the\nblob file\nin the order the flush wrote them, which is key order, so a scan's next\nvalues\nare almost always its immediate on-disk neighbours. Reading the run they\ncover\nin one go turns that stream of small reads into a handful of large ones.\n\n**Full scan of 20k separated values, same tree, cold cache per scan:**\n\n| | p50 | p99 | p999 |\n|---|---|---|---|\n| off | 18.4ms | 22.0ms | 39.0ms |\n| on | 8.7ms | 10.3ms | 12.8ms |\n\n**2.1× at the median and 3.0× at the p999**: collapsing a per-value read\ninto a\nper-window one takes out the scans that were unlucky with their reads,\nnot just\nthe average one. (`benches/blob_scan_prefetch.rs`, both arms on the real\nfilesystem; a `MemFs` would turn every read into a memcpy and hide the\ndifference.)\n\n## Read-ahead waits to be asked\n\nA scan can walk keys alone, or reject a row on its key before asking for\nthe\nvalue. Reading ahead for those would charge them for values nobody\nwants, so the\nguards report the first UNCONDITIONAL resolution and the iterator\ngathers a\nwindow from there: a key-only scan behaves exactly as before, and a scan\nthat\nreads every value pays a solo read only for the first. `into_inner_if`\ndoes not\narm it, deliberately: that method exists so a caller can decide per key,\na\nsparse predicate is the case it exists for, and arming on one early\nmatch would\nread ahead for every later row before its own predicate could reject it.\n\nBoth budgets are on what is actually spent. The read budget bounds a\nspan's\nEXTENT, gaps included, because merging through a gap is the point and\nthe read\nis therefore wider than the records in it. The admission budget bounds\nthe\nweight the cache charges, checked before inserting rather than\nsubtracted after.\n\nWindow size is `KvSeparationOptions::scan_prefetch`, 64 by default, 0 to\ndisable. It covers the sequential scans (`iter`, `range`, `prefix`,\n`batch_range_scan`) and deliberately not the seekable iterator, where a\nseek\ndiscards whatever was read ahead. Records coalesce per blob file:\nadjacent ones merge into a single read,\na gap wider than a few KiB breaks the run, and one read is capped so a\nwindow of\nlarge values cannot balloon.\n\nIt is an I/O optimization and nothing else. Warmed values go through the\nsame\nvalidation as a direct read (`Reader::get` and the prefetch share\n`parse_record`, split out for that reason), land in the same cache, and\nany\nfailure is dropped so the read walk fetches that value itself and\nreports its\ncorruption authoritatively.\n\n## The bug this turned up\n\nWriting the both-ends test failed, and not because of the read-ahead.\n**Walking\nany tree iterator from both ends dropped rows**, with no KV separation\nand none\nof this code involved:\n\n```rust\nlet mut it = tree.iter(SeqNo::MAX, None);\nit.next();                                    // take the first key\nwhile let Some(g) = it.next_back() { /* ... */ }   // drain the rest backwards\n// one key is silently missing\n```\n\nTen keys in, nine come out. `DoubleEndedIterator` promises the two ends\nmeet in\nthe middle exactly once, and a caller mixing directions had no way to\nnotice\notherwise: no error, nothing logged, just a row that came out of neither\nend.\n\nThe merger keeps a separate tournament per direction over the same\nsources, and\na source's head is pulled OUT of the source when it enters a tournament.\nA value\nbuffered by the forward tournament is therefore unreachable backward:\nonce that\nsource runs dry the backward walk stops with the value still parked on\nthe other\nside. One value per source, in whichever direction was used first. The\nread-ahead only made it easy to hit, because it steps forward in bursts.\n\nHanding the value over as soon as its source is exhausted does not work,\nand the\ncode said so where it declined to: the other end may still be stepping\ntoward\nthat value, and claiming it early yields it twice (two existing tests\npin\nexactly that). Waiting for this tournament to empty does not work\neither, in the\nother direction: a parked head is its source's NEXT item here, so\nholding it\nback emits it after values that sort above it, and every layer above\nassumes a\nsorted stream.\n\nOrdering is what decides, so ordering is what the code asks. A parked\nhead\ncompetes for the winner on every step and is claimed only when it sorts\nahead of\nwhat this tournament would emit itself; with nothing of our own left,\nany parked\nhead wins, which is how the two ends hand over the last rows of a range.\n`take_slot` moves it, so it cannot come out twice. Both directions had\nthe bug;\nboth are fixed there.\n\nThe check is priced for the common case: only a slot emptied without a\nrefill\ncan hold a parked leaf, so the merger tracks those slots per direction\nand the\nparked scan walks that list — empty while no source has run dry,\nO(exhausted)\nafter — instead of every slot on every mixed-end step. Forward-only\niteration\nnever reaches it at all.\n\n## Same defects, other prefetch\n\nThe blob read-ahead reuses the batched block prewarm's shape, and\nauditing one\nturned up the same costs in the other:\n\n- The prewarm asked `get_block(..).is_none()` to decide a block was\ncold. That\nclones the block out to drop it a line later **and counts a cache hit\nfor a\nblock the plan is deciding not to read**, feeding the eviction policy a\nhit no\nreader made. It asks `has_block` now, which itself no longer reads\nthrough a\n  cloning `peek`.\n- Three key-batching loops allocated a fresh vector per table while\nwalking a\n  level; hoisted and cleared instead.\n- The parallel (table index, offset) vector that paired staging buffers\nwith\nfiles carried per-request bookkeeping the request itself can hold;\nfolded\n  into `BlockRead`.\n\nThe staging buffers stay zero-initialized, deliberately. Skipping the\nmemset\nwas tried and rejected: it required handing uninitialized memory to\n`FsFile::read_at`, which takes a `&mut [u8]` and is a safe, publicly\nimplementable method, and forming that reference over uninitialized\nmemory is\nundefined behaviour on its own. The unmeasured memset saving was not\nworth\nchanging a method every backend implements, so the branch adds no\n`unsafe`\nblocks at all.\n\nWhat remains of that work is `BlockRead.buf` becoming a `BlockBuf`: the\ndestination plus a count of what has actually been written to it.\n`append`\nfills and counts; a backend reading into the buffer directly uses\n`unfilled_mut` and `advance` — all safe. The caller checks `is_full`\nbefore\ndecoding anything, so an `Fs` implementation that ignores a request\nproduces a\nrejected request rather than a decode of stale allocation contents. A\nrequest\nwhose destination arrives partly filled is completed, not restarted:\nevery\nimplementation resumes the read at `offset + filled`, covering exactly\nthe\nunfilled suffix.\n\n## A second hole review found\n\nThe blob cache is keyed by a POSITION (blob file id plus offset), not by\na\nrecord. A corrupt index can point two keys at the same position, and a\ndirect\nread catches that by comparing the key it was asked for against the one\nstored\nin the record. The cached path did not, so whichever entry was read\nsecond was\nserved the other's value instead of the error. Order decided which one\nbroke;\nthe read-ahead makes order irrelevant, because it warms a whole window\nbefore\nthe scan reaches any of it.\n\nEntries now carry both fields the cache key does not, the user key and\nthe\ndeclared on-disk size, and a lookup compares both, treating a mismatch\nas a\nmiss so the caller does the real read and gets the real error. The\nreader\nrejects a wrong size just as it rejects a wrong key, so the cached path\nhas to\ncheck the same two things. This is what the row cache already does with\nits own\nkey, for the same reason.\n\nThe admission budget had two problems of the same shape: it counted\non-disk\nbytes while the cache charges decoded bytes (so a compressible window\ncould\nadmit several times the capacity), and it subtracted after inserting, so\nthe\nvalue that exhausted the budget went in anyway. It now compares the full\nweight\nthe cache will charge against what is left, before inserting.\n\nThe span walk's arithmetic was audited as part of that. Where the input\nis\nuntrusted it now rejects rather than clamps: a record end that does not\nfit a\n`u64` is a handle no writer produced, and a clamped `span_end + max_gap`\nreads\nas \"nothing is too far away\", which would merge a span across a gap of\nany\nsize. Where the bounds are provable (the slice is sorted by offset, and\na\nwindow holds a bounded number of bounded records) it is plain arithmetic\nwith\nthe reason written down and a `debug_assert` on the ordering invariant.\n\n## Verification\n\n3230 tests all-features, 2575 default, 2602 `--no-default-features\n--features\nlz4`, clippy `-D warnings` on both feature sets, `cargo doc` clean on\nboth,\n70 doc-tests, `cargo fmt`, and no-std at 0 errors on\n`thumbv7em-none-eabihf`.\n\nNew tests pin that a scan returns identical values with read-ahead on\nand off\n(across blob-file boundaries, and with a window wider than the scan),\nthat a\nkey-only scan is unaffected, and that reverse and both-ends walks yield\nevery\nentry exactly once: at the merger, at the tree, and over separated\nvalues.\n\nCloses #597\n\n\n<!-- This is an auto-generated comment: release notes by coderabbit.ai\n-->\n## Summary by CodeRabbit\n\n* **New Features**\n* Blob scans now read separated values ahead in coalesced batches,\nreducing small individual reads.\n* Added a configurable scan read-ahead window, enabled by default and\ndisableable.\n* Added safer, more efficient batched block reading and prewarming\nbehavior.\n  * Added a benchmark for measuring scan prefetch performance.\n\n* **Bug Fixes**\n* Fixed mixed-direction iteration so every entry is returned exactly\nonce.\n* Improved cache validation to prevent conflicting blob values from\nbeing served.\n\n* **Documentation**\n  * Documented scan read-ahead behavior.\n<!-- end of auto-generated comment: release notes by coderabbit.ai -->",
+          "timestamp": "2026-08-31T23:32:06+03:00",
+          "tree_id": "cc958dbeb646b87bac470974c763ab72c09aaf77",
+          "url": "https://github.com/structured-world/coordinode-lsm-tree/commit/7f49eea765f3bde87117b4f399120ed4083fb504"
+        },
+        "date": 1788214186068,
+        "tool": "customBiggerIsBetter",
+        "benches": [
+          {
+            "name": "fillseq",
+            "value": 2063220.5010997276,
+            "unit": "ops/sec",
+            "extra": "P50: 0.4us | P99: 1.6us | P99.9: 3.6us\nthreads: 1 | elapsed: 0.10s | num: 200000 | iterations: 3"
+          },
+          {
+            "name": "fillrandom",
+            "value": 1208621.914728932,
+            "unit": "ops/sec",
+            "extra": "P50: 0.7us | P99: 2.1us | P99.9: 4.2us\nthreads: 1 | elapsed: 0.17s | num: 200000 | iterations: 3"
+          },
+          {
+            "name": "readrandom",
+            "value": 863972.7182297998,
+            "unit": "ops/sec",
+            "extra": "P50: 1.0us | P99: 4.2us | P99.9: 6.7us\nthreads: 1 | elapsed: 0.23s | num: 200000 | iterations: 3"
+          },
+          {
+            "name": "readseq",
+            "value": 3657742.4091969104,
+            "unit": "ops/sec",
+            "extra": "P50: 0.2us | P99: 3.1us | P99.9: 5.5us\nthreads: 1 | elapsed: 0.05s | num: 200000 | iterations: 3"
+          },
+          {
+            "name": "seekrandom",
+            "value": 457600.55811160547,
+            "unit": "ops/sec",
+            "extra": "P50: 1.9us | P99: 5.3us | P99.9: 8.2us\nthreads: 1 | elapsed: 0.44s | num: 200000 | iterations: 3"
+          },
+          {
+            "name": "prefixscan",
+            "value": 226791.67352650056,
+            "unit": "ops/sec",
+            "extra": "P50: 4.1us | P99: 5.1us | P99.9: 7.1us\nthreads: 1 | elapsed: 0.88s | num: 200000 | iterations: 3"
+          },
+          {
+            "name": "overwrite",
+            "value": 1226115.838213402,
+            "unit": "ops/sec",
+            "extra": "P50: 0.7us | P99: 2.1us | P99.9: 4.2us\nthreads: 1 | elapsed: 0.16s | num: 200000 | iterations: 3"
+          },
+          {
+            "name": "mergerandom",
+            "value": 1076131.3017287238,
+            "unit": "ops/sec",
+            "extra": "P50: 0.3us | P99: 1.4us | P99.9: 2.8us\nthreads: 1 | elapsed: 0.19s | num: 200000 | iterations: 3"
+          },
+          {
+            "name": "readwhilewriting",
+            "value": 692549.3552742942,
+            "unit": "ops/sec",
+            "extra": "P50: 1.3us | P99: 4.6us | P99.9: 7.2us\nthreads: 1 | elapsed: 0.29s | num: 200000 | iterations: 3"
           }
         ]
       }
