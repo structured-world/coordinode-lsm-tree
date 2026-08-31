@@ -765,7 +765,9 @@ pub trait Fs: Send + Sync + 'static {
     ///
     /// Fills each [`BlockBuf`] completely (block reads are fixed-size); a short
     /// read on any block is an error, leaving every buffer's contents
-    /// unspecified.
+    /// unspecified. A destination that arrives partly filled is COMPLETED: it
+    /// already owns the block's first `filled` bytes, so the read covers the
+    /// unfilled suffix starting at `offset + filled` in the file.
     ///
     /// The destination starts uninitialized and only counts what is written to
     /// it, so an implementation that reports success without filling a request
@@ -779,8 +781,21 @@ pub trait Fs: Send + Sync + 'static {
     /// is reported as [`io::ErrorKind::UnexpectedEof`]).
     fn read_blocks_batched(&self, reqs: &mut [BlockRead<'_>]) -> io::Result<()> {
         for req in reqs.iter_mut() {
-            let want = req.buf.capacity();
-            let n = req.file.read_at(req.buf.unfilled_mut(), req.offset)?;
+            // A destination that arrives partly filled already owns the
+            // block's first `filled` bytes; the read owes the unfilled
+            // suffix, which starts `filled` bytes into the block on disk.
+            let offset = req
+                .offset
+                .checked_add(req.buf.filled() as u64)
+                .ok_or_else(|| {
+                    io::Error::new(
+                        io::ErrorKind::InvalidInput,
+                        "read_blocks_batched: request offset overflows",
+                    )
+                })?;
+            let dst = req.buf.unfilled_mut();
+            let want = dst.len();
+            let n = req.file.read_at(dst, offset)?;
             req.buf.advance(n);
             if n != want {
                 return Err(io::Error::new(

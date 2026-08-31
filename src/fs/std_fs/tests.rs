@@ -307,6 +307,36 @@ fn fs_read_blocks_batched_across_files() -> io::Result<()> {
     Ok(())
 }
 
+/// A request whose destination arrives partly filled resumes the read at
+/// `offset + filled`, completing the block instead of re-reading its start
+/// into the suffix (which would silently duplicate the block's first bytes)
+/// or mis-reporting the shorter remaining read as EOF.
+#[test]
+fn fs_read_blocks_batched_partly_filled_request_resumes_at_offset_plus_filled() -> io::Result<()> {
+    let dir = tempfile::tempdir()?;
+    let fs = StdFs;
+    let opts = FsOpenOptions::new().write(true).create(true).read(true);
+    let mut file = fs.open(&dir.path().join("resume.bin"), &opts)?;
+    file.write_all(&(0..=255u8).collect::<Vec<_>>())?;
+
+    // Block = bytes 10..18. The caller has already produced the first 3 of
+    // them; the batched read owes only the remaining 5, from offset 13.
+    let mut buf = [0u8; 8];
+    {
+        let mut dst = crate::fs::BlockBuf::new(&mut buf);
+        dst.append(&[10, 11, 12]);
+        let mut reqs = vec![crate::fs::BlockRead {
+            file: file.as_ref(),
+            offset: 10,
+            buf: dst,
+        }];
+        fs.read_blocks_batched(&mut reqs)?;
+        assert!(reqs[0].buf.is_full(), "the request is completed, not short");
+    }
+    assert_eq!(buf, [10, 11, 12, 13, 14, 15, 16, 17]);
+    Ok(())
+}
+
 #[test]
 fn fs_file_read_many_short_read_at_eof_errors() -> io::Result<()> {
     let dir = tempfile::tempdir()?;

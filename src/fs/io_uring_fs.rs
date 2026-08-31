@@ -163,8 +163,20 @@ impl Fs for IoUringFs {
         // fall back to serial reads for the whole batch.
         if reqs.iter().any(|r| r.file.backing_fd().is_none()) {
             for req in reqs.iter_mut() {
-                let want = req.buf.capacity();
-                let n = req.file.read_at(req.buf.unfilled_mut(), req.offset)?;
+                // A partly filled destination owns the block's first `filled`
+                // bytes already; complete it from `offset + filled`.
+                let offset = req
+                    .offset
+                    .checked_add(req.buf.filled() as u64)
+                    .ok_or_else(|| {
+                        crate::io::Error::from(io::Error::new(
+                            io::ErrorKind::InvalidInput,
+                            "read_blocks_batched: request offset overflows",
+                        ))
+                    })?;
+                let dst = req.buf.unfilled_mut();
+                let want = dst.len();
+                let n = req.file.read_at(dst, offset)?;
                 req.buf.advance(n);
                 if n != want {
                     return Err(crate::io::Error::from(io::Error::new(
@@ -911,7 +923,7 @@ impl RingThread {
         // missing fd or over-cap length returning via `?` mid-loop would strand
         // earlier sends with the kernel still writing their buffers). `None`
         // entries mark empty-buffer requests the send loop skips.
-        let mut metas: Vec<Option<(i32, u32)>> = Vec::with_capacity(reqs.len());
+        let mut metas: Vec<Option<(i32, u32, u64)>> = Vec::with_capacity(reqs.len());
         for req in reqs.iter() {
             if req.buf.capacity() == 0 {
                 metas.push(None);
@@ -933,12 +945,25 @@ impl RingThread {
                     io::Error::new(io::ErrorKind::InvalidInput, "buffer exceeds i32::MAX")
                 })?
                 .unsigned_abs();
-            metas.push(Some((fd, len)));
+            // A partly filled destination owns the block's first `filled` bytes
+            // already, so the suffix the SQE describes lives `filled` bytes into
+            // the block on disk. Submitting the original offset would duplicate
+            // the block's beginning into the suffix instead.
+            let offset = req
+                .offset
+                .checked_add(req.buf.filled() as u64)
+                .ok_or_else(|| {
+                    io::Error::new(
+                        io::ErrorKind::InvalidInput,
+                        "submit_reads_multi: request offset overflows",
+                    )
+                })?;
+            metas.push(Some((fd, len, offset)));
         }
 
         let mut receivers: Vec<(mpsc::Receiver<i32>, usize)> = Vec::with_capacity(reqs.len());
         for (req, meta) in reqs.iter_mut().zip(&metas) {
-            let Some((fd, len)) = *meta else {
+            let Some((fd, len, offset)) = *meta else {
                 continue;
             };
             let (tx, rx) = mpsc::sync_channel(1);
@@ -949,7 +974,7 @@ impl RingThread {
                     fd,
                     buf: UnsafeSendMutPtr(dst),
                     len,
-                    offset: req.offset,
+                    offset,
                 },
                 result_tx: tx,
             };
