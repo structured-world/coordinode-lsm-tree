@@ -440,8 +440,9 @@ impl<S: MergeSource, C: UserComparator + Clone> Iterator for SeekingMerger<S, C>
             }
             None => {
                 // Source exhausted forward: drop its slot. Anything the
-                // backward tournament buffers for it stays there until
-                // this tournament empties out (see `winner_slot` above).
+                // backward tournament buffers for it is picked up by
+                // `pick_parked` above, on the step where it sorts ahead of
+                // this tournament's own winner.
                 let old = tree.pop_min()?;
                 Some(Ok(old.value))
             }
