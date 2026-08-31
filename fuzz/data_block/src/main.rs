@@ -3,11 +3,11 @@ extern crate afl;
 
 use arbitrary::{Arbitrary, Result, Unstructured};
 use lsm_tree::{
-    table::{
-        block::{decoder::ParsedItem, BlockOffset},
-        Block, DataBlock,
-    },
     InternalValue, SeqNo, ValueType,
+    table::{
+        Block, DataBlock,
+        block::{BlockOffset, decoder::ParsedItem},
+    },
 };
 
 #[derive(Arbitrary, Clone, Debug, PartialEq, Eq, Ord, PartialOrd)]
@@ -48,8 +48,8 @@ impl<'a> Arbitrary<'a> for FuzzyValue {
 }
 
 fn generate_ping_pong_code(seed: u64, len: usize) -> Vec<u8> {
-    use rand::prelude::*;
     use rand::SeedableRng;
+    use rand::prelude::*;
     use rand_chacha::ChaCha8Rng;
 
     let mut rng = ChaCha8Rng::seed_from_u64(seed);
@@ -71,8 +71,8 @@ fn main() {
         let restart_interval = restart_interval.max(1);
 
         let item_count = {
-            use rand::prelude::*;
             use rand::SeedableRng;
+            use rand::prelude::*;
             use rand_chacha::ChaCha8Rng;
 
             let mut rng = ChaCha8Rng::seed_from_u64(seed);
@@ -80,8 +80,8 @@ fn main() {
         };
 
         let hash_ratio = {
-            use rand::prelude::*;
             use rand::SeedableRng;
+            use rand::prelude::*;
             use rand_chacha::ChaCha8Rng;
 
             let mut rng = ChaCha8Rng::seed_from_u64(seed);
@@ -264,8 +264,8 @@ fn main() {
         }
 
         {
-            use rand::prelude::*;
             use rand::SeedableRng;
+            use rand::prelude::*;
             use rand_chacha::ChaCha8Rng;
 
             let mut rng = ChaCha8Rng::seed_from_u64(seed);
