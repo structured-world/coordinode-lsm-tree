@@ -26,6 +26,16 @@
 //! number of in-flight blocks (submitted but not yet drained) so a huge SST
 //! never buffers its entire compressed output: when the cap is reached it
 //! drains (and writes) one block before submitting the next.
+//!
+//! ## Deadlock freedom (help-first draining)
+//!
+//! Jobs live in a shared queue; a spawned task is only a TOKEN that claims one
+//! queued job. When the writer needs a block that is not ready, it first claims
+//! and runs queued jobs on its own thread, and parks only once the queue is
+//! empty (every remaining job is then executing on a worker). A writer running
+//! ON one of the spawner's own threads — or against a fully saturated or
+//! one-worker pool — therefore degrades to the serial path instead of waiting
+//! on a token task that can never run.
 
 // `Box` for the (no_std-able) CompactionSpawner trait; under std it's in the
 // prelude. Everything below the trait is the std-only parallel pipeline.
@@ -38,7 +48,7 @@ use crate::{
 use alloc::boxed::Box;
 #[cfg(feature = "std")]
 use std::{
-    collections::BTreeMap,
+    collections::{BTreeMap, VecDeque},
     sync::{Arc, Condvar, Mutex, PoisonError},
 };
 
@@ -103,11 +113,64 @@ impl CompactionSpawner for RayonSpawner {
     }
 }
 
-/// Shared reorder slot: finished blocks keyed by submission sequence number.
+/// One submitted, not-yet-executed transform job. Lives in the shared queue so
+/// that ANY thread — a pool worker via its token task, or the writer itself
+/// inside [`BlockCompressor::take_next`] — can claim and run it.
+#[cfg(feature = "std")]
+struct PendingJob {
+    seq: u64,
+    encoded: Vec<u8>,
+    extra_flags: u8,
+}
+
+/// Shared pipeline state: the job queue, the reorder slot for finished blocks
+/// (keyed by submission sequence number), and the constant per-SST transform
+/// parameters every job needs.
 #[cfg(feature = "std")]
 struct Shared {
+    queue: Mutex<VecDeque<PendingJob>>,
     ready: Mutex<BTreeMap<u64, crate::Result<PreparedBlock<'static>>>>,
     woke: Condvar,
+
+    // Constant transform parameters, read by whichever thread runs a job.
+    table_id: TableId,
+    compression: CompressionType,
+    encryption: Option<Arc<dyn EncryptionProvider>>,
+    #[cfg(zstd_any)]
+    zstd_dict: Option<Arc<ZstdDictionary>>,
+    ecc: Option<crate::table::block::EccParams>,
+}
+
+#[cfg(feature = "std")]
+impl Shared {
+    /// Claims one queued job and runs it to completion, publishing the result
+    /// into the reorder slot. Returns `false` when the queue was empty (the
+    /// job this token was spawned for was already helped to completion by
+    /// another thread — a cheap no-op).
+    fn run_one(&self) -> bool {
+        let job = {
+            let mut queue = self.queue.lock().unwrap_or_else(PoisonError::into_inner);
+            queue.pop_front()
+        };
+        let Some(job) = job else {
+            return false;
+        };
+        let result = prepare_owned(
+            &job.encoded,
+            self.table_id,
+            self.compression,
+            self.encryption.as_deref(),
+            #[cfg(zstd_any)]
+            self.zstd_dict.as_deref(),
+            self.ecc,
+            job.extra_flags,
+        );
+        let mut ready = self.ready.lock().unwrap_or_else(PoisonError::into_inner);
+        ready.insert(job.seq, result);
+        drop(ready);
+        self.woke.notify_all();
+        true
+    }
 }
 
 /// Ordered parallel block-preparation pipeline.
@@ -120,14 +183,6 @@ struct Shared {
 pub struct BlockCompressor {
     spawner: Arc<dyn CompactionSpawner>,
     shared: Arc<Shared>,
-
-    // Constant transform parameters, cloned into each job closure.
-    table_id: TableId,
-    compression: CompressionType,
-    encryption: Option<Arc<dyn EncryptionProvider>>,
-    #[cfg(zstd_any)]
-    zstd_dict: Option<Arc<ZstdDictionary>>,
-    ecc: Option<crate::table::block::EccParams>,
 
     next_submit: u64,
     next_drain: u64,
@@ -146,15 +201,16 @@ impl BlockCompressor {
         Self {
             spawner,
             shared: Arc::new(Shared {
+                queue: Mutex::new(VecDeque::new()),
                 ready: Mutex::new(BTreeMap::new()),
                 woke: Condvar::new(),
+                table_id,
+                compression,
+                encryption,
+                #[cfg(zstd_any)]
+                zstd_dict,
+                ecc,
             }),
-            table_id,
-            compression,
-            encryption,
-            #[cfg(zstd_any)]
-            zstd_dict,
-            ecc,
             next_submit: 0,
             next_drain: 0,
         }
@@ -175,33 +231,40 @@ impl BlockCompressor {
         let seq = self.next_submit;
         self.next_submit += 1;
 
-        let shared = Arc::clone(&self.shared);
-        let table_id = self.table_id;
-        let compression = self.compression;
-        let encryption = self.encryption.clone();
-        #[cfg(zstd_any)]
-        let zstd_dict = self.zstd_dict.clone();
-        let ecc = self.ecc;
-
-        self.spawner.spawn(Box::new(move || {
-            let result = prepare_owned(
-                &encoded,
-                table_id,
-                compression,
-                encryption.as_deref(),
-                #[cfg(zstd_any)]
-                zstd_dict.as_deref(),
-                ecc,
+        // The job goes into the shared queue, not into the spawned closure:
+        // the spawned task is only a TOKEN that claims one queued job. Any
+        // thread can claim — including the writer itself in `take_next` — so
+        // a job is never stranded behind a saturated or re-entrant pool.
+        {
+            let mut queue = self
+                .shared
+                .queue
+                .lock()
+                .unwrap_or_else(PoisonError::into_inner);
+            queue.push_back(PendingJob {
+                seq,
+                encoded,
                 extra_flags,
-            );
-            let mut ready = shared.ready.lock().unwrap_or_else(PoisonError::into_inner);
-            ready.insert(seq, result);
-            drop(ready);
-            shared.woke.notify_all();
+            });
+        }
+
+        let shared = Arc::clone(&self.shared);
+        self.spawner.spawn(Box::new(move || {
+            let _ = shared.run_one();
         }));
     }
 
-    /// Blocks until the next-in-sequence block is ready, then returns it.
+    /// Returns the next-in-sequence block, running queued transform jobs on
+    /// THIS thread while it is not ready ("help-first" draining).
+    ///
+    /// Helping is what makes the pipeline deadlock-free by construction: if
+    /// the spawner's workers are all busy — or the caller itself is running ON
+    /// one of the spawner's threads, so its token tasks are queued behind this
+    /// very call — the drain claims the pending jobs from the shared queue and
+    /// executes them inline instead of parking. A one-worker (or fully
+    /// saturated) pool degrades to the serial path, never to a deadlock. The
+    /// writer only parks once the queue is empty, which means every remaining
+    /// in-flight job is already EXECUTING on some worker and will publish.
     ///
     /// Returns `None` only when nothing is in flight ([`Self::pending`] is 0).
     /// The inner `Result` carries any transform error raised on the worker.
@@ -210,21 +273,45 @@ impl BlockCompressor {
             return None;
         }
         let seq = self.next_drain;
-        let mut ready = self
-            .shared
-            .ready
-            .lock()
-            .unwrap_or_else(PoisonError::into_inner);
         loop {
-            if let Some(result) = ready.remove(&seq) {
-                self.next_drain += 1;
-                return Some(result);
+            {
+                let mut ready = self
+                    .shared
+                    .ready
+                    .lock()
+                    .unwrap_or_else(PoisonError::into_inner);
+                if let Some(result) = ready.remove(&seq) {
+                    self.next_drain += 1;
+                    return Some(result);
+                }
             }
-            ready = self
+
+            // Not ready: help. Jobs are queued FIFO and `seq` is the oldest
+            // undrained submission, so the first claimed job is `seq` itself
+            // unless a worker already claimed it.
+            if self.shared.run_one() {
+                continue;
+            }
+
+            // Queue empty: `seq` is executing on a worker right now (this
+            // writer thread is the only submitter, so no new job can appear
+            // while it sits here). Park until the worker publishes.
+            let mut ready = self
                 .shared
-                .woke
-                .wait(ready)
+                .ready
+                .lock()
                 .unwrap_or_else(PoisonError::into_inner);
+            loop {
+                if let Some(result) = ready.remove(&seq) {
+                    self.next_drain += 1;
+                    return Some(result);
+                }
+                ready = self
+                    .shared
+                    .woke
+                    .wait(ready)
+                    .unwrap_or_else(PoisonError::into_inner);
+            }
         }
     }
 }

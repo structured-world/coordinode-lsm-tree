@@ -1115,7 +1115,8 @@ impl AbstractTree for BlobTree {
         // Parallel block compression for the flush writer, mirroring the
         // standard tree's flush: engaged only when the per-block transform does
         // real CPU work (codec / encryption / page ECC). See the standard
-        // flush for the deadlock-safety reasoning.
+        // flush for why this is safe wherever the host runs the flush (the
+        // pipeline's help-first drain, see `parallel_compressor`).
         #[cfg(feature = "std")]
         {
             let transform_does_work = data_block_compression != crate::CompressionType::None

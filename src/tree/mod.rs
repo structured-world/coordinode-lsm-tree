@@ -873,9 +873,10 @@ impl AbstractTree for Tree {
         // compaction writers use. Engaged only when the per-block transform does
         // real CPU work (a codec, encryption, or page ECC): with the identity
         // transform the pipeline's owned buffer + queue hop per block buys
-        // nothing over the serial reusable-buffer path. Deadlock-safe: a flush
-        // never runs ON the pool (the pool runs sub-compactions and block
-        // tasks), so its blocks always drain.
+        // nothing over the serial reusable-buffer path. Safe wherever the host
+        // runs this flush — even on a thread of an injected pool — because the
+        // pipeline's help-first drain executes queued jobs inline instead of
+        // waiting on a saturated pool (see `parallel_compressor`).
         #[cfg(feature = "std")]
         {
             let transform_does_work = data_block_compression != crate::CompressionType::None
