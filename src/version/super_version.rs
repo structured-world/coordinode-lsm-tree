@@ -101,6 +101,19 @@ pub struct SuperVersions {
     /// for the tree's life.
     log_rotate_bytes: u64,
 
+    /// Cached size of the current `edits-{snapshot_id}` log in bytes. `None`
+    /// until first measured (a recovered log may be non-empty) or after an
+    /// append error left the on-disk size uncertain. Kept exact by adding each
+    /// appended record's size: every install runs under the version write
+    /// lock, so this history is the log's only writer. Saves an `open` +
+    /// `seek` syscall pair on every flush / compaction install.
+    log_bytes: Option<u64>,
+
+    /// Reusable payload-assembly buffer for edit appends — the scratch
+    /// `edit_log::append_edit` documents as reusable; allocating it per
+    /// install defeated that.
+    edit_scratch: Vec<u8>,
+
     /// Lock-free mirror of the latest (back) `SuperVersion`, shared with the
     /// `Tree` so a point read at `MAX_SEQNO` can load the current snapshot
     /// without taking the history `RwLock` or cloning the deque entry. Kept
@@ -148,6 +161,8 @@ impl SuperVersions {
             sync_mode,
             snapshot_id,
             log_rotate_bytes,
+            log_bytes: None,
+            edit_scratch: Vec::new(),
         }
     }
 
@@ -354,11 +369,38 @@ impl SuperVersions {
     ) -> crate::Result<()> {
         let log_path = tree_path.join(format!("edits-{}", self.snapshot_id));
 
-        if edit_log::log_size(fs, &log_path)? < self.log_rotate_bytes {
+        // Cached log size when available; measure once otherwise (fresh open
+        // with a recovered log, or after an append error of unknown extent).
+        let log_size = if let Some(n) = self.log_bytes {
+            n
+        } else {
+            let n = edit_log::log_size(fs, &log_path)?;
+            self.log_bytes = Some(n);
+            n
+        };
+
+        if log_size < self.log_rotate_bytes {
             // Common path: append the delta and fsync. No snapshot rewrite.
             let edit = next.diff(prior)?;
-            let mut scratch = Vec::new();
-            return edit_log::append_edit(fs, &log_path, &edit, &mut scratch, self.sync_mode);
+            match edit_log::append_edit(
+                fs,
+                &log_path,
+                &edit,
+                &mut self.edit_scratch,
+                self.sync_mode,
+            ) {
+                Ok(appended) => {
+                    self.log_bytes = Some(log_size + appended);
+                    return Ok(());
+                }
+                Err(e) => {
+                    // A failed append may have written a partial record; the
+                    // on-disk size is unknown, so drop the cache and re-measure
+                    // on the next install.
+                    self.log_bytes = None;
+                    return Err(e);
+                }
+            }
         }
 
         // Rotation: write `next` as a fresh full snapshot and repoint CURRENT.
@@ -373,6 +415,9 @@ impl SuperVersions {
             self.sync_mode,
         )?;
         self.snapshot_id = next.id();
+        // The new generation starts with an empty log (created lazily on the
+        // first append).
+        self.log_bytes = Some(0);
 
         // The durable commit point of a rotation is the CURRENT repoint inside
         // `persist_version` above — past it, the rotation has SUCCEEDED. Deleting
