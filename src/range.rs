@@ -266,17 +266,15 @@ impl TreeIter {
                 Bound::Included(key_slice.clone()),
             );
 
+            // Arc bumps, not byte copies — see the bound construction note in
+            // `create_range` / `user_to_internal_bounds`.
             let range = (
                 Bound::Included(InternalKey::new(
-                    key_slice.as_ref(),
+                    key_slice.clone(),
                     SeqNo::MAX,
                     crate::ValueType::Tombstone,
                 )),
-                Bound::Included(InternalKey::new(
-                    key_slice.as_ref(),
-                    0,
-                    crate::ValueType::Value,
-                )),
+                Bound::Included(InternalKey::new(key_slice, 0, crate::ValueType::Value)),
             );
 
             let mut iters: Vec<BoxedIterator<'_>> = Vec::new();
@@ -499,16 +497,19 @@ impl TreeIter {
                 },
             );
 
+            // `key.clone()` (an Arc bump on the refcounted `UserKey`) instead of
+            // `key.as_ref()` (`&[u8]`, which would heap-copy the bound's bytes
+            // into a fresh `Slice`) — same reasoning as `user_to_internal_bounds`.
             let range = (
                 match &user_range.0 {
                     // NOTE: See memtable.rs for range explanation
                     Bound::Included(key) => Bound::Included(InternalKey::new(
-                        key.as_ref(),
+                        key.clone(),
                         SeqNo::MAX,
                         crate::ValueType::Tombstone,
                     )),
                     Bound::Excluded(key) => Bound::Excluded(InternalKey::new(
-                        key.as_ref(),
+                        key.clone(),
                         0,
                         crate::ValueType::Tombstone,
                     )),
@@ -530,10 +531,10 @@ impl TreeIter {
                     // abcdef -> 5
                     //
                     Bound::Included(key) => {
-                        Bound::Included(InternalKey::new(key.as_ref(), 0, crate::ValueType::Value))
+                        Bound::Included(InternalKey::new(key.clone(), 0, crate::ValueType::Value))
                     }
                     Bound::Excluded(key) => Bound::Excluded(InternalKey::new(
-                        key.as_ref(),
+                        key.clone(),
                         SeqNo::MAX,
                         crate::ValueType::Value,
                     )),
