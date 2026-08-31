@@ -352,6 +352,16 @@ fn span_extent(
     let mut end = start + 1;
     let mut span_end = first.offset.checked_add(first_len as u64)?;
 
+    // The anchor's own width counts against the bound, not just the records
+    // merged after it. Its length comes from a handle, so a corrupt one can
+    // declare a record wider than any read is allowed to be; checking only what
+    // follows would leave that width unexamined, and a later handle pointing
+    // inside the declared span would turn it into a span that gets read whole.
+    // Returning it alone leaves it to the direct read, which validates it.
+    if span_end - first.offset > reach {
+        return Some((end, span_end));
+    }
+
     while let Some(&(_, next, next_len)) = items.get(end) {
         let within_gap = span_end
             .checked_add(max_gap)

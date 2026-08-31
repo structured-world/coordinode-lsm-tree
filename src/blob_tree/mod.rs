@@ -45,10 +45,15 @@ impl IterGuard for Guard {
     ) -> crate::Result<(UserKey, Option<UserValue>)> {
         let kv = self.kv?;
 
+        // Deliberately does NOT arm the scan's read-ahead, even on a match.
+        // This method exists so a caller can decide per key whether the value
+        // is worth reading, and a sparse predicate is the case it exists for.
+        // Arming on the first match would read ahead for every later item
+        // before its own predicate could reject it, which is exactly the I/O
+        // the caller asked to avoid: one match in a thousand would turn a
+        // selective scan into a full read of the value log. A caller that
+        // wants every value uses `into_inner`, and that is what arms it.
         if pred(&kv.key.user_key) {
-            if let Some(p) = &self.prefetch {
-                p.note_resolved();
-            }
             resolve_value_handle(
                 self.tree.id(),
                 &self.tree.index.config.cache,

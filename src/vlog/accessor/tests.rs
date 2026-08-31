@@ -95,6 +95,34 @@ fn a_span_never_exceeds_the_remaining_read_budget() {
     );
 }
 
+/// The record that anchors a span is bounded too.
+///
+/// Its length comes from a handle, so a corrupt one can declare a record wider
+/// than any read is allowed to be. Checking only the records merged AFTER it
+/// leaves that width unexamined, and a second handle pointing inside the
+/// declared span turns it into a multi-record span that gets read in full.
+#[test]
+fn an_anchor_record_wider_than_the_bound_does_not_carry_a_span() {
+    // First record claims 1 MiB; the second sits inside that claim, so it
+    // passes a check made only on `next_end - first.offset`.
+    let mut items = items(&[0], 1_048_576);
+    items.push((
+        b"k".as_ref(),
+        ValueHandle {
+            blob_file_id: 1,
+            offset: 100,
+            on_disk_size: 100,
+        },
+        100,
+    ));
+
+    let (end, _) = span_extent(&items, 0, 4096, 4_096, u64::MAX).expect("extent");
+    assert_eq!(
+        end, 1,
+        "an anchor wider than the read cap must not gather a span",
+    );
+}
+
 /// A budget of zero admits nothing beyond the record that anchors the span, so
 /// the caller sees a one-record span and skips it (a single record is what the
 /// direct read already does well).
