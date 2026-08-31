@@ -50,7 +50,7 @@ impl<'a> Accessor<'a> {
         vhandle: &ValueHandle,
         cache: &Cache,
     ) -> crate::Result<Option<UserValue>> {
-        if let Some(value) = cache.get_blob(tree_id, vhandle) {
+        if let Some(value) = cache.get_blob(tree_id, vhandle, key) {
             return Ok(Some(value));
         }
 
@@ -72,7 +72,7 @@ impl<'a> Accessor<'a> {
         };
 
         let value = reader.get(key, vhandle)?;
-        cache.insert_blob(tree_id, vhandle, value.clone());
+        cache.insert_blob(tree_id, vhandle, key, value.clone());
 
         Ok(Some(value))
     }
@@ -293,7 +293,7 @@ impl<'a> Accessor<'a> {
                 // capacity from one window, evicting everything else to hold
                 // values the scan has not reached yet.
                 *admit_budget = admit_budget.saturating_sub(value.len() as u64);
-                cache.insert_blob(tree_id, &vhandle, value);
+                cache.insert_blob(tree_id, &vhandle, key, value);
             }
         }
     }
