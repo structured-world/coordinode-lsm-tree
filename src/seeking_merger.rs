@@ -128,6 +128,60 @@ fn build_max_cmp<C: UserComparator + Clone>(comparator: C) -> MaxCmp<C> {
     MaxCmp { comparator }
 }
 
+/// The slot whose leaf is parked in `other` and now belongs to `active`, if it
+/// beats what `active` holds itself.
+///
+/// A slot with no leaf in `active` but one in `other` is a source that has run
+/// out in the active direction while the opposite tournament still buffers its
+/// head. That head is the source's next item HERE, so it competes for the
+/// winner: returning it only when it sorts ahead of the active tournament's own
+/// winner is what keeps the stream sorted without stealing an item the opposite
+/// end is still walking toward. With `active` empty, any parked head wins,
+/// which is how the two directions hand over the last items of a range.
+///
+/// `cmp` is the active direction's ordering, so "ahead" reads the same way in
+/// both: `Less` under the min-tree, `Less` under the reversed max-tree.
+fn pick_parked<A, O, C>(
+    active: &LoserTree<MergerEntry, A>,
+    other: Option<&LoserTree<MergerEntry, O>>,
+    cmp: &C,
+) -> Option<usize>
+where
+    A: crate::loser_tree::EntryComparator<MergerEntry>,
+    O: crate::loser_tree::EntryComparator<MergerEntry>,
+    C: crate::loser_tree::EntryComparator<MergerEntry>,
+{
+    let other = other?;
+    if other.is_empty() {
+        return None;
+    }
+
+    let winner = active.winner_slot().and_then(|slot| active.peek_slot(slot));
+
+    let mut best: Option<(usize, &MergerEntry)> = None;
+    for slot in 0..active.slots() {
+        // Only a slot this direction cannot refill itself: one still holding a
+        // leaf here will produce it through the tournament as usual.
+        if active.peek_slot(slot).is_some() {
+            continue;
+        }
+        let Some(parked) = other.peek_slot(slot) else {
+            continue;
+        };
+        if best.is_none_or(|(_, current)| cmp.compare(parked, current) == Ordering::Less) {
+            best = Some((slot, parked));
+        }
+    }
+
+    let (slot, parked) = best?;
+    match winner {
+        // Ahead of what this tournament would emit next, so it goes first.
+        Some(w) => (cmp.compare(parked, w) == Ordering::Less).then_some(slot),
+        // Nothing of our own left: the parked heads are the remainder.
+        None => Some(slot),
+    }
+}
+
 /// Merging iterator over `MergeSource`s, backed by two independent
 /// `LoserTree` tournaments.
 ///
@@ -333,6 +387,7 @@ impl<S: MergeSource, C: UserComparator + Clone> Iterator for SeekingMerger<S, C>
             forward_tree,
             backward_tree,
             pending_forward_error,
+            comparator,
             ..
         } = self;
         let tree = forward_tree.as_mut()?;
@@ -340,25 +395,24 @@ impl<S: MergeSource, C: UserComparator + Clone> Iterator for SeekingMerger<S, C>
         // construction every MergerEntry's `source` field equals
         // its slot index). Avoids a separate peek_min call. None
         // means the tournament is exhausted.
-        // When this tournament is spent, every source is drained
-        // forward. Whatever the BACKWARD one still holds is therefore
-        // all that remains of the range, and it belongs to whichever
-        // end asks next — this one. Adopt those buffered heads and
-        // carry on; `take_slot` MOVES each, so none can be emitted
-        // from both ends.
+        // A source that is drained forward may still have its head parked in
+        // the BACKWARD tournament, and that head is the source's next item in
+        // this direction. It has to compete for the winner right away: waiting
+        // for this tournament to empty would emit it after values that sort
+        // above it, and the pipeline above depends on a sorted stream.
         //
-        // The trigger is this tournament running dry, not a single
-        // source doing so: a source can be exhausted forward while the
-        // backward walk is still stepping toward its buffered head, and
-        // claiming it then would yield it twice. Nothing left on this
-        // side is the point where the other end can no longer have a
-        // claim.
-        if tree.is_empty() {
-            let other = backward_tree.as_mut()?;
-            if other.is_empty() {
-                return None;
-            }
-            tree.refill_with(|slot| other.take_slot(slot));
+        // It cannot be claimed the moment its source runs dry, either. The
+        // backward walk may still be stepping toward it, and taking it then
+        // yields it from both ends. Ordering is what decides: the parked head
+        // belongs to whichever end reaches it first, and comparing it against
+        // this tournament's own winner is that question asked precisely.
+        if let Some(slot) = pick_parked(
+            tree,
+            backward_tree.as_ref(),
+            &build_min_cmp(comparator.clone()),
+        ) && let Some(entry) = backward_tree.as_mut().and_then(|bt| bt.take_slot(slot))
+        {
+            return Some(Ok(entry.value));
         }
         let source = tree.winner_slot()?;
         #[expect(
@@ -429,18 +483,19 @@ impl<S: CoherentMergeSource, C: UserComparator + Clone> DoubleEndedIterator
             forward_tree,
             backward_tree,
             pending_backward_error,
+            comparator,
             ..
         } = self;
         let tree = backward_tree.as_mut()?;
-        // Mirror of `next()`: once this tournament is spent, the heads the
-        // FORWARD one still buffers are the remainder of the range and this
-        // end is the one asking for them.
-        if tree.is_empty() {
-            let other = forward_tree.as_mut()?;
-            if other.is_empty() {
-                return None;
-            }
-            tree.refill_with(|slot| other.take_slot(slot));
+        // Mirror of `next()`: a head parked in the FORWARD tournament competes
+        // for this end's winner as soon as its source is drained backward.
+        if let Some(slot) = pick_parked(
+            tree,
+            forward_tree.as_ref(),
+            &build_max_cmp(comparator.clone()),
+        ) && let Some(entry) = forward_tree.as_mut().and_then(|ft| ft.take_slot(slot))
+        {
+            return Some(Ok(entry.value));
         }
         let source = tree.winner_slot()?;
         #[expect(

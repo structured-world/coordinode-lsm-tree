@@ -699,3 +699,30 @@ fn backward_step_then_forward_drain_yields_every_item() {
         "an item was stranded between the two tournaments",
     );
 }
+
+/// Adopting the other direction's parked leaves must not reorder the stream.
+///
+/// A source's buffered head in the opposite tournament is that source's next
+/// item; if the walk keeps emitting from its own tree until that tree empties,
+/// the parked item comes out after values that sort above it. The merged stream
+/// has to stay sorted no matter which end was used first.
+#[test]
+fn adopting_a_parked_leaf_keeps_the_forward_stream_sorted() {
+    let cmp = comparator::default_comparator();
+    let a = VecSource::new(
+        [make_iv(b"a", 0), make_iv(b"b", 0), make_iv(b"d", 0)],
+        cmp.clone(),
+    );
+    let b = VecSource::new([make_iv(b"c", 0)], cmp.clone());
+    let mut m = SeekingMerger::new(alloc::vec![a, b], cmp);
+
+    // One step from the back, then drain forward.
+    assert_eq!(k(&m.next_back().unwrap().unwrap()), "d");
+
+    let mut keys: Vec<String> = Vec::new();
+    for item in &mut m {
+        keys.push(k(&item.unwrap()));
+    }
+
+    assert_eq!(keys, ["a", "b", "c"], "the forward stream must stay sorted");
+}
