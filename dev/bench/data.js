@@ -17862,60 +17862,6 @@ window.BENCHMARK_DATA = {
             "value": 698055.634091662,
             "unit": "ops/sec",
             "extra": "P50: 1.2us | P99: 5.6us | P99.9: 8.6us\nthreads: 1 | elapsed: 0.29s | num: 200000 | iterations: 3"
-          },
-          {
-            "name": "fillseq /100k",
-            "value": 2099307.8854811597,
-            "unit": "ops/sec",
-            "extra": "P50: 0.4us | P99: 1.6us | P99.9: 3.7us\nthreads: 1 | elapsed: 0.05s | num: 100000 | iterations: 3"
-          },
-          {
-            "name": "fillrandom /100k",
-            "value": 1305989.125080795,
-            "unit": "ops/sec",
-            "extra": "P50: 0.6us | P99: 2.0us | P99.9: 4.2us\nthreads: 1 | elapsed: 0.08s | num: 100000 | iterations: 3"
-          },
-          {
-            "name": "readrandom /100k",
-            "value": 1000266.5710411825,
-            "unit": "ops/sec",
-            "extra": "P50: 0.9us | P99: 4.0us | P99.9: 6.5us\nthreads: 1 | elapsed: 0.10s | num: 100000 | iterations: 3"
-          },
-          {
-            "name": "readseq /100k",
-            "value": 3775199.408864176,
-            "unit": "ops/sec",
-            "extra": "P50: 0.1us | P99: 3.1us | P99.9: 5.8us\nthreads: 1 | elapsed: 0.03s | num: 100000 | iterations: 3"
-          },
-          {
-            "name": "seekrandom /100k",
-            "value": 492914.9854096425,
-            "unit": "ops/sec",
-            "extra": "P50: 1.7us | P99: 5.2us | P99.9: 8.1us\nthreads: 1 | elapsed: 0.20s | num: 100000 | iterations: 3"
-          },
-          {
-            "name": "prefixscan /100k",
-            "value": 253056.9558630913,
-            "unit": "ops/sec",
-            "extra": "P50: 3.7us | P99: 4.6us | P99.9: 7.9us\nthreads: 1 | elapsed: 0.40s | num: 100000 | iterations: 3"
-          },
-          {
-            "name": "overwrite /100k",
-            "value": 1304070.7167295243,
-            "unit": "ops/sec",
-            "extra": "P50: 0.7us | P99: 2.0us | P99.9: 4.2us\nthreads: 1 | elapsed: 0.08s | num: 100000 | iterations: 3"
-          },
-          {
-            "name": "mergerandom /100k",
-            "value": 1135047.0849312148,
-            "unit": "ops/sec",
-            "extra": "P50: 0.3us | P99: 1.5us | P99.9: 2.4us\nthreads: 1 | elapsed: 0.09s | num: 100000 | iterations: 3"
-          },
-          {
-            "name": "readwhilewriting /100k",
-            "value": 811388.427267474,
-            "unit": "ops/sec",
-            "extra": "P50: 1.1us | P99: 4.4us | P99.9: 7.0us\nthreads: 1 | elapsed: 0.12s | num: 100000 | iterations: 3"
           }
         ]
       },
@@ -17994,60 +17940,6 @@ window.BENCHMARK_DATA = {
             "value": 686894.3332828272,
             "unit": "ops/sec",
             "extra": "P50: 1.2us | P99: 5.5us | P99.9: 8.7us\nthreads: 1 | elapsed: 0.29s | num: 200000 | iterations: 3"
-          },
-          {
-            "name": "fillseq /100k",
-            "value": 2082883.6040484926,
-            "unit": "ops/sec",
-            "extra": "P50: 0.4us | P99: 1.6us | P99.9: 3.7us\nthreads: 1 | elapsed: 0.05s | num: 100000 | iterations: 3"
-          },
-          {
-            "name": "fillrandom /100k",
-            "value": 1262867.1960016615,
-            "unit": "ops/sec",
-            "extra": "P50: 0.7us | P99: 2.1us | P99.9: 4.2us\nthreads: 1 | elapsed: 0.08s | num: 100000 | iterations: 3"
-          },
-          {
-            "name": "readrandom /100k",
-            "value": 988418.5906473402,
-            "unit": "ops/sec",
-            "extra": "P50: 0.9us | P99: 4.0us | P99.9: 6.6us\nthreads: 1 | elapsed: 0.10s | num: 100000 | iterations: 3"
-          },
-          {
-            "name": "readseq /100k",
-            "value": 3849403.3347843015,
-            "unit": "ops/sec",
-            "extra": "P50: 0.1us | P99: 3.0us | P99.9: 5.5us\nthreads: 1 | elapsed: 0.03s | num: 100000 | iterations: 3"
-          },
-          {
-            "name": "seekrandom /100k",
-            "value": 489773.4975361675,
-            "unit": "ops/sec",
-            "extra": "P50: 1.7us | P99: 5.2us | P99.9: 8.6us\nthreads: 1 | elapsed: 0.20s | num: 100000 | iterations: 3"
-          },
-          {
-            "name": "prefixscan /100k",
-            "value": 250022.71081293668,
-            "unit": "ops/sec",
-            "extra": "P50: 3.6us | P99: 7.3us | P99.9: 10.4us\nthreads: 1 | elapsed: 0.40s | num: 100000 | iterations: 3"
-          },
-          {
-            "name": "overwrite /100k",
-            "value": 1326369.2932563245,
-            "unit": "ops/sec",
-            "extra": "P50: 0.6us | P99: 2.0us | P99.9: 4.4us\nthreads: 1 | elapsed: 0.08s | num: 100000 | iterations: 3"
-          },
-          {
-            "name": "mergerandom /100k",
-            "value": 1111175.3000042746,
-            "unit": "ops/sec",
-            "extra": "P50: 0.3us | P99: 1.5us | P99.9: 2.6us\nthreads: 1 | elapsed: 0.09s | num: 100000 | iterations: 3"
-          },
-          {
-            "name": "readwhilewriting /100k",
-            "value": 775878.2794706734,
-            "unit": "ops/sec",
-            "extra": "P50: 1.1us | P99: 4.5us | P99.9: 7.3us\nthreads: 1 | elapsed: 0.13s | num: 100000 | iterations: 3"
           }
         ]
       },
