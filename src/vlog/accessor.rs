@@ -120,25 +120,32 @@ impl<'a> Accessor<'a> {
         // length is computed once here and carried, so the span walk below and
         // the parse both use the one definition without recomputing it.
         //
-        // This caps the READ, in on-disk bytes. It is not the admission budget:
-        // a compressed blob file stores less than the cache will charge for the
-        // decoded value, so a highly compressible window would pass a check made
-        // here and still admit many times the cache's capacity. The admission
-        // budget is enforced in `warm_span`, against the weight the cache
-        // actually sees.
+        // This is a pre-filter on the records, not the read budget. What is
+        // actually read is a span's EXTENT, which also covers the gaps merged
+        // into it, so the budget that bounds the I/O is applied per span below.
+        // Nor is it the admission budget: a compressed blob file stores less
+        // than the cache will charge for the decoded value, so that is enforced
+        // separately in `warm_span` against the weight the cache sees.
         let half = capacity / 2;
-        let mut read_bytes: u64 = 0;
+        let mut record_bytes: u64 = 0;
+        let mut full = false;
         items.retain_mut(|(key, vhandle, len)| {
-            if read_bytes >= half || cache.contains_blob(tree_id, vhandle) {
+            if full || cache.contains_blob(tree_id, vhandle) {
                 return false;
             }
             let Ok(record) = crate::vlog::blob_file::reader::record_len(key.len(), vhandle) else {
                 return false;
             };
-            // Plain add: a window holds at most `u16::MAX` records and
-            // `record_len` caps each at the 256 MiB value limit plus its
-            // header, so the running total cannot approach `u64::MAX`.
-            read_bytes += record as u64;
+            // Checked BEFORE keeping, so the record that fills the budget is
+            // dropped rather than admitted whole on top of it. Plain add: a
+            // window holds at most `u16::MAX` records and `record_len` caps
+            // each at the 256 MiB value limit plus its header, so the running
+            // total cannot approach `u64::MAX`.
+            if record_bytes + record as u64 > half {
+                full = true;
+                return false;
+            }
+            record_bytes += record as u64;
             *len = record;
             true
         });
@@ -162,56 +169,36 @@ impl<'a> Accessor<'a> {
             items.sort_unstable_by_key(key);
         }
 
-        // What this prefetch may still admit, in the weight the cache charges.
-        // Spans stop being warmed once it runs out.
+        // Two budgets, because the two costs are different. `read_budget` is
+        // the I/O: what a span costs is its EXTENT, gaps included, not the sum
+        // of its records, and merging through a gap is exactly what buys the
+        // speedup. `admit_budget` is the cache weight, which for a compressed
+        // file is a different number again. Each bounds the prefetch at half
+        // the cache.
+        let mut read_budget = half;
         let mut admit_budget = half;
 
         let mut start = 0;
-        while start < items.len() && admit_budget > 0 {
+        while start < items.len() && admit_budget > 0 && read_budget > 0 {
             #[expect(clippy::indexing_slicing, reason = "start < items.len() by the loop")]
-            let (_, first, first_len) = items[start];
-            let file_id = first.blob_file_id;
+            let (_, first, _) = items[start];
 
-            // Extend the span while the next record is close enough to be worth
-            // reading through the gap, and the whole span still fits one read.
-            //
-            // Offsets come from a `BlobIndirection` decoded out of an SST value,
-            // so they are on-disk data: `record_len` bounds a record's length,
-            // but nothing bounds where it claims to start. An end that does not
-            // fit a `u64` is a handle no writer produced, so it is rejected
-            // rather than clamped. Clamping would be worse than wrong here: a
-            // saturated `span_end + max_gap` compares as "nothing is too far
-            // away", which merges the span across a gap of any size.
-            let mut end = start + 1;
-            let Some(mut span_end) = first.offset.checked_add(first_len as u64) else {
+            // The span may not reach past what is left of the read budget, so a
+            // run of small records with wide gaps cannot turn into a read the
+            // budget never sanctioned.
+            let Some((end, span_end)) =
+                span_extent(items, start, max_gap, max_read as u64, read_budget)
+            else {
                 start += 1;
                 continue;
             };
-            while end < items.len() {
-                #[expect(clippy::indexing_slicing, reason = "end < items.len() by the loop")]
-                let (_, next, next_len) = items[end];
-                let within_gap = span_end
-                    .checked_add(max_gap)
-                    .is_some_and(|reach| next.offset <= reach);
-                if next.blob_file_id != file_id || !within_gap {
-                    break;
-                }
-                let Some(next_end) = next.offset.checked_add(next_len as u64) else {
-                    break;
-                };
-                // `items` is sorted by offset, so `next.offset >= first.offset`
-                // and this end is at or past the span's start.
-                debug_assert!(next_end >= first.offset);
-                if next_end - first.offset > max_read as u64 {
-                    break;
-                }
-                span_end = span_end.max(next_end);
-                end += 1;
-            }
 
             if end - start >= 2
                 && let Some(span) = items.get(start..end)
             {
+                // `span_extent` bounds the extent by `reach`, so it fits.
+                debug_assert!(span_end - first.offset <= read_budget);
+                read_budget -= span_end - first.offset;
                 self.warm_span(
                     tree_id,
                     span,
@@ -326,3 +313,67 @@ impl<'a> Accessor<'a> {
         }
     }
 }
+
+/// How far one coalesced span reaches, starting at `items[start]`.
+///
+/// Returns the exclusive end index and the span's end offset, or `None` when
+/// the first record's own end does not fit a `u64`.
+///
+/// A span grows while the next record is in the same blob file, starts within
+/// `max_gap` of what the span already covers, and leaves the whole extent
+/// within BOTH bounds: `max_read`, the cap on any single read, and
+/// `read_budget`, what is left of this prefetch's I/O allowance.
+///
+/// The extent is what a caller actually reads, GAPS INCLUDED. Merging through a
+/// gap is the point, but it means the read is wider than the records in it, so
+/// both bounds have to be applied to the extent. Bounding the record bytes
+/// instead would let a run of small records with wide gaps read many times what
+/// the budget allowed.
+///
+/// Offsets come from a `BlobIndirection` decoded out of an SST value, so they
+/// are on-disk data: `record_len` bounds a record's length, but nothing bounds
+/// where it claims to start. An end that does not fit a `u64` is a handle no
+/// writer produced, and is rejected rather than clamped. Clamping would be
+/// worse than wrong here: a saturated `span_end + max_gap` compares as
+/// "nothing is too far away", which merges the span across a gap of any size.
+///
+/// `items` must be sorted by `(blob_file_id, offset)`.
+fn span_extent(
+    items: &[(&[u8], ValueHandle, usize)],
+    start: usize,
+    max_gap: u64,
+    max_read: u64,
+    read_budget: u64,
+) -> Option<(usize, u64)> {
+    let reach = max_read.min(read_budget);
+    let (_, first, first_len) = *items.get(start)?;
+    let file_id = first.blob_file_id;
+
+    let mut end = start + 1;
+    let mut span_end = first.offset.checked_add(first_len as u64)?;
+
+    while let Some(&(_, next, next_len)) = items.get(end) {
+        let within_gap = span_end
+            .checked_add(max_gap)
+            .is_some_and(|reach| next.offset <= reach);
+        if next.blob_file_id != file_id || !within_gap {
+            break;
+        }
+        let Some(next_end) = next.offset.checked_add(next_len as u64) else {
+            break;
+        };
+        // Sorted by offset, so this end is at or past the span's start.
+        debug_assert!(next_end >= first.offset);
+        if next_end - first.offset > reach {
+            break;
+        }
+        span_end = span_end.max(next_end);
+        end += 1;
+    }
+
+    Some((end, span_end))
+}
+
+#[cfg(test)]
+#[expect(clippy::expect_used, reason = "test code")]
+mod tests;
