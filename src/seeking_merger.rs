@@ -139,11 +139,27 @@ fn build_max_cmp<C: UserComparator + Clone>(comparator: C) -> MaxCmp<C> {
 /// end is still walking toward. With `active` empty, any parked head wins,
 /// which is how the two directions hand over the last items of a range.
 ///
+/// Memoized result of the parked-candidate scan in [`pick_parked`].
+#[derive(Clone, Copy)]
+enum ParkedCache {
+    /// The parked set may have changed since the last scan; recompute.
+    Stale,
+    /// Scanned: no vacated slot currently holds a parked leaf.
+    Empty,
+    /// Scanned: this slot's parked leaf sorts first in the active direction.
+    Best(usize),
+}
+
 /// `vacated` is the merger-maintained list of slots emptied in `active` since
 /// its last (re)initialization — the only slots that can hold a parked leaf.
-/// Scanning it instead of every slot keeps a mixed-end step O(log n) while no
-/// source has run dry (the list is empty) and O(exhausted) after, instead of
-/// paying O(sources) per emitted item.
+/// `cache` memoizes the scan's best candidate: the parked set changes only at
+/// discrete events (a slot vacates, the opposite direction steps, a claim, a
+/// full refill), all of which reset the cache to `None`, so a long drain in
+/// one direction pays the O(exhausted) scan once and an O(1) comparison per
+/// item after — not the scan per item. An ORDERED structure over the parked
+/// heads would not do better: it only pays off when the scan repeats, and the
+/// scan repeats only under alternation, where the opposite direction's every
+/// step can change a parked head and would invalidate that structure too.
 ///
 /// `cmp` is the active direction's ordering, so "ahead" reads the same way in
 /// both: `Less` under the min-tree, `Less` under the reversed max-tree.
@@ -151,6 +167,7 @@ fn pick_parked<A, O, C>(
     active: &LoserTree<MergerEntry, A>,
     other: Option<&LoserTree<MergerEntry, O>>,
     vacated: &[usize],
+    cache: &mut ParkedCache,
     cmp: &C,
 ) -> Option<usize>
 where
@@ -163,27 +180,40 @@ where
         return None;
     }
 
-    let winner = active.winner_slot().and_then(|slot| active.peek_slot(slot));
-
-    let mut best: Option<(usize, &MergerEntry)> = None;
-    for &slot in vacated {
-        // A vacated slot stays empty in `active` until the next full
-        // (re)initialization, which rebuilds this list.
-        debug_assert!(
-            active.peek_slot(slot).is_none(),
-            "vacated slot holds a leaf in the active tournament"
-        );
-        // Nothing parked for it RIGHT NOW; the opposite direction may still
-        // buffer one later (its next full refill), so the entry stays listed.
-        let Some(parked) = other.peek_slot(slot) else {
-            continue;
-        };
-        if best.is_none_or(|(_, current)| cmp.compare(parked, current) == Ordering::Less) {
-            best = Some((slot, parked));
+    // A cached candidate must still be parked; every event that can move or
+    // consume one resets the cache, so a vanished head means a missed
+    // invalidation. Recompute rather than trust it.
+    let best_slot = match *cache {
+        ParkedCache::Best(slot) if other.peek_slot(slot).is_some() => Some(slot),
+        ParkedCache::Empty => None,
+        ParkedCache::Stale | ParkedCache::Best(_) => {
+            let mut best: Option<(usize, &MergerEntry)> = None;
+            for &slot in vacated {
+                // A vacated slot stays empty in `active` until the next full
+                // (re)initialization, which rebuilds this list.
+                debug_assert!(
+                    active.peek_slot(slot).is_none(),
+                    "vacated slot holds a leaf in the active tournament"
+                );
+                // Nothing parked for it RIGHT NOW; the opposite direction may
+                // still buffer one later (its next full refill), so the entry
+                // stays listed.
+                let Some(parked) = other.peek_slot(slot) else {
+                    continue;
+                };
+                if best.is_none_or(|(_, current)| cmp.compare(parked, current) == Ordering::Less) {
+                    best = Some((slot, parked));
+                }
+            }
+            let computed = best.map(|(slot, _)| slot);
+            *cache = computed.map_or(ParkedCache::Empty, ParkedCache::Best);
+            computed
         }
-    }
+    };
 
-    let (slot, parked) = best?;
+    let slot = best_slot?;
+    let parked = other.peek_slot(slot)?;
+    let winner = active.winner_slot().and_then(|slot| active.peek_slot(slot));
     match winner {
         // Ahead of what this tournament would emit next, so it goes first.
         Some(w) => (cmp.compare(parked, w) == Ordering::Less).then_some(slot),
@@ -240,6 +270,14 @@ pub struct SeekingMerger<S: MergeSource, C: UserComparator + Clone> {
     forward_vacated: Vec<usize>,
     /// Mirror of `forward_vacated` for `backward_tree`.
     backward_vacated: Vec<usize>,
+    /// Memoized best parked candidate for the forward direction (a slot in
+    /// `forward_vacated` whose backward leaf sorts first under the min order).
+    /// Reset to [`ParkedCache::Stale`] by every event that can change the
+    /// parked set: a forward vacate, ANY backward step (it can move a parked
+    /// head), a claim, a full (re)initialization, a reseek.
+    forward_parked_best: ParkedCache,
+    /// Mirror of `forward_parked_best` for the backward direction.
+    backward_parked_best: ParkedCache,
 }
 
 impl<S: MergeSource, C: UserComparator + Clone> SeekingMerger<S, C> {
@@ -261,6 +299,8 @@ impl<S: MergeSource, C: UserComparator + Clone> SeekingMerger<S, C> {
             backward_primed: false,
             forward_vacated: Vec::new(),
             backward_vacated: Vec::new(),
+            forward_parked_best: ParkedCache::Stale,
+            backward_parked_best: ParkedCache::Stale,
         }
     }
 
@@ -274,6 +314,8 @@ impl<S: MergeSource, C: UserComparator + Clone> SeekingMerger<S, C> {
             pending_forward_error,
             forward_vacated,
             backward_vacated,
+            forward_parked_best,
+            backward_parked_best,
             ..
         } = self;
         let n = *n_sources;
@@ -318,9 +360,13 @@ impl<S: MergeSource, C: UserComparator + Clone> SeekingMerger<S, C> {
             forward_tree.insert(LoserTree::build(initial, cmp))
         };
         // A full (re)initialization re-derives which slots stand empty; between
-        // inits the list only grows at the vacate sites.
+        // inits the list only grows at the vacate sites. Both parked caches are
+        // stale: this rebuilt the forward candidates, and the migrate path may
+        // have taken backward leaves.
         forward_vacated.clear();
         forward_vacated.extend((0..n).filter(|&i| tree.peek_slot(i).is_none()));
+        *forward_parked_best = ParkedCache::Stale;
+        *backward_parked_best = ParkedCache::Stale;
     }
 
     fn initialize_backward(&mut self) {
@@ -333,6 +379,8 @@ impl<S: MergeSource, C: UserComparator + Clone> SeekingMerger<S, C> {
             pending_backward_error,
             forward_vacated,
             backward_vacated,
+            forward_parked_best,
+            backward_parked_best,
             ..
         } = self;
         let n = *n_sources;
@@ -373,6 +421,8 @@ impl<S: MergeSource, C: UserComparator + Clone> SeekingMerger<S, C> {
         };
         backward_vacated.clear();
         backward_vacated.extend((0..n).filter(|&i| tree.peek_slot(i).is_none()));
+        *forward_parked_best = ParkedCache::Stale;
+        *backward_parked_best = ParkedCache::Stale;
     }
 }
 
@@ -399,6 +449,8 @@ impl<S: MergeSource + crate::reseek::Reseekable, C: UserComparator + Clone>
         self.backward_primed = false;
         self.forward_vacated.clear();
         self.backward_vacated.clear();
+        self.forward_parked_best = ParkedCache::Stale;
+        self.backward_parked_best = ParkedCache::Stale;
         self.pending_forward_error = None;
         self.pending_backward_error = None;
     }
@@ -439,9 +491,14 @@ impl<S: MergeSource, C: UserComparator + Clone> Iterator for SeekingMerger<S, C>
             comparator,
             forward_vacated,
             backward_vacated,
+            forward_parked_best,
+            backward_parked_best,
             ..
         } = self;
         let tree = forward_tree.as_mut()?;
+        // Every arm below mutates the forward tree, and any forward head can
+        // be a backward-vacated slot's parked candidate.
+        *backward_parked_best = ParkedCache::Stale;
         // winner_slot returns the source index directly (by
         // construction every MergerEntry's `source` field equals
         // its slot index). Avoids a separate peek_min call. None
@@ -461,11 +518,14 @@ impl<S: MergeSource, C: UserComparator + Clone> Iterator for SeekingMerger<S, C>
             tree,
             backward_tree.as_ref(),
             forward_vacated,
+            forward_parked_best,
             &build_min_cmp(comparator.clone()),
         ) && let Some(entry) = backward_tree.as_mut().and_then(|bt| bt.take_slot(slot))
         {
-            // The claim emptied the backward slot without a refill.
+            // The claim emptied the backward slot without a refill and
+            // consumed the cached candidate.
             backward_vacated.push(slot);
+            *forward_parked_best = ParkedCache::Stale;
             return Some(Ok(entry.value));
         }
         let source = tree.winner_slot()?;
@@ -491,6 +551,7 @@ impl<S: MergeSource, C: UserComparator + Clone> Iterator for SeekingMerger<S, C>
                 let old = tree.pop_min()?;
                 pending_forward_error.get_or_insert(e);
                 forward_vacated.push(source);
+                *forward_parked_best = ParkedCache::Stale;
                 Some(Ok(old.value))
             }
             None => {
@@ -500,6 +561,7 @@ impl<S: MergeSource, C: UserComparator + Clone> Iterator for SeekingMerger<S, C>
                 // this tournament's own winner.
                 let old = tree.pop_min()?;
                 forward_vacated.push(source);
+                *forward_parked_best = ParkedCache::Stale;
                 Some(Ok(old.value))
             }
         }
@@ -543,20 +605,28 @@ impl<S: CoherentMergeSource, C: UserComparator + Clone> DoubleEndedIterator
             comparator,
             forward_vacated,
             backward_vacated,
+            forward_parked_best,
+            backward_parked_best,
             ..
         } = self;
         let tree = backward_tree.as_mut()?;
+        // Every arm below mutates the backward tree, and any backward head can
+        // be a forward-vacated slot's parked candidate.
+        *forward_parked_best = ParkedCache::Stale;
         // Mirror of `next()`: a head parked in the FORWARD tournament competes
         // for this end's winner as soon as its source is drained backward.
         if let Some(slot) = pick_parked(
             tree,
             forward_tree.as_ref(),
             backward_vacated,
+            backward_parked_best,
             &build_max_cmp(comparator.clone()),
         ) && let Some(entry) = forward_tree.as_mut().and_then(|ft| ft.take_slot(slot))
         {
-            // The claim emptied the forward slot without a refill.
+            // The claim emptied the forward slot without a refill and
+            // consumed the cached candidate.
             forward_vacated.push(slot);
+            *backward_parked_best = ParkedCache::Stale;
             return Some(Ok(entry.value));
         }
         let source = tree.winner_slot()?;
@@ -577,11 +647,13 @@ impl<S: CoherentMergeSource, C: UserComparator + Clone> DoubleEndedIterator
                 let old = tree.pop_min()?;
                 pending_backward_error.get_or_insert(e);
                 backward_vacated.push(source);
+                *backward_parked_best = ParkedCache::Stale;
                 Some(Ok(old.value))
             }
             None => {
                 let old = tree.pop_min()?;
                 backward_vacated.push(source);
+                *backward_parked_best = ParkedCache::Stale;
                 Some(Ok(old.value))
             }
         }
