@@ -11,21 +11,10 @@
 
 LSM-tree storage engine in Rust. Embedded library; provides keyed point reads, prefix and range scans, MVCC snapshots, compaction, and a block cache. No write-ahead log: durability is the caller's responsibility. Built for [CoordiNode](https://github.com/structured-world/coordinode); usable standalone.
 
-## Status
-
-On-disk format version **V5** — the ONLY supported format. The engine carries no legacy decode paths, no backward-compat variations, and no in-place upgrade: a pre-V5 database fails to open with `InvalidVersion`, and this crate ships no conversion tooling and plans none (such a store stays readable by the engine that wrote it). Versioning is single-monotonic: every breaking format change bumps to the next version with explicit migration notes.
-
 ## Quick start
 
 ```sh
-cargo add coordinode-lsm-tree@5.7
-```
-
-or add it to `Cargo.toml` directly:
-
-```toml
-[dependencies]
-coordinode-lsm-tree = "5.7"
+cargo add coordinode-lsm-tree
 ```
 
 ```rust
@@ -226,9 +215,9 @@ All optional. The default build (`std` + `parallel`) is the minimal core: no com
 
 ## Benchmarks
 
-CI runs [`db_bench`](tools/db_bench) on every push to `main` and on pull requests. Results from `main` are published to the [benchmark dashboard](https://structured-world.github.io/coordinode-lsm-tree/dev/bench/). PRs regressing performance by more than 15% trigger an alert; more than 25% fails CI.
+CI runs [`db_bench`](tools/db_bench) on every push to `main`, and publishes the results to the [benchmark dashboard](https://structured-world.github.io/coordinode-lsm-tree/dev/bench/). A run regressing performance by more than 15% raises an alert; more than 25% fails the job.
 
-Flamegraphs are generated on every merge to `main` from instrumented `db_bench` runs and published under `flamegraphs/<commit-sha>/flamegraph.svg` on [gh-pages](https://structured-world.github.io/coordinode-lsm-tree/).
+Pull requests are deliberately not auto-benchmarked: the bench host is serialised across the whole repository, so every PR push would queue behind it. Measure a branch on demand with the workflow's manual dispatch instead — those runs do not touch the dashboard's `main` series.
 
 Local Criterion microbenchmarks:
 
@@ -251,7 +240,21 @@ cargo run --release --features flamegraph -- \
 | Tool | Use |
 |------|-----|
 | [`tools/db_bench`](tools/db_bench) | RocksDB-compatible benchmark suite, also drives the CI perf dashboard. |
-| [`tools/sst-dump`](tools/sst-dump) | Inspect / verify a single SST file out-of-band. Subcommands: `verify` (walk every block, check per-block XXH3, exit non-zero on corruption), `properties` (print the SST's stored metadata: id, key range, KV / tombstone counts, block counts, compression, timestamp), `hex <offset>` (raw hex dump of a region with optional `Header` decode; useful for inspecting a specific offset flagged by `verify --verbose`), `index-dump` (print TLI entries: end_key + offset + size + seqno per pointed-at block; useful for diagnosing range-read fan-out), `dump` (stream every KV entry to stdout with optional `--from` / `--to` / `--max=N` / `--keys-only` filters; full-index SSTs only), `filter-stats` (print BuRR filter sizing: section bytes, layer count, item count, approximate bits-per-key; single-block filters only, partitioned filters not yet supported), `salvage <dest>` (block-salvage a corrupt SST into a fresh file at `<dest>`: re-emit every block that passes its checksum, dropping and reporting the corrupt ones, so a single bad block costs only its own key range instead of the whole file). |
+| [`tools/sst-dump`](tools/sst-dump) | Inspect, verify and rescue a single SST out-of-band — no `Tree`, no manifest. See its [subcommands](#sst-dump-subcommands) below. |
+
+<a id="sst-dump-subcommands"></a>
+
+| `sst-dump` subcommand | What it does |
+|---|---|
+| `verify` | Walks every block and checks its per-block XXH3; exits non-zero on corruption. `--verbose` reports each finding individually instead of a count plus the first three. |
+| `properties` | Prints the SST's stored metadata: id, key range, KV / tombstone counts, block counts, compression, timestamp. |
+| `index-dump` | Prints the top-level index: `end_key` + offset + size + seqno per pointed-at block. Useful for diagnosing range-read fan-out. |
+| `dump` | Streams every KV entry to stdout, with optional `--from` / `--to` / `--max=N` / `--keys-only`. Full-index SSTs only. |
+| `hex <offset>` | Raw hex dump of a region, with an optional `Header` decode — for inspecting an offset that `verify --verbose` flagged. |
+| `dump-block <offset>` | Decodes one block at `offset` and prints its header, framing and (for encrypted blocks) the reconstructed AAD. The forensic step past `hex`. |
+| `filter-stats` | Prints BuRR filter sizing: section bytes, layer count, item count, approximate bits per key. Single-block filters only; partitioned-filter tables are not covered. |
+| `salvage <dest>` | Block-salvages a corrupt SST into a fresh file: every block that passes its checksum is re-emitted, the corrupt ones are dropped and reported. A bad block costs its own key range instead of the whole file. |
+| `repair` | Rebuilds a missing or corrupt `MANIFEST` from the SSTs on disk (the path argument is the DB **directory**, not one SST). `--salvage` additionally block-salvages tables that fail whole-file recovery, quarantining the corrupt original. |
 
 ## Data integrity & durability
 
