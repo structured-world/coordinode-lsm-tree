@@ -158,7 +158,12 @@ fn read_data_frame_returns_decompressible_zstd_frame() -> crate::Result<()> {
         &transform,
     )?;
 
-    let (header, frame, _corrected) = Block::read_data_frame(&tmp.file, tmp.handle, &transform)?;
+    let (header, frame, _corrected) = Block::read_data_frame(
+        &tmp.file,
+        tmp.handle,
+        crate::table::block::BlockIdentity::for_test(0, BlockType::Data),
+        &transform,
+    )?;
     // The returned bytes are the COMPRESSED frame: it must be smaller than
     // the payload and must decompress back to the original (proving
     // read_data_frame skipped decode yet returned a valid frame).
@@ -191,8 +196,13 @@ fn read_data_frame_rejects_oversized_handle() -> crate::Result<()> {
         &transform,
     )?;
     let oversized = BlockHandle::new(tmp.handle.offset(), u32::MAX);
-    let err = Block::read_data_frame(&tmp.file, oversized, &transform)
-        .expect_err("oversized handle must be rejected");
+    let err = Block::read_data_frame(
+        &tmp.file,
+        oversized,
+        crate::table::block::BlockIdentity::for_test(0, BlockType::Data),
+        &transform,
+    )
+    .expect_err("oversized handle must be rejected");
     assert!(
         matches!(err, crate::Error::DecompressedSizeTooLarge { .. }),
         "expected DecompressedSizeTooLarge, got {err:?}",
@@ -881,6 +891,46 @@ mod encrypted {
 
     fn test_provider() -> crate::encryption::Aes256GcmProvider {
         crate::encryption::Aes256GcmProvider::new(&[0x42; 32])
+    }
+
+    /// An encrypted block HAS a compressed frame; it just sits one layer
+    /// deeper. The frame reader used to refuse these outright because it read
+    /// the on-disk bytes itself and never decrypted them, so the only way to
+    /// reach the frame was a full block decode that also decompressed it —
+    /// which is why the block-layout cross-check skipped encrypted tables.
+    /// Reading through the shared primitive, the decrypt happens on the way
+    /// and the frame comes back like any other.
+    #[cfg(feature = "zstd")]
+    #[test]
+    fn read_data_frame_returns_the_frame_of_an_encrypted_block() -> crate::Result<()> {
+        let enc = test_provider();
+        // Repetitive payload so zstd produces a genuinely smaller frame.
+        let data: Vec<u8> = (0..40_000u32).map(|i| (i % 64) as u8).collect();
+        let identity = crate::table::block::BlockIdentity::for_test(0, BlockType::Data);
+        let transform = crate::table::block::BlockTransform::from_parts(
+            CompressionType::Zstd(3),
+            Some(&enc),
+            None,
+        )?;
+        let tmp = super::write_block_to_tempfile(&data, identity, &transform)?;
+
+        let (header, frame, _recovery) =
+            Block::read_data_frame(&tmp.file, tmp.handle, identity, &transform)?;
+
+        // What came back is the COMPRESSED plaintext frame: smaller than the
+        // payload, and it decompresses to the original without a second read.
+        assert!(
+            frame.len() < data.len(),
+            "frame must be compressed (got {} for {} bytes)",
+            frame.len(),
+            data.len(),
+        );
+        let decompressed = crate::compression::ZstdBackend::decompress(
+            &frame,
+            header.uncompressed_length as usize + 1,
+        )?;
+        assert_eq!(decompressed, data, "frame must decompress to the original");
+        Ok(())
     }
 
     #[test]

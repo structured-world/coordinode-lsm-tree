@@ -1161,16 +1161,50 @@ impl Block {
     /// call sites (`load_block`, the partial-decode path, patrol scrub) use it
     /// to attribute the on-read recovery to the right metric counter, keeping
     /// the public [`EccStatus`] free of the kind.
-    #[expect(
-        clippy::too_many_lines,
-        reason = "two ways to OBTAIN the payload (encrypted Vec vs zero-copy Slice), each with its own size caps and trailer classification; what happens to the payload afterwards is shared"
-    )]
     pub(crate) fn from_file_with_recovery(
         file: &dyn FsFile,
         handle: BlockHandle,
         identity: BlockIdentity,
         transform: &BlockTransform<'_>,
     ) -> crate::Result<(Self, EccStatus, Option<EccRecoveryKind>)> {
+        let (header, payload, ecc_status, recovery) =
+            Self::read_verified_payload(file, handle, identity, transform)?;
+        let data = Self::decompress_payload(&header, payload, transform)?;
+        Ok((Self { header, data }, ecc_status, recovery))
+    }
+
+    /// THE block-read primitive: reads a block's frame and hands back its
+    /// VERIFIED payload, one step short of decompression.
+    ///
+    /// Everything that has to happen before a caller may look at a block's
+    /// bytes happens here, once: the size caps that bound the allocation, the
+    /// header decode, the parity-trailer classification, the checksum (with
+    /// ECC recovery when a recognized trailer is present), and the decrypt.
+    /// What comes back is exactly what the writer compressed.
+    ///
+    /// Callers that want the decoded block feed it to
+    /// [`Self::decompress_payload`] — that pairing IS
+    /// [`Self::from_file_with_recovery`]. Callers that want the compressed
+    /// frame (partial decode, the block-layout cross-check) stop here, and get
+    /// it without a second read of the same bytes.
+    ///
+    /// # Errors
+    ///
+    /// [`crate::Error::DecompressedSizeTooLarge`] when the handle or the
+    /// header declares more than the caps allow, [`crate::Error::InvalidHeader`]
+    /// on an undecodable header or a frame shorter than its own declaration,
+    /// a checksum error when the payload fails and parity cannot recover it,
+    /// plus any I/O and decrypt failure.
+    #[expect(
+        clippy::too_many_lines,
+        reason = "two ways to OBTAIN the payload (encrypted Vec vs zero-copy Slice), each with its own size caps and trailer classification"
+    )]
+    pub(crate) fn read_verified_payload(
+        file: &dyn FsFile,
+        handle: BlockHandle,
+        identity: BlockIdentity,
+        transform: &BlockTransform<'_>,
+    ) -> crate::Result<(Header, Slice, EccStatus, Option<EccRecoveryKind>)> {
         let encryption = transform.encryption();
         // `identity` (tree/table + compression context) feeds AAD
         // reconstruction on the encrypted read path below.
@@ -1221,7 +1255,7 @@ impl Block {
         // No intermediate Slice, no overlap of encrypted + decrypted buffers.
         // When no encryption, read into a Slice (zero-copy on the
         // None-compression path).
-        let (header, data, ecc_status, recovery) = if let Some(enc) = encryption {
+        let (header, payload, ecc_status, recovery) = if let Some(enc) = encryption {
             let block_size = handle.size() as usize;
 
             // Pre-decode lower bound: every header is at least MIN_LEN; the
@@ -1355,9 +1389,12 @@ impl Block {
 
             let decrypted = decrypt_block_payload(enc, &buf, &identity)?;
 
-            let data = Self::decompress_payload(&parsed_header, Slice::from(decrypted), transform)?;
-
-            (parsed_header, data, ecc_status, payload_corrected)
+            (
+                parsed_header,
+                Slice::from(decrypted),
+                ecc_status,
+                payload_corrected,
+            )
         } else {
             // Single I/O read — header + payload in one Slice.
             let buf = crate::file::read_exact(file, *handle.offset(), handle.size() as usize)?;
@@ -1444,12 +1481,10 @@ impl Block {
                 ecc_status
             };
 
-            let data = Self::decompress_payload(&parsed_header, payload_slice, transform)?;
-
-            (parsed_header, data, ecc_status, payload_corrected)
+            (parsed_header, payload_slice, ecc_status, payload_corrected)
         };
 
-        Ok((Self { header, data }, ecc_status, recovery))
+        Ok((header, payload, ecc_status, recovery))
     }
 
     /// In-place autoheal primitive: read this block's on-disk frame and, if its
@@ -1609,120 +1644,36 @@ impl Block {
         Ok(Some((frame, kind)))
     }
 
-    /// Reads a data block's verified COMPRESSED payload (the zstd frame) WITHOUT
-    /// decompressing it, for partial / lazy decode. Returns the header, the
-    /// compressed-frame bytes (checksum-verified; ECC-recovered if a recognized
-    /// parity trailer is present), and `Some(kind)` when a recovery occurred so
-    /// the caller can schedule auto-heal and count the recovery.
+    /// Reads a data block's verified COMPRESSED payload (the zstd frame)
+    /// WITHOUT decompressing it, for partial / lazy decode and the
+    /// block-layout cross-check.
     ///
-    /// Non-encrypted blocks only — the caller must ensure
-    /// `transform.encryption().is_none()` (an encrypted block's plaintext frame
-    /// is only available after a whole-block decrypt, which defeats the lazy
-    /// path). Mirrors the non-encrypted read+verify of
-    /// [`Self::from_file_with_status`], stopping before decompression.
+    /// A thin naming over [`Self::read_verified_payload`], which is where the
+    /// caps, the trailer classification, the checksum and the ECC recovery all
+    /// live. It used to be a second copy of that verification that additionally
+    /// REFUSED encrypted blocks, because it read the on-disk bytes directly and
+    /// an encrypted block's frame only exists after a whole-block decrypt. The
+    /// primitive performs that decrypt, so the refusal is gone: what comes back
+    /// is the compressed frame either way.
+    ///
+    /// `Some(kind)` on the recovery slot means ECC repaired the frame, so the
+    /// caller can schedule auto-heal (the bytes are right, the on-disk copy is
+    /// still faulty) and count the recovery by mechanism.
     ///
     /// # Errors
     ///
-    /// Returns an error on a framing / checksum failure (unrecoverable), or if
-    /// called for an encrypted transform.
+    /// Whatever [`Self::read_verified_payload`] returns: a framing, checksum,
+    /// cap, decrypt or I/O failure.
     #[cfg(feature = "zstd")]
     pub(crate) fn read_data_frame(
         file: &dyn FsFile,
         handle: BlockHandle,
+        identity: BlockIdentity,
         transform: &BlockTransform<'_>,
     ) -> crate::Result<(Header, Slice, Option<EccRecoveryKind>)> {
-        if transform.encryption().is_some() {
-            return Err(crate::Error::Io(crate::io::Error::other(
-                "read_data_frame: encrypted blocks are not supported on the lazy path",
-            )));
-        }
-
-        // Pre-allocation sanity cap on `handle.size()`, mirroring
-        // `from_file_with_status`: reject an absurd on-disk size before
-        // allocating the read buffer, so a corrupt handle cannot force a huge
-        // allocation. Non-encrypted path (encryption rejected above), so no
-        // encryption overhead; the ECC term uses the block's ACTUAL per-SST
-        // scheme (never a hardcoded one) and is 0 when there is no parity.
-        let max_ecc_overhead = match transform.ecc_params() {
-            Some(params) => u64::from(expected_parity_len(MAX_DECOMPRESSION_SIZE, params)),
-            None => 0,
-        };
-        let max_on_disk_size =
-            u64::from(MAX_DECOMPRESSION_SIZE) + max_ecc_overhead + Header::MAX_LEN as u64;
-        if u64::from(handle.size()) > max_on_disk_size {
-            return Err(crate::Error::DecompressedSizeTooLarge {
-                declared: u64::from(handle.size()),
-                limit: max_on_disk_size,
-            });
-        }
-
-        let buf = crate::file::read_exact(file, *handle.offset(), handle.size() as usize)?;
-        let parsed_header = Header::decode_from(&mut &buf[..])?;
-        // Reject a header that declares a decompressed size past the cap before
-        // the lazy decode path trusts it.
-        if parsed_header.uncompressed_length > MAX_DECOMPRESSION_SIZE {
-            return Err(crate::Error::DecompressedSizeTooLarge {
-                declared: u64::from(parsed_header.uncompressed_length),
-                limit: u64::from(MAX_DECOMPRESSION_SIZE),
-            });
-        }
-        let header_len = Header::header_len(parsed_header.block_type);
-
-        let has_ecc = block_has_parity(&parsed_header, transform);
-        let ecc_length = if has_ecc {
-            checked_ecc_length(
-                parsed_header.data_length,
-                block_ecc_params(&parsed_header, transform),
-            )?
-        } else {
-            0
-        };
-
-        // The header was decoded from `buf` above, so `buf.len() >= header_len`
-        // holds and this cannot underflow. `checked_sub` on this recovery path
-        // surfaces any future decode regression loudly instead of clamping to a
-        // 0-payload the trailer check could accept as a clean empty block.
-        let actual_payload_plus_ecc = buf
-            .len()
-            .checked_sub(header_len)
-            .ok_or(crate::Error::InvalidHeader("Block"))?;
-        let actual_data_len = parsed_header.data_length as usize;
-        let _ecc_status = classify_block_trailer(
-            has_ecc,
-            actual_payload_plus_ecc,
-            actual_data_len,
-            ecc_length,
-            &handle,
-        )?;
-
-        let (payload, recovery): (Slice, Option<EccRecoveryKind>) = if ecc_length == 0 {
-            #[expect(
-                clippy::indexing_slicing,
-                reason = "actual_data_len <= post-header len, checked via classify_block_trailer"
-            )]
-            let checksum = Checksum::from_raw(crate::hash::hash128(
-                &buf[header_len..header_len + actual_data_len],
-            ));
-            checksum.check(parsed_header.checksum)?;
-            (buf.slice(header_len..header_len + actual_data_len), None)
-        } else {
-            #[expect(clippy::indexing_slicing, reason = "header was decoded from buf")]
-            let mut cursor = crate::io::Cursor::new(&buf[header_len..]);
-            // `recovery` is surfaced so the partial-decode caller can schedule
-            // auto-heal (the recovered bytes are correct but the on-disk copy is
-            // still faulty) and count the recovery; a heal is also logged inside
-            // read_payload_and_verify.
-            let (frame, recovery) = Self::read_payload_and_verify(
-                &mut cursor,
-                parsed_header.data_length,
-                ecc_length,
-                parsed_header.checksum,
-                block_ecc_params(&parsed_header, transform),
-            )?;
-            (frame, recovery)
-        };
-
-        Ok((parsed_header, payload, recovery))
+        let (header, payload, _status, recovery) =
+            Self::read_verified_payload(file, handle, identity, transform)?;
+        Ok((header, payload, recovery))
     }
 }
 

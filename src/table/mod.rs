@@ -5307,8 +5307,17 @@ impl Table {
                 if !ends.iter().zip(ends.iter().skip(1)).all(|(a, b)| a < b) {
                     return Err(ERR);
                 }
-                let (header, frame, _recovery) =
-                    Block::read_data_frame(&*file, block_handle, &transform)?;
+                let (header, frame, _recovery) = Block::read_data_frame(
+                    &*file,
+                    block_handle,
+                    crate::table::block::BlockIdentity {
+                        table_id: self.metadata.id,
+                        block_type: BlockType::Data,
+                        dict_id: self.metadata.data_block_compression.dict_id(),
+                        window_log: 0,
+                    },
+                    &transform,
+                )?;
                 if ends.last() != Some(&header.uncompressed_length) {
                     return Err(ERR);
                 }
