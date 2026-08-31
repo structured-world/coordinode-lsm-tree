@@ -144,10 +144,13 @@ jobs:
           # Comment the comparison on the commit that regressed.
           comment-on-alert: true
           alert-comment-cc-users: "@polaz"
-          # A run 15% below the series is flagged. Advisory, not a gate:
-          # these are shared runners, and one slow run is not a regression
-          # on its own. fail-threshold is deliberately unset -- it would be
-          # dead config while nothing fails the job.
+          # A run 15% below the series is flagged. Advisory, not a gate: both
+          # triggers (a push to main, a manual dispatch) fire after a merge,
+          # never before one, so failing the job could only turn main red
+          # after the fact instead of stopping anything from landing. The
+          # comment carries the same signal without that. fail-threshold is
+          # deliberately unset -- it would be dead config while nothing
+          # fails the job.
           alert-threshold: "115%"
           fail-on-alert: false
           save-data-file: ${{ github.event_name == 'push' && github.ref == 'refs/heads/main' }}

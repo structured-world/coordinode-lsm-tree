@@ -219,7 +219,7 @@ All optional. The default build (`std` + `parallel`) is the minimal core: no com
 
 ## Benchmarks
 
-CI runs [`db_bench`](tools/db_bench) on every push to `main`, and publishes the results to the [benchmark dashboard](https://structured-world.github.io/coordinode-lsm-tree/dev/bench/). A run regressing performance by more than 15% is flagged on the dashboard and in the run's comment. The flag is advisory: shared runners vary enough that a single slow run is not on its own a regression, so it never fails the job.
+CI runs [`db_bench`](tools/db_bench) on every push to `main`, and publishes the results to the [benchmark dashboard](https://structured-world.github.io/coordinode-lsm-tree/dev/bench/). A run regressing performance by more than 15% is flagged on the dashboard and in the run's comment. The flag is advisory and never fails the job: benchmarks run after a merge, not before one, so a failure could only turn `main` red after the fact rather than stop anything from landing.
 
 Pull requests are deliberately not auto-benchmarked: the bench host is serialised across the whole repository, so every PR push would queue behind it. Measure a branch on demand with the workflow's manual dispatch instead — those runs do not touch the dashboard's `main` series.
 
@@ -244,7 +244,7 @@ cargo run --release --features flamegraph -- \
 | Tool | Use |
 |------|-----|
 | [`tools/db_bench`](tools/db_bench) | RocksDB-compatible benchmark suite, also drives the CI perf dashboard. |
-| [`tools/sst-dump`](tools/sst-dump) | Inspect, verify and rescue a single SST out-of-band — no `Tree`, no manifest. See its [subcommands](#sst-dump-subcommands) below. |
+| [`tools/sst-dump`](tools/sst-dump) | Inspect, verify and rescue SSTs out-of-band, without ever opening a `Tree`. The inspection commands read one SST and need no manifest; `repair` is the exception, taking a whole database directory and writing it a new one. See its [subcommands](#sst-dump-subcommands) below. |
 
 <a id="sst-dump-subcommands"></a>
 
