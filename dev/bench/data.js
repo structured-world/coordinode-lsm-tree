@@ -1,5 +1,5 @@
 window.BENCHMARK_DATA = {
-  "lastUpdate": 1782845048170,
+  "lastUpdate": 1788210510935,
   "repoUrl": "https://github.com/structured-world/coordinode-lsm-tree",
   "entries": {
     "lsm-tree db_bench": [
@@ -20622,6 +20622,84 @@ window.BENCHMARK_DATA = {
             "value": 686392.0810286675,
             "unit": "ops/sec",
             "extra": "P50: 1.3us | P99: 4.5us | P99.9: 7.0us\nthreads: 1 | elapsed: 0.29s | num: 200000 | iterations: 3"
+          }
+        ]
+      },
+      {
+        "commit": {
+          "author": {
+            "email": "mail@polaz.com",
+            "name": "Dmitry Prudnikov",
+            "username": "polaz"
+          },
+          "committer": {
+            "email": "noreply@github.com",
+            "name": "GitHub",
+            "username": "web-flow"
+          },
+          "distinct": true,
+          "id": "90d298e4014a40fe183e4a72db194a26eb934865",
+          "message": "perf(verify): run the reconcile gates on one decode per block (#590)\n\nThe repair verdict (`block_verify_verdict`) and the scrub digest refresh\n(`refresh_healed_checksum`) each called the semantic cross-checks in\nsequence,\nand every one of them walked the whole table itself. One reconcile\ntherefore\nre-read and re-decoded each data block seven to nine times, re-opened\nthe file\nand re-parsed the TOC once per gate, and reloaded every filter partition\nonce\nper gate. Repair time grew with the gate count, so each new check taxed\nevery\nfuture reconcile.\n\n## What changed\n\nBoth chains now call one driver, `Table::verify_reconcile_gates`:\n\n- the file is opened and its TOC parsed ONCE for the pass, and the\nhandle is\n  lent to every section read;\n- the side sections (seqno bounds, zone map, locator, filter, meta) are\nread\nonce each, through extracted `read_*_section` helpers that share a\nsingle\n  `section_transform`;\n- each live data block is read disk-fresh and decoded once into a\n`DecodedBlock` (raw block, row view, columnar batch, materialized\nentries);\n- every per-block check consumes that one decode before the next block\nis\n  touched.\n\nIt still STREAMS — one block in memory at a time, no table-sized buffer,\nwhich\nwould have been a peak-memory regression on large SSTs.\n\nThe gates covered: index separators, per-KV checksums, seqno bounds,\nblock\nentry counts, zone map, locator, filter, point-read reachability,\nmetadata\nbounds. The section-only checks (TLI mirrors, blob links, block layout)\nare\nunchanged and still run on their own.\n\n## The separator gate\n\n`verify_tli_mirrors` was a second full pass over the data: its per-leaf\nseparator check decoded the addressed block for every handle. Everything\nelse\nit does — mirror equality, section tiling, binary-index pointers, and\nthe\ntop-level partition boundaries — touches index blocks only.\n\nThat loop is now a gate. `read_tli_separators` builds the disk-fresh\noffset → separator map from the copy recovery prefers (tail first, head\nfallback), walking the partitions when the index is partitioned, and\neach\nblock's decoded last key is judged against it on the shared decode.\n`verify_tli_mirrors` keeps the rest and now probes block headers only.\n\nThe pairing runs BOTH ways, which the standalone loop could not express\n— it\nwalked the index side alone, so a live block the index does not address\nwas\ninvisible to it. The per-block half rejects a walked block with no\nseparator;\nthe finalizer rejects a live separator no block claimed.\n\n## Behaviour\n\n- The driver returns the gate that tripped, so scrub keeps its per-gate\nrefusal\nwording (\"digest mismatch with a zone-map cross-check failure …\") and\nrepair\n  keeps its per-gate reasoning.\n- Checks run in the order the old chains used, so a table with a single\ndefect\n  reports the same gate — and the same message — as before.\n- Per-path wording is preserved where it differed, including the\ncolumnar\n  sort-order message, which is not the row one.\n- Reading every section from ONE open image is also the stronger\ncontract: the\n  gates cannot disagree about which bytes they graded.\n\n## The per-KV gate\n\n`verify_kv_checked` splits the footer, builds its own inner `DataBlock`,\niterates it and materializes every entry — exactly what the walk had\njust done.\nA footer-bearing SST was therefore still decoded twice per block, and no\nread\ncount could show it, because the second decode reads nothing off the\ndisk.\n\nThe digest rule now lives in `KvDigestProbe` (`open` / `observe` /\n`finish`),\nwhich both paths drive: `verify_kv_checked` feeds it while streaming its\nown\ndecode, for callers holding only raw bytes; the gate feeds it the\nentries the\nwalk already materialized. One rule, two sources. The gate lost its\n`&self`\nand with it the comparator, so it no longer has the means to decode a\nblock.\n\nThe same holds one level up: `decode_block_entries` has no production\ncaller\nleft and is now test-only, so nothing outside the shared walk can decode\na\nsingle data block.\n\n## Memory\n\nThe sections stay live for the whole walk where the gate-by-gate shape\nheld one\nat a time, so the peak is their sum rather than their max. That is\nbounded by\nwhat an open table already pins permanently — `Inner` holds the seqno\nbounds,\nzone map, locator and filter simultaneously for its whole lifetime — so\nthe\nincrement is one extra copy of resident data for one table's pass.\nReleasing\nany of them early is not available: each is consulted on EVERY block, so\nit\nwould mean walking again per section, which is the cost this removes.\n\n## Measurement\n\nAsserted, not claimed. `FaultFs`'s injector gained a positional read\ncounter\nand a file-open counter, and `reconcile_gates_read_each_block_once` pins\nboth:\n\n- the read SLOPE — three more data blocks must cost exactly three more\nreads. A\nper-gate walk charges one read per gate per block, so it cannot satisfy\nthat\n  whatever its constant term is.\n- the open COUNT — one for the whole pass, independent of how many\nsections it\nconsults and how many blocks it walks. Reproducing the per-reader open\nmakes\n  it three and fails the test.\n\nWhile the old shape was still around to compare against, it measured 6\nreads\nfor the whole family on a three-block table against 18 for the separate\nwalks.\n\n## Single-gate entry points removed\n\n`verify_zone_map`, `verify_locator`, `verify_seqno_bounds`,\n`verify_block_entry_counts`, `verify_filter`,\n`verify_point_read_reachability`\nand `verify_metadata_bounds` had no caller left once both chains moved\nto the\ncombined pass. Keeping them for the tests would have left a second way\nto run\nthe same checks, and one the product never takes.\n\nAll 44 test call sites now drive the pass and assert WHICH gate refused\nthe\ntable. That is strictly more than they pinned before: a gate the pass\nforgot to\ncall would have kept passing its own per-gate test, and now it cannot.\nTwo\npaths are newly pinned through the pass itself: a stale per-KV footer to\nthe\nKvChecksums gate (tested only at the `verify_kv_checked` level before),\nand a\nseparator lowered in both mirrors to the Separators gate. The second is\nred-proven — without the gate the pass returns `Ok(())`, so no other\ngate\ncatches that forgery.\n\nOne correction to an existing test: the scrub-side separator test\nrefuses on\nthe attribution guard (\"not attributable to this pass's heal\") and never\nreaches the gate chain, so it would stay green with no separator\ncross-check at\nall. A forge that predates the pass can never satisfy the attributable\nbranch,\nso the heal path cannot pin this check; its doc no longer claims to.\n\n## Related\n\n- #591 — one block-read primitive, and the `block_layout` boundary check\nas a\ngate of this pass. It is the last per-block work still outside the walk,\nand\nonly on tables that carry a `block_layout` section (large\n`data_block_size`\nplus zstd, unencrypted); a default-configured table already reaches one\npass\n  here.\n\n## Also carries\n\n`ci(deps): bump Swatinem/rust-cache from 2.9.1 to 2.9.2`. The automated\nbump\nfor that release was closed unmerged, and a closed dependency PR tells\nthe bot\nnot to offer that version again, so it would not have come back on its\nown.\n\nCloses #581",
+          "timestamp": "2026-08-30T15:22:22+03:00",
+          "tree_id": "c542ce6bf0cfa1153a51c40d6b8c45e1aa51fc2b",
+          "url": "https://github.com/structured-world/coordinode-lsm-tree/commit/90d298e4014a40fe183e4a72db194a26eb934865"
+        },
+        "date": 1788210509472,
+        "tool": "customBiggerIsBetter",
+        "benches": [
+          {
+            "name": "fillseq",
+            "value": 2039851.8720766054,
+            "unit": "ops/sec",
+            "extra": "P50: 0.4us | P99: 1.6us | P99.9: 3.7us\nthreads: 1 | elapsed: 0.10s | num: 200000 | iterations: 3"
+          },
+          {
+            "name": "fillrandom",
+            "value": 1095078.702621933,
+            "unit": "ops/sec",
+            "extra": "P50: 0.8us | P99: 2.2us | P99.9: 4.3us\nthreads: 1 | elapsed: 0.18s | num: 200000 | iterations: 3"
+          },
+          {
+            "name": "readrandom",
+            "value": 847544.7087461766,
+            "unit": "ops/sec",
+            "extra": "P50: 1.0us | P99: 4.1us | P99.9: 6.6us\nthreads: 1 | elapsed: 0.24s | num: 200000 | iterations: 3"
+          },
+          {
+            "name": "readseq",
+            "value": 3815609.961786857,
+            "unit": "ops/sec",
+            "extra": "P50: 0.1us | P99: 3.0us | P99.9: 5.5us\nthreads: 1 | elapsed: 0.05s | num: 200000 | iterations: 3"
+          },
+          {
+            "name": "seekrandom",
+            "value": 447720.4257438896,
+            "unit": "ops/sec",
+            "extra": "P50: 1.9us | P99: 5.1us | P99.9: 8.2us\nthreads: 1 | elapsed: 0.45s | num: 200000 | iterations: 3"
+          },
+          {
+            "name": "prefixscan",
+            "value": 233446.90856151303,
+            "unit": "ops/sec",
+            "extra": "P50: 4.0us | P99: 5.0us | P99.9: 7.5us\nthreads: 1 | elapsed: 0.86s | num: 200000 | iterations: 3"
+          },
+          {
+            "name": "overwrite",
+            "value": 1164671.3168265398,
+            "unit": "ops/sec",
+            "extra": "P50: 0.7us | P99: 2.2us | P99.9: 4.2us\nthreads: 1 | elapsed: 0.17s | num: 200000 | iterations: 3"
+          },
+          {
+            "name": "mergerandom",
+            "value": 1040525.7843381912,
+            "unit": "ops/sec",
+            "extra": "P50: 0.3us | P99: 1.4us | P99.9: 2.7us\nthreads: 1 | elapsed: 0.19s | num: 200000 | iterations: 3"
+          },
+          {
+            "name": "readwhilewriting",
+            "value": 669005.1115937657,
+            "unit": "ops/sec",
+            "extra": "P50: 1.3us | P99: 4.5us | P99.9: 6.8us\nthreads: 1 | elapsed: 0.30s | num: 200000 | iterations: 3"
           }
         ]
       }
