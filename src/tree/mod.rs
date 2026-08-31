@@ -869,6 +869,26 @@ impl AbstractTree for Tree {
             table_writer = table_writer.use_zstd_dictionary(self.config.zstd_dictionary.clone());
         }
 
+        // Parallel block compression for the flush writer, on the same pool the
+        // compaction writers use. Engaged only when the per-block transform does
+        // real CPU work (a codec, encryption, or page ECC): with the identity
+        // transform the pipeline's owned buffer + queue hop per block buys
+        // nothing over the serial reusable-buffer path. Deadlock-safe: a flush
+        // never runs ON the pool (the pool runs sub-compactions and block
+        // tasks), so its blocks always drain.
+        #[cfg(feature = "std")]
+        {
+            let transform_does_work = data_block_compression != crate::CompressionType::None
+                || self.config.encryption.is_some()
+                || self.config.page_ecc;
+            if transform_does_work {
+                table_writer = table_writer.use_parallel_compression(
+                    self.config.compaction_pool.clone(),
+                    self.config.compaction_threads,
+                );
+            }
+        }
+
         // Set range tombstones BEFORE writing KV items so that if MultiWriter
         // rotates to a new table during the write loop, earlier tables already
         // carry the RT metadata.
