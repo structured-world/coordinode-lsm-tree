@@ -688,8 +688,17 @@ impl Iter {
             None => transform,
         };
         let block_handle = BlockHandle::new(handle.offset(), handle.size());
-        let (_header, frame, recovery) =
-            crate::table::block::Block::read_data_frame(fd.as_ref(), block_handle, &transform)?;
+        let (_header, frame, recovery) = crate::table::block::Block::read_data_frame(
+            fd.as_ref(),
+            block_handle,
+            crate::table::block::BlockIdentity {
+                table_id: self.table_id.table_id(),
+                block_type: crate::table::block::BlockType::Data,
+                dict_id: self.compression.dict_id(),
+                window_log: 0,
+            },
+            &transform,
+        )?;
         // The partial path bypasses `load_block`, so schedule auto-heal here too:
         // an ECC-corrected frame read flags the SST for a healing rewrite (the
         // partial path is non-encrypted by the guard above). This is a primary

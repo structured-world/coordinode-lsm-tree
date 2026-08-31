@@ -888,6 +888,121 @@ impl Block {
         })
     }
 
+    /// Decompresses a block's verified payload into its final bytes.
+    ///
+    /// The LAST stage of every read path, and the only place the codec match
+    /// lives: the reader path, the encrypted file path and the plain file path
+    /// all reach the same bytes by different routes (a `Read` stream, a
+    /// decrypted `Vec`, a zero-copy `Slice`) and then owe the payload the same
+    /// treatment. Three copies of that treatment is three places for a codec
+    /// arm to be added to two of them.
+    ///
+    /// `payload` is post-checksum, post-ECC and post-decrypt: whatever the
+    /// writer compressed, exactly as it compressed it.
+    ///
+    /// # Errors
+    ///
+    /// [`crate::Error::Decompress`] when the codec rejects the stream or
+    /// produces a length other than the header's `uncompressed_length`,
+    /// [`crate::Error::InvalidHeader`] when an uncompressed block's payload
+    /// disagrees with that length, and
+    /// [`crate::Error::ZstdDictMismatch`] when the block names a dictionary
+    /// the transform does not carry.
+    pub(crate) fn decompress_payload(
+        header: &Header,
+        payload: Slice,
+        transform: &BlockTransform<'_>,
+    ) -> crate::Result<Slice> {
+        let compression = transform.compression();
+        #[cfg(zstd_any)]
+        let zstd_dict = transform.zstd_dict();
+
+        match compression {
+            CompressionType::None => {
+                #[expect(clippy::cast_possible_truncation, reason = "values are u32 length max")]
+                let actual_len = payload.len() as u32;
+
+                if header.uncompressed_length != actual_len {
+                    return Err(crate::Error::InvalidHeader("Block"));
+                }
+
+                Ok(payload)
+            }
+
+            #[cfg(feature = "lz4")]
+            CompressionType::Lz4 => {
+                // Decompress straight into the Slice allocation, skipping the
+                // zero-fill and the Vec -> Slice copy. SAFETY: the payload's
+                // checksum verified above, so the stream is intact and
+                // wildcopy never reads an unwritten position.
+                #[expect(unsafe_code, reason = "fill an uninitialized Slice via decompress")]
+                let mut builder =
+                    unsafe { Slice::builder_unzeroed(header.uncompressed_length as usize) };
+
+                let bytes_written = lz4_flex::block::decompress_into(&payload, &mut builder)
+                    .map_err(|_| crate::Error::Decompress(compression))?;
+
+                if bytes_written != header.uncompressed_length as usize {
+                    return Err(crate::Error::Decompress(compression));
+                }
+
+                Ok(builder.freeze().into())
+            }
+
+            #[cfg(zstd_any)]
+            CompressionType::Zstd(_) => {
+                // Decompress straight into the Slice allocation, skipping the
+                // zero-fill and the Vec -> Slice copy. SAFETY: the same
+                // precondition as the lz4 arm — every caller verifies the
+                // payload against the header checksum BEFORE reaching here, so
+                // the frame is intact and the decoder's back-references only
+                // target already-written positions. The length equality below
+                // rejects a short fill, so no uninitialized byte survives into
+                // the frozen Slice.
+                #[expect(unsafe_code, reason = "fill an uninitialized Slice via decompress")]
+                let mut builder =
+                    unsafe { Slice::builder_unzeroed(header.uncompressed_length as usize) };
+
+                let bytes_written =
+                    crate::compression::ZstdBackend::decompress_into(&payload, &mut builder)
+                        .map_err(|_| crate::Error::Decompress(compression))?;
+
+                if bytes_written != header.uncompressed_length as usize {
+                    return Err(crate::Error::Decompress(compression));
+                }
+
+                Ok(builder.freeze().into())
+            }
+
+            #[cfg(zstd_any)]
+            CompressionType::ZstdDict { dict_id, .. } => {
+                let dict = zstd_dict.ok_or(crate::Error::ZstdDictMismatch {
+                    expected: dict_id,
+                    got: None,
+                })?;
+                if dict.id() != dict_id {
+                    return Err(crate::Error::ZstdDictMismatch {
+                        expected: dict_id,
+                        got: Some(dict.id()),
+                    });
+                }
+
+                let decompressed = crate::compression::ZstdBackend::decompress_with_dict(
+                    &payload,
+                    dict,
+                    header.uncompressed_length as usize,
+                )
+                .map_err(|_| crate::Error::Decompress(compression))?;
+
+                if decompressed.len() != header.uncompressed_length as usize {
+                    return Err(crate::Error::Decompress(compression));
+                }
+
+                Ok(Slice::from(decompressed))
+            }
+        }
+    }
+
     /// Reads a block from a reader.
     ///
     /// Pipeline: read → verify checksum → decrypt → decompress.
@@ -899,25 +1014,17 @@ impl Block {
     /// or provider will typically surface as a read/validation error
     /// (checksum, length, or decompression failure) rather than
     /// silently producing valid-looking plaintext.
-    // The encrypted and unencrypted branches duplicate the checksum
-    // verification and compression match because their input types
-    // differ: encrypted reads into Vec<u8> (for decrypt_vec in-place
-    // reuse), while unencrypted reads into Slice (zero-copy on the
-    // None-compression path). Unifying them would require either a
-    // Cow/enum wrapper or sacrificing the zero-copy optimization.
-    #[expect(
-        clippy::too_many_lines,
-        reason = "encrypt/no-encrypt branches duplicate compression match — see comment above"
-    )]
+    // The two branches still differ in how they OBTAIN the payload — encrypted
+    // reads into a `Vec` so `decrypt_vec` can reuse the buffer in place,
+    // unencrypted reads into a `Slice` to stay zero-copy — but they no longer
+    // duplicate what happens to it afterwards: both hand the verified payload
+    // to `decompress_payload`.
     pub fn from_reader<R: crate::io::Read>(
         reader: &mut R,
         identity: BlockIdentity,
         transform: &BlockTransform<'_>,
     ) -> crate::Result<Self> {
-        let compression = transform.compression();
         let encryption = transform.encryption();
-        #[cfg(zstd_any)]
-        let zstd_dict = transform.zstd_dict();
         // `identity` (tree/table + dict/window context) feeds AAD
         // reconstruction on the encrypted path; `block_type` is still derived
         // from the parsed header (the frame self-describes it), not asserted
@@ -979,101 +1086,13 @@ impl Block {
             // block identity), opaque in-place decrypt otherwise.
             let decrypted = decrypt_block_payload(enc, &raw_vec, &identity)?;
 
-            match compression {
-                CompressionType::None => {
-                    #[expect(
-                        clippy::cast_possible_truncation,
-                        reason = "values are u32 length max"
-                    )]
-                    let actual_len = decrypted.len() as u32;
-
-                    if header.uncompressed_length != actual_len {
-                        return Err(crate::Error::InvalidHeader("Block"));
-                    }
-
-                    Slice::from(decrypted)
-                }
-
-                #[cfg(feature = "lz4")]
-                CompressionType::Lz4 => {
-                    // Decompress straight into the Slice's heap allocation,
-                    // skipping both the zero-fill of `vec![0; n]` and the
-                    // Vec -> Slice copy.
-                    //
-                    // SAFETY (load-bearing, do NOT reorder): the block checksum is
-                    // verified ABOVE, before this point. That ordering is the
-                    // precondition, not an optimization. `lz4_flex` is the
-                    // unchecked fast decoder: it may wildcopy a back-reference out
-                    // of the output buffer before detecting a malformed frame, so
-                    // it must only ever run on a checksum-verified, intact stream.
-                    // On such a stream every back-reference targets an
-                    // already-written byte, so the uninitialized builder is written
-                    // before it is ever read. Never move the decompress ahead of
-                    // the checksum check.
-                    #[expect(unsafe_code, reason = "fill an uninitialized Slice via decompress")]
-                    let mut builder =
-                        unsafe { Slice::builder_unzeroed(header.uncompressed_length as usize) };
-
-                    let bytes_written = lz4_flex::block::decompress_into(&decrypted, &mut builder)
-                        .map_err(|_| crate::Error::Decompress(compression))?;
-
-                    if bytes_written != header.uncompressed_length as usize {
-                        return Err(crate::Error::Decompress(compression));
-                    }
-
-                    builder.freeze().into()
-                }
-
-                #[cfg(zstd_any)]
-                CompressionType::Zstd(_) => {
-                    // Decompress straight into the Slice allocation: no
-                    // zero-filled scratch Vec and no Vec -> Slice copy. SAFETY:
-                    // same checksum-first precondition as the lz4 arm above. The
-                    // stream is checksum-verified before this point, so the decoder
-                    // only writes the uninitialized builder, never reads it
-                    // unwritten. Do not reorder ahead of the checksum check.
-                    #[expect(unsafe_code, reason = "fill an uninitialized Slice via decompress")]
-                    let mut builder =
-                        unsafe { Slice::builder_unzeroed(header.uncompressed_length as usize) };
-
-                    let bytes_written =
-                        crate::compression::ZstdBackend::decompress_into(&decrypted, &mut builder)
-                            .map_err(|_| crate::Error::Decompress(compression))?;
-
-                    if bytes_written != header.uncompressed_length as usize {
-                        return Err(crate::Error::Decompress(compression));
-                    }
-
-                    builder.freeze().into()
-                }
-
-                #[cfg(zstd_any)]
-                CompressionType::ZstdDict { dict_id, .. } => {
-                    let dict = zstd_dict.ok_or(crate::Error::ZstdDictMismatch {
-                        expected: dict_id,
-                        got: None,
-                    })?;
-                    if dict.id() != dict_id {
-                        return Err(crate::Error::ZstdDictMismatch {
-                            expected: dict_id,
-                            got: Some(dict.id()),
-                        });
-                    }
-
-                    let decompressed = crate::compression::ZstdBackend::decompress_with_dict(
-                        &decrypted,
-                        dict,
-                        header.uncompressed_length as usize,
-                    )
-                    .map_err(|_| crate::Error::Decompress(compression))?;
-
-                    if decompressed.len() != header.uncompressed_length as usize {
-                        return Err(crate::Error::Decompress(compression));
-                    }
-
-                    Slice::from(decompressed)
-                }
-            }
+            // SAFETY note that outlives this call site: the checksum was
+            // verified ABOVE, before any decoder touches these bytes. The lz4
+            // arm inside `decompress_payload` wildcopies back-references into
+            // an uninitialized buffer and is only sound on an intact stream,
+            // so the verify-then-decompress ORDER is a precondition, not an
+            // optimization. Never hoist a decompress ahead of its checksum.
+            Self::decompress_payload(&header, Slice::from(decrypted), transform)?
         } else {
             // Zero-copy fast path for non-ECC blocks (the v0..v5
             // legacy shape); ECC blocks go through the Vec-allocating
@@ -1101,87 +1120,7 @@ impl Block {
                 payload
             };
 
-            match compression {
-                CompressionType::None => {
-                    #[expect(
-                        clippy::cast_possible_truncation,
-                        reason = "values are u32 length max"
-                    )]
-                    let actual_len = raw_data.len() as u32;
-
-                    if header.uncompressed_length != actual_len {
-                        return Err(crate::Error::InvalidHeader("Block"));
-                    }
-
-                    raw_data
-                }
-
-                #[cfg(feature = "lz4")]
-                CompressionType::Lz4 => {
-                    // Decompress straight into the Slice's heap allocation,
-                    // skipping the zero-fill and the Vec -> Slice copy. SAFETY:
-                    // see the matching arm above — the checksum-verified stream
-                    // is intact, so wildcopy never reads an unwritten position.
-                    #[expect(unsafe_code, reason = "fill an uninitialized Slice via decompress")]
-                    let mut builder =
-                        unsafe { Slice::builder_unzeroed(header.uncompressed_length as usize) };
-
-                    let bytes_written = lz4_flex::block::decompress_into(&raw_data, &mut builder)
-                        .map_err(|_| crate::Error::Decompress(compression))?;
-
-                    if bytes_written != header.uncompressed_length as usize {
-                        return Err(crate::Error::Decompress(compression));
-                    }
-
-                    builder.freeze().into()
-                }
-
-                #[cfg(zstd_any)]
-                CompressionType::Zstd(_) => {
-                    // Decompress straight into the Slice allocation — no
-                    // zero-filled scratch Vec and no Vec -> Slice copy.
-                    #[expect(unsafe_code, reason = "fill an uninitialized Slice via decompress")]
-                    let mut builder =
-                        unsafe { Slice::builder_unzeroed(header.uncompressed_length as usize) };
-
-                    let bytes_written =
-                        crate::compression::ZstdBackend::decompress_into(&raw_data, &mut builder)
-                            .map_err(|_| crate::Error::Decompress(compression))?;
-
-                    if bytes_written != header.uncompressed_length as usize {
-                        return Err(crate::Error::Decompress(compression));
-                    }
-
-                    builder.freeze().into()
-                }
-
-                #[cfg(zstd_any)]
-                CompressionType::ZstdDict { dict_id, .. } => {
-                    let dict = zstd_dict.ok_or(crate::Error::ZstdDictMismatch {
-                        expected: dict_id,
-                        got: None,
-                    })?;
-                    if dict.id() != dict_id {
-                        return Err(crate::Error::ZstdDictMismatch {
-                            expected: dict_id,
-                            got: Some(dict.id()),
-                        });
-                    }
-
-                    let decompressed = crate::compression::ZstdBackend::decompress_with_dict(
-                        &raw_data,
-                        dict,
-                        header.uncompressed_length as usize,
-                    )
-                    .map_err(|_| crate::Error::Decompress(compression))?;
-
-                    if decompressed.len() != header.uncompressed_length as usize {
-                        return Err(crate::Error::Decompress(compression));
-                    }
-
-                    Slice::from(decompressed)
-                }
-            }
+            Self::decompress_payload(&header, raw_data, transform)?
         };
 
         Ok(Self { header, data })
@@ -1230,21 +1169,51 @@ impl Block {
     /// call sites (`load_block`, the partial-decode path, patrol scrub) use it
     /// to attribute the on-read recovery to the right metric counter, keeping
     /// the public [`EccStatus`] free of the kind.
-    // Same duplication rationale as from_reader — see comment there.
-    #[expect(
-        clippy::too_many_lines,
-        reason = "encrypt/no-encrypt branches duplicate compression match — see from_reader"
-    )]
     pub(crate) fn from_file_with_recovery(
         file: &dyn FsFile,
         handle: BlockHandle,
         identity: BlockIdentity,
         transform: &BlockTransform<'_>,
     ) -> crate::Result<(Self, EccStatus, Option<EccRecoveryKind>)> {
-        let compression = transform.compression();
+        let (header, payload, ecc_status, recovery) =
+            Self::read_verified_payload(file, handle, identity, transform)?;
+        let data = Self::decompress_payload(&header, payload, transform)?;
+        Ok((Self { header, data }, ecc_status, recovery))
+    }
+
+    /// THE block-read primitive: reads a block's frame and hands back its
+    /// VERIFIED payload, one step short of decompression.
+    ///
+    /// Everything that has to happen before a caller may look at a block's
+    /// bytes happens here, once: the size caps that bound the allocation, the
+    /// header decode, the parity-trailer classification, the checksum (with
+    /// ECC recovery when a recognized trailer is present), and the decrypt.
+    /// What comes back is exactly what the writer compressed.
+    ///
+    /// Callers that want the decoded block feed it to
+    /// [`Self::decompress_payload`] — that pairing IS
+    /// [`Self::from_file_with_recovery`]. Callers that want the compressed
+    /// frame (partial decode, the block-layout cross-check) stop here, and get
+    /// it without a second read of the same bytes.
+    ///
+    /// # Errors
+    ///
+    /// [`crate::Error::DecompressedSizeTooLarge`] when the handle or the
+    /// header declares more than the caps allow, [`crate::Error::InvalidHeader`]
+    /// on an undecodable header or a frame shorter than its own declaration,
+    /// a checksum error when the payload fails and parity cannot recover it,
+    /// plus any I/O and decrypt failure.
+    #[expect(
+        clippy::too_many_lines,
+        reason = "two ways to OBTAIN the payload (encrypted Vec vs zero-copy Slice), each with its own size caps and trailer classification"
+    )]
+    pub(crate) fn read_verified_payload(
+        file: &dyn FsFile,
+        handle: BlockHandle,
+        identity: BlockIdentity,
+        transform: &BlockTransform<'_>,
+    ) -> crate::Result<(Header, Slice, EccStatus, Option<EccRecoveryKind>)> {
         let encryption = transform.encryption();
-        #[cfg(zstd_any)]
-        let zstd_dict = transform.zstd_dict();
         // `identity` (tree/table + compression context) feeds AAD
         // reconstruction on the encrypted read path below.
         // handle.size() includes Header::MIN_LEN + payload +
@@ -1294,7 +1263,7 @@ impl Block {
         // No intermediate Slice, no overlap of encrypted + decrypted buffers.
         // When no encryption, read into a Slice (zero-copy on the
         // None-compression path).
-        let (header, data, ecc_status, recovery) = if let Some(enc) = encryption {
+        let (header, payload, ecc_status, recovery) = if let Some(enc) = encryption {
             let block_size = handle.size() as usize;
 
             // Pre-decode lower bound: every header is at least MIN_LEN; the
@@ -1428,91 +1397,12 @@ impl Block {
 
             let decrypted = decrypt_block_payload(enc, &buf, &identity)?;
 
-            let data = match compression {
-                CompressionType::None => {
-                    #[expect(
-                        clippy::cast_possible_truncation,
-                        reason = "values are u32 length max"
-                    )]
-                    let actual_len = decrypted.len() as u32;
-
-                    if parsed_header.uncompressed_length != actual_len {
-                        return Err(crate::Error::InvalidHeader("Block"));
-                    }
-
-                    Slice::from(decrypted)
-                }
-
-                #[cfg(feature = "lz4")]
-                CompressionType::Lz4 => {
-                    // Decompress straight into the Slice allocation (no zero-fill,
-                    // no Vec -> Slice copy). SAFETY: see the read-path arm above;
-                    // the checksum-verified stream is intact.
-                    #[expect(unsafe_code, reason = "fill an uninitialized Slice via decompress")]
-                    let mut decompressed = unsafe {
-                        Slice::builder_unzeroed(parsed_header.uncompressed_length as usize)
-                    };
-
-                    let bytes_written =
-                        lz4_flex::block::decompress_into(&decrypted, &mut decompressed)
-                            .map_err(|_| crate::Error::Decompress(compression))?;
-
-                    if bytes_written != parsed_header.uncompressed_length as usize {
-                        return Err(crate::Error::Decompress(compression));
-                    }
-
-                    decompressed.freeze().into()
-                }
-
-                #[cfg(zstd_any)]
-                CompressionType::Zstd(_) => {
-                    // Decompress straight into the Slice allocation — no
-                    // zero-filled scratch Vec and no Vec -> Slice copy.
-                    #[expect(unsafe_code, reason = "fill an uninitialized Slice via decompress")]
-                    let mut builder = unsafe {
-                        Slice::builder_unzeroed(parsed_header.uncompressed_length as usize)
-                    };
-
-                    let bytes_written =
-                        crate::compression::ZstdBackend::decompress_into(&decrypted, &mut builder)
-                            .map_err(|_| crate::Error::Decompress(compression))?;
-
-                    if bytes_written != parsed_header.uncompressed_length as usize {
-                        return Err(crate::Error::Decompress(compression));
-                    }
-
-                    builder.freeze().into()
-                }
-
-                #[cfg(zstd_any)]
-                CompressionType::ZstdDict { dict_id, .. } => {
-                    let dict = zstd_dict.ok_or(crate::Error::ZstdDictMismatch {
-                        expected: dict_id,
-                        got: None,
-                    })?;
-                    if dict.id() != dict_id {
-                        return Err(crate::Error::ZstdDictMismatch {
-                            expected: dict_id,
-                            got: Some(dict.id()),
-                        });
-                    }
-
-                    let decompressed = crate::compression::ZstdBackend::decompress_with_dict(
-                        &decrypted,
-                        dict,
-                        parsed_header.uncompressed_length as usize,
-                    )
-                    .map_err(|_| crate::Error::Decompress(compression))?;
-
-                    if decompressed.len() != parsed_header.uncompressed_length as usize {
-                        return Err(crate::Error::Decompress(compression));
-                    }
-
-                    Slice::from(decompressed)
-                }
-            };
-
-            (parsed_header, data, ecc_status, payload_corrected)
+            (
+                parsed_header,
+                Slice::from(decrypted),
+                ecc_status,
+                payload_corrected,
+            )
         } else {
             // Single I/O read — header + payload in one Slice.
             let buf = crate::file::read_exact(file, *handle.offset(), handle.size() as usize)?;
@@ -1599,102 +1489,10 @@ impl Block {
                 ecc_status
             };
 
-            let data = match compression {
-                CompressionType::None => {
-                    #[expect(
-                        clippy::cast_possible_truncation,
-                        reason = "values are u32 length max"
-                    )]
-                    let actual_len = payload_slice.len() as u32;
-
-                    if parsed_header.uncompressed_length != actual_len {
-                        return Err(crate::Error::InvalidHeader("Block"));
-                    }
-
-                    payload_slice
-                }
-
-                #[cfg(feature = "lz4")]
-                CompressionType::Lz4 => {
-                    let compressed_data: &[u8] = &payload_slice;
-
-                    // Decompress straight into the Slice allocation (no zero-fill,
-                    // no Vec -> Slice copy). SAFETY: see the read-path arm above;
-                    // the checksum-verified stream is intact.
-                    #[expect(unsafe_code, reason = "fill an uninitialized Slice via decompress")]
-                    let mut decompressed = unsafe {
-                        Slice::builder_unzeroed(parsed_header.uncompressed_length as usize)
-                    };
-
-                    let bytes_written =
-                        lz4_flex::block::decompress_into(compressed_data, &mut decompressed)
-                            .map_err(|_| crate::Error::Decompress(compression))?;
-
-                    if bytes_written != parsed_header.uncompressed_length as usize {
-                        return Err(crate::Error::Decompress(compression));
-                    }
-
-                    decompressed.freeze().into()
-                }
-
-                #[cfg(zstd_any)]
-                CompressionType::Zstd(_) => {
-                    let compressed_data: &[u8] = &payload_slice;
-
-                    // Decompress straight into the Slice allocation — no
-                    // zero-filled scratch Vec and no Vec -> Slice copy.
-                    #[expect(unsafe_code, reason = "fill an uninitialized Slice via decompress")]
-                    let mut builder = unsafe {
-                        Slice::builder_unzeroed(parsed_header.uncompressed_length as usize)
-                    };
-
-                    let bytes_written = crate::compression::ZstdBackend::decompress_into(
-                        compressed_data,
-                        &mut builder,
-                    )
-                    .map_err(|_| crate::Error::Decompress(compression))?;
-
-                    if bytes_written != parsed_header.uncompressed_length as usize {
-                        return Err(crate::Error::Decompress(compression));
-                    }
-
-                    builder.freeze().into()
-                }
-
-                #[cfg(zstd_any)]
-                CompressionType::ZstdDict { dict_id, .. } => {
-                    let compressed_data: &[u8] = &payload_slice;
-
-                    let dict = zstd_dict.ok_or(crate::Error::ZstdDictMismatch {
-                        expected: dict_id,
-                        got: None,
-                    })?;
-                    if dict.id() != dict_id {
-                        return Err(crate::Error::ZstdDictMismatch {
-                            expected: dict_id,
-                            got: Some(dict.id()),
-                        });
-                    }
-
-                    let decompressed = crate::compression::ZstdBackend::decompress_with_dict(
-                        compressed_data,
-                        dict,
-                        parsed_header.uncompressed_length as usize,
-                    )
-                    .map_err(|_| crate::Error::Decompress(compression))?;
-
-                    if decompressed.len() != parsed_header.uncompressed_length as usize {
-                        return Err(crate::Error::Decompress(compression));
-                    }
-
-                    Slice::from(decompressed)
-                }
-            };
-
-            (parsed_header, data, ecc_status, payload_corrected)
+            (parsed_header, payload_slice, ecc_status, payload_corrected)
         };
 
-        Ok((Self { header, data }, ecc_status, recovery))
+        Ok((header, payload, ecc_status, recovery))
     }
 
     /// In-place autoheal primitive: read this block's on-disk frame and, if its
@@ -1854,120 +1652,36 @@ impl Block {
         Ok(Some((frame, kind)))
     }
 
-    /// Reads a data block's verified COMPRESSED payload (the zstd frame) WITHOUT
-    /// decompressing it, for partial / lazy decode. Returns the header, the
-    /// compressed-frame bytes (checksum-verified; ECC-recovered if a recognized
-    /// parity trailer is present), and `Some(kind)` when a recovery occurred so
-    /// the caller can schedule auto-heal and count the recovery.
+    /// Reads a data block's verified COMPRESSED payload (the zstd frame)
+    /// WITHOUT decompressing it, for partial / lazy decode and the
+    /// block-layout cross-check.
     ///
-    /// Non-encrypted blocks only — the caller must ensure
-    /// `transform.encryption().is_none()` (an encrypted block's plaintext frame
-    /// is only available after a whole-block decrypt, which defeats the lazy
-    /// path). Mirrors the non-encrypted read+verify of
-    /// [`Self::from_file_with_status`], stopping before decompression.
+    /// A thin naming over [`Self::read_verified_payload`], which is where the
+    /// caps, the trailer classification, the checksum and the ECC recovery all
+    /// live. It used to be a second copy of that verification that additionally
+    /// REFUSED encrypted blocks, because it read the on-disk bytes directly and
+    /// an encrypted block's frame only exists after a whole-block decrypt. The
+    /// primitive performs that decrypt, so the refusal is gone: what comes back
+    /// is the compressed frame either way.
+    ///
+    /// `Some(kind)` on the recovery slot means ECC repaired the frame, so the
+    /// caller can schedule auto-heal (the bytes are right, the on-disk copy is
+    /// still faulty) and count the recovery by mechanism.
     ///
     /// # Errors
     ///
-    /// Returns an error on a framing / checksum failure (unrecoverable), or if
-    /// called for an encrypted transform.
+    /// Whatever [`Self::read_verified_payload`] returns: a framing, checksum,
+    /// cap, decrypt or I/O failure.
     #[cfg(feature = "zstd")]
     pub(crate) fn read_data_frame(
         file: &dyn FsFile,
         handle: BlockHandle,
+        identity: BlockIdentity,
         transform: &BlockTransform<'_>,
     ) -> crate::Result<(Header, Slice, Option<EccRecoveryKind>)> {
-        if transform.encryption().is_some() {
-            return Err(crate::Error::Io(crate::io::Error::other(
-                "read_data_frame: encrypted blocks are not supported on the lazy path",
-            )));
-        }
-
-        // Pre-allocation sanity cap on `handle.size()`, mirroring
-        // `from_file_with_status`: reject an absurd on-disk size before
-        // allocating the read buffer, so a corrupt handle cannot force a huge
-        // allocation. Non-encrypted path (encryption rejected above), so no
-        // encryption overhead; the ECC term uses the block's ACTUAL per-SST
-        // scheme (never a hardcoded one) and is 0 when there is no parity.
-        let max_ecc_overhead = match transform.ecc_params() {
-            Some(params) => u64::from(expected_parity_len(MAX_DECOMPRESSION_SIZE, params)),
-            None => 0,
-        };
-        let max_on_disk_size =
-            u64::from(MAX_DECOMPRESSION_SIZE) + max_ecc_overhead + Header::MAX_LEN as u64;
-        if u64::from(handle.size()) > max_on_disk_size {
-            return Err(crate::Error::DecompressedSizeTooLarge {
-                declared: u64::from(handle.size()),
-                limit: max_on_disk_size,
-            });
-        }
-
-        let buf = crate::file::read_exact(file, *handle.offset(), handle.size() as usize)?;
-        let parsed_header = Header::decode_from(&mut &buf[..])?;
-        // Reject a header that declares a decompressed size past the cap before
-        // the lazy decode path trusts it.
-        if parsed_header.uncompressed_length > MAX_DECOMPRESSION_SIZE {
-            return Err(crate::Error::DecompressedSizeTooLarge {
-                declared: u64::from(parsed_header.uncompressed_length),
-                limit: u64::from(MAX_DECOMPRESSION_SIZE),
-            });
-        }
-        let header_len = Header::header_len(parsed_header.block_type);
-
-        let has_ecc = block_has_parity(&parsed_header, transform);
-        let ecc_length = if has_ecc {
-            checked_ecc_length(
-                parsed_header.data_length,
-                block_ecc_params(&parsed_header, transform),
-            )?
-        } else {
-            0
-        };
-
-        // The header was decoded from `buf` above, so `buf.len() >= header_len`
-        // holds and this cannot underflow. `checked_sub` on this recovery path
-        // surfaces any future decode regression loudly instead of clamping to a
-        // 0-payload the trailer check could accept as a clean empty block.
-        let actual_payload_plus_ecc = buf
-            .len()
-            .checked_sub(header_len)
-            .ok_or(crate::Error::InvalidHeader("Block"))?;
-        let actual_data_len = parsed_header.data_length as usize;
-        let _ecc_status = classify_block_trailer(
-            has_ecc,
-            actual_payload_plus_ecc,
-            actual_data_len,
-            ecc_length,
-            &handle,
-        )?;
-
-        let (payload, recovery): (Slice, Option<EccRecoveryKind>) = if ecc_length == 0 {
-            #[expect(
-                clippy::indexing_slicing,
-                reason = "actual_data_len <= post-header len, checked via classify_block_trailer"
-            )]
-            let checksum = Checksum::from_raw(crate::hash::hash128(
-                &buf[header_len..header_len + actual_data_len],
-            ));
-            checksum.check(parsed_header.checksum)?;
-            (buf.slice(header_len..header_len + actual_data_len), None)
-        } else {
-            #[expect(clippy::indexing_slicing, reason = "header was decoded from buf")]
-            let mut cursor = crate::io::Cursor::new(&buf[header_len..]);
-            // `recovery` is surfaced so the partial-decode caller can schedule
-            // auto-heal (the recovered bytes are correct but the on-disk copy is
-            // still faulty) and count the recovery; a heal is also logged inside
-            // read_payload_and_verify.
-            let (frame, recovery) = Self::read_payload_and_verify(
-                &mut cursor,
-                parsed_header.data_length,
-                ecc_length,
-                parsed_header.checksum,
-                block_ecc_params(&parsed_header, transform),
-            )?;
-            (frame, recovery)
-        };
-
-        Ok((parsed_header, payload, recovery))
+        let (header, payload, _status, recovery) =
+            Self::read_verified_payload(file, handle, identity, transform)?;
+        Ok((header, payload, recovery))
     }
 }
 

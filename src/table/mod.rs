@@ -440,6 +440,22 @@ pub(crate) enum ReconcileGate {
     PointReadReachability,
     /// Recorded metadata bounds against the decoded contents.
     MetadataBounds,
+    /// Recorded inner-block boundaries against the frame's actual zstd blocks.
+    ///
+    /// Only a zstd build can raise it: the writer emits the `block_layout`
+    /// section exclusively for data blocks that split into two or more inner
+    /// zstd blocks, so without zstd there are no such frames and no boundaries
+    /// to disagree about. The section-level forgery (a present-but-EMPTY map,
+    /// i.e. a relabelled `delete_bitmap`) is caught on every build, but by
+    /// `verify_block_layout` and outside this enum.
+    #[cfg_attr(
+        not(feature = "zstd"),
+        expect(
+            dead_code,
+            reason = "the per-frame gate that raises it needs a zstd decoder"
+        )
+    )]
+    BlockLayout,
 }
 
 /// The recorded metadata a reconcile judges, plus the accumulators the block
@@ -534,6 +550,19 @@ pub(crate) struct DecodedBlock {
     /// view below strips the footer, so the per-KV digest gate needs these
     /// bytes rather than the stripped ones.
     pub(crate) raw: Block,
+    /// The same block one layer earlier: the payload as the writer compressed
+    /// it, post-checksum and post-decrypt but pre-decompression. Carried from
+    /// the SAME read that produced `raw`, so the gate that cross-checks the
+    /// frame's inner-block boundaries costs no extra I/O. Equal to `raw.data`
+    /// on an uncompressed table, where the two layers coincide.
+    #[cfg_attr(
+        not(feature = "zstd"),
+        expect(
+            dead_code,
+            reason = "the only consumer is the block-layout boundary gate, which needs a zstd decoder"
+        )
+    )]
+    pub(crate) frame: crate::Slice,
     /// The row-major view. `None` on a columnar table, whose rows are
     /// reconstructed from `batch` instead.
     pub(crate) row: Option<DataBlock>,
@@ -872,7 +901,7 @@ impl Table {
         &self,
         handle: &BlockHandle,
         block_type: BlockType,
-    ) -> crate::Result<Block> {
+    ) -> crate::Result<(Block, crate::Slice)> {
         let (fd, _cache_event) = self
             .file_accessor
             .get_or_open_table(&self.global_id(), &self.path)?;
@@ -883,7 +912,11 @@ impl Table {
             #[cfg(zstd_any)]
             self.zstd_dictionary.as_deref(),
         )?;
-        let block = Block::from_file(
+        // The two halves of ONE read: the frame as the writer compressed it,
+        // and the block that frame decodes to. Gates that cross-check the
+        // frame's inner structure (the block-layout boundaries) used to reach
+        // for it with a second pread of the same bytes.
+        let (header, frame, _status, _recovery) = Block::read_verified_payload(
             fd.as_ref(),
             *handle,
             crate::table::block::BlockIdentity {
@@ -894,14 +927,17 @@ impl Table {
             },
             &transform,
         )?;
-        // Swap-defence role check, mirroring `load_block`.
-        if block.header.block_type != block_type {
+        // Swap-defence role check, mirroring `load_block`. Before the
+        // decompress: a block that is not what the index claims has no
+        // business being handed to a codec.
+        if header.block_type != block_type {
             return Err(crate::Error::InvalidTag((
                 "BlockType",
-                block.header.block_type.into(),
+                header.block_type.into(),
             )));
         }
-        Ok(block)
+        let data = Block::decompress_payload(&header, frame.clone(), &transform)?;
+        Ok((Block { header, data }, frame))
     }
 
     /// Frames the block starting at `offset` by reading its HEADER straight
@@ -3611,11 +3647,23 @@ impl Table {
         let mut meta = self
             .meta_bounds_probe(&*file, &regions, bitmap_digest_authenticated)
             .map_err(tag(G::MetadataBounds))?;
+        // The per-frame half of the block-layout check. The section-level half
+        // (present-but-empty, which is a relabelled delete_bitmap dropping the
+        // deletion metadata) stays in `verify_block_layout`, where it runs on
+        // EVERY build; this half needs a zstd decoder and the frame the walk
+        // already has.
+        #[cfg(feature = "zstd")]
+        let block_layout = self
+            .read_block_layout_section(&*file, &regions)
+            .map_err(tag(G::BlockLayout))?
+            .filter(|map| !map.is_empty());
 
         // Per-block state the gates carry across the walk.
         let mut separators_checked = 0usize;
         let mut seqno_checked = 0usize;
         let mut zone_checked = 0usize;
+        #[cfg(feature = "zstd")]
+        let mut layout_checked = 0usize;
         let mut locator_seen: crate::HashSet<Vec<u8>> = crate::HashSet::default();
         let mut prev_internal: Option<(UserKey, SeqNo)> = None;
 
@@ -3686,6 +3734,25 @@ impl Table {
                 failed = Some(G::MetadataBounds);
                 return Err(e);
             }
+            #[cfg(feature = "zstd")]
+            if let Some(map) = &block_layout {
+                match Self::check_block_layout_entry(map, block) {
+                    Err(e) => {
+                        failed = Some(G::BlockLayout);
+                        return Err(e);
+                    }
+                    // Blocks absent from the map are single-inner-block frames
+                    // the writer had nothing to record for.
+                    Ok(false) => {}
+                    Ok(true) => {
+                        let Some(next) = layout_checked.checked_add(1) else {
+                            failed = Some(G::BlockLayout);
+                            return Err(crate::Error::InvalidHeader("block_layout"));
+                        };
+                        layout_checked = next;
+                    }
+                }
+            }
             Ok(())
         });
         if let Err(e) = walk {
@@ -3726,6 +3793,22 @@ impl Table {
                 G::ZoneMap,
                 crate::Error::InvalidHeader(
                     "zone_map carries entries for blocks the index does not hold",
+                ),
+            ));
+        }
+        // Every recorded LIVE entry matched a walked block (offsets are unique
+        // on both sides), so equal counts mean the map records ONLY this
+        // table's blocks. A restricted view compares against the live entries:
+        // its punched prefix keeps its own, legitimately, because the map is
+        // not rewritten on reopen.
+        #[cfg(feature = "zstd")]
+        if let Some(map) = &block_layout
+            && layout_checked != map.live_len(punch)
+        {
+            return Err((
+                G::BlockLayout,
+                crate::Error::InvalidHeader(
+                    "block_layout carries entries for blocks the index does not hold",
                 ),
             ));
         }
@@ -3916,12 +3999,163 @@ impl Table {
         Ok(Some(crate::table::zone_map::ZoneMap::decode(&block.data)?))
     }
 
+    /// Reads the `block_layout` section FROM DISK, or `None` when the table
+    /// has none.
+    ///
+    /// Disk-fresh for the same reason every other reconcile section is: the
+    /// in-memory copy was loaded at recover time and would not show an on-disk
+    /// re-stamp made after the open.
+    ///
+    /// The encryption-aware transform is not optional here. On an encrypted
+    /// table the section is AEAD-sealed and its AAD binds the block type, so a
+    /// `delete_bitmap` relabelled into a `block_layout` fails to open — which
+    /// is precisely the forgery the emptiness check downstream exists to
+    /// catch.
+    ///
+    /// # Errors
+    ///
+    /// Propagates the section decode, and rejects a block that does not carry
+    /// the block-layout role.
+    #[cfg(all(feature = "std", feature = "zstd"))]
+    fn read_block_layout_section(
+        &self,
+        file: &dyn crate::fs::FsFile,
+        regions: &regions::ParsedRegions,
+    ) -> crate::Result<Option<crate::table::block_layout::BlockLayoutMap>> {
+        let Some(bl_handle) = regions.block_layout else {
+            return Ok(None);
+        };
+        let block = Block::from_file(
+            file,
+            bl_handle,
+            crate::table::block::BlockIdentity {
+                table_id: self.metadata.id,
+                block_type: BlockType::BlockLayout,
+                dict_id: 0,
+                window_log: 0,
+            },
+            &self.section_transform(),
+        )?;
+        if block.header.block_type != BlockType::BlockLayout {
+            return Err(crate::Error::InvalidTag((
+                "BlockType",
+                block.header.block_type.into(),
+            )));
+        }
+        Ok(Some(crate::table::block_layout::BlockLayoutMap::decode(
+            &block.data,
+        )?))
+    }
+
     /// The recorded zone-map entry must match the one the block's decoded
     /// contents produce. A columnar block records
     /// one entry per stored column, re-derived by the SAME function the writer
     /// used, so any divergence (a re-stamped range, an added / dropped column,
     /// a flipped id) is a forgery; a row block records a single synthetic
     /// whole-block key range.
+    /// Every boundary the map records for this block must be exactly where the
+    /// frame's k-th inner zstd block ends, and the last one must EXHAUST the
+    /// frame: an unrecorded inner block past the final boundary would hide
+    /// data the partial-read path never decompresses.
+    ///
+    /// Decodes one inner block per recorded end, carrying the resume state and
+    /// the accumulated window forward, so `n` boundaries cost `n` inner-block
+    /// decodes. The stepwise-from-zero shape this replaces re-decoded the
+    /// prefix `[0, k)` for every `k`, i.e. `n(n+1)/2`.
+    ///
+    /// A zstd reset / decode failure on a checksum-clean frame is DETERMINISTIC
+    /// codec corruption (a forge that kept the block checksum but broke the
+    /// inner framing), not transient I/O: it maps to the structural error so
+    /// the repair gate routes the table through salvage, which re-encodes the
+    /// block, instead of aborting for a retry that can never succeed.
+    ///
+    /// # Errors
+    ///
+    /// [`crate::Error::InvalidHeader`] when the boundaries are not strictly
+    /// increasing, disagree with the frame's inner blocks, or leave the frame
+    /// unfinished.
+    #[cfg(all(feature = "std", feature = "zstd"))]
+    fn check_block_layout_entry(
+        recorded_map: &crate::table::block_layout::BlockLayoutMap,
+        block: &DecodedBlock,
+    ) -> crate::Result<bool> {
+        const ERR: crate::Error =
+            crate::Error::InvalidHeader("block_layout disagrees with the frames' inner blocks");
+
+        let Some(ends) = recorded_map.ends_for(block.handle.offset().0) else {
+            return Ok(false);
+        };
+        if !ends.iter().zip(ends.iter().skip(1)).all(|(a, b)| a < b) {
+            return Err(ERR);
+        }
+        if ends.last() != Some(&block.raw.header.uncompressed_length) {
+            return Err(ERR);
+        }
+
+        let mut src = std::io::Cursor::new(block.frame.as_ref());
+        let mut decoder = structured_zstd::decoding::FrameDecoder::new();
+        // The resume window: every inner block decoded so far. zstd
+        // back-references reach into it, so it is the decoder's input as much
+        // as the compressed bytes are.
+        let mut window: Vec<u8> = Vec::new();
+        let mut resume: Option<structured_zstd::decoding::ResumeState> = None;
+        let mut compressed_cursor = 0u64;
+
+        for (idx, &end) in ends.iter().enumerate() {
+            #[expect(
+                clippy::cast_possible_truncation,
+                reason = "inner-block index is bounded by ends.len(), well within u32"
+            )]
+            let end_block = (idx + 1) as u32;
+            // `reset` re-parses the frame header from the start; a resume then
+            // repositions the source to the inner block it left off at.
+            src.set_position(0);
+            decoder.reset(&mut src).map_err(|_| ERR)?;
+            let pd = if let Some(state) = resume.as_ref() {
+                src.set_position(compressed_cursor);
+                decoder
+                    .decode_blocks_partial(
+                        &mut src,
+                        state.block_index(),
+                        end_block,
+                        Some(structured_zstd::decoding::ResumeInput {
+                            window_prime: &window,
+                            state,
+                        }),
+                        true,
+                    )
+                    .map_err(|_| ERR)?
+            } else {
+                decoder
+                    .decode_blocks_partial(&mut src, 0, end_block, None, true)
+                    .map_err(|_| ERR)?
+            };
+            if pd.stopped_at.is_some() || pd.start_block + pd.blocks_decoded != end_block {
+                return Err(ERR);
+            }
+            // A fresh decode emits `[0, end_block)`; a resume emits only the
+            // new tail, contiguous with what the window already holds — so the
+            // window is reset for the former and appended to for the latter,
+            // and the cursor advances rather than restarting.
+            if resume.is_some() {
+                compressed_cursor += decoder.bytes_read_from_source();
+            } else {
+                compressed_cursor = decoder.bytes_read_from_source();
+                window.clear();
+            }
+            window.extend_from_slice(&pd.data);
+            if window.len() != end as usize {
+                return Err(ERR);
+            }
+            // The final recorded end must exhaust the frame.
+            if idx + 1 == ends.len() && !pd.frame_finished {
+                return Err(ERR);
+            }
+            resume = pd.resume_state;
+        }
+        Ok(true)
+    }
+
     #[cfg(feature = "std")]
     fn check_block_zone_entry(
         recorded_map: &crate::table::zone_map::ZoneMap,
@@ -5194,23 +5428,27 @@ impl Table {
         Ok(())
     }
 
-    /// Cross-checks the recorded `block_layout` section against the ACTUAL
-    /// inner-block boundaries of each zstd data frame, derived by stepwise
-    /// partial decodes. The section's block is checksum-clean to the walk
-    /// even when a cumulative end was re-stamped to another structurally
-    /// valid value, and the partial range-read path trusts it to bound
-    /// decompression — a mis-mapped boundary silently omits keys from the
-    /// affected span. Every recorded entry must belong to a real data block,
-    /// its ends must be strictly increasing, each prefix decode must land
-    /// exactly on its recorded boundary, and the final end must exhaust the
-    /// frame. A no-op for tables without the section, for encrypted tables
-    /// (the lazy path never engages there — the plaintext frame requires a
-    /// whole-block decrypt), and on builds without zstd.
+    /// The SECTION-level half of the block-layout check: the section must not
+    /// be present-but-empty on a table that has data blocks.
+    ///
+    /// The writer emits `block_layout` only when it has a multi-inner-block
+    /// frame to record, so an empty map is a forgery — a `delete_bitmap`
+    /// renamed and re-roled, which drops the deletion metadata and resurrects
+    /// positionally-deleted rows. The per-block cross-check cannot catch that
+    /// one: a block absent from the map is skipped, so an empty map trivially
+    /// "agrees" with every block.
+    ///
+    /// This runs on EVERY build, including non-zstd, because the forgery does
+    /// not need zstd to do its damage. The per-frame half — where each recorded
+    /// boundary is matched against the frame's actual inner blocks — lives in
+    /// [`Self::verify_reconcile_gates`], which already holds the decoded frame
+    /// and needs no second read to do it.
     ///
     /// # Errors
     ///
-    /// [`crate::Error::InvalidHeader`] when the recorded layout disagrees
-    /// with the frames; any I/O / decode error from the frame reads.
+    /// [`crate::Error::InvalidHeader`] on the empty-map forgery,
+    /// [`crate::Error::InvalidTag`] when the section does not carry the
+    /// block-layout role, plus any I/O / decode error from the section read.
     #[cfg(feature = "std")]
     pub(crate) fn verify_block_layout(&self) -> crate::Result<()> {
         // The section-presence + EMPTINESS check runs on EVERY build (including
@@ -5266,100 +5504,6 @@ impl Table {
             }
             return Ok(());
         }
-        // The per-frame cross-check decodes whole zstd DATA frames: it needs
-        // zstd (the lazy partial-decode path) and cannot run on an encrypted
-        // table (the plaintext frame requires a whole-block decrypt the lazy
-        // path never performs). The emptiness forgery above is already rejected
-        // on every build, so a non-zstd / encrypted table stops here.
-        #[cfg(feature = "zstd")]
-        {
-            if self.encryption.is_some() {
-                return Ok(());
-            }
-            const ERR: crate::Error =
-                crate::Error::InvalidHeader("block_layout disagrees with the frames' inner blocks");
-
-            let transform = crate::table::util::build_block_transform(
-                self.metadata.data_block_compression,
-                None,
-                self.metadata.ecc_params,
-                #[cfg(zstd_any)]
-                self.zstd_dictionary.as_deref(),
-            )?;
-            // A restricted view's punched prefix frames read as zeros and cannot
-            // be frame-decoded; the map still records them (it is not rewritten
-            // on reopen), so cross-check `recorded_seen` against the LIVE map
-            // entries (offset >= punch) below instead of the whole map length.
-            let punch = self.punch_offset()?;
-            let mut recorded_seen = 0usize;
-            for handle in self.block_index.iter() {
-                let handle = handle?;
-                let block_handle = BlockHandle::new(handle.offset(), handle.size());
-                if block_handle.offset().0 < punch {
-                    continue;
-                }
-                let Some(ends) = map.ends_for(block_handle.offset().0) else {
-                    continue;
-                };
-                recorded_seen = recorded_seen
-                    .checked_add(1)
-                    .ok_or(crate::Error::InvalidHeader("block_layout"))?;
-                if !ends.iter().zip(ends.iter().skip(1)).all(|(a, b)| a < b) {
-                    return Err(ERR);
-                }
-                let (header, frame, _recovery) =
-                    Block::read_data_frame(&*file, block_handle, &transform)?;
-                if ends.last() != Some(&header.uncompressed_length) {
-                    return Err(ERR);
-                }
-                // Stepwise COLD prefix decodes: each recorded boundary must
-                // be exactly where the frame's k-th inner block ends. The
-                // per-block quadratic cost is bounded by the handful of
-                // inner blocks a data block splits into.
-                let mut src = std::io::Cursor::new(frame.as_ref());
-                let mut decoder = structured_zstd::decoding::FrameDecoder::new();
-                for (idx, &end) in ends.iter().enumerate() {
-                    #[expect(
-                        clippy::cast_possible_truncation,
-                        reason = "inner-block index is bounded by ends.len(), well within u32"
-                    )]
-                    let end_block = (idx + 1) as u32;
-                    src.set_position(0);
-                    // A zstd reset / decode failure on a checksum-clean frame is
-                    // DETERMINISTIC codec corruption (a forge that kept the block
-                    // checksum but broke the inner framing), NOT transient I/O:
-                    // map it to the structural `ERR` so repair's is_corruption
-                    // gate routes the table through salvage (which drops / re-
-                    // encodes the block) instead of aborting for a retry that can
-                    // never succeed. `Error::Io` stays reserved for real fs reads
-                    // (the frame read above still propagates its own I/O).
-                    decoder.reset(&mut src).map_err(|_| ERR)?;
-                    let pd = decoder
-                        .decode_blocks_partial(&mut src, 0, end_block, None, false)
-                        .map_err(|_| ERR)?;
-                    if pd.stopped_at.is_some()
-                        || pd.blocks_decoded != end_block
-                        || pd.data.len() != end as usize
-                    {
-                        return Err(ERR);
-                    }
-                    // The final recorded end must EXHAUST the frame: extra
-                    // unrecorded inner blocks would hide data past the map.
-                    if idx + 1 == ends.len() && !pd.frame_finished {
-                        return Err(ERR);
-                    }
-                }
-            }
-            // Every recorded LIVE entry matched a walked block (offsets are
-            // unique on both sides), so equal counts mean the map records ONLY
-            // the table's blocks. A restricted view compares against the live
-            // map entries; the punched prefix's entries are legitimately present.
-            if recorded_seen != map.live_len(punch) {
-                return Err(crate::Error::InvalidHeader(
-                    "block_layout carries entries for blocks the index does not hold",
-                ));
-            }
-        }
         Ok(())
     }
 
@@ -5400,22 +5544,22 @@ impl Table {
             // digest gate needs the footered bytes. A `Block` clone is a
             // header copy plus a refcount bump on the payload, not a copy.
             #[cfg(feature = "columnar")]
-            let (raw, row, batch) = if self.metadata.columnar {
-                let raw = self.load_block_from_disk(&handle, BlockType::Columnar)?;
+            let (raw, frame, row, batch) = if self.metadata.columnar {
+                let (raw, frame) = self.load_block_from_disk(&handle, BlockType::Columnar)?;
                 let batch = crate::table::columnar::ColumnBatch::decode(&raw.data)?;
-                (raw, None, Some(batch))
+                (raw, frame, None, Some(batch))
             } else {
-                let raw = self.load_block_from_disk(&handle, BlockType::Data)?;
+                let (raw, frame) = self.load_block_from_disk(&handle, BlockType::Data)?;
                 let row =
                     DataBlock::from_loaded(raw.clone(), self.metadata.kv_checksum_algo.is_some())?;
-                (raw, Some(row), None)
+                (raw, frame, Some(row), None)
             };
             #[cfg(not(feature = "columnar"))]
-            let (raw, row) = {
-                let raw = self.load_block_from_disk(&handle, BlockType::Data)?;
+            let (raw, frame, row) = {
+                let (raw, frame) = self.load_block_from_disk(&handle, BlockType::Data)?;
                 let row =
                     DataBlock::from_loaded(raw.clone(), self.metadata.kv_checksum_algo.is_some())?;
-                (raw, Some(row))
+                (raw, frame, Some(row))
             };
 
             // Materialize the entries from whichever view this table has. The
@@ -5439,6 +5583,7 @@ impl Table {
             check(&DecodedBlock {
                 handle,
                 raw,
+                frame,
                 row,
                 #[cfg(feature = "columnar")]
                 batch,
@@ -5463,11 +5608,11 @@ impl Table {
         use crate::table::block::ParsedItem as _;
         #[cfg(feature = "columnar")]
         if self.metadata.columnar {
-            let block = self.load_block_from_disk(block_handle, BlockType::Columnar)?;
+            let (block, _frame) = self.load_block_from_disk(block_handle, BlockType::Columnar)?;
             let batch = crate::table::columnar::ColumnBatch::decode(&block.data)?;
             return crate::table::columnar::column_batch_to_entries(&batch);
         }
-        let block = self.load_block_from_disk(block_handle, BlockType::Data)?;
+        let (block, _frame) = self.load_block_from_disk(block_handle, BlockType::Data)?;
         let data_block = DataBlock::from_loaded(block, self.metadata.kv_checksum_algo.is_some())?;
         Ok(data_block
             .try_iter(self.comparator.clone())?

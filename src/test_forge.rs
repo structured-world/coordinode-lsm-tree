@@ -1516,6 +1516,107 @@ pub fn forge_block_layout_empty(
     replace_section_frame(path, b"block_layout", &forged)
 }
 
+/// REPLACES the `block_layout` section with a valid, checksum-consistent map
+/// whose FIRST recorded entry has one interior boundary moved, re-stamping the
+/// TOC + trailer.
+///
+/// Models the forgery the per-frame cross-check exists for: every byte-level
+/// check reads clean (the section is a well-formed, checksum-valid block whose
+/// ends are still strictly increasing and still finish at the block's
+/// uncompressed length), but one boundary no longer marks where an inner zstd
+/// block actually ends. The partial range-read path bounds its decompression by
+/// that boundary, so it silently omits keys from the affected span.
+///
+/// The moved end is the first interior one, shifted DOWN by one byte: still
+/// greater than its predecessor and still below its successor, so the cheap
+/// ordering checks cannot see it. Only decoding the frame can.
+///
+/// The SST must be PLAIN (no encryption on the section block).
+///
+/// # Errors
+///
+/// Returns an error when the table carries no `block_layout` section, when the
+/// section does not decode, or when its first entry has fewer than three
+/// boundaries (no interior end to move).
+#[cfg(feature = "zstd")]
+pub fn forge_block_layout_shifted_end(
+    path: &std::path::Path,
+    table_id: crate::TableId,
+) -> crate::Result<()> {
+    use crate::table::block::{Block, BlockIdentity, BlockTransform, BlockType};
+    use crate::table::block_layout::BlockLayoutMap;
+
+    let map = {
+        let mut file = std::fs::File::open(path)?;
+        let reader = crate::sfa::Reader::from_reader(&mut file)?;
+        let entry = reader
+            .toc()
+            .iter()
+            .find(|e| e.name() == b"block_layout")
+            .ok_or(crate::Error::InvalidHeader("no block_layout section"))?;
+        let handle = crate::table::BlockHandle::new(
+            crate::table::BlockOffset(entry.pos()),
+            u32::try_from(entry.len()).map_err(|_| crate::Error::InvalidHeader("block_layout"))?,
+        );
+        let fs = crate::fs::StdFs;
+        let f = crate::fs::Fs::open(&fs, path, &crate::fs::FsOpenOptions::new().read(true))?;
+        let block = Block::from_file(
+            f.as_ref(),
+            handle,
+            BlockIdentity {
+                table_id,
+                block_type: BlockType::BlockLayout,
+                dict_id: 0,
+                window_log: 0,
+            },
+            &BlockTransform::PLAIN,
+        )?;
+        BlockLayoutMap::decode(&block.data)?
+    };
+
+    let mut layouts: Vec<(crate::table::BlockOffset, Vec<u32>)> = map
+        .offsets()
+        .into_iter()
+        .map(|offset| {
+            let ends = map.ends_for(offset).unwrap_or_default().to_vec();
+            (crate::table::BlockOffset(offset), ends)
+        })
+        .collect();
+    let first = layouts
+        .first_mut()
+        .ok_or(crate::Error::InvalidHeader("empty block_layout"))?;
+    // Interior only: moving the last end would fail the cheap
+    // "ends with the block's uncompressed_length" check instead.
+    if first.1.len() < 3 {
+        return Err(crate::Error::InvalidHeader(
+            "block_layout entry has no interior boundary to move",
+        ));
+    }
+    let interior = first
+        .1
+        .get_mut(0)
+        .ok_or(crate::Error::InvalidHeader("block_layout entry is empty"))?;
+    *interior = interior
+        .checked_sub(1)
+        .ok_or(crate::Error::InvalidHeader("boundary at zero"))?;
+
+    let mut payload = Vec::new();
+    crate::table::block_layout::encode_block_layouts(&mut payload, &layouts);
+    let mut forged = Vec::new();
+    Block::write_into(
+        &mut forged,
+        &payload,
+        BlockIdentity {
+            table_id,
+            block_type: BlockType::BlockLayout,
+            dict_id: 0,
+            window_log: 0,
+        },
+        &BlockTransform::PLAIN,
+    )?;
+    replace_section_frame(path, b"block_layout", &forged)
+}
+
 /// REPLACES the `zone_map` section with a valid, checksum-consistent `ZoneMap`
 /// block encoding an EMPTY map (zero entries), re-stamping the TOC + trailer.
 /// Models a `delete_bitmap` relabeled and re-roled to an empty `zone_map`: every
