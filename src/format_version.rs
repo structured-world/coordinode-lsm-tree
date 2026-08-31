@@ -70,10 +70,12 @@
 /// layout the engine deliberately cannot read. A caller matching on this enum
 /// should be matching what the writer emits, and that is one shape.
 ///
-/// Adopting a pre-V5 database is a CONVERSION, not a compatibility mode: the
-/// offline migration tool (#580) owns every legacy decoder and rewrites the
-/// tree into V5. Recovery, salvage, patrol scrub and verify stay V5-only by
-/// construction, so no legacy shape is ever reachable from the live engine.
+/// There is no upgrade path and none is planned. A pre-V5 database is not
+/// adopted, converted or repaired by this crate — it fails at the manifest
+/// gate and stays that way. That is what keeps recovery, salvage, patrol scrub
+/// and verify free of a second layout to reason about: every one of them can
+/// assume the shape the current writer emits, with no branch for a shape it
+/// might also have to accept.
 #[derive(Copy, Clone, Debug, Eq, PartialEq)]
 pub enum FormatVersion {
     /// Two on-disk changes shipped together in this format version

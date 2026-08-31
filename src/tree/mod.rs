@@ -3780,7 +3780,7 @@ impl Tree {
         // Check for old version
         if config.fs.exists(&config.path.join("version"))? {
             log::error!(
-                "It looks like you are trying to open a V1 database - the database needs a manual migration, however a migration tool is not provided, as V1 is extremely outdated."
+                "this directory holds a V1 database, which this engine cannot read: V5 is the only supported on-disk format and no conversion path exists"
             );
             // Literal discriminant: V1 is a retired format and FormatVersion
             // carries no legacy variants (V5-only contract).
