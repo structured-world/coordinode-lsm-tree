@@ -6542,7 +6542,7 @@ impl Table {
 
     /// Decodes blocks read by the level prewarm into the cache (`buffers[i]` is
     /// the on-disk bytes of `handles[i]`, both from [`Table::plan_prewarm`]).
-    pub(crate) fn decode_prewarmed(&self, handles: &[BlockHandle], buffers: &[crate::Slice]) {
+    pub(crate) fn decode_prewarmed(&self, handles: &[BlockHandle], buffers: &[&[u8]]) {
         crate::table::util::decode_prewarmed_blocks(
             self.global_id(),
             &self.cache,

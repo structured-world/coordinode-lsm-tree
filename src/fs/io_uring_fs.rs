@@ -163,8 +163,23 @@ impl Fs for IoUringFs {
         // fall back to serial reads for the whole batch.
         if reqs.iter().any(|r| r.file.backing_fd().is_none()) {
             for req in reqs.iter_mut() {
-                let n = req.file.read_at(req.buf, req.offset)?;
-                if n != req.buf.len() {
+                let want = req.buf.capacity();
+                // SAFETY: `read_at` writes into the slice and reports how many
+                // bytes it wrote; exactly that many are claimed, and none are
+                // read back here. Same step, and same justification, as the
+                // trait's own serial default.
+                #[expect(unsafe_code, reason = "see safety")]
+                let dst = unsafe {
+                    let uninit = req.buf.uninit_mut();
+                    core::slice::from_raw_parts_mut(uninit.as_mut_ptr().cast::<u8>(), uninit.len())
+                };
+                let n = req.file.read_at(dst, req.offset)?;
+                // SAFETY: `read_at` initialized the first `n` bytes of `dst`.
+                #[expect(unsafe_code, reason = "see safety")]
+                unsafe {
+                    req.buf.assume_filled(n);
+                }
+                if n != want {
                     return Err(crate::io::Error::from(io::Error::new(
                         io::ErrorKind::UnexpectedEof,
                         "read_blocks_batched: short read on a fixed-size block",
@@ -911,7 +926,7 @@ impl RingThread {
         // entries mark empty-buffer requests the send loop skips.
         let mut metas: Vec<Option<(i32, u32)>> = Vec::with_capacity(reqs.len());
         for req in reqs.iter() {
-            if req.buf.is_empty() {
+            if req.buf.capacity() == 0 {
                 metas.push(None);
                 continue;
             }
@@ -921,7 +936,7 @@ impl RingThread {
                     "submit_reads_multi: request without fd",
                 )
             })?;
-            let len: u32 = i32::try_from(req.buf.len())
+            let len: u32 = i32::try_from(req.buf.capacity())
                 .map_err(|_| {
                     io::Error::new(io::ErrorKind::InvalidInput, "buffer exceeds i32::MAX")
                 })?
@@ -935,11 +950,18 @@ impl RingThread {
                 continue;
             };
             let (tx, rx) = mpsc::sync_channel(1);
-            let expected = req.buf.len();
+            let expected = req.buf.capacity();
+            // SAFETY: the kernel writes into this memory and reports how many
+            // bytes it wrote; nothing reads it back until the completion loop
+            // has confirmed every request got its full length, and only then
+            // are those bytes claimed. Handing the kernel the destination
+            // directly is the point of the uninitialized buffer.
+            #[expect(unsafe_code, reason = "see safety")]
+            let dst = unsafe { req.buf.uninit_mut().as_mut_ptr().cast::<u8>() };
             let op = Op {
                 kind: OpKind::Read {
                     fd,
-                    buf: UnsafeSendMutPtr(req.buf.as_mut_ptr()),
+                    buf: UnsafeSendMutPtr(dst),
                     len,
                     offset: req.offset,
                 },
@@ -986,6 +1008,20 @@ impl RingThread {
                             "io_uring read_blocks_batched: short read on a fixed-size block",
                         ));
                     }
+                }
+            }
+        }
+        if first_err.is_none() {
+            // Every completion matched its request's full length, so the kernel
+            // wrote every byte of every destination. Claim them: the caller
+            // reads nothing back until this happens, which is what keeps a
+            // partly-written batch from ever reaching it.
+            for req in reqs.iter_mut() {
+                let want = req.buf.capacity();
+                // SAFETY: confirmed above, per request, against its own length.
+                #[expect(unsafe_code, reason = "see safety")]
+                unsafe {
+                    req.buf.assume_filled(want);
                 }
             }
         }

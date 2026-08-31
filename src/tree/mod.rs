@@ -3387,19 +3387,30 @@ impl Tree {
 
         // One buffer per cold block, in (table, block) order.
         //
-        // SAFETY: left uninitialized on purpose. `read_blocks_batched` fills
-        // every buffer completely or reports an error, and the error path below
-        // returns WITHOUT decoding, so no byte is ever read before it is
-        // written. Zeroing them first would memset exactly the bytes the read
-        // is about to overwrite, once per cold block. Same contract, and the
-        // same builder, as the single-block `read_exact`.
-        #[expect(unsafe_code, reason = "see the initialization contract above")]
-        let mut all_buffers: Vec<crate::slice::Builder> = planned
+        // One buffer per cold block, in (table, block) order, uninitialized.
+        //
+        // Not zeroed: the read overwrites every byte, so a memset here would be
+        // pure waste, once per cold block. What makes that safe is not the
+        // promise that `read_blocks_batched` fills what it is given, because
+        // `Fs` is a public SAFE trait and an implementation that reports
+        // success having written nothing is merely wrong, not `unsafe`. It is
+        // that the destination counts what was written to it: nothing below
+        // reads a buffer back until it says it is full, and only writes can
+        // make it say so.
+        let mut all_buffers: Vec<Vec<core::mem::MaybeUninit<u8>>> = planned
             .iter()
             .flat_map(|(_, _, handles)| {
-                handles
-                    .iter()
-                    .map(|h| unsafe { crate::Slice::builder_unzeroed(h.size() as usize) })
+                handles.iter().map(|h| {
+                    let len = h.size() as usize;
+                    let mut v = Vec::with_capacity(len);
+                    // SAFETY: `MaybeUninit<u8>` has no initialization
+                    // requirement, so the capacity is a valid length for it.
+                    #[expect(unsafe_code, reason = "see safety")]
+                    unsafe {
+                        v.set_len(len);
+                    }
+                    v
+                })
             })
             .collect();
 
@@ -3418,7 +3429,7 @@ impl Tree {
                 .map(|((file, offset), buf)| crate::fs::BlockRead {
                     file,
                     offset,
-                    buf: &mut buf[..],
+                    buf: crate::fs::BlockBuf::new(&mut buf[..]),
                 })
                 .collect();
             // Best-effort: a batched-read failure just leaves the blocks for the
@@ -3426,11 +3437,27 @@ impl Tree {
             if fs.read_blocks_batched(&mut reqs).is_err() {
                 return false;
             }
+            // The same, mechanically, for an implementation that reported
+            // success without doing the work: what it did not write is not
+            // claimed, so the buffer is short and nothing below may read it.
+            if !reqs.iter().all(|r| r.buf.is_full()) {
+                return false;
+            }
         }
 
-        let all_buffers: Vec<crate::Slice> = all_buffers
-            .into_iter()
-            .map(|b| crate::Slice::from(b.freeze()))
+        // Views, not owned copies: the decode reads these bytes and builds its
+        // own block out of them, so staging them into an owning type would copy
+        // every block a second time.
+        let all_buffers: Vec<&[u8]> = all_buffers
+            .iter()
+            .map(|b| {
+                // SAFETY: every request reported full above, so each buffer was
+                // written end to end.
+                #[expect(unsafe_code, reason = "see safety")]
+                unsafe {
+                    core::slice::from_raw_parts(b.as_ptr().cast::<u8>(), b.len())
+                }
+            })
             .collect();
 
         // Decode each table's blocks (its contiguous slice of all_buffers).
@@ -3584,9 +3611,22 @@ impl Tree {
         keys: &[K],
         results: &mut [Option<InternalValue>],
     ) -> crate::Result<()> {
-        let mut buffers: Vec<Vec<u8>> = chunk
+        // Uninitialized: the read overwrites every byte, and the destination
+        // counts what was actually written, so nothing below can read a byte
+        // the read did not produce. See `BlockBuf`.
+        let mut buffers: Vec<Vec<core::mem::MaybeUninit<u8>>> = chunk
             .iter()
-            .map(|t| vec![0u8; t.handle.size() as usize])
+            .map(|t| {
+                let len = t.handle.size() as usize;
+                let mut v = Vec::with_capacity(len);
+                // SAFETY: `MaybeUninit<u8>` has no initialization requirement,
+                // so the capacity is a valid length for it.
+                #[expect(unsafe_code, reason = "see safety")]
+                unsafe {
+                    v.set_len(len);
+                }
+                v
+            })
             .collect();
         {
             let mut reqs: Vec<crate::fs::BlockRead<'_>> = chunk
@@ -3595,13 +3635,26 @@ impl Tree {
                 .map(|(t, buf)| crate::fs::BlockRead {
                     file: t.file.as_ref(),
                     offset: *t.handle.offset(),
-                    buf: buf.as_mut_slice(),
+                    buf: crate::fs::BlockBuf::new(&mut buf[..]),
                 })
                 .collect();
             fs.read_blocks_batched(&mut reqs)?;
+            // An implementation that reported success without filling a request
+            // leaves it short; refuse to decode rather than read what it never
+            // wrote.
+            if !reqs.iter().all(|r| r.buf.is_full()) {
+                return Err(crate::Error::Io(crate::io::Error::new(
+                    crate::io::ErrorKind::UnexpectedEof,
+                    "read_blocks_batched reported success on an unfilled block",
+                )));
+            }
         }
 
         for (task, buf) in chunk.iter().zip(buffers.iter()) {
+            // SAFETY: every request reported full above, so this buffer was
+            // written end to end.
+            #[expect(unsafe_code, reason = "see safety")]
+            let buf = unsafe { core::slice::from_raw_parts(buf.as_ptr().cast::<u8>(), buf.len()) };
             if let Some(block) = task.table.decode_data_block_from_bytes(buf)? {
                 for &kidx in &task.keys {
                     if let Some(item) = task.table.point_read_translated(

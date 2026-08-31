@@ -262,7 +262,7 @@ pub fn decode_prewarmed_blocks(
     table_id: GlobalTableId,
     cache: &Cache,
     handles: &[BlockHandle],
-    buffers: &[crate::Slice],
+    buffers: &[&[u8]],
     block_type: BlockType,
     compression: CompressionType,
     encryption: Option<&dyn EncryptionProvider>,

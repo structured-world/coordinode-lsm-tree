@@ -625,8 +625,140 @@ pub struct BlockRead<'a> {
     pub file: &'a dyn FsFile,
     /// Byte offset within `file`.
     pub offset: u64,
-    /// Destination buffer; filled completely on success.
-    pub buf: &'a mut [u8],
+    /// Destination; filled completely on success.
+    pub buf: BlockBuf<'a>,
+}
+
+/// The destination of one [`BlockRead`]: memory that starts UNINITIALIZED, plus
+/// a count of how much of it has actually been written.
+///
+/// A caller wants to hand out a buffer it has not paid to zero, and then read
+/// back only what the implementation put there. `Fs` is a public, SAFE trait,
+/// so "the implementation fills every request or fails" cannot be the thing
+/// that keeps the caller from reading uninitialized memory: an implementation
+/// that returns success having filled nothing is wrong, but it is not `unsafe`,
+/// and safe code must not be able to cause undefined behaviour.
+///
+/// So the count is not something an implementation asserts, it is something it
+/// EARNS. [`append`](Self::append) copies bytes in and counts them; there is no
+/// other safe way to move the count. An implementation that reads straight into
+/// the buffer, which is the fast path and what the backends here do, reaches
+/// for [`uninit_mut`](Self::uninit_mut) and [`assume_filled`](Self::assume_filled)
+/// and takes on the `unsafe` obligation that goes with them. The caller checks
+/// [`is_full`](Self::is_full) before reading anything back, so a safe
+/// implementation that does nothing yields a rejected request rather than
+/// undefined behaviour.
+///
+/// The boundary is deliberate and stops here. Handing the uninitialized bytes
+/// to [`FsFile::read_at`], which wants a `&mut [u8]`, is left to implementations
+/// that take the `unsafe` step for it, exactly as the single-block
+/// `crate::file::read_exact` already does. What changes is that no SAFE
+/// implementation can reach the caller's decode path with memory it never
+/// wrote.
+pub struct BlockBuf<'a> {
+    buf: &'a mut [core::mem::MaybeUninit<u8>],
+    filled: usize,
+}
+
+impl<'a> BlockBuf<'a> {
+    /// Wraps uninitialized memory as an empty destination.
+    #[must_use]
+    pub fn new(buf: &'a mut [core::mem::MaybeUninit<u8>]) -> Self {
+        Self { buf, filled: 0 }
+    }
+
+    /// Wraps memory that is already initialized.
+    ///
+    /// For a caller that has a plain buffer in hand and is not trying to avoid
+    /// the cost of having initialized it. The counting is the same, so the same
+    /// short-request check still catches an implementation that does not fill
+    /// what it was given; only the consequence of skipping that check differs,
+    /// since these bytes were readable to begin with.
+    #[must_use]
+    pub fn from_init(buf: &'a mut [u8]) -> Self {
+        let len = buf.len();
+        // SAFETY: every initialized `u8` is a valid `MaybeUninit<u8>`, and the
+        // wrapper only ever writes through it.
+        #[expect(unsafe_code, reason = "see safety")]
+        let buf = unsafe {
+            core::slice::from_raw_parts_mut(
+                buf.as_mut_ptr().cast::<core::mem::MaybeUninit<u8>>(),
+                len,
+            )
+        };
+        Self { buf, filled: 0 }
+    }
+
+    /// How many bytes the request wants.
+    #[must_use]
+    pub fn capacity(&self) -> usize {
+        self.buf.len()
+    }
+
+    /// How many bytes have been written so far.
+    #[must_use]
+    pub fn filled(&self) -> usize {
+        self.filled
+    }
+
+    /// Whether the request has been filled completely.
+    #[must_use]
+    pub fn is_full(&self) -> bool {
+        self.filled == self.buf.len()
+    }
+
+    /// Copies `bytes` into the unfilled part and counts them.
+    ///
+    /// The safe way to fill a request. Returns the number of bytes taken, which
+    /// is `bytes.len()` unless the request had less room left.
+    pub fn append(&mut self, bytes: &[u8]) -> usize {
+        let room = self.buf.len() - self.filled;
+        let n = room.min(bytes.len());
+        for (slot, byte) in self
+            .buf
+            .iter_mut()
+            .skip(self.filled)
+            .zip(bytes.iter().take(n))
+        {
+            slot.write(*byte);
+        }
+        self.filled += n;
+        n
+    }
+
+    /// The unfilled part, as the uninitialized memory it is.
+    ///
+    /// For an implementation that has the kernel write into the buffer directly
+    /// rather than copying through one of its own.
+    ///
+    /// # Safety
+    ///
+    /// The bytes are uninitialized: they may be written, but not read, and no
+    /// `&[u8]` or `&mut [u8]` may be formed over them until they have been.
+    /// Whatever is written must then be claimed with
+    /// [`assume_filled`](Self::assume_filled), which is what lets the caller
+    /// read it back.
+    pub unsafe fn uninit_mut(&mut self) -> &mut [core::mem::MaybeUninit<u8>] {
+        let filled = self.filled;
+        #[expect(
+            clippy::indexing_slicing,
+            reason = "filled <= buf.len() is the type's invariant"
+        )]
+        &mut self.buf[filled..]
+    }
+
+    /// Counts `n` more bytes as written.
+    ///
+    /// # Safety
+    ///
+    /// The first `n` bytes of the slice returned by
+    /// [`uninit_mut`](Self::uninit_mut) must have been initialized. Claiming
+    /// bytes that were not written is what makes the caller read uninitialized
+    /// memory, which is the whole thing this type exists to prevent.
+    pub unsafe fn assume_filled(&mut self, n: usize) {
+        debug_assert!(self.filled + n <= self.buf.len());
+        self.filled = (self.filled + n).min(self.buf.len());
+    }
 }
 
 /// Pluggable filesystem abstraction.
@@ -663,8 +795,15 @@ pub trait Fs: Send + Sync + 'static {
     /// many devices) coalesce into one submission and overlap in flight, with
     /// the kernel fanning each read out to its file's underlying device.
     ///
-    /// Fills each `buf` completely (block reads are fixed-size); a short read on
-    /// any block is an error, leaving every `buf`'s contents unspecified.
+    /// Fills each [`BlockBuf`] completely (block reads are fixed-size); a short
+    /// read on any block is an error, leaving every buffer's contents
+    /// unspecified.
+    ///
+    /// The destination starts uninitialized and only counts what is written to
+    /// it, so an implementation that reports success without filling a request
+    /// leaves that request short rather than exposing uninitialized memory: see
+    /// [`BlockBuf`]. The caller rejects a short request, which is why this
+    /// contract does not have to be trusted.
     ///
     /// # Errors
     ///
@@ -672,8 +811,24 @@ pub trait Fs: Send + Sync + 'static {
     /// is reported as [`io::ErrorKind::UnexpectedEof`]).
     fn read_blocks_batched(&self, reqs: &mut [BlockRead<'_>]) -> io::Result<()> {
         for req in reqs.iter_mut() {
-            let n = req.file.read_at(req.buf, req.offset)?;
-            if n != req.buf.len() {
+            let want = req.buf.capacity();
+            // SAFETY: `read_at` writes into the slice and reports how many bytes
+            // it wrote; exactly that many are claimed below, and none are read
+            // back here. Reading straight into the destination is the point of
+            // the uninitialized buffer: the alternative is a second buffer and a
+            // copy per block.
+            #[expect(unsafe_code, reason = "see safety")]
+            let dst = unsafe {
+                let uninit = req.buf.uninit_mut();
+                core::slice::from_raw_parts_mut(uninit.as_mut_ptr().cast::<u8>(), uninit.len())
+            };
+            let n = req.file.read_at(dst, req.offset)?;
+            // SAFETY: `read_at` initialized the first `n` bytes of `dst`.
+            #[expect(unsafe_code, reason = "see safety")]
+            unsafe {
+                req.buf.assume_filled(n);
+            }
+            if n != want {
                 return Err(io::Error::new(
                     io::ErrorKind::UnexpectedEof,
                     "read_blocks_batched: short read on a fixed-size block",
@@ -1332,4 +1487,68 @@ pub(crate) fn copy_file_streamed<F: Fs + ?Sized>(fs: &F, src: &Path, dst: &Path)
         return Err(e);
     }
     Ok(())
+}
+
+#[cfg(test)]
+mod block_buf_tests {
+    use super::BlockBuf;
+    use core::mem::MaybeUninit;
+    use test_log::test;
+
+    /// The count only moves when bytes are written, which is the property the
+    /// caller relies on to know a buffer is safe to read back.
+    #[test]
+    fn a_fresh_buffer_is_empty_and_not_full() {
+        let mut mem = [MaybeUninit::<u8>::uninit(); 4];
+        let buf = BlockBuf::new(&mut mem);
+        assert_eq!(buf.capacity(), 4);
+        assert_eq!(buf.filled(), 0);
+        assert!(!buf.is_full(), "nothing has been written yet");
+    }
+
+    /// `append` is the safe way to fill, and it is the writing that counts.
+    #[test]
+    fn appending_counts_only_what_it_wrote() {
+        let mut mem = [MaybeUninit::<u8>::uninit(); 4];
+        let mut buf = BlockBuf::new(&mut mem);
+
+        assert_eq!(buf.append(&[1, 2]), 2);
+        assert_eq!(buf.filled(), 2);
+        assert!(!buf.is_full());
+
+        assert_eq!(buf.append(&[3, 4]), 2);
+        assert!(buf.is_full(), "the request is filled end to end");
+    }
+
+    /// A write past the end takes only what fits, so the count can never claim
+    /// more than the buffer holds.
+    #[test]
+    fn appending_past_the_end_takes_only_what_fits() {
+        let mut mem = [MaybeUninit::<u8>::uninit(); 3];
+        let mut buf = BlockBuf::new(&mut mem);
+
+        assert_eq!(buf.append(&[1, 2, 3, 4, 5]), 3, "only three bytes fit");
+        assert!(buf.is_full());
+        assert_eq!(buf.append(&[6]), 0, "a full buffer takes nothing more");
+        assert_eq!(buf.filled(), 3);
+    }
+
+    /// The point of the type: an `Fs` implementation is safe code, and safe code
+    /// that reports success without writing anything leaves the request short.
+    /// The caller sees that and refuses to read the buffer, which is what makes
+    /// the uninitialized memory sound rather than merely promised.
+    #[test]
+    fn a_request_a_lazy_implementation_ignored_is_not_full() {
+        let mut mem = [MaybeUninit::<u8>::uninit(); 8];
+        let buf = BlockBuf::new(&mut mem);
+
+        // Everything a safe implementation can do without writing.
+        let _ = buf.capacity();
+        let _ = buf.filled();
+
+        assert!(
+            !buf.is_full(),
+            "a buffer nobody wrote to must never report itself filled",
+        );
+    }
 }
