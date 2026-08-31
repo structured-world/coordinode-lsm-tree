@@ -99,6 +99,29 @@ fn splitmix64(state: &mut u64) -> u64 {
     z ^ (z >> 31)
 }
 
+/// Cap on retained per-op samples for the percentile report: enough volume for
+/// a meaningful P999 while bounding memory (Criterion drives these micro-ops
+/// through millions of iterations).
+const PCT_SAMPLE_CAP: usize = 1_000_000;
+
+/// Reports per-op tail latency (P50/P99/P999) to stderr — Criterion's summary
+/// only surfaces mean/CI.
+fn report_percentiles(label: &str, mut samples: Vec<std::time::Duration>) {
+    if samples.is_empty() {
+        return;
+    }
+    samples.sort_unstable();
+    let pick =
+        |per_mille: usize| samples[(samples.len() * per_mille / 1000).min(samples.len() - 1)];
+    eprintln!(
+        "  [{label}] n={} P50={:?} P99={:?} P999={:?}",
+        samples.len(),
+        pick(500),
+        pick(990),
+        pick(999),
+    );
+}
+
 /// Point-lookup cost averaged over 10 000 distinct resident keys, so a single
 /// key's placement in the (per-process random) tower structure cannot dominate
 /// the measurement the way it does in `memtable get`.
@@ -122,11 +145,26 @@ fn memtable_get_many(c: &mut Criterion) {
 
     let mut i = 0usize;
     c.bench_function("memtable get many", |b| {
-        b.iter(|| {
-            let key = &probes[i % probes.len()];
-            i += 1;
-            assert!(memtable.get(key.as_bytes(), MAX_SEQNO).is_some());
+        // Per-op timing so the percentile report sees individual lookups, not
+        // only Criterion's aggregate.
+        let mut samples = Vec::new();
+        b.iter_custom(|iters| {
+            let mut total = std::time::Duration::ZERO;
+            for _ in 0..iters {
+                let key = &probes[i % probes.len()];
+                i += 1;
+                let t = std::time::Instant::now();
+                let found = memtable.get(key.as_bytes(), MAX_SEQNO).is_some();
+                let elapsed = t.elapsed();
+                assert!(found);
+                total += elapsed;
+                if samples.len() < PCT_SAMPLE_CAP {
+                    samples.push(elapsed);
+                }
+            }
+            total
         });
+        report_percentiles("get many", std::mem::take(&mut samples));
     });
 }
 
@@ -152,11 +190,26 @@ fn memtable_get_miss_many(c: &mut Criterion) {
 
     let mut i = 0usize;
     c.bench_function("memtable get miss many", |b| {
-        b.iter(|| {
-            let key = &probes[i % probes.len()];
-            i += 1;
-            assert!(memtable.get(key.as_bytes(), MAX_SEQNO).is_none());
+        // Per-op timing so the percentile report sees individual lookups, not
+        // only Criterion's aggregate.
+        let mut samples = Vec::new();
+        b.iter_custom(|iters| {
+            let mut total = std::time::Duration::ZERO;
+            for _ in 0..iters {
+                let key = &probes[i % probes.len()];
+                i += 1;
+                let t = std::time::Instant::now();
+                let found = memtable.get(key.as_bytes(), MAX_SEQNO).is_some();
+                let elapsed = t.elapsed();
+                assert!(!found);
+                total += elapsed;
+                if samples.len() < PCT_SAMPLE_CAP {
+                    samples.push(elapsed);
+                }
+            }
+            total
         });
+        report_percentiles("get miss many", std::mem::take(&mut samples));
     });
 }
 
