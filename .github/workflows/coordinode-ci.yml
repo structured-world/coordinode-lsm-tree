@@ -240,6 +240,21 @@ jobs:
           cargo fmt --all -- --check
           find tools fuzz -name '*.rs' -not -path '*/target/*' -print0 \
             | xargs -0 rustfmt --check --
+      - name: Manifest metadata limits
+        if: needs.changes.outputs.code != 'false'
+        # crates.io rejects a description over 255 characters, and nothing
+        # local catches it: `cargo package` and `cargo publish --dry-run`
+        # both accept an oversized one, so the first refusal comes from the
+        # registry during a release. Measure it here instead.
+        run: |
+          set -euo pipefail
+          LEN=$(cargo metadata --no-deps --format-version 1 \
+            | jq -r '.packages[0].description | length')
+          echo "description: $LEN chars (crates.io limit 255)"
+          if [ "$LEN" -gt 255 ]; then
+            echo "::error file=Cargo.toml::description is $LEN chars; crates.io rejects over 255"
+            exit 1
+          fi
       - name: Clippy (strict)
         if: needs.changes.outputs.code != 'false'
         # `--all-targets` lints tests + benches too, not just the lib; without

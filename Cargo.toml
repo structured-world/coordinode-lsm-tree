@@ -14,7 +14,10 @@ exclude = ["tools/compare-rocksdb", "tools/db_bench", "tools/sst-dump"]
 
 [package]
 name = "coordinode-lsm-tree"
-description = "Embedded LSM-tree storage engine in pure Rust, with no C/C++ dependency. MVCC snapshots, BuRR filters, zstd dictionary compression, columnar PAX blocks, AES-256-GCM at rest, per-block ECC with self-healing, compaction on a near-full disk, and no_std support."
+# crates.io rejects a description over 255 characters, and `cargo package`
+# does NOT catch it locally: the registry is the first thing that says no.
+# The CI lint job measures this, so keep the headroom it leaves.
+description = "Embedded LSM-tree storage engine in pure Rust, no C/C++ dependency. MVCC snapshots, BuRR filters, zstd dictionary compression, columnar PAX blocks, AES-256-GCM at rest, self-healing per-block ECC, compaction on a near-full disk, no_std support."
 license = "Apache-2.0"
 version = "5.8.0"
 edition = "2024"
