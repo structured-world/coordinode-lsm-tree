@@ -1,5 +1,5 @@
 window.BENCHMARK_DATA = {
-  "lastUpdate": 1788214187370,
+  "lastUpdate": 1788219300455,
   "repoUrl": "https://github.com/structured-world/coordinode-lsm-tree",
   "entries": {
     "lsm-tree db_bench": [
@@ -20670,6 +20670,84 @@ window.BENCHMARK_DATA = {
             "value": 692549.3552742942,
             "unit": "ops/sec",
             "extra": "P50: 1.3us | P99: 4.6us | P99.9: 7.2us\nthreads: 1 | elapsed: 0.29s | num: 200000 | iterations: 3"
+          }
+        ]
+      },
+      {
+        "commit": {
+          "author": {
+            "email": "mail@polaz.com",
+            "name": "Dmitry Prudnikov",
+            "username": "polaz"
+          },
+          "committer": {
+            "email": "noreply@github.com",
+            "name": "GitHub",
+            "username": "web-flow"
+          },
+          "distinct": true,
+          "id": "1b23801004ac56403b977b33d1a4ca09b4f61fb2",
+          "message": "perf: cut hot-path allocations across point reads, memtable and scans (#601)\n\nHot-path audit of the benched operations: each finding was confirmed on\nthe matching benchmark (interleaved A/B against the pre-change binary,\nseveral rounds, same host) and landed as its own commit. The audit also\nsurfaced one correctness defect on the reverse-scan path, fixed here\nwith regression tests.\n\n## A point read cloned its snapshot\n\n`get`, `get_pinned`, `multi_get` and the blob tree's counterparts each\ntook the version-history read lock and cloned a `SuperVersion` out of\nthe deque, two `Arc` bumps plus a `Version` clone, on every call. The\nlock-free mirror of the latest snapshot already existed and already\nserved `get_internal_entry`; the other entry points simply never used\nit.\n\nThe fast path now lives in one place. `snapshot_for_read` returns a\n`SnapshotRef` that either pins the mirrored latest snapshot with the\n`arc-swap` load guard, no lock and no clone, which is the `MAX_SEQNO`\ncase every ordinary read takes, or falls back to cloning the historical\nsnapshot out of the locked history. Iterators keep cloning on purpose: a\nguard held across a long scan would delay the mirror's writers, and a\nscan has a version's worth of work to amortise a clone over anyway.\n\n`get_pinned/disk_hit` 608 -> 592 ns.\n\n## A memtable key was rebuilt on every touch\n\n`node_internal_key` built a fresh `Slice` from the arena bytes for every\nentry a scan, flush or point read reconstructed: one allocation and one\ncopy per key longer than the 20-byte inline threshold. The bytes were\nalready sitting in an arena block that outlives the read, so the copy\nbought nothing.\n\nArena blocks are now allocated as byteview shared-heap regions, a\nrefcount header followed by the block data, so a node's key can be a\nrefcounted view of the block that already stores it. Reconstructing a\nkey is a reference bump; short keys still inline and take no reference\nat all. A view keeps its block alive after the arena drops; a regression\ntest reads a key after dropping the whole map. The `bytes` slice backend\ncannot wrap foreign memory and keeps the copying path.\n\n`merge` benchmark (memtable-sourced): 9 to 27 percent faster across the\n`MergeHeap` and `SeekingMerger` arms at 2 to 16 sources.\n\n## The skiplist search re-resolved the arena per field\n\n`compare_key` / `compare_nodes` read the key offset, key length and\nseqno through per-field accessors, each re-resolving the arena block\npointer (an Acquire load plus branch), three to four resolves per\nvisited node. One metadata read now serves all fields. `alloc_node` also\nmade two arena allocations per insert (key bytes, then node); the node\nallocation now carries the key bytes right after the tower, one CAS loop\ninstead of two, with the key on the header's cache line for the common\nheight-1/2 node.\n\nat_insert/off (20k inserts + flush) 18.22 -> 17.91 ms median, the new\nside won every interleaved round; memtable get-miss lookups 4 to 10\npercent faster per round.\n\n## A memtable point lookup copied its probe key\n\n`Memtable::get` built an `InternalKey` range bound per call,\nheap-copying the probe key for every memtable a point read touches, then\ndrove a full range iterator to read one node. `SkipMap::point_get` now\nsearches with the borrowed `(key, seqno)` pair directly, nothing is\nmaterialized for the probe, and the found-key check is byte identity\ninstead of a comparator dispatch.\n\nmemtable get 1.74 -> 1.62 us median.\n\n## Scan bounds copied the range keys\n\n`create_range` / `create_range_point` rebuilt their internal-key bounds\nfrom `key.as_ref()`, heap-copying each bound key (two to four copies per\nopened scan). They now hand the refcounted `UserKey` over by value, an\n`Arc` bump, no byte copy, matching what `user_to_internal_bounds`\nalready did on the seekable path.\n\n## Fix: key boundaries were detected by byte order, not identity\n\n`MvccStream::next_back` and `CompactionStream::next` decided \"is the\nneighbouring entry a different key?\" with a bytewise `<` / `>` on the\nuser keys. Under a custom comparator whose order differs from byte\norder, a neighbouring different key can sort bytewise the other way;\nboth sites then classified it as \"same key\". A reverse scan dropped\nrows, and a `WeakTombstone` head annihilated against the other key's\nvalue during compaction, resurrecting older versions below. Both checks\nnow use `same_user_key` (byte equality, the crate's single key-identity\nrelation), which the merge order makes sufficient, and which is also\ncheaper than an ordering compare. Regression tests cover both sites with\na reverse-lexicographic comparator.\n\n## Bench instrumentation\n\nThe memtable bench gains deterministic `get many` / `get miss many` arms\n(10k-probe averages over a seeded key population). The existing\nsingle-hot-key arms swing +-50 percent between runs of the same binary\nbecause the tower layout is re-randomized per process; the new arms are\nwhat the audit's verdicts were measured on.\n\n## Verification\n\n`cargo nextest run` green on all-features (3237), clippy clean on\n`--all-features --all-targets` for the host and\n`x86_64-unknown-linux-gnu`, `cargo doc` zero warnings. Every benchmark\nnamed above measured before/after with interleaved A/B runs; no covered\nbenchmark regressed.\n\nPart of #600.\n\n\n<!-- This is an auto-generated comment: release notes by coderabbit.ai\n-->\n\n## Summary by CodeRabbit\n\n* **Performance**\n* Improved point-read and multi-read efficiency by reducing snapshot\noverhead and avoiding unnecessary key copies.\n* Accelerated table flushing through parallel compression when\ncompression, encryption, or error correction is enabled.\n  * Reduced memory copying during in-memory lookups and iteration.\n\n* **Bug Fixes**\n* Fixed compaction and reverse-scan behavior with custom key comparators\nso distinct keys are preserved correctly.\n* Ensured key views remain valid after their source in-memory structure\nis released.\n\n* **API**\n  * Exposed snapshot handles for advanced integrations.\n\n<!-- end of auto-generated comment: release notes by coderabbit.ai -->",
+          "timestamp": "2026-09-01T02:33:41+03:00",
+          "tree_id": "d68cd1788a60e7ff5db91e696cf4ef04c5e864cd",
+          "url": "https://github.com/structured-world/coordinode-lsm-tree/commit/1b23801004ac56403b977b33d1a4ca09b4f61fb2"
+        },
+        "date": 1788219277322,
+        "tool": "customBiggerIsBetter",
+        "benches": [
+          {
+            "name": "fillseq",
+            "value": 2078046.134577551,
+            "unit": "ops/sec",
+            "extra": "P50: 0.4us | P99: 1.6us | P99.9: 3.7us\nthreads: 1 | elapsed: 0.10s | num: 200000 | iterations: 3"
+          },
+          {
+            "name": "fillrandom",
+            "value": 1197225.6283457628,
+            "unit": "ops/sec",
+            "extra": "P50: 0.7us | P99: 2.1us | P99.9: 4.5us\nthreads: 1 | elapsed: 0.17s | num: 200000 | iterations: 3"
+          },
+          {
+            "name": "readrandom",
+            "value": 866815.1596159069,
+            "unit": "ops/sec",
+            "extra": "P50: 1.0us | P99: 4.1us | P99.9: 7.1us\nthreads: 1 | elapsed: 0.23s | num: 200000 | iterations: 3"
+          },
+          {
+            "name": "readseq",
+            "value": 3551364.251250071,
+            "unit": "ops/sec",
+            "extra": "P50: 0.2us | P99: 3.1us | P99.9: 5.8us\nthreads: 1 | elapsed: 0.06s | num: 200000 | iterations: 3"
+          },
+          {
+            "name": "seekrandom",
+            "value": 433727.63317287643,
+            "unit": "ops/sec",
+            "extra": "P50: 1.9us | P99: 5.5us | P99.9: 9.4us\nthreads: 1 | elapsed: 0.46s | num: 200000 | iterations: 3"
+          },
+          {
+            "name": "prefixscan",
+            "value": 218915.9132921791,
+            "unit": "ops/sec",
+            "extra": "P50: 4.1us | P99: 8.9us | P99.9: 11.6us\nthreads: 1 | elapsed: 0.91s | num: 200000 | iterations: 3"
+          },
+          {
+            "name": "overwrite",
+            "value": 1275292.7861813763,
+            "unit": "ops/sec",
+            "extra": "P50: 0.7us | P99: 2.1us | P99.9: 4.2us\nthreads: 1 | elapsed: 0.16s | num: 200000 | iterations: 3"
+          },
+          {
+            "name": "mergerandom",
+            "value": 1100816.113693433,
+            "unit": "ops/sec",
+            "extra": "P50: 0.3us | P99: 1.4us | P99.9: 2.6us\nthreads: 1 | elapsed: 0.18s | num: 200000 | iterations: 3"
+          },
+          {
+            "name": "readwhilewriting",
+            "value": 722793.6094434316,
+            "unit": "ops/sec",
+            "extra": "P50: 1.2us | P99: 4.4us | P99.9: 6.9us\nthreads: 1 | elapsed: 0.28s | num: 200000 | iterations: 3"
           }
         ]
       }
