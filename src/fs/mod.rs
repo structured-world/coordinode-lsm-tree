@@ -724,8 +724,11 @@ impl<'a> BlockBuf<'a> {
     /// not, and the block decoded from it then fails its checksum. Clamped at
     /// the capacity so the fill point stays inside the buffer.
     pub fn advance(&mut self, n: usize) {
-        debug_assert!(self.filled + n <= self.buf.len());
-        self.filled = (self.filled + n).min(self.buf.len());
+        // Clamp BEFORE adding: `filled + n` computed first would panic in
+        // debug builds and wrap `filled` backwards in release builds for an
+        // oversized `n`.
+        let remaining = self.buf.len() - self.filled;
+        self.filled += n.min(remaining);
     }
 }
 
@@ -769,9 +772,9 @@ pub trait Fs: Send + Sync + 'static {
     /// already owns the block's first `filled` bytes, so the read covers the
     /// unfilled suffix starting at `offset + filled` in the file.
     ///
-    /// The destination starts uninitialized and only counts what is written to
-    /// it, so an implementation that reports success without filling a request
-    /// leaves that request short rather than exposing uninitialized memory: see
+    /// The destination is initialized memory whose fill count starts at zero,
+    /// so an implementation that reports success without filling a request
+    /// leaves that request short rather than making stale bytes look read: see
     /// [`BlockBuf`]. The caller rejects a short request, which is why this
     /// contract does not have to be trusted.
     ///
@@ -1462,6 +1465,19 @@ pub(crate) fn copy_file_streamed<F: Fs + ?Sized>(fs: &F, src: &Path, dst: &Path)
 mod block_buf_tests {
     use super::BlockBuf;
     use test_log::test;
+
+    /// An oversized `advance` clamps at the capacity instead of overflowing:
+    /// `filled + n` must not be computed first, or a huge `n` panics in debug
+    /// builds and wraps `filled` BACKWARDS in release builds.
+    #[test]
+    fn advance_with_oversized_n_clamps_at_capacity() {
+        let mut mem = [0u8; 4];
+        let mut buf = BlockBuf::new(&mut mem);
+        buf.append(&[1, 2]);
+        buf.advance(usize::MAX);
+        assert_eq!(buf.filled(), 4, "clamped at capacity, not wrapped");
+        assert!(buf.is_full());
+    }
 
     /// The count only moves when bytes are written, which is what tells the
     /// caller the request was actually served.
