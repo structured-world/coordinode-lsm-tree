@@ -761,6 +761,14 @@ impl SkipMap {
 
     /// Compares the key stored at `node` with `target` using the pluggable
     /// `UserComparator` for `user_key` ordering, then seqno DESC.
+    #[inline]
+    fn compare_key(&self, node: u32, target: &InternalKey) -> CmpOrdering {
+        self.compare_key_parts(node, &target.user_key, target.seqno)
+    }
+
+    /// [`Self::compare_key`] against a borrowed `(user_key, seqno)` pair, so
+    /// point lookups can search without materializing an [`InternalKey`]
+    /// (which would heap-copy the probe key on the slice backend).
     #[expect(
         clippy::indexing_slicing,
         reason = "metadata is exactly OFF_TOWER (24) bytes by construction"
@@ -769,7 +777,7 @@ impl SkipMap {
         clippy::expect_used,
         reason = "infallible: fixed-width slices always convert to arrays"
     )]
-    fn compare_key(&self, node: u32, target: &InternalKey) -> CmpOrdering {
+    fn compare_key_parts(&self, node: u32, target_uk: &[u8], target_seqno: SeqNo) -> CmpOrdering {
         // One metadata read serves key offset, key length AND (on the equal
         // branch) the seqno: every field split into its own accessor would
         // re-resolve the arena block pointer (an extra Acquire load + branch)
@@ -782,7 +790,6 @@ impl SkipMap {
         // SAFETY: key_offset/key_len were written during alloc_node; the key
         // bytes are immutable once the node is published.
         let node_uk = unsafe { self.arena.get_bytes(key_off, key_len) };
-        let target_uk: &[u8] = &target.user_key;
 
         // Hot path: for the default byte-ordering comparator, compare the user
         // keys with a direct `slice::cmp` (inlines to `memcmp`) instead of the
@@ -799,7 +806,7 @@ impl SkipMap {
             CmpOrdering::Equal => {
                 // Reverse seqno: higher seqno sorts first.
                 let node_seq = u64::from_ne_bytes(m[16..24].try_into().expect("8 bytes"));
-                target.seqno.cmp(&node_seq)
+                target_seqno.cmp(&node_seq)
             }
             other => other,
         }
@@ -925,7 +932,13 @@ impl SkipMap {
     }
 
     /// Finds the first node whose key >= `target`, or UNSET.
+    #[inline]
     fn seek_ge(&self, target: &InternalKey) -> u32 {
+        self.seek_ge_parts(&target.user_key, target.seqno)
+    }
+
+    /// [`Self::seek_ge`] against a borrowed `(user_key, seqno)` pair.
+    fn seek_ge_parts(&self, target_uk: &[u8], target_seqno: SeqNo) -> u32 {
         let mut node = self.head;
         let list_h = self.height.load(Ordering::Acquire);
 
@@ -935,7 +948,7 @@ impl SkipMap {
                 if next == UNSET {
                     break;
                 }
-                if self.compare_key(next, target) == CmpOrdering::Less {
+                if self.compare_key_parts(next, target_uk, target_seqno) == CmpOrdering::Less {
                     node = next;
                 } else {
                     break;
@@ -944,6 +957,29 @@ impl SkipMap {
         }
 
         self.next_at(node, 0)
+    }
+
+    /// Point lookup: the entry for `key` with the highest seqno `<= max_seqno`,
+    /// or `None` if no version of `key` is visible.
+    ///
+    /// Searches with borrowed `(key, seqno)` parts — no [`InternalKey`] bound is
+    /// materialized, so the probe key is never copied and nothing allocates.
+    /// The found entry's key IS materialized, as a zero-copy view on the slice
+    /// backend (see [`Self::node_internal_key`]).
+    pub fn point_get(&self, key: &[u8], max_seqno: SeqNo) -> Option<InternalValue> {
+        let node = self.seek_ge_parts(key, max_seqno);
+        if node == UNSET {
+            return None;
+        }
+        // Key identity is byte equality (see `comparator::same_user_key`), so
+        // no comparator dispatch is needed to reject a different key.
+        if !crate::comparator::same_user_key(self.node_user_key_bytes(node), key) {
+            return None;
+        }
+        Some(InternalValue {
+            key: self.node_internal_key(node),
+            value: self.node_value(node),
+        })
     }
 
     /// Finds the first node whose key > `target`, or UNSET.
@@ -1105,13 +1141,6 @@ impl Entry<'_> {
     /// Reconstructs the [`InternalKey`] (allocates a new `Slice` for `user_key`).
     pub fn key(&self) -> InternalKey {
         self.map.node_internal_key(self.node)
-    }
-
-    /// Returns a borrowed reference to the raw `user_key` bytes stored in
-    /// the arena.  This is cheaper than [`key()`](Self::key) when only the
-    /// `user_key` is needed (avoids allocating a new `Slice`).
-    pub fn user_key_bytes(&self) -> &[u8] {
-        self.map.node_user_key_bytes(self.node)
     }
 
     /// Reconstructs the value (allocates a new `Slice`).
