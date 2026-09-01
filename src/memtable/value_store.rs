@@ -72,14 +72,16 @@ impl ValueStore {
 
     /// Appends a value and returns its index.
     ///
-    /// The value is cloned into the store (cheap for `ByteView` — atomic
-    /// refcount increment only).
+    /// The value MOVES into its slot: the caller's handle becomes the stored
+    /// one, so appending costs no refcount traffic.
     ///
     /// # Panics
     ///
-    /// Panics if more than `u32::MAX` values are appended (unreachable in
-    /// practice — a memtable with 4 billion entries would exhaust memory
-    /// long before this limit).
+    /// Panics when the index space is exhausted (`u32::MAX` reservations),
+    /// rather than wrapping and re-issuing a slot that live nodes still
+    /// reference. Unreachable in practice: the arena backing the nodes these
+    /// values belong to addresses 2^32 bytes and a node costs at least 28 of
+    /// them, so it reports exhaustion roughly 28x earlier.
     #[expect(
         clippy::indexing_slicing,
         reason = "seg_idx < MAX_SEGMENTS enforced by u32 index range"
@@ -87,11 +89,24 @@ impl ValueStore {
     pub fn append(&self, value: UserValue) -> u32 {
         // One atomic RMW rather than a CAS loop guarding `u32::MAX`: the
         // counter cannot get there. Every value belongs to one skiplist node,
-        // a node occupies at least 28 arena bytes, and arena offsets are
-        // `u32`, so a memtable holds fewer than 2^32 / 28 entries; the arena
-        // reports exhaustion long before this index space could wrap.
+        // the node is allocated BEFORE this call and occupies at least 28
+        // arena bytes, and arena offsets are `u32` (2^32 bytes total), so a
+        // memtable holds fewer than 2^32 / 28 entries; the arena panics on
+        // exhaustion roughly 28x before this index space could wrap.
+        //
+        // The assert is nonetheless a real one, not a `debug_assert`: the
+        // bound above is an invariant spanning two modules, and if a future
+        // change breaks it the failure mode is silent data corruption (a
+        // wrapped index re-issues slot 0, `ptr::write` overwrites a value
+        // live skiplist nodes still point at, and a concurrent reader of
+        // that slot races the write). Failing loudly costs one compare
+        // against a constant on a perfectly predicted branch, touches no
+        // memory, and keeps the single-RMW reservation; a CAS loop would
+        // charge the hot path for a path that cannot be taken. The last
+        // index is spent on the guard rather than handed out, so the wrap
+        // is refused before any slot can be re-issued.
         let idx = self.next_idx.fetch_add(1, Ordering::Relaxed);
-        debug_assert!(idx != u32::MAX, "ValueStore::append: index space exhausted");
+        assert!(idx != u32::MAX, "ValueStore::append: index space exhausted");
         let seg_idx = (idx >> SEGMENT_SHIFT) as usize;
         let slot = (idx & SEGMENT_MASK) as usize;
 
@@ -110,6 +125,13 @@ impl ValueStore {
         }
 
         idx
+    }
+
+    /// Test-only: positions the reservation counter so a test can reach the
+    /// end of the index space without performing 4 billion appends.
+    #[cfg(test)]
+    pub(crate) fn set_next_idx_for_test(&self, idx: u32) {
+        self.next_idx.store(idx, Ordering::Relaxed);
     }
 
     /// Reads a value by index (wait-free).

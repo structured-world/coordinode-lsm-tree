@@ -38,6 +38,24 @@ fn crosses_segment_boundary() {
     );
 }
 
+/// The reservation counter must fail loudly at the end of the index space
+/// instead of wrapping to zero. A wrap would hand out slot 0 a second time,
+/// so `ptr::write` would overwrite a live value that existing skiplist nodes
+/// still point at: silent wrong-value reads, plus a data race against a
+/// concurrent reader of that slot.
+///
+/// The exhaustion itself is unreachable in production (the arena addresses
+/// 2^32 bytes and a node costs at least 28 of them, so it panics roughly 28x
+/// earlier), which is exactly why this guard has to hold in release builds
+/// too: it is what catches the invariant being broken by a future change.
+#[test]
+#[should_panic(expected = "index space exhausted")]
+fn append_at_the_end_of_the_index_space_panics_instead_of_wrapping_to_slot_zero() {
+    let store = ValueStore::new();
+    store.set_next_idx_for_test(u32::MAX);
+    let _ = store.append(val(b"wraps-onto-slot-zero"));
+}
+
 #[test]
 fn concurrent_append_and_read() {
     use std::sync::Arc;
