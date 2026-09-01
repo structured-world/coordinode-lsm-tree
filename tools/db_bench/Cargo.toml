@@ -31,3 +31,11 @@ tempfile = "3"
 tracing = { version = "0.1", optional = true }
 tracing-flame = { version = "0.2", optional = true }
 tracing-subscriber = { version = "0.3", features = ["registry"], optional = true }
+
+# Deterministic code layout for the dashboard binary: default codegen (16
+# units, no LTO) reshuffles function placement on ANY code change, stepping
+# the published trend by several percent on commits that never touch the
+# measured path. See the same section in the crate root Cargo.toml.
+[profile.release]
+lto = "thin"
+codegen-units = 1

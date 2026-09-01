@@ -415,3 +415,19 @@ name = "at_insert"
 harness = false
 path = "benches/at_insert.rs"
 required-features = []
+
+# Deterministic code layout for anything measured: with the default 16
+# codegen units and no LTO, ANY code change reshuffles function placement and
+# moves hot loops across cache lines, stepping macro-benchmarks by several
+# percent on commits that never touch the measured path (bisected to exactly
+# that: a functionally inert commit "regressed" seekrandom 3-4% until the A/B
+# was rebuilt with these settings, where the delta collapsed to zero). One
+# codegen unit removes the layout lottery; thin LTO restores the cross-unit
+# inlining a single unit would otherwise lose.
+[profile.release]
+lto = "thin"
+codegen-units = 1
+
+[profile.bench]
+lto = "thin"
+codegen-units = 1
