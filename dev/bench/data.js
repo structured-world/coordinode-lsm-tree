@@ -1,5 +1,5 @@
 window.BENCHMARK_DATA = {
-  "lastUpdate": 1788222920490,
+  "lastUpdate": 1788233758305,
   "repoUrl": "https://github.com/structured-world/coordinode-lsm-tree",
   "entries": {
     "lsm-tree db_bench": [
@@ -20826,6 +20826,84 @@ window.BENCHMARK_DATA = {
             "value": 723705.2446383538,
             "unit": "ops/sec",
             "extra": "P50: 1.2us | P99: 4.4us | P99.9: 6.9us\nthreads: 1 | elapsed: 0.28s | num: 200000 | iterations: 3"
+          }
+        ]
+      },
+      {
+        "commit": {
+          "author": {
+            "email": "mail@polaz.com",
+            "name": "Dmitry Prudnikov",
+            "username": "polaz"
+          },
+          "committer": {
+            "email": "noreply@github.com",
+            "name": "GitHub",
+            "username": "web-flow"
+          },
+          "distinct": true,
+          "id": "bcd18656cd7d7ac7ddc5bb870110da3654cf927a",
+          "message": "perf: close the hot-path audit (ECC clean read, zero-copy columns, deterministic codegen) (#602)\n\nClosing sweep of the hot-path audit: the remaining benched operations\nwere walked, the live findings fixed and measured, every `saturating_*`\nand clone site in the crate reviewed, and the dashboard's post-#601 dip\nbisected to its actual cause.\n\n## A clean ECC-protected block read copied its whole frame\n\nEvery ECC-protected block read went through the streaming verify helper\nwith a cursor over bytes ALREADY resident in the read buffer: the\npayload was copied into a fresh allocation and the parity trailer into a\nsecond one, on a path where the checksum matches almost always and the\nparity is never needed. A resident-frame verifier now checks the payload\nin place and never touches the parity bytes. The clean payload is then\ndetached into its own exact-size allocation rather than served as a view\nof the frame: a view would keep header + payload + parity alive for as\nlong as the block sits in the block cache, whose weight charges only\nheader + payload, letting the resident set overshoot capacity by the\nparity ratio (12.5% SEC-DED, 50% RS(4,2)). One payload copy per disk\nread buys exact cache accounting; the encrypted path already detached\nthrough its owned buffer. Recovery and failure semantics are unchanged\nand covered on the resident path by new `from_file` tests (SEC-DED heal,\ndouble-bit fail-closed, RS over-corrupt fail-closed); the streaming\ncallers keep the old helper.\n\nNew `ecc/clean_read` bench arm (secded + rs_4_2 at 4/16/64 KiB, with\nper-read P50/P99/P999). Best-of-3 interleaved A/B against main under a\nmatched codegen profile: secded 540 -> 373 ns (4 KiB) and 8.64 -> 4.71\nus (64 KiB), rs_4_2 1.67 -> 1.46 us (16 KiB) and 8.74 -> 5.34 us (64\nKiB); rs_4_2/4 KiB neutral.\n\n## Plain columns were copied out of every block\n\n`ColumnBatch::decode` copied every projected column (the Plain arm was a\n`to_vec`), and the dedup scan allocated a fresh Vec per finished key\nrun. `Column.data` is now a `Slice`: a Plain column is a refcounted view\nof the decoded block, Delta stays owned; the two seqno-globalizing\npasses rebuild their column into an owned buffer instead of patching in\nplace (bulk-ingested segments only); the dedup scan reuses one last-key\nbuffer. Retention is bounded: a view keeps the whole block alive, so\nwhen the served Plain views cover less than half the block (a key-only\nprojection over value-heavy rows) they are detached into exact-size\ncopies instead (`MAX_VIEW_AMPLIFICATION = 2`); full decodes and wide\nprojections stay zero-copy, and a test pins both outcomes by pointer\ncontainment. Interleaved A/B with matched codegen profiles:\npoint_lookup/columnar 2.44 -> 2.24 us (-8%, 3/3), full_scan/columnar -1\nto -3%, row arms unchanged.\n\nSource-level change for `columnar`-feature consumers: `Column.data` is a\n`Slice` (was `Vec<u8>`) and `ColumnBatch::decode` / `decode_projected`\ntake `&Slice` (was `&[u8]`); a `Vec<u8>` converts with `.into()`, as the\nmodule examples show. The changelog entry comes from the conventional\ncommit through the release automation, and versioning follows this\nfork's manual policy (semver checks are deliberately off), so no version\nbump rides in this PR.\n\n## Compaction skips the parallel pipeline for an identity transform\n\nSame gate the flush writers already apply (codec, encryption or page\nECC): a plain level no longer pays the pipeline's owned buffer, queue\nhop and pool churn per block for a no-op transform.\n\n## Masking arithmetic\n\nEvery `saturating_*` site was walked. Each remaining one sits on\nuntrusted on-disk input or is a documented clamp-by-contract (quotas,\nrecovery diagnostics). Three real maskings were removed: the range-stats\nestimators narrowed provably-bounded u128 quotients with\n`unwrap_or(u64::MAX)` (now plain casts with the bound stated), and\n`restrict_bound::serialize` clamped an over-long bound's length while\nwriting the full payload, a self-inconsistent frame (now fails loudly at\nthe cause; `write()` already rejects the case upstream).\n\n## The dashboard dip after #601 was codegen layout, not the engine\n\nreadseq / prefixscan / seekrandom stepped down 2-4% at the #601 merge\nwhile the write benches rose. Reproduced locally (seekrandom -4%, 3/3)\nand bisected: the culprit commit was a flush-side change gated off for\nthe uncompressed workload, i.e. unreachable. Rebuilding both bisect ends\nwith `codegen-units = 1` and thin LTO collapsed the delta to zero: the\ndefault 16-unit partitioning reshuffles function placement on any code\nchange. The crate's bench profile and both standalone bench harnesses\nnow pin `lto = \"thin\"`, `codegen-units = 1`, so the trend measures the\nengine rather than the linker; as a side effect the engine runs 3-13%\nfaster under the pinned profile on the columnar bench. The crate's\nrelease profile stays at the defaults: it is what `cross test -r` builds\nfor the foreign-target jobs, and the pin more than doubled that build\npast the job's time budget for binaries nothing measures.\n\n## Walked clean, no change needed\n\n`BlockTransform` dispatch, `decompress_payload` (None passthrough, lz4\nstraight into the target slice), the zstd dictionary path, bloom probe,\nblock-cache `get_block`, the compaction `Scanner`, `Merger`,\n`multi_get`, tight_space and partial-decode paths.\n\n## Verification\n\n`cargo nextest run --all-features` green (3241), clippy clean on\n`--all-features --all-targets`, `cargo doc` zero warnings, `cargo fmt`\nclean.\n\nCloses #600.",
+          "timestamp": "2026-09-01T06:34:20+03:00",
+          "tree_id": "29907f3db93d1b5a84508c9cce5515206ac6dbda",
+          "url": "https://github.com/structured-world/coordinode-lsm-tree/commit/bcd18656cd7d7ac7ddc5bb870110da3654cf927a"
+        },
+        "date": 1788233756996,
+        "tool": "customBiggerIsBetter",
+        "benches": [
+          {
+            "name": "fillseq",
+            "value": 2096140.8192433105,
+            "unit": "ops/sec",
+            "extra": "P50: 0.4us | P99: 1.6us | P99.9: 3.7us\nthreads: 1 | elapsed: 0.10s | num: 200000 | iterations: 3"
+          },
+          {
+            "name": "fillrandom",
+            "value": 1243400.9602536936,
+            "unit": "ops/sec",
+            "extra": "P50: 0.7us | P99: 2.1us | P99.9: 4.2us\nthreads: 1 | elapsed: 0.16s | num: 200000 | iterations: 3"
+          },
+          {
+            "name": "readrandom",
+            "value": 919349.1616544632,
+            "unit": "ops/sec",
+            "extra": "P50: 0.9us | P99: 4.0us | P99.9: 6.6us\nthreads: 1 | elapsed: 0.22s | num: 200000 | iterations: 3"
+          },
+          {
+            "name": "readseq",
+            "value": 3811375.7025294444,
+            "unit": "ops/sec",
+            "extra": "P50: 0.1us | P99: 3.0us | P99.9: 5.5us\nthreads: 1 | elapsed: 0.05s | num: 200000 | iterations: 3"
+          },
+          {
+            "name": "seekrandom",
+            "value": 498914.4083969111,
+            "unit": "ops/sec",
+            "extra": "P50: 1.7us | P99: 5.1us | P99.9: 8.4us\nthreads: 1 | elapsed: 0.40s | num: 200000 | iterations: 3"
+          },
+          {
+            "name": "prefixscan",
+            "value": 252988.67283189605,
+            "unit": "ops/sec",
+            "extra": "P50: 3.7us | P99: 4.7us | P99.9: 7.9us\nthreads: 1 | elapsed: 0.79s | num: 200000 | iterations: 3"
+          },
+          {
+            "name": "overwrite",
+            "value": 1274056.3578957322,
+            "unit": "ops/sec",
+            "extra": "P50: 0.7us | P99: 2.1us | P99.9: 4.2us\nthreads: 1 | elapsed: 0.16s | num: 200000 | iterations: 3"
+          },
+          {
+            "name": "mergerandom",
+            "value": 1137587.9977640708,
+            "unit": "ops/sec",
+            "extra": "P50: 0.3us | P99: 1.4us | P99.9: 2.4us\nthreads: 1 | elapsed: 0.18s | num: 200000 | iterations: 3"
+          },
+          {
+            "name": "readwhilewriting",
+            "value": 771474.7161968247,
+            "unit": "ops/sec",
+            "extra": "P50: 1.1us | P99: 4.2us | P99.9: 6.8us\nthreads: 1 | elapsed: 0.26s | num: 200000 | iterations: 3"
           }
         ]
       }
