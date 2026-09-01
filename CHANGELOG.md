@@ -11,6 +11,12 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 
 ## [Unreleased]
 
+## [5.8.3](https://github.com/structured-world/coordinode-lsm-tree/compare/v5.8.2...v5.8.3) - 2026-09-01
+
+### Performance
+
+- bench harness wall-clock fix and write hot-path audit ([#606](https://github.com/structured-world/coordinode-lsm-tree/pull/606))
+
 ## [5.8.2](https://github.com/structured-world/coordinode-lsm-tree/compare/v5.8.1...v5.8.2) - 2026-09-01
 
 ### Performance
