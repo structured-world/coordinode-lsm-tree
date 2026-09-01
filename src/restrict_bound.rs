@@ -80,9 +80,15 @@ fn sidecar_tmp_path(table_path: &Path) -> PathBuf {
 /// header + bound (the checksum detects accidental corruption; an encrypted
 /// payload is additionally AEAD-authenticated by the provider).
 fn serialize(table_id: u64, bound: &[u8]) -> Vec<u8> {
-    // `bound` is a user key; its length is bounded by the same limits the writer
-    // enforces on stored keys, well within u32.
-    let bound_len = u32::try_from(bound.len()).unwrap_or(u32::MAX);
+    // `bound` is a user key; its length is bounded by the same limits the
+    // writer enforces on stored keys (u16::MAX), well within u32. Fail loudly
+    // here rather than fall back to a length that lies about the payload —
+    // a clamped length would serialize a self-inconsistent frame.
+    #[expect(
+        clippy::expect_used,
+        reason = "user keys are length-capped at u16::MAX by the writer"
+    )]
+    let bound_len = u32::try_from(bound.len()).expect("restriction bound length exceeds u32");
     let mut out = Vec::with_capacity(HEADER_LEN + bound.len() + CHECKSUM_LEN);
     out.extend_from_slice(&table_id.to_le_bytes());
     out.extend_from_slice(&bound_len.to_le_bytes());
