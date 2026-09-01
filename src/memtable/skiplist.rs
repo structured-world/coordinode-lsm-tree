@@ -24,7 +24,7 @@ use crate::{UserKey, ValueType};
 
 use core::cmp::Ordering as CmpOrdering;
 use core::ops::{Bound, RangeBounds};
-use core::sync::atomic::{AtomicUsize, Ordering};
+use core::sync::atomic::{AtomicU32, AtomicUsize, Ordering};
 use portable_atomic::AtomicU64;
 
 // ---------------------------------------------------------------------------
@@ -136,6 +136,14 @@ pub struct SkipMap {
     len: AtomicUsize,
     /// PRNG counter for height generation (splitmix64-based).
     rng_state: AtomicU64,
+    /// The most recently appended TAIL node (`UNSET` until one exists), a
+    /// hint for the sequential-insert fast path in
+    /// [`Self::insert_with_kv_digest`]. Purely advisory: the fast path
+    /// re-validates it and the level-0 CAS is what makes the link correct,
+    /// so a stale hint costs one comparison and falls back to the full
+    /// splice search. Nodes are never freed while the map lives, so the
+    /// offset stays dereferenceable.
+    tail_hint: AtomicU32,
 }
 
 impl SkipMap {
@@ -196,6 +204,7 @@ impl SkipMap {
             height: AtomicUsize::new(1),
             len: AtomicUsize::new(0),
             rng_state: AtomicU64::new(seed),
+            tail_hint: AtomicU32::new(UNSET),
         }
     }
 
@@ -207,7 +216,7 @@ impl SkipMap {
     ///
     /// Multiple entries with the same `user_key` but different `seqno` are
     /// expected (MVCC).  No deduplication is performed.
-    pub fn insert(&self, key: &InternalKey, value: &UserValue) {
+    pub fn insert(&self, key: &InternalKey, value: UserValue) {
         self.insert_with_kv_digest(key, value, None);
     }
 
@@ -228,7 +237,7 @@ impl SkipMap {
     pub fn insert_with_kv_digest(
         &self,
         key: &InternalKey,
-        value: &UserValue,
+        value: UserValue,
         kv_digest: Option<(u32, ChecksumAlgorithm)>,
     ) {
         let height = self.random_height();
@@ -251,7 +260,27 @@ impl SkipMap {
         // Find predecessors and link the node at each level.
         let mut preds = [self.head; MAX_HEIGHT];
         let mut succs = [UNSET; MAX_HEIGHT];
-        self.find_splice(key, &mut preds, &mut succs);
+
+        // Sequential-insert fast path. A height-1 node links at level 0 only,
+        // and a key that sorts after the current tail (the hinted node has no
+        // successor and compares Less) belongs right behind it: `preds[0]` is
+        // the hint, `succs[0]` is UNSET, and the full top-down splice search
+        // (about one node walk per level from the head) is skipped. Both
+        // facts are re-checked here and the level-0 CAS below still guards
+        // against a concurrent append: if another writer took the tail slot
+        // first, the CAS fails and the regular per-level re-search runs.
+        // Taller nodes need predecessors on every level and take the full
+        // search; they are one insert in four.
+        let hint = self.tail_hint.load(Ordering::Relaxed);
+        let appended_at_tail = height == 1
+            && hint != UNSET
+            && self.next_at(hint, 0) == UNSET
+            && self.compare_key(hint, key) == CmpOrdering::Less;
+        if appended_at_tail {
+            preds[0] = hint;
+        } else {
+            self.find_splice(key, &mut preds, &mut succs);
+        }
 
         for level in 0..height {
             loop {
@@ -282,6 +311,13 @@ impl SkipMap {
                     }
                 }
             }
+        }
+
+        // `succs[0]` is the level-0 successor the node was actually linked
+        // before (the CAS loop refreshes it on a re-search), so UNSET means
+        // this node is the new tail: publish it as the next append's hint.
+        if succs[0] == UNSET {
+            self.tail_hint.store(node, Ordering::Relaxed);
         }
 
         self.len.fetch_add(1, Ordering::Relaxed);
@@ -446,7 +482,7 @@ impl SkipMap {
     fn alloc_node(
         &self,
         key: &InternalKey,
-        value: &UserValue,
+        value: UserValue,
         height: usize,
         kv_digest: Option<(u32, ChecksumAlgorithm)>,
     ) -> u32 {

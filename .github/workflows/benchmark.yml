@@ -63,15 +63,16 @@ jobs:
     # self-hosted runners (if added later) without the label
     # won't pick the job up.
     runs-on: [self-hosted, gpu-private-systems]
-    # The db_bench pass is seconds and the compare-rocksdb criterion matrix
-    # is a few minutes (half-second window per scenario). The dominant cost is
-    # the first-run / cold-cache librocksdb-sys C++ compile (RocksDB built from
-    # source via bindgen): on a cold rust-cache that alone is 15-25 min, so a
-    # 30 min cap was too tight and the job was cancelled mid-compile, producing
-    # no dashboard at all. 60 min leaves headroom for a cold RocksDB build plus
-    # both bench passes while still catching a genuinely runaway run. A warm
-    # cache finishes in a few minutes well under this.
-    timeout-minutes: 60
+    # The db_bench pass is a couple of minutes. The compare-rocksdb criterion
+    # matrix runs ~40 min on a warm cache: the bulk is RocksDB's cold zstd-22
+    # writes (write_throughput_zstd22 / overwrite_zstd22 at 70k rows cost
+    # ~30-60 s per iteration on that engine, times the 10-sample floor), the
+    # rest of the matrix is minutes. On a cold rust-cache the librocksdb-sys
+    # C++ compile (RocksDB built from source via bindgen) adds 15-25 min on
+    # top, so the cap leaves room for a cold build plus the full matrix while
+    # still catching a runaway run (a group-level sample_size override in the
+    # harness once pushed the matrix past an hour by itself).
+    timeout-minutes: 90
     steps:
       # v6 requires runner ≥2.327.1 (node24 runtime) — the self-hosted
       # runner has a current runner agent that satisfies this.

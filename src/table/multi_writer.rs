@@ -849,7 +849,15 @@ impl MultiWriter {
 
     /// Writes an item
     pub fn write(&mut self, item: InternalValue) -> crate::Result<()> {
-        let is_next_key = self.current_key.as_ref() < Some(&item.key.user_key);
+        // A new user key is a change of byte IDENTITY, never of byte order:
+        // the stream arrives in comparator order, and a comparator whose order
+        // is not the byte order (reversed, numeric) makes `<` false for keys
+        // that are new, which silently disabled rotation. Same-key versions
+        // stay in one output because identity does not change between them.
+        let is_next_key = !self
+            .current_key
+            .as_ref()
+            .is_some_and(|c| crate::comparator::same_user_key(c, &item.key.user_key));
 
         if is_next_key {
             self.current_key = Some(item.key.user_key.clone());

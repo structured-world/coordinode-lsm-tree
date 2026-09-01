@@ -166,7 +166,7 @@ pub fn do_compaction(opts: &Options) -> crate::Result<CompactionResult> {
     let runtime_config = opts.runtime_config.load_full();
     let choice = super::choose_with_density_rewrite(
         &*opts.strategy,
-        &version_history_lock.latest_version().version,
+        &version_history_lock.latest_version_ref().version,
         &opts.config,
         &runtime_config,
         &compaction_state,
@@ -224,7 +224,7 @@ pub fn do_compaction(opts: &Options) -> crate::Result<CompactionResult> {
             // invariant (table path = f(level)).
             if opts.config.level_routes.is_some() {
                 let (dst_folder, _) = opts.config.tables_folder_for_level(payload.dest_level);
-                let version = &version_history_lock.latest_version().version;
+                let version = &version_history_lock.latest_version_ref().version;
                 // Check actual on-disk table paths (not configured routing) to
                 // handle tables that may have been recovered from a different
                 // tier after route reconfiguration.

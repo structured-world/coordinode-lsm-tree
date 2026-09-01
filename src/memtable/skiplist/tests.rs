@@ -38,7 +38,7 @@ fn verify_kv_digests_passes_when_uncorrupted() {
     for i in 0..8u8 {
         let key = make_key(&[b'k', i], u64::from(i) + 1);
         let val = make_value(&[b'v', i, i, i]);
-        map.insert_with_kv_digest(&key, &val, Some((digest4(&key, &val, algo), algo)));
+        map.insert_with_kv_digest(&key, val.clone(), Some((digest4(&key, &val, algo), algo)));
     }
     assert!(map.verify_kv_digests().is_ok());
 }
@@ -54,7 +54,7 @@ fn verify_kv_digests_detects_residence_corruption() {
     let map = new_map();
     let key = make_key(b"victim", 42);
     let val = make_value(b"payload");
-    map.insert_with_kv_digest(&key, &val, Some((digest4(&key, &val, algo), algo)));
+    map.insert_with_kv_digest(&key, val.clone(), Some((digest4(&key, &val, algo), algo)));
 
     // Flip a bit in the (only) node's user-key bytes, simulating residence
     // corruption.
@@ -80,12 +80,12 @@ fn verify_kv_digests_skips_nodes_without_a_digest() {
     // No-digest node (pre-toggle): corrupt it later; must be skipped.
     let k0 = make_key(b"aaa", 1);
     let v0 = make_value(b"no-digest");
-    map.insert_with_kv_digest(&k0, &v0, None);
+    map.insert_with_kv_digest(&k0, v0, None);
 
     // Digest-bearing node (post-toggle): left intact.
     let k1 = make_key(b"bbb", 2);
     let v1 = make_value(b"has-digest");
-    map.insert_with_kv_digest(&k1, &v1, Some((digest4(&k1, &v1, algo), algo)));
+    map.insert_with_kv_digest(&k1, v1.clone(), Some((digest4(&k1, &v1, algo), algo)));
 
     // Corrupt the FIRST node's key (the no-digest "aaa" entry sorts first).
     map.test_flip_first_key_byte();
@@ -103,7 +103,7 @@ fn verify_kv_digests_no_digests_is_ok() {
     let map = new_map();
     for i in 0..4u8 {
         let key = make_key(&[b'x', i], u64::from(i) + 1);
-        map.insert(&key, &make_value(b"plain"));
+        map.insert(&key, make_value(b"plain"));
     }
     assert!(map.verify_kv_digests().is_ok());
 }
@@ -124,7 +124,7 @@ fn verify_kv_digests_rejects_non_4_byte_algorithm_tag() {
     #[expect(clippy::cast_possible_truncation, reason = "low 32 bits on purpose")]
     let d64 = crate::table::block::kv_checksum::kv_digest(&item, ChecksumAlgorithm::Xxh3_64)
         .expect("xxh3 always available") as u32;
-    map.insert_with_kv_digest(&key, &val, Some((d64, ChecksumAlgorithm::Xxh3_64)));
+    map.insert_with_kv_digest(&key, val, Some((d64, ChecksumAlgorithm::Xxh3_64)));
 
     assert!(
         map.verify_kv_digests().is_err(),
@@ -142,7 +142,7 @@ fn verify_kv_digests_fails_closed_on_corrupt_value_type() {
     let map = new_map();
     let key = make_key(b"k", 1);
     let val = make_value(b"v");
-    map.insert_with_kv_digest(&key, &val, Some((digest4(&key, &val, algo), algo)));
+    map.insert_with_kv_digest(&key, val.clone(), Some((digest4(&key, &val, algo), algo)));
 
     map.test_corrupt_first_node_value_type();
 
@@ -157,7 +157,7 @@ fn insert_and_get_single() {
     let map = new_map();
     let key = make_key(b"hello", 1);
     let val = make_value(b"world");
-    map.insert(&key, &val);
+    map.insert(&key, val);
 
     assert_eq!(map.len(), 1);
     assert!(!map.is_empty());
@@ -197,9 +197,9 @@ fn custom_comparator_orders_and_reverse_iterates() {
         "a custom comparator must take the trait-dispatch path"
     );
 
-    map.insert(&make_key(b"aaa", 1), &make_value(b"a"));
-    map.insert(&make_key(b"ccc", 1), &make_value(b"c"));
-    map.insert(&make_key(b"bbb", 1), &make_value(b"b"));
+    map.insert(&make_key(b"aaa", 1), make_value(b"a"));
+    map.insert(&make_key(b"ccc", 1), make_value(b"c"));
+    map.insert(&make_key(b"bbb", 1), make_value(b"b"));
 
     // Forward iteration follows the custom (reverse) order.
     let fwd: Vec<Vec<u8>> = map.iter().map(|e| e.key().user_key.to_vec()).collect();
@@ -227,16 +227,16 @@ fn ordering_user_key_asc_seqno_desc() {
     let map = new_map();
 
     // Same user_key, different seqnos → should iterate highest seqno first.
-    map.insert(&make_key(b"abc", 1), &make_value(b"v1"));
-    map.insert(&make_key(b"abc", 3), &make_value(b"v3"));
-    map.insert(&make_key(b"abc", 2), &make_value(b"v2"));
+    map.insert(&make_key(b"abc", 1), make_value(b"v1"));
+    map.insert(&make_key(b"abc", 3), make_value(b"v3"));
+    map.insert(&make_key(b"abc", 2), make_value(b"v2"));
 
     let seqnos: Vec<SeqNo> = map.iter().map(|e| e.key().seqno).collect();
     assert_eq!(seqnos, vec![3, 2, 1]);
 
     // Different user_keys → ascending.
-    map.insert(&make_key(b"zzz", 10), &make_value(b"z"));
-    map.insert(&make_key(b"aaa", 10), &make_value(b"a"));
+    map.insert(&make_key(b"zzz", 10), make_value(b"z"));
+    map.insert(&make_key(b"aaa", 10), make_value(b"a"));
 
     let keys: Vec<Vec<u8>> = map.iter().map(|e| e.key().user_key.to_vec()).collect();
     assert_eq!(
@@ -256,7 +256,7 @@ fn range_lower_bound() {
     let map = new_map();
     for i in 0u8..10 {
         let key = vec![b'a' + i];
-        map.insert(&make_key(&key, 0), &make_value(&[i]));
+        map.insert(&make_key(&key, 0), make_value(&[i]));
     }
 
     // Range from 'e' onwards → e, f, g, h, i, j
@@ -270,7 +270,7 @@ fn range_bounded() {
     let map = new_map();
     for i in 0u8..10 {
         let key = vec![b'a' + i];
-        map.insert(&make_key(&key, 0), &make_value(&[i]));
+        map.insert(&make_key(&key, 0), make_value(&[i]));
     }
 
     let lo = make_key(b"c", crate::MAX_SEQNO);
@@ -284,7 +284,7 @@ fn double_ended_iter() {
     let map = new_map();
     for i in 0u8..5 {
         let key = vec![b'a' + i];
-        map.insert(&make_key(&key, 0), &make_value(&[i]));
+        map.insert(&make_key(&key, 0), make_value(&[i]));
     }
 
     let mut iter = map.iter();
@@ -302,7 +302,7 @@ fn double_ended_range() {
     let map = new_map();
     for i in 0u8..10 {
         let key = vec![b'a' + i];
-        map.insert(&make_key(&key, 0), &make_value(&[i]));
+        map.insert(&make_key(&key, 0), make_value(&[i]));
     }
 
     let lo = make_key(b"c", crate::MAX_SEQNO);
@@ -318,7 +318,7 @@ fn double_ended_range() {
 #[test]
 fn empty_value() {
     let map = new_map();
-    map.insert(&make_key(b"k", 0), &make_value(b""));
+    map.insert(&make_key(b"k", 0), make_value(b""));
     let entry = map.iter().next().unwrap();
     assert!(entry.value().is_empty());
 }
@@ -337,7 +337,7 @@ fn concurrent_inserts() {
             std::thread::spawn(move || {
                 for i in 0..n_per_thread {
                     let key = format!("t{t:02}_k{i:05}");
-                    map.insert(&make_key(key.as_bytes(), i as u64), &make_value(b"v"));
+                    map.insert(&make_key(key.as_bytes(), i as u64), make_value(b"v"));
                 }
             })
         })
@@ -363,9 +363,9 @@ fn mvcc_point_lookup_via_range() {
     let map = new_map();
 
     // Insert 3 versions of "key" at seqnos 1, 2, 3.
-    map.insert(&make_key(b"key", 1), &make_value(b"v1"));
-    map.insert(&make_key(b"key", 2), &make_value(b"v2"));
-    map.insert(&make_key(b"key", 3), &make_value(b"v3"));
+    map.insert(&make_key(b"key", 1), make_value(b"v1"));
+    map.insert(&make_key(b"key", 2), make_value(b"v2"));
+    map.insert(&make_key(b"key", 3), make_value(b"v3"));
 
     // Memtable MVCC read at read_seqno=3 (visible: seqno <= 2).
     // The memtable uses lower_bound = InternalKey("key", read_seqno - 1).
@@ -423,7 +423,7 @@ fn empty_range_next_back() {
 fn range_excluded_end_next_back() {
     let map = new_map();
     for i in 0u8..5 {
-        map.insert(&make_key(&[b'a' + i], 0), &make_value(&[i]));
+        map.insert(&make_key(&[b'a' + i], 0), make_value(&[i]));
     }
 
     // Excluded end "d" → range is [a, d) = a, b, c
@@ -440,7 +440,7 @@ fn range_excluded_end_next_back() {
 #[test]
 fn seek_le_all_greater_returns_none() {
     let map = new_map();
-    map.insert(&make_key(b"m", 0), &make_value(b"v"));
+    map.insert(&make_key(b"m", 0), make_value(b"v"));
 
     // All keys > "a", so seek_le("a") returns UNSET → next_back = None
     let hi = make_key(b"a", 0);
@@ -451,7 +451,7 @@ fn seek_le_all_greater_returns_none() {
 #[test]
 fn next_back_on_first_element() {
     let map = new_map();
-    map.insert(&make_key(b"only", 0), &make_value(b"v"));
+    map.insert(&make_key(b"only", 0), make_value(b"v"));
 
     let mut iter = map.iter();
     // next_back on single-element list
@@ -484,7 +484,7 @@ fn concurrent_insert_and_iter_no_sigbus() {
                 barrier.wait();
                 for i in 0..500 {
                     let key = format!("t{t:02}_k{i:04}");
-                    map.insert(&make_key(key.as_bytes(), i as u64), &make_value(b"val"));
+                    map.insert(&make_key(key.as_bytes(), i as u64), make_value(b"val"));
                 }
             })
         })
@@ -531,7 +531,7 @@ fn concurrent_insert_and_iter_no_sigbus() {
 fn key_view_after_map_drop_remains_valid() {
     let long_key = vec![0xA5u8; 64];
     let map = new_map();
-    map.insert(&make_key(&long_key, 1), &make_value(b"payload"));
+    map.insert(&make_key(&long_key, 1), make_value(b"payload"));
 
     #[expect(
         clippy::expect_used,
@@ -543,8 +543,57 @@ fn key_view_after_map_drop_remains_valid() {
     // Recycle allocator pages with a fresh map full of different bytes.
     let other = new_map();
     for i in 0..100u64 {
-        other.insert(&make_key(&[0x5Au8; 64], i), &make_value(&[0xFFu8; 128]));
+        other.insert(&make_key(&[0x5Au8; 64], i), make_value(&[0xFFu8; 128]));
     }
 
     assert_eq!(&*key.user_key, long_key.as_slice());
+}
+
+/// The sequential-insert fast path (tail hint) must never change WHERE a
+/// node lands: appends take it, everything else (a key below the tail, a
+/// newer version of the tail's own key, which sorts BEFORE the older one)
+/// must fall back to the full splice search. Interleaves all three and
+/// checks the final order is the exact internal-key order with nothing
+/// lost.
+#[test]
+fn tail_hint_keeps_internal_key_order_under_mixed_inserts() {
+    let map = new_map();
+    let mut expected: Vec<(Vec<u8>, SeqNo)> = Vec::new();
+
+    for i in 0..2_000u64 {
+        // Append: strictly increasing key (the hint path for height-1 nodes).
+        let key = format!("k{i:06}").into_bytes();
+        map.insert(&make_key(&key, 1), make_value(b"v"));
+        expected.push((key.clone(), 1));
+
+        if i % 7 == 3 {
+            // Newer version of the tail key: same user key, higher seqno.
+            // Sorts BEFORE the version just appended, so it is NOT a tail append.
+            map.insert(&make_key(&key, 2), make_value(b"v2"));
+            expected.push((key.clone(), 2));
+        }
+        if i % 11 == 5 {
+            // A key below the current tail (out of order): full search path.
+            let below = format!("k{:06}", i / 2).into_bytes();
+            map.insert(&make_key(&below, 3), make_value(b"v3"));
+            expected.push((below, 3));
+        }
+    }
+
+    // Internal-key order: user key ascending, seqno DESCENDING within a key.
+    expected.sort_by(|a, b| a.0.cmp(&b.0).then_with(|| b.1.cmp(&a.1)));
+
+    let got: Vec<(Vec<u8>, SeqNo)> = map
+        .iter()
+        .map(|e| {
+            let k = e.key();
+            (k.user_key.to_vec(), k.seqno)
+        })
+        .collect();
+    assert_eq!(got.len(), expected.len(), "an insert was lost");
+    assert_eq!(
+        got, expected,
+        "iteration order must be the internal-key order"
+    );
+    assert_eq!(map.len(), expected.len());
 }

@@ -10,11 +10,16 @@ pub fn prefill_sequential(
 ) -> lsm_tree::Result<()> {
     let batch_size = 10_000u64;
 
+    // One key buffer and one value for the whole prefill: the engine copies
+    // the bytes it keeps, so a fresh `Vec` per op would only add two heap
+    // round-trips of harness overhead to every insert.
+    let mut key = vec![0u8; config.key_size];
+    let value = make_value(config.value_size);
+
     for i in 0..config.num {
-        let key = make_sequential_key(i, config.key_size);
-        let value = make_value(config.value_size);
+        fill_sequential_key(&mut key, i);
         let seq = seqno.fetch_add(1, Ordering::Relaxed);
-        tree.insert(key, value, seq);
+        tree.insert(&key[..], &value[..], seq);
 
         // Flush every batch_size ops to build SSTs on disk.
         if (i + 1) % batch_size == 0 {
@@ -166,6 +171,14 @@ pub fn make_random_key(key_size: usize) -> Vec<u8> {
     let mut key = vec![0u8; key_size];
     rand::rng().fill(&mut key[..]);
     key
+}
+
+/// Fill an existing buffer with random key bytes (zero-alloc variant of
+/// [`make_random_key`]).
+#[inline]
+pub fn fill_random_key(buf: &mut [u8]) {
+    use rand::Rng;
+    rand::rng().fill(buf);
 }
 
 /// Create a deterministic value of the given size.

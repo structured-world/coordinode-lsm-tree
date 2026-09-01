@@ -1,5 +1,5 @@
 use crate::config::BenchConfig;
-use crate::db::make_sequential_key;
+use crate::db::{fill_sequential_key, make_sequential_key};
 use crate::reporter::Reporter;
 use crate::workloads::{Workload, run_threaded};
 use lsm_tree::{
@@ -93,16 +93,19 @@ impl Workload for MergeRandom {
         // the same key distribution as single-threaded (key = global_index % hot_keys).
         run_threaded(config, reporter, |_t, my_ops, start| {
             let mut local = Reporter::new();
+            // One key buffer per thread: the engine copies what it keeps, so
+            // a per-op `Vec` would only add harness overhead.
+            let mut key = vec![0u8; config.key_size];
+            // Each operand adds 1 to the counter for this key.
+            let operand = 1_i64.to_le_bytes();
 
             for i in start..(start + my_ops) {
                 let key_idx = i % hot_keys;
-                let key = make_sequential_key(key_idx, config.key_size);
-                // Each operand adds 1 to the counter for this key.
-                let operand = 1_i64.to_le_bytes();
+                fill_sequential_key(&mut key, key_idx);
                 let seq = seqno.fetch_add(1, Ordering::Relaxed);
 
                 let t = Instant::now();
-                tree.merge(key, operand.as_slice(), seq);
+                tree.merge(&key[..], operand.as_slice(), seq);
                 local.record_duration(t.elapsed());
 
                 if (i + 1) % flush_interval == 0 {

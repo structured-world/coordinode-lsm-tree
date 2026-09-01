@@ -31,6 +31,20 @@
 //! Linux CI uses the distro `libclang.so` which `bindgen` finds
 //! without env-var help.
 //!
+//! ## Criterion settings come from the command line
+//!
+//! Sample count, warm-up and measurement window are NOT set in code: the
+//! groups inherit whatever the Criterion CLI passes (the benchmark workflow
+//! runs `--sample-size 10 --warm-up-time 0.5 --measurement-time 0.5`). A
+//! group-level `sample_size(..)` silently overrides the CLI, and with the
+//! cold-write arms costing seconds per iteration (RocksDB at zstd-22 writes
+//! 10k rows in ~5 s) a 100-sample default turns a one-minute arm into ten.
+//!
+//! Warm read arms build their on-disk state ONCE per arm (see
+//! [`WarmEngine`]): Criterion re-enters a `bench_with_input` routine
+//! closure for the warm-up pass and for every sample, so anything built
+//! inside the closure is rebuilt once per sample.
+//!
 //! ## Engine matrix
 //!
 //! The shared workload closure is parameterised over an [`Engine`]
@@ -709,11 +723,6 @@ fn write_throughput_variant(c: &mut Criterion, group_name: &str, compression: Co
         Compression::Zstd22 => None,
     };
     for &n in &[1_000_u64, 10_000_u64, 70_000_u64] {
-        // The 70k working set exceeds the default 16 MiB block cache, so each
-        // pass is far slower (scattered miss + decode). Drop to the criterion
-        // sample-size floor there to keep the variant's wall-clock bounded while
-        // the reported median stays stable; smaller sets keep the default 100.
-        group.sample_size(if n >= 70_000 { 10 } else { 100 });
         // Precompute the keys + values ONCE per `n` (outside the
         // criterion warmup / measurement loop), so the timed body
         // does no per-iteration allocation.
@@ -838,48 +847,55 @@ fn point_read_variant(
 
     let mut group = c.benchmark_group(group_name);
     for &n in &[1_000_u64, 10_000_u64, 70_000_u64] {
-        // The 70k working set exceeds the default 16 MiB block cache, so each
-        // pass is far slower (scattered miss + decode). Drop to the criterion
-        // sample-size floor there to keep the variant's wall-clock bounded while
-        // the reported median stays stable; smaller sets keep the default 100.
-        group.sample_size(if n >= 70_000 { 10 } else { 100 });
         let inputs = WorkloadInputs::build(n);
         group.throughput(Throughput::Elements(n));
         for &(label, engine, strategy, row_cache) in &series {
+            // Built once per arm on the first closure entry (see `WarmEngine`):
+            // the criterion warm-up / measurement loop only ever pays for
+            // reads, never for open / write / flush.
+            let mut warm: Option<WarmEngine> = None;
             group.bench_with_input(BenchmarkId::new(label, n), &n, |b, _| {
-                // The temp dir + engine handle outlive every timed
-                // iteration: build the on-disk database once here so
-                // the criterion warmup / measurement loop only ever
-                // pays for reads, never for open / write / flush.
-                let dir = tempfile::tempdir().expect("tempdir");
-                match engine {
-                    Engine::Ours | Engine::BlobTree => {
-                        let tree = open_ours(
-                            dir.path(),
-                            compression,
-                            engine.kv_separated(),
-                            strategy,
-                            row_cache,
-                        )
-                        .expect("ours: open");
-                        for ((key, value), seqno) in
-                            inputs.keys.iter().zip(inputs.values.iter()).zip(0u64..)
-                        {
-                            tree.insert(key, value, seqno);
+                let warm = warm.get_or_insert_with(|| {
+                    let warm = WarmEngine::build(engine, compression, strategy, row_cache, &inputs);
+                    // One-time hit check OUTSIDE the timed window: enforce the
+                    // workload contract ("read every stored key") so a
+                    // setup/flush regression can't silently become a miss-read
+                    // benchmark, without taxing each timed `get` with a branch.
+                    // `MAX_SEQNO` (not `u64::MAX`, whose MSB is reserved) reads
+                    // the latest visible version.
+                    match &warm {
+                        WarmEngine::Ours { tree, .. } => {
+                            for key in &inputs.keys {
+                                assert!(
+                                    tree.get(key, MAX_SEQNO).expect("ours: verify").is_some(),
+                                    "ours: key unexpectedly missing"
+                                );
+                            }
                         }
-                        tree.flush_active_memtable(0).expect("ours: flush");
-                        // One-time hit check OUTSIDE the timed window: enforce
-                        // the workload contract ("read every stored key") so a
-                        // setup/flush regression can't silently become a
-                        // miss-read benchmark, without taxing each timed `get`
-                        // with a branch. `MAX_SEQNO` (not `u64::MAX`, whose MSB
-                        // is reserved) reads the latest visible version.
-                        for key in &inputs.keys {
-                            assert!(
-                                tree.get(key, MAX_SEQNO).expect("ours: verify").is_some(),
-                                "ours: key unexpectedly missing"
-                            );
+                        WarmEngine::RocksDb { db, .. } => {
+                            for key in &inputs.keys {
+                                assert!(
+                                    db.get(key).expect("rocksdb: verify").is_some(),
+                                    "rocksdb: key unexpectedly missing"
+                                );
+                            }
                         }
+                        WarmEngine::SurrealKv { tree, .. } => {
+                            let txn = tree.begin().expect("surrealkv: begin");
+                            for key in &inputs.keys {
+                                assert!(
+                                    txn.get(key.as_slice())
+                                        .expect("surrealkv: verify")
+                                        .is_some(),
+                                    "surrealkv: key unexpectedly missing"
+                                );
+                            }
+                        }
+                    }
+                    warm
+                });
+                match warm {
+                    WarmEngine::Ours { tree, .. } => {
                         b.iter_custom(|iters| {
                             let start = std::time::Instant::now();
                             for _ in 0..iters {
@@ -891,29 +907,7 @@ fn point_read_variant(
                             start.elapsed()
                         });
                     }
-                    Engine::RocksDb => {
-                        // Bloom (10 bits/key) + 16 MiB cache + no compression,
-                        // matching our engine's defaults so the per-`get`
-                        // overhead is attributable, not a config artefact —
-                        // see `rocksdb_options`.
-                        let opts =
-                            rocksdb_options(compression, strategy == IndexStrategy::HashIndex);
-                        let db = rocksdb::DB::open(&opts, dir.path()).expect("rocksdb: open");
-                        let mut write_opts = rocksdb::WriteOptions::default();
-                        write_opts.disable_wal(true);
-                        for (key, value) in inputs.keys.iter().zip(inputs.values.iter()) {
-                            db.put_opt(key, value, &write_opts).expect("rocksdb: put");
-                        }
-                        db.flush().expect("rocksdb: flush");
-                        // Same one-time, outside-the-timed-window hit check as
-                        // the `ours` arm: enforce "read every stored key"
-                        // without a per-read branch in the measured loop.
-                        for key in &inputs.keys {
-                            assert!(
-                                db.get(key).expect("rocksdb: verify").is_some(),
-                                "rocksdb: key unexpectedly missing"
-                            );
-                        }
+                    WarmEngine::RocksDb { db, .. } => {
                         b.iter_custom(|iters| {
                             let start = std::time::Instant::now();
                             for _ in 0..iters {
@@ -925,23 +919,13 @@ fn point_read_variant(
                             start.elapsed()
                         });
                     }
-                    Engine::SurrealKv => {
-                        // `rt` outlives `tree` (drops last) so its background
-                        // tasks keep running for the whole read phase.
-                        let (_rt, tree) = setup_surrealkv_warm(dir.path(), &inputs)
-                            .unwrap_or_else(|e| panic!("surrealkv: warm setup: {e}"));
-                        // One read snapshot, reused across all iterations — the
-                        // closest analogue of the other engines' direct warm
-                        // reads (a single consistent view, no per-get txn churn).
+                    WarmEngine::SurrealKv { tree, .. } => {
+                        // One read snapshot per closure entry, reused across its
+                        // iterations, the closest analogue of the other engines'
+                        // direct warm reads (a consistent view, no per-get txn
+                        // churn). `begin` is microseconds, so re-taking it on
+                        // each entry costs nothing measurable.
                         let txn = tree.begin().expect("surrealkv: begin");
-                        for key in &inputs.keys {
-                            assert!(
-                                txn.get(key.as_slice())
-                                    .expect("surrealkv: verify")
-                                    .is_some(),
-                                "surrealkv: key unexpectedly missing"
-                            );
-                        }
                         b.iter_custom(|iters| {
                             let start = std::time::Instant::now();
                             for _ in 0..iters {
@@ -968,10 +952,19 @@ fn point_read_variant(
 fn populate_rocksdb(
     dir: &std::path::Path,
     compression: Compression,
+    hash_index: bool,
     inputs: &WorkloadInputs,
 ) -> rocksdb::DB {
-    let opts = rocksdb_options(compression, false);
-    let db = rocksdb::DB::open(&opts, dir).expect("rocksdb: open");
+    let opts = rocksdb_options(compression, hash_index);
+    // Open through a column-family descriptor that carries the SAME options:
+    // the default CF is what every read hits, and the descriptor form is what
+    // makes `cf_handle(DEFAULT)` exist for `batched_multi_get_cf`. `DB::open_cf`
+    // is deliberately not used: it gives each named CF `Options::default()`, so
+    // the compression / bloom / cache configured above would silently not apply
+    // to the data.
+    let default_cf =
+        rocksdb::ColumnFamilyDescriptor::new(rocksdb::DEFAULT_COLUMN_FAMILY_NAME, opts.clone());
+    let db = rocksdb::DB::open_cf_descriptors(&opts, dir, [default_cf]).expect("rocksdb: open");
     let mut write_opts = rocksdb::WriteOptions::default();
     write_opts.disable_wal(true);
     for (key, value) in inputs.keys.iter().zip(inputs.values.iter()) {
@@ -983,20 +976,98 @@ fn populate_rocksdb(
 
 /// Populates our engine at `dir` and flushes, returning the warm handle.
 /// Companion to [`populate_rocksdb`] for the warm read groups. `kv_separated`
-/// selects the `blob_tree` (KV-separated) configuration.
+/// selects the `blob_tree` (KV-separated) configuration; `strategy` /
+/// `row_cache` select the `point_read` index-strategy series.
 fn populate_ours(
     dir: &std::path::Path,
     compression: Compression,
     inputs: &WorkloadInputs,
     kv_separated: bool,
+    strategy: IndexStrategy,
+    row_cache: bool,
 ) -> lsm_tree::AnyTree {
-    let tree = open_ours(dir, compression, kv_separated, IndexStrategy::Binary, false)
-        .expect("ours: open");
+    let tree = open_ours(dir, compression, kv_separated, strategy, row_cache).expect("ours: open");
     for ((key, value), seqno) in inputs.keys.iter().zip(inputs.values.iter()).zip(0u64..) {
         tree.insert(key, value, seqno);
     }
     tree.flush_active_memtable(0).expect("ours: flush");
     tree
+}
+
+/// Warm on-disk state for one read arm (`point_read`, `multi_get`,
+/// `range_scan`, `seek_random`): the populated + flushed engine and the
+/// directory holding it.
+///
+/// Criterion re-enters a `bench_with_input` routine closure for the warm-up
+/// pass and again for EVERY sample, so state built inside the closure is
+/// rebuilt once per sample (a RocksDB zstd-22 populate of 10k rows is ~5 s, so
+/// that alone was minutes per arm). Each arm keeps one `Option<WarmEngine>`
+/// outside its closure and fills it on the first entry, so the closure only
+/// ever times reads.
+///
+/// Field order is drop order: the engine closes before its directory is
+/// removed, and the SurrealKV runtime outlives the tree so the background
+/// tasks `build()` spawned stay alive for the whole read phase.
+enum WarmEngine {
+    Ours {
+        tree: lsm_tree::AnyTree,
+        _dir: tempfile::TempDir,
+    },
+    RocksDb {
+        db: rocksdb::DB,
+        _dir: tempfile::TempDir,
+    },
+    SurrealKv {
+        tree: SkvTree,
+        _rt: tokio::runtime::Runtime,
+        _dir: tempfile::TempDir,
+    },
+}
+
+impl WarmEngine {
+    /// Builds the warm state for `engine` with the matched per-engine
+    /// configuration (`compression` on both; `strategy` selects the data-block
+    /// hash index on both ours and RocksDB, ribbon / `row_cache` are ours-only).
+    fn build(
+        engine: Engine,
+        compression: Compression,
+        strategy: IndexStrategy,
+        row_cache: bool,
+        inputs: &WorkloadInputs,
+    ) -> Self {
+        let dir = tempfile::tempdir().expect("tempdir");
+        match engine {
+            Engine::Ours | Engine::BlobTree => {
+                let tree = populate_ours(
+                    dir.path(),
+                    compression,
+                    inputs,
+                    engine.kv_separated(),
+                    strategy,
+                    row_cache,
+                );
+                Self::Ours { tree, _dir: dir }
+            }
+            Engine::RocksDb => {
+                let db = populate_rocksdb(
+                    dir.path(),
+                    compression,
+                    strategy == IndexStrategy::HashIndex,
+                    inputs,
+                );
+                Self::RocksDb { db, _dir: dir }
+            }
+            Engine::SurrealKv => {
+                let (rt, tree) = setup_surrealkv_warm(dir.path(), inputs)
+                    .unwrap_or_else(|e| panic!("surrealkv: warm setup: {e}"));
+                Self::SurrealKv {
+                    tree,
+                    _rt: rt,
+                    _dir: dir,
+                }
+            }
+        }
+    }
 }
 
 /// Batched read head-to-head: one `multi_get` call resolves the whole key set,
@@ -1028,46 +1099,69 @@ fn multi_get_variant(c: &mut Criterion, group_name: &str, compression: Compressi
 
     let mut group = c.benchmark_group(group_name);
     for &n in &[1_000_u64, 10_000_u64, 70_000_u64] {
-        // The 70k working set exceeds the 16 MiB block cache (cold, scattered),
-        // so a single batched pass is far slower; drop to the criterion sample
-        // floor there to bound wall-clock while the median stays stable.
-        group.sample_size(if n >= 70_000 { 10 } else { 100 });
         let inputs = WorkloadInputs::build(n);
         group.throughput(Throughput::Elements(n));
         for &(label, engine) in &series {
+            // This measures WARM steady-state batched-MultiGet throughput, NOT
+            // cold first-touch latency: every engine populates + probes once
+            // per arm outside the timed window (see `WarmEngine`), so all arms
+            // (ours, blob_tree, rocksdb) enter the loop equally warmed. That
+            // symmetry is the point of the comparison. Cold fan-out latency is
+            // a separate, OS-cache-dropping measurement, not this bench.
+            let mut warm: Option<WarmEngine> = None;
             group.bench_with_input(BenchmarkId::new(label, n), &n, |b, _| {
-                // Build the on-disk database once (outside the timed window), so
-                // the measurement loop only ever pays for the batched read.
-                let dir = tempfile::tempdir().expect("tempdir");
-                // This measures WARM steady-state batched-MultiGet throughput, NOT
-                // cold first-touch latency: every engine populates + probes once
-                // outside the timed window, so all arms (ours, blob_tree, and the
-                // RocksDB arm below) enter the loop equally warmed. That symmetry
-                // is the point of the comparison. Cold fan-out latency is a
-                // separate, OS-cache-dropping measurement, not this bench.
-                match engine {
-                    Engine::Ours | Engine::BlobTree => {
-                        let tree =
-                            populate_ours(dir.path(), compression, &inputs, engine.kv_separated());
-                        // One-time "every key present" contract check OUTSIDE the
-                        // timed window (mirrors point_read), so a setup regression
-                        // can't quietly become a miss-read benchmark. It also warms
-                        // the cache identically to the RocksDB probe below.
-                        let probe = tree
-                            .multi_get(inputs.keys.iter(), MAX_SEQNO)
-                            .expect("ours: verify");
-                        // Cardinality before presence: a batched API that dropped
-                        // positions would otherwise pass the presence check while
-                        // the timed loop measures fewer than `n` lookups.
-                        assert_eq!(
-                            probe.len(),
-                            inputs.keys.len(),
-                            "ours: multi_get must return one result per input key"
-                        );
-                        assert!(
-                            probe.iter().all(Option::is_some),
-                            "ours: key unexpectedly missing"
-                        );
+                let warm = warm.get_or_insert_with(|| {
+                    let warm = WarmEngine::build(
+                        engine,
+                        compression,
+                        IndexStrategy::Binary,
+                        false,
+                        &inputs,
+                    );
+                    // One-time "every key present" contract check OUTSIDE the
+                    // timed window (mirrors point_read), so a setup regression
+                    // can't quietly become a miss-read benchmark. Cardinality
+                    // before presence: a batched API that dropped positions
+                    // would otherwise pass the presence check while the timed
+                    // loop measures fewer than `n` lookups.
+                    match &warm {
+                        WarmEngine::Ours { tree, .. } => {
+                            let probe = tree
+                                .multi_get(inputs.keys.iter(), MAX_SEQNO)
+                                .expect("ours: verify");
+                            assert_eq!(
+                                probe.len(),
+                                inputs.keys.len(),
+                                "ours: multi_get must return one result per input key"
+                            );
+                            assert!(
+                                probe.iter().all(Option::is_some),
+                                "ours: key unexpectedly missing"
+                            );
+                        }
+                        WarmEngine::RocksDb { db, .. } => {
+                            let cf = db
+                                .cf_handle(rocksdb::DEFAULT_COLUMN_FAMILY_NAME)
+                                .expect("rocksdb: default cf");
+                            let probe = db.batched_multi_get_cf(&cf, inputs.keys.iter(), false);
+                            assert_eq!(
+                                probe.len(),
+                                inputs.keys.len(),
+                                "rocksdb: batched_multi_get_cf must return one result per input key"
+                            );
+                            assert!(
+                                probe.iter().all(|r| matches!(r, Ok(Some(_)))),
+                                "rocksdb: key unexpectedly missing"
+                            );
+                        }
+                        WarmEngine::SurrealKv { .. } => {
+                            unreachable!("surrealkv is filtered out of the multi_get series")
+                        }
+                    }
+                    warm
+                });
+                match warm {
+                    WarmEngine::Ours { tree, .. } => {
                         b.iter_custom(|iters| {
                             let start = std::time::Instant::now();
                             for _ in 0..iters {
@@ -1079,41 +1173,16 @@ fn multi_get_variant(c: &mut Criterion, group_name: &str, compression: Compressi
                             start.elapsed()
                         });
                     }
-                    Engine::RocksDb => {
-                        // Open tracking the default CF: `batched_multi_get_cf`
-                        // (RocksDB's OPTIMIZED batched MultiGet: batched bloom
-                        // probes + coalesced block reads, NOT the legacy per-key
-                        // `multi_get`) needs a CF handle, and a plain `DB::open`
-                        // leaves the crate's CF map empty so `cf_handle` is None.
-                        // Same options / WAL-disabled populate as `populate_rocksdb`.
-                        let opts = rocksdb_options(compression, false);
-                        let db = rocksdb::DB::open_cf(
-                            &opts,
-                            dir.path(),
-                            [rocksdb::DEFAULT_COLUMN_FAMILY_NAME],
-                        )
-                        .expect("rocksdb: open_cf");
-                        let mut write_opts = rocksdb::WriteOptions::default();
-                        write_opts.disable_wal(true);
-                        for (key, value) in inputs.keys.iter().zip(inputs.values.iter()) {
-                            db.put_opt(key, value, &write_opts).expect("rocksdb: put");
-                        }
-                        db.flush().expect("rocksdb: flush");
-                        // `sorted_input = false`: keys arrive in insertion order and
-                        // RocksDB sorts internally, exactly as our `multi_get` does.
+                    WarmEngine::RocksDb { db, .. } => {
+                        // `batched_multi_get_cf` is RocksDB's OPTIMIZED batched
+                        // MultiGet (batched bloom probes + coalesced block reads,
+                        // NOT the legacy per-key `multi_get`); it needs the CF
+                        // handle `populate_rocksdb`'s descriptor open provides.
+                        // `sorted_input = false`: keys arrive in insertion order
+                        // and RocksDB sorts internally, exactly as ours does.
                         let cf = db
                             .cf_handle(rocksdb::DEFAULT_COLUMN_FAMILY_NAME)
                             .expect("rocksdb: default cf");
-                        let probe = db.batched_multi_get_cf(&cf, inputs.keys.iter(), false);
-                        assert_eq!(
-                            probe.len(),
-                            inputs.keys.len(),
-                            "rocksdb: batched_multi_get_cf must return one result per input key"
-                        );
-                        assert!(
-                            probe.iter().all(|r| matches!(r, Ok(Some(_)))),
-                            "rocksdb: key unexpectedly missing"
-                        );
                         b.iter_custom(|iters| {
                             let start = std::time::Instant::now();
                             for _ in 0..iters {
@@ -1123,7 +1192,7 @@ fn multi_get_variant(c: &mut Criterion, group_name: &str, compression: Compressi
                             start.elapsed()
                         });
                     }
-                    Engine::SurrealKv => {
+                    WarmEngine::SurrealKv { .. } => {
                         unreachable!("surrealkv is filtered out of the multi_get series")
                     }
                 }
@@ -1147,20 +1216,17 @@ fn bench_range_scan(c: &mut Criterion) {
 fn range_scan_variant(c: &mut Criterion, group_name: &str, compression: Compression) {
     let mut group = c.benchmark_group(group_name);
     for &n in &[1_000_u64, 10_000_u64, 70_000_u64] {
-        // The 70k working set exceeds the default 16 MiB block cache, so each
-        // pass is far slower (scattered miss + decode). Drop to the criterion
-        // sample-size floor there to keep the variant's wall-clock bounded while
-        // the reported median stays stable; smaller sets keep the default 100.
-        group.sample_size(if n >= 70_000 { 10 } else { 100 });
         let inputs = WorkloadInputs::build(n);
         group.throughput(Throughput::Elements(n));
         for &engine in engines_for(compression) {
+            // Built once per arm on the first closure entry (see `WarmEngine`).
+            let mut warm: Option<WarmEngine> = None;
             group.bench_with_input(BenchmarkId::new(engine.label(), n), &n, |b, _| {
-                let dir = tempfile::tempdir().expect("tempdir");
-                match engine {
-                    Engine::Ours | Engine::BlobTree => {
-                        let tree =
-                            populate_ours(dir.path(), compression, &inputs, engine.kv_separated());
+                let warm = warm.get_or_insert_with(|| {
+                    WarmEngine::build(engine, compression, IndexStrategy::Binary, false, &inputs)
+                });
+                match warm {
+                    WarmEngine::Ours { tree, .. } => {
                         b.iter_custom(|iters| {
                             let start = std::time::Instant::now();
                             for _ in 0..iters {
@@ -1172,8 +1238,7 @@ fn range_scan_variant(c: &mut Criterion, group_name: &str, compression: Compress
                             start.elapsed()
                         });
                     }
-                    Engine::RocksDb => {
-                        let db = populate_rocksdb(dir.path(), compression, &inputs);
+                    WarmEngine::RocksDb { db, .. } => {
                         b.iter_custom(|iters| {
                             let start = std::time::Instant::now();
                             for _ in 0..iters {
@@ -1185,9 +1250,7 @@ fn range_scan_variant(c: &mut Criterion, group_name: &str, compression: Compress
                             start.elapsed()
                         });
                     }
-                    Engine::SurrealKv => {
-                        let (_rt, tree) = setup_surrealkv_warm(dir.path(), &inputs)
-                            .unwrap_or_else(|e| panic!("surrealkv: warm setup: {e}"));
+                    WarmEngine::SurrealKv { tree, .. } => {
                         let txn = tree.begin().expect("surrealkv: begin");
                         b.iter_custom(|iters| {
                             let start = std::time::Instant::now();
@@ -1226,20 +1289,17 @@ fn bench_seek_random(c: &mut Criterion) {
 fn seek_random_variant(c: &mut Criterion, group_name: &str, compression: Compression) {
     let mut group = c.benchmark_group(group_name);
     for &n in &[1_000_u64, 10_000_u64, 70_000_u64] {
-        // The 70k working set exceeds the default 16 MiB block cache, so each
-        // pass is far slower (scattered miss + decode). Drop to the criterion
-        // sample-size floor there to keep the variant's wall-clock bounded while
-        // the reported median stays stable; smaller sets keep the default 100.
-        group.sample_size(if n >= 70_000 { 10 } else { 100 });
         let inputs = WorkloadInputs::build(n);
         group.throughput(Throughput::Elements(n));
         for &engine in engines_for(compression) {
+            // Built once per arm on the first closure entry (see `WarmEngine`).
+            let mut warm: Option<WarmEngine> = None;
             group.bench_with_input(BenchmarkId::new(engine.label(), n), &n, |b, _| {
-                let dir = tempfile::tempdir().expect("tempdir");
-                match engine {
-                    Engine::Ours | Engine::BlobTree => {
-                        let tree =
-                            populate_ours(dir.path(), compression, &inputs, engine.kv_separated());
+                let warm = warm.get_or_insert_with(|| {
+                    WarmEngine::build(engine, compression, IndexStrategy::Binary, false, &inputs)
+                });
+                match warm {
+                    WarmEngine::Ours { tree, .. } => {
                         b.iter_custom(|iters| {
                             let start = std::time::Instant::now();
                             for _ in 0..iters {
@@ -1255,8 +1315,7 @@ fn seek_random_variant(c: &mut Criterion, group_name: &str, compression: Compres
                             start.elapsed()
                         });
                     }
-                    Engine::RocksDb => {
-                        let db = populate_rocksdb(dir.path(), compression, &inputs);
+                    WarmEngine::RocksDb { db, .. } => {
                         b.iter_custom(|iters| {
                             let start = std::time::Instant::now();
                             for _ in 0..iters {
@@ -1272,9 +1331,7 @@ fn seek_random_variant(c: &mut Criterion, group_name: &str, compression: Compres
                             start.elapsed()
                         });
                     }
-                    Engine::SurrealKv => {
-                        let (_rt, tree) = setup_surrealkv_warm(dir.path(), &inputs)
-                            .unwrap_or_else(|e| panic!("surrealkv: warm setup: {e}"));
+                    WarmEngine::SurrealKv { tree, .. } => {
                         let txn = tree.begin().expect("surrealkv: begin");
                         b.iter_custom(|iters| {
                             let start = std::time::Instant::now();
@@ -1320,11 +1377,6 @@ fn bench_overwrite(c: &mut Criterion) {
 fn overwrite_variant(c: &mut Criterion, group_name: &str, compression: Compression) {
     let mut group = c.benchmark_group(group_name);
     for &n in &[1_000_u64, 10_000_u64, 70_000_u64] {
-        // The 70k working set exceeds the default 16 MiB block cache, so each
-        // pass is far slower (scattered miss + decode). Drop to the criterion
-        // sample-size floor there to keep the variant's wall-clock bounded while
-        // the reported median stays stable; smaller sets keep the default 100.
-        group.sample_size(if n >= 70_000 { 10 } else { 100 });
         let inputs = WorkloadInputs::build(n);
         group.throughput(Throughput::Elements(n));
         for &engine in engines_for(compression) {
@@ -1342,6 +1394,8 @@ fn overwrite_variant(c: &mut Criterion, group_name: &str, compression: Compressi
                                     compression,
                                     &inputs,
                                     engine.kv_separated(),
+                                    IndexStrategy::Binary,
+                                    false,
                                 );
                                 let start = std::time::Instant::now();
                                 // Second seqno range so the overwrite produces a
@@ -1356,7 +1410,7 @@ fn overwrite_variant(c: &mut Criterion, group_name: &str, compression: Compressi
                                 total += start.elapsed();
                             }
                             Engine::RocksDb => {
-                                let db = populate_rocksdb(dir.path(), compression, &inputs);
+                                let db = populate_rocksdb(dir.path(), compression, false, &inputs);
                                 let mut write_opts = rocksdb::WriteOptions::default();
                                 write_opts.disable_wal(true);
                                 let start = std::time::Instant::now();
@@ -1558,8 +1612,13 @@ fn compaction_variant(c: &mut Criterion, group_name: &str, level: i32) {
         let inputs = WorkloadInputs::build(n);
         group.throughput(Throughput::Elements(n));
         for engine in [Engine::Ours, Engine::RocksDb] {
+            // Collected across every closure entry (Criterion re-enters the
+            // routine for warm-up and per sample) and reported ONCE after the
+            // arm. Every iteration is an independent full compaction from a
+            // fresh on-disk state, so the warm-up iterations are the same
+            // population as the measured ones and belong in the distribution.
+            let mut samples = Vec::new();
             group.bench_with_input(BenchmarkId::new(engine.label(), n), &n, |b, _| {
-                let mut samples = Vec::new();
                 b.iter_custom(|iters| {
                     let mut total = Duration::ZERO;
                     for _ in 0..iters {
@@ -1571,8 +1630,8 @@ fn compaction_variant(c: &mut Criterion, group_name: &str, level: i32) {
                     }
                     total
                 });
-                report_percentiles(&format!("{group_name}/{}/{n}", engine.label()), samples);
             });
+            report_percentiles(&format!("{group_name}/{}/{n}", engine.label()), samples);
         }
     }
     group.finish();
@@ -1750,8 +1809,11 @@ fn subcompaction_variant(c: &mut Criterion, group_name: &str, level: i32) {
         let inputs = SubcompactionInputs::build(n);
         group.throughput(Throughput::Elements(n));
         for engine in [Engine::Ours, Engine::RocksDb] {
+            // Same shape as `compaction_variant`: one buffer per arm, reported
+            // after the arm, warm-up iterations included (each is a full
+            // sub-compaction from a fresh clone of the master state).
+            let mut samples = Vec::new();
             group.bench_with_input(BenchmarkId::new(engine.label(), n), &n, |b, _| {
-                let mut samples = Vec::new();
                 b.iter_custom(|iters| {
                     let mut total = Duration::ZERO;
                     for _ in 0..iters {
@@ -1764,8 +1826,8 @@ fn subcompaction_variant(c: &mut Criterion, group_name: &str, level: i32) {
                     }
                     total
                 });
-                report_percentiles(&format!("{group_name}/{}/{n}", engine.label()), samples);
             });
+            report_percentiles(&format!("{group_name}/{}/{n}", engine.label()), samples);
         }
     }
     group.finish();
