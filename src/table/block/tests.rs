@@ -1902,6 +1902,103 @@ mod page_ecc {
         Ok(())
     }
 
+    /// The resident-frame verifier's SEC-DED heal arm: a single bit flip in a
+    /// SECDED-protected block read through `from_file` (the resident path,
+    /// not the streaming `from_reader`) is healed and the payload restored.
+    #[test]
+    fn block_from_file_secded_recovers_from_single_bit_flip() -> crate::Result<()> {
+        let tmp = super::write_block_to_tempfile(
+            PAYLOAD,
+            BlockIdentity::for_test(0, BlockType::Data),
+            &BlockTransform::PlainEcc(EccParams::SECDED),
+        )?;
+        let path = tmp.dir.path().join("block");
+
+        let mut bytes = std::fs::read(&path)?;
+        let payload_start = Header::MIN_LEN;
+        bytes[payload_start + 2] ^= 0x04; // one flipped bit
+        std::fs::write(&path, &bytes)?;
+
+        let file = std::fs::File::open(&path)?;
+        let block = Block::from_file(
+            &file,
+            tmp.handle,
+            BlockIdentity::for_test(0, BlockType::Data),
+            &BlockTransform::PlainEcc(EccParams::SECDED),
+        )?;
+        assert_eq!(&*block.data, PAYLOAD);
+        Ok(())
+    }
+
+    /// The resident-frame verifier's fail-closed arm: a double bit flip in one
+    /// SEC-DED word read through `from_file` is detected but not healable, so
+    /// the read surfaces `PageEccUnrecoverable` instead of serving the payload.
+    #[test]
+    fn block_from_file_secded_unrecoverable_on_double_bit_flip() -> crate::Result<()> {
+        let tmp = super::write_block_to_tempfile(
+            PAYLOAD,
+            BlockIdentity::for_test(0, BlockType::Data),
+            &BlockTransform::PlainEcc(EccParams::SECDED),
+        )?;
+        let path = tmp.dir.path().join("block");
+
+        let mut bytes = std::fs::read(&path)?;
+        let payload_start = Header::MIN_LEN;
+        bytes[payload_start] ^= 0x81; // two flipped bits in one word
+        std::fs::write(&path, &bytes)?;
+
+        let file = std::fs::File::open(&path)?;
+        let result = Block::from_file(
+            &file,
+            tmp.handle,
+            BlockIdentity::for_test(0, BlockType::Data),
+            &BlockTransform::PlainEcc(EccParams::SECDED),
+        );
+        assert!(
+            matches!(&result, Err(crate::Error::PageEccUnrecoverable { .. })),
+            "a double-bit flip must fail closed on the resident path, got {:?}",
+            result.as_ref().err(),
+        );
+        Ok(())
+    }
+
+    /// The resident-frame verifier's RS fail-closed arm: corrupting more
+    /// shards than the scheme's parity can reconstruct surfaces
+    /// `PageEccUnrecoverable` through `from_file`.
+    #[test]
+    fn block_from_file_plain_ecc_unrecoverable_when_too_many_shards_corrupt() -> crate::Result<()> {
+        let tmp = super::write_block_to_tempfile(
+            PAYLOAD,
+            BlockIdentity::for_test(0, BlockType::Data),
+            &BlockTransform::PlainEcc(EccParams::RS_4_2),
+        )?;
+        let path = tmp.dir.path().join("block");
+
+        // RS(4,2) recovers at most 2 lost shards: corrupt one byte in three
+        // DIFFERENT shards so no 4-of-6 subset reconstructs a matching payload.
+        let mut bytes = std::fs::read(&path)?;
+        let payload_start = Header::MIN_LEN;
+        let shard = PAYLOAD.len().div_ceil(4).next_multiple_of(2);
+        for i in 0..3 {
+            bytes[payload_start + i * shard] ^= 0xFF;
+        }
+        std::fs::write(&path, &bytes)?;
+
+        let file = std::fs::File::open(&path)?;
+        let result = Block::from_file(
+            &file,
+            tmp.handle,
+            BlockIdentity::for_test(0, BlockType::Data),
+            &BlockTransform::PlainEcc(EccParams::RS_4_2),
+        );
+        assert!(
+            matches!(&result, Err(crate::Error::PageEccUnrecoverable { .. })),
+            "an over-corrupt RS block must fail closed on the resident path, got {:?}",
+            result.as_ref().err(),
+        );
+        Ok(())
+    }
+
     /// `heal_frame` validates the on-disk trailer before treating a block as
     /// clean: a handle whose size claims more bytes than `header + data + parity`
     /// (extra trailing bytes) is rejected — matching the normal read path — rather
