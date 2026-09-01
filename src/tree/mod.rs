@@ -384,7 +384,11 @@ impl AbstractTree for Tree {
     }
 
     fn current_version(&self) -> Version {
-        self.version_history.read().latest_version().version
+        self.version_history
+            .read()
+            .latest_version_ref()
+            .version
+            .clone()
     }
 
     #[cfg(feature = "std")]
@@ -424,7 +428,7 @@ impl AbstractTree for Tree {
         // leaves the current view's own (compaction-installed) digest in place for
         // the next patrol to reconcile.
         let restriction_matches = version_lock
-            .latest_version()
+            .latest_version_ref()
             .version
             .iter_tables()
             .find(|t| t.id() == table_id)
@@ -1061,7 +1065,11 @@ impl AbstractTree for Tree {
     }
 
     fn active_memtable(&self) -> Arc<Memtable> {
-        self.version_history.read().latest_version().active_memtable
+        self.version_history
+            .read()
+            .latest_version_ref()
+            .active_memtable
+            .clone()
     }
 
     #[expect(clippy::significant_drop_tightening)]
@@ -1760,7 +1768,7 @@ impl AbstractTree for Tree {
         inner::TestHooks::fire(&self.test_hooks.range_write);
 
         history
-            .latest_version()
+            .latest_version_ref()
             .active_memtable
             .insert_range_tombstone(start.into(), end.into(), seqno)
     }
@@ -2471,6 +2479,14 @@ impl Tree {
             auto_heal = c.auto_heal;
         })?;
         self.0.heal_hints.set_enabled(auto_heal);
+        // Mirror the insert-time digest gate for the write hot path (see
+        // `TreeInner::kv_digest_at_insert`). Relaxed: a toggle taking effect
+        // on the next inserts is the documented contract (mixed inserts are
+        // supported), so no ordering against other memory is needed.
+        let gate = inner::kv_digest_at_insert_gate(&self.0.runtime_config.load());
+        self.0
+            .kv_digest_at_insert
+            .store(gate, core::sync::atomic::Ordering::Relaxed);
         // Drop the cached admission footprint so the next check re-probes
         // disk-free: an operator who just raised the budget (or freed disk)
         // should see it promptly, not at the next flush.
@@ -4299,8 +4315,6 @@ impl Tree {
     #[doc(hidden)]
     #[must_use]
     pub fn append_entry(&self, value: InternalValue) -> (u64, u64) {
-        use crate::runtime_config::{KvChecksumComputePoint, KvChecksumPolicy};
-
         // Per-KV residence digest (KvChecksumComputePoint::AtInsert): compute
         // the entry's 4-byte logical-content digest now, so a RAM bit-flip
         // while it sits in the memtable is caught at flush. The digest covers
@@ -4308,29 +4322,23 @@ impl Tree {
         // receives it, so computing it before taking the version-history guard
         // is correct (a concurrent rotation just routes the same value+digest
         // into the new active memtable) AND keeps the hash out of the read-lock
-        // critical section. Reading the live snapshot is a cheap arc-swap load;
-        // under the default `AtBlockCompile` (or `Off`) the two `matches!`
-        // checks short-circuit and no digest is computed, so the hot insert
-        // path is unchanged.
-        let kv_digest = {
-            let rc = self.0.runtime_config.load();
-            if matches!(
-                rc.kv_checksum_compute_point,
-                KvChecksumComputePoint::AtInsert
-            ) && !matches!(rc.kv_checksums, KvChecksumPolicy::Off)
-            {
-                crate::table::block::kv_checksum::kv_digest(&value, rc.kv_checksum_algo).map(|d| {
-                    #[expect(
-                        clippy::cast_possible_truncation,
-                        reason = "AtInsert is config-validated to a 4-byte algorithm; the digest fits u32"
-                    )]
-                    let lo = d as u32;
-                    (lo, rc.kv_checksum_algo)
-                })
-            } else {
-                None
-            }
-        };
+        // critical section. The gate is one relaxed byte mirrored from the
+        // runtime config (`TreeInner::kv_digest_at_insert`); under the default
+        // `AtBlockCompile` (or `Off`) it is `0` and no digest is computed.
+        let gate = self
+            .0
+            .kv_digest_at_insert
+            .load(core::sync::atomic::Ordering::Relaxed);
+        let kv_digest = inner::kv_digest_algo_from_gate(gate).and_then(|algo| {
+            crate::table::block::kv_checksum::kv_digest(&value, algo).map(|d| {
+                #[expect(
+                    clippy::cast_possible_truncation,
+                    reason = "AtInsert is config-validated to a 4-byte algorithm; the digest fits u32"
+                )]
+                let lo = d as u32;
+                (lo, algo)
+            })
+        });
 
         // The `.read()` guard is a temporary that lives until the end of this
         // statement, so the insert runs under the version-history read lock:
@@ -4338,7 +4346,7 @@ impl Tree {
         // and a concurrent `rotate_memtable()` cannot seal it mid-insert.
         self.version_history
             .read()
-            .latest_version()
+            .latest_version_ref()
             .active_memtable
             .insert_with_kv_digest(value, kv_digest)
     }
@@ -4352,30 +4360,21 @@ impl Tree {
     #[doc(hidden)]
     #[must_use]
     pub(crate) fn append_batch(&self, items: Vec<InternalValue>) -> (u64, u64) {
-        use crate::runtime_config::{KvChecksumComputePoint, KvChecksumPolicy};
-
         // Per-KV residence digest under AtInsert (see `append_entry`): pass the
         // algorithm so the bulk path fixes each entry's digest at insert. The
         // default path passes `None` and is unchanged.
-        let kv_algo = {
-            let rc = self.0.runtime_config.load();
-            if matches!(
-                rc.kv_checksum_compute_point,
-                KvChecksumComputePoint::AtInsert
-            ) && !matches!(rc.kv_checksums, KvChecksumPolicy::Off)
-            {
-                Some(rc.kv_checksum_algo)
-            } else {
-                None
-            }
-        };
+        let kv_algo = inner::kv_digest_algo_from_gate(
+            self.0
+                .kv_digest_at_insert
+                .load(core::sync::atomic::Ordering::Relaxed),
+        );
 
         // Hold the read guard for the entire insert to prevent rotate_memtable()
         // from sealing this memtable mid-batch (which could cause data loss if
         // a concurrent flush persists only a prefix of the batch).
         self.version_history
             .read()
-            .latest_version()
+            .latest_version_ref()
             .active_memtable
             .insert_batch_with_kv_algo(items, kv_algo)
     }
@@ -4551,6 +4550,9 @@ impl Tree {
             #[cfg(feature = "std")]
             background_deleter: Arc::clone(&background_deleter),
             heal_hints: Arc::clone(&heal_hints),
+            kv_digest_at_insert: portable_atomic::AtomicU8::new(inner::kv_digest_at_insert_gate(
+                &initial_runtime,
+            )),
             runtime_config: Arc::new(crate::runtime_config::handle::RuntimeConfigHandle::new(
                 initial_runtime,
             )),

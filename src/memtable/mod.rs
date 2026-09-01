@@ -63,7 +63,11 @@ pub struct Memtable {
 
     /// Approximate active memtable size.
     ///
-    /// If this grows too large, a flush is triggered.
+    /// If this grows too large, a flush is triggered. Updated with `Relaxed`
+    /// RMWs: it is a rotation heuristic, and nothing derives the visibility
+    /// of other memory from it (entry visibility comes from the skiplist's
+    /// release/acquire tower stores; `highest_seqno` keeps `AcqRel` so a
+    /// reader that observes a seqno also observes its entry).
     pub(crate) approximate_size: AtomicU64,
 
     /// Highest encountered sequence number.
@@ -253,7 +257,7 @@ impl Memtable {
 
         let size_before = self
             .approximate_size
-            .fetch_add(total_size, core::sync::atomic::Ordering::AcqRel);
+            .fetch_add(total_size, core::sync::atomic::Ordering::Relaxed);
 
         if kv_algo.is_some() {
             // Flag that this memtable carries residence digests for the
@@ -273,8 +277,8 @@ impl Memtable {
                     (lo, algo)
                 })
             });
-            let key = InternalKey::new(item.key.user_key, item.key.seqno, item.key.value_type);
-            self.items.insert_with_kv_digest(&key, &item.value, digest);
+            self.items
+                .insert_with_kv_digest(&item.key, item.value, digest);
         }
 
         self.highest_seqno
@@ -302,10 +306,11 @@ impl Memtable {
 
         let size_before = self
             .approximate_size
-            .fetch_add(item_size, core::sync::atomic::Ordering::AcqRel);
+            .fetch_add(item_size, core::sync::atomic::Ordering::Relaxed);
 
-        let key = InternalKey::new(item.key.user_key, item.key.seqno, item.key.value_type);
-        self.items.insert(&key, &item.value);
+        // `item.key` is borrowed and `item.value` moved: the key bytes are
+        // copied into the arena, the value handle is stored as-is.
+        self.items.insert(&item.key, item.value);
 
         self.highest_seqno
             .fetch_max(item.key.seqno, core::sync::atomic::Ordering::AcqRel);
@@ -343,7 +348,7 @@ impl Memtable {
 
         let size_before = self
             .approximate_size
-            .fetch_add(item_size, core::sync::atomic::Ordering::AcqRel);
+            .fetch_add(item_size, core::sync::atomic::Ordering::Relaxed);
 
         if kv_digest.is_some() {
             // Flag that this memtable carries at least one residence digest so
@@ -353,9 +358,8 @@ impl Memtable {
                 .store(true, core::sync::atomic::Ordering::Relaxed);
         }
 
-        let key = InternalKey::new(item.key.user_key, item.key.seqno, item.key.value_type);
         self.items
-            .insert_with_kv_digest(&key, &item.value, kv_digest);
+            .insert_with_kv_digest(&item.key, item.value, kv_digest);
 
         self.highest_seqno
             .fetch_max(item.key.seqno, core::sync::atomic::Ordering::AcqRel);

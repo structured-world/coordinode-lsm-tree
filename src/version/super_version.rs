@@ -482,11 +482,17 @@ impl SuperVersions {
     }
 
     pub fn latest_version(&self) -> SuperVersion {
+        self.latest_version_ref().clone()
+    }
+
+    /// Borrows the newest super-version. This is the write hot path's
+    /// accessor: a clone bumps and later drops three `Arc`s (active
+    /// memtable, sealed memtables, version), which is pure overhead when
+    /// the caller only needs one field for the duration of the lock guard.
+    pub fn latest_version_ref(&self) -> &SuperVersion {
         #[expect(clippy::expect_used, reason = "SuperVersion is expected to exist")]
         self.versions
-            .iter()
-            .last()
-            .cloned()
+            .back()
             .expect("should always have a SuperVersion")
     }
 

@@ -84,33 +84,29 @@ impl ValueStore {
         clippy::indexing_slicing,
         reason = "seg_idx < MAX_SEGMENTS enforced by u32 index range"
     )]
-    pub fn append(&self, value: &UserValue) -> u32 {
-        // Use fetch_update with checked_add to prevent wraparound past u32::MAX
-        // (which would reuse indices and cause memory unsafety).
-        #[expect(
-            clippy::expect_used,
-            reason = "a memtable with 4 billion entries would exhaust memory long before this"
-        )]
-        let idx = self
-            .next_idx
-            .fetch_update(Ordering::Relaxed, Ordering::Relaxed, |current| {
-                current.checked_add(1)
-            })
-            .expect("ValueStore::append: exceeded u32::MAX entries");
+    pub fn append(&self, value: UserValue) -> u32 {
+        // One atomic RMW rather than a CAS loop guarding `u32::MAX`: the
+        // counter cannot get there. Every value belongs to one skiplist node,
+        // a node occupies at least 28 arena bytes, and arena offsets are
+        // `u32`, so a memtable holds fewer than 2^32 / 28 entries; the arena
+        // reports exhaustion long before this index space could wrap.
+        let idx = self.next_idx.fetch_add(1, Ordering::Relaxed);
+        debug_assert!(idx != u32::MAX, "ValueStore::append: index space exhausted");
         let seg_idx = (idx >> SEGMENT_SHIFT) as usize;
         let slot = (idx & SEGMENT_MASK) as usize;
 
         self.ensure_segment(seg_idx);
 
         // SAFETY: ensure_segment guarantees the segment is allocated.
-        // The atomic fetch_update guarantees `slot` is unique — no two threads
+        // The atomic fetch_add guarantees `slot` is unique: no two threads
         // write the same slot.  We write before publishing the node (via the
         // skiplist CAS), so readers see the value only after it's fully
-        // written.
+        // written. The value MOVES into its slot: the caller's handle is the
+        // stored one, so the insert path does no refcount traffic.
         unsafe {
             let seg_ptr = self.segments[seg_idx].load(Ordering::Acquire);
             debug_assert!(!seg_ptr.is_null());
-            ptr::write(seg_ptr.add(slot), value.clone());
+            ptr::write(seg_ptr.add(slot), value);
         }
 
         idx

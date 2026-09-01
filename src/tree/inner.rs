@@ -209,6 +209,15 @@ pub struct TreeInner {
     // alternative (slower hot path, but compiles under alloc-only).
     pub(crate) runtime_config: Arc<RuntimeConfigHandle>,
 
+    /// Insert-time per-KV digest gate, mirrored from the runtime config so
+    /// the write hot path reads one relaxed byte instead of taking an
+    /// `ArcSwap` guard per insert. `0` = no insert-time digest (`Off` or
+    /// `AtBlockCompile`); otherwise the algorithm's `wire_tag() + 1`. See
+    /// [`kv_digest_at_insert_gate`]. Rewritten by
+    /// [`crate::Tree::update_runtime_config`], the only runtime-config
+    /// mutation point.
+    pub(crate) kv_digest_at_insert: portable_atomic::AtomicU8,
+
     /// Storage-admission used-bytes cache, stamped with the version it was
     /// computed for. The admission gate (`Tree::compute_write_admission`) must
     /// not re-stat every live file on each gated write — that would make
@@ -308,6 +317,9 @@ impl TreeInner {
             #[cfg(feature = "std")]
             background_deleter: Arc::new(crate::BackgroundDeleter::new(None)),
             heal_hints: crate::heal_hints::HealHints::new_shared(initial_runtime.auto_heal),
+            kv_digest_at_insert: portable_atomic::AtomicU8::new(kv_digest_at_insert_gate(
+                &initial_runtime,
+            )),
             runtime_config: Arc::new(RuntimeConfigHandle::new((*initial_runtime).clone())),
             admission_used_cache: Mutex::new(None),
 
@@ -322,6 +334,34 @@ impl TreeInner {
     pub fn get_next_table_id(&self) -> TableId {
         self.table_id_counter.next()
     }
+}
+
+/// Encodes the insert-time per-KV digest gate for
+/// [`TreeInner::kv_digest_at_insert`]: `0` when inserts carry no digest
+/// (`KvChecksumComputePoint::AtBlockCompile`, or checksums `Off`),
+/// otherwise the configured algorithm's `wire_tag() + 1`. Decode with
+/// [`kv_digest_algo_from_gate`].
+pub fn kv_digest_at_insert_gate(rc: &crate::runtime_config::RuntimeConfig) -> u8 {
+    use crate::runtime_config::{KvChecksumComputePoint, KvChecksumPolicy};
+    if matches!(
+        rc.kv_checksum_compute_point,
+        KvChecksumComputePoint::AtInsert
+    ) && !matches!(rc.kv_checksums, KvChecksumPolicy::Off)
+    {
+        rc.kv_checksum_algo.wire_tag() + 1
+    } else {
+        0
+    }
+}
+
+/// Inverse of [`kv_digest_at_insert_gate`]: the algorithm an insert must
+/// digest with, or `None` when inserts carry no digest.
+#[inline]
+pub fn kv_digest_algo_from_gate(gate: u8) -> Option<crate::runtime_config::ChecksumAlgorithm> {
+    // `gate - 1` is a wire tag this process wrote itself, so the decode
+    // cannot fail; a `None` here would only mean a corrupt byte.
+    gate.checked_sub(1)
+        .and_then(crate::runtime_config::ChecksumAlgorithm::from_wire_tag)
 }
 
 impl Drop for TreeInner {

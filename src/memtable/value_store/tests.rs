@@ -7,8 +7,8 @@ fn val(s: &[u8]) -> UserValue {
 #[test]
 fn append_and_get() {
     let store = ValueStore::new();
-    let i0 = store.append(&val(b"hello"));
-    let i1 = store.append(&val(b"world"));
+    let i0 = store.append(val(b"hello"));
+    let i1 = store.append(val(b"world"));
 
     assert_eq!(&*unsafe { store.get(i0) }, b"hello");
     assert_eq!(&*unsafe { store.get(i1) }, b"world");
@@ -17,7 +17,7 @@ fn append_and_get() {
 #[test]
 fn empty_value() {
     let store = ValueStore::new();
-    let i = store.append(&val(b""));
+    let i = store.append(val(b""));
     assert!(unsafe { store.get(i) }.is_empty());
 }
 
@@ -27,7 +27,7 @@ fn crosses_segment_boundary() {
 
     // Fill first segment + 1
     for i in 0..=SEGMENT_SIZE {
-        store.append(&val(format!("v{i}").as_bytes()));
+        store.append(val(format!("v{i}").as_bytes()));
     }
 
     // Last entry is in segment 1
@@ -54,7 +54,7 @@ fn concurrent_append_and_read() {
                 let mut indices = Vec::with_capacity(n_per_thread);
                 for i in 0..n_per_thread {
                     let v = format!("t{t}_v{i}");
-                    indices.push((store.append(&val(v.as_bytes())), v));
+                    indices.push((store.append(val(v.as_bytes())), v));
                 }
                 indices
             })
