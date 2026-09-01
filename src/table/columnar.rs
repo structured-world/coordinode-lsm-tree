@@ -228,6 +228,15 @@ fn codec_decode(codec: CodecId, type_tag: TypeTag, data: &[u8]) -> Result<Vec<u8
     }
 }
 
+/// Largest ratio of decoded-block bytes to served-view bytes at which a
+/// projection is still handed out as zero-copy views of the block. Above it
+/// the views are detached into exact-size copies, so a narrow projection over
+/// wide rows cannot pin the whole block (and, batch by batch, the whole table)
+/// for the sake of a few bytes. `2` keeps every full decode and every
+/// projection covering at least half the block on the zero-copy path; the
+/// copies it does force are, by construction, at most half a block per batch.
+const MAX_VIEW_AMPLIFICATION: usize = 2;
+
 /// One decoded column of a [`ColumnBatch`].
 #[derive(Clone, Debug, Eq, PartialEq)]
 pub struct Column {
@@ -659,7 +668,9 @@ impl ColumnBatch {
     /// bytes are stepped over, never allocated or codec-decoded).
     ///
     /// Takes the refcounted block bytes so `Plain` columns come back as
-    /// zero-copy views of the block instead of per-column copies.
+    /// zero-copy views of the block instead of per-column copies — as long as
+    /// the projection covers enough of the block for a view to be worth what
+    /// it retains (see [`MAX_VIEW_AMPLIFICATION`]).
     fn decode_inner(bytes: &crate::Slice, wanted: Option<&[u16]>) -> Result<Self> {
         // Smallest possible column: id(2) + type(1) + width(1) + codec(1) +
         // has_validity(1) + data_len(4), with empty validity + data.
@@ -676,6 +687,11 @@ impl ColumnBatch {
             ));
         }
         let mut columns = Vec::with_capacity(column_count);
+        // Bytes the served `Plain` views cover, and which columns they are:
+        // the retention check below decides once per block whether keeping
+        // the whole block alive for them is proportionate.
+        let mut viewed_bytes = 0usize;
+        let mut view_columns: Vec<usize> = Vec::new();
         for _ in 0..column_count {
             let column_id = cur.read_u16()?;
             let type_tag = cur.read_u8()?;
@@ -710,7 +726,11 @@ impl ColumnBatch {
             // Plain is the identity: the column is served as a zero-copy view
             // of the block bytes. Delta re-codes into an owned buffer.
             let data = match codec {
-                CodecId::Plain => bytes.slice(data_start..data_start + data_len),
+                CodecId::Plain => {
+                    viewed_bytes += data_len;
+                    view_columns.push(columns.len());
+                    bytes.slice(data_start..data_start + data_len)
+                }
                 CodecId::Delta => crate::Slice::from(codec_decode(codec, type_tag, raw)?),
             };
             let column = Column {
@@ -723,6 +743,21 @@ impl ColumnBatch {
             // iff it could have been produced by `encode`.
             column.validate(row_count)?;
             columns.push(column);
+        }
+        // Retention check: a view keeps the WHOLE decoded block alive, skipped
+        // columns included, for as long as any served column lives — and the
+        // scan buffers one batch per block (a whole overlap group on the merge
+        // path). A narrow projection over value-heavy rows (a key-only scan)
+        // would then pin the full table payload while exposing a sliver of it.
+        // When the views cover too small a share of the block, detach them
+        // into exact-size copies instead: those columns are small by
+        // definition, so the copy is cheap, and the block can be freed.
+        if !view_columns.is_empty() && bytes.len() > MAX_VIEW_AMPLIFICATION * viewed_bytes {
+            for idx in view_columns {
+                if let Some(col) = columns.get_mut(idx) {
+                    col.data = crate::Slice::from(&col.data[..]);
+                }
+            }
         }
         if !cur.is_empty() {
             return Err(Error::InvalidHeader(

@@ -326,6 +326,51 @@ fn decode_projected_decodes_only_the_wanted_columns() {
     );
 }
 
+/// Whether `col`'s bytes live inside `block`'s allocation (a zero-copy view)
+/// rather than in a detached copy.
+fn is_view_of(col: &Column, block: &Slice) -> bool {
+    let start = block.as_ptr() as usize;
+    let end = start + block.len();
+    let p = col.data.as_ptr() as usize;
+    p >= start && p < end
+}
+
+#[test]
+fn decode_projected_detaches_a_narrow_projection_from_a_value_heavy_block() {
+    // Keys are a few bytes, values are large: a key-only projection covers a
+    // sliver of the block. Served as a view it would keep the whole block
+    // (values included) alive per batch, so it must come back detached; a
+    // full decode covers the block and keeps the zero-copy view.
+    let big_value = vec![0xABu8; 4096];
+    let entries = vec![
+        entry(b"a", 2, ValueType::Value, &big_value),
+        entry(b"b", 1, ValueType::Value, &big_value),
+    ];
+    let block: Slice = entries_to_column_batch(&entries)
+        .expect("transpose")
+        .encode(CodecId::Plain)
+        .expect("encode")
+        .into();
+
+    let narrow =
+        ColumnBatch::decode_projected(&block, &[COL_USER_KEY]).expect("key-only projection");
+    assert!(
+        !is_view_of(&narrow.columns[0], &block),
+        "a key-only projection of a value-heavy block must not pin the block",
+    );
+
+    let full = ColumnBatch::decode(&block).expect("full decode");
+    let value_col = full
+        .columns
+        .iter()
+        .find(|c| c.column_id == COL_VALUE)
+        .expect("value column");
+    assert!(
+        is_view_of(value_col, &block),
+        "a full decode covers the block and stays zero-copy",
+    );
+}
+
 #[test]
 fn intrinsic_transpose_round_trips_entries() {
     // A mix of value kinds, including a tombstone (empty value) and a merge
