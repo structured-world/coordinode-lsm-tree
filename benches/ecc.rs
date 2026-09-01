@@ -17,6 +17,28 @@
 use criterion::{BenchmarkId, Criterion, Throughput, criterion_group, criterion_main};
 use lsm_tree::ecc::{RS_DATA_SHARDS, RS_PARITY_SHARDS, encode_parity, try_recover};
 
+/// Timed reads in the tail-latency pass that follows each Criterion arm: a
+/// thousand samples behind the P999, and well under a second per arm.
+const PCT_SAMPLES: usize = 200_000;
+
+/// Reports per-read tail latency (P50/P99/P999) to stderr — Criterion's summary
+/// only surfaces mean/CI.
+fn report_percentiles(label: &str, mut samples: Vec<std::time::Duration>) {
+    if samples.is_empty() {
+        return;
+    }
+    samples.sort_unstable();
+    let pick =
+        |per_mille: usize| samples[(samples.len() * per_mille / 1000).min(samples.len() - 1)];
+    eprintln!(
+        "  [{label}] n={} P50={:?} P99={:?} P999={:?}",
+        samples.len(),
+        pick(500),
+        pick(990),
+        pick(999),
+    );
+}
+
 /// Block sizes covering the typical SST data-block range. 4 KiB is
 /// the default `data_block_size` in `Writer`; the larger sizes show
 /// how parity scales with the on-disk payload (parity is ~50% the
@@ -134,10 +156,96 @@ fn bench_try_recover_all_subsets_fail(c: &mut Criterion) {
     group.finish();
 }
 
+fn bench_clean_read(c: &mut Criterion) {
+    // The path EVERY ECC-protected block read takes: frame in, checksum
+    // matches in place, payload detached and served. The parity bytes must
+    // never be copied here — recovery (benched above) runs only on a mismatch.
+    use lsm_tree::fs::{Fs, FsOpenOptions, MemFs};
+    use lsm_tree::table::BlockHandle;
+    use lsm_tree::table::block::{
+        Block, BlockIdentity, BlockOffset, BlockTransform, BlockType, EccParams,
+    };
+
+    let mut group = c.benchmark_group("ecc/clean_read");
+    let schemes: &[(&str, EccParams)] =
+        &[("secded", EccParams::SECDED), ("rs_4_2", EccParams::RS_4_2)];
+    for &(label, params) in schemes {
+        for &size in SIZES {
+            let payload = deterministic_payload(size);
+            let transform = BlockTransform::PLAIN.with_ecc(params);
+            let identity = BlockIdentity {
+                table_id: 0,
+                block_type: BlockType::Data,
+                dict_id: 0,
+                window_log: 0,
+            };
+
+            let fs = MemFs::new();
+            let path = format!("/bench-{label}-{size}");
+            let mut file = fs
+                .open(
+                    std::path::Path::new(&path),
+                    &FsOpenOptions::new().write(true).create(true).read(true),
+                )
+                .expect("open mem file");
+            let header =
+                Block::write_into(&mut file, &payload, identity, &transform).expect("write block");
+            // `on_disk_size_with` sizes the frame under the block's ACTUAL
+            // scheme; the plain `on_disk_size` assumes the legacy RS(4,2)
+            // layout for flagged blocks.
+            let on_disk = header.on_disk_size_with(Some(params));
+            let handle = BlockHandle::new(BlockOffset(0), on_disk);
+
+            group.throughput(Throughput::Bytes(size as u64));
+            // Set by the routine: Criterion applies the command-line filter by
+            // skipping the routine, and the tail-latency pass below must skip
+            // with it.
+            let mut ran = false;
+            group.bench_with_input(BenchmarkId::new(label, size), &handle, |b, &handle| {
+                ran = true;
+                b.iter_custom(|iters| {
+                    let mut total = std::time::Duration::ZERO;
+                    for _ in 0..iters {
+                        let t = std::time::Instant::now();
+                        let block = Block::from_file(&*file, handle, identity, &transform)
+                            .expect("clean read succeeds");
+                        let elapsed = t.elapsed();
+                        std::hint::black_box(block);
+                        total += elapsed;
+                    }
+                    total
+                });
+            });
+            if !ran {
+                continue;
+            }
+            // Tail-latency pass, run once Criterion is done with the arm so it
+            // sees the steady state Criterion measured and nothing else.
+            // Sampling inside the routine would take in the warm-up reads too:
+            // Criterion re-enters the routine for warm-up and for every
+            // measurement sample and marks no phase boundary. Criterion's own
+            // report only surfaces mean and CI, hence the separate P50/P99/P999.
+            let samples: Vec<_> = (0..PCT_SAMPLES)
+                .map(|_| {
+                    let t = std::time::Instant::now();
+                    let block = Block::from_file(&*file, handle, identity, &transform)
+                        .expect("clean read succeeds");
+                    let elapsed = t.elapsed();
+                    std::hint::black_box(block);
+                    elapsed
+                })
+                .collect();
+            report_percentiles(&format!("clean_read/{label}/{size}"), samples);
+        }
+    }
+    group.finish();
+}
+
 criterion_group!(
     benches,
     bench_encode_parity,
     bench_try_recover_first_subset,
     bench_try_recover_all_subsets_fail,
+    bench_clean_read,
 );
 criterion_main!(benches);

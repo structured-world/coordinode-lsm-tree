@@ -553,6 +553,118 @@ impl Block {
         }
     }
 
+    /// [`Self::read_payload_and_verify`] for a frame that is ALREADY resident:
+    /// `bytes` are the post-header frame bytes (payload followed by the parity
+    /// trailer).
+    ///
+    /// Returns `Ok(None)` when the checksum matches — the caller serves the
+    /// payload zero-copy out of its own buffer, and the parity bytes are never
+    /// touched. The streaming helper cannot offer that: it must copy the
+    /// payload out of the reader and consume the parity to position the
+    /// cursor, which on the resident path made every ECC-protected block pay
+    /// two allocations and a full payload copy for a verification that almost
+    /// always succeeds. Recovery (`Ok(Some(..))`) and failure behave exactly
+    /// like the streaming helper.
+    fn verify_resident_payload(
+        bytes: &[u8],
+        data_length: u32,
+        ecc_length: u32,
+        expected: Checksum,
+        #[cfg_attr(
+            not(feature = "page_ecc"),
+            expect(unused_variables, reason = "recovery scheme only used under page_ecc")
+        )]
+        ecc_params: EccParams,
+    ) -> crate::Result<Option<(Slice, EccRecoveryKind)>> {
+        let data = bytes
+            .get(..data_length as usize)
+            .ok_or(crate::Error::InvalidHeader("Block"))?;
+
+        let computed = Checksum::from_raw(crate::hash::hash128(data));
+        if computed == expected {
+            return Ok(None);
+        }
+
+        if ecc_length == 0 {
+            log::error!("Checksum mismatch for block payload, got={computed}, expected={expected}",);
+            computed.check(expected)?;
+            return Ok(None); // unreachable: check() errored above
+        }
+
+        let parity = bytes
+            .get(data_length as usize..(data_length as usize) + ecc_length as usize)
+            .ok_or(crate::Error::InvalidHeader("Block"))?;
+
+        #[cfg(feature = "page_ecc")]
+        {
+            let expected_raw = expected.into_u128();
+
+            // SEC-DED heal, mirroring the streaming helper: the repaired block
+            // must reproduce the stored checksum, a double-bit error surfaces.
+            if matches!(ecc_params, crate::table::block::EccParams::Secded) {
+                let mut healed = data.to_vec();
+                if crate::secded::try_correct_block(&mut healed, parity)
+                    == crate::secded::SecdedOutcome::Corrected
+                    && crate::hash::hash128(&healed) == expected_raw
+                {
+                    log::warn!(
+                        "recovered block via SEC-DED single-bit heal after \
+                         checksum mismatch (data_len={}, ecc_len={ecc_length})",
+                        data.len(),
+                    );
+                    return Ok(Some((Slice::from(healed), EccRecoveryKind::Secded)));
+                }
+                log::error!(
+                    "Checksum mismatch on SEC-DED block, heal failed, \
+                     got={computed}, expected={expected}",
+                );
+                return Err(crate::Error::PageEccUnrecoverable {
+                    got: computed,
+                    expected,
+                });
+            }
+
+            let (data_shards, parity_shards) = ecc_params.as_shards();
+            if let Some(recovered) = crate::ecc::try_recover(
+                data,
+                parity,
+                data.len(),
+                data_shards,
+                parity_shards,
+                |buf| crate::hash::hash128(buf) == expected_raw,
+            )? {
+                log::warn!(
+                    "recovered block from RS parity after checksum mismatch \
+                     (data_len={}, ecc_len={ecc_length})",
+                    data.len(),
+                );
+                return Ok(Some((Slice::from(recovered), EccRecoveryKind::Shard)));
+            }
+            log::error!(
+                "Checksum mismatch on ECC-protected block, recovery failed, \
+                 got={computed}, expected={expected}",
+            );
+            Err(crate::Error::PageEccUnrecoverable {
+                got: computed,
+                expected,
+            })
+        }
+
+        #[cfg(not(feature = "page_ecc"))]
+        {
+            let _ = parity;
+            log::error!(
+                "block has ECC trailer (ecc_length={ecc_length}) but this \
+                 build lacks the page_ecc feature — cannot attempt recovery; \
+                 got={computed}, expected={expected}",
+            );
+            Err(crate::Error::ChecksumMismatch {
+                expected,
+                got: computed,
+            })
+        }
+    }
+
     /// Encodes a block into a writer.
     ///
     /// Pipeline: raw data → compress → encrypt → checksum → write. The
@@ -1375,15 +1487,24 @@ impl Block {
                 buf.truncate(actual_data_len);
                 (Slice::from(buf), None)
             } else {
+                // Resident-frame verify: the clean case reuses the owned read
+                // buffer (one in-place move, as in the non-ECC arm above)
+                // instead of copying payload + parity out through a cursor.
                 #[expect(clippy::indexing_slicing, reason = "header was decoded from buf")]
-                let mut cursor = crate::io::Cursor::new(&buf[header_len..]);
-                Self::read_payload_and_verify(
-                    &mut cursor,
+                match Self::verify_resident_payload(
+                    &buf[header_len..],
                     parsed_header.data_length,
                     ecc_length,
                     parsed_header.checksum,
                     block_ecc_params(&parsed_header, transform),
-                )?
+                )? {
+                    None => {
+                        buf.copy_within(header_len..header_len + actual_data_len, 0);
+                        buf.truncate(actual_data_len);
+                        (Slice::from(buf), None)
+                    }
+                    Some((healed, kind)) => (healed, Some(kind)),
+                }
             };
 
             // Fold a successful ECC repair into the reported status; an
@@ -1470,16 +1591,30 @@ impl Block {
                     })?;
                     (buf.slice(header_len..header_len + actual_data_len), None)
                 } else {
+                    // Resident-frame verify: the checksum runs in place over the
+                    // read buffer (no cursor copy of payload + parity). The clean
+                    // payload is then DETACHED into its own allocation rather
+                    // than served as a view of `buf`: a view would keep the whole
+                    // frame alive, parity trailer included, for as long as the
+                    // block sits in the block cache, whose weight charges only
+                    // header + payload. That would let the cache overshoot its
+                    // capacity by the parity ratio (12.5% SEC-DED, 50% RS(4,2)).
+                    // One payload copy per disk read is the price of exact cache
+                    // accounting; the parity bytes are never copied or touched.
                     #[expect(clippy::indexing_slicing, reason = "header was decoded from buf")]
-                    let mut cursor = crate::io::Cursor::new(&buf[header_len..]);
-                    let (payload, recovery) = Self::read_payload_and_verify(
-                        &mut cursor,
+                    match Self::verify_resident_payload(
+                        &buf[header_len..],
                         parsed_header.data_length,
                         ecc_length,
                         parsed_header.checksum,
                         block_ecc_params(&parsed_header, transform),
-                    )?;
-                    (payload, recovery)
+                    )? {
+                        None => (
+                            Slice::from(&buf[header_len..header_len + actual_data_len]),
+                            None,
+                        ),
+                        Some((healed, kind)) => (healed, Some(kind)),
+                    }
                 };
             // Fold a successful ECC repair into the status; the recovery
             // mechanism is carried out separately as `payload_corrected`.

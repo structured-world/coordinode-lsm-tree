@@ -155,7 +155,7 @@ fn first_user_key_rejects_a_non_key_first_column() {
             column_id: COL_USER_KEY,
             type_tag: TypeTag::Fixed(4),
             validity: None,
-            data: alloc::vec![0, 0, 0, 0],
+            data: alloc::vec![0, 0, 0, 0].into(),
         }],
     };
     assert!(fixed_first.first_user_key().is_err());
@@ -166,7 +166,7 @@ fn first_user_key_rejects_a_non_key_first_column() {
             column_id: 99,
             type_tag: TypeTag::Bytes,
             validity: None,
-            data: alloc::vec![0, 0, 0, 0, 0, 0, 0, 0],
+            data: alloc::vec![0, 0, 0, 0, 0, 0, 0, 0].into(),
         }],
     };
     assert!(missing.first_user_key().is_err());
@@ -186,7 +186,7 @@ fn first_user_key_returns_the_first_row_key() {
             column_id: COL_USER_KEY,
             type_tag: TypeTag::Bytes,
             validity: None,
-            data,
+            data: data.into(),
         }],
     };
     assert_eq!(batch.first_user_key().expect("first key"), Some(&b"k0"[..]));
@@ -225,14 +225,14 @@ fn delta_codec_round_trips_fixed8_column() {
             column_id: 1,
             type_tag: TypeTag::Fixed(8),
             validity: None,
-            data: data.clone(),
+            data: data.clone().into(),
         }],
     };
     let encoded = batch.encode(CodecId::Plain).expect("encode");
     // The codec byte (row_count 4 + col_count 4 + id 2 + type 1 + width 1 =
     // offset 12) must record Delta, auto-selected for the fixed-8 column.
     assert_eq!(encoded[12], u8::from(CodecId::Delta));
-    let decoded = ColumnBatch::decode(&encoded).expect("decode");
+    let decoded = ColumnBatch::decode(&encoded.into()).expect("decode");
     assert_eq!(
         decoded.columns[0].data, data,
         "delta column must round-trip"
@@ -249,7 +249,7 @@ fn auto_codec_is_delta_only_for_the_seqno_column() {
             column_id: 99, // not the intrinsic seqno column
             type_tag: TypeTag::Fixed(8),
             validity: None,
-            data: vec![0u8; 16],
+            data: vec![0u8; 16].into(),
         }],
     };
     let encoded = batch.encode(CodecId::Plain).expect("encode");
@@ -274,7 +274,7 @@ fn encode_rejects_delta_on_a_non_fixed8_column() {
             column_id: 50,
             type_tag: TypeTag::Bytes,
             validity: None,
-            data: bytes_data,
+            data: bytes_data.into(),
         }],
     };
     assert!(batch.encode(CodecId::Delta).is_err());
@@ -288,7 +288,7 @@ fn from_columnar_block_rejects_a_zero_row_block() {
         .expect("transpose")
         .encode(CodecId::Plain)
         .expect("encode");
-    assert!(crate::table::data_block::DataBlock::from_columnar_block(&empty, 16).is_err());
+    assert!(crate::table::data_block::DataBlock::from_columnar_block(&empty.into(), 16).is_err());
 }
 
 #[test]
@@ -304,8 +304,8 @@ fn decode_projected_decodes_only_the_wanted_columns() {
         .encode(CodecId::Plain)
         .expect("encode");
 
-    let projected =
-        ColumnBatch::decode_projected(&bytes, &[COL_USER_KEY]).expect("decode_projected");
+    let projected = ColumnBatch::decode_projected(&bytes.clone().into(), &[COL_USER_KEY])
+        .expect("decode_projected");
     assert_eq!(projected.row_count, 2);
     assert_eq!(
         projected.columns.len(),
@@ -321,8 +321,53 @@ fn decode_projected_decodes_only_the_wanted_columns() {
     // Projecting every column equals a full decode.
     let all = [COL_USER_KEY, COL_SEQNO, COL_VALUE_TYPE, COL_VALUE];
     assert_eq!(
-        ColumnBatch::decode_projected(&bytes, &all).expect("decode_projected all"),
-        ColumnBatch::decode(&bytes).expect("decode"),
+        ColumnBatch::decode_projected(&bytes.clone().into(), &all).expect("decode_projected all"),
+        ColumnBatch::decode(&bytes.into()).expect("decode"),
+    );
+}
+
+/// Whether `col`'s bytes live inside `block`'s allocation (a zero-copy view)
+/// rather than in a detached copy.
+fn is_view_of(col: &Column, block: &Slice) -> bool {
+    let start = block.as_ptr() as usize;
+    let end = start + block.len();
+    let p = col.data.as_ptr() as usize;
+    p >= start && p < end
+}
+
+#[test]
+fn decode_projected_detaches_a_narrow_projection_from_a_value_heavy_block() {
+    // Keys are a few bytes, values are large: a key-only projection covers a
+    // sliver of the block. Served as a view it would keep the whole block
+    // (values included) alive per batch, so it must come back detached; a
+    // full decode covers the block and keeps the zero-copy view.
+    let big_value = vec![0xABu8; 4096];
+    let entries = vec![
+        entry(b"a", 2, ValueType::Value, &big_value),
+        entry(b"b", 1, ValueType::Value, &big_value),
+    ];
+    let block: Slice = entries_to_column_batch(&entries)
+        .expect("transpose")
+        .encode(CodecId::Plain)
+        .expect("encode")
+        .into();
+
+    let narrow =
+        ColumnBatch::decode_projected(&block, &[COL_USER_KEY]).expect("key-only projection");
+    assert!(
+        !is_view_of(&narrow.columns[0], &block),
+        "a key-only projection of a value-heavy block must not pin the block",
+    );
+
+    let full = ColumnBatch::decode(&block).expect("full decode");
+    let value_col = full
+        .columns
+        .iter()
+        .find(|c| c.column_id == COL_VALUE)
+        .expect("value column");
+    assert!(
+        is_view_of(value_col, &block),
+        "a full decode covers the block and stays zero-copy",
     );
 }
 
@@ -347,7 +392,7 @@ fn intrinsic_transpose_round_trips_entries() {
     // And through the block encode / decode, so the transpose composes with
     // the on-disk columnar format.
     let bytes = batch.encode(CodecId::Plain).expect("encode");
-    let decoded = ColumnBatch::decode(&bytes).expect("decode");
+    let decoded = ColumnBatch::decode(&bytes.into()).expect("decode");
     let back2 = column_batch_to_entries(&decoded).expect("untranspose decoded");
     assert_entries_eq(&entries, &back2);
 }
@@ -361,7 +406,7 @@ fn intrinsic_untranspose_rejects_wrong_layout() {
             column_id: 0,
             type_tag: TypeTag::Fixed(4),
             validity: None,
-            data: vec![0; 4],
+            data: vec![0; 4].into(),
         }],
     };
     assert!(column_batch_to_entries(&bad).is_err());
@@ -396,25 +441,25 @@ fn intrinsic_untranspose_rejects_huge_row_count() {
                 column_id: 0,
                 type_tag: TypeTag::Bytes,
                 validity: None,
-                data: 0u32.to_le_bytes().to_vec(),
+                data: 0u32.to_le_bytes().to_vec().into(),
             },
             Column {
                 column_id: 1,
                 type_tag: TypeTag::Fixed(8),
                 validity: None,
-                data: Vec::new(),
+                data: Vec::new().into(),
             },
             Column {
                 column_id: 2,
                 type_tag: TypeTag::Fixed(1),
                 validity: None,
-                data: Vec::new(),
+                data: Vec::new().into(),
             },
             Column {
                 column_id: 3,
                 type_tag: TypeTag::Bytes,
                 validity: None,
-                data: 0u32.to_le_bytes().to_vec(),
+                data: 0u32.to_le_bytes().to_vec().into(),
             },
         ],
     };
@@ -438,7 +483,7 @@ fn untranspose_frames_multiple_value_subcolumns() {
         column_id: 3,
         type_tag: TypeTag::Fixed(4),
         validity: None,
-        data: vec![1, 0, 0, 0, 2, 0, 0, 0], // row 0 = 1, row 1 = 2
+        data: vec![1, 0, 0, 0, 2, 0, 0, 0].into(), // row 0 = 1, row 1 = 2
     });
     let mut bytes_data = Vec::new();
     for off in [0u32, 2, 5] {
@@ -449,7 +494,7 @@ fn untranspose_frames_multiple_value_subcolumns() {
         column_id: 4,
         type_tag: TypeTag::Bytes,
         validity: None,
-        data: bytes_data,
+        data: bytes_data.into(),
     });
 
     let entries = column_batch_to_entries(&batch).expect("untranspose");
@@ -486,7 +531,7 @@ fn untranspose_rejects_value_subcolumn_id_collisions() {
         column_id: COL_USER_KEY,
         type_tag: TypeTag::Fixed(4),
         validity: None,
-        data: vec![0, 0, 0, 0],
+        data: vec![0, 0, 0, 0].into(),
     }]);
     assert!(
         column_batch_to_entries(&collide_intrinsic).is_err(),
@@ -499,13 +544,13 @@ fn untranspose_rejects_value_subcolumn_id_collisions() {
             column_id: 5,
             type_tag: TypeTag::Fixed(4),
             validity: None,
-            data: vec![0, 0, 0, 0],
+            data: vec![0, 0, 0, 0].into(),
         },
         Column {
             column_id: 5,
             type_tag: TypeTag::Fixed(4),
             validity: None,
-            data: vec![1, 0, 0, 0],
+            data: vec![1, 0, 0, 0].into(),
         },
     ]);
     assert!(
@@ -520,7 +565,10 @@ fn validate_ingest_rejects_an_invalid_value_type() {
     // the submitting call, not defer it to the flush-time decode.
     let mut batch =
         entries_to_column_batch(&[entry(b"k0", 0, ValueType::Value, b"v")]).expect("transpose");
-    batch.columns[2].data[0] = 99; // not a valid ValueType tag
+    // Column bytes are an immutable view now — rebuild the poisoned column.
+    let mut poisoned = batch.columns[2].data.to_vec();
+    poisoned[0] = 99; // not a valid ValueType tag
+    batch.columns[2].data = poisoned.into();
     assert!(
         validate_columnar_ingest_batch(&batch, &crate::comparator::default_comparator()).is_err(),
         "an invalid value-type tag must be rejected during eager validation",
@@ -548,14 +596,14 @@ fn untranspose_reconstructs_nullable_value_subcolumns() {
         column_id: 3,
         type_tag: TypeTag::Bytes,
         validity: None,
-        data: bytes_data,
+        data: bytes_data.into(),
     });
     // Fixed-4 sub-column, row 0 present (=1), row 1 null. validity bit 0 set.
     batch.columns.push(Column {
         column_id: 4,
         type_tag: TypeTag::Fixed(4),
         validity: Some(alloc::vec![0b0000_0001]),
-        data: alloc::vec![1, 0, 0, 0, 0, 0, 0, 0],
+        data: alloc::vec![1, 0, 0, 0, 0, 0, 0, 0].into(),
     });
 
     let entries = column_batch_to_entries(&batch).expect("untranspose");
@@ -594,7 +642,7 @@ fn untranspose_reconstructs_a_nullable_bytes_subcolumn() {
         column_id: 3,
         type_tag: TypeTag::Bytes,
         validity: Some(alloc::vec![0b0000_0001]), // row 0 present, row 1 null
-        data,
+        data: data.into(),
     });
 
     let entries = column_batch_to_entries(&batch).expect("untranspose");
@@ -629,7 +677,11 @@ fn append_concatenates_fixed_bytes_and_nullable_columns() {
             column_id: 3,
             type_tag: TypeTag::Fixed(4),
             validity: None,
-            data: fixed.iter().flat_map(|v| v.to_le_bytes()).collect(),
+            data: fixed
+                .iter()
+                .flat_map(|v| v.to_le_bytes())
+                .collect::<Vec<u8>>()
+                .into(),
         });
         let mut bytes_data = Vec::new();
         let mut acc = 0u32;
@@ -645,7 +697,7 @@ fn append_concatenates_fixed_bytes_and_nullable_columns() {
             column_id: 4,
             type_tag: TypeTag::Bytes,
             validity: None,
-            data: bytes_data,
+            data: bytes_data.into(),
         });
         let mut nf2_data = Vec::new();
         let mut nf2_valid = 0u8;
@@ -659,7 +711,7 @@ fn append_concatenates_fixed_bytes_and_nullable_columns() {
             column_id: 5,
             type_tag: TypeTag::Fixed(2),
             validity: Some(alloc::vec![nf2_valid]),
-            data: nf2_data,
+            data: nf2_data.into(),
         });
         batch
     };
@@ -708,13 +760,13 @@ fn sample_batch() -> ColumnBatch {
                 column_id: 1,
                 type_tag: TypeTag::Fixed(4),
                 validity: Some(vec![0b0000_0101]), // rows 0 and 2 valid, row 1 null
-                data: vec![10, 0, 0, 0, 0, 0, 0, 0, 30, 0, 0, 0],
+                data: vec![10, 0, 0, 0, 0, 0, 0, 0, 30, 0, 0, 0].into(),
             },
             Column {
                 column_id: 2,
                 type_tag: TypeTag::Bytes,
                 validity: None,
-                data: bytes_data,
+                data: bytes_data.into(),
             },
         ],
     }
@@ -724,7 +776,7 @@ fn sample_batch() -> ColumnBatch {
 fn columnar_batch_round_trips_through_plain_codec() {
     let batch = sample_batch();
     let encoded = batch.encode(CodecId::Plain).expect("encode");
-    let decoded = ColumnBatch::decode(&encoded).expect("decode");
+    let decoded = ColumnBatch::decode(&encoded.into()).expect("decode");
     assert_eq!(decoded, batch, "columnar batch must survive a round-trip");
 }
 
@@ -733,7 +785,7 @@ fn columnar_decode_rejects_truncated_payload() {
     let encoded = sample_batch().encode(CodecId::Plain).expect("encode");
     // Drop the last byte: the final column's data is now short.
     let truncated = &encoded[..encoded.len() - 1];
-    assert!(ColumnBatch::decode(truncated).is_err());
+    assert!(ColumnBatch::decode(&truncated.to_vec().into()).is_err());
 }
 
 #[test]
@@ -746,7 +798,7 @@ fn columnar_encode_rejects_fixed_width_length_mismatch() {
             column_id: 1,
             type_tag: TypeTag::Fixed(4),
             validity: None,
-            data: vec![0; 8],
+            data: vec![0; 8].into(),
         }],
     };
     assert!(bad.encode(CodecId::Plain).is_err());
@@ -758,7 +810,7 @@ fn columnar_decode_rejects_unknown_codec_tag() {
     // Codec byte of the first column sits after row_count(4) + col_count(4)
     // + column_id(2) + type_tag(1) + width(1) = offset 12.
     encoded[12] = 0xFF;
-    assert!(ColumnBatch::decode(&encoded).is_err());
+    assert!(ColumnBatch::decode(&encoded.clone().into()).is_err());
 }
 
 #[test]
@@ -771,7 +823,7 @@ fn columnar_encode_rejects_zero_width_fixed_column() {
             column_id: 1,
             type_tag: TypeTag::Fixed(0),
             validity: None,
-            data: Vec::new(),
+            data: Vec::new().into(),
         }],
     };
     assert!(bad.encode(CodecId::Plain).is_err());
@@ -786,7 +838,7 @@ fn columnar_encode_rejects_wrong_validity_length() {
             column_id: 1,
             type_tag: TypeTag::Fixed(1),
             validity: Some(vec![0, 0]),
-            data: vec![7],
+            data: vec![7].into(),
         }],
     };
     assert!(bad.encode(CodecId::Plain).is_err());
@@ -801,7 +853,7 @@ fn columnar_encode_rejects_validity_padding_bits() {
             column_id: 1,
             type_tag: TypeTag::Fixed(1),
             validity: Some(vec![0xFF]),
-            data: vec![7],
+            data: vec![7].into(),
         }],
     };
     assert!(bad.encode(CodecId::Plain).is_err());
@@ -814,14 +866,14 @@ fn columnar_decode_rejects_bytes_offset_out_of_bounds() {
     // at 31 (id 2 + type 1 + width 1 + codec 1 + has_validity 1 + len 4 = 10
     // header bytes), so its data / offset table begins at 41.
     encoded[41] = 9;
-    assert!(ColumnBatch::decode(&encoded).is_err());
+    assert!(ColumnBatch::decode(&encoded.clone().into()).is_err());
 }
 
 #[test]
 fn columnar_decode_rejects_trailing_bytes() {
     let mut encoded = sample_batch().encode(CodecId::Plain).expect("encode");
     encoded.push(0); // one byte past the last declared column
-    assert!(ColumnBatch::decode(&encoded).is_err());
+    assert!(ColumnBatch::decode(&encoded.clone().into()).is_err());
 }
 
 #[test]
@@ -829,7 +881,7 @@ fn columnar_decode_rejects_huge_column_count() {
     // row_count = 0, column_count = u32::MAX, but no column bytes follow.
     let mut payload = 0u32.to_le_bytes().to_vec();
     payload.extend_from_slice(&u32::MAX.to_le_bytes());
-    assert!(ColumnBatch::decode(&payload).is_err());
+    assert!(ColumnBatch::decode(&payload.clone().into()).is_err());
 }
 
 #[test]
@@ -837,7 +889,7 @@ fn columnar_decode_rejects_non_boolean_validity_flag() {
     let mut encoded = sample_batch().encode(CodecId::Plain).expect("encode");
     // has_validity flag of the first column is at byte 13.
     encoded[13] = 2;
-    assert!(ColumnBatch::decode(&encoded).is_err());
+    assert!(ColumnBatch::decode(&encoded.clone().into()).is_err());
 }
 
 #[test]
@@ -845,7 +897,7 @@ fn columnar_decode_rejects_non_zero_bytes_width() {
     let mut encoded = sample_batch().encode(CodecId::Plain).expect("encode");
     // The Bytes column's width byte (must be 0) is at byte 34.
     encoded[34] = 5;
-    assert!(ColumnBatch::decode(&encoded).is_err());
+    assert!(ColumnBatch::decode(&encoded.clone().into()).is_err());
 }
 
 #[test]
@@ -856,7 +908,7 @@ fn column_batch_into_entries_rejects_an_empty_key_row() {
     let mut batch =
         entries_to_column_batch(&[entry(b"k", 5, ValueType::Value, b"v")]).expect("valid batch");
     let key_col = batch.columns.get_mut(0).expect("key column");
-    key_col.data = alloc::vec![0u8; 8];
+    key_col.data = alloc::vec![0u8; 8].into();
     let err = column_batch_into_entries(batch).expect_err("empty key must be rejected");
     assert!(
         matches!(err, crate::Error::InvalidHeader(m) if m.contains("user key is empty")),
@@ -871,7 +923,7 @@ fn column_batch_match_entries_rejects_an_empty_key_row() {
     let mut batch =
         entries_to_column_batch(&[entry(b"k", 5, ValueType::Value, b"v")]).expect("valid batch");
     let key_col = batch.columns.get_mut(0).expect("key column");
-    key_col.data = alloc::vec![0u8; 8];
+    key_col.data = alloc::vec![0u8; 8].into();
     let cmp = crate::comparator::default_comparator();
     let err = column_batch_match_entries(&batch, b"", &cmp, None)
         .expect_err("matched empty key must be rejected");

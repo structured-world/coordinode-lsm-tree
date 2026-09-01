@@ -5662,7 +5662,7 @@ fn write_columnar_batch_stores_value_subcolumns_and_round_trips() -> crate::Resu
         column_id: 3,
         type_tag: TypeTag::Fixed(4),
         validity: None,
-        data: vec![1, 0, 0, 0, 2, 0, 0, 0],
+        data: vec![1, 0, 0, 0, 2, 0, 0, 0].into(),
     });
     let mut bytes_data = Vec::new();
     for off in [0u32, 2, 5] {
@@ -5673,7 +5673,7 @@ fn write_columnar_batch_stores_value_subcolumns_and_round_trips() -> crate::Resu
         column_id: 4,
         type_tag: TypeTag::Bytes,
         validity: None,
-        data: bytes_data,
+        data: bytes_data.into(),
     });
 
     let mut writer = Writer::new(file.clone(), 0, 0, Arc::new(StdFs))?
@@ -5757,7 +5757,7 @@ fn delete_bitmap_masks_value_subcolumns_in_point_and_projection_reads() -> crate
         column_id: 4,
         type_tag: TypeTag::Bytes,
         validity: None,
-        data: bytes_data,
+        data: bytes_data.into(),
     });
 
     let mut writer = Writer::new(src.clone(), 0, 0, Arc::new(StdFs))?
@@ -5840,7 +5840,7 @@ fn write_columnar_batch_accounts_tombstones_seqno_bounds_and_restart_locator() -
         column_id: 3,
         type_tag: TypeTag::Fixed(2),
         validity: None,
-        data: vec![1, 1, 2, 2, 3, 3],
+        data: vec![1, 1, 2, 2, 3, 3].into(),
     });
 
     let mut writer = Writer::new(file.clone(), 0, 0, Arc::new(StdFs))?
@@ -6070,25 +6070,25 @@ fn write_columnar_batch_on_an_empty_batch_writes_no_block() -> crate::Result<()>
                 column_id: 0,
                 type_tag: TypeTag::Bytes,
                 validity: None,
-                data: 0u32.to_le_bytes().to_vec(),
+                data: 0u32.to_le_bytes().to_vec().into(),
             },
             Column {
                 column_id: 1,
                 type_tag: TypeTag::Fixed(8),
                 validity: None,
-                data: Vec::new(),
+                data: Vec::new().into(),
             },
             Column {
                 column_id: 2,
                 type_tag: TypeTag::Fixed(1),
                 validity: None,
-                data: Vec::new(),
+                data: Vec::new().into(),
             },
             Column {
                 column_id: 3,
                 type_tag: TypeTag::Fixed(4),
                 validity: None,
-                data: Vec::new(),
+                data: Vec::new().into(),
             },
         ],
     };

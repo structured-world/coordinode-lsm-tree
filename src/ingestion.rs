@@ -117,7 +117,7 @@ impl AnyIngestion<'_> {
     ///     column_id: 3,
     ///     type_tag: TypeTag::Fixed(4),
     ///     validity: None,
-    ///     data: vec![1, 0, 0, 0],
+    ///     data: vec![1, 0, 0, 0].into(),
     /// });
     ///
     /// let mut ingestion = any.ingestion()?;
@@ -204,7 +204,7 @@ impl AnyTree {
     ///     column_id: 3,
     ///     type_tag: TypeTag::Fixed(4),
     ///     validity: None,
-    ///     data: vec![1, 0, 0, 0],
+    ///     data: vec![1, 0, 0, 0].into(),
     /// });
     /// let mut ingestion = any.ingestion()?;
     /// ingestion.write_columnar_batch(&batch)?;

@@ -106,7 +106,7 @@ fn byte_eq_simd_matches_scalar_on_a_corpus() {
             column_id: 2,
             type_tag: TypeTag::Fixed(1),
             validity: None,
-            data: data.clone(),
+            data: data.clone().into(),
         }],
     };
     assert_eq!(
@@ -133,7 +133,7 @@ fn bytes_column(column_id: u16, validity: Option<Vec<u8>>, rows: &[&[u8]]) -> Co
         column_id,
         type_tag: TypeTag::Bytes,
         validity,
-        data,
+        data: data.into(),
     }
 }
 
@@ -168,7 +168,7 @@ fn matching_rows_all_true_for_a_non_bytes_column() {
             column_id: 1,
             type_tag: TypeTag::Fixed(8),
             validity: None,
-            data: vec![0u8; 16],
+            data: vec![0u8; 16].into(),
         }],
     };
     let pred = ColumnRangePredicate {
@@ -200,7 +200,7 @@ fn filter_batch_compacts_fixed_data_and_validity() {
             column_id: 2,
             type_tag: TypeTag::Fixed(1),
             validity: Some(vec![0b0000_0101]),
-            data: vec![10, 20, 30],
+            data: vec![10, 20, 30].into(),
         }],
     };
     let filtered = filter_batch(&batch, &[true, false, true]);

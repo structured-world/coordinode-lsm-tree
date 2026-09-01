@@ -99,10 +99,9 @@ fn splitmix64(state: &mut u64) -> u64 {
     z ^ (z >> 31)
 }
 
-/// Cap on retained per-op samples for the percentile report: enough volume for
-/// a meaningful P999 while bounding memory (Criterion drives these micro-ops
-/// through millions of iterations).
-const PCT_SAMPLE_CAP: usize = 1_000_000;
+/// Timed lookups in the tail-latency pass that follows each Criterion arm: a
+/// thousand samples behind the P999, and well under a second per arm.
+const PCT_SAMPLES: usize = 200_000;
 
 /// Reports per-op tail latency (P50/P99/P999) to stderr — Criterion's summary
 /// only surfaces mean/CI.
@@ -144,10 +143,11 @@ fn memtable_get_many(c: &mut Criterion) {
     }
 
     let mut i = 0usize;
+    // Set by the routine: Criterion applies the command-line filter by skipping
+    // the routine, and the tail-latency pass below must skip with it.
+    let mut ran = false;
     c.bench_function("memtable get many", |b| {
-        // Per-op timing so the percentile report sees individual lookups, not
-        // only Criterion's aggregate.
-        let mut samples = Vec::new();
+        ran = true;
         b.iter_custom(|iters| {
             let mut total = std::time::Duration::ZERO;
             for _ in 0..iters {
@@ -158,14 +158,30 @@ fn memtable_get_many(c: &mut Criterion) {
                 let elapsed = t.elapsed();
                 assert!(found);
                 total += elapsed;
-                if samples.len() < PCT_SAMPLE_CAP {
-                    samples.push(elapsed);
-                }
             }
             total
         });
-        report_percentiles("get many", std::mem::take(&mut samples));
     });
+    if !ran {
+        return;
+    }
+    // Tail-latency pass, run once Criterion is done with the arm so it sees
+    // the steady state Criterion measured and nothing else. Sampling inside
+    // the routine would take in the warm-up lookups too: Criterion re-enters
+    // the routine for warm-up and for every measurement sample and marks no
+    // phase boundary. Criterion's own report only surfaces mean and CI, hence
+    // the separate P50/P99/P999.
+    let samples: Vec<_> = (0..PCT_SAMPLES)
+        .map(|n| {
+            let key = &probes[n % probes.len()];
+            let t = std::time::Instant::now();
+            let found = memtable.get(key.as_bytes(), MAX_SEQNO).is_some();
+            let elapsed = t.elapsed();
+            assert!(found);
+            elapsed
+        })
+        .collect();
+    report_percentiles("get many", samples);
 }
 
 /// Miss cost averaged over 10 000 distinct absent keys (same population trick
@@ -189,10 +205,9 @@ fn memtable_get_miss_many(c: &mut Criterion) {
         .collect();
 
     let mut i = 0usize;
+    let mut ran = false;
     c.bench_function("memtable get miss many", |b| {
-        // Per-op timing so the percentile report sees individual lookups, not
-        // only Criterion's aggregate.
-        let mut samples = Vec::new();
+        ran = true;
         b.iter_custom(|iters| {
             let mut total = std::time::Duration::ZERO;
             for _ in 0..iters {
@@ -203,14 +218,25 @@ fn memtable_get_miss_many(c: &mut Criterion) {
                 let elapsed = t.elapsed();
                 assert!(!found);
                 total += elapsed;
-                if samples.len() < PCT_SAMPLE_CAP {
-                    samples.push(elapsed);
-                }
             }
             total
         });
-        report_percentiles("get miss many", std::mem::take(&mut samples));
     });
+    if !ran {
+        return;
+    }
+    // Same post-arm tail-latency pass as `memtable get many` (see the note there).
+    let samples: Vec<_> = (0..PCT_SAMPLES)
+        .map(|n| {
+            let key = &probes[n % probes.len()];
+            let t = std::time::Instant::now();
+            let found = memtable.get(key.as_bytes(), MAX_SEQNO).is_some();
+            let elapsed = t.elapsed();
+            assert!(!found);
+            elapsed
+        })
+        .collect();
+    report_percentiles("get miss many", samples);
 }
 
 fn memtable_highest_seqno(c: &mut Criterion) {

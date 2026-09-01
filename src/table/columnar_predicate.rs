@@ -187,7 +187,7 @@ fn filter_column(col: &Column, rows: usize, mask: &[bool], kept: usize) -> Colum
         column_id: col.column_id,
         type_tag: col.type_tag,
         validity,
-        data,
+        data: data.into(),
     }
 }
 
@@ -306,7 +306,7 @@ fn take_column(col: &Column, rows: usize, indices: &[u32]) -> crate::Result<Colu
         column_id: col.column_id,
         type_tag: col.type_tag,
         validity,
-        data,
+        data: data.into(),
     })
 }
 

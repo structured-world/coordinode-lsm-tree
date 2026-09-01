@@ -4780,14 +4780,20 @@ fn salvage_drops_a_columnar_block_with_an_invalid_value_type() -> crate::Result<
     let Some(payload) = block.get(header_len..header_len + header.data_length as usize) else {
         panic!("payload range within the block");
     };
-    let mut batch = ColumnBatch::decode(payload)?;
+    let mut batch = ColumnBatch::decode(&payload.into())?;
     let poisoned_rows = u64::from(batch.row_count);
     // Columns are ordered (key, seqno, value-type, values...); 0xFF is not a
     // defined ValueType tag.
-    let Some(vt_byte) = batch.columns.get_mut(2).and_then(|col| col.data.get_mut(0)) else {
+    // Column bytes are an immutable view now — rebuild the poisoned column.
+    let Some(col) = batch.columns.get_mut(2).filter(|c| !c.data.is_empty()) else {
         panic!("value-type column present and non-empty");
     };
-    *vt_byte = 0xFF;
+    let mut poisoned = col.data.to_vec();
+    let Some(first_byte) = poisoned.first_mut() else {
+        panic!("column is non-empty");
+    };
+    *first_byte = 0xFF;
+    col.data = poisoned.into();
     let new_payload = batch.encode(CodecId::Plain)?;
     assert_eq!(
         new_payload.len(),
@@ -4890,7 +4896,7 @@ fn salvage_drops_a_columnar_block_with_out_of_order_keys() -> crate::Result<()> 
     let Some(payload) = block.get(header_len..header_len + header.data_length as usize) else {
         panic!("payload range within the block");
     };
-    let mut batch = ColumnBatch::decode(payload)?;
+    let mut batch = ColumnBatch::decode(&payload.into())?;
     let poisoned_rows = u64::from(batch.row_count);
     assert!(batch.row_count >= 2, "block holds at least two rows");
     {
@@ -4920,14 +4926,17 @@ fn salvage_drops_a_columnar_block_with_out_of_order_keys() -> crate::Result<()> 
             panic!("second key within the column");
         };
         let second = second.to_vec();
-        let Some(dst0) = key_col.data.get_mut(table_len + o0..table_len + o0 + len) else {
+        // Column bytes are an immutable view now — rebuild the swapped column.
+        let mut swapped = key_col.data.to_vec();
+        let Some(dst0) = swapped.get_mut(table_len + o0..table_len + o0 + len) else {
             panic!("first key range within the column");
         };
         dst0.copy_from_slice(&second);
-        let Some(dst1) = key_col.data.get_mut(table_len + o1..table_len + o1 + len) else {
+        let Some(dst1) = swapped.get_mut(table_len + o1..table_len + o1 + len) else {
             panic!("second key range within the column");
         };
         dst1.copy_from_slice(&first);
+        key_col.data = swapped.into();
     }
     let new_payload = batch.encode(CodecId::Plain)?;
     assert_eq!(
@@ -5025,7 +5034,7 @@ fn verify_point_read_reachability_rejects_a_reordered_columnar_block() -> crate:
     let Some(payload) = block.get(header_len..header_len + header.data_length as usize) else {
         panic!("payload range within the block");
     };
-    let mut batch = ColumnBatch::decode(payload)?;
+    let mut batch = ColumnBatch::decode(&payload.into())?;
     assert!(batch.row_count >= 2, "block holds at least two rows");
     {
         let Some(key_col) = batch.columns.first_mut() else {
@@ -5053,14 +5062,17 @@ fn verify_point_read_reachability_rejects_a_reordered_columnar_block() -> crate:
             panic!("second key within the column");
         };
         let second = second.to_vec();
-        let Some(dst0) = key_col.data.get_mut(table_len + o0..table_len + o0 + len) else {
+        // Column bytes are an immutable view now — rebuild the swapped column.
+        let mut swapped = key_col.data.to_vec();
+        let Some(dst0) = swapped.get_mut(table_len + o0..table_len + o0 + len) else {
             panic!("first key range within the column");
         };
         dst0.copy_from_slice(&second);
-        let Some(dst1) = key_col.data.get_mut(table_len + o1..table_len + o1 + len) else {
+        let Some(dst1) = swapped.get_mut(table_len + o1..table_len + o1 + len) else {
             panic!("second key range within the column");
         };
         dst1.copy_from_slice(&first);
+        key_col.data = swapped.into();
     }
     let new_payload = batch.encode(CodecId::Plain)?;
     let new_header = Header {
@@ -5158,7 +5170,7 @@ fn salvage_drops_a_zero_row_columnar_block() -> crate::Result<()> {
         column_id: id,
         type_tag: TypeTag::Fixed(width),
         validity: None,
-        data: Vec::new(),
+        data: Vec::new().into(),
     };
     let mut columns = vec![
         Column {
@@ -5167,7 +5179,7 @@ fn salvage_drops_a_zero_row_columnar_block() -> crate::Result<()> {
             validity: None,
             // A zero-row Bytes column is exactly its (row_count + 1) * 4 = 4
             // byte offset table.
-            data: vec![0u8; 4],
+            data: vec![0u8; 4].into(),
         },
         empty_fixed(COL_SEQNO, 8),
         empty_fixed(COL_VALUE_TYPE, 1),
@@ -5184,7 +5196,7 @@ fn salvage_drops_a_zero_row_columnar_block() -> crate::Result<()> {
             column_id: next_id,
             type_tag: TypeTag::Bytes,
             validity: None,
-            data: vec![0u8; 4],
+            data: vec![0u8; 4].into(),
         });
         next_id += 1;
         let Some(next_rem) = rem.checked_sub(14) else {
@@ -5479,7 +5491,7 @@ fn salvage_drops_an_out_of_order_columnar_block_in_a_delete_bearing_sst() -> cra
     let Some(payload) = block.get(header_len..header_len + header.data_length as usize) else {
         panic!("payload range within the block");
     };
-    let mut batch = ColumnBatch::decode(payload)?;
+    let mut batch = ColumnBatch::decode(&payload.into())?;
     let poisoned_rows = u64::from(batch.row_count);
     assert!(batch.row_count >= 2, "block holds at least two rows");
     {
@@ -5508,14 +5520,17 @@ fn salvage_drops_an_out_of_order_columnar_block_in_a_delete_bearing_sst() -> cra
             panic!("second key within the column");
         };
         let second = second.to_vec();
-        let Some(dst0) = key_col.data.get_mut(table_len + o0..table_len + o0 + len) else {
+        // Column bytes are an immutable view now — rebuild the swapped column.
+        let mut swapped = key_col.data.to_vec();
+        let Some(dst0) = swapped.get_mut(table_len + o0..table_len + o0 + len) else {
             panic!("first key range within the column");
         };
         dst0.copy_from_slice(&second);
-        let Some(dst1) = key_col.data.get_mut(table_len + o1..table_len + o1 + len) else {
+        let Some(dst1) = swapped.get_mut(table_len + o1..table_len + o1 + len) else {
             panic!("second key range within the column");
         };
         dst1.copy_from_slice(&first);
+        key_col.data = swapped.into();
     }
     let new_payload = batch.encode(CodecId::Plain)?;
     assert_eq!(
@@ -6272,14 +6287,14 @@ fn salvage_fails_closed_on_a_zero_row_block_in_a_delete_bearing_sst() -> crate::
         column_id: id,
         type_tag: TypeTag::Fixed(width),
         validity: None,
-        data: Vec::new(),
+        data: Vec::new().into(),
     };
     let mut columns = vec![
         Column {
             column_id: COL_USER_KEY,
             type_tag: TypeTag::Bytes,
             validity: None,
-            data: vec![0u8; 4],
+            data: vec![0u8; 4].into(),
         },
         empty_fixed(COL_SEQNO, 8),
         empty_fixed(COL_VALUE_TYPE, 1),
@@ -6294,7 +6309,7 @@ fn salvage_fails_closed_on_a_zero_row_block_in_a_delete_bearing_sst() -> crate::
             column_id: next_id,
             type_tag: TypeTag::Bytes,
             validity: None,
-            data: vec![0u8; 4],
+            data: vec![0u8; 4].into(),
         });
         next_id += 1;
         let Some(next_rem) = rem.checked_sub(14) else {
@@ -9478,7 +9493,7 @@ fn salvage_preserves_columnar_value_subcolumns() -> crate::Result<()> {
             column_id: 3,
             type_tag: TypeTag::Fixed(4),
             validity: None,
-            data,
+            data: data.into(),
         });
         writer.write_columnar_batch(&batch, &cmp)?;
     }

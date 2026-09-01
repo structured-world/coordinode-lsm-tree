@@ -359,22 +359,27 @@ impl ColumnarScan {
         let Some(col) = batch.columns.iter_mut().find(|c| c.column_id == COL_SEQNO) else {
             return Ok(());
         };
+        // Column bytes are an immutable (possibly shared) view, so the
+        // globalized column is rebuilt into an owned buffer — one allocation
+        // per batch, and only for bulk-ingested segments (`global != 0`).
+        let mut out = alloc::vec::Vec::with_capacity(batch.row_count as usize * 8);
         for row in 0..batch.row_count as usize {
             let at = row * 8;
             let bytes = col
                 .data
-                .get_mut(at..at + 8)
+                .get(at..at + 8)
                 .ok_or(Error::InvalidHeader("columnar_scan: short seqno column"))?;
             let local = u64::from_le_bytes(
-                (&*bytes)
+                bytes
                     .try_into()
                     .map_err(|_| Error::InvalidHeader("columnar_scan: short seqno column"))?,
             );
             let effective = local.checked_add(global).ok_or(Error::InvalidHeader(
                 "columnar_scan: effective seqno overflows",
             ))?;
-            bytes.copy_from_slice(&effective.to_le_bytes());
+            out.extend_from_slice(&effective.to_le_bytes());
         }
+        col.data = crate::Slice::from(out);
         Ok(())
     }
 
@@ -570,8 +575,11 @@ impl ColumnarScan {
         let mut out = Vec::new();
         // The user key of the last key run whose newest visible version was
         // already emitted (or deliberately dropped by the range filter) —
-        // owned, because a run can span batch boundaries.
-        let mut last_key: Option<alloc::vec::Vec<u8>> = None;
+        // owned, because a run can span batch boundaries. One REUSED buffer:
+        // a fresh `to_vec` per run would make unique-key data (the common
+        // case) pay an allocation and free per row.
+        let mut last_key: alloc::vec::Vec<u8> = alloc::vec::Vec::new();
+        let mut have_last = false;
         for batch in seg.table.columnar_scan(&augmented, None)? {
             if batch.row_count == 0 {
                 continue;
@@ -622,10 +630,7 @@ impl ColumnarScan {
                     continue;
                 }
                 let key = bytes_column_row(&key_col.data, batch.row_count, row)?;
-                if last_key
-                    .as_deref()
-                    .is_some_and(|p| cmp.compare(p, key) == core::cmp::Ordering::Equal)
-                {
+                if have_last && cmp.compare(&last_key, key) == core::cmp::Ordering::Equal {
                     // A later visible version of an already-decided key run —
                     // shadowed by the newest visible version above it.
                     mask.push(false);
@@ -634,7 +639,9 @@ impl ColumnarScan {
                 // First visible row of a new key run = the newest visible
                 // version. Deciding the run here (even when the range filter or
                 // a deletion drops the row) also drops its older versions above.
-                last_key = Some(key.to_vec());
+                last_key.clear();
+                last_key.extend_from_slice(key);
+                have_last = true;
                 // A visible range tombstone deletes the run when it covers the
                 // NEWEST visible version (older versions are older still); an
                 // uncovered newest version shadows the covered older ones, so
@@ -896,14 +903,17 @@ impl ColumnarScan {
         // coordinates. Done before the predicate filter, while row `i` of
         // `merged` still corresponds to `kept[i]`.
         if let Some(col) = merged.columns.iter_mut().find(|c| c.column_id == COL_SEQNO) {
-            for (row, &i) in kept.iter().enumerate() {
-                let at = row * 8;
-                let bytes = col
-                    .data
-                    .get_mut(at..at + 8)
-                    .ok_or(Error::InvalidHeader("columnar_scan: short seqno column"))?;
-                bytes.copy_from_slice(&eff_at(i).to_le_bytes());
+            // Column bytes are an immutable (possibly shared) view — rebuild
+            // the globalized column into an owned buffer (one per merged batch
+            // on this multi-segment path).
+            let mut out = alloc::vec::Vec::with_capacity(kept.len() * 8);
+            for &i in &kept {
+                out.extend_from_slice(&eff_at(i).to_le_bytes());
             }
+            if out.len() != col.data.len() {
+                return Err(Error::InvalidHeader("columnar_scan: short seqno column"));
+            }
+            col.data = crate::Slice::from(out);
         }
 
         // Apply the row predicate AFTER newest-version dedup: each surviving row is

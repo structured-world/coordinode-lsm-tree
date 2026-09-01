@@ -1257,13 +1257,23 @@ impl AbstractTree for Tree {
             let num = u128::from(idx_bytes);
             let den = u128::from(data_end);
             let blob_bytes = table.referenced_blob_bytes()?;
-            let sst_blob = u64::try_from(u128::from(blob_bytes) * num / den).unwrap_or(u64::MAX);
+            // `num <= den` (both offsets are bounded by `data_end`), so
+            // `x * num / den <= x` and the u128 -> u64 narrowing is total —
+            // no fallback value to mask a range error with.
+            #[expect(
+                clippy::cast_possible_truncation,
+                reason = "num <= den, so the quotient never exceeds the u64 input"
+            )]
+            let sst_blob = (u128::from(blob_bytes) * num / den) as u64;
             // Round up to at least one entry: a non-empty byte span over a
             // non-empty SST always covers at least one row, so a narrow range
             // never reports bytes with a zero key count.
-            let in_range_entries = u64::try_from(u128::from(table.metadata.item_count) * num / den)
-                .unwrap_or(u64::MAX)
-                .max(1);
+            #[expect(
+                clippy::cast_possible_truncation,
+                reason = "num <= den, so the quotient never exceeds the u64 input"
+            )]
+            let in_range_entries =
+                ((u128::from(table.metadata.item_count) * num / den) as u64).max(1);
             bytes = bytes.saturating_add(idx_bytes).saturating_add(sst_blob);
             key_count = key_count.saturating_add(in_range_entries);
         }
@@ -1306,9 +1316,14 @@ impl AbstractTree for Tree {
             if count == 0 {
                 return (0, 0);
             }
-            let mt_bytes =
-                u64::try_from(u128::from(mt.size()) * u128::from(count) / u128::from(total))
-                    .unwrap_or(u64::MAX);
+            // `count <= total` (the counted entries are a filtered subset of
+            // the memtable), so the quotient never exceeds the u64 `size()`
+            // and the narrowing is total.
+            #[expect(
+                clippy::cast_possible_truncation,
+                reason = "count <= total, so the quotient never exceeds the u64 input"
+            )]
+            let mt_bytes = (u128::from(mt.size()) * u128::from(count) / u128::from(total)) as u64;
             (mt_bytes, count)
         };
         let (b, c) = estimate(&super_version.active_memtable);
@@ -1468,12 +1483,16 @@ impl AbstractTree for Tree {
                     };
                     let idx_bytes = off_hi.saturating_sub(off_lo);
                     if idx_bytes > 0 {
-                        let est = u64::try_from(
-                            u128::from(table.metadata.item_count) * u128::from(idx_bytes)
-                                / u128::from(data_end),
-                        )
-                        .unwrap_or(u64::MAX)
-                        .max(1);
+                        // `idx_bytes <= data_end` (both offsets are bounded by
+                        // `data_end`), so the quotient never exceeds the u64
+                        // `item_count` and the narrowing is total.
+                        #[expect(
+                            clippy::cast_possible_truncation,
+                            reason = "idx_bytes <= data_end, so the quotient never exceeds the u64 input"
+                        )]
+                        let est = ((u128::from(table.metadata.item_count) * u128::from(idx_bytes)
+                            / u128::from(data_end)) as u64)
+                            .max(1);
                         rows = rows.saturating_add(est);
                     }
                 }

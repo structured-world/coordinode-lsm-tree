@@ -63,3 +63,15 @@ tempfile = "3"
 name = "compare"
 harness = false
 path = "benches/compare.rs"
+
+# Deterministic code layout for the head-to-head harness: default codegen (16
+# units, no LTO) reshuffles function placement on ANY code change, moving the
+# ours-vs-rocksdb ratios by several percent on commits that never touch the
+# measured path. See the same section in the crate root Cargo.toml.
+[profile.release]
+lto = "thin"
+codegen-units = 1
+
+[profile.bench]
+lto = "thin"
+codegen-units = 1
