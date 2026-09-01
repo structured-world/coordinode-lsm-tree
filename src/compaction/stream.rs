@@ -250,6 +250,21 @@ impl<'a, I: Iterator<Item = Item>, F: StreamFilter + 'a> CompactionStream<'a, I,
     /// When a base value or tombstone boundary is found, the result is a `Value`
     /// (complete merge). When no boundary is found (partial merge), the result
     /// remains a `MergeOperand` so future compactions can find the real base.
+    /// [`Self::resolve_merge_operands`] with the stream's own operator. The
+    /// resolver needs `&mut self` for the input stream, so the operator cannot
+    /// be borrowed across the call; it is MOVED out and back instead of
+    /// cloning its `Arc` per merged key (one refcount bump and drop each).
+    /// Restored on every path, including an error. A stream without an
+    /// operator returns `head` untouched.
+    fn resolve_with_operator(&mut self, head: InternalValue) -> crate::Result<InternalValue> {
+        let Some(merge_op) = self.merge_operator.take() else {
+            return Ok(head);
+        };
+        let result = self.resolve_merge_operands(head, merge_op.as_ref());
+        self.merge_operator = Some(merge_op);
+        result
+    }
+
     fn resolve_merge_operands(
         &mut self,
         head: InternalValue,
@@ -491,11 +506,9 @@ impl<'a, I: Iterator<Item = Item>, F: StreamFilter + 'a> Iterator for Compaction
                     // collapse via partial merge (result stays MergeOperand if no base found)
                     if head.key.value_type.is_merge_operand()
                         && head.key.seqno < self.gc_seqno_threshold
-                        && let Some(merge_op) = self.merge_operator.clone()
+                        && self.merge_operator.is_some()
                     {
-                        let merged =
-                            fail_iter!(self.resolve_merge_operands(head, merge_op.as_ref()));
-                        head = merged;
+                        head = fail_iter!(self.resolve_with_operator(head));
                     }
                 } else if peeked.key.seqno < self.gc_seqno_threshold {
                     // Merge operands below GC watermark: collapse via merge operator.
@@ -503,9 +516,8 @@ impl<'a, I: Iterator<Item = Item>, F: StreamFilter + 'a> Iterator for Compaction
                     if head.key.value_type.is_merge_operand()
                         && head.key.seqno < self.gc_seqno_threshold
                     {
-                        if let Some(merge_op) = self.merge_operator.clone() {
-                            let mut merged =
-                                fail_iter!(self.resolve_merge_operands(head, merge_op.as_ref()));
+                        if self.merge_operator.is_some() {
+                            let mut merged = fail_iter!(self.resolve_with_operator(head));
                             // Drop the merged result if an applicable tombstone
                             // outranks it (same rule as the main emit path).
                             if self.covered_by_applied_tombstone(
@@ -559,9 +571,8 @@ impl<'a, I: Iterator<Item = Item>, F: StreamFilter + 'a> Iterator for Compaction
                 && head.key.seqno < self.gc_seqno_threshold
             {
                 // Last stream item is a MergeOperand below GC — partial merge.
-                if let Some(merge_op) = self.merge_operator.clone() {
-                    let merged = fail_iter!(self.resolve_merge_operands(head, merge_op.as_ref()));
-                    head = merged;
+                if self.merge_operator.is_some() {
+                    head = fail_iter!(self.resolve_with_operator(head));
                 }
             }
 

@@ -151,8 +151,15 @@ pub struct Writer {
     /// Stored so `use_partitioned_filter()` can re-apply it to the new writer
     prefix_extractor: Option<Arc<dyn PrefixExtractor>>,
 
-    /// Tracks the previously written item to detect weak tombstone/value pairs
-    previous_item: Option<(UserKey, ValueType)>,
+    /// Value type of the previously written item (merge-operand ordering
+    /// checks in the columnar path).
+    previous_type: Option<ValueType>,
+
+    /// Key of the previously written item ONLY when it was a weak tombstone,
+    /// so a following `Value` for the same key counts as reclaimable. Kept
+    /// separate from `previous_type` so the common path holds no key handle:
+    /// one refcount bump and drop per written entry otherwise.
+    previous_weak_tombstone_key: Option<UserKey>,
 
     linked_blob_files: Vec<LinkedFile>,
 
@@ -469,7 +476,8 @@ impl Writer {
 
             prefix_extractor: None,
 
-            previous_item: None,
+            previous_type: None,
+            previous_weak_tombstone_key: None,
 
             linked_blob_files: Vec::new(),
             range_tombstones: Vec::new(),
@@ -1103,12 +1111,15 @@ impl Writer {
     pub fn write(&mut self, item: InternalValue) -> crate::Result<()> {
         let value_type = item.key.value_type;
         let seqno = item.key.seqno;
-        let user_key = item.key.user_key.clone();
+        // Borrow the key for the bookkeeping below; `item` moves into the
+        // chunk as-is at the end, so no per-entry handle clone is needed.
+        let user_key = &item.key.user_key;
+        let user_key_len = user_key.len();
         let value_len = item.value.len();
 
         // Per-entry shape accounting (pairs with item_count: counts every
         // version). usize -> u64 is a widening cast on every supported target.
-        self.meta.sum_user_key_bytes += user_key.len() as u64;
+        self.meta.sum_user_key_bytes += user_key_len as u64;
         self.meta.sum_value_bytes += value_len as u64;
 
         if item.is_tombstone() {
@@ -1120,9 +1131,8 @@ impl Writer {
         }
 
         if value_type == ValueType::Value
-            && let Some((prev_key, prev_type)) = &self.previous_item
-            && prev_type == &ValueType::WeakTombstone
-            && prev_key.as_ref() == user_key.as_ref()
+            && let Some(prev_key) = &self.previous_weak_tombstone_key
+            && crate::comparator::same_user_key(prev_key, user_key)
         {
             self.meta.weak_tombstone_reclaimable_count += 1;
         }
@@ -1133,7 +1143,7 @@ impl Writer {
         if !self
             .current_key
             .as_ref()
-            .is_some_and(|c| crate::comparator::same_user_key(c, &user_key))
+            .is_some_and(|c| crate::comparator::same_user_key(c, user_key))
         {
             self.meta.key_count += 1;
             self.current_key = Some(user_key.clone());
@@ -1143,7 +1153,7 @@ impl Writer {
             // of the same key
 
             if self.bloom_policy.is_active() {
-                self.filter_writer.register_key(&user_key)?;
+                self.filter_writer.register_key(user_key)?;
             }
 
             // Retrieval-ribbon locator: record this key's newest version (its
@@ -1165,7 +1175,7 @@ impl Writer {
                     crate::config::LocatorPrecision::Entry => pos,
                 };
                 self.locators
-                    .push((crate::hash::hash64(&user_key), self.locator_block_id, slot));
+                    .push((crate::hash::hash64(user_key), self.locator_block_id, slot));
             }
         }
 
@@ -1173,9 +1183,14 @@ impl Writer {
             self.meta.first_key = Some(user_key.clone());
         }
 
-        self.chunk_size += user_key.len() + value_len;
+        // Only a weak tombstone's key is retained (for the reclaimable check
+        // on the next entry); every other entry leaves no handle behind.
+        let weak_tombstone_key = (value_type == ValueType::WeakTombstone).then(|| user_key.clone());
+
+        self.chunk_size += user_key_len + value_len;
         self.chunk.push(item);
-        self.previous_item = Some((user_key, value_type));
+        self.previous_type = Some(value_type);
+        self.previous_weak_tombstone_key = weak_tombstone_key;
         self.current_key_seqno = Some(seqno);
 
         if self.chunk_size >= self.data_block_size as usize {
@@ -1797,9 +1812,8 @@ impl Writer {
                 self.meta.weak_tombstone_count += 1;
             }
             if e.key.value_type == ValueType::Value
-                && let Some((prev_key, prev_type)) = &self.previous_item
-                && prev_type == &ValueType::WeakTombstone
-                && prev_key.as_ref() == user_key.as_ref()
+                && let Some(prev_key) = &self.previous_weak_tombstone_key
+                && crate::comparator::same_user_key(prev_key, user_key)
             {
                 self.meta.weak_tombstone_reclaimable_count += 1;
             }
@@ -1834,7 +1848,9 @@ impl Writer {
             if self.meta.first_key.is_none() {
                 self.meta.first_key = Some(user_key.clone());
             }
-            self.previous_item = Some((user_key.clone(), e.key.value_type));
+            self.previous_type = Some(e.key.value_type);
+            self.previous_weak_tombstone_key =
+                (e.key.value_type == ValueType::WeakTombstone).then(|| user_key.clone());
             self.current_key_seqno = Some(e.key.seqno);
             self.meta.lowest_seqno = self.meta.lowest_seqno.min(e.key.seqno);
             self.meta.highest_seqno = self.meta.highest_seqno.max(e.key.seqno);
@@ -1978,9 +1994,7 @@ impl Writer {
                         first.key.seqno > prev_seqno
                             || (first.key.seqno == prev_seqno
                                 && !(first.key.value_type == crate::ValueType::MergeOperand
-                                    && self.previous_item.as_ref().is_some_and(|(_, vt)| {
-                                        *vt == crate::ValueType::MergeOperand
-                                    })))
+                                    && self.previous_type == Some(crate::ValueType::MergeOperand)))
                     }) =>
                 {
                     return Err(err());
