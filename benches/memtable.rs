@@ -99,44 +99,13 @@ fn splitmix64(state: &mut u64) -> u64 {
     z ^ (z >> 31)
 }
 
-/// Cap on retained per-op samples for the percentile report: enough volume for
-/// a meaningful P999 while bounding memory (Criterion drives these micro-ops
-/// through millions of iterations).
-const PCT_SAMPLE_CAP: usize = 1_000_000;
-
-/// The most recent `PCT_SAMPLE_CAP` per-op timings. A ring, not an append-only
-/// cap: Criterion's warm-up alone runs millions of these ops before measurement
-/// starts, so keeping the FIRST cap-many samples would report the warm-up and
-/// drop every measured op. The measurement phase comes last, so the tail of the
-/// stream is what the report should see.
-struct TailSamples {
-    buf: Vec<std::time::Duration>,
-    seen: usize,
-}
-
-impl TailSamples {
-    fn new() -> Self {
-        Self {
-            buf: Vec::with_capacity(PCT_SAMPLE_CAP),
-            seen: 0,
-        }
-    }
-
-    #[inline]
-    fn record(&mut self, d: std::time::Duration) {
-        if self.buf.len() < PCT_SAMPLE_CAP {
-            self.buf.push(d);
-        } else {
-            self.buf[self.seen % PCT_SAMPLE_CAP] = d;
-        }
-        self.seen += 1;
-    }
-}
+/// Timed lookups in the tail-latency pass that follows each Criterion arm: a
+/// thousand samples behind the P999, and well under a second per arm.
+const PCT_SAMPLES: usize = 200_000;
 
 /// Reports per-op tail latency (P50/P99/P999) to stderr — Criterion's summary
 /// only surfaces mean/CI.
-fn report_percentiles(label: &str, samples: TailSamples) {
-    let mut samples = samples.buf;
+fn report_percentiles(label: &str, mut samples: Vec<std::time::Duration>) {
     if samples.is_empty() {
         return;
     }
@@ -174,12 +143,11 @@ fn memtable_get_many(c: &mut Criterion) {
     }
 
     let mut i = 0usize;
-    // Per-op timing so the percentile report sees individual lookups, not only
-    // Criterion's aggregate. The samples outlive the routine closure: Criterion
-    // re-enters it for warm-up and for every measurement sample, so a
-    // collection declared inside it would be rebuilt and reported per invocation.
-    let mut samples = TailSamples::new();
+    // Set by the routine: Criterion applies the command-line filter by skipping
+    // the routine, and the tail-latency pass below must skip with it.
+    let mut ran = false;
     c.bench_function("memtable get many", |b| {
+        ran = true;
         b.iter_custom(|iters| {
             let mut total = std::time::Duration::ZERO;
             for _ in 0..iters {
@@ -190,11 +158,29 @@ fn memtable_get_many(c: &mut Criterion) {
                 let elapsed = t.elapsed();
                 assert!(found);
                 total += elapsed;
-                samples.record(elapsed);
             }
             total
         });
     });
+    if !ran {
+        return;
+    }
+    // Tail-latency pass, run once Criterion is done with the arm so it sees
+    // the steady state Criterion measured and nothing else. Sampling inside
+    // the routine would take in the warm-up lookups too: Criterion re-enters
+    // the routine for warm-up and for every measurement sample and marks no
+    // phase boundary. Criterion's own report only surfaces mean and CI, hence
+    // the separate P50/P99/P999.
+    let samples: Vec<_> = (0..PCT_SAMPLES)
+        .map(|n| {
+            let key = &probes[n % probes.len()];
+            let t = std::time::Instant::now();
+            let found = memtable.get(key.as_bytes(), MAX_SEQNO).is_some();
+            let elapsed = t.elapsed();
+            assert!(found);
+            elapsed
+        })
+        .collect();
     report_percentiles("get many", samples);
 }
 
@@ -219,9 +205,9 @@ fn memtable_get_miss_many(c: &mut Criterion) {
         .collect();
 
     let mut i = 0usize;
-    // Same sampling shape as `memtable get many` (see the note there).
-    let mut samples = TailSamples::new();
+    let mut ran = false;
     c.bench_function("memtable get miss many", |b| {
+        ran = true;
         b.iter_custom(|iters| {
             let mut total = std::time::Duration::ZERO;
             for _ in 0..iters {
@@ -232,11 +218,24 @@ fn memtable_get_miss_many(c: &mut Criterion) {
                 let elapsed = t.elapsed();
                 assert!(!found);
                 total += elapsed;
-                samples.record(elapsed);
             }
             total
         });
     });
+    if !ran {
+        return;
+    }
+    // Same post-arm tail-latency pass as `memtable get many` (see the note there).
+    let samples: Vec<_> = (0..PCT_SAMPLES)
+        .map(|n| {
+            let key = &probes[n % probes.len()];
+            let t = std::time::Instant::now();
+            let found = memtable.get(key.as_bytes(), MAX_SEQNO).is_some();
+            let elapsed = t.elapsed();
+            assert!(!found);
+            elapsed
+        })
+        .collect();
     report_percentiles("get miss many", samples);
 }
 

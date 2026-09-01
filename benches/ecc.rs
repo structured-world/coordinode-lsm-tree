@@ -17,44 +17,13 @@
 use criterion::{BenchmarkId, Criterion, Throughput, criterion_group, criterion_main};
 use lsm_tree::ecc::{RS_DATA_SHARDS, RS_PARITY_SHARDS, encode_parity, try_recover};
 
-/// Cap on retained per-read samples for the percentile report: enough volume
-/// for a meaningful P999 while bounding memory (Criterion drives the
-/// sub-microsecond reads through millions of iterations).
-const PCT_SAMPLE_CAP: usize = 1_000_000;
-
-/// The most recent `PCT_SAMPLE_CAP` per-read timings. A ring, not an
-/// append-only cap: Criterion's warm-up alone runs millions of these reads
-/// before measurement starts, so keeping the FIRST cap-many samples would
-/// report the warm-up and drop every measured read. The measurement phase
-/// comes last, so the tail of the stream is what the report should see.
-struct TailSamples {
-    buf: Vec<std::time::Duration>,
-    seen: usize,
-}
-
-impl TailSamples {
-    fn new() -> Self {
-        Self {
-            buf: Vec::with_capacity(PCT_SAMPLE_CAP),
-            seen: 0,
-        }
-    }
-
-    #[inline]
-    fn record(&mut self, d: std::time::Duration) {
-        if self.buf.len() < PCT_SAMPLE_CAP {
-            self.buf.push(d);
-        } else {
-            self.buf[self.seen % PCT_SAMPLE_CAP] = d;
-        }
-        self.seen += 1;
-    }
-}
+/// Timed reads in the tail-latency pass that follows each Criterion arm: a
+/// thousand samples behind the P999, and well under a second per arm.
+const PCT_SAMPLES: usize = 200_000;
 
 /// Reports per-read tail latency (P50/P99/P999) to stderr — Criterion's summary
 /// only surfaces mean/CI.
-fn report_percentiles(label: &str, samples: TailSamples) {
-    let mut samples = samples.buf;
+fn report_percentiles(label: &str, mut samples: Vec<std::time::Duration>) {
     if samples.is_empty() {
         return;
     }
@@ -228,13 +197,12 @@ fn bench_clean_read(c: &mut Criterion) {
             let handle = BlockHandle::new(BlockOffset(0), on_disk);
 
             group.throughput(Throughput::Bytes(size as u64));
-            // Per-read timing so the percentile report sees individual reads
-            // (tail latency), not only Criterion's aggregate. The samples
-            // outlive the routine closure: Criterion re-enters that closure
-            // for warm-up and for every measurement sample, so a collection
-            // declared inside it would be rebuilt and reported per invocation.
-            let mut samples = TailSamples::new();
+            // Set by the routine: Criterion applies the command-line filter by
+            // skipping the routine, and the tail-latency pass below must skip
+            // with it.
+            let mut ran = false;
             group.bench_with_input(BenchmarkId::new(label, size), &handle, |b, &handle| {
+                ran = true;
                 b.iter_custom(|iters| {
                     let mut total = std::time::Duration::ZERO;
                     for _ in 0..iters {
@@ -244,11 +212,29 @@ fn bench_clean_read(c: &mut Criterion) {
                         let elapsed = t.elapsed();
                         std::hint::black_box(block);
                         total += elapsed;
-                        samples.record(elapsed);
                     }
                     total
                 });
             });
+            if !ran {
+                continue;
+            }
+            // Tail-latency pass, run once Criterion is done with the arm so it
+            // sees the steady state Criterion measured and nothing else.
+            // Sampling inside the routine would take in the warm-up reads too:
+            // Criterion re-enters the routine for warm-up and for every
+            // measurement sample and marks no phase boundary. Criterion's own
+            // report only surfaces mean and CI, hence the separate P50/P99/P999.
+            let samples: Vec<_> = (0..PCT_SAMPLES)
+                .map(|_| {
+                    let t = std::time::Instant::now();
+                    let block = Block::from_file(&*file, handle, identity, &transform)
+                        .expect("clean read succeeds");
+                    let elapsed = t.elapsed();
+                    std::hint::black_box(block);
+                    elapsed
+                })
+                .collect();
             report_percentiles(&format!("clean_read/{label}/{size}"), samples);
         }
     }
