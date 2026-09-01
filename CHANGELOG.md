@@ -11,6 +11,12 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 
 ## [Unreleased]
 
+## [5.8.2](https://github.com/structured-world/coordinode-lsm-tree/compare/v5.8.1...v5.8.2) - 2026-09-01
+
+### Performance
+
+- close the hot-path audit (ECC clean read, zero-copy columns, deterministic codegen) ([#602](https://github.com/structured-world/coordinode-lsm-tree/pull/602))
+
 ## [5.8.1](https://github.com/structured-world/coordinode-lsm-tree/compare/v5.8.0...v5.8.1) - 2026-08-31
 
 ### Documentation
