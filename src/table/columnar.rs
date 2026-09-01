@@ -26,11 +26,11 @@
 //!         column_id: 7,
 //!         type_tag: TypeTag::Fixed(4),
 //!         validity: Some(vec![0b0000_0001]), // row 0 valid, row 1 null
-//!         data: vec![1, 0, 0, 0, 0, 0, 0, 0],
+//!         data: vec![1, 0, 0, 0, 0, 0, 0, 0].into(),
 //!     }],
 //! };
 //! let bytes = batch.encode(CodecId::Plain).unwrap();
-//! assert_eq!(ColumnBatch::decode(&bytes).unwrap(), batch);
+//! assert_eq!(ColumnBatch::decode(&bytes.into()).unwrap(), batch);
 //! ```
 //!
 //! # Schema evolution
