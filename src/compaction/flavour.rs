@@ -240,9 +240,16 @@ pub(super) fn prepare_table_writer(
     // writes stay ordered. None / single-thread leaves the serial path.
     // Skipped for sub-compaction writers (block_parallel = false), which
     // already occupy the pool's workers — see the `block_parallel` parameter
-    // note on `prepare_table_writer`.
+    // note on `prepare_table_writer`. Also skipped (like the flush writers)
+    // when the per-block transform does no real CPU work: with the identity
+    // transform the pipeline's owned buffer + queue hop per block only adds
+    // lock traffic and pool churn over the serial reusable-buffer path.
     #[cfg(feature = "std")]
-    let table_writer = if block_parallel {
+    let transform_does_work = data_block_compression != crate::CompressionType::None
+        || opts.config.encryption.is_some()
+        || opts.config.page_ecc;
+    #[cfg(feature = "std")]
+    let table_writer = if block_parallel && transform_does_work {
         table_writer.use_parallel_compression(
             opts.config.compaction_pool.clone(),
             opts.config.compaction_threads,
