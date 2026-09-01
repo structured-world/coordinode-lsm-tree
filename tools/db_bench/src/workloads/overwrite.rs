@@ -1,5 +1,5 @@
 use crate::config::BenchConfig;
-use crate::db::{make_sequential_key, make_value, prefill_sequential};
+use crate::db::{fill_sequential_key, make_value, prefill_sequential};
 use crate::reporter::Reporter;
 use crate::workloads::{Workload, run_threaded};
 use lsm_tree::{AbstractTree, AnyTree};
@@ -24,15 +24,18 @@ impl Workload for Overwrite {
         run_threaded(config, reporter, |_t, my_ops, _start| {
             let mut local = Reporter::new();
             let mut rng = rand::rng();
+            // One key buffer and one value per thread: the engine copies what
+            // it keeps, so per-op `Vec`s would only add harness overhead.
+            let mut key = vec![0u8; config.key_size];
+            let value = make_value(config.value_size);
 
             for _ in 0..my_ops {
                 let idx: u64 = rng.random_range(0..config.num);
-                let key = make_sequential_key(idx, config.key_size);
-                let value = make_value(config.value_size);
+                fill_sequential_key(&mut key, idx);
                 let seq = seqno.fetch_add(1, Ordering::Relaxed);
 
                 let t = Instant::now();
-                tree.insert(key, value, seq);
+                tree.insert(&key[..], &value[..], seq);
                 local.record_duration(t.elapsed());
             }
 
