@@ -22,9 +22,39 @@ use lsm_tree::ecc::{RS_DATA_SHARDS, RS_PARITY_SHARDS, encode_parity, try_recover
 /// sub-microsecond reads through millions of iterations).
 const PCT_SAMPLE_CAP: usize = 1_000_000;
 
+/// The most recent `PCT_SAMPLE_CAP` per-read timings. A ring, not an
+/// append-only cap: Criterion's warm-up alone runs millions of these reads
+/// before measurement starts, so keeping the FIRST cap-many samples would
+/// report the warm-up and drop every measured read. The measurement phase
+/// comes last, so the tail of the stream is what the report should see.
+struct TailSamples {
+    buf: Vec<std::time::Duration>,
+    seen: usize,
+}
+
+impl TailSamples {
+    fn new() -> Self {
+        Self {
+            buf: Vec::with_capacity(PCT_SAMPLE_CAP),
+            seen: 0,
+        }
+    }
+
+    #[inline]
+    fn record(&mut self, d: std::time::Duration) {
+        if self.buf.len() < PCT_SAMPLE_CAP {
+            self.buf.push(d);
+        } else {
+            self.buf[self.seen % PCT_SAMPLE_CAP] = d;
+        }
+        self.seen += 1;
+    }
+}
+
 /// Reports per-read tail latency (P50/P99/P999) to stderr — Criterion's summary
 /// only surfaces mean/CI.
-fn report_percentiles(label: &str, mut samples: Vec<std::time::Duration>) {
+fn report_percentiles(label: &str, samples: TailSamples) {
+    let mut samples = samples.buf;
     if samples.is_empty() {
         return;
     }
@@ -199,11 +229,11 @@ fn bench_clean_read(c: &mut Criterion) {
 
             group.throughput(Throughput::Bytes(size as u64));
             // Per-read timing so the percentile report sees individual reads
-            // (tail latency), not only Criterion's aggregate. The sample vector
-            // outlives the routine closure: Criterion re-enters that closure
-            // for warm-up and for every measurement sample, so a vector
+            // (tail latency), not only Criterion's aggregate. The samples
+            // outlive the routine closure: Criterion re-enters that closure
+            // for warm-up and for every measurement sample, so a collection
             // declared inside it would be rebuilt and reported per invocation.
-            let mut samples = Vec::new();
+            let mut samples = TailSamples::new();
             group.bench_with_input(BenchmarkId::new(label, size), &handle, |b, &handle| {
                 b.iter_custom(|iters| {
                     let mut total = std::time::Duration::ZERO;
@@ -214,9 +244,7 @@ fn bench_clean_read(c: &mut Criterion) {
                         let elapsed = t.elapsed();
                         std::hint::black_box(block);
                         total += elapsed;
-                        if samples.len() < PCT_SAMPLE_CAP {
-                            samples.push(elapsed);
-                        }
+                        samples.record(elapsed);
                     }
                     total
                 });
