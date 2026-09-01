@@ -435,3 +435,60 @@ fn a_transform_on_the_rotation_boundary_belongs_to_the_new_output() -> crate::Re
     );
     Ok(())
 }
+
+/// Regression: output rotation must recognise a NEW user key by byte
+/// identity, not by byte order. `MultiWriter::write` used `current_key <
+/// new_key` to detect the next key, which under a comparator whose order is
+/// not the byte order (here: reversed) is false for every key after the
+/// first, so `target_size` was never consulted and the whole stream landed
+/// in one table. Keys arrive in comparator order (descending bytes), each
+/// with a value that fills a whole 4 KiB data block (so the block spills and
+/// the size hint grows past the 100-byte target before the next key):
+/// every key after the first must open a new output.
+#[test]
+fn multi_writer_rotates_under_a_non_lexicographic_comparator() -> crate::Result<()> {
+    use crate::fs::StdFs;
+    use crate::{InternalValue, UserKey};
+    use std::sync::Arc;
+
+    #[derive(Debug)]
+    struct ReverseComparator;
+    impl crate::comparator::UserComparator for ReverseComparator {
+        fn name(&self) -> &'static str {
+            "reverse-test"
+        }
+        fn compare(&self, a: &[u8], b: &[u8]) -> core::cmp::Ordering {
+            b.cmp(a)
+        }
+        fn is_lexicographic(&self) -> bool {
+            false
+        }
+    }
+
+    let folder = tempfile::tempdir()?;
+    let base_path = folder.path().to_path_buf();
+    std::fs::create_dir_all(&base_path)?;
+
+    let id_gen = SequenceNumberCounter::default();
+    let fs: Arc<dyn crate::fs::Fs> = Arc::new(StdFs);
+    let mut mw = super::MultiWriter::new(base_path, id_gen, 100, 1, fs)?
+        .set_comparator(Arc::new(ReverseComparator));
+
+    // Comparator order for a reversed comparator: byte-descending.
+    for key in [b"z" as &[u8], b"l", b"a"] {
+        mw.write(InternalValue::from_components(
+            UserKey::from(key),
+            vec![0u8; 4_096],
+            1,
+            crate::ValueType::Value,
+        ))?;
+    }
+
+    let results = mw.finish()?;
+    assert_eq!(
+        results.len(),
+        3,
+        "each new key exceeds the 100-byte target, so every key after the first opens a new output"
+    );
+    Ok(())
+}
