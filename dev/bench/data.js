@@ -1,5 +1,5 @@
 window.BENCHMARK_DATA = {
-  "lastUpdate": 1788237401367,
+  "lastUpdate": 1788261733736,
   "repoUrl": "https://github.com/structured-world/coordinode-lsm-tree",
   "entries": {
     "lsm-tree db_bench": [
@@ -20982,6 +20982,84 @@ window.BENCHMARK_DATA = {
             "value": 777327.9976606781,
             "unit": "ops/sec",
             "extra": "P50: 1.1us | P99: 4.3us | P99.9: 6.8us\nthreads: 1 | elapsed: 0.26s | num: 200000 | iterations: 3"
+          }
+        ]
+      },
+      {
+        "commit": {
+          "author": {
+            "email": "mail@polaz.com",
+            "name": "Dmitry Prudnikov",
+            "username": "polaz"
+          },
+          "committer": {
+            "email": "noreply@github.com",
+            "name": "GitHub",
+            "username": "web-flow"
+          },
+          "distinct": true,
+          "id": "f4fcef994e830c07288991937c50f0c21a8e5a18",
+          "message": "perf: bench harness wall-clock fix and write hot-path audit (#606)\n\n## Summary\n\nTwo things on one branch: the compare-rocksdb bench harness that has\nkept the Benchmark workflow from finishing since 2026-06-20, and a write\nhot-path audit of the db_bench write workloads (fillseq, fillrandom,\noverwrite, mergerandom) it was measured with.\n\n### Bench harness (#604)\n\nThe compare-rocksdb step ran the full hour and reached 6 of 8 groups;\nevery Benchmark run since June is `cancelled` and `dev/compare` on\ngh-pages is stale.\n\n- `group.sample_size(..)` in code silently overrode the workflow's\n`--sample-size 10`, so every 1k/10k arm collected 100 samples; a cold\nRocksDB zstd-22 write of 10k rows is ~5 s, so one arm ran 9 min. The\nworkflow flags are now the single source of truth.\n- The warm read groups built their on-disk state inside the\n`bench_with_input` routine closure, which Criterion re-enters for\nwarm-up and for every sample: 101 populates per arm. State is built once\nper arm (`WarmEngine`).\n- The RocksDB `multi_get` arm opened via `DB::open_cf`, which gives the\ncolumn family default `Options`: no zstd-22, no bloom, no 16 MiB cache.\nIt now opens through a descriptor carrying the bench options.\n- Compaction percentiles were reported per closure entry; now once per\narm.\n- Job cap 60 -> 90 min: the matrix is ~40 min warm, a cold\nlibrocksdb-sys build adds 15-25 min.\n\n### Write hot-path audit (#605)\n\n- `SuperVersions::latest_version()` cloned the SuperVersion (three Arc\nbumps and drops) on every insert; the write path borrows it\n(`latest_version_ref()`).\n- The AtInsert digest gate took an `ArcSwap` guard per insert; it is one\nrelaxed byte on TreeInner now, rewritten by `update_runtime_config`.\n- The memtable rebuilt the InternalKey it already had and cloned the\nvalue into the ValueStore; the key is borrowed and the value moves.\nValueStore index counter: CAS loop -> `fetch_add` under a release-active\n`assert` (the arena panics roughly 28x before the counter could wrap,\nbut the bound spans two modules and a wrap would silently re-issue slot\n0, so the guard holds in release too). `approximate_size` RMWs: AcqRel\n-> Relaxed.\n- Skiplist tail hint: a height-1 node whose key sorts after the current\ntail links straight behind it; re-validated, the level-0 CAS stays\nauthoritative.\n- **Bug**: `MultiWriter::write` detected a new key with byte-order `<`,\nso under a comparator whose order is not the byte order (reversed,\nnumeric) outputs never rotated and `target_size` was ignored. Regression\ntest added (test-first: 1 output before, 3 after).\n- Table writer cloned every entry's key handle twice; only a weak\ntombstone's key is retained now. CompactionStream cloned the\nmerge-operator Arc per merged key; it is moved out and back around the\ncall.\n- db_bench write workloads allocated a key and a value `Vec` per op; one\nbuffer per thread now, as RocksDB's db_bench does. This lifts the write\nseries on the dashboard by about +10% on its own (harness step, not\nengine).\n\n## Measurements\n\nLocal Mac, 1M ops, interleaved old/new binaries, 5 rounds:\n\n| workload | before | after |\n|---|---|---|\n| fillseq | 2.15M ops/s | 4.25M engine-only, 4.7M with the harness\nchange |\n| overwrite | ~0.54M | +2..9% (5/5 rounds) |\n| mergerandom | ~0.80M | +2..4% (4/5) |\n| fillrandom | ~0.55M | neutral |\n\nSmoke of the harness: `point_read_zstd22/rocksdb/10000` +\n`multi_get_zstd22/rocksdb/10000` run in 16 s total with one setup each.\n\n## Testing\n\nfmt; clippy `--all-features --all-targets -D warnings` (crate and\ndb_bench); `cargo doc` default and all-features with 0 warnings; nextest\n3245/3245 (all features); doctests 78/78; no-std check 0 errors;\ncompare-rocksdb `cargo check --benches`. The value-index guard also has\na release-profile regression test (`debug_assert` is compiled out there,\nso the test fails on the previous code).\n\nCloses #604\nCloses #605\n\n\n<!-- This is an auto-generated comment: release notes by coderabbit.ai\n-->\n\n## Summary by CodeRabbit\n\n* **Bug Fixes**\n* Fixed table rotation when using custom key comparators, including\nreverse or numeric ordering.\n* Improved handling of weak tombstones and merge operations across\ndifferent key orderings.\n\n* **Performance**\n* Reduced overhead during memtable inserts, compaction, version access,\nand value storage.\n* Improved benchmark and workload efficiency by reusing resources and\navoiding unnecessary setup.\n\n* **Reliability**\n* Added safeguards and coverage for custom comparator ordering,\ninsertion ordering, and checksum behavior.\n\n<!-- end of auto-generated comment: release notes by coderabbit.ai -->",
+          "timestamp": "2026-09-01T14:20:31+03:00",
+          "tree_id": "b13fa7c52832ebbb430497a5fca2b2b15fb8c8b5",
+          "url": "https://github.com/structured-world/coordinode-lsm-tree/commit/f4fcef994e830c07288991937c50f0c21a8e5a18"
+        },
+        "date": 1788261732410,
+        "tool": "customBiggerIsBetter",
+        "benches": [
+          {
+            "name": "fillseq",
+            "value": 3553696.82996561,
+            "unit": "ops/sec",
+            "extra": "P50: 0.1us | P99: 1.5us | P99.9: 3.4us\nthreads: 1 | elapsed: 0.06s | num: 200000 | iterations: 3"
+          },
+          {
+            "name": "fillrandom",
+            "value": 1254800.1123497828,
+            "unit": "ops/sec",
+            "extra": "P50: 0.7us | P99: 2.1us | P99.9: 4.2us\nthreads: 1 | elapsed: 0.16s | num: 200000 | iterations: 3"
+          },
+          {
+            "name": "readrandom",
+            "value": 836160.0385396195,
+            "unit": "ops/sec",
+            "extra": "P50: 1.0us | P99: 4.1us | P99.9: 6.6us\nthreads: 1 | elapsed: 0.24s | num: 200000 | iterations: 3"
+          },
+          {
+            "name": "readseq",
+            "value": 3837074.000849912,
+            "unit": "ops/sec",
+            "extra": "P50: 0.1us | P99: 3.1us | P99.9: 5.5us\nthreads: 1 | elapsed: 0.05s | num: 200000 | iterations: 3"
+          },
+          {
+            "name": "seekrandom",
+            "value": 469740.80188733584,
+            "unit": "ops/sec",
+            "extra": "P50: 1.8us | P99: 5.0us | P99.9: 7.9us\nthreads: 1 | elapsed: 0.43s | num: 200000 | iterations: 3"
+          },
+          {
+            "name": "prefixscan",
+            "value": 251239.61279498576,
+            "unit": "ops/sec",
+            "extra": "P50: 3.7us | P99: 6.9us | P99.9: 9.3us\nthreads: 1 | elapsed: 0.80s | num: 200000 | iterations: 3"
+          },
+          {
+            "name": "overwrite",
+            "value": 1272491.064838147,
+            "unit": "ops/sec",
+            "extra": "P50: 0.7us | P99: 2.1us | P99.9: 4.2us\nthreads: 1 | elapsed: 0.16s | num: 200000 | iterations: 3"
+          },
+          {
+            "name": "mergerandom",
+            "value": 1189959.054103928,
+            "unit": "ops/sec",
+            "extra": "P50: 0.3us | P99: 1.4us | P99.9: 2.2us\nthreads: 1 | elapsed: 0.17s | num: 200000 | iterations: 3"
+          },
+          {
+            "name": "readwhilewriting",
+            "value": 711129.9228680041,
+            "unit": "ops/sec",
+            "extra": "P50: 1.2us | P99: 4.3us | P99.9: 6.9us\nthreads: 1 | elapsed: 0.28s | num: 200000 | iterations: 3"
           }
         ]
       }
