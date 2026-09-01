@@ -1591,10 +1591,16 @@ impl Block {
                     })?;
                     (buf.slice(header_len..header_len + actual_data_len), None)
                 } else {
-                    // Resident-frame verify: the clean case (the overwhelming
-                    // majority) serves the payload as a zero-copy view of the
-                    // read buffer, exactly like the non-ECC arm above, instead
-                    // of copying payload + parity out through a cursor.
+                    // Resident-frame verify: the checksum runs in place over the
+                    // read buffer (no cursor copy of payload + parity). The clean
+                    // payload is then DETACHED into its own allocation rather
+                    // than served as a view of `buf`: a view would keep the whole
+                    // frame alive, parity trailer included, for as long as the
+                    // block sits in the block cache, whose weight charges only
+                    // header + payload. That would let the cache overshoot its
+                    // capacity by the parity ratio (12.5% SEC-DED, 50% RS(4,2)).
+                    // One payload copy per disk read is the price of exact cache
+                    // accounting; the parity bytes are never copied or touched.
                     #[expect(clippy::indexing_slicing, reason = "header was decoded from buf")]
                     match Self::verify_resident_payload(
                         &buf[header_len..],
@@ -1603,7 +1609,10 @@ impl Block {
                         parsed_header.checksum,
                         block_ecc_params(&parsed_header, transform),
                     )? {
-                        None => (buf.slice(header_len..header_len + actual_data_len), None),
+                        None => (
+                            Slice::from(&buf[header_len..header_len + actual_data_len]),
+                            None,
+                        ),
                         Some((healed, kind)) => (healed, Some(kind)),
                     }
                 };

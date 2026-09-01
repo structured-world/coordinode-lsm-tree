@@ -17,6 +17,29 @@
 use criterion::{BenchmarkId, Criterion, Throughput, criterion_group, criterion_main};
 use lsm_tree::ecc::{RS_DATA_SHARDS, RS_PARITY_SHARDS, encode_parity, try_recover};
 
+/// Cap on retained per-read samples for the percentile report: enough volume
+/// for a meaningful P999 while bounding memory (Criterion drives the
+/// sub-microsecond reads through millions of iterations).
+const PCT_SAMPLE_CAP: usize = 1_000_000;
+
+/// Reports per-read tail latency (P50/P99/P999) to stderr — Criterion's summary
+/// only surfaces mean/CI.
+fn report_percentiles(label: &str, mut samples: Vec<std::time::Duration>) {
+    if samples.is_empty() {
+        return;
+    }
+    samples.sort_unstable();
+    let pick =
+        |per_mille: usize| samples[(samples.len() * per_mille / 1000).min(samples.len() - 1)];
+    eprintln!(
+        "  [{label}] n={} P50={:?} P99={:?} P999={:?}",
+        samples.len(),
+        pick(500),
+        pick(990),
+        pick(999),
+    );
+}
+
 /// Block sizes covering the typical SST data-block range. 4 KiB is
 /// the default `data_block_size` in `Writer`; the larger sizes show
 /// how parity scales with the on-disk payload (parity is ~50% the
@@ -136,8 +159,8 @@ fn bench_try_recover_all_subsets_fail(c: &mut Criterion) {
 
 fn bench_clean_read(c: &mut Criterion) {
     // The path EVERY ECC-protected block read takes: frame in, checksum
-    // matches, payload served. This is where the verify must be
-    // allocation-free — recovery (benched above) runs only on a mismatch.
+    // matches in place, payload detached and served. The parity bytes must
+    // never be copied here — recovery (benched above) runs only on a mismatch.
     use lsm_tree::fs::{Fs, FsOpenOptions, MemFs};
     use lsm_tree::table::BlockHandle;
     use lsm_tree::table::block::{
@@ -176,11 +199,28 @@ fn bench_clean_read(c: &mut Criterion) {
 
             group.throughput(Throughput::Bytes(size as u64));
             group.bench_with_input(BenchmarkId::new(label, size), &handle, |b, &handle| {
-                b.iter(|| {
-                    let block = Block::from_file(&*file, handle, identity, &transform)
-                        .expect("clean read succeeds");
-                    std::hint::black_box(block);
+                // Per-read timing so the percentile report sees individual
+                // reads (tail latency), not only Criterion's aggregate.
+                let mut samples = Vec::new();
+                b.iter_custom(|iters| {
+                    let mut total = std::time::Duration::ZERO;
+                    for _ in 0..iters {
+                        let t = std::time::Instant::now();
+                        let block = Block::from_file(&*file, handle, identity, &transform)
+                            .expect("clean read succeeds");
+                        let elapsed = t.elapsed();
+                        std::hint::black_box(block);
+                        total += elapsed;
+                        if samples.len() < PCT_SAMPLE_CAP {
+                            samples.push(elapsed);
+                        }
+                    }
+                    total
                 });
+                report_percentiles(
+                    &format!("clean_read/{label}/{size}"),
+                    std::mem::take(&mut samples),
+                );
             });
         }
     }
