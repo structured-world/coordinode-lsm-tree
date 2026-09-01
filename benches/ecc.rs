@@ -198,10 +198,13 @@ fn bench_clean_read(c: &mut Criterion) {
             let handle = BlockHandle::new(BlockOffset(0), on_disk);
 
             group.throughput(Throughput::Bytes(size as u64));
+            // Per-read timing so the percentile report sees individual reads
+            // (tail latency), not only Criterion's aggregate. The sample vector
+            // outlives the routine closure: Criterion re-enters that closure
+            // for warm-up and for every measurement sample, so a vector
+            // declared inside it would be rebuilt and reported per invocation.
+            let mut samples = Vec::new();
             group.bench_with_input(BenchmarkId::new(label, size), &handle, |b, &handle| {
-                // Per-read timing so the percentile report sees individual
-                // reads (tail latency), not only Criterion's aggregate.
-                let mut samples = Vec::new();
                 b.iter_custom(|iters| {
                     let mut total = std::time::Duration::ZERO;
                     for _ in 0..iters {
@@ -217,11 +220,8 @@ fn bench_clean_read(c: &mut Criterion) {
                     }
                     total
                 });
-                report_percentiles(
-                    &format!("clean_read/{label}/{size}"),
-                    std::mem::take(&mut samples),
-                );
             });
+            report_percentiles(&format!("clean_read/{label}/{size}"), samples);
         }
     }
     group.finish();
