@@ -1457,7 +1457,7 @@ fn from_columnar_block_masked_drops_deleted_positions() {
     let mut dv = DeleteBitmap::new();
     dv.insert(10);
     dv.insert(12);
-    let block = DataBlock::from_columnar_block_masked(&data, 16, &dv, 10)
+    let block = DataBlock::from_columnar_block_masked(&data.into(), 16, &dv, 10)
         .unwrap()
         .expect("not all rows deleted");
 
@@ -1508,7 +1508,7 @@ fn from_columnar_block_masked_returns_none_when_all_deleted() {
     dv.insert(0);
     dv.insert(1);
     assert!(
-        DataBlock::from_columnar_block_masked(&data, 16, &dv, 0)
+        DataBlock::from_columnar_block_masked(&data.into(), 16, &dv, 0)
             .unwrap()
             .is_none()
     );

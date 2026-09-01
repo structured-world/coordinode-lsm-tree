@@ -472,7 +472,9 @@ impl DataBlock {
     /// these directly (no serialize + re-parse round-trip); [`Self::from_columnar_block`]
     /// re-encodes on top of this for the byte-based point-read path.
     #[cfg(feature = "columnar")]
-    pub(crate) fn columnar_block_entries(block_data: &[u8]) -> crate::Result<Vec<InternalValue>> {
+    pub(crate) fn columnar_block_entries(
+        block_data: &crate::Slice,
+    ) -> crate::Result<Vec<InternalValue>> {
         let batch = crate::table::columnar::ColumnBatch::decode(block_data)?;
         // Consuming, zero-copy untranspose: row keys / values are views into the
         // batch's column buffers rather than per-row copies.
@@ -493,7 +495,7 @@ impl DataBlock {
     /// deleted (the caller skips the block).
     #[cfg(feature = "columnar")]
     pub(crate) fn columnar_block_entries_masked(
-        block_data: &[u8],
+        block_data: &crate::Slice,
         deletes: &crate::table::delete_bitmap::DeleteBitmap,
         block_start_row: u32,
     ) -> crate::Result<Option<Vec<InternalValue>>> {
@@ -520,7 +522,7 @@ impl DataBlock {
 
     #[cfg(feature = "columnar")]
     pub(crate) fn from_columnar_block(
-        block_data: &[u8],
+        block_data: &crate::Slice,
         restart_interval: u8,
     ) -> crate::Result<Self> {
         let entries = Self::columnar_block_entries(block_data)?;
@@ -534,7 +536,7 @@ impl DataBlock {
     /// and re-encoding the whole block per lookup.
     #[cfg(feature = "columnar")]
     pub(crate) fn columnar_point_block(
-        block_data: &[u8],
+        block_data: &crate::Slice,
         needle: &[u8],
         comparator: &crate::comparator::SharedComparator,
         restart_interval: u8,
@@ -561,7 +563,7 @@ impl DataBlock {
     // delete-masking path (see `Iter::load_and_resolve`).
     #[cfg(feature = "columnar")]
     pub(crate) fn from_columnar_block_masked(
-        block_data: &[u8],
+        block_data: &crate::Slice,
         restart_interval: u8,
         deletes: &crate::table::delete_bitmap::DeleteBitmap,
         block_start_row: u32,

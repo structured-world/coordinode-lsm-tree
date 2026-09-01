@@ -240,7 +240,11 @@ pub struct Column {
     /// row is valid / non-null).
     pub validity: Option<Vec<u8>>,
     /// Decoded column bytes, framed per [`TypeTag`].
-    pub data: Vec<u8>,
+    ///
+    /// A zero-copy view of the decoded block for `Plain` columns (the common
+    /// codec — a projection then never copies the column bytes); an owned
+    /// buffer for re-coded (`Delta`) columns.
+    pub data: crate::Slice,
 }
 
 /// A decoded columnar row-group: the read unit obtained by decoding a
@@ -575,7 +579,7 @@ impl ColumnBatch {
             merged.push((new_data, new_validity));
         }
         for (col, (data, validity)) in self.columns.iter_mut().zip(merged) {
-            col.data = data;
+            col.data = crate::Slice::from(data);
             col.validity = validity;
         }
         self.row_count = combined_rows;
@@ -632,7 +636,7 @@ impl ColumnBatch {
     /// could hold, carries an unknown type / codec tag, a non-canonical width /
     /// validity flag, or any column that fails [`Column::validate`] (fixed-width
     /// length, `Bytes` offset framing, validity bitmap length / padding).
-    pub fn decode(bytes: &[u8]) -> Result<Self> {
+    pub fn decode(bytes: &crate::Slice) -> Result<Self> {
         Self::decode_inner(bytes, None)
     }
 
@@ -646,14 +650,17 @@ impl ColumnBatch {
     ///
     /// As [`ColumnBatch::decode`], evaluated only for the projected columns
     /// (the headers of skipped columns are still framing-checked).
-    pub fn decode_projected(bytes: &[u8], wanted: &[u16]) -> Result<Self> {
+    pub fn decode_projected(bytes: &crate::Slice, wanted: &[u16]) -> Result<Self> {
         Self::decode_inner(bytes, Some(wanted))
     }
 
     /// Shared decode body. `wanted == None` decodes every column; `Some(ids)`
     /// decodes only the listed columns and skips the rest (their validity + data
     /// bytes are stepped over, never allocated or codec-decoded).
-    fn decode_inner(bytes: &[u8], wanted: Option<&[u16]>) -> Result<Self> {
+    ///
+    /// Takes the refcounted block bytes so `Plain` columns come back as
+    /// zero-copy views of the block instead of per-column copies.
+    fn decode_inner(bytes: &crate::Slice, wanted: Option<&[u16]>) -> Result<Self> {
         // Smallest possible column: id(2) + type(1) + width(1) + codec(1) +
         // has_validity(1) + data_len(4), with empty validity + data.
         const MIN_COLUMN_BYTES: usize = 10;
@@ -694,13 +701,18 @@ impl ColumnBatch {
             } else {
                 None
             };
+            let data_start = cur.pos;
             let raw = cur.read_bytes(data_len)?;
             if !want {
                 continue;
             }
-            // Restore the column's logical bytes from its stored codec form
-            // (Plain is identity; Delta runs the prefix-sum).
-            let data = codec_decode(codec, type_tag, raw)?;
+            // Restore the column's logical bytes from its stored codec form.
+            // Plain is the identity: the column is served as a zero-copy view
+            // of the block bytes. Delta re-codes into an owned buffer.
+            let data = match codec {
+                CodecId::Plain => bytes.slice(data_start..data_start + data_len),
+                CodecId::Delta => crate::Slice::from(codec_decode(codec, type_tag, raw)?),
+            };
             let column = Column {
                 column_id,
                 type_tag,
@@ -950,25 +962,25 @@ pub fn entries_to_column_batch(entries: &[InternalValue]) -> Result<ColumnBatch>
             column_id: COL_USER_KEY,
             type_tag: TypeTag::Bytes,
             validity: None,
-            data: key_data,
+            data: key_data.into(),
         },
         Column {
             column_id: COL_SEQNO,
             type_tag: TypeTag::Fixed(8),
             validity: None,
-            data: seqno_data,
+            data: seqno_data.into(),
         },
         Column {
             column_id: COL_VALUE_TYPE,
             type_tag: TypeTag::Fixed(1),
             validity: None,
-            data: vt_data,
+            data: vt_data.into(),
         },
         Column {
             column_id: COL_VALUE,
             type_tag: TypeTag::Bytes,
             validity: None,
-            data: value_data,
+            data: value_data.into(),
         },
     ];
     Ok(ColumnBatch { row_count, columns })
@@ -1111,7 +1123,7 @@ pub fn validate_columnar_ingest_batch(
     let (key_col, seqno_col, vt_col, _value_cols) = validate_columnar_columns(batch)?;
     // Reject a malformed value-type tag on submit rather than letting it surface
     // only at flush-time decode (`column_batch_to_entries`).
-    for &vt_byte in &vt_col.data {
+    for &vt_byte in vt_col.data.iter() {
         ValueType::try_from(vt_byte).map_err(|()| Error::InvalidTag(("ValueType", vt_byte)))?;
     }
     for i in 0..batch.row_count {
@@ -1200,7 +1212,7 @@ pub fn column_batch_into_entries(batch: ColumnBatch) -> Result<Vec<InternalValue
     let value_cols: Vec<Column> = cols.collect();
 
     // Shared key buffer: every row's key is a view into it.
-    let key_data = Slice::from(key_col.data);
+    let key_data = key_col.data;
 
     // A single non-nullable bytes value column lets every row's value be a view
     // into one shared buffer; otherwise reconstruct (frame / fixed-width) per row.
@@ -1213,7 +1225,7 @@ pub fn column_batch_into_entries(batch: ColumnBatch) -> Result<Vec<InternalValue
             .into_iter()
             .next()
             .ok_or(Error::InvalidHeader("columnar: value column vanished"))?;
-        ValueSource::SharedBytes(Slice::from(single.data))
+        ValueSource::SharedBytes(single.data)
     } else {
         ValueSource::Reconstruct(value_cols)
     };

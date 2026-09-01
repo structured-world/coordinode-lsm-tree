@@ -42,7 +42,7 @@ fn subcol_batch(rows: &[(Vec<u8>, u32)]) -> ColumnBatch {
         column_id: 3,
         type_tag: TypeTag::Fixed(4),
         validity: None,
-        data,
+        data: data.into(),
     });
     batch
 }
@@ -1085,7 +1085,7 @@ fn tree_columnar_scan_merge_preserves_a_nullable_sub_column() {
         type_tag: TypeTag::Fixed(4),
         // LSB-first: row 0 valid (bit set), row 1 (k2) null (bit clear) → 0b01.
         validity: Some(vec![0b0000_0001]),
-        data: vec![10, 0, 0, 0, 0, 0, 0, 0],
+        data: vec![10, 0, 0, 0, 0, 0, 0, 0].into(),
     });
     {
         let mut ingest = any.ingestion().expect("ingestion");
@@ -1139,7 +1139,7 @@ fn ingest_bytes_value(any: &AnyTree, k: &[u8], value: &[u8]) {
         column_id: 3,
         type_tag: TypeTag::Bytes,
         validity: None,
-        data,
+        data: data.into(),
     });
     let mut ingest = any.ingestion().expect("ingestion");
     ingest.write_columnar_batch(&batch).expect("write");

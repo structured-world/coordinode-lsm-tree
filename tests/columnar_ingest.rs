@@ -34,7 +34,7 @@ fn two_subcolumn_batch() -> ColumnBatch {
         column_id: 3,
         type_tag: TypeTag::Fixed(4),
         validity: None,
-        data: vec![1, 0, 0, 0, 2, 0, 0, 0], // row 0 = 1, row 1 = 2
+        data: vec![1, 0, 0, 0, 2, 0, 0, 0].into(), // row 0 = 1, row 1 = 2
     });
     let mut bytes_data = Vec::new();
     for off in [0u32, 2, 5] {
@@ -45,7 +45,7 @@ fn two_subcolumn_batch() -> ColumnBatch {
         column_id: 4,
         type_tag: TypeTag::Bytes,
         validity: None,
-        data: bytes_data,
+        data: bytes_data.into(),
     });
     batch
 }
@@ -207,7 +207,7 @@ fn one_fixed_subcolumn_batch(key: &[u8], seqno: u64) -> ColumnBatch {
         column_id: 3,
         type_tag: TypeTag::Fixed(4),
         validity: None,
-        data: vec![0, 0, 0, 0],
+        data: vec![0, 0, 0, 0].into(),
     });
     batch
 }
@@ -238,7 +238,7 @@ fn columnar_ingest_rejects_unsorted_keys() -> lsm_tree::Result<()> {
         column_id: 3,
         type_tag: TypeTag::Fixed(4),
         validity: None,
-        data: vec![0, 0, 0, 0, 0, 0, 0, 0],
+        data: vec![0, 0, 0, 0, 0, 0, 0, 0].into(),
     });
 
     let mut ingest = any.ingestion()?;
@@ -398,7 +398,7 @@ fn fixed_bytes_batch(rows: &[(&[u8], u32, &[u8])]) -> ColumnBatch {
         column_id: 4,
         type_tag: TypeTag::Bytes,
         validity: None,
-        data: bytes_data,
+        data: bytes_data.into(),
     });
     batch
 }
@@ -599,14 +599,14 @@ fn columnar_ingest_round_trips_a_nullable_value_subcolumn() -> lsm_tree::Result<
         column_id: 3,
         type_tag: TypeTag::Bytes,
         validity: None,
-        data: bytes_data,
+        data: bytes_data.into(),
     });
     // Fixed-4 sub-column, row 0 present, row 1 null (validity bit 0 set only).
     batch.columns.push(Column {
         column_id: 4,
         type_tag: TypeTag::Fixed(4),
         validity: Some(vec![0b0000_0001]),
-        data: vec![1, 0, 0, 0, 0, 0, 0, 0],
+        data: vec![1, 0, 0, 0, 0, 0, 0, 0].into(),
     });
 
     let mut ingest = any.ingestion()?;
@@ -641,7 +641,7 @@ fn three_subcolumn_batch() -> ColumnBatch {
         column_id: 3,
         type_tag: TypeTag::Fixed(4),
         validity: None,
-        data: vec![3, 0, 0, 0, 4, 0, 0, 0], // row 0 = 3, row 1 = 4
+        data: vec![3, 0, 0, 0, 4, 0, 0, 0].into(), // row 0 = 3, row 1 = 4
     });
     let mut bytes_data = Vec::new();
     for off in [0u32, 2, 5] {
@@ -652,13 +652,13 @@ fn three_subcolumn_batch() -> ColumnBatch {
         column_id: 4,
         type_tag: TypeTag::Bytes,
         validity: None,
-        data: bytes_data,
+        data: bytes_data.into(),
     });
     batch.columns.push(Column {
         column_id: 5,
         type_tag: TypeTag::Fixed(4),
         validity: None,
-        data: vec![5, 0, 0, 0, 6, 0, 0, 0], // the new field: row 0 = 5, row 1 = 6
+        data: vec![5, 0, 0, 0, 6, 0, 0, 0].into(), // the new field: row 0 = 5, row 1 = 6
     });
     batch
 }
