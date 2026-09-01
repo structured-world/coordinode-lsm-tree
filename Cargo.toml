@@ -424,10 +424,13 @@ required-features = []
 # was rebuilt with these settings, where the delta collapsed to zero). One
 # codegen unit removes the layout lottery; thin LTO restores the cross-unit
 # inlining a single unit would otherwise lose.
-[profile.release]
-lto = "thin"
-codegen-units = 1
-
+#
+# Pinned on the bench profile only, which is what every criterion harness in
+# this crate builds with; the two standalone harnesses under tools/ carry the
+# same pin in their own manifests. The release profile stays at the defaults:
+# it is what `cross test -r` builds for the foreign-target test jobs, and a
+# single codegen unit with LTO more than doubles that build, past the job's
+# time budget, for binaries nothing measures.
 [profile.bench]
 lto = "thin"
 codegen-units = 1
