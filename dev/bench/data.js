@@ -1,5 +1,5 @@
 window.BENCHMARK_DATA = {
-  "lastUpdate": 1788263947455,
+  "lastUpdate": 1788615967467,
   "repoUrl": "https://github.com/structured-world/coordinode-lsm-tree",
   "entries": {
     "lsm-tree db_bench": [
@@ -21138,6 +21138,84 @@ window.BENCHMARK_DATA = {
             "value": 763010.3479120028,
             "unit": "ops/sec",
             "extra": "P50: 1.1us | P99: 4.2us | P99.9: 6.6us\nthreads: 1 | elapsed: 0.26s | num: 200000 | iterations: 3"
+          }
+        ]
+      },
+      {
+        "commit": {
+          "author": {
+            "email": "mail@polaz.com",
+            "name": "Dmitry Prudnikov",
+            "username": "polaz"
+          },
+          "committer": {
+            "email": "noreply@github.com",
+            "name": "GitHub",
+            "username": "web-flow"
+          },
+          "distinct": true,
+          "id": "99a899baa9d2883a9a9cb00d70d6b5f6de4bc072",
+          "message": "chore: name the maintainer as copyright holder (#609)\n\n## Summary\n\nThe maintainer copyright line in the first-party `.rs` headers and the\nREADME now names the current maintainer, Dmitry Prudnikov. Years are\nunchanged (269 files from 2026, 2 from 2025); the original-author lines\n(fjall-rs, vendored Ribbon filter) are untouched. No code change.\n\n## Testing\n\nExact-line replacement over the 271 headers, verified: no old line left,\n271 new lines, one per file. `cargo fmt --all --check` passes.\n\nCloses #608",
+          "timestamp": "2026-09-05T13:43:50Z",
+          "tree_id": "198ad664a136a76c276f3126bfc74347a301bb06",
+          "url": "https://github.com/structured-world/coordinode-lsm-tree/commit/99a899baa9d2883a9a9cb00d70d6b5f6de4bc072"
+        },
+        "date": 1788615941028,
+        "tool": "customBiggerIsBetter",
+        "benches": [
+          {
+            "name": "fillseq",
+            "value": 3656539.757922442,
+            "unit": "ops/sec",
+            "extra": "P50: 0.1us | P99: 1.4us | P99.9: 3.4us\nthreads: 1 | elapsed: 0.05s | num: 200000 | iterations: 3"
+          },
+          {
+            "name": "fillrandom",
+            "value": 1324107.6661338522,
+            "unit": "ops/sec",
+            "extra": "P50: 0.6us | P99: 2.1us | P99.9: 4.3us\nthreads: 1 | elapsed: 0.15s | num: 200000 | iterations: 3"
+          },
+          {
+            "name": "readrandom",
+            "value": 852109.912549877,
+            "unit": "ops/sec",
+            "extra": "P50: 1.0us | P99: 4.1us | P99.9: 6.7us\nthreads: 1 | elapsed: 0.23s | num: 200000 | iterations: 3"
+          },
+          {
+            "name": "readseq",
+            "value": 3826698.249938003,
+            "unit": "ops/sec",
+            "extra": "P50: 0.1us | P99: 3.1us | P99.9: 5.7us\nthreads: 1 | elapsed: 0.05s | num: 200000 | iterations: 3"
+          },
+          {
+            "name": "seekrandom",
+            "value": 486303.5723352236,
+            "unit": "ops/sec",
+            "extra": "P50: 1.8us | P99: 5.0us | P99.9: 8.0us\nthreads: 1 | elapsed: 0.41s | num: 200000 | iterations: 3"
+          },
+          {
+            "name": "prefixscan",
+            "value": 252490.65588577354,
+            "unit": "ops/sec",
+            "extra": "P50: 3.7us | P99: 6.3us | P99.9: 8.9us\nthreads: 1 | elapsed: 0.79s | num: 200000 | iterations: 3"
+          },
+          {
+            "name": "overwrite",
+            "value": 1278891.4691518974,
+            "unit": "ops/sec",
+            "extra": "P50: 0.7us | P99: 2.1us | P99.9: 4.4us\nthreads: 1 | elapsed: 0.16s | num: 200000 | iterations: 3"
+          },
+          {
+            "name": "mergerandom",
+            "value": 1201599.7281693032,
+            "unit": "ops/sec",
+            "extra": "P50: 0.3us | P99: 1.4us | P99.9: 2.1us\nthreads: 1 | elapsed: 0.17s | num: 200000 | iterations: 3"
+          },
+          {
+            "name": "readwhilewriting",
+            "value": 674151.5011230352,
+            "unit": "ops/sec",
+            "extra": "P50: 1.3us | P99: 4.4us | P99.9: 7.1us\nthreads: 1 | elapsed: 0.30s | num: 200000 | iterations: 3"
           }
         ]
       }
