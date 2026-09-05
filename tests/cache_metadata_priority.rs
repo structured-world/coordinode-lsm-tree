@@ -1,5 +1,5 @@
 // SPDX-License-Identifier: Apache-2.0
-// Copyright (c) 2026-present, Structured World Foundation
+// Copyright (c) 2026-present, Dmitry Prudnikov
 
 //! Demonstrates the metadata-block priority pin: when the data working set
 //! exceeds the block cache, heavy data-block churn evicts metadata blocks from

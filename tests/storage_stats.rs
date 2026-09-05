@@ -1,5 +1,5 @@
 // SPDX-License-Identifier: Apache-2.0
-// Copyright (c) 2026-present, Structured World Foundation
+// Copyright (c) 2026-present, Dmitry Prudnikov
 
 //! End-to-end tests for `AbstractTree::storage_stats`: used-byte accounting
 //! (cross-checked against the checkpoint total), the average K/V shape recorded

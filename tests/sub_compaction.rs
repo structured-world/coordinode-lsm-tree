@@ -1,5 +1,5 @@
 // SPDX-License-Identifier: Apache-2.0
-// Copyright (c) 2026-present, Structured World Foundation
+// Copyright (c) 2026-present, Dmitry Prudnikov
 
 //! Parallel sub-compaction correctness: a compaction split into disjoint key
 //! ranges across worker threads must produce exactly the same logical content

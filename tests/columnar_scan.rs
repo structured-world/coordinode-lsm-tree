@@ -1,5 +1,5 @@
 // SPDX-License-Identifier: Apache-2.0
-// Copyright (c) 2026-present, Structured World Foundation
+// Copyright (c) 2026-present, Dmitry Prudnikov
 
 //! Vectorized columnar scan: projection decodes only the requested columns, and
 //! a key-range predicate filters to exactly the rows a naive row scan would

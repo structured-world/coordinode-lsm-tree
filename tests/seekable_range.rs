@@ -1,5 +1,5 @@
 // SPDX-License-Identifier: Apache-2.0
-// Copyright (c) 2026-present, Structured World Foundation
+// Copyright (c) 2026-present, Dmitry Prudnikov
 
 //! Equivalence tests for the seekable range iterator (#495): `seek_to`,
 //! `seek_to_for_prev`, and `batch_range_scan` must return exactly what the

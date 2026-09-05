@@ -1,5 +1,5 @@
 // SPDX-License-Identifier: Apache-2.0
-// Copyright (c) 2026-present, Structured World Foundation
+// Copyright (c) 2026-present, Dmitry Prudnikov
 
 //! Integration tests for the meta-block mirror (TAIL + MID copies,
 //! see writer/mod.rs `write_meta_section`). A single bit-flip or

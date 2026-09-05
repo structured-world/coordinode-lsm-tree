@@ -1,5 +1,5 @@
 // SPDX-License-Identifier: Apache-2.0
-// Copyright (c) 2026-present, Structured World Foundation
+// Copyright (c) 2026-present, Dmitry Prudnikov
 
 //! Equal-seqno tie-breaks on the range read path: sources holding the same
 //! key at the same caller-assigned seqno must resolve by SOURCE recency,

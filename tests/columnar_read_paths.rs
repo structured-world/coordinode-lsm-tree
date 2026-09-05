@@ -1,5 +1,5 @@
 // SPDX-License-Identifier: Apache-2.0
-// Copyright (c) 2026-present, Structured World Foundation
+// Copyright (c) 2026-present, Dmitry Prudnikov
 
 //! Columnar read-path coverage: reverse iteration, bounded ranges, masked
 //! (deleted) scans, and point reads (present / absent / deleted). These exercise

@@ -1,6 +1,6 @@
 // SPDX-License-Identifier: Apache-2.0
 // Copyright (c) 2025-present, fjall-rs
-// Copyright (c) 2026-present, Structured World Foundation
+// Copyright (c) 2026-present, Dmitry Prudnikov
 
 pub(crate) mod binary_index;
 // Crate-internal: Decoder, Decodable, ParsedItem are not part of the public API.

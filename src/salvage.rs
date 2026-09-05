@@ -1,5 +1,5 @@
 // SPDX-License-Identifier: Apache-2.0
-// Copyright (c) 2026-present, Structured World Foundation
+// Copyright (c) 2026-present, Dmitry Prudnikov
 
 //! Block-granular SST salvage: recover the readable blocks of an SST whose
 //! whole-file verification fails, dropping the corrupted ones.

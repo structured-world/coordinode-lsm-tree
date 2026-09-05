@@ -1,5 +1,5 @@
 // SPDX-License-Identifier: Apache-2.0
-// Copyright (c) 2026-present, Structured World Foundation
+// Copyright (c) 2026-present, Dmitry Prudnikov
 
 //! Integration tests for `AbstractTree::approximate_range_stats` (#499): the
 //! estimate is computed from SST block-index offsets + the memtable, never

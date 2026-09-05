@@ -1,5 +1,5 @@
 // SPDX-License-Identifier: Apache-2.0
-// Copyright (c) 2026-present, Structured World Foundation
+// Copyright (c) 2026-present, Dmitry Prudnikov
 
 //! AAD (Additional Authenticated Data) construction for AAD-bound encrypted
 //! blocks, per the wire-format spec in `docs/aad-block-format.md` §5.3.

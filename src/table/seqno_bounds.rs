@@ -1,5 +1,5 @@
 // SPDX-License-Identifier: Apache-2.0
-// Copyright (c) 2026-present, Structured World Foundation
+// Copyright (c) 2026-present, Dmitry Prudnikov
 
 //! Per-SST seqno-bounds section: a parallel `(data-block offset -> [seqno_min,
 //! seqno_max])` map that powers the `scan_since_seqno` block-skip WITHOUT

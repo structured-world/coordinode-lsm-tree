@@ -1,5 +1,5 @@
 // SPDX-License-Identifier: Apache-2.0
-// Copyright (c) 2026-present, Structured World Foundation
+// Copyright (c) 2026-present, Dmitry Prudnikov
 
 //! End-to-end tests for the opt-in computed write-backpressure verdict
 //! ([`AbstractTree::write_backpressure`]): the L0-count and pending-compaction-

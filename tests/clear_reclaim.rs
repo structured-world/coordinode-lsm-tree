@@ -1,5 +1,5 @@
 // SPDX-License-Identifier: Apache-2.0
-// Copyright (c) 2026-present, Structured World Foundation
+// Copyright (c) 2026-present, Dmitry Prudnikov
 
 //! `clear()` must reclaim the obsolete SST files synchronously enough that a
 //! caller measuring on-disk footprint right after it returns sees the drop.

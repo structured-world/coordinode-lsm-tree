@@ -1,6 +1,6 @@
 // SPDX-License-Identifier: Apache-2.0 OR MIT
 // Copyright (c) 2024-present, fjall-rs
-// Copyright (c) 2026-present, Structured World Foundation
+// Copyright (c) 2026-present, Dmitry Prudnikov
 //
 // Vendored from the `byteview` crate (https://github.com/fjall-rs/byteview),
 // ported to `no_std` + `alloc` and kept in-tree as a self-contained module so

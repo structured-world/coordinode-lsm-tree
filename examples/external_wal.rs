@@ -1,5 +1,5 @@
 // SPDX-License-Identifier: Apache-2.0
-// Copyright (c) 2026-present, Structured World Foundation
+// Copyright (c) 2026-present, Dmitry Prudnikov
 
 //! Worked example for the external-WAL recipe (`docs/external-wal.md`): the
 //! engine has no internal WAL, so durability is the caller's job. This program

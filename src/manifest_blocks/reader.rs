@@ -1,5 +1,5 @@
 // SPDX-License-Identifier: Apache-2.0
-// Copyright (c) 2026-present, Structured World Foundation
+// Copyright (c) 2026-present, Dmitry Prudnikov
 
 //! [`ManifestArchiveReader`] — locates and verifies the footer of a
 //! Blocks-based manifest file, then exposes its sections via TOC

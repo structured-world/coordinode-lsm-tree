@@ -1,5 +1,5 @@
 // SPDX-License-Identifier: Apache-2.0
-// Copyright (c) 2026-present, Structured World Foundation
+// Copyright (c) 2026-present, Dmitry Prudnikov
 
 //! Columnar (PAX) read-path benchmark matrix: row-major vs columnar, with and
 //! without per-block zone maps. The columnar layout's wins and overhead

@@ -1,5 +1,5 @@
 // SPDX-License-Identifier: Apache-2.0
-// Copyright (c) 2026-present, Structured World Foundation
+// Copyright (c) 2026-present, Dmitry Prudnikov
 
 //! End-to-end tests for the opt-in compaction space-admission gate: a merge is
 //! skipped (or narrowed) when its transient output would not fit the free disk,
