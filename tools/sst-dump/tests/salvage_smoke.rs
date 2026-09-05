@@ -1,5 +1,5 @@
 // SPDX-License-Identifier: Apache-2.0
-// Copyright (c) 2026-present, Structured World Foundation
+// Copyright (c) 2026-present, Dmitry Prudnikov
 
 //! End-to-end smoke test for `sst-dump salvage`: build a real SST via
 //! `lsm-tree`, drive the `salvage` subcommand against it, and assert the

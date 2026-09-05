@@ -1,5 +1,5 @@
 // SPDX-License-Identifier: Apache-2.0
-// Copyright (c) 2026-present, Structured World Foundation
+// Copyright (c) 2026-present, Dmitry Prudnikov
 
 //! Tree-wide queue of SSTs whose blocks were ECC-corrected on a read that was
 //! confirmed *persistent* (the on-disk bytes are still faulty after a

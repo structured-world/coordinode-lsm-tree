@@ -1,5 +1,5 @@
 // SPDX-License-Identifier: Apache-2.0
-// Copyright (c) 2026-present, Structured World Foundation
+// Copyright (c) 2026-present, Dmitry Prudnikov
 
 //! End-to-end durability-mode coverage: a tree opened under either
 //! [`SyncMode`] must persist a flush and recover it after reopen. On macOS

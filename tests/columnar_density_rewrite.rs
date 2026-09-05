@@ -1,5 +1,5 @@
 // SPDX-License-Identifier: Apache-2.0
-// Copyright (c) 2026-present, Structured World Foundation
+// Copyright (c) 2026-present, Dmitry Prudnikov
 
 //! Density-based rewrite of a columnar segment whose delete-bitmap has grown
 //! past the adaptive purge threshold. A segment first relocated with a

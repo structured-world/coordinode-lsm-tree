@@ -1,5 +1,5 @@
 // SPDX-License-Identifier: Apache-2.0
-// Copyright (c) 2025-present, Structured World Foundation
+// Copyright (c) 2025-present, Dmitry Prudnikov
 
 //! Pure Rust zstd backend via the `structured-zstd` crate.
 //!

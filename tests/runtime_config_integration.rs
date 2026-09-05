@@ -1,5 +1,5 @@
 // SPDX-License-Identifier: Apache-2.0
-// Copyright (c) 2026-present, Structured World Foundation
+// Copyright (c) 2026-present, Dmitry Prudnikov
 
 //! End-to-end Tree-level integration of the runtime-config foundation
 //! (#352): `Tree::update_runtime_config` swaps the live snapshot

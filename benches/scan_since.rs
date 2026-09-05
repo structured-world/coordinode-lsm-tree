@@ -1,5 +1,5 @@
 // SPDX-License-Identifier: Apache-2.0
-// Copyright (c) 2026-present, Structured World Foundation
+// Copyright (c) 2026-present, Dmitry Prudnikov
 
 //! Benchmarks for the `seqno_in_index` block-skip optimization behind
 //! `Tree::scan_since_seqno` (the CDC / incremental-scan primitive).

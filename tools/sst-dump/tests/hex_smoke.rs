@@ -1,5 +1,5 @@
 // SPDX-License-Identifier: Apache-2.0
-// Copyright (c) 2026-present, Structured World Foundation
+// Copyright (c) 2026-present, Dmitry Prudnikov
 
 //! End-to-end smoke test for the `hex` subcommand: build a real SST
 //! via `lsm-tree`, then drive the `sst-dump hex` binary against

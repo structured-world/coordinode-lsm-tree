@@ -1,6 +1,6 @@
 // SPDX-License-Identifier: Apache-2.0
 // Copyright (c) 2025-present, fjall-rs
-// Copyright (c) 2026-present, Structured World Foundation
+// Copyright (c) 2026-present, Dmitry Prudnikov
 
 //! The hash index is a compact (typically <=1 byte per KV) index
 //! embeddeded into a block to speed up point reads.

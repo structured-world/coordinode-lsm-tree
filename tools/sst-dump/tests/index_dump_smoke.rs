@@ -1,5 +1,5 @@
 // SPDX-License-Identifier: Apache-2.0
-// Copyright (c) 2026-present, Structured World Foundation
+// Copyright (c) 2026-present, Dmitry Prudnikov
 
 //! End-to-end smoke test for the `index-dump` subcommand: build a
 //! real SST, then drive `sst-dump index-dump` against it and check

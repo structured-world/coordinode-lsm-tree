@@ -1,5 +1,5 @@
 // SPDX-License-Identifier: Apache-2.0
-// Copyright (c) 2026-present, Structured World Foundation
+// Copyright (c) 2026-present, Dmitry Prudnikov
 
 //! The engine walks its directories by ITS OWN naming grammar. A file whose
 //! name matches no shape the engine owns is not engine state: it is never read,

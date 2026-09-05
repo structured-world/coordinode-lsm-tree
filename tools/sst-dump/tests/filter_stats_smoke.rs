@@ -1,5 +1,5 @@
 // SPDX-License-Identifier: Apache-2.0
-// Copyright (c) 2026-present, Structured World Foundation
+// Copyright (c) 2026-present, Dmitry Prudnikov
 
 //! End-to-end smoke test for the `filter-stats` subcommand: build a
 //! real SST with a full BuRR filter, then drive `sst-dump

@@ -1,5 +1,5 @@
 // SPDX-License-Identifier: Apache-2.0
-// Copyright (c) 2026-present, Structured World Foundation
+// Copyright (c) 2026-present, Dmitry Prudnikov
 
 //! Correctness of the opt-in row cache (decoded point-read results keyed by the
 //! owning SST + user-key hash). The row cache must never change observed values:

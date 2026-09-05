@@ -1,5 +1,5 @@
 // SPDX-License-Identifier: Apache-2.0
-// Copyright (c) 2026-present, Structured World Foundation
+// Copyright (c) 2026-present, Dmitry Prudnikov
 
 //! End-to-end columnar ingest: a consumer hands the ingestion a pre-transposed
 //! `ColumnBatch` whose value is split into typed sub-columns. The batch is

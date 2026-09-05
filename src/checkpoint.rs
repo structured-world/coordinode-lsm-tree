@@ -1,5 +1,5 @@
 // SPDX-License-Identifier: Apache-2.0
-// Copyright (c) 2026-present, Structured World Foundation
+// Copyright (c) 2026-present, Dmitry Prudnikov
 
 //! Implementation of [`Tree::create_checkpoint`](crate::Tree::create_checkpoint)
 //! and [`BlobTree::create_checkpoint`](crate::BlobTree::create_checkpoint).

@@ -1,5 +1,5 @@
 // SPDX-License-Identifier: Apache-2.0
-// Copyright (c) 2026-present, Structured World Foundation
+// Copyright (c) 2026-present, Dmitry Prudnikov
 
 //! End-to-end parallel block compression driven through the public `Config`
 //! knobs: a tree opened with `compaction_threads > 1` builds its per-tree

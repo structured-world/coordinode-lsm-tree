@@ -1,5 +1,5 @@
 // SPDX-License-Identifier: Apache-2.0
-// Copyright (c) 2026-present, Structured World Foundation
+// Copyright (c) 2026-present, Dmitry Prudnikov
 
 //! Integration tests for `AbstractTree::approximate_range_cardinality` (#505):
 //! a zone-map-based row-count estimate plus a selectivity ratio, computed

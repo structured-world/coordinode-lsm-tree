@@ -1,5 +1,5 @@
 // SPDX-License-Identifier: Apache-2.0
-// Copyright (c) 2026-present, Structured World Foundation
+// Copyright (c) 2026-present, Dmitry Prudnikov
 
 //! Regression coverage for `lsm_tree::inspect::read_table_properties`'s
 //! TAIL-first / MID-fallback recovery path. Companion to

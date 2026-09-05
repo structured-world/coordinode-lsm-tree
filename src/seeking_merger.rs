@@ -1,5 +1,5 @@
 // SPDX-License-Identifier: Apache-2.0
-// Copyright (c) 2026-present, Structured World Foundation
+// Copyright (c) 2026-present, Dmitry Prudnikov
 
 //! Merging iterator over `MergeSource`s, backed by two independent
 //! `LoserTree` tournaments (forward min, backward max).

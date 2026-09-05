@@ -1,6 +1,6 @@
 // SPDX-License-Identifier: Apache-2.0
 // Copyright (c) 2024-present, fjall-rs
-// Copyright (c) 2026-present, Structured World Foundation
+// Copyright (c) 2026-present, Dmitry Prudnikov
 
 // no-std foundation: when the `std` feature is OFF the crate root opts into
 // `no_std`. Default builds keep `std` enabled (file I/O, threading, system
