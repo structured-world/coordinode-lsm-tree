@@ -1,5 +1,5 @@
 window.BENCHMARK_DATA = {
-  "lastUpdate": 1788615967467,
+  "lastUpdate": 1788624807939,
   "repoUrl": "https://github.com/structured-world/coordinode-lsm-tree",
   "entries": {
     "lsm-tree db_bench": [
@@ -21216,6 +21216,84 @@ window.BENCHMARK_DATA = {
             "value": 674151.5011230352,
             "unit": "ops/sec",
             "extra": "P50: 1.3us | P99: 4.4us | P99.9: 7.1us\nthreads: 1 | elapsed: 0.30s | num: 200000 | iterations: 3"
+          }
+        ]
+      },
+      {
+        "commit": {
+          "author": {
+            "email": "mail@polaz.com",
+            "name": "Dmitry Prudnikov",
+            "username": "polaz"
+          },
+          "committer": {
+            "email": "noreply@github.com",
+            "name": "GitHub",
+            "username": "web-flow"
+          },
+          "distinct": true,
+          "id": "a139e9e548939ad49a4fac186417d2a52eb7f611",
+          "message": "chore: name the maintainer in the licence appendix (#612)\n\n## Summary\n\nThe maintainer copyright line in `LICENSE-APACHE` names the current\nmaintainer, Dmitry Prudnikov; the original-author line (fjall-rs\ncontributors) is unchanged. No code change.\n\nCloses #611\n\n<!-- This is an auto-generated comment: release notes by coderabbit.ai\n-->\n\n## Summary by CodeRabbit\n\n* **Documentation**\n* Updated the Apache License 2.0 copyright attribution to credit Dmitry\nPrudnikov.\n\n<!-- end of auto-generated comment: release notes by coderabbit.ai -->",
+          "timestamp": "2026-09-05T19:11:19+03:00",
+          "tree_id": "0ebc0d4ca93dfdd07c148a3795b5f5620f197b33",
+          "url": "https://github.com/structured-world/coordinode-lsm-tree/commit/a139e9e548939ad49a4fac186417d2a52eb7f611"
+        },
+        "date": 1788624782295,
+        "tool": "customBiggerIsBetter",
+        "benches": [
+          {
+            "name": "fillseq",
+            "value": 3599197.0191450287,
+            "unit": "ops/sec",
+            "extra": "P50: 0.1us | P99: 1.5us | P99.9: 3.4us\nthreads: 1 | elapsed: 0.06s | num: 200000 | iterations: 3"
+          },
+          {
+            "name": "fillrandom",
+            "value": 1215888.5432908088,
+            "unit": "ops/sec",
+            "extra": "P50: 0.7us | P99: 2.2us | P99.9: 4.4us\nthreads: 1 | elapsed: 0.16s | num: 200000 | iterations: 3"
+          },
+          {
+            "name": "readrandom",
+            "value": 829930.2768520009,
+            "unit": "ops/sec",
+            "extra": "P50: 1.1us | P99: 4.1us | P99.9: 6.8us\nthreads: 1 | elapsed: 0.24s | num: 200000 | iterations: 3"
+          },
+          {
+            "name": "readseq",
+            "value": 3828245.0214630556,
+            "unit": "ops/sec",
+            "extra": "P50: 0.1us | P99: 3.0us | P99.9: 5.7us\nthreads: 1 | elapsed: 0.05s | num: 200000 | iterations: 3"
+          },
+          {
+            "name": "seekrandom",
+            "value": 465683.6745567591,
+            "unit": "ops/sec",
+            "extra": "P50: 1.9us | P99: 5.1us | P99.9: 8.4us\nthreads: 1 | elapsed: 0.43s | num: 200000 | iterations: 3"
+          },
+          {
+            "name": "prefixscan",
+            "value": 252619.53128259777,
+            "unit": "ops/sec",
+            "extra": "P50: 3.7us | P99: 4.8us | P99.9: 11.3us\nthreads: 1 | elapsed: 0.79s | num: 200000 | iterations: 3"
+          },
+          {
+            "name": "overwrite",
+            "value": 1259197.1603190054,
+            "unit": "ops/sec",
+            "extra": "P50: 0.7us | P99: 2.2us | P99.9: 4.5us\nthreads: 1 | elapsed: 0.16s | num: 200000 | iterations: 3"
+          },
+          {
+            "name": "mergerandom",
+            "value": 1188235.962535324,
+            "unit": "ops/sec",
+            "extra": "P50: 0.3us | P99: 1.4us | P99.9: 2.4us\nthreads: 1 | elapsed: 0.17s | num: 200000 | iterations: 3"
+          },
+          {
+            "name": "readwhilewriting",
+            "value": 732375.0242759434,
+            "unit": "ops/sec",
+            "extra": "P50: 1.2us | P99: 4.2us | P99.9: 6.7us\nthreads: 1 | elapsed: 0.27s | num: 200000 | iterations: 3"
           }
         ]
       }
