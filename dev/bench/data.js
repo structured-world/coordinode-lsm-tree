@@ -1,5 +1,5 @@
 window.BENCHMARK_DATA = {
-  "lastUpdate": 1788627905111,
+  "lastUpdate": 1788629856081,
   "repoUrl": "https://github.com/structured-world/coordinode-lsm-tree",
   "entries": {
     "lsm-tree db_bench": [
@@ -21372,6 +21372,84 @@ window.BENCHMARK_DATA = {
             "value": 672698.9147987472,
             "unit": "ops/sec",
             "extra": "P50: 1.3us | P99: 4.3us | P99.9: 7.4us\nthreads: 1 | elapsed: 0.30s | num: 200000 | iterations: 3"
+          }
+        ]
+      },
+      {
+        "commit": {
+          "author": {
+            "email": "mail@polaz.com",
+            "name": "Dmitry Prudnikov",
+            "username": "polaz"
+          },
+          "committer": {
+            "email": "noreply@github.com",
+            "name": "GitHub",
+            "username": "web-flow"
+          },
+          "distinct": true,
+          "id": "76c52235d2db774b6f38ab1408ddd385cc3b6b49",
+          "message": "chore: name the maintainer in the crate metadata (#614)\n\nThe crate had no authors field in Cargo.toml; crates.io now shows the\nmaintainer alongside the licence text already in the tarball.",
+          "timestamp": "2026-09-05T17:32:43Z",
+          "tree_id": "4b06e694e135e138c3b6ed8cd26739c2e1507d69",
+          "url": "https://github.com/structured-world/coordinode-lsm-tree/commit/76c52235d2db774b6f38ab1408ddd385cc3b6b49"
+        },
+        "date": 1788629825123,
+        "tool": "customBiggerIsBetter",
+        "benches": [
+          {
+            "name": "fillseq",
+            "value": 3563487.3398916232,
+            "unit": "ops/sec",
+            "extra": "P50: 0.1us | P99: 1.8us | P99.9: 3.5us\nthreads: 1 | elapsed: 0.06s | num: 200000 | iterations: 3"
+          },
+          {
+            "name": "fillrandom",
+            "value": 1276260.080133435,
+            "unit": "ops/sec",
+            "extra": "P50: 0.6us | P99: 2.8us | P99.9: 4.5us\nthreads: 1 | elapsed: 0.16s | num: 200000 | iterations: 3"
+          },
+          {
+            "name": "readrandom",
+            "value": 710999.6086764804,
+            "unit": "ops/sec",
+            "extra": "P50: 1.0us | P99: 5.8us | P99.9: 9.7us\nthreads: 1 | elapsed: 0.28s | num: 200000 | iterations: 3"
+          },
+          {
+            "name": "readseq",
+            "value": 3474903.5688197874,
+            "unit": "ops/sec",
+            "extra": "P50: 0.1us | P99: 3.7us | P99.9: 8.3us\nthreads: 1 | elapsed: 0.06s | num: 200000 | iterations: 3"
+          },
+          {
+            "name": "seekrandom",
+            "value": 432141.1207303828,
+            "unit": "ops/sec",
+            "extra": "P50: 1.8us | P99: 6.4us | P99.9: 10.9us\nthreads: 1 | elapsed: 0.46s | num: 200000 | iterations: 3"
+          },
+          {
+            "name": "prefixscan",
+            "value": 253857.48506791235,
+            "unit": "ops/sec",
+            "extra": "P50: 3.7us | P99: 4.8us | P99.9: 7.6us\nthreads: 1 | elapsed: 0.79s | num: 200000 | iterations: 3"
+          },
+          {
+            "name": "overwrite",
+            "value": 1312689.781304701,
+            "unit": "ops/sec",
+            "extra": "P50: 0.6us | P99: 2.2us | P99.9: 4.4us\nthreads: 1 | elapsed: 0.15s | num: 200000 | iterations: 3"
+          },
+          {
+            "name": "mergerandom",
+            "value": 910318.6227148693,
+            "unit": "ops/sec",
+            "extra": "P50: 0.4us | P99: 1.5us | P99.9: 4.0us\nthreads: 1 | elapsed: 0.22s | num: 200000 | iterations: 3"
+          },
+          {
+            "name": "readwhilewriting",
+            "value": 604108.646813667,
+            "unit": "ops/sec",
+            "extra": "P50: 1.2us | P99: 6.8us | P99.9: 9.9us\nthreads: 1 | elapsed: 0.33s | num: 200000 | iterations: 3"
           }
         ]
       }
