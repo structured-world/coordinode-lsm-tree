@@ -1,5 +1,5 @@
 window.BENCHMARK_DATA = {
-  "lastUpdate": 1788624807939,
+  "lastUpdate": 1788627905111,
   "repoUrl": "https://github.com/structured-world/coordinode-lsm-tree",
   "entries": {
     "lsm-tree db_bench": [
@@ -21294,6 +21294,84 @@ window.BENCHMARK_DATA = {
             "value": 732375.0242759434,
             "unit": "ops/sec",
             "extra": "P50: 1.2us | P99: 4.2us | P99.9: 6.7us\nthreads: 1 | elapsed: 0.27s | num: 200000 | iterations: 3"
+          }
+        ]
+      },
+      {
+        "commit": {
+          "author": {
+            "email": "mail@polaz.com",
+            "name": "Dmitry Prudnikov",
+            "username": "polaz"
+          },
+          "committer": {
+            "email": "noreply@github.com",
+            "name": "GitHub",
+            "username": "web-flow"
+          },
+          "distinct": true,
+          "id": "8375f48726f3387e14c8ab2f9b4c1d2e1d240dd7",
+          "message": "ci: run the Dependabot auto-merge in the base branch context (#613)\n\n## Summary\n\nDependabot pull requests here get a failing `auto-merge` check:\ntriggered on `pull_request`, the job receives Dependabot secrets instead\nof Actions secrets, so `RELEASER_APP_ID` resolves to an empty string and\nthe App token step fails before doing anything.\n\nThe workflow follows the one already proven in structured-email-address\nand structured-public-domains: `pull_request_target` (base-branch\ncontext, where the secrets exist), no checkout at all, approval and\nauto-merge bound to the inspected head SHA, and auto-merge disarmed when\nsomeone other than Dependabot pushes to the branch. First-party actions\nkeep their major-tag pins per this repository's policy.\n\n## Testing\n\nTakes effect for Dependabot pull requests opened or updated after merge.\n\n\n<!-- This is an auto-generated comment: release notes by coderabbit.ai\n-->\n\n## Summary by CodeRabbit\n\n- **Chores**\n  - Improved automated handling of eligible dependency updates.\n- Added safeguards to prevent unintended auto-merges when pull requests\nare modified or rerun.\n- Improved consistency by ensuring approval and merge actions apply only\nto the reviewed commit.\n- Updated automation permissions and execution controls to reduce\nunnecessary access and avoid stale or conflicting runs.\n\n<!-- end of auto-generated comment: release notes by coderabbit.ai -->",
+          "timestamp": "2026-09-05T20:02:53+03:00",
+          "tree_id": "0d015d0bbfa475fe23782935cee57761d176ac12",
+          "url": "https://github.com/structured-world/coordinode-lsm-tree/commit/8375f48726f3387e14c8ab2f9b4c1d2e1d240dd7"
+        },
+        "date": 1788627877625,
+        "tool": "customBiggerIsBetter",
+        "benches": [
+          {
+            "name": "fillseq",
+            "value": 3637067.3758366117,
+            "unit": "ops/sec",
+            "extra": "P50: 0.1us | P99: 1.5us | P99.9: 3.4us\nthreads: 1 | elapsed: 0.05s | num: 200000 | iterations: 3"
+          },
+          {
+            "name": "fillrandom",
+            "value": 1169516.6149249126,
+            "unit": "ops/sec",
+            "extra": "P50: 0.7us | P99: 2.2us | P99.9: 4.2us\nthreads: 1 | elapsed: 0.17s | num: 200000 | iterations: 3"
+          },
+          {
+            "name": "readrandom",
+            "value": 807134.7971812512,
+            "unit": "ops/sec",
+            "extra": "P50: 1.1us | P99: 4.0us | P99.9: 6.6us\nthreads: 1 | elapsed: 0.25s | num: 200000 | iterations: 3"
+          },
+          {
+            "name": "readseq",
+            "value": 3861055.739281748,
+            "unit": "ops/sec",
+            "extra": "P50: 0.1us | P99: 3.0us | P99.9: 5.5us\nthreads: 1 | elapsed: 0.05s | num: 200000 | iterations: 3"
+          },
+          {
+            "name": "seekrandom",
+            "value": 483130.54057727417,
+            "unit": "ops/sec",
+            "extra": "P50: 1.8us | P99: 5.0us | P99.9: 7.8us\nthreads: 1 | elapsed: 0.41s | num: 200000 | iterations: 3"
+          },
+          {
+            "name": "prefixscan",
+            "value": 252817.64538935706,
+            "unit": "ops/sec",
+            "extra": "P50: 3.7us | P99: 4.7us | P99.9: 8.8us\nthreads: 1 | elapsed: 0.79s | num: 200000 | iterations: 3"
+          },
+          {
+            "name": "overwrite",
+            "value": 1130645.991704213,
+            "unit": "ops/sec",
+            "extra": "P50: 0.8us | P99: 2.3us | P99.9: 4.5us\nthreads: 1 | elapsed: 0.18s | num: 200000 | iterations: 3"
+          },
+          {
+            "name": "mergerandom",
+            "value": 803530.3588434,
+            "unit": "ops/sec",
+            "extra": "P50: 0.4us | P99: 1.8us | P99.9: 3.4us\nthreads: 1 | elapsed: 0.25s | num: 200000 | iterations: 3"
+          },
+          {
+            "name": "readwhilewriting",
+            "value": 672698.9147987472,
+            "unit": "ops/sec",
+            "extra": "P50: 1.3us | P99: 4.3us | P99.9: 7.4us\nthreads: 1 | elapsed: 0.30s | num: 200000 | iterations: 3"
           }
         ]
       }
