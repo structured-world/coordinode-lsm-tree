@@ -9166,6 +9166,9 @@ fn salvage_blob_file_recovers_a_compressed_source() -> crate::Result<()> {
         crate::Checksum::from_raw(crate::repair::compute_table_checksum(&*fs, &dest)?),
         0,
         &fs,
+        // Lz4, so there is no dictionary for the handle to pin.
+        #[cfg(zstd_any)]
+        &crate::compression::ZstdDictionaries::new(),
     )?;
     assert_eq!(
         handle.compression(),

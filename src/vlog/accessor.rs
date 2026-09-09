@@ -10,28 +10,18 @@ use crate::{
 #[cfg(not(feature = "std"))]
 use alloc::{string::ToString, vec::Vec};
 
+/// Reads separated values out of the blob files a version names.
+///
+/// Takes no dictionary: a `ZstdDict` blob file carries its own, pinned on the
+/// handle this walks, so decoding needs nothing the version does not already
+/// hold.
 pub struct Accessor<'a> {
     blob_files: &'a BlobFileList,
-    #[cfg(zstd_any)]
-    zstd_dictionaries: Option<&'a crate::compression::ZstdDictionaries>,
 }
 
 impl<'a> Accessor<'a> {
     pub fn new(blob_files: &'a BlobFileList) -> Self {
-        Self {
-            blob_files,
-            #[cfg(zstd_any)]
-            zstd_dictionaries: None,
-        }
-    }
-
-    /// Supplies the dictionaries [`CompressionType::ZstdDict`](crate::CompressionType::ZstdDict)
-    /// blob reads resolve against, each file by the id it recorded.
-    #[cfg(zstd_any)]
-    #[must_use]
-    pub fn with_dicts(mut self, dicts: &'a crate::compression::ZstdDictionaries) -> Self {
-        self.zstd_dictionaries = Some(dicts);
-        self
+        Self { blob_files }
     }
 
     /// Reads one separated value.
@@ -65,15 +55,7 @@ impl<'a> Accessor<'a> {
             .file_accessor()
             .get_or_open_blob_file(&bf_id, &blob_file.0.path)?;
 
-        let reader = {
-            let r = Reader::new(blob_file, file.as_ref());
-            #[cfg(zstd_any)]
-            let r = match self.zstd_dictionaries {
-                Some(dicts) => r.with_dicts(dicts),
-                None => r,
-            };
-            r
-        };
+        let reader = Reader::new(blob_file, file.as_ref());
 
         let value = reader.get(key, vhandle)?;
         cache.insert_blob(tree_id, vhandle, key, value.clone());
@@ -258,15 +240,7 @@ impl<'a> Accessor<'a> {
             return;
         };
 
-        let reader = {
-            let r = Reader::new(blob_file, file.as_ref());
-            #[cfg(zstd_any)]
-            let r = match self.zstd_dictionaries {
-                Some(dicts) => r.with_dicts(dicts),
-                None => r,
-            };
-            r
-        };
+        let reader = Reader::new(blob_file, file.as_ref());
 
         // An uncompressed value is returned as a VIEW into the buffer it was
         // parsed from. Sub-slicing the span would therefore make every cached

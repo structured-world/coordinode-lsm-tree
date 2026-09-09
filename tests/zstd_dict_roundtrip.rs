@@ -898,6 +898,74 @@ mod zstd_dict {
     }
 
     #[test]
+    fn a_live_reader_keeps_the_dictionary_its_blob_files_need() -> lsm_tree::Result<()> {
+        // A reader that captured a version keeps its blob files alive even
+        // after `clear` drains the history out from under it. The dictionary
+        // those files decode with has to be pinned by the same hold: what the
+        // REGISTRY holds is a moving target, and the collection that follows a
+        // clear takes an id no retained version names any more.
+        let dir = tempfile::tempdir()?;
+        let dict = make_test_dictionary();
+        let dict_id = dict.id();
+        let big_value = b"blob-value-".repeat(20);
+
+        {
+            let tree = make_config(dir.path())
+                .with_kv_separation(Some(make_blob_opts(
+                    CompressionType::zstd_dict(3, dict_id)?,
+                    Arc::new(dict),
+                )))
+                .open()?;
+            for i in 0u32..50 {
+                let key = format!("key-{i:04}");
+                tree.insert(key.as_bytes(), &big_value, i.into());
+            }
+            tree.flush_active_memtable(0)?;
+        }
+
+        // Reopened WITHOUT that dictionary in the write policy, so the only
+        // thing that still needs it is the blob files already written under it.
+        let tree = make_config(dir.path())
+            .with_kv_separation(Some(
+                lsm_tree::KvSeparationOptions::default().separation_threshold(1),
+            ))
+            .open()?;
+        let lsm_tree::AnyTree::Blob(blob) = &tree else {
+            panic!("a blob tree");
+        };
+
+        // Captured, not yet resolved: each guard holds its own version, which
+        // is what defers the deletion of the blob files under it.
+        let pending: Vec<_> = tree
+            .range(
+                "key-0000".as_bytes().."key-9999".as_bytes(),
+                lsm_tree::MAX_SEQNO,
+                None,
+            )
+            .collect();
+        assert_eq!(pending.len(), 50, "the whole generation is captured");
+
+        tree.clear()?;
+        assert_eq!(
+            blob.index.collect_unreferenced_dictionaries()?,
+            1,
+            "no retained version names it once the history is drained",
+        );
+        assert!(
+            !dir.path().join("dicts").join(dict_id.to_string()).exists(),
+            "its file is unlinked",
+        );
+
+        // The reader is still owed its values, and the bytes it needs to
+        // decode them are held by the blob files it pinned.
+        for guard in pending {
+            let (_, value) = guard.into_inner()?;
+            assert_eq!(value.as_ref(), big_value.as_slice());
+        }
+        Ok(())
+    }
+
+    #[test]
     fn a_dictionary_still_in_use_is_never_collected() -> lsm_tree::Result<()> {
         // The direction that matters: collection must not take a dictionary
         // the tables still need, or the tree loses the ability to read itself.

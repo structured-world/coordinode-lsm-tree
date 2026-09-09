@@ -385,6 +385,22 @@ impl ZstdDictionaries {
         }
     }
 
+    /// The dictionary `compression` names, if it names one and the set holds
+    /// it.
+    ///
+    /// The lookup a file does ONCE, when its handle is built: a table and a
+    /// blob file each record one descriptor, and the resolved dictionary is
+    /// then pinned for the handle's life rather than resolved per read. That is
+    /// what keeps a reader that captured a version able to decode after the set
+    /// has moved on.
+    #[must_use]
+    pub fn for_compression(&self, compression: CompressionType) -> Option<Arc<ZstdDictionary>> {
+        match compression {
+            CompressionType::ZstdDict { dict_id, .. } => self.get(dict_id).cloned(),
+            _ => None,
+        }
+    }
+
     /// Removes `id`, returning the reduced set. Removing an absent id is a
     /// no-op.
     #[must_use]

@@ -7269,8 +7269,15 @@ fn validate_frames(
     blob_id: crate::vlog::BlobFileId,
     live_data_start: u64,
 ) -> crate::Result<Option<super::BlobLiveTotals>> {
-    let handle =
-        crate::vlog::recover_blob_file(path, blob_id, crate::Checksum::from_raw(0), 0, &config.fs)?;
+    let handle = crate::vlog::recover_blob_file(
+        path,
+        blob_id,
+        crate::Checksum::from_raw(0),
+        0,
+        &config.fs,
+        #[cfg(zstd_any)]
+        &config.current_zstd_dictionaries(),
+    )?;
     super::validate_blob_frames(config, path, blob_id, live_data_start, &handle)
 }
 

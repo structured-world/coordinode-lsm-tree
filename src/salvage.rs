@@ -2986,8 +2986,24 @@ pub fn salvage_blob_file(
     // tail sector — and abort before the scanner and writer are even created,
     // making the valid-prefix recovery below unreachable. The salvaged dest gets
     // its own digest on finish.
-    let source_handle =
-        crate::vlog::recover_blob_file(source, blob_file_id, crate::Checksum::from_raw(0), 0, fs)?;
+    // The handle is a probe for `compression()`; nothing is read THROUGH it
+    // here (the scanner below reads the frames). It still gets the caller's
+    // dictionary, so a handle that names one is never built without it.
+    #[cfg(zstd_any)]
+    let source_dicts = zstd_dictionary
+        .cloned()
+        .map_or_else(crate::compression::ZstdDictionaries::new, |d| {
+            crate::compression::ZstdDictionaries::new().with(d)
+        });
+    let source_handle = crate::vlog::recover_blob_file(
+        source,
+        blob_file_id,
+        crate::Checksum::from_raw(0),
+        0,
+        fs,
+        #[cfg(zstd_any)]
+        &source_dicts,
+    )?;
     let compression = source_handle.compression();
     #[cfg(zstd_any)]
     if let crate::CompressionType::ZstdDict { dict_id, .. } = compression {

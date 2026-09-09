@@ -623,12 +623,9 @@ fn blob_file_dictionary(
     config: &Config,
     compression: crate::CompressionType,
 ) -> Option<Arc<crate::compression::ZstdDictionary>> {
-    match compression {
-        crate::CompressionType::ZstdDict { dict_id, .. } => {
-            config.current_zstd_dictionaries().get(dict_id).cloned()
-        }
-        _ => None,
-    }
+    config
+        .current_zstd_dictionaries()
+        .for_compression(compression)
 }
 
 /// Recover params for a repair's TRANSIENT table open: the tree's configured
@@ -2659,7 +2656,14 @@ fn recover_blob_files(
             frontier,
         )?);
         let handle = crate::vlog::recover_blob_file_from(
-            blob_path, blob_id, checksum, 0, &config.fs, frontier,
+            blob_path,
+            blob_id,
+            checksum,
+            0,
+            &config.fs,
+            frontier,
+            #[cfg(zstd_any)]
+            &config.current_zstd_dictionaries(),
         )?;
         match validate_blob_frames(config, blob_path, blob_id, frontier, &handle)? {
             Some(_) => Ok(()),
@@ -2881,6 +2885,8 @@ fn recover_blob_files(
             crate::Checksum::from_raw(0),
             0,
             &config.fs,
+            #[cfg(zstd_any)]
+            &config.current_zstd_dictionaries(),
         ) {
             Ok(handle) => handle,
             Err(e) if is_environmental(&e) => return Err(e),
@@ -2985,6 +2991,8 @@ fn recover_blob_files(
                     0,
                     &config.fs,
                     0,
+                    #[cfg(zstd_any)]
+                    &config.current_zstd_dictionaries(),
                 )?;
                 Ok(Some((bf, report)))
             })();
@@ -3093,7 +3101,14 @@ fn recover_blob_files(
         };
 
         match crate::vlog::recover_blob_file_from(
-            &blob_path, blob_id, checksum, 0, &config.fs, frontier,
+            &blob_path,
+            blob_id,
+            checksum,
+            0,
+            &config.fs,
+            frontier,
+            #[cfg(zstd_any)]
+            &config.current_zstd_dictionaries(),
         ) {
             Ok(bf) => {
                 if frontier > 0 {

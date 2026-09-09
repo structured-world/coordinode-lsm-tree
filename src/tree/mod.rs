@@ -5815,6 +5815,8 @@ impl Tree {
             tree_id,
             config.descriptor_table.as_ref(),
             &config.fs,
+            #[cfg(zstd_any)]
+            &config.current_zstd_dictionaries(),
         )?;
 
         let version = Version::from_recovery(recovery, &tables, &blob_files)?;

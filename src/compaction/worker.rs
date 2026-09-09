@@ -1746,6 +1746,11 @@ fn run_subcompaction(
             .use_target_size(blob_opts.file_target_size)
             .use_passthrough_compression(blob_opts.compression)
             .use_sync_mode(opts.config.sync_mode);
+            // Relocation compresses nothing (frames are copied verbatim) but
+            // still records a codec, so the files it produces need the set to
+            // pin the dictionary that codec names.
+            #[cfg(zstd_any)]
+            let writer = writer.use_zstd_dictionaries(opts.config.current_zstd_dictionaries());
 
             let inner = StandardCompaction::new(table_writer, tables_for_deletion);
             Box::new(RelocatingCompaction::new(
@@ -2621,6 +2626,10 @@ fn merge_tables(
                 .use_target_size(blob_opts.file_target_size)
                 .use_passthrough_compression(blob_opts.compression)
                 .use_sync_mode(opts.config.sync_mode);
+                // Same as the relocation above: the recorded codec is what the
+                // produced file's reader resolves, so it must be pinnable.
+                #[cfg(zstd_any)]
+                let writer = writer.use_zstd_dictionaries(opts.config.current_zstd_dictionaries());
 
                 let inner = StandardCompaction::new(table_writer, tables);
 

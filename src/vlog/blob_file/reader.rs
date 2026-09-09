@@ -76,36 +76,11 @@ pub fn record_len(key_len: usize, vhandle: &ValueHandle) -> crate::Result<usize>
 pub struct Reader<'a> {
     blob_file: &'a BlobFile,
     file: &'a dyn FsFile,
-
-    /// Every dictionary the tree can decompress against. Must be supplied when
-    /// the blob file's compression type is [`CompressionType::ZstdDict`].
-    #[cfg(zstd_any)]
-    zstd_dictionaries: Option<&'a crate::compression::ZstdDictionaries>,
 }
 
 impl<'a> Reader<'a> {
     pub fn new(blob_file: &'a BlobFile, file: &'a dyn FsFile) -> Self {
-        Self {
-            blob_file,
-            file,
-            #[cfg(zstd_any)]
-            zstd_dictionaries: None,
-        }
-    }
-
-    /// Provides the dictionaries [`CompressionType::ZstdDict`] blobs resolve
-    /// against.
-    ///
-    /// The SET, not one dictionary: a blob file records the id it was written
-    /// with, and that recorded id is what the read resolves. Handing the reader
-    /// a single dictionary instead would make the current write policy decide
-    /// how OLDER files decode, so the first rotation would render the previous
-    /// generation unreadable.
-    #[cfg(zstd_any)]
-    #[must_use]
-    pub fn with_dicts(mut self, dicts: &'a crate::compression::ZstdDictionaries) -> Self {
-        self.zstd_dictionaries = Some(dicts);
-        self
+        Self { blob_file, file }
     }
 
     pub fn get(&self, key: &'a [u8], vhandle: &'a ValueHandle) -> crate::Result<UserValue> {
@@ -276,17 +251,17 @@ impl<'a> Reader<'a> {
 
             #[cfg(zstd_any)]
             CompressionType::ZstdDict { dict_id, .. } => {
-                // The id the FILE recorded, resolved against what the tree
-                // holds. Not the dictionary the tree currently writes with:
-                // that one decodes nothing written before it existed.
-                let dict = self
-                    .zstd_dictionaries
-                    .and_then(|dicts| dicts.get(*dict_id))
-                    .ok_or(crate::Error::ZstdDictMismatch {
+                // The blob file's OWN dictionary, pinned on its handle when the
+                // handle was built. Not looked up per read: the hold that keeps
+                // this file readable is what keeps its dictionary alive, so a
+                // reader cannot lose it to a collection running underneath.
+                let dict = self.blob_file.0.zstd_dictionary.as_deref().ok_or(
+                    crate::Error::ZstdDictMismatch {
                         expected: *dict_id,
                         got: None,
-                    })?;
-                debug_assert_eq!(dict.id(), *dict_id, "the set is keyed by the id");
+                    },
+                )?;
+                debug_assert_eq!(dict.id(), *dict_id, "pinned by this file's own descriptor");
 
                 let decompressed = crate::compression::ZstdBackend::decompress_with_dict(
                     &raw_data,

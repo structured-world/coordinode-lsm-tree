@@ -100,19 +100,10 @@ fn resolve_value_handle(
         let mut cursor = crate::io::Cursor::new(item.value);
         let vptr = BlobIndirection::decode_from(&mut cursor)?;
 
-        // The whole set, so each blob file decodes against the dictionary IT
-        // recorded. Held across the read: registration swaps the registry on a
-        // live tree, and a read works against the snapshot it started with.
-        #[cfg(zstd_any)]
-        let dicts = config.zstd_dictionaries.load();
-
-        // Resolve indirection using value log
-        let accessor = {
-            let a = Accessor::new(&version.blob_files);
-            #[cfg(zstd_any)]
-            let a = a.with_dicts(&dicts);
-            a
-        };
+        // Resolve indirection using value log. No dictionary passed: each blob
+        // file carries the one its own descriptor names, pinned for as long as
+        // this version keeps the file alive.
+        let accessor = Accessor::new(&version.blob_files);
 
         match accessor.get(tree_id, &item.key.user_key, &vptr.vhandle, &config.cache) {
             Ok(Some(v)) => {
@@ -426,18 +417,7 @@ impl<I: Iterator<Item = crate::Result<InternalValue>>> PrefetchScan<I> {
             return;
         }
 
-        // One snapshot of the set for the whole window: every file in it
-        // decodes against the dictionary it recorded, whichever generation it
-        // belongs to.
-        #[cfg(zstd_any)]
-        let dicts = self.tree.index.config.zstd_dictionaries.load();
-
-        let accessor = {
-            let a = Accessor::new(&self.version.blob_files);
-            #[cfg(zstd_any)]
-            let a = a.with_dicts(&dicts);
-            a
-        };
+        let accessor = Accessor::new(&self.version.blob_files);
 
         accessor.prefetch(
             self.tree.id(),
@@ -1131,7 +1111,9 @@ impl AbstractTree for BlobTree {
             .use_compression(kv_opts.compression)
             .use_sync_mode(self.index.config.sync_mode);
             #[cfg(zstd_any)]
-            let w = w.use_zstd_dictionary(kv_opts.zstd_dictionary.clone());
+            let w = w
+                .use_zstd_dictionary(kv_opts.zstd_dictionary.clone())
+                .use_zstd_dictionaries(self.index.config.current_zstd_dictionaries());
             w
         };
 

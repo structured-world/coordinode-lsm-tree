@@ -688,6 +688,8 @@ fn blob_reader_rejects_retired_blob_magic_frame() -> crate::Result<()> {
         file_accessor: FileAccessor::File(Arc::new(file2)),
         fs: Arc::new(crate::fs::StdFs),
         deletion_pause: once_cell::race::OnceBox::new(),
+        #[cfg(zstd_any)]
+        zstd_dictionary: None,
 
         #[cfg(feature = "std")]
         background_deleter: once_cell::race::OnceBox::new(),
@@ -763,15 +765,15 @@ fn blob_reader_zstd_dict_missing_dict_returns_mismatch() -> crate::Result<()> {
     Ok(())
 }
 
-/// A blob written under dict A resolves against a SET, by the id the file
-/// recorded: a set holding only the tree's newer dict B cannot decode it, and a
-/// set holding both decodes it whichever one the tree currently writes with.
+/// The reader takes no dictionary: a blob file carries the one its own
+/// descriptor names, pinned when the handle was built. A handle built while the
+/// tree held that dictionary decodes; one built while it did not reports the id
+/// as missing, and neither answer can change afterwards.
 #[test]
 #[cfg(zstd_any)]
-fn blob_reader_resolves_the_dictionary_the_file_recorded() -> crate::Result<()> {
+fn blob_reader_uses_the_dictionary_pinned_on_its_file() -> crate::Result<()> {
     use crate::compression::{ZstdDictionaries, ZstdDictionary};
 
-    let id_generator = SequenceNumberCounter::default();
     let folder = tempfile::tempdir()?;
 
     let dict_a = ZstdDictionary::new(b"dictionary_a_content_for_testing");
@@ -783,37 +785,50 @@ fn blob_reader_resolves_the_dictionary_the_file_recorded() -> crate::Result<()> 
     let dict_a_arc = Arc::new(dict_a);
     let dict_b_arc = Arc::new(dict_b);
 
-    let mut writer =
-        crate::vlog::BlobFileWriter::new(id_generator, folder.path(), 0, None, Arc::new(StdFs))?
-            .use_target_size(u64::MAX)
-            .use_compression(compression)
-            .use_zstd_dictionary(Some(dict_a_arc.clone()));
+    // Written by a tree that holds only the newer B alongside the A it
+    // compresses with: the handle pins A, because A is what the file records.
+    let both = ZstdDictionaries::new()
+        .with(dict_b_arc.clone())
+        .with(dict_a_arc.clone());
+    let mut writer = crate::vlog::BlobFileWriter::new(
+        SequenceNumberCounter::default(),
+        folder.path(),
+        0,
+        None,
+        Arc::new(StdFs),
+    )?
+    .use_target_size(u64::MAX)
+    .use_compression(compression)
+    .use_zstd_dictionary(Some(dict_a_arc))
+    .use_zstd_dictionaries(both);
 
     let handle = writer.write(b"key", 0, b"value-compressed-with-dict-a")?;
     let blob_file = writer.finish()?;
     let blob_file = blob_file.first().unwrap();
 
     let file = File::open(&blob_file.0.path)?;
+    let value = Reader::new(blob_file, &file).get(b"key", &handle)?;
+    assert_eq!(&*value, b"value-compressed-with-dict-a");
 
-    // Rotated away: the tree now holds only B, so A's generation is gone.
+    // The same file recovered by a tree that does NOT hold A pins nothing, and
+    // says which id it wanted rather than decoding against something else.
     let only_b = ZstdDictionaries::new().with(dict_b_arc);
-    let result = Reader::new(blob_file, &file)
-        .with_dicts(&only_b)
-        .get(b"key", &handle);
+    let orphaned = crate::vlog::recover_blob_file(
+        &blob_file.0.path,
+        blob_file.id(),
+        crate::Checksum::from_raw(0),
+        0,
+        &(Arc::new(StdFs) as Arc<dyn crate::fs::Fs>),
+        &only_b,
+    )?;
+    let result = Reader::new(&orphaned, &file).get(b"key", &handle);
     assert!(
         matches!(
             result,
             Err(crate::Error::ZstdDictMismatch { got: None, .. })
         ),
-        "a set without the recorded dictionary must report it missing; got: {result:?}",
+        "a tree without the recorded dictionary must report it missing; got: {result:?}",
     );
-
-    // Rotated properly: both are held, and the file names the one it needs.
-    let both = only_b.with(dict_a_arc);
-    let value = Reader::new(blob_file, &file)
-        .with_dicts(&both)
-        .get(b"key", &handle)?;
-    assert_eq!(&*value, b"value-compressed-with-dict-a");
 
     Ok(())
 }

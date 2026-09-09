@@ -43,6 +43,17 @@ pub struct MultiWriter {
     #[cfg(zstd_any)]
     zstd_dictionary: Option<alloc::sync::Arc<crate::compression::ZstdDictionary>>,
 
+    /// The tree's dictionary set, used to PIN the dictionary each finished file
+    /// records on its handle (see `blob_file::Inner::zstd_dictionary`).
+    ///
+    /// Not the same question as [`Self::zstd_dictionary`], which is what this
+    /// writer COMPRESSES with. A relocation pass compresses with nothing (it
+    /// copies frames verbatim) yet still records a codec, so the file it
+    /// produces needs a dictionary its own descriptor names and the write slot
+    /// cannot answer.
+    #[cfg(zstd_any)]
+    zstd_dictionaries: crate::compression::ZstdDictionaries,
+
     tree_id: TreeId,
     descriptor_table: Option<Arc<DescriptorTable>>,
 }
@@ -81,6 +92,8 @@ impl MultiWriter {
 
             #[cfg(zstd_any)]
             zstd_dictionary: None,
+            #[cfg(zstd_any)]
+            zstd_dictionaries: crate::compression::ZstdDictionaries::new(),
 
             tree_id,
             descriptor_table,
@@ -142,6 +155,19 @@ impl MultiWriter {
         self
     }
 
+    /// Provides the tree's dictionary set, so each finished file can pin the
+    /// dictionary its own recorded descriptor names.
+    ///
+    /// Required wherever the files this writer produces are `ZstdDict`, whether
+    /// this writer compresses them itself or passes already-compressed frames
+    /// through: the handle a reader gets must carry its own dictionary.
+    #[cfg(zstd_any)]
+    #[must_use]
+    pub fn use_zstd_dictionaries(mut self, dicts: crate::compression::ZstdDictionaries) -> Self {
+        self.zstd_dictionaries = dicts;
+        self
+    }
+
     /// Sets up a new writer for the next blob file.
     fn rotate(&mut self) -> crate::Result<()> {
         log::debug!("Rotating blob file writer");
@@ -169,6 +195,8 @@ impl MultiWriter {
             self.passthrough_compression,
             self.descriptor_table.clone(),
             &self.fs,
+            #[cfg(zstd_any)]
+            &self.zstd_dictionaries,
         )?;
         self.results.extend(blob_file);
 
@@ -180,6 +208,7 @@ impl MultiWriter {
         passthrough_compression: CompressionType,
         descriptor_table: Option<Arc<DescriptorTable>>,
         fs: &Arc<dyn Fs>,
+        #[cfg(zstd_any)] zstd_dictionaries: &crate::compression::ZstdDictionaries,
     ) -> crate::Result<Option<BlobFile>> {
         if writer.item_count > 0 {
             let blob_file_id = writer.blob_file_id;
@@ -207,6 +236,15 @@ impl MultiWriter {
             };
             file_accessor.insert_for_blob_file((tree_id, blob_file_id).into(), file);
 
+            // What the FILE will record, which is what its reader resolves
+            // against: the passthrough codec when relocation is stamping the
+            // source's own, else what this writer compressed with.
+            let recorded_compression = if passthrough_compression == CompressionType::None {
+                metadata.compression
+            } else {
+                passthrough_compression
+            };
+
             let blob_file = BlobFile(Arc::new(BlobFileInner {
                 checksum,
                 tree_id,
@@ -217,6 +255,8 @@ impl MultiWriter {
                 live_data_start: 0,
                 id: blob_file_id,
                 file_accessor,
+                #[cfg(zstd_any)]
+                zstd_dictionary: zstd_dictionaries.for_compression(recorded_compression),
                 meta: Metadata {
                     id: blob_file_id,
                     version: metadata.version,
@@ -224,13 +264,9 @@ impl MultiWriter {
                     item_count: metadata.item_count,
                     total_compressed_bytes: metadata.total_compressed_bytes,
                     total_uncompressed_bytes: metadata.total_uncompressed_bytes,
-                    key_range: metadata.key_range.clone(),
+                    key_range: metadata.key_range,
 
-                    compression: if passthrough_compression == CompressionType::None {
-                        metadata.compression
-                    } else {
-                        passthrough_compression
-                    },
+                    compression: recorded_compression,
                 },
                 fs: fs.clone(),
                 deletion_pause: once_cell::race::OnceBox::new(),
@@ -322,6 +358,8 @@ impl MultiWriter {
             self.passthrough_compression,
             self.descriptor_table.clone(),
             &self.fs,
+            #[cfg(zstd_any)]
+            &self.zstd_dictionaries,
         )?;
         self.results.extend(blob_file);
         Ok(self.results)
