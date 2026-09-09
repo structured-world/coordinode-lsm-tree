@@ -966,6 +966,103 @@ mod zstd_dict {
     }
 
     #[test]
+    fn relocation_keeps_the_codec_its_frames_were_written_under() -> lsm_tree::Result<()> {
+        // A relocation copies blob frames VERBATIM: it never re-encodes them.
+        // The file it produces must therefore record the codec those frames
+        // actually carry, not whatever the tree's blob policy says today, or
+        // the bytes and the descriptor disagree and the file stops decoding.
+        let dir = tempfile::tempdir()?;
+        let dict = make_test_dictionary();
+        let big_value = b"blob-value-".repeat(20);
+        let replacement = b"second-generation-value-".repeat(15);
+
+        {
+            let tree = make_config(dir.path())
+                .with_kv_separation(Some(
+                    make_blob_opts(CompressionType::zstd_dict(3, dict.id())?, Arc::new(dict))
+                        .staleness_threshold(0.0)
+                        .age_cutoff(1.0),
+                ))
+                .open()?;
+            for i in 0u32..50 {
+                let key = format!("key-{i:04}");
+                tree.insert(key.as_bytes(), &big_value, i.into());
+            }
+            tree.flush_active_memtable(0)?;
+            // Overwrite half, so the first blob file carries dead bytes and a
+            // relocation pass has a reason to rewrite it.
+            for i in 0u32..25 {
+                let key = format!("key-{i:04}");
+                tree.insert(key.as_bytes(), &replacement, (100 + i).into());
+            }
+            tree.flush_active_memtable(0)?;
+            // Above every seqno written, so the superseded versions are
+            // actually dropped: that is what records dead bytes in the
+            // version's fragmentation map and makes the file relocatable.
+            tree.major_compact(u64::MAX, 100_000)?;
+        }
+
+        let blob_ids = |dir: &std::path::Path| -> lsm_tree::Result<Vec<String>> {
+            let mut names = Vec::new();
+            for entry in std::fs::read_dir(dir.join("blobs"))? {
+                names.push(entry?.file_name().to_string_lossy().into_owned());
+            }
+            names.sort();
+            Ok(names)
+        };
+        let before = blob_ids(dir.path())?;
+
+        // The blob policy changes. Files already written keep THEIR codec.
+        let tree = make_config(dir.path())
+            .with_kv_separation(Some(
+                lsm_tree::KvSeparationOptions::default()
+                    .separation_threshold(1)
+                    .staleness_threshold(0.0)
+                    .age_cutoff(1.0),
+            ))
+            .open()?;
+        // Which compaction picks the stale file up is a scheduling decision, so
+        // drive it until it happens rather than assuming one pass suffices.
+        // The test is worthless if the relocation never runs, so failing to
+        // provoke it is a failure, not a silent pass.
+        let mut relocated = false;
+        for round in 0u32..5 {
+            let key = format!("filler-{round:04}");
+            tree.insert(key.as_bytes(), &replacement, (200 + round).into());
+            tree.flush_active_memtable(0)?;
+            tree.major_compact(u64::MAX, 100_000)?;
+
+            let after = blob_ids(dir.path())?;
+            if before.iter().any(|id| !after.contains(id)) {
+                relocated = true;
+                break;
+            }
+        }
+        assert!(
+            relocated,
+            "no generation-A blob file was relocated: before={before:?} after={:?}",
+            blob_ids(dir.path())?,
+        );
+
+        for i in 25u32..50 {
+            let key = format!("key-{i:04}");
+            assert_eq!(
+                tree.get(key.as_bytes(), lsm_tree::MAX_SEQNO)?.as_deref(),
+                Some(big_value.as_slice()),
+                "a relocated blob must still decode under its own codec",
+            );
+        }
+        for i in 0u32..25 {
+            let key = format!("key-{i:04}");
+            assert_eq!(
+                tree.get(key.as_bytes(), lsm_tree::MAX_SEQNO)?.as_deref(),
+                Some(replacement.as_slice()),
+            );
+        }
+        Ok(())
+    }
+
+    #[test]
     fn a_dictionary_still_in_use_is_never_collected() -> lsm_tree::Result<()> {
         // The direction that matters: collection must not take a dictionary
         // the tables still need, or the tree loses the ability to read itself.

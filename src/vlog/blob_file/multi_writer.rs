@@ -131,6 +131,36 @@ impl MultiWriter {
         self
     }
 
+    /// Records `compression` on the file being filled, rotating first when a
+    /// frame already in it claims a different one.
+    ///
+    /// The relocation counterpart of [`Self::use_passthrough_compression`],
+    /// which fixes one codec for the whole pass. A relocation copies frames
+    /// VERBATIM out of sources that need not share a codec (the blob policy may
+    /// have moved since they were written), while a blob file records exactly
+    /// one. Rotating on that boundary is what keeps every output file's
+    /// descriptor true of every frame in it.
+    ///
+    /// # Errors
+    ///
+    /// Propagates the rotation's finish of the file being closed.
+    pub(crate) fn record_source_compression(
+        &mut self,
+        compression: CompressionType,
+    ) -> crate::Result<()> {
+        if self.passthrough_compression == compression {
+            return Ok(());
+        }
+        // Only what is already written constrains the codec; an untouched
+        // writer can simply be restamped.
+        if self.active_writer.item_count > 0 {
+            self.rotate()?;
+        }
+        self.passthrough_compression = compression;
+        self.active_writer.metadata_compression_override = Some(compression);
+        Ok(())
+    }
+
     /// Sets the compression method.
     #[must_use]
     #[doc(hidden)]
