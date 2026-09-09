@@ -956,9 +956,7 @@ impl AbstractTree for Tree {
                 params.encryption.clone_from(&self.config.encryption);
                 #[cfg(zstd_any)]
                 {
-                    params
-                        .zstd_dictionary
-                        .clone_from(&self.config.zstd_dictionary);
+                    params.zstd_dictionaries = self.config.current_zstd_dictionaries();
                 }
                 #[cfg(feature = "metrics")]
                 {
@@ -1848,6 +1846,208 @@ impl AbstractTree for Tree {
 }
 
 impl Tree {
+    /// Stores `dict` in the tree and records it in the current version, so it
+    /// resolves after a reopen with no dictionary supplied in the config.
+    ///
+    /// Additive: tables already written keep resolving to the dictionary they
+    /// were written against, which is what makes it safe to introduce a
+    /// dictionary on a tree that already holds data, and to replace one (both
+    /// are this same operation). Registering an id the tree already holds is a
+    /// no-op, since the id is derived from the bytes.
+    ///
+    /// The file is written BEFORE the version edit that references it. The
+    /// other order would publish an id whose bytes a crash could still lose,
+    /// and the tables written against it would then fail to open; this order
+    /// can only leave an unreferenced file, which the next collection removes.
+    ///
+    /// Both steps happen under the version lock, which is what serializes this
+    /// against [`Self::collect_unreferenced_dictionaries`]. Taking the lock only
+    /// for the edit would leave the file published in the window the collector
+    /// scans, and it would be unlinked as an orphan before the edit that names
+    /// it ever landed.
+    ///
+    /// # Errors
+    ///
+    /// Propagates the store's write failures and the version install's.
+    #[cfg(zstd_any)]
+    pub fn register_zstd_dictionary(
+        &self,
+        dict: alloc::sync::Arc<crate::compression::ZstdDictionary>,
+    ) -> crate::Result<()> {
+        let id = dict.id();
+        let mut version_lock = self.version_history.write();
+
+        let folder = self.config.path.join(crate::file::DICTS_FOLDER);
+        crate::dicts::write(&*self.config.fs, &folder, &dict, self.config.sync_mode)?;
+
+        // Resolvable from this moment on rather than from the next open: the
+        // tables this registration was made for are written right after it, and
+        // reading them back needs the dictionary in the LIVE set.
+        let dicts = self.config.current_zstd_dictionaries().with(dict);
+        self.config
+            .zstd_dictionaries
+            .store(alloc::sync::Arc::new(dicts));
+
+        if version_lock
+            .latest_version_ref()
+            .version
+            .dicts()
+            .contains(&id)
+        {
+            return Ok(());
+        }
+        version_lock.upgrade_version(
+            &self.config.path,
+            |current| {
+                let mut copy = current.clone();
+                copy.version = copy.version.with_dict(id);
+                Ok(copy)
+            },
+            &self.config.seqno,
+            &self.config.visible_seqno,
+            &*self.config.fs,
+            self.0.runtime_config.load_full(),
+            self.0.config.encryption.clone(),
+            // Registering a dictionary adds a file and drops nothing, so no
+            // snapshot loses anything it could read before.
+            crate::version::RetentionEffect::Keep,
+        )
+    }
+
+    /// The dictionaries this tree can decompress against, as of this call.
+    #[cfg(zstd_any)]
+    #[must_use]
+    pub fn zstd_dictionaries(&self) -> crate::compression::ZstdDictionaries {
+        self.config.current_zstd_dictionaries()
+    }
+
+    /// Drops every dictionary nothing references any more, returning how many
+    /// files were removed.
+    ///
+    /// Two stages, because "nothing uses it" and "no version mentions it" are
+    /// different questions and only the second makes a file safe to unlink:
+    ///
+    /// 1. The latest version stops REGISTERING an id once nothing references
+    ///    it. That is the version edit; it costs an install and nothing on
+    ///    disk.
+    /// 2. The file goes only when no RETAINED version registers the id any
+    ///    more. A version still in the history can still be read from, and its
+    ///    tables would fail to open without their dictionary.
+    ///
+    /// So the file survives until the versions that named it have been pruned,
+    /// which is the same lifetime rule the tables themselves follow.
+    ///
+    /// REFERENCED means both directions: the files that already exist (tables
+    /// and blob files alike), and the ids the compression policy names for what
+    /// is written next. Counting only the first would unregister a dictionary
+    /// before its first table is written, and nothing puts the id back
+    /// afterwards — so a later pass would unlink the file while live tables are
+    /// compressed against it.
+    ///
+    /// The whole pass holds the version lock. Registration takes the same lock
+    /// before it writes anything, so the two cannot interleave: without that, a
+    /// registration's file could land between this scan and its removals and be
+    /// unlinked as an orphan while the edit naming it was still to come.
+    ///
+    /// # Errors
+    ///
+    /// Propagates the version install and the store's removal failures.
+    #[cfg(zstd_any)]
+    pub fn collect_unreferenced_dictionaries(&self) -> crate::Result<usize> {
+        let mut version_lock = self.version_history.write();
+
+        // Stage 1: unregister what neither the latest version's tables nor the
+        // write policy needs.
+        let latest = version_lock.latest_version_ref().version.clone();
+        let mut referenced = latest.referenced_dicts();
+        referenced.extend(self.config.write_referenced_dict_ids());
+        let stale: Vec<crate::file::DictId> = latest
+            .dicts()
+            .iter()
+            .copied()
+            .filter(|id| !referenced.contains(id))
+            .collect();
+
+        if !stale.is_empty() {
+            version_lock.upgrade_version(
+                &self.config.path,
+                |current| {
+                    let mut copy = current.clone();
+                    for id in &stale {
+                        copy.version = copy.version.without_dict(*id);
+                    }
+                    Ok(copy)
+                },
+                &self.config.seqno,
+                &self.config.visible_seqno,
+                &*self.config.fs,
+                self.0.runtime_config.load_full(),
+                self.0.config.encryption.clone(),
+                // Dropping a dictionary nothing reads takes away no version a
+                // snapshot could observe: the tables that used it are already
+                // gone, and their disappearance is what raised the floor.
+                crate::version::RetentionEffect::Keep,
+            )?;
+        }
+
+        // Stage 2: unlink the files nothing names any more. Still under the
+        // version lock, so no registration can publish a file into the window
+        // between the listing and the removals.
+        let still_owed = version_lock.registered_dicts();
+
+        let folder = self.config.path.join(crate::file::DICTS_FOLDER);
+        let mut removed = 0;
+        for id in crate::dicts::list_ids(&*self.config.fs, &folder)? {
+            if still_owed.contains(&id) || referenced.contains(&id) {
+                continue;
+            }
+            // A held deletion pause SKIPS the dictionary entirely — it is not
+            // queued for later. A checkpoint holds its captured version as a
+            // LOCAL clone, so a concurrent clear or GC install can drop that
+            // version out of the history while the checkpoint is still going to
+            // link the dictionaries it names; removing one now would fail
+            // `link_dictionaries` on a missing file and abort a checkpoint that
+            // was otherwise valid.
+            //
+            // Skipping rather than DEFERRING (which is what tables and blob
+            // files do) because a queued removal fires unconditionally when the
+            // pause drains, and by then the id may have been registered again:
+            // registration finds the file already there, makes its write a
+            // no-op, durably records the id — and the drain then deletes the
+            // dictionary that registration just published. A table's removal
+            // cannot be undone by re-creating the table, so deferring is right
+            // for it; a dictionary collection is an explicit operation that can
+            // simply be run again, so waiting for the next pass costs nothing
+            // and leaves no queued action to fire against a re-registered file.
+            if self.deletion_pause.is_active() {
+                continue;
+            }
+            crate::dicts::remove(&*self.config.fs, &folder, id, self.config.sync_mode)?;
+
+            // Out of the LIVE set too, not just off the disk. The registry holds
+            // each dictionary's raw bytes and its prepared decoder state, so a
+            // tree that rotates dictionaries over a long life would otherwise
+            // accumulate every generation it ever held until it is dropped —
+            // and `zstd_dictionaries()` would keep naming ids the tree no
+            // longer owns.
+            self.config.zstd_dictionaries.store(alloc::sync::Arc::new(
+                self.config.current_zstd_dictionaries().without(id),
+            ));
+            removed += 1;
+        }
+        // Explicitly, and only here: the guard is what excludes a concurrent
+        // registration from the removals above, so releasing it at its last READ
+        // (which is what tightening the scope would do) is precisely the race.
+        //
+        // This drop is also what satisfies `clippy::significant_drop_tightening`
+        // — it makes the guard's last use its own release, so the lint does not
+        // fire and the function needs no expectation. Adding one anyway is a
+        // BUILD FAILURE here, not dead weight: `unfulfilled_lint_expectations`
+        // is an error under the crate's `-D warnings`.
+        drop(version_lock);
+        Ok(removed)
+    }
+
     /// Maps a raw internal entry to its change-data-capture event, routing
     /// `Indirection` (KV-separated) values through `resolve_indirection`.
     ///
@@ -3986,16 +4186,22 @@ impl Tree {
         // a pool per compaction would spawn threads on each run). A caller-
         // supplied pool is left untouched. Shadowed under `parallel` only, so
         // non-parallel builds don't carry an unused `mut`.
+        // `mut` under `zstd_any` too: installing the dictionaries ASSIGNS the
+        // config a registry of its own rather than storing through the one it
+        // arrived with, which is what keeps two trees opened from clones of one
+        // config from sharing a set.
+        #[cfg_attr(
+            not(any(feature = "parallel", zstd_any)),
+            expect(unused_mut, reason = "assigned only by the parallel / zstd builds")
+        )]
+        let mut config = config;
+
         #[cfg(feature = "parallel")]
-        let config = {
-            let mut config = config;
-            if config.compaction_pool.is_none() && config.compaction_threads > 1 {
-                config.compaction_pool = Some(Arc::new(
-                    crate::table::writer::RayonSpawner::with_threads(config.compaction_threads)?,
-                ));
-            }
-            config
-        };
+        if config.compaction_pool.is_none() && config.compaction_threads > 1 {
+            config.compaction_pool = Some(Arc::new(
+                crate::table::writer::RayonSpawner::with_threads(config.compaction_threads)?,
+            ));
+        }
 
         // Gate on the `page_ecc` cargo feature: caller asked for ECC
         // but the build does not link the Reed-Solomon codec. We have
@@ -4028,6 +4234,32 @@ impl Tree {
             config.fs.create_dir_all(&config.path)?;
             crate::config::acquire_directory_lock(&*config.fs, &config.path, config.directory_lock)?
         };
+
+        // Load the tree's own dictionaries before anything opens a table: a
+        // table resolves the dictionary id it recorded against this set, so an
+        // empty one fails every dictionary-compressed table in the tree. Under
+        // the directory lock, since it reads the tree's own folder, and before
+        // the recover / create split, because a freshly created tree writes
+        // dictionary-compressed tables too.
+        //
+        // A dictionary supplied through the config joins them, which is what
+        // keeps `Config::dict` working: on the first open it is the only one
+        // there, and it is registered at the end of this function so later
+        // opens need no config at all.
+        //
+        // Under the lock for a second reason: the load SWEEPS unpublished
+        // `.tmp` registrations. Doing that before the lock lets an opener that
+        // is about to fail with `Locked` delete a live owner's in-flight
+        // registration between its write and its rename.
+        #[cfg(zstd_any)]
+        config.install_own_zstd_dictionaries()?;
+
+        // Only now can the compression policy be checked: it names a dictionary
+        // by id, and the tree may hold that id without the caller supplying the
+        // bytes again. Validating before the load would refuse exactly the
+        // reopen the tree owning its dictionaries exists to allow.
+        #[cfg(zstd_any)]
+        config.validate_zstd_dictionary()?;
 
         // Check for old version
         if config.fs.exists(&config.path.join("version"))? {
@@ -4109,6 +4341,32 @@ impl Tree {
             }
             Err(e) => Err(e),
         }?;
+
+        // A dictionary supplied through the config becomes the tree's, so the
+        // caller supplies it once rather than on every open forever. Idempotent
+        // by id, so re-opening with the same one writes nothing.
+        //
+        // BOTH write slots, not just the table one: a KV-separated tree
+        // compresses its blob files against a dictionary of their own, and a
+        // blob file whose dictionary the tree never stored cannot be read back
+        // from a checkpoint or after the caller stops supplying it — the same
+        // failure the table side had, one file class over.
+        //
+        // After the recover / create above, because registering installs a
+        // version edit and there is no history to install into before that.
+        #[cfg(zstd_any)]
+        for dict in [
+            tree.config.zstd_dictionary.clone(),
+            tree.config
+                .kv_separation_opts
+                .as_ref()
+                .and_then(|o| o.zstd_dictionary.clone()),
+        ]
+        .into_iter()
+        .flatten()
+        {
+            tree.register_zstd_dictionary(dict)?;
+        }
 
         Ok(tree)
     }
@@ -5322,7 +5580,7 @@ impl Tree {
                         params.encryption.clone_from(&config.encryption);
                         #[cfg(zstd_any)]
                         {
-                            params.zstd_dictionary.clone_from(&config.zstd_dictionary);
+                            params.zstd_dictionaries = config.current_zstd_dictionaries();
                         }
                         #[cfg(feature = "metrics")]
                         {
@@ -5557,6 +5815,8 @@ impl Tree {
             tree_id,
             config.descriptor_table.as_ref(),
             &config.fs,
+            #[cfg(zstd_any)]
+            &config.current_zstd_dictionaries(),
         )?;
 
         let version = Version::from_recovery(recovery, &tables, &blob_files)?;
@@ -5820,3 +6080,6 @@ mod cache_stats_tests;
 #[cfg(all(test, feature = "std"))]
 #[expect(clippy::expect_used, reason = "test code")]
 mod restricted_reclaim_tests;
+
+#[cfg(all(test, feature = "std", zstd_any))]
+mod dict_collect_tests;

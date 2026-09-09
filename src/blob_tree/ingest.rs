@@ -57,6 +57,14 @@ impl<'a> BlobIngestion<'a> {
         .use_compression(kv.compression)
         .use_sync_mode(tree.index.config.sync_mode);
 
+        // Ingestion writes blob files under the tree's own blob policy, so it
+        // needs the dictionary to compress with and the set to pin on what it
+        // produces. Without the first, a `ZstdDict` policy fails the write.
+        #[cfg(zstd_any)]
+        let blob = blob
+            .use_zstd_dictionary(kv.zstd_dictionary.clone())
+            .use_zstd_dictionaries(tree.index.config.current_zstd_dictionaries());
+
         let separation_threshold = kv.separation_threshold;
 
         Ok(Self {
@@ -237,9 +245,7 @@ impl<'a> BlobIngestion<'a> {
                 params.encryption.clone_from(&index.config.encryption);
                 #[cfg(zstd_any)]
                 {
-                    params
-                        .zstd_dictionary
-                        .clone_from(&index.config.zstd_dictionary);
+                    params.zstd_dictionaries = index.config.current_zstd_dictionaries();
                 }
                 #[cfg(feature = "metrics")]
                 {

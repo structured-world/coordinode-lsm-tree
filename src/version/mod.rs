@@ -230,6 +230,22 @@ pub struct VersionInner {
     /// manifest, so a reopened tree refuses those snapshots instead of
     /// answering from data they never saw. `0` until the first such install.
     retention_floor: crate::SeqNo,
+
+    /// Ids of the compression dictionaries this version's tables may reference,
+    /// ascending. The bytes live in `dicts/`; this is what says which of them
+    /// the tree still owes a reader.
+    ///
+    /// Versioned rather than tree-global for the same reason tables are: a
+    /// dictionary is reachable exactly while some retained version references
+    /// it, so the file can be removed once no version does, and a recovery that
+    /// lands on an older version still finds what that version's tables were
+    /// written against.
+    ///
+    /// Not gated on the compression features. A build without them cannot
+    /// resolve these ids, but it must carry the list forward across its own
+    /// installs, or reopening with zstd again would find tables whose
+    /// dictionary the tree has forgotten.
+    dicts: Arc<[crate::file::DictId]>,
 }
 
 /// A version is an immutable, point-in-time view of a tree's structure
@@ -287,6 +303,104 @@ impl Version {
                 blob_files: self.blob_files.clone(),
                 gc_stats: self.gc_stats.clone(),
                 retention_floor: floor,
+                dicts: self.dicts.clone(),
+            }),
+        }
+    }
+
+    /// Ids of the compression dictionaries this version's tables may reference,
+    /// ascending. See [`VersionInner::dicts`].
+    #[must_use]
+    pub fn dicts(&self) -> &[crate::file::DictId] {
+        &self.dicts
+    }
+
+    /// The dictionary ids this version's files actually reference, ascending.
+    ///
+    /// The REGISTERED set ([`Self::dicts`]) is what the tree owes a reader; this
+    /// is what it still needs. They diverge once a compaction rewrites the last
+    /// file that used a dictionary, which is exactly when it becomes
+    /// collectable.
+    ///
+    /// Blob files count as much as tables: a KV-separated tree stores its values
+    /// there, under a dictionary of their own, and a blob file whose dictionary
+    /// was collected cannot resolve a single indirection.
+    #[must_use]
+    pub fn referenced_dicts(&self) -> Vec<crate::file::DictId> {
+        fn dict_of(compression: crate::CompressionType) -> Option<crate::file::DictId> {
+            match compression {
+                #[cfg(zstd_any)]
+                crate::CompressionType::ZstdDict { dict_id, .. } => Some(dict_id),
+                _ => None,
+            }
+        }
+
+        let mut ids: Vec<crate::file::DictId> = self
+            .iter_tables()
+            .filter_map(|table| dict_of(table.metadata.data_block_compression))
+            .chain(
+                self.blob_files
+                    .iter()
+                    .filter_map(|bf| dict_of(bf.compression())),
+            )
+            .collect();
+        ids.sort_unstable();
+        ids.dedup();
+        ids
+    }
+
+    /// Registers `id` with this version, returning the extended version.
+    ///
+    /// Idempotent: an id already present returns this version unchanged, since
+    /// the id is derived from the dictionary's own bytes and cannot name two
+    /// different dictionaries.
+    #[must_use]
+    pub fn with_dict(&self, id: crate::file::DictId) -> Self {
+        if self.dicts.contains(&id) {
+            return self.clone();
+        }
+        let mut dicts = self.dicts.to_vec();
+        // Ascending, so the persisted order does not depend on registration
+        // order and two trees holding the same dictionaries encode alike.
+        let at = dicts.partition_point(|held| *held < id);
+        dicts.insert(at, id);
+        self.with_dicts(dicts)
+    }
+
+    /// Drops `id` from this version, returning the reduced version. An id this
+    /// version does not hold returns it unchanged.
+    ///
+    /// Dropping the id is what makes the file collectable; the bytes are
+    /// removed separately, once no retained version holds the id any more.
+    #[must_use]
+    pub fn without_dict(&self, id: crate::file::DictId) -> Self {
+        if !self.dicts.contains(&id) {
+            return self.clone();
+        }
+        let dicts = self
+            .dicts
+            .iter()
+            .copied()
+            .filter(|held| *held != id)
+            .collect::<Vec<_>>();
+        self.with_dicts(dicts)
+    }
+
+    /// This version with `dicts` in place of its own list.
+    ///
+    /// A REBUILT version (manifest repair) also sets the list this way, since
+    /// it starts empty and the ids have to be derived from the recovered files.
+    #[must_use]
+    pub(crate) fn with_dicts(&self, dicts: Vec<crate::file::DictId>) -> Self {
+        Self {
+            inner: Arc::new(VersionInner {
+                id: self.id,
+                tree_type: self.tree_type,
+                levels: self.levels.clone(),
+                blob_files: self.blob_files.clone(),
+                gc_stats: self.gc_stats.clone(),
+                retention_floor: self.retention_floor,
+                dicts: Arc::from(dicts),
             }),
         }
     }
@@ -337,6 +451,7 @@ impl Version {
                 blob_files: Arc::default(),
                 gc_stats: Arc::default(),
                 retention_floor: 0,
+                dicts: Arc::from([]),
             }),
         }
     }
@@ -390,14 +505,18 @@ impl Version {
             })
             .collect::<crate::Result<Vec<_>>>()?;
 
-        Ok(Self::from_levels(
+        let recovered = Self::from_levels(
             recovery.curr_version_id,
             recovery.tree_type,
             version_levels,
             BlobFileList::new(blob_files.iter().cloned().map(|bf| (bf.id(), bf)).collect()),
             recovery.gc_stats,
         )
-        .with_retention_floor(recovery.retention_floor))
+        .with_retention_floor(recovery.retention_floor);
+
+        // The recovered set is what the manifest recorded, so it is adopted
+        // whole rather than folded in one id at a time.
+        Ok(recovered.with_dicts(recovery.dicts))
     }
 
     /// Creates a new pre-populated version.
@@ -416,6 +535,7 @@ impl Version {
                 blob_files: Arc::new(blob_files),
                 gc_stats: Arc::new(gc_stats),
                 retention_floor: 0,
+                dicts: Arc::from([]),
             }),
         }
     }
@@ -536,6 +656,7 @@ impl Version {
                 blob_files: value_log,
                 gc_stats,
                 retention_floor: self.retention_floor,
+                dicts: self.dicts.clone(),
             }),
         }
     }
@@ -623,6 +744,7 @@ impl Version {
                 blob_files: value_log,
                 gc_stats,
                 retention_floor: self.retention_floor,
+                dicts: self.dicts.clone(),
             }),
         })
     }
@@ -720,6 +842,7 @@ impl Version {
                 blob_files: value_log,
                 gc_stats,
                 retention_floor: self.retention_floor,
+                dicts: self.dicts.clone(),
             }),
         }
     }
@@ -775,6 +898,7 @@ impl Version {
                 blob_files: self.blob_files.clone(),
                 gc_stats: self.gc_stats.clone(),
                 retention_floor: self.retention_floor,
+                dicts: self.dicts.clone(),
             }),
         }
     }
@@ -831,6 +955,7 @@ impl Version {
                 blob_files: self.blob_files.clone(),
                 gc_stats: self.gc_stats.clone(),
                 retention_floor: self.retention_floor,
+                dicts: self.dicts.clone(),
             }),
         })
     }
@@ -931,6 +1056,7 @@ impl Version {
                 blob_files: value_log,
                 gc_stats,
                 retention_floor: self.retention_floor,
+                dicts: self.dicts.clone(),
             }),
         }
     }
@@ -1127,6 +1253,21 @@ impl Version {
         // restrictions above.
         writer.start("retention_floor")?;
         writer.write_u64::<LittleEndian>(self.retention_floor)?;
+
+        // The dictionary ids this version's tables may reference. Written only
+        // when the tree holds any, so a tree that compresses against none adds
+        // no section and encodes exactly as it did before; the same optional
+        // treatment as the two sections above. Ids only: the bytes are in
+        // `dicts/`, keyed by these.
+        if !self.dicts.is_empty() {
+            writer.start("dicts")?;
+            writer.write_u32::<LittleEndian>(
+                u32::try_from(self.dicts.len()).map_err(|_| crate::Error::Unrecoverable)?,
+            )?;
+            for id in self.dicts.iter() {
+                writer.write_u32::<LittleEndian>(*id)?;
+            }
+        }
 
         Ok(())
     }

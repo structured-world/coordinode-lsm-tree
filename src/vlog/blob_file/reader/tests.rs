@@ -688,6 +688,8 @@ fn blob_reader_rejects_retired_blob_magic_frame() -> crate::Result<()> {
         file_accessor: FileAccessor::File(Arc::new(file2)),
         fs: Arc::new(crate::fs::StdFs),
         deletion_pause: once_cell::race::OnceBox::new(),
+        #[cfg(zstd_any)]
+        zstd_dictionary: None,
 
         #[cfg(feature = "std")]
         background_deleter: once_cell::race::OnceBox::new(),
@@ -720,11 +722,14 @@ fn blob_reader_rejects_retired_blob_magic_frame() -> crate::Result<()> {
     Ok(())
 }
 
-/// Write a blob with `ZstdDict`, then read it back without supplying a
-/// dictionary.  Expect `ZstdDictMismatch { got: None }`.
+/// A writer that compressed against a dictionary produces a handle carrying it,
+/// so the read needs nothing supplied: it just used those bytes, and they are
+/// the file's by construction. The opposite case — a handle recovered by a tree
+/// that does not hold the recorded id — is covered by
+/// [`blob_reader_uses_the_dictionary_pinned_on_its_file`].
 #[test]
 #[cfg(zstd_any)]
-fn blob_reader_zstd_dict_missing_dict_returns_mismatch() -> crate::Result<()> {
+fn blob_reader_reads_a_written_dictionary_blob_with_nothing_supplied() -> crate::Result<()> {
     use crate::compression::ZstdDictionary;
 
     let id_generator = SequenceNumberCounter::default();
@@ -748,29 +753,22 @@ fn blob_reader_zstd_dict_missing_dict_returns_mismatch() -> crate::Result<()> {
     let blob_file = blob_file.first().unwrap();
 
     let file = File::open(&blob_file.0.path)?;
-    // Reader created WITHOUT a dictionary
-    let reader = Reader::new(blob_file, &file);
-
-    let result = reader.get(b"key", &handle);
-    assert!(
-        matches!(
-            result,
-            Err(crate::Error::ZstdDictMismatch { got: None, .. })
-        ),
-        "expected ZstdDictMismatch{{got: None}} when dict is absent; got: {result:?}",
-    );
+    // The reader takes no dictionary at all: the file's handle carries it.
+    let value = Reader::new(blob_file, &file).get(b"key", &handle)?;
+    assert_eq!(&*value, b"value-to-compress-with-dict");
 
     Ok(())
 }
 
-/// Write a blob with dict A, then read it back with dict B (different id).
-/// Expect `ZstdDictMismatch { got: Some(B.id()) }`.
+/// The reader takes no dictionary: a blob file carries the one its own
+/// descriptor names, pinned when the handle was built. A handle built while the
+/// tree held that dictionary decodes; one built while it did not reports the id
+/// as missing, and neither answer can change afterwards.
 #[test]
 #[cfg(zstd_any)]
-fn blob_reader_zstd_dict_wrong_dict_id_returns_mismatch() -> crate::Result<()> {
-    use crate::compression::ZstdDictionary;
+fn blob_reader_uses_the_dictionary_pinned_on_its_file() -> crate::Result<()> {
+    use crate::compression::{ZstdDictionaries, ZstdDictionary};
 
-    let id_generator = SequenceNumberCounter::default();
     let folder = tempfile::tempdir()?;
 
     let dict_a = ZstdDictionary::new(b"dictionary_a_content_for_testing");
@@ -782,24 +780,49 @@ fn blob_reader_zstd_dict_wrong_dict_id_returns_mismatch() -> crate::Result<()> {
     let dict_a_arc = Arc::new(dict_a);
     let dict_b_arc = Arc::new(dict_b);
 
-    let mut writer =
-        crate::vlog::BlobFileWriter::new(id_generator, folder.path(), 0, None, Arc::new(StdFs))?
-            .use_target_size(u64::MAX)
-            .use_compression(compression)
-            .use_zstd_dictionary(Some(dict_a_arc));
+    // Written by a tree that holds only the newer B alongside the A it
+    // compresses with: the handle pins A, because A is what the file records.
+    let both = ZstdDictionaries::new()
+        .with(dict_b_arc.clone())
+        .with(dict_a_arc.clone());
+    let mut writer = crate::vlog::BlobFileWriter::new(
+        SequenceNumberCounter::default(),
+        folder.path(),
+        0,
+        None,
+        Arc::new(StdFs),
+    )?
+    .use_target_size(u64::MAX)
+    .use_compression(compression)
+    .use_zstd_dictionary(Some(dict_a_arc))
+    .use_zstd_dictionaries(both);
 
     let handle = writer.write(b"key", 0, b"value-compressed-with-dict-a")?;
     let blob_file = writer.finish()?;
     let blob_file = blob_file.first().unwrap();
 
     let file = File::open(&blob_file.0.path)?;
-    // Reader supplied with dict B (wrong id)
-    let reader = Reader::new(blob_file, &file).with_dict(Some(&dict_b_arc));
+    let value = Reader::new(blob_file, &file).get(b"key", &handle)?;
+    assert_eq!(&*value, b"value-compressed-with-dict-a");
 
-    let result = reader.get(b"key", &handle);
+    // The same file recovered by a tree that does NOT hold A pins nothing, and
+    // says which id it wanted rather than decoding against something else.
+    let only_b = ZstdDictionaries::new().with(dict_b_arc);
+    let orphaned = crate::vlog::recover_blob_file(
+        &blob_file.0.path,
+        blob_file.id(),
+        crate::Checksum::from_raw(0),
+        0,
+        &(Arc::new(StdFs) as Arc<dyn crate::fs::Fs>),
+        &only_b,
+    )?;
+    let result = Reader::new(&orphaned, &file).get(b"key", &handle);
     assert!(
-        matches!(result, Err(crate::Error::ZstdDictMismatch { .. })),
-        "expected ZstdDictMismatch when wrong dict id provided; got: {result:?}",
+        matches!(
+            result,
+            Err(crate::Error::ZstdDictMismatch { got: None, .. })
+        ),
+        "a tree without the recorded dictionary must report it missing; got: {result:?}",
     );
 
     Ok(())

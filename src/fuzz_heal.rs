@@ -325,6 +325,8 @@ fn salvage_and_check_minimality(
         encryption,
         #[cfg(zstd_any)]
         zstd_dictionary: None,
+        #[cfg(zstd_any)]
+        zstd_dictionaries: crate::compression::ZstdDictionaries::new(),
         table_id: 0,
         expected_stored_id: None,
         output_id: None,

@@ -160,9 +160,11 @@ pub struct RecoverParams {
     pub pin_index: bool,
     /// At-rest encryption provider, matching how the table was written.
     pub encryption: Option<Arc<dyn crate::encryption::EncryptionProvider>>,
-    /// zstd dictionary, matching how the table was written.
+    /// Every dictionary the tree can decompress against. The table resolves
+    /// the id it recorded against this set; supplying a set that does not hold
+    /// that id fails the recovery, naming the id.
     #[cfg(zstd_any)]
-    pub zstd_dictionary: Option<Arc<crate::compression::ZstdDictionary>>,
+    pub zstd_dictionaries: crate::compression::ZstdDictionaries,
     /// The tree's key ordering.
     pub comparator: SharedComparator,
     /// Metrics sink.
@@ -197,7 +199,7 @@ impl RecoverParams {
             pin_index: false,
             encryption: None,
             #[cfg(zstd_any)]
-            zstd_dictionary: None,
+            zstd_dictionaries: crate::compression::ZstdDictionaries::new(),
             comparator,
             #[cfg(feature = "metrics")]
             metrics: Arc::new(Metrics::default()),
@@ -7374,7 +7376,7 @@ impl Table {
             pin_index,
             encryption,
             #[cfg(zstd_any)]
-            zstd_dictionary,
+            zstd_dictionaries,
             comparator,
             #[cfg(feature = "metrics")]
             metrics,
@@ -7485,20 +7487,29 @@ impl Table {
             }
         };
 
-        // Fail-fast: if this table was written with dictionary compression,
-        // verify the caller provided the matching dictionary. Without this
-        // check, reopening with the wrong dictionary (or None) would only
-        // surface as a decompression error on the first data-block read.
+        // Resolve the dictionary this table was written against, by the id the
+        // table itself records. Fail-fast: a tree that does not hold that id
+        // cannot decompress a single data block, so say so here rather than on
+        // the first read. `got` reports what the tree DOES hold when it holds
+        // exactly one, which is the common misconfiguration (the wrong
+        // dictionary supplied) and the only case where naming one is useful.
         #[cfg(zstd_any)]
-        if let CompressionType::ZstdDict { dict_id, .. } = metadata.data_block_compression {
-            let got = zstd_dictionary.as_ref().map(|d| d.id());
-            if got != Some(dict_id) {
-                return Err(crate::Error::ZstdDictMismatch {
-                    expected: dict_id,
-                    got,
-                });
-            }
-        }
+        let zstd_dictionary =
+            if let CompressionType::ZstdDict { dict_id, .. } = metadata.data_block_compression {
+                let Some(dict) = zstd_dictionaries.get(dict_id) else {
+                    return Err(crate::Error::ZstdDictMismatch {
+                        expected: dict_id,
+                        got: (zstd_dictionaries.len() == 1)
+                            .then(|| zstd_dictionaries.ids().next())
+                            .flatten(),
+                    });
+                };
+                Some(dict.clone())
+            } else {
+                // Not dictionary-compressed: carrying a dictionary would be a
+                // handle nothing reads.
+                None
+            };
 
         let file_handle: Arc<dyn FsFile> = Arc::from(file);
 
@@ -8335,7 +8346,15 @@ impl Table {
             params.encryption.clone_from(&self.encryption);
             #[cfg(zstd_any)]
             {
-                params.zstd_dictionary.clone_from(&self.zstd_dictionary);
+                // Reopening THIS table, so the only dictionary the recovery can
+                // need is the one it already resolved: the reopened view has
+                // the same id in its metadata.
+                params.zstd_dictionaries = self
+                    .zstd_dictionary
+                    .clone()
+                    .map_or_else(crate::compression::ZstdDictionaries::new, |dict| {
+                        crate::compression::ZstdDictionaries::new().with(dict)
+                    });
             }
             #[cfg(feature = "metrics")]
             {

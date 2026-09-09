@@ -266,6 +266,9 @@ pub mod ecc;
 #[doc(hidden)]
 pub mod file_accessor;
 
+#[cfg(zstd_any)]
+pub(crate) mod dicts;
+
 mod double_ended_peekable;
 mod error;
 
@@ -545,7 +548,7 @@ pub use {
 pub use tree::columnar_scan::ColumnarScan;
 
 #[cfg(zstd_any)]
-pub use compression::ZstdDictionary;
+pub use compression::{ZstdDictionaries, ZstdDictionary};
 
 #[cfg(feature = "metrics")]
 pub use metrics::{CacheStats, Metrics};

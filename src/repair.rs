@@ -609,6 +609,28 @@ fn trustworthy_restriction_bound(
     }
 }
 
+/// The dictionary a blob file's own compression descriptor names, resolved
+/// against the tree's set.
+///
+/// A blob file records ONE descriptor, so this answers with one dictionary; the
+/// set is what turns the recorded id back into bytes. Resolving here rather than
+/// passing the configured dictionary is what lets a file written under an
+/// earlier dictionary still be read and salvaged. `None` for a file that uses no
+/// dictionary, and for an id the tree does not hold: a repair walks files one by
+/// one and reports an unusable one as its own casualty, so an absent dictionary
+/// must not abort the pass over every other file the way it aborts an open.
+#[cfg(all(feature = "std", zstd_any))]
+fn blob_file_dictionary(
+    config: &Config,
+    compression: crate::CompressionType,
+) -> Option<Arc<crate::compression::ZstdDictionary>> {
+    config
+        .current_zstd_dictionaries()
+        .for_compression(compression)
+        .ok()
+        .flatten()
+}
+
 /// Recover params for a repair's TRANSIENT table open: the tree's configured
 /// comparator / crypto / dictionary context (so the table decodes consistently
 /// with how it was written), and everything else neutral — tree id 0 and no
@@ -644,7 +666,7 @@ fn repair_recover_params(
     params.encryption.clone_from(&config.encryption);
     #[cfg(zstd_any)]
     {
-        params.zstd_dictionary.clone_from(&config.zstd_dictionary);
+        params.zstd_dictionaries = config.current_zstd_dictionaries();
     }
     params
 }
@@ -1539,6 +1561,11 @@ fn try_salvage_table(
             encryption: config.encryption.clone(),
             #[cfg(zstd_any)]
             zstd_dictionary: config.zstd_dictionary.clone(),
+            // The whole set, not just the configured one: the source may have
+            // been written under a dictionary the tree stores and the caller
+            // never supplied, and salvage cannot read a block it cannot resolve.
+            #[cfg(zstd_any)]
+            zstd_dictionaries: config.current_zstd_dictionaries(),
             // The real table id, so encrypted block AAD (which binds it) decrypts
             // and the recovered copy reopens under the same id below.
             table_id,
@@ -2254,6 +2281,8 @@ fn validate_blob_frames(
     let fs = &config.fs;
     let compression = handle.compression();
     let comparator = &config.comparator;
+    #[cfg(zstd_any)]
+    let dict = blob_file_dictionary(config, compression);
 
     let scanner = if live_data_start > 0 {
         crate::vlog::BlobFileScanner::resume(path, &**fs, blob_id, live_data_start)?
@@ -2282,7 +2311,7 @@ fn validate_blob_frames(
                     &entry.value,
                     entry.uncompressed_len as usize,
                     #[cfg(zstd_any)]
-                    config.zstd_dictionary.as_deref(),
+                    dict.as_deref(),
                 )
                 .is_err()
                 {
@@ -2630,7 +2659,14 @@ fn recover_blob_files(
             frontier,
         )?);
         let handle = crate::vlog::recover_blob_file_from(
-            blob_path, blob_id, checksum, 0, &config.fs, frontier,
+            blob_path,
+            blob_id,
+            checksum,
+            0,
+            &config.fs,
+            frontier,
+            #[cfg(zstd_any)]
+            &config.current_zstd_dictionaries(),
         )?;
         match validate_blob_frames(config, blob_path, blob_id, frontier, &handle)? {
             Some(_) => Ok(()),
@@ -2852,6 +2888,8 @@ fn recover_blob_files(
             crate::Checksum::from_raw(0),
             0,
             &config.fs,
+            #[cfg(zstd_any)]
+            &config.current_zstd_dictionaries(),
         ) {
             Ok(handle) => handle,
             Err(e) if is_environmental(&e) => return Err(e),
@@ -2936,9 +2974,11 @@ fn recover_blob_files(
                     frontier,
                     // Repair has the tree's dictionary context, so a
                     // dictionary-compressed blob salvages its intact frames
-                    // instead of being set aside whole.
+                    // instead of being set aside whole. The id comes from the
+                    // SOURCE's own descriptor, so a file written under an
+                    // earlier dictionary resolves to that one.
                     #[cfg(zstd_any)]
-                    config.zstd_dictionary.as_ref(),
+                    blob_file_dictionary(config, handle.compression()).as_ref(),
                 )?;
                 let Some(salvaged_path) = report.salvaged_path.clone() else {
                     return Ok(None);
@@ -2954,6 +2994,8 @@ fn recover_blob_files(
                     0,
                     &config.fs,
                     0,
+                    #[cfg(zstd_any)]
+                    &config.current_zstd_dictionaries(),
                 )?;
                 Ok(Some((bf, report)))
             })();
@@ -3062,7 +3104,14 @@ fn recover_blob_files(
         };
 
         match crate::vlog::recover_blob_file_from(
-            &blob_path, blob_id, checksum, 0, &config.fs, frontier,
+            &blob_path,
+            blob_id,
+            checksum,
+            0,
+            &config.fs,
+            frontier,
+            #[cfg(zstd_any)]
+            &config.current_zstd_dictionaries(),
         ) {
             Ok(bf) => {
                 if frontier > 0 {
@@ -3874,6 +3923,22 @@ fn repair_tree(
     #[cfg(feature = "std")]
     let _directory_lock =
         crate::config::acquire_directory_lock(&*config.fs, &config.path, config.directory_lock)?;
+
+    // A repair opens every SST it finds, so it needs the tree's dictionaries
+    // exactly as an open does — and it does NOT go through `Tree::open`, which
+    // is where they would otherwise be loaded. Without this every
+    // dictionary-compressed table is graded unreadable and the rebuilt manifest
+    // leaves the tree's data behind. Under the directory lock, since it reads
+    // the tree's own folder, and on a COPY, so the caller's config keeps the
+    // registry it had (a `Config` is cloned per tree, and they must not share).
+    #[cfg(zstd_any)]
+    let owned_config = {
+        let mut owned = config.clone();
+        owned.install_own_zstd_dictionaries()?;
+        owned
+    };
+    #[cfg(zstd_any)]
+    let config = &owned_config;
 
     if let Some(p) = &config.recovery_progress {
         p.set_phase(crate::RecoveryPhase::PendingSwaps);
@@ -6156,6 +6221,44 @@ fn publish_repaired_manifest(
     // existed.
     let version = Version::from_levels(version_id, tree_type, levels, blob_file_list, blob_frag)
         .with_retention_floor(config.repair_retention_floor);
+
+    // Register the dictionaries the recovered files name. A rebuilt version
+    // starts with none, and nothing later puts them back once the write policy
+    // stops naming them: a checkpoint copies exactly this list, so the snapshot
+    // would carry the tables and not the dictionaries that decode them.
+    //
+    // Derived from the files themselves and intersected with what `dicts/`
+    // actually holds, so a repair over a tree whose dictionary is genuinely
+    // gone records no id it cannot honour.
+    #[cfg(zstd_any)]
+    let version = {
+        let held = config.current_zstd_dictionaries();
+        let ids: Vec<_> = version
+            .referenced_dicts()
+            .into_iter()
+            .filter(|id| held.get(*id).is_some())
+            .collect();
+
+        // STORE what the manifest is about to name. The set here holds the
+        // caller-supplied dictionary as well as the folder's, so a repair of a
+        // tree written before dictionaries were stored (tables naming an id,
+        // no `dicts/` at all) would otherwise commit a manifest referencing
+        // bytes that exist only in the caller's memory — and the reopen the
+        // repair exists to enable would fail on the missing file. Writing is
+        // idempotent by id, so a dictionary already on disk costs an `exists`.
+        let folder = config.path.join(crate::file::DICTS_FOLDER);
+        for id in &ids {
+            if let Some(dict) = held.get(*id) {
+                crate::dicts::write(&*config.fs, &folder, dict, config.sync_mode)?;
+            }
+        }
+
+        if ids.is_empty() {
+            version
+        } else {
+            version.with_dicts(ids)
+        }
+    };
 
     // The LAST cancellation boundary: per-file checks only run before a file
     // starts, so a cancel requested during the final file's verification or

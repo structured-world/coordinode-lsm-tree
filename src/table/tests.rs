@@ -94,7 +94,11 @@ fn test_with_table_impl(
                 let mut params = test_recover_params(file.clone(), checksum);
                 #[cfg(zstd_any)]
                 {
-                    params.zstd_dictionary.clone_from(&zstd_dictionary);
+                    params.zstd_dictionaries = zstd_dictionary
+                        .clone()
+                        .map_or_else(crate::compression::ZstdDictionaries::new, |dict| {
+                            crate::compression::ZstdDictionaries::new().with(dict)
+                        });
                 }
                 #[cfg(feature = "metrics")]
                 {
@@ -125,7 +129,11 @@ fn test_with_table_impl(
                 params.pin_filter = true;
                 #[cfg(zstd_any)]
                 {
-                    params.zstd_dictionary.clone_from(&zstd_dictionary);
+                    params.zstd_dictionaries = zstd_dictionary
+                        .clone()
+                        .map_or_else(crate::compression::ZstdDictionaries::new, |dict| {
+                            crate::compression::ZstdDictionaries::new().with(dict)
+                        });
                 }
                 #[cfg(feature = "metrics")]
                 {
@@ -156,7 +164,11 @@ fn test_with_table_impl(
                 params.pin_index = true;
                 #[cfg(zstd_any)]
                 {
-                    params.zstd_dictionary.clone_from(&zstd_dictionary);
+                    params.zstd_dictionaries = zstd_dictionary
+                        .clone()
+                        .map_or_else(crate::compression::ZstdDictionaries::new, |dict| {
+                            crate::compression::ZstdDictionaries::new().with(dict)
+                        });
                 }
                 #[cfg(feature = "metrics")]
                 {
@@ -188,7 +200,11 @@ fn test_with_table_impl(
                 params.pin_index = true;
                 #[cfg(zstd_any)]
                 {
-                    params.zstd_dictionary.clone_from(&zstd_dictionary);
+                    params.zstd_dictionaries = zstd_dictionary
+                        .clone()
+                        .map_or_else(crate::compression::ZstdDictionaries::new, |dict| {
+                            crate::compression::ZstdDictionaries::new().with(dict)
+                        });
                 }
                 #[cfg(feature = "metrics")]
                 {
@@ -221,7 +237,11 @@ fn test_with_table_impl(
                 params.pin_index = true;
                 #[cfg(zstd_any)]
                 {
-                    params.zstd_dictionary.clone_from(&zstd_dictionary);
+                    params.zstd_dictionaries = zstd_dictionary
+                        .clone()
+                        .map_or_else(crate::compression::ZstdDictionaries::new, |dict| {
+                            crate::compression::ZstdDictionaries::new().with(dict)
+                        });
                 }
                 #[cfg(feature = "metrics")]
                 {
@@ -275,7 +295,11 @@ fn test_with_table_impl(
                 let mut params = test_recover_params(file.clone(), checksum);
                 #[cfg(zstd_any)]
                 {
-                    params.zstd_dictionary.clone_from(&zstd_dictionary);
+                    params.zstd_dictionaries = zstd_dictionary
+                        .clone()
+                        .map_or_else(crate::compression::ZstdDictionaries::new, |dict| {
+                            crate::compression::ZstdDictionaries::new().with(dict)
+                        });
                 }
                 #[cfg(feature = "metrics")]
                 {
@@ -305,7 +329,11 @@ fn test_with_table_impl(
                 params.pin_filter = true;
                 #[cfg(zstd_any)]
                 {
-                    params.zstd_dictionary.clone_from(&zstd_dictionary);
+                    params.zstd_dictionaries = zstd_dictionary
+                        .clone()
+                        .map_or_else(crate::compression::ZstdDictionaries::new, |dict| {
+                            crate::compression::ZstdDictionaries::new().with(dict)
+                        });
                 }
                 #[cfg(feature = "metrics")]
                 {
@@ -335,7 +363,11 @@ fn test_with_table_impl(
                 params.pin_index = true;
                 #[cfg(zstd_any)]
                 {
-                    params.zstd_dictionary.clone_from(&zstd_dictionary);
+                    params.zstd_dictionaries = zstd_dictionary
+                        .clone()
+                        .map_or_else(crate::compression::ZstdDictionaries::new, |dict| {
+                            crate::compression::ZstdDictionaries::new().with(dict)
+                        });
                 }
                 #[cfg(feature = "metrics")]
                 {
@@ -367,7 +399,11 @@ fn test_with_table_impl(
                 params.pin_index = true;
                 #[cfg(zstd_any)]
                 {
-                    params.zstd_dictionary.clone_from(&zstd_dictionary);
+                    params.zstd_dictionaries = zstd_dictionary
+                        .clone()
+                        .map_or_else(crate::compression::ZstdDictionaries::new, |dict| {
+                            crate::compression::ZstdDictionaries::new().with(dict)
+                        });
                 }
                 #[cfg(feature = "metrics")]
                 {
@@ -400,7 +436,10 @@ fn test_with_table_impl(
                 params.pin_index = true;
                 #[cfg(zstd_any)]
                 {
-                    params.zstd_dictionary = zstd_dictionary;
+                    params.zstd_dictionaries = zstd_dictionary
+                        .map_or_else(crate::compression::ZstdDictionaries::new, |dict| {
+                            crate::compression::ZstdDictionaries::new().with(dict)
+                        });
                 }
                 #[cfg(feature = "metrics")]
                 {

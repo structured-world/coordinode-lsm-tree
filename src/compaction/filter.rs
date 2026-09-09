@@ -107,18 +107,9 @@ impl AccessorShared<'_> {
         user_key: &[u8],
         vhandle: &ValueHandle,
     ) -> crate::Result<Option<UserValue>> {
-        let accessor = {
-            let a = Accessor::new(&self.version.blob_files);
-            #[cfg(zstd_any)]
-            let a = a.with_dict(
-                self.opts
-                    .config
-                    .kv_separation_opts
-                    .as_ref()
-                    .and_then(|o| o.zstd_dictionary.as_deref()),
-            );
-            a
-        };
+        // No dictionary passed: a compaction reads blob files of every
+        // generation the tree holds, and each carries its own.
+        let accessor = Accessor::new(&self.version.blob_files);
 
         accessor.get(
             self.opts.tree_id,
@@ -277,6 +268,15 @@ impl<'a, 'b: 'a> StreamFilterAdapter<'a, 'b> {
             .use_target_size(blob_opts.file_target_size)
             .use_compression(blob_opts.compression)
             .use_sync_mode(self.shared.opts.config.sync_mode);
+
+            // A filter that rewrites a separated value writes a NEW blob file
+            // under the tree's blob policy, so it needs both halves: the
+            // dictionary to compress with, and the set to pin on the file it
+            // produces. Without the first, a `ZstdDict` policy fails the write.
+            #[cfg(zstd_any)]
+            let writer = writer
+                .use_zstd_dictionary(blob_opts.zstd_dictionary.clone())
+                .use_zstd_dictionaries(self.shared.opts.config.current_zstd_dictionaries());
 
             self.blob_writer.insert(writer)
         };

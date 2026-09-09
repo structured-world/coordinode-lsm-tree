@@ -7269,8 +7269,15 @@ fn validate_frames(
     blob_id: crate::vlog::BlobFileId,
     live_data_start: u64,
 ) -> crate::Result<Option<super::BlobLiveTotals>> {
-    let handle =
-        crate::vlog::recover_blob_file(path, blob_id, crate::Checksum::from_raw(0), 0, &config.fs)?;
+    let handle = crate::vlog::recover_blob_file(
+        path,
+        blob_id,
+        crate::Checksum::from_raw(0),
+        0,
+        &config.fs,
+        #[cfg(zstd_any)]
+        &config.current_zstd_dictionaries(),
+    )?;
     super::validate_blob_frames(config, path, blob_id, live_data_start, &handle)
 }
 
@@ -11256,12 +11263,16 @@ fn a_clean_manifest_record_preserves_a_bulk_ingested_offset() -> crate::Result<(
     Ok(())
 }
 
-/// A repair run WITHOUT the tree's zstd dictionary must fail, not delete the
-/// blob file it cannot read. A missing (or wrong) dictionary is the caller
-/// supplying the wrong recovery context: every frame fails to decompress
-/// identically, and grading them corrupt "salvages" an intact file into
-/// nothing, drops the tables referencing it, and lets the cleanup remove all
-/// of it. The operator must be able to re-run with the right dictionary.
+/// A repair that CANNOT resolve the tree's zstd dictionary must fail, not
+/// delete the blob file it could not read. An unresolvable dictionary is a
+/// wrong recovery context: every frame fails to decompress identically, and
+/// grading them corrupt "salvages" an intact file into nothing, drops the
+/// tables referencing it, and lets the cleanup remove all of it. The operator
+/// must be able to re-run once the dictionary is back.
+///
+/// Reaching that state now takes losing the tree's `dicts/` folder: a repair
+/// loads it itself, so simply not passing `Config::dict` no longer leaves the
+/// repair without a dictionary.
 #[cfg(zstd_any)]
 #[test]
 fn a_repair_without_the_dictionary_never_discards_the_blob_file() -> crate::Result<()> {
@@ -11306,8 +11317,11 @@ fn a_repair_without_the_dictionary_never_discards_the_blob_file() -> crate::Resu
         tree.insert(b"zzz", vec![b'w'; 64], 100);
         tree.flush_active_memtable(0)?;
     }
-    // Repair entered over a missing table — but run WITHOUT the dictionary.
+    // Repair entered over a missing table, with the tree's own copy of the
+    // dictionary gone too, so nothing can resolve the id the blob file names.
     memfs.remove_file(&root.join("tables").join("1"))?;
+    let dicts = root.join(crate::file::DICTS_FOLDER);
+    memfs.remove_file(&dicts.join(dict.id().to_string()))?;
     let blobs = root.join(crate::file::BLOBS_FOLDER);
     let blob_count = memfs.read_dir(&blobs)?.len();
 

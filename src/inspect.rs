@@ -983,10 +983,19 @@ pub struct FilterStats {
 #[cfg(feature = "std")]
 pub fn is_blob_file(path: &Path) -> crate::Result<bool> {
     let fs: std::sync::Arc<dyn Fs> = std::sync::Arc::new(StdFs);
-    // The id and checksum are not part of the question: recovery stores both
-    // without verifying them, and the caller is asking only whether the bytes
+    // The id, checksum and dictionary are not part of the question: recovery
+    // stores the first two without verifying them and resolves the third only
+    // to pin it for reads, and the caller is asking only whether the bytes
     // parse as a blob file at all.
-    match crate::vlog::recover_blob_file(path, 0, crate::Checksum::from_raw(0), 0, &fs) {
+    match crate::vlog::recover_blob_file(
+        path,
+        0,
+        crate::Checksum::from_raw(0),
+        0,
+        &fs,
+        #[cfg(zstd_any)]
+        &crate::compression::ZstdDictionaries::new(),
+    ) {
         Ok(_) => Ok(true),
         Err(e) if e.is_environmental() => Err(e),
         Err(_) => Ok(false),

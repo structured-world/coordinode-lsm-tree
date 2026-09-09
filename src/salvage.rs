@@ -38,10 +38,23 @@ pub struct SalvageOptions {
     /// Encryption provider matching the source's at-rest encryption, or `None`
     /// for an unencrypted source.
     pub encryption: Option<Arc<dyn EncryptionProvider>>,
-    /// zstd dictionary matching the source's dictionary compression, or `None`
-    /// when the source uses no dictionary.
+    /// zstd dictionary the RECOVERED copy is written against, or `None` to
+    /// rewrite without one.
+    ///
+    /// One, because a block is compressed against exactly one dictionary. It is
+    /// also joined into the read set below, so a standalone salvage that knows
+    /// only the source's dictionary can keep passing just this.
     #[cfg(zstd_any)]
     pub zstd_dictionary: Option<Arc<crate::compression::ZstdDictionary>>,
+    /// Every dictionary the SOURCE may have been written against.
+    ///
+    /// Reading is the other direction from writing: a table records the id of
+    /// the one dictionary its blocks use, and resolving that id needs the whole
+    /// set the tree holds. [`crate::repair`] fills this from the tree's `dicts/`
+    /// folder, which is what lets a table written under a dictionary the caller
+    /// never supplied be salvaged at all.
+    #[cfg(zstd_any)]
+    pub zstd_dictionaries: crate::compression::ZstdDictionaries,
     /// The open / decrypt context id for an ENCRYPTED source: block AAD binds
     /// the table identity, so an encrypted source sealed under a non-zero id
     /// only decrypts when the same id is supplied here.
@@ -882,7 +895,15 @@ fn salvage_attempt(
         params.encryption.clone_from(&options.encryption);
         #[cfg(zstd_any)]
         {
-            params.zstd_dictionary.clone_from(&options.zstd_dictionary);
+            // The read set, plus the write dictionary: a standalone salvage
+            // knows only the one its source used and passes just that, while a
+            // repair passes the tree's whole set (the source may predate the
+            // dictionary new blocks are written against).
+            let mut dicts = options.zstd_dictionaries.clone();
+            if let Some(dict) = options.zstd_dictionary.clone() {
+                dicts = dicts.with(dict);
+            }
+            params.zstd_dictionaries = dicts;
         }
         crate::table::Table::recover_inner(
             params,
@@ -1064,8 +1085,34 @@ fn salvage_attempt(
     } else {
         writer
     };
+    // The writer MIRRORS the source's compression descriptor, so it must be
+    // handed the dictionary that descriptor NAMES. The set answers first; the
+    // caller's single slot answers only when it holds that same id, which is
+    // how one generation is salvaged without building a set. Any other
+    // dictionary is refused rather than used: the mirrored descriptor would
+    // still stamp the source's `dict_id` over blocks compressed against
+    // different bytes, and that copy reads back as garbage instead of failing.
     #[cfg(zstd_any)]
-    let writer = writer.use_zstd_dictionary(options.zstd_dictionary.clone());
+    let writer = writer.use_zstd_dictionary(match table.metadata.data_block_compression {
+        crate::CompressionType::ZstdDict { dict_id, .. } => {
+            let supplied = options.zstd_dictionaries.get(dict_id).cloned().or_else(|| {
+                options
+                    .zstd_dictionary
+                    .clone()
+                    .filter(|d| d.id() == dict_id)
+            });
+            match supplied {
+                Some(dict) => Some(dict),
+                None => {
+                    return Err(crate::Error::ZstdDictMismatch {
+                        expected: dict_id,
+                        got: options.zstd_dictionary.as_ref().map(|d| d.id()),
+                    });
+                }
+            }
+        }
+        _ => options.zstd_dictionary.clone(),
+    });
 
     let walk = match salvage_blocks(
         &table,
@@ -2824,10 +2871,14 @@ pub(crate) fn decompress_blob_value<'a>(
         #[cfg(zstd_any)]
         crate::CompressionType::ZstdDict { dict_id, .. } => {
             use crate::compression::CompressionProvider as _;
+            // A blob file carries ONE compression descriptor, so the caller
+            // resolves `dict_id` against whatever set it holds and passes the
+            // one dictionary the file names. Here that id is only cross-checked.
             let Some(dict) = zstd_dictionary else {
-                return Err(crate::Error::FeatureUnsupported(
-                    "salvage of a dictionary-compressed blob file",
-                ));
+                return Err(crate::Error::ZstdDictMismatch {
+                    expected: dict_id,
+                    got: None,
+                });
             };
             if dict.id() != dict_id {
                 return Err(crate::Error::ZstdDictMismatch {
@@ -2948,8 +2999,24 @@ pub fn salvage_blob_file(
     // tail sector — and abort before the scanner and writer are even created,
     // making the valid-prefix recovery below unreachable. The salvaged dest gets
     // its own digest on finish.
-    let source_handle =
-        crate::vlog::recover_blob_file(source, blob_file_id, crate::Checksum::from_raw(0), 0, fs)?;
+    // The handle is a probe for `compression()`; nothing is read THROUGH it
+    // here (the scanner below reads the frames). It still gets the caller's
+    // dictionary, so a handle that names one is never built without it.
+    #[cfg(zstd_any)]
+    let source_dicts = zstd_dictionary
+        .cloned()
+        .map_or_else(crate::compression::ZstdDictionaries::new, |d| {
+            crate::compression::ZstdDictionaries::new().with(d)
+        });
+    let source_handle = crate::vlog::recover_blob_file(
+        source,
+        blob_file_id,
+        crate::Checksum::from_raw(0),
+        0,
+        fs,
+        #[cfg(zstd_any)]
+        &source_dicts,
+    )?;
     let compression = source_handle.compression();
     #[cfg(zstd_any)]
     if let crate::CompressionType::ZstdDict { dict_id, .. } = compression {

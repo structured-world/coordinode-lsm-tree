@@ -1746,6 +1746,16 @@ fn run_subcompaction(
             .use_target_size(blob_opts.file_target_size)
             .use_passthrough_compression(blob_opts.compression)
             .use_sync_mode(opts.config.sync_mode);
+            // The policy here is only the OPENING value. Relocation copies
+            // frames verbatim out of files that may predate a policy change, so
+            // `RelocatingCompaction` records each output file's codec from the
+            // SOURCE its frames came from and rotates when that changes;
+            // stamping the current policy on borrowed bytes is precisely the
+            // mislabelling that rule exists to prevent. The set is what pins the
+            // dictionary that recorded codec names, since this writer
+            // compresses nothing of its own.
+            #[cfg(zstd_any)]
+            let writer = writer.use_zstd_dictionaries(opts.config.current_zstd_dictionaries());
 
             let inner = StandardCompaction::new(table_writer, tables_for_deletion);
             Box::new(RelocatingCompaction::new(
@@ -2125,9 +2135,7 @@ fn run_merge_on_read_relocation(
         params.encryption.clone_from(&opts.config.encryption);
         #[cfg(zstd_any)]
         {
-            params
-                .zstd_dictionary
-                .clone_from(&opts.config.zstd_dictionary);
+            params.zstd_dictionaries = opts.config.current_zstd_dictionaries();
         }
         #[cfg(feature = "metrics")]
         {
@@ -2623,6 +2631,12 @@ fn merge_tables(
                 .use_target_size(blob_opts.file_target_size)
                 .use_passthrough_compression(blob_opts.compression)
                 .use_sync_mode(opts.config.sync_mode);
+                // Same as the tight-space relocation above, through the same
+                // `RelocatingCompaction`: the policy is only the opening value,
+                // each output file records the codec of the source its frames
+                // came from, and the set pins the dictionary that names.
+                #[cfg(zstd_any)]
+                let writer = writer.use_zstd_dictionaries(opts.config.current_zstd_dictionaries());
 
                 let inner = StandardCompaction::new(table_writer, tables);
 

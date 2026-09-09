@@ -19,6 +19,9 @@ use alloc::sync::Arc;
 use alloc::{string::ToString, vec::Vec};
 use core::sync::atomic::AtomicBool;
 
+#[cfg(test)]
+mod tests;
+
 /// Blob file writer, may write multiple blob files
 pub struct MultiWriter {
     fs: Arc<dyn Fs>,
@@ -42,6 +45,17 @@ pub struct MultiWriter {
     /// Dictionary for `ZstdDict` compression, shared across all rotated writers.
     #[cfg(zstd_any)]
     zstd_dictionary: Option<alloc::sync::Arc<crate::compression::ZstdDictionary>>,
+
+    /// The tree's dictionary set, used to PIN the dictionary each finished file
+    /// records on its handle (see `blob_file::Inner::zstd_dictionary`).
+    ///
+    /// Not the same question as [`Self::zstd_dictionary`], which is what this
+    /// writer COMPRESSES with. A relocation pass compresses with nothing (it
+    /// copies frames verbatim) yet still records a codec, so the file it
+    /// produces needs a dictionary its own descriptor names and the write slot
+    /// cannot answer.
+    #[cfg(zstd_any)]
+    zstd_dictionaries: crate::compression::ZstdDictionaries,
 
     tree_id: TreeId,
     descriptor_table: Option<Arc<DescriptorTable>>,
@@ -81,6 +95,8 @@ impl MultiWriter {
 
             #[cfg(zstd_any)]
             zstd_dictionary: None,
+            #[cfg(zstd_any)]
+            zstd_dictionaries: crate::compression::ZstdDictionaries::new(),
 
             tree_id,
             descriptor_table,
@@ -118,6 +134,36 @@ impl MultiWriter {
         self
     }
 
+    /// Records `compression` on the file being filled, rotating first when a
+    /// frame already in it claims a different one.
+    ///
+    /// The relocation counterpart of [`Self::use_passthrough_compression`],
+    /// which fixes one codec for the whole pass. A relocation copies frames
+    /// VERBATIM out of sources that need not share a codec (the blob policy may
+    /// have moved since they were written), while a blob file records exactly
+    /// one. Rotating on that boundary is what keeps every output file's
+    /// descriptor true of every frame in it.
+    ///
+    /// # Errors
+    ///
+    /// Propagates the rotation's finish of the file being closed.
+    pub(crate) fn record_source_compression(
+        &mut self,
+        compression: CompressionType,
+    ) -> crate::Result<()> {
+        if self.passthrough_compression == compression {
+            return Ok(());
+        }
+        // Only what is already written constrains the codec; an untouched
+        // writer can simply be restamped.
+        if self.active_writer.item_count > 0 {
+            self.rotate()?;
+        }
+        self.passthrough_compression = compression;
+        self.active_writer.metadata_compression_override = Some(compression);
+        Ok(())
+    }
+
     /// Sets the compression method.
     #[must_use]
     #[doc(hidden)]
@@ -139,6 +185,19 @@ impl MultiWriter {
     ) -> Self {
         self.active_writer = self.active_writer.use_zstd_dictionary(dict.clone());
         self.zstd_dictionary = dict;
+        self
+    }
+
+    /// Provides the tree's dictionary set, so each finished file can pin the
+    /// dictionary its own recorded descriptor names.
+    ///
+    /// Required wherever the files this writer produces are `ZstdDict`, whether
+    /// this writer compresses them itself or passes already-compressed frames
+    /// through: the handle a reader gets must carry its own dictionary.
+    #[cfg(zstd_any)]
+    #[must_use]
+    pub fn use_zstd_dictionaries(mut self, dicts: crate::compression::ZstdDictionaries) -> Self {
+        self.zstd_dictionaries = dicts;
         self
     }
 
@@ -169,6 +228,8 @@ impl MultiWriter {
             self.passthrough_compression,
             self.descriptor_table.clone(),
             &self.fs,
+            #[cfg(zstd_any)]
+            &self.zstd_dictionaries,
         )?;
         self.results.extend(blob_file);
 
@@ -180,6 +241,7 @@ impl MultiWriter {
         passthrough_compression: CompressionType,
         descriptor_table: Option<Arc<DescriptorTable>>,
         fs: &Arc<dyn Fs>,
+        #[cfg(zstd_any)] zstd_dictionaries: &crate::compression::ZstdDictionaries,
     ) -> crate::Result<Option<BlobFile>> {
         if writer.item_count > 0 {
             let blob_file_id = writer.blob_file_id;
@@ -192,8 +254,52 @@ impl MultiWriter {
             );
 
             let tree_id = writer.tree_id;
+            // Taken before `finish` consumes the writer.
+            #[cfg(zstd_any)]
+            let writer_dictionary = writer.zstd_dictionary.clone();
 
             let (metadata, checksum) = writer.finish()?;
+
+            // What the FILE will record, which is what its reader resolves
+            // against: the passthrough codec when relocation is stamping the
+            // source's own, else what this writer compressed with.
+            let recorded_compression = if passthrough_compression == CompressionType::None {
+                metadata.compression
+            } else {
+                passthrough_compression
+            };
+
+            // Resolved BEFORE the file is opened and its descriptor published,
+            // because those are side effects only the finished handle's `Drop`
+            // knows how to undo. Failing between them would strand both: an
+            // orphan file no version names, and an open descriptor in the
+            // shared table for the life of the process.
+            //
+            // The set answers first, then the dictionary this writer compressed
+            // with when THAT is the one the file records: a writer holding the
+            // matching dictionary needs no set to pin it, since it just used
+            // those bytes. The set is what answers for a relocation, which
+            // compresses nothing and records the source's codec.
+            #[cfg(zstd_any)]
+            let zstd_dictionary = match zstd_dictionaries.for_compression(recorded_compression) {
+                Ok(dict) => dict,
+                Err(e) => match (&recorded_compression, &writer_dictionary) {
+                    (CompressionType::ZstdDict { dict_id, .. }, Some(d)) if d.id() == *dict_id => {
+                        Some(alloc::sync::Arc::clone(d))
+                    }
+                    _ => {
+                        // No handle exists yet, so no `Drop` will reclaim this;
+                        // the unlink has to happen here.
+                        if let Err(remove) = fs.remove_file(&path) {
+                            log::warn!(
+                                "Could not delete unusable blob file at {}: {remove:?}",
+                                path.display(),
+                            );
+                        }
+                        return Err(e);
+                    }
+                },
+            };
 
             let file: Arc<dyn FsFile> =
                 Arc::from(fs.open(&path, &crate::fs::FsOpenOptions::new().read(true))?);
@@ -217,6 +323,8 @@ impl MultiWriter {
                 live_data_start: 0,
                 id: blob_file_id,
                 file_accessor,
+                #[cfg(zstd_any)]
+                zstd_dictionary,
                 meta: Metadata {
                     id: blob_file_id,
                     version: metadata.version,
@@ -224,13 +332,9 @@ impl MultiWriter {
                     item_count: metadata.item_count,
                     total_compressed_bytes: metadata.total_compressed_bytes,
                     total_uncompressed_bytes: metadata.total_uncompressed_bytes,
-                    key_range: metadata.key_range.clone(),
+                    key_range: metadata.key_range,
 
-                    compression: if passthrough_compression == CompressionType::None {
-                        metadata.compression
-                    } else {
-                        passthrough_compression
-                    },
+                    compression: recorded_compression,
                 },
                 fs: fs.clone(),
                 deletion_pause: once_cell::race::OnceBox::new(),
@@ -322,6 +426,8 @@ impl MultiWriter {
             self.passthrough_compression,
             self.descriptor_table.clone(),
             &self.fs,
+            #[cfg(zstd_any)]
+            &self.zstd_dictionaries,
         )?;
         self.results.extend(blob_file);
         Ok(self.results)

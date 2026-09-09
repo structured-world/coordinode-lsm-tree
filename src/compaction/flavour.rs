@@ -552,7 +552,11 @@ pub struct RelocatingCompaction {
     inner: StandardCompaction,
     blob_scanner: Peekable<BlobFileMergeScanner>,
     blob_writer: BlobFileWriter,
-    rewriting_blob_file_ids: HashSet<BlobFileId>,
+    /// Codec of each file being rewritten, by id. Relocation copies frames
+    /// VERBATIM, so the output file must record the codec of the SOURCE those
+    /// frames came from; the current blob policy describes what would be
+    /// written fresh, which is a different question and need not agree.
+    rewriting_blob_file_codecs: crate::HashMap<BlobFileId, crate::CompressionType>,
     rewriting_blob_files: Vec<BlobFile>,
     /// Paces relocated-blob I/O. The merge loop's limiter only sees the
     /// encoded handle in `item.value`; the real payload moved here is
@@ -583,7 +587,10 @@ impl RelocatingCompaction {
             inner,
             blob_scanner,
             blob_writer,
-            rewriting_blob_file_ids: rewriting_blob_files.iter().map(BlobFile::id).collect(),
+            rewriting_blob_file_codecs: rewriting_blob_files
+                .iter()
+                .map(|bf| (bf.id(), bf.compression()))
+                .collect(),
             rewriting_blob_files,
             rate_limiter,
             stop_signal,
@@ -634,8 +641,8 @@ impl CompactionFlavour for RelocatingCompaction {
             );
 
             let indirection = if self
-                .rewriting_blob_file_ids
-                .contains(&indirection.vhandle.blob_file_id)
+                .rewriting_blob_file_codecs
+                .contains_key(&indirection.vhandle.blob_file_id)
             {
                 self.drain_blobs(&item.key.user_key, &indirection)?;
 
@@ -696,6 +703,24 @@ impl CompactionFlavour for RelocatingCompaction {
                     .request_interruptible(blob_entry.value.len() as u64, || {
                         self.stop_signal.is_stopped()
                     });
+
+                // These bytes are the SOURCE's, still encoded as it left them.
+                // Record that codec on the file receiving them, rotating first
+                // when it differs from what the current output file already
+                // claims: a blob file describes one codec, and a relocation can
+                // draw from sources that do not share one (the blob policy may
+                // have changed since they were written). Stamping the current
+                // policy instead would label these frames with a codec they are
+                // not in, and the next read of them would fail to decode.
+                #[expect(
+                    clippy::expect_used,
+                    reason = "the id came from `rewriting_blob_file_codecs`'s own key set"
+                )]
+                let source_codec = *self
+                    .rewriting_blob_file_codecs
+                    .get(&blob_file_id)
+                    .expect("relocated frame comes from a file being rewritten");
+                self.blob_writer.record_source_compression(source_codec)?;
 
                 let new_indirection = BlobIndirection {
                     vhandle: self.blob_writer.write_raw(
@@ -821,9 +846,7 @@ impl StandardCompaction {
                 params.encryption.clone_from(&opts.config.encryption);
                 #[cfg(zstd_any)]
                 {
-                    params
-                        .zstd_dictionary
-                        .clone_from(&opts.config.zstd_dictionary);
+                    params.zstd_dictionaries = opts.config.current_zstd_dictionaries();
                 }
                 #[cfg(feature = "metrics")]
                 {

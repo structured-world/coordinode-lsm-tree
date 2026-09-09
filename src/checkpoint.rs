@@ -26,7 +26,7 @@
 // host `fs` module's std dependency rather than introducing a new one.
 use crate::{
     AbstractTree, CheckpointInfo,
-    file::{BLOBS_FOLDER, CURRENT_VERSION_FILE, TABLES_FOLDER, fsync_directory},
+    file::{BLOBS_FOLDER, CURRENT_VERSION_FILE, DICTS_FOLDER, TABLES_FOLDER, fsync_directory},
     fs::{Fs, FsFile, FsOpenOptions, SyncMode},
     version::Version,
     vlog::BlobFile,
@@ -423,6 +423,62 @@ pub fn link_blob_files(
         count += 1;
     }
     Ok((count, bytes))
+}
+
+/// Copies the compression dictionaries the captured version registers into the
+/// checkpoint, returning how many were carried.
+///
+/// A checkpoint is a tree that opens on its own, and its tables resolve the
+/// dictionary id they recorded against the dictionaries beside them. Linking the
+/// tables without these leaves a directory that cannot be opened at all.
+///
+/// Driven by the VERSION's registered set rather than a listing of the source
+/// folder: a dictionary the source still carries for an older version is not
+/// part of this snapshot, and a checkpoint should be no larger than the tree it
+/// captures. The folder is created only when there is something to put in it, so
+/// a tree that compresses against no dictionary produces exactly the checkpoint
+/// it did before.
+///
+/// # Errors
+///
+/// Propagates the create / link / copy failures of either backend.
+fn link_dictionaries(
+    version: &crate::version::Version,
+    src_fs: &Arc<dyn Fs>,
+    src_root: &Path,
+    target_root: &Path,
+    target_fs: &Arc<dyn Fs>,
+    sync_mode: SyncMode,
+    use_reflink: bool,
+) -> crate::Result<usize> {
+    let ids = version.dicts();
+    if ids.is_empty() {
+        return Ok(0);
+    }
+
+    let src_folder = src_root.join(DICTS_FOLDER);
+    let dst_folder = target_root.join(DICTS_FOLDER);
+    target_fs.create_dir(&dst_folder)?;
+
+    for id in ids {
+        let name = id.to_string();
+        // The byte count is deliberately dropped rather than totalled into
+        // `CheckpointInfo::total_bytes`. That figure is contracted to measure
+        // the same SET of files as `StorageStats::used_bytes` — the SSTs, their
+        // sidecars and the blob files — and a dictionary is tree-level state
+        // like the manifest, which the same contract excludes. Adding it on one
+        // side only would break the equality both surfaces are asserted against.
+        link_or_copy_cross_fs(
+            src_fs,
+            &src_folder.join(&name),
+            target_fs,
+            &dst_folder.join(&name),
+            sync_mode,
+            use_reflink,
+        )
+        .map_err(crate::Error::from)?;
+    }
+    Ok(ids.len())
 }
 
 /// Copies an OPTIONAL metadata file from `src_root` to `target_root`.
@@ -849,6 +905,20 @@ pub fn run_checkpoint<T: AbstractTree>(
         (0, 0)
     };
 
+    // Before the metadata: the manifest the checkpoint commits to names these
+    // ids, and a crash between the two should leave a checkpoint missing its
+    // pointer (which the guard removes) rather than one whose manifest names
+    // dictionaries that are not there.
+    let dict_files = link_dictionaries(
+        &version,
+        src_fs,
+        src_root,
+        target_root,
+        target_fs,
+        sync_mode,
+        use_reflink,
+    )?;
+
     copy_metadata(
         &**src_fs,
         src_root,
@@ -869,6 +939,9 @@ pub fn run_checkpoint<T: AbstractTree>(
     fsync_directory(&target_root.join(TABLES_FOLDER), &**target_fs, sync_mode)?;
     if include_blobs {
         fsync_directory(&target_root.join(BLOBS_FOLDER), &**target_fs, sync_mode)?;
+    }
+    if dict_files > 0 {
+        fsync_directory(&target_root.join(DICTS_FOLDER), &**target_fs, sync_mode)?;
     }
 
     fsync_directory(target_root, &**target_fs, sync_mode)?;

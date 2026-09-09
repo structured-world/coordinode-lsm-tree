@@ -163,6 +163,34 @@ fn parse_retention_floor_section(mut bytes: &[u8]) -> crate::Result<SeqNo> {
     Ok(floor)
 }
 
+/// Reads the registered dictionary ids: `count: u32 | id: u32 * count`.
+///
+/// Read strictly, like the sections above: a lost id is a dictionary the tree
+/// stops accounting for, so the tables written against it would fail to open
+/// while its file is left behind as an orphan.
+fn parse_dicts_section(mut bytes: &[u8]) -> crate::Result<Vec<crate::file::DictId>> {
+    const ERR: crate::Error = crate::Error::InvalidHeader("dicts section");
+    let r = &mut bytes;
+    let count = r.read_u32::<LittleEndian>().map_err(|_| ERR)? as usize;
+    // The ids are fixed-width, so the bytes that remain say how many there can
+    // be. Reserving on the count alone would let a corrupt section name four
+    // billion ids and turn the recovery into a multi-gigabyte allocation before
+    // the first short read could refuse it.
+    // Compared by division rather than `count * 4`, which overflows a 32-bit
+    // `usize` for the very counts this check exists to reject.
+    if count > r.len() / size_of::<crate::file::DictId>() {
+        return Err(ERR);
+    }
+    let mut ids = Vec::with_capacity(count);
+    for _ in 0..count {
+        ids.push(r.read_u32::<LittleEndian>().map_err(|_| ERR)?);
+    }
+    if !r.is_empty() {
+        return Err(ERR);
+    }
+    Ok(ids)
+}
+
 /// Reads and validates the CURRENT version pointer file.
 ///
 /// The file format is: `version_id: u64 | checksum: u128 | checksum_type: u8`
@@ -348,6 +376,12 @@ pub struct Recovery {
     /// compaction or `clear` invalidated is refused, not answered from newer
     /// data.
     pub retention_floor: SeqNo,
+    /// Ids of the compression dictionaries the recovered version references,
+    /// from the snapshot's `dicts` section (empty when the snapshot predates it
+    /// or the tree compresses against none) and REPLACED wholesale by each
+    /// replayed edit that carries the section. Wholesale, like the restriction
+    /// sets above: an edit that drops a dictionary has to be able to say so.
+    pub dicts: Vec<crate::file::DictId>,
     /// Per-section counters describing how many records were dropped
     /// during this recovery. Always zero under
     /// [`ManifestRecoveryMode::AbsoluteConsistency`] (any corruption
@@ -463,6 +497,13 @@ impl Recovery {
         // absolute floor, not a delta.
         if let Some(floor) = edit.retention_floor {
             self.retention_floor = floor;
+        }
+
+        // Carried only when the registered set changed, and then in full: an
+        // edit that collected a dictionary says so by omitting its id, so this
+        // replaces rather than merges.
+        if let Some(dicts) = &edit.dicts {
+            self.dicts.clone_from(dicts);
         }
 
         self.curr_version_id = edit.new_version_id;
@@ -1288,6 +1329,15 @@ pub fn recover(
         0
     };
 
+    // The dictionary ids, absent on a snapshot written before the section
+    // existed or by a tree that compresses against none (→ empty, which is
+    // what such a tree holds).
+    let dicts = if archive.section("dicts").is_some() {
+        parse_dicts_section(&archive.read_section("dicts")?)?
+    } else {
+        Vec::new()
+    };
+
     let mut recovery = Recovery {
         tree_type: {
             if archive.section("tree_type").is_none() {
@@ -1311,6 +1361,7 @@ pub fn recover(
         restrictions,
         blob_restrictions,
         retention_floor,
+        dicts,
         stats: RecoveryStats {
             tables_dropped_to_tail,
             tables_dropped_to_corruption,

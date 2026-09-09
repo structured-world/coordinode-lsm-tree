@@ -1,6 +1,13 @@
 use super::*;
 use test_log::test;
 
+/// A tree that holds no dictionary: what recovery pins on a blob file whose
+/// codec names none. Every test here writes uncompressed blobs.
+#[cfg(zstd_any)]
+fn no_dicts() -> crate::compression::ZstdDictionaries {
+    crate::compression::ZstdDictionaries::new()
+}
+
 #[test]
 fn vlog_recovery_missing_blob_file_returns_unrecoverable() {
     // Manifest says blob id=0 exists, but the blobs folder is empty.
@@ -12,6 +19,8 @@ fn vlog_recovery_missing_blob_file_returns_unrecoverable() {
         0,
         None,
         &(Arc::new(crate::fs::StdFs) as Arc<dyn crate::fs::Fs>),
+        #[cfg(zstd_any)]
+        &no_dicts(),
     );
     assert!(matches!(result, Err(crate::Error::Unrecoverable)));
 }
@@ -26,6 +35,8 @@ fn vlog_recovery_nonexistent_folder_no_ids_returns_empty() {
         0,
         None,
         &(Arc::new(crate::fs::StdFs) as Arc<dyn crate::fs::Fs>),
+        #[cfg(zstd_any)]
+        &no_dicts(),
     )
     .unwrap();
     assert!(blob_files.is_empty());
@@ -42,6 +53,8 @@ fn vlog_recovery_nonexistent_folder_with_ids_returns_unrecoverable() {
         0,
         None,
         &(Arc::new(crate::fs::StdFs) as Arc<dyn crate::fs::Fs>),
+        #[cfg(zstd_any)]
+        &no_dicts(),
     );
     assert!(matches!(result, Err(crate::Error::Unrecoverable)));
 }
@@ -64,6 +77,8 @@ fn vlog_recovery_sweeps_a_crashed_salvage_copy() {
         0,
         None,
         &(Arc::new(crate::fs::StdFs) as Arc<dyn crate::fs::Fs>),
+        #[cfg(zstd_any)]
+        &no_dicts(),
     )
     .expect("a repair's own leftover must not make the tree unopenable");
 
@@ -82,7 +97,15 @@ fn recover_blob_file_on_non_blob_file_errors() {
     std::fs::write(&path, b"this is not a blob file").unwrap();
 
     let fs: Arc<dyn crate::fs::Fs> = Arc::new(crate::fs::StdFs);
-    let result = recover_blob_file(path.as_path(), 42, Checksum::from_raw(0), 0, &fs);
+    let result = recover_blob_file(
+        path.as_path(),
+        42,
+        Checksum::from_raw(0),
+        0,
+        &fs,
+        #[cfg(zstd_any)]
+        &no_dicts(),
+    );
     // `BlobFile` is not `Debug`, so assert on the boolean rather than the value.
     assert!(result.is_err(), "recovering a non-blob file must fail");
 }
@@ -123,7 +146,15 @@ fn blob_punch_on_drop_retains_the_reclaim_when_the_link_probe_cannot_answer() ->
     ));
     let fs: Arc<dyn Fs> = Arc::new(fault);
 
-    let blob = recover_blob_file(&path, 0, Checksum::from_raw(0), 0, &fs)?;
+    let blob = recover_blob_file(
+        &path,
+        0,
+        Checksum::from_raw(0),
+        0,
+        &fs,
+        #[cfg(zstd_any)]
+        &no_dicts(),
+    )?;
     let pause = crate::deletion_pause::DeletionPause::new_shared();
     blob.install_deletion_pause(Arc::clone(&pause));
     blob.mark_punch_on_drop(first_frame_end);
@@ -230,8 +261,16 @@ fn recovery_keeps_the_blob_copy_the_manifest_checksum_names() {
     std::io::Write::write_all(&mut f, &rotted).expect("write twin");
     drop(f);
 
-    let (recovered, orphans) =
-        recover_blob_files(&blobs, &[(0, checksum, 0)], 0, None, &fs).expect("recover");
+    let (recovered, orphans) = recover_blob_files(
+        &blobs,
+        &[(0, checksum, 0)],
+        0,
+        None,
+        &fs,
+        #[cfg(zstd_any)]
+        &no_dicts(),
+    )
+    .expect("recover");
     assert_eq!(recovered.len(), 1, "one copy per id survives");
     assert_eq!(
         &*recovered[0].0.path, &*authoritative,
@@ -320,7 +359,15 @@ fn a_refused_digest_read_does_not_decide_the_blob_duplicate() {
             .on_path(authoritative.display().to_string())
             .skip(1),
     );
-    let result = recover_blob_files(&blobs, &[(0, checksum, 0)], 0, None, &fs);
+    let result = recover_blob_files(
+        &blobs,
+        &[(0, checksum, 0)],
+        0,
+        None,
+        &fs,
+        #[cfg(zstd_any)]
+        &no_dicts(),
+    );
     injector.clear();
 
     assert!(
@@ -399,7 +446,15 @@ fn recovery_refuses_when_no_blob_duplicate_matches_the_manifest() {
         f.write_all(&damaged).expect("write copy");
     }
 
-    let result = recover_blob_files(&blobs, &[(0, checksum, 0)], 0, None, &fs);
+    let result = recover_blob_files(
+        &blobs,
+        &[(0, checksum, 0)],
+        0,
+        None,
+        &fs,
+        #[cfg(zstd_any)]
+        &no_dicts(),
+    );
     assert!(
         matches!(result, Err(crate::Error::Unrecoverable)),
         "with no copy matching the manifest, picking one by filename would open \

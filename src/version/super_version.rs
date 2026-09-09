@@ -613,6 +613,23 @@ impl SuperVersions {
             .expect("should always have a SuperVersion")
     }
 
+    /// Every dictionary id ANY retained version still registers.
+    ///
+    /// The collection boundary: a file may be unlinked only once it is absent
+    /// from this set, because a retained version can still be read from and its
+    /// tables cannot open without the dictionary they name.
+    #[must_use]
+    pub fn registered_dicts(&self) -> Vec<crate::file::DictId> {
+        let mut ids: Vec<crate::file::DictId> = self
+            .versions
+            .iter()
+            .flat_map(|v| v.version.dicts().iter().copied())
+            .collect();
+        ids.sort_unstable();
+        ids.dedup();
+        ids
+    }
+
     /// Seqno of the oldest retained version: the read boundary. A snapshot at
     /// seqno `s` is servable iff `s == 0` or `s > oldest_retained_seqno()`.
     /// Advances when [`maintenance`](Self::maintenance) prunes the front and
