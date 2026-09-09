@@ -722,11 +722,14 @@ fn blob_reader_rejects_retired_blob_magic_frame() -> crate::Result<()> {
     Ok(())
 }
 
-/// Write a blob with `ZstdDict`, then read it back without supplying a
-/// dictionary.  Expect `ZstdDictMismatch { got: None }`.
+/// A writer that compressed against a dictionary produces a handle carrying it,
+/// so the read needs nothing supplied: it just used those bytes, and they are
+/// the file's by construction. The opposite case — a handle recovered by a tree
+/// that does not hold the recorded id — is covered by
+/// [`blob_reader_uses_the_dictionary_pinned_on_its_file`].
 #[test]
 #[cfg(zstd_any)]
-fn blob_reader_zstd_dict_missing_dict_returns_mismatch() -> crate::Result<()> {
+fn blob_reader_reads_a_written_dictionary_blob_with_nothing_supplied() -> crate::Result<()> {
     use crate::compression::ZstdDictionary;
 
     let id_generator = SequenceNumberCounter::default();
@@ -750,17 +753,9 @@ fn blob_reader_zstd_dict_missing_dict_returns_mismatch() -> crate::Result<()> {
     let blob_file = blob_file.first().unwrap();
 
     let file = File::open(&blob_file.0.path)?;
-    // Reader created WITHOUT a dictionary
-    let reader = Reader::new(blob_file, &file);
-
-    let result = reader.get(b"key", &handle);
-    assert!(
-        matches!(
-            result,
-            Err(crate::Error::ZstdDictMismatch { got: None, .. })
-        ),
-        "expected ZstdDictMismatch{{got: None}} when dict is absent; got: {result:?}",
-    );
+    // The reader takes no dictionary at all: the file's handle carries it.
+    let value = Reader::new(blob_file, &file).get(b"key", &handle)?;
+    assert_eq!(&*value, b"value-to-compress-with-dict");
 
     Ok(())
 }

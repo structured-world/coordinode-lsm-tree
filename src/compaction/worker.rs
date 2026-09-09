@@ -1746,9 +1746,14 @@ fn run_subcompaction(
             .use_target_size(blob_opts.file_target_size)
             .use_passthrough_compression(blob_opts.compression)
             .use_sync_mode(opts.config.sync_mode);
-            // Relocation compresses nothing (frames are copied verbatim) but
-            // still records a codec, so the files it produces need the set to
-            // pin the dictionary that codec names.
+            // The policy here is only the OPENING value. Relocation copies
+            // frames verbatim out of files that may predate a policy change, so
+            // `RelocatingCompaction` records each output file's codec from the
+            // SOURCE its frames came from and rotates when that changes;
+            // stamping the current policy on borrowed bytes is precisely the
+            // mislabelling that rule exists to prevent. The set is what pins the
+            // dictionary that recorded codec names, since this writer
+            // compresses nothing of its own.
             #[cfg(zstd_any)]
             let writer = writer.use_zstd_dictionaries(opts.config.current_zstd_dictionaries());
 
@@ -2626,8 +2631,10 @@ fn merge_tables(
                 .use_target_size(blob_opts.file_target_size)
                 .use_passthrough_compression(blob_opts.compression)
                 .use_sync_mode(opts.config.sync_mode);
-                // Same as the relocation above: the recorded codec is what the
-                // produced file's reader resolves, so it must be pinnable.
+                // Same as the tight-space relocation above, through the same
+                // `RelocatingCompaction`: the policy is only the opening value,
+                // each output file records the codec of the source its frames
+                // came from, and the set pins the dictionary that names.
                 #[cfg(zstd_any)]
                 let writer = writer.use_zstd_dictionaries(opts.config.current_zstd_dictionaries());
 

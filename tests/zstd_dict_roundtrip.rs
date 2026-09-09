@@ -1063,6 +1063,50 @@ mod zstd_dict {
     }
 
     #[test]
+    fn a_blob_file_naming_a_dictionary_the_tree_lost_reports_that_id() -> lsm_tree::Result<()> {
+        // The blob twin of the table rule. A table whose recorded id the tree
+        // no longer holds refuses to open and names the id; a blob file has to
+        // do the same, or the open succeeds and every value in that file turns
+        // into a failed read later, far from the cause. Reaching the tree's
+        // dictionary folder is what makes this recoverable: the operator can
+        // put the file back.
+        let dir = tempfile::tempdir()?;
+        let dict = make_test_dictionary();
+        let dict_id = dict.id();
+        let big_value = b"blob-value-".repeat(20);
+
+        {
+            let tree = make_config(dir.path())
+                .with_kv_separation(Some(make_blob_opts(
+                    CompressionType::zstd_dict(3, dict_id)?,
+                    Arc::new(dict),
+                )))
+                .open()?;
+            for i in 0u32..20 {
+                let key = format!("key-{i:04}");
+                tree.insert(key.as_bytes(), &big_value, i.into());
+            }
+            tree.flush_active_memtable(0)?;
+        }
+
+        // The dictionary goes missing while the blob files that name it stay.
+        std::fs::remove_file(dir.path().join("dicts").join(dict_id.to_string()))?;
+
+        let err = make_config(dir.path())
+            .with_kv_separation(Some(
+                lsm_tree::KvSeparationOptions::default().separation_threshold(1),
+            ))
+            .open()
+            .err()
+            .expect("a blob file whose dictionary is gone must refuse the open");
+        match err {
+            lsm_tree::Error::ZstdDictMismatch { expected, .. } => assert_eq!(expected, dict_id),
+            other => panic!("expected ZstdDictMismatch naming {dict_id}, got {other:?}"),
+        }
+        Ok(())
+    }
+
+    #[test]
     fn a_dictionary_still_in_use_is_never_collected() -> lsm_tree::Result<()> {
         // The direction that matters: collection must not take a dictionary
         // the tables still need, or the tree loses the ability to read itself.

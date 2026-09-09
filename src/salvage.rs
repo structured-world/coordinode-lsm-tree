@@ -1091,13 +1091,31 @@ fn salvage_attempt(
     // blocks against bytes the stamped `dict_id` does not describe, and the
     // first read of the copy fails: exactly the multi-generation salvage the
     // read set above exists to enable.
+    // The singular slot answers only when it holds THAT id: a caller may supply
+    // the one dictionary the source needs without building a set, and that is
+    // the same dictionary, not a substitute. Any OTHER dictionary is refused
+    // rather than used, because the mirrored descriptor still stamps the
+    // source's `dict_id` over blocks compressed against different bytes — a
+    // copy that reads back as garbage instead of failing.
     #[cfg(zstd_any)]
     let writer = writer.use_zstd_dictionary(match table.metadata.data_block_compression {
-        crate::CompressionType::ZstdDict { dict_id, .. } => options
-            .zstd_dictionaries
-            .get(dict_id)
-            .cloned()
-            .or_else(|| options.zstd_dictionary.clone()),
+        crate::CompressionType::ZstdDict { dict_id, .. } => {
+            let supplied = options.zstd_dictionaries.get(dict_id).cloned().or_else(|| {
+                options
+                    .zstd_dictionary
+                    .clone()
+                    .filter(|d| d.id() == dict_id)
+            });
+            match supplied {
+                Some(dict) => Some(dict),
+                None => {
+                    return Err(crate::Error::ZstdDictMismatch {
+                        expected: dict_id,
+                        got: options.zstd_dictionary.as_ref().map(|d| d.id()),
+                    });
+                }
+            }
+        }
         _ => options.zstd_dictionary.clone(),
     });
 

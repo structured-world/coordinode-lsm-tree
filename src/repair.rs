@@ -616,8 +616,9 @@ fn trustworthy_restriction_bound(
 /// set is what turns the recorded id back into bytes. Resolving here rather than
 /// passing the configured dictionary is what lets a file written under an
 /// earlier dictionary still be read and salvaged. `None` for a file that uses no
-/// dictionary, and for an id the tree does not hold — the salvage path reports
-/// that as the mis-supplied context it is.
+/// dictionary, and for an id the tree does not hold: a repair walks files one by
+/// one and reports an unusable one as its own casualty, so an absent dictionary
+/// must not abort the pass over every other file the way it aborts an open.
 #[cfg(all(feature = "std", zstd_any))]
 fn blob_file_dictionary(
     config: &Config,
@@ -626,6 +627,8 @@ fn blob_file_dictionary(
     config
         .current_zstd_dictionaries()
         .for_compression(compression)
+        .ok()
+        .flatten()
 }
 
 /// Recover params for a repair's TRANSIENT table open: the tree's configured

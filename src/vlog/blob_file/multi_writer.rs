@@ -251,6 +251,9 @@ impl MultiWriter {
             );
 
             let tree_id = writer.tree_id;
+            // Taken before `finish` consumes the writer.
+            #[cfg(zstd_any)]
+            let writer_dictionary = writer.zstd_dictionary.clone();
 
             let (metadata, checksum) = writer.finish()?;
 
@@ -286,7 +289,24 @@ impl MultiWriter {
                 id: blob_file_id,
                 file_accessor,
                 #[cfg(zstd_any)]
-                zstd_dictionary: zstd_dictionaries.for_compression(recorded_compression),
+                // The set first, then the dictionary this writer compressed
+                // with when THAT is the one the file records. A writer holding
+                // the matching dictionary needs no set to pin it: it just used
+                // those bytes, so they are the file's by construction. The set
+                // is what answers for a relocation, which compresses nothing
+                // and records the source's codec.
+                #[cfg(zstd_any)]
+                zstd_dictionary: match zstd_dictionaries.for_compression(recorded_compression) {
+                    Ok(dict) => dict,
+                    Err(e) => match (&recorded_compression, &writer_dictionary) {
+                        (CompressionType::ZstdDict { dict_id, .. }, Some(d))
+                            if d.id() == *dict_id =>
+                        {
+                            Some(alloc::sync::Arc::clone(d))
+                        }
+                        _ => return Err(e),
+                    },
+                },
                 meta: Metadata {
                     id: blob_file_id,
                     version: metadata.version,

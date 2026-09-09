@@ -393,11 +393,27 @@ impl ZstdDictionaries {
     /// then pinned for the handle's life rather than resolved per read. That is
     /// what keeps a reader that captured a version able to decode after the set
     /// has moved on.
-    #[must_use]
-    pub fn for_compression(&self, compression: CompressionType) -> Option<Arc<ZstdDictionary>> {
+    ///
+    /// # Errors
+    ///
+    /// [`crate::Error::ZstdDictMismatch`] when the descriptor names an id the
+    /// set does not hold. Fail-fast, exactly as a table's recovery does: the
+    /// file cannot decode a single value that way, so the id is named here
+    /// while an operator can still restore it, rather than on the first read
+    /// of each value far from the cause.
+    pub fn for_compression(
+        &self,
+        compression: CompressionType,
+    ) -> crate::Result<Option<Arc<ZstdDictionary>>> {
         match compression {
-            CompressionType::ZstdDict { dict_id, .. } => self.get(dict_id).cloned(),
-            _ => None,
+            CompressionType::ZstdDict { dict_id, .. } => match self.get(dict_id) {
+                Some(dict) => Ok(Some(dict.clone())),
+                None => Err(crate::Error::ZstdDictMismatch {
+                    expected: dict_id,
+                    got: None,
+                }),
+            },
+            _ => Ok(None),
         }
     }
 

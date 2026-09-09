@@ -252,8 +252,13 @@ pub fn recover_blob_files(
             blob_files.push(BlobFile(Arc::new(BlobFileInner {
                 id: blob_file_id,
                 path: blob_file_path.clone(),
+                // Fail-fast on an id the tree does not hold, exactly as a
+                // table's recovery does: the file cannot decode a single value
+                // that way, so the open names the id while an operator can
+                // still restore it, rather than turning every value in the
+                // file into a failed read far from the cause.
                 #[cfg(zstd_any)]
-                zstd_dictionary: zstd_dictionaries.for_compression(meta.compression),
+                zstd_dictionary: zstd_dictionaries.for_compression(meta.compression)?,
                 meta,
                 is_deleted: AtomicBool::new(false),
                 punch_on_drop: portable_atomic::AtomicU64::new(u64::MAX),
@@ -391,8 +396,18 @@ pub fn recover_blob_file_from(
     Ok(BlobFile(Arc::new(BlobFileInner {
         id,
         path: path.to_path_buf(),
+        // LENIENT, unlike the plural recovery that serves `Tree::open`. This
+        // opens ONE named file for a caller inspecting or repairing it:
+        // `is_blob_file` only asks whether the bytes parse at all, and a
+        // salvage reads the descriptor to decide what to do about the file and
+        // reports a missing dictionary itself, naming the one the caller DID
+        // supply. Refusing here would collapse both answers into "not a blob
+        // file" and throw that context away.
         #[cfg(zstd_any)]
-        zstd_dictionary: zstd_dictionaries.for_compression(meta.compression),
+        zstd_dictionary: zstd_dictionaries
+            .for_compression(meta.compression)
+            .ok()
+            .flatten(),
         meta,
         is_deleted: AtomicBool::new(false),
         punch_on_drop: portable_atomic::AtomicU64::new(u64::MAX),
