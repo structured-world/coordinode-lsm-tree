@@ -1086,17 +1086,12 @@ fn salvage_attempt(
         writer
     };
     // The writer MIRRORS the source's compression descriptor, so it must be
-    // handed the dictionary that descriptor names — not the caller's current
-    // write dictionary. Giving it a different one compresses the recovered
-    // blocks against bytes the stamped `dict_id` does not describe, and the
-    // first read of the copy fails: exactly the multi-generation salvage the
-    // read set above exists to enable.
-    // The singular slot answers only when it holds THAT id: a caller may supply
-    // the one dictionary the source needs without building a set, and that is
-    // the same dictionary, not a substitute. Any OTHER dictionary is refused
-    // rather than used, because the mirrored descriptor still stamps the
-    // source's `dict_id` over blocks compressed against different bytes — a
-    // copy that reads back as garbage instead of failing.
+    // handed the dictionary that descriptor NAMES. The set answers first; the
+    // caller's single slot answers only when it holds that same id, which is
+    // how one generation is salvaged without building a set. Any other
+    // dictionary is refused rather than used: the mirrored descriptor would
+    // still stamp the source's `dict_id` over blocks compressed against
+    // different bytes, and that copy reads back as garbage instead of failing.
     #[cfg(zstd_any)]
     let writer = writer.use_zstd_dictionary(match table.metadata.data_block_compression {
         crate::CompressionType::ZstdDict { dict_id, .. } => {
