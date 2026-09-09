@@ -19,6 +19,9 @@ use alloc::sync::Arc;
 use alloc::{string::ToString, vec::Vec};
 use core::sync::atomic::AtomicBool;
 
+#[cfg(test)]
+mod tests;
+
 /// Blob file writer, may write multiple blob files
 pub struct MultiWriter {
     fs: Arc<dyn Fs>,
@@ -257,6 +260,47 @@ impl MultiWriter {
 
             let (metadata, checksum) = writer.finish()?;
 
+            // What the FILE will record, which is what its reader resolves
+            // against: the passthrough codec when relocation is stamping the
+            // source's own, else what this writer compressed with.
+            let recorded_compression = if passthrough_compression == CompressionType::None {
+                metadata.compression
+            } else {
+                passthrough_compression
+            };
+
+            // Resolved BEFORE the file is opened and its descriptor published,
+            // because those are side effects only the finished handle's `Drop`
+            // knows how to undo. Failing between them would strand both: an
+            // orphan file no version names, and an open descriptor in the
+            // shared table for the life of the process.
+            //
+            // The set answers first, then the dictionary this writer compressed
+            // with when THAT is the one the file records: a writer holding the
+            // matching dictionary needs no set to pin it, since it just used
+            // those bytes. The set is what answers for a relocation, which
+            // compresses nothing and records the source's codec.
+            #[cfg(zstd_any)]
+            let zstd_dictionary = match zstd_dictionaries.for_compression(recorded_compression) {
+                Ok(dict) => dict,
+                Err(e) => match (&recorded_compression, &writer_dictionary) {
+                    (CompressionType::ZstdDict { dict_id, .. }, Some(d)) if d.id() == *dict_id => {
+                        Some(alloc::sync::Arc::clone(d))
+                    }
+                    _ => {
+                        // No handle exists yet, so no `Drop` will reclaim this;
+                        // the unlink has to happen here.
+                        if let Err(remove) = fs.remove_file(&path) {
+                            log::warn!(
+                                "Could not delete unusable blob file at {}: {remove:?}",
+                                path.display(),
+                            );
+                        }
+                        return Err(e);
+                    }
+                },
+            };
+
             let file: Arc<dyn FsFile> =
                 Arc::from(fs.open(&path, &crate::fs::FsOpenOptions::new().read(true))?);
             let file_accessor = if let Some(dt) = descriptor_table {
@@ -269,15 +313,6 @@ impl MultiWriter {
             };
             file_accessor.insert_for_blob_file((tree_id, blob_file_id).into(), file);
 
-            // What the FILE will record, which is what its reader resolves
-            // against: the passthrough codec when relocation is stamping the
-            // source's own, else what this writer compressed with.
-            let recorded_compression = if passthrough_compression == CompressionType::None {
-                metadata.compression
-            } else {
-                passthrough_compression
-            };
-
             let blob_file = BlobFile(Arc::new(BlobFileInner {
                 checksum,
                 tree_id,
@@ -289,24 +324,7 @@ impl MultiWriter {
                 id: blob_file_id,
                 file_accessor,
                 #[cfg(zstd_any)]
-                // The set first, then the dictionary this writer compressed
-                // with when THAT is the one the file records. A writer holding
-                // the matching dictionary needs no set to pin it: it just used
-                // those bytes, so they are the file's by construction. The set
-                // is what answers for a relocation, which compresses nothing
-                // and records the source's codec.
-                #[cfg(zstd_any)]
-                zstd_dictionary: match zstd_dictionaries.for_compression(recorded_compression) {
-                    Ok(dict) => dict,
-                    Err(e) => match (&recorded_compression, &writer_dictionary) {
-                        (CompressionType::ZstdDict { dict_id, .. }, Some(d))
-                            if d.id() == *dict_id =>
-                        {
-                            Some(alloc::sync::Arc::clone(d))
-                        }
-                        _ => return Err(e),
-                    },
-                },
+                zstd_dictionary,
                 meta: Metadata {
                     id: blob_file_id,
                     version: metadata.version,
