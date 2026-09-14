@@ -1403,6 +1403,44 @@ mod zstd_dict {
     }
 
     #[test]
+    fn a_failed_set_aside_after_the_commit_still_hands_back_the_report() -> lsm_tree::Result<()> {
+        use lsm_tree::fs::{Fault, FaultFs, FaultOp, FaultRule, StdFs};
+
+        // The set-aside runs once the rebuilt manifest is durable, so by then
+        // the repair has happened. If it fails, the report still has to reach
+        // the caller: a retry finds nothing left to repair and answers without
+        // one, and an external log would never learn what it must replay.
+        let dir = tempfile::tempdir()?;
+        let dict = make_test_dictionary();
+        let dict_id = dict.id();
+        a_tree_holding_an_unused_dictionary(dir.path(), dict)?;
+
+        let path = dir.path().join("dicts").join(dict_id.to_string());
+        let mut bytes = std::fs::read(&path)?;
+        if let Some(first) = bytes.first_mut() {
+            *first ^= 0x01;
+        }
+        std::fs::write(&path, &bytes)?;
+
+        let fs = FaultFs::new(StdFs);
+        fs.injector().arm(
+            FaultRule::new(
+                FaultOp::Rename,
+                Fault::Error(lsm_tree::io::ErrorKind::Other),
+            )
+            .on_path(".damaged"),
+        );
+        let Err(err) = make_config(dir.path()).with_fs(fs).repair() else {
+            panic!("the armed rename must fail the set-aside");
+        };
+        assert!(
+            matches!(err, lsm_tree::Error::RepairedButUnopened { .. }),
+            "the committed repair's report comes back with the failure; got {err:?}",
+        );
+        Ok(())
+    }
+
+    #[test]
     fn a_repair_given_the_dictionary_rewrites_a_damaged_copy_tables_need() -> lsm_tree::Result<()> {
         // The tables need the damaged dictionary, and the caller supplies an
         // intact copy of it. The repair reads the tables through that copy and

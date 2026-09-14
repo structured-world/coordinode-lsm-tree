@@ -3996,32 +3996,64 @@ fn repair_tree(
     // Phase 2: turn what the scan found into a manifest, commit it, and carry
     // out the removals and swaps that commit authorizes. The directory lock is
     // held by THIS frame for the whole of it.
-    #[cfg_attr(
-        not(zstd_any),
-        expect(unused_mut, reason = "only dictionaries amend it")
-    )]
-    let mut report = rebuild_from_scan(config, allow_resurrection, manifest_referenced, scan)?;
-
-    // Only now that the rebuilt manifest is durable: every damaged dictionary
-    // still under its name is moved aside, or the open this repair was run for
-    // would fail on it. One the rebuild rewrote from a supplied copy reads
-    // intact again and stays.
+    let rebuilt = rebuild_from_scan(config, allow_resurrection, manifest_referenced, scan);
     #[cfg(zstd_any)]
-    for id in damaged_dictionaries {
-        if let Some(aside) = crate::dicts::set_aside_if_damaged(
+    let rebuilt = set_aside_damaged_dictionaries(config, damaged_dictionaries, rebuilt);
+    rebuilt
+}
+
+/// Moves every damaged dictionary still under its name aside, now that the
+/// rebuilt manifest is durable, and records each in the report.
+///
+/// Left under its name, a damaged dictionary would fail the open this repair
+/// was run for. One the rebuild rewrote from a supplied copy reads intact
+/// again and stays.
+///
+/// # Errors
+///
+/// A failure here, like one inside the rebuild's own post-commit steps, comes
+/// back as [`crate::Error::RepairedButUnopened`] carrying the report: the
+/// manifest is durable, so the repair happened, and a retry would find nothing
+/// left to repair and answer with no report at all. Every dictionary is still
+/// tried; the first failure is the one returned. A rebuild that failed before
+/// its commit is passed through untouched, with nothing set aside.
+#[cfg(zstd_any)]
+fn set_aside_damaged_dictionaries(
+    config: &Config,
+    damaged: Vec<crate::file::DictId>,
+    rebuilt: crate::Result<RepairReport>,
+) -> crate::Result<RepairReport> {
+    let (mut report, mut post_commit_error) = match rebuilt {
+        Ok(report) => (report, None),
+        Err(crate::Error::RepairedButUnopened { report, cause }) => (*report, Some(*cause)),
+        Err(e) => return Err(e),
+    };
+    let folder = config.path.join(crate::file::DICTS_FOLDER);
+    for id in damaged {
+        match crate::dicts::set_aside_if_damaged(
             &*config.fs,
-            &config.path.join(crate::file::DICTS_FOLDER),
+            &folder,
             id,
             config.encryption.as_deref(),
             config.sync_mode,
-        )? {
-            report.damaged_dictionaries.push((
+        ) {
+            Ok(Some(aside)) => report.damaged_dictionaries.push((
                 aside,
                 format!("dictionary {id} no longer hashes to its name; moved aside"),
-            ));
+            )),
+            Ok(None) => {}
+            Err(e) => {
+                post_commit_error.get_or_insert(e);
+            }
         }
     }
-    Ok(report)
+    match post_commit_error {
+        Some(cause) => Err(crate::Error::RepairedButUnopened {
+            report: Box::new(report),
+            cause: Box::new(cause),
+        }),
+        None => Ok(report),
+    }
 }
 
 /// Everything [`scan_table_folders`] learned from the table folders, and the
