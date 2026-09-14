@@ -36,8 +36,8 @@ fn main() {
 }
 
 #[cfg(zstd_any)]
-fn main() {
-    measure::run();
+fn main() -> std::io::Result<()> {
+    measure::run()
 }
 
 #[cfg(zstd_any)]
@@ -286,8 +286,8 @@ mod measure {
     /// corpus / dictionary / block can be run through another zstd
     /// implementation (`zstd -3 -D dict.bin block.bin`) and the two numbers
     /// compared. Enabled with `DICT_RATIO_DUMP=<dir>`.
-    fn dump_artifacts(dir: &str) {
-        std::fs::create_dir_all(dir).expect("dump directory");
+    fn dump_artifacts(dir: &str) -> std::io::Result<()> {
+        std::fs::create_dir_all(dir)?;
         for w in WORKLOADS {
             let corpus: Vec<u8> = blocks(w, 0..20_000, 64 * 1024).concat();
             let (dict, _) = train(&corpus);
@@ -297,8 +297,8 @@ mod measure {
                 .take_while(|c| c.is_ascii_alphanumeric())
                 .collect();
 
-            std::fs::write(format!("{dir}/{slug}.corpus.bin"), &corpus).expect("corpus");
-            std::fs::write(format!("{dir}/{slug}.dict.bin"), dict.raw()).expect("dict");
+            std::fs::write(format!("{dir}/{slug}.corpus.bin"), &corpus)?;
+            std::fs::write(format!("{dir}/{slug}.dict.bin"), dict.raw())?;
             for block_size in [4 * 1024usize, 16 * 1024, 64 * 1024] {
                 let block = blocks(w, 20_000..40_000, block_size)
                     .into_iter()
@@ -307,8 +307,7 @@ mod measure {
                 std::fs::write(
                     format!("{dir}/{slug}.block{}k.bin", block_size / 1024),
                     &block,
-                )
-                .expect("block");
+                )?;
                 // What THIS crate produces for the same bytes at every level,
                 // so an external implementation has something to disagree with
                 // per level rather than only at the default.
@@ -326,12 +325,15 @@ mod measure {
                 }
             }
         }
+        Ok(())
     }
 
-    pub fn run() {
+    /// # Errors
+    ///
+    /// Propagates the artifact dump's directory and file write failures.
+    pub fn run() -> std::io::Result<()> {
         if let Ok(dir) = std::env::var("DICT_RATIO_DUMP") {
-            dump_artifacts(&dir);
-            return;
+            return dump_artifacts(&dir);
         }
 
         println!("zstd level {LEVEL}, dictionary budget {DICT_SIZE} bytes\n");
@@ -497,5 +499,6 @@ mod measure {
             println!("{:<32} {}", w.name, latency_line(&mut plain_us));
             println!("{:<32} {}", "  with dict", latency_line(&mut dict_us));
         }
+        Ok(())
     }
 }
