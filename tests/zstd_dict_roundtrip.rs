@@ -1694,6 +1694,27 @@ mod zstd_dict {
     }
 
     #[test]
+    fn a_dictionary_compressed_blob_file_is_recognised_without_its_dictionary()
+    -> lsm_tree::Result<()> {
+        // Whether a file is a blob file is a question about its shape, which
+        // its metadata answers. The dictionary its descriptor names only
+        // matters for reading values, so inspecting the file with no dictionary
+        // at hand must still recognise it.
+        let dir = tempfile::tempdir()?;
+        a_blob_tree_whose_dictionary_is_gone(dir.path())?;
+        let blobs = dir.path().join("blobs");
+        let names = names_in(&blobs, |_| true)?;
+        assert!(!names.is_empty(), "the flush wrote a blob file");
+        for name in names {
+            assert!(
+                lsm_tree::inspect::is_blob_file(&blobs.join(&name))?,
+                "{name} is a blob file whatever dictionary it names",
+            );
+        }
+        Ok(())
+    }
+
+    #[test]
     fn a_repair_sweeps_an_unreferenced_blob_file_whose_dictionary_is_gone() -> lsm_tree::Result<()>
     {
         // The other side of the rule above. A blob file no recovered table

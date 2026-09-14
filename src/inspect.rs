@@ -986,7 +986,10 @@ pub fn is_blob_file(path: &Path) -> crate::Result<bool> {
     // The id, checksum and dictionary are not part of the question: recovery
     // stores the first two without verifying them and resolves the third only
     // to pin it for reads, and the caller is asking only whether the bytes
-    // parse as a blob file at all.
+    // parse as a blob file at all. The empty set is deliberate: this single-file
+    // recovery leaves a handle whose descriptor names a dictionary it was not
+    // given unpinned rather than failing, so a dictionary-compressed blob file
+    // is recognised here like any other.
     match crate::vlog::recover_blob_file(
         path,
         0,
