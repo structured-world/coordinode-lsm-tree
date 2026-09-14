@@ -21,7 +21,8 @@
 //!
 //! A dictionary keeps literal stretches of the records it was trained on, so on
 //! a tree with an encryption provider the file is sealed with that provider,
-//! the same way the manifest is. The name check runs over the decrypted bytes.
+//! the same way the manifest is. The name check runs over the decrypted bytes,
+//! and a seal that no longer opens is the same damage, caught one step earlier.
 //! A tree is encrypted throughout or not at all, so the provider alone says
 //! which form a file is in.
 
@@ -156,10 +157,10 @@ fn sync_entries(fs: &dyn Fs, folder: &Path, sync_mode: SyncMode) -> crate::Resul
 /// # Errors
 ///
 /// [`crate::Error::ZstdDictCorrupt`] when the bytes on disk do not hash to the
-/// id they are filed under, which is this store's integrity check.
-/// [`crate::Error::Decrypt`] when the file does not open under `encryption`.
-/// Otherwise propagates the open / read failures of the backend, including
-/// `NotFound` when the tree does not hold that dictionary.
+/// id they are filed under, which is this store's integrity check, or when the
+/// seal no longer opens under `encryption`. Otherwise propagates the open /
+/// read failures of the backend, including `NotFound` when the tree does not
+/// hold that dictionary.
 pub fn read_one(
     fs: &dyn Fs,
     folder: &Path,
@@ -170,14 +171,31 @@ pub fn read_one(
     let mut raw = Vec::new();
     file.read_to_end(&mut raw)?;
     if let Some(e) = encryption {
-        raw = e.decrypt_vec(raw)?;
+        // A seal that does not open is the authenticated form of the name check
+        // failing, and is reported as damage rather than as a wrong key. That is
+        // safe because a wrong key never gets to act on the verdict: an open of
+        // an existing tree verifies the manifest under the key before it reads
+        // a dictionary, and a repair under a wrong key stops on the first sealed
+        // table, before its commit, so it never sets a healthy file aside. A
+        // repair that commits with no sealed file to prove the key writes the
+        // manifest under this key, which makes it the tree's.
+        raw = match e.decrypt_vec(raw) {
+            Ok(plain) => plain,
+            Err(crate::Error::Decrypt(_)) => {
+                return Err(crate::Error::ZstdDictCorrupt { id, got: None });
+            }
+            Err(other) => return Err(other),
+        };
     }
 
     let dict = ZstdDictionary::new(&raw);
     if dict.id() != id {
         // The name IS the digest, so a mismatch is corruption of the bytes (or
         // a file placed under a name it does not own), never a stale name.
-        return Err(crate::Error::ZstdDictCorrupt { id, got: dict.id() });
+        return Err(crate::Error::ZstdDictCorrupt {
+            id,
+            got: Some(dict.id()),
+        });
     }
     Ok(dict)
 }

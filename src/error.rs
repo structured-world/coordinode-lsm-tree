@@ -210,7 +210,8 @@ pub enum Error {
     },
 
     /// A dictionary the tree stores no longer hashes to the id it is filed
-    /// under: its bytes were altered or truncated on disk.
+    /// under, or on an encrypted tree its seal no longer opens: its bytes were
+    /// altered or truncated on disk.
     ///
     /// Damage rather than configuration, unlike [`Self::ZstdDictMismatch`]: the
     /// id is the truncated hash of the content, so the file disagreeing with its
@@ -221,8 +222,9 @@ pub enum Error {
         /// The id the file is filed under.
         id: u32,
 
-        /// The id its bytes hash to now.
-        got: u32,
+        /// The id its bytes hash to now; `None` when its seal no longer opens,
+        /// so there are no bytes to hash.
+        got: Option<u32>,
     },
 
     /// Per-record XXH3-64 mismatch inside a framed manifest section

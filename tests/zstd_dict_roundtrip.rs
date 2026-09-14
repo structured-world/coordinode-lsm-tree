@@ -1498,6 +1498,61 @@ mod zstd_dict {
 
     #[test]
     #[cfg(feature = "encryption")]
+    fn open_or_repair_sets_aside_a_sealed_dictionary_whose_seal_broke() -> lsm_tree::Result<()> {
+        // On an encrypted tree the damage shows up one step earlier: a flipped
+        // bit breaks the seal before the name check ever sees the bytes. With
+        // the key already proven by the manifest, a seal that no longer opens
+        // is the same damage and has to reach the same repair. A WRONG key is
+        // still the configuration error it was, and leaves the file alone.
+        use lsm_tree::Aes256GcmProvider;
+
+        let dir = tempfile::tempdir()?;
+        let dict = make_test_dictionary();
+        let dict_id = dict.id();
+        let key = [0x42; 32];
+        {
+            let tree = make_config(dir.path())
+                .zstd_dictionary(Some(Arc::new(dict)))
+                .with_encryption(Some(Arc::new(Aes256GcmProvider::new(&key))))
+                .open()?;
+            for i in 0u32..100 {
+                let key = format!("key-{i:05}");
+                tree.insert(key.as_bytes(), b"written-without-a-dictionary", i.into());
+            }
+            tree.flush_active_memtable(0)?;
+        }
+        damage_the_dictionary(dir.path(), dict_id)?;
+        let path = dir.path().join("dicts").join(dict_id.to_string());
+
+        let wrong = make_config(dir.path())
+            .with_encryption(Some(Arc::new(Aes256GcmProvider::new(&[0x24; 32]))))
+            .open_or_repair(lsm_tree::RepairPolicy::default());
+        assert!(
+            matches!(wrong, Err(lsm_tree::Error::Decrypt(_))),
+            "a wrong key is a configuration error: {:?}",
+            wrong.map(|(_, report)| report),
+        );
+        assert!(path.exists(), "and the wrong key set nothing aside");
+
+        let (tree, report) = make_config(dir.path())
+            .with_encryption(Some(Arc::new(Aes256GcmProvider::new(&key))))
+            .open_or_repair(lsm_tree::RepairPolicy::default())?;
+        let report = report.expect("the open failed on the broken seal, so it was repaired");
+        let aside = dir.path().join("dicts").join(format!("{dict_id}.damaged"));
+        assert!(
+            report.damaged_dictionaries.iter().any(|(p, _)| *p == aside),
+            "the repair set the file aside and reported where it went",
+        );
+        assert!(!path.exists(), "nothing is left under the id");
+        assert_eq!(
+            tree.get(b"key-00042", lsm_tree::MAX_SEQNO)?.as_deref(),
+            Some(b"written-without-a-dictionary".as_slice()),
+        );
+        Ok(())
+    }
+
+    #[test]
+    #[cfg(feature = "encryption")]
     fn open_or_repair_without_the_key_leaves_an_encrypted_tree_alone() -> lsm_tree::Result<()> {
         // Without its provider an encrypted dictionary reads back as
         // ciphertext, which hashes to nothing, exactly as a damaged one does.
@@ -1555,20 +1610,14 @@ mod zstd_dict {
         Ok(())
     }
 
-    #[test]
-    fn a_repair_refuses_a_blob_file_naming_a_dictionary_the_tree_lost() -> lsm_tree::Result<()> {
-        // A blob file whose descriptor names a dictionary the tree no longer
-        // holds is intact bytes behind a missing context, the same case as a
-        // table naming one. The repair has to stop and name the id, as it does
-        // for a table, so the operator can put the file back: grading the
-        // failed decode as damage salvages nothing and drops the file, and every
-        // value in it, from the rebuilt manifest.
-        let dir = tempfile::tempdir()?;
+    /// Writes a blob tree whose blob files are compressed against a dictionary,
+    /// then removes the dictionary's file, and returns its id.
+    fn a_blob_tree_whose_dictionary_is_gone(dir: &std::path::Path) -> lsm_tree::Result<u32> {
         let dict = make_test_dictionary();
         let dict_id = dict.id();
         let big_value = b"blob-value-".repeat(20);
         {
-            let tree = make_config(dir.path())
+            let tree = make_config(dir)
                 .with_kv_separation(Some(make_blob_opts(
                     CompressionType::zstd_dict(3, dict_id)?,
                     Arc::new(dict),
@@ -1580,7 +1629,38 @@ mod zstd_dict {
             }
             tree.flush_active_memtable(0)?;
         }
-        std::fs::remove_file(dir.path().join("dicts").join(dict_id.to_string()))?;
+        std::fs::remove_file(dir.join("dicts").join(dict_id.to_string()))?;
+        Ok(dict_id)
+    }
+
+    /// Removes every table, so nothing references the blob files any more.
+    fn drop_every_table(dir: &std::path::Path) -> lsm_tree::Result<()> {
+        let tables = dir.join("tables");
+        let names = names_in(&tables, |_| true)?;
+        assert!(!names.is_empty(), "the flush wrote a table");
+        for name in names {
+            std::fs::remove_file(tables.join(name))?;
+        }
+        Ok(())
+    }
+
+    /// A blob tree's config with no dictionary supplied.
+    fn a_blob_config(dir: &std::path::Path) -> Config {
+        make_config(dir).with_kv_separation(Some(
+            lsm_tree::KvSeparationOptions::default().separation_threshold(1),
+        ))
+    }
+
+    #[test]
+    fn a_repair_refuses_a_blob_file_naming_a_dictionary_the_tree_lost() -> lsm_tree::Result<()> {
+        // A blob file whose descriptor names a dictionary the tree no longer
+        // holds is intact bytes behind a missing context, the same case as a
+        // table naming one. The repair has to stop and name the id, as it does
+        // for a table, so the operator can put the file back: grading the
+        // failed decode as damage salvages nothing and drops the file, and every
+        // value in it, from the rebuilt manifest.
+        let dir = tempfile::tempdir()?;
+        let dict_id = a_blob_tree_whose_dictionary_is_gone(dir.path())?;
         let manifest_before = manifest_names(dir.path())?;
         let blobs = dir.path().join("blobs");
         let blobs_before = names_in(&blobs, |_| true)?;
@@ -1588,10 +1668,7 @@ mod zstd_dict {
 
         // Both repairs: nothing is committed, so the second sees the same tree.
         for salvage in [false, true] {
-            let err = make_config(dir.path())
-                .with_kv_separation(Some(
-                    lsm_tree::KvSeparationOptions::default().separation_threshold(1),
-                ))
+            let err = a_blob_config(dir.path())
                 .repair_with_salvage(salvage)
                 .expect_err("a blob file whose dictionary is gone must stop the repair");
             match err {
@@ -1624,39 +1701,38 @@ mod zstd_dict {
         // must not stop the repair: that would leave the tree unrepairable until
         // the operator restored bytes for a file the repair discards anyway.
         let dir = tempfile::tempdir()?;
-        let dict = make_test_dictionary();
-        let dict_id = dict.id();
-        let big_value = b"blob-value-".repeat(20);
-        {
-            let tree = make_config(dir.path())
-                .with_kv_separation(Some(make_blob_opts(
-                    CompressionType::zstd_dict(3, dict_id)?,
-                    Arc::new(dict),
-                )))
-                .open()?;
-            for i in 0u32..20 {
-                let key = format!("key-{i:04}");
-                tree.insert(key.as_bytes(), &big_value, i.into());
-            }
-            tree.flush_active_memtable(0)?;
-        }
-        std::fs::remove_file(dir.path().join("dicts").join(dict_id.to_string()))?;
-        // Every table goes, so nothing references the blob file any more.
-        let tables = dir.path().join("tables");
-        let table_names = names_in(&tables, |_| true)?;
-        assert!(!table_names.is_empty(), "the flush wrote a table");
-        for name in table_names {
-            std::fs::remove_file(tables.join(name))?;
-        }
+        a_blob_tree_whose_dictionary_is_gone(dir.path())?;
+        drop_every_table(dir.path())?;
 
-        make_config(dir.path())
-            .with_kv_separation(Some(
-                lsm_tree::KvSeparationOptions::default().separation_threshold(1),
-            ))
-            .repair()?;
+        a_blob_config(dir.path()).repair()?;
         assert!(
             names_in(&dir.path().join("blobs"), |_| true)?.is_empty(),
             "the unreachable blob file went to the sweep",
+        );
+        Ok(())
+    }
+
+    #[test]
+    fn a_repair_sweeps_every_copy_of_an_unreferenced_blob_file_whose_dictionary_is_gone()
+    -> lsm_tree::Result<()> {
+        // The same file with a second copy under another spelling of its id.
+        // Choosing which copy to keep verifies them, and without the dictionary
+        // no copy verifies; for an id nothing references that is not a reason
+        // to stop, since neither copy is kept.
+        let dir = tempfile::tempdir()?;
+        a_blob_tree_whose_dictionary_is_gone(dir.path())?;
+        drop_every_table(dir.path())?;
+        let blobs = dir.path().join("blobs");
+        let names = names_in(&blobs, |_| true)?;
+        let [name] = names.as_slice() else {
+            panic!("the flush wrote one blob file, found {names:?}");
+        };
+        std::fs::copy(blobs.join(name), blobs.join(format!("0{name}")))?;
+
+        a_blob_config(dir.path()).repair()?;
+        assert!(
+            names_in(&blobs, |_| true)?.is_empty(),
+            "both copies went to the sweep",
         );
         Ok(())
     }

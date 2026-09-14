@@ -47,11 +47,13 @@ fn an_encrypted_dictionary_is_sealed_on_disk_and_opens_only_under_its_key() -> c
         "and opens back to the same bytes under the key",
     );
 
+    // A different key does not open it. The store cannot tell that from a
+    // broken seal, so it reports damage; its callers prove the key first.
     let other = Aes256GcmProvider::new(&[0x22; 32]);
     assert!(
         matches!(
             read_one(&*fs, &folder, dict.id(), Some(&other)),
-            Err(crate::Error::Decrypt(_)),
+            Err(crate::Error::ZstdDictCorrupt { got: None, .. }),
         ),
         "a different key does not open it",
     );
@@ -246,16 +248,13 @@ fn a_flipped_bit_is_caught_because_the_name_is_the_digest() -> crate::Result<()>
     // the worst failure this store can have: every block written against it
     // would decompress to plausible garbage instead of failing, so the read
     // must refuse rather than hand the bytes back.
-    let path = folder.join(dict.id().to_string());
-    let mut raw = std::fs::read(&path).unwrap();
-    *raw.first_mut().unwrap() ^= 0x01;
-    std::fs::write(&path, &raw).unwrap();
+    damage(&folder, dict.id())?;
 
     let err = read_one(&*fs, &folder, dict.id(), None).unwrap_err();
     match err {
         crate::Error::ZstdDictCorrupt { id, got } => {
             assert_eq!(id, dict.id());
-            assert_ne!(got, dict.id(), "the corrupted bytes hash elsewhere");
+            assert_ne!(got, Some(dict.id()), "the corrupted bytes hash elsewhere");
         }
         other => panic!("expected ZstdDictCorrupt, got {other:?}"),
     }
@@ -269,9 +268,9 @@ fn a_truncated_dictionary_is_caught_the_same_way() -> crate::Result<()> {
     write(&*fs, &folder, &dict, None, SyncMode::Normal)?;
 
     let path = folder.join(dict.id().to_string());
-    let raw = std::fs::read(&path).unwrap();
+    let raw = std::fs::read(&path)?;
     let half = raw.get(..raw.len() / 2).unwrap();
-    std::fs::write(&path, half).unwrap();
+    std::fs::write(&path, half)?;
 
     assert!(matches!(
         read_one(&*fs, &folder, dict.id(), None),
@@ -319,11 +318,7 @@ fn the_scan_fails_on_a_corrupt_dictionary_rather_than_skipping_it() -> crate::Re
     let bad = ZstdDictionary::new(b"bbbbbbbbbbbbbbbbbbbb");
     write(&*fs, &folder, &good, None, SyncMode::Normal)?;
     write(&*fs, &folder, &bad, None, SyncMode::Normal)?;
-
-    let path = folder.join(bad.id().to_string());
-    let mut raw = std::fs::read(&path).unwrap();
-    *raw.first_mut().unwrap() ^= 0x01;
-    std::fs::write(&path, &raw).unwrap();
+    damage(&folder, bad.id())?;
 
     // Skipping it would turn a detectable corruption into "unknown dictionary
     // id" on the first table that needs it, far from the cause.
@@ -414,8 +409,8 @@ fn the_scan_ignores_files_the_engine_does_not_own() -> crate::Result<()> {
     let (_dir, fs, folder) = store()?;
     let dict = ZstdDictionary::new(b"content");
     write(&*fs, &folder, &dict, None, SyncMode::Normal)?;
-    std::fs::write(folder.join("notes.txt"), b"mine").unwrap();
-    std::fs::write(folder.join("7.tmp"), b"unpublished").unwrap();
+    std::fs::write(folder.join("notes.txt"), b"mine")?;
+    std::fs::write(folder.join("7.tmp"), b"unpublished")?;
 
     let set = read_all(&*fs, &folder, None)?;
 
@@ -456,10 +451,10 @@ fn the_sweep_takes_temps_and_leaves_everything_else() -> crate::Result<()> {
 
     // A crashed registration leaves this behind.
     let temp = folder.join(format!("{}{DICT_TMP_SUFFIX}", 777));
-    std::fs::write(&temp, b"half-written").unwrap();
+    std::fs::write(&temp, b"half-written")?;
     // An operator's file, which the engine does not own and must not touch.
     let foreign = folder.join("notes.txt");
-    std::fs::write(&foreign, b"mine").unwrap();
+    std::fs::write(&foreign, b"mine")?;
 
     sweep_temps(&*fs, &folder)?;
 

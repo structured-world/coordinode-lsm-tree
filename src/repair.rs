@@ -2680,11 +2680,21 @@ fn recover_blob_files(
             #[cfg(zstd_any)]
             &config.current_zstd_dictionaries(),
         )?;
-        // A missing dictionary propagates, and both callers pass it on: which
-        // copy is whole cannot be told without it, and the choice decides
-        // which copy survives.
+        // Without the dictionary no copy can be verified. For an id a recovered
+        // table references that stops the repair, as it does in the recovery
+        // below, since the choice decides which copy survives. For one nothing
+        // references no copy survives either way: it simply does not verify,
+        // and every copy takes the unreferenced path to the sweep.
         #[cfg(zstd_any)]
-        let dict = blob_file_dictionary(config, handle.compression())?;
+        let dict = match blob_file_dictionary(config, handle.compression()) {
+            Ok(dict) => dict,
+            Err(e) if referenced.contains(&blob_id) => return Err(e),
+            Err(_) => {
+                return Err(crate::Error::InvalidHeader(
+                    "blob file names a dictionary the tree does not hold",
+                ));
+            }
+        };
         match validate_blob_frames(
             config,
             blob_path,
@@ -4097,7 +4107,7 @@ fn set_aside_damaged_dictionaries(
         ) {
             Ok(Some(aside)) => report.damaged_dictionaries.push((
                 aside,
-                format!("dictionary {id} no longer hashes to its name; moved aside"),
+                format!("dictionary {id} failed its integrity check; moved aside"),
             )),
             Ok(None) => {}
             Err(e) => {
