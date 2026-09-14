@@ -705,13 +705,13 @@ impl CompactionFlavour for RelocatingCompaction {
                     });
 
                 // These bytes are the SOURCE's, still encoded as it left them.
-                // Record that codec on the file receiving them, rotating first
-                // when it differs from what the current output file already
-                // claims: a blob file describes one codec, and a relocation can
-                // draw from sources that do not share one (the blob policy may
-                // have changed since they were written). Stamping the current
-                // policy instead would label these frames with a codec they are
-                // not in, and the next read of them would fail to decode.
+                // They go to the output file that records that codec, one per
+                // codec for the whole pass: a blob file describes one codec, and
+                // a relocation can draw from sources that do not share one (the
+                // blob policy may have changed since they were written).
+                // Stamping the current policy instead would label these frames
+                // with a codec they are not in, and the next read of them would
+                // fail to decode.
                 #[expect(
                     clippy::expect_used,
                     reason = "the id came from `rewriting_blob_file_codecs`'s own key set"

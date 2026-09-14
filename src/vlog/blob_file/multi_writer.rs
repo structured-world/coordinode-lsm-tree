@@ -31,6 +31,17 @@ pub struct MultiWriter {
 
     active_writer: Writer,
 
+    /// Writers for the other source codecs a relocation has met, each still
+    /// filling its own file while the active one takes frames of its codec.
+    ///
+    /// A relocation merges its sources by key, so two compression generations
+    /// over the same keys alternate on nearly every frame. A file records one
+    /// codec, and closing it on every switch would produce a file per value;
+    /// keeping one open per codec leaves every file as full as the size target
+    /// allows. Empty outside relocation, and at most one entry per codec the
+    /// sources carry.
+    parked: Vec<(CompressionType, Writer)>,
+
     results: Vec<BlobFile>,
 
     id_generator: SequenceNumberCounter,
@@ -86,6 +97,7 @@ impl MultiWriter {
             target_size: 64 * 1_024 * 1_024,
 
             active_writer: Writer::new(blob_file_path, blob_file_id, tree_id, &*fs)?,
+            parked: Vec::new(),
 
             results: Vec::new(),
 
@@ -134,19 +146,18 @@ impl MultiWriter {
         self
     }
 
-    /// Records `compression` on the file being filled, rotating first when a
-    /// frame already in it claims a different one.
+    /// Directs the next frames to a file that records `compression`.
     ///
     /// The relocation counterpart of [`Self::use_passthrough_compression`],
     /// which fixes one codec for the whole pass. A relocation copies frames
     /// VERBATIM out of sources that need not share a codec (the blob policy may
     /// have moved since they were written), while a blob file records exactly
-    /// one. Rotating on that boundary is what keeps every output file's
-    /// descriptor true of every frame in it.
+    /// one. Each codec therefore gets its own output file, and switching parks
+    /// the current one rather than closing it (see [`Self::parked`]).
     ///
     /// # Errors
     ///
-    /// Propagates the rotation's finish of the file being closed.
+    /// Propagates the creation of the first file for a codec not met before.
     pub(crate) fn record_source_compression(
         &mut self,
         compression: CompressionType,
@@ -154,14 +165,38 @@ impl MultiWriter {
         if self.passthrough_compression == compression {
             return Ok(());
         }
-        // Only what is already written constrains the codec; an untouched
-        // writer can simply be restamped.
-        if self.active_writer.item_count > 0 {
-            self.rotate()?;
-        }
+        let next = if let Some(at) = self.parked.iter().position(|(c, _)| *c == compression) {
+            self.parked.swap_remove(at).1
+        } else if self.active_writer.item_count == 0 {
+            // Nothing written constrains an untouched writer: restamp it.
+            self.active_writer.metadata_compression_override = Some(compression);
+            self.passthrough_compression = compression;
+            return Ok(());
+        } else {
+            self.fresh_writer(compression)?
+        };
+        let previous = core::mem::replace(&mut self.active_writer, next);
+        self.parked.push((self.passthrough_compression, previous));
         self.passthrough_compression = compression;
-        self.active_writer.metadata_compression_override = Some(compression);
         Ok(())
+    }
+
+    /// A new writer for the next blob file, recording `passthrough` when this
+    /// writer copies already-encoded frames.
+    fn fresh_writer(&self, passthrough: CompressionType) -> crate::Result<Writer> {
+        let id = self.id_generator.next();
+        let path = self.folder.join(id.to_string());
+        let mut w = Writer::new(path, id, self.tree_id, &*self.fs)?
+            .use_compression(self.compression)
+            .use_sync_mode(self.sync_mode);
+        // Carry the passthrough metadata codec onto the new writer so every
+        // file in a relocation records the real compression.
+        if passthrough != CompressionType::None {
+            w.metadata_compression_override = Some(passthrough);
+        }
+        #[cfg(zstd_any)]
+        let w = w.use_zstd_dictionary(self.zstd_dictionary.clone());
+        Ok(w)
     }
 
     /// Sets the compression method.
@@ -205,22 +240,7 @@ impl MultiWriter {
     fn rotate(&mut self) -> crate::Result<()> {
         log::debug!("Rotating blob file writer");
 
-        let new_blob_file_id = self.id_generator.next();
-        let blob_file_path = self.folder.join(new_blob_file_id.to_string());
-
-        let new_writer = {
-            let mut w = Writer::new(blob_file_path, new_blob_file_id, self.tree_id, &*self.fs)?
-                .use_compression(self.compression)
-                .use_sync_mode(self.sync_mode);
-            // Carry the passthrough metadata codec onto each rotated writer so
-            // every file in a relocation records the real compression.
-            if self.passthrough_compression != CompressionType::None {
-                w.metadata_compression_override = Some(self.passthrough_compression);
-            }
-            #[cfg(zstd_any)]
-            let w = w.use_zstd_dictionary(self.zstd_dictionary.clone());
-            w
-        };
+        let new_writer = self.fresh_writer(self.passthrough_compression)?;
 
         let old_writer = core::mem::replace(&mut self.active_writer, new_writer);
         let blob_file = Self::consume_writer(
@@ -421,15 +441,19 @@ impl MultiWriter {
     }
 
     pub(crate) fn finish(mut self) -> crate::Result<Vec<BlobFile>> {
-        let blob_file = Self::consume_writer(
-            self.active_writer,
-            self.passthrough_compression,
-            self.descriptor_table.clone(),
-            &self.fs,
-            #[cfg(zstd_any)]
-            &self.zstd_dictionaries,
-        )?;
-        self.results.extend(blob_file);
+        let writers =
+            core::iter::once((self.passthrough_compression, self.active_writer)).chain(self.parked);
+        for (passthrough, writer) in writers {
+            let blob_file = Self::consume_writer(
+                writer,
+                passthrough,
+                self.descriptor_table.clone(),
+                &self.fs,
+                #[cfg(zstd_any)]
+                &self.zstd_dictionaries,
+            )?;
+            self.results.extend(blob_file);
+        }
         Ok(self.results)
     }
 }
