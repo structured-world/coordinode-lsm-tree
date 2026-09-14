@@ -1837,20 +1837,22 @@ fn open_or_repair_propagates_a_wrong_key_decrypt_failure() -> lsm_tree::Result<(
         tree.insert(b"k", b"v", 1);
         tree.flush_active_memtable(1)?;
     }
-    let manifest_names = || -> Vec<String> {
-        let mut names: Vec<String> = std::fs::read_dir(&dir)
-            .expect("read dir")
-            .map(|e| e.expect("entry").file_name().to_string_lossy().into_owned())
-            .filter(|n| {
-                n.strip_prefix('v')
-                    .is_some_and(|rest| rest.parse::<u64>().is_ok())
-                    || n == "current"
-            })
-            .collect();
+    let manifest_names = || -> lsm_tree::Result<Vec<String>> {
+        let mut names = Vec::new();
+        for entry in std::fs::read_dir(&dir)? {
+            let name = entry?.file_name().to_string_lossy().into_owned();
+            if name
+                .strip_prefix('v')
+                .is_some_and(|rest| rest.parse::<u64>().is_ok())
+                || name == "current"
+            {
+                names.push(name);
+            }
+        }
         names.sort();
-        names
+        Ok(names)
     };
-    let before = manifest_names();
+    let before = manifest_names()?;
 
     // Open with key B: the AEAD verification of both footer copies fails.
     let result = Config::new(
@@ -1867,7 +1869,7 @@ fn open_or_repair_propagates_a_wrong_key_decrypt_failure() -> lsm_tree::Result<(
     );
     assert_eq!(
         before,
-        manifest_names(),
+        manifest_names()?,
         "a repair under the wrong key would have rewritten the manifest",
     );
 
@@ -1905,15 +1907,15 @@ fn open_or_repair_without_a_key_leaves_an_encrypted_store_alone() -> lsm_tree::R
         tree.insert(b"k", b"v", 1);
         tree.flush_active_memtable(1)?;
     }
-    let tables = || -> Vec<String> {
-        let mut names: Vec<String> = std::fs::read_dir(dir.path().join("tables"))
-            .expect("read dir")
-            .map(|e| e.expect("entry").file_name().to_string_lossy().into_owned())
-            .collect();
+    let tables = || -> lsm_tree::Result<Vec<String>> {
+        let mut names = Vec::new();
+        for entry in std::fs::read_dir(dir.path().join("tables"))? {
+            names.push(entry?.file_name().to_string_lossy().into_owned());
+        }
         names.sort();
-        names
+        Ok(names)
     };
-    let before = tables();
+    let before = tables()?;
 
     let result = Config::new(
         &dir,
@@ -1926,7 +1928,7 @@ fn open_or_repair_without_a_key_leaves_an_encrypted_store_alone() -> lsm_tree::R
         "an encrypted store opened without its key must not be repaired open: {:?}",
         result.map(|(_, report)| report),
     );
-    assert_eq!(before, tables(), "no table was dropped or set aside");
+    assert_eq!(before, tables()?, "no table was dropped or set aside");
 
     // Nor by an explicit repair: the missing key stops it before its commit,
     // as a wrong one does, instead of grading every sealed table as damage.
@@ -1942,7 +1944,7 @@ fn open_or_repair_without_a_key_leaves_an_encrypted_store_alone() -> lsm_tree::R
     );
     assert_eq!(
         before,
-        tables(),
+        tables()?,
         "the explicit repair dropped nothing either"
     );
 
