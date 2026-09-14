@@ -411,6 +411,15 @@ impl SuperVersions {
         // contract (monotone counter) this clamp is a no-op.
         let seqno = seqno.max(prior.seqno);
         let mut next_version = f(&prior)?;
+        // Every install is a transition to a new id. A rotation persists the
+        // installed version as a fresh `v{id}` snapshot, created exclusively,
+        // so one under the prior id would fail on the snapshot that id names.
+        debug_assert!(
+            next_version.version.id() > prior.version.id(),
+            "an install must advance the version id ({} -> {})",
+            prior.version.id(),
+            next_version.version.id(),
+        );
         next_version.seqno = seqno;
         log::trace!("Next version seqno={}", next_version.seqno);
 

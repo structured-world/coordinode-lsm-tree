@@ -1973,9 +1973,7 @@ impl Tree {
                 &self.config.path,
                 |current| {
                     let mut copy = current.clone();
-                    for id in &stale {
-                        copy.version = copy.version.without_dict(*id);
-                    }
+                    copy.version = copy.version.without_dicts(&stale);
                     Ok(copy)
                 },
                 &self.config.seqno,

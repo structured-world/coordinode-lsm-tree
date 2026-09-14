@@ -349,11 +349,11 @@ impl Version {
         ids
     }
 
-    /// Registers `id` with this version, returning the extended version.
+    /// The next version, registering `id` as well.
     ///
     /// Idempotent: an id already present returns this version unchanged, since
     /// the id is derived from the dictionary's own bytes and cannot name two
-    /// different dictionaries.
+    /// different dictionaries. That is not a transition, so it is not installed.
     #[must_use]
     pub fn with_dict(&self, id: crate::file::DictId) -> Self {
         if self.dicts.contains(&id) {
@@ -364,37 +364,47 @@ impl Version {
         // order and two trees holding the same dictionaries encode alike.
         let at = dicts.partition_point(|held| *held < id);
         dicts.insert(at, id);
-        self.with_dicts(dicts)
+        self.with_id_and_dicts(self.id + 1, dicts)
     }
 
-    /// Drops `id` from this version, returning the reduced version. An id this
-    /// version does not hold returns it unchanged.
+    /// The next version, no longer registering any of `ids`. None of them
+    /// held returns this version unchanged, which is not installed either.
     ///
-    /// Dropping the id is what makes the file collectable; the bytes are
+    /// Dropping an id is what makes its file collectable; the bytes are
     /// removed separately, once no retained version holds the id any more.
+    /// One transition for the whole set, however many ids it drops.
     #[must_use]
-    pub fn without_dict(&self, id: crate::file::DictId) -> Self {
-        if !self.dicts.contains(&id) {
+    pub fn without_dicts(&self, ids: &[crate::file::DictId]) -> Self {
+        if !self.dicts.iter().any(|held| ids.contains(held)) {
             return self.clone();
         }
         let dicts = self
             .dicts
             .iter()
             .copied()
-            .filter(|held| *held != id)
+            .filter(|held| !ids.contains(held))
             .collect::<Vec<_>>();
-        self.with_dicts(dicts)
+        self.with_id_and_dicts(self.id + 1, dicts)
     }
 
-    /// This version with `dicts` in place of its own list.
+    /// This version with `dicts` in place of its own list, under the SAME id.
     ///
-    /// A REBUILT version (manifest repair) also sets the list this way, since
-    /// it starts empty and the ids have to be derived from the recovered files.
+    /// For a version that is being rebuilt rather than installed: manifest
+    /// repair and recovery set the list this way, since the ids have to be
+    /// derived from the recovered files. An install goes through
+    /// [`Self::with_dict`] / [`Self::without_dicts`], which advance the id like
+    /// every other transition: a rotation writes the installed version as a
+    /// fresh `v{id}` snapshot, and one under the prior id would collide with
+    /// the snapshot that id already names.
     #[must_use]
     pub(crate) fn with_dicts(&self, dicts: Vec<crate::file::DictId>) -> Self {
+        self.with_id_and_dicts(self.id, dicts)
+    }
+
+    fn with_id_and_dicts(&self, id: VersionId, dicts: Vec<crate::file::DictId>) -> Self {
         Self {
             inner: Arc::new(VersionInner {
-                id: self.id,
+                id,
                 tree_type: self.tree_type,
                 levels: self.levels.clone(),
                 blob_files: self.blob_files.clone(),

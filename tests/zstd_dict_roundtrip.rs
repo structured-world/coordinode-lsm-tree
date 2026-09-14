@@ -1291,6 +1291,116 @@ mod zstd_dict {
     }
 
     #[test]
+    fn a_dictionary_registers_when_every_install_rotates_the_manifest() -> lsm_tree::Result<()> {
+        // A rotation writes the installed version as a fresh `v{id}` snapshot,
+        // and that file is created exclusively. A registration that installed
+        // a version under the id it already had would rotate onto the snapshot
+        // that id already names and fail, which with the threshold at zero is
+        // the open itself.
+        let dir = tempfile::tempdir()?;
+        let first = make_test_dictionary();
+        let first_id = first.id();
+
+        {
+            let tree = make_config(dir.path())
+                .manifest_log_rotate_bytes(0)
+                .data_block_compression_policy(CompressionPolicy::all(CompressionType::zstd_dict(
+                    3, first_id,
+                )?))
+                .zstd_dictionary(Some(Arc::new(first)))
+                .open()?;
+            for i in 0u32..100 {
+                let key = format!("key-{i:05}");
+                let val = format!("value-{i:05}-padding-to-make-it-longer");
+                tree.insert(key.as_bytes(), val.as_bytes(), i.into());
+            }
+            tree.flush_active_memtable(0)?;
+
+            // A registration on the live tree takes the same install.
+            let mut samples = Vec::new();
+            for i in 0u32..500 {
+                samples.extend_from_slice(format!("other-{i:05}-sample").as_bytes());
+            }
+            let second = Arc::new(ZstdDictionary::new(&samples));
+            let lsm_tree::AnyTree::Standard(standard) = &tree else {
+                panic!("a standard tree");
+            };
+            standard.register_zstd_dictionary(Arc::clone(&second))?;
+            assert!(standard.zstd_dictionaries().get(second.id()).is_some());
+        }
+
+        // The registrations are durable: a reopen that supplies nothing resolves
+        // the tables written under the first dictionary.
+        let reopened = make_config(dir.path())
+            .manifest_log_rotate_bytes(0)
+            .open()?;
+        assert_eq!(
+            reopened.get(b"key-00042", lsm_tree::MAX_SEQNO)?.as_deref(),
+            Some(b"value-00042-padding-to-make-it-longer".as_slice()),
+        );
+        Ok(())
+    }
+
+    #[test]
+    fn a_dictionary_is_collected_when_every_install_rotates_the_manifest() -> lsm_tree::Result<()> {
+        // The collection's first stage is an install that only drops ids, so
+        // it has the same exposure as a registration: under the id it already
+        // had, a rotation fails on the snapshot that id already names.
+        let dir = tempfile::tempdir()?;
+        let dict = make_test_dictionary();
+        let dict_id = dict.id();
+
+        {
+            let tree = make_config(dir.path())
+                .data_block_compression_policy(CompressionPolicy::all(CompressionType::zstd_dict(
+                    3, dict_id,
+                )?))
+                .zstd_dictionary(Some(Arc::new(dict)))
+                .open()?;
+            for i in 0u32..100 {
+                let key = format!("key-{i:05}");
+                tree.insert(
+                    key.as_bytes(),
+                    b"value-written-under-the-dictionary",
+                    i.into(),
+                );
+            }
+            tree.flush_active_memtable(0)?;
+        }
+
+        {
+            let tree = make_config(dir.path())
+                .manifest_log_rotate_bytes(0)
+                .data_block_compression_policy(CompressionPolicy::all(CompressionType::None))
+                .open()?;
+            tree.major_compact(u64::MAX, 0)?;
+            let lsm_tree::AnyTree::Standard(standard) = &tree else {
+                panic!("a standard tree");
+            };
+            // Stage 1 unregisters the id; a retained version still names it.
+            assert_eq!(standard.collect_unreferenced_dictionaries()?, 0);
+        }
+
+        let tree = make_config(dir.path())
+            .manifest_log_rotate_bytes(0)
+            .data_block_compression_policy(CompressionPolicy::all(CompressionType::None))
+            .open()?;
+        let lsm_tree::AnyTree::Standard(standard) = &tree else {
+            panic!("a standard tree");
+        };
+        assert_eq!(
+            standard.collect_unreferenced_dictionaries()?,
+            1,
+            "the unregistration was persisted, so the file is collectable",
+        );
+        assert_eq!(
+            tree.get(b"key-00042", lsm_tree::MAX_SEQNO)?.as_deref(),
+            Some(b"value-written-under-the-dictionary".as_slice()),
+        );
+        Ok(())
+    }
+
+    #[test]
     fn two_trees_from_one_cloned_config_keep_separate_dictionary_sets() -> lsm_tree::Result<()> {
         // A `Config` is `Clone`, and a keyspace clones one base config per
         // partition. The registry a tree loads at open therefore has to belong
