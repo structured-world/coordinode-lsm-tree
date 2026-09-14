@@ -552,6 +552,10 @@ impl Version {
         // crash lost the edit registering a file already published. The files
         // are what a reader and a checkpoint need, and every id they name
         // resolved at the open or the table would have refused it.
+        //
+        // The other direction, a registered id whose file is gone, is settled
+        // by the open, which holds the dictionary set this function does not:
+        // it drops every registered id the tree no longer holds.
         let mut dicts = recovery.dicts;
         dicts.extend(recovered.referenced_dicts());
         dicts.sort_unstable();
