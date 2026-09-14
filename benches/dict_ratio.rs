@@ -6,7 +6,9 @@
 //! assumed.
 //!
 //! Prints a table instead of using criterion: the question here is BYTES first
-//! and time second, and criterion measures time.
+//! and time second, and criterion measures time. The dictionary codec's own
+//! timing runs under criterion in `benches/zstd_dict.rs`; the timing columns
+//! here only price each variant beside the bytes it produced.
 //!
 //! Four things are measured, one per question a dictionary policy has to
 //! answer:
