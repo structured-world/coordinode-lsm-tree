@@ -191,23 +191,36 @@ mod measure {
 
         let bytes: usize = compressed.iter().map(Vec::len).sum();
 
+        let decode = |frame: &[u8], len: usize| match dict {
+            Some(d) => {
+                ZstdBackend::decompress_with_dict(frame, d, len).expect("dict decompression")
+            }
+            None => ZstdBackend::decompress(frame, len).expect("plain decompression"),
+        };
+
         // Read back, because a policy that only counts written bytes hides
         // what it costs to serve them.
         let started = Instant::now();
         for (block, frame) in blocks.iter().zip(&compressed) {
-            let out = match dict {
-                Some(d) => ZstdBackend::decompress_with_dict(frame, d, block.len())
-                    .expect("dict decompression"),
-                None => ZstdBackend::decompress(frame, block.len()).expect("plain decompression"),
-            };
+            let out = decode(frame, block.len());
             // Not `debug_assert_eq!`: the bench profile inherits `release` and
             // strips debug assertions, so the check would be absent from the
-            // only build that ever runs this. The decompressed buffer has no
-            // other use, and an unvalidated round-trip would report a read
-            // throughput for work nothing proved correct.
+            // only build that ever runs this. The length is all this timed
+            // pass checks, since comparing the bytes here would bill a memcmp
+            // to the decoder.
             assert_eq!(out.len(), block.len(), "round-trip length mismatch");
         }
         let read = started.elapsed();
+
+        // The bytes are proven in a second, untimed pass: a same-length but
+        // wrong output would otherwise report ratio and throughput for a round
+        // trip that never worked.
+        for (block, frame) in blocks.iter().zip(&compressed) {
+            assert!(
+                decode(frame, block.len()) == *block,
+                "round-trip produced different bytes"
+            );
+        }
 
         Variant {
             bytes,
