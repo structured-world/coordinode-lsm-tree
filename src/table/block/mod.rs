@@ -246,6 +246,23 @@ fn decrypt_block_payload(
     }
 }
 
+/// Refuses a block whose header says it is encrypted when the reader has no
+/// provider to open it.
+///
+/// Read as plaintext, the ciphertext fails to parse, which reads as damage,
+/// and a repair acting on that verdict drops every sealed file it finds. A
+/// missing key is a configuration error, as a wrong one is. Only the
+/// self-describing blocks (meta and manifest) carry the bit; the rest are
+/// read after their table's meta, which fails first.
+fn refuse_encrypted_without_provider(header: &Header) -> crate::Result<()> {
+    if header.block_flags & header::block_flags::ENCRYPTED != 0 {
+        return Err(crate::Error::Decrypt(
+            "block is encrypted but no encryption provider is configured",
+        ));
+    }
+    Ok(())
+}
+
 /// Classifies the on-disk trailer (bytes after the `data_length` payload) into
 /// an [`EccStatus`], or `Err` on a framing violation.
 ///
@@ -1120,12 +1137,14 @@ impl Block {
     /// Pipeline: read → verify checksum → decrypt → decompress.
     /// When `encryption` is `None`, the decrypt step is skipped.
     ///
-    /// Encryption state is determined by the caller (via [`Config`]),
-    /// not recorded in the on-disk block header. With an authenticated
-    /// encryption provider (such as AES-256-GCM), using the wrong key
-    /// or provider will typically surface as a read/validation error
-    /// (checksum, length, or decompression failure) rather than
-    /// silently producing valid-looking plaintext.
+    /// Encryption state is determined by the caller (via [`Config`]). Only
+    /// the self-describing blocks (meta and manifest) record it in their
+    /// header, and one of those read with no provider is refused as
+    /// [`crate::Error::Decrypt`]. With an authenticated encryption provider
+    /// (such as AES-256-GCM), using the wrong key or provider will typically
+    /// surface as a read/validation error (checksum, length, or
+    /// decompression failure) rather than silently producing valid-looking
+    /// plaintext.
     // The two branches still differ in how they OBTAIN the payload — encrypted
     // reads into a `Vec` so `decrypt_vec` can reuse the buffer in place,
     // unencrypted reads into a `Slice` to stay zero-copy — but they no longer
@@ -1142,6 +1161,9 @@ impl Block {
         // from the parsed header (the frame self-describes it), not asserted
         // against identity.block_type.
         let header = Header::decode_from(reader)?;
+        if encryption.is_none() {
+            refuse_encrypted_without_provider(&header)?;
+        }
 
         // Validate both size fields before any I/O or hashing to fail fast
         // on malformed headers. The on-disk data_length may include encryption
@@ -1529,6 +1551,7 @@ impl Block {
             let buf = crate::file::read_exact(file, *handle.offset(), handle.size() as usize)?;
 
             let parsed_header = Header::decode_from(&mut &buf[..])?;
+            refuse_encrypted_without_provider(&parsed_header)?;
             let header_len = Header::header_len(parsed_header.block_type);
 
             // Recognized-ECC presence keys on `block_has_parity`, not on

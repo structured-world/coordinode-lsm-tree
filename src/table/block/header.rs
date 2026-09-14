@@ -109,8 +109,9 @@ pub mod block_flags {
 
     /// The payload was encrypted. The scheme/key comes from the
     /// owning SST's encryption config (caller-supplied via the
-    /// `BlockTransform`); this bit is a presence-only self-describing
-    /// signal, not validated against the transform on the read path.
+    /// `BlockTransform`). The read path refuses the bit when the
+    /// transform has no provider, so a missing key surfaces as a
+    /// configuration error instead of ciphertext parsed as plaintext.
     pub const ENCRYPTED: u8 = 1 << 3;
 
     /// Mask of every defined transform-layer bit. The header decoder
