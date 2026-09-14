@@ -16,8 +16,17 @@
 //! here than elsewhere in the tree, because a silently altered dictionary does
 //! not fail a read, it decompresses every block written against it into
 //! plausible-looking garbage.
+//!
+//! ## Encrypted trees
+//!
+//! A dictionary keeps literal stretches of the records it was trained on, so on
+//! a tree with an encryption provider the file is sealed with that provider,
+//! the same way the manifest is. The name check runs over the decrypted bytes.
+//! A tree is encrypted throughout or not at all, so the provider alone says
+//! which form a file is in.
 
 use crate::compression::{ZstdDictionaries, ZstdDictionary};
+use crate::encryption::EncryptionProvider;
 use crate::file::{DICT_TMP_SUFFIX, DictDirEntry, DictId};
 use crate::fs::{Fs, FsFile, FsOpenOptions, SyncMode};
 #[cfg(not(feature = "std"))]
@@ -35,7 +44,7 @@ fn path_of(folder: &Path, id: DictId) -> PathBuf {
 }
 
 /// Writes `dict` into the tree's dictionary folder, creating the folder if this
-/// is the first one.
+/// is the first one, sealed with `encryption` when the tree has a provider.
 ///
 /// Published by an atomic rename, so a crash mid-write leaves a `.tmp` the
 /// sweep disposes of rather than a half-written dictionary under a live name.
@@ -50,19 +59,21 @@ fn path_of(folder: &Path, id: DictId) -> PathBuf {
 /// dictionary under this id. Accepting it silently would be the worst outcome
 /// the store can produce: the caller's new dictionary would be selected for
 /// WRITES while every read resolved the id back to the old bytes, so new blocks
-/// would decompress into plausible garbage. Otherwise propagates the create /
-/// write / sync / rename failures of the backend.
+/// would decompress into plausible garbage. Otherwise propagates the provider's
+/// encryption failure and the create / write / sync / rename failures of the
+/// backend.
 pub fn write(
     fs: &dyn Fs,
     folder: &Path,
     dict: &ZstdDictionary,
+    encryption: Option<&dyn EncryptionProvider>,
     sync_mode: SyncMode,
 ) -> crate::Result<()> {
     let final_path = path_of(folder, dict.id());
     if fs.exists(&final_path)? {
         // Same id: prove it is the same DICTIONARY before treating the write as
         // done. `read_one` re-hashes, so a corrupt file is caught here too.
-        let held = read_one(fs, folder, dict.id())?;
+        let held = read_one(fs, folder, dict.id(), encryption)?;
         if held.raw() != dict.raw() {
             return Err(crate::Error::ZstdDictMismatch {
                 expected: dict.id(),
@@ -90,6 +101,14 @@ pub fn write(
         }
     }
 
+    // Sealed before the temp file exists, so a provider failure leaves nothing
+    // behind to clean up.
+    let sealed = encryption.map(|e| e.encrypt(dict.raw())).transpose()?;
+    let bytes = match &sealed {
+        Some(ciphertext) => ciphertext.as_slice(),
+        None => dict.raw(),
+    };
+
     let tmp_path = folder.join(format!("{}{DICT_TMP_SUFFIX}", dict.id()));
     // `create(true)` rather than `create_new(true)`: a `.tmp` left by a crashed
     // registration is disposable by definition (it is referenced by no version),
@@ -99,7 +118,7 @@ pub fn write(
         &FsOpenOptions::new().write(true).create(true).truncate(true),
     )?;
     let written = file
-        .write_all(dict.raw())
+        .write_all(bytes)
         .map_err(crate::io::Error::from)
         .and_then(|()| file.flush().map_err(crate::io::Error::from))
         .and_then(|()| FsFile::sync_all_with(&*file, sync_mode));
@@ -117,18 +136,28 @@ pub fn write(
     Ok(())
 }
 
-/// Reads the dictionary stored under `id`.
+/// Reads the dictionary stored under `id`, opening the seal with `encryption`
+/// when the tree has a provider.
 ///
 /// # Errors
 ///
 /// [`crate::Error::ZstdDictMismatch`] when the bytes on disk do not hash to the
-/// id they are filed under, which is this store's integrity check. Otherwise
-/// propagates the open / read failures of the backend, including `NotFound`
-/// when the tree does not hold that dictionary.
-pub fn read_one(fs: &dyn Fs, folder: &Path, id: DictId) -> crate::Result<ZstdDictionary> {
+/// id they are filed under, which is this store's integrity check.
+/// [`crate::Error::Decrypt`] when the file does not open under `encryption`.
+/// Otherwise propagates the open / read failures of the backend, including
+/// `NotFound` when the tree does not hold that dictionary.
+pub fn read_one(
+    fs: &dyn Fs,
+    folder: &Path,
+    id: DictId,
+    encryption: Option<&dyn EncryptionProvider>,
+) -> crate::Result<ZstdDictionary> {
     let mut file = fs.open(&path_of(folder, id), &FsOpenOptions::new().read(true))?;
     let mut raw = Vec::new();
     file.read_to_end(&mut raw)?;
+    if let Some(e) = encryption {
+        raw = e.decrypt_vec(raw)?;
+    }
 
     let dict = ZstdDictionary::new(&raw);
     if dict.id() != id {
@@ -156,14 +185,18 @@ pub fn read_one(fs: &dyn Fs, folder: &Path, id: DictId) -> crate::Result<ZstdDic
 /// a corrupt dictionary fails the open rather than silently dropping out of the
 /// set, which would turn into "unknown dictionary id" on the first table that
 /// needs it.
-pub fn read_all(fs: &dyn Fs, folder: &Path) -> crate::Result<ZstdDictionaries> {
+pub fn read_all(
+    fs: &dyn Fs,
+    folder: &Path,
+    encryption: Option<&dyn EncryptionProvider>,
+) -> crate::Result<ZstdDictionaries> {
     if !fs.exists(folder)? {
         return Ok(ZstdDictionaries::new());
     }
     let mut set = ZstdDictionaries::new();
     for dirent in fs.read_dir(folder)? {
         if let DictDirEntry::Dict(id) = DictDirEntry::classify(&dirent.file_name) {
-            set = set.with(Arc::new(read_one(fs, folder, id)?));
+            set = set.with(Arc::new(read_one(fs, folder, id, encryption)?));
         }
     }
     Ok(set)

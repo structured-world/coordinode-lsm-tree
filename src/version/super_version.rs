@@ -420,6 +420,18 @@ impl SuperVersions {
             prior.version.id(),
             next_version.version.id(),
         );
+        // A checkpoint carries only the dictionaries a version registers, so a
+        // file naming one the version does not register would travel without it.
+        debug_assert!(
+            next_version
+                .version
+                .referenced_dicts()
+                .iter()
+                .all(|id| next_version.version.dicts().contains(id)),
+            "every dictionary a file references is registered ({:?} of {:?})",
+            next_version.version.referenced_dicts(),
+            next_version.version.dicts(),
+        );
         next_version.seqno = seqno;
         log::trace!("Next version seqno={}", next_version.seqno);
 

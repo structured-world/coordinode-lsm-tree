@@ -14,11 +14,50 @@ fn a_written_dictionary_reads_back_byte_for_byte() -> crate::Result<()> {
     let (_dir, fs, folder) = store();
     let dict = ZstdDictionary::new(b"representative content for a dictionary");
 
-    write(&*fs, &folder, &dict, SyncMode::Normal)?;
-    let read = read_one(&*fs, &folder, dict.id())?;
+    write(&*fs, &folder, &dict, None, SyncMode::Normal)?;
+    let read = read_one(&*fs, &folder, dict.id(), None)?;
 
     assert_eq!(read.raw(), dict.raw());
     assert_eq!(read.id(), dict.id());
+    Ok(())
+}
+
+#[test]
+#[cfg(feature = "encryption")]
+fn an_encrypted_dictionary_is_sealed_on_disk_and_opens_only_under_its_key() -> crate::Result<()> {
+    use crate::encryption::Aes256GcmProvider;
+
+    // A dictionary keeps literal stretches of its training records, so on an
+    // encrypted tree the file must not carry them in the clear, and a reader
+    // without the key must be refused rather than handed bytes to hash.
+    let (_dir, fs, folder) = store();
+    let dict = ZstdDictionary::new(b"a training record that must not reach the disk in the clear");
+    let key = Aes256GcmProvider::new(&[0x11; 32]);
+
+    write(&*fs, &folder, &dict, Some(&key), SyncMode::Normal)?;
+
+    let on_disk = std::fs::read(folder.join(dict.id().to_string())).unwrap();
+    assert!(
+        !on_disk.windows(dict.raw().len()).any(|w| w == dict.raw()),
+        "the dictionary is not stored in the clear",
+    );
+    assert_eq!(
+        read_one(&*fs, &folder, dict.id(), Some(&key))?.raw(),
+        dict.raw(),
+        "and opens back to the same bytes under the key",
+    );
+
+    let other = Aes256GcmProvider::new(&[0x22; 32]);
+    assert!(
+        matches!(
+            read_one(&*fs, &folder, dict.id(), Some(&other)),
+            Err(crate::Error::Decrypt(_)),
+        ),
+        "a different key does not open it",
+    );
+
+    // Rewriting the same id under the key still recognises it as held.
+    write(&*fs, &folder, &dict, Some(&key), SyncMode::Normal)?;
     Ok(())
 }
 
@@ -34,6 +73,7 @@ fn the_folder_is_created_on_the_first_write() -> crate::Result<()> {
         &*fs,
         &folder,
         &ZstdDictionary::new(b"content"),
+        None,
         SyncMode::Normal,
     )?;
 
@@ -46,10 +86,10 @@ fn writing_an_id_already_held_is_a_no_op() -> crate::Result<()> {
     let (_dir, fs, folder) = store();
     let dict = ZstdDictionary::new(b"content");
 
-    write(&*fs, &folder, &dict, SyncMode::Normal)?;
-    write(&*fs, &folder, &dict, SyncMode::Normal)?;
+    write(&*fs, &folder, &dict, None, SyncMode::Normal)?;
+    write(&*fs, &folder, &dict, None, SyncMode::Normal)?;
 
-    assert_eq!(read_one(&*fs, &folder, dict.id())?.raw(), dict.raw());
+    assert_eq!(read_one(&*fs, &folder, dict.id(), None)?.raw(), dict.raw());
     Ok(())
 }
 
@@ -71,7 +111,7 @@ fn rewriting_a_held_dictionary_still_syncs_its_directory() -> crate::Result<()> 
     let dict = ZstdDictionary::new(b"content whose registration is retried");
 
     let fs = FaultFs::new(StdFs);
-    write(&fs, &folder, &dict, SyncMode::Normal)?;
+    write(&fs, &folder, &dict, None, SyncMode::Normal)?;
 
     fs.injector().arm(
         FaultRule::new(
@@ -82,7 +122,7 @@ fn rewriting_a_held_dictionary_still_syncs_its_directory() -> crate::Result<()> 
     );
 
     assert!(
-        write(&fs, &folder, &dict, SyncMode::Normal).is_err(),
+        write(&fs, &folder, &dict, None, SyncMode::Normal).is_err(),
         "the retry must sync the directory, so the armed failure surfaces",
     );
     Ok(())
@@ -92,7 +132,7 @@ fn rewriting_a_held_dictionary_still_syncs_its_directory() -> crate::Result<()> 
 fn writing_a_different_dictionary_under_a_held_id_is_refused() -> crate::Result<()> {
     let (_dir, fs, folder) = store();
     let held = ZstdDictionary::new(b"the dictionary this id belongs to");
-    write(&*fs, &folder, &held, SyncMode::Normal)?;
+    write(&*fs, &folder, &held, None, SyncMode::Normal)?;
 
     // A DIFFERENT dictionary claiming the same id: what a collision of the
     // truncated 32-bit hash looks like from here. Treating the write as already
@@ -102,14 +142,14 @@ fn writing_a_different_dictionary_under_a_held_id_is_refused() -> crate::Result<
     let colliding = ZstdDictionary::new(b"entirely different content");
     let colliding = colliding.with_id_for_test(held.id());
 
-    let err = write(&*fs, &folder, &colliding, SyncMode::Normal).unwrap_err();
+    let err = write(&*fs, &folder, &colliding, None, SyncMode::Normal).unwrap_err();
     match err {
         crate::Error::ZstdDictMismatch { expected, .. } => assert_eq!(expected, held.id()),
         other => panic!("expected ZstdDictMismatch, got {other:?}"),
     }
 
     // The dictionary already there is untouched.
-    assert_eq!(read_one(&*fs, &folder, held.id())?.raw(), held.raw());
+    assert_eq!(read_one(&*fs, &folder, held.id(), None)?.raw(), held.raw());
     Ok(())
 }
 
@@ -117,7 +157,7 @@ fn writing_a_different_dictionary_under_a_held_id_is_refused() -> crate::Result<
 fn reading_a_dictionary_the_tree_does_not_hold_reports_not_found() {
     let (_dir, fs, folder) = store();
 
-    let err = read_one(&*fs, &folder, 12345).unwrap_err();
+    let err = read_one(&*fs, &folder, 12345, None).unwrap_err();
 
     // The caller distinguishes "never registered" from "corrupt", so this must
     // not surface as a mismatch.
@@ -131,7 +171,7 @@ fn reading_a_dictionary_the_tree_does_not_hold_reports_not_found() {
 fn a_flipped_bit_is_caught_because_the_name_is_the_digest() -> crate::Result<()> {
     let (_dir, fs, folder) = store();
     let dict = ZstdDictionary::new(b"content that will be corrupted on disk");
-    write(&*fs, &folder, &dict, SyncMode::Normal)?;
+    write(&*fs, &folder, &dict, None, SyncMode::Normal)?;
 
     // Corrupt one byte under the live name. A silently altered dictionary is
     // the worst failure this store can have: every block written against it
@@ -142,7 +182,7 @@ fn a_flipped_bit_is_caught_because_the_name_is_the_digest() -> crate::Result<()>
     *raw.first_mut().unwrap() ^= 0x01;
     std::fs::write(&path, &raw).unwrap();
 
-    let err = read_one(&*fs, &folder, dict.id()).unwrap_err();
+    let err = read_one(&*fs, &folder, dict.id(), None).unwrap_err();
     match err {
         crate::Error::ZstdDictMismatch { expected, got } => {
             assert_eq!(expected, dict.id());
@@ -157,7 +197,7 @@ fn a_flipped_bit_is_caught_because_the_name_is_the_digest() -> crate::Result<()>
 fn a_truncated_dictionary_is_caught_the_same_way() -> crate::Result<()> {
     let (_dir, fs, folder) = store();
     let dict = ZstdDictionary::new(b"content long enough to truncate");
-    write(&*fs, &folder, &dict, SyncMode::Normal)?;
+    write(&*fs, &folder, &dict, None, SyncMode::Normal)?;
 
     let path = folder.join(dict.id().to_string());
     let raw = std::fs::read(&path).unwrap();
@@ -165,7 +205,7 @@ fn a_truncated_dictionary_is_caught_the_same_way() -> crate::Result<()> {
     std::fs::write(&path, half).unwrap();
 
     assert!(matches!(
-        read_one(&*fs, &folder, dict.id()),
+        read_one(&*fs, &folder, dict.id(), None),
         Err(crate::Error::ZstdDictMismatch { .. }),
     ));
     Ok(())
@@ -176,10 +216,10 @@ fn the_scan_loads_every_dictionary_the_folder_holds() -> crate::Result<()> {
     let (_dir, fs, folder) = store();
     let a = ZstdDictionary::new(b"aaaaaaaaaaaaaaaaaaaa");
     let b = ZstdDictionary::new(b"bbbbbbbbbbbbbbbbbbbb");
-    write(&*fs, &folder, &a, SyncMode::Normal)?;
-    write(&*fs, &folder, &b, SyncMode::Normal)?;
+    write(&*fs, &folder, &a, None, SyncMode::Normal)?;
+    write(&*fs, &folder, &b, None, SyncMode::Normal)?;
 
-    let set = read_all(&*fs, &folder)?;
+    let set = read_all(&*fs, &folder, None)?;
 
     assert_eq!(set.len(), 2);
     assert_eq!(
@@ -196,10 +236,10 @@ fn the_scan_loads_every_dictionary_the_folder_holds() -> crate::Result<()> {
 #[test]
 fn the_scan_of_an_empty_folder_is_an_empty_set() -> crate::Result<()> {
     let (_dir, fs, folder) = store();
-    assert!(read_all(&*fs, &folder)?.is_empty());
+    assert!(read_all(&*fs, &folder, None)?.is_empty());
 
     fs.create_dir_all(&folder)?;
-    assert!(read_all(&*fs, &folder)?.is_empty());
+    assert!(read_all(&*fs, &folder, None)?.is_empty());
     Ok(())
 }
 
@@ -208,8 +248,8 @@ fn the_scan_fails_on_a_corrupt_dictionary_rather_than_skipping_it() -> crate::Re
     let (_dir, fs, folder) = store();
     let good = ZstdDictionary::new(b"aaaaaaaaaaaaaaaaaaaa");
     let bad = ZstdDictionary::new(b"bbbbbbbbbbbbbbbbbbbb");
-    write(&*fs, &folder, &good, SyncMode::Normal)?;
-    write(&*fs, &folder, &bad, SyncMode::Normal)?;
+    write(&*fs, &folder, &good, None, SyncMode::Normal)?;
+    write(&*fs, &folder, &bad, None, SyncMode::Normal)?;
 
     let path = folder.join(bad.id().to_string());
     let mut raw = std::fs::read(&path).unwrap();
@@ -218,7 +258,7 @@ fn the_scan_fails_on_a_corrupt_dictionary_rather_than_skipping_it() -> crate::Re
 
     // Skipping it would turn a detectable corruption into "unknown dictionary
     // id" on the first table that needs it, far from the cause.
-    assert!(read_all(&*fs, &folder).is_err());
+    assert!(read_all(&*fs, &folder, None).is_err());
     Ok(())
 }
 
@@ -226,11 +266,11 @@ fn the_scan_fails_on_a_corrupt_dictionary_rather_than_skipping_it() -> crate::Re
 fn the_scan_ignores_files_the_engine_does_not_own() -> crate::Result<()> {
     let (_dir, fs, folder) = store();
     let dict = ZstdDictionary::new(b"content");
-    write(&*fs, &folder, &dict, SyncMode::Normal)?;
+    write(&*fs, &folder, &dict, None, SyncMode::Normal)?;
     std::fs::write(folder.join("notes.txt"), b"mine").unwrap();
     std::fs::write(folder.join("7.tmp"), b"unpublished").unwrap();
 
-    let set = read_all(&*fs, &folder)?;
+    let set = read_all(&*fs, &folder, None)?;
 
     assert_eq!(set.len(), 1, "only the published dictionary is loaded");
     assert!(set.get(dict.id()).is_some());
@@ -242,13 +282,13 @@ fn removing_a_dictionary_leaves_the_others() -> crate::Result<()> {
     let (_dir, fs, folder) = store();
     let a = ZstdDictionary::new(b"aaaaaaaaaaaaaaaaaaaa");
     let b = ZstdDictionary::new(b"bbbbbbbbbbbbbbbbbbbb");
-    write(&*fs, &folder, &a, SyncMode::Normal)?;
-    write(&*fs, &folder, &b, SyncMode::Normal)?;
+    write(&*fs, &folder, &a, None, SyncMode::Normal)?;
+    write(&*fs, &folder, &b, None, SyncMode::Normal)?;
 
     remove(&*fs, &folder, a.id(), SyncMode::Normal)?;
 
-    assert!(read_one(&*fs, &folder, a.id()).is_err());
-    assert_eq!(read_one(&*fs, &folder, b.id())?.raw(), b.raw());
+    assert!(read_one(&*fs, &folder, a.id(), None).is_err());
+    assert_eq!(read_one(&*fs, &folder, b.id(), None)?.raw(), b.raw());
     Ok(())
 }
 
@@ -265,7 +305,7 @@ fn removing_an_absent_dictionary_succeeds() -> crate::Result<()> {
 fn the_sweep_takes_temps_and_leaves_everything_else() -> crate::Result<()> {
     let (_dir, fs, folder) = store();
     let dict = ZstdDictionary::new(b"content");
-    write(&*fs, &folder, &dict, SyncMode::Normal)?;
+    write(&*fs, &folder, &dict, None, SyncMode::Normal)?;
 
     // A crashed registration leaves this behind.
     let temp = folder.join(format!("{}{DICT_TMP_SUFFIX}", 777));
@@ -279,7 +319,7 @@ fn the_sweep_takes_temps_and_leaves_everything_else() -> crate::Result<()> {
     assert!(!fs.exists(&temp)?, "the unpublished temp is disposable");
     assert!(fs.exists(&foreign)?, "a foreign name is never swept");
     assert_eq!(
-        read_one(&*fs, &folder, dict.id())?.raw(),
+        read_one(&*fs, &folder, dict.id(), None)?.raw(),
         dict.raw(),
         "a published dictionary survives the sweep",
     );

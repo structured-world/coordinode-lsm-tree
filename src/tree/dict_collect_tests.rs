@@ -1,10 +1,11 @@
 // SPDX-License-Identifier: Apache-2.0
 // Copyright (c) 2026-present, Dmitry Prudnikov
 
-//! Dictionary collection against the deletion pause.
+//! Dictionary registration and collection cases that need crate internals: the
+//! deletion pause, and a manifest written directly.
 //!
 //! Lives in the crate rather than beside the other dictionary integration
-//! tests because the pause is not part of the public surface.
+//! tests because neither is part of the public surface.
 
 use crate::compression::ZstdDictionary;
 use crate::config::CompressionPolicy;
@@ -194,6 +195,69 @@ fn a_dictionary_registered_during_a_pause_survives_it() -> crate::Result<()> {
     assert!(
         reopened.zstd_dictionaries().get(dict_id).is_some(),
         "the registration survives a reopen, not just the live set",
+    );
+    Ok(())
+}
+
+/// A version recovered from a manifest that does not register a dictionary its
+/// tables are compressed against still owes that dictionary.
+///
+/// That is the shape of a manifest written before the tree stored its
+/// dictionaries, and of one where a crash lost the edit registering a file that
+/// had already been published. The tables still resolve, since the open scans
+/// the folder, but a checkpoint carries only what the version registers.
+#[test]
+fn a_recovered_version_registers_what_its_files_reference() -> crate::Result<()> {
+    let dir = tempfile::tempdir()?;
+    let target = tempfile::tempdir()?;
+    let checkpoint = target.path().join("snapshot");
+    let dict = ZstdDictionary::new(&training_corpus());
+    let dict_id = dict.id();
+    let compression = CompressionType::zstd_dict(3, dict_id)?;
+
+    {
+        let tree = config(dir.path())
+            .data_block_compression_policy(CompressionPolicy::all(compression))
+            .zstd_dictionary(Some(Arc::new(dict)))
+            .open()?;
+        for i in 0u32..100 {
+            tree.insert(
+                format!("key-{i:05}").as_bytes(),
+                b"value-under-the-dictionary",
+                u64::from(i),
+            );
+        }
+        tree.flush_active_memtable(0)?;
+        let crate::AnyTree::Standard(tree) = tree else {
+            panic!("a standard tree");
+        };
+
+        // The tables name the id; the manifest from here on does not.
+        let unregistered = tree.current_version().without_dicts(&[dict_id]);
+        crate::version::persist_version(
+            dir.path(),
+            &unregistered,
+            tree.config.comparator.name(),
+            &*tree.config.fs,
+            tree.runtime_config.load_full(),
+            tree.config.encryption.clone(),
+            tree.config.sync_mode,
+        )?;
+    }
+
+    // Nothing supplied and a plain write policy, so no registration at open
+    // puts the id back: only the recovery can.
+    let tree = config(dir.path())
+        .data_block_compression_policy(CompressionPolicy::all(CompressionType::None))
+        .open()?;
+    tree.create_checkpoint(&checkpoint)?;
+    drop(tree);
+
+    let restored = config(&checkpoint).open()?;
+    assert_eq!(
+        restored.get(b"key-00042", crate::MAX_SEQNO)?.as_deref(),
+        Some(b"value-under-the-dictionary".as_slice()),
+        "the checkpoint carries the dictionary its tables are compressed against",
     );
     Ok(())
 }

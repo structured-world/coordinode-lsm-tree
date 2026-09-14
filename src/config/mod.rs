@@ -1035,7 +1035,7 @@ impl Config {
         // crashed one is swept rather than left to linger.
         crate::dicts::sweep_temps(&*self.fs, &folder)?;
 
-        let mut dicts = crate::dicts::read_all(&*self.fs, &folder)?;
+        let mut dicts = crate::dicts::read_all(&*self.fs, &folder, self.encryption.as_deref())?;
         if let Some(supplied) = self.zstd_dictionary.clone() {
             dicts = dicts.with(supplied);
         }
@@ -1745,7 +1745,9 @@ impl Config {
     ///
     /// When set, all blocks written to SST files are encrypted after
     /// compression and before checksumming, using the provided
-    /// [`EncryptionProvider`].
+    /// [`EncryptionProvider`]. The compression dictionaries the tree stores
+    /// are sealed with it too, since a dictionary keeps literal stretches of
+    /// the records it was trained on.
     ///
     /// The caller is responsible for key management and rotation.
     /// See `crate::Aes256GcmProvider` (behind the `encryption` feature)

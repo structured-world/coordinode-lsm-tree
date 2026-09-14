@@ -387,6 +387,25 @@ impl Version {
         self.with_id_and_dicts(self.id + 1, dicts)
     }
 
+    /// The next version with every table and blob file gone, still registering
+    /// the ids in `still_written` it held.
+    ///
+    /// Nothing is left to read, so the only dictionaries still owed are the
+    /// ones the next write compresses against. Dropping those as well would
+    /// leave the tables written after this naming an id the version does not
+    /// register, and a checkpoint, which carries only what is registered, would
+    /// copy them without it.
+    #[must_use]
+    pub(crate) fn cleared(&self, still_written: &[crate::file::DictId]) -> Self {
+        let dicts = self
+            .dicts
+            .iter()
+            .copied()
+            .filter(|id| still_written.contains(id))
+            .collect();
+        Self::new(self.id + 1, self.tree_type).with_dicts(dicts)
+    }
+
     /// This version with `dicts` in place of its own list, under the SAME id.
     ///
     /// For a version that is being rebuilt rather than installed: manifest
@@ -524,9 +543,17 @@ impl Version {
         )
         .with_retention_floor(recovery.retention_floor);
 
-        // The recovered set is what the manifest recorded, so it is adopted
-        // whole rather than folded in one id at a time.
-        Ok(recovered.with_dicts(recovery.dicts))
+        // What the manifest recorded, plus every id the recovered files name.
+        // The two agree once every registration has landed; they part on a
+        // manifest written before the tree stored its dictionaries, and after a
+        // crash lost the edit registering a file already published. The files
+        // are what a reader and a checkpoint need, and every id they name
+        // resolved at the open or the table would have refused it.
+        let mut dicts = recovery.dicts;
+        dicts.extend(recovered.referenced_dicts());
+        dicts.sort_unstable();
+        dicts.dedup();
+        Ok(recovered.with_dicts(dicts))
     }
 
     /// Creates a new pre-populated version.

@@ -697,6 +697,11 @@ impl AbstractTree for Tree {
         // garbage the moment the new empty version is installed.
         let prior = versions.latest_version();
 
+        #[cfg(zstd_any)]
+        let still_written = self.config.write_referenced_dict_ids();
+        #[cfg(not(zstd_any))]
+        let still_written: Vec<crate::file::DictId> = Vec::new();
+
         versions.upgrade_version(
             &config.path,
             |v| {
@@ -706,7 +711,7 @@ impl AbstractTree for Tree {
                     self.config.comparator.clone(),
                 ));
                 copy.sealed_memtables = Arc::default();
-                copy.version = Version::new(v.version.id() + 1, self.tree_type());
+                copy.version = v.version.cleared(&still_written);
                 Ok(copy)
             },
             &config.seqno,
@@ -1878,7 +1883,13 @@ impl Tree {
         let mut version_lock = self.version_history.write();
 
         let folder = self.config.path.join(crate::file::DICTS_FOLDER);
-        crate::dicts::write(&*self.config.fs, &folder, &dict, self.config.sync_mode)?;
+        crate::dicts::write(
+            &*self.config.fs,
+            &folder,
+            &dict,
+            self.config.encryption.as_deref(),
+            self.config.sync_mode,
+        )?;
 
         // Resolvable from this moment on rather than from the next open: the
         // tables this registration was made for are written right after it, and

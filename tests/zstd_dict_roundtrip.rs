@@ -258,6 +258,60 @@ mod zstd_dict {
     }
 
     #[test]
+    #[cfg(feature = "encryption")]
+    fn an_encrypted_tree_stores_its_dictionary_encrypted() -> lsm_tree::Result<()> {
+        // A dictionary keeps literal substrings of the records it was trained
+        // on. On a tree whose tables are encrypted, a plaintext copy of it
+        // beside them would hand those records to anyone who can read the
+        // directory, key or no key.
+        use lsm_tree::Aes256GcmProvider;
+
+        let dir = tempfile::tempdir()?;
+        let dict = make_test_dictionary();
+        let dict_id = dict.id();
+        let raw = dict.raw().to_vec();
+        let compression = CompressionType::zstd_dict(3, dict_id)?;
+        let key = [0x42; 32];
+
+        {
+            let tree = make_config(dir.path())
+                .data_block_compression_policy(CompressionPolicy::all(compression))
+                .zstd_dictionary(Some(Arc::new(dict)))
+                .with_encryption(Some(Arc::new(Aes256GcmProvider::new(&key))))
+                .open()?;
+            for i in 0u32..100 {
+                let key = format!("key-{i:05}");
+                let val = format!("value-{i:05}-padding-to-make-it-longer");
+                tree.insert(key.as_bytes(), val.as_bytes(), i.into());
+            }
+            tree.flush_active_memtable(0)?;
+        }
+
+        let stored = std::fs::read(dir.path().join("dicts").join(dict_id.to_string()))?;
+        // Probes spread across the whole dictionary, not just its head.
+        let leaked = raw
+            .chunks_exact(32)
+            .step_by(16)
+            .any(|probe| stored.windows(probe.len()).any(|w| w == probe));
+        assert!(
+            !leaked,
+            "no stretch of the dictionary appears on disk in the clear"
+        );
+
+        // Still the tree's own: a reopen with the key and nothing else supplied
+        // resolves the tables through the stored copy.
+        let reopened = make_config(dir.path())
+            .data_block_compression_policy(CompressionPolicy::all(compression))
+            .with_encryption(Some(Arc::new(Aes256GcmProvider::new(&key))))
+            .open()?;
+        assert_eq!(
+            reopened.get(b"key-00042", lsm_tree::MAX_SEQNO)?.as_deref(),
+            Some(b"value-00042-padding-to-make-it-longer".as_slice()),
+        );
+        Ok(())
+    }
+
+    #[test]
     fn zstd_dict_survives_major_compaction() -> lsm_tree::Result<()> {
         // Verifies that dictionary-compressed data is correctly preserved through
         // the full compaction cycle: three L0 SSTs are flushed, then major_compact
@@ -1287,6 +1341,52 @@ mod zstd_dict {
                 Some(b"value-written-under-the-dictionary".as_slice()),
             );
         }
+        Ok(())
+    }
+
+    #[test]
+    fn a_dictionary_written_against_after_a_clear_travels_into_a_checkpoint() -> lsm_tree::Result<()>
+    {
+        // A clear leaves no files, but the write policy still names its
+        // dictionary, and the flush right after it compresses against that id.
+        // A clear that dropped the registration would leave those tables naming
+        // an id the version does not register, and a checkpoint carries only
+        // what the version registers: it would copy the tables and not the
+        // dictionary they need.
+        let dir = tempfile::tempdir()?;
+        let target = tempfile::tempdir()?;
+        let checkpoint = target.path().join("snapshot");
+        let dict = make_test_dictionary();
+        let dict_id = dict.id();
+        let compression = CompressionType::zstd_dict(3, dict_id)?;
+
+        {
+            let tree = make_config(dir.path())
+                .data_block_compression_policy(CompressionPolicy::all(compression))
+                .zstd_dictionary(Some(Arc::new(dict)))
+                .open()?;
+            tree.insert(b"before-the-clear", b"gone", 0);
+            tree.flush_active_memtable(0)?;
+            tree.clear()?;
+
+            for i in 0u32..100 {
+                let key = format!("key-{i:05}");
+                let val = format!("value-{i:05}-padding-to-make-it-longer");
+                tree.insert(key.as_bytes(), val.as_bytes(), (i + 10).into());
+            }
+            tree.flush_active_memtable(0)?;
+            tree.create_checkpoint(&checkpoint)?;
+        }
+
+        assert!(
+            checkpoint.join("dicts").join(dict_id.to_string()).exists(),
+            "the dictionary the post-clear tables are written against is carried",
+        );
+        let restored = make_config(&checkpoint).open()?;
+        assert_eq!(
+            restored.get(b"key-00042", lsm_tree::MAX_SEQNO)?.as_deref(),
+            Some(b"value-00042-padding-to-make-it-longer".as_slice()),
+        );
         Ok(())
     }
 

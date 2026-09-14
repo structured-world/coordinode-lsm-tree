@@ -6249,7 +6249,13 @@ fn publish_repaired_manifest(
         let folder = config.path.join(crate::file::DICTS_FOLDER);
         for id in &ids {
             if let Some(dict) = held.get(*id) {
-                crate::dicts::write(&*config.fs, &folder, dict, config.sync_mode)?;
+                crate::dicts::write(
+                    &*config.fs,
+                    &folder,
+                    dict,
+                    config.encryption.as_deref(),
+                    config.sync_mode,
+                )?;
             }
         }
 
