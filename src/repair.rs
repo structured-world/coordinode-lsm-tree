@@ -1551,7 +1551,7 @@ fn try_salvage_table(
     // Salvage under the tree's configured comparator + crypto/dictionary context
     // so the rewritten SST opens, orders, and decrypts / decompresses consistently
     // with the rest of the tree on reopen (the reopen below uses the same
-    // `config.encryption` / `config.zstd_dictionary`).
+    // `config.encryption` and the same dictionary set).
     let report = crate::salvage::salvage_with_context(
         source,
         table_path.to_path_buf(),

@@ -38,12 +38,16 @@ pub struct SalvageOptions {
     /// Encryption provider matching the source's at-rest encryption, or `None`
     /// for an unencrypted source.
     pub encryption: Option<Arc<dyn EncryptionProvider>>,
-    /// zstd dictionary the RECOVERED copy is written against, or `None` to
-    /// rewrite without one.
+    /// zstd dictionary the SOURCE was written against, or `None` when the
+    /// source uses none or [`Self::zstd_dictionaries`] already holds it.
     ///
-    /// One, because a block is compressed against exactly one dictionary. It is
-    /// also joined into the read set below, so a standalone salvage that knows
-    /// only the source's dictionary can keep passing just this.
+    /// A fallback for a standalone salvage that knows only one generation: it
+    /// is joined into the read set, and answers the write side only when it
+    /// has the id the source names. It never chooses the copy's compression:
+    /// the copy mirrors the source's descriptor, so it is written against the
+    /// source's own dictionary, and a dictionary with another id is refused
+    /// with [`Error::ZstdDictMismatch`](crate::Error::ZstdDictMismatch) when
+    /// the set does not hold the source's.
     #[cfg(zstd_any)]
     pub zstd_dictionary: Option<Arc<crate::compression::ZstdDictionary>>,
     /// Every dictionary the SOURCE may have been written against.
@@ -895,10 +899,10 @@ fn salvage_attempt(
         params.encryption.clone_from(&options.encryption);
         #[cfg(zstd_any)]
         {
-            // The read set, plus the write dictionary: a standalone salvage
-            // knows only the one its source used and passes just that, while a
-            // repair passes the tree's whole set (the source may predate the
-            // dictionary new blocks are written against).
+            // The read set, plus the single-dictionary fallback: a standalone
+            // salvage knows only the one its source used and passes just that,
+            // while a repair passes the tree's whole set (the source may predate
+            // the dictionary new blocks are written against).
             let mut dicts = options.zstd_dictionaries.clone();
             if let Some(dict) = options.zstd_dictionary.clone() {
                 dicts = dicts.with(dict);
@@ -1022,9 +1026,9 @@ fn salvage_attempt(
 
     // The recovered copy is written under the SAME layout as the source —
     // compression, ECC, restart interval, columnar (+ zone map), per-KV
-    // checksums (`mirror_from`) — plus the caller's encryption provider and zstd
-    // dictionary, so a columnar / encrypted / dictionary source salvages into a
-    // faithful copy that reopens under the live tree's `Config` instead of a
+    // checksums (`mirror_from`) — plus the caller's encryption provider and the
+    // source's own zstd dictionary, so a columnar / encrypted / dictionary source
+    // salvages into a faithful copy that reopens under the live tree's `Config` instead of a
     // degraded row-major / plaintext mismatch.
     // The recovered copy is stamped with the SOURCE's stored table id (its
     // identity), not the caller's open/AAD context id: an unencrypted
@@ -1111,7 +1115,9 @@ fn salvage_attempt(
                 }
             }
         }
-        _ => options.zstd_dictionary.clone(),
+        // A source without a dictionary is copied without one: the mirrored
+        // descriptor names none, and index blocks never carry one.
+        _ => None,
     });
 
     let walk = match salvage_blocks(
@@ -2942,10 +2948,11 @@ pub(crate) fn blob_key_regresses(
 /// descriptor: each surviving value is decompressed (validating the payload)
 /// and re-emitted through the writer under the same codec, so LZ4 and Zstd
 /// sources salvage in full. A dictionary-compressed source additionally needs
-/// its dictionary via `zstd_dictionary` — without it the values cannot be
-/// decoded, and the salvage is rejected with [`Error::FeatureUnsupported`]
-/// rather than guessing (the repair caller passes the tree's configured
-/// dictionary automatically).
+/// the dictionary its descriptor names via `zstd_dictionary`, and the recovered
+/// file is written against that same one. Without it, or with a dictionary of
+/// another id, the values cannot be decoded and the salvage is rejected with
+/// [`Error::ZstdDictMismatch`] rather than guessing (the repair caller resolves
+/// the source's id against the tree's dictionaries and passes that one).
 ///
 /// The salvaged file is written COMPACTED: after the first dropped record,
 /// every later record lands at a new offset, so it is **not a drop-in
@@ -2961,7 +2968,7 @@ pub(crate) fn blob_key_regresses(
 /// Records below the frontier are dead by definition (their relocated copies
 /// live elsewhere), so skipping them loses nothing.
 ///
-/// [`Error::FeatureUnsupported`]: crate::Error::FeatureUnsupported
+/// [`Error::ZstdDictMismatch`]: crate::Error::ZstdDictMismatch
 ///
 /// # Errors
 ///
@@ -2989,7 +2996,7 @@ pub fn salvage_blob_file(
     // with the same compression — never copied through verbatim under a
     // mismatched descriptor. A DICTIONARY-compressed source decodes only when
     // the caller supplies the matching dictionary (manifest repair passes the
-    // tree's configured one); without it this entry fails closed, the same
+    // one the source's descriptor names); without it this entry fails closed, the same
     // way SST salvage fails closed on range tombstones.
     //
     // A placeholder checksum is passed on purpose: `recover_blob_file` only STORES
