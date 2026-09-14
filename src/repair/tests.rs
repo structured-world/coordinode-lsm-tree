@@ -7279,7 +7279,17 @@ fn validate_frames(
         #[cfg(zstd_any)]
         &config.current_zstd_dictionaries(),
     )?;
-    super::validate_blob_frames(config, path, blob_id, live_data_start, &handle)
+    #[cfg(zstd_any)]
+    let dict = super::blob_file_dictionary(config, handle.compression())?;
+    super::validate_blob_frames(
+        config,
+        path,
+        blob_id,
+        live_data_start,
+        &handle,
+        #[cfg(zstd_any)]
+        dict.as_ref(),
+    )
 }
 
 fn blob_validation_config(memfs: std::sync::Arc<crate::fs::MemFs>) -> crate::Config {

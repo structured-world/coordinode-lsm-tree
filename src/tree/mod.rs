@@ -4244,32 +4244,6 @@ impl Tree {
             crate::config::acquire_directory_lock(&*config.fs, &config.path, config.directory_lock)?
         };
 
-        // Load the tree's own dictionaries before anything opens a table: a
-        // table resolves the dictionary id it recorded against this set, so an
-        // empty one fails every dictionary-compressed table in the tree. Under
-        // the directory lock, since it reads the tree's own folder, and before
-        // the recover / create split, because a freshly created tree writes
-        // dictionary-compressed tables too.
-        //
-        // A dictionary supplied through the config joins them, which is what
-        // keeps `Config::dict` working: on the first open it is the only one
-        // there, and it is registered at the end of this function so later
-        // opens need no config at all.
-        //
-        // Under the lock for a second reason: the load SWEEPS unpublished
-        // `.tmp` registrations. Doing that before the lock lets an opener that
-        // is about to fail with `Locked` delete a live owner's in-flight
-        // registration between its write and its rename.
-        #[cfg(zstd_any)]
-        config.install_own_zstd_dictionaries()?;
-
-        // Only now can the compression policy be checked: it names a dictionary
-        // by id, and the tree may hold that id without the caller supplying the
-        // bytes again. Validating before the load would refuse exactly the
-        // reopen the tree owning its dictionaries exists to allow.
-        #[cfg(zstd_any)]
-        config.validate_zstd_dictionary()?;
-
         // Check for old version
         if config.fs.exists(&config.path.join("version"))? {
             log::error!(
@@ -4301,54 +4275,90 @@ impl Tree {
         // Decide between recovery and fresh creation atomically by attempting
         // to read the CURRENT version file. This avoids a TOCTOU race that
         // would occur if we probed with exists() first.
-        let tree = match crate::version::recovery::get_current_version(
+        let recovering = match crate::version::recovery::get_current_version(
             &config.path,
             &*config.fs,
             config.encryption.clone(),
         ) {
-            Ok(_) => Self::recover(
+            Ok(_) => true,
+            Err(crate::Error::Io(e)) if e.kind() == crate::io::ErrorKind::NotFound => false,
+            Err(e) => return Err(e),
+        };
+
+        // Load the tree's own dictionaries before anything opens a table: a
+        // table resolves the dictionary id it recorded against this set, so an
+        // empty one fails every dictionary-compressed table in the tree. Before
+        // the recover / create split, because a freshly created tree writes
+        // dictionary-compressed tables too.
+        //
+        // AFTER the probe above, which verified the manifest under the
+        // configured provider. A dictionary file carries no header saying it is
+        // sealed, so without the key an encrypted one reads as bytes that fail
+        // their hash, which is how a damaged one reads, and a damaged one is
+        // what `open_or_repair` repairs. The probe fails a wrong or missing key
+        // first, as the configuration error it is.
+        //
+        // A dictionary supplied through the config joins them, which is what
+        // keeps `Config::dict` working: on the first open it is the only one
+        // there, and it is registered at the end of this function so later
+        // opens need no config at all.
+        //
+        // Under the directory lock, since it reads the tree's own folder and
+        // SWEEPS unpublished `.tmp` registrations: doing that before the lock
+        // lets an opener that is about to fail with `Locked` delete a live
+        // owner's in-flight registration between its write and its rename.
+        #[cfg(zstd_any)]
+        config.install_own_zstd_dictionaries()?;
+
+        // Only now can the compression policy be checked: it names a dictionary
+        // by id, and the tree may hold that id without the caller supplying the
+        // bytes again. Validating before the load would refuse exactly the
+        // reopen the tree owning its dictionaries exists to allow.
+        #[cfg(zstd_any)]
+        config.validate_zstd_dictionary()?;
+
+        let tree = if recovering {
+            Self::recover(
                 config,
                 #[cfg(feature = "std")]
                 directory_lock,
-            ),
-            Err(crate::Error::Io(e)) if e.kind() == crate::io::ErrorKind::NotFound => {
-                // Missing CURRENT MUST coincide with a directory that
-                // has no version artifacts; otherwise we are looking at
-                // a half-written checkpoint (or other interrupted
-                // sealing). Silently calling `create_new` in that case
-                // would overwrite the partial state with an empty tree,
-                // turning a recoverable failure into data loss.
-                if has_existing_version_state(&config.path, &*config.fs)? {
-                    // Return Error::Io(InvalidData, ...) rather than
-                    // Error::Unrecoverable so callers that don't read
-                    // logs still get a programmatic surface with the
-                    // path and remediation hint embedded. `log::error!`
-                    // stays for human ops who DO watch logs and want
-                    // the full context at the moment of failure (the
-                    // structured error is what propagates up the call
-                    // chain; the log line records the diagnosis next
-                    // to the timestamp).
-                    let msg = format!(
-                        "Tree::open: refusing to recover {} — `current` pointer is missing \
-                         but the directory still holds version artifacts (tables/, blobs/, \
-                         or vN). This is the on-disk signature of a half-written checkpoint \
-                         or interrupted sealing. Remove the partial directory and retry the \
-                         checkpoint, or restore `current` from a backup before reopening.",
-                        config.path.display(),
-                    );
-                    log::error!("{msg}");
-                    return Err(crate::Error::from(crate::io::Error::new(
-                        crate::io::ErrorKind::InvalidData,
-                        msg,
-                    )));
-                }
-                Self::create_new(
-                    config,
-                    #[cfg(feature = "std")]
-                    directory_lock,
-                )
+            )
+        } else {
+            // Missing CURRENT MUST coincide with a directory that
+            // has no version artifacts; otherwise we are looking at
+            // a half-written checkpoint (or other interrupted
+            // sealing). Silently calling `create_new` in that case
+            // would overwrite the partial state with an empty tree,
+            // turning a recoverable failure into data loss.
+            if has_existing_version_state(&config.path, &*config.fs)? {
+                // Return Error::Io(InvalidData, ...) rather than
+                // Error::Unrecoverable so callers that don't read
+                // logs still get a programmatic surface with the
+                // path and remediation hint embedded. `log::error!`
+                // stays for human ops who DO watch logs and want
+                // the full context at the moment of failure (the
+                // structured error is what propagates up the call
+                // chain; the log line records the diagnosis next
+                // to the timestamp).
+                let msg = format!(
+                    "Tree::open: refusing to recover {} — `current` pointer is missing \
+                     but the directory still holds version artifacts (tables/, blobs/, \
+                     or vN). This is the on-disk signature of a half-written checkpoint \
+                     or interrupted sealing. Remove the partial directory and retry the \
+                     checkpoint, or restore `current` from a backup before reopening.",
+                    config.path.display(),
+                );
+                log::error!("{msg}");
+                return Err(crate::Error::from(crate::io::Error::new(
+                    crate::io::ErrorKind::InvalidData,
+                    msg,
+                )));
             }
-            Err(e) => Err(e),
+            Self::create_new(
+                config,
+                #[cfg(feature = "std")]
+                directory_lock,
+            )
         }?;
 
         // A dictionary supplied through the config becomes the tree's, so the

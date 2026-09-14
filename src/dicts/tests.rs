@@ -253,11 +253,11 @@ fn a_flipped_bit_is_caught_because_the_name_is_the_digest() -> crate::Result<()>
 
     let err = read_one(&*fs, &folder, dict.id(), None).unwrap_err();
     match err {
-        crate::Error::ZstdDictMismatch { expected, got } => {
-            assert_eq!(expected, dict.id());
-            assert_ne!(got, Some(dict.id()), "the corrupted bytes hash elsewhere");
+        crate::Error::ZstdDictCorrupt { id, got } => {
+            assert_eq!(id, dict.id());
+            assert_ne!(got, dict.id(), "the corrupted bytes hash elsewhere");
         }
-        other => panic!("expected ZstdDictMismatch, got {other:?}"),
+        other => panic!("expected ZstdDictCorrupt, got {other:?}"),
     }
     Ok(())
 }
@@ -275,7 +275,7 @@ fn a_truncated_dictionary_is_caught_the_same_way() -> crate::Result<()> {
 
     assert!(matches!(
         read_one(&*fs, &folder, dict.id(), None),
-        Err(crate::Error::ZstdDictMismatch { .. }),
+        Err(crate::Error::ZstdDictCorrupt { .. }),
     ));
     Ok(())
 }

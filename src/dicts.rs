@@ -155,7 +155,7 @@ fn sync_entries(fs: &dyn Fs, folder: &Path, sync_mode: SyncMode) -> crate::Resul
 ///
 /// # Errors
 ///
-/// [`crate::Error::ZstdDictMismatch`] when the bytes on disk do not hash to the
+/// [`crate::Error::ZstdDictCorrupt`] when the bytes on disk do not hash to the
 /// id they are filed under, which is this store's integrity check.
 /// [`crate::Error::Decrypt`] when the file does not open under `encryption`.
 /// Otherwise propagates the open / read failures of the backend, including
@@ -177,10 +177,7 @@ pub fn read_one(
     if dict.id() != id {
         // The name IS the digest, so a mismatch is corruption of the bytes (or
         // a file placed under a name it does not own), never a stale name.
-        return Err(crate::Error::ZstdDictMismatch {
-            expected: id,
-            got: Some(dict.id()),
-        });
+        return Err(crate::Error::ZstdDictCorrupt { id, got: dict.id() });
     }
     Ok(dict)
 }
@@ -217,10 +214,9 @@ pub fn read_all(
 }
 
 /// Whether `err` is [`read_one`]'s integrity failure for `id`: the file filed
-/// under `id` holds bytes that hash elsewhere. That shape, a mismatch naming
-/// both ids, is the integrity check and nothing else.
+/// under `id` holds bytes that hash elsewhere.
 fn is_damage(err: &crate::Error, id: DictId) -> bool {
-    matches!(err, crate::Error::ZstdDictMismatch { expected, got: Some(_) } if *expected == id)
+    matches!(err, crate::Error::ZstdDictCorrupt { id: filed, .. } if *filed == id)
 }
 
 /// Loads every intact dictionary the folder holds, skipping each one whose
