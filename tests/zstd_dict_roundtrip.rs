@@ -1400,6 +1400,7 @@ mod zstd_dict {
         let dir = tempfile::tempdir()?;
         let first = make_test_dictionary();
         let first_id = first.id();
+        let second_id;
 
         {
             let tree = make_config(dir.path())
@@ -1422,11 +1423,12 @@ mod zstd_dict {
                 samples.extend_from_slice(format!("other-{i:05}-sample").as_bytes());
             }
             let second = Arc::new(ZstdDictionary::new(&samples));
+            second_id = second.id();
             let lsm_tree::AnyTree::Standard(standard) = &tree else {
                 panic!("a standard tree");
             };
             standard.register_zstd_dictionary(Arc::clone(&second))?;
-            assert!(standard.zstd_dictionaries().get(second.id()).is_some());
+            assert!(standard.zstd_dictionaries().get(second_id).is_some());
         }
 
         // The registrations are durable: a reopen that supplies nothing resolves
@@ -1437,6 +1439,25 @@ mod zstd_dict {
         assert_eq!(
             reopened.get(b"key-00042", lsm_tree::MAX_SEQNO)?.as_deref(),
             Some(b"value-00042-padding-to-make-it-longer".as_slice()),
+        );
+
+        // And the second one is registered in the VERSION, not merely present
+        // in the folder, which the open scans either way. Nothing uses it, so
+        // a collection right after the reopen unregisters it, but the
+        // recovered version that still names it is retained and keeps the
+        // file. A registration that never reached the manifest would be
+        // unlinked by this very pass.
+        let lsm_tree::AnyTree::Standard(standard) = &reopened else {
+            panic!("a standard tree");
+        };
+        assert!(standard.zstd_dictionaries().get(second_id).is_some());
+        assert_eq!(standard.collect_unreferenced_dictionaries()?, 0);
+        assert!(
+            dir.path()
+                .join("dicts")
+                .join(second_id.to_string())
+                .exists(),
+            "the runtime registration survived the reopen",
         );
         Ok(())
     }

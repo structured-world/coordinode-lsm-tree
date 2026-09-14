@@ -36,7 +36,7 @@ fn an_encrypted_dictionary_is_sealed_on_disk_and_opens_only_under_its_key() -> c
 
     write(&*fs, &folder, &dict, Some(&key), SyncMode::Normal)?;
 
-    let on_disk = std::fs::read(folder.join(dict.id().to_string())).unwrap();
+    let on_disk = std::fs::read(folder.join(dict.id().to_string()))?;
     assert!(
         !on_disk.windows(dict.raw().len()).any(|w| w == dict.raw()),
         "the dictionary is not stored in the clear",
