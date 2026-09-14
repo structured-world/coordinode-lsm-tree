@@ -107,6 +107,13 @@ pub type DictId = u32;
 /// no version. Disposable.
 pub const DICT_TMP_SUFFIX: &str = ".tmp";
 
+/// Suffix a repair gives a dictionary file whose bytes no longer hash to its name.
+///
+/// Deliberately NOT one of the shapes [`DictDirEntry`] owns: it classifies as
+/// [`DictDirEntry::Foreign`], so no open reads it and no sweep removes it, and
+/// the damaged bytes stay where an operator can find them.
+pub const DICT_DAMAGED_SUFFIX: &str = ".damaged";
+
 /// What a directory entry in a `dicts/` folder IS: the dictionary half of the
 /// naming grammar, exactly as [`BlobDirEntry`] is the blob half.
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]

@@ -1344,6 +1344,138 @@ mod zstd_dict {
         Ok(())
     }
 
+    /// Registers `dict` through the config's write slot while the tables are
+    /// written without it, so the tree owns a dictionary no file references.
+    fn a_tree_holding_an_unused_dictionary(
+        dir: &std::path::Path,
+        dict: ZstdDictionary,
+    ) -> lsm_tree::Result<()> {
+        let tree = make_config(dir)
+            .zstd_dictionary(Some(Arc::new(dict)))
+            .open()?;
+        for i in 0u32..100 {
+            let key = format!("key-{i:05}");
+            tree.insert(key.as_bytes(), b"written-without-a-dictionary", i.into());
+        }
+        tree.flush_active_memtable(0)?;
+        Ok(())
+    }
+
+    #[test]
+    fn a_repair_sets_aside_a_damaged_dictionary_nothing_needs() -> lsm_tree::Result<()> {
+        // A repair exists for the tree whose files are damaged. A damaged
+        // dictionary that no file references must not stop it before it has
+        // looked at a single table, and must not be left under its name either,
+        // or the open the repair was run for fails on the same file.
+        let dir = tempfile::tempdir()?;
+        let dict = make_test_dictionary();
+        let dict_id = dict.id();
+        a_tree_holding_an_unused_dictionary(dir.path(), dict)?;
+
+        let path = dir.path().join("dicts").join(dict_id.to_string());
+        let mut bytes = std::fs::read(&path)?;
+        if let Some(first) = bytes.first_mut() {
+            *first ^= 0x01;
+        }
+        std::fs::write(&path, &bytes)?;
+
+        let report = make_config(dir.path()).repair()?;
+        assert!(
+            !path.exists(),
+            "the damaged file is not left under its name"
+        );
+        let aside = dir.path().join("dicts").join(format!("{dict_id}.damaged"));
+        assert!(
+            aside.exists(),
+            "its bytes are kept beside it for an operator"
+        );
+        assert!(
+            report.damaged_dictionaries.iter().any(|(p, _)| *p == aside),
+            "and the report names where they went",
+        );
+
+        let tree = make_config(dir.path()).open()?;
+        assert_eq!(
+            tree.get(b"key-00042", lsm_tree::MAX_SEQNO)?.as_deref(),
+            Some(b"written-without-a-dictionary".as_slice()),
+        );
+        Ok(())
+    }
+
+    #[test]
+    fn a_repair_given_the_dictionary_rewrites_a_damaged_copy_tables_need() -> lsm_tree::Result<()> {
+        // The tables need the damaged dictionary, and the caller supplies an
+        // intact copy of it. The repair reads the tables through that copy and
+        // stores it under the id, which must replace the damaged bytes rather
+        // than be refused as a different dictionary claiming a held id.
+        let dir = tempfile::tempdir()?;
+        let dict = make_test_dictionary();
+        let dict_id = dict.id();
+        let compression = CompressionType::zstd_dict(3, dict_id)?;
+        {
+            let tree = make_config(dir.path())
+                .data_block_compression_policy(CompressionPolicy::all(compression))
+                .zstd_dictionary(Some(Arc::new(dict)))
+                .open()?;
+            for i in 0u32..100 {
+                let key = format!("key-{i:05}");
+                let val = format!("value-{i:05}-padding-to-make-it-longer");
+                tree.insert(key.as_bytes(), val.as_bytes(), i.into());
+            }
+            tree.flush_active_memtable(0)?;
+        }
+
+        let path = dir.path().join("dicts").join(dict_id.to_string());
+        let mut bytes = std::fs::read(&path)?;
+        if let Some(first) = bytes.first_mut() {
+            *first ^= 0x01;
+        }
+        std::fs::write(&path, &bytes)?;
+
+        let report = make_config(dir.path())
+            .zstd_dictionary(Some(Arc::new(make_test_dictionary())))
+            .repair()?;
+        assert!(
+            report.damaged_dictionaries.is_empty(),
+            "rewritten from the supplied copy, so nothing is left to set aside",
+        );
+
+        // The rewritten file is the tree's own again: nothing supplied.
+        let tree = make_config(dir.path()).open()?;
+        assert_eq!(
+            tree.get(b"key-00042", lsm_tree::MAX_SEQNO)?.as_deref(),
+            Some(b"value-00042-padding-to-make-it-longer".as_slice()),
+        );
+        Ok(())
+    }
+
+    #[test]
+    fn a_registered_dictionary_whose_file_is_gone_does_not_break_a_checkpoint()
+    -> lsm_tree::Result<()> {
+        // The manifest still registers a dictionary nothing uses, and its file
+        // is gone. The open succeeds, since no table needs it, and every
+        // checkpoint after it must too: it copies what the version registers.
+        let dir = tempfile::tempdir()?;
+        let target = tempfile::tempdir()?;
+        let checkpoint = target.path().join("snapshot");
+        let dict = make_test_dictionary();
+        let dict_id = dict.id();
+        a_tree_holding_an_unused_dictionary(dir.path(), dict)?;
+
+        std::fs::remove_file(dir.path().join("dicts").join(dict_id.to_string()))?;
+
+        let tree = make_config(dir.path()).open()?;
+        tree.create_checkpoint(&checkpoint)?;
+        drop(tree);
+
+        let restored = make_config(&checkpoint).open()?;
+        assert_eq!(
+            restored.get(b"key-00042", lsm_tree::MAX_SEQNO)?.as_deref(),
+            Some(b"written-without-a-dictionary".as_slice()),
+        );
+        Ok(())
+    }
+
     #[test]
     fn a_dictionary_written_against_after_a_clear_travels_into_a_checkpoint() -> lsm_tree::Result<()>
     {

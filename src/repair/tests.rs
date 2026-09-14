@@ -232,6 +232,7 @@ fn wal_replay_scope_derives_from_lost_coverage() {
             lost_coverage: lost,
             unknowable_losses: Vec::new(),
             blob_files_salvaged: Vec::new(),
+            damaged_dictionaries: Vec::new(),
             method: "test",
             warnings: Vec::new(),
         }

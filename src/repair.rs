@@ -139,6 +139,14 @@ pub struct RepairReport {
     /// repairs where no blob file needed salvage.
     pub blob_files_salvaged: Vec<(PathBuf, String)>,
 
+    /// Dictionary files whose bytes no longer hashed to their name, moved to
+    /// `{id}.damaged` beside them once the rebuilt manifest was durable:
+    /// `(new path, reason)` each. Left under its name, such a file would fail
+    /// every open of the repaired tree. A table that needed one is not in this
+    /// list: it fails the repair instead, which a re-run supplying that
+    /// dictionary recovers from.
+    pub damaged_dictionaries: Vec<(PathBuf, String)>,
+
     /// Description of the level-assignment strategy used (constant for now;
     /// surfaced so the report is self-explanatory and forward-compatible).
     pub method: &'static str,
@@ -3931,11 +3939,17 @@ fn repair_tree(
     // leaves the tree's data behind. Under the directory lock, since it reads
     // the tree's own folder, and on a COPY, so the caller's config keeps the
     // registry it had (a `Config` is cloned per tree, and they must not share).
+    //
+    // A dictionary whose bytes no longer hash to its name is left out rather
+    // than failing the load: the repair is for exactly that tree. A table that
+    // needs it then fails like one whose dictionary was never supplied, which
+    // aborts rather than drops it, so a re-run with the right dictionary still
+    // recovers it.
     #[cfg(zstd_any)]
-    let owned_config = {
+    let (owned_config, damaged_dictionaries) = {
         let mut owned = config.clone();
-        owned.install_own_zstd_dictionaries()?;
-        owned
+        let damaged = owned.install_own_zstd_dictionaries_skipping_damaged()?;
+        (owned, damaged)
     };
     #[cfg(zstd_any)]
     let config = &owned_config;
@@ -3982,7 +3996,32 @@ fn repair_tree(
     // Phase 2: turn what the scan found into a manifest, commit it, and carry
     // out the removals and swaps that commit authorizes. The directory lock is
     // held by THIS frame for the whole of it.
-    rebuild_from_scan(config, allow_resurrection, manifest_referenced, scan)
+    #[cfg_attr(
+        not(zstd_any),
+        expect(unused_mut, reason = "only dictionaries amend it")
+    )]
+    let mut report = rebuild_from_scan(config, allow_resurrection, manifest_referenced, scan)?;
+
+    // Only now that the rebuilt manifest is durable: every damaged dictionary
+    // still under its name is moved aside, or the open this repair was run for
+    // would fail on it. One the rebuild rewrote from a supplied copy reads
+    // intact again and stays.
+    #[cfg(zstd_any)]
+    for id in damaged_dictionaries {
+        if let Some(aside) = crate::dicts::set_aside_if_damaged(
+            &*config.fs,
+            &config.path.join(crate::file::DICTS_FOLDER),
+            id,
+            config.encryption.as_deref(),
+            config.sync_mode,
+        )? {
+            report.damaged_dictionaries.push((
+                aside,
+                format!("dictionary {id} no longer hashes to its name; moved aside"),
+            ));
+        }
+    }
+    Ok(report)
 }
 
 /// Everything [`scan_table_folders`] learned from the table folders, and the
@@ -6624,6 +6663,7 @@ fn publish_repaired_manifest(
         lost_coverage,
         unknowable_losses,
         blob_files_salvaged,
+        damaged_dictionaries: Vec::new(),
         method: "all-to-L0 with sequence-number ordering",
         warnings,
     };

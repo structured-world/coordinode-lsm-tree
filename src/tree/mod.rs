@@ -5830,6 +5830,27 @@ impl Tree {
 
         let version = Version::from_recovery(recovery, &tables, &blob_files)?;
 
+        // Registered ids the tree no longer holds are dropped. One a recovered
+        // file names cannot be among them, since that file would have refused
+        // to open; the rest owe a reader nothing once the file is gone, while
+        // every checkpoint copies what the version registers and would fail on
+        // the missing file.
+        #[cfg(zstd_any)]
+        let version = {
+            let held = config.current_zstd_dictionaries();
+            if version.dicts().iter().all(|id| held.get(*id).is_some()) {
+                version
+            } else {
+                let dicts = version
+                    .dicts()
+                    .iter()
+                    .copied()
+                    .filter(|id| held.get(*id).is_some())
+                    .collect();
+                version.with_dicts(dicts)
+            }
+        };
+
         // Republish any restriction sidecar that never landed. The sidecar is
         // written AFTER its slice commits, so a failure (or a crash) in that
         // window leaves a committed restriction with no `.restrict-bound` file.

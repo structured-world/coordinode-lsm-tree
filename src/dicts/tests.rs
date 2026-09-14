@@ -330,6 +330,81 @@ fn the_scan_fails_on_a_corrupt_dictionary_rather_than_skipping_it() -> crate::Re
     Ok(())
 }
 
+/// Flips the first byte of the dictionary filed under `id`.
+fn damage(folder: &std::path::Path, id: DictId) {
+    let path = folder.join(id.to_string());
+    let mut raw = std::fs::read(&path).unwrap();
+    *raw.first_mut().unwrap() ^= 0x01;
+    std::fs::write(&path, &raw).unwrap();
+}
+
+#[test]
+fn the_repair_scan_skips_a_damaged_dictionary_and_keeps_the_rest() -> crate::Result<()> {
+    // The strict scan fails on the damaged file; the repair's reports it and
+    // loads everything else, touching nothing on disk.
+    let (_dir, fs, folder) = store();
+    let good = ZstdDictionary::new(b"aaaaaaaaaaaaaaaaaaaa");
+    let bad = ZstdDictionary::new(b"bbbbbbbbbbbbbbbbbbbb");
+    write(&*fs, &folder, &good, None, SyncMode::Normal)?;
+    write(&*fs, &folder, &bad, None, SyncMode::Normal)?;
+    damage(&folder, bad.id());
+
+    let (set, damaged) = read_all_skipping_damaged(&*fs, &folder, None)?;
+
+    assert!(set.get(good.id()).is_some(), "the intact one loads");
+    assert!(set.get(bad.id()).is_none(), "the damaged one does not");
+    assert_eq!(damaged, vec![bad.id()]);
+    assert!(
+        fs.exists(&folder.join(bad.id().to_string()))?,
+        "nothing is moved by the scan itself",
+    );
+    Ok(())
+}
+
+#[test]
+fn setting_aside_moves_only_a_file_that_is_still_damaged() -> crate::Result<()> {
+    let (_dir, fs, folder) = store();
+    let dict = ZstdDictionary::new(b"content that will be damaged");
+    write(&*fs, &folder, &dict, None, SyncMode::Normal)?;
+    damage(&folder, dict.id());
+
+    let aside = set_aside_if_damaged(&*fs, &folder, dict.id(), None, SyncMode::Normal)?;
+    let expected = folder.join(format!("{}{}", dict.id(), crate::file::DICT_DAMAGED_SUFFIX));
+    assert_eq!(aside.as_deref(), Some(expected.as_path()));
+    assert!(!fs.exists(&folder.join(dict.id().to_string()))?);
+    assert!(
+        matches!(
+            DictDirEntry::classify(&format!(
+                "{}{}",
+                dict.id(),
+                crate::file::DICT_DAMAGED_SUFFIX
+            )),
+            DictDirEntry::Foreign,
+        ),
+        "the new name is one no open reads and no sweep removes",
+    );
+
+    // Nothing under the name any more, and an intact one is left alone.
+    assert!(set_aside_if_damaged(&*fs, &folder, dict.id(), None, SyncMode::Normal)?.is_none());
+    write(&*fs, &folder, &dict, None, SyncMode::Normal)?;
+    assert!(set_aside_if_damaged(&*fs, &folder, dict.id(), None, SyncMode::Normal)?.is_none());
+    Ok(())
+}
+
+#[test]
+fn writing_over_a_damaged_copy_of_the_same_id_heals_it() -> crate::Result<()> {
+    // A damaged file no longer hashes to its name, so it is not a different
+    // dictionary claiming the id: the correct bytes replace it.
+    let (_dir, fs, folder) = store();
+    let dict = ZstdDictionary::new(b"content written twice, damaged in between");
+    write(&*fs, &folder, &dict, None, SyncMode::Normal)?;
+    damage(&folder, dict.id());
+
+    write(&*fs, &folder, &dict, None, SyncMode::Normal)?;
+    assert_eq!(read_one(&*fs, &folder, dict.id(), None)?.raw(), dict.raw());
+    Ok(())
+}
+
 #[test]
 fn the_scan_ignores_files_the_engine_does_not_own() -> crate::Result<()> {
     let (_dir, fs, folder) = store();

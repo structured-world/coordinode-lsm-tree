@@ -1035,7 +1035,39 @@ impl Config {
         // crashed one is swept rather than left to linger.
         crate::dicts::sweep_temps(&*self.fs, &folder)?;
 
-        let mut dicts = crate::dicts::read_all(&*self.fs, &folder, self.encryption.as_deref())?;
+        let dicts = crate::dicts::read_all(&*self.fs, &folder, self.encryption.as_deref())?;
+        self.install_zstd_dictionary_set(dicts);
+        Ok(())
+    }
+
+    /// [`Self::install_own_zstd_dictionaries`] for a repair: a dictionary whose
+    /// bytes no longer hash to its name is left out of the set instead of
+    /// failing the load, and its id is returned. Nothing is changed on disk.
+    ///
+    /// # Errors
+    ///
+    /// Propagates the folder scan and every read failure other than the
+    /// integrity check.
+    #[cfg(zstd_any)]
+    pub(crate) fn install_own_zstd_dictionaries_skipping_damaged(
+        &mut self,
+    ) -> crate::Result<alloc::vec::Vec<crate::file::DictId>> {
+        let folder = self.path.join(crate::file::DICTS_FOLDER);
+        crate::dicts::sweep_temps(&*self.fs, &folder)?;
+
+        let (dicts, damaged) = crate::dicts::read_all_skipping_damaged(
+            &*self.fs,
+            &folder,
+            self.encryption.as_deref(),
+        )?;
+        self.install_zstd_dictionary_set(dicts);
+        Ok(damaged)
+    }
+
+    /// Joins the supplied dictionaries to `dicts`, fills the empty write slots
+    /// from it, and installs it as this config's own registry.
+    #[cfg(zstd_any)]
+    fn install_zstd_dictionary_set(&mut self, mut dicts: crate::compression::ZstdDictionaries) {
         if let Some(supplied) = self.zstd_dictionary.clone() {
             dicts = dicts.with(supplied);
         }
@@ -1072,7 +1104,6 @@ impl Config {
         }
 
         self.zstd_dictionaries = Arc::new(arc_swap::ArcSwap::from_pointee(dicts));
-        Ok(())
     }
 
     /// The dictionary `policy` names, if the set holds it.

@@ -73,19 +73,27 @@ pub fn write(
     if fs.exists(&final_path)? {
         // Same id: prove it is the same DICTIONARY before treating the write as
         // done. `read_one` re-hashes, so a corrupt file is caught here too.
-        let held = read_one(fs, folder, dict.id(), encryption)?;
-        if held.raw() != dict.raw() {
-            return Err(crate::Error::ZstdDictMismatch {
-                expected: dict.id(),
-                got: Some(held.id()),
-            });
+        match read_one(fs, folder, dict.id(), encryption) {
+            Ok(held) => {
+                if held.raw() != dict.raw() {
+                    return Err(crate::Error::ZstdDictMismatch {
+                        expected: dict.id(),
+                        got: Some(held.id()),
+                    });
+                }
+                // Sync even though the bytes were already there. The file may
+                // be a PREVIOUS attempt that died between its rename and its
+                // syncs, leaving the entries not yet durable; returning without
+                // syncing would let the caller durably register the id on top
+                // of a file a power loss can still lose.
+                return sync_entries(fs, folder, sync_mode);
+            }
+            // The file no longer hashes to its name, so it is damaged bytes,
+            // not a different dictionary; the one being written hashes to the
+            // name by construction and replaces them below.
+            Err(e) if is_damage(&e, dict.id()) => {}
+            Err(e) => return Err(e),
         }
-        // Sync even though the bytes were already there. The file may be a
-        // PREVIOUS attempt that died between its rename and its syncs, leaving
-        // the entries not yet durable; returning without syncing would let the
-        // caller durably register the id on top of a file a power loss can
-        // still lose.
-        return sync_entries(fs, folder, sync_mode);
     }
 
     if !fs.exists(folder)? {
@@ -206,6 +214,82 @@ pub fn read_all(
         }
     }
     Ok(set)
+}
+
+/// Whether `err` is [`read_one`]'s integrity failure for `id`: the file filed
+/// under `id` holds bytes that hash elsewhere. That shape, a mismatch naming
+/// both ids, is the integrity check and nothing else.
+fn is_damage(err: &crate::Error, id: DictId) -> bool {
+    matches!(err, crate::Error::ZstdDictMismatch { expected, got: Some(_) } if *expected == id)
+}
+
+/// Loads every intact dictionary the folder holds, skipping each one whose
+/// bytes no longer hash to its name, and returns the skipped ids.
+///
+/// The repair's counterpart of [`read_all`], which fails on the first damaged
+/// file: a repair exists for exactly that tree, and an orphaned damaged
+/// dictionary must not stop it before it looks at a table. Nothing is changed
+/// on disk here; see [`set_aside_if_damaged`]. A table that needs a skipped
+/// dictionary fails to open naming it, as one whose dictionary is missing does.
+///
+/// # Errors
+///
+/// Propagates the directory read and every read failure other than the
+/// integrity check: a transient I/O fault or a wrong key has to fail the
+/// repair, not cost the tree a dictionary.
+pub fn read_all_skipping_damaged(
+    fs: &dyn Fs,
+    folder: &Path,
+    encryption: Option<&dyn EncryptionProvider>,
+) -> crate::Result<(ZstdDictionaries, Vec<DictId>)> {
+    let mut set = ZstdDictionaries::new();
+    let mut damaged = Vec::new();
+    if !fs.exists(folder)? {
+        return Ok((set, damaged));
+    }
+    for dirent in fs.read_dir(folder)? {
+        let DictDirEntry::Dict(id) = DictDirEntry::classify(&dirent.file_name) else {
+            continue;
+        };
+        match read_one(fs, folder, id, encryption) {
+            Ok(dict) => set = set.with(Arc::new(dict)),
+            Err(e) if is_damage(&e, id) => damaged.push(id),
+            Err(e) => return Err(e),
+        }
+    }
+    Ok((set, damaged))
+}
+
+/// Moves the dictionary filed under `id` to `{id}.damaged` if its bytes still
+/// fail the integrity check, returning where it went.
+///
+/// `{id}.damaged` is outside the names an open reads, so the tree opens, and
+/// outside the names a sweep removes, so the bytes stay for an operator. A file
+/// that reads intact again (a correct copy was written over it meanwhile) or is
+/// gone is left alone.
+///
+/// # Errors
+///
+/// Propagates the read failures other than the integrity check, and the
+/// rename and its directory sync.
+pub fn set_aside_if_damaged(
+    fs: &dyn Fs,
+    folder: &Path,
+    id: DictId,
+    encryption: Option<&dyn EncryptionProvider>,
+    sync_mode: SyncMode,
+) -> crate::Result<Option<PathBuf>> {
+    match read_one(fs, folder, id, encryption) {
+        Ok(_) => Ok(None),
+        Err(crate::Error::Io(e)) if e.kind() == crate::io::ErrorKind::NotFound => Ok(None),
+        Err(e) if is_damage(&e, id) => {
+            let aside = folder.join(format!("{id}{}", crate::file::DICT_DAMAGED_SUFFIX));
+            fs.rename(&path_of(folder, id), &aside)?;
+            fs.sync_directory_with(folder, sync_mode)?;
+            Ok(Some(aside))
+        }
+        Err(e) => Err(e),
+    }
 }
 
 /// Lists the ids the folder holds, without reading a single dictionary.
