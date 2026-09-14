@@ -69,6 +69,62 @@ fn a_finished_file_whose_dictionary_is_missing_leaves_nothing_behind() -> crate:
     Ok(())
 }
 
+/// A writer that fails to finish takes the files already finished with it.
+///
+/// `finish` closes one file per codec. When a later one fails, the files it
+/// already published are handles nobody will ever receive: dropping them
+/// unmarked leaves their bytes on disk and their descriptors in the shared
+/// table, for a relocation that as a whole did not happen.
+#[test_log::test]
+#[cfg(zstd_any)]
+fn a_failed_finish_leaves_no_file_behind() -> crate::Result<()> {
+    use super::*;
+    use crate::fs::StdFs;
+
+    let folder = tempfile::tempdir()?;
+    let fs: Arc<dyn Fs> = Arc::new(StdFs);
+    let descriptor_table = Arc::new(DescriptorTable::new(10));
+
+    let mut writer = MultiWriter::new(
+        SequenceNumberCounter::default(),
+        folder.path(),
+        7,
+        Some(descriptor_table.clone()),
+        fs.clone(),
+    )?
+    .use_target_size(u64::MAX);
+
+    // A dictionary nothing can resolve, parked behind a plain writer that
+    // finishes first and succeeds.
+    writer.record_source_compression(CompressionType::ZstdDict {
+        level: 3,
+        dict_id: 0xDEAD_BEEF,
+    })?;
+    writer.write_raw(b"a", 0, b"encoded-under-a-dictionary", 26)?;
+    let dict_path = writer.active_writer.path.clone();
+    writer.record_source_compression(CompressionType::None)?;
+    writer.write_raw(b"b", 0, b"plain", 5)?;
+    let plain_id = writer.active_writer.blob_file_id();
+    let plain_path = writer.active_writer.path.clone();
+
+    assert!(
+        writer.finish().is_err(),
+        "the unresolvable file fails the finish"
+    );
+    assert!(!fs.exists(&dict_path)?, "the failing file is removed");
+    assert!(
+        !fs.exists(&plain_path)?,
+        "and so is the one that finished before it"
+    );
+    assert!(
+        descriptor_table
+            .access_for_blob_file(&(7, plain_id).into())
+            .is_none(),
+        "its descriptor is not left in the shared table",
+    );
+    Ok(())
+}
+
 /// Sources of different codecs interleaved by key fill one file per codec.
 ///
 /// A relocation merges its sources by key, so when two compression generations

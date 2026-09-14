@@ -441,18 +441,40 @@ impl MultiWriter {
     }
 
     pub(crate) fn finish(mut self) -> crate::Result<Vec<BlobFile>> {
-        let writers =
+        let mut writers =
             core::iter::once((self.passthrough_compression, self.active_writer)).chain(self.parked);
-        for (passthrough, writer) in writers {
-            let blob_file = Self::consume_writer(
+        while let Some((passthrough, writer)) = writers.next() {
+            match Self::consume_writer(
                 writer,
                 passthrough,
                 self.descriptor_table.clone(),
                 &self.fs,
                 #[cfg(zstd_any)]
                 &self.zstd_dictionaries,
-            )?;
-            self.results.extend(blob_file);
+            ) {
+                Ok(blob_file) => self.results.extend(blob_file),
+                Err(e) => {
+                    // The write as a whole failed, so no version will ever name
+                    // the files finished so far: marked deleted, their handles'
+                    // drop unlinks them and evicts their descriptors. The
+                    // writers not reached yet never produced a handle, so their
+                    // files are removed here.
+                    for file in &self.results {
+                        file.mark_as_deleted();
+                    }
+                    for (_, unfinished) in writers {
+                        let path = unfinished.path.clone();
+                        drop(unfinished);
+                        if let Err(rm) = self.fs.remove_file(&path) {
+                            log::warn!(
+                                "Could not delete unfinished blob file at {}: {rm:?}",
+                                path.display(),
+                            );
+                        }
+                    }
+                    return Err(e);
+                }
+            }
         }
         Ok(self.results)
     }
