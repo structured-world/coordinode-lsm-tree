@@ -335,6 +335,9 @@ impl Version {
             }
         }
 
+        // The data block codec only. An index block never names a dictionary:
+        // the writer downgrades a `ZstdDict` index policy to plain zstd before
+        // it records `index_block_compression`, so that field never holds one.
         let mut ids: Vec<crate::file::DictId> = self
             .iter_tables()
             .filter_map(|table| dict_of(table.metadata.data_block_compression))
