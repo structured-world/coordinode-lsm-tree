@@ -167,7 +167,7 @@ pub fn fill_sequential_key(buf: &mut [u8], index: u64) {
 /// this in a tight loop does NOT re-seed on each invocation.
 #[inline]
 pub fn make_random_key(key_size: usize) -> Vec<u8> {
-    use rand::Rng;
+    use rand::RngExt;
     let mut key = vec![0u8; key_size];
     rand::rng().fill(&mut key[..]);
     key
@@ -177,7 +177,7 @@ pub fn make_random_key(key_size: usize) -> Vec<u8> {
 /// [`make_random_key`]).
 #[inline]
 pub fn fill_random_key(buf: &mut [u8]) {
-    use rand::Rng;
+    use rand::RngExt;
     rand::rng().fill(buf);
 }
 

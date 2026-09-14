@@ -3,7 +3,7 @@ use crate::db::{fill_sequential_key, prefill_sequential, read_seqno};
 use crate::reporter::Reporter;
 use crate::workloads::{Workload, run_threaded};
 use lsm_tree::{AbstractTree, AnyTree, Guard};
-use rand::Rng;
+use rand::RngExt;
 use std::sync::atomic::AtomicU64;
 use std::time::Instant;
 
