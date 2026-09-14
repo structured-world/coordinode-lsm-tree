@@ -128,6 +128,74 @@ fn rewriting_a_held_dictionary_still_syncs_its_directory() -> crate::Result<()> 
     Ok(())
 }
 
+/// Arms a directory-sync failure on the tree root, letting the first matching
+/// sync through. The root path is a substring of `dicts/` too, so the skip is
+/// what separates them: a write syncs `dicts/` first and its parent second.
+fn fail_the_parent_sync(fs: &crate::fs::FaultFs<StdFs>, root: &std::path::Path) {
+    use crate::fs::{Fault, FaultOp, FaultRule};
+    fs.injector().arm(
+        FaultRule::new(
+            FaultOp::SyncDirectory,
+            Fault::Error(crate::io::ErrorKind::Other),
+        )
+        .on_path(root.to_string_lossy())
+        .skip(1),
+    );
+}
+
+#[test]
+fn a_retry_after_a_failed_parent_sync_still_syncs_the_parent() -> crate::Result<()> {
+    use crate::fs::FaultFs;
+
+    // The first attempt creates `dicts/` and fails syncing its entry in the
+    // tree root. The retry finds the folder already there, and if it takes
+    // that as done it registers the dictionary on top of a folder a power loss
+    // can still take away, while the manifest naming it survives.
+    let dir = tempfile::tempdir()?;
+    let folder = dir.path().join(crate::file::DICTS_FOLDER);
+    let dict = ZstdDictionary::new(b"content whose folder entry is not yet durable");
+
+    let fs = FaultFs::new(StdFs);
+    fail_the_parent_sync(&fs, dir.path());
+    assert!(
+        write(&fs, &folder, &dict, None, SyncMode::Normal).is_err(),
+        "the first attempt fails on the parent sync",
+    );
+    assert!(fs.exists(&folder)?, "and leaves the folder behind");
+
+    // Re-armed from scratch, so the retry's first sync (`dicts/`) passes and
+    // only a sync of the parent can trip it.
+    fs.injector().clear();
+    fail_the_parent_sync(&fs, dir.path());
+    assert!(
+        write(&fs, &folder, &dict, None, SyncMode::Normal).is_err(),
+        "the retry syncs the parent again, so the armed failure surfaces",
+    );
+    Ok(())
+}
+
+#[test]
+fn rewriting_a_held_dictionary_still_syncs_the_parent() -> crate::Result<()> {
+    use crate::fs::FaultFs;
+
+    // The file already exists: a previous attempt got as far as the rename.
+    // Its folder may be as fresh as the file, so the entry of `dicts/` in the
+    // tree root is as much in doubt as the file's entry in `dicts/`.
+    let dir = tempfile::tempdir()?;
+    let folder = dir.path().join(crate::file::DICTS_FOLDER);
+    let dict = ZstdDictionary::new(b"content registered twice");
+
+    let fs = FaultFs::new(StdFs);
+    write(&fs, &folder, &dict, None, SyncMode::Normal)?;
+
+    fail_the_parent_sync(&fs, dir.path());
+    assert!(
+        write(&fs, &folder, &dict, None, SyncMode::Normal).is_err(),
+        "the rewrite syncs the parent, so the armed failure surfaces",
+    );
+    Ok(())
+}
+
 #[test]
 fn writing_a_different_dictionary_under_a_held_id_is_refused() -> crate::Result<()> {
     let (_dir, fs, folder) = store();

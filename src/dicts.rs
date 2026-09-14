@@ -81,24 +81,15 @@ pub fn write(
             });
         }
         // Sync even though the bytes were already there. The file may be a
-        // PREVIOUS attempt that died between its rename and this sync, leaving
-        // the directory entry not yet durable; returning without syncing would
-        // let the caller durably register the id on top of a file a power loss
-        // can still lose. Syncing an already-durable directory is a no-op.
-        fs.sync_directory_with(folder, sync_mode)?;
-        return Ok(());
+        // PREVIOUS attempt that died between its rename and its syncs, leaving
+        // the entries not yet durable; returning without syncing would let the
+        // caller durably register the id on top of a file a power loss can
+        // still lose.
+        return sync_entries(fs, folder, sync_mode);
     }
 
     if !fs.exists(folder)? {
         fs.create_dir_all(folder)?;
-        fs.sync_directory_with(folder, sync_mode)?;
-        // And the directory that CONTAINS it: syncing `dicts/` alone persists
-        // its contents, not its own entry in the tree root. A crash could then
-        // keep the version edit that names a dictionary while the folder
-        // holding it never existed, and the scan at open would come back empty.
-        if let Some(parent) = folder.parent() {
-            fs.sync_directory_with(parent, sync_mode)?;
-        }
     }
 
     // Sealed before the temp file exists, so a provider failure leaves nothing
@@ -132,7 +123,22 @@ pub fn write(
         let _ = fs.remove_file(&tmp_path);
         return Err(e.into());
     }
+    sync_entries(fs, folder, sync_mode)
+}
+
+/// Makes the file's entry in `dicts/` durable, and the entry of `dicts/` in the
+/// tree root.
+///
+/// Both, on every write, whether or not this call created the folder: an
+/// earlier attempt may have created it and died before its own syncs, and a
+/// retry that took the existing folder as durable would let the caller register
+/// the id over a folder a power loss can still take away. Syncing an already
+/// durable directory costs one call; this runs once per registration.
+fn sync_entries(fs: &dyn Fs, folder: &Path, sync_mode: SyncMode) -> crate::Result<()> {
     fs.sync_directory_with(folder, sync_mode)?;
+    if let Some(parent) = folder.parent() {
+        fs.sync_directory_with(parent, sync_mode)?;
+    }
     Ok(())
 }
 
