@@ -2,16 +2,16 @@ use super::*;
 use crate::fs::StdFs;
 use test_log::test;
 
-fn store() -> (tempfile::TempDir, Arc<dyn Fs>, PathBuf) {
-    let dir = tempfile::tempdir().unwrap();
+fn store() -> crate::Result<(tempfile::TempDir, Arc<dyn Fs>, PathBuf)> {
+    let dir = tempfile::tempdir()?;
     let fs: Arc<dyn Fs> = Arc::new(StdFs);
     let folder = dir.path().join(crate::file::DICTS_FOLDER);
-    (dir, fs, folder)
+    Ok((dir, fs, folder))
 }
 
 #[test]
 fn a_written_dictionary_reads_back_byte_for_byte() -> crate::Result<()> {
-    let (_dir, fs, folder) = store();
+    let (_dir, fs, folder) = store()?;
     let dict = ZstdDictionary::new(b"representative content for a dictionary");
 
     write(&*fs, &folder, &dict, None, SyncMode::Normal)?;
@@ -30,7 +30,7 @@ fn an_encrypted_dictionary_is_sealed_on_disk_and_opens_only_under_its_key() -> c
     // A dictionary keeps literal stretches of its training records, so on an
     // encrypted tree the file must not carry them in the clear, and a reader
     // without the key must be refused rather than handed bytes to hash.
-    let (_dir, fs, folder) = store();
+    let (_dir, fs, folder) = store()?;
     let dict = ZstdDictionary::new(b"a training record that must not reach the disk in the clear");
     let key = Aes256GcmProvider::new(&[0x11; 32]);
 
@@ -63,7 +63,7 @@ fn an_encrypted_dictionary_is_sealed_on_disk_and_opens_only_under_its_key() -> c
 
 #[test]
 fn the_folder_is_created_on_the_first_write() -> crate::Result<()> {
-    let (_dir, fs, folder) = store();
+    let (_dir, fs, folder) = store()?;
     assert!(
         !fs.exists(&folder)?,
         "no folder before the first dictionary"
@@ -83,7 +83,7 @@ fn the_folder_is_created_on_the_first_write() -> crate::Result<()> {
 
 #[test]
 fn writing_an_id_already_held_is_a_no_op() -> crate::Result<()> {
-    let (_dir, fs, folder) = store();
+    let (_dir, fs, folder) = store()?;
     let dict = ZstdDictionary::new(b"content");
 
     write(&*fs, &folder, &dict, None, SyncMode::Normal)?;
@@ -198,7 +198,7 @@ fn rewriting_a_held_dictionary_still_syncs_the_parent() -> crate::Result<()> {
 
 #[test]
 fn writing_a_different_dictionary_under_a_held_id_is_refused() -> crate::Result<()> {
-    let (_dir, fs, folder) = store();
+    let (_dir, fs, folder) = store()?;
     let held = ZstdDictionary::new(b"the dictionary this id belongs to");
     write(&*fs, &folder, &held, None, SyncMode::Normal)?;
 
@@ -222,8 +222,8 @@ fn writing_a_different_dictionary_under_a_held_id_is_refused() -> crate::Result<
 }
 
 #[test]
-fn reading_a_dictionary_the_tree_does_not_hold_reports_not_found() {
-    let (_dir, fs, folder) = store();
+fn reading_a_dictionary_the_tree_does_not_hold_reports_not_found() -> crate::Result<()> {
+    let (_dir, fs, folder) = store()?;
 
     let err = read_one(&*fs, &folder, 12345, None).unwrap_err();
 
@@ -233,11 +233,12 @@ fn reading_a_dictionary_the_tree_does_not_hold_reports_not_found() {
         crate::Error::Io(e) => assert_eq!(e.kind(), crate::io::ErrorKind::NotFound),
         other => panic!("expected NotFound, got {other:?}"),
     }
+    Ok(())
 }
 
 #[test]
 fn a_flipped_bit_is_caught_because_the_name_is_the_digest() -> crate::Result<()> {
-    let (_dir, fs, folder) = store();
+    let (_dir, fs, folder) = store()?;
     let dict = ZstdDictionary::new(b"content that will be corrupted on disk");
     write(&*fs, &folder, &dict, None, SyncMode::Normal)?;
 
@@ -263,7 +264,7 @@ fn a_flipped_bit_is_caught_because_the_name_is_the_digest() -> crate::Result<()>
 
 #[test]
 fn a_truncated_dictionary_is_caught_the_same_way() -> crate::Result<()> {
-    let (_dir, fs, folder) = store();
+    let (_dir, fs, folder) = store()?;
     let dict = ZstdDictionary::new(b"content long enough to truncate");
     write(&*fs, &folder, &dict, None, SyncMode::Normal)?;
 
@@ -281,7 +282,7 @@ fn a_truncated_dictionary_is_caught_the_same_way() -> crate::Result<()> {
 
 #[test]
 fn the_scan_loads_every_dictionary_the_folder_holds() -> crate::Result<()> {
-    let (_dir, fs, folder) = store();
+    let (_dir, fs, folder) = store()?;
     let a = ZstdDictionary::new(b"aaaaaaaaaaaaaaaaaaaa");
     let b = ZstdDictionary::new(b"bbbbbbbbbbbbbbbbbbbb");
     write(&*fs, &folder, &a, None, SyncMode::Normal)?;
@@ -303,7 +304,7 @@ fn the_scan_loads_every_dictionary_the_folder_holds() -> crate::Result<()> {
 
 #[test]
 fn the_scan_of_an_empty_folder_is_an_empty_set() -> crate::Result<()> {
-    let (_dir, fs, folder) = store();
+    let (_dir, fs, folder) = store()?;
     assert!(read_all(&*fs, &folder, None)?.is_empty());
 
     fs.create_dir_all(&folder)?;
@@ -313,7 +314,7 @@ fn the_scan_of_an_empty_folder_is_an_empty_set() -> crate::Result<()> {
 
 #[test]
 fn the_scan_fails_on_a_corrupt_dictionary_rather_than_skipping_it() -> crate::Result<()> {
-    let (_dir, fs, folder) = store();
+    let (_dir, fs, folder) = store()?;
     let good = ZstdDictionary::new(b"aaaaaaaaaaaaaaaaaaaa");
     let bad = ZstdDictionary::new(b"bbbbbbbbbbbbbbbbbbbb");
     write(&*fs, &folder, &good, None, SyncMode::Normal)?;
@@ -331,23 +332,26 @@ fn the_scan_fails_on_a_corrupt_dictionary_rather_than_skipping_it() -> crate::Re
 }
 
 /// Flips the first byte of the dictionary filed under `id`.
-fn damage(folder: &std::path::Path, id: DictId) {
+fn damage(folder: &std::path::Path, id: DictId) -> crate::Result<()> {
     let path = folder.join(id.to_string());
-    let mut raw = std::fs::read(&path).unwrap();
-    *raw.first_mut().unwrap() ^= 0x01;
-    std::fs::write(&path, &raw).unwrap();
+    let mut raw = std::fs::read(&path)?;
+    if let Some(first) = raw.first_mut() {
+        *first ^= 0x01;
+    }
+    std::fs::write(&path, &raw)?;
+    Ok(())
 }
 
 #[test]
 fn the_repair_scan_skips_a_damaged_dictionary_and_keeps_the_rest() -> crate::Result<()> {
     // The strict scan fails on the damaged file; the repair's reports it and
     // loads everything else, touching nothing on disk.
-    let (_dir, fs, folder) = store();
+    let (_dir, fs, folder) = store()?;
     let good = ZstdDictionary::new(b"aaaaaaaaaaaaaaaaaaaa");
     let bad = ZstdDictionary::new(b"bbbbbbbbbbbbbbbbbbbb");
     write(&*fs, &folder, &good, None, SyncMode::Normal)?;
     write(&*fs, &folder, &bad, None, SyncMode::Normal)?;
-    damage(&folder, bad.id());
+    damage(&folder, bad.id())?;
 
     let (set, damaged) = read_all_skipping_damaged(&*fs, &folder, None)?;
 
@@ -363,10 +367,10 @@ fn the_repair_scan_skips_a_damaged_dictionary_and_keeps_the_rest() -> crate::Res
 
 #[test]
 fn setting_aside_moves_only_a_file_that_is_still_damaged() -> crate::Result<()> {
-    let (_dir, fs, folder) = store();
+    let (_dir, fs, folder) = store()?;
     let dict = ZstdDictionary::new(b"content that will be damaged");
     write(&*fs, &folder, &dict, None, SyncMode::Normal)?;
-    damage(&folder, dict.id());
+    damage(&folder, dict.id())?;
 
     let aside = set_aside_if_damaged(&*fs, &folder, dict.id(), None, SyncMode::Normal)?;
     let expected = folder.join(format!("{}{}", dict.id(), crate::file::DICT_DAMAGED_SUFFIX));
@@ -395,10 +399,10 @@ fn setting_aside_moves_only_a_file_that_is_still_damaged() -> crate::Result<()> 
 fn writing_over_a_damaged_copy_of_the_same_id_heals_it() -> crate::Result<()> {
     // A damaged file no longer hashes to its name, so it is not a different
     // dictionary claiming the id: the correct bytes replace it.
-    let (_dir, fs, folder) = store();
+    let (_dir, fs, folder) = store()?;
     let dict = ZstdDictionary::new(b"content written twice, damaged in between");
     write(&*fs, &folder, &dict, None, SyncMode::Normal)?;
-    damage(&folder, dict.id());
+    damage(&folder, dict.id())?;
 
     write(&*fs, &folder, &dict, None, SyncMode::Normal)?;
     assert_eq!(read_one(&*fs, &folder, dict.id(), None)?.raw(), dict.raw());
@@ -407,7 +411,7 @@ fn writing_over_a_damaged_copy_of_the_same_id_heals_it() -> crate::Result<()> {
 
 #[test]
 fn the_scan_ignores_files_the_engine_does_not_own() -> crate::Result<()> {
-    let (_dir, fs, folder) = store();
+    let (_dir, fs, folder) = store()?;
     let dict = ZstdDictionary::new(b"content");
     write(&*fs, &folder, &dict, None, SyncMode::Normal)?;
     std::fs::write(folder.join("notes.txt"), b"mine").unwrap();
@@ -422,7 +426,7 @@ fn the_scan_ignores_files_the_engine_does_not_own() -> crate::Result<()> {
 
 #[test]
 fn removing_a_dictionary_leaves_the_others() -> crate::Result<()> {
-    let (_dir, fs, folder) = store();
+    let (_dir, fs, folder) = store()?;
     let a = ZstdDictionary::new(b"aaaaaaaaaaaaaaaaaaaa");
     let b = ZstdDictionary::new(b"bbbbbbbbbbbbbbbbbbbb");
     write(&*fs, &folder, &a, None, SyncMode::Normal)?;
@@ -437,7 +441,7 @@ fn removing_a_dictionary_leaves_the_others() -> crate::Result<()> {
 
 #[test]
 fn removing_an_absent_dictionary_succeeds() -> crate::Result<()> {
-    let (_dir, fs, folder) = store();
+    let (_dir, fs, folder) = store()?;
     fs.create_dir_all(&folder)?;
 
     remove(&*fs, &folder, 4242, SyncMode::Normal)?;
@@ -446,7 +450,7 @@ fn removing_an_absent_dictionary_succeeds() -> crate::Result<()> {
 
 #[test]
 fn the_sweep_takes_temps_and_leaves_everything_else() -> crate::Result<()> {
-    let (_dir, fs, folder) = store();
+    let (_dir, fs, folder) = store()?;
     let dict = ZstdDictionary::new(b"content");
     write(&*fs, &folder, &dict, None, SyncMode::Normal)?;
 
@@ -471,7 +475,7 @@ fn the_sweep_takes_temps_and_leaves_everything_else() -> crate::Result<()> {
 
 #[test]
 fn sweeping_a_folder_that_does_not_exist_succeeds() -> crate::Result<()> {
-    let (_dir, fs, folder) = store();
+    let (_dir, fs, folder) = store()?;
     sweep_temps(&*fs, &folder)?;
     Ok(())
 }
