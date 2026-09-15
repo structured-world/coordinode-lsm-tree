@@ -452,10 +452,10 @@ pub trait AbstractTree: sealed::Sealed {
     ///
     /// Only used in tests.
     #[doc(hidden)]
-    fn flush_active_memtable(&self, eviction_seqno: SeqNo) -> crate::Result<()> {
+    fn flush_active_memtable(&self, gc_watermark: SeqNo) -> crate::Result<()> {
         let lock = self.get_flush_lock();
         self.rotate_memtable();
-        self.flush(&lock, eviction_seqno)?;
+        self.flush(&lock, gc_watermark)?;
         Ok(())
     }
 
@@ -465,13 +465,11 @@ pub trait AbstractTree: sealed::Sealed {
     ///
     /// The function may not return a result, if nothing was flushed.
     ///
-    /// `seqno_threshold` is an MVCC GC watermark, not a hint: the flush folds
-    /// away versions below it exactly as a compaction does, and when it does,
-    /// the install raises the retention floor
-    /// ([`retention_floor`](Self::retention_floor)) to match. From then on a
-    /// snapshot below the watermark yields
-    /// [`Error::SnapshotBelowRetention`](crate::Error::SnapshotBelowRetention)
-    /// rather than a stale or absent answer. Pass `0` to collect nothing.
+    /// `gc_watermark` has the meaning documented at
+    /// [`major_compact`](Self::major_compact): the flush folds away versions
+    /// below it exactly as a compaction does, and when it does, the install
+    /// raises the retention floor ([`retention_floor`](Self::retention_floor))
+    /// to match. Pass `0` to collect nothing.
     ///
     /// # Errors
     ///
@@ -481,7 +479,7 @@ pub trait AbstractTree: sealed::Sealed {
     /// flush surfaces [`crate::Error::MemtableKvChecksumMismatch`],
     /// [`crate::Error::MemtableKvChecksumCorruptAlgorithm`], or
     /// [`crate::Error::InvalidTag`] (corrupt `value_type`).
-    fn flush(&self, _lock: &FlushGuard<'_>, seqno_threshold: SeqNo) -> crate::Result<Option<u64>> {
+    fn flush(&self, _lock: &FlushGuard<'_>, gc_watermark: SeqNo) -> crate::Result<Option<u64>> {
         use crate::{
             compaction::stream::CompactionStream, merge::Merger, range_tombstone::RangeTombstone,
         };
@@ -539,7 +537,7 @@ pub trait AbstractTree: sealed::Sealed {
         );
         // RT suppression is not needed here: flush writes both entries and RTs
         // to the output tables. Suppression happens at read time, not write time.
-        let stream = CompactionStream::new(merger, seqno_threshold)
+        let stream = CompactionStream::new(merger, gc_watermark)
             .with_merge_operator(self.tree_config().merge_operator.clone());
         // Versions that go in and do not come out, so the install can tell a
         // flush that collected history from one that collected none and only
@@ -573,7 +571,7 @@ pub trait AbstractTree: sealed::Sealed {
                 blob_files.as_deref(),
                 None,
                 &sealed_ids,
-                seqno_threshold,
+                gc_watermark,
                 gc_balance.load(core::sync::atomic::Ordering::Relaxed) > 0,
             )?;
             // The installed files name their dictionaries from here on.
@@ -706,12 +704,14 @@ pub trait AbstractTree: sealed::Sealed {
     ///
     /// Returns a [`crate::compaction::CompactionResult`] describing what action was taken.
     ///
-    /// # Garbage-collection / merge-fold watermark (`seqno_threshold`)
+    /// # GC watermark (`gc_watermark`)
     ///
-    /// `seqno_threshold` is the MVCC garbage-collection watermark: the engine may
-    /// collapse history that no snapshot reading at a seqno `< seqno_threshold`
-    /// can still observe. Concretely, only entries whose seqno is `< seqno_threshold`
-    /// are eligible for:
+    /// `gc_watermark` is the one number that decides what history the engine's
+    /// own GC may collect: every snapshot at or above it that is still servable
+    /// (above the current retention floor) stays readable, and a version only
+    /// snapshots below it could see may be dropped. It never lowers the floor:
+    /// a snapshot an earlier run already refused stays refused. Concretely,
+    /// only entries whose seqno is `< gc_watermark` are eligible for:
     ///
     /// - dropping shadowed versions / GC-ing tombstones, and
     /// - **folding merge operands** via the [`crate::MergeOperator`]: a key written
@@ -719,7 +719,7 @@ pub trait AbstractTree: sealed::Sealed {
     ///   call, and reads re-apply the whole chain (`O(operands)` per read) until
     ///   compaction folds it. Folding a chain into a single value is only
     ///   MVCC-safe when no live snapshot reads *between* the operands, which is
-    ///   exactly what `seqno_threshold` certifies.
+    ///   exactly what `gc_watermark` certifies.
     ///
     /// The engine does **not** track snapshots (unlike a `RocksDB`-style
     /// snapshot list); the caller owns snapshot lifecycle and must supply this
@@ -729,17 +729,27 @@ pub trait AbstractTree: sealed::Sealed {
     ///   live seqno** (e.g. the next value from the [`crate::SequenceNumberCounter`]).
     /// - With outstanding snapshots, pass the **oldest** snapshot's seqno so their
     ///   reads stay correct.
-    /// - `seqno_threshold == 0` certifies nothing as collapsible, so **no folding
-    ///   or GC happens** — `major_compact(target, 0)` only restructures tables and
-    ///   leaves a merge-only key's full operand chain intact.
+    /// - `gc_watermark == 0` certifies nothing as collapsible, so **no folding
+    ///   or GC happens**: `major_compact(target, 0)` only restructures tables
+    ///   and leaves a merge-only key's full operand chain intact.
     ///
-    /// A compaction that collects anything raises the retention floor to just
-    /// below `seqno_threshold`. From then on a new read at or below the floor
-    /// (see [`oldest_retained_seqno`](Self::oldest_retained_seqno)) fails with
+    /// A run that collects anything raises the retention floor to
+    /// `gc_watermark - 1` (capped at the install's own seqno) unless it is
+    /// already higher. When the opt-in tight-space mode takes over a run
+    /// (`RuntimeConfig::tight_space_compaction`), each slice raises it that
+    /// far whether or not it collected. The floor is the
+    /// only read boundary: from then on a new read at or below it (see
+    /// [`oldest_retained_seqno`](Self::oldest_retained_seqno)) fails with
     /// [`Error::SnapshotBelowRetention`](crate::Error::SnapshotBelowRetention),
     /// which is why the watermark must not exceed the oldest snapshot still in
     /// use. A reader opened before the install keeps its own version, and the
     /// tables it references, until it is dropped.
+    ///
+    /// A [compaction filter](crate::compaction::filter) is the exception: it
+    /// acts on whatever version it is shown, regardless of `gc_watermark`
+    /// (`0` included). A run whose filter removed or rewrote anything raises
+    /// the floor to the install's own seqno, so every snapshot up to it is
+    /// refused from then on, however low the watermark was.
     ///
     /// # Errors
     ///
@@ -747,7 +757,7 @@ pub trait AbstractTree: sealed::Sealed {
     fn major_compact(
         &self,
         target_size: u64,
-        seqno_threshold: SeqNo,
+        gc_watermark: SeqNo,
     ) -> crate::Result<crate::compaction::CompactionResult>;
 
     /// Returns the disk space used by stale blobs.
@@ -851,13 +861,22 @@ pub trait AbstractTree: sealed::Sealed {
     ///
     /// Returns a [`crate::compaction::CompactionResult`] describing what action was taken.
     ///
+    /// `gc_watermark` has the meaning documented at
+    /// [`major_compact`](Self::major_compact): the engine's own GC collects
+    /// only versions below it, and a run that collects one raises the
+    /// retention floor. Two things act regardless of it: a compaction filter,
+    /// and a strategy that drops whole tables (FIFO eviction, a drop-range, a
+    /// custom strategy choosing to drop). Either removes data at any
+    /// watermark, `0` included, and raises the floor to the install's own
+    /// seqno, so a low watermark does not protect a snapshot from them.
+    ///
     /// # Errors
     ///
     /// Will return `Err` if an IO error occurs.
     fn compact(
         &self,
         strategy: Arc<dyn crate::compaction::CompactionStrategy>,
-        seqno_threshold: SeqNo,
+        gc_watermark: SeqNo,
     ) -> crate::Result<crate::compaction::CompactionResult>;
 
     /// Returns the next table's ID.

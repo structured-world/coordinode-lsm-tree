@@ -833,9 +833,9 @@ pub fn run_checkpoint<T: AbstractTree>(
     let captured_seqno = visible_seqno.get();
 
     // Force a flush so the captured version reflects all data that has
-    // reached the active memtable. The eviction seqno parameter doubles
-    // as `CompactionStream::gc_seqno_threshold` — any older version of
-    // a key with `seqno < threshold` is dropped during the flush-time
+    // reached the active memtable. The flush's `gc_watermark` is the
+    // same number `CompactionStream` folds by: any older version of a
+    // key with `seqno < gc_watermark` is dropped during the flush-time
     // merge, and snapshot readers on the SOURCE tree lose that history.
     //
     // We pass `0` so the checkpoint-triggered flush never expands GC

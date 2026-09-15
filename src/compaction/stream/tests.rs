@@ -743,7 +743,7 @@ mod merge_operator_tests {
     #[test]
     #[expect(clippy::unwrap_used, reason = "test assertion")]
     fn compaction_merge_operands_below_gc() -> crate::Result<()> {
-        // All entries below gc_seqno_threshold=1000, no base → partial merge
+        // All entries below gc_watermark=1000, no base → partial merge
         #[rustfmt::skip]
         let vec = stream![
             "a", "op2", "M",
@@ -896,7 +896,7 @@ mod merge_operator_tests {
     #[test]
     #[expect(clippy::unwrap_used, reason = "test assertion")]
     fn compaction_merge_above_gc_preserved() -> crate::Result<()> {
-        // Entries above gc_seqno_threshold → NOT merged, preserved as-is
+        // Entries above gc_watermark → NOT merged, preserved as-is
         #[rustfmt::skip]
         let vec = stream![
             "a", "op2", "M",
@@ -904,7 +904,7 @@ mod merge_operator_tests {
         ];
 
         let iter = vec.iter().cloned().map(Ok);
-        let mut iter = CompactionStream::new(iter, 0) // gc_threshold=0, nothing expired
+        let mut iter = CompactionStream::new(iter, 0) // gc_watermark=0, nothing expired
             .with_merge_operator(Some(merge_op()));
 
         let item = iter.next().unwrap()?;
@@ -1096,11 +1096,11 @@ mod merge_operator_tests {
         Ok(())
     }
 
-    /// Exact GC boundary: head.seqno == gc_seqno_threshold should NOT merge.
+    /// Exact GC boundary: head.seqno == gc_watermark should NOT merge.
     #[test]
     #[expect(clippy::unwrap_used, reason = "test assertion")]
     fn compaction_merge_at_exact_gc_boundary() -> crate::Result<()> {
-        // gc_threshold=999; head.seqno=999 (NOT below threshold)
+        // gc_watermark=999; head.seqno=999 (NOT below threshold)
         // Entries should be preserved as-is
         let vec = vec![
             InternalValue::from_components("a", "op2", 999, ValueType::MergeOperand),
@@ -1110,7 +1110,7 @@ mod merge_operator_tests {
         let iter = vec.iter().cloned().map(Ok);
         let mut iter = CompactionStream::new(iter, 999).with_merge_operator(Some(merge_op()));
 
-        // head.seqno == gc_threshold → NOT below → preserved as MergeOperand
+        // head.seqno == gc_watermark → NOT below → preserved as MergeOperand
         let item = iter.next().unwrap()?;
         assert_eq!(item.key.value_type, ValueType::MergeOperand);
         assert_eq!(&*item.value, b"op2");
@@ -1459,9 +1459,9 @@ fn compaction_stream_custom_comparator_weak_tombstone_not_annihilated_across_key
 /// Runs the stream to exhaustion and reports how many watermark-driven drops
 /// it counted.
 #[expect(clippy::expect_used, reason = "test assertion")]
-fn collected_count(vec: &[InternalValue], gc_threshold: u64) -> u64 {
+fn collected_count(vec: &[InternalValue], gc_watermark: u64) -> u64 {
     let iter = vec.iter().cloned().map(Ok);
-    let iter = CompactionStream::new(iter, gc_threshold);
+    let iter = CompactionStream::new(iter, gc_watermark);
     let balance = iter.gc_balance();
     for item in iter {
         item.expect("stream must not error");

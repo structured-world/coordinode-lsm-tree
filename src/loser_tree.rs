@@ -138,7 +138,7 @@ pub struct LoserTree<E, F> {
     /// = loser leaf index at each internal node.
     tree: Vec<usize>,
     /// Number of source slots originally supplied. Less than or equal
-    /// to `leaves.len()` (= `cap`). Exposed via [`Self::slots`].
+    /// to `leaves.len()` (= `cap`).
     n_sources: usize,
     /// Count of present leaves. When zero the tree is empty.
     active: usize,

@@ -253,9 +253,9 @@ fn checkpoint_flattens_level_routes() -> lsm_tree::Result<()> {
 
 /// 4b. Regression for MVCC GC leak through checkpoint flush.
 ///
-/// `run_checkpoint` calls `flush_active_memtable(threshold)` to make sure
-/// the active memtable is in SSTs before linking. The threshold value
-/// drives `CompactionStream`'s `gc_seqno_threshold` — anything below it
+/// `run_checkpoint` calls `flush_active_memtable(gc_watermark)` to make sure
+/// the active memtable is in SSTs before linking. The GC watermark is
+/// what `CompactionStream` folds by: anything below it
 /// can be dropped from older versions of the same key. Passing
 /// `SeqNo::MAX` would mean "no caller cares about any historical seqno",
 /// which silently destroys MVCC history that the SOURCE tree's readers

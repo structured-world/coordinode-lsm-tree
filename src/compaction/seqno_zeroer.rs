@@ -47,7 +47,7 @@
 //! reads through 10 changed. That is the safe direction and the deliberate one;
 //! the gate below is what keeps it safe, not the floor's precision.
 //!
-//! That coupling is why the gate is `seqno < gc_seqno_threshold` and not, say,
+//! That coupling is why the gate is `seqno < gc_watermark` and not, say,
 //! the output level's own bounds: an entry rewritten at or above the watermark
 //! would change an answer the recorded floor still promises.
 //!
@@ -73,9 +73,9 @@ pub(super) struct BottommostSeqnoZeroer<I> {
     /// zeroing is only safe at the authoritative bottom.
     enabled: bool,
     comparator: SharedComparator,
-    /// Entries with `seqno < gc_seqno_threshold` are below the GC watermark and
-    /// eligible for zeroing (subject to the no-coverage rule).
-    gc_seqno_threshold: SeqNo,
+    /// Entries with `seqno < gc_watermark` are eligible for zeroing (subject to
+    /// the no-coverage rule).
+    gc_watermark: SeqNo,
     /// Range tombstones from the whole version, sorted lazily by `start`.
     tombstones: Vec<RangeTombstone>,
     idx: usize,
@@ -96,7 +96,7 @@ impl<I> BottommostSeqnoZeroer<I> {
         inner: I,
         enabled: bool,
         tombstones: Vec<RangeTombstone>,
-        gc_seqno_threshold: SeqNo,
+        gc_watermark: SeqNo,
         comparator: SharedComparator,
         gc_balance: alloc::sync::Arc<portable_atomic::AtomicU64>,
     ) -> Self {
@@ -104,7 +104,7 @@ impl<I> BottommostSeqnoZeroer<I> {
             inner,
             enabled,
             comparator: comparator.clone(),
-            gc_seqno_threshold,
+            gc_watermark,
             tombstones,
             idx: 0,
             active: ActiveTombstoneSet::new_with_comparator(comparator),
@@ -150,7 +150,7 @@ impl<I: Iterator<Item = crate::Result<InternalValue>>> Iterator for BottommostSe
         match self.inner.next()? {
             Ok(mut kv) => {
                 if kv.key.seqno > 0
-                    && kv.key.seqno < self.gc_seqno_threshold
+                    && kv.key.seqno < self.gc_watermark
                     && !self.covered(kv.key.user_key.as_ref())
                 {
                     kv.key.seqno = 0;

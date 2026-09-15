@@ -964,9 +964,9 @@ impl AbstractTree for BlobTree {
     fn major_compact(
         &self,
         target_size: u64,
-        seqno_threshold: SeqNo,
+        gc_watermark: SeqNo,
     ) -> crate::Result<crate::compaction::CompactionResult> {
-        self.index.major_compact(target_size, seqno_threshold)
+        self.index.major_compact(target_size, gc_watermark)
     }
 
     fn clear_active_memtable(&self) {
@@ -1286,9 +1286,9 @@ impl AbstractTree for BlobTree {
     fn compact(
         &self,
         strategy: Arc<dyn crate::compaction::CompactionStrategy>,
-        seqno_threshold: SeqNo,
+        gc_watermark: SeqNo,
     ) -> crate::Result<crate::compaction::CompactionResult> {
-        self.index.compact(strategy, seqno_threshold)
+        self.index.compact(strategy, gc_watermark)
     }
 
     fn get_next_table_id(&self) -> TableId {

@@ -743,7 +743,7 @@ impl AbstractTree for Tree {
     fn major_compact(
         &self,
         target_size: u64,
-        seqno_threshold: SeqNo,
+        gc_watermark: SeqNo,
     ) -> crate::Result<crate::compaction::CompactionResult> {
         let strategy = Arc::new(crate::compaction::major::Strategy::new(target_size));
 
@@ -751,7 +751,7 @@ impl AbstractTree for Tree {
         let _lock = self.0.major_compaction_lock.write();
 
         log::info!("Starting major compaction");
-        self.inner_compact(strategy, seqno_threshold)
+        self.inner_compact(strategy, gc_watermark)
     }
 
     fn l0_run_count(&self) -> usize {
@@ -1088,14 +1088,14 @@ impl AbstractTree for Tree {
     fn compact(
         &self,
         strategy: Arc<dyn CompactionStrategy>,
-        seqno_threshold: SeqNo,
+        gc_watermark: SeqNo,
     ) -> crate::Result<crate::compaction::CompactionResult> {
         // NOTE: Read lock major compaction lock
         // That way, if a major compaction is running, we cannot proceed
         // But in general, parallel (non-major) compactions can occur
         let _lock = self.0.major_compaction_lock.read();
 
-        self.inner_compact(strategy, seqno_threshold)
+        self.inner_compact(strategy, gc_watermark)
     }
 
     fn get_next_table_id(&self) -> TableId {
@@ -2570,7 +2570,7 @@ impl Tree {
     /// # History retention
     ///
     /// The stream carries what the tree still PHYSICALLY HOLDS. A compaction
-    /// run with a GC watermark (the `seqno_threshold` passed to
+    /// run with a GC watermark (the `gc_watermark` passed to
     /// [`compact`](crate::AbstractTree::compact) /
     /// [`major_compact`](crate::AbstractTree::major_compact)) drops shadowed
     /// versions and evicted tombstones below that watermark and may fold
@@ -4638,12 +4638,12 @@ impl Tree {
     fn inner_compact(
         &self,
         strategy: Arc<dyn CompactionStrategy>,
-        mvcc_gc_watermark: SeqNo,
+        gc_watermark: SeqNo,
     ) -> crate::Result<crate::compaction::CompactionResult> {
         use crate::compaction::worker::{Options, do_compaction};
 
         let mut opts = Options::from_tree(self, strategy);
-        opts.mvcc_gc_watermark = mvcc_gc_watermark;
+        opts.gc_watermark = gc_watermark;
 
         let result = do_compaction(&opts)?;
 

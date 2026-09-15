@@ -111,12 +111,12 @@ pub(super) fn prepare_table_writer(
     let filter_partitioning = opts.config.filter_block_partitioning_policy.get(dst_lvl);
 
     log::debug!(
-        "Compacting tables {:?} into L{} (canonical L{}), target_size={}, data_block_restart_interval={data_block_restart_interval}, index_block_restart_interval={index_block_restart_interval}, data_block_size={data_block_size}, data_block_compression={data_block_compression:?}, index_block_compression={index_block_compression:?}, mvcc_gc_watermark={}",
+        "Compacting tables {:?} into L{} (canonical L{}), target_size={}, data_block_restart_interval={data_block_restart_interval}, index_block_restart_interval={index_block_restart_interval}, data_block_size={data_block_size}, data_block_compression={data_block_compression:?}, index_block_compression={index_block_compression:?}, gc_watermark={}",
         payload.table_ids,
         payload.dest_level,
         payload.canonical_level,
         payload.target_size,
-        opts.mvcc_gc_watermark,
+        opts.gc_watermark,
     );
 
     // The outputs' L0 recency key: the newest input's recency. An output's own
@@ -453,7 +453,7 @@ pub(super) fn install_merge(
     let retention = crate::version::RetentionEffect::of_run(
         filter_transformed,
         collected_below_watermark,
-        opts.mvcc_gc_watermark,
+        opts.gc_watermark,
     );
 
     let tables_out = created_tables.len();

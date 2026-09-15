@@ -75,8 +75,11 @@ pub struct Options {
     /// the tree is dropped.
     pub stop_signal: StopSignal,
 
-    /// Evicts items that are older than this seqno (MVCC GC).
-    pub mvcc_gc_watermark: u64,
+    /// The GC watermark: a version only snapshots below it could see may be
+    /// collected, and a run that collects one raises the retention floor to
+    /// just below it (never lowering a higher floor). See
+    /// [`AbstractTree::major_compact`](crate::AbstractTree::major_compact).
+    pub gc_watermark: crate::SeqNo,
 
     pub compaction_state: Arc<Mutex<CompactionState>>,
 
@@ -130,7 +133,7 @@ impl Options {
             version_history: tree.version_history.clone(),
             stop_signal: tree.stop_signal.clone(),
             strategy,
-            mvcc_gc_watermark: 0,
+            gc_watermark: 0,
 
             compaction_state: tree.compaction_state.clone(),
             deletion_pause: tree.deletion_pause.clone(),
@@ -521,7 +524,7 @@ fn pick_run_indexes(run: &Run<Table>, to_compact: &[TableId]) -> Option<(usize, 
 fn create_compaction_stream<'a>(
     version: &Version,
     to_compact: &[TableId],
-    eviction_seqno: SeqNo,
+    gc_watermark: SeqNo,
     merge_operator: Option<Arc<dyn crate::merge_operator::MergeOperator>>,
     comparator: crate::comparator::SharedComparator,
 ) -> crate::Result<Option<CompactionStream<'a, Merger<CompactionReader<'a>>>>> {
@@ -550,7 +553,7 @@ fn create_compaction_stream<'a>(
 
     Ok(if found == to_compact.len() {
         Some(
-            CompactionStream::new(Merger::new(readers, comparator), eviction_seqno)
+            CompactionStream::new(Merger::new(readers, comparator), gc_watermark)
                 .with_merge_operator(merge_operator),
         )
     } else {
@@ -570,7 +573,7 @@ fn create_bounded_compaction_stream<'a>(
     version: &'a Version,
     to_compact: &HashSet<TableId>,
     bounds: (core::ops::Bound<UserKey>, core::ops::Bound<UserKey>),
-    eviction_seqno: SeqNo,
+    gc_watermark: SeqNo,
     merge_operator: Option<Arc<dyn crate::merge_operator::MergeOperator>>,
     comparator: crate::comparator::SharedComparator,
 ) -> Option<CompactionStream<'a, Merger<CompactionReader<'a>>>> {
@@ -586,7 +589,7 @@ fn create_bounded_compaction_stream<'a>(
 
     if found == to_compact.len() {
         Some(
-            CompactionStream::new(Merger::new(readers, comparator), eviction_seqno)
+            CompactionStream::new(Merger::new(readers, comparator), gc_watermark)
                 .with_merge_operator(merge_operator),
         )
     } else {
@@ -1340,7 +1343,7 @@ fn run_tight_space_compaction(
                 opts.encryption.clone(),
                 // A slice is a merge with GC below the watermark, plus the
                 // punched input prefix: older snapshots lose both.
-                crate::version::RetentionEffect::GcBelow(opts.mvcc_gc_watermark),
+                crate::version::RetentionEffect::GcBelow(opts.gc_watermark),
             );
             if let Err(e) = install {
                 // The install did not commit, so no sidecar was written (the mark
@@ -1597,7 +1600,7 @@ fn run_subcompaction(
         version,
         &payload.table_ids,
         bounds,
-        opts.mvcc_gc_watermark,
+        opts.gc_watermark,
         opts.config.merge_operator.clone(),
         opts.config.comparator.clone(),
     ) else {
@@ -1689,7 +1692,7 @@ fn run_subcompaction(
         merge_iter,
         is_last_level,
         version_tombstones,
-        opts.mvcc_gc_watermark,
+        opts.gc_watermark,
         opts.config.comparator.clone(),
         Arc::clone(&gc_balance),
     );
@@ -1789,7 +1792,7 @@ fn run_subcompaction(
         input_range_tombstones,
         version,
         &payload.table_ids,
-        opts.mvcc_gc_watermark,
+        opts.gc_watermark,
         is_last_level,
         &opts.config.comparator,
     );
@@ -2069,7 +2072,7 @@ fn plan_merge_on_read(
         keys.iter()
             .map(|(user_key, seqno)| (user_key.as_ref(), *seqno)),
         input_range_tombstones,
-        opts.mvcc_gc_watermark,
+        opts.gc_watermark,
         &opts.config.comparator,
     )?;
     if bitmap.is_empty() {
@@ -2497,7 +2500,7 @@ fn merge_tables(
     let Some(mut merge_iter) = create_compaction_stream(
         &current_super_version.version,
         &payload.table_ids.iter().copied().collect::<Vec<_>>(),
-        opts.mvcc_gc_watermark,
+        opts.gc_watermark,
         opts.config.merge_operator.clone(),
         opts.config.comparator.clone(),
     )?
@@ -2706,7 +2709,7 @@ fn merge_tables(
             merge_iter,
             is_last_level,
             zeroing_tombstones,
-            opts.mvcc_gc_watermark,
+            opts.gc_watermark,
             opts.config.comparator.clone(),
             Arc::clone(&gc_balance),
         );

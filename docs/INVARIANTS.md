@@ -214,10 +214,16 @@ matching entry (and add one for a new subsystem).
 - **The retention boundary is durable.** An install that discards what older
   snapshots saw raises the version's *retention floor* in the same version
   edit (`Version::retention_floor`, the `retention_floor` manifest section and
-  the appended edit-log field): a GC compaction with watermark `w` sets it to
-  `w - 1` (capped at its own install seqno), a `clear`, a table drop or a
-  compaction whose filter removed or rewrote rows to its own install seqno;
-  a flush, ingest, move, blob relocation or an empty drop leaves it alone.
+  the appended edit-log field): a flush or compaction that collected a
+  version under GC watermark `w` raises it to `w - 1` (capped at its own
+  install seqno), a `clear`, a table drop or a compaction whose filter removed
+  or rewrote rows to its own install seqno; an ingest, move, blob relocation,
+  a flush or compaction that collected nothing, or an empty drop leaves it
+  alone. The one exception to "collected nothing, raises nothing" is the
+  tight-space slice loop, which records `GcBelow(w)` for every slice whether
+  or not its merge collected (see the Compaction entry on `of_run`). The floor
+  only rises (`Version::with_retention_floor`), so a lower
+  watermark on a later run never makes a refused snapshot readable again.
   Merge-on-read relocation is NOT in that list: it is reached only for a
   non-empty delete bitmap built from below-watermark range tombstones, so the
   replacement masks rows an older snapshot could read, and it reports
@@ -225,23 +231,33 @@ matching entry (and add one for a new subsystem).
   `AbstractTree::retention_floor` exposes the persisted value, and
   `oldest_retained_seqno` reports the same one. A reopened tree reads the
   floor from the recovered version, so the snapshots the live tree refused
-  stay refused after a restart. Version seqnos
-  are non-decreasing along the history (`upgrade_version_with_seqno` clamps),
-  so a counter reset below the floor cannot slip a version under it. A
+  stay refused after a restart. Install seqnos are non-decreasing
+  (`upgrade_version_with_seqno` clamps), so after a counter reset a drop or a
+  filtering compaction cannot install below the current version and raise the
+  floor only that far. A
   manifest rebuilt by `Config::repair` seeds the floor from
   `Config::repair_retention_floor` (default `0`): the tables cannot record it
   and the engine must not guess it (see
   [manifest-recovery.md](manifest-recovery.md#retention-floor)).
 
-- **Retention is per key, so its storage cost is the key versions the window
-  reads, plus what open readers hold.** A superseded key version stays in the
-  tables only while the GC watermark still covers a snapshot that reads it; a
-  table a compaction consumed is released at install unless a reader still
-  holds a version that references it. A wide window therefore costs the
-  superseded versions inside it, not every flush and compaction output
-  produced while it was open, and a long-lived iterator pins the file set it
-  resolved until it drops. Keep `seqno_threshold` as close to the oldest live
-  snapshot as the caller can prove. Pinned by the `retained_history_*` tests in
+- **Retention costs the superseded versions above the floor, the history
+  below it that no compaction has consumed yet, and what open readers hold.**
+  The floor is the only read boundary, and for the engine's own version GC
+  the GC watermark (`gc_watermark` on `flush`, `compact` and `major_compact`)
+  is the one number that moves it (a `clear`, a table drop and a filtering
+  compaction move it too, by the entry above): a superseded key version stays
+  in the tables while a snapshot at or above the watermark still reads it,
+  and once none does a run may collect it and raise the floor to just below
+  the watermark (if it is not already higher). The floor is tree-wide but a
+  run is not: a compaction over some tables raises it while tables it did not
+  touch keep their superseded versions below it, unreadable but still on disk
+  until a later compaction consumes them. A table a compaction consumed is
+  released at install unless a reader still holds a version that references
+  it. A wide window therefore costs the superseded versions it covers, not
+  every flush and compaction output produced while it was open, and a
+  long-lived iterator pins the file set it resolved until it drops. Keep
+  `gc_watermark` as close to the oldest live snapshot as the caller can prove.
+  Pinned by the `retained_history_*` tests in
   `tests/retention_by_live_readers.rs`.
 
 - **Re-applying a put / delete at its original seqno is idempotent; a merge
