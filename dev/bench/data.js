@@ -1,5 +1,5 @@
 window.BENCHMARK_DATA = {
-  "lastUpdate": 1789457676915,
+  "lastUpdate": 1789471579857,
   "repoUrl": "https://github.com/structured-world/coordinode-lsm-tree",
   "entries": {
     "lsm-tree db_bench": [
@@ -22434,6 +22434,90 @@ window.BENCHMARK_DATA = {
             "value": 716249.5041538979,
             "unit": "ops/sec",
             "extra": "P50: 1.2us | P99: 4.5us | P99.9: 27.5us\nthreads: 1 | elapsed: 0.28s | num: 200000 | iterations: 3"
+          }
+        ]
+      },
+      {
+        "commit": {
+          "author": {
+            "email": "mail@polaz.com",
+            "name": "Dmitry Prudnikov",
+            "username": "polaz"
+          },
+          "committer": {
+            "email": "noreply@github.com",
+            "name": "GitHub",
+            "username": "web-flow"
+          },
+          "distinct": true,
+          "id": "49c518758851f1512965638b5d41725523333d0b",
+          "message": "feat(config): change compression policies on a live tree (#642)\n\n## Summary\n\nThe data block, index block and blob compression policies move into\n`RuntimeConfig`, next to the other settings that take effect on the next\nwrite, so `update_runtime_config` changes them on a running tree.\nBefore, all three were fixed at open: the two block policies were\n`Config` fields, and blob compression was a field of\n`KvSeparationOptions`, so moving a cold tree to a heavier codec or a new\ndictionary meant a close and a reopen.\n\nA change rewrites nothing. Every table and blob file records its own\ncodec, and since #640 resolves the dictionary it names by id from the\ntree's own store, so existing files keep decoding the way they were\nwritten while flushes, ingestion, compaction and compaction filters pick\nup the current policy. A generation converges on the new policy when its\ndata is next rewritten.\n\n## The configuration surface\n\n- `Config::data_block_compression_policy` and\n`Config::index_block_compression_policy` stay as builders and now seed\nthe initial runtime snapshot. A new `Config::blob_compression` does the\nsame for blob files and replaces `KvSeparationOptions::compression`. The\npublic fields `Config::data_block_compression_policy` /\n`index_block_compression_policy` and `KvSeparationOptions::compression`\nare removed.\n- `Config::with_runtime_config` keeps the three policies as the builders\nset them. Without that, a caller that set compression and then handed\nover a `RuntimeConfig` would silently lose it to that config's defaults,\nin whichever order the calls came.\n- `BlobTree` gains `update_runtime_config`, `runtime_config` and\n`register_zstd_dictionary`, so a key-value separated tree has the same\nlive surface as a plain one.\n\n## Writers resolve their dictionary when they start\n\nA writer used to take its dictionary from a slot filled at open. It now\nlooks up the id the current policy names in the tree's store at the\nmoment it starts (flush, ingestion, compaction, compaction filter), so a\npolicy change is picked up by the next writer with no slot to refill.\nThe dictionaries a `Config` supplies are what the open registers with\nthe tree, nothing more.\n\nA policy naming a dictionary the tree does not hold is refused before\nanything is written: at open, and in `update_runtime_config`, which\nvalidates the updated snapshot and leaves the current one in place when\nit fails. Register the dictionary first (`register_zstd_dictionary`),\nthen switch the policy to it.\n\n## A dictionary collection racing a writer\n\nMoving the policy opens a window the fixed policy never had. A writer\nresolves dictionary X under the current policy, the policy moves to Y, a\ncollection finds nothing that names X (no installed file yet, and the\npolicy now says Y) and unlinks it, and the writer then installs tables\nnaming an id the tree no longer holds.\n\nTwo parts close it:\n\n- A write takes one runtime snapshot for everything it writes and holds\nit until its files are installed. The hold belongs to the operation, not\nits writers, since finishing a writer comes before the install: a flush\nreturns it as a `WritePin` with its files, an ingestion keeps it until\n`finish` has installed, and a compaction loads one snapshot before it\nsplits into ranges or slices, gives it to its table writers and its\nfilter's blob files alike, and drops it after its install. A snapshot\nnaming no dictionary is not pinned.\n- `update_runtime_config` records the snapshot it replaced (weakly, when\nit named any dictionary), and a collection spares every id a still-held\nreplaced snapshot names. The update validates and publishes under the\nversion lock, which is what orders it against a collection; the caller's\nmutator runs before the lock is taken, so it may read the tree.\n\n`flush_to_tables` therefore returns the pin as a third element beside\nthe tables and blob files, to be held until `register_tables` returns;\nthat pair is the one public composition that installs files outside the\ntree's own flush.\n\nThe compaction strategy's choice no longer keeps a snapshot for the\nwhole run either. That hold covered the compaction gap by accident, and\nonly when the choice and the writers happened to see the same snapshot.\n\nCounting references to the dictionary itself was tried first and\ndropped: readers and the table handles pin dictionaries too, so \"someone\nholds it\" does not mean \"a writer will name it\", and five collection\ntests failed on it.\n\n## compare-rocksdb: the ribbon variant measured the plain read path\n\nUnrelated to the policy change, found while migrating the bench to\n`blob_compression`. Each variant applied its own settings first and the\nsymmetry preset last, so the preset switched the `ours-ribbon` variant's\nlocator back off and it measured the ordinary read path. The preset is\nnow applied first. The `ours-ribbon` numbers on the comparison dashboard\nwill move after this merges; that is the fix, not a regression.\n\n## Performance\n\nThe read and insert paths are untouched. Writer setup does one registry\nlookup and one `Arc` clone per flush, ingestion or compaction, where it\nused to read a slot; the pin is one optional `Arc` and allocates\nnothing. `update_runtime_config` now takes the version lock, which it\nholds only while it validates and swaps the snapshot.\n\n## Testing\n\n`cargo nextest run --workspace --all-features` 3430/3430 and\n`--workspace` 2689/2689, `cargo test --doc --all-features` 80/80, clippy\nwith `-D warnings` for `--all-features`, the default features and\n`--features zstd`, `cargo doc --no-deps` clean in both configurations,\nno-std check 0 errors, `cargo fmt --check` clean. Clippy is also clean\non `tools/compare-rocksdb` and `tools/db_bench`, and `tools/sst-dump`\npasses 37/37.\n\nNew tests in `src/tree/live_compression_tests.rs`:\n\n- a blob compression change applies to the next blob file, and both\ngenerations read back, including after a reopen;\n- a compaction filter reads every blob generation (three codecs in one\ntree);\n- a relocation after a live blob policy change keeps each file\ndecodable;\n- a data block policy change applies to the next flush and to\ncompaction;\n- an update naming a dictionary the tree does not hold changes nothing;\n- an update whose mutator reads the tree completes (it hung under the\nversion lock);\n- a dictionary a held snapshot names survives a collection (fails\nwithout recording the replaced snapshot);\n- an ingestion whose policy is replaced while it writes keeps its\ndictionary;\n- the window between finished files and their install, one test per\npath: a flush, a blob flush, an ingestion, a blob ingestion, a parallel\ncompaction and a tight-space slice. Each changes the policy and runs a\ncollection at that point through a test-only failpoint, and each fails\nwithout the hold: the install finds a file naming an unregistered\ndictionary;\n- a compaction filter's blob files opened after a mid-compaction policy\nchange follow the compaction's snapshot, serially and across parallel\nranges.\n\nAnd in `src/config/tests.rs`: the compression builders seed the initial\nruntime config, and `with_runtime_config` keeps what they set (fails\nwith a plain replace). The existing blob tests moved from\n`KvSeparationOptions::compression` to `Config::blob_compression`.\n\nCloses #641\n\n\n<!-- This is an auto-generated comment: release notes by coderabbit.ai\n-->\n\n## Summary by CodeRabbit\n\n* **New Features**\n* Added live runtime configuration for data-block, index-block, and blob\ncompression policies.\n* Compression changes apply to new writes and compaction without\nrestarting; existing files remain readable with their recorded codecs.\n* Added runtime configuration access and updates for blob trees,\nincluding Zstandard dictionary registration.\n\n* **Bug Fixes**\n* Improved consistency of compression and dictionary settings during\ningestion, flushing, and compaction.\n* Prevented removal of dictionaries still required by active writers or\nexisting data.\n\n<!-- end of auto-generated comment: release notes by coderabbit.ai -->",
+          "timestamp": "2026-09-15T14:23:59+03:00",
+          "tree_id": "36f410d47f50a45112e318b0077c1dfc240bbf85",
+          "url": "https://github.com/structured-world/coordinode-lsm-tree/commit/49c518758851f1512965638b5d41725523333d0b"
+        },
+        "date": 1789471556862,
+        "tool": "customBiggerIsBetter",
+        "benches": [
+          {
+            "name": "mixed",
+            "value": 134283.71322585264,
+            "unit": "ops/sec",
+            "extra": "P50: 0.3us | P99: 5.4us | P99.9: 7.9us\nthreads: 1 | elapsed: 3.99s | num: 200000 | iterations: 3"
+          },
+          {
+            "name": "fillseq",
+            "value": 4417109.993592098,
+            "unit": "ops/sec",
+            "extra": "P50: 0.1us | P99: 1.2us | P99.9: 1.6us\nthreads: 1 | elapsed: 0.05s | num: 200000 | iterations: 3"
+          },
+          {
+            "name": "fillrandom",
+            "value": 1385527.3301777856,
+            "unit": "ops/sec",
+            "extra": "P50: 0.6us | P99: 1.8us | P99.9: 3.1us\nthreads: 1 | elapsed: 0.14s | num: 200000 | iterations: 3"
+          },
+          {
+            "name": "readrandom",
+            "value": 870289.4003367925,
+            "unit": "ops/sec",
+            "extra": "P50: 1.0us | P99: 3.2us | P99.9: 17.7us\nthreads: 1 | elapsed: 0.23s | num: 200000 | iterations: 3"
+          },
+          {
+            "name": "readseq",
+            "value": 4497680.591095977,
+            "unit": "ops/sec",
+            "extra": "P50: 0.1us | P99: 1.9us | P99.9: 2.4us\nthreads: 1 | elapsed: 0.04s | num: 200000 | iterations: 3"
+          },
+          {
+            "name": "seekrandom",
+            "value": 511721.084007838,
+            "unit": "ops/sec",
+            "extra": "P50: 1.7us | P99: 3.7us | P99.9: 5.1us\nthreads: 1 | elapsed: 0.39s | num: 200000 | iterations: 3"
+          },
+          {
+            "name": "prefixscan",
+            "value": 252872.5295219954,
+            "unit": "ops/sec",
+            "extra": "P50: 3.7us | P99: 4.8us | P99.9: 9.6us\nthreads: 1 | elapsed: 0.79s | num: 200000 | iterations: 3"
+          },
+          {
+            "name": "overwrite",
+            "value": 1408740.8056242117,
+            "unit": "ops/sec",
+            "extra": "P50: 0.6us | P99: 1.9us | P99.9: 4.6us\nthreads: 1 | elapsed: 0.14s | num: 200000 | iterations: 3"
+          },
+          {
+            "name": "mergerandom",
+            "value": 1228924.1278649592,
+            "unit": "ops/sec",
+            "extra": "P50: 0.3us | P99: 1.4us | P99.9: 2.5us\nthreads: 1 | elapsed: 0.16s | num: 200000 | iterations: 3"
+          },
+          {
+            "name": "readwhilewriting",
+            "value": 716155.3375445821,
+            "unit": "ops/sec",
+            "extra": "P50: 1.2us | P99: 4.5us | P99.9: 26.8us\nthreads: 1 | elapsed: 0.28s | num: 200000 | iterations: 3"
           }
         ]
       }
