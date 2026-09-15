@@ -1,5 +1,5 @@
 window.BENCHMARK_DATA = {
-  "lastUpdate": 1789482126409,
+  "lastUpdate": 1789494395314,
   "repoUrl": "https://github.com/structured-world/coordinode-lsm-tree",
   "entries": {
     "lsm-tree db_bench": [
@@ -22602,6 +22602,90 @@ window.BENCHMARK_DATA = {
             "value": 728681.9106460876,
             "unit": "ops/sec",
             "extra": "P50: 1.2us | P99: 4.5us | P99.9: 26.9us\nthreads: 1 | elapsed: 0.27s | num: 200000 | iterations: 3"
+          }
+        ]
+      },
+      {
+        "commit": {
+          "author": {
+            "email": "mail@polaz.com",
+            "name": "Dmitry Prudnikov",
+            "username": "polaz"
+          },
+          "committer": {
+            "email": "noreply@github.com",
+            "name": "GitHub",
+            "username": "web-flow"
+          },
+          "distinct": true,
+          "id": "c4161e51d3bc0691af6cbbf6301cf67d9482e7bd",
+          "message": "refactor(compaction): name the GC watermark once (#644)\n\n## Summary\n\nWith the version history no longer pruned by the watermark, the number a\nflush or compaction takes means one thing: every snapshot at or above it\nstays readable, and a version only snapshots below it could see may be\ncollected, raising the retention floor to just below it. It went by four\nnames (`seqno_threshold`, `mvcc_gc_watermark`, `gc_seqno_threshold`,\n`eviction_seqno`). It is now `gc_watermark` everywhere, the name\n`register_tables` already used.\n\n- `compact`, `major_compact`, `flush` and `flush_active_memtable` take\n`gc_watermark`. The meaning is documented once at `major_compact`, and\n`compact` and `flush` point to it.\n- Internally, `compaction::worker::Options`, `inner_compact`,\n`CompactionStream` and the bottommost seqno zeroer use the same name.\n- `docs/INVARIANTS.md` states retention cost as the superseded versions\nabove the floor plus what open readers hold, with the floor as the only\nread boundary. Two stale claims there are corrected:\n  - a flush that collected under the watermark does raise the floor;\n- the install-seqno clamp guards the floor a drop records, not read\nrouting.\n\nThe public parameter renames are positional, so no call site changes;\nworth one line in the release notes.\n\n## Testing\n\nNo behaviour change.\n\n- `cargo nextest run --all-features`: 3430 passed. Default features:\n2689 passed.\n- `cargo test --doc --all-features`.\n- `cargo clippy --all-targets -D warnings` for all-features, default and\n`--features zstd`, plus `tools/db_bench`.\n- `cargo doc` with default features and with all features.\n- `cargo check --no-default-features --features alloc`: no errors,\nwarning count unchanged.\n\nCloses #628\n\n\n<!-- This is an auto-generated comment: release notes by coderabbit.ai\n-->\n## Summary by CodeRabbit\n\n- **Refactor**\n- Standardized garbage-collection watermark terminology across\ncompaction, flushing, retention interfaces, and configuration.\n- Renamed the public compaction watermark option for clearer API\nconsistency.\n\n- **Bug Fixes**\n  - Improved retention-floor tracking for flushes that collect versions.\n- Ensured install sequence numbers remain non-decreasing, including\nafter counter resets.\n- Expanded retention-cost accounting to include superseded versions,\nretained history, and open-reader pins.\n\n- **Documentation**\n- Updated invariants and integration guidance to reflect watermark-based\ncollection and retention behavior.\n<!-- end of auto-generated comment: release notes by coderabbit.ai -->",
+          "timestamp": "2026-09-15T20:44:13+03:00",
+          "tree_id": "d125d329d9b3c637742a66f23f7f956823c307a4",
+          "url": "https://github.com/structured-world/coordinode-lsm-tree/commit/c4161e51d3bc0691af6cbbf6301cf67d9482e7bd"
+        },
+        "date": 1789494371600,
+        "tool": "customBiggerIsBetter",
+        "benches": [
+          {
+            "name": "mixed",
+            "value": 120702.3770545537,
+            "unit": "ops/sec",
+            "extra": "P50: 0.3us | P99: 6.4us | P99.9: 10.0us\nthreads: 1 | elapsed: 4.43s | num: 200000 | iterations: 3"
+          },
+          {
+            "name": "fillseq",
+            "value": 4306290.881637913,
+            "unit": "ops/sec",
+            "extra": "P50: 0.1us | P99: 1.3us | P99.9: 1.6us\nthreads: 1 | elapsed: 0.05s | num: 200000 | iterations: 3"
+          },
+          {
+            "name": "fillrandom",
+            "value": 1368103.6137102533,
+            "unit": "ops/sec",
+            "extra": "P50: 0.6us | P99: 1.9us | P99.9: 3.1us\nthreads: 1 | elapsed: 0.15s | num: 200000 | iterations: 3"
+          },
+          {
+            "name": "readrandom",
+            "value": 906032.0460635391,
+            "unit": "ops/sec",
+            "extra": "P50: 1.1us | P99: 3.1us | P99.9: 8.1us\nthreads: 1 | elapsed: 0.22s | num: 200000 | iterations: 3"
+          },
+          {
+            "name": "readseq",
+            "value": 4348509.086481518,
+            "unit": "ops/sec",
+            "extra": "P50: 0.1us | P99: 1.9us | P99.9: 2.6us\nthreads: 1 | elapsed: 0.05s | num: 200000 | iterations: 3"
+          },
+          {
+            "name": "seekrandom",
+            "value": 487181.6277806086,
+            "unit": "ops/sec",
+            "extra": "P50: 1.8us | P99: 3.8us | P99.9: 5.3us\nthreads: 1 | elapsed: 0.41s | num: 200000 | iterations: 3"
+          },
+          {
+            "name": "prefixscan",
+            "value": 248432.42956592506,
+            "unit": "ops/sec",
+            "extra": "P50: 3.7us | P99: 4.7us | P99.9: 10.4us\nthreads: 1 | elapsed: 0.81s | num: 200000 | iterations: 3"
+          },
+          {
+            "name": "overwrite",
+            "value": 1312452.6750072464,
+            "unit": "ops/sec",
+            "extra": "P50: 0.7us | P99: 1.9us | P99.9: 3.7us\nthreads: 1 | elapsed: 0.15s | num: 200000 | iterations: 3"
+          },
+          {
+            "name": "mergerandom",
+            "value": 1269131.1124186122,
+            "unit": "ops/sec",
+            "extra": "P50: 0.3us | P99: 1.3us | P99.9: 2.2us\nthreads: 1 | elapsed: 0.16s | num: 200000 | iterations: 3"
+          },
+          {
+            "name": "readwhilewriting",
+            "value": 656917.7359393295,
+            "unit": "ops/sec",
+            "extra": "P50: 1.3us | P99: 4.7us | P99.9: 27.0us\nthreads: 1 | elapsed: 0.30s | num: 200000 | iterations: 3"
           }
         ]
       }
