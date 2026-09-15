@@ -215,11 +215,12 @@ matching entry (and add one for a new subsystem).
   snapshots saw raises the version's *retention floor* in the same version
   edit (`Version::retention_floor`, the `retention_floor` manifest section and
   the appended edit-log field): a flush or compaction that collected a
-  version under GC watermark `w` sets it to `w - 1` (capped at its own install
-  seqno), a `clear`, a table drop or a compaction whose filter removed or
-  rewrote rows to its own install seqno; an ingest, move, blob relocation, a
-  flush or compaction that collected nothing, or an empty drop leaves it
-  alone.
+  version under GC watermark `w` raises it to `w - 1` (capped at its own
+  install seqno), a `clear`, a table drop or a compaction whose filter removed
+  or rewrote rows to its own install seqno; an ingest, move, blob relocation,
+  a flush or compaction that collected nothing, or an empty drop leaves it
+  alone. The floor only rises (`Version::with_retention_floor`), so a lower
+  watermark on a later run never makes a refused snapshot readable again.
   Merge-on-read relocation is NOT in that list: it is reached only for a
   non-empty delete bitmap built from below-watermark range tombstones, so the
   replacement masks rows an older snapshot could read, and it reports
@@ -243,7 +244,8 @@ matching entry (and add one for a new subsystem).
   and a filtering compaction move it too, by the entry above): a superseded
   key version stays in the tables while a
   snapshot at or above the watermark still reads it, and once none does a run
-  may collect it and raise the floor to just below the watermark. A table a
+  may collect it and raise the floor to just below the watermark (if it is
+  not already higher). A table a
   compaction consumed is released at install unless a reader still holds a
   version that references it. A wide window therefore costs the superseded
   versions it covers, not every flush and compaction output produced while it

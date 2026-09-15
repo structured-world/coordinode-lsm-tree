@@ -75,9 +75,10 @@ pub struct Options {
     /// the tree is dropped.
     pub stop_signal: StopSignal,
 
-    /// The GC watermark: every snapshot at or above it stays readable, and a
-    /// version only snapshots below it could see may be collected. A run that
-    /// collects one raises the retention floor to just below it.
+    /// The GC watermark: a version only snapshots below it could see may be
+    /// collected, and a run that collects one raises the retention floor to
+    /// just below it (never lowering a higher floor). See
+    /// [`AbstractTree::major_compact`](crate::AbstractTree::major_compact).
     pub gc_watermark: crate::SeqNo,
 
     pub compaction_state: Arc<Mutex<CompactionState>>,

@@ -5,7 +5,7 @@
 //!
 //! A table records the id of the dictionary it was compressed with, and that id
 //! is all it records. This module is what turns the id back into bytes across a
-//! reopen: one file per dictionary under [`DICTS_FOLDER`], named by the id.
+//! reopen: one file per dictionary under [`DICTS_FOLDER`](crate::file::DICTS_FOLDER), named by the id.
 //!
 //! ## Why the name is the checksum
 //!

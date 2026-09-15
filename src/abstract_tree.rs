@@ -707,8 +707,10 @@ pub trait AbstractTree: sealed::Sealed {
     /// # GC watermark (`gc_watermark`)
     ///
     /// `gc_watermark` is the one number that decides what history the engine's
-    /// own GC may collect: every snapshot at or above it stays readable, and a
-    /// version only snapshots below it could see may be dropped. Concretely,
+    /// own GC may collect: every snapshot at or above it that is still servable
+    /// (above the current retention floor) stays readable, and a version only
+    /// snapshots below it could see may be dropped. It never lowers the floor:
+    /// a snapshot an earlier run already refused stays refused. Concretely,
     /// only entries whose seqno is `< gc_watermark` are eligible for:
     ///
     /// - dropping shadowed versions / GC-ing tombstones, and
@@ -732,7 +734,8 @@ pub trait AbstractTree: sealed::Sealed {
     ///   and leaves a merge-only key's full operand chain intact.
     ///
     /// A run that collects anything raises the retention floor to
-    /// `gc_watermark - 1` (capped at the install's own seqno). The floor is the
+    /// `gc_watermark - 1` (capped at the install's own seqno) unless it is
+    /// already higher. The floor is the
     /// only read boundary: from then on a new read at or below it (see
     /// [`oldest_retained_seqno`](Self::oldest_retained_seqno)) fails with
     /// [`Error::SnapshotBelowRetention`](crate::Error::SnapshotBelowRetention),

@@ -108,8 +108,8 @@ pub struct CompactionStream<'a, I: Iterator<Item = Item>, F: StreamFilter = NoFi
     /// KV stream
     inner: CountingPeek<I>,
 
-    /// The GC watermark: every snapshot at or above it stays readable, and a
-    /// version only snapshots below it could see may be collected.
+    /// The GC watermark: the stream keeps every version a snapshot at or above
+    /// it reads, and may drop a version only snapshots below it could see.
     gc_watermark: SeqNo,
 
     /// Event emitter that receives all dropped KVs
@@ -161,7 +161,7 @@ pub struct CompactionStream<'a, I: Iterator<Item = Item>, F: StreamFilter = NoFi
     /// collects the lot and writes no table.
     ///
     /// It is a BALANCE rather than a list of drop sites: `Counting` adds on
-    /// every consumption and [`Self::note_emitted`] subtracts on every emit, so
+    /// every consumption and [`Self::settle_one`] subtracts on every emit, so
     /// any way of losing a version registers itself. The polarity is chosen so
     /// that an oversight over-reports (the floor rises, reads are refused)
     /// rather than under-reports (the floor stays put and a read is answered
