@@ -1034,7 +1034,13 @@ impl AbstractTree for BlobTree {
         &self,
         stream: impl Iterator<Item = crate::Result<InternalValue>>,
         range_tombstones: Vec<crate::range_tombstone::RangeTombstone>,
-    ) -> crate::Result<Option<(Vec<Table>, Option<Vec<BlobFile>>)>> {
+    ) -> crate::Result<
+        Option<(
+            Vec<Table>,
+            Option<Vec<BlobFile>>,
+            crate::runtime_config::WritePin,
+        )>,
+    > {
         use crate::{coding::Encode, file::BLOBS_FOLDER, table::multi_writer::MultiWriter};
 
         let start = crate::time::Instant::now();
@@ -1116,7 +1122,8 @@ impl AbstractTree for BlobTree {
         table_writer = table_writer.use_kv_checksums(rc.kv_checksums, rc.kv_checksum_algo);
         table_writer = table_writer.use_locator(self.index.config.locator_policy.get(0));
 
-        // Resolved from `rc`, which the writer holds, as in the standard flush.
+        // Resolved from `rc`, which the writers hold and then hand to the
+        // install, as in the standard flush.
         #[cfg(zstd_any)]
         let dicts = self.index.config.current_zstd_dictionaries();
         #[cfg(zstd_any)]
@@ -1217,6 +1224,9 @@ impl AbstractTree for BlobTree {
             }
         }
 
+        let mut write_pin = blob_writer.take_write_pin();
+        write_pin.join(table_writer.take_write_pin());
+
         let blob_files = blob_writer.finish()?;
 
         let result = table_writer.finish()?;
@@ -1260,7 +1270,7 @@ impl AbstractTree for BlobTree {
         // Return Some even when tables is empty (RT-only flush): the caller
         // (AbstractTree::flush) handles empty tables by re-inserting RTs into
         // the active memtable and still needs to delete sealed memtables.
-        Ok(Some((tables, Some(blob_files))))
+        Ok(Some((tables, Some(blob_files), write_pin)))
     }
 
     fn register_tables(

@@ -258,8 +258,9 @@ impl<'a, 'b: 'a> StreamFilterAdapter<'a, 'b> {
             writer
         } else {
             // Instantiate writer as necessary, under the blob compression in
-            // force now. The writer holds the snapshot, so a collection cannot
-            // take the dictionary it names while the writer is still open.
+            // force now. The writer holds the snapshot, and the produced output
+            // after it, so a collection cannot take the dictionary it names
+            // before its files are installed.
             let rc = self.shared.opts.runtime_config.load_full();
             let writer = BlobFileWriter::new(
                 self.shared.opts.blob_file_id_generator.clone(),

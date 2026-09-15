@@ -489,10 +489,12 @@ pub enum CompressionType {
     ///
     /// `level` is the compression level (1–22), `dict_id` identifies the
     /// dictionary (truncated xxh3 hash of the dictionary bytes). A tree must
-    /// hold the dictionary before a policy names it: supply it through
+    /// hold the dictionary before a policy names it. Supply it through
     /// [`Config::zstd_dictionary`](crate::Config::zstd_dictionary) or
+    /// [`KvSeparationOptions::dict`](crate::KvSeparationOptions::dict), or
     /// register it with
-    /// [`Tree::register_zstd_dictionary`](crate::Tree::register_zstd_dictionary).
+    /// [`Tree::register_zstd_dictionary`](crate::Tree::register_zstd_dictionary)
+    /// or [`BlobTree::register_zstd_dictionary`](crate::BlobTree::register_zstd_dictionary).
     #[cfg(zstd_any)]
     ZstdDict {
         /// Compression level (1–22)

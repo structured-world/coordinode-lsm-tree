@@ -162,13 +162,14 @@ pub fn do_compaction(opts: &Options) -> crate::Result<CompactionResult> {
     );
     // Structural decision plus the runtime-config-driven density-rewrite
     // fallback (applied here, where the live runtime config lives, so the
-    // structural strategies stay free of it).
-    let runtime_config = opts.runtime_config.load_full();
+    // structural strategies stay free of it). The snapshot is read for the
+    // choice only; the writers take their own, which is the one that must stay
+    // held until their outputs are installed.
     let choice = super::choose_with_density_rewrite(
         &*opts.strategy,
         &version_history_lock.latest_version_ref().version,
         &opts.config,
-        &runtime_config,
+        &opts.runtime_config.load(),
         &compaction_state,
     );
 
@@ -1090,7 +1091,7 @@ fn run_tight_space_compaction(
                 None
             };
 
-            let produced = run_subcompaction(
+            let mut produced = run_subcompaction(
                 opts,
                 &slice_payload,
                 &version.version,
@@ -1138,13 +1139,15 @@ fn run_tight_space_compaction(
 
             // Advance the cumulative frontier from this slice's relocation, then
             // release `produced` (and its clones of the stale Inners) so the prior
-            // views can punch once drained.
+            // views can punch once drained. Its hold on the outputs' dictionaries
+            // stays until the slice is installed.
             if relocating {
                 for (id, fe) in produced.consumed_through() {
                     let slot = resume_offsets.entry(*id).or_insert(0);
                     *slot = (*slot).max(*fe);
                 }
             }
+            let write_pin = produced.take_write_pin();
             drop(produced);
 
             // Serialize each surviving input's suffix-digest capture (inside
@@ -1309,6 +1312,9 @@ fn run_tight_space_compaction(
                 });
             }
 
+            #[cfg(test)]
+            opts.config.fire_before_output_install();
+
             // Install one atomic, durable version edit for the slice.
             let install = opts.version_history.write().upgrade_version(
                 &opts.config.path,
@@ -1342,6 +1348,7 @@ fn run_tight_space_compaction(
                 // space is freed now instead of at the next orphan sweep.
                 return Err(rollback(e));
             }
+            drop(write_pin);
 
             // Mark, then punch. The install committed, so now record each restricted
             // input's exact bound to its `.restrict-bound` sidecar — STRICTLY AFTER
@@ -1812,8 +1819,13 @@ fn run_subcompaction(
         filter.finish();
     }
 
+    // As in the serial merge: the filter writer's hold goes with the output.
+    let mut filter_write_pin = crate::runtime_config::WritePin::default();
     let extra_blob_files = filter_blob_writer
-        .map(BlobFileWriter::finish)
+        .map(|mut writer| {
+            filter_write_pin = writer.take_write_pin();
+            writer.finish()
+        })
         .transpose()?
         .unwrap_or_default();
 
@@ -1829,6 +1841,7 @@ fn run_subcompaction(
                 blob_file.mark_as_deleted();
             }
         })?;
+    produced.hold(filter_write_pin);
     if filter_marker.load(core::sync::atomic::Ordering::Relaxed) > 0 {
         produced.mark_filter_transformed();
     }
@@ -2453,6 +2466,9 @@ fn merge_tables(
             }
             let outputs = committed;
 
+            #[cfg(test)]
+            opts.config.fire_before_output_install();
+
             // Re-acquire locks and install one atomic version edit for all outputs.
             let mut compaction_state = opts.compaction_state.lock();
             let mut version_history_lock = opts.version_history.write();
@@ -2773,8 +2789,14 @@ fn merge_tables(
 
     log::trace!("Blob fragmentation diff: {blob_frag_map:#?}");
 
+    // The filter's blob writer holds the dictionary its files name; the hold
+    // rides with the produced output to the install.
+    let mut filter_write_pin = crate::runtime_config::WritePin::default();
     let extra_blob_files = filter_blob_writer
-        .map(BlobFileWriter::finish)
+        .map(|mut writer| {
+            filter_write_pin = writer.take_write_pin();
+            writer.finish()
+        })
         .transpose()
         .inspect_err(|e| {
             // NOTE: We cannot use hidden_guard here because we already locked the compaction state
@@ -2812,6 +2834,7 @@ fn merge_tables(
                 blob_file.mark_as_deleted();
             }
         })?;
+    produce_output.hold(filter_write_pin);
     if filter_marker.load(core::sync::atomic::Ordering::Relaxed) > 0 {
         produce_output.mark_filter_transformed();
     }

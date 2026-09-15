@@ -248,8 +248,10 @@ pub struct TreeInner {
     /// dictionary that snapshot's policy names from the tree's store. A policy
     /// change in between must not let a collection take that dictionary, or the
     /// writer produces a table naming a file that is gone. So a collection
-    /// spares every dictionary a still-held snapshot here names; a snapshot no
-    /// writer holds any more has no strong reference left and drops out.
+    /// spares every dictionary a still-held snapshot here names. The write
+    /// holds its snapshot through a [`WritePin`](crate::runtime_config::WritePin)
+    /// until its files are installed; a snapshot nothing holds any more has no
+    /// strong reference left and drops out.
     #[cfg(zstd_any)]
     pub(crate) retired_write_snapshots:
         Mutex<alloc::vec::Vec<alloc::sync::Weak<crate::runtime_config::RuntimeConfig>>>,

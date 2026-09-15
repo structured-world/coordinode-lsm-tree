@@ -670,6 +670,14 @@ pub struct Config {
     #[cfg(all(test, feature = "std"))]
     pub(crate) fail_tight_blob_reopen: Arc<core::sync::atomic::AtomicBool>,
 
+    /// Test-only failpoint: run once, then disarmed, between the moment a write
+    /// has finished its output files and the moment it installs them (a flush,
+    /// an ingestion, a parallel or tight-space compaction), so a test can put a
+    /// concurrent operation into that window deterministically. Behind
+    /// `cfg(test)`, never compiled into release builds.
+    #[cfg(all(test, feature = "std"))]
+    pub(crate) before_output_install: Arc<std::sync::Mutex<Option<OutputInstallHook>>>,
+
     /// A dictionary supplied for the data block policy to name. The open
     /// registers it with the tree, so it survives the reopen without being
     /// supplied again.
@@ -818,6 +826,34 @@ impl Default for Config {
             fail_tight_after_first_slice: Arc::new(core::sync::atomic::AtomicBool::new(false)),
             #[cfg(all(test, feature = "std"))]
             fail_tight_blob_reopen: Arc::new(core::sync::atomic::AtomicBool::new(false)),
+            #[cfg(all(test, feature = "std"))]
+            before_output_install: Arc::new(std::sync::Mutex::new(None)),
+        }
+    }
+}
+
+/// The callback the [`Config::before_output_install`] failpoint runs.
+#[cfg(all(test, feature = "std"))]
+pub(crate) type OutputInstallHook = Box<dyn FnOnce() + Send>;
+
+#[cfg(all(test, feature = "std"))]
+impl Config {
+    /// Arms the [`Self::before_output_install`] failpoint with `hook`.
+    #[cfg(zstd_any)]
+    pub(crate) fn arm_before_output_install(&self, hook: impl FnOnce() + Send + 'static) {
+        #[expect(clippy::unwrap_used, reason = "test-only seam")]
+        self.before_output_install
+            .lock()
+            .unwrap()
+            .replace(Box::new(hook));
+    }
+
+    /// Runs the [`Self::before_output_install`] failpoint once, if armed.
+    pub(crate) fn fire_before_output_install(&self) {
+        #[expect(clippy::unwrap_used, reason = "test-only seam")]
+        let hook = self.before_output_install.lock().unwrap().take();
+        if let Some(hook) = hook {
+            hook();
         }
     }
 }

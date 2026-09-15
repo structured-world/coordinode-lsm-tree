@@ -84,7 +84,7 @@ fn blob_zstd_dict_matching_dict_is_accepted() {
 }
 
 #[test]
-fn the_compression_builders_seed_the_initial_runtime_config() {
+fn compression_builders_on_a_config_seed_the_initial_runtime_config() {
     // The three compression settings live in the runtime config; the builders
     // are how a caller sets what the tree starts with.
     let data = CompressionPolicy::new([CompressionType::None, CompressionType::Zstd(9)]);
@@ -111,7 +111,7 @@ fn the_compression_builders_seed_the_initial_runtime_config() {
 }
 
 #[test]
-fn with_runtime_config_keeps_what_the_compression_builders_set() {
+fn with_runtime_config_after_compression_builders_keeps_their_policies() {
     // The compression settings moved into the runtime config, where
     // `with_runtime_config` replaces the snapshot. A caller that set its
     // compression through the builders BEFORE handing over a runtime config

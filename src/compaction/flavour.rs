@@ -8,6 +8,7 @@ use crate::coding::{Decode, Encode};
 use crate::compaction::Input as CompactionPayload;
 use crate::compaction::worker::Options;
 use crate::range_tombstone::RangeTombstone;
+use crate::runtime_config::WritePin;
 use crate::table::multi_writer::MultiWriter;
 use crate::time::Instant;
 use crate::version::{SuperVersions, Version};
@@ -233,9 +234,9 @@ pub(super) fn prepare_table_writer(
     );
 
     // The dictionary this snapshot's policy names for the destination level.
-    // The writer holds the snapshot until its tables are installed: a
-    // collection spares what a held snapshot names, however the policy has
-    // changed since.
+    // The writer holds the snapshot while it writes and the produced output
+    // after it, until the install: a collection spares what a held snapshot
+    // names, however the policy has changed since.
     #[cfg(zstd_any)]
     let table_writer = table_writer
         .use_zstd_dictionary(
@@ -309,6 +310,10 @@ pub(super) struct ProducedOutput {
     /// must not raise the retention floor: doing so refuses snapshots whose
     /// data is still on disk.
     collected_below_watermark: bool,
+    /// The writers' hold on the dictionaries these outputs were written
+    /// against. Nothing installed names them before the install, so the hold
+    /// lasts until then; see [`install_merge`].
+    write_pin: WritePin,
 }
 
 #[cfg_attr(
@@ -357,6 +362,19 @@ impl ProducedOutput {
         self.collected_below_watermark = true;
     }
 
+    /// Adds a hold on dictionaries to this output, for files a writer outside
+    /// the flavour produced (the compaction filter's blob files).
+    pub(super) fn hold(&mut self, pin: WritePin) {
+        self.write_pin.join(pin);
+    }
+
+    /// Takes the hold for an install that does not go through
+    /// [`install_merge`] (the tight-space slice), which must keep it until its
+    /// own version edit is done.
+    pub(super) fn take_write_pin(&mut self) -> WritePin {
+        core::mem::take(&mut self.write_pin)
+    }
+
     /// Marks this produced-but-not-installed output's freshly written files as
     /// deleted. Used when a sibling sub-compaction fails and the shared
     /// [`install_merge`] is skipped: each already-finished sub-compaction has
@@ -396,6 +414,9 @@ impl ProducedOutput {
             // physically removed and no filter acted, so neither of the other
             // two signals catches it: say it here.
             collected_below_watermark: true,
+            // The source's blocks are reused, so the source, installed until
+            // this replaces it, names their dictionary.
+            write_pin: WritePin::default(),
         }
     }
 }
@@ -438,6 +459,9 @@ pub(super) fn install_merge(
     let mut blob_frag_map = FragmentationMap::default();
     let mut filter_transformed = false;
     let mut collected_below_watermark = false;
+    // Held to the end of the install, past the version edit: until it lands no
+    // installed file names the outputs' dictionaries.
+    let mut write_pin = WritePin::default();
 
     for out in outputs {
         created_tables.extend(out.created_tables);
@@ -447,6 +471,7 @@ pub(super) fn install_merge(
         out.blob_frag_map.merge_into(&mut blob_frag_map);
         filter_transformed |= out.filter_transformed;
         collected_below_watermark |= out.collected_below_watermark;
+        write_pin.join(out.write_pin);
     }
 
     // What this install does to older snapshots, read off what the run
@@ -544,6 +569,7 @@ pub(super) fn install_merge(
                 blob_file.mark_as_deleted();
             }
         })?;
+    drop(write_pin);
 
     // NOTE: If the application were to crash >here< it's fine — the tables /
     // blob files are not referenced anymore and are cleaned up upon recovery.
@@ -788,9 +814,12 @@ impl CompactionFlavour for RelocatingCompaction {
 
         let tables_to_delete = core::mem::take(&mut self.inner.tables_to_rewrite);
 
-        let created_tables = self.inner.consume_writer(opts, dst_lvl)?;
+        let (created_tables, write_pin) = self.inner.consume_writer(opts, dst_lvl)?;
         // The output SSTs are already finalized; if blob finalization fails the
-        // compaction aborts, so delete them here or they orphan on disk.
+        // compaction aborts, so delete them here or they orphan on disk. The
+        // relocation writer resolved no dictionary from the policy (it copies
+        // frames, whose sources stay installed until this output replaces
+        // them), so it holds no pin to hand on.
         let mut created_blob_files = self.blob_writer.finish().inspect_err(|_| {
             for table in &created_tables {
                 table.mark_as_deleted();
@@ -808,6 +837,7 @@ impl CompactionFlavour for RelocatingCompaction {
             // The producer owns the filter counter and marks this after.
             filter_transformed: false,
             collected_below_watermark: false,
+            write_pin,
         })
     }
 }
@@ -828,14 +858,22 @@ impl StandardCompaction {
         }
     }
 
-    fn consume_writer(self, opts: &Options, dst_lvl: usize) -> crate::Result<Vec<Table>> {
+    /// Finishes the writer and opens its tables, returning them with the
+    /// writer's hold on their dictionary, which the install still needs.
+    fn consume_writer(
+        mut self,
+        opts: &Options,
+        dst_lvl: usize,
+    ) -> crate::Result<(Vec<Table>, WritePin)> {
         let table_base_folder = self.table_writer.base_path.clone();
         let level_fs = self.table_writer.fs.clone();
 
         let pin_filter = opts.config.filter_block_pinning_policy.get(dst_lvl);
         let pin_index = opts.config.index_block_pinning_policy.get(dst_lvl);
 
-        self.table_writer
+        let write_pin = self.table_writer.take_write_pin();
+        let tables = self
+            .table_writer
             .finish()?
             .into_iter()
             .map(|(table_id, checksum)| -> crate::Result<Table> {
@@ -864,7 +902,8 @@ impl StandardCompaction {
                 }
                 Table::recover(params)
             })
-            .collect::<crate::Result<Vec<_>>>()
+            .collect::<crate::Result<Vec<_>>>()?;
+        Ok((tables, write_pin))
     }
 }
 
@@ -902,7 +941,7 @@ impl CompactionFlavour for StandardCompaction {
         log::debug!("Compaction done in {:?}", self.start.elapsed());
 
         let tables_to_delete = core::mem::take(&mut self.tables_to_rewrite);
-        let created_tables = self.consume_writer(opts, dst_lvl)?;
+        let (created_tables, write_pin) = self.consume_writer(opts, dst_lvl)?;
 
         Ok(ProducedOutput {
             created_tables,
@@ -918,6 +957,7 @@ impl CompactionFlavour for StandardCompaction {
             // The producer owns the filter counter and marks this after.
             filter_transformed: false,
             collected_below_watermark: false,
+            write_pin,
         })
     }
 }

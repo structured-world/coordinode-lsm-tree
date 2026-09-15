@@ -808,7 +808,13 @@ impl AbstractTree for Tree {
         &self,
         stream: impl Iterator<Item = crate::Result<InternalValue>>,
         range_tombstones: Vec<crate::range_tombstone::RangeTombstone>,
-    ) -> crate::Result<Option<(Vec<Table>, Option<Vec<BlobFile>>)>> {
+    ) -> crate::Result<
+        Option<(
+            Vec<Table>,
+            Option<Vec<BlobFile>>,
+            crate::runtime_config::WritePin,
+        )>,
+    > {
         use crate::table::multi_writer::MultiWriter;
         use crate::time::Instant;
 
@@ -900,8 +906,9 @@ impl AbstractTree for Tree {
         table_writer = table_writer.use_locator(self.config.locator_policy.get(0));
 
         // The dictionary THIS snapshot's policy names. The writer holds the
-        // snapshot until its tables are installed: a collection spares what a
-        // held snapshot names, however the policy has changed since.
+        // snapshot, and the caller after it until the tables are installed: a
+        // collection spares what a held snapshot names, however the policy has
+        // changed since.
         #[cfg(zstd_any)]
         {
             table_writer = table_writer
@@ -943,6 +950,7 @@ impl AbstractTree for Tree {
             table_writer.write(item?)?;
         }
 
+        let write_pin = table_writer.take_write_pin();
         let result = table_writer.finish()?;
 
         log::debug!("Flushed memtable(s) in {:?}", start.elapsed());
@@ -984,7 +992,7 @@ impl AbstractTree for Tree {
         // Return Some even when tables is empty (RT-only flush): the caller
         // (AbstractTree::flush) handles empty tables by re-inserting RTs into
         // the active memtable and still needs to delete sealed memtables.
-        Ok(Some((tables, None)))
+        Ok(Some((tables, None, write_pin)))
     }
 
     #[expect(clippy::significant_drop_tightening)]
@@ -1990,7 +1998,8 @@ impl Tree {
     /// tables are compressed against it. What is written next includes the
     /// writers already running: a flush or compaction started under a policy
     /// [`Self::update_runtime_config`] has since replaced still writes against
-    /// the dictionary that policy named, so it is spared until they finish.
+    /// the dictionary that policy named, so it is spared until their files are
+    /// installed and name it themselves.
     ///
     /// The whole pass holds the version lock. Registration takes the same lock
     /// before it writes anything, so the two cannot interleave: without that, a

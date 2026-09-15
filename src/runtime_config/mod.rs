@@ -57,7 +57,9 @@
 pub mod types;
 
 pub(crate) mod handle;
+mod pin;
 
+pub use pin::WritePin;
 pub use types::{
     ChecksumAlgorithm, ECC_DESCRIPTOR_LEN, EccDescriptor, EccGranularity, EccScheme,
     KvChecksumComputePoint, KvChecksumPolicy, LevelMask, RuntimeConfig, TableIdRange,
