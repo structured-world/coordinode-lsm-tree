@@ -94,10 +94,19 @@ impl Version {
             }
         }
 
+        // The registered dictionaries change only on a registration or a
+        // collection, so like the floor they are carried exactly when they
+        // differ, and then in full (the replay replaces the set wholesale).
+        let dicts = (self.dicts() != prior.dicts()).then(|| self.dicts().to_vec());
+
         // The retention floor only ever rises, and only on a GC compaction /
-        // clear / table drop, so it is carried exactly when it changed.
-        let retention_floor =
-            (self.retention_floor() != prior.retention_floor()).then(|| self.retention_floor());
+        // clear / table drop, so it is carried exactly when it changed — OR
+        // when the dictionaries are carried, because that section sits after
+        // the floor in a positional payload and cannot be decoded without it.
+        // Re-stating the current floor replays as the no-op it is.
+        let retention_floor = (self.retention_floor() != prior.retention_floor()
+            || dicts.is_some())
+        .then(|| self.retention_floor());
 
         Ok(VersionEdit {
             new_version_id: self.id(),
@@ -108,6 +117,7 @@ impl Version {
             restrictions,
             blob_restrictions,
             retention_floor,
+            dicts,
         })
     }
 }

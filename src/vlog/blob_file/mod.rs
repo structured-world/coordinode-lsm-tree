@@ -90,6 +90,22 @@ pub struct Inner {
     // for the rationale (no-std-friendly one-shot slot).
     pub(crate) deletion_pause: once_cell::race::OnceBox<Arc<DeletionPause>>,
 
+    /// The dictionary this file's blobs were compressed against, resolved once
+    /// when the handle is built and held for its life. `None` when
+    /// [`Metadata::compression`] is not
+    /// [`ZstdDict`](crate::CompressionType::ZstdDict), or when the tree did not
+    /// hold the id the file records.
+    ///
+    /// Pinned here rather than looked up per read, exactly as a table pins
+    /// its own: the handle that keeps a blob file readable has to keep the
+    /// bytes that decode it readable too. A reader captures a version, and
+    /// that capture defers the file's deletion past a `clear` that drains the
+    /// history; a dictionary resolved from the LIVE registry instead would be
+    /// collected out from under that reader, since collection only spares what
+    /// a RETAINED version still names.
+    #[cfg(zstd_any)]
+    pub(crate) zstd_dictionary: Option<Arc<crate::compression::ZstdDictionary>>,
+
     /// Tree-wide background file deleter. See
     /// [`Table::install_background_deleter`](crate::Table) for the contract:
     /// when present (and no checkpoint pause is active) the [`Drop`] impl frees
@@ -419,6 +435,17 @@ impl BlobFile {
             &self.0.path,
             frontier,
         )?);
+        // The restricted view is the SAME file, so its dictionary is the one
+        // already pinned here. Carrying it over re-resolves nothing and cannot
+        // disagree with the descriptor the view keeps.
+        #[cfg(zstd_any)]
+        let dicts = self
+            .0
+            .zstd_dictionary
+            .clone()
+            .map_or_else(crate::compression::ZstdDictionaries::new, |d| {
+                crate::compression::ZstdDictionaries::new().with(d)
+            });
         super::recover_blob_file_from(
             &self.0.path,
             self.0.id,
@@ -426,6 +453,8 @@ impl BlobFile {
             self.0.tree_id,
             &self.0.fs,
             frontier,
+            #[cfg(zstd_any)]
+            &dicts,
         )
     }
 

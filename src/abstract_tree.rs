@@ -37,9 +37,13 @@ pub struct CheckpointInfo {
     /// the SSTs, the blob files, and the `.restrict-bound` sidecar that belongs
     /// to a tight-space-restricted SST (per-table state, written beside its
     /// table, that a restore needs to recover the exact bound). Tree-level
-    /// metadata — the manifest, the version pointer, the config — is NOT
-    /// counted: this figure describes the captured data, not the whole
-    /// directory.
+    /// metadata — the manifest, the version pointer, the config, and the
+    /// compression dictionaries under `dicts/` — is NOT counted: this figure
+    /// describes the captured data, not the whole directory. A checkpoint of a
+    /// dictionary-compressed tree therefore holds a little more on disk than
+    /// this reports, by the size of the dictionaries it carries (order 100 KiB
+    /// each, and shared by every table written against them rather than
+    /// per-table like the data this counts).
     ///
     /// It measures the same SET of files as
     /// [`StorageStats::used_bytes`](crate::StorageStats::used_bytes), which

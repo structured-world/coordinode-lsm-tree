@@ -474,9 +474,7 @@ impl<'a> Ingestion<'a> {
                 params.encryption.clone_from(&self.tree.config.encryption);
                 #[cfg(zstd_any)]
                 {
-                    params
-                        .zstd_dictionary
-                        .clone_from(&self.tree.config.zstd_dictionary);
+                    params.zstd_dictionaries = self.tree.config.current_zstd_dictionaries();
                 }
                 #[cfg(feature = "metrics")]
                 {

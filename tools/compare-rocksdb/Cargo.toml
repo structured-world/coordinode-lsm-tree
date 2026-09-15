@@ -42,15 +42,13 @@ lsm-tree = { package = "coordinode-lsm-tree", path = "../..", features = ["zstd"
 # `DBCompressionType::Zstd` at level 22, matching our engine. The
 # C-toolchain compile burden scales with the codecs the workloads
 # actually need (a future `*_lz4` variant adds rocksdb's `lz4`).
-rocksdb = { version = "0.24", default-features = false, features = ["zstd"] }
+rocksdb = { version = "0.25", default-features = false, features = ["zstd"] }
 # SurrealKV — pure-Rust embedded LSM/MVCC store, the Rust-native
-# comparison point. Not published to crates.io, so pinned to a git tag
-# for reproducibility. No FFI / libclang burden (unlike rocksdb).
-# Pinned to the exact commit behind tag v0.21.2. The repo gitignores
-# Cargo.lock, so a bare `tag = "v0.21.2"` could silently resolve to a
-# different commit if the tag were ever retargeted — `rev` makes the
-# benchmark dependency reproducible.
-surrealkv = { git = "https://github.com/surrealdb/surrealkv", rev = "d7e85669f59493c9501adcf0289e497ee206ffae" } # v0.21.2
+# comparison point. No FFI / libclang burden (unlike rocksdb). Pinned to an
+# exact release: this crate commits no Cargo.lock, so a caret range would let
+# the comparison point move between runs of the same commit, and a published
+# version, unlike a git tag, cannot be retargeted.
+surrealkv = "=0.21.4"
 # SurrealKV needs a tokio runtime: its `build()` spawns background
 # compaction tasks via `tokio::spawn`, and `commit()` is async. The
 # criterion harness is sync, so each surrealkv arm owns a multi-thread

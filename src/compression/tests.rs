@@ -7,6 +7,107 @@ fn compression_serialize_none() {
     assert_eq!(1, serialized.len());
 }
 
+#[cfg(zstd_any)]
+mod dictionaries {
+    use super::*;
+    use test_log::test;
+
+    fn dict(content: &[u8]) -> Arc<ZstdDictionary> {
+        Arc::new(ZstdDictionary::new(content))
+    }
+
+    #[test]
+    fn an_empty_set_resolves_nothing() {
+        let dicts = ZstdDictionaries::new();
+        assert!(dicts.is_empty());
+        assert_eq!(dicts.len(), 0);
+        assert!(dicts.get(0).is_none());
+        assert!(dicts.get(u32::MAX).is_none());
+        assert_eq!(dicts.ids().count(), 0);
+    }
+
+    #[test]
+    fn a_registered_dictionary_resolves_by_its_own_id() {
+        let d = dict(b"the quick brown fox");
+        let dicts = ZstdDictionaries::new().with(d.clone());
+
+        assert_eq!(dicts.len(), 1);
+        assert_eq!(
+            dicts.get(d.id()).map(|held| held.raw()),
+            Some(d.raw()),
+            "the id a table records must resolve to the bytes it was written with",
+        );
+    }
+
+    #[test]
+    fn several_dictionaries_coexist_and_resolve_independently() {
+        // The whole point of the set: one tree holding data written under more
+        // than one dictionary.
+        let a = dict(b"aaaaaaaaaaaaaaaa");
+        let b = dict(b"bbbbbbbbbbbbbbbb");
+        assert_ne!(a.id(), b.id(), "distinct content must take distinct ids");
+
+        let dicts = ZstdDictionaries::new().with(a.clone()).with(b.clone());
+
+        assert_eq!(dicts.len(), 2);
+        assert_eq!(dicts.get(a.id()).map(|d| d.raw()), Some(a.raw()));
+        assert_eq!(dicts.get(b.id()).map(|d| d.raw()), Some(b.raw()));
+    }
+
+    #[test]
+    fn re_registering_an_id_keeps_the_dictionary_already_held() {
+        // The id is derived from the bytes, so a second registration under an
+        // existing id is either the same content or a collision. Replacing
+        // would re-point every table written against the first one at bytes it
+        // was not compressed with, which decompresses to garbage rather than
+        // failing loudly.
+        let first = dict(b"content");
+        let same = dict(b"content");
+        assert_eq!(first.id(), same.id());
+
+        let dicts = ZstdDictionaries::new().with(first.clone()).with(same);
+
+        assert_eq!(dicts.len(), 1);
+        assert_eq!(dicts.get(first.id()).map(|d| d.raw()), Some(first.raw()));
+    }
+
+    #[test]
+    fn removing_the_only_dictionary_empties_the_set() {
+        let d = dict(b"content");
+        let dicts = ZstdDictionaries::new().with(d.clone());
+
+        let reduced = dicts.without(d.id());
+        assert!(reduced.is_empty());
+        assert!(reduced.get(d.id()).is_none());
+
+        // The set it was derived from is untouched: registration and removal
+        // build new sets rather than mutating a shared one.
+        assert_eq!(dicts.len(), 1);
+    }
+
+    #[test]
+    fn removing_an_absent_id_changes_nothing() {
+        let d = dict(b"content");
+        let dicts = ZstdDictionaries::new().with(d.clone());
+
+        let same = dicts.without(d.id().wrapping_add(1));
+        assert_eq!(same.len(), 1);
+        assert!(same.get(d.id()).is_some());
+    }
+
+    #[test]
+    fn removing_one_of_several_leaves_the_others() {
+        let a = dict(b"aaaaaaaaaaaaaaaa");
+        let b = dict(b"bbbbbbbbbbbbbbbb");
+        let dicts = ZstdDictionaries::new().with(a.clone()).with(b.clone());
+
+        let reduced = dicts.without(a.id());
+        assert_eq!(reduced.len(), 1);
+        assert!(reduced.get(a.id()).is_none());
+        assert!(reduced.get(b.id()).is_some());
+    }
+}
+
 #[cfg(feature = "lz4")]
 mod lz4 {
     use super::*;

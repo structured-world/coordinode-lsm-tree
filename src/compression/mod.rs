@@ -177,6 +177,23 @@ impl ZstdDictionary {
         }
     }
 
+    /// The same dictionary with `id` forced, for exercising an id COLLISION.
+    ///
+    /// The id is the hash of the content, so two different dictionaries sharing
+    /// one is a collision of the 32-bit truncation — reachable in principle,
+    /// unsearchable in a test. This is the only way to construct that state, and
+    /// it needs the private field, so it lives with the type.
+    #[cfg(test)]
+    #[must_use]
+    pub(crate) fn with_id_for_test(&self, id: u32) -> Self {
+        Self {
+            id: u64::from(id),
+            raw: Arc::clone(&self.raw),
+            #[cfg(feature = "zstd")]
+            prepared: Arc::clone(&self.prepared),
+        }
+    }
+
     /// Returns the shared pre-parsed `DictionaryHandle`, parsing on first call
     /// and reusing the cached handle on every subsequent call (across threads).
     ///
@@ -288,6 +305,143 @@ impl core::fmt::Debug for ZstdDictionary {
 #[cfg(zstd_any)]
 fn compute_dict_id(raw: &[u8]) -> u64 {
     xxhash_rust::xxh3::xxh3_64(raw)
+}
+
+/// Every dictionary a tree can decompress against, keyed by the id its tables
+/// already record.
+///
+/// A table names the dictionary it was written with; this is what turns that
+/// name back into bytes. Holding SEVERAL is what lets one tree mix data written
+/// under different dictionaries, which in turn is what lets a dictionary be
+/// introduced or replaced on a tree that already holds data: the tables written
+/// before keep resolving to the dictionary they used.
+///
+/// Cheap to clone (one `Arc` bump): every reader that opens a table takes a
+/// handle, and the set changes only on registration.
+#[cfg(zstd_any)]
+#[derive(Clone, Default)]
+pub struct ZstdDictionaries {
+    /// Immutable map, replaced wholesale on registration. Registrations are
+    /// rare and the map is small (a handful of dictionaries at most), so
+    /// copy-on-write beats a lock on a path every table open reads.
+    by_id: Option<Arc<crate::HashMap<u32, Arc<ZstdDictionary>>>>,
+}
+
+#[cfg(zstd_any)]
+impl ZstdDictionaries {
+    /// An empty set: a tree that compresses against no dictionary.
+    #[must_use]
+    pub fn new() -> Self {
+        Self { by_id: None }
+    }
+
+    /// The dictionary `id` names, or `None` when this tree does not hold it.
+    #[must_use]
+    pub fn get(&self, id: u32) -> Option<&Arc<ZstdDictionary>> {
+        self.by_id.as_ref()?.get(&id)
+    }
+
+    /// Whether this tree holds no dictionary at all.
+    #[must_use]
+    pub fn is_empty(&self) -> bool {
+        self.by_id.as_ref().is_none_or(|m| m.is_empty())
+    }
+
+    /// How many dictionaries this tree holds.
+    #[must_use]
+    pub fn len(&self) -> usize {
+        self.by_id.as_ref().map_or(0, |m| m.len())
+    }
+
+    /// The ids held, in no particular order.
+    pub fn ids(&self) -> impl Iterator<Item = u32> + '_ {
+        self.by_id.iter().flat_map(|m| m.keys().copied())
+    }
+
+    /// The dictionaries held, in no particular order.
+    pub fn iter(&self) -> impl Iterator<Item = &Arc<ZstdDictionary>> + '_ {
+        self.by_id.iter().flat_map(|m| m.values())
+    }
+
+    /// Adds `dict` under its own id, returning the extended set.
+    ///
+    /// Re-adding an id already present is a no-op rather than a replacement:
+    /// the id is derived from the bytes, so a second dictionary claiming an
+    /// existing id has the same content or is a hash collision, and in neither
+    /// case may the tables written against the first one be re-pointed.
+    #[must_use]
+    pub fn with(&self, dict: Arc<ZstdDictionary>) -> Self {
+        let id = dict.id();
+        if self.get(id).is_some() {
+            return self.clone();
+        }
+        let mut next = self
+            .by_id
+            .as_ref()
+            .map_or_else(crate::HashMap::default, |m| (**m).clone());
+        next.insert(id, dict);
+        Self {
+            by_id: Some(Arc::new(next)),
+        }
+    }
+
+    /// The dictionary `compression` names, if it names one and the set holds
+    /// it.
+    ///
+    /// The lookup a file does ONCE, when its handle is built: a table and a
+    /// blob file each record one descriptor, and the resolved dictionary is
+    /// then pinned for the handle's life rather than resolved per read. That is
+    /// what keeps a reader that captured a version able to decode after the set
+    /// has moved on.
+    ///
+    /// # Errors
+    ///
+    /// [`crate::Error::ZstdDictMismatch`] when the descriptor names an id the
+    /// set does not hold. Fail-fast, exactly as a table's recovery does: the
+    /// file cannot decode a single value that way, so the id is named here
+    /// while an operator can still restore it, rather than on the first read
+    /// of each value far from the cause.
+    pub fn for_compression(
+        &self,
+        compression: CompressionType,
+    ) -> crate::Result<Option<Arc<ZstdDictionary>>> {
+        match compression {
+            CompressionType::ZstdDict { dict_id, .. } => match self.get(dict_id) {
+                Some(dict) => Ok(Some(dict.clone())),
+                None => Err(crate::Error::ZstdDictMismatch {
+                    expected: dict_id,
+                    got: None,
+                }),
+            },
+            _ => Ok(None),
+        }
+    }
+
+    /// Removes `id`, returning the reduced set. Removing an absent id is a
+    /// no-op.
+    #[must_use]
+    pub fn without(&self, id: u32) -> Self {
+        if self.get(id).is_none() {
+            return self.clone();
+        }
+        let mut next = self
+            .by_id
+            .as_ref()
+            .map_or_else(crate::HashMap::default, |m| (**m).clone());
+        next.remove(&id);
+        Self {
+            by_id: (!next.is_empty()).then(|| Arc::new(next)),
+        }
+    }
+}
+
+#[cfg(zstd_any)]
+impl core::fmt::Debug for ZstdDictionaries {
+    fn fmt(&self, f: &mut core::fmt::Formatter<'_>) -> core::fmt::Result {
+        f.debug_struct("ZstdDictionaries")
+            .field("len", &self.len())
+            .finish_non_exhaustive()
+    }
 }
 
 /// Compression algorithm to use

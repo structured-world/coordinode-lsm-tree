@@ -1590,6 +1590,8 @@ fn salvage_propagates_an_environmental_failure_from_the_mirror_probe() -> crate:
             encryption: None,
             #[cfg(zstd_any)]
             zstd_dictionary: None,
+            #[cfg(zstd_any)]
+            zstd_dictionaries: crate::compression::ZstdDictionaries::new(),
             table_id: 0,
             expected_stored_id: None,
             output_id: None,
@@ -7114,7 +7116,10 @@ fn corrupt_second_data_block(
         params.encryption = encryption;
         #[cfg(zstd_any)]
         {
-            params.zstd_dictionary = zstd_dictionary;
+            params.zstd_dictionaries = zstd_dictionary
+                .map_or_else(crate::compression::ZstdDictionaries::new, |dict| {
+                    crate::compression::ZstdDictionaries::new().with(dict)
+                });
         }
         Table::recover(params)?
     };
@@ -7181,6 +7186,8 @@ fn salvage_recovers_an_encrypted_sst_with_the_provider() -> crate::Result<()> {
         encryption: Some(Arc::clone(&enc)),
         #[cfg(zstd_any)]
         zstd_dictionary: None,
+        #[cfg(zstd_any)]
+        zstd_dictionaries: crate::compression::ZstdDictionaries::new(),
         table_id: 0,
         expected_stored_id: None,
         output_id: None,
@@ -7273,6 +7280,7 @@ fn salvage_recovers_a_dictionary_sst_with_the_dictionary() -> crate::Result<()> 
     let options = SalvageOptions {
         encryption: None,
         zstd_dictionary: Some(Arc::clone(&dict)),
+        zstd_dictionaries: crate::compression::ZstdDictionaries::new(),
         table_id: 0,
         expected_stored_id: None,
         output_id: None,
@@ -7306,7 +7314,8 @@ fn salvage_recovers_a_dictionary_sst_with_the_dictionary() -> crate::Result<()> 
             Arc::new(crate::cache::Cache::with_capacity_bytes(1 << 20)),
         );
         params.descriptor_table = Some(Arc::new(crate::descriptor_table::DescriptorTable::new(8)));
-        params.zstd_dictionary = Some(Arc::clone(&dict));
+        params.zstd_dictionaries =
+            crate::compression::ZstdDictionaries::new().with(Arc::clone(&dict));
         Table::recover(params)?
     };
     assert_eq!(
@@ -7420,6 +7429,8 @@ fn salvage_recovers_an_encrypted_sst_with_a_nonzero_table_id() -> crate::Result<
         encryption: Some(Arc::clone(&enc)),
         #[cfg(zstd_any)]
         zstd_dictionary: None,
+        #[cfg(zstd_any)]
+        zstd_dictionaries: crate::compression::ZstdDictionaries::new(),
         table_id: 0,
         expected_stored_id: None,
         output_id: None,
@@ -7441,6 +7452,8 @@ fn salvage_recovers_an_encrypted_sst_with_a_nonzero_table_id() -> crate::Result<
         encryption: Some(Arc::clone(&enc)),
         #[cfg(zstd_any)]
         zstd_dictionary: None,
+        #[cfg(zstd_any)]
+        zstd_dictionaries: crate::compression::ZstdDictionaries::new(),
         table_id: TID,
         expected_stored_id: None,
         output_id: None,
@@ -9153,6 +9166,9 @@ fn salvage_blob_file_recovers_a_compressed_source() -> crate::Result<()> {
         crate::Checksum::from_raw(crate::repair::compute_table_checksum(&*fs, &dest)?),
         0,
         &fs,
+        // Lz4, so there is no dictionary for the handle to pin.
+        #[cfg(zstd_any)]
+        &crate::compression::ZstdDictionaries::new(),
     )?;
     assert_eq!(
         handle.compression(),

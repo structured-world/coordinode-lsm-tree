@@ -55,15 +55,23 @@
 //! [blob_restriction_count : u32 LE]        (appended section, see below)
 //!   repeat: id u64 LE | frontier u64 LE
 //! [retention_floor    : u64 LE]            (appended section, see below)
+//! [dict_count         : u32 LE]            (appended section, see below)
+//!   repeat: id u32 LE
 //! ```
 //!
-//! The two bracketed sections were appended after the format shipped and are
+//! The three bracketed sections were appended after the format shipped and are
 //! written only when they carry something: the blob frontiers when the list is
-//! non-empty, the retention floor when it changed in this edit. A payload that
-//! ends before either decodes as "absent", so older edit logs replay unchanged.
-//! Because the blob-frontier section has no presence marker of its own, an
-//! edit that carries a retention floor always writes the blob section first
-//! (with a zero count when empty), so the decoder can tell the two apart.
+//! non-empty, the retention floor when it changed in this edit, the dictionary
+//! ids when the registered set changed. A payload that ends before any of them
+//! decodes as "absent", so older edit logs replay unchanged.
+//!
+//! None of the three has a presence marker of its own, so they are positional
+//! and a later one is written only with every earlier one present: an edit
+//! carrying a retention floor writes the blob section first (a zero count when
+//! empty), and one carrying dictionary ids writes both (the floor re-stated at
+//! its current value when this edit did not change it, which replays as the
+//! no-op it is). That is what lets the decoder tell a floor from a blob count
+//! from a dictionary count.
 //!
 //! The per-table / per-blob record bodies are byte-identical to the snapshot
 //! encoding in [`Version::encode_into`](super::Version::encode_into) (plus the
@@ -154,6 +162,12 @@ pub struct VersionEdit {
     /// GC compaction, a `clear` or a table drop raises it, so the common edit
     /// carries nothing here.
     pub retention_floor: Option<u64>,
+    /// The version's FULL set of registered dictionary ids, or `None` when the
+    /// set is unchanged from the prior version. Carried whole rather than as a
+    /// delta so that a replay lands on the set the version actually had,
+    /// exactly as the restriction sets above: an edit that drops a dictionary
+    /// has to be able to say the id is gone.
+    pub dicts: Option<Vec<crate::file::DictId>>,
 }
 
 /// `checksum_type` byte written for XXH3-128 (matches the snapshot encoder).
@@ -161,7 +175,21 @@ const CHECKSUM_TYPE_XXH3: u8 = 0;
 
 impl VersionEdit {
     /// Serializes the edit payload (without the framing header) into `out`.
+    ///
+    /// # Errors
+    ///
+    /// [`crate::Error::InvalidHeader`] when the edit carries dictionary ids but
+    /// no retention floor. The appended sections are positional, so such an
+    /// edit would encode into bytes the decoder reads as a floor built from the
+    /// dictionary count and the first id: a fabricated floor, and the whole set
+    /// lost. Refusing to write it is what keeps the encoding total.
     fn encode_payload(&self, out: &mut Vec<u8>) -> crate::Result<()> {
+        if self.dicts.is_some() && self.retention_floor.is_none() {
+            return Err(crate::Error::InvalidHeader(
+                "VersionEdit: dictionary ids without a retention floor",
+            ));
+        }
+
         out.write_u64::<LittleEndian>(self.new_version_id)?;
 
         out.write_u32::<LittleEndian>(u32_len(self.changed_levels.len())?)?;
@@ -224,7 +252,20 @@ impl VersionEdit {
         // marker either, so whenever it is written the blob section is written
         // too (a zero count when empty): the decoder reads "blob section, then
         // floor" positionally and must not mistake a floor for a blob count.
-        if !self.blob_restrictions.is_empty() || self.retention_floor.is_some() {
+        //
+        // The DICTIONARY section, third in the chain, is under the same
+        // decision, and for the same reason: it appears only once a tree has
+        // registered a dictionary, and a binary without dictionary support
+        // cannot serve such a tree at all — every dictionary-compressed table
+        // in it names an id that binary has no way to resolve. So the trailing
+        // bytes it rejects are the fail-fast, exactly as above, and a rollback
+        // stays possible for every tree that never registered one. Deliberate,
+        // not an omission: the manifest layout version is unchanged for all
+        // three sections.
+        if !self.blob_restrictions.is_empty()
+            || self.retention_floor.is_some()
+            || self.dicts.is_some()
+        {
             out.write_u32::<LittleEndian>(u32_len(self.blob_restrictions.len())?)?;
             for (id, frontier) in &self.blob_restrictions {
                 out.write_u64::<LittleEndian>(*id)?;
@@ -234,6 +275,15 @@ impl VersionEdit {
         if let Some(floor) = self.retention_floor {
             out.write_u64::<LittleEndian>(floor)?;
         }
+        if let Some(dicts) = &self.dicts {
+            // The floor above is already written: `Version::diff` re-states an
+            // unchanged one whenever it carries dictionaries, and the guard at
+            // the top of this function refuses any edit that did not.
+            out.write_u32::<LittleEndian>(u32_len(dicts.len())?)?;
+            for id in dicts {
+                out.write_u32::<LittleEndian>(*id)?;
+            }
+        }
         Ok(())
     }
 
@@ -242,8 +292,10 @@ impl VersionEdit {
     ///
     /// # Errors
     ///
-    /// Returns an error if the payload exceeds the framing payload cap or a
-    /// write fails.
+    /// Returns an error if the payload exceeds the framing payload cap, a write
+    /// fails, or the edit carries dictionary ids without a retention floor (the
+    /// positional sections cannot express that). The payload is assembled
+    /// before any of it reaches `writer`, so a refused edit emits no record.
     pub fn append_to<W: Write>(&self, writer: &mut W, scratch: &mut Vec<u8>) -> crate::Result<()> {
         framing::write_framed_record(writer, scratch, |payload| self.encode_payload(payload))
     }
@@ -358,6 +410,20 @@ impl VersionEdit {
             Some(r.read_u64::<LittleEndian>().map_err(|_| ERR)?)
         };
 
+        // The dictionary ids are the third appended section, under the same
+        // positional rule: written only after the floor, so bytes remaining
+        // here are the id list and nothing else.
+        let dicts = if r.is_empty() {
+            None
+        } else {
+            let count = r.read_u32::<LittleEndian>().map_err(|_| ERR)?;
+            let mut ids = Vec::with_capacity(cap(count));
+            for _ in 0..count {
+                ids.push(r.read_u32::<LittleEndian>().map_err(|_| ERR)?);
+            }
+            Some(ids)
+        };
+
         // A well-formed edit consumes its payload exactly. Trailing bytes mean a
         // corrupt / mis-encoded record (format drift, not power loss — the
         // framing checksum already passed), so reject rather than silently
@@ -375,6 +441,7 @@ impl VersionEdit {
             restrictions,
             blob_restrictions,
             retention_floor,
+            dicts,
         })
     }
 }

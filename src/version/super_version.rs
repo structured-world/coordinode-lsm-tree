@@ -411,6 +411,27 @@ impl SuperVersions {
         // contract (monotone counter) this clamp is a no-op.
         let seqno = seqno.max(prior.seqno);
         let mut next_version = f(&prior)?;
+        // Every install is a transition to a new id. A rotation persists the
+        // installed version as a fresh `v{id}` snapshot, created exclusively,
+        // so one under the prior id would fail on the snapshot that id names.
+        debug_assert!(
+            next_version.version.id() > prior.version.id(),
+            "an install must advance the version id ({} -> {})",
+            prior.version.id(),
+            next_version.version.id(),
+        );
+        // A checkpoint carries only the dictionaries a version registers, so a
+        // file naming one the version does not register would travel without it.
+        debug_assert!(
+            next_version
+                .version
+                .referenced_dicts()
+                .iter()
+                .all(|id| next_version.version.dicts().contains(id)),
+            "every dictionary a file references is registered ({:?} of {:?})",
+            next_version.version.referenced_dicts(),
+            next_version.version.dicts(),
+        );
         next_version.seqno = seqno;
         log::trace!("Next version seqno={}", next_version.seqno);
 
@@ -611,6 +632,23 @@ impl SuperVersions {
         self.versions
             .front()
             .expect("should always have a SuperVersion")
+    }
+
+    /// Every dictionary id ANY retained version still registers.
+    ///
+    /// The collection boundary: a file may be unlinked only once it is absent
+    /// from this set, because a retained version can still be read from and its
+    /// tables cannot open without the dictionary they name.
+    #[must_use]
+    pub fn registered_dicts(&self) -> Vec<crate::file::DictId> {
+        let mut ids: Vec<crate::file::DictId> = self
+            .versions
+            .iter()
+            .flat_map(|v| v.version.dicts().iter().copied())
+            .collect();
+        ids.sort_unstable();
+        ids.dedup();
+        ids
     }
 
     /// Seqno of the oldest retained version: the read boundary. A snapshot at

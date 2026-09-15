@@ -45,8 +45,14 @@ reviews:
         Tests must have descriptive names and comments explaining WHAT is being tested.
     - path: "benches/**"
       instructions: |
-        Check benchmark methodology. Use criterion properly.
+        Check benchmark methodology. Timing benchmarks use criterion properly.
         Measure P99/P999 latency, not just throughput.
+        A harness whose primary output is BYTES (compressed size, ratio) is a
+        measurement report, not a timing benchmark: criterion measures time and
+        cannot report size, so such a harness prints its tables directly (see
+        the module doc of `benches/dict_ratio.rs`). Review its methodology
+        instead: the fixtures, the round-trip validation, and what each timing
+        column bills. Do not ask it to move to criterion.
     - path: "src/compaction/**"
       instructions: |
         Compaction is crash-safety critical. Every state mutation must be atomic.

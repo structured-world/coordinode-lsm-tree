@@ -18,6 +18,7 @@ fn recovery_with(version_id: u64, table_ids: Vec<Vec<Vec<RecoveredTable>>>) -> R
         restrictions: crate::HashMap::default(),
         blob_restrictions: crate::HashMap::default(),
         retention_floor: 0,
+        dicts: Vec::new(),
         stats: RecoveryStats::default(),
     }
 }
@@ -65,6 +66,44 @@ fn parse_retention_floor_section_is_strict() {
         parse_retention_floor_section(&bytes).is_err(),
         "trailing byte"
     );
+}
+
+/// The ids the section actually holds are read back in order.
+#[test]
+fn parse_dicts_section_reads_every_id() {
+    let mut bytes = Vec::new();
+    bytes.write_u32::<LittleEndian>(2).expect("write");
+    bytes.write_u32::<LittleEndian>(7).expect("write");
+    bytes.write_u32::<LittleEndian>(9).expect("write");
+    assert_eq!(parse_dicts_section(&bytes).expect("parse"), vec![7, 9]);
+}
+
+/// A count larger than the section can hold must be refused BEFORE anything is
+/// reserved for it. The ids are fixed-width, so the section's own length says
+/// how many there can be; trusting the count instead lets a corrupt manifest
+/// name four billion ids and turn a recovery into a multi-gigabyte allocation.
+#[test]
+fn parse_dicts_section_rejects_a_count_the_section_cannot_hold() {
+    let mut bytes = Vec::new();
+    bytes.write_u32::<LittleEndian>(u32::MAX).expect("write");
+    bytes.write_u32::<LittleEndian>(7).expect("write");
+
+    assert!(matches!(
+        parse_dicts_section(&bytes),
+        Err(crate::Error::InvalidHeader("dicts section")),
+    ));
+}
+
+/// A count SHORT of the ids present is a corrupt section too: the strict tail
+/// check catches it, so no id is silently dropped.
+#[test]
+fn parse_dicts_section_rejects_a_count_below_the_ids_present() {
+    let mut bytes = Vec::new();
+    bytes.write_u32::<LittleEndian>(1).expect("write");
+    bytes.write_u32::<LittleEndian>(7).expect("write");
+    bytes.write_u32::<LittleEndian>(9).expect("write");
+
+    assert!(parse_dicts_section(&bytes).is_err());
 }
 
 fn rtable(id: u64, seqno: u64) -> RecoveredTable {

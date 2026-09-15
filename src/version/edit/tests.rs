@@ -56,6 +56,7 @@ fn sample() -> VersionEdit {
         // A raised retention floor, so the round-trip covers the trailing
         // appended section as well.
         retention_floor: Some(77),
+        dicts: None,
     }
 }
 
@@ -102,6 +103,88 @@ fn payload_with_frontiers_but_no_floor_decodes_floor_as_none() {
     let decoded = VersionEdit::decode_payload(&payload).expect("decode");
     assert_eq!(decoded.blob_restrictions, edit.blob_restrictions);
     assert_eq!(decoded.retention_floor, None);
+}
+
+#[test]
+fn dictionary_ids_roundtrip_in_registration_order_independent_form() {
+    let mut edit = sample();
+    edit.dicts = Some(vec![3, 17, 4096]);
+    let mut payload = Vec::new();
+    edit.encode_payload(&mut payload).expect("encode");
+
+    let decoded = VersionEdit::decode_payload(&payload).expect("decode");
+    assert_eq!(decoded.dicts, Some(vec![3, 17, 4096]));
+    assert_eq!(decoded.retention_floor, Some(77));
+    assert_eq!(decoded, edit);
+}
+
+#[test]
+fn an_edit_that_collected_every_dictionary_carries_the_empty_set() {
+    // The distinction that makes the section wholesale rather than additive:
+    // "no dictionaries any more" must be expressible, and it is NOT the same
+    // as "unchanged".
+    let mut edit = sample();
+    edit.dicts = Some(vec![]);
+    let mut payload = Vec::new();
+    edit.encode_payload(&mut payload).expect("encode");
+
+    let decoded = VersionEdit::decode_payload(&payload).expect("decode");
+    assert_eq!(
+        decoded.dicts,
+        Some(vec![]),
+        "an empty set is carried, not read back as unchanged",
+    );
+}
+
+#[test]
+fn a_payload_without_the_dictionary_section_decodes_it_as_unchanged() {
+    // The pre-dictionary shape: an edit written before the section existed
+    // ends after the floor and must decode as "set unchanged", not as an
+    // empty set (which would drop every registration on replay).
+    let mut edit = sample();
+    edit.dicts = None;
+    let mut payload = Vec::new();
+    edit.encode_payload(&mut payload).expect("encode");
+
+    let decoded = VersionEdit::decode_payload(&payload).expect("decode");
+    assert_eq!(decoded.dicts, None);
+}
+
+#[test]
+fn a_dictionary_section_without_a_floor_is_refused_by_the_encoder() {
+    // The appended sections are positional with no presence markers, so the
+    // dictionary ids are only findable after a floor. Encoding them without one
+    // produces a record the decoder reads as "floor = <count><first id>", which
+    // applies a fabricated retention floor and drops the whole set. Refuse to
+    // write it rather than emit bytes that decode into something else.
+    let mut edit = sample();
+    edit.retention_floor = None;
+    edit.dicts = Some(vec![7, 9]);
+
+    let mut payload = Vec::new();
+    assert!(edit.encode_payload(&mut payload).is_err());
+
+    let mut buf = Vec::new();
+    let mut scratch = Vec::new();
+    assert!(edit.append_to(&mut buf, &mut scratch).is_err());
+    assert!(
+        buf.is_empty(),
+        "no framed record is emitted for a refused edit"
+    );
+}
+
+#[test]
+fn a_truncated_dictionary_section_is_rejected() {
+    // A count that outruns the payload is format drift, not power loss: the
+    // framing checksum already passed. Reject rather than adopt a short set,
+    // which would silently forget dictionaries the tables still reference.
+    let mut edit = sample();
+    edit.dicts = Some(vec![1, 2, 3]);
+    let mut payload = Vec::new();
+    edit.encode_payload(&mut payload).expect("encode");
+    payload.truncate(payload.len() - 4);
+
+    assert!(VersionEdit::decode_payload(&payload).is_err());
 }
 
 #[test]

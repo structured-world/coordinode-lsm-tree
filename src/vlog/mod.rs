@@ -141,6 +141,7 @@ pub fn recover_blob_files(
     tree_id: TreeId,
     descriptor_table: Option<&Arc<DescriptorTable>>,
     fs: &Arc<dyn Fs>,
+    #[cfg(zstd_any)] zstd_dictionaries: &crate::compression::ZstdDictionaries,
 ) -> crate::Result<(Vec<BlobFile>, Vec<PathBuf>)> {
     // Recover directly from read_dir; treat NotFound as empty only for
     // standard (non-blob) trees where no blob folder is expected.
@@ -251,6 +252,13 @@ pub fn recover_blob_files(
             blob_files.push(BlobFile(Arc::new(BlobFileInner {
                 id: blob_file_id,
                 path: blob_file_path.clone(),
+                // Fail-fast on an id the tree does not hold, exactly as a
+                // table's recovery does: the file cannot decode a single value
+                // that way, so the open names the id while an operator can
+                // still restore it, rather than turning every value in the
+                // file into a failed read far from the cause.
+                #[cfg(zstd_any)]
+                zstd_dictionary: zstd_dictionaries.for_compression(meta.compression)?,
                 meta,
                 is_deleted: AtomicBool::new(false),
                 punch_on_drop: portable_atomic::AtomicU64::new(u64::MAX),
@@ -336,8 +344,18 @@ pub fn recover_blob_file(
     checksum: Checksum,
     tree_id: TreeId,
     fs: &Arc<dyn Fs>,
+    #[cfg(zstd_any)] zstd_dictionaries: &crate::compression::ZstdDictionaries,
 ) -> crate::Result<BlobFile> {
-    recover_blob_file_from(path, id, checksum, tree_id, fs, 0)
+    recover_blob_file_from(
+        path,
+        id,
+        checksum,
+        tree_id,
+        fs,
+        0,
+        #[cfg(zstd_any)]
+        zstd_dictionaries,
+    )
 }
 
 /// As [`recover_blob_file`], but for a view whose consumed prefix below
@@ -356,6 +374,7 @@ pub fn recover_blob_file_from(
     tree_id: TreeId,
     fs: &Arc<dyn Fs>,
     live_data_start: u64,
+    #[cfg(zstd_any)] zstd_dictionaries: &crate::compression::ZstdDictionaries,
 ) -> crate::Result<BlobFile> {
     let mut file = fs.open(path, &crate::fs::FsOpenOptions::new().read(true))?;
 
@@ -377,6 +396,18 @@ pub fn recover_blob_file_from(
     Ok(BlobFile(Arc::new(BlobFileInner {
         id,
         path: path.to_path_buf(),
+        // LENIENT, unlike the plural recovery that serves `Tree::open`. This
+        // opens ONE named file for a caller inspecting or repairing it:
+        // `is_blob_file` only asks whether the bytes parse at all, and a
+        // salvage reads the descriptor to decide what to do about the file and
+        // reports a missing dictionary itself, naming the one the caller DID
+        // supply. Refusing here would collapse both answers into "not a blob
+        // file" and throw that context away.
+        #[cfg(zstd_any)]
+        zstd_dictionary: zstd_dictionaries
+            .for_compression(meta.compression)
+            .ok()
+            .flatten(),
         meta,
         is_deleted: AtomicBool::new(false),
         punch_on_drop: portable_atomic::AtomicU64::new(u64::MAX),

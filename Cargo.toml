@@ -301,6 +301,12 @@ rand = "0.10.1"
 serde_json = "1"
 strum = { version = "0.28.0", features = ["derive"] }
 test-log = "0.2.18"
+# The dictionary TRAINER, for the ratio measurement only. The library consumes
+# finished dictionary bytes and never trains, so `dict-builder` is added here
+# rather than to the normal dependency: a dev-dependency's features do not
+# reach consumers, so none of them pays for `fastrand` (and the `std` it
+# forces) for a capability they do not use.
+structured-zstd = { version = "0.0.52", features = ["dict-builder", "lsm"] }
 
 [lints.rust]
 unexpected_cfgs = { level = "warn", check-cfg = [
@@ -328,6 +334,12 @@ name = "blob_scan_prefetch"
 harness = false
 path = "benches/blob_scan_prefetch.rs"
 required-features = []
+
+[[bench]]
+name = "dict_ratio"
+harness = false
+path = "benches/dict_ratio.rs"
+required-features = ["zstd"]
 
 [[bench]]
 name = "memtable"

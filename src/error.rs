@@ -209,6 +209,24 @@ pub enum Error {
         got: Option<u32>,
     },
 
+    /// A dictionary the tree stores no longer hashes to the id it is filed
+    /// under, or on an encrypted tree its seal no longer opens: its bytes were
+    /// altered or truncated on disk.
+    ///
+    /// Damage rather than configuration, unlike [`Self::ZstdDictMismatch`]: the
+    /// id is the truncated hash of the content, so the file disagreeing with its
+    /// own name is decided by the bytes alone. A repair moves such a file aside
+    /// (see [`RepairReport::damaged_dictionaries`](crate::RepairReport::damaged_dictionaries)),
+    /// and [`Config::open_or_repair`](crate::Config::open_or_repair) engages one.
+    ZstdDictCorrupt {
+        /// The id the file is filed under.
+        id: u32,
+
+        /// The id its bytes hash to now; `None` when its seal no longer opens,
+        /// so there are no bytes to hash.
+        got: Option<u32>,
+    },
+
     /// Per-record XXH3-64 mismatch inside a framed manifest section
     /// (`tables` / `blob_files`). Distinct from
     /// [`Error::ChecksumMismatch`] — same XXH3 family but a
