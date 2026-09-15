@@ -1,5 +1,5 @@
 window.BENCHMARK_DATA = {
-  "lastUpdate": 1789494395314,
+  "lastUpdate": 1789497521484,
   "repoUrl": "https://github.com/structured-world/coordinode-lsm-tree",
   "entries": {
     "lsm-tree db_bench": [
@@ -22686,6 +22686,90 @@ window.BENCHMARK_DATA = {
             "value": 656917.7359393295,
             "unit": "ops/sec",
             "extra": "P50: 1.3us | P99: 4.7us | P99.9: 27.0us\nthreads: 1 | elapsed: 0.30s | num: 200000 | iterations: 3"
+          }
+        ]
+      },
+      {
+        "commit": {
+          "author": {
+            "email": "49699333+dependabot[bot]@users.noreply.github.com",
+            "name": "dependabot[bot]",
+            "username": "dependabot[bot]"
+          },
+          "committer": {
+            "email": "noreply@github.com",
+            "name": "GitHub",
+            "username": "web-flow"
+          },
+          "distinct": true,
+          "id": "706bc2be63694fb05ca3d2d62b82d9eb257dfb4f",
+          "message": "ci(deps): bump release-plz/action from 0.5.133 to 0.5.136 (#646)\n\nBumps [release-plz/action](https://github.com/release-plz/action) from\n0.5.133 to 0.5.136.\n<details>\n<summary>Release notes</summary>\n<p><em>Sourced from <a\nhref=\"https://github.com/release-plz/action/releases\">release-plz/action's\nreleases</a>.</em></p>\n<blockquote>\n<h2>v0.5.136</h2>\n<h2>What's Changed</h2>\n<ul>\n<li>Update to 0.3.165 by <a\nhref=\"https://github.com/marcoieni\"><code>@​marcoieni</code></a> in <a\nhref=\"https://redirect.github.com/release-plz/action/pull/525\">release-plz/action#525</a></li>\n</ul>\n<p><strong>Full Changelog</strong>: <a\nhref=\"https://github.com/release-plz/action/compare/v0.5.135...v0.5.136\">https://github.com/release-plz/action/compare/v0.5.135...v0.5.136</a></p>\n<h2>v0.5.135</h2>\n<h2>What's Changed</h2>\n<ul>\n<li>chore(deps): update dependency taiki-e/install-action to v2.87.9 by\n<a href=\"https://github.com/renovate\"><code>@​renovate</code></a>[bot]\nin <a\nhref=\"https://redirect.github.com/release-plz/action/pull/524\">release-plz/action#524</a></li>\n<li>Update to 0.3.164 by <a\nhref=\"https://github.com/marcoieni\"><code>@​marcoieni</code></a> in <a\nhref=\"https://redirect.github.com/release-plz/action/pull/523\">release-plz/action#523</a></li>\n</ul>\n<p><strong>Full Changelog</strong>: <a\nhref=\"https://github.com/release-plz/action/compare/v0.5.134...v0.5.135\">https://github.com/release-plz/action/compare/v0.5.134...v0.5.135</a></p>\n<h2>v0.5.134</h2>\n<h2>What's Changed</h2>\n<ul>\n<li>chore(deps): update dependency taiki-e/install-action to v2.87.7 by\n<a href=\"https://github.com/renovate\"><code>@​renovate</code></a>[bot]\nin <a\nhref=\"https://redirect.github.com/release-plz/action/pull/519\">release-plz/action#519</a></li>\n<li>chore(deps): lock file maintenance by <a\nhref=\"https://github.com/renovate\"><code>@​renovate</code></a>[bot] in\n<a\nhref=\"https://redirect.github.com/release-plz/action/pull/520\">release-plz/action#520</a></li>\n<li>chore(deps): update dependency taiki-e/install-action to v2.87.8 by\n<a href=\"https://github.com/renovate\"><code>@​renovate</code></a>[bot]\nin <a\nhref=\"https://redirect.github.com/release-plz/action/pull/521\">release-plz/action#521</a></li>\n<li>Update to 0.3.163 by <a\nhref=\"https://github.com/marcoieni\"><code>@​marcoieni</code></a> in <a\nhref=\"https://redirect.github.com/release-plz/action/pull/522\">release-plz/action#522</a></li>\n</ul>\n<p><strong>Full Changelog</strong>: <a\nhref=\"https://github.com/release-plz/action/compare/v0.5.133...v0.5.134\">https://github.com/release-plz/action/compare/v0.5.133...v0.5.134</a></p>\n</blockquote>\n</details>\n<details>\n<summary>Commits</summary>\n<ul>\n<li><a\nhref=\"https://github.com/release-plz/action/commit/a80d79efe0a195618acb02a4089d55fe74d2505f\"><code>a80d79e</code></a>\nUpdate to 0.3.165 (<a\nhref=\"https://redirect.github.com/release-plz/action/issues/525\">#525</a>)</li>\n<li><a\nhref=\"https://github.com/release-plz/action/commit/346832d73e3415c2ebd0432cba3a2bf5881e5f7d\"><code>346832d</code></a>\nUpdate to 0.3.164 (<a\nhref=\"https://redirect.github.com/release-plz/action/issues/523\">#523</a>)</li>\n<li><a\nhref=\"https://github.com/release-plz/action/commit/9355587261247bf6422bac5847e6b0680f4db520\"><code>9355587</code></a>\nchore(deps): update dependency taiki-e/install-action to v2.87.9 (<a\nhref=\"https://redirect.github.com/release-plz/action/issues/524\">#524</a>)</li>\n<li><a\nhref=\"https://github.com/release-plz/action/commit/503fe65046e8810d4844f6b3aa12ab599a3549d7\"><code>503fe65</code></a>\nUpdate to 0.3.163 (<a\nhref=\"https://redirect.github.com/release-plz/action/issues/522\">#522</a>)</li>\n<li><a\nhref=\"https://github.com/release-plz/action/commit/22505707b8691a014e086e5558e9c9bdfa9f25d7\"><code>2250570</code></a>\nchore(deps): update dependency taiki-e/install-action to v2.87.8 (<a\nhref=\"https://redirect.github.com/release-plz/action/issues/521\">#521</a>)</li>\n<li><a\nhref=\"https://github.com/release-plz/action/commit/62ea74bc903eca6395dff1fdddffae57fd0ac47b\"><code>62ea74b</code></a>\nchore(deps): lock file maintenance (<a\nhref=\"https://redirect.github.com/release-plz/action/issues/520\">#520</a>)</li>\n<li><a\nhref=\"https://github.com/release-plz/action/commit/c944210877f3c25a996f6b096e4820609a00c80c\"><code>c944210</code></a>\nchore(deps): update dependency taiki-e/install-action to v2.87.7 (<a\nhref=\"https://redirect.github.com/release-plz/action/issues/519\">#519</a>)</li>\n<li>See full diff in <a\nhref=\"https://github.com/release-plz/action/compare/aec534bbd8631793b9b3b8f1ee6cd886c322e17f...a80d79efe0a195618acb02a4089d55fe74d2505f\">compare\nview</a></li>\n</ul>\n</details>\n<br />\n\n\n[![Dependabot compatibility\nscore](https://dependabot-badges.githubapp.com/badges/compatibility_score?dependency-name=release-plz/action&package-manager=github_actions&previous-version=0.5.133&new-version=0.5.136)](https://docs.github.com/en/github/managing-security-vulnerabilities/about-dependabot-security-updates#about-compatibility-scores)\n\nDependabot will resolve any conflicts with this PR as long as you don't\nalter it yourself. You can also trigger a rebase manually by commenting\n`@dependabot rebase`.\n\n[//]: # (dependabot-automerge-start)\n[//]: # (dependabot-automerge-end)\n\n---\n\n<details>\n<summary>Dependabot commands and options</summary>\n<br />\n\nYou can trigger Dependabot actions by commenting on this PR:\n- `@dependabot rebase` will rebase this PR\n- `@dependabot recreate` will recreate this PR, overwriting any edits\nthat have been made to it\n- `@dependabot show <dependency name> ignore conditions` will show all\nof the ignore conditions of the specified dependency\n- `@dependabot ignore this major version` will close this PR and stop\nDependabot creating any more for this major version (unless you reopen\nthe PR or upgrade to it yourself)\n- `@dependabot ignore this minor version` will close this PR and stop\nDependabot creating any more for this minor version (unless you reopen\nthe PR or upgrade to it yourself)\n- `@dependabot ignore this dependency` will close this PR and stop\nDependabot creating any more for this dependency (unless you reopen the\nPR or upgrade to it yourself)\n\n\n</details>\n\nSigned-off-by: dependabot[bot] <support@github.com>\nCo-authored-by: dependabot[bot] <49699333+dependabot[bot]@users.noreply.github.com>",
+          "timestamp": "2026-09-15T18:36:15Z",
+          "tree_id": "aa0fe1682357979253bff1ea967edade298a3cb1",
+          "url": "https://github.com/structured-world/coordinode-lsm-tree/commit/706bc2be63694fb05ca3d2d62b82d9eb257dfb4f"
+        },
+        "date": 1789497492043,
+        "tool": "customBiggerIsBetter",
+        "benches": [
+          {
+            "name": "mixed",
+            "value": 132421.77879371843,
+            "unit": "ops/sec",
+            "extra": "P50: 0.3us | P99: 5.3us | P99.9: 8.4us\nthreads: 1 | elapsed: 4.04s | num: 200000 | iterations: 3"
+          },
+          {
+            "name": "fillseq",
+            "value": 4339516.008138241,
+            "unit": "ops/sec",
+            "extra": "P50: 0.1us | P99: 1.2us | P99.9: 1.6us\nthreads: 1 | elapsed: 0.05s | num: 200000 | iterations: 3"
+          },
+          {
+            "name": "fillrandom",
+            "value": 1409980.0857937632,
+            "unit": "ops/sec",
+            "extra": "P50: 0.6us | P99: 1.9us | P99.9: 3.2us\nthreads: 1 | elapsed: 0.14s | num: 200000 | iterations: 3"
+          },
+          {
+            "name": "readrandom",
+            "value": 972370.4911654355,
+            "unit": "ops/sec",
+            "extra": "P50: 1.0us | P99: 3.1us | P99.9: 7.5us\nthreads: 1 | elapsed: 0.21s | num: 200000 | iterations: 3"
+          },
+          {
+            "name": "readseq",
+            "value": 4413000.930216466,
+            "unit": "ops/sec",
+            "extra": "P50: 0.1us | P99: 2.0us | P99.9: 2.6us\nthreads: 1 | elapsed: 0.05s | num: 200000 | iterations: 3"
+          },
+          {
+            "name": "seekrandom",
+            "value": 512532.73226228,
+            "unit": "ops/sec",
+            "extra": "P50: 1.7us | P99: 3.9us | P99.9: 5.5us\nthreads: 1 | elapsed: 0.39s | num: 200000 | iterations: 3"
+          },
+          {
+            "name": "prefixscan",
+            "value": 249344.4115176976,
+            "unit": "ops/sec",
+            "extra": "P50: 3.7us | P99: 4.7us | P99.9: 7.6us\nthreads: 1 | elapsed: 0.80s | num: 200000 | iterations: 3"
+          },
+          {
+            "name": "overwrite",
+            "value": 1415527.7348206397,
+            "unit": "ops/sec",
+            "extra": "P50: 0.6us | P99: 1.9us | P99.9: 3.0us\nthreads: 1 | elapsed: 0.14s | num: 200000 | iterations: 3"
+          },
+          {
+            "name": "mergerandom",
+            "value": 1282584.0641828666,
+            "unit": "ops/sec",
+            "extra": "P50: 0.3us | P99: 1.3us | P99.9: 2.9us\nthreads: 1 | elapsed: 0.16s | num: 200000 | iterations: 3"
+          },
+          {
+            "name": "readwhilewriting",
+            "value": 717702.2589929798,
+            "unit": "ops/sec",
+            "extra": "P50: 1.2us | P99: 4.6us | P99.9: 28.2us\nthreads: 1 | elapsed: 0.28s | num: 200000 | iterations: 3"
           }
         ]
       }
