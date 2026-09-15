@@ -11,6 +11,28 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 
 ## [Unreleased]
 
+## [5.9.0](https://github.com/structured-world/coordinode-lsm-tree/compare/v5.8.6...v5.9.0) - 2026-09-15
+
+### Added
+
+- *(version)* keep only the current version ([#643](https://github.com/structured-world/coordinode-lsm-tree/pull/643))
+- *(config)* change compression policies on a live tree ([#642](https://github.com/structured-world/coordinode-lsm-tree/pull/642))
+- *(compression)* let the tree own its zstd dictionaries ([#640](https://github.com/structured-world/coordinode-lsm-tree/pull/640))
+
+### Documentation
+
+- *(compaction)* write down the two couplings the folds rest on ([#639](https://github.com/structured-world/coordinode-lsm-tree/pull/639))
+
+### Fixed
+
+- *(compaction)* refuse an interrupted merge, and record only real losses ([#636](https://github.com/structured-world/coordinode-lsm-tree/pull/636))
+- *(tree)* record the GC a flush performed, and only what a run collected ([#635](https://github.com/structured-world/coordinode-lsm-tree/pull/635))
+- *(compaction)* keep the newest version below the GC threshold ([#631](https://github.com/structured-world/coordinode-lsm-tree/pull/631))
+
+### Refactored
+
+- *(compaction)* name the GC watermark once ([#644](https://github.com/structured-world/coordinode-lsm-tree/pull/644))
+
 ## [5.8.6](https://github.com/structured-world/coordinode-lsm-tree/compare/v5.8.5...v5.8.6) - 2026-09-08
 
 ### Fixed
