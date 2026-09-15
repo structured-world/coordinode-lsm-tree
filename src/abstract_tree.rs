@@ -735,7 +735,9 @@ pub trait AbstractTree: sealed::Sealed {
     ///
     /// A run that collects anything raises the retention floor to
     /// `gc_watermark - 1` (capped at the install's own seqno) unless it is
-    /// already higher. The floor is the
+    /// already higher. When the opt-in tight-space mode takes over a run
+    /// (`RuntimeConfig::tight_space_compaction`), each slice raises it that
+    /// far whether or not it collected. The floor is the
     /// only read boundary: from then on a new read at or below it (see
     /// [`oldest_retained_seqno`](Self::oldest_retained_seqno)) fails with
     /// [`Error::SnapshotBelowRetention`](crate::Error::SnapshotBelowRetention),
@@ -862,7 +864,11 @@ pub trait AbstractTree: sealed::Sealed {
     /// `gc_watermark` has the meaning documented at
     /// [`major_compact`](Self::major_compact): the engine's own GC collects
     /// only versions below it, and a run that collects one raises the
-    /// retention floor. A compaction filter acts regardless of it.
+    /// retention floor. Two things act regardless of it: a compaction filter,
+    /// and a strategy that drops whole tables (FIFO eviction, a drop-range, a
+    /// custom strategy choosing to drop). Either removes data at any
+    /// watermark, `0` included, and raises the floor to the install's own
+    /// seqno, so a low watermark does not protect a snapshot from them.
     ///
     /// # Errors
     ///
