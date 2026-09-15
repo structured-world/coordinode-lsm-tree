@@ -9,7 +9,6 @@ use crate::{
     BlobFile, CompressionType, DescriptorTable, SeqNo, SequenceNumberCounter, TreeId,
     file_accessor::FileAccessor,
     fs::{Fs, SyncMode},
-    runtime_config::WritePin,
     vlog::{
         ValueHandle,
         blob_file::{Inner as BlobFileInner, Metadata},
@@ -69,13 +68,6 @@ pub struct MultiWriter {
     #[cfg(zstd_any)]
     zstd_dictionaries: crate::compression::ZstdDictionaries,
 
-    /// The hold on the snapshot [`Self::zstd_dictionary`] was resolved from.
-    /// It keeps that dictionary out of a collection after a policy change, and
-    /// passes to the caller before [`Self::finish`] (see
-    /// [`Self::take_write_pin`]), since the files are not installed until
-    /// later.
-    write_pin: WritePin,
-
     tree_id: TreeId,
     descriptor_table: Option<Arc<DescriptorTable>>,
 }
@@ -117,7 +109,6 @@ impl MultiWriter {
             zstd_dictionary: None,
             #[cfg(zstd_any)]
             zstd_dictionaries: crate::compression::ZstdDictionaries::new(),
-            write_pin: WritePin::default(),
 
             tree_id,
             descriptor_table,
@@ -230,28 +221,6 @@ impl MultiWriter {
         self.active_writer = self.active_writer.use_zstd_dictionary(dict.clone());
         self.zstd_dictionary = dict;
         self
-    }
-
-    /// Holds `snapshot`, the runtime config the dictionary was resolved from,
-    /// until [`Self::take_write_pin`] hands the hold on.
-    #[cfg(zstd_any)]
-    #[must_use]
-    pub(crate) fn use_config_snapshot(
-        self,
-        snapshot: Arc<crate::runtime_config::RuntimeConfig>,
-    ) -> Self {
-        Self {
-            write_pin: WritePin::new(snapshot),
-            ..self
-        }
-    }
-
-    /// Hands the caller this writer's hold on the dictionary it compresses
-    /// against. Take it before [`Self::finish`] and keep it until the files
-    /// are installed: `finish` consumes the writer, and the files name the
-    /// dictionary to a collection only once they are part of the tree.
-    pub(crate) fn take_write_pin(&mut self) -> WritePin {
-        core::mem::take(&mut self.write_pin)
     }
 
     /// Provides the tree's dictionary set, so each finished file can pin the
@@ -472,11 +441,6 @@ impl MultiWriter {
     }
 
     pub(crate) fn finish(mut self) -> crate::Result<Vec<BlobFile>> {
-        debug_assert!(
-            self.write_pin.is_empty(),
-            "take the write pin before finishing: dropping it here would let a \
-             collection take the dictionary before the files are installed",
-        );
         let mut writers =
             core::iter::once((self.passthrough_compression, self.active_writer)).chain(self.parked);
         while let Some((passthrough, writer)) = writers.next() {

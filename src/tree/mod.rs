@@ -905,20 +905,18 @@ impl AbstractTree for Tree {
         // Flush writes level 0; resolve that level's locator policy entry.
         table_writer = table_writer.use_locator(self.config.locator_policy.get(0));
 
-        // The dictionary THIS snapshot's policy names. The writer holds the
-        // snapshot, and the caller after it until the tables are installed: a
-        // collection spares what a held snapshot names, however the policy has
-        // changed since.
+        // The dictionary THIS snapshot's policy names. The flush holds the
+        // snapshot until its tables are installed: a collection spares what a
+        // held snapshot names, however the policy has changed since.
         #[cfg(zstd_any)]
         {
-            table_writer = table_writer
-                .use_zstd_dictionary(
-                    self.config
-                        .current_zstd_dictionaries()
-                        .for_compression(data_block_compression)?,
-                )
-                .use_config_snapshot(Arc::clone(&rc));
+            table_writer = table_writer.use_zstd_dictionary(
+                self.config
+                    .current_zstd_dictionaries()
+                    .for_compression(data_block_compression)?,
+            );
         }
+        let write_pin = crate::runtime_config::WritePin::new(&rc);
 
         // Parallel block compression for the flush writer, on the same pool the
         // compaction writers use. Engaged only when the per-block transform does
@@ -950,7 +948,6 @@ impl AbstractTree for Tree {
             table_writer.write(item?)?;
         }
 
-        let write_pin = table_writer.take_write_pin();
         let result = table_writer.finish()?;
 
         log::debug!("Flushed memtable(s) in {:?}", start.elapsed());
@@ -2784,21 +2781,28 @@ impl Tree {
     where
         F: FnOnce(&mut crate::runtime_config::RuntimeConfig),
     {
+        // The mutator is the caller's code and may read the tree, so it runs
+        // before any lock is taken: under the version lock a read of the
+        // version history would wait on this thread forever.
+        let mut next = (*self.0.runtime_config.load_full()).clone();
+        mutator(&mut next);
+
         // Under the version lock, which a dictionary collection holds for its
         // whole pass: checking a policy against the tree's dictionaries and
         // publishing it must not interleave with a collection that takes the
         // one it names.
         #[cfg(zstd_any)]
         let version_lock = self.version_history.write();
-
-        let replaced = self.0.runtime_config.load_full();
-        let mut next = (*replaced).clone();
-        mutator(&mut next);
         #[cfg(zstd_any)]
         next.check_dictionaries(
             self.config.kv_separation_opts.is_some(),
             &self.config.current_zstd_dictionaries(),
         )?;
+        // What the swap below replaces, read under the lock every update takes,
+        // so it is the snapshot a writer may still hold, not the one the
+        // mutator started from.
+        #[cfg(zstd_any)]
+        let replaced = self.0.runtime_config.load_full();
         // The heal gate below follows exactly the config THIS call commits,
         // rather than a separate `load_full()` that could observe a different
         // concurrent update's value. Concurrent `update_runtime_config` calls
@@ -2822,9 +2826,9 @@ impl Tree {
                 retired.retain(|snapshot| snapshot.strong_count() > 0);
                 retired.push(Arc::downgrade(&replaced));
             }
+            drop(replaced);
             drop(version_lock);
         }
-        drop(replaced);
         self.0.heal_hints.set_enabled(auto_heal);
         // Mirror the insert-time digest gate for the write hot path (see
         // `TreeInner::kv_digest_at_insert`). Relaxed: a toggle taking effect

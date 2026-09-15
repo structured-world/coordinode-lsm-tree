@@ -28,6 +28,11 @@ pub struct Ingestion<'a> {
     pub(crate) level_fs: Arc<dyn Fs>,
     tree: &'a Tree,
     pub(crate) writer: MultiWriter,
+    /// The hold on the snapshot this ingestion writes under, kept until
+    /// `finish` has installed what it wrote (see
+    /// [`WritePin`](crate::runtime_config::WritePin)). It covers the blob
+    /// files of a blob ingestion too, which share the snapshot.
+    pub(crate) write_pin: crate::runtime_config::WritePin,
     seqno: SeqNo,
     last_key: Option<UserKey>,
     /// Successive columnar batches with the same layout accumulate here into one
@@ -176,17 +181,15 @@ impl<'a> Ingestion<'a> {
         writer = writer.use_kv_checksums(rc.kv_checksums, rc.kv_checksum_algo);
         writer = writer.use_locator(tree.config.locator_policy.get(INITIAL_CANONICAL_LEVEL));
 
-        // Resolved from `rc`, which the writer holds while the ingestion
-        // writes and `finish` holds until the install, as in the flush.
+        // Resolved from `rc`, which the ingestion holds until `finish` has
+        // installed its tables, as in the flush.
         #[cfg(zstd_any)]
         {
-            writer = writer
-                .use_zstd_dictionary(
-                    tree.config
-                        .current_zstd_dictionaries()
-                        .for_compression(data_block_compression)?,
-                )
-                .use_config_snapshot(Arc::clone(rc));
+            writer = writer.use_zstd_dictionary(
+                tree.config
+                    .current_zstd_dictionaries()
+                    .for_compression(data_block_compression)?,
+            );
         }
 
         Ok(Self {
@@ -194,6 +197,7 @@ impl<'a> Ingestion<'a> {
             level_fs,
             tree,
             writer,
+            write_pin: crate::runtime_config::WritePin::new(rc),
             seqno: 0,
             last_key: None,
             #[cfg(feature = "columnar")]
@@ -451,9 +455,9 @@ impl<'a> Ingestion<'a> {
         self.tree.rotate_memtable();
         self.tree.flush(&flush_lock, 0)?;
 
-        // Finalize the ingestion writer, writing all buffered data to disk. Its
-        // hold on the dictionary stays here until the tables are installed.
-        let write_pin = self.writer.take_write_pin();
+        // Finalize the ingestion writer, writing all buffered data to disk. The
+        // hold on its dictionary stays here until the tables are installed.
+        let write_pin = core::mem::take(&mut self.write_pin);
         let results = self.writer.finish()?;
 
         log::info!("Finished ingestion writer");

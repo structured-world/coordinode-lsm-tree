@@ -10,7 +10,6 @@ use crate::{
     fs::{Fs, SyncMode},
     prefix::PrefixExtractor,
     range_tombstone::RangeTombstone,
-    runtime_config::WritePin,
     table::writer::LinkedFile,
     value::InternalValue,
     vlog::BlobFileId,
@@ -193,13 +192,6 @@ pub struct MultiWriter {
     #[cfg(zstd_any)]
     zstd_dictionary: Option<Arc<crate::compression::ZstdDictionary>>,
 
-    /// The hold on the snapshot [`Self::zstd_dictionary`] was resolved from.
-    /// It keeps that dictionary out of a collection after a policy change, and
-    /// passes to the caller before [`Self::finish`] (see
-    /// [`Self::take_write_pin`]), since the tables are not installed until
-    /// later.
-    write_pin: WritePin,
-
     /// Optional parallel block-compression executor + worker count, preserved
     /// here so every successor [`Writer`] of a rotated run shares the same pool.
     #[cfg(feature = "std")]
@@ -284,7 +276,6 @@ impl MultiWriter {
 
             #[cfg(zstd_any)]
             zstd_dictionary: None,
-            write_pin: WritePin::default(),
 
             #[cfg(feature = "std")]
             spawner: None,
@@ -753,28 +744,6 @@ impl MultiWriter {
         self
     }
 
-    /// Holds `snapshot`, the runtime config the dictionary was resolved from,
-    /// until [`Self::take_write_pin`] hands the hold on.
-    #[cfg(zstd_any)]
-    #[must_use]
-    pub(crate) fn use_config_snapshot(
-        self,
-        snapshot: Arc<crate::runtime_config::RuntimeConfig>,
-    ) -> Self {
-        Self {
-            write_pin: WritePin::new(snapshot),
-            ..self
-        }
-    }
-
-    /// Hands the caller this writer's hold on the dictionary it compresses
-    /// against. Take it before [`Self::finish`] and keep it until the tables
-    /// are installed: `finish` consumes the writer, and the tables name the
-    /// dictionary to a collection only once they are part of the tree.
-    pub(crate) fn take_write_pin(&mut self) -> WritePin {
-        core::mem::take(&mut self.write_pin)
-    }
-
     /// Flushes the current writer, stores its metadata, and sets up a new writer for the next table
     fn rotate(&mut self) -> crate::Result<()> {
         log::debug!("Rotating table writer");
@@ -942,11 +911,6 @@ impl MultiWriter {
     ///
     /// Returns the metadata of created tables
     pub fn finish(mut self) -> crate::Result<Vec<(TableId, Checksum)>> {
-        debug_assert!(
-            self.write_pin.is_empty(),
-            "take the write pin before finishing: dropping it here would let a \
-             collection take the dictionary before the tables are installed",
-        );
         // Same judgment as `rotate` for the LAST output's window — by the
         // LIVE counter here: with no successor output, trailing verdicts
         // (removals after the final write) have nowhere else to land, and a

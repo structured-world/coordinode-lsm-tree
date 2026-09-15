@@ -47,7 +47,7 @@ impl<'a> BlobIngestion<'a> {
 
         // One snapshot for the whole ingestion, blob files and index tables
         // alike: an ingestion is one batch of files, written under one policy.
-        // The writers hold it, and `finish` after them until the install, so a
+        // The table ingestion holds it until `finish` has installed both, so a
         // collection cannot take a dictionary it names in between.
         let rc = tree.index.0.runtime_config.load_full();
         let blob_compression = rc.blob_compression;
@@ -72,7 +72,6 @@ impl<'a> BlobIngestion<'a> {
             let dicts = tree.index.config.current_zstd_dictionaries();
             blob.use_zstd_dictionary(dicts.for_compression(blob_compression)?)
                 .use_zstd_dictionaries(dicts)
-                .use_config_snapshot(rc)
         };
 
         let separation_threshold = kv.separation_threshold;
@@ -207,10 +206,9 @@ impl<'a> BlobIngestion<'a> {
         index.rotate_memtable();
         index.flush(&flush_lock, 0)?;
 
-        // Both writers' hold on their dictionaries stays here until the files
+        // The hold on the ingestion's dictionaries stays here until the files
         // are installed.
-        let mut write_pin = self.blob.take_write_pin();
-        write_pin.join(self.table.writer.take_write_pin());
+        let write_pin = core::mem::take(&mut self.table.write_pin);
 
         // Finalize the blob writer first, ensuring all large values are
         // written to blob files before we finalize the index tables that

@@ -14,7 +14,7 @@ use crate::{
     AbstractTree, AnyTree, BlobTree, CompressionType, Config, SequenceNumberCounter, Tree,
 };
 use std::sync::Arc;
-use std::sync::atomic::{AtomicBool, AtomicUsize, Ordering};
+use std::sync::atomic::{AtomicUsize, Ordering};
 use test_log::test;
 
 fn training_corpus() -> Vec<u8> {
@@ -275,7 +275,7 @@ fn blob_relocation_after_a_policy_change_keeps_each_file_decodable() -> crate::R
         tree.current_version()
             .blob_files
             .iter()
-            .any(|file| file.compression() == with_dict),
+            .any(|file| file.compression() == with_dict && !first_files.contains(&file.id())),
         "the relocated survivors keep the codec they were written under",
     );
 
@@ -387,6 +387,32 @@ fn policy_update_naming_an_unheld_dictionary_is_refused_unpublished() -> crate::
 }
 
 #[test]
+fn runtime_config_update_whose_mutator_reads_the_tree_completes() -> crate::Result<()> {
+    // The mutator is the caller's code and may read the tree it updates. An
+    // update that ran it while holding the version lock would wait on itself
+    // for good, so the update runs on its own thread with a deadline.
+    let dir = tempfile::tempdir()?;
+    let tree = open_standard_tree(config(dir.path()))?;
+    let (done, finished) = std::sync::mpsc::channel();
+    let updater = tree.clone();
+    std::thread::spawn(move || {
+        let result = updater.update_runtime_config(|c| {
+            c.zone_map = updater.current_version().iter_tables().next().is_none();
+        });
+        done.send(result).expect("the test is still waiting");
+    });
+
+    finished
+        .recv_timeout(std::time::Duration::from_secs(10))
+        .expect("the update completes instead of waiting on its own lock")?;
+    assert!(
+        tree.runtime_config().zone_map,
+        "and the change is published"
+    );
+    Ok(())
+}
+
+#[test]
 fn dictionary_named_by_a_held_snapshot_survives_a_collection() -> crate::Result<()> {
     // A flush or compaction keeps the runtime-config snapshot it started
     // under. A policy change in the meantime must not let a collection take
@@ -467,26 +493,38 @@ fn ingestion_with_its_policy_replaced_while_writing_keeps_its_dictionary() -> cr
     Ok(())
 }
 
+/// What the armed window did: `None` until it runs, then the outcome of the
+/// policy change and the collection it performed.
+type WindowOutcome = Arc<std::sync::Mutex<Option<crate::Result<()>>>>;
+
 /// Arms the window between a write finishing its files and installing them
 /// with a policy change away from the dictionary and a collection, which is the
-/// last moment the dictionary can be taken from the write. Returns whether the
-/// window was reached, so a test cannot pass by never entering it.
+/// last moment the dictionary can be taken from the write. The outcome is kept
+/// for [`window_reached`], so a test can neither pass by never entering the
+/// window nor lose a failure inside it.
 fn replace_policy_and_collect_before_install(
     tree: &Tree,
     replace: fn(&mut RuntimeConfig),
-) -> Arc<AtomicBool> {
-    let reached = Arc::new(AtomicBool::new(false));
-    let (tree_in_hook, reached_in_hook) = (tree.clone(), Arc::clone(&reached));
+) -> WindowOutcome {
+    let outcome: WindowOutcome = Arc::new(std::sync::Mutex::new(None));
+    let (tree_in_hook, outcome_in_hook) = (tree.clone(), Arc::clone(&outcome));
     tree.config.arm_before_output_install(move || {
-        tree_in_hook
+        let result = tree_in_hook
             .update_runtime_config(replace)
-            .expect("the replacement names no dictionary");
-        tree_in_hook
-            .collect_unreferenced_dictionaries()
-            .expect("a collection");
-        reached_in_hook.store(true, Ordering::SeqCst);
+            .and_then(|()| tree_in_hook.collect_unreferenced_dictionaries())
+            .map(|_| ());
+        outcome_in_hook.lock().expect("unpoisoned").replace(result);
     });
-    reached
+    outcome
+}
+
+/// The armed window ran, and what it did succeeded.
+fn window_reached(outcome: &WindowOutcome) -> crate::Result<()> {
+    outcome
+        .lock()
+        .expect("unpoisoned")
+        .take()
+        .expect("the window was reached")
 }
 
 fn disable_data_dictionary(c: &mut RuntimeConfig) {
@@ -540,7 +578,7 @@ fn flush_with_its_policy_replaced_before_install_keeps_its_dictionary() -> crate
         let reached = replace_policy_and_collect_before_install(&tree, disable_data_dictionary);
         write_generation(&tree, 0)?;
 
-        assert!(reached.load(Ordering::SeqCst), "the window was reached");
+        window_reached(&reached)?;
         assert!(
             tree.current_version().dicts().contains(&dict.id()),
             "still registered: the installed tables name it",
@@ -565,7 +603,7 @@ fn blob_flush_with_its_policy_replaced_before_install_keeps_its_dictionary() -> 
             replace_policy_and_collect_before_install(&tree.index, disable_blob_dictionary);
         write_generation(&tree, 0)?;
 
-        assert!(reached.load(Ordering::SeqCst), "the window was reached");
+        window_reached(&reached)?;
         assert_eq!(
             newest_blob_codec(&tree),
             CompressionType::zstd_dict(3, dict.id())?
@@ -598,7 +636,7 @@ fn ingestion_with_its_policy_replaced_before_install_keeps_its_dictionary() -> c
         let reached = replace_policy_and_collect_before_install(&tree, disable_data_dictionary);
         ingestion.finish()?;
 
-        assert!(reached.load(Ordering::SeqCst), "the window was reached");
+        window_reached(&reached)?;
         assert!(
             tree.current_version().dicts().contains(&dict.id()),
             "still registered: the ingested tables name it",
@@ -628,7 +666,7 @@ fn blob_ingestion_with_its_policy_replaced_before_install_keeps_its_dictionary()
             replace_policy_and_collect_before_install(&tree.index, disable_blob_dictionary);
         ingestion.finish()?;
 
-        assert!(reached.load(Ordering::SeqCst), "the window was reached");
+        window_reached(&reached)?;
         assert!(
             tree.current_version().dicts().contains(&dict.id()),
             "still registered: the ingested blob files name it",
@@ -677,7 +715,7 @@ fn subcompaction_with_its_policy_replaced_before_install_keeps_its_dictionary() 
         let reached = replace_policy_and_collect_before_install(&tree, disable_data_dictionary);
         tree.major_compact(u64::MAX, 0)?;
 
-        assert!(reached.load(Ordering::SeqCst), "the window was reached");
+        window_reached(&reached)?;
         assert!(
             tree.current_version().dicts().contains(&dict.id()),
             "still registered: the compacted tables name it",
@@ -700,16 +738,21 @@ fn subcompaction_with_its_policy_replaced_before_install_keeps_its_dictionary() 
     Ok(())
 }
 
-#[cfg(feature = "parallel")]
 #[test]
-fn filter_blob_files_with_their_policy_replaced_before_install_keep_their_dictionary()
+fn filter_blob_files_opened_after_a_policy_change_follow_the_compaction_snapshot()
 -> crate::Result<()> {
-    // A compaction filter that replaces a separated value writes it to a blob
-    // file of its own, under the blob policy of the moment it opens that file,
-    // and the file reaches the install beside the sub-compaction's tables. The
-    // filter moves the policy to the dictionary on its first item, after the
-    // table writers took theirs, so its blob files are the only output whose
-    // write named the dictionary.
+    // A compaction takes one snapshot for everything it writes, including the
+    // blob files its filter opens for the values it replaces. The filter here
+    // moves the blob policy to a dictionary on its first item, after the
+    // compaction took its snapshot, so a filter that loaded one of its own would
+    // write those files under the dictionary. Serial and parallel alike.
+    for threads in [1, 4] {
+        filter_blob_files_follow_the_compaction_snapshot(threads)?;
+    }
+    Ok(())
+}
+
+fn filter_blob_files_follow_the_compaction_snapshot(threads: usize) -> crate::Result<()> {
     type Arming = Arc<std::sync::Mutex<Option<(Tree, CompressionType)>>>;
 
     struct Rewrite(Arming);
@@ -753,7 +796,7 @@ fn filter_blob_files_with_their_policy_replaced_before_install_keep_their_dictio
     let make_config = || {
         config(dir.path())
             .data_block_size_policy(crate::config::BlockSizePolicy::all(512))
-            .compaction_threads(4)
+            .compaction_threads(threads)
             .subcompaction_min_bytes(0)
             .blob_compression(CompressionType::None)
             .with_compaction_filter_factory(Some(Arc::new(RewriteFactory(Arc::clone(&arming)))))
@@ -772,22 +815,34 @@ fn filter_blob_files_with_their_policy_replaced_before_install_keep_their_dictio
         tree.flush_active_memtable(0)?;
 
         tree.register_zstd_dictionary(Arc::clone(&dict))?;
+        let files_before = tree
+            .current_version()
+            .blob_files
+            .iter()
+            .map(crate::vlog::BlobFile::id)
+            .max()
+            .expect("the writes produced blob files");
         arming.lock().expect("unpoisoned").replace((
             tree.index.clone(),
             CompressionType::zstd_dict(3, dict.id())?,
         ));
-        let reached =
-            replace_policy_and_collect_before_install(&tree.index, disable_blob_dictionary);
         tree.major_compact(u64::MAX, 0)?;
         assert!(
             arming.lock().expect("unpoisoned").is_none(),
             "the filter moved the policy",
         );
 
-        assert!(reached.load(Ordering::SeqCst), "the window was reached");
+        let written: Vec<CompressionType> = tree
+            .current_version()
+            .blob_files
+            .iter()
+            .filter(|file| file.id() > files_before)
+            .map(crate::vlog::BlobFile::compression)
+            .collect();
+        assert!(!written.is_empty(), "the filter wrote blob files");
         assert!(
-            tree.current_version().dicts().contains(&dict.id()),
-            "still registered: the filter's blob files name it",
+            written.iter().all(|codec| *codec == CompressionType::None),
+            "written under the compaction's snapshot, not the later policy: {written:?}",
         );
         for i in 0..N {
             let k = key(0, i);
@@ -845,7 +900,7 @@ fn tight_space_slice_with_its_policy_replaced_before_install_keeps_its_dictionar
         let reached = replace_policy_and_collect_before_install(&tree, disable_data_dictionary);
         tree.major_compact(64 * 1024 * 1024, 0)?;
 
-        assert!(reached.load(Ordering::SeqCst), "the window was reached");
+        window_reached(&reached)?;
         assert!(
             tree.current_version().dicts().contains(&dict.id()),
             "still registered: the slice outputs name it",

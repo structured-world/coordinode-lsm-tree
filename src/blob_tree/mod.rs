@@ -1122,16 +1122,16 @@ impl AbstractTree for BlobTree {
         table_writer = table_writer.use_kv_checksums(rc.kv_checksums, rc.kv_checksum_algo);
         table_writer = table_writer.use_locator(self.index.config.locator_policy.get(0));
 
-        // Resolved from `rc`, which the writers hold and then hand to the
-        // install, as in the standard flush.
+        // Resolved from `rc`, which the flush holds until the install, as in
+        // the standard flush; one snapshot covers the tables and the blob files.
         #[cfg(zstd_any)]
         let dicts = self.index.config.current_zstd_dictionaries();
         #[cfg(zstd_any)]
         {
-            table_writer = table_writer
-                .use_zstd_dictionary(dicts.for_compression(data_block_compression)?)
-                .use_config_snapshot(Arc::clone(&rc));
+            table_writer =
+                table_writer.use_zstd_dictionary(dicts.for_compression(data_block_compression)?);
         }
+        let write_pin = crate::runtime_config::WritePin::new(&rc);
 
         // Parallel block compression for the flush writer, mirroring the
         // standard tree's flush: engaged only when the per-block transform does
@@ -1176,8 +1176,7 @@ impl AbstractTree for BlobTree {
             #[cfg(zstd_any)]
             let w = w
                 .use_zstd_dictionary(dicts.for_compression(rc.blob_compression)?)
-                .use_zstd_dictionaries(dicts)
-                .use_config_snapshot(Arc::clone(&rc));
+                .use_zstd_dictionaries(dicts);
             w
         };
 
@@ -1223,9 +1222,6 @@ impl AbstractTree for BlobTree {
                 table_writer.write(InternalValue::new(item.key, value))?;
             }
         }
-
-        let mut write_pin = blob_writer.take_write_pin();
-        write_pin.join(table_writer.take_write_pin());
 
         let blob_files = blob_writer.finish()?;
 
