@@ -50,7 +50,7 @@ jobs:
 
       # Step 1: Create or update release PR (version bump + changelog)
       - name: Create release PR
-        uses: release-plz/action@aec534bbd8631793b9b3b8f1ee6cd886c322e17f  # v0.5.133
+        uses: release-plz/action@a80d79efe0a195618acb02a4089d55fe74d2505f  # v0.5.136
         with:
           command: release-pr
           config: .release-plz.toml
@@ -60,7 +60,7 @@ jobs:
       # Step 2: If version in Cargo.toml > latest tag, create GitHub Release + tag
       # This triggers release.yml → cargo publish via OIDC
       - name: Create GitHub Release
-        uses: release-plz/action@aec534bbd8631793b9b3b8f1ee6cd886c322e17f  # v0.5.133
+        uses: release-plz/action@a80d79efe0a195618acb02a4089d55fe74d2505f  # v0.5.136
         with:
           command: release
           config: .release-plz.toml
