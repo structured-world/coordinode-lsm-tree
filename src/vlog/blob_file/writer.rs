@@ -303,7 +303,7 @@ impl Writer {
                     });
                 }
                 let compressed =
-                    crate::compression::ZstdBackend::compress_with_dict(value, *level, dict.raw())?;
+                    crate::compression::ZstdBackend::compress_with_dict(value, *level, dict)?;
                 check_size_cap(compressed.len())?;
                 alloc::borrow::Cow::Owned(compressed)
             }

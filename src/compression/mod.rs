@@ -47,13 +47,13 @@ pub trait CompressionProvider {
 
     /// Compress `data` using a zstd dictionary.
     ///
-    /// `dict_raw` may be either a finalized zstd dictionary (header bytes
+    /// `dict` may hold either a finalized zstd dictionary (header bytes
     /// `37 A4 30 EC`, i.e. little-endian integer `0xEC30A437`, followed by
-    /// entropy tables and content — produced by `zstd --train`; accessible
-    /// via [`ZstdDictionary::raw`] for persistence and interop) or raw content
-    /// bytes (bare bytes used as LZ77 history). The zstd backend in this crate
-    /// accepts either representation.
-    fn compress_with_dict(data: &[u8], level: i32, dict_raw: &[u8]) -> crate::Result<Vec<u8>>;
+    /// entropy tables and content, as `zstd --train` writes it) or raw content
+    /// bytes (bare bytes used as LZ77 history). It is prepared for the encoder
+    /// once and shared across calls and threads, so no call parses or copies it.
+    fn compress_with_dict(data: &[u8], level: i32, dict: &ZstdDictionary)
+    -> crate::Result<Vec<u8>>;
 
     /// Decompress a zstd frame that was compressed with a dictionary.
     ///
@@ -118,6 +118,13 @@ pub struct ZstdDictionary {
     /// preserves the single-parse contract.
     #[cfg(feature = "zstd")]
     prepared: Arc<OnceBox<structured_zstd::decoding::DictionaryHandle>>,
+    /// The encoder-side twin of `prepared` (zstd's `CDict` beside the `DDict`):
+    /// parsed once, with the entropy tables it seeds, and shared by every
+    /// thread's compressor as a reference-counted handle. The two sides own
+    /// their dictionary content separately by design, so this is the one
+    /// encoder copy of it for the dictionary's lifetime.
+    #[cfg(feature = "zstd")]
+    encoder: Arc<OnceBox<structured_zstd::encoding::EncoderDictionary>>,
 }
 
 #[cfg(zstd_any)]
@@ -128,6 +135,8 @@ impl Clone for ZstdDictionary {
             raw: Arc::clone(&self.raw),
             #[cfg(feature = "zstd")]
             prepared: Arc::clone(&self.prepared),
+            #[cfg(feature = "zstd")]
+            encoder: Arc::clone(&self.encoder),
         }
     }
 }
@@ -174,6 +183,8 @@ impl ZstdDictionary {
             raw: Arc::from(raw),
             #[cfg(feature = "zstd")]
             prepared: Arc::new(OnceBox::new()),
+            #[cfg(feature = "zstd")]
+            encoder: Arc::new(OnceBox::new()),
         }
     }
 
@@ -183,6 +194,10 @@ impl ZstdDictionary {
     /// one is a collision of the 32-bit truncation — reachable in principle,
     /// unsearchable in a test. This is the only way to construct that state, and
     /// it needs the private field, so it lives with the type.
+    ///
+    /// The prepared encoder and decoder carry the id into the frames they
+    /// write and pin, so the copy prepares its own rather than sharing the
+    /// original's.
     #[cfg(test)]
     #[must_use]
     pub(crate) fn with_id_for_test(&self, id: u32) -> Self {
@@ -190,8 +205,48 @@ impl ZstdDictionary {
             id: u64::from(id),
             raw: Arc::clone(&self.raw),
             #[cfg(feature = "zstd")]
-            prepared: Arc::clone(&self.prepared),
+            prepared: Arc::new(OnceBox::new()),
+            #[cfg(feature = "zstd")]
+            encoder: Arc::new(OnceBox::new()),
         }
+    }
+
+    /// The zstd frame-header id this dictionary's frames carry: the lower 32
+    /// bits of the fingerprint, clamped to at least 1 because a raw-content
+    /// dictionary with id 0 would put no id on the wire. Shared by the encoder
+    /// and decoder sides so both derive it the same way.
+    #[cfg(feature = "zstd")]
+    pub(crate) fn frame_id(&self) -> u32 {
+        self.id().max(1)
+    }
+
+    /// Returns the shared encoder dictionary, preparing it on first call and
+    /// reusing it on every later one, across threads.
+    ///
+    /// A finalized dictionary (magic `37 A4 30 EC`) is parsed for the encoder
+    /// only; anything else is raw content, given [`Self::frame_id`] so the
+    /// frames record the id the reader pins. Cloning the result is a reference
+    /// count, so attaching it to a compressor copies nothing. A parse failure
+    /// is not cached: the next call retries.
+    #[cfg(feature = "zstd")]
+    pub(crate) fn prepared_encoder(
+        &self,
+    ) -> crate::Result<structured_zstd::encoding::EncoderDictionary> {
+        use structured_zstd::decoding::{DICTIONARY_MAGIC, Dictionary};
+        use structured_zstd::encoding::EncoderDictionary;
+
+        self.encoder
+            .get_or_try_init(|| -> crate::Result<Box<EncoderDictionary>> {
+                let dictionary = if self.raw.starts_with(&DICTIONARY_MAGIC) {
+                    EncoderDictionary::from_bytes(&self.raw)
+                } else {
+                    Dictionary::from_raw_content(self.frame_id(), self.raw.to_vec())
+                        .map(EncoderDictionary::from_dictionary)
+                }
+                .map_err(|e| crate::Error::Io(crate::io::Error::other(e.to_string())))?;
+                Ok(Box::new(dictionary))
+            })
+            .cloned()
     }
 
     /// Returns the shared pre-parsed `DictionaryHandle`, parsing on first call
@@ -214,8 +269,7 @@ impl ZstdDictionary {
     pub(crate) fn prepared_handle(
         &self,
     ) -> crate::Result<structured_zstd::decoding::DictionaryHandle> {
-        use structured_zstd::decoding::{Dictionary, DictionaryHandle};
-        const DICT_MAGIC: [u8; 4] = [0x37, 0xA4, 0x30, 0xEC];
+        use structured_zstd::decoding::{DICTIONARY_MAGIC, Dictionary, DictionaryHandle};
 
         // `OnceBox::get_or_try_init` is the canonical single-init-
         // across-racers primitive: the closure runs at most once
@@ -232,16 +286,11 @@ impl ZstdDictionary {
         // is what lets the type stay no-std + alloc compatible.
         self.prepared
             .get_or_try_init(|| -> crate::Result<Box<DictionaryHandle>> {
-                let handle = if self.raw.starts_with(&DICT_MAGIC) {
+                let handle = if self.raw.starts_with(&DICTIONARY_MAGIC) {
                     DictionaryHandle::decode_dict(&self.raw)
                         .map_err(|e| crate::Error::Io(crate::io::Error::other(e.to_string())))?
                 } else {
-                    #[expect(
-                        clippy::cast_possible_truncation,
-                        reason = "intentional: lower 32 bits of xxh3 as internal dict id (matches compressor)"
-                    )]
-                    let raw_content_id = (self.id as u32).max(1);
-                    let dict = Dictionary::from_raw_content(raw_content_id, self.raw.to_vec())
+                    let dict = Dictionary::from_raw_content(self.frame_id(), self.raw.to_vec())
                         .map_err(|e| crate::Error::Io(crate::io::Error::other(e.to_string())))?;
                     DictionaryHandle::from_dictionary(dict)
                 };
