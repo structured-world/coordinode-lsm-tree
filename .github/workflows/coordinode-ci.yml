@@ -557,7 +557,7 @@ jobs:
         run: cargo +nightly llvm-cov --no-report nextest --all-features
       # zstd feature: run with a narrower feature set (zstd + lz4, no defaults)
       # to validate the zstd backend in isolation. --all-features already enables
-      # zstd (zstd-pure is an alias), so this step covers the non-default path.
+      # zstd, so this step covers the non-default path.
       - name: Run tests (zstd backend) with coverage
         env:
           PROPTEST_CASES: "32"
