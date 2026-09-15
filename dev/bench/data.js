@@ -1,5 +1,5 @@
 window.BENCHMARK_DATA = {
-  "lastUpdate": 1789471579857,
+  "lastUpdate": 1789482126409,
   "repoUrl": "https://github.com/structured-world/coordinode-lsm-tree",
   "entries": {
     "lsm-tree db_bench": [
@@ -22518,6 +22518,90 @@ window.BENCHMARK_DATA = {
             "value": 716155.3375445821,
             "unit": "ops/sec",
             "extra": "P50: 1.2us | P99: 4.5us | P99.9: 26.8us\nthreads: 1 | elapsed: 0.28s | num: 200000 | iterations: 3"
+          }
+        ]
+      },
+      {
+        "commit": {
+          "author": {
+            "email": "mail@polaz.com",
+            "name": "Dmitry Prudnikov",
+            "username": "polaz"
+          },
+          "committer": {
+            "email": "noreply@github.com",
+            "name": "GitHub",
+            "username": "web-flow"
+          },
+          "distinct": true,
+          "id": "b19cf6a49808fef5a6ef745be41ba950c62005ca",
+          "message": "feat(version): keep only the current version (#643)\n\n## Summary\n\nThe tree kept a deque of past versions and routed a snapshot read to the\nnewest version installed below it. Every table a compaction consumed\nstayed on disk until the GC watermark passed that install, whether or\nnot the snapshot window still needed any key in it, and the live read\nboundary differed from the one a reopened tree drew.\n\nThe compaction folds already keep every key version a snapshot at or\nabove the watermark reads, and every loss they report lies strictly\nbelow it and raises the persisted retention floor. So the current\nversion answers every snapshot above the floor, and the history now\nkeeps only that one.\n\n- `SuperVersions` holds the current version. `maintenance`, the\nfree-list accounting and `drain_obsolete_to_latest` are gone.\n- One check, `SuperVersion::check_serves`, refuses `0 < seqno <= floor`\nwith `SnapshotBelowRetention`. Its error path is out of line.\n- Under std, point reads and iterators resolve the version from the\nlock-free mirror, without the history lock.\n- `oldest_retained_seqno()` reports the floor, so the boundary is the\nsame live and after a reopen.\n- A consumed table is released at install unless an open reader still\nholds a version that references it. That reader keeps reading its own\nversion until it drops.\n- Dictionary collection runs in one pass: the current version is the\nonly registry, and a reader's tables pinned their dictionaries on open.\n- `docs/INVARIANTS.md`, `docs/external-wal.md`,\n`docs/manifest-recovery.md` and the trait docs describe the floor as the\nread boundary.\n\nBehaviour change: a read at or below the floor that a retained version\nused to answer is now refused straight away.\n`AbstractTree::version_free_list_len` and the hidden\n`AbstractTree::version_memtable_size_sum` are removed.\n\n## Testing\n\n- New `tests/retention_by_live_readers.rs`:\n- in-window snapshots read correctly across compactions and across a\nreopen;\n- an iterator opened before an install reads its own version until\ndropped;\n  - a merge snapshot between base and operand;\n  - storage stays bounded under overwrite and append patterns.\n- Unit tests for the resolver in `src/version/super_version/tests.rs`.\n- Existing tests that encoded the old routing or the two-stage\ndictionary collection were updated to the new contract.\n- `cargo nextest run --all-features`: 3430 passed. Default features:\n2689 passed.\n- `cargo test --doc --all-features`.\n- `cargo clippy --all-targets -D warnings` for all-features, default and\n`--features zstd`, plus `tools/db_bench`.\n- `cargo doc` with default features and with all features.\n- `cargo check --no-default-features --features alloc`: no errors,\nwarning count unchanged.\n\nCloses #638",
+          "timestamp": "2026-09-15T17:19:43+03:00",
+          "tree_id": "e817ae321ae423f792869a01a24b7ed747d81c1b",
+          "url": "https://github.com/structured-world/coordinode-lsm-tree/commit/b19cf6a49808fef5a6ef745be41ba950c62005ca"
+        },
+        "date": 1789482101106,
+        "tool": "customBiggerIsBetter",
+        "benches": [
+          {
+            "name": "mixed",
+            "value": 133016.73432006774,
+            "unit": "ops/sec",
+            "extra": "P50: 0.3us | P99: 5.3us | P99.9: 7.9us\nthreads: 1 | elapsed: 4.02s | num: 200000 | iterations: 3"
+          },
+          {
+            "name": "fillseq",
+            "value": 4363390.204961309,
+            "unit": "ops/sec",
+            "extra": "P50: 0.1us | P99: 1.2us | P99.9: 1.7us\nthreads: 1 | elapsed: 0.05s | num: 200000 | iterations: 3"
+          },
+          {
+            "name": "fillrandom",
+            "value": 1402402.6452960137,
+            "unit": "ops/sec",
+            "extra": "P50: 0.6us | P99: 1.9us | P99.9: 3.0us\nthreads: 1 | elapsed: 0.14s | num: 200000 | iterations: 3"
+          },
+          {
+            "name": "readrandom",
+            "value": 969527.4986405771,
+            "unit": "ops/sec",
+            "extra": "P50: 1.0us | P99: 3.0us | P99.9: 7.6us\nthreads: 1 | elapsed: 0.21s | num: 200000 | iterations: 3"
+          },
+          {
+            "name": "readseq",
+            "value": 4502327.568282976,
+            "unit": "ops/sec",
+            "extra": "P50: 0.1us | P99: 1.9us | P99.9: 2.4us\nthreads: 1 | elapsed: 0.04s | num: 200000 | iterations: 3"
+          },
+          {
+            "name": "seekrandom",
+            "value": 511328.1282567208,
+            "unit": "ops/sec",
+            "extra": "P50: 1.7us | P99: 3.9us | P99.9: 5.2us\nthreads: 1 | elapsed: 0.39s | num: 200000 | iterations: 3"
+          },
+          {
+            "name": "prefixscan",
+            "value": 252164.56645418587,
+            "unit": "ops/sec",
+            "extra": "P50: 3.7us | P99: 4.7us | P99.9: 7.1us\nthreads: 1 | elapsed: 0.79s | num: 200000 | iterations: 3"
+          },
+          {
+            "name": "overwrite",
+            "value": 1429459.613091597,
+            "unit": "ops/sec",
+            "extra": "P50: 0.6us | P99: 1.9us | P99.9: 3.2us\nthreads: 1 | elapsed: 0.14s | num: 200000 | iterations: 3"
+          },
+          {
+            "name": "mergerandom",
+            "value": 1276495.9145524867,
+            "unit": "ops/sec",
+            "extra": "P50: 0.3us | P99: 1.3us | P99.9: 2.8us\nthreads: 1 | elapsed: 0.16s | num: 200000 | iterations: 3"
+          },
+          {
+            "name": "readwhilewriting",
+            "value": 728681.9106460876,
+            "unit": "ops/sec",
+            "extra": "P50: 1.2us | P99: 4.5us | P99.9: 26.9us\nthreads: 1 | elapsed: 0.27s | num: 200000 | iterations: 3"
           }
         ]
       }
