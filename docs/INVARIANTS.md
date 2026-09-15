@@ -78,18 +78,18 @@ matching entry (and add one for a new subsystem).
 
 ## Compaction
 
-- **Every MVCC version a live snapshot can observe survives a compaction, in the
-  tree though not necessarily in the new output.** A snapshot below the install
-  keeps reading the version retained for it, whose tables stay on disk until no
-  version or open reader references them, so a merge may leave such a version
-  out of what it writes: preservation is provided by the retained history plus
-  file lifetime, not by every output carrying every version (see the routing
-  entry under Snapshot / sequence number, and the file-lifecycle entry below).
-  What a merge may NOT do is drop a version the recorded retention floor still
-  promises, since after a reopen the floor is the only boundary left. Enforced
-  in `src/compaction/worker.rs` (merge + tombstone handling), the floor recorded
-  at install (`RetentionEffect`), and the compaction integration tests
-  (`src/compaction/leveled`).
+- **Every MVCC version a snapshot above the retention floor can observe
+  survives a compaction, in the tree it installs.** Every such snapshot is
+  answered from the current version, however far below the install it sits, so
+  a merge keeps every key version a snapshot at or above its GC watermark reads
+  (the newest one below the watermark included) and may lose only what the
+  floor it records then refuses (see the output entry under Snapshot / sequence
+  number). A reader that resolved its version before the install is not
+  affected: its clone keeps that version's tables on disk until it drops (the
+  file-lifecycle entry below). Enforced in `src/compaction/worker.rs` (merge +
+  tombstone handling), the floor recorded at install (`RetentionEffect`), and
+  the retention tests (`tests/retention_by_live_readers.rs`,
+  `src/compaction/leveled`).
 
 - **Everything an install reports as collected history sits strictly below the
   GC watermark.** This is what lets the effect be derived from the watermark at
@@ -121,9 +121,9 @@ matching entry (and add one for a new subsystem).
   the same watermark, so the fold half is gated exactly as above. Its other
   half is the punched input prefix, which the balance cannot see because the
   bytes leave outside the stream: the original file is kept whole while any
-  prior version still references it and punches its consumed prefix only once
-  those readers drain, so the loss is deferred but certain, and the floor is
-  what covers it. An audit of this coupling has to visit that caller too.
+  reader still holds the view it resolved and punches its consumed prefix only
+  once those readers drop, so the loss is deferred but certain, and the floor
+  is what covers it. An audit of this coupling has to visit that caller too.
 
   Stated at `RetentionEffect::of_run` (`src/version/super_version.rs`), which
   derives the effect for every other install, and upheld at the sites listed
@@ -155,12 +155,14 @@ matching entry (and add one for a new subsystem).
 
 ## File lifecycle and concurrency
 
-- **A file referenced by a live version or an in-flight reader is never deleted.**
-  Compaction installs the new version and only then drops inputs that no version or
-  open iterator / snapshot still references; an obsolete SST is unlinked after its
-  last reader releases it, never while in use. A premature delete would fault an
-  active read. Enforced by the version ref-counting in `src/version` and the file
-  GC in `src/compaction` / `src/tree`.
+- **A file referenced by the current version or an in-flight reader is never
+  deleted.** Compaction installs the new version and only then drops inputs; the
+  tree keeps only the current version, so an input is released at once unless
+  an open iterator or point read still holds a version that references it, and
+  is unlinked after that last reader releases it, never while in use. A
+  premature delete would fault an active read. Enforced by the version
+  ref-counting in `src/version` and the file GC in `src/compaction` /
+  `src/tree`.
 
 - **A directory has at most one writer process.** Opening a tree acquires an
   exclusive lock on a `LOCK` file; a second open of the same directory fails with
@@ -178,62 +180,36 @@ matching entry (and add one for a new subsystem).
   visible at read seqno `s + 1`. Enforced in the read path (`src/tree`, `src/mvcc_stream.rs`) and the
   seqno ordering (`src/seqno.rs`, `src/value.rs`).
 
-- **A snapshot is served from a retained version, or refused; never clamped.**
-  A read at snapshot `R` resolves to the newest `SuperVersion` installed below
-  `R`. Compaction maintenance keeps only the newest version below the caller's
-  GC watermark (`major_compact`'s `seqno_threshold`) and releases the older
-  ones, and `clear` drains the history to the new empty version; a read at
-  `0 < R <= oldest_retained_seqno()` then has no version to be served from and
-  fails with `Error::SnapshotBelowRetention` (point reads directly, iterators as
-  their first and only item) rather than being served from a newer version,
-  which would return data the snapshot never saw. Snapshot `0` sees nothing
-  from any version and is always served empty. Enforced in
-  `src/version/super_version.rs` (`get_version_for_snapshot`) and surfaced by
-  every read path that resolves a snapshot (`src/tree`, `src/blob_tree`).
+- **A snapshot is served from the current version, or refused; never clamped.**
+  A read at snapshot `R > floor` (the current version's retention floor,
+  `oldest_retained_seqno()`) is answered from the current `SuperVersion`; a
+  read at `0 < R <= floor` fails with `Error::SnapshotBelowRetention` (point
+  reads directly, iterators as their first and only item) rather than being
+  answered from what survived, which would return data the snapshot never saw.
+  Snapshot `0` sees nothing and is always served empty. The floor is
+  persisted with the version, so the boundary is the same live and after a
+  reopen. Enforced by one check, `SuperVersion::check_serves`
+  (`src/version/super_version.rs`), which the history resolver and the
+  lock-free path of `Tree::snapshot_for_read` / `Tree::get_version_for_snapshot`
+  both run, and surfaced by every read path that resolves a snapshot
+  (`src/tree`, `src/blob_tree`). A reader holds the version it resolved for
+  its whole traversal, so a concurrent install cannot swap the file set
+  underneath it.
 
-- **While the history that installed it is live, a compaction output only has
-  to serve reads STRICTLY ABOVE its own install seqno.** Strictly: at `R == I`
-  neither spelling of the comparison selects the output, since both are `<`
-  with the sides arranged differently. A read at snapshot `R > 0` resolves to
-  the version whose seqno is highest still strictly below `R` (snapshot `0` has
-  no version below it and is served from the oldest retained one, which changes
-  nothing: no entry is visible at seqno `0`), so an output
-  installed at seqno `I` is reachable only from `R > I`; a read at or below `I`
-  is routed to the version current at that seqno and answered from THAT
-  version's tables, for as long as it is retained. Those are not necessarily
-  this compaction's inputs: with consecutive compactions (A replaced by B at
-  20, B by C at 30) a read at 15 resolves to the version holding A, while the
-  compaction at 30 consumed B. They are the ancestry its inputs came from, and
-  the file-lifecycle rule below is what keeps them on disk. Once maintenance
-  prunes that version, such a read is REFUSED (the entry above) rather than
-  answered from this output. Either way it is not this output's problem, which
-  is why a fold may discard a version that a lower snapshot still resolves to.
-
-  The qualifier is load-bearing, because a reopen does NOT preserve it. The
-  recovered history is a single version whose seqno is the persisted retention
-  floor (`SuperVersions::new`), not the seqno anything was installed at, so an
-  output installed at `I = 100` under a floor of `20` answers a read at
-  `R = 50` after a restart. The floor, not the install seqno, is the boundary
-  from then on: `0 < R <= floor` is refused, everything above it is answered
-  from the surviving tables, and snapshot `0` keeps its own rule from the entry
-  above (always served, always empty). A fold must therefore be sound against
-  the floor ALONE, not merely against the routing; a fold that leaned on the
-  routing is the shape that produced the "GC fold drops the readable version"
-  defect.
-
-  Enforced by `SuperVersions::get_version_for_snapshot`
-  (`src/version/super_version.rs`) and, for point reads under `std`, by the
-  mirrored-latest fast path in `Tree::snapshot_for_read`, which answers
-  `seqno > latest.seqno` without consulting the resolver. Those are two
-  spellings of one comparison, and the constraint between them runs ONE WAY:
-  the fast path may claim a snapshot only when the resolver would answer it
-  with the latest version anyway. Widening the fast path breaks routing by
-  itself, since iterators call the resolver directly and would still get the
-  previous version. Changing the resolver alone does not, because the fast path
-  fires only above `latest.seqno`, where both spellings pick the latest
-  regardless. Iterators additionally hold the version they
-  resolved for the whole traversal, so a concurrent compaction cannot swap the
-  file set underneath one.
+- **A compaction output answers every snapshot above the floor, including
+  those below its own install seqno.** An output installed at seqno `I` under
+  a floor `F < I` is the only answer a read at `F < R < I` gets; no older
+  version is kept to route it to. It answers correctly because the folds keep
+  every key version a snapshot at or above the GC watermark reads, and every
+  loss they report lies strictly below the watermark and raises the floor to
+  `watermark - 1` (capped at `I`; the Compaction entries above), so whatever a
+  read above the floor saw is still in the tree. A fold must therefore be
+  sound against the floor ALONE; a fold that relied on reads below the install
+  being answered by an older version is the shape that produced the "GC fold
+  drops the readable version" defect. Enforced by the folds
+  (`src/compaction/stream.rs`) and pinned by
+  `tests/retention_by_live_readers.rs` (in-window snapshots across
+  compactions, and across a reopen).
 
 - **The retention boundary is durable.** An install that discards what older
   snapshots saw raises the version's *retention floor* in the same version
@@ -246,9 +222,10 @@ matching entry (and add one for a new subsystem).
   non-empty delete bitmap built from below-watermark range tombstones, so the
   replacement masks rows an older snapshot could read, and it reports
   `GcBelow` like any other collecting run (`ProducedOutput::for_relocation`).
-  `AbstractTree::retention_floor` exposes the persisted value. A reopened history is seeded at
-  the floor, so the snapshots the live tree refused stay refused after a
-  restart instead of being answered from the surviving version. Version seqnos
+  `AbstractTree::retention_floor` exposes the persisted value, and
+  `oldest_retained_seqno` reports the same one. A reopened tree reads the
+  floor from the recovered version, so the snapshots the live tree refused
+  stay refused after a restart. Version seqnos
   are non-decreasing along the history (`upgrade_version_with_seqno` clamps),
   so a counter reset below the floor cannot slip a version under it. A
   manifest rebuilt by `Config::repair` seeds the floor from
@@ -256,14 +233,16 @@ matching entry (and add one for a new subsystem).
   and the engine must not guess it (see
   [manifest-recovery.md](manifest-recovery.md#retention-floor)).
 
-- **Retention is versioned, so its storage cost scales with write + compaction
-  volume.** History is served from whole retained `SuperVersion`s: every table a
-  compaction consumed stays on disk until the GC watermark passes that
-  compaction's install seqno, whether or not the snapshot window still needs any
-  key version inside it. A wide window therefore costs the disk of every flush
-  and compaction output produced while it was open, not just the disk of the
-  superseded key versions; keep `seqno_threshold` as close to the oldest live
-  snapshot as the caller can prove.
+- **Retention is per key, so its storage cost is the key versions the window
+  reads, plus what open readers hold.** A superseded key version stays in the
+  tables only while the GC watermark still covers a snapshot that reads it; a
+  table a compaction consumed is released at install unless a reader still
+  holds a version that references it. A wide window therefore costs the
+  superseded versions inside it, not every flush and compaction output
+  produced while it was open, and a long-lived iterator pins the file set it
+  resolved until it drops. Keep `seqno_threshold` as close to the oldest live
+  snapshot as the caller can prove. Pinned by the `retained_history_*` tests in
+  `tests/retention_by_live_readers.rs`.
 
 - **Re-applying a put / delete at its original seqno is idempotent; a merge
   operand is NOT.** For a put or delete, the same (key, value, seqno) reproduces

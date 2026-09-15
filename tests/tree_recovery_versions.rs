@@ -233,14 +233,13 @@ fn tree_rejects_unsupported_manifest_version() -> lsm_tree::Result<()> {
 }
 
 #[test]
-fn tree_recovery_version_free_list() -> lsm_tree::Result<()> {
+fn version_upgrades_on_reopen_replay_from_one_snapshot_generation() -> lsm_tree::Result<()> {
     // Under the incremental manifest a version upgrade appends a VersionEdit to
     // the snapshot's `edits-{snapshot_id}` log rather than writing a full
     // `v{id}` per version. So only the snapshot file (`v0`, which CURRENT points
-    // at) exists on disk; intermediate versions live in the log. The in-memory
-    // free list still tracks every version for MVCC. On reopen the snapshot is
-    // loaded and the log replayed, and orphan-cleanup keeps exactly that one
-    // snapshot generation (`v0` + `edits-0`).
+    // at) exists on disk; intermediate versions live in the log. On reopen the
+    // snapshot is loaded and the log replayed, and orphan-cleanup keeps exactly
+    // that one snapshot generation (`v0` + `edits-0`).
     let folder = get_tmp_folder();
 
     let path = folder.path();
@@ -259,7 +258,6 @@ fn tree_recovery_version_free_list() -> lsm_tree::Result<()> {
 
         tree.insert("a", "a", 0);
         tree.flush_active_memtable(0)?;
-        assert_eq!(1, tree.version_free_list_len());
         // The flush appended an edit to the log, not a new snapshot file.
         assert!(
             path.join("edits-0").try_exists()?,
@@ -272,7 +270,6 @@ fn tree_recovery_version_free_list() -> lsm_tree::Result<()> {
 
         tree.insert("b", "b", 0);
         tree.flush_active_memtable(0)?;
-        assert_eq!(2, tree.version_free_list_len());
         assert!(
             !path.join("v2").try_exists()?,
             "second upgrade also appends, no v2 snapshot"
@@ -286,7 +283,6 @@ fn tree_recovery_version_free_list() -> lsm_tree::Result<()> {
             SequenceNumberCounter::default(),
         )
         .open()?;
-        assert_eq!(0, tree.version_free_list_len());
         // CURRENT still points at the v0 snapshot, with its edit log layered on
         // top — both survive orphan cleanup; there is no v1/v2 to clean.
         assert!(

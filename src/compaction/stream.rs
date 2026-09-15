@@ -798,13 +798,9 @@ impl<'a, I: Iterator<Item = Item>, F: StreamFilter + 'a> CompactionStream<'a, I,
                         // to, so the floor would promise data the output no
                         // longer holds.
                         //
-                        // What this fold may discard rests on the output's
-                        // install seqno being above every data seqno it
-                        // contains: reads below the install are routed to the
-                        // retained version and its pre-compaction tables. That
-                        // routing is gone after a reopen, where the recorded
-                        // floor is the only boundary left, so the fold has to be
-                        // sound on its own rather than by that coupling.
+                        // The floor is the only read boundary: every snapshot
+                        // above it is answered from the output, so this fold
+                        // keeps everything such a snapshot reads.
                         if head.key.seqno < self.gc_seqno_threshold {
                             let drained = fail_iter!(self.drain_key(&head.key.user_key));
                             // A tail that was all tombstones, under a head this

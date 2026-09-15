@@ -64,23 +64,11 @@ fn a_collection_under_a_held_pause_leaves_the_dictionary_alone() -> crate::Resul
         tree.flush_active_memtable(0)?;
     }
 
-    // ...then rewritten without it. The first collection only unregisters it
-    // from the latest version; the file stays while a retained version names
-    // it, so the reopen below is what makes it genuinely removable.
-    {
-        let tree = config(dir.path())
-            .data_block_compression_policy(CompressionPolicy::all(CompressionType::None))
-            .open()?;
-        tree.major_compact(u64::MAX, 0)?;
-        let crate::AnyTree::Standard(tree) = tree else {
-            panic!("a standard tree");
-        };
-        tree.collect_unreferenced_dictionaries()?;
-    }
-
+    // ...then rewritten without it, which leaves it collectable.
     let tree = config(dir.path())
         .data_block_compression_policy(CompressionPolicy::all(CompressionType::None))
         .open()?;
+    tree.major_compact(u64::MAX, 0)?;
     let crate::AnyTree::Standard(tree) = tree else {
         panic!("a standard tree");
     };
@@ -289,20 +277,10 @@ fn a_collected_dictionary_is_evicted_from_the_live_registry() -> crate::Result<(
         tree.flush_active_memtable(0)?;
     }
 
-    {
-        let tree = config(dir.path())
-            .data_block_compression_policy(CompressionPolicy::all(CompressionType::None))
-            .open()?;
-        tree.major_compact(u64::MAX, 0)?;
-        let crate::AnyTree::Standard(tree) = tree else {
-            panic!("a standard tree");
-        };
-        tree.collect_unreferenced_dictionaries()?;
-    }
-
     let tree = config(dir.path())
         .data_block_compression_policy(CompressionPolicy::all(CompressionType::None))
         .open()?;
+    tree.major_compact(u64::MAX, 0)?;
     let crate::AnyTree::Standard(tree) = tree else {
         panic!("a standard tree");
     };

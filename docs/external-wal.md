@@ -241,7 +241,7 @@ Run the replay BEFORE publishing your visible watermark, so readers never
 observe the repaired-but-not-yet-reconciled state.
 
 **Snapshots below the retention boundary stay refused.** A live tree refuses
-a snapshot read below the history it no longer holds
+a snapshot read at or below its retention floor
 (`Error::SnapshotBelowRetention`): a compaction's GC watermark, a `clear`, a
 table drop (`drop_range`, FIFO eviction) or a filtering compaction each raise
 that boundary, and the manifest carries it across a normal reopen. A repair

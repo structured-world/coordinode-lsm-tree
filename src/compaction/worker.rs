@@ -1438,13 +1438,12 @@ fn run_tight_space_compaction(
             current_views = next_views;
             lower = Bound::Included(boundary.clone());
 
-            // Drop this iteration's handles to the stale Inners so the only
-            // remaining Arcs are the prior version snapshots; draining them then
-            // drops + punches the originals NOW, reclaiming space before the next
-            // slice. (Concurrent reader snapshots defer their share safely.)
+            // Drop this iteration's handles to the stale Inners: the install
+            // above replaced the version that held them, so the originals drop
+            // and punch NOW, reclaiming space before the next slice. (Concurrent
+            // reader snapshots defer their share safely.)
             drop(prior_to_punch);
             drop(current_stale);
-            opts.version_history.write().drain_obsolete_to_latest();
 
             // Test-only crash point: abort right after the first slice is durably
             // installed and punched, exercising the reopen-with-restriction path.
@@ -1514,12 +1513,6 @@ fn run_tight_space_compaction(
         .show(payload.table_ids.iter().copied());
 
     let tables_out = result?;
-
-    opts.version_history.write().maintenance(
-        &opts.config.path,
-        opts.mvcc_gc_watermark,
-        &*opts.config.fs,
-    )?;
 
     Ok(CompactionResult {
         action: CompactionAction::Merged,
@@ -1859,7 +1852,7 @@ fn run_subcompaction(
 
 #[expect(
     clippy::significant_drop_tightening,
-    reason = "version_history_lock must be held across upgrade_version and maintenance"
+    reason = "the hidden-set check and the install must run under one version lock"
 )]
 fn move_tables(
     compaction_state: &CompactionGuard<'_>,
@@ -1903,15 +1896,6 @@ fn move_tables(
         // A trivial move rewrites nothing: every version survives as-is.
         crate::version::RetentionEffect::Keep,
     )?;
-
-    if let Err(e) = version_history_lock.maintenance(
-        &opts.config.path,
-        opts.mvcc_gc_watermark,
-        &*opts.config.fs,
-    ) {
-        log::error!("Manifest maintenance failed: {e:?}");
-        return Err(e);
-    }
 
     Ok(CompactionResult {
         action: CompactionAction::Moved,
@@ -2189,22 +2173,12 @@ fn run_merge_on_read_relocation(
         .hide(payload.table_ids.iter().copied());
 
     let produced = super::flavour::ProducedOutput::for_relocation(relocated, source.clone());
-    let result = (|| -> crate::Result<usize> {
-        let mut version_history_lock = opts.version_history.write();
-        let tables_out = super::flavour::install_merge(
-            &mut version_history_lock,
-            opts,
-            payload,
-            vec![produced],
-        )?;
-        version_history_lock.maintenance(
-            &opts.config.path,
-            opts.mvcc_gc_watermark,
-            &*opts.config.fs,
-        )?;
-        drop(version_history_lock);
-        Ok(tables_out)
-    })();
+    let result = super::flavour::install_merge(
+        &mut opts.version_history.write(),
+        opts,
+        payload,
+        vec![produced],
+    );
 
     compaction_state
         .hidden_set_mut()
@@ -2503,10 +2477,6 @@ fn merge_tables(
             compaction_state
                 .hidden_set_mut()
                 .show(payload.table_ids.iter().copied());
-
-            version_history_lock
-                .maintenance(&opts.config.path, opts.mvcc_gc_watermark, &*opts.config.fs)
-                .inspect_err(|e| log::error!("Manifest maintenance failed: {e:?}"))?;
 
             drop(version_history_lock);
             drop(compaction_state);
@@ -2881,12 +2851,6 @@ fn merge_tables(
         .hidden_set_mut()
         .show(payload.table_ids.iter().copied());
 
-    version_history_lock
-        .maintenance(&opts.config.path, opts.mvcc_gc_watermark, &*opts.config.fs)
-        .inspect_err(|e| {
-            log::error!("Manifest maintenance failed: {e:?}");
-        })?;
-
     drop(version_history_lock);
     drop(compaction_state);
 
@@ -2971,18 +2935,9 @@ fn drop_tables(
         opts.encryption.clone(),
         // Whole tables go (drop-range, FIFO / TTL eviction): the rows every
         // older snapshot saw in them are gone, so no snapshot up to this
-        // install is servable after a reopen.
+        // install is servable.
         crate::version::RetentionEffect::DropsData,
     )?;
-
-    if let Err(e) = version_history_lock.maintenance(
-        &opts.config.path,
-        opts.mvcc_gc_watermark,
-        &*opts.config.fs,
-    ) {
-        log::error!("Manifest maintenance failed: {e:?}");
-        return Err(e);
-    }
 
     drop(version_history_lock);
 

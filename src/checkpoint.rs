@@ -589,11 +589,10 @@ fn write_current_for_version(
 /// `version` is the captured snapshot held by the checkpoint driver
 /// from `tree.current_version()`. Writing it through
 /// [`crate::version::persist_version`] removes the dependency on the
-/// source `v<id>` file's lifetime: a concurrent
-/// [`crate::version::SuperVersions::maintenance`] call may delete the
-/// source file between capture and this function, but the snapshot is
-/// fully reconstructible from memory, so checkpoint creation does not
-/// fail under that race. `comparator_name` is required to encode the
+/// source `v<id>` file's lifetime: a concurrent manifest rotation may
+/// delete the source file between capture and this function, but the
+/// snapshot is fully reconstructible from memory, so checkpoint creation
+/// does not fail under that race. `comparator_name` is required to encode the
 /// version through the same wire-format path the live tree uses (see
 /// [`crate::version::persist_version`]'s signature). `current` is
 /// then written via [`write_current_for_version`] referencing the
@@ -627,14 +626,12 @@ pub fn copy_metadata(
         sync_mode,
     )?;
     // Re-serialise the captured Version into target/v<id> rather than
-    // copying the source file. Reason: SuperVersions::maintenance can
-    // physically remove the source v<id> between current_version() and
-    // this point (manifest GC fires when seqno < mvcc_gc_watermark for
-    // a version older than the active one). The captured `version` is
-    // an in-memory snapshot held by the checkpoint driver and is the
-    // authoritative source for the snapshot we just hard-linked SSTs
-    // for, so writing it from memory eliminates the race entirely —
-    // the source file's lifetime no longer matters.
+    // copying the source file. Reason: a manifest rotation can physically
+    // remove the source v<id> between current_version() and this point.
+    // The captured `version` is an in-memory snapshot held by the
+    // checkpoint driver and is the authoritative source for the snapshot
+    // we just hard-linked SSTs for, so writing it from memory eliminates
+    // the race entirely: the source file's lifetime no longer matters.
     // Checkpoints carry their own snapshot of the runtime config so
     // the captured manifest is encoded with the same toggles the
     // live tree used at capture time. Receives the snapshot from the

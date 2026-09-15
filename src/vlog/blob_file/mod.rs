@@ -99,10 +99,10 @@ pub struct Inner {
     /// Pinned here rather than looked up per read, exactly as a table pins
     /// its own: the handle that keeps a blob file readable has to keep the
     /// bytes that decode it readable too. A reader captures a version, and
-    /// that capture defers the file's deletion past a `clear` that drains the
-    /// history; a dictionary resolved from the LIVE registry instead would be
+    /// that capture defers the file's deletion past any install that replaces
+    /// it; a dictionary resolved from the LIVE registry instead would be
     /// collected out from under that reader, since collection only spares what
-    /// a RETAINED version still names.
+    /// the current version still names.
     #[cfg(zstd_any)]
     pub(crate) zstd_dictionary: Option<Arc<crate::compression::ZstdDictionary>>,
 

@@ -9,13 +9,10 @@
 //! with `RetentionEffect::Keep`, which left the persisted retention floor
 //! where it was.
 //!
-//! While the process lives that was invisible, and still is: a read below the
-//! install is routed to the retained `SuperVersion` and its sealed memtables,
-//! so it comes back answered either way. A reopen removes that routing and the
-//! floor is the only boundary left. Admitting a read the flush had already
-//! collected the answer for returned a silent "absent" instead of
-//! `SnapshotBelowRetention`, which a consumer cannot tell from a genuine
-//! delete.
+//! The floor is the read boundary, live and after a reopen alike. Admitting a
+//! read the flush had already collected the answer for returned a silent
+//! "absent" instead of `SnapshotBelowRetention`, which a consumer cannot tell
+//! from a genuine delete.
 //!
 //! These tests pin both sides of that boundary, and the watermark-0 case that
 //! must move nothing.
@@ -94,14 +91,14 @@ fn a_flush_that_collects_below_the_watermark_refuses_reads_below_it_after_a_reop
         "a flush that collected below watermark 8 must record a floor of 7",
     );
 
-    // While the process lives the read is still ANSWERED, not refused: the
-    // history retains the pre-flush SuperVersion and routes the read to its
-    // sealed memtables. The persisted floor is a boundary for what survives a
-    // reopen, not a live gate, and `oldest_retained_seqno` is the live one.
-    assert_eq!(
-        tree.get("k", 3)?.as_deref(),
-        Some(&b"oldest"[..]),
-        "a live tree still answers from the retained version",
+    // The floor is the live boundary too: the read is refused already, with
+    // no pre-flush version kept around to answer it.
+    assert!(
+        matches!(
+            tree.get("k", SeqNo::from(3_u64)),
+            Err(lsm_tree::Error::SnapshotBelowRetention { .. })
+        ),
+        "a live tree refuses what the flush collected, as a reopened one does",
     );
 
     drop(tree);

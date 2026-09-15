@@ -1281,39 +1281,20 @@ mod zstd_dict {
         // The file is there while a table references it.
         assert!(dir.path().join("dicts").join(dict_id.to_string()).exists());
 
-        {
-            let tree = make_config(dir.path())
-                .data_block_compression_policy(CompressionPolicy::all(CompressionType::None))
-                .open()?;
-            // Rewrite everything under the no-dictionary policy.
-            tree.major_compact(u64::MAX, 0)?;
-
-            let lsm_tree::AnyTree::Standard(standard) = &tree else {
-                panic!("a standard tree");
-            };
-
-            // Stage 1 only: the latest version stops registering the id, but
-            // the version that named it is STILL RETAINED and can still be read
-            // from, so unlinking the file now would break exactly that read.
-            assert_eq!(
-                standard.collect_unreferenced_dictionaries()?,
-                0,
-                "a dictionary a retained version still names is not unlinked",
-            );
-            assert!(
-                dir.path().join("dicts").join(dict_id.to_string()).exists(),
-                "its file survives while a retained version names it",
-            );
-        }
-
-        // Stage 2: after a reopen the history is one version, and that version
-        // no longer registers the id, so the file is finally collectable.
         let tree = make_config(dir.path())
             .data_block_compression_policy(CompressionPolicy::all(CompressionType::None))
             .open()?;
+        // A reader that resolved the version before the rewrite.
+        let reader = tree.iter(lsm_tree::MAX_SEQNO, None);
+        // Rewrite everything under the no-dictionary policy.
+        tree.major_compact(u64::MAX, 0)?;
+
         let lsm_tree::AnyTree::Standard(standard) = &tree else {
             panic!("a standard tree");
         };
+
+        // The current version no longer names the id, and no older version is
+        // kept, so one pass unregisters it and unlinks the file.
         assert_eq!(
             standard.collect_unreferenced_dictionaries()?,
             1,
@@ -1323,6 +1304,16 @@ mod zstd_dict {
             !dir.path().join("dicts").join(dict_id.to_string()).exists(),
             "its file is gone",
         );
+
+        // The reader still decodes its own tables: they pinned the dictionary
+        // when they were opened, so its file was not what they read from.
+        let mut read = 0;
+        for guard in reader {
+            let (_, value) = guard.into_inner()?;
+            assert_eq!(&*value, b"value-written-under-the-dictionary");
+            read += 1;
+        }
+        assert_eq!(read, 100);
 
         // And the data is still readable: it was rewritten, not lost.
         for i in 0u32..100 {
@@ -1915,22 +1906,15 @@ mod zstd_dict {
         );
 
         // And the second one is registered in the VERSION, not merely present
-        // in the folder, which the open scans either way. Nothing uses it, so
-        // a collection right after the reopen unregisters it, but the
-        // recovered version that still names it is retained and keeps the
-        // file. A registration that never reached the manifest would be
-        // unlinked by this very pass.
+        // in the folder, which the open scans either way. Nothing references
+        // it, so only a registration that reached the manifest puts it there.
         let lsm_tree::AnyTree::Standard(standard) = &reopened else {
             panic!("a standard tree");
         };
         assert!(standard.zstd_dictionaries().get(second_id).is_some());
-        assert_eq!(standard.collect_unreferenced_dictionaries()?, 0);
         assert!(
-            dir.path()
-                .join("dicts")
-                .join(second_id.to_string())
-                .exists(),
-            "the runtime registration survived the reopen",
+            reopened.current_version().dicts().contains(&second_id),
+            "the runtime registration survived the reopen in the version",
         );
         Ok(())
     }
@@ -1971,22 +1955,21 @@ mod zstd_dict {
             let lsm_tree::AnyTree::Standard(standard) = &tree else {
                 panic!("a standard tree");
             };
-            // Stage 1 unregisters the id; a retained version still names it.
-            assert_eq!(standard.collect_unreferenced_dictionaries()?, 0);
+            assert_eq!(
+                standard.collect_unreferenced_dictionaries()?,
+                1,
+                "the unregistration installs through a rotation and the file goes",
+            );
         }
 
+        // The unregistration was persisted: the reopened version does not name
+        // the id, and nothing is missing to read.
         let tree = make_config(dir.path())
             .manifest_log_rotate_bytes(0)
             .data_block_compression_policy(CompressionPolicy::all(CompressionType::None))
             .open()?;
-        let lsm_tree::AnyTree::Standard(standard) = &tree else {
-            panic!("a standard tree");
-        };
-        assert_eq!(
-            standard.collect_unreferenced_dictionaries()?,
-            1,
-            "the unregistration was persisted, so the file is collectable",
-        );
+        assert!(!tree.current_version().dicts().contains(&dict_id));
+        assert!(!dir.path().join("dicts").join(dict_id.to_string()).exists());
         assert_eq!(
             tree.get(b"key-00042", lsm_tree::MAX_SEQNO)?.as_deref(),
             Some(b"value-written-under-the-dictionary".as_slice()),

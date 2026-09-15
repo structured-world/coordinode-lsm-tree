@@ -169,15 +169,12 @@ impl Tree {
         let hi = clone_bound(range.end_bound());
         let bounds_ref = (bound_as_ref(&lo), bound_as_ref(&hi));
 
-        // The segment list below is built from the version a read at `seqno`
-        // resolves to, not from the current one. Two things follow that this
-        // scan depends on: a compaction installed at or above `seqno` cannot
-        // turn a row-major tree columnar (or the reverse) underneath it, and
-        // the per-segment recency ranking is the ranking THAT version had.
-        let super_version = self
-            .version_history
-            .read()
-            .get_version_for_snapshot(seqno)?;
+        // The segment list below is built from the one version a read at
+        // `seqno` resolves to, held for the whole scan: a compaction installing
+        // mid-scan cannot turn a row-major tree columnar (or the reverse)
+        // underneath it, and the per-segment recency ranking is the ranking
+        // THAT version has.
+        let super_version = self.get_version_for_snapshot(seqno)?;
 
         let mut segments: Vec<Segment> = Vec::new();
         // `iter_tables` yields newest-first (the same order the sequenced
