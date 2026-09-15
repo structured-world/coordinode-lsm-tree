@@ -314,10 +314,9 @@ retry after the filesystem is fixed completes the drop.
 
 ## Retention floor
 
-A live tree refuses a snapshot read below the oldest version its history
-retains (`Error::SnapshotBelowRetention`), and the manifest records that
-boundary as the version's *retention floor* so the refusal holds across a
-reopen: a GC compaction raises it to its watermark minus one (capped at the
+A live tree refuses a snapshot read at or below its *retention floor*
+(`Error::SnapshotBelowRetention`), and the manifest records that boundary with
+the version so the refusal holds across a reopen: a GC compaction raises it to its watermark minus one (capped at the
 compaction's own install seqno), a `clear`, a table drop or a compaction
 whose filter transformed rows to the install's own seqno. The lost manifest
 was the floor's only durable copy, and the tables cannot stand in for it: a

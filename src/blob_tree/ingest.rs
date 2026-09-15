@@ -328,12 +328,6 @@ impl<'a> BlobIngestion<'a> {
         // The installed files name their dictionaries from here on.
         drop(write_pin);
 
-        // Perform maintenance on the version history (e.g., clean up old versions).
-        // We use gc_watermark=0 since ingestion doesn't affect sealed memtables.
-        if let Err(e) = version_lock.maintenance(&index.config.path, 0, &*index.config.fs) {
-            log::warn!("Version GC failed: {e:?}");
-        }
-
         Ok(())
     }
 

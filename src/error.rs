@@ -468,21 +468,21 @@ pub enum Error {
         limit: u64,
     },
 
-    /// A read asked for a snapshot whose version the history no longer
-    /// retains.
+    /// A read asked for a snapshot at or below the retention floor.
     ///
-    /// The engine serves a snapshot at seqno `s` from the newest retained
-    /// version installed BELOW `s`. Compaction maintenance prunes the history
-    /// up to the newest version below the caller's GC watermark
+    /// Every snapshot above the floor is served from the current version. An
+    /// install that loses or rewrites what an older snapshot read raises the
+    /// floor past it: a compaction or flush that collected history below the
+    /// caller's GC watermark
     /// ([`AbstractTree::major_compact`](crate::AbstractTree::major_compact)'s
-    /// `seqno_threshold`), and [`AbstractTree::clear`](crate::AbstractTree::clear)
-    /// drains it to the new empty version, so afterwards every snapshot at or
-    /// below the oldest retained version's seqno has nothing to be served
-    /// from. Serving it from the oldest retained version instead would
-    /// silently answer with data the snapshot never saw, so the read is
-    /// refused. Snapshot `0` is the exception: it sees no entry from any
-    /// version and is always served (empty). The boundary is persisted with
-    /// the manifest, so the refusal holds across a reopen as well.
+    /// `seqno_threshold`), a filtering compaction, a table drop,
+    /// [`AbstractTree::clear`](crate::AbstractTree::clear). Serving such a
+    /// snapshot from what survived would silently answer with data it never
+    /// saw, so the read is refused. Snapshot `0` is the exception: it sees no
+    /// entry from any version and is always served (empty). The floor is
+    /// persisted with the manifest, so the refusal is the same on either side
+    /// of a reopen. A reader that resolved its version before the install is
+    /// not affected: it keeps reading that version until it drops it.
     ///
     /// Point reads return it directly; iterators yield it as their first and
     /// only item. [`AbstractTree::oldest_retained_seqno`](crate::AbstractTree::oldest_retained_seqno)
@@ -493,8 +493,8 @@ pub enum Error {
         /// The snapshot seqno the read asked for.
         requested: SeqNo,
 
-        /// Seqno of the oldest version the history still retains; reads at
-        /// `oldest_retained + 1` and above are servable.
+        /// The retention floor; reads at `oldest_retained + 1` and above are
+        /// servable.
         oldest_retained: SeqNo,
     },
 }

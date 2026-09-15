@@ -20,7 +20,6 @@ fn remove_if_present(fs: &dyn Fs, path: &Path) -> crate::Result<()> {
         Err(e) => Err(e.into()),
     }
 }
-use alloc::collections::VecDeque;
 use alloc::sync::Arc;
 #[cfg(not(feature = "std"))]
 use alloc::vec::Vec;
@@ -45,24 +44,23 @@ pub struct SuperVersion {
     pub(crate) seqno: SeqNo,
 }
 
-/// A borrowed-or-owned [`SuperVersion`] for the duration of one read.
+/// The [`SuperVersion`] one point read runs against.
 ///
-/// A point read at or beyond the latest installed version does not need its
-/// own copy of the snapshot: the mirrored latest [`SuperVersion`] is the one
-/// `get_version_for_snapshot` would return, and holding the `arc-swap` load
-/// guard keeps it alive without the history lock or the clone (two `Arc`
-/// bumps plus a [`Version`] clone per call). Historical snapshot reads still
-/// clone out of the locked history, which this wraps as `Owned`.
+/// A point read does not need its own copy of the snapshot: every snapshot
+/// above the retention floor is served by the current version, and holding the
+/// mirror's `arc-swap` load guard keeps it alive without the history lock or a
+/// clone (three `Arc` bumps per call).
 ///
 /// Short-lived by design: a guard held across a long scan would delay the
 /// mirror's writers, so iterators keep cloning; this type serves the point
-/// lookups. The mirror needs `arc-swap`, so under no-std only `Owned` exists
-/// and every read clones, as before.
+/// lookups. The mirror needs `arc-swap`, so under no-std the read clones the
+/// current version out of the locked history instead.
 pub enum SnapshotRef {
-    /// The latest installed snapshot, pinned by the mirror's load guard.
+    /// The current snapshot, pinned by the mirror's load guard.
     #[cfg(feature = "std")]
     Latest(arc_swap::Guard<Arc<SuperVersion>>),
-    /// A historical snapshot cloned out of the locked version history.
+    /// The current snapshot, cloned out of the locked version history.
+    #[cfg(not(feature = "std"))]
     Owned(SuperVersion),
 }
 
@@ -73,6 +71,7 @@ impl core::ops::Deref for SnapshotRef {
         match self {
             #[cfg(feature = "std")]
             Self::Latest(guard) => guard,
+            #[cfg(not(feature = "std"))]
             Self::Owned(version) => version,
         }
     }
@@ -82,9 +81,10 @@ impl core::ops::Deref for SnapshotRef {
 /// what decides whether the install raises the persisted retention floor
 /// (see [`Version::retention_floor`]).
 ///
-/// The in-memory history keeps serving older snapshots from retained
-/// versions either way; the floor matters after a reopen, when only the
-/// latest version survives and the data an older snapshot saw may be gone.
+/// The floor is the read boundary, live and after a reopen alike: every
+/// snapshot above it is answered from the latest version, so an install that
+/// loses what an older snapshot read has to raise it, or that snapshot would be
+/// answered from data that is gone.
 #[derive(Clone, Copy, Debug)]
 pub enum RetentionEffect {
     /// Every snapshot the prior version served stays servable after a
@@ -143,8 +143,16 @@ impl RetentionEffect {
     }
 }
 
+/// The tree's current [`SuperVersion`], and the manifest persistence that
+/// installs its successors.
+///
+/// Only the latest version is kept. Every snapshot above the retention floor
+/// is answered from it, since the compaction folds keep every key version such
+/// a snapshot reads and every loss they report raises the floor; an older
+/// version is needed only by a reader that already resolved it, and that
+/// reader holds its own clone, which keeps its tables on disk until it drops.
 pub struct SuperVersions {
-    versions: VecDeque<SuperVersion>,
+    current: SuperVersion,
 
     /// Stable comparator identity persisted in every version file.
     comparator_name: Arc<str>,
@@ -179,15 +187,14 @@ pub struct SuperVersions {
     /// install defeated that.
     edit_scratch: Vec<u8>,
 
-    /// Lock-free mirror of the latest (back) `SuperVersion`, shared with the
-    /// `Tree` so a point read at `MAX_SEQNO` can load the current snapshot
-    /// without taking the history `RwLock` or cloning the deque entry. Kept
-    /// in sync under the same write lock at every site that changes the back
-    /// (construction, [`append_version`](Self::append_version),
+    /// Lock-free mirror of the current `SuperVersion`, shared with the `Tree`
+    /// so a read can load it without taking the history `RwLock`. Kept in
+    /// sync under the same write lock at every site that changes the current
+    /// version (construction, [`append_version`](Self::append_version),
     /// [`replace_latest_version`](Self::replace_latest_version)). Recent
     /// inserts remain visible through it because they mutate the shared
-    /// `active_memtable` behind a stable `Arc` — the back only changes on
-    /// flush / compaction.
+    /// `active_memtable` behind a stable `Arc`; the current version only
+    /// changes on rotation, flush and compaction.
     ///
     /// `std`-only: `arc-swap` is not `#![no_std]`. A no-std build (where
     /// `SuperVersions` is already std-bound for other reasons) simply does
@@ -203,11 +210,9 @@ impl SuperVersions {
     /// snapshot id on open (which may be `< version.id()` when edits were
     /// replayed on top of it).
     ///
-    /// The single seed version sits at the recovered
-    /// [`retention_floor`](Version::retention_floor): the history holds no
-    /// older version to serve a snapshot at or below it from, and the data
-    /// such a snapshot saw may be gone, so the seed's seqno IS the reopened
-    /// tree's read boundary (`0` on a fresh create).
+    /// The seed version's seqno is the recovered
+    /// [`retention_floor`](Version::retention_floor), below which the data a
+    /// snapshot saw may be gone (`0` on a fresh create).
     pub fn new(
         version: Version,
         comparator: &SharedComparator,
@@ -227,113 +232,13 @@ impl SuperVersions {
         Self {
             #[cfg(feature = "std")]
             latest: Arc::new(ArcSwap::from_pointee(initial.clone())),
-            versions: vec![initial].into(),
+            current: initial,
             comparator_name,
             sync_mode,
             snapshot_id,
             log_rotate_bytes,
             log_bytes: None,
             edit_scratch: Vec::new(),
-        }
-    }
-
-    pub fn memtable_size_sum(&self) -> u64 {
-        let mut set = crate::HashMap::default();
-
-        for super_version in &self.versions {
-            set.entry(super_version.active_memtable.id)
-                .and_modify(|bytes| *bytes += super_version.active_memtable.size())
-                .or_insert_with(|| super_version.active_memtable.size());
-
-            for sealed in super_version.sealed_memtables.iter() {
-                set.entry(sealed.id)
-                    .and_modify(|bytes| *bytes += sealed.size())
-                    .or_insert_with(|| sealed.size());
-            }
-        }
-
-        set.into_values().sum()
-    }
-
-    pub fn len(&self) -> usize {
-        self.versions.len()
-    }
-
-    pub fn free_list_len(&self) -> usize {
-        // Clamp-to-zero: the live version is excluded from the free list, so an
-        // empty history yields a zero-length free list rather than underflowing.
-        self.len().saturating_sub(1)
-    }
-
-    pub fn maintenance(
-        &mut self,
-        folder: &Path,
-        gc_watermark: SeqNo,
-        fs: &dyn Fs,
-    ) -> crate::Result<()> {
-        if gc_watermark == 0 {
-            return Ok(());
-        }
-
-        if self.free_list_len() < 1 {
-            return Ok(());
-        }
-
-        log::trace!("Running manifest GC with watermark={gc_watermark}");
-
-        if let Some(hi_idx) = self.versions.iter().rposition(|x| x.seqno < gc_watermark) {
-            for _ in 0..hi_idx {
-                let Some(head) = self.versions.front() else {
-                    break;
-                };
-
-                let evicted_id = head.version.id();
-                log::trace!("Removing version #{evicted_id} (seqno={})", head.seqno);
-
-                // Under the incremental manifest only the CURRENT snapshot has a
-                // `v{id}` file on disk; intermediate versions live in the edit
-                // log and have no file (so removing them is a no-op NotFound).
-                // The snapshot file must NOT be removed here even when its
-                // in-memory version is evicted from the history — `CURRENT` still
-                // points at it and the log layers on top. Its lifecycle belongs
-                // to rotation (which writes the next snapshot and deletes the old
-                // one only after `CURRENT` is repointed).
-                if evicted_id != self.snapshot_id {
-                    let path = folder.join(format!("v{evicted_id}"));
-                    match fs.remove_file(&path) {
-                        Ok(()) => {}
-                        Err(e) if e.kind() == crate::io::ErrorKind::NotFound => {}
-                        Err(e) => return Err(e.into()),
-                    }
-                }
-
-                self.versions.pop_front();
-            }
-        }
-
-        log::trace!(
-            "Manifest GC done, version length now {}",
-            self.versions.len()
-        );
-
-        Ok(())
-    }
-
-    /// Drops every retained version except the latest from the in-memory
-    /// history.
-    ///
-    /// Used by [`AbstractTree::clear`](crate::AbstractTree::clear): the new
-    /// (latest) version is empty and every prior version's tables / blob files
-    /// were just marked deleted, so releasing the history's hold lets
-    /// [`Inner::Drop`](crate::table::Table) reclaim their files once any
-    /// concurrent reader's own snapshot clone is released (MVCC-safe — a reader
-    /// keeps its clone alive, deferring deletion until it finishes). The
-    /// on-disk manifest already reflects the latest version (persisted by the
-    /// preceding `upgrade_version`); intermediate in-memory versions carry no
-    /// `v{id}` snapshot file, so there is nothing to unlink here.
-    pub(crate) fn drain_obsolete_to_latest(&mut self) {
-        while self.versions.len() > 1 {
-            self.versions.pop_front();
         }
     }
 
@@ -401,14 +306,12 @@ impl SuperVersions {
         retention: RetentionEffect,
     ) -> crate::Result<()> {
         let prior = self.latest_version();
-        // Version seqnos are non-decreasing along the history. The counter is
-        // caller-owned and a deployment that reopens with it reset would
-        // otherwise install a version BELOW the recovered retention floor;
-        // a read below the floor would then find that "newer" version by its
-        // smaller seqno and be served from data the snapshot never saw, and
-        // the lock-free latest-snapshot fast path (which trusts the back to
-        // carry the highest seqno) would serve it too. Under the seqno
-        // contract (monotone counter) this clamp is a no-op.
+        // Install seqnos are non-decreasing. The counter is caller-owned, and a
+        // deployment that reopens with it reset would otherwise install below
+        // the current version: a drop or a filtering compaction there raises
+        // the floor only to that smaller seqno, leaving snapshots above it
+        // answered by the current version without the rows it removed. Under
+        // the seqno contract (monotone counter) this clamp is a no-op.
         let seqno = seqno.max(prior.seqno);
         let mut next_version = f(&prior)?;
         // Every install is a transition to a new id. A rotation persists the
@@ -574,20 +477,21 @@ impl SuperVersions {
         Ok(())
     }
 
+    /// Makes `version` the current one. The replaced version stays alive only
+    /// in the readers that already hold it.
     pub fn append_version(&mut self, version: SuperVersion) {
-        // Mirror the new back into the lock-free latest pointer so point
-        // reads at MAX_SEQNO see it without taking the history lock.
+        // Mirror it into the lock-free pointer so reads see it without taking
+        // the history lock.
         #[cfg(feature = "std")]
         self.latest.store(Arc::new(version.clone()));
-        self.versions.push_back(version);
+        self.current = version;
     }
 
+    /// Replaces the current version with one that changes only its memtables
+    /// (a rotation, a cleared active memtable), which the manifest does not
+    /// record.
     pub fn replace_latest_version(&mut self, version: SuperVersion) {
-        if self.versions.pop_back().is_some() {
-            #[cfg(feature = "std")]
-            self.latest.store(Arc::new(version.clone()));
-            self.versions.push_back(version);
-        }
+        self.append_version(version);
     }
 
     /// Returns a handle to the lock-free latest-`SuperVersion` mirror.
@@ -619,121 +523,74 @@ impl SuperVersions {
     /// memtable, sealed memtables, version), which is pure overhead when
     /// the caller only needs one field for the duration of the lock guard.
     pub fn latest_version_ref(&self) -> &SuperVersion {
-        #[expect(clippy::expect_used, reason = "SuperVersion is expected to exist")]
-        self.versions
-            .back()
-            .expect("should always have a SuperVersion")
+        &self.current
     }
 
-    /// Borrows the oldest retained super-version: the history is never empty
-    /// (construction seeds it, and every eviction keeps at least the back).
-    fn oldest_version_ref(&self) -> &SuperVersion {
-        #[expect(clippy::expect_used, reason = "SuperVersion is expected to exist")]
-        self.versions
-            .front()
-            .expect("should always have a SuperVersion")
-    }
-
-    /// Every dictionary id ANY retained version still registers.
+    /// Every dictionary id the current version registers.
     ///
     /// The collection boundary: a file may be unlinked only once it is absent
-    /// from this set, because a retained version can still be read from and its
-    /// tables cannot open without the dictionary they name.
+    /// from this set. A reader holding a replaced version needs no file: its
+    /// tables and blob files pinned their dictionaries when they were opened.
     #[must_use]
     pub fn registered_dicts(&self) -> Vec<crate::file::DictId> {
-        let mut ids: Vec<crate::file::DictId> = self
-            .versions
-            .iter()
-            .flat_map(|v| v.version.dicts().iter().copied())
-            .collect();
-        ids.sort_unstable();
-        ids.dedup();
-        ids
-    }
-
-    /// Seqno of the oldest retained version: the read boundary. A snapshot at
-    /// seqno `s` is servable iff `s == 0` or `s > oldest_retained_seqno()`.
-    /// Advances when [`maintenance`](Self::maintenance) prunes the front and
-    /// when [`drain_obsolete_to_latest`](Self::drain_obsolete_to_latest) drops
-    /// everything but the back.
-    #[must_use]
-    pub fn oldest_retained_seqno(&self) -> SeqNo {
-        self.oldest_version_ref().seqno
+        self.current.version.dicts().to_vec()
     }
 
     /// Resolves the super-version that serves a read at snapshot `seqno`: the
-    /// newest retained version installed below it.
+    /// current one, for every snapshot above the retention floor.
     ///
-    /// This is where the engine's read routing lives, and compaction depends on
-    /// it: because a read at `seqno` is answered by a version installed
-    /// STRICTLY below it, an output installed at seqno `I` never has to answer
-    /// a read below `I`, which is answered from the version current then, out
-    /// of THAT version's tables. Those need not be this compaction's own
-    /// inputs: consecutive compactions (A replaced by B at 20, B by C at 30)
-    /// leave a read at 15 on the version holding A, while the compaction at 30
-    /// consumed B. Either way it is not the new output's problem, which is what
-    /// lets a fold discard a version some lower snapshot still resolves to.
-    /// The dependency is
-    /// one-way and unenforced by any type, so a change to the comparison here
-    /// changes what the folds are allowed to drop; a reopen already drops the
-    /// routing (the history restarts as one version whose seqno is the
-    /// persisted floor, not any install seqno), which is why the folds are
-    /// written to be sound against the floor alone.
+    /// The current version answers such a snapshot as the version installed
+    /// just below it would have: a fold keeps every key version a snapshot at
+    /// or above its watermark reads (the newest below the watermark included),
+    /// and an install that loses or rewrites anything a lower snapshot read
+    /// raises the floor past it (see [`RetentionEffect`]). What is not covered
+    /// by the floor is therefore never gone, and what is gone is refused. A
+    /// reopened tree already reads this way, so a live one and a reopened one
+    /// draw the same boundary.
     ///
-    /// The comparison is spelled twice. Point reads under `std` take
-    /// [`Tree::snapshot_for_read`](crate::Tree)'s mirrored-latest fast path,
-    /// which answers `seqno > latest.seqno` without reaching this function.
-    /// The constraint between them runs ONE WAY: the fast path must only claim
-    /// a snapshot this resolver would answer with the latest version anyway.
-    /// Widening it (to `>=`, say) breaks that on its own, since iterators come
-    /// here directly and would still get the previous version. Changing this
-    /// resolver alone does not, because the fast path fires only above
-    /// `latest.seqno`, where both spellings pick the latest regardless.
-    ///
-    /// Snapshot `0` is served from the oldest retained version. No entry has a
-    /// seqno below `0`, so nothing is visible at that snapshot from any
-    /// version and the choice is immaterial; keeping it servable lets a caller
-    /// probe an empty tree at `0` after pruning.
+    /// Snapshot `0` is served: no entry has a seqno below `0`, so nothing is
+    /// visible at it whatever the file set.
     ///
     /// # Errors
     ///
     /// [`Error::SnapshotBelowRetention`](crate::Error::SnapshotBelowRetention)
-    /// when `0 < seqno <= oldest_retained_seqno()`: the history has been pruned
-    /// past the requested snapshot, and serving it from a newer version would
-    /// answer with data the snapshot never saw.
+    /// when `0 < seqno <= retention_floor`: an install collected what
+    /// the snapshot read, and answering from what survived would return data
+    /// the snapshot never saw.
     pub fn get_version_for_snapshot(&self, seqno: SeqNo) -> crate::Result<SuperVersion> {
-        let oldest = self.oldest_version_ref();
-        if seqno == 0 {
-            return Ok(oldest.clone());
-        }
+        self.current.check_serves(seqno)?;
+        Ok(self.current.clone())
+    }
+}
 
-        // The boundary is checked against the FRONT explicitly rather than
-        // left to the search below: version seqnos are non-decreasing along
-        // the history, so the search would reach the same verdict, but the
-        // explicit check keeps the contract independent of that ordering (and
-        // costs nothing: the front is one deref away).
-        if seqno <= oldest.seqno {
-            log::trace!(
-                "snapshot seqno={seqno} is below the retained history (oldest retained \
-                 seqno={}, {} versions)",
-                oldest.seqno,
-                self.versions.len()
-            );
-            return Err(crate::Error::SnapshotBelowRetention {
-                requested: seqno,
-                oldest_retained: oldest.seqno,
-            });
+impl SuperVersion {
+    /// The retention check every snapshot read goes through: the current
+    /// version serves `seqno` iff it is `0` or above its retention floor.
+    ///
+    /// # Errors
+    ///
+    /// [`Error::SnapshotBelowRetention`](crate::Error::SnapshotBelowRetention)
+    /// when `0 < seqno <= floor`.
+    #[inline]
+    pub(crate) fn check_serves(&self, seqno: SeqNo) -> crate::Result<()> {
+        let floor = self.version.retention_floor();
+        // The common case first: a read above the floor.
+        if seqno > floor || seqno == 0 {
+            Ok(())
+        } else {
+            Err(below_retention(seqno, floor))
         }
+    }
+}
 
-        // `oldest.seqno < seqno` holds here, so the search finds at least the
-        // front; the fallback is unreachable and only keeps the code panic-free.
-        Ok(self
-            .versions
-            .iter()
-            .rev()
-            .find(|version| version.seqno < seqno)
-            .unwrap_or(oldest)
-            .clone())
+/// Kept out of line so the check inlined into every read stays a load and two
+/// compares.
+#[cold]
+#[inline(never)]
+fn below_retention(requested: SeqNo, floor: SeqNo) -> crate::Error {
+    crate::Error::SnapshotBelowRetention {
+        requested,
+        oldest_retained: floor,
     }
 }
 

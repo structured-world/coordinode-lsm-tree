@@ -227,19 +227,20 @@ pub struct VersionInner {
     /// snapshot at or below it saw may have been discarded (a GC compaction
     /// dropped versions below its watermark, a `clear` / table drop removed
     /// whole tables). Monotone across versions and persisted with the
-    /// manifest, so a reopened tree refuses those snapshots instead of
-    /// answering from data they never saw. `0` until the first such install.
+    /// manifest, so the tree refuses those snapshots, live and after a reopen,
+    /// instead of answering from data they never saw. `0` until the first such
+    /// install.
     retention_floor: crate::SeqNo,
 
     /// Ids of the compression dictionaries this version's tables may reference,
     /// ascending. The bytes live in `dicts/`; this is what says which of them
     /// the tree still owes a reader.
     ///
-    /// Versioned rather than tree-global for the same reason tables are: a
-    /// dictionary is reachable exactly while some retained version references
-    /// it, so the file can be removed once no version does, and a recovery that
-    /// lands on an older version still finds what that version's tables were
-    /// written against.
+    /// Versioned rather than tree-global for the same reason tables are: the
+    /// file can be removed once the current version no longer references it
+    /// (a reader of an older version holds tables that pinned it on open), and
+    /// a recovery that lands on an older version still finds what that
+    /// version's tables were written against.
     ///
     /// Not gated on the compression features. A build without them cannot
     /// resolve these ids, but it must carry the list forward across its own
@@ -374,7 +375,7 @@ impl Version {
     /// held returns this version unchanged, which is not installed either.
     ///
     /// Dropping an id is what makes its file collectable; the bytes are
-    /// removed separately, once no retained version holds the id any more.
+    /// removed separately, once this drop is installed as the current version.
     /// One transition for the whole set, however many ids it drops.
     #[must_use]
     pub fn without_dicts(&self, ids: &[crate::file::DictId]) -> Self {

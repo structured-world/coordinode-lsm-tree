@@ -93,7 +93,7 @@ pub trait SeekableGuardIter: DoubleEndedIterator<Item = IterGuardImpl> + Send {
 }
 
 /// A [`SeekableGuardIter`] that failed before it could open its snapshot
-/// (the history no longer retains a version for the requested seqno).
+/// (the requested seqno is at or below the retention floor).
 ///
 /// It carries the failure as its single item, from either end, so the
 /// consumer meets it through the same per-row `Result` it already handles;

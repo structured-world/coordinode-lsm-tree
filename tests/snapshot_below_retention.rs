@@ -1,12 +1,12 @@
-//! A snapshot read below the oldest retained version must return
+//! A snapshot read at or below the retention floor must return
 //! `Error::SnapshotBelowRetention`, never panic.
 //!
-//! `maintenance(gc_watermark)` prunes the version history down to the newest
-//! version below the watermark. Any read at a snapshot seqno at or below that
-//! version's seqno has no retained version to serve it: the engine used to
-//! `expect` one and take the whole tree down. Every read surface that resolves
-//! a snapshot is exercised here, on both the standard and the KV-separated
-//! tree, plus the `clear` path (which drains the history the same way).
+//! An install that collects what older snapshots read (a GC compaction below
+//! its watermark, `clear`, `drop_range`, FIFO eviction, a filtering compaction)
+//! raises the floor, and a read at or below it has nothing left to be answered
+//! from: the engine used to `expect` a version and take the whole tree down.
+//! Every read surface that resolves a snapshot is exercised here, on both the
+//! standard and the KV-separated tree, plus the `clear` path.
 //!
 //! The second half covers the boundary's durability: the install that
 //! discards what older snapshots saw (a GC compaction, `clear`, `drop_range`,
@@ -23,7 +23,8 @@ use std::sync::Arc;
 use test_log::test;
 
 /// A pruned tree: two flushed versions of `"k"`, then a major compaction whose
-/// watermark sits above both, so only the second version stays in the history.
+/// watermark sits above both, so the first is collected and the floor rises
+/// past it.
 ///
 /// Returns the tree, the seqno of the FIRST write of `"k"` (a snapshot at
 /// `first + 1` saw `v1` before the prune) and the seqno counter, plus the
@@ -45,16 +46,17 @@ fn pruned_tree(kv_separated: bool) -> lsm_tree::Result<PrunedTree> {
     tree.insert("k", "v2", second);
     tree.flush_active_memtable(0)?;
 
-    // The watermark is above every seqno handed out so far: maintenance keeps
-    // the newest version below it (the second flush) and drops the rest.
+    // The watermark is above every seqno handed out so far: the fold keeps the
+    // second version and collects the first, so the floor becomes
+    // `watermark - 1`.
     let watermark = seqno.get();
     tree.major_compact(common::COMPACTION_TARGET, watermark)?;
 
     // Each flush takes a seqno of its own for the version it installs, so the
-    // retained version (the second flush) sits ABOVE `first + 1`: the snapshot
-    // the tests probe is strictly below the boundary, not merely at it. Pinned
-    // here so a change to how installs allocate seqnos fails loudly instead of
-    // silently turning the strict-below probes into at-boundary ones.
+    // floor sits ABOVE `first + 1`: the snapshot the tests probe is strictly
+    // below the boundary, not merely at it. Pinned here so a change to how
+    // installs allocate seqnos fails loudly instead of silently turning the
+    // strict-below probes into at-boundary ones.
     let oldest = tree.oldest_retained_seqno();
     assert!(
         first + 1 < oldest,
@@ -140,7 +142,7 @@ fn oldest_retained_seqno_after_prune_is_the_read_boundary() -> lsm_tree::Result<
     assert_eq!(
         tree.get("k", oldest + 1)?.as_deref(),
         Some(b"v2".as_slice()),
-        "one above the boundary is served from the retained version"
+        "one above the boundary is served from the current version"
     );
     assert_eq!(
         tree.get("k", SeqNo::MAX)?.as_deref(),
@@ -378,7 +380,7 @@ fn blob_tree_reads_below_retention_return_error() -> lsm_tree::Result<()> {
     );
     assert!(batch.next().is_none());
 
-    // Above the boundary the retained version serves the read.
+    // Above the boundary the current version serves the read.
     assert_eq!(
         tree.get("k", oldest + 1)?.as_deref(),
         Some(b"v2".as_slice())
@@ -599,7 +601,7 @@ fn blob_tree_reopen_without_gc_keeps_boundary_zero() -> lsm_tree::Result<()> {
 /// when run with a watermark: a flush with a GC watermark, a bulk
 /// ingestion, and a leveled trivial move (a single non-overlapping L0 table
 /// slides into the last level untouched). Each is followed by a reopen so the
-/// persisted floor, not just the live history, is what is checked.
+/// persisted floor is what is checked.
 #[test]
 fn additive_installs_do_not_raise_the_boundary() -> lsm_tree::Result<()> {
     let folder = get_tmp_folder();
@@ -608,7 +610,7 @@ fn additive_installs_do_not_raise_the_boundary() -> lsm_tree::Result<()> {
 
     let first = seqno.next();
     tree.insert("a", "v1", first);
-    // A flush run with a watermark prunes the in-memory history only.
+    // A flush run with a watermark, over one version per key: nothing to fold.
     tree.flush_active_memtable(seqno.get())?;
     // A trivial move with a watermark: one table, nothing to merge with.
     tree.compact(
@@ -671,8 +673,8 @@ fn leveled_merge_with_watermark_raises_the_boundary() -> lsm_tree::Result<()> {
 }
 
 /// `drop_range` removes whole tables, so every snapshot up to its install is
-/// refused after a reopen, for the surviving keys too (the boundary is
-/// tree-wide, not per key).
+/// refused, live and after a reopen, for the surviving keys too (the boundary
+/// is tree-wide, not per key).
 #[test]
 fn drop_range_raises_the_boundary_to_its_install() -> lsm_tree::Result<()> {
     let folder = get_tmp_folder();
@@ -687,18 +689,12 @@ fn drop_range_raises_the_boundary_to_its_install() -> lsm_tree::Result<()> {
     let snapshot = seqno.get();
     assert_eq!(tree.get("b", snapshot)?.as_deref(), Some(b"vb".as_slice()));
 
-    // The drop's own install takes the next seqno: that is the persisted
-    // boundary. The LIVE history is not pruned by a drop (its GC watermark
-    // is 0), so while the tree stays open the snapshot is still served from
-    // the retained pre-drop version; only the reopen loses that version.
+    // The drop's own install takes the next seqno: that is the boundary, and
+    // it holds at once, with no pre-drop version kept to serve the snapshot.
     let install = seqno.get();
     tree.drop_range("a"..="a")?;
-    assert_eq!(
-        tree.oldest_retained_seqno(),
-        0,
-        "live history keeps serving"
-    );
-    assert_eq!(tree.get("b", snapshot)?.as_deref(), Some(b"vb".as_slice()));
+    assert_eq!(tree.oldest_retained_seqno(), install);
+    assert_below_retention(tree.get("b", snapshot).unwrap_err(), snapshot, install);
     drop(tree);
 
     let tree = reopen(folder.path(), false, seqno.get())?;
@@ -789,9 +785,8 @@ fn gc_watermark_above_the_counter_is_capped_at_the_install() -> lsm_tree::Result
 
 /// A compaction filter removes or rewrites rows regardless of the GC
 /// watermark, so a filtering compaction discards what older snapshots saw
-/// even at watermark `0`: its install seqno becomes the persisted boundary,
-/// and the reopen refuses the snapshot the live tree still served from the
-/// retained pre-compaction version.
+/// even at watermark `0`: its install seqno becomes the boundary, which the
+/// live tree and the reopened one both enforce.
 #[test]
 fn compaction_filter_rewrite_raises_the_boundary_to_its_install() -> lsm_tree::Result<()> {
     use lsm_tree::compaction::filter::{
@@ -845,8 +840,8 @@ fn compaction_filter_rewrite_raises_the_boundary_to_its_install() -> lsm_tree::R
 
     let install = seqno.get();
     tree.major_compact(common::COMPACTION_TARGET, 0)?;
-    // Live: the retained pre-compaction version still serves the snapshot.
-    assert_eq!(tree.get("a", snapshot)?.as_deref(), Some(b"a".as_slice()));
+    // Refused at once: no pre-compaction version is kept to serve it.
+    assert_below_retention(tree.get("a", snapshot).unwrap_err(), snapshot, install);
     assert!(
         tree.get("a", SeqNo::MAX)?.is_none(),
         "the filter removed it"
@@ -894,11 +889,9 @@ fn drop_range_without_a_contained_table_keeps_the_boundary() -> lsm_tree::Result
     Ok(())
 }
 
-/// `retention_floor()` reports the PERSISTED boundary (what a reopen will
-/// enforce) while `oldest_retained_seqno()` reports the LIVE one (what the
-/// retained history still serves); a table drop separates the two until the
-/// restart, and the persisted one is what a deployment records for a later
-/// repair.
+/// `retention_floor()` reports the persisted boundary, which is also the live
+/// one `oldest_retained_seqno()` reports, and is what a deployment records for
+/// a later repair.
 #[test]
 fn retention_floor_reports_the_persisted_boundary() -> lsm_tree::Result<()> {
     let folder = get_tmp_folder();
@@ -921,10 +914,10 @@ fn retention_floor_reports_the_persisted_boundary() -> lsm_tree::Result<()> {
     );
     assert_eq!(
         tree.oldest_retained_seqno(),
-        0,
-        "live: history still retained"
+        install,
+        "live: the same boundary"
     );
-    assert_eq!(tree.get("b", snapshot)?.as_deref(), Some(b"vb".as_slice()));
+    assert_below_retention(tree.get("b", snapshot).unwrap_err(), snapshot, install);
 
     // A later GC compaction below that install does not lower it.
     tree.insert("b", "vb2", seqno.next());

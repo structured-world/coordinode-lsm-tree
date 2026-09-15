@@ -757,10 +757,6 @@ impl AbstractTree for BlobTree {
         self.index.metrics()
     }
 
-    fn version_free_list_len(&self) -> usize {
-        self.index.version_free_list_len()
-    }
-
     fn prefix<K: AsRef<[u8]>>(
         &self,
         prefix: K,
@@ -945,15 +941,14 @@ impl AbstractTree for BlobTree {
             self.index.0.runtime_config.load_full(),
             self.index.0.config.encryption.clone(),
             // Every table and blob file goes: no snapshot up to this install
-            // is servable after a reopen.
+            // is servable.
             crate::version::RetentionEffect::DropsData,
         )?;
 
         // Same MVCC-safe reclaim as the standard tree, plus the blob files:
-        // mark every obsolete table / blob file deleted, drop the history's
-        // hold, and let Inner::Drop reclaim each once its last reference is
-        // released (a live reader's snapshot clone defers deletion).
-        versions.drain_obsolete_to_latest();
+        // mark every obsolete table / blob file deleted and let Inner::Drop
+        // reclaim each once its last reference is released (a live reader's
+        // snapshot clone defers deletion).
         drop(versions);
 
         for table in prior.version.iter_tables() {
