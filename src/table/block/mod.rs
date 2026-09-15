@@ -869,9 +869,7 @@ impl Block {
                 }
 
                 compressed_buf = Some(crate::compression::ZstdBackend::compress_with_dict(
-                    data,
-                    level,
-                    dict.raw(),
+                    data, level, dict,
                 )?);
             }
         }

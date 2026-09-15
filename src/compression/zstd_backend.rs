@@ -15,15 +15,6 @@
 use super::CompressionProvider;
 use std::io::Read;
 
-/// Zstd finalized dictionary magic number (bytes `37 A4 30 EC`,
-/// little-endian `0xEC30_A437`).
-///
-/// A dictionary blob that begins with these four bytes is a fully trained,
-/// finalized zstd dictionary containing entropy tables and must be parsed
-/// with `Dictionary::decode_dict`. A blob without this prefix is treated
-/// as raw content and is loaded via `Dictionary::from_raw_content`.
-const DICT_MAGIC: [u8; 4] = [0x37, 0xA4, 0x30, 0xEC];
-
 /// Read at most `capacity` bytes from `reader` into a pre-allocated buffer,
 /// then probe for excess data. Returns the filled portion of the buffer.
 ///
@@ -197,7 +188,7 @@ fn decode_raw_content_bounded(
 fn do_decompress_with_dict(
     decoder: &mut structured_zstd::decoding::FrameDecoder,
     data: &[u8],
-    // Pre-computed synthetic id for the raw-content path: `dict.id().max(1)`.
+    // Pre-computed synthetic id for the raw-content path: `dict.frame_id()`.
     // Unused on the finalized-dict path (`is_raw_content = false`).
     raw_content_id: u32,
     capacity: usize,
@@ -268,8 +259,8 @@ fn do_decompress_with_dict(
             });
         }
 
-        // `raw_content_id` was computed by the caller from `dict.id().max(1)`,
-        // reusing the cached xxh3 fingerprint without re-hashing dict_raw.
+        // `raw_content_id` is the caller's `dict.frame_id()`, derived from the
+        // cached xxh3 fingerprint without re-hashing the dictionary.
         decoder
             .force_dict(raw_content_id)
             .map_err(|e| crate::Error::Io(crate::io::Error::other(e.to_string())))?;
@@ -404,170 +395,48 @@ impl CompressionProvider for ZstdProvider {
         bounded_read(&mut decoder, capacity)
     }
 
-    fn compress_with_dict(data: &[u8], level: i32, dict_raw: &[u8]) -> crate::Result<Vec<u8>> {
-        use structured_zstd::decoding::Dictionary;
-        use structured_zstd::encoding::{
-            CompressionLevel, EncoderDictionary, FrameCompressor, MatchGeneratorDriver,
-        };
+    fn compress_with_dict(
+        data: &[u8],
+        level: i32,
+        dict: &crate::compression::ZstdDictionary,
+    ) -> crate::Result<Vec<u8>> {
+        use structured_zstd::encoding::{CompressionLevel, FrameCompressor};
 
-        // Thread-local `FrameCompressor` with the dictionary pre-loaded.
+        // One reusable compression context per thread (zstd's `CCtx`) with the
+        // dictionary attached, kept while the (dictionary, level) pair holds.
+        // The dictionary is prepared once for every thread
+        // (`ZstdDictionary::prepared_encoder`), so a miss here builds only the
+        // match-finder state and attaches a shared handle: nothing is parsed
+        // or copied. Keyed by the full 64-bit fingerprint, so two dictionaries
+        // sharing a 32-bit truncation never share a context.
         //
-        // Parsing a zstd dictionary (especially a finalized one with entropy tables)
-        // is expensive relative to per-block compression of 4–64 KiB LSM blocks.
-        // This single-entry cache amortises that cost: if the (dict_content, level)
-        // pair matches the stored entry the compressor is reused as-is; otherwise
-        // the entry is replaced (old dictionary evicted, new one parsed).
-        //
-        // In practice LSM-tree workloads use one dictionary per level, so the
-        // same (dict, level) pair recurs on every block write — the cache
-        // almost always hits.
-        //
-        // `FrameCompressor::compress()` resets internal state at the start of
-        // each call (matcher reset, offset history `[1, 4, 8]`) and then re-primes
-        // from the stored dictionary, so re-using the compressor across calls is safe.
-        //
-        // Cache key: (xxh3_64(dict_raw), level). The full 64-bit hash avoids
-        // false cache hits when two distinct dictionaries share the same 32-bit
-        // truncation.
-        //
-        // Source type `Cursor<Vec<u8>>`: TLS requires `'static` bounds, so the
-        // source must be owned. This costs one O(data.len()) copy per call, which
-        // is negligible compared to the dictionary-parsing savings.
-        type CachedCompressor =
-            FrameCompressor<std::io::Cursor<Vec<u8>>, Vec<u8>, MatchGeneratorDriver>;
+        // One entry: a thread writes one (dictionary, level) pair for a whole
+        // compaction job (a multi-entry cache is tracked in #231).
         thread_local! {
-            // Single-entry memoizer keyed by (dict_hash, level).
-            // Sufficient for the typical case of one dict/level per compaction job per thread.
-            // For workloads that interleave multiple dicts in the same thread, a multi-entry
-            // keyed cache would avoid re-initialization on key changes (tracked in #231).
-            static TLS_COMPRESSOR: std::cell::RefCell<Option<(u64, i32, CachedCompressor)>> =
+            static TLS_COMPRESSOR: std::cell::RefCell<Option<(u64, i32, FrameCompressor)>> =
                 const { std::cell::RefCell::new(None) };
         }
 
-        // The encoder attaches the dictionary via the `EncoderDictionary`
-        // (CDict-analog) path, which parses for the encode side only.
-        //
-        // Two dictionary formats are supported:
-        //
-        // 1. **Finalized zstd dictionary** (magic bytes `37 A4 30 EC` prefix): produced by
-        //    `zstd --train` / `zstd::dict::from_continuous` and the C zstd library.
-        //    Contains entropy tables (Huffman + FSE) that prime the compressor's
-        //    coding state for better ratios. Attached via `set_dictionary_from_bytes`
-        //    (which builds an `EncoderDictionary`, skipping the decode lookup tables).
-        //
-        // 2. **Raw content dictionary** (no magic): a bare byte sequence used as
-        //    LZ77 history to improve match distances on repetitive data. No entropy
-        //    table seeding. Parsed via `Dictionary::from_raw_content`, then wrapped
-        //    in an `EncoderDictionary` and attached via `set_encoder_dictionary`.
-        //
-        // Both formats end up attached as an `EncoderDictionary`, so a
-        // `ZstdDictionary` created from a raw training corpus (without a
-        // finalized header) compresses just as one created from a
-        // finalized dictionary.
-        //
-        // ID derivation for raw content dictionaries:
-        //   - Use the lower 32 bits of the xxh3 hash of `dict_raw`, clamped
-        //     to at least 1. (id=0 is rejected by `FrameCompressor::set_dictionary`
-        //     in structured-zstd.)
-        //   - The id is written into the frame header (Dict_ID field) and
-        //     kept there on disk, so the reader can optionally pin the
-        //     inner frame's `Dictionary_ID` against the expected
-        //     dictionary (`FrameDecoder::expect_dict_id`) to detect a
-        //     block that was compressed under the wrong dictionary.
-        let dict_key = xxhash_rust::xxh3::xxh3_64(dict_raw);
-
         TLS_COMPRESSOR.with(|cell| {
             let mut state = cell.borrow_mut();
-
-            // Re-initialise if this is the first call in this thread or if the
-            // dictionary or compression level has changed.
-            if !matches!(&*state, Some((k, l, _)) if *k == dict_key && *l == level) {
+            if !matches!(&*state, Some((key, l, _)) if *key == dict.id64() && *l == level) {
                 let mut compressor = FrameCompressor::new(CompressionLevel::from_level(level));
-                if dict_raw.starts_with(&DICT_MAGIC) {
-                    // Finalized dict: parse for the ENCODER side only via
-                    // `EncoderDictionary` (the `set_dictionary_from_bytes` path),
-                    // which skips building the decode lookup tables the encoder
-                    // never reads. Cheaper than the old `decode_dict` full parse
-                    // on every cache miss — most visible at btultra2 / L22, where
-                    // dictionary parsing dominates the miss-path cost.
-                    compressor
-                        .set_dictionary_from_bytes(dict_raw)
-                        .map_err(|e| crate::Error::Io(crate::io::Error::other(e.to_string())))?;
-                } else {
-                    // Raw-content dict (no magic header): there is no serialized
-                    // dictionary blob to parse for encoding, so wrap the
-                    // raw-content `Dictionary` as an `EncoderDictionary` and
-                    // attach it without a reparse.
-                    #[expect(
-                        clippy::cast_possible_truncation,
-                        reason = "intentional: lower 32 bits of xxh3 as internal dict id"
-                    )]
-                    let id = {
-                        let h = dict_key as u32;
-                        h.max(1) // id=0 is rejected by the attach path; internal use only
-                    };
-                    let dictionary = Dictionary::from_raw_content(id, dict_raw.to_vec())
-                        .map_err(|e| crate::Error::Io(crate::io::Error::other(e.to_string())))?;
-                    compressor
-                        .set_encoder_dictionary(EncoderDictionary::from_dictionary(dictionary))
-                        .map_err(|e| crate::Error::Io(crate::io::Error::other(e.to_string())))?;
-                }
-                *state = Some((dict_key, level, compressor));
+                compressor
+                    .set_encoder_dictionary(dict.prepared_encoder()?)
+                    .map_err(|e| crate::Error::Io(crate::io::Error::other(e.to_string())))?;
+                *state = Some((dict.id64(), level, compressor));
             }
-
-            // Unreachable: the branch above always initialises `state`.
             let Some((_, _, compressor)) = state.as_mut() else {
-                unreachable!("TLS_COMPRESSOR always initialised above");
+                unreachable!("TLS_COMPRESSOR initialised above");
             };
 
-            // `compress()` resets the matcher and offset history at the start of
-            // each call and then re-primes from the stored dictionary, so the same
-            // `FrameCompressor` instance can safely be re-used across blocks.
-            //
-            // Source buffer: after `compress()` the exhausted `Cursor<Vec<u8>>`
-            // remains in the compressor (position == len, Vec capacity intact).
-            // Recover it with `take_source()`, clear, and refill to reuse the
-            // allocation on subsequent calls instead of cloning `data` each time.
-            //
-            // Drain buffer: the filled `Vec<u8>` is returned to the caller via
-            // `take_drain()`, so its capacity cannot be recovered for the next
-            // call without an extra copy (which would negate the saving). Using
-            // `Vec::new()` is allocation-free at construction; the allocator
-            // recycles same-size blocks in practice on the hot path.
-            let src_buf = compressor.take_source().map_or_else(
-                || data.to_vec(),
-                |c| {
-                    let mut v = c.into_inner();
-                    v.clear();
-                    v.extend_from_slice(data);
-                    v
-                },
-            );
-            // Size hint so btultra2 (L22) picks the small-source parameter set
-            // for this 4-64 KiB block instead of allocating the full 8 MiB
-            // tables — without it dictionary block compression at L22 runs ~34x
-            // slower (the matcher reset rebuilds the large tables every call).
-            compressor.set_source_size_hint(data.len() as u64);
-            compressor.set_source(std::io::Cursor::new(src_buf));
-            compressor.set_drain(Vec::new());
-            compressor.compress();
-
-            // `set_drain(Vec::new())` is called on every path above, so
-            // `take_drain()` always returns `Some`. This cannot fail.
-            let compressed = compressor
-                .take_drain()
-                .unwrap_or_else(|| unreachable!("drain is always set by set_drain() above"));
-
-            // The frame keeps the dictionary id its header declares (the
-            // synthetic xxh3-derived id for raw-content dicts, the embedded
-            // id for finalized dicts). Retaining it on disk lets the reader
-            // pin the inner frame's `Dictionary_ID` against the expected
-            // dictionary via `FrameDecoder::expect_dict_id`, surfacing a
-            // block compressed under the wrong dictionary as a typed decode
-            // error instead of silent wrong output. It also drops the
-            // per-block header rewrite the old id-stripping step performed
-            // on every dictionary write.
-            Ok(compressed)
+            // Reads `data` in place and sizes the frame from its length, so a
+            // 4-64 KiB block gets the small-source parameter set without a
+            // separate hint. Every call is an independent frame the dictionary
+            // is primed into. Its header keeps the dictionary id, which the
+            // reader pins (`FrameDecoder::expect_dict_id`) to catch a block
+            // compressed under the wrong dictionary.
+            Ok(compressor.compress_independent_frame(data))
         })
     }
 
@@ -605,7 +474,9 @@ impl CompressionProvider for ZstdProvider {
         // For finalized dicts the frame embeds the dictID from the dict header;
         // `init` loads the matching dict automatically. `decode_all_to_vec`
         // handles this via the standard path.
-        let is_raw_content = !dict.raw().starts_with(&DICT_MAGIC);
+        let is_raw_content = !dict
+            .raw()
+            .starts_with(&structured_zstd::decoding::DICTIONARY_MAGIC);
 
         TLS_DECODER.with(|cell| {
             let mut state = cell.borrow_mut();
@@ -629,7 +500,7 @@ impl CompressionProvider for ZstdProvider {
                 unreachable!("TLS_DECODER always initialised above");
             };
 
-            do_decompress_with_dict(decoder, data, dict.id().max(1), capacity, is_raw_content)
+            do_decompress_with_dict(decoder, data, dict.frame_id(), capacity, is_raw_content)
         })
     }
 }

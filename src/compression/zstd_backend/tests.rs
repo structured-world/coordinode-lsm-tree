@@ -76,7 +76,7 @@ fn compress_with_dict_roundtrip_pure_to_pure() {
     // same pure backend.
     let dict = ZstdDictionary::new(DICT);
 
-    let compressed = ZstdProvider::compress_with_dict(PLAINTEXT, 3, DICT)
+    let compressed = ZstdProvider::compress_with_dict(PLAINTEXT, 3, &dict)
         .expect("compression with dict should succeed");
 
     // The output must be a non-empty zstd frame.
@@ -99,8 +99,8 @@ fn compress_with_dict_produces_zstd_magic() {
     // zstd frames always start with the little-endian magic number 0xFD2FB528
     // (bytes: 0x28, 0xB5, 0x2F, 0xFD). A mismatched magic means the frame is
     // corrupt or the output is not a valid zstd frame.
-    let compressed =
-        ZstdProvider::compress_with_dict(PLAINTEXT, 3, DICT).expect("compression should succeed");
+    let compressed = ZstdProvider::compress_with_dict(PLAINTEXT, 3, &ZstdDictionary::new(DICT))
+        .expect("compression should succeed");
 
     assert!(
         compressed.starts_with(&[0x28, 0xB5, 0x2F, 0xFD]),
@@ -117,7 +117,7 @@ fn compress_with_dict_roundtrip_representative_levels() {
 
     for level in [1, 3, 9, 19] {
         let compressed =
-            ZstdProvider::compress_with_dict(PLAINTEXT, level, DICT).expect("compress");
+            ZstdProvider::compress_with_dict(PLAINTEXT, level, &dict).expect("compress");
 
         let decompressed =
             ZstdProvider::decompress_with_dict(&compressed, &dict, PLAINTEXT.len() + 1)
@@ -135,7 +135,7 @@ fn compress_with_dict_empty_dict_returns_error() {
     // An empty dictionary slice must return an error because there is no
     // content to use as LZ77 history. Both the finalized-format path and
     // the raw-content path reject empty input.
-    let result = ZstdProvider::compress_with_dict(PLAINTEXT, 3, b"");
+    let result = ZstdProvider::compress_with_dict(PLAINTEXT, 3, &ZstdDictionary::new(b""));
     assert!(
         result.is_err(),
         "expected an error for empty dictionary, got Ok"
@@ -149,7 +149,7 @@ fn compress_with_dict_raw_content_dict_works() {
     let raw_content_dict = b"this is raw content dictionary data for matching";
     let dict = ZstdDictionary::new(raw_content_dict);
 
-    let compressed = ZstdProvider::compress_with_dict(PLAINTEXT, 3, raw_content_dict)
+    let compressed = ZstdProvider::compress_with_dict(PLAINTEXT, 3, &dict)
         .expect("compression with raw content dict should succeed");
 
     let decompressed = ZstdProvider::decompress_with_dict(&compressed, &dict, PLAINTEXT.len() + 1)
@@ -184,8 +184,7 @@ fn raw_content_dict_substitution_rejected_by_inner_frame_gate() {
     let payload = b"defense-in-depth payload bytes compressed under a raw dict";
 
     // Frame genuinely compressed under dict B (carries dict B's synthetic id).
-    let frame_b =
-        ZstdProvider::compress_with_dict(payload, 3, &dict_b_raw).expect("compress under B");
+    let frame_b = ZstdProvider::compress_with_dict(payload, 3, &dict_b).expect("compress under B");
 
     // Matching dict B decodes cleanly (the gate's expectation == frame id).
     let ok = ZstdProvider::decompress_with_dict(&frame_b, &dict_b, payload.len() + 1)
@@ -200,7 +199,7 @@ fn raw_content_dict_substitution_rejected_by_inner_frame_gate() {
     // Lock down the exact mismatch payload the gate emits, not just any
     // Decompress error: the id carried is the EXPECTED dict (the one we
     // decoded with), so an unrelated decompression failure would not match.
-    let expected_dict_id = dict_a.id().max(1);
+    let expected_dict_id = dict_a.frame_id();
     assert!(
         matches!(
             err,
@@ -216,7 +215,7 @@ fn compress_with_dict_empty_plaintext_roundtrips() {
     // Edge case: compressing an empty payload with a dictionary must round-trip.
     let dict = ZstdDictionary::new(DICT);
 
-    let compressed = ZstdProvider::compress_with_dict(&[], 3, DICT)
+    let compressed = ZstdProvider::compress_with_dict(&[], 3, &dict)
         .expect("compression of empty payload should succeed");
 
     let decompressed = ZstdProvider::decompress_with_dict(&compressed, &dict, 1)
@@ -238,7 +237,7 @@ fn compress_with_dict_raw_content_empty_plaintext_roundtrips_at_capacity_one() {
     let raw_dict = b"raw content dictionary for empty payload smoke test";
     let dict = ZstdDictionary::new(raw_dict);
 
-    let compressed = ZstdProvider::compress_with_dict(&[], 3, raw_dict)
+    let compressed = ZstdProvider::compress_with_dict(&[], 3, &dict)
         .expect("compression of empty payload with raw-content dict should succeed");
 
     let decompressed = ZstdProvider::decompress_with_dict(&compressed, &dict, 1)
@@ -260,7 +259,7 @@ fn compress_with_dict_raw_content_empty_plaintext_roundtrips_at_exact_capacity()
     let raw_dict = b"raw content dictionary for empty payload exact-capacity test";
     let dict = ZstdDictionary::new(raw_dict);
 
-    let compressed = ZstdProvider::compress_with_dict(&[], 3, raw_dict)
+    let compressed = ZstdProvider::compress_with_dict(&[], 3, &dict)
         .expect("compression of empty payload with raw-content dict should succeed");
 
     let decompressed = ZstdProvider::decompress_with_dict(&compressed, &dict, 0)
@@ -279,12 +278,11 @@ fn decompress_with_dict_raw_content_rejects_frame_exceeding_capacity() {
     // DecompressedSizeTooLarge when the capacity limit is smaller than the
     // plaintext — exercising the FCS pre-check in decompress_with_dict and
     // the decode_raw_content_bounded loop capacity guard.
-    let raw_dict = b"this is raw content dictionary data for matching";
+    let dict = ZstdDictionary::new(b"this is raw content dictionary data for matching");
 
-    let compressed = ZstdProvider::compress_with_dict(PLAINTEXT, 3, raw_dict)
+    let compressed = ZstdProvider::compress_with_dict(PLAINTEXT, 3, &dict)
         .expect("compression with raw content dict should succeed");
 
-    let dict = ZstdDictionary::new(raw_dict);
     // Capacity set to half the plaintext length — frame decompresses to
     // more than this limit so the guard must fire.
     let too_small = PLAINTEXT.len() / 2;
@@ -302,12 +300,11 @@ fn decompress_with_dict_raw_content_rejects_zero_capacity_non_empty() {
     // either the FCS pre-check rejects the frame up front, or the bounded
     // raw-content decode path hits its size/capacity guard when decoding the
     // first block for a zero-capacity output buffer.
-    let raw_dict = b"raw content dict for zero-capacity test";
+    let dict = ZstdDictionary::new(b"raw content dict for zero-capacity test");
 
-    let compressed = ZstdProvider::compress_with_dict(PLAINTEXT, 3, raw_dict)
-        .expect("compression should succeed");
+    let compressed =
+        ZstdProvider::compress_with_dict(PLAINTEXT, 3, &dict).expect("compression should succeed");
 
-    let dict = ZstdDictionary::new(raw_dict);
     let result = ZstdProvider::decompress_with_dict(&compressed, &dict, 0);
 
     assert!(
@@ -390,7 +387,7 @@ fn decompress_with_dict_returns_error_on_corrupt_finalized_frame() {
     // do_decompress_with_dict when decode_all_to_vec fails.
     let dict = ZstdDictionary::new(DICT);
     let mut frame =
-        ZstdProvider::compress_with_dict(PLAINTEXT, 3, DICT).expect("compression must succeed");
+        ZstdProvider::compress_with_dict(PLAINTEXT, 3, &dict).expect("compression must succeed");
     frame.pop(); // truncate last byte → corrupt frame
     let result = ZstdProvider::decompress_with_dict(&frame, &dict, 1024);
     assert!(
@@ -407,7 +404,7 @@ fn decompress_with_dict_returns_error_on_corrupt_raw_content_frame() {
     let raw_dict = b"some raw content dictionary bytes for testing corruption";
     let dict = ZstdDictionary::new(raw_dict);
     let mut frame =
-        ZstdProvider::compress_with_dict(PLAINTEXT, 3, raw_dict).expect("compression must succeed");
+        ZstdProvider::compress_with_dict(PLAINTEXT, 3, &dict).expect("compression must succeed");
     frame.pop(); // truncate last byte → corrupt frame
     let result = ZstdProvider::decompress_with_dict(&frame, &dict, 1024);
     assert!(
@@ -429,18 +426,6 @@ fn decompress_with_dict_returns_error_on_corrupt_raw_content_frame() {
 // `FrameDecoder` manually (mirroring `do_decompress_with_dict`) and call the
 // private function directly, bypassing the FCS pre-check.
 
-/// Compute the synthetic raw-content dict id used by both
-/// `compress_with_dict` and `do_decompress_with_dict` for raw-content
-/// (non-finalized) dictionaries.
-#[expect(
-    clippy::cast_possible_truncation,
-    reason = "intentional: lower 32 bits of xxh3"
-)]
-fn raw_content_id(dict_raw: &[u8]) -> u32 {
-    let h = xxhash_rust::xxh3::xxh3_64(dict_raw) as u32;
-    h.max(1)
-}
-
 /// Build a `FrameDecoder` initialised with `dict_raw` for the raw-content
 /// path, pointing `cursor` at the blocks region of `compressed`.
 ///
@@ -451,7 +436,7 @@ fn make_raw_content_decoder<'a>(
     cursor: &mut std::io::Cursor<&'a [u8]>,
 ) -> structured_zstd::decoding::FrameDecoder {
     use structured_zstd::decoding::{Dictionary, FrameDecoder};
-    let id = raw_content_id(dict_raw);
+    let id = ZstdDictionary::new(dict_raw).frame_id();
     let parsed = Dictionary::from_raw_content(id, dict_raw.to_vec())
         .expect("Dictionary::from_raw_content should succeed");
     let mut decoder = FrameDecoder::new();
@@ -476,7 +461,7 @@ fn decode_raw_content_bounded_remaining_zero_returns_error() {
     // pre-check in do_decompress_with_dict returns early first (frames
     // produced by compress_with_dict include the frame content size).
     let raw_dict = b"raw content dict for remaining-zero test";
-    let compressed = ZstdProvider::compress_with_dict(PLAINTEXT, 3, raw_dict)
+    let compressed = ZstdProvider::compress_with_dict(PLAINTEXT, 3, &ZstdDictionary::new(raw_dict))
         .expect("compression should succeed");
 
     let mut cursor = std::io::Cursor::new(compressed.as_slice());
@@ -588,7 +573,7 @@ fn decode_raw_content_bounded_collected_exceeds_capacity_returns_error() {
     // This path is unreachable through the high-level API for the same
     // reason as the test above.
     let raw_dict = b"raw content dict for can-exceeds-capacity test";
-    let compressed = ZstdProvider::compress_with_dict(PLAINTEXT, 3, raw_dict)
+    let compressed = ZstdProvider::compress_with_dict(PLAINTEXT, 3, &ZstdDictionary::new(raw_dict))
         .expect("compression should succeed");
 
     let mut cursor = std::io::Cursor::new(compressed.as_slice());
