@@ -242,17 +242,6 @@ impl SuperVersions {
         }
     }
 
-    /// Bytes held by the current version's memtables, active and sealed.
-    pub fn memtable_size_sum(&self) -> u64 {
-        self.current.active_memtable.size()
-            + self
-                .current
-                .sealed_memtables
-                .iter()
-                .map(|sealed| sealed.size())
-                .sum::<u64>()
-    }
-
     /// Modifies the level manifest atomically.
     ///
     /// The function accepts a transition function that receives the current version
@@ -317,14 +306,12 @@ impl SuperVersions {
         retention: RetentionEffect,
     ) -> crate::Result<()> {
         let prior = self.latest_version();
-        // Version seqnos are non-decreasing along the history. The counter is
-        // caller-owned and a deployment that reopens with it reset would
-        // otherwise install a version BELOW the recovered retention floor;
-        // a read below the floor would then find that "newer" version by its
-        // smaller seqno and be served from data the snapshot never saw, and
-        // the lock-free latest-snapshot fast path (which trusts the back to
-        // carry the highest seqno) would serve it too. Under the seqno
-        // contract (monotone counter) this clamp is a no-op.
+        // Install seqnos are non-decreasing. The counter is caller-owned, and a
+        // deployment that reopens with it reset would otherwise install below
+        // the current version: a drop or a filtering compaction there raises
+        // the floor only to that smaller seqno, leaving snapshots above it
+        // answered by the current version without the rows it removed. Under
+        // the seqno contract (monotone counter) this clamp is a no-op.
         let seqno = seqno.max(prior.seqno);
         let mut next_version = f(&prior)?;
         // Every install is a transition to a new id. A rotation persists the

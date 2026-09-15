@@ -120,12 +120,6 @@ pub trait AbstractTree: sealed::Sealed {
     /// Returns the number of cached table file descriptors.
     fn table_file_cache_size(&self) -> usize;
 
-    // TODO: remove
-    #[doc(hidden)]
-    fn version_memtable_size_sum(&self) -> u64 {
-        self.get_version_history_lock().memtable_size_sum()
-    }
-
     #[doc(hidden)]
     fn next_table_id(&self) -> TableId;
 
