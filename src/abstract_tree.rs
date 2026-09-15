@@ -706,10 +706,10 @@ pub trait AbstractTree: sealed::Sealed {
     ///
     /// # GC watermark (`gc_watermark`)
     ///
-    /// `gc_watermark` is the one number that decides what history a run may
-    /// collect: every snapshot at or above it stays readable, and a version
-    /// only snapshots below it could see may be dropped. Concretely, only
-    /// entries whose seqno is `< gc_watermark` are eligible for:
+    /// `gc_watermark` is the one number that decides what history the engine's
+    /// own GC may collect: every snapshot at or above it stays readable, and a
+    /// version only snapshots below it could see may be dropped. Concretely,
+    /// only entries whose seqno is `< gc_watermark` are eligible for:
     ///
     /// - dropping shadowed versions / GC-ing tombstones, and
     /// - **folding merge operands** via the [`crate::MergeOperator`]: a key written
@@ -739,6 +739,12 @@ pub trait AbstractTree: sealed::Sealed {
     /// which is why the watermark must not exceed the oldest snapshot still in
     /// use. A reader opened before the install keeps its own version, and the
     /// tables it references, until it is dropped.
+    ///
+    /// A [compaction filter](crate::compaction::filter) is the exception: it
+    /// acts on whatever version it is shown, regardless of `gc_watermark`
+    /// (`0` included). A run whose filter removed or rewrote anything raises
+    /// the floor to the install's own seqno, so every snapshot up to it is
+    /// refused from then on, however low the watermark was.
     ///
     /// # Errors
     ///
@@ -851,8 +857,9 @@ pub trait AbstractTree: sealed::Sealed {
     /// Returns a [`crate::compaction::CompactionResult`] describing what action was taken.
     ///
     /// `gc_watermark` has the meaning documented at
-    /// [`major_compact`](Self::major_compact): only versions below it may be
-    /// collected, and a run that collects one raises the retention floor.
+    /// [`major_compact`](Self::major_compact): the engine's own GC collects
+    /// only versions below it, and a run that collects one raises the
+    /// retention floor. A compaction filter acts regardless of it.
     ///
     /// # Errors
     ///

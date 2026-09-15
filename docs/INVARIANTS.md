@@ -237,9 +237,11 @@ matching entry (and add one for a new subsystem).
   [manifest-recovery.md](manifest-recovery.md#retention-floor)).
 
 - **Retention costs the superseded versions above the floor, plus what open
-  readers hold.** The floor is the only read boundary, and the GC watermark
-  (`gc_watermark` on `flush`, `compact` and `major_compact`) is the one number
-  that moves it: a superseded key version stays in the tables while a
+  readers hold.** The floor is the only read boundary, and for the engine's
+  own version GC the GC watermark (`gc_watermark` on `flush`, `compact` and
+  `major_compact`) is the one number that moves it (a `clear`, a table drop
+  and a filtering compaction move it too, by the entry above): a superseded
+  key version stays in the tables while a
   snapshot at or above the watermark still reads it, and once none does a run
   may collect it and raise the floor to just below the watermark. A table a
   compaction consumed is released at install unless a reader still holds a
