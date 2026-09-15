@@ -194,6 +194,10 @@ impl ZstdDictionary {
     /// one is a collision of the 32-bit truncation — reachable in principle,
     /// unsearchable in a test. This is the only way to construct that state, and
     /// it needs the private field, so it lives with the type.
+    ///
+    /// The prepared encoder and decoder carry the id into the frames they
+    /// write and pin, so the copy prepares its own rather than sharing the
+    /// original's.
     #[cfg(test)]
     #[must_use]
     pub(crate) fn with_id_for_test(&self, id: u32) -> Self {
@@ -201,9 +205,9 @@ impl ZstdDictionary {
             id: u64::from(id),
             raw: Arc::clone(&self.raw),
             #[cfg(feature = "zstd")]
-            prepared: Arc::clone(&self.prepared),
+            prepared: Arc::new(OnceBox::new()),
             #[cfg(feature = "zstd")]
-            encoder: Arc::clone(&self.encoder),
+            encoder: Arc::new(OnceBox::new()),
         }
     }
 

@@ -211,6 +211,23 @@ fn raw_content_dict_substitution_rejected_by_inner_frame_gate() {
 }
 
 #[test]
+fn forced_id_copy_writes_and_reads_under_its_own_id() {
+    // A raw-content dictionary's frames carry its id, and the prepared encoder
+    // and decoder bake that id in. A copy with a forced id is a different
+    // dictionary as far as the id goes, so it must not inherit a cache the
+    // original already prepared: its frames would carry the original's id,
+    // which its own decoder then rejects as a mismatch.
+    let original = ZstdDictionary::new(b"raw content dictionary whose id gets forced");
+    ZstdProvider::compress_with_dict(PLAINTEXT, 3, &original).expect("prime the original");
+
+    let forced = original.with_id_for_test(original.id().wrapping_add(1));
+    let frame = ZstdProvider::compress_with_dict(PLAINTEXT, 3, &forced).expect("compress");
+    let back = ZstdProvider::decompress_with_dict(&frame, &forced, PLAINTEXT.len() + 1)
+        .expect("the copy reads back what it wrote");
+    assert_eq!(back, PLAINTEXT);
+}
+
+#[test]
 fn compress_with_dict_empty_plaintext_roundtrips() {
     // Edge case: compressing an empty payload with a dictionary must round-trip.
     let dict = ZstdDictionary::new(DICT);
