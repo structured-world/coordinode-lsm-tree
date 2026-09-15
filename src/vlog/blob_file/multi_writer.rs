@@ -68,6 +68,13 @@ pub struct MultiWriter {
     #[cfg(zstd_any)]
     zstd_dictionaries: crate::compression::ZstdDictionaries,
 
+    /// The runtime-config snapshot [`Self::zstd_dictionary`] was resolved from,
+    /// held for the writer's life and never read. Holding it keeps that
+    /// dictionary out of a collection after a policy change replaced the
+    /// snapshot, until the files written against it are installed.
+    #[cfg(zstd_any)]
+    _config_snapshot: Option<Arc<crate::runtime_config::RuntimeConfig>>,
+
     tree_id: TreeId,
     descriptor_table: Option<Arc<DescriptorTable>>,
 }
@@ -109,6 +116,8 @@ impl MultiWriter {
             zstd_dictionary: None,
             #[cfg(zstd_any)]
             zstd_dictionaries: crate::compression::ZstdDictionaries::new(),
+            #[cfg(zstd_any)]
+            _config_snapshot: None,
 
             tree_id,
             descriptor_table,
@@ -221,6 +230,20 @@ impl MultiWriter {
         self.active_writer = self.active_writer.use_zstd_dictionary(dict.clone());
         self.zstd_dictionary = dict;
         self
+    }
+
+    /// Holds `snapshot`, the runtime config the dictionary was resolved from,
+    /// for as long as this writer lives (see `Self::_config_snapshot`).
+    #[cfg(zstd_any)]
+    #[must_use]
+    pub(crate) fn use_config_snapshot(
+        self,
+        snapshot: Arc<crate::runtime_config::RuntimeConfig>,
+    ) -> Self {
+        Self {
+            _config_snapshot: Some(snapshot),
+            ..self
+        }
     }
 
     /// Provides the tree's dictionary set, so each finished file can pin the

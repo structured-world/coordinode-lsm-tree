@@ -15,9 +15,8 @@ fn blob_tree_with_pinned_fd() -> lsm_tree::Result<()> {
             SequenceNumberCounter::default(),
         )
         .use_descriptor_table(None)
-        .with_kv_separation(Some(
-            KvSeparationOptions::default().compression(lsm_tree::CompressionType::None),
-        ))
+        .with_kv_separation(Some(KvSeparationOptions::default()))
+        .blob_compression(lsm_tree::CompressionType::None)
         .open()?;
 
         tree.insert("big", &big_value, 0);

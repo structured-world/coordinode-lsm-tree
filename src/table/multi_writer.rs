@@ -192,6 +192,13 @@ pub struct MultiWriter {
     #[cfg(zstd_any)]
     zstd_dictionary: Option<Arc<crate::compression::ZstdDictionary>>,
 
+    /// The runtime-config snapshot [`Self::zstd_dictionary`] was resolved from,
+    /// held for the writer's life and never read. Holding it keeps that
+    /// dictionary out of a collection after a policy change replaced the
+    /// snapshot, until the tables written against it are installed.
+    #[cfg(zstd_any)]
+    _config_snapshot: Option<Arc<crate::runtime_config::RuntimeConfig>>,
+
     /// Optional parallel block-compression executor + worker count, preserved
     /// here so every successor [`Writer`] of a rotated run shares the same pool.
     #[cfg(feature = "std")]
@@ -276,6 +283,8 @@ impl MultiWriter {
 
             #[cfg(zstd_any)]
             zstd_dictionary: None,
+            #[cfg(zstd_any)]
+            _config_snapshot: None,
 
             #[cfg(feature = "std")]
             spawner: None,
@@ -742,6 +751,20 @@ impl MultiWriter {
         self.zstd_dictionary.clone_from(&dictionary);
         self.writer = self.writer.use_zstd_dictionary(dictionary);
         self
+    }
+
+    /// Holds `snapshot`, the runtime config the dictionary was resolved from,
+    /// for as long as this writer lives (see `Self::_config_snapshot`).
+    #[cfg(zstd_any)]
+    #[must_use]
+    pub(crate) fn use_config_snapshot(
+        self,
+        snapshot: Arc<crate::runtime_config::RuntimeConfig>,
+    ) -> Self {
+        Self {
+            _config_snapshot: Some(snapshot),
+            ..self
+        }
     }
 
     /// Flushes the current writer, stores its metadata, and sets up a new writer for the next table

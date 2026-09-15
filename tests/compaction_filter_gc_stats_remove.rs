@@ -51,9 +51,8 @@ fn compaction_filter_gc_stats_remove() -> lsm_tree::Result<()> {
             SequenceNumberCounter::default(),
             SequenceNumberCounter::default(),
         )
-        .with_kv_separation(Some(
-            KvSeparationOptions::default().compression(lsm_tree::CompressionType::None),
-        ))
+        .with_kv_separation(Some(KvSeparationOptions::default()))
+        .blob_compression(lsm_tree::CompressionType::None)
         .with_compaction_filter_factory(Some(Arc::new(MyFilterFactory)))
         .open()?;
 

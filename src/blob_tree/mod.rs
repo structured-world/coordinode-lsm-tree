@@ -269,6 +269,50 @@ impl BlobTree {
             Some(&bounds),
         )
     }
+
+    /// Updates the live [`RuntimeConfig`](crate::runtime_config::RuntimeConfig),
+    /// as [`Tree::update_runtime_config`](crate::Tree::update_runtime_config)
+    /// does for the index tree.
+    ///
+    /// The blob files share the snapshot: a change of
+    /// [`blob_compression`](crate::runtime_config::RuntimeConfig::blob_compression)
+    /// applies to the next blob file written, and every earlier one keeps the
+    /// codec it recorded.
+    ///
+    /// # Errors
+    ///
+    /// Same as [`Tree::update_runtime_config`](crate::Tree::update_runtime_config),
+    /// including a blob compression that names a dictionary the tree does not
+    /// hold.
+    pub fn update_runtime_config<F>(&self, mutator: F) -> crate::Result<()>
+    where
+        F: FnOnce(&mut crate::runtime_config::RuntimeConfig),
+    {
+        self.index.update_runtime_config(mutator)
+    }
+
+    /// Snapshot of the current runtime config, shared by the index and the
+    /// blob files.
+    #[must_use]
+    pub fn runtime_config(&self) -> Arc<crate::runtime_config::RuntimeConfig> {
+        self.index.runtime_config()
+    }
+
+    /// Stores `dict` in the tree, as
+    /// [`Tree::register_zstd_dictionary`](crate::Tree::register_zstd_dictionary)
+    /// does. The step before a blob compression that names it: an update
+    /// naming a dictionary the tree does not hold is refused.
+    ///
+    /// # Errors
+    ///
+    /// Same as [`Tree::register_zstd_dictionary`](crate::Tree::register_zstd_dictionary).
+    #[cfg(zstd_any)]
+    pub fn register_zstd_dictionary(
+        &self,
+        dict: Arc<crate::compression::ZstdDictionary>,
+    ) -> crate::Result<()> {
+        self.index.register_zstd_dictionary(dict)
+    }
 }
 
 impl crate::abstract_tree::sealed::Sealed for BlobTree {}
@@ -879,7 +923,7 @@ impl AbstractTree for BlobTree {
         // The blob dictionary counts here as much as the table one: the next
         // blob file is compressed against it.
         #[cfg(zstd_any)]
-        let still_written = config.write_referenced_dict_ids();
+        let still_written = self.index.write_referenced_dict_ids();
         #[cfg(not(zstd_any))]
         let still_written: Vec<crate::file::DictId> = Vec::new();
 
@@ -1004,8 +1048,14 @@ impl AbstractTree for BlobTree {
         let index_block_restart_interval =
             self.index.config.index_block_restart_interval_policy.get(0);
 
-        let data_block_compression = self.index.config.data_block_compression_policy.get(0);
-        let index_block_compression = self.index.config.index_block_compression_policy.get(0);
+        // Live runtime snapshot, one for the whole flush: the compression
+        // policies (tables and blob files alike) and the per-flush SST options
+        // below all come from it, so a concurrent `update_runtime_config`
+        // cannot give one flush two configurations.
+        let rc = self.index.0.runtime_config.load_full();
+
+        let data_block_compression = rc.data_block_compression_policy.get(0);
+        let index_block_compression = rc.index_block_compression_policy.get(0);
 
         let data_block_hash_ratio = self.index.config.data_block_hash_ratio_policy.get(0);
 
@@ -1042,11 +1092,6 @@ impl AbstractTree for BlobTree {
             }
         });
 
-        // Live runtime snapshot: a blob tree's index must honor the same
-        // per-flush SST config as a standard tree's flush, not just the
-        // structural block options above.
-        let rc = self.index.0.runtime_config.load_full();
-
         if index_partitioning {
             // Size-adaptive index: single-level for small SSTs, spill to
             // partitioned only past the threshold (see flush path).
@@ -1071,10 +1116,14 @@ impl AbstractTree for BlobTree {
         table_writer = table_writer.use_kv_checksums(rc.kv_checksums, rc.kv_checksum_algo);
         table_writer = table_writer.use_locator(self.index.config.locator_policy.get(0));
 
+        // Resolved from `rc`, which the writer holds, as in the standard flush.
+        #[cfg(zstd_any)]
+        let dicts = self.index.config.current_zstd_dictionaries();
         #[cfg(zstd_any)]
         {
-            table_writer =
-                table_writer.use_zstd_dictionary(self.index.config.zstd_dictionary.clone());
+            table_writer = table_writer
+                .use_zstd_dictionary(dicts.for_compression(data_block_compression)?)
+                .use_config_snapshot(Arc::clone(&rc));
         }
 
         // Parallel block compression for the flush writer, mirroring the
@@ -1115,12 +1164,13 @@ impl AbstractTree for BlobTree {
                 self.index.config.fs.clone(),
             )?
             .use_target_size(kv_opts.file_target_size)
-            .use_compression(kv_opts.compression)
+            .use_compression(rc.blob_compression)
             .use_sync_mode(self.index.config.sync_mode);
             #[cfg(zstd_any)]
             let w = w
-                .use_zstd_dictionary(kv_opts.zstd_dictionary.clone())
-                .use_zstd_dictionaries(self.index.config.current_zstd_dictionaries());
+                .use_zstd_dictionary(dicts.for_compression(rc.blob_compression)?)
+                .use_zstd_dictionaries(dicts)
+                .use_config_snapshot(Arc::clone(&rc));
             w
         };
 

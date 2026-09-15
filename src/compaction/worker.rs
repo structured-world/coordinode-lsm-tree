@@ -1744,7 +1744,7 @@ fn run_subcompaction(
                 opts.config.fs.clone(),
             )?
             .use_target_size(blob_opts.file_target_size)
-            .use_passthrough_compression(blob_opts.compression)
+            .use_passthrough_compression(opts.runtime_config.load().blob_compression)
             .use_sync_mode(opts.config.sync_mode);
             // The policy here is only the OPENING value. Relocation copies
             // frames verbatim out of files that may predate a policy change, so
@@ -2629,7 +2629,7 @@ fn merge_tables(
                     opts.config.fs.clone(),
                 )?
                 .use_target_size(blob_opts.file_target_size)
-                .use_passthrough_compression(blob_opts.compression)
+                .use_passthrough_compression(opts.runtime_config.load().blob_compression)
                 .use_sync_mode(opts.config.sync_mode);
                 // Same as the tight-space relocation above, through the same
                 // `RelocatingCompaction`: the policy is only the opening value,

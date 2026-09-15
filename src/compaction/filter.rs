@@ -257,7 +257,10 @@ impl<'a, 'b: 'a> StreamFilterAdapter<'a, 'b> {
         let writer = if let Some(writer) = self.blob_writer {
             writer
         } else {
-            // Instantiate writer as necessary
+            // Instantiate writer as necessary, under the blob compression in
+            // force now. The writer holds the snapshot, so a collection cannot
+            // take the dictionary it names while the writer is still open.
+            let rc = self.shared.opts.runtime_config.load_full();
             let writer = BlobFileWriter::new(
                 self.shared.opts.blob_file_id_generator.clone(),
                 self.shared.blobs_folder,
@@ -266,7 +269,7 @@ impl<'a, 'b: 'a> StreamFilterAdapter<'a, 'b> {
                 self.shared.opts.config.fs.clone(),
             )?
             .use_target_size(blob_opts.file_target_size)
-            .use_compression(blob_opts.compression)
+            .use_compression(rc.blob_compression)
             .use_sync_mode(self.shared.opts.config.sync_mode);
 
             // A filter that rewrites a separated value writes a NEW blob file
@@ -274,9 +277,13 @@ impl<'a, 'b: 'a> StreamFilterAdapter<'a, 'b> {
             // dictionary to compress with, and the set to pin on the file it
             // produces. Without the first, a `ZstdDict` policy fails the write.
             #[cfg(zstd_any)]
-            let writer = writer
-                .use_zstd_dictionary(blob_opts.zstd_dictionary.clone())
-                .use_zstd_dictionaries(self.shared.opts.config.current_zstd_dictionaries());
+            let writer = {
+                let dicts = self.shared.opts.config.current_zstd_dictionaries();
+                writer
+                    .use_zstd_dictionary(dicts.for_compression(rc.blob_compression)?)
+                    .use_zstd_dictionaries(dicts)
+                    .use_config_snapshot(rc)
+            };
 
             self.blob_writer.insert(writer)
         };

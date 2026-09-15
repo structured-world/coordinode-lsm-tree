@@ -241,6 +241,19 @@ pub struct TreeInner {
     /// whole entry to `None` for an immediate re-probe.
     pub(crate) admission_used_cache: Mutex<Option<(u64, u64, u64, crate::time::Instant)>>,
 
+    /// Runtime-config snapshots an update replaced while they named a
+    /// dictionary, held weakly.
+    ///
+    /// A flush or compaction takes a snapshot when it starts and resolves the
+    /// dictionary that snapshot's policy names from the tree's store. A policy
+    /// change in between must not let a collection take that dictionary, or the
+    /// writer produces a table naming a file that is gone. So a collection
+    /// spares every dictionary a still-held snapshot here names; a snapshot no
+    /// writer holds any more has no strong reference left and drops out.
+    #[cfg(zstd_any)]
+    pub(crate) retired_write_snapshots:
+        Mutex<alloc::vec::Vec<alloc::sync::Weak<crate::runtime_config::RuntimeConfig>>>,
+
     #[doc(hidden)]
     #[cfg(feature = "metrics")]
     pub metrics: Arc<Metrics>,
@@ -322,6 +335,8 @@ impl TreeInner {
             )),
             runtime_config: Arc::new(RuntimeConfigHandle::new((*initial_runtime).clone())),
             admission_used_cache: Mutex::new(None),
+            #[cfg(zstd_any)]
+            retired_write_snapshots: Mutex::new(alloc::vec::Vec::new()),
 
             #[cfg(feature = "metrics")]
             metrics: Metrics::default().into(),

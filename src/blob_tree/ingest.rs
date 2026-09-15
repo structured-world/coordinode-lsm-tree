@@ -45,6 +45,13 @@ impl<'a> BlobIngestion<'a> {
 
         let blob_file_size = kv.file_target_size;
 
+        // The blob compression as of this ingestion's start, for its whole
+        // life: an ingestion is one batch of files, written under one policy.
+        // The writer holds the snapshot, so a collection cannot take the
+        // dictionary it names while the ingestion is still writing.
+        let rc = tree.index.0.runtime_config.load_full();
+        let blob_compression = rc.blob_compression;
+
         let table = TableIngestion::new(&tree.index)?;
         let blob = BlobFileWriter::new(
             tree.index.0.blob_file_id_counter.clone(),
@@ -54,16 +61,19 @@ impl<'a> BlobIngestion<'a> {
             tree.index.config.fs.clone(),
         )?
         .use_target_size(blob_file_size)
-        .use_compression(kv.compression)
+        .use_compression(blob_compression)
         .use_sync_mode(tree.index.config.sync_mode);
 
         // Ingestion writes blob files under the tree's own blob policy, so it
         // needs the dictionary to compress with and the set to pin on what it
         // produces. Without the first, a `ZstdDict` policy fails the write.
         #[cfg(zstd_any)]
-        let blob = blob
-            .use_zstd_dictionary(kv.zstd_dictionary.clone())
-            .use_zstd_dictionaries(tree.index.config.current_zstd_dictionaries());
+        let blob = {
+            let dicts = tree.index.config.current_zstd_dictionaries();
+            blob.use_zstd_dictionary(dicts.for_compression(blob_compression)?)
+                .use_zstd_dictionaries(dicts)
+                .use_config_snapshot(rc)
+        };
 
         let separation_threshold = kv.separation_threshold;
 

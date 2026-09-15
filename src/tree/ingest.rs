@@ -72,6 +72,18 @@ impl<'a> Ingestion<'a> {
             reason = "INITIAL_CANONICAL_LEVEL is 1, well within u8"
         )]
         let ingest_level = INITIAL_CANONICAL_LEVEL as u8;
+
+        // One runtime-config snapshot for the whole ingestion writer setup, so
+        // a concurrent `update_runtime_config` can't leave the ingested SST
+        // with its compression from one snapshot and `seqno_in_index` or the
+        // checksum settings from another. `Off` (default) emits no per-KV
+        // footer and leaves the data-block payload encoding unchanged; the
+        // index format follows the policy in force at ingestion.
+        let rc = tree.0.runtime_config.load_full();
+        let data_block_compression = rc
+            .data_block_compression_policy
+            .get(INITIAL_CANONICAL_LEVEL);
+
         // TODO: maybe create a PrepareMultiWriter that can be used by flush, ingest and compaction worker
         let mut writer = MultiWriter::new(
             folder.clone(),
@@ -102,14 +114,9 @@ impl<'a> Ingestion<'a> {
                 .data_block_hash_ratio_policy
                 .get(INITIAL_CANONICAL_LEVEL),
         )
-        .use_data_block_compression(
-            tree.config
-                .data_block_compression_policy
-                .get(INITIAL_CANONICAL_LEVEL),
-        )
+        .use_data_block_compression(data_block_compression)
         .use_index_block_compression(
-            tree.config
-                .index_block_compression_policy
+            rc.index_block_compression_policy
                 .get(INITIAL_CANONICAL_LEVEL),
         )
         .use_data_block_restart_interval(
@@ -122,14 +129,6 @@ impl<'a> Ingestion<'a> {
                 .index_block_restart_interval_policy
                 .get(INITIAL_CANONICAL_LEVEL),
         );
-
-        // One runtime-config snapshot for the whole ingestion writer setup, so
-        // a concurrent `update_runtime_config` can't leave the ingested SST
-        // with `seqno_in_index` from one snapshot and checksum settings from
-        // another. `Off` (default) emits no per-KV footer and leaves the
-        // data-block payload encoding unchanged; the index format follows the
-        // policy in force at ingestion.
-        let rc = tree.0.runtime_config.load_full();
 
         if index_partitioning {
             // Size-adaptive index: single-level for small SSTs, spill to
@@ -163,9 +162,17 @@ impl<'a> Ingestion<'a> {
         writer = writer.use_kv_checksums(rc.kv_checksums, rc.kv_checksum_algo);
         writer = writer.use_locator(tree.config.locator_policy.get(INITIAL_CANONICAL_LEVEL));
 
+        // Resolved from `rc`, which the writer holds for the ingestion's life,
+        // as in the flush.
         #[cfg(zstd_any)]
         {
-            writer = writer.use_zstd_dictionary(tree.config.zstd_dictionary.clone());
+            writer = writer
+                .use_zstd_dictionary(
+                    tree.config
+                        .current_zstd_dictionaries()
+                        .for_compression(data_block_compression)?,
+                )
+                .use_config_snapshot(Arc::clone(&rc));
         }
 
         Ok(Self {

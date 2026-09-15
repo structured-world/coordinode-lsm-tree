@@ -96,8 +96,15 @@ pub(super) fn prepare_table_writer(
     let data_block_restart_interval = opts.config.data_block_restart_interval_policy.get(dst_lvl);
     let index_block_restart_interval = opts.config.index_block_restart_interval_policy.get(dst_lvl);
 
-    let data_block_compression = opts.config.data_block_compression_policy.get(dst_lvl);
-    let index_block_compression = opts.config.index_block_compression_policy.get(dst_lvl);
+    // One runtime-config snapshot for the whole writer setup: reading
+    // `load_full()` per field could straddle a concurrent
+    // `update_runtime_config`, letting one SST mix its compression or
+    // `seqno_in_index` from snapshot A with `kv_checksums` from snapshot B and
+    // breaking the single-snapshot-per-compaction contract.
+    let rc = opts.runtime_config.load_full();
+
+    let data_block_compression = rc.data_block_compression_policy.get(dst_lvl);
+    let index_block_compression = rc.index_block_compression_policy.get(dst_lvl);
 
     let data_block_hash_ratio = opts.config.data_block_hash_ratio_policy.get(dst_lvl);
 
@@ -146,13 +153,6 @@ pub(super) fn prepare_table_writer(
     if let Some(marker) = transform_marker {
         table_writer = table_writer.use_transform_marker(marker);
     }
-
-    // One runtime-config snapshot for the whole writer setup: reading
-    // `load_full()` per field could straddle a concurrent
-    // `update_runtime_config`, letting one SST mix `seqno_in_index` from
-    // snapshot A with `kv_checksums` from snapshot B and breaking the
-    // single-snapshot-per-compaction contract.
-    let rc = opts.runtime_config.load_full();
 
     if index_partitioning {
         // Size-adaptive index: single-level for small SSTs, spill to a
@@ -232,8 +232,18 @@ pub(super) fn prepare_table_writer(
             .get(usize::from(payload.dest_level)),
     );
 
+    // The dictionary this snapshot's policy names for the destination level.
+    // The writer holds the snapshot until its tables are installed: a
+    // collection spares what a held snapshot names, however the policy has
+    // changed since.
     #[cfg(zstd_any)]
-    let table_writer = table_writer.use_zstd_dictionary(opts.config.zstd_dictionary.clone());
+    let table_writer = table_writer
+        .use_zstd_dictionary(
+            opts.config
+                .current_zstd_dictionaries()
+                .for_compression(data_block_compression)?,
+        )
+        .use_config_snapshot(alloc::sync::Arc::clone(&rc));
 
     // Parallel block compression: hand the (per-tree or caller-shared) pool to
     // the writer so its CPU-bound transform work runs on worker threads while
