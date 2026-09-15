@@ -475,7 +475,7 @@ pub enum Error {
     /// floor past it: a compaction or flush that collected history below the
     /// caller's GC watermark
     /// ([`AbstractTree::major_compact`](crate::AbstractTree::major_compact)'s
-    /// `seqno_threshold`), a filtering compaction, a table drop,
+    /// `gc_watermark`), a filtering compaction, a table drop,
     /// [`AbstractTree::clear`](crate::AbstractTree::clear). Serving such a
     /// snapshot from what survived would silently answer with data it never
     /// saw, so the read is refused. Snapshot `0` is the exception: it sees no

@@ -108,8 +108,9 @@ pub struct CompactionStream<'a, I: Iterator<Item = Item>, F: StreamFilter = NoFi
     /// KV stream
     inner: CountingPeek<I>,
 
-    /// MVCC watermark to get rid of old versions
-    gc_seqno_threshold: SeqNo,
+    /// The GC watermark: every snapshot at or above it stays readable, and a
+    /// version only snapshots below it could see may be collected.
+    gc_watermark: SeqNo,
 
     /// Event emitter that receives all dropped KVs
     dropped_callback: Option<&'a mut dyn DroppedKvCallback>,
@@ -128,8 +129,8 @@ pub struct CompactionStream<'a, I: Iterator<Item = Item>, F: StreamFilter = NoFi
     /// to be re-emitted unchanged on subsequent `next()` calls.
     pending: VecDeque<InternalValue>,
 
-    /// Range tombstones strictly below the watermark (`seqno <
-    /// gc_seqno_threshold`) whose covered entries can be physically dropped
+    /// Range tombstones strictly below the watermark (`seqno < gc_watermark`)
+    /// whose covered entries can be physically dropped
     /// during this (bottommost) compaction: every live snapshot (which reads at
     /// or above the watermark) sees them in effect, so the covered KVs are
     /// deleted for all readers. A tombstone exactly at the watermark is excluded
@@ -175,14 +176,14 @@ pub struct CompactionStream<'a, I: Iterator<Item = Item>, F: StreamFilter = NoFi
 impl<I: Iterator<Item = Item>> CompactionStream<'_, I, NoFilter> {
     /// Initializes a new merge iterator
     #[must_use]
-    pub fn new(iter: I, gc_seqno_threshold: SeqNo) -> Self {
+    pub fn new(iter: I, gc_watermark: SeqNo) -> Self {
         let gc_balance = Arc::new(portable_atomic::AtomicU64::new(0));
         let iter = CountingPeek::new(iter, Arc::clone(&gc_balance));
 
         Self {
             inner: iter,
             gc_balance,
-            gc_seqno_threshold,
+            gc_watermark,
             dropped_callback: None,
             filter: NoFilter,
             evict_tombstones: false,
@@ -204,7 +205,7 @@ impl<'a, I: Iterator<Item = Item>, F: StreamFilter + 'a> CompactionStream<'a, I,
     pub fn with_filter<NF: StreamFilter>(self, filter: NF) -> CompactionStream<'a, I, NF> {
         CompactionStream {
             inner: self.inner,
-            gc_seqno_threshold: self.gc_seqno_threshold,
+            gc_watermark: self.gc_watermark,
             dropped_callback: self.dropped_callback,
             filter,
             evict_tombstones: self.evict_tombstones,
@@ -266,7 +267,7 @@ impl<'a, I: Iterator<Item = Item>, F: StreamFilter + 'a> CompactionStream<'a, I,
 
     /// Enables compaction-time range-tombstone application: surviving entries
     /// covered by a tombstone whose seqno is strictly below the watermark
-    /// (`seqno < gc_seqno_threshold`) and higher than the entry's seqno are
+    /// (`seqno < gc_watermark`) and higher than the entry's seqno are
     /// physically dropped (and reported to the drop callback for blob-GC
     /// accounting) instead of being carried to the output and suppressed at read
     /// time.
@@ -289,7 +290,7 @@ impl<'a, I: Iterator<Item = Item>, F: StreamFilter + 'a> CompactionStream<'a, I,
             // the point-key GC: a tombstone exactly at the watermark is still
             // invisible to the oldest live snapshot (which reads at the
             // watermark), so it must NOT physically drop covered keys yet.
-            .filter(|rt| rt.visible_at(self.gc_seqno_threshold))
+            .filter(|rt| rt.visible_at(self.gc_watermark))
             .collect();
         self.rt_active = Some(ActiveTombstoneSet::new_with_comparator(comparator.clone()));
         self.rt_comparator = Some(comparator);
@@ -702,14 +703,14 @@ impl<'a, I: Iterator<Item = Item>, F: StreamFilter + 'a> CompactionStream<'a, I,
                     // For a lone merge operand with a merge operator and below GC threshold,
                     // collapse via partial merge (result stays MergeOperand if no base found)
                     if head.key.value_type.is_merge_operand()
-                        && head.key.seqno < self.gc_seqno_threshold
+                        && head.key.seqno < self.gc_watermark
                         && self.merge_operator.is_some()
                     {
                         head = fail_iter!(self.resolve_with_operator(head));
                     }
                 } else if head.key.value_type == ValueType::Tombstone
                     && self.evict_tombstones
-                    && head.key.seqno < self.gc_seqno_threshold
+                    && head.key.seqno < self.gc_watermark
                 {
                     // Bottom level, and the tombstone itself is below the
                     // watermark: it is then the newest version any servable
@@ -741,7 +742,7 @@ impl<'a, I: Iterator<Item = Item>, F: StreamFilter + 'a> CompactionStream<'a, I,
                     continue;
                 } else if head.key.value_type == ValueType::WeakTombstone
                     && peeked.key.value_type == ValueType::Value
-                    && head.key.seqno < self.gc_seqno_threshold
+                    && head.key.seqno < self.gc_watermark
                 {
                     // The weak delete and the put it consumed leave the output
                     // together: an annihilation, a visibility transform rather
@@ -755,11 +756,10 @@ impl<'a, I: Iterator<Item = Item>, F: StreamFilter + 'a> CompactionStream<'a, I,
                     fail_iter!(self.drain_key(&head.key.user_key));
                     self.note_transform();
                     continue;
-                } else if peeked.key.seqno < self.gc_seqno_threshold {
+                } else if peeked.key.seqno < self.gc_watermark {
                     // Merge operands below GC watermark: collapse via merge operator.
                     // Both head AND peeked must be below threshold for MVCC safety.
-                    if head.key.value_type.is_merge_operand()
-                        && head.key.seqno < self.gc_seqno_threshold
+                    if head.key.value_type.is_merge_operand() && head.key.seqno < self.gc_watermark
                     {
                         if self.merge_operator.is_some() {
                             let mut merged = fail_iter!(self.resolve_with_operator(head));
@@ -777,7 +777,7 @@ impl<'a, I: Iterator<Item = Item>, F: StreamFilter + 'a> CompactionStream<'a, I,
                             }
                             // Skip zeroing for partial merges (MergeOperand) to avoid duplicate keys
                             if self.zero_seqnos
-                                && merged.key.seqno < self.gc_seqno_threshold
+                                && merged.key.seqno < self.gc_watermark
                                 && !merged.key.value_type.is_merge_operand()
                             {
                                 merged.key.seqno = 0;
@@ -801,7 +801,7 @@ impl<'a, I: Iterator<Item = Item>, F: StreamFilter + 'a> CompactionStream<'a, I,
                         // The floor is the only read boundary: every snapshot
                         // above it is answered from the output, so this fold
                         // keeps everything such a snapshot reads.
-                        if head.key.seqno < self.gc_seqno_threshold {
+                        if head.key.seqno < self.gc_watermark {
                             let drained = fail_iter!(self.drain_key(&head.key.user_key));
                             // A tail that was all tombstones, under a head this
                             // fold emits, is observationally neutral ONLY at the
@@ -825,9 +825,7 @@ impl<'a, I: Iterator<Item = Item>, F: StreamFilter + 'a> CompactionStream<'a, I,
                 self.note_transform();
                 self.note_neutral_drop();
                 continue;
-            } else if head.key.value_type.is_merge_operand()
-                && head.key.seqno < self.gc_seqno_threshold
-            {
+            } else if head.key.value_type.is_merge_operand() && head.key.seqno < self.gc_watermark {
                 // Last stream item is a MergeOperand below GC — partial merge.
                 if self.merge_operator.is_some() {
                     head = fail_iter!(self.resolve_with_operator(head));
@@ -848,7 +846,7 @@ impl<'a, I: Iterator<Item = Item>, F: StreamFilter + 'a> CompactionStream<'a, I,
 
             // Zero seqnos below GC, but skip MergeOperands (duplicate key risk)
             if self.zero_seqnos
-                && head.key.seqno < self.gc_seqno_threshold
+                && head.key.seqno < self.gc_watermark
                 && !head.key.value_type.is_merge_operand()
             {
                 head.key.seqno = 0;

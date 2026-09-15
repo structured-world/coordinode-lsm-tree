@@ -72,7 +72,7 @@ memtable.
 A write is durable once the memtable holding it has been flushed:
 
 ```rust,ignore
-fn flush_active_memtable(&self, eviction_seqno: SeqNo) -> crate::Result<()>;
+fn flush_active_memtable(&self, gc_watermark: SeqNo) -> crate::Result<()>;
 ```
 
 When this returns `Ok`, the active memtable has been written and synced as an SST,
@@ -225,7 +225,7 @@ any repair, derive the obligation from the report instead:
    - **Do not fold or zero history a lost RANGE DELETION may target.** A
      zeroed survivor's true age is unknowable, so a replayed range deletion
      from a lost SST cannot decide whether the survivor pre- or post-dates
-     it. Keep the compaction GC watermark (`seqno_threshold`) at or below
+     it. Keep the compaction GC watermark (`gc_watermark`) at or below
      the seqno up to which the tree is already authoritative — reconciled,
      or provably not in need of replay — before letting it fold history.
 

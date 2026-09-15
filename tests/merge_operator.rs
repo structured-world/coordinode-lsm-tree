@@ -369,7 +369,7 @@ fn merge_major_compaction() -> lsm_tree::Result<()> {
     let tree = open_tree_with_counter(&folder);
 
     // Write and flush multiple times to create multiple tables.
-    // Use gc_seqno_threshold=0 to preserve merge operands during flush
+    // Use gc_watermark=0 to preserve merge operands during flush
     // (they can't be resolved since the base may be in a different table).
     tree.insert("counter", 100_i64.to_le_bytes(), 0);
     tree.flush_active_memtable(0)?;
@@ -479,7 +479,7 @@ fn merge_sealed_memtable_resolution() -> lsm_tree::Result<()> {
     tree.insert("key", 100_i64.to_le_bytes(), 0);
 
     // Rotate memtable manually by writing enough to trigger
-    // or use flush with gc_threshold=0 to preserve entries
+    // or use flush with gc_watermark=0 to preserve entries
     tree.flush_active_memtable(0)?;
 
     // Now write operands to a new memtable, then seal it
@@ -551,7 +551,7 @@ fn merge_multiple_operands_in_single_table() -> lsm_tree::Result<()> {
     let folder = tempfile::tempdir()?;
     let tree = open_tree_with_counter(&folder);
 
-    // Write base + multiple operands, flush with gc_threshold=0
+    // Write base + multiple operands, flush with gc_watermark=0
     // to preserve all entries individually in one SST
     tree.insert("counter", 100_i64.to_le_bytes(), 0);
     tree.merge("counter", 10_i64.to_le_bytes(), 1);
@@ -577,7 +577,7 @@ fn merge_operand_above_watermark_preserves_tail() -> lsm_tree::Result<()> {
     tree.merge("counter", 10_i64.to_le_bytes(), 5);
     tree.merge("counter", 20_i64.to_le_bytes(), 10);
 
-    // Flush with gc_threshold=7: seqno 0 and 5 are below, seqno 10 is above.
+    // Flush with gc_watermark=7: seqno 0 and 5 are below, seqno 10 is above.
     // The operand at seqno=10 must NOT cause the tail (seqno=5, seqno=0)
     // to be drained — they are needed for merge resolution.
     tree.flush_active_memtable(7)?;
@@ -904,7 +904,7 @@ fn merge_rt_suppresses_operand_in_disk_range_scan() -> lsm_tree::Result<()> {
     let folder = tempfile::tempdir()?;
     let tree = open_tree_with_counter(&folder);
 
-    // Base + operand in same flush (gc_threshold=0 preserves both as separate entries)
+    // Base + operand in same flush (gc_watermark=0 preserves both as separate entries)
     tree.insert("counter", 100_i64.to_le_bytes(), 0);
     tree.merge("counter", 10_i64.to_le_bytes(), 1);
     tree.flush_active_memtable(0)?;
