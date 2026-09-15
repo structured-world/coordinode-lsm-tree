@@ -2120,9 +2120,9 @@ fn blob_file_picking_simple() -> crate::Result<()> {
         KvSeparationOptions::default()
             .separation_threshold(1)
             .age_cutoff(1.0)
-            .staleness_threshold(0.01)
-            .compression(crate::CompressionType::None),
+            .staleness_threshold(0.01),
     ))
+    .blob_compression(crate::CompressionType::None)
     .open()?;
 
     tree.insert("a", "a", 0);

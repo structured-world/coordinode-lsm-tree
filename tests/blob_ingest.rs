@@ -18,9 +18,8 @@ fn blob_ingest_gc_stats() -> lsm_tree::Result<()> {
             SequenceNumberCounter::default(),
             SequenceNumberCounter::default(),
         )
-        .with_kv_separation(Some(
-            KvSeparationOptions::default().compression(lsm_tree::CompressionType::None),
-        ))
+        .with_kv_separation(Some(KvSeparationOptions::default()))
+        .blob_compression(lsm_tree::CompressionType::None)
         .open()?;
 
         let mut ingestion = tree.ingestion()?;

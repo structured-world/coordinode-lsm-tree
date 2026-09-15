@@ -707,10 +707,9 @@ fn range_tombstone_blob_tree() -> lsm_tree::Result<()> {
         SequenceNumberCounter::default(),
     )
     .with_kv_separation(Some(
-        lsm_tree::KvSeparationOptions::default()
-            .separation_threshold(1)
-            .compression(lsm_tree::CompressionType::None),
+        lsm_tree::KvSeparationOptions::default().separation_threshold(1),
     ))
+    .blob_compression(lsm_tree::CompressionType::None)
     .open()?;
 
     tree.insert("a", "value_a", 1);

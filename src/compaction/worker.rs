@@ -11,7 +11,7 @@ use crate::{
     blob_tree::FragmentationMap,
     compaction::{
         Choice,
-        filter::{Context, StreamFilterAdapter, TransformCounters},
+        filter::{Context, FilterBlobOutput, StreamFilterAdapter, TransformCounters},
         flavour::{RelocatingCompaction, StandardCompaction},
         state::CompactionState,
         stream::CompactionStream,
@@ -162,13 +162,14 @@ pub fn do_compaction(opts: &Options) -> crate::Result<CompactionResult> {
     );
     // Structural decision plus the runtime-config-driven density-rewrite
     // fallback (applied here, where the live runtime config lives, so the
-    // structural strategies stay free of it).
-    let runtime_config = opts.runtime_config.load_full();
+    // structural strategies stay free of it). The snapshot is read for the
+    // choice only; the writers take their own, which is the one that must stay
+    // held until their outputs are installed.
     let choice = super::choose_with_density_rewrite(
         &*opts.strategy,
         &version_history_lock.latest_version_ref().version,
         &opts.config,
-        &runtime_config,
+        &opts.runtime_config.load(),
         &compaction_state,
     );
 
@@ -1061,6 +1062,8 @@ fn run_tight_space_compaction(
     // Doubles as the next slice's scan-resume map and the punch offset for each
     // stale file's prior view. Empty (and unused) on the non-relocating path.
     let mut resume_offsets: crate::HashMap<BlobFileId, u64> = crate::HashMap::default();
+    // One runtime snapshot for every slice: the slices are one compaction.
+    let rc = opts.runtime_config.load_full();
 
     let result = (|| -> crate::Result<usize> {
         let mut tables_out = 0usize;
@@ -1103,6 +1106,7 @@ fn run_tight_space_compaction(
                 false,
                 &blobs_folder,
                 reloc,
+                &rc,
             )?;
             drop(version);
 
@@ -1309,6 +1313,9 @@ fn run_tight_space_compaction(
                 });
             }
 
+            #[cfg(test)]
+            opts.config.fire_before_output_install();
+
             // Install one atomic, durable version edit for the slice.
             let install = opts.version_history.write().upgrade_version(
                 &opts.config.path,
@@ -1486,6 +1493,7 @@ fn run_tight_space_compaction(
             false,
             &blobs_folder,
             tail_reloc,
+            &rc,
         )?;
         drop(version);
         let tail_out = produced.created_tables().len();
@@ -1497,6 +1505,9 @@ fn run_tight_space_compaction(
         )?;
         Ok(tables_out + tail_out)
     })();
+    // Held across every slice's install: the installed outputs name their
+    // dictionaries from here on (see `WritePin`).
+    drop(rc);
 
     compaction_state
         .hidden_set_mut()
@@ -1567,6 +1578,10 @@ fn run_subcompaction(
     // each stale file's scan at `resume_offsets` so an already-punched prefix is
     // never re-read. `None` is the pass-through path (no blob relocation).
     relocation: Option<RelocationSetup>,
+    // The compaction's runtime snapshot, shared by all of its sub-compactions
+    // (or slices): one configuration for everything the compaction writes, the
+    // filter's blob files included, held until the output is installed.
+    rc: &Arc<crate::runtime_config::RuntimeConfig>,
 ) -> crate::Result<super::flavour::ProducedOutput> {
     use super::flavour::CompactionFlavour;
 
@@ -1661,8 +1676,11 @@ fn run_subcompaction(
         compaction_filter.as_deref_mut(),
         opts,
         version,
-        blobs_folder,
-        &mut filter_blob_writer,
+        FilterBlobOutput {
+            folder: blobs_folder,
+            writer: &mut filter_blob_writer,
+            runtime: rc,
+        },
         &filter_ctx,
         TransformCounters {
             transform: transform_marker.clone(),
@@ -1694,6 +1712,7 @@ fn run_subcompaction(
         false,
         transform_marker,
         false,
+        rc,
     )?;
     let mut compactor: Box<dyn CompactionFlavour> = match relocation {
         // Tight-space blob defrag: relocate the stale files' live entries into a
@@ -1744,7 +1763,7 @@ fn run_subcompaction(
                 opts.config.fs.clone(),
             )?
             .use_target_size(blob_opts.file_target_size)
-            .use_passthrough_compression(blob_opts.compression)
+            .use_passthrough_compression(rc.blob_compression)
             .use_sync_mode(opts.config.sync_mode);
             // The policy here is only the OPENING value. Relocation copies
             // frames verbatim out of files that may predate a policy change, so
@@ -2336,6 +2355,9 @@ fn merge_tables(
             let num_ranges = ranges.len();
             let only_first_owns_inputs =
                 |idx: usize| if idx == 0 { tables.clone() } else { Vec::new() };
+            // One runtime snapshot for the whole compaction, taken before it
+            // splits: every range writes under the same configuration.
+            let rc = opts.runtime_config.load_full();
 
             let outputs: Vec<crate::Result<super::flavour::ProducedOutput>> =
                 if let Some(spawner) = opts.config.compaction_pool.clone() {
@@ -2353,6 +2375,7 @@ fn merge_tables(
                         let version = Arc::clone(&version);
                         let rts = Arc::clone(&rts);
                         let blobs = Arc::clone(&blobs);
+                        let rc = Arc::clone(&rc);
                         let tables_for_deletion = only_first_owns_inputs(idx);
                         spawner.spawn(Box::new(move || {
                             let out = run_subcompaction(
@@ -2369,6 +2392,7 @@ fn merge_tables(
                                 // The parallel path never relocates blobs; tight
                                 // blob defrag is the serial slice loop's domain.
                                 None,
+                                &rc,
                             );
                             // The receiver outlives every send (it drains N
                             // items below), so this cannot fail.
@@ -2414,6 +2438,7 @@ fn merge_tables(
                                 true,
                                 &blobs_folder,
                                 None,
+                                &rc,
                             )
                         })
                         .collect()
@@ -2453,6 +2478,9 @@ fn merge_tables(
             }
             let outputs = committed;
 
+            #[cfg(test)]
+            opts.config.fire_before_output_install();
+
             // Re-acquire locks and install one atomic version edit for all outputs.
             let mut compaction_state = opts.compaction_state.lock();
             let mut version_history_lock = opts.version_history.write();
@@ -2468,6 +2496,9 @@ fn merge_tables(
                             .hidden_set_mut()
                             .show(payload.table_ids.iter().copied());
                     })?;
+            // Held until the install: the installed outputs name their
+            // dictionaries from here on (see `WritePin`).
+            drop(rc);
 
             compaction_state
                 .hidden_set_mut()
@@ -2559,6 +2590,10 @@ fn merge_tables(
     // This is used by the compaction filter if it wants to write new blobs
     // TODO: the filter should really pipe new blobs into the compaction stream directly,
     // TODO: but that will probably require to change the protocol between filter <-> compaction stream a bit
+    // One runtime snapshot for everything this compaction writes, its tables
+    // and its filter's blob files, held until its output is installed.
+    let rc = opts.runtime_config.load_full();
+
     let mut filter_blob_writer = None;
     // Filter-only transform counter (see `TransformCounters::filter`): read
     // after `produce` to decide the install's retention effect.
@@ -2567,8 +2602,11 @@ fn merge_tables(
         compaction_filter.as_deref_mut(),
         opts,
         &current_super_version.version,
-        &blobs_folder,
-        &mut filter_blob_writer,
+        FilterBlobOutput {
+            folder: &blobs_folder,
+            writer: &mut filter_blob_writer,
+            runtime: &rc,
+        },
         &filter_ctx,
         TransformCounters {
             transform: transform_marker.clone(),
@@ -2586,6 +2624,7 @@ fn merge_tables(
         true,
         transform_marker,
         true,
+        &rc,
     )?;
 
     let start = Instant::now();
@@ -2629,7 +2668,7 @@ fn merge_tables(
                     opts.config.fs.clone(),
                 )?
                 .use_target_size(blob_opts.file_target_size)
-                .use_passthrough_compression(blob_opts.compression)
+                .use_passthrough_compression(rc.blob_compression)
                 .use_sync_mode(opts.config.sync_mode);
                 // Same as the tight-space relocation above, through the same
                 // `RelocatingCompaction`: the policy is only the opening value,
@@ -2834,6 +2873,9 @@ fn merge_tables(
             .hidden_set_mut()
             .show(payload.table_ids.iter().copied());
     })?;
+    // Held until the install: the installed outputs name their dictionaries
+    // from here on (see `WritePin`).
+    drop(rc);
 
     compaction_state
         .hidden_set_mut()

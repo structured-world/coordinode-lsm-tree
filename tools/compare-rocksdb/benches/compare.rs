@@ -549,6 +549,12 @@ fn open_ours(
         SequenceNumberCounter::default(),
         SequenceNumberCounter::default(),
     );
+    // The symmetry preset (RocksDbParity by default) FIRST, so our opt-ins match
+    // RocksDB's feature set as the baseline and each variant's own settings
+    // below land on top of it. Applied last, the parity preset's locator
+    // switch-off undid the ribbon variant's locator, so that variant measured
+    // the plain read path under the ribbon's name.
+    let config = apply_preset(config, active_preset());
     // Row cache: a key->resolved-value layer in front of the block cache so a
     // repeat point read skips the index walk + data-block decode.
     //
@@ -594,19 +600,16 @@ fn open_ours(
     };
     let config = if kv_separated {
         // Blobs stay `None`-compressed (the bench crate has no `lz4` feature, so
-        // `KvSeparationOptions::default().compression` is already `None`; set it
-        // explicitly so a future feature flip cannot silently compress blobs).
-        config.with_kv_separation(Some(
-            KvSeparationOptions::default()
-                .separation_threshold(BLOB_SEPARATION_THRESHOLD)
-                .compression(CompressionType::None),
-        ))
+        // the default blob compression is already `None`; set it explicitly so a
+        // future feature flip cannot silently compress blobs).
+        config
+            .with_kv_separation(Some(
+                KvSeparationOptions::default().separation_threshold(BLOB_SEPARATION_THRESHOLD),
+            ))
+            .blob_compression(CompressionType::None)
     } else {
         config
     };
-    // Apply the symmetry preset (RocksDbParity by default) so our opt-ins match
-    // RocksDB's feature set for the head-to-head.
-    let config = apply_preset(config, active_preset());
     Ok(config.open()?)
 }
 

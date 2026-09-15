@@ -28,6 +28,11 @@ pub struct Ingestion<'a> {
     pub(crate) level_fs: Arc<dyn Fs>,
     tree: &'a Tree,
     pub(crate) writer: MultiWriter,
+    /// The hold on the snapshot this ingestion writes under, kept until
+    /// `finish` has installed what it wrote (see
+    /// [`WritePin`](crate::runtime_config::WritePin)). It covers the blob
+    /// files of a blob ingestion too, which share the snapshot.
+    pub(crate) write_pin: crate::runtime_config::WritePin,
     seqno: SeqNo,
     last_key: Option<UserKey>,
     /// Successive columnar batches with the same layout accumulate here into one
@@ -44,6 +49,21 @@ impl<'a> Ingestion<'a> {
     ///
     /// Will return `Err` if an IO error occurs.
     pub fn new(tree: &'a Tree) -> crate::Result<Self> {
+        Self::with_runtime_snapshot(tree, &tree.0.runtime_config.load_full())
+    }
+
+    /// Creates a new ingestion whose writer is configured from `rc`, so an
+    /// ingestion that writes more than tables (a blob ingestion) takes one
+    /// snapshot for all of its files.
+    ///
+    /// # Errors
+    ///
+    /// Will return `Err` if an IO error occurs, or if the snapshot's policy
+    /// names a dictionary the tree does not hold.
+    pub(crate) fn with_runtime_snapshot(
+        tree: &'a Tree,
+        rc: &Arc<crate::runtime_config::RuntimeConfig>,
+    ) -> crate::Result<Self> {
         // Ingested tables are placed at L0 (via with_new_l0_run), so use
         // the level-routed folder for level 0.
         let (folder, level_fs) = tree.config.tables_folder_for_level(0);
@@ -72,6 +92,17 @@ impl<'a> Ingestion<'a> {
             reason = "INITIAL_CANONICAL_LEVEL is 1, well within u8"
         )]
         let ingest_level = INITIAL_CANONICAL_LEVEL as u8;
+
+        // One runtime-config snapshot for the whole ingestion writer setup, so
+        // a concurrent `update_runtime_config` can't leave the ingested SST
+        // with its compression from one snapshot and `seqno_in_index` or the
+        // checksum settings from another. `Off` (default) emits no per-KV
+        // footer and leaves the data-block payload encoding unchanged; the
+        // index format follows the policy in force at ingestion.
+        let data_block_compression = rc
+            .data_block_compression_policy
+            .get(INITIAL_CANONICAL_LEVEL);
+
         // TODO: maybe create a PrepareMultiWriter that can be used by flush, ingest and compaction worker
         let mut writer = MultiWriter::new(
             folder.clone(),
@@ -102,14 +133,9 @@ impl<'a> Ingestion<'a> {
                 .data_block_hash_ratio_policy
                 .get(INITIAL_CANONICAL_LEVEL),
         )
-        .use_data_block_compression(
-            tree.config
-                .data_block_compression_policy
-                .get(INITIAL_CANONICAL_LEVEL),
-        )
+        .use_data_block_compression(data_block_compression)
         .use_index_block_compression(
-            tree.config
-                .index_block_compression_policy
+            rc.index_block_compression_policy
                 .get(INITIAL_CANONICAL_LEVEL),
         )
         .use_data_block_restart_interval(
@@ -122,14 +148,6 @@ impl<'a> Ingestion<'a> {
                 .index_block_restart_interval_policy
                 .get(INITIAL_CANONICAL_LEVEL),
         );
-
-        // One runtime-config snapshot for the whole ingestion writer setup, so
-        // a concurrent `update_runtime_config` can't leave the ingested SST
-        // with `seqno_in_index` from one snapshot and checksum settings from
-        // another. `Off` (default) emits no per-KV footer and leaves the
-        // data-block payload encoding unchanged; the index format follows the
-        // policy in force at ingestion.
-        let rc = tree.0.runtime_config.load_full();
 
         if index_partitioning {
             // Size-adaptive index: single-level for small SSTs, spill to
@@ -163,9 +181,15 @@ impl<'a> Ingestion<'a> {
         writer = writer.use_kv_checksums(rc.kv_checksums, rc.kv_checksum_algo);
         writer = writer.use_locator(tree.config.locator_policy.get(INITIAL_CANONICAL_LEVEL));
 
+        // Resolved from `rc`, which the ingestion holds until `finish` has
+        // installed its tables, as in the flush.
         #[cfg(zstd_any)]
         {
-            writer = writer.use_zstd_dictionary(tree.config.zstd_dictionary.clone());
+            writer = writer.use_zstd_dictionary(
+                tree.config
+                    .current_zstd_dictionaries()
+                    .for_compression(data_block_compression)?,
+            );
         }
 
         Ok(Self {
@@ -173,6 +197,7 @@ impl<'a> Ingestion<'a> {
             level_fs,
             tree,
             writer,
+            write_pin: crate::runtime_config::WritePin::new(rc),
             seqno: 0,
             last_key: None,
             #[cfg(feature = "columnar")]
@@ -392,7 +417,6 @@ impl<'a> Ingestion<'a> {
     ///
     /// Will return `Err` if an IO error occurs.
     #[allow(clippy::significant_drop_tightening)]
-    #[cfg_attr(not(feature = "columnar"), allow(unused_mut))]
     pub fn finish(mut self) -> crate::Result<()> {
         use crate::{AbstractTree, Table};
 
@@ -431,10 +455,15 @@ impl<'a> Ingestion<'a> {
         self.tree.rotate_memtable();
         self.tree.flush(&flush_lock, 0)?;
 
-        // Finalize the ingestion writer, writing all buffered data to disk.
+        // Finalize the ingestion writer, writing all buffered data to disk. The
+        // hold on its dictionary stays here until the tables are installed.
+        let write_pin = core::mem::take(&mut self.write_pin);
         let results = self.writer.finish()?;
 
         log::info!("Finished ingestion writer");
+
+        #[cfg(all(test, feature = "std"))]
+        self.tree.config.fire_before_output_install();
 
         // Acquire locks for version registration. We must hold both the
         // compaction state lock and version history lock to safely modify
@@ -525,6 +554,8 @@ impl<'a> Ingestion<'a> {
             // Ingestion only adds tables: older snapshots keep everything.
             crate::version::RetentionEffect::Keep,
         )?;
+        // The installed tables name their dictionary from here on.
+        drop(write_pin);
 
         // Perform maintenance on the version history (e.g., clean up old versions).
         // We use gc_watermark=0 since ingestion doesn't affect sealed memtables.

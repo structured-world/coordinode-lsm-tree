@@ -698,7 +698,7 @@ impl AbstractTree for Tree {
         let prior = versions.latest_version();
 
         #[cfg(zstd_any)]
-        let still_written = self.config.write_referenced_dict_ids();
+        let still_written = self.write_referenced_dict_ids();
         #[cfg(not(zstd_any))]
         let still_written: Vec<crate::file::DictId> = Vec::new();
 
@@ -808,7 +808,13 @@ impl AbstractTree for Tree {
         &self,
         stream: impl Iterator<Item = crate::Result<InternalValue>>,
         range_tombstones: Vec<crate::range_tombstone::RangeTombstone>,
-    ) -> crate::Result<Option<(Vec<Table>, Option<Vec<BlobFile>>)>> {
+    ) -> crate::Result<
+        Option<(
+            Vec<Table>,
+            Option<Vec<BlobFile>>,
+            crate::runtime_config::WritePin,
+        )>,
+    > {
         use crate::table::multi_writer::MultiWriter;
         use crate::time::Instant;
 
@@ -821,21 +827,22 @@ impl AbstractTree for Tree {
         let data_block_restart_interval = self.config.data_block_restart_interval_policy.get(0);
         let index_block_restart_interval = self.config.index_block_restart_interval_policy.get(0);
 
-        let data_block_compression = self.config.data_block_compression_policy.get(0);
-        let index_block_compression = self.config.index_block_compression_policy.get(0);
+        // One runtime-config snapshot for the whole flush writer setup. The
+        // compression policies, the index spill threshold, `seqno_in_index`,
+        // and the per-KV checksum policy are all live (toggleable via
+        // `update_runtime_config`); reading `load_full()` per field could
+        // straddle a concurrent update and mix two snapshots into one SST.
+        // Compaction is the migration mechanism, so a toggle takes effect on
+        // the next flush / compaction.
+        let rc = self.0.runtime_config.load_full();
+
+        let data_block_compression = rc.data_block_compression_policy.get(0);
+        let index_block_compression = rc.index_block_compression_policy.get(0);
 
         let data_block_hash_ratio = self.config.data_block_hash_ratio_policy.get(0);
 
         let index_partitioning = self.config.index_block_partitioning_policy.get(0);
         let filter_partitioning = self.config.filter_block_partitioning_policy.get(0);
-
-        // One runtime-config snapshot for the whole flush writer setup. The
-        // index spill threshold, `seqno_in_index`, and the per-KV checksum
-        // policy are all live (toggleable via `update_runtime_config`); reading
-        // `load_full()` per field could straddle a concurrent update and mix two
-        // snapshots into one SST. Compaction is the migration mechanism, so a
-        // toggle takes effect on the next flush / compaction.
-        let rc = self.0.runtime_config.load_full();
 
         log::debug!(
             "Flushing memtable(s) to {}, data_block_restart_interval={data_block_restart_interval}, index_block_restart_interval={index_block_restart_interval}, data_block_size={data_block_size}, data_block_compression={data_block_compression:?}, index_block_compression={index_block_compression:?}",
@@ -898,10 +905,18 @@ impl AbstractTree for Tree {
         // Flush writes level 0; resolve that level's locator policy entry.
         table_writer = table_writer.use_locator(self.config.locator_policy.get(0));
 
+        // The dictionary THIS snapshot's policy names. The flush holds the
+        // snapshot until its tables are installed: a collection spares what a
+        // held snapshot names, however the policy has changed since.
         #[cfg(zstd_any)]
         {
-            table_writer = table_writer.use_zstd_dictionary(self.config.zstd_dictionary.clone());
+            table_writer = table_writer.use_zstd_dictionary(
+                self.config
+                    .current_zstd_dictionaries()
+                    .for_compression(data_block_compression)?,
+            );
         }
+        let write_pin = crate::runtime_config::WritePin::new(&rc);
 
         // Parallel block compression for the flush writer, on the same pool the
         // compaction writers use. Engaged only when the per-block transform does
@@ -974,7 +989,7 @@ impl AbstractTree for Tree {
         // Return Some even when tables is empty (RT-only flush): the caller
         // (AbstractTree::flush) handles empty tables by re-inserting RTs into
         // the active memtable and still needs to delete sealed memtables.
-        Ok(Some((tables, None)))
+        Ok(Some((tables, None, write_pin)))
     }
 
     #[expect(clippy::significant_drop_tightening)]
@@ -1932,6 +1947,30 @@ impl Tree {
         self.config.current_zstd_dictionaries()
     }
 
+    /// The dictionary ids new files may still be written against: every one
+    /// the live snapshot's policies name, and every one a replaced snapshot a
+    /// writer still holds names (see `TreeInner::retired_write_snapshots`).
+    #[cfg(zstd_any)]
+    pub(crate) fn write_referenced_dict_ids(&self) -> Vec<crate::file::DictId> {
+        let kv_separated = self.config.kv_separation_opts.is_some();
+        let mut ids: Vec<crate::file::DictId> = self
+            .0
+            .runtime_config
+            .load()
+            .write_dict_ids(kv_separated)
+            .collect();
+        self.0.retired_write_snapshots.lock().retain(|snapshot| {
+            let Some(held) = snapshot.upgrade() else {
+                return false;
+            };
+            ids.extend(held.write_dict_ids(kv_separated));
+            true
+        });
+        ids.sort_unstable();
+        ids.dedup();
+        ids
+    }
+
     /// Drops every dictionary nothing references any more, returning how many
     /// files were removed.
     ///
@@ -1949,11 +1988,15 @@ impl Tree {
     /// which is the same lifetime rule the tables themselves follow.
     ///
     /// REFERENCED means both directions: the files that already exist (tables
-    /// and blob files alike), and the ids the compression policy names for what
-    /// is written next. Counting only the first would unregister a dictionary
-    /// before its first table is written, and nothing puts the id back
-    /// afterwards — so a later pass would unlink the file while live tables are
-    /// compressed against it.
+    /// and blob files alike), and the ids the compression policies name for
+    /// what is written next. Counting only the first would unregister a
+    /// dictionary before its first table is written, and nothing puts the id
+    /// back afterwards — so a later pass would unlink the file while live
+    /// tables are compressed against it. What is written next includes the
+    /// writers already running: a flush or compaction started under a policy
+    /// [`Self::update_runtime_config`] has since replaced still writes against
+    /// the dictionary that policy named, so it is spared until their files are
+    /// installed and name it themselves.
     ///
     /// The whole pass holds the version lock. Registration takes the same lock
     /// before it writes anything, so the two cannot interleave: without that, a
@@ -1971,7 +2014,7 @@ impl Tree {
         // write policy needs.
         let latest = version_lock.latest_version_ref().version.clone();
         let mut referenced = latest.referenced_dicts();
-        referenced.extend(self.config.write_referenced_dict_ids());
+        referenced.extend(self.write_referenced_dict_ids());
         let stale: Vec<crate::file::DictId> = latest
             .dicts()
             .iter()
@@ -2699,23 +2742,15 @@ impl Tree {
     /// is then atomically swapped in. Subsequent calls to
     /// [`Self::runtime_config`] observe the new snapshot.
     ///
-    /// ## Current scope
+    /// ## Semantics
     ///
-    /// This API ships the snapshot + atomic-swap mechanism. No write
-    /// path in the current tree consults `runtime_config` yet — that
-    /// wiring lands with the V5-batch format features (manifest
-    /// hardening, per-KV protection, scan-since-seqno) which extend
-    /// [`RuntimeConfig`](crate::runtime_config::RuntimeConfig) with
-    /// their own fields and read it at block write / manifest commit /
-    /// compaction boundaries.
-    ///
-    /// ## Designed semantics (effective once wired by V5 features)
-    ///
-    /// - Subsequent write paths load the new snapshot lockless on their
-    ///   next operation.
+    /// - Write paths (flush, compaction, ingestion) take one snapshot when
+    ///   they start and use it throughout, so a change applies to the next
+    ///   one and never splits a single file between two configurations.
     /// - Existing on-disk data remains in its original format and reads
-    ///   transparently — every block / manifest is self-describing via
-    ///   its own header.
+    ///   transparently: every block, manifest and blob file is
+    ///   self-describing via its own header or descriptor. That includes
+    ///   the compression policies, so changing one rewrites nothing.
     /// - Compaction acts as the live-migration mechanism: source blocks
     ///   are rewritten per the current snapshot over subsequent cycles,
     ///   so all data converges to the current settings without
@@ -2737,29 +2772,63 @@ impl Tree {
     ///
     /// Returns [`crate::Error::PageEccUnsupported`] when the mutator
     /// leaves `page_ecc = true` on a binary built without the
-    /// `page_ecc` cargo feature. The live snapshot stays at its
+    /// `page_ecc` cargo feature, and
+    /// [`crate::Error::ZstdDictMismatch`] when a compression policy names a
+    /// dictionary the tree does not hold (register it first with
+    /// `Self::register_zstd_dictionary`). The live snapshot stays at its
     /// pre-mutation value on error.
     pub fn update_runtime_config<F>(&self, mutator: F) -> crate::Result<()>
     where
         F: FnOnce(&mut crate::runtime_config::RuntimeConfig),
     {
-        // Route through the validating handle path so an invalid
-        // mutation (currently: `page_ecc = true` on a non-`page_ecc`
-        // build) is rejected at update time, not silently swallowed
-        // at the next manifest write.
-        // Capture this update's `auto_heal` inside the mutation so the read-path
-        // heal gate reflects exactly the config THIS call commits, rather than a
-        // separate `load_full()` that could observe a different concurrent
-        // update's value. Concurrent `update_runtime_config` calls must be
-        // serialized by the caller (see the last-writer-wins note above); under
-        // that contract the gate and the committed config stay in sync. On a
-        // validation error `try_update` does not commit and `?` returns before
-        // the gate is touched, so it keeps tracking the unchanged config.
-        let mut auto_heal = false;
-        self.0.runtime_config.try_update(|c| {
-            mutator(c);
-            auto_heal = c.auto_heal;
-        })?;
+        // The mutator is the caller's code and may read the tree, so it runs
+        // before any lock is taken: under the version lock a read of the
+        // version history would wait on this thread forever.
+        let mut next = (*self.0.runtime_config.load_full()).clone();
+        mutator(&mut next);
+
+        // Under the version lock, which a dictionary collection holds for its
+        // whole pass: checking a policy against the tree's dictionaries and
+        // publishing it must not interleave with a collection that takes the
+        // one it names.
+        #[cfg(zstd_any)]
+        let version_lock = self.version_history.write();
+        #[cfg(zstd_any)]
+        next.check_dictionaries(
+            self.config.kv_separation_opts.is_some(),
+            &self.config.current_zstd_dictionaries(),
+        )?;
+        // What the swap below replaces, read under the lock every update takes,
+        // so it is the snapshot a writer may still hold, not the one the
+        // mutator started from.
+        #[cfg(zstd_any)]
+        let replaced = self.0.runtime_config.load_full();
+        // The heal gate below follows exactly the config THIS call commits,
+        // rather than a separate `load_full()` that could observe a different
+        // concurrent update's value. Concurrent `update_runtime_config` calls
+        // must be serialized by the caller (see the last-writer-wins note
+        // above); under that contract the gate and the committed config stay in
+        // sync. On a validation error nothing is committed and `?` returns
+        // before the gate is touched, so it keeps tracking the unchanged config.
+        let auto_heal = next.auto_heal;
+        // Route through the validating handle path so an invalid mutation
+        // (e.g. `page_ecc = true` on a non-`page_ecc` build) is rejected at
+        // update time, not silently swallowed at the next manifest write.
+        self.0.runtime_config.try_update(|c| *c = next)?;
+
+        // A writer that took `replaced` before this swap may still be about to
+        // resolve the dictionary it names; see `retired_write_snapshots`.
+        #[cfg(zstd_any)]
+        {
+            let kv_separated = self.config.kv_separation_opts.is_some();
+            if replaced.write_dict_ids(kv_separated).next().is_some() {
+                let mut retired = self.0.retired_write_snapshots.lock();
+                retired.retain(|snapshot| snapshot.strong_count() > 0);
+                retired.push(Arc::downgrade(&replaced));
+            }
+            drop(replaced);
+            drop(version_lock);
+        }
         self.0.heal_hints.set_enabled(auto_heal);
         // Mirror the insert-time digest gate for the write hot path (see
         // `TreeInner::kv_digest_at_insert`). Relaxed: a toggle taking effect
@@ -4310,12 +4379,15 @@ impl Tree {
         #[cfg(zstd_any)]
         config.install_own_zstd_dictionaries()?;
 
-        // Only now can the compression policy be checked: it names a dictionary
-        // by id, and the tree may hold that id without the caller supplying the
-        // bytes again. Validating before the load would refuse exactly the
-        // reopen the tree owning its dictionaries exists to allow.
+        // Only now can the compression policies be checked: they name
+        // dictionaries by id, and the tree may hold one without the caller
+        // supplying the bytes again. Validating before the load would refuse
+        // exactly the reopen the tree owning its dictionaries exists to allow.
         #[cfg(zstd_any)]
-        config.validate_zstd_dictionary()?;
+        config.initial_runtime_config.check_dictionaries(
+            config.kv_separation_opts.is_some(),
+            &config.current_zstd_dictionaries(),
+        )?;
 
         let tree = if recovering {
             Self::recover(
@@ -5031,6 +5103,8 @@ impl Tree {
                 initial_runtime,
             )),
             admission_used_cache: Mutex::new(None),
+            #[cfg(zstd_any)]
+            retired_write_snapshots: Mutex::new(Vec::new()),
 
             #[cfg(feature = "metrics")]
             metrics,
@@ -6123,3 +6197,7 @@ mod restricted_reclaim_tests;
 
 #[cfg(all(test, feature = "std", zstd_any))]
 mod dict_collect_tests;
+
+#[cfg(all(test, feature = "std", zstd_any))]
+#[expect(clippy::expect_used, reason = "test code")]
+mod live_compression_tests;

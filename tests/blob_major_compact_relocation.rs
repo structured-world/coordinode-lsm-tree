@@ -18,11 +18,8 @@ fn blob_tree_major_compact_relocation_simple() -> lsm_tree::Result<()> {
             SequenceNumberCounter::default(),
             SequenceNumberCounter::default(),
         )
-        .with_kv_separation(Some(
-            KvSeparationOptions::default()
-                .compression(lsm_tree::CompressionType::None)
-                .age_cutoff(1.0),
-        ))
+        .with_kv_separation(Some(KvSeparationOptions::default().age_cutoff(1.0)))
+        .blob_compression(lsm_tree::CompressionType::None)
         .open()?;
 
         assert!(tree.get("big", SeqNo::MAX)?.is_none());
@@ -113,11 +110,8 @@ fn blob_tree_major_compact_relocation_repeated_key() -> lsm_tree::Result<()> {
             SequenceNumberCounter::default(),
             SequenceNumberCounter::default(),
         )
-        .with_kv_separation(Some(
-            KvSeparationOptions::default()
-                .compression(lsm_tree::CompressionType::None)
-                .age_cutoff(1.0),
-        ))
+        .with_kv_separation(Some(KvSeparationOptions::default().age_cutoff(1.0)))
+        .blob_compression(lsm_tree::CompressionType::None)
         .open()?;
 
         assert!(tree.get("big", SeqNo::MAX)?.is_none());
@@ -226,11 +220,8 @@ fn blob_tree_major_compact_relocation_interleaved() -> lsm_tree::Result<()> {
             SequenceNumberCounter::default(),
             SequenceNumberCounter::default(),
         )
-        .with_kv_separation(Some(
-            KvSeparationOptions::default()
-                .compression(lsm_tree::CompressionType::None)
-                .age_cutoff(1.0),
-        ))
+        .with_kv_separation(Some(KvSeparationOptions::default().age_cutoff(1.0)))
+        .blob_compression(lsm_tree::CompressionType::None)
         .open()?;
 
         assert!(tree.get("big", SeqNo::MAX)?.is_none());

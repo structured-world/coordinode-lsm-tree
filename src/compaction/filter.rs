@@ -200,6 +200,15 @@ pub(crate) struct TransformCounters {
     pub filter: alloc::sync::Arc<portable_atomic::AtomicU64>,
 }
 
+/// Where a filter's separated replacement values go: a blob file in `folder`,
+/// opened on the first one into `writer`, under the compaction's `runtime`
+/// snapshot like everything else the compaction writes.
+pub(crate) struct FilterBlobOutput<'a> {
+    pub folder: &'a Path,
+    pub writer: &'a mut Option<BlobFileWriter>,
+    pub runtime: &'a crate::runtime_config::RuntimeConfig,
+}
+
 /// Adapts a [`CompactionFilter`] to a [`StreamFilter`]
 //
 // NOTE: this slightly helps insulate CompactionStream from lifetime spam
@@ -208,6 +217,7 @@ pub(crate) struct StreamFilterAdapter<'a, 'b: 'a> {
     shared: AccessorShared<'a>,
     blob_opts: Option<&'a KvSeparationOptions>,
     blob_writer: &'a mut Option<BlobFileWriter>,
+    runtime: &'a crate::runtime_config::RuntimeConfig,
     ctx: &'a Context,
     counters: TransformCounters,
 }
@@ -217,8 +227,11 @@ impl<'a, 'b: 'a> StreamFilterAdapter<'a, 'b> {
         filter: Option<&'a mut (dyn CompactionFilter + 'b)>,
         opts: &'a Options,
         version: &'a Version,
-        blobs_folder: &'a Path,
-        blob_writer: &'a mut Option<BlobFileWriter>,
+        FilterBlobOutput {
+            folder,
+            writer,
+            runtime,
+        }: FilterBlobOutput<'a>,
         ctx: &'a Context,
         counters: TransformCounters,
     ) -> Self {
@@ -227,10 +240,11 @@ impl<'a, 'b: 'a> StreamFilterAdapter<'a, 'b> {
             shared: AccessorShared {
                 opts,
                 version,
-                blobs_folder,
+                blobs_folder: folder,
             },
             blob_opts: opts.config.kv_separation_opts.as_ref(),
-            blob_writer,
+            blob_writer: writer,
+            runtime,
             ctx,
             counters,
         }
@@ -257,7 +271,11 @@ impl<'a, 'b: 'a> StreamFilterAdapter<'a, 'b> {
         let writer = if let Some(writer) = self.blob_writer {
             writer
         } else {
-            // Instantiate writer as necessary
+            // Instantiate writer as necessary, under the compaction's snapshot:
+            // the SSTs it writes and the blob files its filter writes follow one
+            // configuration, and the compaction's hold on that snapshot keeps
+            // the dictionary these files name until they are installed.
+            let rc = self.runtime;
             let writer = BlobFileWriter::new(
                 self.shared.opts.blob_file_id_generator.clone(),
                 self.shared.blobs_folder,
@@ -266,7 +284,7 @@ impl<'a, 'b: 'a> StreamFilterAdapter<'a, 'b> {
                 self.shared.opts.config.fs.clone(),
             )?
             .use_target_size(blob_opts.file_target_size)
-            .use_compression(blob_opts.compression)
+            .use_compression(rc.blob_compression)
             .use_sync_mode(self.shared.opts.config.sync_mode);
 
             // A filter that rewrites a separated value writes a NEW blob file
@@ -274,9 +292,12 @@ impl<'a, 'b: 'a> StreamFilterAdapter<'a, 'b> {
             // dictionary to compress with, and the set to pin on the file it
             // produces. Without the first, a `ZstdDict` policy fails the write.
             #[cfg(zstd_any)]
-            let writer = writer
-                .use_zstd_dictionary(blob_opts.zstd_dictionary.clone())
-                .use_zstd_dictionaries(self.shared.opts.config.current_zstd_dictionaries());
+            let writer = {
+                let dicts = self.shared.opts.config.current_zstd_dictionaries();
+                writer
+                    .use_zstd_dictionary(dicts.for_compression(rc.blob_compression)?)
+                    .use_zstd_dictionaries(dicts)
+            };
 
             self.blob_writer.insert(writer)
         };

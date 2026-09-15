@@ -51,9 +51,8 @@ fn compaction_filter_gc_stats_change() -> lsm_tree::Result<()> {
             SequenceNumberCounter::default(),
             SequenceNumberCounter::default(),
         )
-        .with_kv_separation(Some(
-            KvSeparationOptions::default().compression(lsm_tree::CompressionType::None),
-        ))
+        .with_kv_separation(Some(KvSeparationOptions::default()))
+        .blob_compression(lsm_tree::CompressionType::None)
         .with_compaction_filter_factory(Some(Arc::new(MyFilterFactory)))
         .open()?;
 
@@ -136,9 +135,8 @@ fn compaction_filter_gc_stats_change_non_blob() -> lsm_tree::Result<()> {
             SequenceNumberCounter::default(),
             SequenceNumberCounter::default(),
         )
-        .with_kv_separation(Some(
-            KvSeparationOptions::default().compression(lsm_tree::CompressionType::None),
-        ))
+        .with_kv_separation(Some(KvSeparationOptions::default()))
+        .blob_compression(lsm_tree::CompressionType::None)
         .with_compaction_filter_factory(Some(Arc::new(MyFilterFactory)))
         .open()?;
 
@@ -213,11 +211,8 @@ fn compaction_filter_gc_stats_change_blob_writer_rotation() -> lsm_tree::Result<
             SequenceNumberCounter::default(),
             SequenceNumberCounter::default(),
         )
-        .with_kv_separation(Some(
-            KvSeparationOptions::default()
-                .file_target_size(1)
-                .compression(lsm_tree::CompressionType::None),
-        ))
+        .with_kv_separation(Some(KvSeparationOptions::default().file_target_size(1)))
+        .blob_compression(lsm_tree::CompressionType::None)
         .with_compaction_filter_factory(Some(Arc::new(MyFilterFactory)))
         .open()?;
 

@@ -71,7 +71,7 @@ tree.flush_active_memtable(0)?;
 ### Storage & encoding
 
 - Block-based tables with optional compression (none / LZ4 / Zstd) and prefix truncation.
-- Per-table data block size policy and per-table compression policy.
+- Per-table data block size policy, and compression policies for data blocks, index blocks and blob files that change on a live tree (`update_runtime_config`): every file records its own codec, so new writes and compaction take up the current one while existing files read as before.
 - Optional **zstd dictionary compression**, trained per-table or per-column for small (4-64 KiB) blocks and blob files.
 - Optional **columnar PAX block layout** (`columnar` feature): per-row-group column-major storage of key / seqno / value-type / value sub-columns, for column-projection pushdown, vectorized predicate scans, per-column dictionaries, and positional delete-bitmap MVCC.
 - Optional **block-level encryption at rest**: AES-256-GCM, key supplied by caller.

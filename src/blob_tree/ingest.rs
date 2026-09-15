@@ -45,7 +45,14 @@ impl<'a> BlobIngestion<'a> {
 
         let blob_file_size = kv.file_target_size;
 
-        let table = TableIngestion::new(&tree.index)?;
+        // One snapshot for the whole ingestion, blob files and index tables
+        // alike: an ingestion is one batch of files, written under one policy.
+        // The table ingestion holds it until `finish` has installed both, so a
+        // collection cannot take a dictionary it names in between.
+        let rc = tree.index.0.runtime_config.load_full();
+        let blob_compression = rc.blob_compression;
+
+        let table = TableIngestion::with_runtime_snapshot(&tree.index, &rc)?;
         let blob = BlobFileWriter::new(
             tree.index.0.blob_file_id_counter.clone(),
             tree.index.config.path.join(BLOBS_FOLDER),
@@ -54,16 +61,18 @@ impl<'a> BlobIngestion<'a> {
             tree.index.config.fs.clone(),
         )?
         .use_target_size(blob_file_size)
-        .use_compression(kv.compression)
+        .use_compression(blob_compression)
         .use_sync_mode(tree.index.config.sync_mode);
 
         // Ingestion writes blob files under the tree's own blob policy, so it
         // needs the dictionary to compress with and the set to pin on what it
         // produces. Without the first, a `ZstdDict` policy fails the write.
         #[cfg(zstd_any)]
-        let blob = blob
-            .use_zstd_dictionary(kv.zstd_dictionary.clone())
-            .use_zstd_dictionaries(tree.index.config.current_zstd_dictionaries());
+        let blob = {
+            let dicts = tree.index.config.current_zstd_dictionaries();
+            blob.use_zstd_dictionary(dicts.for_compression(blob_compression)?)
+                .use_zstd_dictionaries(dicts)
+        };
 
         let separation_threshold = kv.separation_threshold;
 
@@ -166,7 +175,7 @@ impl<'a> BlobIngestion<'a> {
     ///
     /// Will return `Err` if an IO error occurs.
     #[allow(clippy::significant_drop_tightening)]
-    pub fn finish(self) -> crate::Result<()> {
+    pub fn finish(mut self) -> crate::Result<()> {
         use crate::AbstractTree;
 
         let index = self.index().clone();
@@ -197,6 +206,10 @@ impl<'a> BlobIngestion<'a> {
         index.rotate_memtable();
         index.flush(&flush_lock, 0)?;
 
+        // The hold on the ingestion's dictionaries stays here until the files
+        // are installed.
+        let write_pin = core::mem::take(&mut self.table.write_pin);
+
         // Finalize the blob writer first, ensuring all large values are
         // written to blob files before we finalize the index tables that
         // reference them.
@@ -205,6 +218,9 @@ impl<'a> BlobIngestion<'a> {
         // Finalize the table writer, creating index tables with blob
         // indirections pointing to the blob files we just created.
         let results = self.table.writer.finish()?;
+
+        #[cfg(all(test, feature = "std"))]
+        index.config.fire_before_output_install();
 
         // Acquire locks for version registration on the index tree. We must
         // hold both the compaction state lock and version history lock to
@@ -309,6 +325,8 @@ impl<'a> BlobIngestion<'a> {
             // everything.
             crate::version::RetentionEffect::Keep,
         )?;
+        // The installed files name their dictionaries from here on.
+        drop(write_pin);
 
         // Perform maintenance on the version history (e.g., clean up old versions).
         // We use gc_watermark=0 since ingestion doesn't affect sealed memtables.

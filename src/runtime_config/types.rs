@@ -836,6 +836,41 @@ pub struct RuntimeConfig {
     /// threshold) in every level.
     pub delete_strategy: crate::config::DeleteStrategyPolicy,
 
+    /// Per-level compression of data blocks. A flush writes level 0's entry, a
+    /// compaction its destination level's.
+    ///
+    /// Takes effect on the next flush / compaction; existing SSTs keep the
+    /// codec they recorded and read as before, and compaction migrates data to
+    /// the current policy as it rewrites it. A `ZstdDict` entry names a
+    /// dictionary the tree must already hold (register it first with
+    /// `Tree::register_zstd_dictionary`); an update naming one it does not is
+    /// refused. Default: uncompressed at level 0 and LZ4 below it, or
+    /// uncompressed everywhere without the `lz4` feature.
+    ///
+    /// Seeded at open by [`crate::Config::data_block_compression_policy`], as
+    /// the other two compression settings are by their builders;
+    /// [`crate::Config::with_runtime_config`] leaves all three as the builders
+    /// set them.
+    pub data_block_compression_policy: crate::config::CompressionPolicy,
+
+    /// Per-level compression of index blocks, applied as
+    /// [`Self::data_block_compression_policy`] is. Index blocks never carry a
+    /// dictionary: a `ZstdDict` entry is written as plain zstd at its level.
+    /// Default: uncompressed.
+    pub index_block_compression_policy: crate::config::CompressionPolicy,
+
+    /// Compression of the values a KV-separated tree writes to blob files.
+    ///
+    /// Takes effect on the next blob file written: a flush, an ingestion, or a
+    /// compaction filter that rewrites values. Each blob file records its own
+    /// codec, so earlier files keep theirs and stay readable, and GC relocation
+    /// copies frames verbatim under the codec they were written with; a change
+    /// therefore reaches existing values only as they are rewritten. A
+    /// `ZstdDict` entry names a dictionary the tree must already hold, as for
+    /// data blocks. Unused by a standard tree. Default: LZ4, or uncompressed
+    /// without the `lz4` feature.
+    pub blob_compression: crate::CompressionType,
+
     /// Index-size threshold (bytes) at or below which an SST's block index
     /// is written single-level; above it the index spills to a two-level
     /// (partitioned) layout. A single-level index is one block reached by a
@@ -957,6 +992,20 @@ impl Default for RuntimeConfig {
             zone_map: false,
             columnar: false,
             delete_strategy: crate::config::DeleteStrategyPolicy::default(),
+            // Uncompressed at level 0: a flush is on the write path and its
+            // tables are the first to be compacted away.
+            #[cfg(feature = "lz4")]
+            data_block_compression_policy: crate::config::CompressionPolicy::new([
+                crate::CompressionType::None,
+                crate::CompressionType::Lz4,
+            ]),
+            #[cfg(not(feature = "lz4"))]
+            data_block_compression_policy: crate::config::CompressionPolicy::disabled(),
+            index_block_compression_policy: crate::config::CompressionPolicy::disabled(),
+            #[cfg(feature = "lz4")]
+            blob_compression: crate::CompressionType::Lz4,
+            #[cfg(not(feature = "lz4"))]
+            blob_compression: crate::CompressionType::None,
             index_partition_spill_threshold: crate::table::writer::DEFAULT_SPILL_THRESHOLD,
             disable_cow_on_sst_files: true,
             use_reflink_for_checkpoint: true,
@@ -990,6 +1039,50 @@ impl RuntimeConfig {
     #[must_use]
     pub const fn manifest_ecc(&self) -> bool {
         self.page_ecc
+    }
+
+    /// The dictionary ids new files may be written against under this
+    /// snapshot: every one the data block policy names, and the blob
+    /// compression's when `kv_separated`.
+    ///
+    /// Index blocks are left out: the writer downgrades a `ZstdDict` index
+    /// entry to plain zstd, so no index block ever names a dictionary.
+    #[cfg(zstd_any)]
+    pub(crate) fn write_dict_ids(&self, kv_separated: bool) -> impl Iterator<Item = u32> + '_ {
+        let blob = kv_separated.then_some(self.blob_compression);
+        self.data_block_compression_policy
+            .iter()
+            .copied()
+            .chain(blob)
+            .filter_map(|ct| match ct {
+                crate::CompressionType::ZstdDict { dict_id, .. } => Some(dict_id),
+                _ => None,
+            })
+    }
+
+    /// Refuses a snapshot whose policies name a dictionary `dicts` does not
+    /// hold, before anything is written under it.
+    ///
+    /// # Errors
+    ///
+    /// [`crate::Error::ZstdDictMismatch`] naming the first such id, with
+    /// `got: None`: the tree has no dictionary under it.
+    #[cfg(zstd_any)]
+    pub(crate) fn check_dictionaries(
+        &self,
+        kv_separated: bool,
+        dicts: &crate::compression::ZstdDictionaries,
+    ) -> crate::Result<()> {
+        match self
+            .write_dict_ids(kv_separated)
+            .find(|id| dicts.get(*id).is_none())
+        {
+            Some(expected) => Err(crate::Error::ZstdDictMismatch {
+                expected,
+                got: None,
+            }),
+            None => Ok(()),
+        }
     }
 }
 

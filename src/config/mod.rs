@@ -235,12 +235,12 @@ impl TryFrom<u8> for TreeType {
 const DEFAULT_FILE_FOLDER: &str = ".lsm.data";
 
 /// Options for key-value separation
+///
+/// Blob compression is not among them: it changes on a live tree, so it lives in
+/// [`RuntimeConfig::blob_compression`](crate::runtime_config::RuntimeConfig::blob_compression),
+/// seeded by [`Config::blob_compression`].
 #[derive(Clone, Debug, PartialEq)]
 pub struct KvSeparationOptions {
-    /// What type of compression is used for blobs
-    #[doc(hidden)]
-    pub compression: CompressionType,
-
     /// Blob file target size in bytes
     #[doc(hidden)]
     pub file_target_size: u64,
@@ -262,10 +262,8 @@ pub struct KvSeparationOptions {
     #[doc(hidden)]
     pub scan_prefetch: u16,
 
-    /// Pre-trained zstd dictionary for blob-file dictionary compression.
-    ///
-    /// Required when `compression` is [`CompressionType::ZstdDict`].
-    /// The `dict_id` in the compression type must match [`ZstdDictionary::id`](crate::ZstdDictionary::id).
+    /// A zstd dictionary to register with the tree at open, for the blob
+    /// compression to name. See [`Self::dict`].
     #[cfg(zstd_any)]
     #[doc(hidden)]
     pub zstd_dictionary: Option<alloc::sync::Arc<crate::compression::ZstdDictionary>>,
@@ -274,12 +272,6 @@ pub struct KvSeparationOptions {
 impl Default for KvSeparationOptions {
     fn default() -> Self {
         Self {
-            #[cfg(feature="lz4")]
-            compression:   CompressionType::Lz4,
-
-            #[cfg(not(feature="lz4"))]
-            compression: CompressionType::None,
-
             file_target_size: /* 64 MiB */ 64 * 1_024 * 1_024,
             separation_threshold: /* 1 KiB */ 1_024,
 
@@ -295,13 +287,6 @@ impl Default for KvSeparationOptions {
 }
 
 impl KvSeparationOptions {
-    /// Sets the blob compression method.
-    #[must_use]
-    pub fn compression(mut self, compression: CompressionType) -> Self {
-        self.compression = compression;
-        self
-    }
-
     /// Sets the target size of blob files.
     ///
     /// Smaller blob files allow more granular garbage collection
@@ -376,14 +361,14 @@ impl KvSeparationOptions {
         self
     }
 
-    /// Sets the zstd dictionary for blob-file dictionary compression.
+    /// Supplies a zstd dictionary for the blob compression to name.
     ///
-    /// Required when [`compression`](Self::compression) is set to
-    /// [`CompressionType::ZstdDict`].  The `dict_id` encoded in the
-    /// compression type must equal [`ZstdDictionary::id()`](crate::ZstdDictionary::id) of the
-    /// supplied dictionary; [`Config::open`] will return
-    /// [`Error::ZstdDictMismatch`](crate::Error::ZstdDictMismatch) if
-    /// they disagree.
+    /// The open registers it with the tree, which stores it, so a later open
+    /// needs nothing supplied; this is also how the bytes reach a tree the
+    /// first time. Which dictionary blob files are written against is decided
+    /// by [`Config::blob_compression`]: a [`CompressionType::ZstdDict`] there
+    /// names one by id, and [`Config::open`] refuses one the tree does not hold
+    /// with [`Error::ZstdDictMismatch`](crate::Error::ZstdDictMismatch).
     #[cfg(zstd_any)]
     #[must_use]
     pub fn dict(
@@ -439,12 +424,6 @@ pub struct Config {
     ///
     /// Once set, the level count is fixed (in the "manifest" file)
     pub level_count: u8,
-
-    /// What type of compression is used for data blocks
-    pub data_block_compression_policy: CompressionPolicy,
-
-    /// What type of compression is used for index blocks
-    pub index_block_compression_policy: CompressionPolicy,
 
     /// Restart interval inside data blocks
     pub data_block_restart_interval_policy: RestartIntervalPolicy,
@@ -691,16 +670,22 @@ pub struct Config {
     #[cfg(all(test, feature = "std"))]
     pub(crate) fail_tight_blob_reopen: Arc<core::sync::atomic::AtomicBool>,
 
-    /// The dictionary NEW blocks are compressed against, when the compression
-    /// policy asks for [`CompressionType::ZstdDict`].
+    /// Test-only failpoint: run once, then disarmed, between the moment a write
+    /// has finished its output files and the moment it installs them (a flush,
+    /// an ingestion, a parallel or tight-space compaction), so a test can put a
+    /// concurrent operation into that window deterministically. Behind
+    /// `cfg(test)`, never compiled into release builds.
+    #[cfg(all(test, feature = "std"))]
+    pub(crate) before_output_install: Arc<std::sync::Mutex<Option<OutputInstallHook>>>,
+
+    /// A dictionary supplied for the data block policy to name. The open
+    /// registers it with the tree, so it survives the reopen without being
+    /// supplied again.
     ///
-    /// One, because a block is written against exactly one dictionary. Reading
-    /// is the other direction and takes the whole set
-    /// ([`Self::zstd_dictionaries`]): a tree can hold tables written against
-    /// several, and each resolves to the one it names.
-    ///
-    /// Supplying a dictionary here registers it with the tree, so it survives
-    /// the reopen without being supplied again.
+    /// Supply only: which dictionary new blocks are written against is the
+    /// policy's to say, by id, and a writer resolves that id from
+    /// [`Self::zstd_dictionaries`] when it starts. A slot filled at open could
+    /// not follow a policy that changes on a live tree.
     #[cfg(zstd_any)]
     pub(crate) zstd_dictionary: Option<Arc<crate::compression::ZstdDictionary>>,
 
@@ -786,17 +771,6 @@ impl Default for Config {
             index_block_partition_size_policy: BlockSizePolicy::all(4_096), // TODO: implement
             filter_block_partition_size_policy: BlockSizePolicy::all(4_096), // TODO: implement
 
-            data_block_compression_policy: ({
-                #[cfg(feature = "lz4")]
-                let c = CompressionPolicy::new([CompressionType::None, CompressionType::Lz4]);
-
-                #[cfg(not(feature = "lz4"))]
-                let c = CompressionPolicy::new([CompressionType::None]);
-
-                c
-            }),
-            index_block_compression_policy: CompressionPolicy::all(CompressionType::None),
-
             data_block_hash_ratio_policy: HashRatioPolicy::all(0.0),
 
             locator_policy: LocatorPolicy::block_level(),
@@ -852,6 +826,34 @@ impl Default for Config {
             fail_tight_after_first_slice: Arc::new(core::sync::atomic::AtomicBool::new(false)),
             #[cfg(all(test, feature = "std"))]
             fail_tight_blob_reopen: Arc::new(core::sync::atomic::AtomicBool::new(false)),
+            #[cfg(all(test, feature = "std"))]
+            before_output_install: Arc::new(std::sync::Mutex::new(None)),
+        }
+    }
+}
+
+/// The callback the [`Config::before_output_install`] failpoint runs.
+#[cfg(all(test, feature = "std"))]
+pub(crate) type OutputInstallHook = Box<dyn FnOnce() + Send>;
+
+#[cfg(all(test, feature = "std"))]
+impl Config {
+    /// Arms the [`Self::before_output_install`] failpoint with `hook`.
+    #[cfg(zstd_any)]
+    pub(crate) fn arm_before_output_install(&self, hook: impl FnOnce() + Send + 'static) {
+        #[expect(clippy::unwrap_used, reason = "test-only seam")]
+        self.before_output_install
+            .lock()
+            .unwrap()
+            .replace(Box::new(hook));
+    }
+
+    /// Runs the [`Self::before_output_install`] failpoint once, if armed.
+    pub(crate) fn fire_before_output_install(&self) {
+        #[expect(clippy::unwrap_used, reason = "test-only seam")]
+        let hook = self.before_output_install.lock().unwrap().take();
+        if let Some(hook) = hook {
+            hook();
         }
     }
 }
@@ -1010,8 +1012,7 @@ impl Config {
 
     /// Gives this config a registry of its OWN, holding every dictionary the
     /// tree at [`Self::path`] stores plus the ones supplied through
-    /// [`Self::zstd_dictionary`] and the KV-separation options, and fills either
-    /// write slot the caller left empty from what the tree already holds.
+    /// [`Self::zstd_dictionary`] and the KV-separation options.
     ///
     /// Every path that opens a table has to call this first: a table resolves
     /// the dictionary id it recorded against this set, so an unloaded one fails
@@ -1064,18 +1065,17 @@ impl Config {
         Ok(damaged)
     }
 
-    /// Joins the supplied dictionaries to `dicts`, fills the empty write slots
-    /// from it, and installs it as this config's own registry.
+    /// Joins the supplied dictionaries to `dicts` and installs it as this
+    /// config's own registry.
+    ///
+    /// The supplied ones join the SAME set the tree's stored ones are in, and
+    /// every read and write resolves out of it by id: a table or blob file by
+    /// the id it recorded, a writer by the id its policy names.
     #[cfg(zstd_any)]
     fn install_zstd_dictionary_set(&mut self, mut dicts: crate::compression::ZstdDictionaries) {
         if let Some(supplied) = self.zstd_dictionary.clone() {
             dicts = dicts.with(supplied);
         }
-        // The blob dictionary joins the SAME set, and blob reads resolve out of
-        // it by the id each file recorded (`vlog::blob_file::Reader::with_dicts`),
-        // never out of the write slot below. The two are separate questions:
-        // rotating the blob dictionary changes what the next file is written
-        // against, and leaves every earlier file resolving to its own.
         if let Some(supplied) = self
             .kv_separation_opts
             .as_ref()
@@ -1083,145 +1083,7 @@ impl Config {
         {
             dicts = dicts.with(supplied);
         }
-
-        // Fill an empty WRITE slot from what the tree holds. Supplying the
-        // bytes once is the point of storing them, and that has to cover
-        // writing too: a reopen keeps its compression policy, the policy names
-        // a dictionary by id, and the tree can answer that id itself. Without
-        // this the reopen is refused by the validation below even though the
-        // file is right there, and the caller is back to carrying the bytes
-        // forever. A slot the caller DID fill is left alone: it is the caller's
-        // choice of what new blocks are written against.
-        if self.zstd_dictionary.is_none() {
-            self.zstd_dictionary =
-                Self::policy_dictionary(&dicts, self.data_block_compression_policy.iter().copied());
-        }
-        if let Some(kv_opts) = &mut self.kv_separation_opts
-            && kv_opts.zstd_dictionary.is_none()
-        {
-            kv_opts.zstd_dictionary =
-                Self::policy_dictionary(&dicts, core::iter::once(kv_opts.compression));
-        }
-
         self.zstd_dictionaries = Arc::new(arc_swap::ArcSwap::from_pointee(dicts));
-    }
-
-    /// The dictionary `policy` names, if the set holds it.
-    ///
-    /// A policy may name several ids across levels; the FIRST one the tree can
-    /// answer wins, since a block is written against exactly one dictionary and
-    /// a policy that names two the tree holds is already ambiguous at the
-    /// validation below.
-    #[cfg(zstd_any)]
-    fn policy_dictionary(
-        dicts: &crate::compression::ZstdDictionaries,
-        mut policy: impl Iterator<Item = CompressionType>,
-    ) -> Option<Arc<crate::compression::ZstdDictionary>> {
-        policy.find_map(|ct| match ct {
-            CompressionType::ZstdDict { dict_id, .. } => dicts.get(dict_id).cloned(),
-            _ => None,
-        })
-    }
-
-    /// The dictionary ids NEW blocks may still be written against: every one a
-    /// compression policy names, plus the supplied dictionary itself.
-    ///
-    /// A collection has to count these as referenced. "No table uses it" is a
-    /// statement about the past; a dictionary the write policy names is one the
-    /// next flush compresses against, and dropping its registration is not
-    /// recoverable — nothing puts the id back once tables start naming it, so a
-    /// later pass unlinks the file out from under them.
-    ///
-    /// Index blocks are excluded deliberately, matching
-    /// [`Self::validate_zstd_dictionary`]: the writer downgrades a `ZstdDict`
-    /// index policy to plain zstd, so no index block ever names a dictionary.
-    #[cfg(zstd_any)]
-    pub(crate) fn write_referenced_dict_ids(&self) -> alloc::vec::Vec<crate::file::DictId> {
-        let mut ids = alloc::vec::Vec::new();
-        let mut push = |id: crate::file::DictId| {
-            if !ids.contains(&id) {
-                ids.push(id);
-            }
-        };
-
-        for ct in self.data_block_compression_policy.iter() {
-            if let &CompressionType::ZstdDict { dict_id, .. } = ct {
-                push(dict_id);
-            }
-        }
-        if let Some(kv_opts) = &self.kv_separation_opts {
-            if let CompressionType::ZstdDict { dict_id, .. } = kv_opts.compression {
-                push(dict_id);
-            }
-            if let Some(dict) = &kv_opts.zstd_dictionary {
-                push(dict.id());
-            }
-        }
-        if let Some(dict) = &self.zstd_dictionary {
-            push(dict.id());
-        }
-        ids
-    }
-
-    /// Validates that every `ZstdDict` entry in compression policies references
-    /// a `dict_id` that matches the configured dictionary. Catches mismatches
-    /// at open time rather than at first block write/read.
-    #[cfg(zstd_any)]
-    pub(crate) fn validate_zstd_dictionary(&self) -> crate::Result<()> {
-        let dict_id = self.zstd_dictionary.as_ref().map(|d| d.id());
-
-        // NOTE: Only data block policies are validated. Index blocks never
-        // carry a dictionary — Writer::use_index_block_compression() downgrades
-        // ZstdDict to plain Zstd. Validating index policies here would reject
-        // configs that use ZstdDict solely for index blocks even though the
-        // writer handles them correctly.
-        for ct in self.data_block_compression_policy.iter() {
-            if let &CompressionType::ZstdDict {
-                dict_id: required, ..
-            } = ct
-            {
-                match dict_id {
-                    None => {
-                        return Err(crate::Error::ZstdDictMismatch {
-                            expected: required,
-                            got: None,
-                        });
-                    }
-                    Some(actual) if actual != required => {
-                        return Err(crate::Error::ZstdDictMismatch {
-                            expected: required,
-                            got: Some(actual),
-                        });
-                    }
-                    _ => {}
-                }
-            }
-        }
-
-        // Blob files with ZstdDict compression must have a matching dictionary.
-        if let Some(ref kv_opts) = self.kv_separation_opts
-            && let CompressionType::ZstdDict {
-                dict_id: required, ..
-            } = kv_opts.compression
-        {
-            match kv_opts.zstd_dictionary.as_ref().map(|d| d.id()) {
-                None => {
-                    return Err(crate::Error::ZstdDictMismatch {
-                        expected: required,
-                        got: None,
-                    });
-                }
-                Some(actual) if actual != required => {
-                    return Err(crate::Error::ZstdDictMismatch {
-                        expected: required,
-                        got: Some(actual),
-                    });
-                }
-                _ => {}
-            }
-        }
-
-        Ok(())
     }
 
     /// Like [`Config::new`], but accepts pre-built shared generators.
@@ -1554,6 +1416,17 @@ impl Config {
     /// `RuntimeConfigHandle` exposed via
     /// [`crate::Tree::runtime_config`].
     ///
+    /// Replaces the snapshot, including what the builders that seed it set
+    /// earlier ([`Self::ecc_scheme`] and the other `RuntimeConfig`-backed
+    /// builders), EXCEPT the three compression policies: those keep what
+    /// [`Self::data_block_compression_policy`],
+    /// [`Self::index_block_compression_policy`] and [`Self::blob_compression`]
+    /// set, in whichever order they are called, and the policies in `runtime`
+    /// are ignored. A caller that set its compression through the builders and
+    /// its runtime toggles through this does not lose the former to the
+    /// latter's defaults. On a live tree, all three change through
+    /// [`crate::Tree::update_runtime_config`].
+    ///
     /// **Manifest-hardening toggles** in the supplied snapshot
     /// that are currently wired through the writer
     /// (`manifest_footer_mirror`, `page_ecc` *as consumed by
@@ -1577,7 +1450,12 @@ impl Config {
     /// runtime handle. Wiring through SST emission is a follow-up.
     #[must_use]
     pub fn with_runtime_config(mut self, runtime: crate::runtime_config::RuntimeConfig) -> Self {
-        self.initial_runtime_config = runtime;
+        let kept = core::mem::replace(&mut self.initial_runtime_config, runtime);
+        self.initial_runtime_config.data_block_compression_policy =
+            kept.data_block_compression_policy;
+        self.initial_runtime_config.index_block_compression_policy =
+            kept.index_block_compression_policy;
+        self.initial_runtime_config.blob_compression = kept.blob_compression;
         self
     }
 
@@ -1670,17 +1548,37 @@ impl Config {
         self
     }
 
-    /// Sets the compression method for data blocks.
+    /// Sets the compression the tree starts with for data blocks.
+    ///
+    /// The initial value of
+    /// [`RuntimeConfig::data_block_compression_policy`](crate::runtime_config::RuntimeConfig::data_block_compression_policy),
+    /// which a live tree changes with [`crate::Tree::update_runtime_config`].
     #[must_use]
     pub fn data_block_compression_policy(mut self, policy: CompressionPolicy) -> Self {
-        self.data_block_compression_policy = policy;
+        self.initial_runtime_config.data_block_compression_policy = policy;
         self
     }
 
-    /// Sets the compression method for index blocks.
+    /// Sets the compression the tree starts with for index blocks.
+    ///
+    /// The initial value of
+    /// [`RuntimeConfig::index_block_compression_policy`](crate::runtime_config::RuntimeConfig::index_block_compression_policy),
+    /// which a live tree changes with [`crate::Tree::update_runtime_config`].
     #[must_use]
     pub fn index_block_compression_policy(mut self, policy: CompressionPolicy) -> Self {
-        self.index_block_compression_policy = policy;
+        self.initial_runtime_config.index_block_compression_policy = policy;
+        self
+    }
+
+    /// Sets the compression a KV-separated tree starts with for blob files.
+    ///
+    /// The initial value of
+    /// [`RuntimeConfig::blob_compression`](crate::runtime_config::RuntimeConfig::blob_compression),
+    /// which a live tree changes with [`crate::BlobTree::update_runtime_config`].
+    /// A standard tree ignores it.
+    #[must_use]
+    pub fn blob_compression(mut self, compression: CompressionType) -> Self {
+        self.initial_runtime_config.blob_compression = compression;
         self
     }
 
@@ -1929,11 +1827,15 @@ impl Config {
         self
     }
 
-    /// Sets the pre-trained zstd dictionary for dictionary compression.
+    /// Supplies a pre-trained zstd dictionary for the data block policy to
+    /// name.
     ///
-    /// When set, data blocks using [`CompressionType::ZstdDict`] will be
-    /// compressed and decompressed with this dictionary. The dictionary
-    /// should be trained on representative data samples for best results.
+    /// The open registers it with the tree, which stores it, so a later open
+    /// needs nothing supplied. Which blocks are written against it is decided
+    /// by the policy: a [`CompressionType::ZstdDict`] entry names a dictionary
+    /// by id, and every block reads back through the id it recorded. The
+    /// dictionary should be trained on representative data samples for best
+    /// results.
     ///
     /// Create a dictionary with [`ZstdDictionary::new`](crate::ZstdDictionary::new),
     /// then use [`CompressionType::zstd_dict`] to create a matching

@@ -18,7 +18,11 @@ use core::ops::RangeBounds;
 
 pub type RangeItem = crate::Result<KvPair>;
 
-type FlushToTablesResult = (Vec<Table>, Option<Vec<BlobFile>>);
+type FlushToTablesResult = (
+    Vec<Table>,
+    Option<Vec<BlobFile>>,
+    crate::runtime_config::WritePin,
+);
 
 /// Summary of a checkpoint produced by
 /// [`AbstractTree::create_checkpoint`].
@@ -562,7 +566,7 @@ pub trait AbstractTree: sealed::Sealed {
         // Clone needed: flush_to_tables_with_rt consumes the Vec, but on the
         // RT-only path (no KV data, tables.is_empty()) we re-insert RTs into the
         // active memtable. Flush is infrequent and RT count is small.
-        if let Some((tables, blob_files)) =
+        if let Some((tables, blob_files, write_pin)) =
             self.flush_to_tables_with_rt(stream, range_tombstones.clone())?
         {
             // If no tables were produced (RT-only memtable), re-insert RTs
@@ -575,6 +579,9 @@ pub trait AbstractTree: sealed::Sealed {
                 }
             }
 
+            #[cfg(all(test, feature = "std"))]
+            self.tree_config().fire_before_output_install();
+
             self.register_tables(
                 &tables,
                 blob_files.as_deref(),
@@ -583,6 +590,8 @@ pub trait AbstractTree: sealed::Sealed {
                 seqno_threshold,
                 gc_balance.load(core::sync::atomic::Ordering::Relaxed) > 0,
             )?;
+            // The installed files name their dictionaries from here on.
+            drop(write_pin);
         }
 
         Ok(Some(flushed_size))
@@ -798,6 +807,11 @@ pub trait AbstractTree: sealed::Sealed {
     ///
     /// This method will not make the table immediately available,
     /// use [`AbstractTree::register_tables`] for that.
+    ///
+    /// Alongside the files comes a [`WritePin`](crate::runtime_config::WritePin)
+    /// on the compression dictionaries they were written against. Keep it until
+    /// `register_tables` returns: until then no installed file names those
+    /// dictionaries, and a collection in between would take them.
     ///
     /// # Errors
     ///

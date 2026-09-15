@@ -391,17 +391,21 @@ mod zstd_dict {
     // Blob-file (KV-separation) tests
     // -------------------------------------------------------------------------
 
-    /// Build KvSeparationOptions that force every value into a blob file,
-    /// compress blobs with ZstdDict, and attach the matching dictionary.
-    fn make_blob_opts(
+    /// `config` as a blob tree that forces every value into a blob file,
+    /// compresses blobs with `compression`, and supplies `dict` for it.
+    fn with_blob_dict(
+        config: Config,
         compression: lsm_tree::CompressionType,
         dict: Arc<lsm_tree::ZstdDictionary>,
-    ) -> lsm_tree::KvSeparationOptions {
-        lsm_tree::KvSeparationOptions::default()
-            .compression(compression)
-            // separation_threshold = 1 forces every non-empty value into a blob file
-            .separation_threshold(1)
-            .dict(dict)
+    ) -> Config {
+        config
+            .with_kv_separation(Some(
+                lsm_tree::KvSeparationOptions::default()
+                    // separation_threshold = 1 forces every non-empty value into a blob file
+                    .separation_threshold(1)
+                    .dict(dict),
+            ))
+            .blob_compression(compression)
     }
 
     #[test]
@@ -420,9 +424,8 @@ mod zstd_dict {
         let big_value = b"blob-value-".repeat(20);
 
         {
-            let tree = make_config(dir.path())
-                .with_kv_separation(Some(make_blob_opts(compression, Arc::new(dict))))
-                .open()?;
+            let tree =
+                with_blob_dict(make_config(dir.path()), compression, Arc::new(dict)).open()?;
             for i in 0u32..50 {
                 let key = format!("key-{i:04}");
                 tree.insert(key.as_bytes(), &big_value, i.into());
@@ -447,10 +450,9 @@ mod zstd_dict {
         // files.
         let restored = make_config(&checkpoint)
             .with_kv_separation(Some(
-                lsm_tree::KvSeparationOptions::default()
-                    .separation_threshold(1)
-                    .compression(compression),
+                lsm_tree::KvSeparationOptions::default().separation_threshold(1),
             ))
+            .blob_compression(compression)
             .open()?;
         for i in 0u32..50 {
             let key = format!("key-{i:04}");
@@ -473,9 +475,7 @@ mod zstd_dict {
         let compression = lsm_tree::CompressionType::zstd_dict(3, dict.id())?;
         let dict_arc = Arc::new(dict);
 
-        let tree = make_config(dir.path())
-            .with_kv_separation(Some(make_blob_opts(compression, dict_arc)))
-            .open()?;
+        let tree = with_blob_dict(make_config(dir.path()), compression, dict_arc).open()?;
 
         let big_value = b"blob-value-".repeat(20);
 
@@ -515,9 +515,7 @@ mod zstd_dict {
         let compression = lsm_tree::CompressionType::zstd_dict(3, dict.id())?;
         let dict_arc = Arc::new(dict);
 
-        let tree = make_config(dir.path())
-            .with_kv_separation(Some(make_blob_opts(compression, dict_arc)))
-            .open()?;
+        let tree = with_blob_dict(make_config(dir.path()), compression, dict_arc).open()?;
 
         let big_value = b"compacted-blob-value-".repeat(15);
 
@@ -558,19 +556,18 @@ mod zstd_dict {
 
     #[test]
     fn blob_zstd_dict_missing_at_open_is_rejected() -> lsm_tree::Result<()> {
-        // ZstdDict compression configured for blobs, but no dictionary provided at open.
-        // Config::validate_zstd_dictionary must catch this before any I/O.
+        // ZstdDict compression configured for blobs, but no dictionary provided
+        // at open and none stored: the open must refuse before any I/O.
         let dir = tempfile::tempdir()?;
         let dict = make_test_dictionary();
         let compression = lsm_tree::CompressionType::zstd_dict(3, dict.id())?;
 
         let result = make_config(dir.path())
             .with_kv_separation(Some(
-                lsm_tree::KvSeparationOptions::default()
-                    .compression(compression)
-                    .separation_threshold(1),
+                lsm_tree::KvSeparationOptions::default().separation_threshold(1),
                 // deliberately omit .dict(...)
             ))
+            .blob_compression(compression)
             .open();
 
         let expected_id = dict.id();
@@ -588,33 +585,27 @@ mod zstd_dict {
 
     #[test]
     fn blob_zstd_dict_id_mismatch_at_open_is_rejected() -> lsm_tree::Result<()> {
-        // dict_id in CompressionType does not match the actual dictionary provided.
+        // dict_id in CompressionType does not match the dictionary provided. The
+        // provided one is registered, but the compression names another id,
+        // which the tree does not hold, so the open refuses it by that id.
         let dir = tempfile::tempdir()?;
         let dict = make_test_dictionary();
         let wrong_dict = ZstdDictionary::new(b"entirely different content for wrong dict");
         // compression claims to need wrong_dict.id(), but we provide dict
         let expected_id = wrong_dict.id();
-        let provided_id = dict.id();
         let compression = lsm_tree::CompressionType::zstd_dict(3, expected_id)?;
 
-        let result = make_config(dir.path())
-            .with_kv_separation(Some(
-                lsm_tree::KvSeparationOptions::default()
-                    .compression(compression)
-                    .separation_threshold(1)
-                    .dict(Arc::new(dict)),
-            ))
-            .open();
+        let result = with_blob_dict(make_config(dir.path()), compression, Arc::new(dict)).open();
 
         assert!(
             matches!(
                 result,
                 Err(lsm_tree::Error::ZstdDictMismatch {
                     expected,
-                    got: Some(actual),
-                }) if expected == expected_id && actual == provided_id
+                    got: None,
+                }) if expected == expected_id
             ),
-            "expected ZstdDictMismatch{{expected: {expected_id}, got: Some({provided_id})}}",
+            "expected ZstdDictMismatch{{expected: {expected_id}, got: None}}",
         );
 
         Ok(())
@@ -630,9 +621,7 @@ mod zstd_dict {
         let compression = lsm_tree::CompressionType::zstd_dict(3, dict.id())?;
         let dict_arc = Arc::new(dict);
 
-        let tree = make_config(dir.path())
-            .with_kv_separation(Some(make_blob_opts(compression, dict_arc)))
-            .open()?;
+        let tree = with_blob_dict(make_config(dir.path()), compression, dict_arc).open()?;
 
         let big_value = b"range-blob-value-".repeat(10);
 
@@ -683,9 +672,7 @@ mod zstd_dict {
         let compression = lsm_tree::CompressionType::zstd_dict(3, dict.id())?;
         let dict_arc = Arc::new(dict);
 
-        let tree = make_config(dir.path())
-            .with_kv_separation(Some(make_blob_opts(compression, dict_arc)))
-            .open()?;
+        let tree = with_blob_dict(make_config(dir.path()), compression, dict_arc).open()?;
 
         let big_value = b"multi-get-blob-value-".repeat(10);
 
@@ -889,12 +876,12 @@ mod zstd_dict {
         let big_value = b"blob-value-".repeat(20);
 
         {
-            let tree = make_config(dir.path())
-                .with_kv_separation(Some(make_blob_opts(
-                    CompressionType::zstd_dict(3, first.id())?,
-                    Arc::new(first),
-                )))
-                .open()?;
+            let tree = with_blob_dict(
+                make_config(dir.path()),
+                CompressionType::zstd_dict(3, first.id())?,
+                Arc::new(first),
+            )
+            .open()?;
             for i in 0u32..50 {
                 let key = format!("first-{i:04}");
                 tree.insert(key.as_bytes(), &big_value, i.into());
@@ -906,12 +893,12 @@ mod zstd_dict {
         // Reopened under a DIFFERENT dictionary: the new one is what new blob
         // files are written against, the old one is still what the old ones
         // resolve to. Both are in the tree's set, read from its own folder.
-        let tree = make_config(dir.path())
-            .with_kv_separation(Some(make_blob_opts(
-                CompressionType::zstd_dict(3, second.id())?,
-                Arc::new(second),
-            )))
-            .open()?;
+        let tree = with_blob_dict(
+            make_config(dir.path()),
+            CompressionType::zstd_dict(3, second.id())?,
+            Arc::new(second),
+        )
+        .open()?;
         for i in 0u32..50 {
             let key = format!("second-{i:04}");
             tree.insert(key.as_bytes(), &big_value, (1000 + i).into());
@@ -964,12 +951,12 @@ mod zstd_dict {
         let big_value = b"blob-value-".repeat(20);
 
         {
-            let tree = make_config(dir.path())
-                .with_kv_separation(Some(make_blob_opts(
-                    CompressionType::zstd_dict(3, dict_id)?,
-                    Arc::new(dict),
-                )))
-                .open()?;
+            let tree = with_blob_dict(
+                make_config(dir.path()),
+                CompressionType::zstd_dict(3, dict_id)?,
+                Arc::new(dict),
+            )
+            .open()?;
             for i in 0u32..50 {
                 let key = format!("key-{i:04}");
                 tree.insert(key.as_bytes(), &big_value, i.into());
@@ -1031,12 +1018,16 @@ mod zstd_dict {
         let replacement = b"second-generation-value-".repeat(15);
 
         {
+            let compression = CompressionType::zstd_dict(3, dict.id())?;
             let tree = make_config(dir.path())
                 .with_kv_separation(Some(
-                    make_blob_opts(CompressionType::zstd_dict(3, dict.id())?, Arc::new(dict))
+                    lsm_tree::KvSeparationOptions::default()
+                        .separation_threshold(1)
+                        .dict(Arc::new(dict))
                         .staleness_threshold(0.0)
                         .age_cutoff(1.0),
                 ))
+                .blob_compression(compression)
                 .open()?;
             for i in 0u32..50 {
                 let key = format!("key-{i:04}");
@@ -1130,12 +1121,12 @@ mod zstd_dict {
         let big_value = b"blob-value-".repeat(20);
 
         {
-            let tree = make_config(dir.path())
-                .with_kv_separation(Some(make_blob_opts(
-                    CompressionType::zstd_dict(3, dict_id)?,
-                    Arc::new(dict),
-                )))
-                .open()?;
+            let tree = with_blob_dict(
+                make_config(dir.path()),
+                CompressionType::zstd_dict(3, dict_id)?,
+                Arc::new(dict),
+            )
+            .open()?;
             for i in 0u32..20 {
                 let key = format!("key-{i:04}");
                 tree.insert(key.as_bytes(), &big_value, i.into());
@@ -1617,12 +1608,12 @@ mod zstd_dict {
         let dict_id = dict.id();
         let big_value = b"blob-value-".repeat(20);
         {
-            let tree = make_config(dir)
-                .with_kv_separation(Some(make_blob_opts(
-                    CompressionType::zstd_dict(3, dict_id)?,
-                    Arc::new(dict),
-                )))
-                .open()?;
+            let tree = with_blob_dict(
+                make_config(dir),
+                CompressionType::zstd_dict(3, dict_id)?,
+                Arc::new(dict),
+            )
+            .open()?;
             for i in 0u32..20 {
                 let key = format!("key-{i:04}");
                 tree.insert(key.as_bytes(), &big_value, i.into());

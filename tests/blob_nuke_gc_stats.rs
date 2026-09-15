@@ -17,9 +17,8 @@ fn blob_tree_nuke_gc_stats() -> lsm_tree::Result<()> {
             SequenceNumberCounter::default(),
             SequenceNumberCounter::default(),
         )
-        .with_kv_separation(Some(
-            KvSeparationOptions::default().compression(lsm_tree::CompressionType::None),
-        ))
+        .with_kv_separation(Some(KvSeparationOptions::default()))
+        .blob_compression(lsm_tree::CompressionType::None)
         .open()?;
 
         assert!(tree.get("big", SeqNo::MAX)?.is_none());
@@ -69,9 +68,8 @@ fn blob_tree_nuke_gc_stats_multi() -> lsm_tree::Result<()> {
             SequenceNumberCounter::default(),
             SequenceNumberCounter::default(),
         )
-        .with_kv_separation(Some(
-            KvSeparationOptions::default().compression(lsm_tree::CompressionType::None),
-        ))
+        .with_kv_separation(Some(KvSeparationOptions::default()))
+        .blob_compression(lsm_tree::CompressionType::None)
         .open()?;
 
         assert!(tree.get("big", SeqNo::MAX)?.is_none());

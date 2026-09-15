@@ -11309,12 +11309,12 @@ fn a_repair_without_the_dictionary_never_discards_the_blob_file() -> crate::Resu
         .with_kv_separation(Some(
             KvSeparationOptions::default()
                 .separation_threshold(16)
-                .compression(CompressionType::ZstdDict {
-                    level: 3,
-                    dict_id: dict.id(),
-                })
                 .dict(Arc::clone(&dict)),
         ))
+        .blob_compression(CompressionType::ZstdDict {
+            level: 3,
+            dict_id: dict.id(),
+        })
     };
     {
         let tree = match with_dict().open()? {
