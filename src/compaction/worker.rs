@@ -618,28 +618,44 @@ fn collect_version_tombstones(version: &Version) -> Vec<crate::range_tombstone::
 /// Whether this compaction holds every surviving version of the keys it reads,
 /// so that a key missing from its inputs is genuinely absent from the tree.
 ///
-/// Writing to the last level is not enough on its own: that level can hold
-/// several overlapping runs, and a compaction that rewrites only part of it
-/// (a targeted single-table rewrite, for instance) leaves older versions behind
-/// in a run it never read. Absence is proven only when the whole last level is
-/// an input, since nothing older than it exists. The three decisions that turn
-/// "not in my inputs" into "not in the tree" hang off this: dropping a
-/// tombstone, zeroing a seqno, and folding merge operands onto an absent base.
+/// Neither the destination level nor the level layout proves that. A level can
+/// hold several overlapping runs, so rewriting part of one leaves older
+/// versions in a run that was never read; and a move can drop a NEWER entry
+/// into an empty last level while an OLDER one stays on a level above, so
+/// "nothing below me" is not "nothing older than me" either. What does prove it
+/// is that no table outside the inputs can hold another version of these keys:
+/// every table this compaction does not read is disjoint from the range it
+/// covers. The three decisions that turn "not in my inputs" into "not in the
+/// tree" hang off this: dropping a tombstone, zeroing a seqno, and folding
+/// merge operands onto an absent base.
 fn holds_every_surviving_version(
     version: &Version,
     table_ids: &HashSet<TableId>,
     is_last_level: bool,
+    comparator: &dyn crate::comparator::UserComparator,
 ) -> bool {
+    use crate::version::run::Ranged as _;
+
     if !is_last_level {
         return false;
     }
-    let Some(last) = version.level(version.level_count() - 1) else {
-        // No last level to hold anything older.
-        return true;
-    };
-    last.iter()
-        .flat_map(|run| run.iter())
-        .all(|table| table_ids.contains(&table.id()))
+
+    let covered = crate::KeyRange::aggregate_cmp(
+        version
+            .iter_tables()
+            .filter(|table| table_ids.contains(&table.id()))
+            .map(Table::key_range),
+        comparator,
+    );
+
+    version
+        .iter_tables()
+        .filter(|table| !table_ids.contains(&table.id()))
+        .all(|table| {
+            !table
+                .key_range()
+                .overlaps_with_key_range_cmp(&covered, comparator)
+        })
 }
 
 /// Garbage-collects range tombstones for a bottommost compaction's output.
@@ -1654,8 +1670,12 @@ fn run_subcompaction(
     // Dropping a tombstone, zeroing a seqno and folding operands onto an absent
     // base all read "not in my inputs" as "not in the tree", so they need the
     // stronger premise than the destination level alone.
-    let holds_everything =
-        holds_every_surviving_version(version, &payload.table_ids, is_last_level);
+    let holds_everything = holds_every_surviving_version(
+        version,
+        &payload.table_ids,
+        is_last_level,
+        opts.config.comparator.as_ref(),
+    );
 
     merge_iter = merge_iter
         .evict_tombstones(holds_everything)
@@ -2553,6 +2573,7 @@ fn merge_tables(
         &current_super_version.version,
         &payload.table_ids,
         is_last_level,
+        opts.config.comparator.as_ref(),
     );
 
     merge_iter = merge_iter
