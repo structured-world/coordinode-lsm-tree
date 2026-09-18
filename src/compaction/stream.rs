@@ -485,13 +485,18 @@ impl<'a, I: Iterator<Item = Item>, F: StreamFilter + 'a> CompactionStream<'a, I,
 
         // The operator is only ever handed a base this stream has PROVEN: the
         // boundary it just found, or absence. Absence is proven by a tombstone
-        // boundary, and at the bottom level by there being no level below to
-        // hold one. Without a boundary anywhere else the base may sit lower
-        // down, and folding onto an assumed-empty base is not a partial answer
-        // but a wrong one: a set removal becomes an empty set, a patch becomes
-        // a whole record, and either one overwrites the real base when they
-        // meet. So the operands are re-emitted unchanged instead, each with its
-        // own seqno and order, and the fold happens where the base is.
+        // boundary, or by `evict_tombstones`, which the caller sets only where
+        // this compaction holds every surviving version of the key, so nothing
+        // outside it can hold a base. Writing to the last level is NOT that
+        // proof on its own: the level can hold several overlapping runs, and a
+        // compaction rewriting part of it leaves older versions in a run it
+        // never read (see `holds_every_surviving_version`). Without either
+        // proof the base may sit lower down, and folding onto an assumed-empty
+        // base is not a partial answer but a wrong one: a set removal becomes
+        // an empty set, a patch becomes a whole record, and either one
+        // overwrites the real base when they meet. So the operands are
+        // re-emitted unchanged instead, each with its own seqno and order, and
+        // the fold happens where the base is.
         //
         // Re-emission goes through `pending`, as the Indirection bail-out
         // above does: those entries re-enter the pipeline one at a time, so

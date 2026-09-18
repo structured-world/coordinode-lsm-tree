@@ -65,9 +65,10 @@ pub trait MergeOperator: Send + Sync + RefUnwindSafe + 'static {
     /// has none: it was never written, or a delete removed it. `None` always
     /// means absence, never "the engine did not look": a read resolves over
     /// every level before calling this, and a compaction calls it only where it
-    /// found the boundary or stands at the bottom level, where there is nothing
-    /// below to hold one. Where a compaction cannot prove either, it keeps the
-    /// operands instead of asking. The value may already be the output of a
+    /// found the boundary or holds every surviving version of the key, so
+    /// nothing outside it can hold a base. Where a compaction can prove
+    /// neither, it keeps the operands instead of asking. The value may already
+    /// be the output of a
     /// previous `merge` call (after compaction or an earlier read), so
     /// implementations must be stable when re-merging.
     ///
