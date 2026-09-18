@@ -3396,3 +3396,119 @@ fn tight_space_engages_when_the_local_share_covers_the_output() -> crate::Result
     }
     Ok(())
 }
+
+/// A set that carries removals, so folding onto an assumed-empty base is
+/// distinguishable from folding onto the real one. `0x02` removes, anything
+/// else is a whole set to union in.
+struct SetMerge;
+
+impl crate::MergeOperator for SetMerge {
+    fn merge(
+        &self,
+        _key: &[u8],
+        base_value: Option<&[u8]>,
+        operands: &[&[u8]],
+    ) -> crate::Result<crate::UserValue> {
+        let mut set: Vec<u8> = base_value.map(<[u8]>::to_vec).unwrap_or_default();
+        for operand in operands {
+            match operand.split_first() {
+                Some((0x02, rest)) => set.retain(|m| !rest.contains(m)),
+                _ => {
+                    for m in *operand {
+                        if !set.contains(m) {
+                            set.push(*m);
+                        }
+                    }
+                }
+            }
+        }
+        set.sort_unstable();
+        Ok(set.into())
+    }
+}
+
+/// Compacts exactly the named table back into the level it already sits in,
+/// which is how a targeted rewrite (ECC self-heal) reaches the merge path.
+struct RewriteOneTable(TableId, u8);
+
+impl CompactionStrategy for RewriteOneTable {
+    fn get_name(&self) -> &'static str {
+        "RewriteOneTableTest"
+    }
+
+    fn choose(&self, _: &Version, _: &Config, _: &CompactionState) -> Choice {
+        Choice::Merge(Input {
+            table_ids: core::iter::once(self.0).collect(),
+            dest_level: self.1,
+            canonical_level: self.1,
+            target_size: u64::MAX,
+        })
+    }
+}
+
+/// Being at the last level does not by itself prove the compaction holds every
+/// version of a key: a targeted rewrite can take one table out of a last level
+/// that holds several overlapping runs, leaving the base behind in a run it
+/// never read. Absence has to be proven from the inputs, not from the
+/// destination.
+#[test]
+fn a_rewrite_of_one_last_level_table_does_not_prove_absence() -> crate::Result<()> {
+    let dir = tempfile::tempdir()?;
+    let seqno = SequenceNumberCounter::default();
+    let config = Config::new(&dir, seqno.clone(), SequenceNumberCounter::default())
+        .with_merge_operator(Some(Arc::new(SetMerge)));
+    let last_level = config.level_count - 1;
+    let tree = config.open()?;
+    let crate::AnyTree::Standard(tree) = tree else {
+        unreachable!("standard tree configured (no kv separation)");
+    };
+
+    // The base, parked at the last level on its own run.
+    tree.insert("k", [1u8, 2, 3], seqno.next());
+    tree.flush_active_memtable(0)?;
+    tree.compact(
+        Arc::new(crate::compaction::MoveDown(0, last_level)),
+        seqno.get(),
+    )?;
+
+    // A second run at the SAME last level, overlapping the first and holding
+    // only the operand.
+    tree.merge("k", [0x02u8, 2], seqno.next());
+    tree.flush_active_memtable(0)?;
+    tree.compact(
+        Arc::new(crate::compaction::MoveDown(0, last_level)),
+        seqno.get(),
+    )?;
+
+    let version = tree.version_history.read().latest_version();
+    let level = version
+        .version
+        .level(last_level.into())
+        .ok_or_else(|| crate::Error::from(crate::io::Error::other("last level is missing")))?;
+    assert!(
+        level.iter().count() >= 2,
+        "the recipe needs two overlapping runs at the last level, else the \
+         rewrite below would hold the base after all",
+    );
+    // The operand's table is the later one, so it carries the higher id.
+    let operand_table = version
+        .version
+        .iter_tables()
+        .map(Table::id)
+        .max()
+        .ok_or_else(|| crate::Error::from(crate::io::Error::other("no tables")))?;
+    drop(version);
+
+    tree.compact(
+        Arc::new(RewriteOneTable(operand_table, last_level)),
+        seqno.get(),
+    )?;
+
+    assert_eq!(
+        Some(vec![1u8, 3]),
+        tree.get("k", crate::MAX_SEQNO)?.map(|v| v.to_vec()),
+        "the removal must still apply to the base the rewrite never read",
+    );
+
+    Ok(())
+}

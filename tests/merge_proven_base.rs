@@ -84,17 +84,18 @@ impl MergeOperator for OrderedSetMerge {
     }
 }
 
-fn open_tree(folder: &tempfile::TempDir, seqno: &SequenceNumberCounter) -> lsm_tree::AnyTree {
+fn open_tree(
+    folder: &tempfile::TempDir,
+    seqno: &SequenceNumberCounter,
+) -> lsm_tree::Result<lsm_tree::AnyTree> {
     Config::new(folder, seqno.clone(), SequenceNumberCounter::default())
         .with_merge_operator(Some(Arc::new(OrderedSetMerge)))
         .open()
-        .expect("open tree with a merge operator")
 }
 
-fn read_set(tree: &lsm_tree::AnyTree, key: &str, seqno: u64) -> Option<Vec<u64>> {
+fn read_set(tree: &lsm_tree::AnyTree, key: &str, seqno: u64) -> lsm_tree::Result<Option<Vec<u64>>> {
     tree.get(key, seqno)
-        .expect("read")
-        .map(|value| decode_set(&value))
+        .map(|value| value.map(|value| decode_set(&value)))
 }
 
 #[test]
@@ -109,7 +110,7 @@ fn a_removal_survives_a_compaction_that_does_not_hold_the_base() -> lsm_tree::Re
     // merge path never runs, and the test would pass without proving anything.
     let folder = tempfile::tempdir()?;
     let seqno = SequenceNumberCounter::default();
-    let tree = open_tree(&folder, &seqno);
+    let tree = open_tree(&folder, &seqno)?;
 
     tree.insert("k", encode_set(&[1, 2, 3]), seqno.next());
     tree.flush_active_memtable(0)?;
@@ -122,7 +123,7 @@ fn a_removal_survives_a_compaction_that_does_not_hold_the_base() -> lsm_tree::Re
     tree.flush_active_memtable(0)?;
     tree.compact(Arc::new(lsm_tree::compaction::MoveDown(0, 1)), seqno.get())?;
 
-    assert_eq!(Some(vec![1, 2, 3]), read_set(&tree, "k", seqno.get()));
+    assert_eq!(Some(vec![1, 2, 3]), read_set(&tree, "k", seqno.get())?);
 
     tree.merge("k", remove(2), seqno.next());
     for round in 0..4u64 {
@@ -133,7 +134,7 @@ fn a_removal_survives_a_compaction_that_does_not_hold_the_base() -> lsm_tree::Re
 
     // The read path applies over every level, so it is right before the
     // compaction and stays the answer afterwards.
-    assert_eq!(Some(vec![1, 3]), read_set(&tree, "k", seqno.get()));
+    assert_eq!(Some(vec![1, 3]), read_set(&tree, "k", seqno.get())?);
 
     let watermark = seqno.get();
     let result = tree.compact(
@@ -155,7 +156,7 @@ fn a_removal_survives_a_compaction_that_does_not_hold_the_base() -> lsm_tree::Re
         "the last-level table holding the base must not be an input",
     );
 
-    assert_eq!(Some(vec![1, 3]), read_set(&tree, "k", seqno.get()));
+    assert_eq!(Some(vec![1, 3]), read_set(&tree, "k", seqno.get())?);
 
     Ok(())
 }
@@ -167,7 +168,7 @@ fn a_key_built_only_from_operands_materialises_at_the_last_level() -> lsm_tree::
     // collapsible: one value, not a chain that carries its removal forever.
     let folder = tempfile::tempdir()?;
     let seqno = SequenceNumberCounter::default();
-    let tree = open_tree(&folder, &seqno);
+    let tree = open_tree(&folder, &seqno)?;
 
     tree.merge("k", add(1), seqno.next());
     tree.merge("k", add(2), seqno.next());
@@ -177,7 +178,7 @@ fn a_key_built_only_from_operands_materialises_at_the_last_level() -> lsm_tree::
     let watermark = seqno.get();
     tree.major_compact(64_000_000, watermark)?;
 
-    assert_eq!(Some(vec![2]), read_set(&tree, "k", seqno.get()));
+    assert_eq!(Some(vec![2]), read_set(&tree, "k", seqno.get())?);
     assert_eq!(1, tree.table_count());
 
     // One entry, not three: the chain folded rather than surviving as operands.
