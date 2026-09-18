@@ -220,14 +220,20 @@ jobs:
             if [ -n "${LIBCLANG_PATH:-}" ]; then
               exit 0
             fi
+            # Probed through the shell's own path form, but EXPORTED as a
+            # native path: everything downstream (the linker's DLL search,
+            # clang-sys) is a Windows process, and a `/c/...` string means
+            # nothing to it.
             for dir in "/c/Program Files/LLVM/bin" "/c/Program Files (x86)/LLVM/bin"; do
               if [ -f "$dir/libclang.dll" ]; then
-                echo "LIBCLANG_PATH=$dir" >> "$GITHUB_ENV"
+                native="$(cd "$dir" && pwd -W)"
+                echo "LIBCLANG_PATH=$native" >> "$GITHUB_ENV"
                 # LIBCLANG_PATH only tells clang-sys where to look. The build
                 # script links against libclang, so Windows resolves the DLL
                 # itself at process start and searches PATH: without this the
                 # script dies as STATUS_DLL_NOT_FOUND before running a line.
-                echo "$dir" >> "$GITHUB_PATH"
+                echo "$native" >> "$GITHUB_PATH"
+                echo "libclang: $native"
                 exit 0
               fi
             done
