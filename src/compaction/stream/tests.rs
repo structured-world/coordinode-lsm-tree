@@ -741,9 +741,11 @@ mod merge_operator_tests {
     }
 
     #[test]
-    #[expect(clippy::unwrap_used, reason = "test assertion")]
-    fn compaction_merge_operands_below_gc() -> crate::Result<()> {
-        // All entries below gc_watermark=1000, no base → partial merge
+    fn operands_without_a_proven_base_are_kept_as_they_are() -> crate::Result<()> {
+        // No boundary in this stream and not the bottom level, so the base may
+        // sit lower down. Folding here would hand the operator an empty base it
+        // cannot tell from a proven-absent one, so the operands travel on
+        // untouched, each with its own seqno, to the level that holds the base.
         #[rustfmt::skip]
         let vec = stream![
             "a", "op2", "M",
@@ -751,11 +753,47 @@ mod merge_operator_tests {
         ];
 
         let iter = vec.iter().cloned().map(Ok);
-        let mut iter = CompactionStream::new(iter, 1_000).with_merge_operator(Some(merge_op()));
+        let iter = CompactionStream::new(iter, 1_000).with_merge_operator(Some(merge_op()));
+        let out: Vec<_> = iter.collect::<crate::Result<Vec<_>>>()?;
+
+        assert_eq!(2, out.len(), "both operands survive");
+        assert_eq!(
+            vec![b"op2".to_vec(), b"op1".to_vec()],
+            out.iter().map(|e| e.value.to_vec()).collect::<Vec<_>>(),
+            "unfolded, in stream order",
+        );
+        assert!(
+            out.iter()
+                .all(|e| e.key.value_type == ValueType::MergeOperand),
+            "still operands, not a value",
+        );
+        assert_eq!(
+            vec.iter().map(|e| e.key.seqno).collect::<Vec<_>>(),
+            out.iter().map(|e| e.key.seqno).collect::<Vec<_>>(),
+            "each keeps its own seqno",
+        );
+
+        Ok(())
+    }
+
+    #[test]
+    #[expect(clippy::unwrap_used, reason = "test assertion")]
+    fn operands_fold_onto_a_proven_absent_base_at_the_bottom_level() -> crate::Result<()> {
+        // Same stream at the bottom level: there is no level below to hold a
+        // base, so absence is proven and the chain becomes the key's value.
+        #[rustfmt::skip]
+        let vec = stream![
+            "a", "op2", "M",
+            "a", "op1", "M",
+        ];
+
+        let iter = vec.iter().cloned().map(Ok);
+        let mut iter = CompactionStream::new(iter, 1_000)
+            .evict_tombstones(true)
+            .with_merge_operator(Some(merge_op()));
 
         let item = iter.next().unwrap()?;
-        // Partial merge (no base boundary) → stays MergeOperand
-        assert_eq!(item.key.value_type, ValueType::MergeOperand);
+        assert_eq!(item.key.value_type, ValueType::Value);
         assert_eq!(&*item.value, b"op1,op2");
         assert!(iter.next().is_none());
 
@@ -1209,10 +1247,10 @@ mod merge_operator_tests {
         ));
     }
 
-    /// Complete merge (with base) emits Value; partial merge emits MergeOperand.
+    /// A key whose base is in the stream folds; a key whose base may be below
+    /// keeps its operands. One stream, both outcomes.
     #[test]
-    fn compaction_merge_complete_vs_partial() -> crate::Result<()> {
-        // Complete merge: operand + base → Value
+    fn a_key_folds_only_where_its_base_is_proven() -> crate::Result<()> {
         #[rustfmt::skip]
         let vec = stream![
             "a", "op1", "M",
@@ -1225,13 +1263,16 @@ mod merge_operator_tests {
         let iter = CompactionStream::new(iter, 1_000).with_merge_operator(Some(merge_op()));
         let out: Vec<_> = iter.map(Result::unwrap).collect();
 
-        assert_eq!(out.len(), 2);
-        // "a": base found → complete merge → Value
+        assert_eq!(out.len(), 3);
+        // "a": the base is right here, so the fold is the key's value.
         assert_eq!(out[0].key.value_type, ValueType::Value);
         assert_eq!(&*out[0].value, b"base,op1");
-        // "b": no base → partial merge → MergeOperand
+        // "b": no base in this stream and not the bottom level, so both
+        // operands travel on.
         assert_eq!(out[1].key.value_type, ValueType::MergeOperand);
-        assert_eq!(&*out[1].value, b"op1,op2");
+        assert_eq!(&*out[1].value, b"op2");
+        assert_eq!(out[2].key.value_type, ValueType::MergeOperand);
+        assert_eq!(&*out[2].value, b"op1");
 
         Ok(())
     }

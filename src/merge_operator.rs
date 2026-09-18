@@ -61,10 +61,15 @@ pub trait MergeOperator: Send + Sync + RefUnwindSafe + 'static {
     ///
     /// `key` is the user key being merged.
     ///
-    /// `base_value` is the existing value for the key, or `None` if no base
-    /// value exists (e.g., the key was never written or was deleted). This
-    /// may already be the output of a previous `merge` call (after compaction
-    /// or an earlier read), so implementations must be stable when re-merging.
+    /// `base_value` is the existing value for the key, or `None` when the key
+    /// has none: it was never written, or a delete removed it. `None` always
+    /// means absence, never "the engine did not look": a read resolves over
+    /// every level before calling this, and a compaction calls it only where it
+    /// found the boundary or stands at the bottom level, where there is nothing
+    /// below to hold one. Where a compaction cannot prove either, it keeps the
+    /// operands instead of asking. The value may already be the output of a
+    /// previous `merge` call (after compaction or an earlier read), so
+    /// implementations must be stable when re-merging.
     ///
     /// `operands` contains the merge operand values in ascending sequence
     /// number order (chronological — oldest first).

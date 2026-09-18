@@ -329,10 +329,11 @@ impl<'a, I: Iterator<Item = Item>, F: StreamFilter + 'a> CompactionStream<'a, I,
     /// Collects merge operands and resolves them via the merge operator.
     ///
     /// `head` is the first `MergeOperand` entry (highest seqno).
-    /// Collects subsequent same-key entries, merges them, and returns the result.
-    /// When a base value or tombstone boundary is found, the result is a `Value`
-    /// (complete merge). When no boundary is found (partial merge), the result
-    /// remains a `MergeOperand` so future compactions can find the real base.
+    /// Collects subsequent same-key entries and folds them onto the base, which
+    /// the stream has to have proven: a boundary it found, or absence at the
+    /// bottom level. The result is then the key's `Value`. Without a proven
+    /// base the operands are re-emitted unchanged and the fold waits for the
+    /// level that holds one.
     /// [`Self::resolve_merge_operands`] with the stream's own operator. The
     /// resolver needs `&mut self` for the input stream, so the operator cannot
     /// be borrowed across the call; it is MOVED out and back instead of
@@ -482,6 +483,31 @@ impl<'a, I: Iterator<Item = Item>, F: StreamFilter + 'a> CompactionStream<'a, I,
             }
         }
 
+        // The operator is only ever handed a base this stream has PROVEN: the
+        // boundary it just found, or absence. Absence is proven by a tombstone
+        // boundary, and at the bottom level by there being no level below to
+        // hold one. Without a boundary anywhere else the base may sit lower
+        // down, and folding onto an assumed-empty base is not a partial answer
+        // but a wrong one: a set removal becomes an empty set, a patch becomes
+        // a whole record, and either one overwrites the real base when they
+        // meet. So the operands are re-emitted unchanged instead, each with its
+        // own seqno and order, and the fold happens where the base is.
+        //
+        // Re-emission goes through `pending`, as the Indirection bail-out
+        // above does: those entries re-enter the pipeline one at a time, so
+        // each settles itself against the balance and the run reports no
+        // collected history for this key. Nothing re-collects them into
+        // another attempt either, since they are no longer in `inner`.
+        if !found_boundary && !self.evict_tombstones {
+            let mut iter = collected.into_iter();
+            #[expect(clippy::expect_used, reason = "collected always has head")]
+            let first = iter
+                .next()
+                .expect("collected should contain at least one element");
+            self.pending.extend(iter);
+            return Ok(first);
+        }
+
         // Drop collected operands that a covering applied range tombstone deletes
         // (they are pre-delete state): only operands newer than the tombstone fold
         // onto the now-empty base. Without this, an operand below the tombstone
@@ -507,22 +533,14 @@ impl<'a, I: Iterator<Item = Item>, F: StreamFilter + 'a> CompactionStream<'a, I,
         let operand_refs: Vec<&[u8]> = operands_reversed.iter().map(AsRef::as_ref).collect();
         let merged = merge_op.merge(&user_key, base_value.as_deref(), &operand_refs)?;
 
-        // Complete merge (base or tombstone found): emit as Value.
-        // Partial merge (no boundary in this stream — base may be in lower level):
-        // emit as MergeOperand so future compactions can find the real base.
-        // The MergeOperator contract requires stability across re-merging:
-        // future passes may see this pre-merged output as an operand.
-        let result_type = if found_boundary {
-            ValueType::Value
-        } else {
-            ValueType::MergeOperand
-        };
-
+        // The base was proven either way, so this is the key's value, not a
+        // further operand. A key that never had a put therefore materialises at
+        // the bottom level instead of carrying its operands forever.
         Ok(InternalValue::from_components(
             user_key,
             merged,
             head_seqno,
-            result_type,
+            ValueType::Value,
         ))
     }
 
