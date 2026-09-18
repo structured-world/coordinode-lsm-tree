@@ -211,6 +211,11 @@ jobs:
             for dir in "/c/Program Files/LLVM/bin" "/c/Program Files (x86)/LLVM/bin"; do
               if [ -f "$dir/libclang.dll" ]; then
                 echo "LIBCLANG_PATH=$dir" >> "$GITHUB_ENV"
+                # LIBCLANG_PATH only tells clang-sys where to look. The build
+                # script links against libclang, so Windows resolves the DLL
+                # itself at process start and searches PATH: without this the
+                # script dies as STATUS_DLL_NOT_FOUND before running a line.
+                echo "$dir" >> "$GITHUB_PATH"
                 exit 0
               fi
             done
