@@ -143,6 +143,18 @@ jobs:
       - name: Run benchmarks
         run: bash .github/scripts/run-benchmarks.sh 200000
 
+      # The bench runner is self-hosted, so its workspace survives between runs
+      # (a GitHub-hosted runner starts each job on an empty disk, which is why
+      # this is not needed there). The step below fetches `gh-pages:gh-pages`,
+      # and on a run that does NOT auto-push (every manual dispatch) it commits
+      # to that local branch and leaves the commit behind. The next run's fetch
+      # then reports non-fast-forward against its own leftover and fails before
+      # measuring anything. Drop the local branch first: the step recreates it
+      # from the remote, so nothing that was actually published is lost.
+      - name: Drop a local gh-pages left by an earlier run
+        if: steps.bot-token.outputs.token != ''
+        run: git branch --delete --force gh-pages 2>/dev/null || true
+
       - name: Store benchmark results
         if: steps.bot-token.outputs.token != ''
         uses: benchmark-action/github-action-benchmark@52576c92bccf6ac60c8223ec7eb2565637cae9ba  # v1.22.1
