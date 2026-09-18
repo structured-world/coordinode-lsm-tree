@@ -1,5 +1,5 @@
 window.BENCHMARK_DATA = {
-  "lastUpdate": 1789500126425,
+  "lastUpdate": 1789719378896,
   "repoUrl": "https://github.com/structured-world/coordinode-lsm-tree",
   "entries": {
     "lsm-tree db_bench": [
@@ -22854,6 +22854,90 @@ window.BENCHMARK_DATA = {
             "value": 727891.4243959523,
             "unit": "ops/sec",
             "extra": "P50: 1.2us | P99: 4.6us | P99.9: 27.9us\nthreads: 1 | elapsed: 0.27s | num: 200000 | iterations: 3"
+          }
+        ]
+      },
+      {
+        "commit": {
+          "author": {
+            "email": "mail@polaz.com",
+            "name": "Dmitry Prudnikov",
+            "username": "polaz"
+          },
+          "committer": {
+            "email": "noreply@github.com",
+            "name": "GitHub",
+            "username": "web-flow"
+          },
+          "distinct": true,
+          "id": "569ec575d2ef5d2fe902caaba5e1032bad38cb4a",
+          "message": "build(deps): update structured-zstd to 0.0.54 (#649)\n\n## Summary\n\nTakes structured-zstd 0.0.54. Both requirements move (the `zstd` feature\ndependency and the dev-dependency with the dictionary trainer); a 0.0.x\ncaret pins the exact patch, so the manifest has to change.\n\nThe release is a drop-in here. The decoder's public surface is\nunchanged, and what it does change sits behind the calls we already\nmake:\n\n- a dictionary-resident match is copied in the inline sequence executor,\non the path every dictionary block read takes;\n- predefined sequence tables are read in place;\n- streamed frames are held to a window plus a block, and an unsized\nframe decodes into the caller's slice;\n- explicit compression parameters now reach dictionary frames, which\nleaves ours alone: we compress by level.\n\nNothing to adopt on our side: the release's two new public items\n(`MAX_BLOCK_SIZE`, `dictionary_describes_frame`) answer questions we do\nnot ask, and we keep no copy of either.\n\n## Measurement\n\n`benches/zstd_dict`, 0.0.53 against 0.0.54, arms alternated, two rounds\neach:\n\n| case | 0.0.53 | 0.0.54 |\n|---|---|---|\n| `decompress_with_dict/warm` | 380-387 ns | 145-160 ns |\n| `decompress_with_dict/tls_hit` | 420-428 ns | 182-183 ns |\n\nA dictionary block therefore reads about 2.3 to 2.6 times faster.\n`dict_ratio` reports the same bytes as 0.0.53 in every dictionary row.\n\n## Testing\n\n- `cargo nextest run --all-features`: 3431 passed. Default features:\n2689 passed. `--no-default-features --features zstd,lz4`: 2921 passed.\n- `cargo test --doc --all-features`.\n- `cargo clippy --all-targets -D warnings` for all-features, default and\n`--features zstd`, plus `tools/db_bench`.\n- `cargo doc` with default features and with all features.\n- `cargo check --no-default-features --features alloc`: no errors,\nwarning count unchanged.\n\nCloses #648\n\n\n<!-- This is an auto-generated comment: release notes by coderabbit.ai\n-->\n\n## Summary by CodeRabbit\n\n- **Chores**\n- Updated the optional structured compression dependency to version\n0.0.54.\n\n<!-- end of auto-generated comment: release notes by coderabbit.ai -->",
+          "timestamp": "2026-09-18T11:06:16+03:00",
+          "tree_id": "15eccd37b8a1e285e1bbde29c4e48be84bee040e",
+          "url": "https://github.com/structured-world/coordinode-lsm-tree/commit/569ec575d2ef5d2fe902caaba5e1032bad38cb4a"
+        },
+        "date": 1789719345714,
+        "tool": "customBiggerIsBetter",
+        "benches": [
+          {
+            "name": "mixed",
+            "value": 74025.54781312554,
+            "unit": "ops/sec",
+            "extra": "P50: 0.3us | P99: 5.2us | P99.9: 7.7us\nthreads: 1 | elapsed: 7.23s | num: 200000 | iterations: 3"
+          },
+          {
+            "name": "fillseq",
+            "value": 4386794.170301491,
+            "unit": "ops/sec",
+            "extra": "P50: 0.1us | P99: 1.2us | P99.9: 1.6us\nthreads: 1 | elapsed: 0.05s | num: 200000 | iterations: 3"
+          },
+          {
+            "name": "fillrandom",
+            "value": 1391286.7522830216,
+            "unit": "ops/sec",
+            "extra": "P50: 0.6us | P99: 1.8us | P99.9: 2.9us\nthreads: 1 | elapsed: 0.14s | num: 200000 | iterations: 3"
+          },
+          {
+            "name": "readrandom",
+            "value": 959968.1474888917,
+            "unit": "ops/sec",
+            "extra": "P50: 1.0us | P99: 3.0us | P99.9: 7.6us\nthreads: 1 | elapsed: 0.21s | num: 200000 | iterations: 3"
+          },
+          {
+            "name": "readseq",
+            "value": 4513785.3147560675,
+            "unit": "ops/sec",
+            "extra": "P50: 0.1us | P99: 1.8us | P99.9: 2.4us\nthreads: 1 | elapsed: 0.04s | num: 200000 | iterations: 3"
+          },
+          {
+            "name": "seekrandom",
+            "value": 508987.5144777363,
+            "unit": "ops/sec",
+            "extra": "P50: 1.7us | P99: 3.6us | P99.9: 4.8us\nthreads: 1 | elapsed: 0.39s | num: 200000 | iterations: 3"
+          },
+          {
+            "name": "prefixscan",
+            "value": 249911.05228304904,
+            "unit": "ops/sec",
+            "extra": "P50: 3.7us | P99: 4.7us | P99.9: 6.7us\nthreads: 1 | elapsed: 0.80s | num: 200000 | iterations: 3"
+          },
+          {
+            "name": "overwrite",
+            "value": 1435517.7245275506,
+            "unit": "ops/sec",
+            "extra": "P50: 0.6us | P99: 1.9us | P99.9: 2.8us\nthreads: 1 | elapsed: 0.14s | num: 200000 | iterations: 3"
+          },
+          {
+            "name": "mergerandom",
+            "value": 1274360.9872938436,
+            "unit": "ops/sec",
+            "extra": "P50: 0.3us | P99: 1.3us | P99.9: 2.7us\nthreads: 1 | elapsed: 0.16s | num: 200000 | iterations: 3"
+          },
+          {
+            "name": "readwhilewriting",
+            "value": 723186.8948815016,
+            "unit": "ops/sec",
+            "extra": "P50: 1.2us | P99: 4.5us | P99.9: 26.9us\nthreads: 1 | elapsed: 0.28s | num: 200000 | iterations: 3"
           }
         ]
       }
