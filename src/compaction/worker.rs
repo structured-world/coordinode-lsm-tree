@@ -221,6 +221,25 @@ pub fn do_compaction(opts: &Options) -> crate::Result<CompactionResult> {
             }
         }
         Choice::Move(payload) => {
+            // Checked before the cross-folder conversion below, not after: that
+            // conversion rewrites only the selected inputs, so it lands them on
+            // the same level under the same overlapping table and inherits the
+            // placement rather than fixing it. The placement is what is wrong,
+            // so neither form of this task may run. Refusing matches what this
+            // path already does for a strategy that hands over hidden tables.
+            // See `move_keeps_the_read_order`.
+            if !move_keeps_the_read_order(
+                &version_history_lock.latest_version_ref().version,
+                &payload,
+                opts.config.comparator.as_ref(),
+            ) {
+                log::warn!(
+                    "Compaction task created by {:?} would move tables beneath an overlapping table, hiding the versions it moved - declining to run it",
+                    opts.strategy.get_name(),
+                );
+                return Ok(CompactionResult::nothing());
+            }
+
             // Cross-folder trivial moves are not possible — the file must be
             // rewritten to end up in the correct storage tier directory.
             // This applies even when both folders are on the same filesystem,
@@ -242,24 +261,6 @@ pub fn do_compaction(opts: &Options) -> crate::Result<CompactionResult> {
                     log::debug!("Converting trivial move to merge: cross-folder level routing");
                     return merge_tables(compaction_state, version_history_lock, opts, &payload);
                 }
-            }
-
-            // A move relocates tables without reading them, so it may not
-            // change which version of a key a read reaches. Merging the same
-            // inputs would not rescue it: the output lands on the same level,
-            // under the same overlapping table. Refusing is the only sound
-            // answer, as this path already does for a strategy that hands over
-            // hidden tables. See `move_keeps_the_read_order`.
-            if !move_keeps_the_read_order(
-                &version_history_lock.latest_version_ref().version,
-                &payload,
-                opts.config.comparator.as_ref(),
-            ) {
-                log::warn!(
-                    "Compaction task created by {:?} would move tables beneath an overlapping table, hiding the versions it moved - declining to run it",
-                    opts.strategy.get_name(),
-                );
-                return Ok(CompactionResult::nothing());
             }
 
             drop(version_history_lock);
@@ -646,11 +647,17 @@ fn collect_version_tombstones(version: &Version) -> Vec<crate::range_tombstone::
 /// run above it does not hold it. Neither shows up as corruption, since both
 /// tables are intact on disk.
 ///
-/// So a move is only trivial while nothing it would slide under overlaps it:
-/// every table outside the move, on a level at or above the destination other
-/// than L0, must be disjoint from the range being moved. L0 is exempt because
-/// the read path reads all of its runs and keeps the highest seqno, which is
-/// exactly the case this predicate exists to protect.
+/// Two conditions make a move trivial, and both are per table rather than over
+/// the moved set as a whole, so that a move spanning a gap is not refused for an
+/// overlap that falls inside it:
+///
+/// - The moved tables land in ONE run, so they must be mutually disjoint, or
+///   that run breaks the disjointness the read path assumes of L1+.
+/// - Nothing a table newly slides beneath may overlap it. "Newly" is what
+///   matters: only levels from the table's own (its remaining peers end up
+///   above it) down to the destination change precedence. Levels already above
+///   the source keep winning exactly as before, so an overlap there is not this
+///   move's problem and refusing over it would decline a safe move forever.
 fn move_keeps_the_read_order(
     version: &Version,
     payload: &CompactionPayload,
@@ -658,27 +665,44 @@ fn move_keeps_the_read_order(
 ) -> bool {
     use crate::version::run::Ranged as _;
 
-    let moved = crate::KeyRange::aggregate_cmp(
-        version
-            .iter_tables()
-            .filter(|table| payload.table_ids.contains(&table.id()))
-            .map(Table::key_range),
-        comparator,
-    );
-
-    version
+    let moved: Vec<(usize, &Table)> = version
         .iter_levels()
         .enumerate()
-        .skip(1)
-        .take_while(|(idx, _)| *idx <= usize::from(payload.dest_level))
-        .flat_map(|(_, level)| level.iter())
-        .flat_map(|run| run.iter())
-        .filter(|table| !payload.table_ids.contains(&table.id()))
-        .all(|table| {
-            !table
-                .key_range()
-                .overlaps_with_key_range_cmp(&moved, comparator)
+        .flat_map(|(idx, level)| {
+            level
+                .iter()
+                .flat_map(|run| run.iter())
+                .map(move |table| (idx, table))
         })
+        .filter(|(_, table)| payload.table_ids.contains(&table.id()))
+        .collect();
+
+    let overlaps = |a: &Table, b: &Table| {
+        a.key_range()
+            .overlaps_with_key_range_cmp(b.key_range(), comparator)
+    };
+
+    for (position, (_, table)) in moved.iter().enumerate() {
+        if moved
+            .iter()
+            .skip(position + 1)
+            .any(|(_, other)| overlaps(table, other))
+        {
+            return false;
+        }
+    }
+
+    let dest = usize::from(payload.dest_level);
+    moved.iter().all(|(source, table)| {
+        version
+            .iter_levels()
+            .enumerate()
+            .filter(|(idx, _)| (*source..=dest).contains(idx))
+            .flat_map(|(_, level)| level.iter())
+            .flat_map(|run| run.iter())
+            .filter(|other| !payload.table_ids.contains(&other.id()))
+            .all(|other| !overlaps(table, other))
+    })
 }
 
 /// Whether this compaction holds every surviving version of the keys it reads,

@@ -3446,6 +3446,166 @@ impl CompactionStrategy for RewriteOneTable {
     }
 }
 
+/// Moves exactly the named tables to `dest`, which is how a strategy can hand
+/// over a subset of a level (the built-in `MoveDown` always takes a whole one).
+struct MoveTables(Vec<TableId>, u8);
+
+impl CompactionStrategy for MoveTables {
+    fn get_name(&self) -> &'static str {
+        "MoveTablesTest"
+    }
+
+    fn choose(&self, _: &Version, _: &Config, _: &CompactionState) -> Choice {
+        Choice::Move(Input {
+            table_ids: self.0.iter().copied().collect(),
+            dest_level: self.1,
+            canonical_level: self.1,
+            target_size: u64::MAX,
+        })
+    }
+}
+
+/// Returns the ids of the tables currently on `level`, newest id first.
+fn table_ids_on_level(tree: &crate::Tree, level: usize) -> Vec<TableId> {
+    let version = tree.version_history.read().latest_version();
+    let mut ids: Vec<TableId> = version
+        .version
+        .level(level)
+        .map(|level| {
+            level
+                .iter()
+                .flat_map(|run| run.iter())
+                .map(Table::id)
+                .collect()
+        })
+        .unwrap_or_default();
+    ids.sort_unstable_by(|a, b| b.cmp(a));
+    ids
+}
+
+/// Moving only PART of L0 leaves the rest of L0 above the moved tables, so the
+/// same reasoning applies there as to any other level: the read path takes the
+/// best L0 answer before it ever looks lower, and an older leftover would mask
+/// the newer version that was moved away.
+#[test]
+fn a_move_of_part_of_l0_does_not_leave_an_older_peer_above_it() -> crate::Result<()> {
+    let dir = tempfile::tempdir()?;
+    let seqno = SequenceNumberCounter::default();
+    let config = Config::new(&dir, seqno.clone(), SequenceNumberCounter::default());
+    let last_level = config.level_count - 1;
+    let tree = config.open()?;
+    let crate::AnyTree::Standard(tree) = tree else {
+        unreachable!("standard tree configured (no kv separation)");
+    };
+
+    // Two L0 tables holding the same key, older flushed first.
+    tree.insert("k", "old", seqno.next());
+    tree.flush_active_memtable(0)?;
+    tree.insert("k", "new", seqno.next());
+    tree.flush_active_memtable(0)?;
+
+    let ids = table_ids_on_level(&tree, 0);
+    assert_eq!(2, ids.len(), "the recipe needs two L0 tables");
+    #[expect(clippy::indexing_slicing, reason = "length asserted right above")]
+    let newer = ids[0];
+
+    // Move only the NEWER one down, leaving the older behind in L0.
+    tree.compact(Arc::new(MoveTables(vec![newer], last_level)), seqno.get())?;
+
+    assert_eq!(
+        Some(&b"new"[..]),
+        tree.get("k", crate::MAX_SEQNO)?.as_deref(),
+        "the moved newer version must not be masked by the peer left in L0",
+    );
+
+    Ok(())
+}
+
+/// The moved tables land in a SINGLE run, and `optimize_runs` only splits
+/// overlapping tables apart when the destination already holds another run: a
+/// move into an empty level leaves them together. A run below L0 is then read
+/// as if it were disjoint, the lookup taking the first table whose range covers
+/// the key and looking no further, so a key held by the OTHER table of that run
+/// is not found at all. Such a move is not trivial.
+#[test]
+fn a_move_of_overlapping_tables_into_one_run_is_refused() -> crate::Result<()> {
+    let dir = tempfile::tempdir()?;
+    let seqno = SequenceNumberCounter::default();
+    let config = Config::new(&dir, seqno.clone(), SequenceNumberCounter::default());
+    let last_level = config.level_count - 1;
+    let tree = config.open()?;
+    let crate::AnyTree::Standard(tree) = tree else {
+        unreachable!("standard tree configured (no kv separation)");
+    };
+
+    // One table spanning "a".."z", another holding only "m": their ranges
+    // overlap while the keys do not, so one run cannot serve both.
+    tree.insert("a", "1", seqno.next());
+    tree.insert("z", "1", seqno.next());
+    tree.flush_active_memtable(0)?;
+    tree.insert("m", "1", seqno.next());
+    tree.flush_active_memtable(0)?;
+
+    let ids = table_ids_on_level(&tree, 0);
+    assert_eq!(2, ids.len(), "the recipe needs two overlapping L0 tables");
+
+    tree.compact(Arc::new(MoveTables(ids, last_level)), seqno.get())?;
+
+    for key in ["a", "m", "z"] {
+        assert_eq!(
+            Some(&b"1"[..]),
+            tree.get(key, crate::MAX_SEQNO)?.as_deref(),
+            "key {key} must still be readable after the move",
+        );
+    }
+
+    Ok(())
+}
+
+/// The gate must only refuse what the move actually changes. An overlap on a
+/// level ALREADY above the source keeps winning before and after, so declining
+/// over it would stall a safe move forever.
+#[test]
+fn a_move_under_a_level_that_already_outranked_it_still_runs() -> crate::Result<()> {
+    let dir = tempfile::tempdir()?;
+    let seqno = SequenceNumberCounter::default();
+    let config = Config::new(&dir, seqno.clone(), SequenceNumberCounter::default());
+    let tree = config.open()?;
+    let crate::AnyTree::Standard(tree) = tree else {
+        unreachable!("standard tree configured (no kv separation)");
+    };
+
+    // The older copy goes to L2 first, then the newer one lands above it in L1.
+    tree.insert("k", "old", seqno.next());
+    tree.flush_active_memtable(0)?;
+    tree.compact(Arc::new(crate::compaction::MoveDown(0, 2)), seqno.get())?;
+    tree.insert("k", "new", seqno.next());
+    tree.flush_active_memtable(0)?;
+    tree.compact(Arc::new(crate::compaction::MoveDown(0, 1)), seqno.get())?;
+
+    assert_eq!(
+        Some(&b"new"[..]),
+        tree.get("k", crate::MAX_SEQNO)?.as_deref(),
+        "the recipe needs the newer copy to win before the move under test",
+    );
+
+    // L2 -> L3 passes under nothing new: L1 outranked L2 before and still does.
+    let result = tree.compact(Arc::new(crate::compaction::MoveDown(2, 3)), seqno.get())?;
+
+    assert_eq!(
+        crate::compaction::CompactionAction::Moved,
+        result.action,
+        "a move that changes no precedence must not be declined",
+    );
+    assert_eq!(
+        Some(&b"new"[..]),
+        tree.get("k", crate::MAX_SEQNO)?.as_deref(),
+        "and the answer is unchanged by it",
+    );
+
+    Ok(())
+}
+
 /// Being at the last level does not by itself prove the compaction holds every
 /// version of a key: a targeted rewrite can take one table out of a last level
 /// that holds several overlapping runs, leaving the base behind in a run it
