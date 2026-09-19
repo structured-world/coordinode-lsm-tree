@@ -1,5 +1,5 @@
 window.BENCHMARK_DATA = {
-  "lastUpdate": 1789776668226,
+  "lastUpdate": 1789813339296,
   "repoUrl": "https://github.com/structured-world/coordinode-lsm-tree",
   "entries": {
     "lsm-tree db_bench": [
@@ -23106,6 +23106,90 @@ window.BENCHMARK_DATA = {
             "value": 582673.8436546236,
             "unit": "ops/sec",
             "extra": "P50: 1.4us | P99: 7.0us | P99.9: 78.0us\nthreads: 1 | elapsed: 0.34s | num: 200000 | iterations: 3"
+          }
+        ]
+      },
+      {
+        "commit": {
+          "author": {
+            "email": "mail@polaz.com",
+            "name": "Dmitry Prudnikov",
+            "username": "polaz"
+          },
+          "committer": {
+            "email": "noreply@github.com",
+            "name": "GitHub",
+            "username": "web-flow"
+          },
+          "distinct": true,
+          "id": "d9391cabbd0de0082d5d0e1026cbf387d6462cdc",
+          "message": "feat(compression): make the btultra2 two-pass seed switchable (#656)\n\n## Summary\n\nzstd levels 19-22 select `btultra2`, which walks a block once to seed\nits statistics before the pass that emits. Since structured-zstd 0.0.53\nthat seed runs on every frame, where a reused compressor previously\nskipped it on every frame but the first. That is a correctness fix\nupstream, not a defect to revert: without it a frame's output depends on\nwhat the same compressor emitted before it. It also costs a factor of\ntwo on those levels, which is what halved the `mixed` db_bench workload\nwhen we took the release.\n\nWhat the seed buys varies with the data. Measured on 4 KiB blocks at\nlevel 22, default against an explicit single-pass `Strategy::Btultra`,\nsteady state on a reused compressor:\n\n| fixture | bytes | time |\n|---|---|---|\n| synthetic LSM records | 97 vs 97 (same) | 3158 vs 1306 us, 2.42x |\n| text | 1579 vs 1585 (+0.4%) | 718 vs 358 us, 2.00x |\n| mixed entropy | 1416 vs 1428 (+0.8%) | 756 vs 392 us, 1.93x |\n| incompressible | 4106 vs 4106 (same) | 8 vs 8 us, 1.02x |\n\nSo it becomes a knob rather than a decision taken for the user:\n`RuntimeConfig::zstd_two_pass_seed`, **default `true`**, which is the\ncodec's own behaviour. Asking for level 22 is asking for ratio, and that\nis what it keeps giving unless a deployment decides otherwise.\n\n## Design notes\n\n- The setting travels **with the block**, on `CompressionContext` beside\nthe codec and the dictionary, because that is the granularity the\nencoder is configured at.\n- Both zstd paths key their per-thread compressor cache on the STRATEGY\nthe setting selects, not on the setting itself: a compressor carries the\nparameters it was built with, and blocks written under either setting\ncan interleave on one thread, but below level 19 the two build the\nidentical compressor and must share one cache entry.\n- It is read once per writer, so it takes effect on the next operation\nstarted rather than on the next block: a running compaction finishes\nunder the setting it began with, including the files it rotates into.\n- Nothing about a block records which setting wrote it. The seed changes\nhow the encoder searches, never what the frame means, so a reader needs\nto know nothing and a live toggle needs no migration.\n- It is wired through the SST writer, the blob writer and their\nmulti-writers, so every file of one flush or compaction is uniform, and\na compaction started after a toggle migrates its outputs.\n- `prepare_owned` reached eight arguments, so the five describing how a\nblock is encoded (codec, encryption, dictionary, seed, parity) became\n`TransformParams`.\n\n## Testing\n\n- `a_single_pass_frame_at_level_22_still_round_trips` and\n`a_single_pass_dictionary_frame_round_trips`: valid frames decoding to\ntheir input, with and without a dictionary.\n- `the_seed_setting_reaches_the_encoder_at_level_22`: the two settings\nemit **different bytes** at 22. This is what proves the flag arrives at\nthe encoder rather than being carried and dropped; which output is\nsmaller is a per-input tradeoff, not a contract.\n- `the_seed_setting_is_ignored_below_level_19`: **identical bytes** at\nlevels 1, 3, 9 and 18, so turning the knob off cannot quietly change\nblocks at other levels.\n- `the_compressor_cache_key_ignores_the_seed_below_level_19`: both\nsettings map onto one cache entry below 19 and onto separate ones from\n19 up, so alternating snapshots of the setting cannot thrash the cache\nat levels the setting does not reach.\n- `tests/zstd_two_pass_seed.rs`: a tree reads back what it wrote with\nthe seed off, and a tree holding blocks written under **both** settings\nreads them all correctly, including after a major compaction rewrites\nthem under the current one.\n- `cargo nextest run --all-features`: 3445 passed.\n`--no-default-features --features zstd,lz4`: 2935 passed.\n- `cargo test --doc --features lz4`: 72 passed.\n- `cargo clippy --all-features --all-targets -- -D warnings`: clean.\n`cargo fmt --check`: clean.\n- `cargo check --target thumbv7em-none-eabihf --no-default-features\n--features alloc`: 0 errors.\n\n`docs/compression.md` records the measurements behind the default, when\na deployment would want the other one, and when a change takes effect.\n\nCloses #655\n\n\n<!-- This is an auto-generated comment: release notes by coderabbit.ai\n-->\n## Summary by CodeRabbit\n\n* **New Features**\n* Added runtime configuration for selecting single-pass or two-pass zstd\nseeding at compression levels 19–22.\n* Applied the selected setting consistently to table, blob, dictionary,\nand compaction compression.\n  * Preserved the setting across writer rotations and compaction output.\n* **Bug Fixes**\n* Ensured data remains readable when compression settings change between\nwrites and compactions.\n* **Tests**\n* Added coverage for round-trip compatibility and configuration changes.\n<!-- end of auto-generated comment: release notes by coderabbit.ai -->",
+          "timestamp": "2026-09-19T13:18:15+03:00",
+          "tree_id": "6a828ee84f087e9e7c3a08fa03a58401e23446d1",
+          "url": "https://github.com/structured-world/coordinode-lsm-tree/commit/d9391cabbd0de0082d5d0e1026cbf387d6462cdc"
+        },
+        "date": 1789813298241,
+        "tool": "customBiggerIsBetter",
+        "benches": [
+          {
+            "name": "mixed",
+            "value": 75133.1274401527,
+            "unit": "ops/sec",
+            "extra": "P50: 0.4us | P99: 8.7us | P99.9: 27.5us\nthreads: 1 | elapsed: 7.12s | num: 200000 | iterations: 3"
+          },
+          {
+            "name": "fillseq",
+            "value": 3232098.6177930264,
+            "unit": "ops/sec",
+            "extra": "P50: 0.2us | P99: 0.6us | P99.9: 3.8us\nthreads: 1 | elapsed: 0.06s | num: 200000 | iterations: 3"
+          },
+          {
+            "name": "fillrandom",
+            "value": 1165618.678339949,
+            "unit": "ops/sec",
+            "extra": "P50: 0.7us | P99: 1.4us | P99.9: 4.8us\nthreads: 1 | elapsed: 0.17s | num: 200000 | iterations: 3"
+          },
+          {
+            "name": "readrandom",
+            "value": 716617.5365627225,
+            "unit": "ops/sec",
+            "extra": "P50: 1.1us | P99: 6.3us | P99.9: 72.5us\nthreads: 1 | elapsed: 0.28s | num: 200000 | iterations: 3"
+          },
+          {
+            "name": "readseq",
+            "value": 2541858.047395485,
+            "unit": "ops/sec",
+            "extra": "P50: 0.2us | P99: 4.9us | P99.9: 9.3us\nthreads: 1 | elapsed: 0.08s | num: 200000 | iterations: 3"
+          },
+          {
+            "name": "seekrandom",
+            "value": 332617.98292472324,
+            "unit": "ops/sec",
+            "extra": "P50: 2.4us | P99: 8.3us | P99.9: 14.9us\nthreads: 1 | elapsed: 0.60s | num: 200000 | iterations: 3"
+          },
+          {
+            "name": "prefixscan",
+            "value": 201045.9819301882,
+            "unit": "ops/sec",
+            "extra": "P50: 4.4us | P99: 5.8us | P99.9: 12.0us\nthreads: 1 | elapsed: 0.99s | num: 200000 | iterations: 3"
+          },
+          {
+            "name": "overwrite",
+            "value": 1114269.4459518034,
+            "unit": "ops/sec",
+            "extra": "P50: 0.8us | P99: 1.5us | P99.9: 4.9us\nthreads: 1 | elapsed: 0.18s | num: 200000 | iterations: 3"
+          },
+          {
+            "name": "mergerandom",
+            "value": 458207.78440040763,
+            "unit": "ops/sec",
+            "extra": "P50: 0.3us | P99: 0.9us | P99.9: 3.8us\nthreads: 1 | elapsed: 0.44s | num: 200000 | iterations: 3"
+          },
+          {
+            "name": "readwhilewriting",
+            "value": 619827.7312786457,
+            "unit": "ops/sec",
+            "extra": "P50: 1.3us | P99: 6.7us | P99.9: 73.7us\nthreads: 1 | elapsed: 0.32s | num: 200000 | iterations: 3"
           }
         ]
       }
