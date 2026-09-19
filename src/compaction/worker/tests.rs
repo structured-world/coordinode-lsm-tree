@@ -3549,7 +3549,15 @@ fn a_move_of_overlapping_tables_into_one_run_is_refused() -> crate::Result<()> {
     let ids = table_ids_on_level(&tree, 0);
     assert_eq!(2, ids.len(), "the recipe needs two overlapping L0 tables");
 
-    tree.compact(Arc::new(MoveTables(ids, last_level)), seqno.get())?;
+    let result = tree.compact(Arc::new(MoveTables(ids, last_level)), seqno.get())?;
+
+    // Reads alone would also pass if the move were admitted and the two tables
+    // happened to land in separate runs, so pin the refusal itself.
+    assert_eq!(
+        crate::compaction::CompactionAction::Nothing,
+        result.action,
+        "a move of overlapping tables into one run must be declined",
+    );
 
     for key in ["a", "m", "z"] {
         assert_eq!(
@@ -3558,6 +3566,210 @@ fn a_move_of_overlapping_tables_into_one_run_is_refused() -> crate::Result<()> {
             "key {key} must still be readable after the move",
         );
     }
+
+    Ok(())
+}
+
+/// Disjoint tables can still be handed over in an order that is not the
+/// comparator's: the move collects them by walking levels, so a table from a
+/// higher level comes first whatever its keys are. The destination run is read
+/// by binary search over the tables' minimum keys, so an unsorted run loses the
+/// keys of whichever table sits on the wrong side of the split.
+#[test]
+fn a_move_from_two_levels_sorts_the_run_it_lands_in() -> crate::Result<()> {
+    let dir = tempfile::tempdir()?;
+    let seqno = SequenceNumberCounter::default();
+    let config = Config::new(&dir, seqno.clone(), SequenceNumberCounter::default());
+    let last_level = config.level_count - 1;
+    let tree = config.open()?;
+    let crate::AnyTree::Standard(tree) = tree else {
+        unreachable!("standard tree configured (no kv separation)");
+    };
+
+    // The LATER key goes to the higher level, so walking levels yields "z"
+    // before "a" while the comparator orders them the other way round.
+    tree.insert("a", "1", seqno.next());
+    tree.flush_active_memtable(0)?;
+    tree.compact(Arc::new(crate::compaction::MoveDown(0, 1)), seqno.get())?;
+    tree.insert("z", "1", seqno.next());
+    tree.flush_active_memtable(0)?;
+
+    let mut ids = table_ids_on_level(&tree, 0);
+    ids.extend(table_ids_on_level(&tree, 1));
+    assert_eq!(2, ids.len(), "the recipe needs one table on each level");
+
+    let result = tree.compact(Arc::new(MoveTables(ids, last_level)), seqno.get())?;
+    assert_eq!(
+        crate::compaction::CompactionAction::Moved,
+        result.action,
+        "the tables are disjoint, so the move itself is sound",
+    );
+
+    for key in ["a", "z"] {
+        assert_eq!(
+            Some(&b"1"[..]),
+            tree.get(key, crate::MAX_SEQNO)?.as_deref(),
+            "key {key} must survive landing in a run built from two levels",
+        );
+    }
+
+    Ok(())
+}
+
+/// Level routing turns a move into a rewrite, and a rewrite is exactly what
+/// repairs inputs that cannot share a run: it reads all of them and emits one
+/// sorted output. Refusing it would leave a strategy handing over an
+/// overlapping L0 with nothing to do, forever.
+#[test]
+fn a_cross_folder_move_of_overlapping_tables_is_rewritten() -> crate::Result<()> {
+    use crate::config::LevelRoute;
+    use crate::fs::{Fs, MemFs};
+
+    let dir = tempfile::tempdir()?;
+    let seqno = SequenceNumberCounter::default();
+    let hot_dir = crate::path::PathBuf::from("/hot-tier");
+    let hot = Arc::new(MemFs::with_capacity(u64::MAX));
+    hot.create_dir_all(&hot_dir)?;
+    let hot_fs: Arc<dyn Fs> = hot;
+
+    let config = Config::new(dir.path(), seqno.clone(), SequenceNumberCounter::default())
+        .with_shared_fs(Arc::new(MemFs::with_capacity(u64::MAX)))
+        .level_routes(vec![LevelRoute {
+            levels: 0..1,
+            path: hot_dir,
+            fs: hot_fs,
+        }]);
+    let last_level = config.level_count - 1;
+    let crate::AnyTree::Standard(tree) = config.open()? else {
+        unreachable!("standard tree configured (no kv separation)");
+    };
+
+    // The same shape a trivial move must refuse: ranges overlap, keys do not.
+    tree.insert("a", "1", seqno.next());
+    tree.insert("z", "1", seqno.next());
+    tree.flush_active_memtable(0)?;
+    tree.insert("m", "1", seqno.next());
+    tree.flush_active_memtable(0)?;
+
+    let ids = table_ids_on_level(&tree, 0);
+    assert_eq!(2, ids.len(), "the recipe needs two overlapping L0 tables");
+
+    let result = tree.compact(Arc::new(MoveTables(ids, last_level)), seqno.get())?;
+    assert_eq!(
+        crate::compaction::CompactionAction::Merged,
+        result.action,
+        "routing rewrites the inputs, which consolidates them instead of \
+         leaving them in one unreadable run",
+    );
+
+    for key in ["a", "m", "z"] {
+        assert_eq!(
+            Some(&b"1"[..]),
+            tree.get(key, crate::MAX_SEQNO)?.as_deref(),
+            "key {key} must survive the rewrite",
+        );
+    }
+
+    Ok(())
+}
+
+/// An L0 table that holds only versions older than the peer it passes under
+/// stays readable in both directions, because L0 is the one level read by
+/// taking the best answer across every run before looking lower: the newer peer
+/// wins while it is visible, and a snapshot that predates it falls through to
+/// the level the older table moved to. Refusing this would stall a strategy
+/// that hands over part of L0 forever.
+#[test]
+fn a_move_of_an_older_l0_table_under_a_newer_peer_still_runs() -> crate::Result<()> {
+    let dir = tempfile::tempdir()?;
+    let seqno = SequenceNumberCounter::default();
+    let config = Config::new(&dir, seqno.clone(), SequenceNumberCounter::default());
+    let last_level = config.level_count - 1;
+    let tree = config.open()?;
+    let crate::AnyTree::Standard(tree) = tree else {
+        unreachable!("standard tree configured (no kv separation)");
+    };
+
+    // Two L0 tables holding the same key, the older flushed first. Its seqno
+    // range ends below where the newer one's begins, which is what makes the
+    // move provably safe rather than merely plausible.
+    let old_seqno = seqno.next();
+    tree.insert("k", "old", old_seqno);
+    tree.flush_active_memtable(0)?;
+    let new_seqno = seqno.next();
+    tree.insert("k", "new", new_seqno);
+    tree.flush_active_memtable(0)?;
+
+    let ids = table_ids_on_level(&tree, 0);
+    assert_eq!(2, ids.len(), "the recipe needs two L0 tables");
+    #[expect(clippy::indexing_slicing, reason = "length asserted right above")]
+    let older = ids[1];
+
+    // Move the OLDER one down, leaving the newer behind in L0 above it.
+    let result = tree.compact(Arc::new(MoveTables(vec![older], last_level)), seqno.get())?;
+    assert_eq!(
+        crate::compaction::CompactionAction::Moved,
+        result.action,
+        "an overlap with a strictly newer L0 peer does not hide anything",
+    );
+
+    assert_eq!(
+        Some(&b"new"[..]),
+        tree.get("k", crate::MAX_SEQNO)?.as_deref(),
+        "the newer version still answers the current read",
+    );
+    assert_eq!(
+        Some(&b"old"[..]),
+        tree.get("k", new_seqno)?.as_deref(),
+        "and a snapshot predating it still reaches the moved older version",
+    );
+
+    Ok(())
+}
+
+/// A move upward inverts the precedence the move downward relies on, so the
+/// levels it crosses are the ones BETWEEN the destination and the source. Read
+/// in the downward direction that span is empty, which checks nothing at all.
+#[test]
+fn a_move_up_under_a_newer_table_is_refused() -> crate::Result<()> {
+    let dir = tempfile::tempdir()?;
+    let seqno = SequenceNumberCounter::default();
+    let config = Config::new(&dir, seqno.clone(), SequenceNumberCounter::default());
+    let tree = config.open()?;
+    let crate::AnyTree::Standard(tree) = tree else {
+        unreachable!("standard tree configured (no kv separation)");
+    };
+
+    // The older copy settles on L2, the newer one above it on L1.
+    tree.insert("k", "old", seqno.next());
+    tree.flush_active_memtable(0)?;
+    tree.compact(Arc::new(crate::compaction::MoveDown(0, 2)), seqno.get())?;
+    tree.insert("k", "new", seqno.next());
+    tree.flush_active_memtable(0)?;
+    tree.compact(Arc::new(crate::compaction::MoveDown(0, 1)), seqno.get())?;
+
+    assert_eq!(
+        Some(&b"new"[..]),
+        tree.get("k", crate::MAX_SEQNO)?.as_deref(),
+        "the recipe needs the newer copy to win before the move under test",
+    );
+
+    // Lifting the older table up to L1 puts its run ahead of the newer one on
+    // the same level, where the first covering run answers the read.
+    let ids = table_ids_on_level(&tree, 2);
+    assert_eq!(1, ids.len(), "the recipe needs exactly one table on L2");
+    let result = tree.compact(Arc::new(MoveTables(ids, 1)), seqno.get())?;
+
+    assert_eq!(
+        crate::compaction::CompactionAction::Nothing,
+        result.action,
+        "a move that lifts an older table over a newer one must be declined",
+    );
+    assert_eq!(
+        Some(&b"new"[..]),
+        tree.get("k", crate::MAX_SEQNO)?.as_deref(),
+        "and the newer version still answers the read",
+    );
 
     Ok(())
 }

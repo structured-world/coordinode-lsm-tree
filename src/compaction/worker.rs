@@ -227,8 +227,7 @@ pub fn do_compaction(opts: &Options) -> crate::Result<CompactionResult> {
             // placement rather than fixing it. The placement is what is wrong,
             // so neither form of this task may run. Refusing matches what this
             // path already does for a strategy that hands over hidden tables.
-            // See `move_keeps_the_read_order`.
-            if !move_keeps_the_read_order(
+            if !nothing_the_move_passes_under_overlaps(
                 &version_history_lock.latest_version_ref().version,
                 &payload,
                 opts.config.comparator.as_ref(),
@@ -261,6 +260,21 @@ pub fn do_compaction(opts: &Options) -> crate::Result<CompactionResult> {
                     log::debug!("Converting trivial move to merge: cross-folder level routing");
                     return merge_tables(compaction_state, version_history_lock, opts, &payload);
                 }
+            }
+
+            // Only a real trivial move has to answer this one: the rewrite
+            // above consolidates the same inputs into one sorted output, which
+            // is the repair rather than the problem.
+            if !moved_tables_can_share_a_run(
+                &version_history_lock.latest_version_ref().version,
+                &payload,
+                opts.config.comparator.as_ref(),
+            ) {
+                log::warn!(
+                    "Compaction task created by {:?} would move overlapping tables into one run, losing the keys of all but the first - declining to run it",
+                    opts.strategy.get_name(),
+                );
+                return Ok(CompactionResult::nothing());
             }
 
             drop(version_history_lock);
@@ -647,25 +661,80 @@ fn collect_version_tombstones(version: &Version) -> Vec<crate::range_tombstone::
 /// run above it does not hold it. Neither shows up as corruption, since both
 /// tables are intact on disk.
 ///
-/// Two conditions make a move trivial, and both are per table rather than over
-/// the moved set as a whole, so that a move spanning a gap is not refused for an
-/// overlap that falls inside it:
+/// This condition is per table rather than over the moved set as a whole, so
+/// that a move spanning a gap is not refused for an overlap that falls inside
+/// it. "Newly" is what matters: only the levels BETWEEN the source and the
+/// destination change precedence, in whichever direction the move goes. Levels
+/// outside that span keep winning exactly as before, so an overlap there is not
+/// this move's problem and refusing over it would decline a safe move forever.
 ///
-/// - The moved tables land in ONE run, so they must be mutually disjoint, or
-///   that run breaks the disjointness the read path assumes of L1+.
-/// - Nothing a table newly slides beneath may overlap it. "Newly" is what
-///   matters: only levels from the table's own (its remaining peers end up
-///   above it) down to the destination change precedence. Levels already above
-///   the source keep winning exactly as before, so an overlap there is not this
-///   move's problem and refusing over it would decline a safe move forever.
-fn move_keeps_the_read_order(
+/// One overlap is survivable, and only one: a table leaving L0 may pass under a
+/// table that stays there, provided everything in the mover is older than
+/// everything in the table it passes. L0 is read by taking the best answer
+/// across all of its runs and only then looking lower, so the newer peer wins
+/// while it is visible and a snapshot that predates it falls through to the
+/// moved table. No other level reads that way: from L1 down the lookup stops at
+/// the first run whose range covers the key, hit or miss, so a table hidden
+/// under an overlapping one is not reached at all, however old it is.
+fn nothing_the_move_passes_under_overlaps(
     version: &Version,
     payload: &CompactionPayload,
     comparator: &dyn crate::comparator::UserComparator,
 ) -> bool {
-    use crate::version::run::Ranged as _;
+    let moved = moved_tables(version, payload);
+    let dest = usize::from(payload.dest_level);
 
-    let moved: Vec<(usize, &Table)> = version
+    moved.iter().all(|(source, table)| {
+        let span = *source.min(&dest)..=*source.max(&dest);
+        version
+            .iter_levels()
+            .enumerate()
+            .filter(|(idx, _)| span.contains(idx))
+            .flat_map(|(idx, level)| {
+                level
+                    .iter()
+                    .flat_map(|run| run.iter())
+                    .map(move |other| (idx, other))
+            })
+            .filter(|(_, other)| !payload.table_ids.contains(&other.id()))
+            .all(|(idx, other)| {
+                !overlaps(table, other, comparator)
+                    || (idx == 0 && table.seqno_range().1 < other.seqno_range().0)
+            })
+    })
+}
+
+/// Whether the tables this task hands over can share one run, which is where a
+/// trivial move puts them: below L0 the read path takes the first table of a run
+/// whose range covers the key and looks no further, so a run holding two
+/// overlapping tables loses whatever lives only in the second.
+///
+/// Only a trivial move needs this. A cross-folder task carrying the same inputs
+/// is rewritten instead, and the rewrite reads all of them and emits one sorted
+/// output, which is exactly the repair.
+fn moved_tables_can_share_a_run(
+    version: &Version,
+    payload: &CompactionPayload,
+    comparator: &dyn crate::comparator::UserComparator,
+) -> bool {
+    let moved = moved_tables(version, payload);
+
+    for (position, (_, table)) in moved.iter().enumerate() {
+        if moved
+            .iter()
+            .skip(position + 1)
+            .any(|(_, other)| overlaps(table, other, comparator))
+        {
+            return false;
+        }
+    }
+
+    true
+}
+
+/// The tables this task moves, each with the level it currently sits on.
+fn moved_tables<'a>(version: &'a Version, payload: &CompactionPayload) -> Vec<(usize, &'a Table)> {
+    version
         .iter_levels()
         .enumerate()
         .flat_map(|(idx, level)| {
@@ -675,34 +744,14 @@ fn move_keeps_the_read_order(
                 .map(move |table| (idx, table))
         })
         .filter(|(_, table)| payload.table_ids.contains(&table.id()))
-        .collect();
+        .collect()
+}
 
-    let overlaps = |a: &Table, b: &Table| {
-        a.key_range()
-            .overlaps_with_key_range_cmp(b.key_range(), comparator)
-    };
+fn overlaps(a: &Table, b: &Table, comparator: &dyn crate::comparator::UserComparator) -> bool {
+    use crate::version::run::Ranged as _;
 
-    for (position, (_, table)) in moved.iter().enumerate() {
-        if moved
-            .iter()
-            .skip(position + 1)
-            .any(|(_, other)| overlaps(table, other))
-        {
-            return false;
-        }
-    }
-
-    let dest = usize::from(payload.dest_level);
-    moved.iter().all(|(source, table)| {
-        version
-            .iter_levels()
-            .enumerate()
-            .filter(|(idx, _)| (*source..=dest).contains(idx))
-            .flat_map(|(_, level)| level.iter())
-            .flat_map(|run| run.iter())
-            .filter(|other| !payload.table_ids.contains(&other.id()))
-            .all(|other| !overlaps(table, other))
-    })
+    a.key_range()
+        .overlaps_with_key_range_cmp(b.key_range(), comparator)
 }
 
 /// Whether this compaction holds every surviving version of the keys it reads,
