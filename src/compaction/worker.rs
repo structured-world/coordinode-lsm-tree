@@ -717,8 +717,7 @@ fn nothing_the_move_passes_under_overlaps(
                 // thresholds, which is not true of the levels below it.
                 if tables.iter().any(|table| {
                     others.iter().any(|other| {
-                        overlaps(table, other, comparator)
-                            && table.seqno_range().1 >= other.seqno_range().0
+                        overlaps(table, other, comparator) && !proven_older(table, other)
                     })
                 }) {
                     return false;
@@ -738,7 +737,7 @@ fn nothing_the_move_passes_under_overlaps(
 }
 
 /// Sorts tables by the minimum key of their range, which is the order both
-/// sides of [`overlapping_pairs`] are required to be in.
+/// sides of [`any_overlap`] are required to be in.
 fn sort_by_min_key(tables: &mut [&Table], comparator: &dyn crate::comparator::UserComparator) {
     use crate::version::run::Ranged as _;
 
@@ -835,6 +834,19 @@ fn moved_tables<'a>(version: &'a Version, payload: &CompactionPayload) -> Vec<(u
         })
         .filter(|(_, table)| payload.table_ids.contains(&table.id()))
         .collect()
+}
+
+/// Whether everything in `table` is older than everything in `other`, which is
+/// what lets a table leave L0 under a peer that overlaps it.
+///
+/// A table whose bounds do not translate into the tree's seqno space proves
+/// nothing, so it answers `false`: the exemption exists to let a PROVABLY safe
+/// move through, and no proof means the move is refused like any other overlap.
+fn proven_older(table: &Table, other: &Table) -> bool {
+    match (table.seqno_range(), other.seqno_range()) {
+        (Some((_, newest_moved)), Some((oldest_peer, _))) => newest_moved < oldest_peer,
+        _ => false,
+    }
 }
 
 fn overlaps(a: &Table, b: &Table, comparator: &dyn crate::comparator::UserComparator) -> bool {
