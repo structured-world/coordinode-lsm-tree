@@ -828,6 +828,9 @@ pub struct RuntimeConfig {
     /// is asking for ratio, so the ratio is what it keeps giving. Turn it off to
     /// buy back roughly half the write time on those levels at that cost, and
     /// only there: every level below 19 picks another strategy and ignores this.
+    /// The numbers behind the default, and when a deployment would want the
+    /// other one, are written down in `docs/compression.md`.
+    ///
     /// Takes effect on the next block written by any path that compresses:
     /// flush, compaction, ingestion, blob writes, and the index and filter
     /// blocks, which carry their own compression policy. Blocks already on disk
