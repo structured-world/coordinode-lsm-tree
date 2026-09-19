@@ -22,7 +22,11 @@ use once_cell::race::OnceBox;
 #[cfg(zstd_any)]
 pub trait CompressionProvider {
     /// Compress `data` at the given zstd level (1–22).
-    fn compress(data: &[u8], level: i32) -> crate::Result<Vec<u8>>;
+    ///
+    /// `two_pass_seed` selects whether levels 19-22 run the `btultra2` seed
+    /// pass; it has no effect below 19, where another strategy applies. See
+    /// [`crate::runtime_config::RuntimeConfig::zstd_two_pass_seed`].
+    fn compress(data: &[u8], level: i32, two_pass_seed: bool) -> crate::Result<Vec<u8>>;
 
     /// Compress `data`, additionally returning the inner zstd-block layout of
     /// the produced frame: the cumulative decompressed END offset of each inner
@@ -40,7 +44,11 @@ pub trait CompressionProvider {
     /// # Errors
     ///
     /// Returns an error if compression fails.
-    fn compress_with_layout(data: &[u8], level: i32) -> crate::Result<(Vec<u8>, Vec<u32>)>;
+    fn compress_with_layout(
+        data: &[u8],
+        level: i32,
+        two_pass_seed: bool,
+    ) -> crate::Result<(Vec<u8>, Vec<u32>)>;
 
     /// Decompress a zstd frame, pre-allocating `capacity` bytes.
     fn decompress(data: &[u8], capacity: usize) -> crate::Result<Vec<u8>>;
@@ -52,8 +60,14 @@ pub trait CompressionProvider {
     /// entropy tables and content, as `zstd --train` writes it) or raw content
     /// bytes (bare bytes used as LZ77 history). It is prepared for the encoder
     /// once and shared across calls and threads, so no call parses or copies it.
-    fn compress_with_dict(data: &[u8], level: i32, dict: &ZstdDictionary)
-    -> crate::Result<Vec<u8>>;
+    ///
+    /// `two_pass_seed` carries the same meaning as on [`compress`](Self::compress).
+    fn compress_with_dict(
+        data: &[u8],
+        level: i32,
+        dict: &ZstdDictionary,
+        two_pass_seed: bool,
+    ) -> crate::Result<Vec<u8>>;
 
     /// Decompress a zstd frame that was compressed with a dictionary.
     ///

@@ -845,13 +845,21 @@ impl Block {
 
             #[cfg(zstd_any)]
             CompressionType::Zstd(level) => {
+                let two_pass_seed = transform.two_pass_seed();
                 if block_type == BlockType::Data {
-                    let (buf, lay) =
-                        crate::compression::ZstdBackend::compress_with_layout(data, level)?;
+                    let (buf, lay) = crate::compression::ZstdBackend::compress_with_layout(
+                        data,
+                        level,
+                        two_pass_seed,
+                    )?;
                     compressed_buf = Some(buf);
                     layout = lay;
                 } else {
-                    compressed_buf = Some(crate::compression::ZstdBackend::compress(data, level)?);
+                    compressed_buf = Some(crate::compression::ZstdBackend::compress(
+                        data,
+                        level,
+                        two_pass_seed,
+                    )?);
                 }
             }
 
@@ -869,7 +877,10 @@ impl Block {
                 }
 
                 compressed_buf = Some(crate::compression::ZstdBackend::compress_with_dict(
-                    data, level, dict,
+                    data,
+                    level,
+                    dict,
+                    transform.two_pass_seed(),
                 )?);
             }
         }

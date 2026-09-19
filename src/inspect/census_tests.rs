@@ -80,7 +80,8 @@ mod with_zstd {
 
     #[test]
     fn census_real_frame_walks_to_last_block() {
-        let frame = crate::compression::ZstdBackend::compress(&vec![0x5Au8; 8192], 3).unwrap();
+        let frame =
+            crate::compression::ZstdBackend::compress(&vec![0x5Au8; 8192], 3, true).unwrap();
         assert!(is_zstd_frame(&frame));
         let census = census_zstd_frame(&frame).unwrap();
         assert!(!census.blocks.is_empty());
@@ -101,7 +102,8 @@ mod with_zstd {
 
     #[test]
     fn census_real_frame_rejects_truncation() {
-        let frame = crate::compression::ZstdBackend::compress(&vec![0x7Eu8; 4096], 3).unwrap();
+        let frame =
+            crate::compression::ZstdBackend::compress(&vec![0x7Eu8; 4096], 3, true).unwrap();
         let truncated = &frame[..frame.len() - 8];
         let err = census_zstd_frame(truncated).unwrap_err();
         assert!(matches!(err, crate::Error::InvalidHeader(_)));

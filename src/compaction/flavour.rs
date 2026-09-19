@@ -236,11 +236,16 @@ pub(super) fn prepare_table_writer(
     // collection spares what a held snapshot names, however the policy has
     // changed since.
     #[cfg(zstd_any)]
-    let table_writer = table_writer.use_zstd_dictionary(
-        opts.config
-            .current_zstd_dictionaries()
-            .for_compression(data_block_compression)?,
-    );
+    let table_writer = table_writer
+        .use_zstd_dictionary(
+            opts.config
+                .current_zstd_dictionaries()
+                .for_compression(data_block_compression)?,
+        )
+        // Live like the settings above: a compaction started after a toggle
+        // writes its outputs under the new strategy, which is how existing
+        // SSTs migrate to it.
+        .use_zstd_two_pass_seed(rc.zstd_two_pass_seed);
 
     // Parallel block compression: hand the (per-tree or caller-shared) pool to
     // the writer so its CPU-bound transform work runs on worker threads while

@@ -57,6 +57,11 @@ pub struct MultiWriter {
     #[cfg(zstd_any)]
     zstd_dictionary: Option<alloc::sync::Arc<crate::compression::ZstdDictionary>>,
 
+    /// Whether zstd levels 19-22 run the `btultra2` two-pass seed, shared
+    /// across all rotated writers so one run is uniform.
+    #[cfg(zstd_any)]
+    zstd_two_pass_seed: bool,
+
     /// The tree's dictionary set, used to PIN the dictionary each finished file
     /// records on its handle (see `blob_file::Inner::zstd_dictionary`).
     ///
@@ -107,6 +112,8 @@ impl MultiWriter {
 
             #[cfg(zstd_any)]
             zstd_dictionary: None,
+            #[cfg(zstd_any)]
+            zstd_two_pass_seed: true,
             #[cfg(zstd_any)]
             zstd_dictionaries: crate::compression::ZstdDictionaries::new(),
 
@@ -195,7 +202,9 @@ impl MultiWriter {
             w.metadata_compression_override = Some(passthrough);
         }
         #[cfg(zstd_any)]
-        let w = w.use_zstd_dictionary(self.zstd_dictionary.clone());
+        let w = w
+            .use_zstd_dictionary(self.zstd_dictionary.clone())
+            .use_zstd_two_pass_seed(self.zstd_two_pass_seed);
         Ok(w)
     }
 
@@ -220,6 +229,19 @@ impl MultiWriter {
     ) -> Self {
         self.active_writer = self.active_writer.use_zstd_dictionary(dict.clone());
         self.zstd_dictionary = dict;
+        self
+    }
+
+    /// Selects whether zstd levels 19-22 run the `btultra2` two-pass seed,
+    /// propagated to every rotated writer so all blob files of one run are
+    /// written under the same strategy.
+    ///
+    /// See [`crate::runtime_config::RuntimeConfig::zstd_two_pass_seed`].
+    #[cfg(zstd_any)]
+    #[must_use]
+    pub fn use_zstd_two_pass_seed(mut self, enabled: bool) -> Self {
+        self.active_writer = self.active_writer.use_zstd_two_pass_seed(enabled);
+        self.zstd_two_pass_seed = enabled;
         self
     }
 

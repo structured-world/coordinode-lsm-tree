@@ -815,6 +815,23 @@ pub struct RuntimeConfig {
     /// written with, and a missing section just means no block-skip for that SST.
     pub zone_map: bool,
 
+    /// Whether zstd levels 19-22 run the `btultra2` two-pass statistics seed.
+    ///
+    /// Those levels select the `btultra2` strategy, which walks the block once
+    /// to seed its statistics before the pass that actually emits. The seed
+    /// roughly doubles the cost of compressing a block and buys between nothing
+    /// and a fraction of a percent of ratio, depending on how much structure the
+    /// data has: none on uniform or incompressible blocks, around half a percent
+    /// on text.
+    ///
+    /// Default `true`, which is the codec's own behaviour: asking for level 22
+    /// is asking for ratio, so the ratio is what it keeps giving. Turn it off to
+    /// buy back roughly half the write time on those levels at that cost, and
+    /// only there: every level below 19 picks another strategy and ignores this.
+    /// Takes effect on the next block written; blocks already on disk are
+    /// unaffected and decode the same either way.
+    pub zstd_two_pass_seed: bool,
+
     /// Whether new SSTs store their data column-organized (a PAX row-group per
     /// block) instead of row-major. The entry's intrinsic fields (user key,
     /// seqno, value type, value) become separate per-block columns, so a scan
@@ -990,6 +1007,8 @@ impl Default for RuntimeConfig {
             auto_heal: false,
             seqno_in_index: false,
             zone_map: false,
+            // The codec's own behaviour at levels 19-22; see the field docs.
+            zstd_two_pass_seed: true,
             columnar: false,
             delete_strategy: crate::config::DeleteStrategyPolicy::default(),
             // Uncompressed at level 0: a flush is on the write path and its

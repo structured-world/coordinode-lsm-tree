@@ -350,6 +350,12 @@ pub struct Writer {
     #[cfg(zstd_any)]
     zstd_dictionary: Option<Arc<crate::compression::ZstdDictionary>>,
 
+    /// Whether zstd levels 19-22 run the `btultra2` two-pass seed. Defaults to
+    /// `true`, the codec's own behaviour; set from the live runtime config via
+    /// [`Self::use_zstd_two_pass_seed`].
+    #[cfg(zstd_any)]
+    zstd_two_pass_seed: bool,
+
     /// Optional executor for parallel block compression. `None` (default) =
     /// serial path: each block is compressed and written inline. `Some` =
     /// blocks are compressed on worker threads while writes stay ordered here.
@@ -500,6 +506,8 @@ impl Writer {
 
             #[cfg(zstd_any)]
             zstd_dictionary: None,
+            #[cfg(zstd_any)]
+            zstd_two_pass_seed: true,
 
             #[cfg(feature = "std")]
             spawner: None,
@@ -710,6 +718,17 @@ impl Writer {
         self.index_writer = self.index_writer.use_encryption(encryption.clone());
         self.filter_writer = self.filter_writer.use_encryption(encryption.clone());
         self.encryption = encryption;
+        self
+    }
+
+    /// Selects whether zstd levels 19-22 run the `btultra2` two-pass seed.
+    ///
+    /// See [`crate::runtime_config::RuntimeConfig::zstd_two_pass_seed`]. Has no
+    /// effect below level 19, where another strategy applies.
+    #[cfg(zstd_any)]
+    #[must_use]
+    pub fn use_zstd_two_pass_seed(mut self, enabled: bool) -> Self {
+        self.zstd_two_pass_seed = enabled;
         self
     }
 
@@ -1333,6 +1352,8 @@ impl Writer {
                 #[cfg(zstd_any)]
                 self.zstd_dictionary.as_deref(),
             )?;
+            #[cfg(zstd_any)]
+            let t = t.with_two_pass_seed(self.zstd_two_pass_seed);
             if let Some(ecc) = self.ecc {
                 t.with_ecc(ecc)
             } else {
@@ -1423,6 +1444,8 @@ impl Writer {
                 #[cfg(zstd_any)]
                 self.zstd_dictionary.as_deref(),
             )?;
+            #[cfg(zstd_any)]
+            let t = t.with_two_pass_seed(self.zstd_two_pass_seed);
             if let Some(ecc) = self.ecc {
                 t.with_ecc(ecc)
             } else {
@@ -2032,6 +2055,8 @@ impl Writer {
                 self.encryption.clone(),
                 #[cfg(zstd_any)]
                 self.zstd_dictionary.clone(),
+                #[cfg(zstd_any)]
+                self.zstd_two_pass_seed,
                 self.ecc,
             ));
         }

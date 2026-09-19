@@ -49,6 +49,8 @@ fn take_next_returns_blocks_in_submission_order() {
         None,
         #[cfg(zstd_any)]
         None,
+        #[cfg(zstd_any)]
+        true,
         None,
     );
     assert_eq!(c.pending(), 0);
@@ -83,6 +85,8 @@ fn take_next_reorders_out_of_order_completions() {
         None,
         #[cfg(zstd_any)]
         None,
+        #[cfg(zstd_any)]
+        true,
         None,
     );
 

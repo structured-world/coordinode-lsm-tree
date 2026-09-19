@@ -1171,6 +1171,7 @@ impl AbstractTree for BlobTree {
             #[cfg(zstd_any)]
             let w = w
                 .use_zstd_dictionary(dicts.for_compression(rc.blob_compression)?)
+                .use_zstd_two_pass_seed(rc.zstd_two_pass_seed)
                 .use_zstd_dictionaries(dicts);
             w
         };

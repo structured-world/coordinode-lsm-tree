@@ -183,8 +183,10 @@ mod measure {
         let compressed: Vec<Vec<u8>> = blocks
             .iter()
             .map(|b| match dict {
-                Some(d) => ZstdBackend::compress_with_dict(b, level, d).expect("dict compression"),
-                None => ZstdBackend::compress(b, level).expect("plain compression"),
+                Some(d) => {
+                    ZstdBackend::compress_with_dict(b, level, d, true).expect("dict compression")
+                }
+                None => ZstdBackend::compress(b, level, true).expect("plain compression"),
             })
             .collect();
         let write = started.elapsed();
@@ -312,9 +314,9 @@ mod measure {
                 // so an external implementation has something to disagree with
                 // per level rather than only at the default.
                 for &level in LEVELS {
-                    let plain = ZstdBackend::compress(&block, level).expect("plain");
+                    let plain = ZstdBackend::compress(&block, level, true).expect("plain");
                     let with_dict =
-                        ZstdBackend::compress_with_dict(&block, level, &dict).expect("dict");
+                        ZstdBackend::compress_with_dict(&block, level, &dict, true).expect("dict");
                     println!(
                         "dump {slug} {}K L{level}: raw {} ours-plain {} ours-dict {}",
                         block_size / 1024,
@@ -480,19 +482,20 @@ mod measure {
             // OUTPUT whether to probe, so what bounds that decision is the tail,
             // and a mean hides it.
             const PROBES: usize = 200;
-            let _ = ZstdBackend::compress(&sample, LEVEL);
+            let _ = ZstdBackend::compress(&sample, LEVEL, true);
             let mut plain_us = Vec::with_capacity(PROBES);
             for _ in 0..PROBES {
                 let started = Instant::now();
-                let _ = ZstdBackend::compress(&sample, LEVEL).expect("probe");
+                let _ = ZstdBackend::compress(&sample, LEVEL, true).expect("probe");
                 plain_us.push(started.elapsed().as_secs_f64() * 1e6);
             }
 
-            let _ = ZstdBackend::compress_with_dict(&sample, LEVEL, &dict);
+            let _ = ZstdBackend::compress_with_dict(&sample, LEVEL, &dict, true);
             let mut dict_us = Vec::with_capacity(PROBES);
             for _ in 0..PROBES {
                 let started = Instant::now();
-                let _ = ZstdBackend::compress_with_dict(&sample, LEVEL, &dict).expect("probe");
+                let _ =
+                    ZstdBackend::compress_with_dict(&sample, LEVEL, &dict, true).expect("probe");
                 dict_us.push(started.elapsed().as_secs_f64() * 1e6);
             }
 
