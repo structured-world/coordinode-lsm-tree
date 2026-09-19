@@ -14,6 +14,11 @@ use alloc::{boxed::Box, vec::Vec};
 
 pub struct FullIndexWriter {
     compression: CompressionType,
+
+    /// Whether zstd levels 19-22 run the `btultra2` two-pass seed. Defaults to
+    /// `true`, the codec's own behaviour.
+    #[cfg(zstd_any)]
+    zstd_two_pass_seed: bool,
     restart_interval: u8,
     block_handles: Vec<KeyedBlockHandle>,
     encryption: Option<Arc<dyn EncryptionProvider>>,
@@ -33,6 +38,8 @@ impl FullIndexWriter {
     pub fn new() -> Self {
         Self {
             compression: CompressionType::None,
+            #[cfg(zstd_any)]
+            zstd_two_pass_seed: true,
             restart_interval: 1,
             block_handles: Vec::new(),
             encryption: None,
@@ -65,6 +72,12 @@ impl<W: crate::io::Write + crate::io::Seek> BlockIndexWriter<W> for FullIndexWri
         compression: CompressionType,
     ) -> Box<dyn BlockIndexWriter<W>> {
         self.compression = compression;
+        self
+    }
+
+    #[cfg(zstd_any)]
+    fn use_zstd_two_pass_seed(mut self: Box<Self>, enabled: bool) -> Box<dyn BlockIndexWriter<W>> {
+        self.zstd_two_pass_seed = enabled;
         self
     }
 
@@ -131,6 +144,8 @@ impl<W: crate::io::Write + crate::io::Seek> BlockIndexWriter<W> for FullIndexWri
                     #[cfg(zstd_any)]
                     None,
                 )?;
+                #[cfg(zstd_any)]
+                let t = t.with_two_pass_seed(self.zstd_two_pass_seed);
                 if let Some(ecc) = self.ecc {
                     t.with_ecc(ecc)
                 } else {

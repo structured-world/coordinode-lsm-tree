@@ -185,11 +185,13 @@ impl<'a> Ingestion<'a> {
         // installed its tables, as in the flush.
         #[cfg(zstd_any)]
         {
-            writer = writer.use_zstd_dictionary(
-                tree.config
-                    .current_zstd_dictionaries()
-                    .for_compression(data_block_compression)?,
-            );
+            writer = writer
+                .use_zstd_dictionary(
+                    tree.config
+                        .current_zstd_dictionaries()
+                        .for_compression(data_block_compression)?,
+                )
+                .use_zstd_two_pass_seed(rc.zstd_two_pass_seed);
         }
 
         Ok(Self {

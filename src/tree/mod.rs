@@ -902,11 +902,13 @@ impl AbstractTree for Tree {
         // held snapshot names, however the policy has changed since.
         #[cfg(zstd_any)]
         {
-            table_writer = table_writer.use_zstd_dictionary(
-                self.config
-                    .current_zstd_dictionaries()
-                    .for_compression(data_block_compression)?,
-            );
+            table_writer = table_writer
+                .use_zstd_dictionary(
+                    self.config
+                        .current_zstd_dictionaries()
+                        .for_compression(data_block_compression)?,
+                )
+                .use_zstd_two_pass_seed(rc.zstd_two_pass_seed);
         }
         let write_pin = crate::runtime_config::WritePin::new(&rc);
 

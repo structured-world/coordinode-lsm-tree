@@ -729,6 +729,10 @@ impl Writer {
     #[must_use]
     pub fn use_zstd_two_pass_seed(mut self, enabled: bool) -> Self {
         self.zstd_two_pass_seed = enabled;
+        // Index and filter blocks follow their own compression policy, so they
+        // run their own encoders and have to be told separately.
+        self.index_writer = self.index_writer.use_zstd_two_pass_seed(enabled);
+        self.filter_writer = self.filter_writer.use_zstd_two_pass_seed(enabled);
         self
     }
 

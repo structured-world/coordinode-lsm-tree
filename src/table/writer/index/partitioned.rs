@@ -28,6 +28,11 @@ pub struct PartitionedIndexWriter {
     compression: CompressionType,
     restart_interval: u8,
 
+    /// Whether zstd levels 19-22 run the `btultra2` two-pass seed. Defaults to
+    /// `true`, the codec's own behaviour.
+    #[cfg(zstd_any)]
+    zstd_two_pass_seed: bool,
+
     tli_handles: Vec<KeyedBlockHandle>,
     data_block_handles: Vec<KeyedBlockHandle>,
 
@@ -63,6 +68,8 @@ impl PartitionedIndexWriter {
             partition_size: 4_096,
             compression: CompressionType::None,
             restart_interval: 1,
+            #[cfg(zstd_any)]
+            zstd_two_pass_seed: true,
 
             tli_handles: Vec::new(),
             data_block_handles: Vec::new(),
@@ -106,6 +113,8 @@ impl PartitionedIndexWriter {
                     #[cfg(zstd_any)]
                     None,
                 )?;
+                #[cfg(zstd_any)]
+                let t = t.with_two_pass_seed(self.zstd_two_pass_seed);
                 if let Some(ecc) = self.ecc {
                     t.with_ecc(ecc)
                 } else {
@@ -191,6 +200,8 @@ impl PartitionedIndexWriter {
                     #[cfg(zstd_any)]
                     None,
                 )?;
+                #[cfg(zstd_any)]
+                let t = t.with_two_pass_seed(self.zstd_two_pass_seed);
                 if let Some(ecc) = self.ecc {
                     t.with_ecc(ecc)
                 } else {
@@ -249,6 +260,12 @@ impl<W: crate::io::Write + crate::io::Seek> BlockIndexWriter<W> for PartitionedI
         compression: CompressionType,
     ) -> Box<dyn BlockIndexWriter<W>> {
         self.compression = compression;
+        self
+    }
+
+    #[cfg(zstd_any)]
+    fn use_zstd_two_pass_seed(mut self: Box<Self>, enabled: bool) -> Box<dyn BlockIndexWriter<W>> {
+        self.zstd_two_pass_seed = enabled;
         self
     }
 

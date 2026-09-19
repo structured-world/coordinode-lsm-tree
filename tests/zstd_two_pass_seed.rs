@@ -17,6 +17,63 @@ fn value_for(i: u64) -> Vec<u8> {
     format!("value-{i:06}-{}", "payload".repeat(8)).into_bytes()
 }
 
+/// The setting is documented as taking effect on the next block written, so a
+/// FLUSH has to honour it, not only a compaction. Proven by the bytes on disk:
+/// the same keys flushed under each setting produce different SSTs, which they
+/// cannot do if the flush ignores the flag.
+#[test]
+fn a_flush_honours_the_seed_setting() -> lsm_tree::Result<()> {
+    fn flush_bytes(seed: bool) -> lsm_tree::Result<u64> {
+        let folder = tempfile::tempdir()?;
+        let seqno = SequenceNumberCounter::default();
+        let tree = Config::new(&folder, seqno.clone(), SequenceNumberCounter::default())
+            .data_block_compression_policy(lsm_tree::config::CompressionPolicy::all(
+                CompressionType::Zstd(22),
+            ))
+            .open()?;
+        let lsm_tree::AnyTree::Standard(tree) = tree else {
+            panic!("standard tree configured (no kv separation)");
+        };
+        tree.update_runtime_config(|cfg| cfg.zstd_two_pass_seed = seed)?;
+
+        for i in 0..256u64 {
+            tree.insert(format!("key-{i:06}"), value_for(i), seqno.next());
+        }
+        tree.flush_active_memtable(0)?;
+
+        // The single table this flush produced, read straight off disk.
+        let mut tables: Vec<_> = std::fs::read_dir(folder.path().join("tables"))?
+            .filter_map(std::result::Result::ok)
+            .map(|e| e.path())
+            .filter(|p| p.is_file())
+            .collect();
+        tables.sort();
+        let table = tables
+            .first()
+            .unwrap_or_else(|| panic!("the flush must have written a table"));
+        Ok(std::fs::metadata(table)?.len())
+    }
+
+    // Sizes, not bytes: an SST carries ids and seqnos that differ between two
+    // otherwise identical runs, so only the compressed length is comparable.
+    // Two flushes under the SAME setting must agree on it, or the comparison
+    // below would be reading noise.
+    assert_eq!(
+        flush_bytes(true)?,
+        flush_bytes(true)?,
+        "the flushed size must be stable for the comparison below to mean anything",
+    );
+
+    let seeded = flush_bytes(true)?;
+    let single = flush_bytes(false)?;
+    assert_ne!(
+        seeded, single,
+        "a flush must write under the configured strategy, not the default",
+    );
+
+    Ok(())
+}
+
 #[test]
 fn a_tree_reads_back_what_it_wrote_without_the_two_pass_seed() -> lsm_tree::Result<()> {
     let folder = tempfile::tempdir()?;

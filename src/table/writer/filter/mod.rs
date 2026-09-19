@@ -42,6 +42,12 @@ pub trait FilterWriter<W: crate::io::Write + crate::io::Seek> {
         compression: CompressionType,
     ) -> Box<dyn FilterWriter<W>>;
 
+    /// Selects whether zstd levels 19-22 run the `btultra2` two-pass seed for
+    /// the blocks this writer compresses. See
+    /// [`crate::runtime_config::RuntimeConfig::zstd_two_pass_seed`].
+    #[cfg(zstd_any)]
+    fn use_zstd_two_pass_seed(self: Box<Self>, enabled: bool) -> Box<dyn FilterWriter<W>>;
+
     fn use_partition_size(self: Box<Self>, size: u32) -> Box<dyn FilterWriter<W>>;
 
     fn set_prefix_extractor(
