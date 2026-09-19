@@ -11,6 +11,17 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 
 ## [Unreleased]
 
+## [5.10.0](https://github.com/structured-world/coordinode-lsm-tree/compare/v5.9.0...v5.10.0) - 2026-09-19
+
+### Added
+
+- *(compression)* make the btultra2 two-pass seed switchable ([#656](https://github.com/structured-world/coordinode-lsm-tree/pull/656))
+
+### Fixed
+
+- *(compaction)* refuse a move that would hide the versions it moves ([#654](https://github.com/structured-world/coordinode-lsm-tree/pull/654))
+- *(merge)* hand the operator only a base the engine has proven ([#651](https://github.com/structured-world/coordinode-lsm-tree/pull/651))
+
 ## [5.9.0](https://github.com/structured-world/coordinode-lsm-tree/compare/v5.8.6...v5.9.0) - 2026-09-18
 
 ### Added
