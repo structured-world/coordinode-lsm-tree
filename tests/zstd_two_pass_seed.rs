@@ -22,7 +22,7 @@ fn value_for(i: u64) -> Vec<u8> {
 /// the same keys flushed under each setting produce different SSTs, which they
 /// cannot do if the flush ignores the flag.
 #[test]
-fn a_flush_honours_the_seed_setting() -> lsm_tree::Result<()> {
+fn flush_writes_under_the_configured_seed_setting() -> lsm_tree::Result<()> {
     fn flush_bytes(seed: bool) -> lsm_tree::Result<u64> {
         let folder = tempfile::tempdir()?;
         let seqno = SequenceNumberCounter::default();
@@ -68,7 +68,12 @@ fn a_flush_honours_the_seed_setting() -> lsm_tree::Result<()> {
     let single = flush_bytes(false)?;
     assert_ne!(
         seeded, single,
-        "a flush must write under the configured strategy, not the default",
+        "a flush must write under the configured strategy, not the default. \
+         The two strategies are only guaranteed to differ in the bytes they \
+         search, not in the bytes they emit, so this fixture was chosen because \
+         they do differ on it. If an encoder change ever makes the sizes equal \
+         here, the comparison has stopped proving anything: pick a fixture where \
+         they differ again rather than relaxing the assertion",
     );
 
     Ok(())

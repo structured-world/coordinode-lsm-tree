@@ -100,7 +100,7 @@ fn with_ecc_upgrades_encrypted_variants() {
 /// left alone: no encoder reads them.
 #[cfg(zstd_any)]
 #[test]
-fn the_two_pass_seed_setting_reaches_every_compressed_variant() {
+fn with_two_pass_seed_reaches_every_compressed_variant() {
     let zstd = || CompressionContext::new(CompressionType::Zstd(22)).expect("zstd ctx");
 
     assert!(
@@ -124,17 +124,39 @@ fn the_two_pass_seed_setting_reaches_every_compressed_variant() {
         "the default is the codec's own behaviour",
     );
 
-    let enc = crate::encryption::Aes256GcmProvider::new(&[0x22; 32]);
-    assert!(
-        BlockTransform::Encrypted(&enc).two_pass_seed(),
-        "encryption alone compresses nothing",
-    );
-    assert!(
-        !BlockTransform::CompressedAndEncrypted(zstd(), &enc)
-            .with_two_pass_seed(false)
-            .two_pass_seed(),
-    );
+    #[cfg(feature = "encryption")]
+    {
+        let enc = crate::encryption::Aes256GcmProvider::new(&[0x22; 32]);
+        assert!(
+            BlockTransform::Encrypted(&enc).two_pass_seed(),
+            "encryption alone compresses nothing",
+        );
+        assert!(
+            !BlockTransform::CompressedAndEncrypted(zstd(), &enc)
+                .with_two_pass_seed(false)
+                .two_pass_seed(),
+        );
 
+        #[cfg(feature = "page_ecc")]
+        {
+            let p = EccParams::try_new(8, 2).expect("valid shards");
+            assert!(matches!(
+                BlockTransform::Encrypted(&enc)
+                    .with_ecc(p)
+                    .with_two_pass_seed(false),
+                BlockTransform::EncryptedEcc(_, _)
+            ));
+            assert!(
+                !BlockTransform::CompressedAndEncrypted(zstd(), &enc)
+                    .with_ecc(p)
+                    .with_two_pass_seed(false)
+                    .two_pass_seed(),
+            );
+        }
+    }
+
+    // The ECC variants that carry no encryption are reachable without that
+    // feature, so they are covered on their own.
     #[cfg(feature = "page_ecc")]
     {
         let p = EccParams::try_new(8, 2).expect("valid shards");
@@ -147,21 +169,8 @@ fn the_two_pass_seed_setting_reaches_every_compressed_variant() {
             BlockTransform::Plain.with_ecc(p).with_two_pass_seed(false),
             BlockTransform::PlainEcc(_)
         ));
-        assert!(matches!(
-            BlockTransform::Encrypted(&enc)
-                .with_ecc(p)
-                .with_two_pass_seed(false),
-            BlockTransform::EncryptedEcc(_, _)
-        ));
-
         assert!(
             !BlockTransform::Compressed(zstd())
-                .with_ecc(p)
-                .with_two_pass_seed(false)
-                .two_pass_seed(),
-        );
-        assert!(
-            !BlockTransform::CompressedAndEncrypted(zstd(), &enc)
                 .with_ecc(p)
                 .with_two_pass_seed(false)
                 .two_pass_seed(),

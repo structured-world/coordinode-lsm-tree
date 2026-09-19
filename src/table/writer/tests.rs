@@ -452,7 +452,7 @@ fn write_columnar_batch_records_entry_precision_locator() -> crate::Result<()> {
 /// only slightly larger, so nothing else would notice the flip.
 #[cfg(zstd_any)]
 #[test]
-fn the_two_pass_seed_is_on_by_default_everywhere_a_writer_starts() -> crate::Result<()> {
+fn writer_keeps_the_two_pass_seed_on_by_default_across_subwriter_swaps() -> crate::Result<()> {
     assert!(
         crate::runtime_config::RuntimeConfig::default().zstd_two_pass_seed,
         "the runtime config ships with the seed on",

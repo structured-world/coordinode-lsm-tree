@@ -2658,9 +2658,10 @@ impl Writer {
                 dict_id: 0,
                 window_log: 0,
             },
-            // TLI tail mirror uses the same codec as the head and
-            // never carries a zstd dict. page_ecc upgrades the
-            // transform when the tree opted in.
+            // TLI tail mirror uses the same codec and the same zstd
+            // seed strategy as the head, and never carries a zstd
+            // dict. page_ecc upgrades the transform when the tree
+            // opted in.
             &{
                 let t = crate::table::block::BlockTransform::from_parts(
                     self.index_block_compression,
@@ -2668,6 +2669,8 @@ impl Writer {
                     #[cfg(zstd_any)]
                     None,
                 )?;
+                #[cfg(zstd_any)]
+                let t = t.with_two_pass_seed(self.zstd_two_pass_seed);
                 if let Some(ecc) = self.ecc {
                     t.with_ecc(ecc)
                 } else {
