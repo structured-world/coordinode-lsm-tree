@@ -244,6 +244,24 @@ pub fn do_compaction(opts: &Options) -> crate::Result<CompactionResult> {
                 }
             }
 
+            // A move relocates tables without reading them, so it may not
+            // change which version of a key a read reaches. Merging the same
+            // inputs would not rescue it: the output lands on the same level,
+            // under the same overlapping table. Refusing is the only sound
+            // answer, as this path already does for a strategy that hands over
+            // hidden tables. See `move_keeps_the_read_order`.
+            if !move_keeps_the_read_order(
+                &version_history_lock.latest_version_ref().version,
+                &payload,
+                opts.config.comparator.as_ref(),
+            ) {
+                log::warn!(
+                    "Compaction task created by {:?} would move tables beneath an overlapping table, hiding the versions it moved - declining to run it",
+                    opts.strategy.get_name(),
+                );
+                return Ok(CompactionResult::nothing());
+            }
+
             drop(version_history_lock);
 
             move_tables(&compaction_state, opts, &payload)
@@ -613,6 +631,54 @@ fn collect_version_tombstones(version: &Version) -> Vec<crate::range_tombstone::
         .flat_map(|run| run.iter())
         .flat_map(|t| t.range_tombstones().iter().cloned())
         .collect()
+}
+
+/// Whether relocating `payload.table_ids` to `payload.dest_level` leaves the
+/// point read reaching the same version of every key.
+///
+/// A move rewrites nothing: it just relabels which level the tables sit on. The
+/// read path walks levels from the top and stops at the first one holding the
+/// key, taking "higher" to mean "newer", and below L0 it also takes the runs of
+/// one level to be disjoint (it breaks at the first run whose range covers the
+/// key). A move that drops tables underneath an overlapping table breaks both
+/// readings at once: the older copy above now answers the read, and a key that
+/// lives only in the moved table can be missed entirely because the covering
+/// run above it does not hold it. Neither shows up as corruption, since both
+/// tables are intact on disk.
+///
+/// So a move is only trivial while nothing it would slide under overlaps it:
+/// every table outside the move, on a level at or above the destination other
+/// than L0, must be disjoint from the range being moved. L0 is exempt because
+/// the read path reads all of its runs and keeps the highest seqno, which is
+/// exactly the case this predicate exists to protect.
+fn move_keeps_the_read_order(
+    version: &Version,
+    payload: &CompactionPayload,
+    comparator: &dyn crate::comparator::UserComparator,
+) -> bool {
+    use crate::version::run::Ranged as _;
+
+    let moved = crate::KeyRange::aggregate_cmp(
+        version
+            .iter_tables()
+            .filter(|table| payload.table_ids.contains(&table.id()))
+            .map(Table::key_range),
+        comparator,
+    );
+
+    version
+        .iter_levels()
+        .enumerate()
+        .skip(1)
+        .take_while(|(idx, _)| *idx <= usize::from(payload.dest_level))
+        .flat_map(|(_, level)| level.iter())
+        .flat_map(|run| run.iter())
+        .filter(|table| !payload.table_ids.contains(&table.id()))
+        .all(|table| {
+            !table
+                .key_range()
+                .overlaps_with_key_range_cmp(&moved, comparator)
+        })
 }
 
 /// Whether this compaction holds every surviving version of the keys it reads,

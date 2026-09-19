@@ -3472,13 +3472,20 @@ fn a_rewrite_of_one_last_level_table_does_not_prove_absence() -> crate::Result<(
     )?;
 
     // A second run at the SAME last level, overlapping the first and holding
-    // only the operand.
+    // only the operand. Merged rather than moved: a move under an overlapping
+    // table is refused (it would hide what it moved), while a merge reads its
+    // input and is free to land beside the run already there.
     tree.merge("k", [0x02u8, 2], seqno.next());
     tree.flush_active_memtable(0)?;
-    tree.compact(
-        Arc::new(crate::compaction::MoveDown(0, last_level)),
-        seqno.get(),
-    )?;
+    let fresh = {
+        let version = tree.version_history.read().latest_version();
+        version
+            .version
+            .level(0)
+            .and_then(|level| level.iter().flat_map(|run| run.iter()).map(Table::id).max())
+            .ok_or_else(|| crate::Error::from(crate::io::Error::other("no L0 table")))?
+    };
+    tree.compact(Arc::new(RewriteOneTable(fresh, last_level)), seqno.get())?;
 
     let version = tree.version_history.read().latest_version();
     let level = version
@@ -3508,6 +3515,43 @@ fn a_rewrite_of_one_last_level_table_does_not_prove_absence() -> crate::Result<(
         Some(vec![1u8, 3]),
         tree.get("k", crate::MAX_SEQNO)?.map(|v| v.to_vec()),
         "the removal must still apply to the base the rewrite never read",
+    );
+
+    Ok(())
+}
+
+/// A trivial move relocates tables without reading them, which is only sound
+/// while it keeps the ordering the point read depends on: a level walk stops at
+/// the first level holding the key, so a table placed BELOW an overlapping one
+/// must not hold the newer version. Moving newer tables under older ones turns
+/// every read of those keys into the stale answer, with both tables intact on
+/// disk. The move has to become a merge instead.
+#[test]
+fn a_move_beneath_an_older_overlapping_table_does_not_stale_the_read() -> crate::Result<()> {
+    let dir = tempfile::tempdir()?;
+    let seqno = SequenceNumberCounter::default();
+    let config = Config::new(&dir, seqno.clone(), SequenceNumberCounter::default());
+    let last_level = config.level_count - 1;
+    let tree = config.open()?;
+
+    // The older version, parked on an upper level.
+    tree.insert("k", "old", seqno.next());
+    tree.flush_active_memtable(0)?;
+    tree.compact(Arc::new(crate::compaction::MoveDown(0, 1)), seqno.get())?;
+
+    // The newer version, aimed at the last level: below the one above, which
+    // still holds the same key.
+    tree.insert("k", "new", seqno.next());
+    tree.flush_active_memtable(0)?;
+    tree.compact(
+        Arc::new(crate::compaction::MoveDown(0, last_level)),
+        seqno.get(),
+    )?;
+
+    assert_eq!(
+        Some(&b"new"[..]),
+        tree.get("k", crate::MAX_SEQNO)?.as_deref(),
+        "the newer version must win wherever the compaction put it",
     );
 
     Ok(())
