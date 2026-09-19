@@ -828,8 +828,11 @@ pub struct RuntimeConfig {
     /// is asking for ratio, so the ratio is what it keeps giving. Turn it off to
     /// buy back roughly half the write time on those levels at that cost, and
     /// only there: every level below 19 picks another strategy and ignores this.
-    /// Takes effect on the next block written; blocks already on disk are
-    /// unaffected and decode the same either way.
+    /// Takes effect on the next block written by any path that compresses:
+    /// flush, compaction, ingestion, blob writes, and the index and filter
+    /// blocks, which carry their own compression policy. Blocks already on disk
+    /// are unaffected and decode the same either way, since nothing about a
+    /// block records which setting wrote it.
     pub zstd_two_pass_seed: bool,
 
     /// Whether new SSTs store their data column-organized (a PAX row-group per
