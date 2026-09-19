@@ -695,6 +695,37 @@ fn the_seed_setting_is_ignored_below_level_19() {
 }
 
 #[test]
+fn the_compressor_cache_key_ignores_the_seed_below_level_19() {
+    // The caches key on the strategy a compressor was built with, not on the
+    // setting that asked for it. Below 19 both settings build the identical
+    // compressor, so keying on the setting would throw one away (and, on the
+    // dictionary path, re-attach the dictionary) every time two jobs carrying
+    // different snapshots of it alternate on a worker thread.
+    for level in [1, 3, 9, 18] {
+        assert!(
+            !builds_a_single_pass_compressor(level, false),
+            "level {level} selects no btultra2, so there is no strategy to override",
+        );
+        assert_eq!(
+            builds_a_single_pass_compressor(level, true),
+            builds_a_single_pass_compressor(level, false),
+            "level {level} must map both settings onto one cache entry",
+        );
+    }
+
+    for level in [19, 20, 22] {
+        assert!(
+            builds_a_single_pass_compressor(level, false),
+            "level {level} runs the seed unless the strategy is overridden",
+        );
+        assert!(
+            !builds_a_single_pass_compressor(level, true),
+            "and keeps it when the setting is on",
+        );
+    }
+}
+
+#[test]
 fn a_single_pass_dictionary_frame_round_trips() {
     // The dictionary path configures its own compressor, so the setting has
     // to reach that one too.

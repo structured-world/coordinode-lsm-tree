@@ -831,11 +831,14 @@ pub struct RuntimeConfig {
     /// The numbers behind the default, and when a deployment would want the
     /// other one, are written down in `docs/compression.md`.
     ///
-    /// Takes effect on the next block written by any path that compresses:
-    /// flush, compaction, ingestion, blob writes, and the index and filter
-    /// blocks, which carry their own compression policy. Blocks already on disk
-    /// are unaffected and decode the same either way, since nothing about a
-    /// block records which setting wrote it.
+    /// Read once per writer, when a path that compresses starts one: flush,
+    /// compaction, ingestion, blob writes, and the index and filter writers,
+    /// which carry their own compression policy. So it takes effect on the next
+    /// such operation, not on the next block: an operation already running
+    /// keeps the setting it started with for every block it still writes and
+    /// every file it rotates into, which for a long compaction can be a while.
+    /// Blocks already on disk are unaffected and decode the same either way,
+    /// since nothing about a block records which setting wrote it.
     pub zstd_two_pass_seed: bool,
 
     /// Whether new SSTs store their data column-organized (a PAX row-group per

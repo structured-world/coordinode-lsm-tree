@@ -17,8 +17,8 @@ fn value_for(i: u64) -> Vec<u8> {
     format!("value-{i:06}-{}", "payload".repeat(8)).into_bytes()
 }
 
-/// The setting is documented as taking effect on the next block written, so a
-/// FLUSH has to honour it, not only a compaction. Proven by the bytes on disk:
+/// The setting is documented as taking effect on the next operation started, so
+/// a FLUSH has to honour it, not only a compaction. Proven by the bytes on disk:
 /// the same keys flushed under each setting produce different SSTs, which they
 /// cannot do if the flush ignores the flag.
 #[test]

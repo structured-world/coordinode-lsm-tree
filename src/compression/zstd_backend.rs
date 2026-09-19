@@ -342,6 +342,19 @@ fn inner_block_layout(
 /// switch, so the level presets are left exactly as the codec ships them.
 const FIRST_TWO_PASS_LEVEL: i32 = 19;
 
+/// Whether a compressor for `level` has to be built with the strategy
+/// overridden, which is the only thing the seed setting changes about one.
+///
+/// This is what the thread-local caches below key on, rather than the setting
+/// itself: below level 19 both settings build the identical compressor, so
+/// keying on the raw flag would rebuild one every time two jobs carrying
+/// different snapshots of the setting alternate on a worker thread, which a
+/// toggle during a long compaction makes routine. The rebuild also drops the
+/// attached dictionary on the path that has one.
+const fn builds_a_single_pass_compressor(level: i32, two_pass_seed: bool) -> bool {
+    !two_pass_seed && level >= FIRST_TWO_PASS_LEVEL
+}
+
 /// Applies the single-pass strategy to a compressor built for `level`.
 ///
 /// `btultra` is what level 18 selects: the same binary-tree finder and optimal
@@ -368,23 +381,25 @@ fn with_tls_compressor<R>(
 ) -> crate::Result<R> {
     use structured_zstd::encoding::{CompressionLevel, FrameCompressor};
 
-    // The seed setting is part of the cache key: a compressor carries the
-    // parameters it was built with, so a block written under one setting must
+    // The strategy is part of the cache key: a compressor carries the
+    // parameters it was built with, so a block written under one strategy must
     // not reuse the compressor configured for the other.
     thread_local! {
         static TLS_COMPRESSOR: std::cell::RefCell<Option<(i32, bool, FrameCompressor)>> =
             const { std::cell::RefCell::new(None) };
     }
 
+    let single_pass = builds_a_single_pass_compressor(level, two_pass_seed);
+
     TLS_COMPRESSOR.with(|cell| {
         let mut state = cell.borrow_mut();
-        if !matches!(&*state, Some((l, seed, _)) if *l == level && *seed == two_pass_seed) {
+        if !matches!(&*state, Some((l, cached, _)) if *l == level && *cached == single_pass) {
             let configured = CompressionLevel::from_level(level);
             let mut compressor = FrameCompressor::new(configured);
-            if !two_pass_seed && level >= FIRST_TWO_PASS_LEVEL {
+            if single_pass {
                 use_single_pass(&mut compressor, configured)?;
             }
-            *state = Some((level, two_pass_seed, compressor));
+            *state = Some((level, single_pass, compressor));
         }
         let Some((_, _, compressor)) = state.as_mut() else {
             unreachable!("TLS_COMPRESSOR initialised above");
@@ -447,32 +462,35 @@ impl CompressionProvider for ZstdProvider {
         //
         // One entry: a thread writes one (dictionary, level) pair for a whole
         // compaction job (a multi-entry cache is tracked in #231).
-        // The seed setting joins the key for the same reason it does on the
-        // dictionary-less path: the parameters live in the compressor.
+        // The strategy joins the key for the same reason it does on the
+        // dictionary-less path: the parameters live in the compressor. A miss
+        // costs more here, since it re-attaches the dictionary as well.
         thread_local! {
             static TLS_COMPRESSOR: std::cell::RefCell<Option<(u64, i32, bool, FrameCompressor)>> =
                 const { std::cell::RefCell::new(None) };
         }
 
+        let single_pass = builds_a_single_pass_compressor(level, two_pass_seed);
+
         TLS_COMPRESSOR.with(|cell| {
             let mut state = cell.borrow_mut();
             if !matches!(
                 &*state,
-                Some((key, l, seed, _))
-                    if *key == dict.id64() && *l == level && *seed == two_pass_seed
+                Some((key, l, cached, _))
+                    if *key == dict.id64() && *l == level && *cached == single_pass
             ) {
                 let configured = CompressionLevel::from_level(level);
                 let mut compressor = FrameCompressor::new(configured);
                 // Before the dictionary: attaching it builds match-finder state
                 // from the parameters in force, so the strategy has to be the
                 // final one by then.
-                if !two_pass_seed && level >= FIRST_TWO_PASS_LEVEL {
+                if single_pass {
                     use_single_pass(&mut compressor, configured)?;
                 }
                 compressor
                     .set_encoder_dictionary(dict.prepared_encoder()?)
                     .map_err(|e| crate::Error::Io(crate::io::Error::other(e.to_string())))?;
-                *state = Some((dict.id64(), level, two_pass_seed, compressor));
+                *state = Some((dict.id64(), level, single_pass, compressor));
             }
             let Some((_, _, _, compressor)) = state.as_mut() else {
                 unreachable!("TLS_COMPRESSOR initialised above");

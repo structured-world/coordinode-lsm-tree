@@ -64,3 +64,12 @@ encoder searches, never what the frame means, so:
 It applies to every path that compresses: flush, compaction, ingestion, blob
 writes, and the index and filter blocks, which carry their own compression
 policy and so run their own encoders.
+
+### When a change takes effect
+
+Each of those paths reads the setting once, as it builds its writer, and that
+writer keeps what it read until it finishes. A change therefore applies to the
+next operation started, not to the next block written: a compaction already
+running writes every remaining block, and every file it rotates into, under the
+setting it began with. Turning the seed off for immediate CPU relief will not
+shorten the compaction that is already running, only the ones after it.
