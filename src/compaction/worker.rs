@@ -615,6 +615,49 @@ fn collect_version_tombstones(version: &Version) -> Vec<crate::range_tombstone::
         .collect()
 }
 
+/// Whether this compaction holds every surviving version of the keys it reads,
+/// so that a key missing from its inputs is genuinely absent from the tree.
+///
+/// Neither the destination level nor the level layout proves that. A level can
+/// hold several overlapping runs, so rewriting part of one leaves older
+/// versions in a run that was never read; and a move can drop a NEWER entry
+/// into an empty last level while an OLDER one stays on a level above, so
+/// "nothing below me" is not "nothing older than me" either. What does prove it
+/// is that no table outside the inputs can hold another version of these keys:
+/// every table this compaction does not read is disjoint from the range it
+/// covers. The three decisions that turn "not in my inputs" into "not in the
+/// tree" hang off this: dropping a tombstone, zeroing a seqno, and folding
+/// merge operands onto an absent base.
+fn holds_every_surviving_version(
+    version: &Version,
+    table_ids: &HashSet<TableId>,
+    is_last_level: bool,
+    comparator: &dyn crate::comparator::UserComparator,
+) -> bool {
+    use crate::version::run::Ranged as _;
+
+    if !is_last_level {
+        return false;
+    }
+
+    let covered = crate::KeyRange::aggregate_cmp(
+        version
+            .iter_tables()
+            .filter(|table| table_ids.contains(&table.id()))
+            .map(Table::key_range),
+        comparator,
+    );
+
+    version
+        .iter_tables()
+        .filter(|table| !table_ids.contains(&table.id()))
+        .all(|table| {
+            !table
+                .key_range()
+                .overlaps_with_key_range_cmp(&covered, comparator)
+        })
+}
+
 /// Garbage-collects range tombstones for a bottommost compaction's output.
 ///
 /// A tombstone at or below the watermark has been fully applied (every live
@@ -1624,8 +1667,18 @@ fn run_subcompaction(
         Vec::new()
     };
 
+    // Dropping a tombstone, zeroing a seqno and folding operands onto an absent
+    // base all read "not in my inputs" as "not in the tree", so they need the
+    // stronger premise than the destination level alone.
+    let holds_everything = holds_every_surviving_version(
+        version,
+        &payload.table_ids,
+        is_last_level,
+        opts.config.comparator.as_ref(),
+    );
+
     merge_iter = merge_iter
-        .evict_tombstones(is_last_level)
+        .evict_tombstones(holds_everything)
         .zero_seqnos(false);
     if is_last_level {
         merge_iter = merge_iter.with_range_tombstone_application(
@@ -1690,7 +1743,7 @@ fn run_subcompaction(
     // levels outside this compaction still blocks zeroing.
     let merge_iter = super::seqno_zeroer::BottommostSeqnoZeroer::new(
         merge_iter,
-        is_last_level,
+        holds_everything,
         version_tombstones,
         opts.gc_watermark,
         opts.config.comparator.clone(),
@@ -2514,8 +2567,17 @@ fn merge_tables(
     let dst_lvl = payload.canonical_level.into();
     let is_last_level = payload.dest_level == opts.config.level_count - 1;
 
+    // See `holds_every_surviving_version`: the destination level alone does not
+    // prove that a key missing from the inputs is missing from the tree.
+    let holds_everything = holds_every_surviving_version(
+        &current_super_version.version,
+        &payload.table_ids,
+        is_last_level,
+        opts.config.comparator.as_ref(),
+    );
+
     merge_iter = merge_iter
-        .evict_tombstones(is_last_level)
+        .evict_tombstones(holds_everything)
         .zero_seqnos(false);
 
     // Whole-version tombstones for compaction-time RT application (drop covered
@@ -2707,7 +2769,7 @@ fn merge_tables(
         // this runs on the `no_std` serial path too.
         let merge_iter = super::seqno_zeroer::BottommostSeqnoZeroer::new(
             merge_iter,
-            is_last_level,
+            holds_everything,
             zeroing_tombstones,
             opts.gc_watermark,
             opts.config.comparator.clone(),
