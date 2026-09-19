@@ -296,6 +296,7 @@ impl<'a, 'b: 'a> StreamFilterAdapter<'a, 'b> {
                 let dicts = self.shared.opts.config.current_zstd_dictionaries();
                 writer
                     .use_zstd_dictionary(dicts.for_compression(rc.blob_compression)?)
+                    .use_zstd_two_pass_seed(rc.zstd_two_pass_seed)
                     .use_zstd_dictionaries(dicts)
             };
 

@@ -350,6 +350,12 @@ pub struct Writer {
     #[cfg(zstd_any)]
     zstd_dictionary: Option<Arc<crate::compression::ZstdDictionary>>,
 
+    /// Whether zstd levels 19-22 run the `btultra2` two-pass seed. Defaults to
+    /// `true`, the codec's own behaviour; set from the live runtime config via
+    /// [`Self::use_zstd_two_pass_seed`].
+    #[cfg(zstd_any)]
+    zstd_two_pass_seed: bool,
+
     /// Optional executor for parallel block compression. `None` (default) =
     /// serial path: each block is compressed and written inline. `Some` =
     /// blocks are compressed on worker threads while writes stay ordered here.
@@ -500,6 +506,8 @@ impl Writer {
 
             #[cfg(zstd_any)]
             zstd_dictionary: None,
+            #[cfg(zstd_any)]
+            zstd_two_pass_seed: true,
 
             #[cfg(feature = "std")]
             spawner: None,
@@ -581,19 +589,24 @@ impl Writer {
     #[must_use]
     pub fn use_partitioned_filter(mut self) -> Self {
         self.assert_not_started("partitioned filter");
-        self.filter_writer = Box::new(filter::PartitionedFilterWriter::new(self.bloom_policy))
+        let filter_writer = Box::new(filter::PartitionedFilterWriter::new(self.bloom_policy))
             .use_tli_compression(self.index_block_compression)
             .use_partition_size(self.meta_partition_size)
             .set_prefix_extractor(self.prefix_extractor.clone())
             .use_encryption(self.encryption.clone())
             .use_table_id(self.table_id);
+        // Replacing a subwriter re-applies the settings already chosen, so the
+        // builder reads the same whatever order its methods are called in.
+        #[cfg(zstd_any)]
+        let filter_writer = filter_writer.use_zstd_two_pass_seed(self.zstd_two_pass_seed);
+        self.filter_writer = filter_writer;
         self
     }
 
     #[must_use]
     pub fn use_partitioned_index(mut self) -> Self {
         self.assert_not_started("partitioned index");
-        self.index_writer = Box::new(index::PartitionedIndexWriter::new())
+        let index_writer = Box::new(index::PartitionedIndexWriter::new())
             .use_compression(self.index_block_compression)
             .use_partition_size(self.meta_partition_size)
             .use_restart_interval(self.index_block_restart_interval)
@@ -602,6 +615,10 @@ impl Writer {
             // Reapply page_ecc — swapping the index writer would otherwise drop
             // a flag set earlier in the builder chain (order-independence).
             .use_ecc(self.ecc);
+        // Same reason as page_ecc above.
+        #[cfg(zstd_any)]
+        let index_writer = index_writer.use_zstd_two_pass_seed(self.zstd_two_pass_seed);
+        self.index_writer = index_writer;
         self
     }
 
@@ -613,7 +630,7 @@ impl Writer {
     #[must_use]
     pub fn use_adaptive_index(mut self, spill_threshold: u64) -> Self {
         self.assert_not_started("adaptive index");
-        self.index_writer = Box::new(index::AdaptiveIndexWriter::new(spill_threshold))
+        let index_writer = Box::new(index::AdaptiveIndexWriter::new(spill_threshold))
             .use_compression(self.index_block_compression)
             .use_partition_size(self.meta_partition_size)
             .use_restart_interval(self.index_block_restart_interval)
@@ -624,6 +641,10 @@ impl Writer {
             // order (otherwise the table mixes ECC and non-ECC index blocks
             // while `Writer` still records ECC as enabled).
             .use_ecc(self.ecc);
+        // Same reason as page_ecc above.
+        #[cfg(zstd_any)]
+        let index_writer = index_writer.use_zstd_two_pass_seed(self.zstd_two_pass_seed);
+        self.index_writer = index_writer;
         self
     }
 
@@ -710,6 +731,21 @@ impl Writer {
         self.index_writer = self.index_writer.use_encryption(encryption.clone());
         self.filter_writer = self.filter_writer.use_encryption(encryption.clone());
         self.encryption = encryption;
+        self
+    }
+
+    /// Selects whether zstd levels 19-22 run the `btultra2` two-pass seed.
+    ///
+    /// See [`crate::runtime_config::RuntimeConfig::zstd_two_pass_seed`]. Has no
+    /// effect below level 19, where another strategy applies.
+    #[cfg(zstd_any)]
+    #[must_use]
+    pub fn use_zstd_two_pass_seed(mut self, enabled: bool) -> Self {
+        self.zstd_two_pass_seed = enabled;
+        // Index and filter blocks follow their own compression policy, so they
+        // run their own encoders and have to be told separately.
+        self.index_writer = self.index_writer.use_zstd_two_pass_seed(enabled);
+        self.filter_writer = self.filter_writer.use_zstd_two_pass_seed(enabled);
         self
     }
 
@@ -1333,6 +1369,8 @@ impl Writer {
                 #[cfg(zstd_any)]
                 self.zstd_dictionary.as_deref(),
             )?;
+            #[cfg(zstd_any)]
+            let t = t.with_two_pass_seed(self.zstd_two_pass_seed);
             if let Some(ecc) = self.ecc {
                 t.with_ecc(ecc)
             } else {
@@ -1423,6 +1461,8 @@ impl Writer {
                 #[cfg(zstd_any)]
                 self.zstd_dictionary.as_deref(),
             )?;
+            #[cfg(zstd_any)]
+            let t = t.with_two_pass_seed(self.zstd_two_pass_seed);
             if let Some(ecc) = self.ecc {
                 t.with_ecc(ecc)
             } else {
@@ -2032,6 +2072,8 @@ impl Writer {
                 self.encryption.clone(),
                 #[cfg(zstd_any)]
                 self.zstd_dictionary.clone(),
+                #[cfg(zstd_any)]
+                self.zstd_two_pass_seed,
                 self.ecc,
             ));
         }
@@ -2616,9 +2658,10 @@ impl Writer {
                 dict_id: 0,
                 window_log: 0,
             },
-            // TLI tail mirror uses the same codec as the head and
-            // never carries a zstd dict. page_ecc upgrades the
-            // transform when the tree opted in.
+            // TLI tail mirror uses the same codec and the same zstd
+            // seed strategy as the head, and never carries a zstd
+            // dict. page_ecc upgrades the transform when the tree
+            // opted in.
             &{
                 let t = crate::table::block::BlockTransform::from_parts(
                     self.index_block_compression,
@@ -2626,6 +2669,8 @@ impl Writer {
                     #[cfg(zstd_any)]
                     None,
                 )?;
+                #[cfg(zstd_any)]
+                let t = t.with_two_pass_seed(self.zstd_two_pass_seed);
                 if let Some(ecc) = self.ecc {
                     t.with_ecc(ecc)
                 } else {

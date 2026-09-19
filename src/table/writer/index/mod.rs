@@ -42,6 +42,14 @@ pub trait BlockIndexWriter<W: crate::io::Write + crate::io::Seek> {
         compression: CompressionType,
     ) -> Box<dyn BlockIndexWriter<W>>;
 
+    /// Selects whether zstd levels 19-22 run the `btultra2` two-pass seed for
+    /// the index blocks this writer compresses. Index blocks follow their own
+    /// compression policy, so the setting has to reach them separately from the
+    /// data blocks. See
+    /// [`crate::runtime_config::RuntimeConfig::zstd_two_pass_seed`].
+    #[cfg(zstd_any)]
+    fn use_zstd_two_pass_seed(self: Box<Self>, enabled: bool) -> Box<dyn BlockIndexWriter<W>>;
+
     // No default: `Box<Self> -> Box<dyn>` requires `Sized` which would break
     // object safety. Same constraint applies to all `use_*` builder methods.
     fn use_restart_interval(self: Box<Self>, interval: u8) -> Box<dyn BlockIndexWriter<W>>;

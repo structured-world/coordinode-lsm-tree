@@ -144,6 +144,12 @@ pub struct Writer {
     /// `compression` is [`CompressionType::ZstdDict`].
     #[cfg(zstd_any)]
     pub(crate) zstd_dictionary: Option<alloc::sync::Arc<crate::compression::ZstdDictionary>>,
+
+    /// Whether zstd levels 19-22 run the `btultra2` two-pass seed. Defaults to
+    /// `true`, the codec's own behaviour; set from the live runtime config via
+    /// [`Self::use_zstd_two_pass_seed`].
+    #[cfg(zstd_any)]
+    pub(crate) zstd_two_pass_seed: bool,
 }
 
 impl Writer {
@@ -210,6 +216,8 @@ impl Writer {
 
             #[cfg(zstd_any)]
             zstd_dictionary: None,
+            #[cfg(zstd_any)]
+            zstd_two_pass_seed: true,
         })
     }
 
@@ -222,6 +230,17 @@ impl Writer {
     #[must_use]
     pub fn use_sync_mode(mut self, sync_mode: SyncMode) -> Self {
         self.sync_mode = sync_mode;
+        self
+    }
+
+    /// Selects whether zstd levels 19-22 run the `btultra2` two-pass seed.
+    ///
+    /// See [`crate::runtime_config::RuntimeConfig::zstd_two_pass_seed`]. Has no
+    /// effect below level 19, where another strategy applies.
+    #[cfg(zstd_any)]
+    #[must_use]
+    pub fn use_zstd_two_pass_seed(mut self, enabled: bool) -> Self {
+        self.zstd_two_pass_seed = enabled;
         self
     }
 
@@ -265,6 +284,9 @@ impl Writer {
         check_size_cap(uncompressed_len as usize)?;
         check_size_cap(value.len())?;
 
+        #[cfg(zstd_any)]
+        let two_pass_seed = self.zstd_two_pass_seed;
+
         // Perform compression before mutating writer state, so an error
         // leaves the writer consistent. Post-compression output is also
         // checked against the cap (reuses DecompressedSizeTooLarge since
@@ -282,7 +304,8 @@ impl Writer {
 
             #[cfg(zstd_any)]
             CompressionType::Zstd(level) => {
-                let compressed = crate::compression::ZstdBackend::compress(value, *level)?;
+                let compressed =
+                    crate::compression::ZstdBackend::compress(value, *level, two_pass_seed)?;
                 check_size_cap(compressed.len())?;
                 alloc::borrow::Cow::Owned(compressed)
             }
@@ -302,8 +325,12 @@ impl Writer {
                         got: Some(dict.id()),
                     });
                 }
-                let compressed =
-                    crate::compression::ZstdBackend::compress_with_dict(value, *level, dict)?;
+                let compressed = crate::compression::ZstdBackend::compress_with_dict(
+                    value,
+                    *level,
+                    dict,
+                    two_pass_seed,
+                )?;
                 check_size_cap(compressed.len())?;
                 alloc::borrow::Cow::Owned(compressed)
             }

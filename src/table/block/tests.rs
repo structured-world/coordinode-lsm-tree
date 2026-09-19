@@ -693,7 +693,7 @@ fn zstd_corrupted_uncompressed_length_triggers_decompress_error() {
     // Fully-qualified path resolves the trait method unambiguously without
     // needing `use CompressionProvider` in this test module scope.
     let compressed =
-        crate::compression::ZstdBackend::compress(payload, 3).expect("zstd compress failed");
+        crate::compression::ZstdBackend::compress(payload, 3, true).expect("zstd compress failed");
 
     let data_length = compressed.len() as u32;
     let uncompressed_length_corrupted = payload.len() as u32 + 1;
@@ -739,7 +739,7 @@ fn zstd_decreased_uncompressed_length_triggers_decompress_error() {
     let payload: &[u8] = b"hello world hello world hello world";
 
     let compressed =
-        crate::compression::ZstdBackend::compress(payload, 3).expect("zstd compress failed");
+        crate::compression::ZstdBackend::compress(payload, 3, true).expect("zstd compress failed");
 
     let data_length = compressed.len() as u32;
     // Set uncompressed_length smaller than real decompressed size.

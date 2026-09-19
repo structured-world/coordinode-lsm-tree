@@ -226,6 +226,13 @@ impl EccParams {
 pub struct CompressionContext<'a> {
     kind: CompressionType,
 
+    /// Whether zstd levels 19-22 run the `btultra2` two-pass seed. Defaults to
+    /// `true`, the codec's own behaviour; the writer overrides it from the live
+    /// runtime config. Carried per block because that is the granularity the
+    /// encoder is configured at.
+    #[cfg(zstd_any)]
+    two_pass_seed: bool,
+
     #[cfg(zstd_any)]
     zstd_dict: Option<&'a ZstdDictionary>,
 
@@ -284,6 +291,8 @@ impl<'a> CompressionContext<'a> {
         Ok(Self {
             kind,
             #[cfg(zstd_any)]
+            two_pass_seed: true,
+            #[cfg(zstd_any)]
             zstd_dict: None,
             #[cfg(not(zstd_any))]
             _lifetime: core::marker::PhantomData,
@@ -311,8 +320,29 @@ impl<'a> CompressionContext<'a> {
                 level,
                 dict_id: dict.id(),
             },
+            two_pass_seed: true,
             zstd_dict: Some(dict),
         }
+    }
+
+    /// Selects whether zstd levels 19-22 run the `btultra2` two-pass seed.
+    ///
+    /// Only those levels select that strategy, so on any other level this
+    /// changes nothing. Leaving it at the default keeps the codec's own
+    /// behaviour. See
+    /// [`crate::runtime_config::RuntimeConfig::zstd_two_pass_seed`].
+    #[cfg(zstd_any)]
+    #[must_use]
+    pub fn with_two_pass_seed(mut self, enabled: bool) -> Self {
+        self.two_pass_seed = enabled;
+        self
+    }
+
+    /// Whether the two-pass seed is in force for this block.
+    #[cfg(zstd_any)]
+    #[must_use]
+    pub fn two_pass_seed(&self) -> bool {
+        self.two_pass_seed
     }
 
     /// On-disk codec discriminator.
@@ -437,6 +467,50 @@ impl BlockTransform<'_> {
             #[cfg(feature = "page_ecc")]
             Self::CompressedEcc(ctx, _) | Self::CompressedAndEncryptedEcc(ctx, _, _) => {
                 ctx.zstd_dict()
+            }
+        }
+    }
+
+    /// Selects whether zstd levels 19-22 run the `btultra2` two-pass seed.
+    ///
+    /// A no-op on variants that compress nothing. See
+    /// [`crate::runtime_config::RuntimeConfig::zstd_two_pass_seed`].
+    #[cfg(zstd_any)]
+    #[must_use]
+    pub fn with_two_pass_seed(self, enabled: bool) -> Self {
+        match self {
+            Self::Plain | Self::Encrypted(_) => self,
+            Self::Compressed(ctx) => Self::Compressed(ctx.with_two_pass_seed(enabled)),
+            Self::CompressedAndEncrypted(ctx, enc) => {
+                Self::CompressedAndEncrypted(ctx.with_two_pass_seed(enabled), enc)
+            }
+            #[cfg(feature = "page_ecc")]
+            Self::PlainEcc(_) | Self::EncryptedEcc(_, _) => self,
+            #[cfg(feature = "page_ecc")]
+            Self::CompressedEcc(ctx, ecc) => {
+                Self::CompressedEcc(ctx.with_two_pass_seed(enabled), ecc)
+            }
+            #[cfg(feature = "page_ecc")]
+            Self::CompressedAndEncryptedEcc(ctx, enc, ecc) => {
+                Self::CompressedAndEncryptedEcc(ctx.with_two_pass_seed(enabled), enc, ecc)
+            }
+        }
+    }
+
+    /// Whether zstd levels 19-22 run the `btultra2` two-pass seed for this
+    /// block. Variants that compress nothing report the default, which no
+    /// encoder ever reads.
+    #[cfg(zstd_any)]
+    #[must_use]
+    pub fn two_pass_seed(&self) -> bool {
+        match self {
+            Self::Plain | Self::Encrypted(_) => true,
+            Self::Compressed(ctx) | Self::CompressedAndEncrypted(ctx, _) => ctx.two_pass_seed(),
+            #[cfg(feature = "page_ecc")]
+            Self::PlainEcc(_) | Self::EncryptedEcc(_, _) => true,
+            #[cfg(feature = "page_ecc")]
+            Self::CompressedEcc(ctx, _) | Self::CompressedAndEncryptedEcc(ctx, _, _) => {
+                ctx.two_pass_seed()
             }
         }
     }

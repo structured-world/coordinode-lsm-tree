@@ -93,3 +93,87 @@ fn with_ecc_upgrades_encrypted_variants() {
         assert_eq!(t.compression(), CompressionType::Lz4);
     }
 }
+
+/// The seed setting has to survive every shape a transform can take, including
+/// the ECC variants, since a block written with parity compresses the same way
+/// as one without. Variants that compress nothing report the default and are
+/// left alone: no encoder reads them.
+#[cfg(zstd_any)]
+#[test]
+fn with_two_pass_seed_reaches_every_compressed_variant() {
+    let zstd = || CompressionContext::new(CompressionType::Zstd(22)).expect("zstd ctx");
+
+    assert!(
+        BlockTransform::Plain.two_pass_seed(),
+        "a transform that compresses nothing reports the default",
+    );
+    assert!(matches!(
+        BlockTransform::Plain.with_two_pass_seed(false),
+        BlockTransform::Plain
+    ));
+
+    assert!(
+        !BlockTransform::Compressed(zstd())
+            .with_two_pass_seed(false)
+            .two_pass_seed(),
+    );
+    assert!(
+        BlockTransform::Compressed(zstd())
+            .with_two_pass_seed(true)
+            .two_pass_seed(),
+        "the default is the codec's own behaviour",
+    );
+
+    #[cfg(feature = "encryption")]
+    {
+        let enc = crate::encryption::Aes256GcmProvider::new(&[0x22; 32]);
+        assert!(
+            BlockTransform::Encrypted(&enc).two_pass_seed(),
+            "encryption alone compresses nothing",
+        );
+        assert!(
+            !BlockTransform::CompressedAndEncrypted(zstd(), &enc)
+                .with_two_pass_seed(false)
+                .two_pass_seed(),
+        );
+
+        #[cfg(feature = "page_ecc")]
+        {
+            let p = EccParams::try_new(8, 2).expect("valid shards");
+            assert!(matches!(
+                BlockTransform::Encrypted(&enc)
+                    .with_ecc(p)
+                    .with_two_pass_seed(false),
+                BlockTransform::EncryptedEcc(_, _)
+            ));
+            assert!(
+                !BlockTransform::CompressedAndEncrypted(zstd(), &enc)
+                    .with_ecc(p)
+                    .with_two_pass_seed(false)
+                    .two_pass_seed(),
+            );
+        }
+    }
+
+    // The ECC variants that carry no encryption are reachable without that
+    // feature, so they are covered on their own.
+    #[cfg(feature = "page_ecc")]
+    {
+        let p = EccParams::try_new(8, 2).expect("valid shards");
+
+        assert!(
+            BlockTransform::Plain.with_ecc(p).two_pass_seed(),
+            "parity without compression reports the default",
+        );
+        assert!(matches!(
+            BlockTransform::Plain.with_ecc(p).with_two_pass_seed(false),
+            BlockTransform::PlainEcc(_)
+        ));
+        assert!(
+            !BlockTransform::Compressed(zstd())
+                .with_ecc(p)
+                .with_two_pass_seed(false)
+                .two_pass_seed(),
+        );
+    }
+}

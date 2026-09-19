@@ -116,6 +116,11 @@ pub struct MultiWriter {
     use_zone_map: bool,
 
     /// Preserved across writer rotation so every successor [`Writer`] of one
+    /// flush / compaction compresses under the same strategy.
+    #[cfg(zstd_any)]
+    use_zstd_two_pass_seed: bool,
+
+    /// Preserved across writer rotation so every successor [`Writer`] of one
     /// flush / compaction uniformly writes columnar (or row-major) data blocks.
     use_columnar: bool,
 
@@ -261,6 +266,8 @@ impl MultiWriter {
             kv_checksum: None,
             use_seqno_in_index: false,
             use_zone_map: false,
+            #[cfg(zstd_any)]
+            use_zstd_two_pass_seed: true,
             use_columnar: false,
             bulk_ingested: false,
             recency: None,
@@ -628,6 +635,17 @@ impl MultiWriter {
         self
     }
 
+    /// Wires the `zstd_two_pass_seed` runtime config through to the inner
+    /// [`Writer`] and preserves it across rotations, so every SST of one flush
+    /// or compaction is written under the same strategy.
+    #[cfg(zstd_any)]
+    #[must_use]
+    pub fn use_zstd_two_pass_seed(mut self, enabled: bool) -> Self {
+        self.use_zstd_two_pass_seed = enabled;
+        self.writer = self.writer.use_zstd_two_pass_seed(enabled);
+        self
+    }
+
     /// Enables the `zone_map` section on this writer and every successor it
     /// rotates to, so all SSTs of one flush / compaction emit it.
     #[must_use]
@@ -775,6 +793,10 @@ impl MultiWriter {
             new_writer = new_writer.use_kv_checksums(policy, algo);
         }
         new_writer = new_writer.use_seqno_in_index(self.use_seqno_in_index);
+        #[cfg(zstd_any)]
+        {
+            new_writer = new_writer.use_zstd_two_pass_seed(self.use_zstd_two_pass_seed);
+        }
         new_writer = new_writer.use_zone_map(self.use_zone_map);
         new_writer = new_writer.use_columnar(self.use_columnar);
         new_writer = new_writer.use_bulk_ingested(Some(self.bulk_ingested));

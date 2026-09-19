@@ -71,6 +71,7 @@ impl<'a> BlobIngestion<'a> {
         let blob = {
             let dicts = tree.index.config.current_zstd_dictionaries();
             blob.use_zstd_dictionary(dicts.for_compression(blob_compression)?)
+                .use_zstd_two_pass_seed(rc.zstd_two_pass_seed)
                 .use_zstd_dictionaries(dicts)
         };
 

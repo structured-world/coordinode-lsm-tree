@@ -445,3 +445,33 @@ fn write_columnar_batch_records_entry_precision_locator() -> crate::Result<()> {
     );
     Ok(())
 }
+
+/// The default must stay the codec's own behaviour: whoever asks for level 22
+/// is asking for ratio, and gets it without opting into anything. Pinned here
+/// because the cost of the opposite default is silent: the output stays valid,
+/// only slightly larger, so nothing else would notice the flip.
+#[cfg(zstd_any)]
+#[test]
+fn writer_keeps_the_two_pass_seed_on_by_default_across_subwriter_swaps() -> crate::Result<()> {
+    assert!(
+        crate::runtime_config::RuntimeConfig::default().zstd_two_pass_seed,
+        "the runtime config ships with the seed on",
+    );
+
+    let dir = tempfile::tempdir()?;
+    let writer = Writer::new(dir.path().join("1"), 1, 0, Arc::new(StdFs))?;
+    assert!(
+        writer.zstd_two_pass_seed,
+        "a fresh table writer starts with the seed on",
+    );
+
+    // Selecting another index or filter layout replaces the subwriter, and the
+    // default has to survive that too.
+    let writer = writer.use_partitioned_index().use_partitioned_filter();
+    assert!(
+        writer.zstd_two_pass_seed,
+        "swapping subwriters leaves the default in force",
+    );
+
+    Ok(())
+}

@@ -57,6 +57,13 @@ impl<W: crate::io::Write + crate::io::Seek> FilterWriter<W> for FullFilterWriter
         self
     }
 
+    // A full filter writes one block under the transform the caller hands it
+    // and compresses nothing itself, so there is no encoder here to configure.
+    #[cfg(zstd_any)]
+    fn use_zstd_two_pass_seed(self: Box<Self>, _: bool) -> Box<dyn FilterWriter<W>> {
+        self
+    }
+
     fn set_filter_policy(
         mut self: Box<Self>,
         policy: BloomConstructionPolicy,

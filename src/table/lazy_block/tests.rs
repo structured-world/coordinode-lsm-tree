@@ -21,7 +21,7 @@ fn large_block_frame() -> (Vec<u8>, Vec<u32>, Vec<u8>) {
     let block_bytes = DataBlock::encode_into_vec(&items, 16, 0.0).expect("encode block");
     // High level so the frame pre-splits into many inner zstd blocks.
     let (frame, ends) =
-        ZstdBackend::compress_with_layout(&block_bytes, 19).expect("compress with layout");
+        ZstdBackend::compress_with_layout(&block_bytes, 19, true).expect("compress with layout");
     assert!(
         ends.len() >= 4,
         "fixture must split into several inner blocks, got {}",

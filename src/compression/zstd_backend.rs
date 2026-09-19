@@ -337,29 +337,74 @@ fn inner_block_layout(
 /// source-size hint from `data`, so the L22 small-source parameter set is still
 /// selected for the 4-64 KiB blocks an LSM writes. Default generics keep the
 /// cached type `'static` for thread-local storage.
+/// The lowest level whose preset selects `btultra2`, the only strategy that
+/// runs the two-pass statistics seed. Below it the seed flag has nothing to
+/// switch, so the level presets are left exactly as the codec ships them.
+const FIRST_TWO_PASS_LEVEL: i32 = 19;
+
+/// Whether a compressor for `level` has to be built with the strategy
+/// overridden, which is the only thing the seed setting changes about one.
+///
+/// This is what the thread-local caches below key on, rather than the setting
+/// itself: below level 19 both settings build the identical compressor, so
+/// keying on the raw flag would rebuild one every time two jobs carrying
+/// different snapshots of the setting alternate on a worker thread, which a
+/// toggle during a long compaction makes routine. The rebuild also drops the
+/// attached dictionary on the path that has one.
+const fn builds_a_single_pass_compressor(level: i32, two_pass_seed: bool) -> bool {
+    !two_pass_seed && level >= FIRST_TWO_PASS_LEVEL
+}
+
+/// Applies the single-pass strategy to a compressor built for `level`.
+///
+/// `btultra` is what level 18 selects: the same binary-tree finder and optimal
+/// parse as `btultra2`, without the seed pass. Only the strategy is overridden,
+/// so every other parameter stays at the preset for the requested level.
+fn use_single_pass(
+    compressor: &mut structured_zstd::encoding::FrameCompressor,
+    level: structured_zstd::encoding::CompressionLevel,
+) -> crate::Result<()> {
+    use structured_zstd::encoding::{CompressionParameters, Strategy};
+
+    let params = CompressionParameters::builder(level)
+        .strategy(Strategy::Btultra)
+        .build()
+        .map_err(|e| crate::Error::Io(crate::io::Error::other(e.to_string())))?;
+    compressor.set_parameters(&params);
+    Ok(())
+}
+
 fn with_tls_compressor<R>(
     level: i32,
+    two_pass_seed: bool,
     f: impl FnOnce(&mut structured_zstd::encoding::FrameCompressor) -> R,
-) -> R {
+) -> crate::Result<R> {
     use structured_zstd::encoding::{CompressionLevel, FrameCompressor};
 
+    // The strategy is part of the cache key: a compressor carries the
+    // parameters it was built with, so a block written under one strategy must
+    // not reuse the compressor configured for the other.
     thread_local! {
-        static TLS_COMPRESSOR: std::cell::RefCell<Option<(i32, FrameCompressor)>> =
+        static TLS_COMPRESSOR: std::cell::RefCell<Option<(i32, bool, FrameCompressor)>> =
             const { std::cell::RefCell::new(None) };
     }
 
+    let single_pass = builds_a_single_pass_compressor(level, two_pass_seed);
+
     TLS_COMPRESSOR.with(|cell| {
         let mut state = cell.borrow_mut();
-        if !matches!(&*state, Some((l, _)) if *l == level) {
-            *state = Some((
-                level,
-                FrameCompressor::new(CompressionLevel::from_level(level)),
-            ));
+        if !matches!(&*state, Some((l, cached, _)) if *l == level && *cached == single_pass) {
+            let configured = CompressionLevel::from_level(level);
+            let mut compressor = FrameCompressor::new(configured);
+            if single_pass {
+                use_single_pass(&mut compressor, configured)?;
+            }
+            *state = Some((level, single_pass, compressor));
         }
-        let Some((_, compressor)) = state.as_mut() else {
+        let Some((_, _, compressor)) = state.as_mut() else {
             unreachable!("TLS_COMPRESSOR initialised above");
         };
-        f(compressor)
+        Ok(f(compressor))
     })
 }
 
@@ -367,26 +412,30 @@ fn with_tls_compressor<R>(
 pub struct ZstdProvider;
 
 impl CompressionProvider for ZstdProvider {
-    fn compress(data: &[u8], level: i32) -> crate::Result<Vec<u8>> {
+    fn compress(data: &[u8], level: i32, two_pass_seed: bool) -> crate::Result<Vec<u8>> {
         // `compress_independent_frame` is the `FrameCompressor` CCtx-style
         // single-frame API (structured-zstd >= 0.0.29): it allocates a fresh
         // output Vec and emits one standalone frame.
-        Ok(with_tls_compressor(level, |compressor| {
+        with_tls_compressor(level, two_pass_seed, |compressor| {
             compressor.compress_independent_frame(data)
-        }))
+        })
     }
 
-    fn compress_with_layout(data: &[u8], level: i32) -> crate::Result<(Vec<u8>, Vec<u32>)> {
+    fn compress_with_layout(
+        data: &[u8],
+        level: i32,
+        two_pass_seed: bool,
+    ) -> crate::Result<(Vec<u8>, Vec<u32>)> {
         // Mirrors `compress`, but also reads back the frame layout the encoder
         // recorded during this emit (`last_frame_emit_info`, under the `lsm`
         // feature). The layout is only meaningful when the frame split into
         // >= 2 inner zstd blocks; a single-block frame returns an empty layout
         // (nothing to partial-decode) and no per-block table is persisted.
-        Ok(with_tls_compressor(level, |compressor| {
+        with_tls_compressor(level, two_pass_seed, |compressor| {
             let frame = compressor.compress_independent_frame(data);
             let layout = inner_block_layout(compressor.last_frame_emit_info());
             (frame, layout)
-        }))
+        })
     }
 
     fn decompress(data: &[u8], capacity: usize) -> crate::Result<Vec<u8>> {
@@ -399,6 +448,7 @@ impl CompressionProvider for ZstdProvider {
         data: &[u8],
         level: i32,
         dict: &crate::compression::ZstdDictionary,
+        two_pass_seed: bool,
     ) -> crate::Result<Vec<u8>> {
         use structured_zstd::encoding::{CompressionLevel, FrameCompressor};
 
@@ -412,21 +462,37 @@ impl CompressionProvider for ZstdProvider {
         //
         // One entry: a thread writes one (dictionary, level) pair for a whole
         // compaction job (a multi-entry cache is tracked in #231).
+        // The strategy joins the key for the same reason it does on the
+        // dictionary-less path: the parameters live in the compressor. A miss
+        // costs more here, since it re-attaches the dictionary as well.
         thread_local! {
-            static TLS_COMPRESSOR: std::cell::RefCell<Option<(u64, i32, FrameCompressor)>> =
+            static TLS_COMPRESSOR: std::cell::RefCell<Option<(u64, i32, bool, FrameCompressor)>> =
                 const { std::cell::RefCell::new(None) };
         }
 
+        let single_pass = builds_a_single_pass_compressor(level, two_pass_seed);
+
         TLS_COMPRESSOR.with(|cell| {
             let mut state = cell.borrow_mut();
-            if !matches!(&*state, Some((key, l, _)) if *key == dict.id64() && *l == level) {
-                let mut compressor = FrameCompressor::new(CompressionLevel::from_level(level));
+            if !matches!(
+                &*state,
+                Some((key, l, cached, _))
+                    if *key == dict.id64() && *l == level && *cached == single_pass
+            ) {
+                let configured = CompressionLevel::from_level(level);
+                let mut compressor = FrameCompressor::new(configured);
+                // Before the dictionary: attaching it builds match-finder state
+                // from the parameters in force, so the strategy has to be the
+                // final one by then.
+                if single_pass {
+                    use_single_pass(&mut compressor, configured)?;
+                }
                 compressor
                     .set_encoder_dictionary(dict.prepared_encoder()?)
                     .map_err(|e| crate::Error::Io(crate::io::Error::other(e.to_string())))?;
-                *state = Some((dict.id64(), level, compressor));
+                *state = Some((dict.id64(), level, single_pass, compressor));
             }
-            let Some((_, _, compressor)) = state.as_mut() else {
+            let Some((_, _, _, compressor)) = state.as_mut() else {
                 unreachable!("TLS_COMPRESSOR initialised above");
             };
 

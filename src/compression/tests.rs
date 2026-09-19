@@ -179,7 +179,7 @@ mod zstd {
         // the self-describing frame format).
         use super::CompressionProvider;
         let data = b"the quick brown fox jumps over the lazy dog".repeat(64);
-        let compressed = super::ZstdBackend::compress(&data, -22).expect("compress at -22");
+        let compressed = super::ZstdBackend::compress(&data, -22, true).expect("compress at -22");
         let back = super::ZstdBackend::decompress(&compressed, data.len()).expect("decompress");
         assert_eq!(back, data, "a negative-level frame round-trips");
     }

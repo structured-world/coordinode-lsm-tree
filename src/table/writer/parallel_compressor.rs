@@ -138,6 +138,8 @@ struct Shared {
     encryption: Option<Arc<dyn EncryptionProvider>>,
     #[cfg(zstd_any)]
     zstd_dict: Option<Arc<ZstdDictionary>>,
+    #[cfg(zstd_any)]
+    two_pass_seed: bool,
     ecc: Option<crate::table::block::EccParams>,
 }
 
@@ -158,11 +160,15 @@ impl Shared {
         let result = prepare_owned(
             &job.encoded,
             self.table_id,
-            self.compression,
-            self.encryption.as_deref(),
-            #[cfg(zstd_any)]
-            self.zstd_dict.as_deref(),
-            self.ecc,
+            TransformParams {
+                compression: self.compression,
+                encryption: self.encryption.as_deref(),
+                #[cfg(zstd_any)]
+                zstd_dict: self.zstd_dict.as_deref(),
+                #[cfg(zstd_any)]
+                two_pass_seed: self.two_pass_seed,
+                ecc: self.ecc,
+            },
             job.extra_flags,
         );
         let mut ready = self.ready.lock().unwrap_or_else(PoisonError::into_inner);
@@ -196,6 +202,7 @@ impl BlockCompressor {
         compression: CompressionType,
         encryption: Option<Arc<dyn EncryptionProvider>>,
         #[cfg(zstd_any)] zstd_dict: Option<Arc<ZstdDictionary>>,
+        #[cfg(zstd_any)] two_pass_seed: bool,
         ecc: Option<crate::table::block::EccParams>,
     ) -> Self {
         Self {
@@ -209,6 +216,8 @@ impl BlockCompressor {
                 encryption,
                 #[cfg(zstd_any)]
                 zstd_dict,
+                #[cfg(zstd_any)]
+                two_pass_seed,
                 ecc,
             }),
             next_submit: 0,
@@ -316,24 +325,48 @@ impl BlockCompressor {
     }
 }
 
+/// The transform settings a block is written under, borrowed from [`Shared`]
+/// for the duration of one job. Grouped rather than passed one by one: they are
+/// read together, they are constant for a whole table, and every one of them
+/// describes the same thing, how this block is encoded.
+#[cfg(feature = "std")]
+#[derive(Clone, Copy)]
+struct TransformParams<'a> {
+    compression: CompressionType,
+    encryption: Option<&'a dyn EncryptionProvider>,
+    #[cfg(zstd_any)]
+    zstd_dict: Option<&'a ZstdDictionary>,
+    #[cfg(zstd_any)]
+    two_pass_seed: bool,
+    ecc: Option<crate::table::block::EccParams>,
+}
+
 /// Worker-side block preparation: rebuild the transform from owned parts, run
 /// the pipeline, and detach the result from the borrowed `encoded` buffer.
 #[cfg(feature = "std")]
 fn prepare_owned(
     encoded: &[u8],
     table_id: TableId,
-    compression: CompressionType,
-    encryption: Option<&dyn EncryptionProvider>,
-    #[cfg(zstd_any)] zstd_dict: Option<&ZstdDictionary>,
-    ecc: Option<crate::table::block::EccParams>,
+    params: TransformParams<'_>,
     extra_flags: u8,
 ) -> crate::Result<PreparedBlock<'static>> {
+    let TransformParams {
+        compression,
+        encryption,
+        #[cfg(zstd_any)]
+        zstd_dict,
+        #[cfg(zstd_any)]
+        two_pass_seed,
+        ecc,
+    } = params;
     let transform = BlockTransform::from_parts(
         compression,
         encryption,
         #[cfg(zstd_any)]
         zstd_dict,
     )?;
+    #[cfg(zstd_any)]
+    let transform = transform.with_two_pass_seed(two_pass_seed);
     let transform = if let Some(ecc) = ecc {
         transform.with_ecc(ecc)
     } else {

@@ -44,6 +44,11 @@ pub struct PartitionedFilterWriter {
 
     compression: CompressionType,
 
+    /// Whether zstd levels 19-22 run the `btultra2` two-pass seed for the TLI
+    /// block. Defaults to `true`, the codec's own behaviour.
+    #[cfg(zstd_any)]
+    zstd_two_pass_seed: bool,
+
     // Accepted to keep the FilterWriter API uniform — written by
     // set_prefix_extractor but not read (partitioned filters cannot be
     // probed by prefix hash; see Table::maybe_contains_prefix).
@@ -78,6 +83,8 @@ impl PartitionedFilterWriter {
             last_key: None,
 
             compression: CompressionType::None,
+            #[cfg(zstd_any)]
+            zstd_two_pass_seed: true,
 
             prefix_extractor: None,
 
@@ -201,6 +208,8 @@ impl PartitionedFilterWriter {
                     #[cfg(zstd_any)]
                     None,
                 )?;
+                #[cfg(zstd_any)]
+                let t = t.with_two_pass_seed(self.zstd_two_pass_seed);
                 if let Some(ecc) = self.ecc {
                     t.with_ecc(ecc)
                 } else {
@@ -254,6 +263,12 @@ impl<W: crate::io::Write + crate::io::Seek> FilterWriter<W> for PartitionedFilte
         compression: CompressionType,
     ) -> Box<dyn FilterWriter<W>> {
         self.compression = compression;
+        self
+    }
+
+    #[cfg(zstd_any)]
+    fn use_zstd_two_pass_seed(mut self: Box<Self>, enabled: bool) -> Box<dyn FilterWriter<W>> {
+        self.zstd_two_pass_seed = enabled;
         self
     }
 

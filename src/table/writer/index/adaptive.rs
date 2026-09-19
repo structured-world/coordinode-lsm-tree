@@ -62,6 +62,11 @@ pub struct AdaptiveIndexWriter<W: Write + Seek + 'static> {
     // Forwarded config (applied to whichever inner writer is built).
     compression: CompressionType,
     restart_interval: u8,
+
+    /// Whether zstd levels 19-22 run the `btultra2` two-pass seed, forwarded
+    /// like the rest of this config. Defaults to `true`.
+    #[cfg(zstd_any)]
+    zstd_two_pass_seed: bool,
     /// Per-bottom-partition size, forwarded to the partitioned writer
     /// once spilled. Distinct from `spill_threshold` (which decides
     /// *whether* to partition at all).
@@ -88,6 +93,8 @@ impl<W: Write + Seek + 'static> AdaptiveIndexWriter<W> {
         Self {
             compression: CompressionType::None,
             restart_interval: 1,
+            #[cfg(zstd_any)]
+            zstd_two_pass_seed: true,
             partition_size: 4_096,
             encryption: None,
             table_id: 0,
@@ -103,6 +110,8 @@ impl<W: Write + Seek + 'static> AdaptiveIndexWriter<W> {
     /// (`Full` or `Partitioned`), so both layouts inherit identical
     /// compression / encryption / restart / ecc / table-id settings.
     fn configure(&self, inner: Box<dyn BlockIndexWriter<W>>) -> Box<dyn BlockIndexWriter<W>> {
+        #[cfg(zstd_any)]
+        let inner = inner.use_zstd_two_pass_seed(self.zstd_two_pass_seed);
         inner
             .use_compression(self.compression)
             .use_restart_interval(self.restart_interval)
@@ -168,6 +177,17 @@ impl<W: Write + Seek + 'static> BlockIndexWriter<W> for AdaptiveIndexWriter<W> {
         compression: CompressionType,
     ) -> Box<dyn BlockIndexWriter<W>> {
         self.compression = compression;
+        self
+    }
+
+    #[cfg(zstd_any)]
+    fn use_zstd_two_pass_seed(mut self: Box<Self>, enabled: bool) -> Box<dyn BlockIndexWriter<W>> {
+        self.zstd_two_pass_seed = enabled;
+        // A writer this one has already spilled into is past `configure`, so it
+        // has to learn the setting directly.
+        if let Some(spilled) = self.spilled.take() {
+            self.spilled = Some(spilled.use_zstd_two_pass_seed(enabled));
+        }
         self
     }
 
