@@ -1,5 +1,5 @@
 window.BENCHMARK_DATA = {
-  "lastUpdate": 1789723706175,
+  "lastUpdate": 1789776668226,
   "repoUrl": "https://github.com/structured-world/coordinode-lsm-tree",
   "entries": {
     "lsm-tree db_bench": [
@@ -23022,6 +23022,90 @@ window.BENCHMARK_DATA = {
             "value": 738709.050088566,
             "unit": "ops/sec",
             "extra": "P50: 1.2us | P99: 4.4us | P99.9: 27.3us\nthreads: 1 | elapsed: 0.27s | num: 200000 | iterations: 3"
+          }
+        ]
+      },
+      {
+        "commit": {
+          "author": {
+            "email": "mail@polaz.com",
+            "name": "Dmitry Prudnikov",
+            "username": "polaz"
+          },
+          "committer": {
+            "email": "noreply@github.com",
+            "name": "GitHub",
+            "username": "web-flow"
+          },
+          "distinct": true,
+          "id": "44a6467e2be59bed34fb94e6bc8b0709607fec15",
+          "message": "fix(merge): hand the operator only a base the engine has proven (#651)\n\n## Summary\n\nA compaction called `merge` with `base_value: None` whenever its own\ninputs held no value or tombstone for the key, and emitted the result as\nanother operand because the base might sit lower down. The operator was\ntold \"absent\" where the engine meant \"unknown\", and the two want\nopposite answers. A sum of deltas survives that, since a sum of deltas\nis still a delta; a set removal does not, and neither does a document\npatch: folded onto an assumed-empty base it becomes a whole state, which\nthen overwrites the real base when the two meet.\n\n`None` now always means proven absence:\n\n- the boundary this stream found, as before;\n- where the compaction holds every surviving version of the key, so\nnothing outside it can hold a base: a key written only through operands\nthen materialises as a value instead of carrying its operands forever;\n- nowhere else. Without a proven base the collected operands are\nre-emitted unchanged, each with its own seqno and order, through the\n`pending` queue the Indirection bail-out already uses, and the fold\nhappens at the level that holds the base.\n\nNo new API: the trait keeps one method with one meaning for `None`. No\nnew accounting either, since `settle_one` fires per emitted item, so\nre-emitted operands net to zero against the collected-history balance\nand the retention floor stays put.\n\nBehaviour change for consumers: an operand chain now survives until it\nmeets its base or reaches a compaction that holds the whole of it, where\nbefore it was folded into a single operand at any level.\n\nProving that from the destination level does not work, and the premise\nwas already carrying two older decisions. A level can hold several\noverlapping runs, so a compaction that rewrites part of one (a targeted\nsingle-table rewrite, as ECC self-heal issues) leaves older versions in\na run it never read; and levels do not order versions on their own,\nsince a move can place a newer table below an older one.\n`holds_every_surviving_version` therefore asks what the decision\nactually needs: every table this compaction does not read is disjoint\nfrom the key range it covers. It gates all three decisions that read\n\"not in my inputs\" as \"not in the tree\": dropping a tombstone, zeroing a\nseqno, and folding operands onto an absent base.\n\n## Benchmark runner\n\nThe bench host is one physical machine that boots either Linux or\nWindows, and each boot registers its own runner with its own labels.\nPinning the job to the Linux label left the whole benchmark queued for\nas long as the box was running Windows, so no bench ran at all in that\nwindow. The job now targets the runner group holding both registrations\nand runs on either OS:\n\n- every step is POSIX shell, declared once through job defaults, since\nWindows would otherwise hand them to PowerShell;\n- the libclang pre-flight gained a Windows branch that locates\n`libclang.dll` and exports its directory as a native path, both to\n`LIBCLANG_PATH` and to `PATH`: the librocksdb-sys build script links\nagainst libclang, so Windows resolves the DLL at process start;\n- the dashboard cross-link banner is injected with shell built-ins\ninstead of `awk`, which minimal Git for Windows installs do not ship;\n- a local `gh-pages` left by an earlier run is dropped before the\nresults are stored. This one is not Windows-specific: the runner is\nself-hosted, so its workspace survives, and a run that does not\nauto-push (every manual dispatch) commits to that branch and leaves the\ncommit behind, which made the next run's fetch fail as non-fast-forward\nbefore measuring anything.\n\n## Testing\n\n- Regression test\n`a_removal_survives_a_compaction_that_does_not_hold_the_base`: an\nordered set with removals, base parked at the last level, neighbour keys\neither side so every table spans one range, asserting the compaction ran\nand left the base out of its inputs. Reads back `{1, 2, 3}` before the\nfix and `{1, 3}` after.\n- `a_key_built_only_from_operands_materialises_at_the_last_level`: a key\nthat never saw a put folds to one value at the last level instead of\nkeeping its chain.\n- `a_rewrite_of_one_last_level_table_does_not_prove_absence`: two\noverlapping runs at the last level, one holding the base and one the\nremoval, with only the latter rewritten. Read back the empty set before\nthe coverage gate and `{1, 3}` after.\n- Stream unit tests:\n`operands_without_a_proven_base_are_kept_as_they_are`,\n`operands_fold_onto_a_proven_absent_base_at_the_bottom_level`,\n`a_key_folds_only_where_its_base_is_proven`.\n- `cargo nextest run --all-features`: 3435 passed. Default features:\n2693 passed.\n- `cargo test --doc --all-features`: 80 passed.\n- `cargo clippy --workspace --all-targets --all-features -- -D\nwarnings`: clean.\n- `cargo doc --no-deps` with default features and with all features:\nclean.\n- `cargo check --no-default-features --features alloc`: no errors,\nwarning count unchanged.\n- Patch coverage: every instrumented changed line in\n`src/compaction/stream.rs` is covered.\n- The workflow change was exercised by dispatching this branch onto the\nWindows runner: checkout, toolchain, cache, db_bench, result storage and\nthe libclang pre-flight all pass there.\n\n## Related\n\n- #652 — `MoveDown` can place newer tables below older ones, which makes\nthe read path answer from the older one. Surfaced while building a\nrecipe for this PR; it is a pre-existing defect in that strategy, not in\nthe absence proof, so it is tracked separately.\n\nCloses #650",
+          "timestamp": "2026-09-19T03:07:28+03:00",
+          "tree_id": "a8d988524e8bf7c5d59adc05edb9983a8ba677b2",
+          "url": "https://github.com/structured-world/coordinode-lsm-tree/commit/44a6467e2be59bed34fb94e6bc8b0709607fec15"
+        },
+        "date": 1789776664125,
+        "tool": "customBiggerIsBetter",
+        "benches": [
+          {
+            "name": "mixed",
+            "value": 69810.64924386382,
+            "unit": "ops/sec",
+            "extra": "P50: 0.4us | P99: 8.8us | P99.9: 28.5us\nthreads: 1 | elapsed: 7.67s | num: 200000 | iterations: 3"
+          },
+          {
+            "name": "fillseq",
+            "value": 3158300.329094894,
+            "unit": "ops/sec",
+            "extra": "P50: 0.2us | P99: 0.6us | P99.9: 3.8us\nthreads: 1 | elapsed: 0.06s | num: 200000 | iterations: 3"
+          },
+          {
+            "name": "fillrandom",
+            "value": 1097191.4094301409,
+            "unit": "ops/sec",
+            "extra": "P50: 0.8us | P99: 1.6us | P99.9: 5.2us\nthreads: 1 | elapsed: 0.18s | num: 200000 | iterations: 3"
+          },
+          {
+            "name": "readrandom",
+            "value": 670247.35143381,
+            "unit": "ops/sec",
+            "extra": "P50: 1.2us | P99: 6.7us | P99.9: 73.7us\nthreads: 1 | elapsed: 0.30s | num: 200000 | iterations: 3"
+          },
+          {
+            "name": "readseq",
+            "value": 2513889.238040172,
+            "unit": "ops/sec",
+            "extra": "P50: 0.2us | P99: 4.9us | P99.9: 10.6us\nthreads: 1 | elapsed: 0.08s | num: 200000 | iterations: 3"
+          },
+          {
+            "name": "seekrandom",
+            "value": 315267.6559345353,
+            "unit": "ops/sec",
+            "extra": "P50: 2.5us | P99: 8.3us | P99.9: 15.7us\nthreads: 1 | elapsed: 0.63s | num: 200000 | iterations: 3"
+          },
+          {
+            "name": "prefixscan",
+            "value": 186358.03291641938,
+            "unit": "ops/sec",
+            "extra": "P50: 4.7us | P99: 6.7us | P99.9: 12.9us\nthreads: 1 | elapsed: 1.07s | num: 200000 | iterations: 3"
+          },
+          {
+            "name": "overwrite",
+            "value": 1065352.4478869534,
+            "unit": "ops/sec",
+            "extra": "P50: 0.8us | P99: 1.6us | P99.9: 5.0us\nthreads: 1 | elapsed: 0.19s | num: 200000 | iterations: 3"
+          },
+          {
+            "name": "mergerandom",
+            "value": 448245.56685134384,
+            "unit": "ops/sec",
+            "extra": "P50: 0.3us | P99: 1.3us | P99.9: 3.8us\nthreads: 1 | elapsed: 0.45s | num: 200000 | iterations: 3"
+          },
+          {
+            "name": "readwhilewriting",
+            "value": 582673.8436546236,
+            "unit": "ops/sec",
+            "extra": "P50: 1.4us | P99: 7.0us | P99.9: 78.0us\nthreads: 1 | elapsed: 0.34s | num: 200000 | iterations: 3"
           }
         ]
       }
