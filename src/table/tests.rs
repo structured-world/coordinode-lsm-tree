@@ -3022,6 +3022,49 @@ fn table_partitioned_index() -> crate::Result<()> {
 }
 
 #[test]
+fn seqno_range_reports_none_when_the_base_pushes_it_past_the_seqno_space() -> crate::Result<()> {
+    use crate::ValueType::Value;
+
+    // The bounds come from the table's own metadata, the base from the
+    // manifest. Nothing ties the two together, so a damaged manifest can pair
+    // a valid table with a base that leaves its bounds unrepresentable. The
+    // answer then has to be "cannot tell", not a wrapped bound that reads as a
+    // perfectly ordinary seqno and would decide an age comparison wrongly.
+    let items = [
+        InternalValue::from_components("a", "a", 0, Value),
+        InternalValue::from_components("b", "b", 8, Value),
+    ];
+
+    let dir = tempfile::tempdir()?;
+    let file = dir.path().join("seqno-range");
+
+    let mut writer = crate::table::Writer::new(file.clone(), 0, 0, Arc::new(StdFs))?;
+    for item in items.iter().cloned() {
+        writer.write(item)?;
+    }
+    let _trailer = writer.finish()?;
+
+    let recover = |base: crate::SeqNo| -> crate::Result<crate::Table> {
+        let mut params = test_recover_params(file.clone(), crate::Checksum::from_raw(0));
+        params.global_seqno = base;
+        crate::Table::recover(params)
+    };
+
+    assert_eq!(
+        Some((7, 15)),
+        recover(7)?.seqno_range(),
+        "a base that fits shifts both bounds by it",
+    );
+    assert_eq!(
+        None,
+        recover(crate::SeqNo::MAX - 4)?.seqno_range(),
+        "a base that does not fit reports no range rather than a wrapped one",
+    );
+
+    Ok(())
+}
+
+#[test]
 #[expect(clippy::unwrap_used)]
 fn table_global_seqno() -> crate::Result<()> {
     use crate::ValueType::Value;

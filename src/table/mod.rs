@@ -606,6 +606,31 @@ impl Table {
         self.0.global_seqno
     }
 
+    /// The lowest and highest sequence numbers this table holds, in the tree's
+    /// own seqno space, or `None` when they cannot be expressed there.
+    ///
+    /// The stored bounds are LOCAL to the table: a bulk ingest writes rows at
+    /// local seqnos and carries the base in [`Self::global_seqno`], so the two
+    /// have to be added before a bound means anything outside this table. Use
+    /// it to compare the ages of two tables; use [`Self::seqno_visibility`] to
+    /// ask what a given snapshot sees.
+    ///
+    /// The two halves of that sum come from different places, the bounds from
+    /// the table's own metadata and the base from the manifest, so nothing in
+    /// the type system says they still fit together. A table written normally
+    /// always fits, since both halves were seqnos the tree issued; damaged
+    /// metadata need not, and `None` says exactly that rather than wrapping
+    /// into a plausible-looking bound. A caller comparing ages has to treat it
+    /// as "cannot tell", never as an extreme.
+    #[must_use]
+    pub fn seqno_range(&self) -> Option<(SeqNo, SeqNo)> {
+        let base = self.global_seqno();
+        Some((
+            self.metadata.seqnos.0.checked_add(base)?,
+            self.metadata.seqnos.1.checked_add(base)?,
+        ))
+    }
+
     /// Classifies how this SST's rows are visible at query snapshot `seqno`,
     /// using the same exclusive MVCC rule as [`Self::point_read`]: a row is
     /// visible iff its effective seqno (`local + global_seqno`) is `< seqno`.

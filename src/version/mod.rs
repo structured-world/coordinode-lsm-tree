@@ -901,13 +901,23 @@ impl Version {
         let comparator = ctx.comparator;
         let id = self.id + 1;
 
-        let affected_tables = self
+        let mut affected_tables = self
             .iter_tables()
             .filter(|x| ids.contains(&x.id()))
             .cloned()
             .collect::<Vec<_>>();
 
         assert_eq!(affected_tables.len(), ids.len(), "invalid table IDs");
+
+        // The tables arrive in level-walk order, which says nothing about their
+        // keys: a table from a higher level comes first even when its range
+        // sorts after. They are about to become one run, and a run is searched
+        // by binary search over minimum keys, so sort them into comparator
+        // order first. `optimize_runs` below re-sorts only when it has to split
+        // the level into several runs, so a move into an empty level would
+        // otherwise keep whatever order the walk produced.
+        affected_tables
+            .sort_by(|a, b| comparator.compare(a.key_range().min(), b.key_range().min()));
 
         let mut levels = vec![];
 
