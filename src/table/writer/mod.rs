@@ -589,19 +589,24 @@ impl Writer {
     #[must_use]
     pub fn use_partitioned_filter(mut self) -> Self {
         self.assert_not_started("partitioned filter");
-        self.filter_writer = Box::new(filter::PartitionedFilterWriter::new(self.bloom_policy))
+        let filter_writer = Box::new(filter::PartitionedFilterWriter::new(self.bloom_policy))
             .use_tli_compression(self.index_block_compression)
             .use_partition_size(self.meta_partition_size)
             .set_prefix_extractor(self.prefix_extractor.clone())
             .use_encryption(self.encryption.clone())
             .use_table_id(self.table_id);
+        // Replacing a subwriter re-applies the settings already chosen, so the
+        // builder reads the same whatever order its methods are called in.
+        #[cfg(zstd_any)]
+        let filter_writer = filter_writer.use_zstd_two_pass_seed(self.zstd_two_pass_seed);
+        self.filter_writer = filter_writer;
         self
     }
 
     #[must_use]
     pub fn use_partitioned_index(mut self) -> Self {
         self.assert_not_started("partitioned index");
-        self.index_writer = Box::new(index::PartitionedIndexWriter::new())
+        let index_writer = Box::new(index::PartitionedIndexWriter::new())
             .use_compression(self.index_block_compression)
             .use_partition_size(self.meta_partition_size)
             .use_restart_interval(self.index_block_restart_interval)
@@ -610,6 +615,10 @@ impl Writer {
             // Reapply page_ecc — swapping the index writer would otherwise drop
             // a flag set earlier in the builder chain (order-independence).
             .use_ecc(self.ecc);
+        // Same reason as page_ecc above.
+        #[cfg(zstd_any)]
+        let index_writer = index_writer.use_zstd_two_pass_seed(self.zstd_two_pass_seed);
+        self.index_writer = index_writer;
         self
     }
 
@@ -621,7 +630,7 @@ impl Writer {
     #[must_use]
     pub fn use_adaptive_index(mut self, spill_threshold: u64) -> Self {
         self.assert_not_started("adaptive index");
-        self.index_writer = Box::new(index::AdaptiveIndexWriter::new(spill_threshold))
+        let index_writer = Box::new(index::AdaptiveIndexWriter::new(spill_threshold))
             .use_compression(self.index_block_compression)
             .use_partition_size(self.meta_partition_size)
             .use_restart_interval(self.index_block_restart_interval)
@@ -632,6 +641,10 @@ impl Writer {
             // order (otherwise the table mixes ECC and non-ECC index blocks
             // while `Writer` still records ECC as enabled).
             .use_ecc(self.ecc);
+        // Same reason as page_ecc above.
+        #[cfg(zstd_any)]
+        let index_writer = index_writer.use_zstd_two_pass_seed(self.zstd_two_pass_seed);
+        self.index_writer = index_writer;
         self
     }
 
