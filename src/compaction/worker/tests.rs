@@ -3673,6 +3673,66 @@ fn a_cross_folder_move_of_overlapping_tables_is_rewritten() -> crate::Result<()>
     Ok(())
 }
 
+/// The L0 exemption is decided per overlapping pair, so finding one pair that
+/// qualifies says nothing about the next: a mover that is older than the first
+/// peer it meets can still be newer than the second, and that second pair is
+/// the one that hides a version. A check that stops at the first overlap it
+/// finds would admit this move.
+#[test]
+fn a_move_out_of_l0_weighs_every_overlapping_peer_not_just_the_first() -> crate::Result<()> {
+    let dir = tempfile::tempdir()?;
+    let seqno = SequenceNumberCounter::default();
+    let config = Config::new(&dir, seqno.clone(), SequenceNumberCounter::default());
+    let last_level = config.level_count - 1;
+    let tree = config.open()?;
+    let crate::AnyTree::Standard(tree) = tree else {
+        unreachable!("standard tree configured (no kv separation)");
+    };
+
+    // Oldest: the table that will be moved. It spans both peers below.
+    tree.insert("a", "1", seqno.next());
+    tree.insert("m", "mover", seqno.next());
+    tree.flush_active_memtable(0)?;
+    let mover = {
+        let ids = table_ids_on_level(&tree, 0);
+        assert_eq!(1, ids.len(), "the mover is the only table so far");
+        #[expect(clippy::indexing_slicing, reason = "length asserted right above")]
+        let id = ids[0];
+        id
+    };
+
+    // Newer, and sorts FIRST by key: this is the pair the exemption clears.
+    tree.insert("a", "newer", seqno.next());
+    tree.flush_active_memtable(0)?;
+
+    // The second peer: it overlaps the mover too, but holds a version OLDER
+    // than the mover's, so the mover would end up below something it outranks.
+    // Written with an explicit seqno under the mover's, since the tree's own
+    // counter only moves forward.
+    tree.insert("m", "older-peer", 0);
+    tree.flush_active_memtable(0)?;
+
+    let result = tree.compact(Arc::new(MoveTables(vec![mover], last_level)), seqno.get())?;
+    assert_eq!(
+        crate::compaction::CompactionAction::Nothing,
+        result.action,
+        "the second overlapping peer is not strictly newer, so the move hides a version",
+    );
+
+    assert_eq!(
+        Some(&b"newer"[..]),
+        tree.get("a", crate::MAX_SEQNO)?.as_deref(),
+        "key a still reads the newest version",
+    );
+    assert_eq!(
+        Some(&b"mover"[..]),
+        tree.get("m", crate::MAX_SEQNO)?.as_deref(),
+        "and key m still reads the version the move would have hidden",
+    );
+
+    Ok(())
+}
+
 /// An L0 table that holds only versions older than the peer it passes under
 /// stays readable in both directions, because L0 is the one level read by
 /// taking the best answer across every run before looking lower: the newer peer

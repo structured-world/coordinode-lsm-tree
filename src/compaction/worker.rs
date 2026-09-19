@@ -681,27 +681,109 @@ fn nothing_the_move_passes_under_overlaps(
     payload: &CompactionPayload,
     comparator: &dyn crate::comparator::UserComparator,
 ) -> bool {
-    let moved = moved_tables(version, payload);
     let dest = usize::from(payload.dest_level);
 
-    moved.iter().all(|(source, table)| {
-        let span = *source.min(&dest)..=*source.max(&dest);
-        version
-            .iter_levels()
-            .enumerate()
-            .filter(|(idx, _)| span.contains(idx))
-            .flat_map(|(idx, level)| {
-                level
-                    .iter()
-                    .flat_map(|run| run.iter())
-                    .map(move |other| (idx, other))
-            })
-            .filter(|(_, other)| !payload.table_ids.contains(&other.id()))
-            .all(|(idx, other)| {
-                !overlaps(table, other, comparator)
-                    || (idx == 0 && table.seqno_range().1 < other.seqno_range().0)
-            })
-    })
+    // Grouped by the level they leave, because that is what decides which
+    // levels each one crosses. There are at most as many groups as the tree has
+    // levels, and a move almost always takes one or two.
+    let mut by_source: Vec<(usize, Vec<&Table>)> = Vec::new();
+    for (source, table) in moved_tables(version, payload) {
+        match by_source.iter_mut().find(|(level, _)| *level == source) {
+            Some((_, tables)) => tables.push(table),
+            None => by_source.push((source, vec![table])),
+        }
+    }
+
+    for (source, mut tables) in by_source {
+        sort_by_min_key(&mut tables, comparator);
+        let span = source.min(dest)..=source.max(dest);
+
+        for (idx, level) in version.iter_levels().enumerate() {
+            if !span.contains(&idx) {
+                continue;
+            }
+            let mut others: Vec<&Table> = level
+                .iter()
+                .flat_map(|run| run.iter())
+                .filter(|other| !payload.table_ids.contains(&other.id()))
+                .collect();
+            sort_by_min_key(&mut others, comparator);
+
+            if idx == 0 {
+                // L0 is the one level where an overlap can still be allowed,
+                // and the test is per pair, so every pair has to be examined
+                // rather than just the first one found. Pairwise is affordable
+                // precisely here: L0 is kept small by the stall / stop
+                // thresholds, which is not true of the levels below it.
+                if tables.iter().any(|table| {
+                    others.iter().any(|other| {
+                        overlaps(table, other, comparator)
+                            && table.seqno_range().1 >= other.seqno_range().0
+                    })
+                }) {
+                    return false;
+                }
+            } else if any_overlap(&tables, &others, comparator) {
+                // Below L0 no overlap is allowed, so the question collapses to
+                // whether one exists, which two sorted walks answer in one
+                // pass. The level can hold thousands of tables and this runs
+                // under the version read lock, so rescanning it per moved
+                // table is what this avoids.
+                return false;
+            }
+        }
+    }
+
+    true
+}
+
+/// Sorts tables by the minimum key of their range, which is the order both
+/// sides of [`overlapping_pairs`] are required to be in.
+fn sort_by_min_key(tables: &mut [&Table], comparator: &dyn crate::comparator::UserComparator) {
+    use crate::version::run::Ranged as _;
+
+    tables.sort_by(|a, b| comparator.compare(a.key_range().min(), b.key_range().min()));
+}
+
+/// Whether any table on one side overlaps any table on the other.
+///
+/// Linear in the two lists, where the obvious nested loop is the product of
+/// their lengths. Both MUST be sorted by minimum key ([`sort_by_min_key`]).
+///
+/// A pointer advances only past a table that cannot overlap anything left on
+/// the other side, since every table remaining there starts at or after the one
+/// it was just compared against. So no overlap is stepped over.
+///
+/// It answers EXISTENCE only. Enumerating every overlapping pair needs more
+/// than two pointers, because the tables within one list may overlap each other
+/// (a level holds several runs, and only a run is internally disjoint).
+fn any_overlap(
+    left: &[&Table],
+    right: &[&Table],
+    comparator: &dyn crate::comparator::UserComparator,
+) -> bool {
+    use crate::version::run::Ranged as _;
+
+    let mut l = 0;
+    let mut r = 0;
+
+    while let (Some(a), Some(b)) = (left.get(l), right.get(r)) {
+        if comparator
+            .compare(a.key_range().max(), b.key_range().min())
+            .is_lt()
+        {
+            l += 1;
+        } else if comparator
+            .compare(b.key_range().max(), a.key_range().min())
+            .is_lt()
+        {
+            r += 1;
+        } else {
+            return true;
+        }
+    }
+
+    false
 }
 
 /// Whether the tables this task hands over can share one run, which is where a
@@ -717,19 +799,27 @@ fn moved_tables_can_share_a_run(
     payload: &CompactionPayload,
     comparator: &dyn crate::comparator::UserComparator,
 ) -> bool {
-    let moved = moved_tables(version, payload);
+    use crate::version::run::Ranged as _;
 
-    for (position, (_, table)) in moved.iter().enumerate() {
-        if moved
-            .iter()
-            .skip(position + 1)
-            .any(|(_, other)| overlaps(table, other, comparator))
-        {
+    let mut moved: Vec<&Table> = moved_tables(version, payload)
+        .into_iter()
+        .map(|(_, table)| table)
+        .collect();
+    sort_by_min_key(&mut moved, comparator);
+
+    // Sorted by where they start, neighbours are enough: if two tables overlap,
+    // so does every pair between them, because a table starting inside the
+    // first one's range and before the second's start lies within the first.
+    // That is what keeps a whole-level move from costing its table count
+    // squared.
+    !moved.windows(2).any(|pair| {
+        let [a, b] = pair else {
             return false;
-        }
-    }
-
-    true
+        };
+        comparator
+            .compare(b.key_range().min(), a.key_range().max())
+            .is_le()
+    })
 }
 
 /// The tables this task moves, each with the level it currently sits on.
