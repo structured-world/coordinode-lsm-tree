@@ -87,4 +87,95 @@ pub trait MergeOperator: Send + Sync + RefUnwindSafe + 'static {
         base_value: Option<&[u8]>,
         operands: &[&[u8]],
     ) -> crate::Result<UserValue>;
+
+    /// Whether folding a PREFIX of the operand chain, with no base, yields
+    /// something that is still a valid operand.
+    ///
+    /// A key written only through [`crate::AbstractTree::merge`] never gets a
+    /// base, so a compaction that holds neither a boundary nor every surviving
+    /// version of the key cannot prove what the base is. It then keeps the
+    /// operands and every read re-applies the whole chain, which for a
+    /// continuously written key grows without bound: only a compaction spanning
+    /// every level ever folds it.
+    ///
+    /// Returning `true` lets such a compaction fold the operands it holds into
+    /// one composed operand instead. It is opt-in and defaults to `false`,
+    /// because for most operators it would be wrong: an operand that edits a
+    /// base is not the same thing as the state it produces against an empty
+    /// one. A set removal folded onto an assumed-empty set is an empty set, and
+    /// an empty set later meeting the real set is not a removal; a document
+    /// patch becomes a whole record, and that record overwrites the base it was
+    /// meant to amend.
+    ///
+    /// # Obligation
+    ///
+    /// Three properties, not just "my operator looks associative". Write
+    /// `f(base, ops)` for `self.merge(key, base, ops)`, and let `P` be any
+    /// non-empty prefix of a chain and `S` the rest of it.
+    ///
+    /// 1. **Closure.** `f(None, P)` is itself a valid operand: it can be fed
+    ///    back into `f` in operand position, and re-folding it is stable.
+    /// 2. **Identity compatibility.** `f(None, P)` represents exactly the
+    ///    composition of `P`, not the state `P` would produce against an empty
+    ///    base. The two coincide for a delta; for an edit against a base they
+    ///    do not, which is what makes this opt-in.
+    /// 3. **Composition law.** For every admissible base `B` (including
+    ///    `None`), every prefix `P` and every suffix `S`:
+    ///
+    /// ```text
+    /// f(B, [f(None, P), ...S])  ==  f(B, [...P, ...S])
+    /// ```
+    ///
+    /// A sum of deltas satisfies all three, because a sum of deltas is itself a
+    /// delta and carries no notion of the base it will land on. An operator
+    /// that cannot state the law above for arbitrary `B`, `P` and `S` must
+    /// leave this `false`.
+    ///
+    /// Order independence is NOT required, and neither is contiguity of the
+    /// operands: the engine composes only where it holds every version of the
+    /// key, so `P` is always a real prefix of the real chain and never a
+    /// subset with gaps in it. A concatenation is as eligible as a sum.
+    ///
+    /// Getting this wrong does not cost performance, it costs correctness: the
+    /// composed operand is written to disk and later folded onto a real base,
+    /// so a `true` that does not hold produces silently wrong state rather than
+    /// an error.
+    ///
+    /// # Partial operators
+    ///
+    /// The three properties are about the values a successful merge returns, so
+    /// an operator that can REFUSE is not held to them when it refuses. It does
+    /// not have to be total, and its failures do not have to be independent of
+    /// how the chain is bracketed. Composition changes which intermediate
+    /// results exist, so checked arithmetic can legitimately refuse a prefix
+    /// whose whole chain against the real base is in range: summing
+    /// `[i64::MAX, 1]` overflows on its own, while the same operands applied to
+    /// a base of `-1` do not.
+    ///
+    /// The engine treats a refused composition as a composition it will not do:
+    /// the operands are re-emitted and the fold happens where the base is,
+    /// exactly as it would for an operator that left this `false`. A failing
+    /// composition therefore costs the optimisation for that key and nothing
+    /// else, and never fails a compaction that would otherwise have succeeded.
+    ///
+    /// The freedom is one-directional, and this part IS an obligation. A
+    /// composition that SUCCEEDS is written to disk in place of the operands it
+    /// replaces, and nothing can bring them back, so a refusal that appears only
+    /// after composing is permanent: a read or a later proven-base compaction
+    /// that used to succeed now fails. So whenever `f(None, P)` succeeds and
+    /// `f(B, [...P, ...S])` succeeds, `f(B, [f(None, P), ...S])` must succeed
+    /// too, and equal it. Refusing earlier than the un-composed chain would is
+    /// free; refusing later than it would is not allowed.
+    ///
+    /// Checked arithmetic satisfies this without extra care, because the
+    /// composed step lands on a total the un-composed chain also passes
+    /// through: if every one of its intermediates is in range, so is that one.
+    ///
+    /// Folding stays gated on the GC watermark either way: the composed operand
+    /// carries the head's sequence number, so only operands the watermark has
+    /// already certified as collapsible take part, and no live snapshot can
+    /// read between them.
+    fn composes_operands(&self) -> bool {
+        false
+    }
 }

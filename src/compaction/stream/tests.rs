@@ -740,6 +740,368 @@ mod merge_operator_tests {
         Arc::new(ConcatMerge)
     }
 
+    /// The same concatenation, declaring that its operands compose, so a
+    /// compaction without a proven base folds them instead of keeping them.
+    struct ComposingConcat;
+
+    impl crate::merge_operator::MergeOperator for ComposingConcat {
+        fn merge(
+            &self,
+            key: &[u8],
+            base_value: Option<&[u8]>,
+            operands: &[&[u8]],
+        ) -> crate::Result<UserValue> {
+            ConcatMerge.merge(key, base_value, operands)
+        }
+
+        fn composes_operands(&self) -> bool {
+            true
+        }
+    }
+
+    fn composing_merge_op() -> Arc<dyn crate::merge_operator::MergeOperator> {
+        Arc::new(ComposingConcat)
+    }
+
+    /// No tables outside the inputs, so every chain in front of the stream is
+    /// the whole chain. Models a compaction that read everything overlapping
+    /// the keys it touches.
+    fn inputs_are_complete() -> crate::compaction::stream::InputCompleteness<'static> {
+        &|_key, _oldest, _newest| true
+    }
+
+    #[test]
+    fn composing_operator_with_every_operand_range_deleted_drops_the_key() -> crate::Result<()> {
+        // A tombstone covering the oldest operand is a chain boundary, so the
+        // composition is declined and the operands are re-emitted rather than
+        // folded into one that would outlive the tombstone. Here it covers all
+        // of them, so the emit path then drops each in turn and the key leaves.
+        // This is also what keeps the fold from ever seeing an empty operand
+        // list: emptying one means the oldest was covered, which declines the
+        // composition before the coverage filter runs.
+        let entries = vec![
+            InternalValue::from_components(
+                b"a".as_ref(),
+                b"op2".as_ref(),
+                999,
+                ValueType::MergeOperand,
+            ),
+            InternalValue::from_components(
+                b"a".as_ref(),
+                b"op1".as_ref(),
+                998,
+                ValueType::MergeOperand,
+            ),
+        ];
+
+        let mut callback = TrackCallback::default();
+        let cmp = crate::comparator::default_comparator();
+        // Above both operands so it covers them, below the watermark so it is
+        // applied at all.
+        let rt = RangeTombstone::new(
+            UserKey::from(b"a".as_ref()),
+            UserKey::from(b"b".as_ref()),
+            1_500,
+        );
+
+        let iter = entries.into_iter().map(Ok);
+        {
+            let mut iter = CompactionStream::new(iter, 2_000)
+                .with_merge_operator(Some(composing_merge_op()))
+                .with_range_tombstone_application(vec![rt], cmp)
+                // Complete inputs, so only the barrier can decline the fold.
+                .with_input_completeness(inputs_are_complete())
+                .with_drop_callback(&mut callback);
+
+            iter_closed!(iter);
+        }
+
+        assert!(
+            callback.items.iter().any(|kv| &*kv.value == b"op1"),
+            "the older range-deleted operand must reach the drop callback",
+        );
+        assert!(
+            callback.items.iter().any(|kv| &*kv.value == b"op2"),
+            "the newer range-deleted operand must reach the drop callback",
+        );
+
+        Ok(())
+    }
+
+    #[test]
+    #[expect(clippy::unwrap_used, reason = "test assertion")]
+    fn composing_operator_across_a_range_tombstone_keeps_the_operands() -> crate::Result<()> {
+        // "3"@3 above a range tombstone at 2, "1"@1 below it. A read resolves
+        // that to "3": the tombstone hides the older operand. Composing the two
+        // would write "1,3"@3, which outranks the tombstone and would read back
+        // whole. The barrier is installed WITHOUT deletion rights, which is
+        // what a compaction off the last level gets: it may not drop the
+        // covered operand, only refuse to fold across it.
+        let entries = vec![
+            InternalValue::from_components(
+                b"a".as_ref(),
+                b"3".as_ref(),
+                3,
+                ValueType::MergeOperand,
+            ),
+            InternalValue::from_components(
+                b"a".as_ref(),
+                b"1".as_ref(),
+                1,
+                ValueType::MergeOperand,
+            ),
+        ];
+
+        let cmp = crate::comparator::default_comparator();
+        let rt = RangeTombstone::new(
+            UserKey::from(b"a".as_ref()),
+            UserKey::from(b"b".as_ref()),
+            2,
+        );
+
+        let iter = entries.into_iter().map(Ok);
+        let mut iter = CompactionStream::new(iter, 1_000)
+            .with_merge_operator(Some(composing_merge_op()))
+            .with_range_tombstone_barriers(vec![rt], cmp)
+            .with_input_completeness(inputs_are_complete());
+
+        // Both operands come through untouched: nothing folded, nothing deleted.
+        let first = iter.next().unwrap()?;
+        assert_eq!(first.key.value_type, ValueType::MergeOperand);
+        assert_eq!(&*first.value, b"3");
+        let second = iter.next().unwrap()?;
+        assert_eq!(second.key.value_type, ValueType::MergeOperand);
+        assert_eq!(&*second.value, b"1");
+        iter_closed!(iter);
+
+        Ok(())
+    }
+
+    #[test]
+    #[expect(clippy::unwrap_used, reason = "test assertion")]
+    fn a_filter_that_can_transform_declines_the_composition() -> crate::Result<()> {
+        // Every entry reaches the filter exactly once, on its way out. A
+        // composed chain is written once and the operands inside it never come
+        // back, so collecting their verdicts during the fold would mean asking
+        // the head a second time and the tail early, which a filter need not
+        // tolerate; and a verdict that turns an operand into a tombstone is a
+        // chain boundary rather than an operand with new bytes. So a filter
+        // that can say anything but Keep declines the fold instead, and the
+        // operands go out one by one exactly as they did before composition
+        // existed — including the verdict this one has for the older of them.
+        struct DropOldest;
+        impl StreamFilter for DropOldest {
+            fn filter_item(&mut self, value: &InternalValue) -> crate::Result<StreamFilterVerdict> {
+                if &*value.value == b"expired" {
+                    Ok(StreamFilterVerdict::Drop)
+                } else {
+                    Ok(StreamFilterVerdict::Keep)
+                }
+            }
+        }
+
+        let entries = vec![
+            InternalValue::from_components(
+                b"a".as_ref(),
+                b"keep".as_ref(),
+                3,
+                ValueType::MergeOperand,
+            ),
+            InternalValue::from_components(
+                b"a".as_ref(),
+                b"expired".as_ref(),
+                2,
+                ValueType::MergeOperand,
+            ),
+        ];
+
+        let cmp = crate::comparator::default_comparator();
+        let mut callback = TrackCallback::default();
+        let iter = entries.into_iter().map(Ok);
+        {
+            let mut iter = CompactionStream::new(iter, 1_000)
+                .with_filter(DropOldest)
+                .with_merge_operator(Some(composing_merge_op()))
+                .with_range_tombstone_barriers(Vec::new(), cmp)
+                .with_input_completeness(inputs_are_complete())
+                .with_drop_callback(&mut callback);
+
+            // Not composed: the head comes out on its own, and the older
+            // operand is dropped by the filter on its own way out.
+            let item = iter.next().unwrap()?;
+            assert_eq!(item.key.value_type, ValueType::MergeOperand);
+            assert_eq!(&*item.value, b"keep");
+            iter_closed!(iter);
+        }
+        assert!(
+            callback.items.iter().any(|kv| &*kv.value == b"expired"),
+            "the dropped operand must reach the drop callback from the emit path",
+        );
+
+        Ok(())
+    }
+
+    #[test]
+    #[expect(clippy::unwrap_used, reason = "test assertion")]
+    fn a_filter_that_only_keeps_permits_the_composition() -> crate::Result<()> {
+        // The other half of the promise: a filter present but incapable of a
+        // verdict has nothing to collect during the fold, so it must not cost
+        // the composition. This is what the production adapter reports when no
+        // user filter sits behind it, which is the common case.
+        struct AlwaysKeeps;
+        impl StreamFilter for AlwaysKeeps {
+            fn filter_item(
+                &mut self,
+                _value: &InternalValue,
+            ) -> crate::Result<StreamFilterVerdict> {
+                Ok(StreamFilterVerdict::Keep)
+            }
+
+            fn keeps_everything(&self) -> bool {
+                true
+            }
+        }
+
+        #[rustfmt::skip]
+        let vec = stream![
+            "a", "op2", "M",
+            "a", "op1", "M",
+        ];
+
+        let cmp = crate::comparator::default_comparator();
+        let iter = vec.iter().cloned().map(Ok);
+        let mut iter = CompactionStream::new(iter, 1_000)
+            .with_filter(AlwaysKeeps)
+            .with_merge_operator(Some(composing_merge_op()))
+            .with_range_tombstone_barriers(Vec::new(), cmp)
+            .with_input_completeness(inputs_are_complete());
+
+        let item = iter.next().unwrap()?;
+        assert_eq!(item.key.value_type, ValueType::MergeOperand);
+        assert_eq!(&*item.value, b"op1,op2");
+        iter_closed!(iter);
+
+        Ok(())
+    }
+
+    #[test]
+    #[expect(clippy::unwrap_used, reason = "test assertion")]
+    fn merge_with_a_range_deleted_base_off_the_last_level_keeps_the_entries() -> crate::Result<()> {
+        // The base is hidden by a range tombstone above it, so the operand must
+        // not fold onto it. Off the last level the tombstone may not delete the
+        // base either, so the only correct outcome is to leave both entries
+        // alone and let the fold happen where the tombstone has been applied.
+        // Folding here would resurrect the deleted base under the head's seqno.
+        let entries = vec![
+            InternalValue::from_components(
+                b"a".as_ref(),
+                b"op".as_ref(),
+                3,
+                ValueType::MergeOperand,
+            ),
+            InternalValue::from_components(b"a".as_ref(), b"base".as_ref(), 1, ValueType::Value),
+        ];
+
+        let cmp = crate::comparator::default_comparator();
+        let rt = RangeTombstone::new(
+            UserKey::from(b"a".as_ref()),
+            UserKey::from(b"b".as_ref()),
+            2,
+        );
+
+        let iter = entries.into_iter().map(Ok);
+        let mut iter = CompactionStream::new(iter, 1_000)
+            .with_merge_operator(Some(merge_op()))
+            .with_range_tombstone_barriers(vec![rt], cmp);
+
+        let first = iter.next().unwrap()?;
+        assert_eq!(first.key.value_type, ValueType::MergeOperand);
+        assert_eq!(&*first.value, b"op");
+        let second = iter.next().unwrap()?;
+        assert_eq!(
+            second.key.value_type,
+            ValueType::Value,
+            "the range-deleted base must survive here: this compaction may not delete it",
+        );
+        assert_eq!(&*second.value, b"base");
+        iter_closed!(iter);
+
+        Ok(())
+    }
+
+    #[test]
+    #[expect(clippy::unwrap_used, reason = "test assertion")]
+    fn composing_operator_above_a_range_tombstone_still_folds() -> crate::Result<()> {
+        // The same barrier, but both operands sit above it, so no chain crosses
+        // it and the fold is free to happen.
+        let entries = vec![
+            InternalValue::from_components(
+                b"a".as_ref(),
+                b"3".as_ref(),
+                5,
+                ValueType::MergeOperand,
+            ),
+            InternalValue::from_components(
+                b"a".as_ref(),
+                b"1".as_ref(),
+                4,
+                ValueType::MergeOperand,
+            ),
+        ];
+
+        let cmp = crate::comparator::default_comparator();
+        let rt = RangeTombstone::new(
+            UserKey::from(b"a".as_ref()),
+            UserKey::from(b"b".as_ref()),
+            2,
+        );
+
+        let iter = entries.into_iter().map(Ok);
+        let mut iter = CompactionStream::new(iter, 1_000)
+            .with_merge_operator(Some(composing_merge_op()))
+            .with_range_tombstone_barriers(vec![rt], cmp)
+            .with_input_completeness(inputs_are_complete());
+
+        let item = iter.next().unwrap()?;
+        assert_eq!(item.key.value_type, ValueType::MergeOperand);
+        assert_eq!(&*item.value, b"1,3");
+        iter_closed!(iter);
+
+        Ok(())
+    }
+
+    #[test]
+    #[expect(clippy::unwrap_used, reason = "test assertion")]
+    fn composing_operator_without_a_proven_base_emits_one_operand() -> crate::Result<()> {
+        // No boundary in this stream and not the bottom level, so the base is
+        // unproven. A composing operator folds anyway, and the result stays a
+        // MergeOperand: calling it a Value would assert the base is empty.
+        //
+        // Range-tombstone application is installed with nothing in it, which is
+        // what a compaction that can see the tombstones and finds none looks
+        // like. Composing requires that: a tombstone between two operands ends
+        // the chain, and a stream that cannot see one must not fold across it.
+        #[rustfmt::skip]
+        let vec = stream![
+            "a", "op2", "M",
+            "a", "op1", "M",
+        ];
+
+        let cmp = crate::comparator::default_comparator();
+        let iter = vec.iter().cloned().map(Ok);
+        let mut iter = CompactionStream::new(iter, 1_000)
+            .with_merge_operator(Some(composing_merge_op()))
+            .with_range_tombstone_application(Vec::new(), cmp)
+            .with_input_completeness(inputs_are_complete());
+
+        let item = iter.next().unwrap()?;
+        assert_eq!(item.key.value_type, ValueType::MergeOperand);
+        assert_eq!(&*item.value, b"op1,op2");
+        iter_closed!(iter);
+
+        Ok(())
+    }
+
     #[test]
     fn operands_without_a_proven_base_are_kept_as_they_are() -> crate::Result<()> {
         // No boundary in this stream and not the bottom level, so the base may
