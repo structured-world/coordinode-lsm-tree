@@ -315,6 +315,12 @@ impl<'a, 'b: 'a> StreamFilterAdapter<'a, 'b> {
 }
 
 impl<'a, 'b: 'a> StreamFilter for StreamFilterAdapter<'a, 'b> {
+    /// The adapter is installed on every compaction, so without a user filter
+    /// behind it there is nothing that can return a verdict.
+    fn keeps_everything(&self) -> bool {
+        self.filter.is_none()
+    }
+
     fn filter_item(&mut self, item: &InternalValue) -> crate::Result<StreamFilterVerdict> {
         let Some(filter) = self.filter.as_mut() else {
             return Ok(StreamFilterVerdict::Keep);

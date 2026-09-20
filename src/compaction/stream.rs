@@ -113,6 +113,23 @@ pub enum StreamFilterVerdict {
 pub trait StreamFilter {
     /// Handle an item, possibly modifying it.
     fn filter_item(&mut self, item: &InternalValue) -> crate::Result<StreamFilterVerdict>;
+
+    /// Whether this filter can ever return anything but
+    /// [`StreamFilterVerdict::Keep`].
+    ///
+    /// Answering `false` is a promise, and it buys the caller the right to
+    /// skip asking. The merge stream uses it to decide whether a chain may be
+    /// composed: every entry reaches `filter_item` exactly once on the way
+    /// out, but a composed chain is written once and the operands inside it
+    /// never come back, so their verdicts would have to be collected during
+    /// the fold — asking a second time on the way there is not allowed, since
+    /// a filter need not be idempotent or stateless. A filter that can only
+    /// keep has no verdict to collect, so the question does not arise.
+    ///
+    /// Defaults to `true`, the answer that costs nothing but a declined fold.
+    fn keeps_everything(&self) -> bool {
+        false
+    }
 }
 
 /// A [`StreamFilter`] that does not modify anything
@@ -121,6 +138,10 @@ pub struct NoFilter;
 impl StreamFilter for NoFilter {
     fn filter_item(&mut self, _item: &InternalValue) -> crate::Result<StreamFilterVerdict> {
         Ok(StreamFilterVerdict::Keep)
+    }
+
+    fn keeps_everything(&self) -> bool {
+        true
     }
 }
 
@@ -687,9 +708,22 @@ impl<'a, I: Iterator<Item = Item>, F: StreamFilter + 'a> CompactionStream<'a, I,
         // tombstone between two of them is a reset the fold would erase, and
         // unlike an omitted operand no property of the operator can repair it.
         // `inputs_hold_every_version_of` is what rules that out.
+        //
+        // And it needs the compaction filter to have nothing to say. Every
+        // entry reaches `filter_item` exactly once, on its way out; the head
+        // of this chain already has, and the rest would on re-emission. A
+        // composition is written once and the operands inside it never come
+        // back, so their verdicts would have to be collected during the fold —
+        // a second visit for the head, a premature one for the tail, and a
+        // filter is not required to be idempotent or stateless. Worse, a
+        // verdict that turns an operand into a tombstone is a chain boundary,
+        // not an operand with new bytes, so applying it mid-fold would
+        // resurrect what it was meant to hide. A filter that can only keep
+        // raises none of this.
         let no_proven_base = !found_boundary && !self.evict_tombstones;
         let oldest_seqno = collected.last().map_or(head_seqno, |entry| entry.key.seqno);
         let composes = merge_op.composes_operands()
+            && self.filter.keeps_everything()
             && self.rt_comparator.is_some()
             && self.inputs_hold_the_chain(user_key.as_ref(), oldest_seqno, head_seqno);
         let crosses_barrier = composes
@@ -723,52 +757,11 @@ impl<'a, I: Iterator<Item = Item>, F: StreamFilter + 'a> CompactionStream<'a, I,
             !covered
         });
 
-        // Only the head reached `filter_item`; the rest were taken straight off
-        // the input. That was harmless while an unproven chain was re-emitted,
-        // because each entry then got its verdict on the way out. A composition
-        // is written once and the entries inside it never come back, so their
-        // verdicts have to be collected here instead: a filter that drops an
-        // expired operand would otherwise see it persisted inside the result.
-        //
-        // Only the composing path needs this. The proven-base fold produces the
-        // key's value, which the caller filters as a whole, exactly as it did
-        // before.
-        if compose_only {
-            let mut filter_error = None;
-            collected.retain_mut(|entry| match self.filter.filter_item(entry) {
-                Ok(StreamFilterVerdict::Keep) => true,
-                Ok(StreamFilterVerdict::Replace((value_type, value))) => {
-                    entry.value = value;
-                    // Same rule the emit path uses: a filter turning an operand
-                    // into a value must not retype it, or blob-pointer bytes
-                    // end up under a merge-operand tag.
-                    if value_type != ValueType::Value {
-                        entry.key.value_type = value_type;
-                    }
-                    true
-                }
-                Ok(StreamFilterVerdict::Drop) => {
-                    if let Some(watcher) = &mut self.dropped_callback {
-                        watcher.on_dropped(entry);
-                    }
-                    self.note_transform();
-                    false
-                }
-                Err(err) => {
-                    filter_error.get_or_insert(err);
-                    true
-                }
-            });
-            if let Some(err) = filter_error {
-                return Err(err);
-            }
-        }
-
-        // Neither filter can empty a composing chain of its head: the head has
-        // already passed the filter in `next_inner`, and a covered oldest is
-        // exactly the barrier that declined the composition before any of this
-        // ran. So the fold below always has at least one entry, and so does the
-        // re-emit it may fall back to.
+        // The coverage filter cannot empty a composing chain: emptying it means
+        // every operand was covered, the oldest included, and a covered oldest
+        // is exactly the barrier that declined the composition before any of
+        // this ran. So the fold below always has at least one entry, and so
+        // does the re-emit it may fall back to.
         debug_assert!(
             !compose_only || !collected.is_empty(),
             "a composing chain the barrier check passed cannot be emptied here",

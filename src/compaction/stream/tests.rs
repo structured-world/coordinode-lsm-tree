@@ -879,13 +879,16 @@ mod merge_operator_tests {
 
     #[test]
     #[expect(clippy::unwrap_used, reason = "test assertion")]
-    fn composed_operands_each_pass_the_compaction_filter() -> crate::Result<()> {
-        // Only the head of a chain goes through the filter in `next_inner`; the
-        // rest are taken straight off the input. Before composing they were
-        // re-emitted and so each got its verdict on the way out, but a composed
-        // operand is written once and the entries inside it never come back. A
-        // filter dropping an expired operand must therefore be honoured here,
-        // or the expired delta is persisted inside the composition.
+    fn a_filter_that_can_transform_declines_the_composition() -> crate::Result<()> {
+        // Every entry reaches the filter exactly once, on its way out. A
+        // composed chain is written once and the operands inside it never come
+        // back, so collecting their verdicts during the fold would mean asking
+        // the head a second time and the tail early, which a filter need not
+        // tolerate; and a verdict that turns an operand into a tombstone is a
+        // chain boundary rather than an operand with new bytes. So a filter
+        // that can say anything but Keep declines the fold instead, and the
+        // operands go out one by one exactly as they did before composition
+        // existed — including the verdict this one has for the older of them.
         struct DropOldest;
         impl StreamFilter for DropOldest {
             fn filter_item(&mut self, value: &InternalValue) -> crate::Result<StreamFilterVerdict> {
@@ -923,17 +926,16 @@ mod merge_operator_tests {
                 .with_input_completeness(inputs_are_complete())
                 .with_drop_callback(&mut callback);
 
+            // Not composed: the head comes out on its own, and the older
+            // operand is dropped by the filter on its own way out.
             let item = iter.next().unwrap()?;
             assert_eq!(item.key.value_type, ValueType::MergeOperand);
-            assert_eq!(
-                &*item.value, b"keep",
-                "the filtered operand must not be folded into the composition",
-            );
+            assert_eq!(&*item.value, b"keep");
             iter_closed!(iter);
         }
         assert!(
             callback.items.iter().any(|kv| &*kv.value == b"expired"),
-            "the dropped operand must reach the drop callback, as it would on the emit path",
+            "the dropped operand must reach the drop callback from the emit path",
         );
 
         Ok(())
@@ -941,96 +943,43 @@ mod merge_operator_tests {
 
     #[test]
     #[expect(clippy::unwrap_used, reason = "test assertion")]
-    fn a_filter_replacing_a_collected_operand_composes_the_replacement() -> crate::Result<()> {
-        // The verdict has to reach the fold, not just the head: composing the
-        // original would persist the value the filter rewrote away.
-        struct Rewrite;
-        impl StreamFilter for Rewrite {
-            fn filter_item(&mut self, value: &InternalValue) -> crate::Result<StreamFilterVerdict> {
-                if &*value.value == b"old" {
-                    Ok(StreamFilterVerdict::Replace((
-                        ValueType::MergeOperand,
-                        UserValue::from(b"new".as_ref()),
-                    )))
-                } else {
-                    Ok(StreamFilterVerdict::Keep)
-                }
+    fn a_filter_that_only_keeps_permits_the_composition() -> crate::Result<()> {
+        // The other half of the promise: a filter present but incapable of a
+        // verdict has nothing to collect during the fold, so it must not cost
+        // the composition. This is what the production adapter reports when no
+        // user filter sits behind it, which is the common case.
+        struct AlwaysKeeps;
+        impl StreamFilter for AlwaysKeeps {
+            fn filter_item(
+                &mut self,
+                _value: &InternalValue,
+            ) -> crate::Result<StreamFilterVerdict> {
+                Ok(StreamFilterVerdict::Keep)
+            }
+
+            fn keeps_everything(&self) -> bool {
+                true
             }
         }
 
-        let entries = vec![
-            InternalValue::from_components(
-                b"a".as_ref(),
-                b"head".as_ref(),
-                3,
-                ValueType::MergeOperand,
-            ),
-            InternalValue::from_components(
-                b"a".as_ref(),
-                b"old".as_ref(),
-                2,
-                ValueType::MergeOperand,
-            ),
+        #[rustfmt::skip]
+        let vec = stream![
+            "a", "op2", "M",
+            "a", "op1", "M",
         ];
 
         let cmp = crate::comparator::default_comparator();
-        let iter = entries.into_iter().map(Ok);
+        let iter = vec.iter().cloned().map(Ok);
         let mut iter = CompactionStream::new(iter, 1_000)
-            .with_filter(Rewrite)
+            .with_filter(AlwaysKeeps)
             .with_merge_operator(Some(composing_merge_op()))
             .with_range_tombstone_barriers(Vec::new(), cmp)
             .with_input_completeness(inputs_are_complete());
 
         let item = iter.next().unwrap()?;
-        assert_eq!(&*item.value, b"new,head");
+        assert_eq!(item.key.value_type, ValueType::MergeOperand);
+        assert_eq!(&*item.value, b"op1,op2");
         iter_closed!(iter);
-
-        Ok(())
-    }
-
-    #[test]
-    fn a_filter_error_on_a_collected_operand_fails_the_compaction() -> crate::Result<()> {
-        // A filter error is the caller's to see: unlike a refused composition
-        // there is no correct output to fall back to, because the verdict for
-        // that operand is unknown.
-        struct Failing;
-        impl StreamFilter for Failing {
-            fn filter_item(&mut self, value: &InternalValue) -> crate::Result<StreamFilterVerdict> {
-                if &*value.value == b"boom" {
-                    Err(crate::Error::MergeOperator)
-                } else {
-                    Ok(StreamFilterVerdict::Keep)
-                }
-            }
-        }
-
-        let entries = vec![
-            InternalValue::from_components(
-                b"a".as_ref(),
-                b"head".as_ref(),
-                3,
-                ValueType::MergeOperand,
-            ),
-            InternalValue::from_components(
-                b"a".as_ref(),
-                b"boom".as_ref(),
-                2,
-                ValueType::MergeOperand,
-            ),
-        ];
-
-        let cmp = crate::comparator::default_comparator();
-        let iter = entries.into_iter().map(Ok);
-        let mut iter = CompactionStream::new(iter, 1_000)
-            .with_filter(Failing)
-            .with_merge_operator(Some(composing_merge_op()))
-            .with_range_tombstone_barriers(Vec::new(), cmp)
-            .with_input_completeness(inputs_are_complete());
-
-        assert!(
-            iter.next().is_some_and(|item| item.is_err()),
-            "the filter's error must surface rather than being folded away",
-        );
 
         Ok(())
     }
