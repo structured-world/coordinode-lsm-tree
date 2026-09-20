@@ -185,7 +185,7 @@ lz4_flex = { version = "0.14.0", optional = true, default-features = false, feat
 ] }
 # Default features carry the runtime-dispatched SIMD decode kernels;
 # `default-features = false` drops them onto the scalar path.
-structured-zstd = { version = "0.0.54", optional = true, features = ["lsm"] }
+structured-zstd = { version = "0.0.55", optional = true, features = ["lsm"] }
 # `once_cell::race::OnceBox` — the no-std + alloc one-shot primitive.
 # We pick it over `std::sync::OnceLock` (which has both `set` and the
 # stabilised `get_or_try_init` on our 1.92 MSRV) because OnceLock is
@@ -306,7 +306,7 @@ test-log = "0.2.18"
 # rather than to the normal dependency: a dev-dependency's features do not
 # reach consumers, so none of them pays for `fastrand` (and the `std` it
 # forces) for a capability they do not use.
-structured-zstd = { version = "0.0.54", features = ["dict-builder", "lsm"] }
+structured-zstd = { version = "0.0.55", features = ["dict-builder", "lsm"] }
 
 [lints.rust]
 unexpected_cfgs = { level = "warn", check-cfg = [
