@@ -1,5 +1,5 @@
 window.BENCHMARK_DATA = {
-  "lastUpdate": 1789815668088,
+  "lastUpdate": 1789914641890,
   "repoUrl": "https://github.com/structured-world/coordinode-lsm-tree",
   "entries": {
     "lsm-tree db_bench": [
@@ -23274,6 +23274,90 @@ window.BENCHMARK_DATA = {
             "value": 612587.446858039,
             "unit": "ops/sec",
             "extra": "P50: 1.3us | P99: 6.6us | P99.9: 78.0us\nthreads: 1 | elapsed: 0.33s | num: 200000 | iterations: 3"
+          }
+        ]
+      },
+      {
+        "commit": {
+          "author": {
+            "email": "mail@polaz.com",
+            "name": "Dmitry Prudnikov",
+            "username": "polaz"
+          },
+          "committer": {
+            "email": "noreply@github.com",
+            "name": "GitHub",
+            "username": "web-flow"
+          },
+          "distinct": true,
+          "id": "3a44c5a83bc368d9f7ce4eec0eeae447f5913719",
+          "message": "feat(merge): fold composing operands without a proven base (#658)\n\n## Summary\n\nA key written only through `merge` never gets a base, so a compaction\nholding neither a boundary nor every surviving version of it kept the\noperands and left every read to re-apply the chain. For a continuously\nwritten key that grows without bound: newer operands always sit above\nwhatever run a compaction reaches, so only a compaction spanning every\nlevel folds it.\n\n`MergeOperator::composes_operands()` lets an operator say that folding a\nprefix of its chain yields something that is still an operand. It\ndefaults to `false`, so every existing operator keeps today's behaviour\nexactly. Where the stream used to re-emit for want of a proven base, an\noperator that sets it folds instead and emits the result as a\n`MergeOperand` rather than a `Value`, because calling it a value would\nassert the base is empty.\n\nMeasured on one hot counter key with overlapping neighbour traffic,\nflushed and leveled-compacted every round, read cost at 15 360 operands:\n\n| | Read |\n|---|---|\n| before | 31.9 ms, growing linearly |\n| after | 0.40 ms, flat from 256 operands up |\n\n## What composition is allowed to assume\n\nFolding mid-tree steps around invariants the re-emit path got for free,\nso each one is re-established explicitly.\n\n**The chain must be the whole chain.** A strategy may select some runs\nand leave others out (`SizeTiered` picks by size), so the operands in\nfront of the stream are not always every version of the key: an omitted\nput or point tombstone between two of them is a reset the fold would\nerase, and an omitted operand reorders it. Composition is gated on the\ncompaction holding every version of the key *within the chain's\nsequence-number interval*. Both narrower forms were tried and are\nuseless — whole-range completeness is false whenever a neighbour table\nspans the same keys, key-only completeness is false once the key reaches\na lower level, and an intermediate measurement with the key-only gate\nstill grew linearly (16.7 ms at 15 360). The interval is what makes it\nusable: a version older than the chain is the base it will meet later, a\nnewer one applies after it, and neither can sit between two operands\nbeing folded. The predicate consults each outside table's seqno range,\nthen its key range, then its filter, answering conservatively at every\nstep.\n\n**Range tombstones end a chain.** A range tombstone between two operands\nhides the ones below it exactly as an in-stream tombstone does. Only the\nbottommost compaction was given them, because only it may delete what\nthey cover, so `RangeTombstoneUse` now separates deleting from bounding\nand a compaction off the last level receives them as boundaries: nothing\nis dropped for coverage, and a chain reaching under the newest\napplicable one is not composed. A base hidden by one is never folded\nonto either — it ends the chain and everything goes back unchanged.\n\n**The compaction filter must have nothing to say.** Every entry reaches\n`filter_item` exactly once, on its way out. A composed chain is written\nonce and the operands inside it never come back, so their verdicts\ncannot be collected there: asking during the fold means a second visit\nfor the head and an early one for the tail, and a filter is required to\nbe neither idempotent nor stateless. A verdict that turns an operand\ninto a tombstone is worse than that — it is a chain boundary, not an\noperand with new bytes, so applying it mid-fold resurrects what it was\nmeant to hide. `StreamFilter` therefore reports whether it can return\nanything but Keep, and a chain composes only when it cannot. The\nproduction adapter answers with whether a user filter sits behind it, so\na tree with no compaction filter composes and a tree with one keeps\nexactly the behaviour it had before this feature.\n\n**The GC watermark still governs.** All three call sites enter with the\nhead below it, so the composed operand's seqno is below it too and no\nlive snapshot reads between the operands.\n\n## The contract\n\nThe rustdoc states it as three properties rather than the word\nassociativity, because a wrong `true` is written to disk and folded onto\na real base later, which is silently wrong state and not a slowdown:\nclosure of the composed operand, identity compatibility of `f(None, P)`,\nand the composition law `f(B, [f(None, P), ...S]) == f(B, [...P, ...S])`\nover any admissible base, prefix and suffix.\n\nOrder independence is deliberately *not* required: the completeness gate\nmakes `P` a true prefix, never a subset with gaps, so a concatenation is\nas eligible as a sum.\n\nPartial operators are allowed. A refused composition is one the engine\ndeclines, so the operands are re-emitted and the fold happens where the\nbase is — an optimisation must never fail a compaction that would\notherwise have succeeded. The freedom is one-directional and the other\nhalf is an obligation: a composition that succeeds replaces its operands\non disk, so refusing *later* than the un-composed chain would is not\nallowed.\n\nThis also carries a `structured-zstd` bump to 0.0.55, which fixes the\noverlapping-match copier on the decode path.\n\n## Testing\n\n`tests/merge_composing_operands.rs` covers the tree-level behaviour: a\ncomposing operator folds a chain with no proven base, the same scenario\nwith a non-composing operator keeps every operand (both the regression\nlock on the default and the proof that the scenario really lacks a\nproven base), a composed operand meets a base a later compaction\nreaches, a refused composition leaves the operands in place, and a\nwatermark below the newest operands leaves the snapshot read unchanged.\n\n`src/compaction/stream/tests.rs` covers the stream directly: composing\nacross a range tombstone versus above it, a range-deleted base off the\nlast level, every operand range-deleted, and both sides of the filter\ngate. `src/compaction/worker/tests.rs` covers the completeness decision\nper table.\n\nGates: `cargo fmt --check`, `cargo clippy --workspace --all-targets\n--all-features -- -D warnings`, 3472 tests via nextest, 80 doctests,\n`cargo doc` clean, no-std check error count 0. Patch coverage of `src/`\nmeasured locally with `cargo llvm-cov` against the diff: 194 of 196\nadded executable lines. The two are a one-line delegation to a table\nfilter, whose decision is covered by the `may_break_chain` unit tests,\nand the predicate install on the parallel sub-compaction path.\n\nCloses #657\n\n\n<!-- This is an auto-generated comment: release notes by coderabbit.ai\n-->\n\n## Summary by CodeRabbit\n\n* **New Features**\n* Merge operators can now combine sequences of merge operands during\ncompaction when explicitly supported.\n* Compaction can determine whether input data is complete before safely\ncombining operands.\n\n* **Bug Fixes**\n* Improved range-tombstone handling distinguishes between stopping merge\nchains and deleting covered data.\n* Compaction now preserves operands when composition is unsafe, refused,\nor blocked by filters and tombstone boundaries.\n* Enhanced handling of data spanning multiple tables and compaction\nlevels.\n\n<!-- end of auto-generated comment: release notes by coderabbit.ai -->",
+          "timestamp": "2026-09-20T17:26:30+03:00",
+          "tree_id": "143c3725fba5dda0777a5dbb01fd1ff1439063a5",
+          "url": "https://github.com/structured-world/coordinode-lsm-tree/commit/3a44c5a83bc368d9f7ce4eec0eeae447f5913719"
+        },
+        "date": 1789914598283,
+        "tool": "customBiggerIsBetter",
+        "benches": [
+          {
+            "name": "mixed",
+            "value": 77753.6284675552,
+            "unit": "ops/sec",
+            "extra": "P50: 0.4us | P99: 8.6us | P99.9: 30.3us\nthreads: 1 | elapsed: 6.88s | num: 200000 | iterations: 3"
+          },
+          {
+            "name": "fillseq",
+            "value": 3148763.323204811,
+            "unit": "ops/sec",
+            "extra": "P50: 0.2us | P99: 0.6us | P99.9: 3.8us\nthreads: 1 | elapsed: 0.06s | num: 200000 | iterations: 3"
+          },
+          {
+            "name": "fillrandom",
+            "value": 1097285.9181457623,
+            "unit": "ops/sec",
+            "extra": "P50: 0.8us | P99: 1.8us | P99.9: 5.0us\nthreads: 1 | elapsed: 0.18s | num: 200000 | iterations: 3"
+          },
+          {
+            "name": "readrandom",
+            "value": 689308.854137766,
+            "unit": "ops/sec",
+            "extra": "P50: 1.2us | P99: 6.3us | P99.9: 73.5us\nthreads: 1 | elapsed: 0.29s | num: 200000 | iterations: 3"
+          },
+          {
+            "name": "readseq",
+            "value": 2525762.7803596687,
+            "unit": "ops/sec",
+            "extra": "P50: 0.2us | P99: 4.7us | P99.9: 11.6us\nthreads: 1 | elapsed: 0.08s | num: 200000 | iterations: 3"
+          },
+          {
+            "name": "seekrandom",
+            "value": 318278.0394200083,
+            "unit": "ops/sec",
+            "extra": "P50: 2.5us | P99: 8.0us | P99.9: 15.1us\nthreads: 1 | elapsed: 0.63s | num: 200000 | iterations: 3"
+          },
+          {
+            "name": "prefixscan",
+            "value": 198666.2738372212,
+            "unit": "ops/sec",
+            "extra": "P50: 4.5us | P99: 5.9us | P99.9: 12.2us\nthreads: 1 | elapsed: 1.01s | num: 200000 | iterations: 3"
+          },
+          {
+            "name": "overwrite",
+            "value": 1029314.8880105402,
+            "unit": "ops/sec",
+            "extra": "P50: 0.8us | P99: 1.8us | P99.9: 5.4us\nthreads: 1 | elapsed: 0.19s | num: 200000 | iterations: 3"
+          },
+          {
+            "name": "mergerandom",
+            "value": 422853.45315872587,
+            "unit": "ops/sec",
+            "extra": "P50: 0.4us | P99: 1.3us | P99.9: 3.8us\nthreads: 1 | elapsed: 0.47s | num: 200000 | iterations: 3"
+          },
+          {
+            "name": "readwhilewriting",
+            "value": 585307.2087313789,
+            "unit": "ops/sec",
+            "extra": "P50: 1.4us | P99: 6.9us | P99.9: 77.6us\nthreads: 1 | elapsed: 0.34s | num: 200000 | iterations: 3"
           }
         ]
       }
