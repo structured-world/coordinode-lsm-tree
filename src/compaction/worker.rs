@@ -2,6 +2,7 @@
 // Copyright (c) 2024-present, fjall-rs
 // Copyright (c) 2026-present, Dmitry Prudnikov
 
+use super::stream::RangeTombstoneUse;
 use super::{CompactionAction, CompactionResult, CompactionStrategy, Input as CompactionPayload};
 use crate::time::Instant;
 use crate::tree::inner::{CompactionGuard, VersionsReadGuard};
@@ -646,6 +647,50 @@ fn collect_version_tombstones(version: &Version) -> Vec<crate::range_tombstone::
         .flat_map(|run| run.iter())
         .flat_map(|t| t.range_tombstones().iter().cloned())
         .collect()
+}
+
+/// Which range tombstones a compaction is given, and what it may do with them.
+///
+/// The bottommost one deletes what they cover. A composing merge operator needs
+/// them anywhere, as chain boundaries only: a range tombstone between two
+/// operands ends the chain, and a fold across it would produce one operand
+/// newer than the still-propagating tombstone. Gathering them costs a pass over
+/// the version, so nothing is gathered when neither applies.
+fn range_tombstone_plan(
+    version: &Version,
+    is_last_level: bool,
+    config: &crate::config::Config,
+) -> Option<(
+    Vec<crate::range_tombstone::RangeTombstone>,
+    RangeTombstoneUse,
+)> {
+    let use_ = if is_last_level {
+        RangeTombstoneUse::Delete
+    } else if config
+        .merge_operator
+        .as_ref()
+        .is_some_and(|op| op.composes_operands())
+    {
+        RangeTombstoneUse::Boundary
+    } else {
+        return None;
+    };
+
+    Some((collect_version_tombstones(version), use_))
+}
+
+/// The list the bottommost seqno-zeroer should see: it only ever acts at the
+/// bottom, so boundary-only tombstones are none of its business.
+fn zeroing_tombstones_from(
+    plan: Option<&(
+        Vec<crate::range_tombstone::RangeTombstone>,
+        RangeTombstoneUse,
+    )>,
+) -> Vec<crate::range_tombstone::RangeTombstone> {
+    match plan {
+        Some((tombstones, RangeTombstoneUse::Delete)) => tombstones.clone(),
+        _ => Vec::new(),
+    }
 }
 
 /// Whether relocating `payload.table_ids` to `payload.dest_level` leaves the
@@ -1898,15 +1943,12 @@ fn run_subcompaction(
         )));
     };
 
-    // Whole-version range tombstones drive both compaction-time RT application
-    // (drop covered KVs in the merge, with blob-GC accounting) and the
-    // bottommost seqno-zeroing gate below. Gathered from every level so coverage
-    // outside this compaction is respected.
-    let version_tombstones = if is_last_level {
-        collect_version_tombstones(version)
-    } else {
-        Vec::new()
-    };
+    // Whole-version range tombstones drive compaction-time RT application (drop
+    // covered KVs in the merge, with blob-GC accounting), merge-chain
+    // boundaries for a composing operator, and the bottommost seqno-zeroing
+    // gate below. Gathered from every level so coverage outside this compaction
+    // is respected.
+    let rt_plan = range_tombstone_plan(version, is_last_level, &opts.config);
 
     // Dropping a tombstone, zeroing a seqno and folding operands onto an absent
     // base all read "not in my inputs" as "not in the tree", so they need the
@@ -1921,12 +1963,14 @@ fn run_subcompaction(
     merge_iter = merge_iter
         .evict_tombstones(holds_everything)
         .zero_seqnos(false);
-    if is_last_level {
-        merge_iter = merge_iter.with_range_tombstone_application(
-            version_tombstones.clone(),
+    if let Some((tombstones, rt_use)) = &rt_plan {
+        merge_iter = merge_iter.with_range_tombstones(
+            tombstones.clone(),
             opts.config.comparator.clone(),
+            *rt_use,
         );
     }
+    let version_tombstones = zeroing_tombstones_from(rt_plan.as_ref());
 
     let filter_ctx = Context { is_last_level };
     let mut compaction_filter = if apply_compaction_filter {
@@ -2827,17 +2871,15 @@ fn merge_tables(
     // the seqno-zeroer wrapper are `core` + `alloc`, so the bottommost
     // RT-application + zeroing runs on the `no_std` serial path too (see the
     // zeroer wrap below).
-    let zeroing_tombstones = if is_last_level {
-        collect_version_tombstones(&current_super_version.version)
-    } else {
-        Vec::new()
-    };
-    if is_last_level {
-        merge_iter = merge_iter.with_range_tombstone_application(
-            zeroing_tombstones.clone(),
+    let rt_plan = range_tombstone_plan(&current_super_version.version, is_last_level, &opts.config);
+    if let Some((tombstones, rt_use)) = &rt_plan {
+        merge_iter = merge_iter.with_range_tombstones(
+            tombstones.clone(),
             opts.config.comparator.clone(),
+            *rt_use,
         );
     }
+    let zeroing_tombstones = zeroing_tombstones_from(rt_plan.as_ref());
 
     let blobs_folder = opts.config.path.join(BLOBS_FOLDER);
 

@@ -65,6 +65,21 @@ impl<I: Iterator<Item = Item>> CountingPeek<I> {
     }
 }
 
+/// What a compaction may do with the range tombstones it was given.
+///
+/// Both uses end a merge chain, because a range tombstone between two operands
+/// hides the ones below it exactly as an in-stream tombstone does. Only a
+/// bottommost compaction may also delete what they cover: elsewhere the
+/// tombstone is still propagating and a lower level may hold versions it hides.
+#[derive(Clone, Copy, PartialEq, Eq, Debug)]
+pub enum RangeTombstoneUse {
+    /// End merge chains only.
+    Boundary,
+
+    /// End merge chains, and physically drop the covered entries.
+    Delete,
+}
+
 /// A callback that receives all dropped KVs
 ///
 /// Used for counting blobs that are not referenced anymore because of
@@ -142,6 +157,9 @@ pub struct CompactionStream<'a, I: Iterator<Item = Item>, F: StreamFilter = NoFi
     rt_idx: usize,
     rt_sorted: bool,
 
+    /// What the installed tombstones are allowed to do here.
+    rt_use: RangeTombstoneUse,
+
     /// Ticked on every VISIBILITY-CHANGING drop this merge performs itself —
     /// a bottommost tombstone elision (and the versions it drains), a
     /// range-tombstone application, a weak-tombstone annihilation. Such a
@@ -195,6 +213,7 @@ impl<I: Iterator<Item = Item>> CompactionStream<'_, I, NoFilter> {
             rt_active: None,
             rt_idx: 0,
             rt_sorted: false,
+            rt_use: RangeTombstoneUse::Boundary,
             transform_marker: None,
         }
     }
@@ -217,6 +236,7 @@ impl<'a, I: Iterator<Item = Item>, F: StreamFilter + 'a> CompactionStream<'a, I,
             rt_active: self.rt_active,
             rt_idx: self.rt_idx,
             rt_sorted: self.rt_sorted,
+            rt_use: self.rt_use,
             transform_marker: self.transform_marker,
             gc_balance: self.gc_balance,
         }
@@ -278,11 +298,53 @@ impl<'a, I: Iterator<Item = Item>, F: StreamFilter + 'a> CompactionStream<'a, I,
     /// tombstone at the watermark), so those entries are preserved (PITR/MVCC
     /// safety). Pass tombstones gathered from the whole version; this filters
     /// them to the applicable set.
+    /// Production installs tombstones through [`Self::with_range_tombstones`],
+    /// whose use is decided once by the compaction worker; this reads better in
+    /// a test that is specifically about deletion.
+    #[cfg(test)]
     #[must_use]
     pub fn with_range_tombstone_application(
+        self,
+        tombstones: Vec<RangeTombstone>,
+        comparator: SharedComparator,
+    ) -> Self {
+        self.with_range_tombstones(tombstones, comparator, RangeTombstoneUse::Delete)
+    }
+
+    /// The same tombstones, for a compaction that may NOT delete what they
+    /// cover.
+    ///
+    /// A range tombstone ends a merge chain the way an in-stream `Tombstone`
+    /// does: operands below it are hidden and operands above it fold onto an
+    /// absent base. A compaction off the last level still has to know that,
+    /// because composing across the break would produce one operand newer than
+    /// the tombstone, which then survives the read the tombstone should have
+    /// cut. It may not physically drop the covered entries, though: the
+    /// tombstone is still propagating and a lower level may hold versions it is
+    /// hiding.
+    ///
+    /// So this installs them as boundaries only. Nothing is dropped for
+    /// coverage; the sole effect is that a chain crossing one is not composed.
+    ///
+    /// Production goes through [`Self::with_range_tombstones`]; this is the
+    /// readable form for a test that is specifically about boundaries.
+    #[cfg(test)]
+    #[must_use]
+    pub fn with_range_tombstone_barriers(
+        self,
+        tombstones: Vec<RangeTombstone>,
+        comparator: SharedComparator,
+    ) -> Self {
+        self.with_range_tombstones(tombstones, comparator, RangeTombstoneUse::Boundary)
+    }
+
+    /// Installs the tombstones for the use a caller has already decided on.
+    #[must_use]
+    pub fn with_range_tombstones(
         mut self,
         tombstones: Vec<RangeTombstone>,
         comparator: SharedComparator,
+        use_: RangeTombstoneUse,
     ) -> Self {
         self.rt_apply = tombstones
             .into_iter()
@@ -294,7 +356,16 @@ impl<'a, I: Iterator<Item = Item>, F: StreamFilter + 'a> CompactionStream<'a, I,
             .collect();
         self.rt_active = Some(ActiveTombstoneSet::new_with_comparator(comparator.clone()));
         self.rt_comparator = Some(comparator);
+        self.rt_use = use_;
         self
+    }
+
+    /// Whether a covering tombstone may physically drop what it covers, as
+    /// opposed to only ending a merge chain. See
+    /// [`Self::with_range_tombstone_barriers`].
+    fn covered_and_deletable(&mut self, user_key: &[u8], seqno: SeqNo) -> bool {
+        self.rt_use == RangeTombstoneUse::Delete
+            && self.covered_by_applied_tombstone(user_key, seqno)
     }
 
     /// Returns `true` if `user_key`/`seqno` is covered by an applicable
@@ -441,7 +512,7 @@ impl<'a, I: Iterator<Item = Item>, F: StreamFilter + 'a> CompactionStream<'a, I,
                     // this, a compaction resurrects a range-deleted key whenever a
                     // later merge operand exists (the read path before compaction
                     // already folds onto the empty base).
-                    if self.covered_by_applied_tombstone(user_key.as_ref(), next.key.seqno) {
+                    if self.covered_and_deletable(user_key.as_ref(), next.key.seqno) {
                         if let Some(watcher) = &mut self.dropped_callback {
                             watcher.on_dropped(&next);
                         }
@@ -516,8 +587,34 @@ impl<'a, I: Iterator<Item = Item>, F: StreamFilter + 'a> CompactionStream<'a, I,
         // as a `MergeOperand` rather than a `Value` for exactly that reason —
         // calling it a value would assert the base is empty, which is the
         // wrong answer this branch exists to avoid.
-        let compose_only = !found_boundary && !self.evict_tombstones;
-        if compose_only && !merge_op.composes_operands() {
+        // Composing needs the range tombstones too, and not only to delete what
+        // they cover. A range tombstone between two operands ENDS the chain,
+        // exactly as an in-stream `Tombstone` boundary does: the ones below it
+        // are hidden and the ones above fold onto an absent base. Composing
+        // across that break would produce one operand newer than the
+        // still-propagating tombstone, which then survives the read the
+        // tombstone should have cut. So a stream that cannot see them does not
+        // compose at all, and one that can does not compose a chain reaching
+        // under the newest applicable one.
+        //
+        // The oldest collected operand is the whole test: a tombstone covering
+        // it either sits inside the chain or above all of it, and both are
+        // reasons to leave the operands alone; one below it covers nothing
+        // here. In a deleting compaction `retain` will drop the covered ones
+        // anyway, so this only ever declines ahead of that.
+        //
+        // Every fold before this feature coincided with having the tombstones,
+        // through either the boundary or `evict_tombstones`; requiring it here
+        // keeps that invariant rather than adding a new precaution.
+        let no_proven_base = !found_boundary && !self.evict_tombstones;
+        let composes = merge_op.composes_operands() && self.rt_comparator.is_some();
+        let crosses_barrier = composes
+            && collected.last().is_some_and(|oldest| {
+                let (key, seqno) = (oldest.key.user_key.clone(), oldest.key.seqno);
+                self.covered_by_applied_tombstone(key.as_ref(), seqno)
+            });
+        let compose_only = no_proven_base && composes && !crosses_barrier;
+        if no_proven_base && !compose_only {
             let mut iter = collected.into_iter();
             #[expect(clippy::expect_used, reason = "collected always has head")]
             let first = iter
@@ -532,7 +629,7 @@ impl<'a, I: Iterator<Item = Item>, F: StreamFilter + 'a> CompactionStream<'a, I,
         // onto the now-empty base. Without this, an operand below the tombstone
         // would resurrect deleted state across compaction.
         collected.retain(|e| {
-            let covered = self.covered_by_applied_tombstone(e.key.user_key.as_ref(), e.key.seqno);
+            let covered = self.covered_and_deletable(e.key.user_key.as_ref(), e.key.seqno);
             if covered {
                 if let Some(watcher) = &mut self.dropped_callback {
                     watcher.on_dropped(e);
@@ -542,22 +639,15 @@ impl<'a, I: Iterator<Item = Item>, F: StreamFilter + 'a> CompactionStream<'a, I,
             !covered
         });
 
-        // A covering tombstone can take every operand, and then there is
-        // neither a fold to do nor anything to re-emit. Composing an empty list
-        // would ask the operator a question it is entitled to refuse, and the
-        // refusal has no fallback left: the entries it would re-emit are
-        // exactly the ones just dropped. The key is deleted, which is what
-        // emptied the list, so it leaves as a tombstone at the head's seqno and
-        // the emit path drops it for the same coverage. A proven base still
-        // asks, because there the answer is the key's surviving value.
-        if compose_only && collected.is_empty() {
-            return Ok(InternalValue::from_components(
-                user_key,
-                UserValue::from(Vec::new()),
-                head_seqno,
-                ValueType::Tombstone,
-            ));
-        }
+        // The retain above cannot empty a composing chain: emptying it means
+        // every operand was covered, the oldest included, and a covered oldest
+        // is exactly the barrier that declined the composition before any of
+        // this ran. So the fold below always has at least the head, and so does
+        // the re-emit it may fall back to.
+        debug_assert!(
+            !compose_only || !collected.is_empty(),
+            "a composing chain the barrier check passed cannot be emptied by coverage",
+        );
 
         // Operand values in chronological order (ascending seqno): `collected`
         // holds them newest-first, so reading it backwards is that order.
@@ -856,7 +946,7 @@ impl<'a, I: Iterator<Item = Item>, F: StreamFilter + 'a> CompactionStream<'a, I,
                             let mut merged = fail_iter!(self.resolve_with_operator(head));
                             // Drop the merged result if an applicable tombstone
                             // outranks it (same rule as the main emit path).
-                            if self.covered_by_applied_tombstone(
+                            if self.covered_and_deletable(
                                 merged.key.user_key.as_ref(),
                                 merged.key.seqno,
                             ) {
@@ -927,7 +1017,7 @@ impl<'a, I: Iterator<Item = Item>, F: StreamFilter + 'a> CompactionStream<'a, I,
             // surviving entry when an applicable (strictly-below-watermark)
             // tombstone outranks it, accounting it to the drop callback (blob GC)
             // instead of carrying it to the output to be suppressed at every read.
-            if self.covered_by_applied_tombstone(head.key.user_key.as_ref(), head.key.seqno) {
+            if self.covered_and_deletable(head.key.user_key.as_ref(), head.key.seqno) {
                 if let Some(watcher) = &mut self.dropped_callback {
                     watcher.on_dropped(&head);
                 }
