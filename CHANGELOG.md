@@ -11,6 +11,12 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 
 ## [Unreleased]
 
+## [5.11.0](https://github.com/structured-world/coordinode-lsm-tree/compare/v5.10.0...v5.11.0) - 2026-09-20
+
+### Added
+
+- *(merge)* fold composing operands without a proven base ([#658](https://github.com/structured-world/coordinode-lsm-tree/pull/658))
+
 ## [5.10.0](https://github.com/structured-world/coordinode-lsm-tree/compare/v5.9.0...v5.10.0) - 2026-09-19
 
 ### Added
