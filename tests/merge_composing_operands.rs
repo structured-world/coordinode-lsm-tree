@@ -211,6 +211,87 @@ fn a_composed_operand_still_folds_onto_a_base_that_appears_later() -> lsm_tree::
     Ok(())
 }
 
+/// Checked arithmetic, so the operator can refuse. Composition moves where a
+/// refusal happens, which is the shape the fallback exists for.
+struct CheckedSum;
+
+impl MergeOperator for CheckedSum {
+    fn merge(
+        &self,
+        _key: &[u8],
+        base_value: Option<&[u8]>,
+        operands: &[&[u8]],
+    ) -> lsm_tree::Result<UserValue> {
+        let mut total = base_value.map(decode).unwrap_or(0);
+        for operand in operands {
+            total = total
+                .checked_add(decode(operand))
+                .ok_or(lsm_tree::Error::MergeOperator)?;
+        }
+        Ok(UserValue::from(total.to_le_bytes().to_vec()))
+    }
+
+    fn composes_operands(&self) -> bool {
+        true
+    }
+}
+
+#[test]
+fn a_composition_the_operator_refuses_falls_back_to_the_operands() -> lsm_tree::Result<()> {
+    // The operands compose to something out of range while the whole chain
+    // against the real base does not: -1 + i64::MAX + 1 is i64::MAX, but
+    // i64::MAX + 1 on its own overflows. The compaction must not fail over an
+    // optimisation it can simply decline.
+    let folder = tempfile::tempdir()?;
+    let seqno = SequenceNumberCounter::default();
+    let tree = open_tree(&folder, &seqno, Arc::new(CheckedSum))?;
+
+    tree.insert(KEY, (-1_i64).to_le_bytes(), seqno.next());
+    tree.insert("a", b"x", seqno.next());
+    tree.insert("z", b"x", seqno.next());
+    tree.flush_active_memtable(0)?;
+    tree.compact(Arc::new(lsm_tree::compaction::MoveDown(0, 6)), seqno.get())?;
+
+    tree.insert("a", b"y", seqno.next());
+    tree.insert("z", b"y", seqno.next());
+    tree.flush_active_memtable(0)?;
+    tree.compact(Arc::new(lsm_tree::compaction::MoveDown(0, 1)), seqno.get())?;
+
+    tree.merge(KEY, i64::MAX.to_le_bytes(), seqno.next());
+    tree.flush_active_memtable(0)?;
+    tree.merge(KEY, 1_i64.to_le_bytes(), seqno.next());
+    tree.flush_active_memtable(0)?;
+
+    assert_eq!(Some(i64::MAX), read(&tree, seqno.get())?);
+    let before = tree.approximate_len();
+
+    // Composing these two operands overflows, so the fold declines and the
+    // compaction still succeeds.
+    let result = tree.compact(
+        Arc::new(lsm_tree::compaction::Leveled::default()),
+        seqno.get(),
+    )?;
+    assert_ne!(
+        lsm_tree::compaction::CompactionAction::Nothing,
+        result.action,
+        "the compaction must have run",
+    );
+    assert_eq!(Some(i64::MAX), read(&tree, seqno.get())?);
+
+    // Declined, not silently folded to a wrong value: both operands survive.
+    assert_eq!(
+        before,
+        tree.approximate_len(),
+        "a refused composition must leave the operands in place",
+    );
+
+    // And the fold that does meet the base is in range, so it happens there.
+    tree.major_compact(64_000_000, seqno.get())?;
+    assert_eq!(Some(i64::MAX), read(&tree, seqno.get())?);
+
+    Ok(())
+}
+
 #[test]
 fn a_watermark_below_the_newest_operands_leaves_them_alone() -> lsm_tree::Result<()> {
     // Folding is gated on the watermark exactly as the proven-base fold is: the

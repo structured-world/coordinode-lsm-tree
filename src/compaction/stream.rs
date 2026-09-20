@@ -536,15 +536,47 @@ impl<'a, I: Iterator<Item = Item>, F: StreamFilter + 'a> CompactionStream<'a, I,
             !covered
         });
 
-        // Extract operand values for merge
-        let operands: Vec<UserValue> = collected.into_iter().map(|e| e.value).collect();
+        // Operand values in chronological order (ascending seqno): `collected`
+        // holds them newest-first, so reading it backwards is that order.
+        // Borrowed rather than moved out, because the composing path below may
+        // still have to re-emit the entries with their own seqnos.
+        let merged = {
+            let operand_refs: Vec<&[u8]> =
+                collected.iter().rev().map(|e| e.value.as_ref()).collect();
+            merge_op.merge(&user_key, base_value.as_deref(), &operand_refs)
+        };
 
-        // Reverse to chronological order (ascending seqno)
-        let mut operands_reversed = operands;
-        operands_reversed.reverse();
-
-        let operand_refs: Vec<&[u8]> = operands_reversed.iter().map(AsRef::as_ref).collect();
-        let merged = merge_op.merge(&user_key, base_value.as_deref(), &operand_refs)?;
+        let merged = match merged {
+            Ok(merged) => merged,
+            // A fold onto a PROVEN base is the only place the key's value can
+            // be produced, so its failure is the caller's to see.
+            Err(err) if !compose_only => return Err(err),
+            // A mid-tree composition is an optimisation, and an optimisation
+            // must never make a compaction fail that would otherwise have
+            // succeeded. Composition changes which intermediate results exist,
+            // so an operator with checked arithmetic can refuse a prefix whose
+            // full chain against the real base is perfectly in range: with
+            // `base = -1` and operands `[i64::MAX, 1]`, the chain stays in
+            // range while the prefix alone overflows. The three properties an
+            // operator asserts by composing are about the values it returns,
+            // so they cannot rule this out, and requiring totality instead
+            // would be a heavier obligation than simply declining here.
+            //
+            // So the operands are re-emitted exactly as the non-composing
+            // branch above does, and the fold happens where the base is. That
+            // is the behaviour this key had before the operator opted in, so
+            // the failure surfaces at the same point, and for the same reason,
+            // as it would have without the optimisation.
+            Err(_) => {
+                let mut iter = collected.into_iter();
+                #[expect(clippy::expect_used, reason = "collected always has head")]
+                let first = iter
+                    .next()
+                    .expect("collected should contain at least one element");
+                self.pending.extend(iter);
+                return Ok(first);
+            }
+        };
 
         // With a proven base this is the key's value, not a further operand: a
         // key that never had a put therefore materialises at the bottom level

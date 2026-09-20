@@ -136,6 +136,23 @@ pub trait MergeOperator: Send + Sync + RefUnwindSafe + 'static {
     /// so a `true` that does not hold produces silently wrong state rather than
     /// an error.
     ///
+    /// # Partial operators
+    ///
+    /// The three properties are about the values a successful merge returns, so
+    /// an operator that can REFUSE is not held to them when it refuses. It does
+    /// not have to be total, and its failures do not have to be independent of
+    /// how the chain is bracketed. Composition changes which intermediate
+    /// results exist, so checked arithmetic can legitimately refuse a prefix
+    /// whose whole chain against the real base is in range: summing
+    /// `[i64::MAX, 1]` overflows on its own, while the same operands applied to
+    /// a base of `-1` do not.
+    ///
+    /// The engine treats a refused composition as a composition it will not do:
+    /// the operands are re-emitted and the fold happens where the base is,
+    /// exactly as it would for an operator that left this `false`. A failing
+    /// composition therefore costs the optimisation for that key and nothing
+    /// else, and never fails a compaction that would otherwise have succeeded.
+    ///
     /// Folding stays gated on the GC watermark either way: the composed operand
     /// carries the head's sequence number, so only operands the watermark has
     /// already certified as collapsible take part, and no live snapshot can
