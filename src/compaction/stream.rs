@@ -114,11 +114,11 @@ pub trait StreamFilter {
     /// Handle an item, possibly modifying it.
     fn filter_item(&mut self, item: &InternalValue) -> crate::Result<StreamFilterVerdict>;
 
-    /// Whether this filter can ever return anything but
+    /// Whether this filter only ever returns
     /// [`StreamFilterVerdict::Keep`].
     ///
-    /// Answering `false` is a promise, and it buys the caller the right to
-    /// skip asking. The merge stream uses it to decide whether a chain may be
+    /// Answering `true` is a promise, and it buys the caller the right to stop
+    /// asking. The merge stream uses it to decide whether a chain may be
     /// composed: every entry reaches `filter_item` exactly once on the way
     /// out, but a composed chain is written once and the operands inside it
     /// never come back, so their verdicts would have to be collected during
@@ -126,7 +126,7 @@ pub trait StreamFilter {
     /// a filter need not be idempotent or stateless. A filter that can only
     /// keep has no verdict to collect, so the question does not arise.
     ///
-    /// Defaults to `true`, the answer that costs nothing but a declined fold.
+    /// Defaults to `false`, which costs nothing but a declined fold.
     fn keeps_everything(&self) -> bool {
         false
     }
