@@ -65,6 +65,14 @@ impl<I: Iterator<Item = Item>> CountingPeek<I> {
     }
 }
 
+/// Answers whether a compaction's inputs hold every version of one key within
+/// one sequence-number interval, given as `(key, oldest, newest)` inclusive.
+/// See [`CompactionStream::with_input_completeness`].
+///
+/// Borrowed rather than owned so the stream carries no destructor that could
+/// observe the caller's borrows, and so declaring it costs no allocation.
+pub type InputCompleteness<'a> = &'a dyn Fn(&[u8], SeqNo, SeqNo) -> bool;
+
 /// What a compaction may do with the range tombstones it was given.
 ///
 /// Both uses end a merge chain, because a range tombstone between two operands
@@ -160,6 +168,11 @@ pub struct CompactionStream<'a, I: Iterator<Item = Item>, F: StreamFilter = NoFi
     /// What the installed tombstones are allowed to do here.
     rt_use: RangeTombstoneUse,
 
+    /// Answers, for one key, whether every version of it is in this
+    /// compaction's inputs. `None` means the caller never declared it, and
+    /// then nothing is composed. See [`Self::with_input_completeness`].
+    completeness: Option<InputCompleteness<'a>>,
+
     /// Ticked on every VISIBILITY-CHANGING drop this merge performs itself —
     /// a bottommost tombstone elision (and the versions it drains), a
     /// range-tombstone application, a weak-tombstone annihilation. Such a
@@ -214,6 +227,7 @@ impl<I: Iterator<Item = Item>> CompactionStream<'_, I, NoFilter> {
             rt_idx: 0,
             rt_sorted: false,
             rt_use: RangeTombstoneUse::Boundary,
+            completeness: None,
             transform_marker: None,
         }
     }
@@ -237,6 +251,7 @@ impl<'a, I: Iterator<Item = Item>, F: StreamFilter + 'a> CompactionStream<'a, I,
             rt_idx: self.rt_idx,
             rt_sorted: self.rt_sorted,
             rt_use: self.rt_use,
+            completeness: self.completeness,
             transform_marker: self.transform_marker,
             gc_balance: self.gc_balance,
         }
@@ -358,6 +373,44 @@ impl<'a, I: Iterator<Item = Item>, F: StreamFilter + 'a> CompactionStream<'a, I,
         self.rt_comparator = Some(comparator);
         self.rt_use = use_;
         self
+    }
+
+    /// Declares how to tell whether a key's versions are all in this
+    /// compaction's inputs.
+    ///
+    /// Composing a chain needs more than the operands in front of it: it needs
+    /// to know they are ALL of them. A strategy may select some runs and leave
+    /// others out (`SizeTiered` picks by size), and an omitted run can hold a
+    /// version of the same key between two selected ones — another operand, a
+    /// put, or a point tombstone. Fold across that and the result carries state
+    /// the omitted entry was supposed to reset or reorder, and unlike an
+    /// omitted operand no property of the operator can repair it.
+    ///
+    /// The question is asked per key AND per sequence-number interval, because
+    /// both wider forms answer "incomplete" almost always. A neighbouring
+    /// table spanning the same keys says nothing about whether it holds THIS
+    /// key; and a table that does hold it, but only in versions older than the
+    /// chain being folded, cannot sit between two of those operands — it is
+    /// the base they will meet later, not a break in the middle.
+    ///
+    /// The predicate may answer conservatively, since a false "not complete"
+    /// only declines a fold, but it must never claim completeness it cannot
+    /// prove.
+    ///
+    /// Without this declaration nothing is composed.
+    #[must_use]
+    pub fn with_input_completeness(mut self, predicate: InputCompleteness<'a>) -> Self {
+        self.completeness = Some(predicate);
+        self
+    }
+
+    /// Whether this compaction's inputs hold every version of `user_key`
+    /// between `oldest` and `newest`. Reached only for a chain a composing
+    /// operator is about to fold, not per entry.
+    fn inputs_hold_the_chain(&self, user_key: &[u8], oldest: SeqNo, newest: SeqNo) -> bool {
+        self.completeness
+            .as_ref()
+            .is_some_and(|predicate| predicate(user_key, oldest, newest))
     }
 
     /// Whether a covering tombstone may physically drop what it covers, as
@@ -506,6 +559,27 @@ impl<'a, I: Iterator<Item = Item>, F: StreamFilter + 'a> CompactionStream<'a, I,
                 }
                 ValueType::Value => {
                     found_boundary = true;
+                    // A covered base is not a base: the tombstone hides it from
+                    // every reader. Where this compaction may delete it, it
+                    // goes and the operands fold onto the empty base it leaves
+                    // (below). Where it may not, the base must still not be
+                    // folded onto, and it must still be emitted, so the only
+                    // correct move is to stop and put everything back: the fold
+                    // then happens at the level that applies the tombstone.
+                    // Using it as a base here would republish deleted state
+                    // under the head's seqno.
+                    if self.rt_use == RangeTombstoneUse::Boundary
+                        && self.covered_by_applied_tombstone(user_key.as_ref(), next.key.seqno)
+                    {
+                        collected.push(next);
+                        let mut iter = collected.into_iter();
+                        #[expect(clippy::expect_used, reason = "collected always has head")]
+                        let first = iter
+                            .next()
+                            .expect("collected should contain at least one element");
+                        self.pending.extend(iter);
+                        return Ok(first);
+                    }
                     // A covering applied range tombstone newer than this value
                     // deletes it, so the merge operands must fold onto an empty
                     // base instead of the value being physically dropped. Without
@@ -606,8 +680,18 @@ impl<'a, I: Iterator<Item = Item>, F: StreamFilter + 'a> CompactionStream<'a, I,
         // Every fold before this feature coincided with having the tombstones,
         // through either the boundary or `evict_tombstones`; requiring it here
         // keeps that invariant rather than adding a new precaution.
+        //
+        // And it needs the chain to be the whole chain. A strategy may select
+        // some runs and not others, so the operands in front of this stream are
+        // not always every version of the key; an omitted put or point
+        // tombstone between two of them is a reset the fold would erase, and
+        // unlike an omitted operand no property of the operator can repair it.
+        // `inputs_hold_every_version_of` is what rules that out.
         let no_proven_base = !found_boundary && !self.evict_tombstones;
-        let composes = merge_op.composes_operands() && self.rt_comparator.is_some();
+        let oldest_seqno = collected.last().map_or(head_seqno, |entry| entry.key.seqno);
+        let composes = merge_op.composes_operands()
+            && self.rt_comparator.is_some()
+            && self.inputs_hold_the_chain(user_key.as_ref(), oldest_seqno, head_seqno);
         let crosses_barrier = composes
             && collected.last().is_some_and(|oldest| {
                 let (key, seqno) = (oldest.key.user_key.clone(), oldest.key.seqno);
@@ -639,14 +723,55 @@ impl<'a, I: Iterator<Item = Item>, F: StreamFilter + 'a> CompactionStream<'a, I,
             !covered
         });
 
-        // The retain above cannot empty a composing chain: emptying it means
-        // every operand was covered, the oldest included, and a covered oldest
-        // is exactly the barrier that declined the composition before any of
-        // this ran. So the fold below always has at least the head, and so does
-        // the re-emit it may fall back to.
+        // Only the head reached `filter_item`; the rest were taken straight off
+        // the input. That was harmless while an unproven chain was re-emitted,
+        // because each entry then got its verdict on the way out. A composition
+        // is written once and the entries inside it never come back, so their
+        // verdicts have to be collected here instead: a filter that drops an
+        // expired operand would otherwise see it persisted inside the result.
+        //
+        // Only the composing path needs this. The proven-base fold produces the
+        // key's value, which the caller filters as a whole, exactly as it did
+        // before.
+        if compose_only {
+            let mut filter_error = None;
+            collected.retain_mut(|entry| match self.filter.filter_item(entry) {
+                Ok(StreamFilterVerdict::Keep) => true,
+                Ok(StreamFilterVerdict::Replace((value_type, value))) => {
+                    entry.value = value;
+                    // Same rule the emit path uses: a filter turning an operand
+                    // into a value must not retype it, or blob-pointer bytes
+                    // end up under a merge-operand tag.
+                    if value_type != ValueType::Value {
+                        entry.key.value_type = value_type;
+                    }
+                    true
+                }
+                Ok(StreamFilterVerdict::Drop) => {
+                    if let Some(watcher) = &mut self.dropped_callback {
+                        watcher.on_dropped(entry);
+                    }
+                    self.note_transform();
+                    false
+                }
+                Err(err) => {
+                    filter_error.get_or_insert(err);
+                    true
+                }
+            });
+            if let Some(err) = filter_error {
+                return Err(err);
+            }
+        }
+
+        // Neither filter can empty a composing chain of its head: the head has
+        // already passed the filter in `next_inner`, and a covered oldest is
+        // exactly the barrier that declined the composition before any of this
+        // ran. So the fold below always has at least one entry, and so does the
+        // re-emit it may fall back to.
         debug_assert!(
             !compose_only || !collected.is_empty(),
-            "a composing chain the barrier check passed cannot be emptied by coverage",
+            "a composing chain the barrier check passed cannot be emptied here",
         );
 
         // Operand values in chronological order (ascending seqno): `collected`

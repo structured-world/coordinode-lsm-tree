@@ -1,4 +1,4 @@
-use super::{create_compaction_stream, pick_run_indexes};
+use super::{create_compaction_stream, may_break_chain, pick_run_indexes};
 use crate::{
     AbstractTree, Config, KvSeparationOptions, SequenceNumberCounter, Table, TableId,
     compaction::{Choice, CompactionStrategy, Input, state::CompactionState},
@@ -7,6 +7,94 @@ use crate::{
 };
 use std::sync::Arc;
 use test_log::test;
+
+mod chain_completeness {
+    use super::may_break_chain;
+    use crate::{KeyRange, UserKey};
+    use test_log::test;
+
+    fn range(min: &str, max: &str) -> KeyRange {
+        KeyRange::new((UserKey::from(min.as_bytes()), UserKey::from(max.as_bytes())))
+    }
+
+    #[test]
+    fn a_table_older_than_the_chain_cannot_break_it() {
+        // Versions below the chain are the base it will meet later, not a
+        // break inside it, so the filter is never even consulted.
+        let cmp = crate::comparator::default_comparator();
+        assert!(!may_break_chain(
+            Some((1, 4)),
+            &range("a", "z"),
+            cmp.as_ref(),
+            b"m",
+            (10, 20),
+            || panic!("the seqno range alone must settle this"),
+        ));
+    }
+
+    #[test]
+    fn a_table_newer_than_the_chain_cannot_break_it() {
+        let cmp = crate::comparator::default_comparator();
+        assert!(!may_break_chain(
+            Some((30, 40)),
+            &range("a", "z"),
+            cmp.as_ref(),
+            b"m",
+            (10, 20),
+            || panic!("the seqno range alone must settle this"),
+        ));
+    }
+
+    #[test]
+    fn a_table_beside_the_key_cannot_break_the_chain() {
+        // Overlapping seqnos, but the key is outside its range entirely.
+        let cmp = crate::comparator::default_comparator();
+        assert!(!may_break_chain(
+            Some((10, 20)),
+            &range("a", "f"),
+            cmp.as_ref(),
+            b"m",
+            (10, 20),
+            || panic!("the key range alone must settle this"),
+        ));
+    }
+
+    #[test]
+    fn a_table_spanning_the_key_defers_to_its_filter() {
+        // Both ranges overlap, so only the filter can rule the table out —
+        // and it is asked exactly here, where reading a block may be needed.
+        let cmp = crate::comparator::default_comparator();
+        assert!(!may_break_chain(
+            Some((10, 20)),
+            &range("a", "z"),
+            cmp.as_ref(),
+            b"m",
+            (10, 20),
+            || false,
+        ));
+        assert!(may_break_chain(
+            Some((10, 20)),
+            &range("a", "z"),
+            cmp.as_ref(),
+            b"m",
+            (10, 20),
+            || true,
+        ));
+    }
+
+    #[test]
+    fn an_unknown_seqno_range_is_assumed_to_overlap() {
+        let cmp = crate::comparator::default_comparator();
+        assert!(may_break_chain(
+            None,
+            &range("a", "z"),
+            cmp.as_ref(),
+            b"m",
+            (10, 20),
+            || true,
+        ));
+    }
+}
 
 /// A serial merge stopped part-way must not commit what it wrote.
 ///

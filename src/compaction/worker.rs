@@ -666,17 +666,115 @@ fn range_tombstone_plan(
 )> {
     let use_ = if is_last_level {
         RangeTombstoneUse::Delete
-    } else if config
-        .merge_operator
-        .as_ref()
-        .is_some_and(|op| op.composes_operands())
-    {
+    } else if composes_operands(config) {
         RangeTombstoneUse::Boundary
     } else {
         return None;
     };
 
     Some((collect_version_tombstones(version), use_))
+}
+
+/// Whether the configured merge operator opts its operands into composition.
+fn composes_operands(config: &crate::config::Config) -> bool {
+    config
+        .merge_operator
+        .as_ref()
+        .is_some_and(|op| op.composes_operands())
+}
+
+/// Key ranges of every table this compaction does NOT read.
+///
+/// A key inside none of them has all of its versions in the inputs, which is
+/// what [`CompactionStream::with_input_completeness`] needs to let a chain be
+/// composed. It is the same question [`holds_every_surviving_version`] asks,
+/// asked per key instead of over the whole compacted range, and without the
+/// bottommost requirement that one adds for proving a base absent.
+fn outside_tables<'a>(version: &'a Version, table_ids: &HashSet<TableId>) -> Vec<&'a Table> {
+    version
+        .iter_tables()
+        .filter(|table| !table_ids.contains(&table.id()))
+        .collect()
+}
+
+/// Builds the per-key completeness predicate for
+/// [`CompactionStream::with_input_completeness`] over the tables this
+/// compaction did not read.
+///
+/// Three tests, cheapest first. The seqno range rules out the tables that
+/// cannot hold a version BETWEEN the chain's ends: an older one is the base
+/// the composed operand will meet later, and a newer one applies after it, so
+/// neither breaks the chain. The key range then rules out tables that do not
+/// span the key at all, and the table's filter answers what the key range
+/// cannot: whether it holds THIS key rather than merely spanning it.
+///
+/// All three are conservative in the safe direction. A table whose seqno range
+/// is unknown, a filter false positive, or an error reading one all read as
+/// "may hold it", and the fold is declined.
+/// The completeness predicate this compaction should declare, or `None` when
+/// its operator does not compose and the question never arises.
+fn input_completeness_for<'a>(
+    version: &'a Version,
+    table_ids: &HashSet<TableId>,
+    config: &crate::config::Config,
+) -> Option<impl Fn(&[u8], SeqNo, SeqNo) -> bool + 'a> {
+    composes_operands(config).then(|| {
+        input_completeness_predicate(
+            outside_tables(version, table_ids),
+            config.comparator.clone(),
+        )
+    })
+}
+
+fn input_completeness_predicate(
+    outside: Vec<&Table>,
+    comparator: crate::comparator::SharedComparator,
+) -> impl Fn(&[u8], SeqNo, SeqNo) -> bool + '_ {
+    use crate::version::run::Ranged as _;
+
+    move |key: &[u8], oldest: SeqNo, newest: SeqNo| {
+        let cmp = comparator.as_ref();
+        let key_hash = crate::hash::hash64(key);
+
+        !outside.iter().any(|table| {
+            may_break_chain(
+                table.seqno_range(),
+                table.key_range(),
+                cmp,
+                key,
+                (oldest, newest),
+                || table.bloom_may_contain_key(key, key_hash).unwrap_or(true),
+            )
+        })
+    }
+}
+
+/// Whether one table outside the inputs could hold a version of `key` inside
+/// the `(oldest, newest)` sequence-number interval, and so break a chain being
+/// composed across it. See [`input_completeness_predicate`].
+///
+/// Split out from the table walk so the three tests are exercisable without
+/// building tables: `may_contain` is only consulted once the cheap ranges have
+/// failed to rule the table out, since it can read a filter block.
+fn may_break_chain(
+    seqno_range: Option<(SeqNo, SeqNo)>,
+    key_range: &crate::KeyRange,
+    comparator: &dyn crate::comparator::UserComparator,
+    key: &[u8],
+    (oldest, newest): (SeqNo, SeqNo),
+    may_contain: impl FnOnce() -> bool,
+) -> bool {
+    // An unknown seqno range proves nothing, so it has to be assumed to
+    // overlap; the key range and the filter can still rule the table out.
+    let within_seqnos = seqno_range.is_none_or(|(low, high)| high >= oldest && low <= newest);
+    if !within_seqnos {
+        return false;
+    }
+
+    let within_keys = comparator.compare(key_range.min(), key) != core::cmp::Ordering::Greater
+        && comparator.compare(key_range.max(), key) != core::cmp::Ordering::Less;
+
+    within_keys && may_contain()
 }
 
 /// The list the bottommost seqno-zeroer should see: it only ever acts at the
@@ -1925,6 +2023,9 @@ fn run_subcompaction(
 
     let mut blob_frag_map = FragmentationMap::default();
 
+    // Declared before the stream that borrows it, so it outlives it.
+    let completeness = input_completeness_for(version, &payload.table_ids, &opts.config);
+
     let Some(mut merge_iter) = create_bounded_compaction_stream(
         version,
         &payload.table_ids,
@@ -1969,6 +2070,9 @@ fn run_subcompaction(
             opts.config.comparator.clone(),
             *rt_use,
         );
+    }
+    if let Some(predicate) = &completeness {
+        merge_iter = merge_iter.with_input_completeness(predicate);
     }
     let version_tombstones = zeroing_tombstones_from(rt_plan.as_ref());
 
@@ -2835,6 +2939,13 @@ fn merge_tables(
 
     let mut blob_frag_map = FragmentationMap::default();
 
+    // Declared before the stream that borrows it, so it outlives it.
+    let completeness = input_completeness_for(
+        &current_super_version.version,
+        &payload.table_ids,
+        &opts.config,
+    );
+
     let Some(mut merge_iter) = create_compaction_stream(
         &current_super_version.version,
         &payload.table_ids.iter().copied().collect::<Vec<_>>(),
@@ -2878,6 +2989,9 @@ fn merge_tables(
             opts.config.comparator.clone(),
             *rt_use,
         );
+    }
+    if let Some(predicate) = &completeness {
+        merge_iter = merge_iter.with_input_completeness(predicate);
     }
     let zeroing_tombstones = zeroing_tombstones_from(rt_plan.as_ref());
 

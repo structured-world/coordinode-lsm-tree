@@ -126,21 +126,15 @@ pub trait MergeOperator: Send + Sync + RefUnwindSafe + 'static {
     /// f(B, [f(None, P), ...S])  ==  f(B, [...P, ...S])
     /// ```
     ///
-    /// 4. **Order independence.** Operands must combine to the same result
-    ///    whatever order they are applied in. A compaction sees the operands in
-    ///    the tables it selected, and a strategy may select some runs and not
-    ///    others (`SizeTiered` picks by size), so the operands it holds are not
-    ///    always a contiguous run of sequence numbers. Composing 1 and 3 while
-    ///    2 sits in a table left out produces an operand at 3, and the read
-    ///    then applies 2 before it. For a sum that is the same answer; for a
-    ///    concatenation it is `213` where the chain says `123`. The engine
-    ///    cannot see what it did not select, so this one is on the operator.
+    /// A sum of deltas satisfies all three, because a sum of deltas is itself a
+    /// delta and carries no notion of the base it will land on. An operator
+    /// that cannot state the law above for arbitrary `B`, `P` and `S` must
+    /// leave this `false`.
     ///
-    /// A sum of deltas satisfies all four, because a sum of deltas is itself a
-    /// delta, carries no notion of the base it will land on, and does not care
-    /// in which order the deltas arrive. An operator that cannot state the law
-    /// above for arbitrary `B`, `P` and `S`, or whose result depends on operand
-    /// order, must leave this `false`.
+    /// Order independence is NOT required, and neither is contiguity of the
+    /// operands: the engine composes only where it holds every version of the
+    /// key, so `P` is always a real prefix of the real chain and never a
+    /// subset with gaps in it. A concatenation is as eligible as a sum.
     ///
     /// Getting this wrong does not cost performance, it costs correctness: the
     /// composed operand is written to disk and later folded onto a real base,

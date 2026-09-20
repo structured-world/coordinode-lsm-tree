@@ -763,6 +763,13 @@ mod merge_operator_tests {
         Arc::new(ComposingConcat)
     }
 
+    /// No tables outside the inputs, so every chain in front of the stream is
+    /// the whole chain. Models a compaction that read everything overlapping
+    /// the keys it touches.
+    fn inputs_are_complete() -> crate::compaction::stream::InputCompleteness<'static> {
+        &|_key, _oldest, _newest| true
+    }
+
     #[test]
     fn composing_operator_with_every_operand_range_deleted_drops_the_key() -> crate::Result<()> {
         // A tombstone covering the oldest operand is a chain boundary, so the
@@ -802,6 +809,8 @@ mod merge_operator_tests {
             let mut iter = CompactionStream::new(iter, 2_000)
                 .with_merge_operator(Some(composing_merge_op()))
                 .with_range_tombstone_application(vec![rt], cmp)
+                // Complete inputs, so only the barrier can decline the fold.
+                .with_input_completeness(inputs_are_complete())
                 .with_drop_callback(&mut callback);
 
             iter_closed!(iter);
@@ -853,7 +862,8 @@ mod merge_operator_tests {
         let iter = entries.into_iter().map(Ok);
         let mut iter = CompactionStream::new(iter, 1_000)
             .with_merge_operator(Some(composing_merge_op()))
-            .with_range_tombstone_barriers(vec![rt], cmp);
+            .with_range_tombstone_barriers(vec![rt], cmp)
+            .with_input_completeness(inputs_are_complete());
 
         // Both operands come through untouched: nothing folded, nothing deleted.
         let first = iter.next().unwrap()?;
@@ -862,6 +872,209 @@ mod merge_operator_tests {
         let second = iter.next().unwrap()?;
         assert_eq!(second.key.value_type, ValueType::MergeOperand);
         assert_eq!(&*second.value, b"1");
+        iter_closed!(iter);
+
+        Ok(())
+    }
+
+    #[test]
+    #[expect(clippy::unwrap_used, reason = "test assertion")]
+    fn composed_operands_each_pass_the_compaction_filter() -> crate::Result<()> {
+        // Only the head of a chain goes through the filter in `next_inner`; the
+        // rest are taken straight off the input. Before composing they were
+        // re-emitted and so each got its verdict on the way out, but a composed
+        // operand is written once and the entries inside it never come back. A
+        // filter dropping an expired operand must therefore be honoured here,
+        // or the expired delta is persisted inside the composition.
+        struct DropOldest;
+        impl StreamFilter for DropOldest {
+            fn filter_item(&mut self, value: &InternalValue) -> crate::Result<StreamFilterVerdict> {
+                if &*value.value == b"expired" {
+                    Ok(StreamFilterVerdict::Drop)
+                } else {
+                    Ok(StreamFilterVerdict::Keep)
+                }
+            }
+        }
+
+        let entries = vec![
+            InternalValue::from_components(
+                b"a".as_ref(),
+                b"keep".as_ref(),
+                3,
+                ValueType::MergeOperand,
+            ),
+            InternalValue::from_components(
+                b"a".as_ref(),
+                b"expired".as_ref(),
+                2,
+                ValueType::MergeOperand,
+            ),
+        ];
+
+        let cmp = crate::comparator::default_comparator();
+        let mut callback = TrackCallback::default();
+        let iter = entries.into_iter().map(Ok);
+        {
+            let mut iter = CompactionStream::new(iter, 1_000)
+                .with_filter(DropOldest)
+                .with_merge_operator(Some(composing_merge_op()))
+                .with_range_tombstone_barriers(Vec::new(), cmp)
+                .with_input_completeness(inputs_are_complete())
+                .with_drop_callback(&mut callback);
+
+            let item = iter.next().unwrap()?;
+            assert_eq!(item.key.value_type, ValueType::MergeOperand);
+            assert_eq!(
+                &*item.value, b"keep",
+                "the filtered operand must not be folded into the composition",
+            );
+            iter_closed!(iter);
+        }
+        assert!(
+            callback.items.iter().any(|kv| &*kv.value == b"expired"),
+            "the dropped operand must reach the drop callback, as it would on the emit path",
+        );
+
+        Ok(())
+    }
+
+    #[test]
+    #[expect(clippy::unwrap_used, reason = "test assertion")]
+    fn a_filter_replacing_a_collected_operand_composes_the_replacement() -> crate::Result<()> {
+        // The verdict has to reach the fold, not just the head: composing the
+        // original would persist the value the filter rewrote away.
+        struct Rewrite;
+        impl StreamFilter for Rewrite {
+            fn filter_item(&mut self, value: &InternalValue) -> crate::Result<StreamFilterVerdict> {
+                if &*value.value == b"old" {
+                    Ok(StreamFilterVerdict::Replace((
+                        ValueType::MergeOperand,
+                        UserValue::from(b"new".as_ref()),
+                    )))
+                } else {
+                    Ok(StreamFilterVerdict::Keep)
+                }
+            }
+        }
+
+        let entries = vec![
+            InternalValue::from_components(
+                b"a".as_ref(),
+                b"head".as_ref(),
+                3,
+                ValueType::MergeOperand,
+            ),
+            InternalValue::from_components(
+                b"a".as_ref(),
+                b"old".as_ref(),
+                2,
+                ValueType::MergeOperand,
+            ),
+        ];
+
+        let cmp = crate::comparator::default_comparator();
+        let iter = entries.into_iter().map(Ok);
+        let mut iter = CompactionStream::new(iter, 1_000)
+            .with_filter(Rewrite)
+            .with_merge_operator(Some(composing_merge_op()))
+            .with_range_tombstone_barriers(Vec::new(), cmp)
+            .with_input_completeness(inputs_are_complete());
+
+        let item = iter.next().unwrap()?;
+        assert_eq!(&*item.value, b"new,head");
+        iter_closed!(iter);
+
+        Ok(())
+    }
+
+    #[test]
+    fn a_filter_error_on_a_collected_operand_fails_the_compaction() -> crate::Result<()> {
+        // A filter error is the caller's to see: unlike a refused composition
+        // there is no correct output to fall back to, because the verdict for
+        // that operand is unknown.
+        struct Failing;
+        impl StreamFilter for Failing {
+            fn filter_item(&mut self, value: &InternalValue) -> crate::Result<StreamFilterVerdict> {
+                if &*value.value == b"boom" {
+                    Err(crate::Error::MergeOperator)
+                } else {
+                    Ok(StreamFilterVerdict::Keep)
+                }
+            }
+        }
+
+        let entries = vec![
+            InternalValue::from_components(
+                b"a".as_ref(),
+                b"head".as_ref(),
+                3,
+                ValueType::MergeOperand,
+            ),
+            InternalValue::from_components(
+                b"a".as_ref(),
+                b"boom".as_ref(),
+                2,
+                ValueType::MergeOperand,
+            ),
+        ];
+
+        let cmp = crate::comparator::default_comparator();
+        let iter = entries.into_iter().map(Ok);
+        let mut iter = CompactionStream::new(iter, 1_000)
+            .with_filter(Failing)
+            .with_merge_operator(Some(composing_merge_op()))
+            .with_range_tombstone_barriers(Vec::new(), cmp)
+            .with_input_completeness(inputs_are_complete());
+
+        assert!(
+            iter.next().is_some_and(|item| item.is_err()),
+            "the filter's error must surface rather than being folded away",
+        );
+
+        Ok(())
+    }
+
+    #[test]
+    #[expect(clippy::unwrap_used, reason = "test assertion")]
+    fn merge_with_a_range_deleted_base_off_the_last_level_keeps_the_entries() -> crate::Result<()> {
+        // The base is hidden by a range tombstone above it, so the operand must
+        // not fold onto it. Off the last level the tombstone may not delete the
+        // base either, so the only correct outcome is to leave both entries
+        // alone and let the fold happen where the tombstone has been applied.
+        // Folding here would resurrect the deleted base under the head's seqno.
+        let entries = vec![
+            InternalValue::from_components(
+                b"a".as_ref(),
+                b"op".as_ref(),
+                3,
+                ValueType::MergeOperand,
+            ),
+            InternalValue::from_components(b"a".as_ref(), b"base".as_ref(), 1, ValueType::Value),
+        ];
+
+        let cmp = crate::comparator::default_comparator();
+        let rt = RangeTombstone::new(
+            UserKey::from(b"a".as_ref()),
+            UserKey::from(b"b".as_ref()),
+            2,
+        );
+
+        let iter = entries.into_iter().map(Ok);
+        let mut iter = CompactionStream::new(iter, 1_000)
+            .with_merge_operator(Some(merge_op()))
+            .with_range_tombstone_barriers(vec![rt], cmp);
+
+        let first = iter.next().unwrap()?;
+        assert_eq!(first.key.value_type, ValueType::MergeOperand);
+        assert_eq!(&*first.value, b"op");
+        let second = iter.next().unwrap()?;
+        assert_eq!(
+            second.key.value_type,
+            ValueType::Value,
+            "the range-deleted base must survive here: this compaction may not delete it",
+        );
+        assert_eq!(&*second.value, b"base");
         iter_closed!(iter);
 
         Ok(())
@@ -897,7 +1110,8 @@ mod merge_operator_tests {
         let iter = entries.into_iter().map(Ok);
         let mut iter = CompactionStream::new(iter, 1_000)
             .with_merge_operator(Some(composing_merge_op()))
-            .with_range_tombstone_barriers(vec![rt], cmp);
+            .with_range_tombstone_barriers(vec![rt], cmp)
+            .with_input_completeness(inputs_are_complete());
 
         let item = iter.next().unwrap()?;
         assert_eq!(item.key.value_type, ValueType::MergeOperand);
@@ -928,7 +1142,8 @@ mod merge_operator_tests {
         let iter = vec.iter().cloned().map(Ok);
         let mut iter = CompactionStream::new(iter, 1_000)
             .with_merge_operator(Some(composing_merge_op()))
-            .with_range_tombstone_application(Vec::new(), cmp);
+            .with_range_tombstone_application(Vec::new(), cmp)
+            .with_input_completeness(inputs_are_complete());
 
         let item = iter.next().unwrap()?;
         assert_eq!(item.key.value_type, ValueType::MergeOperand);
