@@ -331,9 +331,15 @@ impl<'a, I: Iterator<Item = Item>, F: StreamFilter + 'a> CompactionStream<'a, I,
     /// `head` is the first `MergeOperand` entry (highest seqno).
     /// Collects subsequent same-key entries and folds them onto the base, which
     /// the stream has to have proven: a boundary it found, or absence at the
-    /// bottom level. The result is then the key's `Value`. Without a proven
-    /// base the operands are re-emitted unchanged and the fold waits for the
-    /// level that holds one.
+    /// bottom level. The result is then the key's `Value`.
+    ///
+    /// Without a proven base the outcome depends on the operator. By default
+    /// the operands are re-emitted unchanged and the fold waits for the level
+    /// that holds a base. An operator whose
+    /// [`MergeOperator::composes_operands`] is set folds them here instead and
+    /// the result is a `MergeOperand`, which meets the base wherever it is; if
+    /// that operator refuses the composition, the operands are re-emitted as
+    /// they would have been by default.
     /// [`Self::resolve_merge_operands`] with the stream's own operator. The
     /// resolver needs `&mut self` for the input stream, so the operator cannot
     /// be borrowed across the call; it is MOVED out and back instead of
@@ -535,6 +541,23 @@ impl<'a, I: Iterator<Item = Item>, F: StreamFilter + 'a> CompactionStream<'a, I,
             }
             !covered
         });
+
+        // A covering tombstone can take every operand, and then there is
+        // neither a fold to do nor anything to re-emit. Composing an empty list
+        // would ask the operator a question it is entitled to refuse, and the
+        // refusal has no fallback left: the entries it would re-emit are
+        // exactly the ones just dropped. The key is deleted, which is what
+        // emptied the list, so it leaves as a tombstone at the head's seqno and
+        // the emit path drops it for the same coverage. A proven base still
+        // asks, because there the answer is the key's surviving value.
+        if compose_only && collected.is_empty() {
+            return Ok(InternalValue::from_components(
+                user_key,
+                UserValue::from(Vec::new()),
+                head_seqno,
+                ValueType::Tombstone,
+            ));
+        }
 
         // Operand values in chronological order (ascending seqno): `collected`
         // holds them newest-first, so reading it backwards is that order.

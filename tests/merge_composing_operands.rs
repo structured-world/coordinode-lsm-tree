@@ -116,7 +116,7 @@ fn tree_with_unproven_base(
 }
 
 #[test]
-fn a_composing_operator_folds_a_chain_without_a_proven_base() -> lsm_tree::Result<()> {
+fn composing_operator_without_proven_base_folds_operand_chain() -> lsm_tree::Result<()> {
     let folder = tempfile::tempdir()?;
     let seqno = SequenceNumberCounter::default();
     let tree = tree_with_unproven_base(&folder, &seqno, Arc::new(ComposingSum), 6)?;
@@ -148,7 +148,7 @@ fn a_composing_operator_folds_a_chain_without_a_proven_base() -> lsm_tree::Resul
 }
 
 #[test]
-fn a_non_composing_operator_keeps_its_operands_without_a_proven_base() -> lsm_tree::Result<()> {
+fn non_composing_operator_without_proven_base_keeps_operands() -> lsm_tree::Result<()> {
     // The default. This is the behaviour a merge operator that edits a base
     // depends on for correctness, so it must not move.
     let folder = tempfile::tempdir()?;
@@ -177,7 +177,7 @@ fn a_non_composing_operator_keeps_its_operands_without_a_proven_base() -> lsm_tr
 }
 
 #[test]
-fn a_composed_operand_still_folds_onto_a_base_that_appears_later() -> lsm_tree::Result<()> {
+fn composed_operand_meeting_a_base_later_folds_onto_it() -> lsm_tree::Result<()> {
     // The composed result is an operand, not a value: when a later compaction
     // does reach the base, it must fold onto it rather than replace it.
     let folder = tempfile::tempdir()?;
@@ -237,7 +237,7 @@ impl MergeOperator for CheckedSum {
 }
 
 #[test]
-fn a_composition_the_operator_refuses_falls_back_to_the_operands() -> lsm_tree::Result<()> {
+fn composing_operator_refusing_the_composition_keeps_operands() -> lsm_tree::Result<()> {
     // The operands compose to something out of range while the whole chain
     // against the real base does not: -1 + i64::MAX + 1 is i64::MAX, but
     // i64::MAX + 1 on its own overflows. The compaction must not fail over an
@@ -293,15 +293,22 @@ fn a_composition_the_operator_refuses_falls_back_to_the_operands() -> lsm_tree::
 }
 
 #[test]
-fn a_watermark_below_the_newest_operands_leaves_them_alone() -> lsm_tree::Result<()> {
+fn composing_operator_with_operands_above_the_watermark_keeps_the_snapshot() -> lsm_tree::Result<()>
+{
     // Folding is gated on the watermark exactly as the proven-base fold is: the
     // composed operand carries the head's seqno, so operands at or above the
-    // watermark must stay separate and the total must still read right.
+    // watermark must stay separate. The latest read alone cannot show that: an
+    // implementation that folded the newer operands too would still total 7 and
+    // would have moved what the snapshot at the watermark sees, so that read is
+    // the one the assertion has to pin.
     let folder = tempfile::tempdir()?;
     let seqno = SequenceNumberCounter::default();
     let tree = tree_with_unproven_base(&folder, &seqno, Arc::new(ComposingSum), 4)?;
 
     let watermark = seqno.get();
+    let at_watermark = read(&tree, watermark)?;
+    assert_eq!(Some(4), at_watermark);
+
     for _ in 0..3 {
         tree.merge(KEY, 1_i64.to_le_bytes(), seqno.next());
         tree.flush_active_memtable(0)?;
@@ -312,6 +319,11 @@ fn a_watermark_below_the_newest_operands_leaves_them_alone() -> lsm_tree::Result
         watermark,
     )?;
 
+    assert_eq!(
+        at_watermark,
+        read(&tree, watermark)?,
+        "the snapshot at the watermark must read what it read before the fold",
+    );
     assert_eq!(Some(7), read(&tree, seqno.get())?);
 
     Ok(())

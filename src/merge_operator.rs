@@ -153,6 +153,19 @@ pub trait MergeOperator: Send + Sync + RefUnwindSafe + 'static {
     /// composition therefore costs the optimisation for that key and nothing
     /// else, and never fails a compaction that would otherwise have succeeded.
     ///
+    /// The freedom is one-directional, and this part IS an obligation. A
+    /// composition that SUCCEEDS is written to disk in place of the operands it
+    /// replaces, and nothing can bring them back, so a refusal that appears only
+    /// after composing is permanent: a read or a later proven-base compaction
+    /// that used to succeed now fails. So whenever `f(None, P)` succeeds and
+    /// `f(B, [...P, ...S])` succeeds, `f(B, [f(None, P), ...S])` must succeed
+    /// too, and equal it. Refusing earlier than the un-composed chain would is
+    /// free; refusing later than it would is not allowed.
+    ///
+    /// Checked arithmetic satisfies this without extra care, because the
+    /// composed step lands on a total the un-composed chain also passes
+    /// through: if every one of its intermediates is in range, so is that one.
+    ///
     /// Folding stays gated on the GC watermark either way: the composed operand
     /// carries the head's sequence number, so only operands the watermark has
     /// already certified as collapsible take part, and no live snapshot can
