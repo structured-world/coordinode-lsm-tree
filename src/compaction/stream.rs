@@ -503,7 +503,15 @@ impl<'a, I: Iterator<Item = Item>, F: StreamFilter + 'a> CompactionStream<'a, I,
         // each settles itself against the balance and the run reports no
         // collected history for this key. Nothing re-collects them into
         // another attempt either, since they are no longer in `inner`.
-        if !found_boundary && !self.evict_tombstones {
+        //
+        // Unless the operator composes: then folding a prefix of the chain
+        // yields something that is still an operand, so the fold can happen
+        // here and meet the base later, wherever it is. The result is emitted
+        // as a `MergeOperand` rather than a `Value` for exactly that reason —
+        // calling it a value would assert the base is empty, which is the
+        // wrong answer this branch exists to avoid.
+        let compose_only = !found_boundary && !self.evict_tombstones;
+        if compose_only && !merge_op.composes_operands() {
             let mut iter = collected.into_iter();
             #[expect(clippy::expect_used, reason = "collected always has head")]
             let first = iter
@@ -538,14 +546,19 @@ impl<'a, I: Iterator<Item = Item>, F: StreamFilter + 'a> CompactionStream<'a, I,
         let operand_refs: Vec<&[u8]> = operands_reversed.iter().map(AsRef::as_ref).collect();
         let merged = merge_op.merge(&user_key, base_value.as_deref(), &operand_refs)?;
 
-        // The base was proven either way, so this is the key's value, not a
-        // further operand. A key that never had a put therefore materialises at
-        // the bottom level instead of carrying its operands forever.
+        // With a proven base this is the key's value, not a further operand: a
+        // key that never had a put therefore materialises at the bottom level
+        // instead of carrying its operands forever. Composed without a proven
+        // base it stays an operand, and folds onto the real base when a later
+        // compaction reaches it.
+        let value_type = if compose_only {
+            ValueType::MergeOperand
+        } else {
+            ValueType::Value
+        };
+
         Ok(InternalValue::from_components(
-            user_key,
-            merged,
-            head_seqno,
-            ValueType::Value,
+            user_key, merged, head_seqno, value_type,
         ))
     }
 
