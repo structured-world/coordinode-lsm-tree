@@ -740,6 +740,119 @@ mod merge_operator_tests {
         Arc::new(ConcatMerge)
     }
 
+    /// The same concatenation, declaring that its operands compose, so a
+    /// compaction without a proven base folds them instead of keeping them.
+    struct ComposingConcat;
+
+    impl crate::merge_operator::MergeOperator for ComposingConcat {
+        fn merge(
+            &self,
+            key: &[u8],
+            base_value: Option<&[u8]>,
+            operands: &[&[u8]],
+        ) -> crate::Result<UserValue> {
+            ConcatMerge.merge(key, base_value, operands)
+        }
+
+        fn composes_operands(&self) -> bool {
+            true
+        }
+    }
+
+    fn composing_merge_op() -> Arc<dyn crate::merge_operator::MergeOperator> {
+        Arc::new(ComposingConcat)
+    }
+
+    #[test]
+    fn composing_operator_with_every_operand_range_deleted_drops_the_key() -> crate::Result<()> {
+        // A last-level compaction applies range tombstones, but only one that
+        // holds every surviving version evicts them, so a composing operator can
+        // reach the fold with the coverage check having taken every operand.
+        // There is then nothing to compose and nothing to re-emit: the entries
+        // the fallback would put back are the ones just dropped. The key is
+        // deleted, which is what emptied the list, so it must leave quietly
+        // rather than panic on the empty collection.
+        let entries = vec![
+            InternalValue::from_components(
+                b"a".as_ref(),
+                b"op2".as_ref(),
+                999,
+                ValueType::MergeOperand,
+            ),
+            InternalValue::from_components(
+                b"a".as_ref(),
+                b"op1".as_ref(),
+                998,
+                ValueType::MergeOperand,
+            ),
+        ];
+
+        let mut callback = TrackCallback::default();
+        let cmp = crate::comparator::default_comparator();
+        // Above both operands so it covers them, below the watermark so it is
+        // applied at all.
+        let rt = RangeTombstone::new(
+            UserKey::from(b"a".as_ref()),
+            UserKey::from(b"b".as_ref()),
+            1_500,
+        );
+
+        let iter = entries.into_iter().map(Ok);
+        {
+            let mut iter = CompactionStream::new(iter, 2_000)
+                .with_merge_operator(Some(composing_merge_op()))
+                .with_range_tombstone_application(vec![rt], cmp)
+                .with_drop_callback(&mut callback);
+
+            iter_closed!(iter);
+        }
+
+        // Both operands are reported by the coverage check that emptied the
+        // list, and the tombstone standing in for them is reported again by the
+        // emit path that drops it for the same coverage.
+        assert!(
+            callback.items.iter().any(|kv| &*kv.value == b"op1"),
+            "the older range-deleted operand must reach the drop callback",
+        );
+        assert!(
+            callback.items.iter().any(|kv| &*kv.value == b"op2"),
+            "the newer range-deleted operand must reach the drop callback",
+        );
+        assert!(
+            callback
+                .items
+                .iter()
+                .any(|kv| kv.key.value_type == ValueType::Tombstone),
+            "the tombstone that replaced the emptied set must be dropped too",
+        );
+
+        Ok(())
+    }
+
+    #[test]
+    #[expect(clippy::unwrap_used, reason = "test assertion")]
+    fn composing_operator_without_a_proven_base_emits_one_operand() -> crate::Result<()> {
+        // No boundary in this stream and not the bottom level, so the base is
+        // unproven. A composing operator folds anyway, and the result stays a
+        // MergeOperand: calling it a Value would assert the base is empty.
+        #[rustfmt::skip]
+        let vec = stream![
+            "a", "op2", "M",
+            "a", "op1", "M",
+        ];
+
+        let iter = vec.iter().cloned().map(Ok);
+        let mut iter =
+            CompactionStream::new(iter, 1_000).with_merge_operator(Some(composing_merge_op()));
+
+        let item = iter.next().unwrap()?;
+        assert_eq!(item.key.value_type, ValueType::MergeOperand);
+        assert_eq!(&*item.value, b"op1,op2");
+        iter_closed!(iter);
+
+        Ok(())
+    }
+
     #[test]
     fn operands_without_a_proven_base_are_kept_as_they_are() -> crate::Result<()> {
         // No boundary in this stream and not the bottom level, so the base may
