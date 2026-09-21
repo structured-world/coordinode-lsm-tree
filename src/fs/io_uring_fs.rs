@@ -159,37 +159,62 @@ impl Fs for IoUringFs {
     fn read_blocks_batched(&self, reqs: &mut [BlockRead<'_>]) -> crate::io::Result<()> {
         // Every request that has an fd goes to the one shared ring in a single
         // batched submission (the kernel fans each read out to its file's
-        // device). If any request lacks an fd (a non-io_uring file mixed in),
-        // fall back to serial reads for the whole batch.
-        if reqs.iter().any(|r| r.file.backing_fd().is_none()) {
-            for req in reqs.iter_mut() {
-                // A partly filled destination owns the block's first `filled`
-                // bytes already; complete it from `offset + filled`.
-                let offset = req
-                    .offset
-                    .checked_add(req.buf.filled() as u64)
-                    .ok_or_else(|| {
-                        crate::io::Error::from(io::Error::new(
-                            io::ErrorKind::InvalidInput,
-                            "read_blocks_batched: request offset overflows",
-                        ))
-                    })?;
-                let dst = req.buf.unfilled_mut();
-                let want = dst.len();
-                let n = req.file.read_at(dst, offset)?;
-                req.buf.advance(n);
-                if n != want {
-                    return Err(crate::io::Error::from(io::Error::new(
-                        io::ErrorKind::UnexpectedEof,
-                        "read_blocks_batched: short read on a fixed-size block",
-                    )));
-                }
-            }
-            return Ok(());
+        // device). A request without one (a non-io_uring file mixed into the
+        // batch) cannot be submitted, so it is read serially — but only it:
+        // degrading the whole batch would forfeit the ring for the requests
+        // that were perfectly submittable.
+        if reqs.iter().all(|r| r.file.backing_fd().is_some()) {
+            // The common case: nothing to split, and no borrow-gathering pass.
+            return self
+                .inner
+                .submit_reads_multi(reqs)
+                .map_err(crate::io::Error::from);
         }
-        self.inner
-            .submit_reads_multi(reqs)
-            .map_err(crate::io::Error::from)
+
+        let (mut submittable, mut serial): (Vec<&mut BlockRead<'_>>, Vec<&mut BlockRead<'_>>) =
+            reqs.iter_mut().partition(|r| r.file.backing_fd().is_some());
+        log::debug!(
+            "io_uring batched read: {} of {} requests lack a descriptor and are read serially",
+            serial.len(),
+            submittable.len() + serial.len(),
+        );
+
+        // The ring group goes first and is waited out inside
+        // `submit_reads_multi` (it drains every completion before returning, so
+        // no buffer is still being written when the serial reads start). A
+        // failure there is surfaced immediately, matching what the undivided
+        // batch did: the first failing block's error, with the remaining
+        // destinations left unfilled.
+        if !submittable.is_empty() {
+            self.inner
+                .submit_reads_multi(&mut submittable)
+                .map_err(crate::io::Error::from)?;
+        }
+
+        for req in &mut serial {
+            // A partly filled destination owns the block's first `filled`
+            // bytes already; complete it from `offset + filled`.
+            let offset = req
+                .offset
+                .checked_add(req.buf.filled() as u64)
+                .ok_or_else(|| {
+                    crate::io::Error::from(io::Error::new(
+                        io::ErrorKind::InvalidInput,
+                        "read_blocks_batched: request offset overflows",
+                    ))
+                })?;
+            let dst = req.buf.unfilled_mut();
+            let want = dst.len();
+            let n = req.file.read_at(dst, offset)?;
+            req.buf.advance(n);
+            if n != want {
+                return Err(crate::io::Error::from(io::Error::new(
+                    io::ErrorKind::UnexpectedEof,
+                    "read_blocks_batched: short read on a fixed-size block",
+                )));
+            }
+        }
+        Ok(())
     }
 
     fn create_dir_all(&self, path: &Path) -> crate::io::Result<()> {
@@ -917,14 +942,22 @@ impl RingThread {
     /// reads from DIFFERENT files (SSTs, and on a multi-device layout different
     /// devices) coalesce into one submission to the shared ring. Callers
     /// guarantee every request has an fd (`read_blocks_batched` checks first).
-    fn submit_reads_multi(&self, reqs: &mut [BlockRead<'_>]) -> io::Result<()> {
+    /// Generic over how the caller holds each request — `BlockRead` directly
+    /// when the whole batch is submittable, `&mut BlockRead` when only a subset
+    /// is and the rest are read serially. Monomorphised, so the common
+    /// whole-batch path pays nothing for the subset one and neither has to
+    /// gather its requests into a fresh allocation.
+    fn submit_reads_multi<'r, T: core::borrow::BorrowMut<BlockRead<'r>>>(
+        &self,
+        reqs: &mut [T],
+    ) -> io::Result<()> {
         // Pre-pass: resolve every request's fd and validate its length BEFORE
         // submitting any op (same un-drained-in-flight hazard as submit_reads: a
         // missing fd or over-cap length returning via `?` mid-loop would strand
         // earlier sends with the kernel still writing their buffers). `None`
         // entries mark empty-buffer requests the send loop skips.
         let mut metas: Vec<Option<(i32, u32, u64)>> = Vec::with_capacity(reqs.len());
-        for req in reqs.iter() {
+        for req in reqs.iter().map(core::borrow::Borrow::borrow) {
             if req.buf.capacity() == 0 {
                 metas.push(None);
                 continue;
@@ -962,7 +995,11 @@ impl RingThread {
         }
 
         let mut receivers: Vec<(mpsc::Receiver<i32>, usize)> = Vec::with_capacity(reqs.len());
-        for (req, meta) in reqs.iter_mut().zip(&metas) {
+        for (req, meta) in reqs
+            .iter_mut()
+            .map(core::borrow::BorrowMut::borrow_mut)
+            .zip(&metas)
+        {
             let Some((fd, len, offset)) = *meta else {
                 continue;
             };
@@ -1026,7 +1063,7 @@ impl RingThread {
             // Every completion matched the length its request asked for, so the
             // kernel filled every destination. Count it, the same unfilled span
             // the submission described.
-            for req in reqs.iter_mut() {
+            for req in reqs.iter_mut().map(core::borrow::BorrowMut::borrow_mut) {
                 let remaining = req.buf.capacity() - req.buf.filled();
                 req.buf.advance(remaining);
             }

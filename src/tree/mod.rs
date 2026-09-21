@@ -1770,7 +1770,7 @@ impl AbstractTree for Tree {
                 miss_keys,
                 seqno,
                 comparator,
-                &*self.config.fs,
+                &self.config,
                 &mut internal_entries,
             )?;
 
@@ -3452,7 +3452,7 @@ impl Tree {
         miss_keys: Vec<(usize, u64)>,
         seqno: SeqNo,
         comparator: &dyn crate::comparator::UserComparator,
-        fs: &dyn crate::fs::Fs,
+        config: &crate::Config,
         results: &mut [Option<InternalValue>],
     ) -> crate::Result<()> {
         debug_assert_eq!(results.len(), keys.len());
@@ -3474,17 +3474,33 @@ impl Tree {
             // signals oversize and warms nothing; the level is then resolved by
             // reading its blocks in budget-sized chunks into a scratch and
             // point-reading directly (no cache, no eviction).
-            if Self::prewarm_level_cross_sst(fs, level, &still_remaining, keys, seqno, comparator)
-                && Self::resolve_level_chunked(
-                    fs,
-                    level,
-                    &mut still_remaining,
-                    keys,
-                    seqno,
-                    comparator,
-                    results,
-                )?
-            {
+            // The level's tables were opened through the backend its route
+            // names, so its reads are submitted there too. Reading them through
+            // the primary still returns the right bytes — the handles are the
+            // route's either way — but a batch sent to a backend that holds
+            // none of the files loses the batching entirely.
+            #[expect(
+                clippy::cast_possible_truncation,
+                reason = "level index is bounded by level_count (7)"
+            )]
+            let level_fs = config.fs_for_level(level_idx as u8);
+
+            if Self::prewarm_level_cross_sst(
+                level_fs,
+                level,
+                &still_remaining,
+                keys,
+                seqno,
+                comparator,
+            ) && Self::resolve_level_chunked(
+                level_fs,
+                level,
+                &mut still_remaining,
+                keys,
+                seqno,
+                comparator,
+                results,
+            )? {
                 continue;
             }
 

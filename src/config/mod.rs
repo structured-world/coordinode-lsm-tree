@@ -1111,6 +1111,18 @@ impl Config {
 mod tests;
 
 impl Config {
+    /// The [`level_routes`](Self::level_routes) entry covering `level`, if any.
+    ///
+    /// The single place the level→route lookup lives, so the path a level's
+    /// tables are written to and the backend its reads are submitted to cannot
+    /// disagree about which route covers it.
+    fn route_for_level(&self, level: u8) -> Option<&LevelRoute> {
+        self.level_routes
+            .as_ref()?
+            .iter()
+            .find(|route| route.levels.contains(&level))
+    }
+
     /// Returns the tables folder path and [`Fs`] backend for the given level.
     ///
     /// If [`level_routes`](Self::level_routes) has an entry covering this
@@ -1118,14 +1130,29 @@ impl Config {
     /// primary [`path`](Self::path) and [`fs`](Self::fs).
     #[must_use]
     pub fn tables_folder_for_level(&self, level: u8) -> (PathBuf, Arc<dyn Fs>) {
-        if let Some(routes) = &self.level_routes {
-            for route in routes {
-                if route.levels.contains(&level) {
-                    return (route.path.join(TABLES_FOLDER), route.fs.clone());
-                }
-            }
+        match self.route_for_level(level) {
+            Some(route) => (route.path.join(TABLES_FOLDER), route.fs.clone()),
+            None => (self.path.join(TABLES_FOLDER), self.fs.clone()),
         }
-        (self.path.join(TABLES_FOLDER), self.fs.clone())
+    }
+
+    /// The [`Fs`] backend that a level's tables are opened through.
+    ///
+    /// The read path resolves its backend per level: a level served by a
+    /// [`level_routes`](Self::level_routes) entry has its reads submitted to
+    /// that route's backend, not the primary's. Submitting them to the primary
+    /// would silently forfeit whatever the route provides — a shared `io_uring`
+    /// ring, a device queue — while still returning correct bytes, because the
+    /// file handles themselves came from the route.
+    ///
+    /// Borrows rather than cloning the `Arc`: this is called per level on the
+    /// multi-get read path, where a refcount bump buys nothing.
+    #[must_use]
+    pub fn fs_for_level(&self, level: u8) -> &dyn Fs {
+        match self.route_for_level(level) {
+            Some(route) => route.fs.as_ref(),
+            None => self.fs.as_ref(),
+        }
     }
 
     /// Best-effort minimum free space (bytes) across every filesystem this tree

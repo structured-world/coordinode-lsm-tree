@@ -744,7 +744,7 @@ fn read_blocks_batched_fallback_short_read_errors() -> io::Result<()> {
 }
 
 #[test]
-fn read_blocks_batched_falls_back_for_non_uring_file() -> io::Result<()> {
+fn read_blocks_batched_serves_a_mixed_batch_without_degrading_the_ring_group() -> io::Result<()> {
     let Some(fs) = try_io_uring() else {
         return Ok(());
     };
@@ -754,9 +754,12 @@ fn read_blocks_batched_falls_back_for_non_uring_file() -> io::Result<()> {
     let mut uring_file = fs.open(&dir.path().join("u.bin"), &opts)?;
     uring_file.write_all(&(0..=255u8).collect::<Vec<_>>())?;
     uring_file.sync_all()?;
+    // Wrapped so the test can see whether this request was submitted to the
+    // ring or read through the serial `read_at` fallback.
+    let counted = CountingFile::new(uring_file);
 
-    // A StdFs handle has no fd for the ring (backing_fd None), so mixing it into
-    // the batch forces the whole batch onto the serial read_at fallback.
+    // A StdFs handle has no fd for the ring (backing_fd None), so it cannot be
+    // submitted and is read serially — but only it.
     let std_fs = crate::fs::StdFs;
     let mut std_file = std_fs.open(&dir.path().join("s.bin"), &opts)?;
     let rev: Vec<u8> = (0..=255u8).rev().collect();
@@ -769,7 +772,7 @@ fn read_blocks_batched_falls_back_for_non_uring_file() -> io::Result<()> {
     {
         let mut reqs = vec![
             crate::fs::BlockRead {
-                file: uring_file.as_ref(),
+                file: &counted,
                 offset: 10,
                 buf: crate::fs::BlockBuf::new(&mut b0),
             },
@@ -783,7 +786,370 @@ fn read_blocks_batched_falls_back_for_non_uring_file() -> io::Result<()> {
     }
     assert_eq!(b0, [10, 11, 12, 13]);
     assert_eq!(b1, [rev[20], rev[21], rev[22], rev[23]]);
+    assert_eq!(
+        counted.read_at_calls(),
+        0,
+        "the descriptor-bearing request went to the ring; one handle without a \
+         descriptor must not drag the rest onto the serial path",
+    );
     Ok(())
+}
+
+/// The split must not reorder what each request reads: every destination holds
+/// the bytes ITS `(file, offset)` names, whichever group served it.
+#[test]
+fn read_blocks_batched_keeps_each_destination_with_its_own_request() -> io::Result<()> {
+    let Some(fs) = try_io_uring() else {
+        return Ok(());
+    };
+    let dir = tempfile::tempdir()?;
+    let opts = FsOpenOptions::new().write(true).create(true).read(true);
+
+    let mut uring_file = fs.open(&dir.path().join("u.bin"), &opts)?;
+    uring_file.write_all(&(0..=255u8).collect::<Vec<_>>())?;
+    uring_file.sync_all()?;
+
+    let std_fs = crate::fs::StdFs;
+    let mut std_file = std_fs.open(&dir.path().join("s.bin"), &opts)?;
+    let rev: Vec<u8> = (0..=255u8).rev().collect();
+    std_file.write_all(&rev)?;
+    std_file.sync_all()?;
+
+    // Interleaved, so a split that preserved only group-internal order would
+    // still be caught.
+    let mut bufs = [[0u8; 2]; 6];
+    let offsets = [0u64, 1, 2, 3, 4, 5];
+    {
+        let mut reqs: Vec<crate::fs::BlockRead<'_>> = Vec::new();
+        for (i, (buf, offset)) in bufs.iter_mut().zip(offsets).enumerate() {
+            reqs.push(crate::fs::BlockRead {
+                file: if i % 2 == 0 {
+                    uring_file.as_ref()
+                } else {
+                    std_file.as_ref()
+                },
+                offset: offset * 10,
+                buf: crate::fs::BlockBuf::new(&mut buf[..]),
+            });
+        }
+        fs.read_blocks_batched(&mut reqs)?;
+    }
+    for (i, (buf, offset)) in bufs.iter().zip(offsets).enumerate() {
+        let at = (offset * 10) as usize;
+        let expected: [u8; 2] = if i % 2 == 0 {
+            [at as u8, (at + 1) as u8]
+        } else {
+            [rev[at], rev[at + 1]]
+        };
+        assert_eq!(*buf, expected, "request {i} was served the wrong bytes");
+    }
+    Ok(())
+}
+
+/// A batch where NOTHING can be submitted still reads correctly: the ring group
+/// is empty and every request takes the serial path.
+#[test]
+fn read_blocks_batched_with_no_submittable_request_reads_serially() -> io::Result<()> {
+    let Some(fs) = try_io_uring() else {
+        return Ok(());
+    };
+    let dir = tempfile::tempdir()?;
+    let opts = FsOpenOptions::new().write(true).create(true).read(true);
+
+    let std_fs = crate::fs::StdFs;
+    let mut std_file = std_fs.open(&dir.path().join("s.bin"), &opts)?;
+    std_file.write_all(&(0..=255u8).collect::<Vec<_>>())?;
+    std_file.sync_all()?;
+
+    let mut b0 = [0u8; 4];
+    let mut b1 = [0u8; 4];
+    {
+        let mut reqs = vec![
+            crate::fs::BlockRead {
+                file: std_file.as_ref(),
+                offset: 0,
+                buf: crate::fs::BlockBuf::new(&mut b0),
+            },
+            crate::fs::BlockRead {
+                file: std_file.as_ref(),
+                offset: 100,
+                buf: crate::fs::BlockBuf::new(&mut b1),
+            },
+        ];
+        fs.read_blocks_batched(&mut reqs)?;
+    }
+    assert_eq!(b0, [0, 1, 2, 3]);
+    assert_eq!(b1, [100, 101, 102, 103]);
+    Ok(())
+}
+
+/// A short read in the SERIAL half of a mixed batch is still the documented
+/// `UnexpectedEof`, and the ring half is still filled — the split must not turn
+/// one group's failure into silence about the other.
+#[test]
+fn read_blocks_batched_reports_a_short_serial_read_in_a_mixed_batch() -> io::Result<()> {
+    let Some(fs) = try_io_uring() else {
+        return Ok(());
+    };
+    let dir = tempfile::tempdir()?;
+    let opts = FsOpenOptions::new().write(true).create(true).read(true);
+
+    let mut uring_file = fs.open(&dir.path().join("u.bin"), &opts)?;
+    uring_file.write_all(&(0..=255u8).collect::<Vec<_>>())?;
+    uring_file.sync_all()?;
+
+    let std_fs = crate::fs::StdFs;
+    let mut std_file = std_fs.open(&dir.path().join("s.bin"), &opts)?;
+    std_file.write_all(&[1, 2, 3, 4])?;
+    std_file.sync_all()?;
+
+    let mut b0 = [0u8; 4];
+    let mut b1 = [0u8; 8]; // past EOF of the 4-byte file
+    let err = {
+        let mut reqs = vec![
+            crate::fs::BlockRead {
+                file: uring_file.as_ref(),
+                offset: 10,
+                buf: crate::fs::BlockBuf::new(&mut b0),
+            },
+            crate::fs::BlockRead {
+                file: std_file.as_ref(),
+                offset: 0,
+                buf: crate::fs::BlockBuf::new(&mut b1),
+            },
+        ];
+        fs.read_blocks_batched(&mut reqs)
+            .expect_err("a short read on a fixed-size block is an error")
+    };
+    assert_eq!(err.kind(), io::ErrorKind::UnexpectedEof, "{err}");
+    assert_eq!(b0, [10, 11, 12, 13], "the ring group was served first");
+    Ok(())
+}
+
+/// A short read in the RING half of a mixed batch fails the whole call, and
+/// the serial half is left unread: the ring group is submitted first and its
+/// failure is surfaced before anything else runs.
+#[test]
+fn read_blocks_batched_reports_a_short_ring_read_in_a_mixed_batch() -> io::Result<()> {
+    let Some(fs) = try_io_uring() else {
+        return Ok(());
+    };
+    let dir = tempfile::tempdir()?;
+    let opts = FsOpenOptions::new().write(true).create(true).read(true);
+
+    let mut uring_file = fs.open(&dir.path().join("u.bin"), &opts)?;
+    uring_file.write_all(&[1, 2, 3, 4])?;
+    uring_file.sync_all()?;
+
+    let std_fs = crate::fs::StdFs;
+    let mut std_file = std_fs.open(&dir.path().join("s.bin"), &opts)?;
+    std_file.write_all(&(0..=255u8).collect::<Vec<_>>())?;
+    std_file.sync_all()?;
+
+    let mut b0 = [0u8; 8]; // past EOF of the 4-byte uring file
+    let mut b1 = [0u8; 4];
+    let err = {
+        let mut reqs = vec![
+            crate::fs::BlockRead {
+                file: uring_file.as_ref(),
+                offset: 0,
+                buf: crate::fs::BlockBuf::new(&mut b0),
+            },
+            crate::fs::BlockRead {
+                file: std_file.as_ref(),
+                offset: 10,
+                buf: crate::fs::BlockBuf::new(&mut b1),
+            },
+        ];
+        fs.read_blocks_batched(&mut reqs)
+            .expect_err("a short read on a fixed-size block is an error")
+    };
+    assert_eq!(err.kind(), io::ErrorKind::UnexpectedEof, "{err}");
+    Ok(())
+}
+
+/// A destination that arrives partly filled owns the block's first bytes
+/// already, so the read covers the suffix from `offset + filled` — on both
+/// sides of the split.
+#[test]
+fn read_blocks_batched_resumes_partly_filled_destinations_in_a_mixed_batch() -> io::Result<()> {
+    let Some(fs) = try_io_uring() else {
+        return Ok(());
+    };
+    let dir = tempfile::tempdir()?;
+    let opts = FsOpenOptions::new().write(true).create(true).read(true);
+
+    let mut uring_file = fs.open(&dir.path().join("u.bin"), &opts)?;
+    uring_file.write_all(&(0..=255u8).collect::<Vec<_>>())?;
+    uring_file.sync_all()?;
+
+    let std_fs = crate::fs::StdFs;
+    let mut std_file = std_fs.open(&dir.path().join("s.bin"), &opts)?;
+    let rev: Vec<u8> = (0..=255u8).rev().collect();
+    std_file.write_all(&rev)?;
+    std_file.sync_all()?;
+
+    let mut b0 = [0u8; 4];
+    let mut b1 = [0u8; 4];
+    {
+        let mut buf0 = crate::fs::BlockBuf::new(&mut b0);
+        let mut buf1 = crate::fs::BlockBuf::new(&mut b1);
+        // Two bytes of each block are already owned by the caller.
+        assert_eq!(buf0.append(&[0xAA, 0xBB]), 2);
+        assert_eq!(buf1.append(&[0xCC, 0xDD]), 2);
+        let mut reqs = vec![
+            crate::fs::BlockRead {
+                file: uring_file.as_ref(),
+                offset: 10,
+                buf: buf0,
+            },
+            crate::fs::BlockRead {
+                file: std_file.as_ref(),
+                offset: 20,
+                buf: buf1,
+            },
+        ];
+        fs.read_blocks_batched(&mut reqs)?;
+        assert!(reqs.iter().all(|r| r.buf.is_full()));
+    }
+    // The suffix starts two bytes into each block, and the prefix is untouched.
+    assert_eq!(b0, [0xAA, 0xBB, 12, 13]);
+    assert_eq!(b1, [0xCC, 0xDD, rev[22], rev[23]]);
+    Ok(())
+}
+
+/// An empty request is a no-op wherever it lands, including in the middle of a
+/// split batch: the ring skips it and the serial loop reads nothing for it.
+#[test]
+fn read_blocks_batched_tolerates_an_empty_request_in_a_mixed_batch() -> io::Result<()> {
+    let Some(fs) = try_io_uring() else {
+        return Ok(());
+    };
+    let dir = tempfile::tempdir()?;
+    let opts = FsOpenOptions::new().write(true).create(true).read(true);
+
+    let mut uring_file = fs.open(&dir.path().join("u.bin"), &opts)?;
+    uring_file.write_all(&(0..=255u8).collect::<Vec<_>>())?;
+    uring_file.sync_all()?;
+
+    let std_fs = crate::fs::StdFs;
+    let mut std_file = std_fs.open(&dir.path().join("s.bin"), &opts)?;
+    let rev: Vec<u8> = (0..=255u8).rev().collect();
+    std_file.write_all(&rev)?;
+    std_file.sync_all()?;
+
+    let mut empty_uring: [u8; 0] = [];
+    let mut empty_std: [u8; 0] = [];
+    let mut b0 = [0u8; 4];
+    let mut b1 = [0u8; 4];
+    {
+        let mut reqs = vec![
+            crate::fs::BlockRead {
+                file: uring_file.as_ref(),
+                offset: 0,
+                buf: crate::fs::BlockBuf::new(&mut empty_uring),
+            },
+            crate::fs::BlockRead {
+                file: uring_file.as_ref(),
+                offset: 10,
+                buf: crate::fs::BlockBuf::new(&mut b0),
+            },
+            crate::fs::BlockRead {
+                file: std_file.as_ref(),
+                offset: 0,
+                buf: crate::fs::BlockBuf::new(&mut empty_std),
+            },
+            crate::fs::BlockRead {
+                file: std_file.as_ref(),
+                offset: 20,
+                buf: crate::fs::BlockBuf::new(&mut b1),
+            },
+        ];
+        fs.read_blocks_batched(&mut reqs)?;
+        assert!(
+            reqs.iter().all(|r| r.buf.is_full()),
+            "an empty destination is trivially full, and the rest were filled",
+        );
+    }
+    assert_eq!(b0, [10, 11, 12, 13]);
+    assert_eq!(b1, [rev[20], rev[21], rev[22], rev[23]]);
+    Ok(())
+}
+
+/// Wraps a file handle, passing its descriptor through so the ring still
+/// accepts it, and counts the serial `read_at` calls made against it. A count
+/// above zero says the request took the fallback path.
+struct CountingFile {
+    inner: Box<dyn crate::fs::FsFile>,
+    read_at_calls: std::sync::atomic::AtomicUsize,
+}
+
+impl CountingFile {
+    fn new(inner: Box<dyn crate::fs::FsFile>) -> Self {
+        Self {
+            inner,
+            read_at_calls: std::sync::atomic::AtomicUsize::new(0),
+        }
+    }
+
+    fn read_at_calls(&self) -> usize {
+        self.read_at_calls
+            .load(std::sync::atomic::Ordering::Relaxed)
+    }
+}
+
+impl io::Read for CountingFile {
+    fn read(&mut self, buf: &mut [u8]) -> io::Result<usize> {
+        self.inner.read(buf)
+    }
+}
+
+impl io::Write for CountingFile {
+    fn write(&mut self, buf: &[u8]) -> io::Result<usize> {
+        self.inner.write(buf)
+    }
+
+    fn flush(&mut self) -> io::Result<()> {
+        self.inner.flush()
+    }
+}
+
+impl io::Seek for CountingFile {
+    fn seek(&mut self, pos: io::SeekFrom) -> io::Result<u64> {
+        self.inner.seek(pos)
+    }
+}
+
+impl crate::fs::FsFile for CountingFile {
+    fn sync_all(&self) -> crate::io::Result<()> {
+        self.inner.sync_all()
+    }
+
+    fn sync_data(&self) -> crate::io::Result<()> {
+        self.inner.sync_data()
+    }
+
+    fn metadata(&self) -> crate::io::Result<crate::fs::FsMetadata> {
+        self.inner.metadata()
+    }
+
+    fn set_len(&self, size: u64) -> crate::io::Result<()> {
+        self.inner.set_len(size)
+    }
+
+    fn read_at(&self, buf: &mut [u8], offset: u64) -> crate::io::Result<usize> {
+        self.read_at_calls
+            .fetch_add(1, std::sync::atomic::Ordering::Relaxed);
+        self.inner.read_at(buf, offset)
+    }
+
+    fn backing_fd(&self) -> Option<i32> {
+        self.inner.backing_fd()
+    }
+
+    fn lock_exclusive(&self) -> crate::io::Result<()> {
+        self.inner.lock_exclusive()
+    }
 }
 
 #[test]

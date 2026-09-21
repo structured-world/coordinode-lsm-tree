@@ -1335,3 +1335,147 @@ fn a_routed_level_reads_through_its_own_backend() -> lsm_tree::Result<()> {
     );
     Ok(())
 }
+
+/// The other direction of the same rule: an unrouted tree must keep submitting
+/// to the primary. A per-level lookup that resolved wrongly in this direction
+/// would send reads to a backend the configuration never named.
+#[test]
+fn an_unrouted_tree_still_reads_through_the_primary() -> lsm_tree::Result<()> {
+    let dir = tempfile::tempdir()?;
+    let (primary_fs, primary_batched) = CountingFs::paired();
+
+    let config = || {
+        Config::new(
+            dir.path().join("primary"),
+            SequenceNumberCounter::default(),
+            SequenceNumberCounter::default(),
+        )
+        .with_shared_fs(Arc::clone(&primary_fs))
+        .data_block_compression_policy(CompressionPolicy::all(lsm_tree::CompressionType::None))
+        .index_block_compression_policy(CompressionPolicy::all(lsm_tree::CompressionType::None))
+    };
+
+    {
+        let tree = config().open()?;
+        for i in 0..400u32 {
+            tree.insert(format!("key{i:05}"), vec![b'v'; 64], u64::from(i));
+        }
+        tree.flush_active_memtable(0)?;
+    }
+
+    let tree = config().open()?;
+    primary_batched.store(0, std::sync::atomic::Ordering::Relaxed);
+
+    let keys: Vec<String> = (0..8).map(|i| format!("key{:05}", i * 50)).collect();
+    let values = tree.multi_get(&keys, lsm_tree::SeqNo::MAX)?;
+    assert!(values.iter().all(Option::is_some));
+    assert!(
+        primary_batched.load(std::sync::atomic::Ordering::Relaxed) > 0,
+        "with no route to resolve to, the primary is the backend that holds \
+         the tables and must receive their batched reads",
+    );
+    Ok(())
+}
+
+/// A tree whose routes cover only part of the level space reads each level
+/// through whichever backend holds it. The interesting case is the boundary:
+/// `levels` is a half-open range, so its end is NOT covered and must fall back.
+#[test]
+fn every_level_resolves_to_the_backend_that_holds_it() {
+    let dir = tempfile::tempdir().expect("tempdir");
+    let (primary_fs, primary_calls) = CountingFs::paired();
+    let (hot_fs, hot_calls) = CountingFs::paired();
+
+    let config = Config::new(
+        dir.path().join("primary"),
+        SequenceNumberCounter::default(),
+        SequenceNumberCounter::default(),
+    )
+    .with_shared_fs(Arc::clone(&primary_fs))
+    .level_routes(vec![LevelRoute {
+        levels: 1..3,
+        path: dir.path().join("hot"),
+        fs: Arc::clone(&hot_fs),
+    }]);
+
+    // Which backend a level resolved to, read behaviourally: an empty batch is
+    // a no-op on every backend, so the counter alone says who was asked.
+    let asked = |level: u8| -> &'static str {
+        let before_primary = primary_calls.load(std::sync::atomic::Ordering::Relaxed);
+        let before_hot = hot_calls.load(std::sync::atomic::Ordering::Relaxed);
+        config
+            .fs_for_level(level)
+            .read_blocks_batched(&mut [])
+            .expect("an empty batch reads nothing and cannot fail");
+        let primary_moved =
+            primary_calls.load(std::sync::atomic::Ordering::Relaxed) != before_primary;
+        let hot_moved = hot_calls.load(std::sync::atomic::Ordering::Relaxed) != before_hot;
+        match (primary_moved, hot_moved) {
+            (true, false) => "primary",
+            (false, true) => "hot",
+            _ => panic!("exactly one backend must answer for a level"),
+        }
+    };
+
+    assert_eq!(asked(0), "primary", "below the route's range");
+    assert_eq!(asked(1), "hot", "the range's first level is covered");
+    assert_eq!(asked(2), "hot", "still inside the range");
+    assert_eq!(
+        asked(3),
+        "primary",
+        "the range is half-open: its end is not covered",
+    );
+    assert_eq!(asked(6), "primary", "above the route's range");
+}
+
+/// The path a level's tables are written to and the backend its reads go to
+/// must name the same route, or a level would be written to one tier and read
+/// through another's backend.
+#[test]
+fn the_write_path_and_the_read_backend_agree_on_the_route() {
+    let dir = tempfile::tempdir().expect("tempdir");
+    let (primary_fs, primary_calls) = CountingFs::paired();
+    let (hot_fs, hot_calls) = CountingFs::paired();
+
+    let config = Config::new(
+        dir.path().join("primary"),
+        SequenceNumberCounter::default(),
+        SequenceNumberCounter::default(),
+    )
+    .with_shared_fs(Arc::clone(&primary_fs))
+    .level_routes(vec![LevelRoute {
+        levels: 1..3,
+        path: dir.path().join("hot"),
+        fs: Arc::clone(&hot_fs),
+    }]);
+
+    for level in 0..7u8 {
+        let (folder, write_fs) = config.tables_folder_for_level(level);
+        let before_primary = primary_calls.load(std::sync::atomic::Ordering::Relaxed);
+        let before_hot = hot_calls.load(std::sync::atomic::Ordering::Relaxed);
+        write_fs
+            .read_blocks_batched(&mut [])
+            .expect("empty batch cannot fail");
+        let write_went_hot = hot_calls.load(std::sync::atomic::Ordering::Relaxed) != before_hot;
+        let write_went_primary =
+            primary_calls.load(std::sync::atomic::Ordering::Relaxed) != before_primary;
+
+        let before_primary = primary_calls.load(std::sync::atomic::Ordering::Relaxed);
+        let before_hot = hot_calls.load(std::sync::atomic::Ordering::Relaxed);
+        config
+            .fs_for_level(level)
+            .read_blocks_batched(&mut [])
+            .expect("empty batch cannot fail");
+        let read_went_hot = hot_calls.load(std::sync::atomic::Ordering::Relaxed) != before_hot;
+        let read_went_primary =
+            primary_calls.load(std::sync::atomic::Ordering::Relaxed) != before_primary;
+
+        assert_eq!(
+            (write_went_hot, write_went_primary),
+            (read_went_hot, read_went_primary),
+            "L{level} ({}) is written through one backend and read through \
+             another",
+            folder.display(),
+        );
+    }
+}

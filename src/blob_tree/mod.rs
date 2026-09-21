@@ -1494,7 +1494,7 @@ impl AbstractTree for BlobTree {
                 miss_keys,
                 seqno,
                 comparator,
-                &*self.index.config.fs,
+                &self.index.config,
                 &mut internal_entries,
             )?;
 
