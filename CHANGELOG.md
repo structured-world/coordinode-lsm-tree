@@ -11,6 +11,13 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 
 ## [Unreleased]
 
+## [5.11.1](https://github.com/structured-world/coordinode-lsm-tree/compare/v5.11.0...v5.11.1) - 2026-09-21
+
+### Fixed
+
+- *(compaction)* one compaction budget per tree, not per invocation ([#676](https://github.com/structured-world/coordinode-lsm-tree/pull/676))
+- *(fs)* read each level through the backend that holds it ([#673](https://github.com/structured-world/coordinode-lsm-tree/pull/673))
+
 ## [5.11.0](https://github.com/structured-world/coordinode-lsm-tree/compare/v5.10.0...v5.11.0) - 2026-09-20
 
 ### Added
