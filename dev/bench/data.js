@@ -1,5 +1,5 @@
 window.BENCHMARK_DATA = {
-  "lastUpdate": 1790004498073,
+  "lastUpdate": 1790023536899,
   "repoUrl": "https://github.com/structured-world/coordinode-lsm-tree",
   "entries": {
     "lsm-tree db_bench": [
@@ -23526,6 +23526,90 @@ window.BENCHMARK_DATA = {
             "value": 622873.8590118792,
             "unit": "ops/sec",
             "extra": "P50: 1.3us | P99: 7.0us | P99.9: 76.2us\nthreads: 1 | elapsed: 0.32s | num: 200000 | iterations: 3"
+          }
+        ]
+      },
+      {
+        "commit": {
+          "author": {
+            "email": "mail@polaz.com",
+            "name": "Dmitry Prudnikov",
+            "username": "polaz"
+          },
+          "committer": {
+            "email": "noreply@github.com",
+            "name": "GitHub",
+            "username": "web-flow"
+          },
+          "distinct": true,
+          "id": "04bbf52c4c3a85703fcc98aaacc3f9b623bb700c",
+          "message": "fix(compaction): one compaction budget per tree, not per invocation (#676)\n\n## What was wrong\n\n`compaction_rate_limit` is documented as bytes per second, and it did\nnot bound anything. The limiter was constructed inside\n`Options::from_tree` (`src/compaction/worker.rs:144`), which runs on\nevery compaction — so the `Arc` was shared only with itself:\n\n- **Concurrent compactions multiplied the rate.** A regular compaction\ntakes only a read lock on `major_compaction_lock`, so several run at\nonce; each held a private bucket, and `k` of them issued up to `k ×\nrate`.\n- **Every invocation re-earned the burst.** The constructor seeds a full\nsecond of rate so the first request is not penalised, and caps\naccumulation at that same second precisely so an idle compactor cannot\ndump a backlog. Rebuilding per invocation handed that burst out again\neach time, so a stream of short compactions ran unthrottled.\n\nThe limiter's own doc comment says \"share across compaction invocations\nby wrapping in `Arc`\" — the one construction site did the opposite.\n\n## What changed\n\nThe limiter lives on the tree, built once at open from\n`Config::compaction_rate_limit`, and `Options::from_tree` clones the\nhandle. Its debt and its refill clock now survive across invocations,\nwhich is what makes the configured figure mean bytes per second for the\ntree. No public API changes.\n\nA blob tree runs its compactions through its index tree, so it draws on\nthat tree's budget with no extra wiring.\n\n## Scope\n\nBug only. Two things the issue originally carried are deliberately\n**not** here, because they are new capability rather than a restored\ncontract, and they ship on the 6.0 line (#675): a public setter for\nsharing one limiter across several trees, and a live-tunable rate. The\nsecond needs design work this change does not do — `burst_bytes` is\nimmutable and the bucket already holds accumulated budget or debt, so a\nrate change has to define the whole bucket's behaviour, especially the\n`0 ↔ nonzero` transitions.\n\n## Verification\n\nSix tests, four of which fail against `main` (verified by running them\nthere in a worktree):\n\n- two compactions of one tree meet the same debt — **fails on main**;\n- a second compaction does not re-earn the burst — **fails on main**;\n- admitted work over an interval stays within `burst + rate × elapsed`,\ncounting what the limiter *admits after waiting* rather than what it\ndebits — **fails on main**;\n- a blob tree shares its index tree's budget — **fails on main**;\n- an unlimited tree (`rate = 0`, the default) never makes a compaction\nwait, for 1 B through `u64::MAX` — passes on main, pins the free path;\n- a reopened tree starts with a fresh bucket — passes on main, pins that\nthe budget is process state and not durable.\n\nGates: `cargo fmt --check`, `clippy --all-features --all-targets -D\nwarnings`, 2736 tests and 72 doctests on macOS/arm64; `cargo check\n--target thumbv7em-none-eabihf --no-default-features --features alloc`\nat 0 errors. On Linux x86_64 (kernel 6.19, as root): clippy clean and\n2782 tests passed with `--features io-uring`.\n\nCoverage of the lines this branch changes: 11/11.\n\n## Also in this branch\n\n- **CI survives a tool-CDN outage.** A run died on eleven consecutive\nHTTP 504s while the installer pulled a prebuilt `cargo-nextest` from\nGitHub Releases; the action's own retries all target that same host, so\nthey wait out nothing. Each install step now hands its failure to a\nfallback that builds from crates.io, a different host. Nothing is\nskipped: if both are unreachable the fallback fails and CI goes red.\n- **The `multi_get` properties stay on real files.** They are among the\nheaviest file-op generators in the suite, so they are where a platform's\nI/O cost surfaces first: 44 s and 54 s on the Windows runner against 1-2\ns elsewhere, once seen at 104 s. The comment at the fixture now says so,\nbecause that gap is a defect worth reporting rather than routing around.\n\nCloses #666",
+          "timestamp": "2026-09-21T20:40:32Z",
+          "tree_id": "24c62260d524f3b78e44be745324444c3a6965c0",
+          "url": "https://github.com/structured-world/coordinode-lsm-tree/commit/04bbf52c4c3a85703fcc98aaacc3f9b623bb700c"
+        },
+        "date": 1790023482989,
+        "tool": "customBiggerIsBetter",
+        "benches": [
+          {
+            "name": "mixed",
+            "value": 59310.973459802095,
+            "unit": "ops/sec",
+            "extra": "P50: 0.4us | P99: 10.2us | P99.9: 39.0us\nthreads: 1 | elapsed: 9.02s | num: 200000 | iterations: 3"
+          },
+          {
+            "name": "fillseq",
+            "value": 3006248.4874812295,
+            "unit": "ops/sec",
+            "extra": "P50: 0.2us | P99: 0.8us | P99.9: 4.0us\nthreads: 1 | elapsed: 0.07s | num: 200000 | iterations: 3"
+          },
+          {
+            "name": "fillrandom",
+            "value": 884213.5605644289,
+            "unit": "ops/sec",
+            "extra": "P50: 0.9us | P99: 2.7us | P99.9: 6.4us\nthreads: 1 | elapsed: 0.23s | num: 200000 | iterations: 3"
+          },
+          {
+            "name": "readrandom",
+            "value": 580165.8694220678,
+            "unit": "ops/sec",
+            "extra": "P50: 1.4us | P99: 7.4us | P99.9: 85.6us\nthreads: 1 | elapsed: 0.34s | num: 200000 | iterations: 3"
+          },
+          {
+            "name": "readseq",
+            "value": 2297509.040698075,
+            "unit": "ops/sec",
+            "extra": "P50: 0.2us | P99: 5.4us | P99.9: 12.9us\nthreads: 1 | elapsed: 0.09s | num: 200000 | iterations: 3"
+          },
+          {
+            "name": "seekrandom",
+            "value": 286081.00068845396,
+            "unit": "ops/sec",
+            "extra": "P50: 2.7us | P99: 8.8us | P99.9: 19.8us\nthreads: 1 | elapsed: 0.70s | num: 200000 | iterations: 3"
+          },
+          {
+            "name": "prefixscan",
+            "value": 178563.68018316347,
+            "unit": "ops/sec",
+            "extra": "P50: 4.8us | P99: 11.1us | P99.9: 18.1us\nthreads: 1 | elapsed: 1.12s | num: 200000 | iterations: 3"
+          },
+          {
+            "name": "overwrite",
+            "value": 865140.5875083216,
+            "unit": "ops/sec",
+            "extra": "P50: 0.9us | P99: 2.8us | P99.9: 6.5us\nthreads: 1 | elapsed: 0.23s | num: 200000 | iterations: 3"
+          },
+          {
+            "name": "mergerandom",
+            "value": 399866.12482140976,
+            "unit": "ops/sec",
+            "extra": "P50: 0.4us | P99: 1.5us | P99.9: 3.8us\nthreads: 1 | elapsed: 0.50s | num: 200000 | iterations: 3"
+          },
+          {
+            "name": "readwhilewriting",
+            "value": 512980.4574964912,
+            "unit": "ops/sec",
+            "extra": "P50: 1.5us | P99: 7.4us | P99.9: 85.1us\nthreads: 1 | elapsed: 0.39s | num: 200000 | iterations: 3"
           }
         ]
       }
