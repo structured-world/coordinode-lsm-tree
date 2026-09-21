@@ -837,8 +837,12 @@ fn burr_wire_rejects_corrupted_m_below_w() {
     let num_blocks_corrupt: u32 = 1;
     bytes[layer_header_start + 4..layer_header_start + 8]
         .copy_from_slice(&num_blocks_corrupt.to_le_bytes());
-    // z_byte_len = m * stride * 8; stride=1 (r=7 for fpr=0.01) → 256
-    let z_byte_len_corrupt: u32 = 32 * 8;
+    // z_byte_len = segments * r * 8, derived from the corrupted m rather
+    // than restated, so the test keeps reaching Params::new if the packed
+    // geometry ever changes instead of tripping the length check first.
+    let z_byte_len_corrupt =
+        u32::try_from(super::packed::z_byte_len(m_corrupt as usize, params.r).expect("fits usize"))
+            .expect("fits u32");
     bytes[layer_header_start + 8..layer_header_start + 12]
         .copy_from_slice(&z_byte_len_corrupt.to_le_bytes());
 
@@ -1225,6 +1229,114 @@ fn retrieval_wire_bytes_use_filter_type_three() {
 /// band placement, and BuRR's answer to one is the next layer. Failing the
 /// build instead turned a small, perfectly valid key set into a dead write:
 /// the LSM writer surfaced it as an unrecoverable compaction.
+/// Deterministic, well-spread hashes for a sizing fixture.
+fn sizing_hashes(n: usize) -> Vec<u64> {
+    (0..n as u64)
+        .map(|i| crate::hash::hash64(&i.to_le_bytes()))
+        .collect()
+}
+
+#[test]
+fn packed_layout_costs_about_r_bits_per_key() {
+    // The whole point of the packed layout: the payload follows `r`, where
+    // the row-major one cost 64 bits per row whatever `r` was — 74.5 bits per
+    // key at any width. The bound is per key including the per-block
+    // threshold bytes, the per-layer headers and the later layers' slots.
+    for (n, r) in [
+        (1_000_usize, 8_u8),
+        (1_000, 10),
+        (1_000, 16),
+        (100_000, 8),
+        (100_000, 10),
+        (100_000, 16),
+    ] {
+        let params = BurrParams::with_bpk(n, f32::from(r)).expect("params");
+        let builder = BurrBuilder::new(params).expect("builder");
+        let filter = builder.build_from_hashes(&sizing_hashes(n)).expect("build");
+        let len = filter.encoded_len();
+        assert_eq!(len, filter.to_wire_bytes().len(), "encoded_len is exact");
+        #[expect(
+            clippy::cast_precision_loss,
+            reason = "test code: a ratio over counts far below f64's exact range"
+        )]
+        let bits_per_key = (len * 8) as f64 / n as f64;
+        println!("n={n} r={r} bytes={len} bits/key={bits_per_key:.2}");
+        // Envelope, not a point: the slot inflation (~5%), the per-block
+        // threshold byte and the later layers all scale with r, while the
+        // per-layer headers do not — so a small filter carries visibly more
+        // per key than a large one. Measured at the time of writing:
+        //
+        //   n = 1 000    r =  8 / 10 / 16  →  10.83 / 13.39 / 21.07
+        //   n = 100 000  r =  8 / 10 / 16  →   9.47 / 11.80 / 18.79
+        //
+        // against a flat 74.5 for every one of them before the transpose.
+        assert!(
+            bits_per_key < f64::from(r).mul_add(1.25, 3.5),
+            "n={n} r={r}: {bits_per_key:.2} bits/key — the payload must follow r, \
+             not sit at the row-major 74.5",
+        );
+    }
+}
+
+#[test]
+fn the_pre_build_estimate_lands_within_its_stated_tolerance() {
+    // `estimated_filter_size` decides where a partition splits, so what
+    // matters is that it tracks the built size across the range a partition
+    // can hold. It cannot be exact — the later layers' slot counts follow the
+    // bumped keys, which depend on the hashes — so the contract is a stated
+    // tolerance, and this is what states it.
+    use crate::table::filter::BloomConstructionPolicy;
+
+    let mut worst = 0.0_f64;
+    for n in [1_000_usize, 5_000, 20_000, 100_000] {
+        for r in [8_u8, 10, 16] {
+            let policy = BloomConstructionPolicy::BitsPerKey(f32::from(r));
+            let params = BurrParams::with_bpk(n, f32::from(r)).expect("params");
+            let builder = BurrBuilder::new(params).expect("builder");
+            let filter = builder.build_from_hashes(&sizing_hashes(n)).expect("build");
+
+            let actual = filter.encoded_len();
+            let estimate = policy.estimated_filter_size(n);
+            #[expect(
+                clippy::cast_precision_loss,
+                reason = "test code: a ratio over counts far below f64's exact range"
+            )]
+            let error = (estimate as f64 - actual as f64) / actual as f64;
+            println!(
+                "n={n} r={r} actual={actual} estimate={estimate} error={:+.1}%",
+                error * 100.0
+            );
+            worst = worst.max(error.abs());
+        }
+    }
+    assert!(
+        worst < 0.10,
+        "worst estimate error {:.1}% exceeds the 10% tolerance the doc states",
+        worst * 100.0,
+    );
+}
+
+#[test]
+fn a_hundred_thousand_keys_at_ten_bits_cost_about_twelve_bits_each() {
+    // The headline figure, pinned on its own so a regression names itself
+    // rather than widening an envelope. `BitsPerKey(10)` is the default
+    // policy, and this is what it now costs in memory — it used to cost
+    // 74.78 bits per key, the same as `BitsPerKey(16)` did.
+    let n = 100_000_usize;
+    let params = BurrParams::with_bpk(n, 10.0).expect("params");
+    let builder = BurrBuilder::new(params).expect("builder");
+    let filter = builder.build_from_hashes(&sizing_hashes(n)).expect("build");
+    #[expect(
+        clippy::cast_precision_loss,
+        reason = "test code: a ratio over counts far below f64's exact range"
+    )]
+    let bits_per_key = (filter.encoded_len() * 8) as f64 / n as f64;
+    assert!(
+        (11.0..12.5).contains(&bits_per_key),
+        "expected ~11.8 bits/key, got {bits_per_key:.2}",
+    );
+}
+
 #[test]
 fn burr_builds_every_small_key_set_by_bumping_unplaceable_keys() {
     for n in 1..=256_usize {

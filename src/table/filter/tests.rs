@@ -1,24 +1,54 @@
 use super::*;
 use test_log::test;
 
+/// Builds the filter a policy would build for `n` keys and returns the exact
+/// serialised length, so an estimate can be checked against the real thing
+/// rather than against a restatement of its own formula.
+fn built_len(policy: BloomConstructionPolicy, n: usize) -> usize {
+    use crate::table::filter::ribbon::burr::BurrBuilder;
+    let params = policy.burr_params(n).expect("policy is active");
+    let builder = BurrBuilder::new(params).expect("builder");
+    let hashes: Vec<u64> = (0..n as u64)
+        .map(|i| crate::hash::hash64(&i.to_le_bytes()))
+        .collect();
+    builder
+        .build_from_hashes_owned(hashes)
+        .expect("build")
+        .encoded_len()
+}
+
+/// The estimate's contract is a tolerance against the built size, so both
+/// tests below check exactly that. Wider than the ~4% the model measures at,
+/// because the bumped-key counts that drive the later layers are a property
+/// of the hashes and a different key set moves them.
+fn assert_estimate_tracks_build(policy: BloomConstructionPolicy, n: usize) {
+    let estimate = policy.estimated_filter_size(n);
+    let actual = built_len(policy, n);
+    #[expect(
+        clippy::cast_precision_loss,
+        reason = "test code: a ratio over counts far below f64's exact range"
+    )]
+    let error = (estimate as f64 - actual as f64) / actual as f64;
+    assert!(
+        error.abs() < 0.10,
+        "{policy:?} at n={n}: estimate {estimate} vs built {actual} is {:+.1}%, \
+         outside the tolerance the estimate documents",
+        error * 100.0,
+    );
+}
+
 #[test]
 fn burr_estimated_size_bpk() {
-    let policy = BloomConstructionPolicy::BitsPerKey(10.0);
-    let n = 1_000_000;
-    let estimated_size = policy.estimated_filter_size(n);
-    // 10 bits/key × 1M keys × 1.05 overhead / 8 ≈ 1.31 MB
-    assert!(estimated_size > 1_200_000);
-    assert!(estimated_size < 1_400_000);
+    // One million keys is the size a partition estimate has to stay sane at,
+    // and it is the point the smaller fixtures in the BuRR tests do not reach.
+    assert_estimate_tracks_build(BloomConstructionPolicy::BitsPerKey(10.0), 1_000_000);
 }
 
 #[test]
 fn burr_estimated_size_fpr() {
-    let policy = BloomConstructionPolicy::FalsePositiveRate(0.01);
-    let n = 1_000_000;
-    let estimated_size = policy.estimated_filter_size(n);
-    // ceil(-log2(0.01)) = 7 bits/key → 7M bits × 1.05 / 8 ≈ 918 KB
-    assert!(estimated_size > 800_000);
-    assert!(estimated_size < 1_000_000);
+    // ceil(-log2(0.01)) = 7 bits per key, so this also covers an odd `r` that
+    // the bits-per-key fixtures (8, 10, 16) do not.
+    assert_estimate_tracks_build(BloomConstructionPolicy::FalsePositiveRate(0.01), 1_000_000);
 }
 
 #[test]

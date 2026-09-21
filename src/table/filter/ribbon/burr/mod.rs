@@ -75,7 +75,9 @@
 pub mod builder;
 pub mod error;
 pub mod filter;
+pub(crate) mod packed;
 pub mod params;
+
 mod prefetch;
 pub(crate) mod threshold;
 pub(crate) mod wire;
@@ -86,6 +88,7 @@ pub use filter::{
     BurrFilter, BurrFilterReader, contains_hash_from_bytes, recover_value_from_bytes,
 };
 pub use params::BurrParams;
+pub(crate) use wire::FORMAT_VERSION;
 
 #[cfg(test)]
 mod tests;

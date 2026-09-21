@@ -127,6 +127,17 @@ impl BurrFilter {
         self.params
     }
 
+    /// The exact length [`Self::to_wire_bytes`] produces, computed from the
+    /// built layers without serialising them.
+    ///
+    /// This is the figure to account memory and filter budgets against. The
+    /// pre-build `estimated_filter_size` cannot be exact, because how many
+    /// keys each layer bumps is a property of the hashes, not of the count.
+    #[must_use]
+    pub fn encoded_len(&self) -> usize {
+        super::wire::encoded_len(self)
+    }
+
     /// Probe with a pre-computed u64 hash (e.g. xxh3 output from
     /// `crate::hash::hash64`). The hash must be produced the same way
     /// the builder's input hashes were (the on-disk LSM filter uses

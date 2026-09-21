@@ -11,7 +11,7 @@
 //! ──────  ────  ──────────────────────────────────────────
 //! 0       6     MAGIC_BYTES (existing crate constant)
 //! 6       1     filter_type = BURR_FILTER_TYPE_BYTE (2)
-//! 7       1     format_version (FORMAT_VERSION = 1)
+//! 7       1     format_version (FORMAT_VERSION = 2)
 //! 8       1     r (fingerprint bits, 1..=64)
 //! 9       1     w (band width, fixed at 64)
 //! 10      1     b (block size)
@@ -20,13 +20,20 @@
 //! 20      —     per-layer payloads (`num_layers` entries):
 //!                   4     m (u32 LE)             — slot count
 //!                   4     num_blocks (u32 LE)    — = m.div_ceil(b)
-//!                   4     z_byte_len (u32 LE)    — = m * stride_words * 8
+//!                   4     z_byte_len (u32 LE)    — = segments * r * 8
 //!                   N     thresholds (num_blocks bytes)
-//!                   M     z storage (z_byte_len bytes, raw u64 words LE)
+//!                   M     z storage (z_byte_len bytes, u64 words LE)
 //! ```
 //!
-//! `stride_words = r.div_ceil(64)`. For the current implementation
-//! `r <= 64` so `stride_words = 1` and a row of z is exactly 8 bytes.
+//! # Solution storage
+//!
+//! `z` is bit-sliced, not row-major: rows are grouped into segments of 64
+//! and each segment stores `r` words, word `j` holding bit `j` of its 64
+//! rows, so `segments = m.div_ceil(64)` and the payload is `r` bits per row
+//! rather than 64 whatever `r` is. See [`super::packed`] for the layout and
+//! the band read. A membership probe reduces one result bit at a time and
+//! stops at the first bit that disagrees with the fingerprint; a retrieval
+//! probe reads all `r`.
 //!
 //! The per-layer seed is NOT stored — it's re-derived from
 //! `root_seed + layer_index` via [`super::builder::derive_layer_seed`]
@@ -68,13 +75,45 @@ pub(crate) const BURR_RETRIEVAL_TYPE_BYTE: u8 = 3;
 
 /// Format version. Bumped if/when the wire layout changes
 /// incompatibly. Readers reject mismatched versions explicitly.
-pub(crate) const FORMAT_VERSION: u8 = 1;
+///
+/// Version 2 bit-slices the solution matrix (see the module docs). There is
+/// no reader for version 1: a table carrying one is refused when it is
+/// opened, and converting it is the offline tool's job, so no legacy decode
+/// path lives on the read hot path.
+pub(crate) const FORMAT_VERSION: u8 = 2;
 
 /// Header length in bytes (MAGIC + filter_type + version + r + w + b +
 /// num_layers + root_seed) — 6 + 1 + 1 + 1 + 1 + 1 + 1 + 8 = 20.
-const HEADER_LEN: usize = MAGIC_BYTES.len() + 6 + 8;
+pub(crate) const HEADER_LEN: usize = MAGIC_BYTES.len() + 6 + 8;
 /// Per-layer fixed header length: m + num_blocks + z_byte_len = 12.
-const LAYER_HEADER_LEN: usize = 12;
+pub(crate) const LAYER_HEADER_LEN: usize = 12;
+
+/// The exact number of bytes [`encode`] will produce for `filter`, without
+/// serialising it.
+///
+/// This is the figure memory accounting and the filter-size budget use. It is
+/// distinct from [`BloomConstructionPolicy::estimated_filter_size`], which
+/// predicts a size from a key count *before* the build and cannot be exact:
+/// how many keys each layer bumps depends on the hashes.
+///
+/// [`BloomConstructionPolicy::estimated_filter_size`]: crate::table::filter::BloomConstructionPolicy::estimated_filter_size
+pub(crate) fn encoded_len(filter: &BurrFilter) -> usize {
+    let layers = filter.layers_inner();
+    if layers.is_empty() {
+        // `to_wire_bytes` emits nothing for a zero-layer filter.
+        return 0;
+    }
+    let r = filter.params().r;
+    HEADER_LEN
+        + layers
+            .iter()
+            .map(|layer| {
+                LAYER_HEADER_LEN
+                    + layer.thresholds.len()
+                    + super::packed::z_byte_len(layer.m, r).unwrap_or(0)
+            })
+            .sum::<usize>()
+}
 
 /// Serialize a built [`BurrFilter`] into the wire format.
 pub(crate) fn encode(filter: &BurrFilter) -> Vec<u8> {
@@ -83,11 +122,14 @@ pub(crate) fn encode(filter: &BurrFilter) -> Vec<u8> {
 
     // Pre-size the buffer to avoid reallocations: header + per-layer
     // (fixed header + thresholds + z) for every layer.
-    let stride_words = usize::from(params.r).div_ceil(64);
     let estimated_size: usize = HEADER_LEN
         + layers
             .iter()
-            .map(|layer| LAYER_HEADER_LEN + layer.thresholds.len() + layer.m * stride_words * 8)
+            .map(|layer| {
+                LAYER_HEADER_LEN
+                    + layer.thresholds.len()
+                    + super::packed::z_byte_len(layer.m, params.r).unwrap_or(0)
+            })
             .sum::<usize>();
     let mut buf = Vec::with_capacity(estimated_size);
 
@@ -129,13 +171,11 @@ pub(crate) fn encode(filter: &BurrFilter) -> Vec<u8> {
         // loud panic at write time rather than corruption at read.
         #[expect(
             clippy::expect_used,
-            reason = "programmer invariant: filter partitions are capped at \
-                      ~4 KB upstream; an overflow here means a regression \
-                      slipped past the partition-size policy"
+            reason = "programmer invariant: a layer's packed payload is \
+                      `segments * r * 8` bytes, bounded by the partition-size \
+                      policy; an overflow here means a regression slipped past it"
         )]
-        let z_byte_len: usize = m
-            .checked_mul(stride_words)
-            .and_then(|v| v.checked_mul(8))
+        let z_byte_len: usize = super::packed::z_byte_len(m, params.r)
             .expect("BuRR layer z payload size overflows usize");
         #[expect(
             clippy::expect_used,
@@ -166,10 +206,15 @@ pub(crate) fn encode(filter: &BurrFilter) -> Vec<u8> {
                 .expect("vec write");
         }
         buf.extend_from_slice(&layer.thresholds);
-        // Serialize z as little-endian u64 words.
+        // The solver works row-major — back-substitution reads rows below the
+        // one it is finishing — so the transpose happens here, once per layer,
+        // on the way out. The builder's row-major buffer is transient; what is
+        // stored, cached and probed is the bit-sliced form.
         let z_words = layer.ribbon.z_raw_words();
-        debug_assert_eq!(z_words.len(), m * stride_words);
-        for word in z_words {
+        debug_assert_eq!(z_words.len(), m, "one solver row per slot");
+        let columns = super::packed::transpose(z_words, params.r);
+        debug_assert_eq!(columns.len() * 8, z_byte_len);
+        for word in columns {
             buf.extend_from_slice(&word.to_le_bytes());
         }
     }
@@ -202,7 +247,6 @@ pub(crate) struct DecodedFilter<'a> {
     pub(crate) r: u8,
     pub(crate) w: u8,
     pub(crate) b: u8,
-    pub(crate) stride_words: usize,
     pub(crate) layers: Vec<LayerView<'a>>,
 }
 
@@ -256,7 +300,6 @@ pub(crate) fn decode(bytes: &[u8]) -> crate::Result<DecodedFilter<'_>> {
         return Err(crate::Error::InvalidHeader("BurrFilter params"));
     }
 
-    let stride_words = usize::from(r).div_ceil(64);
     let mut layers = Vec::with_capacity(usize::from(num_layers));
     let mut pos = HEADER_LEN;
 
@@ -293,9 +336,7 @@ pub(crate) fn decode(bytes: &[u8]) -> crate::Result<DecodedFilter<'_>> {
             return Err(crate::Error::InvalidHeader("BurrFilter layer m"));
         }
         let expected_blocks = m.div_ceil(usize::from(b));
-        let expected_z_len = m
-            .checked_mul(stride_words)
-            .and_then(|n| n.checked_mul(8))
+        let expected_z_len = super::packed::z_byte_len(m, r)
             .ok_or(crate::Error::InvalidHeader("BurrFilter layer payload"))?;
         if num_blocks != expected_blocks || z_byte_len != expected_z_len {
             return Err(crate::Error::InvalidHeader("BurrFilter layer payload"));
@@ -340,13 +381,7 @@ pub(crate) fn decode(bytes: &[u8]) -> crate::Result<DecodedFilter<'_>> {
         });
     }
 
-    Ok(DecodedFilter {
-        r,
-        w,
-        b,
-        stride_words,
-        layers,
-    })
+    Ok(DecodedFilter { r, w, b, layers })
 }
 
 /// Outcome of walking a wire-format BuRR to the layer that holds `hash`
@@ -359,17 +394,20 @@ pub(crate) fn decode(bytes: &[u8]) -> crate::Result<DecodedFilter<'_>> {
 /// two query paths cannot drift on the bounds checks; each caller only
 /// interprets the terminal `acc`.
 enum FirstLayerWalk {
-    /// `hash` is kept at some layer: `acc` is the GF(2) dot-product over
-    /// that layer's z rows (the recovered r-bit RHS — already masked to r
-    /// bits because the builder masks every stored z row); `fingerprint` is
-    /// the hash-derived fingerprint recomputed for the membership compare.
-    Found { acc: u64, fingerprint: u64 },
+    /// `hash` is kept at some layer and every result bit was reduced. For a
+    /// retrieval walk the value is the recovered `r`-bit RHS; for a
+    /// membership walk it is that same value, reached only because each bit
+    /// agreed with the fingerprint as it was computed.
+    Found(u64),
+    /// Membership only: a result bit disagreed with the fingerprint, so the
+    /// key is definitely absent and the remaining bits were never read.
+    Absent,
     /// Every layer bumped `hash`. For a membership filter that is
     /// definitely-absent; normally unreachable since the last layer accepts
     /// all keys.
     AllBumped,
-    /// A layer's z payload was truncated mid-row past the header-validated
-    /// lengths (structure parsed, but a row slice is short). The caller
+    /// A layer's z payload was truncated past the header-validated lengths
+    /// (structure parsed, but a column word is missing). The caller
     /// fail-closes (membership → possibly-present; retrieval → fall back to
     /// the sorted index).
     Truncated,
@@ -397,7 +435,11 @@ enum FirstLayerWalk {
               `bytes.len() < ...`. Raw indexing avoids per-field Option \
               unwrapping on the read hot loop."
 )]
-fn walk_first_layer(bytes: &[u8], hash: u64, expected_type: u8) -> crate::Result<FirstLayerWalk> {
+fn walk_first_layer<const EARLY_OUT: bool>(
+    bytes: &[u8],
+    hash: u64,
+    expected_type: u8,
+) -> crate::Result<FirstLayerWalk> {
     if bytes.len() < HEADER_LEN {
         return Err(crate::Error::InvalidHeader("BurrFilter"));
     }
@@ -461,8 +503,7 @@ fn walk_first_layer(bytes: &[u8], hash: u64, expected_type: u8) -> crate::Result
             return Err(crate::Error::InvalidHeader("BurrFilter layer m"));
         }
         let expected_blocks = m.div_ceil(usize::from(b));
-        let expected_z_len = m
-            .checked_mul(8)
+        let expected_z_len = super::packed::z_byte_len(m, r)
             .ok_or(crate::Error::InvalidHeader("BurrFilter layer payload"))?;
         if num_blocks != expected_blocks || z_byte_len != expected_z_len {
             return Err(crate::Error::InvalidHeader("BurrFilter layer payload"));
@@ -491,39 +532,36 @@ fn walk_first_layer(bytes: &[u8], hash: u64, expected_type: u8) -> crate::Result
         let layer_params = layer_params_base.with_seed(seed);
 
         let equation: StandardEquation = standard_equation_from_hash(hash, seed, &layer_params);
-        let fingerprint = equation.fingerprint;
 
-        // Prefetch the [start, start+w) coefficient window (w u64 rows = w*8
-        // bytes) before the threshold check so the hash-random cold miss on the
-        // first band row overlaps the is_bumped work. Hint only; clamped to `z`.
-        let win_start = equation.start * 8;
+        // The band's columns are two adjacent runs of `r` words — the segment
+        // the band starts in and the next — so the whole window is one
+        // contiguous `2 * r * 8`-byte span. Prefetch it before the threshold
+        // check so the hash-random cold miss overlaps the is_bumped work.
+        // Hint only; clamped to `z`.
+        let win_start = (equation.start / super::packed::SEGMENT_ROWS) * usize::from(r) * 8;
         super::prefetch::prefetch_span(
             z.as_ptr().wrapping_add(win_start),
-            (usize::from(w) * 8).min(z.len().saturating_sub(win_start)),
+            (2 * usize::from(r) * 8).min(z.len().saturating_sub(win_start)),
         );
 
         if is_bumped(&equation, thresholds, b) {
             continue;
         }
 
-        // GF(2) XOR-reduce against the band rows whose coeff bit is set.
-        let mut acc: u64 = 0;
-        let mut lo = equation.coeff_lo;
-        while lo != 0 {
-            let offset = lo.trailing_zeros() as usize;
-            let row_byte = (equation.start + offset) * 8;
-            let Some(slice) = z.get(row_byte..row_byte + 8) else {
-                // row_byte+8 > z len: payload truncated mid-row.
-                return Ok(FirstLayerWalk::Truncated);
-            };
-            let Ok(arr) = <[u8; 8]>::try_from(slice) else {
-                return Ok(FirstLayerWalk::Truncated);
-            };
-            acc ^= u64::from_le_bytes(arr);
-            lo &= lo - 1;
-        }
         debug_assert_eq!(equation.coeff_hi, 0, "w <= 64 keeps coeff_hi == 0");
-        return Ok(FirstLayerWalk::Found { acc, fingerprint });
+        return Ok(
+            match super::packed::walk_band::<EARLY_OUT>(
+                z,
+                r,
+                equation.start,
+                equation.coeff_lo,
+                equation.fingerprint,
+            ) {
+                super::packed::BandWalk::Reduced(acc) => FirstLayerWalk::Found(acc),
+                super::packed::BandWalk::Mismatch => FirstLayerWalk::Absent,
+                super::packed::BandWalk::Truncated => FirstLayerWalk::Truncated,
+            },
+        );
     }
 
     Ok(FirstLayerWalk::AllBumped)
@@ -544,10 +582,19 @@ fn walk_first_layer(bytes: &[u8], hash: u64, expected_type: u8) -> crate::Result
 ///   fail-closed `true` path: a structurally invalid header is a real error
 ///   returned upstream so the table read path can surface it.
 #[inline]
+#[expect(
+    clippy::match_same_arms,
+    reason = "`Found` and `Truncated` both answer possibly-present, for opposite \
+              reasons: one found the key's fingerprint, the other could not read \
+              far enough to rule it out. Merging them would put one comment on \
+              two unrelated outcomes and hide the fail-closed rule."
+)]
 pub(crate) fn contains_hash_from_bytes(bytes: &[u8], hash: u64) -> crate::Result<bool> {
-    match walk_first_layer(bytes, hash, BURR_FILTER_TYPE_BYTE)? {
-        FirstLayerWalk::Found { acc, fingerprint } => Ok(acc == fingerprint),
-        FirstLayerWalk::AllBumped => Ok(false),
+    // Early-out: each result bit is compared as it is reduced, so an absent
+    // key stops at the first disagreeing bit — about two of them on average.
+    match walk_first_layer::<true>(bytes, hash, BURR_FILTER_TYPE_BYTE)? {
+        FirstLayerWalk::Found(_) => Ok(true),
+        FirstLayerWalk::Absent | FirstLayerWalk::AllBumped => Ok(false),
         // Truncated payload → fail closed: report possibly-present so the
         // table read path falls through to a real index lookup rather than
         // a false negative on substituted zeros.
@@ -573,11 +620,15 @@ pub(crate) fn contains_hash_from_bytes(bytes: &[u8], hash: u64) -> crate::Result
 ///   unparseable or is not a retrieval payload (e.g. a membership tag 2).
 #[inline]
 pub(crate) fn recover_value_from_bytes(bytes: &[u8], hash: u64) -> crate::Result<Option<u64>> {
-    // `acc` is already masked to r bits (the builder masks every stored z
-    // row to the fingerprint width), so no extra masking is needed here.
-    match walk_first_layer(bytes, hash, BURR_RETRIEVAL_TYPE_BYTE)? {
-        FirstLayerWalk::Found { acc, .. } => Ok(Some(acc)),
-        FirstLayerWalk::AllBumped | FirstLayerWalk::Truncated => Ok(None),
+    // No early-out: a retrieval needs all `r` bits and has no fingerprint to
+    // compare them against. `acc` carries exactly those bits, so no extra
+    // masking is needed here.
+    match walk_first_layer::<false>(bytes, hash, BURR_RETRIEVAL_TYPE_BYTE)? {
+        FirstLayerWalk::Found(acc) => Ok(Some(acc)),
+        // `Absent` is unreachable without the early-out; mapped to "cannot
+        // answer" rather than asserted away, so a future change to the walk
+        // degrades to the index fallback instead of a wrong locator.
+        FirstLayerWalk::Absent | FirstLayerWalk::AllBumped | FirstLayerWalk::Truncated => Ok(None),
     }
 }
 
@@ -590,14 +641,13 @@ pub(crate) fn recover_value_from_bytes(bytes: &[u8], hash: u64) -> crate::Result
 /// elsewhere; the filter consumes that same hash directly instead of
 /// re-hashing.
 #[inline]
+#[expect(
+    clippy::match_same_arms,
+    reason = "same as `contains_hash_from_bytes`: found and truncated both answer \
+              possibly-present for opposite reasons, and the fail-closed rule \
+              needs its own arm to be stated at."
+)]
 pub(crate) fn contains_hash(decoded: &DecodedFilter<'_>, hash: u64) -> bool {
-    // r is validated to 1..=64 in decode, so a solution row is one word for
-    // the currently-deployed wire format and both the fingerprint and the
-    // accumulator stay in registers. If the format ever grows to r > 64 the
-    // assertion below catches the mismatch — the probe path must be updated
-    // at the same time.
-    debug_assert_eq!(decoded.stride_words, 1, "BuRR wire format pins r <= 64");
-
     for layer in &decoded.layers {
         let layer_params = match Params::new(
             layer.m,
@@ -615,55 +665,37 @@ pub(crate) fn contains_hash(decoded: &DecodedFilter<'_>, hash: u64) -> bool {
 
         let equation: StandardEquation =
             standard_equation_from_hash(hash, layer.seed, &layer_params);
-        let fingerprint = equation.fingerprint;
 
-        // Prefetch the [start, start+w) coefficient window (w u64 rows = w*8
-        // bytes) before the threshold check so the hash-random cold miss on the
-        // first band row overlaps the is_bumped work. Hint only; clamped to `z`.
+        // Same contiguous two-segment window as the borrowed-bytes walk.
         let z = layer.z_bytes;
-        let win_start = equation.start * 8;
+        let win_start = (equation.start / super::packed::SEGMENT_ROWS) * usize::from(decoded.r) * 8;
         super::prefetch::prefetch_span(
             z.as_ptr().wrapping_add(win_start),
-            (usize::from(decoded.w) * 8).min(z.len().saturating_sub(win_start)),
+            (2 * usize::from(decoded.r) * 8).min(z.len().saturating_sub(win_start)),
         );
 
         if is_bumped(&equation, layer.thresholds, decoded.b) {
             continue;
         }
 
-        // Kept at this layer — XOR-reduce the band-rows whose coeff bit
-        // is set, compare against the fingerprint. start ∈ [0, m-w] and
-        // every set bit offset ∈ [0, w-1], so row_index ∈ [0, m-1] is
-        // always in-bounds (proven; no per-row bounds check in the
-        // loop). z_bytes is borrowed wire bytes; we decode 8 LE bytes
-        // → u64 per matched row inline (no per-call allocation, vs
-        // pre-decoding into Vec<u64> which would happen on every
-        // FilterBlock construction during the LSM read path).
-        let mut acc: u64 = 0;
-        let mut lo = equation.coeff_lo;
-        while lo != 0 {
-            let offset = lo.trailing_zeros() as usize;
-            let row_byte = (equation.start + offset) * 8;
-            // row_byte..row_byte+8 ⊂ z is proven by start+offset < m
-            // and the decode-time check that z len == m * 8. If the
-            // invariant ever drifts (corruption, future format change
-            // missed here), fail closed → return true so the table
-            // read path falls through to a real index lookup rather
-            // than producing a false negative on substituted zeros.
-            let Some(slice) = z.get(row_byte..row_byte + 8) else {
-                return true;
-            };
-            let Ok(arr) = <[u8; 8]>::try_from(slice) else {
-                return true;
-            };
-            acc ^= u64::from_le_bytes(arr);
-            lo &= lo - 1;
-        }
-        // coeff_hi is always 0 for w <= 64 (the case we deploy); a
-        // future w > 64 build path would need to extend the loop here.
+        // coeff_hi is always 0 for w <= 64 (the case we deploy); a future
+        // w > 64 build path would need a wider band read.
         debug_assert_eq!(equation.coeff_hi, 0, "w <= 64 keeps coeff_hi == 0");
 
-        return acc == fingerprint;
+        return match super::packed::walk_band::<true>(
+            z,
+            decoded.r,
+            equation.start,
+            equation.coeff_lo,
+            equation.fingerprint,
+        ) {
+            super::packed::BandWalk::Reduced(_) => true,
+            super::packed::BandWalk::Mismatch => false,
+            // Fail closed on a truncated payload: report possibly-present so
+            // the read path falls through to a real index lookup rather than
+            // producing a false negative on missing words.
+            super::packed::BandWalk::Truncated => true,
+        };
     }
     false
 }

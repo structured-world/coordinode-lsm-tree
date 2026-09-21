@@ -171,6 +171,18 @@ pub struct ParsedMeta {
     /// reconstructs row entries from a columnar block on load.
     pub columnar: bool,
 
+    /// Which `BuRR` wire format this table's filter and locator sections
+    /// carry, from the optional `descriptor#filter_format` property.
+    ///
+    /// `None` means the key is ABSENT, which is what a table written before
+    /// the stamp existed looks like — and every such table carries the v1
+    /// layout this release cannot read. The recover path refuses one that
+    /// actually has a filter or locator section, naming the offline converter,
+    /// rather than letting the mismatch surface as a parse error inside the
+    /// first point read. A table with neither section is unaffected: there is
+    /// nothing to misread.
+    pub filter_format: Option<u8>,
+
     /// Bulk-ingest provenance from the optional `descriptor#bulk_ingested`
     /// property: `Some(true)` = bulk-ingested (every entry at LOCAL seqno 0, MVCC
     /// ordering carried by a manifest-only `global_seqno`), `Some(false)` = a
@@ -398,6 +410,16 @@ impl ParsedMeta {
             None => false,
             Some(v) => match v.value.as_ref() {
                 [b] => *b != 0,
+                _ => return Err(crate::Error::InvalidHeader("TableMeta")),
+            },
+        };
+
+        // Optional BuRR wire-format stamp. Absent = a table written before the
+        // stamp existed, hence the v1 layout; see the field's doc comment.
+        let filter_format = match block.point_read(b"descriptor#filter_format", SeqNo::MAX, &cmp)? {
+            None => None,
+            Some(v) => match v.value.as_ref() {
+                [b] => Some(*b),
                 _ => return Err(crate::Error::InvalidHeader("TableMeta")),
             },
         };
@@ -651,6 +673,7 @@ impl ParsedMeta {
             data_block_restart_interval,
             index_block_restart_interval,
             columnar,
+            filter_format,
             bulk_ingested,
             recency,
             lineage,

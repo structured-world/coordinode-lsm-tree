@@ -37,8 +37,17 @@ fn churn_index_filter_reloads(metadata_priority: bool) -> (usize, usize) {
     // Cache holds the metadata set plus a fraction of the data, far less than
     // the whole data working set, so data churn drives eviction. With the pin
     // ON the metadata is held in the protected tier and data is evicted instead.
+    //
+    // The capacity is chosen RELATIVE TO THE FILTER SIZE, which is what decides
+    // whether the regime exists at all: a filter block small enough to survive
+    // the churn on its own makes the baseline show no reloads and the test
+    // measures nothing. At the bit-sliced layout's ~13 bits per key, 30 SSTs of
+    // 130 keys carry roughly 6 KiB of filter in total, so the cache is sized in
+    // that neighbourhood rather than in the data's. Anything that changes filter
+    // size materially has to revisit this number — the assertion below is what
+    // catches it having gone stale.
     let cache =
-        Arc::new(Cache::with_capacity_bytes(256 * 1024).with_metadata_priority(metadata_priority));
+        Arc::new(Cache::with_capacity_bytes(48 * 1024).with_metadata_priority(metadata_priority));
     let any = Config::new(
         folder.path(),
         SequenceNumberCounter::default(),

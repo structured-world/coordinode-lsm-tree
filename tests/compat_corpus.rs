@@ -20,7 +20,7 @@
 //! ```
 
 use lsm_tree::{
-    AbstractTree, CompressionType, Config, SeqNo, SequenceNumberCounter, config::CompressionPolicy,
+    AbstractTree, CompressionType, Config, SequenceNumberCounter, config::CompressionPolicy,
     get_tmp_folder,
 };
 use std::path::Path;
@@ -84,7 +84,20 @@ fn regenerate_golden_corpus() {
 }
 
 #[test]
-fn golden_v5_corpus_opens_and_reads_under_current_code() {
+fn golden_v5_corpus_is_refused_at_open_naming_the_converter() {
+    // The 6.0 filter format replaces its predecessor outright and no reader
+    // for the old layout ships, so this fixture — written by 5.6.0 — must no
+    // longer open. What this test guards is the SHAPE of that refusal, which
+    // is the part that can regress silently:
+    //
+    //   * it happens at OPEN, not on the first point read. A tree that opens
+    //     and then fails somewhere under a `get` tells an operator nothing
+    //     about what to do, and may have served reads from the levels that
+    //     happened to parse before reaching one that did not.
+    //   * it is a TYPED error that names the remedy, not a parse failure.
+    //
+    // When the offline converter lands, the companion test to write is the
+    // positive one: convert this same fixture and assert it opens and reads.
     let fixture = Path::new(FIXTURE);
     assert!(
         fixture.join("current").exists(),
@@ -99,28 +112,27 @@ fn golden_v5_corpus_opens_and_reads_under_current_code() {
     copy_dir(fixture, tmp.path());
     let _ = std::fs::remove_file(tmp.path().join("LOCK"));
 
-    let tree = Config::new(
+    let err = Config::new(
         tmp.path(),
         SequenceNumberCounter::default(),
         SequenceNumberCounter::default(),
     )
     .open()
-    .expect("current code must open the v5.6.0 golden corpus");
+    .err()
+    .expect("a v5 store must not open under the 6.0 filter format");
 
-    for i in 0..N {
-        let got = tree
-            .get(key(i), SeqNo::MAX)
-            .expect("get")
-            .unwrap_or_else(|| panic!("golden corpus: key {i} missing"));
-        assert_eq!(
-            &*got,
-            val(i).as_slice(),
-            "golden corpus: value mismatch for key {i}"
-        );
-    }
-    let scanned = tree.range(key(0)..key(1_000_000), SeqNo::MAX, None).count();
-    assert_eq!(
-        scanned, N as usize,
-        "golden corpus: range scan must see every row"
+    assert!(
+        matches!(
+            err,
+            lsm_tree::Error::UnsupportedFilterFormat { found: None, .. }
+        ),
+        "expected UnsupportedFilterFormat naming the converter, got: {err:?}",
+    );
+    // The message is the operator-facing half of the contract: a Debug dump
+    // would not tell anyone that a tool exists.
+    let rendered = err.to_string();
+    assert!(
+        rendered.contains("offline converter"),
+        "the error must name the converter, got: {rendered}",
     );
 }
