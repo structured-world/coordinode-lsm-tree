@@ -5027,6 +5027,8 @@ impl Tree {
         // move.
         let initial_runtime = config.initial_runtime_config.clone();
         let sync_mode = config.sync_mode;
+        // Same reason: read before the move.
+        let compaction_rate_limit = config.compaction_rate_limit;
         let super_versions = SuperVersions::new(
             version,
             &comparator,
@@ -5055,6 +5057,9 @@ impl Tree {
             #[cfg(feature = "std")]
             background_deleter: Arc::clone(&background_deleter),
             heal_hints: Arc::clone(&heal_hints),
+            compaction_rate_limiter: Arc::new(crate::rate_limiter::RateLimiter::new(
+                compaction_rate_limit,
+            )),
             kv_digest_at_insert: portable_atomic::AtomicU8::new(inner::kv_digest_at_insert_gate(
                 &initial_runtime,
             )),

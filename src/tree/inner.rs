@@ -188,6 +188,19 @@ pub struct TreeInner {
     /// the read path can record without a back-reference to the tree.
     pub(crate) heal_hints: Arc<crate::heal_hints::HealHints>,
 
+    /// The tree's compaction I/O budget, built once from
+    /// [`Config::compaction_rate_limit`](crate::Config::compaction_rate_limit)
+    /// and shared by every compaction this tree runs.
+    ///
+    /// It lives here, rather than being built per invocation, because the
+    /// configured figure is bytes per second for the TREE: a bucket per
+    /// compaction would multiply the rate by however many run at once (a
+    /// regular compaction takes only `major_compaction_lock.read()`, so
+    /// several do), and would hand out the constructor's one-second burst
+    /// again on every invocation — a burst the bucket is meant to earn by
+    /// idling.
+    pub(crate) compaction_rate_limiter: Arc<crate::rate_limiter::RateLimiter>,
+
     /// Runtime-toggleable configuration. Lockless atomic snapshot.
     ///
     /// Reachable through the public Tree API
@@ -299,6 +312,8 @@ impl TreeInner {
 
         let comparator = config.comparator.clone();
         let sync_mode = config.sync_mode;
+        // Read before `config` is moved into the Arc below.
+        let config_rate_limit = config.compaction_rate_limit;
 
         // The first persist above wrote the full snapshot `v{version.id()}` and
         // pointed CURRENT at it, so that id is the initial manifest snapshot.
@@ -332,6 +347,9 @@ impl TreeInner {
             #[cfg(feature = "std")]
             background_deleter: Arc::new(crate::BackgroundDeleter::new(None)),
             heal_hints: crate::heal_hints::HealHints::new_shared(initial_runtime.auto_heal),
+            compaction_rate_limiter: Arc::new(crate::rate_limiter::RateLimiter::new(
+                config_rate_limit,
+            )),
             kv_digest_at_insert: portable_atomic::AtomicU8::new(kv_digest_at_insert_gate(
                 &initial_runtime,
             )),

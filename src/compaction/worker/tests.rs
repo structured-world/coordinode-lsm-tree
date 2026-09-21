@@ -4172,3 +4172,196 @@ fn a_second_compaction_does_not_re_earn_the_burst() -> crate::Result<()> {
 
     Ok(())
 }
+
+/// What the budget bounds is work ADMITTED after waiting, not bytes debited —
+/// a debit lands immediately and can drive the bucket into debt, so counting
+/// debits would report work the limiter is in fact still holding back. Over an
+/// interval the admitted total stays within `burst + rate × elapsed`, the
+/// burst being the head start the constructor deliberately grants.
+#[test]
+fn admitted_work_stays_within_the_burst_plus_the_rate() -> crate::Result<()> {
+    use core::time::Duration;
+
+    let dir = tempfile::tempdir()?;
+    let rate: u64 = 1_024 * 1_024;
+    let tree = match Config::new(
+        dir.path(),
+        SequenceNumberCounter::default(),
+        SequenceNumberCounter::default(),
+    )
+    .compaction_rate_limit(rate)
+    .open()?
+    {
+        crate::AnyTree::Standard(t) => t,
+        crate::AnyTree::Blob(_) => panic!("expected Standard tree"),
+    };
+
+    let chunk = 64 * 1_024u64;
+    let mut now = Duration::ZERO;
+    let mut admitted = 0u64;
+
+    // Ten compactions in sequence, each asking for a few chunks. The clock
+    // only advances by what the limiter made the caller wait, so nothing but
+    // the limiter's own pacing bounds the total.
+    for _ in 0..10 {
+        let opts = super::Options::from_tree(
+            &tree,
+            Arc::new(crate::compaction::major::Strategy::new(64 * 1024 * 1024)),
+        );
+        for _ in 0..4 {
+            let wait = opts.rate_limiter.acquire_wait(chunk, now);
+            now += wait;
+            admitted += chunk;
+        }
+    }
+
+    let ceiling =
+        rate + rate * now.as_secs() + rate * u64::from(now.subsec_nanos()) / 1_000_000_000;
+    assert!(
+        admitted <= ceiling,
+        "admitted {admitted} B over {now:?} exceeds burst + rate × elapsed = \
+         {ceiling} B",
+    );
+    // And the pacing is real: 2.5 MiB at 1 MiB/s cannot have been instant.
+    assert!(
+        !now.is_zero(),
+        "asking for more than the burst must have forced a wait",
+    );
+
+    Ok(())
+}
+
+/// A blob tree runs its compactions through its index tree, so it draws on
+/// that tree's budget — not on one of its own, and not on a fresh one each
+/// time.
+#[test]
+fn a_blob_tree_shares_the_index_trees_budget() -> crate::Result<()> {
+    use core::time::Duration;
+
+    let dir = tempfile::tempdir()?;
+    let rate = 1_024 * 1_024;
+    let tree = match Config::new(
+        dir.path(),
+        SequenceNumberCounter::default(),
+        SequenceNumberCounter::default(),
+    )
+    .compaction_rate_limit(rate)
+    .with_kv_separation(Some(KvSeparationOptions::default()))
+    .open()?
+    {
+        crate::AnyTree::Blob(t) => t,
+        crate::AnyTree::Standard(_) => panic!("expected Blob tree"),
+    };
+
+    let strategy: Arc<dyn CompactionStrategy> =
+        Arc::new(crate::compaction::major::Strategy::new(64 * 1024 * 1024));
+    let first = super::Options::from_tree(&tree.index, Arc::clone(&strategy));
+    assert!(
+        !first
+            .rate_limiter
+            .acquire_wait(rate * 4, Duration::ZERO)
+            .is_zero(),
+    );
+
+    let second = super::Options::from_tree(&tree.index, strategy);
+    assert!(
+        !second
+            .rate_limiter
+            .acquire_wait(1, Duration::ZERO)
+            .is_zero(),
+        "the blob tree's compactions run through the index tree, so they meet \
+         the debt an earlier one left",
+    );
+
+    Ok(())
+}
+
+/// The unthrottled default must stay free: at a limit of `0` every request is
+/// admitted immediately, however much is asked for and whenever it is asked.
+#[test]
+fn an_unlimited_tree_never_makes_a_compaction_wait() -> crate::Result<()> {
+    use core::time::Duration;
+
+    let dir = tempfile::tempdir()?;
+    let tree = match Config::new(
+        dir.path(),
+        SequenceNumberCounter::default(),
+        SequenceNumberCounter::default(),
+    )
+    .open()?
+    {
+        crate::AnyTree::Standard(t) => t,
+        crate::AnyTree::Blob(_) => panic!("expected Standard tree"),
+    };
+    assert_eq!(
+        tree.config.compaction_rate_limit, 0,
+        "0 is the default, and this test is about that default",
+    );
+
+    let opts = super::Options::from_tree(
+        &tree,
+        Arc::new(crate::compaction::major::Strategy::new(64 * 1024 * 1024)),
+    );
+    for bytes in [1u64, 1 << 20, u64::MAX] {
+        assert!(
+            opts.rate_limiter
+                .acquire_wait(bytes, Duration::ZERO)
+                .is_zero(),
+            "an unlimited tree must admit {bytes} B immediately",
+        );
+    }
+    // Still immediate after the bucket would otherwise be deep in debt.
+    assert!(
+        opts.rate_limiter
+            .acquire_wait(u64::MAX, Duration::from_secs(1))
+            .is_zero(),
+    );
+
+    Ok(())
+}
+
+/// The budget is a live-process figure, not durable state: a reopened tree
+/// starts fresh. Pinning it keeps a later change from quietly persisting debt
+/// across restarts without saying so.
+#[test]
+fn a_reopened_tree_starts_with_a_fresh_budget() -> crate::Result<()> {
+    use core::time::Duration;
+
+    let dir = tempfile::tempdir()?;
+    let rate = 1_024 * 1_024;
+    let open = || -> crate::Result<crate::Tree> {
+        match Config::new(
+            dir.path(),
+            SequenceNumberCounter::default(),
+            SequenceNumberCounter::default(),
+        )
+        .compaction_rate_limit(rate)
+        .open()?
+        {
+            crate::AnyTree::Standard(t) => Ok(t),
+            crate::AnyTree::Blob(_) => panic!("expected Standard tree"),
+        }
+    };
+    let strategy: Arc<dyn CompactionStrategy> =
+        Arc::new(crate::compaction::major::Strategy::new(64 * 1024 * 1024));
+
+    {
+        let tree = open()?;
+        let opts = super::Options::from_tree(&tree, Arc::clone(&strategy));
+        assert!(
+            !opts
+                .rate_limiter
+                .acquire_wait(rate * 4, Duration::ZERO)
+                .is_zero(),
+        );
+    }
+
+    let tree = open()?;
+    let opts = super::Options::from_tree(&tree, strategy);
+    assert!(
+        opts.rate_limiter.acquire_wait(1, Duration::ZERO).is_zero(),
+        "a new process gets a new bucket; the debt does not outlive the tree",
+    );
+
+    Ok(())
+}
