@@ -4076,3 +4076,99 @@ fn a_move_beneath_an_older_overlapping_table_does_not_stale_the_read() -> crate:
 
     Ok(())
 }
+
+/// `compaction_rate_limit` is bytes per second for the TREE. Every compaction
+/// draws on one bucket, so what an earlier one spent is still spent when the
+/// next one asks: a fresh bucket per invocation would multiply the configured
+/// rate by however many compactions run, and a regular compaction takes only a
+/// read lock, so several do run at once.
+#[test]
+fn compactions_of_one_tree_draw_on_one_budget() -> crate::Result<()> {
+    use core::time::Duration;
+
+    let dir = tempfile::tempdir()?;
+    let rate = 1_024 * 1_024; // 1 MiB/s, so the burst ceiling is 1 MiB
+    let tree = match Config::new(
+        dir.path(),
+        SequenceNumberCounter::default(),
+        SequenceNumberCounter::default(),
+    )
+    .compaction_rate_limit(rate)
+    .open()?
+    {
+        crate::AnyTree::Standard(t) => t,
+        crate::AnyTree::Blob(_) => panic!("expected Standard tree"),
+    };
+
+    let strategy: Arc<dyn CompactionStrategy> =
+        Arc::new(crate::compaction::major::Strategy::new(64 * 1024 * 1024));
+
+    // One compaction spends the whole bucket and then some: the debit lands
+    // immediately and drives it into debt.
+    let first = super::Options::from_tree(&tree, Arc::clone(&strategy));
+    let owed = first.rate_limiter.acquire_wait(rate * 4, Duration::ZERO);
+    assert!(
+        !owed.is_zero(),
+        "spending four seconds of budget at once must leave a debt to wait out",
+    );
+
+    // A second compaction, at the same instant, must meet that debt.
+    let second = super::Options::from_tree(&tree, strategy);
+    let next = second.rate_limiter.acquire_wait(1, Duration::ZERO);
+    assert!(
+        !next.is_zero(),
+        "the budget the first compaction spent is still spent: a second \
+         compaction starting at the same instant must wait, not find a full \
+         bucket (waited {next:?})",
+    );
+
+    Ok(())
+}
+
+/// The one-second burst the constructor seeds is meant to be earned by idling,
+/// not handed out afresh to every compaction. A tree that runs many short
+/// compactions back to back must not collect a new burst each time.
+#[test]
+fn a_second_compaction_does_not_re_earn_the_burst() -> crate::Result<()> {
+    use core::time::Duration;
+
+    let dir = tempfile::tempdir()?;
+    let rate = 1_024 * 1_024;
+    let tree = match Config::new(
+        dir.path(),
+        SequenceNumberCounter::default(),
+        SequenceNumberCounter::default(),
+    )
+    .compaction_rate_limit(rate)
+    .open()?
+    {
+        crate::AnyTree::Standard(t) => t,
+        crate::AnyTree::Blob(_) => panic!("expected Standard tree"),
+    };
+
+    let strategy: Arc<dyn CompactionStrategy> =
+        Arc::new(crate::compaction::major::Strategy::new(64 * 1024 * 1024));
+
+    // Drain exactly the burst, at t = 0. Nothing has to be waited out yet.
+    let first = super::Options::from_tree(&tree, Arc::clone(&strategy));
+    assert!(
+        first
+            .rate_limiter
+            .acquire_wait(rate, Duration::ZERO)
+            .is_zero(),
+        "the seeded burst covers the first second of work",
+    );
+
+    // Still t = 0, so nothing has refilled. A fresh bucket here would hand out
+    // the same burst again and let the tree issue 2 MiB in an instant.
+    let second = super::Options::from_tree(&tree, strategy);
+    let after = second.rate_limiter.acquire_wait(rate, Duration::ZERO);
+    assert!(
+        !after.is_zero(),
+        "the burst is earned by idling, not granted per compaction: a second \
+         compaction at the same instant must wait for the refill (waited \
+         {after:?})",
+    );
+
+    Ok(())
+}
