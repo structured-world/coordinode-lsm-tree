@@ -1,5 +1,5 @@
 use super::*;
-use crate::fs::MemFs;
+use crate::fs::{MemFs, StdFs};
 use crate::io::ErrorKind;
 use std::io::{Read, Seek, SeekFrom, Write};
 use test_log::test;
@@ -371,6 +371,75 @@ fn path_filtered_rule_never_matches_a_pathless_op() {
     // No path filter matches a path-less op.
     let any = FaultRule::new(FaultOp::Write, Fault::Error(ErrorKind::Other));
     assert!(any.matches(FaultOp::Write, None));
+}
+
+#[test]
+fn an_armed_reflink_rule_refuses_the_clone_and_an_unarmed_one_delegates() {
+    // A checkpoint prefers a reflink clone where the filesystem offers one, so
+    // a test that wants to fail the placement of a file has to be able to fail
+    // that path too — otherwise the injection silently does nothing on a
+    // copy-on-write filesystem and the test passes for the wrong reason.
+    // Over a REAL backend with a real source file, so the unarmed case is
+    // decided by the filesystem's own answer rather than by an error a
+    // non-existent path would have produced anyway.
+    let dir = tempfile::tempdir().expect("tempdir");
+    let src = dir.path().join("src");
+    std::fs::write(&src, b"payload").expect("write source");
+
+    // Unarmed: the wrapper's verdict must equal the bare backend's on an
+    // equivalent call, whatever that verdict is on this host.
+    let bare = StdFs.reflink_file(&src, &dir.path().join("bare-dst"));
+    let fs = FaultFs::new(StdFs);
+    let wrapped = fs.reflink_file(&src, &dir.path().join("wrapped-dst"));
+    assert_eq!(
+        bare.is_ok(),
+        wrapped.is_ok(),
+        "an unarmed wrapper must pass the call through, not decide it: bare \
+         {bare:?} vs wrapped {wrapped:?}",
+    );
+
+    fs.injector().arm(FaultRule::new(
+        FaultOp::Reflink,
+        Fault::Error(ErrorKind::PermissionDenied),
+    ));
+    let armed = fs
+        .reflink_file(&src, &dir.path().join("armed-dst"))
+        .expect_err("an armed FaultOp::Reflink must refuse the clone");
+    assert_eq!(armed.kind(), ErrorKind::PermissionDenied);
+}
+
+#[test]
+fn a_reflink_rule_matches_the_destination_path() {
+    // The rule is matched against the DESTINATION, the file the clone would
+    // create — matching the source would fire on the wrong file when a
+    // checkpoint places one table and skips another.
+    let dir = tempfile::tempdir().expect("tempdir");
+    let matching_src = dir.path().join("wanted-src");
+    let plain_src = dir.path().join("src");
+    std::fs::write(&matching_src, b"payload").expect("write source");
+    std::fs::write(&plain_src, b"payload").expect("write source");
+
+    let fs = FaultFs::new(StdFs);
+    fs.injector().arm(
+        FaultRule::new(FaultOp::Reflink, Fault::Error(ErrorKind::PermissionDenied))
+            .on_path("wanted-dst"),
+    );
+
+    // The SOURCE matches the filter and the destination does not: the call must
+    // reach the backend, so its outcome equals the bare backend's.
+    let bare = StdFs.reflink_file(&matching_src, &dir.path().join("bare-other"));
+    let elsewhere = fs.reflink_file(&matching_src, &dir.path().join("other"));
+    assert_eq!(
+        bare.is_ok(),
+        elsewhere.is_ok(),
+        "a destination outside the filter must not fire the rule, even when \
+         the SOURCE matches it: bare {bare:?} vs wrapped {elsewhere:?}",
+    );
+
+    let matched = fs
+        .reflink_file(&plain_src, &dir.path().join("wanted-dst"))
+        .expect_err("the armed rule fires on the matching destination");
+    assert_eq!(matched.kind(), ErrorKind::PermissionDenied);
 }
 
 #[test]

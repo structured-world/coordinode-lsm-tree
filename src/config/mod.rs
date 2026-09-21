@@ -1111,6 +1111,18 @@ impl Config {
 mod tests;
 
 impl Config {
+    /// The [`level_routes`](Self::level_routes) entry covering `level`, if any.
+    ///
+    /// The single place the level→route lookup lives, so the path a level's
+    /// tables are written to and the backend its reads are submitted to cannot
+    /// disagree about which route covers it.
+    fn route_for_level(&self, level: u8) -> Option<&LevelRoute> {
+        self.level_routes
+            .as_ref()?
+            .iter()
+            .find(|route| route.levels.contains(&level))
+    }
+
     /// Returns the tables folder path and [`Fs`] backend for the given level.
     ///
     /// If [`level_routes`](Self::level_routes) has an entry covering this
@@ -1118,14 +1130,10 @@ impl Config {
     /// primary [`path`](Self::path) and [`fs`](Self::fs).
     #[must_use]
     pub fn tables_folder_for_level(&self, level: u8) -> (PathBuf, Arc<dyn Fs>) {
-        if let Some(routes) = &self.level_routes {
-            for route in routes {
-                if route.levels.contains(&level) {
-                    return (route.path.join(TABLES_FOLDER), route.fs.clone());
-                }
-            }
+        match self.route_for_level(level) {
+            Some(route) => (route.path.join(TABLES_FOLDER), route.fs.clone()),
+            None => (self.path.join(TABLES_FOLDER), self.fs.clone()),
         }
-        (self.path.join(TABLES_FOLDER), self.fs.clone())
     }
 
     /// Best-effort minimum free space (bytes) across every filesystem this tree

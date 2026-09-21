@@ -744,7 +744,7 @@ fn read_blocks_batched_fallback_short_read_errors() -> io::Result<()> {
 }
 
 #[test]
-fn read_blocks_batched_falls_back_for_non_uring_file() -> io::Result<()> {
+fn read_blocks_batched_serves_a_mixed_batch_without_degrading_the_ring_group() -> io::Result<()> {
     let Some(fs) = try_io_uring() else {
         return Ok(());
     };
@@ -754,9 +754,12 @@ fn read_blocks_batched_falls_back_for_non_uring_file() -> io::Result<()> {
     let mut uring_file = fs.open(&dir.path().join("u.bin"), &opts)?;
     uring_file.write_all(&(0..=255u8).collect::<Vec<_>>())?;
     uring_file.sync_all()?;
+    // Wrapped so the test can see whether this request was submitted to the
+    // ring or read through the serial `read_at` fallback.
+    let counted = CountingFile::new(uring_file);
 
-    // A StdFs handle has no fd for the ring (backing_fd None), so mixing it into
-    // the batch forces the whole batch onto the serial read_at fallback.
+    // A StdFs handle has no fd for the ring (backing_fd None), so it cannot be
+    // submitted and is read serially — but only it.
     let std_fs = crate::fs::StdFs;
     let mut std_file = std_fs.open(&dir.path().join("s.bin"), &opts)?;
     let rev: Vec<u8> = (0..=255u8).rev().collect();
@@ -769,7 +772,7 @@ fn read_blocks_batched_falls_back_for_non_uring_file() -> io::Result<()> {
     {
         let mut reqs = vec![
             crate::fs::BlockRead {
-                file: uring_file.as_ref(),
+                file: &counted,
                 offset: 10,
                 buf: crate::fs::BlockBuf::new(&mut b0),
             },
@@ -783,7 +786,656 @@ fn read_blocks_batched_falls_back_for_non_uring_file() -> io::Result<()> {
     }
     assert_eq!(b0, [10, 11, 12, 13]);
     assert_eq!(b1, [rev[20], rev[21], rev[22], rev[23]]);
+    assert_eq!(
+        counted.read_at_calls(),
+        0,
+        "the descriptor-bearing request went to the ring; one handle without a \
+         descriptor must not drag the rest onto the serial path",
+    );
     Ok(())
+}
+
+/// The split must not reorder what each request reads: every destination holds
+/// the bytes ITS `(file, offset)` names, whichever group served it.
+#[test]
+fn read_blocks_batched_keeps_each_destination_with_its_own_request() -> io::Result<()> {
+    let Some(fs) = try_io_uring() else {
+        return Ok(());
+    };
+    let dir = tempfile::tempdir()?;
+    let opts = FsOpenOptions::new().write(true).create(true).read(true);
+
+    let mut uring_file = fs.open(&dir.path().join("u.bin"), &opts)?;
+    uring_file.write_all(&(0..=255u8).collect::<Vec<_>>())?;
+    uring_file.sync_all()?;
+
+    let std_fs = crate::fs::StdFs;
+    let mut std_file = std_fs.open(&dir.path().join("s.bin"), &opts)?;
+    let rev: Vec<u8> = (0..=255u8).rev().collect();
+    std_file.write_all(&rev)?;
+    std_file.sync_all()?;
+
+    // Interleaved, so a split that preserved only group-internal order would
+    // still be caught. Offsets stay within the 256-byte fixtures, and `u8`
+    // keeps the expected bytes derivable without a narrowing cast.
+    let mut bufs = [[0u8; 2]; 6];
+    let offsets: [u8; 6] = [0, 10, 20, 30, 40, 50];
+    {
+        let mut reqs: Vec<crate::fs::BlockRead<'_>> = Vec::new();
+        for (i, (buf, offset)) in bufs.iter_mut().zip(offsets).enumerate() {
+            reqs.push(crate::fs::BlockRead {
+                file: if i % 2 == 0 {
+                    uring_file.as_ref()
+                } else {
+                    std_file.as_ref()
+                },
+                offset: u64::from(offset),
+                buf: crate::fs::BlockBuf::new(&mut buf[..]),
+            });
+        }
+        fs.read_blocks_batched(&mut reqs)?;
+    }
+    for (i, (buf, offset)) in bufs.iter().zip(offsets).enumerate() {
+        let at = usize::from(offset);
+        // The uring fixture holds byte value == its offset; the std fixture
+        // holds the reverse.
+        let expected: [u8; 2] = if i % 2 == 0 {
+            [offset, offset + 1]
+        } else {
+            [rev[at], rev[at + 1]]
+        };
+        assert_eq!(*buf, expected, "request {i} was served the wrong bytes");
+    }
+    Ok(())
+}
+
+/// A batch where NOTHING can be submitted still reads correctly: the ring group
+/// is empty and every request takes the serial path.
+#[test]
+fn read_blocks_batched_with_no_submittable_request_reads_serially() -> io::Result<()> {
+    let Some(fs) = try_io_uring() else {
+        return Ok(());
+    };
+    let dir = tempfile::tempdir()?;
+    let opts = FsOpenOptions::new().write(true).create(true).read(true);
+
+    let std_fs = crate::fs::StdFs;
+    let mut std_file = std_fs.open(&dir.path().join("s.bin"), &opts)?;
+    std_file.write_all(&(0..=255u8).collect::<Vec<_>>())?;
+    std_file.sync_all()?;
+
+    let mut b0 = [0u8; 4];
+    let mut b1 = [0u8; 4];
+    {
+        let mut reqs = vec![
+            crate::fs::BlockRead {
+                file: std_file.as_ref(),
+                offset: 0,
+                buf: crate::fs::BlockBuf::new(&mut b0),
+            },
+            crate::fs::BlockRead {
+                file: std_file.as_ref(),
+                offset: 100,
+                buf: crate::fs::BlockBuf::new(&mut b1),
+            },
+        ];
+        fs.read_blocks_batched(&mut reqs)?;
+    }
+    assert_eq!(b0, [0, 1, 2, 3]);
+    assert_eq!(b1, [100, 101, 102, 103]);
+    Ok(())
+}
+
+/// A short read in the SERIAL half of a mixed batch is still the documented
+/// `UnexpectedEof`, and the ring half is still filled — the split must not turn
+/// one group's failure into silence about the other.
+#[test]
+fn read_blocks_batched_reports_a_short_serial_read_in_a_mixed_batch() -> io::Result<()> {
+    let Some(fs) = try_io_uring() else {
+        return Ok(());
+    };
+    let dir = tempfile::tempdir()?;
+    let opts = FsOpenOptions::new().write(true).create(true).read(true);
+
+    let mut uring_file = fs.open(&dir.path().join("u.bin"), &opts)?;
+    uring_file.write_all(&(0..=255u8).collect::<Vec<_>>())?;
+    uring_file.sync_all()?;
+
+    let std_fs = crate::fs::StdFs;
+    let mut std_file = std_fs.open(&dir.path().join("s.bin"), &opts)?;
+    std_file.write_all(&[1, 2, 3, 4])?;
+    std_file.sync_all()?;
+
+    let mut b0 = [0u8; 4];
+    let mut b1 = [0u8; 8]; // past EOF of the 4-byte file
+    let err = {
+        let mut reqs = vec![
+            crate::fs::BlockRead {
+                file: uring_file.as_ref(),
+                offset: 10,
+                buf: crate::fs::BlockBuf::new(&mut b0),
+            },
+            crate::fs::BlockRead {
+                file: std_file.as_ref(),
+                offset: 0,
+                buf: crate::fs::BlockBuf::new(&mut b1),
+            },
+        ];
+        fs.read_blocks_batched(&mut reqs)
+            .expect_err("a short read on a fixed-size block is an error")
+    };
+    assert_eq!(err.kind(), crate::io::ErrorKind::UnexpectedEof, "{err}");
+    assert_eq!(b0, [10, 11, 12, 13], "the ring group was served first");
+    Ok(())
+}
+
+/// A short read in the RING half of a mixed batch fails the whole call, and
+/// the serial half is left unread: the ring group is submitted first and its
+/// failure is surfaced before anything else runs.
+#[test]
+fn read_blocks_batched_reports_a_short_ring_read_in_a_mixed_batch() -> io::Result<()> {
+    let Some(fs) = try_io_uring() else {
+        return Ok(());
+    };
+    let dir = tempfile::tempdir()?;
+    let opts = FsOpenOptions::new().write(true).create(true).read(true);
+
+    let mut uring_file = fs.open(&dir.path().join("u.bin"), &opts)?;
+    uring_file.write_all(&[1, 2, 3, 4])?;
+    uring_file.sync_all()?;
+
+    let std_fs = crate::fs::StdFs;
+    let mut std_file = std_fs.open(&dir.path().join("s.bin"), &opts)?;
+    std_file.write_all(&(0..=255u8).collect::<Vec<_>>())?;
+    std_file.sync_all()?;
+
+    let mut b0 = [0u8; 8]; // past EOF of the 4-byte uring file
+    let mut b1 = [0u8; 4];
+    let err = {
+        let mut reqs = vec![
+            crate::fs::BlockRead {
+                file: uring_file.as_ref(),
+                offset: 0,
+                buf: crate::fs::BlockBuf::new(&mut b0),
+            },
+            crate::fs::BlockRead {
+                file: std_file.as_ref(),
+                offset: 10,
+                buf: crate::fs::BlockBuf::new(&mut b1),
+            },
+        ];
+        fs.read_blocks_batched(&mut reqs)
+            .expect_err("a short read on a fixed-size block is an error")
+    };
+    assert_eq!(err.kind(), crate::io::ErrorKind::UnexpectedEof, "{err}");
+    Ok(())
+}
+
+/// A destination that arrives partly filled owns the block's first bytes
+/// already, so the read covers the suffix from `offset + filled` — on both
+/// sides of the split.
+#[test]
+fn read_blocks_batched_resumes_partly_filled_destinations_in_a_mixed_batch() -> io::Result<()> {
+    let Some(fs) = try_io_uring() else {
+        return Ok(());
+    };
+    let dir = tempfile::tempdir()?;
+    let opts = FsOpenOptions::new().write(true).create(true).read(true);
+
+    let mut uring_file = fs.open(&dir.path().join("u.bin"), &opts)?;
+    uring_file.write_all(&(0..=255u8).collect::<Vec<_>>())?;
+    uring_file.sync_all()?;
+
+    let std_fs = crate::fs::StdFs;
+    let mut std_file = std_fs.open(&dir.path().join("s.bin"), &opts)?;
+    let rev: Vec<u8> = (0..=255u8).rev().collect();
+    std_file.write_all(&rev)?;
+    std_file.sync_all()?;
+
+    let mut b0 = [0u8; 4];
+    let mut b1 = [0u8; 4];
+    {
+        let mut buf0 = crate::fs::BlockBuf::new(&mut b0);
+        let mut buf1 = crate::fs::BlockBuf::new(&mut b1);
+        // Two bytes of each block are already owned by the caller.
+        assert_eq!(buf0.append(&[0xAA, 0xBB]), 2);
+        assert_eq!(buf1.append(&[0xCC, 0xDD]), 2);
+        let mut reqs = vec![
+            crate::fs::BlockRead {
+                file: uring_file.as_ref(),
+                offset: 10,
+                buf: buf0,
+            },
+            crate::fs::BlockRead {
+                file: std_file.as_ref(),
+                offset: 20,
+                buf: buf1,
+            },
+        ];
+        fs.read_blocks_batched(&mut reqs)?;
+        assert!(reqs.iter().all(|r| r.buf.is_full()));
+    }
+    // The suffix starts two bytes into each block, and the prefix is untouched.
+    assert_eq!(b0, [0xAA, 0xBB, 12, 13]);
+    assert_eq!(b1, [0xCC, 0xDD, rev[22], rev[23]]);
+    Ok(())
+}
+
+/// An empty request is a no-op wherever it lands, including in the middle of a
+/// split batch: the ring skips it and the serial loop reads nothing for it.
+#[test]
+fn read_blocks_batched_tolerates_an_empty_request_in_a_mixed_batch() -> io::Result<()> {
+    let Some(fs) = try_io_uring() else {
+        return Ok(());
+    };
+    let dir = tempfile::tempdir()?;
+    let opts = FsOpenOptions::new().write(true).create(true).read(true);
+
+    let mut uring_file = fs.open(&dir.path().join("u.bin"), &opts)?;
+    uring_file.write_all(&(0..=255u8).collect::<Vec<_>>())?;
+    uring_file.sync_all()?;
+
+    let std_fs = crate::fs::StdFs;
+    let mut std_file = std_fs.open(&dir.path().join("s.bin"), &opts)?;
+    let rev: Vec<u8> = (0..=255u8).rev().collect();
+    std_file.write_all(&rev)?;
+    std_file.sync_all()?;
+
+    let mut empty_uring: [u8; 0] = [];
+    let mut empty_std: [u8; 0] = [];
+    let mut b0 = [0u8; 4];
+    let mut b1 = [0u8; 4];
+    {
+        let mut reqs = vec![
+            crate::fs::BlockRead {
+                file: uring_file.as_ref(),
+                offset: 0,
+                buf: crate::fs::BlockBuf::new(&mut empty_uring),
+            },
+            crate::fs::BlockRead {
+                file: uring_file.as_ref(),
+                offset: 10,
+                buf: crate::fs::BlockBuf::new(&mut b0),
+            },
+            crate::fs::BlockRead {
+                file: std_file.as_ref(),
+                offset: 0,
+                buf: crate::fs::BlockBuf::new(&mut empty_std),
+            },
+            crate::fs::BlockRead {
+                file: std_file.as_ref(),
+                offset: 20,
+                buf: crate::fs::BlockBuf::new(&mut b1),
+            },
+        ];
+        fs.read_blocks_batched(&mut reqs)?;
+        assert!(
+            reqs.iter().all(|r| r.buf.is_full()),
+            "an empty destination is trivially full, and the rest were filled",
+        );
+    }
+    assert_eq!(b0, [10, 11, 12, 13]);
+    assert_eq!(b1, [rev[20], rev[21], rev[22], rev[23]]);
+    Ok(())
+}
+
+/// When BOTH halves of a split batch fail, the error returned is the one whose
+/// request came first in the CALLER's order — the contract is the first failing
+/// block, and splitting must not re-order which failure wins. The serial
+/// request is placed first here, so its error has to beat the ring's.
+#[test]
+fn read_blocks_batched_reports_the_earliest_failure_when_both_halves_fail() -> io::Result<()> {
+    let Some(fs) = try_io_uring() else {
+        return Ok(());
+    };
+    let dir = tempfile::tempdir()?;
+    let opts = FsOpenOptions::new().write(true).create(true).read(true);
+
+    // Both files are 4 bytes, so both requests below read past EOF.
+    let mut uring_file = fs.open(&dir.path().join("u.bin"), &opts)?;
+    uring_file.write_all(&[1, 2, 3, 4])?;
+    uring_file.sync_all()?;
+    let std_fs = crate::fs::StdFs;
+    let mut std_file = std_fs.open(&dir.path().join("s.bin"), &opts)?;
+    std_file.write_all(&[1, 2, 3, 4])?;
+    std_file.sync_all()?;
+
+    let mut b0 = [0u8; 8];
+    let mut b1 = [0u8; 8];
+    let err = {
+        let mut serial_first = crate::fs::BlockBuf::new(&mut b0);
+        // An overflowing resume offset, which is `InvalidInput` — distinct from
+        // the ring half's `UnexpectedEof`, so the verdict says which one won.
+        assert_eq!(serial_first.append(&[0xAA, 0xBB]), 2);
+        let mut reqs = vec![
+            crate::fs::BlockRead {
+                file: std_file.as_ref(),
+                offset: u64::MAX - 1,
+                buf: serial_first,
+            },
+            crate::fs::BlockRead {
+                file: uring_file.as_ref(),
+                offset: 0,
+                buf: crate::fs::BlockBuf::new(&mut b1),
+            },
+        ];
+        fs.read_blocks_batched(&mut reqs)
+            .expect_err("both halves fail, so the call fails")
+    };
+    assert_eq!(
+        err.kind(),
+        crate::io::ErrorKind::InvalidInput,
+        "the request at index 0 is the serial one, so its error wins: {err}",
+    );
+    Ok(())
+}
+
+/// The mirror of the case above: when the RING half holds the earlier request,
+/// its error is the one reported.
+#[test]
+fn read_blocks_batched_prefers_the_ring_failure_when_it_came_first() -> io::Result<()> {
+    let Some(fs) = try_io_uring() else {
+        return Ok(());
+    };
+    let dir = tempfile::tempdir()?;
+    let opts = FsOpenOptions::new().write(true).create(true).read(true);
+
+    let mut uring_file = fs.open(&dir.path().join("u.bin"), &opts)?;
+    uring_file.write_all(&[1, 2, 3, 4])?;
+    uring_file.sync_all()?;
+    let std_fs = crate::fs::StdFs;
+    let mut std_file = std_fs.open(&dir.path().join("s.bin"), &opts)?;
+    std_file.write_all(&[1, 2, 3, 4])?;
+    std_file.sync_all()?;
+
+    let mut b0 = [0u8; 8];
+    let mut b1 = [0u8; 8];
+    let err = {
+        let mut serial_second = crate::fs::BlockBuf::new(&mut b1);
+        assert_eq!(serial_second.append(&[0xAA, 0xBB]), 2);
+        let mut reqs = vec![
+            crate::fs::BlockRead {
+                file: uring_file.as_ref(),
+                offset: 0,
+                buf: crate::fs::BlockBuf::new(&mut b0),
+            },
+            crate::fs::BlockRead {
+                file: std_file.as_ref(),
+                offset: u64::MAX - 1,
+                buf: serial_second,
+            },
+        ];
+        fs.read_blocks_batched(&mut reqs)
+            .expect_err("both halves fail, so the call fails")
+    };
+    assert_eq!(
+        err.kind(),
+        crate::io::ErrorKind::UnexpectedEof,
+        "the request at index 0 is the ring one, so its short read wins: {err}",
+    );
+    Ok(())
+}
+
+/// The resume-offset overflow guard covers the RING half too: a submittable
+/// request whose partly filled destination would push its offset past `u64`
+/// is refused before anything is submitted, not wrapped around into a read of
+/// some other part of the file.
+#[test]
+fn read_blocks_batched_rejects_an_overflowing_resume_offset_on_the_ring_side() -> io::Result<()> {
+    let Some(fs) = try_io_uring() else {
+        return Ok(());
+    };
+    let dir = tempfile::tempdir()?;
+    let opts = FsOpenOptions::new().write(true).create(true).read(true);
+
+    let mut uring_file = fs.open(&dir.path().join("u.bin"), &opts)?;
+    uring_file.write_all(&(0..=255u8).collect::<Vec<_>>())?;
+    uring_file.sync_all()?;
+
+    let mut buf = [0u8; 4];
+    let err = {
+        let mut dst = crate::fs::BlockBuf::new(&mut buf);
+        assert_eq!(dst.append(&[0xAA, 0xBB]), 2);
+        let mut reqs = vec![crate::fs::BlockRead {
+            file: uring_file.as_ref(),
+            offset: u64::MAX - 1,
+            buf: dst,
+        }];
+        fs.read_blocks_batched(&mut reqs)
+            .expect_err("an overflowing resume offset must be refused")
+    };
+    assert_eq!(err.kind(), crate::io::ErrorKind::InvalidInput, "{err}");
+    Ok(())
+}
+
+/// A serial read that FAILS outright (as opposed to coming up short) is
+/// reported as itself: the backend's own error, not a substitute.
+#[test]
+fn read_blocks_batched_surfaces_a_serial_read_error_verbatim() -> io::Result<()> {
+    let Some(fs) = try_io_uring() else {
+        return Ok(());
+    };
+    let dir = tempfile::tempdir()?;
+    let opts = FsOpenOptions::new().write(true).create(true).read(true);
+
+    let mut uring_file = fs.open(&dir.path().join("u.bin"), &opts)?;
+    uring_file.write_all(&(0..=255u8).collect::<Vec<_>>())?;
+    uring_file.sync_all()?;
+
+    // A descriptor-less handle whose reads are made to fail.
+    let faulty = crate::fs::FaultFs::new(crate::fs::StdFs);
+    let mut std_file = faulty.open(&dir.path().join("s.bin"), &opts)?;
+    std_file.write_all(&(0..=255u8).collect::<Vec<_>>())?;
+    std_file.sync_all()?;
+    assert_eq!(std_file.backing_fd(), None);
+    faulty.injector().arm(crate::fs::FaultRule::new(
+        crate::fs::FaultOp::ReadAt,
+        crate::fs::Fault::Error(crate::io::ErrorKind::PermissionDenied),
+    ));
+
+    let mut b0 = [0u8; 4];
+    let mut b1 = [0u8; 4];
+    let err = {
+        let mut reqs = vec![
+            crate::fs::BlockRead {
+                file: uring_file.as_ref(),
+                offset: 10,
+                buf: crate::fs::BlockBuf::new(&mut b0),
+            },
+            crate::fs::BlockRead {
+                file: std_file.as_ref(),
+                offset: 20,
+                buf: crate::fs::BlockBuf::new(&mut b1),
+            },
+        ];
+        fs.read_blocks_batched(&mut reqs)
+            .expect_err("the serial half's read fails")
+    };
+    assert_eq!(
+        err.kind(),
+        crate::io::ErrorKind::PermissionDenied,
+        "the backend's own error is what the caller sees: {err}",
+    );
+    assert_eq!(b0, [10, 11, 12, 13], "the ring half still ran");
+    Ok(())
+}
+
+/// A ring request that SUCCEEDS must not lend its index to a later one that
+/// fails. With a good ring read at 0, a failing serial read at 1 and a failing
+/// ring read at 2, the winner is the serial failure at index 1 — attributing
+/// the ring's failure to the group's first request would wrongly report index 0
+/// and hand back the wrong error.
+#[test]
+fn read_blocks_batched_blames_the_ring_request_that_failed_not_its_group() -> io::Result<()> {
+    let Some(fs) = try_io_uring() else {
+        return Ok(());
+    };
+    let dir = tempfile::tempdir()?;
+    let opts = FsOpenOptions::new().write(true).create(true).read(true);
+
+    let mut uring_file = fs.open(&dir.path().join("u.bin"), &opts)?;
+    uring_file.write_all(&(0..=255u8).collect::<Vec<_>>())?;
+    uring_file.sync_all()?;
+    let std_fs = crate::fs::StdFs;
+    let mut std_file = std_fs.open(&dir.path().join("s.bin"), &opts)?;
+    std_file.write_all(&[1, 2, 3, 4])?;
+    std_file.sync_all()?;
+
+    let mut good = [0u8; 4];
+    let mut serial_bad = [0u8; 4];
+    let mut ring_bad = [0u8; 8];
+    let err = {
+        let mut serial_buf = crate::fs::BlockBuf::new(&mut serial_bad);
+        // Overflowing resume offset → InvalidInput, at index 1.
+        assert_eq!(serial_buf.append(&[0xAA, 0xBB]), 2);
+        let mut reqs = vec![
+            crate::fs::BlockRead {
+                file: uring_file.as_ref(),
+                offset: 10,
+                buf: crate::fs::BlockBuf::new(&mut good),
+            },
+            crate::fs::BlockRead {
+                file: std_file.as_ref(),
+                offset: u64::MAX - 1,
+                buf: serial_buf,
+            },
+            crate::fs::BlockRead {
+                // Reads past the 256-byte fixture's end → UnexpectedEof, at 2.
+                file: uring_file.as_ref(),
+                offset: 252,
+                buf: crate::fs::BlockBuf::new(&mut ring_bad),
+            },
+        ];
+        fs.read_blocks_batched(&mut reqs)
+            .expect_err("two of the three requests fail")
+    };
+    assert_eq!(
+        err.kind(),
+        crate::io::ErrorKind::InvalidInput,
+        "index 1 fails before index 2, so the serial error wins: {err}",
+    );
+    Ok(())
+}
+
+/// An offset that would overflow while resuming a partly filled destination is
+/// rejected, not wrapped into a read somewhere else in the file. The check
+/// lives in the serial half of the split, so a mixed batch has to reach it.
+#[test]
+fn read_blocks_batched_rejects_an_overflowing_resume_offset() -> io::Result<()> {
+    let Some(fs) = try_io_uring() else {
+        return Ok(());
+    };
+    let dir = tempfile::tempdir()?;
+    let opts = FsOpenOptions::new().write(true).create(true).read(true);
+
+    let mut uring_file = fs.open(&dir.path().join("u.bin"), &opts)?;
+    uring_file.write_all(&(0..=255u8).collect::<Vec<_>>())?;
+    uring_file.sync_all()?;
+
+    let std_fs = crate::fs::StdFs;
+    let mut std_file = std_fs.open(&dir.path().join("s.bin"), &opts)?;
+    std_file.write_all(&(0..=255u8).collect::<Vec<_>>())?;
+    std_file.sync_all()?;
+
+    let mut b0 = [0u8; 4];
+    let mut b1 = [0u8; 4];
+    let err = {
+        let mut buf1 = crate::fs::BlockBuf::new(&mut b1);
+        // Two bytes already owned, so the resume offset is `u64::MAX - 1 + 2`.
+        assert_eq!(buf1.append(&[0xAA, 0xBB]), 2);
+        let mut reqs = vec![
+            crate::fs::BlockRead {
+                file: uring_file.as_ref(),
+                offset: 10,
+                buf: crate::fs::BlockBuf::new(&mut b0),
+            },
+            crate::fs::BlockRead {
+                file: std_file.as_ref(),
+                offset: u64::MAX - 1,
+                buf: buf1,
+            },
+        ];
+        fs.read_blocks_batched(&mut reqs)
+            .expect_err("an overflowing resume offset must be refused")
+    };
+    assert_eq!(err.kind(), crate::io::ErrorKind::InvalidInput, "{err}");
+    Ok(())
+}
+
+/// Wraps a file handle, passing its descriptor through so the ring still
+/// accepts it, and counts the serial `read_at` calls made against it. A count
+/// above zero says the request took the fallback path.
+struct CountingFile {
+    inner: Box<dyn crate::fs::FsFile>,
+    read_at_calls: std::sync::atomic::AtomicUsize,
+}
+
+impl CountingFile {
+    fn new(inner: Box<dyn crate::fs::FsFile>) -> Self {
+        Self {
+            inner,
+            read_at_calls: std::sync::atomic::AtomicUsize::new(0),
+        }
+    }
+
+    fn read_at_calls(&self) -> usize {
+        self.read_at_calls
+            .load(std::sync::atomic::Ordering::Relaxed)
+    }
+}
+
+impl io::Read for CountingFile {
+    fn read(&mut self, buf: &mut [u8]) -> io::Result<usize> {
+        self.inner.read(buf)
+    }
+}
+
+impl io::Write for CountingFile {
+    fn write(&mut self, buf: &[u8]) -> io::Result<usize> {
+        self.inner.write(buf)
+    }
+
+    fn flush(&mut self) -> io::Result<()> {
+        self.inner.flush()
+    }
+}
+
+impl io::Seek for CountingFile {
+    fn seek(&mut self, pos: io::SeekFrom) -> io::Result<u64> {
+        self.inner.seek(pos)
+    }
+}
+
+impl crate::fs::FsFile for CountingFile {
+    fn sync_all(&self) -> crate::io::Result<()> {
+        self.inner.sync_all()
+    }
+
+    fn sync_data(&self) -> crate::io::Result<()> {
+        self.inner.sync_data()
+    }
+
+    fn metadata(&self) -> crate::io::Result<crate::fs::FsMetadata> {
+        self.inner.metadata()
+    }
+
+    fn set_len(&self, size: u64) -> crate::io::Result<()> {
+        self.inner.set_len(size)
+    }
+
+    fn read_at(&self, buf: &mut [u8], offset: u64) -> crate::io::Result<usize> {
+        self.read_at_calls
+            .fetch_add(1, std::sync::atomic::Ordering::Relaxed);
+        self.inner.read_at(buf, offset)
+    }
+
+    fn backing_fd(&self) -> Option<i32> {
+        self.inner.backing_fd()
+    }
+
+    fn lock_exclusive(&self) -> crate::io::Result<()> {
+        self.inner.lock_exclusive()
+    }
 }
 
 #[test]
