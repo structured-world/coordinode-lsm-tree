@@ -1401,6 +1401,67 @@ fn a_routed_level_reads_through_its_own_backend_on_the_chunked_path() -> lsm_tre
     Ok(())
 }
 
+/// A read failure on the chunked path is surfaced, not swallowed. The prewarm
+/// is best-effort and hides its own failures behind the serial resolve; the
+/// chunked resolve is authoritative and must propagate. Asserting this also
+/// proves the chunked path is the one running — a swallowed error would mean
+/// the read had gone through the prewarm instead.
+#[test]
+fn a_read_failure_on_the_chunked_path_reaches_the_caller() -> lsm_tree::Result<()> {
+    let dir = tempfile::tempdir()?;
+    let injector = Arc::new(lsm_tree::fs::FaultInjector::new());
+    let routed_fs: Arc<dyn lsm_tree::fs::Fs> = Arc::new(lsm_tree::fs::FaultFs::with_injector(
+        StdFs,
+        Arc::clone(&injector),
+    ));
+
+    let config = || {
+        Config::new(
+            dir.path().join("primary"),
+            SequenceNumberCounter::default(),
+            SequenceNumberCounter::default(),
+        )
+        .use_cache(Arc::new(lsm_tree::Cache::with_capacity_bytes(8 * 1_024)))
+        .data_block_compression_policy(CompressionPolicy::all(lsm_tree::CompressionType::None))
+        .index_block_compression_policy(CompressionPolicy::all(lsm_tree::CompressionType::None))
+        .level_routes(vec![LevelRoute {
+            levels: 0..7,
+            path: dir.path().join("routed"),
+            fs: Arc::clone(&routed_fs),
+        }])
+    };
+
+    {
+        let tree = config().open()?;
+        for i in 0..2_000u32 {
+            tree.insert(format!("key{i:05}"), vec![b'v'; 64], u64::from(i));
+        }
+        tree.flush_active_memtable(0)?;
+    }
+
+    let tree = config().open()?;
+    // Armed only now, so opening the tree (which reads its metadata) is not
+    // what fails.
+    injector.arm(lsm_tree::fs::FaultRule::new(
+        lsm_tree::fs::FaultOp::ReadAt,
+        lsm_tree::fs::Fault::Error(lsm_tree::io::ErrorKind::PermissionDenied),
+    ));
+
+    let keys: Vec<String> = (0..64).map(|i| format!("key{:05}", i * 31)).collect();
+    let err = tree
+        .multi_get(&keys, lsm_tree::SeqNo::MAX)
+        .expect_err("a failing read on the authoritative path must surface");
+    assert!(
+        matches!(
+            &err,
+            lsm_tree::Error::Io(io_err)
+                if io_err.kind() == lsm_tree::io::ErrorKind::PermissionDenied,
+        ),
+        "expected the injected read failure, got {err:?}",
+    );
+    Ok(())
+}
+
 /// The other direction of the same rule: an unrouted tree must keep submitting
 /// to the primary. A per-level lookup that resolved wrongly in this direction
 /// would send reads to a backend the configuration never named.
