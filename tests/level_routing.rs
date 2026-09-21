@@ -1336,6 +1336,71 @@ fn a_routed_level_reads_through_its_own_backend() -> lsm_tree::Result<()> {
     Ok(())
 }
 
+/// The same rule on the OTHER read path. When a level's cold working set is
+/// too large to warm without thrashing the cache, the multi-get resolves it by
+/// reading blocks into a scratch instead — a second batched-read call site,
+/// which must resolve its backend the same way.
+#[test]
+fn a_routed_level_reads_through_its_own_backend_on_the_chunked_path() -> lsm_tree::Result<()> {
+    let dir = tempfile::tempdir()?;
+    let (primary_fs, primary_batched) = CountingFs::paired();
+    let (routed_fs, routed_batched) = CountingFs::paired();
+
+    let config = || {
+        Config::new(
+            dir.path().join("primary"),
+            SequenceNumberCounter::default(),
+            SequenceNumberCounter::default(),
+        )
+        .with_shared_fs(Arc::clone(&primary_fs))
+        // A cache far too small to hold the level's cold blocks, so the prewarm
+        // declines and the chunked read-into-scratch path runs instead.
+        .use_cache(Arc::new(lsm_tree::Cache::with_capacity_bytes(8 * 1_024)))
+        .data_block_compression_policy(CompressionPolicy::all(lsm_tree::CompressionType::None))
+        .index_block_compression_policy(CompressionPolicy::all(lsm_tree::CompressionType::None))
+        .level_routes(vec![LevelRoute {
+            levels: 0..7,
+            path: dir.path().join("routed"),
+            fs: Arc::clone(&routed_fs),
+        }])
+    };
+
+    {
+        let tree = config().open()?;
+        for i in 0..2_000u32 {
+            tree.insert(format!("key{i:05}"), vec![b'v'; 64], u64::from(i));
+        }
+        tree.flush_active_memtable(0)?;
+    }
+
+    let tree = config().open()?;
+    primary_batched.store(0, std::sync::atomic::Ordering::Relaxed);
+    routed_batched.store(0, std::sync::atomic::Ordering::Relaxed);
+
+    // Enough keys, spread widely enough, that their cold blocks exceed half the
+    // cache — the condition that sends the level down the chunked path.
+    let keys: Vec<String> = (0..64).map(|i| format!("key{:05}", i * 31)).collect();
+    let values = tree.multi_get(&keys, lsm_tree::SeqNo::MAX)?;
+    assert!(
+        values.iter().all(Option::is_some),
+        "every key was written, so every key must resolve",
+    );
+
+    let on_route = routed_batched.load(std::sync::atomic::Ordering::Relaxed);
+    let on_primary = primary_batched.load(std::sync::atomic::Ordering::Relaxed);
+    assert!(
+        on_route > 0,
+        "the chunked path reads the same routed tables and must submit to the \
+         route's backend (route saw {on_route}, primary saw {on_primary})",
+    );
+    assert_eq!(
+        on_primary, 0,
+        "the primary holds none of these tables (route saw {on_route}, primary \
+         saw {on_primary})",
+    );
+    Ok(())
+}
+
 /// The other direction of the same rule: an unrouted tree must keep submitting
 /// to the primary. A per-level lookup that resolved wrongly in this direction
 /// would send reads to a backend the configuration never named.

@@ -1076,6 +1076,51 @@ fn read_blocks_batched_tolerates_an_empty_request_in_a_mixed_batch() -> io::Resu
     Ok(())
 }
 
+/// An offset that would overflow while resuming a partly filled destination is
+/// rejected, not wrapped into a read somewhere else in the file. The check
+/// lives in the serial half of the split, so a mixed batch has to reach it.
+#[test]
+fn read_blocks_batched_rejects_an_overflowing_resume_offset() -> io::Result<()> {
+    let Some(fs) = try_io_uring() else {
+        return Ok(());
+    };
+    let dir = tempfile::tempdir()?;
+    let opts = FsOpenOptions::new().write(true).create(true).read(true);
+
+    let mut uring_file = fs.open(&dir.path().join("u.bin"), &opts)?;
+    uring_file.write_all(&(0..=255u8).collect::<Vec<_>>())?;
+    uring_file.sync_all()?;
+
+    let std_fs = crate::fs::StdFs;
+    let mut std_file = std_fs.open(&dir.path().join("s.bin"), &opts)?;
+    std_file.write_all(&(0..=255u8).collect::<Vec<_>>())?;
+    std_file.sync_all()?;
+
+    let mut b0 = [0u8; 4];
+    let mut b1 = [0u8; 4];
+    let err = {
+        let mut buf1 = crate::fs::BlockBuf::new(&mut b1);
+        // Two bytes already owned, so the resume offset is `u64::MAX - 1 + 2`.
+        assert_eq!(buf1.append(&[0xAA, 0xBB]), 2);
+        let mut reqs = vec![
+            crate::fs::BlockRead {
+                file: uring_file.as_ref(),
+                offset: 10,
+                buf: crate::fs::BlockBuf::new(&mut b0),
+            },
+            crate::fs::BlockRead {
+                file: std_file.as_ref(),
+                offset: u64::MAX - 1,
+                buf: buf1,
+            },
+        ];
+        fs.read_blocks_batched(&mut reqs)
+            .expect_err("an overflowing resume offset must be refused")
+    };
+    assert_eq!(err.kind(), crate::io::ErrorKind::InvalidInput, "{err}");
+    Ok(())
+}
+
 /// Wraps a file handle, passing its descriptor through so the ring still
 /// accepts it, and counts the serial `read_at` calls made against it. A count
 /// above zero says the request took the fallback path.

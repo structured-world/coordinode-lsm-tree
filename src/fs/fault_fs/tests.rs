@@ -374,6 +374,64 @@ fn path_filtered_rule_never_matches_a_pathless_op() {
 }
 
 #[test]
+fn an_armed_reflink_rule_refuses_the_clone_and_an_unarmed_one_delegates() {
+    // A checkpoint prefers a reflink clone where the filesystem offers one, so
+    // a test that wants to fail the placement of a file has to be able to fail
+    // that path too — otherwise the injection silently does nothing on a
+    // copy-on-write filesystem and the test passes for the wrong reason.
+    let fs = FaultFs::new(MemFs::new());
+    let src = Path::new("/d/src");
+    let dst = Path::new("/d/dst");
+
+    // Unarmed: the call reaches the wrapped backend, whose own verdict stands
+    // (MemFs declines reflink, which is a delegation, not an injection).
+    let delegated = fs
+        .reflink_file(src, dst)
+        .expect_err("MemFs does not support reflink");
+    assert_ne!(
+        delegated.kind(),
+        ErrorKind::PermissionDenied,
+        "an unarmed wrapper must not invent a verdict of its own",
+    );
+
+    fs.injector().arm(FaultRule::new(
+        FaultOp::Reflink,
+        Fault::Error(ErrorKind::PermissionDenied),
+    ));
+    let armed = fs
+        .reflink_file(src, dst)
+        .expect_err("an armed FaultOp::Reflink must refuse the clone");
+    assert_eq!(armed.kind(), ErrorKind::PermissionDenied);
+}
+
+#[test]
+fn a_reflink_rule_matches_the_destination_path() {
+    // The rule is matched against the DESTINATION, the file the clone would
+    // create — matching the source would fire on the wrong file when a
+    // checkpoint places one table and skips another.
+    let fs = FaultFs::new(MemFs::new());
+    fs.injector().arm(
+        FaultRule::new(FaultOp::Reflink, Fault::Error(ErrorKind::PermissionDenied))
+            .on_path("wanted"),
+    );
+
+    let elsewhere = fs
+        .reflink_file(Path::new("/d/wanted-src"), Path::new("/d/other"))
+        .expect_err("MemFs declines reflink regardless");
+    assert_ne!(
+        elsewhere.kind(),
+        ErrorKind::PermissionDenied,
+        "a destination outside the filter must not fire the rule, even when \
+         the SOURCE matches it",
+    );
+
+    let matched = fs
+        .reflink_file(Path::new("/d/src"), Path::new("/d/wanted"))
+        .expect_err("the armed rule fires on the matching destination");
+    assert_eq!(matched.kind(), ErrorKind::PermissionDenied);
+}
+
+#[test]
 fn identity_probes_forward_to_inner_backend() {
     let mem = MemFs::new();
     let inner_id = mem.backend_id();
