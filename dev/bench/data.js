@@ -1,5 +1,5 @@
 window.BENCHMARK_DATA = {
-  "lastUpdate": 1789917025651,
+  "lastUpdate": 1790004498073,
   "repoUrl": "https://github.com/structured-world/coordinode-lsm-tree",
   "entries": {
     "lsm-tree db_bench": [
@@ -23442,6 +23442,90 @@ window.BENCHMARK_DATA = {
             "value": 599687.5627797918,
             "unit": "ops/sec",
             "extra": "P50: 1.4us | P99: 6.7us | P99.9: 77.6us\nthreads: 1 | elapsed: 0.33s | num: 200000 | iterations: 3"
+          }
+        ]
+      },
+      {
+        "commit": {
+          "author": {
+            "email": "mail@polaz.com",
+            "name": "Dmitry Prudnikov",
+            "username": "polaz"
+          },
+          "committer": {
+            "email": "noreply@github.com",
+            "name": "GitHub",
+            "username": "web-flow"
+          },
+          "distinct": true,
+          "id": "2b80fff08ad47ec5665c933fcf02bd4e07218f58",
+          "message": "fix(fs): read each level through the backend that holds it (#673)\n\n## What was wrong\n\nBatched block reads were submitted to the tree's primary filesystem for\nevery level, ignoring `level_routes` entirely. On a tiered tree that\nlost the batching in both directions, silently — the file handles belong\nto the route either way, so the bytes came back correct:\n\n- primary on `io_uring`, level routed elsewhere → the routed level's\nhandles carry no descriptor the ring can use, so the whole batch fell\nback to serial reads;\n- primary on `StdFs`, level routed to `io_uring` → the batch took the\ntrait's serial default and the route's ring was never reached at all.\n\nSeparately, `IoUringFs::read_blocks_batched` degraded a whole batch when\na single request lacked a descriptor, so one non-`io_uring` handle\ndragged every other request onto the serial path.\n\n## What changed\n\n**Reads follow the table, not the level map.** Each planned read is\nsubmitted through the `Fs` its `Table` was opened on, one submission per\nbackend. Review pointed out that the level map is the wrong source of\ntruth: routes may be reassigned on reopen while the old folder stays\ncovered, and recovery then keeps every table on the backend whose folder\nit was found in — so a level can hold tables from two backends at once,\nand its current route can name one that holds none of them. Both\nbatched-read call sites (the level prewarm and the chunked\nread-into-scratch resolve) group this way, which covers\n`BlobTree::multi_get` too since it shares the path.\n\n**A mixed batch is split, not degraded.** Requests carrying a descriptor\ngo to the ring in one submission; only the rest are read serially. The\nsubmission helper is generic over how the caller holds each request, so\nthe common whole-batch path neither allocates nor gathers.\n\n**The split preserves error precedence.** `Fs::read_blocks_batched`\nreturns the FIRST failing block's error, and first means first in the\ncaller's order. Indices travel with the partitioned requests, and the\nsubmission reports which of its own requests failed, so a successful\nrequest never lends its index to a later failure.\n\n**A test that passed or failed on who ran it.** The partial-checkpoint\nassertion forced its failure with `chmod 000`, which `CAP_DAC_OVERRIDE`\nbypasses — it failed as root and passed otherwise. It now injects at the\n`Fs` boundary, arming both placement strategies (hard link and reflink\nclone) so the result does not depend on the host filesystem either.\n`FaultFs` gained the reflink hook it was missing for that.\n\n## Verification\n\n- Linux, x86_64, kernel 6.19, **running as root**: `cargo nextest run\n--features io-uring` — 2776 passed, 0 failed. The io_uring tests\nexercised the real ring (none reported the kernel-unsupported skip), and\n`cargo clippy --all-features --all-targets -- -D warnings` is clean\nthere, which is where this backend compiles at all.\n- macOS, arm64: full suite 2730 passed, doc tests 72 passed, clippy\nclean, `cargo fmt --check` clean.\n- `cargo check --target thumbv7em-none-eabihf --no-default-features\n--features alloc`: 0 errors, unchanged.\n- Coverage of the lines this branch changes: 141/167. What remains\nuncovered is the pre-existing defensive surface this change only\nre-wrapped — a ring thread that has shut down mid-batch, a buffer above\n`i32::MAX`, an `fd` absent after the partition already proved it present\n— plus the arguments of a `log::debug!` call.\n\nBoth defects are covered by tests that fail without the fix, verified\nagainst the pre-fix code:\n\n- the routing test reports `route saw 0, primary saw 1`;\n- the split test reports `left: 1, right: 0` on the ring request's\nserial-read counter.\n\nCloses #664",
+          "timestamp": "2026-09-21T18:24:05+03:00",
+          "tree_id": "846e0898097e2e9a945768ce5273e712e819a393",
+          "url": "https://github.com/structured-world/coordinode-lsm-tree/commit/2b80fff08ad47ec5665c933fcf02bd4e07218f58"
+        },
+        "date": 1790004447837,
+        "tool": "customBiggerIsBetter",
+        "benches": [
+          {
+            "name": "mixed",
+            "value": 79767.14622184963,
+            "unit": "ops/sec",
+            "extra": "P50: 0.4us | P99: 8.7us | P99.9: 28.0us\nthreads: 1 | elapsed: 6.71s | num: 200000 | iterations: 3"
+          },
+          {
+            "name": "fillseq",
+            "value": 3163205.5925474875,
+            "unit": "ops/sec",
+            "extra": "P50: 0.2us | P99: 0.6us | P99.9: 3.8us\nthreads: 1 | elapsed: 0.06s | num: 200000 | iterations: 3"
+          },
+          {
+            "name": "fillrandom",
+            "value": 1140658.604871867,
+            "unit": "ops/sec",
+            "extra": "P50: 0.7us | P99: 1.5us | P99.9: 4.8us\nthreads: 1 | elapsed: 0.18s | num: 200000 | iterations: 3"
+          },
+          {
+            "name": "readrandom",
+            "value": 711356.4500467717,
+            "unit": "ops/sec",
+            "extra": "P50: 1.1us | P99: 6.5us | P99.9: 74.0us\nthreads: 1 | elapsed: 0.28s | num: 200000 | iterations: 3"
+          },
+          {
+            "name": "readseq",
+            "value": 2552922.0746065946,
+            "unit": "ops/sec",
+            "extra": "P50: 0.2us | P99: 4.8us | P99.9: 9.4us\nthreads: 1 | elapsed: 0.08s | num: 200000 | iterations: 3"
+          },
+          {
+            "name": "seekrandom",
+            "value": 325313.85874449345,
+            "unit": "ops/sec",
+            "extra": "P50: 2.5us | P99: 8.1us | P99.9: 14.1us\nthreads: 1 | elapsed: 0.61s | num: 200000 | iterations: 3"
+          },
+          {
+            "name": "prefixscan",
+            "value": 198568.26325147788,
+            "unit": "ops/sec",
+            "extra": "P50: 4.5us | P99: 5.9us | P99.9: 12.0us\nthreads: 1 | elapsed: 1.01s | num: 200000 | iterations: 3"
+          },
+          {
+            "name": "overwrite",
+            "value": 1115744.5502852122,
+            "unit": "ops/sec",
+            "extra": "P50: 0.8us | P99: 1.5us | P99.9: 4.9us\nthreads: 1 | elapsed: 0.18s | num: 200000 | iterations: 3"
+          },
+          {
+            "name": "mergerandom",
+            "value": 446636.1375978747,
+            "unit": "ops/sec",
+            "extra": "P50: 0.3us | P99: 1.3us | P99.9: 3.6us\nthreads: 1 | elapsed: 0.45s | num: 200000 | iterations: 3"
+          },
+          {
+            "name": "readwhilewriting",
+            "value": 622873.8590118792,
+            "unit": "ops/sec",
+            "extra": "P50: 1.3us | P99: 7.0us | P99.9: 76.2us\nthreads: 1 | elapsed: 0.32s | num: 200000 | iterations: 3"
           }
         ]
       }
