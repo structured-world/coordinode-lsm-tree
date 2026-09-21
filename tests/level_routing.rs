@@ -1191,13 +1191,54 @@ fn open_or_repair_refuses_when_omitted_routes_cannot_be_ruled_out() -> lsm_tree:
     Ok(())
 }
 
+/// How a [`CountingFs`] answers a batched read. Only the batched entry point is
+/// affected; every other operation delegates, so a tree stays usable and the
+/// serial read path still works while the batched one misbehaves.
+#[derive(Copy, Clone, Debug, PartialEq, Eq)]
+enum BatchedBehaviour {
+    /// Delegate to the real backend.
+    Serve,
+    /// Fail the call.
+    Fail,
+    /// Report success without writing anything — the "lazy implementation"
+    /// the `BlockBuf` fill count exists to catch.
+    ClaimSuccessWithoutFilling,
+}
+
 /// A backend that counts the batched reads it is asked to perform, delegating
 /// everything else to [`StdFs`]. Two of them, one on the primary and one on a
-/// route, say which backend a read was actually submitted to.
+/// route, say which backend a read was actually submitted to; the behaviour
+/// switch makes the batched path fail on demand.
 #[derive(Debug)]
 struct CountingFs {
     inner: StdFs,
     batched: Arc<std::sync::atomic::AtomicUsize>,
+    behaviour: Arc<std::sync::Mutex<BatchedBehaviour>>,
+}
+
+/// A backend, its batched-read counter, and the switch controlling how it
+/// answers those reads.
+struct CountingHandles {
+    fs: Arc<dyn lsm_tree::fs::Fs>,
+    batched: Arc<std::sync::atomic::AtomicUsize>,
+    behaviour: Arc<std::sync::Mutex<BatchedBehaviour>>,
+}
+
+impl CountingHandles {
+    fn calls(&self) -> usize {
+        self.batched.load(std::sync::atomic::Ordering::Relaxed)
+    }
+
+    fn reset(&self) {
+        self.batched.store(0, std::sync::atomic::Ordering::Relaxed);
+    }
+
+    fn behave(&self, how: BatchedBehaviour) {
+        *self
+            .behaviour
+            .lock()
+            .unwrap_or_else(std::sync::PoisonError::into_inner) = how;
+    }
 }
 
 impl CountingFs {
@@ -1206,12 +1247,24 @@ impl CountingFs {
         Arc<dyn lsm_tree::fs::Fs>,
         Arc<std::sync::atomic::AtomicUsize>,
     ) {
+        let handles = Self::handles();
+        (handles.fs, handles.batched)
+    }
+
+    /// The same backend, with the behaviour switch exposed too.
+    fn handles() -> CountingHandles {
         let batched = Arc::new(std::sync::atomic::AtomicUsize::new(0));
+        let behaviour = Arc::new(std::sync::Mutex::new(BatchedBehaviour::Serve));
         let fs = Arc::new(Self {
             inner: StdFs,
             batched: Arc::clone(&batched),
+            behaviour: Arc::clone(&behaviour),
         });
-        (fs, batched)
+        CountingHandles {
+            fs,
+            batched,
+            behaviour,
+        }
     }
 }
 
@@ -1222,7 +1275,19 @@ impl lsm_tree::fs::Fs for CountingFs {
     ) -> lsm_tree::io::Result<()> {
         self.batched
             .fetch_add(1, std::sync::atomic::Ordering::Relaxed);
-        self.inner.read_blocks_batched(reqs)
+        let behaviour = *self
+            .behaviour
+            .lock()
+            .unwrap_or_else(std::sync::PoisonError::into_inner);
+        match behaviour {
+            BatchedBehaviour::Serve => self.inner.read_blocks_batched(reqs),
+            BatchedBehaviour::Fail => Err(lsm_tree::io::Error::new(
+                lsm_tree::io::ErrorKind::PermissionDenied,
+                "batched read refused by the test backend",
+            )),
+            // Every destination is left exactly as it arrived.
+            BatchedBehaviour::ClaimSuccessWithoutFilling => Ok(()),
+        }
     }
 
     fn open(
@@ -1564,6 +1629,185 @@ fn a_reassigned_route_reads_each_table_where_recovery_found_it() -> lsm_tree::Re
         on_other, 0,
         "the newly assigned route holds none of these tables and must see none \
          of their reads (primary saw {on_primary}, new route saw {on_other})",
+    );
+    Ok(())
+}
+
+/// After a route reassignment a single level can hold tables recovered from
+/// two different backends. Each group must reach its own: one submission per
+/// backend, not one submission to whichever backend happens to be first.
+#[test]
+fn a_level_split_across_two_backends_submits_to_both() -> lsm_tree::Result<()> {
+    let dir = tempfile::tempdir()?;
+    let primary = CountingFs::handles();
+    let other = CountingFs::handles();
+
+    let unrouted = || {
+        Config::new(
+            dir.path().join("primary"),
+            SequenceNumberCounter::default(),
+            SequenceNumberCounter::default(),
+        )
+        .with_shared_fs(Arc::clone(&primary.fs))
+        .data_block_compression_policy(CompressionPolicy::all(lsm_tree::CompressionType::None))
+        .index_block_compression_policy(CompressionPolicy::all(lsm_tree::CompressionType::None))
+    };
+    let routed = || {
+        unrouted().level_routes(vec![LevelRoute {
+            levels: 0..1,
+            path: dir.path().join("other"),
+            fs: Arc::clone(&other.fs),
+        }])
+    };
+
+    // First half lands on the primary (no route yet)...
+    {
+        let tree = unrouted().open()?;
+        for i in 0..400u32 {
+            tree.insert(format!("a{i:05}"), vec![b'v'; 64], u64::from(i));
+        }
+        tree.flush_active_memtable(0)?;
+    }
+    // ...the second half on the newly routed folder, same level.
+    {
+        let tree = routed().open()?;
+        for i in 0..400u32 {
+            tree.insert(format!("b{i:05}"), vec![b'v'; 64], u64::from(1_000 + i));
+        }
+        tree.flush_active_memtable(0)?;
+    }
+
+    let tree = routed().open()?;
+    primary.reset();
+    other.reset();
+
+    // Keys from both halves, so the level's plan spans both backends.
+    let mut keys: Vec<String> = (0..6).map(|i| format!("a{:05}", i * 60)).collect();
+    keys.extend((0..6).map(|i| format!("b{:05}", i * 60)));
+    let values = tree.multi_get(&keys, lsm_tree::SeqNo::MAX)?;
+    assert!(
+        values.iter().all(Option::is_some),
+        "every key was written, so every key must resolve",
+    );
+
+    assert!(
+        primary.calls() > 0 && other.calls() > 0,
+        "both backends hold tables on this level and both must be submitted to \
+         (primary saw {}, route saw {})",
+        primary.calls(),
+        other.calls(),
+    );
+    Ok(())
+}
+
+/// The prewarm is best-effort by contract: it populates the cache and the
+/// serial resolve answers. A backend that refuses the batched read must
+/// therefore cost nothing but the warming — the query still resolves.
+#[test]
+fn a_failed_prewarm_still_answers_the_query() -> lsm_tree::Result<()> {
+    let dir = tempfile::tempdir()?;
+    let primary = CountingFs::handles();
+
+    let config = || {
+        Config::new(
+            dir.path().join("primary"),
+            SequenceNumberCounter::default(),
+            SequenceNumberCounter::default(),
+        )
+        .with_shared_fs(Arc::clone(&primary.fs))
+        .data_block_compression_policy(CompressionPolicy::all(lsm_tree::CompressionType::None))
+        .index_block_compression_policy(CompressionPolicy::all(lsm_tree::CompressionType::None))
+    };
+
+    {
+        let tree = config().open()?;
+        for i in 0..400u32 {
+            tree.insert(format!("key{i:05}"), vec![b'v'; 64], u64::from(i));
+        }
+        tree.flush_active_memtable(0)?;
+    }
+
+    let keys: Vec<String> = (0..8).map(|i| format!("key{:05}", i * 50)).collect();
+
+    for behaviour in [
+        BatchedBehaviour::Fail,
+        BatchedBehaviour::ClaimSuccessWithoutFilling,
+    ] {
+        // A fresh tree per case: the first query's serial resolve leaves the
+        // blocks cached, and a warm level has nothing left to prewarm.
+        let tree = config().open()?;
+        primary.behave(behaviour);
+        primary.reset();
+        let values = tree.multi_get(&keys, lsm_tree::SeqNo::MAX)?;
+        assert!(
+            values.iter().all(Option::is_some),
+            "a {behaviour:?} batched read must not change the answer — the \
+             serial resolve reads authoritatively",
+        );
+        assert!(
+            primary.calls() > 0,
+            "the prewarm did attempt a batched read ({behaviour:?})",
+        );
+    }
+    Ok(())
+}
+
+/// The chunked resolve is authoritative, so the same two misbehaviours are
+/// errors there rather than a silent fall-through: a backend that refuses, and
+/// one that claims success without writing the bytes.
+#[test]
+fn the_chunked_resolve_refuses_a_misbehaving_backend() -> lsm_tree::Result<()> {
+    let dir = tempfile::tempdir()?;
+    let primary = CountingFs::handles();
+
+    let config = || {
+        Config::new(
+            dir.path().join("primary"),
+            SequenceNumberCounter::default(),
+            SequenceNumberCounter::default(),
+        )
+        .with_shared_fs(Arc::clone(&primary.fs))
+        // Too small to warm, so the chunked path runs.
+        .use_cache(Arc::new(lsm_tree::Cache::with_capacity_bytes(8 * 1_024)))
+        .data_block_compression_policy(CompressionPolicy::all(lsm_tree::CompressionType::None))
+        .index_block_compression_policy(CompressionPolicy::all(lsm_tree::CompressionType::None))
+    };
+
+    {
+        let tree = config().open()?;
+        for i in 0..2_000u32 {
+            tree.insert(format!("key{i:05}"), vec![b'v'; 64], u64::from(i));
+        }
+        tree.flush_active_memtable(0)?;
+    }
+
+    let tree = config().open()?;
+    let keys: Vec<String> = (0..64).map(|i| format!("key{:05}", i * 31)).collect();
+
+    primary.behave(BatchedBehaviour::Fail);
+    let refused = tree
+        .multi_get(&keys, lsm_tree::SeqNo::MAX)
+        .expect_err("a refused read on the authoritative path must surface");
+    assert!(
+        matches!(
+            &refused,
+            lsm_tree::Error::Io(io_err)
+                if io_err.kind() == lsm_tree::io::ErrorKind::PermissionDenied,
+        ),
+        "expected the backend's own refusal, got {refused:?}",
+    );
+
+    primary.behave(BatchedBehaviour::ClaimSuccessWithoutFilling);
+    let unfilled = tree
+        .multi_get(&keys, lsm_tree::SeqNo::MAX)
+        .expect_err("bytes nobody wrote must not be decoded as a block");
+    assert!(
+        matches!(
+            &unfilled,
+            lsm_tree::Error::Io(io_err)
+                if io_err.kind() == lsm_tree::io::ErrorKind::UnexpectedEof,
+        ),
+        "expected the short-request guard, got {unfilled:?}",
     );
     Ok(())
 }

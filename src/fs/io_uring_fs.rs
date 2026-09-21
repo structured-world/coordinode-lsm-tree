@@ -171,10 +171,12 @@ impl Fs for IoUringFs {
         // that were perfectly submittable.
         if reqs.iter().all(|r| r.file.backing_fd().is_some()) {
             // The common case: nothing to split, and no borrow-gathering pass.
+            // Every request is in the one group, so its position IS its index
+            // and nothing has to be mapped back.
             return self
                 .inner
                 .submit_reads_multi(reqs)
-                .map_err(crate::io::Error::from);
+                .map_err(|(_, e)| crate::io::Error::from(e));
         }
 
         // Indices travel with the requests: the contract is "the FIRST failing
@@ -199,15 +201,20 @@ impl Fs for IoUringFs {
         let ring_failure = if submittable.is_empty() {
             None
         } else {
-            // The whole submission fails as one, so the earliest index in the
-            // group is the position its error is attributed to.
-            let first = submittable.first().map_or(0, |(i, _)| *i);
             let mut group: Vec<&mut BlockRead<'_>> =
                 submittable.iter_mut().map(|(_, r)| &mut **r).collect();
+            // The submission reports WHICH of its requests failed, as a
+            // position in the group; mapping it back through the group's own
+            // index list gives the caller-order index the comparison needs. An
+            // earlier request that succeeded must not be blamed for a later
+            // one's failure.
             self.inner
                 .submit_reads_multi(&mut group)
                 .err()
-                .map(|e| (first, crate::io::Error::from(e)))
+                .map(|(at, e)| {
+                    let caller_index = submittable.get(at).map_or(usize::MAX, |(i, _)| *i);
+                    (caller_index, crate::io::Error::from(e))
+                })
         };
 
         let mut serial_failure: Option<(usize, crate::io::Error)> = None;
@@ -993,22 +1000,25 @@ impl RingThread {
     fn submit_reads_multi<'r, T: core::borrow::BorrowMut<BlockRead<'r>>>(
         &self,
         reqs: &mut [T],
-    ) -> io::Result<()> {
+    ) -> Result<(), (usize, io::Error)> {
         // Pre-pass: resolve every request's fd and validate its length BEFORE
         // submitting any op (same un-drained-in-flight hazard as submit_reads: a
         // missing fd or over-cap length returning via `?` mid-loop would strand
         // earlier sends with the kernel still writing their buffers). `None`
         // entries mark empty-buffer requests the send loop skips.
         let mut metas: Vec<Option<(i32, u32, u64)>> = Vec::with_capacity(reqs.len());
-        for req in reqs.iter().map(core::borrow::Borrow::borrow) {
+        for (at, req) in reqs.iter().map(core::borrow::Borrow::borrow).enumerate() {
             if req.buf.capacity() == 0 {
                 metas.push(None);
                 continue;
             }
             let fd = req.file.backing_fd().ok_or_else(|| {
-                io::Error::new(
-                    io::ErrorKind::InvalidInput,
-                    "submit_reads_multi: request without fd",
+                (
+                    at,
+                    io::Error::new(
+                        io::ErrorKind::InvalidInput,
+                        "submit_reads_multi: request without fd",
+                    ),
                 )
             })?;
             // From the UNFILLED region, which is where the pointer below points
@@ -1018,7 +1028,10 @@ impl RingThread {
             // end of the allocation.
             let len: u32 = i32::try_from(req.buf.capacity() - req.buf.filled())
                 .map_err(|_| {
-                    io::Error::new(io::ErrorKind::InvalidInput, "buffer exceeds i32::MAX")
+                    (
+                        at,
+                        io::Error::new(io::ErrorKind::InvalidInput, "buffer exceeds i32::MAX"),
+                    )
                 })?
                 .unsigned_abs();
             // A partly filled destination owns the block's first `filled` bytes
@@ -1029,19 +1042,27 @@ impl RingThread {
                 .offset
                 .checked_add(req.buf.filled() as u64)
                 .ok_or_else(|| {
-                    io::Error::new(
-                        io::ErrorKind::InvalidInput,
-                        "submit_reads_multi: request offset overflows",
+                    (
+                        at,
+                        io::Error::new(
+                            io::ErrorKind::InvalidInput,
+                            "submit_reads_multi: request offset overflows",
+                        ),
                     )
                 })?;
             metas.push(Some((fd, len, offset)));
         }
 
-        let mut receivers: Vec<(mpsc::Receiver<i32>, usize)> = Vec::with_capacity(reqs.len());
-        for (req, meta) in reqs
+        // The position each receiver's request occupies in `reqs`, so a failure
+        // is attributed to the request that actually failed rather than to the
+        // group it belonged to.
+        let mut receivers: Vec<(mpsc::Receiver<i32>, usize, usize)> =
+            Vec::with_capacity(reqs.len());
+        for (at, (req, meta)) in reqs
             .iter_mut()
             .map(core::borrow::BorrowMut::borrow_mut)
             .zip(&metas)
+            .enumerate()
         {
             let Some((fd, len, offset)) = *meta else {
                 continue;
@@ -1063,40 +1084,53 @@ impl RingThread {
                 .unwrap_or_else(std::sync::PoisonError::into_inner)
                 .as_ref()
                 .ok_or_else(|| {
-                    io::Error::new(io::ErrorKind::BrokenPipe, "io_uring thread shut down")
+                    (
+                        at,
+                        io::Error::new(io::ErrorKind::BrokenPipe, "io_uring thread shut down"),
+                    )
                 })?
                 .send(op)
-                .map_err(|_| io::Error::new(io::ErrorKind::BrokenPipe, "io_uring thread exited"))?;
-            receivers.push((rx, expected));
+                .map_err(|_| {
+                    (
+                        at,
+                        io::Error::new(io::ErrorKind::BrokenPipe, "io_uring thread exited"),
+                    )
+                })?;
+            receivers.push((rx, expected, at));
         }
 
         // Drain EVERY receiver before returning, even on error: an un-recv'd op
         // may still have the kernel writing into its raw-ptr buffer, so a short
         // read or negative result must not short-circuit the loop and let the
         // caller free those buffers mid-write (use-after-free). See `submit_reads`.
-        let mut first_err: Option<io::Error> = None;
-        for (rx, expected) in receivers {
+        // Receivers are in submission order, so the first failure found is also
+        // the earliest-indexed one.
+        let mut first_err: Option<(usize, io::Error)> = None;
+        for (rx, expected, at) in receivers {
             let recv = rx.recv();
             if first_err.is_some() {
                 continue;
             }
             match recv {
                 Err(_) => {
-                    first_err = Some(io::Error::new(
-                        io::ErrorKind::BrokenPipe,
-                        "io_uring thread exited",
+                    first_err = Some((
+                        at,
+                        io::Error::new(io::ErrorKind::BrokenPipe, "io_uring thread exited"),
                     ));
                 }
                 Ok(result) if result < 0 => {
-                    first_err = Some(io::Error::from_raw_os_error(-result));
+                    first_err = Some((at, io::Error::from_raw_os_error(-result)));
                 }
                 Ok(result) => {
                     #[expect(clippy::cast_sign_loss, reason = "guarded by result < 0 above")]
                     let n = result as usize;
                     if n != expected {
-                        first_err = Some(io::Error::new(
-                            io::ErrorKind::UnexpectedEof,
-                            "io_uring read_blocks_batched: short read on a fixed-size block",
+                        first_err = Some((
+                            at,
+                            io::Error::new(
+                                io::ErrorKind::UnexpectedEof,
+                                "io_uring read_blocks_batched: short read on a fixed-size block",
+                            ),
                         ));
                     }
                 }

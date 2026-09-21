@@ -1079,6 +1079,160 @@ fn read_blocks_batched_tolerates_an_empty_request_in_a_mixed_batch() -> io::Resu
     Ok(())
 }
 
+/// When BOTH halves of a split batch fail, the error returned is the one whose
+/// request came first in the CALLER's order — the contract is the first failing
+/// block, and splitting must not re-order which failure wins. The serial
+/// request is placed first here, so its error has to beat the ring's.
+#[test]
+fn read_blocks_batched_reports_the_earliest_failure_when_both_halves_fail() -> io::Result<()> {
+    let Some(fs) = try_io_uring() else {
+        return Ok(());
+    };
+    let dir = tempfile::tempdir()?;
+    let opts = FsOpenOptions::new().write(true).create(true).read(true);
+
+    // Both files are 4 bytes, so both requests below read past EOF.
+    let mut uring_file = fs.open(&dir.path().join("u.bin"), &opts)?;
+    uring_file.write_all(&[1, 2, 3, 4])?;
+    uring_file.sync_all()?;
+    let std_fs = crate::fs::StdFs;
+    let mut std_file = std_fs.open(&dir.path().join("s.bin"), &opts)?;
+    std_file.write_all(&[1, 2, 3, 4])?;
+    std_file.sync_all()?;
+
+    let mut b0 = [0u8; 8];
+    let mut b1 = [0u8; 8];
+    let err = {
+        let mut serial_first = crate::fs::BlockBuf::new(&mut b0);
+        // An overflowing resume offset, which is `InvalidInput` — distinct from
+        // the ring half's `UnexpectedEof`, so the verdict says which one won.
+        assert_eq!(serial_first.append(&[0xAA, 0xBB]), 2);
+        let mut reqs = vec![
+            crate::fs::BlockRead {
+                file: std_file.as_ref(),
+                offset: u64::MAX - 1,
+                buf: serial_first,
+            },
+            crate::fs::BlockRead {
+                file: uring_file.as_ref(),
+                offset: 0,
+                buf: crate::fs::BlockBuf::new(&mut b1),
+            },
+        ];
+        fs.read_blocks_batched(&mut reqs)
+            .expect_err("both halves fail, so the call fails")
+    };
+    assert_eq!(
+        err.kind(),
+        crate::io::ErrorKind::InvalidInput,
+        "the request at index 0 is the serial one, so its error wins: {err}",
+    );
+    Ok(())
+}
+
+/// The mirror of the case above: when the RING half holds the earlier request,
+/// its error is the one reported.
+#[test]
+fn read_blocks_batched_prefers_the_ring_failure_when_it_came_first() -> io::Result<()> {
+    let Some(fs) = try_io_uring() else {
+        return Ok(());
+    };
+    let dir = tempfile::tempdir()?;
+    let opts = FsOpenOptions::new().write(true).create(true).read(true);
+
+    let mut uring_file = fs.open(&dir.path().join("u.bin"), &opts)?;
+    uring_file.write_all(&[1, 2, 3, 4])?;
+    uring_file.sync_all()?;
+    let std_fs = crate::fs::StdFs;
+    let mut std_file = std_fs.open(&dir.path().join("s.bin"), &opts)?;
+    std_file.write_all(&[1, 2, 3, 4])?;
+    std_file.sync_all()?;
+
+    let mut b0 = [0u8; 8];
+    let mut b1 = [0u8; 8];
+    let err = {
+        let mut serial_second = crate::fs::BlockBuf::new(&mut b1);
+        assert_eq!(serial_second.append(&[0xAA, 0xBB]), 2);
+        let mut reqs = vec![
+            crate::fs::BlockRead {
+                file: uring_file.as_ref(),
+                offset: 0,
+                buf: crate::fs::BlockBuf::new(&mut b0),
+            },
+            crate::fs::BlockRead {
+                file: std_file.as_ref(),
+                offset: u64::MAX - 1,
+                buf: serial_second,
+            },
+        ];
+        fs.read_blocks_batched(&mut reqs)
+            .expect_err("both halves fail, so the call fails")
+    };
+    assert_eq!(
+        err.kind(),
+        crate::io::ErrorKind::UnexpectedEof,
+        "the request at index 0 is the ring one, so its short read wins: {err}",
+    );
+    Ok(())
+}
+
+/// A ring request that SUCCEEDS must not lend its index to a later one that
+/// fails. With a good ring read at 0, a failing serial read at 1 and a failing
+/// ring read at 2, the winner is the serial failure at index 1 — attributing
+/// the ring's failure to the group's first request would wrongly report index 0
+/// and hand back the wrong error.
+#[test]
+fn read_blocks_batched_blames_the_ring_request_that_failed_not_its_group() -> io::Result<()> {
+    let Some(fs) = try_io_uring() else {
+        return Ok(());
+    };
+    let dir = tempfile::tempdir()?;
+    let opts = FsOpenOptions::new().write(true).create(true).read(true);
+
+    let mut uring_file = fs.open(&dir.path().join("u.bin"), &opts)?;
+    uring_file.write_all(&(0..=255u8).collect::<Vec<_>>())?;
+    uring_file.sync_all()?;
+    let std_fs = crate::fs::StdFs;
+    let mut std_file = std_fs.open(&dir.path().join("s.bin"), &opts)?;
+    std_file.write_all(&[1, 2, 3, 4])?;
+    std_file.sync_all()?;
+
+    let mut good = [0u8; 4];
+    let mut serial_bad = [0u8; 4];
+    let mut ring_bad = [0u8; 8];
+    let err = {
+        let mut serial_buf = crate::fs::BlockBuf::new(&mut serial_bad);
+        // Overflowing resume offset → InvalidInput, at index 1.
+        assert_eq!(serial_buf.append(&[0xAA, 0xBB]), 2);
+        let mut reqs = vec![
+            crate::fs::BlockRead {
+                file: uring_file.as_ref(),
+                offset: 10,
+                buf: crate::fs::BlockBuf::new(&mut good),
+            },
+            crate::fs::BlockRead {
+                file: std_file.as_ref(),
+                offset: u64::MAX - 1,
+                buf: serial_buf,
+            },
+            crate::fs::BlockRead {
+                // Reads past the 256-byte fixture's end → UnexpectedEof, at 2.
+                file: uring_file.as_ref(),
+                offset: 252,
+                buf: crate::fs::BlockBuf::new(&mut ring_bad),
+            },
+        ];
+        fs.read_blocks_batched(&mut reqs)
+            .expect_err("two of the three requests fail")
+    };
+    assert_eq!(
+        err.kind(),
+        crate::io::ErrorKind::InvalidInput,
+        "index 1 fails before index 2, so the serial error wins: {err}",
+    );
+    Ok(())
+}
+
 /// An offset that would overflow while resuming a partly filled destination is
 /// rejected, not wrapped into a read somewhere else in the file. The check
 /// lives in the serial half of the split, so a mixed batch has to reach it.
