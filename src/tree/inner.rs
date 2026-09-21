@@ -199,6 +199,13 @@ pub struct TreeInner {
     /// several do), and would hand out the constructor's one-second burst
     /// again on every invocation — a burst the bucket is meant to earn by
     /// idling.
+    ///
+    /// The bucket is `no_std`-clean (`spin` + `portable_atomic` + `core`), but
+    /// under `no_std` it does not throttle: there is no ambient monotonic clock
+    /// there, so
+    /// [`request_interruptible`](crate::rate_limiter::RateLimiter::request_interruptible)
+    /// only honours the stop signal. Holding the bucket per tree is what makes
+    /// the rate correct once a caller-provided clock is wired in.
     pub(crate) compaction_rate_limiter: Arc<crate::rate_limiter::RateLimiter>,
 
     /// Runtime-toggleable configuration. Lockless atomic snapshot.
