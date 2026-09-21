@@ -1176,6 +1176,90 @@ fn read_blocks_batched_prefers_the_ring_failure_when_it_came_first() -> io::Resu
     Ok(())
 }
 
+/// The resume-offset overflow guard covers the RING half too: a submittable
+/// request whose partly filled destination would push its offset past `u64`
+/// is refused before anything is submitted, not wrapped around into a read of
+/// some other part of the file.
+#[test]
+fn read_blocks_batched_rejects_an_overflowing_resume_offset_on_the_ring_side() -> io::Result<()> {
+    let Some(fs) = try_io_uring() else {
+        return Ok(());
+    };
+    let dir = tempfile::tempdir()?;
+    let opts = FsOpenOptions::new().write(true).create(true).read(true);
+
+    let mut uring_file = fs.open(&dir.path().join("u.bin"), &opts)?;
+    uring_file.write_all(&(0..=255u8).collect::<Vec<_>>())?;
+    uring_file.sync_all()?;
+
+    let mut buf = [0u8; 4];
+    let err = {
+        let mut dst = crate::fs::BlockBuf::new(&mut buf);
+        assert_eq!(dst.append(&[0xAA, 0xBB]), 2);
+        let mut reqs = vec![crate::fs::BlockRead {
+            file: uring_file.as_ref(),
+            offset: u64::MAX - 1,
+            buf: dst,
+        }];
+        fs.read_blocks_batched(&mut reqs)
+            .expect_err("an overflowing resume offset must be refused")
+    };
+    assert_eq!(err.kind(), crate::io::ErrorKind::InvalidInput, "{err}");
+    Ok(())
+}
+
+/// A serial read that FAILS outright (as opposed to coming up short) is
+/// reported as itself: the backend's own error, not a substitute.
+#[test]
+fn read_blocks_batched_surfaces_a_serial_read_error_verbatim() -> io::Result<()> {
+    let Some(fs) = try_io_uring() else {
+        return Ok(());
+    };
+    let dir = tempfile::tempdir()?;
+    let opts = FsOpenOptions::new().write(true).create(true).read(true);
+
+    let mut uring_file = fs.open(&dir.path().join("u.bin"), &opts)?;
+    uring_file.write_all(&(0..=255u8).collect::<Vec<_>>())?;
+    uring_file.sync_all()?;
+
+    // A descriptor-less handle whose reads are made to fail.
+    let faulty = crate::fs::FaultFs::new(crate::fs::StdFs);
+    let mut std_file = faulty.open(&dir.path().join("s.bin"), &opts)?;
+    std_file.write_all(&(0..=255u8).collect::<Vec<_>>())?;
+    std_file.sync_all()?;
+    assert_eq!(std_file.backing_fd(), None);
+    faulty.injector().arm(crate::fs::FaultRule::new(
+        crate::fs::FaultOp::ReadAt,
+        crate::fs::Fault::Error(crate::io::ErrorKind::PermissionDenied),
+    ));
+
+    let mut b0 = [0u8; 4];
+    let mut b1 = [0u8; 4];
+    let err = {
+        let mut reqs = vec![
+            crate::fs::BlockRead {
+                file: uring_file.as_ref(),
+                offset: 10,
+                buf: crate::fs::BlockBuf::new(&mut b0),
+            },
+            crate::fs::BlockRead {
+                file: std_file.as_ref(),
+                offset: 20,
+                buf: crate::fs::BlockBuf::new(&mut b1),
+            },
+        ];
+        fs.read_blocks_batched(&mut reqs)
+            .expect_err("the serial half's read fails")
+    };
+    assert_eq!(
+        err.kind(),
+        crate::io::ErrorKind::PermissionDenied,
+        "the backend's own error is what the caller sees: {err}",
+    );
+    assert_eq!(b0, [10, 11, 12, 13], "the ring half still ran");
+    Ok(())
+}
+
 /// A ring request that SUCCEEDS must not lend its index to a later one that
 /// fails. With a good ring read at 0, a failing serial read at 1 and a failing
 /// ring read at 2, the winner is the serial failure at index 1 — attributing
