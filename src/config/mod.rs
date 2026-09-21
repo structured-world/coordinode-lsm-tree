@@ -1136,25 +1136,6 @@ impl Config {
         }
     }
 
-    /// The [`Fs`] backend that a level's tables are opened through.
-    ///
-    /// The read path resolves its backend per level: a level served by a
-    /// [`level_routes`](Self::level_routes) entry has its reads submitted to
-    /// that route's backend, not the primary's. Submitting them to the primary
-    /// would silently forfeit whatever the route provides — a shared `io_uring`
-    /// ring, a device queue — while still returning correct bytes, because the
-    /// file handles themselves came from the route.
-    ///
-    /// Borrows rather than cloning the `Arc`: this is called per level on the
-    /// multi-get read path, where a refcount bump buys nothing.
-    #[must_use]
-    pub fn fs_for_level(&self, level: u8) -> &dyn Fs {
-        match self.route_for_level(level) {
-            Some(route) => route.fs.as_ref(),
-            None => self.fs.as_ref(),
-        }
-    }
-
     /// Best-effort minimum free space (bytes) across every filesystem this tree
     /// writes to: the primary [`path`](Self::path) plus each
     /// [`level_routes`](Self::level_routes) volume.

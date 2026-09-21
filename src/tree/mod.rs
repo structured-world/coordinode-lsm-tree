@@ -1770,7 +1770,6 @@ impl AbstractTree for Tree {
                 miss_keys,
                 seqno,
                 comparator,
-                &self.config,
                 &mut internal_entries,
             )?;
 
@@ -3452,7 +3451,6 @@ impl Tree {
         miss_keys: Vec<(usize, u64)>,
         seqno: SeqNo,
         comparator: &dyn crate::comparator::UserComparator,
-        config: &crate::Config,
         results: &mut [Option<InternalValue>],
     ) -> crate::Result<()> {
         debug_assert_eq!(results.len(), keys.len());
@@ -3474,33 +3472,19 @@ impl Tree {
             // signals oversize and warms nothing; the level is then resolved by
             // reading its blocks in budget-sized chunks into a scratch and
             // point-reading directly (no cache, no eviction).
-            // The level's tables were opened through the backend its route
-            // names, so its reads are submitted there too. Reading them through
-            // the primary still returns the right bytes — the handles are the
-            // route's either way — but a batch sent to a backend that holds
-            // none of the files loses the batching entirely.
-            #[expect(
-                clippy::cast_possible_truncation,
-                reason = "level index is bounded by level_count (7)"
-            )]
-            let level_fs = config.fs_for_level(level_idx as u8);
-
-            if Self::prewarm_level_cross_sst(
-                level_fs,
-                level,
-                &still_remaining,
-                keys,
-                seqno,
-                comparator,
-            ) && Self::resolve_level_chunked(
-                level_fs,
-                level,
-                &mut still_remaining,
-                keys,
-                seqno,
-                comparator,
-                results,
-            )? {
+            // Both submit through the backend each TABLE carries, so a tree
+            // reopened with a changed routing map still reads every table
+            // through the backend it was recovered on.
+            if Self::prewarm_level_cross_sst(level, &still_remaining, keys, seqno, comparator)
+                && Self::resolve_level_chunked(
+                    level,
+                    &mut still_remaining,
+                    keys,
+                    seqno,
+                    comparator,
+                    results,
+                )?
+            {
                 continue;
             }
 
@@ -3694,7 +3678,6 @@ impl Tree {
         reason = "planned[ti] and all_buffers[k..end] indices are built from `planned` itself, so they are in range by construction"
     )]
     fn prewarm_level_cross_sst<K: AsRef<[u8]>>(
-        fs: &dyn crate::fs::Fs,
         level: &crate::version::Level,
         remaining: &[(usize, u64)],
         keys: &[K],
@@ -3770,34 +3753,48 @@ impl Tree {
             .collect();
 
         {
-            // Paired directly with the plan rather than through a parallel
-            // (table index, offset) vector: `all_buffers` is already in
-            // (table, block) order, so zipping the two walks needs no third
-            // collection to remember which file each buffer belongs to.
+            // Grouped by the backend each TABLE was opened through, not by the
+            // level's current route: a tree may be reopened with the routing map
+            // changed, and recovery keeps every table on the backend whose
+            // folder it was found in. Submitting a table's reads anywhere else
+            // forfeits the batching that backend provides.
+            //
+            // Paired with the plan positionally: `all_buffers` is in
+            // (table, block) order, so the walk that fills it is the walk that
+            // built it.
+            let mut groups: Vec<(&Arc<dyn crate::fs::Fs>, Vec<crate::fs::BlockRead<'_>>)> =
+                Vec::new();
             let mut bufs = all_buffers.iter_mut();
-            let mut reqs: Vec<crate::fs::BlockRead<'_>> = planned
-                .iter()
-                .flat_map(|(_, file, handles)| {
-                    handles.iter().map(move |h| (file.as_ref(), *h.offset()))
-                })
-                .zip(&mut bufs)
-                .map(|((file, offset), buf)| crate::fs::BlockRead {
-                    file,
-                    offset,
-                    buf: crate::fs::BlockBuf::new(&mut buf[..]),
-                })
-                .collect();
-            // Best-effort: a batched-read failure just leaves the blocks for the
-            // resolve walk to read normally.
-            if fs.read_blocks_batched(&mut reqs).is_err() {
-                return false;
+            for (table, file, handles) in &planned {
+                for handle in handles {
+                    let Some(buf) = bufs.next() else {
+                        // Unreachable: all_buffers was built from these handles.
+                        return false;
+                    };
+                    let req = crate::fs::BlockRead {
+                        file: file.as_ref(),
+                        offset: *handle.offset(),
+                        buf: crate::fs::BlockBuf::new(&mut buf[..]),
+                    };
+                    match groups.iter_mut().find(|(fs, _)| Arc::ptr_eq(fs, &table.fs)) {
+                        Some((_, reqs)) => reqs.push(req),
+                        None => groups.push((&table.fs, vec![req])),
+                    }
+                }
             }
-            // Independently of what the call returned: an implementation that
-            // reported success without filling a request leaves it short, and
-            // a block decoded from a buffer nobody wrote would be decoded from
-            // whatever the allocation held.
-            if !reqs.iter().all(|r| r.buf.is_full()) {
-                return false;
+            for (fs, reqs) in &mut groups {
+                // Best-effort: a batched-read failure just leaves the blocks for
+                // the resolve walk to read normally.
+                if fs.read_blocks_batched(reqs).is_err() {
+                    return false;
+                }
+                // Independently of what the call returned: an implementation
+                // that reported success without filling a request leaves it
+                // short, and a block decoded from a buffer nobody wrote would be
+                // decoded from whatever the allocation held.
+                if !reqs.iter().all(|r| r.buf.is_full()) {
+                    return false;
+                }
             }
         }
 
@@ -3898,7 +3895,6 @@ impl Tree {
         reason = "start/end stay within tasks by construction"
     )]
     fn resolve_level_chunked<K: AsRef<[u8]>>(
-        fs: &dyn crate::fs::Fs,
         level: &crate::version::Level,
         still_remaining: &mut Vec<(usize, u64)>,
         keys: &[K],
@@ -3936,7 +3932,7 @@ impl Tree {
                 bytes += sz;
                 end += 1;
             }
-            Self::resolve_block_task_chunk(fs, &tasks[start..end], keys, results)?;
+            Self::resolve_block_task_chunk(&tasks[start..end], keys, results)?;
             start = end;
         }
         still_remaining.retain(|&(idx, _)| results[idx].is_none());
@@ -3952,7 +3948,6 @@ impl Tree {
         reason = "buffers is built from chunk so indices align; key indices are valid (caller's keys/results aligned)"
     )]
     fn resolve_block_task_chunk<K: AsRef<[u8]>>(
-        fs: &dyn crate::fs::Fs,
         chunk: &[BlockTask<'_>],
         keys: &[K],
         results: &mut [Option<InternalValue>],
@@ -3962,24 +3957,37 @@ impl Tree {
             .map(|t| vec![0u8; t.handle.size() as usize])
             .collect();
         {
-            let mut reqs: Vec<crate::fs::BlockRead<'_>> = chunk
-                .iter()
-                .zip(buffers.iter_mut())
-                .map(|(t, buf)| crate::fs::BlockRead {
-                    file: t.file.as_ref(),
-                    offset: *t.handle.offset(),
+            // One submission per backend, for the reason `prewarm_level_cross_sst`
+            // states: a table's reads belong to the backend it was opened
+            // through, which a reopen with a changed routing map can leave
+            // different from the level's current route.
+            let mut groups: Vec<(&Arc<dyn crate::fs::Fs>, Vec<crate::fs::BlockRead<'_>>)> =
+                Vec::new();
+            for (task, buf) in chunk.iter().zip(buffers.iter_mut()) {
+                let req = crate::fs::BlockRead {
+                    file: task.file.as_ref(),
+                    offset: *task.handle.offset(),
                     buf: crate::fs::BlockBuf::new(&mut buf[..]),
-                })
-                .collect();
-            fs.read_blocks_batched(&mut reqs)?;
-            // An implementation that reported success without filling a request
-            // leaves it short; refuse to decode a block out of bytes it never
-            // wrote.
-            if !reqs.iter().all(|r| r.buf.is_full()) {
-                return Err(crate::Error::Io(crate::io::Error::new(
-                    crate::io::ErrorKind::UnexpectedEof,
-                    "read_blocks_batched reported success on an unfilled block",
-                )));
+                };
+                match groups
+                    .iter_mut()
+                    .find(|(fs, _)| Arc::ptr_eq(fs, &task.table.fs))
+                {
+                    Some((_, reqs)) => reqs.push(req),
+                    None => groups.push((&task.table.fs, vec![req])),
+                }
+            }
+            for (fs, reqs) in &mut groups {
+                fs.read_blocks_batched(reqs)?;
+                // An implementation that reported success without filling a
+                // request leaves it short; refuse to decode a block out of bytes
+                // it never wrote.
+                if !reqs.iter().all(|r| r.buf.is_full()) {
+                    return Err(crate::Error::Io(crate::io::Error::new(
+                        crate::io::ErrorKind::UnexpectedEof,
+                        "read_blocks_batched reported success on an unfilled block",
+                    )));
+                }
             }
         }
 

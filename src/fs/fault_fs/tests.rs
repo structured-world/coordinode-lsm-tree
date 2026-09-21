@@ -1,5 +1,5 @@
 use super::*;
-use crate::fs::MemFs;
+use crate::fs::{MemFs, StdFs};
 use crate::io::ErrorKind;
 use std::io::{Read, Seek, SeekFrom, Write};
 use test_log::test;
@@ -379,19 +379,23 @@ fn an_armed_reflink_rule_refuses_the_clone_and_an_unarmed_one_delegates() {
     // a test that wants to fail the placement of a file has to be able to fail
     // that path too — otherwise the injection silently does nothing on a
     // copy-on-write filesystem and the test passes for the wrong reason.
-    let fs = FaultFs::new(MemFs::new());
-    let src = Path::new("/d/src");
-    let dst = Path::new("/d/dst");
+    // Over a REAL backend with a real source file, so the unarmed case is
+    // decided by the filesystem's own answer rather than by an error a
+    // non-existent path would have produced anyway.
+    let dir = tempfile::tempdir().expect("tempdir");
+    let src = dir.path().join("src");
+    std::fs::write(&src, b"payload").expect("write source");
 
-    // Unarmed: the call reaches the wrapped backend, whose own verdict stands
-    // (MemFs declines reflink, which is a delegation, not an injection).
-    let delegated = fs
-        .reflink_file(src, dst)
-        .expect_err("MemFs does not support reflink");
-    assert_ne!(
-        delegated.kind(),
-        ErrorKind::PermissionDenied,
-        "an unarmed wrapper must not invent a verdict of its own",
+    // Unarmed: the wrapper's verdict must equal the bare backend's on an
+    // equivalent call, whatever that verdict is on this host.
+    let bare = StdFs.reflink_file(&src, &dir.path().join("bare-dst"));
+    let fs = FaultFs::new(StdFs);
+    let wrapped = fs.reflink_file(&src, &dir.path().join("wrapped-dst"));
+    assert_eq!(
+        bare.is_ok(),
+        wrapped.is_ok(),
+        "an unarmed wrapper must pass the call through, not decide it: bare \
+         {bare:?} vs wrapped {wrapped:?}",
     );
 
     fs.injector().arm(FaultRule::new(
@@ -399,7 +403,7 @@ fn an_armed_reflink_rule_refuses_the_clone_and_an_unarmed_one_delegates() {
         Fault::Error(ErrorKind::PermissionDenied),
     ));
     let armed = fs
-        .reflink_file(src, dst)
+        .reflink_file(&src, &dir.path().join("armed-dst"))
         .expect_err("an armed FaultOp::Reflink must refuse the clone");
     assert_eq!(armed.kind(), ErrorKind::PermissionDenied);
 }
@@ -409,24 +413,31 @@ fn a_reflink_rule_matches_the_destination_path() {
     // The rule is matched against the DESTINATION, the file the clone would
     // create — matching the source would fire on the wrong file when a
     // checkpoint places one table and skips another.
-    let fs = FaultFs::new(MemFs::new());
+    let dir = tempfile::tempdir().expect("tempdir");
+    let matching_src = dir.path().join("wanted-src");
+    let plain_src = dir.path().join("src");
+    std::fs::write(&matching_src, b"payload").expect("write source");
+    std::fs::write(&plain_src, b"payload").expect("write source");
+
+    let fs = FaultFs::new(StdFs);
     fs.injector().arm(
         FaultRule::new(FaultOp::Reflink, Fault::Error(ErrorKind::PermissionDenied))
-            .on_path("wanted"),
+            .on_path("wanted-dst"),
     );
 
-    let elsewhere = fs
-        .reflink_file(Path::new("/d/wanted-src"), Path::new("/d/other"))
-        .expect_err("MemFs declines reflink regardless");
-    assert_ne!(
-        elsewhere.kind(),
-        ErrorKind::PermissionDenied,
+    // The SOURCE matches the filter and the destination does not: the call must
+    // reach the backend, so its outcome equals the bare backend's.
+    let bare = StdFs.reflink_file(&matching_src, &dir.path().join("bare-other"));
+    let elsewhere = fs.reflink_file(&matching_src, &dir.path().join("other"));
+    assert_eq!(
+        bare.is_ok(),
+        elsewhere.is_ok(),
         "a destination outside the filter must not fire the rule, even when \
-         the SOURCE matches it",
+         the SOURCE matches it: bare {bare:?} vs wrapped {elsewhere:?}",
     );
 
     let matched = fs
-        .reflink_file(Path::new("/d/src"), Path::new("/d/wanted"))
+        .reflink_file(&plain_src, &dir.path().join("wanted-dst"))
         .expect_err("the armed rule fires on the matching destination");
     assert_eq!(matched.kind(), ErrorKind::PermissionDenied);
 }

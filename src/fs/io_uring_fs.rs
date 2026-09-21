@@ -171,50 +171,90 @@ impl Fs for IoUringFs {
                 .map_err(crate::io::Error::from);
         }
 
-        let (mut submittable, mut serial): (Vec<&mut BlockRead<'_>>, Vec<&mut BlockRead<'_>>) =
-            reqs.iter_mut().partition(|r| r.file.backing_fd().is_some());
+        // Indices travel with the requests: the contract is "the FIRST failing
+        // block's error", and first means first in the caller's order, not
+        // first in whichever group happened to run earlier. Splitting the batch
+        // must not reorder which failure wins.
+        let (mut submittable, mut serial): (
+            Vec<(usize, &mut BlockRead<'_>)>,
+            Vec<(usize, &mut BlockRead<'_>)>,
+        ) = reqs
+            .iter_mut()
+            .enumerate()
+            .partition(|(_, r)| r.file.backing_fd().is_some());
         log::debug!(
             "io_uring batched read: {} of {} requests lack a descriptor and are read serially",
             serial.len(),
             submittable.len() + serial.len(),
         );
 
-        // The ring group goes first and is waited out inside
+        // The ring group runs first and is waited out inside
         // `submit_reads_multi` (it drains every completion before returning, so
-        // no buffer is still being written when the serial reads start). A
-        // failure there is surfaced immediately, matching what the undivided
-        // batch did: the first failing block's error, with the remaining
-        // destinations left unfilled.
-        if !submittable.is_empty() {
+        // no buffer is still being written while the serial reads run). Its
+        // verdict is held rather than returned: a serial request EARLIER in the
+        // caller's order may fail too, and that one owns the result.
+        let ring_failure = if submittable.is_empty() {
+            None
+        } else {
+            // The whole submission fails as one, so the earliest index in the
+            // group is the position its error is attributed to.
+            let first = submittable.first().map_or(0, |(i, _)| *i);
+            let mut group: Vec<&mut BlockRead<'_>> =
+                submittable.iter_mut().map(|(_, r)| &mut **r).collect();
             self.inner
-                .submit_reads_multi(&mut submittable)
-                .map_err(crate::io::Error::from)?;
-        }
+                .submit_reads_multi(&mut group)
+                .err()
+                .map(|e| (first, crate::io::Error::from(e)))
+        };
 
-        for req in &mut serial {
+        let mut serial_failure: Option<(usize, crate::io::Error)> = None;
+        for (idx, req) in &mut serial {
             // A partly filled destination owns the block's first `filled`
             // bytes already; complete it from `offset + filled`.
-            let offset = req
-                .offset
-                .checked_add(req.buf.filled() as u64)
-                .ok_or_else(|| {
+            let Some(offset) = req.offset.checked_add(req.buf.filled() as u64) else {
+                serial_failure = Some((
+                    *idx,
                     crate::io::Error::from(io::Error::new(
                         io::ErrorKind::InvalidInput,
                         "read_blocks_batched: request offset overflows",
-                    ))
-                })?;
+                    )),
+                ));
+                break;
+            };
             let dst = req.buf.unfilled_mut();
             let want = dst.len();
-            let n = req.file.read_at(dst, offset)?;
-            req.buf.advance(n);
-            if n != want {
-                return Err(crate::io::Error::from(io::Error::new(
-                    io::ErrorKind::UnexpectedEof,
-                    "read_blocks_batched: short read on a fixed-size block",
-                )));
+            match req.file.read_at(dst, offset) {
+                Ok(n) => {
+                    req.buf.advance(n);
+                    if n != want {
+                        serial_failure = Some((
+                            *idx,
+                            crate::io::Error::from(io::Error::new(
+                                io::ErrorKind::UnexpectedEof,
+                                "read_blocks_batched: short read on a fixed-size block",
+                            )),
+                        ));
+                        break;
+                    }
+                }
+                Err(e) => {
+                    serial_failure = Some((*idx, e));
+                    break;
+                }
             }
         }
-        Ok(())
+
+        match (ring_failure, serial_failure) {
+            (Some((ring_at, ring_err)), Some((serial_at, serial_err))) => {
+                if serial_at < ring_at {
+                    Err(serial_err)
+                } else {
+                    Err(ring_err)
+                }
+            }
+            (Some((_, e)), None) | (None, Some((_, e))) => Err(e),
+            (None, None) => Ok(()),
+        }
     }
 
     fn create_dir_all(&self, path: &Path) -> crate::io::Result<()> {

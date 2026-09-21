@@ -816,9 +816,10 @@ fn read_blocks_batched_keeps_each_destination_with_its_own_request() -> io::Resu
     std_file.sync_all()?;
 
     // Interleaved, so a split that preserved only group-internal order would
-    // still be caught.
+    // still be caught. Offsets stay within the 256-byte fixtures, and `u8`
+    // keeps the expected bytes derivable without a narrowing cast.
     let mut bufs = [[0u8; 2]; 6];
-    let offsets = [0u64, 1, 2, 3, 4, 5];
+    let offsets: [u8; 6] = [0, 10, 20, 30, 40, 50];
     {
         let mut reqs: Vec<crate::fs::BlockRead<'_>> = Vec::new();
         for (i, (buf, offset)) in bufs.iter_mut().zip(offsets).enumerate() {
@@ -828,16 +829,18 @@ fn read_blocks_batched_keeps_each_destination_with_its_own_request() -> io::Resu
                 } else {
                     std_file.as_ref()
                 },
-                offset: offset * 10,
+                offset: u64::from(offset),
                 buf: crate::fs::BlockBuf::new(&mut buf[..]),
             });
         }
         fs.read_blocks_batched(&mut reqs)?;
     }
     for (i, (buf, offset)) in bufs.iter().zip(offsets).enumerate() {
-        let at = (offset * 10) as usize;
+        let at = usize::from(offset);
+        // The uring fixture holds byte value == its offset; the std fixture
+        // holds the reverse.
         let expected: [u8; 2] = if i % 2 == 0 {
-            [at as u8, (at + 1) as u8]
+            [offset, offset + 1]
         } else {
             [rev[at], rev[at + 1]]
         };
