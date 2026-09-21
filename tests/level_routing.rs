@@ -1190,3 +1190,148 @@ fn open_or_repair_refuses_when_omitted_routes_cannot_be_ruled_out() -> lsm_tree:
     );
     Ok(())
 }
+
+/// A backend that counts the batched reads it is asked to perform, delegating
+/// everything else to [`StdFs`]. Two of them, one on the primary and one on a
+/// route, say which backend a read was actually submitted to.
+#[derive(Debug)]
+struct CountingFs {
+    inner: StdFs,
+    batched: Arc<std::sync::atomic::AtomicUsize>,
+}
+
+impl CountingFs {
+    /// A backend and the counter reading its batched-read calls.
+    fn paired() -> (
+        Arc<dyn lsm_tree::fs::Fs>,
+        Arc<std::sync::atomic::AtomicUsize>,
+    ) {
+        let batched = Arc::new(std::sync::atomic::AtomicUsize::new(0));
+        let fs = Arc::new(Self {
+            inner: StdFs,
+            batched: Arc::clone(&batched),
+        });
+        (fs, batched)
+    }
+}
+
+impl lsm_tree::fs::Fs for CountingFs {
+    fn read_blocks_batched(
+        &self,
+        reqs: &mut [lsm_tree::fs::BlockRead<'_>],
+    ) -> lsm_tree::io::Result<()> {
+        self.batched
+            .fetch_add(1, std::sync::atomic::Ordering::Relaxed);
+        self.inner.read_blocks_batched(reqs)
+    }
+
+    fn open(
+        &self,
+        path: &std::path::Path,
+        opts: &lsm_tree::fs::FsOpenOptions,
+    ) -> lsm_tree::io::Result<Box<dyn lsm_tree::fs::FsFile>> {
+        self.inner.open(path, opts)
+    }
+
+    fn create_dir_all(&self, path: &std::path::Path) -> lsm_tree::io::Result<()> {
+        self.inner.create_dir_all(path)
+    }
+
+    fn read_dir(
+        &self,
+        path: &std::path::Path,
+    ) -> lsm_tree::io::Result<Vec<lsm_tree::fs::FsDirEntry>> {
+        self.inner.read_dir(path)
+    }
+
+    fn remove_file(&self, path: &std::path::Path) -> lsm_tree::io::Result<()> {
+        self.inner.remove_file(path)
+    }
+
+    fn remove_dir_all(&self, path: &std::path::Path) -> lsm_tree::io::Result<()> {
+        self.inner.remove_dir_all(path)
+    }
+
+    fn rename(&self, from: &std::path::Path, to: &std::path::Path) -> lsm_tree::io::Result<()> {
+        self.inner.rename(from, to)
+    }
+
+    fn metadata(&self, path: &std::path::Path) -> lsm_tree::io::Result<lsm_tree::fs::FsMetadata> {
+        self.inner.metadata(path)
+    }
+
+    fn sync_directory(&self, path: &std::path::Path) -> lsm_tree::io::Result<()> {
+        self.inner.sync_directory(path)
+    }
+
+    fn exists(&self, path: &std::path::Path) -> lsm_tree::io::Result<bool> {
+        self.inner.exists(path)
+    }
+}
+
+/// A routed level's tables are opened through the route's backend, so its reads
+/// belong to that backend too. Submitting them to the primary's instead loses
+/// whatever the route was provisioned for — a ring, a device queue, a cache —
+/// and does so silently, since the handles still read correctly.
+#[test]
+fn a_routed_level_reads_through_its_own_backend() -> lsm_tree::Result<()> {
+    let dir = tempfile::tempdir()?;
+    let (primary_fs, primary_batched) = CountingFs::paired();
+    let (routed_fs, routed_batched) = CountingFs::paired();
+
+    let config = || {
+        Config::new(
+            dir.path().join("primary"),
+            SequenceNumberCounter::default(),
+            SequenceNumberCounter::default(),
+        )
+        .with_shared_fs(Arc::clone(&primary_fs))
+        .data_block_compression_policy(CompressionPolicy::all(lsm_tree::CompressionType::None))
+        .index_block_compression_policy(CompressionPolicy::all(lsm_tree::CompressionType::None))
+        .level_routes(vec![LevelRoute {
+            levels: 0..7,
+            path: dir.path().join("routed"),
+            fs: Arc::clone(&routed_fs),
+        }])
+    };
+
+    // Enough keys to span several 4 KiB data blocks, so the level prewarm has
+    // more than one cold block to fetch (it declines below two).
+    {
+        let tree = config().open()?;
+        for i in 0..400u32 {
+            tree.insert(format!("key{i:05}"), vec![b'v'; 64], u64::from(i));
+        }
+        tree.flush_active_memtable(0)?;
+    }
+
+    // Reopened: a fresh block cache, so the read below is cold and the prewarm
+    // actually has work to submit.
+    let tree = config().open()?;
+    primary_batched.store(0, std::sync::atomic::Ordering::Relaxed);
+    routed_batched.store(0, std::sync::atomic::Ordering::Relaxed);
+
+    // Keys spread across the table so the batch spans several blocks. More than
+    // two, or multi_get takes the per-key path instead.
+    let keys: Vec<String> = (0..8).map(|i| format!("key{:05}", i * 50)).collect();
+    let values = tree.multi_get(&keys, lsm_tree::SeqNo::MAX)?;
+    assert!(
+        values.iter().all(Option::is_some),
+        "every key was written, so every key must resolve",
+    );
+
+    let on_route = routed_batched.load(std::sync::atomic::Ordering::Relaxed);
+    let on_primary = primary_batched.load(std::sync::atomic::Ordering::Relaxed);
+    assert!(
+        on_route > 0,
+        "the level's tables live on the route, so its batched reads must be \
+         submitted to the route's backend (route saw {on_route}, primary saw \
+         {on_primary})",
+    );
+    assert_eq!(
+        on_primary, 0,
+        "the primary backend holds none of these tables and must see none of \
+         their reads (route saw {on_route}, primary saw {on_primary})",
+    );
+    Ok(())
+}
