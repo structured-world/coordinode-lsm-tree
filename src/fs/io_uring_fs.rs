@@ -105,6 +105,12 @@ impl std::fmt::Debug for IoUringFs {
     }
 }
 
+/// Requests paired with their position in the caller's batch. The position is
+/// what decides which failure a split batch reports: the contract is the FIRST
+/// failing block in the caller's order, which survives the split only if each
+/// group remembers where its requests came from.
+type IndexedReads<'a, 'b> = Vec<(usize, &'a mut BlockRead<'b>)>;
+
 // ---------------------------------------------------------------------------
 // Fs for IoUringFs
 // ---------------------------------------------------------------------------
@@ -175,10 +181,7 @@ impl Fs for IoUringFs {
         // block's error", and first means first in the caller's order, not
         // first in whichever group happened to run earlier. Splitting the batch
         // must not reorder which failure wins.
-        let (mut submittable, mut serial): (
-            Vec<(usize, &mut BlockRead<'_>)>,
-            Vec<(usize, &mut BlockRead<'_>)>,
-        ) = reqs
+        let (mut submittable, mut serial): (IndexedReads<'_, '_>, IndexedReads<'_, '_>) = reqs
             .iter_mut()
             .enumerate()
             .partition(|(_, r)| r.file.backing_fd().is_some());
