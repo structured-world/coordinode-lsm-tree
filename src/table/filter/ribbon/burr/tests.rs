@@ -1279,6 +1279,115 @@ fn packed_layout_costs_about_r_bits_per_key() {
 }
 
 #[test]
+fn deduplicating_prefix_tokens_shrinks_the_filter_without_losing_a_member() {
+    // What the full-filter writer feeds the builder when a prefix extractor is
+    // configured: one token per key plus one per prefix, and neighbouring keys
+    // share prefixes by construction. This measures what removing the repeats
+    // is worth now that every token costs `r` bits rather than a slot only.
+    //
+    // 4 000 keys over 200 prefixes, which is the shape the extractor exists
+    // for — many keys under each prefix.
+    let keys: Vec<Vec<u8>> = (0..4_000_u32)
+        .map(|i| format!("p{:03}/k{:05}", i % 200, i).into_bytes())
+        .collect();
+
+    let mut raw: Vec<u64> = Vec::new();
+    for k in &keys {
+        raw.push(crate::hash::hash64(k));
+        // The extractor's prefix: everything up to and including the slash.
+        let cut = k.iter().position(|&b| b == b'/').expect("has a prefix") + 1;
+        raw.push(crate::hash::hash64(&k[..cut]));
+    }
+    let mut deduped = raw.clone();
+    deduped.sort_unstable();
+    deduped.dedup();
+
+    let build = |tokens: &[u64]| {
+        let params = BurrParams::with_bpk(tokens.len(), 10.0).expect("params");
+        let builder = BurrBuilder::new(params).expect("builder");
+        builder.build_from_hashes(tokens).expect("build")
+    };
+    let before = build(&raw);
+    let after = build(&deduped);
+
+    println!(
+        "tokens {} -> {}, filter {} -> {} bytes",
+        raw.len(),
+        deduped.len(),
+        before.encoded_len(),
+        after.encoded_len(),
+    );
+
+    // 4 000 keys + 200 distinct prefixes = 4 200 real tokens against 8 000
+    // pushed, so the filter should come out close to half the size.
+    assert_eq!(
+        deduped.len(),
+        4_200,
+        "one token per key plus one per prefix"
+    );
+    assert!(
+        after.encoded_len() * 100 < before.encoded_len() * 60,
+        "dedup must cut the filter materially: {} vs {} bytes",
+        after.encoded_len(),
+        before.encoded_len(),
+    );
+
+    // The saving must not cost a member: every key and every prefix still
+    // probes present. A dedup that dropped a distinct token would show up
+    // here as a false negative, which is the one failure a filter may not have.
+    for k in &keys {
+        assert!(after.contains_hash(crate::hash::hash64(k)), "key {k:?}");
+        let cut = k.iter().position(|&b| b == b'/').expect("has a prefix") + 1;
+        assert!(
+            after.contains_hash(crate::hash::hash64(&k[..cut])),
+            "prefix of {k:?}",
+        );
+    }
+}
+
+#[test]
+fn decoding_borrows_the_payload_instead_of_expanding_it() {
+    // The packing has to hold in memory too, not only on disk. A decode that
+    // materialised its own copy of the payload — worse, one row per word again
+    // — would move the overhead from the file into the block cache and give
+    // back most of the win, invisibly, because the file would still look small.
+    //
+    // Asserted structurally rather than by measuring an allocation: every
+    // layer's payload must point INTO the caller's buffer, which is only true
+    // of a borrow.
+    let n = 5_000_usize;
+    let params = BurrParams::with_bpk(n, 10.0).expect("params");
+    let builder = BurrBuilder::new(params).expect("builder");
+    let filter = builder.build_from_hashes(&sizing_hashes(n)).expect("build");
+    let bytes = filter.to_wire_bytes();
+
+    let decoded = super::wire::decode(&bytes).expect("decode");
+    let buffer = bytes.as_ptr_range();
+    let mut borrowed_bytes = 0_usize;
+    for layer in &decoded.layers {
+        let payload = layer.z_bytes.as_ptr_range();
+        assert!(
+            buffer.contains(&payload.start) && payload.end <= buffer.end,
+            "a layer's payload was copied out of the wire buffer",
+        );
+        borrowed_bytes += layer.z_bytes.len();
+        // Same for the thresholds.
+        let thresholds = layer.thresholds.as_ptr_range();
+        assert!(
+            buffer.contains(&thresholds.start) && thresholds.end <= buffer.end,
+            "a layer's thresholds were copied out of the wire buffer",
+        );
+    }
+    // Sanity: the borrowed payload is the bulk of the file, so the assertion
+    // above is not passing on an empty set of layers.
+    assert!(
+        borrowed_bytes * 10 > bytes.len() * 9,
+        "expected the payload to dominate the file, got {borrowed_bytes} of {}",
+        bytes.len(),
+    );
+}
+
+#[test]
 fn the_pre_build_estimate_lands_within_its_stated_tolerance() {
     // `estimated_filter_size` decides where a partition splits, so what
     // matters is that it tracks the built size across the range a partition

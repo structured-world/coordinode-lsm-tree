@@ -104,10 +104,9 @@ impl<W: crate::io::Write + crate::io::Seek> FilterWriter<W> for FullFilterWriter
     fn register_key(&mut self, key: &UserKey) -> crate::Result<()> {
         self.bloom_hash_buffer.push(crate::hash::hash64(key));
 
-        // Prefix hashes are intentionally not deduplicated. The filter
-        // treats each hash as an independent membership token; duplicates
-        // inflate the entry count but keep construction simple and lower
-        // effective FPR slightly.
+        // Prefix hashes are pushed as they come; `finish` sorts and dedups
+        // the buffer once, which is cheaper than keeping a set here on the
+        // per-key write path.
         if let Some(extractor) = &self.prefix_extractor {
             for prefix in extractor.prefixes(key.as_ref()) {
                 self.bloom_hash_buffer.push(crate::hash::hash64(prefix));
@@ -126,10 +125,28 @@ impl<W: crate::io::Write + crate::io::Seek> FilterWriter<W> for FullFilterWriter
             return Ok(0);
         }
 
-        let n = self.bloom_hash_buffer.len();
+        // A prefix extractor emits one token per prefix per key, and prefixes
+        // repeat across neighbouring keys by construction — that is what a
+        // prefix is. Duplicates add no members, so deduplicating costs a sort
+        // and removes real tokens: fewer slots to solve, a smaller payload,
+        // and a faster build. Under the row-major layout the saving was in
+        // slots only; now every removed token would also have cost `r` bits.
+        //
+        // Gated on the extractor being configured. Without one, `register_key`
+        // pushes exactly one hash per key over a key set that is already
+        // unique, so a duplicate needs a 64-bit hash collision — the sort
+        // would be pure cost on the write path.
+        let has_prefix_tokens = self.prefix_extractor.is_some();
+        let mut hashes = self.bloom_hash_buffer;
+        let raw = hashes.len();
+        if has_prefix_tokens {
+            hashes.sort_unstable();
+            hashes.dedup();
+        }
+        let n = hashes.len();
 
         log::trace!(
-            "Constructing BuRR filter with {n} entries: {:?}",
+            "Constructing BuRR filter with {n} entries ({raw} before dedup): {:?}",
             self.bloom_policy,
         );
 
@@ -143,7 +160,7 @@ impl<W: crate::io::Write + crate::io::Seek> FilterWriter<W> for FullFilterWriter
         // was actually written.
         // `finish` consumes `Box<Self>`, so we can move `bloom_hash_buffer`
         // into the BuRR builder directly — no `to_vec()` clone.
-        let filter_bytes = build_burr_filter_bytes(self.bloom_policy, self.bloom_hash_buffer)?;
+        let filter_bytes = build_burr_filter_bytes(self.bloom_policy, hashes)?;
 
         if filter_bytes.is_empty() {
             log::trace!("BuRR policy produced empty filter — skipping block write");
