@@ -62,12 +62,20 @@ fn run_test_with_cache(
     cache_bytes: Option<u64>,
     value_len: usize,
 ) -> Result<(), TestCaseError> {
+    // In-memory backend: what this property tests is that the batch read path
+    // agrees with the per-key one across MVCC states — flushes, compactions and
+    // multi-level shadowing all still happen, they just land in memory. The
+    // real filesystem is not the subject, and paying for it here costs 90-104 s
+    // per property on the Windows runner against 1-2 s elsewhere, for no extra
+    // coverage of the thing under test. Real-filesystem behaviour is covered by
+    // the integration suites that exist for it.
     let tmpdir = lsm_tree::get_tmp_folder();
     let mut config = Config::new(
         &tmpdir,
         SequenceNumberCounter::default(),
         SequenceNumberCounter::default(),
-    );
+    )
+    .with_shared_fs(Arc::new(lsm_tree::fs::MemFs::with_capacity(u64::MAX)));
     if let Some(bytes) = cache_bytes {
         config = config.use_cache(Arc::new(Cache::with_capacity_bytes(bytes)));
     }
