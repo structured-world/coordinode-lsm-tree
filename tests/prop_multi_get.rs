@@ -62,6 +62,12 @@ fn run_test_with_cache(
     cache_bytes: Option<u64>,
     value_len: usize,
 ) -> Result<(), TestCaseError> {
+    // Real files on disk, deliberately. These two properties are among the
+    // heaviest file-op generators in the suite, which makes them the place a
+    // platform's I/O cost shows up first: on the Windows runner they take 44 s
+    // and 54 s against 1-2 s elsewhere, and have been seen at 104 s. That gap
+    // is a defect worth seeing, so the test keeps producing the signal rather
+    // than routing around it through an in-memory backend.
     let tmpdir = lsm_tree::get_tmp_folder();
     let mut config = Config::new(
         &tmpdir,

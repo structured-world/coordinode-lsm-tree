@@ -112,10 +112,11 @@ pub struct Options {
     /// AEAD pipeline the data blocks use.
     pub encryption: Option<Arc<dyn crate::encryption::EncryptionProvider>>,
 
-    /// Per-compaction I/O rate limiter. Built from
-    /// [`Config::compaction_rate_limit`]; a limit of `0` makes every
-    /// request immediate (no throttling). Only the compaction merge loop
-    /// calls it, so flush and user reads are never throttled.
+    /// The tree's compaction I/O rate limiter, shared by every compaction it
+    /// runs. Built once at open from [`Config::compaction_rate_limit`]; a
+    /// limit of `0` makes every request immediate (no throttling). Only the
+    /// compaction merge loop calls it, so flush and user reads are never
+    /// throttled.
     pub rate_limiter: Arc<crate::rate_limiter::RateLimiter>,
 
     #[cfg(feature = "metrics")]
@@ -141,9 +142,9 @@ impl Options {
             heal_hints: tree.heal_hints.clone(),
             runtime_config: tree.runtime_config.clone(),
             encryption: tree.config.encryption.clone(),
-            rate_limiter: Arc::new(crate::rate_limiter::RateLimiter::new(
-                tree.config.compaction_rate_limit,
-            )),
+            // The tree's one budget, not a fresh one: see
+            // `TreeInner::compaction_rate_limiter`.
+            rate_limiter: Arc::clone(&tree.compaction_rate_limiter),
 
             #[cfg(feature = "metrics")]
             metrics: tree.metrics.clone(),

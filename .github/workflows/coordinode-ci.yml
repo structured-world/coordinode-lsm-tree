@@ -334,8 +334,20 @@ jobs:
         if: needs.changes.outputs.code != 'false' && needs.lint.result == 'success'
         with:
           prefix-key: ${{ runner.os }}-cargo
+      # The installer downloads a prebuilt binary from GitHub Releases. That
+      # CDN has outages — a run died here on eleven consecutive HTTP 504s —
+      # and the action's own retries all draw on the same host, so they ride
+      # the outage down with it. `continue-on-error` hands the failure to the
+      # step below instead of the job, and that step builds from crates.io, a
+      # different host entirely. If both are down, the fallback fails the job:
+      # nothing is skipped, the tests still run or CI still goes red.
       - uses: taiki-e/install-action@1ef5c5f58e85d25baaaa1704478fdd6c2921f2b5  # nextest
+        id: install-nextest
         if: needs.changes.outputs.code != 'false' && needs.lint.result == 'success'
+        continue-on-error: true
+      - name: Install nextest from crates.io (fallback)
+        if: needs.changes.outputs.code != 'false' && needs.lint.result == 'success' && steps.install-nextest.outcome == 'failure'
+        run: cargo install cargo-nextest --locked
       - name: Run tests
         if: needs.changes.outputs.code != 'false' && needs.lint.result == 'success'
         # tools/db_bench is a standalone crate, not in workspace — built separately
@@ -389,7 +401,13 @@ jobs:
       - uses: Swatinem/rust-cache@6323deb102c322ba6fcbdcafc7e3dddab59af2b6  # v2.9.2
         with:
           prefix-key: ubuntu-cargo
+      # Same GitHub-Releases outage exposure as the test job; same fallback.
       - uses: taiki-e/install-action@1ef5c5f58e85d25baaaa1704478fdd6c2921f2b5  # nextest
+        id: install-nextest
+        continue-on-error: true
+      - name: Install nextest from crates.io (fallback)
+        if: steps.install-nextest.outcome == 'failure'
+        run: cargo install cargo-nextest --locked
       - name: Run bitrot heal fuzzer
         # Pin the reproducer directory explicitly so the test's dump location does
         # not depend on the process working directory (robust if the crate ever
@@ -544,8 +562,19 @@ jobs:
         with:
           components: llvm-tools-preview
       - uses: Swatinem/rust-cache@6323deb102c322ba6fcbdcafc7e3dddab59af2b6  # v2.9.2
+      # Same GitHub-Releases outage exposure as the test job; same fallback.
       - uses: taiki-e/install-action@6bd9352acd589686fbc4cff533c083c3366dd444  # cargo-llvm-cov
+        id: install-llvm-cov
+        continue-on-error: true
+      - name: Install cargo-llvm-cov from crates.io (fallback)
+        if: steps.install-llvm-cov.outcome == 'failure'
+        run: cargo install cargo-llvm-cov --locked
       - uses: taiki-e/install-action@1ef5c5f58e85d25baaaa1704478fdd6c2921f2b5  # nextest
+        id: install-nextest
+        continue-on-error: true
+      - name: Install nextest from crates.io (fallback)
+        if: steps.install-nextest.outcome == 'failure'
+        run: cargo install cargo-nextest --locked
       - name: Run tests (all-features) with coverage
         env:
           # Same proptest budget as the regular test job — without
