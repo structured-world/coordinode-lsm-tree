@@ -6,7 +6,10 @@
 // described in https://github.com/structured-world/coordinode-lsm-tree/issues/210.
 
 use lsm_tree::{
-    AbstractTree, AnyTree, Config, KvSeparationOptions, SequenceNumberCounter, config::LevelRoute,
+    AbstractTree, AnyTree, Config, KvSeparationOptions, SequenceNumberCounter,
+    config::LevelRoute,
+    fs::{Fault, FaultFs, FaultInjector, FaultOp, FaultRule, StdFs},
+    io::ErrorKind,
 };
 use std::sync::Arc;
 
@@ -620,43 +623,59 @@ fn checkpoint_failure_leaves_source_intact() -> lsm_tree::Result<()> {
         "early reject must leave the pre-existing target alone",
     );
 
-    // ── (b) Post-prepare failure path (Unix-only) ───────────────────
-    // Force `link_tables` to fail by chmod-ing the source SST to 000
-    // AFTER `prepare_target` would normally have succeeded. The outer
-    // `PartialCheckpointGuard` (armed right after prepare_target returns)
-    // must remove the entire partial checkpoint so a retry on the same
-    // path succeeds. Restricted to Unix because Windows has no portable
-    // way to make an open file unreadable from another process.
-    #[cfg(unix)]
+    // ── (b) Post-prepare failure path ───────────────────────────────
+    // Fail the placement of a table file in the target AFTER
+    // `prepare_target` has succeeded. The outer `PartialCheckpointGuard`
+    // (armed right after prepare_target returns) must remove the entire
+    // partial checkpoint so a retry on the same path succeeds.
+    //
+    // Injected through the `Fs` rather than through file permissions: a
+    // chmod-000 injection is silently ineffective for a privileged process
+    // (CAP_DAC_OVERRIDE bypasses the mode bits), which made this assertion
+    // pass or fail on who ran the suite rather than on what the code does.
+    // Both placement strategies are armed — hard link and reflink clone —
+    // so the failure does not depend on whether the host filesystem offers
+    // copy-on-write clones either.
     {
-        use std::os::unix::fs::PermissionsExt;
+        let fault_src = tempfile::tempdir()?;
+        let injector = Arc::new(FaultInjector::new());
+        let faulty_tree = Config::new(
+            fault_src.path(),
+            SequenceNumberCounter::default(),
+            SequenceNumberCounter::default(),
+        )
+        .with_shared_fs(Arc::new(FaultFs::with_injector(
+            StdFs,
+            Arc::clone(&injector),
+        )))
+        .open()?;
+        for i in 0u32..50 {
+            faulty_tree.insert(format!("k{i:03}"), format!("v{i}"), u64::from(i));
+        }
+        faulty_tree.flush_active_memtable(0)?;
 
         let post_dst = dst_dir.path().join("post");
-        let src_tables = src_dir.path().join("tables");
-        let orig_perm = std::fs::metadata(&src_tables)?.permissions();
+        let tables_in_target = std::path::Path::new("post").join(lsm_tree::file::TABLES_FOLDER);
+        let target_substr = tables_in_target.to_string_lossy().into_owned();
+        injector.arm(
+            FaultRule::new(FaultOp::HardLink, Fault::Error(ErrorKind::PermissionDenied))
+                .on_path(target_substr.clone()),
+        );
+        injector.arm(
+            FaultRule::new(FaultOp::Reflink, Fault::Error(ErrorKind::PermissionDenied))
+                .on_path(target_substr),
+        );
 
-        // Strip read+execute on the SOURCE tables/ directory. We strip
-        // the *directory* not the SST file because `link(2)` does NOT
-        // require read permission on the source file (it just bumps the
-        // inode's link count) — but it DOES require search (x) permission
-        // on every directory component of the source path. Without `x`
-        // on `tables/`, the kernel cannot resolve `tables/<id>` and
-        // `link()` fails with `EACCES`.
-        std::fs::set_permissions(&src_tables, std::fs::Permissions::from_mode(0o000))?;
-
-        let result = tree.create_checkpoint(&post_dst);
-        // Restore perms BEFORE assertions so source remains usable even
-        // if a later assertion fails.
-        std::fs::set_permissions(&src_tables, orig_perm)?;
-
-        let err = result.expect_err("create_checkpoint should fail when src tables/ is unreadable");
-        let msg = format!("{err:?}");
+        let err = faulty_tree
+            .create_checkpoint(&post_dst)
+            .expect_err("create_checkpoint must fail when the target file cannot be placed");
         assert!(
-            msg.contains("Permission")
-                || msg.contains("denied")
-                || msg.contains("Os")
-                || msg.contains("error"),
-            "expected post-prepare I/O error, got {msg}",
+            matches!(
+                &err,
+                lsm_tree::Error::Io(io_err)
+                    if io_err.kind() == lsm_tree::io::ErrorKind::PermissionDenied,
+            ),
+            "expected the injected post-prepare I/O error, got {err:?}",
         );
 
         // PartialCheckpointGuard must have removed the partial checkpoint.
@@ -667,24 +686,20 @@ fn checkpoint_failure_leaves_source_intact() -> lsm_tree::Result<()> {
             post_dst.display(),
         );
 
-        // And a retry against the same path now succeeds, proving no
-        // stale state leaked.
-        let info = tree.create_checkpoint(&post_dst)?;
+        // With the fault disarmed, a retry against the same path succeeds,
+        // proving no stale state leaked.
+        injector.clear();
+        let info = faulty_tree.create_checkpoint(&post_dst)?;
         assert!(info.sst_files >= 1);
-    }
 
-    // Portable fallback (non-Unix): exercise just the success-then-
-    // cleanup-then-retry chain to verify run_checkpoint is idempotent
-    // against a freshly cleaned target.
-    #[cfg(not(unix))]
-    {
-        let post_dst = dst_dir.path().join("post");
-        let info1 = tree.create_checkpoint(&post_dst)?;
-        assert!(info1.sst_files >= 1);
-        std::fs::remove_dir_all(&post_dst)?;
-        let info2 = tree.create_checkpoint(&post_dst)?;
-        assert_eq!(info1.sst_files, info2.sst_files);
-        assert_eq!(info1.version_id, info2.version_id);
+        // The source tree is intact across the failure.
+        for i in 0u32..50 {
+            let key = format!("k{i:03}");
+            let val = faulty_tree
+                .get(key.as_bytes(), lsm_tree::SeqNo::MAX)?
+                .unwrap_or_else(|| panic!("source lost {key}"));
+            assert_eq!(&*val, format!("v{i}").as_bytes());
+        }
     }
 
     // ── Source intact across both failure modes ──────────────────────

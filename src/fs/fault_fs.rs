@@ -116,6 +116,12 @@ pub enum FaultOp {
     /// unanswerable alias probe must not be read as "these are distinct
     /// files"). Matched against the FIRST path.
     SameFile,
+    /// [`Fs::reflink_file`] — the copy-on-write clone a checkpoint prefers on a
+    /// filesystem that offers it. Paired with [`Self::HardLink`], failing it
+    /// models a publish that cannot place its destination file whichever
+    /// strategy the filesystem admits, without depending on the host's
+    /// reflink support. Matched against the DESTINATION path.
+    Reflink,
 }
 
 /// What a matched [`FaultRule`] does to the operation.
@@ -569,6 +575,9 @@ impl<F: Fs> Fs for FaultFs<F> {
     }
 
     fn reflink_file(&self, src: &Path, dst: &Path) -> io::Result<()> {
+        if let Some(Fault::Error(kind)) = self.injector.check(FaultOp::Reflink, Some(dst)) {
+            return Err(fault_error(kind, FaultOp::Reflink));
+        }
         self.inner.reflink_file(src, dst)
     }
 
