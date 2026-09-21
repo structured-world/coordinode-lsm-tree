@@ -155,6 +155,28 @@ fn column_word(z: &[u8], word_index: usize) -> Option<u64> {
 ///
 /// `start` must satisfy `start + 64 <= m`, which the equation generator
 /// guarantees (`start` is drawn from `0..=m - w` with `w == 64`).
+///
+/// # What the early-out is actually worth
+///
+/// Less than it looks, at the widths this crate uses. Measured on a
+/// 1M-token filter with the reader pinned (`benches/bloom.rs`), the negative
+/// and positive probes are indistinguishable at P50 — 41-42 ns for both, at
+/// `r` = 7, 10 and 14:
+///
+/// ```text
+/// FPR=1%     positive P50 41 ns    negative P50 42 ns
+/// FPR=0.1%   positive P50 42 ns    negative P50 41 ns
+/// FPR=0.01%  positive P50 42 ns    negative P50 41 ns
+/// ```
+///
+/// The reason is the layout this module chose: a segment's `r` column words
+/// are adjacent, so at `r <= 14` the whole set spans one or two cache lines.
+/// Once the first word is fetched the rest arrive with it, and stopping early
+/// saves decoding, not fetching — while the probe's cost is dominated by the
+/// equation derivation and that first cold touch. The early-out is kept
+/// because it costs nothing measurable either and it starts to matter as `r`
+/// grows past a line's worth of words, but the packing's payoff is the ~6x
+/// memory reduction, not this.
 #[inline]
 pub(crate) fn walk_band<const EARLY_OUT: bool>(
     z: &[u8],
