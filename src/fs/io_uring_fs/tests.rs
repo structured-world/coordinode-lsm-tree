@@ -921,7 +921,7 @@ fn read_blocks_batched_reports_a_short_serial_read_in_a_mixed_batch() -> io::Res
         fs.read_blocks_batched(&mut reqs)
             .expect_err("a short read on a fixed-size block is an error")
     };
-    assert_eq!(err.kind(), io::ErrorKind::UnexpectedEof, "{err}");
+    assert_eq!(err.kind(), crate::io::ErrorKind::UnexpectedEof, "{err}");
     assert_eq!(b0, [10, 11, 12, 13], "the ring group was served first");
     Ok(())
 }
@@ -964,7 +964,7 @@ fn read_blocks_batched_reports_a_short_ring_read_in_a_mixed_batch() -> io::Resul
         fs.read_blocks_batched(&mut reqs)
             .expect_err("a short read on a fixed-size block is an error")
     };
-    assert_eq!(err.kind(), io::ErrorKind::UnexpectedEof, "{err}");
+    assert_eq!(err.kind(), crate::io::ErrorKind::UnexpectedEof, "{err}");
     Ok(())
 }
 
