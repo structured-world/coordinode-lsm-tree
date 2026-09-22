@@ -837,8 +837,12 @@ fn burr_wire_rejects_corrupted_m_below_w() {
     let num_blocks_corrupt: u32 = 1;
     bytes[layer_header_start + 4..layer_header_start + 8]
         .copy_from_slice(&num_blocks_corrupt.to_le_bytes());
-    // z_byte_len = m * stride * 8; stride=1 (r=7 for fpr=0.01) → 256
-    let z_byte_len_corrupt: u32 = 32 * 8;
+    // z_byte_len = segments * r * 8, derived from the corrupted m rather
+    // than restated, so the test keeps reaching Params::new if the packed
+    // geometry ever changes instead of tripping the length check first.
+    let z_byte_len_corrupt =
+        u32::try_from(super::packed::z_byte_len(m_corrupt as usize, params.r).expect("fits usize"))
+            .expect("fits u32");
     bytes[layer_header_start + 8..layer_header_start + 12]
         .copy_from_slice(&z_byte_len_corrupt.to_le_bytes());
 
@@ -1225,6 +1229,381 @@ fn retrieval_wire_bytes_use_filter_type_three() {
 /// band placement, and BuRR's answer to one is the next layer. Failing the
 /// build instead turned a small, perfectly valid key set into a dead write:
 /// the LSM writer surfaced it as an unrecoverable compaction.
+/// Deterministic, well-spread hashes for a sizing fixture.
+fn sizing_hashes(n: usize) -> Vec<u64> {
+    (0..n as u64)
+        .map(|i| crate::hash::hash64(&i.to_le_bytes()))
+        .collect()
+}
+
+#[test]
+fn packed_layout_costs_about_r_bits_per_key() {
+    // The whole point of the packed layout: the payload follows `r`, where
+    // the row-major one cost 64 bits per row whatever `r` was — 74.5 bits per
+    // key at any width. The bound is per key including the per-block
+    // threshold bytes, the per-layer headers and the later layers' slots.
+    for (n, r) in [
+        (1_000_usize, 8_u8),
+        (1_000, 10),
+        (1_000, 16),
+        (100_000, 8),
+        (100_000, 10),
+        (100_000, 16),
+    ] {
+        let params = BurrParams::with_bpk(n, f32::from(r)).expect("params");
+        let builder = BurrBuilder::new(params).expect("builder");
+        let filter = builder.build_from_hashes(&sizing_hashes(n)).expect("build");
+        let len = filter.encoded_len();
+        assert_eq!(len, filter.to_wire_bytes().len(), "encoded_len is exact");
+        #[expect(
+            clippy::cast_precision_loss,
+            reason = "test code: a ratio over counts far below f64's exact range"
+        )]
+        let bits_per_key = (len * 8) as f64 / n as f64;
+        println!("n={n} r={r} bytes={len} bits/key={bits_per_key:.2}");
+        // Envelope, not a point: the slot inflation (~5%), the per-block
+        // threshold byte and the later layers all scale with r, while the
+        // per-layer headers do not — so a small filter carries visibly more
+        // per key than a large one. Measured at the time of writing:
+        //
+        //   n = 1 000    r =  8 / 10 / 16  →  10.83 / 13.39 / 21.07
+        //   n = 100 000  r =  8 / 10 / 16  →   9.47 / 11.80 / 18.79
+        //
+        // against a flat 74.5 for every one of them before the transpose.
+        assert!(
+            bits_per_key < f64::from(r).mul_add(1.25, 3.5),
+            "n={n} r={r}: {bits_per_key:.2} bits/key — the payload must follow r, \
+             not sit at the row-major 74.5",
+        );
+    }
+}
+
+#[test]
+fn wire_round_trips_at_every_fingerprint_width_for_both_filter_kinds() {
+    // The width is what the packed layout is parameterised by, so every one of
+    // them is a distinct geometry: `r` column words per segment, a band read
+    // that recombines two of them, and a payload length of segments * r * 8.
+    // An off-by-one in any of that would show at some widths and not others —
+    // r = 1, r = 64 and the widths where a segment's words cross a cache line
+    // are all different cases — so the sweep is exhaustive rather than a
+    // sample.
+    use super::filter::BurrFilterReader;
+
+    // Enough keys for several layers, few enough that 64 builds stay quick.
+    let n = 600_usize;
+    let members = sizing_hashes(n);
+    // Disjoint from the members, to check the probe answers on both sides.
+    let strangers: Vec<u64> = (n as u64..n as u64 + 600)
+        .map(|i| crate::hash::hash64(&i.to_le_bytes()))
+        .collect();
+
+    for r in 1..=64_u8 {
+        let params = BurrParams::with_bpk(n, f32::from(r)).expect("params");
+        let builder = BurrBuilder::new(params).expect("builder");
+
+        // Membership: every member must read present through the wire reader,
+        // and the in-memory filter and the wire reader must agree on every
+        // probe — the two walk different representations of the same matrix.
+        let filter = builder.build_from_hashes(&members).expect("build");
+        let bytes = filter.to_wire_bytes();
+        assert_eq!(bytes.len(), filter.encoded_len(), "r={r}: encoded_len");
+        let reader = BurrFilterReader::new(&bytes).expect("decode");
+        for h in &members {
+            assert!(reader.contains_hash(*h), "r={r}: member {h} read absent");
+        }
+        for h in &strangers {
+            assert_eq!(
+                reader.contains_hash(*h),
+                filter.contains_hash(*h),
+                "r={r}: wire and in-memory disagree on {h}",
+            );
+        }
+
+        // Retrieval: the same geometry storing a caller value instead of a
+        // fingerprint. It has no early-out, so it exercises the full column
+        // read at this width, and every member must recover its exact value.
+        let mask = if r == 64 { u64::MAX } else { (1u64 << r) - 1 };
+        let locators: Vec<u64> = (0..n as u64)
+            .map(|i| i.wrapping_mul(0x9E37) & mask)
+            .collect();
+        let retrieval = builder
+            .build_from_hashes_with_values(&members, &locators)
+            .expect("retrieval build");
+        let bytes = retrieval.to_wire_bytes();
+        for (h, want) in members.iter().zip(&locators) {
+            assert_eq!(
+                super::recover_value_from_bytes(&bytes, *h).expect("parse"),
+                Some(*want),
+                "r={r}: recovered the wrong locator",
+            );
+        }
+        // A membership reader must refuse a retrieval payload by its tag, so
+        // the two cannot be confused at this width either.
+        assert!(
+            BurrFilterReader::new(&bytes).is_err(),
+            "r={r}: a membership reader accepted a retrieval payload",
+        );
+    }
+}
+
+#[test]
+fn deduplicating_prefix_tokens_shrinks_the_filter_without_losing_a_member() {
+    // What the full-filter writer feeds the builder when a prefix extractor is
+    // configured: one token per key plus one per prefix, and neighbouring keys
+    // share prefixes by construction. This measures what removing the repeats
+    // is worth now that every token costs `r` bits rather than a slot only.
+    //
+    // 4 000 keys over 200 prefixes, which is the shape the extractor exists
+    // for — many keys under each prefix.
+    // 4 000 keys over 200 prefixes: twenty keys per prefix, which is the shape
+    // the extractor exists for. Small on purpose — this asserts the RULE (no
+    // member lost, the filter roughly halves), and the rule does not depend on
+    // scale. The million-key figure lives in `benches/bloom.rs`, where paying
+    // for a build that size is what the harness is for.
+    let keys: Vec<Vec<u8>> = (0..4_000_u32)
+        .map(|i| format!("p{:03}/k{:05}", i % 200, i).into_bytes())
+        .collect();
+
+    let mut raw: Vec<u64> = Vec::new();
+    for k in &keys {
+        raw.push(crate::hash::hash64(k));
+        // The extractor's prefix: everything up to and including the slash.
+        let cut = k.iter().position(|&b| b == b'/').expect("has a prefix") + 1;
+        raw.push(crate::hash::hash64(&k[..cut]));
+    }
+    let mut deduped = raw.clone();
+    deduped.sort_unstable();
+    deduped.dedup();
+
+    let build = |tokens: &[u64]| {
+        let params = BurrParams::with_bpk(tokens.len(), 10.0).expect("params");
+        let builder = BurrBuilder::new(params).expect("builder");
+        builder.build_from_hashes(tokens).expect("build")
+    };
+    let before = build(&raw);
+    let after = build(&deduped);
+
+    println!(
+        "tokens {} -> {}, filter {} -> {} bytes",
+        raw.len(),
+        deduped.len(),
+        before.encoded_len(),
+        after.encoded_len(),
+    );
+
+    // 4 000 keys + 200 distinct prefixes = 4 200 real tokens against 8 000
+    // pushed, so the filter should come out close to half the size.
+    assert_eq!(
+        deduped.len(),
+        4_200,
+        "one token per key plus one per prefix"
+    );
+    assert!(
+        after.encoded_len() * 100 < before.encoded_len() * 60,
+        "dedup must cut the filter materially: {} vs {} bytes",
+        after.encoded_len(),
+        before.encoded_len(),
+    );
+
+    // The saving must not cost a member: every key and every prefix still
+    // probes present. A dedup that dropped a distinct token would show up
+    // here as a false negative, which is the one failure a filter may not have.
+    for k in &keys {
+        assert!(after.contains_hash(crate::hash::hash64(k)), "key {k:?}");
+        let cut = k.iter().position(|&b| b == b'/').expect("has a prefix") + 1;
+        assert!(
+            after.contains_hash(crate::hash::hash64(&k[..cut])),
+            "prefix of {k:?}",
+        );
+    }
+}
+
+#[test]
+fn decoding_borrows_the_payload_instead_of_expanding_it() {
+    // The packing has to hold in memory too, not only on disk. A decode that
+    // materialised its own copy of the payload — worse, one row per word again
+    // — would move the overhead from the file into the block cache and give
+    // back most of the win, invisibly, because the file would still look small.
+    //
+    // Asserted structurally rather than by measuring an allocation: every
+    // layer's payload must point INTO the caller's buffer, which is only true
+    // of a borrow.
+    let n = 5_000_usize;
+    let params = BurrParams::with_bpk(n, 10.0).expect("params");
+    let builder = BurrBuilder::new(params).expect("builder");
+    let filter = builder.build_from_hashes(&sizing_hashes(n)).expect("build");
+    let bytes = filter.to_wire_bytes();
+
+    let decoded = super::wire::decode(&bytes).expect("decode");
+    let buffer = bytes.as_ptr_range();
+    let mut borrowed_bytes = 0_usize;
+    for layer in &decoded.layers {
+        let payload = layer.z_bytes.as_ptr_range();
+        assert!(
+            buffer.contains(&payload.start) && payload.end <= buffer.end,
+            "a layer's payload was copied out of the wire buffer",
+        );
+        borrowed_bytes += layer.z_bytes.len();
+        // Same for the thresholds.
+        let thresholds = layer.thresholds.as_ptr_range();
+        assert!(
+            buffer.contains(&thresholds.start) && thresholds.end <= buffer.end,
+            "a layer's thresholds were copied out of the wire buffer",
+        );
+    }
+    // Sanity: the borrowed payload is the bulk of the file, so the assertion
+    // above is not passing on an empty set of layers.
+    assert!(
+        borrowed_bytes * 10 > bytes.len() * 9,
+        "expected the payload to dominate the file, got {borrowed_bytes} of {}",
+        bytes.len(),
+    );
+}
+
+#[test]
+fn the_pre_build_estimate_lands_within_its_stated_tolerance() {
+    // `estimated_filter_size` decides where a partition splits, so what
+    // matters is that it tracks the built size across the range a partition
+    // can hold. It cannot be exact — the later layers' slot counts follow the
+    // bumped keys, which depend on the hashes — so the contract is a stated
+    // tolerance, and this is what states it.
+    use crate::table::filter::BloomConstructionPolicy;
+
+    let mut worst = 0.0_f64;
+    for n in [1_000_usize, 5_000, 20_000, 100_000] {
+        for r in [8_u8, 10, 16] {
+            let policy = BloomConstructionPolicy::BitsPerKey(f32::from(r));
+            let params = BurrParams::with_bpk(n, f32::from(r)).expect("params");
+            let builder = BurrBuilder::new(params).expect("builder");
+            let filter = builder.build_from_hashes(&sizing_hashes(n)).expect("build");
+
+            let actual = filter.encoded_len();
+            let estimate = policy.estimated_filter_size(n);
+            #[expect(
+                clippy::cast_precision_loss,
+                reason = "test code: a ratio over counts far below f64's exact range"
+            )]
+            let error = (estimate as f64 - actual as f64) / actual as f64;
+            println!(
+                "n={n} r={r} actual={actual} estimate={estimate} error={:+.1}%",
+                error * 100.0
+            );
+            worst = worst.max(error.abs());
+        }
+    }
+    assert!(
+        worst < 0.10,
+        "worst estimate error {:.1}% exceeds the 10% tolerance the doc states",
+        worst * 100.0,
+    );
+}
+
+#[test]
+fn a_hundred_thousand_keys_cost_about_r_bits_each_and_the_estimate_tracks_them() {
+    measure_size_at(
+        100_000,
+        &[(8_u8, 9.0..10.0), (10, 11.0..12.5), (16, 17.5..19.5)],
+    );
+}
+
+/// The same measurement at the scale a deployment runs at. `#[ignore]`d
+/// because three million-key builds cost seconds, which does not belong in
+/// every CI run — the rule the fast test asserts does not depend on scale,
+/// and what a million keys adds is the ASYMPTOTE: at a hundred thousand the
+/// per-layer headers and the last-layer floor are still visible per key.
+///
+/// ```text
+/// cargo nextest run --lib --all-features --no-capture \
+///   --run-ignored=ignored-only -E 'test(million_key_filter_sizes)'
+/// ```
+#[test]
+#[ignore = "heavy: three million-key BuRR builds; run manually when re-measuring"]
+fn million_key_filter_sizes() {
+    // r = 7 is the width that lands near the ~1% false-positive rate the
+    // industry baselines quote their bits-per-key at, so it is the one point
+    // where our figure is directly comparable to theirs.
+    measure_size_at(
+        1_000_000,
+        &[
+            (7_u8, 7.5..9.0),
+            (8, 8.5..10.0),
+            (10, 10.5..12.5),
+            (16, 17.0..19.5),
+        ],
+    );
+}
+
+/// Builds a filter of `n` keys at each width, reports its size, its bits per
+/// key and the pre-build estimate's error, and asserts each against its band.
+fn measure_size_at(n: usize, widths: &[(u8, core::ops::Range<f64>)]) {
+    // Every one of these used to be 74.49 bits per key, whatever `r` was.
+    // That is the defect: the figure named a false-positive target and said
+    // nothing about memory.
+    let members = sizing_hashes(n);
+
+    for (r, want) in widths.iter().map(|(r, w)| (*r, w.clone())) {
+        let policy = crate::table::filter::BloomConstructionPolicy::BitsPerKey(f32::from(r));
+        let params = BurrParams::with_bpk(n, f32::from(r)).expect("params");
+        let builder = BurrBuilder::new(params).expect("builder");
+        let filter = builder.build_from_hashes(&members).expect("build");
+
+        let len = filter.encoded_len();
+        assert_eq!(len, filter.to_wire_bytes().len(), "r={r}: encoded_len");
+
+        #[expect(
+            clippy::cast_precision_loss,
+            reason = "test code: ratios over counts far below f64's exact range"
+        )]
+        let (bits_per_key, estimate_error) = {
+            let estimate = policy.estimated_filter_size(n);
+            (
+                (len * 8) as f64 / n as f64,
+                (estimate as f64 - len as f64) / len as f64,
+            )
+        };
+        // The realised false-positive rate, measured rather than assumed to
+        // be 2^-r: the threshold scheme bumps keys between layers, and the
+        // rate is what makes a cross-engine comparison meaningful — bits per
+        // key only means something next to the FPR it buys.
+        let probes = (n / 5).max(10_000);
+        let mut hits = 0_usize;
+        for i in 0..probes as u64 {
+            if filter.contains_hash(crate::hash::hash64(&(u64::MAX - i).to_le_bytes())) {
+                hits += 1;
+            }
+        }
+        #[expect(
+            clippy::cast_precision_loss,
+            reason = "test code: a ratio over counts far below f64's exact range"
+        )]
+        let fpr = hits as f64 / probes as f64;
+        println!(
+            "n={n} r={r} bytes={len} bits/key={bits_per_key:.2} fpr={:.4}% \
+             (2^-r = {:.4}%) estimate error={:+.1}%",
+            fpr * 100.0,
+            100.0 / f64::from(1_u32 << r.min(31)),
+            estimate_error * 100.0,
+        );
+        assert!(
+            fpr < 4.0 / f64::from(1_u32 << r.min(31)),
+            "r={r}: realised FPR {fpr} is far above the 2^-r the width promises",
+        );
+
+        assert!(
+            want.contains(&bits_per_key),
+            "r={r}: {bits_per_key:.2} bits/key is outside {want:?} — the payload \
+             must follow r, and it used to sit at 74.49 for every width",
+        );
+        // The same tolerance the estimate documents, asserted at the scale
+        // where a filter partition decision actually matters.
+        assert!(
+            estimate_error.abs() < 0.10,
+            "r={r}: the pre-build estimate is {:+.1}% off the built size",
+            estimate_error * 100.0,
+        );
+    }
+}
+
 #[test]
 fn burr_builds_every_small_key_set_by_bumping_unplaceable_keys() {
     for n in 1..=256_usize {

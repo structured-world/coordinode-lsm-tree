@@ -247,6 +247,48 @@ fn burr_filter_contains(c: &mut Criterion) {
                 })
             });
         });
+
+        // The negative probe is the case the bit-sliced layout changes, and
+        // the one the true-positive benches above structurally cannot show.
+        // A present key agrees on every result bit, so its probe reads all
+        // `r` of them either way; an absent key disagrees after about two,
+        // and the walk stops there instead of XOR-folding the whole band.
+        // Sharing the built filter with the positive benches keeps the two
+        // numbers comparable — same payload, same residency, different keys.
+        //
+        // One width only. Measured across all three, the negative and positive
+        // probes came out indistinguishable (41-42 ns P50 at r = 7, 10 and 14
+        // alike — see `packed::walk_band` for why), so two more copies of the
+        // same number would cost bench time and add nothing. What is kept is
+        // the guard: a future change that makes the negative path SLOWER than
+        // the positive one shows up here.
+        if fpr != 0.01 {
+            continue;
+        }
+        let miss_hashes: Vec<u64> = (0..10_000_u64)
+            .map(|i| hash64(&(u128::MAX - u128::from(i)).to_be_bytes()))
+            .collect();
+        let miss_label = format!(
+            "burr filter contains (probe-only), true negative (FPR={}%)",
+            fpr * 100.0
+        );
+        let mut miss_idx = 0_usize;
+        c.bench_function(&miss_label, |b| {
+            b.iter_custom(|iters| {
+                measure_with_percentiles(&miss_label, iters, || {
+                    let hash = miss_hashes[miss_idx];
+                    miss_idx += 1;
+                    if miss_idx == miss_hashes.len() {
+                        miss_idx = 0;
+                    }
+                    // Not asserted absent: at these rates a handful of these
+                    // keys are genuine false positives, and failing the bench
+                    // on one would make it flaky for the reason the filter
+                    // exists. The work measured is the same either way.
+                    let _ = reader.contains_hash(hash);
+                })
+            });
+        });
     }
 }
 

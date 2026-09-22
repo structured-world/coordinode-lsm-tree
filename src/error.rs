@@ -19,6 +19,38 @@ pub enum Error {
     /// Invalid or unparsable data format version
     InvalidVersion(u8),
 
+    /// A table carries a `BuRR` filter or locator section in a wire format
+    /// this release does not read.
+    ///
+    /// The solution matrix was packed to `r` bits per row in the 6.0 format,
+    /// replacing a layout that spent a full 64-bit word per row whatever `r`
+    /// was. No reader for the old layout ships, deliberately: keeping one
+    /// would put a legacy decode path on the point-read hot path for as long
+    /// as any cold level went un-rewritten.
+    ///
+    /// The store is intact and its data is not lost — the sections have to be
+    /// rewritten by the offline converter before this release can open it.
+    /// Reported when the table is opened rather than from inside the first
+    /// point read, so an operator learns what to do instead of seeing a
+    /// header parse fail somewhere under a `get`.
+    ///
+    /// **On the converter not being in the tree yet.** The gate and the
+    /// converter are separate deliverables that block the same release, so no
+    /// published build ever refuses a store it has no tool for. Keeping a
+    /// migration-capable reader in the engine until the tool lands was
+    /// considered and rejected: a legacy decode path on the point-read hot
+    /// path would outlive the migration by however long the coldest level
+    /// goes un-rewritten, which for a bottom level can be indefinitely. The
+    /// engine carries one format; conversion is a one-way offline step.
+    UnsupportedFilterFormat {
+        /// The format the table carries, or `None` when the table predates
+        /// the stamp entirely (which means the original layout).
+        found: Option<u8>,
+
+        /// The only format this release reads.
+        expected: u8,
+    },
+
     /// Some required files could not be recovered from disk
     Unrecoverable,
 
@@ -501,6 +533,23 @@ pub enum Error {
 
 impl core::fmt::Display for Error {
     fn fmt(&self, f: &mut core::fmt::Formatter<'_>) -> core::fmt::Result {
+        // One variant gets prose rather than its Debug form: it is the only
+        // error whose remedy is a separate tool, and an operator who sees it
+        // needs to be told that rather than left to infer it from a struct
+        // dump. Everything else stays `{self:?}`.
+        if let Self::UnsupportedFilterFormat { found, expected } = self {
+            write!(f, "LsmTreeError: this store's filter sections are in ")?;
+            match found {
+                Some(v) => write!(f, "format {v}")?,
+                None => write!(f, "the original unstamped format")?,
+            }
+            return write!(
+                f,
+                ", but this release reads only format {expected}. The data is \
+                 intact: run the offline converter over the store to rewrite \
+                 its filter and locator sections, then open it again.",
+            );
+        }
         write!(f, "LsmTreeError: {self:?}")
     }
 }
@@ -564,6 +613,14 @@ impl Error {
     ///   key produces on perfectly healthy ciphertext.
     /// - [`Self::ZstdDictMismatch`]: the persisted descriptor names a
     ///   dictionary the caller did not supply, or supplied a different one.
+    /// - [`Self::UnsupportedFilterFormat`]: the persisted descriptor names a
+    ///   filter format this binary does not read. Exactly the same shape as
+    ///   the dictionary mismatch — healthy bytes, wrong environment — and the
+    ///   classification matters most for repair, which grades a table it
+    ///   cannot recover as damaged and leaves it out of the rebuilt manifest.
+    ///   Without this arm, repairing a legacy store would DELETE every
+    ///   filtered table in it over an error whose whole meaning is that the
+    ///   data is intact and awaiting conversion.
     ///
     /// A failure that DOES implicate the bytes (a bad sector, a structural
     /// decode failure) is not in this class: a retry cannot fix it, and the
@@ -575,6 +632,7 @@ impl Error {
             Self::Decrypt(_) => true,
             #[cfg(zstd_any)]
             Self::ZstdDictMismatch { .. } => true,
+            Self::UnsupportedFilterFormat { .. } => true,
             _ => false,
         }
     }

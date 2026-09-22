@@ -20,7 +20,7 @@
 //! ```
 
 use lsm_tree::{
-    AbstractTree, CompressionType, Config, SeqNo, SequenceNumberCounter, config::CompressionPolicy,
+    AbstractTree, CompressionType, Config, SequenceNumberCounter, config::CompressionPolicy,
     get_tmp_folder,
 };
 use std::path::Path;
@@ -84,7 +84,20 @@ fn regenerate_golden_corpus() {
 }
 
 #[test]
-fn golden_v5_corpus_opens_and_reads_under_current_code() {
+fn golden_v5_corpus_is_refused_at_open_naming_the_converter() {
+    // The 6.0 filter format replaces its predecessor outright and no reader
+    // for the old layout ships, so this fixture — written by 5.6.0 — must no
+    // longer open. What this test guards is the SHAPE of that refusal, which
+    // is the part that can regress silently:
+    //
+    //   * it happens at OPEN, not on the first point read. A tree that opens
+    //     and then fails somewhere under a `get` tells an operator nothing
+    //     about what to do, and may have served reads from the levels that
+    //     happened to parse before reaching one that did not.
+    //   * it is a TYPED error that names the remedy, not a parse failure.
+    //
+    // When the offline converter lands, the companion test to write is the
+    // positive one: convert this same fixture and assert it opens and reads.
     let fixture = Path::new(FIXTURE);
     assert!(
         fixture.join("current").exists(),
@@ -99,28 +112,95 @@ fn golden_v5_corpus_opens_and_reads_under_current_code() {
     copy_dir(fixture, tmp.path());
     let _ = std::fs::remove_file(tmp.path().join("LOCK"));
 
-    let tree = Config::new(
+    let err = Config::new(
         tmp.path(),
         SequenceNumberCounter::default(),
         SequenceNumberCounter::default(),
     )
     .open()
-    .expect("current code must open the v5.6.0 golden corpus");
+    .err()
+    .expect("a v5 store must not open under the 6.0 filter format");
 
-    for i in 0..N {
-        let got = tree
-            .get(key(i), SeqNo::MAX)
-            .expect("get")
-            .unwrap_or_else(|| panic!("golden corpus: key {i} missing"));
-        assert_eq!(
-            &*got,
-            val(i).as_slice(),
-            "golden corpus: value mismatch for key {i}"
-        );
-    }
-    let scanned = tree.range(key(0)..key(1_000_000), SeqNo::MAX, None).count();
-    assert_eq!(
-        scanned, N as usize,
-        "golden corpus: range scan must see every row"
+    assert!(
+        matches!(
+            err,
+            lsm_tree::Error::UnsupportedFilterFormat { found: None, .. }
+        ),
+        "expected UnsupportedFilterFormat naming the converter, got: {err:?}",
     );
+    // The message is the operator-facing half of the contract: a Debug dump
+    // would not tell anyone that a tool exists.
+    let rendered = err.to_string();
+    assert!(
+        rendered.contains("offline converter"),
+        "the error must name the converter, got: {rendered}",
+    );
+}
+
+#[test]
+fn repairing_a_v5_store_refuses_instead_of_discarding_its_tables() {
+    // Refusing the OPEN is only half the contract. An operator whose store
+    // will not open reaches for `repair()` next, and repair grades every SST
+    // it cannot recover as damaged: a table that fails recovery is left out
+    // of the rebuilt manifest and scheduled for removal once that manifest is
+    // durable. For a legacy store that would be every filtered table in it,
+    // deleted — over an error whose entire meaning is "the data is intact and
+    // awaiting conversion".
+    //
+    // So the refusal has to travel as one of the errors repair PROPAGATES
+    // rather than grades, the way a missing zstd dictionary already does: the
+    // bytes are healthy, the caller's environment is wrong, and a rerun after
+    // fixing it finds everything still on disk.
+    let fixture = Path::new(FIXTURE);
+    assert!(fixture.join("current").exists(), "golden fixture missing");
+
+    let tmp = get_tmp_folder();
+    copy_dir(fixture, tmp.path());
+    let _ = std::fs::remove_file(tmp.path().join("LOCK"));
+
+    // Count the SSTs before, so "nothing was discarded" is asserted against
+    // the directory rather than against the report's own accounting.
+    let sst_count = |dir: &Path| -> usize {
+        walk_count(&dir.join("segments")) + walk_count(&dir.join("current"))
+    };
+    let before = sst_count(tmp.path());
+
+    let err = Config::new(
+        tmp.path(),
+        SequenceNumberCounter::default(),
+        SequenceNumberCounter::default(),
+    )
+    .repair()
+    .expect_err("repair must refuse a store it cannot read rather than rebuild it");
+
+    assert!(
+        matches!(
+            err,
+            lsm_tree::Error::UnsupportedFilterFormat { found: None, .. }
+        ),
+        "repair must propagate the format refusal, not grade the tables as \
+         damaged; got: {err:?}",
+    );
+    assert_eq!(
+        sst_count(tmp.path()),
+        before,
+        "repair removed files from a store whose data is intact",
+    );
+}
+
+/// Counts files under `dir` recursively, or 0 if it does not exist.
+fn walk_count(dir: &Path) -> usize {
+    let Ok(entries) = std::fs::read_dir(dir) else {
+        return 0;
+    };
+    entries
+        .filter_map(Result::ok)
+        .map(|e| {
+            if e.file_type().is_ok_and(|t| t.is_dir()) {
+                walk_count(&e.path())
+            } else {
+                1
+            }
+        })
+        .sum()
 }

@@ -7512,6 +7512,42 @@ impl Table {
             }
         };
 
+        // Refuse a table whose BuRR sections are in the superseded wire format,
+        // here rather than on the first probe. The filter and the retrieval
+        // locator share `FORMAT_VERSION`, so both are covered by the one stamp
+        // and both are checked by the one condition — a table converted on the
+        // filter side alone would otherwise open and then fail inside a point
+        // read on its stale locator.
+        //
+        // Gated on a section actually being present: a table with no filter and
+        // no locator has nothing that could be misread, and refusing it would
+        // turn a harmless absence into an outage.
+        //
+        // NOT exempted in salvage mode, though salvage does re-derive every one
+        // of these sections from the recovered entries and so could in
+        // principle re-emit a legacy table in the current format. Exempting it
+        // here alone would not produce that migration: `verify_keep_decision`
+        // grades a table that RECOVERED by its block-verify verdict, and a
+        // healthy legacy table verdicts Clean and is KEPT verbatim — so the
+        // rebuilt manifest would reference unconverted tables, repair would
+        // report success, and the next ordinary open would refuse again. A
+        // repair that reports success and leaves an unopenable store is worse
+        // than one that refuses. Turning salvage into a real migration means a
+        // keep-decision reason that forces the rewrite, which is the offline
+        // converter's job and is tracked with it.
+        {
+            let has_burr_section = regions.filter.is_some()
+                || regions.filter_tli.is_some()
+                || regions.locator.is_some();
+            let expected = crate::table::filter::ribbon::burr::FORMAT_VERSION;
+            if has_burr_section && metadata.filter_format != Some(expected) {
+                return Err(crate::Error::UnsupportedFilterFormat {
+                    found: metadata.filter_format,
+                    expected,
+                });
+            }
+        }
+
         // Resolve the dictionary this table was written against, by the id the
         // table itself records. Fail-fast: a tree that does not hold that id
         // cannot decompress a single data block, so say so here rather than on

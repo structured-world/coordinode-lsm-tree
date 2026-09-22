@@ -2973,6 +2973,15 @@ fn write_meta_section<W: crate::io::Write + crate::io::Seek>(
         // homogeneous SST, so the read path learns the layout from the
         // descriptor instead of inspecting a block header.
         meta("descriptor#columnar", &[u8::from(p.use_columnar)]),
+        // Which BuRR wire format this table's filter and locator sections
+        // carry. Stamped so a reader learns it from the metadata instead of
+        // discovering it deep inside a point read, where the only honest
+        // answer left is a parse error. A table written before the stamp
+        // existed carries the v1 layout, which this release cannot read.
+        meta(
+            "descriptor#filter_format",
+            &[crate::table::filter::ribbon::burr::FORMAT_VERSION],
+        ),
         // Authenticated positional-delete count: the `delete_bitmap` section is
         // optional (omitted when empty), so this count lets a reader detect a
         // re-stamped TOC that hid a non-empty bitmap. A `> 0` count with no
