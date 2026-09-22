@@ -133,6 +133,80 @@ fn compression_makes_decoded_exceed_read() {
 }
 
 #[test]
+fn resolving_a_separated_value_counts_the_blob_it_read() {
+    // The clause that stops a key-value-separated tree from reading gigabytes
+    // while reporting only its indirections. A separated value leaves the
+    // filesystem through the blob path, not through a block, so if the blob
+    // read went uncounted, a change that moved work into it would look like an
+    // improvement.
+    let folder = get_tmp_folder();
+    let value_len = 8_192;
+    let n = 200_u32;
+    let tree = Config::new(
+        folder.path(),
+        SequenceNumberCounter::default(),
+        SequenceNumberCounter::default(),
+    )
+    .data_block_compression_policy(CompressionPolicy::all(CompressionType::None))
+    .with_kv_separation(Some(Default::default()))
+    .open()
+    .expect("open");
+    core::mem::forget(folder);
+    for i in 0..n {
+        tree.insert(key(i), vec![b'v'; value_len], u64::from(i));
+    }
+    tree.flush_active_memtable(0).expect("flush");
+
+    let m = tree.metrics();
+    let before = (m.bytes_read(), m.blob_bytes_read(), m.bytes_decoded());
+
+    for i in 0..n {
+        let got = tree.get(key(i), SeqNo::MAX).expect("get").expect("present");
+        assert_eq!(got.len(), value_len, "the whole value must come back");
+    }
+
+    let blob_read = m.blob_bytes_read() - before.1;
+    let total_read = m.bytes_read() - before.0;
+    let decoded = m.bytes_decoded() - before.2;
+    let payload = u64::from(n) * value_len as u64;
+
+    // Read is the ON-DISK span asked of the filesystem, decoded is what came
+    // out of it. A blob file compresses, and a run of one byte compresses
+    // hard, so the two must sit on opposite sides of the payload: anything
+    // that reported them as equal would be measuring the same number twice
+    // under two names.
+    assert!(
+        blob_read > 0,
+        "resolving a separated value read no blob bytes"
+    );
+    assert!(
+        blob_read < payload,
+        "blob reads {blob_read} B for {payload} B of values; a compressed blob \
+         file cannot be asked for more than it holds",
+    );
+    assert!(
+        decoded >= payload,
+        "decoded {decoded} B is less than the {payload} B of values returned",
+    );
+    assert!(
+        total_read > blob_read,
+        "the total must also carry the indirection blocks: {total_read} vs {blob_read}",
+    );
+
+    // Reading the same keys again is served from the blob cache, which asks
+    // the filesystem for nothing — the same clause the block path is held to.
+    let cached_from = m.blob_bytes_read();
+    for i in 0..n {
+        let _ = tree.get(key(i), SeqNo::MAX).expect("get");
+    }
+    assert_eq!(
+        m.blob_bytes_read(),
+        cached_from,
+        "a cached blob read asked the filesystem for nothing, so read must not move",
+    );
+}
+
+#[test]
 fn streaming_a_single_segment_copies_nothing() {
     // The clause: copied counts GATHERS — building a new buffer from bytes
     // that already exist in another. A scan over one segment whose rows are

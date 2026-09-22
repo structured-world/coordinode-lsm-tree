@@ -95,6 +95,25 @@ pub struct Metrics {
     /// the honest answer to "how much did this read ask the filesystem for".
     pub(crate) data_block_io_requested: AtomicU64,
 
+    /// Blob record bytes requested from the `Fs` trait: the on-disk span of
+    /// the records a read or a prefetch asked for, gaps merged into a
+    /// coalesced read included.
+    ///
+    /// Separate from the block counters because a blob is not a block, and
+    /// summed into [`Metrics::bytes_read`] because it IS a read of the
+    /// filesystem. A key-value-separated tree keeps most of its bytes here, so
+    /// leaving them out would let a change that moves work into the blob path
+    /// report an improvement by moving it out of sight.
+    ///
+    /// Counted on the uncached path only, like every other read counter: a
+    /// value served from the blob cache asks the filesystem for nothing.
+    pub(crate) blob_bytes_io_requested: AtomicU64,
+
+    /// Blob value bytes produced after decompression, decryption and
+    /// validation — the blob-side twin of `block_bytes_decoded`, summed into
+    /// [`Metrics::bytes_decoded`] for the same reason.
+    pub(crate) blob_bytes_decoded: AtomicU64,
+
     /// Number of index block bytes that were requested from OS or disk
     pub(crate) index_block_io_requested: AtomicU64,
 
@@ -225,16 +244,29 @@ impl Metrics {
     /// decompresses everything it then discards; decoded without read hides a
     /// change that decodes the same amount from far more I/O.
     pub fn bytes_decoded(&self) -> u64 {
-        self.block_bytes_decoded.load(Relaxed)
+        self.block_bytes_decoded.load(Relaxed) + self.blob_bytes_decoded.load(Relaxed)
     }
 
-    /// Bytes requested from the `Fs` trait, across every block role.
+    /// Bytes requested from the `Fs` trait: every block role, plus the blob
+    /// records a key-value-separated tree resolves.
     ///
-    /// An alias for [`Self::block_io`] under the name the mixed-layout
-    /// measurements use, so the triple reads as one family:
-    /// `bytes_read` / [`Self::bytes_decoded`] / [`Self::bytes_copied`].
+    /// Wider than [`Self::block_io`] on purpose. A separated value's bytes
+    /// leave the filesystem through the blob path rather than through a block,
+    /// and a figure that omitted them would report a tree that reads gigabytes
+    /// as reading only its indirections.
+    ///
+    /// Reported with [`Self::bytes_decoded`] and [`Self::bytes_copied`]; the
+    /// three are one family.
     pub fn bytes_read(&self) -> u64 {
-        self.block_io()
+        self.block_io() + self.blob_bytes_io_requested.load(Relaxed)
+    }
+
+    /// Bytes requested from the `Fs` trait for separated values alone.
+    ///
+    /// The blob-only share of [`Self::bytes_read`], so a scan can be asked
+    /// whether it paid for the blobs of rows it then discarded.
+    pub fn blob_bytes_read(&self) -> u64 {
+        self.blob_bytes_io_requested.load(Relaxed)
     }
 
     /// Bytes moved by a gather — accumulation, filtering, row gathering and

@@ -2,6 +2,8 @@
 // Copyright (c) 2024-present, fjall-rs
 // Copyright (c) 2026-present, Dmitry Prudnikov
 
+#[cfg(feature = "metrics")]
+use crate::metrics::Metrics;
 use crate::{
     Cache, GlobalTableId, TreeId, UserValue,
     version::BlobFileList,
@@ -17,11 +19,47 @@ use alloc::{string::ToString, vec::Vec};
 /// hold.
 pub struct Accessor<'a> {
     blob_files: &'a BlobFileList,
+    /// Where this accessor's reads are counted. A blob read is a read of the
+    /// filesystem like any other, so it lands in the same `bytes_read` /
+    /// `bytes_decoded` pair the block path reports through.
+    #[cfg(feature = "metrics")]
+    metrics: &'a Metrics,
 }
 
 impl<'a> Accessor<'a> {
-    pub fn new(blob_files: &'a BlobFileList) -> Self {
-        Self { blob_files }
+    pub fn new(
+        blob_files: &'a BlobFileList,
+        #[cfg(feature = "metrics")] metrics: &'a Metrics,
+    ) -> Self {
+        Self {
+            blob_files,
+            #[cfg(feature = "metrics")]
+            metrics,
+        }
+    }
+
+    /// Records one uncached blob read: what was asked of the filesystem, and
+    /// what came out of the record's validation and decompression.
+    #[cfg_attr(
+        not(feature = "metrics"),
+        expect(
+            unused_variables,
+            clippy::unused_self,
+            reason = "the arguments and the accessor's counters are both the feature's payload"
+        )
+    )]
+    #[inline]
+    fn count_read(&self, on_disk: usize, decoded: usize) {
+        #[cfg(feature = "metrics")]
+        {
+            use core::sync::atomic::Ordering::Relaxed;
+            self.metrics
+                .blob_bytes_io_requested
+                .fetch_add(on_disk as u64, Relaxed);
+            self.metrics
+                .blob_bytes_decoded
+                .fetch_add(decoded as u64, Relaxed);
+        }
     }
 
     /// Reads one separated value.
@@ -58,6 +96,12 @@ impl<'a> Accessor<'a> {
         let reader = Reader::new(blob_file, file.as_ref());
 
         let value = reader.get(key, vhandle)?;
+        // The same length `Reader::get` just read, recomputed rather than
+        // returned: it is a pure function of the key length and the handle, so
+        // the two cannot disagree, and threading it back out would widen the
+        // reader's signature for one counter.
+        let on_disk = crate::vlog::blob_file::reader::record_len(key.len(), vhandle)?;
+        self.count_read(on_disk, value.len());
         cache.insert_blob(tree_id, vhandle, key, value.clone());
 
         Ok(Some(value))
@@ -239,6 +283,12 @@ impl<'a> Accessor<'a> {
         let Ok(span) = crate::file::read_exact(file.as_ref(), span_start, span_len) else {
             return;
         };
+        // The whole extent, gaps included: that is what was asked of the
+        // filesystem, and swallowing a gap to merge two reads is the point of
+        // the coalescing, so charging only the records would hide its cost.
+        // Counted here rather than per record, because the read happened once
+        // whether or not every record it covers is then parsed.
+        self.count_read(span_len, 0);
 
         let reader = Reader::new(blob_file, file.as_ref());
 
@@ -275,6 +325,8 @@ impl<'a> Accessor<'a> {
                 span.slice(rel..record_end)
             };
             if let Ok(value) = reader.parse_record(key, &vhandle, &record) {
+                // Decoded only: the span's bytes were charged once above.
+                self.count_read(0, value.len());
                 // Checked BEFORE inserting, against the full weight the cache
                 // charges (key as well as value), and against the DECODED
                 // length rather than the on-disk one: a compressed blob file
