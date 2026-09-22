@@ -7522,6 +7522,19 @@ impl Table {
         // Gated on a section actually being present: a table with no filter and
         // no locator has nothing that could be misread, and refusing it would
         // turn a harmless absence into an outage.
+        //
+        // NOT exempted in salvage mode, though salvage does re-derive every one
+        // of these sections from the recovered entries and so could in
+        // principle re-emit a legacy table in the current format. Exempting it
+        // here alone would not produce that migration: `verify_keep_decision`
+        // grades a table that RECOVERED by its block-verify verdict, and a
+        // healthy legacy table verdicts Clean and is KEPT verbatim — so the
+        // rebuilt manifest would reference unconverted tables, repair would
+        // report success, and the next ordinary open would refuse again. A
+        // repair that reports success and leaves an unopenable store is worse
+        // than one that refuses. Turning salvage into a real migration means a
+        // keep-decision reason that forces the rewrite, which is the offline
+        // converter's job and is tracked with it.
         {
             let has_burr_section = regions.filter.is_some()
                 || regions.filter_tli.is_some()
