@@ -120,6 +120,41 @@ projection scenarios, and `bytes_copied` per input byte on every scenario. A
 change that improves compressed size while raising decoded per row has not
 paid for itself.
 
+### The `mixed-layout` workload
+
+`db_bench --benchmark mixed-layout` is where those counters are read. It walks
+a set of record shapes rather than repeating one operation, and reports the
+byte counters per emitted row instead of a rate:
+
+```sh
+cd tools/db_bench && cargo run --release -- --benchmark mixed-layout --num 70000
+```
+
+| Scenario | Shape |
+|---|---|
+| `narrow-records` | A few small fields per row. The control: no projection can cost more per row than reading a narrow row whole. |
+| `wide-records-full-read` | Small fields plus a 4 KiB payload, read whole. The baseline a projection is compared against. |
+| `mixed-value-sizes` | Short and long values in one key space, so no single block geometry fits both. |
+| `versions-and-deletes` | Several versions per key, a fifth deleted, read at `SeqNo::MAX`. Its expected visibility is derived from the write history, not from a second read, so a faulty resolution routine cannot agree with itself. |
+| `wide-records-projected` | **Unsupported.** Needs a projected scan spanning row and columnar segments. |
+| `row-updates-over-columnar-base` | **Unsupported.** Same missing capability. |
+| `blobs-filtered-before-fetch` | **Unsupported.** Needs materialization deferred past the filter. |
+
+A scenario whose native path does not exist reports `UNSUPPORTED` with the
+capability it waits for, and contributes no figure. It is never quietly run
+through a fallback path under the same name: a series that stays continuous
+across the change that was supposed to move it is worse than a gap.
+
+**On the dashboard** this workload publishes one series per scenario per
+counter, named `mixed-layout / <scenario> rows per KiB read` (and `… decoded`),
+in place of the ops/sec every other workload reports — for a scenario sweep the
+rate counts scenarios per second, which describes the harness rather than the
+engine. The unit is inverted because the dashboard draws every series
+bigger-is-better and all three counters improve by shrinking: more rows out of
+the same kibibyte is the improvement. `bytes_copied` stays in each point's
+annotation rather than becoming a series, because it is legitimately zero for a
+scan that gathers nothing.
+
 ## Checklist for format-changing PRs
 
 A PR that adds or changes an on-disk format feature MUST:

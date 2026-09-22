@@ -21,7 +21,14 @@ path = "src/main.rs"
 flamegraph = ["dep:tracing", "dep:tracing-subscriber", "dep:tracing-flame"]
 
 [dependencies]
-lsm-tree = { package = "coordinode-lsm-tree", path = "../..", features = ["lz4", "zstd"] }
+# `metrics` is not optional here: the mixed-layout workload reports the
+# read-path byte counters, and without the feature they do not exist. Every
+# other workload reports rates and is unaffected by it being on.
+lsm-tree = { package = "coordinode-lsm-tree", path = "../..", features = [
+    "lz4",
+    "zstd",
+    "metrics",
+] }
 clap = { version = "4", features = ["derive"] }
 hdrhistogram = "7"
 rand = "0.10"

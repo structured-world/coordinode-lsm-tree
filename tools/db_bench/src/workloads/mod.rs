@@ -2,6 +2,7 @@ pub mod fillrandom;
 pub mod fillseq;
 pub mod mergerandom;
 pub mod mixed;
+pub mod mixed_layout;
 pub mod overwrite;
 pub mod prefixscan;
 pub mod readrandom;
@@ -133,6 +134,10 @@ macro_rules! define_workloads {
 // workloads below then say where.
 define_workloads! {
     "mixed" => mixed::Mixed,
+    // Directly after `mixed`, because it answers the other half of the same
+    // question: `mixed` says whether the whole cycle got faster, this says
+    // what the read path actually moved to get there.
+    "mixed-layout" => mixed_layout::MixedLayout,
     "fillseq" => fillseq::FillSeq,
     "fillrandom" => fillrandom::FillRandom,
     "readrandom" => readrandom::ReadRandom,

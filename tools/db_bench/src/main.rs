@@ -374,7 +374,24 @@ fn run_single(
     let median_idx = (results.len() - 1) / 2;
     let median = &results[median_idx];
 
-    if cli.github_json {
+    if cli.github_json && !median.reporter.published().is_empty() {
+        // A workload that publishes its own series replaces the derived
+        // ops/sec rather than adding to it: for a scenario sweep the rate
+        // counts scenarios per second, which describes the harness and not
+        // the engine, and a dashboard series that means nothing is worse
+        // than an absent one because it still moves.
+        for series in median.reporter.published() {
+            github_entries.push(serde_json::json!({
+                "name": format!("{benchmark_name} / {}", series.name),
+                "value": series.value,
+                "unit": series.unit,
+                "extra": format!(
+                    "{}\nnum: {} | iterations: {}",
+                    series.extra, cli.num, iterations,
+                ),
+            }));
+        }
+    } else if cli.github_json {
         let s = median.reporter.summary(entry_size);
         // Raw ops/sec, no normalization. The previous design ran a
         // calibration workload at startup to "normalize" results

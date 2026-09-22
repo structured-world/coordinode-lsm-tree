@@ -14,12 +14,34 @@ pub struct Summary {
     pub p9999: f64,
 }
 
+/// One dashboard series a workload publishes itself, in place of the ops/sec
+/// figure the harness derives.
+///
+/// Rate is the right summary for a workload that repeats one operation, and
+/// the wrong one for a workload whose result IS a set of quantities: a
+/// scenario sweep that reports bytes moved per row would publish "7 ops/sec"
+/// (one per scenario), which is a number about the harness rather than about
+/// the engine. Such a workload states its own series and the harness reports
+/// those instead.
+///
+/// `value` is always oriented so that **bigger is better** — the dashboard is
+/// configured `customBiggerIsBetter` for every series it draws, so a quantity
+/// that improves by shrinking is published as its reciprocal (rows per KiB,
+/// not bytes per row) rather than as a series that silently reads upside down.
+pub struct PublishedSeries {
+    pub name: String,
+    pub value: f64,
+    pub unit: String,
+    pub extra: String,
+}
+
 /// Collects per-operation latencies and computes summary statistics.
 pub struct Reporter {
     histogram: Histogram<u64>,
     start: Option<Instant>,
     elapsed: Duration,
     ops_counted: u64,
+    published: Vec<PublishedSeries>,
 }
 
 impl Reporter {
@@ -33,7 +55,32 @@ impl Reporter {
             start: None,
             elapsed: Duration::ZERO,
             ops_counted: 0,
+            published: Vec::new(),
         }
+    }
+
+    /// Publish a series this workload computes itself. See [`PublishedSeries`]
+    /// for why a workload would, and for the bigger-is-better orientation its
+    /// `value` must already carry.
+    pub fn publish_series(
+        &mut self,
+        name: impl Into<String>,
+        value: f64,
+        unit: impl Into<String>,
+        extra: impl Into<String>,
+    ) {
+        self.published.push(PublishedSeries {
+            name: name.into(),
+            value,
+            unit: unit.into(),
+            extra: extra.into(),
+        });
+    }
+
+    /// The series this workload published, empty for every workload that
+    /// reports a rate.
+    pub fn published(&self) -> &[PublishedSeries] {
+        &self.published
     }
 
     /// Start the measurement timer, resetting all prior state.
@@ -41,6 +88,7 @@ impl Reporter {
         self.histogram.reset();
         self.elapsed = Duration::ZERO;
         self.ops_counted = 0;
+        self.published.clear();
         self.start = Some(Instant::now());
     }
 
@@ -85,6 +133,16 @@ impl Reporter {
             .add(&other.histogram)
             .expect("failed to merge histograms: incompatible configurations");
         self.ops_counted += other.ops_counted;
+        // Published series are not merged: `merge` folds one thread's share of
+        // a rate workload into the whole, and a series is a quantity, not a
+        // share — adding, averaging or concatenating per-thread copies would
+        // each be wrong in a different way. No threaded workload publishes
+        // one; the assertion holds that nothing is being dropped silently.
+        debug_assert!(
+            other.published.is_empty(),
+            "a per-thread reporter published a series; decide how it combines \
+             across threads before publishing from a threaded workload",
+        );
     }
 
     /// Compute derived metrics from raw histogram + elapsed time.
