@@ -1,5 +1,5 @@
 window.BENCHMARK_DATA = {
-  "lastUpdate": 1790075927506,
+  "lastUpdate": 1790102329490,
   "repoUrl": "https://github.com/structured-world/coordinode-lsm-tree",
   "entries": {
     "lsm-tree db_bench": [
@@ -23778,6 +23778,90 @@ window.BENCHMARK_DATA = {
             "value": 649307.2216598501,
             "unit": "ops/sec",
             "extra": "P50: 1.2us | P99: 6.4us | P99.9: 74.1us\nthreads: 1 | elapsed: 0.31s | num: 200000 | iterations: 3"
+          }
+        ]
+      },
+      {
+        "commit": {
+          "author": {
+            "email": "49699333+dependabot[bot]@users.noreply.github.com",
+            "name": "dependabot[bot]",
+            "username": "dependabot[bot]"
+          },
+          "committer": {
+            "email": "noreply@github.com",
+            "name": "GitHub",
+            "username": "web-flow"
+          },
+          "distinct": true,
+          "id": "dc88cd24f4fc68eee016fae82ec0ab49dca73e93",
+          "message": "ci(deps): bump release-plz/action from 0.5.136 to 0.5.139 (#693)\n\nBumps [release-plz/action](https://github.com/release-plz/action) from\n0.5.136 to 0.5.139.\n<details>\n<summary>Release notes</summary>\n<p><em>Sourced from <a\nhref=\"https://github.com/release-plz/action/releases\">release-plz/action's\nreleases</a>.</em></p>\n<blockquote>\n<h2>v0.5.139</h2>\n<h2>What's Changed</h2>\n<ul>\n<li>chore(deps): update dependency taiki-e/install-action to v2.87.14 by\n<a href=\"https://github.com/renovate\"><code>@​renovate</code></a>[bot]\nin <a\nhref=\"https://redirect.github.com/release-plz/action/pull/536\">release-plz/action#536</a></li>\n<li>chore(deps): update dependency taiki-e/install-action to v2.87.15 by\n<a href=\"https://github.com/renovate\"><code>@​renovate</code></a>[bot]\nin <a\nhref=\"https://redirect.github.com/release-plz/action/pull/537\">release-plz/action#537</a></li>\n<li>chore(deps): update dependency taiki-e/install-action to v2.87.16 by\n<a href=\"https://github.com/renovate\"><code>@​renovate</code></a>[bot]\nin <a\nhref=\"https://redirect.github.com/release-plz/action/pull/538\">release-plz/action#538</a></li>\n<li>Update to 0.3.169 by <a\nhref=\"https://github.com/marcoieni\"><code>@​marcoieni</code></a> in <a\nhref=\"https://redirect.github.com/release-plz/action/pull/540\">release-plz/action#540</a></li>\n</ul>\n<p><strong>Full Changelog</strong>: <a\nhref=\"https://github.com/release-plz/action/compare/v0.5.138...v0.5.139\">https://github.com/release-plz/action/compare/v0.5.138...v0.5.139</a></p>\n<h2>v0.5.138</h2>\n<h2>What's Changed</h2>\n<ul>\n<li>chore(deps): lock file maintenance by <a\nhref=\"https://github.com/renovate\"><code>@​renovate</code></a>[bot] in\n<a\nhref=\"https://redirect.github.com/release-plz/action/pull/532\">release-plz/action#532</a></li>\n<li>chore(deps): update dependency taiki-e/install-action to v2.87.13 by\n<a href=\"https://github.com/renovate\"><code>@​renovate</code></a>[bot]\nin <a\nhref=\"https://redirect.github.com/release-plz/action/pull/534\">release-plz/action#534</a></li>\n<li>Update to 0.3.168 by <a\nhref=\"https://github.com/marcoieni\"><code>@​marcoieni</code></a> in <a\nhref=\"https://redirect.github.com/release-plz/action/pull/535\">release-plz/action#535</a></li>\n</ul>\n<p><strong>Full Changelog</strong>: <a\nhref=\"https://github.com/release-plz/action/compare/v0.5.137...v0.5.138\">https://github.com/release-plz/action/compare/v0.5.137...v0.5.138</a></p>\n<h2>v0.5.137</h2>\n<h2>What's Changed</h2>\n<ul>\n<li>chore(deps): update dependency taiki-e/install-action to v2.87.10 by\n<a href=\"https://github.com/renovate\"><code>@​renovate</code></a>[bot]\nin <a\nhref=\"https://redirect.github.com/release-plz/action/pull/526\">release-plz/action#526</a></li>\n<li>chore(deps): update dependency taiki-e/install-action to v2.87.11 by\n<a href=\"https://github.com/renovate\"><code>@​renovate</code></a>[bot]\nin <a\nhref=\"https://redirect.github.com/release-plz/action/pull/529\">release-plz/action#529</a></li>\n<li>fix: support Gitea runners without GitHub identity lookup by <a\nhref=\"https://github.com/marcoienibot\"><code>@​marcoienibot</code></a>\nin <a\nhref=\"https://redirect.github.com/release-plz/action/pull/528\">release-plz/action#528</a></li>\n<li>chore(deps): update dependency taiki-e/install-action to v2.87.12 by\n<a href=\"https://github.com/renovate\"><code>@​renovate</code></a>[bot]\nin <a\nhref=\"https://redirect.github.com/release-plz/action/pull/530\">release-plz/action#530</a></li>\n<li>Update to 0.3.167 by <a\nhref=\"https://github.com/marcoieni\"><code>@​marcoieni</code></a> in <a\nhref=\"https://redirect.github.com/release-plz/action/pull/531\">release-plz/action#531</a></li>\n</ul>\n<h2>New Contributors</h2>\n<ul>\n<li><a\nhref=\"https://github.com/marcoienibot\"><code>@​marcoienibot</code></a>\nmade their first contribution in <a\nhref=\"https://redirect.github.com/release-plz/action/pull/528\">release-plz/action#528</a></li>\n</ul>\n<p><strong>Full Changelog</strong>: <a\nhref=\"https://github.com/release-plz/action/compare/v0.5.136...v0.5.137\">https://github.com/release-plz/action/compare/v0.5.136...v0.5.137</a></p>\n</blockquote>\n</details>\n<details>\n<summary>Commits</summary>\n<ul>\n<li><a\nhref=\"https://github.com/release-plz/action/commit/b8d6b54b02889ff2ae2bb82e8b57c3a8fc1683a5\"><code>b8d6b54</code></a>\nUpdate to 0.3.169 (<a\nhref=\"https://redirect.github.com/release-plz/action/issues/540\">#540</a>)</li>\n<li><a\nhref=\"https://github.com/release-plz/action/commit/7e10418246386569da67d0a24cf48e1e22cd02a5\"><code>7e10418</code></a>\nchore(deps): update dependency taiki-e/install-action to v2.87.16 (<a\nhref=\"https://redirect.github.com/release-plz/action/issues/538\">#538</a>)</li>\n<li><a\nhref=\"https://github.com/release-plz/action/commit/d857f6137c15757d56160bec07b8b864a0ff4635\"><code>d857f61</code></a>\nchore(deps): update dependency taiki-e/install-action to v2.87.15 (<a\nhref=\"https://redirect.github.com/release-plz/action/issues/537\">#537</a>)</li>\n<li><a\nhref=\"https://github.com/release-plz/action/commit/9e858f9ef3a7956552c999d63e4560d0f8fee359\"><code>9e858f9</code></a>\nchore(deps): update dependency taiki-e/install-action to v2.87.14 (<a\nhref=\"https://redirect.github.com/release-plz/action/issues/536\">#536</a>)</li>\n<li><a\nhref=\"https://github.com/release-plz/action/commit/d6c56271d640b6c1b61d1e00593641c400a9f4bd\"><code>d6c5627</code></a>\nUpdate to 0.3.168 (<a\nhref=\"https://redirect.github.com/release-plz/action/issues/535\">#535</a>)</li>\n<li><a\nhref=\"https://github.com/release-plz/action/commit/3acb31e441dd97e24c4a506379662b1f8464c68a\"><code>3acb31e</code></a>\nchore(deps): update dependency taiki-e/install-action to v2.87.13 (<a\nhref=\"https://redirect.github.com/release-plz/action/issues/534\">#534</a>)</li>\n<li><a\nhref=\"https://github.com/release-plz/action/commit/f77cdb110db9e97e8a6b0be2860b1e30acc07888\"><code>f77cdb1</code></a>\nchore(deps): lock file maintenance (<a\nhref=\"https://redirect.github.com/release-plz/action/issues/532\">#532</a>)</li>\n<li><a\nhref=\"https://github.com/release-plz/action/commit/8e61445f0b34e7c6d985255f2f1f05a36eb350dc\"><code>8e61445</code></a>\nUpdate to 0.3.167 (<a\nhref=\"https://redirect.github.com/release-plz/action/issues/531\">#531</a>)</li>\n<li><a\nhref=\"https://github.com/release-plz/action/commit/c9cf542b74a03e4207534ce67266b3e0eaf3fc33\"><code>c9cf542</code></a>\nchore(deps): update dependency taiki-e/install-action to v2.87.12 (<a\nhref=\"https://redirect.github.com/release-plz/action/issues/530\">#530</a>)</li>\n<li><a\nhref=\"https://github.com/release-plz/action/commit/c4d7bf617fc39443dd5d5045d1267fe8400870d6\"><code>c4d7bf6</code></a>\nfix: support Gitea runners without GitHub identity lookup (<a\nhref=\"https://redirect.github.com/release-plz/action/issues/528\">#528</a>)</li>\n<li>Additional commits viewable in <a\nhref=\"https://github.com/release-plz/action/compare/a80d79efe0a195618acb02a4089d55fe74d2505f...b8d6b54b02889ff2ae2bb82e8b57c3a8fc1683a5\">compare\nview</a></li>\n</ul>\n</details>\n<br />\n\n\n[![Dependabot compatibility\nscore](https://dependabot-badges.githubapp.com/badges/compatibility_score?dependency-name=release-plz/action&package-manager=github_actions&previous-version=0.5.136&new-version=0.5.139)](https://docs.github.com/en/github/managing-security-vulnerabilities/about-dependabot-security-updates#about-compatibility-scores)\n\nDependabot will resolve any conflicts with this PR as long as you don't\nalter it yourself. You can also trigger a rebase manually by commenting\n`@dependabot rebase`.\n\n[//]: # (dependabot-automerge-start)\n[//]: # (dependabot-automerge-end)\n\n---\n\n<details>\n<summary>Dependabot commands and options</summary>\n<br />\n\nYou can trigger Dependabot actions by commenting on this PR:\n- `@dependabot rebase` will rebase this PR\n- `@dependabot recreate` will recreate this PR, overwriting any edits\nthat have been made to it\n- `@dependabot show <dependency name> ignore conditions` will show all\nof the ignore conditions of the specified dependency\n- `@dependabot ignore this major version` will close this PR and stop\nDependabot creating any more for this major version (unless you reopen\nthe PR or upgrade to it yourself)\n- `@dependabot ignore this minor version` will close this PR and stop\nDependabot creating any more for this minor version (unless you reopen\nthe PR or upgrade to it yourself)\n- `@dependabot ignore this dependency` will close this PR and stop\nDependabot creating any more for this dependency (unless you reopen the\nPR or upgrade to it yourself)\n\n\n</details>\n\nSigned-off-by: dependabot[bot] <support@github.com>\nCo-authored-by: dependabot[bot] <49699333+dependabot[bot]@users.noreply.github.com>",
+          "timestamp": "2026-09-22T18:34:35Z",
+          "tree_id": "7235f30273c2aa909f87719f3574fff24d069878",
+          "url": "https://github.com/structured-world/coordinode-lsm-tree/commit/dc88cd24f4fc68eee016fae82ec0ab49dca73e93"
+        },
+        "date": 1790102273431,
+        "tool": "customBiggerIsBetter",
+        "benches": [
+          {
+            "name": "mixed",
+            "value": 80651.45472703277,
+            "unit": "ops/sec",
+            "extra": "P50: 0.4us | P99: 8.4us | P99.9: 27.4us\nthreads: 1 | elapsed: 6.64s | num: 200000 | iterations: 3"
+          },
+          {
+            "name": "fillseq",
+            "value": 3165839.3273224593,
+            "unit": "ops/sec",
+            "extra": "P50: 0.2us | P99: 0.6us | P99.9: 3.7us\nthreads: 1 | elapsed: 0.06s | num: 200000 | iterations: 3"
+          },
+          {
+            "name": "fillrandom",
+            "value": 1195346.5160131608,
+            "unit": "ops/sec",
+            "extra": "P50: 0.7us | P99: 1.3us | P99.9: 4.7us\nthreads: 1 | elapsed: 0.17s | num: 200000 | iterations: 3"
+          },
+          {
+            "name": "readrandom",
+            "value": 756175.1150331395,
+            "unit": "ops/sec",
+            "extra": "P50: 1.0us | P99: 6.4us | P99.9: 72.6us\nthreads: 1 | elapsed: 0.26s | num: 200000 | iterations: 3"
+          },
+          {
+            "name": "readseq",
+            "value": 2540043.7903549457,
+            "unit": "ops/sec",
+            "extra": "P50: 0.2us | P99: 4.8us | P99.9: 8.6us\nthreads: 1 | elapsed: 0.08s | num: 200000 | iterations: 3"
+          },
+          {
+            "name": "seekrandom",
+            "value": 330595.9984660346,
+            "unit": "ops/sec",
+            "extra": "P50: 2.4us | P99: 8.2us | P99.9: 14.3us\nthreads: 1 | elapsed: 0.60s | num: 200000 | iterations: 3"
+          },
+          {
+            "name": "prefixscan",
+            "value": 193672.1123391214,
+            "unit": "ops/sec",
+            "extra": "P50: 4.5us | P99: 6.2us | P99.9: 13.4us\nthreads: 1 | elapsed: 1.03s | num: 200000 | iterations: 3"
+          },
+          {
+            "name": "overwrite",
+            "value": 1124749.3214949719,
+            "unit": "ops/sec",
+            "extra": "P50: 0.8us | P99: 1.4us | P99.9: 4.8us\nthreads: 1 | elapsed: 0.18s | num: 200000 | iterations: 3"
+          },
+          {
+            "name": "mergerandom",
+            "value": 467839.2120839126,
+            "unit": "ops/sec",
+            "extra": "P50: 0.4us | P99: 0.9us | P99.9: 3.2us\nthreads: 1 | elapsed: 0.43s | num: 200000 | iterations: 3"
+          },
+          {
+            "name": "readwhilewriting",
+            "value": 651135.1401682338,
+            "unit": "ops/sec",
+            "extra": "P50: 1.2us | P99: 6.7us | P99.9: 73.9us\nthreads: 1 | elapsed: 0.31s | num: 200000 | iterations: 3"
           }
         ]
       }
