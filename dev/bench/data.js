@@ -1,5 +1,5 @@
 window.BENCHMARK_DATA = {
-  "lastUpdate": 1790026223031,
+  "lastUpdate": 1790075927506,
   "repoUrl": "https://github.com/structured-world/coordinode-lsm-tree",
   "entries": {
     "lsm-tree db_bench": [
@@ -23694,6 +23694,90 @@ window.BENCHMARK_DATA = {
             "value": 579374.2757821552,
             "unit": "ops/sec",
             "extra": "P50: 1.4us | P99: 6.8us | P99.9: 77.8us\nthreads: 1 | elapsed: 0.35s | num: 200000 | iterations: 3"
+          }
+        ]
+      },
+      {
+        "commit": {
+          "author": {
+            "email": "mail@polaz.com",
+            "name": "Dmitry Prudnikov",
+            "username": "polaz"
+          },
+          "committer": {
+            "email": "noreply@github.com",
+            "name": "GitHub",
+            "username": "web-flow"
+          },
+          "distinct": true,
+          "id": "8b03201bb82fab1bf486819a0f0a54d460583fed",
+          "message": "feat(filter)!: pack the BuRR solution matrix to r bits per row (#690)\n\n## What was wrong\n\nThe BuRR solution matrix was stored one `u64` per row whatever the\nfingerprint width was. `wire.rs` sized a row as `r.div_ceil(64)` words\nand `r` is validated to `1..=64`, so the stride was always 1 and a row\nwas always 8 bytes — on disk and in the block cache, since filter bodies\nare written uncompressed.\n\nSo `BitsPerKey(10)` and `BitsPerKey(16)` cost the same 74.49 bits per\nkey. The figure named a false-positive target and said nothing about\nmemory.\n\nA second consequence was an accounting bug rather than a missed\noptimisation: `estimated_filter_size` already modelled the packed layout\n(`n · r · 1.05 / 8`), and the partitioned writer spills on that\nestimate. Every partitioned filter was six to seven times its configured\n`partition_size`.\n\n## What changed\n\nRows are grouped into **segments of 64 and stored transposed**, one word\nper result bit, so a layer's payload is `segments · r · 8` bytes. A\nsegment is 64 rows rather than `b` rows because `b` is configurable in\n`64..=255` and need not divide 64; the final segment is partial and its\nrows past `m` are never addressed.\n\nA membership probe reduces one result bit at a time and stops at the\nfirst that disagrees with the fingerprint. Retrieval has no fingerprint\nto compare against and reads all `r`.\n\nThe size estimate now computes the first layer exactly and applies a\nmeasured multiplier for the layers the bumped keys land in. The exact\nlength is available separately, after the build, as `encoded_len`.\n`partition_size` stays a **target** with a stated tolerance rather than\na ceiling, matching the partitioned index writer, which likewise spills\non an accumulated size.\n\nPrefix tokens are deduplicated before the build: an extractor emits one\nper prefix per key and neighbouring keys share prefixes by construction,\nso the repeats add no members. Gated on an extractor being configured —\nwithout one the key set is already unique and the sort would be pure\ncost.\n\n## Measured\n\nAt a million keys, with the realised false-positive rate measured rather\nthan assumed:\n\n| `r` | bits/key | realised FPR | 2⁻ʳ |\n|---:|---:|---:|---:|\n| 7 | **8.27** | 0.781% | 0.781% |\n| 8 | 9.43 | 0.397% | 0.391% |\n| 10 | 11.76 | 0.104% | 0.098% |\n| 16 | 18.72 | 0.0025% | 0.0015% |\n\nEvery one of those was **74.49** before, whatever `r` was.\n\n**Against the baselines, at a matched rate.** RocksDB publishes 10.0\nbits/key for its Bloom filter and 7.0 for its Ribbon filter at the same\nFPR ([Ribbon Filter, RocksDB\nblog](https://rocksdb.org/blog/2021/12/29/ribbon-filter.html)). Our `r =\n7` lands at 0.781%, which is the comparable point:\n\n| | bits/key |\n|---|---:|\n| ours, before this change | 74.49 |\n| RocksDB Bloom | 10.0 |\n| **ours, after** | **8.27** |\n| RocksDB Ribbon | 7.0 |\n\nSo this moves us from ~7x worse than a Bloom filter to ~17% better than\none, and leaves us ~18% behind RocksDB's Ribbon. That remaining gap has\na named cause and is **deliberately out of scope here**: the 5%\nper-layer slot inflation and the conservative 90% threshold load factor\n(`threshold.rs` calls its own scheme an MVP and defers the analytic\nper-block variant). `1.05 × 1.15 ≈ 1.18` over `r` bits is exactly what\nthe table shows. Closing it is BuRR overloading plus compact threshold\nencoding, which is a change on top of this representation, not part of\nit.\n\n**The early-out did not pay.** Negative and positive probes measure the\nsame, 41-42 ns P50 at `r` = 7, 10 and 14 alike. A segment's `r` column\nwords are adjacent, so at these widths the whole set spans one or two\ncache lines: once the first word is fetched the rest arrive with it, and\nstopping early saves decoding rather than fetching, while the probe's\ncost sits in the equation derivation and the first cold touch. Kept,\nbecause it costs nothing measurable either and starts to matter as `r`\ngrows past a line's worth of words — and recorded next to the walk so\nthe prediction is not made again from the same reasoning.\n\n## Refusing without losing anything\n\nThe refusal is classified as an **environmental** error, the class\nrepair propagates instead of grading. That matters more than it sounds:\nrepair treats an SST it cannot recover as damaged — left out of the\nrebuilt manifest and scheduled for removal once that manifest is durable\n— so without the classification, repairing a 5.x store would have\ndeleted every filtered table in it, over an error whose whole meaning is\nthat the data is intact. It is the same shape as a missing zstd\ndictionary, which is already in that class.\n\nIt is **not** exempted in salvage mode, although salvage does re-derive\nthe filter, filter-TLI, locator and zone map from recovered entries.\nExempting it there would not produce a migration: `verify_keep_decision`\ngrades a table that recovered by its block-verify verdict, and a healthy\nlegacy table verdicts `Clean` and is kept verbatim, so the rebuilt\nmanifest would reference unconverted tables while repair reported\nsuccess — and the next ordinary open would refuse again. Turning salvage\ninto a real in-place migration needs a keep-decision reason that forces\nthe rewrite, which belongs with the converter.\n\n## Verification\n\nGates: `cargo fmt --check`, `clippy --all-features --all-targets -D\nwarnings` and again on default features, 3509 tests, 72 doctests, `cargo\ndoc` clean, and `cargo check --target thumbv7em-none-eabihf\n--no-default-features --features alloc`.\n\nThree tests caught real behaviour changes rather than breaking:\n\n- **the v5 golden corpus stopped opening** — which is the intended\neffect, so it now asserts the shape of the refusal instead: at open\nrather than inside the first point read, typed, and naming the\nconverter;\n- **the cache-priority test stopped seeing filter evictions** — because\nfilters became small enough to survive the churn at 256 KiB. The\nfixture's cache was resized to restore the eviction regime the test\nclaims to exercise, with a comment tying the number to the filter size;\n- **two estimate tests pinned the old formula's numbers** — rewritten to\ncheck the estimate against a real build, which is the contract they were\nalways for.\n\nEvery `r` in `1..=64` round-trips through the wire for both filter\nkinds, and a test asserts that decoding borrows the payload rather than\nexpanding it — a decode that copied would move the saving out of the\nfile and into the block cache, where the file would still look small.\n\n## Known gap, not closed here\n\nThe head-to-head harness has **no workload where the filter decides**:\n`tools/compare-rocksdb` covers write throughput, point read, multi-get,\nrange scan, seek, overwrite and compaction, all over keys that exist. A\ncomment in it already names \"bloom negative probes\" as part of the\nworkload surface not yet built. So the read-path half of this change\ncannot be demonstrated cross-engine yet, and the memory table above is\nthe evidence that exists.\n\nCloses #660\n\nBREAKING CHANGE: the BuRR wire format is replaced and no reader for the\nprevious layout ships. Tables now stamp their filter format; a store\nwritten by 5.x, which carries no stamp, is refused when it is opened if\nit has a filter or locator section, with a typed error naming the\noffline converter (#672).\n\n\n<!-- This is an auto-generated comment: release notes by coderabbit.ai\n-->\n\n## Summary by CodeRabbit\n\n- **New Features**\n- Added support for a more compact BuRR filter layout, reducing filter\nstorage overhead.\n- Prefix-token entries are now deduplicated before filters are built,\nwhich can further reduce table size.\n- Filter size estimates now more closely track the final serialized\nsize.\n\n- **Bug Fixes**\n- Tables now report a clear error when their filter format is\nunsupported, including guidance to use the offline converter.\n- Unsupported formats are detected when opening a table rather than\nduring point reads.\n\n<!-- end of auto-generated comment: release notes by coderabbit.ai -->",
+          "timestamp": "2026-09-22T14:14:13+03:00",
+          "tree_id": "4ca362b337619c1ef189fd34144390c334dc9e29",
+          "url": "https://github.com/structured-world/coordinode-lsm-tree/commit/8b03201bb82fab1bf486819a0f0a54d460583fed"
+        },
+        "date": 1790075867278,
+        "tool": "customBiggerIsBetter",
+        "benches": [
+          {
+            "name": "mixed",
+            "value": 80601.05946632141,
+            "unit": "ops/sec",
+            "extra": "P50: 0.4us | P99: 8.2us | P99.9: 27.8us\nthreads: 1 | elapsed: 6.64s | num: 200000 | iterations: 3"
+          },
+          {
+            "name": "fillseq",
+            "value": 3214209.376813015,
+            "unit": "ops/sec",
+            "extra": "P50: 0.2us | P99: 0.6us | P99.9: 3.7us\nthreads: 1 | elapsed: 0.06s | num: 200000 | iterations: 3"
+          },
+          {
+            "name": "fillrandom",
+            "value": 1164076.5962400327,
+            "unit": "ops/sec",
+            "extra": "P50: 0.7us | P99: 1.4us | P99.9: 4.8us\nthreads: 1 | elapsed: 0.17s | num: 200000 | iterations: 3"
+          },
+          {
+            "name": "readrandom",
+            "value": 763580.2751943312,
+            "unit": "ops/sec",
+            "extra": "P50: 1.0us | P99: 6.2us | P99.9: 71.6us\nthreads: 1 | elapsed: 0.26s | num: 200000 | iterations: 3"
+          },
+          {
+            "name": "readseq",
+            "value": 2578838.310706176,
+            "unit": "ops/sec",
+            "extra": "P50: 0.2us | P99: 4.7us | P99.9: 9.2us\nthreads: 1 | elapsed: 0.08s | num: 200000 | iterations: 3"
+          },
+          {
+            "name": "seekrandom",
+            "value": 327565.3980222584,
+            "unit": "ops/sec",
+            "extra": "P50: 2.5us | P99: 8.1us | P99.9: 13.8us\nthreads: 1 | elapsed: 0.61s | num: 200000 | iterations: 3"
+          },
+          {
+            "name": "prefixscan",
+            "value": 200841.9898741494,
+            "unit": "ops/sec",
+            "extra": "P50: 4.4us | P99: 5.8us | P99.9: 11.5us\nthreads: 1 | elapsed: 1.00s | num: 200000 | iterations: 3"
+          },
+          {
+            "name": "overwrite",
+            "value": 1134114.7383880827,
+            "unit": "ops/sec",
+            "extra": "P50: 0.8us | P99: 1.4us | P99.9: 4.9us\nthreads: 1 | elapsed: 0.18s | num: 200000 | iterations: 3"
+          },
+          {
+            "name": "mergerandom",
+            "value": 470832.84680605825,
+            "unit": "ops/sec",
+            "extra": "P50: 0.3us | P99: 1.3us | P99.9: 3.4us\nthreads: 1 | elapsed: 0.42s | num: 200000 | iterations: 3"
+          },
+          {
+            "name": "readwhilewriting",
+            "value": 649307.2216598501,
+            "unit": "ops/sec",
+            "extra": "P50: 1.2us | P99: 6.4us | P99.9: 74.1us\nthreads: 1 | elapsed: 0.31s | num: 200000 | iterations: 3"
           }
         ]
       }
