@@ -77,6 +77,49 @@ LSM_BENCH_PRESET=lsm-paranoid cargo bench
 The active preset is printed once to stderr at the start of the run, so it is
 recorded in the dashboard provenance.
 
+## Read-path byte counters
+
+Three counters describe what a read costs, and they are reported together
+because each one alone is misleading. They are behind the `metrics` feature
+and read through `AbstractTree::metrics()`.
+
+| Counter | Counts | Does not count |
+|---|---|---|
+| `bytes_read` | Bytes requested from the `Fs` trait: a block's on-disk size, summed over the block roles (data, index, filter, range tombstone). | Device I/O. The OS page cache, readahead and request coalescing sit below this line. A block served from the block cache asks for nothing and adds nothing. |
+| `bytes_decoded` | Payload bytes the block transform produced — what decompression, decryption and Page-ECC verification turned the bytes read into. | Anything on the cached path: a cached block is already decoded, so no transform runs for it. |
+| `bytes_copied` | Bytes moved by a **gather**: column-batch accumulation, batch filtering, row gathering by index, and row-value reconstruction from sub-columns. The figure is the size of the RESULT. | Transform output (that is `bytes_decoded`), write-path serialisation, and moves that transfer ownership without duplicating bytes. |
+
+**Why the definitions are written down rather than inferred.** "Bytes read"
+can plausibly mean either bytes asked of the filesystem or bytes the device
+actually moved, and the two differ by the whole page cache. "Bytes copied"
+means nothing at all until the set of operations it counts is named — without
+that, a new code path wins simply by not being instrumented. A figure whose
+definition is implicit is not a measurement.
+
+**How to read them.**
+
+- **Read and decoded together** tell a physical projection from a cosmetic
+  one. A projection that returns two columns of a wide record but still loads
+  and decompresses the whole block leaves decoded unchanged while the
+  returned batch shrinks; one that reads only the pages it needs moves it.
+  Read alone cannot show this — a 4 KiB compressed block is 4 KiB read
+  however much it expands to.
+- **Their ratio** is the compression the read actually paid for.
+- **Copied per input byte** should be a small constant. A path that
+  materialises its working set once sits there; one that folds batches
+  together pairwise records the whole accumulated size on every fold, so the
+  counter grows with the square of the fold count rather than with the data.
+  That growth is visible here and nowhere else.
+
+`tests/read_byte_counters.rs` pins one clause of each definition, so a change
+that moves a counter without moving the behaviour it stands for fails rather
+than quietly rebasing the instrument.
+
+**May not regress:** `bytes_read` and `bytes_decoded` per emitted row on the
+projection scenarios, and `bytes_copied` per input byte on every scenario. A
+change that improves compressed size while raising decoded per row has not
+paid for itself.
+
 ## Checklist for format-changing PRs
 
 A PR that adds or changes an on-disk format feature MUST:

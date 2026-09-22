@@ -230,6 +230,8 @@ impl Tree {
             seqno,
             lo,
             hi,
+            #[cfg(feature = "metrics")]
+            metrics: self.0.metrics.clone(),
         })
     }
 }
@@ -283,6 +285,31 @@ pub struct ColumnarScan {
     /// drop the rows that fall outside it.
     lo: Bound<UserKey>,
     hi: Bound<UserKey>,
+
+    /// Where this scan's gather cost is recorded. Held rather than reached
+    /// for through the tree because the scan outlives the call that built it.
+    #[cfg(feature = "metrics")]
+    metrics: alloc::sync::Arc<crate::Metrics>,
+}
+
+impl ColumnarScan {
+    /// Records the bytes a gather moved.
+    ///
+    /// The figure is the SIZE OF THE RESULT — what the operation wrote into a
+    /// new buffer — which is what makes repeated accumulation visible:
+    /// folding `k` batches one at a time records the whole accumulated size
+    /// `k` times, so the counter grows quadratically exactly where the work
+    /// does, while a single pass over the same data records it once.
+    #[inline]
+    fn record_gather(&self, batch: &ColumnBatch) {
+        #[cfg(feature = "metrics")]
+        self.metrics.bytes_copied.fetch_add(
+            batch.data_size() as u64,
+            core::sync::atomic::Ordering::Relaxed,
+        );
+        #[cfg(not(feature = "metrics"))]
+        let _ = batch;
+    }
 }
 
 impl ColumnarScan {
@@ -794,11 +821,18 @@ impl ColumnarScan {
                     }
                 }
                 let visible = filter_batch(&batch, &mask);
+                self.record_gather(&visible);
                 if visible.row_count == 0 {
                     continue;
                 }
                 match &mut combined {
-                    Some(acc) => acc.append(&visible)?,
+                    Some(acc) => {
+                        acc.append(&visible)?;
+                        // The accumulated batch, not the appended one: append
+                        // rebuilds the whole thing, so this is where the fold
+                        // over k batches shows its k-squared shape.
+                        self.record_gather(acc);
+                    }
                     None => combined = Some(visible),
                 }
             }
@@ -901,6 +935,7 @@ impl ColumnarScan {
         }
 
         let mut merged = take_rows(&combined, &kept)?;
+        self.record_gather(&merged);
 
         // The union spans segments with DIFFERENT offsets, so no single one
         // applies: write each surviving row's effective seqno — already computed
@@ -928,6 +963,7 @@ impl ColumnarScan {
         if let Some(pred) = self.predicate.as_ref() {
             let mask = pred.matching_rows(&merged);
             merged = filter_batch(&merged, &mask);
+            self.record_gather(&merged);
         }
 
         // Match the singleton contract: yield exactly the projected columns.

@@ -172,6 +172,17 @@ pub fn load_block(
         )));
     }
 
+    // What the transform produced, counted once per block that actually ran
+    // one. Paired with the per-role `*_io_requested` below: those record what
+    // was asked of the filesystem, this records what came out the other side
+    // of decompression, decryption and ECC. The ratio is the compression the
+    // read actually paid for, and its absolute value is what separates a
+    // physical projection from a cosmetic one.
+    #[cfg(feature = "metrics")]
+    metrics
+        .block_bytes_decoded
+        .fetch_add(block.data.len() as u64, Relaxed);
+
     #[cfg(feature = "metrics")]
     match block_type {
         BlockType::Filter => {

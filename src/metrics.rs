@@ -54,7 +54,45 @@ pub struct Metrics {
     /// Note: `BlobTree` prefix scans do not currently record this metric.
     pub(crate) prefix_bloom_skips: AtomicUsize,
 
-    /// Number of data block bytes that were requested from OS or disk
+    /// Payload bytes produced by the block transform — what decompression,
+    /// decryption and Page-ECC verification turned the bytes read into.
+    ///
+    /// Counted at the same site as `*_io_requested` and only on the same
+    /// uncached path, because a block served from the cache is already
+    /// decoded and no transform runs for it.
+    ///
+    /// This is the counter that tells a PHYSICAL projection from a cosmetic
+    /// one. A projection that returns two columns of a wide record but still
+    /// loads and decompresses the whole block leaves this figure unchanged
+    /// while the returned batch shrinks; one that reads only the pages it
+    /// needs moves it. Read alone cannot show that — a 4 KiB compressed block
+    /// is 4 KiB read however much it expands to.
+    pub(crate) block_bytes_decoded: AtomicU64,
+
+    /// Bytes moved by a gather: an operation that builds a new buffer whose
+    /// contents already existed in another one.
+    ///
+    /// The named set, so a new path cannot win by not being instrumented:
+    /// column-batch accumulation, batch filtering, row gathering by index,
+    /// and row-value reconstruction from sub-columns. It does NOT count a
+    /// block transform's output (that is `block_bytes_decoded`), a write
+    /// path's serialisation, or a move that transfers ownership without
+    /// duplicating bytes.
+    ///
+    /// The quantity this exists to expose is quadratic accumulation and
+    /// repeated re-gather: bytes copied per input byte should be a small
+    /// constant, and a path that re-materialises its working set several
+    /// times shows up here and nowhere else.
+    pub(crate) bytes_copied: AtomicU64,
+
+    /// Number of data block bytes that were requested from OS or disk.
+    ///
+    /// Definition: bytes REQUESTED FROM THE `Fs` TRAIT, which is the block's
+    /// on-disk size (`handle.size()`), not device I/O — the OS page cache,
+    /// readahead and request coalescing all sit below this line and are not
+    /// visible to it. Counted only when the block was not served from the
+    /// block cache, so a fully cached read reports zero bytes read, which is
+    /// the honest answer to "how much did this read ask the filesystem for".
     pub(crate) data_block_io_requested: AtomicU64,
 
     /// Number of index block bytes that were requested from OS or disk
@@ -177,6 +215,36 @@ impl Metrics {
             + self.index_block_io_requested.load(Relaxed)
             + self.filter_block_io_requested.load(Relaxed)
             + self.range_tombstone_block_io_requested.load(Relaxed)
+    }
+
+    /// Payload bytes the block transform produced — see
+    /// [`Self::bytes_read`] for the figure this is paired with.
+    ///
+    /// Read and decoded are reported together or not at all: each alone is
+    /// misleading. Read without decoded hides a projection that loads and
+    /// decompresses everything it then discards; decoded without read hides a
+    /// change that decodes the same amount from far more I/O.
+    pub fn bytes_decoded(&self) -> u64 {
+        self.block_bytes_decoded.load(Relaxed)
+    }
+
+    /// Bytes requested from the `Fs` trait, across every block role.
+    ///
+    /// An alias for [`Self::block_io`] under the name the mixed-layout
+    /// measurements use, so the triple reads as one family:
+    /// `bytes_read` / [`Self::bytes_decoded`] / [`Self::bytes_copied`].
+    pub fn bytes_read(&self) -> u64 {
+        self.block_io()
+    }
+
+    /// Bytes moved by a gather — accumulation, filtering, row gathering and
+    /// row-value reconstruction. The exact set is on the field.
+    ///
+    /// Interpreted per input byte: a path that materialises its working set
+    /// once sits near a small constant, and one that re-gathers repeatedly
+    /// grows with the number of passes rather than with the data.
+    pub fn bytes_copied(&self) -> u64 {
+        self.bytes_copied.load(Relaxed)
     }
 
     /// Number of data blocks that were accessed.
