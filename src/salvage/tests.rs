@@ -2586,11 +2586,18 @@ fn forge_row_group_column(
     };
     let page_at = group_at + directory_len + page.offset as usize;
 
+    // The page keeps its stamp: the forgery targets its content, not which
+    // group it claims to belong to.
+    let stamp = directory.stamp_for(page);
     let mut bytes = std::fs::read(source)?;
-    let mut column =
-        Column::decode_page(&block_payload(&bytes, page_at)?.into(), row_count, &mut 0)?;
+    let mut column = Column::decode_page(
+        &block_payload(&bytes, page_at)?.into(),
+        row_count,
+        stamp,
+        &mut 0,
+    )?;
     mutate(&mut column, row_count);
-    let new_payload = column.encode_page(row_count, CodecId::Plain)?;
+    let new_payload = column.encode_page(row_count, CodecId::Plain, stamp)?;
     restamp_block(&mut bytes, page_at, &new_payload)?;
     std::fs::write(source, &bytes)?;
     Ok(row_count)
@@ -2649,8 +2656,11 @@ fn forge_row_group_row_count(
     row_count: u32,
 ) -> crate::Result<()> {
     let (group_at, directory) = row_group(source, fs, group)?;
-    let forged =
-        crate::table::column_page::PageDirectory::new(row_count, directory.entries().to_vec())?;
+    let forged = crate::table::column_page::PageDirectory::new(
+        row_count,
+        directory.group_tag(),
+        directory.entries().to_vec(),
+    )?;
     let mut payload = Vec::new();
     forged.encode_into(&mut payload);
     let mut bytes = std::fs::read(source)?;
@@ -4816,6 +4826,106 @@ fn salvage_regenerates_a_rotted_parity_trailer_rather_than_copying_it() -> crate
             fresh.as_slice(),
             "block at offset {off}: the salvaged copy's parity matches its payload",
         );
+    }
+    Ok(())
+}
+
+/// Two row groups of an encrypted columnar table swap their value pages. Each
+/// page still authenticates, because the AEAD binds its table and its role but
+/// not the group it belongs to, and the two pages have the same length and row
+/// count. Unlike a block swap, which only costs a lookup miss because a value
+/// cannot leave its key's block, a page swap would serve one key's value under
+/// another key; the read must refuse the group instead.
+#[cfg(all(feature = "columnar", feature = "encryption"))]
+#[test]
+fn a_value_page_moved_between_row_groups_of_an_encrypted_table_is_refused() -> crate::Result<()> {
+    use crate::coding::Decode;
+    use crate::table::columnar::COL_VALUE;
+
+    let dir = tempdir()?;
+    let source = dir.path().join("source");
+    let fs: Arc<dyn Fs> = Arc::new(StdFs);
+    let enc: Arc<dyn crate::encryption::EncryptionProvider> =
+        Arc::new(crate::encryption::Aes256GcmProvider::new(&[0x42; 32]));
+    let mut writer = Writer::new(source.clone(), 0, 0, Arc::clone(&fs))?
+        .use_columnar(true)
+        .use_data_block_size(256)
+        .use_encryption(Some(Arc::clone(&enc)));
+    for i in 0..200_u32 {
+        writer.write(InternalValue::from_components(
+            format!("key{i:05}").into_bytes(),
+            format!("val{i:05}").into_bytes(),
+            1,
+            ValueType::Value,
+        ))?;
+    }
+    assert!(writer.finish()?.is_some(), "source is non-empty");
+
+    // Where the first two groups keep their value pages. The directory is
+    // encrypted, so it is read through the table; the page extents are then
+    // plain file ranges.
+    let pages = {
+        let table = open_encrypted(source.clone(), &fs, Arc::clone(&enc))?;
+        let handles: Vec<_> = table
+            .data_block_handles()
+            .filter_map(Result::ok)
+            .take(2)
+            .collect();
+        assert_eq!(handles.len(), 2, "source has at least two row groups");
+        let bytes = std::fs::read(&source)?;
+        let mut pages = Vec::new();
+        for kh in &handles {
+            let handle = kh.as_ref();
+            let directory = table.salvage_load_row_group(handle)?.group.directory;
+            let at = usize::try_from(*handle.offset()).unwrap_or(usize::MAX);
+            let Some(frame) = bytes.get(at..) else {
+                panic!("row group within the file");
+            };
+            let header = crate::table::block::Header::decode_from(&mut &frame[..])?;
+            let Some(value_page) = directory
+                .entries()
+                .iter()
+                .find(|e| e.id.column_id == COL_VALUE)
+            else {
+                panic!("row group holds a value page");
+            };
+            pages.push((
+                directory.row_count(),
+                at + header.on_disk_size_with(None) as usize + value_page.offset as usize,
+                value_page.length as usize,
+            ));
+        }
+        pages
+    };
+    let [(rows_a, at_a, len_a), (rows_b, at_b, len_b)] = pages[..] else {
+        panic!("two value pages located");
+    };
+    assert_eq!(
+        (rows_a, len_a),
+        (rows_b, len_b),
+        "the swap needs pages of the same length over the same row count",
+    );
+
+    let mut bytes = std::fs::read(&source)?;
+    let (Some(page_a), Some(page_b)) = (
+        bytes.get(at_a..at_a + len_a).map(<[u8]>::to_vec),
+        bytes.get(at_b..at_b + len_b).map(<[u8]>::to_vec),
+    ) else {
+        panic!("both value pages within the file");
+    };
+    for (at, page) in [(at_a, &page_b), (at_b, &page_a)] {
+        let Some(target) = bytes.get_mut(at..at + page.len()) else {
+            panic!("value page within the file");
+        };
+        target.copy_from_slice(page);
+    }
+    std::fs::write(&source, &bytes)?;
+
+    let table = open_encrypted(source, &fs, enc)?;
+    let key = b"key00000";
+    match table.get(key, crate::MAX_SEQNO, crate::hash::hash64(key)) {
+        Err(crate::Error::InvalidHeader(_)) => {}
+        other => panic!("a page from another row group must be refused, got {other:?}"),
     }
     Ok(())
 }
@@ -9355,6 +9465,112 @@ fn salvage_reencodes_an_ecc_recovered_columnar_block() -> crate::Result<()> {
         "the recovered copy stays columnar"
     );
     assert_eq!(recovered.metadata.item_count, 8, "every row is recovered");
+    Ok(())
+}
+
+/// A salvage whose output mixes copied and re-encoded row groups after a lost
+/// one. A copy keeps its pages' group tag, so the copy's tags no longer match
+/// its ordinals, and a re-encoded group must take a tag no copy already holds:
+/// two groups sharing a tag would let their pages pass for each other's. Here
+/// group 0 is lost, group 1 is re-encoded because the loss suppresses its
+/// boundary key, group 2 is copied with its tag 2, and group 3 is healed from
+/// parity and re-encoded after it. Group 3's ordinal in the copy is 2, which
+/// is exactly the tag the copy of group 2 kept.
+#[cfg(all(feature = "columnar", feature = "page_ecc"))]
+#[test]
+fn salvage_keeps_row_group_tags_unique_when_copies_and_reencodes_mix() -> crate::Result<()> {
+    use crate::table::block::EccParams;
+    use crate::table::columnar::entries_to_column_batch;
+
+    let dir = tempdir()?;
+    let source = dir.path().join("source");
+    let dest = dir.path().join("salvaged");
+    let fs: Arc<dyn Fs> = Arc::new(StdFs);
+    let cmp = default_comparator();
+    let key = |i: u32| format!("k{i:04}").into_bytes();
+
+    let mut writer = Writer::new(source.clone(), 0, 0, Arc::clone(&fs))?
+        .use_columnar(true)
+        .use_ecc(Some(EccParams::RS_4_2));
+    for group in 0..4u32 {
+        let entries: Vec<InternalValue> = (0..4u32)
+            .map(|i| {
+                InternalValue::from_components(
+                    key(group * 4 + i),
+                    b"x".to_vec(),
+                    0,
+                    ValueType::Value,
+                )
+            })
+            .collect();
+        writer.write_columnar_batch(&entries_to_column_batch(&entries)?, &cmp)?;
+    }
+    assert!(writer.finish()?.is_some(), "source is non-empty");
+
+    let offsets: Vec<usize> = {
+        let table = open(source.clone(), &fs)?;
+        table
+            .data_block_handles()
+            .filter_map(Result::ok)
+            .map(|kh| usize::try_from(*kh.as_ref().offset()).unwrap_or(usize::MAX))
+            .collect()
+    };
+    let [lost, lost_end, _, healed] = offsets[..] else {
+        panic!("source has four row groups, got {offsets:?}");
+    };
+    let mut bytes = std::fs::read(&source)?;
+    // Past what RS(4,2) corrects: every byte of the lost group after its
+    // directory's header, parity included.
+    let header_len = crate::table::block::Header::MIN_LEN;
+    let Some(lost_bytes) = bytes.get_mut(lost + header_len..lost_end) else {
+        panic!("lost group within the file");
+    };
+    for b in lost_bytes {
+        *b ^= 0xFF;
+    }
+    // One byte, which parity restores: the healed group is re-encoded.
+    let Some(b) = bytes.get_mut(healed + header_len + 3) else {
+        panic!("healed group within the file");
+    };
+    *b ^= 0x80;
+    std::fs::write(&source, &bytes)?;
+
+    let report = salvage_sst(&source, dest.clone(), &fs)?;
+    assert_eq!(
+        report.dropped.len(),
+        1,
+        "only the first group is lost: {report:?}"
+    );
+    assert_eq!(report.blocks_salvaged, 3, "{report:?}");
+    assert_eq!(
+        report.blocks_copied_verbatim, 1,
+        "the clean group keeps its bytes, so the tag rule did not force a re-encode: {report:?}",
+    );
+
+    let recovered = open(dest, &fs)?;
+    let tags: Vec<u64> = recovered
+        .data_block_handles()
+        .filter_map(Result::ok)
+        .map(|kh| {
+            recovered
+                .salvage_load_row_group(kh.as_ref())
+                .map(|g| g.group.directory.group_tag())
+        })
+        .collect::<crate::Result<_>>()?;
+    assert!(
+        tags.is_sorted_by(|a, b| a < b),
+        "row group tags must strictly increase in the copy, got {tags:?}",
+    );
+    // Row 4 is the suppressed boundary key; every row after it survives.
+    for i in 5..16u32 {
+        let k = key(i);
+        assert!(
+            recovered
+                .get(&k, crate::MAX_SEQNO, crate::hash::hash64(&k))?
+                .is_some(),
+            "row {i} of a recovered group must read back",
+        );
+    }
     Ok(())
 }
 

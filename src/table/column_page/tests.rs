@@ -6,7 +6,7 @@
 //! payload that decodes into a different set of pages than it was written
 //! from, and a payload whose entries describe a placement no writer produces.
 
-use super::{PageDirectory, PageEntry, PageId, VERSION};
+use super::{PageDirectory, PageEntry, PageId, PageStamp, VERSION};
 
 fn id(column_id: u16, part: u8) -> PageId {
     PageId { column_id, part }
@@ -22,9 +22,14 @@ fn entry(offset: u32, length: u32, column_id: u16, part: u8) -> PageEntry {
 
 const ROWS: u32 = 512;
 
+/// A tag wide enough that a field read at the wrong width or byte order
+/// would not round-trip by accident.
+const TAG: u64 = 0x0102_0304_0506_0708;
+
 fn directory() -> PageDirectory {
     PageDirectory::new(
         ROWS,
+        TAG,
         vec![
             entry(0, 128, 0, 0),
             entry(128, 4_096, 3, 0),
@@ -36,7 +41,7 @@ fn directory() -> PageDirectory {
 
 /// Byte offset of the first entry's `flags` field: the header, then the
 /// entry's offset, length, column id and part.
-const FIRST_FLAGS_AT: usize = (1 + 2 + 4) + (4 + 4 + 2 + 1);
+const FIRST_FLAGS_AT: usize = (1 + 2 + 4 + 8) + (4 + 4 + 2 + 1);
 
 #[test]
 fn a_directory_round_trips_through_its_wire_form() {
@@ -51,6 +56,34 @@ fn a_directory_round_trips_through_its_wire_form() {
         ROWS,
         "the row count must survive, since a reader needs it before any page",
     );
+    assert_eq!(
+        decoded.group_tag(),
+        TAG,
+        "the tag must survive, since every page's stamp is checked against it",
+    );
+}
+
+#[test]
+fn a_page_stamp_round_trips_and_names_its_directory_entry() {
+    // The stamp is what a reader compares a page against, so it has to come
+    // back exactly as written and has to be the one the directory implies for
+    // that entry: the group's tag and the entry's own column part.
+    let directory = directory();
+    let entry = directory.entries()[2];
+    let stamp = directory.stamp_for(&entry);
+    assert_eq!(
+        stamp,
+        PageStamp {
+            group_tag: TAG,
+            id: id(3, 1),
+        },
+    );
+
+    let mut bytes = Vec::new();
+    stamp.encode_into(&mut bytes);
+    assert_eq!(bytes.len(), PageStamp::LEN);
+    let array: [u8; PageStamp::LEN] = bytes.try_into().expect("stamp length");
+    assert_eq!(PageStamp::decode(array), stamp);
 }
 
 #[test]
@@ -73,7 +106,7 @@ fn an_unknown_version_is_refused_rather_than_parsed() {
 fn overlapping_pages_are_refused_at_construction() {
     // A directory that maps one byte into two pages has no correct reading,
     // so it is rejected where it is still fixable rather than at read time.
-    let err = PageDirectory::new(ROWS, vec![entry(0, 200, 0, 0), entry(128, 64, 1, 0)])
+    let err = PageDirectory::new(ROWS, TAG, vec![entry(0, 200, 0, 0), entry(128, 64, 1, 0)])
         .expect_err("overlapping pages must be refused");
     assert!(
         format!("{err:?}").contains("overlapping"),
@@ -83,7 +116,7 @@ fn overlapping_pages_are_refused_at_construction() {
 
 #[test]
 fn descending_pages_are_refused_at_construction() {
-    let err = PageDirectory::new(ROWS, vec![entry(4_096, 64, 1, 0), entry(0, 128, 0, 0)])
+    let err = PageDirectory::new(ROWS, TAG, vec![entry(4_096, 64, 1, 0), entry(0, 128, 0, 0)])
         .expect_err("descending pages must be refused");
     assert!(
         format!("{err:?}").contains("ascending"),
@@ -97,7 +130,7 @@ fn two_pages_claiming_one_column_part_are_refused() {
     // both claim column 3 part 0 leave a reader no way to tell which one is
     // the column's data. Whichever it picked, the other page is silently
     // unreachable, and a lookup that returns the first match would hide it.
-    let err = PageDirectory::new(ROWS, vec![entry(0, 64, 3, 0), entry(64, 64, 3, 0)])
+    let err = PageDirectory::new(ROWS, TAG, vec![entry(0, 64, 3, 0), entry(64, 64, 3, 0)])
         .expect_err("a duplicated column part must be refused");
     assert!(
         format!("{err:?}").contains("same column part"),
@@ -107,7 +140,7 @@ fn two_pages_claiming_one_column_part_are_refused() {
 
 #[test]
 fn a_page_extent_that_overflows_is_refused() {
-    let err = PageDirectory::new(ROWS, vec![entry(u32::MAX - 8, 16, 0, 0)])
+    let err = PageDirectory::new(ROWS, TAG, vec![entry(u32::MAX - 8, 16, 0, 0)])
         .expect_err("an extent past u32 must be refused");
     assert!(
         format!("{err:?}").contains("overflow"),
@@ -133,7 +166,7 @@ fn more_pages_than_the_count_field_holds_are_refused_at_construction() {
         })
         .collect();
     let err =
-        PageDirectory::new(ROWS, too_many).expect_err("a page count past u16 must be refused");
+        PageDirectory::new(ROWS, TAG, too_many).expect_err("a page count past u16 must be refused");
     assert!(
         format!("{err:?}").contains("page count"),
         "the error must name the page count, got {err:?}",
@@ -158,7 +191,7 @@ fn a_directory_of_the_largest_declarable_size_decodes_in_bounded_time() {
         })
         .collect();
     let mut bytes = Vec::new();
-    PageDirectory::new(ROWS, entries.clone())
+    PageDirectory::new(ROWS, TAG, entries.clone())
         .expect("distinct and ascending")
         .encode_into(&mut bytes);
 
@@ -223,7 +256,7 @@ fn a_contiguous_layout_places_each_page_where_the_previous_one_ends() {
     // pages follow the directory back to back. Offsets are a running sum of
     // lengths, and the pages' total is where the group ends.
     let directory =
-        PageDirectory::contiguous(ROWS, [(id(0, 0), 100), (id(1, 0), 40), (id(2, 0), 7)])
+        PageDirectory::contiguous(ROWS, TAG, [(id(0, 0), 100), (id(1, 0), 40), (id(2, 0), 7)])
             .expect("three pages");
     let offsets: Vec<u32> = directory.entries().iter().map(|e| e.offset).collect();
     assert_eq!(
@@ -238,7 +271,7 @@ fn a_contiguous_layout_places_each_page_where_the_previous_one_ends() {
     );
 
     assert_eq!(
-        PageDirectory::contiguous(ROWS, [])
+        PageDirectory::contiguous(ROWS, TAG, [])
             .expect("no pages")
             .pages_len(),
         0,
@@ -248,7 +281,7 @@ fn a_contiguous_layout_places_each_page_where_the_previous_one_ends() {
 
 #[test]
 fn a_contiguous_layout_that_overflows_is_refused() {
-    let err = PageDirectory::contiguous(ROWS, [(id(0, 0), u32::MAX), (id(1, 0), 1)])
+    let err = PageDirectory::contiguous(ROWS, TAG, [(id(0, 0), u32::MAX), (id(1, 0), 1)])
         .expect_err("a group length past u32 must be refused");
     assert!(
         format!("{err:?}").contains("overflow"),

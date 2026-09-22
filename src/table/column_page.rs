@@ -18,6 +18,7 @@
 //! [version   : u8    ]  currently 1; an unknown version is refused
 //! [page_count: u16 LE]
 //! [row_count : u32 LE]  rows in the group; every page describes exactly these
+//! [group_tag : u64 LE]  names the group; every page carries it in its stamp
 //! repeated page_count times, ascending by offset, non-overlapping:
 //!   [offset   : u32 LE]  start of the page, from the END of the directory
 //!   [length   : u32 LE]  on-disk length of the page, its header included
@@ -32,6 +33,23 @@
 //! block's identity. They are measured from the directory's end, where the
 //! first page starts, because the directory's own on-disk length depends on
 //! the transforms applied to it and is not known until it is sealed.
+//!
+//! # Page stamp
+//!
+//! Every page payload opens with a [`PageStamp`]: the group's tag and the
+//! `(column_id, part)` it holds. A reader refuses a page whose stamp is not
+//! the one its directory entry implies. The block layer's AEAD binds a block
+//! to its table and role but not to its position, which costs nothing for a
+//! row-major block, since a value cannot leave its key's block. A page's value
+//! is separated from its key by construction, so without the stamp two groups'
+//! value pages of equal length would swap undetected under encryption and
+//! serve one key's value under another. Inside an encrypted page the stamp is
+//! authenticated with the rest of the payload.
+//!
+//! The tag is carried in the directory rather than derived from the group's
+//! ordinal, so a group copied byte for byte into a table where its ordinal
+//! differs (a salvage that dropped an earlier group) still verifies. Tags
+//! strictly increase within a table, which keeps them unique.
 
 use crate::{Error, Result};
 #[cfg(not(feature = "std"))]
@@ -47,8 +65,8 @@ use alloc::vec::Vec;
 /// read; this one versions the directory block's own wire form.
 pub const VERSION: u8 = 1;
 
-/// `version` + `page_count` + `row_count`.
-const HEADER_LEN: usize = 1 + 2 + 4;
+/// `version` + `page_count` + `row_count` + `group_tag`.
+const HEADER_LEN: usize = 1 + 2 + 4 + 8;
 
 /// `offset` + `length` + `column_id` + `part` + `flags`.
 const ENTRY_LEN: usize = 4 + 4 + 2 + 1 + 1;
@@ -78,16 +96,53 @@ pub struct PageEntry {
     pub id: PageId,
 }
 
+/// What a page says about itself, at the front of its payload: the group it
+/// was written into and what it holds. See the module docs for why.
+#[derive(Clone, Copy, Debug, Eq, PartialEq)]
+pub struct PageStamp {
+    /// The owning group's [`PageDirectory::group_tag`].
+    pub group_tag: u64,
+    /// What the page holds.
+    pub id: PageId,
+}
+
+impl PageStamp {
+    /// `group_tag` + `column_id` + `part`.
+    pub const LEN: usize = 8 + 2 + 1;
+
+    /// Appends the stamp's wire form to `out`.
+    pub fn encode_into(self, out: &mut Vec<u8>) {
+        out.extend_from_slice(&self.group_tag.to_le_bytes());
+        out.extend_from_slice(&self.id.column_id.to_le_bytes());
+        out.push(self.id.part);
+    }
+
+    /// Reads a stamp from its wire form. Every byte pattern is a stamp; what
+    /// makes one wrong is disagreeing with the directory.
+    #[must_use]
+    pub fn decode(bytes: [u8; Self::LEN]) -> Self {
+        let [t0, t1, t2, t3, t4, t5, t6, t7, c0, c1, part] = bytes;
+        Self {
+            group_tag: u64::from_le_bytes([t0, t1, t2, t3, t4, t5, t6, t7]),
+            id: PageId {
+                column_id: u16::from_le_bytes([c0, c1]),
+                part,
+            },
+        }
+    }
+}
+
 /// A decoded page directory.
 #[derive(Clone, Debug, Default, Eq, PartialEq)]
 pub struct PageDirectory {
     row_count: u32,
+    group_tag: u64,
     entries: Vec<PageEntry>,
 }
 
 impl PageDirectory {
-    /// Builds a directory for a group of `row_count` rows from entries already
-    /// in ascending offset order.
+    /// Builds a directory for a group of `row_count` rows tagged `group_tag`,
+    /// from entries already in ascending offset order.
     ///
     /// # Errors
     ///
@@ -101,7 +156,7 @@ impl PageDirectory {
     /// correct reading, and one with more pages than its count field could
     /// only be written by truncating the list or by writing a count its
     /// entries contradict.
-    pub fn new(row_count: u32, entries: Vec<PageEntry>) -> Result<Self> {
+    pub fn new(row_count: u32, group_tag: u64, entries: Vec<PageEntry>) -> Result<Self> {
         if entries.len() > usize::from(u16::MAX) {
             return Err(Error::InvalidHeader(
                 "column page: page count exceeds the u16 directory field",
@@ -131,7 +186,11 @@ impl PageDirectory {
                 "column page: two pages claim the same column part",
             ));
         }
-        Ok(Self { row_count, entries })
+        Ok(Self {
+            row_count,
+            group_tag,
+            entries,
+        })
     }
 
     /// Lays `pages` out back to back from the directory's end, in the order
@@ -148,6 +207,7 @@ impl PageDirectory {
     /// length does not fit a `u32`.
     pub fn contiguous(
         row_count: u32,
+        group_tag: u64,
         pages: impl IntoIterator<Item = (PageId, u32)>,
     ) -> Result<Self> {
         let mut offset: u32 = 0;
@@ -158,7 +218,7 @@ impl PageDirectory {
                 "column page: group length overflows u32",
             ))?;
         }
-        Self::new(row_count, entries)
+        Self::new(row_count, group_tag, entries)
     }
 
     /// Total on-disk length of the pages, which is also where the last page
@@ -176,6 +236,21 @@ impl PageDirectory {
     #[must_use]
     pub fn row_count(&self) -> u32 {
         self.row_count
+    }
+
+    /// The tag every page of this group carries in its [`PageStamp`].
+    #[must_use]
+    pub fn group_tag(&self) -> u64 {
+        self.group_tag
+    }
+
+    /// The stamp the page at `entry` must carry.
+    #[must_use]
+    pub fn stamp_for(&self, entry: &PageEntry) -> PageStamp {
+        PageStamp {
+            group_tag: self.group_tag,
+            id: entry.id,
+        }
     }
 
     /// The pages, in ascending offset order.
@@ -197,6 +272,7 @@ impl PageDirectory {
         let count = self.entries.len() as u16;
         out.extend_from_slice(&count.to_le_bytes());
         out.extend_from_slice(&self.row_count.to_le_bytes());
+        out.extend_from_slice(&self.group_tag.to_le_bytes());
         for entry in &self.entries {
             out.extend_from_slice(&entry.offset.to_le_bytes());
             out.extend_from_slice(&entry.length.to_le_bytes());
@@ -228,6 +304,7 @@ impl PageDirectory {
         }
         let count = usize::from(u16::from_le_bytes(take(&mut rest).ok_or(ERR)?));
         let row_count = u32::from_le_bytes(take(&mut rest).ok_or(ERR)?);
+        let group_tag = u64::from_le_bytes(take(&mut rest).ok_or(ERR)?);
 
         // The declared count is on-disk data, so it bounds nothing until the
         // bytes behind it are seen to exist: reserve for what the payload can
@@ -255,7 +332,7 @@ impl PageDirectory {
                 "ColumnPageDirectory: trailing bytes after the declared pages",
             ));
         }
-        Self::new(row_count, entries)
+        Self::new(row_count, group_tag, entries)
     }
 }
 

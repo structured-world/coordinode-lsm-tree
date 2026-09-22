@@ -2360,8 +2360,13 @@ fn salvage_blocks(
                                 // consistent with the degraded-bitmap path.
                                 // A suppressed boundary key rebuilt the batch, so the
                                 // block's raw bytes no longer describe it — re-encode.
+                                // A copy keeps its pages' group tag, so one the copy
+                                // cannot take without repeating a tag is re-encoded
+                                // under a fresh one rather than dropped.
+                                let group_tag = sb.group.directory.group_tag();
                                 let verbatim_source = if table.has_delete_bitmap_section()
                                     || rebuilt_by_suppression
+                                    || !writer.accepts_group_tag(group_tag)
                                 {
                                     None
                                 } else {
@@ -2380,6 +2385,7 @@ fn salvage_blocks(
                                         .append_verbatim_row_group(
                                             &raw,
                                             uncompressed,
+                                            group_tag,
                                             &entries,
                                             Some(batch.zone_stats()),
                                             comparator,

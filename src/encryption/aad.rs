@@ -237,7 +237,9 @@ pub fn build(ctx: &EncryptionContext, identity: &BlockIdentity) -> [u8; AAD_LEN]
     // substitution is prevented by per-tree key isolation (a tree's blocks
     // decrypt only under its own key). Intra-file block-swap degrades only to a
     // lookup miss (a value is inseparable from its key inside the authenticated
-    // block), not forgery.
+    // block), not forgery. A columnar page does separate values from keys, so
+    // it names its row group inside its authenticated payload instead (see
+    // `table::column_page`).
     buf[8..16].copy_from_slice(&identity.table_id.to_be_bytes());
 
     // Offset 16..22: disk-mirrored codec context.

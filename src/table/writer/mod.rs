@@ -348,6 +348,12 @@ pub struct Writer {
     /// the marker key `lineage_last`, only alongside `lineage`.
     lineage_last: bool,
 
+    /// Tag of the last columnar row group written, `None` before the first.
+    /// Tags strictly increase so they stay unique within the table, which is
+    /// what makes a page's stamp name exactly one group.
+    #[cfg(feature = "columnar")]
+    last_group_tag: Option<u64>,
+
     /// Pre-trained zstd dictionary for dictionary compression
     #[cfg(zstd_any)]
     zstd_dictionary: Option<Arc<crate::compression::ZstdDictionary>>,
@@ -468,6 +474,9 @@ impl Writer {
             locator: None,
             locators: Vec::new(),
             locator_block_id: 0,
+
+            #[cfg(feature = "columnar")]
+            last_group_tag: None,
 
             block_buffer: Vec::new(),
             file_writer: writer,
@@ -1465,6 +1474,7 @@ impl Writer {
         // like data.
         let page_transform = self.data_transform(self.data_block_compression)?;
         let directory_transform = self.data_transform(crate::CompressionType::None)?;
+        let group_tag = self.next_group_tag()?;
 
         // One page per column: today every column's encoding names a single
         // part. A codec whose encoding names several parts gets one page per
@@ -1474,11 +1484,12 @@ impl Writer {
             .columns
             .iter()
             .map(|col| {
-                let payload = col.encode_page(batch.row_count, CodecId::Plain)?;
                 let id = PageId {
                     column_id: col.column_id,
                     part: 0,
                 };
+                let stamp = crate::table::column_page::PageStamp { group_tag, id };
+                let payload = col.encode_page(batch.row_count, CodecId::Plain, stamp)?;
                 Ok((id, payload))
             })
             .collect::<crate::Result<Vec<_>>>()?;
@@ -1502,6 +1513,7 @@ impl Writer {
 
         let directory = PageDirectory::contiguous(
             batch.row_count,
+            group_tag,
             pages
                 .iter()
                 .map(|(id, prepared)| (*id, prepared.on_disk_len(self.ecc))),
@@ -1537,6 +1549,7 @@ impl Writer {
                 ))?;
             uncompressed += u64::from(header.uncompressed_length);
         }
+        self.last_group_tag = Some(group_tag);
 
         // Per-column zone-map stats for this row group, derived once from the
         // batch. Gated on the zone-map policy exactly like the row-block
@@ -2101,29 +2114,64 @@ impl Writer {
     ///
     /// `raw` MUST be every block of one group, back to back, each already
     /// proved verbatim-safe by the salvage walk; `uncompressed_length` is the
-    /// sum over them.
+    /// sum over them, and `group_tag` is the tag its directory carries.
     ///
     /// # Errors
     ///
     /// As [`Self::append_verbatim_data_block`], minus the single-header length
-    /// check: a group has no one header to check against.
+    /// check: a group has no one header to check against. Also
+    /// [`crate::Error::InvalidHeader`] when [`Self::accepts_group_tag`] refuses
+    /// `group_tag`, which a caller is expected to have asked first.
     #[cfg(feature = "columnar")]
     pub(crate) fn append_verbatim_row_group(
         &mut self,
         raw: &[u8],
         uncompressed_length: u64,
+        group_tag: u64,
         entries: &[InternalValue],
         columnar_columns: Option<Vec<crate::table::zone_map::ColumnStats>>,
         comparator: &crate::SharedComparator,
     ) -> crate::Result<Option<crate::UserKey>> {
-        self.append_verbatim_extent(
+        if !self.accepts_group_tag(group_tag) {
+            return Err(crate::Error::InvalidHeader(
+                "columnar: a copied row group's tag does not follow the table's last",
+            ));
+        }
+        let first_key = self.append_verbatim_extent(
             raw,
             uncompressed_length,
             Vec::new(),
             entries,
             columnar_columns,
             comparator,
-        )
+        )?;
+        self.last_group_tag = Some(group_tag);
+        Ok(first_key)
+    }
+
+    /// Whether a row group tagged `group_tag` may be copied in next. A copy
+    /// keeps the tag its pages were stamped with, so it must still be above
+    /// every tag already in the table; a group encoded here takes the next
+    /// one instead.
+    ///
+    /// A salvage copying one source table in key order always satisfies
+    /// this: the source's tags increase, and a group it re-encodes takes one
+    /// above the last emitted, which is at most the source tag it replaces.
+    #[cfg(feature = "columnar")]
+    #[must_use]
+    pub(crate) fn accepts_group_tag(&self, group_tag: u64) -> bool {
+        self.last_group_tag.is_none_or(|last| group_tag > last)
+    }
+
+    /// The tag for the next row group encoded here.
+    #[cfg(feature = "columnar")]
+    fn next_group_tag(&self) -> crate::Result<u64> {
+        match self.last_group_tag {
+            None => Ok(0),
+            Some(last) => last.checked_add(1).ok_or(crate::Error::InvalidHeader(
+                "columnar: row group tags exhausted",
+            )),
+        }
     }
 
     /// Shared body of the verbatim copies: validates the entries' order,

@@ -56,6 +56,7 @@ to decode the key page just to count rows.
 | `version` | `u8` | directory wire version; an unknown one is refused |
 | `page_count` | `u16` | entries that follow |
 | `row_count` | `u32` | rows in the group; every page describes exactly these |
+| `group_tag` | `u64` | names the group; every page repeats it in its stamp |
 
 Then, for each page:
 
@@ -117,38 +118,57 @@ stated consequence is that two blocks of the same table are interchangeable
 at the AEAD layer, and that **position integrity is supplied one layer up, by
 the authenticated index**.
 
-That is exactly the layer a page does not have. A page is not in the index,
-so the protection the block layer is relying on does not reach it.
+For a row-major block that trade costs little: a swapped block is a lookup
+miss, because a value never leaves the block that holds its key. A page
+breaks that premise. Its values are separated from their keys by
+construction, and it is not in the index, so two row groups' value pages of
+equal length and row count swap undetected, and a key reads another key's
+value. Under encryption that is a forged read, not a miss.
 
-The page layer therefore binds the page's **logical** position:
+The page layer therefore makes every page **name itself**. Each page payload
+opens with a stamp, and a reader refuses a page whose stamp is not the one its
+directory entry implies:
 
 ```text
-AAD(page) = AAD(block) || row_group_ordinal || page_slot
+page payload = group_tag : u64 || column_id : u16 || part : u8 || encoding
 ```
 
-Logical, not physical, and that distinction is what makes it possible at all:
-the row group's ordinal and the page's slot within it are known to the writer
-before placement, so parallel encryption is preserved, while a file offset is
-not. A page moved between tables, between row groups, or between slots fails
-verification, which is the misdirection property the existing tests assert
-for blocks and which a page must not lose by being addressed differently.
+Inside an encrypted page the stamp is authenticated with the rest of the
+payload, so it binds exactly as a field in the AAD would, without changing
+the block layer's identity or its AAD layout. In a plain table, which has no
+authentication at all, it still turns a misplaced page into a refused read
+rather than a wrong value.
 
-The directory carries the same binding for itself, so a substituted directory
-fails before any page it names is read.
+The tag is **carried in the directory, not derived from the group's
+position**. A position-derived binding such as the group's ordinal would break
+the byte-for-byte copy that salvage makes of intact groups: once an earlier
+group is lost, every later group's ordinal in the copy shifts, and each copied
+page would fail verification under its new one. A carried tag survives the
+copy. What the binding needs is uniqueness within a table, and the writer
+supplies it by issuing tags in strictly increasing order: a group it encodes
+takes the next tag, and a copied group is accepted only above the last tag
+already written. A salvage copying one table in key order always satisfies
+that, because the source's tags increase and a re-encoded group takes a tag
+no higher than the source tag it replaces.
+
+Moving a page between slots of one group is already refused by
+`(column_id, part)`, which the stamp repeats. Moving a whole group, directory
+and pages together, is the block swap the index already governs: the group's
+keys travel with its values.
 
 ## Framing overhead
 
 The acceptance this format is held to asks for the overhead as a measured
 figure rather than a promise of zero. Per row group, each page adds a block
 header (33 bytes: SST blocks carry no flags byte, their transform comes from
-the table descriptor) and a 12-byte directory entry, and the group adds the
-directory's own header and block header once:
+the table descriptor), an 11-byte stamp and a 12-byte directory entry, and
+the group adds the directory's own 15-byte header and block header once:
 
 | Row group | 8 pages | 20 pages |
 |---|---|---|
-| 32 KiB | 400 B (1.22%) | 940 B (2.87%) |
-| 128 KiB | 400 B (0.31%) | 940 B (0.72%) |
-| 256 KiB | 400 B (0.15%) | 940 B (0.36%) |
+| 32 KiB | 496 B (1.51%) | 1168 B (3.56%) |
+| 128 KiB | 496 B (0.38%) | 1168 B (0.89%) |
+| 256 KiB | 496 B (0.19%) | 1168 B (0.45%) |
 
 Encryption adds its per-page tag and frame on top, roughly doubling those.
 Page-ECC does **not** scale with the page count in any meaningful way: its
@@ -157,7 +177,7 @@ paid with or without pages, and splitting only adds the rounding at each page
 boundary.
 
 These figures are a second reason the row group grows. At 32 KiB with a
-richly-encoded schema the framing is already 3%; at 128 KiB and above it is
+richly-encoded schema the framing is already 3.6%; at 128 KiB and above it is
 under 1% and stops being a term in the decision.
 
 ## What the index entry covers

@@ -528,8 +528,9 @@ impl RowGroupBlocks {
     /// # Errors
     ///
     /// [`crate::Error::InvalidHeader`] for a zero-row group, a page naming an
-    /// encoding part this build does not decode, or a page whose own column
-    /// id disagrees with the one the directory filed it under. The last two
+    /// encoding part this build does not decode, a page whose stamp names
+    /// another group or part, or a page whose own column id disagrees with the
+    /// one the directory filed it under. The last three
     /// fail the group rather than the page: a reader that skipped what it
     /// could not interpret, or trusted a page to be what the directory said
     /// without checking, would return a batch that is quietly missing or
@@ -559,8 +560,12 @@ impl RowGroupBlocks {
             if wanted.is_some_and(|w| !w.contains(&entry.id.column_id)) {
                 continue;
             }
-            let column =
-                crate::table::columnar::Column::decode_page(&page.data, row_count, copied)?;
+            let column = crate::table::columnar::Column::decode_page(
+                &page.data,
+                row_count,
+                self.directory.stamp_for(entry),
+                copied,
+            )?;
             if column.column_id != entry.id.column_id {
                 return Err(crate::Error::InvalidHeader(
                     "columnar: page column disagrees with its directory entry",

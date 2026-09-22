@@ -413,18 +413,25 @@ impl Column {
         Ok(())
     }
 
-    /// The payload of this column's page: its wire form and nothing else.
+    /// The payload of this column's page: `stamp`, then the column's wire form.
     ///
     /// # Errors
     ///
     /// As [`ColumnBatch::encode`], for this one column.
-    pub(crate) fn encode_page(&self, row_count: u32, default_codec: CodecId) -> Result<Vec<u8>> {
+    pub(crate) fn encode_page(
+        &self,
+        row_count: u32,
+        default_codec: CodecId,
+        stamp: crate::table::column_page::PageStamp,
+    ) -> Result<Vec<u8>> {
         let mut out = Vec::new();
+        stamp.encode_into(&mut out);
         self.encode_into(row_count, default_codec, &mut out)?;
         Ok(out)
     }
 
-    /// Decodes a column page's payload for a group of `row_count` rows.
+    /// Decodes a column page's payload for a group of `row_count` rows,
+    /// refusing it unless it carries `expected` as its stamp.
     ///
     /// A `Plain` column comes back as a zero-copy view of `bytes`, which here
     /// is the page's own payload rather than a whole row group's, so holding
@@ -432,17 +439,26 @@ impl Column {
     ///
     /// # Errors
     ///
-    /// Returns [`Error::InvalidHeader`] for a malformed column, or for bytes
-    /// left over after it: a page holds one column, and a tail means either a
-    /// writer this build does not understand or a corruption.
+    /// Returns [`Error::InvalidHeader`] for a stamp other than `expected`, for
+    /// a malformed column, or for bytes left over after it: a page holds one
+    /// column, and a tail means either a writer this build does not understand
+    /// or a corruption.
     ///
     /// Adds to `copied` the validity bitmap it copies out of the page.
     pub(crate) fn decode_page(
         bytes: &crate::Slice,
         row_count: u32,
+        expected: crate::table::column_page::PageStamp,
         copied: &mut usize,
     ) -> Result<Self> {
+        use crate::table::column_page::PageStamp;
+
         let mut cur = Cursor::new(bytes);
+        if PageStamp::decode(cur.read_array::<{ PageStamp::LEN }>()?) != expected {
+            return Err(Error::InvalidHeader(
+                "columnar: page belongs to another row group or column part",
+            ));
+        }
         let (column, _) = Self::decode_from(&mut cur, bytes, row_count, |_| true, copied)?.ok_or(
             Error::InvalidHeader("columnar: page column was not decoded"),
         )?;

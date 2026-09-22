@@ -877,14 +877,23 @@ fn columnar_decode_rejects_trailing_bytes() {
 /// tail did that copy: it is counted like the read a checksum later refuses.
 #[test]
 fn column_page_decode_refused_after_copying_still_counts_the_copy() {
+    use crate::table::column_page::{PageId, PageStamp};
+
     let batch = sample_batch();
     let nullable = batch.columns.first().expect("the nullable fixed column");
+    let stamp = PageStamp {
+        group_tag: 7,
+        id: PageId {
+            column_id: nullable.column_id,
+            part: 0,
+        },
+    };
     let mut page = nullable
-        .encode_page(batch.row_count, CodecId::Plain)
+        .encode_page(batch.row_count, CodecId::Plain, stamp)
         .expect("encode page");
     page.push(0); // one byte past the page's column
     let mut copied = 0usize;
-    let decoded = Column::decode_page(&page.into(), batch.row_count, &mut copied);
+    let decoded = Column::decode_page(&page.into(), batch.row_count, stamp, &mut copied);
     assert!(decoded.is_err(), "trailing bytes must be refused");
     assert_eq!(
         copied, 1,
