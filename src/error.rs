@@ -33,6 +33,15 @@ pub enum Error {
     /// Reported when the table is opened rather than from inside the first
     /// point read, so an operator learns what to do instead of seeing a
     /// header parse fail somewhere under a `get`.
+    ///
+    /// **On the converter not being in the tree yet.** The gate and the
+    /// converter are separate deliverables that block the same release, so no
+    /// published build ever refuses a store it has no tool for. Keeping a
+    /// migration-capable reader in the engine until the tool lands was
+    /// considered and rejected: a legacy decode path on the point-read hot
+    /// path would outlive the migration by however long the coldest level
+    /// goes un-rewritten, which for a bottom level can be indefinitely. The
+    /// engine carries one format; conversion is a one-way offline step.
     UnsupportedFilterFormat {
         /// The format the table carries, or `None` when the table predates
         /// the stamp entirely (which means the original layout).
@@ -604,6 +613,14 @@ impl Error {
     ///   key produces on perfectly healthy ciphertext.
     /// - [`Self::ZstdDictMismatch`]: the persisted descriptor names a
     ///   dictionary the caller did not supply, or supplied a different one.
+    /// - [`Self::UnsupportedFilterFormat`]: the persisted descriptor names a
+    ///   filter format this binary does not read. Exactly the same shape as
+    ///   the dictionary mismatch — healthy bytes, wrong environment — and the
+    ///   classification matters most for repair, which grades a table it
+    ///   cannot recover as damaged and leaves it out of the rebuilt manifest.
+    ///   Without this arm, repairing a legacy store would DELETE every
+    ///   filtered table in it over an error whose whole meaning is that the
+    ///   data is intact and awaiting conversion.
     ///
     /// A failure that DOES implicate the bytes (a bad sector, a structural
     /// decode failure) is not in this class: a retry cannot fix it, and the
@@ -615,6 +632,7 @@ impl Error {
             Self::Decrypt(_) => true,
             #[cfg(zstd_any)]
             Self::ZstdDictMismatch { .. } => true,
+            Self::UnsupportedFilterFormat { .. } => true,
             _ => false,
         }
     }

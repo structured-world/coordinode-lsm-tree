@@ -136,3 +136,71 @@ fn golden_v5_corpus_is_refused_at_open_naming_the_converter() {
         "the error must name the converter, got: {rendered}",
     );
 }
+
+#[test]
+fn repairing_a_v5_store_refuses_instead_of_discarding_its_tables() {
+    // Refusing the OPEN is only half the contract. An operator whose store
+    // will not open reaches for `repair()` next, and repair grades every SST
+    // it cannot recover as damaged: a table that fails recovery is left out
+    // of the rebuilt manifest and scheduled for removal once that manifest is
+    // durable. For a legacy store that would be every filtered table in it,
+    // deleted — over an error whose entire meaning is "the data is intact and
+    // awaiting conversion".
+    //
+    // So the refusal has to travel as one of the errors repair PROPAGATES
+    // rather than grades, the way a missing zstd dictionary already does: the
+    // bytes are healthy, the caller's environment is wrong, and a rerun after
+    // fixing it finds everything still on disk.
+    let fixture = Path::new(FIXTURE);
+    assert!(fixture.join("current").exists(), "golden fixture missing");
+
+    let tmp = get_tmp_folder();
+    copy_dir(fixture, tmp.path());
+    let _ = std::fs::remove_file(tmp.path().join("LOCK"));
+
+    // Count the SSTs before, so "nothing was discarded" is asserted against
+    // the directory rather than against the report's own accounting.
+    let sst_count = |dir: &Path| -> usize {
+        walk_count(&dir.join("segments")) + walk_count(&dir.join("current"))
+    };
+    let before = sst_count(tmp.path());
+
+    let err = Config::new(
+        tmp.path(),
+        SequenceNumberCounter::default(),
+        SequenceNumberCounter::default(),
+    )
+    .repair()
+    .expect_err("repair must refuse a store it cannot read rather than rebuild it");
+
+    assert!(
+        matches!(
+            err,
+            lsm_tree::Error::UnsupportedFilterFormat { found: None, .. }
+        ),
+        "repair must propagate the format refusal, not grade the tables as \
+         damaged; got: {err:?}",
+    );
+    assert_eq!(
+        sst_count(tmp.path()),
+        before,
+        "repair removed files from a store whose data is intact",
+    );
+}
+
+/// Counts files under `dir` recursively, or 0 if it does not exist.
+fn walk_count(dir: &Path) -> usize {
+    let Ok(entries) = std::fs::read_dir(dir) else {
+        return 0;
+    };
+    entries
+        .filter_map(Result::ok)
+        .map(|e| {
+            if e.file_type().is_ok_and(|t| t.is_dir()) {
+                walk_count(&e.path())
+            } else {
+                1
+            }
+        })
+        .sum()
+}

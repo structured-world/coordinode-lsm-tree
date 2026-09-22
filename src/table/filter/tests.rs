@@ -37,18 +37,29 @@ fn assert_estimate_tracks_build(policy: BloomConstructionPolicy, n: usize) {
     );
 }
 
+/// A hundred thousand keys, not a million: what these two check is that the
+/// estimate tracks a real build through each POLICY, and that does not need
+/// scale. The million-key point belongs to the ignored measurement in the
+/// `BuRR` tests, which already covers both widths these reach — paying for two
+/// more million-key builds on every default run would buy nothing.
+const ESTIMATE_FIXTURE_KEYS: usize = 100_000;
+
 #[test]
 fn burr_estimated_size_bpk() {
-    // One million keys is the size a partition estimate has to stay sane at,
-    // and it is the point the smaller fixtures in the BuRR tests do not reach.
-    assert_estimate_tracks_build(BloomConstructionPolicy::BitsPerKey(10.0), 1_000_000);
+    assert_estimate_tracks_build(
+        BloomConstructionPolicy::BitsPerKey(10.0),
+        ESTIMATE_FIXTURE_KEYS,
+    );
 }
 
 #[test]
 fn burr_estimated_size_fpr() {
     // ceil(-log2(0.01)) = 7 bits per key, so this also covers an odd `r` that
     // the bits-per-key fixtures (8, 10, 16) do not.
-    assert_estimate_tracks_build(BloomConstructionPolicy::FalsePositiveRate(0.01), 1_000_000);
+    assert_estimate_tracks_build(
+        BloomConstructionPolicy::FalsePositiveRate(0.01),
+        ESTIMATE_FIXTURE_KEYS,
+    );
 }
 
 #[test]
