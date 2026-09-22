@@ -255,6 +255,16 @@ fn burr_filter_contains(c: &mut Criterion) {
         // and the walk stops there instead of XOR-folding the whole band.
         // Sharing the built filter with the positive benches keeps the two
         // numbers comparable — same payload, same residency, different keys.
+        //
+        // One width only. Measured across all three, the negative and positive
+        // probes came out indistinguishable (41-42 ns P50 at r = 7, 10 and 14
+        // alike — see `packed::walk_band` for why), so two more copies of the
+        // same number would cost bench time and add nothing. What is kept is
+        // the guard: a future change that makes the negative path SLOWER than
+        // the positive one shows up here.
+        if fpr != 0.01 {
+            continue;
+        }
         let miss_hashes: Vec<u64> = (0..10_000_u64)
             .map(|i| hash64(&(u128::MAX - u128::from(i)).to_be_bytes()))
             .collect();
