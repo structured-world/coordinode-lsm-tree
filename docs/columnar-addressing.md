@@ -85,6 +85,129 @@ addressing unit, and none may become one: a statistics zone that also defined
 row identity would make pruning granularity a compatibility constraint, which
 is precisely the coupling the separation is for.
 
+## The geometry the separation requires
+
+Pages only pay if a page is worth reading on its own, and today's row group is
+far too small for that. A columnar row group is flushed at the data-block size
+target, 4 KiB by default (`src/tree/ingest.rs` compares `data_size()` against
+`data_block_size_policy`). The formats this design draws on are three orders
+of magnitude coarser: FastLanes' row group is a fixed multiple of 1024 rows,
+64 × 1024 in its defaults, and Vortex chunks a column at 2 MB of uncompressed
+data while pruning at 8k rows.
+
+What 4 KiB buys, for the record shapes the mixed-layout benchmark measures:
+
+| Shape | Bytes per row | Rows in a 4 KiB row group | A one-field page over those rows |
+|---|---|---|---|
+| narrow | 61 | 67 | 536 B |
+| 256-byte values | 285 | 14 | 112 B |
+| 4 KiB payload | 4157 | 1 | 8 B |
+
+A 536-byte page, or a 112-byte one, is below the granularity any device will
+serve: the read still costs a sector. Splitting a 4 KiB row group into pages
+therefore saves decode work — which `decode_projected` already saves — and
+saves nothing on the read the issue is about. **An eight-byte-per-row page
+needs 512 rows to reach 4 KiB at all**, which puts the row group at 30 KiB for
+narrow records and 142 KiB for 256-byte ones.
+
+So independently readable pages and a larger row group are one change, not
+two, and they are each other's precondition:
+
+- pages are pointless while the row group is 4 KiB, because the whole group is
+  one device read;
+- a row group of hundreds of kilobytes is unaffordable **unless** pages are
+  independently readable, because a point read would otherwise fetch the whole
+  group to return one row.
+
+That mutual dependence is also what keeps the change honest. A row group grows
+exactly as far as the page it makes readable is worth reading, and no further;
+the sizing is a measurement against the read path, not a number adopted from a
+format whose unit is written once per dataset rather than once per flush.
+
+Two consequences for the format follow directly:
+
+- **Integrity has to be per page, not per row group.** At 4 KiB a single
+  checksum or authentication tag over the whole block costs nothing extra to
+  verify. At 256 KiB it forces the whole group to be read to verify anything
+  inside it, which is precisely the ceiling the pages exist to remove.
+- **A point read stops being a whole-group read.** It fetches the page holding
+  keys and the pages holding the fields it was asked for. The key page is on
+  the path of every read, which is the first reason the grouping puts keys and
+  MVCC metadata in a page of their own rather than beside the payload.
+
+## Where the page directory lives, and how many pages there are
+
+The reference formats both keep their page directory in the file footer.
+Vortex registers every segment in a footer table as `SegmentSpec { offset:
+u64, length: u32, alignment_exponent: u8 }`, and its layout tree references
+those by index. FastLanes puts a descriptor per row group in the footer, each
+carrying a descriptor per column, each carrying a descriptor per segment
+(entry-point offset and size, data offset and size).
+
+**Their row group is large enough for that to be cheap, and ours is not.**
+FastLanes' Figure 7 shows one string column encoded as `DICT_FFOR_UINT8`
+occupying **five** segments (dictionary bytes, dictionary offsets, bit-packed
+codes, bases, bit widths), a constant column occupying **zero** (its value
+lives in the metadata), and a dictionary-only column occupying **one**. So the
+page count per row group is not a small constant chosen by us — it is however
+many parts the chosen encoding expressions name, and it is data-dependent.
+
+At a 16-byte descriptor, a 64 MiB SST works out as:
+
+| Row group | Groups per SST | 8 pages each | 20 pages each |
+|---|---|---|---|
+| 32 KiB | 2048 | 256 KiB of directory | 640 KiB |
+| 128 KiB | 512 | 64 KiB | 160 KiB |
+| 256 KiB | 256 | 32 KiB | 80 KiB |
+
+A footer is read whole when the table opens. Several hundred kilobytes of it
+per SST, across every open table, is a different cost from the one the
+reference formats pay — theirs is a file opened once per query against a row
+group of 64 × 1024 rows.
+
+**So the directory is per row group, not per table**, sitting with the group
+it describes and fetched with it, and the table-level footer gains nothing per
+page. This also keeps the directory's lifetime right: it is the thing a read
+consults after the index has already chosen a row group, so it is on the same
+path as the group's own bytes, not on the open path of every table.
+
+## What the neighbouring work requires of a page
+
+The page boundary is not free to choose, because four other pieces of work
+address it:
+
+- **Light column codecs.** The encoding is an expression over operators and
+  each operator names the parts of its encoded form. Those parts are what a
+  page holds: a page is one part of one encoding for a run of rows, which is
+  what makes "all the bases together, all the bit-packed bodies together"
+  expressible at all. The page count therefore follows the expressions, as
+  above.
+- **Column-native compaction.** What may be carried across a compaction
+  without re-encoding is "a self-contained decodable unit with its
+  dependencies preserved" — exactly the parts an expression names, carried
+  together. A page that is not self-contained cannot be copied, so the
+  boundary has to fall where a decodable unit ends, not where a convenient
+  byte count does.
+- **Selective late materialization.** The reader groups outstanding fetches
+  **by page**, and the guarantee is stated per page rather than per row: a
+  page holding one surviving row is still read whole. It also asks for useful
+  and incidentally-read bytes to be reported separately, which only means
+  something if a page is small enough for the distinction to exist.
+- **Resumable reads.** A suspension point carries a set of outstanding
+  requests, and a page is the natural request. A page addressed as a byte
+  range needs the request type to express a range rather than a block handle.
+
+There is a tension here worth stating rather than discovering later.
+**Per-page identity and cross-compaction copyability pull against each
+other.** The tighter a page's authentication binds it to its logical position
+(which table, which row group, which slot), the less of it can be carried
+across a compaction that changes any of those. That is already true today:
+`relocate_columnar_with_deletes` reuses blocks verbatim and carries
+restrictions around encryption and ECC for exactly this reason. The format
+does not get to have both without a decision about which binding is worth its
+cost, and that decision belongs with the page identity scheme, measured — not
+assumed in either direction.
+
 ## What this means for the conversion
 
 The offline converter preserves the logical geometry and changes only the
