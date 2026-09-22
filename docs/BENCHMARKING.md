@@ -85,8 +85,9 @@ and read through `AbstractTree::metrics()`.
 
 | Counter | Counts | Does not count |
 |---|---|---|
-| `bytes_read` | Bytes requested from the `Fs` trait: a block's on-disk size, summed over the block roles (data, index, filter, range tombstone). | Device I/O. The OS page cache, readahead and request coalescing sit below this line. A block served from the block cache asks for nothing and adds nothing. |
-| `bytes_decoded` | Payload bytes the block transform produced — what decompression, decryption and Page-ECC verification turned the bytes read into. | Anything on the cached path: a cached block is already decoded, so no transform runs for it. |
+| `bytes_read` | Bytes requested from the `Fs` trait: a block's on-disk size summed over the block roles (data, index, filter, range tombstone), plus the on-disk span of every blob record a key-value-separated tree resolved (a coalesced prefetch charges its whole extent, gaps included, because that is what it read). | Device I/O. The OS page cache, readahead and request coalescing sit below this line. Anything served from a cache, block or blob, asks for nothing and adds nothing. |
+| `blob_bytes_read` | The blob-only share of `bytes_read`, so a scan can be asked whether it paid for the blobs of rows it then discarded. | Everything the block roles cover. |
+| `bytes_decoded` | Payload bytes produced after the transform — what decompression, decryption and Page-ECC verification turned the bytes read into, for blocks and for blob records alike. | Anything on a cached path: a cached block or blob is already decoded, so no transform runs for it. |
 | `bytes_copied` | Bytes moved by a **gather**: column-batch accumulation, batch filtering, row gathering by index, and row-value reconstruction from sub-columns. The figure is the size of the RESULT. | Transform output (that is `bytes_decoded`), write-path serialisation, and moves that transfer ownership without duplicating bytes. |
 
 **Why the definitions are written down rather than inferred.** "Bytes read"
@@ -95,6 +96,12 @@ actually moved, and the two differ by the whole page cache. "Bytes copied"
 means nothing at all until the set of operations it counts is named — without
 that, a new code path wins simply by not being instrumented. A figure whose
 definition is implicit is not a measurement.
+
+That last hazard is not hypothetical: a key-value-separated tree keeps most of
+its bytes in blob files, so a counter that covered only blocks would report a
+tree reading gigabytes as reading a few bytes of indirection per row, and any
+change that moved work into the blob path would read as a win. Blob reads are
+counted for that reason.
 
 **How to read them.**
 
@@ -134,16 +141,30 @@ cd tools/db_bench && cargo run --release -- --benchmark mixed-layout --num 70000
 |---|---|
 | `narrow-records` | A few small fields per row. The control: no projection can cost more per row than reading a narrow row whole. |
 | `wide-records-full-read` | Small fields plus a 4 KiB payload, read whole. The baseline a projection is compared against. |
+| `wide-records-projected` | **Unsupported.** Needs a projection that returns the header fields without the payload. |
 | `mixed-value-sizes` | Short and long values in one key space, so no single block geometry fits both. |
-| `versions-and-deletes` | Several versions per key, a fifth deleted, read at `SeqNo::MAX`. Its expected visibility is derived from the write history, not from a second read, so a faulty resolution routine cannot agree with itself. |
-| `wide-records-projected` | **Unsupported.** Needs a projected scan spanning row and columnar segments. |
-| `row-updates-over-columnar-base` | **Unsupported.** Same missing capability. |
-| `blobs-filtered-before-fetch` | **Unsupported.** Needs materialization deferred past the filter. |
+| `row-updates-over-columnar-base` | A columnar base flushed first, then the layout switched off and a third of the keys rewritten, so the newest version of those lives in a row-major run above a columnar one. |
+| `versions-deletes-tombstones` | Several versions per key, a fifth point-deleted, a contiguous slice covered by a range tombstone, read at `SeqNo::MAX`. |
+| `selective-scan-sparse` | A predicate matching ~1% of rows. Where materializing before the predicate runs wastes nearly all the work. |
+| `selective-scan-near-full` | A predicate matching ~90%, over the same fixture. Deferring materialization buys almost nothing here and its bookkeeping can cost more than it saves, so the two are read together. |
+| `blobs-well-placed` | Values far above the separation threshold, written once in key order, so neighbours' blobs are adjacent. |
+| `blobs-scattered` | The same blobs written in a strided order and rewritten in several flushed rounds, so a key's live blob sits in whichever file its last round landed in. |
+| `blobs-filtered-before-fetch` | **Unsupported.** Needs materialization deferred past the filter, so discarded rows' blobs are never fetched. |
+
+**Every scenario checks what it read.** A pass that only counted rows would
+report a flattering figure for a build that stopped resolving versions, since
+skipping work is fast. Each read pass compares every value against the oracle
+its fixture derived from the **write history** — not from a second read, since
+two paths sharing one faulty version-resolution routine agree with each other
+while both are wrong.
 
 A scenario whose native path does not exist reports `UNSUPPORTED` with the
 capability it waits for, and contributes no figure. It is never quietly run
 through a fallback path under the same name: a series that stays continuous
-across the change that was supposed to move it is worse than a gap.
+across the change that was supposed to move it is worse than a gap. Its
+fixture exists regardless and is exercised by the workload's tests
+(`cd tools/db_bench && cargo nextest run`), so enabling the scenario later is
+one line rather than a fresh argument about what the expected result is.
 
 **On the dashboard** this workload publishes one series per scenario per
 counter, named `mixed-layout / <scenario> rows per KiB read` (and `… decoded`),

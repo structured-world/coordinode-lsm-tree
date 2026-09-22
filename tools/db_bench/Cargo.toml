@@ -23,11 +23,15 @@ flamegraph = ["dep:tracing", "dep:tracing-subscriber", "dep:tracing-flame"]
 [dependencies]
 # `metrics` is not optional here: the mixed-layout workload reports the
 # read-path byte counters, and without the feature they do not exist. Every
-# other workload reports rates and is unaffected by it being on.
+# other workload reports rates and is unaffected by it being on. `columnar`
+# is on for the same reason: one of that workload's fixtures lays a row-major
+# run over a columnar base, which is a shape the layout has to be compiled in
+# to build at all.
 lsm-tree = { package = "coordinode-lsm-tree", path = "../..", features = [
     "lz4",
     "zstd",
     "metrics",
+    "columnar",
 ] }
 clap = { version = "4", features = ["derive"] }
 hdrhistogram = "7"

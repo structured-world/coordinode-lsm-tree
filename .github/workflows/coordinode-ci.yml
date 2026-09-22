@@ -268,6 +268,15 @@ jobs:
         # unnoticed until its tests stopped compiling altogether. Lint both, or
         # the one nobody builds is the one that breaks.
         run: cargo clippy --all-targets -- -D warnings
+      - name: Clippy (db_bench)
+        if: needs.changes.outputs.code != 'false'
+        # The workspace gates above cover MEMBERS only, and the tool crates
+        # carry their own `[workspace]`, so nothing was linting this one. Its
+        # formatting was already checked (the `find tools` pass above); its
+        # lints were not, and the mixed-layout workload is a substantial body
+        # of code to leave unlinted.
+        working-directory: tools/db_bench
+        run: cargo clippy --all-features --all-targets -- -D warnings
 
   test:
     needs: [changes, lint]
@@ -362,10 +371,17 @@ jobs:
       - name: Run doc tests
         if: needs.changes.outputs.code != 'false' && needs.lint.result == 'success'
         run: cargo test --doc --features lz4
-      - name: Check db_bench crate
+      - name: Build + test db_bench crate
         if: needs.changes.outputs.code != 'false' && needs.lint.result == 'success'
+        # Standalone crate (not in workspace). Its tests build every
+        # mixed-layout fixture, including the ones whose scenario has no read
+        # path yet and which the benchmark therefore never builds — an
+        # unexercised fixture stops compiling, or stops meaning what its
+        # scenario needs, without anything noticing. No `--profile ci`: the
+        # parent crate's nextest profile is not visible from a non-workspace
+        # child.
         working-directory: tools/db_bench
-        run: cargo check --all-features
+        run: cargo nextest run --all-features
       - name: Build + test sst-dump crate
         if: needs.changes.outputs.code != 'false' && needs.lint.result == 'success'
         # Standalone crate (not in workspace), exercise both the bin
