@@ -27,10 +27,11 @@ pub struct Summary {
 /// the engine. Such a workload states its own series and the harness reports
 /// those instead.
 ///
-/// `value` is always oriented so that **bigger is better** — the dashboard is
-/// configured `customBiggerIsBetter` for every series it draws, so a quantity
-/// that improves by shrinking is published as its reciprocal (rows per KiB,
-/// not bytes per row) rather than as a series that silently reads upside down.
+/// Each series states its [`Direction`], and the dashboard keeps the two
+/// directions in separate suites: `github-action-benchmark` fixes one
+/// direction per suite, so a cost that improves by shrinking is published as a
+/// smaller-is-better series rather than as a reciprocal that reads upside down
+/// or divides by zero.
 ///
 /// Every output mode reports these in place of the rate: the dashboard entries,
 /// the `--json` report and the human summary.
@@ -40,6 +41,40 @@ pub struct PublishedSeries {
     pub value: f64,
     pub unit: String,
     pub extra: String,
+    pub direction: Direction,
+}
+
+/// Dashboard entries, one suite per direction.
+///
+/// `github-action-benchmark` takes a single direction per suite, so yields and
+/// costs are written to separate files and stored as separate suites; mixing
+/// them would read one of the two upside down.
+#[derive(Default)]
+pub struct GithubSuites {
+    /// Bigger-is-better entries: the `customBiggerIsBetter` suite.
+    pub yields: Vec<serde_json::Value>,
+    /// Smaller-is-better entries: the `customSmallerIsBetter` suite.
+    pub costs: Vec<serde_json::Value>,
+}
+
+impl GithubSuites {
+    /// Adds `entry` to the suite its direction belongs to.
+    pub fn push(&mut self, direction: Direction, entry: serde_json::Value) {
+        match direction {
+            Direction::BiggerIsBetter => self.yields.push(entry),
+            Direction::SmallerIsBetter => self.costs.push(entry),
+        }
+    }
+}
+
+/// Which way a series improves.
+#[derive(Clone, Copy, Debug, PartialEq, Eq, Serialize)]
+#[serde(rename_all = "snake_case")]
+pub enum Direction {
+    /// A yield: rows per KiB read, operations per second.
+    BiggerIsBetter,
+    /// A cost: bytes copied per byte decoded, an amplification.
+    SmallerIsBetter,
 }
 
 /// Collects per-operation latencies and computes summary statistics.
@@ -67,20 +102,21 @@ impl Reporter {
     }
 
     /// Publish a series this workload computes itself. See [`PublishedSeries`]
-    /// for why a workload would, and for the bigger-is-better orientation its
-    /// `value` must already carry.
+    /// for why a workload would, and [`Direction`] for which way it improves.
     pub fn publish_series(
         &mut self,
         name: impl Into<String>,
         value: f64,
         unit: impl Into<String>,
         extra: impl Into<String>,
+        direction: Direction,
     ) {
         self.published.push(PublishedSeries {
             name: name.into(),
             value,
             unit: unit.into(),
             extra: extra.into(),
+            direction,
         });
     }
 

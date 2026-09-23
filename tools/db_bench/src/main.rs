@@ -6,7 +6,7 @@ mod reporter;
 mod workloads;
 
 use crate::config::{BenchConfig, Compression};
-use crate::reporter::{JsonConfig, Reporter};
+use crate::reporter::{Direction, GithubSuites, JsonConfig, Reporter};
 use crate::workloads::{available_benchmarks, create_workload};
 use clap::Parser;
 use lsm_tree::AbstractTree; // for get_highest_seqno
@@ -76,6 +76,12 @@ struct Cli {
     /// Implies running all benchmarks if --benchmark is "all".
     #[arg(long)]
     github_json: bool,
+
+    /// With --github-json: write the smaller-is-better series (costs such as
+    /// bytes copied per byte decoded) to this file, in the same format, for a
+    /// customSmallerIsBetter suite. Without it those series are not written.
+    #[arg(long, requires = "github_json")]
+    github_json_costs: Option<PathBuf>,
 
     /// Database directory path. If not set, a temporary directory is used.
     /// Note: some workloads (e.g. `prefixscan`, `mergerandom`) create their
@@ -193,7 +199,7 @@ fn main() {
     };
 
     // Collect github-action-benchmark entries when --github-json is set.
-    let mut github_entries: Vec<serde_json::Value> = Vec::new();
+    let mut github_entries = GithubSuites::default();
     let mut failures = 0u32;
 
     for benchmark_name in &benchmarks {
@@ -210,13 +216,29 @@ fn main() {
     }
 
     if cli.github_json {
-        let array = serde_json::Value::Array(github_entries);
-        match serde_json::to_string_pretty(&array) {
+        let GithubSuites { yields, costs } = github_entries;
+        match serde_json::to_string_pretty(&serde_json::Value::Array(yields)) {
             Ok(json) => println!("{json}"),
             Err(e) => {
                 eprintln!("Error: failed to serialize GitHub JSON: {e}");
                 failures += 1;
             }
+        }
+        match &cli.github_json_costs {
+            Some(path) => {
+                let written = serde_json::to_string_pretty(&serde_json::Value::Array(costs))
+                    .map_err(|e| e.to_string())
+                    .and_then(|json| std::fs::write(path, json).map_err(|e| e.to_string()));
+                if let Err(e) = written {
+                    eprintln!("Error: failed to write {}: {e}", path.display());
+                    failures += 1;
+                }
+            }
+            None if !costs.is_empty() => eprintln!(
+                "Note: {} smaller-is-better series not written; pass --github-json-costs <PATH>",
+                costs.len(),
+            ),
+            None => {}
         }
     }
 
@@ -237,7 +259,7 @@ fn run_single(
     bench_config: &BenchConfig,
     cli: &Cli,
     iterations: u32,
-    github_entries: &mut Vec<serde_json::Value>,
+    github_entries: &mut GithubSuites,
 ) -> Result<(), Box<dyn std::error::Error>> {
     eprintln!("=== db_bench: {benchmark_name} ===");
     eprintln!(
@@ -381,15 +403,18 @@ fn run_single(
         // the engine, and a dashboard series that means nothing is worse
         // than an absent one because it still moves.
         for series in median.reporter.published() {
-            github_entries.push(serde_json::json!({
-                "name": format!("{benchmark_name} / {}", series.name),
-                "value": series.value,
-                "unit": series.unit,
-                "extra": format!(
-                    "{}\nnum: {} | iterations: {}",
-                    series.extra, cli.num, iterations,
-                ),
-            }));
+            github_entries.push(
+                series.direction,
+                serde_json::json!({
+                    "name": format!("{benchmark_name} / {}", series.name),
+                    "value": series.value,
+                    "unit": series.unit,
+                    "extra": format!(
+                        "{}\nnum: {} | iterations: {}",
+                        series.extra, cli.num, iterations,
+                    ),
+                }),
+            );
         }
     } else if cli.github_json {
         let s = median.reporter.summary(entry_size);
@@ -402,16 +427,19 @@ fn run_single(
         // self-hosted runner the right answer is to report what
         // the host actually delivered and let the dashboard show
         // the absolute trend.
-        github_entries.push(serde_json::json!({
-            "name": benchmark_name,
-            "value": s.ops_per_sec,
-            "unit": "ops/sec",
-            "extra": format!(
-                "P50: {:.1}us | P99: {:.1}us | P99.9: {:.1}us\n\
-                 threads: {} | elapsed: {:.2}s | num: {} | iterations: {}",
-                s.p50, s.p99, s.p999, cli.threads, s.secs, cli.num, iterations,
-            ),
-        }));
+        github_entries.push(
+            Direction::BiggerIsBetter,
+            serde_json::json!({
+                "name": benchmark_name,
+                "value": s.ops_per_sec,
+                "unit": "ops/sec",
+                "extra": format!(
+                    "P50: {:.1}us | P99: {:.1}us | P99.9: {:.1}us\n\
+                     threads: {} | elapsed: {:.2}s | num: {} | iterations: {}",
+                    s.p50, s.p99, s.p999, cli.threads, s.secs, cli.num, iterations,
+                ),
+            }),
+        );
     } else if cli.json {
         let json_config = JsonConfig {
             num: cli.num,

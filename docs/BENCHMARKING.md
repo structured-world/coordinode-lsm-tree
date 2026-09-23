@@ -172,11 +172,16 @@ in place of the ops/sec every other workload reports — for a scenario sweep th
 rate counts scenarios per second, which describes the harness rather than the
 engine. The `--json` report and the plain summary carry the same series in
 place of the rate. The fixtures open their trees with the run's cache and
-metadata flags, so `--cache-mb 0` measures cold reads here as everywhere else. The unit is inverted because the dashboard draws every series
-bigger-is-better and all three counters improve by shrinking: more rows out of
-the same kibibyte is the improvement. `bytes_copied` stays in each point's
-annotation rather than becoming a series, because it is legitimately zero for a
-scan that gathers nothing.
+metadata flags, so `--cache-mb 0` measures cold reads here as everywhere else.
+
+Read and decoded are yields in the bigger-is-better suite: more rows out of the
+same kibibyte is the improvement. Copied is published as a cost,
+`mixed-layout / <scenario> bytes copied per byte decoded` (the copy
+amplification of the read), in a separate smaller-is-better suite,
+`lsm-tree db_bench costs`, because the dashboard fixes one direction per suite.
+Zero is the best value there, and a scenario whose copies go from zero to
+anything alerts. `db_bench --github-json` writes the yields to stdout and
+`--github-json-costs <PATH>` writes the costs.
 
 ## Checklist for format-changing PRs
 

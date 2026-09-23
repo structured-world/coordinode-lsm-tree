@@ -192,6 +192,34 @@ jobs:
           save-data-file: ${{ github.event_name == 'push' && github.ref == 'refs/heads/main' }}
           benchmark-data-dir-path: dev/bench
 
+      # The step above leaves a local gh-pages commit on a run that does not
+      # auto-push, and the next store step fetches gh-pages:gh-pages; drop it
+      # again for the same reason as before the first store.
+      - name: Drop the local gh-pages the yield store left
+        if: steps.bot-token.outputs.token != ''
+        run: git branch --delete --force gh-pages 2>/dev/null || true
+
+      # Costs (bytes copied per byte decoded and other amplifications) improve
+      # by shrinking, and the action fixes one direction per suite, so they are
+      # their own smaller-is-better suite on the same dashboard. A cost that was
+      # zero and becomes nonzero alerts: the action divides by the previous
+      # value and treats 0/0 as unchanged.
+      - name: Store benchmark costs
+        if: steps.bot-token.outputs.token != ''
+        uses: benchmark-action/github-action-benchmark@52576c92bccf6ac60c8223ec7eb2565637cae9ba  # v1.22.1
+        with:
+          name: "lsm-tree db_bench costs"
+          tool: customSmallerIsBetter
+          output-file-path: benchmark-costs.json
+          github-token: ${{ steps.bot-token.outputs.token }}
+          auto-push: ${{ github.event_name == 'push' && github.ref == 'refs/heads/main' }}
+          comment-on-alert: true
+          alert-comment-cc-users: "@polaz"
+          alert-threshold: "115%"
+          fail-on-alert: false
+          save-data-file: ${{ github.event_name == 'push' && github.ref == 'refs/heads/main' }}
+          benchmark-data-dir-path: dev/bench
+
       # Head-to-head RocksDB comparison. Distinct from the db_bench
       # trend above (single-engine, value-over-commits): this runs the
       # standalone `tools/compare-rocksdb` criterion harness where every

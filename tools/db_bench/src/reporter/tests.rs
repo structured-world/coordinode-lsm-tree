@@ -1,4 +1,4 @@
-use super::{JsonConfig, Reporter};
+use super::{Direction, GithubSuites, JsonConfig, Reporter};
 
 fn json_config() -> JsonConfig {
     JsonConfig {
@@ -19,7 +19,13 @@ fn json_published_series_omits_rate() {
     // dashboard output already does.
     let mut reporter = Reporter::new();
     reporter.start();
-    reporter.publish_series("scan rows per KiB read", 12.5, "rows/KiB", "rows: 100");
+    reporter.publish_series(
+        "scan rows per KiB read",
+        12.5,
+        "rows/KiB",
+        "rows: 100",
+        Direction::BiggerIsBetter,
+    );
     reporter.stop();
 
     let json: serde_json::Value =
@@ -32,6 +38,43 @@ fn json_published_series_omits_rate() {
         json.get("ops_per_sec").is_none(),
         "a workload with published series must not report a rate",
     );
+}
+
+#[test]
+fn github_suites_cost_series_goes_to_the_smaller_is_better_suite() {
+    // github-action-benchmark fixes one direction per suite. A cost landing in
+    // the yield suite would alert on every improvement and stay silent on
+    // every regression, so the split is the whole of the contract.
+    let mut suites = GithubSuites::default();
+    suites.push(
+        Direction::BiggerIsBetter,
+        serde_json::json!({"name": "rows per KiB read"}),
+    );
+    suites.push(
+        Direction::SmallerIsBetter,
+        serde_json::json!({"name": "bytes copied per byte decoded"}),
+    );
+    assert_eq!(
+        suites.yields,
+        vec![serde_json::json!({"name": "rows per KiB read"})]
+    );
+    assert_eq!(
+        suites.costs,
+        vec![serde_json::json!({"name": "bytes copied per byte decoded"})],
+    );
+}
+
+#[test]
+fn json_series_direction_is_reported() {
+    // The --json report carries each series' direction, so a consumer can
+    // tell a yield from a cost without knowing the series by name.
+    let mut reporter = Reporter::new();
+    reporter.start();
+    reporter.publish_series("copied", 0.0, "B/B", "", Direction::SmallerIsBetter);
+    reporter.stop();
+    let json: serde_json::Value =
+        serde_json::from_str(&reporter.to_json("mixed-layout", &json_config())).expect("json");
+    assert_eq!(json["series"][0]["direction"], "smaller_is_better");
 }
 
 #[test]

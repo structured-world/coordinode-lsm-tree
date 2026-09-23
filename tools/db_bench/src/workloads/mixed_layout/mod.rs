@@ -46,7 +46,7 @@ pub mod fixtures;
 mod tests;
 
 use crate::config::BenchConfig;
-use crate::reporter::Reporter;
+use crate::reporter::{Direction, Reporter};
 use crate::workloads::Workload;
 use fixtures::{Fixture, FixtureFn, field_bucket, field_group};
 use lsm_tree::{AbstractTree, AnyTree, Guard, SeqNo};
@@ -109,13 +109,8 @@ impl Readings {
         })
     }
 
-    /// Rows emitted per KiB the scenario moved, for one counter.
-    ///
-    /// The dashboard draws every series bigger-is-better, and all three
-    /// counters improve by SHRINKING, so the published quantity is inverted:
-    /// more rows out of the same kibibyte is the improvement. Bytes per row
-    /// would draw the same measurement upside down on a chart that cannot say
-    /// so.
+    /// Rows emitted per KiB the scenario moved, for one counter: a yield, so
+    /// more rows out of the same kibibyte is the improvement.
     #[expect(
         clippy::cast_precision_loss,
         reason = "ratios over counts far below f64's exact range"
@@ -124,14 +119,26 @@ impl Readings {
         self.rows as f64 / (bytes.max(1) as f64 / 1024.0)
     }
 
-    /// Publishes the two series that state the read path's cost, and carries
-    /// the rest of the readings in the annotation.
+    /// Bytes gathers moved per byte the transform produced: the copy
+    /// amplification of the read, the quantity the acceptance rule says may
+    /// not regress. Zero where nothing is gathered, which a smaller-is-better
+    /// series draws honestly; a read served wholly from cache decodes nothing,
+    /// so its copies are counted against one byte rather than divided by zero.
+    #[expect(
+        clippy::cast_precision_loss,
+        reason = "ratios over counts far below f64's exact range"
+    )]
+    fn copy_amplification(&self) -> f64 {
+        self.bytes_copied as f64 / self.bytes_decoded.max(1) as f64
+    }
+
+    /// Publishes the series that state the read path's cost, and carries the
+    /// raw readings in the annotation.
     ///
-    /// Copied is annotation rather than a series because it is legitimately
-    /// zero for a scan that gathers nothing, and rows-per-KiB of zero bytes is
-    /// not a point on a chart. It is still printed, still pinned by
-    /// `tests/read_byte_counters.rs`, and becomes a series the day a scenario
-    /// gathers.
+    /// Read and decoded are yields (rows per KiB). Copied is a cost that is
+    /// legitimately zero for a read that gathers nothing, so it is published
+    /// as an amplification in the smaller-is-better suite, where zero is the
+    /// best value rather than a division by zero.
     fn publish(&self, scenario: &str, reporter: &mut Reporter) {
         let annotation = format!(
             "rows: {} | read: {} B | decoded: {} B | copied: {} B | elapsed: {:?}",
@@ -142,12 +149,21 @@ impl Readings {
             self.rows_per_kib(self.bytes_read),
             "rows/KiB",
             annotation.clone(),
+            Direction::BiggerIsBetter,
         );
         reporter.publish_series(
             format!("{scenario} rows per KiB decoded"),
             self.rows_per_kib(self.bytes_decoded),
             "rows/KiB",
+            annotation.clone(),
+            Direction::BiggerIsBetter,
+        );
+        reporter.publish_series(
+            format!("{scenario} bytes copied per byte decoded"),
+            self.copy_amplification(),
+            "B/B",
             annotation,
+            Direction::SmallerIsBetter,
         );
     }
 
