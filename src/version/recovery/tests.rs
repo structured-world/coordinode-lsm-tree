@@ -522,10 +522,16 @@ fn open_fixture_writer(folder: &Path, id: u64, fs: &dyn Fs) -> crate::Result<Fix
     )
 }
 
-/// Append the standard `tree_type` section (Standard = 0). Every
-/// recovery fixture in this module needs one — varying the
-/// `tree_type` byte itself is not what these tests exercise.
-fn write_tree_type(w: &mut FixtureWriter) -> crate::Result<()> {
+/// Append the sections every manifest opens with: `format_version` (the
+/// current format) and `tree_type` (Standard = 0). Varying either byte is not
+/// what these fixtures exercise; [`write_header_at`] writes another version.
+fn write_header(w: &mut FixtureWriter) -> crate::Result<()> {
+    write_header_at(w, crate::FormatVersion::V6.into())
+}
+
+fn write_header_at(w: &mut FixtureWriter, format_version: u8) -> crate::Result<()> {
+    w.start("format_version")?;
+    w.write_u8(format_version)?;
     w.start("tree_type")?;
     w.write_u8(0)?;
     Ok(())
@@ -598,7 +604,7 @@ fn write_tables(
     fs: &dyn Fs,
 ) -> crate::Result<()> {
     let mut w = open_fixture_writer(folder, id, fs)?;
-    write_tree_type(&mut w)?;
+    write_header(&mut w)?;
     start_tables(&mut w, levels)?;
     for &(level, run, table) in records {
         write_good_table_record(&mut w, level, run, table)?;
@@ -702,7 +708,7 @@ fn place_table_accepts_run_ordinals_past_u16() -> crate::Result<()> {
 /// `blob_files` section carries the corrupt payload.
 fn write_corrupt_blob_count(folder: &Path, id: u64, fs: &dyn Fs) -> crate::Result<()> {
     let mut w = open_fixture_writer(folder, id, fs)?;
-    write_tree_type(&mut w)?;
+    write_header(&mut w)?;
     write_empty_tables(&mut w)?;
 
     w.start("blob_files")?;
@@ -767,7 +773,7 @@ fn write_truncated_tables_tail(
     fs: &dyn Fs,
 ) -> crate::Result<()> {
     let mut w = open_fixture_writer(folder, id, fs)?;
-    write_tree_type(&mut w)?;
+    write_header(&mut w)?;
     start_tables(&mut w, 1)?;
     for entry_id in 0..complete {
         write_good_table_record(&mut w, 0, 0, entry_id)?;
@@ -815,7 +821,7 @@ fn recover_tolerate_tail_does_not_swallow_invalid_tag() -> crate::Result<()> {
     fs.create_dir_all(folder)?;
 
     let mut w = open_fixture_writer(folder, 1, &fs)?;
-    write_tree_type(&mut w)?;
+    write_header(&mut w)?;
     start_tables(&mut w, 1)?;
     // Framed record with a corrupt `checksum_type` byte in the
     // payload. The framing XXH3 still covers the payload, so
@@ -850,7 +856,7 @@ fn recover_tolerate_tail_does_not_swallow_invalid_tag() -> crate::Result<()> {
 /// then the section ends two bytes into the next record's frame header.
 fn write_truncated_at_second_run(folder: &Path, id: u64, fs: &dyn Fs) -> crate::Result<()> {
     let mut w = open_fixture_writer(folder, id, fs)?;
-    write_tree_type(&mut w)?;
+    write_header(&mut w)?;
     start_tables(&mut w, 1)?;
     write_good_table_record(&mut w, 0, 0, 42)?;
     write_torn_table_record(&mut w, 2)?;
@@ -896,7 +902,7 @@ fn write_truncated_blob_tail(
         "actual must be < declared for truncation"
     );
     let mut w = open_fixture_writer(folder, id, fs)?;
-    write_tree_type(&mut w)?;
+    write_header(&mut w)?;
     write_empty_tables(&mut w)?;
     w.start("blob_files")?;
     w.write_u32::<LittleEndian>(declared)?;
@@ -935,7 +941,7 @@ fn recover_rejects_a_truncated_blob_files_section_in_every_mode() -> crate::Resu
 /// `FragmentationMap::decode_from` hits `UnexpectedEof` on the first byte.
 fn write_truncated_blob_gc_stats(folder: &Path, id: u64, fs: &dyn Fs) -> crate::Result<()> {
     let mut w = open_fixture_writer(folder, id, fs)?;
-    write_tree_type(&mut w)?;
+    write_header(&mut w)?;
     write_empty_tables(&mut w)?;
     w.start("blob_files")?;
     w.write_u32::<LittleEndian>(0)?;
@@ -1022,7 +1028,7 @@ fn write_manifest_with_mid_record_corruption(
     fs: &dyn Fs,
 ) -> crate::Result<()> {
     let mut w = open_fixture_writer(folder, id, fs)?;
-    write_tree_type(&mut w)?;
+    write_header(&mut w)?;
 
     start_tables(&mut w, 2)?;
     // Level 0: 1 run, 3 records, middle one is corrupt.
@@ -1071,7 +1077,7 @@ fn write_manifest_with_corrupt_blob_record(
     fs: &dyn Fs,
 ) -> crate::Result<()> {
     let mut w = open_fixture_writer(folder, id, fs)?;
-    write_tree_type(&mut w)?;
+    write_header(&mut w)?;
 
     write_empty_tables(&mut w)?;
 
@@ -1131,5 +1137,63 @@ fn recover_rejects_a_corrupt_blob_file_record_in_every_mode() -> crate::Result<(
             }
         )
     });
+    Ok(())
+}
+
+/// A manifest otherwise readable by this engine, labelled with another
+/// format version. Every section after the label is in the current layout, so
+/// only the label can refuse it.
+fn write_manifest_labelled(folder: &Path, fs: &dyn Fs, format_version: u8) -> crate::Result<()> {
+    let mut w = open_fixture_writer(folder, 1, fs)?;
+    write_header_at(&mut w, format_version)?;
+    write_empty_tables(&mut w)?;
+    write_empty_blob_files(&mut w)?;
+    write_empty_blob_gc_stats(&mut w)?;
+    w.finish()?;
+    write_current(folder, 1, fs)
+}
+
+/// Recovery reads the format version before any section: a manifest of
+/// another format is refused as such, rather than parsed as the current one
+/// and either misread or reported as damage.
+#[test]
+fn recover_refuses_a_manifest_of_another_format_version() -> crate::Result<()> {
+    let fs = MemFs::new();
+    let folder = Path::new("/format/v5");
+    fs.create_dir_all(folder)?;
+    write_manifest_labelled(folder, &fs, 5)?;
+
+    let err = recover(folder, &fs, ManifestRecoveryMode::AbsoluteConsistency, None)
+        .expect_err("a V5 manifest must be refused");
+    assert!(
+        matches!(err, crate::Error::InvalidVersion(5)),
+        "expected InvalidVersion(5), got {err:?}",
+    );
+    Ok(())
+}
+
+/// Repair consults the committed manifest before rebuilding, and a manifest
+/// of another format must stop it there. Read as "no manifest", the rebuild
+/// would republish the old store in the current format and drop what only the
+/// manifest held (restrictions, retention floor, blob GC state): a migration
+/// that belongs to the offline converter, done silently and lossily.
+#[test]
+fn repair_refuses_a_store_of_another_format_version() -> crate::Result<()> {
+    let dir = tempfile::tempdir()?;
+    let fs = crate::fs::StdFs;
+    fs.create_dir_all(&dir.path().join(crate::file::TABLES_FOLDER))?;
+    write_manifest_labelled(dir.path(), &fs, 5)?;
+
+    let err = crate::Config::new(
+        dir.path(),
+        crate::SequenceNumberCounter::default(),
+        crate::SequenceNumberCounter::default(),
+    )
+    .repair()
+    .expect_err("repair must not rebuild a V5 store");
+    assert!(
+        matches!(err, crate::Error::InvalidVersion(5)),
+        "expected InvalidVersion(5), got {err:?}",
+    );
     Ok(())
 }

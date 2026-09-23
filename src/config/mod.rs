@@ -1634,24 +1634,16 @@ impl Config {
         self
     }
 
-    /// Sets the MANIFEST recovery policy for `Tree::open`.
+    /// Sets what `Tree::open` does with a torn tail of the manifest edit log.
     ///
-    /// The default ([`ManifestRecoveryMode::AbsoluteConsistency`]) is the
-    /// only choice that's safe for live production: any corrupt record
-    /// in the on-disk manifest aborts the open. Switching to a more
-    /// permissive mode trades strict correctness for partial
-    /// availability after a disaster. The recovery path emits a
-    /// `warn!` summary per affected section (aggregate counts: total
-    /// table records dropped, total blob-file records dropped,
-    /// header truncations) rather than one log line per dropped
-    /// record — the dropped records were never decoded in the first
-    /// place, so no per-record IDs are available. Always pair the
-    /// non-default modes with an out-of-band integrity scan
-    /// ([`verify_integrity`](crate::verify::verify_integrity) for
-    /// whole-file XXH3 over every SST + blob file, or
-    /// [`verify_block_checksums`](crate::verify::verify_block_checksums)
-    /// for per-block granularity) before trusting the recovered tree
-    /// for writes.
+    /// The only difference between the modes is an edit-log record the writer
+    /// never finished appending (power loss mid-append): the default
+    /// ([`ManifestRecoveryMode::AbsoluteConsistency`]) fails the open,
+    /// [`ManifestRecoveryMode::TolerateCorruptedTailRecords`] drops it and
+    /// opens at the last complete edit. That record was never acknowledged, so
+    /// dropping it loses no committed state. Damage to anything committed (a
+    /// snapshot section, a fully written edit) fails the open in either mode;
+    /// [`Config::repair`] rebuilds the manifest from the tables on disk.
     ///
     /// See the [`ManifestRecoveryMode`] doc for per-variant semantics.
     #[must_use]

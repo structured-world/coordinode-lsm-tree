@@ -666,6 +666,19 @@ pub fn recover(
         encryption,
     )?;
 
+    // The format label comes first: every section below is parsed in the
+    // current layout, so a manifest of another format must be refused as
+    // such, never misread or reported as damage. Every caller shares this
+    // gate, repair included, which would otherwise rebuild an old store in
+    // the current format.
+    let format_version = archive
+        .read_section("format_version")?
+        .first()
+        .copied()
+        .ok_or(crate::Error::InvalidHeader("format_version"))?;
+    crate::FormatVersion::try_from(format_version)
+        .map_err(|()| crate::Error::InvalidVersion(format_version))?;
+
     // The snapshot's sections are read strictly whatever `mode` says: each is
     // one checksummed block bound to the CURRENT digest, so it arrives whole,
     // and a record inside it that does not verify or decode is a writer defect

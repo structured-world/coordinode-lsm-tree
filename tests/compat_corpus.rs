@@ -148,7 +148,9 @@ fn repairing_a_v5_store_refuses_instead_of_discarding_its_tables() {
     // So the refusal has to travel as one of the errors repair PROPAGATES
     // rather than grades, the way a missing zstd dictionary already does: the
     // bytes are healthy, the caller's environment is wrong, and a rerun after
-    // fixing it finds everything still on disk.
+    // fixing it finds everything still on disk. Repair reads the committed
+    // manifest's format label before it looks at a single table, so the
+    // refusal is the manifest's version, whatever the tables would have said.
     let fixture = Path::new(FIXTURE);
     assert!(fixture.join("current").exists(), "golden fixture missing");
 
@@ -172,10 +174,7 @@ fn repairing_a_v5_store_refuses_instead_of_discarding_its_tables() {
     .expect_err("repair must refuse a store it cannot read rather than rebuild it");
 
     assert!(
-        matches!(
-            err,
-            lsm_tree::Error::UnsupportedFilterFormat { found: None, .. }
-        ),
+        matches!(err, lsm_tree::Error::InvalidVersion(5)),
         "repair must propagate the format refusal, not grade the tables as \
          damaged; got: {err:?}",
     );

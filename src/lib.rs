@@ -71,26 +71,28 @@
 //!
 //! ## On-disk format
 //!
-//! Current version: **V5**. V5 introduces the `BuRR` filter wire format,
-//! per-block Reed-Solomon Page ECC, and per-entry (per-KV) checksum
-//! footers (collapsed into the same version because V5 had not shipped
-//! when they landed): the self-describing block types (`Meta` / `Manifest` /
-//! `ManifestFooter`) gain a `block_flags` byte whose `ECC_PARITY` bit marks a
-//! parity trailer and whose `KV_CHECKSUM_FOOTER` bit marks a per-entry
-//! checksum footer. SST block types (`Data` / `Index` / `Filter` /
-//! `RangeTombstone`) keep the compact header WITHOUT that byte and derive parity / footer
-//! presence from the per-SST meta descriptors (`descriptor#page_ecc`,
-//! `descriptor#kv_checksum`). The block magic is bumped so a pre-V5 reader
-//! rejects V5 blocks immediately at header decode.
-//! A V5 SST written with every optional transform off (no Page ECC, no per-KV
-//! footers) is still NOT byte-identical to a pre-V5 table — the bumped block
-//! magic and the per-SST meta descriptor keys always differ. Any
-//! "byte-identical when off" guarantees in the feature docs are within-V5 and
+//! Current version: **V6**, the only one this engine reads or writes. Relative
+//! to V5, which the 5.x releases write, the version snapshot names each
+//! table's level and run in its own record, and the `BuRR` filter and
+//! retrieval-locator sections use the packed solution layout; see
+//! [`FormatVersion`] for the full list.
+//!
+//! The self-describing block types (`Meta` / `Manifest` / `ManifestFooter`)
+//! carry a `block_flags` byte whose `ECC_PARITY` bit marks a per-block
+//! Reed-Solomon parity trailer and whose `KV_CHECKSUM_FOOTER` bit marks a
+//! per-entry checksum footer. SST block types (`Data` / `Index` / `Filter` /
+//! `RangeTombstone`) keep the compact header WITHOUT that byte and derive
+//! parity / footer presence from the per-SST meta descriptors
+//! (`descriptor#page_ecc`, `descriptor#kv_checksum`). Any "byte-identical when
+//! off" guarantee in the feature docs is within the current format and
 //! payload-level (e.g. index entries when `seqno_in_index = false`), not a
 //! cross-version equivalence.
-//! V3-V4 databases are not readable by this version and vice versa. The
-//! manifest version gate rejects pre-V5 databases at `Tree::open` time.
-//! V4 introduced range tombstones (still supported).
+//!
+//! Earlier formats, V5 included, are not readable by this version and vice
+//! versa: the manifest version gate refuses them with
+//! [`Error::InvalidVersion`] at `Tree::open` and at `Config::repair`, before
+//! any section is parsed. A V5 store is converted by the separate offline
+//! converter; the engine carries no V5 decoder.
 #![deny(clippy::all, missing_docs, clippy::cargo)]
 #![deny(clippy::unwrap_used)]
 #![deny(clippy::indexing_slicing)]

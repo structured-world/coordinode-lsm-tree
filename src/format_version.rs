@@ -103,9 +103,9 @@ pub enum FormatVersion {
     /// `ManifestFooter`), the compact header on SST block types, and the
     /// `[L,S,M,4]` block magic.
     ///
-    /// V5 ↔ V6 incompatibility is enforced by the manifest version gate at
-    /// `Tree::open`, which returns `InvalidVersion` for anything other than
-    /// V6.
+    /// V5 ↔ V6 incompatibility is enforced by the manifest version gate, read
+    /// before any section at `Tree::open` and at `Config::repair`, which
+    /// returns `InvalidVersion` for anything other than V6.
     V6 = 6,
 }
 
