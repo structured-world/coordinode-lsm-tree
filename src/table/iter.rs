@@ -530,20 +530,26 @@ impl Iter {
                         .get(&handle.offset().0)
                         .map(|&start| (mask, start))
                 });
-                let (entries, rebuilt) = if let Some((mask, start)) = masked {
-                    DataBlock::columnar_block_entries_masked(&raw.data, &mask.bitmap, start)?
+                let mut gathered = 0usize;
+                let entries = if let Some((mask, start)) = masked {
+                    DataBlock::columnar_block_entries_masked(
+                        &raw.data,
+                        &mask.bitmap,
+                        start,
+                        &mut gathered,
+                    )
                 } else {
-                    let (entries, rebuilt) = DataBlock::columnar_block_entries(&raw.data)?;
-                    (Some(entries), rebuilt)
+                    DataBlock::columnar_block_entries(&raw.data, &mut gathered).map(Some)
                 };
                 // Keys, and values of a single bytes column, are views into the
                 // decoded columns and cost nothing here; only values rebuilt
-                // from sub-columns are a gather.
+                // from sub-columns are a gather. Charged before the result is
+                // judged: a block refused after a gather still did it.
                 #[cfg(feature = "metrics")]
-                self.metrics.record_gather(rebuilt);
+                self.metrics.record_gather(gathered);
                 #[cfg(not(feature = "metrics"))]
-                let _ = rebuilt;
-                return Ok(entries.map(BlockSource::Columnar));
+                let _ = gathered;
+                return Ok(entries?.map(BlockSource::Columnar));
             }
             #[cfg(not(feature = "columnar"))]
             {

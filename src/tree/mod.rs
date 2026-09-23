@@ -1193,6 +1193,10 @@ impl AbstractTree for Tree {
         use crate::table::block_index::BlockIndex;
         use core::ops::Bound;
 
+        // A query planner asks for this estimate as part of the query it
+        // plans, so the index walks below are the query's reads and stay
+        // counted. A monitoring report's reads are the ones kept out of the
+        // counters (see `Table::live_item_count`).
         let lo: Bound<&[u8]> = match range.start_bound() {
             Bound::Included(k) => Bound::Included(k.as_ref()),
             Bound::Excluded(k) => Bound::Excluded(k.as_ref()),
@@ -1458,7 +1462,11 @@ impl AbstractTree for Tree {
             // its replacement now owns, while the numerator below starts at the
             // restriction — so charging the prefix here would report a
             // full-keyspace query as selecting a fraction of the tree.
-            total_rows = total_rows.saturating_add(table.live_item_count()?);
+            // The planner's estimate is part of the query it plans, so the
+            // reads it makes are the query's and are counted, like the index
+            // walks below.
+            total_rows = total_rows
+                .saturating_add(table.live_item_count(crate::table::util::ReadCharge::Foreground)?);
             if !table
                 .metadata
                 .key_range

@@ -459,9 +459,9 @@ pub(crate) fn maybe_record_persistent_heal(
     }
 }
 
-/// Whose read a confirming re-read belongs to, which decides whether it is
-/// charged to the read-byte counters (see [`maybe_record_persistent_heal`]).
-#[cfg(feature = "metrics")]
+/// Whose read a block read belongs to, which decides whether it is charged to
+/// the read-byte counters (see [`maybe_record_persistent_heal`] and
+/// `Table::live_item_count`).
 #[derive(Copy, Clone, Debug, Eq, PartialEq)]
 pub(crate) enum ReadCharge {
     /// A read made for a caller: counted.

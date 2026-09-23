@@ -57,9 +57,15 @@ const ALL_FIXTURES: [(&str, fixtures::FixtureFn); 8] = [
     ("blobs-scattered", fixtures::blobs_scattered),
 ];
 
+/// Builds `f` in the system temporary directory, which outlives the fixture;
+/// a per-test base would be removed while the fixture's tree is still open.
 fn build(f: fixtures::FixtureFn) -> Fixture {
+    build_with(f, &config())
+}
+
+fn build_with(f: fixtures::FixtureFn, config: &BenchConfig) -> Fixture {
     let seqno = AtomicU64::new(1);
-    f(&config(), &seqno).expect("fixture must build")
+    f(config, &seqno, &std::env::temp_dir()).expect("fixture must build")
 }
 
 /// The ordinary read is the cross-check, not the oracle: it agrees with the
@@ -239,12 +245,11 @@ fn scattered_blob_fixture_num_equal_to_preferred_stride_writes_every_key() {
     // fixed stride is not coprime with its own multiples, and at `--num 7919`
     // the old one sent every step to key 0, leaving the rows the rewrite
     // rounds skip absent and the scenario measuring a far smaller dataset.
-    let seqno = AtomicU64::new(1);
     let config = BenchConfig {
         num: 7_919,
         ..config()
     };
-    let fixture = fixtures::blobs_scattered(&config, &seqno).expect("fixture must build");
+    let fixture = build_with(fixtures::blobs_scattered, &config);
     let absent = fixture
         .oracle
         .rows
@@ -300,11 +305,29 @@ fn mixed_layout_more_than_one_thread_is_refused() {
 fn published_series_fixture_capped_names_the_keys_it_built() {
     // Each fixture caps its key count below what --num may ask for, so a
     // series has to carry the size the scenario actually built; the request
-    // alone would label a smaller working set as the requested one.
-    let fixture = build(fixtures::narrow);
-    let built = fixture.oracle.rows.len();
-    let readings =
-        super::Readings::measure(&fixture.tree, built as u64, || Ok(0)).expect("measure");
+    // alone would label a smaller working set as the requested one. Measured
+    // through the path `run` takes, with a request past the blob fixtures'
+    // cap (the smallest), so the built count and --num differ.
+    let requested = BenchConfig {
+        num: 10_001,
+        ..config()
+    };
+    let seqno = AtomicU64::new(1);
+    let (readings, _) = super::measure_scenario(
+        fixtures::blobs_well_placed,
+        |_| Ok(0),
+        &requested,
+        &seqno,
+        &std::env::temp_dir(),
+    )
+    .expect("measure");
+    let built = readings.keys;
+    assert!(
+        built < requested.num,
+        "the readings must carry the keys the capped fixture built, not the {} \
+         requested, got {built}",
+        requested.num,
+    );
     let mut reporter = crate::reporter::Reporter::new();
     readings.publish("narrow-records", &mut reporter);
     assert!(
@@ -317,6 +340,25 @@ fn published_series_fixture_capped_names_the_keys_it_built() {
             "{} does not name the {built} keys the fixture built: {}",
             series.name,
             series.extra,
+        );
+    }
+}
+
+#[test]
+fn every_fixture_builds_its_tree_beneath_the_given_directory() {
+    // `--db` places the run on a chosen filesystem. A fixture that built its
+    // tree in the system temporary directory instead would report figures
+    // from another device under the requested one.
+    let base = tempfile::tempdir().expect("base directory");
+    for (what, f) in ALL_FIXTURES {
+        let seqno = AtomicU64::new(1);
+        let fixture = f(&config(), &seqno, base.path()).expect("fixture must build");
+        let path = &fixture.tree.tree_config().path;
+        assert!(
+            path.starts_with(base.path()),
+            "{what}: tree built at {} rather than beneath {}",
+            path.display(),
+            base.path().display(),
         );
     }
 }
@@ -373,8 +415,7 @@ fn every_fixture_num_zero_builds_an_empty_oracle() {
     // returning.
     let empty = BenchConfig { num: 0, ..config() };
     for (what, f) in ALL_FIXTURES {
-        let seqno = AtomicU64::new(1);
-        let fixture = f(&empty, &seqno).expect("fixture must build");
+        let fixture = build_with(f, &empty);
         assert!(
             fixture.oracle.rows.is_empty(),
             "{what}: no keys were asked for, yet the oracle expects some",

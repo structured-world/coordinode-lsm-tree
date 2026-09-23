@@ -288,7 +288,10 @@ fn from_columnar_block_rejects_a_zero_row_block() {
         .expect("transpose")
         .encode(CodecId::Plain)
         .expect("encode");
-    assert!(crate::table::data_block::DataBlock::from_columnar_block(&empty.into(), 16).is_err());
+    assert!(
+        crate::table::data_block::DataBlock::from_columnar_block(&empty.into(), 16, &mut 0)
+            .is_err()
+    );
 }
 
 #[test]
@@ -874,6 +877,21 @@ fn columnar_decode_rejects_trailing_bytes() {
     let mut encoded = sample_batch().encode(CodecId::Plain).expect("encode");
     encoded.push(0); // one byte past the last declared column
     assert!(ColumnBatch::decode(&encoded.clone().into()).is_err());
+}
+
+/// A decode that copied a validity bitmap and only then met a malformed tail
+/// did that copy: it is counted like the read a checksum later refuses.
+#[test]
+fn columnar_decode_refused_after_copying_still_counts_the_copy() {
+    let mut encoded = sample_batch().encode(CodecId::Plain).expect("encode");
+    encoded.push(0); // one byte past the last declared column
+    let mut copied = 0usize;
+    let decoded = ColumnBatch::decode_counting_copies(&encoded.into(), None, &mut copied);
+    assert!(decoded.is_err(), "trailing bytes must be refused");
+    assert_eq!(
+        copied, 1,
+        "the first column's one-byte validity bitmap was copied before the refusal",
+    );
 }
 
 #[test]

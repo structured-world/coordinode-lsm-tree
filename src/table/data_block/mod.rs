@@ -472,16 +472,19 @@ impl DataBlock {
     /// these directly (no serialize + re-parse round-trip); [`Self::from_columnar_block`]
     /// re-encodes on top of this for the byte-based point-read path.
     ///
-    /// Also returns the bytes gathered on the way: what the decode copied out
-    /// of the block (validity bitmaps, detached columns) plus the values that
-    /// had to be rebuilt from sub-columns, the latter zero when every value is
-    /// a view into the column buffer.
+    /// Also adds to `gathered` the bytes gathered on the way, as each gather
+    /// runs, so a block refused after one still counts it: what the decode
+    /// copied out of the block (validity bitmaps, detached columns) plus the
+    /// values that had to be rebuilt from sub-columns, the latter zero when
+    /// every value is a view into the column buffer.
     #[cfg(feature = "columnar")]
     pub(crate) fn columnar_block_entries(
         block_data: &crate::Slice,
-    ) -> crate::Result<(Vec<InternalValue>, usize)> {
-        let (batch, decode_copied) =
-            crate::table::columnar::ColumnBatch::decode_counting_copies(block_data, None)?;
+        gathered: &mut usize,
+    ) -> crate::Result<Vec<InternalValue>> {
+        let batch = crate::table::columnar::ColumnBatch::decode_counting_copies(
+            block_data, None, gathered,
+        )?;
         let views = batch
             .columns
             .get(3..)
@@ -489,6 +492,9 @@ impl DataBlock {
         // Consuming, zero-copy untranspose: row keys / values are views into the
         // batch's column buffers rather than per-row copies.
         let entries = crate::table::columnar::column_batch_into_entries(batch)?;
+        if !views {
+            *gathered += entries.iter().map(|e| e.value.len()).sum::<usize>();
+        }
         // The writer never spills an empty block, so a zero-row columnar block is
         // corrupt; reject it before any consumer with a non-empty precondition.
         if entries.is_empty() {
@@ -496,12 +502,7 @@ impl DataBlock {
                 "columnar: empty reconstructed data block",
             ));
         }
-        let rebuilt = if views {
-            0
-        } else {
-            entries.iter().map(|e| e.value.len()).sum()
-        };
-        Ok((entries, decode_copied + rebuilt))
+        Ok(entries)
     }
 
     /// As [`Self::columnar_block_entries`], but drops rows whose global position
@@ -514,8 +515,9 @@ impl DataBlock {
         block_data: &crate::Slice,
         deletes: &crate::table::delete_bitmap::DeleteBitmap,
         block_start_row: u32,
-    ) -> crate::Result<(Option<Vec<InternalValue>>, usize)> {
-        let (entries, rebuilt) = Self::columnar_block_entries(block_data)?;
+        gathered: &mut usize,
+    ) -> crate::Result<Option<Vec<InternalValue>>> {
+        let entries = Self::columnar_block_entries(block_data, gathered)?;
         let mut kept = Vec::with_capacity(entries.len());
         for (index, entry) in entries.into_iter().enumerate() {
             let offset = u32::try_from(index).map_err(|_| {
@@ -531,27 +533,25 @@ impl DataBlock {
             }
         }
         if kept.is_empty() {
-            return Ok((None, rebuilt));
+            return Ok(None);
         }
-        Ok((Some(kept), rebuilt))
+        Ok(Some(kept))
     }
 
     /// Reconstructs a columnar block as a row-major block.
     ///
-    /// Also returns the bytes of the values rebuilt from sub-columns on the way,
-    /// as [`Self::columnar_block_entries`] counts them: that rebuild is a gather
-    /// of its own, separate from the encode that then copies the rebuilt values
-    /// into the block.
+    /// Also adds to `gathered` the bytes of the values rebuilt from sub-columns
+    /// on the way, as [`Self::columnar_block_entries`] counts them: that
+    /// rebuild is a gather of its own, separate from the encode that then
+    /// copies the rebuilt values into the block.
     #[cfg(feature = "columnar")]
     pub(crate) fn from_columnar_block(
         block_data: &crate::Slice,
         restart_interval: u8,
-    ) -> crate::Result<(Self, usize)> {
-        let (entries, rebuilt) = Self::columnar_block_entries(block_data)?;
-        Ok((
-            Self::encode_entries_to_block(&entries, restart_interval)?,
-            rebuilt,
-        ))
+        gathered: &mut usize,
+    ) -> crate::Result<Self> {
+        let entries = Self::columnar_block_entries(block_data, gathered)?;
+        Self::encode_entries_to_block(&entries, restart_interval)
     }
 
     /// Point-read fast path for a columnar block: reconstructs only the rows whose
@@ -560,9 +560,9 @@ impl DataBlock {
     /// normal seqno-aware [`Self::point_read`] on the result. Avoids untransposing
     /// and re-encoding the whole block per lookup.
     ///
-    /// Also returns the bytes gathered: what the decode copied out of the block,
-    /// plus the matching rows' keys and values, which are copied out of the
-    /// columns before the encode copies them again.
+    /// Also adds to `gathered` what the decode copied out of the block, plus
+    /// the matching rows' keys and values, which are copied out of the columns
+    /// before the encode copies them again.
     #[cfg(feature = "columnar")]
     pub(crate) fn columnar_point_block(
         block_data: &crate::Slice,
@@ -570,24 +570,22 @@ impl DataBlock {
         comparator: &crate::comparator::SharedComparator,
         restart_interval: u8,
         deletes: Option<(&crate::table::delete_bitmap::DeleteBitmap, u32)>,
-    ) -> crate::Result<(Option<Self>, usize)> {
-        let (batch, decode_copied) =
-            crate::table::columnar::ColumnBatch::decode_counting_copies(block_data, None)?;
+        gathered: &mut usize,
+    ) -> crate::Result<Option<Self>> {
+        let batch = crate::table::columnar::ColumnBatch::decode_counting_copies(
+            block_data, None, gathered,
+        )?;
         let entries = crate::table::columnar::column_batch_match_entries(
             &batch, needle, comparator, deletes,
         )?;
         if entries.is_empty() {
-            return Ok((None, decode_copied));
+            return Ok(None);
         }
-        let gathered = decode_copied
-            + entries
-                .iter()
-                .map(|e| e.key.user_key.len() + e.value.len())
-                .sum::<usize>();
-        Ok((
-            Some(Self::encode_entries_to_block(&entries, restart_interval)?),
-            gathered,
-        ))
+        *gathered += entries
+            .iter()
+            .map(|e| e.key.user_key.len() + e.value.len())
+            .sum::<usize>();
+        Self::encode_entries_to_block(&entries, restart_interval).map(Some)
     }
 
     /// As [`Self::from_columnar_block`], but drops rows whose global position is
@@ -596,22 +594,20 @@ impl DataBlock {
     ///
     /// Returns `Ok(None)` when every row in the block is deleted: the row encoder
     /// has a non-empty precondition, so a fully-deleted block is reported as
-    /// "nothing to yield" and the caller skips it. Also returns the rebuilt-value
-    /// bytes, as [`Self::from_columnar_block`] does.
+    /// "nothing to yield" and the caller skips it. Also adds the rebuilt-value
+    /// bytes to `gathered`, as [`Self::from_columnar_block`] does.
     #[cfg(feature = "columnar")]
     pub(crate) fn from_columnar_block_masked(
         block_data: &crate::Slice,
         restart_interval: u8,
         deletes: &crate::table::delete_bitmap::DeleteBitmap,
         block_start_row: u32,
-    ) -> crate::Result<(Option<Self>, usize)> {
-        let (kept, rebuilt) =
-            Self::columnar_block_entries_masked(block_data, deletes, block_start_row)?;
-        let block = match kept {
-            Some(kept) => Some(Self::encode_entries_to_block(&kept, restart_interval)?),
-            None => None,
-        };
-        Ok((block, rebuilt))
+        gathered: &mut usize,
+    ) -> crate::Result<Option<Self>> {
+        let kept =
+            Self::columnar_block_entries_masked(block_data, deletes, block_start_row, gathered)?;
+        kept.map(|kept| Self::encode_entries_to_block(&kept, restart_interval))
+            .transpose()
     }
 
     /// Re-encodes reconstructed columnar `entries` into a row-major data block.

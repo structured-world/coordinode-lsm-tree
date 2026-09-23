@@ -241,7 +241,7 @@ impl Scanner {
         {
             // The scanner feeds compaction, which is maintenance and outside
             // the read counters, so the rebuilt-value count is not charged.
-            DataBlock::from_columnar_block(&block.data, restart_interval).map(|(block, _)| block)
+            DataBlock::from_columnar_block(&block.data, restart_interval, &mut 0)
         }
         #[cfg(not(feature = "columnar"))]
         {

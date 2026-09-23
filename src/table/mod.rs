@@ -77,7 +77,7 @@ use iter::Iter;
 
 use crate::path::PathBuf;
 use portable_atomic::AtomicU64;
-use util::load_block;
+use util::{ReadCharge, load_block};
 
 #[cfg(feature = "metrics")]
 use crate::metrics::Metrics;
@@ -1206,30 +1206,37 @@ impl Table {
         // start-row map is built at open from the zone map (every block), so
         // an unmapped block is unreachable; it falls through to the whole-block
         // reconstruction below rather than masking against the wrong positions.
-        let (rebuilt, values) = if let Some(&start) = self
+        let mut values = 0usize;
+        let rebuilt = if let Some(&start) = self
             .delete_block_starts
             .as_ref()
             .and_then(|starts| starts.get(&handle.offset().0))
         {
-            DataBlock::from_columnar_block_masked(&block.data, restart, &self.delete_bitmap, start)?
+            DataBlock::from_columnar_block_masked(
+                &block.data,
+                restart,
+                &self.delete_bitmap,
+                start,
+                &mut values,
+            )
         } else {
             // No materialized deletes (or, unreachably, an unmapped block):
             // reconstruct the whole block.
-            let (block, values) = DataBlock::from_columnar_block(&block.data, restart)?;
-            (Some(block), values)
+            DataBlock::from_columnar_block(&block.data, restart, &mut values).map(Some)
         };
         // Two gathers, each charged at the size of what it built: the values
         // rebuilt from sub-columns (none when they are views), and the
-        // row-major block encoded from the rows.
+        // row-major block encoded from the rows. The first is charged before
+        // the result is judged: a block refused after it still did it.
         #[cfg(feature = "metrics")]
-        {
-            metrics.record_gather(values);
-            if let Some(rebuilt) = &rebuilt {
-                metrics.record_gather(rebuilt.inner.data.len());
-            }
-        }
+        metrics.record_gather(values);
         #[cfg(not(feature = "metrics"))]
         let _ = values;
+        let rebuilt = rebuilt?;
+        #[cfg(feature = "metrics")]
+        if let Some(rebuilt) = &rebuilt {
+            metrics.record_gather(rebuilt.inner.data.len());
+        }
         Ok(rebuilt)
     }
 
@@ -1677,26 +1684,29 @@ impl Table {
             .as_ref()
             .and_then(|starts| starts.get(&handle.offset().0))
             .map(|&start| (self.delete_bitmap.as_ref(), start));
-        let (rebuilt, rows) = DataBlock::columnar_point_block(
+        let mut rows = 0usize;
+        let rebuilt = DataBlock::columnar_point_block(
             &block.data,
             needle,
             &self.comparator,
             self.metadata.data_block_restart_interval,
             deletes,
-        )?;
+            &mut rows,
+        );
         // `rows` is what the decode copied out of the block, plus the needle's
         // keys and values copied out of the columns when it is present; a miss
-        // still decoded the block, so it is charged either way. The small block
-        // encoded from the rows exists only on a hit.
+        // or a refused block still did those copies, so they are charged
+        // either way. The small block encoded from the rows exists only on a
+        // hit.
         #[cfg(feature = "metrics")]
-        {
-            self.metrics.record_gather(rows);
-            if let Some(rebuilt) = &rebuilt {
-                self.metrics.record_gather(rebuilt.inner.data.len());
-            }
-        }
+        self.metrics.record_gather(rows);
         #[cfg(not(feature = "metrics"))]
         let _ = rows;
+        let rebuilt = rebuilt?;
+        #[cfg(feature = "metrics")]
+        if let Some(rebuilt) = &rebuilt {
+            self.metrics.record_gather(rebuilt.inner.data.len());
+        }
         Ok(rebuilt)
     }
 
@@ -1735,15 +1745,19 @@ impl Table {
             #[cfg(zstd_any)]
             self.zstd_dictionary.as_deref(),
         )?;
-        let (batch, copied) = crate::table::columnar::ColumnBatch::decode_counting_copies(
+        let mut copied = 0usize;
+        let batch = crate::table::columnar::ColumnBatch::decode_counting_copies(
             &block.data,
             Some(projection),
-        )?;
+            &mut copied,
+        );
+        // Charged before the result is judged: a decode refused after it
+        // copied still did the copy.
         #[cfg(feature = "metrics")]
         self.metrics.record_gather(copied);
         #[cfg(not(feature = "metrics"))]
         let _ = copied;
-        Ok(batch)
+        batch
     }
 
     /// Returns the (possibly compressed) file size.
@@ -8632,8 +8646,13 @@ impl Table {
         )
     )]
     pub(crate) fn punch_offset_for(&self, key: &[u8]) -> crate::Result<u64> {
+        self.punch_offset_charged(key, ReadCharge::Maintenance)
+    }
+
+    /// [`Self::punch_offset_for`], charging its index walk as `charge` says.
+    fn punch_offset_charged(&self, key: &[u8], charge: ReadCharge) -> crate::Result<u64> {
         let mut data_end = 0u64;
-        for handle in self.maintenance_index_walk() {
+        for handle in self.index_walk_charged(charge) {
             let handle = handle?;
             if self.comparator.compare(handle.end_key(), key) != core::cmp::Ordering::Less {
                 return Ok(handle.offset().0);
@@ -8689,33 +8708,51 @@ impl Table {
     /// one the blocks above the straddling one are apportioned by data bytes,
     /// which is the same granularity every other estimate over this table uses.
     ///
+    /// `charge` says whose read this is. A query planner's estimate is part of
+    /// the query and is counted; a monitoring report is not, so polling it
+    /// leaves a workload's read counters unchanged.
+    ///
     /// # Errors
     ///
-    /// Propagates the index lookup of the restriction bound and the read of the
-    /// straddling block.
-    pub(crate) fn live_item_count(&self) -> crate::Result<u64> {
+    /// Propagates the index walk and the read of the straddling block.
+    pub(crate) fn live_item_count(&self, charge: ReadCharge) -> crate::Result<u64> {
         let Some(bound) = self.restrict_lower_bound() else {
             return Ok(self.metadata.item_count);
         };
-        let punch = self.punch_offset_for(bound)?;
+        // One walk serves all of it: the blocks below the straddling one are
+        // skipped, the straddling one is counted, the rest are summed.
+        let mut walk = self.index_walk_charged(charge);
+        let mut any_block = false;
+        let straddle = loop {
+            let Some(handle) = walk.next() else {
+                break None;
+            };
+            let handle = handle?;
+            any_block = true;
+            if self.comparator.compare(handle.end_key(), bound) != core::cmp::Ordering::Less {
+                break Some(handle);
+            }
+        };
+        let Some(straddle) = straddle else {
+            // Past every block the whole data region is superseded; a table
+            // with no data blocks keeps its recorded count.
+            return Ok(if any_block {
+                0
+            } else {
+                self.metadata.item_count
+            });
+        };
+        let punch = straddle.offset().0;
         if punch == 0 {
             return Ok(self.metadata.item_count);
         }
-        // Nothing below the straddling block survives, and the restriction can
-        // reach past every block (then the whole data region is dead).
-        let Some((straddle_end, straddle_live)) = self.straddling_block_live(punch, bound)? else {
-            return Ok(0);
-        };
+        let straddle_live = self.straddling_block_live(&straddle, bound, charge)?;
         if !self.zone_map.is_empty() {
+            // The straddling block is counted exactly above: its recorded row
+            // count covers the dead rows below the bound too.
             let mut rows = straddle_live;
-            for handle in self.maintenance_index_walk() {
+            for handle in walk {
                 let handle = handle?;
-                // `<=` skips the straddling block: it is counted exactly above,
-                // and its recorded row count covers the dead rows below the
-                // bound too.
-                if *handle.offset() <= punch {
-                    continue;
-                }
                 if let Some(col) = self
                     .zone_map
                     .columns_for(*handle.offset())
@@ -8726,13 +8763,12 @@ impl Table {
             }
             return Ok(rows);
         }
-        let Some(last) = self.maintenance_index_walk().next_back() else {
-            return Ok(straddle_live);
+        let straddle_end = punch + u64::from(straddle.size());
+        let last = match walk.next_back() {
+            Some(last) => last?,
+            None => straddle,
         };
-        let data_end = {
-            let last = last?;
-            *last.offset() + u64::from(last.size())
-        };
+        let data_end = *last.offset() + u64::from(last.size());
         // A straddling block reaching past the data section cannot be reasoned
         // about; keep the recorded count rather than inventing a smaller one.
         let Some(above) = data_end.checked_sub(straddle_end).filter(|_| data_end > 0) else {
@@ -8745,52 +8781,60 @@ impl Table {
         Ok(straddle_live + apportioned)
     }
 
-    /// The block at `punch` STRADDLES the restriction: it is the first whose
-    /// last key reaches `bound`, so the view serves only its entries
-    /// `>= bound`. Returns its end offset and that live count.
+    /// This view's block-index walk, charged to the read counters only when it
+    /// serves a caller's read.
+    fn index_walk_charged(&self, charge: ReadCharge) -> block_index::BlockIndexIterImpl {
+        match charge {
+            ReadCharge::Foreground => self.block_index.iter(),
+            ReadCharge::Maintenance => self.maintenance_index_walk(),
+        }
+    }
+
+    /// The live rows of the block STRADDLING the restriction: the first whose
+    /// last key reaches `bound`, of which the view serves only the entries
+    /// `>= bound`.
     ///
     /// Every block below it is dead in full and every block above is live in
     /// full, so it is the only one whose rows have to be counted rather than
     /// read off the index — and a bound landing on a block's last key (what a
     /// tight-space slice commonly produces) makes almost all of its rows dead.
     ///
-    /// `None` when no block starts at `punch`: the restriction reaches past the
-    /// last key, so the whole data region is superseded.
-    ///
     /// # Errors
     ///
-    /// Propagates the block-index walk and the read of the straddling block.
-    fn straddling_block_live(&self, punch: u64, bound: &[u8]) -> crate::Result<Option<(u64, u64)>> {
-        for handle in self.maintenance_index_walk() {
-            let handle = handle?;
-            if *handle.offset() != punch {
-                continue;
-            }
-            let end = punch + u64::from(handle.size());
-            // Counting rows is statistics, not a caller's read: charge the
-            // block to detached counters, like the index walk above.
+    /// Propagates the read of the block.
+    fn straddling_block_live(
+        &self,
+        straddle: &KeyedBlockHandle,
+        bound: &[u8],
+        charge: ReadCharge,
+    ) -> crate::Result<u64> {
+        #[cfg(feature = "metrics")]
+        let uncounted = Metrics::default();
+        #[cfg(feature = "metrics")]
+        let metrics = match charge {
+            ReadCharge::Foreground => &*self.metrics,
+            ReadCharge::Maintenance => &uncounted,
+        };
+        #[cfg(not(feature = "metrics"))]
+        let _ = charge;
+        // A wholly delete-masked columnar block serves no keys at all.
+        let Some(block) = self.load_data_block_charged(
+            straddle.as_ref(),
             #[cfg(feature = "metrics")]
-            let uncounted = Metrics::default();
-            // A wholly delete-masked columnar block serves no keys at all.
-            let Some(block) = self.load_data_block_charged(
-                handle.as_ref(),
-                #[cfg(feature = "metrics")]
-                &uncounted,
-            )?
-            else {
-                return Ok(Some((end, 0)));
-            };
-            let data = &block.inner.data;
-            let cmp = &*self.comparator;
-            let mut live = 0u64;
-            for item in block.iter(self.comparator.clone()) {
-                if item.compare_key(bound, data, cmp) != core::cmp::Ordering::Less {
-                    live += 1;
-                }
+            metrics,
+        )?
+        else {
+            return Ok(0);
+        };
+        let data = &block.inner.data;
+        let cmp = &*self.comparator;
+        let mut live = 0u64;
+        for item in block.iter(self.comparator.clone()) {
+            if item.compare_key(bound, data, cmp) != core::cmp::Ordering::Less {
+                live += 1;
             }
-            return Ok(Some((end, live)));
         }
-        Ok(None)
+        Ok(live)
     }
 
     /// The same digest for a restriction this VIEW does not carry yet: the

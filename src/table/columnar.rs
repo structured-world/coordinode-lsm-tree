@@ -646,7 +646,7 @@ impl ColumnBatch {
     /// validity flag, or any column that fails [`Column::validate`] (fixed-width
     /// length, `Bytes` offset framing, validity bitmap length / padding).
     pub fn decode(bytes: &crate::Slice) -> Result<Self> {
-        Self::decode_inner(bytes, None).map(|(batch, _)| batch)
+        Self::decode_inner(bytes, None, &mut 0)
     }
 
     /// Decodes only the columns whose id is in `wanted`, advancing past every
@@ -660,18 +660,19 @@ impl ColumnBatch {
     /// As [`ColumnBatch::decode`], evaluated only for the projected columns
     /// (the headers of skipped columns are still framing-checked).
     pub fn decode_projected(bytes: &crate::Slice, wanted: &[u16]) -> Result<Self> {
-        Self::decode_inner(bytes, Some(wanted)).map(|(batch, _)| batch)
+        Self::decode_inner(bytes, Some(wanted), &mut 0)
     }
 
     /// [`ColumnBatch::decode`] or, with `Some(wanted)`,
-    /// [`ColumnBatch::decode_projected`], also returning the bytes the decode
-    /// copied out of the block: validity bitmaps, and `Plain` columns detached
-    /// from it. Read paths charge those to the gather counter.
+    /// [`ColumnBatch::decode_projected`], also adding to `copied` the bytes
+    /// the decode copied out of the block: validity bitmaps, and `Plain`
+    /// columns detached from it. Read paths charge those to the gather counter.
     pub(crate) fn decode_counting_copies(
         bytes: &crate::Slice,
         wanted: Option<&[u16]>,
-    ) -> Result<(Self, usize)> {
-        Self::decode_inner(bytes, wanted)
+        copied: &mut usize,
+    ) -> Result<Self> {
+        Self::decode_inner(bytes, wanted, copied)
     }
 
     /// Shared decode body. `wanted == None` decodes every column; `Some(ids)`
@@ -681,9 +682,14 @@ impl ColumnBatch {
     /// Takes the refcounted block bytes so `Plain` columns come back as
     /// zero-copy views of the block instead of per-column copies — as long as
     /// the projection covers enough of the block for a view to be worth what
-    /// it retains (see [`MAX_VIEW_AMPLIFICATION`]). Returns the batch and the
-    /// bytes copied out of the block to build it.
-    fn decode_inner(bytes: &crate::Slice, wanted: Option<&[u16]>) -> Result<(Self, usize)> {
+    /// it retains (see [`MAX_VIEW_AMPLIFICATION`]). Adds to `copied` each copy
+    /// out of the block as it is made, so a payload refused after one still
+    /// counts it.
+    fn decode_inner(
+        bytes: &crate::Slice,
+        wanted: Option<&[u16]>,
+        copied: &mut usize,
+    ) -> Result<Self> {
         // Smallest possible column: id(2) + type(1) + width(1) + codec(1) +
         // has_validity(1) + data_len(4), with empty validity + data.
         const MIN_COLUMN_BYTES: usize = 10;
@@ -704,7 +710,6 @@ impl ColumnBatch {
         // the whole block alive for them is proportionate.
         let mut viewed_bytes = 0usize;
         let mut view_columns: Vec<usize> = Vec::new();
-        let mut copied = 0usize;
         for _ in 0..column_count {
             let column_id = cur.read_u16()?;
             let type_tag = cur.read_u8()?;
@@ -727,7 +732,7 @@ impl ColumnBatch {
             let validity = if has_validity {
                 let v = cur.read_bytes(validity_len(row_count))?;
                 if want {
-                    copied += v.len();
+                    *copied += v.len();
                     Some(v.to_vec())
                 } else {
                     None
@@ -762,6 +767,13 @@ impl ColumnBatch {
             column.validate(row_count)?;
             columns.push(column);
         }
+        // Checked before the retention detach below, so a refused payload is
+        // not copied for nothing.
+        if !cur.is_empty() {
+            return Err(Error::InvalidHeader(
+                "columnar: trailing bytes after the last column",
+            ));
+        }
         // Retention check: a view keeps the WHOLE decoded block alive, skipped
         // columns included, for as long as any served column lives — and the
         // scan buffers one batch per block (a whole overlap group on the merge
@@ -773,17 +785,12 @@ impl ColumnBatch {
         if !view_columns.is_empty() && bytes.len() > MAX_VIEW_AMPLIFICATION * viewed_bytes {
             for idx in view_columns {
                 if let Some(col) = columns.get_mut(idx) {
-                    copied += col.data.len();
+                    *copied += col.data.len();
                     col.data = crate::Slice::from(&col.data[..]);
                 }
             }
         }
-        if !cur.is_empty() {
-            return Err(Error::InvalidHeader(
-                "columnar: trailing bytes after the last column",
-            ));
-        }
-        Ok((Self { row_count, columns }, copied))
+        Ok(Self { row_count, columns })
     }
 }
 

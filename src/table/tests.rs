@@ -1655,7 +1655,7 @@ fn live_item_count_drops_the_straddling_block_rows_below_the_bound() -> crate::R
             );
             assert_eq!(
                 5,
-                restricted.live_item_count()?,
+                restricted.live_item_count(crate::table::util::ReadCharge::Maintenance)?,
                 "a zone-mapped view counts the straddling block's live suffix, \
                  not its whole row count",
             );
@@ -1666,13 +1666,14 @@ fn live_item_count_drops_the_straddling_block_rows_below_the_bound() -> crate::R
     )
 }
 
-/// Counting a restricted view's live rows is statistics, not a read: the
-/// storage and selectivity reports call it, so charging its cold straddling
-/// block to the read counters would make a workload's figures depend on
-/// whether anything polled those reports while it ran.
+/// A monitoring report counting a restricted view's live rows is not a read:
+/// charging its cold straddling block to the read counters would make a
+/// workload's figures depend on whether anything polled the report while it
+/// ran.
 #[cfg(feature = "metrics")]
 #[test]
-fn live_item_count_over_a_cold_straddling_block_counts_no_bytes() -> crate::Result<()> {
+fn live_item_count_for_maintenance_over_a_cold_straddling_block_counts_no_bytes()
+-> crate::Result<()> {
     test_with_table(
         &twelve_letter_items(),
         |table| {
@@ -1683,7 +1684,10 @@ fn live_item_count_over_a_cold_straddling_block_counts_no_bytes() -> crate::Resu
                 metrics.bytes_decoded(),
                 metrics.bytes_copied(),
             );
-            assert_eq!(5, restricted.live_item_count()?);
+            assert_eq!(
+                5,
+                restricted.live_item_count(crate::table::util::ReadCharge::Maintenance)?
+            );
             assert_eq!(
                 (
                     metrics.bytes_read(),
@@ -1691,8 +1695,35 @@ fn live_item_count_over_a_cold_straddling_block_counts_no_bytes() -> crate::Resu
                     metrics.bytes_copied(),
                 ),
                 before,
-                "counting live rows reads the straddling block for statistics, \
-                 which the read counters must not see",
+                "a report's live-row count must not reach the read counters",
+            );
+            Ok(())
+        },
+        Some(4),
+        Some(|w: Writer| w.use_zone_map(true)),
+    )
+}
+
+/// The planner's estimate is part of the query it plans, so the blocks it
+/// reads to count a restricted view's live rows are charged like the query's
+/// own reads.
+#[cfg(feature = "metrics")]
+#[test]
+fn live_item_count_for_a_query_over_a_cold_straddling_block_counts_its_reads() -> crate::Result<()>
+{
+    test_with_table(
+        &twelve_letter_items(),
+        |table| {
+            let restricted = table.with_restriction(crate::UserKey::from(&b"h"[..]));
+            let metrics = &restricted.metrics;
+            let (read, decoded) = (metrics.bytes_read(), metrics.bytes_decoded());
+            assert_eq!(
+                5,
+                restricted.live_item_count(crate::table::util::ReadCharge::Foreground)?
+            );
+            assert!(
+                metrics.bytes_read() > read && metrics.bytes_decoded() > decoded,
+                "the straddling block a query's estimate reads must be counted",
             );
             Ok(())
         },
@@ -1710,7 +1741,7 @@ fn live_item_count_apportions_only_the_blocks_above_the_straddling_one() -> crat
         &twelve_letter_items(),
         |table| {
             let restricted = table.with_restriction(crate::UserKey::from(&b"h"[..]));
-            let live = restricted.live_item_count()?;
+            let live = restricted.live_item_count(crate::table::util::ReadCharge::Maintenance)?;
             // Exact for the straddling block (1 entry), apportioned by bytes
             // above it (~4 entries) — so within a block's granularity of the
             // true 5, and well below the 8 that counting the straddling block

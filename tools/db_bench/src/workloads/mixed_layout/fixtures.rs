@@ -26,6 +26,7 @@ use lsm_tree::table::columnar::{
     COL_VALUE, Column, TypeTag, entries_to_column_batch, frame_value_cells,
 };
 use lsm_tree::{AbstractTree, AnyTree, InternalValue, ValueType};
+use std::path::Path;
 use std::sync::atomic::{AtomicU64, Ordering};
 use tempfile::TempDir;
 
@@ -119,8 +120,17 @@ impl Oracle {
     }
 }
 
-/// Builds a scenario's tree and the expectation that goes with it.
-pub type FixtureFn = fn(&BenchConfig, &AtomicU64) -> lsm_tree::Result<Fixture>;
+/// Builds a scenario's tree beneath the given directory, and the expectation
+/// that goes with it.
+pub type FixtureFn = fn(&BenchConfig, &AtomicU64, &Path) -> lsm_tree::Result<Fixture>;
+
+/// A fresh directory for one fixture's tree beneath `base`, removed with the
+/// fixture.
+fn fixture_dir(base: &Path) -> std::io::Result<TempDir> {
+    tempfile::Builder::new()
+        .prefix("mixed-layout-")
+        .tempdir_in(base)
+}
 
 /// A built tree together with what it must contain.
 ///
@@ -262,8 +272,8 @@ fn set_columnar(tree: &AnyTree, columnar: bool) -> lsm_tree::Result<()> {
 /// The control every wide-record figure is read against. Whatever a projection
 /// costs per row, it cannot legitimately cost more than reading a narrow row
 /// whole.
-pub fn narrow(config: &BenchConfig, seqno: &AtomicU64) -> lsm_tree::Result<Fixture> {
-    let dir = TempDir::new()?;
+pub fn narrow(config: &BenchConfig, seqno: &AtomicU64, base: &Path) -> lsm_tree::Result<Fixture> {
+    let dir = fixture_dir(base)?;
     let tree = open(&dir, config, Opening::default())?;
     let n = config.num.min(200_000);
 
@@ -295,8 +305,8 @@ pub fn narrow(config: &BenchConfig, seqno: &AtomicU64) -> lsm_tree::Result<Fixtu
 /// Serves both the full read (the baseline a projection is compared against)
 /// and the projection scenario, which reads the same tree and must return the
 /// header fields without paying for the payload.
-pub fn wide(config: &BenchConfig, seqno: &AtomicU64) -> lsm_tree::Result<Fixture> {
-    let dir = TempDir::new()?;
+pub fn wide(config: &BenchConfig, seqno: &AtomicU64, base: &Path) -> lsm_tree::Result<Fixture> {
+    let dir = fixture_dir(base)?;
     let tree = open(&dir, config, Opening::default())?;
     let n = config.num.min(50_000);
 
@@ -328,8 +338,12 @@ pub fn wide(config: &BenchConfig, seqno: &AtomicU64) -> lsm_tree::Result<Fixture
 /// This is what makes a single block geometry a compromise: the block size
 /// that fits many short rows holds a fraction of a long one, so whichever way
 /// it is set, one of the two shapes pays.
-pub fn mixed_sizes(config: &BenchConfig, seqno: &AtomicU64) -> lsm_tree::Result<Fixture> {
-    let dir = TempDir::new()?;
+pub fn mixed_sizes(
+    config: &BenchConfig,
+    seqno: &AtomicU64,
+    base: &Path,
+) -> lsm_tree::Result<Fixture> {
+    let dir = fixture_dir(base)?;
     let tree = open(&dir, config, Opening::default())?;
     let n = config.num.min(100_000);
 
@@ -368,8 +382,9 @@ pub fn mixed_sizes(config: &BenchConfig, seqno: &AtomicU64) -> lsm_tree::Result<
 pub fn columnar_base_row_updates(
     config: &BenchConfig,
     seqno: &AtomicU64,
+    base: &Path,
 ) -> lsm_tree::Result<Fixture> {
-    let dir = TempDir::new()?;
+    let dir = fixture_dir(base)?;
     let tree = open(
         &dir,
         config,
@@ -424,8 +439,9 @@ pub fn columnar_base_row_updates(
 pub fn versions_deletes_tombstones(
     config: &BenchConfig,
     seqno: &AtomicU64,
+    base: &Path,
 ) -> lsm_tree::Result<Fixture> {
-    let dir = TempDir::new()?;
+    let dir = fixture_dir(base)?;
     let tree = open(&dir, config, Opening::default())?;
     let n = config.num.min(100_000);
 
@@ -494,7 +510,11 @@ pub fn versions_deletes_tombstones(
 /// predicate, and a filter the harness ran over returned rows would make both
 /// cost exactly the same engine work. Zone maps are on, so a block holding no
 /// matching row can be skipped unread.
-pub fn selectivity(config: &BenchConfig, _seqno: &AtomicU64) -> lsm_tree::Result<Fixture> {
+pub fn selectivity(
+    config: &BenchConfig,
+    _seqno: &AtomicU64,
+    base: &Path,
+) -> lsm_tree::Result<Fixture> {
     /// Rows per ingested batch. The ingestion accumulates batches and cuts a
     /// block once the pending rows reach the block size target, so a batch is
     /// the granularity of that cut: one row per call lets the target decide
@@ -503,7 +523,7 @@ pub fn selectivity(config: &BenchConfig, _seqno: &AtomicU64) -> lsm_tree::Result
     /// any predicate and leaving the zone map nothing to skip.
     const BATCH: u64 = 1;
 
-    let dir = TempDir::new()?;
+    let dir = fixture_dir(base)?;
     let tree = open(
         &dir,
         config,
@@ -564,8 +584,12 @@ pub fn selectivity(config: &BenchConfig, _seqno: &AtomicU64) -> lsm_tree::Result
 /// Values are far above the separation threshold, so each lives in a blob
 /// file, and a sequential write leaves consecutive keys' blobs adjacent. The
 /// favourable case, against which the scattered profile below is read.
-pub fn blobs_well_placed(config: &BenchConfig, seqno: &AtomicU64) -> lsm_tree::Result<Fixture> {
-    let dir = TempDir::new()?;
+pub fn blobs_well_placed(
+    config: &BenchConfig,
+    seqno: &AtomicU64,
+    base: &Path,
+) -> lsm_tree::Result<Fixture> {
+    let dir = fixture_dir(base)?;
     let tree = open(
         &dir,
         config,
@@ -614,8 +638,12 @@ fn gcd(mut a: u64, mut b: u64) -> u64 {
 /// profile where a scan that fetches a blob before deciding it wants the row
 /// pays the most, which is what makes it the fixture the late-materialization
 /// scenario waits for.
-pub fn blobs_scattered(config: &BenchConfig, seqno: &AtomicU64) -> lsm_tree::Result<Fixture> {
-    let dir = TempDir::new()?;
+pub fn blobs_scattered(
+    config: &BenchConfig,
+    seqno: &AtomicU64,
+    base: &Path,
+) -> lsm_tree::Result<Fixture> {
+    let dir = fixture_dir(base)?;
     let tree = open(
         &dir,
         config,

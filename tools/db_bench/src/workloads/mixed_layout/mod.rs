@@ -52,8 +52,9 @@ use fixtures::{Fixture, FixtureFn};
 use lsm_tree::table::columnar::COL_USER_KEY;
 use lsm_tree::table::columnar_predicate::ColumnRangePredicate;
 use lsm_tree::{AbstractTree, AnyTree, Guard, SeqNo};
+use std::path::Path;
 use std::sync::atomic::AtomicU64;
-use std::time::Instant;
+use std::time::{Duration, Instant};
 
 pub struct MixedLayout;
 
@@ -511,6 +512,25 @@ fn scenarios(config: &BenchConfig) -> Vec<Scenario> {
     ]
 }
 
+/// Builds one scenario's fixture beneath `dir` and measures `read` over it,
+/// returning the readings and the read's wall time (the build is not timed).
+///
+/// The readings name the keys the fixture BUILT: every fixture caps `--num`,
+/// so the request would label a smaller working set as the requested one.
+fn measure_scenario(
+    fixture: FixtureFn,
+    read: ReadFn,
+    config: &BenchConfig,
+    seqno: &AtomicU64,
+    dir: &Path,
+) -> lsm_tree::Result<(Readings, Duration)> {
+    let fixture = fixture(config, seqno, dir)?;
+    let t = Instant::now();
+    let keys = fixture.oracle.rows.len() as u64;
+    let readings = Readings::measure(&fixture.tree, keys, || read(&fixture))?;
+    Ok((readings, t.elapsed()))
+}
+
 impl Workload for MixedLayout {
     // The report is labelled with the run's settings, so a setting the
     // scenarios do not use is refused rather than recorded. They run one after
@@ -546,14 +566,17 @@ impl Workload for MixedLayout {
 
     fn run(
         &self,
-        _tree: &AnyTree,
+        tree: &AnyTree,
         config: &BenchConfig,
         seqno: &AtomicU64,
         reporter: &mut Reporter,
     ) -> lsm_tree::Result<()> {
         // Each scenario builds its own tree: they differ in value shape, in
         // layout and in write history, so one shared tree would make every
-        // figure a blend. The harness's tree is unused for the same reason.
+        // figure a blend. The harness's tree holds no data for the same
+        // reason; its directory is where `--db` put the run, so the fixtures
+        // are built beneath it and measure the device that was asked for.
+        let fixtures_in = tree.tree_config().path.as_path();
         reporter.start();
 
         let mut unsupported = 0_usize;
@@ -561,11 +584,9 @@ impl Workload for MixedLayout {
             let name = scenario.name;
             match scenario.support {
                 Support::Native(read) => {
-                    let fixture = (scenario.fixture)(config, seqno)?;
-                    let t = Instant::now();
-                    let keys = fixture.oracle.rows.len() as u64;
-                    let readings = Readings::measure(&fixture.tree, keys, || read(&fixture))?;
-                    reporter.record_duration(t.elapsed());
+                    let (readings, elapsed) =
+                        measure_scenario(scenario.fixture, read, config, seqno, fixtures_in)?;
+                    reporter.record_duration(elapsed);
                     readings.report(name);
                     readings.publish(name, reporter);
                 }
