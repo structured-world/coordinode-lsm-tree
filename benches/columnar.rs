@@ -11,8 +11,10 @@
 //!     transpose-back-to-row cost here, so this is the overhead boundary.
 //!   - `columnar/point_lookup` — random `get`; the layout must not regress the
 //!     point-read path.
+//!   - `columnar/filter_batch` — compact one decoded batch to the rows a mask
+//!     keeps, the gather behind every filtered columnar scan.
 //!
-//! Three layouts per operation: `row` (baseline), `columnar`, and
+//! Three layouts per tree operation: `row` (baseline), `columnar`, and
 //! `columnar+zonemap`.
 
 #![cfg(feature = "columnar")]
@@ -162,5 +164,51 @@ fn bench_point_lookup(c: &mut Criterion) {
     group.finish();
 }
 
-criterion_group!(benches, bench_full_scan, bench_point_lookup);
+/// Batch filtering: compacting a decoded block's batch to the rows a mask
+/// keeps, the gather behind every range-bounded, partially visible or
+/// predicate-filtered columnar scan. Keep ratios span a selective predicate,
+/// an even split and a range that clips a few rows.
+fn bench_filter_batch(c: &mut Criterion) {
+    use lsm_tree::table::columnar::entries_to_column_batch;
+    use lsm_tree::table::columnar_predicate::filter_batch;
+    use lsm_tree::{InternalValue, ValueType};
+
+    let rows = 4_096u32;
+    let entries: Vec<InternalValue> = (0..rows)
+        .map(|i| {
+            InternalValue::from_components(
+                format!("key{i:08}").as_bytes(),
+                vec![b'v'; 100],
+                0,
+                ValueType::Value,
+            )
+        })
+        .collect();
+    let batch = entries_to_column_batch(&entries).expect("transpose");
+
+    let mut group = c.benchmark_group("columnar/filter_batch");
+    for (label, keep_one_in) in [("keep_1pct", 100u32), ("keep_50pct", 2), ("keep_99pct", 0)] {
+        let mask: Vec<bool> = (0..rows)
+            .map(|i| match keep_one_in {
+                0 => i % 100 != 0,
+                n => i % n == 0,
+            })
+            .collect();
+        group.bench_function(label, |b| {
+            b.iter_custom(|iters| {
+                timed_with_tail(label, iters, || {
+                    std::hint::black_box(filter_batch(&batch, &mask).expect("filter"));
+                })
+            });
+        });
+    }
+    group.finish();
+}
+
+criterion_group!(
+    benches,
+    bench_full_scan,
+    bench_point_lookup,
+    bench_filter_batch
+);
 criterion_main!(benches);

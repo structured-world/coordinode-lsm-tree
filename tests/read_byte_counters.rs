@@ -578,6 +578,43 @@ fn an_uncompressed_blob_prefetch_counts_the_records_it_copies_out() {
 }
 
 #[test]
+fn a_point_read_admitted_to_the_row_cache_counts_the_row_it_detaches() {
+    // A point read that misses the row cache copies the key and value it
+    // resolved out of the data block, so the cached row owns its bytes rather
+    // than pinning the block. That copy is a gather like any other: both
+    // lookup paths (value-only and full entry) charge it, and the later hit,
+    // served from the cached row, copies nothing.
+    let value_len = 200;
+    let (_folder, tree) = filled_tree(100, value_len, CompressionType::None);
+    let m = tree.metrics();
+    let row = |i: u32| (key(i).len() + value_len) as u64;
+
+    let before = m.bytes_copied();
+    assert!(tree.get(key(5), SeqNo::MAX).expect("get").is_some());
+    assert_eq!(
+        m.bytes_copied() - before,
+        row(5),
+        "the value-only lookup detached one row into the row cache",
+    );
+
+    let before = m.bytes_copied();
+    assert!(tree.get(key(5), SeqNo::MAX).expect("get").is_some());
+    assert_eq!(m.bytes_copied(), before, "a row-cache hit copies nothing",);
+
+    let before = m.bytes_copied();
+    assert!(
+        tree.get_internal_entry(&key(7), SeqNo::MAX)
+            .expect("get entry")
+            .is_some()
+    );
+    assert_eq!(
+        m.bytes_copied() - before,
+        row(7),
+        "the full-entry lookup detached one row into the row cache",
+    );
+}
+
+#[test]
 fn streaming_a_single_segment_copies_nothing() {
     // The clause: copied counts GATHERS — building a new buffer from bytes
     // that already exist in another. A scan over one segment whose rows are
@@ -728,6 +765,63 @@ fn a_merged_columnar_scan_counts_the_seqno_column_it_rewrites() {
         first + second + both + returned + 8 * rows,
         "each segment's rows, the accumulator over both, the surviving rows and \
          the rewritten seqnos are one gather each",
+    );
+}
+
+#[test]
+fn a_scan_of_one_ingested_segment_counts_the_seqno_column_it_globalizes() {
+    // A bulk-ingested segment stores its rows at local seqno 0 and carries its
+    // place in the tree as a per-segment offset. Returning its seqno column
+    // therefore writes each row's effective seqno into a new column, even on
+    // the path that otherwise streams the segment untouched: that rewrite is a
+    // gather, 8 bytes per row, and the only one this scan performs.
+    let folder = get_tmp_folder();
+    let AnyTree::Standard(tree) = Config::new(
+        folder.path(),
+        SequenceNumberCounter::new(100),
+        SequenceNumberCounter::default(),
+    )
+    .open()
+    .expect("open") else {
+        panic!("expected a standard tree");
+    };
+    tree.update_runtime_config(|cfg| cfg.columnar = true)
+        .expect("enable columnar");
+    let n = 1_000;
+    let entries: Vec<InternalValue> = (0..n)
+        .map(|i| InternalValue::from_components(key(i), b"vv", 0, ValueType::Value))
+        .collect();
+    let any = AnyTree::Standard(tree.clone());
+    let mut ingest = any.ingestion().expect("ingestion");
+    ingest
+        .write_columnar_batch(&entries_to_column_batch(&entries).expect("transpose"))
+        .expect("write batch");
+    ingest.finish().expect("finish");
+    let m = tree.metrics();
+    let before = m.bytes_copied();
+
+    let mut rows = 0_u64;
+    for batch in tree
+        .columnar_scan(&[COL_USER_KEY, COL_SEQNO, COL_VALUE], None, SeqNo::MAX, ..)
+        .expect("scan")
+    {
+        let batch = batch.expect("batch");
+        let seqnos = batch
+            .columns
+            .iter()
+            .find(|c| c.column_id == COL_SEQNO)
+            .expect("seqno column");
+        assert!(
+            seqnos.data.chunks_exact(8).all(|s| s != [0; 8]),
+            "the returned seqnos are the segment's effective ones, not its local zeros",
+        );
+        rows += u64::from(batch.row_count);
+    }
+    assert_eq!(rows, u64::from(n), "the scan yields every ingested row");
+    assert_eq!(
+        m.bytes_copied() - before,
+        8 * rows,
+        "the globalized seqno column is one gather of 8 bytes per row",
     );
 }
 

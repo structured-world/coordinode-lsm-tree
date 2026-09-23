@@ -75,12 +75,13 @@ pub struct Metrics {
     /// The named set, so a new path cannot win by not being instrumented:
     /// column-batch accumulation, batch filtering, row gathering by index,
     /// row-value reconstruction from sub-columns, the prefix copies and the
-    /// synthesized block of a large zstd block's partial decode, and what
+    /// synthesized block of a large zstd block's partial decode, what
     /// decoding a columnar block copies out of it (validity bitmaps, and
-    /// columns a narrow projection detaches), wherever a read performs them
+    /// columns a narrow projection detaches), the effective seqnos written
+    /// over a bulk-ingested segment's local ones, and the key and value a
+    /// point read detaches into the row cache, wherever a read performs them
     /// (single-segment and merged columnar scans, row iteration and point
-    /// reads of a columnar segment, range reads of a partially decoded
-    /// block). It does NOT count a
+    /// reads, range reads of a partially decoded block). It does NOT count a
     /// block transform's output (that is `block_bytes_decoded`), a write
     /// path's serialisation, the input decoding of compaction, repair and
     /// salvage (maintenance, not reads), or a move that transfers ownership without
@@ -298,10 +299,6 @@ impl Metrics {
     /// site in the named set calls this, so the set and its instrumentation
     /// cannot drift apart one path at a time.
     #[inline]
-    #[cfg_attr(
-        not(feature = "columnar"),
-        expect(dead_code, reason = "every gather site is a columnar read path")
-    )]
     pub(crate) fn record_gather(&self, bytes: usize) {
         self.bytes_copied.fetch_add(bytes as u64, Relaxed);
     }

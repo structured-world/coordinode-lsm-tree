@@ -375,26 +375,38 @@ impl Cache {
         }
     }
 
-    /// Caches the resolved point-read result `iv` for SST `id`, keyed by
-    /// `key_hash`. Only a newest-version result (from a latest-version read)
-    /// should be inserted, so the seqno-visibility check on lookup stays correct.
-    /// SSTs are immutable, so an entry stays valid until its SST is compacted
-    /// away (after which its `table_id` is never read again and the entry ages
-    /// out of the cache).
+    /// Caches the resolved point-read result (`user_key`, `seqno`,
+    /// `value_type`, `value`) for SST `id`, keyed by `key_hash`, and returns
+    /// the bytes it copied to own the row (zero when the row cache is off or
+    /// the row is too heavy to admit). Only a newest-version result (from a
+    /// latest-version read) should be inserted, so the seqno-visibility check
+    /// on lookup stays correct. SSTs are immutable, so an entry stays valid
+    /// until its SST is compacted away (after which its `table_id` is never
+    /// read again and the entry ages out of the cache).
     #[doc(hidden)]
-    pub fn insert_row(&self, id: GlobalTableId, key_hash: u64, mut iv: InternalValue) {
+    #[must_use = "the bytes copied belong to the reading caller's gather count"]
+    pub fn insert_row(
+        &self,
+        id: GlobalTableId,
+        key_hash: u64,
+        user_key: &[u8],
+        seqno: crate::SeqNo,
+        value_type: crate::ValueType,
+        value: &[u8],
+    ) -> usize {
         if !self.row_cache_enabled {
-            return;
+            return 0;
         }
-        // The point-read path hands over a value that is a SUBSLICE of the
-        // decoded data block, and a subslice keeps the whole block allocation
-        // alive. The weigher charges a row its own key and value bytes only, so
-        // a 100-byte row viewing a 4 KiB block would be accounted as 100 bytes
-        // while holding 4096 — and a workload touching one key per block, the
-        // one a row cache helps least, would overrun the requested capacity by
-        // that ratio. Copying the value out costs one small allocation per
-        // MISS, on a path that has just walked the index and decoded a block,
-        // and it makes the charge equal to what is actually retained.
+        // The point-read path hands over a key and value that may be SUBSLICES
+        // of the decoded data block, and a subslice keeps the whole block
+        // allocation alive. The weigher charges a row its own key and value
+        // bytes only, so a 100-byte row viewing a 4 KiB block would be
+        // accounted as 100 bytes while holding 4096 — and a workload touching
+        // one key per block, the one a row cache helps least, would overrun the
+        // requested capacity by that ratio. Copying both out costs small
+        // allocations per MISS, on a path that has just walked the index and
+        // decoded a block, and it makes the charge equal to what is actually
+        // retained.
         //
         // Unless the row cannot be admitted at all. A row heavier than one shard
         // is refused by the insert below, and a value that big is re-read as
@@ -402,14 +414,18 @@ impl Cache {
         // memcpy on every one of those reads to produce something immediately
         // discarded. The copy does not change the weight, so projecting it here
         // is exact.
-        if row_weight(iv.key.user_key.len(), iv.value.len()) > self.data.max_entry_weight() {
-            return;
+        if row_weight(user_key.len(), value.len()) > self.data.max_entry_weight() {
+            return 0;
         }
-        iv.value = crate::UserValue::from(&*iv.value);
+        let iv = InternalValue {
+            key: crate::key::InternalKey::new(crate::UserKey::from(user_key), seqno, value_type),
+            value: crate::UserValue::from(value),
+        };
         self.data.insert(
             (TAG_ROW, id.tree_id(), id.table_id(), key_hash).into(),
             Item::Row(iv),
         );
+        user_key.len() + value.len()
     }
 
     /// Caches a separated value under its position, together with the two

@@ -485,16 +485,9 @@ impl DataBlock {
         let batch = crate::table::columnar::ColumnBatch::decode_counting_copies(
             block_data, None, gathered,
         )?;
-        let views = batch
-            .columns
-            .get(3..)
-            .is_some_and(crate::table::columnar::values_are_views);
         // Consuming, zero-copy untranspose: row keys / values are views into the
         // batch's column buffers rather than per-row copies.
-        let entries = crate::table::columnar::column_batch_into_entries(batch)?;
-        if !views {
-            *gathered += entries.iter().map(|e| e.value.len()).sum::<usize>();
-        }
+        let entries = crate::table::columnar::column_batch_into_entries(batch, gathered)?;
         // The writer never spills an empty block, so a zero-row columnar block is
         // corrupt; reject it before any consumer with a non-empty precondition.
         if entries.is_empty() {

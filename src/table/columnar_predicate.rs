@@ -20,7 +20,7 @@
 //! transform and are not yet filterable at the row level (block skip still
 //! works, since the zone-map min / max are already comparable-encoded).
 
-use super::columnar::{Column, ColumnBatch, TypeTag};
+use super::columnar::{Column, ColumnBatch, TypeTag, frame_bytes_column, gather_fixed_column};
 use super::zone_map::ColumnStats;
 use alloc::vec::Vec;
 
@@ -115,106 +115,30 @@ impl ColumnRangePredicate {
 /// Returns a new batch keeping only the rows where `mask[i]` is true, preserving
 /// column order and per-column framing, so the scan yields only matching rows. A
 /// mask shorter than `row_count` drops the unspecified trailing rows.
-#[must_use]
-pub fn filter_batch(batch: &ColumnBatch, mask: &[bool]) -> ColumnBatch {
-    let kept = mask.iter().filter(|&&m| m).count();
-    let rows = batch.row_count as usize;
-    let columns = batch
-        .columns
-        .iter()
-        .map(|c| filter_column(c, rows, mask, kept))
-        .collect();
-    // kept <= row_count, which is a u32, so the count fits.
-    let row_count = u32::try_from(kept).unwrap_or(batch.row_count);
-    ColumnBatch { row_count, columns }
-}
-
-/// Compacts one column to the rows selected by `mask`, rebuilding its framing
-/// (fixed chunks copied through, `Bytes` offset table + payload rebuilt) and its
-/// validity bitmap.
-fn filter_column(col: &Column, rows: usize, mask: &[bool], kept: usize) -> Column {
-    let data = match col.type_tag {
-        TypeTag::Fixed(width) => {
-            let width = width as usize;
-            // Bounded by a block's row count and the fixed width, so no overflow.
-            let mut out = Vec::with_capacity(kept * width);
-            for (row, &keep) in mask.iter().enumerate() {
-                if keep
-                    && let Some(start) = row.checked_mul(width)
-                    && let Some(end) = start.checked_add(width)
-                    && let Some(chunk) = col.data.get(start..end)
-                {
-                    out.extend_from_slice(chunk);
-                }
-            }
-            out
-        }
-        TypeTag::Bytes => {
-            // Rebuild the (kept + 1) u32 offset table and the packed payload.
-            let mut offsets = Vec::with_capacity((kept + 1) * 4);
-            let mut payload = Vec::new();
-            let mut acc: u32 = 0;
-            offsets.extend_from_slice(&acc.to_le_bytes());
-            for (row, &keep) in mask.iter().enumerate() {
-                if !keep {
-                    continue;
-                }
-                // Every kept row writes exactly one offset, so the table stays in
-                // lockstep with the kept row count even if a row's bytes are
-                // unreadable: a corrupt slice degrades to empty rather than
-                // leaving a missing offset and malformed framing.
-                let value = bytes_row(&col.data, rows, row).unwrap_or(&[]);
-                payload.extend_from_slice(value);
-                // `col` is an already-decoded column, so its per-row lengths and
-                // their running total both fit u32 by construction (that is how
-                // the offset table was parsed). The kept payload is a SUBSET of
-                // that original, so `acc` stays within the original total and can
-                // never exceed u32::MAX — plain arithmetic, no cap to hide a
-                // corrupt overrun and no error channel to surface one on.
-                let len = u32::try_from(value.len()).unwrap_or(u32::MAX);
-                acc += len;
-                offsets.extend_from_slice(&acc.to_le_bytes());
-            }
-            offsets.extend_from_slice(&payload);
-            offsets
-        }
-    };
-    let validity = col
-        .validity
-        .as_ref()
-        .map(|bits| compact_validity(bits, mask, kept));
-    Column {
-        column_id: col.column_id,
-        type_tag: col.type_tag,
-        validity,
-        data: data.into(),
-    }
-}
-
-/// Rebuilds a validity bitmap for the rows selected by `mask`, preserving each
-/// kept row's null bit in compacted order.
-fn compact_validity(bits: &[u8], mask: &[bool], kept: usize) -> Vec<u8> {
-    let mut out = alloc::vec![0u8; kept.div_ceil(8)];
-    let mut o = 0usize;
+///
+/// # Errors
+///
+/// Returns an error if a `Bytes` column's kept payload does not fit its `u32`
+/// offsets, which a column decoded from a valid block cannot reach (the kept
+/// cells are a subset of the column's own).
+pub fn filter_batch(batch: &ColumnBatch, mask: &[bool]) -> crate::Result<ColumnBatch> {
+    // The mask is read once, into the kept rows' indices, and every column is
+    // then gathered over those alone: a selective mask costs one pass over it
+    // rather than one per column. A mask bit past `u32::MAX` (never a row of a
+    // block) becomes an out-of-range index, which gathers an empty cell.
+    let mut kept = Vec::with_capacity(mask.len());
     for (row, &keep) in mask.iter().enumerate() {
-        if !keep {
-            continue;
+        if keep {
+            kept.push(u32::try_from(row).unwrap_or(u32::MAX));
         }
-        let valid = bits
-            .get(row / 8)
-            .is_some_and(|b| b & (1u8 << (row % 8)) != 0);
-        if valid && let Some(byte) = out.get_mut(o / 8) {
-            *byte |= 1u8 << (o % 8);
-        }
-        o += 1;
     }
-    out
+    take_rows(batch, &kept)
 }
 
 /// Builds a new batch from `batch`'s rows selected (and reordered) by `indices`.
 ///
-/// Like [`filter_batch`] but driven by an explicit row-index list rather than a
-/// per-row bool mask, so it can both *drop* and *reorder* rows. The tree-level
+/// The gather [`filter_batch`] runs over a mask's kept rows, driven here by an
+/// explicit row-index list, so it can both *drop* and *reorder* rows. The tree-level
 /// merge path (`Tree::columnar_scan` over an overlapping segment group) uses it
 /// to gather the surviving rows of a group in key order after a stable sort +
 /// newest-wins dedup. An out-of-range index contributes an empty (`Bytes`) or
@@ -235,68 +159,32 @@ pub(crate) fn take_rows(batch: &ColumnBatch, indices: &[u32]) -> crate::Result<C
 
 /// Gathers one column to the rows listed in `indices` (in that order),
 /// rebuilding its framing (fixed chunks copied, `Bytes` offset table + payload
-/// repacked) and its validity bitmap. Sibling of [`filter_column`] for the
-/// index-driven [`take_rows`] gather.
-/// Advances the running `Bytes` offset accumulator by one gathered value's
-/// length, returning the new offset. Unlike the mask-driven `filter_column`, a
-/// gather may REPEAT an index (any index list is permitted), so the emitted
-/// payload is not a subset of the original and the running u32 offset can exceed
-/// the original total. A saturating accumulator would peg the offsets at
-/// `u32::MAX` while the payload kept growing, desyncing the offset table from the
-/// payload (later rows mis-sliced on read); instead this returns
-/// [`crate::Error::DecompressedSizeTooLarge`] when either a single value's length
-/// or the accumulated total would exceed the u32 offset-table capacity.
-fn advance_bytes_offset(acc: u32, value_len: usize) -> crate::Result<u32> {
-    let len = u32::try_from(value_len).map_err(|_| crate::Error::DecompressedSizeTooLarge {
-        declared: value_len as u64,
-        limit: u64::from(u32::MAX),
-    })?;
-    acc.checked_add(len)
-        .ok_or_else(|| crate::Error::DecompressedSizeTooLarge {
-            declared: u64::from(acc) + u64::from(len),
-            limit: u64::from(u32::MAX),
-        })
-}
-
+/// repacked) and its validity bitmap. The body is written once, straight into
+/// its final buffer.
 fn take_column(col: &Column, rows: usize, indices: &[u32]) -> crate::Result<Column> {
     let data = match col.type_tag {
+        // Out-of-range index: zero-fill one cell so the fixed framing stays
+        // `row_count * width` bytes long.
         TypeTag::Fixed(width) => {
             let width = width as usize;
-            let mut out = Vec::with_capacity(indices.len() * width);
-            for &i in indices {
-                let i = i as usize;
-                if let Some(start) = i.checked_mul(width)
-                    && let Some(end) = start.checked_add(width)
-                    && let Some(chunk) = col.data.get(start..end)
-                {
-                    out.extend_from_slice(chunk);
-                } else {
-                    // Out-of-range index: zero-fill one cell so the fixed framing
-                    // stays `row_count * width` bytes long.
-                    out.resize(out.len() + width, 0);
-                }
-            }
-            out
+            gather_fixed_column(
+                width,
+                indices.len(),
+                indices.iter().map(|&i| {
+                    let start = (i as usize).checked_mul(width)?;
+                    col.data.get(start..start.checked_add(width)?)
+                }),
+            )
         }
-        TypeTag::Bytes => {
-            let mut offsets = Vec::with_capacity((indices.len() + 1) * 4);
-            let mut payload = Vec::new();
-            let mut acc: u32 = 0;
-            offsets.extend_from_slice(&acc.to_le_bytes());
-            for &i in indices {
-                // A missing cell degrades to empty (one offset still written), so
-                // the offset table stays in lockstep with the output row count.
-                let value = bytes_row(&col.data, rows, i as usize).unwrap_or(&[]);
-                // Advance the offset accumulator BEFORE appending the value, so a
-                // genuinely oversized gather is a clean error rather than a
-                // silently corrupt batch (see `advance_bytes_offset`).
-                acc = advance_bytes_offset(acc, value.len())?;
-                payload.extend_from_slice(value);
-                offsets.extend_from_slice(&acc.to_le_bytes());
-            }
-            offsets.extend_from_slice(&payload);
-            offsets
-        }
+        // A missing cell degrades to empty (one offset still written), so the
+        // offset table stays in lockstep with the output row count. A gather
+        // may repeat an index, so its payload can outgrow the original: that
+        // is refused before anything is written (see `frame_bytes_column`).
+        TypeTag::Bytes => frame_bytes_column(indices.len(), || {
+            indices
+                .iter()
+                .map(|&i| bytes_row(&col.data, rows, i as usize).unwrap_or(&[]))
+        })?,
     };
     let validity = col
         .validity
@@ -306,7 +194,7 @@ fn take_column(col: &Column, rows: usize, indices: &[u32]) -> crate::Result<Colu
         column_id: col.column_id,
         type_tag: col.type_tag,
         validity,
-        data: data.into(),
+        data,
     })
 }
 

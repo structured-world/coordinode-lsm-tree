@@ -1285,7 +1285,7 @@ impl Table {
                 Ok(!self.delete_bitmap.contains(pos))
             })
             .collect::<crate::Result<_>>()?;
-        let masked = crate::table::columnar_predicate::filter_batch(&batch, &keep);
+        let masked = crate::table::columnar_predicate::filter_batch(&batch, &keep)?;
         if masked.row_count == 0 {
             Ok(None)
         } else {
@@ -5917,8 +5917,18 @@ impl Table {
         if seqno > self.metadata.seqnos.1
             && let Some(iv) = &item
         {
-            self.cache
-                .insert_row(self.global_id(), key_hash, iv.clone());
+            let detached = self.cache.insert_row(
+                self.global_id(),
+                key_hash,
+                &iv.key.user_key,
+                iv.key.seqno,
+                iv.key.value_type,
+                &iv.value,
+            );
+            #[cfg(feature = "metrics")]
+            self.metrics.record_gather(detached);
+            #[cfg(not(feature = "metrics"))]
+            let _ = detached;
         }
 
         // Translate table-local seqno back to global coordinate so callers
@@ -5998,16 +6008,18 @@ impl Table {
 
         // Populate only when this read could see the SST's newest version
         // (`seqno > max`, exclusive), mirroring `Table::get`. The value path does
-        // not reconstruct the matched key, so rebuild the `InternalValue` from
-        // the query key (the needle) + the resolved `(value_type, seqno, value)`.
+        // not reconstruct the matched key, so the row is keyed by the query key
+        // (the needle) + the resolved `(value_type, seqno, value)`.
         if seqno > self.metadata.seqnos.1
             && let Some((vt, s, v)) = &item
         {
-            let iv = InternalValue {
-                key: crate::key::InternalKey::new(crate::UserKey::from(key), *s, *vt),
-                value: v.clone(),
-            };
-            self.cache.insert_row(self.global_id(), key_hash, iv);
+            let detached = self
+                .cache
+                .insert_row(self.global_id(), key_hash, key, *s, *vt, v);
+            #[cfg(feature = "metrics")]
+            self.metrics.record_gather(detached);
+            #[cfg(not(feature = "metrics"))]
+            let _ = detached;
         }
 
         // Translate table-local seqno back to the global coordinate, mirroring
@@ -7110,7 +7122,7 @@ impl Table {
                         }
                     }
                 }
-                let filtered = crate::table::columnar_predicate::filter_batch(&batch, &keep);
+                let filtered = crate::table::columnar_predicate::filter_batch(&batch, &keep)?;
                 #[cfg(feature = "metrics")]
                 self.metrics.record_gather(filtered.data_size());
                 filtered

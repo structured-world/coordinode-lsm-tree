@@ -380,35 +380,42 @@ impl ColumnarScan {
     /// masking arithmetic elsewhere translates the THRESHOLD into local space
     /// instead (cheaper, one subtraction per segment), which is why the column
     /// itself still needs this before it reaches a caller. A zero offset leaves
-    /// the batch untouched.
-    fn globalize_seqnos(batch: &mut ColumnBatch, global: SeqNo) -> crate::Result<()> {
+    /// the batch untouched. The rewritten column is a gather and is charged.
+    fn globalize_seqnos(&self, batch: &mut ColumnBatch, global: SeqNo) -> crate::Result<()> {
         if global == 0 {
             return Ok(());
         }
         let Some(col) = batch.columns.iter_mut().find(|c| c.column_id == COL_SEQNO) else {
             return Ok(());
         };
-        // Column bytes are an immutable (possibly shared) view, so the
-        // globalized column is rebuilt into an owned buffer — one allocation
-        // per batch, and only for bulk-ingested segments (`global != 0`).
-        let mut out = alloc::vec::Vec::with_capacity(batch.row_count as usize * 8);
-        for row in 0..batch.row_count as usize {
-            let at = row * 8;
-            let bytes = col
-                .data
-                .get(at..at + 8)
-                .ok_or(Error::InvalidHeader("columnar_scan: short seqno column"))?;
-            let local = u64::from_le_bytes(
-                bytes
-                    .try_into()
-                    .map_err(|_| Error::InvalidHeader("columnar_scan: short seqno column"))?,
-            );
-            let effective = local.checked_add(global).ok_or(Error::InvalidHeader(
-                "columnar_scan: effective seqno overflows",
-            ))?;
-            out.extend_from_slice(&effective.to_le_bytes());
+        let len = batch.row_count as usize * 8;
+        if col.data.len() != len {
+            return Err(Error::InvalidHeader("columnar_scan: short seqno column"));
         }
-        col.data = crate::Slice::from(out);
+        // Column bytes are an immutable (possibly shared) view, so the
+        // globalized column is rebuilt into a new buffer, written in place:
+        // one allocation per batch, and only for bulk-ingested segments
+        // (`global != 0`).
+        // SAFETY: the loop writes one 8-byte seqno per row, and `len` is
+        // exactly `row_count * 8`, which the source column matches, so every
+        // byte is initialized before the buffer is frozen and read. An early
+        // return on overflow drops the builder unread.
+        #[expect(unsafe_code, reason = "see safety")]
+        let mut out = unsafe { crate::Slice::builder_unzeroed(len) };
+        for (dst, src) in out.chunks_exact_mut(8).zip(col.data.chunks_exact(8)) {
+            let mut local = [0u8; 8];
+            local.copy_from_slice(src);
+            let effective =
+                u64::from_le_bytes(local)
+                    .checked_add(global)
+                    .ok_or(Error::InvalidHeader(
+                        "columnar_scan: effective seqno overflows",
+                    ))?;
+            dst.copy_from_slice(&effective.to_le_bytes());
+        }
+        col.data = crate::Slice::from(out.freeze());
+        #[cfg(feature = "metrics")]
+        self.metrics.record_gather(len);
         Ok(())
     }
 
@@ -452,7 +459,7 @@ impl ColumnarScan {
                 .columnar_scan(&self.projection, self.predicate.as_ref())?;
             out.retain(|b| b.row_count > 0);
             for batch in &mut out {
-                Self::globalize_seqnos(batch, seg.global)?;
+                self.globalize_seqnos(batch, seg.global)?;
             }
             return Ok(out);
         }
@@ -529,7 +536,7 @@ impl ColumnarScan {
                 };
                 mask.push(keep);
             }
-            let mut visible = filter_batch(&batch, &mask);
+            let mut visible = filter_batch(&batch, &mask)?;
             self.record_gather(&visible);
             if partial && !seqno_projected {
                 visible.columns.retain(|c| c.column_id != COL_SEQNO);
@@ -538,7 +545,7 @@ impl ColumnarScan {
                 visible.columns.retain(|c| c.column_id != COL_USER_KEY);
             }
             if visible.row_count > 0 {
-                Self::globalize_seqnos(&mut visible, seg.global)?;
+                self.globalize_seqnos(&mut visible, seg.global)?;
                 out.push(visible);
             }
         }
@@ -706,12 +713,12 @@ impl ColumnarScan {
                 mask.push(!range_filter || key_in_bounds(key, &self.lo, &self.hi, cmp));
             }
 
-            let mut visible = filter_batch(&batch, &mask);
+            let mut visible = filter_batch(&batch, &mask)?;
             self.record_gather(&visible);
             // The predicate runs on the deduped survivors only (see doc).
             if let Some(pred) = self.predicate.as_ref() {
                 let pred_mask = pred.matching_rows(&visible);
-                visible = filter_batch(&visible, &pred_mask);
+                visible = filter_batch(&visible, &pred_mask)?;
                 self.record_gather(&visible);
             }
             // Match the singleton contract: yield exactly the projected columns.
@@ -730,7 +737,7 @@ impl ColumnarScan {
                 visible.columns.retain(|c| c.column_id != pc);
             }
             if visible.row_count > 0 {
-                Self::globalize_seqnos(&mut visible, seg.global)?;
+                self.globalize_seqnos(&mut visible, seg.global)?;
                 out.push(visible);
             }
         }
@@ -820,7 +827,7 @@ impl ColumnarScan {
                         source_rank.push(seg.recency_rank);
                     }
                 }
-                let visible = filter_batch(&batch, &mask);
+                let visible = filter_batch(&batch, &mask)?;
                 self.record_gather(&visible);
                 if visible.row_count == 0 {
                     continue;
@@ -971,7 +978,7 @@ impl ColumnarScan {
         // older matching version.
         if let Some(pred) = self.predicate.as_ref() {
             let mask = pred.matching_rows(&merged);
-            merged = filter_batch(&merged, &mask);
+            merged = filter_batch(&merged, &mask)?;
             self.record_gather(&merged);
         }
 
