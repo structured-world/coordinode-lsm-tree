@@ -39,3 +39,26 @@ tracing-subscriber = { version = "0.3", features = ["registry"], optional = true
 [profile.release]
 lto = "thin"
 codegen-units = 1
+
+# The same dev profiles as the crate root: this is a separate workspace and
+# does not inherit them. See the root Cargo.toml for what each one is for.
+[profile.dev]
+debug = "line-tables-only"
+
+[profile.dev.build-override]
+debug = "line-tables-only"
+
+[profile.debugger]
+inherits = "dev"
+debug = "full"
+
+# Here "*" also covers the engine, which is a dependency of this workspace
+# rather than a member, so a dev build measures an optimised engine.
+[profile.dev.package."*"]
+opt-level = 2
+
+# The engine is a path dependency here, which Cargo builds incrementally, and a
+# compiler cache never serves incremental artifacts: every fresh target
+# directory would recompile it. Non-incremental makes it cacheable.
+[profile.dev.package.coordinode-lsm-tree]
+incremental = false

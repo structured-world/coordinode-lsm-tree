@@ -449,3 +449,23 @@ required-features = []
 [profile.bench]
 lto = "thin"
 codegen-units = 1
+
+# Line tables keep file and line in backtraces and panics while dropping the
+# rest of the debug info, which is most of a dev target directory's size and
+# link time. Build scripts and proc macros get the same through
+# build-override. A debugger session wants the full info: `--profile debugger`.
+[profile.dev]
+debug = "line-tables-only"
+
+[profile.dev.build-override]
+debug = "line-tables-only"
+
+[profile.debugger]
+inherits = "dev"
+debug = "full"
+
+# Dependencies are optimised, this crate stays at 0 so it rebuilds fast. The
+# value matches the other workspaces built on the same machines, so a shared
+# compiler cache serves one project's dependency artifacts to the others.
+[profile.dev.package."*"]
+opt-level = 2

@@ -136,9 +136,17 @@ jobs:
         with:
           toolchain: stable
 
+      # The checkout above runs `git clean -ffdx`, which removes every ignored
+      # `target/` in the workspace, so nothing built survives on the runner
+      # from one run to the next. The one build worth carrying over is
+      # tools/compare-rocksdb's, which compiles RocksDB from C++ source
+      # (15-25 minutes): it is the only workspace cached here, restored after
+      # the checkout and saved when the job ends. The engine and db_bench build
+      # in minutes and are removed by the last step instead.
       - uses: Swatinem/rust-cache@6323deb102c322ba6fcbdcafc7e3dddab59af2b6  # v2.9.2
         with:
           prefix-key: bench
+          workspaces: tools/compare-rocksdb -> target
 
       - name: Run benchmarks
         run: bash .github/scripts/run-benchmarks.sh 200000
@@ -264,8 +272,14 @@ jobs:
         # docs/BENCHMARKING.md.
         env:
           LSM_BENCH_PRESET: rocksdb-parity
+        # The restored cache carries the previous run's reports under
+        # target/criterion, and Criterion never removes a group's directory once
+        # the group is renamed or deleted. The publish step copies every
+        # directory there, so the stale ones go before the run; the compiled
+        # RocksDB beside them stays.
         run: |
           cd tools/compare-rocksdb
+          rm -rf target/criterion
           cargo bench --bench compare -- \
             --sample-size 10 --warm-up-time 0.5 --measurement-time 0.5
 
@@ -406,3 +420,15 @@ jobs:
             git push origin gh-pages
             echo "::notice::published compare-rocksdb overlays to dev/compare/report/index.html"
           fi
+
+      # The workspace of a self-hosted runner survives the job, and the next
+      # checkout only clears it when the next run starts, so the engine's and
+      # db_bench's build would sit on the host's disk in between. Removed
+      # whatever the job's outcome. tools/compare-rocksdb/target is left for
+      # the rust-cache step, which saves it when the job ends; emptying it
+      # here would save an empty cache.
+      - name: Remove this run's build output
+        if: always()
+        run: |
+          cargo clean
+          cargo clean --manifest-path tools/db_bench/Cargo.toml
