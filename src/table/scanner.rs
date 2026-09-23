@@ -239,7 +239,9 @@ impl Scanner {
     fn reconstruct_columnar(block: &Block, restart_interval: u8) -> crate::Result<DataBlock> {
         #[cfg(feature = "columnar")]
         {
-            DataBlock::from_columnar_block(&block.data, restart_interval)
+            // The scanner feeds compaction, which is maintenance and outside
+            // the read counters, so the rebuilt-value count is not charged.
+            DataBlock::from_columnar_block(&block.data, restart_interval).map(|(block, _)| block)
         }
         #[cfg(not(feature = "columnar"))]
         {

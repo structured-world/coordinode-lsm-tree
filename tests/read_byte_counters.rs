@@ -586,6 +586,91 @@ fn subcolumn_segment(n: u32) -> (TempDir, Tree) {
     (folder, tree)
 }
 
+/// A columnar tree of `n` rows whose value is split into a 1000-byte bytes
+/// sub-column and a fixed-width one, with the framed value a row read rebuilds
+/// from them. The wide cell keeps the rebuilt value far larger than a row
+/// block's own framing, so a copy of it is unmistakable in the counter.
+fn wide_subcolumn_segment(n: u32) -> (TempDir, Tree, Vec<u8>) {
+    let (folder, tree) = columnar_segment(0, 0);
+    let cell = vec![b'w'; 1_000];
+    let entries: Vec<InternalValue> = (0..n)
+        .map(|i| InternalValue::from_components(key(i), cell.as_slice(), 0, ValueType::Value))
+        .collect();
+    let mut batch = entries_to_column_batch(&entries).expect("transpose");
+    batch.columns.push(Column {
+        column_id: COL_VALUE + 1,
+        type_tag: TypeTag::Fixed(4),
+        validity: None,
+        data: (0..n)
+            .flat_map(u32::to_le_bytes)
+            .collect::<Vec<u8>>()
+            .into(),
+    });
+    let any = AnyTree::Standard(tree.clone());
+    let mut ingest = any.ingestion().expect("ingestion");
+    ingest.write_columnar_batch(&batch).expect("write batch");
+    ingest.finish().expect("finish");
+    // Every row frames the same two cells, so every rebuilt value is this long.
+    let framed = lsm_tree::table::columnar::frame_value_cells(&[
+        (TypeTag::Bytes, &cell),
+        (TypeTag::Fixed(4), &[0; 4]),
+    ])
+    .expect("frame");
+    (folder, tree, framed)
+}
+
+#[test]
+fn a_point_read_of_a_split_value_counts_the_rows_it_gathers_and_the_block() {
+    // A columnar point read copies the matching key's rows out of the columns
+    // into owned entries, then encodes those into a small row block. Two
+    // gathers, each charged at the size of what it built: charging only the
+    // block drops the first, which is as large as the value itself.
+    let n = 200;
+    let (_folder, tree, framed) = wide_subcolumn_segment(n);
+    let m = tree.metrics();
+
+    let before = m.bytes_copied();
+    for i in 0..n {
+        let got = tree.get(key(i), SeqNo::MAX).expect("get").expect("present");
+        // Rows differ in their fixed-width cell, not in their framed length.
+        assert_eq!(
+            got.len(),
+            framed.len(),
+            "the read rebuilds the framed value"
+        );
+    }
+    let rows = u64::from(n) * (key(0).len() + framed.len()) as u64;
+    let copied = m.bytes_copied() - before;
+    assert!(
+        copied >= 2 * rows,
+        "the rows were gathered ({rows} B) and then encoded into blocks at least \
+         as large, but only {copied} B were charged",
+    );
+}
+
+#[test]
+fn a_multi_get_of_a_split_value_counts_the_values_it_rebuilds_and_the_blocks() {
+    // The row path over a split-value block rebuilds every row's value from
+    // its sub-columns and then encodes the rows into a row-major block. The
+    // rebuild is a gather of its own, as large as the values; charging only
+    // the encoded block drops it.
+    let n = 200;
+    let (_folder, tree, framed) = wide_subcolumn_segment(n);
+    let m = tree.metrics();
+
+    let keys: Vec<Vec<u8>> = (0..n).map(key).collect();
+    let before = m.bytes_copied();
+    let got = tree.multi_get(&keys, SeqNo::MAX).expect("multi_get");
+    assert!(got.iter().all(Option::is_some), "every key is present");
+    let values = u64::from(n) * framed.len() as u64;
+    let copied = m.bytes_copied() - before;
+    assert!(
+        copied >= 2 * values,
+        "every value was rebuilt ({values} B) and then encoded into blocks at \
+         least as large, but only {copied} B were charged",
+    );
+}
+
 #[test]
 fn scanning_rows_of_a_single_value_column_copies_nothing() {
     // A columnar segment whose value is one plain bytes column hands every

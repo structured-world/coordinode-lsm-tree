@@ -1129,7 +1129,7 @@ impl Table {
             self.zstd_dictionary.as_deref(),
         )?;
         let restart = self.metadata.data_block_restart_interval;
-        let rebuilt = match self
+        let (rebuilt, values) = match self
             .delete_block_starts
             .as_ref()
             .and_then(|starts| starts.get(&handle.offset().0))
@@ -1144,17 +1144,26 @@ impl Table {
                 restart,
                 &self.delete_bitmap,
                 start,
-            ),
+            )?,
             // No materialized deletes (or, unreachably, an unmapped block):
             // reconstruct the whole block.
-            None => DataBlock::from_columnar_block(&block.data, restart).map(Some),
-        }?;
-        // The row-major block is re-encoded from the sub-columns: a row-value
-        // reconstruction gather, charged at the size of what it built.
+            None => {
+                let (block, values) = DataBlock::from_columnar_block(&block.data, restart)?;
+                (Some(block), values)
+            }
+        };
+        // Two gathers, each charged at the size of what it built: the values
+        // rebuilt from sub-columns (none when they are views), and the
+        // row-major block encoded from the rows.
         #[cfg(feature = "metrics")]
-        if let Some(rebuilt) = &rebuilt {
-            self.metrics.record_gather(rebuilt.inner.data.len());
+        {
+            self.metrics.record_gather(values);
+            if let Some(rebuilt) = &rebuilt {
+                self.metrics.record_gather(rebuilt.inner.data.len());
+            }
         }
+        #[cfg(not(feature = "metrics"))]
+        let _ = values;
         Ok(rebuilt)
     }
 
@@ -1603,18 +1612,23 @@ impl Table {
             .as_ref()
             .and_then(|starts| starts.get(&handle.offset().0))
             .map(|&start| (self.delete_bitmap.as_ref(), start));
-        let rebuilt = DataBlock::columnar_point_block(
+        let (rebuilt, rows) = DataBlock::columnar_point_block(
             &block.data,
             needle,
             &self.comparator,
             self.metadata.data_block_restart_interval,
             deletes,
         )?;
-        // Only the needle's rows are rebuilt, so the gather is that small block.
+        // Only the needle's rows are rebuilt, in two gathers: their keys and
+        // values copied out of the columns, then the small block encoded from
+        // them.
         #[cfg(feature = "metrics")]
         if let Some(rebuilt) = &rebuilt {
+            self.metrics.record_gather(rows);
             self.metrics.record_gather(rebuilt.inner.data.len());
         }
+        #[cfg(not(feature = "metrics"))]
+        let _ = rows;
         Ok(rebuilt)
     }
 

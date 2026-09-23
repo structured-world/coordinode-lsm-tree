@@ -1459,6 +1459,7 @@ fn from_columnar_block_masked_drops_deleted_positions() {
     dv.insert(12);
     let block = DataBlock::from_columnar_block_masked(&data.into(), 16, &dv, 10)
         .unwrap()
+        .0
         .expect("not all rows deleted");
 
     assert_eq!(block.len(), 2);
