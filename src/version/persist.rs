@@ -8,6 +8,8 @@ use crate::{
     version::{Version, edit::BootstrapEdit, edit_log},
 };
 use alloc::sync::Arc;
+#[cfg(not(feature = "std"))]
+use alloc::vec::Vec;
 
 use crate::path::Path;
 
