@@ -1511,6 +1511,7 @@ fn from_columnar_block_masked_returns_none_when_all_deleted() {
     assert!(
         DataBlock::from_columnar_block_masked(&data.into(), 16, &dv, 0)
             .unwrap()
+            .0
             .is_none()
     );
 }

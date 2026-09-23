@@ -1129,28 +1129,22 @@ impl Table {
             self.zstd_dictionary.as_deref(),
         )?;
         let restart = self.metadata.data_block_restart_interval;
-        let (rebuilt, values) = match self
+        // The segment has materialized deletes and this block has a recorded
+        // start position: drop the deleted rows during reconstruction. The
+        // start-row map is built at open from the zone map (every block), so
+        // an unmapped block is unreachable; it falls through to the whole-block
+        // reconstruction below rather than masking against the wrong positions.
+        let (rebuilt, values) = if let Some(&start) = self
             .delete_block_starts
             .as_ref()
             .and_then(|starts| starts.get(&handle.offset().0))
         {
-            // The segment has materialized deletes and this block has a recorded
-            // start position: drop the deleted rows during reconstruction. The
-            // start-row map is built at open from the zone map (every block), so
-            // an unmapped block is unreachable; it falls through to the whole-block
-            // reconstruction below rather than masking against the wrong positions.
-            Some(&start) => DataBlock::from_columnar_block_masked(
-                &block.data,
-                restart,
-                &self.delete_bitmap,
-                start,
-            )?,
+            DataBlock::from_columnar_block_masked(&block.data, restart, &self.delete_bitmap, start)?
+        } else {
             // No materialized deletes (or, unreachably, an unmapped block):
             // reconstruct the whole block.
-            None => {
-                let (block, values) = DataBlock::from_columnar_block(&block.data, restart)?;
-                (Some(block), values)
-            }
+            let (block, values) = DataBlock::from_columnar_block(&block.data, restart)?;
+            (Some(block), values)
         };
         // Two gathers, each charged at the size of what it built: the values
         // rebuilt from sub-columns (none when they are views), and the
