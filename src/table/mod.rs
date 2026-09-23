@@ -1095,7 +1095,15 @@ impl Table {
         let Ok(file) = self.fs.open(&self.path, &FsOpenOptions::new().read(true)) else {
             return err;
         };
-        match Self::block_is_zeroed_in(&*file, handle) {
+        // The probe's reads are this read path's too, so they are charged
+        // like the load that failed.
+        #[cfg(feature = "metrics")]
+        let mut on_read = |len: u64| {
+            crate::table::util::record_block_read(&self.metrics, BlockType::Data, len);
+        };
+        #[cfg(not(feature = "metrics"))]
+        let mut on_read = |_: u64| {};
+        match Self::block_is_zeroed_in(&*file, handle, &mut on_read) {
             Ok(true) => crate::Error::Excised {
                 offset: handle.offset().0,
             },
@@ -1181,7 +1189,12 @@ impl Table {
             #[cfg(zstd_any)]
             self.zstd_dictionary.as_deref(),
         )?;
-        let batch = crate::table::columnar::ColumnBatch::decode(&block.data)?;
+        let (batch, copied) =
+            crate::table::columnar::ColumnBatch::decode_counting_copies(&block.data, None)?;
+        #[cfg(feature = "metrics")]
+        self.metrics.record_gather(copied);
+        #[cfg(not(feature = "metrics"))]
+        let _ = copied;
         // A real writer never emits an empty data block (the ingest path skips
         // the write entirely), so a checksum-clean ZERO-ROW batch is malformed
         // input. Reject it here rather than return it as "live": the writer
@@ -1661,7 +1674,15 @@ impl Table {
             #[cfg(zstd_any)]
             self.zstd_dictionary.as_deref(),
         )?;
-        crate::table::columnar::ColumnBatch::decode_projected(&block.data, projection)
+        let (batch, copied) = crate::table::columnar::ColumnBatch::decode_counting_copies(
+            &block.data,
+            Some(projection),
+        )?;
+        #[cfg(feature = "metrics")]
+        self.metrics.record_gather(copied);
+        #[cfg(not(feature = "metrics"))]
+        let _ = copied;
+        Ok(batch)
     }
 
     /// Returns the (possibly compressed) file size.
@@ -4314,6 +4335,9 @@ impl Table {
     /// read; a nonzero window proves the block intact without reading the rest
     /// (a real block's header and first entry bytes are never all zero).
     ///
+    /// `on_read` is told the length of each read before it is issued, so a
+    /// read path can charge the probe to its byte counters.
+    ///
     /// # Errors
     ///
     /// Propagates the positioned read failure.
@@ -4321,10 +4345,12 @@ impl Table {
     fn block_is_zeroed_in(
         file: &dyn crate::fs::FsFile,
         block_handle: &BlockHandle,
+        on_read: &mut dyn FnMut(u64),
     ) -> crate::Result<bool> {
         const WINDOW: usize = 64;
         let size = block_handle.size() as usize;
         let window = size.min(WINDOW);
+        on_read(window as u64);
         let head = crate::file::read_exact(file, block_handle.offset().0, window)?;
         if head.iter().any(|&b| b != 0) {
             return Ok(false);
@@ -4332,6 +4358,7 @@ impl Table {
         if size <= window {
             return Ok(true);
         }
+        on_read(size as u64);
         let bytes = crate::file::read_exact(file, block_handle.offset().0, size)?;
         Ok(bytes.iter().all(|&b| b == 0))
     }
@@ -4401,7 +4428,9 @@ impl Table {
         for (i, handle) in self.block_index.iter().enumerate() {
             let handle = handle?;
             let block = BlockHandle::new(handle.offset(), handle.size());
-            if Self::block_is_zeroed_in(&*file, &block)? {
+            // A recovery walk over the file's geometry, not a read a caller
+            // asked for, so it charges nothing to the read counters.
+            if Self::block_is_zeroed_in(&*file, &block, &mut |_| {})? {
                 // A readable block BELOW a zeroed one is positive evidence of
                 // a punch that failed mid-reclaim.
                 if first_readable.is_some() {

@@ -74,8 +74,9 @@ pub struct Metrics {
     ///
     /// The named set, so a new path cannot win by not being instrumented:
     /// column-batch accumulation, batch filtering, row gathering by index,
-    /// and row-value reconstruction from sub-columns, wherever a read or a
-    /// salvage performs them (single-segment and merged columnar scans, row
+    /// row-value reconstruction from sub-columns, and what decoding a
+    /// columnar block copies out of it (validity bitmaps, and columns a narrow
+    /// projection detaches), wherever a read or a salvage performs them (single-segment and merged columnar scans, row
     /// iteration and point reads of a columnar segment). It does NOT count a
     /// block transform's output (that is `block_bytes_decoded`), a write
     /// path's serialisation, the input decoding of compaction and repair

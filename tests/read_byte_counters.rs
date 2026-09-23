@@ -273,6 +273,44 @@ fn a_block_read_rejected_as_corrupt_still_counts_its_bytes() {
 }
 
 #[test]
+fn a_block_read_rejected_as_corrupt_is_not_counted_as_a_load() {
+    // Bytes are charged when the read is issued; a *load* is a block that came
+    // back usable. Counting the rejected read as a load would inflate
+    // `block_load_io_count` and pull every cache hit rate down for a block
+    // that was never loaded.
+    let (folder, tree) = filled_tree(200, 64, CompressionType::None);
+    let tables = folder.path().join("tables");
+    let table = std::fs::read_dir(&tables)
+        .expect("tables dir")
+        .map(|e| e.expect("entry").path())
+        .find(|p| p.is_file())
+        .expect("one table file");
+    let mut bytes = std::fs::read(&table).expect("read table");
+    bytes[64] ^= 0xFF;
+    std::fs::write(&table, &bytes).expect("write table");
+
+    let m = tree.metrics();
+    let loaded = || m.data_block_load_count() - m.data_block_load_cached_count();
+    let mut failed = 0;
+    for i in 0..200 {
+        let (loads, read) = (loaded(), m.bytes_read());
+        if tree.get(key(i), SeqNo::MAX).is_err() {
+            failed += 1;
+            assert_eq!(
+                loaded(),
+                loads,
+                "key {i}: the rejected block was counted as loaded"
+            );
+            assert!(
+                m.bytes_read() > read,
+                "key {i}: the rejected read must still count its bytes"
+            );
+        }
+    }
+    assert!(failed > 0, "a corrupt data block must fail some read");
+}
+
+#[test]
 fn a_batched_multi_get_counts_the_blocks_it_prewarmed() {
     // multi_get reads a level's cold blocks in one batched request and decodes
     // them into the cache, outside the per-block load path. The later lookups
@@ -519,6 +557,35 @@ fn streaming_a_single_segment_copies_nothing() {
         m.bytes_copied(),
         before,
         "a straight range scan gathers nothing and must not move the counter",
+    );
+}
+
+#[test]
+fn a_narrow_projection_over_wide_rows_counts_the_columns_it_detaches() {
+    // A key-only projection over rows carrying a large value covers a sliver
+    // of each block, so the decoder copies the key column out rather than
+    // keep the whole block alive for it. That copy is a gather like any
+    // other: without a predicate, delete mask or range bound no later stage
+    // charges anything, so if the decode-time copy went uncounted a
+    // projection would look zero-copy exactly when it copies every byte it
+    // returns.
+    let (_folder, tree) = columnar_segment(1_000, 4_096);
+    let m = tree.metrics();
+    let before = m.bytes_copied();
+
+    let mut returned = 0;
+    for batch in tree
+        .columnar_scan(&[COL_USER_KEY], None, SeqNo::MAX, ..)
+        .expect("scan")
+    {
+        returned += batch_bytes(&batch.expect("batch"));
+    }
+    assert!(returned > 0, "the scan must return the keys");
+
+    let copied = m.bytes_copied() - before;
+    assert!(
+        copied >= returned,
+        "the projection detached {returned} B of keys from the blocks but charged {copied} B",
     );
 }
 

@@ -3650,6 +3650,8 @@ fn load_block_records_heal_hint_on_persistent_ecc_correction() -> crate::Result<
     let sink = HealHints::default();
     sink.set_enabled(true);
     let fresh_cache = Cache::with_capacity_bytes(10_000_000);
+    #[cfg(feature = "metrics")]
+    let (read_before, decoded_before) = (metrics.bytes_read(), metrics.bytes_decoded());
     let block = load_block(
         table_id,
         &table.path,
@@ -3676,11 +3678,29 @@ fn load_block_records_heal_hint_on_persistent_ecc_correction() -> crate::Result<
         vec![table_id],
         "a persistent ECC correction must queue the SST for healing",
     );
+    // The confirming re-read is a second request for the whole block and a
+    // second transform over it, so both counters carry two of each.
+    #[cfg(feature = "metrics")]
+    {
+        let size = u64::from(handle.size());
+        assert_eq!(
+            metrics.bytes_read() - read_before,
+            2 * size,
+            "the corrected read and its confirming re-read were both asked of the filesystem",
+        );
+        assert_eq!(
+            metrics.bytes_decoded() - decoded_before,
+            2 * block.data.len() as u64,
+            "the confirming re-read decoded the block a second time",
+        );
+    }
 
     // A DISABLED sink (auto_heal off) corrects on read but records nothing.
     table.file_accessor.remove_for_table(&table_id);
     let off_sink = HealHints::default(); // enabled == false
     let fresh_cache = Cache::with_capacity_bytes(10_000_000);
+    #[cfg(feature = "metrics")]
+    let read_before = metrics.bytes_read();
     let block = load_block(
         table_id,
         &table.path,
@@ -3706,7 +3726,81 @@ fn load_block_records_heal_hint_on_persistent_ecc_correction() -> crate::Result<
         off_sink.snapshot().is_empty(),
         "auto_heal off must not schedule a rewrite",
     );
+    #[cfg(feature = "metrics")]
+    assert_eq!(
+        metrics.bytes_read() - read_before,
+        u64::from(handle.size()),
+        "with auto-heal off there is no confirming re-read to count",
+    );
 
+    Ok(())
+}
+
+/// A data block that fails to load is probed for a hole-punched (all-zero)
+/// extent, which reads the block's first 64 bytes and, when they are zero, the
+/// whole extent again. Those probe reads are asked of the filesystem like any
+/// other, so `bytes_read` must include them, or a table with excised blocks
+/// reports a third of the I/O it did.
+#[cfg(feature = "metrics")]
+#[test]
+fn excised_probe_counts_the_bytes_it_reads() -> crate::Result<()> {
+    use crate::{
+        Cache, InternalValue,
+        fs::StdFs,
+        table::{BlockHandle, block_index::BlockIndex as _},
+    };
+
+    let dir = tempdir()?;
+    let file = dir.path().join("table");
+    let mut writer = Writer::new(file.clone(), 0, 0, Arc::new(StdFs))?;
+    for i in 0..200u32 {
+        writer.write(InternalValue::from_components(
+            format!("key{i:05}").as_bytes(),
+            b"value-payload-bytes",
+            u64::from(i) + 1,
+            crate::ValueType::Value,
+        ))?;
+    }
+    #[expect(
+        clippy::unwrap_used,
+        reason = "finish() returns Some after writing items"
+    )]
+    let (_, checksum) = writer.finish()?.unwrap();
+
+    let metrics = Arc::new(crate::metrics::Metrics::default());
+    let table = {
+        let mut params = test_recover_params(file.clone(), checksum);
+        params.cache = Arc::new(Cache::with_capacity_bytes(10_000_000));
+        params.metrics = metrics.clone();
+        Table::recover(params)?
+    };
+    #[expect(clippy::unwrap_used, reason = "table has at least one data block")]
+    let keyed = table.block_index.iter().next().unwrap()?;
+    let handle = BlockHandle::new(keyed.offset(), keyed.size());
+
+    // Zero the block's extent, the shape a hole punch leaves.
+    let mut bytes = std::fs::read(&file)?;
+    #[allow(
+        clippy::cast_possible_truncation,
+        reason = "in-file block offset fits usize; only narrows on 32-bit targets"
+    )]
+    let (start, len) = (handle.offset().0 as usize, handle.size() as usize);
+    bytes[start..start + len].fill(0);
+    std::fs::write(&file, &bytes)?;
+    table.file_accessor.remove_for_table(&table.global_id());
+
+    let before = metrics.bytes_read();
+    let err = table.load_data_block(&handle).err();
+    assert!(
+        matches!(err, Some(crate::Error::Excised { .. })),
+        "a zeroed extent must read as excised, got {err:?}",
+    );
+    let size = u64::from(handle.size());
+    assert_eq!(
+        metrics.bytes_read() - before,
+        size + size.min(64) + size,
+        "the load, the 64-byte probe and the full-extent probe were all asked of the filesystem",
+    );
     Ok(())
 }
 

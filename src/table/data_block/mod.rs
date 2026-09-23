@@ -472,13 +472,16 @@ impl DataBlock {
     /// these directly (no serialize + re-parse round-trip); [`Self::from_columnar_block`]
     /// re-encodes on top of this for the byte-based point-read path.
     ///
-    /// Also returns the bytes of the values that had to be rebuilt from
-    /// sub-columns: zero when every value is a view into the column buffer.
+    /// Also returns the bytes gathered on the way: what the decode copied out
+    /// of the block (validity bitmaps, detached columns) plus the values that
+    /// had to be rebuilt from sub-columns, the latter zero when every value is
+    /// a view into the column buffer.
     #[cfg(feature = "columnar")]
     pub(crate) fn columnar_block_entries(
         block_data: &crate::Slice,
     ) -> crate::Result<(Vec<InternalValue>, usize)> {
-        let batch = crate::table::columnar::ColumnBatch::decode(block_data)?;
+        let (batch, decode_copied) =
+            crate::table::columnar::ColumnBatch::decode_counting_copies(block_data, None)?;
         let views = batch
             .columns
             .get(3..)
@@ -498,7 +501,7 @@ impl DataBlock {
         } else {
             entries.iter().map(|e| e.value.len()).sum()
         };
-        Ok((entries, rebuilt))
+        Ok((entries, decode_copied + rebuilt))
     }
 
     /// As [`Self::columnar_block_entries`], but drops rows whose global position
@@ -557,8 +560,9 @@ impl DataBlock {
     /// normal seqno-aware [`Self::point_read`] on the result. Avoids untransposing
     /// and re-encoding the whole block per lookup.
     ///
-    /// Also returns the bytes of the matching rows' keys and values, which are
-    /// copied out of the columns before the encode copies them again.
+    /// Also returns the bytes gathered: what the decode copied out of the block,
+    /// plus the matching rows' keys and values, which are copied out of the
+    /// columns before the encode copies them again.
     #[cfg(feature = "columnar")]
     pub(crate) fn columnar_point_block(
         block_data: &crate::Slice,
@@ -567,17 +571,19 @@ impl DataBlock {
         restart_interval: u8,
         deletes: Option<(&crate::table::delete_bitmap::DeleteBitmap, u32)>,
     ) -> crate::Result<(Option<Self>, usize)> {
-        let batch = crate::table::columnar::ColumnBatch::decode(block_data)?;
+        let (batch, decode_copied) =
+            crate::table::columnar::ColumnBatch::decode_counting_copies(block_data, None)?;
         let entries = crate::table::columnar::column_batch_match_entries(
             &batch, needle, comparator, deletes,
         )?;
         if entries.is_empty() {
-            return Ok((None, 0));
+            return Ok((None, decode_copied));
         }
-        let gathered = entries
-            .iter()
-            .map(|e| e.key.user_key.len() + e.value.len())
-            .sum();
+        let gathered = decode_copied
+            + entries
+                .iter()
+                .map(|e| e.key.user_key.len() + e.value.len())
+                .sum::<usize>();
         Ok((
             Some(Self::encode_entries_to_block(&entries, restart_interval)?),
             gathered,

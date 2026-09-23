@@ -176,6 +176,9 @@ pub fn load_block(
         )));
     }
 
+    #[cfg(feature = "metrics")]
+    record_block_loaded(metrics, block_type);
+
     // What the transform produced, counted once per block that actually ran
     // one. Paired with the per-role `*_io_requested` below: those record what
     // was asked of the filesystem, this records what came out the other side
@@ -213,30 +216,19 @@ pub fn load_block(
     Ok(block)
 }
 
-/// Charges one uncached block read to its role's counters: `on_disk` bytes
-/// asked of the filesystem. Every path that reads a block without going
-/// through the block cache calls this at the point the read is issued, so a
-/// read that then fails validation is still counted.
+/// Charges one uncached block read to its role's requested-bytes counter:
+/// `on_disk` bytes asked of the filesystem. Every path that reads a block
+/// without going through the block cache calls this at the point the read is
+/// issued, so a read that then fails validation is still counted. Whether the
+/// block then loaded is a separate count, [`record_block_loaded`].
 #[cfg(feature = "metrics")]
 pub(crate) fn record_block_read(metrics: &Metrics, block_type: BlockType, on_disk: u64) {
     use core::sync::atomic::Ordering::Relaxed;
-    let (loads, requested) = match block_type {
-        BlockType::Filter => (
-            &metrics.filter_block_load_io,
-            &metrics.filter_block_io_requested,
-        ),
-        BlockType::Index => (
-            &metrics.index_block_load_io,
-            &metrics.index_block_io_requested,
-        ),
-        BlockType::RangeTombstone => (
-            &metrics.range_tombstone_block_load_io,
-            &metrics.range_tombstone_block_io_requested,
-        ),
-        BlockType::Data | BlockType::Meta | BlockType::Columnar => (
-            &metrics.data_block_load_io,
-            &metrics.data_block_io_requested,
-        ),
+    let requested = match block_type {
+        BlockType::Filter => &metrics.filter_block_io_requested,
+        BlockType::Index => &metrics.index_block_io_requested,
+        BlockType::RangeTombstone => &metrics.range_tombstone_block_io_requested,
+        BlockType::Data | BlockType::Meta | BlockType::Columnar => &metrics.data_block_io_requested,
         // Manifest variants never reach a table read path; the remaining
         // sections are loaded once on open via `Block::from_file`, outside
         // these per-read counters.
@@ -248,8 +240,30 @@ pub(crate) fn record_block_read(metrics: &Metrics, block_type: BlockType, on_dis
         | BlockType::ZoneMap
         | BlockType::DeleteBitmap => return,
     };
-    loads.fetch_add(1, Relaxed);
     requested.fetch_add(on_disk, Relaxed);
+}
+
+/// Counts one block that came back from disk usable, after its checksum,
+/// transform and type checks passed. A read that failed any of them asked the
+/// filesystem for bytes ([`record_block_read`]) but loaded nothing, so it must
+/// not lower the cache hit rates the load counters feed.
+#[cfg(feature = "metrics")]
+fn record_block_loaded(metrics: &Metrics, block_type: BlockType) {
+    use core::sync::atomic::Ordering::Relaxed;
+    let loads = match block_type {
+        BlockType::Filter => &metrics.filter_block_load_io,
+        BlockType::Index => &metrics.index_block_load_io,
+        BlockType::RangeTombstone => &metrics.range_tombstone_block_load_io,
+        BlockType::Data | BlockType::Meta | BlockType::Columnar => &metrics.data_block_load_io,
+        BlockType::Manifest
+        | BlockType::ManifestFooter
+        | BlockType::BlockLayout
+        | BlockType::Locator
+        | BlockType::SeqnoBounds
+        | BlockType::ZoneMap
+        | BlockType::DeleteBitmap => return,
+    };
+    loads.fetch_add(1, Relaxed);
 }
 
 /// Decodes pre-read block bytes into the cache: the decode half of a batched
@@ -375,6 +389,10 @@ pub(crate) fn maybe_record_persistent_heal(
     if !hints.is_enabled() {
         return false;
     }
+    // The confirming re-read is a second request for the whole block, charged
+    // as issued like the first.
+    #[cfg(feature = "metrics")]
+    record_block_read(metrics, block_type, handle.size().into());
     match reread_block_is_corrected(
         table_id,
         path,
@@ -387,7 +405,20 @@ pub(crate) fn maybe_record_persistent_heal(
         #[cfg(zstd_any)]
         zstd_dict,
     ) {
-        Ok(true) => {
+        Ok((corrected, decoded)) => {
+            #[cfg(feature = "metrics")]
+            metrics
+                .block_bytes_decoded
+                .fetch_add(decoded, core::sync::atomic::Ordering::Relaxed);
+            #[cfg(not(feature = "metrics"))]
+            let _ = decoded;
+            if !corrected {
+                log::debug!(
+                    "Transient ECC correction on table {table_id:?} block {handle:?}; \
+                     re-read clean, not scheduling"
+                );
+                return false;
+            }
             if hints.record(table_id) {
                 #[cfg(feature = "metrics")]
                 metrics
@@ -399,13 +430,6 @@ pub(crate) fn maybe_record_persistent_heal(
                 );
                 return true;
             }
-            false
-        }
-        Ok(false) => {
-            log::debug!(
-                "Transient ECC correction on table {table_id:?} block {handle:?}; \
-                 re-read clean, not scheduling"
-            );
             false
         }
         Err(e) => {
@@ -592,8 +616,9 @@ pub(crate) fn build_block_transform<'a>(
 /// **persistent** on-disk fault rather than a transient read-path glitch (bad
 /// RAM / DMA / cable during the first read): a second independent read of the
 /// same offset that again recovers from parity proves the bytes on the medium
-/// are faulty. Returns `Ok(true)` when the re-read was itself ECC-corrected,
-/// `Ok(false)` when it read clean (transient) or carried no recognized parity.
+/// are faulty. Returns whether the re-read was itself ECC-corrected (`false`
+/// when it read clean, a transient fault, or carried no recognized parity),
+/// and the length the re-read decoded to, for the caller's byte counters.
 ///
 /// Runs only on the cold corrected-read path, so the extra disk read costs
 /// nothing on clean reads.
@@ -611,7 +636,7 @@ fn reread_block_is_corrected(
     encryption: Option<&dyn EncryptionProvider>,
     ecc: Option<crate::table::block::EccParams>,
     #[cfg(zstd_any)] zstd_dict: Option<&crate::compression::ZstdDictionary>,
-) -> crate::Result<bool> {
+) -> crate::Result<(bool, u64)> {
     let (fd, _cache_event) = file_accessor.get_or_open_table(&table_id, path)?;
     let transform = build_block_transform(
         compression,
@@ -620,7 +645,7 @@ fn reread_block_is_corrected(
         #[cfg(zstd_any)]
         zstd_dict,
     )?;
-    let (_block, ecc_status) = Block::from_file_with_status(
+    let (block, ecc_status) = Block::from_file_with_status(
         fd.as_ref(),
         *handle,
         crate::table::block::BlockIdentity {
@@ -631,9 +656,9 @@ fn reread_block_is_corrected(
         },
         &transform,
     )?;
-    Ok(matches!(
-        ecc_status,
-        crate::table::block::EccStatus::Corrected
+    Ok((
+        matches!(ecc_status, crate::table::block::EccStatus::Corrected),
+        block.data.len() as u64,
     ))
 }
 
