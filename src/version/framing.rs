@@ -308,16 +308,18 @@ pub fn read_framed_record<R: Read>(
     };
 
     // A `len` past the sanity bound (64 KiB) is a forged header, except for
-    // a variable-size record whose bytes are all present: an edit written
-    // with `write_frame_of_any_len` before its manifest was published. Such a
-    // record is read and its checksum decides; one that does not fit the
-    // bytes left keeps the BadHeader verdict rather than passing for a torn
-    // append, which no record this large can be. By this point the 4 bytes of
-    // `len` are consumed, which is acceptable because a BadHeader signal
-    // tells the caller to surrender per-record granularity for the rest of
-    // the section.
+    // a variable-size record whose bytes are all present within a known
+    // bound: an edit written with `write_frame_of_any_len` before its
+    // manifest was published. Such a record is read and its checksum decides.
+    // Without a known bound (`u64::MAX`) the length alone would size the
+    // allocation, and a record that does not fit the bytes left keeps the
+    // BadHeader verdict rather than passing for a torn append, which no
+    // record this large can be. By this point the 4 bytes of `len` are
+    // consumed, which is acceptable because a BadHeader signal tells the
+    // caller to surrender per-record granularity for the rest of the section.
     if len > MAX_FRAME_PAYLOAD
         && (expected_payload_len.is_some()
+            || remaining_in_section == u64::MAX
             || u64::from(len) + FRAME_HEADER_LEN as u64 > remaining_in_section)
     {
         return Ok(FramedRecordOutcome::BadHeader);
