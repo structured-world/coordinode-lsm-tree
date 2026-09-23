@@ -1,5 +1,5 @@
 window.BENCHMARK_DATA = {
-  "lastUpdate": 1790172700202,
+  "lastUpdate": 1790177809307,
   "repoUrl": "https://github.com/structured-world/coordinode-lsm-tree",
   "entries": {
     "lsm-tree db_bench": [
@@ -24114,6 +24114,90 @@ window.BENCHMARK_DATA = {
             "value": 332576.08585480927,
             "unit": "ops/sec",
             "extra": "P50: 2.2us | P99: 13.8us | P99.9: 91.3us\nthreads: 1 | elapsed: 0.60s | num: 200000 | iterations: 3"
+          }
+        ]
+      },
+      {
+        "commit": {
+          "author": {
+            "email": "mail@polaz.com",
+            "name": "Dmitry Prudnikov",
+            "username": "polaz"
+          },
+          "committer": {
+            "email": "noreply@github.com",
+            "name": "GitHub",
+            "username": "web-flow"
+          },
+          "distinct": true,
+          "id": "1ed75e154fe257134cd580e05322a57a7db8ea61",
+          "message": "build: cacheable dev profiles and a self-cleaning bench runner (#700)\n\n## Summary\n\nDev builds that are smaller and cacheable, a bench runner that does not\naccumulate builds, and repository automation that covers the maintained\n`<major>.x.x` release lines.\n\n- **Dev profiles** in the crate root and in `tools/db_bench` (a separate\nworkspace that does not inherit the root's): `dev` and `build-override`\nkeep only line tables, so backtraces still name file and line while the\ntarget directory and link time shrink; a `debugger` profile inherits\n`dev` with full debug info.\n- **Dependencies at `opt-level = 2`** in dev, the crate itself at 0.\nMeasured on a cold build, then a rebuild with dependencies already built\n(compile + full test suite): at 0 it is 99 s + 95 s cold and 31 s + 95 s\nwarm; at 2 it is 223 s + 56 s cold and 43 s + 56 s warm. Builds with\ndependencies restored from a cache are the common case, and there 2 is\nahead.\n- **`tools/db_bench`** builds the engine it takes by path\nnon-incrementally, so a compiler cache can serve it.\n- **Bench job**: the checkout's `git clean -ffdx` wipes every target\ndirectory at the start of each run, so rust-cache now carries\n`tools/compare-rocksdb`'s build across runs (RocksDB compiled from C++\nsource, a 15-25 minute rebuild), and a last step, run whatever the\noutcome, removes the engine's and db_bench's build so it does not sit on\nthe self-hosted runner's disk between runs.\n- **Maintained lines**: CodeRabbit reviews PRs based on `<major>.x.x`\nbranches as well as main, and the nightly branch sweep knows those\nlines' release PR prefix (`release-5.x.x-`) and keeps the newest branch\nof each prefix.\n\n## Testing\n\nFormatting, clippy (library and db_bench, all features), the full test\nsuite, doc tests and the no-std check pass on macOS; `--profile\ndebugger` builds in both workspaces; the workflows pass actionlint.\n\nCloses #699",
+          "timestamp": "2026-09-23T18:31:40+03:00",
+          "tree_id": "1ba7ef140f5d5f1cfe3243da1853b82e419cdf99",
+          "url": "https://github.com/structured-world/coordinode-lsm-tree/commit/1ed75e154fe257134cd580e05322a57a7db8ea61"
+        },
+        "date": 1790177806050,
+        "tool": "customBiggerIsBetter",
+        "benches": [
+          {
+            "name": "mixed",
+            "value": 17066.526543796237,
+            "unit": "ops/sec",
+            "extra": "P50: 0.5us | P99: 12.6us | P99.9: 33.0us\nthreads: 1 | elapsed: 31.36s | num: 200000 | iterations: 3"
+          },
+          {
+            "name": "fillseq",
+            "value": 2346423.6672774055,
+            "unit": "ops/sec",
+            "extra": "P50: 0.2us | P99: 4.5us | P99.9: 7.0us\nthreads: 1 | elapsed: 0.09s | num: 200000 | iterations: 3"
+          },
+          {
+            "name": "fillrandom",
+            "value": 454003.40028116654,
+            "unit": "ops/sec",
+            "extra": "P50: 1.8us | P99: 7.8us | P99.9: 22.4us\nthreads: 1 | elapsed: 0.44s | num: 200000 | iterations: 3"
+          },
+          {
+            "name": "readrandom",
+            "value": 331000.88758384506,
+            "unit": "ops/sec",
+            "extra": "P50: 2.6us | P99: 12.7us | P99.9: 62.5us\nthreads: 1 | elapsed: 0.60s | num: 200000 | iterations: 3"
+          },
+          {
+            "name": "readseq",
+            "value": 2012412.6416703283,
+            "unit": "ops/sec",
+            "extra": "P50: 0.2us | P99: 7.0us | P99.9: 12.3us\nthreads: 1 | elapsed: 0.10s | num: 200000 | iterations: 3"
+          },
+          {
+            "name": "seekrandom",
+            "value": 169669.56976843078,
+            "unit": "ops/sec",
+            "extra": "P50: 5.1us | P99: 14.3us | P99.9: 25.0us\nthreads: 1 | elapsed: 1.18s | num: 200000 | iterations: 3"
+          },
+          {
+            "name": "prefixscan",
+            "value": 119164.6365218122,
+            "unit": "ops/sec",
+            "extra": "P50: 7.0us | P99: 31.2us | P99.9: 47.3us\nthreads: 1 | elapsed: 1.68s | num: 200000 | iterations: 3"
+          },
+          {
+            "name": "overwrite",
+            "value": 279469.0233879521,
+            "unit": "ops/sec",
+            "extra": "P50: 2.9us | P99: 11.4us | P99.9: 23.0us\nthreads: 1 | elapsed: 0.72s | num: 200000 | iterations: 3"
+          },
+          {
+            "name": "mergerandom",
+            "value": 647497.683366601,
+            "unit": "ops/sec",
+            "extra": "P50: 0.4us | P99: 4.9us | P99.9: 14.2us\nthreads: 1 | elapsed: 0.31s | num: 200000 | iterations: 3"
+          },
+          {
+            "name": "readwhilewriting",
+            "value": 226817.3453152968,
+            "unit": "ops/sec",
+            "extra": "P50: 3.6us | P99: 16.5us | P99.9: 111.1us\nthreads: 1 | elapsed: 0.88s | num: 200000 | iterations: 3"
           }
         ]
       }
