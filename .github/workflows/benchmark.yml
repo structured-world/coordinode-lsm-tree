@@ -272,8 +272,14 @@ jobs:
         # docs/BENCHMARKING.md.
         env:
           LSM_BENCH_PRESET: rocksdb-parity
+        # The restored cache carries the previous run's reports under
+        # target/criterion, and Criterion never removes a group's directory once
+        # the group is renamed or deleted. The publish step copies every
+        # directory there, so the stale ones go before the run; the compiled
+        # RocksDB beside them stays.
         run: |
           cd tools/compare-rocksdb
+          rm -rf target/criterion
           cargo bench --bench compare -- \
             --sample-size 10 --warm-up-time 0.5 --measurement-time 0.5
 
