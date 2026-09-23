@@ -22,7 +22,10 @@
 
 use crate::config::BenchConfig;
 use lsm_tree::runtime_config::RuntimeConfig;
-use lsm_tree::{AbstractTree, AnyTree};
+use lsm_tree::table::columnar::{
+    COL_VALUE, Column, TypeTag, entries_to_column_batch, frame_value_cells,
+};
+use lsm_tree::{AbstractTree, AnyTree, InternalValue, ValueType};
 use std::sync::atomic::{AtomicU64, Ordering};
 use tempfile::TempDir;
 
@@ -127,7 +130,89 @@ pub type FixtureFn = fn(&BenchConfig, &AtomicU64) -> lsm_tree::Result<Fixture>;
 pub struct Fixture {
     pub tree: AnyTree,
     pub oracle: Oracle,
+    pub shape: Shape,
     _dir: TempDir,
+}
+
+/// How a fixture stores its values, which decides what a row read returns.
+#[derive(Clone, Copy, PartialEq, Eq, Debug)]
+pub enum Shape {
+    /// One opaque value per key: a row read returns [`Value::bytes`].
+    Opaque,
+    /// The value in [`COL_ROW`], with its two filter fields split out into
+    /// [`COL_GROUP`] and [`COL_BUCKET`] so a columnar scan can filter on them.
+    /// A row read returns the three cells framed together.
+    Split,
+}
+
+/// The sub-column holding a split value's whole row.
+pub const COL_ROW: u16 = COL_VALUE;
+/// The sub-column holding the sparse field, as its 8 big-endian header bytes:
+/// big-endian so the bytewise order a predicate compares in is numeric order.
+pub const COL_GROUP: u16 = COL_VALUE + 1;
+/// The sub-column holding the near-full field, encoded like [`COL_GROUP`].
+pub const COL_BUCKET: u16 = COL_VALUE + 2;
+
+impl Fixture {
+    /// What a row read of a key holding `value` returns.
+    pub fn read_bytes(&self, value: Value) -> lsm_tree::Result<Vec<u8>> {
+        let row = value.bytes();
+        match self.shape {
+            Shape::Opaque => Ok(row),
+            Shape::Split => {
+                let (group, bucket) = header_fields(&row);
+                frame_value_cells(&[
+                    (TypeTag::Bytes, &row),
+                    (TypeTag::Bytes, &group),
+                    (TypeTag::Bytes, &bucket),
+                ])
+            }
+        }
+    }
+}
+
+/// The two filter fields of a value, as the bytes their sub-columns hold.
+fn header_fields(row: &[u8]) -> ([u8; 8], [u8; 8]) {
+    let group = field_group(row).expect("every value carries a full header");
+    let bucket = field_bucket(row).expect("every value carries a full header");
+    (group.to_be_bytes(), bucket.to_be_bytes())
+}
+
+/// Builds a bytes column: a `rows + 1` little-endian `u32` offset table, then
+/// the cells back to back, which is the framing a columnar block stores.
+fn bytes_column<'a>(column_id: u16, cells: impl Iterator<Item = &'a [u8]>) -> Column {
+    let cells: Vec<&[u8]> = cells.collect();
+    let payload: usize = cells.iter().map(|c| c.len()).sum();
+    let mut data = Vec::with_capacity((cells.len() + 1) * 4 + payload);
+    let mut end = 0_u32;
+    data.extend_from_slice(&end.to_le_bytes());
+    for cell in &cells {
+        end += u32::try_from(cell.len()).expect("a fixture cell is far below 4 GiB");
+        data.extend_from_slice(&end.to_le_bytes());
+    }
+    for cell in &cells {
+        data.extend_from_slice(cell);
+    }
+    Column {
+        column_id,
+        type_tag: TypeTag::Bytes,
+        validity: None,
+        data: data.into(),
+    }
+}
+
+/// Reads row `row` of a bytes column built with the framing [`bytes_column`]
+/// writes, or `None` if the column is shorter than its offsets claim.
+pub fn bytes_cell(column: &Column, rows: u32, row: u32) -> Option<&[u8]> {
+    let offset = |i: u32| -> Option<usize> {
+        let at = usize::try_from(i).ok()? * 4;
+        let raw: [u8; 4] = column.data.get(at..at + 4)?.try_into().ok()?;
+        usize::try_from(u32::from_le_bytes(raw)).ok()
+    };
+    let table = (usize::try_from(rows).ok()? + 1) * 4;
+    column
+        .data
+        .get(table + offset(row)?..table + offset(row + 1)?)
 }
 
 fn key(i: u64) -> Vec<u8> {
@@ -141,11 +226,15 @@ fn key(i: u64) -> Vec<u8> {
 struct Opening {
     columnar: bool,
     kv_separation: bool,
+    /// Per-block column min / max, which lets a predicate skip a block
+    /// without loading it.
+    zone_map: bool,
 }
 
 fn open(dir: &TempDir, config: &BenchConfig, opening: Opening) -> lsm_tree::Result<AnyTree> {
     let mut rc = RuntimeConfig::default();
     rc.columnar = opening.columnar;
+    rc.zone_map = opening.zone_map;
 
     let mut builder = crate::config::tree_builder(dir.path(), config)?.with_runtime_config(rc);
 
@@ -196,6 +285,7 @@ pub fn narrow(config: &BenchConfig, seqno: &AtomicU64) -> lsm_tree::Result<Fixtu
     Ok(Fixture {
         tree,
         oracle: Oracle { rows },
+        shape: Shape::Opaque,
         _dir: dir,
     })
 }
@@ -228,6 +318,7 @@ pub fn wide(config: &BenchConfig, seqno: &AtomicU64) -> lsm_tree::Result<Fixture
     Ok(Fixture {
         tree,
         oracle: Oracle { rows },
+        shape: Shape::Opaque,
         _dir: dir,
     })
 }
@@ -262,6 +353,7 @@ pub fn mixed_sizes(config: &BenchConfig, seqno: &AtomicU64) -> lsm_tree::Result<
     Ok(Fixture {
         tree,
         oracle: Oracle { rows },
+        shape: Shape::Opaque,
         _dir: dir,
     })
 }
@@ -283,7 +375,7 @@ pub fn columnar_base_row_updates(
         config,
         Opening {
             columnar: true,
-            kv_separation: false,
+            ..Opening::default()
         },
     )?;
     let n = config.num.min(100_000);
@@ -318,6 +410,7 @@ pub fn columnar_base_row_updates(
     Ok(Fixture {
         tree,
         oracle: Oracle { rows },
+        shape: Shape::Opaque,
         _dir: dir,
     })
 }
@@ -383,6 +476,7 @@ pub fn versions_deletes_tombstones(
     Ok(Fixture {
         tree,
         oracle: Oracle { rows },
+        shape: Shape::Opaque,
         _dir: dir,
     })
 }
@@ -393,29 +487,74 @@ pub fn versions_deletes_tombstones(
 /// derives its own set from [`bucket_of`] over the same oracle. The right
 /// point to materialize a row differs between the two, so a change that helps
 /// one can hurt the other and both have to be visible.
-pub fn selectivity(config: &BenchConfig, seqno: &AtomicU64) -> lsm_tree::Result<Fixture> {
+///
+/// Stored columnar, with the two filter fields split out of the header into
+/// sub-columns of their own ([`Shape::Split`]), because that is the only shape
+/// in which the engine evaluates a predicate itself: the scenarios hand it the
+/// predicate, and a filter the harness ran over returned rows would make both
+/// cost exactly the same engine work. Zone maps are on, so a block holding no
+/// matching row can be skipped unread.
+pub fn selectivity(config: &BenchConfig, _seqno: &AtomicU64) -> lsm_tree::Result<Fixture> {
+    /// Rows per ingested batch. The ingestion accumulates batches and cuts a
+    /// block once the pending rows reach the block size target, so a batch is
+    /// the granularity of that cut: one row per call lets the target decide
+    /// block geometry exactly as it does for a row-major flush. A large batch
+    /// would land as one block of its own size, holding a matching row for
+    /// any predicate and leaving the zone map nothing to skip.
+    const BATCH: u64 = 1;
+
     let dir = TempDir::new()?;
-    let tree = open(&dir, config, Opening::default())?;
+    let tree = open(
+        &dir,
+        config,
+        Opening {
+            columnar: true,
+            zone_map: true,
+            ..Opening::default()
+        },
+    )?;
     let n = config.num.min(100_000);
 
     let mut rows = Vec::with_capacity(n as usize);
-    for i in 0..n {
-        let value = Value {
-            seed: i,
-            len: HEADER_LEN + 224,
-        };
-        tree.insert(key(i), value.bytes(), seqno.fetch_add(1, Ordering::Relaxed));
-        rows.push(Row {
-            key: key(i),
-            expect: Some(value),
-            selected: group_of(i) == 0,
-        });
+    let mut ingestion = tree.ingestion()?;
+    for start in (0..n).step_by(BATCH as usize) {
+        let end = (start + BATCH).min(n);
+        let values: Vec<Vec<u8>> = (start..end)
+            .map(|i| value_bytes(i, HEADER_LEN + 224))
+            .collect();
+        // Transposed at local seqno 0: an ingested run is ordered by the one
+        // sequence number the ingestion assigns it, not by per-row ones.
+        let entries: Vec<InternalValue> = (start..end)
+            .zip(&values)
+            .map(|(i, v)| InternalValue::from_components(key(i), v.as_slice(), 0, ValueType::Value))
+            .collect();
+        let mut batch = entries_to_column_batch(&entries)?;
+        let fields: Vec<([u8; 8], [u8; 8])> = values.iter().map(|v| header_fields(v)).collect();
+        batch
+            .columns
+            .push(bytes_column(COL_GROUP, fields.iter().map(|(g, _)| &g[..])));
+        batch
+            .columns
+            .push(bytes_column(COL_BUCKET, fields.iter().map(|(_, b)| &b[..])));
+        ingestion.write_columnar_batch(&batch)?;
+
+        for i in start..end {
+            rows.push(Row {
+                key: key(i),
+                expect: Some(Value {
+                    seed: i,
+                    len: HEADER_LEN + 224,
+                }),
+                selected: group_of(i) == 0,
+            });
+        }
     }
-    tree.flush_active_memtable(0)?;
+    ingestion.finish()?;
 
     Ok(Fixture {
         tree,
         oracle: Oracle { rows },
+        shape: Shape::Split,
         _dir: dir,
     })
 }
@@ -431,8 +570,8 @@ pub fn blobs_well_placed(config: &BenchConfig, seqno: &AtomicU64) -> lsm_tree::R
         &dir,
         config,
         Opening {
-            columnar: false,
             kv_separation: true,
+            ..Opening::default()
         },
     )?;
     let n = config.num.min(10_000);
@@ -455,6 +594,7 @@ pub fn blobs_well_placed(config: &BenchConfig, seqno: &AtomicU64) -> lsm_tree::R
     Ok(Fixture {
         tree,
         oracle: Oracle { rows },
+        shape: Shape::Opaque,
         _dir: dir,
     })
 }
@@ -480,8 +620,8 @@ pub fn blobs_scattered(config: &BenchConfig, seqno: &AtomicU64) -> lsm_tree::Res
         &dir,
         config,
         Opening {
-            columnar: false,
             kv_separation: true,
+            ..Opening::default()
         },
     )?;
     let n = config.num.min(10_000);
@@ -529,6 +669,7 @@ pub fn blobs_scattered(config: &BenchConfig, seqno: &AtomicU64) -> lsm_tree::Res
     Ok(Fixture {
         tree,
         oracle: Oracle { rows },
+        shape: Shape::Opaque,
         _dir: dir,
     })
 }

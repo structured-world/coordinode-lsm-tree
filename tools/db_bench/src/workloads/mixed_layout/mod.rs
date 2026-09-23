@@ -48,7 +48,9 @@ mod tests;
 use crate::config::BenchConfig;
 use crate::reporter::{Direction, Reporter};
 use crate::workloads::Workload;
-use fixtures::{Fixture, FixtureFn, field_bucket, field_group};
+use fixtures::{Fixture, FixtureFn};
+use lsm_tree::table::columnar::COL_USER_KEY;
+use lsm_tree::table::columnar_predicate::ColumnRangePredicate;
 use lsm_tree::{AbstractTree, AnyTree, Guard, SeqNo};
 use std::sync::atomic::AtomicU64;
 use std::time::Instant;
@@ -206,7 +208,7 @@ fn verify_point_reads(fixture: &Fixture) -> lsm_tree::Result<u64> {
             (Some(expected), Some(actual)) => {
                 assert_eq!(
                     &*actual,
-                    expected.bytes().as_slice(),
+                    fixture.read_bytes(*expected)?.as_slice(),
                     "value disagrees with the write history for key {:?}",
                     String::from_utf8_lossy(&row.key),
                 );
@@ -232,82 +234,157 @@ fn verify_point_reads(fixture: &Fixture) -> lsm_tree::Result<u64> {
     Ok(rows)
 }
 
-/// Scans the whole key space, keeps the rows a predicate over the VALUE
-/// selects, and checks every emitted row against the oracle.
-///
-/// The scan walks the visible rows of the write history in lockstep, so a
-/// missing, duplicated, reordered or wrong row fails at the first place it
-/// diverges; a count alone would let one omission and one wrong row cancel
-/// out. The predicate reads the field back out of what the scan returned, so a
-/// path that returned the wrong row's header cannot pass by agreeing with a
-/// predicate evaluated over the key.
-fn verify_selective_scan(
-    fixture: &Fixture,
-    predicate: fn(&[u8]) -> bool,
-    expected: u64,
-) -> lsm_tree::Result<u64> {
-    let mut visible = fixture
-        .oracle
-        .rows
-        .iter()
-        .filter_map(|r| r.expect.map(|v| (&r.key, v)));
-    let mut rows = 0_u64;
-    for guard in fixture.tree.iter(SeqNo::MAX, None) {
-        let (key, value) = guard.into_inner()?;
-        let Some((want_key, want)) = visible.next() else {
+/// Checks a scan's rows against the rows of the write history it should
+/// return, one at a time and in order, so a missing, duplicated, reordered or
+/// wrong row fails at the first place it diverges; a count alone would let one
+/// omission and one wrong row cancel out.
+struct Lockstep<'a, I: Iterator<Item = (&'a [u8], fixtures::Value)>> {
+    expected: I,
+    rows: u64,
+}
+
+impl<'a, I: Iterator<Item = (&'a [u8], fixtures::Value)>> Lockstep<'a, I> {
+    /// Checks the next emitted row, whose value must equal `expect`'s
+    /// rendering of the version the write history holds.
+    fn check(
+        &mut self,
+        key: &[u8],
+        value: &[u8],
+        expect: impl FnOnce(fixtures::Value) -> lsm_tree::Result<Vec<u8>>,
+    ) -> lsm_tree::Result<()> {
+        let Some((want_key, want)) = self.expected.next() else {
             panic!(
-                "the scan emitted {:?} after the last row the write history keeps",
-                String::from_utf8_lossy(&key),
+                "the scan emitted {:?} after the last row the write history selects",
+                String::from_utf8_lossy(key),
             );
         };
         assert_eq!(
-            &*key,
-            want_key.as_slice(),
+            key,
+            want_key,
             "the scan emitted {:?} where the write history has {:?} next",
-            String::from_utf8_lossy(&key),
+            String::from_utf8_lossy(key),
             String::from_utf8_lossy(want_key),
         );
         assert_eq!(
-            &*value,
-            want.bytes().as_slice(),
+            value,
+            expect(want)?.as_slice(),
             "value disagrees with the write history for key {:?}",
-            String::from_utf8_lossy(&key),
+            String::from_utf8_lossy(key),
         );
-        if predicate(&value) {
-            rows += 1;
+        self.rows += 1;
+        Ok(())
+    }
+
+    /// The number of rows checked, once the scan has ended with nothing the
+    /// write history selects left unreturned.
+    fn finish(mut self) -> u64 {
+        if let Some((missed, _)) = self.expected.next() {
+            panic!(
+                "the scan ended before {:?}, which the write history selects",
+                String::from_utf8_lossy(missed),
+            );
+        }
+        self.rows
+    }
+}
+
+/// The rows of the write history a scan should return, in key order: the
+/// visible ones whose version `keep` selects.
+fn lockstep(
+    fixture: &Fixture,
+    keep: impl Fn(fixtures::Value) -> bool,
+) -> Lockstep<'_, impl Iterator<Item = (&[u8], fixtures::Value)>> {
+    Lockstep {
+        expected: fixture
+            .oracle
+            .rows
+            .iter()
+            .filter_map(move |r| r.expect.filter(|&v| keep(v)).map(|v| (r.key.as_slice(), v))),
+        rows: 0,
+    }
+}
+
+/// Scans a split-value fixture with the predicate handed to the engine, and
+/// checks what comes back against the rows the write history says it selects.
+///
+/// The predicate runs inside the columnar scan, over the field's own
+/// sub-column, so the rows it rejects are the engine's to skip: a block the
+/// zone map rules out is never read, and a rejected row is never gathered.
+/// Filtering returned rows here instead would make every selectivity cost the
+/// same engine work and only change the row count the figures divide by. The
+/// expected set comes from the seeds, not from the stored field, so a scan
+/// that filtered on the wrong column or kept the wrong rows disagrees with it.
+fn verify_predicate_scan(
+    fixture: &Fixture,
+    predicate: &ColumnRangePredicate,
+    selects: fn(u64) -> bool,
+) -> lsm_tree::Result<u64> {
+    assert_eq!(
+        fixture.shape,
+        fixtures::Shape::Split,
+        "a predicate needs its field in a sub-column of its own",
+    );
+    let mut check = lockstep(fixture, |v| selects(v.seed));
+    for batch in fixture.tree.columnar_scan(
+        &[COL_USER_KEY, fixtures::COL_ROW],
+        Some(predicate),
+        SeqNo::MAX,
+        ..,
+    )? {
+        let batch = batch?;
+        let column = |id| {
+            batch
+                .columns
+                .iter()
+                .find(|c| c.column_id == id)
+                .expect("the scan returns every projected column")
+        };
+        let (keys, values) = (column(COL_USER_KEY), column(fixtures::COL_ROW));
+        for row in 0..batch.row_count {
+            let cell = |c| {
+                fixtures::bytes_cell(c, batch.row_count, row)
+                    .expect("a returned column holds every row it counts")
+            };
+            // The row sub-column holds the value whole, so the cell is
+            // compared with the value itself rather than with the framed row
+            // a row read builds around it.
+            check.check(cell(keys), cell(values), |v| Ok(v.bytes()))?;
         }
     }
-    if let Some((missed, _)) = visible.next() {
-        panic!(
-            "the scan ended before {:?}, which the write history keeps",
-            String::from_utf8_lossy(missed),
-        );
+    Ok(check.finish())
+}
+
+/// An inclusive predicate on one of the fields, whose sub-columns hold them
+/// big-endian so bytewise order is numeric order.
+fn field_range(column_id: u16, lo: u64, hi: u64) -> ColumnRangePredicate {
+    ColumnRangePredicate {
+        column_id,
+        lower: Some(lo.to_be_bytes().to_vec()),
+        upper: Some(hi.to_be_bytes().to_vec()),
     }
-    assert_eq!(
-        rows, expected,
-        "the predicate selected {rows} rows, the write history says {expected}",
-    );
-    Ok(rows)
 }
 
 /// ~1% selectivity: the case where materializing a row before the predicate
 /// runs wastes almost all of the work.
 fn scan_sparse(fixture: &Fixture) -> lsm_tree::Result<u64> {
-    let expected = fixture.oracle.selected();
-    verify_selective_scan(fixture, |v| field_group(v) == Some(0), expected)
+    let rows = verify_predicate_scan(fixture, &field_range(fixtures::COL_GROUP, 0, 0), |seed| {
+        fixtures::group_of(seed) == 0
+    })?;
+    assert_eq!(
+        rows,
+        fixture.oracle.selected(),
+        "the sparse predicate must select what the fixture marked",
+    );
+    Ok(rows)
 }
 
 /// ~90% selectivity: the case where deferring materialization buys almost
 /// nothing and its bookkeeping can cost more than it saves. The right answer
 /// differs from the sparse case, which is why both are measured.
 fn scan_near_full(fixture: &Fixture) -> lsm_tree::Result<u64> {
-    let expected = fixture
-        .oracle
-        .rows
-        .iter()
-        .filter(|r| r.expect.is_some_and(|v| fixtures::bucket_of(v.seed) != 0))
-        .count() as u64;
-    verify_selective_scan(fixture, |v| field_bucket(v) != Some(0), expected)
+    verify_predicate_scan(fixture, &field_range(fixtures::COL_BUCKET, 1, 9), |seed| {
+        fixtures::bucket_of(seed) != 0
+    })
 }
 
 /// Every visible row, resolved in key order.
@@ -318,8 +395,12 @@ fn scan_near_full(fixture: &Fixture) -> lsm_tree::Result<u64> {
 /// move the byte counters. A point read fetches one record whatever sits
 /// next to it.
 fn scan_all(fixture: &Fixture) -> lsm_tree::Result<u64> {
-    let expected = fixture.oracle.visible();
-    verify_selective_scan(fixture, |_| true, expected)
+    let mut check = lockstep(fixture, |_| true);
+    for guard in fixture.tree.iter(SeqNo::MAX, None) {
+        let (key, value) = guard.into_inner()?;
+        check.check(&key, &value, |v| fixture.read_bytes(v))?;
+    }
+    Ok(check.finish())
 }
 
 /// A scenario: a fixture, and either the read pass that measures it or the

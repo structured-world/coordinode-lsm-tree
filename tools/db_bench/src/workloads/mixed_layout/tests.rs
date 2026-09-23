@@ -51,7 +51,7 @@ fn assert_ordinary_read_agrees(fixture: &Fixture, what: &str) {
         match (&row.expect, got) {
             (Some(expected), Some(actual)) => assert_eq!(
                 &*actual,
-                expected.bytes().as_slice(),
+                fixture.read_bytes(*expected).expect("frame").as_slice(),
                 "{what}: value for {:?} disagrees with the write history",
                 String::from_utf8_lossy(&row.key),
             ),
@@ -147,6 +147,30 @@ fn the_selectivity_fixture_separates_a_sparse_predicate_from_a_near_full_one() {
     assert!(
         near_full * 10 > total * 8,
         "the near-full predicate selected {near_full} of {total}, which is not near-full",
+    );
+}
+
+#[test]
+fn selective_scans_sparse_predicate_reads_less_than_near_full() {
+    // The predicate is the engine's to evaluate. A pass that scanned every row
+    // and filtered in the harness would read the same blocks at every
+    // selectivity, and the pair would differ only in the row count the figures
+    // divide by. The sparse field matches one row in 97, so most blocks hold
+    // none and the zone map skips them unread; the near-full one skips none.
+    let measure = |read: super::ReadFn| {
+        let fixture = build(fixtures::selectivity);
+        let readings =
+            super::Readings::measure(&fixture.tree, || read(&fixture)).expect("scan must succeed");
+        (readings.rows, readings.bytes_read)
+    };
+    let (sparse_rows, sparse_read) = measure(super::scan_sparse);
+    let (full_rows, full_read) = measure(super::scan_near_full);
+
+    assert!(sparse_rows > 0 && full_rows > sparse_rows * 10);
+    assert!(
+        sparse_read * 2 < full_read,
+        "the sparse scan read {sparse_read} B against {full_read} B for the near-full \
+         one; the predicate is not skipping anything",
     );
 }
 
