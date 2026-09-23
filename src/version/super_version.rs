@@ -421,10 +421,13 @@ impl SuperVersions {
                 &mut self.edit_scratch,
                 self.sync_mode,
             ) {
-                Ok(appended) => {
+                Ok(Some(appended)) => {
                     self.log_bytes = Some(log_size + appended);
                     return Ok(());
                 }
+                // The edit is too large for one appended record and nothing
+                // was written: rotate below, which records any version.
+                Ok(None) => {}
                 Err(e) => {
                     // A failed append may have written a partial record; the
                     // on-disk size is unknown, so drop the cache and re-measure
@@ -437,7 +440,7 @@ impl SuperVersions {
 
         // Rotation: write `next` as a fresh full snapshot and repoint CURRENT.
         let old_snapshot = self.snapshot_id;
-        persist_version(
+        let new_log_bytes = persist_version(
             tree_path,
             next,
             &self.comparator_name,
@@ -447,9 +450,9 @@ impl SuperVersions {
             self.sync_mode,
         )?;
         self.snapshot_id = next.id();
-        // The new generation starts with an empty log (created lazily on the
-        // first append).
-        self.log_bytes = Some(0);
+        // The new generation's log: empty, or the one record completing a
+        // version wider than a snapshot.
+        self.log_bytes = Some(new_log_bytes);
 
         // The durable commit point of a rotation is the CURRENT repoint inside
         // `persist_version` above — past it, the rotation has SUCCEEDED. Deleting

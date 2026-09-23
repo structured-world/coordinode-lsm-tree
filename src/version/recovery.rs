@@ -163,6 +163,21 @@ fn parse_retention_floor_section(mut bytes: &[u8]) -> crate::Result<SeqNo> {
     Ok(floor)
 }
 
+/// Parses the optional `bootstrap_edit` section: `u32 LE` payload length then
+/// `u64 LE` XXH3-64 of the payload of the record the snapshot's log must begin
+/// with. Read strictly (exactly twelve bytes), since the length it yields is
+/// what the framing reader trusts past its cap.
+fn parse_bootstrap_edit_section(mut bytes: &[u8]) -> crate::Result<super::edit::BootstrapEdit> {
+    const ERR: crate::Error = crate::Error::InvalidHeader("bootstrap_edit section");
+    let r = &mut bytes;
+    let len = r.read_u32::<LittleEndian>().map_err(|_| ERR)?;
+    let digest = r.read_u64::<LittleEndian>().map_err(|_| ERR)?;
+    if !r.is_empty() {
+        return Err(ERR);
+    }
+    Ok(super::edit::BootstrapEdit { len, digest })
+}
+
 /// Reads the registered dictionary ids: `count: u32 | id: u32 * count`.
 ///
 /// Read strictly, like the sections above: a lost id is a dictionary the tree
@@ -1382,8 +1397,19 @@ pub fn recover(
     // AbsoluteConsistency and TolerateCorruptedTailRecords (truncation-salvage
     // only). A clean end-of-log is always accepted. Each applied edit advances
     // `recovery.curr_version_id` past the snapshot's id.
+    //
+    // A snapshot of a version wider than it can count names the log's first
+    // record in its `bootstrap_edit` section; without that record the snapshot
+    // describes the wide levels empty, so the log must hold it in every mode.
+    let bootstrap = if archive.section("bootstrap_edit").is_some() {
+        Some(parse_bootstrap_edit_section(
+            &archive.read_section("bootstrap_edit")?,
+        )?)
+    } else {
+        None
+    };
     let log_path = folder.join(format!("edits-{curr_version_id}"));
-    let edits = super::edit_log::replay_log(fs, &log_path, mode)?;
+    let edits = super::edit_log::replay_log(fs, &log_path, mode, bootstrap)?;
     if !edits.is_empty() {
         log::info!(
             "Replaying {} manifest edit(s) on top of snapshot #{curr_version_id}",

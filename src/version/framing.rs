@@ -121,27 +121,48 @@ where
     // and pass the same `&mut` reference to every framed write.
     scratch.clear();
     payload_fn(scratch)?;
+    write_frame(writer, scratch)
+}
 
-    if scratch.len() > MAX_FRAME_PAYLOAD as usize {
+/// Writes an already assembled `payload` as one framed record.
+///
+/// # Errors
+///
+/// Returns the I/O error from `writer` if any write fails, or
+/// [`crate::Error::Unrecoverable`] when the payload exceeds
+/// [`MAX_FRAME_PAYLOAD`], before any byte reaches `writer`.
+pub fn write_frame<W: Write>(writer: &mut W, payload: &[u8]) -> crate::Result<()> {
+    if payload.len() > MAX_FRAME_PAYLOAD as usize {
         log::error!(
-            "write_framed_record refusing to emit oversized payload \
+            "write_frame refusing to emit oversized payload \
              ({} bytes; MAX_FRAME_PAYLOAD = {})",
-            scratch.len(),
+            payload.len(),
             MAX_FRAME_PAYLOAD,
         );
         return Err(crate::Error::Unrecoverable);
     }
+    write_frame_of_any_len(writer, payload)
+}
 
-    #[expect(
-        clippy::cast_possible_truncation,
-        reason = "the explicit MAX_FRAME_PAYLOAD guard above ensures scratch.len() fits in u32"
-    )]
-    let len = scratch.len() as u32;
-    let digest = xxhash_rust::xxh3::xxh3_64(scratch);
+/// Writes `payload` as one framed record whatever its size up to `u32::MAX`.
+///
+/// Only for the bootstrap edit of a snapshot: it is written and synced before
+/// the manifest that reads it is published, and the snapshot records its
+/// length, so [`read_framed_record`] reads it with that length pinned. No
+/// other record may exceed [`MAX_FRAME_PAYLOAD`].
+///
+/// # Errors
+///
+/// Returns the I/O error from `writer` if any write fails, or
+/// [`crate::Error::Unrecoverable`] when the payload does not fit a `u32`
+/// length.
+pub fn write_frame_of_any_len<W: Write>(writer: &mut W, payload: &[u8]) -> crate::Result<()> {
+    let len = u32::try_from(payload.len()).map_err(|_| crate::Error::Unrecoverable)?;
+    let digest = xxhash_rust::xxh3::xxh3_64(payload);
 
     writer.write_u32::<LittleEndian>(len)?;
     writer.write_u64::<LittleEndian>(digest)?;
-    writer.write_all(scratch)?;
+    writer.write_all(payload)?;
 
     Ok(())
 }
@@ -176,7 +197,8 @@ pub enum FramedRecordOutcome {
     },
 
     /// The header's `len` field is truly implausible — exceeds
-    /// [`MAX_FRAME_PAYLOAD`] (64 KiB). By the time this variant is
+    /// [`MAX_FRAME_PAYLOAD`] (64 KiB) and is not the length the caller
+    /// pinned. By the time this variant is
     /// returned the reader HAS consumed the 4-byte `len` field; the
     /// digest and payload have not been read. The cursor position
     /// is therefore unaligned with both this record and the next,
@@ -285,15 +307,14 @@ pub fn read_framed_record<R: Read>(
         Err(e) => return Err(e.into()),
     };
 
-    if len > MAX_FRAME_PAYLOAD {
-        // `len` exceeds the sanity bound (64 KiB). This is a truly
-        // implausible value — no legitimate record approaches it, so
-        // the header itself is forged. We cannot trust `len` to skip
-        // past this record; the caller is told to fall back to
-        // section-level recovery. By this point we have already
-        // consumed the 4 bytes of `len`, but that is acceptable
-        // because a BadHeader signal tells the caller to surrender
-        // per-record granularity for the rest of the section.
+    // A `len` past the sanity bound (64 KiB) is a forged header, unless the
+    // caller pinned exactly that length: the bootstrap edit written with
+    // `write_frame_of_any_len`, whose length the snapshot records. A length
+    // read from the damaged bytes themselves never sizes an allocation past
+    // the cap. By this point the 4 bytes of `len` are consumed, which is
+    // acceptable because a BadHeader signal tells the caller to surrender
+    // per-record granularity for the rest of the section.
+    if len > MAX_FRAME_PAYLOAD && expected_payload_len != Some(len) {
         return Ok(FramedRecordOutcome::BadHeader);
     }
 

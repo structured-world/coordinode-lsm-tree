@@ -27,8 +27,13 @@ fn append_then_replay_roundtrips_all_edits() {
     for e in &edits {
         append_edit(&StdFs, &path, e, &mut scratch, SyncMode::Normal).expect("append");
     }
-    let replayed =
-        replay_log(&StdFs, &path, ManifestRecoveryMode::AbsoluteConsistency).expect("replay");
+    let replayed = replay_log(
+        &StdFs,
+        &path,
+        ManifestRecoveryMode::AbsoluteConsistency,
+        None,
+    )
+    .expect("replay");
     assert_eq!(replayed, edits, "append+replay must round-trip in order");
 }
 
@@ -37,11 +42,41 @@ fn replay_absent_log_is_empty() {
     let dir = tempfile::tempdir().expect("tempdir");
     let path = dir.path().join("edits-missing");
     assert!(
-        replay_log(&StdFs, &path, ManifestRecoveryMode::AbsoluteConsistency)
-            .expect("replay")
-            .is_empty()
+        replay_log(
+            &StdFs,
+            &path,
+            ManifestRecoveryMode::AbsoluteConsistency,
+            None
+        )
+        .expect("replay")
+        .is_empty()
     );
     assert_eq!(log_size(&StdFs, &path).expect("size"), 0);
+}
+
+/// A snapshot that names a bootstrap record makes its log mandatory: an absent
+/// log is not an empty one.
+#[test]
+fn an_absent_log_is_refused_when_the_snapshot_names_a_bootstrap_record() {
+    let dir = tempfile::tempdir().expect("tempdir");
+    let path = dir.path().join("edits-missing");
+    let bootstrap = BootstrapEdit { len: 1, digest: 0 };
+    let err = replay_log(
+        &StdFs,
+        &path,
+        ManifestRecoveryMode::SkipAnyCorruptedRecords,
+        Some(bootstrap),
+    )
+    .expect_err("the bootstrap record is required");
+    assert!(
+        matches!(
+            err,
+            crate::Error::TornManifestEditLog {
+                kind: "bootstrap-edit"
+            }
+        ),
+        "expected TornManifestEditLog(bootstrap-edit), got {err:?}",
+    );
 }
 
 /// Appends `count` clean edits, then truncates the file to `clean + 5`
@@ -81,6 +116,7 @@ fn torn_tail_record_is_dropped_on_replay() {
         &StdFs,
         &path,
         ManifestRecoveryMode::TolerateCorruptedTailRecords,
+        None,
     )
     .expect("replay");
     assert_eq!(
@@ -97,8 +133,13 @@ fn torn_tail_record_aborts_under_strict() {
     // truncate the tail (Tree::repair) before the tree opens.
     let dir = tempfile::tempdir().expect("tempdir");
     let path = log_with_torn_tail(dir.path(), 2);
-    let err = replay_log(&StdFs, &path, ManifestRecoveryMode::AbsoluteConsistency)
-        .expect_err("strict must reject torn tail");
+    let err = replay_log(
+        &StdFs,
+        &path,
+        ManifestRecoveryMode::AbsoluteConsistency,
+        None,
+    )
+    .expect_err("strict must reject torn tail");
     assert!(
         matches!(err, crate::Error::TornManifestEditLog { kind: "truncated" }),
         "expected TornManifestEditLog(truncated), got {err:?}",
@@ -118,8 +159,13 @@ fn clean_log_replays_under_strict() {
     for e in &edits {
         append_edit(&StdFs, &path, e, &mut scratch, SyncMode::Normal).expect("append");
     }
-    let replayed = replay_log(&StdFs, &path, ManifestRecoveryMode::AbsoluteConsistency)
-        .expect("strict must accept a clean log");
+    let replayed = replay_log(
+        &StdFs,
+        &path,
+        ManifestRecoveryMode::AbsoluteConsistency,
+        None,
+    )
+    .expect("strict must accept a clean log");
     assert_eq!(replayed, edits, "clean log replays fully under strict");
 }
 
@@ -146,7 +192,7 @@ fn checksum_mismatch_tail_aborts_under_strict_and_tolerate_tail() {
         ManifestRecoveryMode::AbsoluteConsistency,
         ManifestRecoveryMode::TolerateCorruptedTailRecords,
     ] {
-        let err = replay_log(&StdFs, &path, mode).expect_err("must reject committed bit-rot");
+        let err = replay_log(&StdFs, &path, mode, None).expect_err("must reject committed bit-rot");
         assert!(
             matches!(
                 err,
@@ -158,8 +204,13 @@ fn checksum_mismatch_tail_aborts_under_strict_and_tolerate_tail() {
         );
     }
 
-    let replayed = replay_log(&StdFs, &path, ManifestRecoveryMode::PointInTimeRecovery)
-        .expect("PIT drops bit-rotted tail");
+    let replayed = replay_log(
+        &StdFs,
+        &path,
+        ManifestRecoveryMode::PointInTimeRecovery,
+        None,
+    )
+    .expect("PIT drops bit-rotted tail");
     assert_eq!(
         replayed,
         vec![edit(1), edit(2)],

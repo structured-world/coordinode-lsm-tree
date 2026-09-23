@@ -7,12 +7,16 @@
 name: CoordiNode CI
 
 on:
+  # Maintained release lines live on `<major>.x.x` branches and take bug-fix
+  # backports; they are gated exactly like main.
   push:
     branches:
       - main
+      - "*.x.x"
   pull_request:
     branches:
       - main
+      - "*.x.x"
   # Manual re-run from any branch. Two use cases:
   #   (a) re-trigger a flaky cross-compile target after qemu
   #       hiccup — needs `full_cross_matrix: true` because the
@@ -475,7 +479,9 @@ jobs:
 
   # Generates the cross-compile target matrix. The full 5-target
   # sweep runs in either of two cases:
-  #   - push to main (regression coverage on every merged change)
+  #   - push to main or to a maintained `*.x.x` line (regression
+  #     coverage on every merged change; the `push` trigger above
+  #     fires on no other branch)
   #   - workflow_dispatch with `full_cross_matrix: true` (manual
   #     opt-in for re-testing flaky targets or for full coverage
   #     on a draft branch)
@@ -514,7 +520,7 @@ jobs:
     steps:
       - id: set
         env:
-          IS_FULL: ${{ (github.event_name == 'push' && github.ref == 'refs/heads/main') || (github.event_name == 'workflow_dispatch' && inputs.full_cross_matrix) }}
+          IS_FULL: ${{ github.event_name == 'push' || (github.event_name == 'workflow_dispatch' && inputs.full_cross_matrix) }}
         run: |
           if [ "$IS_FULL" = "true" ]; then
             echo 'targets=["aarch64-unknown-linux-gnu","aarch64-unknown-linux-musl","i686-unknown-linux-gnu","powerpc64-unknown-linux-gnu","riscv64gc-unknown-linux-gnu"]' >> "$GITHUB_OUTPUT"
