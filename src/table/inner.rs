@@ -263,6 +263,18 @@ impl Inner {
     pub(super) fn global_id(&self) -> GlobalTableId {
         (self.tree_id, self.metadata.id).into()
     }
+
+    /// Walks the block index for work that is not a read a caller made:
+    /// scrub, heal, verification, salvage, space reclaim and the geometry of a
+    /// restricted view. A cold index is read from disk as it is walked, and
+    /// those reads stay out of the read counters, which describe reads.
+    pub(crate) fn maintenance_index_walk(&self) -> super::block_index::BlockIndexIterImpl {
+        use super::block_index::BlockIndex;
+        let walk = self.block_index.iter();
+        #[cfg(feature = "metrics")]
+        let walk = walk.uncounted();
+        walk
+    }
 }
 
 impl Drop for Inner {
@@ -396,9 +408,8 @@ impl Drop for Inner {
             if off == u64::MAX {
                 return;
             }
-            use crate::table::block_index::BlockIndex;
             let mut reclaimable: alloc::vec::Vec<(u64, u64)> = alloc::vec::Vec::new();
-            for handle in self.block_index.iter() {
+            for handle in self.maintenance_index_walk() {
                 // Log why reclaim stopped instead of silently swallowing the
                 // block-index read error (this is an integrity-sensitive path).
                 let handle = match handle {

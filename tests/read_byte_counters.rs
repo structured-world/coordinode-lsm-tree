@@ -917,6 +917,86 @@ fn a_compaction_counts_nothing_it_reads_or_opens() -> lsm_tree::Result<()> {
     Ok(())
 }
 
+/// A standard tree whose tables keep a partitioned index that is neither
+/// pinned nor cached, so every walk of it reads index blocks from disk: the
+/// shape in which a maintenance walk that forgot to detach from the tree's
+/// metrics shows up in the read counters.
+fn cold_index_tree(folder: &TempDir) -> lsm_tree::Result<Tree> {
+    use lsm_tree::config::{BlockSizePolicy, PinningPolicy};
+    let AnyTree::Standard(tree) = Config::new(
+        folder.path(),
+        SequenceNumberCounter::default(),
+        SequenceNumberCounter::default(),
+    )
+    .data_block_size_policy(BlockSizePolicy::all(512))
+    .index_block_partitioning_policy(PinningPolicy::all(true))
+    .index_block_pinning_policy(PinningPolicy::disabled())
+    .use_cache(std::sync::Arc::new(lsm_tree::Cache::with_capacity_bytes(0)))
+    .open()?
+    else {
+        panic!("expected a standard tree");
+    };
+    Ok(tree)
+}
+
+#[test]
+fn a_patrol_scrub_over_a_cold_index_counts_nothing() -> lsm_tree::Result<()> {
+    // A patrol scrub is maintenance: it walks each table's index to find the
+    // blocks it verifies. With an index that is read from disk on every walk,
+    // that walk must stay out of the read counters like the blocks it reads.
+    let folder = get_tmp_folder();
+    let tree = cold_index_tree(&folder)?;
+    for i in 0..5_000 {
+        tree.insert(key(i), vec![b'v'; 64], u64::from(i));
+    }
+    tree.flush_active_memtable(0)?;
+
+    let m = tree.metrics();
+    let (read, decoded) = (m.bytes_read(), m.bytes_decoded());
+    let report =
+        lsm_tree::scrub::patrol_scrub(&tree, &lsm_tree::scrub::PatrolScrubOptions::default());
+    assert!(
+        report.is_ok(),
+        "the scrub must find nothing wrong: {report:?}"
+    );
+    assert_eq!(m.bytes_read(), read, "the scrub's index walk was counted");
+    assert_eq!(
+        m.bytes_decoded(),
+        decoded,
+        "the scrub's index decoding was counted"
+    );
+    Ok(())
+}
+
+#[test]
+fn a_compaction_over_a_cold_index_counts_nothing() -> lsm_tree::Result<()> {
+    // The serial compaction scanner walks each input's index too; with a cold
+    // index that walk reads from disk, and it is maintenance all the same.
+    let folder = get_tmp_folder();
+    let tree = cold_index_tree(&folder)?;
+    for round in 0..2_u32 {
+        for i in 0..2_500 {
+            tree.insert(key(i), vec![b'v'; 64], u64::from(round * 2_500 + i));
+        }
+        tree.flush_active_memtable(0)?;
+    }
+
+    let m = tree.metrics();
+    let (read, decoded) = (m.bytes_read(), m.bytes_decoded());
+    tree.major_compact(u64::MAX, 5_000)?;
+    assert_eq!(
+        m.bytes_read(),
+        read,
+        "the compaction's index walk was counted"
+    );
+    assert_eq!(
+        m.bytes_decoded(),
+        decoded,
+        "the compaction's index decoding was counted"
+    );
+    Ok(())
+}
+
 #[test]
 fn a_parallel_sub_compaction_counts_nothing_it_reads() -> lsm_tree::Result<()> {
     // A compaction split across threads reads each input through a key-bounded

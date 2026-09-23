@@ -85,7 +85,7 @@ and read through `AbstractTree::metrics()`.
 
 | Counter | Counts | Does not count |
 |---|---|---|
-| `bytes_read` | Bytes requested from the `Fs` trait: a block's on-disk size summed over the block roles (data, index, filter, range tombstone), plus the on-disk span of every blob record a key-value-separated tree resolved (a coalesced prefetch charges its whole extent, gaps included, because that is what it read). Charged when the read is issued, so a read that then fails its checksum is counted, and on every path that reads outside the block cache: point and range reads, `multi_get`'s batched and chunked reads, and the partial decode of large zstd blocks. | Device I/O. The OS page cache, readahead and request coalescing sit below this line. Anything served from a cache, block or blob, asks for nothing and adds nothing. Maintenance: a compaction's input, the values its filter resolves, the index walk that opens a table, a patrol scrub's reads, including the re-read that confirms an ECC correction, and salvage. |
+| `bytes_read` | Bytes requested from the `Fs` trait: a block's on-disk size summed over the block roles (data, index, filter, range tombstone), plus the on-disk span of every blob record a key-value-separated tree resolved (a coalesced prefetch charges its whole extent, gaps included, because that is what it read). Charged when the read is issued, so a read that then fails its checksum is counted, and on every path that reads outside the block cache: point and range reads, `multi_get`'s batched and chunked reads, and the partial decode of large zstd blocks. | Device I/O. The OS page cache, readahead and request coalescing sit below this line. Anything served from a cache, block or blob, asks for nothing and adds nothing. Maintenance: a compaction's input, the values its filter resolves, the index walks that open a table, verify it or locate its live region, a patrol scrub's reads, including the re-read that confirms an ECC correction, and salvage. |
 | `blob_bytes_read` | The blob-only share of `bytes_read`, so a scan can be asked whether it paid for the blobs of rows it then discarded. | Everything the block roles cover. |
 | `bytes_decoded` | Payload bytes produced after the transform — what decompression, decryption and Page-ECC verification turned the bytes read into, for blocks and for blob records alike. | Anything on a cached path: a cached block or blob is already decoded, so no transform runs for it. |
 | `bytes_copied` | Bytes moved by a **gather**: column-batch accumulation, batch filtering, row gathering by index, row-value reconstruction from sub-columns, a point read's copy of the matching rows out of the columns, the row-major block a columnar block is re-encoded into, and what decoding a columnar block copies out of it (validity bitmaps, and columns a narrow projection detaches rather than keep the whole block alive for), on every read that performs one (single-segment and merged columnar scans, row iteration and point reads of a columnar segment). The figure is the size of the RESULT. A row read whose value is a single bytes column hands out views into the decoded column and charges nothing. | Transform output (that is `bytes_decoded`), write-path serialisation, the input decoding of compaction, repair and salvage (maintenance, not reads), and moves that transfer ownership without duplicating bytes. |
@@ -145,7 +145,10 @@ a second pass from a `counters` build. It runs on one thread, since its figures
 are bytes per row and concurrency does not change them, and each scenario fixes
 its own key format, value sizes and tree kind. `--threads` other than 1,
 `--key-size`, `--value-size` and `--use-blob-tree` are therefore refused rather
-than recorded against a run that did not use them.
+than recorded against a run that did not use them. `--num` is an upper bound:
+each fixture caps its key count at a size that keeps the sweep's build time
+bounded, and every series names in its annotation (`keys: N`) the size it was
+measured on.
 
 | Scenario | Shape |
 |---|---|

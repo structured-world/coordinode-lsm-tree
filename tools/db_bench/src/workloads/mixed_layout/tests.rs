@@ -37,6 +37,26 @@ fn config() -> BenchConfig {
     }
 }
 
+/// Every fixture, including those of the unsupported scenarios. The tests that
+/// cover all of them read this one list, so a new fixture cannot be added to
+/// one of them and silently missed by another.
+const ALL_FIXTURES: [(&str, fixtures::FixtureFn); 8] = [
+    ("narrow", fixtures::narrow),
+    ("wide", fixtures::wide),
+    ("mixed-sizes", fixtures::mixed_sizes),
+    (
+        "columnar-base-row-updates",
+        fixtures::columnar_base_row_updates,
+    ),
+    (
+        "versions-deletes-tombstones",
+        fixtures::versions_deletes_tombstones,
+    ),
+    ("selectivity", fixtures::selectivity),
+    ("blobs-well-placed", fixtures::blobs_well_placed),
+    ("blobs-scattered", fixtures::blobs_scattered),
+];
+
 fn build(f: fixtures::FixtureFn) -> Fixture {
     let seqno = AtomicU64::new(1);
     f(&config(), &seqno).expect("fixture must build")
@@ -73,24 +93,7 @@ fn every_fixture_ordinary_read_matches_oracle() {
     // Includes the fixtures of the unsupported scenarios: they are the ones
     // most at risk of rotting unnoticed, because the benchmark never builds
     // them.
-    let all: [(&str, fixtures::FixtureFn); 8] = [
-        ("narrow", fixtures::narrow),
-        ("wide", fixtures::wide),
-        ("mixed-sizes", fixtures::mixed_sizes),
-        (
-            "columnar-base-row-updates",
-            fixtures::columnar_base_row_updates,
-        ),
-        (
-            "versions-deletes-tombstones",
-            fixtures::versions_deletes_tombstones,
-        ),
-        ("selectivity", fixtures::selectivity),
-        ("blobs-well-placed", fixtures::blobs_well_placed),
-        ("blobs-scattered", fixtures::blobs_scattered),
-    ];
-
-    for (what, f) in all {
+    for (what, f) in ALL_FIXTURES {
         let fixture = build(f);
         assert!(
             !fixture.oracle.rows.is_empty(),
@@ -159,8 +162,9 @@ fn selective_scans_sparse_predicate_reads_less_than_near_full() {
     // none and the zone map skips them unread; the near-full one skips none.
     let measure = |read: super::ReadFn| {
         let fixture = build(fixtures::selectivity);
-        let readings =
-            super::Readings::measure(&fixture.tree, || read(&fixture)).expect("scan must succeed");
+        let keys = fixture.oracle.rows.len() as u64;
+        let readings = super::Readings::measure(&fixture.tree, keys, || read(&fixture))
+            .expect("scan must succeed");
         (readings.rows, readings.bytes_read)
     };
     let (sparse_rows, sparse_read) = measure(super::scan_sparse);
@@ -293,6 +297,31 @@ fn mixed_layout_more_than_one_thread_is_refused() {
 }
 
 #[test]
+fn published_series_fixture_capped_names_the_keys_it_built() {
+    // Each fixture caps its key count below what --num may ask for, so a
+    // series has to carry the size the scenario actually built; the request
+    // alone would label a smaller working set as the requested one.
+    let fixture = build(fixtures::narrow);
+    let built = fixture.oracle.rows.len();
+    let readings =
+        super::Readings::measure(&fixture.tree, built as u64, || Ok(0)).expect("measure");
+    let mut reporter = crate::reporter::Reporter::new();
+    readings.publish("narrow-records", &mut reporter);
+    assert!(
+        !reporter.published().is_empty(),
+        "the scenario published nothing"
+    );
+    for series in reporter.published() {
+        assert!(
+            series.extra.contains(&format!("keys: {built}")),
+            "{} does not name the {built} keys the fixture built: {}",
+            series.name,
+            series.extra,
+        );
+    }
+}
+
+#[test]
 fn mixed_layout_shape_flags_it_ignores_are_refused() {
     // Every scenario fixes its own key format, value lengths and tree kind, so
     // --key-size, --value-size and --use-blob-tree change nothing it measures.
@@ -343,23 +372,7 @@ fn every_fixture_num_zero_builds_an_empty_oracle() {
     // with no keys nothing is coprime with it, so it looped instead of
     // returning.
     let empty = BenchConfig { num: 0, ..config() };
-    let all: [(&str, fixtures::FixtureFn); 8] = [
-        ("narrow", fixtures::narrow),
-        ("wide", fixtures::wide),
-        ("mixed-sizes", fixtures::mixed_sizes),
-        (
-            "columnar-base-row-updates",
-            fixtures::columnar_base_row_updates,
-        ),
-        (
-            "versions-deletes-tombstones",
-            fixtures::versions_deletes_tombstones,
-        ),
-        ("selectivity", fixtures::selectivity),
-        ("blobs-well-placed", fixtures::blobs_well_placed),
-        ("blobs-scattered", fixtures::blobs_scattered),
-    ];
-    for (what, f) in all {
+    for (what, f) in ALL_FIXTURES {
         let seqno = AtomicU64::new(1);
         let fixture = f(&empty, &seqno).expect("fixture must build");
         assert!(

@@ -80,6 +80,8 @@ enum Support {
 /// timed here — nothing is estimated, because an estimated figure cannot be
 /// compared across a change that alters the estimate's inputs.
 struct Readings {
+    /// Keys the fixture built, which its own cap may hold below `--num`.
+    keys: u64,
     rows: u64,
     bytes_read: u64,
     bytes_decoded: u64,
@@ -95,6 +97,7 @@ impl Readings {
     /// exists to report under the cost of creating its own input.
     fn measure(
         tree: &AnyTree,
+        keys: u64,
         body: impl FnOnce() -> lsm_tree::Result<u64>,
     ) -> lsm_tree::Result<Self> {
         let m = tree.metrics();
@@ -103,6 +106,7 @@ impl Readings {
         let rows = body()?;
         let elapsed = start.elapsed();
         Ok(Self {
+            keys,
             rows,
             bytes_read: m.bytes_read() - r0,
             bytes_decoded: m.bytes_decoded() - d0,
@@ -142,9 +146,16 @@ impl Readings {
     /// as an amplification in the smaller-is-better suite, where zero is the
     /// best value rather than a division by zero.
     fn publish(&self, scenario: &str, reporter: &mut Reporter) {
+        // `keys` is the working set the scenario built. Each fixture caps it
+        // on its own, so it is the size the series describes, not `--num`.
         let annotation = format!(
-            "rows: {} | read: {} B | decoded: {} B | copied: {} B | elapsed: {:?}",
-            self.rows, self.bytes_read, self.bytes_decoded, self.bytes_copied, self.elapsed,
+            "keys: {} | rows: {} | read: {} B | decoded: {} B | copied: {} B | elapsed: {:?}",
+            self.keys,
+            self.rows,
+            self.bytes_read,
+            self.bytes_decoded,
+            self.bytes_copied,
+            self.elapsed,
         );
         reporter.publish_series(
             format!("{scenario} rows per KiB read"),
@@ -179,8 +190,9 @@ impl Readings {
     fn report(&self, scenario: &str) {
         let rows = self.rows.max(1) as f64;
         eprintln!(
-            "  {scenario:<34} rows={:<9} read/row={:<9.1} decoded/row={:<9.1} \
+            "  {scenario:<34} keys={:<9} rows={:<9} read/row={:<9.1} decoded/row={:<9.1} \
              copied/row={:<9.1} expand={:<5.2} {:?}",
+            self.keys,
             self.rows,
             self.bytes_read as f64 / rows,
             self.bytes_decoded as f64 / rows,
@@ -551,7 +563,8 @@ impl Workload for MixedLayout {
                 Support::Native(read) => {
                     let fixture = (scenario.fixture)(config, seqno)?;
                     let t = Instant::now();
-                    let readings = Readings::measure(&fixture.tree, || read(&fixture))?;
+                    let keys = fixture.oracle.rows.len() as u64;
+                    let readings = Readings::measure(&fixture.tree, keys, || read(&fixture))?;
                     reporter.record_duration(t.elapsed());
                     readings.report(name);
                     readings.publish(name, reporter);

@@ -457,10 +457,9 @@ fn run_single(
                     "name": format!("{benchmark_name} / {}", series.name),
                     "value": series.value,
                     "unit": series.unit,
-                    "extra": format!(
-                        "{}\nnum: {} | iterations: {}",
-                        series.extra, cli.num, iterations,
-                    ),
+                    // The series' own annotation names the size it measured;
+                    // --num is only an upper bound its fixtures may cap.
+                    "extra": format!("{}\niterations: {}", series.extra, iterations),
                 }),
             );
         }

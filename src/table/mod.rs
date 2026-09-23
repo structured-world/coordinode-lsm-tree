@@ -877,8 +877,7 @@ impl Table {
     // std-only: the sole consumer is the std-gated salvage walk.
     #[cfg(feature = "std")]
     pub(crate) fn data_block_handles(&self) -> block_index::BlockIndexIterImpl {
-        use block_index::BlockIndex;
-        self.block_index.iter()
+        self.maintenance_index_walk()
     }
 
     fn load_block(
@@ -1274,7 +1273,7 @@ impl Table {
         // increasing offsets rejects the reorder: a genuine index is always in
         // offset order (the writer emits blocks back-to-back).
         let mut prev_offset: Option<u64> = None;
-        for keyed in self.block_index.iter() {
+        for keyed in self.maintenance_index_walk() {
             let keyed = match keyed {
                 Ok(keyed) => keyed,
                 // Only an ENVIRONMENTAL read propagates: a retry, the right key,
@@ -1746,7 +1745,7 @@ impl Table {
             ..PatrolScrubReport::default()
         };
 
-        for entry in self.block_index.iter() {
+        for entry in self.maintenance_index_walk() {
             let keyed = match entry {
                 Ok(h) => h,
                 Err(e) => {
@@ -1961,9 +1960,8 @@ impl Table {
             // zeros and stays a hole.
             let mut holes: alloc::vec::Vec<(u64, u64)> = alloc::vec::Vec::new();
             if sparse {
-                use crate::table::block_index::BlockIndex;
                 let mut probe = alloc::vec::Vec::new();
-                for handle in self.block_index.iter() {
+                for handle in self.maintenance_index_walk() {
                     let handle = handle.map_err(|e| alloc::format!("block index iter: {e}"))?;
                     let block_off = handle.offset().0;
                     let block_len = u64::from(handle.size());
@@ -2426,7 +2424,7 @@ impl Table {
             }
         }
 
-        for entry in self.block_index.iter() {
+        for entry in self.maintenance_index_walk() {
             let keyed = match entry {
                 Ok(h) => h,
                 Err(e) => {
@@ -2964,7 +2962,7 @@ impl Table {
             Ok(())
         };
 
-        for entry in self.block_index.iter() {
+        for entry in self.maintenance_index_walk() {
             // Propagate a transient index-read failure rather than `break`: a
             // truncated prediction would return a digest and an offset set that
             // omit every later block, and the write loop's `predicted_offsets`
@@ -3695,7 +3693,7 @@ impl Table {
             // A PRESENT-but-empty map on a table with data blocks is a forgery;
             // the standalone gate rejects it before its walk, so do it here.
             Some(map) if map.is_empty() => {
-                if self.block_index.iter().next().is_some() {
+                if self.maintenance_index_walk().next().is_some() {
                     return Err((
                         G::ZoneMap,
                         crate::Error::InvalidHeader(
@@ -4423,7 +4421,7 @@ impl Table {
         let mut first_readable: Option<(usize, UserKey)> = None;
         let mut after_last_zeroed: Option<usize> = None;
         let mut irregular = false;
-        for (i, handle) in self.block_index.iter().enumerate() {
+        for (i, handle) in self.maintenance_index_walk().enumerate() {
             let handle = handle?;
             let block = BlockHandle::new(handle.offset(), handle.size());
             // A recovery walk over the file's geometry, not a read a caller
@@ -4555,7 +4553,7 @@ impl Table {
         // the anchor), so this only walks forward past WHOLLY EMPTY blocks —
         // e.g. a columnar block fully masked by its delete bitmap, which
         // carries no key to anchor on.
-        for (i, handle) in self.block_index.iter().enumerate() {
+        for (i, handle) in self.maintenance_index_walk().enumerate() {
             let handle = handle?;
             if i < start {
                 continue;
@@ -4919,7 +4917,7 @@ impl Table {
         // hidden bitmap deleted.
         if let Some(filter) = &full_filter
             && filter.is_empty()
-            && self.block_index.iter().next().is_some()
+            && self.maintenance_index_walk().next().is_some()
         {
             return Err(crate::Error::InvalidHeader(
                 "filter section is present but empty on a table with data blocks",
@@ -5204,7 +5202,7 @@ impl Table {
         // `data_block_count` describes the WHOLE table, punched prefix
         // included, so it is counted off the index itself — no decode.
         let mut block_count: u64 = 0;
-        for handle in self.block_index.iter() {
+        for handle in self.maintenance_index_walk() {
             handle?;
             block_count = block_count
                 .checked_add(1)
@@ -5574,7 +5572,7 @@ impl Table {
         // cannot catch it: a block absent from the map is skipped, so an empty
         // map trivially "agrees" with every block.)
         if map.is_empty() {
-            if self.block_index.iter().next().is_some() {
+            if self.maintenance_index_walk().next().is_some() {
                 return Err(crate::Error::InvalidHeader(
                     "block_layout section is present but empty on a table with data blocks",
                 ));
@@ -5609,7 +5607,7 @@ impl Table {
         use crate::table::block::ParsedItem as _;
 
         let punch = self.punch_offset()?;
-        for handle in self.block_index.iter() {
+        for handle in self.maintenance_index_walk() {
             let handle = handle?;
             let handle = BlockHandle::new(handle.offset(), handle.size());
             if handle.offset().0 < punch {
@@ -6859,7 +6857,7 @@ impl Table {
         // dropped by the scanner's key filter.
         let mut start_offset = 0u64;
         if let Some(bound) = &self.1 {
-            for keyed in self.block_index.iter() {
+            for keyed in self.maintenance_index_walk() {
                 let keyed = keyed?;
                 if self.comparator.compare(keyed.end_key(), bound.as_ref())
                     == core::cmp::Ordering::Less
@@ -8571,7 +8569,7 @@ impl Table {
     )]
     pub(crate) fn punch_offset_for(&self, key: &[u8]) -> crate::Result<u64> {
         let mut data_end = 0u64;
-        for handle in self.block_index.iter() {
+        for handle in self.maintenance_index_walk() {
             let handle = handle?;
             if self.comparator.compare(handle.end_key(), key) != core::cmp::Ordering::Less {
                 return Ok(handle.offset().0);
@@ -8646,7 +8644,7 @@ impl Table {
         };
         if !self.zone_map.is_empty() {
             let mut rows = straddle_live;
-            for handle in self.block_index.iter() {
+            for handle in self.maintenance_index_walk() {
                 let handle = handle?;
                 // `<=` skips the straddling block: it is counted exactly above,
                 // and its recorded row count covers the dead rows below the
@@ -8664,7 +8662,7 @@ impl Table {
             }
             return Ok(rows);
         }
-        let Some(last) = self.block_index.iter().next_back() else {
+        let Some(last) = self.maintenance_index_walk().next_back() else {
             return Ok(straddle_live);
         };
         let data_end = {
@@ -8699,7 +8697,7 @@ impl Table {
     ///
     /// Propagates the block-index walk and the read of the straddling block.
     fn straddling_block_live(&self, punch: u64, bound: &[u8]) -> crate::Result<Option<(u64, u64)>> {
-        for handle in self.block_index.iter() {
+        for handle in self.maintenance_index_walk() {
             let handle = handle?;
             if *handle.offset() != punch {
                 continue;

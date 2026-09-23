@@ -1205,11 +1205,9 @@ fn tight_slice_boundaries(
     slice_budget: u64,
     cmp: &dyn crate::comparator::UserComparator,
 ) -> crate::Result<Vec<UserKey>> {
-    use crate::table::block_index::BlockIndex;
-
     let mut entries: Vec<(UserKey, u32)> = Vec::new();
     for input in inputs {
-        for handle in input.block_index.iter() {
+        for handle in input.maintenance_index_walk() {
             let handle = handle?;
             entries.push((handle.end_key().clone(), handle.size()));
         }
