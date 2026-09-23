@@ -3782,12 +3782,16 @@ impl Tree {
                     }
                 }
             }
-            // Charged as issued: every planned block is asked of the
-            // filesystem below, whether or not the batch then succeeds.
-            for (table, _, handles) in &planned {
-                table.record_batched_read(handles);
-            }
             for (fs, reqs) in &mut groups {
+                // Charged as issued: this group's blocks are asked of its
+                // backend now, whether or not the call then succeeds. A group
+                // after a failure is never asked, so it is charged here, just
+                // before its own call, rather than with the whole plan.
+                for (table, _, handles) in &planned {
+                    if Arc::ptr_eq(&table.fs, fs) {
+                        table.record_batched_read(handles);
+                    }
+                }
                 // Best-effort: a batched-read failure just leaves the blocks for
                 // the resolve walk to read normally.
                 if fs.read_blocks_batched(reqs).is_err() {
@@ -3982,13 +3986,16 @@ impl Tree {
                     None => groups.push((&task.table.fs, vec![req])),
                 }
             }
-            // Charged as issued, like the prewarm: these reads bypass the
-            // per-block load path that charges every other read.
-            for task in chunk {
-                task.table
-                    .record_batched_read(core::slice::from_ref(&task.handle));
-            }
             for (fs, reqs) in &mut groups {
+                // Charged as issued, group by group like the prewarm: these
+                // reads bypass the per-block load path that charges every
+                // other read, and a group after a failure is never asked.
+                for task in chunk {
+                    if Arc::ptr_eq(&task.table.fs, fs) {
+                        task.table
+                            .record_batched_read(core::slice::from_ref(&task.handle));
+                    }
+                }
                 fs.read_blocks_batched(reqs)?;
                 // An implementation that reported success without filling a
                 // request leaves it short; refuse to decode a block out of bytes
