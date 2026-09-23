@@ -829,3 +829,158 @@ fn a_predicate_scan_of_one_segment_counts_its_filter_gather() {
         "the predicate mask built the returned batch, so its bytes are the gather",
     );
 }
+
+#[test]
+fn a_columnar_point_read_that_misses_counts_what_its_decode_copied() {
+    // A point read decodes the block before it knows whether the key is there,
+    // and decoding copies each nullable column's validity out of the block. A
+    // miss still did that copy, so the counter moves on a miss as on a hit.
+    // With no filter, a key absent from the segment but inside its key range
+    // reaches the block.
+    let folder = get_tmp_folder();
+    let AnyTree::Standard(tree) = Config::new(
+        folder.path(),
+        SequenceNumberCounter::default(),
+        SequenceNumberCounter::default(),
+    )
+    .filter_policy(lsm_tree::config::FilterPolicy::disabled())
+    .open()
+    .expect("open") else {
+        panic!("expected a standard tree");
+    };
+    tree.update_runtime_config(|cfg| cfg.columnar = true)
+        .expect("enable columnar");
+    let n = 64_u32;
+    let entries: Vec<InternalValue> = (0..n)
+        .map(|i| InternalValue::from_components(key(2 * i), b"ignored", 0, ValueType::Value))
+        .collect();
+    let mut batch = entries_to_column_batch(&entries).expect("transpose");
+    batch.columns.pop();
+    let rows = n as usize;
+    batch.columns.push(Column {
+        column_id: 3,
+        type_tag: TypeTag::Fixed(4),
+        validity: Some(vec![0b0101_0101; rows.div_ceil(8)]),
+        data: vec![0; rows * 4].into(),
+    });
+    let any = AnyTree::Standard(tree.clone());
+    let mut ingest = any.ingestion().expect("ingestion");
+    ingest.write_columnar_batch(&batch).expect("write batch");
+    ingest.finish().expect("finish");
+
+    let m = tree.metrics();
+    let before = m.bytes_copied();
+    assert!(
+        tree.get(key(3), SeqNo::MAX).expect("get").is_none(),
+        "an odd key was never written",
+    );
+    assert!(
+        m.bytes_copied() > before,
+        "the miss decoded the block and copied its validity, but charged nothing",
+    );
+}
+
+#[test]
+fn a_compaction_counts_nothing_it_reads_or_opens() -> lsm_tree::Result<()> {
+    // Compaction reads its inputs and then opens its outputs, and opening a
+    // table walks its index to build the table's locator. Neither is a read a
+    // caller made, so neither may move the read counters: a background
+    // compaction running beside a measured read would otherwise inflate it.
+    let folder = get_tmp_folder();
+    let config = || {
+        Config::new(
+            folder.path(),
+            SequenceNumberCounter::default(),
+            SequenceNumberCounter::default(),
+        )
+    };
+    {
+        let tree = config().open()?;
+        for i in 0..8 {
+            tree.insert(key(i), vec![b'b'; 64 * 1024], u64::from(i));
+        }
+        tree.flush_active_memtable(0)?;
+        tree.insert(key(100), b"x", 100);
+        tree.flush_active_memtable(0)?;
+    }
+
+    let tree = config().open()?;
+    let m = tree.metrics();
+    let (read, decoded) = (m.bytes_read(), m.bytes_decoded());
+    tree.major_compact(u64::MAX, 0)?;
+    assert_eq!(m.bytes_read(), read, "the compaction's reads were counted");
+    assert_eq!(
+        m.bytes_decoded(),
+        decoded,
+        "the compaction's decoding was counted"
+    );
+    Ok(())
+}
+
+#[test]
+fn a_compaction_filter_reading_a_blob_counts_nothing() -> lsm_tree::Result<()> {
+    // Compaction is maintenance: its input reads and decoding stay outside the
+    // read counters. A filter that resolves a separated value runs inside that
+    // compaction, so its blob read is maintenance too, and counting it would
+    // let a background compaction inflate what foreground reads report.
+    use lsm_tree::KvSeparationOptions;
+    use lsm_tree::compaction::filter::{CompactionFilter, Context, Factory, ItemAccessor, Verdict};
+    use std::sync::Arc;
+
+    struct ReadsValues;
+    impl CompactionFilter for ReadsValues {
+        fn filter_item(
+            &mut self,
+            item: ItemAccessor<'_>,
+            _ctx: &Context,
+        ) -> lsm_tree::Result<Verdict> {
+            let _ = item.value()?;
+            Ok(Verdict::Keep)
+        }
+    }
+    struct ReadsValuesFactory;
+    impl Factory for ReadsValuesFactory {
+        fn name(&self) -> &str {
+            "reads-values"
+        }
+        fn make_filter(&self, _ctx: &Context) -> Box<dyn CompactionFilter> {
+            Box::new(ReadsValues)
+        }
+    }
+
+    let folder = get_tmp_folder();
+    let config = || {
+        Config::new(
+            folder.path(),
+            SequenceNumberCounter::default(),
+            SequenceNumberCounter::default(),
+        )
+        .with_kv_separation(Some(KvSeparationOptions::default()))
+        .with_compaction_filter_factory(Some(Arc::new(ReadsValuesFactory)))
+    };
+    {
+        let tree = config().open()?;
+        for i in 0..8 {
+            tree.insert(key(i), vec![b'b'; 64 * 1024], u64::from(i));
+        }
+        tree.flush_active_memtable(0)?;
+    }
+
+    // Reopened, so no blob is cached and the filter's reads go to the files.
+    let tree = config().open()?;
+    let m = tree.metrics();
+    let (read, blob, decoded) = (m.bytes_read(), m.blob_bytes_read(), m.bytes_decoded());
+    tree.major_compact(u64::MAX, 0)?;
+    assert_eq!(
+        m.blob_bytes_read(),
+        blob,
+        "the filter's blob reads were counted"
+    );
+    assert_eq!(m.bytes_read(), read, "the compaction's reads were counted");
+    assert_eq!(
+        m.bytes_decoded(),
+        decoded,
+        "the compaction's decoding was counted"
+    );
+    Ok(())
+}

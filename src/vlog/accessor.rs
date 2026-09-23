@@ -21,15 +21,17 @@ pub struct Accessor<'a> {
     blob_files: &'a BlobFileList,
     /// Where this accessor's reads are counted. A blob read is a read of the
     /// filesystem like any other, so it lands in the same `bytes_read` /
-    /// `bytes_decoded` pair the block path reports through.
+    /// `bytes_decoded` pair the block path reports through. `None` for a
+    /// maintenance read (a compaction filter resolving a value), which the
+    /// read counters leave out as they leave out compaction's own input.
     #[cfg(feature = "metrics")]
-    metrics: &'a Metrics,
+    metrics: Option<&'a Metrics>,
 }
 
 impl<'a> Accessor<'a> {
     pub fn new(
         blob_files: &'a BlobFileList,
-        #[cfg(feature = "metrics")] metrics: &'a Metrics,
+        #[cfg(feature = "metrics")] metrics: Option<&'a Metrics>,
     ) -> Self {
         Self {
             blob_files,
@@ -51,12 +53,12 @@ impl<'a> Accessor<'a> {
     #[inline]
     fn count_read(&self, on_disk: usize, decoded: usize) {
         #[cfg(feature = "metrics")]
-        {
+        if let Some(metrics) = self.metrics {
             use core::sync::atomic::Ordering::Relaxed;
-            self.metrics
+            metrics
                 .blob_bytes_io_requested
                 .fetch_add(on_disk as u64, Relaxed);
-            self.metrics
+            metrics
                 .blob_bytes_decoded
                 .fetch_add(decoded as u64, Relaxed);
         }

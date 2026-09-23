@@ -3546,6 +3546,67 @@ fn load_block_cache_hit_rejects_wrong_block_type() -> crate::Result<()> {
     Ok(())
 }
 
+/// A block read from disk under the wrong role is rejected only after its
+/// transform ran, so the decoded bytes it produced are counted: decoded is
+/// what the transform output, whether or not the caller could use it.
+#[cfg(feature = "metrics")]
+#[test]
+fn a_block_rejected_for_its_role_counts_what_its_transform_decoded() -> crate::Result<()> {
+    use crate::{
+        CompressionType,
+        cache::Cache,
+        table::{block::BlockType, util::load_block},
+    };
+
+    let dir = tempdir()?;
+    let file = dir.path().join("table");
+    let mut writer = Writer::new(file.clone(), 0, 0, Arc::new(StdFs))?;
+    writer.write(InternalValue::from_components(
+        b"a",
+        b"v1",
+        1,
+        crate::ValueType::Value,
+    ))?;
+    let (_, checksum) = writer
+        .finish()?
+        .expect("finish() returns Some after writing data items");
+
+    let metrics = Arc::new(crate::metrics::Metrics::default());
+    let table = {
+        let mut params = test_recover_params(file, checksum);
+        params.cache = Arc::new(Cache::with_capacity_bytes(10_000_000));
+        params.metrics = metrics.clone();
+        Table::recover(params)?
+    };
+
+    let decoded_before = metrics.bytes_decoded();
+    let result = load_block(
+        table.global_id(),
+        &table.path,
+        &table.file_accessor,
+        &Cache::with_capacity_bytes(10_000_000),
+        &table.regions.tli,
+        BlockType::Data,
+        CompressionType::None,
+        None,
+        None,
+        #[cfg(zstd_any)]
+        None,
+        None,
+        &metrics,
+    );
+    assert!(
+        matches!(&result, Err(crate::Error::InvalidTag(("BlockType", _)))),
+        "the index block must be refused as a data block",
+    );
+    assert!(
+        metrics.bytes_decoded() > decoded_before,
+        "the transform ran before the role check, so its output must be counted",
+    );
+
+    Ok(())
+}
+
 /// A read that recovers a data block from its Page-ECC parity, and confirms the
 /// on-disk fault persists across a cache-bypassing re-read, must record the SST
 /// in the heal sink for a healing recompaction. A clean read records nothing.

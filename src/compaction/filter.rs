@@ -108,11 +108,13 @@ impl AccessorShared<'_> {
         vhandle: &ValueHandle,
     ) -> crate::Result<Option<UserValue>> {
         // No dictionary passed: a compaction reads blob files of every
-        // generation the tree holds, and each carries its own.
+        // generation the tree holds, and each carries its own. Not counted:
+        // this read is part of the compaction, which is maintenance, and the
+        // read counters leave compaction's input out.
         let accessor = Accessor::new(
             &self.version.blob_files,
             #[cfg(feature = "metrics")]
-            &self.opts.metrics,
+            None,
         );
 
         accessor.get(

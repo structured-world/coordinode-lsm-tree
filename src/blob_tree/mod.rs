@@ -116,7 +116,7 @@ fn resolve_value_handle(
         let accessor = Accessor::new(
             &version.blob_files,
             #[cfg(feature = "metrics")]
-            metrics,
+            Some(metrics),
         );
 
         match accessor.get(tree_id, &item.key.user_key, &vptr.vhandle, &config.cache) {
@@ -496,7 +496,7 @@ impl<I: Iterator<Item = crate::Result<InternalValue>>> PrefetchScan<I> {
         let accessor = Accessor::new(
             &self.version.blob_files,
             #[cfg(feature = "metrics")]
-            self.tree.metrics(),
+            Some(self.tree.metrics()),
         );
 
         accessor.prefetch(

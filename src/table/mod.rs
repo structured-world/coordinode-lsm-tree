@@ -1626,13 +1626,16 @@ impl Table {
             self.metadata.data_block_restart_interval,
             deletes,
         )?;
-        // Only the needle's rows are rebuilt, in two gathers: their keys and
-        // values copied out of the columns, then the small block encoded from
-        // them.
+        // `rows` is what the decode copied out of the block, plus the needle's
+        // keys and values copied out of the columns when it is present; a miss
+        // still decoded the block, so it is charged either way. The small block
+        // encoded from the rows exists only on a hit.
         #[cfg(feature = "metrics")]
-        if let Some(rebuilt) = &rebuilt {
+        {
             self.metrics.record_gather(rows);
-            self.metrics.record_gather(rebuilt.inner.data.len());
+            if let Some(rebuilt) = &rebuilt {
+                self.metrics.record_gather(rebuilt.inner.data.len());
+            }
         }
         #[cfg(not(feature = "metrics"))]
         let _ = rows;
@@ -8320,8 +8323,10 @@ impl Table {
                 rebuildable_section_degraded = true;
                 return None;
             }
-            let blocks: Vec<BlockHandle> = block_index
-                .iter()
+            let walk = block_index.iter();
+            #[cfg(feature = "metrics")]
+            let walk = walk.uncounted();
+            let blocks: Vec<BlockHandle> = walk
                 .map(|r| r.map(|kbh| *kbh.as_ref()))
                 .collect::<crate::Result<Vec<_>>>()
                 .inspect_err(|e| {

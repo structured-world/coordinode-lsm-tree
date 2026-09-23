@@ -87,7 +87,7 @@ pub struct Iter {
     comparator: SharedComparator,
 
     #[cfg(feature = "metrics")]
-    metrics: Arc<Metrics>,
+    pub(crate) metrics: Arc<Metrics>,
 
     poisoned: bool,
 }

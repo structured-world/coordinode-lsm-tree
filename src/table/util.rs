@@ -169,6 +169,19 @@ pub fn load_block(
     let _ = recovery;
     let corrected = matches!(ecc_status, crate::table::block::EccStatus::Corrected);
 
+    // What the transform produced, counted once per block that actually ran
+    // one. Paired with the per-role `*_io_requested` below: those record what
+    // was asked of the filesystem, this records what came out the other side
+    // of decompression, decryption and ECC. The ratio is the compression the
+    // read actually paid for, and its absolute value is what separates a
+    // physical projection from a cosmetic one. Charged before the role check:
+    // the transform has run whether or not the block turns out to be the one
+    // the caller asked for.
+    #[cfg(feature = "metrics")]
+    metrics
+        .block_bytes_decoded
+        .fetch_add(block.data.len() as u64, Relaxed);
+
     if block.header.block_type != block_type {
         return Err(crate::Error::InvalidTag((
             "BlockType",
@@ -178,17 +191,6 @@ pub fn load_block(
 
     #[cfg(feature = "metrics")]
     record_block_loaded(metrics, block_type);
-
-    // What the transform produced, counted once per block that actually ran
-    // one. Paired with the per-role `*_io_requested` below: those record what
-    // was asked of the filesystem, this records what came out the other side
-    // of decompression, decryption and ECC. The ratio is the compression the
-    // read actually paid for, and its absolute value is what separates a
-    // physical projection from a cosmetic one.
-    #[cfg(feature = "metrics")]
-    metrics
-        .block_bytes_decoded
-        .fetch_add(block.data.len() as u64, Relaxed);
 
     // ECC recovered this block's payload from parity. The bytes returned below
     // are correct, but the on-disk copy is still faulty: when auto-heal is on,

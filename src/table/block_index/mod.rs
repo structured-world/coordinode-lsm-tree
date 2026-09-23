@@ -30,6 +30,24 @@ pub enum BlockIndexIterImpl {
     TwoLevel(self::two_level::Iter),
 }
 
+impl BlockIndexIterImpl {
+    /// This walk with its block loads charged to counters nothing reports, for
+    /// a table open: loading the index to build the table's own structures is
+    /// not a read, and the read counters describe reads.
+    #[cfg(feature = "metrics")]
+    #[must_use]
+    pub(crate) fn uncounted(mut self) -> Self {
+        let detached = || alloc::sync::Arc::new(crate::Metrics::default());
+        match &mut self {
+            Self::Volatile(i) => i.metrics = detached(),
+            Self::TwoLevel(i) => i.metrics = detached(),
+            // A pinned index loads nothing while it is walked.
+            Self::Full(_) => {}
+        }
+        self
+    }
+}
+
 impl BlockIndexIter for BlockIndexIterImpl {
     fn seek_lower(&mut self, key: &[u8], seqno: SeqNo) -> bool {
         match self {
