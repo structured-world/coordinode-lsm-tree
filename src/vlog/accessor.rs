@@ -324,6 +324,11 @@ impl<'a> Accessor<'a> {
             };
 
             let record = if aliases_input {
+                // A copy out of the span: charged as the gather it is.
+                #[cfg(feature = "metrics")]
+                if let Some(metrics) = self.metrics {
+                    metrics.record_gather(bytes.len());
+                }
                 crate::Slice::from(bytes)
             } else {
                 span.slice(rel..record_end)

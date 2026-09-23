@@ -540,6 +540,44 @@ fn a_blob_prefetch_the_filesystem_refuses_still_counts_its_span() {
 }
 
 #[test]
+fn an_uncompressed_blob_prefetch_counts_the_records_it_copies_out() {
+    // A scan's read-ahead reads a run of neighbouring records in one buffer.
+    // An uncompressed record would otherwise be handed out as a view that pins
+    // the whole run in the cache, so each is copied into a buffer of its own:
+    // a copy the scan performed, and one the gather counter has to show.
+    let folder = get_tmp_folder();
+    let tree = Config::new(
+        folder.path(),
+        SequenceNumberCounter::default(),
+        SequenceNumberCounter::default(),
+    )
+    .blob_compression(CompressionType::None)
+    .with_kv_separation(Some(Default::default()))
+    .open()
+    .expect("open");
+    let value_len = 8_192_usize;
+    for i in 0..50 {
+        tree.insert(key(i), vec![b'v'; value_len], u64::from(i));
+    }
+    tree.flush_active_memtable(0).expect("flush");
+
+    let m = tree.metrics();
+    let before = m.bytes_copied();
+    let mut rows = 0_usize;
+    for guard in tree.iter(SeqNo::MAX, None) {
+        let (_, value) = guard.into_inner().expect("row");
+        assert_eq!(value.len(), value_len);
+        rows += 1;
+    }
+    assert_eq!(rows, 50);
+    assert!(
+        m.bytes_copied() - before >= value_len as u64,
+        "the read-ahead copied records out of its span but charged {} B",
+        m.bytes_copied() - before,
+    );
+}
+
+#[test]
 fn streaming_a_single_segment_copies_nothing() {
     // The clause: copied counts GATHERS — building a new buffer from bytes
     // that already exist in another. A scan over one segment whose rows are
