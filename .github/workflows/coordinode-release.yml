@@ -1,9 +1,21 @@
 name: Release
 
+# Runs on the maintained `<major>.x.x` release lines; main carries its own copy
+# of this workflow. release-plz opens the release PR against the branch it runs
+# on, and with a newer major already tagged it still bumps within this line
+# (5.11.1 -> 5.11.2) and writes the changelog from this line's commits only.
+# The release PR branch prefix is set per line in .release-plz.toml, so this
+# line's release PR and main's never close or overwrite each other.
 on:
   push:
     branches:
-      - main
+      - "*.x.x"
+
+# One release-plz run per branch at a time: two pushes in quick succession
+# would otherwise race on the same release PR branch.
+concurrency:
+  group: release-plz-${{ github.ref }}
+  cancel-in-progress: false
 
 jobs:
   release-plz:
@@ -48,7 +60,7 @@ jobs:
         with:
           toolchain: stable
 
-      # Step 1: Create or update release PR (version bump + changelog)
+      # Step 1: Create or update this line's release PR (version bump + changelog)
       - name: Create release PR
         uses: release-plz/action@a80d79efe0a195618acb02a4089d55fe74d2505f  # v0.5.136
         with:
