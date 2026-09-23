@@ -11,6 +11,12 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 
 ## [Unreleased]
 
+## [5.11.2](https://github.com/structured-world/coordinode-lsm-tree/compare/v5.11.1...v5.11.2) - 2026-09-23
+
+### Fixed
+
+- *(manifest)* keep a level of more than 255 runs openable on 5.x ([#701](https://github.com/structured-world/coordinode-lsm-tree/pull/701))
+
 ## [5.11.1](https://github.com/structured-world/coordinode-lsm-tree/compare/v5.11.0...v5.11.1) - 2026-09-21
 
 ### Fixed
