@@ -23,11 +23,29 @@ jobs:
               github.rest.repos.listBranches,
               { owner: context.repo.owner, repo: context.repo.repo, per_page: 100 }
             );
-            const stale = branches
-              .filter(b => b.name.startsWith("release-plz-"))
-              .map(b => b.name);
-            stale.sort().reverse();
-            const toDelete = stale.slice(1);
+            // main's release PRs use `release-plz-`; each maintained
+            // `<major>.x.x` line has its own prefix (`release-5.x.x-`), so
+            // the two never close each other's PR. Keep the newest branch of
+            // each prefix: it may back an open release PR.
+            const prefixOf = name => {
+              if (name.startsWith("release-plz-")) return "release-plz-";
+              const line = name.match(/^release-\d+\.x\.x-/);
+              return line ? line[0] : null;
+            };
+            const byPrefix = new Map();
+            for (const b of branches) {
+              const prefix = prefixOf(b.name);
+              if (prefix === null) continue;
+              if (!byPrefix.has(prefix)) byPrefix.set(prefix, []);
+              byPrefix.get(prefix).push(b.name);
+            }
+            const stale = [];
+            const toDelete = [];
+            for (const names of byPrefix.values()) {
+              names.sort().reverse();
+              stale.push(...names);
+              toDelete.push(...names.slice(1));
+            }
             for (const branch of toDelete) {
               try {
                 await github.rest.git.deleteRef({
@@ -40,4 +58,4 @@ jobs:
                 core.info(`Skip ${branch}: ${e.message}`);
               }
             }
-            core.info(`Cleaned ${toDelete.length} of ${stale.length} release-plz branches`);
+            core.info(`Cleaned ${toDelete.length} of ${stale.length} release branches`);
