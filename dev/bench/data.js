@@ -1,5 +1,5 @@
 window.BENCHMARK_DATA = {
-  "lastUpdate": 1790163697925,
+  "lastUpdate": 1790172700202,
   "repoUrl": "https://github.com/structured-world/coordinode-lsm-tree",
   "entries": {
     "lsm-tree db_bench": [
@@ -24030,6 +24030,90 @@ window.BENCHMARK_DATA = {
             "value": 256667.06595934342,
             "unit": "ops/sec",
             "extra": "P50: 2.6us | P99: 13.8us | P99.9: 173.4us\nthreads: 1 | elapsed: 0.78s | num: 200000 | iterations: 3"
+          }
+        ]
+      },
+      {
+        "commit": {
+          "author": {
+            "email": "mail@polaz.com",
+            "name": "Dmitry Prudnikov",
+            "username": "polaz"
+          },
+          "committer": {
+            "email": "noreply@github.com",
+            "name": "GitHub",
+            "username": "web-flow"
+          },
+          "distinct": true,
+          "id": "2e996ebed5771f577f6446c72ff53c8dc2bf5203",
+          "message": "fix(manifest): rotate when an edit outgrows one log record (#703)\n\n## Summary\n\nAn edit-log record carries the full run layout of every level an install\nchanges, and a record holds at most 64 KiB. A level of about 1,770\ntables no longer fits one record, so the append failed with\n`Unrecoverable` and the flush or compaction failed with it; at a 64 MiB\ntable target that is a level of roughly 110 GiB.\n\nThe edit is now encoded before the log is touched. One that does not fit\na record writes nothing, and the install rotates to a fresh snapshot,\nwhich frames each table on its own and holds a level of any size. The\non-disk format does not change.\n\nThe 5.x line has the same defect and a V5 snapshot cannot hold more than\n255 runs per level, so its backport takes a different route within the\nV5 format: #701.\n\n## Testing\n\nA compaction that installs a 2,000-table level succeeds and the tree\nreopens with every table (it returned `Unrecoverable` before), and an\noversized edit leaves the log untouched. Formatting, clippy (default and\nall features), the full test suite, doc tests, the doc build and the\nno-std check pass on macOS.\n\nCloses #702\n\n\n<!-- This is an auto-generated comment: release notes by coderabbit.ai\n-->\n\n## Summary by CodeRabbit\n\n* **Bug Fixes**\n* Large changes that exceed the size limit for a single log record are\nnow saved through a snapshot instead of being rejected.\n* Data in large levels remains available after the database is reopened.\n\n<!-- end of auto-generated comment: release notes by coderabbit.ai -->",
+          "timestamp": "2026-09-23T17:06:35+03:00",
+          "tree_id": "bd272e39bce661f61fbb72bb99ebb8e638c01c03",
+          "url": "https://github.com/structured-world/coordinode-lsm-tree/commit/2e996ebed5771f577f6446c72ff53c8dc2bf5203"
+        },
+        "date": 1790172697656,
+        "tool": "customBiggerIsBetter",
+        "benches": [
+          {
+            "name": "mixed",
+            "value": 20269.45745795171,
+            "unit": "ops/sec",
+            "extra": "P50: 0.7us | P99: 12.3us | P99.9: 28.3us\nthreads: 1 | elapsed: 26.41s | num: 200000 | iterations: 3"
+          },
+          {
+            "name": "fillseq",
+            "value": 2219253.2066488913,
+            "unit": "ops/sec",
+            "extra": "P50: 0.2us | P99: 4.4us | P99.9: 8.4us\nthreads: 1 | elapsed: 0.09s | num: 200000 | iterations: 3"
+          },
+          {
+            "name": "fillrandom",
+            "value": 392899.25204496254,
+            "unit": "ops/sec",
+            "extra": "P50: 2.0us | P99: 8.7us | P99.9: 18.6us\nthreads: 1 | elapsed: 0.51s | num: 200000 | iterations: 3"
+          },
+          {
+            "name": "readrandom",
+            "value": 433221.7953278719,
+            "unit": "ops/sec",
+            "extra": "P50: 2.1us | P99: 13.1us | P99.9: 29.0us\nthreads: 1 | elapsed: 0.46s | num: 200000 | iterations: 3"
+          },
+          {
+            "name": "readseq",
+            "value": 2320810.91454165,
+            "unit": "ops/sec",
+            "extra": "P50: 0.3us | P99: 4.8us | P99.9: 7.1us\nthreads: 1 | elapsed: 0.09s | num: 200000 | iterations: 3"
+          },
+          {
+            "name": "seekrandom",
+            "value": 253673.84155730737,
+            "unit": "ops/sec",
+            "extra": "P50: 3.3us | P99: 11.8us | P99.9: 24.2us\nthreads: 1 | elapsed: 0.79s | num: 200000 | iterations: 3"
+          },
+          {
+            "name": "prefixscan",
+            "value": 150891.30376538567,
+            "unit": "ops/sec",
+            "extra": "P50: 5.9us | P99: 15.6us | P99.9: 30.0us\nthreads: 1 | elapsed: 1.33s | num: 200000 | iterations: 3"
+          },
+          {
+            "name": "overwrite",
+            "value": 659293.4647960546,
+            "unit": "ops/sec",
+            "extra": "P50: 1.2us | P99: 7.0us | P99.9: 17.9us\nthreads: 1 | elapsed: 0.30s | num: 200000 | iterations: 3"
+          },
+          {
+            "name": "mergerandom",
+            "value": 683831.6409372105,
+            "unit": "ops/sec",
+            "extra": "P50: 0.5us | P99: 4.4us | P99.9: 12.9us\nthreads: 1 | elapsed: 0.29s | num: 200000 | iterations: 3"
+          },
+          {
+            "name": "readwhilewriting",
+            "value": 332576.08585480927,
+            "unit": "ops/sec",
+            "extra": "P50: 2.2us | P99: 13.8us | P99.9: 91.3us\nthreads: 1 | elapsed: 0.60s | num: 200000 | iterations: 3"
           }
         ]
       }
