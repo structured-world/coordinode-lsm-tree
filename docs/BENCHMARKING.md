@@ -181,8 +181,9 @@ counter, named `mixed-layout / <scenario> rows per KiB read` (and `… decoded`)
 in place of the ops/sec every other workload reports — for a scenario sweep the
 rate counts scenarios per second, which describes the harness rather than the
 engine. The `--json` report and the plain summary carry the same series in
-place of the rate. The fixtures open their trees with the run's cache and
-metadata flags, so `--cache-mb 0` measures cold reads here as everywhere else.
+place of the rate. The fixtures open their trees with the run's cache, metadata
+and compression flags (`--compression` reaches blob files too), so
+`--cache-mb 0` measures cold reads here as everywhere else.
 
 Read and decoded are yields in the bigger-is-better suite: more rows out of the
 same kibibyte is the improvement. Copied is published as a cost,
