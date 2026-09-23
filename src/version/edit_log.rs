@@ -34,30 +34,71 @@ use std::io::{Seek, SeekFrom};
 ///
 /// Returns the appended record's on-disk size in bytes (framing header +
 /// payload), so the caller can keep its cached log size exact without a
-/// re-measuring `open` + `seek` per install.
+/// re-measuring `open` + `seek` per install. Returns `None`, having written
+/// nothing, when the edit does not fit one record: an edit names every table
+/// of each level it changes, so a level of a few thousand tables outgrows the
+/// record cap, and the caller has to record that transition by rotating.
 ///
 /// # Errors
 ///
-/// Returns an I/O error if the open, write, or fsync fails, or a framing error
-/// if the edit payload exceeds the record cap.
+/// Returns an I/O error if the open, write, or fsync fails, or an encoding
+/// error from [`VersionEdit::encode`].
 pub fn append_edit(
     fs: &dyn Fs,
     path: &Path,
     edit: &VersionEdit,
     scratch: &mut Vec<u8>,
     sync_mode: SyncMode,
-) -> crate::Result<u64> {
+) -> crate::Result<Option<u64>> {
+    edit.encode(scratch)?;
+    // An append can be torn by a power loss, and only a record within the cap
+    // can be told apart from a damaged header when it is (see
+    // `read_framed_record`), so a larger one is never appended.
+    if scratch.len() > super::framing::MAX_FRAME_PAYLOAD as usize {
+        return Ok(None);
+    }
     let mut file = fs
         .open(
             path,
             &FsOpenOptions::new().write(true).create(true).append(true),
         )
         .map_err(crate::Error::from)?;
-    edit.append_to(&mut file, scratch)?;
+    super::framing::write_frame(&mut file, scratch)?;
     file.sync_all_with(sync_mode).map_err(crate::Error::from)?;
-    // `append_to` leaves the encoded payload in `scratch`; the framing header
-    // (u32 len + u64 XXH3) precedes it on disk.
-    Ok((super::framing::FRAME_HEADER_LEN + scratch.len()) as u64)
+    // The framing header (u32 len + u64 XXH3) precedes the payload on disk.
+    Ok(Some(
+        (super::framing::FRAME_HEADER_LEN + scratch.len()) as u64,
+    ))
+}
+
+/// Writes `edit` as the only record of a new log at `path`, replacing any file
+/// there, and syncs it. Returns the log's size in bytes.
+///
+/// For a snapshot whose version is completed by this edit: the log is written
+/// before `CURRENT` names the snapshot, so the record is whole by the time
+/// anything reads it, whatever its size.
+///
+/// # Errors
+///
+/// Returns an I/O error if the open, write or sync fails, or an encoding error
+/// from [`VersionEdit::encode`].
+pub fn write_log(
+    fs: &dyn Fs,
+    path: &Path,
+    edit: &VersionEdit,
+    sync_mode: SyncMode,
+) -> crate::Result<u64> {
+    let mut payload = Vec::new();
+    edit.encode(&mut payload)?;
+    let mut file = fs
+        .open(
+            path,
+            &FsOpenOptions::new().write(true).create(true).truncate(true),
+        )
+        .map_err(crate::Error::from)?;
+    super::framing::write_frame_of_any_len(&mut file, &payload)?;
+    file.sync_all_with(sync_mode).map_err(crate::Error::from)?;
+    Ok((super::framing::FRAME_HEADER_LEN + payload.len()) as u64)
 }
 
 /// Replays the durable prefix of the log at `path`. An absent log is an empty
@@ -80,7 +121,11 @@ pub fn replay_log(
     mode: crate::config::ManifestRecoveryMode,
 ) -> crate::Result<Vec<VersionEdit>> {
     match fs.open(path, &FsOpenOptions::new().read(true)) {
-        Ok(mut file) => replay_edits(&mut file, mode),
+        Ok(mut file) => {
+            let log_len = file.seek(SeekFrom::End(0)).map_err(crate::Error::from)?;
+            file.seek(SeekFrom::Start(0)).map_err(crate::Error::from)?;
+            replay_edits(&mut file, log_len, mode)
+        }
         Err(e) if e.kind() == crate::io::ErrorKind::NotFound => Ok(Vec::new()),
         Err(e) => Err(crate::Error::from(e)),
     }

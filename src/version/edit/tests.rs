@@ -327,8 +327,12 @@ fn replay_recovers_all_durable_edits_in_order() {
     for e in &edits {
         e.append_to(&mut log, &mut scratch).expect("append");
     }
-    let replayed =
-        replay_edits(&mut &log[..], ManifestRecoveryMode::AbsoluteConsistency).expect("replay");
+    let replayed = replay_edits(
+        &mut &log[..],
+        log.len() as u64,
+        ManifestRecoveryMode::AbsoluteConsistency,
+    )
+    .expect("replay");
     assert_eq!(replayed, edits, "replay must recover every edit in order");
 }
 
@@ -355,6 +359,7 @@ fn replay_stops_at_torn_tail_keeping_clean_prefix() {
     // dedicated to exactly this salvage.
     let replayed = replay_edits(
         &mut &log[..],
+        log.len() as u64,
         ManifestRecoveryMode::TolerateCorruptedTailRecords,
     )
     .expect("replay");
@@ -379,8 +384,12 @@ fn replay_stops_at_bitflipped_record_under_corruption_tolerant_mode() {
     let target = after_e0 + framing::FRAME_HEADER_LEN + 2;
     log[target] ^= 0xFF;
 
-    let replayed =
-        replay_edits(&mut &log[..], ManifestRecoveryMode::PointInTimeRecovery).expect("replay");
+    let replayed = replay_edits(
+        &mut &log[..],
+        log.len() as u64,
+        ManifestRecoveryMode::PointInTimeRecovery,
+    )
+    .expect("replay");
     assert_eq!(replayed, vec![e0], "PIT drops the corrupted record");
 }
 
@@ -405,6 +414,7 @@ fn bitflipped_tail_aborts_under_tolerate_corrupted_tail() {
 
     let err = replay_edits(
         &mut &log[..],
+        log.len() as u64,
         ManifestRecoveryMode::TolerateCorruptedTailRecords,
     )
     .expect_err("tolerate-tail must reject committed bit-rot");
@@ -422,8 +432,79 @@ fn bitflipped_tail_aborts_under_tolerate_corrupted_tail() {
 #[test]
 fn replay_of_empty_log_is_empty() {
     let replayed =
-        replay_edits(&mut &[][..], ManifestRecoveryMode::AbsoluteConsistency).expect("replay");
+        replay_edits(&mut &[][..], 0, ManifestRecoveryMode::AbsoluteConsistency).expect("replay");
     assert!(replayed.is_empty(), "empty log → no edits");
+}
+
+/// A record past the framing cap replays when all of it is present: that is
+/// how an edit written before its manifest was published arrives.
+#[test]
+fn replay_accepts_a_whole_record_past_the_frame_cap() {
+    let mut e = sample();
+    e.new_version_id = 7;
+    e.changed_levels = vec![ChangedLevel {
+        level: 0,
+        runs: (0..4_000)
+            .map(|id| {
+                vec![TableDesc {
+                    id,
+                    checksum: 0,
+                    global_seqno: 0,
+                }]
+            })
+            .collect(),
+    }];
+    let mut payload = Vec::new();
+    e.encode(&mut payload).expect("encode");
+    assert!(payload.len() > framing::MAX_FRAME_PAYLOAD as usize);
+    let mut log = Vec::new();
+    framing::write_frame_of_any_len(&mut log, &payload).expect("write");
+
+    let replayed = replay_edits(
+        &mut &log[..],
+        log.len() as u64,
+        ManifestRecoveryMode::AbsoluteConsistency,
+    )
+    .expect("replay");
+    assert_eq!(replayed, vec![e]);
+}
+
+/// The same record cut short cannot pass for a torn append: a length past the
+/// cap that the log does not hold is a damaged header in every mode.
+#[test]
+fn replay_rejects_a_record_past_the_frame_cap_that_the_log_does_not_hold() {
+    let mut e = sample();
+    e.changed_levels = vec![ChangedLevel {
+        level: 0,
+        runs: (0..4_000)
+            .map(|id| {
+                vec![TableDesc {
+                    id,
+                    checksum: 0,
+                    global_seqno: 0,
+                }]
+            })
+            .collect(),
+    }];
+    let mut payload = Vec::new();
+    e.encode(&mut payload).expect("encode");
+    let mut log = Vec::new();
+    framing::write_frame_of_any_len(&mut log, &payload).expect("write");
+    log.truncate(log.len() - 1);
+
+    let err = replay_edits(
+        &mut &log[..],
+        log.len() as u64,
+        ManifestRecoveryMode::TolerateCorruptedTailRecords,
+    )
+    .expect_err("an oversized record the log does not hold is not a torn tail");
+    assert!(
+        matches!(
+            err,
+            crate::Error::TornManifestEditLog { kind: "bad-header" }
+        ),
+        "expected TornManifestEditLog(bad-header), got {err:?}",
+    );
 }
 
 #[test]

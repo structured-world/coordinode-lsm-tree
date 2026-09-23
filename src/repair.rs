@@ -6462,7 +6462,7 @@ fn publish_repaired_manifest(
     // is touched.
     let mut post_commit_error: Option<crate::Error> = None;
     match persisted {
-        Ok(()) => published_blob_replacements.disarm(),
+        Ok(_) => published_blob_replacements.disarm(),
         Err(e) => match probe_current(&*config.fs, &config.path, version_id) {
             CurrentProbe::NotSwitched => return Err(e),
             CurrentProbe::Switched => {
@@ -6486,23 +6486,28 @@ fn publish_repaired_manifest(
     // RECORDED, the remaining cleanup is skipped, and the completed report
     // rides out inside [`Error::RepairedButUnopened`].
 
-    // A rebuilt snapshot is a complete generation on its own. Sweep every stale
-    // edit log so nothing is replayed on top of it: the lost manifest's
-    // generation left its log under an OLDER snapshot id (the rebuilt snapshot
-    // uses `max(v*) + 1`), so removing only `edits-{version_id}` would normally
-    // miss it. Drop all `edits-*` — none belong to the fresh snapshot. Runs
-    // only on a PROVEN commit (like every cleanup below): a recorded
-    // post-commit error skips it, and the retry finishes the sweep.
+    // Sweep every stale edit log so nothing is replayed on top of the rebuilt
+    // snapshot: the lost manifest's generation left its log under an OLDER
+    // snapshot id (the rebuilt snapshot uses `max(v*) + 1`). Every `edits-*`
+    // goes except `edits-{version_id}`, which `persist_version` wrote for this
+    // generation when its L0 holds more runs than a snapshot records (one per
+    // recovered table). Runs only on a PROVEN commit (like every cleanup
+    // below): a recorded post-commit error skips it, and the retry finishes
+    // the sweep.
     //
     // No directory fsync here, unlike the blob sweep below. Recovery replays
     // only the LIVE snapshot's log, so an entry a power loss resurrects is
     // never read; the next open recognizes it as an orphan log and sweeps it
     // again. Nothing observes the window, so the barrier would buy nothing.
     if post_commit_error.is_none() {
+        let own_log = format!("edits-{version_id}");
         match config.fs.read_dir(&config.path) {
             Ok(dirents) => {
                 for dirent in dirents {
-                    if dirent.is_dir || !dirent.file_name.starts_with("edits-") {
+                    if dirent.is_dir
+                        || !dirent.file_name.starts_with("edits-")
+                        || dirent.file_name == own_log
+                    {
                         continue;
                     }
                     match config.fs.remove_file(&dirent.path) {

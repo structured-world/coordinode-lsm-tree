@@ -287,17 +287,31 @@ impl VersionEdit {
         Ok(())
     }
 
+    /// Serializes this edit's record payload into `out`, replacing what it
+    /// held, so the caller can check its size before committing it to a log.
+    ///
+    /// # Errors
+    ///
+    /// Returns an error if the edit carries dictionary ids without a retention
+    /// floor (the positional sections cannot express that).
+    pub fn encode(&self, out: &mut Vec<u8>) -> crate::Result<()> {
+        out.clear();
+        self.encode_payload(out)
+    }
+
     /// Appends this edit as one framed record to `writer`, reusing `scratch`
-    /// for the payload assembly (no per-edit heap allocation after warm-up).
+    /// for the payload assembly.
     ///
     /// # Errors
     ///
     /// Returns an error if the payload exceeds the framing payload cap, a write
-    /// fails, or the edit carries dictionary ids without a retention floor (the
-    /// positional sections cannot express that). The payload is assembled
-    /// before any of it reaches `writer`, so a refused edit emits no record.
+    /// fails, or the edit carries dictionary ids without a retention floor. The
+    /// payload is assembled before any of it reaches `writer`, so a refused
+    /// edit emits no record.
+    #[cfg(test)]
     pub fn append_to<W: Write>(&self, writer: &mut W, scratch: &mut Vec<u8>) -> crate::Result<()> {
-        framing::write_framed_record(writer, scratch, |payload| self.encode_payload(payload))
+        self.encode(scratch)?;
+        framing::write_frame(writer, scratch)
     }
 
     /// Decodes a `VersionEdit` from a framed-record payload (the bytes between
@@ -495,14 +509,21 @@ fn tail_defect_kind(outcome: &framing::FramedRecordOutcome) -> &'static str {
 /// payload fails to decode is a genuine format error, not power loss, and is
 /// surfaced as an error in every mode rather than silently truncating the log.
 ///
+/// `log_len` is the log's size in bytes. It bounds a record longer than the
+/// framing cap: such a record is read only when all of it lies within the log,
+/// so a damaged length field never sizes an allocation past the file.
+///
 /// # Errors
 ///
 /// Returns an I/O error from `reader`, [`crate::Error::InvalidHeader`] if a
-/// checksum-valid record fails to decode, or
+/// checksum-valid record fails to decode,
 /// [`crate::Error::TornManifestEditLog`] when the trailing record is
-/// torn / bit-rotted / mis-framed and `mode` does not tolerate that defect.
+/// torn / bit-rotted / mis-framed and `mode` does not tolerate that defect, or
+/// [`crate::Error::Unrecoverable`] when `reader` holds more than `log_len`
+/// bytes.
 pub fn replay_edits<R: Read>(
     reader: &mut R,
+    log_len: u64,
     mode: crate::config::ManifestRecoveryMode,
 ) -> crate::Result<Vec<VersionEdit>> {
     use crate::config::ManifestRecoveryMode;
@@ -526,6 +547,8 @@ pub fn replay_edits<R: Read>(
     let mut reader = crate::io::BufReader::new(reader);
     let mut edits = Vec::new();
     let mut scratch = Vec::new();
+    // Bytes of the records read so far, all of which lie within `log_len`.
+    let mut consumed = 0u64;
     loop {
         // No bytes left at a record boundary: the normal end of the log. A crash
         // exactly at a boundary is indistinguishable from a pristine close, so
@@ -533,9 +556,15 @@ pub fn replay_edits<R: Read>(
         if reader.fill_buf().map_err(crate::Error::from)?.is_empty() {
             break;
         }
-        let outcome = framing::read_framed_record(&mut reader, u64::MAX, None, &mut scratch)?;
+        let remaining = log_len
+            .checked_sub(consumed)
+            .ok_or(crate::Error::Unrecoverable)?;
+        let outcome = framing::read_framed_record(&mut reader, remaining, None, &mut scratch)?;
         match outcome {
-            FramedRecordOutcome::Ok => edits.push(VersionEdit::decode_payload(&scratch)?),
+            FramedRecordOutcome::Ok => {
+                consumed += (framing::FRAME_HEADER_LEN + scratch.len()) as u64;
+                edits.push(VersionEdit::decode_payload(&scratch)?);
+            }
             // Writer-incomplete tail (power loss mid-append): unacknowledged, so
             // tolerant modes drop it; AbsoluteConsistency surfaces it.
             FramedRecordOutcome::TailTruncation => {

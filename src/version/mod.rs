@@ -1125,6 +1125,34 @@ impl Version {
             .all(|level| u8::try_from(level.run_count()).is_ok())
     }
 
+    /// This version under the same id with every level too wide for a snapshot
+    /// emptied: the part of it a snapshot can hold. [`Self::diff`] against it
+    /// yields the edit that restores those levels.
+    pub(crate) fn snapshot_base(&self) -> Self {
+        let levels = self
+            .levels
+            .iter()
+            .map(|level| {
+                if u8::try_from(level.run_count()).is_ok() {
+                    level.clone()
+                } else {
+                    Level::empty()
+                }
+            })
+            .collect();
+        Self {
+            inner: Arc::new(VersionInner {
+                id: self.id,
+                tree_type: self.tree_type,
+                levels,
+                blob_files: self.blob_files.clone(),
+                gc_stats: self.gc_stats.clone(),
+                retention_floor: self.retention_floor,
+                dicts: self.dicts.clone(),
+            }),
+        }
+    }
+
     pub(crate) fn encode_into(
         &self,
         writer: &mut crate::manifest_blocks::writer::ManifestArchiveWriter,
@@ -1206,7 +1234,7 @@ impl Version {
         for level in self.iter_levels() {
             // Nothing bounds a level's run count, and a wrapped count leaves a
             // snapshot that no longer opens, so refuse rather than truncate.
-            // The caller defers rotation while `fits_snapshot` is false.
+            // `persist_version` writes such a level through the edit log.
             let run_count = u8::try_from(level.len()).map_err(|_| {
                 crate::Error::from(crate::io::Error::new(
                     crate::io::ErrorKind::InvalidInput,
