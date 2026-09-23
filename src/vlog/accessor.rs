@@ -95,11 +95,12 @@ impl<'a> Accessor<'a> {
 
         let reader = Reader::new(blob_file, file.as_ref());
 
-        // Read and parse as two steps so the read is charged the moment it
-        // happens: a record that then fails its checksum or decompression was
-        // still asked of the filesystem, as the prefetch path also counts it.
-        let record = reader.read_record(key, vhandle)?;
-        self.count_read(record.len(), 0);
+        // Charged before the read is issued, as a block read is: a request the
+        // filesystem then fails, or whose bytes then fail their checksum or
+        // decompression, was still asked of it.
+        let len = crate::vlog::blob_file::reader::record_len(key.len(), vhandle)?;
+        self.count_read(len, 0);
+        let record = reader.read_record(vhandle, len)?;
         let value = reader.parse_record(key, vhandle, &record)?;
         self.count_read(0, value.len());
         cache.insert_blob(tree_id, vhandle, key, value.clone());
@@ -280,15 +281,16 @@ impl<'a> Accessor<'a> {
         let Ok(span_len) = usize::try_from(span_end - span_start) else {
             return;
         };
+        // The whole extent, gaps included: that is what is asked of the
+        // filesystem, and swallowing a gap to merge two reads is the point of
+        // the coalescing, so charging only the records would hide its cost.
+        // Charged once, before the read is issued, so a read the filesystem
+        // then fails is counted, and whether or not every record it covers is
+        // then parsed.
+        self.count_read(span_len, 0);
         let Ok(span) = crate::file::read_exact(file.as_ref(), span_start, span_len) else {
             return;
         };
-        // The whole extent, gaps included: that is what was asked of the
-        // filesystem, and swallowing a gap to merge two reads is the point of
-        // the coalescing, so charging only the records would hide its cost.
-        // Counted here rather than per record, because the read happened once
-        // whether or not every record it covers is then parsed.
-        self.count_read(span_len, 0);
 
         let reader = Reader::new(blob_file, file.as_ref());
 

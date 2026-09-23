@@ -208,14 +208,16 @@ fn resolving_a_separated_value_counts_the_blob_it_read() {
     let payload = u64::from(n) * value_len as u64;
 
     // Read is the ON-DISK span asked of the filesystem, decoded is what came
-    // out of it. A blob file compresses, and a run of one byte compresses
-    // hard, so the two must sit on opposite sides of the payload: anything
-    // that reported them as equal would be measuring the same number twice
-    // under two names.
+    // out of it. A blob file compresses when a compressor is compiled in, and
+    // a run of one byte compresses hard, so the two must then sit on opposite
+    // sides of the payload: anything that reported them as equal would be
+    // measuring the same number twice under two names. Without one, a record
+    // is its payload plus a header, and only the lower bounds apply.
     assert!(
         blob_read > 0,
         "resolving a separated value read no blob bytes"
     );
+    #[cfg(feature = "lz4")]
     assert!(
         blob_read < payload,
         "blob reads {blob_read} B for {payload} B of values; a compressed blob \
@@ -389,6 +391,113 @@ fn a_blob_read_rejected_as_corrupt_still_counts_its_bytes() {
     assert!(
         m.blob_bytes_read() > before,
         "the corrupt record was read from the filesystem, so read must move",
+    );
+}
+
+/// A key-value-separated tree of `n` 8 KiB values over a filesystem whose
+/// faults the returned injector arms, flushed so every value is in a blob file.
+fn faultable_blob_tree(
+    n: u32,
+) -> (
+    TempDir,
+    AnyTree,
+    std::sync::Arc<lsm_tree::fs::FaultInjector>,
+) {
+    let folder = get_tmp_folder();
+    let injector = std::sync::Arc::new(lsm_tree::fs::FaultInjector::new());
+    let fs: std::sync::Arc<dyn lsm_tree::fs::Fs> = std::sync::Arc::new(
+        lsm_tree::fs::FaultFs::with_injector(lsm_tree::fs::StdFs, std::sync::Arc::clone(&injector)),
+    );
+    let tree = Config::new(
+        folder.path(),
+        SequenceNumberCounter::default(),
+        SequenceNumberCounter::default(),
+    )
+    .with_shared_fs(fs)
+    .with_kv_separation(Some(Default::default()))
+    .open()
+    .expect("open");
+    for i in 0..n {
+        tree.insert(key(i), vec![b'v'; 8_192], u64::from(i));
+    }
+    tree.flush_active_memtable(0).expect("flush");
+    (folder, tree, injector)
+}
+
+/// Makes every read of a blob file fail, leaving the tables readable, so a
+/// lookup reaches the blob read and fails there.
+fn refuse_blob_reads(injector: &lsm_tree::fs::FaultInjector) {
+    injector.arm(
+        lsm_tree::fs::FaultRule::new(
+            lsm_tree::fs::FaultOp::ReadAt,
+            lsm_tree::fs::Fault::Error(lsm_tree::io::ErrorKind::PermissionDenied),
+        )
+        .on_path("blobs"),
+    );
+}
+
+/// The blob bytes one successful point read of `key(0)` asks for.
+fn one_blob_record() -> u64 {
+    let (_folder, tree, _) = faultable_blob_tree(1);
+    let before = tree.metrics().blob_bytes_read();
+    tree.get(key(0), SeqNo::MAX).expect("get").expect("present");
+    tree.metrics().blob_bytes_read() - before
+}
+
+#[test]
+fn a_blob_read_the_filesystem_refuses_still_counts_its_bytes() {
+    // Read is what was asked of the filesystem, and a request the filesystem
+    // then fails was asked all the same, exactly as a block read is charged
+    // before its I/O. Charging after the read returns would drop every
+    // failing request from the figure.
+    let record = one_blob_record();
+    assert!(record > 0);
+
+    let (_folder, tree, injector) = faultable_blob_tree(1);
+    refuse_blob_reads(&injector);
+    let before = tree.metrics().blob_bytes_read();
+    assert!(
+        tree.get(key(0), SeqNo::MAX).is_err(),
+        "a refused blob read must fail the lookup",
+    );
+    assert_eq!(
+        tree.metrics().blob_bytes_read() - before,
+        record,
+        "the refused record was asked of the filesystem, so it is charged",
+    );
+}
+
+#[test]
+fn a_blob_prefetch_the_filesystem_refuses_still_counts_its_span() {
+    // A scan asks for a run of neighbouring records in one coalesced read
+    // before resolving the first of them. When the filesystem refuses that
+    // read the scan falls back to the record alone, which fails too; both
+    // requests were issued, so both are charged, and the figure exceeds the
+    // one record the fallback asked for.
+    let record = one_blob_record();
+
+    let (_folder, tree, injector) = faultable_blob_tree(50);
+    let mut scan = tree.iter(SeqNo::MAX, None);
+    // The read-ahead arms on the first value a scan resolves, so the first
+    // row is read alone and succeeds; the refusal starts after it.
+    scan.next()
+        .expect("the tree holds rows")
+        .into_inner()
+        .expect("the first row reads before any fault is armed");
+    refuse_blob_reads(&injector);
+    let before = tree.metrics().blob_bytes_read();
+    assert!(
+        scan.next()
+            .expect("the tree holds more rows")
+            .into_inner()
+            .is_err(),
+        "a refused blob read must fail the scan",
+    );
+    let charged = tree.metrics().blob_bytes_read() - before;
+    assert!(
+        charged > record,
+        "the refused prefetch span went uncharged: {charged} B against the \
+         {record} B record the fallback asked for",
     );
 }
 

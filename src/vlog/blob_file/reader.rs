@@ -83,27 +83,25 @@ impl<'a> Reader<'a> {
         Self { blob_file, file }
     }
 
-    /// Reads the raw bytes of one record, exactly [`record_len`] of them from
-    /// `vhandle.offset`, without validating them: the caller parses them with
-    /// [`Self::parse_record`], and can account for the read in between.
+    /// Reads the raw bytes of one record, `len` of them from `vhandle.offset`,
+    /// without validating them: the caller parses them with
+    /// [`Self::parse_record`].
+    ///
+    /// `len` is the record's [`record_len`], computed by the caller so that it
+    /// can account for the request before issuing it.
     ///
     /// # Errors
     ///
-    /// Returns the [`record_len`] errors and the file's read failures.
-    pub fn read_record(&self, key: &[u8], vhandle: &ValueHandle) -> crate::Result<crate::Slice> {
+    /// Returns the file's read failures.
+    pub fn read_record(&self, vhandle: &ValueHandle, len: usize) -> crate::Result<crate::Slice> {
         debug_assert_eq!(vhandle.blob_file_id, self.blob_file.id());
-        let read_len = record_len(key.len(), vhandle)?;
-        Ok(crate::file::read_exact(
-            self.file,
-            vhandle.offset,
-            read_len,
-        )?)
+        Ok(crate::file::read_exact(self.file, vhandle.offset, len)?)
     }
 
     /// Reads and parses one record in one call.
     #[cfg(test)]
     pub fn get(&self, key: &'a [u8], vhandle: &'a ValueHandle) -> crate::Result<UserValue> {
-        let record = self.read_record(key, vhandle)?;
+        let record = self.read_record(vhandle, record_len(key.len(), vhandle)?)?;
         self.parse_record(key, vhandle, &record)
     }
 
