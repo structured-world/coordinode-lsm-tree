@@ -428,8 +428,14 @@ impl SuperVersions {
                 }
                 // The edit is too large for one record and nothing was
                 // written: rotate below, since a snapshot holds a level of
-                // any size.
-                Ok(None) => {}
+                // any size. The scratch grew to the oversized payload; give
+                // that back so the history does not hold a manifest-sized
+                // buffer for the rest of the tree's life.
+                Ok(None) => {
+                    self.edit_scratch.clear();
+                    self.edit_scratch
+                        .shrink_to(crate::version::framing::MAX_FRAME_PAYLOAD as usize);
+                }
                 Err(e) => {
                     // A failed append may have written a partial record; the
                     // on-disk size is unknown, so drop the cache and re-measure

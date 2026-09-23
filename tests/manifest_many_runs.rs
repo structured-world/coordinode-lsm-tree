@@ -86,9 +86,8 @@ fn a_level_too_large_for_one_edit_record_compacts_and_reopens() -> lsm_tree::Res
     let value = vec![7u8; 4096];
     {
         let tree = open()?;
-        for i in 0..TABLES {
+        for (i, seqno) in (0..TABLES).zip(1u64..) {
             let key = format!("k{i:05}");
-            let seqno = u64::try_from(i).expect("a table index fits u64") + 1;
             tree.insert(key.as_bytes(), &value, seqno);
         }
         tree.flush_active_memtable(0)?;

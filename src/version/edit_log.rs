@@ -65,9 +65,9 @@ pub fn append_edit(
     super::framing::write_frame(&mut file, scratch)?;
     file.sync_all_with(sync_mode).map_err(crate::Error::from)?;
     // The framing header (u32 len + u64 XXH3) precedes the payload on disk.
-    Ok(Some(
-        (super::framing::FRAME_HEADER_LEN + scratch.len()) as u64,
-    ))
+    let appended = u64::try_from(super::framing::FRAME_HEADER_LEN + scratch.len())
+        .map_err(|_| crate::Error::Unrecoverable)?;
+    Ok(Some(appended))
 }
 
 /// Replays the durable prefix of the log at `path`. An absent log is an empty

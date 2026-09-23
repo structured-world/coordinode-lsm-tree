@@ -36,8 +36,8 @@ fn append_then_replay_roundtrips_all_edits() {
 /// log is touched, so the caller can rotate instead and the log it would have
 /// torn stays as it was.
 #[test]
-fn an_edit_too_large_for_one_record_writes_nothing() {
-    let dir = tempfile::tempdir().expect("tempdir");
+fn an_edit_too_large_for_one_record_writes_nothing() -> crate::Result<()> {
+    let dir = tempfile::tempdir()?;
     let path = dir.path().join("edits-0");
     let mut scratch = Vec::new();
     let table = |id| TableDesc {
@@ -54,10 +54,10 @@ fn an_edit_too_large_for_one_record_writes_nothing() {
         ..Default::default()
     };
 
-    let appended = append_edit(&StdFs, &path, &wide, &mut scratch, SyncMode::Normal)
-        .expect("a declined edit is not an error");
+    let appended = append_edit(&StdFs, &path, &wide, &mut scratch, SyncMode::Normal)?;
     assert_eq!(appended, None);
     assert!(!path.exists(), "a declined edit must not create the log");
+    Ok(())
 }
 
 #[test]
