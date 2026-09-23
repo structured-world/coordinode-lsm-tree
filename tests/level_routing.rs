@@ -1233,7 +1233,13 @@ impl CountingHandles {
     }
 
     /// Bytes asked of this backend through batched reads since the last reset.
-    #[cfg_attr(not(feature = "metrics"), expect(dead_code))]
+    #[cfg_attr(
+        not(feature = "metrics"),
+        expect(
+            dead_code,
+            reason = "only the metrics-gated batched-read tests read it"
+        )
+    )]
     fn asked(&self) -> u64 {
         self.asked.load(std::sync::atomic::Ordering::Relaxed)
     }

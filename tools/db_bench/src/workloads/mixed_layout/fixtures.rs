@@ -638,9 +638,15 @@ pub fn blobs_scattered(config: &BenchConfig, seqno: &AtomicU64) -> lsm_tree::Res
     // repeating, so the first pass already writes neighbours far apart in time.
     // No fixed stride is coprime with every n (a stride divides its own
     // multiples), so the first one at or above the preferred value is taken.
-    let stride = (7_919..)
-        .find(|&s| gcd(s, n) == 1)
-        .expect("n + 1 is coprime with n, so the search ends");
+    // With no keys there is nothing to visit, and nothing is coprime with 0
+    // (gcd(s, 0) == s), so the search is skipped rather than run forever.
+    let stride = if n == 0 {
+        1
+    } else {
+        (7_919..)
+            .find(|&s| gcd(s, n) == 1)
+            .expect("a prime above both 7919 and n is coprime with n")
+    };
     for step in 0..n {
         let i = step.wrapping_mul(stride) % n;
         let value = Value {

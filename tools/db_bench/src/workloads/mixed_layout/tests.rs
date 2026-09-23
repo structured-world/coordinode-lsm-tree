@@ -273,3 +273,52 @@ fn the_scattered_blob_fixture_rewrites_more_than_it_writes_once() {
          are no longer scattering anything",
     );
 }
+
+#[test]
+fn every_fixture_num_zero_builds_an_empty_oracle() {
+    // `--num 0` is a valid run. Every fixture must finish with an empty oracle:
+    // the scattered one searched for a stride coprime with the key count, and
+    // with no keys nothing is coprime with it, so it looped instead of
+    // returning.
+    let empty = BenchConfig { num: 0, ..config() };
+    let all: [(&str, fixtures::FixtureFn); 8] = [
+        ("narrow", fixtures::narrow),
+        ("wide", fixtures::wide),
+        ("mixed-sizes", fixtures::mixed_sizes),
+        (
+            "columnar-base-row-updates",
+            fixtures::columnar_base_row_updates,
+        ),
+        (
+            "versions-deletes-tombstones",
+            fixtures::versions_deletes_tombstones,
+        ),
+        ("selectivity", fixtures::selectivity),
+        ("blobs-well-placed", fixtures::blobs_well_placed),
+        ("blobs-scattered", fixtures::blobs_scattered),
+    ];
+    for (what, f) in all {
+        let seqno = AtomicU64::new(1);
+        let fixture = f(&empty, &seqno).expect("fixture must build");
+        assert!(
+            fixture.oracle.rows.is_empty(),
+            "{what}: no keys were asked for, yet the oracle expects some",
+        );
+    }
+}
+
+#[test]
+fn blob_fixture_compression_none_opens_its_blob_files_uncompressed() {
+    // The blob scenarios are dominated by blob bytes, so a run labelled with a
+    // codec has to write its blobs with that codec; otherwise every codec
+    // measures the blob default and the runs cannot be compared.
+    let fixture = build(fixtures::blobs_well_placed);
+    let lsm_tree::AnyTree::Blob(tree) = &fixture.tree else {
+        panic!("the blob fixture must open a KV-separated tree");
+    };
+    assert_eq!(
+        tree.runtime_config().blob_compression,
+        lsm_tree::CompressionType::None,
+        "--compression none must reach the blob files",
+    );
+}

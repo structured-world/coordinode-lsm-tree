@@ -104,6 +104,9 @@ pub fn tree_builder(path: &Path, config: &BenchConfig) -> lsm_tree::Result<Confi
     )
     .data_block_size_policy(block_size_policy)
     .data_block_compression_policy(compression_policy)
+    // A KV-separated tree writes most of its bytes as blobs, so the codec a
+    // run names has to reach them too; a standard tree ignores this.
+    .blob_compression(config.compression.to_lsm())
     .use_cache(cache);
 
     if config.partition_metadata {
