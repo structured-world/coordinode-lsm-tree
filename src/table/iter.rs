@@ -688,6 +688,11 @@ impl Iter {
                             &entry.resume.window_prime,
                             self.data_block_restart_interval,
                         )?;
+                        // The block is a gather of the cached prefix's entries.
+                        #[cfg(feature = "metrics")]
+                        if self.charge.is_counted() {
+                            self.metrics.record_gather(block.inner.data.len());
+                        }
                         self.cache.insert_partial_block(
                             self.table_id,
                             offset,
@@ -777,14 +782,28 @@ impl Iter {
         }
         // Cold first touch (carried_resume None) or resume-grow from the cached
         // snapshot — either way only the new tail blocks are decompressed.
-        let (block, covered_upper, payload) = crate::table::lazy_block::partial_data_block(
-            frame.to_vec(),
+        let crate::table::lazy_block::PartialBlock {
+            block,
+            covered_upper,
+            payload,
+            copied,
+        } = crate::table::lazy_block::partial_data_block(
+            frame,
             ends,
             self.data_block_restart_interval,
             &self.comparator,
             upper,
             carried_resume,
         )?;
+        // Every prefix copy and the synthesized block are gathers: a range
+        // that grows across reads re-copies a longer prefix each time, and
+        // this is where that shows.
+        #[cfg(feature = "metrics")]
+        if self.charge.is_counted() {
+            self.metrics.record_gather(copied);
+        }
+        #[cfg(not(feature = "metrics"))]
+        let _ = copied;
         // Only the tail this read decoded: a resumed prefix was charged by the
         // read that decoded it. The prefix only grows across resumes.
         debug_assert!(payload.window_prime.len() >= decoded_before);
