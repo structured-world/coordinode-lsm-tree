@@ -25,7 +25,7 @@ use super::writer::MAX_DECOMPRESSION_SIZE;
 
 /// The exact on-disk span a blob record occupies: header + key + on-disk value.
 ///
-/// One definition shared by the single read in [`Reader::get`] and by the
+/// One definition shared by the single read in [`Reader::read_record`] and by the
 /// prefetcher that coalesces several adjacent records into one read, so the two
 /// can never disagree about where a record ends.
 ///
@@ -83,27 +83,42 @@ impl<'a> Reader<'a> {
         Self { blob_file, file }
     }
 
-    pub fn get(&self, key: &'a [u8], vhandle: &'a ValueHandle) -> crate::Result<UserValue> {
+    /// Reads the raw bytes of one record, exactly [`record_len`] of them from
+    /// `vhandle.offset`, without validating them: the caller parses them with
+    /// [`Self::parse_record`], and can account for the read in between.
+    ///
+    /// # Errors
+    ///
+    /// Returns the [`record_len`] errors and the file's read failures.
+    pub fn read_record(&self, key: &[u8], vhandle: &ValueHandle) -> crate::Result<crate::Slice> {
         debug_assert_eq!(vhandle.blob_file_id, self.blob_file.id());
-
         let read_len = record_len(key.len(), vhandle)?;
-        let record = crate::file::read_exact(self.file, vhandle.offset, read_len)?;
+        Ok(crate::file::read_exact(
+            self.file,
+            vhandle.offset,
+            read_len,
+        )?)
+    }
 
+    /// Reads and parses one record in one call.
+    #[cfg(test)]
+    pub fn get(&self, key: &'a [u8], vhandle: &'a ValueHandle) -> crate::Result<UserValue> {
+        let record = self.read_record(key, vhandle)?;
         self.parse_record(key, vhandle, &record)
     }
 
     /// Parses one blob record out of bytes already read from the file.
     ///
     /// `record` must be exactly the [`record_len`] bytes that start at
-    /// `vhandle.offset`. Splitting this out of [`get`](Self::get) lets a caller
+    /// `vhandle.offset`. Splitting this out of the read lets a caller
     /// that read several adjacent records in ONE read serve each of them from
     /// its slice of that buffer: the validation below is identical either way,
     /// so a prefetched value is byte-for-byte what a direct read would return.
     ///
     /// # Errors
     ///
-    /// Returns the same header / checksum / decompression errors as
-    /// [`get`](Self::get); a caller that prefetched speculatively should treat
+    /// Returns the header / checksum / decompression errors of a malformed
+    /// record; a caller that prefetched speculatively should treat
     /// them as "leave this one to the read path" rather than as fatal.
     #[expect(
         clippy::too_many_lines,

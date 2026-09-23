@@ -1129,7 +1129,7 @@ impl Table {
             self.zstd_dictionary.as_deref(),
         )?;
         let restart = self.metadata.data_block_restart_interval;
-        match self
+        let rebuilt = match self
             .delete_block_starts
             .as_ref()
             .and_then(|starts| starts.get(&handle.offset().0))
@@ -1148,7 +1148,14 @@ impl Table {
             // No materialized deletes (or, unreachably, an unmapped block):
             // reconstruct the whole block.
             None => DataBlock::from_columnar_block(&block.data, restart).map(Some),
+        }?;
+        // The row-major block is re-encoded from the sub-columns: a row-value
+        // reconstruction gather, charged at the size of what it built.
+        #[cfg(feature = "metrics")]
+        if let Some(rebuilt) = &rebuilt {
+            self.metrics.record_gather(rebuilt.inner.data.len());
         }
+        Ok(rebuilt)
     }
 
     /// Loads a columnar data block as a delete-masked
@@ -1205,6 +1212,8 @@ impl Table {
             })
             .collect::<crate::Result<_>>()?;
         let masked = crate::table::columnar_predicate::filter_batch(&batch, &keep);
+        #[cfg(feature = "metrics")]
+        self.metrics.record_gather(masked.data_size());
         if masked.row_count == 0 {
             Ok(None)
         } else {
@@ -1594,13 +1603,19 @@ impl Table {
             .as_ref()
             .and_then(|starts| starts.get(&handle.offset().0))
             .map(|&start| (self.delete_bitmap.as_ref(), start));
-        DataBlock::columnar_point_block(
+        let rebuilt = DataBlock::columnar_point_block(
             &block.data,
             needle,
             &self.comparator,
             self.metadata.data_block_restart_interval,
             deletes,
-        )
+        )?;
+        // Only the needle's rows are rebuilt, so the gather is that small block.
+        #[cfg(feature = "metrics")]
+        if let Some(rebuilt) = &rebuilt {
+            self.metrics.record_gather(rebuilt.inner.data.len());
+        }
+        Ok(rebuilt)
     }
 
     /// Loads the data block to point-read for `needle`: for a columnar SST the
@@ -6960,7 +6975,10 @@ impl Table {
                         }
                     }
                 }
-                crate::table::columnar_predicate::filter_batch(&batch, &keep)
+                let filtered = crate::table::columnar_predicate::filter_batch(&batch, &keep);
+                #[cfg(feature = "metrics")]
+                self.metrics.record_gather(filtered.data_size());
+                filtered
             } else {
                 batch
             };

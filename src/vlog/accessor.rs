@@ -95,13 +95,13 @@ impl<'a> Accessor<'a> {
 
         let reader = Reader::new(blob_file, file.as_ref());
 
-        let value = reader.get(key, vhandle)?;
-        // The same length `Reader::get` just read, recomputed rather than
-        // returned: it is a pure function of the key length and the handle, so
-        // the two cannot disagree, and threading it back out would widen the
-        // reader's signature for one counter.
-        let on_disk = crate::vlog::blob_file::reader::record_len(key.len(), vhandle)?;
-        self.count_read(on_disk, value.len());
+        // Read and parse as two steps so the read is charged the moment it
+        // happens: a record that then fails its checksum or decompression was
+        // still asked of the filesystem, as the prefetch path also counts it.
+        let record = reader.read_record(key, vhandle)?;
+        self.count_read(record.len(), 0);
+        let value = reader.parse_record(key, vhandle, &record)?;
+        self.count_read(0, value.len());
         cache.insert_blob(tree_id, vhandle, key, value.clone());
 
         Ok(Some(value))

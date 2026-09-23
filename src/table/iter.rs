@@ -519,14 +519,24 @@ impl Iter {
                         .get(&handle.offset().0)
                         .map(|&start| (mask, start))
                 });
-                return match masked {
+                let entries = match masked {
                     Some((mask, start)) => {
-                        DataBlock::columnar_block_entries_masked(&raw.data, &mask.bitmap, start)
-                            .map(|opt| opt.map(BlockSource::Columnar))
+                        DataBlock::columnar_block_entries_masked(&raw.data, &mask.bitmap, start)?
                     }
-                    None => DataBlock::columnar_block_entries(&raw.data)
-                        .map(|entries| Some(BlockSource::Columnar(entries))),
+                    None => Some(DataBlock::columnar_block_entries(&raw.data)?),
                 };
+                // Every rebuilt row owns a fresh key and value assembled from
+                // its sub-columns: a row-value reconstruction gather.
+                #[cfg(feature = "metrics")]
+                if let Some(entries) = &entries {
+                    self.metrics.record_gather(
+                        entries
+                            .iter()
+                            .map(|e| e.key.user_key.len() + e.value.len())
+                            .sum(),
+                    );
+                }
+                return Ok(entries.map(BlockSource::Columnar));
             }
             #[cfg(not(feature = "columnar"))]
             {

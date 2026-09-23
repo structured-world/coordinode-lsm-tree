@@ -303,10 +303,7 @@ impl ColumnarScan {
     #[inline]
     fn record_gather(&self, batch: &ColumnBatch) {
         #[cfg(feature = "metrics")]
-        self.metrics.bytes_copied.fetch_add(
-            batch.data_size() as u64,
-            core::sync::atomic::Ordering::Relaxed,
-        );
+        self.metrics.record_gather(batch.data_size());
         #[cfg(not(feature = "metrics"))]
         let _ = batch;
     }
@@ -533,6 +530,7 @@ impl ColumnarScan {
                 mask.push(keep);
             }
             let mut visible = filter_batch(&batch, &mask);
+            self.record_gather(&visible);
             if partial && !seqno_projected {
                 visible.columns.retain(|c| c.column_id != COL_SEQNO);
             }
@@ -709,10 +707,12 @@ impl ColumnarScan {
             }
 
             let mut visible = filter_batch(&batch, &mask);
+            self.record_gather(&visible);
             // The predicate runs on the deduped survivors only (see doc).
             if let Some(pred) = self.predicate.as_ref() {
                 let pred_mask = pred.matching_rows(&visible);
                 visible = filter_batch(&visible, &pred_mask);
+                self.record_gather(&visible);
             }
             // Match the singleton contract: yield exactly the projected columns.
             if !key_projected {

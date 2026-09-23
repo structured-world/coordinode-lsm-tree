@@ -74,9 +74,12 @@ pub struct Metrics {
     ///
     /// The named set, so a new path cannot win by not being instrumented:
     /// column-batch accumulation, batch filtering, row gathering by index,
-    /// and row-value reconstruction from sub-columns. It does NOT count a
+    /// and row-value reconstruction from sub-columns, wherever a read or a
+    /// salvage performs them (single-segment and merged columnar scans, row
+    /// iteration and point reads of a columnar segment). It does NOT count a
     /// block transform's output (that is `block_bytes_decoded`), a write
-    /// path's serialisation, or a move that transfers ownership without
+    /// path's serialisation, the input decoding of compaction and repair
+    /// (maintenance, not reads), or a move that transfers ownership without
     /// duplicating bytes.
     ///
     /// The quantity this exists to expose is quadratic accumulation and
@@ -277,6 +280,14 @@ impl Metrics {
     /// grows with the number of passes rather than with the data.
     pub fn bytes_copied(&self) -> u64 {
         self.bytes_copied.load(Relaxed)
+    }
+
+    /// Charges one gather: `bytes` is the size of the buffer it built. Every
+    /// site in the named set calls this, so the set and its instrumentation
+    /// cannot drift apart one path at a time.
+    #[inline]
+    pub(crate) fn record_gather(&self, bytes: usize) {
+        self.bytes_copied.fetch_add(bytes as u64, Relaxed);
     }
 
     /// Number of data blocks that were accessed.

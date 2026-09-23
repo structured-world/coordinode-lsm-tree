@@ -23,10 +23,13 @@
 
 #![cfg(all(feature = "metrics", feature = "columnar"))]
 
+use lsm_tree::table::columnar::{COL_USER_KEY, COL_VALUE, ColumnBatch};
+use lsm_tree::table::columnar_predicate::ColumnRangePredicate;
 use lsm_tree::{
-    AbstractTree, AnyTree, CompressionType, Config, SeqNo, SequenceNumberCounter,
-    config::CompressionPolicy, get_tmp_folder,
+    AbstractTree, AnyTree, CompressionType, Config, Guard, SeqNo, SequenceNumberCounter, Tree,
+    UserKey, config::CompressionPolicy, get_tmp_folder,
 };
+use tempfile::TempDir;
 use test_log::test;
 
 fn key(i: u32) -> Vec<u8> {
@@ -34,9 +37,9 @@ fn key(i: u32) -> Vec<u8> {
 }
 
 /// A tree of `n` rows with `value_len`-byte values, flushed, under the given
-/// compression. Returns the tree so the caller can read it and inspect the
-/// counters.
-fn filled_tree(n: u32, value_len: usize, compression: CompressionType) -> AnyTree {
+/// compression. The directory comes back with the tree: the caller holds it
+/// for as long as it reads, and dropping it afterwards removes the files.
+fn filled_tree(n: u32, value_len: usize, compression: CompressionType) -> (TempDir, AnyTree) {
     let folder = get_tmp_folder();
     let tree = Config::new(
         folder.path(),
@@ -46,14 +49,46 @@ fn filled_tree(n: u32, value_len: usize, compression: CompressionType) -> AnyTre
     .data_block_compression_policy(CompressionPolicy::all(compression))
     .open()
     .expect("open");
-    // Leak the tempdir with the tree: dropping it here would remove the files
-    // under the open tree, and every assertion below is about reading them.
-    core::mem::forget(folder);
     for i in 0..n {
         tree.insert(key(i), vec![b'v'; value_len], u64::from(i));
     }
     tree.flush_active_memtable(0).expect("flush");
-    tree
+    (folder, tree)
+}
+
+/// A columnar tree holding `n` unique keys in one flushed segment, so every
+/// scan below takes the single-segment path.
+fn columnar_segment(n: u32, value_len: usize) -> (TempDir, Tree) {
+    let folder = get_tmp_folder();
+    let AnyTree::Standard(tree) = Config::new(
+        folder.path(),
+        SequenceNumberCounter::default(),
+        SequenceNumberCounter::default(),
+    )
+    .open()
+    .expect("open") else {
+        panic!("expected a standard tree");
+    };
+    tree.update_runtime_config(|cfg| {
+        cfg.columnar = true;
+        cfg.zone_map = true;
+    })
+    .expect("enable columnar");
+    for i in 0..n {
+        tree.insert(key(i), vec![b'v'; value_len], u64::from(i));
+    }
+    tree.flush_active_memtable(0).expect("flush");
+    (folder, tree)
+}
+
+/// Bytes a caller holds after a scan: every column's data plus its validity
+/// bitmap, the same measure the gather counter charges per built batch.
+fn batch_bytes(batch: &ColumnBatch) -> u64 {
+    batch
+        .columns
+        .iter()
+        .map(|c| (c.data.len() + c.validity.as_ref().map_or(0, Vec::len)) as u64)
+        .sum()
 }
 
 #[test]
@@ -63,7 +98,7 @@ fn a_read_served_from_the_block_cache_counts_no_bytes() {
     // nothing; decoded is what the transform produced, and a cached block is
     // already decoded so no transform runs. A counter that ticked on a cache
     // hit would report a tree that never touches disk as doing I/O.
-    let tree = filled_tree(2_000, 64, CompressionType::None);
+    let (_folder, tree) = filled_tree(2_000, 64, CompressionType::None);
     let m = tree.metrics();
 
     for i in 0..2_000 {
@@ -90,6 +125,7 @@ fn a_read_served_from_the_block_cache_counts_no_bytes() {
 }
 
 #[test]
+#[cfg(feature = "lz4")]
 fn compression_makes_decoded_exceed_read() {
     // The clause that gives the pair its purpose. Read alone cannot tell a
     // 4 KiB block that holds 4 KiB from one that expands to 64 KiB, and it is
@@ -97,7 +133,7 @@ fn compression_makes_decoded_exceed_read() {
     // ratio between the two IS the compression the read paid for.
     let compressible = 4_096_usize;
 
-    let plain = filled_tree(4_000, compressible, CompressionType::None);
+    let (_plain_folder, plain) = filled_tree(4_000, compressible, CompressionType::None);
     for i in 0..4_000 {
         let _ = plain.get(key(i), SeqNo::MAX).expect("get");
     }
@@ -112,7 +148,7 @@ fn compression_makes_decoded_exceed_read() {
          decoded {plain_decoded} > read {plain_read}",
     );
 
-    let lz4 = filled_tree(4_000, compressible, CompressionType::Lz4);
+    let (_lz4_folder, lz4) = filled_tree(4_000, compressible, CompressionType::Lz4);
     for i in 0..4_000 {
         let _ = lz4.get(key(i), SeqNo::MAX).expect("get");
     }
@@ -151,7 +187,6 @@ fn resolving_a_separated_value_counts_the_blob_it_read() {
     .with_kv_separation(Some(Default::default()))
     .open()
     .expect("open");
-    core::mem::forget(folder);
     for i in 0..n {
         tree.insert(key(i), vec![b'v'; value_len], u64::from(i));
     }
@@ -207,13 +242,67 @@ fn resolving_a_separated_value_counts_the_blob_it_read() {
 }
 
 #[test]
+fn a_blob_read_rejected_as_corrupt_still_counts_its_bytes() {
+    // Read is what was asked of the filesystem, and a record that fails its
+    // checksum was asked for all the same. Charging it only after the record
+    // validates would hide exactly the reads a failing disk makes, and would
+    // disagree with the prefetch path, which charges its span before parsing.
+    let folder = get_tmp_folder();
+    let value_len = 8_192;
+    let tree = Config::new(
+        folder.path(),
+        SequenceNumberCounter::default(),
+        SequenceNumberCounter::default(),
+    )
+    .with_kv_separation(Some(Default::default()))
+    .open()
+    .expect("open");
+    // Incompressible, so the record fills most of the blob file and the byte
+    // flipped below lands in its payload rather than in the file's metadata.
+    let mut state = 0x9E37_79B9_u32;
+    let value: Vec<u8> = (0..value_len)
+        .map(|_| {
+            state ^= state << 13;
+            state ^= state >> 17;
+            state ^= state << 5;
+            state.to_le_bytes()[0]
+        })
+        .collect();
+    tree.insert(key(0), value, 0);
+    tree.flush_active_memtable(0).expect("flush");
+
+    // Flip one byte inside the only blob record's payload.
+    let blob_dir = folder.path().join("blobs");
+    let blob_file = std::fs::read_dir(&blob_dir)
+        .expect("blob dir")
+        .map(|e| e.expect("entry").path())
+        .find(|p| p.is_file())
+        .expect("one blob file");
+    let mut bytes = std::fs::read(&blob_file).expect("read blob file");
+    let middle = bytes.len() / 2;
+    bytes[middle] ^= 0xFF;
+    std::fs::write(&blob_file, &bytes).expect("write blob file");
+
+    let m = tree.metrics();
+    let before = m.blob_bytes_read();
+    assert!(
+        tree.get(key(0), SeqNo::MAX).is_err(),
+        "a corrupt blob record must fail the read",
+    );
+    assert!(
+        m.blob_bytes_read() > before,
+        "the corrupt record was read from the filesystem, so read must move",
+    );
+}
+
+#[test]
 fn streaming_a_single_segment_copies_nothing() {
     // The clause: copied counts GATHERS — building a new buffer from bytes
     // that already exist in another. A scan over one segment whose rows are
     // returned untouched builds nothing, so the counter must stay at zero.
     // If it moves here, the path is materialising something it does not need
     // to, which is precisely what the counter exists to expose.
-    let tree = filled_tree(1_000, 32, CompressionType::None);
+    let (_folder, tree) = filled_tree(1_000, 32, CompressionType::None);
     let m = tree.metrics();
     let before = m.bytes_copied();
 
@@ -224,5 +313,108 @@ fn streaming_a_single_segment_copies_nothing() {
         m.bytes_copied(),
         before,
         "a straight range scan gathers nothing and must not move the counter",
+    );
+}
+
+#[test]
+fn a_range_bounded_columnar_scan_of_one_segment_counts_its_filter_gather() {
+    // A bounded range over a single segment masks the rows outside it, which
+    // builds a new batch from the decoded one. That is a gather whether or not
+    // other segments overlap, so it must be charged exactly as the overlapping
+    // merge's filter is; otherwise a singleton layout reports zero copies for
+    // the same work and wins every comparison by not being instrumented.
+    let (_folder, tree) = columnar_segment(1_000, 32);
+    let m = tree.metrics();
+    let before = m.bytes_copied();
+
+    let mut returned = 0;
+    let mut rows = 0;
+    for batch in tree
+        .columnar_scan(
+            &[COL_USER_KEY, COL_VALUE],
+            None,
+            SeqNo::MAX,
+            UserKey::from(key(100))..UserKey::from(key(200)),
+        )
+        .expect("scan")
+    {
+        let batch = batch.expect("batch");
+        rows += batch.row_count;
+        returned += batch_bytes(&batch);
+    }
+    assert_eq!(rows, 100, "the range holds exactly 100 rows");
+
+    // The projection is exactly what the mask needs, so every returned batch
+    // is one the mask built. A block wholly outside the range is masked too and
+    // builds an empty batch (its offset arrays still exist), so the charge may
+    // exceed what came back, never fall short of it.
+    let copied = m.bytes_copied() - before;
+    assert!(
+        copied >= returned,
+        "the range mask built {returned} B of returned batches but charged {copied} B",
+    );
+}
+
+#[test]
+fn reading_rows_from_a_columnar_segment_counts_their_reconstruction() {
+    // A row read of a columnar segment rebuilds each row's key and value from
+    // its sub-columns into new buffers. That reconstruction is the price a
+    // row reader pays for the columnar layout, so leaving it uncharged would
+    // report a columnar tree read row by row as copying nothing at all.
+    let (_folder, tree) = columnar_segment(1_000, 32);
+    let m = tree.metrics();
+
+    let before = m.bytes_copied();
+    let mut row_bytes = 0;
+    for kv in tree.range(key(0)..key(1_000_000), SeqNo::MAX, None) {
+        let (k, v) = kv.into_inner().expect("row");
+        row_bytes += (k.len() + v.len()) as u64;
+    }
+    let scan_copied = m.bytes_copied() - before;
+    assert!(
+        scan_copied >= row_bytes,
+        "rebuilding {row_bytes} B of rows was charged only {scan_copied} B",
+    );
+
+    let before = m.bytes_copied();
+    let got = tree.get(key(7), SeqNo::MAX).expect("get").expect("present");
+    assert_eq!(got.len(), 32, "the point read returns the whole value");
+    assert!(
+        m.bytes_copied() - before >= 32,
+        "a point read rebuilt the value but charged no gather for it",
+    );
+}
+
+#[test]
+fn a_predicate_scan_of_one_segment_counts_its_filter_gather() {
+    // The predicate is pushed into the table scan on the single-segment path,
+    // and the table filters each block into a new batch there. The same
+    // predicate over overlapping segments is charged in the merge; charging
+    // it here too keeps the two layouts comparable.
+    let (_folder, tree) = columnar_segment(1_000, 32);
+    let m = tree.metrics();
+    let before = m.bytes_copied();
+
+    let pred = ColumnRangePredicate {
+        column_id: COL_USER_KEY,
+        lower: Some(key(100)),
+        upper: Some(key(199)),
+    };
+    let mut returned = 0;
+    let mut rows = 0;
+    for batch in tree
+        .columnar_scan(&[COL_USER_KEY, COL_VALUE], Some(&pred), SeqNo::MAX, ..)
+        .expect("scan")
+    {
+        let batch = batch.expect("batch");
+        rows += batch.row_count;
+        returned += batch_bytes(&batch);
+    }
+    assert_eq!(rows, 100, "the predicate selects exactly 100 rows");
+
+    assert_eq!(
+        m.bytes_copied() - before,
+        returned,
+        "the predicate mask built the returned batch, so its bytes are the gather",
     );
 }
