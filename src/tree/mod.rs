@@ -4290,8 +4290,8 @@ impl Tree {
         if config.fs.exists(&config.path.join("version"))? {
             log::error!(
                 "refusing to open: this directory has a `version` marker file, which only the \
-                 retired V1 layout wrote. V5 is the only on-disk format THIS engine decodes, and \
-                 it ships no conversion tooling. If the directory is a V1 database the data is \
+                 retired V1 layout wrote. V6 is the only on-disk format THIS engine decodes, and \
+                 it ships no conversion tooling for V1. If the directory is a V1 database the data is \
                  not lost: open it with the engine that wrote it, or convert it there. If the \
                  file is unrelated to this store, move it aside and retry"
             );
@@ -4310,7 +4310,7 @@ impl Tree {
             // binary; see `is_repairable_open_error`).
             //
             // Literal discriminant: V1 is a retired format and FormatVersion
-            // carries no legacy variants (V5-only contract).
+            // carries no legacy variants (single-format contract).
             return Err(crate::Error::InvalidVersion(1));
         }
 
@@ -4943,7 +4943,7 @@ impl Tree {
             )?;
             let manifest = Manifest::decode_from(&mut archive_reader)?;
 
-            // V5 is the only variant `FormatVersion` can decode to (the
+            // V6 is the only variant `FormatVersion` can decode to (the
             // engine reads exactly one on-disk format, no legacy paths), so
             // anything else already failed above: on its framing if the
             // manifest is not shaped like the current one, on the version
@@ -4951,7 +4951,7 @@ impl Tree {
             // format contract documents — and as the compile-time hook that
             // forces a review of the open path when a new variant is added.
             match manifest.version {
-                FormatVersion::V5 => {}
+                FormatVersion::V6 => {}
             }
 
             let supplied_name = config.comparator.name();

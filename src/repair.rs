@@ -3383,8 +3383,8 @@ impl Config {
     /// held directory lock ([`Error::Locked`](crate::Error::Locked) — the
     /// repair would contend on the same lock), an UNSUPPORTED format version
     /// ([`Error::InvalidVersion`](crate::Error::InvalidVersion) — the store
-    /// needs offline conversion or a matching binary, not a V5-only rebuild
-    /// that would reject every table), a ROUTED tree's
+    /// needs offline conversion or a matching binary, not a rebuild in the
+    /// current format that would reject every table), a ROUTED tree's
     /// [`Error::Unrecoverable`](crate::Error::Unrecoverable) (route
     /// provenance is not persisted, so a missing routed table is
     /// indistinguishable from a route path change or an unmounted tier — a
@@ -3455,10 +3455,10 @@ impl Config {
 ///
 /// Everything else propagates: transient I/O (a retry could still read the
 /// files a repair would rebuild around), a held directory lock (the repair
-/// would contend on the same lock), an UNSUPPORTED format version (a pre-V5
+/// would contend on the same lock), an UNSUPPORTED format version (an older
 /// or future database has no live decoder here — it needs offline conversion
-/// or a matching binary, while the V5-only repair would reject every table
-/// and commit a fresh manifest around nothing), and every CONFIGURATION
+/// or a matching binary, and repair refuses it at the same format gate), and
+/// every CONFIGURATION
 /// mismatch — a wrong comparator, level route, zstd dictionary, a
 /// standard-vs-blob tree-type mismatch ([`crate::Error::TreeTypeMismatch`]),
 /// or an encryption key surfacing as a decrypt failure. Those are reversible by
@@ -3645,6 +3645,11 @@ fn sweep_superseded_by_committed_manifest(
         // operands — where the authoritative manifest would have named which
         // files are live. Propagate for a retry.
         Err(e) if is_environmental(&e) => return Err(e),
+        // A manifest of another format is not damage: it is a store this
+        // engine does not write. Rebuilding it here would convert it silently
+        // and drop what only its manifest holds; the offline converter is
+        // the one path from an older format.
+        Err(e @ crate::Error::InvalidVersion(_)) => return Err(e),
         // A manifest that does not load cleanly is exactly the case repair
         // exists for: nothing committed to consult, the scan rebuilds from
         // everything.

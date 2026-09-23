@@ -16,7 +16,7 @@
 ///
 /// | Concept | Type | Tracks |
 /// |---------|------|--------|
-/// | `FormatVersion` | This enum (V1..V5) | Block / SST on-disk layout |
+/// | `FormatVersion` | This enum (V1..V6) | Block / SST on-disk layout and the version snapshot's records |
 /// | `manifest_layout_version` | `u8` in manifest Footer Block | Manifest file structure (footer fields, TOC encoding, head-mirror geometry) |
 ///
 /// A block format bump does NOT force a manifest layout bump and
@@ -54,34 +54,35 @@
 /// 3. The OTHER layer's value stays unless its layer also changed.
 /// ## Supported versions
 ///
-/// **V5 is the ONLY supported on-disk format.** The engine neither reads
-/// nor migrates pre-V5 layouts: there are no legacy decode paths, no
-/// upgrade tooling, and no backward-compat variations anywhere in the
-/// codebase. Discriminants 1–4 are reserved history: opening a tree that
-/// carries one always fails, at whichever gate notices first, and which error
-/// comes back depends on which that is. A V1 directory is caught by its
-/// `version` marker file in `Tree::open` before any manifest is read. Later
-/// pre-V5 manifests are usually caught earlier still, by the Blocks manifest
-/// reader: their framing is not the one it decodes, so they fail at the
-/// footer rather than at a version field. This `TryFrom` is the gate for the
-/// remaining shape: a manifest that frames like the current one but declares
-/// a version this engine does not write, which fails with
-/// [`crate::Error::InvalidVersion`]. The same single-format rule
-/// applies to every subsidiary format (blob frames, manifest layout): each has
-/// exactly one readable shape, the one the current writer emits.
+/// **V6 is the ONLY supported on-disk format.** The engine neither reads
+/// nor migrates earlier layouts: there are no legacy decode paths and no
+/// backward-compat variations anywhere in the engine. Discriminants 1–5 are
+/// reserved history: opening a tree that carries one always fails, at
+/// whichever gate notices first, and which error comes back depends on which
+/// that is. A V1 directory is caught by its `version` marker file in
+/// `Tree::open` before any manifest is read. Pre-V5 manifests are usually
+/// caught earlier still, by the Blocks manifest reader: their framing is not
+/// the one it decodes, so they fail at the footer rather than at a version
+/// field. This `TryFrom` is the gate for the remaining shape: a manifest that
+/// frames like the current one but declares a version this engine does not
+/// write, a V5 manifest among them, which fails with
+/// [`crate::Error::InvalidVersion`]. The same single-format rule applies to
+/// every subsidiary format (blob frames, manifest layout): each has exactly
+/// one readable shape, the one the current writer emits.
 ///
 /// The retired discriminants are reserved as NUMBERS, not as names: this enum
-/// carries no `V1`–`V4` variants. Keeping them as deprecated stubs would add
-/// four public names that no file can ever decode into and that exist only to
-/// keep a downstream exhaustive `match` compiling — a compatibility shim for a
+/// carries no `V1`–`V5` variants. Keeping them as deprecated stubs would add
+/// public names that no file can ever decode into and that exist only to keep
+/// a downstream exhaustive `match` compiling — a compatibility shim for a
 /// layout the engine deliberately cannot read. A caller matching on this enum
 /// should be matching what the writer emits, and that is one shape.
 ///
-/// This crate offers no upgrade path and plans none: a pre-V5 database is not
-/// adopted, converted or repaired here — it fails at the format gate above and
-/// stays that way. That is a statement about THIS engine, not about the data:
-/// the store is still readable by the engine that wrote it, which is where a
-/// conversion would have to happen.
+/// The engine offers no upgrade path: an earlier database is not adopted or
+/// converted here. `Tree::open` fails at whichever gate above notices first.
+/// `Config::repair` refuses a V5 manifest the same way; an older manifest,
+/// which fails at the footer, is to repair indistinguishable from a damaged
+/// one. A V5 store is converted by the separate offline converter, which
+/// carries the V5 decoder so the engine does not have to.
 ///
 /// What the refusal buys is that recovery, salvage, patrol scrub and verify
 /// have no second layout to reason about: every one of them can assume the
@@ -89,38 +90,25 @@
 /// have to accept.
 #[derive(Copy, Clone, Debug, Eq, PartialEq)]
 pub enum FormatVersion {
-    /// Two on-disk changes shipped together in this format version
-    /// (V5 had not been released when both landed, so they collapse
-    /// into the same version bump):
+    /// The 6.0 layout. Relative to V5, which 5.x releases write:
     ///
-    /// 1. `BuRR` (Bumped Ribbon Retrieval) filter wire format. Filter
-    ///    blocks are no longer Bloom-encoded; the `filter_type` byte +
-    ///    per-layer header layout is documented in
-    ///    `src/table/filter/ribbon/burr/wire.rs`.
+    /// 1. The version snapshot's `tables` section holds one framed record per
+    ///    table, each naming its level and run, and no level, run or table
+    ///    counts. V5 stored a level's run count in a byte and silently
+    ///    truncated it past 255 runs, leaving a written tree unopenable.
     ///
-    /// 2. Per-block transform flags + Page ECC. The self-describing block
-    ///    types (`Meta` / `Manifest` / `ManifestFooter`) carry a
-    ///    `block_flags: u8` byte with the transform-presence bits;
-    ///    `ECC_PARITY` marks that a Reed-Solomon parity trailer follows
-    ///    the XXH3-covered payload (its length is derived from
-    ///    `data_length`, not stored). SST block types (`Data` / `Index` /
-    ///    `Filter` / `RangeTombstone`) keep the compact header WITHOUT this
-    ///    byte: their parity / per-KV-footer presence is a per-SST property
-    ///    read from the table descriptor (`page_ecc` / `kv_checksum_algo`),
-    ///    not a serialized header flag. `KV_CHECKSUM_FOOTER` (set on the
-    ///    self-describing types) marks a per-entry checksum footer.
-    ///    When `Config::page_ecc(false)` (the default) no parity bytes
-    ///    follow; likewise no footer unless per-KV checksums are enabled.
-    ///    The block
-    ///    magic was bumped to `[L,S,M,4]` (was `[L,S,M,3]` on pre-V5
-    ///    versions) so a pre-V5 reader that bypasses the manifest gate
-    ///    fails fast at block header decode rather than misreading the
-    ///    new layout.
+    /// 2. The `BuRR` filter and retrieval-locator sections use the packed
+    ///    `r`-bit solution layout (`src/table/filter/ribbon/burr/wire.rs`).
     ///
-    /// Pre-V5 ↔ V5 incompatibility is enforced primarily by the
-    /// manifest version gate at `Tree::open` (returns
-    /// `InvalidVersion` for anything other than V5).
-    V5 = 5,
+    /// Carried over from V5 unchanged: per-block transform flags and Page ECC
+    /// on the self-describing block types (`Meta` / `Manifest` /
+    /// `ManifestFooter`), the compact header on SST block types, and the
+    /// `[L,S,M,4]` block magic.
+    ///
+    /// V5 ↔ V6 incompatibility is enforced by the manifest version gate, read
+    /// before any section at `Tree::open` and at `Config::repair`, which
+    /// returns `InvalidVersion` for anything other than V6.
+    V6 = 6,
 }
 
 impl core::fmt::Display for FormatVersion {
@@ -132,7 +120,7 @@ impl core::fmt::Display for FormatVersion {
 impl From<FormatVersion> for u8 {
     fn from(value: FormatVersion) -> Self {
         match value {
-            FormatVersion::V5 => 5,
+            FormatVersion::V6 => 6,
         }
     }
 }
@@ -140,13 +128,13 @@ impl From<FormatVersion> for u8 {
 impl TryFrom<u8> for FormatVersion {
     type Error = ();
 
-    /// Only the V5 discriminant decodes. Discriminants 1–4 named retired
-    /// formats no shipped reader supports; they fail here so the manifest
+    /// Only the V6 discriminant decodes. Discriminants 1–5 named retired
+    /// formats this engine does not read; they fail here so the manifest
     /// gate reports `InvalidVersion` instead of any code path pretending
     /// a legacy layout is readable.
     fn try_from(value: u8) -> Result<Self, Self::Error> {
         match value {
-            5 => Ok(Self::V5),
+            6 => Ok(Self::V6),
             _ => Err(()),
         }
     }

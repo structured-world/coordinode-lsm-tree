@@ -121,7 +121,7 @@ impl<'a> Reader<'a> {
         let mut magic = [0u8; 4];
         reader.read_exact(&mut magic)?;
 
-        // Exactly one frame format exists (V5-only on-disk contract): any
+        // Exactly one frame format exists (single-format contract): any
         // other magic — including the retired pre-V5 `b"BLOB"` layout — is
         // corruption or a misdirected handle, never a compat case.
         if magic != BLOB_HEADER_MAGIC {

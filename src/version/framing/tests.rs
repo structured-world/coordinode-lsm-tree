@@ -44,12 +44,7 @@ fn framed_record_checksum_mismatch_detected() {
     let mut cursor = Cursor::new(&bytes);
     let outcome = read_framed_record(&mut cursor, u64::MAX, None, &mut Vec::new()).expect("read");
     match outcome {
-        FramedRecordOutcome::ChecksumMismatch {
-            bytes_consumed,
-            expected,
-            got,
-        } => {
-            assert_eq!(bytes_consumed, (FRAME_HEADER_LEN + payload.len()) as u64);
+        FramedRecordOutcome::ChecksumMismatch { expected, got } => {
             // The header carried the digest of the un-flipped
             // payload; the reader recomputed over the flipped
             // bytes. They must differ — that's the whole point
@@ -80,8 +75,8 @@ fn framed_record_len_exceeding_section_bound_classified_as_tail_truncation() {
     // Header claims a 100-byte payload, but the section says only
     // 8 bytes + 1 remain after `len`. That's "len plausible but
     // payload doesn't fit" — a clean tail truncation, NOT a
-    // forged header. The reader should report TailTruncation so
-    // tolerant modes can keep the prefix; only truly implausible
+    // forged header. The reader should report TailTruncation so a
+    // torn edit-log tail can be told apart; only truly implausible
     // `len` (above MAX_FRAME_PAYLOAD) earns the BadHeader tag.
     let mut bytes = Vec::new();
     bytes.extend_from_slice(&100u32.to_le_bytes());

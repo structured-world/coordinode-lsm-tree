@@ -1135,7 +1135,7 @@ impl Version {
         //
 
         writer.start("format_version")?;
-        writer.write_u8(FormatVersion::V5.into())?;
+        writer.write_u8(FormatVersion::V6.into())?;
 
         writer.start("crate_version")?;
         writer.write_all(env!("CARGO_PKG_VERSION").as_bytes())?;
@@ -1144,11 +1144,10 @@ impl Version {
         writer.write_u8(self.tree_type.into())?;
 
         writer.start("level_count")?;
-        #[expect(
-            clippy::cast_possible_truncation,
-            reason = "level count is bounded by 255"
-        )]
-        writer.write_u8(self.level_count() as u8)?;
+        writer.write_u8(
+            u8::try_from(self.level_count())
+                .map_err(|_| crate::Error::InvalidHeader("level_count exceeds u8"))?,
+        )?;
 
         writer.start("filter_hash_type")?;
         writer.write_u8(u8::from(ChecksumType::Xxh3))?;
@@ -1170,56 +1169,33 @@ impl Version {
         // two so the first iteration doesn't trigger a realloc.
         let mut framing_scratch: Vec<u8> = Vec::with_capacity(64);
 
-        // Per-record framing details live in src/version/framing.rs.
-        // Top-level shape inside the `tables` section after framing:
-        //   level_count: u8
-        //   for each level:
-        //     run_count: u8
-        //     for each run:
-        //       table_count: u32 LE
-        //       for each table:
-        //         FRAMED(table_record_payload)   // 12-byte header + payload
-        //
-        // The level / run / table_count counters stay unframed
-        // because they ARE the section's own structural shape — the
-        // pre-framing readers used them to walk the section and the
-        // framing-aware readers continue to use them the same way.
-        // Only the per-table record bytes (the 33-byte
-        // id+checksum_type+checksum+global_seqno payload) become
-        // framed so PointInTimeRecovery / SkipAnyCorruptedRecords
-        // have exact byte boundaries to skip on.
-
-        // Level count
-        #[expect(
-            clippy::cast_possible_truncation,
-            reason = "there are always less than 256 levels"
-        )]
-        writer.write_u8(self.level_count() as u8)?;
-
-        for level in self.iter_levels() {
-            // Run count
-            #[expect(
-                clippy::cast_possible_truncation,
-                reason = "there are always less than 256 runs"
-            )]
-            writer.write_u8(level.len() as u8)?;
-
-            for run in level.iter() {
-                // Table count
-                #[expect(
-                    clippy::cast_possible_truncation,
-                    reason = "there are always less than 4 billion tables in a run"
-                )]
-                writer.write_u32::<LittleEndian>(run.len() as u32)?;
-
-                // Tables — each one framed.
+        // The number of levels the layout spans, then one framed record per
+        // table, in level, run and position order, each naming its own level
+        // and run; the section holds no run or table counts (see
+        // `recovery::TABLE_ENTRY_PAYLOAD_LEN`).
+        writer.write_u8(
+            u8::try_from(self.level_count())
+                .map_err(|_| crate::Error::InvalidHeader("level_count exceeds u8"))?,
+        )?;
+        for (level_idx, level) in self.iter_levels().enumerate() {
+            let level_no = u8::try_from(level_idx)
+                .map_err(|_| crate::Error::InvalidHeader("tables: level index exceeds u8"))?;
+            for (run_idx, run) in level.iter().enumerate() {
+                let place = recovery::TablePlace {
+                    level: level_no,
+                    run: u32::try_from(run_idx).map_err(|_| {
+                        crate::Error::InvalidHeader("tables: run index exceeds u32")
+                    })?,
+                };
                 for table in run.iter() {
                     framing::write_framed_record(writer, &mut framing_scratch, |payload| {
-                        payload.write_u64::<LittleEndian>(table.id())?;
-                        payload.write_u8(0)?; // Checksum type, 0 = XXH3
-                        payload.write_u128::<LittleEndian>(table.checksum().into_u128())?;
-                        payload.write_u64::<LittleEndian>(table.global_seqno())?;
-                        Ok(())
+                        recovery::encode_table_entry_payload(
+                            payload,
+                            place,
+                            table.id(),
+                            table.checksum(),
+                            table.global_seqno(),
+                        )
                     })?;
                 }
             }

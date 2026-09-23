@@ -350,9 +350,9 @@ fn replay_stops_at_torn_tail_keeping_clean_prefix() {
     e2.append_to(&mut log, &mut scratch).expect("append e2");
     log.truncate(clean_len + 6); // partial third record
 
-    // A writer-incomplete (truncated) tail is rolled back under every mode
-    // except AbsoluteConsistency; TolerateCorruptedTailRecords is the mode
-    // dedicated to exactly this salvage.
+    // A writer-incomplete (truncated) tail is rolled back under
+    // TolerateCorruptedTailRecords, the mode dedicated to exactly this
+    // salvage.
     let replayed = replay_edits(
         &mut &log[..],
         ManifestRecoveryMode::TolerateCorruptedTailRecords,
@@ -362,35 +362,11 @@ fn replay_stops_at_torn_tail_keeping_clean_prefix() {
 }
 
 #[test]
-fn replay_stops_at_bitflipped_record_under_corruption_tolerant_mode() {
-    // A bit-flip in the second record is corruption of committed bytes (a
-    // fully-framed record with a bad checksum), not a writer-incomplete tail.
-    // Only the corruption-tolerant modes (PIT / SkipAny) roll it back.
-    let mut log = Vec::new();
-    let mut scratch = Vec::new();
-    let mut e0 = sample();
-    e0.new_version_id = 1;
-    let mut e1 = sample();
-    e1.new_version_id = 2;
-    e0.append_to(&mut log, &mut scratch).expect("append e0");
-    let after_e0 = log.len();
-    e1.append_to(&mut log, &mut scratch).expect("append e1");
-    // Corrupt a payload byte of the second record (past its framing header).
-    let target = after_e0 + framing::FRAME_HEADER_LEN + 2;
-    log[target] ^= 0xFF;
-
-    let replayed =
-        replay_edits(&mut &log[..], ManifestRecoveryMode::PointInTimeRecovery).expect("replay");
-    assert_eq!(replayed, vec![e0], "PIT drops the corrupted record");
-}
-
-#[test]
 fn bitflipped_tail_aborts_under_tolerate_corrupted_tail() {
-    // The mode distinction the bool collapsed: TolerateCorruptedTailRecords
-    // salvages writer-incomplete tails ONLY, so a fully-framed but bit-rotted
-    // trailing record (corruption of committed bytes) must abort, not roll
-    // back. PIT / SkipAny roll it back (covered above); this guards the
-    // boundary so the two policies never merge again.
+    // TolerateCorruptedTailRecords salvages writer-incomplete tails ONLY: a
+    // fully-framed but bit-rotted record is corruption of committed bytes and
+    // must abort, not roll back. Rolling it back would drop every committed
+    // edit after it too, and the open would delete the tables they added.
     let mut log = Vec::new();
     let mut scratch = Vec::new();
     let mut e0 = sample();

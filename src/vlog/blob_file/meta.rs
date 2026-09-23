@@ -192,7 +192,7 @@ impl Metadata {
                 .ok_or(crate::Error::InvalidHeader("BlobFileMeta"))?
         };
 
-        // Exactly one blob-file format is readable (V5-only on-disk contract):
+        // Exactly one blob-file format is readable (single-format contract):
         // [`META_VERSION`] is what the current writer stamps. Anything else,
         // including the retired version 3, is corruption or an unsupported file,
         // never a compat case. Covered end-to-end by

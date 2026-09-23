@@ -33,8 +33,8 @@ matching entry (and add one for a new subsystem).
 - **SST block headers omit the `block_flags` byte; self-describing blocks carry
   it.** `Data` / `Index` / `Filter` / `RangeTombstone` derive parity / footer
   presence from the per-SST meta descriptor, while `Meta` / `Manifest` /
-  `ManifestFooter` carry an explicit `block_flags` byte (V5 format). The block
-  magic is bumped so a pre-V5 reader rejects V5 blocks at header decode. Enforced
+  `ManifestFooter` carry an explicit `block_flags` byte (since the V5 format). The
+  block magic was bumped so a pre-V5 reader rejects these blocks at header decode. Enforced
   in `src/table/block/header.rs` and the format-version gate.
 
 - **A per-block zone map conservatively bounds its block.** The stored

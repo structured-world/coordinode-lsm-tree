@@ -16,7 +16,8 @@ pub enum Error {
     /// Decompression failed
     Decompress(CompressionType),
 
-    /// Invalid or unparsable data format version
+    /// The store declares an on-disk format version this release does not
+    /// read. The data is not damaged; see the `Display` form for the remedy.
     InvalidVersion(u8),
 
     /// A table carries a `BuRR` filter or locator section in a wire format
@@ -264,14 +265,9 @@ pub enum Error {
     /// [`Error::ChecksumMismatch`] — same XXH3 family but a
     /// different output width (XXH3-64 here vs XXH3-128 for
     /// block-level payloads) on a different layer of the on-disk
-    /// format, with different recovery semantics (manifest framing
-    /// surfaces routed through `ManifestRecoveryMode`; block
-    /// checksums surface via `Error::ChecksumMismatch` for the
-    /// block I/O paths). Strict manifest recovery modes surface
-    /// this so an operator can see the exact 64-bit digests that
-    /// disagreed; `SkipAnyCorruptedRecords` and
-    /// `PointInTimeRecovery` route around the corruption without
-    /// raising it.
+    /// format. Raised in every recovery mode, so an operator sees the
+    /// exact 64-bit digests that disagreed; the remedy is
+    /// [`Config::repair`](crate::Config::repair).
     ManifestFrameChecksumMismatch {
         /// SFA section the corrupt record was found in (e.g.
         /// `"tables"`, `"blob_files"`). Static so this can be
@@ -457,21 +453,18 @@ pub enum Error {
     /// A clean end-of-log is never reported here: a crash exactly at a
     /// record boundary is byte-identical to a pristine close, so that
     /// case is always tolerated. This fires when bytes of a trailing
-    /// record are present but the record fails framing — a
-    /// power-loss-truncated append (only
-    /// [`AbsoluteConsistency`](crate::config::ManifestRecoveryMode::AbsoluteConsistency)
-    /// rejects it; other modes roll it back), or a fully-framed record
-    /// whose checksum doesn't match (bit-rot) / whose header is forged
-    /// (rejected by both `AbsoluteConsistency` and
-    /// [`TolerateCorruptedTailRecords`](crate::config::ManifestRecoveryMode::TolerateCorruptedTailRecords),
-    /// which salvages writer-incomplete tails only; rolled back under
-    /// `PointInTimeRecovery` / `SkipAnyCorruptedRecords`).
+    /// record are present but the record fails framing: a
+    /// power-loss-truncated append (rejected by
+    /// [`AbsoluteConsistency`](crate::config::ManifestRecoveryMode::AbsoluteConsistency),
+    /// rolled back by
+    /// [`TolerateCorruptedTailRecords`](crate::config::ManifestRecoveryMode::TolerateCorruptedTailRecords)),
+    /// or a fully-framed record whose checksum doesn't match (bit-rot) /
+    /// whose header is forged, which every mode rejects.
     ///
-    /// Recover by truncating the torn tail: run
-    /// [`Config::repair`](crate::Config::repair), which rebuilds a clean
-    /// standalone snapshot (dropping the edit log), or re-open under a
-    /// [`ManifestRecoveryMode`](crate::config::ManifestRecoveryMode) that
-    /// tolerates the defect to roll the trailing edit back.
+    /// Recover by running [`Config::repair`](crate::Config::repair), which
+    /// rebuilds a clean standalone snapshot from the table files (dropping
+    /// the edit log). A torn tail alone can instead be rolled back by
+    /// re-opening under `TolerateCorruptedTailRecords`.
     TornManifestEditLog {
         /// The trailing defect detected: `"truncated"` (partial record
         /// from a power-loss-interrupted append), `"checksum-mismatch"`
@@ -533,10 +526,31 @@ pub enum Error {
 
 impl core::fmt::Display for Error {
     fn fmt(&self, f: &mut core::fmt::Formatter<'_>) -> core::fmt::Result {
-        // One variant gets prose rather than its Debug form: it is the only
-        // error whose remedy is a separate tool, and an operator who sees it
-        // needs to be told that rather than left to infer it from a struct
-        // dump. Everything else stays `{self:?}`.
+        // The format refusals get prose rather than their Debug form: their
+        // remedy lies outside this process (a separate tool, or another
+        // release), and an operator who sees one needs to be told that rather
+        // than left to infer it from a struct dump. Everything else stays
+        // `{self:?}`.
+        if let Self::InvalidVersion(found) = self {
+            let current = u8::from(crate::FormatVersion::V6);
+            write!(
+                f,
+                "LsmTreeError: this store is in on-disk format {found}, but this \
+                 release reads only format {current}. ",
+            )?;
+            // Only the format immediately before the current one has a
+            // converter; older and newer stores are read by the release that
+            // wrote them.
+            return if found.checked_add(1) == Some(current) {
+                write!(
+                    f,
+                    "The data is intact: run the offline converter over the store, \
+                     then open it again.",
+                )
+            } else {
+                write!(f, "Open it with the release that wrote it.")
+            };
+        }
         if let Self::UnsupportedFilterFormat { found, expected } = self {
             write!(f, "LsmTreeError: this store's filter sections are in ")?;
             match found {

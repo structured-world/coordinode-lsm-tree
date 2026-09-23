@@ -21,7 +21,7 @@ and cannot recover from.
 | Data block (disk) | Page ECC parity trailer | Bit-rot of the block | yes (SEC-DED / XOR / Reed-Solomon) | off (opt-in) |
 | Data block (disk) | AAD-bound AEAD | Tampering, block-swap, codec/epoch relabel + confidentiality | n/a | off (opt-in) |
 | Manifest | 5-layer hardening (XXH3-128 + ECC + AEAD + footer mirror) | Bit-rot, partial write, file substitution | partial (ECC / mirror) | mirror on, rest opt-in |
-| On open | Manifest recovery modes | Malformed manifest records | salvage prefix (mode-dependent) | `AbsoluteConsistency` |
+| On open | Manifest recovery modes | Malformed manifest records | drops a torn edit-log tail (opt-in) | `AbsoluteConsistency` |
 | Out of band | `verify_integrity`, `patrol_scrub`, `sst-dump verify`, `Config::repair` | Latent corruption anywhere | scrub heals; repair rebuilds manifest | n/a |
 
 The rest of this document details each layer.
@@ -192,42 +192,36 @@ transparently emits / consumes the parity trailer per Block.
 
 ## Manifest recovery modes
 
-`Config::manifest_recovery_mode` controls how the engine reacts to a malformed
-MANIFEST record at `Tree::open` time. Each mode trades a different point on the
-**strictness vs availability** axis; pick the one whose contract matches the
-deployment.
+The manifest has two parts with different failure shapes, and recovery treats
+them differently:
 
-| Mode | Behaviour on corruption | When to use |
-|------|-------------------------|-------------|
-| `AbsoluteConsistency` (default) | Any per-record decode mismatch (bad XXH3, invalid tag, truncated TOC entry, declared-count overrun) aborts the open with the original error. No data is silently dropped. | **Production default.** Surfaces every byte of corruption before the tree comes back online; matches what most workloads actually want. |
-| `TolerateCorruptedTailRecords` | If the iteration over `tables` / `blob_files` runs out of bytes before the declared count is reached (truncated tail), keep everything that decoded cleanly before the cut and emit a `warn!` listing the dropped count. Any mid-record error that is NOT a clean tail truncation (bad checksum, etc.) still aborts. | **Power-loss-at-write-tail salvage.** Use when a crash mid-fsync left the MANIFEST tail incomplete and you'd rather come up with the last consistent prefix than refuse to open. Not a general bit-rot tolerance, only "the writer never finished". |
-| `PointInTimeRecovery` | On the first record-decode mismatch inside the `tables` section, keeps the consistent prefix collected so far (records that decoded cleanly BEFORE the corrupt one in the current run, plus complete earlier runs in the same level, plus complete earlier levels) and drops everything after. "Record-decode mismatch" covers all three failure shapes the per-record loop produces: (a) framing-layer XXH3 mismatch, (b) framing-header structural failure (`len > MAX_FRAME_PAYLOAD`), and (c) payload-decode failure inside an otherwise-framed-OK record (e.g. `InvalidTag` from a corrupt `checksum_type` byte: the framing XXH3 happens to cover the corrupt byte, so the bytes pass the framing layer; the corruption only surfaces at per-entry decode). Analogous treatment on `blob_files`. Tail-truncation is still tolerated like `TolerateCorruptedTailRecords`. | **Post-corruption salvage with LSM invariants intact.** Use when a manifest has acquired real bit-rot (not just a truncated write) and you want the largest internally-consistent prefix the engine can still vouch for; matches RocksDB's `kPointInTimeRecovery` accept-the-prefix rule adapted to the level/run/table nesting. |
-| `SkipAnyCorruptedRecords` | On any per-record decode mismatch (framing-layer XXH3 mismatch, payload-decode failure inside an otherwise-framed-OK record, or framing-header `BadHeader`), logs the skip and advances past the bad record using the framing-supplied length field. If the framing header itself is corrupt (length field outside the legal range, so the next-record boundary cannot be located), the rest of that section is dropped: there's no safe way to find the next record boundary in that case. Symmetric on `tables` and `blob_files`. | **Maximum-availability forensic mode.** Use when you'd rather open the tree with whatever survives than refuse to open at all; pairs with the `repair_db` tooling tracked in [#303](https://github.com/structured-world/coordinode-lsm-tree/issues/303) for the cases where even the surviving records aren't enough. |
+- **The snapshot** (`v{N}`) is written whole, then published by the atomic
+  `CURRENT` rewrite. Every section is one checksummed Block bound to the TOC and
+  to the digest `CURRENT` carries, so a snapshot is either the one the writer
+  published or it is damaged. There is no torn-tail case to tolerate: any decode
+  failure inside a snapshot section fails the open in every mode.
+- **The edit log** is appended to after the snapshot, one framed record
+  (length + XXH3-64) per version edit. A power loss mid-append leaves a record
+  the writer never finished and never acknowledged. A fully framed record whose
+  digest or decode fails is different: it was committed, and its bytes changed
+  afterwards.
 
-When a non-default mode drops records, the recovery path logs `warn!` lines
-describing what was tolerated. Individual table-IDs / blob-file-IDs are NOT
-enumerated because they were never decoded. Warnings fall into two categories:
+`Config::manifest_recovery_mode` decides only what happens to the first shape:
 
-**Per-condition warns** (one warn for each malformed shape encountered, at the point of detection):
+| Mode | Torn edit-log tail | Damaged committed record (snapshot or edit log) |
+|------|--------------------|-------------------------------------------------|
+| `AbsoluteConsistency` (default) | Fails the open with `TornManifestEditLog { kind: "truncated" }` | Fails the open |
+| `TolerateCorruptedTailRecords` | Dropped; the tree opens at the last complete edit | Fails the open |
 
-- `tables` section truncated before the `level_count` byte: tail-tolerant mode produces 0 levels.
-- `tables` declared `table_count` exceeds remaining section payload (count header forged or entries truncated): loop walks bytes-actually-present and stops at the first EOF.
-- `blob_files` section truncated before its count header: 0 blob files.
-- `blob_files` declared count exceeds remaining section capacity: same forged-or-truncated shape, same walk-and-stop fallback.
-- `blob_gc_stats` payload truncated (power-loss between the `blob_files` commit and the `blob_gc_stats` payload landing): tail-tolerant mode produces an empty `FragmentationMap`. GC stats are advisory (fragmentation re-accrues on the next compaction pass), so this is a "rebuild on next pass" outcome, not data loss. This is a single in-place warn with no later summary.
+No mode opens past a damaged committed record. On open the engine deletes every
+table and blob file the recovered manifest does not name, so a mode that dropped
+a committed record would also delete the files that record named: the data it
+described would be lost, not hidden. The files stay on disk until the operator
+decides, and `Config::repair` rebuilds the manifest from them (below).
 
-**Per-section summary warns** (at end of section processing, only if the section actually lost records):
-
-- `tables` section, emitted only when `tables_dropped_to_tail > 0` OR `tables_truncated_headers > 0`. Reports two counters in one line: declared-but-missing table records (count header said N, only K < N records read before EOF, so N-K dropped) and the separate counter for level / run / `table_count` headers cut mid-byte (no records were supposed to be present yet for those levels / runs, so the headers contribute zero to record loss but the levels / runs themselves are absent).
-- `blob_files` section, emitted only when `blob_dropped_to_tail > 0`. Reports the declared-but-missing blob-file records count, analogous to the tables-section record-drop counter. A `blob_files` section whose only damage was a missing count header surfaces the per-condition warn above but does NOT add a summary line.
-
-Operators wanting a per-record audit trail should pair a tail-tolerant open with
-an out-of-band integrity scan (see `verify::verify_integrity` /
-`tools/sst-dump verify`).
-
-For workflows where the MANIFEST is unrecoverable even under the lossy modes, the
-`repair_db` tool ([#303](https://github.com/structured-world/coordinode-lsm-tree/issues/303))
-rebuilds the MANIFEST from the SST files themselves.
+This matches RocksDB and Pebble: both read the MANIFEST with checksums verified
+and fail the open on a corrupt record. RocksDB's `best_efforts_recovery` covers
+missing or truncated files, not a record whose bytes changed.
 
 ## Point-in-time recovery
 
@@ -247,8 +241,8 @@ inspection, or rollback to a known-good point.
   block, check per-block XXH3, exit non-zero on corruption. Pair with
   `tools/sst-dump hex <offset>` to inspect a flagged region.
 - **`Config::repair() -> RepairReport`**: rebuild a missing or corrupt manifest
-  (standard and KV-separated / blob trees) from the on-disk SST files when even
-  the lossy recovery modes cannot open the tree.
+  (standard and KV-separated / blob trees) from the on-disk SST files when the
+  open refuses a damaged manifest.
 - **`salvage::salvage_sst(src, dest, &fs) -> SalvageReport`** (also
   `tools/sst-dump salvage <file> <dest>`): block-granular salvage of a single
   SST. Re-emit every block that passes its checksum (and ECC) into a fresh,

@@ -471,25 +471,20 @@ fn tail_defect_kind(outcome: &framing::FramedRecordOutcome) -> &'static str {
 /// successfully in every mode — otherwise a pristine database would fail to
 /// open.
 ///
-/// For a trailing record with bytes present, the policy follows `mode` and the
-/// kind of defect, mirroring how the snapshot sections route the same
-/// [`ManifestRecoveryMode`](crate::config::ManifestRecoveryMode) variants:
+/// For a record with bytes present, the policy follows the kind of defect:
 ///
 /// - **Truncated tail** (`TailTruncation`): the writer never finished the
 ///   record, so the operation was never acknowledged upward. Rolled back (and
-///   the durable prefix recovered) under every mode except
-///   [`AbsoluteConsistency`](crate::config::ManifestRecoveryMode::AbsoluteConsistency),
-///   which surfaces [`crate::Error::TornManifestEditLog`] so an operator
-///   truncates the tail deliberately (via [`Config::repair`](crate::Config::repair)).
-/// - **Corrupt fully-framed tail** (`ChecksumMismatch` / `BadHeader` /
+///   the durable prefix recovered) under
+///   [`TolerateCorruptedTailRecords`](crate::config::ManifestRecoveryMode::TolerateCorruptedTailRecords);
+///   [`AbsoluteConsistency`](crate::config::ManifestRecoveryMode::AbsoluteConsistency)
+///   surfaces [`crate::Error::TornManifestEditLog`] so an operator resolves it
+///   deliberately (via [`Config::repair`](crate::Config::repair)).
+/// - **Corrupt fully-framed record** (`ChecksumMismatch` / `BadHeader` /
 ///   `LenMismatch`): bit-rot or forgery of already-committed bytes, not an
-///   incomplete write. Rolled back only under the corruption-tolerant modes
-///   ([`PointInTimeRecovery`](crate::config::ManifestRecoveryMode::PointInTimeRecovery)
-///   / [`SkipAnyCorruptedRecords`](crate::config::ManifestRecoveryMode::SkipAnyCorruptedRecords)).
-///   Both [`AbsoluteConsistency`](crate::config::ManifestRecoveryMode::AbsoluteConsistency)
-///   and [`TolerateCorruptedTailRecords`](crate::config::ManifestRecoveryMode::TolerateCorruptedTailRecords)
-///   abort with [`crate::Error::TornManifestEditLog`] — the latter salvages
-///   writer-incomplete tails only, never arbitrary bit-rot.
+///   incomplete write. Surfaces [`crate::Error::TornManifestEditLog`] in every
+///   mode. Rolling it back would drop every committed edit after it too, and
+///   the open would then delete the tables those edits added.
 ///
 /// A record whose framing is `Ok` (full payload + matching checksum) but whose
 /// payload fails to decode is a genuine format error, not power loss, and is
@@ -514,12 +509,6 @@ pub fn replay_edits<R: Read>(
 
     // Only AbsoluteConsistency refuses to roll back a writer-incomplete tail.
     let abort_on_truncation = matches!(mode, ManifestRecoveryMode::AbsoluteConsistency);
-    // Only PIT / SkipAny roll back a fully-framed but corrupt trailing record;
-    // AbsoluteConsistency and TolerateCorruptedTailRecords abort on it.
-    let tolerate_corruption = matches!(
-        mode,
-        ManifestRecoveryMode::PointInTimeRecovery | ManifestRecoveryMode::SkipAnyCorruptedRecords
-    );
 
     // Buffer the reader so a clean record boundary can be detected (empty fill)
     // without consuming bytes from a genuine trailing record.
@@ -537,7 +526,7 @@ pub fn replay_edits<R: Read>(
         match outcome {
             FramedRecordOutcome::Ok => edits.push(VersionEdit::decode_payload(&scratch)?),
             // Writer-incomplete tail (power loss mid-append): unacknowledged, so
-            // tolerant modes drop it; AbsoluteConsistency surfaces it.
+            // TolerateCorruptedTailRecords drops it; AbsoluteConsistency surfaces it.
             FramedRecordOutcome::TailTruncation => {
                 if abort_on_truncation {
                     return Err(crate::Error::TornManifestEditLog { kind: "truncated" });
@@ -545,14 +534,11 @@ pub fn replay_edits<R: Read>(
                 break;
             }
             // Fully-framed but corrupt: bit-rot / forgery of committed bytes.
-            // PIT / SkipAny roll it back; AbsoluteConsistency and
-            // TolerateCorruptedTailRecords (truncation-salvage only) abort.
+            // Refused in every mode; the tables it names stay on disk for
+            // repair.
             FramedRecordOutcome::ChecksumMismatch { .. }
             | FramedRecordOutcome::BadHeader
             | FramedRecordOutcome::LenMismatch { .. } => {
-                if tolerate_corruption {
-                    break;
-                }
                 return Err(crate::Error::TornManifestEditLog {
                     kind: tail_defect_kind(&outcome),
                 });

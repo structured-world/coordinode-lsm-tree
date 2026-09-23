@@ -18,40 +18,70 @@ use alloc::vec::Vec;
 use crate::path::Path;
 
 /// Exact on-disk size of a `tables`-section record payload (post-framing):
-/// `id: u64 (8) | checksum_type: u8 (1) | checksum: u128 (16) | global_seqno: u64 (8)`.
+/// `level: u8 (1) | run: u32 (4) | id: u64 (8) | checksum_type: u8 (1) |
+/// checksum: u128 (16) | global_seqno: u64 (8)`.
 ///
-/// Stored as `u32` because the framing layer's `len` field is `u32`;
-/// pinning at this type avoids cast-truncation lints at every
-/// `read_framed_record` call site. Used as a `usize` length check
-/// inside `decode_table_entry_payload` via the implicit
-/// `u32 -> usize` widening.
-const TABLE_ENTRY_PAYLOAD_LEN: u32 = 8 + 1 + 16 + 8;
+/// Each record says which level and run it belongs to, and the section holds
+/// no run or table counts. The section arrives whole or not at all (it is one checksummed
+/// Block bound to the TOC), so counts would add nothing a reader could check
+/// against the disk; they could only disagree with the records, which is how a
+/// run count once truncated to a byte made a written tree unopenable. `RocksDB`
+/// and Pebble keep a file's level in the file's own manifest record for the
+/// same reason.
+///
+/// Stored as `u32` because the framing layer's `len` field is `u32`.
+const TABLE_ENTRY_PAYLOAD_LEN: u32 = 1 + 4 + 8 + 1 + 16 + 8;
+
+/// Where a table sits in the version: its level, and the ordinal of its run
+/// within that level. Runs are numbered from 0 in the order the level holds
+/// them.
+#[derive(Clone, Copy, Debug, Eq, PartialEq, Ord, PartialOrd)]
+pub struct TablePlace {
+    pub level: u8,
+    pub run: u32,
+}
+
+/// Encodes one `tables`-section record payload; the inverse of
+/// [`decode_table_entry_payload`].
+pub fn encode_table_entry_payload(
+    payload: &mut Vec<u8>,
+    place: TablePlace,
+    id: TableId,
+    checksum: Checksum,
+    global_seqno: SeqNo,
+) -> crate::Result<()> {
+    use crate::io::WriteBytesExt;
+
+    payload.write_u8(place.level)?;
+    payload.write_u32::<LittleEndian>(place.run)?;
+    payload.write_u64::<LittleEndian>(id)?;
+    payload.write_u8(0)?; // Checksum type, 0 = XXH3
+    payload.write_u128::<LittleEndian>(checksum.into_u128())?;
+    payload.write_u64::<LittleEndian>(global_seqno)?;
+    Ok(())
+}
 
 /// Exact on-disk size of a `blob_files`-section record payload (post-framing):
 /// `id: u64 (8) | checksum_type: u8 (1) | checksum: u128 (16)`.
 const BLOB_ENTRY_PAYLOAD_LEN: u32 = 8 + 1 + 16;
 
-/// Decodes a 33-byte table-record payload (post-framing): `id: u64 |
-/// checksum_type: u8 | checksum: u128 | global_seqno: u64`. The
-/// surrounding framing header (length + XXH3-64) is handled by
-/// [`crate::version::framing::read_framed_record`] before this is
-/// called.
+/// Decodes a table-record payload (post-framing) laid out as
+/// [`TABLE_ENTRY_PAYLOAD_LEN`] describes. The surrounding framing header
+/// (length + XXH3-64) is handled by
+/// [`crate::version::framing::read_framed_record`] before this is called.
 ///
 /// Rejects payloads whose length is not exactly
 /// [`TABLE_ENTRY_PAYLOAD_LEN`]. The framing layer already verified
 /// the XXH3-64 over the payload matched the header digest, so any
 /// length mismatch at this point is writer / reader format drift,
-/// not on-disk bit-rot. That makes it categorically different from
-/// the per-record corruption shapes PIT / `SkipAny` route around:
-/// `Error::InvalidHeader` is propagated unconditionally and aborts
-/// recovery in ALL modes, including the tolerant ones — a code
-/// bug surfacing as silently-skipped records would be worse than
-/// a hard fail at open time.
-fn decode_table_entry_payload(payload: &[u8]) -> crate::Result<RecoveredTable> {
+/// not on-disk bit-rot, and it aborts recovery.
+fn decode_table_entry_payload(payload: &[u8]) -> crate::Result<(TablePlace, RecoveredTable)> {
     if payload.len() != TABLE_ENTRY_PAYLOAD_LEN as usize {
         return Err(crate::Error::InvalidHeader("tables record payload length"));
     }
     let mut cursor = crate::io::Cursor::new(payload);
+    let level = cursor.read_u8()?;
+    let run = cursor.read_u32::<LittleEndian>()?;
     let id = cursor.read_u64::<LittleEndian>()?;
     let checksum_type = cursor.read_u8()?;
     if checksum_type != 0 {
@@ -59,11 +89,180 @@ fn decode_table_entry_payload(payload: &[u8]) -> crate::Result<RecoveredTable> {
     }
     let checksum = Checksum::from_raw(cursor.read_u128::<LittleEndian>()?);
     let global_seqno = cursor.read_u64::<LittleEndian>()?;
-    Ok(RecoveredTable {
-        id,
-        checksum,
-        global_seqno,
-    })
+    Ok((
+        TablePlace { level, run },
+        RecoveredTable {
+            id,
+            checksum,
+            global_seqno,
+        },
+    ))
+}
+
+/// Places a decoded table record into `levels`, which the snapshot's level
+/// count has already sized.
+///
+/// Records arrive in the order the writer emits them: by level, then by run,
+/// then by position in the run. A record that names the place of the previous
+/// one joins that run; one that names the next run, or run 0 of a later level,
+/// opens a new run. A skipped run ordinal, a place behind the previous one, or
+/// a level beyond the count is a record no writer produced and is refused.
+fn place_table(
+    levels: &mut [Vec<Vec<RecoveredTable>>],
+    previous: &mut Option<TablePlace>,
+    place: TablePlace,
+    table: RecoveredTable,
+) -> crate::Result<()> {
+    const ERR: crate::Error = crate::Error::InvalidHeader("tables record out of place");
+
+    let level = levels.get_mut(usize::from(place.level)).ok_or(ERR)?;
+    if *previous == Some(place) {
+        level.last_mut().ok_or(ERR)?.push(table);
+        return Ok(());
+    }
+    let follows = match *previous {
+        None => place.run == 0,
+        Some(prev) if prev.level == place.level => Some(place.run) == prev.run.checked_add(1),
+        Some(prev) => prev.level < place.level && place.run == 0,
+    };
+    if !follows {
+        return Err(ERR);
+    }
+    level.push(vec![table]);
+    *previous = Some(place);
+    Ok(())
+}
+
+/// Reads the `tables` section: the number of levels the layout spans (`u8`),
+/// then a sequence of framed records, each naming its own level and run (see
+/// [`TABLE_ENTRY_PAYLOAD_LEN`]), grouped back into that many levels. The level
+/// count is not a count of records, so it cannot disagree with them; it also
+/// keeps the section non-empty for a version without tables, which an
+/// encrypted manifest block requires.
+///
+/// Read strictly, whatever the recovery mode: the section is one checksummed
+/// block bound to the `CURRENT` digest, so it arrives whole, and a record that
+/// does not verify, decode or fall in place is a writer defect or a forgery.
+/// Opening past one would drop tables the manifest committed, and the open
+/// then deletes their files as orphans.
+fn read_tables_section(
+    bytes: Vec<u8>,
+    curr_version_id: VersionId,
+    scratch: &mut Vec<u8>,
+) -> crate::Result<Vec<Vec<Vec<RecoveredTable>>>> {
+    use crate::version::framing::{FRAME_HEADER_LEN, FramedRecordOutcome, read_framed_record};
+
+    let section_len = bytes.len() as u64;
+    let mut reader = crate::io::Cursor::new(bytes);
+    let level_count = reader
+        .read_u8()
+        .map_err(|_| crate::Error::InvalidHeader("tables section level count"))?;
+    let mut consumed: u64 = 1;
+    let mut levels = vec![Vec::new(); usize::from(level_count)];
+    let mut previous = None;
+
+    while consumed < section_len {
+        match read_framed_record(
+            &mut reader,
+            section_len - consumed,
+            Some(TABLE_ENTRY_PAYLOAD_LEN),
+            scratch,
+        )? {
+            FramedRecordOutcome::Ok => {
+                consumed += FRAME_HEADER_LEN as u64 + scratch.len() as u64;
+                let (place, table) = decode_table_entry_payload(scratch)?;
+                place_table(&mut levels, &mut previous, place, table)?;
+            }
+            FramedRecordOutcome::TailTruncation => {
+                return Err(crate::Error::from(crate::io::Error::new(
+                    crate::io::ErrorKind::UnexpectedEof,
+                    "manifest tables record truncated mid-frame",
+                )));
+            }
+            FramedRecordOutcome::ChecksumMismatch { expected, got, .. } => {
+                return Err(crate::Error::ManifestFrameChecksumMismatch {
+                    section: "tables",
+                    expected,
+                    got,
+                });
+            }
+            FramedRecordOutcome::BadHeader => {
+                log::error!(
+                    "manifest tables frame header rejected in version \
+                     #{curr_version_id}: len exceeds MAX_FRAME_PAYLOAD"
+                );
+                return Err(crate::Error::InvalidHeader("manifest tables frame header"));
+            }
+            FramedRecordOutcome::LenMismatch { got, expected } => {
+                log::error!(
+                    "manifest tables frame len mismatch in version #{curr_version_id}: \
+                     declared len={got}, expected {expected}"
+                );
+                return Err(crate::Error::InvalidHeader(
+                    "manifest tables frame len mismatch",
+                ));
+            }
+        }
+    }
+
+    Ok(levels)
+}
+
+/// Reads the `blob_files` section: `count: u32`, then exactly `count` framed
+/// records (see [`decode_blob_entry_payload`]), returned sorted by id. Read
+/// strictly, for the same reason as [`read_tables_section`]: a count the
+/// records do not fill, or bytes left after them, is a writer defect.
+fn read_blob_files_section(
+    bytes: Vec<u8>,
+    curr_version_id: VersionId,
+    scratch: &mut Vec<u8>,
+) -> crate::Result<Vec<(BlobFileId, Checksum)>> {
+    use crate::version::framing::{FRAME_HEADER_LEN, FramedRecordOutcome, read_framed_record};
+
+    const ERR: crate::Error = crate::Error::InvalidHeader("blob_files section");
+    const FRAMED_ENTRY_LEN: u64 = FRAME_HEADER_LEN as u64 + BLOB_ENTRY_PAYLOAD_LEN as u64;
+
+    let section_len = bytes.len() as u64;
+    let mut reader = crate::io::Cursor::new(bytes);
+    let count = reader.read_u32::<LittleEndian>().map_err(|_| ERR)?;
+    // The records are fixed-size, so the section's length says exactly how
+    // many it holds; checked before reserving, so a corrupt count cannot turn
+    // into a huge allocation.
+    if section_len - 4 != u64::from(count) * FRAMED_ENTRY_LEN {
+        return Err(ERR);
+    }
+
+    let mut consumed: u64 = 4;
+    let mut blob_file_ids = Vec::with_capacity(count as usize);
+    for _ in 0..count {
+        match read_framed_record(
+            &mut reader,
+            section_len - consumed,
+            Some(BLOB_ENTRY_PAYLOAD_LEN),
+            scratch,
+        )? {
+            FramedRecordOutcome::Ok => {
+                consumed += FRAMED_ENTRY_LEN;
+                blob_file_ids.push(decode_blob_entry_payload(scratch)?);
+            }
+            FramedRecordOutcome::ChecksumMismatch { expected, got, .. } => {
+                return Err(crate::Error::ManifestFrameChecksumMismatch {
+                    section: "blob_files",
+                    expected,
+                    got,
+                });
+            }
+            FramedRecordOutcome::TailTruncation
+            | FramedRecordOutcome::BadHeader
+            | FramedRecordOutcome::LenMismatch { .. } => {
+                log::error!("manifest blob_files record malformed in version #{curr_version_id}");
+                return Err(ERR);
+            }
+        }
+    }
+
+    blob_file_ids.sort_by_key(|(id, _)| *id);
+    Ok(blob_file_ids)
 }
 
 /// Decodes a 25-byte blob-record payload (post-framing): `id: u64 |
@@ -300,44 +499,6 @@ pub struct RecoveredTable {
     pub global_seqno: SeqNo,
 }
 
-/// Per-section counters tracking how many records were dropped during
-/// tolerant / PIT / `SkipAny` recovery and why. Exposed as part of
-/// [`Recovery`] so operators (and integration tests) can verify the
-/// recovery outcome without parsing log output.
-#[derive(Debug, Default, Clone, Copy, PartialEq, Eq)]
-pub struct RecoveryStats {
-    /// Table records dropped because the writer was cut mid-record /
-    /// mid-run-header / mid-level-header (tail truncation).
-    pub tables_dropped_to_tail: u32,
-    /// Table records dropped because their framing checksum or
-    /// header failed — i.e. real bit-rot inside an otherwise-written
-    /// region (only ever non-zero under `SkipAny` / PIT modes).
-    ///
-    /// This counter is a LOWER BOUND on records actually discarded
-    /// under PIT: when PIT hits a corruption boundary it stops
-    /// reading the current level (and all subsequent levels) without
-    /// parsing their run / table counts, so the records inside those
-    /// abandoned levels are NOT included here. Use this counter as
-    /// "records dropped in parsed runs", not "total records lost".
-    pub tables_dropped_to_corruption: u32,
-    /// Number of level / run / table-count header *fields* truncated
-    /// by tail-cutting (count of EVENTS, not bytes — incremented by
-    /// 1 per truncation regardless of whether the cut-mid field is
-    /// 1 byte (`run_count` u8) or 4 bytes (`table_count` u32)). No
-    /// per-entry bytes are lost when this counter is non-zero — the
-    /// writer didn't even finish writing the count header for the
-    /// level or run, so no records were supposed to be present
-    /// yet. Distinguished from record-drop accounting so the
-    /// summary log can report "K headers truncated" vs "M records
-    /// missing" honestly.
-    pub tables_truncated_headers: u32,
-    /// Blob-file records dropped to tail truncation (analogous to
-    /// [`Self::tables_dropped_to_tail`] for the `blob_files` section).
-    pub blob_dropped_to_tail: u32,
-    /// Blob-file records dropped to per-record corruption.
-    pub blob_dropped_to_corruption: u32,
-}
-
 #[derive(Debug)]
 pub struct Recovery {
     pub tree_type: TreeType,
@@ -382,33 +543,6 @@ pub struct Recovery {
     /// replayed edit that carries the section. Wholesale, like the restriction
     /// sets above: an edit that drops a dictionary has to be able to say so.
     pub dicts: Vec<crate::file::DictId>,
-    /// Per-section counters describing how many records were dropped
-    /// during this recovery. Always zero under
-    /// [`ManifestRecoveryMode::AbsoluteConsistency`] (any corruption
-    /// or truncation aborts before returning a [`Recovery`]).
-    ///
-    /// `#[expect]` would be unfulfilled under `cfg(test)` (the
-    /// in-crate unit tests in `src/version/recovery.rs::tests`
-    /// read this field to assert recovery-mode accounting), and
-    /// `#[allow]` would be noisy in builds where tests are off.
-    /// Gate `#[expect]` to non-test builds: under `cargo test`
-    /// the field IS read by the unit-test module so the lint
-    /// doesn't fire and the expectation isn't attached; under
-    /// `cargo build` the field is unread by in-tree code. The
-    /// `version` module is `mod version` (not pub) at the crate
-    /// root, so this field is not part of the published API
-    /// surface today; it's kept for in-tree telemetry assertions
-    /// and as the canonical site to plumb operator-visible
-    /// recovery counters once a public API is exposed.
-    #[cfg_attr(
-        not(test),
-        expect(
-            dead_code,
-            reason = "in-tree telemetry assertions only; not part \
-                      of the published API surface today"
-        )
-    )]
-    pub stats: RecoveryStats,
 }
 
 impl Recovery {
@@ -511,31 +645,12 @@ impl Recovery {
     }
 }
 
-#[expect(
-    clippy::too_many_lines,
-    reason = "manifest recovery is inherently a long sequential read of multiple SFA \
-              sections; splitting the function would just move the per-mode branching \
-              into helpers without clarifying the flow"
-)]
 pub fn recover(
     folder: &Path,
     fs: &dyn Fs,
     mode: ManifestRecoveryMode,
     encryption: Option<alloc::sync::Arc<dyn crate::encryption::EncryptionProvider>>,
 ) -> crate::Result<Recovery> {
-    // Per-record framing constants used by both the tables and
-    // blob_files sections. Each on-disk record is a
-    // FRAME_HEADER_LEN (12-byte) header followed by a fixed-size
-    // payload (TABLE_ENTRY_PAYLOAD_LEN / BLOB_ENTRY_PAYLOAD_LEN).
-    // Wiring the totals through the existing payload-length
-    // constants keeps the two sites in sync — if a future PR
-    // changes a record's payload shape, only one constant moves.
-    const FRAMED_TABLE_ENTRY_LEN: u64 =
-        crate::version::framing::FRAME_HEADER_LEN as u64 + TABLE_ENTRY_PAYLOAD_LEN as u64;
-    const FRAMED_BLOB_ENTRY_LEN: u64 =
-        crate::version::framing::FRAME_HEADER_LEN as u64 + BLOB_ENTRY_PAYLOAD_LEN as u64;
-    use crate::version::framing::FramedRecordOutcome;
-
     let curr_version_id = get_current_version(folder, fs, encryption.clone())?;
     let version_file_path = folder.join(format!("v{curr_version_id}"));
 
@@ -551,754 +666,45 @@ pub fn recover(
         encryption,
     )?;
 
-    // Mode dispatch flags. The per-section loops below treat these
-    // four modes as three flag combinations:
-    //
-    //   AbsoluteConsistency: every flag false → first decode error
-    //     anywhere in the section aborts the open.
-    //   TolerateCorruptedTailRecords: tolerate_tail = true; the
-    //     ChecksumMismatch / BadHeader paths still abort, only
-    //     truncated tail (`FramedRecordOutcome::TailTruncation`) is
-    //     accepted.
-    //   PointInTimeRecovery: tolerate_tail = true AND pit_prefix = true.
-    //     On ChecksumMismatch / BadHeader, behaves like reaching EOF:
-    //     the in-progress record is dropped, the already-decoded
-    //     records inside the current run / level are preserved (pushed
-    //     before the break), and the rest of the manifest (this run's
-    //     remaining records, subsequent runs in this level, and all
-    //     subsequent levels) is abandoned. The recovered prefix is the
-    //     consistent state up to the last good record-group boundary.
-    //   SkipAnyCorruptedRecords: tolerate_tail = true AND skip_any = true.
-    //     ChecksumMismatch on a single record is logged and skipped;
-    //     reading continues with the next record. BadHeader can no
-    //     longer be skipped surgically (the length field itself is
-    //     suspect, so the byte boundary of the next record is
-    //     unknown) — the rest of the current section is abandoned
-    //     under this mode, same as PIT but scoped to one section.
-    let tolerate_tail = !matches!(mode, ManifestRecoveryMode::AbsoluteConsistency);
-    let pit_prefix = matches!(mode, ManifestRecoveryMode::PointInTimeRecovery);
-    let skip_any = matches!(mode, ManifestRecoveryMode::SkipAnyCorruptedRecords);
+    // The format label comes first: every section below is parsed in the
+    // current layout, so a manifest of another format must be refused as
+    // such, never misread or reported as damage. Every caller shares this
+    // gate, repair included, which would otherwise rebuild an old store in
+    // the current format.
+    let format_version = archive
+        .read_section("format_version")?
+        .first()
+        .copied()
+        .ok_or(crate::Error::InvalidHeader("format_version"))?;
+    crate::FormatVersion::try_from(format_version)
+        .map_err(|()| crate::Error::InvalidVersion(format_version))?;
 
-    // // TODO: vvv move into Version::decode vvv
-    let mut levels = vec![];
-    // Separate counters for the two distinct tail-truncation shapes
-    // so the summary warnings can report them honestly. Header
-    // truncation = "the writer didn't even finish writing the
-    // count/length byte for this level/run/section"; no per-entry
-    // bytes are missing because no entry was supposed to be there
-    // yet. Record truncation = "the count says N, only K < N
-    // complete entries are present", so N-K entries are actually
-    // missing. Conflating them under one counter (the previous
-    // behaviour) overcounted: a manifest cut between two runs
-    // would log "1 table record dropped" when zero records were
-    // lost — only a header byte.
-    // Two separate counters per section: "tail-tolerant"-class
-    // drops vs "skip_any / pit"-class drops. The tail counter
-    // covers the established power-loss-at-write-tail shape;
-    // the corruption counter covers checksum mismatches and
-    // bad framing headers under the new PIT / SkipAny modes.
-    // The post-section summary log surfaces them separately so
-    // operators can tell "writer crashed before fsync" (tail)
-    // apart from "real bit-rot inside a written record"
-    // (corruption).
-    let mut tables_dropped_to_tail: u32 = 0;
-    let mut tables_dropped_to_corruption: u32 = 0;
-    let mut tables_truncated_headers: u32 = 0;
+    // The snapshot's sections are read strictly whatever `mode` says: each is
+    // one checksummed block bound to the CURRENT digest, so it arrives whole,
+    // and a record inside it that does not verify or decode is a writer defect
+    // or a forgery, not a torn write. `mode` governs only the edit log below.
 
-    // Scratch buffer threaded through every `read_framed_record`
-    // call across both the `tables` and `blob_files` sections.
-    // Grows once to the largest record's payload size (33 bytes
-    // for tables, 25 for blob_files) and is reused thereafter, so
-    // per-record heap allocations during recovery are zero after
-    // the initial growth.
+    // Scratch buffer threaded through every `read_framed_record` call across
+    // both the `tables` and `blob_files` sections, so per-record heap
+    // allocations during recovery are zero after the initial growth.
     let mut read_scratch: Vec<u8> = Vec::with_capacity(64);
 
-    {
-        if archive.section("tables").is_none() {
-            log::error!(
-                "tables section not found in version #{curr_version_id} - maybe the file is corrupted?"
-            );
-            return Err(crate::Error::Unrecoverable);
-        }
-        let section_bytes = archive.read_section("tables")?;
-        let section_len: u64 = section_bytes.len() as u64;
-        let mut reader = crate::io::Cursor::new(section_bytes);
+    let levels = read_tables_section(
+        archive.read_section("tables")?,
+        curr_version_id,
+        &mut read_scratch,
+    )?;
 
-        // Wrap the level-count read in tail tolerance too: a manifest
-        // truncated before the first byte of `tables` (or right after
-        // the SFA TOC was committed but before any payload landed)
-        // hits EOF here. Under `TolerateCorruptedTailRecords` that's
-        // legitimate "no tables present" — under `AbsoluteConsistency`
-        // it's still a hard fail.
-        // Track bytes consumed inside this section so the
-        // overflow guard below can compare against bytes ACTUALLY
-        // remaining at the moment of the check, not the loose
-        // section-total bound. With the total bound, a count
-        // forgery that's still <= section_total/entry_size slips
-        // past the guard, enters the loop, hits EOF after the real
-        // records, and gets reclassified as a clean tail truncation
-        // under tolerant mode — operators see no signal that the
-        // count header was corrupt. The tight bound surfaces the
-        // forgery as an explicit "count exceeds remaining" warn
-        // before the loop runs.
-        let mut tables_bytes_consumed: u64 = 0;
-
-        let level_count = match reader.read_u8() {
-            Ok(n) => {
-                tables_bytes_consumed += 1;
-                n
-            }
-            Err(e) if tolerate_tail && e.kind() == crate::io::ErrorKind::UnexpectedEof => {
-                log::warn!(
-                    "tables section truncated before level_count byte in version \
-                     #{curr_version_id}; tail-tolerant mode produces 0 levels"
-                );
-                0
-            }
-            Err(e) => return Err(e.into()),
-        };
-
-        // NOTE: `level_count` is the only unframed byte in the
-        // section, so a single bit flip can silently transform it
-        // into any other u8 value, and tolerant recovery modes
-        // would still produce a `Version` whose `level_count()`
-        // disagrees with the downstream `assert!` in
-        // `src/compaction/leveled/mod.rs`, which now compares
-        // against `config.level_count` rather than the literal
-        // `7`. Recovery still does not validate the recovered
-        // byte against `DEFAULT_LEVEL_COUNT`: fixtures use sub-
-        // default level counts for compact test manifests, so a
-        // strict gate here would force them to pad to the default
-        // level count even when the test only cares about a single
-        // level's worth of records. The downstream assertion fires
-        // only when a real corruption produces a Version whose
-        // count disagrees with the Config the compactor receives.
-
-        'levels: for _ in 0..level_count {
-            let mut level = vec![];
-            let run_count = match reader.read_u8() {
-                Ok(n) => {
-                    tables_bytes_consumed += 1;
-                    n
-                }
-                Err(e) if tolerate_tail && e.kind() == crate::io::ErrorKind::UnexpectedEof => {
-                    // No runs in this level had a chance to start;
-                    // pushing the empty `level` keeps the level slot
-                    // visible to downstream code (instead of silently
-                    // dropping it) and matches the cut-mid-run path
-                    // below. HEADER truncation — no records were
-                    // dropped (none were supposed to be present yet)
-                    // so count separately from record-drops.
-                    tables_truncated_headers += 1;
-                    levels.push(level);
-                    break 'levels;
-                }
-                Err(e) => return Err(e.into()),
-            };
-
-            for _ in 0..run_count {
-                let mut run = vec![];
-                // Records lost to corruption in THIS run (SkipAny
-                // skips, PIT/SkipAny BadHeader drops). Used at
-                // tail-truncation to compute the tail-attributed
-                // miss-count honestly: tail = table_count -
-                // run.len() - corrupted_in_run. Without this, the
-                // already-corruption-counted records get
-                // re-attributed as tail drops in the summary log.
-                let mut corrupted_in_run: u32 = 0;
-                let table_count = match reader.read_u32::<LittleEndian>() {
-                    Ok(n) => {
-                        tables_bytes_consumed += 4;
-                        n
-                    }
-                    Err(e) if tolerate_tail && e.kind() == crate::io::ErrorKind::UnexpectedEof => {
-                        // Push the partial `level` so any fully
-                        // decoded runs earlier in this level survive
-                        // — breaking out of `'levels` without this
-                        // push silently drops the consistent prefix.
-                        // The current `run` is empty (failed at the
-                        // very first byte of its header), nothing to
-                        // push for it. HEADER truncation.
-                        tables_truncated_headers += 1;
-                        levels.push(level);
-                        break 'levels;
-                    }
-                    Err(e) => return Err(e.into()),
-                };
-
-                // Tight-bound check: count * framed_entry_size against
-                // bytes_remaining at the current cursor. Each framed
-                // entry is FRAME_HEADER_LEN (12) + 33 bytes payload =
-                // 45 bytes.
-                //
-                // Under `AbsoluteConsistency` count > remaining is a
-                // hard "count header forged" abort. Under any of the
-                // tolerant modes it warns and lets the loop walk
-                // bytes-actually-present.
-                // Clamp-to-zero: `tables_bytes_consumed <= section_len` by loop
-                // invariant, so this never actually saturates — it guards the
-                // subtraction (clamp is the intended min semantics).
-                let bytes_remaining = section_len.saturating_sub(tables_bytes_consumed);
-                // `table_count` is an untrusted u32; widened to u64 its product
-                // with the 45-byte entry size is at most u32::MAX * 45 < u64::MAX,
-                // so a plain multiply cannot overflow (no need to mask it).
-                if u64::from(table_count) * FRAMED_TABLE_ENTRY_LEN > bytes_remaining {
-                    if tolerate_tail {
-                        log::warn!(
-                            "tables: declared table_count={table_count} exceeds \
-                             remaining section payload ({bytes_remaining} bytes, \
-                             ~{} entries) in version #{curr_version_id}; \
-                             tail-tolerant mode walks bytes-actually-present and \
-                             stops at the first EOF",
-                            bytes_remaining / FRAMED_TABLE_ENTRY_LEN,
-                        );
-                    } else {
-                        return Err(crate::Error::Unrecoverable);
-                    }
-                }
-
-                for _ in 0..table_count {
-                    let remaining = section_len.saturating_sub(tables_bytes_consumed);
-                    // Pin the on-disk `len` to the fixed table-record
-                    // payload size so a corrupted-but-plausible
-                    // `len` cannot mis-align the cursor for the
-                    // next record under SkipAny. read_framed_record
-                    // returns `LenMismatch { got, expected }` for
-                    // `len != expected` (schema drift), which the
-                    // match arm below hard-aborts in EVERY recovery
-                    // mode — distinct from `BadHeader` (truly
-                    // implausible `len > MAX_FRAME_PAYLOAD`) which
-                    // is treated as in-section corruption and
-                    // section-dropped under PIT/SkipAny. The
-                    // scratch buffer is reused across every record
-                    // in this section to keep per-record heap
-                    // allocations at zero.
-                    let outcome = crate::version::framing::read_framed_record(
-                        &mut reader,
-                        remaining,
-                        Some(TABLE_ENTRY_PAYLOAD_LEN),
-                        &mut read_scratch,
-                    )?;
-                    match outcome {
-                        FramedRecordOutcome::Ok => {
-                            tables_bytes_consumed += crate::version::framing::FRAME_HEADER_LEN
-                                as u64
-                                + read_scratch.len() as u64;
-                            // Per-record payload decode can fail even
-                            // when the framing checksum verified — a
-                            // writer-side bug or astronomically-rare
-                            // xxh3 collision could produce frame-
-                            // valid bytes that don't decode as a
-                            // valid record (e.g., InvalidTag on a
-                            // corrupt `checksum_type` byte). Under
-                            // SkipAny/PIT this is treated the same
-                            // as ChecksumMismatch — skip / stop
-                            // respectively — instead of aborting the
-                            // whole recovery via `?`. Under strict
-                            // mode the error propagates as before.
-                            match decode_table_entry_payload(&read_scratch) {
-                                Ok(t) => run.push(t),
-                                Err(e) if skip_any => {
-                                    log::warn!(
-                                        "skip_any: tables record decode failed in version \
-                                         #{curr_version_id}: {e:?}; skipping",
-                                    );
-                                    tables_dropped_to_corruption =
-                                        tables_dropped_to_corruption.saturating_add(1);
-                                    corrupted_in_run = corrupted_in_run.saturating_add(1);
-                                }
-                                Err(e) if pit_prefix => {
-                                    log::warn!(
-                                        "pit: tables record decode failed in version \
-                                         #{curr_version_id}: {e:?}; accepting consistent \
-                                         prefix and dropping the rest of this run + unread \
-                                         levels",
-                                    );
-                                    let recovered = u32::try_from(run.len()).unwrap_or(u32::MAX);
-                                    tables_dropped_to_corruption = tables_dropped_to_corruption
-                                        .saturating_add(table_count.saturating_sub(recovered));
-                                    if !run.is_empty() {
-                                        level.push(run);
-                                    }
-                                    if !level.is_empty() {
-                                        levels.push(level);
-                                    }
-                                    break 'levels;
-                                }
-                                Err(e) => return Err(e),
-                            }
-                        }
-                        FramedRecordOutcome::TailTruncation if tolerate_tail => {
-                            // Subtract BOTH successfully decoded records
-                            // (run.len()) AND already-corrupted ones in
-                            // this run (corrupted_in_run, only ever
-                            // non-zero under SkipAny). Without that,
-                            // skipped records get double-counted as
-                            // tail drops in the summary log.
-                            let recovered = u32::try_from(run.len()).unwrap_or(u32::MAX);
-                            let processed = recovered.saturating_add(corrupted_in_run);
-                            tables_dropped_to_tail = tables_dropped_to_tail
-                                .saturating_add(table_count.saturating_sub(processed));
-                            // Skip empty run / empty level: Version::from_recovery
-                            // requires non-empty runs (Run::new returns None on empty
-                            // input and downstream .expect() panics). When corruption
-                            // hits the FIRST record of a run, `run` is empty here.
-                            if !run.is_empty() {
-                                level.push(run);
-                            }
-                            if !level.is_empty() {
-                                levels.push(level);
-                            }
-                            break 'levels;
-                        }
-                        FramedRecordOutcome::ChecksumMismatch { bytes_consumed, .. }
-                            if skip_any =>
-                        {
-                            // Single bad record under SkipAny: log
-                            // it and continue with the next record.
-                            // The 12-byte header was internally
-                            // consistent (len fits the section), so
-                            // the reader has cleanly advanced past
-                            // exactly this record and the next
-                            // iteration's read lines up on the next
-                            // record's header.
-                            log::warn!(
-                                "skip_any: tables record checksum mismatch \
-                                 ({bytes_consumed} bytes) in version \
-                                 #{curr_version_id}, skipping"
-                            );
-                            tables_bytes_consumed += bytes_consumed;
-                            tables_dropped_to_corruption =
-                                tables_dropped_to_corruption.saturating_add(1);
-                            corrupted_in_run = corrupted_in_run.saturating_add(1);
-                        }
-                        FramedRecordOutcome::ChecksumMismatch { .. } if pit_prefix => {
-                            // PIT: corruption is the boundary. Keep
-                            // the consistent prefix collected so far
-                            // (records before this one in the run +
-                            // any complete earlier runs in this
-                            // level + every earlier level), drop
-                            // everything that follows (the corrupt
-                            // record, the remaining records of this
-                            // run, and every level not yet read).
-                            // Adapts RocksDB kPointInTimeRecovery's
-                            // "accept the consistent prefix" rule
-                            // to the level/run/table nesting.
-                            log::warn!(
-                                "pit: tables record checksum mismatch in version \
-                                 #{curr_version_id}; accepting consistent prefix and \
-                                 dropping the rest of this run + unread levels"
-                            );
-                            let recovered = u32::try_from(run.len()).unwrap_or(u32::MAX);
-                            tables_dropped_to_corruption = tables_dropped_to_corruption
-                                .saturating_add(table_count.saturating_sub(recovered));
-                            // Push the partial run + level so the
-                            // pre-corruption prefix survives in the
-                            // recovered Version. This is the
-                            // accept-the-prefix half of the PIT
-                            // contract — see the ManifestRecoveryMode
-                            // docstring and README for the
-                            // user-visible description. Skip if empty:
-                            // when the corrupt record is the FIRST of
-                            // the run, the pre-corruption prefix here
-                            // is the empty set, and Version::from_recovery
-                            // would panic on Run::new(empty).
-                            if !run.is_empty() {
-                                level.push(run);
-                            }
-                            if !level.is_empty() {
-                                levels.push(level);
-                            }
-                            break 'levels;
-                        }
-                        FramedRecordOutcome::ChecksumMismatch { expected, got, .. } => {
-                            return Err(crate::Error::ManifestFrameChecksumMismatch {
-                                section: "tables",
-                                expected,
-                                got,
-                            });
-                        }
-                        FramedRecordOutcome::BadHeader if skip_any || pit_prefix => {
-                            // Header itself is suspect — cannot find
-                            // the next record boundary. Same fallback
-                            // for both modes: drop the rest of this
-                            // section's records and call it done.
-                            log::warn!(
-                                "tables: corrupted framing header in version \
-                                 #{curr_version_id}; remaining records in this \
-                                 section are unrecoverable"
-                            );
-                            // Same accounting fix as the TailTruncation
-                            // arm: subtract BOTH successfully decoded
-                            // (run.len()) AND already-corrupted records
-                            // in this run (corrupted_in_run, only ever
-                            // non-zero under SkipAny) from the
-                            // tail-attributed count, otherwise skipped
-                            // records get double-counted here.
-                            let recovered = u32::try_from(run.len()).unwrap_or(u32::MAX);
-                            let processed = recovered.saturating_add(corrupted_in_run);
-                            tables_dropped_to_corruption = tables_dropped_to_corruption
-                                .saturating_add(table_count.saturating_sub(processed));
-                            // Skip empty run / level for the same reason
-                            // as the other early-exit arms — see comment
-                            // above on the TailTruncation arm.
-                            if !run.is_empty() {
-                                level.push(run);
-                            }
-                            if !level.is_empty() {
-                                levels.push(level);
-                            }
-                            break 'levels;
-                        }
-                        // Strict mode: distinguish "writer crashed
-                        // mid-record" (TailTruncation → surface as
-                        // the original Io(UnexpectedEof) so
-                        // diagnostics match pre-framing recovery)
-                        // from "header was structurally implausible"
-                        // (BadHeader → Unrecoverable, this is real
-                        // corruption that the operator needs to know
-                        // about as such).
-                        FramedRecordOutcome::TailTruncation => {
-                            return Err(crate::Error::from(crate::io::Error::new(
-                                crate::io::ErrorKind::UnexpectedEof,
-                                "manifest tables record truncated mid-frame",
-                            )));
-                        }
-                        FramedRecordOutcome::BadHeader => {
-                            // Strict mode: the framing header was
-                            // structurally implausible (`len` above
-                            // MAX_FRAME_PAYLOAD). Surface as
-                            // InvalidHeader with a section-tagged
-                            // static string so operators can route
-                            // on the variant payload instead of
-                            // parsing the Display message.
-                            log::error!(
-                                "manifest tables frame header rejected in version \
-                                 #{curr_version_id}: len exceeds MAX_FRAME_PAYLOAD"
-                            );
-                            return Err(crate::Error::InvalidHeader(
-                                "manifest tables frame header",
-                            ));
-                        }
-                        FramedRecordOutcome::LenMismatch { got, expected } => {
-                            // `len` is within the implausibility cap
-                            // but disagrees with the fixed-size
-                            // table-record contract. Could be either
-                            // writer / reader format disagreement
-                            // (schema drift) or corruption of the
-                            // length field that happens to stay
-                            // within MAX_FRAME_PAYLOAD; the reader
-                            // cannot distinguish the two. Hard-abort
-                            // in EVERY mode (including PIT / SkipAny
-                            // / tail-tolerant): tolerant modes are
-                            // for power-loss recovery at the tail,
-                            // not for silently absorbing in-record
-                            // ambiguity, and either underlying cause
-                            // is unrecoverable from here.
-                            log::error!(
-                                "manifest tables frame len mismatch in version \
-                                 #{curr_version_id}: declared len={got}, \
-                                 expected fixed-size TABLE_ENTRY_PAYLOAD_LEN={expected} \
-                                 — schema drift, aborting regardless of recovery mode"
-                            );
-                            return Err(crate::Error::InvalidHeader(
-                                "manifest tables frame len mismatch",
-                            ));
-                        }
-                    }
-                }
-
-                // Guard against empty run: under SkipAnyCorruptedRecords
-                // every record in the run may be ChecksumMismatched and
-                // skipped, leaving run empty. Version::from_recovery
-                // calls Run::new(empty).expect() and panics; drop the
-                // empty run instead.
-                if !run.is_empty() {
-                    level.push(run);
-                }
-            }
-
-            levels.push(level);
-        }
-
-        // Preserve the persisted level_count even if PIT/SkipAny/tail
-        // early-exited before reading every level. Downstream code
-        // (notably compaction/leveled with 'assert! version.level_count()
-        // == 7') reads levels.len() directly; shrinking it would crash
-        // the tree after an otherwise-successful recovery. Pad with
-        // empty Vec<_> so each persisted slot survives as a structural
-        // record. Level::from_runs(empty) is legal.
-        while levels.len() < usize::from(level_count) {
-            levels.push(Vec::new());
-        }
-    }
-
-    if tables_dropped_to_tail > 0
-        || tables_dropped_to_corruption > 0
-        || tables_truncated_headers > 0
-    {
-        log::warn!(
-            "manifest recovery summary for version #{curr_version_id}: \
-             {tables_dropped_to_tail} table record(s) dropped to tail-truncation, \
-             {tables_dropped_to_corruption} dropped to per-record corruption \
-             (skip_any/pit modes), \
-             {tables_truncated_headers} level/run header(s) truncated; \
-             recovered tree may be missing SSTs",
-        );
-    }
-
-    let mut blob_dropped_to_tail: u32 = 0;
-    let mut blob_dropped_to_corruption: u32 = 0;
-    let blob_file_ids = {
-        if archive.section("blob_files").is_none() {
-            log::error!(
-                "blob_files section not found in version #{curr_version_id} - maybe the file is corrupted?"
-            );
-            return Err(crate::Error::Unrecoverable);
-        }
-        let section_bytes = archive.read_section("blob_files")?;
-        let section_len: u64 = section_bytes.len() as u64;
-        let mut reader = crate::io::Cursor::new(section_bytes);
-
-        let blob_file_count = match reader.read_u32::<LittleEndian>() {
-            Ok(n) => n,
-            Err(e) if tolerate_tail && e.kind() == crate::io::ErrorKind::UnexpectedEof => {
-                log::warn!(
-                    "blob_files section truncated before count header in version \
-                     #{curr_version_id}; tail-tolerant mode produces 0 blob files"
-                );
-                0
-            }
-            Err(e) => return Err(e.into()),
-        };
-
-        // Each framed blob entry is FRAME_HEADER_LEN (12) + 25 bytes
-        // payload = 37 bytes. Same forged-vs-truncated dispatch as the
-        // tables-section count check.
-        // Capacity as a DIVISION (count > section/entry), which is overflow-safe
-        // by construction — no multiply to mask. `saturating_sub(4)` clamps to
-        // zero when the section is too short to even hold the count header.
-        let blob_section_capacity = section_len.saturating_sub(4) / FRAMED_BLOB_ENTRY_LEN;
-        if u64::from(blob_file_count) > blob_section_capacity {
-            if tolerate_tail {
-                log::warn!(
-                    "blob_files: declared count={blob_file_count} exceeds section \
-                     capacity (~{blob_section_capacity} entries) in version \
-                     #{curr_version_id}; tail-tolerant mode walks \
-                     bytes-actually-present and stops at the first EOF",
-                );
-            } else {
-                return Err(crate::Error::Unrecoverable);
-            }
-        }
-
-        let cap_hint =
-            usize::try_from(u64::from(blob_file_count).min(blob_section_capacity)).unwrap_or(0);
-        let mut blob_file_ids = Vec::with_capacity(cap_hint);
-        let mut blob_bytes_consumed: u64 = 4; // count u32 already read
-        // Records lost to corruption in the blob_files section
-        // (SkipAny ChecksumMismatch / BadHeader). Used at
-        // TailTruncation to compute the tail-attributed miss-count
-        // honestly: tail = blob_file_count - blob_file_ids.len()
-        // - blob_corrupted. Same accounting fix as the tables section.
-        let mut blob_corrupted: u32 = 0;
-
-        for _ in 0..blob_file_count {
-            let remaining = section_len.saturating_sub(blob_bytes_consumed);
-            // Fixed-length pin on the blob_files record (same
-            // SkipAny resync safety net as the tables section).
-            let outcome = crate::version::framing::read_framed_record(
-                &mut reader,
-                remaining,
-                Some(BLOB_ENTRY_PAYLOAD_LEN),
-                &mut read_scratch,
-            )?;
-            match outcome {
-                FramedRecordOutcome::Ok => {
-                    blob_bytes_consumed += crate::version::framing::FRAME_HEADER_LEN as u64
-                        + read_scratch.len() as u64;
-                    // Same SkipAny/PIT decode-error handling as the
-                    // tables section above — see comment there.
-                    match decode_blob_entry_payload(&read_scratch) {
-                        Ok(entry) => blob_file_ids.push(entry),
-                        Err(e) if skip_any => {
-                            log::warn!(
-                                "skip_any: blob_files record decode failed in version \
-                                 #{curr_version_id}: {e:?}; skipping",
-                            );
-                            blob_dropped_to_corruption =
-                                blob_dropped_to_corruption.saturating_add(1);
-                            blob_corrupted = blob_corrupted.saturating_add(1);
-                        }
-                        Err(e) if pit_prefix => {
-                            log::warn!(
-                                "pit: blob_files record decode failed in version \
-                                 #{curr_version_id}: {e:?}; accepting consistent prefix \
-                                 and dropping the rest of the blob_files section",
-                            );
-                            let recovered = u32::try_from(blob_file_ids.len()).unwrap_or(u32::MAX);
-                            blob_dropped_to_corruption = blob_dropped_to_corruption
-                                .saturating_add(blob_file_count.saturating_sub(recovered));
-                            break;
-                        }
-                        Err(e) => return Err(e),
-                    }
-                }
-                FramedRecordOutcome::TailTruncation if tolerate_tail => {
-                    // Subtract BOTH successfully decoded records AND
-                    // already-corrupted ones from the tail-attributed
-                    // count, otherwise skipped records get
-                    // double-counted as tail drops in the summary log.
-                    let recovered = u32::try_from(blob_file_ids.len()).unwrap_or(u32::MAX);
-                    let processed = recovered.saturating_add(blob_corrupted);
-                    blob_dropped_to_tail = blob_file_count.saturating_sub(processed);
-                    break;
-                }
-                FramedRecordOutcome::ChecksumMismatch { bytes_consumed, .. } if skip_any => {
-                    log::warn!(
-                        "skip_any: blob_files record checksum mismatch \
-                         ({bytes_consumed} bytes) in version \
-                         #{curr_version_id}, skipping"
-                    );
-                    blob_bytes_consumed += bytes_consumed;
-                    blob_dropped_to_corruption = blob_dropped_to_corruption.saturating_add(1);
-                    blob_corrupted = blob_corrupted.saturating_add(1);
-                }
-                FramedRecordOutcome::ChecksumMismatch { .. } if pit_prefix => {
-                    log::warn!(
-                        "pit: blob_files record checksum mismatch in version \
-                         #{curr_version_id}; accepting consistent prefix and \
-                         dropping the rest of the blob_files section"
-                    );
-                    let recovered = u32::try_from(blob_file_ids.len()).unwrap_or(u32::MAX);
-                    blob_dropped_to_corruption = blob_file_count.saturating_sub(recovered);
-                    break;
-                }
-                FramedRecordOutcome::ChecksumMismatch { expected, got, .. } => {
-                    return Err(crate::Error::ManifestFrameChecksumMismatch {
-                        section: "blob_files",
-                        expected,
-                        got,
-                    });
-                }
-                FramedRecordOutcome::BadHeader if skip_any || pit_prefix => {
-                    log::warn!(
-                        "blob_files: corrupted framing header in version \
-                         #{curr_version_id}; remaining records unrecoverable"
-                    );
-                    // Accumulator (saturating_add), NOT overwrite: the
-                    // ChecksumMismatch arm above has already counted
-                    // each skipped record in blob_dropped_to_corruption.
-                    // This branch adds the still-unread tail
-                    // (blob_file_count - processed where processed =
-                    // recovered + blob_corrupted) on top, so total
-                    // becomes (already-counted skips) + (unread tail)
-                    // = blob_file_count - recovered. Previous '='
-                    // assignment dropped the earlier skips' contribution
-                    // — under-reporting multi-corruption cases by K
-                    // when K records skipped earlier in the same
-                    // section before BadHeader fired.
-                    let recovered = u32::try_from(blob_file_ids.len()).unwrap_or(u32::MAX);
-                    let processed = recovered.saturating_add(blob_corrupted);
-                    blob_dropped_to_corruption = blob_dropped_to_corruption
-                        .saturating_add(blob_file_count.saturating_sub(processed));
-                    break;
-                }
-                // Strict mode: same Tail vs BadHeader split as the
-                // tables section above. TailTruncation surfaces as
-                // Io(UnexpectedEof) for diagnostic parity with the
-                // pre-framing reader; BadHeader stays Unrecoverable
-                // because the writer never produces a header above
-                // MAX_FRAME_PAYLOAD on its own.
-                FramedRecordOutcome::TailTruncation => {
-                    return Err(crate::Error::from(crate::io::Error::new(
-                        crate::io::ErrorKind::UnexpectedEof,
-                        "manifest blob_files record truncated mid-frame",
-                    )));
-                }
-                FramedRecordOutcome::BadHeader => {
-                    // Strict mode: same shape as the tables section
-                    // — surface a section-tagged InvalidHeader so
-                    // operators can distinguish a `blob_files`
-                    // frame-header failure from a `tables` one
-                    // without parsing the Display message.
-                    log::error!(
-                        "manifest blob_files frame header rejected in version \
-                         #{curr_version_id}: len exceeds MAX_FRAME_PAYLOAD"
-                    );
-                    return Err(crate::Error::InvalidHeader(
-                        "manifest blob_files frame header",
-                    ));
-                }
-                FramedRecordOutcome::LenMismatch { got, expected } => {
-                    // Schema drift on the blob_files section. Same
-                    // reasoning as the tables section above: the
-                    // bytes on disk are well-formed for SOME schema
-                    // but not the one this binary decodes, so
-                    // tolerant modes MUST NOT mask the mismatch —
-                    // hard-abort regardless of the configured
-                    // ManifestRecoveryMode.
-                    log::error!(
-                        "manifest blob_files frame len mismatch in version \
-                         #{curr_version_id}: declared len={got}, \
-                         expected fixed-size BLOB_ENTRY_PAYLOAD_LEN={expected} \
-                         — schema drift, aborting regardless of recovery mode"
-                    );
-                    return Err(crate::Error::InvalidHeader(
-                        "manifest blob_files frame len mismatch",
-                    ));
-                }
-            }
-        }
-
-        blob_file_ids.sort_by_key(|(id, _)| *id);
-        blob_file_ids
-    };
-
-    if blob_dropped_to_tail > 0 || blob_dropped_to_corruption > 0 {
-        log::warn!(
-            "manifest blob_files recovery summary for version #{curr_version_id}: \
-             {blob_dropped_to_tail} blob-file record(s) dropped to tail-truncation, \
-             {blob_dropped_to_corruption} dropped to per-record corruption \
-             (skip_any/pit modes); recovered tree may be missing blob files",
-        );
-    }
-
+    let blob_file_ids = read_blob_files_section(
+        archive.read_section("blob_files")?,
+        curr_version_id,
+        &mut read_scratch,
+    )?;
     debug_assert!(blob_file_ids.is_sorted_by_key(|(id, _)| id));
 
-    let gc_stats = {
-        if archive.section("blob_gc_stats").is_none() {
-            log::error!(
-                "blob_gc_stats section not found in version #{curr_version_id} - maybe the file is corrupted?"
-            );
-            return Err(crate::Error::Unrecoverable);
-        }
-        let section_bytes = archive.read_section("blob_gc_stats")?;
-        let mut reader = crate::io::Cursor::new(section_bytes);
-
-        // Same tail-tolerance contract as the record-list sections:
-        // a power-loss between the `blob_files` commit and the
-        // `blob_gc_stats` payload landing surfaces as
-        // `UnexpectedEof` inside `FragmentationMap::decode_from`.
-        // Strict mode aborts; tolerant mode warns and uses an empty
-        // FragmentationMap (the GC stats are advisory — fragmentation
-        // re-accrues on subsequent compactions, so dropping them is
-        // a "rebuild on next pass" outcome rather than data loss).
-        match crate::blob_tree::FragmentationMap::decode_from(&mut reader) {
-            Ok(m) => m,
-            Err(crate::Error::Io(e))
-                if tolerate_tail && e.kind() == crate::io::ErrorKind::UnexpectedEof =>
-            {
-                log::warn!(
-                    "blob_gc_stats section truncated in version #{curr_version_id}; \
-                     tail-tolerant mode produces an empty FragmentationMap (GC stats \
-                     will rebuild on the next compaction pass)"
-                );
-                crate::blob_tree::FragmentationMap::default()
-            }
-            Err(e) => return Err(e),
-        }
-    };
+    let gc_stats = crate::blob_tree::FragmentationMap::decode_from(&mut crate::io::Cursor::new(
+        archive.read_section("blob_gc_stats")?,
+    ))?;
 
     // Optional tight-space restrictions section. Absent on versions that never
     // ran tight-space reclaim (→ empty). When present it is read strictly: a
@@ -1362,26 +768,17 @@ pub fn recover(
         blob_restrictions,
         retention_floor,
         dicts,
-        stats: RecoveryStats {
-            tables_dropped_to_tail,
-            tables_dropped_to_corruption,
-            tables_truncated_headers,
-            blob_dropped_to_tail,
-            blob_dropped_to_corruption,
-        },
     };
 
     // Replay the incremental edit log layered on top of the snapshot. The log
     // `edits-{snapshot_id}` holds every VersionEdit appended since the snapshot
     // was written; applying them in order reconstructs the current version.
-    // `replay_log` routes the same `mode` the snapshot sections use: a
-    // writer-incomplete trailing edit is rolled back in every mode except the
-    // default `AbsoluteConsistency` (which surfaces `TornManifestEditLog` so the
-    // operator truncates the tail via repair); a fully-framed but bit-rotted
-    // trailing edit is rolled back only under PIT / SkipAny, and aborts under
-    // AbsoluteConsistency and TolerateCorruptedTailRecords (truncation-salvage
-    // only). A clean end-of-log is always accepted. Each applied edit advances
-    // `recovery.curr_version_id` past the snapshot's id.
+    // A writer-incomplete trailing edit is rolled back under
+    // `TolerateCorruptedTailRecords` and surfaces `TornManifestEditLog` under
+    // the default `AbsoluteConsistency`; a fully-framed edit that does not
+    // verify fails the open in every mode. A clean end-of-log is always
+    // accepted. Each applied edit advances `recovery.curr_version_id` past the
+    // snapshot's id.
     let log_path = folder.join(format!("edits-{curr_version_id}"));
     let edits = super::edit_log::replay_log(fs, &log_path, mode)?;
     if !edits.is_empty() {

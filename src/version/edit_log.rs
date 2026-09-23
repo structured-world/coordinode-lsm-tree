@@ -9,7 +9,8 @@
 //! operation is acknowledged upward (the engine has no WAL — durability of data
 //! lives a layer above, but the manifest is the crash anchor for the LSM's own
 //! structure). On recovery the snapshot is loaded and the log replayed; under
-//! tolerant modes a power-loss-truncated trailing record is dropped, while
+//! `TolerateCorruptedTailRecords` a power-loss-truncated trailing record is
+//! dropped, while
 //! `AbsoluteConsistency` surfaces it for deliberate repair (see [`replay_log`]).
 //!
 //! Rotation (writing a fresh snapshot and starting a new log) is driven by
@@ -64,9 +65,9 @@ pub fn append_edit(
 /// edit list (a snapshot with no edits yet).
 ///
 /// `mode` selects the trailing-record policy (see [`replay_edits`]): a clean
-/// end-of-log is always tolerated, a writer-incomplete tail is rolled back in
-/// every mode except `AbsoluteConsistency`, and a fully-framed corrupt tail is
-/// rolled back only under `PointInTimeRecovery` / `SkipAnyCorruptedRecords`.
+/// end-of-log is always tolerated, a writer-incomplete tail is rolled back
+/// under `TolerateCorruptedTailRecords`, and a fully-framed corrupt record
+/// fails the replay in every mode.
 ///
 /// # Errors
 ///

@@ -435,8 +435,8 @@ impl<'a, I: Iterator<Item = Item>, F: StreamFilter + 'a> CompactionStream<'a, I,
     }
 
     /// Whether a covering tombstone may physically drop what it covers, as
-    /// opposed to only ending a merge chain. See
-    /// [`Self::with_range_tombstone_barriers`].
+    /// opposed to only ending a merge chain; the use is fixed when the
+    /// tombstones are installed through [`Self::with_range_tombstones`].
     fn covered_and_deletable(&mut self, user_key: &[u8], seqno: SeqNo) -> bool {
         self.rt_use == RangeTombstoneUse::Delete
             && self.covered_by_applied_tombstone(user_key, seqno)

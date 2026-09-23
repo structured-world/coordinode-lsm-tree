@@ -13,6 +13,16 @@ fn write_test_manifest(
     comparator_name: Option<&str>,
     fs: &dyn Fs,
 ) -> crate::Result<()> {
+    write_manifest_at_version(path, FormatVersion::V6.into(), comparator_name, fs)
+}
+
+/// As [`write_test_manifest`], declaring `version` in `format_version`.
+fn write_manifest_at_version(
+    path: &Path,
+    version: u8,
+    comparator_name: Option<&str>,
+    fs: &dyn Fs,
+) -> crate::Result<()> {
     let mut writer = ManifestArchiveWriter::create(
         path,
         fs,
@@ -22,7 +32,7 @@ fn write_test_manifest(
     )?;
 
     writer.start("format_version")?;
-    writer.write_u8(FormatVersion::V5.into())?;
+    writer.write_u8(version)?;
 
     writer.start("tree_type")?;
     writer.write_u8(TreeType::Standard.into())?;
@@ -112,7 +122,7 @@ fn manifest_rejects_invalid_utf8_comparator_name() -> crate::Result<()> {
         crate::fs::SyncMode::Normal,
     )?;
     writer.start("format_version")?;
-    writer.write_u8(FormatVersion::V5.into())?;
+    writer.write_u8(FormatVersion::V6.into())?;
     writer.start("tree_type")?;
     writer.write_u8(TreeType::Standard.into())?;
     writer.start("level_count")?;
@@ -147,8 +157,30 @@ fn manifest_memfs_default_comparator() -> crate::Result<()> {
     let manifest = decode_manifest(&path, &fs)?;
     assert_eq!(manifest.comparator_name, "default");
     assert_eq!(manifest.level_count, 7);
-    assert!(matches!(manifest.version, FormatVersion::V5));
+    assert!(matches!(manifest.version, FormatVersion::V6));
     assert!(matches!(manifest.tree_type, TreeType::Standard));
+    Ok(())
+}
+
+/// A manifest written by 5.x declares V5, whose version snapshot this engine
+/// no longer decodes. It must be refused at the version gate, before any
+/// section is interpreted under the V6 layout.
+#[test]
+fn a_v5_manifest_is_refused_at_the_version_gate() -> crate::Result<()> {
+    let fs = MemFs::new();
+    let dir = Path::new("/memfs");
+    fs.create_dir_all(dir)?;
+    let path = dir.join("manifest_v5");
+
+    write_manifest_at_version(&path, 5, None, &fs)?;
+
+    assert!(
+        matches!(
+            decode_manifest(&path, &fs),
+            Err(crate::Error::InvalidVersion(5))
+        ),
+        "a V5 manifest must be refused as an unsupported version",
+    );
     Ok(())
 }
 

@@ -124,12 +124,10 @@ fn clean_log_replays_under_strict() {
 }
 
 #[test]
-fn checksum_mismatch_tail_aborts_under_strict_and_tolerate_tail() {
+fn checksum_mismatch_tail_aborts_in_every_mode() {
     // A fully-framed trailing record whose payload bit-rotted (length and
     // digest intact, bytes flipped) is corruption of committed bytes, not an
-    // unacknowledged write. AbsoluteConsistency AND TolerateCorruptedTailRecords
-    // (writer-incomplete salvage only) must both reject it; only the
-    // corruption-tolerant modes (PIT / SkipAny) drop it.
+    // unacknowledged write, so every mode rejects it.
     let dir = tempfile::tempdir().expect("tempdir");
     let path = dir.path().join("edits-bitrot");
     let mut scratch = Vec::new();
@@ -157,14 +155,6 @@ fn checksum_mismatch_tail_aborts_under_strict_and_tolerate_tail() {
             "expected TornManifestEditLog(checksum-mismatch) under {mode:?}, got {err:?}",
         );
     }
-
-    let replayed = replay_log(&StdFs, &path, ManifestRecoveryMode::PointInTimeRecovery)
-        .expect("PIT drops bit-rotted tail");
-    assert_eq!(
-        replayed,
-        vec![edit(1), edit(2)],
-        "PIT: bit-rotted tail dropped, prefix kept",
-    );
 }
 
 #[test]
