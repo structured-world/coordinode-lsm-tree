@@ -329,8 +329,8 @@ fn replay_recovers_all_durable_edits_in_order() {
     }
     let replayed = replay_edits(
         &mut &log[..],
-        log.len() as u64,
         ManifestRecoveryMode::AbsoluteConsistency,
+        None,
     )
     .expect("replay");
     assert_eq!(replayed, edits, "replay must recover every edit in order");
@@ -359,8 +359,8 @@ fn replay_stops_at_torn_tail_keeping_clean_prefix() {
     // dedicated to exactly this salvage.
     let replayed = replay_edits(
         &mut &log[..],
-        log.len() as u64,
         ManifestRecoveryMode::TolerateCorruptedTailRecords,
+        None,
     )
     .expect("replay");
     assert_eq!(replayed, vec![e0, e1], "torn tail dropped, prefix kept");
@@ -386,8 +386,8 @@ fn replay_stops_at_bitflipped_record_under_corruption_tolerant_mode() {
 
     let replayed = replay_edits(
         &mut &log[..],
-        log.len() as u64,
         ManifestRecoveryMode::PointInTimeRecovery,
+        None,
     )
     .expect("replay");
     assert_eq!(replayed, vec![e0], "PIT drops the corrupted record");
@@ -414,8 +414,8 @@ fn bitflipped_tail_aborts_under_tolerate_corrupted_tail() {
 
     let err = replay_edits(
         &mut &log[..],
-        log.len() as u64,
         ManifestRecoveryMode::TolerateCorruptedTailRecords,
+        None,
     )
     .expect_err("tolerate-tail must reject committed bit-rot");
     assert!(
@@ -431,15 +431,17 @@ fn bitflipped_tail_aborts_under_tolerate_corrupted_tail() {
 
 #[test]
 fn replay_of_empty_log_is_empty() {
-    let replayed =
-        replay_edits(&mut &[][..], 0, ManifestRecoveryMode::AbsoluteConsistency).expect("replay");
+    let replayed = replay_edits(
+        &mut &[][..],
+        ManifestRecoveryMode::AbsoluteConsistency,
+        None,
+    )
+    .expect("replay");
     assert!(replayed.is_empty(), "empty log → no edits");
 }
 
-/// A record past the framing cap replays when all of it is present: that is
-/// how an edit written before its manifest was published arrives.
-#[test]
-fn replay_accepts_a_whole_record_past_the_frame_cap() {
+/// An edit naming more tables than one appended record may hold.
+fn wide_edit() -> VersionEdit {
     let mut e = sample();
     e.new_version_id = 7;
     e.changed_levels = vec![ChangedLevel {
@@ -454,50 +456,94 @@ fn replay_accepts_a_whole_record_past_the_frame_cap() {
             })
             .collect(),
     }];
+    e
+}
+
+/// A bootstrap record past the framing cap replays when the snapshot pins its
+/// length and digest.
+#[test]
+fn replay_accepts_the_pinned_bootstrap_record_past_the_frame_cap() {
+    let e = wide_edit();
     let mut payload = Vec::new();
     e.encode(&mut payload).expect("encode");
     assert!(payload.len() > framing::MAX_FRAME_PAYLOAD as usize);
+    let bootstrap = BootstrapEdit::of(&payload).expect("bootstrap");
     let mut log = Vec::new();
     framing::write_frame_of_any_len(&mut log, &payload).expect("write");
 
     let replayed = replay_edits(
         &mut &log[..],
-        log.len() as u64,
         ManifestRecoveryMode::AbsoluteConsistency,
+        Some(bootstrap),
     )
     .expect("replay");
     assert_eq!(replayed, vec![e]);
 }
 
-/// The same record cut short cannot pass for a torn append: a length past the
-/// cap that the log does not hold is a damaged header in every mode.
+/// The snapshot describes the wide levels empty, so a log without its
+/// bootstrap record would open a tree missing them. Absent, empty, cut short
+/// or replaced, it fails the replay in the most tolerant mode as well.
 #[test]
-fn replay_rejects_a_record_past_the_frame_cap_that_the_log_does_not_hold() {
-    let mut e = sample();
-    e.changed_levels = vec![ChangedLevel {
-        level: 0,
-        runs: (0..4_000)
-            .map(|id| {
-                vec![TableDesc {
-                    id,
-                    checksum: 0,
-                    global_seqno: 0,
-                }]
-            })
-            .collect(),
-    }];
+fn replay_refuses_a_log_without_its_bootstrap_record() {
+    let e = wide_edit();
     let mut payload = Vec::new();
     e.encode(&mut payload).expect("encode");
+    let bootstrap = BootstrapEdit::of(&payload).expect("bootstrap");
+    let mut whole = Vec::new();
+    framing::write_frame_of_any_len(&mut whole, &payload).expect("write");
+
+    let mut cut = whole.clone();
+    cut.truncate(cut.len() - 1);
+    let mut other = Vec::new();
+    let mut scratch = Vec::new();
+    sample()
+        .append_to(&mut other, &mut scratch)
+        .expect("append");
+
+    for (case, log) in [
+        ("empty", Vec::new()),
+        ("cut short", cut),
+        ("another record", other),
+    ] {
+        let err = replay_edits(
+            &mut &log[..],
+            ManifestRecoveryMode::SkipAnyCorruptedRecords,
+            Some(bootstrap),
+        )
+        .expect_err(case);
+        assert!(
+            matches!(
+                err,
+                crate::Error::TornManifestEditLog {
+                    kind: "bootstrap-edit"
+                }
+            ),
+            "{case}: expected TornManifestEditLog(bootstrap-edit), got {err:?}",
+        );
+    }
+}
+
+/// A damaged length field in an ordinary record never sizes a read past the
+/// framing cap, however much of the log remains after it.
+#[test]
+fn a_damaged_length_past_the_cap_is_a_bad_header_even_within_the_log() {
     let mut log = Vec::new();
-    framing::write_frame_of_any_len(&mut log, &payload).expect("write");
-    log.truncate(log.len() - 1);
+    let mut scratch = Vec::new();
+    for i in 0..3_000 {
+        let mut e = sample();
+        e.new_version_id = i;
+        e.append_to(&mut log, &mut scratch).expect("append");
+    }
+    assert!(log.len() > 2 * framing::MAX_FRAME_PAYLOAD as usize);
+    let damaged = framing::MAX_FRAME_PAYLOAD + 1_000;
+    log[..4].copy_from_slice(&damaged.to_le_bytes());
 
     let err = replay_edits(
         &mut &log[..],
-        log.len() as u64,
-        ManifestRecoveryMode::TolerateCorruptedTailRecords,
+        ManifestRecoveryMode::AbsoluteConsistency,
+        None,
     )
-    .expect_err("an oversized record the log does not hold is not a torn tail");
+    .expect_err("a damaged length must not be read");
     assert!(
         matches!(
             err,

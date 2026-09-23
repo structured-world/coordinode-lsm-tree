@@ -460,6 +460,38 @@ impl VersionEdit {
     }
 }
 
+/// The record a snapshot's `edits-{id}` log must begin with: its payload
+/// length and the XXH3-64 of the payload, both recorded in the snapshot's
+/// `bootstrap_edit` section.
+///
+/// A snapshot has one when its version holds a level wider than the snapshot
+/// can count: the snapshot then describes that level empty and this edit
+/// restores it. The pinned length is also what lets this one record exceed
+/// the framing cap without a damaged length field in any other record
+/// sizing an allocation.
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+pub struct BootstrapEdit {
+    /// Payload length of the record.
+    pub len: u32,
+    /// XXH3-64 of the payload.
+    pub digest: u64,
+}
+
+impl BootstrapEdit {
+    /// The bootstrap record for an encoded edit `payload`.
+    ///
+    /// # Errors
+    ///
+    /// [`crate::Error::Unrecoverable`] when the payload does not fit a `u32`
+    /// length.
+    pub fn of(payload: &[u8]) -> crate::Result<Self> {
+        Ok(Self {
+            len: u32::try_from(payload.len()).map_err(|_| crate::Error::Unrecoverable)?,
+            digest: xxhash_rust::xxh3::xxh3_64(payload),
+        })
+    }
+}
+
 /// Maps a non-`Ok` trailing-record outcome to the static `kind` carried by
 /// [`crate::Error::TornManifestEditLog`].
 fn tail_defect_kind(outcome: &framing::FramedRecordOutcome) -> &'static str {
@@ -509,22 +541,23 @@ fn tail_defect_kind(outcome: &framing::FramedRecordOutcome) -> &'static str {
 /// payload fails to decode is a genuine format error, not power loss, and is
 /// surfaced as an error in every mode rather than silently truncating the log.
 ///
-/// `log_len` is the log's size in bytes. It bounds a record longer than the
-/// framing cap: such a record is read only when all of it lies within the log,
-/// so a damaged length field never sizes an allocation past the file.
+/// `bootstrap` is the first record the snapshot says this log holds (see
+/// [`BootstrapEdit`]). It is required in every mode: a log that lacks it, or
+/// whose first record is not exactly it, fails the replay, because the
+/// snapshot alone describes a tree with levels missing and opening it would
+/// orphan their tables.
 ///
 /// # Errors
 ///
 /// Returns an I/O error from `reader`, [`crate::Error::InvalidHeader`] if a
-/// checksum-valid record fails to decode,
+/// checksum-valid record fails to decode, or
 /// [`crate::Error::TornManifestEditLog`] when the trailing record is
 /// torn / bit-rotted / mis-framed and `mode` does not tolerate that defect, or
-/// [`crate::Error::Unrecoverable`] when `reader` holds more than `log_len`
-/// bytes.
+/// when the required bootstrap record is absent or not the one recorded.
 pub fn replay_edits<R: Read>(
     reader: &mut R,
-    log_len: u64,
     mode: crate::config::ManifestRecoveryMode,
+    bootstrap: Option<BootstrapEdit>,
 ) -> crate::Result<Vec<VersionEdit>> {
     use crate::config::ManifestRecoveryMode;
     #[cfg(not(feature = "std"))]
@@ -547,8 +580,23 @@ pub fn replay_edits<R: Read>(
     let mut reader = crate::io::BufReader::new(reader);
     let mut edits = Vec::new();
     let mut scratch = Vec::new();
-    // Bytes of the records read so far, all of which lie within `log_len`.
-    let mut consumed = 0u64;
+
+    if let Some(required) = bootstrap {
+        let outcome = if reader.fill_buf().map_err(crate::Error::from)?.is_empty() {
+            FramedRecordOutcome::TailTruncation
+        } else {
+            framing::read_framed_record(&mut reader, u64::MAX, Some(required.len), &mut scratch)?
+        };
+        if !matches!(outcome, FramedRecordOutcome::Ok)
+            || xxhash_rust::xxh3::xxh3_64(&scratch) != required.digest
+        {
+            return Err(crate::Error::TornManifestEditLog {
+                kind: "bootstrap-edit",
+            });
+        }
+        edits.push(VersionEdit::decode_payload(&scratch)?);
+    }
+
     loop {
         // No bytes left at a record boundary: the normal end of the log. A crash
         // exactly at a boundary is indistinguishable from a pristine close, so
@@ -556,15 +604,9 @@ pub fn replay_edits<R: Read>(
         if reader.fill_buf().map_err(crate::Error::from)?.is_empty() {
             break;
         }
-        let remaining = log_len
-            .checked_sub(consumed)
-            .ok_or(crate::Error::Unrecoverable)?;
-        let outcome = framing::read_framed_record(&mut reader, remaining, None, &mut scratch)?;
+        let outcome = framing::read_framed_record(&mut reader, u64::MAX, None, &mut scratch)?;
         match outcome {
-            FramedRecordOutcome::Ok => {
-                consumed += (framing::FRAME_HEADER_LEN + scratch.len()) as u64;
-                edits.push(VersionEdit::decode_payload(&scratch)?);
-            }
+            FramedRecordOutcome::Ok => edits.push(VersionEdit::decode_payload(&scratch)?),
             // Writer-incomplete tail (power loss mid-append): unacknowledged, so
             // tolerant modes drop it; AbsoluteConsistency surfaces it.
             FramedRecordOutcome::TailTruncation => {

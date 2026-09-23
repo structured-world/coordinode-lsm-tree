@@ -5,7 +5,7 @@ use crate::{
     fs::{Fs, SyncMode},
     manifest_blocks::{current_digest, writer::ManifestArchiveWriter},
     runtime_config::RuntimeConfig,
-    version::{Version, edit_log},
+    version::{Version, edit::BootstrapEdit, edit_log},
 };
 use alloc::sync::Arc;
 
@@ -24,7 +24,9 @@ use crate::path::Path;
 /// A snapshot counts a level's runs in one byte, so a version with a wider
 /// level is written as the part a snapshot holds plus an `edits-{id}` log whose
 /// one record restores the rest; recovery replays it on top as it does any
-/// edit. Both are synced before `CURRENT` names them. Returns the size of the
+/// edit. The snapshot's `bootstrap_edit` section records that record's length
+/// and digest, so recovery requires it instead of opening the tree without the
+/// wide levels. Both are synced before `CURRENT` names them. Returns the size of the
 /// log this leaves for the new generation, `0` when the snapshot holds the
 /// whole version.
 pub fn persist_version(
@@ -62,18 +64,35 @@ pub fn persist_version(
     // Block + size-hint trailer + optional head mirror per the
     // runtime config.
     let base = (!version.fits_snapshot()).then(|| version.snapshot_base());
+    // The edit completing a wide version, encoded before the snapshot so the
+    // snapshot can name it: recovery then refuses a log that lacks it rather
+    // than opening a tree whose wide levels are empty.
+    let bootstrap = match &base {
+        Some(base) => {
+            let mut payload = Vec::new();
+            version.diff(base)?.encode(&mut payload)?;
+            let record = BootstrapEdit::of(&payload)?;
+            Some((payload, record))
+        }
+        None => None,
+    };
     let mut writer = ManifestArchiveWriter::create(&path, fs, runtime, encryption, sync_mode)?;
     base.as_ref()
         .unwrap_or(version)
         .encode_into(&mut writer, comparator_name)?;
+    if let Some((_, record)) = &bootstrap {
+        writer.start("bootstrap_edit")?;
+        writer.write_u32::<LittleEndian>(record.len)?;
+        writer.write_u64::<LittleEndian>(record.digest)?;
+    }
     let footer = writer.finish()?;
 
     // The log recovery replays on top of this snapshot. A file left there
     // under the same id belongs to no generation this one continues, so it
     // is replaced (or removed) before the pointer can make it live.
     let log_path = folder.join(format!("edits-{}", version.id()));
-    let log_bytes = if let Some(base) = &base {
-        edit_log::write_log(fs, &log_path, &version.diff(base)?, sync_mode)?
+    let log_bytes = if let Some((payload, _)) = &bootstrap {
+        edit_log::write_log(fs, &log_path, payload, sync_mode)?
     } else {
         match fs.remove_file(&log_path) {
             Ok(()) => {}

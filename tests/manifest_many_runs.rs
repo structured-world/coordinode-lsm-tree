@@ -150,6 +150,58 @@ fn a_checkpoint_of_a_level_with_more_than_255_runs_opens_with_every_run() -> lsm
     Ok(())
 }
 
+/// The snapshot of a version wider than it can count describes the wide level
+/// empty and relies on its log to restore it. Without that log the tree must
+/// not open: an open would find the level's tables unreferenced and delete
+/// them.
+#[test]
+fn a_wide_snapshot_without_its_log_refuses_to_open_and_keeps_its_tables() -> lsm_tree::Result<()> {
+    let dir = tempfile::tempdir()?;
+    let tree = Config::new(
+        dir.path(),
+        SequenceNumberCounter::default(),
+        SequenceNumberCounter::default(),
+    )
+    .open()?;
+    for i in 0..RUNS {
+        let key = format!("k{i:05}");
+        let seqno = 2 * u64::try_from(i).expect("a run index fits u64");
+        tree.insert(key.as_bytes(), key.as_bytes(), seqno + 1);
+        tree.insert(b"zzz", key.as_bytes(), seqno + 2);
+        tree.flush_active_memtable(seqno + 2)?;
+    }
+    let checkpoint = dir.path().join("checkpoint");
+    tree.create_checkpoint(&checkpoint)?;
+
+    let tables =
+        || -> std::io::Result<usize> { Ok(std::fs::read_dir(checkpoint.join("tables"))?.count()) };
+    let before = tables()?;
+    for entry in std::fs::read_dir(&checkpoint)? {
+        let entry = entry?;
+        if entry.file_name().to_string_lossy().starts_with("edits-") {
+            std::fs::remove_file(entry.path())?;
+        }
+    }
+
+    let opened = Config::new(
+        &checkpoint,
+        SequenceNumberCounter::default(),
+        SequenceNumberCounter::default(),
+    )
+    .open();
+    assert!(
+        matches!(
+            opened,
+            Err(lsm_tree::Error::TornManifestEditLog {
+                kind: "bootstrap-edit"
+            })
+        ),
+        "the open must refuse a snapshot whose required log is gone",
+    );
+    assert_eq!(tables()?, before, "no table may be deleted");
+    Ok(())
+}
+
 /// More tables than one edit-log record can describe: an edit carries every
 /// table of each level it changes, and an appended record holds at most 64 KiB.
 const TABLES: usize = 2_000;

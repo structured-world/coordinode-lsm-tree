@@ -146,10 +146,10 @@ pub fn write_frame<W: Write>(writer: &mut W, payload: &[u8]) -> crate::Result<()
 
 /// Writes `payload` as one framed record whatever its size up to `u32::MAX`.
 ///
-/// Only for a record written before the manifest that reads it is published:
-/// such a record is complete and synced by the time anything reads it, and
-/// [`read_framed_record`] accepts a record past [`MAX_FRAME_PAYLOAD`] only
-/// when all of it is present, so a torn one is never at stake.
+/// Only for the bootstrap edit of a snapshot: it is written and synced before
+/// the manifest that reads it is published, and the snapshot records its
+/// length, so [`read_framed_record`] reads it with that length pinned. No
+/// other record may exceed [`MAX_FRAME_PAYLOAD`].
 ///
 /// # Errors
 ///
@@ -197,8 +197,8 @@ pub enum FramedRecordOutcome {
     },
 
     /// The header's `len` field is truly implausible — exceeds
-    /// [`MAX_FRAME_PAYLOAD`] (64 KiB) for a fixed-size record, or for a
-    /// variable-size one whose bytes are not all present. By the time this variant is
+    /// [`MAX_FRAME_PAYLOAD`] (64 KiB) and is not the length the caller
+    /// pinned. By the time this variant is
     /// returned the reader HAS consumed the 4-byte `len` field; the
     /// digest and payload have not been read. The cursor position
     /// is therefore unaligned with both this record and the next,
@@ -307,21 +307,14 @@ pub fn read_framed_record<R: Read>(
         Err(e) => return Err(e.into()),
     };
 
-    // A `len` past the sanity bound (64 KiB) is a forged header, except for
-    // a variable-size record whose bytes are all present within a known
-    // bound: an edit written with `write_frame_of_any_len` before its
-    // manifest was published. Such a record is read and its checksum decides.
-    // Without a known bound (`u64::MAX`) the length alone would size the
-    // allocation, and a record that does not fit the bytes left keeps the
-    // BadHeader verdict rather than passing for a torn append, which no
-    // record this large can be. By this point the 4 bytes of `len` are
-    // consumed, which is acceptable because a BadHeader signal tells the
-    // caller to surrender per-record granularity for the rest of the section.
-    if len > MAX_FRAME_PAYLOAD
-        && (expected_payload_len.is_some()
-            || remaining_in_section == u64::MAX
-            || u64::from(len) + FRAME_HEADER_LEN as u64 > remaining_in_section)
-    {
+    // A `len` past the sanity bound (64 KiB) is a forged header, unless the
+    // caller pinned exactly that length: the bootstrap edit written with
+    // `write_frame_of_any_len`, whose length the snapshot records. A length
+    // read from the damaged bytes themselves never sizes an allocation past
+    // the cap. By this point the 4 bytes of `len` are consumed, which is
+    // acceptable because a BadHeader signal tells the caller to surrender
+    // per-record granularity for the rest of the section.
+    if len > MAX_FRAME_PAYLOAD && expected_payload_len != Some(len) {
         return Ok(FramedRecordOutcome::BadHeader);
     }
 
