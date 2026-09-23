@@ -411,7 +411,13 @@ impl SuperVersions {
             n
         };
 
-        if log_size < self.log_rotate_bytes {
+        // A version with a level of more than 255 runs cannot be written as a
+        // snapshot: the snapshot stores a level's run count in one byte, so it
+        // would wrap and leave a manifest that no longer opens. The edit log
+        // counts runs in four bytes, so such a transition is appended instead,
+        // past the threshold, and the rotation happens once compaction has
+        // brought every level back within a byte.
+        if log_size < self.log_rotate_bytes || !next.fits_snapshot() {
             // Common path: append the delta and fsync. No snapshot rewrite.
             let edit = next.diff(prior)?;
             match edit_log::append_edit(

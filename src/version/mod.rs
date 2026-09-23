@@ -1118,6 +1118,13 @@ impl Version {
 }
 
 impl Version {
+    /// Whether this version can be written as a snapshot: the `tables`
+    /// section stores each level's run count in one byte.
+    pub(crate) fn fits_snapshot(&self) -> bool {
+        self.iter_levels()
+            .all(|level| u8::try_from(level.run_count()).is_ok())
+    }
+
     pub(crate) fn encode_into(
         &self,
         writer: &mut crate::manifest_blocks::writer::ManifestArchiveWriter,
@@ -1197,12 +1204,16 @@ impl Version {
         writer.write_u8(self.level_count() as u8)?;
 
         for level in self.iter_levels() {
-            // Run count
-            #[expect(
-                clippy::cast_possible_truncation,
-                reason = "there are always less than 256 runs"
-            )]
-            writer.write_u8(level.len() as u8)?;
+            // Nothing bounds a level's run count, and a wrapped count leaves a
+            // snapshot that no longer opens, so refuse rather than truncate.
+            // The caller defers rotation while `fits_snapshot` is false.
+            let run_count = u8::try_from(level.len()).map_err(|_| {
+                crate::Error::from(crate::io::Error::new(
+                    crate::io::ErrorKind::InvalidInput,
+                    "a level holds more runs than a manifest snapshot can record",
+                ))
+            })?;
+            writer.write_u8(run_count)?;
 
             for run in level.iter() {
                 // Table count
