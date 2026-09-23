@@ -618,7 +618,12 @@ fn create_bounded_compaction_stream<'a>(
     for run in version.iter_levels().flat_map(|lvl| lvl.iter()) {
         for table in run.iter().filter(|x| to_compact.contains(&x.metadata.id)) {
             found += 1;
-            readers.push(Box::new(table.range(bounds.clone())));
+            // Compaction input is maintenance, not a read a caller made, so
+            // it stays out of the read counters like the serial scanner's.
+            let reader = table.range_iter(bounds.clone());
+            #[cfg(feature = "metrics")]
+            let reader = reader.uncounted();
+            readers.push(Box::new(reader));
         }
     }
 

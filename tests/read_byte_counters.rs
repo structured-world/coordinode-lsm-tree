@@ -918,6 +918,62 @@ fn a_compaction_counts_nothing_it_reads_or_opens() -> lsm_tree::Result<()> {
 }
 
 #[test]
+fn a_parallel_sub_compaction_counts_nothing_it_reads() -> lsm_tree::Result<()> {
+    // A compaction split across threads reads each input through a key-bounded
+    // table iterator rather than the serial scanner. It is the same maintenance
+    // either way, so the read counters must not move for it.
+    let folder = get_tmp_folder();
+    let tree = Config::new(
+        folder.path(),
+        SequenceNumberCounter::default(),
+        SequenceNumberCounter::default(),
+    )
+    .data_block_size_policy(lsm_tree::config::BlockSizePolicy::all(512))
+    .compaction_threads(4)
+    .subcompaction_min_bytes(0)
+    .open()?;
+
+    let n = 2_000;
+    // A bottom level of several tables, the boundaries the split follows.
+    for i in 0..n {
+        tree.insert(key(i), vec![b'a'; 64], u64::from(i));
+    }
+    tree.flush_active_memtable(0)?;
+    tree.major_compact(4_096, 0)?;
+    let bottom_tables = tree.table_count();
+    assert!(bottom_tables > 1, "the split needs several bottom tables");
+
+    for i in 0..n {
+        tree.insert(key(i), vec![b'b'; 64], u64::from(n + i));
+    }
+    tree.flush_active_memtable(0)?;
+
+    let m = tree.metrics();
+    let (read, decoded, copied) = (m.bytes_read(), m.bytes_decoded(), m.bytes_copied());
+    tree.major_compact(u64::MAX, 0)?;
+    assert!(
+        tree.table_count() > 1,
+        "the compaction must have split for the bounded path to run",
+    );
+    assert_eq!(
+        m.bytes_read(),
+        read,
+        "the sub-compactions' reads were counted"
+    );
+    assert_eq!(
+        m.bytes_decoded(),
+        decoded,
+        "the sub-compactions' decoding was counted"
+    );
+    assert_eq!(
+        m.bytes_copied(),
+        copied,
+        "the sub-compactions' copies were counted"
+    );
+    Ok(())
+}
+
+#[test]
 fn a_compaction_writing_a_delete_bitmap_counts_nothing_it_opens() -> lsm_tree::Result<()> {
     // Opening a columnar table whose rows carry a positional delete bitmap
     // walks its index a second time, to map each data block to its first row.

@@ -471,6 +471,17 @@ impl Iter {
         }
     }
 
+    /// Detaches this iterator, and the index walk inside it, from the tree's
+    /// metrics: for maintenance such as a sub-compaction's input, which is not
+    /// a read a caller made.
+    #[cfg(feature = "metrics")]
+    #[must_use]
+    pub(crate) fn uncounted(mut self) -> Self {
+        self.metrics = Arc::new(Metrics::default());
+        self.index_iter = self.index_iter.uncounted();
+        self
+    }
+
     /// Loads and resolves a data block by handle, dispatching on the SST layout:
     /// a columnar SST's block is read as `BlockType::Columnar` and reconstructed
     /// into a row-major block; a row SST's block is loaded directly. The
