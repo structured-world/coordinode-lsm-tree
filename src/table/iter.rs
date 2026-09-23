@@ -519,23 +519,19 @@ impl Iter {
                         .get(&handle.offset().0)
                         .map(|&start| (mask, start))
                 });
-                let entries = match masked {
-                    Some((mask, start)) => {
-                        DataBlock::columnar_block_entries_masked(&raw.data, &mask.bitmap, start)?
-                    }
-                    None => Some(DataBlock::columnar_block_entries(&raw.data)?),
+                let (entries, rebuilt) = if let Some((mask, start)) = masked {
+                    DataBlock::columnar_block_entries_masked(&raw.data, &mask.bitmap, start)?
+                } else {
+                    let (entries, rebuilt) = DataBlock::columnar_block_entries(&raw.data)?;
+                    (Some(entries), rebuilt)
                 };
-                // Every rebuilt row owns a fresh key and value assembled from
-                // its sub-columns: a row-value reconstruction gather.
+                // Keys, and values of a single bytes column, are views into the
+                // decoded columns and cost nothing here; only values rebuilt
+                // from sub-columns are a gather.
                 #[cfg(feature = "metrics")]
-                if let Some(entries) = &entries {
-                    self.metrics.record_gather(
-                        entries
-                            .iter()
-                            .map(|e| e.key.user_key.len() + e.value.len())
-                            .sum(),
-                    );
-                }
+                self.metrics.record_gather(rebuilt);
+                #[cfg(not(feature = "metrics"))]
+                let _ = rebuilt;
                 return Ok(entries.map(BlockSource::Columnar));
             }
             #[cfg(not(feature = "columnar"))]
@@ -698,6 +694,17 @@ impl Iter {
             None => transform,
         };
         let block_handle = BlockHandle::new(handle.offset(), handle.size());
+        // The whole frame is asked of the filesystem on every partial read,
+        // including a resume-grow; charged as issued, like `load_block`.
+        #[cfg(feature = "metrics")]
+        crate::table::util::record_block_read(
+            &self.metrics,
+            crate::table::block::BlockType::Data,
+            handle.size().into(),
+        );
+        let decoded_before = carried_resume
+            .as_ref()
+            .map_or(0, |resume| resume.window_prime.len());
         let (_header, frame, recovery) = crate::table::block::Block::read_data_frame(
             fd.as_ref(),
             block_handle,
@@ -744,6 +751,16 @@ impl Iter {
             upper,
             carried_resume,
         )?;
+        // Only the tail this read decoded: a resumed prefix was charged by the
+        // read that decoded it. The prefix only grows across resumes.
+        debug_assert!(payload.window_prime.len() >= decoded_before);
+        #[cfg(feature = "metrics")]
+        self.metrics.block_bytes_decoded.fetch_add(
+            (payload.window_prime.len() - decoded_before) as u64,
+            core::sync::atomic::Ordering::Relaxed,
+        );
+        #[cfg(not(feature = "metrics"))]
+        let _ = decoded_before;
         // Covering this query decoded most of the block → promote: drop the
         // partial and let the caller cache the whole block.
         if promote_by_fraction(payload.decoded_blocks, total_blocks) {

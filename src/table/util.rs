@@ -143,6 +143,10 @@ pub fn load_block(
         #[cfg(zstd_any)]
         zstd_dict,
     )?;
+    // Charged before the read is validated: a block that then fails its
+    // checksum, decryption or decompression was still asked of the filesystem.
+    #[cfg(feature = "metrics")]
+    record_block_read(metrics, block_type, handle.size().into());
     let (block, ecc_status, recovery) = Block::from_file_with_recovery(
         fd.as_ref(),
         *handle,
@@ -183,48 +187,6 @@ pub fn load_block(
         .block_bytes_decoded
         .fetch_add(block.data.len() as u64, Relaxed);
 
-    #[cfg(feature = "metrics")]
-    match block_type {
-        BlockType::Filter => {
-            metrics.filter_block_load_io.fetch_add(1, Relaxed);
-
-            metrics
-                .filter_block_io_requested
-                .fetch_add(handle.size().into(), Relaxed);
-        }
-        BlockType::Index => {
-            metrics.index_block_load_io.fetch_add(1, Relaxed);
-
-            metrics
-                .index_block_io_requested
-                .fetch_add(handle.size().into(), Relaxed);
-        }
-        BlockType::RangeTombstone => {
-            metrics.range_tombstone_block_load_io.fetch_add(1, Relaxed);
-
-            metrics
-                .range_tombstone_block_io_requested
-                .fetch_add(handle.size().into(), Relaxed);
-        }
-        BlockType::Data | BlockType::Meta | BlockType::Columnar => {
-            metrics.data_block_load_io.fetch_add(1, Relaxed);
-
-            metrics
-                .data_block_io_requested
-                .fetch_add(handle.size().into(), Relaxed);
-        }
-        // Manifest variants are rejected by the function-level guard above;
-        // the block-layout section is loaded once on open via
-        // `Block::from_file`, never through this cached data-block path.
-        BlockType::Manifest
-        | BlockType::ManifestFooter
-        | BlockType::BlockLayout
-        | BlockType::Locator
-        | BlockType::SeqnoBounds
-        | BlockType::ZoneMap
-        | BlockType::DeleteBitmap => {}
-    }
-
     // ECC recovered this block's payload from parity. The bytes returned below
     // are correct, but the on-disk copy is still faulty: when auto-heal is on,
     // confirm the fault is persistent and queue the SST for a healing rewrite.
@@ -249,6 +211,45 @@ pub fn load_block(
     cache.insert_block(table_id, handle.offset(), block.clone());
 
     Ok(block)
+}
+
+/// Charges one uncached block read to its role's counters: `on_disk` bytes
+/// asked of the filesystem. Every path that reads a block without going
+/// through the block cache calls this at the point the read is issued, so a
+/// read that then fails validation is still counted.
+#[cfg(feature = "metrics")]
+pub(crate) fn record_block_read(metrics: &Metrics, block_type: BlockType, on_disk: u64) {
+    use core::sync::atomic::Ordering::Relaxed;
+    let (loads, requested) = match block_type {
+        BlockType::Filter => (
+            &metrics.filter_block_load_io,
+            &metrics.filter_block_io_requested,
+        ),
+        BlockType::Index => (
+            &metrics.index_block_load_io,
+            &metrics.index_block_io_requested,
+        ),
+        BlockType::RangeTombstone => (
+            &metrics.range_tombstone_block_load_io,
+            &metrics.range_tombstone_block_io_requested,
+        ),
+        BlockType::Data | BlockType::Meta | BlockType::Columnar => (
+            &metrics.data_block_load_io,
+            &metrics.data_block_io_requested,
+        ),
+        // Manifest variants never reach a table read path; the remaining
+        // sections are loaded once on open via `Block::from_file`, outside
+        // these per-read counters.
+        BlockType::Manifest
+        | BlockType::ManifestFooter
+        | BlockType::BlockLayout
+        | BlockType::Locator
+        | BlockType::SeqnoBounds
+        | BlockType::ZoneMap
+        | BlockType::DeleteBitmap => return,
+    };
+    loads.fetch_add(1, Relaxed);
+    requested.fetch_add(on_disk, Relaxed);
 }
 
 /// Decodes pre-read block bytes into the cache: the decode half of a batched
@@ -279,6 +280,7 @@ pub fn decode_prewarmed_blocks(
     encryption: Option<&dyn EncryptionProvider>,
     ecc: Option<crate::table::block::EccParams>,
     #[cfg(zstd_any)] zstd_dict: Option<&crate::compression::ZstdDictionary>,
+    #[cfg(feature = "metrics")] metrics: &Metrics,
 ) {
     let Ok(transform) = build_block_transform(
         compression,
@@ -322,6 +324,14 @@ pub fn decode_prewarmed_blocks(
         if let Ok(block) = Block::from_reader(&mut reader, identity, &transform)
             && block.header.block_type == block_type
         {
+            // The read was charged when the batch was submitted; the decode is
+            // charged here, where the transform ran, since the later lookup
+            // that hits this cached block runs none.
+            #[cfg(feature = "metrics")]
+            metrics.block_bytes_decoded.fetch_add(
+                block.data.len() as u64,
+                core::sync::atomic::Ordering::Relaxed,
+            );
             cache.insert_block(table_id, handle.offset(), block);
         }
     }

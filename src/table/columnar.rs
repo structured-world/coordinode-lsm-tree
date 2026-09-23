@@ -1222,6 +1222,16 @@ pub fn column_batch_to_entries(batch: &ColumnBatch) -> Result<Vec<InternalValue>
     Ok(out)
 }
 
+/// Whether [`column_batch_into_entries`] can hand each row its value as a view
+/// into the column buffer: true for a single non-nullable bytes value column,
+/// false when every value must be rebuilt (framed or fixed-width) per row.
+pub(crate) fn values_are_views(value_cols: &[Column]) -> bool {
+    matches!(
+        value_cols,
+        [c] if c.type_tag == TypeTag::Bytes && c.validity.is_none()
+    )
+}
+
 /// Consuming, allocation-light counterpart to [`column_batch_to_entries`] for
 /// the scan path.
 ///
@@ -1249,13 +1259,7 @@ pub fn column_batch_into_entries(batch: ColumnBatch) -> Result<Vec<InternalValue
     // Shared key buffer: every row's key is a view into it.
     let key_data = key_col.data;
 
-    // A single non-nullable bytes value column lets every row's value be a view
-    // into one shared buffer; otherwise reconstruct (frame / fixed-width) per row.
-    let single_bytes_value = matches!(
-        value_cols.as_slice(),
-        [c] if c.type_tag == TypeTag::Bytes && c.validity.is_none()
-    );
-    let value_source = if single_bytes_value {
+    let value_source = if values_are_views(&value_cols) {
         let single = value_cols
             .into_iter()
             .next()

@@ -182,7 +182,31 @@ fn deletes_and_the_range_tombstone_remove_exactly_what_they_cover() {
 }
 
 #[test]
-fn the_scattered_blob_fixture_writes_every_key_whatever_the_row_count() {
+fn blob_placement_scenarios_zero_cache_report_unsupported() {
+    // Placement moves the counters only through the scan's blob prefetch,
+    // which a zero-capacity cache turns off. A figure published then would
+    // measure the two fixtures' version histories under the placement name.
+    let placement = |config: &BenchConfig| {
+        super::scenarios(config)
+            .into_iter()
+            .filter(|s| s.name.starts_with("blobs-") && s.name != "blobs-filtered-before-fetch")
+            .map(|s| matches!(s.support, super::Support::Native(_)))
+            .collect::<Vec<_>>()
+    };
+    let cold = BenchConfig {
+        cache_mb: 0,
+        ..config()
+    };
+    assert_eq!(placement(&cold), vec![false, false], "zero cache");
+    assert_eq!(
+        placement(&config()),
+        vec![true, true],
+        "a cache enables them"
+    );
+}
+
+#[test]
+fn scattered_blob_fixture_num_equal_to_preferred_stride_writes_every_key() {
     // The strided first pass must be a permutation for EVERY row count. A
     // fixed stride is not coprime with its own multiples, and at `--num 7919`
     // the old one sent every step to key 0, leaving the rows the rewrite

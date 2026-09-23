@@ -471,11 +471,18 @@ impl DataBlock {
     /// order), WITHOUT re-encoding to a row-major block. The scan path iterates
     /// these directly (no serialize + re-parse round-trip); [`Self::from_columnar_block`]
     /// re-encodes on top of this for the byte-based point-read path.
+    ///
+    /// Also returns the bytes of the values that had to be rebuilt from
+    /// sub-columns: zero when every value is a view into the column buffer.
     #[cfg(feature = "columnar")]
     pub(crate) fn columnar_block_entries(
         block_data: &crate::Slice,
-    ) -> crate::Result<Vec<InternalValue>> {
+    ) -> crate::Result<(Vec<InternalValue>, usize)> {
         let batch = crate::table::columnar::ColumnBatch::decode(block_data)?;
+        let views = batch
+            .columns
+            .get(3..)
+            .is_some_and(crate::table::columnar::values_are_views);
         // Consuming, zero-copy untranspose: row keys / values are views into the
         // batch's column buffers rather than per-row copies.
         let entries = crate::table::columnar::column_batch_into_entries(batch)?;
@@ -486,20 +493,26 @@ impl DataBlock {
                 "columnar: empty reconstructed data block",
             ));
         }
-        Ok(entries)
+        let rebuilt = if views {
+            0
+        } else {
+            entries.iter().map(|e| e.value.len()).sum()
+        };
+        Ok((entries, rebuilt))
     }
 
     /// As [`Self::columnar_block_entries`], but drops rows whose global position
     /// is marked deleted in `deletes`. `block_start_row` is the block's first
     /// row position (block-index order). Returns `Ok(None)` when every row is
-    /// deleted (the caller skips the block).
+    /// deleted (the caller skips the block). The rebuilt-byte count covers every
+    /// row, masked ones included: they were rebuilt before the mask ran.
     #[cfg(feature = "columnar")]
     pub(crate) fn columnar_block_entries_masked(
         block_data: &crate::Slice,
         deletes: &crate::table::delete_bitmap::DeleteBitmap,
         block_start_row: u32,
-    ) -> crate::Result<Option<Vec<InternalValue>>> {
-        let entries = Self::columnar_block_entries(block_data)?;
+    ) -> crate::Result<(Option<Vec<InternalValue>>, usize)> {
+        let (entries, rebuilt) = Self::columnar_block_entries(block_data)?;
         let mut kept = Vec::with_capacity(entries.len());
         for (index, entry) in entries.into_iter().enumerate() {
             let offset = u32::try_from(index).map_err(|_| {
@@ -515,9 +528,9 @@ impl DataBlock {
             }
         }
         if kept.is_empty() {
-            return Ok(None);
+            return Ok((None, rebuilt));
         }
-        Ok(Some(kept))
+        Ok((Some(kept), rebuilt))
     }
 
     #[cfg(feature = "columnar")]
@@ -525,7 +538,9 @@ impl DataBlock {
         block_data: &crate::Slice,
         restart_interval: u8,
     ) -> crate::Result<Self> {
-        let entries = Self::columnar_block_entries(block_data)?;
+        // The re-encode below is the gather here; its caller charges the block
+        // it produces, which already contains any rebuilt values.
+        let (entries, _) = Self::columnar_block_entries(block_data)?;
         Self::encode_entries_to_block(&entries, restart_interval)
     }
 

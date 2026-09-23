@@ -12,7 +12,7 @@ fn json_config() -> JsonConfig {
 }
 
 #[test]
-fn json_reports_published_series_in_place_of_the_rate() {
+fn json_published_series_omits_rate() {
     // A workload that publishes its own series has no meaningful rate: its
     // ops/sec would count scenarios. The machine-readable report must carry
     // the series, which are the measurement, and drop the rate, as the
@@ -35,7 +35,7 @@ fn json_reports_published_series_in_place_of_the_rate() {
 }
 
 #[test]
-fn json_keeps_the_rate_for_a_workload_without_series() {
+fn json_no_published_series_keeps_rate() {
     // The rate workloads are unchanged: same fields, and no empty series list.
     let mut reporter = Reporter::new();
     reporter.start();

@@ -3782,6 +3782,11 @@ impl Tree {
                     }
                 }
             }
+            // Charged as issued: every planned block is asked of the
+            // filesystem below, whether or not the batch then succeeds.
+            for (table, _, handles) in &planned {
+                table.record_batched_read(handles);
+            }
             for (fs, reqs) in &mut groups {
                 // Best-effort: a batched-read failure just leaves the blocks for
                 // the resolve walk to read normally.
@@ -3976,6 +3981,12 @@ impl Tree {
                     Some((_, reqs)) => reqs.push(req),
                     None => groups.push((&task.table.fs, vec![req])),
                 }
+            }
+            // Charged as issued, like the prewarm: these reads bypass the
+            // per-block load path that charges every other read.
+            for task in chunk {
+                task.table
+                    .record_batched_read(core::slice::from_ref(&task.handle));
             }
             for (fs, reqs) in &mut groups {
                 fs.read_blocks_batched(reqs)?;

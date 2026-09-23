@@ -286,6 +286,10 @@ impl Metrics {
     /// site in the named set calls this, so the set and its instrumentation
     /// cannot drift apart one path at a time.
     #[inline]
+    #[cfg_attr(
+        not(feature = "columnar"),
+        expect(dead_code, reason = "every gather site is a columnar read path")
+    )]
     pub(crate) fn record_gather(&self, bytes: usize) {
         self.bytes_copied.fetch_add(bytes as u64, Relaxed);
     }

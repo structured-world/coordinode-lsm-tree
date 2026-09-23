@@ -314,12 +314,29 @@ struct Scenario {
     support: Support,
 }
 
+/// Why the blob-placement scenarios cannot run on a zero-capacity cache: the
+/// scan's blob prefetch holds what it fetches in the cache, so with no cache
+/// every row reads its blob alone and placement cannot move the counters.
+const PLACEMENT_NEEDS_CACHE: &str = "placement shows only through the scan's blob \
+     prefetch, which holds what it fetches in the cache; --cache-mb 0 turns it off";
+
+/// The blob-placement read pass, unless the run's cache turns the prefetch
+/// off, in which case the figure would measure the fixtures' version
+/// histories rather than placement.
+fn placement_support(config: &BenchConfig) -> Support {
+    if config.cache_mb == 0 {
+        Support::Missing(PLACEMENT_NEEDS_CACHE)
+    } else {
+        Support::Native(scan_all)
+    }
+}
+
 /// Every scenario, in the order the report prints them.
 ///
 /// The unsupported verdicts are the honest statement of where the engine is.
 /// They are named after the capability they wait for rather than after an
 /// issue number, which would rot.
-fn scenarios() -> Vec<Scenario> {
+fn scenarios(config: &BenchConfig) -> Vec<Scenario> {
     vec![
         Scenario {
             name: "narrow-records",
@@ -367,12 +384,12 @@ fn scenarios() -> Vec<Scenario> {
         Scenario {
             name: "blobs-well-placed",
             fixture: fixtures::blobs_well_placed,
-            support: Support::Native(scan_all),
+            support: placement_support(config),
         },
         Scenario {
             name: "blobs-scattered",
             fixture: fixtures::blobs_scattered,
-            support: Support::Native(scan_all),
+            support: placement_support(config),
         },
         Scenario {
             name: "blobs-filtered-before-fetch",
@@ -399,7 +416,7 @@ impl Workload for MixedLayout {
         reporter.start();
 
         let mut unsupported = 0_usize;
-        for scenario in scenarios() {
+        for scenario in scenarios(config) {
             let name = scenario.name;
             match scenario.support {
                 Support::Native(read) => {

@@ -6596,7 +6596,31 @@ impl Table {
             self.metadata.ecc_params,
             #[cfg(zstd_any)]
             self.zstd_dictionary.as_deref(),
+            #[cfg(feature = "metrics")]
+            &self.metrics,
         );
+    }
+
+    /// Charges data blocks a batched multi-get read (prewarm or chunked
+    /// resolve) is about to ask of the filesystem, at the moment it is issued.
+    #[cfg_attr(
+        not(feature = "metrics"),
+        expect(
+            clippy::unused_self,
+            reason = "the table's counters are the feature's payload"
+        )
+    )]
+    pub(crate) fn record_batched_read(&self, handles: &[BlockHandle]) {
+        #[cfg(feature = "metrics")]
+        for handle in handles {
+            crate::table::util::record_block_read(
+                &self.metrics,
+                BlockType::Data,
+                handle.size().into(),
+            );
+        }
+        #[cfg(not(feature = "metrics"))]
+        let _ = handles;
     }
 
     /// Capacity in bytes of this table's (shared) block cache, for the level
@@ -6733,6 +6757,13 @@ impl Table {
                 block.header.block_type.into(),
             )));
         }
+        // The transform ran here, outside the block cache, so its output is
+        // charged here; the read was charged when the batch was issued.
+        #[cfg(feature = "metrics")]
+        self.metrics.block_bytes_decoded.fetch_add(
+            block.data.len() as u64,
+            core::sync::atomic::Ordering::Relaxed,
+        );
         let has_kv_footer = self.metadata.kv_checksum_algo.is_some();
         DataBlock::from_loaded(block, has_kv_footer).map(Some)
     }

@@ -23,11 +23,13 @@
 
 #![cfg(all(feature = "metrics", feature = "columnar"))]
 
-use lsm_tree::table::columnar::{COL_USER_KEY, COL_VALUE, ColumnBatch};
+use lsm_tree::table::columnar::{
+    COL_USER_KEY, COL_VALUE, Column, ColumnBatch, TypeTag, entries_to_column_batch,
+};
 use lsm_tree::table::columnar_predicate::ColumnRangePredicate;
 use lsm_tree::{
-    AbstractTree, AnyTree, CompressionType, Config, Guard, SeqNo, SequenceNumberCounter, Tree,
-    UserKey, config::CompressionPolicy, get_tmp_folder,
+    AbstractTree, AnyTree, CompressionType, Config, Guard, InternalValue, SeqNo,
+    SequenceNumberCounter, Tree, UserKey, ValueType, config::CompressionPolicy, get_tmp_folder,
 };
 use tempfile::TempDir;
 use test_log::test;
@@ -242,6 +244,101 @@ fn resolving_a_separated_value_counts_the_blob_it_read() {
 }
 
 #[test]
+fn a_block_read_rejected_as_corrupt_still_counts_its_bytes() {
+    // The block-path twin of the blob clause below: a data block that fails
+    // its checksum was still asked of the filesystem, so read must move even
+    // though the get fails.
+    let (folder, tree) = filled_tree(200, 64, CompressionType::None);
+    let tables = folder.path().join("tables");
+    let table = std::fs::read_dir(&tables)
+        .expect("tables dir")
+        .map(|e| e.expect("entry").path())
+        .find(|p| p.is_file())
+        .expect("one table file");
+    let mut bytes = std::fs::read(&table).expect("read table");
+    // The data blocks come first; a byte a little way in lands in one of them.
+    bytes[64] ^= 0xFF;
+    std::fs::write(&table, &bytes).expect("write table");
+
+    let m = tree.metrics();
+    let before = m.bytes_read();
+    let failed = (0..200).any(|i| tree.get(key(i), SeqNo::MAX).is_err());
+    assert!(failed, "a corrupt data block must fail some read");
+    assert!(
+        m.bytes_read() > before,
+        "the corrupt block was read from the filesystem, so read must move",
+    );
+}
+
+#[test]
+fn a_batched_multi_get_counts_the_blocks_it_prewarmed() {
+    // multi_get reads a level's cold blocks in one batched request and decodes
+    // them into the cache, outside the per-block load path. The later lookups
+    // then hit the cache, so if the batched read went uncounted, a multi_get
+    // would report reading almost nothing for the same bytes a loop of point
+    // reads is charged for.
+    let n = 2_000;
+    let (_a_folder, point) = filled_tree(n, 64, CompressionType::None);
+    for i in 0..n {
+        let _ = point.get(key(i), SeqNo::MAX).expect("get");
+    }
+    let point_read = point.metrics().bytes_read();
+
+    let (_b_folder, batched) = filled_tree(n, 64, CompressionType::None);
+    let keys: Vec<Vec<u8>> = (0..n).map(key).collect();
+    let got = batched.multi_get(&keys, SeqNo::MAX).expect("multi_get");
+    assert!(got.iter().all(Option::is_some), "every key is present");
+    assert_eq!(
+        batched.metrics().bytes_read(),
+        point_read,
+        "the same blocks were asked of the filesystem either way",
+    );
+}
+
+#[test]
+fn a_multi_get_too_large_to_prewarm_counts_its_chunked_reads() {
+    // When a level's cold blocks exceed half the cache, multi_get skips the
+    // prewarm and reads them in chunks into scratch buffers it decodes
+    // itself, bypassing both the cache and the per-block load path. Those
+    // reads and decodes must be charged like any other.
+    let n = 2_000;
+    let small_cache = || std::sync::Arc::new(lsm_tree::Cache::with_capacity_bytes(32 * 1024));
+    let open = |folder: &TempDir| {
+        let tree = Config::new(
+            folder.path(),
+            SequenceNumberCounter::default(),
+            SequenceNumberCounter::default(),
+        )
+        .data_block_compression_policy(CompressionPolicy::all(CompressionType::None))
+        .use_cache(small_cache())
+        .open()
+        .expect("open");
+        for i in 0..n {
+            tree.insert(key(i), vec![b'v'; 64], u64::from(i));
+        }
+        tree.flush_active_memtable(0).expect("flush");
+        tree
+    };
+
+    let keys: Vec<Vec<u8>> = (0..n).map(key).collect();
+    let folder = get_tmp_folder();
+    let batched = open(&folder);
+    let got = batched.multi_get(&keys, SeqNo::MAX).expect("multi_get");
+    assert!(got.iter().all(Option::is_some), "every key is present");
+    let m = batched.metrics();
+    assert!(
+        m.bytes_read() >= 100_000,
+        "~140 KB of data blocks were read, but only {} B were charged",
+        m.bytes_read(),
+    );
+    assert!(
+        m.bytes_decoded() >= 100_000,
+        "~140 KB of data blocks were decoded, but only {} B were charged",
+        m.bytes_decoded(),
+    );
+}
+
+#[test]
 fn a_blob_read_rejected_as_corrupt_still_counts_its_bytes() {
     // Read is what was asked of the filesystem, and a record that fails its
     // checksum was asked for all the same. Charging it only after the record
@@ -355,26 +452,79 @@ fn a_range_bounded_columnar_scan_of_one_segment_counts_its_filter_gather() {
     );
 }
 
+/// A columnar tree holding `n` rows ingested with the value split into one
+/// fixed-width sub-column, so a row read has to rebuild each value.
+fn subcolumn_segment(n: u32) -> (TempDir, Tree) {
+    let (folder, tree) = columnar_segment(0, 0);
+    let entries: Vec<InternalValue> = (0..n)
+        .map(|i| InternalValue::from_components(key(i), b"ignored", 0, ValueType::Value))
+        .collect();
+    let mut batch = entries_to_column_batch(&entries).expect("transpose");
+    batch.columns.pop();
+    batch.columns.push(Column {
+        column_id: 3,
+        type_tag: TypeTag::Fixed(4),
+        validity: None,
+        data: (0..n)
+            .flat_map(u32::to_le_bytes)
+            .collect::<Vec<u8>>()
+            .into(),
+    });
+    let any = AnyTree::Standard(tree.clone());
+    let mut ingest = any.ingestion().expect("ingestion");
+    ingest.write_columnar_batch(&batch).expect("write batch");
+    ingest.finish().expect("finish");
+    (folder, tree)
+}
+
 #[test]
-fn reading_rows_from_a_columnar_segment_counts_their_reconstruction() {
-    // A row read of a columnar segment rebuilds each row's key and value from
-    // its sub-columns into new buffers. That reconstruction is the price a
-    // row reader pays for the columnar layout, so leaving it uncharged would
-    // report a columnar tree read row by row as copying nothing at all.
+fn scanning_rows_of_a_single_value_column_copies_nothing() {
+    // A columnar segment whose value is one plain bytes column hands every
+    // row its key and value as views into the decoded column buffers. Nothing
+    // is built, so a row scan over it must leave the counter where it was;
+    // charging the row lengths would report a zero-copy scan as copying the
+    // whole dataset.
     let (_folder, tree) = columnar_segment(1_000, 32);
     let m = tree.metrics();
 
     let before = m.bytes_copied();
-    let mut row_bytes = 0;
-    for kv in tree.range(key(0)..key(1_000_000), SeqNo::MAX, None) {
-        let (k, v) = kv.into_inner().expect("row");
-        row_bytes += (k.len() + v.len()) as u64;
-    }
-    let scan_copied = m.bytes_copied() - before;
-    assert!(
-        scan_copied >= row_bytes,
-        "rebuilding {row_bytes} B of rows was charged only {scan_copied} B",
+    let scanned = tree.range(key(0)..key(1_000_000), SeqNo::MAX, None).count();
+    assert_eq!(scanned, 1_000, "the scan must see every row");
+    assert_eq!(
+        m.bytes_copied(),
+        before,
+        "a scan of view-backed rows gathers nothing",
     );
+}
+
+#[test]
+fn scanning_rows_of_a_split_value_counts_their_reconstruction() {
+    // A value stored as sub-columns has no contiguous copy on disk: each row
+    // read builds it into a fresh buffer. That rebuild is the gather a row
+    // reader pays for the split layout, and it must be charged.
+    let (_folder, tree) = subcolumn_segment(1_000);
+    let m = tree.metrics();
+
+    let before = m.bytes_copied();
+    let mut value_bytes = 0;
+    for kv in tree.range(key(0)..key(1_000_000), SeqNo::MAX, None) {
+        let (_, v) = kv.into_inner().expect("row");
+        value_bytes += v.len() as u64;
+    }
+    assert!(value_bytes > 0, "the scan must return values");
+    assert_eq!(
+        m.bytes_copied() - before,
+        value_bytes,
+        "every rebuilt value is one gather, sized as what it built",
+    );
+}
+
+#[test]
+fn a_point_read_of_a_columnar_segment_counts_the_block_it_rebuilds() {
+    // A columnar point read rebuilds the looked-up key's rows into a small
+    // row-major block, a new buffer made from the decoded columns.
+    let (_folder, tree) = columnar_segment(1_000, 32);
+    let m = tree.metrics();
 
     let before = m.bytes_copied();
     let got = tree.get(key(7), SeqNo::MAX).expect("get").expect("present");
