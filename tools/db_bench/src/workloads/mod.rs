@@ -2,6 +2,7 @@ pub mod fillrandom;
 pub mod fillseq;
 pub mod mergerandom;
 pub mod mixed;
+#[cfg(feature = "counters")]
 pub mod mixed_layout;
 pub mod overwrite;
 pub mod prefixscan;
@@ -108,20 +109,28 @@ where
     scope_result
 }
 
-/// Single source of truth for workload name → type mapping.
+/// Single source of truth for workload name → type mapping. An entry may carry
+/// attributes, so a workload compiled in only under a feature is listed only
+/// when it exists.
 macro_rules! define_workloads {
-    ( $( $name:expr => $ty:path ),+ $(,)? ) => {
+    ( $( $(#[$attr:meta])* $name:literal => $ty:path ),+ $(,)? ) => {
         /// Create a workload by name.
         pub fn create_workload(name: &str) -> Option<Box<dyn Workload>> {
             match name {
-                $( $name => Some(Box::new($ty)), )+
+                $( $(#[$attr])* $name => Some(Box::new($ty)), )+
                 _ => None,
             }
         }
 
         /// List all available benchmark names.
-        pub fn available_benchmarks() -> &'static [&'static str] {
-            &[ $( $name, )+ ]
+        #[expect(
+            clippy::vec_init_then_push,
+            reason = "each push can carry a cfg, which a vec! element cannot"
+        )]
+        pub fn available_benchmarks() -> Vec<&'static str> {
+            let mut names = Vec::new();
+            $( $(#[$attr])* names.push($name); )+
+            names
         }
     };
 }
@@ -136,7 +145,11 @@ define_workloads! {
     "mixed" => mixed::Mixed,
     // Directly after `mixed`, because it answers the other half of the same
     // question: `mixed` says whether the whole cycle got faster, this says
-    // what the read path actually moved to get there.
+    // what the read path actually moved to get there. Only in a `counters`
+    // build, whose instrumented engine the rate workloads must not run on;
+    // the dashboard runs it as a second pass, so there its series follow the
+    // rate series instead.
+    #[cfg(feature = "counters")]
     "mixed-layout" => mixed_layout::MixedLayout,
     "fillseq" => fillseq::FillSeq,
     "fillrandom" => fillrandom::FillRandom,

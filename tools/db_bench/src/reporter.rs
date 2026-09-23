@@ -74,6 +74,10 @@ pub enum Direction {
     /// A yield: rows per KiB read, operations per second.
     BiggerIsBetter,
     /// A cost: bytes copied per byte decoded, an amplification.
+    #[cfg_attr(
+        all(not(feature = "counters"), not(test)),
+        expect(dead_code, reason = "only the counters workload publishes a cost")
+    )]
     SmallerIsBetter,
 }
 
@@ -103,6 +107,10 @@ impl Reporter {
 
     /// Publish a series this workload computes itself. See [`PublishedSeries`]
     /// for why a workload would, and [`Direction`] for which way it improves.
+    #[cfg_attr(
+        all(not(feature = "counters"), not(test)),
+        expect(dead_code, reason = "only the counters workload publishes series")
+    )]
     pub fn publish_series(
         &mut self,
         name: impl Into<String>,

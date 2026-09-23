@@ -277,6 +277,13 @@ jobs:
         # of code to leave unlinted.
         working-directory: tools/db_bench
         run: cargo clippy --all-features --all-targets -- -D warnings
+      - name: Clippy (db_bench, default features)
+        if: needs.changes.outputs.code != 'false'
+        # The build the dashboard's rate workloads run from. The workload
+        # behind `counters` is left out of it, so code that is dead without
+        # that feature is only seen here.
+        working-directory: tools/db_bench
+        run: cargo clippy --all-targets -- -D warnings
 
   test:
     needs: [changes, lint]

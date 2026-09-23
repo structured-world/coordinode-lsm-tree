@@ -19,20 +19,15 @@ path = "src/main.rs"
 
 [features]
 flamegraph = ["dep:tracing", "dep:tracing-subscriber", "dep:tracing-flame"]
+# The `mixed-layout` workload, which reports the engine's read-path byte
+# counters instead of a rate. Kept out of the default build: the counters are
+# atomics on every read path, so a binary built with them measures a slower
+# engine than the one that ships, and the rate workloads would publish that.
+# `columnar` comes with it because its fixtures lay rows out columnar.
+counters = ["lsm-tree/metrics", "lsm-tree/columnar"]
 
 [dependencies]
-# `metrics` is not optional here: the mixed-layout workload reports the
-# read-path byte counters, and without the feature they do not exist. Every
-# other workload reports rates and is unaffected by it being on. `columnar`
-# is on for the same reason: one of that workload's fixtures lays a row-major
-# run over a columnar base, which is a shape the layout has to be compiled in
-# to build at all.
-lsm-tree = { package = "coordinode-lsm-tree", path = "../..", features = [
-    "lz4",
-    "zstd",
-    "metrics",
-    "columnar",
-] }
+lsm-tree = { package = "coordinode-lsm-tree", path = "../..", features = ["lz4", "zstd"] }
 clap = { version = "4", features = ["derive"] }
 hdrhistogram = "7"
 rand = "0.10"

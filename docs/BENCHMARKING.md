@@ -134,8 +134,14 @@ a set of record shapes rather than repeating one operation, and reports the
 byte counters per emitted row instead of a rate:
 
 ```sh
-cd tools/db_bench && cargo run --release -- --benchmark mixed-layout --num 70000
+cd tools/db_bench && cargo run --release --features counters -- --benchmark mixed-layout --num 70000
 ```
+
+It is built only with the `counters` feature, which turns on the engine's
+`metrics`: the counters are atomics on every read path, so a binary carrying
+them measures a slower engine than the one that ships. The rate workloads
+therefore run from the default build, and the dashboard runs this workload as
+a second pass from a `counters` build.
 
 | Scenario | Shape |
 |---|---|
@@ -167,7 +173,7 @@ capability it waits for, and contributes no figure. It is never quietly run
 through a fallback path under the same name: a series that stays continuous
 across the change that was supposed to move it is worse than a gap. Its
 fixture exists regardless and is exercised by the workload's tests
-(`cd tools/db_bench && cargo nextest run`), so enabling the scenario later is
+(`cd tools/db_bench && cargo nextest run --features counters`), so enabling the scenario later is
 one line rather than a fresh argument about what the expected result is.
 
 **On the dashboard** this workload publishes one series per scenario per
@@ -184,8 +190,10 @@ same kibibyte is the improvement. Copied is published as a cost,
 amplification of the read), in a separate smaller-is-better suite,
 `lsm-tree db_bench costs`, because the dashboard fixes one direction per suite.
 Zero is the best value there, and a scenario whose copies go from zero to
-anything alerts. `db_bench --github-json` writes the yields to stdout and
-`--github-json-costs <PATH>` writes the costs.
+anything alerts. `db_bench --github-json` writes the yields to stdout, or
+appends them to the array in a file with `--github-json-append <PATH>` (how the
+second pass joins the first pass's suite), and `--github-json-costs <PATH>`
+writes the costs.
 
 ## Checklist for format-changing PRs
 

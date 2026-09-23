@@ -3,6 +3,8 @@ mod db;
 #[cfg(feature = "flamegraph")]
 mod flame;
 mod reporter;
+#[cfg(test)]
+mod tests;
 mod workloads;
 
 use crate::config::{BenchConfig, Compression};
@@ -83,6 +85,13 @@ struct Cli {
     #[arg(long, requires = "github_json")]
     github_json_costs: Option<PathBuf>,
 
+    /// With --github-json: append the bigger-is-better series to the JSON
+    /// array already in this file instead of printing them, so a second run
+    /// (a `counters` build, say) can add its series to the first run's suite.
+    /// A missing file starts an empty array.
+    #[arg(long, requires = "github_json")]
+    github_json_append: Option<PathBuf>,
+
     /// Database directory path. If not set, a temporary directory is used.
     /// Note: some workloads (e.g. `prefixscan`, `mergerandom`) create their
     /// own temporary database (they require special tree configuration) and
@@ -109,6 +118,12 @@ fn parse_benchmark(s: &str) -> Result<String, String> {
     let available = available_benchmarks();
     if available.contains(&s) {
         Ok(s.to_string())
+    } else if s == "mixed-layout" {
+        Err(
+            "mixed-layout reads the engine's byte counters, which this build \
+             leaves out; rebuild with `--features counters`"
+                .to_string(),
+        )
     } else {
         Err(format!(
             "unknown benchmark '{}'. Available: all, {}",
@@ -116,6 +131,27 @@ fn parse_benchmark(s: &str) -> Result<String, String> {
             available.join(", ")
         ))
     }
+}
+
+/// Appends `entries` to the JSON array held in `path`, creating it when the
+/// file does not exist.
+fn append_github_json(
+    path: &std::path::Path,
+    entries: Vec<serde_json::Value>,
+) -> Result<(), String> {
+    let mut all = match std::fs::read_to_string(path) {
+        Ok(text) => match serde_json::from_str::<serde_json::Value>(&text) {
+            Ok(serde_json::Value::Array(existing)) => existing,
+            Ok(_) => return Err("it does not hold a JSON array".to_string()),
+            Err(e) => return Err(e.to_string()),
+        },
+        Err(e) if e.kind() == std::io::ErrorKind::NotFound => Vec::new(),
+        Err(e) => return Err(e.to_string()),
+    };
+    all.extend(entries);
+    let json =
+        serde_json::to_string_pretty(&serde_json::Value::Array(all)).map_err(|e| e.to_string())?;
+    std::fs::write(path, json).map_err(|e| e.to_string())
 }
 
 fn main() {
@@ -193,7 +229,7 @@ fn main() {
     };
 
     let benchmarks: Vec<&str> = if cli.benchmark == "all" {
-        available_benchmarks().to_vec()
+        available_benchmarks()
     } else {
         vec![&cli.benchmark]
     };
@@ -217,12 +253,20 @@ fn main() {
 
     if cli.github_json {
         let GithubSuites { yields, costs } = github_entries;
-        match serde_json::to_string_pretty(&serde_json::Value::Array(yields)) {
-            Ok(json) => println!("{json}"),
-            Err(e) => {
-                eprintln!("Error: failed to serialize GitHub JSON: {e}");
-                failures += 1;
+        match &cli.github_json_append {
+            Some(path) => {
+                if let Err(e) = append_github_json(path, yields) {
+                    eprintln!("Error: failed to append to {}: {e}", path.display());
+                    failures += 1;
+                }
             }
+            None => match serde_json::to_string_pretty(&serde_json::Value::Array(yields)) {
+                Ok(json) => println!("{json}"),
+                Err(e) => {
+                    eprintln!("Error: failed to serialize GitHub JSON: {e}");
+                    failures += 1;
+                }
+            },
         }
         match &cli.github_json_costs {
             Some(path) => {
