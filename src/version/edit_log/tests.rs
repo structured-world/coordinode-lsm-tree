@@ -32,6 +32,34 @@ fn append_then_replay_roundtrips_all_edits() {
     assert_eq!(replayed, edits, "append+replay must round-trip in order");
 }
 
+/// An edit naming more tables than one record holds is declined before the
+/// log is touched, so the caller can rotate instead and the log it would have
+/// torn stays as it was.
+#[test]
+fn an_edit_too_large_for_one_record_writes_nothing() {
+    let dir = tempfile::tempdir().expect("tempdir");
+    let path = dir.path().join("edits-0");
+    let mut scratch = Vec::new();
+    let table = |id| TableDesc {
+        id,
+        checksum: 0,
+        global_seqno: 0,
+    };
+    let wide = VersionEdit {
+        new_version_id: 1,
+        changed_levels: vec![ChangedLevel {
+            level: 0,
+            runs: vec![(0..4_000).map(table).collect()],
+        }],
+        ..Default::default()
+    };
+
+    let appended = append_edit(&StdFs, &path, &wide, &mut scratch, SyncMode::Normal)
+        .expect("a declined edit is not an error");
+    assert_eq!(appended, None);
+    assert!(!path.exists(), "a declined edit must not create the log");
+}
+
 #[test]
 fn replay_absent_log_is_empty() {
     let dir = tempfile::tempdir().expect("tempdir");

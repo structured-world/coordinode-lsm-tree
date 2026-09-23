@@ -287,17 +287,31 @@ impl VersionEdit {
         Ok(())
     }
 
+    /// Serializes this edit's record payload into `out`, replacing what it
+    /// held, so the caller can check its size before committing it to a log.
+    ///
+    /// # Errors
+    ///
+    /// Returns an error if the edit carries dictionary ids without a retention
+    /// floor (the positional sections cannot express that).
+    pub fn encode(&self, out: &mut Vec<u8>) -> crate::Result<()> {
+        out.clear();
+        self.encode_payload(out)
+    }
+
     /// Appends this edit as one framed record to `writer`, reusing `scratch`
-    /// for the payload assembly (no per-edit heap allocation after warm-up).
+    /// for the payload assembly.
     ///
     /// # Errors
     ///
     /// Returns an error if the payload exceeds the framing payload cap, a write
-    /// fails, or the edit carries dictionary ids without a retention floor (the
-    /// positional sections cannot express that). The payload is assembled
-    /// before any of it reaches `writer`, so a refused edit emits no record.
+    /// fails, or the edit carries dictionary ids without a retention floor. The
+    /// payload is assembled before any of it reaches `writer`, so a refused
+    /// edit emits no record.
+    #[cfg(test)]
     pub fn append_to<W: Write>(&self, writer: &mut W, scratch: &mut Vec<u8>) -> crate::Result<()> {
-        framing::write_framed_record(writer, scratch, |payload| self.encode_payload(payload))
+        self.encode(scratch)?;
+        framing::write_frame(writer, scratch)
     }
 
     /// Decodes a `VersionEdit` from a framed-record payload (the bytes between

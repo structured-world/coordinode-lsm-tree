@@ -63,3 +63,52 @@ fn a_level_with_more_than_255_runs_reopens_with_every_run() -> lsm_tree::Result<
     );
     Ok(())
 }
+
+/// More tables than one edit-log record can describe: an edit carries every
+/// table of each level it changes, and a record holds at most 64 KiB.
+const TABLES: usize = 2_000;
+
+#[test]
+fn a_level_too_large_for_one_edit_record_compacts_and_reopens() -> lsm_tree::Result<()> {
+    let dir = tempfile::tempdir()?;
+    let open = || {
+        Config::new(
+            dir.path(),
+            SequenceNumberCounter::default(),
+            SequenceNumberCounter::default(),
+        )
+        .open()
+    };
+
+    // A value as large as a data block ends a block per key, and a one-byte
+    // table target then ends a table per block: one compaction installs the
+    // whole level in a single edit.
+    let value = vec![7u8; 4096];
+    {
+        let tree = open()?;
+        for i in 0..TABLES {
+            let key = format!("k{i:05}");
+            let seqno = u64::try_from(i).expect("a table index fits u64") + 1;
+            tree.insert(key.as_bytes(), &value, seqno);
+        }
+        tree.flush_active_memtable(0)?;
+        tree.major_compact(1, 0)?;
+        assert_eq!(tree.table_count(), TABLES, "every key became a table");
+    }
+
+    let tree = open()?;
+    assert_eq!(
+        tree.table_count(),
+        TABLES,
+        "the reopened tree must carry every table the manifest recorded",
+    );
+    for i in 0..TABLES {
+        let key = format!("k{i:05}");
+        assert_eq!(
+            tree.get(key.as_bytes(), lsm_tree::MAX_SEQNO)?.as_deref(),
+            Some(value.as_slice()),
+            "{key} must read back after reopen",
+        );
+    }
+    Ok(())
+}

@@ -104,12 +104,22 @@ where
     // and pass the same `&mut` reference to every framed write.
     scratch.clear();
     payload_fn(scratch)?;
+    write_frame(writer, scratch)
+}
 
-    if scratch.len() > MAX_FRAME_PAYLOAD as usize {
+/// Writes an already assembled `payload` as one framed record.
+///
+/// # Errors
+///
+/// Returns the I/O error from `writer` if any write fails, or
+/// [`crate::Error::Unrecoverable`] when the payload exceeds
+/// [`MAX_FRAME_PAYLOAD`], before any byte reaches `writer`.
+pub fn write_frame<W: Write>(writer: &mut W, payload: &[u8]) -> crate::Result<()> {
+    if payload.len() > MAX_FRAME_PAYLOAD as usize {
         log::error!(
-            "write_framed_record refusing to emit oversized payload \
+            "write_frame refusing to emit oversized payload \
              ({} bytes; MAX_FRAME_PAYLOAD = {})",
-            scratch.len(),
+            payload.len(),
             MAX_FRAME_PAYLOAD,
         );
         return Err(crate::Error::Unrecoverable);
@@ -117,14 +127,14 @@ where
 
     #[expect(
         clippy::cast_possible_truncation,
-        reason = "the explicit MAX_FRAME_PAYLOAD guard above ensures scratch.len() fits in u32"
+        reason = "the explicit MAX_FRAME_PAYLOAD guard above ensures payload.len() fits in u32"
     )]
-    let len = scratch.len() as u32;
-    let digest = xxhash_rust::xxh3::xxh3_64(scratch);
+    let len = payload.len() as u32;
+    let digest = xxhash_rust::xxh3::xxh3_64(payload);
 
     writer.write_u32::<LittleEndian>(len)?;
     writer.write_u64::<LittleEndian>(digest)?;
-    writer.write_all(scratch)?;
+    writer.write_all(payload)?;
 
     Ok(())
 }

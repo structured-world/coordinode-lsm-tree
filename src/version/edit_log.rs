@@ -35,30 +35,39 @@ use std::io::{Seek, SeekFrom};
 ///
 /// Returns the appended record's on-disk size in bytes (framing header +
 /// payload), so the caller can keep its cached log size exact without a
-/// re-measuring `open` + `seek` per install.
+/// re-measuring `open` + `seek` per install. Returns `None`, having written
+/// nothing, when the edit does not fit one record: an edit names every table
+/// of each level it changes, so a level of a few thousand tables outgrows the
+/// record cap, and the caller has to record that transition in a snapshot,
+/// which frames each table on its own.
 ///
 /// # Errors
 ///
-/// Returns an I/O error if the open, write, or fsync fails, or a framing error
-/// if the edit payload exceeds the record cap.
+/// Returns an I/O error if the open, write, or fsync fails, or an encoding
+/// error from [`VersionEdit::encode`].
 pub fn append_edit(
     fs: &dyn Fs,
     path: &Path,
     edit: &VersionEdit,
     scratch: &mut Vec<u8>,
     sync_mode: SyncMode,
-) -> crate::Result<u64> {
+) -> crate::Result<Option<u64>> {
+    edit.encode(scratch)?;
+    if scratch.len() > super::framing::MAX_FRAME_PAYLOAD as usize {
+        return Ok(None);
+    }
     let mut file = fs
         .open(
             path,
             &FsOpenOptions::new().write(true).create(true).append(true),
         )
         .map_err(crate::Error::from)?;
-    edit.append_to(&mut file, scratch)?;
+    super::framing::write_frame(&mut file, scratch)?;
     file.sync_all_with(sync_mode).map_err(crate::Error::from)?;
-    // `append_to` leaves the encoded payload in `scratch`; the framing header
-    // (u32 len + u64 XXH3) precedes it on disk.
-    Ok((super::framing::FRAME_HEADER_LEN + scratch.len()) as u64)
+    // The framing header (u32 len + u64 XXH3) precedes the payload on disk.
+    Ok(Some(
+        (super::framing::FRAME_HEADER_LEN + scratch.len()) as u64,
+    ))
 }
 
 /// Replays the durable prefix of the log at `path`. An absent log is an empty
