@@ -4943,7 +4943,7 @@ impl Tree {
             )?;
             let manifest = Manifest::decode_from(&mut archive_reader)?;
 
-            // V5 is the only variant `FormatVersion` can decode to (the
+            // V6 is the only variant `FormatVersion` can decode to (the
             // engine reads exactly one on-disk format, no legacy paths), so
             // anything else already failed above: on its framing if the
             // manifest is not shaped like the current one, on the version
@@ -4951,7 +4951,7 @@ impl Tree {
             // format contract documents — and as the compile-time hook that
             // forces a review of the open path when a new variant is added.
             match manifest.version {
-                FormatVersion::V5 => {}
+                FormatVersion::V6 => {}
             }
 
             let supplied_name = config.comparator.name();

@@ -94,104 +94,35 @@ impl core::fmt::Debug for LevelRoute {
     }
 }
 
-/// Policy governing what `Tree::open` does when the on-disk MANIFEST
-/// contains corrupt records.
+/// Policy governing what `Tree::open` does when the manifest's edit log ends
+/// inside a record.
 ///
-/// Mirrors `RocksDB`'s `WALRecoveryMode` semantics, but applied to the
-/// manifest layer (`src/version/recovery.rs`) — lsm-tree itself has no
-/// WAL (durability lives one layer up in the parent fjall/keyspace
-/// crate's `Journal`). The MANIFEST is the equivalent surface where
-/// "loss-tolerance vs strict-consistency" matters at open time.
+/// The manifest is a snapshot plus an append-only edit log. The snapshot's
+/// sections are checksummed blocks bound to the `CURRENT` digest, so they are
+/// read whole or not at all and no mode relaxes them. The only damage an
+/// append can leave that is not already covered is a torn last record: power
+/// was lost mid-append, so the operation it records was never acknowledged.
+/// This is the one thing a mode chooses.
 ///
-/// The default is [`AbsoluteConsistency`](Self::AbsoluteConsistency) —
-/// any corrupt record fails the open. Switching to a more permissive
-/// mode is an explicit, informed operator decision: you are trading
-/// "the tree might silently come up with missing tables / blob files"
-/// for "the tree comes up at all". When a non-default mode drops
-/// records, the recovery path emits a `warn!` summary with the
-/// AGGREGATE dropped count per section (`tables` / `blob_files`) —
-/// individual table IDs / blob-file IDs are NOT enumerated, because
-/// they were never decoded in the first place. Operators wanting a
-/// per-record audit trail should pair tail-tolerant recovery with an
-/// out-of-band integrity scan ([`verify_integrity`](crate::verify::verify_integrity))
-/// of the recovered tree.
+/// Corruption of anything already committed fails the open in every mode.
+/// Rolling a committed edit back would roll back every committed edit after
+/// it, and the open then deletes the tables those edits added as orphans,
+/// losing acknowledged data for good. `RocksDB` and Pebble refuse the same
+/// way; the remedy is [`Config::repair`], which rebuilds the manifest from
+/// the table files themselves.
 #[derive(Copy, Clone, Debug, PartialEq, Eq, Default)]
 pub enum ManifestRecoveryMode {
-    /// Production-safe default. Any per-record decode mismatch (bad
-    /// XXH3, invalid tag, truncated TOC entry, declared-count overrun)
-    /// aborts the open with the original error. Surfaces every byte
-    /// of corruption; never silently drops data.
+    /// Any defect fails the open, a torn last edit included, so an operator
+    /// decides how to resolve it ([`Config::repair`] recovers every table on
+    /// disk). The default.
     #[default]
     AbsoluteConsistency,
 
-    /// Power-loss-at-write-tail salvage. If the per-section iteration
-    /// over the `tables` / `blob_files` records runs out of bytes
-    /// before the declared count is reached (truncated tail), keep
-    /// everything that decoded cleanly before the cut and emit a
-    /// `warn!` listing the dropped record counts.
-    ///
-    /// A declared count that exceeds the section's payload capacity
-    /// (e.g. `table_count` claims more entries than the section has
-    /// bytes for) is treated as the same "writer committed a count
-    /// header then truncated the entries" shape — the recovery
-    /// downgrades the original hard fail to a `warn!` and lets the
-    /// per-entry decode loop walk bytes-actually-present until the
-    /// first `UnexpectedEof`.
-    ///
-    /// Any decode error that is NOT a clean tail truncation (bad
-    /// `checksum_type` tag, etc.) still aborts the open — this mode
-    /// is specifically for "the writer never finished" scenarios,
-    /// not for arbitrary bit-rot in already-committed bytes.
+    /// A torn last edit is rolled back and the tree opens at the durable
+    /// prefix, with a `warn!`. The torn edit was never acknowledged, so
+    /// nothing a caller was told is durable is lost. Any other defect still
+    /// fails the open.
     TolerateCorruptedTailRecords,
-
-    /// Recover the largest consistent prefix and discard the rest.
-    /// Adapts `RocksDB`'s `kPointInTimeRecovery` accept-the-prefix
-    /// rule to the level/run/table nesting: on the first
-    /// record-decode mismatch inside the `tables` section, the
-    /// recovery keeps the records that decoded cleanly *before*
-    /// the corrupt one in the current run, plus every complete
-    /// earlier run in the same level, plus every complete earlier
-    /// level. "Record-decode mismatch" covers ALL three failure
-    /// shapes the per-record loop can surface:
-    ///
-    /// 1. Framing-layer XXH3 mismatch (the 8-byte digest in the
-    ///    record header doesn't match `xxh3_64(payload)`).
-    /// 2. Framing-header structural failure (`len > MAX_FRAME_PAYLOAD`),
-    ///    surfaced as `BadHeader`. Note: `LenMismatch` (decoded `len`
-    ///    disagrees with a fixed-length pin) is a SEPARATE hard-abort
-    ///    case in every recovery mode, not a record-decode mismatch
-    ///    for the purpose of this mode.
-    /// 3. Payload decode failure AFTER a clean framing pass —
-    ///    e.g. `Error::InvalidTag` from a corrupt `checksum_type`
-    ///    byte inside an otherwise-framed-OK record. The framing
-    ///    XXH3 happens to cover the corrupt byte too (it's a
-    ///    digest of the whole payload), so the bytes decode
-    ///    cleanly at the framing layer; the corruption only
-    ///    surfaces inside the per-entry decode helper.
-    ///
-    /// PIT drops the corrupt record itself, the remaining records
-    /// of that run, and every level not yet read. The same rule
-    /// applies to the `blob_files` section. Clean tail-truncation
-    /// is still tolerated, same as
-    /// [`TolerateCorruptedTailRecords`](Self::TolerateCorruptedTailRecords).
-    PointInTimeRecovery,
-
-    /// Skip each corrupt record individually, keep all others.
-    /// Maximum-availability, lossy. On any per-record decode
-    /// mismatch — framing-layer XXH3 mismatch, payload-decode
-    /// failure inside an otherwise-framed-OK record (e.g.
-    /// `Error::InvalidTag` on a corrupt `checksum_type` byte), or
-    /// a framing-header `BadHeader` — the reader logs the skip
-    /// and advances exactly past the bad record using the
-    /// framing-supplied length field. If the length field itself
-    /// is unusable (the recorded length is outside the legal
-    /// range, so the next-record boundary is unknown), the rest
-    /// of that section is dropped. Intended companion to the
-    /// `repair_db` tooling tracked as `#303`: this mode recovers
-    /// what it can in-place; `repair_db` rebuilds the manifest
-    /// from the SST files
-    /// themselves when even this mode can't reach a usable state.
-    SkipAnyCorruptedRecords,
 }
 
 /// LSM-tree type

@@ -85,10 +85,11 @@ fn regenerate_golden_corpus() {
 
 #[test]
 fn golden_v5_corpus_is_refused_at_open_naming_the_converter() {
-    // The 6.0 filter format replaces its predecessor outright and no reader
-    // for the old layout ships, so this fixture — written by 5.6.0 — must no
-    // longer open. What this test guards is the SHAPE of that refusal, which
-    // is the part that can regress silently:
+    // The 6.0 format replaces its predecessor outright and no reader for the
+    // old layout ships, so this fixture — written by 5.6.0 — must no longer
+    // open. It is refused at the manifest's format version, before any table
+    // is opened. What this test guards is the SHAPE of that refusal, which is
+    // the part that can regress silently:
     //
     //   * it happens at OPEN, not on the first point read. A tree that opens
     //     and then fails somewhere under a `get` tells an operator nothing
@@ -119,14 +120,11 @@ fn golden_v5_corpus_is_refused_at_open_naming_the_converter() {
     )
     .open()
     .err()
-    .expect("a v5 store must not open under the 6.0 filter format");
+    .expect("a v5 store must not open under the 6.0 format");
 
     assert!(
-        matches!(
-            err,
-            lsm_tree::Error::UnsupportedFilterFormat { found: None, .. }
-        ),
-        "expected UnsupportedFilterFormat naming the converter, got: {err:?}",
+        matches!(err, lsm_tree::Error::InvalidVersion(5)),
+        "expected the format-version refusal for a V5 store, got: {err:?}",
     );
     // The message is the operator-facing half of the contract: a Debug dump
     // would not tell anyone that a tool exists.

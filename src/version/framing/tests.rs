@@ -44,12 +44,7 @@ fn framed_record_checksum_mismatch_detected() {
     let mut cursor = Cursor::new(&bytes);
     let outcome = read_framed_record(&mut cursor, u64::MAX, None, &mut Vec::new()).expect("read");
     match outcome {
-        FramedRecordOutcome::ChecksumMismatch {
-            bytes_consumed,
-            expected,
-            got,
-        } => {
-            assert_eq!(bytes_consumed, (FRAME_HEADER_LEN + payload.len()) as u64);
+        FramedRecordOutcome::ChecksumMismatch { expected, got } => {
             // The header carried the digest of the un-flipped
             // payload; the reader recomputed over the flipped
             // bytes. They must differ — that's the whole point

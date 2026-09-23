@@ -19,7 +19,6 @@ fn recovery_with(version_id: u64, table_ids: Vec<Vec<Vec<RecoveredTable>>>) -> R
         blob_restrictions: crate::HashMap::default(),
         retention_floor: 0,
         dicts: Vec::new(),
-        stats: RecoveryStats::default(),
     }
 }
 
@@ -532,6 +531,45 @@ fn write_tree_type(w: &mut FixtureWriter) -> crate::Result<()> {
     Ok(())
 }
 
+/// Start the `tables` section with the number of levels its layout spans;
+/// the records follow.
+fn start_tables(w: &mut FixtureWriter, levels: u8) -> crate::Result<()> {
+    w.start("tables")?;
+    w.write_u8(levels)?;
+    Ok(())
+}
+
+/// Append a `tables` section of one level and no records, for fixtures whose
+/// subject is another section.
+fn write_empty_tables(w: &mut FixtureWriter) -> crate::Result<()> {
+    start_tables(w, 1)
+}
+
+/// The payload of a table record at `level` / `run`, as the writer lays it
+/// out.
+fn table_payload(level: u8, run: u32, id: u64, checksum_type: u8) -> crate::Result<Vec<u8>> {
+    let mut payload = Vec::new();
+    payload.write_u8(level)?;
+    payload.write_u32::<LittleEndian>(run)?;
+    payload.write_u64::<LittleEndian>(id)?;
+    payload.write_u8(checksum_type)?;
+    payload.write_u128::<LittleEndian>(0)?;
+    payload.write_u64::<LittleEndian>(0)?;
+    Ok(payload)
+}
+
+/// Appends the first `keep` bytes of a well-formed framed table record: a
+/// section that ends inside a record.
+fn write_torn_table_record(w: &mut FixtureWriter, keep: usize) -> crate::Result<()> {
+    let mut framed = Vec::new();
+    write_good_table_record(&mut framed, 0, 0, 999)?;
+    let Some(head) = framed.get(..keep) else {
+        panic!("a torn record keeps fewer bytes than a whole one");
+    };
+    w.write_all(head)?;
+    Ok(())
+}
+
 /// Append an empty `blob_files` section (count = 0). The tables-
 /// corruption fixtures don't exercise blob recovery, so they
 /// stamp this trivial payload to satisfy `recover()`'s
@@ -550,23 +588,111 @@ fn write_empty_blob_gc_stats(w: &mut FixtureWriter) -> crate::Result<()> {
     Ok(())
 }
 
-/// Write a version sfa archive with a corrupt `table_count` (`u32::MAX`).
-///
-/// All four sfa sections are written because `recover()` requires them
-/// all — only the tables section carries the corrupt payload.
-fn write_corrupt_table_count(folder: &Path, id: u64, fs: &dyn Fs) -> crate::Result<()> {
+/// Write a version archive whose `tables` section holds the given records,
+/// each `(level, run, id)`, under a `level_count` of `levels`.
+fn write_tables(
+    folder: &Path,
+    id: u64,
+    levels: u8,
+    records: &[(u8, u32, u64)],
+    fs: &dyn Fs,
+) -> crate::Result<()> {
     let mut w = open_fixture_writer(folder, id, fs)?;
     write_tree_type(&mut w)?;
-
-    w.start("tables")?;
-    w.write_u8(1)?; // 1 level
-    w.write_u8(1)?; // 1 run
-    w.write_u32::<LittleEndian>(u32::MAX)?; // corrupt: exceeds section length
-
+    start_tables(&mut w, levels)?;
+    for &(level, run, table) in records {
+        write_good_table_record(&mut w, level, run, table)?;
+    }
     write_empty_blob_files(&mut w)?;
     write_empty_blob_gc_stats(&mut w)?;
-
     w.finish()?;
+    Ok(())
+}
+
+/// Recovers a `tables` section of `records` under `AbsoluteConsistency`.
+fn recover_tables(levels: u8, records: &[(u8, u32, u64)]) -> crate::Result<Recovery> {
+    let fs = MemFs::new();
+    let folder = Path::new("/tables");
+    fs.create_dir_all(folder)?;
+    write_tables(folder, 1, levels, records, &fs)?;
+    write_current(folder, 1, &fs)?;
+    recover(folder, &fs, ManifestRecoveryMode::AbsoluteConsistency, None)
+}
+
+/// Records group back into the levels and runs they name, in order, and a
+/// level without records survives as an empty slot.
+#[test]
+fn recover_groups_table_records_by_the_place_they_name() -> crate::Result<()> {
+    let recovery = recover_tables(3, &[(0, 0, 1), (0, 0, 2), (0, 1, 3), (2, 0, 4)])?;
+    assert_eq!(
+        recovery.table_ids,
+        vec![
+            vec![vec![rtable_zero(1), rtable_zero(2)], vec![rtable_zero(3)]],
+            vec![],
+            vec![vec![rtable_zero(4)]],
+        ],
+    );
+    Ok(())
+}
+
+/// A table as the fixtures here write it: zero checksum and seqno.
+fn rtable_zero(id: u64) -> RecoveredTable {
+    RecoveredTable {
+        id,
+        checksum: Checksum::from_raw(0),
+        global_seqno: 0,
+    }
+}
+
+/// A record placed where no writer puts one has no correct reading: a
+/// skipped run ordinal, a place behind the previous record, or a level
+/// beyond the level count. Each is refused rather than regrouped.
+#[test]
+fn recover_rejects_a_table_record_out_of_place() {
+    let out_of_place = |records: &[(u8, u32, u64)]| {
+        matches!(
+            recover_tables(2, records),
+            Err(crate::Error::InvalidHeader("tables record out of place"))
+        )
+    };
+    assert!(out_of_place(&[(0, 1, 1)]), "a first run numbered 1");
+    assert!(
+        out_of_place(&[(0, 0, 1), (0, 2, 2)]),
+        "a skipped run ordinal"
+    );
+    assert!(
+        out_of_place(&[(1, 0, 1), (0, 0, 2)]),
+        "a level going backwards"
+    );
+    assert!(
+        out_of_place(&[(0, 1, 1), (0, 0, 2)]),
+        "a run going backwards"
+    );
+    assert!(out_of_place(&[(1, 1, 1)]), "a later level opening at run 1");
+    assert!(out_of_place(&[(2, 0, 1)]), "a level beyond the level count");
+}
+
+/// Run ordinals are `u32`, so a level of more runs than any narrower width
+/// counts places each record in its own run.
+#[test]
+fn place_table_accepts_run_ordinals_past_u16() -> crate::Result<()> {
+    let mut levels = vec![Vec::new()];
+    let mut previous = Some(TablePlace {
+        level: 0,
+        run: 69_999,
+    });
+    levels[0] = vec![vec![rtable_zero(1)]; 70_000];
+    place_table(
+        &mut levels,
+        &mut previous,
+        TablePlace {
+            level: 0,
+            run: 70_000,
+        },
+        rtable_zero(2),
+    )?;
+    assert_eq!(levels[0].len(), 70_001);
+    assert_eq!(levels[0][70_000], vec![rtable_zero(2)]);
     Ok(())
 }
 
@@ -577,9 +703,7 @@ fn write_corrupt_table_count(folder: &Path, id: u64, fs: &dyn Fs) -> crate::Resu
 fn write_corrupt_blob_count(folder: &Path, id: u64, fs: &dyn Fs) -> crate::Result<()> {
     let mut w = open_fixture_writer(folder, id, fs)?;
     write_tree_type(&mut w)?;
-
-    w.start("tables")?;
-    w.write_u8(0)?; // 0 levels
+    write_empty_tables(&mut w)?;
 
     w.start("blob_files")?;
     w.write_u32::<LittleEndian>(u32::MAX)?; // corrupt
@@ -588,26 +712,6 @@ fn write_corrupt_blob_count(folder: &Path, id: u64, fs: &dyn Fs) -> crate::Resul
     w.write_u32::<LittleEndian>(0)?;
 
     w.finish()?;
-    Ok(())
-}
-
-#[test]
-fn recover_rejects_corrupt_table_count() -> crate::Result<()> {
-    let fs = MemFs::new();
-    let folder = Path::new("/corrupt/tables");
-    fs.create_dir_all(folder)?;
-
-    write_corrupt_table_count(folder, 1, &fs)?;
-    write_current(folder, 1, &fs)?;
-
-    let Err(err) = recover(folder, &fs, ManifestRecoveryMode::AbsoluteConsistency, None) else {
-        panic!("corrupt table_count should fail");
-    };
-    assert!(
-        matches!(err, crate::Error::Unrecoverable),
-        "expected Unrecoverable, got: {err:?}"
-    );
-
     Ok(())
 }
 
@@ -624,53 +728,51 @@ fn recover_rejects_corrupt_blob_file_count() -> crate::Result<()> {
         panic!("corrupt blob_file_count should fail");
     };
     assert!(
-        matches!(err, crate::Error::Unrecoverable),
-        "expected Unrecoverable, got: {err:?}"
+        matches!(err, crate::Error::InvalidHeader("blob_files section")),
+        "expected the blob_files section refusal, got: {err:?}"
     );
 
     Ok(())
 }
 
-/// Writes a `vN` archive whose `tables` section claims more table
-/// entries than are actually present (count says 5, only 1 full
-/// entry's worth of bytes is written, the next entry's `id: u64`
-/// is cut off mid-stream). Used to exercise the
-/// `TolerateCorruptedTailRecords` recovery path.
-///
-/// The `id` parameter selects the version file name; the function
-/// otherwise produces a deterministic shape: 1 level, 1 run,
-/// declared count = `declared`, actual full entries = `actual`.
+/// Recovers the archive at `folder` under each recovery mode and asserts every
+/// one refuses it. The snapshot's sections are read strictly whatever the
+/// mode: a section is one checksummed block, so a defect inside it is a
+/// writer defect or a forgery, and opening past it would drop what the
+/// manifest committed.
+fn assert_refused_in_every_mode(
+    folder: &Path,
+    fs: &dyn Fs,
+    refused: impl Fn(&crate::Error) -> bool,
+) {
+    for mode in [
+        ManifestRecoveryMode::AbsoluteConsistency,
+        ManifestRecoveryMode::TolerateCorruptedTailRecords,
+    ] {
+        match recover(folder, fs, mode, None) {
+            Err(e) if refused(&e) => {}
+            Err(e) => panic!("{mode:?}: wrong refusal: {e:?}"),
+            Ok(_) => panic!("{mode:?}: a defective snapshot section must not recover"),
+        }
+    }
+}
+
+/// Writes a `vN` archive whose `tables` section holds `complete` whole
+/// records in level 0, run 0, and then ends inside the next record (its
+/// frame header and part of its payload).
 fn write_truncated_tables_tail(
     folder: &Path,
     id: u64,
-    declared: u32,
-    actual: u32,
+    complete: u64,
     fs: &dyn Fs,
 ) -> crate::Result<()> {
-    assert!(
-        actual < declared,
-        "actual must be < declared for truncation"
-    );
     let mut w = open_fixture_writer(folder, id, fs)?;
     write_tree_type(&mut w)?;
-
-    w.start("tables")?;
-    w.write_u8(1)?; // 1 level
-    w.write_u8(1)?; // 1 run
-    w.write_u32::<LittleEndian>(declared)?;
-    // Write `actual` complete framed entries, then stop. SFA pads
-    // the section length to whatever bytes we wrote — the
-    // truncation surfaces inside the per-entry decode loop, not
-    // at the SFA layer.
-    for entry_id in 0..actual {
-        crate::version::framing::write_framed_record(&mut w, &mut Vec::new(), |payload| {
-            payload.write_u64::<LittleEndian>(u64::from(entry_id))?;
-            payload.write_u8(0)?; // checksum_type
-            payload.write_u128::<LittleEndian>(0)?; // checksum
-            payload.write_u64::<LittleEndian>(0)?; // global_seqno
-            Ok(())
-        })?;
+    start_tables(&mut w, 1)?;
+    for entry_id in 0..complete {
+        write_good_table_record(&mut w, 0, 0, entry_id)?;
     }
+    write_torn_table_record(&mut w, 20)?;
 
     write_empty_blob_files(&mut w)?;
     write_empty_blob_gc_stats(&mut w)?;
@@ -679,60 +781,23 @@ fn write_truncated_tables_tail(
     Ok(())
 }
 
+/// A `tables` section that ends inside a record is refused in every mode: a
+/// torn write cannot produce it (the section is one checksummed block), so
+/// accepting the records before the cut would drop tables the writer did
+/// commit.
 #[test]
-fn recover_absolute_consistency_rejects_truncated_tables_tail() -> crate::Result<()> {
+fn recover_rejects_a_truncated_tables_section_in_every_mode() -> crate::Result<()> {
     let fs = MemFs::new();
-    let folder = Path::new("/absolute/tail");
+    let folder = Path::new("/truncated/tables");
     fs.create_dir_all(folder)?;
 
-    // Section declares 5 entries, only 1 actually written.
-    write_truncated_tables_tail(folder, 1, 5, 1, &fs)?;
+    write_truncated_tables_tail(folder, 1, 1, &fs)?;
     write_current(folder, 1, &fs)?;
 
-    let result = recover(folder, &fs, ManifestRecoveryMode::AbsoluteConsistency, None);
-    let err = result.expect_err("truncated tail must abort under AbsoluteConsistency");
-    // Either Io(UnexpectedEof) (from the byteorder read) — both are
-    // acceptable strict-mode failures. The contract is: SOMETHING
-    // surfaces, the open does not silently succeed with partial data.
-    assert!(
-        matches!(&err, crate::Error::Io(e) if e.kind() == crate::io::ErrorKind::UnexpectedEof)
-            || matches!(err, crate::Error::Unrecoverable),
-        "expected UnexpectedEof or Unrecoverable, got: {err:?}",
-    );
-    Ok(())
-}
-
-#[test]
-fn recover_tolerate_tail_keeps_consistent_prefix_of_tables() -> crate::Result<()> {
-    let fs = MemFs::new();
-    let folder = Path::new("/tolerate/tail");
-    fs.create_dir_all(folder)?;
-
-    // Section declares 5 entries, only 1 actually written → expect
-    // 1 entry recovered, 4 silently dropped + warn logged.
-    write_truncated_tables_tail(folder, 1, 5, 1, &fs)?;
-    write_current(folder, 1, &fs)?;
-
-    let recovery = recover(
+    assert_refused_in_every_mode(
         folder,
         &fs,
-        ManifestRecoveryMode::TolerateCorruptedTailRecords,
-        None,
-    )?;
-    assert_eq!(
-        recovery.table_ids.len(),
-        1,
-        "expected 1 level, got {}: {:?}",
-        recovery.table_ids.len(),
-        recovery.table_ids.iter().map(Vec::len).collect::<Vec<_>>(),
-    );
-    let level = &recovery.table_ids[0];
-    assert_eq!(level.len(), 1, "expected 1 run in the recovered level");
-    assert_eq!(
-        level[0].len(),
-        1,
-        "expected 1 table record (the consistent prefix); got {}",
-        level[0].len(),
+        |e| matches!(e, crate::Error::Io(io) if io.kind() == crate::io::ErrorKind::UnexpectedEof),
     );
     Ok(())
 }
@@ -751,30 +816,14 @@ fn recover_tolerate_tail_does_not_swallow_invalid_tag() -> crate::Result<()> {
 
     let mut w = open_fixture_writer(folder, 1, &fs)?;
     write_tree_type(&mut w)?;
-    w.start("tables")?;
-    w.write_u8(1)?; // 1 level
-    w.write_u8(1)?; // 1 run
-    w.write_u32::<LittleEndian>(1)?; // 1 entry
+    start_tables(&mut w, 1)?;
     // Framed record with a corrupt `checksum_type` byte in the
     // payload. The framing XXH3 still covers the payload, so
     // the record decodes cleanly at the framing layer; the
     // InvalidTag surfaces from `decode_table_entry_payload`.
-    // Handling per mode:
-    //   - AbsoluteConsistency:           aborts (used by this test)
-    //   - TolerateCorruptedTailRecords:  also aborts — tail-
-    //     tolerance is for write-incomplete tail scenarios, not
-    //     arbitrary in-section corruption.
-    //   - PointInTimeRecovery:           truncates the
-    //     recovered tree at the corrupt record's level/run.
-    //   - SkipAnyCorruptedRecords:       skips this record,
-    //     continues with the rest of the section.
-    // This fixture exercises the first row; PIT/SkipAny
-    // behaviour is covered by separate test fixtures below.
+    let corrupt = table_payload(0, 0, 0, 0xFF)?;
     crate::version::framing::write_framed_record(&mut w, &mut Vec::new(), |payload| {
-        payload.write_u64::<LittleEndian>(0)?; // id
-        payload.write_u8(0xFF)?; // corrupt checksum_type
-        payload.write_u128::<LittleEndian>(0)?;
-        payload.write_u64::<LittleEndian>(0)?;
+        payload.extend_from_slice(&corrupt);
         Ok(())
     })?;
     write_empty_blob_files(&mut w)?;
@@ -797,32 +846,14 @@ fn recover_tolerate_tail_does_not_swallow_invalid_tag() -> crate::Result<()> {
     Ok(())
 }
 
-/// Writes a `vN` archive with two runs in one level:
-/// run #0 is a complete entry (declared = actual = 1),
-/// run #1 declares 3 entries but the section is cut so the
-/// `table_count` u32 of run #1 reads partially → EOF.
-/// Exercises the tail-tolerant case where the cut happens mid-RUN
-/// inside an otherwise-valid level. The consistent prefix (run #0
-/// of level #0) MUST survive in the recovered Version.
+/// Writes a `vN` archive with one whole record in run #0 of level 0,
+/// then the section ends two bytes into the next record's frame header.
 fn write_truncated_at_second_run(folder: &Path, id: u64, fs: &dyn Fs) -> crate::Result<()> {
     let mut w = open_fixture_writer(folder, id, fs)?;
     write_tree_type(&mut w)?;
-    w.start("tables")?;
-    w.write_u8(1)?; // 1 level
-    w.write_u8(2)?; // 2 runs in that level
-    // run #0: declared=1, actual=1 — the consistent prefix.
-    w.write_u32::<LittleEndian>(1)?;
-    crate::version::framing::write_framed_record(&mut w, &mut Vec::new(), |payload| {
-        payload.write_u64::<LittleEndian>(42)?; // id
-        payload.write_u8(0)?; // checksum_type
-        payload.write_u128::<LittleEndian>(0)?;
-        payload.write_u64::<LittleEndian>(0)?;
-        Ok(())
-    })?;
-    // run #1: only 2 of the 4 bytes of `table_count` are written.
-    // The reader gets `UnexpectedEof` on the u32 read.
-    w.write_u8(0xAA)?;
-    w.write_u8(0xBB)?;
+    start_tables(&mut w, 1)?;
+    write_good_table_record(&mut w, 0, 0, 42)?;
+    write_torn_table_record(&mut w, 2)?;
     write_empty_blob_files(&mut w)?;
     w.start("blob_gc_stats")?;
     w.write_u32::<LittleEndian>(0)?;
@@ -830,46 +861,22 @@ fn write_truncated_at_second_run(folder: &Path, id: u64, fs: &dyn Fs) -> crate::
     Ok(())
 }
 
+/// A cut inside a record's frame header, not only inside its payload, is
+/// refused in every mode as well.
 #[test]
-fn recover_tolerate_tail_keeps_consistent_prefix_within_a_level() -> crate::Result<()> {
-    // Regression: when the EOF cut happens between two runs of
-    // the same level, the tail-tolerant break must push the
-    // partial level into `levels` so the consistent prefix
-    // (run #0 with 1 entry) survives. Earlier behaviour broke
-    // out of `'levels` without pushing, silently dropping the
-    // already-decoded run.
+fn recover_rejects_a_tables_section_cut_inside_a_frame_header() -> crate::Result<()> {
     let fs = MemFs::new();
-    let folder = Path::new("/tolerate/midlevel");
+    let folder = Path::new("/truncated/header");
     fs.create_dir_all(folder)?;
 
     write_truncated_at_second_run(folder, 1, &fs)?;
     write_current(folder, 1, &fs)?;
 
-    let recovery = recover(
+    assert_refused_in_every_mode(
         folder,
         &fs,
-        ManifestRecoveryMode::TolerateCorruptedTailRecords,
-        None,
-    )?;
-    assert_eq!(
-        recovery.table_ids.len(),
-        1,
-        "expected the partially-decoded level to be present, got {} levels",
-        recovery.table_ids.len(),
+        |e| matches!(e, crate::Error::Io(io) if io.kind() == crate::io::ErrorKind::UnexpectedEof),
     );
-    let level = &recovery.table_ids[0];
-    assert_eq!(
-        level.len(),
-        1,
-        "expected 1 surviving run (the consistent prefix), got {}",
-        level.len(),
-    );
-    assert_eq!(
-        level[0].len(),
-        1,
-        "expected the run to contain its 1 fully-decoded entry",
-    );
-    assert_eq!(level[0][0].id, 42, "wrong entry id recovered");
     Ok(())
 }
 
@@ -890,8 +897,7 @@ fn write_truncated_blob_tail(
     );
     let mut w = open_fixture_writer(folder, id, fs)?;
     write_tree_type(&mut w)?;
-    w.start("tables")?;
-    w.write_u8(0)?; // 0 levels
+    write_empty_tables(&mut w)?;
     w.start("blob_files")?;
     w.write_u32::<LittleEndian>(declared)?;
     for entry_id in 0..actual {
@@ -908,48 +914,29 @@ fn write_truncated_blob_tail(
     Ok(())
 }
 
+/// The `blob_files` companion: a count the records do not fill is refused in
+/// every mode.
 #[test]
-fn recover_tolerate_tail_keeps_consistent_prefix_of_blob_files() -> crate::Result<()> {
-    // Companion to `recover_tolerate_tail_keeps_consistent_prefix_of_tables`
-    // for the blob_files surface. Without this test, a regression
-    // in the blob-files tail-tolerant path would slip through
-    // because the tables-only test already passes.
+fn recover_rejects_a_truncated_blob_files_section_in_every_mode() -> crate::Result<()> {
     let fs = MemFs::new();
-    let folder = Path::new("/tolerate/blob_tail");
+    let folder = Path::new("/truncated/blobs");
     fs.create_dir_all(folder)?;
 
     write_truncated_blob_tail(folder, 1, 5, 1, &fs)?;
     write_current(folder, 1, &fs)?;
 
-    let recovery = recover(
-        folder,
-        &fs,
-        ManifestRecoveryMode::TolerateCorruptedTailRecords,
-        None,
-    )?;
-    assert_eq!(
-        recovery.blob_file_ids.len(),
-        1,
-        "expected 1 surviving blob_file entry (the consistent prefix), got {}",
-        recovery.blob_file_ids.len(),
-    );
-    assert_eq!(
-        recovery.blob_file_ids[0].0, 0,
-        "wrong blob_file id recovered",
-    );
+    assert_refused_in_every_mode(folder, &fs, |e| {
+        matches!(e, crate::Error::InvalidHeader("blob_files section"))
+    });
     Ok(())
 }
 
-/// Writes a `vN` archive whose `blob_gc_stats` section is
-/// truncated to zero bytes. Mimics a power-loss right after the
-/// `blob_files` section was committed but before the
-/// `blob_gc_stats` payload landed — `FragmentationMap::decode_from`
-/// hits `UnexpectedEof` on the first byte.
+/// Writes a `vN` archive whose `blob_gc_stats` section is empty, so
+/// `FragmentationMap::decode_from` hits `UnexpectedEof` on the first byte.
 fn write_truncated_blob_gc_stats(folder: &Path, id: u64, fs: &dyn Fs) -> crate::Result<()> {
     let mut w = open_fixture_writer(folder, id, fs)?;
     write_tree_type(&mut w)?;
-    w.start("tables")?;
-    w.write_u8(0)?; // 0 levels
+    write_empty_tables(&mut w)?;
     w.start("blob_files")?;
     w.write_u32::<LittleEndian>(0)?;
     // blob_gc_stats section started but no payload written —
@@ -960,61 +947,45 @@ fn write_truncated_blob_gc_stats(folder: &Path, id: u64, fs: &dyn Fs) -> crate::
     Ok(())
 }
 
+/// A `blob_gc_stats` section the writer did not finish is refused in every
+/// mode: sections are sealed one checksummed block at a time, so an empty
+/// one is not the shape a power loss leaves.
 #[test]
-fn recover_tolerate_tail_handles_truncated_blob_gc_stats() -> crate::Result<()> {
-    // Tail-tolerant mode must extend beyond the record-list
-    // sections (tables / blob_files): a power-loss between the
-    // blob_files commit and the blob_gc_stats payload is the
-    // exact "writer never finished" shape this mode is meant to
-    // salvage. Strict mode still aborts; tolerant mode emits a
-    // warn and uses a default (empty) FragmentationMap.
+fn recover_rejects_a_truncated_blob_gc_stats_section_in_every_mode() -> crate::Result<()> {
     let fs = MemFs::new();
-    let folder = Path::new("/tolerate/gc_stats");
+    let folder = Path::new("/truncated/gc_stats");
     fs.create_dir_all(folder)?;
     write_truncated_blob_gc_stats(folder, 1, &fs)?;
     write_current(folder, 1, &fs)?;
 
-    // Strict mode: hard fail.
-    let strict = recover(folder, &fs, ManifestRecoveryMode::AbsoluteConsistency, None);
-    assert!(
-        strict.is_err(),
-        "strict mode must abort on truncated blob_gc_stats; got Ok",
-    );
-
-    // Tolerant mode: succeeds with empty gc_stats. Compare via
-    // `Default` (FragmentationMap implements PartialEq) — the
-    // type does not expose an `is_empty()` accessor.
-    let lenient = recover(
+    assert_refused_in_every_mode(
         folder,
         &fs,
-        ManifestRecoveryMode::TolerateCorruptedTailRecords,
-        None,
-    )?;
-    assert_eq!(
-        lenient.gc_stats,
-        crate::blob_tree::FragmentationMap::default(),
-        "tolerant mode must produce default (empty) gc_stats on truncated section",
+        |e| matches!(e, crate::Error::Io(io) if io.kind() == crate::io::ErrorKind::UnexpectedEof),
     );
     Ok(())
 }
 
 // ====================================================================
-// PointInTimeRecovery + SkipAnyCorruptedRecords corruption-matrix tests
+// Corrupt records inside snapshot sections
 // ====================================================================
 //
 // The fixtures below write a complete framed manifest, then pick one
 // specific framed record and emit it with a deliberately-wrong XXH3
-// digest. That gives the reader a `FramedRecordOutcome::ChecksumMismatch`
-// at a known position so each mode's per-record dispatch is exercised
-// end-to-end, not just at the framing-helper unit level.
+// digest, so the reader meets a `FramedRecordOutcome::ChecksumMismatch`
+// at a known position. No mode may open past it.
 
-/// Writes one framed table record with a CORRECT XXH3 digest.
-fn write_good_table_record<W: std::io::Write>(w: &mut W, id: u64) -> crate::Result<()> {
-    crate::version::framing::write_framed_record(w, &mut Vec::new(), |payload| {
-        payload.write_u64::<LittleEndian>(id)?;
-        payload.write_u8(0)?; // checksum_type
-        payload.write_u128::<LittleEndian>(0)?;
-        payload.write_u64::<LittleEndian>(0)?;
+/// Writes one framed table record at `level` / `run` with a CORRECT XXH3
+/// digest.
+fn write_good_table_record<W: std::io::Write>(
+    w: &mut W,
+    level: u8,
+    run: u32,
+    id: u64,
+) -> crate::Result<()> {
+    let payload = table_payload(level, run, id, 0)?;
+    crate::version::framing::write_framed_record(w, &mut Vec::new(), |out| {
+        out.extend_from_slice(&payload);
         Ok(())
     })
 }
@@ -1025,18 +996,14 @@ fn write_good_table_record<W: std::io::Write>(w: &mut W, id: u64) -> crate::Resu
 /// of the header is correct (so the reader's `BadHeader` path does
 /// NOT trigger), which means the `ChecksumMismatch` arm is the one
 /// being exercised.
-fn write_bad_table_record<W: std::io::Write>(w: &mut W, id: u64) -> crate::Result<()> {
-    let mut payload: Vec<u8> = Vec::new();
-    payload.write_u64::<LittleEndian>(id)?;
-    payload.write_u8(0)?;
-    payload.write_u128::<LittleEndian>(0)?;
-    payload.write_u64::<LittleEndian>(0)?;
-
-    #[expect(
-        clippy::cast_possible_truncation,
-        reason = "payload is 33 bytes — fits in u32"
-    )]
-    let len = payload.len() as u32;
+fn write_bad_table_record<W: std::io::Write>(
+    w: &mut W,
+    level: u8,
+    run: u32,
+    id: u64,
+) -> crate::Result<()> {
+    let payload = table_payload(level, run, id, 0)?;
+    let len = u32::try_from(payload.len()).expect("a table record fits a u32 length");
     w.write_u32::<LittleEndian>(len)?;
     // INTENTIONALLY WRONG digest. Real one would be
     // `xxh3_64(&payload)`; using `0xDEAD_BEEF_DEAD_BEEF` instead
@@ -1049,14 +1016,6 @@ fn write_bad_table_record<W: std::io::Write>(w: &mut W, id: u64) -> crate::Resul
 /// Builds a manifest with two levels: level 0 has one run with three
 /// table records, where the MIDDLE record carries a corrupt XXH3
 /// digest. Level 1 has one run with two good records.
-///
-/// The shape lets a test observe three distinct recovery outcomes
-/// from the same on-disk bytes:
-/// - `AbsoluteConsistency` aborts on the corrupt record
-/// - `PointInTimeRecovery` keeps level 0 record #0 only (dropping
-///   #1 and #2 of the current run, and dropping level 1 entirely)
-/// - `SkipAnyCorruptedRecords` keeps level 0 records #0 and #2
-///   (skipping #1) AND keeps level 1
 fn write_manifest_with_mid_record_corruption(
     folder: &Path,
     id: u64,
@@ -1065,19 +1024,14 @@ fn write_manifest_with_mid_record_corruption(
     let mut w = open_fixture_writer(folder, id, fs)?;
     write_tree_type(&mut w)?;
 
-    w.start("tables")?;
-    w.write_u8(2)?; // 2 levels
+    start_tables(&mut w, 2)?;
     // Level 0: 1 run, 3 records, middle one is corrupt.
-    w.write_u8(1)?;
-    w.write_u32::<LittleEndian>(3)?;
-    write_good_table_record(&mut w, 100)?;
-    write_bad_table_record(&mut w, 101)?;
-    write_good_table_record(&mut w, 102)?;
+    write_good_table_record(&mut w, 0, 0, 100)?;
+    write_bad_table_record(&mut w, 0, 0, 101)?;
+    write_good_table_record(&mut w, 0, 0, 102)?;
     // Level 1: 1 run, 2 records, both good.
-    w.write_u8(1)?;
-    w.write_u32::<LittleEndian>(2)?;
-    write_good_table_record(&mut w, 200)?;
-    write_good_table_record(&mut w, 201)?;
+    write_good_table_record(&mut w, 1, 0, 200)?;
+    write_good_table_record(&mut w, 1, 0, 201)?;
 
     write_empty_blob_files(&mut w)?;
     w.start("blob_gc_stats")?;
@@ -1086,118 +1040,31 @@ fn write_manifest_with_mid_record_corruption(
     Ok(())
 }
 
+/// A corrupt table record in the middle of the section fails the open in
+/// every mode, naming the digests that disagreed. Opening past it would drop
+/// a table the writer committed, and the open would then delete its file.
 #[test]
-fn recover_absolute_consistency_rejects_mid_record_corruption() -> crate::Result<()> {
+fn recover_rejects_a_corrupt_table_record_in_every_mode() -> crate::Result<()> {
     let fs = MemFs::new();
-    let folder = Path::new("/absolute/mid_corrupt");
+    let folder = Path::new("/corrupt/table_record");
     fs.create_dir_all(folder)?;
     write_manifest_with_mid_record_corruption(folder, 1, &fs)?;
     write_current(folder, 1, &fs)?;
 
-    let err = recover(folder, &fs, ManifestRecoveryMode::AbsoluteConsistency, None)
-        .expect_err("corrupt record must abort AbsoluteConsistency");
-    assert!(
+    assert_refused_in_every_mode(folder, &fs, |e| {
         matches!(
-            err,
+            e,
             crate::Error::ManifestFrameChecksumMismatch {
                 section: "tables",
                 ..
             }
-        ),
-        "expected ManifestFrameChecksumMismatch on the tables section, got: {err:?}",
-    );
-    Ok(())
-}
-
-#[test]
-fn recover_pit_truncates_at_corrupt_record() -> crate::Result<()> {
-    let fs = MemFs::new();
-    let folder = Path::new("/pit/mid_corrupt");
-    fs.create_dir_all(folder)?;
-    write_manifest_with_mid_record_corruption(folder, 1, &fs)?;
-    write_current(folder, 1, &fs)?;
-
-    let recovery = recover(folder, &fs, ManifestRecoveryMode::PointInTimeRecovery, None)?;
-
-    // PIT contract: drop in-progress run contents + all
-    // subsequent records; the recovered prefix is level 0 with
-    // run 0 containing only the consistent prefix record (id=100).
-    // Level slots are preserved (persisted level_count is 2, so
-    // 2 level slots survive — level 1 padded empty to keep
-    // downstream level_count() invariants intact).
-    assert_eq!(
-        recovery.table_ids.len(),
-        2,
-        "expected both persisted level slots to survive (level 1 padded \
-         empty after PIT truncated its records); got {}",
-        recovery.table_ids.len(),
-    );
-    let level = &recovery.table_ids[0];
-    assert_eq!(level.len(), 1, "expected 1 run in level 0");
-    let run = &level[0];
-    assert_eq!(
-        run.len(),
-        1,
-        "expected only the pre-corruption record to survive in run 0; got {} records",
-        run.len(),
-    );
-    assert!(
-        recovery.table_ids[1].is_empty(),
-        "expected level 1 to be empty (PIT dropped its records); got {} runs",
-        recovery.table_ids[1].len(),
-    );
-    assert_eq!(run[0].id, 100, "expected id=100 (the good prefix record)");
-    Ok(())
-}
-
-#[test]
-fn recover_skip_any_skips_corrupt_record_and_keeps_neighbours() -> crate::Result<()> {
-    let fs = MemFs::new();
-    let folder = Path::new("/skip_any/mid_corrupt");
-    fs.create_dir_all(folder)?;
-    write_manifest_with_mid_record_corruption(folder, 1, &fs)?;
-    write_current(folder, 1, &fs)?;
-
-    let recovery = recover(
-        folder,
-        &fs,
-        ManifestRecoveryMode::SkipAnyCorruptedRecords,
-        None,
-    )?;
-
-    // SkipAny contract: log the single bad record, advance past
-    // it via the framing length header, keep going. Both
-    // surrounding records and the entire next level survive.
-    assert_eq!(
-        recovery.table_ids.len(),
-        2,
-        "expected both levels to survive under SkipAny",
-    );
-    let l0_run = &recovery.table_ids[0][0];
-    assert_eq!(
-        l0_run.len(),
-        2,
-        "expected 2 records in level-0 run 0 (id=100 + id=102, skipping the corrupt id=101); got {}",
-        l0_run.len(),
-    );
-    assert_eq!(l0_run[0].id, 100);
-    assert_eq!(l0_run[1].id, 102);
-
-    let l1_run = &recovery.table_ids[1][0];
-    assert_eq!(
-        l1_run.len(),
-        2,
-        "expected level 1 to recover its full 2 records under SkipAny",
-    );
-    assert_eq!(l1_run[0].id, 200);
-    assert_eq!(l1_run[1].id, 201);
+        )
+    });
     Ok(())
 }
 
 /// Builds a manifest where a `blob_files` record (not a table
-/// record) carries the corrupt XXH3 digest. Exercises the same
-/// per-mode dispatch on the `blob_files` section to confirm the
-/// reader's PIT / `SkipAny` logic was wired through symmetrically.
+/// record) carries the corrupt XXH3 digest.
 fn write_manifest_with_corrupt_blob_record(
     folder: &Path,
     id: u64,
@@ -1206,8 +1073,7 @@ fn write_manifest_with_corrupt_blob_record(
     let mut w = open_fixture_writer(folder, id, fs)?;
     write_tree_type(&mut w)?;
 
-    w.start("tables")?;
-    w.write_u8(0)?; // 0 levels (focus is on blob_files section)
+    write_empty_tables(&mut w)?;
 
     w.start("blob_files")?;
     w.write_u32::<LittleEndian>(3)?;
@@ -1246,385 +1112,24 @@ fn write_manifest_with_corrupt_blob_record(
     Ok(())
 }
 
+/// The `blob_files` companion: a corrupt blob-file record fails the open in
+/// every mode.
 #[test]
-fn recover_skip_any_skips_corrupt_blob_record() -> crate::Result<()> {
+fn recover_rejects_a_corrupt_blob_file_record_in_every_mode() -> crate::Result<()> {
     let fs = MemFs::new();
-    let folder = Path::new("/skip_any/blob_mid_corrupt");
+    let folder = Path::new("/corrupt/blob_record");
     fs.create_dir_all(folder)?;
     write_manifest_with_corrupt_blob_record(folder, 1, &fs)?;
     write_current(folder, 1, &fs)?;
 
-    let recovery = recover(
-        folder,
-        &fs,
-        ManifestRecoveryMode::SkipAnyCorruptedRecords,
-        None,
-    )?;
-    let ids: Vec<u64> = recovery.blob_file_ids.iter().map(|(id, _)| *id).collect();
-    assert_eq!(
-        ids,
-        vec![10, 12],
-        "expected SkipAny to keep ids 10 and 12 while skipping the corrupt id 11",
-    );
-    Ok(())
-}
-
-/// Builds a manifest where level 0 has one good record but level 1's
-/// FIRST table record carries a corrupt XXH3 digest. With PIT or
-/// `SkipAny` + `BadHeader` handling, the early-exit branches push the
-/// (empty) in-progress run into the level — and the (empty) level
-/// into the levels vec — before breaking out. The recovered
-/// `Recovery` then carries an empty run, which `Version::from_recovery`
-/// later rejects via `Run::new(...).expect("persisted runs should not
-/// be empty")` — a panic in code that was supposed to be the tolerant
-/// path.
-fn write_manifest_with_corrupt_first_record_of_second_level(
-    folder: &Path,
-    id: u64,
-    fs: &dyn Fs,
-) -> crate::Result<()> {
-    let mut w = open_fixture_writer(folder, id, fs)?;
-    write_tree_type(&mut w)?;
-
-    w.start("tables")?;
-    w.write_u8(2)?; // 2 levels
-    // Level 0: 1 run, 1 good record (so the consistent prefix is
-    // non-empty and the PIT/SkipAny path will reach level 1).
-    w.write_u8(1)?;
-    w.write_u32::<LittleEndian>(1)?;
-    write_good_table_record(&mut w, 100)?;
-    // Level 1: 1 run, 1 corrupt record AS THE FIRST AND ONLY
-    // record. Under PIT this triggers the corruption-handling
-    // arm BEFORE any record has been pushed into the new run —
-    // run.len() == 0 when the branch pushes it into level.
-    w.write_u8(1)?;
-    w.write_u32::<LittleEndian>(1)?;
-    write_bad_table_record(&mut w, 200)?;
-
-    write_empty_blob_files(&mut w)?;
-    w.start("blob_gc_stats")?;
-    w.write_u32::<LittleEndian>(0)?;
-    w.finish()?;
-    Ok(())
-}
-
-/// Regression test for review finding on PR #342: tolerant/PIT
-/// early-exit branches push the in-progress `run` into the current
-/// `level` regardless of whether the run is empty, and push the
-/// `level` regardless of whether it has any runs. When the FIRST
-/// record of a new run is the corrupt one, the run is empty at the
-/// time the branch fires — `Recovery::table_ids` then carries an
-/// empty inner vec, which `Version::from_recovery` later panics on
-/// via `Run::new(...).expect("persisted runs should not be empty")`.
-/// Invariants under test:
-/// 1. `recover()` must never produce empty RUNS in
-///    `table_ids` — an empty inner-inner vec fails downstream
-///    at `Run::new(...).expect("persisted runs should not be
-///    empty")` inside `Version::from_recovery`.
-/// 2. Empty LEVELS (an outer slot containing zero runs) ARE
-///    expected and permitted — they're the canonical
-///    representation for a level that PIT / `SkipAny` /
-///    tail-truncation cleared of all surviving records. The
-///    slot survives so the `level_count` stays preserved;
-///    the placeholder is "no runs in this slot", NOT "one
-///    placeholder run with no tables inside".
-/// 3. The number of level SLOTS in `table_ids` must equal the
-///    persisted `level_count` — downstream code
-///    (compaction/leveled asserts
-///    `version.level_count() == config.level_count`)
-///    reads `levels.len()` directly and shrinking it crashes
-///    the tree.
-#[test]
-fn recover_pit_drops_empty_run_when_corruption_hits_first_record() -> crate::Result<()> {
-    let fs = MemFs::new();
-    let folder = Path::new("/pit/empty_run");
-    fs.create_dir_all(folder)?;
-    write_manifest_with_corrupt_first_record_of_second_level(folder, 1, &fs)?;
-    write_current(folder, 1, &fs)?;
-
-    let recovery = recover(folder, &fs, ManifestRecoveryMode::PointInTimeRecovery, None)?;
-
-    // The persisted manifest declared 2 levels. The recovered
-    // shape must keep that count — level 1 just has no
-    // surviving runs after PIT dropped its only (corrupt) record.
-    assert_eq!(
-        recovery.table_ids.len(),
-        2,
-        "expected the recovered shape to preserve the persisted \
-         level_count (2); got {} levels",
-        recovery.table_ids.len(),
-    );
-
-    // No empty runs anywhere in the recovered shape.
-    for (level_idx, level) in recovery.table_ids.iter().enumerate() {
-        for (run_idx, run) in level.iter().enumerate() {
-            assert!(
-                !run.is_empty(),
-                "level {level_idx} run {run_idx} is empty — \
-                 Version::from_recovery calls Run::new on this and \
-                 panics via the .expect(\"persisted runs should not \
-                 be empty\")",
-            );
-        }
-    }
-
-    // Level 0 survived intact with its one good record.
-    assert_eq!(recovery.table_ids[0].len(), 1, "level 0 should have 1 run");
-    assert_eq!(recovery.table_ids[0][0][0].id, 100);
-    // Level 1 had its only record dropped → 0 runs (the slot
-    // survives empty, not as a placeholder containing an empty run).
-    assert!(
-        recovery.table_ids[1].is_empty(),
-        "level 1 should have no runs after PIT dropped its corrupt-only run",
-    );
-    Ok(())
-}
-
-/// Builds a manifest where level 0 has ONE run of ONE corrupt
-/// record. Under `SkipAnyCorruptedRecords` the single record is
-/// skipped → the run is empty when the per-run record loop
-/// completes → the unconditional `level.push(run)` at line 498
-/// produces an empty run in `Recovery::table_ids`.
-fn write_manifest_with_all_records_in_run_corrupt(
-    folder: &Path,
-    id: u64,
-    fs: &dyn Fs,
-) -> crate::Result<()> {
-    let mut w = open_fixture_writer(folder, id, fs)?;
-    write_tree_type(&mut w)?;
-
-    w.start("tables")?;
-    w.write_u8(2)?; // 2 levels persisted
-    // Level 0: 1 run, 1 record, all corrupt.
-    w.write_u8(1)?;
-    w.write_u32::<LittleEndian>(1)?;
-    write_bad_table_record(&mut w, 100)?;
-    // Level 1: 1 run, 1 good record (so the recovered shape
-    // still has surviving content + a non-trivial level slot).
-    w.write_u8(1)?;
-    w.write_u32::<LittleEndian>(1)?;
-    write_good_table_record(&mut w, 200)?;
-
-    write_empty_blob_files(&mut w)?;
-    w.start("blob_gc_stats")?;
-    w.write_u32::<LittleEndian>(0)?;
-    w.finish()?;
-    Ok(())
-}
-
-/// Regression test for the second review finding on PR #342:
-/// after the per-run record loop, `level.push(run)` runs
-/// unconditionally. Under `SkipAnyCorruptedRecords` every record
-/// in a run can be `ChecksumMismatched` → run stays empty → the
-/// unconditional push produces an empty run in Recovery.
-/// Same downstream panic as the first finding: `from_recovery`'s
-/// `Run::new(empty).expect()` aborts the tolerant path.
-#[test]
-fn recover_skip_any_drops_run_when_all_records_corrupt() -> crate::Result<()> {
-    let fs = MemFs::new();
-    let folder = Path::new("/skip_any/all_corrupt_run");
-    fs.create_dir_all(folder)?;
-    write_manifest_with_all_records_in_run_corrupt(folder, 1, &fs)?;
-    write_current(folder, 1, &fs)?;
-
-    let recovery = recover(
-        folder,
-        &fs,
-        ManifestRecoveryMode::SkipAnyCorruptedRecords,
-        None,
-    )?;
-
-    // 2 levels persisted, both survive as slots.
-    assert_eq!(recovery.table_ids.len(), 2);
-    // Level 0's only run had its only record skipped → no
-    // surviving runs (the empty-run placeholder must not be
-    // pushed; the level slot itself stays as the structural
-    // record that "the writer persisted a level here").
-    for (run_idx, run) in recovery.table_ids[0].iter().enumerate() {
-        assert!(
-            !run.is_empty(),
-            "level 0 run {run_idx} is empty in Recovery — \
-             Version::from_recovery's Run::new(empty).expect() panics here",
-        );
-    }
-    // Level 1 survived with its one good record.
-    assert_eq!(recovery.table_ids[1].len(), 1);
-    assert_eq!(recovery.table_ids[1][0][0].id, 200);
-    Ok(())
-}
-
-#[test]
-fn recover_pit_truncates_remaining_blob_records_on_corruption() -> crate::Result<()> {
-    let fs = MemFs::new();
-    let folder = Path::new("/pit/blob_mid_corrupt");
-    fs.create_dir_all(folder)?;
-    write_manifest_with_corrupt_blob_record(folder, 1, &fs)?;
-    write_current(folder, 1, &fs)?;
-
-    let recovery = recover(folder, &fs, ManifestRecoveryMode::PointInTimeRecovery, None)?;
-    let ids: Vec<u64> = recovery.blob_file_ids.iter().map(|(id, _)| *id).collect();
-    assert_eq!(
-        ids,
-        vec![10],
-        "PIT must drop the corrupt blob record AND every blob record after it; \
-         expected only id=10 (the good prefix), got {ids:?}",
-    );
-    Ok(())
-}
-
-/// Builds a manifest where level 0 declares `table_count = 3` but
-/// only writes 1 good record + 1 corrupt record before truncating
-/// (the writer was killed mid-record). Used to exercise the
-/// `SkipAny` + `TailTruncation` accounting fix: previously
-/// `tables_dropped_to_tail` was computed from `run.len()` alone
-/// (= 1), which re-counted the already-skipped corrupt record as
-/// a tail drop; the correct math subtracts BOTH
-/// successfully-decoded AND skipped-corrupt records.
-fn write_manifest_skip_any_then_tail_truncated(
-    folder: &Path,
-    id: u64,
-    fs: &dyn Fs,
-) -> crate::Result<()> {
-    let mut w = open_fixture_writer(folder, id, fs)?;
-    write_tree_type(&mut w)?;
-
-    w.start("tables")?;
-    w.write_u8(1)?; // 1 level
-    w.write_u8(1)?; // 1 run
-    w.write_u32::<LittleEndian>(3)?; // declared 3 records...
-    // ...but only 2 actually written (good + corrupt). The third
-    // is implicitly truncated — reader hits UnexpectedEof at the
-    // 3rd record's frame header.
-    write_good_table_record(&mut w, 100)?;
-    write_bad_table_record(&mut w, 101)?;
-
-    write_empty_blob_files(&mut w)?;
-    w.start("blob_gc_stats")?;
-    w.write_u32::<LittleEndian>(0)?;
-    w.finish()?;
-    Ok(())
-}
-
-/// Regression test for review finding on PR #342:
-/// `tables_dropped_to_tail` was being computed from `run.len()`
-/// alone, but under `SkipAnyCorruptedRecords` previously-skipped
-/// corrupt records are NOT in `run` — they were already counted
-/// in `tables_dropped_to_corruption`. The pre-fix math would
-/// double-count them at `TailTruncation`, reporting
-/// `tail = table_count - run.len() = 3 - 1 = 2` when the correct
-/// breakdown is `tail = 1, corruption = 1` (the corrupt record
-/// goes to corruption, only the genuinely missing trailing
-/// record goes to tail).
-#[test]
-fn recover_skip_any_then_tail_accounts_corruption_separately() -> crate::Result<()> {
-    let fs = MemFs::new();
-    let folder = Path::new("/skip_any/then_tail");
-    fs.create_dir_all(folder)?;
-    write_manifest_skip_any_then_tail_truncated(folder, 1, &fs)?;
-    write_current(folder, 1, &fs)?;
-
-    let recovery = recover(
-        folder,
-        &fs,
-        ManifestRecoveryMode::SkipAnyCorruptedRecords,
-        None,
-    )?;
-
-    assert_eq!(
-        recovery.stats.tables_dropped_to_corruption, 1,
-        "the corrupt record must land in the corruption counter",
-    );
-    assert_eq!(
-        recovery.stats.tables_dropped_to_tail, 1,
-        "exactly one trailing record was truncated; the previously-skipped \
-         corrupt record must NOT be re-counted here as tail (pre-fix value \
-         would be 2)",
-    );
-    Ok(())
-}
-
-/// Companion fixture for the blob-side accounting regression
-/// test below. Mirrors `write_manifest_skip_any_then_tail_truncated`
-/// (a good record + a corrupt record + truncated tail) but in
-/// the `blob_files` section so the read path's `SkipAny` +
-/// `TailTruncation` arm fires on blob counters instead of table
-/// counters.
-fn write_manifest_blob_skip_any_then_tail_truncated(
-    folder: &Path,
-    id: u64,
-    fs: &dyn Fs,
-) -> crate::Result<()> {
-    let mut w = open_fixture_writer(folder, id, fs)?;
-    write_tree_type(&mut w)?;
-
-    w.start("tables")?;
-    w.write_u8(0)?; // 0 levels — focus is on blob_files
-
-    w.start("blob_files")?;
-    w.write_u32::<LittleEndian>(3)?; // declared 3...
-    // ...but only 2 written: good, bad. The third is implicitly
-    // truncated (reader hits UnexpectedEof at the 3rd frame
-    // header).
-    crate::version::framing::write_framed_record(&mut w, &mut Vec::new(), |payload| {
-        payload.write_u64::<LittleEndian>(10)?;
-        payload.write_u8(0)?;
-        payload.write_u128::<LittleEndian>(0)?;
-        Ok(())
-    })?;
-    // Corrupt second blob record (wrong xxh3, correct length).
-    let mut payload: Vec<u8> = Vec::new();
-    payload.write_u64::<LittleEndian>(11)?;
-    payload.write_u8(0)?;
-    payload.write_u128::<LittleEndian>(0)?;
-    #[expect(
-        clippy::cast_possible_truncation,
-        reason = "payload is 25 bytes — fits in u32"
-    )]
-    let len = payload.len() as u32;
-    w.write_u32::<LittleEndian>(len)?;
-    w.write_u64::<LittleEndian>(0xDEAD_BEEF_DEAD_BEEF)?;
-    w.write_all(&payload)?;
-
-    w.start("blob_gc_stats")?;
-    w.write_u32::<LittleEndian>(0)?;
-    w.finish()?;
-    Ok(())
-}
-
-/// Regression test for the blob-side counterpart of the
-/// accounting fix from `fd44c376` / 52db0ccd. Manifest declares
-/// 3 blob records: 1 good (id=10) + 1 corrupt (id=11) +
-/// 1 truncated (never written to disk). Under
-/// `SkipAnyCorruptedRecords` the corrupt record skip-arm
-/// increments `blob_dropped_to_corruption` and `blob_corrupted`
-/// to 1 each; the `TailTruncation` arm then attributes the
-/// remaining 1 unread record to `blob_dropped_to_tail`. Without
-/// the `processed = recovered + blob_corrupted` accounting the
-/// tail value would be 2 (overcount).
-#[test]
-fn recover_skip_any_then_tail_accounts_blob_corruption_separately() -> crate::Result<()> {
-    let fs = MemFs::new();
-    let folder = Path::new("/skip_any/blob_then_tail");
-    fs.create_dir_all(folder)?;
-    write_manifest_blob_skip_any_then_tail_truncated(folder, 1, &fs)?;
-    write_current(folder, 1, &fs)?;
-
-    let recovery = recover(
-        folder,
-        &fs,
-        ManifestRecoveryMode::SkipAnyCorruptedRecords,
-        None,
-    )?;
-
-    assert_eq!(
-        recovery.stats.blob_dropped_to_corruption, 1,
-        "the corrupt blob record must land in the corruption counter",
-    );
-    assert_eq!(
-        recovery.stats.blob_dropped_to_tail, 1,
-        "exactly one trailing blob record was truncated; the previously-skipped \
-         corrupt record must NOT be re-counted here as tail (pre-fix value \
-         would be 2)",
-    );
+    assert_refused_in_every_mode(folder, &fs, |e| {
+        matches!(
+            e,
+            crate::Error::ManifestFrameChecksumMismatch {
+                section: "blob_files",
+                ..
+            }
+        )
+    });
     Ok(())
 }

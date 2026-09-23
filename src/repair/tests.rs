@@ -15969,11 +15969,11 @@ fn open_or_repair_propagates_transient_io_without_repairing() -> crate::Result<(
     Ok(())
 }
 
-/// An UNSUPPORTED format version is not structural corruption: a pre-V5 (or
+/// An UNSUPPORTED format version is not structural corruption: an earlier (or
 /// future) database has no live decoder here and needs offline conversion or
 /// a matching binary. Treating `InvalidVersion` as repairable would run the
-/// V5-only pipeline over it — every table is rejected during the scan and a
-/// fresh V5 manifest is committed around nothing, destroying the store.
+/// current-format pipeline over it — every table is rejected during the scan
+/// and a fresh manifest is committed around nothing, destroying the store.
 #[test]
 fn open_or_repair_propagates_an_unsupported_format_version() -> crate::Result<()> {
     use crate::fs::{Fs, FsOpenOptions, MemFs};

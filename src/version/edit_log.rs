@@ -64,9 +64,9 @@ pub fn append_edit(
 /// edit list (a snapshot with no edits yet).
 ///
 /// `mode` selects the trailing-record policy (see [`replay_edits`]): a clean
-/// end-of-log is always tolerated, a writer-incomplete tail is rolled back in
-/// every mode except `AbsoluteConsistency`, and a fully-framed corrupt tail is
-/// rolled back only under `PointInTimeRecovery` / `SkipAnyCorruptedRecords`.
+/// end-of-log is always tolerated, a writer-incomplete tail is rolled back
+/// under `TolerateCorruptedTailRecords`, and a fully-framed corrupt record
+/// fails the replay in every mode.
 ///
 /// # Errors
 ///

@@ -5,21 +5,15 @@
 //!
 //! ## Why framing
 //!
-//! The pre-framing manifest format wrote each `tables` / `blob_files`
-//! record back-to-back with no per-record header. A single corrupt
-//! byte anywhere inside the section invalidated every record that
-//! followed: the reader had no way to locate the start of the next
-//! valid record, so recovery had to choose between (a) aborting the
-//! open ([`ManifestRecoveryMode::AbsoluteConsistency`]) or
-//! (b) accepting only a clean tail-truncation ([`ManifestRecoveryMode::TolerateCorruptedTailRecords`]).
-//!
-//! [`ManifestRecoveryMode::PointInTimeRecovery`] and
-//! [`ManifestRecoveryMode::SkipAnyCorruptedRecords`] both need to do
-//! more than that: PIT wants to stop at the last consistent
-//! record-group boundary and accept the prefix; `SkipAny` wants to
-//! skip one bad record and keep reading. Both modes need to know
-//! the exact byte length of each record so they can step past one
-//! without losing sync with the rest.
+//! The edit log is appended to, so its last record can be cut short by
+//! a power loss mid-append. A length and a digest per record are what
+//! tell that torn tail (the record runs past the end of the file) apart
+//! from damage to a record already committed (it is whole but does not
+//! verify): only the first may be rolled back, under
+//! [`ManifestRecoveryMode::TolerateCorruptedTailRecords`]; the second
+//! fails the open in every mode, [`ManifestRecoveryMode::AbsoluteConsistency`]
+//! included. The snapshot's `tables` / `blob_files` records use the same
+//! framing, which pins each record's size.
 //!
 //! ## Wire format
 //!
@@ -32,19 +26,12 @@
 //! ```
 //!
 //! - `len` is the size of `payload` (does NOT include the 12-byte
-//!   header itself). A `len` value larger than the section's
-//!   remaining capacity is treated as `TailTruncation`, not as
-//!   in-section corruption — under tolerant modes this lets a
-//!   power-loss-mid-record recovery accept the prefix instead of
-//!   aborting. The reader still does NOT trust the `len` for
-//!   skipping (the byte boundary of the next record cannot be
-//!   located from a partial trailing record), so the consumer
-//!   abandons the rest of the section regardless. Use the
-//!   `expected_payload_len` parameter on
-//!   [`read_framed_record`] when the record schema has a fixed
-//!   payload size (table / blob entries) to pin the `len`
-//!   structurally and rule out a "len happens to fit but is
-//!   wrong" alignment slide under `SkipAnyCorruptedRecords`.
+//!   header itself). A `len` value larger than the remaining
+//!   capacity is treated as `TailTruncation`, not as corruption:
+//!   that is the shape a power loss mid-append leaves. Use the
+//!   `expected_payload_len` parameter on [`read_framed_record`]
+//!   when the record schema has a fixed payload size (table / blob
+//!   entries) to pin the `len` structurally.
 //! - `xxh3_64` is `xxh3_64(payload)`. The 64-bit variant gives a
 //!   ≈ 2⁻⁶⁴ false-positive collision rate per record, matching the
 //!   integrity bar of the rest of the on-disk format.
@@ -54,17 +41,14 @@
 //!
 //! ## Trade-off
 //!
-//! 12 bytes of header per record. For a `tables` section's 33-byte
-//! table record this is ~36% overhead; for a `blob_files` section's
+//! 12 bytes of header per record. For a `tables` section's 38-byte
+//! table record this is ~32% overhead; for a `blob_files` section's
 //! 25-byte record it is ~48%. The manifest is small (KiB-scale even
 //! for trees with tens of thousands of tables), so the absolute
-//! cost is negligible. The recovery flexibility — per-record skip,
-//! exact record-group boundaries — is worth the overhead.
+//! cost is negligible.
 //!
 //! [`ManifestRecoveryMode::AbsoluteConsistency`]: crate::config::ManifestRecoveryMode::AbsoluteConsistency
 //! [`ManifestRecoveryMode::TolerateCorruptedTailRecords`]: crate::config::ManifestRecoveryMode::TolerateCorruptedTailRecords
-//! [`ManifestRecoveryMode::PointInTimeRecovery`]: crate::config::ManifestRecoveryMode::PointInTimeRecovery
-//! [`ManifestRecoveryMode::SkipAnyCorruptedRecords`]: crate::config::ManifestRecoveryMode::SkipAnyCorruptedRecords
 
 use crate::io::{LittleEndian, ReadBytesExt, WriteBytesExt};
 #[cfg(not(feature = "std"))]
@@ -77,8 +61,8 @@ pub const FRAME_HEADER_LEN: usize = 4 + 8;
 
 /// Hard cap on `len` — keeps an obviously-forged value from
 /// triggering an allocation that exceeds reasonable manifest
-/// record size. The largest legitimate record today is the
-/// `tables` per-table entry at 33 bytes; even a hypothetical
+/// record size. The largest fixed-size record today is the
+/// `tables` per-table entry at 38 bytes; even a hypothetical
 /// future record with a comparator name string is bounded by the
 /// `comparator_name` length cap upstream. 64 KiB is a generous
 /// ceiling that still cuts off any `len` that would otherwise
@@ -161,29 +145,18 @@ pub enum FramedRecordOutcome {
 
     /// The header decoded with a plausible `len`, the payload was
     /// read in full, but the XXH3-64 digest disagreed with
-    /// `xxh3_64(payload)`. The header itself stays internally
-    /// consistent (len fits the section), so callers operating in
-    /// `SkipAny` mode know how many bytes were consumed and can
-    /// continue reading after the skip. The `bytes_consumed` field
-    /// is `FRAME_HEADER_LEN + len`. The `expected` / `got` digest
-    /// fields carry the actual XXH3-64 values so strict-mode
-    /// callers can surface them in the error path instead of
-    /// reporting zeros.
-    ChecksumMismatch {
-        bytes_consumed: u64,
-        expected: u64,
-        got: u64,
-    },
+    /// `xxh3_64(payload)`: a whole record that does not verify, which
+    /// is damage to committed bytes rather than a torn write. The
+    /// `expected` / `got` digest fields carry the actual XXH3-64
+    /// values so callers can surface them in the error.
+    ChecksumMismatch { expected: u64, got: u64 },
 
     /// The header's `len` field is truly implausible — exceeds
     /// [`MAX_FRAME_PAYLOAD`] (64 KiB). By the time this variant is
     /// returned the reader HAS consumed the 4-byte `len` field; the
     /// digest and payload have not been read. The cursor position
     /// is therefore unaligned with both this record and the next,
-    /// so callers must surrender per-record granularity for the
-    /// rest of the section and fall back to a section-level
-    /// recovery strategy (typically: drop the rest of the section
-    /// under `SkipAny`, abort under stricter modes).
+    /// and callers abort.
     ///
     /// `len` plausible but exceeding the section's remaining bytes
     /// is NOT a `BadHeader` — it's a clean tail truncation and is
@@ -201,11 +174,7 @@ pub enum FramedRecordOutcome {
     /// distinguish the two from the bytes alone. Either way callers
     /// must hard-abort: silently dropping the section would let
     /// genuine schema drift slip through, and the corrupt-len case
-    /// is unrecoverable mid-record anyway. Distinguished from
-    /// [`Self::BadHeader`] (truly implausible `len > MAX_FRAME_PAYLOAD`)
-    /// so callers can hard-abort here regardless of recovery mode
-    /// (tolerant modes are for power-loss recovery at the tail, not
-    /// for silently absorbing in-record ambiguity). By the time
+    /// is unrecoverable mid-record anyway. By the time
     /// this variant is returned the reader has consumed the 4-byte
     /// `len` field; the cursor is mid-record and the caller cannot
     /// resume reading after the mismatch.
@@ -237,28 +206,8 @@ pub enum FramedRecordOutcome {
 /// fixed payload size: any `len != n` is treated as
 /// [`FramedRecordOutcome::LenMismatch`] BEFORE the payload is
 /// consumed, so a corrupted-but-plausible `len` (still within
-/// `MAX_FRAME_PAYLOAD` and the section bound) cannot mis-align
-/// the cursor for the next record. This is the critical safety
-/// net for [`crate::config::ManifestRecoveryMode::SkipAnyCorruptedRecords`]:
-/// without the fixed-length pin, a corrupt `len` would consume
-/// the wrong number of payload bytes, fail the XXH3 check, then
-/// have the `SkipAny` arm "continue past the record" — but the
-/// cursor is now off by `(corrupt_len - real_len)` bytes and the
-/// next read decodes garbage as a new record. With the pin, the
-/// reader stops at `LenMismatch` (cursor has consumed only the
-/// 4-byte `len`, no payload bytes); the recovery callers (see
-/// `src/version/recovery.rs`) hard-abort on `LenMismatch` in
-/// EVERY mode rather than dropping the rest of the section.
-/// This is the deliberate distinction from
-/// [`FramedRecordOutcome::BadHeader`] (truly implausible
-/// `len > MAX_FRAME_PAYLOAD`, treated as in-section corruption
-/// the tolerant modes can absorb): a size disagreement with the
-/// caller's fixed-length pin can be either writer / reader
-/// format drift OR a corrupted length field that still fits
-/// `MAX_FRAME_PAYLOAD` — the reader cannot tell the two apart
-/// and either way silently masking it via a section-drop would
-/// either let an incompatible on-disk schema slip through
-/// tolerant recovery undetected or compound the in-record damage.
+/// `MAX_FRAME_PAYLOAD` and the section bound) is reported as what it
+/// is rather than as a checksum failure over the wrong bytes.
 ///
 /// Pass `None` for variable-size records (none currently exist
 /// in the manifest, but the parameter is kept open-ended for
@@ -365,9 +314,7 @@ pub fn read_framed_record<R: Read>(
     if digest_actual == digest_expected {
         Ok(FramedRecordOutcome::Ok)
     } else {
-        let bytes_consumed = FRAME_HEADER_LEN as u64 + u64::from(len);
         Ok(FramedRecordOutcome::ChecksumMismatch {
-            bytes_consumed,
             expected: digest_expected,
             got: digest_actual,
         })

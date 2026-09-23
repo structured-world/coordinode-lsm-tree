@@ -3383,8 +3383,8 @@ impl Config {
     /// held directory lock ([`Error::Locked`](crate::Error::Locked) — the
     /// repair would contend on the same lock), an UNSUPPORTED format version
     /// ([`Error::InvalidVersion`](crate::Error::InvalidVersion) — the store
-    /// needs offline conversion or a matching binary, not a V5-only rebuild
-    /// that would reject every table), a ROUTED tree's
+    /// needs offline conversion or a matching binary, not a rebuild in the
+    /// current format that would reject every table), a ROUTED tree's
     /// [`Error::Unrecoverable`](crate::Error::Unrecoverable) (route
     /// provenance is not persisted, so a missing routed table is
     /// indistinguishable from a route path change or an unmounted tier — a
