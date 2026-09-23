@@ -7,7 +7,7 @@ use lsm_tree::{AbstractTree, Config, SequenceNumberCounter};
 
 /// More runs than a byte counts, so a snapshot that stored a level's run count
 /// in a `u8` would record 44 of them and lose its place in the section.
-const RUNS: u64 = 300;
+const RUNS: usize = 300;
 
 #[test]
 fn a_level_with_more_than_255_runs_reopens_with_every_run() -> lsm_tree::Result<()> {
@@ -29,24 +29,21 @@ fn a_level_with_more_than_255_runs_reopens_with_every_run() -> lsm_tree::Result<
         let tree = open()?;
         for i in 0..RUNS {
             let key = format!("k{i:05}");
+            let seqno = 2 * u64::try_from(i).expect("a run index fits u64");
             // Every flush also rewrites `zzz`, so each table's key range
             // overlaps every other's and L0 cannot fold two of them into one
             // run: disjoint tables share a run.
-            tree.insert(key.as_bytes(), key.as_bytes(), 2 * i + 1);
-            tree.insert(b"zzz", key.as_bytes(), 2 * i + 2);
-            tree.flush_active_memtable(2 * i + 2)?;
+            tree.insert(key.as_bytes(), key.as_bytes(), seqno + 1);
+            tree.insert(b"zzz", key.as_bytes(), seqno + 2);
+            tree.flush_active_memtable(seqno + 2)?;
         }
-        assert_eq!(
-            tree.l0_run_count(),
-            RUNS as usize,
-            "every flush is its own L0 run"
-        );
+        assert_eq!(tree.l0_run_count(), RUNS, "every flush is its own L0 run");
     }
 
     let tree = open()?;
     assert_eq!(
         tree.l0_run_count(),
-        RUNS as usize,
+        RUNS,
         "the reopened tree must carry every run the snapshot recorded",
     );
     for i in 0..RUNS {

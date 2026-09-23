@@ -526,7 +526,7 @@ pub fn replay_edits<R: Read>(
         match outcome {
             FramedRecordOutcome::Ok => edits.push(VersionEdit::decode_payload(&scratch)?),
             // Writer-incomplete tail (power loss mid-append): unacknowledged, so
-            // tolerant modes drop it; AbsoluteConsistency surfaces it.
+            // TolerateCorruptedTailRecords drops it; AbsoluteConsistency surfaces it.
             FramedRecordOutcome::TailTruncation => {
                 if abort_on_truncation {
                     return Err(crate::Error::TornManifestEditLog { kind: "truncated" });

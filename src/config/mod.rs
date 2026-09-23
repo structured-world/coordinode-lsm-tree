@@ -471,10 +471,10 @@ pub struct Config {
     /// Policy governing what `Tree::open` does when the on-disk
     /// MANIFEST contains corrupt records. Defaults to
     /// [`ManifestRecoveryMode::AbsoluteConsistency`], the only
-    /// production-safe choice — any corruption aborts the open. Other
-    /// modes trade strict correctness for partial-availability after a
-    /// disaster; see the enum doc for the operational scenarios that
-    /// motivate each mode.
+    /// production-safe choice — any corruption aborts the open. The only
+    /// other mode, [`ManifestRecoveryMode::TolerateCorruptedTailRecords`],
+    /// additionally drops a torn edit-log tail (an append the writer never
+    /// finished); damage to anything committed fails the open in both.
     pub(crate) manifest_recovery_mode: ManifestRecoveryMode,
 
     /// Durability level for every fsync the tree issues (SST writes,

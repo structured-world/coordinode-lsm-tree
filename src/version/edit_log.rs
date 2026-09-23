@@ -9,7 +9,8 @@
 //! operation is acknowledged upward (the engine has no WAL — durability of data
 //! lives a layer above, but the manifest is the crash anchor for the LSM's own
 //! structure). On recovery the snapshot is loaded and the log replayed; under
-//! tolerant modes a power-loss-truncated trailing record is dropped, while
+//! `TolerateCorruptedTailRecords` a power-loss-truncated trailing record is
+//! dropped, while
 //! `AbsoluteConsistency` surfaces it for deliberate repair (see [`replay_log`]).
 //!
 //! Rotation (writing a fresh snapshot and starting a new log) is driven by

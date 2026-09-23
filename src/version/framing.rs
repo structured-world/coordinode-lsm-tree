@@ -35,9 +35,8 @@
 //! - `xxh3_64` is `xxh3_64(payload)`. The 64-bit variant gives a
 //!   ≈ 2⁻⁶⁴ false-positive collision rate per record, matching the
 //!   integrity bar of the rest of the on-disk format.
-//! - `payload` is the same bytes the pre-framing writer emitted
-//!   for that record. Migration cost is zero on the payload schema;
-//!   only the surrounding 12 bytes are new.
+//! - `payload` is the record itself; its layout belongs to the section
+//!   or log that reads it, not to the framing.
 //!
 //! ## Trade-off
 //!
@@ -187,8 +186,9 @@ pub enum FramedRecordOutcome {
     },
 
     /// EOF was hit before the header or payload could be read in
-    /// full. Always tail-truncation; recovery policy is the same
-    /// as a count-overrun in the pre-framing format.
+    /// full. A snapshot section fails on it; the edit log treats it as
+    /// an append the writer never finished, which only
+    /// `TolerateCorruptedTailRecords` drops.
     TailTruncation,
 }
 
@@ -235,14 +235,10 @@ pub fn read_framed_record<R: Read>(
     };
 
     if len > MAX_FRAME_PAYLOAD {
-        // `len` exceeds the sanity bound (64 KiB). This is a truly
-        // implausible value — no legitimate record approaches it, so
-        // the header itself is forged. We cannot trust `len` to skip
-        // past this record; the caller is told to fall back to
-        // section-level recovery. By this point we have already
-        // consumed the 4 bytes of `len`, but that is acceptable
-        // because a BadHeader signal tells the caller to surrender
-        // per-record granularity for the rest of the section.
+        // `len` exceeds the sanity bound (64 KiB). No legitimate record
+        // approaches it, so the header itself is damaged and `len` cannot
+        // be trusted to skip past the record. Every caller aborts on
+        // BadHeader, so the 4 bytes already consumed do not matter.
         return Ok(FramedRecordOutcome::BadHeader);
     }
 
@@ -253,10 +249,8 @@ pub fn read_framed_record<R: Read>(
     // reader format disagreement) or in-record corruption of the
     // length field within plausible bounds — the reader cannot
     // tell the two apart. Surface it as a distinct `LenMismatch`
-    // variant (rather than `BadHeader`) so callers hard-abort
-    // regardless of recovery mode, while truly forged headers
-    // (len > MAX_FRAME_PAYLOAD) still go through the tolerant-mode
-    // policy.
+    // variant (rather than `BadHeader`) so the error names what was
+    // seen; every caller aborts on either.
     if let Some(expected) = expected_payload_len
         && len != expected
     {
