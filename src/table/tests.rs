@@ -1666,6 +1666,41 @@ fn live_item_count_drops_the_straddling_block_rows_below_the_bound() -> crate::R
     )
 }
 
+/// Counting a restricted view's live rows is statistics, not a read: the
+/// storage and selectivity reports call it, so charging its cold straddling
+/// block to the read counters would make a workload's figures depend on
+/// whether anything polled those reports while it ran.
+#[cfg(feature = "metrics")]
+#[test]
+fn live_item_count_over_a_cold_straddling_block_counts_no_bytes() -> crate::Result<()> {
+    test_with_table(
+        &twelve_letter_items(),
+        |table| {
+            let restricted = table.with_restriction(crate::UserKey::from(&b"h"[..]));
+            let metrics = &restricted.metrics;
+            let before = (
+                metrics.bytes_read(),
+                metrics.bytes_decoded(),
+                metrics.bytes_copied(),
+            );
+            assert_eq!(5, restricted.live_item_count()?);
+            assert_eq!(
+                (
+                    metrics.bytes_read(),
+                    metrics.bytes_decoded(),
+                    metrics.bytes_copied(),
+                ),
+                before,
+                "counting live rows reads the straddling block for statistics, \
+                 which the read counters must not see",
+            );
+            Ok(())
+        },
+        Some(4),
+        Some(|w: Writer| w.use_zone_map(true)),
+    )
+}
+
 /// Without a zone map the count is apportioned over data bytes, but the
 /// straddling block is still counted exactly: apportioning it whole credited
 /// the view with every row below the bound.

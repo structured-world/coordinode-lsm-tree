@@ -887,6 +887,27 @@ impl Table {
         compression: CompressionType,
         #[cfg(zstd_any)] zstd_dict: Option<&crate::compression::ZstdDictionary>,
     ) -> crate::Result<Block> {
+        self.load_block_charged(
+            handle,
+            block_type,
+            compression,
+            #[cfg(zstd_any)]
+            zstd_dict,
+            #[cfg(feature = "metrics")]
+            &self.metrics,
+        )
+    }
+
+    /// [`Self::load_block`] charging `metrics` instead of the table's own
+    /// counters, so a read that is not a caller's can pass detached ones.
+    fn load_block_charged(
+        &self,
+        handle: &BlockHandle,
+        block_type: BlockType,
+        compression: CompressionType,
+        #[cfg(zstd_any)] zstd_dict: Option<&crate::compression::ZstdDictionary>,
+        #[cfg(feature = "metrics")] metrics: &Metrics,
+    ) -> crate::Result<Block> {
         load_block(
             self.global_id(),
             &self.path,
@@ -901,7 +922,7 @@ impl Table {
             zstd_dict,
             self.heal_hints.get().map(AsRef::as_ref),
             #[cfg(feature = "metrics")]
-            &self.metrics,
+            metrics,
         )
     }
 
@@ -1050,27 +1071,54 @@ impl Table {
     /// `pub(crate)` so the salvage walk ([`crate::salvage`]) can attempt each
     /// data block individually and drop the ones that fail to load.
     pub(crate) fn load_data_block(&self, handle: &BlockHandle) -> crate::Result<Option<DataBlock>> {
+        self.load_data_block_charged(
+            handle,
+            #[cfg(feature = "metrics")]
+            &self.metrics,
+        )
+    }
+
+    /// [`Self::load_data_block`] charging `metrics` instead of the table's own
+    /// counters, so a read that is not a caller's can pass detached ones.
+    fn load_data_block_charged(
+        &self,
+        handle: &BlockHandle,
+        #[cfg(feature = "metrics")] metrics: &Metrics,
+    ) -> crate::Result<Option<DataBlock>> {
         // Columnar SSTs store each data block as a PAX `ColumnBatch`; reconstruct
         // the row entries on load so every row read path works unchanged.
         #[cfg(feature = "columnar")]
         if self.metadata.columnar {
-            return self.load_columnar_data_block(handle);
+            return self.load_columnar_data_block(
+                handle,
+                #[cfg(feature = "metrics")]
+                metrics,
+            );
         }
         // `from_loaded` transparently strips the per-KV checksum footer when
         // this SST carries one. Footer presence is a per-SST property
         // (`kv_checksum_algo`), not a per-block header flag — data blocks omit
         // the block_flags byte — so the descriptor supplies it here.
         let has_kv_footer = self.metadata.kv_checksum_algo.is_some();
-        self.load_block(
+        self.load_block_charged(
             handle,
             BlockType::Data,
             self.metadata.data_block_compression,
             #[cfg(zstd_any)]
             self.zstd_dictionary.as_deref(),
+            #[cfg(feature = "metrics")]
+            metrics,
         )
         .and_then(|block| DataBlock::from_loaded(block, has_kv_footer))
         .map(Some)
-        .map_err(|e| self.classify_excised(handle, e))
+        .map_err(|e| {
+            self.classify_excised(
+                handle,
+                e,
+                #[cfg(feature = "metrics")]
+                metrics,
+            )
+        })
     }
 
     /// Re-reports a failed block load as [`crate::Error::Excised`] when the
@@ -1086,7 +1134,12 @@ impl Table {
     /// and it needs no recorded state — the zeros identify themselves, which
     /// is what lets an in-place excision survive any crash unrecorded.
     #[cfg(feature = "std")]
-    fn classify_excised(&self, handle: &BlockHandle, err: crate::Error) -> crate::Error {
+    fn classify_excised(
+        &self,
+        handle: &BlockHandle,
+        err: crate::Error,
+        #[cfg(feature = "metrics")] metrics: &Metrics,
+    ) -> crate::Error {
         // A transient / positioned-read failure is not a verdict about the
         // bytes: leave it exactly as it is so the caller can still retry.
         if matches!(err, crate::Error::Io(_)) {
@@ -1099,7 +1152,7 @@ impl Table {
         // like the load that failed.
         #[cfg(feature = "metrics")]
         let mut on_read = |len: u64| {
-            crate::table::util::record_block_read(&self.metrics, BlockType::Data, len);
+            crate::table::util::record_block_read(metrics, BlockType::Data, len);
         };
         #[cfg(not(feature = "metrics"))]
         let mut on_read = |_: u64| {};
@@ -1115,7 +1168,12 @@ impl Table {
 
     /// No-std builds have no `Fs` open on this path; the original error stands.
     #[cfg(not(feature = "std"))]
-    const fn classify_excised(&self, _handle: &BlockHandle, err: crate::Error) -> crate::Error {
+    const fn classify_excised(
+        &self,
+        _handle: &BlockHandle,
+        err: crate::Error,
+        #[cfg(feature = "metrics")] _metrics: &Metrics,
+    ) -> crate::Error {
         err
     }
 
@@ -1128,13 +1186,19 @@ impl Table {
     /// Returns `Ok(None)` when the positional delete-bitmap deletes every row of
     /// the block, so the caller treats it as carrying no keys.
     #[cfg(feature = "columnar")]
-    fn load_columnar_data_block(&self, handle: &BlockHandle) -> crate::Result<Option<DataBlock>> {
-        let block = self.load_block(
+    fn load_columnar_data_block(
+        &self,
+        handle: &BlockHandle,
+        #[cfg(feature = "metrics")] metrics: &Metrics,
+    ) -> crate::Result<Option<DataBlock>> {
+        let block = self.load_block_charged(
             handle,
             BlockType::Columnar,
             self.metadata.data_block_compression,
             #[cfg(zstd_any)]
             self.zstd_dictionary.as_deref(),
+            #[cfg(feature = "metrics")]
+            metrics,
         )?;
         let restart = self.metadata.data_block_restart_interval;
         // The segment has materialized deletes and this block has a recorded
@@ -1159,9 +1223,9 @@ impl Table {
         // row-major block encoded from the rows.
         #[cfg(feature = "metrics")]
         {
-            self.metrics.record_gather(values);
+            metrics.record_gather(values);
             if let Some(rebuilt) = &rebuilt {
-                self.metrics.record_gather(rebuilt.inner.data.len());
+                metrics.record_gather(rebuilt.inner.data.len());
             }
         }
         #[cfg(not(feature = "metrics"))]
@@ -8703,8 +8767,17 @@ impl Table {
                 continue;
             }
             let end = punch + u64::from(handle.size());
+            // Counting rows is statistics, not a caller's read: charge the
+            // block to detached counters, like the index walk above.
+            #[cfg(feature = "metrics")]
+            let uncounted = Metrics::default();
             // A wholly delete-masked columnar block serves no keys at all.
-            let Some(block) = self.load_data_block(handle.as_ref())? else {
+            let Some(block) = self.load_data_block_charged(
+                handle.as_ref(),
+                #[cfg(feature = "metrics")]
+                &uncounted,
+            )?
+            else {
                 return Ok(Some((end, 0)));
             };
             let data = &block.inner.data;
