@@ -893,20 +893,19 @@ impl Table {
             compression,
             #[cfg(zstd_any)]
             zstd_dict,
-            #[cfg(feature = "metrics")]
-            &self.metrics,
+            ReadCharge::Foreground,
         )
     }
 
-    /// [`Self::load_block`] charging `metrics` instead of the table's own
-    /// counters, so a read that is not a caller's can pass detached ones.
+    /// [`Self::load_block`] charged as `charge` says, for a read that is not a
+    /// caller's.
     fn load_block_charged(
         &self,
         handle: &BlockHandle,
         block_type: BlockType,
         compression: CompressionType,
         #[cfg(zstd_any)] zstd_dict: Option<&crate::compression::ZstdDictionary>,
-        #[cfg(feature = "metrics")] metrics: &Metrics,
+        charge: ReadCharge,
     ) -> crate::Result<Block> {
         load_block(
             self.global_id(),
@@ -922,7 +921,8 @@ impl Table {
             zstd_dict,
             self.heal_hints.get().map(AsRef::as_ref),
             #[cfg(feature = "metrics")]
-            metrics,
+            &self.metrics,
+            charge,
         )
     }
 
@@ -1071,29 +1071,21 @@ impl Table {
     /// `pub(crate)` so the salvage walk ([`crate::salvage`]) can attempt each
     /// data block individually and drop the ones that fail to load.
     pub(crate) fn load_data_block(&self, handle: &BlockHandle) -> crate::Result<Option<DataBlock>> {
-        self.load_data_block_charged(
-            handle,
-            #[cfg(feature = "metrics")]
-            &self.metrics,
-        )
+        self.load_data_block_charged(handle, ReadCharge::Foreground)
     }
 
-    /// [`Self::load_data_block`] charging `metrics` instead of the table's own
-    /// counters, so a read that is not a caller's can pass detached ones.
+    /// [`Self::load_data_block`] charged as `charge` says, for a read that is
+    /// not a caller's.
     fn load_data_block_charged(
         &self,
         handle: &BlockHandle,
-        #[cfg(feature = "metrics")] metrics: &Metrics,
+        charge: ReadCharge,
     ) -> crate::Result<Option<DataBlock>> {
         // Columnar SSTs store each data block as a PAX `ColumnBatch`; reconstruct
         // the row entries on load so every row read path works unchanged.
         #[cfg(feature = "columnar")]
         if self.metadata.columnar {
-            return self.load_columnar_data_block(
-                handle,
-                #[cfg(feature = "metrics")]
-                metrics,
-            );
+            return self.load_columnar_data_block(handle, charge);
         }
         // `from_loaded` transparently strips the per-KV checksum footer when
         // this SST carries one. Footer presence is a per-SST property
@@ -1106,19 +1098,11 @@ impl Table {
             self.metadata.data_block_compression,
             #[cfg(zstd_any)]
             self.zstd_dictionary.as_deref(),
-            #[cfg(feature = "metrics")]
-            metrics,
+            charge,
         )
         .and_then(|block| DataBlock::from_loaded(block, has_kv_footer))
         .map(Some)
-        .map_err(|e| {
-            self.classify_excised(
-                handle,
-                e,
-                #[cfg(feature = "metrics")]
-                metrics,
-            )
-        })
+        .map_err(|e| self.classify_excised(handle, e, charge))
     }
 
     /// Re-reports a failed block load as [`crate::Error::Excised`] when the
@@ -1138,7 +1122,7 @@ impl Table {
         &self,
         handle: &BlockHandle,
         err: crate::Error,
-        #[cfg(feature = "metrics")] metrics: &Metrics,
+        charge: ReadCharge,
     ) -> crate::Error {
         // A transient / positioned-read failure is not a verdict about the
         // bytes: leave it exactly as it is so the caller can still retry.
@@ -1152,10 +1136,14 @@ impl Table {
         // like the load that failed.
         #[cfg(feature = "metrics")]
         let mut on_read = |len: u64| {
-            crate::table::util::record_block_read(metrics, BlockType::Data, len);
+            if charge.is_counted() {
+                crate::table::util::record_block_read(&self.metrics, BlockType::Data, len);
+            }
         };
         #[cfg(not(feature = "metrics"))]
-        let mut on_read = |_: u64| {};
+        let mut on_read = |_: u64| {
+            let _ = charge;
+        };
         match Self::block_is_zeroed_in(&*file, handle, &mut on_read) {
             Ok(true) => crate::Error::Excised {
                 offset: handle.offset().0,
@@ -1172,7 +1160,7 @@ impl Table {
         &self,
         _handle: &BlockHandle,
         err: crate::Error,
-        #[cfg(feature = "metrics")] _metrics: &Metrics,
+        _charge: ReadCharge,
     ) -> crate::Error {
         err
     }
@@ -1189,7 +1177,7 @@ impl Table {
     fn load_columnar_data_block(
         &self,
         handle: &BlockHandle,
-        #[cfg(feature = "metrics")] metrics: &Metrics,
+        charge: ReadCharge,
     ) -> crate::Result<Option<DataBlock>> {
         let block = self.load_block_charged(
             handle,
@@ -1197,8 +1185,7 @@ impl Table {
             self.metadata.data_block_compression,
             #[cfg(zstd_any)]
             self.zstd_dictionary.as_deref(),
-            #[cfg(feature = "metrics")]
-            metrics,
+            charge,
         )?;
         let restart = self.metadata.data_block_restart_interval;
         // The segment has materialized deletes and this block has a recorded
@@ -1229,13 +1216,17 @@ impl Table {
         // row-major block encoded from the rows. The first is charged before
         // the result is judged: a block refused after it still did it.
         #[cfg(feature = "metrics")]
-        metrics.record_gather(values);
+        if charge.is_counted() {
+            self.metrics.record_gather(values);
+        }
         #[cfg(not(feature = "metrics"))]
-        let _ = values;
+        let _ = (values, charge);
         let rebuilt = rebuilt?;
         #[cfg(feature = "metrics")]
-        if let Some(rebuilt) = &rebuilt {
-            metrics.record_gather(rebuilt.inner.data.len());
+        if let Some(rebuilt) = &rebuilt
+            && charge.is_counted()
+        {
+            self.metrics.record_gather(rebuilt.inner.data.len());
         }
         Ok(rebuilt)
     }
@@ -8321,9 +8312,7 @@ impl Table {
             let mut start: u32 = 0;
             // Part of opening the table, not a read a caller made, so it stays
             // out of the read counters like the locator walk below.
-            let walk = block_index.iter();
-            #[cfg(feature = "metrics")]
-            let walk = walk.uncounted();
+            let walk = block_index.iter().with_charge(ReadCharge::Maintenance);
             for keyed in walk {
                 let keyed = keyed?;
                 map.insert(keyed.offset().0, start);
@@ -8400,9 +8389,7 @@ impl Table {
                 rebuildable_section_degraded = true;
                 return None;
             }
-            let walk = block_index.iter();
-            #[cfg(feature = "metrics")]
-            let walk = walk.uncounted();
+            let walk = block_index.iter().with_charge(ReadCharge::Maintenance);
             let blocks: Vec<BlockHandle> = walk
                 .map(|r| r.map(|kbh| *kbh.as_ref()))
                 .collect::<crate::Result<Vec<_>>>()
@@ -8784,10 +8771,7 @@ impl Table {
     /// This view's block-index walk, charged to the read counters only when it
     /// serves a caller's read.
     fn index_walk_charged(&self, charge: ReadCharge) -> block_index::BlockIndexIterImpl {
-        match charge {
-            ReadCharge::Foreground => self.block_index.iter(),
-            ReadCharge::Maintenance => self.maintenance_index_walk(),
-        }
+        self.block_index.iter().with_charge(charge)
     }
 
     /// The live rows of the block STRADDLING the restriction: the first whose
@@ -8808,22 +8792,8 @@ impl Table {
         bound: &[u8],
         charge: ReadCharge,
     ) -> crate::Result<u64> {
-        #[cfg(feature = "metrics")]
-        let uncounted = Metrics::default();
-        #[cfg(feature = "metrics")]
-        let metrics = match charge {
-            ReadCharge::Foreground => &*self.metrics,
-            ReadCharge::Maintenance => &uncounted,
-        };
-        #[cfg(not(feature = "metrics"))]
-        let _ = charge;
         // A wholly delete-masked columnar block serves no keys at all.
-        let Some(block) = self.load_data_block_charged(
-            straddle.as_ref(),
-            #[cfg(feature = "metrics")]
-            metrics,
-        )?
-        else {
+        let Some(block) = self.load_data_block_charged(straddle.as_ref(), charge)? else {
             return Ok(0);
         };
         let data = &block.inner.data;

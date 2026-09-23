@@ -270,10 +270,9 @@ impl Inner {
     /// those reads stay out of the read counters, which describe reads.
     pub(crate) fn maintenance_index_walk(&self) -> super::block_index::BlockIndexIterImpl {
         use super::block_index::BlockIndex;
-        let walk = self.block_index.iter();
-        #[cfg(feature = "metrics")]
-        let walk = walk.uncounted();
-        walk
+        self.block_index
+            .iter()
+            .with_charge(super::util::ReadCharge::Maintenance)
     }
 }
 

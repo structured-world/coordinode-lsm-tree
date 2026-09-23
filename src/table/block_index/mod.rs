@@ -31,16 +31,14 @@ pub enum BlockIndexIterImpl {
 }
 
 impl BlockIndexIterImpl {
-    /// This walk with its block loads charged to counters nothing reports, for
-    /// a table open: loading the index to build the table's own structures is
-    /// not a read, and the read counters describe reads.
-    #[cfg(feature = "metrics")]
+    /// This walk with its block loads charged as `charge` says, for a walk
+    /// that is not a caller's read: opening, verifying or reclaiming a table,
+    /// compaction, a scrub, a report.
     #[must_use]
-    pub(crate) fn uncounted(mut self) -> Self {
-        let detached = || alloc::sync::Arc::new(crate::Metrics::default());
+    pub(crate) fn with_charge(mut self, charge: crate::table::util::ReadCharge) -> Self {
         match &mut self {
-            Self::Volatile(i) => i.metrics = detached(),
-            Self::TwoLevel(i) => i.metrics = detached(),
+            Self::Volatile(i) => i.charge = charge,
+            Self::TwoLevel(i) => i.charge = charge,
             // A pinned index loads nothing while it is walked.
             Self::Full(_) => {}
         }

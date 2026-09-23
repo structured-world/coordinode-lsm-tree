@@ -252,6 +252,21 @@ impl Cache {
         })
     }
 
+    /// [`Self::get_block`] that leaves the entry's recency and the hit
+    /// statistics as they were, for a reader that must not change what a later
+    /// read finds cached.
+    #[must_use]
+    pub(crate) fn peek_block(&self, id: GlobalTableId, offset: BlockOffset) -> Option<Block> {
+        let key: CacheKey = (TAG_BLOCK, id.tree_id(), id.table_id(), *offset).into();
+
+        Some(match self.data.peek(&key)? {
+            Item::Block(block) => block,
+            Item::Blob(..) | Item::Row(_) => unreachable!("invalid cache item"),
+            #[cfg(feature = "zstd")]
+            Item::PartialBlock(_) => unreachable!("invalid cache item"),
+        })
+    }
+
     /// Whether a full (non-partial) data block is already resident for `offset`.
     ///
     /// The partial-tier reader uses this to bail out (let the normal cached path

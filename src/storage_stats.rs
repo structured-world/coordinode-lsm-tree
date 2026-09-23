@@ -531,8 +531,8 @@ pub(crate) fn compute_storage_stats(
         // both live in this version while a slice is in flight. Count what this
         // view serves, and scale the per-entry aggregates by the same share so
         // the averages stay consistent with the count. A report, not a read:
-        // polling it must not move the read counters.
-        let live_items = table.live_item_count(crate::table::util::ReadCharge::Maintenance)?;
+        // polling it must not move the read counters or the block cache.
+        let live_items = table.live_item_count(crate::table::util::ReadCharge::Report)?;
         let share = |total: u64| -> u64 {
             if live_items == m.item_count || m.item_count == 0 {
                 return total;
@@ -639,7 +639,7 @@ pub(crate) fn compute_level_segment_stats(version: &Version) -> crate::Result<Ve
                 // What this VIEW serves, on the same basis as the tree total: a
                 // restricted table's metadata still counts the prefix the
                 // superseding output owns.
-                let items = table.live_item_count(crate::table::util::ReadCharge::Maintenance)?;
+                let items = table.live_item_count(crate::table::util::ReadCharge::Report)?;
                 let seg_reads = table.read_count.load(Relaxed);
                 let seg_access = table.last_access_secs.load(Relaxed);
                 used_bytes += on_disk;

@@ -620,9 +620,7 @@ fn create_bounded_compaction_stream<'a>(
             found += 1;
             // Compaction input is maintenance, not a read a caller made, so
             // it stays out of the read counters like the serial scanner's.
-            let reader = table.range_iter(bounds.clone());
-            #[cfg(feature = "metrics")]
-            let reader = reader.uncounted();
+            let reader = table.range_iter(bounds.clone()).for_maintenance();
             readers.push(Box::new(reader));
         }
     }

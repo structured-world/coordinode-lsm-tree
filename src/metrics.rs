@@ -212,27 +212,35 @@ impl Metrics {
         }
     }
 
-    /// Number of I/O data block bytes transferred from disk or OS page cache.
+    /// Data block bytes requested from the `Fs` trait by reads callers made.
+    ///
+    /// Charged when each read is issued, so a read that then fails its
+    /// checksum, decryption or decompression is counted; maintenance and
+    /// monitoring reads are not. See [`Self::bytes_read`].
     pub fn data_block_io(&self) -> u64 {
         self.data_block_io_requested.load(Relaxed)
     }
 
-    /// Number of I/O index block bytes transferred from disk or OS page cache.
+    /// Index block bytes requested from the `Fs` trait, on the same terms as
+    /// [`Self::data_block_io`].
     pub fn index_block_io(&self) -> u64 {
         self.index_block_io_requested.load(Relaxed)
     }
 
-    /// Number of I/O filter block bytes transferred from disk or OS page cache.
+    /// Filter block bytes requested from the `Fs` trait, on the same terms as
+    /// [`Self::data_block_io`].
     pub fn filter_block_io(&self) -> u64 {
         self.filter_block_io_requested.load(Relaxed)
     }
 
-    /// Number of I/O range tombstone block bytes transferred from disk or OS page cache.
+    /// Range tombstone block bytes requested from the `Fs` trait, on the same
+    /// terms as [`Self::data_block_io`].
     pub fn range_tombstone_block_io(&self) -> u64 {
         self.range_tombstone_block_io_requested.load(Relaxed)
     }
 
-    /// Number of I/O block bytes transferred from disk or OS page cache.
+    /// Block bytes requested from the `Fs` trait over every block role, on the
+    /// same terms as [`Self::data_block_io`].
     pub fn block_io(&self) -> u64 {
         self.data_block_io_requested.load(Relaxed)
             + self.index_block_io_requested.load(Relaxed)

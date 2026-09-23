@@ -1732,6 +1732,188 @@ fn live_item_count_for_a_query_over_a_cold_straddling_block_counts_its_reads() -
     )
 }
 
+/// A table with Page ECC, one data block per key `a..=h`, and an index split
+/// into several partitions, so every index walk loads partitions through
+/// `cache`.
+#[cfg(all(feature = "metrics", feature = "page_ecc", feature = "std"))]
+fn ecc_two_level_table(
+    dir: &tempfile::TempDir,
+    cache: Arc<crate::Cache>,
+) -> crate::Result<(Table, std::path::PathBuf)> {
+    let (file, checksum) = write_ecc_two_level_table(dir)?;
+    Ok((recover_with_cache(&file, checksum, cache)?, file))
+}
+
+#[cfg(all(feature = "metrics", feature = "page_ecc", feature = "std"))]
+fn recover_with_cache(
+    file: &std::path::Path,
+    checksum: crate::Checksum,
+    cache: Arc<crate::Cache>,
+) -> crate::Result<Table> {
+    let mut params = test_recover_params(file.to_path_buf(), checksum);
+    params.cache = cache;
+    params.metrics = Arc::new(Metrics::default());
+    let table = Table::recover(params)?;
+    assert!(
+        table.metadata.index_block_count > 1,
+        "the fixture must split its index into partitions",
+    );
+    Ok(table)
+}
+
+#[cfg(all(feature = "metrics", feature = "page_ecc", feature = "std"))]
+fn write_ecc_two_level_table(
+    dir: &tempfile::TempDir,
+) -> crate::Result<(std::path::PathBuf, crate::Checksum)> {
+    let file = dir.path().join("table");
+    let mut writer = Writer::new(file.clone(), 0, 0, Arc::new(StdFs))?
+        .use_ecc(Some(crate::table::block::EccParams::RS_4_2))
+        .use_partitioned_index()
+        .use_data_block_size(1)
+        .use_meta_partition_size(3);
+    for (i, key) in [b"a", b"b", b"c", b"d", b"e", b"f", b"g", b"h"]
+        .into_iter()
+        .enumerate()
+    {
+        writer.write(InternalValue::from_components(
+            key.as_slice(),
+            b"value-payload-bytes",
+            u64::try_from(i).expect("small") + 1,
+            crate::ValueType::Value,
+        ))?;
+    }
+    let (_, checksum) = writer.finish()?.expect("the fixture writes entries");
+    Ok((file, checksum))
+}
+
+/// Flips one payload bit of the block at `offset`, which Page ECC repairs on
+/// the next read.
+#[cfg(all(feature = "metrics", feature = "page_ecc", feature = "std"))]
+fn flip_payload_bit(table: &Table, file: &std::path::Path, offset: u64) -> crate::Result<()> {
+    let mut bytes = std::fs::read(file)?;
+    let pos = usize::try_from(offset).expect("offset fits usize")
+        + crate::table::block::Header::MIN_LEN
+        + 3;
+    bytes[pos] ^= 0x80;
+    std::fs::write(file, &bytes)?;
+    table.file_accessor.remove_for_table(&table.global_id());
+    Ok(())
+}
+
+/// A report reading a block that Page ECC repairs keeps the tree's ECC health
+/// counters: they are the latent bit-rot signal, and hiding a fault because a
+/// report found it leaves the medium's decay invisible.
+#[cfg(all(feature = "metrics", feature = "page_ecc", feature = "std"))]
+#[test]
+fn live_item_count_for_a_report_over_a_repaired_block_counts_the_repair() -> crate::Result<()> {
+    let dir = tempdir()?;
+    let (table, file) = ecc_two_level_table(&dir, Arc::new(crate::Cache::with_capacity_bytes(0)))?;
+    let restricted = table.with_restriction(crate::UserKey::from(&b"d"[..]));
+    let straddle = restricted.punch_offset_for(b"d")?;
+    assert!(straddle > 0, "the fixture must punch a real prefix");
+    flip_payload_bit(&table, &file, straddle)?;
+
+    let before = table.metrics.ecc_recovered_count();
+    assert_eq!(
+        5,
+        restricted.live_item_count(crate::table::util::ReadCharge::Report)?
+    );
+    assert!(
+        table.metrics.ecc_recovered_count() > before,
+        "the repair a report's read made must reach the ECC counters",
+    );
+    Ok(())
+}
+
+/// A maintenance walk of a partitioned index keeps the ECC health counters
+/// for the partitions Page ECC repairs, as a foreground walk does.
+#[cfg(all(feature = "metrics", feature = "page_ecc", feature = "std"))]
+#[test]
+fn a_maintenance_index_walk_over_a_repaired_partition_counts_the_repair() -> crate::Result<()> {
+    let dir = tempdir()?;
+    let (table, file) = ecc_two_level_table(&dir, Arc::new(crate::Cache::with_capacity_bytes(0)))?;
+    let last = table
+        .block_index
+        .iter()
+        .next_back()
+        .expect("the table has data blocks")?;
+    // The index partitions follow the data section.
+    let first_partition = last.offset().0 + u64::from(last.size());
+    flip_payload_bit(&table, &file, first_partition)?;
+
+    let before = table.metrics.ecc_recovered_count();
+    table
+        .maintenance_index_walk()
+        .collect::<crate::Result<Vec<_>>>()?;
+    let after_maintenance = table.metrics.ecc_recovered_count();
+    table
+        .block_index
+        .iter()
+        .collect::<crate::Result<Vec<_>>>()?;
+    assert!(
+        table.metrics.ecc_recovered_count() > after_maintenance,
+        "the fixture must corrupt a partition a walk repairs",
+    );
+    assert!(
+        after_maintenance > before,
+        "the repair a maintenance walk made must reach the ECC counters",
+    );
+    Ok(())
+}
+
+/// A report leaves the block cache as it found it: a block it loaded and
+/// cached would turn a later cold read into a hit, and the read counters of
+/// whatever runs next would depend on whether the report was polled.
+#[cfg(all(feature = "metrics", feature = "page_ecc", feature = "std"))]
+#[test]
+fn live_item_count_for_a_report_caches_nothing() -> crate::Result<()> {
+    let dir = tempdir()?;
+    let (file, checksum) = write_ecc_two_level_table(&dir)?;
+    // The offsets are found on an uncached instance, so the report below
+    // starts from a cache nothing has touched.
+    let (straddle, first_partition) = {
+        let probe = recover_with_cache(
+            &file,
+            checksum,
+            Arc::new(crate::Cache::with_capacity_bytes(0)),
+        )?;
+        let last = probe
+            .block_index
+            .iter()
+            .next_back()
+            .expect("the table has data blocks")?;
+        (
+            probe.punch_offset_for(b"d")?,
+            last.offset().0 + u64::from(last.size()),
+        )
+    };
+    let table = recover_with_cache(
+        &file,
+        checksum,
+        Arc::new(crate::Cache::with_capacity_bytes(10_000_000)),
+    )?;
+    let restricted = table.with_restriction(crate::UserKey::from(&b"d"[..]));
+
+    assert_eq!(
+        5,
+        restricted.live_item_count(crate::table::util::ReadCharge::Report)?
+    );
+    let id = table.global_id();
+    assert!(
+        !table
+            .cache
+            .has_block(id, crate::table::BlockOffset(straddle)),
+        "a report must not cache the straddling block it read",
+    );
+    assert!(
+        !table
+            .cache
+            .has_block(id, crate::table::BlockOffset(first_partition)),
+        "a report must not cache the index partitions it walked",
+    );
+    Ok(())
+}
+
 /// Without a zone map the count is apportioned over data bytes, but the
 /// straddling block is still counted exactly: apportioning it whole credited
 /// the view with every row below the bound.
@@ -3485,6 +3667,7 @@ fn load_block_range_tombstone_metrics() -> crate::Result<()> {
         None,
         #[cfg(feature = "metrics")]
         &metrics,
+        crate::table::util::ReadCharge::Foreground,
     )?;
 
     assert_eq!(1, metrics.range_tombstone_block_load_io.load(Relaxed));
@@ -3508,6 +3691,7 @@ fn load_block_range_tombstone_metrics() -> crate::Result<()> {
         None,
         #[cfg(feature = "metrics")]
         &metrics,
+        crate::table::util::ReadCharge::Foreground,
     )?;
 
     assert_eq!(1, metrics.range_tombstone_block_load_io.load(Relaxed));
@@ -3582,6 +3766,7 @@ fn load_block_cache_hit_rejects_wrong_block_type() -> crate::Result<()> {
         None,
         #[cfg(feature = "metrics")]
         &metrics,
+        crate::table::util::ReadCharge::Foreground,
     )?;
 
     // Now request the same offset but claim it is a Data block.  The block is
@@ -3602,6 +3787,7 @@ fn load_block_cache_hit_rejects_wrong_block_type() -> crate::Result<()> {
         None,
         #[cfg(feature = "metrics")]
         &metrics,
+        crate::table::util::ReadCharge::Foreground,
     );
 
     assert!(
@@ -3660,6 +3846,7 @@ fn a_block_rejected_for_its_role_counts_what_its_transform_decoded() -> crate::R
         None,
         None,
         &metrics,
+        crate::table::util::ReadCharge::Foreground,
     );
     assert!(
         matches!(&result, Err(crate::Error::InvalidTag(("BlockType", _)))),
@@ -3728,6 +3915,7 @@ fn index_frame_decoded_len(table: &Table) -> crate::Result<u64> {
         None,
         None,
         &crate::metrics::Metrics::default(),
+        crate::table::util::ReadCharge::Foreground,
     )?;
     Ok(block.data.len() as u64)
 }
@@ -3761,6 +3949,7 @@ fn a_handle_refused_before_reading_counts_no_bytes() -> crate::Result<()> {
         None,
         None,
         &metrics,
+        crate::table::util::ReadCharge::Foreground,
     );
     assert!(
         matches!(&result, Err(crate::Error::DecompressedSizeTooLarge { .. })),
@@ -4012,6 +4201,7 @@ fn load_block_records_heal_hint_on_persistent_ecc_correction() -> crate::Result<
             Some(&clean_sink),
             #[cfg(feature = "metrics")]
             &metrics,
+            crate::table::util::ReadCharge::Foreground,
         )?;
         assert!(
             clean_sink.snapshot().is_empty(),
@@ -4055,6 +4245,7 @@ fn load_block_records_heal_hint_on_persistent_ecc_correction() -> crate::Result<
         Some(&sink),
         #[cfg(feature = "metrics")]
         &metrics,
+        crate::table::util::ReadCharge::Foreground,
     )?;
     assert_eq!(
         block.header.block_type,
@@ -4104,6 +4295,7 @@ fn load_block_records_heal_hint_on_persistent_ecc_correction() -> crate::Result<
         Some(&off_sink),
         #[cfg(feature = "metrics")]
         &metrics,
+        crate::table::util::ReadCharge::Foreground,
     )?;
     assert_eq!(
         block.header.block_type,

@@ -46,6 +46,10 @@ pub struct SliceIndexes(pub usize, pub usize);
 /// picker can rewrite it clean. `None` disables that scheduling (the payload is
 /// still healed and returned). A cache hit never triggers this path: the cached
 /// bytes were already verified on their original read.
+///
+/// `charge` says whose read this is: only a foreground read reaches the read
+/// and load counters, and a report neither fills the cache nor promotes what
+/// it finds there. Page-ECC recoveries are counted for every reader.
 #[expect(
     clippy::too_many_arguments,
     reason = "block loading requires table id, path, file accessor, cache, handle, block type, compression, and heal context"
@@ -63,6 +67,7 @@ pub fn load_block(
     #[cfg(zstd_any)] zstd_dict: Option<&crate::compression::ZstdDictionary>,
     heal_hints: Option<&crate::heal_hints::HealHints>,
     #[cfg(feature = "metrics")] metrics: &Metrics,
+    charge: ReadCharge,
 ) -> crate::Result<Block> {
     #[cfg(feature = "metrics")]
     use core::sync::atomic::Ordering::Relaxed;
@@ -79,7 +84,12 @@ pub fn load_block(
         return Err(crate::Error::InvalidTag(("BlockType", block_type.into())));
     }
 
-    if let Some(block) = cache.get_block(table_id, handle.offset()) {
+    let cached = if charge.touches_cache() {
+        cache.get_block(table_id, handle.offset())
+    } else {
+        cache.peek_block(table_id, handle.offset())
+    };
+    if let Some(block) = cached {
         // Per-KV checking is a header flag, not a block type, so a data
         // block is always BlockType::Data on disk — an exact role match is
         // the right swap-defence check here.
@@ -91,31 +101,8 @@ pub fn load_block(
         }
 
         #[cfg(feature = "metrics")]
-        match block_type {
-            BlockType::Filter => {
-                metrics.filter_block_load_cached.fetch_add(1, Relaxed);
-            }
-            BlockType::Index => {
-                metrics.index_block_load_cached.fetch_add(1, Relaxed);
-            }
-            BlockType::RangeTombstone => {
-                metrics
-                    .range_tombstone_block_load_cached
-                    .fetch_add(1, Relaxed);
-            }
-            BlockType::Data | BlockType::Meta | BlockType::Columnar => {
-                metrics.data_block_load_cached.fetch_add(1, Relaxed);
-            }
-            // Manifest variants are rejected by the function-level guard
-            // above; the block-layout section is loaded once on open via
-            // `Block::from_file`, never through this cached data-block path.
-            BlockType::Manifest
-            | BlockType::ManifestFooter
-            | BlockType::BlockLayout
-            | BlockType::Locator
-            | BlockType::SeqnoBounds
-            | BlockType::ZoneMap
-            | BlockType::DeleteBitmap => {}
+        if charge.is_counted() {
+            record_block_load_cached(metrics, block_type);
         }
 
         return Ok(block);
@@ -125,7 +112,9 @@ pub fn load_block(
 
     // Only track descriptor-table cache metrics; pinned FDs (None) are not cache events.
     #[cfg(feature = "metrics")]
-    if let Some(hit) = cache_event {
+    if let Some(hit) = cache_event
+        && charge.is_counted()
+    {
         if hit {
             metrics.table_file_opened_cached.fetch_add(1, Relaxed);
         } else {
@@ -158,12 +147,15 @@ pub fn load_block(
         &transform,
         || {
             #[cfg(feature = "metrics")]
-            record_block_read(metrics, block_type, handle.size().into());
+            if charge.is_counted() {
+                record_block_read(metrics, block_type, handle.size().into());
+            }
         },
     )?;
-    // Count the on-read ECC recovery (by mechanism) at this primary read site.
-    // The persistence-confirming re-read below goes through a path that does
-    // NOT count, so a single fault is counted exactly once.
+    // Count the on-read ECC recovery (by mechanism) at this primary read site,
+    // whoever the reader is: it is a health signal about the medium. The
+    // persistence-confirming re-read below goes through a path that does NOT
+    // count, so a single fault is counted exactly once.
     #[cfg(feature = "metrics")]
     if let Some(kind) = recovery {
         metrics.record_ecc_recovery(kind);
@@ -181,9 +173,11 @@ pub fn load_block(
     // the transform has run whether or not the block turns out to be the one
     // the caller asked for.
     #[cfg(feature = "metrics")]
-    metrics
-        .block_bytes_decoded
-        .fetch_add(block.data.len() as u64, Relaxed);
+    if charge.is_counted() {
+        metrics
+            .block_bytes_decoded
+            .fetch_add(block.data.len() as u64, Relaxed);
+    }
 
     if block.header.block_type != block_type {
         return Err(crate::Error::InvalidTag((
@@ -193,7 +187,9 @@ pub fn load_block(
     }
 
     #[cfg(feature = "metrics")]
-    record_block_loaded(metrics, block_type);
+    if charge.is_counted() {
+        record_block_loaded(metrics, block_type);
+    }
 
     // ECC recovered this block's payload from parity. The bytes returned below
     // are correct, but the on-disk copy is still faulty: when auto-heal is on,
@@ -214,13 +210,38 @@ pub fn load_block(
             #[cfg(feature = "metrics")]
             metrics,
             #[cfg(feature = "metrics")]
-            ReadCharge::Foreground,
+            charge,
         );
     }
 
-    cache.insert_block(table_id, handle.offset(), block.clone());
+    if charge.touches_cache() {
+        cache.insert_block(table_id, handle.offset(), block.clone());
+    }
 
     Ok(block)
+}
+
+/// Counts one block served from the block cache under its role.
+#[cfg(feature = "metrics")]
+fn record_block_load_cached(metrics: &Metrics, block_type: BlockType) {
+    use core::sync::atomic::Ordering::Relaxed;
+    let cached = match block_type {
+        BlockType::Filter => &metrics.filter_block_load_cached,
+        BlockType::Index => &metrics.index_block_load_cached,
+        BlockType::RangeTombstone => &metrics.range_tombstone_block_load_cached,
+        BlockType::Data | BlockType::Meta | BlockType::Columnar => &metrics.data_block_load_cached,
+        // Manifest variants are rejected by `load_block`'s guard before any
+        // cache lookup; the remaining sections are loaded once on open via
+        // `Block::from_file`, never through this cached path.
+        BlockType::Manifest
+        | BlockType::ManifestFooter
+        | BlockType::BlockLayout
+        | BlockType::Locator
+        | BlockType::SeqnoBounds
+        | BlockType::ZoneMap
+        | BlockType::DeleteBitmap => return,
+    };
+    cached.fetch_add(1, Relaxed);
 }
 
 /// Charges one uncached block read to its role's requested-bytes counter:
@@ -460,14 +481,35 @@ pub(crate) fn maybe_record_persistent_heal(
 }
 
 /// Whose read a block read belongs to, which decides whether it is charged to
-/// the read-byte counters (see [`maybe_record_persistent_heal`] and
-/// `Table::live_item_count`).
+/// the read counters and whether it may fill the block cache.
+///
+/// Page-ECC recoveries are counted whoever read the block: they are a health
+/// signal about the medium, not a cost of the read.
 #[derive(Copy, Clone, Debug, Eq, PartialEq)]
-pub(crate) enum ReadCharge {
-    /// A read made for a caller: counted.
+pub enum ReadCharge {
+    /// A read made for a caller: counted, and cached like any read.
     Foreground,
-    /// Maintenance, such as a patrol scrub: not counted.
+    /// Maintenance, such as compaction or a patrol scrub: not counted.
     Maintenance,
+    /// A monitoring report: not counted, and it neither fills the block cache
+    /// nor touches a cached block's recency, so polling it leaves nothing a
+    /// later read can see.
+    Report,
+}
+
+impl ReadCharge {
+    /// Whether this read is charged to the read counters.
+    #[cfg(feature = "metrics")]
+    #[must_use]
+    pub(crate) const fn is_counted(self) -> bool {
+        matches!(self, Self::Foreground)
+    }
+
+    /// Whether this read may leave a trace in the block cache.
+    #[must_use]
+    pub(crate) const fn touches_cache(self) -> bool {
+        !matches!(self, Self::Report)
+    }
 }
 
 /// Outcome of patrol-scrubbing a single block via [`scrub_block`].

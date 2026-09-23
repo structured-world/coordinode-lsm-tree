@@ -14,7 +14,7 @@ use crate::{
         BlockHandle,
         block::ParsedItem,
         block_index::{BlockIndexIter, BlockIndexIterImpl},
-        util::load_block,
+        util::{ReadCharge, load_block},
     },
 };
 use alloc::sync::Arc;
@@ -403,6 +403,9 @@ pub struct Iter {
 
     #[cfg(feature = "metrics")]
     metrics: Arc<Metrics>,
+
+    /// Whose read this iteration is.
+    charge: ReadCharge,
 }
 
 impl Iter {
@@ -468,17 +471,21 @@ impl Iter {
 
             #[cfg(feature = "metrics")]
             metrics,
+            charge: ReadCharge::Foreground,
         }
     }
 
-    /// Detaches this iterator, and the index walk inside it, from the tree's
-    /// metrics: for maintenance such as a sub-compaction's input, which is not
-    /// a read a caller made.
-    #[cfg(feature = "metrics")]
+    /// Marks this iterator, and the index walk inside it, as maintenance such
+    /// as a sub-compaction's input: not a read a caller made, so it stays out
+    /// of the read counters while its Page-ECC recoveries are still counted.
     #[must_use]
-    pub(crate) fn uncounted(mut self) -> Self {
-        self.metrics = Arc::new(Metrics::default());
-        self.index_iter = self.index_iter.uncounted();
+    #[cfg_attr(
+        not(feature = "std"),
+        expect(dead_code, reason = "its compaction consumer is std-gated")
+    )]
+    pub(crate) fn for_maintenance(mut self) -> Self {
+        self.charge = ReadCharge::Maintenance;
+        self.index_iter = self.index_iter.with_charge(ReadCharge::Maintenance);
         self
     }
 
@@ -511,6 +518,7 @@ impl Iter {
             self.heal_hints.as_ref().map(AsRef::as_ref),
             #[cfg(feature = "metrics")]
             &self.metrics,
+            self.charge,
         )?;
         if self.columnar {
             #[cfg(feature = "columnar")]
@@ -546,7 +554,9 @@ impl Iter {
                 // from sub-columns are a gather. Charged before the result is
                 // judged: a block refused after a gather still did it.
                 #[cfg(feature = "metrics")]
-                self.metrics.record_gather(gathered);
+                if self.charge.is_counted() {
+                    self.metrics.record_gather(gathered);
+                }
                 #[cfg(not(feature = "metrics"))]
                 let _ = gathered;
                 return Ok(entries?.map(BlockSource::Columnar));
@@ -729,11 +739,13 @@ impl Iter {
             // `load_block`.
             || {
                 #[cfg(feature = "metrics")]
-                crate::table::util::record_block_read(
-                    &self.metrics,
-                    crate::table::block::BlockType::Data,
-                    handle.size().into(),
-                );
+                if self.charge.is_counted() {
+                    crate::table::util::record_block_read(
+                        &self.metrics,
+                        crate::table::block::BlockType::Data,
+                        handle.size().into(),
+                    );
+                }
             },
         )?;
         // The partial path bypasses `load_block`, so schedule auto-heal here too:
@@ -760,7 +772,7 @@ impl Iter {
                 #[cfg(feature = "metrics")]
                 &self.metrics,
                 #[cfg(feature = "metrics")]
-                crate::table::util::ReadCharge::Foreground,
+                self.charge,
             );
         }
         // Cold first touch (carried_resume None) or resume-grow from the cached
@@ -777,10 +789,12 @@ impl Iter {
         // read that decoded it. The prefix only grows across resumes.
         debug_assert!(payload.window_prime.len() >= decoded_before);
         #[cfg(feature = "metrics")]
-        self.metrics.block_bytes_decoded.fetch_add(
-            (payload.window_prime.len() - decoded_before) as u64,
-            core::sync::atomic::Ordering::Relaxed,
-        );
+        if self.charge.is_counted() {
+            self.metrics.block_bytes_decoded.fetch_add(
+                (payload.window_prime.len() - decoded_before) as u64,
+                core::sync::atomic::Ordering::Relaxed,
+            );
+        }
         #[cfg(not(feature = "metrics"))]
         let _ = decoded_before;
         // Covering this query decoded most of the block → promote: drop the
