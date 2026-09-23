@@ -1,5 +1,5 @@
 window.BENCHMARK_DATA = {
-  "lastUpdate": 1790104763476,
+  "lastUpdate": 1790163697925,
   "repoUrl": "https://github.com/structured-world/coordinode-lsm-tree",
   "entries": {
     "lsm-tree db_bench": [
@@ -23946,6 +23946,90 @@ window.BENCHMARK_DATA = {
             "value": 295689.4102090317,
             "unit": "ops/sec",
             "extra": "P50: 2.4us | P99: 13.9us | P99.9: 170.5us\nthreads: 1 | elapsed: 0.68s | num: 200000 | iterations: 3"
+          }
+        ]
+      },
+      {
+        "commit": {
+          "author": {
+            "email": "mail@polaz.com",
+            "name": "Dmitry Prudnikov",
+            "username": "polaz"
+          },
+          "committer": {
+            "email": "noreply@github.com",
+            "name": "GitHub",
+            "username": "web-flow"
+          },
+          "distinct": true,
+          "id": "741cf97015117a91ee1e42490c5c0a84f4c92472",
+          "message": "fix(manifest): name each table's place and refuse damage (#698)\n\n## Summary\n\n- **Run count overflow.** The manifest snapshot stored each level's run\ncount in a u8. A level with more than 255 runs wrapped on rotation, and\nthe next open failed as `Unrecoverable`. Each table record now names its\nown level (u8) and run (u32), the way RocksDB (`kNewFile4`) and Pebble\nwrite per-file records, and the snapshot carries no run or table counts.\nThe manifest format moves to V6. A V5 store is refused with\n`InvalidVersion(5)` at open and at `Config::repair` (manifest recovery\nreads the format label before any section), with a message pointing at\nthe offline converter (#672).\n- **Data loss in the tolerant recovery modes.** `PointInTimeRecovery`\nand `SkipAnyCorruptedRecords` opened past a damaged committed record.\nThe open then deleted every table file the recovered manifest no longer\nnamed, so one flipped byte in the edit log lost the tables named after\nit. Both modes are removed. A damaged snapshot section or a damaged\ncommitted edit now fails the open in every mode. Only a torn edit-log\ntail (an append the writer never finished) can be dropped, and only\nunder `TolerateCorruptedTailRecords`. `Config::repair` remains the way\nto rebuild a manifest from the tables on disk. This matches RocksDB and\nPebble, which both fail the open on a corrupt MANIFEST record.\n\n`ManifestRecoveryMode` loses two variants, and `RecoveryStats` is\nremoved.\n\nA fix for the 5.x line within the V5 format follows as a separate PR\nagainst `5.x.x`.\n\n## Testing\n\n- `tests/manifest_many_runs.rs`: 300 overlapping flushes, then a reopen\nkeeps every run and every key. Failed on `main` with `Unrecoverable`.\n-\n`a_corrupted_committed_edit_fails_the_open_in_every_mode_and_keeps_every_table`:\nfailed on `main` under PIT, which lost two of three tables.\n- Truncation and corruption inside snapshot sections are refused in\nevery mode (recovery unit tests).\n- A V5-labelled manifest is refused by recovery, and repair of such a\nstore returns `InvalidVersion(5)` instead of rebuilding it.\n- Tests, clippy (default and all features), formatting, doc tests, the\ndoc build and the no-std check pass.\n\nCloses #697\n\n\n<!-- This is an auto-generated comment: release notes by coderabbit.ai\n-->\n\n## Summary by CodeRabbit\n\n* **Compatibility**\n* The store now reads and writes format V6. Earlier formats, including\nV5, are refused during open and repair; V5 stores require an offline\nconverter.\n* Repair no longer rebuilds over a committed manifest with an\nunsupported format.\n\n* **Recovery**\n* Recovery now rejects damaged committed records and corrupted snapshot\nsections in both recovery modes. The optional tolerant mode can discard\na truncated final edit-log record.\n* Removed the `PointInTimeRecovery` and `SkipAnyCorruptedRecords`\nrecovery modes.\n\n* **Bug Fixes**\n  * Improved format-version errors with guidance on next steps.\n  * Fixed manifest recovery for levels containing more than 255 runs.\n\n<!-- end of auto-generated comment: release notes by coderabbit.ai -->",
+          "timestamp": "2026-09-23T14:34:21+03:00",
+          "tree_id": "ad6af7315ffcd0ef37be77df83462a0c68b3348a",
+          "url": "https://github.com/structured-world/coordinode-lsm-tree/commit/741cf97015117a91ee1e42490c5c0a84f4c92472"
+        },
+        "date": 1790163643381,
+        "tool": "customBiggerIsBetter",
+        "benches": [
+          {
+            "name": "mixed",
+            "value": 11986.553741104697,
+            "unit": "ops/sec",
+            "extra": "P50: 0.5us | P99: 10.9us | P99.9: 21.9us\nthreads: 1 | elapsed: 44.65s | num: 200000 | iterations: 3"
+          },
+          {
+            "name": "fillseq",
+            "value": 1788108.5950535731,
+            "unit": "ops/sec",
+            "extra": "P50: 0.2us | P99: 4.3us | P99.9: 15.3us\nthreads: 1 | elapsed: 0.11s | num: 200000 | iterations: 3"
+          },
+          {
+            "name": "fillrandom",
+            "value": 538702.8591093996,
+            "unit": "ops/sec",
+            "extra": "P50: 1.4us | P99: 6.9us | P99.9: 18.3us\nthreads: 1 | elapsed: 0.37s | num: 200000 | iterations: 3"
+          },
+          {
+            "name": "readrandom",
+            "value": 424748.54121812514,
+            "unit": "ops/sec",
+            "extra": "P50: 2.3us | P99: 7.0us | P99.9: 22.9us\nthreads: 1 | elapsed: 0.47s | num: 200000 | iterations: 3"
+          },
+          {
+            "name": "readseq",
+            "value": 2335697.300356682,
+            "unit": "ops/sec",
+            "extra": "P50: 0.2us | P99: 4.9us | P99.9: 7.2us\nthreads: 1 | elapsed: 0.09s | num: 200000 | iterations: 3"
+          },
+          {
+            "name": "seekrandom",
+            "value": 243919.84716743408,
+            "unit": "ops/sec",
+            "extra": "P50: 3.5us | P99: 8.7us | P99.9: 16.7us\nthreads: 1 | elapsed: 0.82s | num: 200000 | iterations: 3"
+          },
+          {
+            "name": "prefixscan",
+            "value": 134883.2793443337,
+            "unit": "ops/sec",
+            "extra": "P50: 6.3us | P99: 15.6us | P99.9: 39.0us\nthreads: 1 | elapsed: 1.48s | num: 200000 | iterations: 3"
+          },
+          {
+            "name": "overwrite",
+            "value": 571394.5538619462,
+            "unit": "ops/sec",
+            "extra": "P50: 1.5us | P99: 6.9us | P99.9: 13.8us\nthreads: 1 | elapsed: 0.35s | num: 200000 | iterations: 3"
+          },
+          {
+            "name": "mergerandom",
+            "value": 667782.5825587871,
+            "unit": "ops/sec",
+            "extra": "P50: 0.4us | P99: 4.4us | P99.9: 11.9us\nthreads: 1 | elapsed: 0.30s | num: 200000 | iterations: 3"
+          },
+          {
+            "name": "readwhilewriting",
+            "value": 256667.06595934342,
+            "unit": "ops/sec",
+            "extra": "P50: 2.6us | P99: 13.8us | P99.9: 173.4us\nthreads: 1 | elapsed: 0.78s | num: 200000 | iterations: 3"
           }
         ]
       }
