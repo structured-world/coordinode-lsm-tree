@@ -694,14 +694,6 @@ impl Iter {
             None => transform,
         };
         let block_handle = BlockHandle::new(handle.offset(), handle.size());
-        // The whole frame is asked of the filesystem on every partial read,
-        // including a resume-grow; charged as issued, like `load_block`.
-        #[cfg(feature = "metrics")]
-        crate::table::util::record_block_read(
-            &self.metrics,
-            crate::table::block::BlockType::Data,
-            handle.size().into(),
-        );
         let decoded_before = carried_resume
             .as_ref()
             .map_or(0, |resume| resume.window_prime.len());
@@ -715,6 +707,17 @@ impl Iter {
                 window_log: 0,
             },
             &transform,
+            // The whole frame is asked of the filesystem on every partial
+            // read, including a resume-grow; charged as issued, like
+            // `load_block`.
+            || {
+                #[cfg(feature = "metrics")]
+                crate::table::util::record_block_read(
+                    &self.metrics,
+                    crate::table::block::BlockType::Data,
+                    handle.size().into(),
+                );
+            },
         )?;
         // The partial path bypasses `load_block`, so schedule auto-heal here too:
         // an ECC-corrected frame read flags the SST for a healing rewrite (the

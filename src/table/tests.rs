@@ -3666,6 +3666,49 @@ fn index_frame_decoded_len(table: &Table) -> crate::Result<u64> {
     Ok(block.data.len() as u64)
 }
 
+/// A handle declaring more than a block can be is refused before any read is
+/// issued, so nothing was asked of the filesystem and nothing is counted.
+#[cfg(feature = "metrics")]
+#[test]
+fn a_handle_refused_before_reading_counts_no_bytes() -> crate::Result<()> {
+    use crate::{
+        CompressionType,
+        cache::Cache,
+        table::{BlockHandle, block::BlockType, util::load_block},
+    };
+
+    let dir = tempdir()?;
+    let (table, metrics, _frame) = one_row_table_and_its_index_frame(&dir)?;
+
+    let read_before = metrics.bytes_read();
+    let result = load_block(
+        table.global_id(),
+        &table.path,
+        &table.file_accessor,
+        &Cache::with_capacity_bytes(10_000_000),
+        &BlockHandle::new(table.regions.tli.offset(), u32::MAX),
+        BlockType::Data,
+        CompressionType::None,
+        None,
+        None,
+        #[cfg(zstd_any)]
+        None,
+        None,
+        &metrics,
+    );
+    assert!(
+        matches!(&result, Err(crate::Error::DecompressedSizeTooLarge { .. })),
+        "a handle past the size cap must be refused before reading",
+    );
+    assert_eq!(
+        metrics.bytes_read(),
+        read_before,
+        "no read was issued, so none may be counted",
+    );
+
+    Ok(())
+}
+
 /// A batched prewarm decodes each block before checking its role, so a block it
 /// then refuses to cache still counts what its transform produced; the read
 /// walk that falls back to reading it again counts its own decode on top.

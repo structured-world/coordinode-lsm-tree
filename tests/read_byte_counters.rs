@@ -918,6 +918,61 @@ fn a_compaction_counts_nothing_it_reads_or_opens() -> lsm_tree::Result<()> {
 }
 
 #[test]
+fn a_compaction_writing_a_delete_bitmap_counts_nothing_it_opens() -> lsm_tree::Result<()> {
+    // Opening a columnar table whose rows carry a positional delete bitmap
+    // walks its index a second time, to map each data block to its first row.
+    // That walk is part of opening the table, like the locator's, so a
+    // compaction that writes such a table must not move the read counters.
+    let folder = get_tmp_folder();
+    let AnyTree::Standard(tree) = Config::new(
+        folder.path(),
+        SequenceNumberCounter::default(),
+        SequenceNumberCounter::default(),
+    )
+    .open()?
+    else {
+        panic!("expected a standard tree");
+    };
+    tree.update_runtime_config(|cfg| {
+        cfg.columnar = true;
+        cfg.zone_map = true;
+        cfg.delete_strategy = lsm_tree::config::DeleteStrategyPolicy::all(
+            lsm_tree::config::DeleteStrategy::MergeOnRead,
+        );
+    })?;
+    for i in 0..200 {
+        tree.insert(key(i), vec![b'v'; 64], u64::from(i));
+    }
+    tree.remove_range(
+        UserKey::from(&key(0)[..]),
+        UserKey::from(&key(50)[..]),
+        1000,
+    );
+    tree.flush_active_memtable(0)?;
+
+    let m = tree.metrics();
+    let (read, decoded) = (m.bytes_read(), m.bytes_decoded());
+    tree.major_compact(64 * 1024 * 1024, 5000)?;
+    assert!(
+        tree.current_version()
+            .iter_tables()
+            .any(|t| !t.delete_bitmap().is_empty()),
+        "the compaction must write a delete bitmap for the walk to run",
+    );
+    assert_eq!(
+        m.bytes_read(),
+        read,
+        "opening the output was counted as a read"
+    );
+    assert_eq!(
+        m.bytes_decoded(),
+        decoded,
+        "opening the output was counted as a decode",
+    );
+    Ok(())
+}
+
+#[test]
 fn a_compaction_filter_reading_a_blob_counts_nothing() -> lsm_tree::Result<()> {
     // Compaction is maintenance: its input reads and decoding stay outside the
     // read counters. A filter that resolves a separated value runs inside that

@@ -45,7 +45,7 @@ pub mod fixtures;
 #[cfg(test)]
 mod tests;
 
-use crate::config::BenchConfig;
+use crate::config::{BenchConfig, DEFAULT_KEY_SIZE, DEFAULT_VALUE_SIZE};
 use crate::reporter::{Direction, Reporter};
 use crate::workloads::Workload;
 use fixtures::{Fixture, FixtureFn};
@@ -500,17 +500,34 @@ fn scenarios(config: &BenchConfig) -> Vec<Scenario> {
 }
 
 impl Workload for MixedLayout {
-    // The scenarios run one after another on the calling thread, and what they
-    // report is bytes per row, which concurrency does not move; a thread count
-    // other than one would only label the report with a setting it never used.
+    // The report is labelled with the run's settings, so a setting the
+    // scenarios do not use is refused rather than recorded. They run one after
+    // another on the calling thread and report bytes per row, which
+    // concurrency does not move; and each fixes its own key format, value
+    // lengths and tree kind, since those are what distinguish the scenarios.
+    // Cache, compression, block size and metadata placement do reach every
+    // fixture's tree.
     fn check_config(&self, config: &BenchConfig) -> Result<(), String> {
-        if config.threads == 1 {
+        let mut ignored = Vec::new();
+        if config.threads != 1 {
+            ignored.push(format!("--threads {}", config.threads));
+        }
+        if config.key_size != DEFAULT_KEY_SIZE {
+            ignored.push(format!("--key-size {}", config.key_size));
+        }
+        if config.value_size != DEFAULT_VALUE_SIZE {
+            ignored.push(format!("--value-size {}", config.value_size));
+        }
+        if config.use_blob_tree {
+            ignored.push("--use-blob-tree".to_string());
+        }
+        if ignored.is_empty() {
             Ok(())
         } else {
             Err(format!(
-                "mixed-layout runs its scenarios on one thread and reports bytes per \
-                 row; --threads {} is not supported",
-                config.threads,
+                "mixed-layout runs each scenario on one thread with its own key format, \
+                 value sizes and tree kind; it does not use {}",
+                ignored.join(", "),
             ))
         }
     }

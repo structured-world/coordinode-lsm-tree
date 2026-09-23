@@ -1318,8 +1318,22 @@ impl Block {
         identity: BlockIdentity,
         transform: &BlockTransform<'_>,
     ) -> crate::Result<(Self, EccStatus, Option<EccRecoveryKind>)> {
+        Self::from_file_issuing(file, handle, identity, transform, || {})
+    }
+
+    /// [`Self::from_file_with_recovery`] that calls `on_issue` once, right
+    /// before the filesystem read is issued: not for a handle refused before
+    /// any read, but still for a read that then fails. Read accounting hangs
+    /// off it, so it counts exactly the reads that were asked of the filesystem.
+    pub(crate) fn from_file_issuing(
+        file: &dyn FsFile,
+        handle: BlockHandle,
+        identity: BlockIdentity,
+        transform: &BlockTransform<'_>,
+        on_issue: impl FnOnce(),
+    ) -> crate::Result<(Self, EccStatus, Option<EccRecoveryKind>)> {
         let (header, payload, ecc_status, recovery) =
-            Self::read_verified_payload(file, handle, identity, transform)?;
+            Self::read_verified_payload(file, handle, identity, transform, on_issue)?;
         let data = Self::decompress_payload(&header, payload, transform)?;
         Ok((Self { header, data }, ecc_status, recovery))
     }
@@ -1346,6 +1360,9 @@ impl Block {
     /// on an undecodable header or a frame shorter than its own declaration,
     /// a checksum error when the payload fails and parity cannot recover it,
     /// plus any I/O and decrypt failure.
+    ///
+    /// `on_issue` runs once, immediately before the frame is read, so a handle
+    /// refused by the checks above never reaches it.
     #[expect(
         clippy::too_many_lines,
         reason = "two ways to OBTAIN the payload (encrypted Vec vs zero-copy Slice), each with its own size caps and trailer classification"
@@ -1355,6 +1372,7 @@ impl Block {
         handle: BlockHandle,
         identity: BlockIdentity,
         transform: &BlockTransform<'_>,
+        on_issue: impl FnOnce(),
     ) -> crate::Result<(Header, Slice, EccStatus, Option<EccRecoveryKind>)> {
         let encryption = transform.encryption();
         // `identity` (tree/table + compression context) feeds AAD
@@ -1421,6 +1439,7 @@ impl Block {
             // uninitialized allocation (like Slice::builder_unzeroed) could be
             // used here if profiling shows this as a bottleneck.
             let mut buf = vec![0u8; block_size];
+            on_issue();
             let n = file.read_at(&mut buf, *handle.offset())?;
             if n != block_size {
                 return Err(crate::Error::Io(crate::io::Error::new(
@@ -1557,6 +1576,7 @@ impl Block {
             )
         } else {
             // Single I/O read — header + payload in one Slice.
+            on_issue();
             let buf = crate::file::read_exact(file, *handle.offset(), handle.size() as usize)?;
 
             let parsed_header = Header::decode_from(&mut &buf[..])?;
@@ -1845,9 +1865,10 @@ impl Block {
         handle: BlockHandle,
         identity: BlockIdentity,
         transform: &BlockTransform<'_>,
+        on_issue: impl FnOnce(),
     ) -> crate::Result<(Header, Slice, Option<EccRecoveryKind>)> {
         let (header, payload, _status, recovery) =
-            Self::read_verified_payload(file, handle, identity, transform)?;
+            Self::read_verified_payload(file, handle, identity, transform, on_issue)?;
         Ok((header, payload, recovery))
     }
 }

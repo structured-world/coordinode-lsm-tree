@@ -142,8 +142,10 @@ It is built only with the `counters` feature, which turns on the engine's
 them measures a slower engine than the one that ships. The rate workloads
 therefore run from the default build, and the dashboard runs this workload as
 a second pass from a `counters` build. It runs on one thread, since its figures
-are bytes per row and concurrency does not change them; `--threads` other than
-1 is refused rather than recorded against a run that did not use it.
+are bytes per row and concurrency does not change them, and each scenario fixes
+its own key format, value sizes and tree kind. `--threads` other than 1,
+`--key-size`, `--value-size` and `--use-blob-tree` are therefore refused rather
+than recorded against a run that did not use them.
 
 | Scenario | Shape |
 |---|---|

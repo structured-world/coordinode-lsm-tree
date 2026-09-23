@@ -293,6 +293,50 @@ fn mixed_layout_more_than_one_thread_is_refused() {
 }
 
 #[test]
+fn mixed_layout_shape_flags_it_ignores_are_refused() {
+    // Every scenario fixes its own key format, value lengths and tree kind, so
+    // --key-size, --value-size and --use-blob-tree change nothing it measures.
+    // A run that set them would be reported under a shape it never built.
+    use crate::config::{DEFAULT_KEY_SIZE, DEFAULT_VALUE_SIZE};
+    use crate::workloads::Workload;
+    let defaults = BenchConfig {
+        key_size: DEFAULT_KEY_SIZE,
+        value_size: DEFAULT_VALUE_SIZE,
+        ..config()
+    };
+    assert_eq!(super::MixedLayout.check_config(&defaults), Ok(()));
+    for (what, overridden) in [
+        (
+            "--key-size",
+            BenchConfig {
+                key_size: 64,
+                ..defaults.clone()
+            },
+        ),
+        (
+            "--value-size",
+            BenchConfig {
+                value_size: 1_024,
+                ..defaults.clone()
+            },
+        ),
+        (
+            "--use-blob-tree",
+            BenchConfig {
+                use_blob_tree: true,
+                ..defaults.clone()
+            },
+        ),
+    ] {
+        let refused = super::MixedLayout.check_config(&overridden);
+        assert!(
+            refused.as_ref().is_err_and(|e| e.contains(what)),
+            "{what} is ignored by the workload and must be refused by name, got {refused:?}",
+        );
+    }
+}
+
+#[test]
 fn every_fixture_num_zero_builds_an_empty_oracle() {
     // `--num 0` is a valid run. Every fixture must finish with an empty oracle:
     // the scattered one searched for a stride coprime with the key count, and

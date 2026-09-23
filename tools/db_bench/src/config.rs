@@ -41,6 +41,12 @@ impl Compression {
     }
 }
 
+/// `--key-size` when the flag is not given.
+pub const DEFAULT_KEY_SIZE: usize = 16;
+
+/// `--value-size` when the flag is not given.
+pub const DEFAULT_VALUE_SIZE: usize = 100;
+
 #[derive(Debug, Clone)]
 pub struct BenchConfig {
     pub num: u64,

@@ -953,6 +953,7 @@ impl Table {
                 window_log: 0,
             },
             &transform,
+            || {},
         )?;
         // Swap-defence role check, mirroring `load_block`. Before the
         // decompress: a block that is not what the index claims has no
@@ -8248,7 +8249,12 @@ impl Table {
         } else {
             let mut map = crate::HashMap::default();
             let mut start: u32 = 0;
-            for keyed in block_index.iter() {
+            // Part of opening the table, not a read a caller made, so it stays
+            // out of the read counters like the locator walk below.
+            let walk = block_index.iter();
+            #[cfg(feature = "metrics")]
+            let walk = walk.uncounted();
+            for keyed in walk {
                 let keyed = keyed?;
                 map.insert(keyed.offset().0, start);
                 let row_count = zone_map

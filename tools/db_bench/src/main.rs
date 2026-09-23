@@ -30,11 +30,11 @@ struct Cli {
     num: u64,
 
     /// Key size in bytes.
-    #[arg(long, default_value = "16")]
+    #[arg(long, default_value_t = config::DEFAULT_KEY_SIZE)]
     key_size: usize,
 
     /// Value size in bytes.
-    #[arg(long, default_value = "100")]
+    #[arg(long, default_value_t = config::DEFAULT_VALUE_SIZE)]
     value_size: usize,
 
     /// Number of concurrent threads.

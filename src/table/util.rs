@@ -143,11 +143,10 @@ pub fn load_block(
         #[cfg(zstd_any)]
         zstd_dict,
     )?;
-    // Charged before the read is validated: a block that then fails its
-    // checksum, decryption or decompression was still asked of the filesystem.
-    #[cfg(feature = "metrics")]
-    record_block_read(metrics, block_type, handle.size().into());
-    let (block, ecc_status, recovery) = Block::from_file_with_recovery(
+    // Charged as the read is issued, before it is validated: a block that then
+    // fails its checksum, decryption or decompression was still asked of the
+    // filesystem, while a handle refused before reading asked nothing.
+    let (block, ecc_status, recovery) = Block::from_file_issuing(
         fd.as_ref(),
         *handle,
         crate::table::block::BlockIdentity {
@@ -157,6 +156,10 @@ pub fn load_block(
             window_log: 0,
         },
         &transform,
+        || {
+            #[cfg(feature = "metrics")]
+            record_block_read(metrics, block_type, handle.size().into());
+        },
     )?;
     // Count the on-read ECC recovery (by mechanism) at this primary read site.
     // The persistence-confirming re-read below goes through a path that does
