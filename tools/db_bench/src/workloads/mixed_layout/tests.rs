@@ -69,7 +69,7 @@ fn assert_ordinary_read_agrees(fixture: &Fixture, what: &str) {
 }
 
 #[test]
-fn every_fixture_builds_and_its_oracle_matches_an_ordinary_read() {
+fn every_fixture_ordinary_read_matches_oracle() {
     // Includes the fixtures of the unsupported scenarios: they are the ones
     // most at risk of rotting unnoticed, because the benchmark never builds
     // them.
@@ -101,7 +101,7 @@ fn every_fixture_builds_and_its_oracle_matches_an_ordinary_read() {
 }
 
 #[test]
-fn a_value_is_reproducible_from_its_seed_and_carries_its_filter_fields() {
+fn value_bytes_same_seed_reproduces_filter_fields() {
     // The oracle records 16 bytes per row instead of the value, so everything
     // downstream rests on the bytes being a pure function of the two numbers,
     // and on the predicate fields being readable back out of them.
@@ -126,7 +126,7 @@ fn a_value_is_reproducible_from_its_seed_and_carries_its_filter_fields() {
 }
 
 #[test]
-fn the_selectivity_fixture_separates_a_sparse_predicate_from_a_near_full_one() {
+fn selectivity_fixture_sparse_vs_near_full_selects_distinct_fractions() {
     // The two scenarios over this fixture only mean something if the
     // predicates really do select very different fractions: if both matched
     // most rows, the pair would measure one case twice.
@@ -175,7 +175,7 @@ fn selective_scans_sparse_predicate_reads_less_than_near_full() {
 }
 
 #[test]
-fn deletes_and_the_range_tombstone_remove_exactly_what_they_cover() {
+fn versions_fixture_deletes_and_range_tombstone_remove_exactly_covered_rows() {
     // The shape this fixture exists for. Asserted against the operations
     // performed rather than against a read: every fifth key was deleted, and a
     // contiguous slice in the middle was covered by a range tombstone, so the
@@ -254,7 +254,7 @@ fn scattered_blob_fixture_num_equal_to_preferred_stride_writes_every_key() {
 }
 
 #[test]
-fn the_scattered_blob_fixture_rewrites_more_than_it_writes_once() {
+fn scattered_blob_fixture_rewrite_rounds_overwrite_over_a_quarter() {
     // "Scattered" is a property of the write history, not of the final
     // content: a key's live blob has to sit in whichever file its last rewrite
     // round landed in. If the rounds stopped overlapping the first pass, the

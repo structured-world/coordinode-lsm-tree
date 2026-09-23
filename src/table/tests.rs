@@ -4059,11 +4059,8 @@ fn excised_probe_counts_the_bytes_it_reads() -> crate::Result<()> {
 
     // Zero the block's extent, the shape a hole punch leaves.
     let mut bytes = std::fs::read(&file)?;
-    #[allow(
-        clippy::cast_possible_truncation,
-        reason = "in-file block offset fits usize; only narrows on 32-bit targets"
-    )]
-    let (start, len) = (handle.offset().0 as usize, handle.size() as usize);
+    let start = usize::try_from(handle.offset().0).expect("block offset fits usize");
+    let len = usize::try_from(handle.size()).expect("block size fits usize");
     bytes[start..start + len].fill(0);
     std::fs::write(&file, &bytes)?;
     table.file_accessor.remove_for_table(&table.global_id());
