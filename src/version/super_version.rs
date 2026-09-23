@@ -380,7 +380,8 @@ impl SuperVersions {
     /// Persists the transition from `prior` to `next` to disk, durably, the
     /// incremental way: append one [`VersionEdit`](crate::version::edit::VersionEdit)
     /// to the current snapshot's log (the common, O(changed-levels) path), or
-    /// rotate when that log has grown past [`Self::log_rotate_bytes`].
+    /// rotate when that log has grown past [`Self::log_rotate_bytes`] or the
+    /// edit is too large for one log record.
     ///
     /// Rotation writes a fresh full snapshot for `next`, fsyncs it, and atomically
     /// repoints `CURRENT` (all inside [`persist_version`]); only after `CURRENT`
@@ -421,9 +422,19 @@ impl SuperVersions {
                 &mut self.edit_scratch,
                 self.sync_mode,
             ) {
-                Ok(appended) => {
+                Ok(Some(appended)) => {
                     self.log_bytes = Some(log_size + appended);
                     return Ok(());
+                }
+                // The edit is too large for one record and nothing was
+                // written: rotate below, since a snapshot holds a level of
+                // any size. The scratch grew to the oversized payload; give
+                // that back so the history does not hold a manifest-sized
+                // buffer for the rest of the tree's life.
+                Ok(None) => {
+                    self.edit_scratch.clear();
+                    self.edit_scratch
+                        .shrink_to(crate::version::framing::MAX_FRAME_PAYLOAD as usize);
                 }
                 Err(e) => {
                     // A failed append may have written a partial record; the
