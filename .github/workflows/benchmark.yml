@@ -136,9 +136,13 @@ jobs:
         with:
           toolchain: stable
 
+      # The build output is removed at the end of every run (last step), so
+      # the cache keeps only the downloaded crates: saving a target directory
+      # that step already emptied would only store an empty one.
       - uses: Swatinem/rust-cache@6323deb102c322ba6fcbdcafc7e3dddab59af2b6  # v2.9.2
         with:
           prefix-key: bench
+          cache-targets: false
 
       - name: Run benchmarks
         run: bash .github/scripts/run-benchmarks.sh 200000
@@ -406,3 +410,14 @@ jobs:
             git push origin gh-pages
             echo "::notice::published compare-rocksdb overlays to dev/compare/report/index.html"
           fi
+
+      # The workspace of a self-hosted runner survives the job, so every run's
+      # build of the engine and of db_bench would pile up on its disk. Removed
+      # whatever the job's outcome. tools/compare-rocksdb/target is kept: it
+      # holds RocksDB compiled from C++ source, a 15-25 minute rebuild that
+      # would otherwise land on every run of this serialised host.
+      - name: Remove this run's build output
+        if: always()
+        run: |
+          cargo clean
+          cargo clean --manifest-path tools/db_bench/Cargo.toml
