@@ -182,6 +182,30 @@ fn deletes_and_the_range_tombstone_remove_exactly_what_they_cover() {
 }
 
 #[test]
+fn the_scattered_blob_fixture_writes_every_key_whatever_the_row_count() {
+    // The strided first pass must be a permutation for EVERY row count. A
+    // fixed stride is not coprime with its own multiples, and at `--num 7919`
+    // the old one sent every step to key 0, leaving the rows the rewrite
+    // rounds skip absent and the scenario measuring a far smaller dataset.
+    let seqno = AtomicU64::new(1);
+    let config = BenchConfig {
+        num: 7_919,
+        ..config()
+    };
+    let fixture = fixtures::blobs_scattered(&config, &seqno).expect("fixture must build");
+    let absent = fixture
+        .oracle
+        .rows
+        .iter()
+        .filter(|r| r.expect.is_none())
+        .count();
+    assert_eq!(
+        absent, 0,
+        "{absent} of 7919 keys were never written by the strided pass",
+    );
+}
+
+#[test]
 fn the_scattered_blob_fixture_rewrites_more_than_it_writes_once() {
     // "Scattered" is a property of the write history, not of the final
     // content: a key's live blob has to sit in whichever file its last rewrite

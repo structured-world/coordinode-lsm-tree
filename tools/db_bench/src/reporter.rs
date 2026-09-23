@@ -2,6 +2,9 @@ use hdrhistogram::Histogram;
 use serde::Serialize;
 use std::time::{Duration, Instant};
 
+#[cfg(test)]
+mod tests;
+
 /// Derived metrics from a benchmark run.
 pub struct Summary {
     pub secs: f64,
@@ -28,6 +31,10 @@ pub struct Summary {
 /// configured `customBiggerIsBetter` for every series it draws, so a quantity
 /// that improves by shrinking is published as its reciprocal (rows per KiB,
 /// not bytes per row) rather than as a series that silently reads upside down.
+///
+/// Every output mode reports these in place of the rate: the dashboard entries,
+/// the `--json` report and the human summary.
+#[derive(Serialize)]
 pub struct PublishedSeries {
     pub name: String,
     pub value: f64,
@@ -173,6 +180,15 @@ impl Reporter {
     /// would hide genuine perf changes alongside the variance it
     /// was originally introduced to mask.
     pub fn print_human(&self, benchmark: &str, entry_size: usize) {
+        if !self.published.is_empty() {
+            for series in &self.published {
+                println!(
+                    "{benchmark} / {}: {:.3} {}\n{:20} {}",
+                    series.name, series.value, series.unit, "", series.extra,
+                );
+            }
+            return;
+        }
         let s = self.summary(entry_size);
         println!(
             "{benchmark:<20} {:>12} ops in {:.2}s  ({:>12.0} ops/sec, {:.1} MB/sec)",
@@ -189,10 +205,10 @@ impl Reporter {
     pub fn to_json(&self, benchmark: &str, config: &JsonConfig) -> String {
         let s = self.summary(config.entry_size);
 
-        let report = JsonReport {
-            benchmark: benchmark.to_string(),
-            config: config.clone(),
-            elapsed_secs: s.secs,
+        // A workload that published its own series reports those instead of
+        // the rate, exactly as on the dashboard: the rate would count
+        // scenarios per second, which says nothing about the engine.
+        let rate = self.published.is_empty().then_some(Rate {
             ops_total: s.ops,
             ops_per_sec: s.ops_per_sec,
             mb_per_sec: s.mb_per_sec,
@@ -202,6 +218,13 @@ impl Reporter {
                 p999: s.p999,
                 p9999: s.p9999,
             },
+        });
+        let report = JsonReport {
+            benchmark: benchmark.to_string(),
+            config: config.clone(),
+            elapsed_secs: s.secs,
+            rate,
+            series: &self.published,
         };
 
         // Serialization of a fixed struct with primitive fields cannot fail.
@@ -225,10 +248,20 @@ pub struct JsonConfig {
 }
 
 #[derive(Serialize)]
-struct JsonReport {
+struct JsonReport<'a> {
     benchmark: String,
     config: JsonConfig,
     elapsed_secs: f64,
+    /// The rate fields, flattened into the report; absent when the workload
+    /// published series instead.
+    #[serde(flatten, skip_serializing_if = "Option::is_none")]
+    rate: Option<Rate>,
+    #[serde(skip_serializing_if = "<[_]>::is_empty")]
+    series: &'a [PublishedSeries],
+}
+
+#[derive(Serialize)]
+struct Rate {
     ops_total: u64,
     ops_per_sec: f64,
     mb_per_sec: f64,

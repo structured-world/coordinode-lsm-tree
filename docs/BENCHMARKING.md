@@ -88,7 +88,7 @@ and read through `AbstractTree::metrics()`.
 | `bytes_read` | Bytes requested from the `Fs` trait: a block's on-disk size summed over the block roles (data, index, filter, range tombstone), plus the on-disk span of every blob record a key-value-separated tree resolved (a coalesced prefetch charges its whole extent, gaps included, because that is what it read). | Device I/O. The OS page cache, readahead and request coalescing sit below this line. Anything served from a cache, block or blob, asks for nothing and adds nothing. |
 | `blob_bytes_read` | The blob-only share of `bytes_read`, so a scan can be asked whether it paid for the blobs of rows it then discarded. | Everything the block roles cover. |
 | `bytes_decoded` | Payload bytes produced after the transform — what decompression, decryption and Page-ECC verification turned the bytes read into, for blocks and for blob records alike. | Anything on a cached path: a cached block or blob is already decoded, so no transform runs for it. |
-| `bytes_copied` | Bytes moved by a **gather**: column-batch accumulation, batch filtering, row gathering by index, and row-value reconstruction from sub-columns. The figure is the size of the RESULT. | Transform output (that is `bytes_decoded`), write-path serialisation, and moves that transfer ownership without duplicating bytes. |
+| `bytes_copied` | Bytes moved by a **gather**: column-batch accumulation, batch filtering, row gathering by index, and row-value reconstruction from sub-columns, on every read that performs one (single-segment and merged columnar scans, row iteration and point reads of a columnar segment) and in salvage. The figure is the size of the RESULT. | Transform output (that is `bytes_decoded`), write-path serialisation, the input decoding of compaction and repair (maintenance, not reads), and moves that transfer ownership without duplicating bytes. |
 
 **Why the definitions are written down rather than inferred.** "Bytes read"
 can plausibly mean either bytes asked of the filesystem or bytes the device
@@ -147,8 +147,8 @@ cd tools/db_bench && cargo run --release -- --benchmark mixed-layout --num 70000
 | `versions-deletes-tombstones` | Several versions per key, a fifth point-deleted, a contiguous slice covered by a range tombstone, read at `SeqNo::MAX`. |
 | `selective-scan-sparse` | A predicate matching ~1% of rows. Where materializing before the predicate runs wastes nearly all the work. |
 | `selective-scan-near-full` | A predicate matching ~90%, over the same fixture. Deferring materialization buys almost nothing here and its bookkeeping can cost more than it saves, so the two are read together. |
-| `blobs-well-placed` | Values far above the separation threshold, written once in key order, so neighbours' blobs are adjacent. |
-| `blobs-scattered` | The same blobs written in a strided order and rewritten in several flushed rounds, so a key's live blob sits in whichever file its last round landed in. |
+| `blobs-well-placed` | Values far above the separation threshold, written once in key order, so neighbours' blobs are adjacent. Read by a full scan, the pass where adjacent blobs are fetched ahead and merged into one read. |
+| `blobs-scattered` | The same blobs written in a strided order and rewritten in several flushed rounds, so a key's live blob sits in whichever file its last round landed in. Read by the same full scan, so the gap to the well-placed figure is what placement costs. |
 | `blobs-filtered-before-fetch` | **Unsupported.** Needs materialization deferred past the filter, so discarded rows' blobs are never fetched. |
 
 **Every scenario checks what it read.** A pass that only counted rows would
@@ -170,7 +170,9 @@ one line rather than a fresh argument about what the expected result is.
 counter, named `mixed-layout / <scenario> rows per KiB read` (and `… decoded`),
 in place of the ops/sec every other workload reports — for a scenario sweep the
 rate counts scenarios per second, which describes the harness rather than the
-engine. The unit is inverted because the dashboard draws every series
+engine. The `--json` report and the plain summary carry the same series in
+place of the rate. The fixtures open their trees with the run's cache and
+metadata flags, so `--cache-mb 0` measures cold reads here as everywhere else. The unit is inverted because the dashboard draws every series
 bigger-is-better and all three counters improve by shrinking: more rows out of
 the same kibibyte is the improvement. `bytes_copied` stays in each point's
 annotation rather than becoming a series, because it is legitimately zero for a

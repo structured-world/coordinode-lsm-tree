@@ -22,7 +22,7 @@
 
 use crate::config::BenchConfig;
 use lsm_tree::runtime_config::RuntimeConfig;
-use lsm_tree::{AbstractTree, AnyTree, Config, SequenceNumberCounter};
+use lsm_tree::{AbstractTree, AnyTree};
 use std::sync::atomic::{AtomicU64, Ordering};
 use tempfile::TempDir;
 
@@ -135,7 +135,8 @@ fn key(i: u64) -> Vec<u8> {
 }
 
 /// How a fixture's tree is opened. Only the knobs the shapes actually differ
-/// in: everything else follows the benchmark configuration.
+/// in: everything else, the cache included, follows the benchmark
+/// configuration, so a cold-read run (`--cache-mb 0`) is cold here too.
 #[derive(Clone, Copy, Default)]
 struct Opening {
     columnar: bool,
@@ -146,16 +147,7 @@ fn open(dir: &TempDir, config: &BenchConfig, opening: Opening) -> lsm_tree::Resu
     let mut rc = RuntimeConfig::default();
     rc.columnar = opening.columnar;
 
-    let mut builder = Config::new(
-        dir.path(),
-        SequenceNumberCounter::default(),
-        SequenceNumberCounter::default(),
-    )
-    .with_runtime_config(rc)
-    .data_block_size_policy(lsm_tree::config::BlockSizePolicy::all(config.block_size))
-    .data_block_compression_policy(lsm_tree::config::CompressionPolicy::all(
-        config.compression.to_lsm(),
-    ));
+    let mut builder = crate::config::tree_builder(dir.path(), config)?.with_runtime_config(rc);
 
     if opening.kv_separation {
         builder = builder.with_kv_separation(Some(Default::default()));
@@ -296,23 +288,18 @@ pub fn columnar_base_row_updates(
     )?;
     let n = config.num.min(100_000);
 
-    let mut rows: Vec<Row> = (0..n)
-        .map(|i| Row {
+    let mut rows = Vec::with_capacity(n as usize);
+    for i in 0..n {
+        let value = Value {
+            seed: i,
+            len: HEADER_LEN + 96,
+        };
+        tree.insert(key(i), value.bytes(), seqno.fetch_add(1, Ordering::Relaxed));
+        rows.push(Row {
             key: key(i),
-            expect: Some(Value {
-                seed: i,
-                len: HEADER_LEN + 96,
-            }),
+            expect: Some(value),
             selected: true,
-        })
-        .collect();
-    for row in &rows {
-        let value = row.expect.expect("base rows are all present");
-        tree.insert(
-            row.key.clone(),
-            value.bytes(),
-            seqno.fetch_add(1, Ordering::Relaxed),
-        );
+        });
     }
     tree.flush_active_memtable(0)?;
 
@@ -349,23 +336,18 @@ pub fn versions_deletes_tombstones(
     let tree = open(&dir, config, Opening::default())?;
     let n = config.num.min(100_000);
 
-    let mut rows: Vec<Row> = (0..n)
-        .map(|i| Row {
+    let mut rows = Vec::with_capacity(n as usize);
+    for i in 0..n {
+        let value = Value {
+            seed: i,
+            len: HEADER_LEN + 32,
+        };
+        tree.insert(key(i), value.bytes(), seqno.fetch_add(1, Ordering::Relaxed));
+        rows.push(Row {
             key: key(i),
-            expect: Some(Value {
-                seed: i,
-                len: HEADER_LEN + 32,
-            }),
+            expect: Some(value),
             selected: true,
-        })
-        .collect();
-    for row in &rows {
-        let value = row.expect.expect("first pass writes every key");
-        tree.insert(
-            row.key.clone(),
-            value.bytes(),
-            seqno.fetch_add(1, Ordering::Relaxed),
-        );
+        });
     }
     tree.flush_active_memtable(0)?;
 
@@ -477,6 +459,13 @@ pub fn blobs_well_placed(config: &BenchConfig, seqno: &AtomicU64) -> lsm_tree::R
     })
 }
 
+fn gcd(mut a: u64, mut b: u64) -> u64 {
+    while b != 0 {
+        (a, b) = (b, a % b);
+    }
+    a
+}
+
 /// The same blobs, deliberately scattered.
 ///
 /// Written in a strided order and then rewritten in several rounds with a
@@ -505,11 +494,15 @@ pub fn blobs_scattered(config: &BenchConfig, seqno: &AtomicU64) -> lsm_tree::Res
         })
         .collect();
 
-    // A stride coprime with any n visits the key space out of order without
+    // A stride coprime with n visits the key space out of order without
     // repeating, so the first pass already writes neighbours far apart in time.
-    const STRIDE: u64 = 7_919;
+    // No fixed stride is coprime with every n (a stride divides its own
+    // multiples), so the first one at or above the preferred value is taken.
+    let stride = (7_919..)
+        .find(|&s| gcd(s, n) == 1)
+        .expect("n + 1 is coprime with n, so the search ends");
     for step in 0..n {
-        let i = step.wrapping_mul(STRIDE) % n;
+        let i = step.wrapping_mul(stride) % n;
         let value = Value {
             seed: i,
             len: HEADER_LEN + 8_192,

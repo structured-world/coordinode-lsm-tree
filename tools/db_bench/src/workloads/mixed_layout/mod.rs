@@ -58,8 +58,9 @@ pub struct MixedLayout;
 /// One measured read pass over a built fixture, returning the rows it emitted.
 ///
 /// It verifies as it goes and panics on disagreement: a measurement taken over
-/// wrong results is not a slower or faster number, it is not a number.
-type ReadFn = fn(&Fixture) -> u64;
+/// wrong results is not a slower or faster number, it is not a number. A read
+/// that FAILS is returned instead, so the run reports the engine's error.
+type ReadFn = fn(&Fixture) -> lsm_tree::Result<u64>;
 
 /// Whether a scenario's native path exists in this build.
 enum Support {
@@ -90,19 +91,22 @@ impl Readings {
     /// Differences, not absolutes: the fixture build reads as it compacts, and
     /// charging that to the scenario's read would bury the figure the scenario
     /// exists to report under the cost of creating its own input.
-    fn measure(tree: &AnyTree, body: impl FnOnce() -> u64) -> Self {
+    fn measure(
+        tree: &AnyTree,
+        body: impl FnOnce() -> lsm_tree::Result<u64>,
+    ) -> lsm_tree::Result<Self> {
         let m = tree.metrics();
         let (r0, d0, c0) = (m.bytes_read(), m.bytes_decoded(), m.bytes_copied());
         let start = Instant::now();
-        let rows = body();
+        let rows = body()?;
         let elapsed = start.elapsed();
-        Self {
+        Ok(Self {
             rows,
             bytes_read: m.bytes_read() - r0,
             bytes_decoded: m.bytes_decoded() - d0,
             bytes_copied: m.bytes_copied() - c0,
             elapsed,
-        }
+        })
     }
 
     /// Rows emitted per KiB the scenario moved, for one counter.
@@ -178,13 +182,10 @@ impl Readings {
 /// asserts presence, absence and content, so a build that lost a version, kept
 /// a deleted key or returned a neighbouring row fails here rather than
 /// publishing a fast number.
-fn verify_point_reads(fixture: &Fixture) -> u64 {
+fn verify_point_reads(fixture: &Fixture) -> lsm_tree::Result<u64> {
     let mut rows = 0_u64;
     for row in &fixture.oracle.rows {
-        let got = fixture
-            .tree
-            .get(&*row.key, SeqNo::MAX)
-            .expect("get must not fail");
+        let got = fixture.tree.get(&*row.key, SeqNo::MAX)?;
         match (&row.expect, got) {
             (Some(expected), Some(actual)) => {
                 assert_eq!(
@@ -212,33 +213,70 @@ fn verify_point_reads(fixture: &Fixture) -> u64 {
         "the pass emitted a different number of rows than the write history \
          says are visible",
     );
-    rows
+    Ok(rows)
 }
 
 /// Scans the whole key space, keeps the rows a predicate over the VALUE
-/// selects, and checks the selection against the oracle.
+/// selects, and checks every emitted row against the oracle.
 ///
-/// The predicate reads the field back out of what the scan returned, so a path
-/// that returned the wrong row's header cannot pass by agreeing with a
+/// The scan walks the visible rows of the write history in lockstep, so a
+/// missing, duplicated, reordered or wrong row fails at the first place it
+/// diverges; a count alone would let one omission and one wrong row cancel
+/// out. The predicate reads the field back out of what the scan returned, so a
+/// path that returned the wrong row's header cannot pass by agreeing with a
 /// predicate evaluated over the key.
-fn verify_selective_scan(fixture: &Fixture, predicate: fn(&[u8]) -> bool, expected: u64) -> u64 {
+fn verify_selective_scan(
+    fixture: &Fixture,
+    predicate: fn(&[u8]) -> bool,
+    expected: u64,
+) -> lsm_tree::Result<u64> {
+    let mut visible = fixture
+        .oracle
+        .rows
+        .iter()
+        .filter_map(|r| r.expect.map(|v| (&r.key, v)));
     let mut rows = 0_u64;
     for guard in fixture.tree.iter(SeqNo::MAX, None) {
-        let (_, value) = guard.into_inner().expect("scan must not fail");
+        let (key, value) = guard.into_inner()?;
+        let Some((want_key, want)) = visible.next() else {
+            panic!(
+                "the scan emitted {:?} after the last row the write history keeps",
+                String::from_utf8_lossy(&key),
+            );
+        };
+        assert_eq!(
+            &*key,
+            want_key.as_slice(),
+            "the scan emitted {:?} where the write history has {:?} next",
+            String::from_utf8_lossy(&key),
+            String::from_utf8_lossy(want_key),
+        );
+        assert_eq!(
+            &*value,
+            want.bytes().as_slice(),
+            "value disagrees with the write history for key {:?}",
+            String::from_utf8_lossy(&key),
+        );
         if predicate(&value) {
             rows += 1;
         }
+    }
+    if let Some((missed, _)) = visible.next() {
+        panic!(
+            "the scan ended before {:?}, which the write history keeps",
+            String::from_utf8_lossy(missed),
+        );
     }
     assert_eq!(
         rows, expected,
         "the predicate selected {rows} rows, the write history says {expected}",
     );
-    rows
+    Ok(rows)
 }
 
 /// ~1% selectivity: the case where materializing a row before the predicate
 /// runs wastes almost all of the work.
-fn scan_sparse(fixture: &Fixture) -> u64 {
+fn scan_sparse(fixture: &Fixture) -> lsm_tree::Result<u64> {
     let expected = fixture.oracle.selected();
     verify_selective_scan(fixture, |v| field_group(v) == Some(0), expected)
 }
@@ -246,7 +284,7 @@ fn scan_sparse(fixture: &Fixture) -> u64 {
 /// ~90% selectivity: the case where deferring materialization buys almost
 /// nothing and its bookkeeping can cost more than it saves. The right answer
 /// differs from the sparse case, which is why both are measured.
-fn scan_near_full(fixture: &Fixture) -> u64 {
+fn scan_near_full(fixture: &Fixture) -> lsm_tree::Result<u64> {
     let expected = fixture
         .oracle
         .rows
@@ -254,6 +292,18 @@ fn scan_near_full(fixture: &Fixture) -> u64 {
         .filter(|r| r.expect.is_some_and(|v| fixtures::bucket_of(v.seed) != 0))
         .count() as u64;
     verify_selective_scan(fixture, |v| field_bucket(v) != Some(0), expected)
+}
+
+/// Every visible row, resolved in key order.
+///
+/// The blob scenarios read through this rather than through point reads: a
+/// scan is where neighbouring blobs are fetched ahead and adjacent records
+/// merge into one read, so it is the only pass on which blob placement can
+/// move the byte counters. A point read fetches one record whatever sits
+/// next to it.
+fn scan_all(fixture: &Fixture) -> lsm_tree::Result<u64> {
+    let expected = fixture.oracle.visible();
+    verify_selective_scan(fixture, |_| true, expected)
 }
 
 /// A scenario: a fixture, and either the read pass that measures it or the
@@ -317,12 +367,12 @@ fn scenarios() -> Vec<Scenario> {
         Scenario {
             name: "blobs-well-placed",
             fixture: fixtures::blobs_well_placed,
-            support: Support::Native(verify_point_reads),
+            support: Support::Native(scan_all),
         },
         Scenario {
             name: "blobs-scattered",
             fixture: fixtures::blobs_scattered,
-            support: Support::Native(verify_point_reads),
+            support: Support::Native(scan_all),
         },
         Scenario {
             name: "blobs-filtered-before-fetch",
@@ -355,7 +405,7 @@ impl Workload for MixedLayout {
                 Support::Native(read) => {
                     let fixture = (scenario.fixture)(config, seqno)?;
                     let t = Instant::now();
-                    let readings = Readings::measure(&fixture.tree, || read(&fixture));
+                    let readings = Readings::measure(&fixture.tree, || read(&fixture))?;
                     reporter.record_duration(t.elapsed());
                     readings.report(name);
                     readings.publish(name, reporter);
