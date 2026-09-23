@@ -739,6 +739,8 @@ impl Iter {
                 self.heal_hints.as_ref().map(AsRef::as_ref),
                 #[cfg(feature = "metrics")]
                 &self.metrics,
+                #[cfg(feature = "metrics")]
+                crate::table::util::ReadCharge::Foreground,
             );
         }
         // Cold first touch (carried_resume None) or resume-grow from the cached

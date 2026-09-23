@@ -275,6 +275,24 @@ fn the_scattered_blob_fixture_rewrites_more_than_it_writes_once() {
 }
 
 #[test]
+fn mixed_layout_more_than_one_thread_is_refused() {
+    // The scenarios run one after another on one thread, and the figures are
+    // bytes per row, which concurrency does not change. A run asking for more
+    // threads would be recorded under a thread count it never used.
+    use crate::workloads::Workload;
+    assert!(
+        super::MixedLayout
+            .check_config(&BenchConfig {
+                threads: 2,
+                ..config()
+            })
+            .is_err(),
+        "a thread count the workload ignores must be refused, not reported",
+    );
+    assert_eq!(super::MixedLayout.check_config(&config()), Ok(()));
+}
+
+#[test]
 fn every_fixture_num_zero_builds_an_empty_oracle() {
     // `--num 0` is a valid run. Every fixture must finish with an empty oracle:
     // the scattered one searched for a stride coprime with the key count, and

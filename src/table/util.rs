@@ -210,6 +210,8 @@ pub fn load_block(
             heal_hints,
             #[cfg(feature = "metrics")]
             metrics,
+            #[cfg(feature = "metrics")]
+            ReadCharge::Foreground,
         );
     }
 
@@ -337,17 +339,19 @@ pub fn decode_prewarmed_blocks(
         // read walk would produce. A decode error (e.g. a block needing a re-read
         // recovery) just leaves it uncached for the walk to read authoritatively.
         let mut reader = crate::io::Cursor::new(&buf[..]);
-        if let Ok(block) = Block::from_reader(&mut reader, identity, &transform)
-            && block.header.block_type == block_type
-        {
-            // The read was charged when the batch was submitted; the decode is
-            // charged here, where the transform ran, since the later lookup
-            // that hits this cached block runs none.
-            #[cfg(feature = "metrics")]
-            metrics.block_bytes_decoded.fetch_add(
-                block.data.len() as u64,
-                core::sync::atomic::Ordering::Relaxed,
-            );
+        let Ok(block) = Block::from_reader(&mut reader, identity, &transform) else {
+            continue;
+        };
+        // The read was charged when the batch was submitted; the decode is
+        // charged here, where the transform ran, and before the role check: a
+        // block refused for its role was still decoded, and the read walk that
+        // then reads it authoritatively charges its own decode on top.
+        #[cfg(feature = "metrics")]
+        metrics.block_bytes_decoded.fetch_add(
+            block.data.len() as u64,
+            core::sync::atomic::Ordering::Relaxed,
+        );
+        if block.header.block_type == block_type {
             cache.insert_block(table_id, handle.offset(), block);
         }
     }
@@ -368,6 +372,10 @@ pub fn decode_prewarmed_blocks(
 /// Returns `true` when this call newly queued `table_id` for healing (confirmed
 /// persistent fault, scheduling enabled, not already queued). Read paths ignore
 /// the return; the patrol scrub uses it to count distinct SSTs it scheduled.
+///
+/// `charge` says whose read this confirms: a foreground read's confirming
+/// re-read goes into the read-byte counters like the read itself, a patrol
+/// scrub's does not, since the scrub's own read is maintenance and uncounted.
 #[expect(
     clippy::too_many_arguments,
     reason = "mirrors the block read context needed for the confirming re-read"
@@ -384,6 +392,7 @@ pub(crate) fn maybe_record_persistent_heal(
     #[cfg(zstd_any)] zstd_dict: Option<&crate::compression::ZstdDictionary>,
     heal_hints: Option<&crate::heal_hints::HealHints>,
     #[cfg(feature = "metrics")] metrics: &Metrics,
+    #[cfg(feature = "metrics")] charge: ReadCharge,
 ) -> bool {
     let Some(hints) = heal_hints else {
         return false;
@@ -391,10 +400,12 @@ pub(crate) fn maybe_record_persistent_heal(
     if !hints.is_enabled() {
         return false;
     }
-    // The confirming re-read is a second request for the whole block, charged
-    // as issued like the first.
+    // The confirming re-read of a foreground read is a second request for the
+    // whole block, charged as issued like the first.
     #[cfg(feature = "metrics")]
-    record_block_read(metrics, block_type, handle.size().into());
+    if charge == ReadCharge::Foreground {
+        record_block_read(metrics, block_type, handle.size().into());
+    }
     match reread_block_is_corrected(
         table_id,
         path,
@@ -409,9 +420,11 @@ pub(crate) fn maybe_record_persistent_heal(
     ) {
         Ok((corrected, decoded)) => {
             #[cfg(feature = "metrics")]
-            metrics
-                .block_bytes_decoded
-                .fetch_add(decoded, core::sync::atomic::Ordering::Relaxed);
+            if charge == ReadCharge::Foreground {
+                metrics
+                    .block_bytes_decoded
+                    .fetch_add(decoded, core::sync::atomic::Ordering::Relaxed);
+            }
             #[cfg(not(feature = "metrics"))]
             let _ = decoded;
             if !corrected {
@@ -441,6 +454,17 @@ pub(crate) fn maybe_record_persistent_heal(
             false
         }
     }
+}
+
+/// Whose read a confirming re-read belongs to, which decides whether it is
+/// charged to the read-byte counters (see [`maybe_record_persistent_heal`]).
+#[cfg(feature = "metrics")]
+#[derive(Copy, Clone, Debug, Eq, PartialEq)]
+pub(crate) enum ReadCharge {
+    /// A read made for a caller: counted.
+    Foreground,
+    /// Maintenance, such as a patrol scrub: not counted.
+    Maintenance,
 }
 
 /// Outcome of patrol-scrubbing a single block via [`scrub_block`].
@@ -562,6 +586,8 @@ pub(crate) fn scrub_block(
                 heal_hints,
                 #[cfg(feature = "metrics")]
                 metrics,
+                #[cfg(feature = "metrics")]
+                ReadCharge::Maintenance,
             );
             BlockScrubOutcome::Corrected { scheduled }
         }

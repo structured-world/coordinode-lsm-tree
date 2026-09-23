@@ -6791,19 +6791,20 @@ impl Table {
             window_log: 0,
         };
         let block = Block::from_reader(&mut crate::io::Cursor::new(bytes), identity, &transform)?;
+        // The transform ran here, outside the block cache, so its output is
+        // charged here, before the role check that may refuse the block; the
+        // read was charged when the batch was issued.
+        #[cfg(feature = "metrics")]
+        self.metrics.block_bytes_decoded.fetch_add(
+            block.data.len() as u64,
+            core::sync::atomic::Ordering::Relaxed,
+        );
         if block.header.block_type != BlockType::Data {
             return Err(crate::Error::InvalidTag((
                 "BlockType",
                 block.header.block_type.into(),
             )));
         }
-        // The transform ran here, outside the block cache, so its output is
-        // charged here; the read was charged when the batch was issued.
-        #[cfg(feature = "metrics")]
-        self.metrics.block_bytes_decoded.fetch_add(
-            block.data.len() as u64,
-            core::sync::atomic::Ordering::Relaxed,
-        );
         let has_kv_footer = self.metadata.kv_checksum_algo.is_some();
         DataBlock::from_loaded(block, has_kv_footer).map(Some)
     }

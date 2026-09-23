@@ -500,6 +500,21 @@ fn scenarios(config: &BenchConfig) -> Vec<Scenario> {
 }
 
 impl Workload for MixedLayout {
+    // The scenarios run one after another on the calling thread, and what they
+    // report is bytes per row, which concurrency does not move; a thread count
+    // other than one would only label the report with a setting it never used.
+    fn check_config(&self, config: &BenchConfig) -> Result<(), String> {
+        if config.threads == 1 {
+            Ok(())
+        } else {
+            Err(format!(
+                "mixed-layout runs its scenarios on one thread and reports bytes per \
+                 row; --threads {} is not supported",
+                config.threads,
+            ))
+        }
+    }
+
     fn run(
         &self,
         _tree: &AnyTree,

@@ -19,6 +19,12 @@ use std::sync::atomic::AtomicU64;
 
 /// All benchmark workloads implement this trait.
 pub trait Workload {
+    /// Refuses a configuration this workload cannot honour, before anything is
+    /// built, so a run is never reported under settings it did not use.
+    fn check_config(&self, _config: &BenchConfig) -> Result<(), String> {
+        Ok(())
+    }
+
     /// Run the benchmark, recording latencies into the reporter.
     fn run(
         &self,

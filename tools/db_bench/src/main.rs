@@ -311,6 +311,10 @@ fn run_single(
         cli.num, cli.key_size, cli.value_size, cli.threads, cli.cache_mb, iterations,
     );
 
+    create_workload(benchmark_name)
+        .ok_or_else(|| format!("unknown benchmark '{benchmark_name}'"))?
+        .check_config(bench_config)?;
+
     let entry_size = bench_config.entry_size();
 
     // Run N iterations, keep all results.

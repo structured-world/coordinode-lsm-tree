@@ -3607,6 +3607,224 @@ fn a_block_rejected_for_its_role_counts_what_its_transform_decoded() -> crate::R
     Ok(())
 }
 
+/// A one-row table opened with its own metrics, plus the on-disk bytes of its
+/// top-level index block: a checksum-valid block whose role is not Data, which
+/// is what a misdirected data-block handle lands on.
+#[cfg(feature = "metrics")]
+fn one_row_table_and_its_index_frame(
+    dir: &tempfile::TempDir,
+) -> crate::Result<(Table, Arc<crate::metrics::Metrics>, Vec<u8>)> {
+    let file = dir.path().join("table");
+    let mut writer = Writer::new(file.clone(), 0, 0, Arc::new(StdFs))?;
+    writer.write(InternalValue::from_components(
+        b"a",
+        b"v1",
+        1,
+        crate::ValueType::Value,
+    ))?;
+    let (_, checksum) = writer
+        .finish()?
+        .expect("finish() returns Some after writing data items");
+
+    let metrics = Arc::new(crate::metrics::Metrics::default());
+    let table = {
+        let mut params = test_recover_params(file.clone(), checksum);
+        params.cache = Arc::new(crate::cache::Cache::with_capacity_bytes(10_000_000));
+        params.metrics = metrics.clone();
+        Table::recover(params)?
+    };
+
+    let tli = table.regions.tli;
+    let start = usize::try_from(tli.offset().0).expect("block offset fits usize");
+    let end = start + tli.size() as usize;
+    let frame = std::fs::read(&file)?
+        .get(start..end)
+        .expect("the index block lies within the file")
+        .to_vec();
+    Ok((table, metrics, frame))
+}
+
+/// What one transform of the index block produces, decoded under its real role
+/// against throwaway metrics.
+#[cfg(feature = "metrics")]
+fn index_frame_decoded_len(table: &Table) -> crate::Result<u64> {
+    let block = crate::table::util::load_block(
+        table.global_id(),
+        &table.path,
+        &table.file_accessor,
+        &crate::cache::Cache::with_capacity_bytes(10_000_000),
+        &table.regions.tli,
+        crate::table::block::BlockType::Index,
+        crate::CompressionType::None,
+        None,
+        None,
+        #[cfg(zstd_any)]
+        None,
+        None,
+        &crate::metrics::Metrics::default(),
+    )?;
+    Ok(block.data.len() as u64)
+}
+
+/// A batched prewarm decodes each block before checking its role, so a block it
+/// then refuses to cache still counts what its transform produced; the read
+/// walk that falls back to reading it again counts its own decode on top.
+#[cfg(feature = "metrics")]
+#[test]
+fn a_prewarmed_block_rejected_for_its_role_counts_what_its_transform_decoded() -> crate::Result<()>
+{
+    use crate::{
+        CompressionType,
+        cache::Cache,
+        table::{block::BlockType, util::decode_prewarmed_blocks},
+    };
+
+    let dir = tempdir()?;
+    let (table, metrics, frame) = one_row_table_and_its_index_frame(&dir)?;
+    let cache = Cache::with_capacity_bytes(10_000_000);
+
+    let decoded_before = metrics.bytes_decoded();
+    decode_prewarmed_blocks(
+        table.global_id(),
+        &cache,
+        &[table.regions.tli],
+        &[&frame],
+        BlockType::Data,
+        CompressionType::None,
+        None,
+        None,
+        #[cfg(zstd_any)]
+        None,
+        &metrics,
+    );
+    assert!(
+        cache
+            .get_block(table.global_id(), table.regions.tli.offset())
+            .is_none(),
+        "the index block must not be cached as a data block",
+    );
+    assert_eq!(
+        metrics.bytes_decoded() - decoded_before,
+        index_frame_decoded_len(&table)?,
+        "the transform ran before the role check, so its output must be counted",
+    );
+
+    Ok(())
+}
+
+/// The chunked `multi_get` resolver decodes a block before checking its role,
+/// so a block it refuses still counts what its transform produced.
+#[cfg(feature = "metrics")]
+#[test]
+fn a_chunk_decoded_block_rejected_for_its_role_counts_what_its_transform_decoded()
+-> crate::Result<()> {
+    let dir = tempdir()?;
+    let (table, metrics, frame) = one_row_table_and_its_index_frame(&dir)?;
+
+    let decoded_before = metrics.bytes_decoded();
+    let result = table.decode_data_block_from_bytes(&frame);
+    assert!(
+        matches!(&result, Err(crate::Error::InvalidTag(("BlockType", _)))),
+        "the index block must be refused as a data block",
+    );
+    assert_eq!(
+        metrics.bytes_decoded() - decoded_before,
+        index_frame_decoded_len(&table)?,
+        "the transform ran before the role check, so its output must be counted",
+    );
+
+    Ok(())
+}
+
+/// A patrol scrub is maintenance: its own read of a block is not counted, and
+/// neither is the confirming re-read it makes after an ECC correction, so a
+/// scrub running beside a foreground workload leaves that workload's read and
+/// decode figures untouched. The heal it schedules is still recorded.
+#[cfg(all(feature = "metrics", feature = "page_ecc", feature = "std"))]
+#[test]
+fn a_patrol_scrub_that_corrects_a_block_counts_no_bytes() -> crate::Result<()> {
+    use crate::{
+        Cache,
+        heal_hints::HealHints,
+        table::{
+            BlockHandle,
+            block::{BlockType, EccParams, Header},
+            util::{BlockScrubOutcome, scrub_block},
+        },
+    };
+
+    let dir = tempdir()?;
+    let file = dir.path().join("table");
+    let mut writer =
+        Writer::new(file.clone(), 0, 0, Arc::new(StdFs))?.use_ecc(Some(EccParams::RS_4_2));
+    for i in 0..200u32 {
+        let key = format!("key{i:05}");
+        writer.write(InternalValue::from_components(
+            key.as_bytes(),
+            b"value-payload-bytes",
+            u64::from(i) + 1,
+            crate::ValueType::Value,
+        ))?;
+    }
+    let (_, checksum) = writer
+        .finish()?
+        .expect("finish() returns Some after writing data items");
+
+    let metrics = Arc::new(crate::metrics::Metrics::default());
+    let table = {
+        let mut params = test_recover_params(file.clone(), checksum);
+        params.cache = Arc::new(Cache::with_capacity_bytes(10_000_000));
+        params.metrics = metrics.clone();
+        Table::recover(params)?
+    };
+    let table_id = table.global_id();
+    let keyed = table
+        .block_index
+        .iter()
+        .next()
+        .expect("the table has a data block")?;
+    let handle = BlockHandle::new(keyed.offset(), keyed.size());
+
+    // One flipped payload bit: the scrub repairs it from parity, and the
+    // confirming re-read finds it again, so the fault is persistent.
+    let mut bytes = std::fs::read(&file)?;
+    let pos =
+        usize::try_from(handle.offset().0).expect("block offset fits usize") + Header::MIN_LEN + 3;
+    bytes[pos] ^= 0x80;
+    std::fs::write(&file, &bytes)?;
+    table.file_accessor.remove_for_table(&table_id);
+
+    let sink = HealHints::default();
+    sink.set_enabled(true);
+    let (read_before, decoded_before) = (metrics.bytes_read(), metrics.bytes_decoded());
+    let outcome = scrub_block(
+        table_id,
+        &table.path,
+        &table.file_accessor,
+        &handle,
+        BlockType::Data,
+        table.metadata.data_block_compression,
+        None,
+        table.metadata.ecc_params,
+        #[cfg(zstd_any)]
+        None,
+        Some(&sink),
+        &metrics,
+    )?;
+    assert_eq!(
+        outcome,
+        BlockScrubOutcome::Corrected { scheduled: true },
+        "the scrub corrects the block and confirms the fault persists",
+    );
+    assert_eq!(
+        (metrics.bytes_read(), metrics.bytes_decoded()),
+        (read_before, decoded_before),
+        "neither the scrub's read nor its confirming re-read is a foreground read",
+    );
+
+    Ok(())
+}
+
 /// A read that recovers a data block from its Page-ECC parity, and confirms the
 /// on-disk fault persists across a cache-bypassing re-read, must record the SST
 /// in the heal sink for a healing recompaction. A clean read records nothing.
