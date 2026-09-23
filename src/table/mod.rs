@@ -1177,7 +1177,8 @@ impl Table {
     /// keeps its sub-columns and MVCC versions; `Ok(None)` when the positional
     /// delete-bitmap removes every row of the block.
     ///
-    /// `pub(crate)` for the salvage walk ([`crate::salvage`]).
+    /// `pub(crate)` for the salvage walk ([`crate::salvage`]). Salvage is
+    /// maintenance, so nothing here is charged to the gather counter.
     #[cfg(feature = "columnar")]
     pub(crate) fn load_columnar_block_masked(
         &self,
@@ -1190,12 +1191,7 @@ impl Table {
             #[cfg(zstd_any)]
             self.zstd_dictionary.as_deref(),
         )?;
-        let (batch, copied) =
-            crate::table::columnar::ColumnBatch::decode_counting_copies(&block.data, None)?;
-        #[cfg(feature = "metrics")]
-        self.metrics.record_gather(copied);
-        #[cfg(not(feature = "metrics"))]
-        let _ = copied;
+        let batch = crate::table::columnar::ColumnBatch::decode(&block.data)?;
         // A real writer never emits an empty data block (the ingest path skips
         // the write entirely), so a checksum-clean ZERO-ROW batch is malformed
         // input. Reject it here rather than return it as "live": the writer
@@ -1229,8 +1225,6 @@ impl Table {
             })
             .collect::<crate::Result<_>>()?;
         let masked = crate::table::columnar_predicate::filter_batch(&batch, &keep);
-        #[cfg(feature = "metrics")]
-        self.metrics.record_gather(masked.data_size());
         if masked.row_count == 0 {
             Ok(None)
         } else {
