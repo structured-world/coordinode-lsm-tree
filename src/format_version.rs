@@ -77,9 +77,11 @@
 /// layout the engine deliberately cannot read. A caller matching on this enum
 /// should be matching what the writer emits, and that is one shape.
 ///
-/// The engine offers no upgrade path: an earlier database is not adopted,
-/// converted or repaired here — it fails at the format gate above and stays
-/// that way. A V5 store is converted by the separate offline converter, which
+/// The engine offers no upgrade path: an earlier database is not adopted or
+/// converted here. `Tree::open` fails at whichever gate above notices first.
+/// `Config::repair` refuses a V5 manifest the same way; an older manifest,
+/// which fails at the footer, is to repair indistinguishable from a damaged
+/// one. A V5 store is converted by the separate offline converter, which
 /// carries the V5 decoder so the engine does not have to.
 ///
 /// What the refusal buys is that recovery, salvage, patrol scrub and verify

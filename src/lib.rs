@@ -89,10 +89,13 @@
 //! cross-version equivalence.
 //!
 //! Earlier formats, V5 included, are not readable by this version and vice
-//! versa: the manifest version gate refuses them with
+//! versa. A V5 manifest is refused by the manifest version gate with
 //! [`Error::InvalidVersion`] at `Tree::open` and at `Config::repair`, before
-//! any section is parsed. A V5 store is converted by the separate offline
-//! converter; the engine carries no V5 decoder.
+//! any section is parsed. Older manifests usually fail earlier, at the
+//! manifest footer (see [`FormatVersion`]); the engine knows no earlier
+//! layout, so it cannot tell such a manifest from a damaged one, and
+//! `Config::repair` treats it as unreadable. A V5 store is converted by the
+//! separate offline converter; the engine carries no V5 decoder.
 #![deny(clippy::all, missing_docs, clippy::cargo)]
 #![deny(clippy::unwrap_used)]
 #![deny(clippy::indexing_slicing)]
