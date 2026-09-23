@@ -4676,9 +4676,10 @@ impl Table {
                 block.header.block_type.into(),
             )));
         }
+        // Verification, not a caller's read: the walk stays out of the read
+        // counters like every other gate's.
         let blocks: Vec<BlockHandle> = self
-            .block_index
-            .iter()
+            .maintenance_index_walk()
             .map(|r| r.map(|kbh| *kbh.as_ref()))
             .collect::<crate::Result<Vec<_>>>()?;
         Ok(Some(crate::table::locator::LoadedLocator::new(

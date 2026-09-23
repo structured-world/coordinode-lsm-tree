@@ -59,13 +59,13 @@ const ALL_FIXTURES: [(&str, fixtures::FixtureFn); 8] = [
 
 /// Builds `f` in the system temporary directory, which outlives the fixture;
 /// a per-test base would be removed while the fixture's tree is still open.
-fn build(f: fixtures::FixtureFn) -> Fixture {
+fn build(f: fixtures::FixtureFn) -> lsm_tree::Result<Fixture> {
     build_with(f, &config())
 }
 
-fn build_with(f: fixtures::FixtureFn, config: &BenchConfig) -> Fixture {
+fn build_with(f: fixtures::FixtureFn, config: &BenchConfig) -> lsm_tree::Result<Fixture> {
     let seqno = AtomicU64::new(1);
-    f(config, &seqno, &std::env::temp_dir()).expect("fixture must build")
+    f(config, &seqno, &std::env::temp_dir())
 }
 
 /// The ordinary read is the cross-check, not the oracle: it agrees with the
@@ -95,18 +95,19 @@ fn assert_ordinary_read_agrees(fixture: &Fixture, what: &str) {
 }
 
 #[test]
-fn every_fixture_ordinary_read_matches_oracle() {
+fn every_fixture_ordinary_read_matches_oracle() -> lsm_tree::Result<()> {
     // Includes the fixtures of the unsupported scenarios: they are the ones
     // most at risk of rotting unnoticed, because the benchmark never builds
     // them.
     for (what, f) in ALL_FIXTURES {
-        let fixture = build(f);
+        let fixture = build(f)?;
         assert!(
             !fixture.oracle.rows.is_empty(),
             "{what}: a fixture with no rows expects nothing and so proves nothing",
         );
         assert_ordinary_read_agrees(&fixture, what);
     }
+    Ok(())
 }
 
 #[test]
@@ -135,11 +136,11 @@ fn value_bytes_same_seed_reproduces_filter_fields() {
 }
 
 #[test]
-fn selectivity_fixture_sparse_vs_near_full_selects_distinct_fractions() {
+fn selectivity_fixture_sparse_vs_near_full_selects_distinct_fractions() -> lsm_tree::Result<()> {
     // The two scenarios over this fixture only mean something if the
     // predicates really do select very different fractions: if both matched
     // most rows, the pair would measure one case twice.
-    let fixture = build(fixtures::selectivity);
+    let fixture = build(fixtures::selectivity)?;
     let total = fixture.oracle.rows.len() as u64;
     let sparse = fixture.oracle.selected();
     let near_full = fixture
@@ -157,24 +158,24 @@ fn selectivity_fixture_sparse_vs_near_full_selects_distinct_fractions() {
         near_full * 10 > total * 8,
         "the near-full predicate selected {near_full} of {total}, which is not near-full",
     );
+    Ok(())
 }
 
 #[test]
-fn selective_scans_sparse_predicate_reads_less_than_near_full() {
+fn selective_scans_sparse_predicate_reads_less_than_near_full() -> lsm_tree::Result<()> {
     // The predicate is the engine's to evaluate. A pass that scanned every row
     // and filtered in the harness would read the same blocks at every
     // selectivity, and the pair would differ only in the row count the figures
     // divide by. The sparse field matches one row in 97, so most blocks hold
     // none and the zone map skips them unread; the near-full one skips none.
-    let measure = |read: super::ReadFn| {
-        let fixture = build(fixtures::selectivity);
+    let measure = |read: super::ReadFn| -> lsm_tree::Result<(u64, u64)> {
+        let fixture = build(fixtures::selectivity)?;
         let keys = fixture.oracle.rows.len() as u64;
-        let readings = super::Readings::measure(&fixture.tree, keys, || read(&fixture))
-            .expect("scan must succeed");
-        (readings.rows, readings.bytes_read)
+        let readings = super::Readings::measure(&fixture.tree, keys, || read(&fixture))?;
+        Ok((readings.rows, readings.bytes_read))
     };
-    let (sparse_rows, sparse_read) = measure(super::scan_sparse);
-    let (full_rows, full_read) = measure(super::scan_near_full);
+    let (sparse_rows, sparse_read) = measure(super::scan_sparse)?;
+    let (full_rows, full_read) = measure(super::scan_near_full)?;
 
     assert!(sparse_rows > 0 && full_rows > sparse_rows * 10);
     assert!(
@@ -182,15 +183,17 @@ fn selective_scans_sparse_predicate_reads_less_than_near_full() {
         "the sparse scan read {sparse_read} B against {full_read} B for the near-full \
          one; the predicate is not skipping anything",
     );
+    Ok(())
 }
 
 #[test]
-fn versions_fixture_deletes_and_range_tombstone_remove_exactly_covered_rows() {
+fn versions_fixture_deletes_and_range_tombstone_remove_exactly_covered_rows() -> lsm_tree::Result<()>
+{
     // The shape this fixture exists for. Asserted against the operations
     // performed rather than against a read: every fifth key was deleted, and a
     // contiguous slice in the middle was covered by a range tombstone, so the
     // oracle must show both and nothing else.
-    let fixture = build(fixtures::versions_deletes_tombstones);
+    let fixture = build(fixtures::versions_deletes_tombstones)?;
     let n = fixture.oracle.rows.len() as u64;
     let (lo, hi) = (n / 2, n / 2 + n / 20);
 
@@ -213,6 +216,7 @@ fn versions_fixture_deletes_and_range_tombstone_remove_exactly_covered_rows() {
         fixture.oracle.visible() > 0 && fixture.oracle.visible() < n,
         "the fixture must remove some rows and keep some",
     );
+    Ok(())
 }
 
 #[test]
@@ -240,7 +244,7 @@ fn blob_placement_scenarios_zero_cache_report_unsupported() {
 }
 
 #[test]
-fn scattered_blob_fixture_num_equal_to_preferred_stride_writes_every_key() {
+fn scattered_blob_fixture_num_equal_to_preferred_stride_writes_every_key() -> lsm_tree::Result<()> {
     // The strided first pass must be a permutation for EVERY row count. A
     // fixed stride is not coprime with its own multiples, and at `--num 7919`
     // the old one sent every step to key 0, leaving the rows the rewrite
@@ -249,7 +253,7 @@ fn scattered_blob_fixture_num_equal_to_preferred_stride_writes_every_key() {
         num: 7_919,
         ..config()
     };
-    let fixture = build_with(fixtures::blobs_scattered, &config);
+    let fixture = build_with(fixtures::blobs_scattered, &config)?;
     let absent = fixture
         .oracle
         .rows
@@ -260,15 +264,16 @@ fn scattered_blob_fixture_num_equal_to_preferred_stride_writes_every_key() {
         absent, 0,
         "{absent} of 7919 keys were never written by the strided pass",
     );
+    Ok(())
 }
 
 #[test]
-fn scattered_blob_fixture_rewrite_rounds_overwrite_over_a_quarter() {
+fn scattered_blob_fixture_rewrite_rounds_overwrite_over_a_quarter() -> lsm_tree::Result<()> {
     // "Scattered" is a property of the write history, not of the final
     // content: a key's live blob has to sit in whichever file its last rewrite
     // round landed in. If the rounds stopped overlapping the first pass, the
     // fixture would be the well-placed one under another name.
-    let fixture = build(fixtures::blobs_scattered);
+    let fixture = build(fixtures::blobs_scattered)?;
     let rewritten = fixture
         .oracle
         .rows
@@ -281,6 +286,7 @@ fn scattered_blob_fixture_rewrite_rounds_overwrite_over_a_quarter() {
         "only {rewritten} of {total} rows carry a rewritten value; the rounds \
          are no longer scattering anything",
     );
+    Ok(())
 }
 
 #[test]
@@ -302,7 +308,7 @@ fn mixed_layout_more_than_one_thread_is_refused() {
 }
 
 #[test]
-fn published_series_fixture_capped_names_the_keys_it_built() {
+fn published_series_fixture_capped_names_the_keys_it_built() -> lsm_tree::Result<()> {
     // Each fixture caps its key count below what --num may ask for, so a
     // series has to carry the size the scenario actually built; the request
     // alone would label a smaller working set as the requested one. Measured
@@ -319,8 +325,7 @@ fn published_series_fixture_capped_names_the_keys_it_built() {
         &requested,
         &seqno,
         &std::env::temp_dir(),
-    )
-    .expect("measure");
+    )?;
     let built = readings.keys;
     assert!(
         built < requested.num,
@@ -342,17 +347,18 @@ fn published_series_fixture_capped_names_the_keys_it_built() {
             series.extra,
         );
     }
+    Ok(())
 }
 
 #[test]
-fn every_fixture_builds_its_tree_beneath_the_given_directory() {
+fn every_fixture_given_directory_builds_tree_beneath_it() -> lsm_tree::Result<()> {
     // `--db` places the run on a chosen filesystem. A fixture that built its
     // tree in the system temporary directory instead would report figures
     // from another device under the requested one.
-    let base = tempfile::tempdir().expect("base directory");
+    let base = tempfile::tempdir()?;
     for (what, f) in ALL_FIXTURES {
         let seqno = AtomicU64::new(1);
-        let fixture = f(&config(), &seqno, base.path()).expect("fixture must build");
+        let fixture = f(&config(), &seqno, base.path())?;
         let path = &fixture.tree.tree_config().path;
         assert!(
             path.starts_with(base.path()),
@@ -361,6 +367,7 @@ fn every_fixture_builds_its_tree_beneath_the_given_directory() {
             base.path().display(),
         );
     }
+    Ok(())
 }
 
 #[test]
@@ -408,27 +415,28 @@ fn mixed_layout_shape_flags_it_ignores_are_refused() {
 }
 
 #[test]
-fn every_fixture_num_zero_builds_an_empty_oracle() {
+fn every_fixture_num_zero_builds_an_empty_oracle() -> lsm_tree::Result<()> {
     // `--num 0` is a valid run. Every fixture must finish with an empty oracle:
     // the scattered one searched for a stride coprime with the key count, and
     // with no keys nothing is coprime with it, so it looped instead of
     // returning.
     let empty = BenchConfig { num: 0, ..config() };
     for (what, f) in ALL_FIXTURES {
-        let fixture = build_with(f, &empty);
+        let fixture = build_with(f, &empty)?;
         assert!(
             fixture.oracle.rows.is_empty(),
             "{what}: no keys were asked for, yet the oracle expects some",
         );
     }
+    Ok(())
 }
 
 #[test]
-fn blob_fixture_compression_none_opens_its_blob_files_uncompressed() {
+fn blob_fixture_compression_none_opens_its_blob_files_uncompressed() -> lsm_tree::Result<()> {
     // The blob scenarios are dominated by blob bytes, so a run labelled with a
     // codec has to write its blobs with that codec; otherwise every codec
     // measures the blob default and the runs cannot be compared.
-    let fixture = build(fixtures::blobs_well_placed);
+    let fixture = build(fixtures::blobs_well_placed)?;
     let lsm_tree::AnyTree::Blob(tree) = &fixture.tree else {
         panic!("the blob fixture must open a KV-separated tree");
     };
@@ -437,4 +445,5 @@ fn blob_fixture_compression_none_opens_its_blob_files_uncompressed() {
         lsm_tree::CompressionType::None,
         "--compression none must reach the blob files",
     );
+    Ok(())
 }

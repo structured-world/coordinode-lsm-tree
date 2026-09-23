@@ -1740,7 +1740,7 @@ fn ecc_two_level_table(
     dir: &tempfile::TempDir,
     cache: Arc<crate::Cache>,
 ) -> crate::Result<(Table, std::path::PathBuf)> {
-    let (file, checksum) = write_ecc_two_level_table(dir)?;
+    let (file, checksum) = write_ecc_two_level_table(dir, false)?;
     Ok((recover_with_cache(&file, checksum, cache)?, file))
 }
 
@@ -1761,9 +1761,12 @@ fn recover_with_cache(
     Ok(table)
 }
 
+/// Writes the table [`ecc_two_level_table`] opens, with a retrieval locator
+/// when `locator` is set.
 #[cfg(all(feature = "metrics", feature = "page_ecc", feature = "std"))]
 fn write_ecc_two_level_table(
     dir: &tempfile::TempDir,
+    locator: bool,
 ) -> crate::Result<(std::path::PathBuf, crate::Checksum)> {
     let file = dir.path().join("table");
     let mut writer = Writer::new(file.clone(), 0, 0, Arc::new(StdFs))?
@@ -1771,6 +1774,13 @@ fn write_ecc_two_level_table(
         .use_partitioned_index()
         .use_data_block_size(1)
         .use_meta_partition_size(3);
+    if locator {
+        writer = writer.use_locator(crate::config::LocatorPolicyEntry::Enabled {
+            precision: crate::config::LocatorPrecision::Restart,
+            block_id_bits: None,
+            slot_bits: None,
+        });
+    }
     for (i, key) in [b"a", b"b", b"c", b"d", b"e", b"f", b"g", b"h"]
         .into_iter()
         .enumerate()
@@ -1861,6 +1871,36 @@ fn a_maintenance_index_walk_over_a_repaired_partition_counts_the_repair() -> cra
     Ok(())
 }
 
+/// The reconcile gates verify a table, which is maintenance: walking a cold
+/// partitioned index to pair the locator with its blocks must stay out of the
+/// read counters like every other gate's walk.
+#[cfg(all(feature = "metrics", feature = "page_ecc", feature = "std"))]
+#[test]
+fn reconcile_gates_over_a_cold_index_count_no_bytes() -> crate::Result<()> {
+    let dir = tempdir()?;
+    let (file, checksum) = write_ecc_two_level_table(&dir, true)?;
+    let table = recover_with_cache(
+        &file,
+        checksum,
+        Arc::new(crate::Cache::with_capacity_bytes(0)),
+    )?;
+    assert!(
+        table.regions.locator.is_some(),
+        "the fixture must carry a locator for the gate to pair",
+    );
+    let metrics = &table.metrics;
+    let before = (metrics.bytes_read(), metrics.bytes_decoded());
+    if let Err((gate, e)) = table.verify_reconcile_gates(None, false) {
+        panic!("a healthy table must pass every gate, {gate:?} refused it: {e}");
+    }
+    assert_eq!(
+        (metrics.bytes_read(), metrics.bytes_decoded()),
+        before,
+        "the reconcile gates' index walks must not reach the read counters",
+    );
+    Ok(())
+}
+
 /// A report leaves the block cache as it found it: a block it loaded and
 /// cached would turn a later cold read into a hit, and the read counters of
 /// whatever runs next would depend on whether the report was polled.
@@ -1868,7 +1908,7 @@ fn a_maintenance_index_walk_over_a_repaired_partition_counts_the_repair() -> cra
 #[test]
 fn live_item_count_for_a_report_caches_nothing() -> crate::Result<()> {
     let dir = tempdir()?;
-    let (file, checksum) = write_ecc_two_level_table(&dir)?;
+    let (file, checksum) = write_ecc_two_level_table(&dir, false)?;
     // The offsets are found on an uncached instance, so the report below
     // starts from a cache nothing has touched.
     let (straddle, first_partition) = {

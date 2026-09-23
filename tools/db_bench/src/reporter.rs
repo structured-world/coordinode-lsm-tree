@@ -35,13 +35,39 @@ pub struct Summary {
 ///
 /// Every output mode reports these in place of the rate: the dashboard entries,
 /// the `--json` report and the human summary.
-#[derive(Serialize)]
+#[derive(Clone, Serialize)]
 pub struct PublishedSeries {
     pub name: String,
     pub value: f64,
     pub unit: String,
     pub extra: String,
     pub direction: Direction,
+}
+
+/// The lower median of each published series across `iterations`, by its own
+/// value: each series is a separate measurement, so its representative comes
+/// from its own distribution and not from whichever iteration had the median
+/// rate. Series are matched by name and kept in the first iteration's order.
+pub fn median_series(iterations: &[&[PublishedSeries]]) -> Vec<PublishedSeries> {
+    let Some(first) = iterations.first() else {
+        return Vec::new();
+    };
+    first
+        .iter()
+        .map(|wanted| {
+            let mut runs: Vec<&PublishedSeries> = iterations
+                .iter()
+                .filter_map(|it| it.iter().find(|s| s.name == wanted.name))
+                .collect();
+            runs.sort_by(|a, b| a.value.total_cmp(&b.value));
+            // Lower median, as for the rate: len 1 → 0, 2 → 0, 3 → 1. `runs`
+            // holds at least `wanted` itself, so the length is never zero.
+            runs.get((runs.len() - 1) / 2)
+                .copied()
+                .unwrap_or(wanted)
+                .clone()
+        })
+        .collect()
 }
 
 /// Dashboard entries, one suite per direction.
@@ -132,6 +158,12 @@ impl Reporter {
     /// reports a rate.
     pub fn published(&self) -> &[PublishedSeries] {
         &self.published
+    }
+
+    /// Replaces the published series, for a reporter that stands for several
+    /// iterations and carries each series' own median (see [`median_series`]).
+    pub fn replace_published(&mut self, series: Vec<PublishedSeries>) {
+        self.published = series;
     }
 
     /// Start the measurement timer, resetting all prior state.

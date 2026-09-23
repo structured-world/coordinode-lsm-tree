@@ -442,6 +442,15 @@ fn run_single(
     // len=1 → 0, len=2 → 0, len=3 → 1, len=4 → 1, etc.
     results.sort_by(|a, b| a.ops_per_sec.total_cmp(&b.ops_per_sec));
     let median_idx = (results.len() - 1) / 2;
+    // A workload's published series are separate measurements: each takes its
+    // own median across the iterations, not the values of the iteration whose
+    // rate is the median, which says nothing about any one of them.
+    let medians = {
+        let per_iteration: Vec<&[reporter::PublishedSeries]> =
+            results.iter().map(|r| r.reporter.published()).collect();
+        reporter::median_series(&per_iteration)
+    };
+    results[median_idx].reporter.replace_published(medians);
     let median = &results[median_idx];
 
     if cli.github_json && !median.reporter.published().is_empty() {

@@ -24,7 +24,7 @@
 #![cfg(all(feature = "metrics", feature = "columnar"))]
 
 use lsm_tree::table::columnar::{
-    COL_USER_KEY, COL_VALUE, Column, ColumnBatch, TypeTag, entries_to_column_batch,
+    COL_SEQNO, COL_USER_KEY, COL_VALUE, Column, ColumnBatch, TypeTag, entries_to_column_batch,
 };
 use lsm_tree::table::columnar_predicate::ColumnRangePredicate;
 use lsm_tree::{
@@ -663,6 +663,71 @@ fn a_range_bounded_columnar_scan_of_one_segment_counts_its_filter_gather() {
     assert!(
         copied >= returned,
         "the range mask built {returned} B of returned batches but charged {copied} B",
+    );
+}
+
+/// The bytes a scan batch of `keys` holds for the key, seqno and value
+/// columns: two offset tables of `rows + 1` entries, the keys, one 8-byte
+/// seqno per row and the values.
+fn key_seqno_value_bytes(keys: core::ops::Range<u32>, value_len: usize) -> u64 {
+    let rows = keys.len() as u64;
+    let key_bytes: u64 = keys.map(|i| key(i).len() as u64).sum();
+    2 * (rows + 1) * 4 + key_bytes + 8 * rows + rows * value_len as u64
+}
+
+#[test]
+fn a_merged_columnar_scan_counts_the_seqno_column_it_rewrites() {
+    // Overlapping segments carry different seqno offsets, so the merge gathers
+    // the surviving rows and then writes each one's effective seqno into a new
+    // column that replaces the gathered one. That second buffer is a gather of
+    // its own: counting only the first charges every merged seqno once while
+    // it was copied twice. Each segment is one block, so every gather of the
+    // merge is known: each segment's visible rows, the accumulator rebuilt
+    // once over both, the surviving rows, and the rewritten seqnos.
+    let folder = get_tmp_folder();
+    let AnyTree::Standard(tree) = Config::new(
+        folder.path(),
+        SequenceNumberCounter::default(),
+        SequenceNumberCounter::default(),
+    )
+    .data_block_size_policy(lsm_tree::config::BlockSizePolicy::all(1 << 20))
+    .open()
+    .expect("open") else {
+        panic!("expected a standard tree");
+    };
+    tree.update_runtime_config(|cfg| cfg.columnar = true)
+        .expect("enable columnar");
+    for i in 0..1_000 {
+        tree.insert(key(i), vec![b'v'; 32], u64::from(i));
+    }
+    tree.flush_active_memtable(0).expect("flush");
+    for i in 500..1_500 {
+        tree.insert(key(i), vec![b'w'; 32], 2_000 + u64::from(i));
+    }
+    tree.flush_active_memtable(0).expect("flush");
+    let m = tree.metrics();
+    let before = m.bytes_copied();
+
+    let mut returned = 0;
+    let mut rows = 0_u64;
+    for batch in tree
+        .columnar_scan(&[COL_USER_KEY, COL_SEQNO, COL_VALUE], None, SeqNo::MAX, ..)
+        .expect("scan")
+    {
+        let batch = batch.expect("batch");
+        rows += u64::from(batch.row_count);
+        returned += batch_bytes(&batch);
+    }
+    assert_eq!(rows, 1_500, "the merge yields every key once");
+
+    let first = key_seqno_value_bytes(0..1_000, 32);
+    let second = key_seqno_value_bytes(500..1_500, 32);
+    let both = first + second - 4 * 2;
+    assert_eq!(
+        m.bytes_copied() - before,
+        first + second + both + returned + 8 * rows,
+        "each segment's rows, the accumulator over both, the surviving rows and \
+         the rewritten seqnos are one gather each",
     );
 }
 

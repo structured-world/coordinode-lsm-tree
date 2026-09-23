@@ -1,4 +1,28 @@
-use super::{Direction, GithubSuites, JsonConfig, Reporter};
+use super::{Direction, GithubSuites, JsonConfig, PublishedSeries, Reporter, median_series};
+
+fn series(name: &str, value: f64) -> PublishedSeries {
+    PublishedSeries {
+        name: name.to_string(),
+        value,
+        unit: "B/row".to_string(),
+        extra: String::new(),
+        direction: Direction::SmallerIsBetter,
+    }
+}
+
+#[test]
+fn median_series_over_iterations_takes_each_series_own_median() {
+    // Each series is its own measurement. The iteration whose overall rate is
+    // the median says nothing about any one series, so a series taken from it
+    // can be that series' outlier: here no single iteration holds both
+    // medians, and each series must come out at its own.
+    let a = [series("read", 10.0), series("copied", 3.0)];
+    let b = [series("read", 30.0), series("copied", 1.0)];
+    let c = [series("read", 20.0), series("copied", 2.0)];
+    let medians = median_series(&[&a, &b, &c]);
+    let got: Vec<(&str, f64)> = medians.iter().map(|s| (s.name.as_str(), s.value)).collect();
+    assert_eq!(got, vec![("read", 20.0), ("copied", 2.0)]);
+}
 
 fn json_config() -> JsonConfig {
     JsonConfig {

@@ -944,16 +944,25 @@ impl ColumnarScan {
         // `merged` still corresponds to `kept[i]`.
         if let Some(col) = merged.columns.iter_mut().find(|c| c.column_id == COL_SEQNO) {
             // Column bytes are an immutable (possibly shared) view — rebuild
-            // the globalized column into an owned buffer (one per merged batch
-            // on this multi-segment path).
-            let mut out = alloc::vec::Vec::with_capacity(kept.len() * 8);
-            for &i in &kept {
-                out.extend_from_slice(&eff_at(i).to_le_bytes());
-            }
-            if out.len() != col.data.len() {
+            // the globalized column into a new buffer (one per merged batch on
+            // this multi-segment path), written in place so it is copied once.
+            let len = kept.len() * 8;
+            if len != col.data.len() {
                 return Err(Error::InvalidHeader("columnar_scan: short seqno column"));
             }
-            col.data = crate::Slice::from(out);
+            // SAFETY: the loop writes one 8-byte seqno per kept row, and `len`
+            // is exactly `kept.len() * 8`, so every byte is initialized before
+            // the buffer is frozen and read.
+            #[expect(unsafe_code, reason = "see safety")]
+            let mut out = unsafe { crate::Slice::builder_unzeroed(len) };
+            for (dst, &i) in out.chunks_exact_mut(8).zip(&kept) {
+                dst.copy_from_slice(&eff_at(i).to_le_bytes());
+            }
+            col.data = crate::Slice::from(out.freeze());
+            // A gather of its own: the seqnos `take_rows` just copied are
+            // copied again into this column, which replaces them.
+            #[cfg(feature = "metrics")]
+            self.metrics.record_gather(len);
         }
 
         // Apply the row predicate AFTER newest-version dedup: each surviving row is
