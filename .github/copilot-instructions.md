@@ -26,7 +26,7 @@
 ## Testing Standards
 
 - **Corruption tests:** When adding validation for on-disk data, add a test that tampers the relevant field and asserts the error. Use the same serialization path as production (e.g., `lz4_flex::compress` not `compress_prepend_size`).
-- **No mocks for storage:** Tests use real on-disk files via `tempfile::tempdir()`.
+- **No mocks for storage:** Tests never stub or fake the storage layer. They run against a real `Fs` implementation: `StdFs` on files under `tempfile::tempdir()`, or the in-memory `MemFs`, a public backend for ephemeral trees and the reference no-std backend, not a mock. A test of filesystem behaviour itself (fsync, rename, free space, file handles) uses `tempfile::tempdir()`.
 - **Test naming:** `fn <what>_<condition>_<expected>()` — e.g., `fn lz4_corrupted_header_triggers_decompress_error()`.
 
 ## Commit Message Format
