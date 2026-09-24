@@ -83,11 +83,14 @@ impl GroupRead<'_> {
     /// view of a shared read would keep the whole read alive while the cache
     /// charged it as one page.
     ///
-    /// With `wanted == None` a group not wholly cached is read in ONE request,
-    /// as a full scan wants. With `Some`, the directory comes first (a
-    /// [`DIRECTORY_PREFIX`] of the group, extended if the directory is
-    /// longer), then only the wanted pages not already cached, adjacent ones
-    /// coalesced into one request and any bytes the prefix brought in reused.
+    /// When the directory is cached, only the wanted pages that are not are
+    /// read, each run of consecutive ones as one request: a full read after a
+    /// point read has fetched the key page reads the rest of the group, not the
+    /// key page again. When it is not, `wanted == None` reads the group in ONE
+    /// request, as a full scan wants, and `Some` reads the directory first (a
+    /// [`DIRECTORY_PREFIX`] of the group, extended if the directory is longer)
+    /// and then the wanted pages the same way, reusing any bytes the prefix
+    /// brought in.
     ///
     /// Each request is charged when it is issued: the whole group and page
     /// runs to the data role, the directory prefix to the index role. Each
@@ -109,29 +112,24 @@ impl GroupRead<'_> {
             let directory_len = directory_block.header.on_disk_size_with(self.ecc);
             check_group_extent(self.group, directory_len, &directory)?;
             let pages = self.cached_pages(&directory, directory_len, wanted)?;
+            self.count_cached(true, &pages);
             let complete = pages
                 .iter()
                 .zip(directory.entries())
                 .all(|(page, entry)| page.is_some() || !is_wanted(wanted, entry));
-            // A full read that finds a page missing reads the group whole
-            // below, which is one request either way; a selective one keeps
-            // what it found and fetches only the rest.
-            if complete || wanted.is_some() {
-                self.count_cached(true, &pages);
-                if complete {
-                    return Ok(RowGroupBlocks { directory, pages });
-                }
-                let fd = self.open()?;
-                let pages = self.fetch_missing(
-                    fd.as_ref(),
-                    &directory,
-                    directory_len,
-                    &Slice::empty(),
-                    pages,
-                    wanted,
-                )?;
+            if complete {
                 return Ok(RowGroupBlocks { directory, pages });
             }
+            let fd = self.open()?;
+            let pages = self.fetch_missing(
+                fd.as_ref(),
+                &directory,
+                directory_len,
+                &Slice::empty(),
+                pages,
+                wanted,
+            )?;
+            return Ok(RowGroupBlocks { directory, pages });
         }
 
         let fd = self.open()?;

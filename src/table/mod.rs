@@ -1852,19 +1852,44 @@ impl Table {
         }
     }
 
-    /// Point-read counterpart to [`Self::load_columnar_data_block`]: decodes the
-    /// columnar block once and rebuilds only `needle`'s rows (its MVCC versions,
-    /// minus any masked by the positional delete-bitmap) into a tiny row block, or
-    /// `Ok(None)` when the key is absent / wholly deleted. The caller runs the
-    /// normal seqno-aware point read on the result, so a columnar point read
-    /// touches one key's rows instead of untransposing + re-encoding the whole
-    /// block per lookup.
+    /// Point-read counterpart to [`Self::load_columnar_data_block`]: rebuilds
+    /// only `needle`'s rows (its MVCC versions, minus any masked by the
+    /// positional delete-bitmap) into a tiny row block, or `Ok(None)` when the
+    /// key is absent / wholly deleted. The caller runs the normal seqno-aware
+    /// point read on the result.
+    ///
+    /// The key page is read first, and a key it does not hold ends the read
+    /// there: a miss never reads the group's other pages. On a hit the rest of
+    /// the group is read, the directory and key page coming from the cache.
     #[cfg(feature = "columnar")]
     fn load_columnar_point_block(
         &self,
         handle: &BlockHandle,
         needle: &[u8],
     ) -> crate::Result<Option<DataBlock>> {
+        use crate::table::columnar::{COL_USER_KEY, TypeTag};
+
+        let keys = self.load_row_group(handle, Some(&[COL_USER_KEY]), ReadCharge::Foreground)?;
+        let Some(key_col) = keys
+            .columns
+            .first()
+            .filter(|c| c.column_id == COL_USER_KEY && c.type_tag == TypeTag::Bytes)
+        else {
+            return Err(crate::Error::InvalidHeader(
+                "columnar: row group has no user-key column",
+            ));
+        };
+        if crate::table::columnar::key_rows(
+            &key_col.data,
+            keys.row_count,
+            needle,
+            &self.comparator,
+        )?
+        .is_empty()
+        {
+            return Ok(None);
+        }
+
         let batch = self.load_row_group(handle, None, ReadCharge::Foreground)?;
         let deletes = self
             .delete_block_starts

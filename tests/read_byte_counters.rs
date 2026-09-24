@@ -809,6 +809,45 @@ fn a_narrow_projection_over_wide_rows_reads_and_decodes_only_its_pages() {
 }
 
 #[test]
+fn a_columnar_point_read_that_misses_reads_a_fraction_of_its_group() {
+    // A point read asks the key page before anything else, so a key the group
+    // does not hold costs the directory prefix and the key page, not the
+    // group. Without a filter the miss reaches the group; with 128 KiB groups
+    // of 4 KiB rows the rest of the group is the values, which a miss never
+    // needs.
+    let folder = get_tmp_folder();
+    let AnyTree::Standard(tree) = Config::new(
+        folder.path(),
+        SequenceNumberCounter::default(),
+        SequenceNumberCounter::default(),
+    )
+    .filter_policy(lsm_tree::config::FilterPolicy::disabled())
+    .data_block_size_policy(lsm_tree::config::BlockSizePolicy::all(128 * 1_024))
+    .open()
+    .expect("open") else {
+        panic!("expected a standard tree");
+    };
+    tree.update_runtime_config(|cfg| cfg.columnar = true)
+        .expect("enable columnar");
+    for i in 0..200 {
+        tree.insert(key(2 * i), vec![b'v'; 4_096], u64::from(i));
+    }
+    tree.flush_active_memtable(0).expect("flush");
+
+    let m = tree.metrics();
+    let before = m.bytes_read();
+    assert!(
+        tree.get(key(7), SeqNo::MAX).expect("get").is_none(),
+        "an odd key was never written",
+    );
+    let miss = m.bytes_read() - before;
+    assert!(
+        miss > 0 && miss < 16 * 1_024,
+        "a miss read {miss} B of a 128 KiB group; it needs only the directory and key page",
+    );
+}
+
+#[test]
 fn a_projection_repeated_from_the_cache_reads_nothing_and_a_wider_one_only_new_pages() {
     // Pages are cached one by one, so a second projection over the same rows
     // is served from the cache, and a wider one reads only the pages the first
@@ -1199,12 +1238,12 @@ fn a_predicate_scan_of_one_segment_counts_its_filter_gather() {
 }
 
 #[test]
-fn a_columnar_point_read_that_misses_counts_what_its_decode_copied() {
-    // A point read decodes the block before it knows whether the key is there,
-    // and decoding copies each nullable column's validity out of the block. A
-    // miss still did that copy, so the counter moves on a miss as on a hit.
-    // With no filter, a key absent from the segment but inside its key range
-    // reaches the block.
+fn a_columnar_point_read_that_misses_decodes_only_the_key_page() {
+    // A point read looks the key up in the key page before it reads anything
+    // else, so a miss never decodes the value page and never copies its
+    // validity; a hit then reads the value page and copies it. With no filter,
+    // a key absent from the segment but inside its key range reaches the
+    // group.
     let folder = get_tmp_folder();
     let AnyTree::Standard(tree) = Config::new(
         folder.path(),
@@ -1242,9 +1281,19 @@ fn a_columnar_point_read_that_misses_counts_what_its_decode_copied() {
         tree.get(key(3), SeqNo::MAX).expect("get").is_none(),
         "an odd key was never written",
     );
+    assert_eq!(
+        m.bytes_copied(),
+        before,
+        "a miss must not decode the nullable value page",
+    );
+
+    assert!(
+        tree.get(key(2), SeqNo::MAX).expect("get").is_some(),
+        "an even key was written",
+    );
     assert!(
         m.bytes_copied() > before,
-        "the miss decoded the block and copied its validity, but charged nothing",
+        "a hit decoded the value page and copied its validity, but charged nothing",
     );
 }
 

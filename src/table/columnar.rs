@@ -1579,28 +1579,10 @@ pub fn column_batch_match_entries(
         ));
     }
 
-    // Lower bound: first row whose key is `>= needle` (keys are block-index
-    // sorted: user_key ASC, seqno DESC).
-    let mut lo = 0u32;
-    let mut hi = row_count;
-    while lo < hi {
-        let mid = lo + (hi - lo) / 2;
-        let k = bytes_column_row(&key_col.data, row_count, mid)?;
-        if comparator.compare(k, needle) == core::cmp::Ordering::Less {
-            lo = mid + 1;
-        } else {
-            hi = mid;
-        }
-    }
-
-    // Collect the contiguous `== needle` run from `lo`, skipping masked rows.
+    // Collect the contiguous `== needle` run, skipping masked rows.
     let mut out = Vec::new();
-    let mut row = lo;
-    while row < row_count {
+    for row in key_rows(&key_col.data, row_count, needle, comparator)? {
         let k = bytes_column_row(&key_col.data, row_count, row)?;
-        if comparator.compare(k, needle) != core::cmp::Ordering::Equal {
-            break;
-        }
         let masked = if let Some((bitmap, start)) = deletes {
             // Fail closed on a corrupt block_start_row: an overflowing position
             // must error like the scan path, never silently expose the row.
@@ -1637,9 +1619,45 @@ pub fn column_batch_match_entries(
                 value,
             });
         }
-        row += 1;
     }
     Ok(out)
+}
+
+/// The rows of a key column whose key equals `needle`: one contiguous run,
+/// since a group's rows are sorted by user key ascending (seqno descending
+/// within a key). Found by binary search for the first row `>= needle`, then
+/// extended while the key still equals it.
+///
+/// # Errors
+///
+/// Returns an error when the key column's framing is malformed for
+/// `row_count`.
+pub(crate) fn key_rows(
+    key_data: &[u8],
+    row_count: u32,
+    needle: &[u8],
+    comparator: &crate::comparator::SharedComparator,
+) -> Result<core::ops::Range<u32>> {
+    let mut lo = 0u32;
+    let mut hi = row_count;
+    while lo < hi {
+        let mid = lo + (hi - lo) / 2;
+        let k = bytes_column_row(key_data, row_count, mid)?;
+        if comparator.compare(k, needle) == core::cmp::Ordering::Less {
+            lo = mid + 1;
+        } else {
+            hi = mid;
+        }
+    }
+    let mut end = lo;
+    while end < row_count {
+        let k = bytes_column_row(key_data, row_count, end)?;
+        if comparator.compare(k, needle) != core::cmp::Ordering::Equal {
+            break;
+        }
+        end += 1;
+    }
+    Ok(lo..end)
 }
 
 /// Frames one row's value sub-column cells into a single self-describing value
