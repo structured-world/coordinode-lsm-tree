@@ -219,7 +219,7 @@ All optional. The default build (`std` + `parallel`) is the minimal core: no com
 
 ## Benchmarks
 
-CI runs [`db_bench`](tools/db_bench) on every push to `main`, and publishes the results to the [benchmark dashboard](https://structured-world.github.io/coordinode-lsm-tree/dev/bench/). A `main` run regressing performance by more than 15% is flagged on the dashboard; any run, dispatched ones included, is flagged in its own comment. The flag is advisory and never fails the job: neither trigger sits on the merge path, so a failure could only redden `main` after a change has landed, or fail a measurement someone asked for voluntarily.
+CI runs [`db_bench`](tools/db_bench) on every push to `main`, and publishes the results to the [benchmark dashboard](https://structured-world.github.io/coordinode-lsm-tree/dev/bench/). The run lands on whichever bench host is up, so each host keeps its own series, and the [overlay page](https://structured-world.github.io/coordinode-lsm-tree/dev/bench/overlay.html) draws every host's series of a workload on one chart. A `main` run regressing performance by more than 15% against its own host's series is flagged on the dashboard; any run, dispatched ones included, is flagged in its own comment. The flag is advisory and never fails the job: neither trigger sits on the merge path, so a failure could only redden `main` after a change has landed, or fail a measurement someone asked for voluntarily.
 
 Pull requests are deliberately not auto-benchmarked: the bench host is serialised across the whole repository, so every PR push would queue behind it. Measure a branch on demand with the workflow's manual dispatch instead: those runs do not touch the dashboard's `main` series.
 

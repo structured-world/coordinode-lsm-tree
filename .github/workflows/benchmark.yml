@@ -163,11 +163,16 @@ jobs:
         if: steps.bot-token.outputs.token != ''
         run: git branch --delete --force gh-pages 2>/dev/null || true
 
+      # One series per host: the job lands on whichever registered runner is
+      # up (the bench box under Windows or Linux, or the CI host), and a rate
+      # measured on one machine is no baseline for another. Keyed by the
+      # runner's name as well as its OS, since two hosts can share an OS. The
+      # overlay page published below draws every host's series on one chart.
       - name: Store benchmark results
         if: steps.bot-token.outputs.token != ''
         uses: benchmark-action/github-action-benchmark@4322e5726e6334590d251fc4f92bec0efafc45dc  # v1.22.2
         with:
-          name: "lsm-tree db_bench"
+          name: "lsm-tree db_bench · ${{ runner.os }} · ${{ runner.name }}"
           tool: customBiggerIsBetter
           output-file-path: benchmark-results.json
           github-token: ${{ steps.bot-token.outputs.token }}
@@ -203,7 +208,8 @@ jobs:
       # by shrinking, and the action fixes one direction per suite, so they are
       # their own smaller-is-better suite on the same dashboard. A cost that was
       # zero and becomes nonzero alerts: the action divides by the previous
-      # value and treats 0/0 as unchanged.
+      # value and treats 0/0 as unchanged. Bytes are counted by the engine,
+      # not timed, so the costs stay one series across hosts.
       - name: Store benchmark costs
         if: steps.bot-token.outputs.token != ''
         uses: benchmark-action/github-action-benchmark@4322e5726e6334590d251fc4f92bec0efafc45dc  # v1.22.2
@@ -219,6 +225,69 @@ jobs:
           fail-on-alert: false
           save-data-file: ${{ github.event_name == 'push' && github.ref == 'refs/heads/main' }}
           benchmark-data-dir-path: dev/bench
+
+      # The overlay page draws every host's series of one workload on one
+      # chart (.github/bench/overlay.html reads the data.js beside it), and a
+      # banner on the per-host dashboard links it and the RocksDB overlays.
+      # It runs before the head-to-head so a host that cannot build RocksDB
+      # still publishes it. The store step writes the dashboard's index.html
+      # only when it is missing, so the banner is rewritten in place: any
+      # banner line is dropped and the current one goes after <body>.
+      - name: Publish the host overlay page to gh-pages
+        if: >
+          steps.bot-token.outputs.token != '' &&
+          github.event_name == 'push' && github.ref == 'refs/heads/main'
+        env:
+          GH_TOKEN: ${{ steps.bot-token.outputs.token }}
+          REPO: ${{ github.repository }}
+        run: |
+          set -euo pipefail
+          work="$(mktemp -d "${TMPDIR:-/tmp}/overlay-ghpages.XXXXXXXX")"
+          trap 'rm -rf "$work"' EXIT
+          # The token reaches git through a credential helper reading the
+          # environment, never argv or .git/config (see the compare publish
+          # step below for the reasoning).
+          export GIT_CONFIG_COUNT=1
+          export GIT_CONFIG_KEY_0=credential.helper
+          # shellcheck disable=SC2016
+          export GIT_CONFIG_VALUE_0='!f() { echo username=x-access-token; echo "password=${GH_TOKEN}"; }; f'
+          git clone --depth 1 --branch gh-pages \
+            "https://github.com/${REPO}.git" "$work"
+          mkdir -p "$work/dev/bench"
+          cp .github/bench/overlay.html "$work/dev/bench/overlay.html"
+          bench_index="$work/dev/bench/index.html"
+          if [ -f "$bench_index" ]; then
+            banner='<div id="bench-nav-banner" style="padding:8px 14px;background:#0d1117;color:#c9d1d9;font-family:system-ui,sans-serif;border-bottom:1px solid #30363d;font-size:14px">&#128202; <strong>lsm-tree benchmarks</strong> &nbsp;&middot;&nbsp; per-host dashboards &nbsp;&middot;&nbsp; <a href="overlay.html" style="color:#58a6ff;font-weight:600">every host on one chart &rarr;</a> &nbsp;&middot;&nbsp; <a href="../compare/" style="color:#58a6ff;font-weight:600">RocksDB head-to-head &rarr;</a></div>'
+            injected=0
+            # Shell built-ins only: the Git for Windows shell may ship neither
+            # awk nor sed, and the HTML would need escaping for sed anyway.
+            while IFS= read -r line || [ -n "$line" ]; do
+              case "$line" in
+                *'id="bench-nav-banner"'* | *'id="compare-overlay-banner"'*)
+                  continue
+                  ;;
+              esac
+              printf '%s\n' "$line"
+              case "$injected$line" in
+                0*"<body"*)
+                  printf '%s\n' "$banner"
+                  injected=1
+                  ;;
+              esac
+            done < "$bench_index" > "$bench_index.tmp"
+            mv "$bench_index.tmp" "$bench_index"
+          fi
+          cd "$work"
+          git config user.name "github-actions[bot]"
+          git config user.email "41898282+github-actions[bot]@users.noreply.github.com"
+          git add dev/bench/overlay.html
+          git add dev/bench/index.html 2>/dev/null || true
+          if git diff --cached --quiet; then
+            echo "::notice::host overlay page unchanged"
+          else
+            git commit -m "bench: refresh the host overlay page (dev/bench)"
+            git push origin gh-pages
+          fi
 
       # Head-to-head RocksDB comparison. Distinct from the db_bench
       # trend above (single-engine, value-over-commits): this runs the
@@ -401,7 +470,7 @@ jobs:
           <p class="intro">Each chart overlays <strong>ours</strong> against <strong>rocksdb</strong> on the
           same axes (X = element count, Y = average time; <strong>lower is faster</strong>). Generated by the
           <code>compare-rocksdb</code> harness — both engines run in the same process per scenario.
-          &nbsp;&middot;&nbsp; <a href="../bench/">single-engine db_bench trend &rarr;</a>
+          &nbsp;&middot;&nbsp; <a href="../bench/overlay.html">single-engine db_bench trend, every host &rarr;</a>
           &nbsp;&middot;&nbsp; <a href="report/">raw criterion index &rarr;</a></p>
           HTML_HEAD
             for d in "$work"/dev/compare/*/; do
@@ -412,35 +481,10 @@ jobs:
             done
             echo '</body></html>'
           } > "$gallery"
-          # Cross-link banner: the db_bench dashboard (dev/bench/index.html) is
-          # regenerated by benchmark-action on every main push and has no link to
-          # the overlay reports, so visitors never discover dev/compare. Inject a
-          # banner pointing at the overlays right after <body>. Idempotent via the
-          # marker id. Done with shell built-ins rather than awk or sed: this
-          # step also runs under the Git for Windows shell, whose minimal
-          # installs ship neither, and the HTML would need `&`/`/` escaping in
-          # sed anyway.
-          bench_index="$work/dev/bench/index.html"
-          if [ -f "$bench_index" ] && ! grep -q "compare-overlay-banner" "$bench_index"; then
-            banner='<div id="compare-overlay-banner" style="padding:8px 14px;background:#0d1117;color:#c9d1d9;font-family:system-ui,sans-serif;border-bottom:1px solid #30363d;font-size:14px">&#128202; <strong>lsm-tree benchmarks</strong> &nbsp;&middot;&nbsp; you are viewing the single-engine db_bench trend &nbsp;&middot;&nbsp; <a href="../compare/" style="color:#58a6ff;font-weight:600">RocksDB head-to-head overlays &rarr;</a></div>'
-            injected=0
-            while IFS= read -r line || [ -n "$line" ]; do
-              printf '%s\n' "$line"
-              case "$injected$line" in
-                0*"<body"*)
-                  printf '%s\n' "$banner"
-                  injected=1
-                  ;;
-              esac
-            done < "$bench_index" > "$bench_index.tmp"
-            mv "$bench_index.tmp" "$bench_index"
-          fi
           cd "$work"
           git config user.name "github-actions[bot]"
           git config user.email "41898282+github-actions[bot]@users.noreply.github.com"
           git add dev/compare
-          # Stage the banner edit too (file may be absent on a first-ever run).
-          git add dev/bench/index.html 2>/dev/null || true
           if git diff --cached --quiet; then
             echo "::notice::compare-rocksdb reports unchanged — nothing to publish"
           else
