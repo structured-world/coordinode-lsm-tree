@@ -794,8 +794,12 @@ fn a_zone_block_that_does_not_fit_its_directory_is_refused() {
     let mut short = PageZones::new(vec![3]);
     short.push(0, Some((b"a", b"b")));
     let mut payload = Vec::new();
-    short.encode_into(&mut payload);
-    directory
+    PageDirectory::encode_zone_block(TAG, &short, &mut payload);
+    let err = directory
         .decode_zone_block(3, &payload)
         .expect_err("zones for fewer row pages than the group has must be refused");
+    assert!(
+        matches!(err, crate::Error::InvalidHeader("ColumnZones")),
+        "got {err:?}"
+    );
 }

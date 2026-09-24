@@ -1124,12 +1124,17 @@ fn salvage_attempt(
         _ => None,
     });
 
+    // An encrypted block is sealed under its table id, so a copy stamped with
+    // another id cannot carry the source's frames: they would not decrypt
+    // under the copy's id. Re-encode them instead.
+    let resealed =
+        options.encryption.is_some() && options.output_id.is_some_and(|id| id != table.metadata.id);
     let walk = match salvage_blocks(
         &table,
         writer,
         comparator,
         !delete_mask_unpositionable,
-        allow_verbatim,
+        allow_verbatim && !resealed,
         options.blob_rewrite.as_deref(),
         options.progress.as_deref(),
     ) {
