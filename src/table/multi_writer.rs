@@ -541,7 +541,7 @@ impl MultiWriter {
     #[must_use]
     pub(crate) fn use_data_block_size(mut self, size: u32) -> Self {
         assert!(
-            size <= 4 * 1_024 * 1_024,
+            size <= crate::config::MAX_BLOCK_SIZE,
             "data block size must be <= 4 MiB",
         );
         self.data_block_size = size;

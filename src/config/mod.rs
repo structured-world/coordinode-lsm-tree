@@ -11,7 +11,7 @@ mod locator;
 mod pinning;
 mod restart_interval;
 
-pub use block_size::BlockSizePolicy;
+pub use block_size::{BlockSizePolicy, MAX_BLOCK_SIZE};
 pub use compression::CompressionPolicy;
 pub use delete_strategy::{DeleteStrategy, DeleteStrategyPolicy};
 pub use filter::{BloomConstructionPolicy, FilterPolicy, FilterPolicyEntry};

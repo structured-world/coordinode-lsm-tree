@@ -701,7 +701,7 @@ impl Writer {
     #[must_use]
     pub fn use_data_block_size(mut self, size: u32) -> Self {
         assert!(
-            size <= 4 * 1_024 * 1_024,
+            size <= crate::config::MAX_BLOCK_SIZE,
             "data block size must be <= 4 MiB",
         );
         self.data_block_size = size;
@@ -716,7 +716,10 @@ impl Writer {
     /// Panics when `size` exceeds 4 MiB, the same bound as a data block.
     #[must_use]
     pub fn use_row_group_size(mut self, size: u32) -> Self {
-        assert!(size <= 4 * 1_024 * 1_024, "row group size must be <= 4 MiB",);
+        assert!(
+            size <= crate::config::MAX_BLOCK_SIZE,
+            "row group size must be <= 4 MiB",
+        );
         self.row_group_size = size;
         self
     }
@@ -730,7 +733,7 @@ impl Writer {
     #[must_use]
     pub fn use_columnar_page_size(mut self, size: u32) -> Self {
         assert!(
-            size <= 4 * 1_024 * 1_024,
+            size <= crate::config::MAX_BLOCK_SIZE,
             "columnar page size must be <= 4 MiB"
         );
         self.columnar_page_size = size;
@@ -740,8 +743,8 @@ impl Writer {
     #[must_use]
     pub fn use_meta_partition_size(mut self, size: u32) -> Self {
         assert!(
-            size <= 4 * 1_024 * 1_024,
-            "data block size must be <= 4 MiB",
+            size <= crate::config::MAX_BLOCK_SIZE,
+            "meta partition size must be <= 4 MiB",
         );
         self.meta_partition_size = size;
         self.index_writer = self.index_writer.use_partition_size(size);
