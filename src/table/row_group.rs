@@ -399,6 +399,7 @@ impl GroupRead<'_> {
         let bytes = if end <= front.len() {
             front.slice(start..end)
         } else {
+            self.check_block_len(length)?;
             let fd = match fd {
                 Some(fd) => fd,
                 None => fd.insert(self.open()?),
@@ -415,6 +416,12 @@ impl GroupRead<'_> {
         let zones = directory.decode_zone_block(column_id, &block.data)?;
         self.cache_block(&handle, block);
         Ok(zones)
+    }
+
+    /// Refuses a block length the directory declares but no block of this
+    /// table can have, before a read allocates a buffer for it.
+    fn check_block_len(&self, length: u32) -> crate::Result<()> {
+        crate::table::block::check_on_disk_size(u64::from(length), self.encryption, self.ecc)
     }
 
     /// Caches a verified page or zone block under its own offset, unless this
@@ -448,6 +455,7 @@ impl GroupRead<'_> {
             )?
         };
         let directory_len = Header::decode_from(&mut &prefix[..])?.on_disk_size_with(self.ecc);
+        self.check_block_len(directory_len)?;
         let directory_end = directory_len as usize;
         if directory_end > group_len {
             return Err(crate::Error::InvalidHeader(
@@ -497,6 +505,17 @@ impl GroupRead<'_> {
             pages,
             &wanted,
         )?;
+        // Cached only now that the blocks it named carried the stamps it
+        // implies: another group's directory read in this one's place fails
+        // the read without staying behind to refuse every healthy page later.
+        if self.charge.touches_cache() {
+            self.cache.insert_directory(
+                self.table_id,
+                self.group.offset(),
+                Arc::clone(&directory),
+                directory_len,
+            );
+        }
         Ok(RowGroupBlocks {
             directory,
             pages,
@@ -505,8 +524,8 @@ impl GroupRead<'_> {
     }
 
     /// Verifies and admits the directory at the front of `front`, decodes it
-    /// and proves it fills the group, then caches it decoded. Returns it with
-    /// its on-disk length.
+    /// and proves it fills the group. Returns it with its on-disk length; the
+    /// caller caches it once the blocks it names have checked out.
     fn admit_directory(&self, front: &Slice) -> crate::Result<(Arc<PageDirectory>, u32)> {
         let directory_len = Header::decode_from(&mut &front[..])?.on_disk_size_with(self.ecc);
         let handle = BlockHandle::new(self.group.offset(), directory_len);
@@ -524,14 +543,6 @@ impl GroupRead<'_> {
         )?;
         let directory = Arc::new(PageDirectory::decode(&block.data)?);
         check_group_extent(self.group, directory_len, &directory)?;
-        if self.charge.touches_cache() {
-            self.cache.insert_directory(
-                self.table_id,
-                self.group.offset(),
-                Arc::clone(&directory),
-                directory_len,
-            );
-        }
         Ok((directory, directory_len))
     }
 
@@ -571,7 +582,11 @@ impl GroupRead<'_> {
                 let first = i;
                 let mut bytes = 0usize;
                 while i < entries.len() && missing(i) {
-                    let length = entries.get(i).map_or(0, |e| e.length as usize);
+                    let length = entries.get(i).map_or(0, |e| e.length);
+                    // A page longer than any block can be is refused before a
+                    // request allocates a buffer for it.
+                    self.check_block_len(length)?;
+                    let length = length as usize;
                     if i > first && bytes + length > io_buffer {
                         break;
                     }

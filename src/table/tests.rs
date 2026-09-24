@@ -8476,6 +8476,78 @@ fn a_page_refused_by_its_stamp_is_not_cached() -> crate::Result<()> {
     Ok(())
 }
 
+/// A read that meets another group's directory in this group's place fails on
+/// the first page and leaves the directory out of the cache: once the right
+/// bytes are back, the same read is served. A directory cached before the
+/// pages were checked against it would refuse every healthy page of the group
+/// until it was evicted.
+#[cfg(feature = "columnar")]
+#[test]
+fn a_directory_refused_by_its_pages_is_not_cached() -> crate::Result<()> {
+    use crate::coding::Decode;
+    use crate::table::block::Header;
+    use crate::table::row_group::PageWant;
+
+    let dir = tempdir()?;
+    let file = dir.path().join("table");
+    let checksum = columnar_table_file_paged(&file, 400, 16, 100, 16 * 1_024, 1_024)?;
+    let (first, second) = {
+        let table = Table::recover(test_recover_params(file.clone(), checksum))?;
+        let mut groups = table.data_block_handles();
+        let (Some(first), Some(second)) = (groups.next(), groups.next()) else {
+            panic!("the table has two row groups");
+        };
+        let (first, second) = (first?, second?);
+        (
+            BlockHandle::new(first.offset(), first.size()),
+            BlockHandle::new(second.offset(), second.size()),
+        )
+    };
+    assert_eq!(
+        first.size(),
+        second.size(),
+        "the two groups are of one shape"
+    );
+
+    let original = std::fs::read(&file)?;
+    let mut bytes = original.clone();
+    let directory_at = |group: &BlockHandle| -> crate::Result<core::ops::Range<usize>> {
+        let at = usize::try_from(*group.offset()).expect("offset fits");
+        let frame = original.get(at..).expect("group within the file");
+        let len = Header::decode_from(&mut &frame[..])?.on_disk_size_with(None) as usize;
+        Ok(at..at + len)
+    };
+    let (into, from) = (directory_at(&first)?, directory_at(&second)?);
+    assert_eq!(
+        into.len(),
+        from.len(),
+        "the two directories are of one length"
+    );
+    let foreign = original.get(from).expect("directory").to_vec();
+    bytes
+        .get_mut(into)
+        .expect("directory")
+        .copy_from_slice(&foreign);
+    std::fs::write(&file, &bytes)?;
+
+    let table = Table::recover(test_recover_params(file.clone(), checksum))?;
+    assert!(
+        table
+            .load_row_group(&first, &PageWant::ALL, ReadCharge::Foreground)
+            .is_err(),
+        "another group's directory is refused by this group's pages",
+    );
+
+    std::fs::write(&file, &original)?;
+    let pages = table.load_row_group(&first, &PageWant::ALL, ReadCharge::Foreground)?;
+    assert_eq!(
+        pages.group_rows,
+        pages.row_count(),
+        "with the right bytes back the same read is served whole",
+    );
+    Ok(())
+}
+
 /// Row `i`'s key in [`zoned_table_file`].
 #[cfg(feature = "columnar")]
 fn zoned_key(i: u32) -> Vec<u8> {
