@@ -88,6 +88,10 @@ pub struct Metrics {
     /// salvage (maintenance, not reads), or a move that transfers ownership without
     /// duplicating bytes.
     ///
+    /// A view into a decoded buffer is a view whatever its representation: a
+    /// short slice stored inline in the handle is not charged, because building
+    /// that inline copy costs no more than building the handle itself.
+    ///
     /// The quantity this exists to expose is quadratic accumulation and
     /// repeated re-gather: bytes copied per input byte should be a small
     /// constant, and a path that re-materialises its working set several

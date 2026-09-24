@@ -789,7 +789,6 @@ impl Iter {
                 self.heal_hints.as_ref().map(AsRef::as_ref),
                 #[cfg(feature = "metrics")]
                 &self.metrics,
-                #[cfg(feature = "metrics")]
                 self.charge,
             );
         }

@@ -141,7 +141,8 @@ pub fn load_block(
     // Charged as the read is issued, before it is validated: a block that then
     // fails its checksum, decryption or decompression was still asked of the
     // filesystem, while a handle refused before reading asked nothing.
-    let (block, ecc_status, recovery) = Block::from_file_issuing(
+    let mut produced = 0;
+    let read = Block::from_file_issuing(
         fd.as_ref(),
         *handle,
         crate::table::block::BlockIdentity {
@@ -157,7 +158,23 @@ pub fn load_block(
                 record_block_read(metrics, block_type, handle.size().into());
             }
         },
-    )?;
+        &mut produced,
+    );
+    // What the transform produced, counted once per block that actually ran
+    // one. Paired with the per-role `*_io_requested` above: those record what
+    // was asked of the filesystem, this records what came out the other side
+    // of decompression, decryption and ECC. The ratio is the compression the
+    // read actually paid for, and its absolute value is what separates a
+    // physical projection from a cosmetic one. Charged before the result is
+    // judged: a transform whose output the length or role check then refuses
+    // still ran.
+    #[cfg(feature = "metrics")]
+    if charge.is_counted() {
+        metrics
+            .block_bytes_decoded
+            .fetch_add(produced as u64, Relaxed);
+    }
+    let (block, ecc_status, recovery) = read?;
     // Count the on-read ECC recovery (by mechanism) at this primary read site,
     // whoever the reader is: it is a health signal about the medium. The
     // persistence-confirming re-read below goes through a path that does NOT
@@ -169,21 +186,6 @@ pub fn load_block(
     #[cfg(not(feature = "metrics"))]
     let _ = recovery;
     let corrected = matches!(ecc_status, crate::table::block::EccStatus::Corrected);
-
-    // What the transform produced, counted once per block that actually ran
-    // one. Paired with the per-role `*_io_requested` below: those record what
-    // was asked of the filesystem, this records what came out the other side
-    // of decompression, decryption and ECC. The ratio is the compression the
-    // read actually paid for, and its absolute value is what separates a
-    // physical projection from a cosmetic one. Charged before the role check:
-    // the transform has run whether or not the block turns out to be the one
-    // the caller asked for.
-    #[cfg(feature = "metrics")]
-    if charge.is_counted() {
-        metrics
-            .block_bytes_decoded
-            .fetch_add(block.data.len() as u64, Relaxed);
-    }
 
     if block.header.block_type != block_type {
         return Err(crate::Error::InvalidTag((
@@ -215,7 +217,6 @@ pub fn load_block(
             heal_hints,
             #[cfg(feature = "metrics")]
             metrics,
-            #[cfg(feature = "metrics")]
             charge,
         );
     }
@@ -369,18 +370,20 @@ pub fn decode_prewarmed_blocks(
         // read walk would produce. A decode error (e.g. a block needing a re-read
         // recovery) just leaves it uncached for the walk to read authoritatively.
         let mut reader = crate::io::Cursor::new(&buf[..]);
-        let Ok(block) = Block::from_reader(&mut reader, identity, &transform) else {
+        // The read was charged when the batch was submitted; the decode is
+        // charged here, where the transform ran, before the result is judged:
+        // a block refused by its length or role check was still decoded, and
+        // the read walk that then reads it authoritatively charges its own
+        // decode on top.
+        let mut produced = 0;
+        let decoded = Block::from_reader_counting(&mut reader, identity, &transform, &mut produced);
+        #[cfg(feature = "metrics")]
+        metrics
+            .block_bytes_decoded
+            .fetch_add(produced as u64, core::sync::atomic::Ordering::Relaxed);
+        let Ok(block) = decoded else {
             continue;
         };
-        // The read was charged when the batch was submitted; the decode is
-        // charged here, where the transform ran, and before the role check: a
-        // block refused for its role was still decoded, and the read walk that
-        // then reads it authoritatively charges its own decode on top.
-        #[cfg(feature = "metrics")]
-        metrics.block_bytes_decoded.fetch_add(
-            block.data.len() as u64,
-            core::sync::atomic::Ordering::Relaxed,
-        );
         if block.header.block_type == block_type {
             cache.insert_block(table_id, handle.offset(), block);
         }
@@ -404,8 +407,9 @@ pub fn decode_prewarmed_blocks(
 /// the return; the patrol scrub uses it to count distinct SSTs it scheduled.
 ///
 /// `charge` says whose read this confirms: a foreground read's confirming
-/// re-read goes into the read-byte counters like the read itself, a patrol
-/// scrub's does not, since the scrub's own read is maintenance and uncounted.
+/// re-read goes into the read-byte counters like the read itself, and is
+/// charged only once the re-read is actually issued; an untraced one, such as
+/// a patrol scrub's, is neither counted nor allowed to touch the caches.
 #[expect(
     clippy::too_many_arguments,
     reason = "mirrors the block read context needed for the confirming re-read"
@@ -422,7 +426,7 @@ pub(crate) fn maybe_record_persistent_heal(
     #[cfg(zstd_any)] zstd_dict: Option<&crate::compression::ZstdDictionary>,
     heal_hints: Option<&crate::heal_hints::HealHints>,
     #[cfg(feature = "metrics")] metrics: &Metrics,
-    #[cfg(feature = "metrics")] charge: ReadCharge,
+    charge: ReadCharge,
 ) -> bool {
     let Some(hints) = heal_hints else {
         return false;
@@ -431,12 +435,10 @@ pub(crate) fn maybe_record_persistent_heal(
         return false;
     }
     // The confirming re-read of a foreground read is a second request for the
-    // whole block, charged as issued like the first.
-    #[cfg(feature = "metrics")]
-    if charge == ReadCharge::Foreground {
-        record_block_read(metrics, block_type, handle.size().into());
-    }
-    match reread_block_is_corrected(
+    // whole block, charged as issued like the first, and so is what its
+    // transform produced, whether or not the block then checks out.
+    let mut decoded = 0;
+    let reread = reread_block_is_corrected(
         table_id,
         path,
         file_accessor,
@@ -447,16 +449,19 @@ pub(crate) fn maybe_record_persistent_heal(
         ecc,
         #[cfg(zstd_any)]
         zstd_dict,
-    ) {
-        Ok((corrected, decoded)) => {
-            #[cfg(feature = "metrics")]
-            if charge == ReadCharge::Foreground {
-                metrics
-                    .block_bytes_decoded
-                    .fetch_add(decoded, core::sync::atomic::Ordering::Relaxed);
-            }
-            #[cfg(not(feature = "metrics"))]
-            let _ = decoded;
+        #[cfg(feature = "metrics")]
+        metrics,
+        charge,
+        &mut decoded,
+    );
+    #[cfg(feature = "metrics")]
+    if charge.is_counted() {
+        metrics
+            .block_bytes_decoded
+            .fetch_add(decoded as u64, core::sync::atomic::Ordering::Relaxed);
+    }
+    match reread {
+        Ok(corrected) => {
             if !corrected {
                 log::debug!(
                     "Transient ECC correction on table {table_id:?} block {handle:?}; \
@@ -586,7 +591,9 @@ pub(crate) fn scrub_block(
     heal_hints: Option<&crate::heal_hints::HealHints>,
     #[cfg(feature = "metrics")] metrics: &Metrics,
 ) -> crate::Result<BlockScrubOutcome> {
-    let (fd, _cache_event) = file_accessor.get_or_open_table(&table_id, path)?;
+    // The patrol leaves the descriptor cache as it leaves the block cache:
+    // walking every table must not evict the workload's descriptors.
+    let fd = file_accessor.peek_or_open_table(&table_id, path)?;
     let transform = build_block_transform(
         compression,
         encryption,
@@ -640,8 +647,7 @@ pub(crate) fn scrub_block(
                 heal_hints,
                 #[cfg(feature = "metrics")]
                 metrics,
-                #[cfg(feature = "metrics")]
-                ReadCharge::Maintenance,
+                ReadCharge::Untraced,
             );
             BlockScrubOutcome::Corrected { scheduled }
         }
@@ -718,8 +724,17 @@ fn reread_block_is_corrected(
     encryption: Option<&dyn EncryptionProvider>,
     ecc: Option<crate::table::block::EccParams>,
     #[cfg(zstd_any)] zstd_dict: Option<&crate::compression::ZstdDictionary>,
-) -> crate::Result<(bool, u64)> {
-    let (fd, _cache_event) = file_accessor.get_or_open_table(&table_id, path)?;
+    #[cfg(feature = "metrics")] metrics: &Metrics,
+    charge: ReadCharge,
+    decoded: &mut usize,
+) -> crate::Result<bool> {
+    // The confirmation belongs to the read it confirms: an untraced one leaves
+    // the descriptor cache as it found it.
+    let fd = if charge.touches_cache() {
+        file_accessor.get_or_open_table(&table_id, path)?.0
+    } else {
+        file_accessor.peek_or_open_table(&table_id, path)?
+    };
     let transform = build_block_transform(
         compression,
         encryption,
@@ -727,7 +742,7 @@ fn reread_block_is_corrected(
         #[cfg(zstd_any)]
         zstd_dict,
     )?;
-    let (block, ecc_status) = Block::from_file_with_status(
+    let (_block, ecc_status, _recovery) = Block::from_file_issuing(
         fd.as_ref(),
         *handle,
         crate::table::block::BlockIdentity {
@@ -737,10 +752,18 @@ fn reread_block_is_corrected(
             window_log: 0,
         },
         &transform,
+        // Charged when the read is issued, not before the descriptor opens.
+        || {
+            #[cfg(feature = "metrics")]
+            if charge.is_counted() {
+                record_block_read(metrics, block_type, handle.size().into());
+            }
+        },
+        decoded,
     )?;
-    Ok((
-        matches!(ecc_status, crate::table::block::EccStatus::Corrected),
-        block.data.len() as u64,
+    Ok(matches!(
+        ecc_status,
+        crate::table::block::EccStatus::Corrected
     ))
 }
 

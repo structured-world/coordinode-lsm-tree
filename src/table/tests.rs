@@ -1039,6 +1039,58 @@ fn verify_blob_links_on_a_restricted_view_counts_and_caches_nothing() -> crate::
     Ok(())
 }
 
+/// Verifying blob links reads the recorded `linked_blob_files` section as well
+/// as deriving it, and that read is verification too: it must not cache the
+/// table's descriptor.
+#[cfg(feature = "std")]
+#[test]
+fn verify_blob_links_leaves_the_descriptor_table_as_it_found_it() -> crate::Result<()> {
+    use crate::blob_tree::handle::BlobIndirection;
+    use crate::coding::Encode;
+    use crate::vlog::ValueHandle;
+    use crate::{InternalValue, ValueType};
+
+    let dir = tempdir()?;
+    let file = dir.path().join("0");
+    let checksum = {
+        let mut w = Writer::new(file.clone(), 0, 0, Arc::new(StdFs))?.use_data_block_size(128);
+        for i in 0u64..10 {
+            let value = BlobIndirection {
+                size: 1000,
+                vhandle: ValueHandle {
+                    blob_file_id: i,
+                    on_disk_size: 500,
+                    offset: 0,
+                },
+            }
+            .encode_into_vec();
+            w.write(InternalValue::from_components(
+                format!("key{i:05}").into_bytes(),
+                value,
+                i + 1,
+                ValueType::Indirection,
+            ))?;
+            w.link_blob_file(i, 1, 1000, 500);
+        }
+        w.finish()?.expect("the SST is non-empty").1
+    };
+
+    let descriptors = Arc::new(DescriptorTable::new(10));
+    let mut params = test_recover_params(file, checksum);
+    params.descriptor_table = Some(descriptors.clone());
+    let table = Table::recover(params)?;
+    table.file_accessor.remove_for_table(&table.global_id());
+    assert_eq!(descriptors.len(), 0, "precondition: the descriptor is cold");
+
+    table.verify_blob_links()?;
+    assert_eq!(
+        descriptors.len(),
+        0,
+        "verifying the table must not cache its descriptor",
+    );
+    Ok(())
+}
+
 /// An untraced read of a table whose descriptor is not cached opens the file
 /// for itself: putting the descriptor in the shared table would evict another
 /// one and turn a later caller's miss into a hit, a trace the read promised
@@ -1122,11 +1174,16 @@ fn an_untraced_bounded_range_leaves_no_partial_block_in_the_cache() -> crate::Re
         unreachable!("flush produced one table");
     };
 
+    let first_block = table
+        .untraced_index_walk()
+        .next()
+        .expect("the table has a data block")?
+        .offset();
     let cached = table.cache.size();
     let bounded =
-        crate::UserKey::from(&b"key-00000010"[..])..crate::UserKey::from(&b"key-00000030"[..]);
+        || crate::UserKey::from(&b"key-00000010"[..])..crate::UserKey::from(&b"key-00000030"[..]);
     let mut rows = 0;
-    for kv in table.range_iter(bounded).untraced() {
+    for kv in table.range_iter(bounded()).untraced() {
         kv?;
         rows += 1;
     }
@@ -1135,6 +1192,20 @@ fn an_untraced_bounded_range_leaves_no_partial_block_in_the_cache() -> crate::Re
         table.cache.size(),
         cached,
         "an untraced read must not cache a partial block",
+    );
+
+    // The same range read with a trace does leave a partial block: the switch
+    // above took effect in this process and the fixture reaches the partial
+    // tier, so the assertion above tested the guard, not a full-block path.
+    for kv in table.range_iter(bounded()) {
+        kv?;
+    }
+    assert!(
+        table
+            .cache
+            .peek_partial_block(table.global_id(), first_block)
+            .is_some(),
+        "precondition: a traced bounded range takes the partial decode path",
     );
     Ok(())
 }
@@ -4130,6 +4201,149 @@ fn index_frame_decoded_len(table: &Table) -> crate::Result<u64> {
     Ok(block.data.len() as u64)
 }
 
+/// Every read path decodes a block before checking its output length against
+/// the header, so a block refused for that mismatch still counts what its
+/// transform produced: the file read, the batched prewarm and the chunked
+/// `multi_get` resolver alike. The payload checksum does not cover the
+/// declared length, so the frame below passes verification.
+#[cfg(feature = "metrics")]
+#[test]
+fn a_block_refused_for_its_declared_length_counts_what_its_transform_decoded() -> crate::Result<()>
+{
+    use crate::{
+        CompressionType,
+        cache::Cache,
+        coding::{Decode, Encode},
+        table::{
+            block::{BlockType, Header},
+            util::{decode_prewarmed_blocks, load_block},
+        },
+    };
+    use std::io::{Seek, Write};
+
+    let dir = tempdir()?;
+    let (table, metrics, frame) = one_row_table_and_its_index_frame(&dir)?;
+    let produced = index_frame_decoded_len(&table)?;
+
+    let header_len = Header::header_len(BlockType::Index);
+    let mut header = Header::decode_from(&mut &frame[..header_len])?;
+    header.uncompressed_length += 1;
+    let mut tampered = header.encode_into_vec();
+    tampered.extend_from_slice(&frame[header_len..]);
+    assert_eq!(tampered.len(), frame.len(), "the frame keeps its size");
+
+    let mut wf = std::fs::OpenOptions::new().write(true).open(&*table.path)?;
+    wf.seek(std::io::SeekFrom::Start(table.regions.tli.offset().0))?;
+    wf.write_all(&tampered)?;
+    wf.sync_all()?;
+
+    let decoded_before = metrics.bytes_decoded();
+    let result = load_block(
+        table.global_id(),
+        &table.path,
+        &table.file_accessor,
+        &Cache::with_capacity_bytes(10_000_000),
+        &table.regions.tli,
+        BlockType::Index,
+        CompressionType::None,
+        None,
+        None,
+        #[cfg(zstd_any)]
+        None,
+        None,
+        &metrics,
+        crate::table::util::ReadCharge::Foreground,
+    );
+    assert!(result.is_err(), "the length mismatch refuses the block");
+    assert_eq!(
+        metrics.bytes_decoded() - decoded_before,
+        produced,
+        "the file read's transform ran, so its output must be counted",
+    );
+
+    let cache = Cache::with_capacity_bytes(10_000_000);
+    let decoded_before = metrics.bytes_decoded();
+    decode_prewarmed_blocks(
+        table.global_id(),
+        &cache,
+        &[table.regions.tli],
+        &[&tampered],
+        BlockType::Index,
+        CompressionType::None,
+        None,
+        None,
+        #[cfg(zstd_any)]
+        None,
+        &metrics,
+    );
+    assert_eq!(
+        metrics.bytes_decoded() - decoded_before,
+        produced,
+        "the prewarm's transform ran, so its output must be counted",
+    );
+
+    let decoded_before = metrics.bytes_decoded();
+    assert!(
+        table.decode_data_block_from_bytes(&tampered).is_err(),
+        "the chunked resolver refuses the block too",
+    );
+    assert_eq!(
+        metrics.bytes_decoded() - decoded_before,
+        produced,
+        "the chunked resolver's transform ran, so its output must be counted",
+    );
+
+    Ok(())
+}
+
+/// A foreground read's confirming re-read is charged when it is issued, not
+/// before: one whose file cannot even be opened asked nothing of the
+/// filesystem, so nothing is counted.
+#[cfg(feature = "metrics")]
+#[test]
+fn a_confirming_reread_that_never_issues_counts_no_bytes() -> crate::Result<()> {
+    use crate::{
+        CompressionType,
+        heal_hints::HealHints,
+        table::{
+            block::BlockType,
+            util::{ReadCharge, maybe_record_persistent_heal},
+        },
+    };
+
+    let dir = tempdir()?;
+    let (table, metrics, _frame) = one_row_table_and_its_index_frame(&dir)?;
+    table.file_accessor.remove_for_table(&table.global_id());
+    let missing = dir.path().join("missing");
+
+    let sink = HealHints::default();
+    sink.set_enabled(true);
+    let (read_before, decoded_before) = (metrics.bytes_read(), metrics.bytes_decoded());
+    let scheduled = maybe_record_persistent_heal(
+        table.global_id(),
+        &missing,
+        &table.file_accessor,
+        &table.regions.tli,
+        BlockType::Index,
+        CompressionType::None,
+        None,
+        None,
+        #[cfg(zstd_any)]
+        None,
+        Some(&sink),
+        &metrics,
+        ReadCharge::Foreground,
+    );
+    assert!(!scheduled, "an unopenable file confirms nothing");
+    assert_eq!(
+        (metrics.bytes_read(), metrics.bytes_decoded()),
+        (read_before, decoded_before),
+        "no re-read was issued, so none may be counted",
+    );
+
+    Ok(())
+}
+
 /// A handle declaring more than a block can be is refused before any read is
 /// issued, so nothing was asked of the filesystem and nothing is counted.
 #[cfg(feature = "metrics")]
@@ -4330,6 +4544,142 @@ fn a_patrol_scrub_that_corrects_a_block_counts_no_bytes() -> crate::Result<()> {
         "neither the scrub's read nor its confirming re-read is a foreground read",
     );
 
+    Ok(())
+}
+
+/// A patrol scrub walks every table, so it must leave the caches the workload
+/// uses as it found them: neither the cold index it walks nor the descriptor it
+/// opens may be inserted, or the patrol would evict the workload's entries and
+/// turn its later misses into hits.
+#[cfg(feature = "std")]
+#[test]
+fn a_patrol_scrub_leaves_the_block_and_descriptor_caches_as_it_found_them() -> crate::Result<()> {
+    let dir = tempdir()?;
+    let file = dir.path().join("table");
+    let mut writer = Writer::new(file.clone(), 0, 0, Arc::new(StdFs))?.use_data_block_size(128);
+    for i in 0..200u32 {
+        writer.write(InternalValue::from_components(
+            format!("key{i:05}").into_bytes(),
+            b"value-payload-bytes",
+            u64::from(i) + 1,
+            crate::ValueType::Value,
+        ))?;
+    }
+    let (_, checksum) = writer
+        .finish()?
+        .expect("finish() returns Some after writing data items");
+
+    let cache = Arc::new(Cache::with_capacity_bytes(10_000_000));
+    let descriptors = Arc::new(DescriptorTable::new(10));
+    let mut params = test_recover_params(file, checksum);
+    params.cache = cache.clone();
+    params.descriptor_table = Some(descriptors.clone());
+    let table = Table::recover(params)?;
+    table.file_accessor.remove_for_table(&table.global_id());
+    assert_eq!(cache.size(), 0, "precondition: the index is cold");
+    assert_eq!(descriptors.len(), 0, "precondition: the descriptor is cold");
+
+    let report = table.scrub_data_blocks();
+    assert!(report.errors.is_empty(), "the clean table scrubs clean");
+    assert!(report.blocks_scanned > 1, "the scrub walked every block");
+    assert_eq!(
+        cache.size(),
+        0,
+        "the scrub's index walk must not fill the cache"
+    );
+    assert_eq!(
+        descriptors.len(),
+        0,
+        "the scrub must not cache the descriptor it opened",
+    );
+    Ok(())
+}
+
+/// The confirming re-read after an ECC correction belongs to the read it
+/// confirms: under an untraced read it must leave the descriptor cache alone,
+/// while the heal it schedules is still recorded.
+#[cfg(all(feature = "page_ecc", feature = "std"))]
+#[test]
+fn an_untraced_read_confirming_an_ecc_correction_leaves_the_descriptor_cache_alone()
+-> crate::Result<()> {
+    use crate::{
+        heal_hints::HealHints,
+        table::{
+            BlockHandle,
+            block::{BlockType, EccParams, Header},
+            util::{ReadCharge, load_block},
+        },
+    };
+
+    let dir = tempdir()?;
+    let file = dir.path().join("table");
+    let mut writer =
+        Writer::new(file.clone(), 0, 0, Arc::new(StdFs))?.use_ecc(Some(EccParams::RS_4_2));
+    for i in 0..200u32 {
+        writer.write(InternalValue::from_components(
+            format!("key{i:05}").into_bytes(),
+            b"value-payload-bytes",
+            u64::from(i) + 1,
+            crate::ValueType::Value,
+        ))?;
+    }
+    let (_, checksum) = writer
+        .finish()?
+        .expect("finish() returns Some after writing data items");
+
+    let descriptors = Arc::new(DescriptorTable::new(10));
+    let mut params = test_recover_params(file.clone(), checksum);
+    params.descriptor_table = Some(descriptors.clone());
+    #[cfg(feature = "metrics")]
+    let metrics = params.metrics.clone();
+    let table = Table::recover(params)?;
+    let table_id = table.global_id();
+    let keyed = table
+        .block_index
+        .iter()
+        .next()
+        .expect("the table has a data block")?;
+    let handle = BlockHandle::new(keyed.offset(), keyed.size());
+
+    // One flipped payload bit: the read repairs it from parity, and the
+    // confirming re-read finds it again, so the fault is persistent.
+    let mut bytes = std::fs::read(&file)?;
+    let pos =
+        usize::try_from(handle.offset().0).expect("block offset fits usize") + Header::MIN_LEN + 3;
+    bytes[pos] ^= 0x80;
+    std::fs::write(&file, &bytes)?;
+    table.file_accessor.remove_for_table(&table_id);
+    assert_eq!(descriptors.len(), 0, "precondition: the descriptor is cold");
+
+    let sink = HealHints::default();
+    sink.set_enabled(true);
+    load_block(
+        table_id,
+        &table.path,
+        &table.file_accessor,
+        &Cache::with_capacity_bytes(10_000_000),
+        &handle,
+        BlockType::Data,
+        table.metadata.data_block_compression,
+        None,
+        table.metadata.ecc_params,
+        #[cfg(zstd_any)]
+        None,
+        Some(&sink),
+        #[cfg(feature = "metrics")]
+        &metrics,
+        ReadCharge::Untraced,
+    )?;
+    assert_eq!(
+        sink.snapshot(),
+        vec![table_id],
+        "the confirmed fault is still queued for healing",
+    );
+    assert_eq!(
+        descriptors.len(),
+        0,
+        "neither the read nor its confirming re-read may cache the descriptor",
+    );
     Ok(())
 }
 

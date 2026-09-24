@@ -1038,6 +1038,10 @@ impl Block {
     /// `payload` is post-checksum, post-ECC and post-decrypt: whatever the
     /// writer compressed, exactly as it compressed it.
     ///
+    /// `produced` receives the length the transform produced as soon as it
+    /// exists, so a caller charging decode work sees it even when the length
+    /// check below then refuses the block.
+    ///
     /// # Errors
     ///
     /// [`crate::Error::Decompress`] when the codec rejects the stream or
@@ -1050,6 +1054,7 @@ impl Block {
         header: &Header,
         payload: Slice,
         transform: &BlockTransform<'_>,
+        produced: &mut usize,
     ) -> crate::Result<Slice> {
         let compression = transform.compression();
         #[cfg(zstd_any)]
@@ -1057,6 +1062,7 @@ impl Block {
 
         match compression {
             CompressionType::None => {
+                *produced = payload.len();
                 #[expect(clippy::cast_possible_truncation, reason = "values are u32 length max")]
                 let actual_len = payload.len() as u32;
 
@@ -1079,6 +1085,7 @@ impl Block {
 
                 let bytes_written = lz4_flex::block::decompress_into(&payload, &mut builder)
                     .map_err(|_| crate::Error::Decompress(compression))?;
+                *produced = bytes_written;
 
                 if bytes_written != header.uncompressed_length as usize {
                     return Err(crate::Error::Decompress(compression));
@@ -1104,6 +1111,7 @@ impl Block {
                 let bytes_written =
                     crate::compression::ZstdBackend::decompress_into(&payload, &mut builder)
                         .map_err(|_| crate::Error::Decompress(compression))?;
+                *produced = bytes_written;
 
                 if bytes_written != header.uncompressed_length as usize {
                     return Err(crate::Error::Decompress(compression));
@@ -1131,6 +1139,7 @@ impl Block {
                     header.uncompressed_length as usize,
                 )
                 .map_err(|_| crate::Error::Decompress(compression))?;
+                *produced = decompressed.len();
 
                 if decompressed.len() != header.uncompressed_length as usize {
                     return Err(crate::Error::Decompress(compression));
@@ -1163,6 +1172,18 @@ impl Block {
         reader: &mut R,
         identity: BlockIdentity,
         transform: &BlockTransform<'_>,
+    ) -> crate::Result<Self> {
+        Self::from_reader_counting(reader, identity, transform, &mut 0)
+    }
+
+    /// [`Self::from_reader`] that also reports, in `produced`, the length the
+    /// transform produced: set as soon as it exists, so a block refused after
+    /// its transform ran still reports the work.
+    pub(crate) fn from_reader_counting<R: crate::io::Read>(
+        reader: &mut R,
+        identity: BlockIdentity,
+        transform: &BlockTransform<'_>,
+        produced: &mut usize,
     ) -> crate::Result<Self> {
         let encryption = transform.encryption();
         // `identity` (tree/table + dict/window context) feeds AAD
@@ -1235,7 +1256,7 @@ impl Block {
             // an uninitialized buffer and is only sound on an intact stream,
             // so the verify-then-decompress ORDER is a precondition, not an
             // optimization. Never hoist a decompress ahead of its checksum.
-            Self::decompress_payload(&header, Slice::from(decrypted), transform)?
+            Self::decompress_payload(&header, Slice::from(decrypted), transform, produced)?
         } else {
             // Zero-copy fast path for non-ECC blocks (the v0..v5
             // legacy shape); ECC blocks go through the Vec-allocating
@@ -1263,7 +1284,7 @@ impl Block {
                 payload
             };
 
-            Self::decompress_payload(&header, raw_data, transform)?
+            Self::decompress_payload(&header, raw_data, transform, produced)?
         };
 
         Ok(Self { header, data })
@@ -1318,23 +1339,26 @@ impl Block {
         identity: BlockIdentity,
         transform: &BlockTransform<'_>,
     ) -> crate::Result<(Self, EccStatus, Option<EccRecoveryKind>)> {
-        Self::from_file_issuing(file, handle, identity, transform, || {})
+        Self::from_file_issuing(file, handle, identity, transform, || {}, &mut 0)
     }
 
     /// [`Self::from_file_with_recovery`] that calls `on_issue` once, right
     /// before the filesystem read is issued: not for a handle refused before
     /// any read, but still for a read that then fails. Read accounting hangs
     /// off it, so it counts exactly the reads that were asked of the filesystem.
+    /// `produced` receives the transform's output length as soon as it exists,
+    /// so decode accounting sees a block the length check then refuses.
     pub(crate) fn from_file_issuing(
         file: &dyn FsFile,
         handle: BlockHandle,
         identity: BlockIdentity,
         transform: &BlockTransform<'_>,
         on_issue: impl FnOnce(),
+        produced: &mut usize,
     ) -> crate::Result<(Self, EccStatus, Option<EccRecoveryKind>)> {
         let (header, payload, ecc_status, recovery) =
             Self::read_verified_payload(file, handle, identity, transform, on_issue)?;
-        let data = Self::decompress_payload(&header, payload, transform)?;
+        let data = Self::decompress_payload(&header, payload, transform, produced)?;
         Ok((Self { header, data }, ecc_status, recovery))
     }
 

@@ -1429,6 +1429,10 @@ enum ValueSource {
 
 /// Returns row `i` of a [`TypeTag::Bytes`] column body as a zero-copy [`Slice`]
 /// view into `data` (the column's shared buffer), bounds-checked.
+///
+/// Not charged to `bytes_copied` even when the slice is short enough for
+/// [`Slice`] to store it inline: a view is a view whatever its representation,
+/// and the inline copy costs no more than building a shared handle.
 fn bytes_row_slice(data: &Slice, row_count: u32, i: u32) -> Result<Slice> {
     let bytes: &[u8] = data.as_ref();
     let off_bytes = (row_count as usize + 1) * 4;

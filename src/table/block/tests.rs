@@ -446,6 +446,103 @@ fn block_zero_uncompressed_length_with_data_fails_decompress() {
     );
 }
 
+/// Re-frames `payload` under a header whose `uncompressed_length` is one byte
+/// longer than the transform will produce. The payload checksum does not cover
+/// that field, so the block passes verification and is refused only after the
+/// transform has run.
+fn frame_with_overstated_length(payload: &[u8], transform: &BlockTransform<'_>) -> Vec<u8> {
+    use crate::coding::Encode;
+
+    let mut buf = vec![];
+    Block::write_into(
+        &mut buf,
+        payload,
+        BlockIdentity::for_test(0, BlockType::Data),
+        transform,
+    )
+    .unwrap();
+    let mut reader = &buf[..];
+    let mut header = Header::decode_from(&mut reader).unwrap();
+    let body = reader.to_vec();
+    header.uncompressed_length += 1;
+    let mut tampered = header.encode_into_vec();
+    tampered.extend_from_slice(&body);
+    tampered
+}
+
+/// A block whose transform output disagrees with the declared length is
+/// refused, but the transform still ran: the output length must reach the
+/// caller's decode accounting even though the read returns `Err`.
+#[test]
+fn a_refused_uncompressed_block_still_reports_what_it_produced() {
+    const PAYLOAD: &[u8] = b"an uncompressed payload";
+    let transform = BlockTransform::from_parts(
+        CompressionType::None,
+        None,
+        #[cfg(zstd_any)]
+        None,
+    )
+    .unwrap();
+    let tampered = frame_with_overstated_length(PAYLOAD, &transform);
+
+    let mut produced = 0;
+    let result = Block::from_reader_counting(
+        &mut &tampered[..],
+        BlockIdentity::for_test(0, BlockType::Data),
+        &transform,
+        &mut produced,
+    );
+    assert!(result.is_err(), "the length mismatch refuses the block");
+    assert_eq!(
+        produced,
+        PAYLOAD.len(),
+        "the refused block's output must still be reported",
+    );
+}
+
+/// The file read path reports the same for a compressed block: lz4 wrote its
+/// output before the length check refused it.
+#[test]
+#[cfg(feature = "lz4")]
+fn a_refused_lz4_block_read_from_a_file_still_reports_what_it_produced() {
+    use std::io::Write;
+
+    const PAYLOAD: &[u8] = b"an lz4 payload, an lz4 payload, an lz4 payload";
+    let transform = BlockTransform::from_parts(
+        CompressionType::Lz4,
+        None,
+        #[cfg(zstd_any)]
+        None,
+    )
+    .unwrap();
+    let tampered = frame_with_overstated_length(PAYLOAD, &transform);
+
+    let mut tmp = tempfile::NamedTempFile::new().unwrap();
+    tmp.write_all(&tampered).unwrap();
+    tmp.flush().unwrap();
+    let file = std::fs::File::open(tmp.path()).unwrap();
+
+    let mut produced = 0;
+    let result = Block::from_file_issuing(
+        &file,
+        crate::table::BlockHandle::new(BlockOffset(0), tampered.len() as u32),
+        BlockIdentity::for_test(0, BlockType::Data),
+        &transform,
+        || {},
+        &mut produced,
+    );
+    assert!(
+        matches!(&result, Err(crate::Error::Decompress(_))),
+        "the length mismatch refuses the block, got: {:?}",
+        result.err(),
+    );
+    assert_eq!(
+        produced,
+        PAYLOAD.len(),
+        "the refused block's output must still be reported",
+    );
+}
+
 #[test]
 #[cfg(feature = "lz4")]
 fn lz4_corrupted_uncompressed_length_triggers_decompress_error() {

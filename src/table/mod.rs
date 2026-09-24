@@ -679,14 +679,35 @@ impl Table {
     }
 
     pub fn list_blob_file_references(&self) -> crate::Result<Option<Vec<LinkedFile>>> {
+        self.read_blob_file_references(|| {
+            Ok(self
+                .file_accessor
+                .get_or_open_table(&self.global_id(), &self.path)?
+                .0)
+        })
+    }
+
+    /// [`Self::list_blob_file_references`] for verification: the descriptor is
+    /// taken without promoting or caching it, so the check leaves no trace.
+    #[cfg(feature = "std")]
+    fn untraced_blob_file_references(&self) -> crate::Result<Option<Vec<LinkedFile>>> {
+        self.read_blob_file_references(|| {
+            Ok(self
+                .file_accessor
+                .peek_or_open_table(&self.global_id(), &self.path)?)
+        })
+    }
+
+    /// Reads and parses the `linked_blob_files` section through the descriptor
+    /// `open` yields, opened only when the section exists.
+    fn read_blob_file_references(
+        &self,
+        open: impl FnOnce() -> crate::Result<Arc<dyn FsFile>>,
+    ) -> crate::Result<Option<Vec<LinkedFile>>> {
         use crate::io::{LE, ReadBytesExt};
 
         Ok(if let Some(handle) = &self.regions.linked_blob_files {
-            let table_id = self.global_id();
-
-            let (fd, _) = self
-                .file_accessor
-                .get_or_open_table(&table_id, &self.path)?;
+            let fd = open()?;
 
             // Read the exact region using pread-style helper
             let buf =
@@ -930,10 +951,11 @@ impl Table {
     /// block cache in both directions, for the semantic reconcile gates: a
     /// block read before an on-disk alteration leaves its pristine copy
     /// cached, and a gate served that stale original would judge bytes
-    /// other than the ones the digest refresh is about to trust. Reuses the
-    /// cached file descriptor but never consults or populates the block
-    /// cache (the cold verification blocks must not evict the live working
-    /// set either). Decodes under the table's data-block codec context, so
+    /// other than the ones the digest refresh is about to trust. Reuses a
+    /// cached file descriptor without promoting it, opens one privately on a
+    /// miss, and never consults or populates the block cache (the cold
+    /// verification reads must not evict the live working set either).
+    /// Decodes under the table's data-block codec context, so
     /// it fits every gate that walks `block_index` (Data or Columnar role).
     // Compiled under no_std alongside its `verify_kv_checksums` consumer,
     // which is itself dead there (the verify/scrub caller is std-gated).
@@ -949,9 +971,9 @@ impl Table {
         handle: &BlockHandle,
         block_type: BlockType,
     ) -> crate::Result<(Block, crate::Slice)> {
-        let (fd, _cache_event) = self
+        let fd = self
             .file_accessor
-            .get_or_open_table(&self.global_id(), &self.path)?;
+            .peek_or_open_table(&self.global_id(), &self.path)?;
         let transform = crate::table::util::build_block_transform(
             self.metadata.data_block_compression,
             self.encryption.as_deref(),
@@ -984,7 +1006,7 @@ impl Table {
                 header.block_type.into(),
             )));
         }
-        let data = Block::decompress_payload(&header, frame.clone(), &transform)?;
+        let data = Block::decompress_payload(&header, frame.clone(), &transform, &mut 0)?;
         Ok((Block { header, data }, frame))
     }
 
@@ -1814,7 +1836,7 @@ impl Table {
             ..PatrolScrubReport::default()
         };
 
-        for entry in self.maintenance_index_walk() {
+        for entry in self.untraced_index_walk() {
             let keyed = match entry {
                 Ok(h) => h,
                 Err(e) => {
@@ -3275,7 +3297,7 @@ impl Table {
                 }
             }
         }
-        let Some(recorded) = self.list_blob_file_references()? else {
+        let Some(recorded) = self.untraced_blob_file_references()? else {
             // No section is valid ONLY for a table with no indirections; a
             // non-empty derived map with no recorded section is a dropped /
             // renamed section hiding live blob references.
@@ -3764,7 +3786,7 @@ impl Table {
             // A PRESENT-but-empty map on a table with data blocks is a forgery;
             // the standalone gate rejects it before its walk, so do it here.
             Some(map) if map.is_empty() => {
-                if self.maintenance_index_walk().next().is_some() {
+                if self.untraced_index_walk().next().is_some() {
                     return Err((
                         G::ZoneMap,
                         crate::Error::InvalidHeader(
@@ -4678,10 +4700,10 @@ impl Table {
                 block.header.block_type.into(),
             )));
         }
-        // Verification, not a caller's read: the walk stays out of the read
-        // counters like every other gate's.
+        // Verification, not a caller's read: like every other gate's walk it
+        // stays out of the read counters and leaves the block cache alone.
         let blocks: Vec<BlockHandle> = self
-            .maintenance_index_walk()
+            .untraced_index_walk()
             .map(|r| r.map(|kbh| *kbh.as_ref()))
             .collect::<crate::Result<Vec<_>>>()?;
         Ok(Some(crate::table::locator::LoadedLocator::new(
@@ -4989,7 +5011,7 @@ impl Table {
         // hidden bitmap deleted.
         if let Some(filter) = &full_filter
             && filter.is_empty()
-            && self.maintenance_index_walk().next().is_some()
+            && self.untraced_index_walk().next().is_some()
         {
             return Err(crate::Error::InvalidHeader(
                 "filter section is present but empty on a table with data blocks",
@@ -5274,7 +5296,7 @@ impl Table {
         // `data_block_count` describes the WHOLE table, punched prefix
         // included, so it is counted off the index itself — no decode.
         let mut block_count: u64 = 0;
-        for handle in self.maintenance_index_walk() {
+        for handle in self.untraced_index_walk() {
             handle?;
             block_count = block_count
                 .checked_add(1)
@@ -5644,7 +5666,7 @@ impl Table {
         // cannot catch it: a block absent from the map is skipped, so an empty
         // map trivially "agrees" with every block.)
         if map.is_empty() {
-            if self.maintenance_index_walk().next().is_some() {
+            if self.untraced_index_walk().next().is_some() {
                 return Err(crate::Error::InvalidHeader(
                     "block_layout section is present but empty on a table with data blocks",
                 ));
@@ -5679,7 +5701,7 @@ impl Table {
         use crate::table::block::ParsedItem as _;
 
         let punch = self.punch_offset()?;
-        for handle in self.maintenance_index_walk() {
+        for handle in self.untraced_index_walk() {
             let handle = handle?;
             let handle = BlockHandle::new(handle.offset(), handle.size());
             if handle.offset().0 < punch {
@@ -6867,15 +6889,22 @@ impl Table {
             dict_id: self.metadata.data_block_compression.dict_id(),
             window_log: 0,
         };
-        let block = Block::from_reader(&mut crate::io::Cursor::new(bytes), identity, &transform)?;
-        // The transform ran here, outside the block cache, so its output is
-        // charged here, before the role check that may refuse the block; the
-        // read was charged when the batch was issued.
-        #[cfg(feature = "metrics")]
-        self.metrics.block_bytes_decoded.fetch_add(
-            block.data.len() as u64,
-            core::sync::atomic::Ordering::Relaxed,
+        // The transform runs here, outside the block cache, so its output is
+        // charged here, before the result is judged: a block the length or
+        // role check refuses was still decoded. The read was charged when the
+        // batch was issued.
+        let mut produced = 0;
+        let decoded = Block::from_reader_counting(
+            &mut crate::io::Cursor::new(bytes),
+            identity,
+            &transform,
+            &mut produced,
         );
+        #[cfg(feature = "metrics")]
+        self.metrics
+            .block_bytes_decoded
+            .fetch_add(produced as u64, core::sync::atomic::Ordering::Relaxed);
+        let block = decoded?;
         if block.header.block_type != BlockType::Data {
             return Err(crate::Error::InvalidTag((
                 "BlockType",

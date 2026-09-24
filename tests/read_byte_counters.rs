@@ -542,7 +542,10 @@ fn a_blob_prefetch_the_filesystem_refuses_still_counts_its_span() {
 /// A key-value-separated tree of `n` 8 KiB values, blob files written with
 /// `compression`, over a cache with the row cache off, so the only thing a
 /// lookup can detach is the key it hands the blob cache.
-fn blob_tree_without_row_cache(n: u32, compression: CompressionType) -> (TempDir, AnyTree) {
+fn blob_tree_without_row_cache(
+    n: u32,
+    compression: CompressionType,
+) -> lsm_tree::Result<(TempDir, AnyTree)> {
     let folder = get_tmp_folder();
     let tree = Config::new(
         folder.path(),
@@ -554,13 +557,12 @@ fn blob_tree_without_row_cache(n: u32, compression: CompressionType) -> (TempDir
     ))
     .blob_compression(compression)
     .with_kv_separation(Some(Default::default()))
-    .open()
-    .expect("open");
+    .open()?;
     for i in 0..n {
         tree.insert(key(i), vec![b'v'; 8_192], u64::from(i));
     }
-    tree.flush_active_memtable(0).expect("flush");
-    (folder, tree)
+    tree.flush_active_memtable(0)?;
+    Ok((folder, tree))
 }
 
 #[test]
@@ -569,7 +571,7 @@ fn a_blob_admitted_to_the_blob_cache_counts_the_key_it_detaches() -> lsm_tree::R
     // entry does not borrow the caller's buffer. That copy is a gather: a
     // point read that misses charges exactly its key, and a read served from
     // the cache copies nothing.
-    let (_folder, tree) = blob_tree_without_row_cache(20, CompressionType::None);
+    let (_folder, tree) = blob_tree_without_row_cache(20, CompressionType::None)?;
     let m = tree.metrics();
 
     let before = m.bytes_copied();
@@ -599,7 +601,7 @@ fn a_blob_prefetch_counts_the_keys_it_detaches() -> lsm_tree::Result<()> {
     // decompress into buffers of their own, so the keys are the only copy the
     // scan makes: every value is cached exactly once, whichever path read it.
     let n = 50;
-    let (_folder, tree) = blob_tree_without_row_cache(n, CompressionType::Lz4);
+    let (_folder, tree) = blob_tree_without_row_cache(n, CompressionType::Lz4)?;
     let m = tree.metrics();
 
     let before = m.bytes_copied();

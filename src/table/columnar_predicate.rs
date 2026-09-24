@@ -199,8 +199,7 @@ fn take_column(col: &Column, rows: usize, indices: &[u32]) -> crate::Result<Colu
 }
 
 /// Rebuilds a validity bitmap for the rows listed in `indices`, preserving each
-/// gathered row's null bit in output order. Index-driven counterpart of
-/// [`compact_validity`].
+/// gathered row's null bit in output order.
 fn take_validity(bits: &[u8], indices: &[u32]) -> Vec<u8> {
     let mut out = alloc::vec![0u8; indices.len().div_ceil(8)];
     for (o, &i) in indices.iter().enumerate() {
