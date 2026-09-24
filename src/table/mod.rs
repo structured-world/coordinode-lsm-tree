@@ -245,6 +245,8 @@ pub(crate) struct TableSinks<'a> {
     /// Where a confirmed-persistent ECC correction queues the table for a
     /// healing rewrite.
     pub heal_hints: &'a Arc<crate::heal_hints::HealHints>,
+    /// How the tree's columnar reads fetch their pages.
+    pub read_budget: crate::config::ReadBudget,
     /// Moves an obsolete table's `unlink` off the foreground path.
     ///
     /// `None` for outputs that can be ROLLED BACK: the tight-space slice loop
@@ -978,6 +980,7 @@ impl Table {
             #[cfg(feature = "metrics")]
             metrics: &self.metrics,
             charge,
+            budget: self.read_budget(),
         }
         .load(want)?;
         let mut copied = 0usize;
@@ -7962,7 +7965,8 @@ impl Table {
             self.metadata.data_block_restart_interval,
             #[cfg(feature = "metrics")]
             self.metrics.clone(),
-        );
+        )
+        .with_read_budget(self.read_budget());
 
         match range.start_bound() {
             Bound::Included(key) => iter.set_lower_bound(iter::Bound::Included(key.clone())),
@@ -9117,6 +9121,8 @@ impl Table {
 
                 heal_hints: once_cell::race::OnceBox::new(),
 
+                read_budget: once_cell::race::OnceBox::new(),
+
                 #[cfg(all(feature = "std", feature = "page_ecc"))]
                 heal_lock: once_cell::race::OnceBox::new(),
             }),
@@ -9546,10 +9552,18 @@ impl Table {
     pub(crate) fn bind_to_tree(&self, sinks: &TableSinks<'_>) {
         self.install_deletion_pause(Arc::clone(sinks.deletion_pause));
         self.install_heal_hints(Arc::clone(sinks.heal_hints));
+        // A second bind keeps the first budget, like the other sinks.
+        let _ = self.0.read_budget.set(Box::new(sinks.read_budget));
         #[cfg(feature = "std")]
         if let Some(deleter) = sinks.background_deleter {
             self.install_background_deleter(Arc::clone(deleter));
         }
+    }
+
+    /// How this table's columnar reads fetch their pages: the budget its tree
+    /// bound it with, or the default for a table no tree owns.
+    pub(crate) fn read_budget(&self) -> crate::config::ReadBudget {
+        self.0.read_budget.get().copied().unwrap_or_default()
     }
 
     /// The installed heal-hint sink, exposed so tests outside this module can

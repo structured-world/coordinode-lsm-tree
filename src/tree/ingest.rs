@@ -561,6 +561,7 @@ impl<'a> Ingestion<'a> {
             table.bind_to_tree(&crate::table::TableSinks {
                 deletion_pause: &self.tree.deletion_pause,
                 heal_hints: &self.tree.heal_hints,
+                read_budget: self.tree.config.columnar_read_budget,
                 #[cfg(feature = "std")]
                 background_deleter: Some(&self.tree.background_deleter),
             });

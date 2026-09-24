@@ -34,6 +34,7 @@ fn config() -> BenchConfig {
         block_size: 4_096,
         row_group_size: lsm_tree::config::DEFAULT_COLUMNAR_ROW_GROUP_SIZE,
         page_size: lsm_tree::config::DEFAULT_COLUMNAR_PAGE_SIZE,
+        read_budget: lsm_tree::config::ReadBudget::default(),
         use_blob_tree: false,
         metadata_priority: true,
         partition_metadata: false,

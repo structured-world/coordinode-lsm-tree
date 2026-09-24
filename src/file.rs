@@ -397,6 +397,43 @@ pub fn read_exact(file: &dyn FsFile, offset: u64, size: usize) -> crate::io::Res
     Ok(builder.freeze().into())
 }
 
+/// Reads several `(offset, size)` regions of a file in one batched request
+/// ([`FsFile::read_many`]), each into a slice of its own, in the order given.
+///
+/// A backend with batched I/O keeps every region in flight at once; the
+/// default one reads them in turn. Either way a region comes back whole or
+/// the call fails.
+///
+/// # Errors
+///
+/// The first failing region's I/O error; a short region is
+/// [`crate::io::ErrorKind::UnexpectedEof`].
+pub fn read_exact_many(
+    file: &dyn FsFile,
+    regions: &[(u64, usize)],
+) -> crate::io::Result<alloc::vec::Vec<Slice>> {
+    // SAFETY: each builder starts uninitialized, with its region's length.
+    // `read_many` fills every region completely or fails, and on failure every
+    // builder is dropped unread, so no uninitialized byte is ever frozen into
+    // a slice.
+    #[expect(unsafe_code, reason = "see safety")]
+    let mut builders: alloc::vec::Vec<_> = regions
+        .iter()
+        .map(|&(_, size)| unsafe { Slice::builder_unzeroed(size) })
+        .collect();
+    let mut targets: alloc::vec::Vec<(u64, &mut [u8])> = regions
+        .iter()
+        .zip(builders.iter_mut())
+        .map(|(&(offset, _), builder)| (offset, &mut builder[..]))
+        .collect();
+    file.read_many(&mut targets)?;
+    drop(targets);
+    Ok(builders
+        .into_iter()
+        .map(|builder| builder.freeze().into())
+        .collect())
+}
+
 /// Atomically rewrites a file via the [`Fs`] trait.
 ///
 /// Writes `content` to a temporary file in the same directory, fsyncs it,

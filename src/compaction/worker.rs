@@ -1556,6 +1556,7 @@ fn run_tight_space_compaction(
                 table.bind_to_tree(&crate::table::TableSinks {
                     deletion_pause: &opts.deletion_pause,
                     heal_hints: &opts.heal_hints,
+                    read_budget: opts.config.columnar_read_budget,
                     #[cfg(feature = "std")]
                     background_deleter: None,
                 });
@@ -1740,6 +1741,7 @@ fn run_tight_space_compaction(
                 blob_file.bind_to_tree(&crate::table::TableSinks {
                     deletion_pause: &opts.deletion_pause,
                     heal_hints: &opts.heal_hints,
+                    read_budget: opts.config.columnar_read_budget,
                     #[cfg(feature = "std")]
                     background_deleter: None,
                 });

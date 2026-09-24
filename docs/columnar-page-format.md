@@ -372,6 +372,26 @@ other. Only the admitted row pages' pages of the projected columns are read.
 followed by one coalesced read of the whole remainder — the same single
 sequential read the group is today, plus the directory.
 
+### The read budget
+
+How a read fetches the pages it wants is the reader's choice, not the file's:
+`Config::columnar_read_budget` sets it per tree, and the same tables read
+under any budget return the same rows.
+
+- **The I/O buffer** is what one request may ask for. A run of adjacent wanted
+  pages is one request up to it and is cut between pages past it; a single page
+  larger than it is a request of its own. A read of every page takes a group
+  that fits it in one request. The directory prefix is no larger than it.
+- **The in-flight count** is how many requests go out together, through the
+  filesystem's batched read. A backend with batched I/O keeps them in flight at
+  once; one without reads them in turn.
+
+The default is 1 MiB and 16 requests: the I/O buffer Vortex reads a column
+with, under which every group up to 1 MiB still reads in one request. A
+smaller buffer spends more requests on the same bytes; that is its whole
+effect, since the pages of a column lie next to each other and a larger
+buffer only covers more of them per request.
+
 The extra dependent step (directory before pages) is real and is the cost of
 the indirection. It is bounded by the directory being small and adjacent to
 the first page anyone needs, and by the staged read path treating it as one

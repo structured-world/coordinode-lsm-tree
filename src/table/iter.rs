@@ -424,6 +424,9 @@ pub struct Iter {
 
     /// Whose read this iteration is.
     charge: ReadCharge,
+
+    /// How the iteration's columnar reads fetch their pages.
+    read_budget: crate::config::ReadBudget,
 }
 
 impl Iter {
@@ -490,7 +493,15 @@ impl Iter {
             #[cfg(feature = "metrics")]
             metrics,
             charge: ReadCharge::Foreground,
+            read_budget: crate::config::ReadBudget::default(),
         }
+    }
+
+    /// Reads this iteration's columnar row groups under `budget`.
+    #[must_use]
+    pub(crate) fn with_read_budget(mut self, budget: crate::config::ReadBudget) -> Self {
+        self.read_budget = budget;
+        self
     }
 
     /// Marks this iterator, and the index walk inside it, as maintenance such
@@ -544,6 +555,7 @@ impl Iter {
                     #[cfg(feature = "metrics")]
                     metrics: &self.metrics,
                     charge: self.charge,
+                    budget: self.read_budget,
                 }
                 .load(&crate::table::row_group::PageWant::ALL)?;
                 // What decoding the pages copied out of them, plus the values

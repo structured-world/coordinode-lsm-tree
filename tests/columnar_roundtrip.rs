@@ -226,6 +226,88 @@ fn row_pages_and_their_zones_read_back_under_encryption_and_ecc() {
     check("compacted");
 }
 
+/// One tree read under a small and a large read budget: the same tables, the
+/// same rows returned, and the larger budget taking them in fewer requests.
+/// The budget is the reader's, so nothing about the files changes between the
+/// two reads; a column's pages lie next to each other, so a larger I/O buffer
+/// covers more of them per request.
+#[test]
+fn one_table_reads_the_same_rows_under_any_budget_and_fewer_requests_under_a_larger_one() {
+    use lsm_tree::config::{BlockSizePolicy, ReadBudget};
+    use lsm_tree::fs::{FaultFs, StdFs};
+    use lsm_tree::table::columnar::{COL_USER_KEY, COL_VALUE};
+
+    let folder = get_tmp_folder();
+    let open = |budget: ReadBudget, fs: FaultFs<StdFs>| {
+        let any = Config::new(
+            folder.path(),
+            SequenceNumberCounter::default(),
+            SequenceNumberCounter::default(),
+        )
+        .with_fs(fs)
+        .columnar_row_group_size_policy(BlockSizePolicy::all(128 * 1_024))
+        .columnar_page_size_policy(BlockSizePolicy::all(4 * 1_024))
+        .columnar_read_budget(budget)
+        .open()
+        .expect("open");
+        let AnyTree::Standard(tree) = any else {
+            panic!("expected standard tree");
+        };
+        tree.update_runtime_config(|cfg| cfg.columnar = true)
+            .expect("enable columnar");
+        tree
+    };
+    {
+        let tree = open(ReadBudget::default(), FaultFs::new(StdFs));
+        for i in 0..3_000u32 {
+            tree.insert(key(i), value(i), 0);
+        }
+        tree.flush_active_memtable(0).expect("flush");
+    }
+
+    // Everything the two readers do: a projection of every row, and point
+    // reads, each from a cold cache.
+    let read = |budget: ReadBudget| {
+        let fs = FaultFs::new(StdFs);
+        let reads = fs.injector();
+        let tree = open(budget, fs);
+        let before = reads.read_count();
+        let mut rows = Vec::new();
+        for batch in tree
+            .columnar_scan(&[COL_USER_KEY, COL_VALUE], None, SeqNo::MAX, ..)
+            .expect("scan")
+        {
+            let batch = batch.expect("batch");
+            let keys = batch
+                .columns
+                .iter()
+                .find(|c| c.column_id == COL_USER_KEY)
+                .expect("the key column");
+            rows.push((batch.row_count, keys.data.to_vec()));
+        }
+        let values: Vec<_> = (0..3_000u32)
+            .step_by(101)
+            .map(|i| tree.get(key(i), SeqNo::MAX).expect("get"))
+            .collect();
+        (rows, values, reads.read_count() - before)
+    };
+
+    let (small_rows, small_values, small_requests) = read(ReadBudget::new(4 * 1_024, 1));
+    let (large_rows, large_values, large_requests) = read(ReadBudget::new(1 << 20, 16));
+    assert_eq!(
+        small_rows, large_rows,
+        "the projection returns the same rows"
+    );
+    assert_eq!(
+        small_values, large_values,
+        "the point reads return the same values"
+    );
+    assert!(
+        large_requests < small_requests,
+        "the larger budget took {large_requests} requests, the smaller {small_requests}",
+    );
+}
+
 #[test]
 fn columnar_tombstone_hides_row() {
     let folder = get_tmp_folder();

@@ -62,6 +62,14 @@ struct Cli {
     #[arg(long, default_value_t = lsm_tree::config::DEFAULT_COLUMNAR_PAGE_SIZE)]
     page_size: u32,
 
+    /// Bytes one columnar read request may ask for.
+    #[arg(long, default_value_t = lsm_tree::config::ReadBudget::default().io_buffer())]
+    read_io_buffer: u32,
+
+    /// Columnar read requests kept in flight at once.
+    #[arg(long, default_value_t = lsm_tree::config::ReadBudget::default().in_flight())]
+    read_in_flight: u16,
+
     /// Use BlobTree (key-value separation) instead of standard Tree.
     #[arg(long)]
     use_blob_tree: bool,
@@ -176,6 +184,7 @@ fn main() {
         block_size: cli.block_size,
         row_group_size: cli.row_group_size,
         page_size: cli.page_size,
+        read_budget: lsm_tree::config::ReadBudget::new(cli.read_io_buffer, cli.read_in_flight),
         use_blob_tree: cli.use_blob_tree,
         metadata_priority: cli.metadata_priority,
         partition_metadata: cli.partition_metadata,

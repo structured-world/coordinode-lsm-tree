@@ -481,6 +481,7 @@ pub(super) fn install_merge(
     let sinks = crate::table::TableSinks {
         deletion_pause: &opts.deletion_pause,
         heal_hints: &opts.heal_hints,
+        read_budget: opts.config.columnar_read_budget,
         #[cfg(feature = "std")]
         background_deleter: None,
     };

@@ -1010,6 +1010,7 @@ impl AbstractTree for Tree {
         let sinks = crate::table::TableSinks {
             deletion_pause: &self.deletion_pause,
             heal_hints: &self.heal_hints,
+            read_budget: self.config.columnar_read_budget,
             #[cfg(feature = "std")]
             background_deleter: Some(&self.background_deleter),
         };
@@ -5118,6 +5119,7 @@ impl Tree {
         let sinks = crate::table::TableSinks {
             deletion_pause: &deletion_pause,
             heal_hints: &heal_hints,
+            read_budget: inner.config.columnar_read_budget,
             #[cfg(feature = "std")]
             background_deleter: Some(&background_deleter),
         };

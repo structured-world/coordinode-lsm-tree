@@ -265,6 +265,8 @@ pub struct GroupRead<'a> {
     pub metrics: &'a Metrics,
     /// Whose read this is, applied as `load_block` applies it.
     pub charge: ReadCharge,
+    /// How much one request may ask for and how many go in flight at once.
+    pub budget: crate::config::ReadBudget,
 }
 
 impl GroupRead<'_> {
@@ -277,13 +279,15 @@ impl GroupRead<'_> {
     /// charged it as one page.
     ///
     /// When the directory is cached, only the wanted pages that are not are
-    /// read, each run of consecutive ones as one request: a full read after a
-    /// point read has fetched the key page reads the rest of the group, not the
-    /// key page again. When it is not, `wanted == None` reads the group in ONE
-    /// request, as a full scan wants, and `Some` reads the directory first (a
-    /// [`DIRECTORY_PREFIX`] of the group, extended if the directory is longer)
-    /// and then the wanted pages the same way, reusing any bytes the prefix
-    /// brought in.
+    /// read, each run of consecutive ones as requests of up to the budget's
+    /// I/O buffer: a full read after a point read has fetched the key page
+    /// reads the rest of the group, not the key page again. When it is not, a
+    /// read of every page of a group that fits the I/O buffer takes it in ONE
+    /// request, as a full scan wants, and any other read takes the directory
+    /// first (a [`DIRECTORY_PREFIX`] of the group, no more than the I/O
+    /// buffer, extended if the directory is longer) and then the wanted pages
+    /// the same way, reusing any bytes the prefix brought in. Requests go out
+    /// the budget's in-flight count at a time.
     ///
     /// Each request is charged when it is issued: the whole group and page
     /// runs to the data role, the directory prefix to the index role. Each
@@ -352,7 +356,7 @@ impl GroupRead<'_> {
         }
 
         let fd = self.open()?;
-        if want.is_all() {
+        if want.is_all() && self.group.size() <= self.budget.io_buffer() {
             self.read_whole(fd.as_ref())
         } else {
             self.read_selective(fd, want)
@@ -450,7 +454,9 @@ impl GroupRead<'_> {
         let prefix = self.read(
             fd.as_ref(),
             0,
-            group_len.min(DIRECTORY_PREFIX),
+            group_len
+                .min(DIRECTORY_PREFIX)
+                .min(self.budget.io_buffer() as usize),
             BlockType::ColumnPageDirectory,
         )?;
         let directory_len = Header::decode_from(&mut &prefix[..])?.on_disk_size_with(self.ecc);
@@ -537,10 +543,13 @@ impl GroupRead<'_> {
     /// Fetches every page `want` selects that `pages` does not hold yet.
     ///
     /// Pages are contiguous in directory order (the extent check proved it),
-    /// so a run of consecutive missing pages is one byte range and is read in
-    /// one request. `front` holds the group's first bytes when an earlier
-    /// read brought them in, and a range it covers is served from it rather
-    /// than asked for again.
+    /// so a run of consecutive missing pages is one byte range, read in
+    /// requests of up to the budget's I/O buffer: a run within it is one
+    /// request, a longer one is cut between pages, and a page larger than it
+    /// is a request of its own. Requests go out the budget's in-flight count
+    /// at a time. `front` holds the group's first bytes when an earlier read
+    /// brought them in, and a range it covers is served from it rather than
+    /// asked for again.
     fn fetch_missing(
         &self,
         fd: &dyn FsFile,
@@ -551,12 +560,13 @@ impl GroupRead<'_> {
         want: &Wanted<'_>,
     ) -> crate::Result<Vec<Option<Block>>> {
         let entries = directory.entries();
-        let runs = {
+        let io_buffer = self.budget.io_buffer() as usize;
+        let requests = {
             let missing = |i: usize| {
                 pages.get(i).is_some_and(Option::is_none)
                     && entries.get(i).is_some_and(|e| want.wants(e))
             };
-            let mut runs = Vec::new();
+            let mut requests = Vec::new();
             let mut i = 0;
             while i < entries.len() {
                 if !missing(i) {
@@ -564,53 +574,125 @@ impl GroupRead<'_> {
                     continue;
                 }
                 let first = i;
+                let mut bytes = 0usize;
                 while i < entries.len() && missing(i) {
+                    let length = entries.get(i).map_or(0, |e| e.length as usize);
+                    if i > first && bytes + length > io_buffer {
+                        break;
+                    }
+                    bytes += length;
                     i += 1;
                 }
-                runs.push(first..i);
+                requests.push(first..i);
             }
-            runs
+            requests
         };
         // Every offset below is within the group: the extent check proved
         // that the directory and its pages fill it exactly, and the group's
         // length is a `u32`.
         let page_at = |entry: &PageEntry| directory_len as usize + entry.offset as usize;
-        for run in runs {
-            let (Some(first), Some(last)) = (entries.get(run.start), entries.get(run.end - 1))
-            else {
-                continue;
-            };
-            let start = page_at(first);
-            let end = page_at(last) + last.length as usize;
-            let span = self.span(fd, front, start, end)?;
-            for index in run {
-                let Some(entry) = entries.get(index) else {
-                    continue;
+        let span_of = |run: &core::ops::Range<usize>| {
+            let first = entries.get(run.start)?;
+            let last = entries.get(run.end.checked_sub(1)?)?;
+            Some((page_at(first), page_at(last) + last.length as usize))
+        };
+        for batch in requests.chunks(usize::from(self.budget.in_flight())) {
+            let spans = batch
+                .iter()
+                .map(|run| {
+                    span_of(run).ok_or(crate::Error::InvalidHeader(
+                        "columnar: page outside its row group",
+                    ))
+                })
+                .collect::<crate::Result<Vec<_>>>()?;
+            // The requests the bytes already in hand do not reach at all go
+            // out together; one they reach, in whole or in part, is served
+            // from them.
+            let beyond: Vec<(usize, usize)> = spans
+                .iter()
+                .filter(|&&(start, _)| start >= front.len())
+                .map(|&(start, end)| (start, end - start))
+                .collect();
+            let mut read = self.read_many(fd, &beyond)?.into_iter();
+            for (run, &(start, end)) in batch.iter().zip(&spans) {
+                let span = if start >= front.len() {
+                    read.next().ok_or(crate::Error::InvalidHeader(
+                        "columnar: a request came back missing",
+                    ))?
+                } else {
+                    self.span(fd, front, start, end)?
                 };
-                let at = page_at(entry) - start;
-                let bytes =
-                    span.get(at..at + entry.length as usize)
-                        .ok_or(crate::Error::InvalidHeader(
-                            "columnar: page outside its row group",
-                        ))?;
-                let handle = BlockHandle::new(
-                    BlockOffset(*self.group.offset() + page_at(entry) as u64),
-                    entry.length,
-                );
-                let page = self.verify_and_admit(
-                    bytes,
-                    &handle,
-                    BlockType::ColumnPage,
-                    self.compression,
-                    true,
+                self.admit_pages(
+                    directory_len,
+                    entries,
+                    run.clone(),
+                    start,
+                    &span,
+                    &mut pages,
                 )?;
-                self.cache_block(&handle, page.clone());
-                if let Some(slot) = pages.get_mut(index) {
-                    *slot = Some(page);
-                }
             }
         }
         Ok(pages)
+    }
+
+    /// Verifies, admits and caches the pages `run` names out of `span`, the
+    /// group's bytes from `start`, into their slots of `pages`.
+    fn admit_pages(
+        &self,
+        directory_len: u32,
+        entries: &[PageEntry],
+        run: core::ops::Range<usize>,
+        start: usize,
+        span: &Slice,
+        pages: &mut [Option<Block>],
+    ) -> crate::Result<()> {
+        let page_at = |entry: &PageEntry| directory_len as usize + entry.offset as usize;
+        for index in run {
+            let Some(entry) = entries.get(index) else {
+                continue;
+            };
+            let at = page_at(entry) - start;
+            let bytes =
+                span.get(at..at + entry.length as usize)
+                    .ok_or(crate::Error::InvalidHeader(
+                        "columnar: page outside its row group",
+                    ))?;
+            let handle = BlockHandle::new(
+                BlockOffset(*self.group.offset() + page_at(entry) as u64),
+                entry.length,
+            );
+            let page = self.verify_and_admit(
+                bytes,
+                &handle,
+                BlockType::ColumnPage,
+                self.compression,
+                true,
+            )?;
+            self.cache_block(&handle, page.clone());
+            if let Some(slot) = pages.get_mut(index) {
+                *slot = Some(page);
+            }
+        }
+        Ok(())
+    }
+
+    /// Reads the `(at, len)` ranges of the group in one batched request, each
+    /// charged to the data role as the request is issued.
+    fn read_many(&self, fd: &dyn FsFile, ranges: &[(usize, usize)]) -> crate::Result<Vec<Slice>> {
+        if ranges.is_empty() {
+            return Ok(Vec::new());
+        }
+        #[cfg(feature = "metrics")]
+        if self.charge.is_counted() {
+            for &(_, len) in ranges {
+                record_block_read(self.metrics, BlockType::ColumnPage, len as u64);
+            }
+        }
+        let regions: Vec<(u64, usize)> = ranges
+            .iter()
+            .map(|&(at, len)| (*self.group.offset() + at as u64, len))
+            .collect();
+        Ok(crate::file::read_exact_many(fd, &regions)?)
     }
 
     /// The group's bytes `[start, end)`, served from `front` as far as it
