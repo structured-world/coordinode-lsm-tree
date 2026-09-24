@@ -15,6 +15,7 @@
 
 use super::fixtures::{self, Fixture};
 use crate::config::{BenchConfig, Compression};
+use crate::reporter::Direction;
 use lsm_tree::{AbstractTree, SeqNo};
 use std::sync::atomic::AtomicU64;
 
@@ -321,7 +322,9 @@ fn published_series_fixture_capped_names_the_keys_it_built() -> lsm_tree::Result
     let seqno = AtomicU64::new(1);
     let (readings, _) = super::measure_scenario(
         fixtures::blobs_well_placed,
-        |_| Ok(0),
+        // Emits a row per key without reading: a scenario with no row
+        // publishes nothing, and the labels are what is under test.
+        |f| Ok(f.oracle.rows.len() as u64),
         &requested,
         &seqno,
         &std::env::temp_dir(),
@@ -348,6 +351,53 @@ fn published_series_fixture_capped_names_the_keys_it_built() -> lsm_tree::Result
         );
     }
     Ok(())
+}
+
+fn readings(rows: u64, read: u64, decoded: u64, copied: u64) -> super::Readings {
+    super::Readings {
+        keys: rows,
+        rows,
+        bytes_read: read,
+        bytes_decoded: decoded,
+        bytes_copied: copied,
+        elapsed: std::time::Duration::ZERO,
+    }
+}
+
+fn published(readings: &super::Readings) -> Vec<(String, f64, String, Direction)> {
+    let mut reporter = crate::reporter::Reporter::new();
+    readings.publish("s", &mut reporter);
+    reporter
+        .published()
+        .iter()
+        .map(|s| (s.name.clone(), s.value, s.unit.clone(), s.direction))
+        .collect()
+}
+
+#[test]
+fn published_series_are_bytes_per_emitted_row_and_smaller_is_better() {
+    // Every counter is divided by the rows emitted, the one denominator the
+    // three share, and each is a cost. A read served from cache decodes
+    // nothing: its figures are zero, the best value, with no stand-in divisor.
+    let got = published(&readings(4, 400, 0, 0));
+    let want = [
+        ("s bytes read per row", 100.0),
+        ("s bytes decoded per row", 0.0),
+        ("s bytes copied per row", 0.0),
+    ];
+    assert_eq!(got.len(), want.len());
+    for ((name, value, unit, direction), (want_name, want_value)) in got.iter().zip(want) {
+        assert_eq!((name.as_str(), *value), (want_name, want_value));
+        assert_eq!(unit, "B/row");
+        assert_eq!(*direction, Direction::SmallerIsBetter);
+    }
+}
+
+#[test]
+fn published_series_no_row_emitted_publishes_nothing() {
+    // A cost per row does not exist without a row. Publishing one against a
+    // divisor of one would draw a point the run did not measure.
+    assert!(published(&readings(0, 4096, 4096, 128)).is_empty());
 }
 
 #[test]

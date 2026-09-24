@@ -97,9 +97,9 @@ impl GithubSuites {
 #[derive(Clone, Copy, Debug, PartialEq, Eq, Serialize)]
 #[serde(rename_all = "snake_case")]
 pub enum Direction {
-    /// A yield: rows per KiB read, operations per second.
+    /// A yield: operations per second.
     BiggerIsBetter,
-    /// A cost: bytes copied per byte decoded, an amplification.
+    /// A cost: bytes read, decoded or copied per emitted row.
     #[cfg_attr(
         all(not(feature = "counters"), not(test)),
         expect(dead_code, reason = "only the counters workload publishes a cost")

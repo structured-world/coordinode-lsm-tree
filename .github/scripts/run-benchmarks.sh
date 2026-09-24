@@ -1,7 +1,7 @@
 #!/bin/bash
 # Run all db_bench workloads and produce github-action-benchmark JSON:
 # benchmark-results.json holds the bigger-is-better series (rates, yields),
-# benchmark-costs.json the smaller-is-better ones (amplifications). The action
+# benchmark-costs.json the smaller-is-better ones (bytes per row). The action
 # fixes one direction per suite, so the two are stored as separate suites.
 # Usage: .github/scripts/run-benchmarks.sh [NUM_OPS] [ITERATIONS]
 #
@@ -22,8 +22,9 @@ cargo run --release --manifest-path tools/db_bench/Cargo.toml -- \
 
 # The byte-counter workload needs the engine's read counters, which are
 # atomics on every read path, so it runs from a separate `counters` build
-# rather than slowing the rates above. Its yields join the same suite; its
-# costs are the whole of the other one.
+# rather than slowing the rates above. Its series are costs, bytes per emitted
+# row, and are the whole of the other suite; any yield it publishes is
+# appended to the rate suite rather than replacing it.
 cargo run --release --manifest-path tools/db_bench/Cargo.toml --features counters -- \
   --benchmark mixed-layout --num "$NUM" --iterations "$ITERATIONS" \
   --github-json \

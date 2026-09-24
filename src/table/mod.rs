@@ -1090,8 +1090,9 @@ impl Table {
     /// Returns `Ok(None)` when a columnar block is wholly deleted by the
     /// positional mask, so the caller treats it as carrying no keys.
     ///
-    /// `pub(crate)` so the salvage walk ([`crate::salvage`]) can attempt each
-    /// data block individually and drop the ones that fail to load.
+    /// `pub(crate)` so the repair tests can load one block of a table they
+    /// damaged; the salvage walk reads through its own loader,
+    /// [`Table::salvage_load_block`].
     pub(crate) fn load_data_block(&self, handle: &BlockHandle) -> crate::Result<Option<DataBlock>> {
         self.load_data_block_charged(handle, ReadCharge::Foreground)
     }
@@ -1267,12 +1268,13 @@ impl Table {
         &self,
         handle: &BlockHandle,
     ) -> crate::Result<Option<crate::table::columnar::ColumnBatch>> {
-        let block = self.load_block(
+        let block = self.load_block_charged(
             handle,
             BlockType::Columnar,
             self.metadata.data_block_compression,
             #[cfg(zstd_any)]
             self.zstd_dictionary.as_deref(),
+            ReadCharge::Maintenance,
         )?;
         let batch = crate::table::columnar::ColumnBatch::decode(&block.data)?;
         // A real writer never emits an empty data block (the ingest path skips
@@ -1380,12 +1382,13 @@ impl Table {
                 return Ok(false);
             }
             let handle = BlockHandle::new(keyed.offset(), keyed.size());
-            let block = match self.load_block(
+            let block = match self.load_block_charged(
                 &handle,
                 BlockType::Columnar,
                 self.metadata.data_block_compression,
                 #[cfg(zstd_any)]
                 self.zstd_dictionary.as_deref(),
+                ReadCharge::Maintenance,
             ) {
                 Ok(block) => block,
                 // Only an ENVIRONMENTAL read propagates (see the index arm
@@ -4652,7 +4655,7 @@ impl Table {
                 continue;
             }
             let bh = BlockHandle::new(handle.offset(), handle.size());
-            if let Some(db) = self.load_data_block(&bh)?
+            if let Some(db) = self.load_data_block_charged(&bh, ReadCharge::Maintenance)?
                 && let Some(first) = db.first_user_key(self.comparator.clone())?
             {
                 return Ok(Some(first));

@@ -112,7 +112,7 @@ counted for that reason.
   Read alone cannot show this — a 4 KiB compressed block is 4 KiB read
   however much it expands to.
 - **Their ratio** is the compression the read actually paid for.
-- **Copied per input byte** should be a small constant. A path that
+- **Copied per row** should be a small constant. A path that
   materialises its working set once sits there; one that folds batches
   together pairwise records the whole accumulated size on every fold, so the
   counter grows with the square of the fold count rather than with the data.
@@ -123,7 +123,7 @@ that moves a counter without moving the behaviour it stands for fails rather
 than quietly rebasing the instrument.
 
 **May not regress:** `bytes_read` and `bytes_decoded` per emitted row on the
-projection scenarios, and `bytes_copied` per input byte on every scenario. A
+projection scenarios, and `bytes_copied` per emitted row on every scenario. A
 change that improves compressed size while raising decoded per row has not
 paid for itself.
 
@@ -184,24 +184,28 @@ fixture exists regardless and is exercised by the workload's tests
 one line rather than a fresh argument about what the expected result is.
 
 **On the dashboard** this workload publishes one series per scenario per
-counter, named `mixed-layout / <scenario> rows per KiB read` (and `… decoded`),
-in place of the ops/sec every other workload reports — for a scenario sweep the
+counter, named `mixed-layout / <scenario> bytes read per row` (and
+`… bytes decoded per row`, `… bytes copied per row`), in place of the ops/sec
+every other workload reports — for a scenario sweep the
 rate counts scenarios per second, which describes the harness rather than the
 engine. The `--json` report and the plain summary carry the same series in
 place of the rate. The fixtures open their trees with the run's cache, metadata
 and compression flags (`--compression` reaches blob files too), so
 `--cache-mb 0` measures cold reads here as everywhere else.
 
-Read and decoded are yields in the bigger-is-better suite: more rows out of the
-same kibibyte is the improvement. Copied is published as a cost,
-`mixed-layout / <scenario> bytes copied per byte decoded` (the copy
-amplification of the read), in a separate smaller-is-better suite,
-`lsm-tree db_bench costs`, because the dashboard fixes one direction per suite.
-Zero is the best value there, and a scenario whose copies go from zero to
-anything alerts. `db_bench --github-json` writes the yields to stdout, or
-appends them to the array in a file with `--github-json-append <PATH>` (how the
-second pass joins the first pass's suite), and `--github-json-costs <PATH>`
-writes the costs.
+All three are costs with one denominator, the rows the scenario emitted, so
+they read the same way and compare directly: a projection that stops loading a
+payload moves read and decoded per row down together. They live in a
+smaller-is-better suite of their own, `lsm-tree db_bench costs`, because the
+dashboard fixes one direction per suite and the rates are bigger-is-better.
+Zero is the best value there (a read that gathers nothing copies nothing), and
+a scenario whose copies go from zero to anything alerts. A scenario that
+emitted no row publishes nothing, since its cost per row does not exist. The
+plain summary also prints decoded over read and copied over decoded as
+diagnostics, `n/a` where the denominator is zero; they are not series.
+`db_bench --github-json` writes the bigger-is-better series to stdout, or
+appends them to the array in a file with `--github-json-append <PATH>`, and
+`--github-json-costs <PATH>` writes the costs.
 
 ## Checklist for format-changing PRs
 

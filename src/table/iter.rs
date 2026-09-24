@@ -45,12 +45,30 @@ type InnerIter<'a> = DataBlockIter<'a>;
 #[cfg(feature = "zstd")]
 fn partial_decode_enabled() -> bool {
     use std::sync::OnceLock;
+    #[cfg(test)]
+    if FORCE_PARTIAL_DECODE.with(core::cell::Cell::get) {
+        return true;
+    }
     static ENABLED: OnceLock<bool> = OnceLock::new();
     *ENABLED.get_or_init(|| {
         std::env::var("LSM_PARTIAL_DECODE")
             .ok()
             .is_some_and(|v| matches!(v.trim(), "1" | "on" | "true" | "yes"))
     })
+}
+
+#[cfg(all(test, feature = "zstd"))]
+std::thread_local! {
+    /// Engages the partial tier on the current thread regardless of the env
+    /// switch, so a unit test neither mutates the process environment nor
+    /// depends on which test first initialized the cached switch.
+    static FORCE_PARTIAL_DECODE: core::cell::Cell<bool> = const { core::cell::Cell::new(false) };
+}
+
+/// Engages the partial-decode tier for reads on the calling thread.
+#[cfg(all(test, feature = "zstd"))]
+pub fn force_partial_decode_on_this_thread() {
+    FORCE_PARTIAL_DECODE.with(|f| f.set(true));
 }
 
 /// Minimum decompressed block size for the partial tier to engage. Below this a

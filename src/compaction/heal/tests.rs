@@ -295,10 +295,9 @@ fn ecc_heal_scheduled_on_partial_decode_corrected_read() -> crate::Result<()> {
         config::{BlockSizePolicy, CompressionPolicy},
     };
 
-    // Opt into the partial-decode path for this test process (OnceLock-cached;
-    // nextest isolates each test in its own process so this does not leak).
-    // SAFETY: set before any tree in this process reads the env.
-    unsafe { std::env::set_var("LSM_PARTIAL_DECODE", "1") };
+    // Engages the partial-decode path on this thread only: no environment
+    // mutation, and no dependence on which test first read the cached switch.
+    crate::table::iter::force_partial_decode_on_this_thread();
 
     let dir = tempfile::tempdir()?;
     let open = || {

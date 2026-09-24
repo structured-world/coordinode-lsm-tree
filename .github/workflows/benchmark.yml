@@ -199,7 +199,7 @@ jobs:
         if: steps.bot-token.outputs.token != ''
         run: git branch --delete --force gh-pages 2>/dev/null || true
 
-      # Costs (bytes copied per byte decoded and other amplifications) improve
+      # Costs (bytes read, decoded and copied per emitted row) improve
       # by shrinking, and the action fixes one direction per suite, so they are
       # their own smaller-is-better suite on the same dashboard. A cost that was
       # zero and becomes nonzero alerts: the action divides by the previous

@@ -80,7 +80,7 @@ struct Cli {
     github_json: bool,
 
     /// With --github-json: write the smaller-is-better series (costs such as
-    /// bytes copied per byte decoded) to this file, in the same format, for a
+    /// bytes read per emitted row) to this file, in the same format, for a
     /// customSmallerIsBetter suite. Without it those series are not written.
     #[arg(long, requires = "github_json")]
     github_json_costs: Option<PathBuf>,

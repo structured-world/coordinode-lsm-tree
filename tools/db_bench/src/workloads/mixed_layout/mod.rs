@@ -116,37 +116,33 @@ impl Readings {
         })
     }
 
-    /// Rows emitted per KiB the scenario moved, for one counter: a yield, so
-    /// more rows out of the same kibibyte is the improvement.
+    /// Bytes one counter moved per emitted row, or `None` when the scenario
+    /// emitted no row and the cost per row is undefined.
     #[expect(
         clippy::cast_precision_loss,
         reason = "ratios over counts far below f64's exact range"
     )]
-    fn rows_per_kib(&self, bytes: u64) -> f64 {
-        self.rows as f64 / (bytes.max(1) as f64 / 1024.0)
+    fn per_row(&self, bytes: u64) -> Option<f64> {
+        (self.rows != 0).then(|| bytes as f64 / self.rows as f64)
     }
 
-    /// Bytes gathers moved per byte the transform produced: the copy
-    /// amplification of the read, the quantity the acceptance rule says may
-    /// not regress. Zero where nothing is gathered, which a smaller-is-better
-    /// series draws honestly; a read served wholly from cache decodes nothing,
-    /// so its copies are counted against one byte rather than divided by zero.
-    #[expect(
-        clippy::cast_precision_loss,
-        reason = "ratios over counts far below f64's exact range"
-    )]
-    fn copy_amplification(&self) -> f64 {
-        self.bytes_copied as f64 / self.bytes_decoded.max(1) as f64
-    }
-
-    /// Publishes the series that state the read path's cost, and carries the
-    /// raw readings in the annotation.
+    /// Publishes the three counters as bytes per emitted row, all costs, and
+    /// carries the raw readings in the annotation.
     ///
-    /// Read and decoded are yields (rows per KiB). Copied is a cost that is
-    /// legitimately zero for a read that gathers nothing, so it is published
-    /// as an amplification in the smaller-is-better suite, where zero is the
-    /// best value rather than a division by zero.
+    /// Per row rather than per byte of another counter, so every series has
+    /// the same denominator, and one that is legitimately zero (a read that
+    /// gathers nothing copies nothing) is the best value of its series rather
+    /// than a division by zero. A scenario that emitted no row publishes
+    /// nothing: its cost per row does not exist, and a stand-in value would
+    /// draw a point the run did not measure.
     fn publish(&self, scenario: &str, reporter: &mut Reporter) {
+        let (Some(read), Some(decoded), Some(copied)) = (
+            self.per_row(self.bytes_read),
+            self.per_row(self.bytes_decoded),
+            self.per_row(self.bytes_copied),
+        ) else {
+            return;
+        };
         // `keys` is the working set the scenario built. Each fixture caps it
         // on its own, so it is the size the series describes, not `--num`.
         let annotation = format!(
@@ -158,53 +154,55 @@ impl Readings {
             self.bytes_copied,
             self.elapsed,
         );
-        reporter.publish_series(
-            format!("{scenario} rows per KiB read"),
-            self.rows_per_kib(self.bytes_read),
-            "rows/KiB",
-            annotation.clone(),
-            Direction::BiggerIsBetter,
-        );
-        reporter.publish_series(
-            format!("{scenario} rows per KiB decoded"),
-            self.rows_per_kib(self.bytes_decoded),
-            "rows/KiB",
-            annotation.clone(),
-            Direction::BiggerIsBetter,
-        );
-        reporter.publish_series(
-            format!("{scenario} bytes copied per byte decoded"),
-            self.copy_amplification(),
-            "B/B",
-            annotation,
-            Direction::SmallerIsBetter,
-        );
+        for (counter, value) in [("read", read), ("decoded", decoded), ("copied", copied)] {
+            reporter.publish_series(
+                format!("{scenario} bytes {counter} per row"),
+                value,
+                "B/row",
+                annotation.clone(),
+                Direction::SmallerIsBetter,
+            );
+        }
     }
 
     /// The human-readable line. On stderr, like every other line the harness
     /// narrates with: stdout carries the machine-readable report and nothing
     /// else, so `--github-json` stays parseable.
-    #[expect(
-        clippy::cast_precision_loss,
-        reason = "ratios over counts far below f64's exact range"
-    )]
+    ///
+    /// Besides the published figures it prints two diagnostics that are not
+    /// series: decoded over read (the compression the read paid for) and
+    /// copied over decoded (how much of what the transform produced was then
+    /// moved again). Either is `n/a` when its denominator is zero, as it is
+    /// for a read served wholly from cache.
     fn report(&self, scenario: &str) {
-        let rows = self.rows.max(1) as f64;
+        let per_row = |bytes| fmt_ratio(self.per_row(bytes), 1);
         eprintln!(
-            "  {scenario:<34} keys={:<9} rows={:<9} read/row={:<9.1} decoded/row={:<9.1} \
-             copied/row={:<9.1} expand={:<5.2} {:?}",
+            "  {scenario:<34} keys={:<9} rows={:<9} read/row={:<9} decoded/row={:<9} \
+             copied/row={:<9} decoded/read={:<5} copied/decoded={:<5} {:?}",
             self.keys,
             self.rows,
-            self.bytes_read as f64 / rows,
-            self.bytes_decoded as f64 / rows,
-            self.bytes_copied as f64 / rows,
-            // Decoded over read: the compression this read actually paid for.
-            // A projection that loads whole wide blocks to return two columns
-            // shows a high expansion with a low row count.
-            self.bytes_decoded as f64 / (self.bytes_read.max(1) as f64),
+            per_row(self.bytes_read),
+            per_row(self.bytes_decoded),
+            per_row(self.bytes_copied),
+            fmt_ratio(ratio(self.bytes_decoded, self.bytes_read), 2),
+            fmt_ratio(ratio(self.bytes_copied, self.bytes_decoded), 2),
             self.elapsed,
         );
     }
+}
+
+/// `num / den`, or `None` when `den` is zero.
+#[expect(
+    clippy::cast_precision_loss,
+    reason = "ratios over counts far below f64's exact range"
+)]
+fn ratio(num: u64, den: u64) -> Option<f64> {
+    (den != 0).then(|| num as f64 / den as f64)
+}
+
+/// A ratio for the text report, `n/a` where it is undefined.
+fn fmt_ratio(value: Option<f64>, decimals: usize) -> String {
+    value.map_or_else(|| "n/a".to_string(), |v| format!("{v:.decimals$}"))
 }
 
 /// Reads every key the fixture wrote and checks it against the oracle.
@@ -327,6 +325,10 @@ fn lockstep(
 /// same engine work and only change the row count the figures divide by. The
 /// expected set comes from the seeds, not from the stored field, so a scan
 /// that filtered on the wrong column or kept the wrong rows disagrees with it.
+#[expect(
+    clippy::expect_used,
+    reason = "a scan missing a projected column or row is a wrong result, and a verify pass panics on one"
+)]
 fn verify_predicate_scan(
     fixture: &Fixture,
     predicate: &ColumnRangePredicate,

@@ -182,6 +182,10 @@ impl Fixture {
 }
 
 /// The two filter fields of a value, as the bytes their sub-columns hold.
+#[expect(
+    clippy::expect_used,
+    reason = "every fixture value is written with a full header"
+)]
 fn header_fields(row: &[u8]) -> ([u8; 8], [u8; 8]) {
     let group = field_group(row).expect("every value carries a full header");
     let bucket = field_bucket(row).expect("every value carries a full header");
@@ -190,6 +194,10 @@ fn header_fields(row: &[u8]) -> ([u8; 8], [u8; 8]) {
 
 /// Builds a bytes column: a `rows + 1` little-endian `u32` offset table, then
 /// the cells back to back, which is the framing a columnar block stores.
+#[expect(
+    clippy::expect_used,
+    reason = "fixture cells are a few KiB, far below the u32 offset range"
+)]
 fn bytes_column<'a>(column_id: u16, cells: impl Iterator<Item = &'a [u8]>) -> Column {
     let cells: Vec<&[u8]> = cells.collect();
     let payload: usize = cells.iter().map(|c| c.len()).sum();
@@ -638,6 +646,10 @@ fn gcd(mut a: u64, mut b: u64) -> u64 {
 /// profile where a scan that fetches a blob before deciding it wants the row
 /// pays the most, which is what makes it the fixture the late-materialization
 /// scenario waits for.
+#[expect(
+    clippy::expect_used,
+    reason = "some prime above 7919 and n exists and is coprime with n, so the stride search ends"
+)]
 pub fn blobs_scattered(
     config: &BenchConfig,
     seqno: &AtomicU64,

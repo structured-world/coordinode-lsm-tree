@@ -44,11 +44,11 @@ fn json_published_series_omits_rate() {
     let mut reporter = Reporter::new();
     reporter.start();
     reporter.publish_series(
-        "scan rows per KiB read",
+        "scan bytes read per row",
         12.5,
-        "rows/KiB",
+        "B/row",
         "rows: 100",
-        Direction::BiggerIsBetter,
+        Direction::SmallerIsBetter,
     );
     reporter.stop();
 
@@ -56,7 +56,7 @@ fn json_published_series_omits_rate() {
         serde_json::from_str(&reporter.to_json("mixed-layout", &json_config())).expect("json");
     let series = json["series"].as_array().expect("series must be reported");
     assert_eq!(series.len(), 1);
-    assert_eq!(series[0]["name"], "scan rows per KiB read");
+    assert_eq!(series[0]["name"], "scan bytes read per row");
     assert_eq!(series[0]["value"], 12.5);
     assert!(
         json.get("ops_per_sec").is_none(),
@@ -72,19 +72,19 @@ fn github_suites_cost_series_goes_to_the_smaller_is_better_suite() {
     let mut suites = GithubSuites::default();
     suites.push(
         Direction::BiggerIsBetter,
-        serde_json::json!({"name": "rows per KiB read"}),
+        serde_json::json!({"name": "ops per sec"}),
     );
     suites.push(
         Direction::SmallerIsBetter,
-        serde_json::json!({"name": "bytes copied per byte decoded"}),
+        serde_json::json!({"name": "bytes copied per row"}),
     );
     assert_eq!(
         suites.yields,
-        vec![serde_json::json!({"name": "rows per KiB read"})]
+        vec![serde_json::json!({"name": "ops per sec"})]
     );
     assert_eq!(
         suites.costs,
-        vec![serde_json::json!({"name": "bytes copied per byte decoded"})],
+        vec![serde_json::json!({"name": "bytes copied per row"})],
     );
 }
 
@@ -94,7 +94,7 @@ fn json_series_direction_is_reported() {
     // tell a yield from a cost without knowing the series by name.
     let mut reporter = Reporter::new();
     reporter.start();
-    reporter.publish_series("copied", 0.0, "B/B", "", Direction::SmallerIsBetter);
+    reporter.publish_series("copied", 0.0, "B/row", "", Direction::SmallerIsBetter);
     reporter.stop();
     let json: serde_json::Value =
         serde_json::from_str(&reporter.to_json("mixed-layout", &json_config())).expect("json");

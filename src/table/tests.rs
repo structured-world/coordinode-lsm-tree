@@ -1144,10 +1144,9 @@ fn an_untraced_bounded_range_leaves_no_partial_block_in_the_cache() -> crate::Re
         config::{BlockSizePolicy, CompressionPolicy},
     };
 
-    // Opt into the partial-decode path for this test process (OnceLock-cached;
-    // nextest isolates each test in its own process so this does not leak).
-    // SAFETY: set before any tree in this process reads the env.
-    unsafe { std::env::set_var("LSM_PARTIAL_DECODE", "1") };
+    // Engages the partial-decode path on this thread only: no environment
+    // mutation, and no dependence on which test first read the cached switch.
+    super::iter::force_partial_decode_on_this_thread();
 
     let dir = tempdir()?;
     let crate::AnyTree::Standard(tree) = crate::Config::new(
@@ -4341,6 +4340,117 @@ fn a_confirming_reread_that_never_issues_counts_no_bytes() -> crate::Result<()> 
         "no re-read was issued, so none may be counted",
     );
 
+    Ok(())
+}
+
+/// Recovers `file` over a cold cache, with metrics of its own.
+#[cfg(feature = "metrics")]
+fn recover_counted(
+    file: &std::path::Path,
+    checksum: Checksum,
+) -> crate::Result<(Table, Arc<crate::metrics::Metrics>)> {
+    let metrics = Arc::new(crate::metrics::Metrics::default());
+    let mut params = test_recover_params(file.to_path_buf(), checksum);
+    params.cache = Arc::new(Cache::with_capacity_bytes(10_000_000));
+    params.metrics = metrics.clone();
+    Ok((Table::recover(params)?, metrics))
+}
+
+/// Repair's restriction bound reads data blocks to anchor on a key: that is
+/// maintenance, so a cold read there charges nothing to the read counters.
+#[cfg(all(feature = "metrics", feature = "std"))]
+#[test]
+fn a_repair_restriction_bound_counts_no_bytes() -> crate::Result<()> {
+    let dir = tempdir()?;
+    let file = dir.path().join("table");
+    let mut writer = Writer::new(file.clone(), 0, 0, Arc::new(StdFs))?.use_data_block_size(128);
+    for i in 0..50u32 {
+        writer.write(InternalValue::from_components(
+            format!("key{i:05}").into_bytes(),
+            b"value",
+            u64::from(i) + 1,
+            crate::ValueType::Value,
+        ))?;
+    }
+    let (_, checksum) = writer
+        .finish()?
+        .expect("finish() returns Some after writing data items");
+
+    let (table, metrics) = recover_counted(&file, checksum)?;
+    let geometry = PunchGeometry {
+        verdict: PunchProbe::Punched,
+        first_readable: None,
+        after_last_zeroed: Some(0),
+        irregular: false,
+    };
+    let before = (metrics.bytes_read(), metrics.bytes_decoded());
+    let bound = table.greedy_restriction_bound(&geometry)?;
+    assert!(bound.is_some(), "the walk anchors on the first block's key");
+    assert_eq!(
+        (metrics.bytes_read(), metrics.bytes_decoded()),
+        before,
+        "a repair walk is maintenance, not a caller's read",
+    );
+    Ok(())
+}
+
+/// Salvage verifies a columnar table's delete positions and re-emits its
+/// blocks masked: both read data blocks, and both are maintenance, so a cold
+/// read in either charges nothing to the read counters.
+#[cfg(all(feature = "metrics", feature = "columnar"))]
+#[test]
+fn salvage_reads_of_a_columnar_table_count_no_bytes() -> crate::Result<()> {
+    use crate::config::DeleteStrategy;
+
+    let dir = tempdir()?;
+    let file = dir.path().join("table");
+    let mut writer = Writer::new(file.clone(), 0, 0, Arc::new(StdFs))?
+        .use_columnar(true)
+        .use_zone_map(true)
+        .delete_strategy(DeleteStrategy::MergeOnRead);
+    for i in 0..64u32 {
+        writer.write(InternalValue::from_components(
+            format!("key{i:05}").into_bytes(),
+            b"value",
+            u64::from(i) + 1,
+            crate::ValueType::Value,
+        ))?;
+    }
+    for pos in [5u32, 20, 40] {
+        writer.delete_bitmap_mut().insert(pos);
+    }
+    let (_, checksum) = writer
+        .finish()?
+        .expect("finish() returns Some after writing data items");
+
+    let (table, metrics) = recover_counted(&file, checksum)?;
+    let before = (metrics.bytes_read(), metrics.bytes_decoded());
+    assert!(
+        table.delete_positions_verified()?,
+        "the positions check out"
+    );
+    assert_eq!(
+        (metrics.bytes_read(), metrics.bytes_decoded()),
+        before,
+        "verifying delete positions is maintenance, not a caller's read",
+    );
+
+    let (table, metrics) = recover_counted(&file, checksum)?;
+    let first = table
+        .data_block_handles()
+        .next()
+        .expect("the table has a data block")?;
+    let handle = BlockHandle::new(first.offset(), first.size());
+    let before = (metrics.bytes_read(), metrics.bytes_decoded());
+    assert!(
+        table.load_columnar_block_masked(&handle)?.is_some(),
+        "the block keeps live rows",
+    );
+    assert_eq!(
+        (metrics.bytes_read(), metrics.bytes_decoded()),
+        before,
+        "re-emitting a masked block is maintenance, not a caller's read",
+    );
     Ok(())
 }
 

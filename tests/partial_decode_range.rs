@@ -23,14 +23,16 @@ use test_log::test;
 
 const N: u64 = 20_000;
 
-/// Opt into the partial-decode read path for this test process (it is OFF by
-/// default until a resumable decoder lands upstream). nextest isolates each test
-/// in its own process, so this env mutation does not leak between tests, and the
-/// path reads the flag once via a `OnceLock`. Call before opening any tree.
+/// Opt into the partial-decode read path for this test binary (it is OFF by
+/// default). Every test in this binary enables it, so the value is the same
+/// whichever runs first; the path reads the flag once via a `OnceLock`. Call
+/// before opening any tree.
 fn enable_partial_decode() {
-    // SAFETY: set before any other thread in this single-test process reads the
-    // env; nextest runs each test in a dedicated process.
-    unsafe { std::env::set_var("LSM_PARTIAL_DECODE", "1") };
+    static ENABLE: std::sync::Once = std::sync::Once::new();
+    // SAFETY: the variable is written exactly once, and every test calls this
+    // before it opens a tree, so no thread of this binary reads the
+    // environment while the write runs (`Once` makes the others wait for it).
+    ENABLE.call_once(|| unsafe { std::env::set_var("LSM_PARTIAL_DECODE", "1") });
 }
 
 fn key(i: u64) -> Vec<u8> {
@@ -357,5 +359,12 @@ fn partial_decode_counts_the_frame_it_read_and_the_prefix_it_decoded() {
     assert!(
         m.bytes_decoded() > decoded_before,
         "the partial path decoded a prefix but charged nothing",
+    );
+    // The fixture's first block fills the 512 KiB target, so a whole-block
+    // decode would charge at least that much: less proves only a prefix ran.
+    let decoded = m.bytes_decoded() - decoded_before;
+    assert!(
+        decoded < 512 * 1024,
+        "decoded {decoded} B: the range decoded a whole block, not a prefix",
     );
 }
