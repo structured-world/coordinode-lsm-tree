@@ -286,6 +286,14 @@ without it they would trade places and hand each row another row's value.
 Moving a whole group, directory and pages together, is the block swap the
 index already governs: the group's keys travel with its values.
 
+A block of another role in a page slot (a zone block, a directory) is refused
+by the type its block header names, before its stamp is consulted. Moving a page **between
+tables** is refused only under encryption: the block layer's AAD carries the
+table id, so a page authenticated for one table fails in another. The stamp
+does not bind the table, because tags restart at zero in every table; a plain
+table has no cross-table binding, exactly as its row-major data blocks have
+none.
+
 ## Framing overhead
 
 The acceptance this format is held to asks for the overhead as a measured

@@ -5093,6 +5093,217 @@ fn a_value_page_moved_between_row_groups_of_an_encrypted_table_is_refused() -> c
     Ok(())
 }
 
+/// An encrypted columnar SST of table `table_id` holding `key{i}` rows whose
+/// values are `prefix{i}`, all values of one length, in one group.
+#[cfg(all(feature = "columnar", feature = "encryption"))]
+fn encrypted_columnar_source(
+    path: &std::path::Path,
+    fs: &Arc<dyn Fs>,
+    enc: &Arc<dyn crate::encryption::EncryptionProvider>,
+    table_id: crate::TableId,
+    prefix: &str,
+) -> crate::Result<()> {
+    let mut writer = Writer::new(path.to_path_buf(), table_id, 0, Arc::clone(fs))?
+        .use_columnar(true)
+        .use_encryption(Some(Arc::clone(enc)));
+    for i in 0..20_u32 {
+        writer.write(InternalValue::from_components(
+            format!("key{i:05}").into_bytes(),
+            format!("{prefix}{i:05}").into_bytes(),
+            1,
+            ValueType::Value,
+        ))?;
+    }
+    assert!(writer.finish()?.is_some(), "source is non-empty");
+    Ok(())
+}
+
+/// Opens the encrypted SST at `path` as table `table_id`.
+#[cfg(all(feature = "columnar", feature = "encryption"))]
+fn open_encrypted_as(
+    path: std::path::PathBuf,
+    fs: &Arc<dyn Fs>,
+    enc: &Arc<dyn crate::encryption::EncryptionProvider>,
+    table_id: crate::TableId,
+) -> crate::Result<Table> {
+    let checksum = crate::Checksum::from_raw(crate::repair::compute_table_checksum(&**fs, &path)?);
+    let mut params = crate::table::RecoverParams::new(
+        path,
+        checksum,
+        table_id,
+        Arc::clone(fs),
+        default_comparator(),
+        Arc::new(crate::cache::Cache::with_capacity_bytes(1 << 20)),
+    );
+    params.encryption = Some(Arc::clone(enc));
+    Table::recover(params)
+}
+
+/// The file extent of the value page of the first group of `table`.
+#[cfg(all(feature = "columnar", feature = "encryption"))]
+fn first_value_page(table: &Table, bytes: &[u8]) -> crate::Result<core::ops::Range<usize>> {
+    use crate::coding::Decode;
+    use crate::table::columnar::COL_VALUE;
+
+    let Some(Ok(first)) = table.data_block_handles().next() else {
+        panic!("the table has a row group");
+    };
+    let directory = table
+        .salvage_load_row_group(first.as_ref())?
+        .group
+        .directory;
+    let at = usize::try_from(*first.as_ref().offset()).unwrap_or(usize::MAX);
+    let Some(frame) = bytes.get(at..) else {
+        panic!("row group within the file");
+    };
+    let header = crate::table::block::Header::decode_from(&mut &frame[..])?;
+    let Some(page) = directory
+        .entries()
+        .iter()
+        .find(|e| e.id.column_id == COL_VALUE)
+    else {
+        panic!("row group holds a value page");
+    };
+    let start = at + header.on_disk_size_with(None) as usize + page.offset as usize;
+    Ok(start..start + page.length as usize)
+}
+
+/// A value page moved into another table, in the same place of a group of the
+/// same shape, authenticates as a block of its own table only: the AEAD binds
+/// the table id, which the page stamp does not carry. The same move between
+/// two tables of ONE id, the control, is taken for the other's page and
+/// serves its values, which is why the binding matters: without it the
+/// reader would hand back the other table's value under this table's key.
+#[cfg(all(feature = "columnar", feature = "encryption"))]
+#[test]
+fn a_value_page_moved_between_tables_of_an_encrypted_tree_is_refused() -> crate::Result<()> {
+    let dir = tempdir()?;
+    let fs: Arc<dyn Fs> = Arc::new(StdFs);
+    let enc: Arc<dyn crate::encryption::EncryptionProvider> =
+        Arc::new(crate::encryption::Aes256GcmProvider::new(&[0x42; 32]));
+
+    // Moves `from`'s first value page into `into`'s; the two tables were
+    // written with the same row count and value lengths, so the page fits.
+    let transplant = |into: &std::path::Path, into_id, from: &std::path::Path, from_id| {
+        let from_bytes = std::fs::read(from)?;
+        let page = {
+            let table = open_encrypted_as(from.to_path_buf(), &fs, &enc, from_id)?;
+            let range = first_value_page(&table, &from_bytes)?;
+            from_bytes.get(range).map(<[u8]>::to_vec)
+        };
+        let mut into_bytes = std::fs::read(into)?;
+        let range = {
+            let table = open_encrypted_as(into.to_path_buf(), &fs, &enc, into_id)?;
+            first_value_page(&table, &into_bytes)?
+        };
+        let Some(page) = page.filter(|p| p.len() == range.len()) else {
+            panic!("the two value pages are of one length");
+        };
+        let Some(target) = into_bytes.get_mut(range) else {
+            panic!("value page within the file");
+        };
+        target.copy_from_slice(&page);
+        std::fs::write(into, &into_bytes)?;
+        crate::Result::Ok(())
+    };
+    let key = b"key00000";
+
+    // The control: both tables are table 3, and the moved page reads as the
+    // target's own.
+    let (a, b) = (dir.path().join("a"), dir.path().join("b"));
+    encrypted_columnar_source(&a, &fs, &enc, 3, "vala")?;
+    encrypted_columnar_source(&b, &fs, &enc, 3, "valb")?;
+    transplant(&a, 3, &b, 3)?;
+    let table = open_encrypted_as(a, &fs, &enc, 3)?;
+    let Some(got) = table.get(key, crate::MAX_SEQNO, crate::hash::hash64(key))? else {
+        panic!("the key is found");
+    };
+    assert_eq!(
+        &*got.value, b"valb00000",
+        "without a table binding the move goes unseen"
+    );
+
+    // The move between tables 3 and 4 is refused.
+    let (a, b) = (dir.path().join("c"), dir.path().join("d"));
+    encrypted_columnar_source(&a, &fs, &enc, 3, "vala")?;
+    encrypted_columnar_source(&b, &fs, &enc, 4, "valb")?;
+    transplant(&a, 3, &b, 4)?;
+    let table = open_encrypted_as(a, &fs, &enc, 3)?;
+    let refused = table.get(key, crate::MAX_SEQNO, crate::hash::hash64(key));
+    assert!(
+        refused.is_err(),
+        "a page of another table must not authenticate, got {refused:?}",
+    );
+    Ok(())
+}
+
+/// A block of another role in a page's slot, its checksum intact, is refused
+/// by role, as a data-block handle landing on a block of another role is:
+/// relabelling a page as a zone block keeps its bytes valid as a block, and
+/// only the role says it is not the page the directory files there.
+#[cfg(feature = "columnar")]
+#[test]
+fn a_block_of_another_role_in_a_page_slot_is_refused() -> crate::Result<()> {
+    use crate::coding::{Decode, Encode};
+    use crate::table::block::{BlockType, Header};
+    use crate::table::columnar::COL_VALUE;
+    use crate::table::row_group::PageWant;
+    use crate::table::util::ReadCharge;
+
+    let dir = tempdir()?;
+    let source = dir.path().join("source");
+    let fs: Arc<dyn Fs> = Arc::new(StdFs);
+    zoned_source(&source, &fs)?;
+    let (group_at, directory) = row_group(&source, &fs, 0)?;
+    let mut bytes = std::fs::read(&source)?;
+    let directory_len = {
+        let Some(frame) = bytes.get(group_at..) else {
+            panic!("group within the file");
+        };
+        Header::decode_from(&mut &frame[..])?.on_disk_size_with(None)
+    };
+    let Some(page) = directory
+        .entries()
+        .iter()
+        .find(|e| e.id.column_id == COL_VALUE)
+    else {
+        panic!("the group has a value page");
+    };
+    let at = group_at + directory_len as usize + page.offset as usize;
+    let header = {
+        let Some(frame) = bytes.get(at..) else {
+            panic!("page within the file");
+        };
+        Header::decode_from(&mut &frame[..])?
+    };
+    assert_eq!(header.block_type, BlockType::ColumnPage);
+    let mut relabelled = Vec::new();
+    Header {
+        block_type: BlockType::ColumnZones,
+        ..header
+    }
+    .encode_into(&mut relabelled)?;
+    let Some(target) = bytes.get_mut(at..at + relabelled.len()) else {
+        panic!("page header within the file");
+    };
+    target.copy_from_slice(&relabelled);
+    std::fs::write(&source, &bytes)?;
+
+    let table = open(source, &fs)?;
+    let Some(Ok(first)) = table.data_block_handles().next() else {
+        panic!("the table has a row group");
+    };
+    let Err(err) = table.load_row_group(first.as_ref(), &PageWant::ALL, ReadCharge::Foreground)
+    else {
+        panic!("a zone block in a page slot must be refused");
+    };
+    assert!(
+        matches!(err, crate::Error::InvalidTag(("BlockType", _))),
+        "the refusal names the role, got {err:?}",
+    );
+    Ok(())
+}
+
 /// A columnar source with one corrupted PAX data block: the columnar loader
 /// fails to reconstruct that block (a torn sub-column frame), so salvage drops
 /// it and recovers every other block, writing the survivors as a plain row SST.
