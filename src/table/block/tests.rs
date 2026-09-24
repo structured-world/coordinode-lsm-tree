@@ -507,8 +507,6 @@ fn a_refused_uncompressed_block_still_reports_what_it_produced() -> crate::Resul
 #[test]
 #[cfg(feature = "lz4")]
 fn a_refused_lz4_block_read_from_a_file_still_reports_what_it_produced() -> crate::Result<()> {
-    use std::io::Write;
-
     const PAYLOAD: &[u8] = b"an lz4 payload, an lz4 payload, an lz4 payload";
     let transform = BlockTransform::from_parts(
         CompressionType::Lz4,
@@ -520,10 +518,10 @@ fn a_refused_lz4_block_read_from_a_file_still_reports_what_it_produced() -> crat
     let size = u32::try_from(tampered.len())
         .map_err(|_| crate::Error::InvalidHeader("test frame length exceeds u32"))?;
 
-    let mut tmp = tempfile::NamedTempFile::new()?;
-    tmp.write_all(&tampered)?;
-    tmp.flush()?;
-    let file = std::fs::File::open(tmp.path())?;
+    let dir = tempfile::tempdir()?;
+    let path = dir.path().join("block");
+    std::fs::write(&path, &tampered)?;
+    let file = std::fs::File::open(&path)?;
 
     let mut produced = 0;
     let result = Block::from_file_issuing(

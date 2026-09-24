@@ -301,6 +301,13 @@ impl ColumnarScan {
     /// `k` times, so the counter grows quadratically exactly where the work
     /// does, while a single pass over the same data records it once.
     #[inline]
+    #[cfg_attr(
+        not(feature = "metrics"),
+        expect(
+            clippy::unused_self,
+            reason = "the scan's metrics exist only with the feature"
+        )
+    )]
     fn record_gather(&self, batch: &ColumnBatch) {
         #[cfg(feature = "metrics")]
         self.metrics.record_gather(batch.data_size());
@@ -381,6 +388,13 @@ impl ColumnarScan {
     /// instead (cheaper, one subtraction per segment), which is why the column
     /// itself still needs this before it reaches a caller. A zero offset leaves
     /// the batch untouched. The rewritten column is a gather and is charged.
+    #[cfg_attr(
+        not(feature = "metrics"),
+        expect(
+            clippy::unused_self,
+            reason = "the scan's metrics exist only with the feature"
+        )
+    )]
     fn globalize_seqnos(&self, batch: &mut ColumnBatch, global: SeqNo) -> crate::Result<()> {
         if global == 0 {
             return Ok(());
@@ -402,15 +416,23 @@ impl ColumnarScan {
         // return on overflow drops the builder unread.
         #[expect(unsafe_code, reason = "see safety")]
         let mut out = unsafe { crate::Slice::builder_unzeroed(len) };
-        for (dst, src) in out.chunks_exact_mut(8).zip(col.data.chunks_exact(8)) {
+        for (row, (dst, src)) in out
+            .chunks_exact_mut(8)
+            .zip(col.data.chunks_exact(8))
+            .enumerate()
+        {
             let mut local = [0u8; 8];
             local.copy_from_slice(src);
-            let effective =
-                u64::from_le_bytes(local)
-                    .checked_add(global)
-                    .ok_or(Error::InvalidHeader(
-                        "columnar_scan: effective seqno overflows",
-                    ))?;
+            let Some(effective) = u64::from_le_bytes(local).checked_add(global) else {
+                // The rows before this one were already rewritten.
+                #[cfg(feature = "metrics")]
+                self.metrics.record_gather(row * 8);
+                #[cfg(not(feature = "metrics"))]
+                let _ = row;
+                return Err(Error::InvalidHeader(
+                    "columnar_scan: effective seqno overflows",
+                ));
+            };
             dst.copy_from_slice(&effective.to_le_bytes());
         }
         col.data = crate::Slice::from(out.freeze());
@@ -1061,3 +1083,6 @@ fn bound_as_ref(bound: &Bound<UserKey>) -> Bound<&[u8]> {
         Bound::Unbounded => Bound::Unbounded,
     }
 }
+
+#[cfg(all(test, feature = "metrics"))]
+mod tests;
