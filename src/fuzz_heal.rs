@@ -1,9 +1,10 @@
 //! Reproducible single-byte-bitrot fuzzer for the SST read / heal path.
 //!
 //! Builds a deterministic corpus of SSTs across option variations (block size,
-//! per-KV checksums, columnar layout, compression, encryption, Page-ECC), then —
+//! per-KV checksums, columnar layout with one or several row pages per group,
+//! compression, encryption, Page-ECC, and columnar pages under each), then —
 //! from a FIXED seed — repeatedly picks a corpus SST, flips one random bit, and
-//! reads every entry back through [`Table::recover`] + a full scan. Invariant on
+//! reads it back through [`Table::recover`], point reads and a full scan. Invariant on
 //! every mutation: the read path NEVER panics and NEVER returns a wrong value —
 //! a flipped block either heals (Page-ECC corrects the single-symbol error) or
 //! fails its block checksum and is surfaced as an error, but a corrupt block can
@@ -128,10 +129,52 @@ fn variants() -> Vec<Variant> {
         encryption: None,
     });
     #[cfg(feature = "columnar")]
+    {
+        v.push(Variant {
+            label: "columnar",
+            configure: |w| w.use_row_group_size(256).use_columnar(true),
+            encryption: None,
+        });
+        // Groups of several row pages: each page, the zone blocks and the
+        // directory's zones are their own blocks for a flip to land in.
+        v.push(Variant {
+            label: "columnar-pages",
+            configure: |w| {
+                w.use_row_group_size(4096)
+                    .use_columnar_page_size(512)
+                    .use_columnar(true)
+            },
+            encryption: None,
+        });
+    }
+    #[cfg(all(feature = "columnar", feature = "page_ecc"))]
     v.push(Variant {
-        label: "columnar",
-        configure: |w| w.use_row_group_size(256).use_columnar(true),
+        label: "columnar-pages-ecc",
+        configure: |w| {
+            w.use_row_group_size(4096)
+                .use_columnar_page_size(512)
+                .use_columnar(true)
+                .use_page_ecc(
+                    true,
+                    crate::runtime_config::EccScheme::ReedSolomon {
+                        data_shards: 4,
+                        parity_shards: 2,
+                    },
+                )
+        },
         encryption: None,
+    });
+    #[cfg(all(feature = "columnar", feature = "encryption"))]
+    v.push(Variant {
+        label: "columnar-pages-encrypted",
+        configure: |w| {
+            w.use_row_group_size(4096)
+                .use_columnar_page_size(512)
+                .use_columnar(true)
+        },
+        encryption: Some(Arc::new(crate::encryption::Aes256GcmProvider::new(
+            &[5u8; 32],
+        ))),
     });
     #[cfg(feature = "page_ecc")]
     {
@@ -188,6 +231,23 @@ fn build_corpus(dir: &std::path::Path, fs: &Arc<dyn crate::fs::Fs>) -> Vec<Corpu
             .unwrap();
         }
         assert!(w.finish().unwrap().is_some(), "corpus SST is non-empty");
+        #[cfg(feature = "columnar")]
+        if variant.label.starts_with("columnar-pages") {
+            let table = recover(&sst, fs, variant.encryption.clone()).unwrap();
+            let group = table.data_block_handles().next().unwrap().unwrap();
+            let pages = table
+                .load_row_group(
+                    group.as_ref(),
+                    &crate::table::row_group::PageWant::ALL,
+                    crate::table::util::ReadCharge::Untraced,
+                )
+                .unwrap();
+            assert!(
+                pages.starts.len() > 1,
+                "{}: a group spans several row pages",
+                variant.label,
+            );
+        }
         let bytes = std::fs::read(&sst).unwrap();
         let (meta_tail, meta_mid) = meta_mirror_spans(&sst);
         out.push(CorpusEntry {
@@ -251,6 +311,22 @@ fn recover_and_scan(
 ) -> crate::Result<()> {
     use crate::table::block_index::BlockIndex as _;
     let table = recover(path, fs, encryption)?;
+    // Point reads first, on a cold cache: they take their own path to the
+    // data (a columnar group serves one from the key page its zones pick and
+    // the value page beside it), so a flip only they read is caught here or
+    // not at all. Each read is refused or right; a miss is silent omission.
+    for i in (0..KEYS).step_by(23) {
+        let k = key(i);
+        match table.get(&k, crate::MAX_SEQNO, crate::hash::hash64(&k)) {
+            Err(_) => {}
+            Ok(Some(iv)) => assert_eq!(
+                iv.value.as_ref(),
+                val(i).as_slice(),
+                "{ctx}: a point read returned a WRONG value for key {k:?} (silent corruption)",
+            ),
+            Ok(None) => panic!("{ctx}: a point read missed key {k:?} (silent omission)"),
+        }
+    }
     // Full scan: a corrupt block surfaces as `Err`, never a wrong value.
     let mut seen = 0u32;
     for item in table.range_iter(..) {

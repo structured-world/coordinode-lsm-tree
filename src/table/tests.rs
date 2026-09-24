@@ -8407,6 +8407,158 @@ fn zoned_table_file(file: &std::path::Path, rows: u32, deletes: &[u32]) -> crate
     Ok(checksum)
 }
 
+/// A read that fails on one page fails exactly the reads that need that page,
+/// plain, encrypted and under Page-ECC alike: a point read of a key on another
+/// row page and a projection that skips the value column are served, the key
+/// whose value lives on the page gets the error rather than a miss or another
+/// row's value, and once the fault clears the same read is served, so the
+/// failure left nothing behind in the cache.
+#[cfg(feature = "columnar")]
+#[test]
+fn a_failed_page_read_fails_only_the_reads_that_need_the_page() -> crate::Result<()> {
+    use crate::encryption::EncryptionProvider;
+    use crate::fs::{Fault, FaultFs, FaultOp, FaultRule};
+    use crate::io::ErrorKind;
+    use crate::table::columnar::{COL_USER_KEY, COL_VALUE};
+    use crate::table::row_group::{PageWant, RowPageSelect};
+
+    type Variant = (
+        &'static str,
+        Option<Arc<dyn EncryptionProvider>>,
+        fn(Writer) -> Writer,
+    );
+    #[cfg_attr(
+        not(any(feature = "encryption", feature = "page_ecc")),
+        expect(unused_mut, reason = "the other variants are feature-gated")
+    )]
+    let mut variants: Vec<Variant> = alloc::vec![("plain", None, |w| w)];
+    #[cfg(feature = "encryption")]
+    variants.push((
+        "encrypted",
+        Some(Arc::new(crate::encryption::Aes256GcmProvider::new(
+            &[7u8; 32],
+        ))),
+        |w| w,
+    ));
+    #[cfg(feature = "page_ecc")]
+    variants.push(("page-ecc", None, |w| {
+        w.use_page_ecc(
+            true,
+            crate::runtime_config::EccScheme::ReedSolomon {
+                data_shards: 4,
+                parity_shards: 2,
+            },
+        )
+    }));
+
+    for (label, encryption, configure) in variants {
+        let dir = tempdir()?;
+        let file = dir.path().join("table");
+        let writer = Writer::new(file.clone(), 0, 0, Arc::new(StdFs))?
+            .use_encryption(encryption.clone())
+            .use_columnar(true)
+            .use_zone_map(true)
+            .use_row_group_size(64 * 1_024)
+            .use_columnar_page_size(1_024);
+        let mut writer = configure(writer);
+        for i in 0..400 {
+            writer.write(InternalValue::from_components(
+                zoned_key(i),
+                zoned_value(i),
+                u64::from(i) + 1,
+                crate::ValueType::Value,
+            ))?;
+        }
+        let (_, checksum) = writer.finish()?.expect("written");
+        let open = |fs: Arc<dyn crate::fs::Fs>| {
+            let mut params = test_recover_params(file.clone(), checksum);
+            params.fs = fs;
+            params.encryption = encryption.clone();
+            Table::recover(params)
+        };
+
+        // Learn the geometry from a clean table: the group, the rows each
+        // row page starts at, and where the value page of row page 2 sits.
+        let (group, starts, victim_at) = {
+            let table = open(Arc::new(StdFs))?;
+            let Some(Ok(group)) = table.data_block_handles().next() else {
+                panic!("{label}: the table has a row group");
+            };
+            let group = group.into_inner();
+            let pages = table.load_row_group(&group, &PageWant::ALL, ReadCharge::Foreground)?;
+            let Some((directory, directory_len)) =
+                table
+                    .cache
+                    .get_directory(table.global_id(), group.offset(), false)
+            else {
+                panic!("{label}: the read cached the directory");
+            };
+            let Some(victim) = directory
+                .entries()
+                .iter()
+                .find(|e| e.id.column_id == COL_VALUE && e.row_page == 2)
+            else {
+                panic!("{label}: the group has a value page on row page 2");
+            };
+            let victim_at = *group.offset() + u64::from(directory_len) + u64::from(victim.offset);
+            (group, pages.starts, victim_at)
+        };
+        assert!(starts.len() > 4, "{label}: the group has several row pages");
+        let Some((&victim_row, &other_row)) = starts.get(2).zip(starts.get(4)) else {
+            panic!("{label}: row pages 2 and 4 exist");
+        };
+
+        let fault = FaultFs::new(StdFs);
+        let injector = fault.injector();
+        injector.arm(
+            FaultRule::new(FaultOp::ReadAt, Fault::Error(ErrorKind::Other)).at_offset(victim_at),
+        );
+        let table = open(Arc::new(fault))?;
+        let get = |i: u32| {
+            let key = zoned_key(i);
+            table.get(&key, crate::MAX_SEQNO, crate::hash::hash64(&key))
+        };
+
+        let Some(other) = get(other_row)? else {
+            panic!("{label}: a key on another row page is found");
+        };
+        assert_eq!(
+            &*other.value,
+            zoned_value(other_row).as_slice(),
+            "{label}: a key on another row page reads its own value",
+        );
+        let keys_only = table.load_row_group(
+            &group,
+            &PageWant {
+                columns: Some(&[COL_USER_KEY]),
+                row_pages: RowPageSelect::All,
+            },
+            ReadCharge::Foreground,
+        )?;
+        assert_eq!(
+            keys_only.into_batch()?.row_count,
+            400,
+            "{label}: a projection that skips the value column reads every key",
+        );
+        let refused = get(victim_row);
+        assert!(
+            matches!(&refused, Err(crate::Error::Io(e)) if e.kind() == ErrorKind::Other),
+            "{label}: the key whose value page fails to read gets the error, got {refused:?}",
+        );
+
+        injector.clear();
+        let Some(healed) = get(victim_row)? else {
+            panic!("{label}: the key is found once the page reads again");
+        };
+        assert_eq!(
+            &*healed.value,
+            zoned_value(victim_row).as_slice(),
+            "{label}: the failed read left nothing behind",
+        );
+    }
+    Ok(())
+}
+
 /// A read of a group caches its directory decoded, not as the block it was
 /// read as: the next read of the group takes the decoded directory from the
 /// cache instead of parsing and checking a directory of dozens of entries
