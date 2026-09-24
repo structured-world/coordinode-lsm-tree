@@ -88,9 +88,10 @@ is precisely the coupling the separation is for.
 ## The geometry the separation requires
 
 Pages only pay if a page is worth reading on its own, and today's row group is
-far too small for that. A columnar row group is flushed at the data-block size
-target, 4 KiB by default (`src/tree/ingest.rs` compares `data_size()` against
-`data_block_size_policy`). The formats this design draws on are three orders
+far too small for that. A columnar row group is flushed at its own size
+target, `columnar_row_group_size_policy`, whose default of 4 KiB is the data
+block size row groups were cut at before they had a knob of their own. The
+formats this design draws on are three orders
 of magnitude coarser: FastLanes' row group is a fixed multiple of 1024 rows,
 64 × 1024 in its defaults, and Vortex chunks a column at 2 MB of uncompressed
 data while pruning at 8k rows.

@@ -8088,6 +8088,47 @@ fn a_row_group_of_many_row_pages_reads_back_every_row() -> crate::Result<()> {
     Ok(())
 }
 
+/// A page size small enough to give every row a page of its own, in a group
+/// large enough that its pages outnumber what the directory can list (a
+/// `u16` count of column pages), still writes the table: adjacent row pages
+/// are merged until the directory holds them, which coarsens pruning and
+/// changes no row. Refusing instead failed the flush, and every retry of it.
+#[cfg(feature = "columnar")]
+#[test]
+fn a_group_of_more_row_pages_than_the_directory_lists_merges_them() -> crate::Result<()> {
+    use crate::table::row_group::PageWant;
+
+    let dir = tempdir()?;
+    let file = dir.path().join("table");
+    // One row per page and 20,000 rows in one group: 80,000 column pages
+    // for the four columns, past the directory's 65,535.
+    let checksum = columnar_table_file_paged(&file, 20_000, 9, 8, 4 * 1_024 * 1_024, 1)?;
+    let group = first_row_group(&file, checksum)?;
+    let table = Table::recover(test_recover_params(file, checksum))?;
+    let pages = table.load_row_group(&group, &PageWant::ALL, ReadCharge::Foreground)?;
+    assert_eq!(pages.group_rows, 20_000, "the table is one group");
+    assert!(
+        u16::try_from(pages.batches.len() * 4).is_ok(),
+        "the directory lists every page: {} row pages",
+        pages.batches.len(),
+    );
+    assert!(
+        pages.batches.len() > 1_000,
+        "merging keeps the pages as fine as the directory allows: {}",
+        pages.batches.len(),
+    );
+    let scanned: Vec<_> = table.iter().collect::<crate::Result<_>>()?;
+    assert_eq!(scanned.len(), 20_000, "the scan returns every row");
+    for (i, row) in (0..).zip(&scanned) {
+        assert_eq!(
+            &*row.key.user_key,
+            alloc::format!("key{i:06}").as_bytes(),
+            "row {i} in order"
+        );
+    }
+    Ok(())
+}
+
 /// Under the default sizes, a page as large as the group, every group is one
 /// row page, including a group its last row took past the group size: the
 /// group is cut by the writer's size count and a page by the bytes its rows
@@ -8358,6 +8399,83 @@ fn a_page_swapped_with_another_row_page_is_refused() -> crate::Result<()> {
     Ok(())
 }
 
+/// A read that meets a page in another page's place fails and leaves nothing
+/// of it in the cache: once the right bytes are back (a transient misread,
+/// a repaired sector), the same read is served. A page cached before its
+/// stamp was checked would keep failing every read of the group until it was
+/// evicted, though nothing on disk was wrong any more.
+#[cfg(feature = "columnar")]
+#[test]
+fn a_page_refused_by_its_stamp_is_not_cached() -> crate::Result<()> {
+    use crate::coding::Decode;
+    use crate::table::block::Header;
+    use crate::table::columnar::COL_SEQNO;
+    use crate::table::row_group::PageWant;
+
+    let dir = tempdir()?;
+    let file = dir.path().join("table");
+    let checksum = columnar_table_file_paged(&file, 400, 16, 100, 64 * 1_024, 1_024)?;
+    let group = first_row_group(&file, checksum)?;
+
+    let original = std::fs::read(&file)?;
+    let mut bytes = original.clone();
+    let at = usize::try_from(*group.offset()).expect("offset fits");
+    let (directory, directory_len) = {
+        let frame = bytes.get(at..).expect("group within the file");
+        let header = Header::decode_from(&mut &frame[..])?;
+        let payload_at = Header::header_len(header.block_type);
+        let payload = frame
+            .get(payload_at..payload_at + header.data_length as usize)
+            .expect("directory payload");
+        (
+            crate::table::column_page::PageDirectory::decode(payload)?,
+            header.on_disk_size_with(None) as usize,
+        )
+    };
+    let seqno_pages: Vec<_> = directory
+        .entries()
+        .iter()
+        .filter(|e| e.id.column_id == COL_SEQNO)
+        .collect();
+    let (first, second) = seqno_pages
+        .iter()
+        .zip(seqno_pages.iter().skip(1))
+        .find(|(a, b)| a.length == b.length)
+        .expect("two seqno pages of one length");
+    let extent = |e: &crate::table::column_page::PageEntry| {
+        let start = at + directory_len + e.offset as usize;
+        start..start + e.length as usize
+    };
+    let first_bytes = bytes.get(extent(first)).expect("page").to_vec();
+    let second_bytes = bytes.get(extent(second)).expect("page").to_vec();
+    bytes
+        .get_mut(extent(first))
+        .expect("page")
+        .copy_from_slice(&second_bytes);
+    bytes
+        .get_mut(extent(second))
+        .expect("page")
+        .copy_from_slice(&first_bytes);
+    std::fs::write(&file, &bytes)?;
+
+    let table = Table::recover(test_recover_params(file.clone(), checksum))?;
+    assert!(
+        table
+            .load_row_group(&group, &PageWant::ALL, ReadCharge::Foreground)
+            .is_err(),
+        "a page in another row page's place is refused",
+    );
+
+    std::fs::write(&file, &original)?;
+    let pages = table.load_row_group(&group, &PageWant::ALL, ReadCharge::Foreground)?;
+    assert_eq!(
+        pages.group_rows,
+        pages.row_count(),
+        "with the right bytes back the same read is served whole",
+    );
+    Ok(())
+}
+
 /// Row `i`'s key in [`zoned_table_file`].
 #[cfg(feature = "columnar")]
 fn zoned_key(i: u32) -> Vec<u8> {
@@ -8590,6 +8708,73 @@ fn a_group_read_caches_its_directory_decoded() -> crate::Result<()> {
         pages.group_rows,
         cached.row_count(),
         "a later read uses the cached directory",
+    );
+    Ok(())
+}
+
+/// A zone block moved into another group's place, its bytes intact, is
+/// refused: the block names the group it describes, as every page does.
+/// Without that, two groups' zone blocks of one length trade places, still
+/// verify as blocks, and a predicate scan prunes a group's row pages by the
+/// other group's bounds, silently dropping rows that match.
+#[cfg(feature = "columnar")]
+#[test]
+fn a_zone_block_moved_to_another_group_is_refused() -> crate::Result<()> {
+    use crate::table::columnar::{COL_USER_KEY, COL_VALUE};
+    use crate::table::columnar_predicate::ColumnRangePredicate;
+
+    let dir = tempdir()?;
+    let file = dir.path().join("table");
+    let checksum = zoned_table_file(&file, 1_500, &[])?;
+    let table = Table::recover(test_recover_params(file.clone(), checksum))?;
+    let groups: Vec<BlockHandle> = table
+        .data_block_handles()
+        .map(|handle| handle.map(|h| BlockHandle::new(h.offset(), h.size())))
+        .collect::<crate::Result<_>>()?;
+    let zone_block = |group: &BlockHandle| -> crate::Result<BlockHandle> {
+        let blocks = table.data_unit_blocks(group)?;
+        let Some(&(block, BlockType::ColumnZones)) = blocks.last() else {
+            panic!("a group of several row pages ends in its zone block");
+        };
+        Ok(block)
+    };
+    let (Some(first), Some(second)) = (groups.first(), groups.get(1)) else {
+        panic!("the fixture spans several groups");
+    };
+    let (a, b) = (zone_block(first)?, zone_block(second)?);
+    assert_eq!(a.size(), b.size(), "the two zone blocks are of one length");
+    drop(table);
+
+    let mut bytes = std::fs::read(&file)?;
+    let extent = |h: &BlockHandle| {
+        let start = usize::try_from(*h.offset()).expect("offset fits");
+        start..start + h.size() as usize
+    };
+    let a_bytes = bytes.get(extent(&a)).expect("zone block").to_vec();
+    let b_bytes = bytes.get(extent(&b)).expect("zone block").to_vec();
+    assert_ne!(a_bytes, b_bytes, "the two groups hold other values");
+    bytes
+        .get_mut(extent(&a))
+        .expect("zone block")
+        .copy_from_slice(&b_bytes);
+    bytes
+        .get_mut(extent(&b))
+        .expect("zone block")
+        .copy_from_slice(&a_bytes);
+    std::fs::write(&file, &bytes)?;
+
+    // A value of the first group, which its moved-in zones do not cover.
+    let table = Table::recover(test_recover_params(file, checksum))?;
+    let predicate = ColumnRangePredicate {
+        column_id: COL_VALUE,
+        lower: Some(zoned_value(10)),
+        upper: Some(zoned_value(10)),
+    };
+    let result = table.columnar_scan(&[COL_USER_KEY, COL_VALUE], Some(&predicate));
+    assert!(
+        matches!(result, Err(crate::Error::InvalidHeader(_))),
+        "a zone block of another group must be refused, got {:?}",
+        result.map(|batches| batches.iter().map(|b| b.row_count).sum::<u32>()),
     );
     Ok(())
 }

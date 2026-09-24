@@ -681,7 +681,7 @@ fn a_zone_block_round_trips_against_its_directory() {
     );
 
     let mut payload = Vec::new();
-    block_zones().encode_into(&mut payload);
+    PageDirectory::encode_zone_block(TAG, &block_zones(), &mut payload);
     let zones = directory
         .decode_zone_block(3, &payload)
         .expect("column 3's zones for the group's row pages");
@@ -754,7 +754,7 @@ fn a_zone_block_that_does_not_fit_its_directory_is_refused() {
     let directory = with_zone_block(96).expect("a directory listing a zone block");
 
     let mut trailing = Vec::new();
-    block_zones().encode_into(&mut trailing);
+    PageDirectory::encode_zone_block(TAG, &block_zones(), &mut trailing);
     trailing.push(0);
     let err = directory
         .decode_zone_block(3, &trailing)
@@ -767,11 +767,28 @@ fn a_zone_block_that_does_not_fit_its_directory_is_refused() {
     elsewhere.push(0, Some((b"a", b"b")));
     elsewhere.push(0, Some((b"a", b"b")));
     let mut payload = Vec::new();
-    elsewhere.encode_into(&mut payload);
+    PageDirectory::encode_zone_block(TAG, &elsewhere, &mut payload);
     let err = directory
         .decode_zone_block(3, &payload)
         .expect_err("another column's zones must be refused");
     assert!(format!("{err:?}").contains("another column"), "got {err:?}");
+
+    // Column 3's own zones from another group: they describe that group's
+    // row pages, not these.
+    let mut foreign = Vec::new();
+    PageDirectory::encode_zone_block(TAG + 1, &block_zones(), &mut foreign);
+    let err = directory
+        .decode_zone_block(3, &foreign)
+        .expect_err("another group's zone block must be refused");
+    assert!(
+        format!("{err:?}").contains("another row group"),
+        "got {err:?}"
+    );
+
+    let err = directory
+        .decode_zone_block(3, &[0; 7])
+        .expect_err("a payload shorter than the tag must be refused");
+    assert!(format!("{err:?}").contains("group tag"), "got {err:?}");
 
     // Zones for one row page of a group of two.
     let mut short = PageZones::new(vec![3]);

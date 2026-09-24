@@ -3895,7 +3895,11 @@ fn verify_rejects_row_page_zones_that_disagree_with_their_rows() -> crate::Resul
         group_at + directory_len as usize + directory.pages_len() as usize + after_pages as usize;
     let zones = directory.decode_zone_block(COL_VALUE, &block_payload(&bytes, zones_at)?)?;
     let mut payload = Vec::new();
-    narrowed(&zones, &[COL_VALUE], row_pages).encode_into(&mut payload);
+    crate::table::column_page::PageDirectory::encode_zone_block(
+        directory.group_tag(),
+        &narrowed(&zones, &[COL_VALUE], row_pages),
+        &mut payload,
+    );
     restamp_block(&mut bytes, zones_at, &payload)?;
     std::fs::write(&source, &bytes)?;
     let err = reconcile_error(

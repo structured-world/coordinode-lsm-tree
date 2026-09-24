@@ -18,7 +18,7 @@ use crate::coding::Decode;
 use crate::fs::FsFile;
 use crate::path::Path;
 use crate::table::block::{BlockType, EccParams, Header};
-use crate::table::column_page::{PageDirectory, PageEntry, PageZones};
+use crate::table::column_page::{PageDirectory, PageEntry, PageStamp, PageZones};
 use crate::{
     Cache, CompressionType, Slice, encryption::EncryptionProvider, file_accessor::FileAccessor,
 };
@@ -618,8 +618,8 @@ impl GroupRead<'_> {
                     self.span(fd, front, start, end)?
                 };
                 self.admit_pages(
+                    directory,
                     directory_len,
-                    entries,
                     run.clone(),
                     start,
                     &span,
@@ -632,26 +632,32 @@ impl GroupRead<'_> {
 
     /// Verifies, admits and caches the pages `run` names out of `span`, the
     /// group's bytes from `start`, into their slots of `pages`.
+    ///
+    /// A page is cached only once its stamp is the one `directory` implies
+    /// for its slot: a page read in another page's place (a misdirected or
+    /// transient read) fails the read without staying behind in the cache to
+    /// fail every later read of the group.
     fn admit_pages(
         &self,
+        directory: &PageDirectory,
         directory_len: u32,
-        entries: &[PageEntry],
         run: core::ops::Range<usize>,
         start: usize,
         span: &Slice,
         pages: &mut [Option<Block>],
     ) -> crate::Result<()> {
+        let entries = directory.entries();
         let page_at = |entry: &PageEntry| directory_len as usize + entry.offset as usize;
         for index in run {
             let Some(entry) = entries.get(index) else {
                 continue;
             };
             let at = page_at(entry) - start;
-            let bytes =
-                span.get(at..at + entry.length as usize)
-                    .ok_or(crate::Error::InvalidHeader(
-                        "columnar: page outside its row group",
-                    ))?;
+            let Some(bytes) = span.get(at..at + entry.length as usize) else {
+                return Err(crate::Error::InvalidHeader(
+                    "columnar: page outside its row group",
+                ));
+            };
             let handle = BlockHandle::new(
                 BlockOffset(*self.group.offset() + page_at(entry) as u64),
                 entry.length,
@@ -663,6 +669,15 @@ impl GroupRead<'_> {
                 self.compression,
                 true,
             )?;
+            let stamped = page
+                .data
+                .first_chunk::<{ PageStamp::LEN }>()
+                .is_some_and(|stamp| PageStamp::decode(*stamp) == directory.stamp_for(entry));
+            if !stamped {
+                return Err(crate::Error::InvalidHeader(
+                    "columnar: page belongs to another row group, column part or row page",
+                ));
+            }
             self.cache_block(&handle, page.clone());
             if let Some(slot) = pages.get_mut(index) {
                 *slot = Some(page);

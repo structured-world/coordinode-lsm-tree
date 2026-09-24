@@ -42,7 +42,10 @@
 //! zones (see below)
 //! ```
 //!
-//! and a set of zones, in the directory and in each zone block alike:
+//! and a set of zones, in the directory and in each zone block alike. A zone
+//! block's payload opens with its group's `[group_tag: u64 LE]`, which a
+//! reader checks against the directory, so a zone block moved into another
+//! group's place is refused like a page with another group's stamp:
 //!
 //! ```text
 //! [zone_column_count: u16 LE]
@@ -662,17 +665,35 @@ impl PageDirectory {
         Ok(total)
     }
 
+    /// Appends the payload of a zone block of the group `group_tag` names:
+    /// the tag, then `zones`, which hold one column's zones.
+    pub fn encode_zone_block(group_tag: u64, zones: &PageZones, out: &mut Vec<u8>) {
+        out.extend_from_slice(&group_tag.to_le_bytes());
+        zones.encode_into(out);
+    }
+
     /// Parses the payload of the zone block this directory lists for column
-    /// `column_id`: that column's zones, and nothing else.
+    /// `column_id`: this group's tag, then that column's zones, and nothing
+    /// else.
     ///
     /// # Errors
     ///
-    /// [`Error::InvalidHeader`] for a truncated payload, trailing bytes, zones
-    /// of any column but `column_id`, or zones [`Self::new`] would refuse. A
-    /// block holding another column's zones is a block in another's place, and
-    /// its zones would prune this column's row pages by that column's values.
+    /// [`Error::InvalidHeader`] for a truncated payload, trailing bytes, the
+    /// tag of another group, zones of any column but `column_id`, or zones
+    /// [`Self::new`] would refuse. A block of another group or holding another
+    /// column's zones is a block in another's place, and its zones would prune
+    /// this group's row pages by other values.
     pub fn decode_zone_block(&self, column_id: u16, bytes: &[u8]) -> Result<PageZones> {
-        let mut rest = bytes;
+        let Some((tag, mut rest)) = bytes.split_first_chunk::<8>() else {
+            return Err(Error::InvalidHeader(
+                "ColumnZones: payload shorter than its group tag",
+            ));
+        };
+        if u64::from_le_bytes(*tag) != self.group_tag {
+            return Err(Error::InvalidHeader(
+                "ColumnZones: the zone block belongs to another row group",
+            ));
+        }
         let zones = PageZones::decode_from(&mut rest, self.row_pages.len())?;
         if !rest.is_empty() {
             return Err(Error::InvalidHeader(

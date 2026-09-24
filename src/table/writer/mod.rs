@@ -1535,7 +1535,20 @@ impl Writer {
         let row_pages = if self.columnar_page_size >= self.row_group_size {
             alloc::vec![batch.row_count]
         } else {
-            batch.row_page_cuts(self.columnar_page_size)?
+            let cuts = batch.row_page_cuts(self.columnar_page_size)?;
+            // The directory counts the group's column pages in a `u16`, so a
+            // page size that gives more row pages than it can list merges
+            // adjacent ones: the grid stays complete and only pruning coarsens.
+            let fit = usize::from(u16::MAX) / batch.columns.len().max(1);
+            if cuts.len() <= fit {
+                cuts
+            } else {
+                // Each merged page is a run of whole cuts, so its rows are at
+                // most the group's `u32` row count.
+                cuts.chunks(cuts.len().div_ceil(fit.max(1)))
+                    .map(|run| run.iter().sum::<u32>())
+                    .collect()
+            }
         };
         let mut payloads = Vec::with_capacity(batch.columns.len() * row_pages.len());
         for col in &batch.columns {
@@ -1598,9 +1611,11 @@ impl Writer {
             .iter()
             .map(|&column_id| {
                 let mut payload = Vec::new();
-                other_zones
-                    .only(|c| c == column_id)
-                    .encode_into(&mut payload);
+                PageDirectory::encode_zone_block(
+                    group_tag,
+                    &other_zones.only(|c| c == column_id),
+                    &mut payload,
+                );
                 (column_id, payload)
             })
             .collect();

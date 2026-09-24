@@ -188,13 +188,17 @@ byte-wise zone contains them.
 
 Both places hold the same form: a `u16` count of the columns they describe,
 the column ids, then the zones row page by row page, each row page's in
-column order. A zone set is refused unless it names distinct columns the
+column order. A zone block opens with its group's `group_tag` (`u64`) before
+that form, as every page opens with its stamp. A zone set is refused unless it names distinct columns the
 group has, one zone per row page and column, no more nulls than rows, the
 empty range for an all-null row page, and a lower bound no greater than the
 upper one: each of those, read as written, would prune a row page holding a
-match. A zone block holds exactly the column the directory lists it for, so
-one moved into another column's place is refused rather than read as that
-column's. The verification gates re-derive every zone from the decoded rows
+match. A zone block holds exactly the column the directory lists it for, and
+names the group it describes, so one moved into another column's place or
+another group's is refused rather than read as theirs: two groups' zone
+blocks of one length would otherwise trade places, still verify as blocks,
+and prune each group's row pages by the other's bounds, dropping rows that
+match. The verification gates re-derive every zone from the decoded rows
 and refuse a group whose zones differ, a zone block it should not have, or
 one it lacks, as they do for the zone map.
 
@@ -315,7 +319,8 @@ row page. Four parts in 4 KiB row pages cost 244 bytes per row page, about 6%
 of the data; in 16 KiB row pages, 1.5%. Their zones add 7 bytes per zone plus
 its bounds: some 30 bytes of key zone per row page for 12-byte keys, in the
 directory, and up to 135 bytes per wider column in that column's zone block
-(a 33-byte block header and a 6-byte directory listing per column and group),
+(a 33-byte block header, its 8-byte group tag and a 6-byte directory listing
+per column and group),
 which only a read pruning on that column fetches. That is what the
 page size trades against the rows a point read decodes and the pages a
 predicate skips, and why its default is chosen by measurement together with
@@ -328,7 +333,7 @@ paid with or without pages, and splitting only adds the rounding at each page
 boundary.
 
 These figures are a second reason the row group grows. At 32 KiB with a
-richly-encoded schema the framing is already 3.6%; at 128 KiB and above it is
+richly-encoded schema the framing is already 3.84%; at 128 KiB and above it is
 under 1% and stops being a term in the decision.
 
 ### Measured against the unpaged layout
