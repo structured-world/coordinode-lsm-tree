@@ -8407,6 +8407,50 @@ fn zoned_table_file(file: &std::path::Path, rows: u32, deletes: &[u32]) -> crate
     Ok(checksum)
 }
 
+/// A read of a group caches its directory decoded, not as the block it was
+/// read as: the next read of the group takes the decoded directory from the
+/// cache instead of parsing and checking a directory of dozens of entries
+/// again, which a point read would otherwise do twice per lookup. The pages
+/// are cached as blocks, and a read that must leave the cache as it found it
+/// caches nothing.
+#[cfg(feature = "columnar")]
+#[test]
+fn a_group_read_caches_its_directory_decoded() -> crate::Result<()> {
+    use crate::table::row_group::PageWant;
+
+    let dir = tempdir()?;
+    let file = dir.path().join("table");
+    let checksum = zoned_table_file(&file, 400, &[])?;
+    let group = first_row_group(&file, checksum)?;
+
+    let table = Table::recover(test_recover_params(file, checksum))?;
+    table.load_row_group(&group, &PageWant::ALL, ReadCharge::Untraced)?;
+    assert!(
+        table
+            .cache
+            .get_directory(table.global_id(), group.offset(), false)
+            .is_none(),
+        "an untraced read caches no directory",
+    );
+
+    table.load_row_group(&group, &PageWant::ALL, ReadCharge::Foreground)?;
+    let (cached, _) = table
+        .cache
+        .get_directory(table.global_id(), group.offset(), false)
+        .expect("the read cached the directory");
+    assert!(
+        !table.cache.has_block(table.global_id(), group.offset()),
+        "the directory is cached decoded, not as a raw block",
+    );
+    let pages = table.load_row_group(&group, &PageWant::ALL, ReadCharge::Foreground)?;
+    assert_eq!(
+        pages.group_rows,
+        cached.row_count(),
+        "a later read uses the cached directory",
+    );
+    Ok(())
+}
+
 /// Patrol scrub walks every block of a group, the zone block included: a clean
 /// table scrubs clean with the zone block counted, and damage inside the zone
 /// block is reported rather than passed over, since a read that prunes by it

@@ -1589,30 +1589,38 @@ impl Writer {
 
         // Statistics zones for a group of several row pages; one row page's
         // zone is the group's zone-map entry. The key column's zones go into
-        // the directory, which a point read reads first anyway; the others
-        // into a zone block after the pages, which only a read that prunes on
-        // them reads.
+        // the directory, which a point read reads first anyway; every other
+        // column's into a zone block of its own after the pages, which only a
+        // read that prunes on that column reads.
         let (key_zones, other_zones) = batch.group_zones(&row_pages)?;
-        let mut zone_payload = Vec::new();
-        let zone_block = if other_zones.is_empty() {
-            None
-        } else {
-            other_zones.encode_into(&mut zone_payload);
-            Some(Block::prepare_with_flags(
-                &zone_payload,
-                super::block::BlockIdentity {
-                    table_id: self.table_id,
-                    block_type: super::block::BlockType::ColumnZones,
-                    dict_id: 0,
-                    window_log: 0,
-                },
-                &directory_transform,
-                0,
-            )?)
-        };
-        let zones_len = zone_block
-            .as_ref()
-            .map_or(0, |block| block.on_disk_len(self.ecc));
+        let zone_payloads: Vec<(u16, Vec<u8>)> = other_zones
+            .columns()
+            .iter()
+            .map(|&column_id| {
+                let mut payload = Vec::new();
+                other_zones
+                    .only(|c| c == column_id)
+                    .encode_into(&mut payload);
+                (column_id, payload)
+            })
+            .collect();
+        let zone_blocks = zone_payloads
+            .iter()
+            .map(|(column_id, payload)| {
+                let prepared = Block::prepare_with_flags(
+                    payload,
+                    super::block::BlockIdentity {
+                        table_id: self.table_id,
+                        block_type: super::block::BlockType::ColumnZones,
+                        dict_id: 0,
+                        window_log: 0,
+                    },
+                    &directory_transform,
+                    0,
+                )?;
+                Ok((*column_id, prepared))
+            })
+            .collect::<crate::Result<Vec<_>>>()?;
         let directory = PageDirectory::contiguous(
             batch.row_count,
             group_tag,
@@ -1621,7 +1629,15 @@ impl Writer {
                 .iter()
                 .map(|(id, row_page, prepared)| (*id, *row_page, prepared.on_disk_len(self.ecc))),
             key_zones,
-            zones_len,
+            zone_blocks
+                .iter()
+                .map(
+                    |(column_id, prepared)| crate::table::column_page::ZoneBlock {
+                        column_id: *column_id,
+                        length: prepared.on_disk_len(self.ecc),
+                    },
+                )
+                .collect(),
         )?;
         let mut directory_payload = Vec::new();
         directory.encode_into(&mut directory_payload);
@@ -1639,7 +1655,7 @@ impl Writer {
 
         // The group is written directory first, then its pages back to back,
         // which is exactly the layout `PageDirectory::contiguous` recorded,
-        // then the zone block the directory counted after them.
+        // then the zone blocks in the order the directory lists them.
         let mut bytes_written = directory_block.on_disk_len(self.ecc);
         let mut uncompressed = u64::from(
             directory_block
@@ -1649,7 +1665,7 @@ impl Writer {
         for prepared in pages
             .into_iter()
             .map(|(_, _, prepared)| prepared)
-            .chain(zone_block)
+            .chain(zone_blocks.into_iter().map(|(_, prepared)| prepared))
         {
             let header = prepared.write_to(&mut self.file_writer)?;
             bytes_written = bytes_written

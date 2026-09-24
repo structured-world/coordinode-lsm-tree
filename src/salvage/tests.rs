@@ -3859,7 +3859,7 @@ fn verify_rejects_row_page_zones_that_disagree_with_their_rows() -> crate::Resul
         directory.row_pages().to_vec(),
         directory.entries().to_vec(),
         narrowed(directory.zones(), &[COL_USER_KEY], row_pages),
-        directory.zones_len(),
+        directory.zone_blocks().to_vec(),
     )?;
     let mut payload = Vec::new();
     forged.encode_into(&mut payload);
@@ -3876,7 +3876,7 @@ fn verify_rejects_row_page_zones_that_disagree_with_their_rows() -> crate::Resul
         "a forged directory zone must be refused, got {err:?}",
     );
 
-    // The zone block's value zones.
+    // The value column's zone block.
     let source = dir.path().join("block_zones");
     zoned_source(&source, &fs)?;
     let (group_at, directory) = row_group(&source, &fs, 0)?;
@@ -3888,8 +3888,12 @@ fn verify_rejects_row_page_zones_that_disagree_with_their_rows() -> crate::Resul
         };
         crate::table::block::Header::decode_from(&mut &frame[..])?.on_disk_size_with(None)
     };
-    let zones_at = group_at + directory_len as usize + directory.pages_len() as usize;
-    let zones = directory.decode_zone_block(&block_payload(&bytes, zones_at)?)?;
+    let Some((after_pages, _)) = directory.zone_block(COL_VALUE) else {
+        panic!("the value column has a zone block");
+    };
+    let zones_at =
+        group_at + directory_len as usize + directory.pages_len() as usize + after_pages as usize;
+    let zones = directory.decode_zone_block(COL_VALUE, &block_payload(&bytes, zones_at)?)?;
     let mut payload = Vec::new();
     narrowed(&zones, &[COL_VALUE], row_pages).encode_into(&mut payload);
     restamp_block(&mut bytes, zones_at, &payload)?;
@@ -3952,13 +3956,13 @@ fn salvaged_columnar_table_keeps_per_column_zone_statistics() -> crate::Result<(
     Ok(())
 }
 
-/// A clean group of row pages is copied verbatim with its zone block: the
+/// A clean group of row pages is copied verbatim with its zone blocks: the
 /// copy is the group whole, directory, pages and zones, so the salvaged
 /// table's groups still fill their extents, pass every gate, and prune and
 /// read as the source did.
 #[cfg(feature = "columnar")]
 #[test]
-fn salvage_copies_a_group_of_row_pages_with_its_zone_block() -> crate::Result<()> {
+fn salvage_copies_a_group_of_row_pages_with_its_zone_blocks() -> crate::Result<()> {
     let dir = tempdir()?;
     let source = dir.path().join("source");
     let dest = dir.path().join("salvaged");
@@ -3966,8 +3970,8 @@ fn salvage_copies_a_group_of_row_pages_with_its_zone_block() -> crate::Result<()
     zoned_source(&source, &fs)?;
     let (_, directory) = row_group(&source, &fs, 0)?;
     assert!(
-        directory.zones_len() > 0,
-        "the fixture group has a zone block"
+        !directory.zone_blocks().is_empty(),
+        "the fixture group has zone blocks"
     );
 
     let report = salvage_sst(&source, dest.clone(), &fs)?;

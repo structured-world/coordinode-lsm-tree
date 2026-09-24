@@ -29,12 +29,13 @@ use crate::metrics::Metrics;
 /// A columnar row group as read: its directory and the pages that were
 /// fetched, each verified and cached as the block it is.
 pub struct RowGroupBlocks {
-    pub directory: PageDirectory,
+    /// The group's directory, shared with the cache that keeps it decoded.
+    pub directory: Arc<PageDirectory>,
     /// One slot per directory entry, in the directory's order: the page's
     /// block when it was fetched, `None` when the read did not want it.
     pub pages: Vec<Option<Block>>,
-    /// The zones of the group's zone block, when the read needed them to
-    /// select its row pages.
+    /// The zones of the zone block the read needed to select its row pages,
+    /// when it needed one: those of the column it pruned on.
     pub zones: Option<PageZones>,
 }
 
@@ -93,15 +94,18 @@ impl<'a> PageWant<'a> {
         self.columns.is_none() && matches!(self.row_pages, RowPageSelect::All)
     }
 
-    /// Whether resolving this want against `directory` needs the group's
-    /// zone block: it selects by zones the directory does not carry, and the
-    /// group has a zone block to carry them.
-    fn needs_zone_block(&self, directory: &PageDirectory) -> bool {
+    /// The column whose zone block resolving this want against `directory`
+    /// needs: it selects by a column the directory carries no zones for, and
+    /// the group has a zone block for it.
+    fn zone_block_column(&self, directory: &PageDirectory) -> Option<u16> {
         match self.row_pages {
-            RowPageSelect::Zone { column_id, .. } => {
-                directory.zones_len() > 0 && !directory.zones().describes(column_id)
+            RowPageSelect::Zone { column_id, .. }
+                if !directory.zones().describes(column_id)
+                    && directory.zone_block(column_id).is_some() =>
+            {
+                Some(column_id)
             }
-            RowPageSelect::All | RowPageSelect::Range(_) => false,
+            RowPageSelect::All | RowPageSelect::Range(_) | RowPageSelect::Zone { .. } => None,
         }
     }
 
@@ -294,17 +298,25 @@ impl GroupRead<'_> {
     /// about where the group ends, and neither can be trusted to name the
     /// right bytes.
     pub(crate) fn load(&self, want: &PageWant<'_>) -> crate::Result<RowGroupBlocks> {
-        if let Some(directory_block) =
-            self.lookup(self.group.offset(), BlockType::ColumnPageDirectory)?
-        {
-            let directory = PageDirectory::decode(&directory_block.data)?;
-            let directory_len = directory_block.header.on_disk_size_with(self.ecc);
+        if let Some((directory, directory_len)) = self.cache.get_directory(
+            self.table_id,
+            self.group.offset(),
+            self.charge.touches_cache(),
+        ) {
+            // Decoded and checked when it was cached; its extent is checked
+            // again against this read's index entry, which is what names the
+            // group here.
             check_group_extent(self.group, directory_len, &directory)?;
             let mut fd = None;
-            let zones = if want.needs_zone_block(&directory) {
-                Some(self.zone_block(&mut fd, &directory, directory_len, &Slice::empty())?)
-            } else {
-                None
+            let zones = match want.zone_block_column(&directory) {
+                Some(column_id) => Some(self.zone_block(
+                    &mut fd,
+                    &directory,
+                    directory_len,
+                    column_id,
+                    &Slice::empty(),
+                )?),
+                None => None,
             };
             let wanted = want.resolve(&directory, zones.as_ref())?;
             let pages = self.cached_pages(&directory, directory_len, &wanted)?;
@@ -377,22 +389,26 @@ impl GroupRead<'_> {
         fd: &mut Option<Arc<dyn FsFile>>,
         directory: &PageDirectory,
         directory_len: u32,
+        column_id: u16,
         front: &Slice,
     ) -> crate::Result<PageZones> {
-        // The extent check proved the directory, the pages and the zone block
-        // fill the group, and the group's length is a `u32`.
-        let start = directory_len as usize + directory.pages_len() as usize;
-        let end = start + directory.zones_len() as usize;
-        let handle = BlockHandle::new(
-            BlockOffset(*self.group.offset() + start as u64),
-            directory.zones_len(),
-        );
+        let (after_pages, length) =
+            directory
+                .zone_block(column_id)
+                .ok_or(crate::Error::InvalidHeader(
+                    "columnar: the column has no zone block",
+                ))?;
+        // The extent check proved the directory, the pages and the zone
+        // blocks fill the group, and the group's length is a `u32`.
+        let start = directory_len as usize + directory.pages_len() as usize + after_pages as usize;
+        let end = start + length as usize;
+        let handle = BlockHandle::new(BlockOffset(*self.group.offset() + start as u64), length);
         if let Some(block) = self.lookup(handle.offset(), BlockType::ColumnZones)? {
             #[cfg(feature = "metrics")]
             if self.charge.is_counted() {
                 record_block_load_cached(self.metrics, BlockType::ColumnZones);
             }
-            return directory.decode_zone_block(&block.data);
+            return directory.decode_zone_block(column_id, &block.data);
         }
         let bytes = if end <= front.len() {
             front.slice(start..end)
@@ -410,7 +426,18 @@ impl GroupRead<'_> {
             CompressionType::None,
             false,
         )?;
-        directory.decode_zone_block(&block.data)
+        let zones = directory.decode_zone_block(column_id, &block.data)?;
+        self.cache_block(&handle, block);
+        Ok(zones)
+    }
+
+    /// Caches a verified page or zone block under its own offset, unless this
+    /// read must leave the cache as it found it.
+    fn cache_block(&self, handle: &BlockHandle, block: Block) {
+        if self.charge.touches_cache() {
+            self.cache
+                .insert_block(self.table_id, handle.offset(), block);
+        }
     }
 
     /// The directory from a prefix of the group, then the wanted pages.
@@ -448,10 +475,11 @@ impl GroupRead<'_> {
         };
         let (directory, directory_len) = self.admit_directory(&prefix)?;
         let mut fd = Some(fd);
-        let zones = if want.needs_zone_block(&directory) {
-            Some(self.zone_block(&mut fd, &directory, directory_len, &prefix)?)
-        } else {
-            None
+        let zones = match want.zone_block_column(&directory) {
+            Some(column_id) => {
+                Some(self.zone_block(&mut fd, &directory, directory_len, column_id, &prefix)?)
+            }
+            None => None,
         };
         let fd = match fd {
             Some(fd) => fd,
@@ -475,9 +503,10 @@ impl GroupRead<'_> {
         })
     }
 
-    /// Verifies and admits the directory at the front of `front`, then proves
-    /// it fills the group. Returns it with its on-disk length.
-    fn admit_directory(&self, front: &Slice) -> crate::Result<(PageDirectory, u32)> {
+    /// Verifies and admits the directory at the front of `front`, decodes it
+    /// and proves it fills the group, then caches it decoded. Returns it with
+    /// its on-disk length.
+    fn admit_directory(&self, front: &Slice) -> crate::Result<(Arc<PageDirectory>, u32)> {
         let directory_len = Header::decode_from(&mut &front[..])?.on_disk_size_with(self.ecc);
         let handle = BlockHandle::new(self.group.offset(), directory_len);
         let bytes = front
@@ -492,8 +521,16 @@ impl GroupRead<'_> {
             CompressionType::None,
             false,
         )?;
-        let directory = PageDirectory::decode(&block.data)?;
+        let directory = Arc::new(PageDirectory::decode(&block.data)?);
         check_group_extent(self.group, directory_len, &directory)?;
+        if self.charge.touches_cache() {
+            self.cache.insert_directory(
+                self.table_id,
+                self.group.offset(),
+                Arc::clone(&directory),
+                directory_len,
+            );
+        }
         Ok((directory, directory_len))
     }
 
@@ -567,6 +604,7 @@ impl GroupRead<'_> {
                     self.compression,
                     true,
                 )?;
+                self.cache_block(&handle, page.clone());
                 if let Some(slot) = pages.get_mut(index) {
                     *slot = Some(page);
                 }
@@ -746,7 +784,6 @@ impl GroupRead<'_> {
             self.table_id,
             self.path,
             self.file_accessor,
-            self.cache,
             handle,
             block_type,
             compression,

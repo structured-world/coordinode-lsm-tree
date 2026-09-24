@@ -26,8 +26,7 @@
 //! [row_count     : u32 LE]  rows in the group
 //! [group_tag     : u64 LE]  names the group; every page carries it in its stamp
 //! [row_page_count: u16 LE]
-//! [zones_len     : u32 LE]  on-disk length of the zone block after the pages,
-//!                           zero when the group has none
+//! [zone_block_count: u16 LE]
 //! repeated row_page_count times:
 //!   [rows : u32 LE]  rows in the row page, non-zero; the sum is `row_count`
 //! repeated page_count times, ascending by offset, non-overlapping:
@@ -37,10 +36,13 @@
 //!   [part     : u8    ]  which part of that column's encoding it holds
 //!   [flags    : u8    ]  reserved; a reader refuses unknown bits
 //!   [row_page : u16 LE]  which row page's rows it holds
+//! repeated zone_block_count times, in the order they follow the pages:
+//!   [column_id: u16 LE]  the column whose zones the block holds
+//!   [length   : u32 LE]  on-disk length of the block, its header included
 //! zones (see below)
 //! ```
 //!
-//! and a set of zones, in the directory and in the zone block alike:
+//! and a set of zones, in the directory and in each zone block alike:
 //!
 //! ```text
 //! [zone_column_count: u16 LE]
@@ -70,9 +72,10 @@
 //! The key column's zones are in the directory, which a point read reads
 //! first anyway, so it goes from the directory to the one key page that can
 //! hold its key. Every other column's zones are in a
-//! [`ColumnZones`](crate::table::block::BlockType::ColumnZones) block after
-//! the pages, read only by a read that prunes on one of them: a full scan or
-//! a projection that does not prune pays for none of them.
+//! [`ColumnZones`](crate::table::block::BlockType::ColumnZones) block of its
+//! own after the pages, read only by a read that prunes on that column: a full
+//! scan or a projection that does not prune pays for none of them, and one
+//! that prunes on a narrow column does not pay for a wide column's zones.
 //!
 //! Bounds are cut to [`ZONE_BOUND_LEN`] bytes: a prefix of the minimum is
 //! still a lower bound, and a prefix of the maximum with its last byte raised
@@ -121,8 +124,21 @@ use alloc::vec::Vec;
 pub const VERSION: u8 = 2;
 
 /// `version` + `page_count` + `row_count` + `group_tag` + `row_page_count` +
-/// `zones_len`.
-const HEADER_LEN: usize = 1 + 2 + 4 + 8 + 2 + 4;
+/// `zone_block_count`.
+const HEADER_LEN: usize = 1 + 2 + 4 + 8 + 2 + 2;
+
+/// `column_id` + `length` of one zone block.
+const ZONE_BLOCK_LEN: usize = 2 + 4;
+
+/// One zone block after a group's pages: whose zones it holds and how long
+/// it is on disk.
+#[derive(Clone, Copy, Debug, Eq, PartialEq)]
+pub struct ZoneBlock {
+    /// The column whose zones the block holds.
+    pub column_id: u16,
+    /// On-disk length of the block, its header included.
+    pub length: u32,
+}
 
 /// `rows` of one row page.
 const ROW_PAGE_LEN: usize = 4;
@@ -236,16 +252,16 @@ impl PageZones {
         });
     }
 
-    /// Whether these zones describe no column.
-    #[must_use]
-    pub fn is_empty(&self) -> bool {
-        self.columns.is_empty()
-    }
-
     /// Whether these zones describe column `column_id`.
     #[must_use]
     pub fn describes(&self, column_id: u16) -> bool {
         self.columns.contains(&column_id)
+    }
+
+    /// The columns these zones describe, in their order.
+    #[must_use]
+    pub fn columns(&self) -> &[u16] {
+        &self.columns
     }
 
     /// The zones restricted to the columns `keep` accepts, in the same order.
@@ -463,9 +479,11 @@ pub struct PageDirectory {
     /// Where each row page starts, as a row within the group.
     row_page_starts: Vec<u32>,
     entries: Vec<PageEntry>,
-    /// The key column's zones; the other columns' are in the zone block.
+    /// The key column's zones; the other columns' are in zone blocks.
     zones: PageZones,
-    /// On-disk length of the zone block after the pages, zero without one.
+    /// The zone blocks after the pages, in the order they follow them.
+    zone_blocks: Vec<ZoneBlock>,
+    /// Their total on-disk length.
     zones_len: u32,
 }
 
@@ -473,8 +491,8 @@ impl PageDirectory {
     /// Builds a directory for a group of `row_count` rows tagged `group_tag`,
     /// cut into row pages of `row_pages` rows each, from entries already in
     /// ascending offset order, the statistics `zones` the directory itself
-    /// carries, and the on-disk length of the zone block that follows the
-    /// pages (`zones_len`, zero when there is none).
+    /// carries, and the zone blocks that follow the pages (`zone_blocks`, one
+    /// per column whose zones are not in the directory).
     ///
     /// # Errors
     ///
@@ -497,14 +515,16 @@ impl PageDirectory {
     /// their row page has rows, record the empty range when every row is
     /// null, keep a lower bound no greater than the upper one, and keep
     /// every bound within [`ZONE_BOUND_LEN`]: a zone out of any of these would
-    /// prune a row page that holds a match.
+    /// prune a row page that holds a match. The zone blocks are refused unless
+    /// each names a distinct column the group has and the directory carries no
+    /// zones for, and their lengths are non-zero and sum within a `u32`.
     pub fn new(
         row_count: u32,
         group_tag: u64,
         row_pages: Vec<u32>,
         entries: Vec<PageEntry>,
         zones: PageZones,
-        zones_len: u32,
+        zone_blocks: Vec<ZoneBlock>,
     ) -> Result<Self> {
         if entries.len() > usize::from(u16::MAX) {
             return Err(Error::InvalidHeader(
@@ -589,6 +609,7 @@ impl PageDirectory {
             ));
         }
         Self::check_zones(&zones, &row_pages, &cells)?;
+        let zones_len = Self::check_zone_blocks(&zone_blocks, &zones, &cells)?;
         Ok(Self {
             row_count,
             group_tag,
@@ -596,19 +617,61 @@ impl PageDirectory {
             row_page_starts,
             entries,
             zones,
+            zone_blocks,
             zones_len,
         })
     }
 
-    /// Parses the payload of this group's zone block: the zones of the
-    /// columns the directory carries none for.
+    /// The zone block checks [`Self::new`] documents, returning the blocks'
+    /// total length. `cells` are the pages' `(id, row_page)`, sorted.
+    fn check_zone_blocks(
+        zone_blocks: &[ZoneBlock],
+        zones: &PageZones,
+        cells: &[(PageId, u16)],
+    ) -> Result<u32> {
+        let bad = |what| Err(Error::InvalidHeader(what));
+        if zone_blocks.len() > usize::from(u16::MAX) {
+            return bad("column page: zone block count exceeds the u16 directory field");
+        }
+        // Sorted lookups, as for the pages: every list here is read from disk.
+        let mut columns: Vec<u16> = zone_blocks.iter().map(|b| b.column_id).collect();
+        columns.sort_unstable();
+        if columns.windows(2).any(|pair| pair.first() == pair.last()) {
+            return bad("column page: a column has two zone blocks");
+        }
+        let mut in_directory = zones.columns.clone();
+        in_directory.sort_unstable();
+        let mut total: u32 = 0;
+        for block in zone_blocks {
+            let has_pages = cells
+                .binary_search_by(|(id, _)| id.column_id.cmp(&block.column_id))
+                .is_ok();
+            if !has_pages {
+                return bad("column page: a zone block names a column the group does not have");
+            }
+            if in_directory.binary_search(&block.column_id).is_ok() {
+                return bad("column page: a column has zones in the directory and a zone block");
+            }
+            if block.length == 0 {
+                return bad("column page: an empty zone block");
+            }
+            total = total.checked_add(block.length).ok_or(Error::InvalidHeader(
+                "column page: zone blocks overflow u32",
+            ))?;
+        }
+        Ok(total)
+    }
+
+    /// Parses the payload of the zone block this directory lists for column
+    /// `column_id`: that column's zones, and nothing else.
     ///
     /// # Errors
     ///
-    /// [`Error::InvalidHeader`] for a truncated payload, trailing bytes, a
-    /// zone for a column the directory already has zones for, or zones
-    /// [`Self::new`] would refuse.
-    pub fn decode_zone_block(&self, bytes: &[u8]) -> Result<PageZones> {
+    /// [`Error::InvalidHeader`] for a truncated payload, trailing bytes, zones
+    /// of any column but `column_id`, or zones [`Self::new`] would refuse. A
+    /// block holding another column's zones is a block in another's place, and
+    /// its zones would prune this column's row pages by that column's values.
+    pub fn decode_zone_block(&self, column_id: u16, bytes: &[u8]) -> Result<PageZones> {
         let mut rest = bytes;
         let zones = PageZones::decode_from(&mut rest, self.row_pages.len())?;
         if !rest.is_empty() {
@@ -616,9 +679,9 @@ impl PageDirectory {
                 "ColumnZones: trailing bytes after the declared zones",
             ));
         }
-        if zones.columns.iter().any(|c| self.zones.columns.contains(c)) {
+        if zones.columns != [column_id] {
             return Err(Error::InvalidHeader(
-                "ColumnZones: a column has zones in the directory and the zone block",
+                "ColumnZones: a zone block holds zones of another column than its own",
             ));
         }
         let mut cells: Vec<(PageId, u16)> =
@@ -697,7 +760,7 @@ impl PageDirectory {
         row_pages: Vec<u32>,
         pages: impl IntoIterator<Item = (PageId, u16, u32)>,
         zones: PageZones,
-        zones_len: u32,
+        zone_blocks: Vec<ZoneBlock>,
     ) -> Result<Self> {
         let mut offset: u32 = 0;
         let mut entries = Vec::new();
@@ -712,19 +775,33 @@ impl PageDirectory {
                 "column page: group length overflows u32",
             ))?;
         }
-        Self::new(row_count, group_tag, row_pages, entries, zones, zones_len)
+        Self::new(row_count, group_tag, row_pages, entries, zones, zone_blocks)
     }
 
-    /// On-disk length of the zone block after the pages, zero when the group
-    /// has none.
+    /// The zone blocks after the pages, in the order they follow them.
     #[must_use]
-    pub fn zones_len(&self) -> u32 {
-        self.zones_len
+    pub fn zone_blocks(&self) -> &[ZoneBlock] {
+        &self.zone_blocks
+    }
+
+    /// Where column `column_id`'s zone block starts, measured from the end
+    /// of the pages, and its on-disk length; `None` when the column has none.
+    #[must_use]
+    pub fn zone_block(&self, column_id: u16) -> Option<(u32, u32)> {
+        let mut start: u32 = 0;
+        for block in &self.zone_blocks {
+            if block.column_id == column_id {
+                return Some((start, block.length));
+            }
+            // `new` proved the lengths sum within a u32.
+            start = start.wrapping_add(block.length);
+        }
+        None
     }
 
     /// The on-disk length of the whole group this directory describes, given
     /// the directory's own on-disk length: the directory, its pages, then its
-    /// zone block. `None` when it overflows a `u32`. Every walk that frames a
+    /// zone blocks. `None` when it overflows a `u32`. Every walk that frames a
     /// group from its directory takes its extent from here, so none of them
     /// can leave a part of the group out.
     #[must_use]
@@ -798,12 +875,27 @@ impl PageDirectory {
         &self.zones
     }
 
+    /// The bytes the decoded directory holds on the heap, which is what it
+    /// costs the block cache to keep it.
+    #[must_use]
+    pub fn heap_size(&self) -> usize {
+        use core::mem::size_of;
+
+        (self.row_pages.len() + self.row_page_starts.len()) * size_of::<u32>()
+            + self.entries.len() * size_of::<PageEntry>()
+            + self.zone_blocks.len() * size_of::<ZoneBlock>()
+            + self.zones.columns.len() * size_of::<u16>()
+            + self.zones.slots.len() * size_of::<ZoneSlot>()
+            + self.zones.bounds.len()
+    }
+
     /// Serializes the directory into `out`.
     pub fn encode_into(&self, out: &mut Vec<u8>) {
         out.reserve(
             HEADER_LEN
                 + self.row_pages.len() * ROW_PAGE_LEN
                 + self.entries.len() * ENTRY_LEN
+                + self.zone_blocks.len() * ZONE_BLOCK_LEN
                 + self.zones.encoded_len(),
         );
         out.push(VERSION);
@@ -823,8 +915,13 @@ impl PageDirectory {
         out.extend_from_slice(&count.to_le_bytes());
         out.extend_from_slice(&self.row_count.to_le_bytes());
         out.extend_from_slice(&self.group_tag.to_le_bytes());
+        #[expect(
+            clippy::cast_possible_truncation,
+            reason = "the zone block count is bounded to u16::MAX by `new`"
+        )]
+        let zone_block_count = self.zone_blocks.len() as u16;
         out.extend_from_slice(&row_page_count.to_le_bytes());
-        out.extend_from_slice(&self.zones_len.to_le_bytes());
+        out.extend_from_slice(&zone_block_count.to_le_bytes());
         for rows in &self.row_pages {
             out.extend_from_slice(&rows.to_le_bytes());
         }
@@ -835,6 +932,10 @@ impl PageDirectory {
             out.push(entry.id.part);
             out.push(0);
             out.extend_from_slice(&entry.row_page.to_le_bytes());
+        }
+        for block in &self.zone_blocks {
+            out.extend_from_slice(&block.column_id.to_le_bytes());
+            out.extend_from_slice(&block.length.to_le_bytes());
         }
         self.zones.encode_into(out);
     }
@@ -863,7 +964,7 @@ impl PageDirectory {
         let row_count = u32::from_le_bytes(take(&mut rest).ok_or(ERR)?);
         let group_tag = u64::from_le_bytes(take(&mut rest).ok_or(ERR)?);
         let row_page_count = usize::from(u16::from_le_bytes(take(&mut rest).ok_or(ERR)?));
-        let zones_len = u32::from_le_bytes(take(&mut rest).ok_or(ERR)?);
+        let zone_block_count = usize::from(u16::from_le_bytes(take(&mut rest).ok_or(ERR)?));
 
         // The declared counts are on-disk data, so they bound nothing until
         // the bytes behind them are seen to exist: reserve for what the
@@ -892,13 +993,19 @@ impl PageDirectory {
                 row_page,
             });
         }
+        let mut zone_blocks = Vec::with_capacity(zone_block_count.min(rest.len() / ZONE_BLOCK_LEN));
+        for _ in 0..zone_block_count {
+            let column_id = u16::from_le_bytes(take(&mut rest).ok_or(ERR)?);
+            let length = u32::from_le_bytes(take(&mut rest).ok_or(ERR)?);
+            zone_blocks.push(ZoneBlock { column_id, length });
+        }
         let zones = PageZones::decode_from(&mut rest, row_page_count)?;
         if !rest.is_empty() {
             return Err(Error::InvalidHeader(
                 "ColumnPageDirectory: trailing bytes after the declared zones",
             ));
         }
-        Self::new(row_count, group_tag, row_pages, entries, zones, zones_len)
+        Self::new(row_count, group_tag, row_pages, entries, zones, zone_blocks)
     }
 }
 

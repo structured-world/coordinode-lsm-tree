@@ -250,7 +250,7 @@ impl Scanner {
     }
 
     /// Reads one columnar row group from the stream — its directory, then its
-    /// pages, which follow it back to back, then its zone block if it has one
+    /// pages, which follow it back to back, then its zone blocks if it has any
     /// — and reconstructs it into a row-major [`DataBlock`].
     ///
     /// The stream has no index entry to check the group against, so each page
@@ -310,11 +310,11 @@ impl Scanner {
             }
             pages.push(Some(page));
         }
-        // The zone block, when the group has one, closes the group. A scan of
-        // every row has no use for it, but it is read and verified like the
-        // rest, both to reach the next group and so that a stream that ends
-        // or diverges there is refused rather than misframed.
-        if directory.zones_len() > 0 {
+        // The zone blocks, when the group has any, close the group. A scan of
+        // every row has no use for them, but they are read and verified like
+        // the rest, both to reach the next group and so that a stream that
+        // ends or diverges there is refused rather than misframed.
+        for zone_block in directory.zone_blocks() {
             let zones = Self::read_block(
                 reader,
                 table_id,
@@ -331,7 +331,7 @@ impl Scanner {
                     zones.header.block_type.into(),
                 )));
             }
-            if zones.header.on_disk_size_with(ecc) != directory.zones_len() {
+            if zones.header.on_disk_size_with(ecc) != zone_block.length {
                 return Err(crate::Error::InvalidHeader(
                     "columnar: zone block length disagrees with its directory",
                 ));
@@ -341,7 +341,7 @@ impl Scanner {
         // read counters, so neither the page copies nor the rebuilt values are
         // charged.
         let pages = crate::table::row_group::RowGroupBlocks {
-            directory,
+            directory: alloc::sync::Arc::new(directory),
             pages,
             zones: None,
         }

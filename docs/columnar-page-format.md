@@ -37,8 +37,9 @@ row group, contiguous in the file:
   [ seqno, row page 0 ]
   ...
   [ value, row page r-1 ]
-  [ zone block ]                  <- statistics of the non-key columns,
-                                     when the group has several row pages
+  [ zone block, column a ]        <- statistics of each non-key column,
+  [ zone block, column b ]           one block per column, when the group
+                                     has several row pages
 ```
 
 The group's rows are cut into **row pages**: consecutive row ranges shared by
@@ -93,7 +94,7 @@ to decode the key page just to count rows.
 | `row_count` | `u32` | rows in the group; the row pages sum to exactly this |
 | `group_tag` | `u64` | names the group; every page repeats it in its stamp |
 | `row_page_count` | `u16` | row pages that follow |
-| `zones_len` | `u32` | on-disk length of the zone block after the pages, zero without one |
+| `zone_block_count` | `u16` | zone blocks listed after the pages' entries |
 
 Then, for each row page in row order, its row count as a `u32`: none is zero,
 and together they are the group's rows. Then, for each page:
@@ -118,10 +119,20 @@ part missing a row page would hand back a batch short of a column for those
 rows, and a reader cannot tell a page that was never written from one that
 was lost.
 
-The directory ends with the key column's statistics zones (below). The
-directory, its pages and its zone block fill the group exactly; a reader
-refuses a group whose index entry and directory disagree about where it
-ends.
+Then, for each zone block in the order the blocks follow the pages, the
+column whose zones it holds (`u16`) and its on-disk length (`u32`). The
+directory ends with the key column's statistics zones (below). The directory,
+its pages and its zone blocks fill the group exactly; a reader refuses a group
+whose index entry and directory disagree about where it ends.
+
+**A read caches the directory decoded**, not as the block it was read as. A
+directory of many row pages is dozens to hundreds of entries whose decode
+sorts them to prove the page grid, and every read of the group starts from it
+(a point read twice: once for the key pages, once for the row pages holding
+the key). On the mixed-layout point reads over a columnar base, at 64 KiB
+groups of 4 KiB row pages, re-decoding it per read took 1.43 s where 4 KiB
+groups take 232 ms; cached decoded it takes 295 ms, reading 222 B per row
+where 4 KiB groups read 330.
 
 ### Statistics zones
 
@@ -141,18 +152,22 @@ Zones live in two places, chosen by who reads them:
   directory first, and the key zones take it from there to the one key page
   that can hold its key, instead of reading every key page of the group. A key
   is short, so these cost a few dozen bytes per row page.
-- **Every other bytes column's zones are in a `ColumnZones` block after the
-  pages.** Only a read that prunes on one of those columns reads it. A full
-  scan and a projection that does not prune never pay for them; that matters,
-  because a value column's zones are its widest (see below), and every
-  partial read of the group reads the directory.
+- **Every other bytes column's zones are in a `ColumnZones` block of their
+  own after the pages.** Only a read that prunes on that column reads it. A
+  full scan and a projection that does not prune never pay for any; a read
+  that prunes on a narrow column does not pay for a wide column's zones,
+  whose 64-byte bounds make them the widest.
 
 Every zone in the directory would make every partial read pay for all of
 them. Measured over 4 KiB values in 4 KiB row pages, a key-only projection
 then reads 1/15 of what a scan of keys and values reads, where the pages
 alone give it well under 1/20: the value zones push the directory past its
-4 KiB prefix. Parquet makes the same separation between its offset index and
-its column index, the second read only to prune.
+4 KiB prefix. One zone block for every non-key column would make a pruning
+read pay for the columns it does not prune on: on the mixed-layout sparse
+scan, a predicate on an 8-byte field read 7296 B per returned row with one
+block, and 6157 B with one per column. Parquet makes the same separation, an
+offset index apart from a column index per column, each column's read only
+to prune on it.
 
 A zone's bounds are cut to 64 bytes, Parquet's default for its page
 statistics. A prefix of the minimum is still a lower bound, and a prefix of
@@ -177,9 +192,11 @@ column order. A zone set is refused unless it names distinct columns the
 group has, one zone per row page and column, no more nulls than rows, the
 empty range for an all-null row page, and a lower bound no greater than the
 upper one: each of those, read as written, would prune a row page holding a
-match. The verification gates re-derive every zone from the decoded rows and
-refuse a group whose zones differ, a zone block it should not have, or one it
-lacks, as they do for the zone map.
+match. A zone block holds exactly the column the directory lists it for, so
+one moved into another column's place is refused rather than read as that
+column's. The verification gates re-derive every zone from the decoded rows
+and refuse a group whose zones differ, a zone block it should not have, or
+one it lacks, as they do for the zone map.
 
 Offsets are relative to the group, not to the file. A relative offset is what
 makes a row group relocatable by a compaction that copies it whole, and it is
@@ -276,21 +293,22 @@ figure rather than a promise of zero. Per row group, each page adds a block
 header (33 bytes: SST blocks carry no flags byte, their transform comes from
 the table descriptor), a 13-byte stamp and a 14-byte directory entry, 60
 bytes in all; each row page adds its 4-byte row count to the directory; and
-the group adds the directory's own 21-byte header, its 2-byte zone count and
+the group adds the directory's own 19-byte header, its 2-byte zone count and
 its block header once. With one row page per group, which has no zones:
 
 | Row group | 8 pages | 20 pages |
 |---|---|---|
-| 32 KiB | 540 B (1.65%) | 1260 B (3.85%) |
-| 128 KiB | 540 B (0.41%) | 1260 B (0.96%) |
-| 256 KiB | 540 B (0.21%) | 1260 B (0.48%) |
+| 32 KiB | 538 B (1.64%) | 1258 B (3.84%) |
+| 128 KiB | 538 B (0.41%) | 1258 B (0.96%) |
+| 256 KiB | 538 B (0.21%) | 1258 B (0.48%) |
 
 Row pages multiply the pages: every column part pays its 60 bytes once per
 row page. Four parts in 4 KiB row pages cost 244 bytes per row page, about 6%
 of the data; in 16 KiB row pages, 1.5%. Their zones add 7 bytes per zone plus
 its bounds: some 30 bytes of key zone per row page for 12-byte keys, in the
-directory, and up to 135 bytes per wider column in the zone block (33 bytes of
-block header per group), which only a pruning read fetches. That is what the
+directory, and up to 135 bytes per wider column in that column's zone block
+(a 33-byte block header and a 6-byte directory listing per column and group),
+which only a read pruning on that column fetches. That is what the
 page size trades against the rows a point read decodes and the pages a
 predicate skips, and why its default is chosen by measurement together with
 the group size.
@@ -323,7 +341,8 @@ page adjacent, a prefix sized for the directory plus the key page usually
 satisfies a point read in one request.
 
 The prefix is 4 KiB, or the whole group when it is smaller. A directory is
-23 bytes plus 4 per row page, 14 per page and the key zones, so 4 KiB holds
+21 bytes plus 4 per row page, 14 per page, 6 per zone block and the key
+zones, so 4 KiB holds
 the directory of some 250 pages, and the rest of it goes to the start of the
 key pages. A longer directory, which many row pages of a wide schema make, is
 completed by a second request. A
@@ -346,8 +365,8 @@ pages for the projected columns' parts, and only those are read.
 
 **Predicate scan.** The zone map admits or skips the group; for a group it
 admits, the zones of the predicate's column admit or skip each row page, from
-the directory for the key column and from the zone block for any other. Only
-the admitted row pages' pages of the projected columns are read.
+the directory for the key column and from that column's zone block for any
+other. Only the admitted row pages' pages of the projected columns are read.
 
 **Full scan.** Every page of the group is wanted, so the directory read is
 followed by one coalesced read of the whole remainder — the same single

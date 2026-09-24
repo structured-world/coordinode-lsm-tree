@@ -1738,11 +1738,11 @@ impl Table {
             .verbatim
             .map(|(raw, header, _)| (raw, u64::from(header.uncompressed_length)));
         let mut pages = alloc::vec::Vec::with_capacity(decoded.entries().len());
-        let mut zones = None;
+        let mut zone_blocks = decoded.zone_blocks().iter();
         for (handle, role) in blocks {
             let block = self.salvage_load_block(&handle, role)?;
             ecc_recovered |= block.ecc_recovered;
-            // Every block of the group, the zone block included, goes into
+            // Every block of the group, the zone blocks included, goes into
             // the verbatim copy: the copy is the group whole or nothing.
             verbatim = match (verbatim, block.verbatim) {
                 (Some((mut raw, uncompressed)), Some((block_raw, header, _))) => {
@@ -1752,18 +1752,26 @@ impl Table {
                 _ => None,
             };
             if role == BlockType::ColumnZones {
-                // Decoded so a zone block that verifies as a block but not as
-                // zones fails the group here, not in a later read.
-                zones = Some(decoded.decode_zone_block(&block.block.data)?);
+                // Decoded against the column the directory files it under, so
+                // a zone block that verifies as a block but not as that
+                // column's zones fails the group here, not in a later read.
+                let column_id =
+                    zone_blocks
+                        .next()
+                        .map(|z| z.column_id)
+                        .ok_or(crate::Error::InvalidHeader(
+                            "columnar: a zone block the directory does not list",
+                        ))?;
+                decoded.decode_zone_block(column_id, &block.block.data)?;
             } else {
                 pages.push(Some(block.block));
             }
         }
         Ok(SalvageRowGroup {
             group: crate::table::row_group::RowGroupBlocks {
-                directory: decoded,
+                directory: alloc::sync::Arc::new(decoded),
                 pages,
-                zones,
+                zones: None,
             },
             verbatim,
             ecc_recovered,
@@ -2164,16 +2172,15 @@ impl Table {
                 BlockType::ColumnPage,
             ));
         }
-        if directory.zones_len() > 0 {
-            let offset =
-                *group.offset() + u64::from(directory_len) + u64::from(directory.pages_len());
+        // The zone blocks, in the order the directory lists them.
+        let mut offset =
+            *group.offset() + u64::from(directory_len) + u64::from(directory.pages_len());
+        for zone_block in directory.zone_blocks() {
             blocks.push((
-                BlockHandle::new(
-                    crate::table::block::BlockOffset(offset),
-                    directory.zones_len(),
-                ),
+                BlockHandle::new(crate::table::block::BlockOffset(offset), zone_block.length),
                 BlockType::ColumnZones,
             ));
+            offset += u64::from(zone_block.length);
         }
         Ok(blocks)
     }
@@ -6252,19 +6259,27 @@ impl Table {
         let (directory, frame) = self.load_block_from_disk(&directory_handle, directory_role)?;
         let directory_decoded = crate::table::column_page::PageDirectory::decode(&directory.data)?;
         let mut pages = alloc::vec::Vec::with_capacity(directory_decoded.entries().len());
-        let mut zones = None;
+        let mut block_zones = alloc::vec::Vec::with_capacity(directory_decoded.zone_blocks().len());
+        let mut listed = directory_decoded.zone_blocks().iter();
         for (handle, role) in blocks {
             let block = self.load_block_from_disk(&handle, role)?.0;
             if role == BlockType::ColumnZones {
-                zones = Some(directory_decoded.decode_zone_block(&block.data)?);
+                let column_id =
+                    listed
+                        .next()
+                        .map(|z| z.column_id)
+                        .ok_or(crate::Error::InvalidHeader(
+                            "columnar: a zone block the directory does not list",
+                        ))?;
+                block_zones.push(directory_decoded.decode_zone_block(column_id, &block.data)?);
             } else {
                 pages.push(Some(block));
             }
         }
         let group = crate::table::row_group::RowGroupBlocks {
-            directory: directory_decoded,
+            directory: alloc::sync::Arc::new(directory_decoded),
             pages,
-            zones,
+            zones: None,
         };
         // The gates are verification, which the counters leave out; they
         // re-derive per-group statistics, so the row pages are joined.
@@ -6273,13 +6288,18 @@ impl Table {
             .into_batch()?;
         // The row pages' zones decide which pages a read skips, so they are
         // authenticated like the zone map: re-derived from the decoded rows,
-        // both the directory's and the zone block's, and a zone block that
-        // should not exist is as wrong as one that is missing. A zone that
-        // disagrees would let a read prune a row page holding a match, and
-        // nothing on the read path looks at the rows it pruned.
+        // the directory's and every zone block's, in the order the writer
+        // lays them out; a zone block that should not exist is as wrong as
+        // one that is missing. A zone that disagrees would let a read prune a
+        // row page holding a match, and nothing on the read path looks at the
+        // rows it pruned.
         let (key_zones, other_zones) = batch.group_zones(group.directory.row_pages())?;
-        let block_zones = group.zones.unwrap_or_default();
-        if key_zones != *group.directory.zones() || other_zones != block_zones {
+        let expected: alloc::vec::Vec<_> = other_zones
+            .columns()
+            .iter()
+            .map(|&column_id| other_zones.only(|c| c == column_id))
+            .collect();
+        if key_zones != *group.directory.zones() || expected != block_zones {
             return Err(crate::Error::InvalidHeader(
                 "columnar: row page statistics disagree with the group's rows",
             ));

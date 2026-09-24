@@ -171,11 +171,10 @@ pub fn load_block(
     #[cfg(feature = "metrics")]
     record_block_decoded(metrics, charge, produced);
     let (block, ecc_status, recovery) = read?;
-    admit_read_block(
+    let block = admit_read_block(
         table_id,
         path,
         file_accessor,
-        cache,
         handle,
         block_type,
         compression,
@@ -190,11 +189,17 @@ pub fn load_block(
         block,
         ecc_status,
         recovery,
-    )
+    )?;
+    if charge.touches_cache() {
+        cache.insert_block(table_id, handle.offset(), block.clone());
+    }
+    Ok(block)
 }
 
 /// Takes a block just read from disk into the engine: counts it, checks its
-/// role, schedules a heal when ECC had to correct it, and caches it.
+/// role, and schedules a heal when ECC had to correct it. Caching it is the
+/// caller's, which knows the form later reads want it in: a block as read, or
+/// a row group's directory already decoded.
 ///
 /// Everything [`load_block`] does after the read and its decode charge, split
 /// out so a caller that read several blocks in one request — a columnar row
@@ -210,7 +215,6 @@ pub(crate) fn admit_read_block(
     table_id: GlobalTableId,
     path: &Path,
     file_accessor: &FileAccessor,
-    cache: &Cache,
     handle: &BlockHandle,
     block_type: BlockType,
     compression: CompressionType,
@@ -268,10 +272,6 @@ pub(crate) fn admit_read_block(
             metrics,
             charge,
         );
-    }
-
-    if charge.touches_cache() {
-        cache.insert_block(table_id, handle.offset(), block.clone());
     }
 
     Ok(block)
