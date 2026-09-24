@@ -7757,3 +7757,197 @@ fn a_columnar_table_in_a_superseded_layout_is_refused_at_open() -> crate::Result
     );
     Ok(())
 }
+
+/// A one-segment columnar table of `rows` rows with `key_len`-byte keys and
+/// `value_len`-byte values, in row groups of up to `group_size` bytes.
+#[cfg(feature = "columnar")]
+fn columnar_table_file(
+    file: &std::path::Path,
+    rows: u32,
+    key_len: usize,
+    value_len: usize,
+    group_size: u32,
+) -> crate::Result<Checksum> {
+    let mut writer = Writer::new(file.to_path_buf(), 0, 0, Arc::new(StdFs))?
+        .use_columnar(true)
+        .use_data_block_size(group_size);
+    for i in 0..rows {
+        let mut key = alloc::format!("key{i:06}").into_bytes();
+        key.resize(key_len, b'k');
+        writer.write(InternalValue::from_components(
+            key,
+            alloc::vec![b'v'; value_len],
+            u64::from(i) + 1,
+            crate::ValueType::Value,
+        ))?;
+    }
+    let (_, checksum) = writer
+        .finish()?
+        .expect("finish() returns Some after writing data items");
+    Ok(checksum)
+}
+
+/// Where the page of `column_id` sits in the row group `group` names: its
+/// file offset and on-disk length.
+#[cfg(feature = "columnar")]
+fn page_extent(file: &std::path::Path, group: &BlockHandle, column_id: u16) -> (usize, usize) {
+    use crate::coding::Decode;
+    use crate::table::block::Header;
+
+    let bytes = std::fs::read(file).expect("read table");
+    let at = usize::try_from(*group.offset()).expect("offset fits");
+    let frame = bytes.get(at..).expect("group within the file");
+    let header = Header::decode_from(&mut &frame[..]).expect("directory header");
+    let payload_at = Header::header_len(header.block_type);
+    let payload = frame
+        .get(payload_at..payload_at + header.data_length as usize)
+        .expect("directory payload");
+    let directory =
+        crate::table::column_page::PageDirectory::decode(payload).expect("decode directory");
+    let entry = directory
+        .entries()
+        .iter()
+        .find(|e| e.id.column_id == column_id)
+        .expect("the group has a page for the column");
+    let directory_len = header.on_disk_size_with(None) as usize;
+    (
+        at + directory_len + entry.offset as usize,
+        entry.length as usize,
+    )
+}
+
+/// A projection reads only the pages it asked for, so a page it did not ask
+/// for is never verified: a corrupt value page fails a read that wants it and
+/// is invisible to a key-only projection. That is what per-page integrity
+/// buys; a group verified as a whole would fail both.
+#[cfg(feature = "columnar")]
+#[test]
+fn a_projection_never_reads_a_corrupt_page_it_does_not_want() -> crate::Result<()> {
+    use crate::table::columnar::{COL_USER_KEY, COL_VALUE};
+
+    let dir = tempdir()?;
+    let file = dir.path().join("table");
+    let checksum = columnar_table_file(&file, 200, 12, 256, 64 * 1_024)?;
+    let group = {
+        let table = Table::recover(test_recover_params(file.clone(), checksum))?;
+        let first = table
+            .data_block_handles()
+            .next()
+            .expect("the table has a row group")?;
+        BlockHandle::new(first.offset(), first.size())
+    };
+
+    // Flip one byte inside the value page's payload, past its block header.
+    let (value_at, value_len) = page_extent(&file, &group, COL_VALUE);
+    let mut bytes = std::fs::read(&file)?;
+    let target = value_at + value_len / 2;
+    let byte = bytes.get_mut(target).expect("byte within the page");
+    *byte ^= 0x5A;
+    std::fs::write(&file, &bytes)?;
+
+    let table = Table::recover(test_recover_params(file.clone(), checksum))?;
+    let keys = table.load_row_group(&group, Some(&[COL_USER_KEY]), ReadCharge::Foreground)?;
+    assert!(keys.row_count > 0, "the key projection reads its rows");
+
+    let table = Table::recover(test_recover_params(file, checksum))?;
+    assert!(
+        table
+            .load_row_group(&group, None, ReadCharge::Foreground)
+            .is_err(),
+        "a read that wants the corrupt page must fail its check",
+    );
+    Ok(())
+}
+
+/// A projection's pages come back exactly as a full read decodes them, on
+/// every way the reader can assemble a page's bytes: out of the directory
+/// prefix, straddling its end, and wholly beyond it, with a column skipped in
+/// between. Each projection is taken over a cold cache, so no page is served
+/// by another's read.
+#[cfg(feature = "columnar")]
+#[test]
+fn a_projection_decodes_the_same_columns_as_a_full_read() -> crate::Result<()> {
+    use crate::table::columnar::{COL_SEQNO, COL_USER_KEY, COL_VALUE};
+
+    let dir = tempdir()?;
+    let file = dir.path().join("table");
+    // 32-byte keys: the key page of a 64 KiB group outgrows the 4 KiB prefix
+    // it starts in, and the value page lies wholly past it.
+    let checksum = columnar_table_file(&file, 400, 32, 96, 64 * 1_024)?;
+    let fresh = || Table::recover(test_recover_params(file.clone(), checksum));
+    let group = {
+        let first = fresh()?
+            .data_block_handles()
+            .next()
+            .expect("the table has a row group")?;
+        BlockHandle::new(first.offset(), first.size())
+    };
+    let (key_at, key_len) = page_extent(&file, &group, COL_USER_KEY);
+    let group_at = usize::try_from(*group.offset()).expect("offset fits");
+    assert!(
+        key_at < group_at + 4_096 && key_at + key_len > group_at + 4_096,
+        "the fixture must put the key page across the prefix's end",
+    );
+
+    let full = fresh()?.load_row_group(&group, None, ReadCharge::Foreground)?;
+    let column = |id: u16| {
+        full.columns
+            .iter()
+            .find(|c| c.column_id == id)
+            .cloned()
+            .expect("the full read holds every column")
+    };
+    for projection in [
+        &[COL_USER_KEY][..],
+        &[COL_VALUE][..],
+        &[COL_USER_KEY, COL_VALUE][..],
+        &[COL_SEQNO][..],
+    ] {
+        let projected =
+            fresh()?.load_row_group(&group, Some(projection), ReadCharge::Foreground)?;
+        assert_eq!(projected.row_count, full.row_count);
+        let expected: Vec<_> = full
+            .columns
+            .iter()
+            .filter(|c| projection.contains(&c.column_id))
+            .map(|c| column(c.column_id))
+            .collect();
+        assert_eq!(
+            projected.columns, expected,
+            "projection {projection:?} must decode what the full read decodes",
+        );
+    }
+    Ok(())
+}
+
+/// A directory header claiming more bytes than the row group holds is
+/// refused before any page offset is derived from it.
+#[cfg(feature = "columnar")]
+#[test]
+fn a_projection_refuses_a_directory_longer_than_its_group() -> crate::Result<()> {
+    use crate::table::columnar::COL_USER_KEY;
+
+    let dir = tempdir()?;
+    let file = dir.path().join("table");
+    let checksum = columnar_table_file(&file, 200, 12, 256, 64 * 1_024)?;
+    let group = {
+        let table = Table::recover(test_recover_params(file.clone(), checksum))?;
+        let first = table
+            .data_block_handles()
+            .next()
+            .expect("the table has a row group")?;
+        BlockHandle::new(first.offset(), first.size())
+    };
+    // A shorter index entry than the group really is: the directory header,
+    // which is intact, now claims more than the entry spans.
+    let clipped = BlockHandle::new(group.offset(), 64);
+    let table = Table::recover(test_recover_params(file, checksum))?;
+    let err = table
+        .load_row_group(&clipped, Some(&[COL_USER_KEY]), ReadCharge::Foreground)
+        .expect_err("a directory past the group's end must be refused");
+    assert!(
+        matches!(err, crate::Error::InvalidHeader(_)),
+        "expected a framing refusal, got {err:?}",
+    );
+    Ok(())
+}

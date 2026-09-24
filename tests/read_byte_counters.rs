@@ -741,6 +741,108 @@ fn a_narrow_projection_over_wide_rows_copies_nothing() {
     );
 }
 
+/// A columnar segment whose row groups hold many rows: 128 KiB groups, the
+/// geometry pages are for. At a 4 KiB group of 4 KiB rows every group is one
+/// row and one device read, and no page layout can make a projection cheaper.
+fn wide_columnar_segment(n: u32, value_len: usize) -> (TempDir, Tree) {
+    let folder = get_tmp_folder();
+    let AnyTree::Standard(tree) = Config::new(
+        folder.path(),
+        SequenceNumberCounter::default(),
+        SequenceNumberCounter::default(),
+    )
+    .data_block_size_policy(lsm_tree::config::BlockSizePolicy::all(128 * 1_024))
+    .open()
+    .expect("open") else {
+        panic!("expected a standard tree");
+    };
+    tree.update_runtime_config(|cfg| {
+        cfg.columnar = true;
+        cfg.zone_map = true;
+    })
+    .expect("enable columnar");
+    for i in 0..n {
+        tree.insert(key(i), vec![b'v'; value_len], u64::from(i));
+    }
+    tree.flush_active_memtable(0).expect("flush");
+    (folder, tree)
+}
+
+/// Bytes read and decoded by one pass of `projection` over a fresh
+/// [`wide_columnar_segment`], so no pass is served by another's cache.
+fn projection_cost(n: u32, value_len: usize, projection: &[u16]) -> (u64, u64) {
+    let (_folder, tree) = wide_columnar_segment(n, value_len);
+    let m = tree.metrics();
+    let (read, decoded) = (m.bytes_read(), m.bytes_decoded());
+    let mut rows = 0;
+    for batch in tree
+        .columnar_scan(projection, None, SeqNo::MAX, ..)
+        .expect("scan")
+    {
+        rows += batch.expect("batch").row_count;
+    }
+    assert_eq!(rows, n, "the projection must return every row");
+    (m.bytes_read() - read, m.bytes_decoded() - decoded)
+}
+
+#[test]
+fn a_narrow_projection_over_wide_rows_reads_and_decodes_only_its_pages() {
+    // The acceptance the page layout exists for: projecting the keys out of
+    // rows that carry a 4 KiB value must not pay for the values. A smaller
+    // returned batch with the same bytes read would be a cosmetic projection,
+    // so both counters are held to it, against a pass that reads the values.
+    let (keys_read, keys_decoded) = projection_cost(1_000, 4_096, &[COL_USER_KEY]);
+    let (all_read, all_decoded) = projection_cost(1_000, 4_096, &[COL_USER_KEY, COL_VALUE]);
+    assert!(
+        keys_read > 0 && keys_decoded > 0,
+        "the key pass must read its pages",
+    );
+    assert!(
+        keys_read * 20 < all_read,
+        "a key-only projection read {keys_read} B against {all_read} B for keys and values",
+    );
+    assert!(
+        keys_decoded * 20 < all_decoded,
+        "a key-only projection decoded {keys_decoded} B against {all_decoded} B for keys and \
+         values",
+    );
+}
+
+#[test]
+fn a_projection_repeated_from_the_cache_reads_nothing_and_a_wider_one_only_new_pages() {
+    // Pages are cached one by one, so a second projection over the same rows
+    // is served from the cache, and a wider one reads only the pages the first
+    // did not: the directory and the key pages are already there.
+    let (_folder, tree) = wide_columnar_segment(1_000, 4_096);
+    let m = tree.metrics();
+    let scan = |projection: &[u16]| {
+        for batch in tree
+            .columnar_scan(projection, None, SeqNo::MAX, ..)
+            .expect("scan")
+        {
+            batch.expect("batch");
+        }
+    };
+
+    scan(&[COL_USER_KEY]);
+    let after_keys = m.bytes_read();
+    scan(&[COL_USER_KEY]);
+    assert_eq!(
+        m.bytes_read(),
+        after_keys,
+        "a repeated projection must be served from the cache",
+    );
+
+    scan(&[COL_USER_KEY, COL_VALUE]);
+    let widened = m.bytes_read() - after_keys;
+    let (all_read, _) = projection_cost(1_000, 4_096, &[COL_USER_KEY, COL_VALUE]);
+    assert!(
+        widened > 0 && widened < all_read,
+        "widening the projection read {widened} B; a cold pass for the same columns reads \
+         {all_read} B, and the cached directory and key pages must not be read again",
+    );
+}
+
 #[test]
 fn a_range_bounded_columnar_scan_of_one_segment_counts_its_filter_gather() {
     // A bounded range over a single segment masks the rows outside it, which

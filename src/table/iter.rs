@@ -529,22 +529,23 @@ impl Iter {
         if self.columnar {
             #[cfg(feature = "columnar")]
             {
-                let group = crate::table::util::load_row_group(
-                    self.table_id,
-                    &self.path,
-                    &self.file_accessor,
-                    &self.cache,
-                    handle,
-                    self.compression,
-                    self.encryption.as_deref(),
-                    self.ecc,
+                let group = crate::table::row_group::GroupRead {
+                    table_id: self.table_id,
+                    path: &self.path,
+                    file_accessor: &self.file_accessor,
+                    cache: &self.cache,
+                    group: handle,
+                    compression: self.compression,
+                    encryption: self.encryption.as_deref(),
+                    ecc: self.ecc,
                     #[cfg(zstd_any)]
-                    self.zstd_dictionary.as_deref(),
-                    self.heal_hints.as_ref().map(AsRef::as_ref),
+                    zstd_dict: self.zstd_dictionary.as_deref(),
+                    heal_hints: self.heal_hints.as_ref().map(AsRef::as_ref),
                     #[cfg(feature = "metrics")]
-                    &self.metrics,
-                    self.charge,
-                )?;
+                    metrics: &self.metrics,
+                    charge: self.charge,
+                }
+                .load(None)?;
                 // What decoding the pages copied out of them, plus the values
                 // rebuilt from sub-columns below. Keys, and values of a single
                 // bytes column, are views into the decoded columns and cost

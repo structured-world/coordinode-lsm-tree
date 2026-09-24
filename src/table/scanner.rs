@@ -308,13 +308,13 @@ impl Scanner {
                     "columnar: page length disagrees with its directory entry",
                 ));
             }
-            pages.push(page);
+            pages.push(Some(page));
         }
         // The scanner feeds compaction, which is maintenance and outside the
         // read counters, so neither the page copies nor the rebuilt values are
         // charged.
         let batch =
-            crate::table::util::RowGroupBlocks { directory, pages }.to_batch(None, &mut 0)?;
+            crate::table::row_group::RowGroupBlocks { directory, pages }.to_batch(None, &mut 0)?;
         DataBlock::from_column_batch(batch, restart_interval, &mut 0)
     }
 

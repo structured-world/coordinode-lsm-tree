@@ -26,6 +26,8 @@ pub(crate) mod multi_writer;
 pub(crate) mod regions;
 #[cfg(feature = "std")]
 mod relocate;
+#[cfg(feature = "columnar")]
+pub(crate) mod row_group;
 mod scanner;
 pub(crate) mod seqno_bounds;
 pub mod util;
@@ -393,7 +395,7 @@ pub(crate) struct SalvageRowGroup {
     /// The group's verified blocks. Left undecoded so the walk can tell a
     /// group whose bytes did not read from one whose content does not decode:
     /// the two are dropped for different reasons and reported differently.
-    pub group: crate::table::util::RowGroupBlocks,
+    pub group: crate::table::row_group::RowGroupBlocks,
     /// `Some((raw_group_bytes, uncompressed_length))` when every block of the
     /// group qualified for a verbatim copy; `None` otherwise, and the caller
     /// re-encodes the decoded group.
@@ -939,10 +941,11 @@ impl Table {
     /// that consumes one goes through here, so the page format is known to
     /// exactly one reader.
     ///
-    /// Every page is fetched even when `wanted` selects few of them: the
-    /// group is one request either way, and a skipped page is only not
-    /// decoded. Fetching only the selected pages is the next step, and it
-    /// changes nothing a caller sees.
+    /// With `wanted`, only the pages of the selected columns are read and
+    /// decoded, after the directory
+    /// ([`GroupRead::load`](crate::table::row_group::GroupRead::load)); a
+    /// narrow projection over wide rows does not pay for the columns it
+    /// skips.
     ///
     /// `charge` applies to the read and to what decoding the pages copies out
     /// of them, which a counted read charges to the gather counter before the
@@ -960,22 +963,23 @@ impl Table {
         wanted: Option<&[u16]>,
         charge: ReadCharge,
     ) -> crate::Result<crate::table::columnar::ColumnBatch> {
-        let group = crate::table::util::load_row_group(
-            self.global_id(),
-            &self.path,
-            &self.file_accessor,
-            &self.cache,
-            handle,
-            self.metadata.data_block_compression,
-            self.encryption.as_deref(),
-            self.metadata.ecc_params,
+        let group = crate::table::row_group::GroupRead {
+            table_id: self.global_id(),
+            path: &self.path,
+            file_accessor: &self.file_accessor,
+            cache: &self.cache,
+            group: handle,
+            compression: self.metadata.data_block_compression,
+            encryption: self.encryption.as_deref(),
+            ecc: self.metadata.ecc_params,
             #[cfg(zstd_any)]
-            self.zstd_dictionary.as_deref(),
-            self.heal_hints.get().map(AsRef::as_ref),
+            zstd_dict: self.zstd_dictionary.as_deref(),
+            heal_hints: self.heal_hints.get().map(AsRef::as_ref),
             #[cfg(feature = "metrics")]
-            &self.metrics,
+            metrics: &self.metrics,
             charge,
-        )?;
+        }
+        .load(wanted)?;
         let mut copied = 0usize;
         let batch = group.to_batch(wanted, &mut copied);
         #[cfg(feature = "metrics")]
@@ -1730,10 +1734,10 @@ impl Table {
                 }
                 _ => None,
             };
-            pages.push(page.block);
+            pages.push(Some(page.block));
         }
         Ok(SalvageRowGroup {
-            group: crate::table::util::RowGroupBlocks {
+            group: crate::table::row_group::RowGroupBlocks {
                 directory: decoded,
                 pages,
             },
@@ -2036,7 +2040,7 @@ impl Table {
             )));
         }
         let directory = crate::table::column_page::PageDirectory::decode(&directory_block.data)?;
-        crate::table::util::check_group_extent(group, directory_len, &directory)?;
+        crate::table::row_group::check_group_extent(group, directory_len, &directory)?;
 
         let mut blocks = alloc::vec::Vec::with_capacity(directory.entries().len() + 1);
         blocks.push((directory_handle, BlockType::ColumnPageDirectory));
@@ -6119,9 +6123,9 @@ impl Table {
         let directory_decoded = crate::table::column_page::PageDirectory::decode(&directory.data)?;
         let mut pages = alloc::vec::Vec::with_capacity(directory_decoded.entries().len());
         for (handle, role) in blocks {
-            pages.push(self.load_block_from_disk(&handle, role)?.0);
+            pages.push(Some(self.load_block_from_disk(&handle, role)?.0));
         }
-        let batch = crate::table::util::RowGroupBlocks {
+        let batch = crate::table::row_group::RowGroupBlocks {
             directory: directory_decoded,
             pages,
         }

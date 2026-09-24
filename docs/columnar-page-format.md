@@ -197,6 +197,13 @@ header, and extends the read only if the directory did not fit. With the key
 page adjacent, a prefix sized for the directory plus the key page usually
 satisfies a point read in one request.
 
+The prefix is 4 KiB, or the whole group when it is smaller. A directory is
+15 bytes plus 12 per page, so 4 KiB holds the directory of any schema short
+of some 330 pages, and the rest of it goes to the start of the key page. A
+page the prefix covers, wholly or in part, is served from it rather than
+asked for again; the reader then requests each run of consecutive wanted
+pages that are not cached as one range.
+
 ## What a read does
 
 **Point read.** Index gives the row group's extent. One read covers
