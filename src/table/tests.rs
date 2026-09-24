@@ -5279,8 +5279,13 @@ fn predict_heal_streams_the_same_digest_as_materializing_corrections() -> crate:
     let mut corrections: Vec<(u64, Vec<u8>)> = Vec::new();
     for entry in table.block_index.iter() {
         let keyed = entry?;
-        if let Some(c) = table.heal_correction_for_block(fh.as_ref(), &keyed, &transform)? {
-            corrections.push(c);
+        let entry_handle = crate::table::BlockHandle::new(keyed.offset(), keyed.size());
+        for (handle, role) in table.data_unit_blocks(&entry_handle)? {
+            if let Some(c) =
+                table.heal_correction_for_block(fh.as_ref(), handle, role, &transform)?
+            {
+                corrections.push(c);
+            }
         }
     }
     let materialized =
@@ -7698,6 +7703,57 @@ fn recover_salvage_degrades_a_persistent_filter_index_read() -> crate::Result<()
     assert!(
         recovered.salvage_degraded_a_rebuildable_section(),
         "the recovered table must report the degraded rebuildable section",
+    );
+    Ok(())
+}
+
+/// A columnar table stamped with a layout this release does not read is
+/// refused at OPEN, as the typed format error that names the converter.
+///
+/// The alternative is what makes this matter: the table would open, and the
+/// first read of a row group would fail as a block-role mismatch. Salvage and
+/// repair read that as damage — the bytes are not what the index says they
+/// are — and drop the table, so a store awaiting conversion would lose every
+/// columnar table the first time anyone repaired it.
+#[cfg(feature = "columnar")]
+#[test]
+fn a_columnar_table_in_a_superseded_layout_is_refused_at_open() -> crate::Result<()> {
+    let dir = tempdir()?;
+    let sst = dir.path().join("table");
+    let mut writer = Writer::new(sst.clone(), 0, 0, Arc::new(StdFs))?.use_columnar(true);
+    for i in 0..64_u32 {
+        writer.write(InternalValue::from_components(
+            alloc::format!("key{i:05}").into_bytes(),
+            b"v".as_slice(),
+            0,
+            crate::ValueType::Value,
+        ))?;
+    }
+    assert!(writer.finish()?.is_some(), "table is non-empty");
+
+    // Stamp the table as the layout before row groups had pages. Both meta
+    // mirrors agree, so this is not a mirror disagreement: the table simply
+    // says it is in a format this release does not read.
+    crate::test_forge::forge_meta_value_both_mirrors(&sst, b"descriptor#columnar_format", &[1])?;
+    let checksum = Checksum::from_raw(crate::repair::compute_table_checksum(&StdFs, &sst)?);
+
+    let Err(err) = Table::recover(test_recover_params(sst, checksum)) else {
+        panic!("a table in a superseded columnar layout must not open");
+    };
+    assert!(
+        matches!(
+            err,
+            crate::Error::UnsupportedFormat {
+                part: crate::FormatPart::Columnar,
+                found: Some(1),
+                expected: crate::table::meta::COLUMNAR_FORMAT_VERSION,
+            }
+        ),
+        "expected the columnar format refusal, got {err:?}",
+    );
+    assert!(
+        err.is_environmental(),
+        "repair must propagate the refusal rather than grade the table as damaged",
     );
     Ok(())
 }

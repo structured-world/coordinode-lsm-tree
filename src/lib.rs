@@ -524,7 +524,7 @@ pub use {
     comparator::{DefaultUserComparator, SharedComparator, UserComparator},
     compression::CompressionType,
     config::{Config, KvSeparationOptions, TreeType},
-    error::{Error, Result},
+    error::{Error, FormatPart, Result},
     format_version::FormatVersion,
     iter_guard::IterGuard as Guard,
     memtable::{Memtable, MemtableId},

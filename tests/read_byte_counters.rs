@@ -714,14 +714,13 @@ fn streaming_a_single_segment_copies_nothing() {
 }
 
 #[test]
-fn a_narrow_projection_over_wide_rows_counts_the_columns_it_detaches() {
-    // A key-only projection over rows carrying a large value covers a sliver
-    // of each block, so the decoder copies the key column out rather than
-    // keep the whole block alive for it. That copy is a gather like any
-    // other: without a predicate, delete mask or range bound no later stage
-    // charges anything, so if the decode-time copy went uncounted a
-    // projection would look zero-copy exactly when it copies every byte it
-    // returns.
+fn a_narrow_projection_over_wide_rows_copies_nothing() {
+    // A key-only projection over rows carrying a large value: each column is
+    // its own page, so the key column comes back as a view of the key page
+    // alone, which pins no value bytes, and nothing has to be detached to
+    // avoid holding the group. Without a predicate, delete mask or range bound
+    // no later stage gathers either. A copy charged here would be one the
+    // read did not make, or a view the reader started detaching again.
     let (_folder, tree) = columnar_segment(1_000, 4_096);
     let m = tree.metrics();
     let before = m.bytes_copied();
@@ -736,9 +735,9 @@ fn a_narrow_projection_over_wide_rows_counts_the_columns_it_detaches() {
     assert!(returned > 0, "the scan must return the keys");
 
     let copied = m.bytes_copied() - before;
-    assert!(
-        copied >= returned,
-        "the projection detached {returned} B of keys from the blocks but charged {copied} B",
+    assert_eq!(
+        copied, 0,
+        "the projection returned {returned} B of keys as page views but charged {copied} B",
     );
 }
 
@@ -1318,6 +1317,103 @@ fn a_parallel_sub_compaction_counts_nothing_it_reads() -> lsm_tree::Result<()> {
         "the sub-compactions' copies were counted"
     );
     Ok(())
+}
+
+#[test]
+fn a_parallel_sub_compaction_of_columnar_segments_counts_nothing_it_reads() -> lsm_tree::Result<()>
+{
+    // The columnar twin of the test above. A columnar input is read one row
+    // group at a time, directory and pages in one request, through a loader of
+    // its own; it has to carry the maintenance charge exactly as the row-major
+    // loader does, or a compaction beside a measured read would count its
+    // whole input.
+    let folder = get_tmp_folder();
+    let AnyTree::Standard(tree) = Config::new(
+        folder.path(),
+        SequenceNumberCounter::default(),
+        SequenceNumberCounter::default(),
+    )
+    .data_block_size_policy(lsm_tree::config::BlockSizePolicy::all(512))
+    .compaction_threads(4)
+    .subcompaction_min_bytes(0)
+    .open()?
+    else {
+        panic!("expected a standard tree");
+    };
+    tree.update_runtime_config(|cfg| {
+        cfg.columnar = true;
+        cfg.zone_map = true;
+    })?;
+
+    let n = 2_000;
+    for i in 0..n {
+        tree.insert(key(i), vec![b'a'; 64], u64::from(i));
+    }
+    tree.flush_active_memtable(0)?;
+    tree.major_compact(4_096, 0)?;
+    assert!(
+        tree.table_count() > 1,
+        "the split needs several bottom tables"
+    );
+
+    for i in 0..n {
+        tree.insert(key(i), vec![b'b'; 64], u64::from(n + i));
+    }
+    tree.flush_active_memtable(0)?;
+
+    let m = tree.metrics();
+    let (read, decoded, copied) = (m.bytes_read(), m.bytes_decoded(), m.bytes_copied());
+    tree.major_compact(u64::MAX, 0)?;
+    assert!(
+        tree.table_count() > 1,
+        "the compaction must have split for the bounded path to run",
+    );
+    assert_eq!(
+        m.bytes_read(),
+        read,
+        "the sub-compactions' row-group reads were counted"
+    );
+    assert_eq!(
+        m.bytes_decoded(),
+        decoded,
+        "the sub-compactions' page decoding was counted"
+    );
+    assert_eq!(
+        m.bytes_copied(),
+        copied,
+        "the sub-compactions' page copies were counted"
+    );
+    Ok(())
+}
+
+#[test]
+fn a_columnar_read_served_from_the_block_cache_counts_no_bytes() {
+    // The columnar twin of the first test. A row group's directory and pages
+    // are cached as blocks of their own, and a group served whole from them
+    // asks the filesystem for nothing and runs no transform.
+    let (_folder, tree) = columnar_segment(2_000, 64);
+    let m = tree.metrics();
+
+    for i in 0..2_000 {
+        let _ = tree.get(key(i), SeqNo::MAX).expect("get");
+    }
+    let (read_cold, decoded_cold) = (m.bytes_read(), m.bytes_decoded());
+    assert!(read_cold > 0, "a cold pass must report bytes read");
+    assert!(decoded_cold > 0, "a cold pass must report bytes decoded");
+
+    for i in 0..2_000 {
+        let _ = tree.get(key(i), SeqNo::MAX).expect("get");
+    }
+    assert_eq!(
+        m.bytes_read(),
+        read_cold,
+        "a cached row group asked the filesystem for nothing, so read must not move",
+    );
+    assert_eq!(
+        m.bytes_decoded(),
+        decoded_cold,
+        "a cached row group is already decoded, so decoded must not move",
+    );
 }
 
 #[test]

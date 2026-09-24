@@ -6682,6 +6682,78 @@ fn repair_with_resurrection_recovers_a_corrupt_delete_bitmap_sst() -> crate::Res
     Ok(())
 }
 
+/// Repairing a store whose columnar table is in a superseded layout refuses,
+/// and leaves the table on disk.
+///
+/// The failure this guards is data loss, not an error message. Repair grades
+/// every table it cannot recover as damaged, leaves it out of the rebuilt
+/// manifest and removes it once that manifest is durable. A columnar table in
+/// the old layout fails recovery for a reason that says nothing about its
+/// bytes — they are intact and awaiting conversion — so the refusal has to
+/// travel as an error repair PROPAGATES, and the file has to still be there
+/// afterwards.
+#[cfg(feature = "columnar")]
+#[test]
+fn repairing_a_columnar_table_in_a_superseded_layout_refuses_and_keeps_it() -> crate::Result<()> {
+    use crate::table::Writer;
+    use crate::{Config, InternalValue, SequenceNumberCounter, ValueType};
+    use std::sync::Arc;
+
+    let dir = tempfile::tempdir()?;
+    let tables = dir.path().join("tables");
+    std::fs::create_dir_all(&tables)?;
+    let sst = tables.join("0");
+    let fs: Arc<dyn crate::fs::Fs> = Arc::new(StdFs);
+    {
+        let mut w = Writer::new(sst.clone(), 0, 0, Arc::clone(&fs))?.use_columnar(true);
+        for i in 0..64_u32 {
+            w.write(InternalValue::from_components(
+                format!("k{i:05}").into_bytes(),
+                format!("v{i}").into_bytes(),
+                1,
+                ValueType::Value,
+            ))?;
+        }
+        assert!(w.finish()?.is_some(), "the SST is non-empty");
+    }
+    crate::test_forge::forge_meta_value_both_mirrors(&sst, b"descriptor#columnar_format", &[1])?;
+    let before = std::fs::read(&sst)?;
+
+    let err = match Config::new(
+        dir.path(),
+        SequenceNumberCounter::default(),
+        SequenceNumberCounter::default(),
+    )
+    .repair()
+    {
+        Ok(report) => panic!(
+            "repair must refuse a columnar table it cannot read rather than rebuild \
+             without it: {report:?}",
+        ),
+        Err(e) => e,
+    };
+
+    assert!(
+        matches!(
+            err,
+            crate::Error::UnsupportedFormat {
+                part: crate::FormatPart::Columnar,
+                found: Some(1),
+                ..
+            }
+        ),
+        "repair must propagate the format refusal, not grade the table as damaged: {err:?}",
+    );
+    // The table's bytes, not merely its name: a repair that rewrote it in
+    // place would pass an existence check and still have lost the original.
+    assert_eq!(
+        std::fs::read(&sst)?,
+        before,
+        "repair must leave the refused table exactly as it found it",
+    );
+    Ok(())
+}
+
 /// `repair_with_salvage` must QUARANTINE (not salvage) an SST whose TOC HIDES a
 /// deletion section: an omitted `range_tombstones` entry makes the parsed table
 /// report NO tombstones, so the positional salvage walk would re-emit the keys

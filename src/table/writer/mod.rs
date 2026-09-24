@@ -278,10 +278,12 @@ pub struct Writer {
     /// [`Self::use_zone_map`] before the first key is added.
     use_zone_map: bool,
 
-    /// Columnar opt-in. When `true`, each spilled data block stores its entries
+    /// Columnar opt-in. When `true`, each spill writes its entries
     /// column-organized (a PAX row-group of the intrinsic fields) instead of
-    /// row-major, tagged [`BlockType::Columnar`](crate::table::block::BlockType::Columnar)
-    /// so the reader reconstructs the exact entries. Default `false` (row-major).
+    /// row-major, as a page directory followed by one
+    /// [`BlockType::ColumnPage`](crate::table::block::BlockType::ColumnPage) per
+    /// column, so the reader reconstructs the exact entries. Default `false`
+    /// (row-major).
     /// Caller wires the live runtime config in via [`Self::use_columnar`] before
     /// the first key is added.
     use_columnar: bool,
@@ -1453,44 +1455,101 @@ impl Writer {
         item_count: usize,
         zone_block_min: Option<crate::UserKey>,
     ) -> crate::Result<()> {
-        let payload = batch.encode(crate::table::columnar::CodecId::Plain)?;
-        let transform = {
-            let t = crate::table::block::BlockTransform::from_parts(
-                self.data_block_compression,
-                self.encryption.as_deref(),
-                #[cfg(zstd_any)]
-                self.zstd_dictionary.as_deref(),
-            )?;
-            #[cfg(zstd_any)]
-            let t = t.with_two_pass_seed(self.zstd_two_pass_seed);
-            if let Some(ecc) = self.ecc {
-                t.with_ecc(ecc)
-            } else {
-                t
-            }
-        };
-        let mut prepared = Block::prepare_with_flags(
-            &payload,
+        use crate::table::column_page::{PageDirectory, PageId};
+        use crate::table::columnar::CodecId;
+
+        // Pages carry the data and go through the table's data codec; the
+        // directory is a handful of offsets that no codec shrinks, and is kept
+        // plain so a reader never needs the codec or its dictionary to find
+        // out where the pages are. Both are encrypted and ECC-protected exactly
+        // like data.
+        let page_transform = self.data_transform(self.data_block_compression)?;
+        let directory_transform = self.data_transform(crate::CompressionType::None)?;
+
+        // One page per column: today every column's encoding names a single
+        // part. A codec whose encoding names several parts gets one page per
+        // part here, and nothing downstream changes, because pages are found
+        // by `(column_id, part)` and never by position.
+        let payloads = batch
+            .columns
+            .iter()
+            .map(|col| {
+                let payload = col.encode_page(batch.row_count, CodecId::Plain)?;
+                let id = PageId {
+                    column_id: col.column_id,
+                    part: 0,
+                };
+                Ok((id, payload))
+            })
+            .collect::<crate::Result<Vec<_>>>()?;
+        let pages = payloads
+            .iter()
+            .map(|(id, payload)| {
+                let prepared = Block::prepare_with_flags(
+                    payload,
+                    super::block::BlockIdentity {
+                        table_id: self.table_id,
+                        block_type: super::block::BlockType::ColumnPage,
+                        dict_id: self.data_block_compression.dict_id(),
+                        window_log: 0,
+                    },
+                    &page_transform,
+                    0, // pages carry no per-KV checksum footer
+                )?;
+                Ok((*id, prepared))
+            })
+            .collect::<crate::Result<Vec<_>>>()?;
+
+        let directory = PageDirectory::contiguous(
+            batch.row_count,
+            pages
+                .iter()
+                .map(|(id, prepared)| (*id, prepared.on_disk_len(self.ecc))),
+        )?;
+        let mut directory_payload = Vec::new();
+        directory.encode_into(&mut directory_payload);
+        let directory_block = Block::prepare_with_flags(
+            &directory_payload,
             super::block::BlockIdentity {
                 table_id: self.table_id,
-                block_type: super::block::BlockType::Columnar,
-                dict_id: self.data_block_compression.dict_id(),
+                block_type: super::block::BlockType::ColumnPageDirectory,
+                dict_id: 0,
                 window_log: 0,
             },
-            &transform,
-            0, // columnar blocks carry no per-KV checksum footer
+            &directory_transform,
+            0,
         )?;
-        let layout = core::mem::take(&mut prepared.layout);
-        let header = prepared.write_to(&mut self.file_writer)?;
-        // Per-column zone-map stats for this columnar block, derived once from
-        // the batch. Gated on the zone-map policy exactly like the row-block
+
+        // The group is written directory first, then its pages back to back,
+        // which is exactly the layout `PageDirectory::contiguous` recorded.
+        let mut bytes_written = directory_block.on_disk_len(self.ecc);
+        let mut uncompressed = u64::from(
+            directory_block
+                .write_to(&mut self.file_writer)?
+                .uncompressed_length,
+        );
+        for (_, prepared) in pages {
+            let header = prepared.write_to(&mut self.file_writer)?;
+            bytes_written = bytes_written
+                .checked_add(header.on_disk_size_with(self.ecc))
+                .ok_or(crate::Error::InvalidHeader(
+                    "columnar: row group length overflows u32",
+                ))?;
+            uncompressed += u64::from(header.uncompressed_length);
+        }
+
+        // Per-column zone-map stats for this row group, derived once from the
+        // batch. Gated on the zone-map policy exactly like the row-block
         // synthetic entry (`zone_block_min` is `Some` iff the policy is on), so
         // a zone-map-off table writes no zone-map section. `verify_zone_map`
-        // re-derives these from the decoded block to authenticate the section.
+        // re-derives these from the decoded group to authenticate the section.
         let columnar_columns = zone_block_min.as_ref().map(|_| batch.zone_stats());
-        self.register_written_block(
-            header,
-            layout,
+        self.register_written_extent(
+            bytes_written,
+            uncompressed,
+            // Pages are decoded whole, so there is no inner-frame layout to
+            // record for partial decode.
+            Vec::new(),
             last_key,
             last_seqno,
             seqno_bounds,
@@ -1498,6 +1557,30 @@ impl Writer {
             zone_block_min,
             columnar_columns,
         )
+    }
+
+    /// The block transform this writer applies to data, under `compression`.
+    ///
+    /// Shared by every block of a columnar row group, which differ only in
+    /// codec: its pages use the table's data codec and its directory none.
+    #[cfg(feature = "columnar")]
+    fn data_transform(
+        &self,
+        compression: crate::CompressionType,
+    ) -> crate::Result<crate::table::block::BlockTransform<'_>> {
+        let t = crate::table::block::BlockTransform::from_parts(
+            compression,
+            self.encryption.as_deref(),
+            #[cfg(zstd_any)]
+            self.zstd_dictionary.as_deref(),
+        )?;
+        #[cfg(zstd_any)]
+        let t = t.with_two_pass_seed(self.zstd_two_pass_seed);
+        Ok(if let Some(ecc) = self.ecc {
+            t.with_ecc(ecc)
+        } else {
+            t
+        })
     }
 
     /// Validates a columnar batch against the ingest contract without writing
@@ -1711,7 +1794,48 @@ impl Writer {
         zone_block_min: Option<UserKey>,
         columnar_columns: Option<Vec<crate::table::zone_map::ColumnStats>>,
     ) -> crate::Result<()> {
-        self.meta.uncompressed_size += u64::from(header.uncompressed_length);
+        // Size the block-handle with the scheme this writer actually wrote
+        // the parity under (NOT the fixed RS(4,2) `on_disk_size` assumes),
+        // or the handle over-reads on a non-default scheme.
+        let bytes_written = header.on_disk_size_with(self.ecc);
+        self.register_written_extent(
+            bytes_written,
+            u64::from(header.uncompressed_length),
+            layout,
+            last_key,
+            last_seqno,
+            seqno_bounds,
+            item_count,
+            zone_block_min,
+            columnar_columns,
+        )
+    }
+
+    /// Registers one index entry covering `bytes_written` bytes that start at
+    /// the current file position.
+    ///
+    /// Usually that is one block ([`Self::register_written_block`]). A
+    /// columnar row group is several — its page directory and its pages — and
+    /// is still ONE entry: the index names row groups, so `block_id` keeps its
+    /// meaning and every section keyed by a data block's file offset keeps
+    /// working, since the group starts exactly where its directory does.
+    #[expect(
+        clippy::too_many_arguments,
+        reason = "cohesive per-written-block fields; a param struct adds indirection without clarity"
+    )]
+    fn register_written_extent(
+        &mut self,
+        bytes_written: u32,
+        uncompressed_length: u64,
+        layout: Vec<u32>,
+        last_key: UserKey,
+        last_seqno: crate::SeqNo,
+        seqno_bounds: Option<(u64, u64)>,
+        item_count: usize,
+        zone_block_min: Option<UserKey>,
+        columnar_columns: Option<Vec<crate::table::zone_map::ColumnStats>>,
+    ) -> crate::Result<()> {
+        self.meta.uncompressed_size += uncompressed_length;
 
         // Record the inner zstd-block layout keyed by this block's file offset
         // (`meta.file_pos`, captured before the increment below). Only
@@ -1720,10 +1844,6 @@ impl Writer {
         if !layout.is_empty() {
             self.block_layouts.push((self.meta.file_pos, layout));
         }
-        // Size the block-handle with the scheme this writer actually wrote
-        // the parity under (NOT the fixed RS(4,2) `on_disk_size` assumes),
-        // or the handle over-reads on a non-default scheme.
-        let bytes_written = header.on_disk_size_with(self.ecc);
 
         let handle = KeyedBlockHandle::new(
             last_key.clone(),
@@ -1960,6 +2080,65 @@ impl Writer {
                 "verbatim block copy: raw length disagrees with the header on-disk size",
             ));
         }
+        self.append_verbatim_extent(
+            raw,
+            u64::from(header.uncompressed_length),
+            layout,
+            entries,
+            columnar_columns,
+            comparator,
+        )
+    }
+
+    /// Appends a columnar row group by copying its raw on-disk bytes
+    /// **verbatim** — directory and every page, as the source wrote them —
+    /// under one index entry, while folding the same per-row accounting a
+    /// freshly-encoded group gets.
+    ///
+    /// The row-group counterpart to [`Self::append_verbatim_data_block`]. The
+    /// group's page offsets are relative to its own directory, so the copy
+    /// stays addressable at its new file offset without rewriting a byte.
+    ///
+    /// `raw` MUST be every block of one group, back to back, each already
+    /// proved verbatim-safe by the salvage walk; `uncompressed_length` is the
+    /// sum over them.
+    ///
+    /// # Errors
+    ///
+    /// As [`Self::append_verbatim_data_block`], minus the single-header length
+    /// check: a group has no one header to check against.
+    #[cfg(feature = "columnar")]
+    pub(crate) fn append_verbatim_row_group(
+        &mut self,
+        raw: &[u8],
+        uncompressed_length: u64,
+        entries: &[InternalValue],
+        columnar_columns: Option<Vec<crate::table::zone_map::ColumnStats>>,
+        comparator: &crate::SharedComparator,
+    ) -> crate::Result<Option<crate::UserKey>> {
+        self.append_verbatim_extent(
+            raw,
+            uncompressed_length,
+            Vec::new(),
+            entries,
+            columnar_columns,
+            comparator,
+        )
+    }
+
+    /// Shared body of the verbatim copies: validates the entries' order,
+    /// appends `raw` to the data region, and registers it as one index entry.
+    fn append_verbatim_extent(
+        &mut self,
+        raw: &[u8],
+        uncompressed_length: u64,
+        layout: alloc::vec::Vec<u32>,
+        entries: &[InternalValue],
+        columnar_columns: Option<Vec<crate::table::zone_map::ColumnStats>>,
+        comparator: &crate::SharedComparator,
+    ) -> crate::Result<Option<crate::UserKey>> {
+        let bytes_written = u32::try_from(raw.len())
+            .map_err(|_| crate::Error::InvalidHeader("verbatim copy: extent length exceeds u32"))?;
         // The entries come from an UNTRUSTED (possibly tampered,
         // checksum-repatched) block; `account_direct_block` trusts their order,
         // so validate it before any state mutation.
@@ -1976,8 +2155,9 @@ impl Writer {
             // `Block::write_to` would have written a freshly-encoded block's bytes.
             self.file_writer.write_all(raw)?;
         }
-        self.register_written_block(
-            header,
+        self.register_written_extent(
+            bytes_written,
+            uncompressed_length,
             layout,
             inputs.last_key.clone(),
             inputs.last_seqno,
@@ -2973,6 +3153,16 @@ fn write_meta_section<W: crate::io::Write + crate::io::Seek>(
         // homogeneous SST, so the read path learns the layout from the
         // descriptor instead of inspecting a block header.
         meta("descriptor#columnar", &[u8::from(p.use_columnar)]),
+        // Which columnar layout this table's row groups use, stamped for the
+        // same reason as the filter format below: a reader has to learn it
+        // from the metadata, because a row group read under the wrong layout
+        // fails as a block-role mismatch deep inside a read, and salvage would
+        // grade that as damage and drop the data. A table written before the
+        // stamp existed stores each row group as one block.
+        meta(
+            "descriptor#columnar_format",
+            &[crate::table::meta::COLUMNAR_FORMAT_VERSION],
+        ),
         // Which BuRR wire format this table's filter and locator sections
         // carry. Stamped so a reader learns it from the metadata instead of
         // discovering it deep inside a point read, where the only honest

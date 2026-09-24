@@ -6,6 +6,8 @@ pub mod block;
 pub(crate) mod block_index;
 pub(crate) mod block_layout;
 #[cfg(feature = "columnar")]
+pub(crate) mod column_page;
+#[cfg(feature = "columnar")]
 pub mod columnar;
 #[cfg(feature = "columnar")]
 pub mod columnar_predicate;
@@ -369,6 +371,34 @@ pub(crate) struct SalvageBlock {
     /// Whether ECC recovery had to heal the block to read it. Kept separate
     /// from `verbatim` (which is also `None` for verbatim-ineligible clean
     /// reads) so the walk's live progress counts genuine heals only.
+    pub ecc_recovered: bool,
+}
+
+/// What one handle in a section names, for the walks that frame handles
+/// against the bytes they point at.
+#[cfg(feature = "std")]
+#[derive(Clone, Copy)]
+enum FrameUnit {
+    /// One block: every handle in the index section.
+    Block,
+    /// One data unit: a block for a row-major table, a row group for a
+    /// columnar one.
+    DataUnit,
+}
+
+/// Result of [`Table::salvage_load_row_group`]: the decoded group plus, when
+/// every block in it read back cleanly, the group's raw bytes.
+#[cfg(all(feature = "columnar", feature = "std"))]
+pub(crate) struct SalvageRowGroup {
+    /// The group's verified blocks. Left undecoded so the walk can tell a
+    /// group whose bytes did not read from one whose content does not decode:
+    /// the two are dropped for different reasons and reported differently.
+    pub group: crate::table::util::RowGroupBlocks,
+    /// `Some((raw_group_bytes, uncompressed_length))` when every block of the
+    /// group qualified for a verbatim copy; `None` otherwise, and the caller
+    /// re-encodes the decoded group.
+    pub verbatim: Option<(alloc::vec::Vec<u8>, u64)>,
+    /// Whether ECC recovery healed any block of the group.
     pub ecc_recovered: bool,
 }
 
@@ -901,6 +931,62 @@ impl Table {
         self.maintenance_index_walk()
     }
 
+    /// Loads the columnar row group `handle` names and decodes the columns
+    /// `wanted` selects — every column when `None` — in write order.
+    ///
+    /// The single place a columnar group becomes a
+    /// [`ColumnBatch`](crate::table::columnar::ColumnBatch); every read path
+    /// that consumes one goes through here, so the page format is known to
+    /// exactly one reader.
+    ///
+    /// Every page is fetched even when `wanted` selects few of them: the
+    /// group is one request either way, and a skipped page is only not
+    /// decoded. Fetching only the selected pages is the next step, and it
+    /// changes nothing a caller sees.
+    ///
+    /// `charge` applies to the read and to what decoding the pages copies out
+    /// of them, which a counted read charges to the gather counter before the
+    /// batch is judged: a group refused after a copy still made it.
+    ///
+    /// # Errors
+    ///
+    /// Any block's verification error, a malformed directory or page, or
+    /// [`crate::Error::InvalidHeader`] for a zero-row group: no writer emits
+    /// one.
+    #[cfg(feature = "columnar")]
+    pub(crate) fn load_row_group(
+        &self,
+        handle: &BlockHandle,
+        wanted: Option<&[u16]>,
+        charge: ReadCharge,
+    ) -> crate::Result<crate::table::columnar::ColumnBatch> {
+        let group = crate::table::util::load_row_group(
+            self.global_id(),
+            &self.path,
+            &self.file_accessor,
+            &self.cache,
+            handle,
+            self.metadata.data_block_compression,
+            self.encryption.as_deref(),
+            self.metadata.ecc_params,
+            #[cfg(zstd_any)]
+            self.zstd_dictionary.as_deref(),
+            self.heal_hints.get().map(AsRef::as_ref),
+            #[cfg(feature = "metrics")]
+            &self.metrics,
+            charge,
+        )?;
+        let mut copied = 0usize;
+        let batch = group.to_batch(wanted, &mut copied);
+        #[cfg(feature = "metrics")]
+        if charge.is_counted() {
+            self.metrics.record_gather(copied);
+        }
+        #[cfg(not(feature = "metrics"))]
+        let _ = copied;
+        batch
+    }
+
     fn load_block(
         &self,
         handle: &BlockHandle,
@@ -974,12 +1060,13 @@ impl Table {
         let fd = self
             .file_accessor
             .peek_or_open_table(&self.global_id(), &self.path)?;
+        let compression = self.compression_for_role(block_type);
         let transform = crate::table::util::build_block_transform(
-            self.metadata.data_block_compression,
+            compression,
             self.encryption.as_deref(),
             self.metadata.ecc_params,
             #[cfg(zstd_any)]
-            self.zstd_dictionary.as_deref(),
+            self.dictionary_for_role(block_type),
         )?;
         // The two halves of ONE read: the frame as the writer compressed it,
         // and the block that frame decodes to. Gates that cross-check the
@@ -991,7 +1078,7 @@ impl Table {
             crate::table::block::BlockIdentity {
                 table_id: self.metadata.id,
                 block_type,
-                dict_id: self.metadata.data_block_compression.dict_id(),
+                dict_id: compression.dict_id(),
                 window_log: 0,
             },
             &transform,
@@ -1010,34 +1097,19 @@ impl Table {
         Ok((Block { header, data }, frame))
     }
 
-    /// Frames the block starting at `offset` by reading its HEADER straight
-    /// from the file: the on-disk span is header + payload + parity trailer
-    /// (SST blocks carry no `block_flags` byte, so the trailer is sized from
-    /// the per-SST descriptor scheme). The writer emits blocks back-to-back,
-    /// making the physical tiling ground truth: the salvage gap walk frames
-    /// index-omitted bytes with this, and the TLI mirror gate compares each
-    /// decoded handle against the frame its header derives. A header that
-    /// fails to decode, or a span leaving `section_end`, means the bytes are
-    /// not frameable as a block.
+    /// Frames the block starting at `offset` by reading its HEADER through an
+    /// already-open `file`: the on-disk span is header + payload + parity
+    /// trailer (SST blocks carry no `block_flags` byte, so the trailer is sized
+    /// from the per-SST descriptor scheme). The writer emits blocks
+    /// back-to-back, making the physical tiling ground truth: the salvage gap
+    /// walk frames index-omitted bytes with this, and the TLI mirror gate
+    /// compares each decoded handle against the frame its header derives. A
+    /// header that fails to decode, or a span leaving `section_end`, means the
+    /// bytes are not frameable as a block.
     ///
-    /// # Errors
-    ///
-    /// [`crate::Error::InvalidHeader`] on an undecodable header or an
-    /// out-of-section span; any I/O error from the read.
-    #[cfg(feature = "std")]
-    pub(crate) fn probe_block_handle_at(
-        &self,
-        offset: u64,
-        section_end: u64,
-    ) -> crate::Result<BlockHandle> {
-        let file = self.fs.open(&self.path, &FsOpenOptions::new().read(true))?;
-        self.probe_block_handle_in(&*file, offset, section_end)
-    }
-
-    /// As [`probe_block_handle_at`] but reads through an ALREADY-OPEN handle, so
-    /// a caller scanning many offsets (the salvage resync loop, which steps one
-    /// byte at a time because block starts are not aligned) pays a single
-    /// `open` instead of one per probed offset.
+    /// Takes an open handle because every caller scans many offsets (the
+    /// salvage resync loop steps one byte at a time, since block starts are
+    /// not aligned), and one `open` per probe would dominate the walk.
     ///
     /// # Errors
     ///
@@ -1084,6 +1156,80 @@ impl Table {
         let size = u32::try_from(total)
             .map_err(|_| crate::Error::InvalidHeader("block span exceeds the block size limit"))?;
         Ok(BlockHandle::new(BlockOffset(offset), size))
+    }
+
+    /// Frames the DATA UNIT starting at `offset` — what one data index entry
+    /// covers — from the bytes alone, as [`Self::probe_block_handle_in`] frames
+    /// one block.
+    ///
+    /// A row-major table's unit is one block. A columnar table's is a row
+    /// group, and its extent is not in the first block's header: that header
+    /// is the directory's, which frames only itself. So the directory is read
+    /// and the group's extent is its own length plus every page it lists.
+    /// Framing the directory alone would make a group look like a run of
+    /// unrelated blocks to every walk that tiles the data section by frames.
+    ///
+    /// # Errors
+    ///
+    /// As [`Self::probe_block_handle_in`]; for a columnar table also when the
+    /// block at `offset` is not a page directory, or the directory is
+    /// unreadable or reaches past `section_end`.
+    #[cfg(feature = "std")]
+    pub(crate) fn probe_data_unit_in(
+        &self,
+        file: &dyn crate::fs::FsFile,
+        offset: u64,
+        section_end: u64,
+    ) -> crate::Result<BlockHandle> {
+        let first = self.probe_block_handle_in(file, offset, section_end)?;
+        if !self.metadata.columnar {
+            return Ok(first);
+        }
+        #[cfg(feature = "columnar")]
+        {
+            let directory_block = Block::from_file(
+                file,
+                first,
+                crate::table::block::BlockIdentity {
+                    table_id: self.id(),
+                    block_type: BlockType::ColumnPageDirectory,
+                    dict_id: 0,
+                    window_log: 0,
+                },
+                &crate::table::util::build_block_transform(
+                    CompressionType::None,
+                    self.encryption.as_deref(),
+                    self.metadata.ecc_params,
+                    #[cfg(zstd_any)]
+                    None,
+                )?,
+            )?;
+            if directory_block.header.block_type != BlockType::ColumnPageDirectory {
+                return Err(crate::Error::InvalidTag((
+                    "BlockType",
+                    directory_block.header.block_type.into(),
+                )));
+            }
+            let directory =
+                crate::table::column_page::PageDirectory::decode(&directory_block.data)?;
+            let size = first
+                .size()
+                .checked_add(directory.pages_len())
+                .ok_or(crate::Error::InvalidHeader("row group span overflows"))?;
+            if offset
+                .checked_add(u64::from(size))
+                .is_none_or(|end| end > section_end)
+            {
+                return Err(crate::Error::InvalidHeader(
+                    "row group extends past its section",
+                ));
+            }
+            Ok(BlockHandle::new(BlockOffset(offset), size))
+        }
+        #[cfg(not(feature = "columnar"))]
+        {
+            Err(crate::Error::FeatureUnsupported("columnar"))
+        }
     }
 
     /// Loads (and, for columnar SSTs, reconstructs + delete-masks) a data block.
@@ -1202,14 +1348,7 @@ impl Table {
         handle: &BlockHandle,
         charge: ReadCharge,
     ) -> crate::Result<Option<DataBlock>> {
-        let block = self.load_block_charged(
-            handle,
-            BlockType::Columnar,
-            self.metadata.data_block_compression,
-            #[cfg(zstd_any)]
-            self.zstd_dictionary.as_deref(),
-            charge,
-        )?;
+        let batch = self.load_row_group(handle, None, charge)?;
         let restart = self.metadata.data_block_restart_interval;
         // The segment has materialized deletes and this block has a recorded
         // start position: drop the deleted rows during reconstruction. The
@@ -1222,8 +1361,8 @@ impl Table {
             .as_ref()
             .and_then(|starts| starts.get(&handle.offset().0))
         {
-            DataBlock::from_columnar_block_masked(
-                &block.data,
+            DataBlock::from_column_batch_masked(
+                batch,
                 restart,
                 &self.delete_bitmap,
                 start,
@@ -1232,7 +1371,7 @@ impl Table {
         } else {
             // No materialized deletes (or, unreachably, an unmapped block):
             // reconstruct the whole block.
-            DataBlock::from_columnar_block(&block.data, restart, &mut values).map(Some)
+            DataBlock::from_column_batch(batch, restart, &mut values).map(Some)
         };
         // Two gathers, each charged at the size of what it built: the values
         // rebuilt from sub-columns (none when they are views), and the
@@ -1268,23 +1407,10 @@ impl Table {
         &self,
         handle: &BlockHandle,
     ) -> crate::Result<Option<crate::table::columnar::ColumnBatch>> {
-        let block = self.load_block_charged(
-            handle,
-            BlockType::Columnar,
-            self.metadata.data_block_compression,
-            #[cfg(zstd_any)]
-            self.zstd_dictionary.as_deref(),
-            ReadCharge::Maintenance,
-        )?;
-        let batch = crate::table::columnar::ColumnBatch::decode(&block.data)?;
-        // A real writer never emits an empty data block (the ingest path skips
-        // the write entirely), so a checksum-clean ZERO-ROW batch is malformed
-        // input. Reject it here rather than return it as "live": the writer
-        // primitives emit nothing for an empty batch, and a caller counting it
-        // as recovered would misreport an unrecovered block as salvaged.
-        if batch.row_count == 0 {
-            return Err(crate::Error::InvalidHeader("columnar: zero-row data block"));
-        }
+        // `load_row_group` already refuses a zero-row group: a real writer
+        // never emits one, and a caller counting it as recovered would
+        // misreport an unrecovered group as salvaged.
+        let batch = self.load_row_group(handle, None, ReadCharge::Maintenance)?;
         let Some(start) = self
             .delete_block_starts
             .as_ref()
@@ -1382,36 +1508,24 @@ impl Table {
                 return Ok(false);
             }
             let handle = BlockHandle::new(keyed.offset(), keyed.size());
-            let block = match self.load_block_charged(
-                &handle,
-                BlockType::Columnar,
-                self.metadata.data_block_compression,
-                #[cfg(zstd_any)]
-                self.zstd_dictionary.as_deref(),
-                ReadCharge::Maintenance,
-            ) {
-                Ok(block) => block,
+            // FULLY decode the group rather than trusting the directory's row
+            // count: a checksum-repatched tamper can keep that field intact
+            // while breaking a page's column framing. The salvage walk would
+            // drop such a group as undecodable — but its ACTUAL row count is
+            // then just as unknowable as an unreadable group's, so accepting
+            // the claimed count here would let the mask land on unproven
+            // positions for every later group. Decoding checks every page
+            // against that count, so a group that decodes has proved it.
+            let batch = match self.load_row_group(&handle, None, ReadCharge::Maintenance) {
+                Ok(batch) => batch,
                 // Only an ENVIRONMENTAL read propagates (see the index arm
-                // above); a load that fails on the DATA leaves the block's
-                // actual count unknowable, so every later position is
+                // above); a load or decode that fails on the DATA leaves the
+                // group's actual count unknowable, so every later position is
                 // unverifiable — degrade to an unpositionable mask
                 // (`Ok(false)`) rather than trust the (potentially tampered)
                 // zone-map claim for it, and let the resurrection opt-in decide.
                 Err(e) if e.is_environmental() => return Err(e),
                 Err(_) => return Ok(false),
-            };
-            // FULLY decode the batch rather than trusting the leading LE u32
-            // row count: a checksum-repatched tamper can keep those four bytes
-            // intact while breaking the column framing. The salvage walk would
-            // drop such a block as undecodable — but its ACTUAL row count is
-            // then just as unknowable as an unreadable block's, so accepting
-            // the claimed count here would let the mask land on unproven
-            // positions for every later block. Fail closed on any decode
-            // failure.
-            let Ok(batch) = crate::table::columnar::ColumnBatch::decode(&block.data) else {
-                // A decode failure is STRUCTURAL (the salvage walk drops such a
-                // block), so its actual count is unknowable — fail closed.
-                return Ok(false);
             };
             // A ZERO-ROW batch is malformed input (a real writer never emits
             // an empty block) and the salvage walk DROPS it — so accepting it
@@ -1452,12 +1566,13 @@ impl Table {
         let (fd, _) = self
             .file_accessor
             .get_or_open_table(&table_id, &self.path)?;
+        let compression = self.compression_for_role(block_type);
         let transform = crate::table::util::build_block_transform(
-            self.metadata.data_block_compression,
+            compression,
             self.encryption.as_deref(),
             self.metadata.ecc_params,
             #[cfg(zstd_any)]
-            self.zstd_dictionary.as_deref(),
+            self.dictionary_for_role(block_type),
         )?;
         let (block, status, recovery) = crate::table::block::Block::from_file_with_recovery(
             fd.as_ref(),
@@ -1465,7 +1580,7 @@ impl Table {
             crate::table::block::BlockIdentity {
                 table_id: table_id.table_id(),
                 block_type,
-                dict_id: self.metadata.data_block_compression.dict_id(),
+                dict_id: compression.dict_id(),
                 window_log: 0,
             },
             &transform,
@@ -1566,6 +1681,64 @@ impl Table {
             block,
             verbatim,
             ecc_recovered: recovery.is_some(),
+        })
+    }
+
+    /// Salvage helper for a columnar table's entry: loads every block of the
+    /// row group through [`Self::salvage_load_block`].
+    ///
+    /// The group may be byte-copied only when EVERY block in it qualified for
+    /// a verbatim copy on its own. One ECC-healed page makes the whole group's
+    /// raw bytes unsafe to propagate, because they are one unit on disk and
+    /// one index entry in the copy; the caller then re-encodes the decoded
+    /// batch instead. When they all qualify, their raw frames — adjacent by
+    /// construction, as the extent check proved — ARE the group's bytes.
+    ///
+    /// `pub(crate)` for the salvage walk ([`crate::salvage`]).
+    ///
+    /// # Errors
+    ///
+    /// A block's verified read failing, or a directory that cannot be read or
+    /// does not fill the group: without it the pages cannot be located, so
+    /// the group is lost as a unit, exactly as a columnar block was.
+    #[cfg(all(feature = "columnar", feature = "std"))]
+    pub(crate) fn salvage_load_row_group(
+        &self,
+        group: &BlockHandle,
+    ) -> crate::Result<SalvageRowGroup> {
+        let mut blocks = self.data_unit_blocks(group)?.into_iter();
+        let Some((directory_handle, directory_role)) = blocks.next() else {
+            return Err(crate::Error::InvalidHeader(
+                "columnar: row group has no directory",
+            ));
+        };
+        let directory = self.salvage_load_block(&directory_handle, directory_role)?;
+        let decoded = crate::table::column_page::PageDirectory::decode(&directory.block.data)?;
+
+        let mut ecc_recovered = directory.ecc_recovered;
+        let mut verbatim = directory
+            .verbatim
+            .map(|(raw, header, _)| (raw, u64::from(header.uncompressed_length)));
+        let mut pages = alloc::vec::Vec::with_capacity(decoded.entries().len());
+        for (handle, role) in blocks {
+            let page = self.salvage_load_block(&handle, role)?;
+            ecc_recovered |= page.ecc_recovered;
+            verbatim = match (verbatim, page.verbatim) {
+                (Some((mut raw, uncompressed)), Some((page_raw, header, _))) => {
+                    raw.extend_from_slice(&page_raw);
+                    Some((raw, uncompressed + u64::from(header.uncompressed_length)))
+                }
+                _ => None,
+            };
+            pages.push(page.block);
+        }
+        Ok(SalvageRowGroup {
+            group: crate::table::util::RowGroupBlocks {
+                directory: decoded,
+                pages,
+            },
+            verbatim,
+            ecc_recovered,
         })
     }
 
@@ -1688,13 +1861,7 @@ impl Table {
         handle: &BlockHandle,
         needle: &[u8],
     ) -> crate::Result<Option<DataBlock>> {
-        let block = self.load_block(
-            handle,
-            BlockType::Columnar,
-            self.metadata.data_block_compression,
-            #[cfg(zstd_any)]
-            self.zstd_dictionary.as_deref(),
-        )?;
+        let batch = self.load_row_group(handle, None, ReadCharge::Foreground)?;
         let deletes = self
             .delete_block_starts
             .as_ref()
@@ -1702,18 +1869,18 @@ impl Table {
             .map(|&start| (self.delete_bitmap.as_ref(), start));
         let mut rows = 0usize;
         let rebuilt = DataBlock::columnar_point_block(
-            &block.data,
+            &batch,
             needle,
             &self.comparator,
             self.metadata.data_block_restart_interval,
             deletes,
             &mut rows,
         );
-        // `rows` is what the decode copied out of the block, plus the needle's
-        // keys and values copied out of the columns when it is present; a miss
-        // or a refused block still did those copies, so they are charged
-        // either way. The small block encoded from the rows exists only on a
-        // hit.
+        // `rows` is the needle's keys and values copied out of the columns
+        // when it is present (what decoding the pages copied was charged by
+        // `load_row_group`); a miss or a refused group still did those copies,
+        // so they are charged either way. The small block encoded from the
+        // rows exists only on a hit.
         #[cfg(feature = "metrics")]
         self.metrics.record_gather(rows);
         #[cfg(not(feature = "metrics"))]
@@ -1754,26 +1921,7 @@ impl Table {
         handle: &BlockHandle,
         projection: &[u16],
     ) -> crate::Result<crate::table::columnar::ColumnBatch> {
-        let block = self.load_block(
-            handle,
-            BlockType::Columnar,
-            self.metadata.data_block_compression,
-            #[cfg(zstd_any)]
-            self.zstd_dictionary.as_deref(),
-        )?;
-        let mut copied = 0usize;
-        let batch = crate::table::columnar::ColumnBatch::decode_counting_copies(
-            &block.data,
-            Some(projection),
-            &mut copied,
-        );
-        // Charged before the result is judged: a decode refused after it
-        // copied still did the copy.
-        #[cfg(feature = "metrics")]
-        self.metrics.record_gather(copied);
-        #[cfg(not(feature = "metrics"))]
-        let _ = copied;
-        batch
+        self.load_row_group(handle, Some(projection), ReadCharge::Foreground)
     }
 
     /// Returns the (possibly compressed) file size.
@@ -1805,18 +1953,101 @@ impl Table {
         Ok(size.checked_sub(self.punch_offset()?).unwrap_or(size))
     }
 
-    /// The on-disk ROLE of this table's data blocks: a columnar segment's
-    /// writer seals them as [`BlockType::Columnar`], a row-major one as
-    /// [`BlockType::Data`]. Scrub / heal walks pass this as the expected type
-    /// so the per-block role check (swap-defence against a misdirected index
-    /// entry) matches what the writer actually emitted.
+    /// The blocks one data index entry covers, each with the ROLE its writer
+    /// sealed it under.
+    ///
+    /// A row-major table's entry is one [`BlockType::Data`] block and costs no
+    /// read. A columnar table's entry is a row group: its
+    /// [`BlockType::ColumnPageDirectory`] followed by its
+    /// [`BlockType::ColumnPage`]s, found by reading the directory straight
+    /// from disk, bypassing the cache — the walks that call this (scrub, heal,
+    /// the reconcile gates) are judging the bytes on disk, and a cached
+    /// directory is a statement about bytes that may since have changed.
+    ///
+    /// The roles are the swap-defence those walks check each block against,
+    /// so they come from each block's POSITION in the group, never from the
+    /// block's own header: a header is exactly what a misdirected block would
+    /// carry.
+    ///
+    /// # Errors
+    ///
+    /// When the directory cannot be read or does not fill the group exactly.
+    /// Without it the pages cannot be located, so the whole entry is reported
+    /// rather than guessed at.
     #[cfg(feature = "std")]
-    fn data_block_role(&self) -> BlockType {
-        if self.metadata.columnar {
-            BlockType::Columnar
-        } else {
-            BlockType::Data
+    pub(crate) fn data_unit_blocks(
+        &self,
+        entry: &BlockHandle,
+    ) -> crate::Result<alloc::vec::Vec<(BlockHandle, BlockType)>> {
+        if !self.metadata.columnar {
+            return Ok(alloc::vec![(*entry, BlockType::Data)]);
         }
+        #[cfg(feature = "columnar")]
+        {
+            self.row_group_block_handles(entry)
+        }
+        #[cfg(not(feature = "columnar"))]
+        {
+            Err(crate::Error::FeatureUnsupported("columnar"))
+        }
+    }
+
+    /// The handles of a row group's directory and pages, read from disk.
+    /// See [`Self::data_unit_blocks`].
+    #[cfg(all(feature = "std", feature = "columnar"))]
+    fn row_group_block_handles(
+        &self,
+        group: &BlockHandle,
+    ) -> crate::Result<alloc::vec::Vec<(BlockHandle, BlockType)>> {
+        use crate::coding::Decode;
+
+        let (fd, _) = self
+            .file_accessor
+            .get_or_open_table(&self.global_id(), &self.path)?;
+        let prefix = crate::file::read_exact(
+            fd.as_ref(),
+            *group.offset(),
+            crate::table::block::Header::MIN_LEN.min(group.size() as usize),
+        )?;
+        let directory_len = crate::table::block::Header::decode_from(&mut &prefix[..])?
+            .on_disk_size_with(self.metadata.ecc_params);
+        let directory_handle = BlockHandle::new(group.offset(), directory_len);
+        let directory_block = Block::from_file(
+            fd.as_ref(),
+            directory_handle,
+            crate::table::block::BlockIdentity {
+                table_id: self.id(),
+                block_type: BlockType::ColumnPageDirectory,
+                dict_id: 0,
+                window_log: 0,
+            },
+            &crate::table::util::build_block_transform(
+                CompressionType::None,
+                self.encryption.as_deref(),
+                self.metadata.ecc_params,
+                #[cfg(zstd_any)]
+                None,
+            )?,
+        )?;
+        if directory_block.header.block_type != BlockType::ColumnPageDirectory {
+            return Err(crate::Error::InvalidTag((
+                "BlockType",
+                directory_block.header.block_type.into(),
+            )));
+        }
+        let directory = crate::table::column_page::PageDirectory::decode(&directory_block.data)?;
+        crate::table::util::check_group_extent(group, directory_len, &directory)?;
+
+        let mut blocks = alloc::vec::Vec::with_capacity(directory.entries().len() + 1);
+        blocks.push((directory_handle, BlockType::ColumnPageDirectory));
+        for page in directory.entries() {
+            let offset = *group.offset() + u64::from(directory_len) + u64::from(page.offset);
+            blocks.push((
+                BlockHandle::new(crate::table::block::BlockOffset(offset), page.length),
+                BlockType::ColumnPage,
+            ));
+        }
+        Ok(blocks)
     }
 
     /// Patrol-scrubs every data block of this table: a cache-bypassing read that
@@ -1868,53 +2099,98 @@ impl Table {
             {
                 continue;
             }
-            let block_offset = keyed.offset().0;
-            let handle = BlockHandle::new(keyed.offset(), keyed.size());
-            report.blocks_scanned += 1;
-
-            match scrub_block(
-                self.global_id(),
-                &self.path,
-                &self.file_accessor,
-                &handle,
-                self.data_block_role(),
-                self.metadata.data_block_compression,
-                self.encryption.as_deref(),
-                self.metadata.ecc_params,
-                #[cfg(zstd_any)]
-                self.zstd_dictionary.as_deref(),
-                self.heal_hints.get().map(AsRef::as_ref),
-                #[cfg(feature = "metrics")]
-                &self.metrics,
-            ) {
-                Ok(BlockScrubOutcome::Clean) => {}
-                Ok(BlockScrubOutcome::Corrected { scheduled }) => {
-                    report.corrections_applied += 1;
-                    if scheduled {
-                        // heal_hints dedups per SST, so `scheduled` is true at
-                        // most once per table — this counts distinct SSTs.
-                        report.ssts_scheduled_for_rewrite += 1;
-                    }
-                }
+            let entry_handle = BlockHandle::new(keyed.offset(), keyed.size());
+            let blocks = match self.data_unit_blocks(&entry_handle) {
+                Ok(blocks) => blocks,
+                // A row group whose directory cannot be read has no known
+                // pages: the entry is reported as one uncorrectable block at
+                // the group's offset rather than skipped, so a scan never ends
+                // clean over bytes it could not look at.
                 Err(e) => {
-                    report.uncorrectable_blocks += 1;
-                    log::error!(
-                        "patrol scrub: uncorrectable block at offset {block_offset} in table {} \
-                         at {}: {e:?}",
-                        self.id(),
-                        self.path.display(),
-                    );
-                    report.errors.push(ScrubError::UncorrectableBlock {
-                        table_id: self.id(),
-                        path: self.path.to_path_buf(),
-                        block_offset,
-                        reason: alloc::format!("{e:?}"),
-                    });
+                    report.blocks_scanned += 1;
+                    self.record_uncorrectable(&mut report, keyed.offset().0, &e);
+                    continue;
+                }
+            };
+
+            for (handle, role) in blocks {
+                report.blocks_scanned += 1;
+                match scrub_block(
+                    self.global_id(),
+                    &self.path,
+                    &self.file_accessor,
+                    &handle,
+                    role,
+                    self.compression_for_role(role),
+                    self.encryption.as_deref(),
+                    self.metadata.ecc_params,
+                    #[cfg(zstd_any)]
+                    self.dictionary_for_role(role),
+                    self.heal_hints.get().map(AsRef::as_ref),
+                    #[cfg(feature = "metrics")]
+                    &self.metrics,
+                ) {
+                    Ok(BlockScrubOutcome::Clean) => {}
+                    Ok(BlockScrubOutcome::Corrected { scheduled }) => {
+                        report.corrections_applied += 1;
+                        if scheduled {
+                            // heal_hints dedups per SST, so `scheduled` is true at
+                            // most once per table — this counts distinct SSTs.
+                            report.ssts_scheduled_for_rewrite += 1;
+                        }
+                    }
+                    Err(e) => self.record_uncorrectable(&mut report, handle.offset().0, &e),
                 }
             }
         }
 
         report
+    }
+
+    /// Records one block the patrol scrub could not verify or correct.
+    #[cfg(feature = "std")]
+    fn record_uncorrectable(
+        &self,
+        report: &mut crate::scrub::PatrolScrubReport,
+        block_offset: u64,
+        e: &crate::Error,
+    ) {
+        report.uncorrectable_blocks += 1;
+        log::error!(
+            "patrol scrub: uncorrectable block at offset {block_offset} in table {} at {}: {e:?}",
+            self.id(),
+            self.path.display(),
+        );
+        report
+            .errors
+            .push(crate::scrub::ScrubError::UncorrectableBlock {
+                table_id: self.id(),
+                path: self.path.to_path_buf(),
+                block_offset,
+                reason: alloc::format!("{e:?}"),
+            });
+    }
+
+    /// The codec a data-carrying block of `role` was written under: a row
+    /// group's directory is always plain, everything else uses the table's
+    /// data codec.
+    fn compression_for_role(&self, role: BlockType) -> CompressionType {
+        if role == BlockType::ColumnPageDirectory {
+            CompressionType::None
+        } else {
+            self.metadata.data_block_compression
+        }
+    }
+
+    /// The zstd dictionary a data-carrying block of `role` needs, if any: none
+    /// for a directory, which is never compressed.
+    #[cfg(zstd_any)]
+    fn dictionary_for_role(&self, role: BlockType) -> Option<&crate::compression::ZstdDictionary> {
+        if role == BlockType::ColumnPageDirectory {
+            None
+        } else {
+            self.zstd_dictionary.as_deref()
+        }
     }
 
     /// Ensures the heal's handle may be WRITTEN through: probes the link
@@ -2543,302 +2819,343 @@ impl Table {
             {
                 continue;
             }
-            let block_offset = keyed.offset().0;
-            let handle = BlockHandle::new(keyed.offset(), keyed.size());
-            report.blocks_scanned += 1;
+            let entry_handle = BlockHandle::new(keyed.offset(), keyed.size());
+            let blocks = match self.data_unit_blocks(&entry_handle) {
+                Ok(blocks) => blocks,
+                // A row group whose directory cannot be read has no locatable
+                // pages: report the entry as one uncorrectable block rather
+                // than end the pass clean over bytes it could not look at.
+                Err(e) => {
+                    report.blocks_scanned += 1;
+                    report.uncorrectable_blocks += 1;
+                    report.errors.push(ScrubError::UncorrectableBlock {
+                        table_id: self.id(),
+                        path: self.path.to_path_buf(),
+                        block_offset: keyed.offset().0,
+                        reason: alloc::format!("{e:?}"),
+                    });
+                    continue;
+                }
+            };
+            for (handle, role) in blocks {
+                let block_offset = handle.offset().0;
+                report.blocks_scanned += 1;
 
-            // Verify the block through the SAME full read the scrub path uses
-            // (checksum + decode + ECC recovery), not just a bare frame check.
-            // This detects a checksum-clean-but-undecodable block (e.g. a corrupt
-            // `uncompressed_length`) and a corrupt block in a non-ECC segment,
-            // reporting it as uncorrectable instead of silently clean. `heal_hints
-            // = None`: this path persists the correction IN PLACE, so it must not
-            // also queue a full-file healing rewrite. The metric is recorded inside
-            // `scrub_block`.
-            let outcome = crate::table::util::scrub_block(
-                self.global_id(),
-                &self.path,
-                &self.file_accessor,
-                &handle,
-                self.data_block_role(),
-                self.metadata.data_block_compression,
-                self.encryption.as_deref(),
-                self.metadata.ecc_params,
-                #[cfg(zstd_any)]
-                self.zstd_dictionary.as_deref(),
-                None,
-                #[cfg(feature = "metrics")]
-                &self.metrics,
-            );
-            match outcome {
-                // Verified clean: nothing to persist.
-                // Verified clean — but a clean PAYLOAD checksum never
-                // validates the parity trailer (parity is only consulted on a
-                // mismatch), so rot confined to the trailer would silently
-                // leave dead ECC on disk: a later payload fault in this block
-                // could no longer be recovered. This pass holds the read+write
-                // handle and the payload is untouched, so a size-preserving
-                // trailer rebuild is exactly the heal it exists to perform.
-                Ok(crate::table::util::BlockScrubOutcome::Clean) => {
-                    let raw = match crate::file::read_exact(
-                        file.as_ref(),
-                        block_offset,
-                        keyed.size() as usize,
-                    ) {
-                        Ok(raw) => raw,
-                        Err(e) => {
-                            report.uncorrectable_blocks += 1;
-                            report.errors.push(ScrubError::UncorrectableBlock {
-                                table_id: self.id(),
-                                path: self.path.to_path_buf(),
-                                block_offset,
-                                reason: alloc::format!(
-                                    "in-place heal: parity re-read failed: {e:?}"
-                                ),
-                            });
-                            continue;
-                        }
-                    };
-                    use crate::coding::Decode;
-                    let Ok(raw_header) = crate::table::block::Header::decode_from(&mut &raw[..])
-                    else {
-                        // The scrub just read this frame cleanly; a header that
-                        // no longer decodes is an inconsistency worth surfacing.
-                        report.uncorrectable_blocks += 1;
-                        report.errors.push(ScrubError::UncorrectableBlock {
-                            table_id: self.id(),
-                            path: self.path.to_path_buf(),
+                // Verify the block through the SAME full read the scrub path uses
+                // (checksum + decode + ECC recovery), not just a bare frame check.
+                // This detects a checksum-clean-but-undecodable block (e.g. a corrupt
+                // `uncompressed_length`) and a corrupt block in a non-ECC segment,
+                // reporting it as uncorrectable instead of silently clean. `heal_hints
+                // = None`: this path persists the correction IN PLACE, so it must not
+                // also queue a full-file healing rewrite. The metric is recorded inside
+                // `scrub_block`.
+                let outcome = crate::table::util::scrub_block(
+                    self.global_id(),
+                    &self.path,
+                    &self.file_accessor,
+                    &handle,
+                    role,
+                    self.compression_for_role(role),
+                    self.encryption.as_deref(),
+                    self.metadata.ecc_params,
+                    #[cfg(zstd_any)]
+                    self.dictionary_for_role(role),
+                    None,
+                    #[cfg(feature = "metrics")]
+                    &self.metrics,
+                );
+                match outcome {
+                    // Verified clean: nothing to persist.
+                    // Verified clean — but a clean PAYLOAD checksum never
+                    // validates the parity trailer (parity is only consulted on a
+                    // mismatch), so rot confined to the trailer would silently
+                    // leave dead ECC on disk: a later payload fault in this block
+                    // could no longer be recovered. This pass holds the read+write
+                    // handle and the payload is untouched, so a size-preserving
+                    // trailer rebuild is exactly the heal it exists to perform.
+                    Ok(crate::table::util::BlockScrubOutcome::Clean) => {
+                        let raw = match crate::file::read_exact(
+                            file.as_ref(),
                             block_offset,
-                            reason: alloc::string::String::from(
-                                "in-place heal: block scrubbed clean but its header no \
-                                 longer decodes",
-                            ),
-                        });
-                        continue;
-                    };
-                    // The bytes examined below are this SECOND read, not the
-                    // frame the scrub just verified: a transient fault or
-                    // fresh rot between the reads would otherwise feed the
-                    // parity comparison an unverified payload, and the
-                    // rebuild arm would PERSIST parity computed over those
-                    // corrupt bytes — turning a recoverable block into one
-                    // whose ECC agrees with the corruption. Verify the
-                    // re-read header's ROLE and its payload against the
-                    // header checksum first; a mismatch is surfaced, never
-                    // acted on.
-                    if raw_header.block_type != self.data_block_role() {
-                        report.uncorrectable_blocks += 1;
-                        report.errors.push(ScrubError::UncorrectableBlock {
-                            table_id: self.id(),
-                            path: self.path.to_path_buf(),
-                            block_offset,
-                            reason: alloc::string::String::from(
-                                "in-place heal: block scrubbed clean but its re-read \
-                                 header carries a different block role",
-                            ),
-                        });
-                        continue;
-                    }
-                    let header_len = crate::table::block::Header::header_len(raw_header.block_type);
-                    // checked_add: a forged/rotted data_length can overflow
-                    // the payload-end sum on 32-bit targets; overflow is an
-                    // uncorrectable finding, not a panic.
-                    let payload_ok = header_len
-                        .checked_add(raw_header.data_length as usize)
-                        .and_then(|payload_end| raw.get(header_len..payload_end))
-                        .is_some_and(|payload| {
-                            crate::hash::hash128(payload) == raw_header.checksum.into_u128()
-                        });
-                    if !payload_ok {
-                        report.uncorrectable_blocks += 1;
-                        report.errors.push(ScrubError::UncorrectableBlock {
-                            table_id: self.id(),
-                            path: self.path.to_path_buf(),
-                            block_offset,
-                            reason: alloc::string::String::from(
-                                "in-place heal: block scrubbed clean but its re-read \
-                                 payload does not match its checksum",
-                            ),
-                        });
-                        continue;
-                    }
-                    match self.raw_block_parity_delta(&raw, &raw_header) {
-                        // Trailer matches (or no ECC): nothing to persist.
-                        Ok(None) => {}
-                        // Trailer rot: persist the freshly computed parity at
-                        // its on-disk position (header + payload unchanged).
-                        Ok(Some(fresh)) => {
-                            let trailer_offset = block_offset
-                                + crate::table::block::Header::header_len(raw_header.block_type)
-                                    as u64
-                                + u64::from(raw_header.data_length);
-                            // Apply ONLY corrections the prediction pass attested.
-                            // A trailer rebuild that appears now but was not
-                            // predicted (fresh rot between the two reads) is left
-                            // as-is: healing it would put bytes on disk the
-                            // marker's digest never covered, and a later
-                            // checkpoint would snapshot them under the stale
-                            // digest. It stays RS-correctable for the next patrol.
-                            if !predicted_offsets.contains(&trailer_offset) {
-                                continue;
-                            }
-                            // Attribution + the crash-recovery marker were
-                            // captured UP FRONT (before this loop), so nothing is
-                            // done here. First write: make sure no checkpoint link
-                            // shares the inode (lazy detach).
-                            if let Err(reason) = self.ensure_unshared_for_write(
-                                &mut file,
-                                &mut unshare_state,
-                                sync_mode,
-                            ) {
+                            handle.size() as usize,
+                        ) {
+                            Ok(raw) => raw,
+                            Err(e) => {
                                 report.uncorrectable_blocks += 1;
                                 report.errors.push(ScrubError::UncorrectableBlock {
                                     table_id: self.id(),
                                     path: self.path.to_path_buf(),
                                     block_offset,
                                     reason: alloc::format!(
-                                        "unshare hard-linked SST for heal: {reason}"
+                                        "in-place heal: parity re-read failed: {e:?}"
                                     ),
                                 });
                                 continue;
                             }
-                            let write_back = file
-                                .seek(SeekFrom::Start(trailer_offset))
-                                .and_then(|_| file.write_all(&fresh));
-                            // The write_all may have written some bytes even if it
-                            // then errored; mark the file as possibly mutated so a
-                            // later failure does not drop the attestation.
-                            write_attempted = true;
-                            let durable = match write_back {
-                                Ok(()) => file
-                                    .sync_data_with(sync_mode)
-                                    .map_err(|e| alloc::format!("sync: {e}")),
-                                Err(e) => Err(alloc::format!("write: {e}")),
-                            };
-                            if let Err(reason) = durable {
-                                report.uncorrectable_blocks += 1;
-                                report.errors.push(ScrubError::UncorrectableBlock {
-                                    table_id: self.id(),
-                                    path: self.path.to_path_buf(),
-                                    block_offset,
-                                    reason: alloc::format!("in-place parity rebuild {reason}"),
-                                });
-                                continue;
-                            }
-                            report.blocks_healed_in_place += 1;
-                        }
-                        Err(()) => {
+                        };
+                        use crate::coding::Decode;
+                        let Ok(raw_header) =
+                            crate::table::block::Header::decode_from(&mut &raw[..])
+                        else {
+                            // The scrub just read this frame cleanly; a header that
+                            // no longer decodes is an inconsistency worth surfacing.
                             report.uncorrectable_blocks += 1;
                             report.errors.push(ScrubError::UncorrectableBlock {
                                 table_id: self.id(),
                                 path: self.path.to_path_buf(),
                                 block_offset,
                                 reason: alloc::string::String::from(
-                                    "in-place heal: parity trailer unverifiable on a \
-                                     checksum-clean block",
+                                    "in-place heal: block scrubbed clean but its header no \
+                                 longer decodes",
                                 ),
                             });
-                        }
-                    }
-                }
-                // Recovered from parity: persist the corrected frame in place.
-                Ok(crate::table::util::BlockScrubOutcome::Corrected { .. }) => {
-                    // Apply ONLY corrections the prediction pass attested. A block
-                    // that recovers now but was not in the predicted set (a fault
-                    // that appeared after the prediction) is left corrupt: writing
-                    // it would heal bytes the marker's digest never covered, so a
-                    // later checkpoint could snapshot them under the stale digest.
-                    // It stays RS-correctable, so the next patrol retries.
-                    if !predicted_offsets.contains(&block_offset) {
-                        continue;
-                    }
-                    let frame = match crate::table::block::Block::heal_frame(
-                        file.as_ref(),
-                        handle,
-                        &transform,
-                    ) {
-                        Ok(Some((frame, _kind))) => frame,
-                        // The scrub read corrected a fault but the confirming
-                        // re-read is already clean: a TRANSIENT fault the first
-                        // read hit and the re-read did not. This mirrors the
-                        // schedule path (`maybe_record_persistent_heal`), which
-                        // treats a clean confirmation re-read as transient and
-                        // does not act — there is nothing on disk to persist.
-                        Ok(None) => {
-                            log::debug!(
-                                "in-place heal: transient correction on block at offset \
-                                 {block_offset} in table {} at {}; re-read clean, nothing to \
-                                 persist",
-                                self.id(),
-                                self.path.display(),
-                            );
+                            continue;
+                        };
+                        // The bytes examined below are this SECOND read, not the
+                        // frame the scrub just verified: a transient fault or
+                        // fresh rot between the reads would otherwise feed the
+                        // parity comparison an unverified payload, and the
+                        // rebuild arm would PERSIST parity computed over those
+                        // corrupt bytes — turning a recoverable block into one
+                        // whose ECC agrees with the corruption. Verify the
+                        // re-read header's ROLE and its payload against the
+                        // header checksum first; a mismatch is surfaced, never
+                        // acted on.
+                        if raw_header.block_type != role {
+                            report.uncorrectable_blocks += 1;
+                            report.errors.push(ScrubError::UncorrectableBlock {
+                                table_id: self.id(),
+                                path: self.path.to_path_buf(),
+                                block_offset,
+                                reason: alloc::string::String::from(
+                                    "in-place heal: block scrubbed clean but its re-read \
+                                 header carries a different block role",
+                                ),
+                            });
                             continue;
                         }
-                        // A real read/decode error on the re-read: surface it
-                        // rather than silently skip the write-back.
-                        Err(e) => {
+                        let header_len =
+                            crate::table::block::Header::header_len(raw_header.block_type);
+                        // checked_add: a forged/rotted data_length can overflow
+                        // the payload-end sum on 32-bit targets; overflow is an
+                        // uncorrectable finding, not a panic.
+                        let payload_ok = header_len
+                            .checked_add(raw_header.data_length as usize)
+                            .and_then(|payload_end| raw.get(header_len..payload_end))
+                            .is_some_and(|payload| {
+                                crate::hash::hash128(payload) == raw_header.checksum.into_u128()
+                            });
+                        if !payload_ok {
+                            report.uncorrectable_blocks += 1;
+                            report.errors.push(ScrubError::UncorrectableBlock {
+                                table_id: self.id(),
+                                path: self.path.to_path_buf(),
+                                block_offset,
+                                reason: alloc::string::String::from(
+                                    "in-place heal: block scrubbed clean but its re-read \
+                                 payload does not match its checksum",
+                                ),
+                            });
+                            continue;
+                        }
+                        match self.raw_block_parity_delta(&raw, &raw_header) {
+                            // Trailer matches (or no ECC): nothing to persist.
+                            Ok(None) => {}
+                            // Trailer rot: persist the freshly computed parity at
+                            // its on-disk position (header + payload unchanged).
+                            Ok(Some(fresh)) => {
+                                let trailer_offset = block_offset
+                                    + crate::table::block::Header::header_len(raw_header.block_type)
+                                        as u64
+                                    + u64::from(raw_header.data_length);
+                                // Apply ONLY corrections the prediction pass attested.
+                                // A trailer rebuild that appears now but was not
+                                // predicted (fresh rot between the two reads) is left
+                                // as-is: healing it would put bytes on disk the
+                                // marker's digest never covered, and a later
+                                // checkpoint would snapshot them under the stale
+                                // digest. It stays RS-correctable for the next patrol.
+                                if !predicted_offsets.contains(&trailer_offset) {
+                                    continue;
+                                }
+                                // Attribution + the crash-recovery marker were
+                                // captured UP FRONT (before this loop), so nothing is
+                                // done here. First write: make sure no checkpoint link
+                                // shares the inode (lazy detach).
+                                if let Err(reason) = self.ensure_unshared_for_write(
+                                    &mut file,
+                                    &mut unshare_state,
+                                    sync_mode,
+                                ) {
+                                    report.uncorrectable_blocks += 1;
+                                    report.errors.push(ScrubError::UncorrectableBlock {
+                                        table_id: self.id(),
+                                        path: self.path.to_path_buf(),
+                                        block_offset,
+                                        reason: alloc::format!(
+                                            "unshare hard-linked SST for heal: {reason}"
+                                        ),
+                                    });
+                                    continue;
+                                }
+                                let write_back = file
+                                    .seek(SeekFrom::Start(trailer_offset))
+                                    .and_then(|_| file.write_all(&fresh));
+                                // The write_all may have written some bytes even if it
+                                // then errored; mark the file as possibly mutated so a
+                                // later failure does not drop the attestation.
+                                write_attempted = true;
+                                let durable = match write_back {
+                                    Ok(()) => file
+                                        .sync_data_with(sync_mode)
+                                        .map_err(|e| alloc::format!("sync: {e}")),
+                                    Err(e) => Err(alloc::format!("write: {e}")),
+                                };
+                                if let Err(reason) = durable {
+                                    report.uncorrectable_blocks += 1;
+                                    report.errors.push(ScrubError::UncorrectableBlock {
+                                        table_id: self.id(),
+                                        path: self.path.to_path_buf(),
+                                        block_offset,
+                                        reason: alloc::format!("in-place parity rebuild {reason}"),
+                                    });
+                                    continue;
+                                }
+                                report.blocks_healed_in_place += 1;
+                            }
+                            Err(()) => {
+                                report.uncorrectable_blocks += 1;
+                                report.errors.push(ScrubError::UncorrectableBlock {
+                                    table_id: self.id(),
+                                    path: self.path.to_path_buf(),
+                                    block_offset,
+                                    reason: alloc::string::String::from(
+                                        "in-place heal: parity trailer unverifiable on a \
+                                     checksum-clean block",
+                                    ),
+                                });
+                            }
+                        }
+                    }
+                    // Recovered from parity: persist the corrected frame in place.
+                    Ok(crate::table::util::BlockScrubOutcome::Corrected { .. }) => {
+                        // Apply ONLY corrections the prediction pass attested. A block
+                        // that recovers now but was not in the predicted set (a fault
+                        // that appeared after the prediction) is left corrupt: writing
+                        // it would heal bytes the marker's digest never covered, so a
+                        // later checkpoint could snapshot them under the stale digest.
+                        // It stays RS-correctable, so the next patrol retries.
+                        if !predicted_offsets.contains(&block_offset) {
+                            continue;
+                        }
+                        let frame = match crate::table::block::Block::heal_frame(
+                            file.as_ref(),
+                            handle,
+                            &transform,
+                        ) {
+                            Ok(Some((frame, _kind))) => frame,
+                            // The scrub read corrected a fault but the confirming
+                            // re-read is already clean: a TRANSIENT fault the first
+                            // read hit and the re-read did not. This mirrors the
+                            // schedule path (`maybe_record_persistent_heal`), which
+                            // treats a clean confirmation re-read as transient and
+                            // does not act — there is nothing on disk to persist.
+                            Ok(None) => {
+                                log::debug!(
+                                    "in-place heal: transient correction on block at offset \
+                                 {block_offset} in table {} at {}; re-read clean, nothing to \
+                                 persist",
+                                    self.id(),
+                                    self.path.display(),
+                                );
+                                continue;
+                            }
+                            // A real read/decode error on the re-read: surface it
+                            // rather than silently skip the write-back.
+                            Err(e) => {
+                                report.uncorrectable_blocks += 1;
+                                report.errors.push(ScrubError::UncorrectableBlock {
+                                    table_id: self.id(),
+                                    path: self.path.to_path_buf(),
+                                    block_offset,
+                                    reason: alloc::format!(
+                                        "in-place heal: block scrubbed as corrected but the heal \
+                                     re-read failed: {e:?}"
+                                    ),
+                                });
+                                continue;
+                            }
+                        };
+                        // Attribution + the crash-recovery marker were captured UP
+                        // FRONT (before this loop). First write: make sure no
+                        // checkpoint link shares the inode (lazy detach).
+                        if let Err(reason) =
+                            self.ensure_unshared_for_write(&mut file, &mut unshare_state, sync_mode)
+                        {
                             report.uncorrectable_blocks += 1;
                             report.errors.push(ScrubError::UncorrectableBlock {
                                 table_id: self.id(),
                                 path: self.path.to_path_buf(),
                                 block_offset,
                                 reason: alloc::format!(
-                                    "in-place heal: block scrubbed as corrected but the heal \
-                                     re-read failed: {e:?}"
+                                    "unshare hard-linked SST for heal: {reason}"
                                 ),
                             });
                             continue;
                         }
-                    };
-                    // Attribution + the crash-recovery marker were captured UP
-                    // FRONT (before this loop). First write: make sure no
-                    // checkpoint link shares the inode (lazy detach).
-                    if let Err(reason) =
-                        self.ensure_unshared_for_write(&mut file, &mut unshare_state, sync_mode)
-                    {
-                        report.uncorrectable_blocks += 1;
-                        report.errors.push(ScrubError::UncorrectableBlock {
-                            table_id: self.id(),
-                            path: self.path.to_path_buf(),
-                            block_offset,
-                            reason: alloc::format!("unshare hard-linked SST for heal: {reason}"),
-                        });
-                        continue;
+                        // Seek + write (std::io) and sync (crate::io) carry different
+                        // error types, so each is handled separately; both render to
+                        // text for the finding. `sync_data` (not `sync_all`): the file
+                        // size is unchanged, so only the data needs flushing, and it
+                        // must land before the next block so a crash leaves the block
+                        // in its prior, still-RS-correctable state.
+                        let write_back = file
+                            .seek(SeekFrom::Start(block_offset))
+                            .and_then(|_| file.write_all(&frame));
+                        // The write_all may have written some bytes even if it then
+                        // errored (a partial write); mark the file as possibly mutated
+                        // so a later failure does not drop the attestation.
+                        //
+                        // Retaining the attestation across a failed sync is what lets
+                        // a later patrol attribute these bytes — but those bytes are
+                        // NOT durable yet, and that patrol may read them straight from
+                        // the page cache and find the table clean. Recording their
+                        // digest then would let a power loss discard the healed block
+                        // while the manifest keeps the post-heal digest. The
+                        // reconciliation therefore syncs the SST itself before
+                        // refreshing (and refuses the refresh when that sync fails);
+                        // see `crate::scrub`'s marker-based reconcile.
+                        write_attempted = true;
+                        let durable = match write_back {
+                            Ok(()) => file
+                                .sync_data_with(sync_mode)
+                                .map_err(|e| alloc::format!("sync: {e}")),
+                            Err(e) => Err(alloc::format!("write: {e}")),
+                        };
+                        if let Err(reason) = durable {
+                            report.uncorrectable_blocks += 1;
+                            log::error!(
+                                "in-place heal: write-back failed for block at offset \
+                             {block_offset} in table {} at {}: {reason}",
+                                self.id(),
+                                self.path.display(),
+                            );
+                            report.errors.push(ScrubError::UncorrectableBlock {
+                                table_id: self.id(),
+                                path: self.path.to_path_buf(),
+                                block_offset,
+                                reason: alloc::format!("in-place heal {reason}"),
+                            });
+                            continue;
+                        }
+                        report.corrections_applied += 1;
+                        report.blocks_healed_in_place += 1;
                     }
-                    // Seek + write (std::io) and sync (crate::io) carry different
-                    // error types, so each is handled separately; both render to
-                    // text for the finding. `sync_data` (not `sync_all`): the file
-                    // size is unchanged, so only the data needs flushing, and it
-                    // must land before the next block so a crash leaves the block
-                    // in its prior, still-RS-correctable state.
-                    let write_back = file
-                        .seek(SeekFrom::Start(block_offset))
-                        .and_then(|_| file.write_all(&frame));
-                    // The write_all may have written some bytes even if it then
-                    // errored (a partial write); mark the file as possibly mutated
-                    // so a later failure does not drop the attestation.
-                    //
-                    // Retaining the attestation across a failed sync is what lets
-                    // a later patrol attribute these bytes — but those bytes are
-                    // NOT durable yet, and that patrol may read them straight from
-                    // the page cache and find the table clean. Recording their
-                    // digest then would let a power loss discard the healed block
-                    // while the manifest keeps the post-heal digest. The
-                    // reconciliation therefore syncs the SST itself before
-                    // refreshing (and refuses the refresh when that sync fails);
-                    // see `crate::scrub`'s marker-based reconcile.
-                    write_attempted = true;
-                    let durable = match write_back {
-                        Ok(()) => file
-                            .sync_data_with(sync_mode)
-                            .map_err(|e| alloc::format!("sync: {e}")),
-                        Err(e) => Err(alloc::format!("write: {e}")),
-                    };
-                    if let Err(reason) = durable {
+                    Err(e) => {
                         report.uncorrectable_blocks += 1;
                         log::error!(
-                            "in-place heal: write-back failed for block at offset \
-                             {block_offset} in table {} at {}: {reason}",
+                            "in-place heal: uncorrectable block at offset {block_offset} in table \
+                         {} at {}: {e:?}",
                             self.id(),
                             self.path.display(),
                         );
@@ -2846,27 +3163,9 @@ impl Table {
                             table_id: self.id(),
                             path: self.path.to_path_buf(),
                             block_offset,
-                            reason: alloc::format!("in-place heal {reason}"),
+                            reason: alloc::format!("{e:?}"),
                         });
-                        continue;
                     }
-                    report.corrections_applied += 1;
-                    report.blocks_healed_in_place += 1;
-                }
-                Err(e) => {
-                    report.uncorrectable_blocks += 1;
-                    log::error!(
-                        "in-place heal: uncorrectable block at offset {block_offset} in table \
-                         {} at {}: {e:?}",
-                        self.id(),
-                        self.path.display(),
-                    );
-                    report.errors.push(ScrubError::UncorrectableBlock {
-                        table_id: self.id(),
-                        path: self.path.to_path_buf(),
-                        block_offset,
-                        reason: alloc::format!("{e:?}"),
-                    });
                 }
             }
         }
@@ -2910,23 +3209,23 @@ impl Table {
     fn heal_correction_for_block(
         &self,
         file: &dyn crate::fs::FsFile,
-        keyed: &KeyedBlockHandle,
+        handle: BlockHandle,
+        role: BlockType,
         transform: &crate::table::block::BlockTransform<'_>,
     ) -> crate::Result<Option<(u64, alloc::vec::Vec<u8>)>> {
         use crate::coding::Decode;
-        let block_offset = keyed.offset().0;
-        let handle = BlockHandle::new(keyed.offset(), keyed.size());
+        let block_offset = handle.offset().0;
         let outcome = crate::table::util::scrub_block(
             self.global_id(),
             &self.path,
             &self.file_accessor,
             &handle,
-            self.data_block_role(),
-            self.metadata.data_block_compression,
+            role,
+            self.compression_for_role(role),
             self.encryption.as_deref(),
             self.metadata.ecc_params,
             #[cfg(zstd_any)]
-            self.zstd_dictionary.as_deref(),
+            self.dictionary_for_role(role),
             None,
             #[cfg(feature = "metrics")]
             &self.metrics,
@@ -2938,11 +3237,11 @@ impl Table {
                 // failure (see the doc), but a decode / structural inconsistency
                 // leaves the bytes unchanged (`Ok(None)`), matching the write loop's
                 // report-and-skip.
-                let raw = crate::file::read_exact(file, block_offset, keyed.size() as usize)?;
+                let raw = crate::file::read_exact(file, block_offset, handle.size() as usize)?;
                 let Ok(raw_header) = crate::table::block::Header::decode_from(&mut &raw[..]) else {
                     return Ok(None);
                 };
-                if raw_header.block_type != self.data_block_role() {
+                if raw_header.block_type != role {
                     return Ok(None);
                 }
                 let header_len = crate::table::block::Header::header_len(raw_header.block_type);
@@ -3069,30 +3368,36 @@ impl Table {
             {
                 continue;
             }
-            let Some((write_offset, bytes)) =
-                self.heal_correction_for_block(file, &keyed, transform)?
-            else {
-                continue;
-            };
-            // Corrections are strictly increasing and non-overlapping, so a
-            // regression means the block index is damaged (or restamped) — and
-            // it must ABORT for the same reason the index-read failure above
-            // does: stopping here would return a digest and an offset set that
-            // omit every later block, and the write loop's `predicted_offsets`
-            // guard would then silently skip any correctable fault it finds
-            // there, reporting a clean heal over known damage.
-            let Some(gap) = write_offset.checked_sub(pos) else {
-                return Err(crate::Error::InvalidHeader(
-                    "block index yields a heal correction below the position already consumed",
-                ));
-            };
-            consume(&mut rdr, &mut hasher, &mut buf, gap, true)?;
-            hasher.update(&bytes);
-            let replaced = bytes.len() as u64;
-            consume(&mut rdr, &mut hasher, &mut buf, replaced, false)?;
-            pos = write_offset + replaced;
-            offsets.insert(write_offset);
-            // `bytes` is dropped here: only its offset is retained.
+            // An unreadable row-group directory aborts the prediction for the
+            // same reason an index-read failure does: its pages would silently
+            // drop out of the predicted offset set.
+            let blocks = self.data_unit_blocks(&BlockHandle::new(keyed.offset(), keyed.size()))?;
+            for (handle, role) in blocks {
+                let Some((write_offset, bytes)) =
+                    self.heal_correction_for_block(file, handle, role, transform)?
+                else {
+                    continue;
+                };
+                // Corrections are strictly increasing and non-overlapping, so a
+                // regression means the block index is damaged (or restamped) — and
+                // it must ABORT for the same reason the index-read failure above
+                // does: stopping here would return a digest and an offset set that
+                // omit every later block, and the write loop's `predicted_offsets`
+                // guard would then silently skip any correctable fault it finds
+                // there, reporting a clean heal over known damage.
+                let Some(gap) = write_offset.checked_sub(pos) else {
+                    return Err(crate::Error::InvalidHeader(
+                        "block index yields a heal correction below the position already consumed",
+                    ));
+                };
+                consume(&mut rdr, &mut hasher, &mut buf, gap, true)?;
+                hasher.update(&bytes);
+                let replaced = bytes.len() as u64;
+                consume(&mut rdr, &mut hasher, &mut buf, replaced, false)?;
+                pos = write_offset + replaced;
+                offsets.insert(write_offset);
+                // `bytes` is dropped here: only its offset is retained.
+            }
         }
 
         // Hash the untouched tail from the last correction to EOF.
@@ -3494,7 +3799,12 @@ impl Table {
                     "tli handles do not tile the index section",
                 ));
             }
-            self.verify_handles_frame_blocks(&handles, index_section.pos(), index_section.len())?;
+            self.verify_handles_frame_blocks(
+                &handles,
+                index_section.pos(),
+                index_section.len(),
+                FrameUnit::Block,
+            )?;
             let mut data_handles = alloc::vec::Vec::new();
             for top in &keyed {
                 let part = Self::read_tli_at(
@@ -3546,6 +3856,7 @@ impl Table {
                     &data_handles,
                     data_section.pos(),
                     data_section.len(),
+                    FrameUnit::DataUnit,
                 )?;
             }
         } else {
@@ -3555,7 +3866,12 @@ impl Table {
                 ));
             }
             if frame_blocks {
-                self.verify_handles_frame_blocks(&handles, data_section.pos(), data_section.len())?;
+                self.verify_handles_frame_blocks(
+                    &handles,
+                    data_section.pos(),
+                    data_section.len(),
+                    FrameUnit::DataUnit,
+                )?;
             }
         }
         Ok(())
@@ -3569,12 +3885,19 @@ impl Table {
     /// on a non-ECC block), so the separator cross-check passes too — yet
     /// every later physical block is unreachable through the index and
     /// reads silently miss its keys.
+    ///
+    /// `unit` says what one handle names in this section: a block for the
+    /// index section, a data unit for the data section. A columnar table's
+    /// data unit is a row group — several blocks under one handle by design —
+    /// so its frame is the group's, and the protection still holds: a forged
+    /// handle spanning two groups disagrees with the frame of one.
     #[cfg(feature = "std")]
     fn verify_handles_frame_blocks(
         &self,
         handles: &[BlockHandle],
         pos: u64,
         len: u64,
+        unit: FrameUnit,
     ) -> crate::Result<()> {
         // checked, not saturating: a re-stamped TOC could overflow `pos + len`,
         // and a saturated `u64::MAX` bound would then accept a forged oversized
@@ -3588,11 +3911,19 @@ impl Table {
         // them. Index-section handles sit above the (data-section) punch
         // offset and are never skipped.
         let punch = self.punch_offset()?;
+        let file = self.fs.open(&self.path, &FsOpenOptions::new().read(true))?;
         for handle in handles {
             if handle.offset().0 < punch {
                 continue;
             }
-            let probed = self.probe_block_handle_at(handle.offset().0, section_end)?;
+            let probed = match unit {
+                FrameUnit::Block => {
+                    self.probe_block_handle_in(&*file, handle.offset().0, section_end)?
+                }
+                FrameUnit::DataUnit => {
+                    self.probe_data_unit_in(&*file, handle.offset().0, section_end)?
+                }
+            };
             if probed.size() != handle.size() {
                 return Err(crate::Error::InvalidHeader(
                     "an index handle's size disagrees with its block's physical frame",
@@ -5717,8 +6048,7 @@ impl Table {
             // header copy plus a refcount bump on the payload, not a copy.
             #[cfg(feature = "columnar")]
             let (raw, frame, row, batch) = if self.metadata.columnar {
-                let (raw, frame) = self.load_block_from_disk(&handle, BlockType::Columnar)?;
-                let batch = crate::table::columnar::ColumnBatch::decode(&raw.data)?;
+                let (raw, frame, batch) = self.load_row_group_from_disk(&handle)?;
                 (raw, frame, None, Some(batch))
             } else {
                 let (raw, frame) = self.load_block_from_disk(&handle, BlockType::Data)?;
@@ -5765,6 +6095,41 @@ impl Table {
         Ok(())
     }
 
+    /// Loads a columnar row group STRAIGHT FROM THE FILE, bypassing the block
+    /// cache, for the reconcile gates — the reason [`Self::load_block_from_disk`]
+    /// exists, applied to every block of the group.
+    ///
+    /// Returns the directory block and its frame (the entry's first block,
+    /// which is what the gates that look at a raw block get for a columnar
+    /// table: pages carry no per-KV footer and no inner-frame layout, so those
+    /// gates have nothing further to check in a group) together with the
+    /// decoded batch.
+    #[cfg(all(feature = "columnar", feature = "std"))]
+    fn load_row_group_from_disk(
+        &self,
+        group: &BlockHandle,
+    ) -> crate::Result<(Block, crate::Slice, crate::table::columnar::ColumnBatch)> {
+        let mut blocks = self.data_unit_blocks(group)?.into_iter();
+        let Some((directory_handle, directory_role)) = blocks.next() else {
+            return Err(crate::Error::InvalidHeader(
+                "columnar: row group has no directory",
+            ));
+        };
+        let (directory, frame) = self.load_block_from_disk(&directory_handle, directory_role)?;
+        let directory_decoded = crate::table::column_page::PageDirectory::decode(&directory.data)?;
+        let mut pages = alloc::vec::Vec::with_capacity(directory_decoded.entries().len());
+        for (handle, role) in blocks {
+            pages.push(self.load_block_from_disk(&handle, role)?.0);
+        }
+        let batch = crate::table::util::RowGroupBlocks {
+            directory: directory_decoded,
+            pages,
+        }
+        // The gates are verification, which the counters leave out.
+        .to_batch(None, &mut 0)?;
+        Ok((directory, frame, batch))
+    }
+
     /// Decodes ONE data block's entries (row or columnar) into
     /// [`InternalValue`]s, disk-fresh ([`Self::load_block_from_disk`]).
     ///
@@ -5780,8 +6145,7 @@ impl Table {
         use crate::table::block::ParsedItem as _;
         #[cfg(feature = "columnar")]
         if self.metadata.columnar {
-            let (block, _frame) = self.load_block_from_disk(block_handle, BlockType::Columnar)?;
-            let batch = crate::table::columnar::ColumnBatch::decode(&block.data)?;
+            let (_, _, batch) = self.load_row_group_from_disk(block_handle)?;
             return crate::table::columnar::column_batch_to_entries(&batch);
         }
         let (block, _frame) = self.load_block_from_disk(block_handle, BlockType::Data)?;
@@ -7740,11 +8104,33 @@ impl Table {
                 || regions.locator.is_some();
             let expected = crate::table::filter::ribbon::burr::FORMAT_VERSION;
             if has_burr_section && metadata.filter_format != Some(expected) {
-                return Err(crate::Error::UnsupportedFilterFormat {
+                return Err(crate::Error::UnsupportedFormat {
+                    part: crate::FormatPart::Filter,
                     found: metadata.filter_format,
                     expected,
                 });
             }
+        }
+
+        // The same refusal for a columnar table's row groups, for the same
+        // reasons and with the same salvage-mode reasoning as above. It
+        // matters more here, not less: a row group read under the wrong
+        // layout fails as a block-role mismatch, which the recovery paths
+        // grade as DAMAGE, so without this a repair would drop every columnar
+        // table in a store awaiting conversion. Gated on the table being
+        // columnar: a row-major table has no row groups to misread. A build
+        // without the `columnar` feature reads no columnar layout at all and
+        // reports that on the first read, which is a different remedy from
+        // conversion, so the refusal is not raised there.
+        #[cfg(feature = "columnar")]
+        if metadata.columnar
+            && metadata.columnar_format != Some(crate::table::meta::COLUMNAR_FORMAT_VERSION)
+        {
+            return Err(crate::Error::UnsupportedFormat {
+                part: crate::FormatPart::Columnar,
+                found: metadata.columnar_format,
+                expected: crate::table::meta::COLUMNAR_FORMAT_VERSION,
+            });
         }
 
         // Resolve the dictionary this table was written against, by the id the

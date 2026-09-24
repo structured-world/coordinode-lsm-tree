@@ -281,17 +281,11 @@ fn encode_rejects_delta_on_a_non_fixed8_column() {
 }
 
 #[test]
-fn from_columnar_block_rejects_a_zero_row_block() {
-    // A zero-row columnar block is corrupt (the writer never spills empty);
+fn from_column_batch_rejects_a_zero_row_batch() {
+    // A zero-row columnar group is corrupt (the writer never spills empty);
     // reconstructing it must error, not panic in the row encoder.
-    let empty = entries_to_column_batch(&[])
-        .expect("transpose")
-        .encode(CodecId::Plain)
-        .expect("encode");
-    assert!(
-        crate::table::data_block::DataBlock::from_columnar_block(&empty.into(), 16, &mut 0)
-            .is_err()
-    );
+    let empty = entries_to_column_batch(&[]).expect("transpose");
+    assert!(crate::table::data_block::DataBlock::from_column_batch(empty, 16, &mut 0).is_err());
 }
 
 #[test]
@@ -879,14 +873,18 @@ fn columnar_decode_rejects_trailing_bytes() {
     assert!(ColumnBatch::decode(&encoded.clone().into()).is_err());
 }
 
-/// A decode that copied a validity bitmap and only then met a malformed tail
-/// did that copy: it is counted like the read a checksum later refuses.
+/// A page decode that copied a validity bitmap and only then met a malformed
+/// tail did that copy: it is counted like the read a checksum later refuses.
 #[test]
-fn columnar_decode_refused_after_copying_still_counts_the_copy() {
-    let mut encoded = sample_batch().encode(CodecId::Plain).expect("encode");
-    encoded.push(0); // one byte past the last declared column
+fn column_page_decode_refused_after_copying_still_counts_the_copy() {
+    let batch = sample_batch();
+    let nullable = batch.columns.first().expect("the nullable fixed column");
+    let mut page = nullable
+        .encode_page(batch.row_count, CodecId::Plain)
+        .expect("encode page");
+    page.push(0); // one byte past the page's column
     let mut copied = 0usize;
-    let decoded = ColumnBatch::decode_counting_copies(&encoded.into(), None, &mut copied);
+    let decoded = Column::decode_page(&page.into(), batch.row_count, &mut copied);
     assert!(decoded.is_err(), "trailing bytes must be refused");
     assert_eq!(
         copied, 1,
@@ -924,15 +922,9 @@ fn columnar_entries_refused_after_rebuilding_a_value_still_count_it() {
     });
     let vt_col = batch.columns.get_mut(2).expect("value-type column");
     vt_col.data = vec![u8::from(ValueType::Value), 0xEE].into();
-    let encoded: Slice = batch.encode(CodecId::Plain).expect("encode").into();
-    // What the decode itself copies (this block is small enough that its views
-    // are detached), counted on its own clause.
-    let mut decode_copies = 0usize;
-    ColumnBatch::decode_counting_copies(&encoded, None, &mut decode_copies).expect("decode");
 
     let mut gathered = 0usize;
-    let refused =
-        crate::table::data_block::DataBlock::columnar_block_entries(&encoded, &mut gathered);
+    let refused = crate::table::data_block::DataBlock::column_batch_entries(batch, &mut gathered);
     assert!(refused.is_err(), "the bad value-type tag must be refused");
     let first_row = frame_value_cells(&[
         (TypeTag::Fixed(4), &[1, 0, 0, 0][..]),
@@ -941,7 +933,7 @@ fn columnar_entries_refused_after_rebuilding_a_value_still_count_it() {
     .expect("frame");
     assert_eq!(
         gathered,
-        decode_copies + first_row.len(),
+        first_row.len(),
         "the first row's value was rebuilt before the refusal",
     );
 }

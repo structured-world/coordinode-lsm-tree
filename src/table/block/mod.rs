@@ -345,6 +345,17 @@ impl PreparedBlock<'_> {
         }
     }
 
+    /// Bytes this block will occupy once written, under the ECC scheme it was
+    /// prepared with.
+    ///
+    /// Known before the write because the transform has already run, which is
+    /// what lets a writer lay out several blocks and record where each one
+    /// lands before any of them reaches the file.
+    #[cfg(feature = "columnar")]
+    pub(crate) fn on_disk_len(&self, ecc: Option<EccParams>) -> u32 {
+        self.header.on_disk_size_with(ecc)
+    }
+
     /// Writes the framed block (header + payload + optional parity trailer)
     /// to `writer` and returns the header. This is the single point where
     /// block bytes hit the file, so it must run in on-disk order.
@@ -1387,10 +1398,6 @@ impl Block {
     ///
     /// `on_issue` runs once, immediately before the frame is read, so a handle
     /// refused by the checks above never reaches it.
-    #[expect(
-        clippy::too_many_lines,
-        reason = "two ways to OBTAIN the payload (encrypted Vec vs zero-copy Slice), each with its own size caps and trailer classification"
-    )]
     pub(crate) fn read_verified_payload(
         file: &dyn FsFile,
         handle: BlockHandle,
@@ -1475,6 +1482,65 @@ impl Block {
                 )));
             }
 
+            Self::verify_encrypted_frame(buf, handle, identity, transform, enc, enc_overhead)?
+        } else {
+            // Single I/O read — header + payload in one Slice.
+            on_issue();
+            let buf = crate::file::read_exact(file, *handle.offset(), handle.size() as usize)?;
+            Self::verify_plain_frame(&buf, handle, transform)?
+        };
+
+        Ok((header, payload, ecc_status, recovery))
+    }
+
+    /// Verifies one block's on-disk frame, already read, and hands back its
+    /// verified payload one step short of decompression.
+    ///
+    /// The second half of [`Self::read_verified_payload`], split out so a
+    /// caller that read several blocks in one request — a columnar row
+    /// group's pages — verifies each of them through exactly the code a block
+    /// read on its own goes through: the same size caps, trailer
+    /// classification, checksum, ECC recovery and decrypt, and the same
+    /// [`EccStatus`] for auto-heal to act on. `frame` must be exactly the
+    /// bytes `handle` names; `handle` also supplies the file offset errors and
+    /// logs report.
+    ///
+    /// # Errors
+    ///
+    /// As [`Self::read_verified_payload`], minus the I/O.
+    #[cfg(feature = "columnar")]
+    pub(crate) fn verify_frame(
+        frame: alloc::vec::Vec<u8>,
+        handle: BlockHandle,
+        identity: BlockIdentity,
+        transform: &BlockTransform<'_>,
+    ) -> crate::Result<(Header, Slice, EccStatus, Option<EccRecoveryKind>)> {
+        if frame.len() != handle.size() as usize {
+            return Err(crate::Error::InvalidHeader(
+                "Block: frame length disagrees with its handle",
+            ));
+        }
+        match transform.encryption() {
+            Some(enc) => {
+                let enc_overhead = u64::from(enc.max_overhead());
+                Self::verify_encrypted_frame(frame, handle, identity, transform, enc, enc_overhead)
+            }
+            None => Self::verify_plain_frame(&Slice::from(frame), handle, transform),
+        }
+    }
+
+    /// Verifies and decrypts an encrypted block's frame, read into an owned
+    /// buffer so the decrypt can run in place.
+    fn verify_encrypted_frame(
+        mut buf: alloc::vec::Vec<u8>,
+        handle: BlockHandle,
+        identity: BlockIdentity,
+        transform: &BlockTransform<'_>,
+        enc: &dyn crate::encryption::EncryptionProvider,
+        enc_overhead: u64,
+    ) -> crate::Result<(Header, Slice, EccStatus, Option<EccRecoveryKind>)> {
+        let block_size = buf.len();
+        {
             // `decode_from` reads exactly the header (variable: 33 or 34
             // bytes per block_type) and stops, leaving the payload untouched.
             let parsed_header = Header::decode_from(&mut &buf[..])?;
@@ -1592,17 +1658,24 @@ impl Block {
 
             let decrypted = decrypt_block_payload(enc, &buf, &identity)?;
 
-            (
+            Ok((
                 parsed_header,
                 Slice::from(decrypted),
                 ecc_status,
                 payload_corrected,
-            )
-        } else {
-            // Single I/O read — header + payload in one Slice.
-            on_issue();
-            let buf = crate::file::read_exact(file, *handle.offset(), handle.size() as usize)?;
+            ))
+        }
+    }
 
+    /// Verifies an unencrypted block's frame. The payload comes back as a view
+    /// of `buf` on the clean path, so no byte is copied that the reader did
+    /// not have to copy.
+    fn verify_plain_frame(
+        buf: &Slice,
+        handle: BlockHandle,
+        transform: &BlockTransform<'_>,
+    ) -> crate::Result<(Header, Slice, EccStatus, Option<EccRecoveryKind>)> {
+        {
             let parsed_header = Header::decode_from(&mut &buf[..])?;
             refuse_encrypted_without_provider(&parsed_header)?;
             let header_len = Header::header_len(parsed_header.block_type);
@@ -1700,10 +1773,8 @@ impl Block {
                 ecc_status
             };
 
-            (parsed_header, payload_slice, ecc_status, payload_corrected)
-        };
-
-        Ok((header, payload, ecc_status, recovery))
+            Ok((parsed_header, payload_slice, ecc_status, payload_corrected))
+        }
     }
 
     /// In-place autoheal primitive: read this block's on-disk frame and, if its

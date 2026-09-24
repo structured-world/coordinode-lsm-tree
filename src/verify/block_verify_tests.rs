@@ -2873,3 +2873,73 @@ fn codec_disagrees_everywhere_consults_sections_outside_the_mirrors() -> crate::
     );
     Ok(())
 }
+
+/// A healthy columnar SST verifies clean, and every block in its data section
+/// is walked.
+///
+/// The block walk checks each block's role against the roles its section is
+/// allowed to hold, and a columnar row group is not one block: it is a page
+/// directory followed by its pages, all in the data section. A walk that
+/// expected one role per row group would report every healthy columnar SST as
+/// carrying misrouted blocks — and one that skipped them would verify a data
+/// section it never looked at. Both are asserted against here: no finding,
+/// and more blocks walked than the table has row groups.
+#[cfg(feature = "columnar")]
+#[test]
+fn verify_sst_file_walks_a_healthy_columnar_sst_clean() -> crate::Result<()> {
+    use crate::table::Writer;
+
+    let dir = tempfile::tempdir()?;
+    let sst = dir.path().join("table");
+    let mut writer = Writer::new(sst.clone(), 0, 0, alloc::sync::Arc::new(crate::fs::StdFs))?
+        .use_columnar(true)
+        .use_zone_map(true)
+        .use_data_block_size(256);
+    for i in 0u32..200 {
+        writer.write(crate::InternalValue::from_components(
+            format!("key{i:05}").into_bytes(),
+            format!("val{i:05}").into_bytes(),
+            1,
+            crate::ValueType::Value,
+        ))?;
+    }
+    assert!(writer.finish()?.is_some(), "the SST is non-empty");
+
+    let report = verify_sst_file(&sst);
+    assert!(
+        report.is_ok(),
+        "a healthy columnar SST must verify clean: {:?}",
+        report.errors,
+    );
+    // 256-byte row groups over 200 rows give several groups; each is at least
+    // a directory and four pages, so a walk that visited only the entries
+    // (one block per group) would report fewer blocks than this.
+    let groups = {
+        let checksum = crate::Checksum::from_raw(crate::repair::compute_table_checksum(
+            &crate::fs::StdFs,
+            &sst,
+        )?);
+        let mut params = crate::table::RecoverParams::new(
+            sst,
+            checksum,
+            0,
+            alloc::sync::Arc::new(crate::fs::StdFs),
+            crate::comparator::default_comparator(),
+            alloc::sync::Arc::new(crate::cache::Cache::with_capacity_bytes(1 << 20)),
+        );
+        params.descriptor_table = Some(alloc::sync::Arc::new(
+            crate::descriptor_table::DescriptorTable::new(4),
+        ));
+        crate::table::Table::recover(params)?
+            .data_block_handles()
+            .filter_map(Result::ok)
+            .count()
+    };
+    assert!(groups > 1, "the fixture must span several row groups");
+    assert!(
+        report.blocks_scanned >= groups * 5,
+        "every directory and page must be walked: {} blocks for {groups} groups",
+        report.blocks_scanned,
+    );
+    Ok(())
+}

@@ -388,8 +388,8 @@ pub struct Iter {
     #[cfg(feature = "zstd")]
     data_block_restart_interval: u8,
 
-    /// Whether this SST's data blocks are columnar (PAX); when set, each block is
-    /// read as `BlockType::Columnar` and reconstructed into a row block.
+    /// Whether this SST's data entries are columnar (PAX) row groups; when set,
+    /// each entry is read as a row group and reconstructed into row entries.
     columnar: bool,
 
     /// Positional delete mask for a columnar SST with materialized deletes;
@@ -520,40 +520,38 @@ impl Iter {
         self
     }
 
-    /// Loads and resolves a data block by handle, dispatching on the SST layout:
-    /// a columnar SST's block is read as `BlockType::Columnar` and reconstructed
-    /// into a row-major block; a row SST's block is loaded directly. The
-    /// reconstructed block is in-memory, so a fixed restart interval yields a
-    /// correct, iterable block regardless of the SST's recorded value.
-    /// Loads, reconstructs (if columnar), and masks a data block by handle.
-    /// Returns `Ok(None)` when a columnar block is wholly deleted by the
-    /// positional mask, so the caller skips it.
+    /// Loads, reconstructs (if columnar), and masks a data block by handle,
+    /// dispatching on the SST layout: a columnar SST's entry is a row group,
+    /// read and decoded into its row entries; a row SST's is a data block,
+    /// loaded directly. Returns `Ok(None)` when a columnar group is wholly
+    /// deleted by the positional mask, so the caller skips it.
     fn load_and_resolve(&self, handle: &BlockHandle) -> crate::Result<Option<BlockSource>> {
-        let block_type = if self.columnar {
-            crate::table::block::BlockType::Columnar
-        } else {
-            crate::table::block::BlockType::Data
-        };
-        let raw = load_block(
-            self.table_id,
-            &self.path,
-            &self.file_accessor,
-            &self.cache,
-            handle,
-            block_type,
-            self.compression,
-            self.encryption.as_deref(),
-            self.ecc,
-            #[cfg(zstd_any)]
-            self.zstd_dictionary.as_deref(),
-            self.heal_hints.as_ref().map(AsRef::as_ref),
-            #[cfg(feature = "metrics")]
-            &self.metrics,
-            self.charge,
-        )?;
         if self.columnar {
             #[cfg(feature = "columnar")]
             {
+                let group = crate::table::util::load_row_group(
+                    self.table_id,
+                    &self.path,
+                    &self.file_accessor,
+                    &self.cache,
+                    handle,
+                    self.compression,
+                    self.encryption.as_deref(),
+                    self.ecc,
+                    #[cfg(zstd_any)]
+                    self.zstd_dictionary.as_deref(),
+                    self.heal_hints.as_ref().map(AsRef::as_ref),
+                    #[cfg(feature = "metrics")]
+                    &self.metrics,
+                    self.charge,
+                )?;
+                // What decoding the pages copied out of them, plus the values
+                // rebuilt from sub-columns below. Keys, and values of a single
+                // bytes column, are views into the decoded columns and cost
+                // nothing. Charged before the result is judged: a group
+                // refused after a gather still did it.
+                let mut gathered = 0usize;
+                let batch = group.to_batch(None, &mut gathered);
                 // Mask only when the segment has deletes AND this block's start row
                 // is known. The start-row map is built at open from the zone map
                 // (which covers every block), so an unmapped block is unreachable;
@@ -569,21 +567,15 @@ impl Iter {
                         .get(&handle.offset().0)
                         .map(|&start| (mask, start))
                 });
-                let mut gathered = 0usize;
-                let entries = if let Some((mask, start)) = masked {
-                    DataBlock::columnar_block_entries_masked(
-                        &raw.data,
+                let entries = batch.and_then(|batch| match masked {
+                    Some((mask, start)) => DataBlock::column_batch_entries_masked(
+                        batch,
                         &mask.bitmap,
                         start,
                         &mut gathered,
-                    )
-                } else {
-                    DataBlock::columnar_block_entries(&raw.data, &mut gathered).map(Some)
-                };
-                // Keys, and values of a single bytes column, are views into the
-                // decoded columns and cost nothing here; only values rebuilt
-                // from sub-columns are a gather. Charged before the result is
-                // judged: a block refused after a gather still did it.
+                    ),
+                    None => DataBlock::column_batch_entries(batch, &mut gathered).map(Some),
+                });
                 #[cfg(feature = "metrics")]
                 if self.charge.is_counted() {
                     self.metrics.record_gather(gathered);
@@ -597,6 +589,23 @@ impl Iter {
                 return Err(crate::Error::FeatureUnsupported("columnar"));
             }
         }
+        let raw = load_block(
+            self.table_id,
+            &self.path,
+            &self.file_accessor,
+            &self.cache,
+            handle,
+            crate::table::block::BlockType::Data,
+            self.compression,
+            self.encryption.as_deref(),
+            self.ecc,
+            #[cfg(zstd_any)]
+            self.zstd_dictionary.as_deref(),
+            self.heal_hints.as_ref().map(AsRef::as_ref),
+            #[cfg(feature = "metrics")]
+            &self.metrics,
+            self.charge,
+        )?;
         DataBlock::from_loaded(raw, self.has_kv_footer).map(|db| Some(BlockSource::Row(db)))
     }
 

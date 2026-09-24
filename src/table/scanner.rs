@@ -45,8 +45,8 @@ pub struct Scanner {
     /// per-block reads via `BlockIdentity`.
     table_id: crate::TableId,
 
-    /// Whether this SST stores columnar (PAX) data blocks. When set, each
-    /// fetched block is read as `BlockType::Columnar` and reconstructed into a
+    /// Whether this SST stores columnar (PAX) row groups. When set, each
+    /// group is read as its directory and pages and reconstructed into a
     /// row-major block so the scan iterator is unchanged.
     columnar: bool,
     /// Data-block restart interval, used to re-encode a reconstructed columnar
@@ -176,14 +176,51 @@ impl Scanner {
         restart_interval: u8,
         #[cfg(zstd_any)] zstd_dict: Option<&crate::compression::ZstdDictionary>,
     ) -> crate::Result<DataBlock> {
-        // A columnar SST's blocks are tagged (and AAD-bound) as Columnar; read
-        // them under that identity so verification / decryption matches.
-        let block_type = if columnar {
-            BlockType::Columnar
-        } else {
-            BlockType::Data
-        };
-        let block = Block::from_reader(
+        if columnar {
+            return Self::fetch_next_row_group(
+                reader,
+                table_id,
+                compression,
+                encryption,
+                ecc,
+                restart_interval,
+                #[cfg(zstd_any)]
+                zstd_dict,
+            );
+        }
+        let block = Self::read_block(
+            reader,
+            table_id,
+            BlockType::Data,
+            compression,
+            encryption,
+            ecc,
+            #[cfg(zstd_any)]
+            zstd_dict,
+        )?;
+        // A row block must be BlockType::Data. `from_loaded` strips the per-KV
+        // checksum footer when this SST carries one (per-SST `has_kv_footer`,
+        // since data blocks omit the byte).
+        if block.header.block_type != BlockType::Data {
+            return Err(crate::Error::InvalidTag((
+                "BlockType",
+                block.header.block_type.into(),
+            )));
+        }
+        DataBlock::from_loaded(block, has_kv_footer)
+    }
+
+    /// Reads the next block from the stream under `block_type`'s identity.
+    fn read_block(
+        reader: &mut BufReader<Box<dyn FsFile>>,
+        table_id: crate::TableId,
+        block_type: BlockType,
+        compression: CompressionType,
+        encryption: Option<&dyn EncryptionProvider>,
+        ecc: Option<crate::table::block::EccParams>,
+        #[cfg(zstd_any)] zstd_dict: Option<&crate::compression::ZstdDictionary>,
+    ) -> crate::Result<Block> {
+        Block::from_reader(
             reader,
             crate::table::block::BlockIdentity {
                 table_id,
@@ -209,45 +246,90 @@ impl Scanner {
                     t
                 }
             },
-        );
-
-        match block {
-            Ok(block) => {
-                // Columnar blocks are reconstructed into row blocks; a row block
-                // must be BlockType::Data. `from_loaded` strips the per-KV
-                // checksum footer when this SST carries one (per-SST
-                // `has_kv_footer`, since data blocks omit the byte).
-                if columnar {
-                    return Self::reconstruct_columnar(&block, restart_interval);
-                }
-                if block.header.block_type != BlockType::Data {
-                    return Err(crate::Error::InvalidTag((
-                        "BlockType",
-                        block.header.block_type.into(),
-                    )));
-                }
-
-                DataBlock::from_loaded(block, has_kv_footer)
-            }
-            Err(e) => Err(e),
-        }
+        )
     }
 
-    /// Reconstructs a row-major [`DataBlock`] from a loaded columnar block. With
-    /// the `columnar` feature this re-encodes the PAX block; without the feature
-    /// a columnar SST cannot be read.
-    fn reconstruct_columnar(block: &Block, restart_interval: u8) -> crate::Result<DataBlock> {
-        #[cfg(feature = "columnar")]
-        {
-            // The scanner feeds compaction, which is maintenance and outside
-            // the read counters, so the rebuilt-value count is not charged.
-            DataBlock::from_columnar_block(&block.data, restart_interval, &mut 0)
+    /// Reads one columnar row group from the stream — its directory, then its
+    /// pages, which follow it back to back — and reconstructs it into a
+    /// row-major [`DataBlock`].
+    ///
+    /// The stream has no index entry to check the group against, so each page
+    /// is checked against the directory instead: a page whose on-disk length
+    /// differs from the length the directory records means the stream and the
+    /// directory disagree about where the next block starts, and every block
+    /// read after that point would be misframed.
+    #[cfg(feature = "columnar")]
+    fn fetch_next_row_group(
+        reader: &mut BufReader<Box<dyn FsFile>>,
+        table_id: crate::TableId,
+        compression: CompressionType,
+        encryption: Option<&dyn EncryptionProvider>,
+        ecc: Option<crate::table::block::EccParams>,
+        restart_interval: u8,
+        #[cfg(zstd_any)] zstd_dict: Option<&crate::compression::ZstdDictionary>,
+    ) -> crate::Result<DataBlock> {
+        let directory_block = Self::read_block(
+            reader,
+            table_id,
+            BlockType::ColumnPageDirectory,
+            CompressionType::None,
+            encryption,
+            ecc,
+            #[cfg(zstd_any)]
+            None,
+        )?;
+        if directory_block.header.block_type != BlockType::ColumnPageDirectory {
+            return Err(crate::Error::InvalidTag((
+                "BlockType",
+                directory_block.header.block_type.into(),
+            )));
         }
-        #[cfg(not(feature = "columnar"))]
-        {
-            let _ = (block, restart_interval);
-            Err(crate::Error::FeatureUnsupported("columnar"))
+        let directory = crate::table::column_page::PageDirectory::decode(&directory_block.data)?;
+        let mut pages = Vec::with_capacity(directory.entries().len());
+        for entry in directory.entries() {
+            let page = Self::read_block(
+                reader,
+                table_id,
+                BlockType::ColumnPage,
+                compression,
+                encryption,
+                ecc,
+                #[cfg(zstd_any)]
+                zstd_dict,
+            )?;
+            if page.header.block_type != BlockType::ColumnPage {
+                return Err(crate::Error::InvalidTag((
+                    "BlockType",
+                    page.header.block_type.into(),
+                )));
+            }
+            if page.header.on_disk_size_with(ecc) != entry.length {
+                return Err(crate::Error::InvalidHeader(
+                    "columnar: page length disagrees with its directory entry",
+                ));
+            }
+            pages.push(page);
         }
+        // The scanner feeds compaction, which is maintenance and outside the
+        // read counters, so neither the page copies nor the rebuilt values are
+        // charged.
+        let batch =
+            crate::table::util::RowGroupBlocks { directory, pages }.to_batch(None, &mut 0)?;
+        DataBlock::from_column_batch(batch, restart_interval, &mut 0)
+    }
+
+    /// Without the `columnar` feature a columnar SST cannot be read.
+    #[cfg(not(feature = "columnar"))]
+    fn fetch_next_row_group(
+        _reader: &mut BufReader<Box<dyn FsFile>>,
+        _table_id: crate::TableId,
+        _compression: CompressionType,
+        _encryption: Option<&dyn EncryptionProvider>,
+        _ecc: Option<crate::table::block::EccParams>,
+        _restart_interval: u8,
+        #[cfg(zstd_any)] _zstd_dict: Option<&crate::compression::ZstdDictionary>,
+    ) -> crate::Result<DataBlock> {
+        Err(crate::Error::FeatureUnsupported("columnar"))
     }
 }
 

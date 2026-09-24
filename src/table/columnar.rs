@@ -1,18 +1,18 @@
 // SPDX-License-Identifier: Apache-2.0
 // Copyright (c) 2026-present, Dmitry Prudnikov
 
-//! Columnar (PAX / rowgroup) block format and the [`ColumnBatch`] read unit.
+//! Columnar (PAX / rowgroup) column format and the [`ColumnBatch`] read unit.
 //!
-//! A columnar block holds a row-group laid out column-by-column: each column is
-//! an opaque, typed, codec-tagged byte array plus an optional validity bitmap.
-//! The engine attaches no relational or graph meaning to a column; it knows
-//! only the physical [`TypeTag`], the [`CodecId`] used to encode the bytes, and
-//! a caller-assigned `column_id`. This is the payload of a
-//! [`BlockType::Columnar`](crate::table::block::BlockType::Columnar) block. The
-//! intrinsic-field transpose ([`entries_to_column_batch`] and back), the
-//! encode, and the decode path are all `core` + `alloc` and live here; wiring
-//! the transpose into the flush / compaction writer is std-only and lands
-//! separately.
+//! A row group is laid out column-by-column: each column is an opaque, typed,
+//! codec-tagged byte array plus an optional validity bitmap. The engine
+//! attaches no relational or graph meaning to a column; it knows only the
+//! physical [`TypeTag`], the [`CodecId`] used to encode the bytes, and a
+//! caller-assigned `column_id`. On disk each column is its own
+//! [`BlockType::ColumnPage`](crate::table::block::BlockType::ColumnPage),
+//! found through the group's page directory. The intrinsic-field transpose
+//! ([`entries_to_column_batch`] and back), the encode, and the decode path are
+//! all `core` + `alloc` and live here; wiring the transpose into the flush /
+//! compaction writer is std-only and lands separately.
 //!
 //! # Examples
 //!
@@ -256,8 +256,8 @@ pub struct Column {
     pub data: crate::Slice,
 }
 
-/// A decoded columnar row-group: the read unit obtained by decoding a
-/// [`BlockType::Columnar`](crate::table::block::BlockType::Columnar) block.
+/// A decoded columnar row-group: the read unit obtained by decoding a row
+/// group's [`BlockType::ColumnPage`](crate::table::block::BlockType::ColumnPage)s.
 #[derive(Clone, Debug, Eq, PartialEq)]
 pub struct ColumnBatch {
     /// Number of rows every column in the batch describes.
@@ -375,6 +375,151 @@ impl Column {
             check_validity(v, row_count)?;
         }
         Ok(())
+    }
+
+    /// Appends this column's wire form to `out`: its header, validity and data,
+    /// under a type-directed codec where one applies and `default_codec`
+    /// otherwise.
+    ///
+    /// This is the unit a column page carries, and the unit
+    /// [`ColumnBatch::encode`] concatenates, so the two cannot drift apart.
+    #[expect(
+        clippy::cast_possible_truncation,
+        reason = "a column's data length is bounded by the block size policy, far below u32::MAX"
+    )]
+    fn encode_into(&self, row_count: u32, default_codec: CodecId, out: &mut Vec<u8>) -> Result<()> {
+        self.validate(row_count)?;
+        // Pick a type-directed codec (e.g. Delta on the seqno column),
+        // falling back to the caller's default; record it per column.
+        let codec = auto_codec(self.column_id, self.type_tag).unwrap_or(default_codec);
+        // Plain is the identity, so its data is written straight from the
+        // column rather than through a copy that would only be copied again.
+        let recoded = match codec {
+            CodecId::Plain => None,
+            CodecId::Delta => Some(codec_encode(codec, self.type_tag, &self.data)?),
+        };
+        let data: &[u8] = recoded.as_deref().unwrap_or(&self.data);
+        let (type_tag, width) = self.type_tag.to_wire();
+        out.extend_from_slice(&self.column_id.to_le_bytes());
+        out.push(type_tag);
+        out.push(width);
+        out.push(codec.into());
+        out.push(u8::from(self.validity.is_some()));
+        out.extend_from_slice(&(data.len() as u32).to_le_bytes());
+        if let Some(v) = &self.validity {
+            out.extend_from_slice(v);
+        }
+        out.extend_from_slice(data);
+        Ok(())
+    }
+
+    /// The payload of this column's page: its wire form and nothing else.
+    ///
+    /// # Errors
+    ///
+    /// As [`ColumnBatch::encode`], for this one column.
+    pub(crate) fn encode_page(&self, row_count: u32, default_codec: CodecId) -> Result<Vec<u8>> {
+        let mut out = Vec::new();
+        self.encode_into(row_count, default_codec, &mut out)?;
+        Ok(out)
+    }
+
+    /// Decodes a column page's payload for a group of `row_count` rows.
+    ///
+    /// A `Plain` column comes back as a zero-copy view of `bytes`, which here
+    /// is the page's own payload rather than a whole row group's, so holding
+    /// the column keeps exactly its own page alive and nothing else.
+    ///
+    /// # Errors
+    ///
+    /// Returns [`Error::InvalidHeader`] for a malformed column, or for bytes
+    /// left over after it: a page holds one column, and a tail means either a
+    /// writer this build does not understand or a corruption.
+    ///
+    /// Adds to `copied` the validity bitmap it copies out of the page.
+    pub(crate) fn decode_page(
+        bytes: &crate::Slice,
+        row_count: u32,
+        copied: &mut usize,
+    ) -> Result<Self> {
+        let mut cur = Cursor::new(bytes);
+        let (column, _) = Self::decode_from(&mut cur, bytes, row_count, |_| true, copied)?.ok_or(
+            Error::InvalidHeader("columnar: page column was not decoded"),
+        )?;
+        if !cur.is_empty() {
+            return Err(Error::InvalidHeader(
+                "columnar: trailing bytes after the page's column",
+            ));
+        }
+        Ok(column)
+    }
+
+    /// Reads one column's wire form from `cur`, which walks `bytes`.
+    ///
+    /// Returns `None` when `want` is false: the column's validity and data are
+    /// stepped over — still bounds-checked — but never copied or
+    /// codec-decoded, which is what a projection pays for a column it did not
+    /// ask for. The second field is the length of a zero-copy view into
+    /// `bytes`, zero when the column had to be re-coded into its own buffer,
+    /// so a caller can decide whether keeping `bytes` alive for the view is
+    /// proportionate. Adds the validity bitmap it copies out to `copied` as
+    /// the copy is made, so a column refused afterwards still counts it.
+    fn decode_from(
+        cur: &mut Cursor<'_>,
+        bytes: &crate::Slice,
+        row_count: u32,
+        want: impl Fn(u16) -> bool,
+        copied: &mut usize,
+    ) -> Result<Option<(Self, usize)>> {
+        let column_id = cur.read_u16()?;
+        let type_tag = cur.read_u8()?;
+        let width = cur.read_u8()?;
+        let codec = CodecId::try_from(cur.read_u8()?)?;
+        let has_validity = match cur.read_u8()? {
+            0 => false,
+            1 => true,
+            _ => {
+                return Err(Error::InvalidHeader(
+                    "columnar: validity flag must be 0 or 1",
+                ));
+            }
+        };
+        let data_len = cur.read_u32()? as usize;
+        let type_tag = TypeTag::from_wire(type_tag, width)?;
+        let want = want(column_id);
+        let validity = if has_validity {
+            let v = cur.read_bytes(validity_len(row_count))?;
+            if want {
+                *copied += v.len();
+                Some(v.to_vec())
+            } else {
+                None
+            }
+        } else {
+            None
+        };
+        let data_start = cur.pos;
+        let raw = cur.read_bytes(data_len)?;
+        if !want {
+            return Ok(None);
+        }
+        // Restore the column's logical bytes from its stored codec form.
+        // Plain is the identity: the column is served as a zero-copy view
+        // of `bytes`. Delta re-codes into an owned buffer.
+        let (data, viewed) = match codec {
+            CodecId::Plain => (bytes.slice(data_start..data_start + data_len), data_len),
+            CodecId::Delta => (crate::Slice::from(codec_decode(codec, type_tag, raw)?), 0),
+        };
+        let column = Self {
+            column_id,
+            type_tag,
+            validity,
+            data,
+        };
+        // Same well-formedness gate the encoder runs, so a payload decodes
+        // iff it could have been produced by `encode_into`.
+        column.validate(row_count)?;
+        Ok(Some((column, viewed)))
     }
 }
 
@@ -613,22 +758,7 @@ impl ColumnBatch {
         out.extend_from_slice(&self.row_count.to_le_bytes());
         out.extend_from_slice(&(self.columns.len() as u32).to_le_bytes());
         for col in &self.columns {
-            col.validate(self.row_count)?;
-            // Pick a type-directed codec (e.g. Delta on the seqno column),
-            // falling back to the caller's default; record it per column.
-            let col_codec = auto_codec(col.column_id, col.type_tag).unwrap_or(codec);
-            let encoded = codec_encode(col_codec, col.type_tag, &col.data)?;
-            let (type_tag, width) = col.type_tag.to_wire();
-            out.extend_from_slice(&col.column_id.to_le_bytes());
-            out.push(type_tag);
-            out.push(width);
-            out.push(col_codec.into());
-            out.push(u8::from(col.validity.is_some()));
-            out.extend_from_slice(&(encoded.len() as u32).to_le_bytes());
-            if let Some(v) = &col.validity {
-                out.extend_from_slice(v);
-            }
-            out.extend_from_slice(&encoded);
+            col.encode_into(self.row_count, codec, &mut out)?;
         }
         Ok(out)
     }
@@ -643,7 +773,7 @@ impl ColumnBatch {
     /// validity flag, or any column that fails [`Column::validate`] (fixed-width
     /// length, `Bytes` offset framing, validity bitmap length / padding).
     pub fn decode(bytes: &crate::Slice) -> Result<Self> {
-        Self::decode_inner(bytes, None, &mut 0)
+        Self::decode_inner(bytes, None)
     }
 
     /// Decodes only the columns whose id is in `wanted`, advancing past every
@@ -657,19 +787,7 @@ impl ColumnBatch {
     /// As [`ColumnBatch::decode`], evaluated only for the projected columns
     /// (the headers of skipped columns are still framing-checked).
     pub fn decode_projected(bytes: &crate::Slice, wanted: &[u16]) -> Result<Self> {
-        Self::decode_inner(bytes, Some(wanted), &mut 0)
-    }
-
-    /// [`ColumnBatch::decode`] or, with `Some(wanted)`,
-    /// [`ColumnBatch::decode_projected`], also adding to `copied` the bytes
-    /// the decode copied out of the block: validity bitmaps, and `Plain`
-    /// columns detached from it. Read paths charge those to the gather counter.
-    pub(crate) fn decode_counting_copies(
-        bytes: &crate::Slice,
-        wanted: Option<&[u16]>,
-        copied: &mut usize,
-    ) -> Result<Self> {
-        Self::decode_inner(bytes, wanted, copied)
+        Self::decode_inner(bytes, Some(wanted))
     }
 
     /// Shared decode body. `wanted == None` decodes every column; `Some(ids)`
@@ -679,14 +797,10 @@ impl ColumnBatch {
     /// Takes the refcounted block bytes so `Plain` columns come back as
     /// zero-copy views of the block instead of per-column copies — as long as
     /// the projection covers enough of the block for a view to be worth what
-    /// it retains (see [`MAX_VIEW_AMPLIFICATION`]). Adds to `copied` each copy
-    /// out of the block as it is made, so a payload refused after one still
-    /// counts it.
-    fn decode_inner(
-        bytes: &crate::Slice,
-        wanted: Option<&[u16]>,
-        copied: &mut usize,
-    ) -> Result<Self> {
+    /// it retains (see [`MAX_VIEW_AMPLIFICATION`]). No read path decodes a
+    /// whole batch payload (a table's reads decode pages, and count their
+    /// copies there), so nothing here is counted.
+    fn decode_inner(bytes: &crate::Slice, wanted: Option<&[u16]>) -> Result<Self> {
         // Smallest possible column: id(2) + type(1) + width(1) + codec(1) +
         // has_validity(1) + data_len(4), with empty validity + data.
         const MIN_COLUMN_BYTES: usize = 10;
@@ -707,61 +821,17 @@ impl ColumnBatch {
         // the whole block alive for them is proportionate.
         let mut viewed_bytes = 0usize;
         let mut view_columns: Vec<usize> = Vec::new();
+        let want = |id: u16| wanted.is_none_or(|w| w.contains(&id));
         for _ in 0..column_count {
-            let column_id = cur.read_u16()?;
-            let type_tag = cur.read_u8()?;
-            let width = cur.read_u8()?;
-            let codec = CodecId::try_from(cur.read_u8()?)?;
-            let has_validity = match cur.read_u8()? {
-                0 => false,
-                1 => true,
-                _ => {
-                    return Err(Error::InvalidHeader(
-                        "columnar: validity flag must be 0 or 1",
-                    ));
-                }
-            };
-            let data_len = cur.read_u32()? as usize;
-            let type_tag = TypeTag::from_wire(type_tag, width)?;
-            // A skipped column's validity + data are stepped over (the cursor
-            // still bounds-checks the lengths) but never copied or codec-decoded.
-            let want = wanted.is_none_or(|w| w.contains(&column_id));
-            let validity = if has_validity {
-                let v = cur.read_bytes(validity_len(row_count))?;
-                if want {
-                    *copied += v.len();
-                    Some(v.to_vec())
-                } else {
-                    None
-                }
-            } else {
-                None
-            };
-            let data_start = cur.pos;
-            let raw = cur.read_bytes(data_len)?;
-            if !want {
+            let Some((column, viewed)) =
+                Column::decode_from(&mut cur, bytes, row_count, want, &mut 0)?
+            else {
                 continue;
+            };
+            if viewed > 0 {
+                viewed_bytes += viewed;
+                view_columns.push(columns.len());
             }
-            // Restore the column's logical bytes from its stored codec form.
-            // Plain is the identity: the column is served as a zero-copy view
-            // of the block bytes. Delta re-codes into an owned buffer.
-            let data = match codec {
-                CodecId::Plain => {
-                    viewed_bytes += data_len;
-                    view_columns.push(columns.len());
-                    bytes.slice(data_start..data_start + data_len)
-                }
-                CodecId::Delta => crate::Slice::from(codec_decode(codec, type_tag, raw)?),
-            };
-            let column = Column {
-                column_id,
-                type_tag,
-                validity,
-                data,
-            };
-            // Same well-formedness gate the encoder runs, so a payload decodes
-            // iff it could have been produced by `encode`.
-            column.validate(row_count)?;
             columns.push(column);
         }
         // Checked before the retention detach below, so a refused payload is
@@ -782,7 +852,6 @@ impl ColumnBatch {
         if !view_columns.is_empty() && bytes.len() > MAX_VIEW_AMPLIFICATION * viewed_bytes {
             for idx in view_columns {
                 if let Some(col) = columns.get_mut(idx) {
-                    *copied += col.data.len();
                     col.data = crate::Slice::from(&col.data[..]);
                 }
             }
