@@ -308,6 +308,74 @@ fn one_table_reads_the_same_rows_under_any_budget_and_fewer_requests_under_a_lar
     );
 }
 
+/// A projection of every column reads each group in one request, as a row
+/// scan does, once the first group has shown it wants every page: reading the
+/// directory first and then the pages would double the requests of the scan
+/// that has least use for the directory.
+#[test]
+fn a_projection_of_every_column_reads_each_group_in_one_request() {
+    use lsm_tree::config::BlockSizePolicy;
+    use lsm_tree::fs::{FaultFs, StdFs};
+    use lsm_tree::table::columnar::{COL_SEQNO, COL_USER_KEY, COL_VALUE, COL_VALUE_TYPE};
+
+    let folder = get_tmp_folder();
+    let open = |fs: FaultFs<StdFs>| {
+        let any = Config::new(
+            folder.path(),
+            SequenceNumberCounter::default(),
+            SequenceNumberCounter::default(),
+        )
+        .with_fs(fs)
+        .columnar_row_group_size_policy(BlockSizePolicy::all(16 * 1_024))
+        .open()
+        .expect("open");
+        let AnyTree::Standard(tree) = any else {
+            panic!("expected standard tree");
+        };
+        tree.update_runtime_config(|cfg| cfg.columnar = true)
+            .expect("enable columnar");
+        tree
+    };
+    {
+        let tree = open(FaultFs::new(StdFs));
+        for i in 0..20_000u32 {
+            tree.insert(key(i), value(i), 0);
+        }
+        tree.flush_active_memtable(0).expect("flush");
+    }
+    let cold_requests = |scan: &dyn Fn(&lsm_tree::Tree) -> usize| {
+        let fs = FaultFs::new(StdFs);
+        let reads = fs.injector();
+        let tree = open(fs);
+        let before = reads.read_count();
+        let rows = scan(&tree);
+        assert_eq!(rows, 20_000, "the scan returns every row");
+        reads.read_count() - before
+    };
+
+    let row_scan =
+        cold_requests(&|tree| tree.range(key(0)..key(999_999), SeqNo::MAX, None).count());
+    let projection = cold_requests(&|tree| {
+        tree.columnar_scan(
+            &[COL_USER_KEY, COL_SEQNO, COL_VALUE_TYPE, COL_VALUE],
+            None,
+            SeqNo::MAX,
+            ..,
+        )
+        .expect("scan")
+        .map(|batch| batch.expect("batch").row_count as usize)
+        .sum()
+    });
+    assert!(
+        row_scan > 10,
+        "the fixture spans many groups: {row_scan} requests"
+    );
+    assert!(
+        projection <= row_scan + 1,
+        "a projection of every column took {projection} requests, a row scan {row_scan}",
+    );
+}
+
 #[test]
 fn columnar_tombstone_hides_row() {
     let folder = get_tmp_folder();

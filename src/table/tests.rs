@@ -7911,10 +7911,7 @@ fn a_projection_never_reads_a_corrupt_page_it_does_not_want() -> crate::Result<(
     let table = Table::recover(test_recover_params(file.clone(), checksum))?;
     let keys = table.load_row_group(
         &group,
-        &PageWant {
-            columns: Some(&[COL_USER_KEY]),
-            ..PageWant::ALL
-        },
+        &PageWant::projected(&[COL_USER_KEY], crate::table::row_group::RowPageSelect::All),
         ReadCharge::Foreground,
     )?;
     assert!(keys.row_count() > 0, "the key projection reads its rows");
@@ -8027,10 +8024,7 @@ fn a_projection_refuses_a_directory_longer_than_its_group() -> crate::Result<()>
     let err = table
         .load_row_group(
             &clipped,
-            &PageWant {
-                columns: Some(&[COL_USER_KEY]),
-                ..PageWant::ALL
-            },
+            &PageWant::projected(&[COL_USER_KEY], crate::table::row_group::RowPageSelect::All),
             ReadCharge::Foreground,
         )
         .expect_err("a directory past the group's end must be refused");
@@ -8529,10 +8523,7 @@ fn a_failed_page_read_fails_only_the_reads_that_need_the_page() -> crate::Result
         );
         let keys_only = table.load_row_group(
             &group,
-            &PageWant {
-                columns: Some(&[COL_USER_KEY]),
-                row_pages: RowPageSelect::All,
-            },
+            &PageWant::projected(&[COL_USER_KEY], RowPageSelect::All),
             ReadCharge::Foreground,
         )?;
         assert_eq!(

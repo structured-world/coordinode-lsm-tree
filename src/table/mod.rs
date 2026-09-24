@@ -1912,14 +1912,14 @@ impl Table {
         // byte-wise zone of the row page holding it, whatever the key order.
         let keys = self.load_row_group(
             handle,
-            &PageWant {
-                columns: Some(&[COL_USER_KEY]),
-                row_pages: RowPageSelect::Zone {
+            &PageWant::projected(
+                &[COL_USER_KEY],
+                RowPageSelect::Zone {
                     column_id: COL_USER_KEY,
                     lower: Some(needle),
                     upper: Some(needle),
                 },
-            },
+            ),
             ReadCharge::Foreground,
         )?;
         // The key's versions are one run of rows, sorted with the rest of the
@@ -1967,6 +1967,7 @@ impl Table {
             &PageWant {
                 columns: None,
                 row_pages: RowPageSelect::Range(row_pages),
+                whole: false,
             },
             ReadCharge::Foreground,
         )?;
@@ -2034,19 +2035,23 @@ impl Table {
     /// reading them. The returned batches, one per row page read, carry the
     /// requested columns for those rows. This is the projection read the
     /// vectorized scan uses, distinct from the whole-block reconstruction that
-    /// the row read paths use.
+    /// the row read paths use. `whole` is [`PageWant::whole`].
+    ///
+    /// [`PageWant::whole`]: crate::table::row_group::PageWant::whole
     #[cfg(feature = "columnar")]
     fn load_columnar_block_projected(
         &self,
         handle: &BlockHandle,
         projection: &[u16],
         row_pages: crate::table::row_group::RowPageSelect<'_>,
+        whole: bool,
     ) -> crate::Result<crate::table::row_group::RowPages> {
         self.load_row_group(
             handle,
             &crate::table::row_group::PageWant {
                 columns: Some(projection),
                 row_pages,
+                whole,
             },
             ReadCharge::Foreground,
         )
@@ -7617,6 +7622,11 @@ impl Table {
         let mut first_live_block = restrict.is_some();
         let mut row_base: u32 = 0;
         let mut out = Vec::new();
+        // A projection that took every page of the last group it read most
+        // likely takes every page of the next one too, so that one is read
+        // in one request rather than directory first. Being wrong costs only
+        // the bytes of the pages it turns out not to want.
+        let mut expect_whole = false;
         for keyed in self.block_index.iter() {
             let keyed = keyed?;
             if let Some(bound) = restrict
@@ -7666,7 +7676,14 @@ impl Table {
                 ordinals,
                 starts,
                 batches,
-            } = self.load_columnar_block_projected(&handle, &decode_projection, select())?;
+                every_page,
+            } = self.load_columnar_block_projected(
+                &handle,
+                &decode_projection,
+                select(),
+                expect_whole,
+            )?;
+            expect_whole = every_page;
             // The straddling block's key column, decoded separately (one extra
             // cached read for at most one block per scan) so the main
             // projection stays untouched: it masks the rows below the bound.
@@ -7679,6 +7696,7 @@ impl Table {
                         &handle,
                         &[crate::table::columnar::COL_USER_KEY],
                         select(),
+                        false,
                     )?,
                 )),
                 _ => None,

@@ -562,9 +562,12 @@ impl Column {
                 "columnar: page belongs to another row group, column part or row page",
             ));
         }
-        let (column, _) = Self::decode_from(&mut cur, bytes, row_count, |_| true, copied)?.ok_or(
-            Error::InvalidHeader("columnar: page column was not decoded"),
-        )?;
+        let Some((column, _)) = Self::decode_from(&mut cur, bytes, row_count, |_| true, copied)?
+        else {
+            return Err(Error::InvalidHeader(
+                "columnar: page column was not decoded",
+            ));
+        };
         if !cur.is_empty() {
             return Err(Error::InvalidHeader(
                 "columnar: trailing bytes after the page's column",
@@ -1124,14 +1127,12 @@ impl<'a> Cursor<'a> {
     }
 
     fn read_bytes(&mut self, n: usize) -> Result<&'a [u8]> {
-        let end = self
-            .pos
-            .checked_add(n)
-            .ok_or(Error::InvalidHeader("columnar: read length overflow"))?;
-        let slice = self
-            .buf
-            .get(self.pos..end)
-            .ok_or(Error::InvalidHeader("columnar: truncated block payload"))?;
+        let Some(end) = self.pos.checked_add(n) else {
+            return Err(Error::InvalidHeader("columnar: read length overflow"));
+        };
+        let Some(slice) = self.buf.get(self.pos..end) else {
+            return Err(Error::InvalidHeader("columnar: truncated block payload"));
+        };
         self.pos = end;
         Ok(slice)
     }
