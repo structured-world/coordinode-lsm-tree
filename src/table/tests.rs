@@ -1039,6 +1039,106 @@ fn verify_blob_links_on_a_restricted_view_counts_and_caches_nothing() -> crate::
     Ok(())
 }
 
+/// An untraced read of a table whose descriptor is not cached opens the file
+/// for itself: putting the descriptor in the shared table would evict another
+/// one and turn a later caller's miss into a hit, a trace the read promised
+/// not to leave.
+#[cfg(feature = "std")]
+#[test]
+fn an_untraced_read_leaves_the_descriptor_table_as_it_found_it() -> crate::Result<()> {
+    let dir = tempdir()?;
+    let file = dir.path().join("0");
+    let checksum = {
+        let mut w = Writer::new(file.clone(), 0, 0, Arc::new(StdFs))?.use_data_block_size(128);
+        for i in 0u64..50 {
+            w.write(InternalValue::from_components(
+                format!("key{i:05}").into_bytes(),
+                b"value".to_vec(),
+                i + 1,
+                crate::ValueType::Value,
+            ))?;
+        }
+        w.finish()?.expect("the SST is non-empty").1
+    };
+    let descriptors = Arc::new(DescriptorTable::new(10));
+    let mut params = test_recover_params(file, checksum);
+    params.descriptor_table = Some(descriptors.clone());
+    let table = Table::recover(params)?;
+    table.file_accessor.remove_for_table(&table.global_id());
+    assert_eq!(descriptors.len(), 0, "precondition: the descriptor is cold");
+
+    let mut rows = 0;
+    for kv in table.range_iter(..).untraced() {
+        kv?;
+        rows += 1;
+    }
+    assert_eq!(rows, 50, "the untraced walk reads every row");
+    assert_eq!(
+        descriptors.len(),
+        0,
+        "an untraced read must not cache the descriptor it opened",
+    );
+    Ok(())
+}
+
+/// An untraced range read over a large zstd block must not take the partial
+/// decode path either: that path caches the decoded prefix and promotes it,
+/// which is exactly the trace an untraced read promises not to leave.
+#[cfg(all(feature = "zstd", feature = "std"))]
+#[test]
+fn an_untraced_bounded_range_leaves_no_partial_block_in_the_cache() -> crate::Result<()> {
+    use crate::{
+        AbstractTree, CompressionType, SequenceNumberCounter,
+        config::{BlockSizePolicy, CompressionPolicy},
+    };
+
+    // Opt into the partial-decode path for this test process (OnceLock-cached;
+    // nextest isolates each test in its own process so this does not leak).
+    // SAFETY: set before any tree in this process reads the env.
+    unsafe { std::env::set_var("LSM_PARTIAL_DECODE", "1") };
+
+    let dir = tempdir()?;
+    let crate::AnyTree::Standard(tree) = crate::Config::new(
+        dir.path(),
+        SequenceNumberCounter::default(),
+        SequenceNumberCounter::default(),
+    )
+    .data_block_compression_policy(CompressionPolicy::all(CompressionType::zstd(19)?))
+    .data_block_size_policy(BlockSizePolicy::all(512 * 1024))
+    .open()?
+    else {
+        unreachable!("standard tree configured");
+    };
+    for i in 0u64..20_000 {
+        tree.insert(
+            format!("key-{i:08}"),
+            format!("value-{i:08}-padding-padding"),
+            0,
+        );
+    }
+    tree.flush_active_memtable(0)?;
+    let binding = tree.version_history.read().latest_version();
+    let Some(table) = binding.version.iter_tables().next() else {
+        unreachable!("flush produced one table");
+    };
+
+    let cached = table.cache.size();
+    let bounded =
+        crate::UserKey::from(&b"key-00000010"[..])..crate::UserKey::from(&b"key-00000030"[..]);
+    let mut rows = 0;
+    for kv in table.range_iter(bounded).untraced() {
+        kv?;
+        rows += 1;
+    }
+    assert_eq!(rows, 20, "the bounded range reads its rows");
+    assert_eq!(
+        table.cache.size(),
+        cached,
+        "an untraced read must not cache a partial block",
+    );
+    Ok(())
+}
+
 /// An `Fs` that forwards to `MemFs` but reports the CONFIGURED hard-link count
 /// for every file, so the punch path's shared-inode guard can be exercised —
 /// including a checkpoint's link later disappearing (MemFs copies on

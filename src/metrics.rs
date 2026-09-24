@@ -78,8 +78,9 @@ pub struct Metrics {
     /// synthesized block of a large zstd block's partial decode, what
     /// decoding a columnar block copies out of it (validity bitmaps, and
     /// columns a narrow projection detaches), the effective seqnos written
-    /// over a bulk-ingested segment's local ones, and the key and value a
-    /// point read detaches into the row cache, wherever a read performs them
+    /// over a bulk-ingested segment's local ones, the key and value a point
+    /// read detaches into the row cache, and the key a resolved blob is
+    /// cached under, wherever a read performs them
     /// (single-segment and merged columnar scans, row iteration and point
     /// reads, range reads of a partially decoded block). It does NOT count a
     /// block transform's output (that is `block_bytes_decoded`), a write

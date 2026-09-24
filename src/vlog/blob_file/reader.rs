@@ -102,7 +102,7 @@ impl<'a> Reader<'a> {
     #[cfg(test)]
     pub fn get(&self, key: &'a [u8], vhandle: &'a ValueHandle) -> crate::Result<UserValue> {
         let record = self.read_record(vhandle, record_len(key.len(), vhandle)?)?;
-        self.parse_record(key, vhandle, &record)
+        self.parse_record(key, vhandle, &record, &mut 0)
     }
 
     /// Parses one blob record out of bytes already read from the file.
@@ -112,6 +112,10 @@ impl<'a> Reader<'a> {
     /// that read several adjacent records in ONE read serve each of them from
     /// its slice of that buffer: the validation below is identical either way,
     /// so a prefetched value is byte-for-byte what a direct read would return.
+    ///
+    /// `decoded` receives the length the decompressor produced, as soon as it
+    /// produced it: a record refused afterwards (its output is not the length
+    /// the header declares) was still decompressed.
     ///
     /// # Errors
     ///
@@ -127,6 +131,7 @@ impl<'a> Reader<'a> {
         key: &[u8],
         vhandle: &ValueHandle,
         record: &crate::Slice,
+        decoded: &mut usize,
     ) -> crate::Result<UserValue> {
         let value = record;
         let mut reader = Cursor::new(&value[..]);
@@ -231,6 +236,7 @@ impl<'a> Reader<'a> {
                 if real_val_len != raw_data.len() {
                     return Err(crate::Error::InvalidHeader("Blob"));
                 }
+                *decoded = raw_data.len();
                 raw_data
             }
 
@@ -240,6 +246,7 @@ impl<'a> Reader<'a> {
 
                 let bytes_written = lz4_flex::block::decompress_into(&raw_data, &mut buf)
                     .map_err(|_| crate::Error::Decompress(self.blob_file.0.meta.compression))?;
+                *decoded = bytes_written;
 
                 // Runtime validation: corrupted data may decompress to fewer bytes
                 if bytes_written != real_val_len {
@@ -254,6 +261,7 @@ impl<'a> Reader<'a> {
                 let decompressed =
                     crate::compression::ZstdBackend::decompress(&raw_data, real_val_len)
                         .map_err(|_| crate::Error::Decompress(self.blob_file.0.meta.compression))?;
+                *decoded = decompressed.len();
 
                 if decompressed.len() != real_val_len {
                     return Err(crate::Error::Decompress(self.blob_file.0.meta.compression));
@@ -282,6 +290,7 @@ impl<'a> Reader<'a> {
                     real_val_len,
                 )
                 .map_err(|_| crate::Error::Decompress(self.blob_file.0.meta.compression))?;
+                *decoded = decompressed.len();
 
                 if decompressed.len() != real_val_len {
                     return Err(crate::Error::Decompress(self.blob_file.0.meta.compression));

@@ -648,6 +648,9 @@ impl Iter {
             // reconstructed whole, so the inner-block partial decode never
             // applies to them.
             || self.columnar
+            // The tier lives in the block cache (inserts, hit bumps,
+            // promotion), so a read that must leave no trace there skips it.
+            || !self.charge.touches_cache()
         {
             return Ok(None);
         }
@@ -739,9 +742,6 @@ impl Iter {
             None => transform,
         };
         let block_handle = BlockHandle::new(handle.offset(), handle.size());
-        let decoded_before = carried_resume
-            .as_ref()
-            .map_or(0, |resume| resume.window_prime.len());
         let (_header, frame, recovery) = crate::table::block::Block::read_data_frame(
             fd.as_ref(),
             block_handle,
@@ -795,40 +795,36 @@ impl Iter {
         }
         // Cold first touch (carried_resume None) or resume-grow from the cached
         // snapshot — either way only the new tail blocks are decompressed.
-        let crate::table::lazy_block::PartialBlock {
-            block,
-            covered_upper,
-            payload,
-            copied,
-        } = crate::table::lazy_block::partial_data_block(
+        let mut work = crate::table::lazy_block::PartialWork::default();
+        let built = crate::table::lazy_block::partial_data_block(
             frame,
             ends,
             self.data_block_restart_interval,
             &self.comparator,
             upper,
             carried_resume,
-        )?;
-        // Every prefix copy and the synthesized block are gathers: a range
-        // that grows across reads re-copies a longer prefix each time, and
-        // this is where that shows.
+            &mut work,
+        );
+        // Charged before the result is judged: a read that fails at a later
+        // inner block still decoded and copied what came before it. Every
+        // prefix copy and the synthesized block are gathers, so a range that
+        // grows across reads re-copies a longer prefix each time; only the
+        // tail this read decoded counts, a resumed prefix was charged by the
+        // read that decoded it.
         #[cfg(feature = "metrics")]
         if self.charge.is_counted() {
-            self.metrics.record_gather(copied);
+            self.metrics.record_gather(work.copied);
+            self.metrics
+                .block_bytes_decoded
+                .fetch_add(work.decoded as u64, core::sync::atomic::Ordering::Relaxed);
         }
         #[cfg(not(feature = "metrics"))]
-        let _ = copied;
-        // Only the tail this read decoded: a resumed prefix was charged by the
-        // read that decoded it. The prefix only grows across resumes.
-        debug_assert!(payload.window_prime.len() >= decoded_before);
-        #[cfg(feature = "metrics")]
-        if self.charge.is_counted() {
-            self.metrics.block_bytes_decoded.fetch_add(
-                (payload.window_prime.len() - decoded_before) as u64,
-                core::sync::atomic::Ordering::Relaxed,
-            );
-        }
-        #[cfg(not(feature = "metrics"))]
-        let _ = decoded_before;
+        let _ = work;
+        let crate::table::lazy_block::PartialBlock {
+            block,
+            covered_upper,
+            payload,
+        } = built?;
         // Covering this query decoded most of the block → promote: drop the
         // partial and let the caller cache the whole block.
         if promote_by_fraction(payload.decoded_blocks, total_blocks) {

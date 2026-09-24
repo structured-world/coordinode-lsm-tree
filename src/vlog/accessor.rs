@@ -103,11 +103,33 @@ impl<'a> Accessor<'a> {
         let len = crate::vlog::blob_file::reader::record_len(key.len(), vhandle)?;
         self.count_read(len, 0);
         let record = reader.read_record(vhandle, len)?;
-        let value = reader.parse_record(key, vhandle, &record)?;
-        self.count_read(0, value.len());
-        cache.insert_blob(tree_id, vhandle, key, value.clone());
+        // Charged before the result is judged, like the read above: a record
+        // refused after decompression was still decompressed.
+        let mut decoded = 0;
+        let parsed = reader.parse_record(key, vhandle, &record, &mut decoded);
+        self.count_read(0, decoded);
+        let value = parsed?;
+        let detached = cache.insert_blob(tree_id, vhandle, key, value.clone());
+        self.count_gather(detached);
 
         Ok(Some(value))
+    }
+
+    /// Records a gather this accessor performed on a read's behalf.
+    #[cfg_attr(
+        not(feature = "metrics"),
+        expect(
+            unused_variables,
+            clippy::unused_self,
+            reason = "the argument and the accessor's counters are both the feature's payload"
+        )
+    )]
+    #[inline]
+    fn count_gather(&self, bytes: usize) {
+        #[cfg(feature = "metrics")]
+        if let Some(metrics) = self.metrics {
+            metrics.record_gather(bytes);
+        }
     }
 
     /// Warms the cache with a run of upcoming separated values, coalescing
@@ -325,17 +347,17 @@ impl<'a> Accessor<'a> {
 
             let record = if aliases_input {
                 // A copy out of the span: charged as the gather it is.
-                #[cfg(feature = "metrics")]
-                if let Some(metrics) = self.metrics {
-                    metrics.record_gather(bytes.len());
-                }
+                self.count_gather(bytes.len());
                 crate::Slice::from(bytes)
             } else {
                 span.slice(rel..record_end)
             };
-            if let Ok(value) = reader.parse_record(key, &vhandle, &record) {
-                // Decoded only: the span's bytes were charged once above.
-                self.count_read(0, value.len());
+            // Decoded only: the span's bytes were charged once above. Charged
+            // whether or not the record is then accepted.
+            let mut decoded = 0;
+            let parsed = reader.parse_record(key, &vhandle, &record, &mut decoded);
+            self.count_read(0, decoded);
+            if let Ok(value) = parsed {
                 // Checked BEFORE inserting, against the full weight the cache
                 // charges (key as well as value), and against the DECODED
                 // length rather than the on-disk one: a compressed blob file
@@ -357,7 +379,8 @@ impl<'a> Accessor<'a> {
                     return;
                 }
                 *admit_budget -= weight;
-                cache.insert_blob(tree_id, &vhandle, key, value);
+                let detached = cache.insert_blob(tree_id, &vhandle, key, value);
+                self.count_gather(detached);
             }
         }
     }

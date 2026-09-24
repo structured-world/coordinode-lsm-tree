@@ -539,6 +539,85 @@ fn a_blob_prefetch_the_filesystem_refuses_still_counts_its_span() {
     );
 }
 
+/// A key-value-separated tree of `n` 8 KiB values, blob files written with
+/// `compression`, over a cache with the row cache off, so the only thing a
+/// lookup can detach is the key it hands the blob cache.
+fn blob_tree_without_row_cache(n: u32, compression: CompressionType) -> (TempDir, AnyTree) {
+    let folder = get_tmp_folder();
+    let tree = Config::new(
+        folder.path(),
+        SequenceNumberCounter::default(),
+        SequenceNumberCounter::default(),
+    )
+    .use_cache(std::sync::Arc::new(
+        lsm_tree::Cache::with_capacity_bytes(64 << 20).with_row_cache(false),
+    ))
+    .blob_compression(compression)
+    .with_kv_separation(Some(Default::default()))
+    .open()
+    .expect("open");
+    for i in 0..n {
+        tree.insert(key(i), vec![b'v'; 8_192], u64::from(i));
+    }
+    tree.flush_active_memtable(0).expect("flush");
+    (folder, tree)
+}
+
+#[test]
+fn a_blob_admitted_to_the_blob_cache_counts_the_key_it_detaches() -> lsm_tree::Result<()> {
+    // The blob cache stores each value under its own copy of the key, so the
+    // entry does not borrow the caller's buffer. That copy is a gather: a
+    // point read that misses charges exactly its key, and a read served from
+    // the cache copies nothing.
+    let (_folder, tree) = blob_tree_without_row_cache(20, CompressionType::None);
+    let m = tree.metrics();
+
+    let before = m.bytes_copied();
+    for i in 0..10 {
+        assert!(tree.get(key(i), SeqNo::MAX)?.is_some());
+    }
+    let keys: u64 = (0..10).map(|i| key(i).len() as u64).sum();
+    assert_eq!(
+        m.bytes_copied() - before,
+        keys,
+        "each resolved blob detached its key into the cache",
+    );
+
+    let before = m.bytes_copied();
+    for i in 0..10 {
+        assert!(tree.get(key(i), SeqNo::MAX)?.is_some());
+    }
+    assert_eq!(m.bytes_copied(), before, "a blob-cache hit copies nothing");
+    Ok(())
+}
+
+#[test]
+#[cfg(feature = "lz4")]
+fn a_blob_prefetch_counts_the_keys_it_detaches() -> lsm_tree::Result<()> {
+    // A scan's read-ahead caches each record it decodes under a copy of its
+    // key, as the point read does. Over a compressed blob file the records
+    // decompress into buffers of their own, so the keys are the only copy the
+    // scan makes: every value is cached exactly once, whichever path read it.
+    let n = 50;
+    let (_folder, tree) = blob_tree_without_row_cache(n, CompressionType::Lz4);
+    let m = tree.metrics();
+
+    let before = m.bytes_copied();
+    let mut rows = 0;
+    for guard in tree.iter(SeqNo::MAX, None) {
+        guard.into_inner()?;
+        rows += 1;
+    }
+    assert_eq!(rows, n);
+    let keys: u64 = (0..n).map(|i| key(i).len() as u64).sum();
+    assert_eq!(
+        m.bytes_copied() - before,
+        keys,
+        "every value the scan cached detached its key",
+    );
+    Ok(())
+}
+
 #[test]
 fn an_uncompressed_blob_prefetch_counts_the_records_it_copies_out() {
     // A scan's read-ahead reads a run of neighbouring records in one buffer.

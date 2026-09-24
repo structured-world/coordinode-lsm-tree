@@ -84,6 +84,9 @@ pub struct LazyBlock {
     /// Bytes this decoder copied into its prefix: a resumed prefix moved into
     /// `decompressed`, and each tail appended to an existing prefix.
     copied: usize,
+    /// Bytes the decompressor produced for this decoder, including the inner
+    /// blocks it decoded before one that failed.
+    produced: usize,
 }
 
 impl LazyBlock {
@@ -110,6 +113,7 @@ impl LazyBlock {
             resume_state: None,
             compressed_cursor: 0,
             copied: 0,
+            produced: 0,
         })
     }
 
@@ -129,6 +133,7 @@ impl LazyBlock {
             resume_state: resume.state,
             compressed_cursor: resume.compressed_cursor,
             copied: 0,
+            produced: 0,
         }
     }
 
@@ -255,6 +260,9 @@ impl LazyBlock {
                 .decode_blocks_partial(&mut self.source, 0, end_block, None, true)
                 .map_err(|e| crate::Error::Io(crate::io::Error::other(e.to_string())))?
         };
+        // Whatever the pass decoded counts, the blocks before a failing one
+        // included: the decompressor did that work.
+        self.produced += pd.data.len();
         if let Some((idx, err)) = pd.stopped_at {
             return Err(crate::Error::Io(crate::io::Error::other(format!(
                 "lazy partial decode stopped at inner block {idx}: {err:?}"
@@ -399,7 +407,7 @@ pub fn synthesize_data_block(prefix: &Slice, restart_interval: u8) -> crate::Res
     }))
 }
 
-/// What [`partial_data_block`] built, and what it copied to build it.
+/// What [`partial_data_block`] built.
 pub struct PartialBlock {
     /// The synthesized block covering the decoded prefix.
     pub block: DataBlock,
@@ -408,6 +416,15 @@ pub struct PartialBlock {
     pub covered_upper: Option<UserKey>,
     /// The resume payload to cache so the next read continues from here.
     pub payload: PartialResume,
+}
+
+/// The work a [`partial_data_block`] call did, whether it succeeded or not.
+#[derive(Clone, Copy, Debug, Default, Eq, PartialEq)]
+pub struct PartialWork {
+    /// Bytes the decompressor produced for this call: only the tail it
+    /// decoded, never a resumed prefix, and including the inner blocks it
+    /// decoded before one that failed.
+    pub decoded: usize,
     /// Bytes copied: each prefix made shareable for a scan, a resumed prefix
     /// moved into the decoder's window, each tail appended to it, and the
     /// synthesized block.
@@ -429,6 +446,9 @@ pub struct PartialBlock {
 /// no step copies it again. A resumed prefix that already covers `upper` is
 /// not copied at all.
 ///
+/// `work` receives what the call decoded and copied, on failure too: a read
+/// that fails at a later inner block still did the work before it.
+///
 /// # Errors
 ///
 /// Returns an error if the frame or an inner block fails to decode, or the
@@ -440,13 +460,34 @@ pub fn partial_data_block(
     comparator: &SharedComparator,
     upper: &[u8],
     resume: Option<PartialResume>,
+    work: &mut PartialWork,
 ) -> crate::Result<PartialBlock> {
     let mut lazy = match resume {
         Some(payload) => LazyBlock::from_resume(frame, ends, payload),
         None => LazyBlock::new(frame, ends)?,
     };
+    let built = build_partial_block(
+        &mut lazy,
+        restart_interval,
+        comparator,
+        upper,
+        &mut work.copied,
+    );
+    work.copied += lazy.copied;
+    work.decoded += lazy.produced;
+    built
+}
+
+/// The body of [`partial_data_block`] over an opened decoder, adding the
+/// copies it makes itself to `copied` as it makes them.
+fn build_partial_block(
+    lazy: &mut LazyBlock,
+    restart_interval: u8,
+    comparator: &SharedComparator,
+    upper: &[u8],
+    copied: &mut usize,
+) -> crate::Result<PartialBlock> {
     let total = lazy.total_len();
-    let mut copied = 0usize;
     let mut prefix = lazy
         .untouched_seed()
         .cloned()
@@ -476,18 +517,17 @@ pub fn partial_data_block(
             break;
         }
         prefix = Slice::from(lazy.decoded());
-        copied += prefix.len();
+        *copied += prefix.len();
     }
 
     let covered_upper = last_complete_key(&prefix, restart_interval);
     let block = synthesize_data_block(&prefix, restart_interval)?;
-    copied += block.inner.data.len() + lazy.copied;
+    *copied += block.inner.data.len();
     let payload = lazy.resume_payload_over(prefix);
     Ok(PartialBlock {
         block,
         covered_upper,
         payload,
-        copied,
     })
 }
 

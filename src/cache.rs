@@ -431,19 +431,21 @@ impl Cache {
     /// Caches a separated value under its position, together with the two
     /// fields the position does not carry (`user_key` and the handle's declared
     /// on-disk size) so a lookup can prove the entry belongs to the handle it
-    /// is asked about.
+    /// is asked about. Returns the bytes copied to own the entry's key.
     #[doc(hidden)]
+    #[must_use = "the bytes copied belong to the reading caller's gather count"]
     pub fn insert_blob(
         &self,
         vlog_id: crate::TreeId,
         vhandle: &crate::vlog::ValueHandle,
         user_key: &[u8],
         value: UserValue,
-    ) {
+    ) -> usize {
         self.data.insert(
             (TAG_BLOB, vlog_id, vhandle.blob_file_id, vhandle.offset).into(),
             Item::Blob(user_key.into(), vhandle.on_disk_size, value),
         );
+        user_key.len()
     }
 
     /// Whether a separated value is already cached.

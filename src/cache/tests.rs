@@ -90,11 +90,16 @@ fn a_blob_lookup_under_a_conflicting_key_misses_rather_than_serving_the_other_va
         on_disk_size: 5,
     };
 
-    cache.insert_blob(
+    let copied = cache.insert_blob(
         0,
         &vhandle,
         b"real-key",
         crate::UserValue::from(&b"value"[..]),
+    );
+    assert_eq!(
+        copied,
+        b"real-key".len(),
+        "the entry owns a copy of its key"
     );
 
     // The key it was stored under still finds it.
@@ -129,7 +134,8 @@ fn a_blob_lookup_with_a_conflicting_size_misses_rather_than_serving_the_value() 
         on_disk_size: 5,
     };
 
-    cache.insert_blob(0, &stored, b"key", crate::UserValue::from(&b"value"[..]));
+    let copied = cache.insert_blob(0, &stored, b"key", crate::UserValue::from(&b"value"[..]));
+    assert_eq!(copied, b"key".len(), "the entry owns a copy of its key");
 
     assert_eq!(
         cache.get_blob(0, &stored, b"key").as_deref(),

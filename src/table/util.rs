@@ -108,7 +108,13 @@ pub fn load_block(
         return Ok(block);
     }
 
-    let (fd, cache_event) = file_accessor.get_or_open_table(&table_id, path)?;
+    // An untraced read leaves the descriptor cache as it found it, like the
+    // block cache above.
+    let (fd, cache_event) = if charge.touches_cache() {
+        file_accessor.get_or_open_table(&table_id, path)?
+    } else {
+        (file_accessor.peek_or_open_table(&table_id, path)?, None)
+    };
 
     // Only track descriptor-table cache metrics; pinned FDs (None) are not cache events.
     #[cfg(feature = "metrics")]
@@ -492,7 +498,9 @@ pub enum ReadCharge {
     /// Maintenance, such as compaction or a patrol scrub: not counted.
     Maintenance,
     /// A read that must leave no trace: not counted, and it neither fills the
-    /// block cache nor touches a cached block's recency. A monitoring report
+    /// block or descriptor cache nor touches the recency of what they hold,
+    /// and skips the partial-decode tier, which lives in the block cache. A
+    /// monitoring report
     /// (polling it leaves nothing a later read can see), and verification that
     /// must not displace the workload's blocks.
     Untraced,
