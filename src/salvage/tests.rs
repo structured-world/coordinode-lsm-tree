@@ -5097,19 +5097,20 @@ fn a_value_page_moved_between_row_groups_of_an_encrypted_table_is_refused() -> c
     Ok(())
 }
 
-/// An encrypted columnar SST of table `table_id` holding `key{i}` rows whose
-/// values are `prefix{i}`, all values of one length, in one group.
-#[cfg(all(feature = "columnar", feature = "encryption"))]
-fn encrypted_columnar_source(
+/// A columnar SST of table `table_id`, encrypted under `enc` when given,
+/// holding `key{i}` rows whose values are `prefix{i}`, all values of one
+/// length, in one group.
+#[cfg(feature = "columnar")]
+fn columnar_source_as(
     path: &std::path::Path,
     fs: &Arc<dyn Fs>,
-    enc: &Arc<dyn crate::encryption::EncryptionProvider>,
+    enc: Option<&Arc<dyn crate::encryption::EncryptionProvider>>,
     table_id: crate::TableId,
     prefix: &str,
 ) -> crate::Result<()> {
     let mut writer = Writer::new(path.to_path_buf(), table_id, 0, Arc::clone(fs))?
         .use_columnar(true)
-        .use_encryption(Some(Arc::clone(enc)));
+        .use_encryption(enc.map(Arc::clone));
     for i in 0..20_u32 {
         writer.write(InternalValue::from_components(
             format!("key{i:05}").into_bytes(),
@@ -5122,12 +5123,13 @@ fn encrypted_columnar_source(
     Ok(())
 }
 
-/// Opens the encrypted SST at `path` as table `table_id`.
-#[cfg(all(feature = "columnar", feature = "encryption"))]
-fn open_encrypted_as(
+/// Opens the SST at `path`, encrypted under `enc` when given, as table
+/// `table_id`.
+#[cfg(feature = "columnar")]
+fn open_as(
     path: std::path::PathBuf,
     fs: &Arc<dyn Fs>,
-    enc: &Arc<dyn crate::encryption::EncryptionProvider>,
+    enc: Option<&Arc<dyn crate::encryption::EncryptionProvider>>,
     table_id: crate::TableId,
 ) -> crate::Result<Table> {
     let checksum = crate::Checksum::from_raw(crate::repair::compute_table_checksum(&**fs, &path)?);
@@ -5139,12 +5141,12 @@ fn open_encrypted_as(
         default_comparator(),
         Arc::new(crate::cache::Cache::with_capacity_bytes(1 << 20)),
     );
-    params.encryption = Some(Arc::clone(enc));
+    params.encryption = enc.map(Arc::clone);
     Table::recover(params)
 }
 
 /// The file extent of the value page of the first group of `table`.
-#[cfg(all(feature = "columnar", feature = "encryption"))]
+#[cfg(feature = "columnar")]
 fn first_value_page(table: &Table, bytes: &[u8]) -> crate::Result<core::ops::Range<usize>> {
     use crate::coding::Decode;
     use crate::table::columnar::COL_VALUE;
@@ -5173,71 +5175,67 @@ fn first_value_page(table: &Table, bytes: &[u8]) -> crate::Result<core::ops::Ran
 }
 
 /// A value page moved into another table, in the same place of a group of the
-/// same shape, authenticates as a block of its own table only: the AEAD binds
-/// the table id, which the page stamp does not carry. The same move between
-/// two tables of ONE id, the control, is taken for the other's page and
-/// serves its values, which is why the binding matters: without it the
-/// reader would hand back the other table's value under this table's key.
-#[cfg(all(feature = "columnar", feature = "encryption"))]
+/// same shape, is refused, encrypted or not and whether or not the two tables
+/// share an id. A page's values are separated from their keys, so a page
+/// taken for another table's would hand back that table's value under this
+/// table's key. Every table starts its group tags from its own identity, so
+/// the stamp names the table as well as the group, and under encryption the
+/// AEAD binds the table id on top.
+#[cfg(feature = "columnar")]
 #[test]
-fn a_value_page_moved_between_tables_of_an_encrypted_tree_is_refused() -> crate::Result<()> {
+fn a_value_page_moved_between_tables_is_refused() -> crate::Result<()> {
     let dir = tempdir()?;
     let fs: Arc<dyn Fs> = Arc::new(StdFs);
-    let enc: Arc<dyn crate::encryption::EncryptionProvider> =
-        Arc::new(crate::encryption::Aes256GcmProvider::new(&[0x42; 32]));
+    let mut providers: Vec<Option<Arc<dyn crate::encryption::EncryptionProvider>>> = vec![None];
+    #[cfg(feature = "encryption")]
+    providers.push(Some(Arc::new(crate::encryption::Aes256GcmProvider::new(
+        &[0x42; 32],
+    ))));
 
-    // Moves `from`'s first value page into `into`'s; the two tables were
-    // written with the same row count and value lengths, so the page fits.
-    let transplant = |into: &std::path::Path, into_id, from: &std::path::Path, from_id| {
-        let from_bytes = std::fs::read(from)?;
-        let page = {
-            let table = open_encrypted_as(from.to_path_buf(), &fs, &enc, from_id)?;
-            let range = first_value_page(&table, &from_bytes)?;
-            from_bytes.get(range).map(<[u8]>::to_vec)
+    for (n, enc) in providers.iter().enumerate() {
+        let enc = enc.as_ref();
+        // Moves `from`'s first value page into `into`'s; the two tables were
+        // written with the same row count and value lengths, so the page fits.
+        let transplant = |into: &std::path::Path, into_id, from: &std::path::Path, from_id| {
+            let from_bytes = std::fs::read(from)?;
+            let page = {
+                let table = open_as(from.to_path_buf(), &fs, enc, from_id)?;
+                let range = first_value_page(&table, &from_bytes)?;
+                from_bytes.get(range).map(<[u8]>::to_vec)
+            };
+            let mut into_bytes = std::fs::read(into)?;
+            let range = {
+                let table = open_as(into.to_path_buf(), &fs, enc, into_id)?;
+                first_value_page(&table, &into_bytes)?
+            };
+            let Some(page) = page.filter(|p| p.len() == range.len()) else {
+                panic!("the two value pages are of one length");
+            };
+            let Some(target) = into_bytes.get_mut(range) else {
+                panic!("value page within the file");
+            };
+            target.copy_from_slice(&page);
+            std::fs::write(into, &into_bytes)?;
+            crate::Result::Ok(())
         };
-        let mut into_bytes = std::fs::read(into)?;
-        let range = {
-            let table = open_encrypted_as(into.to_path_buf(), &fs, &enc, into_id)?;
-            first_value_page(&table, &into_bytes)?
-        };
-        let Some(page) = page.filter(|p| p.len() == range.len()) else {
-            panic!("the two value pages are of one length");
-        };
-        let Some(target) = into_bytes.get_mut(range) else {
-            panic!("value page within the file");
-        };
-        target.copy_from_slice(&page);
-        std::fs::write(into, &into_bytes)?;
-        crate::Result::Ok(())
-    };
-    let key = b"key00000";
+        let key = b"key00000";
 
-    // The control: both tables are table 3, and the moved page reads as the
-    // target's own.
-    let (a, b) = (dir.path().join("a"), dir.path().join("b"));
-    encrypted_columnar_source(&a, &fs, &enc, 3, "vala")?;
-    encrypted_columnar_source(&b, &fs, &enc, 3, "valb")?;
-    transplant(&a, 3, &b, 3)?;
-    let table = open_encrypted_as(a, &fs, &enc, 3)?;
-    let Some(got) = table.get(key, crate::MAX_SEQNO, crate::hash::hash64(key))? else {
-        panic!("the key is found");
-    };
-    assert_eq!(
-        &*got.value, b"valb00000",
-        "without a table binding the move goes unseen"
-    );
-
-    // The move between tables 3 and 4 is refused.
-    let (a, b) = (dir.path().join("c"), dir.path().join("d"));
-    encrypted_columnar_source(&a, &fs, &enc, 3, "vala")?;
-    encrypted_columnar_source(&b, &fs, &enc, 4, "valb")?;
-    transplant(&a, 3, &b, 4)?;
-    let table = open_encrypted_as(a, &fs, &enc, 3)?;
-    let refused = table.get(key, crate::MAX_SEQNO, crate::hash::hash64(key));
-    assert!(
-        refused.is_err(),
-        "a page of another table must not authenticate, got {refused:?}",
-    );
+        for (into_id, from_id) in [(3, 3), (3, 4)] {
+            let a = dir.path().join(format!("{n}-{into_id}-{from_id}-into"));
+            let b = dir.path().join(format!("{n}-{into_id}-{from_id}-from"));
+            columnar_source_as(&a, &fs, enc, into_id, "vala")?;
+            columnar_source_as(&b, &fs, enc, from_id, "valb")?;
+            transplant(&a, into_id, &b, from_id)?;
+            let table = open_as(a, &fs, enc, into_id)?;
+            let refused = table.get(key, crate::MAX_SEQNO, crate::hash::hash64(key));
+            assert!(
+                refused.is_err(),
+                "encrypted: {}, tables {into_id} and {from_id}: a page of another table \
+                 must be refused, got {refused:?}",
+                enc.is_some(),
+            );
+        }
+    }
     Ok(())
 }
 
@@ -9851,9 +9849,10 @@ fn salvage_reencodes_an_ecc_recovered_columnar_block() -> crate::Result<()> {
 /// its ordinals, and a re-encoded group must take a tag no copy already holds:
 /// two groups sharing a tag would let their pages pass for each other's. Here
 /// group 0 is lost, group 1 is re-encoded because the loss suppresses its
-/// boundary key, group 2 is copied with its tag 2, and group 3 is healed from
-/// parity and re-encoded after it. Group 3's ordinal in the copy is 2, which
-/// is exactly the tag the copy of group 2 kept.
+/// boundary key, group 2 is copied with its tag, and group 3 is healed from
+/// parity and re-encoded after it. Group 1, the copy's first, takes the tag it
+/// replaces, so group 2 can still be copied above it; group 3 takes the next
+/// tag above group 2's.
 #[cfg(all(feature = "columnar", feature = "page_ecc"))]
 #[test]
 fn salvage_keeps_row_group_tags_unique_when_copies_and_reencodes_mix() -> crate::Result<()> {

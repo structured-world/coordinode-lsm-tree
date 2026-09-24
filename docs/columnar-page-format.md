@@ -292,11 +292,15 @@ index already governs: the group's keys travel with its values.
 
 A block of another role in a page slot (a zone block, a directory) is refused
 by the type its block header names, before its stamp is consulted. Moving a page **between
-tables** is refused only under encryption: the block layer's AAD carries the
-table id, so a page authenticated for one table fails in another. The stamp
-does not bind the table, because tags restart at zero in every table; a plain
-table has no cross-table binding, exactly as its row-major data blocks have
-none.
+tables** is refused too, encrypted or not. A row-major block moved into
+another table brings its own keys, so a read of it is a miss; a page does not,
+so the key page of one table beside the value page of another would serve the
+other table's value under this table's key. Every table therefore starts its
+tags at its own base, a hash of its path, id and creation time in the lower
+half of `u64`: tables' tags collide only by chance, and the stamp names the
+table as well as the group. The base is carried, not derived, so a group
+copied verbatim into another table keeps the tags its pages were stamped
+with. Under encryption the block layer's AAD binds the table id on top.
 
 ## Framing overhead
 

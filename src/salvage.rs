@@ -2368,6 +2368,7 @@ fn salvage_blocks(
                                 // cannot take without repeating a tag is re-encoded
                                 // under a fresh one rather than dropped.
                                 let group_tag = sb.group.directory.group_tag();
+                                writer.start_group_tags_at(group_tag);
                                 let verbatim_source = if table.has_delete_bitmap_section()
                                     || rebuilt_by_suppression
                                     || !writer.accepts_group_tag(group_tag)

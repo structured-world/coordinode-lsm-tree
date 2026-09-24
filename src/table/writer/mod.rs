@@ -361,6 +361,15 @@ pub struct Writer {
     #[cfg(feature = "columnar")]
     last_group_tag: Option<u64>,
 
+    /// Tag of the first row group encoded here: a hash of the table's path,
+    /// id and creation time, in the lower half of `u64` so the increments
+    /// after it never run out. Starting every table at its own point is what
+    /// makes a page's stamp name its table as well as its group: a page's
+    /// values are apart from their keys, so a page taken for another table's
+    /// would serve that table's value under this table's key.
+    #[cfg(feature = "columnar")]
+    group_tag_base: u64,
+
     /// Pre-trained zstd dictionary for dictionary compression
     #[cfg(zstd_any)]
     zstd_dictionary: Option<Arc<crate::compression::ZstdDictionary>>,
@@ -439,6 +448,14 @@ impl Writer {
             return Err(e.into());
         }
 
+        #[cfg(feature = "columnar")]
+        let group_tag_base = {
+            let mut seed = alloc::format!("{}", path.display()).into_bytes();
+            seed.extend_from_slice(&table_id.to_le_bytes());
+            seed.extend_from_slice(&crate::time::unix_timestamp().as_nanos().to_le_bytes());
+            crate::hash::hash64(&seed) >> 1
+        };
+
         Ok(Self {
             fs,
             initial_level,
@@ -487,6 +504,8 @@ impl Writer {
 
             #[cfg(feature = "columnar")]
             last_group_tag: None,
+            #[cfg(feature = "columnar")]
+            group_tag_base,
 
             block_buffer: Vec::new(),
             file_writer: writer,
@@ -2299,19 +2318,33 @@ impl Writer {
     /// one instead.
     ///
     /// A salvage copying one source table in key order always satisfies
-    /// this: the source's tags increase, and a group it re-encodes takes one
-    /// above the last emitted, which is at most the source tag it replaces.
+    /// this: the source's tags increase, a first group it re-encodes takes
+    /// the source tag it replaces ([`Self::start_group_tags_at`]), and a later
+    /// one takes one above the last emitted, which is at most the source tag
+    /// it replaces.
     #[cfg(feature = "columnar")]
     #[must_use]
     pub(crate) fn accepts_group_tag(&self, group_tag: u64) -> bool {
         self.last_group_tag.is_none_or(|last| group_tag > last)
     }
 
+    /// Starts this table's tags at `tag`, when no group has been written yet;
+    /// once one has, the order the written tags set stands. A salvage calls it
+    /// with each source group's tag before emitting the group, so a group it
+    /// must re-encode first takes the tag it replaces, and the source's later
+    /// groups, whose tags are above it, can still be copied verbatim.
+    #[cfg(feature = "columnar")]
+    pub(crate) fn start_group_tags_at(&mut self, tag: u64) {
+        if self.last_group_tag.is_none() {
+            self.group_tag_base = tag;
+        }
+    }
+
     /// The tag for the next row group encoded here.
     #[cfg(feature = "columnar")]
     fn next_group_tag(&self) -> crate::Result<u64> {
         match self.last_group_tag {
-            None => Ok(0),
+            None => Ok(self.group_tag_base),
             Some(last) => last.checked_add(1).ok_or(crate::Error::InvalidHeader(
                 "columnar: row group tags exhausted",
             )),
