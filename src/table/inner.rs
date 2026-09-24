@@ -263,6 +263,30 @@ impl Inner {
     pub(super) fn global_id(&self) -> GlobalTableId {
         (self.tree_id, self.metadata.id).into()
     }
+
+    /// Walks the block index for maintenance that rewrites or reshapes the
+    /// table: compaction input, heal, salvage and the geometry of a restricted
+    /// view. A cold index is read from disk as it is walked; those reads stay
+    /// out of the read counters, which describe reads, and are cached like any
+    /// other, since the table is about to be read in full.
+    pub(crate) fn maintenance_index_walk(&self) -> super::block_index::BlockIndexIterImpl {
+        use super::block_index::BlockIndex;
+        self.block_index
+            .iter()
+            .with_charge(super::util::ReadCharge::Maintenance)
+    }
+
+    /// Walks the block index for work that must leave no trace: the patrol
+    /// scrub, verification gates and the space reclaim of a dropped table.
+    /// Uncounted like maintenance, and it neither fills the block cache nor
+    /// promotes what is cached, so a patrol over every table cannot evict the
+    /// workload's blocks.
+    pub(crate) fn untraced_index_walk(&self) -> super::block_index::BlockIndexIterImpl {
+        use super::block_index::BlockIndex;
+        self.block_index
+            .iter()
+            .with_charge(super::util::ReadCharge::Untraced)
+    }
 }
 
 impl Drop for Inner {
@@ -396,9 +420,10 @@ impl Drop for Inner {
             if off == u64::MAX {
                 return;
             }
-            use crate::table::block_index::BlockIndex;
             let mut reclaimable: alloc::vec::Vec<(u64, u64)> = alloc::vec::Vec::new();
-            for handle in self.block_index.iter() {
+            // The table is being dropped: caching its index would only evict
+            // blocks someone still reads.
+            for handle in self.untraced_index_walk() {
                 // Log why reclaim stopped instead of silently swallowing the
                 // block-index read error (this is an integrity-sensitive path).
                 let handle = match handle {

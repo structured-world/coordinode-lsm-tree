@@ -3,10 +3,12 @@ mod db;
 #[cfg(feature = "flamegraph")]
 mod flame;
 mod reporter;
+#[cfg(test)]
+mod tests;
 mod workloads;
 
 use crate::config::{BenchConfig, Compression};
-use crate::reporter::{JsonConfig, Reporter};
+use crate::reporter::{Direction, GithubSuites, JsonConfig, Reporter};
 use crate::workloads::{available_benchmarks, create_workload};
 use clap::Parser;
 use lsm_tree::AbstractTree; // for get_highest_seqno
@@ -28,11 +30,11 @@ struct Cli {
     num: u64,
 
     /// Key size in bytes.
-    #[arg(long, default_value = "16")]
+    #[arg(long, default_value_t = config::DEFAULT_KEY_SIZE)]
     key_size: usize,
 
     /// Value size in bytes.
-    #[arg(long, default_value = "100")]
+    #[arg(long, default_value_t = config::DEFAULT_VALUE_SIZE)]
     value_size: usize,
 
     /// Number of concurrent threads.
@@ -77,6 +79,19 @@ struct Cli {
     #[arg(long)]
     github_json: bool,
 
+    /// With --github-json: write the smaller-is-better series (costs such as
+    /// bytes copied per byte decoded) to this file, in the same format, for a
+    /// customSmallerIsBetter suite. Without it those series are not written.
+    #[arg(long, requires = "github_json")]
+    github_json_costs: Option<PathBuf>,
+
+    /// With --github-json: append the bigger-is-better series to the JSON
+    /// array already in this file instead of printing them, so a second run
+    /// (a `counters` build, say) can add its series to the first run's suite.
+    /// A missing file starts an empty array.
+    #[arg(long, requires = "github_json")]
+    github_json_append: Option<PathBuf>,
+
     /// Database directory path. If not set, a temporary directory is used.
     /// Note: some workloads (e.g. `prefixscan`, `mergerandom`) create their
     /// own temporary database (they require special tree configuration) and
@@ -103,6 +118,12 @@ fn parse_benchmark(s: &str) -> Result<String, String> {
     let available = available_benchmarks();
     if available.contains(&s) {
         Ok(s.to_string())
+    } else if s == "mixed-layout" {
+        Err(
+            "mixed-layout reads the engine's byte counters, which this build \
+             leaves out; rebuild with `--features counters`"
+                .to_string(),
+        )
     } else {
         Err(format!(
             "unknown benchmark '{}'. Available: all, {}",
@@ -110,6 +131,27 @@ fn parse_benchmark(s: &str) -> Result<String, String> {
             available.join(", ")
         ))
     }
+}
+
+/// Appends `entries` to the JSON array held in `path`, creating it when the
+/// file does not exist.
+fn append_github_json(
+    path: &std::path::Path,
+    entries: Vec<serde_json::Value>,
+) -> Result<(), String> {
+    let mut all = match std::fs::read_to_string(path) {
+        Ok(text) => match serde_json::from_str::<serde_json::Value>(&text) {
+            Ok(serde_json::Value::Array(existing)) => existing,
+            Ok(_) => return Err("it does not hold a JSON array".to_string()),
+            Err(e) => return Err(e.to_string()),
+        },
+        Err(e) if e.kind() == std::io::ErrorKind::NotFound => Vec::new(),
+        Err(e) => return Err(e.to_string()),
+    };
+    all.extend(entries);
+    let json =
+        serde_json::to_string_pretty(&serde_json::Value::Array(all)).map_err(|e| e.to_string())?;
+    std::fs::write(path, json).map_err(|e| e.to_string())
 }
 
 fn main() {
@@ -187,13 +229,13 @@ fn main() {
     };
 
     let benchmarks: Vec<&str> = if cli.benchmark == "all" {
-        available_benchmarks().to_vec()
+        available_benchmarks()
     } else {
         vec![&cli.benchmark]
     };
 
     // Collect github-action-benchmark entries when --github-json is set.
-    let mut github_entries: Vec<serde_json::Value> = Vec::new();
+    let mut github_entries = GithubSuites::default();
     let mut failures = 0u32;
 
     for benchmark_name in &benchmarks {
@@ -210,13 +252,37 @@ fn main() {
     }
 
     if cli.github_json {
-        let array = serde_json::Value::Array(github_entries);
-        match serde_json::to_string_pretty(&array) {
-            Ok(json) => println!("{json}"),
-            Err(e) => {
-                eprintln!("Error: failed to serialize GitHub JSON: {e}");
-                failures += 1;
+        let GithubSuites { yields, costs } = github_entries;
+        match &cli.github_json_append {
+            Some(path) => {
+                if let Err(e) = append_github_json(path, yields) {
+                    eprintln!("Error: failed to append to {}: {e}", path.display());
+                    failures += 1;
+                }
             }
+            None => match serde_json::to_string_pretty(&serde_json::Value::Array(yields)) {
+                Ok(json) => println!("{json}"),
+                Err(e) => {
+                    eprintln!("Error: failed to serialize GitHub JSON: {e}");
+                    failures += 1;
+                }
+            },
+        }
+        match &cli.github_json_costs {
+            Some(path) => {
+                let written = serde_json::to_string_pretty(&serde_json::Value::Array(costs))
+                    .map_err(|e| e.to_string())
+                    .and_then(|json| std::fs::write(path, json).map_err(|e| e.to_string()));
+                if let Err(e) = written {
+                    eprintln!("Error: failed to write {}: {e}", path.display());
+                    failures += 1;
+                }
+            }
+            None if !costs.is_empty() => eprintln!(
+                "Note: {} smaller-is-better series not written; pass --github-json-costs <PATH>",
+                costs.len(),
+            ),
+            None => {}
         }
     }
 
@@ -237,13 +303,17 @@ fn run_single(
     bench_config: &BenchConfig,
     cli: &Cli,
     iterations: u32,
-    github_entries: &mut Vec<serde_json::Value>,
+    github_entries: &mut GithubSuites,
 ) -> Result<(), Box<dyn std::error::Error>> {
     eprintln!("=== db_bench: {benchmark_name} ===");
     eprintln!(
         "num={} key_size={} value_size={} threads={} cache={}MB iterations={}",
         cli.num, cli.key_size, cli.value_size, cli.threads, cli.cache_mb, iterations,
     );
+
+    create_workload(benchmark_name)
+        .ok_or_else(|| format!("unknown benchmark '{benchmark_name}'"))?
+        .check_config(bench_config)?;
 
     let entry_size = bench_config.entry_size();
 
@@ -372,9 +442,37 @@ fn run_single(
     // len=1 → 0, len=2 → 0, len=3 → 1, len=4 → 1, etc.
     results.sort_by(|a, b| a.ops_per_sec.total_cmp(&b.ops_per_sec));
     let median_idx = (results.len() - 1) / 2;
+    // A workload's published series are separate measurements: each takes its
+    // own median across the iterations, not the values of the iteration whose
+    // rate is the median, which says nothing about any one of them.
+    let medians = {
+        let per_iteration: Vec<&[reporter::PublishedSeries]> =
+            results.iter().map(|r| r.reporter.published()).collect();
+        reporter::median_series(&per_iteration)
+    };
+    results[median_idx].reporter.replace_published(medians);
     let median = &results[median_idx];
 
-    if cli.github_json {
+    if cli.github_json && !median.reporter.published().is_empty() {
+        // A workload that publishes its own series replaces the derived
+        // ops/sec rather than adding to it: for a scenario sweep the rate
+        // counts scenarios per second, which describes the harness and not
+        // the engine, and a dashboard series that means nothing is worse
+        // than an absent one because it still moves.
+        for series in median.reporter.published() {
+            github_entries.push(
+                series.direction,
+                serde_json::json!({
+                    "name": format!("{benchmark_name} / {}", series.name),
+                    "value": series.value,
+                    "unit": series.unit,
+                    // The series' own annotation names the size it measured;
+                    // --num is only an upper bound its fixtures may cap.
+                    "extra": format!("{}\niterations: {}", series.extra, iterations),
+                }),
+            );
+        }
+    } else if cli.github_json {
         let s = median.reporter.summary(entry_size);
         // Raw ops/sec, no normalization. The previous design ran a
         // calibration workload at startup to "normalize" results
@@ -385,16 +483,19 @@ fn run_single(
         // self-hosted runner the right answer is to report what
         // the host actually delivered and let the dashboard show
         // the absolute trend.
-        github_entries.push(serde_json::json!({
-            "name": benchmark_name,
-            "value": s.ops_per_sec,
-            "unit": "ops/sec",
-            "extra": format!(
-                "P50: {:.1}us | P99: {:.1}us | P99.9: {:.1}us\n\
-                 threads: {} | elapsed: {:.2}s | num: {} | iterations: {}",
-                s.p50, s.p99, s.p999, cli.threads, s.secs, cli.num, iterations,
-            ),
-        }));
+        github_entries.push(
+            Direction::BiggerIsBetter,
+            serde_json::json!({
+                "name": benchmark_name,
+                "value": s.ops_per_sec,
+                "unit": "ops/sec",
+                "extra": format!(
+                    "P50: {:.1}us | P99: {:.1}us | P99.9: {:.1}us\n\
+                     threads: {} | elapsed: {:.2}s | num: {} | iterations: {}",
+                    s.p50, s.p99, s.p999, cli.threads, s.secs, cli.num, iterations,
+                ),
+            }),
+        );
     } else if cli.json {
         let json_config = JsonConfig {
             num: cli.num,

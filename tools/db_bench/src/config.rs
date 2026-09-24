@@ -41,6 +41,12 @@ impl Compression {
     }
 }
 
+/// `--key-size` when the flag is not given.
+pub const DEFAULT_KEY_SIZE: usize = 16;
+
+/// `--value-size` when the flag is not given.
+pub const DEFAULT_VALUE_SIZE: usize = 100;
+
 #[derive(Debug, Clone)]
 pub struct BenchConfig {
     pub num: u64,
@@ -70,6 +76,20 @@ impl BenchConfig {
 
 /// Create an lsm-tree at the given path using the benchmark configuration.
 pub fn create_tree(path: &Path, config: &BenchConfig) -> lsm_tree::Result<AnyTree> {
+    let mut builder = tree_builder(path, config)?;
+    if config.use_blob_tree {
+        builder = builder.with_kv_separation(Some(Default::default()));
+    }
+    builder.open()
+}
+
+/// The tree configuration every benchmark tree shares: cache size and
+/// metadata priority, block size, compression and metadata partitioning.
+///
+/// A workload that opens trees of its own starts from this and adds only what
+/// its shapes differ in, so the cache and block flags printed with a run hold
+/// for every tree it measured.
+pub fn tree_builder(path: &Path, config: &BenchConfig) -> lsm_tree::Result<Config> {
     let cache_bytes = config.cache_mb.checked_mul(1024 * 1024).ok_or_else(|| {
         std::io::Error::new(
             std::io::ErrorKind::InvalidInput,
@@ -90,6 +110,9 @@ pub fn create_tree(path: &Path, config: &BenchConfig) -> lsm_tree::Result<AnyTre
     )
     .data_block_size_policy(block_size_policy)
     .data_block_compression_policy(compression_policy)
+    // A KV-separated tree writes most of its bytes as blobs, so the codec a
+    // run names has to reach them too; a standard tree ignores this.
+    .blob_compression(config.compression.to_lsm())
     .use_cache(cache);
 
     if config.partition_metadata {
@@ -103,9 +126,5 @@ pub fn create_tree(path: &Path, config: &BenchConfig) -> lsm_tree::Result<AnyTre
             .filter_block_pinning_policy(PinningPolicy::disabled());
     }
 
-    if config.use_blob_tree {
-        builder = builder.with_kv_separation(Some(Default::default()));
-    }
-
-    builder.open()
+    Ok(builder)
 }

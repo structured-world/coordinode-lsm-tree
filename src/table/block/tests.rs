@@ -163,6 +163,7 @@ fn read_data_frame_returns_decompressible_zstd_frame() -> crate::Result<()> {
         tmp.handle,
         crate::table::block::BlockIdentity::for_test(0, BlockType::Data),
         &transform,
+        || {},
     )?;
     // The returned bytes are the COMPRESSED frame: it must be smaller than
     // the payload and must decompress back to the original (proving
@@ -186,7 +187,8 @@ fn read_data_frame_returns_decompressible_zstd_frame() -> crate::Result<()> {
 fn read_data_frame_rejects_oversized_handle() -> crate::Result<()> {
     // A handle declaring an absurd on-disk size must be rejected by the
     // pre-allocation cap before any read / allocation, mirroring
-    // `from_file_with_status`.
+    // `from_file_with_status`. No read is issued, so the issue hook read
+    // accounting hangs off must not run either.
     let data: Vec<u8> = (0..1_000u32).map(|i| (i % 64) as u8).collect();
     let transform =
         crate::table::block::BlockTransform::from_parts(CompressionType::Zstd(3), None, None)?;
@@ -196,17 +198,20 @@ fn read_data_frame_rejects_oversized_handle() -> crate::Result<()> {
         &transform,
     )?;
     let oversized = BlockHandle::new(tmp.handle.offset(), u32::MAX);
+    let issued = core::cell::Cell::new(false);
     let err = Block::read_data_frame(
         &tmp.file,
         oversized,
         crate::table::block::BlockIdentity::for_test(0, BlockType::Data),
         &transform,
+        || issued.set(true),
     )
     .expect_err("oversized handle must be rejected");
     assert!(
         matches!(err, crate::Error::DecompressedSizeTooLarge { .. }),
         "expected DecompressedSizeTooLarge, got {err:?}",
     );
+    assert!(!issued.get(), "a refused handle issues no read");
     Ok(())
 }
 
@@ -439,6 +444,105 @@ fn block_zero_uncompressed_length_with_data_fails_decompress() {
         "expected Decompress error, got: {:?}",
         result.err(),
     );
+}
+
+/// Re-frames `payload` under a header whose `uncompressed_length` is one byte
+/// longer than the transform will produce. The payload checksum does not cover
+/// that field, so the block passes verification and is refused only after the
+/// transform has run.
+fn frame_with_overstated_length(
+    payload: &[u8],
+    transform: &BlockTransform<'_>,
+) -> crate::Result<Vec<u8>> {
+    use crate::coding::Encode;
+
+    let mut buf = vec![];
+    Block::write_into(
+        &mut buf,
+        payload,
+        BlockIdentity::for_test(0, BlockType::Data),
+        transform,
+    )?;
+    let mut reader = &buf[..];
+    let mut header = Header::decode_from(&mut reader)?;
+    let body = reader.to_vec();
+    header.uncompressed_length += 1;
+    let mut tampered = header.encode_into_vec();
+    tampered.extend_from_slice(&body);
+    Ok(tampered)
+}
+
+/// A block whose transform output disagrees with the declared length is
+/// refused, but the transform still ran: the output length must reach the
+/// caller's decode accounting even though the read returns `Err`.
+#[test]
+fn a_refused_uncompressed_block_still_reports_what_it_produced() -> crate::Result<()> {
+    const PAYLOAD: &[u8] = b"an uncompressed payload";
+    let transform = BlockTransform::from_parts(
+        CompressionType::None,
+        None,
+        #[cfg(zstd_any)]
+        None,
+    )?;
+    let tampered = frame_with_overstated_length(PAYLOAD, &transform)?;
+
+    let mut produced = 0;
+    let result = Block::from_reader_counting(
+        &mut &tampered[..],
+        BlockIdentity::for_test(0, BlockType::Data),
+        &transform,
+        &mut produced,
+    );
+    assert!(result.is_err(), "the length mismatch refuses the block");
+    assert_eq!(
+        produced,
+        PAYLOAD.len(),
+        "the refused block's output must still be reported",
+    );
+    Ok(())
+}
+
+/// The file read path reports the same for a compressed block: lz4 wrote its
+/// output before the length check refused it.
+#[test]
+#[cfg(feature = "lz4")]
+fn a_refused_lz4_block_read_from_a_file_still_reports_what_it_produced() -> crate::Result<()> {
+    const PAYLOAD: &[u8] = b"an lz4 payload, an lz4 payload, an lz4 payload";
+    let transform = BlockTransform::from_parts(
+        CompressionType::Lz4,
+        None,
+        #[cfg(zstd_any)]
+        None,
+    )?;
+    let tampered = frame_with_overstated_length(PAYLOAD, &transform)?;
+    let size = u32::try_from(tampered.len())
+        .map_err(|_| crate::Error::InvalidHeader("test frame length exceeds u32"))?;
+
+    let dir = tempfile::tempdir()?;
+    let path = dir.path().join("block");
+    std::fs::write(&path, &tampered)?;
+    let file = std::fs::File::open(&path)?;
+
+    let mut produced = 0;
+    let result = Block::from_file_issuing(
+        &file,
+        crate::table::BlockHandle::new(BlockOffset(0), size),
+        BlockIdentity::for_test(0, BlockType::Data),
+        &transform,
+        || {},
+        &mut produced,
+    );
+    assert!(
+        matches!(&result, Err(crate::Error::Decompress(_))),
+        "the length mismatch refuses the block, got: {:?}",
+        result.err(),
+    );
+    assert_eq!(
+        produced,
+        PAYLOAD.len(),
+        "the refused block's output must still be reported",
+    );
+    Ok(())
 }
 
 #[test]
@@ -915,7 +1019,7 @@ mod encrypted {
         let tmp = super::write_block_to_tempfile(&data, identity, &transform)?;
 
         let (header, frame, _recovery) =
-            Block::read_data_frame(&tmp.file, tmp.handle, identity, &transform)?;
+            Block::read_data_frame(&tmp.file, tmp.handle, identity, &transform, || {})?;
 
         // What came back is the COMPRESSED plaintext frame: smaller than the
         // payload, and it decompresses to the original without a second read.

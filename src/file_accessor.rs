@@ -76,6 +76,25 @@ impl FileAccessor {
         }
     }
 
+    /// Returns a table FD without touching the descriptor cache: a cached one
+    /// is used without being promoted, and a miss opens the file for this
+    /// caller alone rather than caching it, so the read leaves no trace a
+    /// later caller could see.
+    pub(crate) fn peek_or_open_table(
+        &self,
+        table_id: &GlobalTableId,
+        path: &Path,
+    ) -> crate::io::Result<Arc<dyn FsFile>> {
+        match self {
+            Self::File(fd) => Ok(fd.clone()),
+            Self::DescriptorTable { table, fs } => match table.peek_for_table(table_id) {
+                Some(fd) => Ok(fd),
+                None => Ok(Arc::from(fs.open(path, &FsOpenOptions::new().read(true))?)),
+            },
+            Self::Closed => Err(crate::io::Error::other("file accessor closed")),
+        }
+    }
+
     /// Returns a blob file FD, opening via [`Fs`] on descriptor-table cache miss.
     ///
     /// See [`get_or_open_table`](Self::get_or_open_table) for

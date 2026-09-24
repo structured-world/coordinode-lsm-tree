@@ -54,8 +54,15 @@ impl IterGuard for Guard {
         // selective scan into a full read of the value log. A caller that
         // wants every value uses `into_inner`, and that is what arms it.
         if pred(&kv.key.user_key) {
-            resolve_value_handle(self.tree.id(), &self.tree.index.config, &self.version, kv)
-                .map(|(k, v)| (k, Some(v)))
+            resolve_value_handle(
+                self.tree.id(),
+                &self.tree.index.config,
+                &self.version,
+                #[cfg(feature = "metrics")]
+                self.tree.metrics(),
+                kv,
+            )
+            .map(|(k, v)| (k, Some(v)))
         } else {
             Ok((kv.key.user_key, None))
         }
@@ -85,6 +92,8 @@ impl IterGuard for Guard {
             self.tree.id(),
             &self.tree.index.config,
             &self.version,
+            #[cfg(feature = "metrics")]
+            self.tree.metrics(),
             self.kv?,
         )
     }
@@ -94,6 +103,7 @@ fn resolve_value_handle(
     tree_id: TreeId,
     config: &Config,
     version: &Version,
+    #[cfg(feature = "metrics")] metrics: &crate::metrics::Metrics,
     item: InternalValue,
 ) -> RangeItem {
     if item.key.value_type.is_indirection() {
@@ -103,7 +113,11 @@ fn resolve_value_handle(
         // Resolve indirection using value log. No dictionary passed: each blob
         // file carries the one its own descriptor names, pinned for as long as
         // this version keeps the file alive.
-        let accessor = Accessor::new(&version.blob_files);
+        let accessor = Accessor::new(
+            &version.blob_files,
+            #[cfg(feature = "metrics")]
+            Some(metrics),
+        );
 
         match accessor.get(tree_id, &item.key.user_key, &vptr.vhandle, &config.cache) {
             Ok(Some(v)) => {
@@ -201,8 +215,14 @@ impl BlobTree {
             return Ok(None);
         };
 
-        let (_, v) =
-            resolve_value_handle(self.id(), &self.index.config, &super_version.version, item)?;
+        let (_, v) = resolve_value_handle(
+            self.id(),
+            &self.index.config,
+            &super_version.version,
+            #[cfg(feature = "metrics")]
+            self.metrics(),
+            item,
+        )?;
 
         Ok(Some(v))
     }
@@ -232,8 +252,14 @@ impl BlobTree {
         self.index
             .scan_since_seqno_with(target_seqno, true, |version, entry| {
                 let seqno = entry.key.seqno;
-                let (key, value) =
-                    resolve_value_handle(self.id(), &self.index.config, version, entry)?;
+                let (key, value) = resolve_value_handle(
+                    self.id(),
+                    &self.index.config,
+                    version,
+                    #[cfg(feature = "metrics")]
+                    self.metrics(),
+                    entry,
+                )?;
                 Ok(ScanSinceEvent::Insert { key, value, seqno })
             })
     }
@@ -262,8 +288,14 @@ impl BlobTree {
             true,
             |version, entry| {
                 let seqno = entry.key.seqno;
-                let (key, value) =
-                    resolve_value_handle(self.id(), &self.index.config, version, entry)?;
+                let (key, value) = resolve_value_handle(
+                    self.id(),
+                    &self.index.config,
+                    version,
+                    #[cfg(feature = "metrics")]
+                    self.metrics(),
+                    entry,
+                )?;
                 Ok(ScanSinceEvent::Insert { key, value, seqno })
             },
             Some(&bounds),
@@ -461,7 +493,11 @@ impl<I: Iterator<Item = crate::Result<InternalValue>>> PrefetchScan<I> {
             return;
         }
 
-        let accessor = Accessor::new(&self.version.blob_files);
+        let accessor = Accessor::new(
+            &self.version.blob_files,
+            #[cfg(feature = "metrics")]
+            Some(self.tree.metrics()),
+        );
 
         accessor.prefetch(
             self.tree.id(),
@@ -1537,6 +1573,8 @@ impl AbstractTree for BlobTree {
                     self.id(),
                     &self.index.config,
                     &super_version.version,
+                    #[cfg(feature = "metrics")]
+                    self.metrics(),
                     item,
                 )?;
                 results[idx] = Some(v);

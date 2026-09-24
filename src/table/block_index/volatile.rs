@@ -12,7 +12,7 @@ use crate::{
         BlockHandle, IndexBlock,
         block::BlockType,
         block_index::{BlockIndexIter, iter::OwnedIndexBlockIter},
-        util::load_block,
+        util::{ReadCharge, load_block},
     },
 };
 use alloc::sync::Arc;
@@ -70,7 +70,9 @@ pub struct Iter {
     hi: Option<(UserKey, SeqNo)>,
 
     #[cfg(feature = "metrics")]
-    pub(crate) metrics: Arc<Metrics>,
+    metrics: Arc<Metrics>,
+    /// Whose walk this is, for the index block it loads.
+    pub(crate) charge: ReadCharge,
 
     poisoned: bool,
 }
@@ -94,6 +96,7 @@ impl Iter {
 
             #[cfg(feature = "metrics")]
             metrics: index.metrics.clone(),
+            charge: ReadCharge::Foreground,
             poisoned: false,
         }
     }
@@ -132,6 +135,7 @@ impl Iter {
             None,
             #[cfg(feature = "metrics")]
             &self.metrics,
+            self.charge,
         )?;
         let index_block = IndexBlock::new(block);
         let lo = self.lo.as_ref().map(|(k, s)| (k.as_ref(), *s));

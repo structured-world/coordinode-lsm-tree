@@ -332,3 +332,30 @@ fn partial_decode_runtime_fraction_promotion_stays_correct() {
         (50..90).rev().map(key).collect::<Vec<_>>()
     );
 }
+
+#[test]
+#[cfg(feature = "metrics")]
+fn partial_decode_counts_the_frame_it_read_and_the_prefix_it_decoded() {
+    // The partial path reads a block's frame and decodes only a prefix of it,
+    // outside the per-block load path. Both halves must reach the read-path
+    // byte counters, or a range query on a large zstd block would report
+    // reading and decoding nothing at all.
+    enable_partial_decode();
+    let (_dir, tree) = large_zstd_block_tree();
+    let m = tree.metrics();
+    let (read_before, decoded_before) = (m.bytes_read(), m.bytes_decoded());
+
+    assert_eq!(
+        range_keys(&tree, 50, 90),
+        (50..90).map(key).collect::<Vec<_>>()
+    );
+
+    assert!(
+        m.bytes_read() > read_before,
+        "the partial path read a frame from the filesystem but charged nothing",
+    );
+    assert!(
+        m.bytes_decoded() > decoded_before,
+        "the partial path decoded a prefix but charged nothing",
+    );
+}

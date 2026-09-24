@@ -12,7 +12,7 @@ use crate::{
     table::{
         block::BlockType,
         block_index::{BlockIndexIter, iter::OwnedIndexBlockIter},
-        util::load_block,
+        util::{ReadCharge, load_block},
     },
 };
 use alloc::sync::Arc;
@@ -62,6 +62,7 @@ impl TwoLevelBlockIndex {
 
             #[cfg(feature = "metrics")]
             metrics: self.metrics.clone(),
+            charge: ReadCharge::Foreground,
             poisoned: false,
         }
     }
@@ -88,6 +89,8 @@ pub struct Iter {
 
     #[cfg(feature = "metrics")]
     metrics: Arc<Metrics>,
+    /// Whose walk this is, for the partitions it loads.
+    pub(crate) charge: ReadCharge,
 
     poisoned: bool,
 }
@@ -182,6 +185,7 @@ impl Iterator for Iter {
                     None,
                     #[cfg(feature = "metrics")]
                     &self.metrics,
+                    self.charge,
                 ) {
                     Ok(b) => b,
                     Err(e) => return self.poison(e),
@@ -268,6 +272,7 @@ impl DoubleEndedIterator for Iter {
                     None,
                     #[cfg(feature = "metrics")]
                     &self.metrics,
+                    self.charge,
                 ) {
                     Ok(b) => b,
                     Err(e) => return self.poison(e),

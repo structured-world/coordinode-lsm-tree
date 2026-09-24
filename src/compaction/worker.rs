@@ -618,7 +618,10 @@ fn create_bounded_compaction_stream<'a>(
     for run in version.iter_levels().flat_map(|lvl| lvl.iter()) {
         for table in run.iter().filter(|x| to_compact.contains(&x.metadata.id)) {
             found += 1;
-            readers.push(Box::new(table.range(bounds.clone())));
+            // Compaction input is maintenance, not a read a caller made, so
+            // it stays out of the read counters like the serial scanner's.
+            let reader = table.range_iter(bounds.clone()).for_maintenance();
+            readers.push(Box::new(reader));
         }
     }
 
@@ -1200,11 +1203,9 @@ fn tight_slice_boundaries(
     slice_budget: u64,
     cmp: &dyn crate::comparator::UserComparator,
 ) -> crate::Result<Vec<UserKey>> {
-    use crate::table::block_index::BlockIndex;
-
     let mut entries: Vec<(UserKey, u32)> = Vec::new();
     for input in inputs {
-        for handle in input.block_index.iter() {
+        for handle in input.maintenance_index_walk() {
             let handle = handle?;
             entries.push((handle.end_key().clone(), handle.size()));
         }

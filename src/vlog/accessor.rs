@@ -2,6 +2,8 @@
 // Copyright (c) 2024-present, fjall-rs
 // Copyright (c) 2026-present, Dmitry Prudnikov
 
+#[cfg(feature = "metrics")]
+use crate::metrics::Metrics;
 use crate::{
     Cache, GlobalTableId, TreeId, UserValue,
     version::BlobFileList,
@@ -17,11 +19,49 @@ use alloc::{string::ToString, vec::Vec};
 /// hold.
 pub struct Accessor<'a> {
     blob_files: &'a BlobFileList,
+    /// Where this accessor's reads are counted. A blob read is a read of the
+    /// filesystem like any other, so it lands in the same `bytes_read` /
+    /// `bytes_decoded` pair the block path reports through. `None` for a
+    /// maintenance read (a compaction filter resolving a value), which the
+    /// read counters leave out as they leave out compaction's own input.
+    #[cfg(feature = "metrics")]
+    metrics: Option<&'a Metrics>,
 }
 
 impl<'a> Accessor<'a> {
-    pub fn new(blob_files: &'a BlobFileList) -> Self {
-        Self { blob_files }
+    pub fn new(
+        blob_files: &'a BlobFileList,
+        #[cfg(feature = "metrics")] metrics: Option<&'a Metrics>,
+    ) -> Self {
+        Self {
+            blob_files,
+            #[cfg(feature = "metrics")]
+            metrics,
+        }
+    }
+
+    /// Records one uncached blob read: what was asked of the filesystem, and
+    /// what came out of the record's validation and decompression.
+    #[cfg_attr(
+        not(feature = "metrics"),
+        expect(
+            unused_variables,
+            clippy::unused_self,
+            reason = "the arguments and the accessor's counters are both the feature's payload"
+        )
+    )]
+    #[inline]
+    fn count_read(&self, on_disk: usize, decoded: usize) {
+        #[cfg(feature = "metrics")]
+        if let Some(metrics) = self.metrics {
+            use core::sync::atomic::Ordering::Relaxed;
+            metrics
+                .blob_bytes_io_requested
+                .fetch_add(on_disk as u64, Relaxed);
+            metrics
+                .blob_bytes_decoded
+                .fetch_add(decoded as u64, Relaxed);
+        }
     }
 
     /// Reads one separated value.
@@ -57,10 +97,39 @@ impl<'a> Accessor<'a> {
 
         let reader = Reader::new(blob_file, file.as_ref());
 
-        let value = reader.get(key, vhandle)?;
-        cache.insert_blob(tree_id, vhandle, key, value.clone());
+        // Charged before the read is issued, as a block read is: a request the
+        // filesystem then fails, or whose bytes then fail their checksum or
+        // decompression, was still asked of it.
+        let len = crate::vlog::blob_file::reader::record_len(key.len(), vhandle)?;
+        self.count_read(len, 0);
+        let record = reader.read_record(vhandle, len)?;
+        // Charged before the result is judged, like the read above: a record
+        // refused after decompression was still decompressed.
+        let mut decoded = 0;
+        let parsed = reader.parse_record(key, vhandle, &record, &mut decoded);
+        self.count_read(0, decoded);
+        let value = parsed?;
+        let detached = cache.insert_blob(tree_id, vhandle, key, value.clone());
+        self.count_gather(detached);
 
         Ok(Some(value))
+    }
+
+    /// Records a gather this accessor performed on a read's behalf.
+    #[cfg_attr(
+        not(feature = "metrics"),
+        expect(
+            unused_variables,
+            clippy::unused_self,
+            reason = "the argument and the accessor's counters are both the feature's payload"
+        )
+    )]
+    #[inline]
+    fn count_gather(&self, bytes: usize) {
+        #[cfg(feature = "metrics")]
+        if let Some(metrics) = self.metrics {
+            metrics.record_gather(bytes);
+        }
     }
 
     /// Warms the cache with a run of upcoming separated values, coalescing
@@ -236,6 +305,13 @@ impl<'a> Accessor<'a> {
         let Ok(span_len) = usize::try_from(span_end - span_start) else {
             return;
         };
+        // The whole extent, gaps included: that is what is asked of the
+        // filesystem, and swallowing a gap to merge two reads is the point of
+        // the coalescing, so charging only the records would hide its cost.
+        // Charged once, before the read is issued, so a read the filesystem
+        // then fails is counted, and whether or not every record it covers is
+        // then parsed.
+        self.count_read(span_len, 0);
         let Ok(span) = crate::file::read_exact(file.as_ref(), span_start, span_len) else {
             return;
         };
@@ -270,11 +346,18 @@ impl<'a> Accessor<'a> {
             };
 
             let record = if aliases_input {
+                // A copy out of the span: charged as the gather it is.
+                self.count_gather(bytes.len());
                 crate::Slice::from(bytes)
             } else {
                 span.slice(rel..record_end)
             };
-            if let Ok(value) = reader.parse_record(key, &vhandle, &record) {
+            // Decoded only: the span's bytes were charged once above. Charged
+            // whether or not the record is then accepted.
+            let mut decoded = 0;
+            let parsed = reader.parse_record(key, &vhandle, &record, &mut decoded);
+            self.count_read(0, decoded);
+            if let Ok(value) = parsed {
                 // Checked BEFORE inserting, against the full weight the cache
                 // charges (key as well as value), and against the DECODED
                 // length rather than the on-disk one: a compressed blob file
@@ -296,7 +379,8 @@ impl<'a> Accessor<'a> {
                     return;
                 }
                 *admit_budget -= weight;
-                cache.insert_blob(tree_id, &vhandle, key, value);
+                let detached = cache.insert_blob(tree_id, &vhandle, key, value);
+                self.count_gather(detached);
             }
         }
     }

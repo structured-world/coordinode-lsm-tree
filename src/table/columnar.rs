@@ -559,7 +559,7 @@ impl ColumnBatch {
         // succeed do we mutate `self`. A fallible encode mid-loop would otherwise
         // leave the batch half-appended (some columns longer) while `row_count`
         // stays unchanged, corrupting the pending rowgroup.
-        let mut merged: Vec<(Vec<u8>, Option<Vec<u8>>)> = Vec::with_capacity(self.columns.len());
+        let mut merged: Vec<(Slice, Option<Vec<u8>>)> = Vec::with_capacity(self.columns.len());
         for (a, b) in self.columns.iter().zip(&other.columns) {
             let new_validity = combine_validity(
                 a.validity.as_deref(),
@@ -568,12 +568,9 @@ impl ColumnBatch {
                 other.row_count,
             )?;
             let new_data = match a.type_tag {
-                TypeTag::Fixed(_) => {
-                    let mut data = Vec::with_capacity(a.data.len() + b.data.len());
-                    data.extend_from_slice(&a.data);
-                    data.extend_from_slice(&b.data);
-                    data
-                }
+                // Both sides validated as `rows * width` bytes, so the result
+                // is the two bodies back to back.
+                TypeTag::Fixed(_) => Slice::fused(&a.data, &b.data),
                 TypeTag::Bytes => {
                     let mut cells: Vec<&[u8]> = Vec::with_capacity(combined_rows as usize);
                     for i in 0..old_rows {
@@ -582,13 +579,13 @@ impl ColumnBatch {
                     for j in 0..other.row_count {
                         cells.push(bytes_column_row(&b.data, other.row_count, j)?);
                     }
-                    encode_bytes_column(&cells)?
+                    frame_bytes_column(cells.len(), || cells.iter().copied())?
                 }
             };
             merged.push((new_data, new_validity));
         }
         for (col, (data, validity)) in self.columns.iter_mut().zip(merged) {
-            col.data = crate::Slice::from(data);
+            col.data = data;
             col.validity = validity;
         }
         self.row_count = combined_rows;
@@ -646,7 +643,7 @@ impl ColumnBatch {
     /// validity flag, or any column that fails [`Column::validate`] (fixed-width
     /// length, `Bytes` offset framing, validity bitmap length / padding).
     pub fn decode(bytes: &crate::Slice) -> Result<Self> {
-        Self::decode_inner(bytes, None)
+        Self::decode_inner(bytes, None, &mut 0)
     }
 
     /// Decodes only the columns whose id is in `wanted`, advancing past every
@@ -660,7 +657,19 @@ impl ColumnBatch {
     /// As [`ColumnBatch::decode`], evaluated only for the projected columns
     /// (the headers of skipped columns are still framing-checked).
     pub fn decode_projected(bytes: &crate::Slice, wanted: &[u16]) -> Result<Self> {
-        Self::decode_inner(bytes, Some(wanted))
+        Self::decode_inner(bytes, Some(wanted), &mut 0)
+    }
+
+    /// [`ColumnBatch::decode`] or, with `Some(wanted)`,
+    /// [`ColumnBatch::decode_projected`], also adding to `copied` the bytes
+    /// the decode copied out of the block: validity bitmaps, and `Plain`
+    /// columns detached from it. Read paths charge those to the gather counter.
+    pub(crate) fn decode_counting_copies(
+        bytes: &crate::Slice,
+        wanted: Option<&[u16]>,
+        copied: &mut usize,
+    ) -> Result<Self> {
+        Self::decode_inner(bytes, wanted, copied)
     }
 
     /// Shared decode body. `wanted == None` decodes every column; `Some(ids)`
@@ -670,8 +679,14 @@ impl ColumnBatch {
     /// Takes the refcounted block bytes so `Plain` columns come back as
     /// zero-copy views of the block instead of per-column copies — as long as
     /// the projection covers enough of the block for a view to be worth what
-    /// it retains (see [`MAX_VIEW_AMPLIFICATION`]).
-    fn decode_inner(bytes: &crate::Slice, wanted: Option<&[u16]>) -> Result<Self> {
+    /// it retains (see [`MAX_VIEW_AMPLIFICATION`]). Adds to `copied` each copy
+    /// out of the block as it is made, so a payload refused after one still
+    /// counts it.
+    fn decode_inner(
+        bytes: &crate::Slice,
+        wanted: Option<&[u16]>,
+        copied: &mut usize,
+    ) -> Result<Self> {
         // Smallest possible column: id(2) + type(1) + width(1) + codec(1) +
         // has_validity(1) + data_len(4), with empty validity + data.
         const MIN_COLUMN_BYTES: usize = 10;
@@ -713,7 +728,12 @@ impl ColumnBatch {
             let want = wanted.is_none_or(|w| w.contains(&column_id));
             let validity = if has_validity {
                 let v = cur.read_bytes(validity_len(row_count))?;
-                if want { Some(v.to_vec()) } else { None }
+                if want {
+                    *copied += v.len();
+                    Some(v.to_vec())
+                } else {
+                    None
+                }
             } else {
                 None
             };
@@ -744,6 +764,13 @@ impl ColumnBatch {
             column.validate(row_count)?;
             columns.push(column);
         }
+        // Checked before the retention detach below, so a refused payload is
+        // not copied for nothing.
+        if !cur.is_empty() {
+            return Err(Error::InvalidHeader(
+                "columnar: trailing bytes after the last column",
+            ));
+        }
         // Retention check: a view keeps the WHOLE decoded block alive, skipped
         // columns included, for as long as any served column lives — and the
         // scan buffers one batch per block (a whole overlap group on the merge
@@ -755,14 +782,10 @@ impl ColumnBatch {
         if !view_columns.is_empty() && bytes.len() > MAX_VIEW_AMPLIFICATION * viewed_bytes {
             for idx in view_columns {
                 if let Some(col) = columns.get_mut(idx) {
+                    *copied += col.data.len();
                     col.data = crate::Slice::from(&col.data[..]);
                 }
             }
-        }
-        if !cur.is_empty() {
-            return Err(Error::InvalidHeader(
-                "columnar: trailing bytes after the last column",
-            ));
         }
         Ok(Self { row_count, columns })
     }
@@ -901,27 +924,116 @@ pub(crate) fn bytes_column_row(data: &[u8], row_count: u32, i: u32) -> Result<&[
         .ok_or(Error::InvalidHeader("columnar: bytes row out of range"))
 }
 
-/// Encodes variable-width cells as a [`TypeTag::Bytes`] column body: a
-/// `(len + 1)`-entry little-endian `u32` offset array followed by the
-/// concatenated payload.
-fn encode_bytes_column(cells: &[&[u8]]) -> Result<Vec<u8>> {
-    let mut offsets = Vec::with_capacity((cells.len() + 1) * 4);
-    let mut acc = 0u32;
-    offsets.extend_from_slice(&acc.to_le_bytes());
-    for c in cells {
-        let len = u32::try_from(c.len())
-            .map_err(|_| Error::InvalidHeader("columnar: bytes cell exceeds u32"))?;
-        acc = acc
-            .checked_add(len)
-            .ok_or(Error::InvalidHeader("columnar: bytes payload exceeds u32"))?;
-        offsets.extend_from_slice(&acc.to_le_bytes());
+/// Frames `count` variable-width cells as a [`TypeTag::Bytes`] column body: a
+/// `(count + 1)`-entry little-endian `u32` offset array followed by the
+/// concatenated payload, written once into a buffer of exactly that size.
+///
+/// `cells` yields the same cells on each call: once to size the buffer, once
+/// to fill it, so no intermediate payload is built and copied again.
+///
+/// # Errors
+///
+/// Returns [`Error::DecompressedSizeTooLarge`] when the payload does not fit
+/// the `u32` offsets, and [`Error::InvalidHeader`] when `cells` yields other
+/// than `count` cells or yields differently on its second call.
+pub(crate) fn frame_bytes_column<'a, I>(count: usize, cells: impl Fn() -> I) -> Result<Slice>
+where
+    I: Iterator<Item = &'a [u8]>,
+{
+    let too_large = |declared: u64| Error::DecompressedSizeTooLarge {
+        declared,
+        limit: u64::from(u32::MAX),
+    };
+    let mut total = 0u32;
+    let mut sized = 0usize;
+    for cell in cells() {
+        total = advance_bytes_offset(total, cell.len())?;
+        sized += 1;
     }
-    let mut out = offsets;
-    out.reserve(acc as usize);
-    for c in cells {
-        out.extend_from_slice(c);
+    let mismatch = || Error::InvalidHeader("columnar: bytes cells changed between passes");
+    if sized != count {
+        return Err(mismatch());
     }
-    Ok(out)
+    let table = count
+        .checked_add(1)
+        .and_then(|n| n.checked_mul(4))
+        .ok_or_else(|| too_large(count as u64))?;
+    let len = table
+        .checked_add(total as usize)
+        .ok_or_else(|| too_large(u64::from(total)))?;
+    // SAFETY: the buffer is frozen (and so read) only after the fill below
+    // wrote all of it: slot 0, one offset slot per cell for exactly `count`
+    // cells, and the payload through exactly `total` bytes. Any other outcome
+    // returns early and drops the builder unread. A zeroing builder would add
+    // a pass over bytes the fill overwrites anyway: measured 3-6% slower on
+    // `columnar/filter_batch` at every keep ratio.
+    #[expect(unsafe_code, reason = "see safety")]
+    let mut out = unsafe { Slice::builder_unzeroed(len) };
+    let (offsets, payload) = out.split_at_mut(table);
+    let mut slots = offsets.chunks_exact_mut(4);
+    let mut written = 0usize;
+    let mut filled = 0usize;
+    if let Some(first) = slots.next() {
+        first.copy_from_slice(&0u32.to_le_bytes());
+    }
+    for cell in cells() {
+        let end = written + cell.len();
+        let (Some(dst), Some(slot)) = (payload.get_mut(written..end), slots.next()) else {
+            return Err(mismatch());
+        };
+        dst.copy_from_slice(cell);
+        written = end;
+        let offset = u32::try_from(written).map_err(|_| mismatch())?;
+        slot.copy_from_slice(&offset.to_le_bytes());
+        filled += 1;
+    }
+    if filled != count || written != total as usize {
+        return Err(mismatch());
+    }
+    Ok(Slice::from(out.freeze()))
+}
+
+/// Advances a `Bytes` column's running offset by one cell's length, returning
+/// the new offset. A gather may repeat a cell, so a payload can outgrow the
+/// column it came from; a saturating offset would then desync the table from
+/// the payload (later rows mis-sliced on read), so this returns
+/// [`Error::DecompressedSizeTooLarge`] when either the cell's length or the
+/// running total would exceed the `u32` offset capacity.
+fn advance_bytes_offset(acc: u32, value_len: usize) -> Result<u32> {
+    let len = u32::try_from(value_len).map_err(|_| Error::DecompressedSizeTooLarge {
+        declared: value_len as u64,
+        limit: u64::from(u32::MAX),
+    })?;
+    acc.checked_add(len)
+        .ok_or_else(|| Error::DecompressedSizeTooLarge {
+            declared: u64::from(acc) + u64::from(len),
+            limit: u64::from(u32::MAX),
+        })
+}
+
+/// Gathers `count` fixed-width cells of `width` bytes into a column body of
+/// exactly `count * width` bytes, written once. A cell `cells` does not supply,
+/// or supplies at the wrong width, is zero-filled, so the framing always
+/// matches `count` rows.
+pub(crate) fn gather_fixed_column<'a>(
+    width: usize,
+    count: usize,
+    mut cells: impl Iterator<Item = Option<&'a [u8]>>,
+) -> Slice {
+    // A cell count addresses rows of one block and `width` is a `u8`, so the
+    // product fits.
+    let len = count * width;
+    // SAFETY: every `width`-byte chunk of the buffer, and so every byte, is
+    // written (copied or zero-filled) before it is frozen and read.
+    #[expect(unsafe_code, reason = "see safety")]
+    let mut out = unsafe { Slice::builder_unzeroed(len) };
+    for dst in out.chunks_exact_mut(width.max(1)) {
+        match cells.next() {
+            Some(Some(cell)) if cell.len() == dst.len() => dst.copy_from_slice(cell),
+            _ => dst.fill(0),
+        }
+    }
+    Slice::from(out.freeze())
 }
 
 /// Whether row `row`'s presence bit is set in a validity bitmap (set = valid).
@@ -1222,6 +1334,16 @@ pub fn column_batch_to_entries(batch: &ColumnBatch) -> Result<Vec<InternalValue>
     Ok(out)
 }
 
+/// Whether [`column_batch_into_entries`] can hand each row its value as a view
+/// into the column buffer: true for a single non-nullable bytes value column,
+/// false when every value must be rebuilt (framed or fixed-width) per row.
+fn values_are_views(value_cols: &[Column]) -> bool {
+    matches!(
+        value_cols,
+        [c] if c.type_tag == TypeTag::Bytes && c.validity.is_none()
+    )
+}
+
 /// Consuming, allocation-light counterpart to [`column_batch_to_entries`] for
 /// the scan path.
 ///
@@ -1229,8 +1351,12 @@ pub fn column_batch_to_entries(batch: &ColumnBatch) -> Result<Vec<InternalValue>
 /// shared [`Slice`]s, so each row's key / value is a view into one buffer
 /// (zero-copy for the Arc-backed large-value case) instead of a per-row copy.
 /// Any other value layout (fixed-width, multiple sub-columns, or nullable) falls
-/// back to the per-row framing reconstruction.
-pub fn column_batch_into_entries(batch: ColumnBatch) -> Result<Vec<InternalValue>> {
+/// back to the per-row framing reconstruction, whose rebuilt bytes are added to
+/// `rebuilt` row by row, so a batch refused at a later row still counts them.
+pub fn column_batch_into_entries(
+    batch: ColumnBatch,
+    rebuilt: &mut usize,
+) -> Result<Vec<InternalValue>> {
     // Structural validation (intrinsic columns + framing) before we consume.
     validate_columnar_columns(&batch)?;
     let row_count = batch.row_count;
@@ -1249,13 +1375,7 @@ pub fn column_batch_into_entries(batch: ColumnBatch) -> Result<Vec<InternalValue
     // Shared key buffer: every row's key is a view into it.
     let key_data = key_col.data;
 
-    // A single non-nullable bytes value column lets every row's value be a view
-    // into one shared buffer; otherwise reconstruct (frame / fixed-width) per row.
-    let single_bytes_value = matches!(
-        value_cols.as_slice(),
-        [c] if c.type_tag == TypeTag::Bytes && c.validity.is_none()
-    );
-    let value_source = if single_bytes_value {
+    let value_source = if values_are_views(&value_cols) {
         let single = value_cols
             .into_iter()
             .next()
@@ -1284,7 +1404,11 @@ pub fn column_batch_into_entries(batch: ColumnBatch) -> Result<Vec<InternalValue
             ValueType::try_from(vt_byte).map_err(|()| Error::InvalidTag(("ValueType", vt_byte)))?;
         let value = match &value_source {
             ValueSource::SharedBytes(data) => bytes_row_slice(data, row_count, i)?,
-            ValueSource::Reconstruct(cols) => reconstruct_row_value(cols, row_count, i)?,
+            ValueSource::Reconstruct(cols) => {
+                let value = reconstruct_row_value(cols, row_count, i)?;
+                *rebuilt += value.len();
+                value
+            }
         };
         out.push(InternalValue {
             key: InternalKey {
@@ -1307,6 +1431,10 @@ enum ValueSource {
 
 /// Returns row `i` of a [`TypeTag::Bytes`] column body as a zero-copy [`Slice`]
 /// view into `data` (the column's shared buffer), bounds-checked.
+///
+/// Not charged to `bytes_copied` even when the slice is short enough for
+/// [`Slice`] to store it inline: a view is a view whatever its representation,
+/// and the inline copy costs no more than building a shared handle.
 fn bytes_row_slice(data: &Slice, row_count: u32, i: u32) -> Result<Slice> {
     let bytes: &[u8] = data.as_ref();
     let off_bytes = (row_count as usize + 1) * 4;
@@ -1345,11 +1473,16 @@ fn bytes_row_slice(data: &Slice, row_count: u32, i: u32) -> Result<Slice> {
 /// seqno-aware point read, so a columnar point read decodes the block once and
 /// touches one key's rows instead of untransposing and re-encoding the whole
 /// block.
+///
+/// Adds to `copied` the key and value bytes of each matching row as it is
+/// copied out of the columns, so rows copied before a later row fails are
+/// still reported.
 pub fn column_batch_match_entries(
     batch: &ColumnBatch,
     needle: &[u8],
     comparator: &crate::comparator::SharedComparator,
     deletes: Option<(&crate::table::delete_bitmap::DeleteBitmap, u32)>,
+    copied: &mut usize,
 ) -> Result<Vec<InternalValue>> {
     let (key_col, seqno_col, vt_col, value_cols) = validate_columnar_columns(batch)?;
     let row_count = batch.row_count;
@@ -1409,6 +1542,7 @@ pub fn column_batch_match_entries(
             let value_type = ValueType::try_from(vt_byte)
                 .map_err(|()| Error::InvalidTag(("ValueType", vt_byte)))?;
             let value = reconstruct_row_value(value_cols, row_count, row)?;
+            *copied += k.len() + value.len();
             out.push(InternalValue {
                 key: InternalKey {
                     user_key: Slice::from(k),

@@ -1213,14 +1213,17 @@ enum BatchedBehaviour {
 struct CountingFs {
     inner: StdFs,
     batched: Arc<std::sync::atomic::AtomicUsize>,
+    /// Bytes the batched reads asked for, whatever the call then returned.
+    asked: Arc<std::sync::atomic::AtomicU64>,
     behaviour: Arc<std::sync::Mutex<BatchedBehaviour>>,
 }
 
-/// A backend, its batched-read counter, and the switch controlling how it
+/// A backend, its batched-read counters, and the switch controlling how it
 /// answers those reads.
 struct CountingHandles {
     fs: Arc<dyn lsm_tree::fs::Fs>,
     batched: Arc<std::sync::atomic::AtomicUsize>,
+    asked: Arc<std::sync::atomic::AtomicU64>,
     behaviour: Arc<std::sync::Mutex<BatchedBehaviour>>,
 }
 
@@ -1229,8 +1232,21 @@ impl CountingHandles {
         self.batched.load(std::sync::atomic::Ordering::Relaxed)
     }
 
+    /// Bytes asked of this backend through batched reads since the last reset.
+    #[cfg_attr(
+        not(feature = "metrics"),
+        expect(
+            dead_code,
+            reason = "only the metrics-gated batched-read tests read it"
+        )
+    )]
+    fn asked(&self) -> u64 {
+        self.asked.load(std::sync::atomic::Ordering::Relaxed)
+    }
+
     fn reset(&self) {
         self.batched.store(0, std::sync::atomic::Ordering::Relaxed);
+        self.asked.store(0, std::sync::atomic::Ordering::Relaxed);
     }
 
     fn behave(&self, how: BatchedBehaviour) {
@@ -1254,15 +1270,18 @@ impl CountingFs {
     /// The same backend, with the behaviour switch exposed too.
     fn handles() -> CountingHandles {
         let batched = Arc::new(std::sync::atomic::AtomicUsize::new(0));
+        let asked = Arc::new(std::sync::atomic::AtomicU64::new(0));
         let behaviour = Arc::new(std::sync::Mutex::new(BatchedBehaviour::Serve));
         let fs = Arc::new(Self {
             inner: StdFs,
             batched: Arc::clone(&batched),
+            asked: Arc::clone(&asked),
             behaviour: Arc::clone(&behaviour),
         });
         CountingHandles {
             fs,
             batched,
+            asked,
             behaviour,
         }
     }
@@ -1275,6 +1294,9 @@ impl lsm_tree::fs::Fs for CountingFs {
     ) -> lsm_tree::io::Result<()> {
         self.batched
             .fetch_add(1, std::sync::atomic::Ordering::Relaxed);
+        let asked: usize = reqs.iter().map(|r| r.buf.capacity()).sum();
+        self.asked
+            .fetch_add(asked as u64, std::sync::atomic::Ordering::Relaxed);
         let behaviour = *self
             .behaviour
             .lock()
@@ -1808,6 +1830,169 @@ fn the_chunked_resolve_refuses_a_misbehaving_backend() -> lsm_tree::Result<()> {
                 if io_err.kind() == lsm_tree::io::ErrorKind::UnexpectedEof,
         ),
         "expected the short-request guard, got {unfilled:?}",
+    );
+    Ok(())
+}
+
+/// Writes one level whose tables live on two backends: the first half through
+/// the primary, the second through a route added afterwards. Index and filter
+/// blocks are pinned at open, so a lookup's only reads are data blocks and
+/// the byte counter can be compared with what the backends were asked for.
+#[cfg(feature = "metrics")]
+fn split_level(
+    dir: &std::path::Path,
+    primary: &CountingHandles,
+    other: &CountingHandles,
+    cache_bytes: u64,
+    rows: u32,
+) -> lsm_tree::Result<impl Fn() -> Config> {
+    use lsm_tree::config::PinningPolicy;
+
+    let unrouted = {
+        let dir = dir.to_path_buf();
+        let fs = Arc::clone(&primary.fs);
+        move || {
+            Config::new(
+                dir.join("primary"),
+                SequenceNumberCounter::default(),
+                SequenceNumberCounter::default(),
+            )
+            .with_shared_fs(Arc::clone(&fs))
+            .use_cache(Arc::new(lsm_tree::Cache::with_capacity_bytes(cache_bytes)))
+            .index_block_pinning_policy(PinningPolicy::all(true))
+            .filter_block_pinning_policy(PinningPolicy::all(true))
+            .data_block_compression_policy(CompressionPolicy::all(lsm_tree::CompressionType::None))
+            .index_block_compression_policy(CompressionPolicy::all(lsm_tree::CompressionType::None))
+        }
+    };
+    let routed = {
+        let dir = dir.to_path_buf();
+        let fs = Arc::clone(&other.fs);
+        let unrouted = unrouted.clone();
+        move || {
+            unrouted().level_routes(vec![LevelRoute {
+                levels: 0..1,
+                path: dir.join("other"),
+                fs: Arc::clone(&fs),
+            }])
+        }
+    };
+
+    {
+        let tree = unrouted().open()?;
+        for i in 0..rows {
+            tree.insert(format!("a{i:05}"), vec![b'v'; 64], u64::from(i));
+        }
+        tree.flush_active_memtable(0)?;
+    }
+    {
+        let tree = routed().open()?;
+        for i in 0..rows {
+            tree.insert(
+                format!("b{i:05}"),
+                vec![b'v'; 64],
+                u64::from(rows + 1_000 + i),
+            );
+        }
+        tree.flush_active_memtable(0)?;
+    }
+    Ok(routed)
+}
+
+/// A batched read is charged when it is ISSUED. The prewarm submits one group
+/// per backend and gives up at the first that fails, so the groups after it are
+/// never asked of anything: charging them anyway reports reads that did not
+/// happen, on top of the serial resolve that then reads those same blocks.
+///
+/// Both backends refuse here, so only the first group is issued. What the
+/// failed run reads beyond a successful one must be exactly what the backends
+/// were asked for: the successful run's data reads all go through the batch,
+/// and the failed run repeats them serially after the refusal.
+#[cfg(feature = "metrics")]
+#[test]
+fn a_failed_prewarm_charges_only_the_groups_it_submitted() -> lsm_tree::Result<()> {
+    let dir = tempfile::tempdir()?;
+    let primary = CountingFs::handles();
+    let other = CountingFs::handles();
+    let config = split_level(dir.path(), &primary, &other, 32 * 1_024 * 1_024, 400)?;
+
+    let mut keys: Vec<String> = (0..6).map(|i| format!("a{:05}", i * 60)).collect();
+    keys.extend((0..6).map(|i| format!("b{:05}", i * 60)));
+
+    let run = |how: BatchedBehaviour| -> lsm_tree::Result<(u64, u64)> {
+        // A fresh tree per run: a warm cache leaves nothing to prewarm.
+        let tree = config().open()?;
+        primary.behave(how);
+        other.behave(how);
+        primary.reset();
+        other.reset();
+        let before = tree.metrics().bytes_read();
+        let values = tree.multi_get(&keys, lsm_tree::SeqNo::MAX)?;
+        assert!(values.iter().all(Option::is_some), "every key resolves");
+        Ok((
+            tree.metrics().bytes_read() - before,
+            primary.asked() + other.asked(),
+        ))
+    };
+
+    let (served, served_asked) = run(BatchedBehaviour::Serve)?;
+    let (refused, refused_asked) = run(BatchedBehaviour::Fail)?;
+
+    assert_eq!(
+        served, served_asked,
+        "a successful prewarm reads every data block through the batch",
+    );
+    assert!(
+        primary.calls() + other.calls() == 1 && refused_asked < served_asked,
+        "the refusal stops the prewarm at its first group",
+    );
+    assert_eq!(
+        refused,
+        served + refused_asked,
+        "the failed run charged {} B beyond the serial reads, but the backends \
+         were asked for {refused_asked} B",
+        refused - served,
+    );
+    Ok(())
+}
+
+/// The chunked resolve charges its batched reads the same way: per backend
+/// group, when the group is submitted. Its first failure is returned to the
+/// caller, so a group after it is never read and must not be charged.
+#[cfg(feature = "metrics")]
+#[test]
+fn a_failed_chunked_resolve_charges_only_the_groups_it_submitted() -> lsm_tree::Result<()> {
+    let dir = tempfile::tempdir()?;
+    let primary = CountingFs::handles();
+    let other = CountingFs::handles();
+    // Four cold blocks of ~4.3 KiB, two per backend, against a 28 KiB cache:
+    // more than half the cache, so the level is resolved in chunks, and a
+    // chunk budget of half the cache holds three of them. Tasks are ordered
+    // run by run, so the first chunk takes both blocks of one backend and one
+    // of the other, whichever run comes first.
+    let config = split_level(dir.path(), &primary, &other, 28 * 1_024, 2_000)?;
+    let keys: Vec<String> = ["a00100", "a01500", "b00100", "b01500"]
+        .map(String::from)
+        .to_vec();
+
+    let tree = config().open()?;
+    primary.behave(BatchedBehaviour::Fail);
+    other.behave(BatchedBehaviour::Fail);
+    primary.reset();
+    other.reset();
+    let before = tree.metrics().bytes_read();
+    tree.multi_get(&keys, lsm_tree::SeqNo::MAX)
+        .expect_err("a refused read on the authoritative path must surface");
+
+    assert_eq!(
+        primary.calls() + other.calls(),
+        1,
+        "the first refusal ends the resolve",
+    );
+    assert_eq!(
+        tree.metrics().bytes_read() - before,
+        primary.asked() + other.asked(),
+        "only the submitted group was read",
     );
     Ok(())
 }
