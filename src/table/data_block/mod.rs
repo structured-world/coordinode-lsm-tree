@@ -568,16 +568,14 @@ impl DataBlock {
         let batch = crate::table::columnar::ColumnBatch::decode_counting_copies(
             block_data, None, gathered,
         )?;
+        // The matcher adds each row's copies as it makes them, so rows copied
+        // before a later row fails are still counted.
         let entries = crate::table::columnar::column_batch_match_entries(
-            &batch, needle, comparator, deletes,
+            &batch, needle, comparator, deletes, gathered,
         )?;
         if entries.is_empty() {
             return Ok(None);
         }
-        *gathered += entries
-            .iter()
-            .map(|e| e.key.user_key.len() + e.value.len())
-            .sum::<usize>();
         Self::encode_entries_to_block(&entries, restart_interval).map(Some)
     }
 

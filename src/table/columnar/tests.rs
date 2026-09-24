@@ -1055,7 +1055,7 @@ fn column_batch_match_entries_rejects_an_empty_key_row() {
     let key_col = batch.columns.get_mut(0).expect("key column");
     key_col.data = alloc::vec![0u8; 8].into();
     let cmp = crate::comparator::default_comparator();
-    let err = column_batch_match_entries(&batch, b"", &cmp, None)
+    let err = column_batch_match_entries(&batch, b"", &cmp, None, &mut 0)
         .expect_err("matched empty key must be rejected");
     assert!(
         matches!(err, crate::Error::InvalidHeader(m) if m.contains("user key is empty")),
@@ -1076,11 +1076,40 @@ fn column_batch_match_entries_fails_closed_when_a_delete_mask_position_overflows
     .expect("two-row same-key batch");
     let bitmap = crate::table::delete_bitmap::DeleteBitmap::new();
     let cmp = crate::comparator::default_comparator();
-    let err = column_batch_match_entries(&batch, b"dup", &cmp, Some((&bitmap, u32::MAX)))
+    let err = column_batch_match_entries(&batch, b"dup", &cmp, Some((&bitmap, u32::MAX)), &mut 0)
         .expect_err("an overflowing delete-mask position must fail closed");
     assert!(
         matches!(err, crate::Error::InvalidHeader(m) if m.contains("position exceeds u32::MAX")),
         "expected an overflow InvalidHeader, got {err:?}",
+    );
+}
+
+#[test]
+fn column_batch_match_entries_counts_the_rows_it_copied_before_a_later_row_fails() {
+    // Two versions of one key; the second carries an invalid value-type byte.
+    // The first version's key and value were already copied out of the columns
+    // when the second is refused, and those copies must still be reported.
+    let mut batch = entries_to_column_batch(&[
+        entry(b"dup", 5, ValueType::Value, b"v0"),
+        entry(b"dup", 3, ValueType::Value, b"v1"),
+    ])
+    .expect("two-row same-key batch");
+    let vt_col = batch.columns.get_mut(2).expect("value-type column");
+    let mut vt = vt_col.data.to_vec();
+    vt[1] = 0xFF;
+    vt_col.data = vt.into();
+    let cmp = crate::comparator::default_comparator();
+    let mut copied = 0;
+    let err = column_batch_match_entries(&batch, b"dup", &cmp, None, &mut copied)
+        .expect_err("the invalid value type must be refused");
+    assert!(
+        matches!(err, crate::Error::InvalidTag(("ValueType", 0xFF))),
+        "expected an invalid value-type tag, got {err:?}",
+    );
+    assert_eq!(
+        copied,
+        b"dup".len() + b"v0".len(),
+        "the first version was copied before the second failed",
     );
 }
 
@@ -1092,7 +1121,7 @@ fn column_batch_match_entries_rejects_a_zero_row_block() {
     // on-disk corruption.
     let batch = entries_to_column_batch(&[]).expect("zero-row batch");
     let cmp = crate::comparator::default_comparator();
-    let err = column_batch_match_entries(&batch, b"x", &cmp, None)
+    let err = column_batch_match_entries(&batch, b"x", &cmp, None, &mut 0)
         .expect_err("a zero-row block must fail closed");
     assert!(
         matches!(err, crate::Error::InvalidHeader(m) if m.contains("empty reconstructed data block")),

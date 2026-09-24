@@ -1473,11 +1473,16 @@ fn bytes_row_slice(data: &Slice, row_count: u32, i: u32) -> Result<Slice> {
 /// seqno-aware point read, so a columnar point read decodes the block once and
 /// touches one key's rows instead of untransposing and re-encoding the whole
 /// block.
+///
+/// Adds to `copied` the key and value bytes of each matching row as it is
+/// copied out of the columns, so rows copied before a later row fails are
+/// still reported.
 pub fn column_batch_match_entries(
     batch: &ColumnBatch,
     needle: &[u8],
     comparator: &crate::comparator::SharedComparator,
     deletes: Option<(&crate::table::delete_bitmap::DeleteBitmap, u32)>,
+    copied: &mut usize,
 ) -> Result<Vec<InternalValue>> {
     let (key_col, seqno_col, vt_col, value_cols) = validate_columnar_columns(batch)?;
     let row_count = batch.row_count;
@@ -1537,6 +1542,7 @@ pub fn column_batch_match_entries(
             let value_type = ValueType::try_from(vt_byte)
                 .map_err(|()| Error::InvalidTag(("ValueType", vt_byte)))?;
             let value = reconstruct_row_value(value_cols, row_count, row)?;
+            *copied += k.len() + value.len();
             out.push(InternalValue {
                 key: InternalKey {
                     user_key: Slice::from(k),
