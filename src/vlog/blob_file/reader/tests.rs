@@ -158,6 +158,39 @@ fn blob_reader_reports_the_decoded_length_of_a_record_it_then_refuses() -> crate
     Ok(())
 }
 
+/// The uncompressed twin: a stored value whose length disagrees with the one
+/// its header declares is refused, but it was read and inspected in full, so
+/// its length is reported like a decompressor's output.
+#[test]
+fn blob_reader_reports_the_length_of_an_uncompressed_record_it_then_refuses() -> crate::Result<()> {
+    let folder = tempfile::tempdir()?;
+    let mut writer = crate::vlog::BlobFileWriter::new(
+        SequenceNumberCounter::default(),
+        folder.path(),
+        0,
+        None,
+        Arc::new(StdFs),
+    )?
+    .use_target_size(u64::MAX);
+
+    let value = b"0123456789abcdef";
+    let handle = writer.write_raw(b"k", 0, value, 32)?;
+    let blob_file = writer.finish()?;
+    let blob_file = blob_file.first().unwrap();
+
+    let file = File::open(&blob_file.0.path)?;
+    let reader = Reader::new(blob_file, &file);
+    let record = reader.read_record(&handle, record_len(1, &handle)?)?;
+    let mut decoded = 0;
+    let result = reader.parse_record(b"k", &handle, &record, &mut decoded);
+    assert!(
+        matches!(result, Err(crate::Error::InvalidHeader("Blob"))),
+        "a value shorter than its declared length must be refused, got: {result:?}",
+    );
+    assert_eq!(decoded, value.len(), "the whole stored value was produced");
+    Ok(())
+}
+
 /// Tamper `real_val_len` in lz4 blob: V4 header CRC catches the
 /// corruption before decompression is attempted.
 #[test]

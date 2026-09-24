@@ -233,10 +233,10 @@ impl<'a> Reader<'a> {
         #[warn(clippy::match_single_binding)]
         let value = match &self.blob_file.0.meta.compression {
             CompressionType::None => {
+                *decoded = raw_data.len();
                 if real_val_len != raw_data.len() {
                     return Err(crate::Error::InvalidHeader("Blob"));
                 }
-                *decoded = raw_data.len();
                 raw_data
             }
 
