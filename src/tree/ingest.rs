@@ -128,6 +128,11 @@ impl<'a> Ingestion<'a> {
                 .data_block_size_policy
                 .get(INITIAL_CANONICAL_LEVEL),
         )
+        .use_row_group_size(
+            tree.config
+                .columnar_row_group_size_policy
+                .get(INITIAL_CANONICAL_LEVEL),
+        )
         .use_data_block_hash_ratio(
             tree.config
                 .data_block_hash_ratio_policy
@@ -385,7 +390,7 @@ impl<'a> Ingestion<'a> {
         let target = self
             .tree
             .config
-            .data_block_size_policy
+            .columnar_row_group_size_policy
             .get(INITIAL_CANONICAL_LEVEL) as usize;
         if self
             .pending_columnar

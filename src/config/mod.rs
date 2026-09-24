@@ -47,6 +47,10 @@ use alloc::sync::Arc;
 use alloc::vec::Vec;
 use core::ops::Range;
 
+/// The size a columnar row group is cut at unless
+/// [`Config::columnar_row_group_size_policy`] says otherwise.
+pub const DEFAULT_COLUMNAR_ROW_GROUP_SIZE: u32 = 4_096;
+
 /// Per-level filesystem routing entry for tiered storage.
 ///
 /// Maps a range of LSM levels to a base directory and filesystem backend.
@@ -365,6 +369,13 @@ pub struct Config {
     /// Block size of data blocks
     pub data_block_size_policy: BlockSizePolicy,
 
+    /// Uncompressed size a columnar table's row groups are cut at, per level:
+    /// the columnar counterpart of [`Self::data_block_size_policy`], which a
+    /// columnar table does not use for its data. A row group is split into
+    /// independently readable column pages, so it is sized for what a read of
+    /// one page is worth rather than for what a read of the whole group costs.
+    pub columnar_row_group_size_policy: BlockSizePolicy,
+
     /// Whether to pin index blocks
     pub index_block_pinning_policy: PinningPolicy,
 
@@ -673,6 +684,8 @@ impl Default for Config {
             level_count: DEFAULT_LEVEL_COUNT,
 
             data_block_size_policy: BlockSizePolicy::all(4_096),
+
+            columnar_row_group_size_policy: BlockSizePolicy::all(DEFAULT_COLUMNAR_ROW_GROUP_SIZE),
 
             index_block_pinning_policy: PinningPolicy::new([true, true, false]),
             filter_block_pinning_policy: PinningPolicy::new([true, false]),
@@ -1543,6 +1556,32 @@ impl Config {
     #[must_use]
     pub fn data_block_size_policy(mut self, policy: BlockSizePolicy) -> Self {
         self.data_block_size_policy = policy;
+        self
+    }
+
+    /// Sets the size a columnar table's row groups are cut at, per level.
+    ///
+    /// Applies to the tables written while the runtime `columnar` switch is
+    /// on; a row-major table cuts its blocks at
+    /// [`Self::data_block_size_policy`]. The default is
+    /// [`DEFAULT_COLUMNAR_ROW_GROUP_SIZE`] at every level.
+    ///
+    /// # Examples
+    ///
+    /// ```
+    /// use lsm_tree::{Config, SequenceNumberCounter, config::BlockSizePolicy};
+    /// # let folder = tempfile::tempdir()?;
+    /// let config = Config::new(
+    ///     folder.path(),
+    ///     SequenceNumberCounter::default(),
+    ///     SequenceNumberCounter::default(),
+    /// )
+    /// .columnar_row_group_size_policy(BlockSizePolicy::all(256 * 1_024));
+    /// # Ok::<(), Box<dyn std::error::Error>>(())
+    /// ```
+    #[must_use]
+    pub fn columnar_row_group_size_policy(mut self, policy: BlockSizePolicy) -> Self {
+        self.columnar_row_group_size_policy = policy;
         self
     }
 

@@ -130,7 +130,7 @@ fn variants() -> Vec<Variant> {
     #[cfg(feature = "columnar")]
     v.push(Variant {
         label: "columnar",
-        configure: |w| w.use_data_block_size(256).use_columnar(true),
+        configure: |w| w.use_row_group_size(256).use_columnar(true),
         encryption: None,
     });
     #[cfg(feature = "page_ecc")]

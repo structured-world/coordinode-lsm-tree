@@ -751,7 +751,7 @@ fn wide_columnar_segment(n: u32, value_len: usize) -> (TempDir, Tree) {
         SequenceNumberCounter::default(),
         SequenceNumberCounter::default(),
     )
-    .data_block_size_policy(lsm_tree::config::BlockSizePolicy::all(128 * 1_024))
+    .columnar_row_group_size_policy(lsm_tree::config::BlockSizePolicy::all(128 * 1_024))
     .open()
     .expect("open") else {
         panic!("expected a standard tree");
@@ -822,7 +822,7 @@ fn a_columnar_point_read_that_misses_reads_a_fraction_of_its_group() {
         SequenceNumberCounter::default(),
     )
     .filter_policy(lsm_tree::config::FilterPolicy::disabled())
-    .data_block_size_policy(lsm_tree::config::BlockSizePolicy::all(128 * 1_024))
+    .columnar_row_group_size_policy(lsm_tree::config::BlockSizePolicy::all(128 * 1_024))
     .open()
     .expect("open") else {
         panic!("expected a standard tree");
@@ -945,7 +945,7 @@ fn a_merged_columnar_scan_counts_the_seqno_column_it_rewrites() -> lsm_tree::Res
         SequenceNumberCounter::default(),
         SequenceNumberCounter::default(),
     )
-    .data_block_size_policy(lsm_tree::config::BlockSizePolicy::all(1 << 20))
+    .columnar_row_group_size_policy(lsm_tree::config::BlockSizePolicy::all(1 << 20))
     .open()?
     else {
         panic!("expected a standard tree");
@@ -1484,7 +1484,7 @@ fn a_parallel_sub_compaction_of_columnar_segments_counts_nothing_it_reads() -> l
         SequenceNumberCounter::default(),
         SequenceNumberCounter::default(),
     )
-    .data_block_size_policy(lsm_tree::config::BlockSizePolicy::all(512))
+    .columnar_row_group_size_policy(lsm_tree::config::BlockSizePolicy::all(512))
     .compaction_threads(4)
     .subcompaction_min_bytes(0)
     .open()?

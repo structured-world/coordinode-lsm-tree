@@ -223,6 +223,38 @@ the indirection. It is bounded by the directory being small and adjacent to
 the first page anyone needs, and by the staged read path treating it as one
 more stage to batch across tables rather than as a per-table stall.
 
+## Row group size
+
+A columnar table cuts its row groups at `columnar_row_group_size_policy`,
+separately from the data block size a row-major table uses. The default is
+still 4 KiB, the size row groups had before pages existed, because the
+measurement below says a larger group is not yet a win on every read.
+
+`db_bench --benchmark mixed-layout --num 70000`, one pass per size, on the
+scenarios whose fixture is columnar:
+
+| Row group | near-full scan, B/row | its time | sparse scan, B/row | point reads over a columnar base, B/row | their time |
+|---|---|---|---|---|---|
+| 4 KiB | 363 | 33.5 ms | 4574 | 330 | 190 ms |
+| 16 KiB | 340 | 19.2 ms | 16196 | 225 | 213 ms |
+| 64 KiB | 324 | 11.7 ms | 28281 | 206 | 295 ms |
+| 128 KiB | 322 | 10.5 ms | 28088 | 205 | 405 ms |
+| 256 KiB | 322 | 10.2 ms | 28053 | 205 | 624 ms |
+
+Two costs grow with the group, and neither is the page layout's:
+
+- **Pruning granularity.** A zone-map entry covers a whole group, so a ~1%
+  predicate that prunes most 4 KiB groups prunes few 64 KiB ones, and the
+  sparse scan reads six times the bytes. Statistics zones finer than the
+  group are what the format separates them for.
+- **Work per point read.** A point hit decodes and validates its pages
+  whole, which is linear in the group's rows, so reads that the cache serves
+  still slow down as the group grows.
+
+The dense scan is three times faster from 64 KiB up, which is what a larger
+default is for once both of those scale with the zone and the rows read
+rather than with the group.
+
 ## Relationship to the existing partial-decode section
 
 The table-level `block_layout` section records, for a data block that

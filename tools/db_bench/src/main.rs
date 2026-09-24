@@ -53,6 +53,11 @@ struct Cli {
     #[arg(long, default_value = "4096")]
     block_size: u32,
 
+    /// Size in bytes a columnar table's row groups are cut at, in place of
+    /// the data block size.
+    #[arg(long, default_value_t = lsm_tree::config::DEFAULT_COLUMNAR_ROW_GROUP_SIZE)]
+    row_group_size: u32,
+
     /// Use BlobTree (key-value separation) instead of standard Tree.
     #[arg(long)]
     use_blob_tree: bool,
@@ -165,6 +170,7 @@ fn main() {
         cache_mb: cli.cache_mb,
         compression: cli.compression,
         block_size: cli.block_size,
+        row_group_size: cli.row_group_size,
         use_blob_tree: cli.use_blob_tree,
         metadata_priority: cli.metadata_priority,
         partition_metadata: cli.partition_metadata,

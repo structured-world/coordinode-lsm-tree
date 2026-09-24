@@ -32,6 +32,7 @@ fn config() -> BenchConfig {
         cache_mb: 8,
         compression: Compression::None,
         block_size: 4_096,
+        row_group_size: lsm_tree::config::DEFAULT_COLUMNAR_ROW_GROUP_SIZE,
         use_blob_tree: false,
         metadata_priority: true,
         partition_metadata: false,

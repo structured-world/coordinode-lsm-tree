@@ -2894,7 +2894,7 @@ fn verify_sst_file_walks_a_healthy_columnar_sst_clean() -> crate::Result<()> {
     let mut writer = Writer::new(sst.clone(), 0, 0, alloc::sync::Arc::new(crate::fs::StdFs))?
         .use_columnar(true)
         .use_zone_map(true)
-        .use_data_block_size(256);
+        .use_row_group_size(256);
     for i in 0u32..200 {
         writer.write(crate::InternalValue::from_components(
             format!("key{i:05}").into_bytes(),

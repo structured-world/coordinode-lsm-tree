@@ -104,6 +104,10 @@ pub struct Writer {
 
     data_block_size: u32,
 
+    /// Uncompressed bytes a columnar row group is cut at: the spill threshold
+    /// in place of `data_block_size` when the table is columnar.
+    row_group_size: u32,
+
     data_block_hash_ratio: f32,
 
     /// Compression to use for data blocks
@@ -449,6 +453,8 @@ impl Writer {
 
             data_block_size: 4_096,
 
+            row_group_size: crate::config::DEFAULT_COLUMNAR_ROW_GROUP_SIZE,
+
             data_block_compression: CompressionType::None,
             index_block_compression: CompressionType::None,
 
@@ -695,6 +701,19 @@ impl Writer {
             "data block size must be <= 4 MiB",
         );
         self.data_block_size = size;
+        self
+    }
+
+    /// Sets the uncompressed size a columnar row group is cut at. Ignored for
+    /// a row-major table, which cuts its blocks at the data block size.
+    ///
+    /// # Panics
+    ///
+    /// Panics when `size` exceeds 4 MiB, the same bound as a data block.
+    #[must_use]
+    pub fn use_row_group_size(mut self, size: u32) -> Self {
+        assert!(size <= 4 * 1_024 * 1_024, "row group size must be <= 4 MiB",);
+        self.row_group_size = size;
         self
     }
 
@@ -1240,7 +1259,12 @@ impl Writer {
         self.previous_weak_tombstone_key = weak_tombstone_key;
         self.current_key_seqno = Some(seqno);
 
-        if self.chunk_size >= self.data_block_size as usize {
+        let cut_at = if self.use_columnar {
+            self.row_group_size
+        } else {
+            self.data_block_size
+        };
+        if self.chunk_size >= cut_at as usize {
             self.spill_block()?;
         }
 

@@ -6776,7 +6776,7 @@ fn restricted_columnar_scan_skips_punched_prefix_and_masks_sub_bound_rows() -> c
     let mut writer = Writer::new(file.clone(), 0, 0, Arc::new(StdFs))?
         .use_columnar(true)
         .use_zone_map(true)
-        .use_data_block_size(256);
+        .use_row_group_size(256);
     for key in &keys {
         writer.write(crate::InternalValue::from_components(
             key.as_slice(),
@@ -7770,7 +7770,7 @@ fn columnar_table_file(
 ) -> crate::Result<Checksum> {
     let mut writer = Writer::new(file.to_path_buf(), 0, 0, Arc::new(StdFs))?
         .use_columnar(true)
-        .use_data_block_size(group_size);
+        .use_row_group_size(group_size);
     for i in 0..rows {
         let mut key = alloc::format!("key{i:06}").into_bytes();
         key.resize(key_len, b'k');
@@ -7814,6 +7814,44 @@ fn page_extent(file: &std::path::Path, group: &BlockHandle, column_id: u16) -> (
         at + directory_len + entry.offset as usize,
         entry.length as usize,
     )
+}
+
+/// A columnar table cuts its row groups at the row group size and a
+/// row-major one its blocks at the data block size, each ignoring the other:
+/// the two are separate geometry, set separately.
+#[cfg(feature = "columnar")]
+#[test]
+fn a_columnar_writer_cuts_at_the_row_group_size_and_a_row_writer_at_the_block_size()
+-> crate::Result<()> {
+    let dir = tempdir()?;
+    let blocks = |columnar: bool| -> crate::Result<usize> {
+        let file = dir.path().join(if columnar { "columnar" } else { "rows" });
+        let mut writer = Writer::new(file.clone(), 0, 0, Arc::new(StdFs))?
+            .use_columnar(columnar)
+            .use_data_block_size(256)
+            .use_row_group_size(64 * 1_024);
+        for i in 0..400_u32 {
+            writer.write(InternalValue::from_components(
+                alloc::format!("key{i:06}").into_bytes(),
+                alloc::vec![b'v'; 64],
+                u64::from(i) + 1,
+                crate::ValueType::Value,
+            ))?;
+        }
+        let (_, checksum) = writer
+            .finish()?
+            .expect("finish() returns Some after writing data items");
+        let table = Table::recover(test_recover_params(file, checksum))?;
+        Ok(table.data_block_handles().count())
+    };
+    // 400 rows of about 73 bytes: some 29 KiB, one 64 KiB row group, and a
+    // 256-byte block every four rows.
+    assert_eq!(blocks(true)?, 1, "the columnar table is one row group");
+    assert!(
+        blocks(false)? >= 50,
+        "the row-major table is cut at the data block size",
+    );
+    Ok(())
 }
 
 /// A projection reads only the pages it asked for, so a page it did not ask

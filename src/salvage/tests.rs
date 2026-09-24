@@ -3354,7 +3354,7 @@ fn salvage_refuses_a_reordered_columnar_index_with_deletes() -> crate::Result<()
     let mut writer = Writer::new(source.clone(), 0, 0, Arc::clone(&fs))?
         .use_columnar(true)
         .use_zone_map(true)
-        .use_data_block_size(256)
+        .use_row_group_size(256)
         .delete_strategy(DeleteStrategy::MergeOnRead);
     for i in 0..n {
         writer.write(iv(i))?;
@@ -3804,7 +3804,7 @@ fn salvaged_columnar_table_keeps_per_column_zone_statistics() -> crate::Result<(
     let mut writer = Writer::new(source.clone(), 0, 0, Arc::clone(&fs))?
         .use_columnar(true)
         .use_zone_map(true)
-        .use_data_block_size(128);
+        .use_row_group_size(128);
     for i in 0u32..64 {
         writer.write(iv(i))?;
     }
@@ -4849,7 +4849,7 @@ fn a_value_page_moved_between_row_groups_of_an_encrypted_table_is_refused() -> c
         Arc::new(crate::encryption::Aes256GcmProvider::new(&[0x42; 32]));
     let mut writer = Writer::new(source.clone(), 0, 0, Arc::clone(&fs))?
         .use_columnar(true)
-        .use_data_block_size(256)
+        .use_row_group_size(256)
         .use_encryption(Some(Arc::clone(&enc)));
     for i in 0..200_u32 {
         writer.write(InternalValue::from_components(
@@ -4946,7 +4946,7 @@ fn salvage_drops_a_corrupted_columnar_block_and_keeps_the_rest() -> crate::Resul
     let mut writer = Writer::new(source.clone(), 0, 0, Arc::clone(&fs))?
         .use_columnar(true)
         .use_zone_map(true)
-        .use_data_block_size(256);
+        .use_row_group_size(256);
     let n = 200u32;
     for i in 0..n {
         writer.write(iv(i))?;
@@ -5031,7 +5031,7 @@ fn salvage_drops_a_columnar_block_with_an_invalid_value_type() -> crate::Result<
     let mut writer = Writer::new(source.clone(), 0, 0, Arc::clone(&fs))?
         .use_columnar(true)
         .use_zone_map(true)
-        .use_data_block_size(256);
+        .use_row_group_size(256);
     for i in 0..n {
         writer.write(iv(i))?;
     }
@@ -5101,7 +5101,7 @@ fn salvage_drops_a_columnar_block_with_out_of_order_keys() -> crate::Result<()> 
     let mut writer = Writer::new(source.clone(), 0, 0, Arc::clone(&fs))?
         .use_columnar(true)
         .use_zone_map(true)
-        .use_data_block_size(256);
+        .use_row_group_size(256);
     for i in 0..n {
         writer.write(iv(i))?;
     }
@@ -5162,7 +5162,7 @@ fn verify_point_read_reachability_rejects_a_reordered_columnar_block() -> crate:
     let mut writer = Writer::new(source.clone(), 0, 0, Arc::clone(&fs))?
         .use_columnar(true)
         .use_zone_map(true)
-        .use_data_block_size(256);
+        .use_row_group_size(256);
     for i in 0..n {
         writer.write(iv(i))?;
     }
@@ -5372,7 +5372,7 @@ fn salvage_does_not_resurrect_deletes_in_an_index_omitted_block() -> crate::Resu
     let mut writer = Writer::new(source.clone(), 0, 0, Arc::clone(&fs))?
         .use_columnar(true)
         .use_zone_map(true)
-        .use_data_block_size(256)
+        .use_row_group_size(256)
         .delete_strategy(DeleteStrategy::MergeOnRead);
     for i in 0..n {
         writer.write(iv(i))?;
@@ -5448,7 +5448,7 @@ fn salvage_drops_an_out_of_order_columnar_block_in_a_delete_bearing_sst() -> cra
     let mut writer = Writer::new(source.clone(), 0, 0, Arc::clone(&fs))?
         .use_columnar(true)
         .use_zone_map(true)
-        .use_data_block_size(256)
+        .use_row_group_size(256)
         .delete_strategy(DeleteStrategy::MergeOnRead);
     for i in 0..n {
         writer.write(iv(i))?;
@@ -5580,7 +5580,7 @@ fn salvage_refuses_a_delete_bitmap_relabeled_to_a_full_filter() -> crate::Result
     let mut writer = Writer::new(source.clone(), 0, 0, Arc::clone(&fs))?
         .use_columnar(true)
         .use_zone_map(true)
-        .use_data_block_size(256)
+        .use_row_group_size(256)
         .use_bloom_policy(BloomConstructionPolicy::BitsPerKey(0.0))
         .delete_strategy(DeleteStrategy::MergeOnRead);
     for i in 0..n {
@@ -5640,7 +5640,7 @@ fn salvage_refuses_a_delete_bitmap_renamed_to_a_filter_without_reroling() -> cra
     let mut writer = Writer::new(source.clone(), 0, 0, Arc::clone(&fs))?
         .use_columnar(true)
         .use_zone_map(true)
-        .use_data_block_size(256)
+        .use_row_group_size(256)
         .use_bloom_policy(BloomConstructionPolicy::BitsPerKey(0.0))
         .delete_strategy(DeleteStrategy::MergeOnRead);
     for i in 0..n {
@@ -5699,7 +5699,7 @@ fn salvage_fails_closed_on_a_corrupt_delete_bitmap_by_default() -> crate::Result
     let mut writer = Writer::new(source.clone(), 0, 0, Arc::clone(&fs))?
         .use_columnar(true)
         .use_zone_map(true)
-        .use_data_block_size(256)
+        .use_row_group_size(256)
         .delete_strategy(DeleteStrategy::MergeOnRead);
     for i in 0..n {
         writer.write(iv(i))?;
@@ -5760,7 +5760,7 @@ fn salvage_fails_closed_on_an_unpositionable_delete_bitmap_by_default() -> crate
     let mut writer = Writer::new(source.clone(), 0, 0, Arc::clone(&fs))?
         .use_columnar(true)
         .use_zone_map(true)
-        .use_data_block_size(256)
+        .use_row_group_size(256)
         .delete_strategy(DeleteStrategy::MergeOnRead);
     for i in 0..n {
         writer.write(iv(i))?;
@@ -5824,7 +5824,7 @@ fn salvage_tolerates_a_corrupt_delete_bitmap_as_all_live() -> crate::Result<()> 
     let mut writer = Writer::new(source.clone(), 0, 0, Arc::clone(&fs))?
         .use_columnar(true)
         .use_zone_map(true)
-        .use_data_block_size(256)
+        .use_row_group_size(256)
         .delete_strategy(DeleteStrategy::MergeOnRead);
     for i in 0..n {
         writer.write(iv(i))?;
@@ -5916,7 +5916,7 @@ fn salvage_tolerates_a_persistently_unreadable_delete_bitmap_as_all_live() -> cr
     let mut writer = Writer::new(source.clone(), 0, 0, Arc::clone(&clean))?
         .use_columnar(true)
         .use_zone_map(true)
-        .use_data_block_size(256)
+        .use_row_group_size(256)
         .delete_strategy(DeleteStrategy::MergeOnRead);
     for i in 0..n {
         writer.write(iv(i))?;
@@ -6062,7 +6062,7 @@ fn salvage_fails_closed_on_an_unreadable_block_in_a_delete_bearing_sst() -> crat
     let mut writer = Writer::new(source.clone(), 0, 0, Arc::clone(&fs))?
         .use_columnar(true)
         .use_zone_map(true)
-        .use_data_block_size(256)
+        .use_row_group_size(256)
         .delete_strategy(DeleteStrategy::MergeOnRead);
     for i in 0..n {
         writer.write(iv(i))?;
@@ -6163,7 +6163,7 @@ fn salvage_fails_closed_on_a_zero_row_block_in_a_delete_bearing_sst() -> crate::
     let mut writer = Writer::new(source.clone(), 0, 0, Arc::clone(&fs))?
         .use_columnar(true)
         .use_zone_map(true)
-        .use_data_block_size(256)
+        .use_row_group_size(256)
         .delete_strategy(DeleteStrategy::MergeOnRead);
     for i in 0..n {
         writer.write(iv(i))?;
@@ -6391,7 +6391,7 @@ fn salvage_fails_closed_on_an_undecodable_checksum_clean_block_with_deletes() ->
     let mut writer = Writer::new(source.clone(), 0, 0, Arc::clone(&fs))?
         .use_columnar(true)
         .use_zone_map(true)
-        .use_data_block_size(256)
+        .use_row_group_size(256)
         .delete_strategy(DeleteStrategy::MergeOnRead);
     for i in 0..n {
         writer.write(iv(i))?;
@@ -6522,7 +6522,7 @@ fn salvage_fails_closed_on_a_zone_map_with_wrong_row_counts() -> crate::Result<(
     let mut writer = Writer::new(source.clone(), 0, 0, Arc::clone(&fs))?
         .use_columnar(true)
         .use_zone_map(true)
-        .use_data_block_size(256)
+        .use_row_group_size(256)
         .delete_strategy(DeleteStrategy::MergeOnRead);
     for i in 0..n {
         writer.write(iv(i))?;
@@ -6644,7 +6644,7 @@ fn salvage_ignores_a_delete_bitmap_without_a_readable_zone_map() -> crate::Resul
     let mut writer = Writer::new(source.clone(), 0, 0, Arc::clone(&fs))?
         .use_columnar(true)
         .use_zone_map(true)
-        .use_data_block_size(256)
+        .use_row_group_size(256)
         .delete_strategy(DeleteStrategy::MergeOnRead);
     for i in 0..n {
         writer.write(iv(i))?;
@@ -6806,7 +6806,7 @@ fn salvage_skips_a_wholly_deleted_block() -> crate::Result<()> {
     let mut writer = Writer::new(source.clone(), 0, 0, Arc::clone(&fs))?
         .use_columnar(true)
         .use_zone_map(true)
-        .use_data_block_size(256)
+        .use_row_group_size(256)
         .delete_strategy(DeleteStrategy::MergeOnRead);
     for i in 0..n {
         writer.write(iv(i))?;
@@ -10167,7 +10167,7 @@ fn salvage_drops_a_columnar_boundary_key_when_its_newest_version_is_lost() -> cr
     // block 2 and its older value the whole of block 3.
     let mut writer = Writer::new(source.clone(), 0, 0, Arc::clone(&fs))?
         .use_columnar(true)
-        .use_data_block_size(1);
+        .use_row_group_size(1);
     writer.write(InternalValue::from_components(
         b"a",
         b"v",

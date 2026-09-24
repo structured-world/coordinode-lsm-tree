@@ -218,8 +218,8 @@ fn columnar_masked_scan_skips_a_wholly_deleted_block() {
         SequenceNumberCounter::default(),
         SequenceNumberCounter::default(),
     )
-    // Small data blocks so the segment spans many blocks for a few hundred rows.
-    .data_block_size_policy(BlockSizePolicy::all(1_024))
+    // Small row groups so the segment spans many of them for a few hundred rows.
+    .columnar_row_group_size_policy(BlockSizePolicy::all(1_024))
     .open()
     .expect("open");
     let AnyTree::Standard(tree) = any else {
