@@ -46,9 +46,79 @@ pub struct RowGroupBlocks {
 /// completed by a second request.
 const DIRECTORY_PREFIX: usize = 4 * 1_024;
 
-/// Whether a read with projection `wanted` needs the page `entry` names.
-fn is_wanted(wanted: Option<&[u16]>, entry: &PageEntry) -> bool {
-    wanted.is_none_or(|w| w.contains(&entry.id.column_id))
+/// The pages a read of a row group wants: the columns it projects, times the
+/// row pages that hold the rows it asks for.
+#[derive(Clone, Debug, Default)]
+pub struct PageWant<'a> {
+    /// The column ids read, or every column when `None`.
+    pub columns: Option<&'a [u16]>,
+    /// The row pages read, half-open, or every row page when `None`.
+    pub row_pages: Option<core::ops::Range<u16>>,
+}
+
+impl<'a> PageWant<'a> {
+    /// Every page of the group.
+    pub const ALL: Self = Self {
+        columns: None,
+        row_pages: None,
+    };
+
+    /// Every row page of the columns `columns` names.
+    #[must_use]
+    pub const fn columns(columns: &'a [u16]) -> Self {
+        Self {
+            columns: Some(columns),
+            row_pages: None,
+        }
+    }
+
+    /// Whether this is a read of the whole group.
+    const fn is_all(&self) -> bool {
+        self.columns.is_none() && self.row_pages.is_none()
+    }
+
+    /// Whether the read needs the page `entry` names.
+    fn wants(&self, entry: &PageEntry) -> bool {
+        self.columns.is_none_or(|w| w.contains(&entry.id.column_id))
+            && self
+                .row_pages
+                .as_ref()
+                .is_none_or(|r| r.contains(&entry.row_page))
+    }
+}
+
+/// A row group decoded row page by row page: one batch per row page read, in
+/// row order, each holding the columns the read projected.
+#[derive(Debug)]
+pub struct RowPages {
+    /// The ordinal of the first row page read.
+    pub first_page: u16,
+    /// The group row the first row page read starts at.
+    pub first_row: u32,
+    /// One batch per row page read, in row order.
+    pub batches: Vec<crate::table::columnar::ColumnBatch>,
+}
+
+impl RowPages {
+    /// The rows the batches hold between them.
+    #[must_use]
+    pub fn row_count(&self) -> u32 {
+        // The directory proved the row pages sum to the group's `u32` row
+        // count, so a subset of them cannot overflow.
+        self.batches.iter().map(|b| b.row_count).sum()
+    }
+
+    /// The batches joined into one ([`ColumnBatch::concat`]), for a consumer
+    /// that takes the group whole.
+    ///
+    /// [`ColumnBatch::concat`]: crate::table::columnar::ColumnBatch::concat
+    ///
+    /// # Errors
+    ///
+    /// As [`ColumnBatch::concat`].
+    pub fn into_batch(self) -> crate::Result<crate::table::columnar::ColumnBatch> {
+        crate::table::columnar::ColumnBatch::concat(self.batches)
+    }
 }
 
 /// Everything a row group read needs to fetch, verify, count and cache the
@@ -74,8 +144,7 @@ pub struct GroupRead<'a> {
 }
 
 impl GroupRead<'_> {
-    /// Loads the group's directory and the pages `wanted` selects by column
-    /// id, or every page when `None`.
+    /// Loads the group's directory and the pages `want` selects.
     ///
     /// Nothing is read for a block already cached. Every block read is
     /// verified and admitted separately ([`admit_read_block`]), so each is
@@ -104,19 +173,19 @@ impl GroupRead<'_> {
     /// a gap or an overrun means the index entry and the directory disagree
     /// about where the group ends, and neither can be trusted to name the
     /// right bytes.
-    pub(crate) fn load(&self, wanted: Option<&[u16]>) -> crate::Result<RowGroupBlocks> {
+    pub(crate) fn load(&self, want: &PageWant<'_>) -> crate::Result<RowGroupBlocks> {
         if let Some(directory_block) =
             self.lookup(self.group.offset(), BlockType::ColumnPageDirectory)?
         {
             let directory = PageDirectory::decode(&directory_block.data)?;
             let directory_len = directory_block.header.on_disk_size_with(self.ecc);
             check_group_extent(self.group, directory_len, &directory)?;
-            let pages = self.cached_pages(&directory, directory_len, wanted)?;
+            let pages = self.cached_pages(&directory, directory_len, want)?;
             self.count_cached(true, &pages);
             let complete = pages
                 .iter()
                 .zip(directory.entries())
-                .all(|(page, entry)| page.is_some() || !is_wanted(wanted, entry));
+                .all(|(page, entry)| page.is_some() || !want.wants(entry));
             if complete {
                 return Ok(RowGroupBlocks { directory, pages });
             }
@@ -127,15 +196,16 @@ impl GroupRead<'_> {
                 directory_len,
                 &Slice::empty(),
                 pages,
-                wanted,
+                want,
             )?;
             return Ok(RowGroupBlocks { directory, pages });
         }
 
         let fd = self.open()?;
-        match wanted {
-            None => self.read_whole(fd.as_ref()),
-            Some(_) => self.read_selective(fd.as_ref(), wanted),
+        if want.is_all() {
+            self.read_whole(fd.as_ref())
+        } else {
+            self.read_selective(fd.as_ref(), want)
         }
     }
 
@@ -149,7 +219,7 @@ impl GroupRead<'_> {
             directory_len,
             &frame,
             alloc::vec![None; directory.entries().len()],
-            None,
+            &PageWant::ALL,
         )?;
         Ok(RowGroupBlocks { directory, pages })
     }
@@ -158,7 +228,7 @@ impl GroupRead<'_> {
     fn read_selective(
         &self,
         fd: &dyn FsFile,
-        wanted: Option<&[u16]>,
+        want: &PageWant<'_>,
     ) -> crate::Result<RowGroupBlocks> {
         let group_len = self.group.size() as usize;
         let prefix = self.read(
@@ -188,9 +258,9 @@ impl GroupRead<'_> {
             prefix
         };
         let (directory, directory_len) = self.admit_directory(&prefix)?;
-        let pages = self.cached_pages(&directory, directory_len, wanted)?;
+        let pages = self.cached_pages(&directory, directory_len, want)?;
         self.count_cached(false, &pages);
-        let pages = self.fetch_missing(fd, &directory, directory_len, &prefix, pages, wanted)?;
+        let pages = self.fetch_missing(fd, &directory, directory_len, &prefix, pages, want)?;
         Ok(RowGroupBlocks { directory, pages })
     }
 
@@ -216,7 +286,7 @@ impl GroupRead<'_> {
         Ok((directory, directory_len))
     }
 
-    /// Fetches every page `wanted` selects that `pages` does not hold yet.
+    /// Fetches every page `want` selects that `pages` does not hold yet.
     ///
     /// Pages are contiguous in directory order (the extent check proved it),
     /// so a run of consecutive missing pages is one byte range and is read in
@@ -230,13 +300,13 @@ impl GroupRead<'_> {
         directory_len: u32,
         front: &Slice,
         mut pages: Vec<Option<Block>>,
-        wanted: Option<&[u16]>,
+        want: &PageWant<'_>,
     ) -> crate::Result<Vec<Option<Block>>> {
         let entries = directory.entries();
         let runs = {
             let missing = |i: usize| {
                 pages.get(i).is_some_and(Option::is_none)
-                    && entries.get(i).is_some_and(|e| is_wanted(wanted, e))
+                    && entries.get(i).is_some_and(|e| want.wants(e))
             };
             let mut runs = Vec::new();
             let mut i = 0;
@@ -335,16 +405,16 @@ impl GroupRead<'_> {
         )?)
     }
 
-    /// The pages `wanted` selects that the cache already holds.
+    /// The pages `want` selects that the cache already holds.
     fn cached_pages(
         &self,
         directory: &PageDirectory,
         directory_len: u32,
-        wanted: Option<&[u16]>,
+        want: &PageWant<'_>,
     ) -> crate::Result<Vec<Option<Block>>> {
         let mut pages = Vec::with_capacity(directory.entries().len());
         for entry in directory.entries() {
-            let page = if is_wanted(wanted, entry) {
+            let page = if want.wants(entry) {
                 let offset =
                     *self.group.offset() + u64::from(directory_len) + u64::from(entry.offset);
                 self.lookup(BlockOffset(offset), BlockType::ColumnPage)?
@@ -485,32 +555,50 @@ impl GroupRead<'_> {
 }
 
 impl RowGroupBlocks {
-    /// Decodes the pages whose column `wanted` selects — every page when
-    /// `None` — into a batch, in write order.
+    /// Decodes the pages `want` selects into one batch per row page, in row
+    /// order, each page a view of its own block.
     ///
     /// # Errors
     ///
-    /// [`crate::Error::InvalidHeader`] for a zero-row group, a page naming an
-    /// encoding part this build does not decode, a wanted page the read did
-    /// not fetch, a page whose stamp names another group or part, or a page
-    /// whose own column id disagrees with the one the directory filed it
-    /// under. They fail the group rather than the page: a reader that skipped
-    /// what it could not interpret, or trusted a page to be what the directory
-    /// said without checking, would return a batch that is quietly missing or
-    /// substituting a column.
+    /// [`crate::Error::InvalidHeader`] for a zero-row group, a row page range
+    /// outside the group, a page naming an encoding part this build does not
+    /// decode, a wanted page the read did not fetch, a page whose stamp names
+    /// another group, part or row page, or a page whose own column id
+    /// disagrees with the one the directory filed it under. They fail the
+    /// group rather than the page: a reader that skipped what it could not
+    /// interpret, or trusted a page to be what the directory said without
+    /// checking, would return a batch that is quietly missing or substituting
+    /// a column.
     ///
     /// Adds to `copied` what decoding the pages copied out of them, as each
     /// copy is made.
-    pub(crate) fn to_batch(
+    pub(crate) fn to_row_pages(
         &self,
-        wanted: Option<&[u16]>,
+        want: &PageWant<'_>,
         copied: &mut usize,
-    ) -> crate::Result<crate::table::columnar::ColumnBatch> {
-        let row_count = self.directory.row_count();
-        if row_count == 0 {
+    ) -> crate::Result<RowPages> {
+        use crate::table::columnar::{Column, ColumnBatch};
+
+        if self.directory.row_count() == 0 {
             return Err(crate::Error::InvalidHeader("columnar: zero-row data block"));
         }
-        let mut columns = Vec::with_capacity(self.pages.len());
+        let outside = || crate::Error::InvalidHeader("columnar: row page range outside the group");
+        // The directory holds at most `u16::MAX` row pages.
+        let all = u16::try_from(self.directory.row_pages().len()).map_err(|_| outside())?;
+        let range = match &want.row_pages {
+            None => 0..all,
+            Some(r) if r.start < r.end && r.end <= all => r.clone(),
+            Some(_) => return Err(outside()),
+        };
+        let first_page = range.start;
+        let first_row = self
+            .directory
+            .row_page_start(first_page)
+            .ok_or_else(outside)?;
+        // One column list per row page read, filled in one pass over the
+        // directory: its entries are column-major, so each row page's columns
+        // arrive in write order.
+        let mut columns: Vec<Vec<Column>> = range.clone().map(|_| Vec::new()).collect();
         for (entry, page) in self.directory.entries().iter().zip(&self.pages) {
             // Every column's encoding names a single part today. A part this
             // build does not decode is refused rather than skipped: skipping
@@ -520,7 +608,7 @@ impl RowGroupBlocks {
                     "columnar: page holds an encoding part this build does not decode",
                 ));
             }
-            if !is_wanted(wanted, entry) {
+            if !want.wants(entry) {
                 continue;
             }
             let Some(page) = page else {
@@ -528,20 +616,41 @@ impl RowGroupBlocks {
                     "columnar: a wanted page was not read",
                 ));
             };
-            let column = crate::table::columnar::Column::decode_page(
-                &page.data,
-                row_count,
-                self.directory.stamp_for(entry),
-                copied,
-            )?;
+            let rows =
+                self.directory
+                    .row_page_rows(entry.row_page)
+                    .ok_or(crate::Error::InvalidHeader(
+                        "columnar: page names a row page the group does not have",
+                    ))?;
+            let column =
+                Column::decode_page(&page.data, rows, self.directory.stamp_for(entry), copied)?;
             if column.column_id != entry.id.column_id {
                 return Err(crate::Error::InvalidHeader(
                     "columnar: page column disagrees with its directory entry",
                 ));
             }
-            columns.push(column);
+            let slot = entry
+                .row_page
+                .checked_sub(range.start)
+                .and_then(|i| columns.get_mut(usize::from(i)))
+                .ok_or(crate::Error::InvalidHeader(
+                    "columnar: page names a row page the group does not have",
+                ))?;
+            slot.push(column);
         }
-        Ok(crate::table::columnar::ColumnBatch { row_count, columns })
+        let batches = columns
+            .into_iter()
+            .zip(range)
+            .map(|(columns, index)| {
+                let row_count = self.directory.row_page_rows(index).ok_or_else(outside)?;
+                Ok(ColumnBatch { row_count, columns })
+            })
+            .collect::<crate::Result<Vec<_>>>()?;
+        Ok(RowPages {
+            first_page,
+            first_row,
+            batches,
+        })
     }
 }
 

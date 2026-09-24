@@ -58,6 +58,10 @@ struct Cli {
     #[arg(long, default_value_t = lsm_tree::config::DEFAULT_COLUMNAR_ROW_GROUP_SIZE)]
     row_group_size: u32,
 
+    /// Size in bytes a columnar row group's rows are cut into row pages at.
+    #[arg(long, default_value_t = lsm_tree::config::DEFAULT_COLUMNAR_PAGE_SIZE)]
+    page_size: u32,
+
     /// Use BlobTree (key-value separation) instead of standard Tree.
     #[arg(long)]
     use_blob_tree: bool,
@@ -171,6 +175,7 @@ fn main() {
         compression: cli.compression,
         block_size: cli.block_size,
         row_group_size: cli.row_group_size,
+        page_size: cli.page_size,
         use_blob_tree: cli.use_blob_tree,
         metadata_priority: cli.metadata_priority,
         partition_metadata: cli.partition_metadata,

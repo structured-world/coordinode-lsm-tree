@@ -2207,10 +2207,14 @@ fn salvage_blocks(
                         }
                         // Salvage is maintenance: what the page decode copies
                         // is not a read's cost and is not charged.
-                        match sb.group.to_batch(None, &mut 0).and_then(|batch| {
-                            crate::table::columnar::column_batch_to_entries(&batch)
-                                .map(|entries| (batch, entries))
-                        }) {
+                        match sb
+                            .group
+                            .to_row_pages(&crate::table::row_group::PageWant::ALL, &mut 0)
+                            .and_then(crate::table::row_group::RowPages::into_batch)
+                            .and_then(|batch| {
+                                crate::table::columnar::column_batch_to_entries(&batch)
+                                    .map(|entries| (batch, entries))
+                            }) {
                             // A real writer never emits an empty data block, so a
                             // checksum-clean ZERO-ROW batch is malformed input:
                             // the writer primitives below would emit NOTHING for

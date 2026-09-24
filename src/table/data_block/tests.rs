@@ -1447,14 +1447,20 @@ fn from_column_batch_masked_drops_deleted_positions() {
         InternalValue::from_components(Slice::from(b"c".as_slice()), Slice::from([]), 1, Value),
         InternalValue::from_components(Slice::from(b"d".as_slice()), Slice::from([]), 1, Value),
     ];
-    let batch = entries_to_column_batch(&entries).unwrap();
+    // Two row pages, [a] and [b, c, d]: the second page's rows keep counting
+    // positions from where the first page ended.
+    let (first, rest) = entries.split_at(1);
+    let pages = [
+        entries_to_column_batch(first).unwrap(),
+        entries_to_column_batch(rest).unwrap(),
+    ];
 
     // The block starts at global row 10, so delete global positions 10 (a)
     // and 12 (c); b and d must survive.
     let mut dv = DeleteBitmap::new();
     dv.insert(10);
     dv.insert(12);
-    let block = DataBlock::from_column_batch_masked(batch, 16, &dv, 10, &mut 0)
+    let block = DataBlock::from_column_batch_masked(pages, 16, &dv, 10, &mut 0)
         .unwrap()
         .expect("not all rows deleted");
 
@@ -1502,7 +1508,7 @@ fn from_column_batch_masked_returns_none_when_all_deleted() {
     dv.insert(0);
     dv.insert(1);
     assert!(
-        DataBlock::from_column_batch_masked(batch, 16, &dv, 0, &mut 0)
+        DataBlock::from_column_batch_masked([batch], 16, &dv, 0, &mut 0)
             .unwrap()
             .is_none()
     );

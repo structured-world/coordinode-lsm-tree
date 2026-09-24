@@ -313,9 +313,9 @@ impl Scanner {
         // The scanner feeds compaction, which is maintenance and outside the
         // read counters, so neither the page copies nor the rebuilt values are
         // charged.
-        let batch =
-            crate::table::row_group::RowGroupBlocks { directory, pages }.to_batch(None, &mut 0)?;
-        DataBlock::from_column_batch(batch, restart_interval, &mut 0)
+        let pages = crate::table::row_group::RowGroupBlocks { directory, pages }
+            .to_row_pages(&crate::table::row_group::PageWant::ALL, &mut 0)?;
+        DataBlock::from_column_batch(pages.batches, restart_interval, &mut 0)
     }
 
     /// Without the `columnar` feature a columnar SST cannot be read.

@@ -462,9 +462,9 @@ impl DataBlock {
     ///
     /// Returns [`crate::Error::InvalidTrailer`] if a footer-bearing block's
     /// footer is structurally malformed.
-    /// Reconstructs a columnar row group's row entries, in block-index order,
-    /// WITHOUT re-encoding them to a row-major block. The scan path iterates
-    /// these directly (no serialize + re-parse round-trip);
+    /// Reconstructs a columnar row group's row entries from its row pages, in
+    /// block-index order, WITHOUT re-encoding them to a row-major block. The
+    /// scan path iterates these directly (no serialize + re-parse round-trip);
     /// [`Self::from_column_batch`] re-encodes on top of this for the
     /// byte-based point-read path.
     ///
@@ -474,14 +474,28 @@ impl DataBlock {
     /// pages copied is counted where they are decoded.
     #[cfg(feature = "columnar")]
     pub(crate) fn column_batch_entries(
-        batch: crate::table::columnar::ColumnBatch,
+        pages: impl IntoIterator<Item = crate::table::columnar::ColumnBatch>,
         gathered: &mut usize,
     ) -> crate::Result<Vec<InternalValue>> {
-        // Consuming, zero-copy untranspose: row keys / values are views into the
-        // batch's column buffers rather than per-row copies.
-        let entries = crate::table::columnar::column_batch_into_entries(batch, gathered)?;
-        // The writer never spills an empty block, so a zero-row columnar block is
-        // corrupt; reject it before any consumer with a non-empty precondition.
+        let mut entries = Vec::new();
+        for batch in pages {
+            // Consuming, zero-copy untranspose: row keys / values are views
+            // into the page's column buffers rather than per-row copies.
+            let rows = crate::table::columnar::column_batch_into_entries(batch, gathered)?;
+            // The writer never writes an empty row page, so a zero-row one is
+            // corrupt; reject it before any consumer with a non-empty
+            // precondition.
+            if rows.is_empty() {
+                return Err(crate::Error::InvalidHeader(
+                    "columnar: empty reconstructed data block",
+                ));
+            }
+            if entries.is_empty() {
+                entries = rows;
+            } else {
+                entries.extend(rows);
+            }
+        }
         if entries.is_empty() {
             return Err(crate::Error::InvalidHeader(
                 "columnar: empty reconstructed data block",
@@ -497,12 +511,12 @@ impl DataBlock {
     /// row, masked ones included: they were rebuilt before the mask ran.
     #[cfg(feature = "columnar")]
     pub(crate) fn column_batch_entries_masked(
-        batch: crate::table::columnar::ColumnBatch,
+        pages: impl IntoIterator<Item = crate::table::columnar::ColumnBatch>,
         deletes: &crate::table::delete_bitmap::DeleteBitmap,
         block_start_row: u32,
         gathered: &mut usize,
     ) -> crate::Result<Option<Vec<InternalValue>>> {
-        let entries = Self::column_batch_entries(batch, gathered)?;
+        let entries = Self::column_batch_entries(pages, gathered)?;
         // Each row's position is `block_start_row + index`. The bitmap is
         // u32-positional and `build_position_bitmap` rejects segments past
         // u32::MAX rows at write time, but a corrupt zone-map `block_start_row`
@@ -538,11 +552,11 @@ impl DataBlock {
     /// rebuilt values into the block.
     #[cfg(feature = "columnar")]
     pub(crate) fn from_column_batch(
-        batch: crate::table::columnar::ColumnBatch,
+        pages: impl IntoIterator<Item = crate::table::columnar::ColumnBatch>,
         restart_interval: u8,
         gathered: &mut usize,
     ) -> crate::Result<Self> {
-        let entries = Self::column_batch_entries(batch, gathered)?;
+        let entries = Self::column_batch_entries(pages, gathered)?;
         Self::encode_entries_to_block(&entries, restart_interval)
     }
 
@@ -552,22 +566,42 @@ impl DataBlock {
     /// The caller runs the normal seqno-aware [`Self::point_read`] on the
     /// result. Avoids untransposing and re-encoding the whole group per lookup.
     ///
+    /// `pages` are consecutive row pages of the group, and `deletes` carries
+    /// the position of the first one's first row: a key's versions can run
+    /// across a row page boundary, so every page that holds one is matched.
+    ///
     /// Also adds to `gathered` the matching rows' keys and values, which are
     /// copied out of the columns before the encode copies them again.
     #[cfg(feature = "columnar")]
     pub(crate) fn columnar_point_block(
-        batch: &crate::table::columnar::ColumnBatch,
+        pages: &[crate::table::columnar::ColumnBatch],
         needle: &[u8],
         comparator: &crate::comparator::SharedComparator,
         restart_interval: u8,
         deletes: Option<(&crate::table::delete_bitmap::DeleteBitmap, u32)>,
         gathered: &mut usize,
     ) -> crate::Result<Option<Self>> {
-        // The matcher adds each row's copies as it makes them, so rows copied
-        // before a later row fails are still counted.
-        let entries = crate::table::columnar::column_batch_match_entries(
-            batch, needle, comparator, deletes, gathered,
-        )?;
+        let overflow = || crate::Error::InvalidHeader("columnar: row position exceeds u32::MAX");
+        let mut entries = Vec::new();
+        let mut offset = 0u32;
+        for batch in pages {
+            let page_deletes = match deletes {
+                Some((bitmap, start)) => {
+                    Some((bitmap, start.checked_add(offset).ok_or_else(overflow)?))
+                }
+                None => None,
+            };
+            // The matcher adds each row's copies as it makes them, so rows
+            // copied before a later row fails are still counted.
+            entries.extend(crate::table::columnar::column_batch_match_entries(
+                batch,
+                needle,
+                comparator,
+                page_deletes,
+                gathered,
+            )?);
+            offset = offset.checked_add(batch.row_count).ok_or_else(overflow)?;
+        }
         if entries.is_empty() {
             return Ok(None);
         }
@@ -584,13 +618,13 @@ impl DataBlock {
     /// rebuilt-value bytes to `gathered`, as [`Self::from_column_batch`] does.
     #[cfg(feature = "columnar")]
     pub(crate) fn from_column_batch_masked(
-        batch: crate::table::columnar::ColumnBatch,
+        pages: impl IntoIterator<Item = crate::table::columnar::ColumnBatch>,
         restart_interval: u8,
         deletes: &crate::table::delete_bitmap::DeleteBitmap,
         block_start_row: u32,
         gathered: &mut usize,
     ) -> crate::Result<Option<Self>> {
-        let kept = Self::column_batch_entries_masked(batch, deletes, block_start_row, gathered)?;
+        let kept = Self::column_batch_entries_masked(pages, deletes, block_start_row, gathered)?;
         kept.map(|kept| Self::encode_entries_to_block(&kept, restart_interval))
             .transpose()
     }

@@ -58,6 +58,8 @@ pub struct BenchConfig {
     pub block_size: u32,
     /// Uncompressed size a columnar table's row groups are cut at.
     pub row_group_size: u32,
+    /// Uncompressed size a columnar row group's rows are cut into row pages at.
+    pub page_size: u32,
     pub use_blob_tree: bool,
     /// Pin index / filter blocks at high cache priority against data-block churn
     /// (#509). Default on.
@@ -112,6 +114,7 @@ pub fn tree_builder(path: &Path, config: &BenchConfig) -> lsm_tree::Result<Confi
     )
     .data_block_size_policy(block_size_policy)
     .columnar_row_group_size_policy(BlockSizePolicy::all(config.row_group_size))
+    .columnar_page_size_policy(BlockSizePolicy::all(config.page_size))
     .data_block_compression_policy(compression_policy)
     // A KV-separated tree writes most of its bytes as blobs, so the codec a
     // run names has to reach them too; a standard tree ignores this.

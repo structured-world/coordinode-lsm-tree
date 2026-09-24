@@ -30,19 +30,52 @@ Pages are found through the row group's own directory instead.
 ```text
 row group, contiguous in the file:
 
-  [ page directory ]   <- the block the index points at
-  [ page 0 ]           <- keys and MVCC metadata
-  [ page 1 ]
+  [ page directory ]              <- the block the index points at
+  [ keys,  row page 0 ]           <- keys and MVCC metadata first
+  [ keys,  row page 1 ]
   ...
-  [ page n-1 ]
+  [ seqno, row page 0 ]
+  ...
+  [ value, row page r-1 ]
 ```
 
-The directory comes **first**, immediately followed by the page holding keys
-and MVCC metadata. That order is not cosmetic: those two are what every read
-of the group needs before it knows anything else, and placing them adjacent
-lets one coalesced read cover both. A point read is then one read for
-`directory + keys` and one for the page holding the field it wants, rather
-than three dependent round trips.
+The group's rows are cut into **row pages**: consecutive row ranges shared by
+every column. Each column part has exactly one page per row page, and a
+column's pages are written together, in row order, before the next column's.
+
+The directory comes **first**, immediately followed by the key pages. That
+order is not cosmetic: those two are what every read of the group needs
+before it knows anything else, and placing them adjacent lets one coalesced
+read cover both. A point read is then one read for `directory + keys` and one
+per column for the row pages holding the key, rather than a read of the
+group.
+
+Column-major order is what makes both kinds of partial read cheap. A
+projection reads a column as one run of adjacent pages, whatever the number
+of row pages; a point read takes one page per column, the row page its key is
+on. A row-major order (all columns of row page 0, then of row page 1) would
+make the point read one run and the projection one request per row page. The
+projection is the read pages are for, so it gets the contiguous run.
+
+### Row pages
+
+A row page closes once its rows reach `columnar_page_size_policy` bytes, a
+row's bytes being what it adds across every column (a fixed column's width, a
+bytes cell's length plus its offset). A row page therefore holds at least one
+row, and a row wider than the page size is a page of its own. A page size at
+or above the row group size writes one row page per group, which is the
+default: groups and pages are both 4 KiB, so a table that does not set either
+writes what it wrote before row pages existed.
+
+The row ranges are the same for every column, which is what lets a reader
+decode row page `i` of the columns it wants and hand them back as one batch
+of those rows, without joining anything. Reads produce one batch per row
+page; a consumer that needs the group as one batch (salvage, verification)
+joins them, framing each column once.
+
+A key's versions are one run of rows, so they can cross a row page boundary.
+A point read therefore takes every row page from the first whose keys reach
+the needle through the one where its run ends, not only the first.
 
 ### The page directory
 
@@ -53,12 +86,14 @@ to decode the key page just to count rows.
 
 | Header field | Width | Meaning |
 |---|---|---|
-| `version` | `u8` | directory wire version; an unknown one is refused |
-| `page_count` | `u16` | entries that follow |
-| `row_count` | `u32` | rows in the group; every page describes exactly these |
+| `version` | `u8` | directory wire version (2); an unknown one is refused |
+| `page_count` | `u16` | page entries that follow the row pages |
+| `row_count` | `u32` | rows in the group; the row pages sum to exactly this |
 | `group_tag` | `u64` | names the group; every page repeats it in its stamp |
+| `row_page_count` | `u16` | row pages that follow |
 
-Then, for each page:
+Then, for each row page in row order, its row count as a `u32`: none is zero,
+and together they are the group's rows. Then, for each page:
 
 | Field | Width | Meaning |
 |---|---|---|
@@ -67,11 +102,18 @@ Then, for each page:
 | `column_id` | `u16` | the column the page belongs to |
 | `part` | `u8` | which part of that column's encoding the page holds |
 | `flags` | `u8` | reserved; a reader rejects unknown bits rather than ignoring them |
+| `row_page` | `u16` | the row page whose rows the page holds |
 
-A page is named by the pair `(column_id, part)`. A column id alone is 16 bits
-wide already, so the two cannot share one field; keeping them separate is also
-what lets a column's parts be addressed individually once encodings name more
-than one.
+A page is named by `(column_id, part, row_page)`. A column id alone is 16 bits
+wide already, so the three cannot share one field; keeping them separate is
+also what lets a column's parts be addressed individually once encodings name
+more than one.
+
+A directory is refused unless it is a complete grid: every column part has a
+page for every row page, and no `(column_id, part, row_page)` appears twice. A
+part missing a row page would hand back a batch short of a column for those
+rows, and a reader cannot tell a page that was never written from one that
+was lost.
 
 Offsets are relative to the group, not to the file. A relative offset is what
 makes a row group relocatable by a compaction that copies it whole, and it is
@@ -99,13 +141,14 @@ figures, is in `columnar-addressing.md`.
 
 ### How many pages
 
-Not a constant. A page holds one part of one column's encoding for the
-group's rows, and how many parts a column has is a property of the encoding
-expression chosen for it — a dictionary-plus-bit-packed string column has
-five (dictionary bytes, dictionary offsets, codes, bases, bit widths), a
-constant column has none of its own, a dictionary-only column has one. The
-directory is therefore variable-length and the reader must not assume a
-fixed page count or a fixed part-to-page mapping.
+Not a constant. A page holds one part of one column's encoding for one row
+page's rows, so a group has as many pages as its column parts times its row
+pages. How many parts a column has is a property of the encoding expression
+chosen for it — a dictionary-plus-bit-packed string column has five
+(dictionary bytes, dictionary offsets, codes, bases, bit widths), a constant
+column has none of its own, a dictionary-only column has one. The directory
+is therefore variable-length and the reader must not assume a fixed page
+count or a fixed part-to-page mapping.
 
 ## Identity: what the page layer must add
 
@@ -130,7 +173,8 @@ opens with a stamp, and a reader refuses a page whose stamp is not the one its
 directory entry implies:
 
 ```text
-page payload = group_tag : u64 || column_id : u16 || part : u8 || encoding
+page payload = group_tag : u64 || column_id : u16 || part : u8
+               || row_page : u16 || encoding
 ```
 
 Inside an encrypted page the stamp is authenticated with the rest of the
@@ -151,24 +195,35 @@ already written. A salvage copying one table in key order always satisfies
 that, because the source's tags increase and a re-encoded group takes a tag
 no higher than the source tag it replaces.
 
-Moving a page between slots of one group is already refused by
-`(column_id, part)`, which the stamp repeats. Moving a whole group, directory
-and pages together, is the block swap the index already governs: the group's
-keys travel with its values.
+Moving a page between slots of one group is refused by
+`(column_id, part, row_page)`, which the stamp repeats. The row page is what
+stops the swap row pages invite: two row pages of one fixed-width column hold
+the same number of bytes whenever they hold the same number of rows, and
+without it they would trade places and hand each row another row's value.
+Moving a whole group, directory and pages together, is the block swap the
+index already governs: the group's keys travel with its values.
 
 ## Framing overhead
 
 The acceptance this format is held to asks for the overhead as a measured
 figure rather than a promise of zero. Per row group, each page adds a block
 header (33 bytes: SST blocks carry no flags byte, their transform comes from
-the table descriptor), an 11-byte stamp and a 12-byte directory entry, and
-the group adds the directory's own 15-byte header and block header once:
+the table descriptor), a 13-byte stamp and a 14-byte directory entry, 60
+bytes in all; each row page adds its 4-byte row count to the directory; and
+the group adds the directory's own 17-byte header and block header once. With
+one row page per group:
 
 | Row group | 8 pages | 20 pages |
 |---|---|---|
-| 32 KiB | 496 B (1.51%) | 1168 B (3.56%) |
-| 128 KiB | 496 B (0.38%) | 1168 B (0.89%) |
-| 256 KiB | 496 B (0.19%) | 1168 B (0.45%) |
+| 32 KiB | 534 B (1.63%) | 1254 B (3.83%) |
+| 128 KiB | 534 B (0.41%) | 1254 B (0.96%) |
+| 256 KiB | 534 B (0.20%) | 1254 B (0.48%) |
+
+Row pages multiply the pages: every column part pays its 60 bytes once per
+row page. Four parts in 4 KiB row pages cost 244 bytes per row page, about 6%
+of the data; in 16 KiB row pages, 1.5%. That is what the page size trades
+against the rows a point read decodes, and why its default is chosen by
+measurement together with the group size.
 
 Encryption adds its per-page tag and frame on top, roughly doubling those.
 Page-ECC does **not** scale with the page count in any meaningful way: its
@@ -198,8 +253,10 @@ page adjacent, a prefix sized for the directory plus the key page usually
 satisfies a point read in one request.
 
 The prefix is 4 KiB, or the whole group when it is smaller. A directory is
-15 bytes plus 12 per page, so 4 KiB holds the directory of any schema short
-of some 330 pages, and the rest of it goes to the start of the key page. A
+17 bytes plus 4 per row page and 14 per page, so 4 KiB holds the directory of
+some 280 pages, and the rest of it goes to the start of the key pages. A
+longer directory, which many row pages of a wide schema make, is completed by
+a second request. A
 page the prefix covers, wholly or in part, is served from it rather than
 asked for again; the reader then requests each run of consecutive wanted
 pages that are not cached as one range.
@@ -207,9 +264,10 @@ pages that are not cached as one range.
 ## What a read does
 
 **Point read.** Index gives the row group's extent. One read covers
-the directory and the key page (adjacent by construction). The key page
-yields the slot; the directory yields the pages holding the wanted fields;
-one further read fetches them, coalesced where they are adjacent.
+the directory and the key pages (adjacent by construction). A key the key
+pages do not hold ends the read there. Otherwise they yield the row pages
+holding the key's versions, and the directory the pages of those row pages;
+one further read per column fetches them.
 
 **Projection.** As above, minus the slot resolution: the directory names the
 pages for the projected columns' parts, and only those are read.
@@ -247,13 +305,15 @@ Two costs grow with the group, and neither is the page layout's:
   predicate that prunes most 4 KiB groups prunes few 64 KiB ones, and the
   sparse scan reads six times the bytes. Statistics zones finer than the
   group are what the format separates them for.
-- **Work per point read.** A point hit decodes and validates its pages
-  whole, which is linear in the group's rows, so reads that the cache serves
-  still slow down as the group grows.
+- **Work per point read.** A point hit decoded and validated its pages
+  whole, which was linear in the group's rows, so reads that the cache
+  served still slowed down as the group grew. Row pages bound it by the page
+  size instead: a hit decodes the key pages and the row pages that hold the
+  key.
 
 The dense scan is three times faster from 64 KiB up, which is what a larger
-default is for once both of those scale with the zone and the rows read
-rather than with the group.
+default is for once pruning also scales with the zone rather than with the
+group.
 
 ## Relationship to the existing partial-decode section
 

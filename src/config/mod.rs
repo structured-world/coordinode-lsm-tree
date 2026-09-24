@@ -51,6 +51,10 @@ use core::ops::Range;
 /// [`Config::columnar_row_group_size_policy`] says otherwise.
 pub const DEFAULT_COLUMNAR_ROW_GROUP_SIZE: u32 = 4_096;
 
+/// The size a columnar row group's rows are cut into row pages at unless
+/// [`Config::columnar_page_size_policy`] says otherwise.
+pub const DEFAULT_COLUMNAR_PAGE_SIZE: u32 = 4_096;
+
 /// Per-level filesystem routing entry for tiered storage.
 ///
 /// Maps a range of LSM levels to a base directory and filesystem backend.
@@ -376,6 +380,11 @@ pub struct Config {
     /// one page is worth rather than for what a read of the whole group costs.
     pub columnar_row_group_size_policy: BlockSizePolicy,
 
+    /// Uncompressed bytes of row data a columnar row page holds, per level.
+    /// A row group's rows are cut into row pages shared by every column, so a
+    /// read of a few rows decodes only the pages that hold them.
+    pub columnar_page_size_policy: BlockSizePolicy,
+
     /// Whether to pin index blocks
     pub index_block_pinning_policy: PinningPolicy,
 
@@ -686,6 +695,8 @@ impl Default for Config {
             data_block_size_policy: BlockSizePolicy::all(4_096),
 
             columnar_row_group_size_policy: BlockSizePolicy::all(DEFAULT_COLUMNAR_ROW_GROUP_SIZE),
+
+            columnar_page_size_policy: BlockSizePolicy::all(DEFAULT_COLUMNAR_PAGE_SIZE),
 
             index_block_pinning_policy: PinningPolicy::new([true, true, false]),
             filter_block_pinning_policy: PinningPolicy::new([true, false]),
@@ -1582,6 +1593,34 @@ impl Config {
     #[must_use]
     pub fn columnar_row_group_size_policy(mut self, policy: BlockSizePolicy) -> Self {
         self.columnar_row_group_size_policy = policy;
+        self
+    }
+
+    /// Sets the size a columnar row group's rows are cut into row pages at,
+    /// per level.
+    ///
+    /// A row page closes once its rows reach this many uncompressed bytes, so
+    /// a page holds at least one row and a group at least one page. A size at
+    /// or above the row group size writes one row page per group. The default
+    /// is [`DEFAULT_COLUMNAR_PAGE_SIZE`] at every level.
+    ///
+    /// # Examples
+    ///
+    /// ```
+    /// use lsm_tree::{Config, SequenceNumberCounter, config::BlockSizePolicy};
+    /// # let folder = tempfile::tempdir()?;
+    /// let config = Config::new(
+    ///     folder.path(),
+    ///     SequenceNumberCounter::default(),
+    ///     SequenceNumberCounter::default(),
+    /// )
+    /// .columnar_row_group_size_policy(BlockSizePolicy::all(256 * 1_024))
+    /// .columnar_page_size_policy(BlockSizePolicy::all(8 * 1_024));
+    /// # Ok::<(), Box<dyn std::error::Error>>(())
+    /// ```
+    #[must_use]
+    pub fn columnar_page_size_policy(mut self, policy: BlockSizePolicy) -> Self {
+        self.columnar_page_size_policy = policy;
         self
     }
 

@@ -2647,7 +2647,10 @@ fn swap_first_two_keys(key_col: &mut crate::table::columnar::Column, row_count: 
 }
 
 /// Forges the `group`-th row group's directory to declare `row_count` rows,
-/// leaving its pages alone, and re-stamps the directory's checksum.
+/// leaving its row pages and pages alone, and re-stamps the directory's
+/// checksum. The directory keeps its length; only its row count field (after
+/// the version byte and the page count) changes, so it no longer agrees with
+/// its own row pages.
 #[cfg(feature = "columnar")]
 fn forge_row_group_row_count(
     source: &std::path::Path,
@@ -2656,13 +2659,12 @@ fn forge_row_group_row_count(
     row_count: u32,
 ) -> crate::Result<()> {
     let (group_at, directory) = row_group(source, fs, group)?;
-    let forged = crate::table::column_page::PageDirectory::new(
-        row_count,
-        directory.group_tag(),
-        directory.entries().to_vec(),
-    )?;
     let mut payload = Vec::new();
-    forged.encode_into(&mut payload);
+    directory.encode_into(&mut payload);
+    let Some(field) = payload.get_mut(3..7) else {
+        panic!("a directory holds its row count");
+    };
+    field.copy_from_slice(&row_count.to_le_bytes());
     let mut bytes = std::fs::read(source)?;
     restamp_block(&mut bytes, group_at, &payload)?;
     std::fs::write(source, &bytes)?;

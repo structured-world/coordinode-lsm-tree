@@ -108,6 +108,9 @@ pub struct Writer {
     /// in place of `data_block_size` when the table is columnar.
     row_group_size: u32,
 
+    /// Uncompressed bytes of row data a columnar row page is closed at.
+    columnar_page_size: u32,
+
     data_block_hash_ratio: f32,
 
     /// Compression to use for data blocks
@@ -454,6 +457,7 @@ impl Writer {
             data_block_size: 4_096,
 
             row_group_size: crate::config::DEFAULT_COLUMNAR_ROW_GROUP_SIZE,
+            columnar_page_size: crate::config::DEFAULT_COLUMNAR_PAGE_SIZE,
 
             data_block_compression: CompressionType::None,
             index_block_compression: CompressionType::None,
@@ -714,6 +718,22 @@ impl Writer {
     pub fn use_row_group_size(mut self, size: u32) -> Self {
         assert!(size <= 4 * 1_024 * 1_024, "row group size must be <= 4 MiB",);
         self.row_group_size = size;
+        self
+    }
+
+    /// Sets the uncompressed size a columnar row group's rows are cut into row
+    /// pages at. Ignored for a row-major table.
+    ///
+    /// # Panics
+    ///
+    /// Panics when `size` exceeds 4 MiB, the same bound as a row group.
+    #[must_use]
+    pub fn use_columnar_page_size(mut self, size: u32) -> Self {
+        assert!(
+            size <= 4 * 1_024 * 1_024,
+            "columnar page size must be <= 4 MiB"
+        );
+        self.columnar_page_size = size;
         self
     }
 
@@ -1488,7 +1508,7 @@ impl Writer {
         item_count: usize,
         zone_block_min: Option<crate::UserKey>,
     ) -> crate::Result<()> {
-        use crate::table::column_page::{PageDirectory, PageId};
+        use crate::table::column_page::{PageDirectory, PageId, PageStamp};
         use crate::table::columnar::CodecId;
 
         // Pages carry the data and go through the table's data codec; the
@@ -1500,26 +1520,58 @@ impl Writer {
         let directory_transform = self.data_transform(crate::CompressionType::None)?;
         let group_tag = self.next_group_tag()?;
 
-        // One page per column: today every column's encoding names a single
-        // part. A codec whose encoding names several parts gets one page per
-        // part here, and nothing downstream changes, because pages are found
-        // by `(column_id, part)` and never by position.
-        let payloads = batch
-            .columns
-            .iter()
-            .map(|col| {
-                let id = PageId {
-                    column_id: col.column_id,
-                    part: 0,
+        // The group's rows are cut into row pages shared by every column, and
+        // each column gets one page per row page, all of one column's pages
+        // together: a read of a column is then one run of adjacent pages, and
+        // a read of a few rows reads only the row pages that hold them. Today
+        // every column's encoding names a single part; a codec whose encoding
+        // names several gets its pages per part here, and nothing downstream
+        // changes, because pages are found by `(column_id, part, row_page)`
+        // and never by position.
+        // A page size at or above the group size is one row page per group:
+        // the group is cut by the writer's own size count, the pages by the
+        // bytes the rows carry, and a group the last row took past its size
+        // must not grow a sliver of a page for that one row.
+        let row_pages = if self.columnar_page_size >= self.row_group_size {
+            alloc::vec![batch.row_count]
+        } else {
+            batch.row_page_cuts(self.columnar_page_size)?
+        };
+        let mut payloads = Vec::with_capacity(batch.columns.len() * row_pages.len());
+        for col in &batch.columns {
+            let id = PageId {
+                column_id: col.column_id,
+                part: 0,
+            };
+            let mut start = 0u32;
+            for (index, &rows) in row_pages.iter().enumerate() {
+                let row_page = u16::try_from(index).map_err(|_| {
+                    crate::Error::InvalidHeader("columnar: more row pages than a group holds")
+                })?;
+                let end = start + rows;
+                let piece;
+                let page_rows = if row_pages.len() == 1 {
+                    col
+                } else {
+                    piece = col.rows(batch.row_count, start, end)?;
+                    &piece
                 };
-                let stamp = crate::table::column_page::PageStamp { group_tag, id };
-                let payload = col.encode_page(batch.row_count, CodecId::Plain, stamp)?;
-                Ok((id, payload))
-            })
-            .collect::<crate::Result<Vec<_>>>()?;
+                let stamp = PageStamp {
+                    group_tag,
+                    id,
+                    row_page,
+                };
+                payloads.push((
+                    id,
+                    row_page,
+                    page_rows.encode_page(rows, CodecId::Plain, stamp)?,
+                ));
+                start = end;
+            }
+        }
         let pages = payloads
             .iter()
-            .map(|(id, payload)| {
+            .map(|(id, row_page, payload)| {
                 let prepared = Block::prepare_with_flags(
                     payload,
                     super::block::BlockIdentity {
@@ -1531,16 +1583,17 @@ impl Writer {
                     &page_transform,
                     0, // pages carry no per-KV checksum footer
                 )?;
-                Ok((*id, prepared))
+                Ok((*id, *row_page, prepared))
             })
             .collect::<crate::Result<Vec<_>>>()?;
 
         let directory = PageDirectory::contiguous(
             batch.row_count,
             group_tag,
+            row_pages,
             pages
                 .iter()
-                .map(|(id, prepared)| (*id, prepared.on_disk_len(self.ecc))),
+                .map(|(id, row_page, prepared)| (*id, *row_page, prepared.on_disk_len(self.ecc))),
         )?;
         let mut directory_payload = Vec::new();
         directory.encode_into(&mut directory_payload);
@@ -1564,7 +1617,7 @@ impl Writer {
                 .write_to(&mut self.file_writer)?
                 .uncompressed_length,
         );
-        for (_, prepared) in pages {
+        for (_, _, prepared) in pages {
             let header = prepared.write_to(&mut self.file_writer)?;
             bytes_written = bytes_written
                 .checked_add(header.on_disk_size_with(self.ecc))

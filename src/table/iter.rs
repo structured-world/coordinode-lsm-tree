@@ -545,14 +545,16 @@ impl Iter {
                     metrics: &self.metrics,
                     charge: self.charge,
                 }
-                .load(None)?;
+                .load(&crate::table::row_group::PageWant::ALL)?;
                 // What decoding the pages copied out of them, plus the values
                 // rebuilt from sub-columns below. Keys, and values of a single
                 // bytes column, are views into the decoded columns and cost
                 // nothing. Charged before the result is judged: a group
                 // refused after a gather still did it.
                 let mut gathered = 0usize;
-                let batch = group.to_batch(None, &mut gathered);
+                let batch = group
+                    .to_row_pages(&crate::table::row_group::PageWant::ALL, &mut gathered)
+                    .map(|pages| pages.batches);
                 // Mask only when the segment has deletes AND this block's start row
                 // is known. The start-row map is built at open from the zone map
                 // (which covers every block), so an unmapped block is unreachable;

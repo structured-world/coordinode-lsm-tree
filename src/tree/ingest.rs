@@ -36,10 +36,20 @@ pub struct Ingestion<'a> {
     seqno: SeqNo,
     last_key: Option<UserKey>,
     /// Successive columnar batches with the same layout accumulate here into one
-    /// rowgroup, flushed to a block once they reach the target data-block size or
+    /// rowgroup, flushed to a block once they reach the target row group size or
     /// the layout changes, so many small ingest batches become few large blocks.
     #[cfg(feature = "columnar")]
-    pending_columnar: Option<crate::table::columnar::ColumnBatch>,
+    pending_columnar: Option<PendingRowGroup>,
+}
+
+/// The columnar batches an ingestion has accepted for its next row group, kept
+/// apart and joined once when the group is written: joining each batch into
+/// the pending group as it arrived would re-copy the whole group per batch.
+#[cfg(feature = "columnar")]
+struct PendingRowGroup {
+    batches: Vec<crate::table::columnar::ColumnBatch>,
+    /// The batches' uncompressed size between them.
+    data_size: usize,
 }
 
 impl<'a> Ingestion<'a> {
@@ -131,6 +141,11 @@ impl<'a> Ingestion<'a> {
         .use_row_group_size(
             tree.config
                 .columnar_row_group_size_policy
+                .get(INITIAL_CANONICAL_LEVEL),
+        )
+        .use_columnar_page_size(
+            tree.config
+                .columnar_page_size_policy
                 .get(INITIAL_CANONICAL_LEVEL),
         )
         .use_data_block_hash_ratio(
@@ -375,10 +390,21 @@ impl<'a> Ingestion<'a> {
         // (below) or at `finish`, so a stream of small batches becomes a few
         // large columnar blocks instead of one block per call.
         match &mut self.pending_columnar {
-            Some(pending) if pending.same_layout(batch) => pending.append(batch)?,
+            Some(pending)
+                if pending
+                    .batches
+                    .first()
+                    .is_some_and(|first| first.same_layout(batch)) =>
+            {
+                pending.data_size += batch.data_size();
+                pending.batches.push(batch.clone());
+            }
             _ => {
                 self.flush_pending_columnar()?;
-                self.pending_columnar = Some(batch.clone());
+                self.pending_columnar = Some(PendingRowGroup {
+                    batches: alloc::vec![batch.clone()],
+                    data_size: batch.data_size(),
+                });
             }
         }
         // Carry the batch's last key forward: it both records the ordering
@@ -395,7 +421,7 @@ impl<'a> Ingestion<'a> {
         if self
             .pending_columnar
             .as_ref()
-            .is_some_and(|p| p.data_size() >= target)
+            .is_some_and(|p| p.data_size >= target)
         {
             self.flush_pending_columnar()?;
         }
@@ -407,11 +433,16 @@ impl<'a> Ingestion<'a> {
     /// tracks `last_key` per accepted batch, so the return value is discarded.
     #[cfg(feature = "columnar")]
     fn flush_pending_columnar(&mut self) -> crate::Result<()> {
-        if let Some(batch) = self.pending_columnar.take() {
+        if let Some(pending) = self.pending_columnar.take() {
+            let data_size = pending.data_size;
+            let batch = crate::table::columnar::ColumnBatch::concat(pending.batches)?;
             // Restore the pending rowgroup if the write fails, so the buffered
             // rows are not silently dropped from ingestion state.
             if let Err(e) = self.writer.write_columnar_batch(&batch) {
-                self.pending_columnar = Some(batch);
+                self.pending_columnar = Some(PendingRowGroup {
+                    batches: alloc::vec![batch],
+                    data_size,
+                });
                 return Err(e);
             }
         }

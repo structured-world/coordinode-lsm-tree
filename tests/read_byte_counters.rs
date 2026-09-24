@@ -848,6 +848,45 @@ fn a_columnar_point_read_that_misses_reads_a_fraction_of_its_group() {
 }
 
 #[test]
+fn a_columnar_point_read_that_hits_reads_only_the_row_page_holding_its_key() {
+    // A hit reads the key pages to find the key, then only the row page that
+    // holds it: with 128 KiB groups of 4 KiB rows cut into 4 KiB row pages,
+    // that is one row's value, not the group's.
+    let folder = get_tmp_folder();
+    let AnyTree::Standard(tree) = Config::new(
+        folder.path(),
+        SequenceNumberCounter::default(),
+        SequenceNumberCounter::default(),
+    )
+    .filter_policy(lsm_tree::config::FilterPolicy::disabled())
+    .columnar_row_group_size_policy(lsm_tree::config::BlockSizePolicy::all(128 * 1_024))
+    .columnar_page_size_policy(lsm_tree::config::BlockSizePolicy::all(4 * 1_024))
+    .open()
+    .expect("open") else {
+        panic!("expected a standard tree");
+    };
+    tree.update_runtime_config(|cfg| cfg.columnar = true)
+        .expect("enable columnar");
+    for i in 0..200 {
+        tree.insert(key(i), vec![b'v'; 4_096], u64::from(i));
+    }
+    tree.flush_active_memtable(0).expect("flush");
+
+    let m = tree.metrics();
+    let before = m.bytes_read();
+    let got = tree
+        .get(key(7), SeqNo::MAX)
+        .expect("get")
+        .expect("a written key");
+    assert_eq!(got.len(), 4_096);
+    let hit = m.bytes_read() - before;
+    assert!(
+        hit > 4_096 && hit < 16 * 1_024,
+        "a hit read {hit} B of a 128 KiB group; it needs the key pages and one row page",
+    );
+}
+
+#[test]
 fn a_projection_repeated_from_the_cache_reads_nothing_and_a_wider_one_only_new_pages() {
     // Pages are cached one by one, so a second projection over the same rows
     // is served from the cache, and a wider one reads only the pages the first
@@ -936,9 +975,9 @@ fn a_merged_columnar_scan_counts_the_seqno_column_it_rewrites() -> lsm_tree::Res
     // the surviving rows and then writes each one's effective seqno into a new
     // column that replaces the gathered one. That second buffer is a gather of
     // its own: counting only the first charges every merged seqno once while
-    // it was copied twice. Each segment is one block, so every gather of the
-    // merge is known: each segment's visible rows, the accumulator rebuilt
-    // once over both, the surviving rows, and the rewritten seqnos.
+    // it was copied twice. Each segment is one block of one row page, so every
+    // gather of the merge is known: each segment's visible rows, the two
+    // joined once, the surviving rows, and the rewritten seqnos.
     let folder = get_tmp_folder();
     let AnyTree::Standard(tree) = Config::new(
         folder.path(),
@@ -946,6 +985,7 @@ fn a_merged_columnar_scan_counts_the_seqno_column_it_rewrites() -> lsm_tree::Res
         SequenceNumberCounter::default(),
     )
     .columnar_row_group_size_policy(lsm_tree::config::BlockSizePolicy::all(1 << 20))
+    .columnar_page_size_policy(lsm_tree::config::BlockSizePolicy::all(1 << 20))
     .open()?
     else {
         panic!("expected a standard tree");
@@ -979,6 +1019,62 @@ fn a_merged_columnar_scan_counts_the_seqno_column_it_rewrites() -> lsm_tree::Res
         first + second + both + returned + 8 * rows,
         "each segment's rows, the accumulator over both, the surviving rows and \
          the rewritten seqnos are one gather each",
+    );
+    Ok(())
+}
+
+#[test]
+fn a_merged_columnar_scan_over_many_row_pages_copies_each_row_a_bounded_number_of_times()
+-> lsm_tree::Result<()> {
+    // The merge joins every visible row page of the overlapping segments into
+    // one batch. Joined once, that is one more copy of the rows; folded page by
+    // page into an accumulator, it re-copies everything gathered so far for
+    // each page, and a segment of many small row pages multiplies the copies.
+    let folder = get_tmp_folder();
+    let AnyTree::Standard(tree) = Config::new(
+        folder.path(),
+        SequenceNumberCounter::default(),
+        SequenceNumberCounter::default(),
+    )
+    .columnar_row_group_size_policy(lsm_tree::config::BlockSizePolicy::all(1 << 20))
+    .columnar_page_size_policy(lsm_tree::config::BlockSizePolicy::all(1_024))
+    .open()?
+    else {
+        panic!("expected a standard tree");
+    };
+    tree.update_runtime_config(|cfg| cfg.columnar = true)?;
+    for i in 0..1_000 {
+        tree.insert(key(i), vec![b'v'; 32], u64::from(i));
+    }
+    tree.flush_active_memtable(0)?;
+    for i in 500..1_500 {
+        tree.insert(key(i), vec![b'w'; 32], 2_000 + u64::from(i));
+    }
+    tree.flush_active_memtable(0)?;
+    let m = tree.metrics();
+    let before = m.bytes_copied();
+
+    let mut returned = 0;
+    let mut rows = 0_u64;
+    for batch in tree.columnar_scan(&[COL_USER_KEY, COL_SEQNO, COL_VALUE], None, SeqNo::MAX, ..)? {
+        let batch = batch?;
+        rows += u64::from(batch.row_count);
+        returned += batch_bytes(&batch);
+    }
+    assert_eq!(rows, 1_500, "the merge yields every key once");
+
+    // The gathers of one row page per segment, plus an offset table's worth
+    // for each of the row pages the segments hold (a 1 KiB page holds about
+    // twenty of these rows).
+    let rows_per_page = 20;
+    let pages = (1_000 + 1_000) / rows_per_page;
+    let first = key_seqno_value_bytes(0..1_000, 32);
+    let second = key_seqno_value_bytes(500..1_500, 32);
+    let linear = 2 * (first + second) + returned + 8 * rows + 2 * 2 * 4 * pages;
+    let copied = m.bytes_copied() - before;
+    assert!(
+        copied <= linear,
+        "the merge copied {copied} B; joining its row pages once copies at most {linear} B",
     );
     Ok(())
 }
