@@ -483,9 +483,22 @@ impl Iter {
         not(feature = "std"),
         expect(dead_code, reason = "its compaction consumer is std-gated")
     )]
-    pub(crate) fn for_maintenance(mut self) -> Self {
-        self.charge = ReadCharge::Maintenance;
-        self.index_iter = self.index_iter.with_charge(ReadCharge::Maintenance);
+    pub(crate) fn for_maintenance(self) -> Self {
+        self.with_charge(ReadCharge::Maintenance)
+    }
+
+    /// Marks this iterator, and the index walk inside it, as a read that
+    /// leaves no trace, such as verification during a scrub: uncounted, and
+    /// it neither fills the block cache nor promotes what is cached.
+    #[must_use]
+    #[cfg(feature = "std")]
+    pub(crate) fn untraced(self) -> Self {
+        self.with_charge(ReadCharge::Untraced)
+    }
+
+    fn with_charge(mut self, charge: ReadCharge) -> Self {
+        self.charge = charge;
+        self.index_iter = self.index_iter.with_charge(charge);
         self
     }
 

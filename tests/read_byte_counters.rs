@@ -578,7 +578,7 @@ fn an_uncompressed_blob_prefetch_counts_the_records_it_copies_out() {
 }
 
 #[test]
-fn a_point_read_admitted_to_the_row_cache_counts_the_row_it_detaches() {
+fn a_point_read_admitted_to_the_row_cache_counts_the_row_it_detaches() -> lsm_tree::Result<()> {
     // A point read that misses the row cache copies the key and value it
     // resolved out of the data block, so the cached row owns its bytes rather
     // than pinning the block. That copy is a gather like any other: both
@@ -590,7 +590,7 @@ fn a_point_read_admitted_to_the_row_cache_counts_the_row_it_detaches() {
     let row = |i: u32| (key(i).len() + value_len) as u64;
 
     let before = m.bytes_copied();
-    assert!(tree.get(key(5), SeqNo::MAX).expect("get").is_some());
+    assert!(tree.get(key(5), SeqNo::MAX)?.is_some());
     assert_eq!(
         m.bytes_copied() - before,
         row(5),
@@ -598,20 +598,17 @@ fn a_point_read_admitted_to_the_row_cache_counts_the_row_it_detaches() {
     );
 
     let before = m.bytes_copied();
-    assert!(tree.get(key(5), SeqNo::MAX).expect("get").is_some());
+    assert!(tree.get(key(5), SeqNo::MAX)?.is_some());
     assert_eq!(m.bytes_copied(), before, "a row-cache hit copies nothing",);
 
     let before = m.bytes_copied();
-    assert!(
-        tree.get_internal_entry(&key(7), SeqNo::MAX)
-            .expect("get entry")
-            .is_some()
-    );
+    assert!(tree.get_internal_entry(&key(7), SeqNo::MAX)?.is_some());
     assert_eq!(
         m.bytes_copied() - before,
         row(7),
         "the full-entry lookup detached one row into the row cache",
     );
+    Ok(())
 }
 
 #[test]
@@ -713,7 +710,7 @@ fn key_seqno_value_bytes(keys: core::ops::Range<u32>, value_len: usize) -> u64 {
 }
 
 #[test]
-fn a_merged_columnar_scan_counts_the_seqno_column_it_rewrites() {
+fn a_merged_columnar_scan_counts_the_seqno_column_it_rewrites() -> lsm_tree::Result<()> {
     // Overlapping segments carry different seqno offsets, so the merge gathers
     // the surviving rows and then writes each one's effective seqno into a new
     // column that replaces the gathered one. That second buffer is a gather of
@@ -728,30 +725,26 @@ fn a_merged_columnar_scan_counts_the_seqno_column_it_rewrites() {
         SequenceNumberCounter::default(),
     )
     .data_block_size_policy(lsm_tree::config::BlockSizePolicy::all(1 << 20))
-    .open()
-    .expect("open") else {
+    .open()?
+    else {
         panic!("expected a standard tree");
     };
-    tree.update_runtime_config(|cfg| cfg.columnar = true)
-        .expect("enable columnar");
+    tree.update_runtime_config(|cfg| cfg.columnar = true)?;
     for i in 0..1_000 {
         tree.insert(key(i), vec![b'v'; 32], u64::from(i));
     }
-    tree.flush_active_memtable(0).expect("flush");
+    tree.flush_active_memtable(0)?;
     for i in 500..1_500 {
         tree.insert(key(i), vec![b'w'; 32], 2_000 + u64::from(i));
     }
-    tree.flush_active_memtable(0).expect("flush");
+    tree.flush_active_memtable(0)?;
     let m = tree.metrics();
     let before = m.bytes_copied();
 
     let mut returned = 0;
     let mut rows = 0_u64;
-    for batch in tree
-        .columnar_scan(&[COL_USER_KEY, COL_SEQNO, COL_VALUE], None, SeqNo::MAX, ..)
-        .expect("scan")
-    {
-        let batch = batch.expect("batch");
+    for batch in tree.columnar_scan(&[COL_USER_KEY, COL_SEQNO, COL_VALUE], None, SeqNo::MAX, ..)? {
+        let batch = batch?;
         rows += u64::from(batch.row_count);
         returned += batch_bytes(&batch);
     }
@@ -766,10 +759,11 @@ fn a_merged_columnar_scan_counts_the_seqno_column_it_rewrites() {
         "each segment's rows, the accumulator over both, the surviving rows and \
          the rewritten seqnos are one gather each",
     );
+    Ok(())
 }
 
 #[test]
-fn a_scan_of_one_ingested_segment_counts_the_seqno_column_it_globalizes() {
+fn a_scan_of_one_ingested_segment_counts_the_seqno_column_it_globalizes() -> lsm_tree::Result<()> {
     // A bulk-ingested segment stores its rows at local seqno 0 and carries its
     // place in the tree as a per-segment offset. Returning its seqno column
     // therefore writes each row's effective seqno into a new column, even on
@@ -781,31 +775,25 @@ fn a_scan_of_one_ingested_segment_counts_the_seqno_column_it_globalizes() {
         SequenceNumberCounter::new(100),
         SequenceNumberCounter::default(),
     )
-    .open()
-    .expect("open") else {
+    .open()?
+    else {
         panic!("expected a standard tree");
     };
-    tree.update_runtime_config(|cfg| cfg.columnar = true)
-        .expect("enable columnar");
+    tree.update_runtime_config(|cfg| cfg.columnar = true)?;
     let n = 1_000;
     let entries: Vec<InternalValue> = (0..n)
         .map(|i| InternalValue::from_components(key(i), b"vv", 0, ValueType::Value))
         .collect();
     let any = AnyTree::Standard(tree.clone());
-    let mut ingest = any.ingestion().expect("ingestion");
-    ingest
-        .write_columnar_batch(&entries_to_column_batch(&entries).expect("transpose"))
-        .expect("write batch");
-    ingest.finish().expect("finish");
+    let mut ingest = any.ingestion()?;
+    ingest.write_columnar_batch(&entries_to_column_batch(&entries)?)?;
+    ingest.finish()?;
     let m = tree.metrics();
     let before = m.bytes_copied();
 
     let mut rows = 0_u64;
-    for batch in tree
-        .columnar_scan(&[COL_USER_KEY, COL_SEQNO, COL_VALUE], None, SeqNo::MAX, ..)
-        .expect("scan")
-    {
-        let batch = batch.expect("batch");
+    for batch in tree.columnar_scan(&[COL_USER_KEY, COL_SEQNO, COL_VALUE], None, SeqNo::MAX, ..)? {
+        let batch = batch?;
         let seqnos = batch
             .columns
             .iter()
@@ -823,6 +811,7 @@ fn a_scan_of_one_ingested_segment_counts_the_seqno_column_it_globalizes() {
         8 * rows,
         "the globalized seqno column is one gather of 8 bytes per row",
     );
+    Ok(())
 }
 
 /// A columnar tree holding `n` rows ingested with the value split into one

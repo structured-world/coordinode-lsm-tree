@@ -3263,8 +3263,10 @@ impl Table {
             // loads a punched block, whereas `scan` walks every physical block from
             // offset 0 (and would fail decoding a zeroed one). Derive from the live
             // region accordingly; the restricted derive covers only the live suffix.
+            // Like `scan`, the walk is verification: uncounted, and it leaves
+            // the workload's block cache as it found it.
             if restricted {
-                for kv in self.range(..) {
+                for kv in self.range_iter(..).untraced() {
                     accumulate(kv?)?;
                 }
             } else {

@@ -969,6 +969,76 @@ fn verify_blob_links_rejects_an_undercounted_suffix_id_on_a_restricted_view() ->
     Ok(())
 }
 
+/// Verifying a restricted view's blob links walks its live suffix through the
+/// range reader, where the unrestricted check reads the file directly. Both
+/// are verification, not a caller's read: neither is counted, and neither
+/// fills the block cache the workload is using, so a scrub reconciling a
+/// restricted table leaves no trace a foreground measurement could see.
+#[cfg(all(feature = "metrics", feature = "std"))]
+#[test]
+fn verify_blob_links_on_a_restricted_view_counts_and_caches_nothing() -> crate::Result<()> {
+    use crate::blob_tree::handle::BlobIndirection;
+    use crate::coding::Encode;
+    use crate::vlog::ValueHandle;
+    use crate::{InternalValue, ValueType};
+
+    let dir = tempdir()?;
+    let file = dir.path().join("0");
+    let checksum = {
+        let mut w = Writer::new(file.clone(), 0, 0, Arc::new(StdFs))?.use_data_block_size(128);
+        for i in 0u64..10 {
+            let value = BlobIndirection {
+                size: 1000,
+                vhandle: ValueHandle {
+                    blob_file_id: i,
+                    on_disk_size: 500,
+                    offset: 0,
+                },
+            }
+            .encode_into_vec();
+            w.write(InternalValue::from_components(
+                format!("key{i:05}").into_bytes(),
+                value,
+                i + 1,
+                ValueType::Indirection,
+            ))?;
+            w.link_blob_file(i, 1, 1000, 500);
+        }
+        w.finish()?.expect("the SST is non-empty").1
+    };
+
+    let cache = Arc::new(crate::Cache::with_capacity_bytes(1 << 20));
+    let mut params = test_recover_params(file, checksum);
+    params.cache = cache.clone();
+    params.metrics = Arc::new(Metrics::default());
+    let metrics = params.metrics.clone();
+    let restricted =
+        Table::recover(params)?.reopen_restricted(crate::UserKey::from(&b"key00005"[..]))?;
+
+    let (read, decoded, copied) = (
+        metrics.bytes_read(),
+        metrics.bytes_decoded(),
+        metrics.bytes_copied(),
+    );
+    let cached = cache.size();
+    restricted.verify_blob_links()?;
+    assert_eq!(
+        (
+            metrics.bytes_read(),
+            metrics.bytes_decoded(),
+            metrics.bytes_copied()
+        ),
+        (read, decoded, copied),
+        "the verification walk is not a caller's read",
+    );
+    assert_eq!(
+        cache.size(),
+        cached,
+        "the verification walk must not fill the block cache",
+    );
+    Ok(())
+}
+
 /// An `Fs` that forwards to `MemFs` but reports the CONFIGURED hard-link count
 /// for every file, so the punch path's shared-inode guard can be exercised —
 /// including a checkpoint's link later disappearing (MemFs copies on
@@ -1826,7 +1896,7 @@ fn live_item_count_for_a_report_over_a_repaired_block_counts_the_repair() -> cra
     let before = table.metrics.ecc_recovered_count();
     assert_eq!(
         5,
-        restricted.live_item_count(crate::table::util::ReadCharge::Report)?
+        restricted.live_item_count(crate::table::util::ReadCharge::Untraced)?
     );
     assert!(
         table.metrics.ecc_recovered_count() > before,
@@ -1936,7 +2006,7 @@ fn live_item_count_for_a_report_caches_nothing() -> crate::Result<()> {
 
     assert_eq!(
         5,
-        restricted.live_item_count(crate::table::util::ReadCharge::Report)?
+        restricted.live_item_count(crate::table::util::ReadCharge::Untraced)?
     );
     let id = table.global_id();
     assert!(

@@ -491,10 +491,11 @@ pub enum ReadCharge {
     Foreground,
     /// Maintenance, such as compaction or a patrol scrub: not counted.
     Maintenance,
-    /// A monitoring report: not counted, and it neither fills the block cache
-    /// nor touches a cached block's recency, so polling it leaves nothing a
-    /// later read can see.
-    Report,
+    /// A read that must leave no trace: not counted, and it neither fills the
+    /// block cache nor touches a cached block's recency. A monitoring report
+    /// (polling it leaves nothing a later read can see), and verification that
+    /// must not displace the workload's blocks.
+    Untraced,
 }
 
 impl ReadCharge {
@@ -508,7 +509,7 @@ impl ReadCharge {
     /// Whether this read may leave a trace in the block cache.
     #[must_use]
     pub(crate) const fn touches_cache(self) -> bool {
-        !matches!(self, Self::Report)
+        !matches!(self, Self::Untraced)
     }
 }
 
