@@ -331,6 +331,35 @@ These figures are a second reason the row group grows. At 32 KiB with a
 richly-encoded schema the framing is already 3.6%; at 128 KiB and above it is
 under 1% and stops being a term in the decision.
 
+### Measured against the unpaged layout
+
+A cold scan of every column of one table (20,000 rows, 16-byte keys,
+100-byte values, the four engine columns), read once as rows and once as a
+projection of all four columns, against the same scan of the layout before
+pages, where a row group was one block. Bytes and requests are exact; times
+are medians of 21 cold scans on an x86 Linux host with the file in the page
+cache, where a request costs a system call and nothing else.
+
+| Row group, row page | bytes read | requests | projection time |
+|---|---|---|---|
+| 4 KiB, one row page | +5.3% | +1 (557 vs 556) | 5.08 ms vs 3.07 ms |
+| 32 KiB, one row page | +0.68% | +1 (72 vs 71) | 1.57 ms vs 1.16 ms |
+| 128 KiB, one row page | +0.17% | +1 (19 vs 18) | 1.09 ms vs 1.04 ms |
+| 32 KiB, 4 KiB row pages | +12.3% | +1 | 3.77 ms |
+| 128 KiB, 4 KiB row pages | +11.3% | +1 | 3.33 ms |
+
+The bytes are the framing above, and with row pages the zone blocks, which
+a read of the whole group takes along. The requests are the unpaged count
+plus one: the first group of a scan is read directory first, and every later
+one in one request (see [What a read does](#what-a-read-does)). The time
+the bytes do not explain is work done per block rather than per byte: each
+page is its own block, with its own header, checksum, verification and
+allocation, so a group of four columns is five blocks where it was one. It
+is a constant per group, which is why it weighs 65% at 4 KiB groups and 4%
+at 128 KiB, and it is what the page layout buys independent verification
+with. Row scans pay the same framing: 11.7 ms against 9.3 ms at 4 KiB, and
+within noise of the unpaged scan from 32 KiB up.
+
 ## What the index entry covers
 
 The index entry for a row group spans the **whole group**: directory and
@@ -376,9 +405,13 @@ admits, the zones of the predicate's column admit or skip each row page, from
 the directory for the key column and from that column's zone block for any
 other. Only the admitted row pages' pages of the projected columns are read.
 
-**Full scan.** Every page of the group is wanted, so the directory read is
-followed by one coalesced read of the whole remainder — the same single
-sequential read the group is today, plus the directory.
+**Full scan.** Every page of the group is wanted, so a group that fits the
+I/O buffer is read in one request, directory and pages together, the single
+sequential read the group was before pages. A projection is read directory
+first, since it does not know which pages it wants until the directory
+says; a scan whose projection took every page of one group expects the same
+of the next and reads that one whole too, so a projection of every column
+pays the directory-first read once per table, not once per group.
 
 ### The read budget
 
