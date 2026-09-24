@@ -1,5 +1,5 @@
 window.BENCHMARK_DATA = {
-  "lastUpdate": 1790177809307,
+  "lastUpdate": 1790277431762,
   "repoUrl": "https://github.com/structured-world/coordinode-lsm-tree",
   "entries": {
     "lsm-tree db_bench": [
@@ -24198,6 +24198,90 @@ window.BENCHMARK_DATA = {
             "value": 226817.3453152968,
             "unit": "ops/sec",
             "extra": "P50: 3.6us | P99: 16.5us | P99.9: 111.1us\nthreads: 1 | elapsed: 0.88s | num: 200000 | iterations: 3"
+          }
+        ]
+      },
+      {
+        "commit": {
+          "author": {
+            "email": "mail@polaz.com",
+            "name": "Dmitry Prudnikov",
+            "username": "polaz"
+          },
+          "committer": {
+            "email": "noreply@github.com",
+            "name": "GitHub",
+            "username": "web-flow"
+          },
+          "distinct": true,
+          "id": "650c4dc9e41f78a4d356e25d910dd5d6327015e3",
+          "message": "feat(metrics): measure bytes read, decoded and copied per emitted row (#706)\n\n## Summary\n\nThe first part of #678: the instrument the read-path work is measured\nwith. Nothing measured how much the engine reads, decodes and copies\nbefore it knows which rows and fields are wanted, so a projection win\nand a change that trades decode CPU for compressed size were\nindistinguishable.\n\n**Engine counters** (behind the existing `metrics` feature):\n\n- `bytes_read`: bytes requested from the filesystem, charged when the\nrequest is issued, so a read the filesystem refuses still counts, and a\nread that is never issued (a confirming re-read whose file cannot be\nopened) does not. Batched reads are charged per backend group as each\ngroup is submitted; the probe of a failed block for a punched extent and\nthe confirming re-read of an ECC-corrected block are charged too. The\nper-role load counters keep counting only blocks that checked out.\nMaintenance is not a read and is not counted: a compaction's input, the\nvalues its filter resolves, the index walks that open, verify or reclaim\na table, a patrol scrub's reads, and repair and salvage, including their\ncolumnar block loads and the restriction-bound search. A patrol scrub\nand the verification gates also leave the block and descriptor caches as\nthey found them, including the index they walk and the confirming\nre-read of a block they find corrected. So does the storage statistics\nreport, so polling it leaves a run's figures unchanged; a query\nplanner's range estimates are part of the query and are counted.\nPage-ECC recoveries are counted whoever read the block.\n- `bytes_decoded`: what the block transform produced (decompression,\ndecryption, Page-ECC verification). Counted on the uncached path, like\n`bytes_read`, including output a later length or role check then\nrefuses.\n- `bytes_copied`: what gathers moved (column-batch accumulation, batch\nfiltering, row gathering by index, both gathers of a columnar row\nreconstruction, the prefix and block copies of a large zstd block's\npartial decode, what decoding a columnar block copies out of it:\nvalidity bitmaps and the columns a narrow projection detaches, the\neffective seqnos written over a bulk-ingested segment's, and the keys\nand values detached into the row and blob caches), charged on every read\npath that performs one, including one that fails after the copy. Views\ninto a decoded block are not copies and are not counted, whatever their\nrepresentation: a short slice stored inline in its handle costs no more\nthan building the handle. Compaction, repair and salvage input decoding\nis maintenance and is not counted.\n- Blob reads are counted in `bytes_read` / `bytes_decoded`, with\n`blob_bytes_read` for the blob-only share, charged before the read is\nissued. Before this, a key-value-separated tree reported a few bytes of\nindirection per row while reading gigabytes.\n\nEach definition is written down in `docs/BENCHMARKING.md` and has\nclauses pinned by tests in `tests/read_byte_counters.rs`.\n\n**`mixed-layout` workload** in `tools/db_bench`, built only with the\ntool's `counters` feature so the instrumentation never touches the rate\nworkloads. `.github/scripts/run-benchmarks.sh` runs it in a second pass\nwith that build. It refuses the flags it does not use: `--threads` other\nthan 1, `--key-size`, `--value-size` and `--use-blob-tree`. It publishes\nthree series per scenario instead of a scenario rate, each the median of\nits own values across iterations: bytes read, decoded and copied per\nemitted row. All three are costs over one denominator, published\nsmaller-is-better in their own dashboard suite; zero is the best value,\nand a scenario that emitted no row publishes nothing rather than\ndividing by a stand-in. The text report adds decoded/read and\ncopied/decoded as diagnostics, `n/a` where the denominator is zero.\n\n- Eight record shapes, each with a fixture and an oracle derived from\nthe operations the fixture performed, never by reading the tree back, so\ntwo read paths sharing a faulty version-resolution routine cannot agree\nwith each other. Every read pass checks each emitted row against it.\n- Shapes: narrow, wide, mixed value sizes, a columnar base with\nrow-major updates over it, versions with point deletes and a range\ntombstone, ~1% and ~90% selectivity over one key space, well-placed and\nscattered blobs (read by a full scan, where placement shows).\n- The selectivity scenarios evaluate their predicate in the engine\nthrough `columnar_scan` with the zone map on, so the sparse scan reads\nless than the near-full one.\n- Fixtures open their trees with the run's cache, metadata and\ncompression flags; `--compression` reaches blob files too.\n- Two scenarios whose native path does not exist yet (projection,\nfiltered blob fetch) report UNSUPPORTED and contribute no figure, rather\nthan running a fallback under the same name. Their fixtures exist and\nare built by the tests.\n\n**CI**: `tools/db_bench` has its own `[workspace]`, so the workspace\ngates never covered it. It is now linted with its default features and\nwith all features, and tested.\n\n## Not in this PR\n\nPart two of #678, which enables the native scenarios as #681-#688 land,\nand the remaining metrics of the issue's table (peak RSS and time to\nfirst batch, blob reads before and after filtering, payload bytes\nrewritten on a metadata-only update, compaction CPU with foreground\np99). Part one's acceptance names the read / decoded / copied counters;\nthe others arrive with the capabilities they measure.\n\n## Testing\n\nTests, clippy (default and all features), formatting, doc tests, the doc\nbuild and the no-std check pass for the library and for\n`tools/db_bench`.\n\nPart of #678",
+          "timestamp": "2026-09-24T17:33:59+03:00",
+          "tree_id": "d9359a8b4a85034a483563f37499f83e69e0edf5",
+          "url": "https://github.com/structured-world/coordinode-lsm-tree/commit/650c4dc9e41f78a4d356e25d910dd5d6327015e3"
+        },
+        "date": 1790277429765,
+        "tool": "customBiggerIsBetter",
+        "benches": [
+          {
+            "name": "mixed",
+            "value": 18481.56760802304,
+            "unit": "ops/sec",
+            "extra": "P50: 0.5us | P99: 13.4us | P99.9: 25.1us\nthreads: 1 | elapsed: 28.96s | num: 200000 | iterations: 3"
+          },
+          {
+            "name": "fillseq",
+            "value": 2399774.382811626,
+            "unit": "ops/sec",
+            "extra": "P50: 0.2us | P99: 4.1us | P99.9: 5.3us\nthreads: 1 | elapsed: 0.08s | num: 200000 | iterations: 3"
+          },
+          {
+            "name": "fillrandom",
+            "value": 664662.71964465,
+            "unit": "ops/sec",
+            "extra": "P50: 1.2us | P99: 6.3us | P99.9: 14.6us\nthreads: 1 | elapsed: 0.30s | num: 200000 | iterations: 3"
+          },
+          {
+            "name": "readrandom",
+            "value": 527430.1981272816,
+            "unit": "ops/sec",
+            "extra": "P50: 1.8us | P99: 6.4us | P99.9: 19.7us\nthreads: 1 | elapsed: 0.38s | num: 200000 | iterations: 3"
+          },
+          {
+            "name": "readseq",
+            "value": 2417721.7554038046,
+            "unit": "ops/sec",
+            "extra": "P50: 0.2us | P99: 4.6us | P99.9: 6.3us\nthreads: 1 | elapsed: 0.08s | num: 200000 | iterations: 3"
+          },
+          {
+            "name": "seekrandom",
+            "value": 283863.91070197744,
+            "unit": "ops/sec",
+            "extra": "P50: 3.0us | P99: 7.9us | P99.9: 14.8us\nthreads: 1 | elapsed: 0.70s | num: 200000 | iterations: 3"
+          },
+          {
+            "name": "prefixscan",
+            "value": 155434.7917548505,
+            "unit": "ops/sec",
+            "extra": "P50: 5.9us | P99: 10.5us | P99.9: 18.6us\nthreads: 1 | elapsed: 1.29s | num: 200000 | iterations: 3"
+          },
+          {
+            "name": "overwrite",
+            "value": 749278.9716553722,
+            "unit": "ops/sec",
+            "extra": "P50: 1.1us | P99: 6.4us | P99.9: 13.4us\nthreads: 1 | elapsed: 0.27s | num: 200000 | iterations: 3"
+          },
+          {
+            "name": "mergerandom",
+            "value": 724105.0992353634,
+            "unit": "ops/sec",
+            "extra": "P50: 0.4us | P99: 4.3us | P99.9: 12.1us\nthreads: 1 | elapsed: 0.28s | num: 200000 | iterations: 3"
+          },
+          {
+            "name": "readwhilewriting",
+            "value": 379346.15706694865,
+            "unit": "ops/sec",
+            "extra": "P50: 1.9us | P99: 13.1us | P99.9: 82.2us\nthreads: 1 | elapsed: 0.53s | num: 200000 | iterations: 3"
           }
         ]
       }
