@@ -964,7 +964,9 @@ where
     // SAFETY: the buffer is frozen (and so read) only after the fill below
     // wrote all of it: slot 0, one offset slot per cell for exactly `count`
     // cells, and the payload through exactly `total` bytes. Any other outcome
-    // returns early and drops the builder unread.
+    // returns early and drops the builder unread. A zeroing builder would add
+    // a pass over bytes the fill overwrites anyway: measured 3-6% slower on
+    // `columnar/filter_batch` at every keep ratio.
     #[expect(unsafe_code, reason = "see safety")]
     let mut out = unsafe { Slice::builder_unzeroed(len) };
     let (offsets, payload) = out.split_at_mut(table);
