@@ -54,8 +54,78 @@ pub struct Metrics {
     /// Note: `BlobTree` prefix scans do not currently record this metric.
     pub(crate) prefix_bloom_skips: AtomicUsize,
 
-    /// Number of data block bytes that were requested from OS or disk
+    /// Payload bytes produced by the block transform — what decompression,
+    /// decryption and Page-ECC verification turned the bytes read into.
+    ///
+    /// Counted at the same site as `*_io_requested` and only on the same
+    /// uncached path, because a block served from the cache is already
+    /// decoded and no transform runs for it.
+    ///
+    /// This is the counter that tells a PHYSICAL projection from a cosmetic
+    /// one. A projection that returns two columns of a wide record but still
+    /// loads and decompresses the whole block leaves this figure unchanged
+    /// while the returned batch shrinks; one that reads only the pages it
+    /// needs moves it. Read alone cannot show that — a 4 KiB compressed block
+    /// is 4 KiB read however much it expands to.
+    pub(crate) block_bytes_decoded: AtomicU64,
+
+    /// Bytes moved by a gather: an operation that builds a new buffer whose
+    /// contents already existed in another one.
+    ///
+    /// The named set, so a new path cannot win by not being instrumented:
+    /// column-batch accumulation, batch filtering, row gathering by index,
+    /// row-value reconstruction from sub-columns, the prefix copies and the
+    /// synthesized block of a large zstd block's partial decode, what
+    /// decoding a columnar block copies out of it (validity bitmaps, and
+    /// columns a narrow projection detaches), the effective seqnos written
+    /// over a bulk-ingested segment's local ones, the key and value a point
+    /// read detaches into the row cache, and the key a resolved blob is
+    /// cached under, wherever a read performs them
+    /// (single-segment and merged columnar scans, row iteration and point
+    /// reads, range reads of a partially decoded block). It does NOT count a
+    /// block transform's output (that is `block_bytes_decoded`), a write
+    /// path's serialisation, the input decoding of compaction, repair and
+    /// salvage (maintenance, not reads), or a move that transfers ownership without
+    /// duplicating bytes.
+    ///
+    /// A view into a decoded buffer is a view whatever its representation: a
+    /// short slice stored inline in the handle is not charged, because building
+    /// that inline copy costs no more than building the handle itself.
+    ///
+    /// The quantity this exists to expose is quadratic accumulation and
+    /// repeated re-gather: bytes copied per input byte should be a small
+    /// constant, and a path that re-materialises its working set several
+    /// times shows up here and nowhere else.
+    pub(crate) bytes_copied: AtomicU64,
+
+    /// Number of data block bytes that were requested from OS or disk.
+    ///
+    /// Definition: bytes REQUESTED FROM THE `Fs` TRAIT, which is the block's
+    /// on-disk size (`handle.size()`), not device I/O — the OS page cache,
+    /// readahead and request coalescing all sit below this line and are not
+    /// visible to it. Counted only when the block was not served from the
+    /// block cache, so a fully cached read reports zero bytes read, which is
+    /// the honest answer to "how much did this read ask the filesystem for".
     pub(crate) data_block_io_requested: AtomicU64,
+
+    /// Blob record bytes requested from the `Fs` trait: the on-disk span of
+    /// the records a read or a prefetch asked for, gaps merged into a
+    /// coalesced read included.
+    ///
+    /// Separate from the block counters because a blob is not a block, and
+    /// summed into [`Metrics::bytes_read`] because it IS a read of the
+    /// filesystem. A key-value-separated tree keeps most of its bytes here, so
+    /// leaving them out would let a change that moves work into the blob path
+    /// report an improvement by moving it out of sight.
+    ///
+    /// Counted on the uncached path only, like every other read counter: a
+    /// value served from the blob cache asks the filesystem for nothing.
+    pub(crate) blob_bytes_io_requested: AtomicU64,
+
+    /// Blob value bytes produced after decompression, decryption and
+    /// validation — the blob-side twin of `block_bytes_decoded`, summed into
+    /// [`Metrics::bytes_decoded`] for the same reason.
+    pub(crate) blob_bytes_decoded: AtomicU64,
 
     /// Number of index block bytes that were requested from OS or disk
     pub(crate) index_block_io_requested: AtomicU64,
@@ -151,32 +221,91 @@ impl Metrics {
         }
     }
 
-    /// Number of I/O data block bytes transferred from disk or OS page cache.
+    /// Data block bytes requested from the `Fs` trait by reads callers made.
+    ///
+    /// Charged when each read is issued, so a read that then fails its
+    /// checksum, decryption or decompression is counted; maintenance and
+    /// monitoring reads are not. See [`Self::bytes_read`].
     pub fn data_block_io(&self) -> u64 {
         self.data_block_io_requested.load(Relaxed)
     }
 
-    /// Number of I/O index block bytes transferred from disk or OS page cache.
+    /// Index block bytes requested from the `Fs` trait, on the same terms as
+    /// [`Self::data_block_io`].
     pub fn index_block_io(&self) -> u64 {
         self.index_block_io_requested.load(Relaxed)
     }
 
-    /// Number of I/O filter block bytes transferred from disk or OS page cache.
+    /// Filter block bytes requested from the `Fs` trait, on the same terms as
+    /// [`Self::data_block_io`].
     pub fn filter_block_io(&self) -> u64 {
         self.filter_block_io_requested.load(Relaxed)
     }
 
-    /// Number of I/O range tombstone block bytes transferred from disk or OS page cache.
+    /// Range tombstone block bytes requested from the `Fs` trait, on the same
+    /// terms as [`Self::data_block_io`].
     pub fn range_tombstone_block_io(&self) -> u64 {
         self.range_tombstone_block_io_requested.load(Relaxed)
     }
 
-    /// Number of I/O block bytes transferred from disk or OS page cache.
+    /// Block bytes requested from the `Fs` trait over every block role, on the
+    /// same terms as [`Self::data_block_io`].
     pub fn block_io(&self) -> u64 {
         self.data_block_io_requested.load(Relaxed)
             + self.index_block_io_requested.load(Relaxed)
             + self.filter_block_io_requested.load(Relaxed)
             + self.range_tombstone_block_io_requested.load(Relaxed)
+    }
+
+    /// Payload bytes the block transform produced — see
+    /// [`Self::bytes_read`] for the figure this is paired with.
+    ///
+    /// Read and decoded are reported together or not at all: each alone is
+    /// misleading. Read without decoded hides a projection that loads and
+    /// decompresses everything it then discards; decoded without read hides a
+    /// change that decodes the same amount from far more I/O.
+    pub fn bytes_decoded(&self) -> u64 {
+        self.block_bytes_decoded.load(Relaxed) + self.blob_bytes_decoded.load(Relaxed)
+    }
+
+    /// Bytes requested from the `Fs` trait: every block role, plus the blob
+    /// records a key-value-separated tree resolves.
+    ///
+    /// Wider than [`Self::block_io`] on purpose. A separated value's bytes
+    /// leave the filesystem through the blob path rather than through a block,
+    /// and a figure that omitted them would report a tree that reads gigabytes
+    /// as reading only its indirections.
+    ///
+    /// Reported with [`Self::bytes_decoded`] and [`Self::bytes_copied`]; the
+    /// three are one family.
+    pub fn bytes_read(&self) -> u64 {
+        self.block_io() + self.blob_bytes_io_requested.load(Relaxed)
+    }
+
+    /// Bytes requested from the `Fs` trait for separated values alone.
+    ///
+    /// The blob-only share of [`Self::bytes_read`], so a scan can be asked
+    /// whether it paid for the blobs of rows it then discarded.
+    pub fn blob_bytes_read(&self) -> u64 {
+        self.blob_bytes_io_requested.load(Relaxed)
+    }
+
+    /// Bytes moved by a gather — accumulation, filtering, row gathering and
+    /// row-value reconstruction. The exact set is on the field.
+    ///
+    /// Interpreted per input byte: a path that materialises its working set
+    /// once sits near a small constant, and one that re-gathers repeatedly
+    /// grows with the number of passes rather than with the data.
+    pub fn bytes_copied(&self) -> u64 {
+        self.bytes_copied.load(Relaxed)
+    }
+
+    /// Charges one gather: `bytes` is the size of the buffer it built. Every
+    /// site in the named set calls this, so the set and its instrumentation
+    /// cannot drift apart one path at a time.
+    #[inline]
+    pub(crate) fn record_gather(&self, bytes: usize) {
+        self.bytes_copied.fetch_add(bytes as u64, Relaxed);
     }
 
     /// Number of data blocks that were accessed.

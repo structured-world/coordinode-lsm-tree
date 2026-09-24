@@ -230,6 +230,8 @@ impl Tree {
             seqno,
             lo,
             hi,
+            #[cfg(feature = "metrics")]
+            metrics: self.0.metrics.clone(),
         })
     }
 }
@@ -283,6 +285,35 @@ pub struct ColumnarScan {
     /// drop the rows that fall outside it.
     lo: Bound<UserKey>,
     hi: Bound<UserKey>,
+
+    /// Where this scan's gather cost is recorded. Held rather than reached
+    /// for through the tree because the scan outlives the call that built it.
+    #[cfg(feature = "metrics")]
+    metrics: alloc::sync::Arc<crate::Metrics>,
+}
+
+impl ColumnarScan {
+    /// Records the bytes a gather moved.
+    ///
+    /// The figure is the SIZE OF THE RESULT — what the operation wrote into a
+    /// new buffer — which is what makes repeated accumulation visible:
+    /// folding `k` batches one at a time records the whole accumulated size
+    /// `k` times, so the counter grows quadratically exactly where the work
+    /// does, while a single pass over the same data records it once.
+    #[inline]
+    #[cfg_attr(
+        not(feature = "metrics"),
+        expect(
+            clippy::unused_self,
+            reason = "the scan's metrics exist only with the feature"
+        )
+    )]
+    fn record_gather(&self, batch: &ColumnBatch) {
+        #[cfg(feature = "metrics")]
+        self.metrics.record_gather(batch.data_size());
+        #[cfg(not(feature = "metrics"))]
+        let _ = batch;
+    }
 }
 
 impl ColumnarScan {
@@ -356,35 +387,57 @@ impl ColumnarScan {
     /// masking arithmetic elsewhere translates the THRESHOLD into local space
     /// instead (cheaper, one subtraction per segment), which is why the column
     /// itself still needs this before it reaches a caller. A zero offset leaves
-    /// the batch untouched.
-    fn globalize_seqnos(batch: &mut ColumnBatch, global: SeqNo) -> crate::Result<()> {
+    /// the batch untouched. The rewritten column is a gather and is charged.
+    #[cfg_attr(
+        not(feature = "metrics"),
+        expect(
+            clippy::unused_self,
+            reason = "the scan's metrics exist only with the feature"
+        )
+    )]
+    fn globalize_seqnos(&self, batch: &mut ColumnBatch, global: SeqNo) -> crate::Result<()> {
         if global == 0 {
             return Ok(());
         }
         let Some(col) = batch.columns.iter_mut().find(|c| c.column_id == COL_SEQNO) else {
             return Ok(());
         };
-        // Column bytes are an immutable (possibly shared) view, so the
-        // globalized column is rebuilt into an owned buffer — one allocation
-        // per batch, and only for bulk-ingested segments (`global != 0`).
-        let mut out = alloc::vec::Vec::with_capacity(batch.row_count as usize * 8);
-        for row in 0..batch.row_count as usize {
-            let at = row * 8;
-            let bytes = col
-                .data
-                .get(at..at + 8)
-                .ok_or(Error::InvalidHeader("columnar_scan: short seqno column"))?;
-            let local = u64::from_le_bytes(
-                bytes
-                    .try_into()
-                    .map_err(|_| Error::InvalidHeader("columnar_scan: short seqno column"))?,
-            );
-            let effective = local.checked_add(global).ok_or(Error::InvalidHeader(
-                "columnar_scan: effective seqno overflows",
-            ))?;
-            out.extend_from_slice(&effective.to_le_bytes());
+        let len = batch.row_count as usize * 8;
+        if col.data.len() != len {
+            return Err(Error::InvalidHeader("columnar_scan: short seqno column"));
         }
-        col.data = crate::Slice::from(out);
+        // Column bytes are an immutable (possibly shared) view, so the
+        // globalized column is rebuilt into a new buffer, written in place:
+        // one allocation per batch, and only for bulk-ingested segments
+        // (`global != 0`).
+        // SAFETY: the loop writes one 8-byte seqno per row, and `len` is
+        // exactly `row_count * 8`, which the source column matches, so every
+        // byte is initialized before the buffer is frozen and read. An early
+        // return on overflow drops the builder unread.
+        #[expect(unsafe_code, reason = "see safety")]
+        let mut out = unsafe { crate::Slice::builder_unzeroed(len) };
+        for (row, (dst, src)) in out
+            .chunks_exact_mut(8)
+            .zip(col.data.chunks_exact(8))
+            .enumerate()
+        {
+            let mut local = [0u8; 8];
+            local.copy_from_slice(src);
+            let Some(effective) = u64::from_le_bytes(local).checked_add(global) else {
+                // The rows before this one were already rewritten.
+                #[cfg(feature = "metrics")]
+                self.metrics.record_gather(row * 8);
+                #[cfg(not(feature = "metrics"))]
+                let _ = row;
+                return Err(Error::InvalidHeader(
+                    "columnar_scan: effective seqno overflows",
+                ));
+            };
+            dst.copy_from_slice(&effective.to_le_bytes());
+        }
+        col.data = crate::Slice::from(out.freeze());
+        #[cfg(feature = "metrics")]
+        self.metrics.record_gather(len);
         Ok(())
     }
 
@@ -428,7 +481,7 @@ impl ColumnarScan {
                 .columnar_scan(&self.projection, self.predicate.as_ref())?;
             out.retain(|b| b.row_count > 0);
             for batch in &mut out {
-                Self::globalize_seqnos(batch, seg.global)?;
+                self.globalize_seqnos(batch, seg.global)?;
             }
             return Ok(out);
         }
@@ -505,7 +558,8 @@ impl ColumnarScan {
                 };
                 mask.push(keep);
             }
-            let mut visible = filter_batch(&batch, &mask);
+            let mut visible = filter_batch(&batch, &mask)?;
+            self.record_gather(&visible);
             if partial && !seqno_projected {
                 visible.columns.retain(|c| c.column_id != COL_SEQNO);
             }
@@ -513,7 +567,7 @@ impl ColumnarScan {
                 visible.columns.retain(|c| c.column_id != COL_USER_KEY);
             }
             if visible.row_count > 0 {
-                Self::globalize_seqnos(&mut visible, seg.global)?;
+                self.globalize_seqnos(&mut visible, seg.global)?;
                 out.push(visible);
             }
         }
@@ -681,11 +735,13 @@ impl ColumnarScan {
                 mask.push(!range_filter || key_in_bounds(key, &self.lo, &self.hi, cmp));
             }
 
-            let mut visible = filter_batch(&batch, &mask);
+            let mut visible = filter_batch(&batch, &mask)?;
+            self.record_gather(&visible);
             // The predicate runs on the deduped survivors only (see doc).
             if let Some(pred) = self.predicate.as_ref() {
                 let pred_mask = pred.matching_rows(&visible);
-                visible = filter_batch(&visible, &pred_mask);
+                visible = filter_batch(&visible, &pred_mask)?;
+                self.record_gather(&visible);
             }
             // Match the singleton contract: yield exactly the projected columns.
             if !key_projected {
@@ -703,7 +759,7 @@ impl ColumnarScan {
                 visible.columns.retain(|c| c.column_id != pc);
             }
             if visible.row_count > 0 {
-                Self::globalize_seqnos(&mut visible, seg.global)?;
+                self.globalize_seqnos(&mut visible, seg.global)?;
                 out.push(visible);
             }
         }
@@ -793,12 +849,19 @@ impl ColumnarScan {
                         source_rank.push(seg.recency_rank);
                     }
                 }
-                let visible = filter_batch(&batch, &mask);
+                let visible = filter_batch(&batch, &mask)?;
+                self.record_gather(&visible);
                 if visible.row_count == 0 {
                     continue;
                 }
                 match &mut combined {
-                    Some(acc) => acc.append(&visible)?,
+                    Some(acc) => {
+                        acc.append(&visible)?;
+                        // The accumulated batch, not the appended one: append
+                        // rebuilds the whole thing, so this is where the fold
+                        // over k batches shows its k-squared shape.
+                        self.record_gather(acc);
+                    }
                     None => combined = Some(visible),
                 }
             }
@@ -901,6 +964,7 @@ impl ColumnarScan {
         }
 
         let mut merged = take_rows(&combined, &kept)?;
+        self.record_gather(&merged);
 
         // The union spans segments with DIFFERENT offsets, so no single one
         // applies: write each surviving row's effective seqno — already computed
@@ -909,16 +973,25 @@ impl ColumnarScan {
         // `merged` still corresponds to `kept[i]`.
         if let Some(col) = merged.columns.iter_mut().find(|c| c.column_id == COL_SEQNO) {
             // Column bytes are an immutable (possibly shared) view — rebuild
-            // the globalized column into an owned buffer (one per merged batch
-            // on this multi-segment path).
-            let mut out = alloc::vec::Vec::with_capacity(kept.len() * 8);
-            for &i in &kept {
-                out.extend_from_slice(&eff_at(i).to_le_bytes());
-            }
-            if out.len() != col.data.len() {
+            // the globalized column into a new buffer (one per merged batch on
+            // this multi-segment path), written in place so it is copied once.
+            let len = kept.len() * 8;
+            if len != col.data.len() {
                 return Err(Error::InvalidHeader("columnar_scan: short seqno column"));
             }
-            col.data = crate::Slice::from(out);
+            // SAFETY: the loop writes one 8-byte seqno per kept row, and `len`
+            // is exactly `kept.len() * 8`, so every byte is initialized before
+            // the buffer is frozen and read.
+            #[expect(unsafe_code, reason = "see safety")]
+            let mut out = unsafe { crate::Slice::builder_unzeroed(len) };
+            for (dst, &i) in out.chunks_exact_mut(8).zip(&kept) {
+                dst.copy_from_slice(&eff_at(i).to_le_bytes());
+            }
+            col.data = crate::Slice::from(out.freeze());
+            // A gather of its own: the seqnos `take_rows` just copied are
+            // copied again into this column, which replaces them.
+            #[cfg(feature = "metrics")]
+            self.metrics.record_gather(len);
         }
 
         // Apply the row predicate AFTER newest-version dedup: each surviving row is
@@ -927,7 +1000,8 @@ impl ColumnarScan {
         // older matching version.
         if let Some(pred) = self.predicate.as_ref() {
             let mask = pred.matching_rows(&merged);
-            merged = filter_batch(&merged, &mask);
+            merged = filter_batch(&merged, &mask)?;
+            self.record_gather(&merged);
         }
 
         // Match the singleton contract: yield exactly the projected columns.
@@ -1009,3 +1083,6 @@ fn bound_as_ref(bound: &Bound<UserKey>) -> Bound<&[u8]> {
         Bound::Unbounded => Bound::Unbounded,
     }
 }
+
+#[cfg(all(test, feature = "metrics"))]
+mod tests;

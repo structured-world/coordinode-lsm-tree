@@ -969,6 +969,246 @@ fn verify_blob_links_rejects_an_undercounted_suffix_id_on_a_restricted_view() ->
     Ok(())
 }
 
+/// Verifying a restricted view's blob links walks its live suffix through the
+/// range reader, where the unrestricted check reads the file directly. Both
+/// are verification, not a caller's read: neither is counted, and neither
+/// fills the block cache the workload is using, so a scrub reconciling a
+/// restricted table leaves no trace a foreground measurement could see.
+#[cfg(all(feature = "metrics", feature = "std"))]
+#[test]
+fn verify_blob_links_on_a_restricted_view_counts_and_caches_nothing() -> crate::Result<()> {
+    use crate::blob_tree::handle::BlobIndirection;
+    use crate::coding::Encode;
+    use crate::vlog::ValueHandle;
+    use crate::{InternalValue, ValueType};
+
+    let dir = tempdir()?;
+    let file = dir.path().join("0");
+    let checksum = {
+        let mut w = Writer::new(file.clone(), 0, 0, Arc::new(StdFs))?.use_data_block_size(128);
+        for i in 0u64..10 {
+            let value = BlobIndirection {
+                size: 1000,
+                vhandle: ValueHandle {
+                    blob_file_id: i,
+                    on_disk_size: 500,
+                    offset: 0,
+                },
+            }
+            .encode_into_vec();
+            w.write(InternalValue::from_components(
+                format!("key{i:05}").into_bytes(),
+                value,
+                i + 1,
+                ValueType::Indirection,
+            ))?;
+            w.link_blob_file(i, 1, 1000, 500);
+        }
+        w.finish()?.expect("the SST is non-empty").1
+    };
+
+    let cache = Arc::new(crate::Cache::with_capacity_bytes(1 << 20));
+    let mut params = test_recover_params(file, checksum);
+    params.cache = cache.clone();
+    params.metrics = Arc::new(Metrics::default());
+    let metrics = params.metrics.clone();
+    let restricted =
+        Table::recover(params)?.reopen_restricted(crate::UserKey::from(&b"key00005"[..]))?;
+
+    let (read, decoded, copied) = (
+        metrics.bytes_read(),
+        metrics.bytes_decoded(),
+        metrics.bytes_copied(),
+    );
+    let cached = cache.size();
+    restricted.verify_blob_links()?;
+    assert_eq!(
+        (
+            metrics.bytes_read(),
+            metrics.bytes_decoded(),
+            metrics.bytes_copied()
+        ),
+        (read, decoded, copied),
+        "the verification walk is not a caller's read",
+    );
+    assert_eq!(
+        cache.size(),
+        cached,
+        "the verification walk must not fill the block cache",
+    );
+    Ok(())
+}
+
+/// Verifying blob links reads the recorded `linked_blob_files` section as well
+/// as deriving it, and that read is verification too: it must not cache the
+/// table's descriptor.
+#[cfg(feature = "std")]
+#[test]
+fn verify_blob_links_leaves_the_descriptor_table_as_it_found_it() -> crate::Result<()> {
+    use crate::blob_tree::handle::BlobIndirection;
+    use crate::coding::Encode;
+    use crate::vlog::ValueHandle;
+    use crate::{InternalValue, ValueType};
+
+    let dir = tempdir()?;
+    let file = dir.path().join("0");
+    let checksum = {
+        let mut w = Writer::new(file.clone(), 0, 0, Arc::new(StdFs))?.use_data_block_size(128);
+        for i in 0u64..10 {
+            let value = BlobIndirection {
+                size: 1000,
+                vhandle: ValueHandle {
+                    blob_file_id: i,
+                    on_disk_size: 500,
+                    offset: 0,
+                },
+            }
+            .encode_into_vec();
+            w.write(InternalValue::from_components(
+                format!("key{i:05}").into_bytes(),
+                value,
+                i + 1,
+                ValueType::Indirection,
+            ))?;
+            w.link_blob_file(i, 1, 1000, 500);
+        }
+        w.finish()?.expect("the SST is non-empty").1
+    };
+
+    let descriptors = Arc::new(DescriptorTable::new(10));
+    let mut params = test_recover_params(file, checksum);
+    params.descriptor_table = Some(descriptors.clone());
+    let table = Table::recover(params)?;
+    table.file_accessor.remove_for_table(&table.global_id());
+    assert_eq!(descriptors.len(), 0, "precondition: the descriptor is cold");
+
+    table.verify_blob_links()?;
+    assert_eq!(
+        descriptors.len(),
+        0,
+        "verifying the table must not cache its descriptor",
+    );
+    Ok(())
+}
+
+/// An untraced read of a table whose descriptor is not cached opens the file
+/// for itself: putting the descriptor in the shared table would evict another
+/// one and turn a later caller's miss into a hit, a trace the read promised
+/// not to leave.
+#[cfg(feature = "std")]
+#[test]
+fn an_untraced_read_leaves_the_descriptor_table_as_it_found_it() -> crate::Result<()> {
+    let dir = tempdir()?;
+    let file = dir.path().join("0");
+    let checksum = {
+        let mut w = Writer::new(file.clone(), 0, 0, Arc::new(StdFs))?.use_data_block_size(128);
+        for i in 0u64..50 {
+            w.write(InternalValue::from_components(
+                format!("key{i:05}").into_bytes(),
+                b"value".to_vec(),
+                i + 1,
+                crate::ValueType::Value,
+            ))?;
+        }
+        w.finish()?.expect("the SST is non-empty").1
+    };
+    let descriptors = Arc::new(DescriptorTable::new(10));
+    let mut params = test_recover_params(file, checksum);
+    params.descriptor_table = Some(descriptors.clone());
+    let table = Table::recover(params)?;
+    table.file_accessor.remove_for_table(&table.global_id());
+    assert_eq!(descriptors.len(), 0, "precondition: the descriptor is cold");
+
+    let mut rows = 0;
+    for kv in table.range_iter(..).untraced() {
+        kv?;
+        rows += 1;
+    }
+    assert_eq!(rows, 50, "the untraced walk reads every row");
+    assert_eq!(
+        descriptors.len(),
+        0,
+        "an untraced read must not cache the descriptor it opened",
+    );
+    Ok(())
+}
+
+/// An untraced range read over a large zstd block must not take the partial
+/// decode path either: that path caches the decoded prefix and promotes it,
+/// which is exactly the trace an untraced read promises not to leave.
+#[cfg(all(feature = "zstd", feature = "std"))]
+#[test]
+fn an_untraced_bounded_range_leaves_no_partial_block_in_the_cache() -> crate::Result<()> {
+    use crate::{
+        AbstractTree, CompressionType, SequenceNumberCounter,
+        config::{BlockSizePolicy, CompressionPolicy},
+    };
+
+    // Engages the partial-decode path on this thread only: no environment
+    // mutation, and no dependence on which test first read the cached switch.
+    super::iter::force_partial_decode_on_this_thread();
+
+    let dir = tempdir()?;
+    let crate::AnyTree::Standard(tree) = crate::Config::new(
+        dir.path(),
+        SequenceNumberCounter::default(),
+        SequenceNumberCounter::default(),
+    )
+    .data_block_compression_policy(CompressionPolicy::all(CompressionType::zstd(19)?))
+    .data_block_size_policy(BlockSizePolicy::all(512 * 1024))
+    .open()?
+    else {
+        unreachable!("standard tree configured");
+    };
+    for i in 0u64..20_000 {
+        tree.insert(
+            format!("key-{i:08}"),
+            format!("value-{i:08}-padding-padding"),
+            0,
+        );
+    }
+    tree.flush_active_memtable(0)?;
+    let binding = tree.version_history.read().latest_version();
+    let Some(table) = binding.version.iter_tables().next() else {
+        unreachable!("flush produced one table");
+    };
+
+    let first_block = table
+        .untraced_index_walk()
+        .next()
+        .expect("the table has a data block")?
+        .offset();
+    let cached = table.cache.size();
+    let bounded =
+        || crate::UserKey::from(&b"key-00000010"[..])..crate::UserKey::from(&b"key-00000030"[..]);
+    let mut rows = 0;
+    for kv in table.range_iter(bounded()).untraced() {
+        kv?;
+        rows += 1;
+    }
+    assert_eq!(rows, 20, "the bounded range reads its rows");
+    assert_eq!(
+        table.cache.size(),
+        cached,
+        "an untraced read must not cache a partial block",
+    );
+
+    // The same range read with a trace does leave a partial block: the switch
+    // above took effect in this process and the fixture reaches the partial
+    // tier, so the assertion above tested the guard, not a full-block path.
+    for kv in table.range_iter(bounded()) {
+        kv?;
+    }
+    assert!(
+        table
+            .cache
+            .peek_partial_block(table.global_id(), first_block)
+            .is_some(),
+        "precondition: a traced bounded range takes the partial decode path",
+    );
+    Ok(())
+}
+
 /// An `Fs` that forwards to `MemFs` but reports the CONFIGURED hard-link count
 /// for every file, so the punch path's shared-inode guard can be exercised —
 /// including a checkpoint's link later disappearing (MemFs copies on
@@ -1655,7 +1895,7 @@ fn live_item_count_drops_the_straddling_block_rows_below_the_bound() -> crate::R
             );
             assert_eq!(
                 5,
-                restricted.live_item_count()?,
+                restricted.live_item_count(crate::table::util::ReadCharge::Maintenance)?,
                 "a zone-mapped view counts the straddling block's live suffix, \
                  not its whole row count",
             );
@@ -1664,6 +1904,294 @@ fn live_item_count_drops_the_straddling_block_rows_below_the_bound() -> crate::R
         Some(4),
         Some(|w: Writer| w.use_zone_map(true)),
     )
+}
+
+/// A monitoring report counting a restricted view's live rows is not a read:
+/// charging its cold straddling block to the read counters would make a
+/// workload's figures depend on whether anything polled the report while it
+/// ran.
+#[cfg(feature = "metrics")]
+#[test]
+fn live_item_count_for_maintenance_over_a_cold_straddling_block_counts_no_bytes()
+-> crate::Result<()> {
+    test_with_table(
+        &twelve_letter_items(),
+        |table| {
+            let restricted = table.with_restriction(crate::UserKey::from(&b"h"[..]));
+            let metrics = &restricted.metrics;
+            let before = (
+                metrics.bytes_read(),
+                metrics.bytes_decoded(),
+                metrics.bytes_copied(),
+            );
+            assert_eq!(
+                5,
+                restricted.live_item_count(crate::table::util::ReadCharge::Maintenance)?
+            );
+            assert_eq!(
+                (
+                    metrics.bytes_read(),
+                    metrics.bytes_decoded(),
+                    metrics.bytes_copied(),
+                ),
+                before,
+                "a report's live-row count must not reach the read counters",
+            );
+            Ok(())
+        },
+        Some(4),
+        Some(|w: Writer| w.use_zone_map(true)),
+    )
+}
+
+/// The planner's estimate is part of the query it plans, so the blocks it
+/// reads to count a restricted view's live rows are charged like the query's
+/// own reads.
+#[cfg(feature = "metrics")]
+#[test]
+fn live_item_count_for_a_query_over_a_cold_straddling_block_counts_its_reads() -> crate::Result<()>
+{
+    test_with_table(
+        &twelve_letter_items(),
+        |table| {
+            let restricted = table.with_restriction(crate::UserKey::from(&b"h"[..]));
+            let metrics = &restricted.metrics;
+            let (read, decoded) = (metrics.bytes_read(), metrics.bytes_decoded());
+            assert_eq!(
+                5,
+                restricted.live_item_count(crate::table::util::ReadCharge::Foreground)?
+            );
+            assert!(
+                metrics.bytes_read() > read && metrics.bytes_decoded() > decoded,
+                "the straddling block a query's estimate reads must be counted",
+            );
+            Ok(())
+        },
+        Some(4),
+        Some(|w: Writer| w.use_zone_map(true)),
+    )
+}
+
+/// A table with Page ECC, one data block per key `a..=h`, and an index split
+/// into several partitions, so every index walk loads partitions through
+/// `cache`.
+#[cfg(all(feature = "metrics", feature = "page_ecc", feature = "std"))]
+fn ecc_two_level_table(
+    dir: &tempfile::TempDir,
+    cache: Arc<crate::Cache>,
+) -> crate::Result<(Table, std::path::PathBuf)> {
+    let (file, checksum) = write_ecc_two_level_table(dir, false)?;
+    Ok((recover_with_cache(&file, checksum, cache)?, file))
+}
+
+#[cfg(all(feature = "metrics", feature = "page_ecc", feature = "std"))]
+fn recover_with_cache(
+    file: &std::path::Path,
+    checksum: crate::Checksum,
+    cache: Arc<crate::Cache>,
+) -> crate::Result<Table> {
+    let mut params = test_recover_params(file.to_path_buf(), checksum);
+    params.cache = cache;
+    params.metrics = Arc::new(Metrics::default());
+    let table = Table::recover(params)?;
+    assert!(
+        table.metadata.index_block_count > 1,
+        "the fixture must split its index into partitions",
+    );
+    Ok(table)
+}
+
+/// Writes the table [`ecc_two_level_table`] opens, with a retrieval locator
+/// when `locator` is set.
+#[cfg(all(feature = "metrics", feature = "page_ecc", feature = "std"))]
+fn write_ecc_two_level_table(
+    dir: &tempfile::TempDir,
+    locator: bool,
+) -> crate::Result<(std::path::PathBuf, crate::Checksum)> {
+    let file = dir.path().join("table");
+    let mut writer = Writer::new(file.clone(), 0, 0, Arc::new(StdFs))?
+        .use_ecc(Some(crate::table::block::EccParams::RS_4_2))
+        .use_partitioned_index()
+        .use_data_block_size(1)
+        .use_meta_partition_size(3);
+    if locator {
+        writer = writer.use_locator(crate::config::LocatorPolicyEntry::Enabled {
+            precision: crate::config::LocatorPrecision::Restart,
+            block_id_bits: None,
+            slot_bits: None,
+        });
+    }
+    for (i, key) in [b"a", b"b", b"c", b"d", b"e", b"f", b"g", b"h"]
+        .into_iter()
+        .enumerate()
+    {
+        writer.write(InternalValue::from_components(
+            key.as_slice(),
+            b"value-payload-bytes",
+            u64::try_from(i).expect("small") + 1,
+            crate::ValueType::Value,
+        ))?;
+    }
+    let (_, checksum) = writer.finish()?.expect("the fixture writes entries");
+    Ok((file, checksum))
+}
+
+/// Flips one payload bit of the block at `offset`, which Page ECC repairs on
+/// the next read.
+#[cfg(all(feature = "metrics", feature = "page_ecc", feature = "std"))]
+fn flip_payload_bit(table: &Table, file: &std::path::Path, offset: u64) -> crate::Result<()> {
+    let mut bytes = std::fs::read(file)?;
+    let pos = usize::try_from(offset).expect("offset fits usize")
+        + crate::table::block::Header::MIN_LEN
+        + 3;
+    bytes[pos] ^= 0x80;
+    std::fs::write(file, &bytes)?;
+    table.file_accessor.remove_for_table(&table.global_id());
+    Ok(())
+}
+
+/// A report reading a block that Page ECC repairs keeps the tree's ECC health
+/// counters: they are the latent bit-rot signal, and hiding a fault because a
+/// report found it leaves the medium's decay invisible.
+#[cfg(all(feature = "metrics", feature = "page_ecc", feature = "std"))]
+#[test]
+fn live_item_count_for_a_report_over_a_repaired_block_counts_the_repair() -> crate::Result<()> {
+    let dir = tempdir()?;
+    let (table, file) = ecc_two_level_table(&dir, Arc::new(crate::Cache::with_capacity_bytes(0)))?;
+    let restricted = table.with_restriction(crate::UserKey::from(&b"d"[..]));
+    let straddle = restricted.punch_offset_for(b"d")?;
+    assert!(straddle > 0, "the fixture must punch a real prefix");
+    flip_payload_bit(&table, &file, straddle)?;
+
+    let before = table.metrics.ecc_recovered_count();
+    assert_eq!(
+        5,
+        restricted.live_item_count(crate::table::util::ReadCharge::Untraced)?
+    );
+    assert!(
+        table.metrics.ecc_recovered_count() > before,
+        "the repair a report's read made must reach the ECC counters",
+    );
+    Ok(())
+}
+
+/// A maintenance walk of a partitioned index keeps the ECC health counters
+/// for the partitions Page ECC repairs, as a foreground walk does.
+#[cfg(all(feature = "metrics", feature = "page_ecc", feature = "std"))]
+#[test]
+fn a_maintenance_index_walk_over_a_repaired_partition_counts_the_repair() -> crate::Result<()> {
+    let dir = tempdir()?;
+    let (table, file) = ecc_two_level_table(&dir, Arc::new(crate::Cache::with_capacity_bytes(0)))?;
+    let last = table
+        .block_index
+        .iter()
+        .next_back()
+        .expect("the table has data blocks")?;
+    // The index partitions follow the data section.
+    let first_partition = last.offset().0 + u64::from(last.size());
+    flip_payload_bit(&table, &file, first_partition)?;
+
+    let before = table.metrics.ecc_recovered_count();
+    table
+        .maintenance_index_walk()
+        .collect::<crate::Result<Vec<_>>>()?;
+    let after_maintenance = table.metrics.ecc_recovered_count();
+    table
+        .block_index
+        .iter()
+        .collect::<crate::Result<Vec<_>>>()?;
+    assert!(
+        table.metrics.ecc_recovered_count() > after_maintenance,
+        "the fixture must corrupt a partition a walk repairs",
+    );
+    assert!(
+        after_maintenance > before,
+        "the repair a maintenance walk made must reach the ECC counters",
+    );
+    Ok(())
+}
+
+/// The reconcile gates verify a table, which is maintenance: walking a cold
+/// partitioned index to pair the locator with its blocks must stay out of the
+/// read counters like every other gate's walk.
+#[cfg(all(feature = "metrics", feature = "page_ecc", feature = "std"))]
+#[test]
+fn reconcile_gates_over_a_cold_index_count_no_bytes() -> crate::Result<()> {
+    let dir = tempdir()?;
+    let (file, checksum) = write_ecc_two_level_table(&dir, true)?;
+    let table = recover_with_cache(
+        &file,
+        checksum,
+        Arc::new(crate::Cache::with_capacity_bytes(0)),
+    )?;
+    assert!(
+        table.regions.locator.is_some(),
+        "the fixture must carry a locator for the gate to pair",
+    );
+    let metrics = &table.metrics;
+    let before = (metrics.bytes_read(), metrics.bytes_decoded());
+    if let Err((gate, e)) = table.verify_reconcile_gates(None, false) {
+        panic!("a healthy table must pass every gate, {gate:?} refused it: {e}");
+    }
+    assert_eq!(
+        (metrics.bytes_read(), metrics.bytes_decoded()),
+        before,
+        "the reconcile gates' index walks must not reach the read counters",
+    );
+    Ok(())
+}
+
+/// A report leaves the block cache as it found it: a block it loaded and
+/// cached would turn a later cold read into a hit, and the read counters of
+/// whatever runs next would depend on whether the report was polled.
+#[cfg(all(feature = "metrics", feature = "page_ecc", feature = "std"))]
+#[test]
+fn live_item_count_for_a_report_caches_nothing() -> crate::Result<()> {
+    let dir = tempdir()?;
+    let (file, checksum) = write_ecc_two_level_table(&dir, false)?;
+    // The offsets are found on an uncached instance, so the report below
+    // starts from a cache nothing has touched.
+    let (straddle, first_partition) = {
+        let probe = recover_with_cache(
+            &file,
+            checksum,
+            Arc::new(crate::Cache::with_capacity_bytes(0)),
+        )?;
+        let last = probe
+            .block_index
+            .iter()
+            .next_back()
+            .expect("the table has data blocks")?;
+        (
+            probe.punch_offset_for(b"d")?,
+            last.offset().0 + u64::from(last.size()),
+        )
+    };
+    let table = recover_with_cache(
+        &file,
+        checksum,
+        Arc::new(crate::Cache::with_capacity_bytes(10_000_000)),
+    )?;
+    let restricted = table.with_restriction(crate::UserKey::from(&b"d"[..]));
+
+    assert_eq!(
+        5,
+        restricted.live_item_count(crate::table::util::ReadCharge::Untraced)?
+    );
+    let id = table.global_id();
+    assert!(
+        !table
+            .cache
+            .has_block(id, crate::table::BlockOffset(straddle)),
+        "a report must not cache the straddling block it read",
+    );
+    assert!(
+        !table
+            .cache
+            .has_block(id, crate::table::BlockOffset(first_partition)),
+        "a report must not cache the index partitions it walked",
+    );
+    Ok(())
 }
 
 /// Without a zone map the count is apportioned over data bytes, but the
@@ -1675,7 +2203,7 @@ fn live_item_count_apportions_only_the_blocks_above_the_straddling_one() -> crat
         &twelve_letter_items(),
         |table| {
             let restricted = table.with_restriction(crate::UserKey::from(&b"h"[..]));
-            let live = restricted.live_item_count()?;
+            let live = restricted.live_item_count(crate::table::util::ReadCharge::Maintenance)?;
             // Exact for the straddling block (1 entry), apportioned by bytes
             // above it (~4 entries) — so within a block's granularity of the
             // true 5, and well below the 8 that counting the straddling block
@@ -3419,6 +3947,7 @@ fn load_block_range_tombstone_metrics() -> crate::Result<()> {
         None,
         #[cfg(feature = "metrics")]
         &metrics,
+        crate::table::util::ReadCharge::Foreground,
     )?;
 
     assert_eq!(1, metrics.range_tombstone_block_load_io.load(Relaxed));
@@ -3442,6 +3971,7 @@ fn load_block_range_tombstone_metrics() -> crate::Result<()> {
         None,
         #[cfg(feature = "metrics")]
         &metrics,
+        crate::table::util::ReadCharge::Foreground,
     )?;
 
     assert_eq!(1, metrics.range_tombstone_block_load_io.load(Relaxed));
@@ -3516,6 +4046,7 @@ fn load_block_cache_hit_rejects_wrong_block_type() -> crate::Result<()> {
         None,
         #[cfg(feature = "metrics")]
         &metrics,
+        crate::table::util::ReadCharge::Foreground,
     )?;
 
     // Now request the same offset but claim it is a Data block.  The block is
@@ -3536,6 +4067,7 @@ fn load_block_cache_hit_rejects_wrong_block_type() -> crate::Result<()> {
         None,
         #[cfg(feature = "metrics")]
         &metrics,
+        crate::table::util::ReadCharge::Foreground,
     );
 
     assert!(
@@ -3543,6 +4075,721 @@ fn load_block_cache_hit_rejects_wrong_block_type() -> crate::Result<()> {
         "expected InvalidTag for block type mismatch on cache hit, got Ok or wrong Err",
     );
 
+    Ok(())
+}
+
+/// A block read from disk under the wrong role is rejected only after its
+/// transform ran, so the decoded bytes it produced are counted: decoded is
+/// what the transform output, whether or not the caller could use it.
+#[cfg(feature = "metrics")]
+#[test]
+fn a_block_rejected_for_its_role_counts_what_its_transform_decoded() -> crate::Result<()> {
+    use crate::{
+        CompressionType,
+        cache::Cache,
+        table::{block::BlockType, util::load_block},
+    };
+
+    let dir = tempdir()?;
+    let file = dir.path().join("table");
+    let mut writer = Writer::new(file.clone(), 0, 0, Arc::new(StdFs))?;
+    writer.write(InternalValue::from_components(
+        b"a",
+        b"v1",
+        1,
+        crate::ValueType::Value,
+    ))?;
+    let (_, checksum) = writer
+        .finish()?
+        .expect("finish() returns Some after writing data items");
+
+    let metrics = Arc::new(crate::metrics::Metrics::default());
+    let table = {
+        let mut params = test_recover_params(file, checksum);
+        params.cache = Arc::new(Cache::with_capacity_bytes(10_000_000));
+        params.metrics = metrics.clone();
+        Table::recover(params)?
+    };
+
+    let decoded_before = metrics.bytes_decoded();
+    let result = load_block(
+        table.global_id(),
+        &table.path,
+        &table.file_accessor,
+        &Cache::with_capacity_bytes(10_000_000),
+        &table.regions.tli,
+        BlockType::Data,
+        CompressionType::None,
+        None,
+        None,
+        #[cfg(zstd_any)]
+        None,
+        None,
+        &metrics,
+        crate::table::util::ReadCharge::Foreground,
+    );
+    assert!(
+        matches!(&result, Err(crate::Error::InvalidTag(("BlockType", _)))),
+        "the index block must be refused as a data block",
+    );
+    assert!(
+        metrics.bytes_decoded() > decoded_before,
+        "the transform ran before the role check, so its output must be counted",
+    );
+
+    Ok(())
+}
+
+/// A one-row table opened with its own metrics, plus the on-disk bytes of its
+/// top-level index block: a checksum-valid block whose role is not Data, which
+/// is what a misdirected data-block handle lands on.
+#[cfg(feature = "metrics")]
+fn one_row_table_and_its_index_frame(
+    dir: &tempfile::TempDir,
+) -> crate::Result<(Table, Arc<crate::metrics::Metrics>, Vec<u8>)> {
+    let file = dir.path().join("table");
+    let mut writer = Writer::new(file.clone(), 0, 0, Arc::new(StdFs))?;
+    writer.write(InternalValue::from_components(
+        b"a",
+        b"v1",
+        1,
+        crate::ValueType::Value,
+    ))?;
+    let (_, checksum) = writer
+        .finish()?
+        .expect("finish() returns Some after writing data items");
+
+    let metrics = Arc::new(crate::metrics::Metrics::default());
+    let table = {
+        let mut params = test_recover_params(file.clone(), checksum);
+        params.cache = Arc::new(crate::cache::Cache::with_capacity_bytes(10_000_000));
+        params.metrics = metrics.clone();
+        Table::recover(params)?
+    };
+
+    let tli = table.regions.tli;
+    let start = usize::try_from(tli.offset().0).expect("block offset fits usize");
+    let end = start + tli.size() as usize;
+    let frame = std::fs::read(&file)?
+        .get(start..end)
+        .expect("the index block lies within the file")
+        .to_vec();
+    Ok((table, metrics, frame))
+}
+
+/// What one transform of the index block produces, decoded under its real role
+/// against throwaway metrics.
+#[cfg(feature = "metrics")]
+fn index_frame_decoded_len(table: &Table) -> crate::Result<u64> {
+    let block = crate::table::util::load_block(
+        table.global_id(),
+        &table.path,
+        &table.file_accessor,
+        &crate::cache::Cache::with_capacity_bytes(10_000_000),
+        &table.regions.tli,
+        crate::table::block::BlockType::Index,
+        crate::CompressionType::None,
+        None,
+        None,
+        #[cfg(zstd_any)]
+        None,
+        None,
+        &crate::metrics::Metrics::default(),
+        crate::table::util::ReadCharge::Foreground,
+    )?;
+    Ok(block.data.len() as u64)
+}
+
+/// Every read path decodes a block before checking its output length against
+/// the header, so a block refused for that mismatch still counts what its
+/// transform produced: the file read, the batched prewarm and the chunked
+/// `multi_get` resolver alike. The payload checksum does not cover the
+/// declared length, so the frame below passes verification.
+#[cfg(feature = "metrics")]
+#[test]
+fn a_block_refused_for_its_declared_length_counts_what_its_transform_decoded() -> crate::Result<()>
+{
+    use crate::{
+        CompressionType,
+        cache::Cache,
+        coding::{Decode, Encode},
+        table::{
+            block::{BlockType, Header},
+            util::{decode_prewarmed_blocks, load_block},
+        },
+    };
+    use std::io::{Seek, Write};
+
+    let dir = tempdir()?;
+    let (table, metrics, frame) = one_row_table_and_its_index_frame(&dir)?;
+    let produced = index_frame_decoded_len(&table)?;
+
+    let header_len = Header::header_len(BlockType::Index);
+    let mut header = Header::decode_from(&mut &frame[..header_len])?;
+    header.uncompressed_length += 1;
+    let mut tampered = header.encode_into_vec();
+    tampered.extend_from_slice(&frame[header_len..]);
+    assert_eq!(tampered.len(), frame.len(), "the frame keeps its size");
+
+    let mut wf = std::fs::OpenOptions::new().write(true).open(&*table.path)?;
+    wf.seek(std::io::SeekFrom::Start(table.regions.tli.offset().0))?;
+    wf.write_all(&tampered)?;
+    wf.sync_all()?;
+
+    let decoded_before = metrics.bytes_decoded();
+    let result = load_block(
+        table.global_id(),
+        &table.path,
+        &table.file_accessor,
+        &Cache::with_capacity_bytes(10_000_000),
+        &table.regions.tli,
+        BlockType::Index,
+        CompressionType::None,
+        None,
+        None,
+        #[cfg(zstd_any)]
+        None,
+        None,
+        &metrics,
+        crate::table::util::ReadCharge::Foreground,
+    );
+    assert!(result.is_err(), "the length mismatch refuses the block");
+    assert_eq!(
+        metrics.bytes_decoded() - decoded_before,
+        produced,
+        "the file read's transform ran, so its output must be counted",
+    );
+
+    let cache = Cache::with_capacity_bytes(10_000_000);
+    let decoded_before = metrics.bytes_decoded();
+    decode_prewarmed_blocks(
+        table.global_id(),
+        &cache,
+        &[table.regions.tli],
+        &[&tampered],
+        BlockType::Index,
+        CompressionType::None,
+        None,
+        None,
+        #[cfg(zstd_any)]
+        None,
+        &metrics,
+    );
+    assert_eq!(
+        metrics.bytes_decoded() - decoded_before,
+        produced,
+        "the prewarm's transform ran, so its output must be counted",
+    );
+
+    let decoded_before = metrics.bytes_decoded();
+    assert!(
+        table.decode_data_block_from_bytes(&tampered).is_err(),
+        "the chunked resolver refuses the block too",
+    );
+    assert_eq!(
+        metrics.bytes_decoded() - decoded_before,
+        produced,
+        "the chunked resolver's transform ran, so its output must be counted",
+    );
+
+    Ok(())
+}
+
+/// A foreground read's confirming re-read is charged when it is issued, not
+/// before: one whose file cannot even be opened asked nothing of the
+/// filesystem, so nothing is counted.
+#[cfg(feature = "metrics")]
+#[test]
+fn a_confirming_reread_that_never_issues_counts_no_bytes() -> crate::Result<()> {
+    use crate::{
+        CompressionType,
+        heal_hints::HealHints,
+        table::{
+            block::BlockType,
+            util::{ReadCharge, maybe_record_persistent_heal},
+        },
+    };
+
+    let dir = tempdir()?;
+    let (table, metrics, _frame) = one_row_table_and_its_index_frame(&dir)?;
+    table.file_accessor.remove_for_table(&table.global_id());
+    let missing = dir.path().join("missing");
+
+    let sink = HealHints::default();
+    sink.set_enabled(true);
+    let (read_before, decoded_before) = (metrics.bytes_read(), metrics.bytes_decoded());
+    let scheduled = maybe_record_persistent_heal(
+        table.global_id(),
+        &missing,
+        &table.file_accessor,
+        &table.regions.tli,
+        BlockType::Index,
+        CompressionType::None,
+        None,
+        None,
+        #[cfg(zstd_any)]
+        None,
+        Some(&sink),
+        &metrics,
+        ReadCharge::Foreground,
+    );
+    assert!(!scheduled, "an unopenable file confirms nothing");
+    assert_eq!(
+        (metrics.bytes_read(), metrics.bytes_decoded()),
+        (read_before, decoded_before),
+        "no re-read was issued, so none may be counted",
+    );
+
+    Ok(())
+}
+
+/// Recovers `file` over a cold cache, with metrics of its own.
+#[cfg(feature = "metrics")]
+fn recover_counted(
+    file: &std::path::Path,
+    checksum: Checksum,
+) -> crate::Result<(Table, Arc<crate::metrics::Metrics>)> {
+    let metrics = Arc::new(crate::metrics::Metrics::default());
+    let mut params = test_recover_params(file.to_path_buf(), checksum);
+    params.cache = Arc::new(Cache::with_capacity_bytes(10_000_000));
+    params.metrics = metrics.clone();
+    Ok((Table::recover(params)?, metrics))
+}
+
+/// Repair's restriction bound reads data blocks to anchor on a key: that is
+/// maintenance, so a cold read there charges nothing to the read counters.
+#[cfg(all(feature = "metrics", feature = "std"))]
+#[test]
+fn a_repair_restriction_bound_counts_no_bytes() -> crate::Result<()> {
+    let dir = tempdir()?;
+    let file = dir.path().join("table");
+    let mut writer = Writer::new(file.clone(), 0, 0, Arc::new(StdFs))?.use_data_block_size(128);
+    for i in 0..50u32 {
+        writer.write(InternalValue::from_components(
+            format!("key{i:05}").into_bytes(),
+            b"value",
+            u64::from(i) + 1,
+            crate::ValueType::Value,
+        ))?;
+    }
+    let (_, checksum) = writer
+        .finish()?
+        .expect("finish() returns Some after writing data items");
+
+    let (table, metrics) = recover_counted(&file, checksum)?;
+    let geometry = PunchGeometry {
+        verdict: PunchProbe::Punched,
+        first_readable: None,
+        after_last_zeroed: Some(0),
+        irregular: false,
+    };
+    let before = (metrics.bytes_read(), metrics.bytes_decoded());
+    let bound = table.greedy_restriction_bound(&geometry)?;
+    assert!(bound.is_some(), "the walk anchors on the first block's key");
+    assert_eq!(
+        (metrics.bytes_read(), metrics.bytes_decoded()),
+        before,
+        "a repair walk is maintenance, not a caller's read",
+    );
+    Ok(())
+}
+
+/// Salvage verifies a columnar table's delete positions and re-emits its
+/// blocks masked: both read data blocks, and both are maintenance, so a cold
+/// read in either charges nothing to the read counters.
+#[cfg(all(feature = "metrics", feature = "columnar"))]
+#[test]
+fn salvage_reads_of_a_columnar_table_count_no_bytes() -> crate::Result<()> {
+    use crate::config::DeleteStrategy;
+
+    let dir = tempdir()?;
+    let file = dir.path().join("table");
+    let mut writer = Writer::new(file.clone(), 0, 0, Arc::new(StdFs))?
+        .use_columnar(true)
+        .use_zone_map(true)
+        .delete_strategy(DeleteStrategy::MergeOnRead);
+    for i in 0..64u32 {
+        writer.write(InternalValue::from_components(
+            format!("key{i:05}").into_bytes(),
+            b"value",
+            u64::from(i) + 1,
+            crate::ValueType::Value,
+        ))?;
+    }
+    for pos in [5u32, 20, 40] {
+        writer.delete_bitmap_mut().insert(pos);
+    }
+    let (_, checksum) = writer
+        .finish()?
+        .expect("finish() returns Some after writing data items");
+
+    let (table, metrics) = recover_counted(&file, checksum)?;
+    let before = (metrics.bytes_read(), metrics.bytes_decoded());
+    assert!(
+        table.delete_positions_verified()?,
+        "the positions check out"
+    );
+    assert_eq!(
+        (metrics.bytes_read(), metrics.bytes_decoded()),
+        before,
+        "verifying delete positions is maintenance, not a caller's read",
+    );
+
+    let (table, metrics) = recover_counted(&file, checksum)?;
+    let first = table
+        .data_block_handles()
+        .next()
+        .expect("the table has a data block")?;
+    let handle = BlockHandle::new(first.offset(), first.size());
+    let before = (metrics.bytes_read(), metrics.bytes_decoded());
+    assert!(
+        table.load_columnar_block_masked(&handle)?.is_some(),
+        "the block keeps live rows",
+    );
+    assert_eq!(
+        (metrics.bytes_read(), metrics.bytes_decoded()),
+        before,
+        "re-emitting a masked block is maintenance, not a caller's read",
+    );
+    Ok(())
+}
+
+/// A handle declaring more than a block can be is refused before any read is
+/// issued, so nothing was asked of the filesystem and nothing is counted.
+#[cfg(feature = "metrics")]
+#[test]
+fn a_handle_refused_before_reading_counts_no_bytes() -> crate::Result<()> {
+    use crate::{
+        CompressionType,
+        cache::Cache,
+        table::{BlockHandle, block::BlockType, util::load_block},
+    };
+
+    let dir = tempdir()?;
+    let (table, metrics, _frame) = one_row_table_and_its_index_frame(&dir)?;
+
+    let read_before = metrics.bytes_read();
+    let result = load_block(
+        table.global_id(),
+        &table.path,
+        &table.file_accessor,
+        &Cache::with_capacity_bytes(10_000_000),
+        &BlockHandle::new(table.regions.tli.offset(), u32::MAX),
+        BlockType::Data,
+        CompressionType::None,
+        None,
+        None,
+        #[cfg(zstd_any)]
+        None,
+        None,
+        &metrics,
+        crate::table::util::ReadCharge::Foreground,
+    );
+    assert!(
+        matches!(&result, Err(crate::Error::DecompressedSizeTooLarge { .. })),
+        "a handle past the size cap must be refused before reading",
+    );
+    assert_eq!(
+        metrics.bytes_read(),
+        read_before,
+        "no read was issued, so none may be counted",
+    );
+
+    Ok(())
+}
+
+/// A batched prewarm decodes each block before checking its role, so a block it
+/// then refuses to cache still counts what its transform produced; the read
+/// walk that falls back to reading it again counts its own decode on top.
+#[cfg(feature = "metrics")]
+#[test]
+fn a_prewarmed_block_rejected_for_its_role_counts_what_its_transform_decoded() -> crate::Result<()>
+{
+    use crate::{
+        CompressionType,
+        cache::Cache,
+        table::{block::BlockType, util::decode_prewarmed_blocks},
+    };
+
+    let dir = tempdir()?;
+    let (table, metrics, frame) = one_row_table_and_its_index_frame(&dir)?;
+    let cache = Cache::with_capacity_bytes(10_000_000);
+
+    let decoded_before = metrics.bytes_decoded();
+    decode_prewarmed_blocks(
+        table.global_id(),
+        &cache,
+        &[table.regions.tli],
+        &[&frame],
+        BlockType::Data,
+        CompressionType::None,
+        None,
+        None,
+        #[cfg(zstd_any)]
+        None,
+        &metrics,
+    );
+    assert!(
+        cache
+            .get_block(table.global_id(), table.regions.tli.offset())
+            .is_none(),
+        "the index block must not be cached as a data block",
+    );
+    assert_eq!(
+        metrics.bytes_decoded() - decoded_before,
+        index_frame_decoded_len(&table)?,
+        "the transform ran before the role check, so its output must be counted",
+    );
+
+    Ok(())
+}
+
+/// The chunked `multi_get` resolver decodes a block before checking its role,
+/// so a block it refuses still counts what its transform produced.
+#[cfg(feature = "metrics")]
+#[test]
+fn a_chunk_decoded_block_rejected_for_its_role_counts_what_its_transform_decoded()
+-> crate::Result<()> {
+    let dir = tempdir()?;
+    let (table, metrics, frame) = one_row_table_and_its_index_frame(&dir)?;
+
+    let decoded_before = metrics.bytes_decoded();
+    let result = table.decode_data_block_from_bytes(&frame);
+    assert!(
+        matches!(&result, Err(crate::Error::InvalidTag(("BlockType", _)))),
+        "the index block must be refused as a data block",
+    );
+    assert_eq!(
+        metrics.bytes_decoded() - decoded_before,
+        index_frame_decoded_len(&table)?,
+        "the transform ran before the role check, so its output must be counted",
+    );
+
+    Ok(())
+}
+
+/// A patrol scrub is maintenance: its own read of a block is not counted, and
+/// neither is the confirming re-read it makes after an ECC correction, so a
+/// scrub running beside a foreground workload leaves that workload's read and
+/// decode figures untouched. The heal it schedules is still recorded.
+#[cfg(all(feature = "metrics", feature = "page_ecc", feature = "std"))]
+#[test]
+fn a_patrol_scrub_that_corrects_a_block_counts_no_bytes() -> crate::Result<()> {
+    use crate::{
+        Cache,
+        heal_hints::HealHints,
+        table::{
+            BlockHandle,
+            block::{BlockType, EccParams, Header},
+            util::{BlockScrubOutcome, scrub_block},
+        },
+    };
+
+    let dir = tempdir()?;
+    let file = dir.path().join("table");
+    let mut writer =
+        Writer::new(file.clone(), 0, 0, Arc::new(StdFs))?.use_ecc(Some(EccParams::RS_4_2));
+    for i in 0..200u32 {
+        let key = format!("key{i:05}");
+        writer.write(InternalValue::from_components(
+            key.as_bytes(),
+            b"value-payload-bytes",
+            u64::from(i) + 1,
+            crate::ValueType::Value,
+        ))?;
+    }
+    let (_, checksum) = writer
+        .finish()?
+        .expect("finish() returns Some after writing data items");
+
+    let metrics = Arc::new(crate::metrics::Metrics::default());
+    let table = {
+        let mut params = test_recover_params(file.clone(), checksum);
+        params.cache = Arc::new(Cache::with_capacity_bytes(10_000_000));
+        params.metrics = metrics.clone();
+        Table::recover(params)?
+    };
+    let table_id = table.global_id();
+    let keyed = table
+        .block_index
+        .iter()
+        .next()
+        .expect("the table has a data block")?;
+    let handle = BlockHandle::new(keyed.offset(), keyed.size());
+
+    // One flipped payload bit: the scrub repairs it from parity, and the
+    // confirming re-read finds it again, so the fault is persistent.
+    let mut bytes = std::fs::read(&file)?;
+    let pos =
+        usize::try_from(handle.offset().0).expect("block offset fits usize") + Header::MIN_LEN + 3;
+    bytes[pos] ^= 0x80;
+    std::fs::write(&file, &bytes)?;
+    table.file_accessor.remove_for_table(&table_id);
+
+    let sink = HealHints::default();
+    sink.set_enabled(true);
+    let (read_before, decoded_before) = (metrics.bytes_read(), metrics.bytes_decoded());
+    let outcome = scrub_block(
+        table_id,
+        &table.path,
+        &table.file_accessor,
+        &handle,
+        BlockType::Data,
+        table.metadata.data_block_compression,
+        None,
+        table.metadata.ecc_params,
+        #[cfg(zstd_any)]
+        None,
+        Some(&sink),
+        &metrics,
+    )?;
+    assert_eq!(
+        outcome,
+        BlockScrubOutcome::Corrected { scheduled: true },
+        "the scrub corrects the block and confirms the fault persists",
+    );
+    assert_eq!(
+        (metrics.bytes_read(), metrics.bytes_decoded()),
+        (read_before, decoded_before),
+        "neither the scrub's read nor its confirming re-read is a foreground read",
+    );
+
+    Ok(())
+}
+
+/// A patrol scrub walks every table, so it must leave the caches the workload
+/// uses as it found them: neither the cold index it walks nor the descriptor it
+/// opens may be inserted, or the patrol would evict the workload's entries and
+/// turn its later misses into hits.
+#[cfg(feature = "std")]
+#[test]
+fn a_patrol_scrub_leaves_the_block_and_descriptor_caches_as_it_found_them() -> crate::Result<()> {
+    let dir = tempdir()?;
+    let file = dir.path().join("table");
+    let mut writer = Writer::new(file.clone(), 0, 0, Arc::new(StdFs))?.use_data_block_size(128);
+    for i in 0..200u32 {
+        writer.write(InternalValue::from_components(
+            format!("key{i:05}").into_bytes(),
+            b"value-payload-bytes",
+            u64::from(i) + 1,
+            crate::ValueType::Value,
+        ))?;
+    }
+    let (_, checksum) = writer
+        .finish()?
+        .expect("finish() returns Some after writing data items");
+
+    let cache = Arc::new(Cache::with_capacity_bytes(10_000_000));
+    let descriptors = Arc::new(DescriptorTable::new(10));
+    let mut params = test_recover_params(file, checksum);
+    params.cache = cache.clone();
+    params.descriptor_table = Some(descriptors.clone());
+    let table = Table::recover(params)?;
+    table.file_accessor.remove_for_table(&table.global_id());
+    assert_eq!(cache.size(), 0, "precondition: the index is cold");
+    assert_eq!(descriptors.len(), 0, "precondition: the descriptor is cold");
+
+    let report = table.scrub_data_blocks();
+    assert!(report.errors.is_empty(), "the clean table scrubs clean");
+    assert!(report.blocks_scanned > 1, "the scrub walked every block");
+    assert_eq!(
+        cache.size(),
+        0,
+        "the scrub's index walk must not fill the cache"
+    );
+    assert_eq!(
+        descriptors.len(),
+        0,
+        "the scrub must not cache the descriptor it opened",
+    );
+    Ok(())
+}
+
+/// The confirming re-read after an ECC correction belongs to the read it
+/// confirms: under an untraced read it must leave the descriptor cache alone,
+/// while the heal it schedules is still recorded.
+#[cfg(all(feature = "page_ecc", feature = "std"))]
+#[test]
+fn an_untraced_read_confirming_an_ecc_correction_leaves_the_descriptor_cache_alone()
+-> crate::Result<()> {
+    use crate::{
+        heal_hints::HealHints,
+        table::{
+            BlockHandle,
+            block::{BlockType, EccParams, Header},
+            util::{ReadCharge, load_block},
+        },
+    };
+
+    let dir = tempdir()?;
+    let file = dir.path().join("table");
+    let mut writer =
+        Writer::new(file.clone(), 0, 0, Arc::new(StdFs))?.use_ecc(Some(EccParams::RS_4_2));
+    for i in 0..200u32 {
+        writer.write(InternalValue::from_components(
+            format!("key{i:05}").into_bytes(),
+            b"value-payload-bytes",
+            u64::from(i) + 1,
+            crate::ValueType::Value,
+        ))?;
+    }
+    let (_, checksum) = writer
+        .finish()?
+        .expect("finish() returns Some after writing data items");
+
+    let descriptors = Arc::new(DescriptorTable::new(10));
+    let mut params = test_recover_params(file.clone(), checksum);
+    params.descriptor_table = Some(descriptors.clone());
+    #[cfg(feature = "metrics")]
+    let metrics = params.metrics.clone();
+    let table = Table::recover(params)?;
+    let table_id = table.global_id();
+    let keyed = table
+        .block_index
+        .iter()
+        .next()
+        .expect("the table has a data block")?;
+    let handle = BlockHandle::new(keyed.offset(), keyed.size());
+
+    // One flipped payload bit: the read repairs it from parity, and the
+    // confirming re-read finds it again, so the fault is persistent.
+    let mut bytes = std::fs::read(&file)?;
+    let pos =
+        usize::try_from(handle.offset().0).expect("block offset fits usize") + Header::MIN_LEN + 3;
+    bytes[pos] ^= 0x80;
+    std::fs::write(&file, &bytes)?;
+    table.file_accessor.remove_for_table(&table_id);
+    assert_eq!(descriptors.len(), 0, "precondition: the descriptor is cold");
+
+    let sink = HealHints::default();
+    sink.set_enabled(true);
+    load_block(
+        table_id,
+        &table.path,
+        &table.file_accessor,
+        &Cache::with_capacity_bytes(10_000_000),
+        &handle,
+        BlockType::Data,
+        table.metadata.data_block_compression,
+        None,
+        table.metadata.ecc_params,
+        #[cfg(zstd_any)]
+        None,
+        Some(&sink),
+        #[cfg(feature = "metrics")]
+        &metrics,
+        ReadCharge::Untraced,
+    )?;
+    assert_eq!(
+        sink.snapshot(),
+        vec![table_id],
+        "the confirmed fault is still queued for healing",
+    );
+    assert_eq!(
+        descriptors.len(),
+        0,
+        "neither the read nor its confirming re-read may cache the descriptor",
+    );
     Ok(())
 }
 
@@ -3624,6 +4871,7 @@ fn load_block_records_heal_hint_on_persistent_ecc_correction() -> crate::Result<
             Some(&clean_sink),
             #[cfg(feature = "metrics")]
             &metrics,
+            crate::table::util::ReadCharge::Foreground,
         )?;
         assert!(
             clean_sink.snapshot().is_empty(),
@@ -3650,6 +4898,8 @@ fn load_block_records_heal_hint_on_persistent_ecc_correction() -> crate::Result<
     let sink = HealHints::default();
     sink.set_enabled(true);
     let fresh_cache = Cache::with_capacity_bytes(10_000_000);
+    #[cfg(feature = "metrics")]
+    let (read_before, decoded_before) = (metrics.bytes_read(), metrics.bytes_decoded());
     let block = load_block(
         table_id,
         &table.path,
@@ -3665,6 +4915,7 @@ fn load_block_records_heal_hint_on_persistent_ecc_correction() -> crate::Result<
         Some(&sink),
         #[cfg(feature = "metrics")]
         &metrics,
+        crate::table::util::ReadCharge::Foreground,
     )?;
     assert_eq!(
         block.header.block_type,
@@ -3676,11 +4927,29 @@ fn load_block_records_heal_hint_on_persistent_ecc_correction() -> crate::Result<
         vec![table_id],
         "a persistent ECC correction must queue the SST for healing",
     );
+    // The confirming re-read is a second request for the whole block and a
+    // second transform over it, so both counters carry two of each.
+    #[cfg(feature = "metrics")]
+    {
+        let size = u64::from(handle.size());
+        assert_eq!(
+            metrics.bytes_read() - read_before,
+            2 * size,
+            "the corrected read and its confirming re-read were both asked of the filesystem",
+        );
+        assert_eq!(
+            metrics.bytes_decoded() - decoded_before,
+            2 * block.data.len() as u64,
+            "the confirming re-read decoded the block a second time",
+        );
+    }
 
     // A DISABLED sink (auto_heal off) corrects on read but records nothing.
     table.file_accessor.remove_for_table(&table_id);
     let off_sink = HealHints::default(); // enabled == false
     let fresh_cache = Cache::with_capacity_bytes(10_000_000);
+    #[cfg(feature = "metrics")]
+    let read_before = metrics.bytes_read();
     let block = load_block(
         table_id,
         &table.path,
@@ -3696,6 +4965,7 @@ fn load_block_records_heal_hint_on_persistent_ecc_correction() -> crate::Result<
         Some(&off_sink),
         #[cfg(feature = "metrics")]
         &metrics,
+        crate::table::util::ReadCharge::Foreground,
     )?;
     assert_eq!(
         block.header.block_type,
@@ -3706,7 +4976,78 @@ fn load_block_records_heal_hint_on_persistent_ecc_correction() -> crate::Result<
         off_sink.snapshot().is_empty(),
         "auto_heal off must not schedule a rewrite",
     );
+    #[cfg(feature = "metrics")]
+    assert_eq!(
+        metrics.bytes_read() - read_before,
+        u64::from(handle.size()),
+        "with auto-heal off there is no confirming re-read to count",
+    );
 
+    Ok(())
+}
+
+/// A data block that fails to load is probed for a hole-punched (all-zero)
+/// extent, which reads the block's first 64 bytes and, when they are zero, the
+/// whole extent again. Those probe reads are asked of the filesystem like any
+/// other, so `bytes_read` must include them, or a table with excised blocks
+/// reports a third of the I/O it did.
+#[cfg(feature = "metrics")]
+#[test]
+fn excised_probe_counts_the_bytes_it_reads() -> crate::Result<()> {
+    use crate::{
+        Cache, InternalValue,
+        fs::StdFs,
+        table::{BlockHandle, block_index::BlockIndex as _},
+    };
+
+    let dir = tempdir()?;
+    let file = dir.path().join("table");
+    let mut writer = Writer::new(file.clone(), 0, 0, Arc::new(StdFs))?;
+    for i in 0..200u32 {
+        writer.write(InternalValue::from_components(
+            format!("key{i:05}").as_bytes(),
+            b"value-payload-bytes",
+            u64::from(i) + 1,
+            crate::ValueType::Value,
+        ))?;
+    }
+    #[expect(
+        clippy::unwrap_used,
+        reason = "finish() returns Some after writing items"
+    )]
+    let (_, checksum) = writer.finish()?.unwrap();
+
+    let metrics = Arc::new(crate::metrics::Metrics::default());
+    let table = {
+        let mut params = test_recover_params(file.clone(), checksum);
+        params.cache = Arc::new(Cache::with_capacity_bytes(10_000_000));
+        params.metrics = metrics.clone();
+        Table::recover(params)?
+    };
+    #[expect(clippy::unwrap_used, reason = "table has at least one data block")]
+    let keyed = table.block_index.iter().next().unwrap()?;
+    let handle = BlockHandle::new(keyed.offset(), keyed.size());
+
+    // Zero the block's extent, the shape a hole punch leaves.
+    let mut bytes = std::fs::read(&file)?;
+    let start = usize::try_from(handle.offset().0).expect("block offset fits usize");
+    let len = usize::try_from(handle.size()).expect("block size fits usize");
+    bytes[start..start + len].fill(0);
+    std::fs::write(&file, &bytes)?;
+    table.file_accessor.remove_for_table(&table.global_id());
+
+    let before = metrics.bytes_read();
+    let err = table.load_data_block(&handle).err();
+    assert!(
+        matches!(err, Some(crate::Error::Excised { .. })),
+        "a zeroed extent must read as excised, got {err:?}",
+    );
+    let size = u64::from(handle.size());
+    assert_eq!(
+        metrics.bytes_read() - before,
+        size + size.min(64) + size,
+        "the load, the 64-byte probe and the full-extent probe were all asked of the filesystem",
+    );
     Ok(())
 }
 

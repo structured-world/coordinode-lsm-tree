@@ -52,6 +52,14 @@ impl DescriptorTable {
         self.inner.get(&key)
     }
 
+    /// Like [`Self::access_for_table`], but without promoting the entry, for
+    /// a read that must leave the table as it found it.
+    #[must_use]
+    pub(crate) fn peek_for_table(&self, id: &GlobalTableId) -> Option<Arc<dyn FsFile>> {
+        let key = CacheKey(TAG_BLOCK, id.tree_id(), id.table_id());
+        self.inner.peek(&key)
+    }
+
     pub fn insert_for_table(&self, id: GlobalTableId, item: Item) {
         let key = CacheKey(TAG_BLOCK, id.tree_id(), id.table_id());
         self.inner.insert(key, item);

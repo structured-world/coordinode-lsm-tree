@@ -1193,6 +1193,10 @@ impl AbstractTree for Tree {
         use crate::table::block_index::BlockIndex;
         use core::ops::Bound;
 
+        // A query planner asks for this estimate as part of the query it
+        // plans, so the index walks below are the query's reads and stay
+        // counted. A monitoring report's reads are the ones kept out of the
+        // counters (see `Table::live_item_count`).
         let lo: Bound<&[u8]> = match range.start_bound() {
             Bound::Included(k) => Bound::Included(k.as_ref()),
             Bound::Excluded(k) => Bound::Excluded(k.as_ref()),
@@ -1458,7 +1462,11 @@ impl AbstractTree for Tree {
             // its replacement now owns, while the numerator below starts at the
             // restriction — so charging the prefix here would report a
             // full-keyspace query as selecting a fraction of the tree.
-            total_rows = total_rows.saturating_add(table.live_item_count()?);
+            // The planner's estimate is part of the query it plans, so the
+            // reads it makes are the query's and are counted, like the index
+            // walks below.
+            total_rows = total_rows
+                .saturating_add(table.live_item_count(crate::table::util::ReadCharge::Foreground)?);
             if !table
                 .metadata
                 .key_range
@@ -3783,6 +3791,15 @@ impl Tree {
                 }
             }
             for (fs, reqs) in &mut groups {
+                // Charged as issued: this group's blocks are asked of its
+                // backend now, whether or not the call then succeeds. A group
+                // after a failure is never asked, so it is charged here, just
+                // before its own call, rather than with the whole plan.
+                for (table, _, handles) in &planned {
+                    if Arc::ptr_eq(&table.fs, fs) {
+                        table.record_batched_read(handles);
+                    }
+                }
                 // Best-effort: a batched-read failure just leaves the blocks for
                 // the resolve walk to read normally.
                 if fs.read_blocks_batched(reqs).is_err() {
@@ -3978,6 +3995,15 @@ impl Tree {
                 }
             }
             for (fs, reqs) in &mut groups {
+                // Charged as issued, group by group like the prewarm: these
+                // reads bypass the per-block load path that charges every
+                // other read, and a group after a failure is never asked.
+                for task in chunk {
+                    if Arc::ptr_eq(&task.table.fs, fs) {
+                        task.table
+                            .record_batched_read(core::slice::from_ref(&task.handle));
+                    }
+                }
                 fs.read_blocks_batched(reqs)?;
                 // An implementation that reported success without filling a
                 // request leaves it short; refuse to decode a block out of bytes

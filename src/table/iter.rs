@@ -14,7 +14,7 @@ use crate::{
         BlockHandle,
         block::ParsedItem,
         block_index::{BlockIndexIter, BlockIndexIterImpl},
-        util::load_block,
+        util::{ReadCharge, load_block},
     },
 };
 use alloc::sync::Arc;
@@ -45,12 +45,30 @@ type InnerIter<'a> = DataBlockIter<'a>;
 #[cfg(feature = "zstd")]
 fn partial_decode_enabled() -> bool {
     use std::sync::OnceLock;
+    #[cfg(test)]
+    if FORCE_PARTIAL_DECODE.with(core::cell::Cell::get) {
+        return true;
+    }
     static ENABLED: OnceLock<bool> = OnceLock::new();
     *ENABLED.get_or_init(|| {
         std::env::var("LSM_PARTIAL_DECODE")
             .ok()
             .is_some_and(|v| matches!(v.trim(), "1" | "on" | "true" | "yes"))
     })
+}
+
+#[cfg(all(test, feature = "zstd"))]
+std::thread_local! {
+    /// Engages the partial tier on the current thread regardless of the env
+    /// switch, so a unit test neither mutates the process environment nor
+    /// depends on which test first initialized the cached switch.
+    static FORCE_PARTIAL_DECODE: core::cell::Cell<bool> = const { core::cell::Cell::new(false) };
+}
+
+/// Engages the partial-decode tier for reads on the calling thread.
+#[cfg(all(test, feature = "zstd"))]
+pub fn force_partial_decode_on_this_thread() {
+    FORCE_PARTIAL_DECODE.with(|f| f.set(true));
 }
 
 /// Minimum decompressed block size for the partial tier to engage. Below this a
@@ -403,6 +421,9 @@ pub struct Iter {
 
     #[cfg(feature = "metrics")]
     metrics: Arc<Metrics>,
+
+    /// Whose read this iteration is.
+    charge: ReadCharge,
 }
 
 impl Iter {
@@ -468,7 +489,35 @@ impl Iter {
 
             #[cfg(feature = "metrics")]
             metrics,
+            charge: ReadCharge::Foreground,
         }
+    }
+
+    /// Marks this iterator, and the index walk inside it, as maintenance such
+    /// as a sub-compaction's input: not a read a caller made, so it stays out
+    /// of the read counters while its Page-ECC recoveries are still counted.
+    #[must_use]
+    #[cfg_attr(
+        not(feature = "std"),
+        expect(dead_code, reason = "its compaction consumer is std-gated")
+    )]
+    pub(crate) fn for_maintenance(self) -> Self {
+        self.with_charge(ReadCharge::Maintenance)
+    }
+
+    /// Marks this iterator, and the index walk inside it, as a read that
+    /// leaves no trace, such as verification during a scrub: uncounted, and
+    /// it neither fills the block cache nor promotes what is cached.
+    #[must_use]
+    #[cfg(feature = "std")]
+    pub(crate) fn untraced(self) -> Self {
+        self.with_charge(ReadCharge::Untraced)
+    }
+
+    fn with_charge(mut self, charge: ReadCharge) -> Self {
+        self.charge = charge;
+        self.index_iter = self.index_iter.with_charge(charge);
+        self
     }
 
     /// Loads and resolves a data block by handle, dispatching on the SST layout:
@@ -500,6 +549,7 @@ impl Iter {
             self.heal_hints.as_ref().map(AsRef::as_ref),
             #[cfg(feature = "metrics")]
             &self.metrics,
+            self.charge,
         )?;
         if self.columnar {
             #[cfg(feature = "columnar")]
@@ -519,14 +569,28 @@ impl Iter {
                         .get(&handle.offset().0)
                         .map(|&start| (mask, start))
                 });
-                return match masked {
-                    Some((mask, start)) => {
-                        DataBlock::columnar_block_entries_masked(&raw.data, &mask.bitmap, start)
-                            .map(|opt| opt.map(BlockSource::Columnar))
-                    }
-                    None => DataBlock::columnar_block_entries(&raw.data)
-                        .map(|entries| Some(BlockSource::Columnar(entries))),
+                let mut gathered = 0usize;
+                let entries = if let Some((mask, start)) = masked {
+                    DataBlock::columnar_block_entries_masked(
+                        &raw.data,
+                        &mask.bitmap,
+                        start,
+                        &mut gathered,
+                    )
+                } else {
+                    DataBlock::columnar_block_entries(&raw.data, &mut gathered).map(Some)
                 };
+                // Keys, and values of a single bytes column, are views into the
+                // decoded columns and cost nothing here; only values rebuilt
+                // from sub-columns are a gather. Charged before the result is
+                // judged: a block refused after a gather still did it.
+                #[cfg(feature = "metrics")]
+                if self.charge.is_counted() {
+                    self.metrics.record_gather(gathered);
+                }
+                #[cfg(not(feature = "metrics"))]
+                let _ = gathered;
+                return Ok(entries?.map(BlockSource::Columnar));
             }
             #[cfg(not(feature = "columnar"))]
             {
@@ -602,6 +666,9 @@ impl Iter {
             // reconstructed whole, so the inner-block partial decode never
             // applies to them.
             || self.columnar
+            // The tier lives in the block cache (inserts, hit bumps,
+            // promotion), so a read that must leave no trace there skips it.
+            || !self.charge.touches_cache()
         {
             return Ok(None);
         }
@@ -655,6 +722,11 @@ impl Iter {
                             &entry.resume.window_prime,
                             self.data_block_restart_interval,
                         )?;
+                        // The block is a gather of the cached prefix's entries.
+                        #[cfg(feature = "metrics")]
+                        if self.charge.is_counted() {
+                            self.metrics.record_gather(block.inner.data.len());
+                        }
                         self.cache.insert_partial_block(
                             self.table_id,
                             offset,
@@ -698,6 +770,19 @@ impl Iter {
                 window_log: 0,
             },
             &transform,
+            // The whole frame is asked of the filesystem on every partial
+            // read, including a resume-grow; charged as issued, like
+            // `load_block`.
+            || {
+                #[cfg(feature = "metrics")]
+                if self.charge.is_counted() {
+                    crate::table::util::record_block_read(
+                        &self.metrics,
+                        crate::table::block::BlockType::Data,
+                        handle.size().into(),
+                    );
+                }
+            },
         )?;
         // The partial path bypasses `load_block`, so schedule auto-heal here too:
         // an ECC-corrected frame read flags the SST for a healing rewrite (the
@@ -722,18 +807,41 @@ impl Iter {
                 self.heal_hints.as_ref().map(AsRef::as_ref),
                 #[cfg(feature = "metrics")]
                 &self.metrics,
+                self.charge,
             );
         }
         // Cold first touch (carried_resume None) or resume-grow from the cached
         // snapshot — either way only the new tail blocks are decompressed.
-        let (block, covered_upper, payload) = crate::table::lazy_block::partial_data_block(
-            frame.to_vec(),
+        let mut work = crate::table::lazy_block::PartialWork::default();
+        let built = crate::table::lazy_block::partial_data_block(
+            frame,
             ends,
             self.data_block_restart_interval,
             &self.comparator,
             upper,
             carried_resume,
-        )?;
+            &mut work,
+        );
+        // Charged before the result is judged: a read that fails at a later
+        // inner block still decoded and copied what came before it. Every
+        // prefix copy and the synthesized block are gathers, so a range that
+        // grows across reads re-copies a longer prefix each time; only the
+        // tail this read decoded counts, a resumed prefix was charged by the
+        // read that decoded it.
+        #[cfg(feature = "metrics")]
+        if self.charge.is_counted() {
+            self.metrics.record_gather(work.copied);
+            self.metrics
+                .block_bytes_decoded
+                .fetch_add(work.decoded as u64, core::sync::atomic::Ordering::Relaxed);
+        }
+        #[cfg(not(feature = "metrics"))]
+        let _ = work;
+        let crate::table::lazy_block::PartialBlock {
+            block,
+            covered_upper,
+            payload,
+        } = built?;
         // Covering this query decoded most of the block → promote: drop the
         // partial and let the caller cache the whole block.
         if promote_by_fraction(payload.decoded_blocks, total_blocks) {

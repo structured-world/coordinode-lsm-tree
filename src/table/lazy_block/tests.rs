@@ -6,7 +6,7 @@ use test_log::test;
 
 /// Build a large sorted-KV data block, compress it, and return the frame +
 /// inner-block `ends` layout and the full decompressed reference bytes.
-fn large_block_frame() -> (Vec<u8>, Vec<u32>, Vec<u8>) {
+fn large_block_frame() -> (Slice, Vec<u32>, Vec<u8>) {
     let items: Vec<InternalValue> = (0u64..20_000)
         .map(|i| {
             InternalValue::from_components(
@@ -30,7 +30,7 @@ fn large_block_frame() -> (Vec<u8>, Vec<u32>, Vec<u8>) {
     let reference =
         ZstdBackend::decompress(&frame, block_bytes.len() + 1).expect("full decompress");
     assert_eq!(reference, block_bytes);
-    (frame, ends, reference)
+    (Slice::from(frame), ends, reference)
 }
 
 #[test]
@@ -176,11 +176,11 @@ fn synthesized_block_matches_original_seek_iter_both_ways() {
     })
     .entries_end_for_test()
     .expect("entries_end");
-    let prefix = &block_bytes[..entries_end];
+    let prefix = Slice::from(&block_bytes[..entries_end]);
 
-    let synth_bytes = synthesize_block_bytes(prefix, ri).expect("synthesize");
+    let synth_bytes = synthesize_block_bytes(&prefix, ri).expect("synthesize");
     let synth = DataBlock::new(Block {
-        data: Slice::from(synth_bytes),
+        data: synth_bytes,
         header: Header::test_dummy(BlockType::Data),
     });
 
@@ -264,8 +264,21 @@ fn partial_data_block_range_matches_full_and_skips_trailing() {
     assert_eq!(reference.len(), 40, "i=10..50 → 40 entries");
 
     // Partial: build a covering block from the frame, then seek the same range.
-    let (partial, covered_upper, payload) =
-        partial_data_block(frame, ends, 16, &cmp, &upper, None).expect("partial block");
+    let PartialBlock {
+        block: partial,
+        covered_upper,
+        payload,
+        ..
+    } = partial_data_block(
+        frame,
+        ends,
+        16,
+        &cmp,
+        &upper,
+        None,
+        &mut PartialWork::default(),
+    )
+    .expect("partial block");
     let blocks = payload.decoded_blocks;
     assert!(
         blocks < nblocks,
@@ -306,16 +319,36 @@ fn partial_data_block_resume_grows_and_matches_full() {
 
     // First (cold) decode covering a near-start window; capture the resume.
     let narrow = b"key-000000000050".to_vec();
-    let (_b0, _c0, payload) =
-        partial_data_block(frame.clone(), ends.clone(), 16, &cmp, &narrow, None)
-            .expect("cold partial");
+    let payload = partial_data_block(
+        frame.clone(),
+        ends.clone(),
+        16,
+        &cmp,
+        &narrow,
+        None,
+        &mut PartialWork::default(),
+    )
+    .expect("cold partial")
+    .payload;
     let narrow_blocks = payload.decoded_blocks;
 
     // Resume-grow to a much wider window; must decode strictly more blocks.
     let lower = b"key-000000000010".to_vec();
     let wide = b"key-000000005000".to_vec();
-    let (partial, _covered, payload2) =
-        partial_data_block(frame, ends, 16, &cmp, &wide, Some(payload)).expect("resume grow");
+    let PartialBlock {
+        block: partial,
+        payload: payload2,
+        ..
+    } = partial_data_block(
+        frame,
+        ends,
+        16,
+        &cmp,
+        &wide,
+        Some(payload),
+        &mut PartialWork::default(),
+    )
+    .expect("resume grow");
     assert!(
         payload2.decoded_blocks > narrow_blocks,
         "resume must extend the decoded extent: {} -> {}",
@@ -335,6 +368,107 @@ fn partial_data_block_resume_grows_and_matches_full() {
     let got: Vec<InternalValue> = pi.map(|x| x.materialize(partial.as_slice())).collect();
 
     assert_eq!(got, reference, "resume-grown range scan must equal full");
+}
+
+/// Every copy a partial read makes is reported: a cold read copies its prefix
+/// once per growth step and then the synthesized block; a resumed read whose
+/// cached prefix already covers the query copies only the block, and the
+/// cache keeps sharing the very prefix it handed in.
+#[test]
+fn partial_data_block_reports_the_copies_it_makes() {
+    use crate::comparator::default_comparator;
+
+    let (frame, ends, _reference) = large_block_frame();
+    let cmp = default_comparator();
+    let upper = b"key-000000000050".to_vec();
+
+    let mut cold_work = PartialWork::default();
+    let cold = partial_data_block(
+        frame.clone(),
+        ends.clone(),
+        16,
+        &cmp,
+        &upper,
+        None,
+        &mut cold_work,
+    )
+    .expect("cold partial");
+    let block_len = cold.block.inner.data.len();
+    let prefix_len = cold.payload.window_prime.len();
+    assert!(
+        cold_work.copied >= block_len + prefix_len,
+        "a cold read copies its prefix and its block: {} < {block_len} + {prefix_len}",
+        cold_work.copied,
+    );
+    assert_eq!(
+        cold_work.decoded, prefix_len,
+        "a cold read decodes exactly its prefix",
+    );
+
+    let cached = cold.payload.window_prime.clone();
+    let mut warm_work = PartialWork::default();
+    let warm = partial_data_block(
+        frame,
+        ends,
+        16,
+        &cmp,
+        &upper,
+        Some(cold.payload),
+        &mut warm_work,
+    )
+    .expect("resumed partial");
+    assert_eq!(
+        warm_work,
+        PartialWork {
+            decoded: 0,
+            copied: warm.block.inner.data.len(),
+        },
+        "a covered resume decodes nothing and copies only the block it synthesizes",
+    );
+    assert_eq!(warm.payload.window_prime, cached);
+}
+
+/// A read that fails at a later inner block still did the work before it:
+/// the blocks it decompressed and the prefixes it copied are reported, not
+/// dropped with the error.
+#[test]
+fn partial_data_block_failing_at_a_later_block_reports_the_work_before_it() {
+    use crate::comparator::default_comparator;
+
+    let (frame, ends, reference) = large_block_frame();
+    let cmp = default_comparator();
+
+    // Where the inner block after the first half starts in the frame.
+    let mut probe = LazyBlock::new(frame.clone(), ends.clone()).expect("new lazy block");
+    probe
+        .ensure_decoded_to(reference.len() / 2)
+        .expect("decode the first half");
+    let decoded_before_corruption = probe.decoded().len();
+    let header_at = usize::try_from(probe.compressed_cursor).expect("frame offset fits usize");
+    assert!(
+        decoded_before_corruption < reference.len(),
+        "the fixture must leave inner blocks after the first half",
+    );
+
+    // Mark that block's header with the reserved block type (both type bits
+    // set), which no decoder accepts.
+    let mut bytes = frame.to_vec();
+    let header = bytes.get_mut(header_at).expect("header byte in the frame");
+    *header |= 0b110;
+
+    let upper = b"key-999999999999".to_vec();
+    let mut work = PartialWork::default();
+    let failed = partial_data_block(Slice::from(bytes), ends, 16, &cmp, &upper, None, &mut work);
+    assert!(failed.is_err(), "the reserved block type must be refused");
+    assert!(
+        work.decoded >= decoded_before_corruption,
+        "the blocks before the failing one were decoded: {} < {decoded_before_corruption}",
+        work.decoded,
+    );
+    assert!(
+        work.copied > 0,
+        "the prefixes made before the failure were copied",
+    );
 }
 
 /// Synthesizing over a prefix that ends mid-entry (inner-block boundaries
@@ -369,10 +503,10 @@ fn synthesize_handles_truncated_prefix() {
     .expect("entries_end");
 
     // Cut a few bytes into the last entry.
-    let prefix = &block_bytes[..entries_end - 3];
-    let synth_bytes = synthesize_block_bytes(prefix, ri).expect("synthesize truncated");
+    let prefix = Slice::from(&block_bytes[..entries_end - 3]);
+    let synth_bytes = synthesize_block_bytes(&prefix, ri).expect("synthesize truncated");
     let synth = DataBlock::new(Block {
-        data: Slice::from(synth_bytes),
+        data: synth_bytes,
         header: Header::test_dummy(BlockType::Data),
     });
 

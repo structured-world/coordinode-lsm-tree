@@ -30,6 +30,22 @@ pub enum BlockIndexIterImpl {
     TwoLevel(self::two_level::Iter),
 }
 
+impl BlockIndexIterImpl {
+    /// This walk with its block loads charged as `charge` says, for a walk
+    /// that is not a caller's read: opening, verifying or reclaiming a table,
+    /// compaction, a scrub, a report.
+    #[must_use]
+    pub(crate) fn with_charge(mut self, charge: crate::table::util::ReadCharge) -> Self {
+        match &mut self {
+            Self::Volatile(i) => i.charge = charge,
+            Self::TwoLevel(i) => i.charge = charge,
+            // A pinned index loads nothing while it is walked.
+            Self::Full(_) => {}
+        }
+        self
+    }
+}
+
 impl BlockIndexIter for BlockIndexIterImpl {
     fn seek_lower(&mut self, key: &[u8], seqno: SeqNo) -> bool {
         match self {

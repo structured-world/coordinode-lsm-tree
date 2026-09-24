@@ -167,9 +167,8 @@ where
     }
 
     /// Read without promotion: returns the value (cloned) without touching the
-    /// frequency counter. Used by the partial-decode tier, which inspects an
-    /// entry without counting it as a hit.
-    #[cfg(any(feature = "zstd", test))]
+    /// frequency counter. Used by readers that inspect an entry without
+    /// counting it as a hit: the partial-decode tier and monitoring reports.
     fn peek(&self, hash: u64, key: &K) -> Option<V> {
         self.map
             .find(hash, |(k, _)| k == key)
@@ -495,7 +494,6 @@ where
     }
 
     /// Returns the value for `key` WITHOUT counting it as a hit (no promotion).
-    #[cfg(any(feature = "zstd", test))]
     pub fn peek(&self, key: &K) -> Option<V> {
         let (h, shard) = self.locate(key);
         shard.read().peek(h, key)

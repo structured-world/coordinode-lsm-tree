@@ -25,7 +25,7 @@ use super::writer::MAX_DECOMPRESSION_SIZE;
 
 /// The exact on-disk span a blob record occupies: header + key + on-disk value.
 ///
-/// One definition shared by the single read in [`Reader::get`] and by the
+/// One definition shared by the single read in [`Reader::read_record`] and by the
 /// prefetcher that coalesces several adjacent records into one read, so the two
 /// can never disagree about where a record ends.
 ///
@@ -83,27 +83,44 @@ impl<'a> Reader<'a> {
         Self { blob_file, file }
     }
 
-    pub fn get(&self, key: &'a [u8], vhandle: &'a ValueHandle) -> crate::Result<UserValue> {
+    /// Reads the raw bytes of one record, `len` of them from `vhandle.offset`,
+    /// without validating them: the caller parses them with
+    /// [`Self::parse_record`].
+    ///
+    /// `len` is the record's [`record_len`], computed by the caller so that it
+    /// can account for the request before issuing it.
+    ///
+    /// # Errors
+    ///
+    /// Returns the file's read failures.
+    pub fn read_record(&self, vhandle: &ValueHandle, len: usize) -> crate::Result<crate::Slice> {
         debug_assert_eq!(vhandle.blob_file_id, self.blob_file.id());
+        Ok(crate::file::read_exact(self.file, vhandle.offset, len)?)
+    }
 
-        let read_len = record_len(key.len(), vhandle)?;
-        let record = crate::file::read_exact(self.file, vhandle.offset, read_len)?;
-
-        self.parse_record(key, vhandle, &record)
+    /// Reads and parses one record in one call.
+    #[cfg(test)]
+    pub fn get(&self, key: &'a [u8], vhandle: &'a ValueHandle) -> crate::Result<UserValue> {
+        let record = self.read_record(vhandle, record_len(key.len(), vhandle)?)?;
+        self.parse_record(key, vhandle, &record, &mut 0)
     }
 
     /// Parses one blob record out of bytes already read from the file.
     ///
     /// `record` must be exactly the [`record_len`] bytes that start at
-    /// `vhandle.offset`. Splitting this out of [`get`](Self::get) lets a caller
+    /// `vhandle.offset`. Splitting this out of the read lets a caller
     /// that read several adjacent records in ONE read serve each of them from
     /// its slice of that buffer: the validation below is identical either way,
     /// so a prefetched value is byte-for-byte what a direct read would return.
     ///
+    /// `decoded` receives the length the decompressor produced, as soon as it
+    /// produced it: a record refused afterwards (its output is not the length
+    /// the header declares) was still decompressed.
+    ///
     /// # Errors
     ///
-    /// Returns the same header / checksum / decompression errors as
-    /// [`get`](Self::get); a caller that prefetched speculatively should treat
+    /// Returns the header / checksum / decompression errors of a malformed
+    /// record; a caller that prefetched speculatively should treat
     /// them as "leave this one to the read path" rather than as fatal.
     #[expect(
         clippy::too_many_lines,
@@ -114,6 +131,7 @@ impl<'a> Reader<'a> {
         key: &[u8],
         vhandle: &ValueHandle,
         record: &crate::Slice,
+        decoded: &mut usize,
     ) -> crate::Result<UserValue> {
         let value = record;
         let mut reader = Cursor::new(&value[..]);
@@ -215,6 +233,7 @@ impl<'a> Reader<'a> {
         #[warn(clippy::match_single_binding)]
         let value = match &self.blob_file.0.meta.compression {
             CompressionType::None => {
+                *decoded = raw_data.len();
                 if real_val_len != raw_data.len() {
                     return Err(crate::Error::InvalidHeader("Blob"));
                 }
@@ -227,6 +246,7 @@ impl<'a> Reader<'a> {
 
                 let bytes_written = lz4_flex::block::decompress_into(&raw_data, &mut buf)
                     .map_err(|_| crate::Error::Decompress(self.blob_file.0.meta.compression))?;
+                *decoded = bytes_written;
 
                 // Runtime validation: corrupted data may decompress to fewer bytes
                 if bytes_written != real_val_len {
@@ -241,6 +261,7 @@ impl<'a> Reader<'a> {
                 let decompressed =
                     crate::compression::ZstdBackend::decompress(&raw_data, real_val_len)
                         .map_err(|_| crate::Error::Decompress(self.blob_file.0.meta.compression))?;
+                *decoded = decompressed.len();
 
                 if decompressed.len() != real_val_len {
                     return Err(crate::Error::Decompress(self.blob_file.0.meta.compression));
@@ -269,6 +290,7 @@ impl<'a> Reader<'a> {
                     real_val_len,
                 )
                 .map_err(|_| crate::Error::Decompress(self.blob_file.0.meta.compression))?;
+                *decoded = decompressed.len();
 
                 if decompressed.len() != real_val_len {
                     return Err(crate::Error::Decompress(self.blob_file.0.meta.compression));

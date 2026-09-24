@@ -288,7 +288,10 @@ fn from_columnar_block_rejects_a_zero_row_block() {
         .expect("transpose")
         .encode(CodecId::Plain)
         .expect("encode");
-    assert!(crate::table::data_block::DataBlock::from_columnar_block(&empty.into(), 16).is_err());
+    assert!(
+        crate::table::data_block::DataBlock::from_columnar_block(&empty.into(), 16, &mut 0)
+            .is_err()
+    );
 }
 
 #[test]
@@ -876,6 +879,133 @@ fn columnar_decode_rejects_trailing_bytes() {
     assert!(ColumnBatch::decode(&encoded.clone().into()).is_err());
 }
 
+/// A decode that copied a validity bitmap and only then met a malformed tail
+/// did that copy: it is counted like the read a checksum later refuses.
+#[test]
+fn columnar_decode_refused_after_copying_still_counts_the_copy() {
+    let mut encoded = sample_batch().encode(CodecId::Plain).expect("encode");
+    encoded.push(0); // one byte past the last declared column
+    let mut copied = 0usize;
+    let decoded = ColumnBatch::decode_counting_copies(&encoded.into(), None, &mut copied);
+    assert!(decoded.is_err(), "trailing bytes must be refused");
+    assert_eq!(
+        copied, 1,
+        "the first column's one-byte validity bitmap was copied before the refusal",
+    );
+}
+
+/// A block whose second row carries a bad value-type tag is refused only after
+/// the first row's value was rebuilt from its sub-columns: that rebuild was a
+/// copy and is counted, like a read a later check refuses.
+#[test]
+fn columnar_entries_refused_after_rebuilding_a_value_still_count_it() {
+    let mut batch = entries_to_column_batch(&[
+        entry(b"k0", 1, ValueType::Value, b"ignored"),
+        entry(b"k1", 2, ValueType::Value, b"ignored"),
+    ])
+    .expect("transpose");
+    batch.columns.pop();
+    batch.columns.push(Column {
+        column_id: 3,
+        type_tag: TypeTag::Fixed(4),
+        validity: None,
+        data: vec![1, 0, 0, 0, 2, 0, 0, 0].into(),
+    });
+    let mut bytes_data = Vec::new();
+    for off in [0u32, 2, 5] {
+        bytes_data.extend_from_slice(&off.to_le_bytes());
+    }
+    bytes_data.extend_from_slice(b"aabbb");
+    batch.columns.push(Column {
+        column_id: 4,
+        type_tag: TypeTag::Bytes,
+        validity: None,
+        data: bytes_data.into(),
+    });
+    let vt_col = batch.columns.get_mut(2).expect("value-type column");
+    vt_col.data = vec![u8::from(ValueType::Value), 0xEE].into();
+    let encoded: Slice = batch.encode(CodecId::Plain).expect("encode").into();
+    // What the decode itself copies (this block is small enough that its views
+    // are detached), counted on its own clause.
+    let mut decode_copies = 0usize;
+    ColumnBatch::decode_counting_copies(&encoded, None, &mut decode_copies).expect("decode");
+
+    let mut gathered = 0usize;
+    let refused =
+        crate::table::data_block::DataBlock::columnar_block_entries(&encoded, &mut gathered);
+    assert!(refused.is_err(), "the bad value-type tag must be refused");
+    let first_row = frame_value_cells(&[
+        (TypeTag::Fixed(4), &[1, 0, 0, 0][..]),
+        (TypeTag::Bytes, b"aa"),
+    ])
+    .expect("frame");
+    assert_eq!(
+        gathered,
+        decode_copies + first_row.len(),
+        "the first row's value was rebuilt before the refusal",
+    );
+}
+
+/// The `Bytes` offset accumulator's overflow guard, exercised WITHOUT
+/// materializing a multi-GiB payload: the arithmetic is driven directly at the
+/// u32 boundary.
+#[test]
+fn advance_bytes_offset_rejects_a_u32_offset_overflow() {
+    // A repeated gather can push the accumulated total past u32::MAX; the
+    // `checked_add` guard rejects it (a tiny `value_len`, nothing allocated).
+    assert!(matches!(
+        super::advance_bytes_offset(u32::MAX - 3, 10),
+        Err(crate::Error::DecompressedSizeTooLarge { .. }),
+    ));
+    // A single value longer than u32::MAX trips the `u32::try_from` guard. Only
+    // reachable where usize is wider than u32 (64-bit); on a 32-bit target usize
+    // IS u32, so a length can never exceed it.
+    #[cfg(target_pointer_width = "64")]
+    assert!(matches!(
+        super::advance_bytes_offset(0, (u32::MAX as usize) + 1),
+        Err(crate::Error::DecompressedSizeTooLarge { .. }),
+    ));
+    // A normal advance within the u32 ceiling succeeds.
+    assert_eq!(
+        super::advance_bytes_offset(100, 50).expect("within the u32 offset ceiling"),
+        150,
+    );
+}
+
+/// The framed column is sized by one pass over the cells and filled by a
+/// second, so a source that yields differently the second time must be
+/// refused rather than leave part of the buffer unwritten.
+#[test]
+fn frame_bytes_column_refuses_cells_that_change_between_passes() {
+    let calls = core::cell::Cell::new(0u32);
+    let short: &[&[u8]] = &[b"a", b"b"];
+    let long: &[&[u8]] = &[b"a", b"bbb"];
+    let fewer: &[&[u8]] = &[b"a"];
+    for second in [long, short, fewer] {
+        calls.set(0);
+        let framed = super::frame_bytes_column(2, || {
+            calls.set(calls.get() + 1);
+            if calls.get() == 1 { long } else { second }.iter().copied()
+        });
+        if core::ptr::eq(second, long) {
+            let framed = framed.expect("identical passes frame the cells");
+            let mut expected = Vec::new();
+            for off in [0u32, 1, 4] {
+                expected.extend_from_slice(&off.to_le_bytes());
+            }
+            expected.extend_from_slice(b"abbb");
+            assert_eq!(&*framed, &expected[..]);
+        } else {
+            assert!(
+                matches!(framed, Err(crate::Error::InvalidHeader(_))),
+                "a second pass yielding other cells must be refused",
+            );
+        }
+    }
+    // Declared count and yielded cells disagree on the first pass.
+    assert!(super::frame_bytes_column(3, || short.iter().copied()).is_err());
+}
+
 #[test]
 fn columnar_decode_rejects_huge_column_count() {
     // row_count = 0, column_count = u32::MAX, but no column bytes follow.
@@ -909,7 +1039,7 @@ fn column_batch_into_entries_rejects_an_empty_key_row() {
         entries_to_column_batch(&[entry(b"k", 5, ValueType::Value, b"v")]).expect("valid batch");
     let key_col = batch.columns.get_mut(0).expect("key column");
     key_col.data = alloc::vec![0u8; 8].into();
-    let err = column_batch_into_entries(batch).expect_err("empty key must be rejected");
+    let err = column_batch_into_entries(batch, &mut 0).expect_err("empty key must be rejected");
     assert!(
         matches!(err, crate::Error::InvalidHeader(m) if m.contains("user key is empty")),
         "expected an empty-key InvalidHeader, got {err:?}",
@@ -925,7 +1055,7 @@ fn column_batch_match_entries_rejects_an_empty_key_row() {
     let key_col = batch.columns.get_mut(0).expect("key column");
     key_col.data = alloc::vec![0u8; 8].into();
     let cmp = crate::comparator::default_comparator();
-    let err = column_batch_match_entries(&batch, b"", &cmp, None)
+    let err = column_batch_match_entries(&batch, b"", &cmp, None, &mut 0)
         .expect_err("matched empty key must be rejected");
     assert!(
         matches!(err, crate::Error::InvalidHeader(m) if m.contains("user key is empty")),
@@ -946,11 +1076,40 @@ fn column_batch_match_entries_fails_closed_when_a_delete_mask_position_overflows
     .expect("two-row same-key batch");
     let bitmap = crate::table::delete_bitmap::DeleteBitmap::new();
     let cmp = crate::comparator::default_comparator();
-    let err = column_batch_match_entries(&batch, b"dup", &cmp, Some((&bitmap, u32::MAX)))
+    let err = column_batch_match_entries(&batch, b"dup", &cmp, Some((&bitmap, u32::MAX)), &mut 0)
         .expect_err("an overflowing delete-mask position must fail closed");
     assert!(
         matches!(err, crate::Error::InvalidHeader(m) if m.contains("position exceeds u32::MAX")),
         "expected an overflow InvalidHeader, got {err:?}",
+    );
+}
+
+#[test]
+fn column_batch_match_entries_counts_the_rows_it_copied_before_a_later_row_fails() {
+    // Two versions of one key; the second carries an invalid value-type byte.
+    // The first version's key and value were already copied out of the columns
+    // when the second is refused, and those copies must still be reported.
+    let mut batch = entries_to_column_batch(&[
+        entry(b"dup", 5, ValueType::Value, b"v0"),
+        entry(b"dup", 3, ValueType::Value, b"v1"),
+    ])
+    .expect("two-row same-key batch");
+    let vt_col = batch.columns.get_mut(2).expect("value-type column");
+    let mut vt = vt_col.data.to_vec();
+    vt[1] = 0xFF;
+    vt_col.data = vt.into();
+    let cmp = crate::comparator::default_comparator();
+    let mut copied = 0;
+    let err = column_batch_match_entries(&batch, b"dup", &cmp, None, &mut copied)
+        .expect_err("the invalid value type must be refused");
+    assert!(
+        matches!(err, crate::Error::InvalidTag(("ValueType", 0xFF))),
+        "expected an invalid value-type tag, got {err:?}",
+    );
+    assert_eq!(
+        copied,
+        b"dup".len() + b"v0".len(),
+        "the first version was copied before the second failed",
     );
 }
 
@@ -962,7 +1121,7 @@ fn column_batch_match_entries_rejects_a_zero_row_block() {
     // on-disk corruption.
     let batch = entries_to_column_batch(&[]).expect("zero-row batch");
     let cmp = crate::comparator::default_comparator();
-    let err = column_batch_match_entries(&batch, b"x", &cmp, None)
+    let err = column_batch_match_entries(&batch, b"x", &cmp, None, &mut 0)
         .expect_err("a zero-row block must fail closed");
     assert!(
         matches!(err, crate::Error::InvalidHeader(m) if m.contains("empty reconstructed data block")),

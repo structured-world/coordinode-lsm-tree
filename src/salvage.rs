@@ -894,6 +894,10 @@ fn salvage_attempt(
             Arc::new(crate::cache::Cache::with_capacity_bytes(8 * 1024 * 1024)),
         );
         params.descriptor_table = Some(Arc::new(crate::descriptor_table::DescriptorTable::new(64)));
+        // The source keeps the metrics `RecoverParams::new` gives it, never a
+        // tree's: salvage is maintenance, like compaction and repair, so its
+        // reads, decodes and row materializations stay out of the read counters
+        // and the walk below charges none of them.
         // Decrypt / decompress the source with the caller's context: without it
         // an encrypted or dictionary-compressed source cannot be read at all.
         params.encryption.clone_from(&options.encryption);

@@ -77,7 +77,7 @@ use iter::Iter;
 
 use crate::path::PathBuf;
 use portable_atomic::AtomicU64;
-use util::load_block;
+use util::{ReadCharge, load_block};
 
 #[cfg(feature = "metrics")]
 use crate::metrics::Metrics;
@@ -679,14 +679,35 @@ impl Table {
     }
 
     pub fn list_blob_file_references(&self) -> crate::Result<Option<Vec<LinkedFile>>> {
+        self.read_blob_file_references(|| {
+            Ok(self
+                .file_accessor
+                .get_or_open_table(&self.global_id(), &self.path)?
+                .0)
+        })
+    }
+
+    /// [`Self::list_blob_file_references`] for verification: the descriptor is
+    /// taken without promoting or caching it, so the check leaves no trace.
+    #[cfg(feature = "std")]
+    fn untraced_blob_file_references(&self) -> crate::Result<Option<Vec<LinkedFile>>> {
+        self.read_blob_file_references(|| {
+            Ok(self
+                .file_accessor
+                .peek_or_open_table(&self.global_id(), &self.path)?)
+        })
+    }
+
+    /// Reads and parses the `linked_blob_files` section through the descriptor
+    /// `open` yields, opened only when the section exists.
+    fn read_blob_file_references(
+        &self,
+        open: impl FnOnce() -> crate::Result<Arc<dyn FsFile>>,
+    ) -> crate::Result<Option<Vec<LinkedFile>>> {
         use crate::io::{LE, ReadBytesExt};
 
         Ok(if let Some(handle) = &self.regions.linked_blob_files {
-            let table_id = self.global_id();
-
-            let (fd, _) = self
-                .file_accessor
-                .get_or_open_table(&table_id, &self.path)?;
+            let fd = open()?;
 
             // Read the exact region using pread-style helper
             let buf =
@@ -877,8 +898,7 @@ impl Table {
     // std-only: the sole consumer is the std-gated salvage walk.
     #[cfg(feature = "std")]
     pub(crate) fn data_block_handles(&self) -> block_index::BlockIndexIterImpl {
-        use block_index::BlockIndex;
-        self.block_index.iter()
+        self.maintenance_index_walk()
     }
 
     fn load_block(
@@ -887,6 +907,26 @@ impl Table {
         block_type: BlockType,
         compression: CompressionType,
         #[cfg(zstd_any)] zstd_dict: Option<&crate::compression::ZstdDictionary>,
+    ) -> crate::Result<Block> {
+        self.load_block_charged(
+            handle,
+            block_type,
+            compression,
+            #[cfg(zstd_any)]
+            zstd_dict,
+            ReadCharge::Foreground,
+        )
+    }
+
+    /// [`Self::load_block`] charged as `charge` says, for a read that is not a
+    /// caller's.
+    fn load_block_charged(
+        &self,
+        handle: &BlockHandle,
+        block_type: BlockType,
+        compression: CompressionType,
+        #[cfg(zstd_any)] zstd_dict: Option<&crate::compression::ZstdDictionary>,
+        charge: ReadCharge,
     ) -> crate::Result<Block> {
         load_block(
             self.global_id(),
@@ -903,6 +943,7 @@ impl Table {
             self.heal_hints.get().map(AsRef::as_ref),
             #[cfg(feature = "metrics")]
             &self.metrics,
+            charge,
         )
     }
 
@@ -910,10 +951,11 @@ impl Table {
     /// block cache in both directions, for the semantic reconcile gates: a
     /// block read before an on-disk alteration leaves its pristine copy
     /// cached, and a gate served that stale original would judge bytes
-    /// other than the ones the digest refresh is about to trust. Reuses the
-    /// cached file descriptor but never consults or populates the block
-    /// cache (the cold verification blocks must not evict the live working
-    /// set either). Decodes under the table's data-block codec context, so
+    /// other than the ones the digest refresh is about to trust. Reuses a
+    /// cached file descriptor without promoting it, opens one privately on a
+    /// miss, and never consults or populates the block cache (the cold
+    /// verification reads must not evict the live working set either).
+    /// Decodes under the table's data-block codec context, so
     /// it fits every gate that walks `block_index` (Data or Columnar role).
     // Compiled under no_std alongside its `verify_kv_checksums` consumer,
     // which is itself dead there (the verify/scrub caller is std-gated).
@@ -929,9 +971,9 @@ impl Table {
         handle: &BlockHandle,
         block_type: BlockType,
     ) -> crate::Result<(Block, crate::Slice)> {
-        let (fd, _cache_event) = self
+        let fd = self
             .file_accessor
-            .get_or_open_table(&self.global_id(), &self.path)?;
+            .peek_or_open_table(&self.global_id(), &self.path)?;
         let transform = crate::table::util::build_block_transform(
             self.metadata.data_block_compression,
             self.encryption.as_deref(),
@@ -953,6 +995,7 @@ impl Table {
                 window_log: 0,
             },
             &transform,
+            || {},
         )?;
         // Swap-defence role check, mirroring `load_block`. Before the
         // decompress: a block that is not what the index claims has no
@@ -963,7 +1006,7 @@ impl Table {
                 header.block_type.into(),
             )));
         }
-        let data = Block::decompress_payload(&header, frame.clone(), &transform)?;
+        let data = Block::decompress_payload(&header, frame.clone(), &transform, &mut 0)?;
         Ok((Block { header, data }, frame))
     }
 
@@ -1047,30 +1090,42 @@ impl Table {
     /// Returns `Ok(None)` when a columnar block is wholly deleted by the
     /// positional mask, so the caller treats it as carrying no keys.
     ///
-    /// `pub(crate)` so the salvage walk ([`crate::salvage`]) can attempt each
-    /// data block individually and drop the ones that fail to load.
+    /// `pub(crate)` so the repair tests can load one block of a table they
+    /// damaged; the salvage walk reads through its own loader,
+    /// [`Table::salvage_load_block`].
     pub(crate) fn load_data_block(&self, handle: &BlockHandle) -> crate::Result<Option<DataBlock>> {
+        self.load_data_block_charged(handle, ReadCharge::Foreground)
+    }
+
+    /// [`Self::load_data_block`] charged as `charge` says, for a read that is
+    /// not a caller's.
+    fn load_data_block_charged(
+        &self,
+        handle: &BlockHandle,
+        charge: ReadCharge,
+    ) -> crate::Result<Option<DataBlock>> {
         // Columnar SSTs store each data block as a PAX `ColumnBatch`; reconstruct
         // the row entries on load so every row read path works unchanged.
         #[cfg(feature = "columnar")]
         if self.metadata.columnar {
-            return self.load_columnar_data_block(handle);
+            return self.load_columnar_data_block(handle, charge);
         }
         // `from_loaded` transparently strips the per-KV checksum footer when
         // this SST carries one. Footer presence is a per-SST property
         // (`kv_checksum_algo`), not a per-block header flag — data blocks omit
         // the block_flags byte — so the descriptor supplies it here.
         let has_kv_footer = self.metadata.kv_checksum_algo.is_some();
-        self.load_block(
+        self.load_block_charged(
             handle,
             BlockType::Data,
             self.metadata.data_block_compression,
             #[cfg(zstd_any)]
             self.zstd_dictionary.as_deref(),
+            charge,
         )
         .and_then(|block| DataBlock::from_loaded(block, has_kv_footer))
         .map(Some)
-        .map_err(|e| self.classify_excised(handle, e))
+        .map_err(|e| self.classify_excised(handle, e, charge))
     }
 
     /// Re-reports a failed block load as [`crate::Error::Excised`] when the
@@ -1086,7 +1141,12 @@ impl Table {
     /// and it needs no recorded state — the zeros identify themselves, which
     /// is what lets an in-place excision survive any crash unrecorded.
     #[cfg(feature = "std")]
-    fn classify_excised(&self, handle: &BlockHandle, err: crate::Error) -> crate::Error {
+    fn classify_excised(
+        &self,
+        handle: &BlockHandle,
+        err: crate::Error,
+        charge: ReadCharge,
+    ) -> crate::Error {
         // A transient / positioned-read failure is not a verdict about the
         // bytes: leave it exactly as it is so the caller can still retry.
         if matches!(err, crate::Error::Io(_)) {
@@ -1095,7 +1155,19 @@ impl Table {
         let Ok(file) = self.fs.open(&self.path, &FsOpenOptions::new().read(true)) else {
             return err;
         };
-        match Self::block_is_zeroed_in(&*file, handle) {
+        // The probe's reads are this read path's too, so they are charged
+        // like the load that failed.
+        #[cfg(feature = "metrics")]
+        let mut on_read = |len: u64| {
+            if charge.is_counted() {
+                crate::table::util::record_block_read(&self.metrics, BlockType::Data, len);
+            }
+        };
+        #[cfg(not(feature = "metrics"))]
+        let mut on_read = |_: u64| {
+            let _ = charge;
+        };
+        match Self::block_is_zeroed_in(&*file, handle, &mut on_read) {
             Ok(true) => crate::Error::Excised {
                 offset: handle.offset().0,
             },
@@ -1107,7 +1179,12 @@ impl Table {
 
     /// No-std builds have no `Fs` open on this path; the original error stands.
     #[cfg(not(feature = "std"))]
-    const fn classify_excised(&self, _handle: &BlockHandle, err: crate::Error) -> crate::Error {
+    const fn classify_excised(
+        &self,
+        _handle: &BlockHandle,
+        err: crate::Error,
+        _charge: ReadCharge,
+    ) -> crate::Error {
         err
     }
 
@@ -1120,35 +1197,61 @@ impl Table {
     /// Returns `Ok(None)` when the positional delete-bitmap deletes every row of
     /// the block, so the caller treats it as carrying no keys.
     #[cfg(feature = "columnar")]
-    fn load_columnar_data_block(&self, handle: &BlockHandle) -> crate::Result<Option<DataBlock>> {
-        let block = self.load_block(
+    fn load_columnar_data_block(
+        &self,
+        handle: &BlockHandle,
+        charge: ReadCharge,
+    ) -> crate::Result<Option<DataBlock>> {
+        let block = self.load_block_charged(
             handle,
             BlockType::Columnar,
             self.metadata.data_block_compression,
             #[cfg(zstd_any)]
             self.zstd_dictionary.as_deref(),
+            charge,
         )?;
         let restart = self.metadata.data_block_restart_interval;
-        match self
+        // The segment has materialized deletes and this block has a recorded
+        // start position: drop the deleted rows during reconstruction. The
+        // start-row map is built at open from the zone map (every block), so
+        // an unmapped block is unreachable; it falls through to the whole-block
+        // reconstruction below rather than masking against the wrong positions.
+        let mut values = 0usize;
+        let rebuilt = if let Some(&start) = self
             .delete_block_starts
             .as_ref()
             .and_then(|starts| starts.get(&handle.offset().0))
         {
-            // The segment has materialized deletes and this block has a recorded
-            // start position: drop the deleted rows during reconstruction. The
-            // start-row map is built at open from the zone map (every block), so
-            // an unmapped block is unreachable; it falls through to the whole-block
-            // reconstruction below rather than masking against the wrong positions.
-            Some(&start) => DataBlock::from_columnar_block_masked(
+            DataBlock::from_columnar_block_masked(
                 &block.data,
                 restart,
                 &self.delete_bitmap,
                 start,
-            ),
+                &mut values,
+            )
+        } else {
             // No materialized deletes (or, unreachably, an unmapped block):
             // reconstruct the whole block.
-            None => DataBlock::from_columnar_block(&block.data, restart).map(Some),
+            DataBlock::from_columnar_block(&block.data, restart, &mut values).map(Some)
+        };
+        // Two gathers, each charged at the size of what it built: the values
+        // rebuilt from sub-columns (none when they are views), and the
+        // row-major block encoded from the rows. The first is charged before
+        // the result is judged: a block refused after it still did it.
+        #[cfg(feature = "metrics")]
+        if charge.is_counted() {
+            self.metrics.record_gather(values);
         }
+        #[cfg(not(feature = "metrics"))]
+        let _ = (values, charge);
+        let rebuilt = rebuilt?;
+        #[cfg(feature = "metrics")]
+        if let Some(rebuilt) = &rebuilt
+            && charge.is_counted()
+        {
+            self.metrics.record_gather(rebuilt.inner.data.len());
+        }
+        Ok(rebuilt)
     }
 
     /// Loads a columnar data block as a delete-masked
@@ -1158,18 +1261,20 @@ impl Table {
     /// keeps its sub-columns and MVCC versions; `Ok(None)` when the positional
     /// delete-bitmap removes every row of the block.
     ///
-    /// `pub(crate)` for the salvage walk ([`crate::salvage`]).
+    /// `pub(crate)` for the salvage walk ([`crate::salvage`]). Salvage is
+    /// maintenance, so nothing here is charged to the gather counter.
     #[cfg(feature = "columnar")]
     pub(crate) fn load_columnar_block_masked(
         &self,
         handle: &BlockHandle,
     ) -> crate::Result<Option<crate::table::columnar::ColumnBatch>> {
-        let block = self.load_block(
+        let block = self.load_block_charged(
             handle,
             BlockType::Columnar,
             self.metadata.data_block_compression,
             #[cfg(zstd_any)]
             self.zstd_dictionary.as_deref(),
+            ReadCharge::Maintenance,
         )?;
         let batch = crate::table::columnar::ColumnBatch::decode(&block.data)?;
         // A real writer never emits an empty data block (the ingest path skips
@@ -1204,7 +1309,7 @@ impl Table {
                 Ok(!self.delete_bitmap.contains(pos))
             })
             .collect::<crate::Result<_>>()?;
-        let masked = crate::table::columnar_predicate::filter_batch(&batch, &keep);
+        let masked = crate::table::columnar_predicate::filter_batch(&batch, &keep)?;
         if masked.row_count == 0 {
             Ok(None)
         } else {
@@ -1254,7 +1359,7 @@ impl Table {
         // increasing offsets rejects the reorder: a genuine index is always in
         // offset order (the writer emits blocks back-to-back).
         let mut prev_offset: Option<u64> = None;
-        for keyed in self.block_index.iter() {
+        for keyed in self.maintenance_index_walk() {
             let keyed = match keyed {
                 Ok(keyed) => keyed,
                 // Only an ENVIRONMENTAL read propagates: a retry, the right key,
@@ -1277,12 +1382,13 @@ impl Table {
                 return Ok(false);
             }
             let handle = BlockHandle::new(keyed.offset(), keyed.size());
-            let block = match self.load_block(
+            let block = match self.load_block_charged(
                 &handle,
                 BlockType::Columnar,
                 self.metadata.data_block_compression,
                 #[cfg(zstd_any)]
                 self.zstd_dictionary.as_deref(),
+                ReadCharge::Maintenance,
             ) {
                 Ok(block) => block,
                 // Only an ENVIRONMENTAL read propagates (see the index arm
@@ -1594,13 +1700,30 @@ impl Table {
             .as_ref()
             .and_then(|starts| starts.get(&handle.offset().0))
             .map(|&start| (self.delete_bitmap.as_ref(), start));
-        DataBlock::columnar_point_block(
+        let mut rows = 0usize;
+        let rebuilt = DataBlock::columnar_point_block(
             &block.data,
             needle,
             &self.comparator,
             self.metadata.data_block_restart_interval,
             deletes,
-        )
+            &mut rows,
+        );
+        // `rows` is what the decode copied out of the block, plus the needle's
+        // keys and values copied out of the columns when it is present; a miss
+        // or a refused block still did those copies, so they are charged
+        // either way. The small block encoded from the rows exists only on a
+        // hit.
+        #[cfg(feature = "metrics")]
+        self.metrics.record_gather(rows);
+        #[cfg(not(feature = "metrics"))]
+        let _ = rows;
+        let rebuilt = rebuilt?;
+        #[cfg(feature = "metrics")]
+        if let Some(rebuilt) = &rebuilt {
+            self.metrics.record_gather(rebuilt.inner.data.len());
+        }
+        Ok(rebuilt)
     }
 
     /// Loads the data block to point-read for `needle`: for a columnar SST the
@@ -1638,7 +1761,19 @@ impl Table {
             #[cfg(zstd_any)]
             self.zstd_dictionary.as_deref(),
         )?;
-        crate::table::columnar::ColumnBatch::decode_projected(&block.data, projection)
+        let mut copied = 0usize;
+        let batch = crate::table::columnar::ColumnBatch::decode_counting_copies(
+            &block.data,
+            Some(projection),
+            &mut copied,
+        );
+        // Charged before the result is judged: a decode refused after it
+        // copied still did the copy.
+        #[cfg(feature = "metrics")]
+        self.metrics.record_gather(copied);
+        #[cfg(not(feature = "metrics"))]
+        let _ = copied;
+        batch
     }
 
     /// Returns the (possibly compressed) file size.
@@ -1704,7 +1839,7 @@ impl Table {
             ..PatrolScrubReport::default()
         };
 
-        for entry in self.block_index.iter() {
+        for entry in self.untraced_index_walk() {
             let keyed = match entry {
                 Ok(h) => h,
                 Err(e) => {
@@ -1919,9 +2054,8 @@ impl Table {
             // zeros and stays a hole.
             let mut holes: alloc::vec::Vec<(u64, u64)> = alloc::vec::Vec::new();
             if sparse {
-                use crate::table::block_index::BlockIndex;
                 let mut probe = alloc::vec::Vec::new();
-                for handle in self.block_index.iter() {
+                for handle in self.maintenance_index_walk() {
                     let handle = handle.map_err(|e| alloc::format!("block index iter: {e}"))?;
                     let block_off = handle.offset().0;
                     let block_len = u64::from(handle.size());
@@ -2384,7 +2518,7 @@ impl Table {
             }
         }
 
-        for entry in self.block_index.iter() {
+        for entry in self.maintenance_index_walk() {
             let keyed = match entry {
                 Ok(h) => h,
                 Err(e) => {
@@ -2922,7 +3056,7 @@ impl Table {
             Ok(())
         };
 
-        for entry in self.block_index.iter() {
+        for entry in self.maintenance_index_walk() {
             // Propagate a transient index-read failure rather than `break`: a
             // truncated prediction would return a digest and an offset set that
             // omit every later block, and the write loop's `predicted_offsets`
@@ -3154,8 +3288,10 @@ impl Table {
             // loads a punched block, whereas `scan` walks every physical block from
             // offset 0 (and would fail decoding a zeroed one). Derive from the live
             // region accordingly; the restricted derive covers only the live suffix.
+            // Like `scan`, the walk is verification: uncounted, and it leaves
+            // the workload's block cache as it found it.
             if restricted {
-                for kv in self.range(..) {
+                for kv in self.range_iter(..).untraced() {
                     accumulate(kv?)?;
                 }
             } else {
@@ -3164,7 +3300,7 @@ impl Table {
                 }
             }
         }
-        let Some(recorded) = self.list_blob_file_references()? else {
+        let Some(recorded) = self.untraced_blob_file_references()? else {
             // No section is valid ONLY for a table with no indirections; a
             // non-empty derived map with no recorded section is a dropped /
             // renamed section hiding live blob references.
@@ -3653,7 +3789,7 @@ impl Table {
             // A PRESENT-but-empty map on a table with data blocks is a forgery;
             // the standalone gate rejects it before its walk, so do it here.
             Some(map) if map.is_empty() => {
-                if self.block_index.iter().next().is_some() {
+                if self.untraced_index_walk().next().is_some() {
                     return Err((
                         G::ZoneMap,
                         crate::Error::InvalidHeader(
@@ -4291,6 +4427,9 @@ impl Table {
     /// read; a nonzero window proves the block intact without reading the rest
     /// (a real block's header and first entry bytes are never all zero).
     ///
+    /// `on_read` is told the length of each read before it is issued, so a
+    /// read path can charge the probe to its byte counters.
+    ///
     /// # Errors
     ///
     /// Propagates the positioned read failure.
@@ -4298,10 +4437,12 @@ impl Table {
     fn block_is_zeroed_in(
         file: &dyn crate::fs::FsFile,
         block_handle: &BlockHandle,
+        on_read: &mut dyn FnMut(u64),
     ) -> crate::Result<bool> {
         const WINDOW: usize = 64;
         let size = block_handle.size() as usize;
         let window = size.min(WINDOW);
+        on_read(window as u64);
         let head = crate::file::read_exact(file, block_handle.offset().0, window)?;
         if head.iter().any(|&b| b != 0) {
             return Ok(false);
@@ -4309,6 +4450,7 @@ impl Table {
         if size <= window {
             return Ok(true);
         }
+        on_read(size as u64);
         let bytes = crate::file::read_exact(file, block_handle.offset().0, size)?;
         Ok(bytes.iter().all(|&b| b == 0))
     }
@@ -4375,10 +4517,12 @@ impl Table {
         let mut first_readable: Option<(usize, UserKey)> = None;
         let mut after_last_zeroed: Option<usize> = None;
         let mut irregular = false;
-        for (i, handle) in self.block_index.iter().enumerate() {
+        for (i, handle) in self.maintenance_index_walk().enumerate() {
             let handle = handle?;
             let block = BlockHandle::new(handle.offset(), handle.size());
-            if Self::block_is_zeroed_in(&*file, &block)? {
+            // A recovery walk over the file's geometry, not a read a caller
+            // asked for, so it charges nothing to the read counters.
+            if Self::block_is_zeroed_in(&*file, &block, &mut |_| {})? {
                 // A readable block BELOW a zeroed one is positive evidence of
                 // a punch that failed mid-reclaim.
                 if first_readable.is_some() {
@@ -4505,13 +4649,13 @@ impl Table {
         // the anchor), so this only walks forward past WHOLLY EMPTY blocks —
         // e.g. a columnar block fully masked by its delete bitmap, which
         // carries no key to anchor on.
-        for (i, handle) in self.block_index.iter().enumerate() {
+        for (i, handle) in self.maintenance_index_walk().enumerate() {
             let handle = handle?;
             if i < start {
                 continue;
             }
             let bh = BlockHandle::new(handle.offset(), handle.size());
-            if let Some(db) = self.load_data_block(&bh)?
+            if let Some(db) = self.load_data_block_charged(&bh, ReadCharge::Maintenance)?
                 && let Some(first) = db.first_user_key(self.comparator.clone())?
             {
                 return Ok(Some(first));
@@ -4559,9 +4703,10 @@ impl Table {
                 block.header.block_type.into(),
             )));
         }
+        // Verification, not a caller's read: like every other gate's walk it
+        // stays out of the read counters and leaves the block cache alone.
         let blocks: Vec<BlockHandle> = self
-            .block_index
-            .iter()
+            .untraced_index_walk()
             .map(|r| r.map(|kbh| *kbh.as_ref()))
             .collect::<crate::Result<Vec<_>>>()?;
         Ok(Some(crate::table::locator::LoadedLocator::new(
@@ -4869,7 +5014,7 @@ impl Table {
         // hidden bitmap deleted.
         if let Some(filter) = &full_filter
             && filter.is_empty()
-            && self.block_index.iter().next().is_some()
+            && self.untraced_index_walk().next().is_some()
         {
             return Err(crate::Error::InvalidHeader(
                 "filter section is present but empty on a table with data blocks",
@@ -5154,7 +5299,7 @@ impl Table {
         // `data_block_count` describes the WHOLE table, punched prefix
         // included, so it is counted off the index itself — no decode.
         let mut block_count: u64 = 0;
-        for handle in self.block_index.iter() {
+        for handle in self.untraced_index_walk() {
             handle?;
             block_count = block_count
                 .checked_add(1)
@@ -5524,7 +5669,7 @@ impl Table {
         // cannot catch it: a block absent from the map is skipped, so an empty
         // map trivially "agrees" with every block.)
         if map.is_empty() {
-            if self.block_index.iter().next().is_some() {
+            if self.untraced_index_walk().next().is_some() {
                 return Err(crate::Error::InvalidHeader(
                     "block_layout section is present but empty on a table with data blocks",
                 ));
@@ -5559,7 +5704,7 @@ impl Table {
         use crate::table::block::ParsedItem as _;
 
         let punch = self.punch_offset()?;
-        for handle in self.block_index.iter() {
+        for handle in self.untraced_index_walk() {
             let handle = handle?;
             let handle = BlockHandle::new(handle.offset(), handle.size());
             if handle.offset().0 < punch {
@@ -5799,8 +5944,18 @@ impl Table {
         if seqno > self.metadata.seqnos.1
             && let Some(iv) = &item
         {
-            self.cache
-                .insert_row(self.global_id(), key_hash, iv.clone());
+            let detached = self.cache.insert_row(
+                self.global_id(),
+                key_hash,
+                &iv.key.user_key,
+                iv.key.seqno,
+                iv.key.value_type,
+                &iv.value,
+            );
+            #[cfg(feature = "metrics")]
+            self.metrics.record_gather(detached);
+            #[cfg(not(feature = "metrics"))]
+            let _ = detached;
         }
 
         // Translate table-local seqno back to global coordinate so callers
@@ -5880,16 +6035,18 @@ impl Table {
 
         // Populate only when this read could see the SST's newest version
         // (`seqno > max`, exclusive), mirroring `Table::get`. The value path does
-        // not reconstruct the matched key, so rebuild the `InternalValue` from
-        // the query key (the needle) + the resolved `(value_type, seqno, value)`.
+        // not reconstruct the matched key, so the row is keyed by the query key
+        // (the needle) + the resolved `(value_type, seqno, value)`.
         if seqno > self.metadata.seqnos.1
             && let Some((vt, s, v)) = &item
         {
-            let iv = InternalValue {
-                key: crate::key::InternalKey::new(crate::UserKey::from(key), *s, *vt),
-                value: v.clone(),
-            };
-            self.cache.insert_row(self.global_id(), key_hash, iv);
+            let detached = self
+                .cache
+                .insert_row(self.global_id(), key_hash, key, *s, *vt, v);
+            #[cfg(feature = "metrics")]
+            self.metrics.record_gather(detached);
+            #[cfg(not(feature = "metrics"))]
+            let _ = detached;
         }
 
         // Translate table-local seqno back to the global coordinate, mirroring
@@ -6581,7 +6738,31 @@ impl Table {
             self.metadata.ecc_params,
             #[cfg(zstd_any)]
             self.zstd_dictionary.as_deref(),
+            #[cfg(feature = "metrics")]
+            &self.metrics,
         );
+    }
+
+    /// Charges data blocks a batched multi-get read (prewarm or chunked
+    /// resolve) is about to ask of the filesystem, at the moment it is issued.
+    #[cfg_attr(
+        not(feature = "metrics"),
+        expect(
+            clippy::unused_self,
+            reason = "the table's counters are the feature's payload"
+        )
+    )]
+    pub(crate) fn record_batched_read(&self, handles: &[BlockHandle]) {
+        #[cfg(feature = "metrics")]
+        for handle in handles {
+            crate::table::util::record_block_read(
+                &self.metrics,
+                BlockType::Data,
+                handle.size().into(),
+            );
+        }
+        #[cfg(not(feature = "metrics"))]
+        let _ = handles;
     }
 
     /// Capacity in bytes of this table's (shared) block cache, for the level
@@ -6711,7 +6892,22 @@ impl Table {
             dict_id: self.metadata.data_block_compression.dict_id(),
             window_log: 0,
         };
-        let block = Block::from_reader(&mut crate::io::Cursor::new(bytes), identity, &transform)?;
+        // The transform runs here, outside the block cache, so its output is
+        // charged here, before the result is judged: a block the length or
+        // role check refuses was still decoded. The read was charged when the
+        // batch was issued.
+        let mut produced = 0;
+        let decoded = Block::from_reader_counting(
+            &mut crate::io::Cursor::new(bytes),
+            identity,
+            &transform,
+            &mut produced,
+        );
+        #[cfg(feature = "metrics")]
+        self.metrics
+            .block_bytes_decoded
+            .fetch_add(produced as u64, core::sync::atomic::Ordering::Relaxed);
+        let block = decoded?;
         if block.header.block_type != BlockType::Data {
             return Err(crate::Error::InvalidTag((
                 "BlockType",
@@ -6777,7 +6973,7 @@ impl Table {
         // dropped by the scanner's key filter.
         let mut start_offset = 0u64;
         if let Some(bound) = &self.1 {
-            for keyed in self.block_index.iter() {
+            for keyed in self.maintenance_index_walk() {
                 let keyed = keyed?;
                 if self.comparator.compare(keyed.end_key(), bound.as_ref())
                     == core::cmp::Ordering::Less
@@ -6960,7 +7156,10 @@ impl Table {
                         }
                     }
                 }
-                crate::table::columnar_predicate::filter_batch(&batch, &keep)
+                let filtered = crate::table::columnar_predicate::filter_batch(&batch, &keep)?;
+                #[cfg(feature = "metrics")]
+                self.metrics.record_gather(filtered.data_size());
+                filtered
             } else {
                 batch
             };
@@ -8158,7 +8357,10 @@ impl Table {
         } else {
             let mut map = crate::HashMap::default();
             let mut start: u32 = 0;
-            for keyed in block_index.iter() {
+            // Part of opening the table, not a read a caller made, so it stays
+            // out of the read counters like the locator walk below.
+            let walk = block_index.iter().with_charge(ReadCharge::Maintenance);
+            for keyed in walk {
                 let keyed = keyed?;
                 map.insert(keyed.offset().0, start);
                 let row_count = zone_map
@@ -8234,8 +8436,8 @@ impl Table {
                 rebuildable_section_degraded = true;
                 return None;
             }
-            let blocks: Vec<BlockHandle> = block_index
-                .iter()
+            let walk = block_index.iter().with_charge(ReadCharge::Maintenance);
+            let blocks: Vec<BlockHandle> = walk
                 .map(|r| r.map(|kbh| *kbh.as_ref()))
                 .collect::<crate::Result<Vec<_>>>()
                 .inspect_err(|e| {
@@ -8478,8 +8680,13 @@ impl Table {
         )
     )]
     pub(crate) fn punch_offset_for(&self, key: &[u8]) -> crate::Result<u64> {
+        self.punch_offset_charged(key, ReadCharge::Maintenance)
+    }
+
+    /// [`Self::punch_offset_for`], charging its index walk as `charge` says.
+    fn punch_offset_charged(&self, key: &[u8], charge: ReadCharge) -> crate::Result<u64> {
         let mut data_end = 0u64;
-        for handle in self.block_index.iter() {
+        for handle in self.index_walk_charged(charge) {
             let handle = handle?;
             if self.comparator.compare(handle.end_key(), key) != core::cmp::Ordering::Less {
                 return Ok(handle.offset().0);
@@ -8535,33 +8742,51 @@ impl Table {
     /// one the blocks above the straddling one are apportioned by data bytes,
     /// which is the same granularity every other estimate over this table uses.
     ///
+    /// `charge` says whose read this is. A query planner's estimate is part of
+    /// the query and is counted; a monitoring report is not, so polling it
+    /// leaves a workload's read counters unchanged.
+    ///
     /// # Errors
     ///
-    /// Propagates the index lookup of the restriction bound and the read of the
-    /// straddling block.
-    pub(crate) fn live_item_count(&self) -> crate::Result<u64> {
+    /// Propagates the index walk and the read of the straddling block.
+    pub(crate) fn live_item_count(&self, charge: ReadCharge) -> crate::Result<u64> {
         let Some(bound) = self.restrict_lower_bound() else {
             return Ok(self.metadata.item_count);
         };
-        let punch = self.punch_offset_for(bound)?;
+        // One walk serves all of it: the blocks below the straddling one are
+        // skipped, the straddling one is counted, the rest are summed.
+        let mut walk = self.index_walk_charged(charge);
+        let mut any_block = false;
+        let straddle = loop {
+            let Some(handle) = walk.next() else {
+                break None;
+            };
+            let handle = handle?;
+            any_block = true;
+            if self.comparator.compare(handle.end_key(), bound) != core::cmp::Ordering::Less {
+                break Some(handle);
+            }
+        };
+        let Some(straddle) = straddle else {
+            // Past every block the whole data region is superseded; a table
+            // with no data blocks keeps its recorded count.
+            return Ok(if any_block {
+                0
+            } else {
+                self.metadata.item_count
+            });
+        };
+        let punch = straddle.offset().0;
         if punch == 0 {
             return Ok(self.metadata.item_count);
         }
-        // Nothing below the straddling block survives, and the restriction can
-        // reach past every block (then the whole data region is dead).
-        let Some((straddle_end, straddle_live)) = self.straddling_block_live(punch, bound)? else {
-            return Ok(0);
-        };
+        let straddle_live = self.straddling_block_live(&straddle, bound, charge)?;
         if !self.zone_map.is_empty() {
+            // The straddling block is counted exactly above: its recorded row
+            // count covers the dead rows below the bound too.
             let mut rows = straddle_live;
-            for handle in self.block_index.iter() {
+            for handle in walk {
                 let handle = handle?;
-                // `<=` skips the straddling block: it is counted exactly above,
-                // and its recorded row count covers the dead rows below the
-                // bound too.
-                if *handle.offset() <= punch {
-                    continue;
-                }
                 if let Some(col) = self
                     .zone_map
                     .columns_for(*handle.offset())
@@ -8572,13 +8797,12 @@ impl Table {
             }
             return Ok(rows);
         }
-        let Some(last) = self.block_index.iter().next_back() else {
-            return Ok(straddle_live);
+        let straddle_end = punch + u64::from(straddle.size());
+        let last = match walk.next_back() {
+            Some(last) => last?,
+            None => straddle,
         };
-        let data_end = {
-            let last = last?;
-            *last.offset() + u64::from(last.size())
-        };
+        let data_end = *last.offset() + u64::from(last.size());
         // A straddling block reaching past the data section cannot be reasoned
         // about; keep the recorded count rather than inventing a smaller one.
         let Some(above) = data_end.checked_sub(straddle_end).filter(|_| data_end > 0) else {
@@ -8591,43 +8815,43 @@ impl Table {
         Ok(straddle_live + apportioned)
     }
 
-    /// The block at `punch` STRADDLES the restriction: it is the first whose
-    /// last key reaches `bound`, so the view serves only its entries
-    /// `>= bound`. Returns its end offset and that live count.
+    /// This view's block-index walk, charged to the read counters only when it
+    /// serves a caller's read.
+    fn index_walk_charged(&self, charge: ReadCharge) -> block_index::BlockIndexIterImpl {
+        self.block_index.iter().with_charge(charge)
+    }
+
+    /// The live rows of the block STRADDLING the restriction: the first whose
+    /// last key reaches `bound`, of which the view serves only the entries
+    /// `>= bound`.
     ///
     /// Every block below it is dead in full and every block above is live in
     /// full, so it is the only one whose rows have to be counted rather than
     /// read off the index — and a bound landing on a block's last key (what a
     /// tight-space slice commonly produces) makes almost all of its rows dead.
     ///
-    /// `None` when no block starts at `punch`: the restriction reaches past the
-    /// last key, so the whole data region is superseded.
-    ///
     /// # Errors
     ///
-    /// Propagates the block-index walk and the read of the straddling block.
-    fn straddling_block_live(&self, punch: u64, bound: &[u8]) -> crate::Result<Option<(u64, u64)>> {
-        for handle in self.block_index.iter() {
-            let handle = handle?;
-            if *handle.offset() != punch {
-                continue;
+    /// Propagates the read of the block.
+    fn straddling_block_live(
+        &self,
+        straddle: &KeyedBlockHandle,
+        bound: &[u8],
+        charge: ReadCharge,
+    ) -> crate::Result<u64> {
+        // A wholly delete-masked columnar block serves no keys at all.
+        let Some(block) = self.load_data_block_charged(straddle.as_ref(), charge)? else {
+            return Ok(0);
+        };
+        let data = &block.inner.data;
+        let cmp = &*self.comparator;
+        let mut live = 0u64;
+        for item in block.iter(self.comparator.clone()) {
+            if item.compare_key(bound, data, cmp) != core::cmp::Ordering::Less {
+                live += 1;
             }
-            let end = punch + u64::from(handle.size());
-            // A wholly delete-masked columnar block serves no keys at all.
-            let Some(block) = self.load_data_block(handle.as_ref())? else {
-                return Ok(Some((end, 0)));
-            };
-            let data = &block.inner.data;
-            let cmp = &*self.comparator;
-            let mut live = 0u64;
-            for item in block.iter(self.comparator.clone()) {
-                if item.compare_key(bound, data, cmp) != core::cmp::Ordering::Less {
-                    live += 1;
-                }
-            }
-            return Ok(Some((end, live)));
         }
-        Ok(None)
+        Ok(live)
     }
 
     /// The same digest for a restriction this VIEW does not carry yet: the

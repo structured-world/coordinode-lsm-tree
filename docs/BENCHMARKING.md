@@ -77,6 +77,136 @@ LSM_BENCH_PRESET=lsm-paranoid cargo bench
 The active preset is printed once to stderr at the start of the run, so it is
 recorded in the dashboard provenance.
 
+## Read-path byte counters
+
+Three counters describe what a read costs, and they are reported together
+because each one alone is misleading. They are behind the `metrics` feature
+and read through `AbstractTree::metrics()`.
+
+| Counter | Counts | Does not count |
+|---|---|---|
+| `bytes_read` | Bytes requested from the `Fs` trait: a block's on-disk size summed over the block roles (data, index, filter, range tombstone), plus the on-disk span of every blob record a key-value-separated tree resolved (a coalesced prefetch charges its whole extent, gaps included, because that is what it read). Charged when the read is issued, so a read that then fails its checksum is counted, and on every path that reads outside the block cache: point and range reads, `multi_get`'s batched and chunked reads, and the partial decode of large zstd blocks. | Device I/O. The OS page cache, readahead and request coalescing sit below this line. Anything served from a cache, block or blob, asks for nothing and adds nothing. Maintenance: a compaction's input, the values its filter resolves, the index walks that open a table, verify it or locate its live region, a patrol scrub's reads, including the re-read that confirms an ECC correction, and salvage. Monitoring: the storage statistics report's reads, which also neither fill the block cache nor promote what they find there, so polling it during a run leaves the run's figures unchanged. A query planner's range estimates are part of the query they plan and are counted. |
+| `blob_bytes_read` | The blob-only share of `bytes_read`, so a scan can be asked whether it paid for the blobs of rows it then discarded. | Everything the block roles cover. |
+| `bytes_decoded` | Payload bytes produced after the transform — what decompression, decryption and Page-ECC verification turned the bytes read into, for blocks and for blob records alike. | Anything on a cached path: a cached block or blob is already decoded, so no transform runs for it. |
+| `bytes_copied` | Bytes moved by a **gather**: column-batch accumulation, batch filtering, row gathering by index, row-value reconstruction from sub-columns, a point read's copy of the matching rows out of the columns, the row-major block a columnar block is re-encoded into, the copy of each uncompressed blob record out of a scan's read-ahead span (so a cached value does not pin the whole span), the partial decode of a large zstd block (the decoded prefix each time it grows, a resumed prefix moved back into the decoder's window, and the row block synthesized from the prefix, including one served from the partial cache), what decoding a columnar block copies out of it (validity bitmaps, and columns a narrow projection detaches rather than keep the whole block alive for), the effective seqnos written over a bulk-ingested segment's local ones, the key and value a point read detaches into the row cache (so the cached row does not pin its block), and the key each resolved blob is cached under, on every read that performs one (single-segment and merged columnar scans, row iteration and point reads). The figure sums the bytes each of those operations produced, whether or not the read then returns a row: a point read of a missing key still decoded its block, a block refused after a copy still made it, and an intermediate gather that is copied again counts both times. A row read whose value is a single bytes column hands out views into the decoded column and charges nothing. A view is a view whatever its representation: a short key or value stored inline in its handle is not charged, because that inline copy costs no more than building the handle. | Transform output (that is `bytes_decoded`), write-path serialisation, the input decoding of compaction, repair and salvage (maintenance, not reads), the storage statistics report (monitoring), and moves that transfer ownership without duplicating bytes. |
+
+**Why the definitions are written down rather than inferred.** "Bytes read"
+can plausibly mean either bytes asked of the filesystem or bytes the device
+actually moved, and the two differ by the whole page cache. "Bytes copied"
+means nothing at all until the set of operations it counts is named — without
+that, a new code path wins simply by not being instrumented. A figure whose
+definition is implicit is not a measurement.
+
+That last hazard is not hypothetical: a key-value-separated tree keeps most of
+its bytes in blob files, so a counter that covered only blocks would report a
+tree reading gigabytes as reading a few bytes of indirection per row, and any
+change that moved work into the blob path would read as a win. Blob reads are
+counted for that reason.
+
+**How to read them.**
+
+- **Read and decoded together** tell a physical projection from a cosmetic
+  one. A projection that returns two columns of a wide record but still loads
+  and decompresses the whole block leaves decoded unchanged while the
+  returned batch shrinks; one that reads only the pages it needs moves it.
+  Read alone cannot show this — a 4 KiB compressed block is 4 KiB read
+  however much it expands to.
+- **Their ratio** is the compression the read actually paid for.
+- **Copied per row** should be a small constant. A path that
+  materialises its working set once sits there; one that folds batches
+  together pairwise records the whole accumulated size on every fold, so the
+  counter grows with the square of the fold count rather than with the data.
+  That growth is visible here and nowhere else.
+
+`tests/read_byte_counters.rs` pins one clause of each definition, so a change
+that moves a counter without moving the behaviour it stands for fails rather
+than quietly rebasing the instrument.
+
+**May not regress:** `bytes_read` and `bytes_decoded` per emitted row on the
+projection scenarios, and `bytes_copied` per emitted row on every scenario. A
+change that improves compressed size while raising decoded per row has not
+paid for itself.
+
+### The `mixed-layout` workload
+
+`db_bench --benchmark mixed-layout` is where those counters are read. It walks
+a set of record shapes rather than repeating one operation, and reports the
+byte counters per emitted row instead of a rate:
+
+```sh
+cd tools/db_bench && cargo run --release --features counters -- --benchmark mixed-layout --num 70000
+```
+
+It is built only with the `counters` feature, which turns on the engine's
+`metrics`: the counters are atomics on every read path, so a binary carrying
+them measures a slower engine than the one that ships. The rate workloads
+therefore run from the default build, and the dashboard runs this workload as
+a second pass from a `counters` build. It runs on one thread, since its figures
+are bytes per row and concurrency does not change them, and each scenario fixes
+its own key format, value sizes and tree kind. `--threads` other than 1,
+`--key-size`, `--value-size` and `--use-blob-tree` are therefore refused rather
+than recorded against a run that did not use them. `--num` is an upper bound:
+each fixture caps its key count at a size that keeps the sweep's build time
+bounded, and every series names in its annotation (`keys: N`) the size it was
+measured on.
+
+| Scenario | Shape |
+|---|---|
+| `narrow-records` | A few small fields per row. The control: no projection can cost more per row than reading a narrow row whole. |
+| `wide-records-full-read` | Small fields plus a 4 KiB payload, read whole. The baseline a projection is compared against. |
+| `wide-records-projected` | **Unsupported.** Needs a projection that returns the header fields without the payload. |
+| `mixed-value-sizes` | Short and long values in one key space, so no single block geometry fits both. |
+| `row-updates-over-columnar-base` | A columnar base flushed first, then the layout switched off and a third of the keys rewritten, so the newest version of those lives in a row-major run above a columnar one. |
+| `versions-deletes-tombstones` | Several versions per key, a fifth point-deleted, a contiguous slice covered by a range tombstone, read at `SeqNo::MAX`. |
+| `selective-scan-sparse` | A predicate matching ~1% of rows, handed to the columnar scan over a field stored in a sub-column of its own, with zone maps on. Where materializing before the predicate runs wastes nearly all the work. |
+| `selective-scan-near-full` | A predicate matching ~90%, over the same fixture. Deferring materialization buys almost nothing here and its bookkeeping can cost more than it saves, so the two are read together. |
+| `blobs-well-placed` | Values far above the separation threshold, written once in key order, so neighbours' blobs are adjacent. Read by a full scan, the pass where adjacent blobs are fetched ahead and merged into one read. |
+| `blobs-scattered` | The same blobs written in a strided order and rewritten in several flushed rounds, so a key's live blob sits in whichever file its last round landed in. Read by the same full scan, so the gap to the well-placed figure is what placement costs. Both placement scenarios report **unsupported** under `--cache-mb 0`: the prefetch holds what it fetches in the cache, so without one placement cannot show. |
+| `blobs-filtered-before-fetch` | **Unsupported.** Needs materialization deferred past the filter, so discarded rows' blobs are never fetched. |
+
+The selective scans hand the predicate to the engine rather than filtering
+returned rows: a harness-side filter would make every selectivity cost the same
+engine work and change only the row count the figures divide by.
+
+**Every scenario checks what it read.** A pass that only counted rows would
+report a flattering figure for a build that stopped resolving versions, since
+skipping work is fast. Each read pass compares every value against the oracle
+its fixture derived from the **write history** — not from a second read, since
+two paths sharing one faulty version-resolution routine agree with each other
+while both are wrong.
+
+A scenario whose native path does not exist reports `UNSUPPORTED` with the
+capability it waits for, and contributes no figure. It is never quietly run
+through a fallback path under the same name: a series that stays continuous
+across the change that was supposed to move it is worse than a gap. Its
+fixture exists regardless and is exercised by the workload's tests
+(`cd tools/db_bench && cargo nextest run --features counters`), so enabling the scenario later is
+one line rather than a fresh argument about what the expected result is.
+
+**On the dashboard** this workload publishes one series per scenario per
+counter, named `mixed-layout / <scenario> bytes read per row` (and
+`… bytes decoded per row`, `… bytes copied per row`), in place of the ops/sec
+every other workload reports — for a scenario sweep the
+rate counts scenarios per second, which describes the harness rather than the
+engine. The `--json` report and the plain summary carry the same series in
+place of the rate. The fixtures open their trees with the run's cache, metadata
+and compression flags (`--compression` reaches blob files too), so
+`--cache-mb 0` measures cold reads here as everywhere else.
+
+All three are costs with one denominator, the rows the scenario emitted, so
+they read the same way and compare directly: a projection that stops loading a
+payload moves read and decoded per row down together. They live in a
+smaller-is-better suite of their own, `lsm-tree db_bench costs`, because the
+dashboard fixes one direction per suite and the rates are bigger-is-better.
+Zero is the best value there (a read that gathers nothing copies nothing), and
+a scenario whose copies go from zero to anything alerts. A scenario that
+emitted no row publishes nothing, since its cost per row does not exist. The
+plain summary also prints decoded over read and copied over decoded as
+diagnostics, `n/a` where the denominator is zero; they are not series.
+`db_bench --github-json` writes the bigger-is-better series to stdout, or
+appends them to the array in a file with `--github-json-append <PATH>`, and
+`--github-json-costs <PATH>` writes the costs.
+
 ## Checklist for format-changing PRs
 
 A PR that adds or changes an on-disk format feature MUST:

@@ -1,9 +1,9 @@
 use super::Cache;
 
-/// A cached row must own its value, not view the data block the value was read
-/// out of.
+/// A cached row must own its key and value, not view the data block they were
+/// read out of.
 ///
-/// The point-read path produces a value as a subslice of the decoded block, and
+/// The point-read path produces them as subslices of the decoded block, and
 /// a subslice keeps the whole block allocation alive. The weigher charges the
 /// row only its own key and value bytes, so a hundred-byte row viewing a four
 /// kilobyte block is accounted as a hundred bytes while holding four thousand.
@@ -15,7 +15,7 @@ use super::Cache;
 /// buffer, a copy's do not. That holds for either slice backend, where a
 /// reference count does not.
 #[test]
-fn row_cache_when_given_a_block_subslice_stores_a_detached_copy() {
+fn row_cache_when_given_block_subslices_stores_detached_copies() {
     let cache = Cache::with_capacity_bytes(1024 * 1024);
     let id = crate::table::GlobalTableId::from((0, 0));
 
@@ -32,36 +32,34 @@ fn row_cache_when_given_a_block_subslice_stores_a_detached_copy() {
     // never point at the block and the test would prove nothing about the case
     // it exists for: a value large enough to be kept as a view.
     let value = block.slice(0..64);
+    // A restart-head key is a view into the block too, with the same effect.
+    let user_key = block.slice(64..96);
     assert!(
-        block_range.contains(&(value.as_ptr() as usize)),
+        block_range.contains(&(value.as_ptr() as usize))
+            && block_range.contains(&(user_key.as_ptr() as usize)),
         "precondition: a subslice past the inline threshold points into the block's own buffer",
     );
 
-    cache.insert_row(
-        id,
-        1,
-        crate::InternalValue {
-            key: crate::key::InternalKey::new(
-                crate::UserKey::from(&b"k"[..]),
-                1,
-                crate::ValueType::Value,
-            ),
-            value,
-        },
+    let copied = cache.insert_row(id, 1, &user_key, 1, crate::ValueType::Value, &value);
+    assert_eq!(
+        copied, 96,
+        "the row owns a copy of its 32-byte key and 64-byte value"
     );
 
-    let Some(got) = cache.get_row(id, 1, b"k") else {
+    let Some(got) = cache.get_row(id, 1, &user_key) else {
         panic!("the row was just inserted, so the lookup must hit");
     };
 
     assert!(
-        !block_range.contains(&(got.value.as_ptr() as usize)),
+        !block_range.contains(&(got.value.as_ptr() as usize))
+            && !block_range.contains(&(got.key.user_key.as_ptr() as usize)),
         "the cached row still points into the block it was read from, so it \
          keeps the whole block alive while being charged only its own bytes",
     );
 
     // And the copy has to be a faithful one.
     assert_eq!(&*got.value, &[7_u8; 64][..]);
+    assert_eq!(&*got.key.user_key, &[7_u8; 32][..]);
 }
 
 #[test]
@@ -92,11 +90,16 @@ fn a_blob_lookup_under_a_conflicting_key_misses_rather_than_serving_the_other_va
         on_disk_size: 5,
     };
 
-    cache.insert_blob(
+    let copied = cache.insert_blob(
         0,
         &vhandle,
         b"real-key",
         crate::UserValue::from(&b"value"[..]),
+    );
+    assert_eq!(
+        copied,
+        b"real-key".len(),
+        "the entry owns a copy of its key"
     );
 
     // The key it was stored under still finds it.
@@ -131,7 +134,8 @@ fn a_blob_lookup_with_a_conflicting_size_misses_rather_than_serving_the_value() 
         on_disk_size: 5,
     };
 
-    cache.insert_blob(0, &stored, b"key", crate::UserValue::from(&b"value"[..]));
+    let copied = cache.insert_blob(0, &stored, b"key", crate::UserValue::from(&b"value"[..]));
+    assert_eq!(copied, b"key".len(), "the entry owns a copy of its key");
 
     assert_eq!(
         cache.get_blob(0, &stored, b"key").as_deref(),
