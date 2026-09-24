@@ -3787,6 +3787,125 @@ fn verify_zone_map_rejects_a_forged_columnar_column_id() -> crate::Result<()> {
     Ok(())
 }
 
+/// A columnar SST of one 64 KiB row group cut into 1 KiB row pages, so the
+/// group carries statistics zones in its directory and its zone block.
+#[cfg(feature = "columnar")]
+fn zoned_source(source: &std::path::Path, fs: &Arc<dyn Fs>) -> crate::Result<()> {
+    let mut writer = Writer::new(source.to_path_buf(), 0, 0, Arc::clone(fs))?
+        .use_columnar(true)
+        .use_zone_map(true)
+        .use_row_group_size(64 * 1_024)
+        .use_columnar_page_size(1_024);
+    for i in 0u32..400 {
+        writer.write(iv(i))?;
+    }
+    assert!(writer.finish()?.is_some(), "source SST is non-empty");
+    Ok(())
+}
+
+/// Narrows the zone of row page 1 to its upper bound alone, keeping every
+/// bound's length, so the zones stay well formed and the same size and only
+/// disagree with the rows they describe.
+#[cfg(feature = "columnar")]
+fn narrowed(
+    zones: &crate::table::column_page::PageZones,
+    columns: &[u16],
+    row_pages: usize,
+) -> crate::table::column_page::PageZones {
+    let mut out = crate::table::column_page::PageZones::new(columns.to_vec());
+    for (row_page, ordinal) in (0..row_pages).zip(0u16..) {
+        for &column_id in columns {
+            let Some(zone) = zones.zone(ordinal, column_id) else {
+                panic!("a zone per row page");
+            };
+            let Some(max) = zone.max else {
+                panic!("the fixture's zones are bounded");
+            };
+            let min = if row_page == 1 { max } else { zone.min };
+            assert_eq!(min.len(), zone.min.len(), "the forgery keeps the length");
+            out.push(zone.null_count, Some((min, max)));
+        }
+    }
+    out
+}
+
+/// A row page's statistics zones decide whether a read skips it, and nothing
+/// on the read path looks at the rows it skipped, so the gates authenticate
+/// them by re-deriving them from the decoded group. A zone narrowed past the
+/// rows it describes, checksum-consistent, in the directory or in the zone
+/// block, is refused.
+#[cfg(feature = "columnar")]
+#[test]
+fn verify_rejects_row_page_zones_that_disagree_with_their_rows() -> crate::Result<()> {
+    use crate::table::columnar::{COL_USER_KEY, COL_VALUE};
+
+    let dir = tempdir()?;
+    let fs: Arc<dyn Fs> = Arc::new(StdFs);
+
+    // The directory's key zones.
+    let source = dir.path().join("key_zones");
+    zoned_source(&source, &fs)?;
+    let honest = open(source.clone(), &fs)?;
+    reconcile_clean(&honest, None);
+    let (group_at, directory) = row_group(&source, &fs, 0)?;
+    let row_pages = directory.row_pages().len();
+    assert!(
+        row_pages > 2,
+        "the fixture must cut its group into row pages"
+    );
+    let forged = crate::table::column_page::PageDirectory::new(
+        directory.row_count(),
+        directory.group_tag(),
+        directory.row_pages().to_vec(),
+        directory.entries().to_vec(),
+        narrowed(directory.zones(), &[COL_USER_KEY], row_pages),
+        directory.zones_len(),
+    )?;
+    let mut payload = Vec::new();
+    forged.encode_into(&mut payload);
+    let mut bytes = std::fs::read(&source)?;
+    restamp_block(&mut bytes, group_at, &payload)?;
+    std::fs::write(&source, &bytes)?;
+    let err = reconcile_error(
+        &open(source, &fs)?,
+        crate::table::ReconcileGate::BlockEntryCounts,
+        None,
+    );
+    assert!(
+        matches!(err, crate::Error::InvalidHeader(msg) if msg.contains("row page statistics")),
+        "a forged directory zone must be refused, got {err:?}",
+    );
+
+    // The zone block's value zones.
+    let source = dir.path().join("block_zones");
+    zoned_source(&source, &fs)?;
+    let (group_at, directory) = row_group(&source, &fs, 0)?;
+    let mut bytes = std::fs::read(&source)?;
+    let directory_len = {
+        use crate::coding::Decode;
+        let Some(frame) = bytes.get(group_at..) else {
+            panic!("group within the file");
+        };
+        crate::table::block::Header::decode_from(&mut &frame[..])?.on_disk_size_with(None)
+    };
+    let zones_at = group_at + directory_len as usize + directory.pages_len() as usize;
+    let zones = directory.decode_zone_block(&block_payload(&bytes, zones_at)?)?;
+    let mut payload = Vec::new();
+    narrowed(&zones, &[COL_VALUE], row_pages).encode_into(&mut payload);
+    restamp_block(&mut bytes, zones_at, &payload)?;
+    std::fs::write(&source, &bytes)?;
+    let err = reconcile_error(
+        &open(source, &fs)?,
+        crate::table::ReconcileGate::BlockEntryCounts,
+        None,
+    );
+    assert!(
+        matches!(err, crate::Error::InvalidHeader(msg) if msg.contains("row page statistics")),
+        "a forged zone block must be refused, got {err:?}",
+    );
+    Ok(())
+}
+
 /// A salvaged COLUMNAR table must keep its per-column zone-map statistics. The
 /// clean-block verbatim copy-through re-emits columnar blocks byte-for-byte via
 /// `append_verbatim_data_block`; if that path recorded the row-block synthetic
@@ -3830,6 +3949,44 @@ fn salvaged_columnar_table_keeps_per_column_zone_statistics() -> crate::Result<(
     // The per-column stats the copy-through recorded must equal what the
     // verifier re-derives from each decoded columnar block.
     reconcile_clean(&table, None);
+    Ok(())
+}
+
+/// A clean group of row pages is copied verbatim with its zone block: the
+/// copy is the group whole, directory, pages and zones, so the salvaged
+/// table's groups still fill their extents, pass every gate, and prune and
+/// read as the source did.
+#[cfg(feature = "columnar")]
+#[test]
+fn salvage_copies_a_group_of_row_pages_with_its_zone_block() -> crate::Result<()> {
+    let dir = tempdir()?;
+    let source = dir.path().join("source");
+    let dest = dir.path().join("salvaged");
+    let fs: Arc<dyn Fs> = Arc::new(StdFs);
+    zoned_source(&source, &fs)?;
+    let (_, directory) = row_group(&source, &fs, 0)?;
+    assert!(
+        directory.zones_len() > 0,
+        "the fixture group has a zone block"
+    );
+
+    let report = salvage_sst(&source, dest.clone(), &fs)?;
+    assert!(
+        report.blocks_copied_verbatim > 0 && report.dropped.is_empty(),
+        "the clean group is copied verbatim: {report:?}",
+    );
+    let (_, copied) = row_group(&dest, &fs, 0)?;
+    assert_eq!(copied, directory, "the copy keeps the group's directory");
+
+    let table = open(dest, &fs)?;
+    reconcile_clean(&table, None);
+    for i in 0u32..400 {
+        let key = iv(i).key.user_key;
+        let Some(got) = table.get(&key, crate::SeqNo::MAX, crate::hash::hash64(&key))? else {
+            panic!("key {i} survives the salvage");
+        };
+        assert_eq!(got.value, iv(i).value, "key {i}");
+    }
     Ok(())
 }
 

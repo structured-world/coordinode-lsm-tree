@@ -26,6 +26,8 @@
 //! [row_count     : u32 LE]  rows in the group
 //! [group_tag     : u64 LE]  names the group; every page carries it in its stamp
 //! [row_page_count: u16 LE]
+//! [zones_len     : u32 LE]  on-disk length of the zone block after the pages,
+//!                           zero when the group has none
 //! repeated row_page_count times:
 //!   [rows : u32 LE]  rows in the row page, non-zero; the sum is `row_count`
 //! repeated page_count times, ascending by offset, non-overlapping:
@@ -35,10 +37,49 @@
 //!   [part     : u8    ]  which part of that column's encoding it holds
 //!   [flags    : u8    ]  reserved; a reader refuses unknown bits
 //!   [row_page : u16 LE]  which row page's rows it holds
+//! zones (see below)
+//! ```
+//!
+//! and a set of zones, in the directory and in the zone block alike:
+//!
+//! ```text
+//! [zone_column_count: u16 LE]
+//! repeated zone_column_count times:
+//!   [column_id: u16 LE]  a column the zones describe
+//! repeated row_page_count * zone_column_count times, row page by row page:
+//!   [null_count: u32 LE]  null rows of the column in the row page
+//!   [flags     : u8    ]  bit 0: no upper bound; other bits reserved
+//!   [min_len   : u8    ]  at most `ZONE_BOUND_LEN`
+//!   [min       : min_len bytes]
+//!   [max_len   : u8    ]  at most `ZONE_BOUND_LEN`, zero without an upper bound
+//!   [max       : max_len bytes]
 //! ```
 //!
 //! Every `(column_id, part)` has exactly one page per row page: the pages form
 //! a complete grid, so a row page can always be assembled from its own pages.
+//!
+//! # Statistics zones
+//!
+//! A group of more than one row page carries a zone per row page and bytes
+//! column: its null count and a byte range that holds every non-null value of
+//! the column in the row page. A reader prunes the row pages whose zones
+//! cannot hold what it looks for before it reads them, so pruning is as fine
+//! as the pages a read can skip, not the group. A group of one row page has
+//! none: its zone is the group's own zone-map entry.
+//!
+//! The key column's zones are in the directory, which a point read reads
+//! first anyway, so it goes from the directory to the one key page that can
+//! hold its key. Every other column's zones are in a
+//! [`ColumnZones`](crate::table::block::BlockType::ColumnZones) block after
+//! the pages, read only by a read that prunes on one of them: a full scan or
+//! a projection that does not prune pays for none of them.
+//!
+//! Bounds are cut to [`ZONE_BOUND_LEN`] bytes: a prefix of the minimum is
+//! still a lower bound, and a prefix of the maximum with its last byte raised
+//! is still an upper bound; a maximum whose prefix is all `0xFF` has no such
+//! bound and is recorded as unbounded. A cut bound prunes less, never wrongly,
+//! and keeps a zone small next to the pages it describes whatever the width
+//! of the values.
 //!
 //! Offsets are relative to the group rather than to the file, which is what
 //! lets a compaction copy a group whole without rewriting its directory, and
@@ -79,14 +120,270 @@ use alloc::vec::Vec;
 /// read; this one versions the directory block's own wire form.
 pub const VERSION: u8 = 2;
 
-/// `version` + `page_count` + `row_count` + `group_tag` + `row_page_count`.
-const HEADER_LEN: usize = 1 + 2 + 4 + 8 + 2;
+/// `version` + `page_count` + `row_count` + `group_tag` + `row_page_count` +
+/// `zones_len`.
+const HEADER_LEN: usize = 1 + 2 + 4 + 8 + 2 + 4;
 
 /// `rows` of one row page.
 const ROW_PAGE_LEN: usize = 4;
 
 /// `offset` + `length` + `column_id` + `part` + `flags` + `row_page`.
 const ENTRY_LEN: usize = 4 + 4 + 2 + 1 + 1 + 2;
+
+/// The most bytes of a bound a statistics zone keeps. The value Parquet's page
+/// index truncates its statistics to by default: long enough that keys and
+/// short fields keep their exact bounds, short enough that a zone of a wide
+/// value costs a small fraction of its page.
+pub const ZONE_BOUND_LEN: usize = 64;
+
+/// Zone flag: the zone has no upper bound.
+const ZONE_MAX_UNBOUNDED: u8 = 1;
+
+/// A zone's fixed fields: `null_count` + `flags` + `min_len` + `max_len`.
+const ZONE_FIXED_LEN: usize = 4 + 1 + 1 + 1;
+
+/// Where one zone's bounds sit in [`PageZones`]'s shared buffer.
+#[derive(Clone, Copy, Debug, Eq, PartialEq)]
+struct ZoneSlot {
+    null_count: u32,
+    /// `(start, len)` of the lower bound.
+    min: (u32, u8),
+    /// `(start, len)` of the upper bound, or `None` when there is none.
+    max: Option<(u32, u8)>,
+}
+
+/// One column's statistics zone over one row page.
+#[derive(Clone, Copy, Debug, Eq, PartialEq)]
+pub struct Zone<'a> {
+    /// Null rows of the column in the row page.
+    pub null_count: u32,
+    /// No non-null value of the column in the row page is below this.
+    pub min: &'a [u8],
+    /// No non-null value of the column in the row page is above this; `None`
+    /// when the zone has no upper bound.
+    pub max: Option<&'a [u8]>,
+}
+
+/// The statistics zones of a group's row pages: one per row page and zone
+/// column, row page by row page, their bounds in one buffer.
+#[derive(Clone, Debug, Default, Eq, PartialEq)]
+pub struct PageZones {
+    columns: Vec<u16>,
+    bounds: Vec<u8>,
+    slots: Vec<ZoneSlot>,
+}
+
+impl PageZones {
+    /// No zones yet, for the columns `columns` names, in the order each row
+    /// page's zones are pushed.
+    #[must_use]
+    pub fn new(columns: Vec<u16>) -> Self {
+        Self {
+            columns,
+            bounds: Vec::new(),
+            slots: Vec::new(),
+        }
+    }
+
+    /// Appends the next zone from the exact range of its rows' non-null
+    /// values, `None` when every row is null, cutting the bounds to
+    /// [`ZONE_BOUND_LEN`].
+    pub fn push(&mut self, null_count: u32, range: Option<(&[u8], &[u8])>) {
+        let Some((min, max)) = range else {
+            self.push_bounds(null_count, &[], Some(&[]));
+            return;
+        };
+        let min = min.get(..ZONE_BOUND_LEN).unwrap_or(min);
+        if max.len() <= ZONE_BOUND_LEN {
+            self.push_bounds(null_count, min, Some(max));
+            return;
+        }
+        // Raise the last byte of the prefix that can be raised and drop what
+        // follows it: every value that starts with the prefix is then below
+        // the bound. A prefix of `0xFF` bytes has no such byte.
+        let prefix = max.get(..ZONE_BOUND_LEN).unwrap_or(max);
+        match prefix.iter().rposition(|&b| b != u8::MAX) {
+            Some(last) => {
+                let mut bound = prefix.get(..=last).unwrap_or(prefix).to_vec();
+                if let Some(byte) = bound.last_mut() {
+                    *byte += 1;
+                }
+                self.push_bounds(null_count, min, Some(&bound));
+            }
+            None => self.push_bounds(null_count, min, None),
+        }
+    }
+
+    /// Appends a zone whose bounds are already at most [`ZONE_BOUND_LEN`].
+    fn push_bounds(&mut self, null_count: u32, min: &[u8], max: Option<&[u8]>) {
+        let mut place = |bound: &[u8]| {
+            // A directory is a block, so its bounds fit the u32 offsets, and
+            // each bound is at most `ZONE_BOUND_LEN` bytes.
+            #[expect(
+                clippy::cast_possible_truncation,
+                reason = "a directory block is far below 4 GiB and a bound below 256 bytes"
+            )]
+            let at = (self.bounds.len() as u32, bound.len() as u8);
+            self.bounds.extend_from_slice(bound);
+            at
+        };
+        let min = place(min);
+        let max = max.map(&mut place);
+        self.slots.push(ZoneSlot {
+            null_count,
+            min,
+            max,
+        });
+    }
+
+    /// Whether these zones describe no column.
+    #[must_use]
+    pub fn is_empty(&self) -> bool {
+        self.columns.is_empty()
+    }
+
+    /// Whether these zones describe column `column_id`.
+    #[must_use]
+    pub fn describes(&self, column_id: u16) -> bool {
+        self.columns.contains(&column_id)
+    }
+
+    /// The zones restricted to the columns `keep` accepts, in the same order.
+    #[must_use]
+    pub fn only(&self, keep: impl Fn(u16) -> bool) -> Self {
+        let kept: Vec<usize> = (0..self.columns.len())
+            .filter(|&i| self.columns.get(i).is_some_and(|&c| keep(c)))
+            .collect();
+        let mut out = Self::new(
+            kept.iter()
+                .filter_map(|&i| self.columns.get(i).copied())
+                .collect(),
+        );
+        let width = self.columns.len();
+        if width == 0 {
+            return out;
+        }
+        for row_page in 0..self.slots.len() / width {
+            for &column in &kept {
+                if let Some(zone) = self.get(row_page * width + column) {
+                    out.push_bounds(zone.null_count, zone.min, zone.max);
+                }
+            }
+        }
+        out
+    }
+
+    /// Column `column_id`'s zone over row page `row_page`, or `None` when the
+    /// column has no zones here or there is no such row page.
+    #[must_use]
+    pub fn zone(&self, row_page: u16, column_id: u16) -> Option<Zone<'_>> {
+        let column = self.columns.iter().position(|&c| c == column_id)?;
+        let index = usize::from(row_page)
+            .checked_mul(self.columns.len())?
+            .checked_add(column)?;
+        self.get(index)
+    }
+
+    /// The zone at `index`, row page by row page.
+    #[must_use]
+    fn get(&self, index: usize) -> Option<Zone<'_>> {
+        let slot = self.slots.get(index)?;
+        let bound = |(start, len): (u32, u8)| {
+            let start = start as usize;
+            self.bounds.get(start..start + usize::from(len))
+        };
+        Some(Zone {
+            null_count: slot.null_count,
+            min: bound(slot.min)?,
+            max: match slot.max {
+                Some(max) => Some(bound(max)?),
+                None => None,
+            },
+        })
+    }
+
+    /// The wire form's length.
+    fn encoded_len(&self) -> usize {
+        2 + self.columns.len() * 2 + self.slots.len() * ZONE_FIXED_LEN + self.bounds.len()
+    }
+
+    /// Appends the zones' wire form to `out`.
+    pub fn encode_into(&self, out: &mut Vec<u8>) {
+        out.reserve(self.encoded_len());
+        // `PageDirectory::new` refuses more zone columns than a u16 counts.
+        #[expect(
+            clippy::cast_possible_truncation,
+            reason = "the zone column count is bounded to u16::MAX when the zones are checked"
+        )]
+        let columns = self.columns.len() as u16;
+        out.extend_from_slice(&columns.to_le_bytes());
+        for column_id in &self.columns {
+            out.extend_from_slice(&column_id.to_le_bytes());
+        }
+        for index in 0..self.slots.len() {
+            let Some(zone) = self.get(index) else {
+                continue;
+            };
+            out.extend_from_slice(&zone.null_count.to_le_bytes());
+            out.push(if zone.max.is_none() {
+                ZONE_MAX_UNBOUNDED
+            } else {
+                0
+            });
+            // Every bound is at most `ZONE_BOUND_LEN`, below 256: `push` cuts
+            // them, and the checks refuse a longer one.
+            #[expect(
+                clippy::cast_possible_truncation,
+                reason = "a bound is at most ZONE_BOUND_LEN bytes"
+            )]
+            let min_len = zone.min.len() as u8;
+            out.push(min_len);
+            out.extend_from_slice(zone.min);
+            let max = zone.max.unwrap_or(&[]);
+            #[expect(
+                clippy::cast_possible_truncation,
+                reason = "a bound is at most ZONE_BOUND_LEN bytes"
+            )]
+            let max_len = max.len() as u8;
+            out.push(max_len);
+            out.extend_from_slice(max);
+        }
+    }
+
+    /// Reads zones for `row_page_count` row pages off the front of `rest`.
+    fn decode_from(rest: &mut &[u8], row_page_count: usize) -> Result<Self> {
+        const ERR: Error = Error::InvalidHeader("ColumnZones");
+
+        let column_count = usize::from(u16::from_le_bytes(take(rest).ok_or(ERR)?));
+        let mut columns = Vec::with_capacity(column_count.min(rest.len() / 2));
+        for _ in 0..column_count {
+            columns.push(u16::from_le_bytes(take(rest).ok_or(ERR)?));
+        }
+        let count = row_page_count.checked_mul(column_count).ok_or(ERR)?;
+        let mut zones = Self::new(columns);
+        zones.slots.reserve(count.min(rest.len() / ZONE_FIXED_LEN));
+        for _ in 0..count {
+            let null_count = u32::from_le_bytes(take(rest).ok_or(ERR)?);
+            let [flags] = take::<1>(rest).ok_or(ERR)?;
+            let [min_len] = take::<1>(rest).ok_or(ERR)?;
+            let min = take_slice(rest, usize::from(min_len)).ok_or(ERR)?;
+            let [max_len] = take::<1>(rest).ok_or(ERR)?;
+            let max = take_slice(rest, usize::from(max_len)).ok_or(ERR)?;
+            let max = match flags {
+                0 => Some(max),
+                ZONE_MAX_UNBOUNDED if max.is_empty() => None,
+                ZONE_MAX_UNBOUNDED => {
+                    return Err(Error::InvalidHeader(
+                        "ColumnZones: an unbounded zone records an upper bound",
+                    ));
+                }
+                _ => return Err(Error::InvalidHeader("ColumnZones: reserved zone flag set")),
+            };
+            zones.push_bounds(null_count, min, max);
+        }
+        Ok(zones)
+    }
+}
 
 /// Which part of which column's encoding a page holds.
 ///
@@ -166,12 +463,18 @@ pub struct PageDirectory {
     /// Where each row page starts, as a row within the group.
     row_page_starts: Vec<u32>,
     entries: Vec<PageEntry>,
+    /// The key column's zones; the other columns' are in the zone block.
+    zones: PageZones,
+    /// On-disk length of the zone block after the pages, zero without one.
+    zones_len: u32,
 }
 
 impl PageDirectory {
     /// Builds a directory for a group of `row_count` rows tagged `group_tag`,
     /// cut into row pages of `row_pages` rows each, from entries already in
-    /// ascending offset order.
+    /// ascending offset order, the statistics `zones` the directory itself
+    /// carries, and the on-disk length of the zone block that follows the
+    /// pages (`zones_len`, zero when there is none).
     ///
     /// # Errors
     ///
@@ -188,11 +491,20 @@ impl PageDirectory {
     /// has no correct reading, and one with more pages than its count field
     /// could only be written by truncating the list or by writing a count its
     /// entries contradict.
+    ///
+    /// The zones are refused unless they name distinct columns the group has,
+    /// hold one zone per row page and zone column, count no more nulls than
+    /// their row page has rows, record the empty range when every row is
+    /// null, keep a lower bound no greater than the upper one, and keep
+    /// every bound within [`ZONE_BOUND_LEN`]: a zone out of any of these would
+    /// prune a row page that holds a match.
     pub fn new(
         row_count: u32,
         group_tag: u64,
         row_pages: Vec<u32>,
         entries: Vec<PageEntry>,
+        zones: PageZones,
+        zones_len: u32,
     ) -> Result<Self> {
         if entries.len() > usize::from(u16::MAX) {
             return Err(Error::InvalidHeader(
@@ -276,13 +588,95 @@ impl PageDirectory {
                 "column page: a column part is missing a row page",
             ));
         }
+        Self::check_zones(&zones, &row_pages, &cells)?;
         Ok(Self {
             row_count,
             group_tag,
             row_pages,
             row_page_starts,
             entries,
+            zones,
+            zones_len,
         })
+    }
+
+    /// Parses the payload of this group's zone block: the zones of the
+    /// columns the directory carries none for.
+    ///
+    /// # Errors
+    ///
+    /// [`Error::InvalidHeader`] for a truncated payload, trailing bytes, a
+    /// zone for a column the directory already has zones for, or zones
+    /// [`Self::new`] would refuse.
+    pub fn decode_zone_block(&self, bytes: &[u8]) -> Result<PageZones> {
+        let mut rest = bytes;
+        let zones = PageZones::decode_from(&mut rest, self.row_pages.len())?;
+        if !rest.is_empty() {
+            return Err(Error::InvalidHeader(
+                "ColumnZones: trailing bytes after the declared zones",
+            ));
+        }
+        if zones.columns.iter().any(|c| self.zones.columns.contains(c)) {
+            return Err(Error::InvalidHeader(
+                "ColumnZones: a column has zones in the directory and the zone block",
+            ));
+        }
+        let mut cells: Vec<(PageId, u16)> =
+            self.entries.iter().map(|e| (e.id, e.row_page)).collect();
+        cells.sort_unstable();
+        Self::check_zones(&zones, &self.row_pages, &cells)?;
+        Ok(zones)
+    }
+
+    /// The zone checks [`Self::new`] documents. `cells` are the pages'
+    /// `(id, row_page)`, sorted.
+    fn check_zones(zones: &PageZones, row_pages: &[u32], cells: &[(PageId, u16)]) -> Result<()> {
+        let bad = |what| Err(Error::InvalidHeader(what));
+        if zones.columns.len() > usize::from(u16::MAX) {
+            return bad("column page: zone column count exceeds the u16 directory field");
+        }
+        let mut columns = zones.columns.clone();
+        columns.sort_unstable();
+        if columns.windows(2).any(|pair| pair.first() == pair.last()) {
+            return bad("column page: a column has two zones");
+        }
+        for column_id in &columns {
+            let has_pages = cells
+                .binary_search_by(|(id, _)| id.column_id.cmp(column_id))
+                .is_ok();
+            if !has_pages {
+                return bad("column page: a zone names a column the group does not have");
+            }
+        }
+        if Some(zones.slots.len()) != row_pages.len().checked_mul(zones.columns.len()) {
+            return bad("column page: zones do not cover every row page and zone column");
+        }
+        for (index, rows) in row_pages
+            .iter()
+            .flat_map(|&rows| core::iter::repeat_n(rows, zones.columns.len()))
+            .enumerate()
+        {
+            let Some(zone) = zones.get(index) else {
+                return bad("column page: a zone's bounds lie outside the directory");
+            };
+            if zone.min.len() > ZONE_BOUND_LEN || zone.max.is_some_and(|m| m.len() > ZONE_BOUND_LEN)
+            {
+                return bad("column page: a zone bound is longer than a zone keeps");
+            }
+            if zone.null_count > rows {
+                return bad("column page: a zone counts more nulls than its row page has rows");
+            }
+            // An all-null zone records the empty range; a zone with values
+            // may record it too, when those values are all empty.
+            let empty = zone.min.is_empty() && zone.max == Some(&[][..]);
+            if zone.null_count == rows && !empty {
+                return bad("column page: an all-null zone records a range");
+            }
+            if zone.max.is_some_and(|max| zone.min > max) {
+                return bad("column page: a zone's lower bound is above its upper bound");
+            }
+        }
+        Ok(())
     }
 
     /// Lays `pages` out back to back from the directory's end, in the order
@@ -302,6 +696,8 @@ impl PageDirectory {
         group_tag: u64,
         row_pages: Vec<u32>,
         pages: impl IntoIterator<Item = (PageId, u16, u32)>,
+        zones: PageZones,
+        zones_len: u32,
     ) -> Result<Self> {
         let mut offset: u32 = 0;
         let mut entries = Vec::new();
@@ -316,7 +712,26 @@ impl PageDirectory {
                 "column page: group length overflows u32",
             ))?;
         }
-        Self::new(row_count, group_tag, row_pages, entries)
+        Self::new(row_count, group_tag, row_pages, entries, zones, zones_len)
+    }
+
+    /// On-disk length of the zone block after the pages, zero when the group
+    /// has none.
+    #[must_use]
+    pub fn zones_len(&self) -> u32 {
+        self.zones_len
+    }
+
+    /// The on-disk length of the whole group this directory describes, given
+    /// the directory's own on-disk length: the directory, its pages, then its
+    /// zone block. `None` when it overflows a `u32`. Every walk that frames a
+    /// group from its directory takes its extent from here, so none of them
+    /// can leave a part of the group out.
+    #[must_use]
+    pub fn group_len(&self, directory_len: u32) -> Option<u32> {
+        directory_len
+            .checked_add(self.pages_len())?
+            .checked_add(self.zones_len)
     }
 
     /// Total on-disk length of the pages, which is also where the last page
@@ -377,10 +792,19 @@ impl PageDirectory {
         &self.entries
     }
 
+    /// The statistics zones the directory carries: the key column's.
+    #[must_use]
+    pub fn zones(&self) -> &PageZones {
+        &self.zones
+    }
+
     /// Serializes the directory into `out`.
     pub fn encode_into(&self, out: &mut Vec<u8>) {
         out.reserve(
-            HEADER_LEN + self.row_pages.len() * ROW_PAGE_LEN + self.entries.len() * ENTRY_LEN,
+            HEADER_LEN
+                + self.row_pages.len() * ROW_PAGE_LEN
+                + self.entries.len() * ENTRY_LEN
+                + self.zones.encoded_len(),
         );
         out.push(VERSION);
         // `new` is the only constructor and refuses more than u16::MAX pages
@@ -400,6 +824,7 @@ impl PageDirectory {
         out.extend_from_slice(&self.row_count.to_le_bytes());
         out.extend_from_slice(&self.group_tag.to_le_bytes());
         out.extend_from_slice(&row_page_count.to_le_bytes());
+        out.extend_from_slice(&self.zones_len.to_le_bytes());
         for rows in &self.row_pages {
             out.extend_from_slice(&rows.to_le_bytes());
         }
@@ -411,6 +836,7 @@ impl PageDirectory {
             out.push(0);
             out.extend_from_slice(&entry.row_page.to_le_bytes());
         }
+        self.zones.encode_into(out);
     }
 
     /// Parses a directory payload.
@@ -437,6 +863,7 @@ impl PageDirectory {
         let row_count = u32::from_le_bytes(take(&mut rest).ok_or(ERR)?);
         let group_tag = u64::from_le_bytes(take(&mut rest).ok_or(ERR)?);
         let row_page_count = usize::from(u16::from_le_bytes(take(&mut rest).ok_or(ERR)?));
+        let zones_len = u32::from_le_bytes(take(&mut rest).ok_or(ERR)?);
 
         // The declared counts are on-disk data, so they bound nothing until
         // the bytes behind them are seen to exist: reserve for what the
@@ -465,12 +892,13 @@ impl PageDirectory {
                 row_page,
             });
         }
+        let zones = PageZones::decode_from(&mut rest, row_page_count)?;
         if !rest.is_empty() {
             return Err(Error::InvalidHeader(
-                "ColumnPageDirectory: trailing bytes after the declared pages",
+                "ColumnPageDirectory: trailing bytes after the declared zones",
             ));
         }
-        Self::new(row_count, group_tag, row_pages, entries)
+        Self::new(row_count, group_tag, row_pages, entries, zones, zones_len)
     }
 }
 
@@ -482,6 +910,14 @@ fn take<const N: usize>(bytes: &mut &[u8]) -> Option<[u8; N]> {
     let (head, tail) = bytes.split_first_chunk::<N>()?;
     *bytes = tail;
     Some(*head)
+}
+
+/// Takes the next `len` bytes off the front of `bytes`, or `None` when fewer
+/// remain.
+fn take_slice<'a>(bytes: &mut &'a [u8], len: usize) -> Option<&'a [u8]> {
+    let (head, tail) = bytes.split_at_checked(len)?;
+    *bytes = tail;
+    Some(head)
 }
 
 #[cfg(test)]

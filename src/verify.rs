@@ -2433,13 +2433,15 @@ fn expected_section_roles(name: &[u8]) -> Option<&'static [crate::table::block::
     use crate::table::block::BlockType;
     Some(match name {
         // A columnar table's data section holds row groups, each a page
-        // directory followed by its pages; a row-major table's holds data
-        // blocks. The single-block columnar layout that preceded pages is no
-        // longer written, so a block in that role here is misrouted.
+        // directory followed by its pages and, for a group of several row
+        // pages, its zone block; a row-major table's holds data blocks. The
+        // single-block columnar layout that preceded pages is no longer
+        // written, so a block in that role here is misrouted.
         b"data" => &[
             BlockType::Data,
             BlockType::ColumnPageDirectory,
             BlockType::ColumnPage,
+            BlockType::ColumnZones,
         ],
         // `filter_tli` is the top-level index OVER filter partitions — the
         // writer emits it with the Index role (same encoding as the data

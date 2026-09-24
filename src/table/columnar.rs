@@ -413,6 +413,48 @@ impl Column {
         Ok(())
     }
 
+    /// The null count of rows `start..end` of this `Bytes` column of
+    /// `row_count` rows, and the byte-wise range of their non-null values
+    /// (`None` when every one is null): what a row page's statistics zone
+    /// records, before its bounds are cut.
+    ///
+    /// # Errors
+    ///
+    /// Returns [`Error::InvalidHeader`] when the column is not a `Bytes`
+    /// column, `start..end` is not within `row_count`, or a row's framing is
+    /// malformed.
+    pub(crate) fn bytes_range(
+        &self,
+        row_count: u32,
+        start: u32,
+        end: u32,
+    ) -> Result<NullsAndRange<'_>> {
+        if self.type_tag != TypeTag::Bytes {
+            return Err(Error::InvalidHeader(
+                "columnar: a zone describes a bytes column",
+            ));
+        }
+        if start > end || end > row_count {
+            return Err(Error::InvalidHeader(
+                "columnar: row range outside the column",
+            ));
+        }
+        let mut nulls = 0u32;
+        let mut range: Option<(&[u8], &[u8])> = None;
+        for row in start..end {
+            if !column_row_valid(self, row) {
+                nulls += 1;
+                continue;
+            }
+            let value = bytes_column_row(&self.data, row_count, row)?;
+            range = Some(match range {
+                None => (value, value),
+                Some((min, max)) => (min.min(value), max.max(value)),
+            });
+        }
+        Ok((nulls, range))
+    }
+
     /// Rows `start..end` of this column of `row_count` rows, as a column of
     /// their own: the unit one row page of the column holds.
     ///
@@ -780,6 +822,72 @@ impl ColumnBatch {
         stats
     }
 
+    /// The statistics zones of this batch cut into row pages of `row_pages`
+    /// rows: one per row page and `Bytes` column, in column order.
+    ///
+    /// The writer records these in a group's directory, and the verification
+    /// gates re-derive them from the decoded group to authenticate it, so the
+    /// two share this computation.
+    ///
+    /// # Errors
+    ///
+    /// Returns [`Error::InvalidHeader`] when the row pages overrun the batch
+    /// or a `Bytes` column is malformed.
+    pub(crate) fn page_zones(
+        &self,
+        row_pages: &[u32],
+    ) -> Result<crate::table::column_page::PageZones> {
+        let bytes_columns: Vec<&Column> = self
+            .columns
+            .iter()
+            .filter(|c| c.type_tag == TypeTag::Bytes)
+            .collect();
+        let mut zones = crate::table::column_page::PageZones::new(
+            bytes_columns.iter().map(|c| c.column_id).collect(),
+        );
+        let mut start = 0u32;
+        for &rows in row_pages {
+            let end = start.checked_add(rows).ok_or(Error::InvalidHeader(
+                "columnar: row pages overrun the batch",
+            ))?;
+            for col in &bytes_columns {
+                let (nulls, range) = col.bytes_range(self.row_count, start, end)?;
+                zones.push(nulls, range);
+            }
+            start = end;
+        }
+        Ok(zones)
+    }
+
+    /// The statistics zones of this batch as a row group cut into row pages of
+    /// `row_pages` rows lays them out: the key column's for its directory, and
+    /// the other columns' for its zone block. A group of one row page has
+    /// neither, since its zone is its zone-map entry.
+    ///
+    /// The writer lays a group out from these, and the verification gates
+    /// re-derive them from the decoded group and require the group to carry
+    /// exactly these, so the two share this one rule.
+    ///
+    /// # Errors
+    ///
+    /// As [`Self::page_zones`].
+    pub(crate) fn group_zones(
+        &self,
+        row_pages: &[u32],
+    ) -> Result<(
+        crate::table::column_page::PageZones,
+        crate::table::column_page::PageZones,
+    )> {
+        if row_pages.len() <= 1 {
+            return Ok(Default::default());
+        }
+        let zones = self.page_zones(row_pages)?;
+        Ok((
+            zones.only(|c| c == COL_USER_KEY),
+            zones.only(|c| c != COL_USER_KEY),
+        ))
+    }
+
     /// The rows of `pages`, in order, as one batch: a row group read page by
     /// page, put back together for a consumer that takes the group whole.
     ///
@@ -1102,6 +1210,10 @@ fn column_row_valid(col: &Column, i: u32) -> bool {
         }
     }
 }
+
+/// A row range's null count and the `(min, max)` of its non-null values, or
+/// `None` for the range when every row is null.
+pub(crate) type NullsAndRange<'a> = (u32, Option<(&'a [u8], &'a [u8])>);
 
 /// Reads row `i` of a [`TypeTag::Bytes`] column body (offset table + payload),
 /// bounds-checked.

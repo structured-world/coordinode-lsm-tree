@@ -1587,6 +1587,32 @@ impl Writer {
             })
             .collect::<crate::Result<Vec<_>>>()?;
 
+        // Statistics zones for a group of several row pages; one row page's
+        // zone is the group's zone-map entry. The key column's zones go into
+        // the directory, which a point read reads first anyway; the others
+        // into a zone block after the pages, which only a read that prunes on
+        // them reads.
+        let (key_zones, other_zones) = batch.group_zones(&row_pages)?;
+        let mut zone_payload = Vec::new();
+        let zone_block = if other_zones.is_empty() {
+            None
+        } else {
+            other_zones.encode_into(&mut zone_payload);
+            Some(Block::prepare_with_flags(
+                &zone_payload,
+                super::block::BlockIdentity {
+                    table_id: self.table_id,
+                    block_type: super::block::BlockType::ColumnZones,
+                    dict_id: 0,
+                    window_log: 0,
+                },
+                &directory_transform,
+                0,
+            )?)
+        };
+        let zones_len = zone_block
+            .as_ref()
+            .map_or(0, |block| block.on_disk_len(self.ecc));
         let directory = PageDirectory::contiguous(
             batch.row_count,
             group_tag,
@@ -1594,6 +1620,8 @@ impl Writer {
             pages
                 .iter()
                 .map(|(id, row_page, prepared)| (*id, *row_page, prepared.on_disk_len(self.ecc))),
+            key_zones,
+            zones_len,
         )?;
         let mut directory_payload = Vec::new();
         directory.encode_into(&mut directory_payload);
@@ -1610,14 +1638,19 @@ impl Writer {
         )?;
 
         // The group is written directory first, then its pages back to back,
-        // which is exactly the layout `PageDirectory::contiguous` recorded.
+        // which is exactly the layout `PageDirectory::contiguous` recorded,
+        // then the zone block the directory counted after them.
         let mut bytes_written = directory_block.on_disk_len(self.ecc);
         let mut uncompressed = u64::from(
             directory_block
                 .write_to(&mut self.file_writer)?
                 .uncompressed_length,
         );
-        for (_, _, prepared) in pages {
+        for prepared in pages
+            .into_iter()
+            .map(|(_, _, prepared)| prepared)
+            .chain(zone_block)
+        {
             let header = prepared.write_to(&mut self.file_writer)?;
             bytes_written = bytes_written
                 .checked_add(header.on_disk_size_with(self.ecc))

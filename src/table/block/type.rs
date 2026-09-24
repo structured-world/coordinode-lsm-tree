@@ -91,6 +91,13 @@ pub enum BlockType {
     /// its LOGICAL position (row group ordinal, page slot) to replace the
     /// position integrity the index supplies for blocks it names.
     ColumnPage,
+    /// The statistics zones of a columnar row group's row pages for its
+    /// columns other than the key: one zone per row page and column. Written
+    /// last in the group, after its pages, so only a read that prunes on one
+    /// of those columns reads it; a full scan or a projection that does not
+    /// prune never pays for it. The key column's zones live in the
+    /// [`Self::ColumnPageDirectory`], which every point read reads anyway.
+    ColumnZones,
 }
 
 // Wire tags are renumbered contiguously `0..=6` for V5. The previous
@@ -122,6 +129,7 @@ impl From<BlockType> for u8 {
             BlockType::DeleteBitmap => 12,
             BlockType::ColumnPageDirectory => 13,
             BlockType::ColumnPage => 14,
+            BlockType::ColumnZones => 15,
         }
     }
 }
@@ -145,6 +153,7 @@ impl TryFrom<u8> for BlockType {
             12 => Ok(Self::DeleteBitmap),
             13 => Ok(Self::ColumnPageDirectory),
             14 => Ok(Self::ColumnPage),
+            15 => Ok(Self::ColumnZones),
             _ => Err(crate::Error::InvalidTag(("BlockType", value))),
         }
     }

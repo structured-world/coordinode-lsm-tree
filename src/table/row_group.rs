@@ -18,7 +18,7 @@ use crate::coding::Decode;
 use crate::fs::FsFile;
 use crate::path::Path;
 use crate::table::block::{BlockType, EccParams, Header};
-use crate::table::column_page::{PageDirectory, PageEntry};
+use crate::table::column_page::{PageDirectory, PageEntry, PageZones};
 use crate::{
     Cache, CompressionType, Slice, encryption::EncryptionProvider, file_accessor::FileAccessor,
 };
@@ -33,6 +33,9 @@ pub struct RowGroupBlocks {
     /// One slot per directory entry, in the directory's order: the page's
     /// block when it was fetched, `None` when the read did not want it.
     pub pages: Vec<Option<Block>>,
+    /// The zones of the group's zone block, when the read needed them to
+    /// select its row pages.
+    pub zones: Option<PageZones>,
 }
 
 /// How much of a row group a selective read fetches before it knows the
@@ -46,35 +49,149 @@ pub struct RowGroupBlocks {
 /// completed by a second request.
 const DIRECTORY_PREFIX: usize = 4 * 1_024;
 
+/// Which row pages of a group a read wants.
+#[derive(Clone, Debug, Default)]
+pub enum RowPageSelect<'a> {
+    /// Every row page.
+    #[default]
+    All,
+    /// The row pages of this half-open range of ordinals.
+    Range(core::ops::Range<u16>),
+    /// The row pages whose statistics zone for `column_id` may hold a
+    /// non-null value within the inclusive `[lower, upper]`, either side
+    /// unbounded when `None`. A row page the column has no zone for is kept:
+    /// only a zone can prove a page holds no match.
+    Zone {
+        /// The column the zones are read for.
+        column_id: u16,
+        /// Inclusive lower bound, or `None` for none.
+        lower: Option<&'a [u8]>,
+        /// Inclusive upper bound, or `None` for none.
+        upper: Option<&'a [u8]>,
+    },
+}
+
 /// The pages a read of a row group wants: the columns it projects, times the
 /// row pages that hold the rows it asks for.
 #[derive(Clone, Debug, Default)]
 pub struct PageWant<'a> {
     /// The column ids read, or every column when `None`.
     pub columns: Option<&'a [u16]>,
-    /// The row pages read, half-open, or every row page when `None`.
-    pub row_pages: Option<core::ops::Range<u16>>,
+    /// The row pages read.
+    pub row_pages: RowPageSelect<'a>,
 }
 
 impl<'a> PageWant<'a> {
     /// Every page of the group.
     pub const ALL: Self = Self {
         columns: None,
-        row_pages: None,
+        row_pages: RowPageSelect::All,
     };
-
-    /// Every row page of the columns `columns` names.
-    #[must_use]
-    pub const fn columns(columns: &'a [u16]) -> Self {
-        Self {
-            columns: Some(columns),
-            row_pages: None,
-        }
-    }
 
     /// Whether this is a read of the whole group.
     const fn is_all(&self) -> bool {
-        self.columns.is_none() && self.row_pages.is_none()
+        self.columns.is_none() && matches!(self.row_pages, RowPageSelect::All)
+    }
+
+    /// Whether resolving this want against `directory` needs the group's
+    /// zone block: it selects by zones the directory does not carry, and the
+    /// group has a zone block to carry them.
+    fn needs_zone_block(&self, directory: &PageDirectory) -> bool {
+        match self.row_pages {
+            RowPageSelect::Zone { column_id, .. } => {
+                directory.zones_len() > 0 && !directory.zones().describes(column_id)
+            }
+            RowPageSelect::All | RowPageSelect::Range(_) => false,
+        }
+    }
+
+    /// This want resolved against `directory` and, when it was read, the
+    /// group's zone block: the row pages it selects, one flag per row page.
+    ///
+    /// # Errors
+    ///
+    /// [`crate::Error::InvalidHeader`] for an empty range or one past the
+    /// group's row pages: a caller names a range from what it read of this
+    /// group, so one outside it is a reader error, not an empty selection.
+    fn resolve(
+        &self,
+        directory: &PageDirectory,
+        block_zones: Option<&PageZones>,
+    ) -> crate::Result<Wanted<'a>> {
+        let count = directory.row_pages().len();
+        let row_pages = match &self.row_pages {
+            RowPageSelect::All => alloc::vec![true; count],
+            RowPageSelect::Range(range) => {
+                if range.start >= range.end || usize::from(range.end) > count {
+                    return Err(crate::Error::InvalidHeader(
+                        "columnar: row page range outside the group",
+                    ));
+                }
+                // A directory holds at most `u16::MAX` row pages, so the
+                // ordinals below cover every one.
+                (0u16..).take(count).map(|i| range.contains(&i)).collect()
+            }
+            RowPageSelect::Zone {
+                column_id,
+                lower,
+                upper,
+            } => (0u16..)
+                .zip(directory.row_pages())
+                .map(|(ordinal, &rows)| {
+                    directory
+                        .zones()
+                        .zone(ordinal, *column_id)
+                        .or_else(|| block_zones.and_then(|z| z.zone(ordinal, *column_id)))
+                        .is_none_or(|zone| zone_may_match(zone, rows, *lower, *upper))
+                })
+                .collect(),
+        };
+        Ok(Wanted {
+            columns: self.columns,
+            row_pages,
+        })
+    }
+}
+
+/// Whether a row page whose column has `zone` over `rows` rows may hold a
+/// non-null value within `[lower, upper]`.
+fn zone_may_match(
+    zone: crate::table::column_page::Zone<'_>,
+    rows: u32,
+    lower: Option<&[u8]>,
+    upper: Option<&[u8]>,
+) -> bool {
+    if zone.null_count == rows {
+        // Every row is null, and a null is within no range.
+        return false;
+    }
+    if let (Some(lower), Some(max)) = (lower, zone.max)
+        && max < lower
+    {
+        return false;
+    }
+    if let Some(upper) = upper
+        && zone.min > upper
+    {
+        return false;
+    }
+    true
+}
+
+/// A [`PageWant`] resolved against a group's directory.
+struct Wanted<'a> {
+    columns: Option<&'a [u16]>,
+    /// One flag per row page.
+    row_pages: Vec<bool>,
+}
+
+impl Wanted<'_> {
+    /// Every page of a group of `row_pages` row pages.
+    fn all(row_pages: usize) -> Self {
+        Self {
+            columns: None,
+            row_pages: alloc::vec![true; row_pages],
+        }
     }
 
     /// Whether the read needs the page `entry` names.
@@ -82,8 +199,9 @@ impl<'a> PageWant<'a> {
         self.columns.is_none_or(|w| w.contains(&entry.id.column_id))
             && self
                 .row_pages
-                .as_ref()
-                .is_none_or(|r| r.contains(&entry.row_page))
+                .get(usize::from(entry.row_page))
+                .copied()
+                .unwrap_or(false)
     }
 }
 
@@ -91,10 +209,12 @@ impl<'a> PageWant<'a> {
 /// row order, each holding the columns the read projected.
 #[derive(Debug)]
 pub struct RowPages {
-    /// The ordinal of the first row page read.
-    pub first_page: u16,
-    /// The group row the first row page read starts at.
-    pub first_row: u32,
+    /// Rows in the whole group, the row pages not read included.
+    pub group_rows: u32,
+    /// Each row page's ordinal, one per batch.
+    pub ordinals: Vec<u16>,
+    /// The group row each row page starts at, one per batch.
+    pub starts: Vec<u32>,
     /// One batch per row page read, in row order.
     pub batches: Vec<crate::table::columnar::ColumnBatch>,
 }
@@ -180,36 +300,56 @@ impl GroupRead<'_> {
             let directory = PageDirectory::decode(&directory_block.data)?;
             let directory_len = directory_block.header.on_disk_size_with(self.ecc);
             check_group_extent(self.group, directory_len, &directory)?;
-            let pages = self.cached_pages(&directory, directory_len, want)?;
+            let mut fd = None;
+            let zones = if want.needs_zone_block(&directory) {
+                Some(self.zone_block(&mut fd, &directory, directory_len, &Slice::empty())?)
+            } else {
+                None
+            };
+            let wanted = want.resolve(&directory, zones.as_ref())?;
+            let pages = self.cached_pages(&directory, directory_len, &wanted)?;
             self.count_cached(true, &pages);
             let complete = pages
                 .iter()
                 .zip(directory.entries())
-                .all(|(page, entry)| page.is_some() || !want.wants(entry));
+                .all(|(page, entry)| page.is_some() || !wanted.wants(entry));
             if complete {
-                return Ok(RowGroupBlocks { directory, pages });
+                return Ok(RowGroupBlocks {
+                    directory,
+                    pages,
+                    zones,
+                });
             }
-            let fd = self.open()?;
+            let fd = match fd {
+                Some(fd) => fd,
+                None => self.open()?,
+            };
             let pages = self.fetch_missing(
                 fd.as_ref(),
                 &directory,
                 directory_len,
                 &Slice::empty(),
                 pages,
-                want,
+                &wanted,
             )?;
-            return Ok(RowGroupBlocks { directory, pages });
+            return Ok(RowGroupBlocks {
+                directory,
+                pages,
+                zones,
+            });
         }
 
         let fd = self.open()?;
         if want.is_all() {
             self.read_whole(fd.as_ref())
         } else {
-            self.read_selective(fd.as_ref(), want)
+            self.read_selective(fd, want)
         }
     }
 
     /// The whole group in one request, every block verified and admitted.
+    /// The zone block comes along in the request, and is left unverified and
+    /// uncached: a read of every page has no use for it.
     fn read_whole(&self, fd: &dyn FsFile) -> crate::Result<RowGroupBlocks> {
         let frame = self.read(fd, 0, self.group.size() as usize, BlockType::ColumnPage)?;
         let (directory, directory_len) = self.admit_directory(&frame)?;
@@ -219,20 +359,69 @@ impl GroupRead<'_> {
             directory_len,
             &frame,
             alloc::vec![None; directory.entries().len()],
-            &PageWant::ALL,
+            &Wanted::all(directory.row_pages().len()),
         )?;
-        Ok(RowGroupBlocks { directory, pages })
+        Ok(RowGroupBlocks {
+            directory,
+            pages,
+            zones: None,
+        })
+    }
+
+    /// The group's zone block, from the cache or read, verified and admitted
+    /// like a page, decoded and checked against `directory`. `front` holds the
+    /// group's first bytes when an earlier read brought them in; `fd` is
+    /// opened here when the block has to be read and it is not yet.
+    fn zone_block(
+        &self,
+        fd: &mut Option<Arc<dyn FsFile>>,
+        directory: &PageDirectory,
+        directory_len: u32,
+        front: &Slice,
+    ) -> crate::Result<PageZones> {
+        // The extent check proved the directory, the pages and the zone block
+        // fill the group, and the group's length is a `u32`.
+        let start = directory_len as usize + directory.pages_len() as usize;
+        let end = start + directory.zones_len() as usize;
+        let handle = BlockHandle::new(
+            BlockOffset(*self.group.offset() + start as u64),
+            directory.zones_len(),
+        );
+        if let Some(block) = self.lookup(handle.offset(), BlockType::ColumnZones)? {
+            #[cfg(feature = "metrics")]
+            if self.charge.is_counted() {
+                record_block_load_cached(self.metrics, BlockType::ColumnZones);
+            }
+            return directory.decode_zone_block(&block.data);
+        }
+        let bytes = if end <= front.len() {
+            front.slice(start..end)
+        } else {
+            let fd = match fd {
+                Some(fd) => fd,
+                None => fd.insert(self.open()?),
+            };
+            self.read(fd.as_ref(), start, end - start, BlockType::ColumnZones)?
+        };
+        let block = self.verify_and_admit(
+            &bytes,
+            &handle,
+            BlockType::ColumnZones,
+            CompressionType::None,
+            false,
+        )?;
+        directory.decode_zone_block(&block.data)
     }
 
     /// The directory from a prefix of the group, then the wanted pages.
     fn read_selective(
         &self,
-        fd: &dyn FsFile,
+        fd: Arc<dyn FsFile>,
         want: &PageWant<'_>,
     ) -> crate::Result<RowGroupBlocks> {
         let group_len = self.group.size() as usize;
         let prefix = self.read(
-            fd,
+            fd.as_ref(),
             0,
             group_len.min(DIRECTORY_PREFIX),
             BlockType::ColumnPageDirectory,
@@ -248,7 +437,7 @@ impl GroupRead<'_> {
         // one buffer so the page reads below see a single contiguous prefix.
         let prefix = if directory_end > prefix.len() {
             let rest = self.read(
-                fd,
+                fd.as_ref(),
                 prefix.len(),
                 directory_end - prefix.len(),
                 BlockType::ColumnPageDirectory,
@@ -258,10 +447,32 @@ impl GroupRead<'_> {
             prefix
         };
         let (directory, directory_len) = self.admit_directory(&prefix)?;
-        let pages = self.cached_pages(&directory, directory_len, want)?;
+        let mut fd = Some(fd);
+        let zones = if want.needs_zone_block(&directory) {
+            Some(self.zone_block(&mut fd, &directory, directory_len, &prefix)?)
+        } else {
+            None
+        };
+        let fd = match fd {
+            Some(fd) => fd,
+            None => self.open()?,
+        };
+        let wanted = want.resolve(&directory, zones.as_ref())?;
+        let pages = self.cached_pages(&directory, directory_len, &wanted)?;
         self.count_cached(false, &pages);
-        let pages = self.fetch_missing(fd, &directory, directory_len, &prefix, pages, want)?;
-        Ok(RowGroupBlocks { directory, pages })
+        let pages = self.fetch_missing(
+            fd.as_ref(),
+            &directory,
+            directory_len,
+            &prefix,
+            pages,
+            &wanted,
+        )?;
+        Ok(RowGroupBlocks {
+            directory,
+            pages,
+            zones,
+        })
     }
 
     /// Verifies and admits the directory at the front of `front`, then proves
@@ -300,7 +511,7 @@ impl GroupRead<'_> {
         directory_len: u32,
         front: &Slice,
         mut pages: Vec<Option<Block>>,
-        want: &PageWant<'_>,
+        want: &Wanted<'_>,
     ) -> crate::Result<Vec<Option<Block>>> {
         let entries = directory.entries();
         let runs = {
@@ -410,7 +621,7 @@ impl GroupRead<'_> {
         &self,
         directory: &PageDirectory,
         directory_len: u32,
-        want: &PageWant<'_>,
+        want: &Wanted<'_>,
     ) -> crate::Result<Vec<Option<Block>>> {
         let mut pages = Vec::with_capacity(directory.entries().len());
         for entry in directory.entries() {
@@ -582,23 +793,22 @@ impl RowGroupBlocks {
         if self.directory.row_count() == 0 {
             return Err(crate::Error::InvalidHeader("columnar: zero-row data block"));
         }
-        let outside = || crate::Error::InvalidHeader("columnar: row page range outside the group");
-        // The directory holds at most `u16::MAX` row pages.
-        let all = u16::try_from(self.directory.row_pages().len()).map_err(|_| outside())?;
-        let range = match &want.row_pages {
-            None => 0..all,
-            Some(r) if r.start < r.end && r.end <= all => r.clone(),
-            Some(_) => return Err(outside()),
-        };
-        let first_page = range.start;
-        let first_row = self
-            .directory
-            .row_page_start(first_page)
-            .ok_or_else(outside)?;
+        let wanted = want.resolve(&self.directory, self.zones.as_ref())?;
+        // The selected row pages, in row order, and each one's place among
+        // them. A directory holds at most `u16::MAX` row pages, so the
+        // ordinals cover every one.
+        let mut ordinals = Vec::new();
+        let mut slot_of: Vec<Option<usize>> = Vec::with_capacity(wanted.row_pages.len());
+        for (ordinal, &selected) in (0u16..).zip(&wanted.row_pages) {
+            slot_of.push(selected.then_some(ordinals.len()));
+            if selected {
+                ordinals.push(ordinal);
+            }
+        }
         // One column list per row page read, filled in one pass over the
         // directory: its entries are column-major, so each row page's columns
         // arrive in write order.
-        let mut columns: Vec<Vec<Column>> = range.clone().map(|_| Vec::new()).collect();
+        let mut columns: Vec<Vec<Column>> = ordinals.iter().map(|_| Vec::new()).collect();
         for (entry, page) in self.directory.entries().iter().zip(&self.pages) {
             // Every column's encoding names a single part today. A part this
             // build does not decode is refused rather than skipped: skipping
@@ -608,7 +818,7 @@ impl RowGroupBlocks {
                     "columnar: page holds an encoding part this build does not decode",
                 ));
             }
-            if !want.wants(entry) {
+            if !wanted.wants(entry) {
                 continue;
             }
             let Some(page) = page else {
@@ -629,32 +839,35 @@ impl RowGroupBlocks {
                     "columnar: page column disagrees with its directory entry",
                 ));
             }
-            let slot = entry
-                .row_page
-                .checked_sub(range.start)
-                .and_then(|i| columns.get_mut(usize::from(i)))
+            let slot = slot_of
+                .get(usize::from(entry.row_page))
+                .copied()
+                .flatten()
+                .and_then(|i| columns.get_mut(i))
                 .ok_or(crate::Error::InvalidHeader(
                     "columnar: page names a row page the group does not have",
                 ))?;
             slot.push(column);
         }
-        let batches = columns
-            .into_iter()
-            .zip(range)
-            .map(|(columns, index)| {
-                let row_count = self.directory.row_page_rows(index).ok_or_else(outside)?;
-                Ok(ColumnBatch { row_count, columns })
-            })
-            .collect::<crate::Result<Vec<_>>>()?;
+        let outside = || crate::Error::InvalidHeader("columnar: row page outside the group");
+        let mut starts = Vec::with_capacity(ordinals.len());
+        let mut batches = Vec::with_capacity(ordinals.len());
+        for (columns, &ordinal) in columns.into_iter().zip(&ordinals) {
+            starts.push(self.directory.row_page_start(ordinal).ok_or_else(outside)?);
+            let row_count = self.directory.row_page_rows(ordinal).ok_or_else(outside)?;
+            batches.push(ColumnBatch { row_count, columns });
+        }
         Ok(RowPages {
-            first_page,
-            first_row,
+            group_rows: self.directory.row_count(),
+            ordinals,
+            starts,
             batches,
         })
     }
 }
 
-/// Proves the directory describes a layout that fills the group exactly.
+/// Proves the directory describes a layout that fills the group exactly: the
+/// directory, its pages back to back, then its zone block when it has one.
 ///
 /// The index entry and the directory are two independent statements of where
 /// the group ends. A writer makes them agree by construction, so a
@@ -665,7 +878,7 @@ pub fn check_group_extent(
     directory_len: u32,
     directory: &PageDirectory,
 ) -> crate::Result<()> {
-    let described = directory_len.checked_add(directory.pages_len());
+    let described = directory.group_len(directory_len);
     if described != Some(group.size()) {
         return Err(crate::Error::InvalidHeader(
             "columnar: page directory does not fill its row group",

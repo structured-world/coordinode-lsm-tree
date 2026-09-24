@@ -250,8 +250,8 @@ impl Scanner {
     }
 
     /// Reads one columnar row group from the stream — its directory, then its
-    /// pages, which follow it back to back — and reconstructs it into a
-    /// row-major [`DataBlock`].
+    /// pages, which follow it back to back, then its zone block if it has one
+    /// — and reconstructs it into a row-major [`DataBlock`].
     ///
     /// The stream has no index entry to check the group against, so each page
     /// is checked against the directory instead: a page whose on-disk length
@@ -310,11 +310,42 @@ impl Scanner {
             }
             pages.push(Some(page));
         }
+        // The zone block, when the group has one, closes the group. A scan of
+        // every row has no use for it, but it is read and verified like the
+        // rest, both to reach the next group and so that a stream that ends
+        // or diverges there is refused rather than misframed.
+        if directory.zones_len() > 0 {
+            let zones = Self::read_block(
+                reader,
+                table_id,
+                BlockType::ColumnZones,
+                CompressionType::None,
+                encryption,
+                ecc,
+                #[cfg(zstd_any)]
+                None,
+            )?;
+            if zones.header.block_type != BlockType::ColumnZones {
+                return Err(crate::Error::InvalidTag((
+                    "BlockType",
+                    zones.header.block_type.into(),
+                )));
+            }
+            if zones.header.on_disk_size_with(ecc) != directory.zones_len() {
+                return Err(crate::Error::InvalidHeader(
+                    "columnar: zone block length disagrees with its directory",
+                ));
+            }
+        }
         // The scanner feeds compaction, which is maintenance and outside the
         // read counters, so neither the page copies nor the rebuilt values are
         // charged.
-        let pages = crate::table::row_group::RowGroupBlocks { directory, pages }
-            .to_row_pages(&crate::table::row_group::PageWant::ALL, &mut 0)?;
+        let pages = crate::table::row_group::RowGroupBlocks {
+            directory,
+            pages,
+            zones: None,
+        }
+        .to_row_pages(&crate::table::row_group::PageWant::ALL, &mut 0)?;
         DataBlock::from_column_batch(pages.batches, restart_interval, &mut 0)
     }
 

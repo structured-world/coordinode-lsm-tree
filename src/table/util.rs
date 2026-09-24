@@ -288,7 +288,9 @@ pub(crate) fn record_block_load_cached(metrics: &Metrics, block_type: BlockType)
     use core::sync::atomic::Ordering::Relaxed;
     let cached = match block_type {
         BlockType::Filter => &metrics.filter_block_load_cached,
-        BlockType::Index | BlockType::ColumnPageDirectory => &metrics.index_block_load_cached,
+        BlockType::Index | BlockType::ColumnPageDirectory | BlockType::ColumnZones => {
+            &metrics.index_block_load_cached
+        }
         BlockType::RangeTombstone => &metrics.range_tombstone_block_load_cached,
         BlockType::Data | BlockType::Meta | BlockType::ColumnPage => {
             &metrics.data_block_load_cached
@@ -317,7 +319,9 @@ pub(crate) fn record_block_read(metrics: &Metrics, block_type: BlockType, on_dis
     use core::sync::atomic::Ordering::Relaxed;
     let requested = match block_type {
         BlockType::Filter => &metrics.filter_block_io_requested,
-        BlockType::Index | BlockType::ColumnPageDirectory => &metrics.index_block_io_requested,
+        BlockType::Index | BlockType::ColumnPageDirectory | BlockType::ColumnZones => {
+            &metrics.index_block_io_requested
+        }
         BlockType::RangeTombstone => &metrics.range_tombstone_block_io_requested,
         BlockType::Data | BlockType::Meta | BlockType::ColumnPage => {
             &metrics.data_block_io_requested
@@ -345,7 +349,9 @@ fn record_block_loaded(metrics: &Metrics, block_type: BlockType) {
     use core::sync::atomic::Ordering::Relaxed;
     let loads = match block_type {
         BlockType::Filter => &metrics.filter_block_load_io,
-        BlockType::Index | BlockType::ColumnPageDirectory => &metrics.index_block_load_io,
+        BlockType::Index | BlockType::ColumnPageDirectory | BlockType::ColumnZones => {
+            &metrics.index_block_load_io
+        }
         BlockType::RangeTombstone => &metrics.range_tombstone_block_load_io,
         BlockType::Data | BlockType::Meta | BlockType::ColumnPage => &metrics.data_block_load_io,
         BlockType::Manifest

@@ -886,6 +886,112 @@ fn a_columnar_point_read_that_hits_reads_only_the_row_page_holding_its_key() {
     );
 }
 
+/// Row `i`'s value in [`zoned_tree`]: distinct, ascending with the key.
+fn zoned_value(i: u32) -> Vec<u8> {
+    let mut value = format!("val{i:06}").into_bytes();
+    value.resize(100, b'v');
+    value
+}
+
+/// A columnar tree of `n` rows with [`zoned_value`]s in 128 KiB groups of
+/// 4 KiB row pages: some thirty row pages a group, each with its zones.
+fn zoned_tree(n: u32) -> (TempDir, Tree) {
+    let folder = get_tmp_folder();
+    let AnyTree::Standard(tree) = Config::new(
+        folder.path(),
+        SequenceNumberCounter::default(),
+        SequenceNumberCounter::default(),
+    )
+    .filter_policy(lsm_tree::config::FilterPolicy::disabled())
+    .columnar_row_group_size_policy(lsm_tree::config::BlockSizePolicy::all(128 * 1_024))
+    .columnar_page_size_policy(lsm_tree::config::BlockSizePolicy::all(4 * 1_024))
+    .open()
+    .expect("open") else {
+        panic!("expected a standard tree");
+    };
+    tree.update_runtime_config(|cfg| {
+        cfg.columnar = true;
+        cfg.zone_map = true;
+    })
+    .expect("enable columnar");
+    for i in 0..n {
+        tree.insert(key(i), zoned_value(i), u64::from(i));
+    }
+    tree.flush_active_memtable(0).expect("flush");
+    (folder, tree)
+}
+
+/// Bytes read and rows returned by one predicate scan of `predicate` over a
+/// fresh [`zoned_tree`] of 2000 rows.
+fn predicate_cost(predicate: &ColumnRangePredicate) -> (u64, u32) {
+    let (_folder, tree) = zoned_tree(2_000);
+    let m = tree.metrics();
+    let before = m.bytes_read();
+    let mut rows = 0;
+    for batch in tree
+        .columnar_scan(&[COL_USER_KEY, COL_VALUE], Some(predicate), SeqNo::MAX, ..)
+        .expect("scan")
+    {
+        rows += batch.expect("batch").row_count;
+    }
+    (m.bytes_read() - before, rows)
+}
+
+#[test]
+fn a_key_predicate_reads_the_row_pages_its_zones_admit_not_the_group() {
+    // The zone map admits the one group holding the keys; the key zones in
+    // its directory admit the one or two row pages holding them. What is read
+    // is the directory and those pages, not the group's 128 KiB.
+    let (read, rows) = predicate_cost(&ColumnRangePredicate {
+        column_id: COL_USER_KEY,
+        lower: Some(key(500)),
+        upper: Some(key(520)),
+    });
+    assert_eq!(rows, 21, "the predicate selects 21 keys");
+    assert!(
+        read < 24 * 1_024,
+        "a 21-row key range read {read} B; it needs the directory and a couple of row pages",
+    );
+}
+
+#[test]
+fn a_value_predicate_reads_its_zone_block_and_the_row_pages_it_admits() {
+    // Zones of the value column are in the zone block after the pages, so a
+    // predicate on it reads that block, then only the row pages whose value
+    // zones admit it.
+    let (read, rows) = predicate_cost(&ColumnRangePredicate {
+        column_id: COL_VALUE,
+        lower: Some(zoned_value(500)),
+        upper: Some(zoned_value(520)),
+    });
+    assert_eq!(rows, 21, "the predicate selects 21 values");
+    assert!(
+        read < 32 * 1_024,
+        "a 21-row value range read {read} B; it needs the directory, the zone block and a \
+         couple of row pages",
+    );
+}
+
+#[test]
+fn a_columnar_point_read_that_hits_reads_one_key_page_not_every_one() {
+    // The key zones name the row page that can hold the key, so a hit reads
+    // that row page's key page and its other pages, not the key pages of the
+    // whole group.
+    let (_folder, tree) = zoned_tree(2_000);
+    let m = tree.metrics();
+    let before = m.bytes_read();
+    let got = tree
+        .get(key(700), SeqNo::MAX)
+        .expect("get")
+        .expect("a written key");
+    assert_eq!(&*got, zoned_value(700).as_slice());
+    let hit = m.bytes_read() - before;
+    assert!(
+        hit < 12 * 1_024,
+        "a hit read {hit} B; it needs the directory, one key page and one row page",
+    );
+}
+
 #[test]
 fn a_projection_repeated_from_the_cache_reads_nothing_and_a_wider_one_only_new_pages() {
     // Pages are cached one by one, so a second projection over the same rows

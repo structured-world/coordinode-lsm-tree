@@ -22,6 +22,7 @@ fn block_type_wire_tags_roundtrip_all_variants() {
         (12, BlockType::DeleteBitmap),
         (13, BlockType::ColumnPageDirectory),
         (14, BlockType::ColumnPage),
+        (15, BlockType::ColumnZones),
     ] {
         assert_eq!(
             u8::from(variant),
@@ -40,9 +41,9 @@ fn block_type_wire_tags_roundtrip_all_variants() {
 fn block_type_rejects_unknown_wire_tag() {
     // Forward-incompatibility guard: a tag this build doesn't know
     // (newer writer, older reader) must surface as a typed error,
-    // not a silent coercion to a known variant. 15 is the first
+    // not a silent coercion to a known variant. 16 is the first
     // unused tag past the contiguous range.
-    assert!(BlockType::try_from(15).is_err());
+    assert!(BlockType::try_from(16).is_err());
     assert!(BlockType::try_from(255).is_err());
 }
 

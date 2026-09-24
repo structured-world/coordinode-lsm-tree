@@ -7911,7 +7911,10 @@ fn a_projection_never_reads_a_corrupt_page_it_does_not_want() -> crate::Result<(
     let table = Table::recover(test_recover_params(file.clone(), checksum))?;
     let keys = table.load_row_group(
         &group,
-        &PageWant::columns(&[COL_USER_KEY]),
+        &PageWant {
+            columns: Some(&[COL_USER_KEY]),
+            ..PageWant::ALL
+        },
         ReadCharge::Foreground,
     )?;
     assert!(keys.row_count() > 0, "the key projection reads its rows");
@@ -7976,7 +7979,10 @@ fn a_projection_decodes_the_same_columns_as_a_full_read() -> crate::Result<()> {
         let projected = fresh()?
             .load_row_group(
                 &group,
-                &PageWant::columns(projection),
+                &PageWant {
+                    columns: Some(projection),
+                    ..PageWant::ALL
+                },
                 ReadCharge::Foreground,
             )?
             .into_batch()?;
@@ -8021,7 +8027,10 @@ fn a_projection_refuses_a_directory_longer_than_its_group() -> crate::Result<()>
     let err = table
         .load_row_group(
             &clipped,
-            &PageWant::columns(&[COL_USER_KEY]),
+            &PageWant {
+                columns: Some(&[COL_USER_KEY]),
+                ..PageWant::ALL
+            },
             ReadCharge::Foreground,
         )
         .expect_err("a directory past the group's end must be refused");
@@ -8352,5 +8361,155 @@ fn a_page_swapped_with_another_row_page_is_refused() -> crate::Result<()> {
         matches!(err, crate::Error::InvalidHeader(_)),
         "expected a stamp refusal, got {err:?}",
     );
+    Ok(())
+}
+
+/// Row `i`'s key in [`zoned_table_file`].
+#[cfg(feature = "columnar")]
+fn zoned_key(i: u32) -> Vec<u8> {
+    alloc::format!("key{i:06}").into_bytes()
+}
+
+/// Row `i`'s value in [`zoned_table_file`]: distinct, ascending with the key,
+/// 100 bytes.
+#[cfg(feature = "columnar")]
+fn zoned_value(i: u32) -> Vec<u8> {
+    let mut value = alloc::format!("val{i:06}").into_bytes();
+    value.resize(100, b'v');
+    value
+}
+
+/// A columnar table of `rows` rows in 64 KiB groups of 1 KiB row pages, so
+/// each group carries statistics zones: the key column's in its directory,
+/// the value column's in its zone block. `deletes` are positional deletes.
+#[cfg(feature = "columnar")]
+fn zoned_table_file(file: &std::path::Path, rows: u32, deletes: &[u32]) -> crate::Result<Checksum> {
+    use crate::config::DeleteStrategy;
+
+    let mut writer = Writer::new(file.to_path_buf(), 0, 0, Arc::new(StdFs))?
+        .use_columnar(true)
+        .use_zone_map(true)
+        .use_row_group_size(64 * 1_024)
+        .use_columnar_page_size(1_024)
+        .delete_strategy(DeleteStrategy::MergeOnRead);
+    for i in 0..rows {
+        writer.write(InternalValue::from_components(
+            zoned_key(i),
+            zoned_value(i),
+            u64::from(i) + 1,
+            crate::ValueType::Value,
+        ))?;
+    }
+    for &pos in deletes {
+        writer.delete_bitmap_mut().insert(pos);
+    }
+    let (_, checksum) = writer.finish()?.expect("written");
+    Ok(checksum)
+}
+
+/// Patrol scrub walks every block of a group, the zone block included: a clean
+/// table scrubs clean with the zone block counted, and damage inside the zone
+/// block is reported rather than passed over, since a read that prunes by it
+/// would otherwise trust bytes nothing checked.
+#[cfg(feature = "columnar")]
+#[test]
+fn patrol_scrub_checks_a_groups_zone_block() -> crate::Result<()> {
+    let dir = tempdir()?;
+    let file = dir.path().join("table");
+    let checksum = zoned_table_file(&file, 400, &[])?;
+    let group = first_row_group(&file, checksum)?;
+    let table = Table::recover(test_recover_params(file.clone(), checksum))?;
+    let blocks = table.data_unit_blocks(&group)?;
+    let Some(&(zone_block, role)) = blocks.last() else {
+        panic!("a group has blocks");
+    };
+    assert_eq!(
+        role,
+        BlockType::ColumnZones,
+        "the group ends in its zone block"
+    );
+
+    let clean = table.scrub_data_blocks();
+    assert_eq!(clean.uncorrectable_blocks, 0, "a clean table scrubs clean");
+    assert!(
+        clean.blocks_scanned >= blocks.len(),
+        "every block of the group is scanned, the zone block included",
+    );
+    drop(table);
+
+    let mut bytes = std::fs::read(&file)?;
+    let at = usize::try_from(*zone_block.offset()).expect("offset fits")
+        + zone_block.size() as usize
+        - 1;
+    *bytes.get_mut(at).expect("byte within the zone block") ^= 0x40;
+    std::fs::write(&file, &bytes)?;
+    let table = Table::recover(test_recover_params(file, checksum))?;
+    let damaged = table.scrub_data_blocks();
+    assert_eq!(
+        damaged.uncorrectable_blocks, 1,
+        "the damaged zone block is reported: {damaged:?}",
+    );
+    Ok(())
+}
+
+/// A predicate scan prunes row pages by their zones, on the key column from
+/// the directory and on the value column from the zone block, and returns
+/// exactly what filtering every row returns. Positional deletes land on the
+/// right rows though the pages before them were never read: a page's rows
+/// are counted from the group's start, not from the pages the scan read.
+#[cfg(feature = "columnar")]
+#[test]
+fn a_predicate_scan_over_row_pages_returns_what_filtering_every_row_returns() -> crate::Result<()> {
+    use crate::table::columnar::{COL_USER_KEY, COL_VALUE, bytes_column_row};
+    use crate::table::columnar_predicate::ColumnRangePredicate;
+
+    const ROWS: u32 = 400;
+    const DELETES: [u32; 3] = [150, 151, 205];
+    let dir = tempdir()?;
+    let file = dir.path().join("table");
+    let checksum = zoned_table_file(&file, ROWS, &DELETES)?;
+    let table = Table::recover(test_recover_params(file, checksum))?;
+
+    let cases = [
+        (COL_USER_KEY, zoned_key(140), zoned_key(160)),
+        (COL_VALUE, zoned_value(200), zoned_value(209)),
+        (COL_USER_KEY, zoned_key(0), zoned_key(0)),
+        (COL_VALUE, zoned_value(ROWS - 1), zoned_value(ROWS - 1)),
+        (COL_USER_KEY, zoned_key(ROWS), zoned_key(ROWS + 10)),
+    ];
+    for (column_id, lower, upper) in cases {
+        let predicate = ColumnRangePredicate {
+            column_id,
+            lower: Some(lower.clone()),
+            upper: Some(upper.clone()),
+        };
+        let mut got = Vec::new();
+        for batch in table.columnar_scan(&[COL_USER_KEY, COL_VALUE], Some(&predicate))? {
+            let keys = batch
+                .columns
+                .iter()
+                .find(|c| c.column_id == COL_USER_KEY)
+                .expect("the key column");
+            for row in 0..batch.row_count {
+                got.push(bytes_column_row(&keys.data, batch.row_count, row)?.to_vec());
+            }
+        }
+        let expected: Vec<Vec<u8>> = (0..ROWS)
+            .filter(|i| !DELETES.contains(i))
+            .filter(|&i| {
+                let cell = if column_id == COL_USER_KEY {
+                    zoned_key(i)
+                } else {
+                    zoned_value(i)
+                };
+                lower <= cell && cell <= upper
+            })
+            .map(zoned_key)
+            .collect();
+        assert_eq!(
+            got, expected,
+            "column {column_id} in {lower:?}..={upper:?} returns what a filter of every row does",
+        );
+    }
     Ok(())
 }

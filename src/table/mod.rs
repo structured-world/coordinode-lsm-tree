@@ -1169,7 +1169,8 @@ impl Table {
     /// A row-major table's unit is one block. A columnar table's is a row
     /// group, and its extent is not in the first block's header: that header
     /// is the directory's, which frames only itself. So the directory is read
-    /// and the group's extent is its own length plus every page it lists.
+    /// and the group's extent is its own length, every page it lists and the
+    /// zone block it counts.
     /// Framing the directory alone would make a group look like a run of
     /// unrelated blocks to every walk that tiles the data section by frames.
     ///
@@ -1216,9 +1217,8 @@ impl Table {
             }
             let directory =
                 crate::table::column_page::PageDirectory::decode(&directory_block.data)?;
-            let size = first
-                .size()
-                .checked_add(directory.pages_len())
+            let size = directory
+                .group_len(first.size())
                 .ok_or(crate::Error::InvalidHeader("row group span overflows"))?;
             if offset
                 .checked_add(u64::from(size))
@@ -1738,22 +1738,32 @@ impl Table {
             .verbatim
             .map(|(raw, header, _)| (raw, u64::from(header.uncompressed_length)));
         let mut pages = alloc::vec::Vec::with_capacity(decoded.entries().len());
+        let mut zones = None;
         for (handle, role) in blocks {
-            let page = self.salvage_load_block(&handle, role)?;
-            ecc_recovered |= page.ecc_recovered;
-            verbatim = match (verbatim, page.verbatim) {
-                (Some((mut raw, uncompressed)), Some((page_raw, header, _))) => {
-                    raw.extend_from_slice(&page_raw);
+            let block = self.salvage_load_block(&handle, role)?;
+            ecc_recovered |= block.ecc_recovered;
+            // Every block of the group, the zone block included, goes into
+            // the verbatim copy: the copy is the group whole or nothing.
+            verbatim = match (verbatim, block.verbatim) {
+                (Some((mut raw, uncompressed)), Some((block_raw, header, _))) => {
+                    raw.extend_from_slice(&block_raw);
                     Some((raw, uncompressed + u64::from(header.uncompressed_length)))
                 }
                 _ => None,
             };
-            pages.push(Some(page.block));
+            if role == BlockType::ColumnZones {
+                // Decoded so a zone block that verifies as a block but not as
+                // zones fails the group here, not in a later read.
+                zones = Some(decoded.decode_zone_block(&block.block.data)?);
+            } else {
+                pages.push(Some(block.block));
+            }
         }
         Ok(SalvageRowGroup {
             group: crate::table::row_group::RowGroupBlocks {
                 directory: decoded,
                 pages,
+                zones,
             },
             verbatim,
             ecc_recovered,
@@ -1872,10 +1882,11 @@ impl Table {
     /// key is absent / wholly deleted. The caller runs the normal seqno-aware
     /// point read on the result.
     ///
-    /// The key pages are read first, and a key they do not hold ends the read
-    /// there: a miss never reads the group's other pages. On a hit only the
-    /// row pages that hold the key are read, the directory and key pages
-    /// coming from the cache.
+    /// Only the key pages of the row pages whose key zone holds `needle` are
+    /// read first, and a key they do not hold ends the read there: a miss
+    /// never reads the group's other pages. On a hit only the row pages that
+    /// hold the key are read, the directory and key pages coming from the
+    /// cache.
     #[cfg(feature = "columnar")]
     fn load_columnar_point_block(
         &self,
@@ -1883,18 +1894,29 @@ impl Table {
         needle: &[u8],
     ) -> crate::Result<Option<DataBlock>> {
         use crate::table::columnar::{COL_USER_KEY, TypeTag};
-        use crate::table::row_group::PageWant;
+        use crate::table::row_group::{PageWant, RowPageSelect};
 
+        // A key equal to the needle is the needle's bytes (the comparator
+        // contract makes equality byte equality), so it lies within the
+        // byte-wise zone of the row page holding it, whatever the key order.
         let keys = self.load_row_group(
             handle,
-            &PageWant::columns(&[COL_USER_KEY]),
+            &PageWant {
+                columns: Some(&[COL_USER_KEY]),
+                row_pages: RowPageSelect::Zone {
+                    column_id: COL_USER_KEY,
+                    lower: Some(needle),
+                    upper: Some(needle),
+                },
+            },
             ReadCharge::Foreground,
         )?;
         // The key's versions are one run of rows, sorted with the rest of the
         // group, so they sit on consecutive row pages: the first page whose
-        // keys reach it through the page where the run ends.
+        // keys reach it through the page where the run ends. Every page of
+        // the run is selected, since each holds the needle.
         let mut hit: Option<core::ops::Range<u16>> = None;
-        for (ordinal, page) in (keys.first_page..).zip(&keys.batches) {
+        for (&ordinal, page) in keys.ordinals.iter().zip(&keys.batches) {
             let Some(key_col) = page
                 .columns
                 .first()
@@ -1933,10 +1955,11 @@ impl Table {
             handle,
             &PageWant {
                 columns: None,
-                row_pages: Some(row_pages),
+                row_pages: RowPageSelect::Range(row_pages),
             },
             ReadCharge::Foreground,
         )?;
+        let first_row = pages.starts.first().copied().unwrap_or(0);
         let deletes = match self
             .delete_block_starts
             .as_ref()
@@ -1945,7 +1968,7 @@ impl Table {
             Some(&start) => Some((
                 self.delete_bitmap.as_ref(),
                 start
-                    .checked_add(pages.first_row)
+                    .checked_add(first_row)
                     .ok_or(crate::Error::InvalidHeader(
                         "columnar: row position exceeds u32::MAX",
                     ))?,
@@ -1995,20 +2018,25 @@ impl Table {
         self.load_data_block(handle)
     }
 
-    /// Loads a columnar data block and decodes only the projected columns,
-    /// stepping over the rest without decoding them. The returned batches, one
-    /// per row page, carry the requested columns for this block's rows. This
-    /// is the projection read the vectorized scan uses, distinct from the
-    /// whole-block reconstruction that the row read paths use.
+    /// Loads a columnar data block and decodes only the projected columns of
+    /// the row pages `row_pages` selects, stepping over the rest without
+    /// reading them. The returned batches, one per row page read, carry the
+    /// requested columns for those rows. This is the projection read the
+    /// vectorized scan uses, distinct from the whole-block reconstruction that
+    /// the row read paths use.
     #[cfg(feature = "columnar")]
     fn load_columnar_block_projected(
         &self,
         handle: &BlockHandle,
         projection: &[u16],
+        row_pages: crate::table::row_group::RowPageSelect<'_>,
     ) -> crate::Result<crate::table::row_group::RowPages> {
         self.load_row_group(
             handle,
-            &crate::table::row_group::PageWant::columns(projection),
+            &crate::table::row_group::PageWant {
+                columns: Some(projection),
+                row_pages,
+            },
             ReadCharge::Foreground,
         )
     }
@@ -2127,13 +2155,24 @@ impl Table {
         let directory = crate::table::column_page::PageDirectory::decode(&directory_block.data)?;
         crate::table::row_group::check_group_extent(group, directory_len, &directory)?;
 
-        let mut blocks = alloc::vec::Vec::with_capacity(directory.entries().len() + 1);
+        let mut blocks = alloc::vec::Vec::with_capacity(directory.entries().len() + 2);
         blocks.push((directory_handle, BlockType::ColumnPageDirectory));
         for page in directory.entries() {
             let offset = *group.offset() + u64::from(directory_len) + u64::from(page.offset);
             blocks.push((
                 BlockHandle::new(crate::table::block::BlockOffset(offset), page.length),
                 BlockType::ColumnPage,
+            ));
+        }
+        if directory.zones_len() > 0 {
+            let offset =
+                *group.offset() + u64::from(directory_len) + u64::from(directory.pages_len());
+            blocks.push((
+                BlockHandle::new(
+                    crate::table::block::BlockOffset(offset),
+                    directory.zones_len(),
+                ),
+                BlockType::ColumnZones,
             ));
         }
         Ok(blocks)
@@ -2261,10 +2300,13 @@ impl Table {
     }
 
     /// The codec a data-carrying block of `role` was written under: a row
-    /// group's directory is always plain, everything else uses the table's
-    /// data codec.
+    /// group's directory and zone block are always plain, everything else
+    /// uses the table's data codec.
     fn compression_for_role(&self, role: BlockType) -> CompressionType {
-        if role == BlockType::ColumnPageDirectory {
+        if matches!(
+            role,
+            BlockType::ColumnPageDirectory | BlockType::ColumnZones
+        ) {
             CompressionType::None
         } else {
             self.metadata.data_block_compression
@@ -2272,10 +2314,13 @@ impl Table {
     }
 
     /// The zstd dictionary a data-carrying block of `role` needs, if any: none
-    /// for a directory, which is never compressed.
+    /// for a directory or a zone block, which are never compressed.
     #[cfg(zstd_any)]
     fn dictionary_for_role(&self, role: BlockType) -> Option<&crate::compression::ZstdDictionary> {
-        if role == BlockType::ColumnPageDirectory {
+        if matches!(
+            role,
+            BlockType::ColumnPageDirectory | BlockType::ColumnZones
+        ) {
             None
         } else {
             self.zstd_dictionary.as_deref()
@@ -6207,17 +6252,38 @@ impl Table {
         let (directory, frame) = self.load_block_from_disk(&directory_handle, directory_role)?;
         let directory_decoded = crate::table::column_page::PageDirectory::decode(&directory.data)?;
         let mut pages = alloc::vec::Vec::with_capacity(directory_decoded.entries().len());
+        let mut zones = None;
         for (handle, role) in blocks {
-            pages.push(Some(self.load_block_from_disk(&handle, role)?.0));
+            let block = self.load_block_from_disk(&handle, role)?.0;
+            if role == BlockType::ColumnZones {
+                zones = Some(directory_decoded.decode_zone_block(&block.data)?);
+            } else {
+                pages.push(Some(block));
+            }
         }
-        let batch = crate::table::row_group::RowGroupBlocks {
+        let group = crate::table::row_group::RowGroupBlocks {
             directory: directory_decoded,
             pages,
-        }
+            zones,
+        };
         // The gates are verification, which the counters leave out; they
         // re-derive per-group statistics, so the row pages are joined.
-        .to_row_pages(&crate::table::row_group::PageWant::ALL, &mut 0)?
-        .into_batch()?;
+        let batch = group
+            .to_row_pages(&crate::table::row_group::PageWant::ALL, &mut 0)?
+            .into_batch()?;
+        // The row pages' zones decide which pages a read skips, so they are
+        // authenticated like the zone map: re-derived from the decoded rows,
+        // both the directory's and the zone block's, and a zone block that
+        // should not exist is as wrong as one that is missing. A zone that
+        // disagrees would let a read prune a row page holding a match, and
+        // nothing on the read path looks at the rows it pruned.
+        let (key_zones, other_zones) = batch.group_zones(group.directory.row_pages())?;
+        let block_zones = group.zones.unwrap_or_default();
+        if key_zones != *group.directory.zones() || other_zones != block_zones {
+            return Err(crate::Error::InvalidHeader(
+                "columnar: row page statistics disagree with the group's rows",
+            ));
+        }
         Ok((directory, frame, batch))
     }
 
@@ -7561,28 +7627,50 @@ impl Table {
                 continue;
             }
             let handle = BlockHandle::new(keyed.offset(), keyed.size());
-            let pages = self.load_columnar_block_projected(&handle, &decode_projection)?;
+            // Row-page pruning: a row page whose zone proves it out of range
+            // is never read, the same proof the zone map gives a whole group,
+            // at the granularity a read can skip.
+            let select = || match predicate {
+                Some(pred) => crate::table::row_group::RowPageSelect::Zone {
+                    column_id: pred.column_id,
+                    lower: pred.lower.as_deref(),
+                    upper: pred.upper.as_deref(),
+                },
+                None => crate::table::row_group::RowPageSelect::All,
+            };
+            let crate::table::row_group::RowPages {
+                group_rows,
+                ordinals,
+                starts,
+                batches,
+            } = self.load_columnar_block_projected(&handle, &decode_projection, select())?;
             // The straddling block's key column, decoded separately (one extra
             // cached read for at most one block per scan) so the main
             // projection stays untouched: it masks the rows below the bound.
+            // The same selection over the same directory reads the same row
+            // pages, one key batch per batch above.
             let bound_keys = match restrict {
                 Some(bound) if straddles_bound => Some((
                     bound,
                     self.load_columnar_block_projected(
                         &handle,
                         &[crate::table::columnar::COL_USER_KEY],
+                        select(),
                     )?,
                 )),
                 _ => None,
             };
-            for (index, batch) in pages.batches.into_iter().enumerate() {
+            for ((batch, &ordinal), &start) in batches.into_iter().zip(&ordinals).zip(&starts) {
                 let row_count = batch.row_count;
+                let page_base = row_base.wrapping_add(start);
                 let bound_mask: Option<Vec<bool>> = match &bound_keys {
                     Some((bound, keys)) => {
                         use crate::table::columnar::{COL_USER_KEY, bytes_column_row};
                         let key_col = keys
-                            .batches
-                            .get(index)
+                            .ordinals
+                            .iter()
+                            .position(|&o| o == ordinal)
+                            .and_then(|i| keys.batches.get(i))
                             .filter(|k| k.row_count == row_count)
                             .and_then(|k| k.columns.iter().find(|c| c.column_id == COL_USER_KEY))
                             .ok_or(crate::Error::InvalidHeader(
@@ -7606,7 +7694,7 @@ impl Table {
                         None => alloc::vec![true; row_count as usize],
                     };
                     if has_deletes {
-                        let mut pos = row_base;
+                        let mut pos = page_base;
                         for k in &mut keep {
                             if self.delete_bitmap.contains(pos) {
                                 *k = false;
@@ -7625,7 +7713,6 @@ impl Table {
                     // building an empty batch for it would be a gather no
                     // caller receives.
                     if !keep.contains(&true) {
-                        row_base = row_base.wrapping_add(row_count);
                         continue;
                     }
                     let filtered = crate::table::columnar_predicate::filter_batch(&batch, &keep)?;
@@ -7635,12 +7722,14 @@ impl Table {
                 } else {
                     batch
                 };
-                row_base = row_base.wrapping_add(row_count);
                 if let Some(column_id) = added_predicate_column {
                     batch.columns.retain(|c| c.column_id != column_id);
                 }
                 out.push(batch);
             }
+            // The whole group's rows, the row pages pruned included, so the
+            // next group's positions start where this group's end.
+            row_base = row_base.wrapping_add(group_rows);
         }
         Ok(out)
     }
