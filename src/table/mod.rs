@@ -92,7 +92,7 @@ pub(crate) type BlockTaskPlan = (
     Arc<dyn crate::fs::FsFile>,
     SeqNo,
     bool,
-    Vec<(BlockHandle, Vec<usize>)>,
+    Vec<(KeyedBlockHandle, Vec<usize>)>,
 );
 
 /// How [`Table::recover_inner`] treats degraded sidecars and the metadata id
@@ -5963,6 +5963,7 @@ impl Table {
             if let Some(found) = data_block.point_read_value(key, seqno, &self.comparator)? {
                 return Ok(Some(found));
             }
+            self.ensure_block_ends_at(&data_block, block_handle.end_key())?;
 
             if self.comparator.compare(block_handle.end_key(), key) == core::cmp::Ordering::Greater
             {
@@ -6102,6 +6103,7 @@ impl Table {
             if let Some(item) = data_block.point_read(key, seqno, &self.comparator)? {
                 return Ok(Some((item, data_block)));
             }
+            self.ensure_block_ends_at(&data_block, block_handle.end_key())?;
 
             // NOTE: If the last block key is higher than ours,
             // our key cannot be in the next block
@@ -6112,6 +6114,40 @@ impl Table {
         }
 
         Ok(None)
+    }
+
+    /// Refuses a data block that does not end at `end_key`, the last key of the
+    /// index entry it was read for: a checksum-valid block of this table found
+    /// in another block's place, whose reads would otherwise answer "absent".
+    ///
+    /// Called where a read of the block found nothing, so a hit pays nothing
+    /// for it. Row tables only: a columnar block is rebuilt without its deleted
+    /// rows, so its last row can precede the entry's end key.
+    ///
+    /// # Errors
+    ///
+    /// Returns [`crate::Error::InvalidHeader`] for a misplaced block, and
+    /// propagates a block-decode failure.
+    pub(crate) fn ensure_block_ends_at(
+        &self,
+        block: &DataBlock,
+        end_key: &[u8],
+    ) -> crate::Result<()> {
+        if self.metadata.columnar {
+            return Ok(());
+        }
+        let last = block
+            .try_iter(self.comparator.clone())?
+            .next_back()
+            .map(|item| item.materialize(block.as_slice()).key.user_key);
+        match last {
+            Some(last) if self.comparator.compare(&last, end_key) == core::cmp::Ordering::Equal => {
+                Ok(())
+            }
+            _ => Err(crate::Error::InvalidHeader(
+                "data block does not end at the end key of its index entry",
+            )),
+        }
     }
 
     fn point_read(
@@ -6382,6 +6418,7 @@ impl Table {
             //     key). On None, do NOT advance p — break out so
             //     the next outer iteration loads the next block
             //     and retries the same key.
+            let mut missed = false;
             while p < passing.len() {
                 let key_idx = passing[p];
                 let key = sorted_keys[key_idx].0;
@@ -6398,6 +6435,8 @@ impl Table {
                             // contract).
                             item.key.seqno = apply_global_seqno(item.key.seqno, global_seqno);
                             results[key_idx] = Some(item);
+                        } else {
+                            missed = true;
                         }
                         p += 1;
                     }
@@ -6413,10 +6452,14 @@ impl Table {
                             // next block — leave p in place so the
                             // outer loop's next iteration retries
                             // this key against the next block.
+                            missed = true;
                             break;
                         }
                     }
                 }
+            }
+            if missed {
+                self.ensure_block_ends_at(&data_block, end_key)?;
             }
         }
 
@@ -6640,7 +6683,7 @@ impl Table {
             return Ok(None);
         };
 
-        let mut blocks: Vec<(BlockHandle, Vec<usize>)> = Vec::new();
+        let mut blocks: Vec<(KeyedBlockHandle, Vec<usize>)> = Vec::new();
         let mut p = 0_usize;
         while p < passing.len() {
             // None ends the index; an Err (index-read / decode failure) is
@@ -6656,7 +6699,6 @@ impl Table {
             if self.comparator.compare(first_in_block, end_key) == core::cmp::Ordering::Greater {
                 continue;
             }
-            let handle = *block_handle.as_ref();
             let mut block_keys: Vec<usize> = Vec::new();
             while p < passing.len() {
                 let pos = passing[p];
@@ -6674,7 +6716,9 @@ impl Table {
                     }
                 }
             }
-            blocks.push((handle, block_keys));
+            // The end key rides along so a resolver that finds nothing in the
+            // block can check the block is the one this entry names.
+            blocks.push((block_handle, block_keys));
         }
         if blocks.is_empty() {
             return Ok(None);

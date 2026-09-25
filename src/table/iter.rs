@@ -2,7 +2,6 @@
 // Copyright (c) 2025-present, fjall-rs
 // Copyright (c) 2026-present, Dmitry Prudnikov
 
-#[cfg(feature = "zstd")]
 use super::KeyedBlockHandle;
 use super::{BlockOffset, DataBlock, GlobalTableId, data_block::Iter as DataBlockIter};
 use crate::{
@@ -772,6 +771,60 @@ impl Iter {
         self.poisoned = true;
         Some(Err(err.into()))
     }
+
+    /// Refuses a block loaded for `handle` that is not the block the entry
+    /// names: a checksum-valid block of the table in another block's place.
+    ///
+    /// The first entry the block yields must not sort past the entry's end
+    /// key, which costs nothing: it is decoded anyway. A block that yields
+    /// nothing is checked in full, since a block at its own place ends at the
+    /// end key whatever window the read clamps it to; a misplaced one holding
+    /// only lower keys yields nothing to a read positioned inside its slot.
+    /// A partially decoded block does not hold its last entry, and a columnar
+    /// block is rebuilt without its deleted rows, so neither gets the full
+    /// check.
+    fn check_block_place(
+        &self,
+        handle: &KeyedBlockHandle,
+        first: Option<&InternalValue>,
+        partial: bool,
+    ) -> crate::Result<()> {
+        let misplaced = || {
+            crate::Error::InvalidHeader("data block does not end at the end key of its index entry")
+        };
+        if let Some(item) = first {
+            return if self
+                .comparator
+                .compare(&item.key.user_key, handle.end_key())
+                == core::cmp::Ordering::Greater
+            {
+                Err(misplaced())
+            } else {
+                Ok(())
+            };
+        }
+        if partial || self.columnar {
+            return Ok(());
+        }
+        let Some(BlockSource::Row(block)) =
+            self.load_and_resolve(&BlockHandle::new(handle.offset(), handle.size()))?
+        else {
+            return Ok(());
+        };
+        let last = block
+            .try_iter(self.comparator.clone())?
+            .next_back()
+            .map(|item| item.materialize(block.as_slice()).key.user_key);
+        match last {
+            Some(last)
+                if self.comparator.compare(&last, handle.end_key())
+                    == core::cmp::Ordering::Equal =>
+            {
+                Ok(())
+            }
+            _ => Err(misplaced()),
+        }
+    }
 }
 
 impl Iterator for Iter {
@@ -874,6 +927,7 @@ impl Iterator for Iter {
             };
             #[cfg(not(feature = "zstd"))]
             let partial: Option<DataBlock> = None;
+            let is_partial = partial.is_some();
 
             let block = if let Some(db) = partial {
                 BlockSource::Row(db)
@@ -902,6 +956,9 @@ impl Iterator for Iter {
             }
 
             let item = reader.next();
+            if let Err(e) = self.check_block_place(&handle, item.as_ref(), is_partial) {
+                return self.poison(e);
+            }
 
             self.lo_offset = handle.offset();
             self.lo_data_block = Some(reader);
@@ -1010,6 +1067,7 @@ impl DoubleEndedIterator for Iter {
             };
             #[cfg(not(feature = "zstd"))]
             let partial: Option<DataBlock> = None;
+            let is_partial = partial.is_some();
 
             let block = if let Some(db) = partial {
                 BlockSource::Row(db)
@@ -1038,6 +1096,9 @@ impl DoubleEndedIterator for Iter {
             }
 
             let item = reader.next_back();
+            if let Err(e) = self.check_block_place(&handle, item.as_ref(), is_partial) {
+                return self.poison(e);
+            }
 
             self.hi_offset = handle.offset();
             self.hi_data_block = Some(reader);

@@ -129,7 +129,7 @@ struct RunResolve {
 struct BlockTask<'a> {
     table: &'a crate::Table,
     file: Arc<dyn crate::fs::FsFile>,
-    handle: crate::table::BlockHandle,
+    handle: crate::table::KeyedBlockHandle,
     table_seqno: SeqNo,
     special: bool,
     keys: Vec<usize>,
@@ -3993,6 +3993,7 @@ impl Tree {
 
         for (task, buf) in chunk.iter().zip(buffers.iter()) {
             if let Some(block) = task.table.decode_data_block_from_bytes(buf)? {
+                let mut missed = false;
                 for &kidx in &task.keys {
                     if let Some(item) = task.table.point_read_translated(
                         &block,
@@ -4000,7 +4001,13 @@ impl Tree {
                         task.table_seqno,
                     )? {
                         Self::keep_highest(results, kidx, item);
+                    } else {
+                        missed = true;
                     }
+                }
+                if missed {
+                    task.table
+                        .ensure_block_ends_at(&block, task.handle.end_key())?;
                 }
             }
         }
