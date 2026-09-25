@@ -128,6 +128,36 @@ fn assert_refused(tree: &lsm_tree::AnyTree) {
         scanned.is_err(),
         "the scan must refuse the misplaced blocks"
     );
+    let reversed: Result<Vec<_>, _> = tree
+        .iter(SeqNo::MAX, None)
+        .rev()
+        .map(|g| g.into_inner().map(|(k, _)| k))
+        .collect();
+    assert!(
+        reversed.is_err(),
+        "a reverse scan must refuse the misplaced blocks"
+    );
+
+    // A range read positioned inside a slot never skips to later keys: its
+    // first entry is the key it starts at, or an error.
+    for i in 0..ROWS {
+        match tree.range(key(i).., SeqNo::MAX, None).next() {
+            Some(g) => {
+                if let Ok((k, _)) = g.into_inner() {
+                    assert_eq!(&*k, key(i).as_slice(), "range from key {i}");
+                }
+            }
+            None => panic!("a range from key {i} is empty"),
+        }
+    }
+
+    // A batched read answers every key, or errors.
+    let keys: Vec<Vec<u8>> = (0..ROWS).map(key).collect();
+    if let Ok(values) = tree.multi_get(&keys, SeqNo::MAX) {
+        for (i, v) in values.iter().enumerate() {
+            assert!(v.is_some(), "multi_get reads key {i} as absent");
+        }
+    }
 
     // The offline verifier reports the damage.
     let report = lsm_tree::verify::verify_block_checksums(tree);
@@ -149,6 +179,25 @@ fn a_data_block_moved_to_another_blocks_place_is_refused() {
     let dir = tempfile::tempdir().expect("tempdir");
     let tree = misplaced_tree(dir.path(), |c| c);
     assert_refused(&tree);
+}
+
+/// A batch too large for a tiny cache goes through the chunked resolver,
+/// which reads blocks into a scratch and point-reads them without the cache.
+#[test]
+fn a_chunked_multi_get_refuses_a_misplaced_block() {
+    let dir = tempfile::tempdir().expect("tempdir");
+    let tree = misplaced_tree(dir.path(), |c| {
+        c.use_cache(std::sync::Arc::new(lsm_tree::Cache::with_capacity_bytes(
+            16 * 1024,
+        )))
+    });
+    let keys: Vec<Vec<u8>> = (0..ROWS).chain(0..ROWS).map(key).collect();
+    assert!(keys.len() > 512, "the batch must take the chunked path");
+    if let Ok(values) = tree.multi_get(&keys, SeqNo::MAX) {
+        for (i, v) in values.iter().enumerate() {
+            assert!(v.is_some(), "multi_get reads position {i} as absent");
+        }
+    }
 }
 
 #[cfg(feature = "encryption")]
