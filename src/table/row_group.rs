@@ -419,21 +419,11 @@ impl GroupRead<'_> {
         Ok(zones)
     }
 
-    /// Refuses a directory whose tag is not the one the index entry names the
-    /// group by. A directory verifies as a block wherever it is read, so
-    /// another group's, read in this one's place, would otherwise be taken
-    /// for this group's: its zones can prune every page, and then no page
-    /// stamp is ever checked against it.
+    /// [`check_group_tag`] against this read's index entry. Checked before the
+    /// directory's zones are used: they can prune every page, and then no
+    /// page stamp is ever checked against the directory.
     fn check_group_tag(&self, directory: &PageDirectory) -> crate::Result<()> {
-        match self.group.group_tag() {
-            Some(tag) if tag.get() == directory.group_tag() => Ok(()),
-            Some(_) => Err(crate::Error::InvalidHeader(
-                "columnar: page directory belongs to another row group",
-            )),
-            None => Err(crate::Error::InvalidHeader(
-                "columnar: the index entry names no row group",
-            )),
-        }
+        check_group_tag(self.group.group_tag(), directory)
     }
 
     /// Refuses a block length the directory declares but no block of this
@@ -1028,6 +1018,28 @@ impl RowGroupBlocks {
             batches,
             every_page,
         })
+    }
+}
+
+/// Refuses a directory whose tag is not `expected`, the one the group's index
+/// entry names it by, and a group whose entry names none.
+///
+/// A directory verifies as a block wherever it is read, so another group's,
+/// read in this one's place, would otherwise be taken for this group's: every
+/// read of a group's blocks (an indexed read, a scan, verification, salvage)
+/// checks it before trusting anything the directory says.
+pub fn check_group_tag(
+    expected: Option<core::num::NonZeroU64>,
+    directory: &PageDirectory,
+) -> crate::Result<()> {
+    match expected {
+        Some(tag) if tag.get() == directory.group_tag() => Ok(()),
+        Some(_) => Err(crate::Error::InvalidHeader(
+            "columnar: page directory belongs to another row group",
+        )),
+        None => Err(crate::Error::InvalidHeader(
+            "columnar: the index entry names no row group",
+        )),
     }
 }
 

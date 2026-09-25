@@ -304,19 +304,7 @@ impl Scanner {
             )));
         }
         let directory = crate::table::column_page::PageDirectory::decode(&directory_block.data)?;
-        match group_tag {
-            Some(tag) if tag.get() == directory.group_tag() => {}
-            Some(_) => {
-                return Err(crate::Error::InvalidHeader(
-                    "columnar: page directory belongs to another row group",
-                ));
-            }
-            None => {
-                return Err(crate::Error::InvalidHeader(
-                    "columnar: the index entry names no row group",
-                ));
-            }
-        }
+        crate::table::row_group::check_group_tag(group_tag, &directory)?;
         let mut pages = Vec::with_capacity(directory.entries().len());
         for entry in directory.entries() {
             let page = Self::read_block(

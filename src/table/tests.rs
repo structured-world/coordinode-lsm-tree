@@ -5279,7 +5279,7 @@ fn predict_heal_streams_the_same_digest_as_materializing_corrections() -> crate:
     let mut corrections: Vec<(u64, Vec<u8>)> = Vec::new();
     for entry in table.block_index.iter() {
         let keyed = entry?;
-        let entry_handle = crate::table::BlockHandle::new(keyed.offset(), keyed.size());
+        let entry_handle = *keyed.as_ref();
         for (handle, role) in table.data_unit_blocks(&entry_handle)? {
             if let Some(c) =
                 table.heal_correction_for_block(fh.as_ref(), handle, role, &transform)?
@@ -8471,6 +8471,35 @@ fn a_page_refused_by_its_stamp_is_not_cached() -> crate::Result<()> {
         pages.group_rows,
         pages.row_count(),
         "with the right bytes back the same read is served whole",
+    );
+    Ok(())
+}
+
+/// A row group's blocks, as verification, salvage and scrub enumerate them,
+/// are refused when the directory does not carry the tag the index entry
+/// names: another group's directory in this group's place would otherwise be
+/// certified, or copied, as this group's.
+#[cfg(feature = "columnar")]
+#[test]
+fn a_row_groups_blocks_are_refused_under_another_groups_tag() -> crate::Result<()> {
+    let dir = tempdir()?;
+    let file = dir.path().join("table");
+    let checksum = columnar_table_file_paged(&file, 400, 16, 100, 16 * 1_024, 1_024)?;
+    let group = first_row_group(&file, checksum)?;
+    let table = Table::recover(test_recover_params(file, checksum))?;
+    assert!(
+        table.data_unit_blocks(&group).is_ok(),
+        "the group under its own tag"
+    );
+
+    let Some(tag) = group.group_tag() else {
+        panic!("a columnar index entry names its group");
+    };
+    let other = group.with_group_tag(tag.checked_add(1));
+    let refused = table.data_unit_blocks(&other);
+    assert!(
+        refused.is_err(),
+        "the group's blocks under another tag must be refused, got {refused:?}",
     );
     Ok(())
 }

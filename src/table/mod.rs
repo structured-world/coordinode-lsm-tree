@@ -2174,6 +2174,10 @@ impl Table {
         }
         let directory = crate::table::column_page::PageDirectory::decode(&directory_block.data)?;
         crate::table::row_group::check_group_extent(group, directory_len, &directory)?;
+        // Verification, salvage and scrub take the group's blocks from here, so
+        // another group's, in this one's place, is refused before it can be
+        // certified or copied as this group's.
+        crate::table::row_group::check_group_tag(group.group_tag(), &directory)?;
 
         let mut blocks = alloc::vec::Vec::with_capacity(directory.entries().len() + 2);
         blocks.push((directory_handle, BlockType::ColumnPageDirectory));
