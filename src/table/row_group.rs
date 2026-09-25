@@ -314,10 +314,11 @@ impl GroupRead<'_> {
             self.group.offset(),
             self.charge.touches_cache(),
         ) {
-            // Decoded and checked when it was cached; its extent is checked
-            // again against this read's index entry, which is what names the
-            // group here.
+            // Decoded and checked when it was cached; its extent and tag are
+            // checked again against this read's index entry, which is what
+            // names the group here.
             check_group_extent(self.group, directory_len, &directory)?;
+            self.check_group_tag(&directory)?;
             let mut fd = None;
             let zones = match want.zone_block_column(&directory) {
                 Some(column_id) => Some(self.zone_block(
@@ -416,6 +417,23 @@ impl GroupRead<'_> {
         let zones = directory.decode_zone_block(column_id, &block.data)?;
         self.cache_block(&handle, block);
         Ok(zones)
+    }
+
+    /// Refuses a directory whose tag is not the one the index entry names the
+    /// group by. A directory verifies as a block wherever it is read, so
+    /// another group's, read in this one's place, would otherwise be taken
+    /// for this group's: its zones can prune every page, and then no page
+    /// stamp is ever checked against it.
+    fn check_group_tag(&self, directory: &PageDirectory) -> crate::Result<()> {
+        match self.group.group_tag() {
+            Some(tag) if tag.get() == directory.group_tag() => Ok(()),
+            Some(_) => Err(crate::Error::InvalidHeader(
+                "columnar: page directory belongs to another row group",
+            )),
+            None => Err(crate::Error::InvalidHeader(
+                "columnar: the index entry names no row group",
+            )),
+        }
     }
 
     /// Refuses a block length the directory declares but no block of this
@@ -543,6 +561,7 @@ impl GroupRead<'_> {
         )?;
         let directory = Arc::new(PageDirectory::decode(&block.data)?);
         check_group_extent(self.group, directory_len, &directory)?;
+        self.check_group_tag(&directory)?;
         Ok((directory, directory_len))
     }
 

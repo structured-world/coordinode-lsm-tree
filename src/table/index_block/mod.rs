@@ -31,6 +31,8 @@ pub struct IndexBlockParsedItem {
     pub prefix: Option<SliceIndexes>,
     pub end_key: SliceIndexes,
     pub seqno: SeqNo,
+    /// The tag of the columnar row group the entry names, when it names one.
+    pub group_tag: Option<core::num::NonZeroU64>,
 }
 
 impl ParsedItem<KeyedBlockHandle> for IndexBlockParsedItem {
@@ -85,7 +87,11 @@ impl ParsedItem<KeyedBlockHandle> for IndexBlockParsedItem {
             bytes.slice(self.end_key.0..self.end_key.1)
         };
 
-        KeyedBlockHandle::new(key, self.seqno, BlockHandle::new(self.offset, self.size))
+        KeyedBlockHandle::new(
+            key,
+            self.seqno,
+            BlockHandle::new(self.offset, self.size).with_group_tag(self.group_tag),
+        )
     }
 }
 

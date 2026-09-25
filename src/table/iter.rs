@@ -1010,7 +1010,7 @@ impl Iterator for Iter {
             let block = if let Some(db) = partial {
                 BlockSource::Row(db)
             } else {
-                match self.load_and_resolve(&BlockHandle::new(handle.offset(), handle.size())) {
+                match self.load_and_resolve(handle.as_ref()) {
                     Ok(Some(b)) => b,
                     // The block was wholly deleted by the mask; skip to the next.
                     Ok(None) => continue,
@@ -1146,7 +1146,7 @@ impl DoubleEndedIterator for Iter {
             let block = if let Some(db) = partial {
                 BlockSource::Row(db)
             } else {
-                match self.load_and_resolve(&BlockHandle::new(handle.offset(), handle.size())) {
+                match self.load_and_resolve(handle.as_ref()) {
                     Ok(Some(b)) => b,
                     // The block was wholly deleted by the mask; skip to the next.
                     Ok(None) => continue,

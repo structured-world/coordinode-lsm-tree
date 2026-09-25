@@ -290,6 +290,20 @@ without it they would trade places and hand each row another row's value.
 Moving a whole group, directory and pages together, is the block swap the
 index already governs: the group's keys travel with its values.
 
+The directory is bound to its group by the **index entry**, which carries the
+group's tag. A directory verifies as a block wherever it is read, so another
+group's of the same shape, read in this one's place, would otherwise be taken
+for this group's: the page stamps catch it as soon as a page is read, but a
+point read whose key zones prune every row page reads none, and would answer
+from the foreign directory that the key is absent. A reader therefore refuses
+a directory whose tag is not the one the index entry names. The tag is a
+varint of at most 9 bytes per group in the index, and it costs a row-major
+table nothing: its entries
+keep the markers they had, and only an entry that names a row group takes the
+tagged one. A group salvage finds by its frame rather than through the index
+has no entry to name it and is taken under its directory's own tag, its pages'
+stamps still checked against it.
+
 A block of another role in a page slot (a zone block, a directory) is refused
 by the type its block header names, before its stamp is consulted. Moving a page **between
 tables** is refused too, encrypted or not. A row-major block moved into
@@ -377,6 +391,11 @@ contract intact — an entry is still one contiguous extent at one offset — an
 it is why every section keyed by a data block's file offset (zone map, seqno
 bounds, the delete-position lookup) keeps working unchanged: the group starts
 where its directory starts, which is where the block it replaces started.
+
+The entry also carries the group's tag, after its seqno, under markers of its
+own (4 for a full entry, 5 for a truncated one) beside the row-major entries'
+0 and 1. A tagged entry whose tag is zero is refused: no group is written
+under it.
 
 A reader that wants only part of the group needs the directory's own length
 first, and the index does not record it. It does not have to: a block header

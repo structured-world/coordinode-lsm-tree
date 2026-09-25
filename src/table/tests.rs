@@ -4440,7 +4440,7 @@ fn salvage_reads_of_a_columnar_table_count_no_bytes() -> crate::Result<()> {
         .data_block_handles()
         .next()
         .expect("the table has a data block")?;
-    let handle = BlockHandle::new(first.offset(), first.size());
+    let handle = *first.as_ref();
     let before = (metrics.bytes_read(), metrics.bytes_decoded());
     assert!(
         table.load_columnar_block_masked(&handle)?.is_some(),
@@ -7897,7 +7897,7 @@ fn a_projection_never_reads_a_corrupt_page_it_does_not_want() -> crate::Result<(
             .data_block_handles()
             .next()
             .expect("the table has a row group")?;
-        BlockHandle::new(first.offset(), first.size())
+        *first.as_ref()
     };
 
     // Flip one byte inside the value page's payload, past its block header.
@@ -7948,7 +7948,7 @@ fn a_projection_decodes_the_same_columns_as_a_full_read() -> crate::Result<()> {
             .data_block_handles()
             .next()
             .expect("the table has a row group")?;
-        BlockHandle::new(first.offset(), first.size())
+        *first.as_ref()
     };
     let (key_at, key_len) = page_extent(&file, &group, COL_USER_KEY);
     let group_at = usize::try_from(*group.offset()).expect("offset fits");
@@ -8015,11 +8015,11 @@ fn a_projection_refuses_a_directory_longer_than_its_group() -> crate::Result<()>
             .data_block_handles()
             .next()
             .expect("the table has a row group")?;
-        BlockHandle::new(first.offset(), first.size())
+        *first.as_ref()
     };
     // A shorter index entry than the group really is: the directory header,
     // which is intact, now claims more than the entry spans.
-    let clipped = BlockHandle::new(group.offset(), 64);
+    let clipped = BlockHandle::new(group.offset(), 64).with_group_tag(group.group_tag());
     let table = Table::recover(test_recover_params(file, checksum))?;
     let err = table
         .load_row_group(
@@ -8043,7 +8043,7 @@ fn first_row_group(file: &std::path::Path, checksum: Checksum) -> crate::Result<
         .data_block_handles()
         .next()
         .expect("the table has a row group")?;
-    Ok(BlockHandle::new(first.offset(), first.size()))
+    Ok(*first.as_ref())
 }
 
 /// A group cut into many row pages reads back exactly what was written, both
@@ -8160,8 +8160,7 @@ fn a_page_size_at_the_group_size_writes_one_row_page_per_group() -> crate::Resul
     let mut groups = 0;
     for keyed in table.data_block_handles() {
         let keyed = keyed?;
-        let handle = BlockHandle::new(keyed.offset(), keyed.size());
-        let pages = table.load_row_group(&handle, &PageWant::ALL, ReadCharge::Foreground)?;
+        let pages = table.load_row_group(keyed.as_ref(), &PageWant::ALL, ReadCharge::Foreground)?;
         assert_eq!(pages.batches.len(), 1, "group {groups} is one row page");
         groups += 1;
     }
@@ -8476,32 +8475,24 @@ fn a_page_refused_by_its_stamp_is_not_cached() -> crate::Result<()> {
     Ok(())
 }
 
-/// A read that meets another group's directory in this group's place fails on
-/// the first page and leaves the directory out of the cache: once the right
-/// bytes are back, the same read is served. A directory cached before the
-/// pages were checked against it would refuse every healthy page of the group
-/// until it was evicted.
+/// Writes the second row group's directory over the first's, the two being of
+/// one shape, and returns the first group's handle from the index with the
+/// file's original bytes.
 #[cfg(feature = "columnar")]
-#[test]
-fn a_directory_refused_by_its_pages_is_not_cached() -> crate::Result<()> {
+fn second_groups_directory_in_the_first(
+    file: &std::path::Path,
+    checksum: Checksum,
+) -> crate::Result<(BlockHandle, Vec<u8>)> {
     use crate::coding::Decode;
     use crate::table::block::Header;
-    use crate::table::row_group::PageWant;
 
-    let dir = tempdir()?;
-    let file = dir.path().join("table");
-    let checksum = columnar_table_file_paged(&file, 400, 16, 100, 16 * 1_024, 1_024)?;
     let (first, second) = {
-        let table = Table::recover(test_recover_params(file.clone(), checksum))?;
+        let table = Table::recover(test_recover_params(file.to_path_buf(), checksum))?;
         let mut groups = table.data_block_handles();
         let (Some(first), Some(second)) = (groups.next(), groups.next()) else {
             panic!("the table has two row groups");
         };
-        let (first, second) = (first?, second?);
-        (
-            BlockHandle::new(first.offset(), first.size()),
-            BlockHandle::new(second.offset(), second.size()),
-        )
+        (*first?.as_ref(), *second?.as_ref())
     };
     assert_eq!(
         first.size(),
@@ -8509,7 +8500,7 @@ fn a_directory_refused_by_its_pages_is_not_cached() -> crate::Result<()> {
         "the two groups are of one shape"
     );
 
-    let original = std::fs::read(&file)?;
+    let original = std::fs::read(file)?;
     let mut bytes = original.clone();
     let directory_at = |group: &BlockHandle| -> crate::Result<core::ops::Range<usize>> {
         let at = usize::try_from(*group.offset()).expect("offset fits");
@@ -8528,7 +8519,52 @@ fn a_directory_refused_by_its_pages_is_not_cached() -> crate::Result<()> {
         .get_mut(into)
         .expect("directory")
         .copy_from_slice(&foreign);
-    std::fs::write(&file, &bytes)?;
+    std::fs::write(file, &bytes)?;
+    Ok((first, original))
+}
+
+/// A point read that meets another group's directory in this group's place
+/// is refused, though the foreign directory's key zones prune every row page
+/// and so no page stamp is checked. Taking the directory on its word answered
+/// that the key is absent.
+#[cfg(feature = "columnar")]
+#[test]
+fn a_point_read_refuses_another_groups_directory_whose_zones_prune_every_page() -> crate::Result<()>
+{
+    let dir = tempdir()?;
+    let file = dir.path().join("table");
+    let checksum = columnar_table_file_paged(&file, 400, 16, 100, 16 * 1_024, 1_024)?;
+    let (_, original) = second_groups_directory_in_the_first(&file, checksum)?;
+
+    let mut key = b"key000000".to_vec();
+    key.resize(16, b'k');
+    let table = Table::recover(test_recover_params(file.clone(), checksum))?;
+    let got = table.get(&key, crate::MAX_SEQNO, crate::hash::hash64(&key));
+    assert!(
+        got.is_err(),
+        "a key of the first group, read through the second's directory, got {got:?}",
+    );
+
+    std::fs::write(&file, &original)?;
+    let got = table.get(&key, crate::MAX_SEQNO, crate::hash::hash64(&key))?;
+    assert!(got.is_some(), "with the right bytes back the key is found");
+    Ok(())
+}
+
+/// A read that meets another group's directory in this group's place fails on
+/// the first page and leaves the directory out of the cache: once the right
+/// bytes are back, the same read is served. A directory cached before the
+/// pages were checked against it would refuse every healthy page of the group
+/// until it was evicted.
+#[cfg(feature = "columnar")]
+#[test]
+fn a_directory_refused_by_its_pages_is_not_cached() -> crate::Result<()> {
+    use crate::table::row_group::PageWant;
+
+    let dir = tempdir()?;
+    let file = dir.path().join("table");
+    let checksum = columnar_table_file_paged(&file, 400, 16, 100, 16 * 1_024, 1_024)?;
+    let (first, original) = second_groups_directory_in_the_first(&file, checksum)?;
 
     let table = Table::recover(test_recover_params(file.clone(), checksum))?;
     assert!(

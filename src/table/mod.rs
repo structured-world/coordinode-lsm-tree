@@ -1231,7 +1231,11 @@ impl Table {
                     "row group extends past its section",
                 ));
             }
-            Ok(BlockHandle::new(BlockOffset(offset), size))
+            // A group found by its frame has no index entry to name it; the
+            // tag its own directory carries is the only one there is, and the
+            // pages' stamps are still checked against it when they decode.
+            Ok(BlockHandle::new(BlockOffset(offset), size)
+                .with_group_tag(core::num::NonZeroU64::new(directory.group_tag())))
         }
         #[cfg(not(feature = "columnar"))]
         {
@@ -1524,7 +1528,7 @@ impl Table {
             if starts.get(&offset) != Some(&cumulative) {
                 return Ok(false);
             }
-            let handle = BlockHandle::new(keyed.offset(), keyed.size());
+            let handle = *keyed.as_ref();
             // FULLY decode the group rather than trusting the directory's row
             // count: a checksum-repatched tamper can keep that field intact
             // while breaking a page's column framing. The salvage walk would
@@ -2242,7 +2246,7 @@ impl Table {
             {
                 continue;
             }
-            let entry_handle = BlockHandle::new(keyed.offset(), keyed.size());
+            let entry_handle = *keyed.as_ref();
             let blocks = match self.data_unit_blocks(&entry_handle) {
                 Ok(blocks) => blocks,
                 // A row group whose directory cannot be read has no known
@@ -2968,7 +2972,7 @@ impl Table {
             {
                 continue;
             }
-            let entry_handle = BlockHandle::new(keyed.offset(), keyed.size());
+            let entry_handle = *keyed.as_ref();
             let blocks = match self.data_unit_blocks(&entry_handle) {
                 Ok(blocks) => blocks,
                 // A row group whose directory cannot be read has no locatable
@@ -3520,7 +3524,7 @@ impl Table {
             // An unreadable row-group directory aborts the prediction for the
             // same reason an index-read failure does: its pages would silently
             // drop out of the predicted offset set.
-            let blocks = self.data_unit_blocks(&BlockHandle::new(keyed.offset(), keyed.size()))?;
+            let blocks = self.data_unit_blocks(keyed.as_ref())?;
             for (handle, role) in blocks {
                 let Some((write_offset, bytes)) =
                     self.heal_correction_for_block(file, handle, role, transform)?
@@ -4999,7 +5003,7 @@ impl Table {
         let mut irregular = false;
         for (i, handle) in self.maintenance_index_walk().enumerate() {
             let handle = handle?;
-            let block = BlockHandle::new(handle.offset(), handle.size());
+            let block = *handle.as_ref();
             // A recovery walk over the file's geometry, not a read a caller
             // asked for, so it charges nothing to the read counters.
             if Self::block_is_zeroed_in(&*file, &block, &mut |_| {})? {
@@ -5134,7 +5138,7 @@ impl Table {
             if i < start {
                 continue;
             }
-            let bh = BlockHandle::new(handle.offset(), handle.size());
+            let bh = *handle.as_ref();
             if let Some(db) = self.load_data_block_charged(&bh, ReadCharge::Maintenance)?
                 && let Some(first) = db.first_user_key(self.comparator.clone())?
             {
@@ -6185,8 +6189,7 @@ impl Table {
 
         let punch = self.punch_offset()?;
         for handle in self.untraced_index_walk() {
-            let handle = handle?;
-            let handle = BlockHandle::new(handle.offset(), handle.size());
+            let handle = *handle?.as_ref();
             if handle.offset().0 < punch {
                 continue;
             }
@@ -7659,7 +7662,7 @@ impl Table {
                 }
                 continue;
             }
-            let handle = BlockHandle::new(keyed.offset(), keyed.size());
+            let handle = *keyed.as_ref();
             // Row-page pruning: a row page whose zone proves it out of range
             // is never read, the same proof the zone map gives a whole group,
             // at the granularity a read can skip.

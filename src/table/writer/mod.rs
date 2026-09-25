@@ -363,7 +363,7 @@ pub struct Writer {
 
     /// Tag of the first row group encoded here: a hash of the table's path,
     /// id and creation time, in the lower half of `u64` so the increments
-    /// after it never run out. Starting every table at its own point is what
+    /// after it never run out, and never zero. Starting every table at its own point is what
     /// makes a page's stamp name its table as well as its group: a page's
     /// values are apart from their keys, so a page taken for another table's
     /// would serve that table's value under this table's key.
@@ -411,6 +411,15 @@ pub struct Writer {
     parallel_pending_bytes: u64,
 }
 
+/// `tag` as the index names a row group, refusing the zero tag no group is
+/// written under.
+#[cfg(feature = "columnar")]
+fn nonzero_group_tag(tag: u64) -> crate::Result<core::num::NonZeroU64> {
+    core::num::NonZeroU64::new(tag).ok_or(crate::Error::InvalidHeader(
+        "columnar: a row group's tag is zero",
+    ))
+}
+
 impl Writer {
     pub fn new(
         path: PathBuf,
@@ -453,7 +462,8 @@ impl Writer {
             let mut seed = alloc::format!("{}", path.display()).into_bytes();
             seed.extend_from_slice(&table_id.to_le_bytes());
             seed.extend_from_slice(&crate::time::unix_timestamp().as_nanos().to_le_bytes());
-            crate::hash::hash64(&seed) >> 1
+            // Never zero: the index names a group by a non-zero tag.
+            (crate::hash::hash64(&seed) >> 1).max(1)
         };
 
         Ok(Self {
@@ -1732,6 +1742,7 @@ impl Writer {
             item_count,
             zone_block_min,
             columnar_columns,
+            Some(nonzero_group_tag(group_tag)?),
         )
     }
 
@@ -1984,6 +1995,7 @@ impl Writer {
             item_count,
             zone_block_min,
             columnar_columns,
+            None,
         )
     }
 
@@ -1994,7 +2006,8 @@ impl Writer {
     /// columnar row group is several — its page directory and its pages — and
     /// is still ONE entry: the index names row groups, so `block_id` keeps its
     /// meaning and every section keyed by a data block's file offset keeps
-    /// working, since the group starts exactly where its directory does.
+    /// working, since the group starts exactly where its directory does. The
+    /// entry carries the group's tag, which its directory must repeat.
     #[expect(
         clippy::too_many_arguments,
         reason = "cohesive per-written-block fields; a param struct adds indirection without clarity"
@@ -2010,6 +2023,7 @@ impl Writer {
         item_count: usize,
         zone_block_min: Option<UserKey>,
         columnar_columns: Option<Vec<crate::table::zone_map::ColumnStats>>,
+        group_tag: Option<core::num::NonZeroU64>,
     ) -> crate::Result<()> {
         self.meta.uncompressed_size += uncompressed_length;
 
@@ -2024,7 +2038,7 @@ impl Writer {
         let handle = KeyedBlockHandle::new(
             last_key.clone(),
             last_seqno,
-            BlockHandle::new(self.meta.file_pos, bytes_written),
+            BlockHandle::new(self.meta.file_pos, bytes_written).with_group_tag(group_tag),
         );
         // Seqno bounds go into the parallel `seqno_bounds` section keyed by this
         // block's file offset, NOT inline in the index entry: keeping them out of
@@ -2262,6 +2276,7 @@ impl Writer {
             layout,
             entries,
             columnar_columns,
+            None,
             comparator,
         )
     }
@@ -2306,6 +2321,7 @@ impl Writer {
             Vec::new(),
             entries,
             columnar_columns,
+            Some(nonzero_group_tag(group_tag)?),
             comparator,
         )?;
         self.last_group_tag = Some(group_tag);
@@ -2325,7 +2341,7 @@ impl Writer {
     #[cfg(feature = "columnar")]
     #[must_use]
     pub(crate) fn accepts_group_tag(&self, group_tag: u64) -> bool {
-        self.last_group_tag.is_none_or(|last| group_tag > last)
+        group_tag != 0 && self.last_group_tag.is_none_or(|last| group_tag > last)
     }
 
     /// Starts this table's tags at `tag`, when no group has been written yet;
@@ -2335,12 +2351,13 @@ impl Writer {
     /// groups, whose tags are above it, can still be copied verbatim.
     #[cfg(feature = "columnar")]
     pub(crate) fn start_group_tags_at(&mut self, tag: u64) {
-        if self.last_group_tag.is_none() {
+        if self.last_group_tag.is_none() && tag != 0 {
             self.group_tag_base = tag;
         }
     }
 
-    /// The tag for the next row group encoded here.
+    /// The tag for the next row group encoded here: never zero, since the base
+    /// is not and the increments are checked.
     #[cfg(feature = "columnar")]
     fn next_group_tag(&self) -> crate::Result<u64> {
         match self.last_group_tag {
@@ -2352,7 +2369,12 @@ impl Writer {
     }
 
     /// Shared body of the verbatim copies: validates the entries' order,
-    /// appends `raw` to the data region, and registers it as one index entry.
+    /// appends `raw` to the data region, and registers it as one index entry,
+    /// naming the row group tagged `group_tag` when the copy is one.
+    #[expect(
+        clippy::too_many_arguments,
+        reason = "cohesive per-copy fields, forwarded to `register_written_extent`"
+    )]
     fn append_verbatim_extent(
         &mut self,
         raw: &[u8],
@@ -2360,6 +2382,7 @@ impl Writer {
         layout: alloc::vec::Vec<u32>,
         entries: &[InternalValue],
         columnar_columns: Option<Vec<crate::table::zone_map::ColumnStats>>,
+        group_tag: Option<core::num::NonZeroU64>,
         comparator: &crate::SharedComparator,
     ) -> crate::Result<Option<crate::UserKey>> {
         let bytes_written = u32::try_from(raw.len())
@@ -2390,6 +2413,7 @@ impl Writer {
             inputs.item_count,
             inputs.zone_block_min,
             columnar_columns,
+            group_tag,
         )?;
         if self.locator.is_some() {
             self.locator_block_id += 1;
