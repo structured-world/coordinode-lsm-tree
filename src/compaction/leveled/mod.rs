@@ -24,6 +24,64 @@ use crate::{
 #[cfg(not(feature = "std"))]
 use alloc::vec::Vec;
 
+/// A merge candidate's cost: the bytes it moves down a level (`promoted`) and
+/// every byte it reads and rewrites to do so (`total`, the promoted bytes
+/// plus those it pulls in from the level below).
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+pub(crate) struct MergeCost {
+    pub(crate) promoted: u64,
+    pub(crate) total: u64,
+}
+
+impl MergeCost {
+    /// Whether `self` rewrites fewer bytes per promoted byte than `other`.
+    ///
+    /// Cross-multiplied in `u128`: two `u64` byte counts multiply into at
+    /// most 128 bits, so the comparison is exact for every size a level can
+    /// hold, where dividing first would lose the low bits.
+    fn cheaper_than(self, other: Self) -> bool {
+        u128::from(self.total) * u128::from(other.promoted)
+            < u128::from(other.total) * u128::from(self.promoted)
+    }
+}
+
+/// Picks the merge candidate that pays down a level's debt at the least
+/// rewriting per promoted byte, and returns its index in `candidates`.
+///
+/// Ranking by the total input alone prefers a small merge that promotes little
+/// into a dense level below, which has to be repeated many times to retire the
+/// same debt; the ratio ranks how much each promoted byte costs. Among the
+/// candidates that promote no more than `overshoot + slack`, the cheapest one
+/// wins, so a level is not asked to push down far more than it owes; when none
+/// is that small, the cheapest overall still makes progress. Ties go to the
+/// earliest candidate, so the choice is the same on every call.
+pub(crate) fn rank_by_promoted_ratio(
+    candidates: &[MergeCost],
+    overshoot: u64,
+    slack: u64,
+) -> Option<usize> {
+    // A bound past `u64::MAX` admits every candidate, which is what clamping
+    // to `u64::MAX` means: no promoted byte count can exceed it.
+    let bound = overshoot.saturating_add(slack);
+    let cheapest = |within_bound: bool| {
+        let mut best: Option<usize> = None;
+        for (index, cost) in candidates.iter().enumerate() {
+            if within_bound && cost.promoted > bound {
+                continue;
+            }
+            let better = match best.and_then(|b| candidates.get(b)) {
+                None => true,
+                Some(current) => cost.cheaper_than(*current),
+            };
+            if better {
+                best = Some(index);
+            }
+        }
+        best
+    };
+    cheapest(true).or_else(|| cheapest(false))
+}
+
 /// Tries to find the most optimal compaction set from one level into the other.
 ///
 /// Scans all runs in both levels to handle transient multi-run states from
@@ -32,8 +90,9 @@ fn pick_minimal_compaction(
     curr_level: &Level,
     next_level: &Level,
     hidden_set: &HiddenSet,
-    _overshoot: u64,
+    overshoot: u64,
     table_base_size: u64,
+    promotion_slack: u64,
     cmp: &dyn crate::comparator::UserComparator,
 ) -> Option<(HashSet<TableId>, bool)> {
     // NOTE: Find largest trivial move (if it exists)
@@ -68,7 +127,7 @@ fn pick_minimal_compaction(
         return None;
     }
 
-    next_level
+    let candidates: Vec<_> = next_level
         .iter()
         .flat_map(|run| {
             // Cap per-run windows at 50x table_base_size. take_while is safe
@@ -106,16 +165,36 @@ fn pick_minimal_compaction(
             }
 
             let next_level_size = window.iter().map(Table::file_size).sum::<u64>();
-            let compaction_bytes = curr_level_size + next_level_size;
+            let cost = MergeCost {
+                promoted: curr_level_size,
+                total: curr_level_size + next_level_size,
+            };
 
-            Some((window, curr_level_pull_in, compaction_bytes))
+            Some((window, curr_level_pull_in, cost))
         })
-        .min_by_key(|(_, _, bytes)| *bytes)
-        .map(|(window, curr_level_pull_in, _)| {
-            let mut ids: HashSet<_> = window.iter().map(Table::id).collect();
-            ids.extend(curr_level_pull_in.iter().map(|t| Table::id(t)));
-            (ids, false)
-        })
+        .collect();
+
+    let costs: Vec<MergeCost> = candidates.iter().map(|(_, _, cost)| *cost).collect();
+    let chosen = rank_by_promoted_ratio(&costs, overshoot, promotion_slack)?;
+    if log::log_enabled!(log::Level::Debug) {
+        let others: Vec<MergeCost> = costs
+            .iter()
+            .enumerate()
+            .filter(|&(index, _)| index != chosen)
+            .map(|(_, cost)| *cost)
+            .collect();
+        let runner_up = rank_by_promoted_ratio(&others, u64::MAX, 0).and_then(|i| others.get(i));
+        log::debug!(
+            "leveled: merge candidate {chosen} of {} chosen at {:?}, runner-up {runner_up:?} \
+             (overshoot {overshoot}, slack {promotion_slack})",
+            costs.len(),
+            costs.get(chosen),
+        );
+    }
+    let (window, curr_level_pull_in, _) = candidates.get(chosen)?;
+    let mut ids: HashSet<_> = window.iter().map(Table::id).collect();
+    ids.extend(curr_level_pull_in.iter().map(|t| Table::id(t)));
+    Some((ids, false))
 }
 
 #[doc(hidden)]
@@ -156,6 +235,11 @@ pub struct Strategy {
     ///
     /// Default = false.
     multi_level: bool,
+
+    /// How many bytes past a level's overshoot a merge may promote and still
+    /// be preferred on its cost per promoted byte. `None` = one target table
+    /// size, the smallest step a merge can take.
+    promotion_slack: Option<u64>,
 }
 
 impl Default for Strategy {
@@ -166,6 +250,7 @@ impl Default for Strategy {
             level_ratio_policy: vec![10.0],
             dynamic: false,
             multi_level: false,
+            promotion_slack: None,
         }
     }
 }
@@ -234,6 +319,30 @@ impl Strategy {
     #[must_use]
     pub fn with_multi_level(mut self, enabled: bool) -> Self {
         self.multi_level = enabled;
+        self
+    }
+
+    /// Sets how many bytes past a level's overshoot a merge may promote and
+    /// still be preferred.
+    ///
+    /// A leveled merge is chosen by the bytes it rewrites per byte it moves
+    /// down a level, among the candidates that promote no more than the
+    /// level's overshoot plus this slack; when none is that small, the
+    /// cheapest candidate overall is taken, so the level still makes progress.
+    ///
+    /// Default = the table target size.
+    ///
+    /// # Examples
+    ///
+    /// ```
+    /// use lsm_tree::compaction::Leveled;
+    ///
+    /// let strategy = Leveled::default().with_promotion_slack(128 * 1_024 * 1_024);
+    /// # let _ = strategy;
+    /// ```
+    #[must_use]
+    pub fn with_promotion_slack(mut self, bytes: u64) -> Self {
+        self.promotion_slack = Some(bytes);
         self
     }
 
@@ -882,6 +991,7 @@ impl CompactionStrategy for Strategy {
             state.hidden_set(),
             overshoot_bytes,
             self.target_size,
+            self.promotion_slack.unwrap_or(self.target_size),
             cmp,
         ) else {
             return Choice::DoNothing;

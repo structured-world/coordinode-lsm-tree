@@ -882,3 +882,96 @@ fn multi_level_with_both_flags() -> crate::Result<()> {
 
     Ok(())
 }
+
+const MIB: u64 = 1_024 * 1_024;
+
+fn cost(promoted: u64, pulled_in: u64) -> MergeCost {
+    MergeCost {
+        promoted,
+        total: promoted + pulled_in,
+    }
+}
+
+/// The smallest merge is not the cheapest way to pay down a level: a merge
+/// promoting 10 MiB into 90 MiB rewrites ten bytes per promoted byte, one
+/// promoting 100 MiB into 150 MiB rewrites 2.5. Ranking by total input alone
+/// took the first, and has to run it ten times to retire what the second
+/// retires once.
+#[test]
+fn a_merge_is_chosen_by_bytes_rewritten_per_promoted_byte() {
+    let small = cost(10 * MIB, 90 * MIB);
+    let large = cost(100 * MIB, 150 * MIB);
+    assert_eq!(
+        rank_by_promoted_ratio(&[small, large], 100 * MIB, 64 * MIB),
+        Some(1),
+        "the candidate that rewrites less per promoted byte wins",
+    );
+}
+
+/// A candidate that promotes far more than the level owes is passed over for
+/// one within the debt, however cheap its ratio, so a level is not asked to
+/// push down much more than its overshoot.
+#[test]
+fn a_merge_promoting_far_past_the_overshoot_loses_to_one_within_it() {
+    let within = cost(20 * MIB, 60 * MIB);
+    let far_past = cost(1_000 * MIB, 100 * MIB);
+    assert!(
+        far_past.cheaper_than(within),
+        "the oversized candidate has the better ratio"
+    );
+    assert_eq!(
+        rank_by_promoted_ratio(&[far_past, within], 20 * MIB, 64 * MIB),
+        Some(1),
+    );
+}
+
+/// When the debt is smaller than any candidate, the cheapest one overall is
+/// still taken: the level has to make progress.
+#[test]
+fn a_level_whose_debt_is_below_every_candidate_still_merges() {
+    let a = cost(200 * MIB, 600 * MIB);
+    let b = cost(300 * MIB, 300 * MIB);
+    assert_eq!(rank_by_promoted_ratio(&[a, b], MIB, 0), Some(1));
+    assert_eq!(rank_by_promoted_ratio(&[], MIB, 0), None);
+}
+
+/// The ratios are compared exactly at byte counts where a cross-product of two
+/// `u64`s would wrap: `u64::MAX / 3 * 2` promoted against `u64::MAX / 2`
+/// rewritten per side, where the rational answer is known.
+#[test]
+fn ratios_are_compared_exactly_near_the_top_of_the_range() {
+    let big = u64::MAX / 4;
+    // 1 rewritten byte per promoted byte against a hair over 1.
+    let exact = MergeCost {
+        promoted: big,
+        total: big,
+    };
+    let slightly_worse = MergeCost {
+        promoted: big - 1,
+        total: big,
+    };
+    assert!(
+        (u128::from(exact.total) * u128::from(slightly_worse.promoted)) > u128::from(u64::MAX),
+        "the cross-product is past what a u64 holds",
+    );
+    assert_eq!(
+        rank_by_promoted_ratio(&[slightly_worse, exact], u64::MAX, 0),
+        Some(1)
+    );
+    assert_eq!(
+        rank_by_promoted_ratio(&[exact, slightly_worse], u64::MAX, 0),
+        Some(0)
+    );
+}
+
+/// Equal ratios keep the earliest candidate, so the same version and hidden
+/// set give the same table set on every call.
+#[test]
+fn equal_ratios_keep_the_earliest_candidate() {
+    let a = cost(10 * MIB, 20 * MIB);
+    let b = cost(20 * MIB, 40 * MIB);
+    for _ in 0..3 {
+        assert_eq!(rank_by_promoted_ratio(&[a, b], u64::MAX, 0), Some(0));
+        assert_eq!(rank_by_promoted_ratio(&[b, a], u64::MAX, 0), Some(0));
+    }
+}
