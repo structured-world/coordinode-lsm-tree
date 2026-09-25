@@ -1411,3 +1411,158 @@ fn tree_columnar_scan_applies_predicate_after_newest_version_wins() {
          returned as the stale older matching version; got {keys:?}",
     );
 }
+
+// ---------------------------------------------------------------------------
+// A range predicate on a fixed-width column. Its stored bytes are not an
+// order-preserving encoding (a little-endian integer compares wrong byte by
+// byte), so the scan cannot evaluate it; it refuses the predicate instead of
+// returning every row as if every row had matched.
+// ---------------------------------------------------------------------------
+
+/// Whether a tree-level scan with `predicate` fails with the refusal, on its
+/// construction or on any batch.
+fn tree_scan_refuses(tree: &lsm_tree::Tree, predicate: &ColumnRangePredicate) -> bool {
+    let is_refusal = |e: &Error| matches!(e, Error::FeatureUnsupported(_));
+    match tree.columnar_scan(&[COL_USER_KEY], Some(predicate), SeqNo::MAX, ..) {
+        Err(e) => is_refusal(&e),
+        Ok(batches) => batches
+            .into_iter()
+            .any(|batch| batch.as_ref().is_err_and(is_refusal)),
+    }
+}
+
+fn fixed_sub_column_predicate() -> ColumnRangePredicate {
+    // Values 0..=10 of sub-column 3, a fixed-4 little-endian integer.
+    ColumnRangePredicate {
+        column_id: 3,
+        lower: Some(0u32.to_le_bytes().to_vec()),
+        upper: Some(10u32.to_le_bytes().to_vec()),
+    }
+}
+
+#[test]
+fn table_columnar_scan_refuses_a_predicate_on_a_fixed_width_column() {
+    let folder = get_tmp_folder();
+    let any = open_columnar_any(folder.path());
+    ingest_segment(&any, &[(key(0), 5), (key(1), 500)]);
+    let version = standard(&any).current_version();
+    let table = version.iter_tables().next().expect("one ingested SST");
+    let result = table.columnar_scan(&[COL_USER_KEY, 3], Some(&fixed_sub_column_predicate()));
+    assert!(
+        matches!(result, Err(Error::FeatureUnsupported(_))),
+        "a fixed-width predicate is refused, not answered with every row: {:?}",
+        result.map(|b| b.iter().map(|b| b.row_count).sum::<u32>()),
+    );
+}
+
+#[test]
+fn tree_columnar_scan_refuses_a_fixed_width_predicate_on_a_single_segment() {
+    let folder = get_tmp_folder();
+    let any = open_columnar_any(folder.path());
+    ingest_segment(&any, &[(key(0), 5), (key(1), 500)]);
+    assert!(tree_scan_refuses(
+        standard(&any),
+        &fixed_sub_column_predicate()
+    ));
+}
+
+#[test]
+fn tree_columnar_scan_refuses_a_fixed_width_predicate_across_overlapping_segments() {
+    let folder = get_tmp_folder();
+    let any = open_columnar_any(folder.path());
+    ingest_segment(&any, &[(key(0), 5), (key(1), 500)]);
+    ingest_segment(&any, &[(key(1), 7), (key(2), 700)]);
+    assert!(tree_scan_refuses(
+        standard(&any),
+        &fixed_sub_column_predicate()
+    ));
+}
+
+/// A segment whose rows carry a `Bytes` sub-column 4 holding `tags[i]`.
+fn tagged_batch(rows: &[(Vec<u8>, &[u8])]) -> ColumnBatch {
+    let entries: Vec<InternalValue> = rows
+        .iter()
+        .map(|(k, _)| InternalValue::from_components(k.clone(), b"v", 0, ValueType::Value))
+        .collect();
+    let mut batch = entries_to_column_batch(&entries).expect("transpose");
+    let mut offsets = Vec::new();
+    let mut payload = Vec::new();
+    offsets.extend_from_slice(&0u32.to_le_bytes());
+    for (_, tag) in rows {
+        payload.extend_from_slice(tag);
+        offsets.extend_from_slice(&u32::try_from(payload.len()).unwrap().to_le_bytes());
+    }
+    offsets.extend_from_slice(&payload);
+    batch.columns.push(Column {
+        column_id: 4,
+        type_tag: TypeTag::Bytes,
+        validity: None,
+        data: offsets.into(),
+    });
+    batch
+}
+
+/// A segment written before sub-column 4 existed has no value for it, so a
+/// predicate on it matches none of that segment's rows, as a null never
+/// matches: taking the absent column as "every row matches" returned them.
+#[test]
+fn tree_columnar_scan_predicate_on_a_column_a_segment_lacks_matches_none_of_its_rows() {
+    let folder = get_tmp_folder();
+    let any = open_columnar_any(folder.path());
+    let mut ingest = any.ingestion().expect("ingestion");
+    let old: Vec<InternalValue> = [key(0), key(1)]
+        .into_iter()
+        .map(|k| InternalValue::from_components(k, b"v", 0, ValueType::Value))
+        .collect();
+    ingest
+        .write_columnar_batch(&entries_to_column_batch(&old).expect("transpose"))
+        .expect("write batch");
+    ingest.finish().expect("finish");
+    let mut ingest = any.ingestion().expect("ingestion");
+    ingest
+        .write_columnar_batch(&tagged_batch(&[
+            (key(2), b"hit".as_slice()),
+            (key(3), b"miss".as_slice()),
+        ]))
+        .expect("write batch");
+    ingest.finish().expect("finish");
+
+    let predicate = ColumnRangePredicate {
+        column_id: 4,
+        lower: Some(b"hit".to_vec()),
+        upper: Some(b"hit".to_vec()),
+    };
+    let mut got: Vec<Vec<u8>> = Vec::new();
+    for batch in standard(&any)
+        .columnar_scan(&[COL_USER_KEY], Some(&predicate), SeqNo::MAX, ..)
+        .expect("scan")
+    {
+        let batch = batch.expect("batch");
+        let rows = batch.row_count as usize;
+        let key_col = batch
+            .columns
+            .iter()
+            .find(|c| c.column_id == COL_USER_KEY)
+            .expect("key column");
+        got.extend(bytes_rows(key_col, rows));
+    }
+    assert_eq!(got, vec![key(2)]);
+}
+
+#[test]
+fn tree_columnar_scan_refuses_a_seqno_predicate_on_a_segment_it_dedups() {
+    // A flushed segment holding two versions of k0 goes through the singleton
+    // dedup path; the seqno column is fixed-width too.
+    let folder = get_tmp_folder();
+    let tree = open_columnar(folder.path());
+    tree.insert(key(0), b"old".to_vec(), 1);
+    tree.insert(key(1), b"v".to_vec(), 2);
+    tree.insert(key(0), b"new".to_vec(), 3);
+    tree.flush_active_memtable(0).expect("flush");
+    let predicate = ColumnRangePredicate {
+        column_id: COL_SEQNO,
+        lower: Some(1u64.to_le_bytes().to_vec()),
+        upper: Some(2u64.to_le_bytes().to_vec()),
+    };
+    assert!(tree_scan_refuses(&tree, &predicate));
+}

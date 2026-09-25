@@ -6941,7 +6941,7 @@ impl Table {
             };
             let mut batch = if predicate.is_some() || has_deletes || bound_mask.is_some() {
                 let mut keep = match predicate {
-                    Some(pred) => pred.matching_rows(&batch),
+                    Some(pred) => pred.scan_mask(&batch)?,
                     None => alloc::vec![true; row_count as usize],
                 };
                 if has_deletes {

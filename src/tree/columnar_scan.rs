@@ -684,7 +684,7 @@ impl ColumnarScan {
             let mut visible = filter_batch(&batch, &mask);
             // The predicate runs on the deduped survivors only (see doc).
             if let Some(pred) = self.predicate.as_ref() {
-                let pred_mask = pred.matching_rows(&visible);
+                let pred_mask = pred.scan_mask(&visible)?;
                 visible = filter_batch(&visible, &pred_mask);
             }
             // Match the singleton contract: yield exactly the projected columns.
@@ -926,7 +926,7 @@ impl ColumnarScan {
         // fails the predicate is correctly dropped instead of falling back to an
         // older matching version.
         if let Some(pred) = self.predicate.as_ref() {
-            let mask = pred.matching_rows(&merged);
+            let mask = pred.scan_mask(&merged)?;
             merged = filter_batch(&merged, &mask);
         }
 
