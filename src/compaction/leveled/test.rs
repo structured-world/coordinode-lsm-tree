@@ -975,3 +975,77 @@ fn equal_ratios_keep_the_earliest_candidate() {
         assert_eq!(rank_by_promoted_ratio(&[b, a], u64::MAX, 0), Some(0));
     }
 }
+
+/// Flushes `keys` with `value_len`-byte values as one table and moves it from
+/// L0 to `level`, returning its id.
+fn table_at_level(
+    tree: &crate::AnyTree,
+    seqno: &SequenceNumberCounter,
+    keys: &[&str],
+    value_len: usize,
+    level: u8,
+) -> crate::Result<TableId> {
+    for key in keys {
+        tree.insert(*key, vec![b'v'; value_len], seqno.next());
+    }
+    tree.flush_active_memtable(0)?;
+    let Some(id) = tree
+        .current_version()
+        .level(0)
+        .and_then(|l0| l0.iter().flat_map(|run| run.iter()).map(Table::id).max())
+    else {
+        panic!("the flush wrote a table to L0");
+    };
+    tree.compact(Arc::new(crate::compaction::MoveDown(0, level)), 0)?;
+    Ok(id)
+}
+
+/// The picker itself, over real levels shaped like the issue's example: a
+/// dense region of L2 that a small L1 table overlaps, and a sparser region a
+/// large L1 table overlaps. Merging the small table rewrites 100 KiB to promote
+/// 10; merging the large one rewrites 250 KiB to promote 100. Ranking by total
+/// input took the first.
+#[test]
+fn the_picker_chooses_the_merge_with_the_least_rewriting_per_promoted_byte() -> crate::Result<()> {
+    const KIB: usize = 1_024;
+    let dir = tempfile::tempdir()?;
+    let seqno = SequenceNumberCounter::default();
+    let tree = Config::new(dir.path(), seqno.clone(), SequenceNumberCounter::default())
+        .data_block_compression_policy(crate::config::CompressionPolicy::disabled())
+        .open()?;
+
+    let dense = ["a0", "a1", "a2", "a3", "a4", "a5", "a6", "a7", "a8", "a9"];
+    let sparse = ["b0", "b1", "b2", "b3", "b4", "b5", "b6", "b7", "b8", "b9"];
+    table_at_level(&tree, &seqno, &dense, 9 * KIB, 2)?;
+    let sparse_l2 = table_at_level(&tree, &seqno, &sparse, 15 * KIB, 2)?;
+    table_at_level(&tree, &seqno, &["a3", "a4"], 5 * KIB, 1)?;
+    let large_l1 = table_at_level(
+        &tree,
+        &seqno,
+        &["b1", "b2", "b3", "b4", "b5", "b6", "b7", "b8"],
+        12 * KIB + KIB / 2,
+        1,
+    )?;
+
+    let version = tree.current_version();
+    let (Some(l1), Some(l2)) = (version.level(1), version.level(2)) else {
+        panic!("the fixture fills L1 and L2");
+    };
+    let Some((chosen, _)) = pick_minimal_compaction(
+        l1,
+        l2,
+        &HiddenSet::default(),
+        u64::MAX,
+        64 * 1_024 * 1_024,
+        64 * 1_024 * 1_024,
+        &crate::comparator::DefaultUserComparator,
+    ) else {
+        panic!("a merge candidate exists");
+    };
+    assert_eq!(
+        chosen,
+        [sparse_l2, large_l1].into_iter().collect::<HashSet<_>>(),
+        "the large table over the sparse region is the cheaper merge per promoted byte",
+    );
+    Ok(())
+}

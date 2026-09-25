@@ -231,11 +231,6 @@ pub struct Strategy {
     ///
     /// Default = false.
     multi_level: bool,
-
-    /// How many bytes past a level's overshoot a merge may promote and still
-    /// be preferred on its cost per promoted byte. `None` = one target table
-    /// size, the smallest step a merge can take.
-    promotion_slack: Option<u64>,
 }
 
 impl Default for Strategy {
@@ -246,7 +241,6 @@ impl Default for Strategy {
             level_ratio_policy: vec![10.0],
             dynamic: false,
             multi_level: false,
-            promotion_slack: None,
         }
     }
 }
@@ -315,30 +309,6 @@ impl Strategy {
     #[must_use]
     pub fn with_multi_level(mut self, enabled: bool) -> Self {
         self.multi_level = enabled;
-        self
-    }
-
-    /// Sets how many bytes past a level's overshoot a merge may promote and
-    /// still be preferred.
-    ///
-    /// A leveled merge is chosen by the bytes it rewrites per byte it moves
-    /// down a level, among the candidates that promote no more than the
-    /// level's overshoot plus this slack; when none is that small, the
-    /// cheapest candidate overall is taken, so the level still makes progress.
-    ///
-    /// Default = the table target size.
-    ///
-    /// # Examples
-    ///
-    /// ```
-    /// use lsm_tree::compaction::Leveled;
-    ///
-    /// let strategy = Leveled::default().with_promotion_slack(128 * 1_024 * 1_024);
-    /// # let _ = strategy;
-    /// ```
-    #[must_use]
-    pub fn with_promotion_slack(mut self, bytes: u64) -> Self {
-        self.promotion_slack = Some(bytes);
         self
     }
 
@@ -987,7 +957,9 @@ impl CompactionStrategy for Strategy {
             state.hidden_set(),
             overshoot_bytes,
             self.target_size,
-            self.promotion_slack.unwrap_or(self.target_size),
+            // A merge may promote up to one target table past the overshoot,
+            // the smallest step a merge can take, and still be preferred.
+            self.target_size,
             cmp,
         ) else {
             return Choice::DoNothing;
