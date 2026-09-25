@@ -235,6 +235,11 @@ pub struct Inner {
     // `no_std` + alloc (see `crate::heal_hints`).
     pub(crate) heal_hints: once_cell::race::OnceBox<Arc<crate::heal_hints::HealHints>>,
 
+    /// How columnar reads of this table fetch their pages, installed once the
+    /// table joins a tree; a table read before it is bound reads under the
+    /// default budget. Not a property of the file, so it is the tree's to set.
+    pub(crate) read_budget: once_cell::race::OnceBox<crate::config::ReadBudget>,
+
     /// Serializes concurrent in-place heal passes of THIS table, held by the
     /// patrol scrub across the WHOLE scan-to-reconcile span. Two overlapping
     /// heals race in two ways without it: through the link-count probe (one

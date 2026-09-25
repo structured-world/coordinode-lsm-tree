@@ -159,11 +159,15 @@ fn repairing_a_v5_store_refuses_instead_of_discarding_its_tables() {
     let _ = std::fs::remove_file(tmp.path().join("LOCK"));
 
     // Count the SSTs before, so "nothing was discarded" is asserted against
-    // the directory rather than against the report's own accounting.
-    let sst_count = |dir: &Path| -> usize {
-        walk_count(&dir.join("segments")) + walk_count(&dir.join("current"))
-    };
+    // the directory rather than against the report's own accounting. The
+    // count must be non-zero: a walk of a directory that does not exist
+    // returns 0 before and after, and would pass while proving nothing.
+    let sst_count = |dir: &Path| -> usize { walk_count(&dir.join("tables")) };
     let before = sst_count(tmp.path());
+    assert!(
+        before > 0,
+        "the fixture must hold SSTs for the comparison to mean anything",
+    );
 
     let err = Config::new(
         tmp.path(),

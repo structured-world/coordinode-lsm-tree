@@ -11,7 +11,7 @@ mod locator;
 mod pinning;
 mod restart_interval;
 
-pub use block_size::BlockSizePolicy;
+pub use block_size::{BlockSizePolicy, MAX_BLOCK_SIZE};
 pub use compression::CompressionPolicy;
 pub use delete_strategy::{DeleteStrategy, DeleteStrategyPolicy};
 pub use filter::{BloomConstructionPolicy, FilterPolicy, FilterPolicyEntry};
@@ -46,6 +46,86 @@ use alloc::sync::Arc;
 #[cfg(not(feature = "std"))]
 use alloc::vec::Vec;
 use core::ops::Range;
+
+/// The size a columnar row group is cut at unless
+/// [`Config::columnar_row_group_size_policy`] says otherwise.
+pub const DEFAULT_COLUMNAR_ROW_GROUP_SIZE: u32 = 4_096;
+
+/// The size a columnar row group's rows are cut into row pages at unless
+/// [`Config::columnar_page_size_policy`] says otherwise.
+pub const DEFAULT_COLUMNAR_PAGE_SIZE: u32 = 4_096;
+
+/// How a columnar read fetches the pages it wants: how much one request may
+/// ask for, and how many requests it keeps in flight at once.
+///
+/// A property of the reader, not of the file: the same table reads under any
+/// budget and returns the same rows, and a larger budget takes the pages in
+/// fewer requests, because a column's pages lie next to each other and a run
+/// of them is one request up to the I/O buffer. Set per tree with
+/// [`Config::columnar_read_budget`].
+///
+/// # Examples
+///
+/// ```
+/// use lsm_tree::config::ReadBudget;
+///
+/// // 256 KiB per request, eight requests in flight at once.
+/// let budget = ReadBudget::new(256 * 1_024, 8);
+/// assert_eq!(budget.io_buffer(), 256 * 1_024);
+/// assert_eq!(budget.in_flight(), 8);
+/// ```
+#[derive(Clone, Copy, Debug, Eq, PartialEq)]
+pub struct ReadBudget {
+    io_buffer: u32,
+    in_flight: u16,
+}
+
+impl ReadBudget {
+    /// The least a request may ask for: a block header's worth, so the first
+    /// request of a group can always read the directory's header and learn
+    /// the directory's length.
+    pub const MIN_IO_BUFFER: u32 = 64;
+
+    /// A budget of `io_buffer` bytes per request and `in_flight` requests at
+    /// once. A budget below [`Self::MIN_IO_BUFFER`] is raised to it, and a
+    /// zero `in_flight` to one: a read needs at least one request of at least
+    /// a header to make progress.
+    ///
+    /// A request never splits a page: one page larger than the I/O buffer is
+    /// still one request.
+    #[must_use]
+    pub const fn new(io_buffer: u32, in_flight: u16) -> Self {
+        Self {
+            io_buffer: if io_buffer < Self::MIN_IO_BUFFER {
+                Self::MIN_IO_BUFFER
+            } else {
+                io_buffer
+            },
+            in_flight: if in_flight == 0 { 1 } else { in_flight },
+        }
+    }
+
+    /// Bytes one request may ask for.
+    #[must_use]
+    pub const fn io_buffer(&self) -> u32 {
+        self.io_buffer
+    }
+
+    /// Requests submitted together, which a backend with batched I/O keeps
+    /// in flight at once.
+    #[must_use]
+    pub const fn in_flight(&self) -> u16 {
+        self.in_flight
+    }
+}
+
+impl Default for ReadBudget {
+    /// 1 MiB per request, the I/O buffer Vortex reads a column with, and 16
+    /// requests in flight.
+    fn default() -> Self {
+        Self::new(1 << 20, 16)
+    }
+}
 
 /// Per-level filesystem routing entry for tiered storage.
 ///
@@ -365,6 +445,21 @@ pub struct Config {
     /// Block size of data blocks
     pub data_block_size_policy: BlockSizePolicy,
 
+    /// Uncompressed size a columnar table's row groups are cut at, per level:
+    /// the columnar counterpart of [`Self::data_block_size_policy`], which a
+    /// columnar table does not use for its data. A row group is split into
+    /// independently readable column pages, so it is sized for what a read of
+    /// one page is worth rather than for what a read of the whole group costs.
+    pub columnar_row_group_size_policy: BlockSizePolicy,
+
+    /// Uncompressed bytes of row data a columnar row page holds, per level.
+    /// A row group's rows are cut into row pages shared by every column, so a
+    /// read of a few rows decodes only the pages that hold them.
+    pub columnar_page_size_policy: BlockSizePolicy,
+
+    /// How columnar reads of this tree fetch their pages; see [`ReadBudget`].
+    pub columnar_read_budget: ReadBudget,
+
     /// Whether to pin index blocks
     pub index_block_pinning_policy: PinningPolicy,
 
@@ -673,6 +768,12 @@ impl Default for Config {
             level_count: DEFAULT_LEVEL_COUNT,
 
             data_block_size_policy: BlockSizePolicy::all(4_096),
+
+            columnar_row_group_size_policy: BlockSizePolicy::all(DEFAULT_COLUMNAR_ROW_GROUP_SIZE),
+
+            columnar_page_size_policy: BlockSizePolicy::all(DEFAULT_COLUMNAR_PAGE_SIZE),
+
+            columnar_read_budget: ReadBudget::default(),
 
             index_block_pinning_policy: PinningPolicy::new([true, true, false]),
             filter_block_pinning_policy: PinningPolicy::new([true, false]),
@@ -1543,6 +1644,85 @@ impl Config {
     #[must_use]
     pub fn data_block_size_policy(mut self, policy: BlockSizePolicy) -> Self {
         self.data_block_size_policy = policy;
+        self
+    }
+
+    /// Sets the size a columnar table's row groups are cut at, per level.
+    ///
+    /// Applies to the tables written while the runtime `columnar` switch is
+    /// on; a row-major table cuts its blocks at
+    /// [`Self::data_block_size_policy`]. The default is
+    /// [`DEFAULT_COLUMNAR_ROW_GROUP_SIZE`] at every level.
+    ///
+    /// # Examples
+    ///
+    /// ```
+    /// use lsm_tree::{Config, SequenceNumberCounter, config::BlockSizePolicy};
+    /// # let folder = tempfile::tempdir()?;
+    /// let config = Config::new(
+    ///     folder.path(),
+    ///     SequenceNumberCounter::default(),
+    ///     SequenceNumberCounter::default(),
+    /// )
+    /// .columnar_row_group_size_policy(BlockSizePolicy::all(256 * 1_024));
+    /// # Ok::<(), Box<dyn std::error::Error>>(())
+    /// ```
+    #[must_use]
+    pub fn columnar_row_group_size_policy(mut self, policy: BlockSizePolicy) -> Self {
+        self.columnar_row_group_size_policy = policy;
+        self
+    }
+
+    /// Sets the size a columnar row group's rows are cut into row pages at,
+    /// per level.
+    ///
+    /// A row page closes once its rows reach this many uncompressed bytes, so
+    /// a page holds at least one row and a group at least one page. A size at
+    /// or above the row group size writes one row page per group. The default
+    /// is [`DEFAULT_COLUMNAR_PAGE_SIZE`] at every level.
+    ///
+    /// # Examples
+    ///
+    /// ```
+    /// use lsm_tree::{Config, SequenceNumberCounter, config::BlockSizePolicy};
+    /// # let folder = tempfile::tempdir()?;
+    /// let config = Config::new(
+    ///     folder.path(),
+    ///     SequenceNumberCounter::default(),
+    ///     SequenceNumberCounter::default(),
+    /// )
+    /// .columnar_row_group_size_policy(BlockSizePolicy::all(256 * 1_024))
+    /// .columnar_page_size_policy(BlockSizePolicy::all(8 * 1_024));
+    /// # Ok::<(), Box<dyn std::error::Error>>(())
+    /// ```
+    #[must_use]
+    pub fn columnar_page_size_policy(mut self, policy: BlockSizePolicy) -> Self {
+        self.columnar_page_size_policy = policy;
+        self
+    }
+
+    /// Sets how columnar reads of this tree fetch their pages: the bytes one
+    /// request may ask for and the requests kept in flight at once. A reader
+    /// setting, not a format one: a tree reopened under another budget reads
+    /// the same tables and returns the same rows. The default is
+    /// [`ReadBudget::default`].
+    ///
+    /// # Examples
+    ///
+    /// ```
+    /// use lsm_tree::{Config, SequenceNumberCounter, config::ReadBudget};
+    /// # let folder = tempfile::tempdir()?;
+    /// let config = Config::new(
+    ///     folder.path(),
+    ///     SequenceNumberCounter::default(),
+    ///     SequenceNumberCounter::default(),
+    /// )
+    /// .columnar_read_budget(ReadBudget::new(64 * 1_024, 4));
+    /// # Ok::<(), Box<dyn std::error::Error>>(())
+    /// ```
+    #[must_use]
+    pub fn columnar_read_budget(mut self, budget: ReadBudget) -> Self {
+        self.columnar_read_budget = budget;
         self
     }
 

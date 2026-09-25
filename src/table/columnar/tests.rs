@@ -281,17 +281,18 @@ fn encode_rejects_delta_on_a_non_fixed8_column() {
 }
 
 #[test]
-fn from_columnar_block_rejects_a_zero_row_block() {
-    // A zero-row columnar block is corrupt (the writer never spills empty);
+fn from_column_batch_rejects_a_zero_row_batch() {
+    // A zero-row columnar group is corrupt (the writer never spills empty);
     // reconstructing it must error, not panic in the row encoder.
-    let empty = entries_to_column_batch(&[])
-        .expect("transpose")
-        .encode(CodecId::Plain)
-        .expect("encode");
-    assert!(
-        crate::table::data_block::DataBlock::from_columnar_block(&empty.into(), 16, &mut 0)
-            .is_err()
-    );
+    let empty = entries_to_column_batch(&[]).expect("transpose");
+    assert!(crate::table::data_block::DataBlock::from_column_batch([empty], 16, &mut 0).is_err());
+}
+
+/// A group with no row pages at all is refused just the same: there is no
+/// row to rebuild a block from.
+#[test]
+fn from_column_batch_rejects_a_group_without_row_pages() {
+    assert!(crate::table::data_block::DataBlock::from_column_batch([], 16, &mut 0).is_err());
 }
 
 #[test]
@@ -662,7 +663,7 @@ fn untranspose_reconstructs_a_nullable_bytes_subcolumn() {
 }
 
 #[test]
-fn append_concatenates_fixed_bytes_and_nullable_columns() {
+fn concat_joins_fixed_bytes_and_nullable_columns() {
     // Build a two-row consumer batch with a fixed-4 (id 3), a bytes (id 4),
     // and a nullable fixed-2 (id 5) value sub-column.
     let build = |keys: [&[u8]; 2],
@@ -719,14 +720,14 @@ fn append_concatenates_fixed_bytes_and_nullable_columns() {
         batch
     };
 
-    let mut a = build([b"k0", b"k1"], [1, 2], [b"a", b"bb"], [Some([9, 9]), None]);
+    let a = build([b"k0", b"k1"], [1, 2], [b"a", b"bb"], [Some([9, 9]), None]);
     let b = build(
         [b"k2", b"k3"],
         [3, 4],
         [b"ccc", b"dddd"],
         [Some([7, 7]), None],
     );
-    a.append(&b).expect("append");
+    let a = ColumnBatch::concat(vec![a, b]).expect("concat");
     assert_eq!(a.row_count, 4);
 
     let entries = column_batch_to_entries(&a).expect("untranspose combined");
@@ -773,6 +774,108 @@ fn sample_batch() -> ColumnBatch {
             },
         ],
     }
+}
+
+/// `batch` cut into row pages of `cuts` rows each, every column sliced with
+/// [`Column::rows`], as the writer cuts a row group.
+fn split_into_row_pages(batch: &ColumnBatch, cuts: &[u32]) -> Vec<ColumnBatch> {
+    let mut start = 0;
+    cuts.iter()
+        .map(|&rows| {
+            let end = start + rows;
+            let columns = batch
+                .columns
+                .iter()
+                .map(|c| c.rows(batch.row_count, start, end).expect("rows"))
+                .collect();
+            start = end;
+            ColumnBatch {
+                row_count: rows,
+                columns,
+            }
+        })
+        .collect()
+}
+
+/// Every way of cutting a batch into row pages joins back into the batch it
+/// was cut from: the nullable fixed column keeps its null, the bytes column
+/// its empty cell, whichever page they land on. A reader that joins a group's
+/// row pages depends on this, and so does every page the writer cuts.
+#[test]
+fn a_batch_cut_into_row_pages_joins_back_unchanged() {
+    let batch = sample_batch();
+    for cuts in [&[3][..], &[1, 2], &[2, 1], &[1, 1, 1]] {
+        let pages = split_into_row_pages(&batch, cuts);
+        assert_eq!(pages.iter().map(|p| p.row_count).collect::<Vec<_>>(), cuts,);
+        let joined = ColumnBatch::concat(pages).expect("concat");
+        assert_eq!(joined, batch, "cut {cuts:?} must join back to the batch");
+    }
+}
+
+/// A row page holds exactly its rows: the middle row of the sample, null in
+/// the fixed column and empty in the bytes column, is a page of its own that
+/// says so.
+#[test]
+fn a_row_page_of_one_row_holds_that_row() {
+    let batch = sample_batch();
+    let pages = split_into_row_pages(&batch, &[1, 1, 1]);
+    let middle = pages.get(1).expect("three pages");
+    let fixed = middle.columns.first().expect("fixed column");
+    assert_eq!(fixed.validity.as_deref(), Some(&[0u8][..]), "row 1 is null");
+    assert_eq!(&fixed.data[..], &[0, 0, 0, 0]);
+    let bytes = middle.columns.get(1).expect("bytes column");
+    assert_eq!(&bytes.data[..], &[0, 0, 0, 0, 0, 0, 0, 0], "one empty cell");
+}
+
+/// A row range past the column, or reversed, is refused rather than clamped:
+/// a clamped page would hold fewer rows than the directory says it does.
+#[test]
+fn column_rows_refuses_a_range_outside_the_column() {
+    let batch = sample_batch();
+    for col in &batch.columns {
+        assert!(col.rows(3, 2, 4).is_err(), "end past the rows");
+        assert!(col.rows(3, 2, 1).is_err(), "reversed range");
+        assert!(col.rows(3, 0, 3).is_ok(), "the whole column");
+    }
+}
+
+/// Row pages close once they reach the page size, counting a fixed column's
+/// width and a bytes cell's length plus its offset: the sample's rows weigh
+/// 10, 8 and 11 bytes.
+#[test]
+fn row_page_cuts_close_a_page_once_it_reaches_the_size() {
+    let batch = sample_batch();
+    let cuts = |size| batch.row_page_cuts(size).expect("cuts");
+    assert_eq!(
+        cuts(0),
+        [1, 1, 1],
+        "a zero size puts every row on its own page"
+    );
+    assert_eq!(cuts(10), [1, 2], "the first row alone reaches 10 bytes");
+    assert_eq!(cuts(18), [2, 1], "the first two rows reach 18 bytes");
+    assert_eq!(cuts(1_000), [3], "a size no row reaches keeps one page");
+}
+
+/// Pages that disagree on their columns cannot be one group, and no pages
+/// are no group: both are refused rather than joined into something else.
+#[test]
+fn concat_refuses_no_pages_and_pages_with_other_columns() {
+    assert!(ColumnBatch::concat(Vec::new()).is_err(), "no row pages");
+
+    let batch = sample_batch();
+    let mut pages = split_into_row_pages(&batch, &[1, 2]);
+    pages
+        .get_mut(1)
+        .expect("two pages")
+        .columns
+        .first_mut()
+        .expect("a column")
+        .column_id = 9;
+    assert!(ColumnBatch::concat(pages).is_err(), "a renamed column");
+
+    let mut pages = split_into_row_pages(&batch, &[1, 2]);
+    pages.get_mut(1).expect("two pages").columns.pop();
+    assert!(ColumnBatch::concat(pages).is_err(), "a missing column");
 }
 
 #[test]
@@ -879,14 +982,28 @@ fn columnar_decode_rejects_trailing_bytes() {
     assert!(ColumnBatch::decode(&encoded.clone().into()).is_err());
 }
 
-/// A decode that copied a validity bitmap and only then met a malformed tail
-/// did that copy: it is counted like the read a checksum later refuses.
+/// A page decode that copied a validity bitmap and only then met a malformed
+/// tail did that copy: it is counted like the read a checksum later refuses.
 #[test]
-fn columnar_decode_refused_after_copying_still_counts_the_copy() {
-    let mut encoded = sample_batch().encode(CodecId::Plain).expect("encode");
-    encoded.push(0); // one byte past the last declared column
+fn column_page_decode_refused_after_copying_still_counts_the_copy() {
+    use crate::table::column_page::{PageId, PageStamp};
+
+    let batch = sample_batch();
+    let nullable = batch.columns.first().expect("the nullable fixed column");
+    let stamp = PageStamp {
+        group_tag: 7,
+        id: PageId {
+            column_id: nullable.column_id,
+            part: 0,
+        },
+        row_page: 0,
+    };
+    let mut page = nullable
+        .encode_page(batch.row_count, CodecId::Plain, stamp)
+        .expect("encode page");
+    page.push(0); // one byte past the page's column
     let mut copied = 0usize;
-    let decoded = ColumnBatch::decode_counting_copies(&encoded.into(), None, &mut copied);
+    let decoded = Column::decode_page(&page.into(), batch.row_count, stamp, &mut copied);
     assert!(decoded.is_err(), "trailing bytes must be refused");
     assert_eq!(
         copied, 1,
@@ -924,15 +1041,9 @@ fn columnar_entries_refused_after_rebuilding_a_value_still_count_it() {
     });
     let vt_col = batch.columns.get_mut(2).expect("value-type column");
     vt_col.data = vec![u8::from(ValueType::Value), 0xEE].into();
-    let encoded: Slice = batch.encode(CodecId::Plain).expect("encode").into();
-    // What the decode itself copies (this block is small enough that its views
-    // are detached), counted on its own clause.
-    let mut decode_copies = 0usize;
-    ColumnBatch::decode_counting_copies(&encoded, None, &mut decode_copies).expect("decode");
 
     let mut gathered = 0usize;
-    let refused =
-        crate::table::data_block::DataBlock::columnar_block_entries(&encoded, &mut gathered);
+    let refused = crate::table::data_block::DataBlock::column_batch_entries([batch], &mut gathered);
     assert!(refused.is_err(), "the bad value-type tag must be refused");
     let first_row = frame_value_cells(&[
         (TypeTag::Fixed(4), &[1, 0, 0, 0][..]),
@@ -941,7 +1052,7 @@ fn columnar_entries_refused_after_rebuilding_a_value_still_count_it() {
     .expect("frame");
     assert_eq!(
         gathered,
-        decode_copies + first_row.len(),
+        first_row.len(),
         "the first row's value was rebuilt before the refusal",
     );
 }

@@ -96,6 +96,40 @@ pub(crate) fn expected_parity_len(data_length: u32, params: EccParams) -> u32 {
     shard_bytes.saturating_mul(parity_shards)
 }
 
+/// Refuses an on-disk block size no block written under `encryption` and
+/// `ecc` can have (the largest payload plus its encryption overhead, its
+/// parity and the largest header), so a corrupt size is rejected before a
+/// buffer is allocated for it.
+pub(crate) fn check_on_disk_size(
+    size: u64,
+    encryption: Option<&dyn crate::encryption::EncryptionProvider>,
+    ecc: Option<EccParams>,
+) -> crate::Result<()> {
+    let enc_overhead = encryption.map_or(0u64, |e| u64::from(e.max_overhead()));
+    let max_payload = u64::from(MAX_DECOMPRESSION_SIZE) + enc_overhead;
+    // The ECC term is the scheme's actual parity for the largest payload,
+    // never a hardcoded one; without ECC there is none.
+    let max_ecc_overhead = match ecc {
+        Some(params) => {
+            #[expect(
+                clippy::cast_possible_truncation,
+                reason = "max_payload is MAX_DECOMPRESSION_SIZE (+ enc overhead), well below u32::MAX"
+            )]
+            let max_payload_u32 = max_payload.min(u64::from(u32::MAX)) as u32;
+            u64::from(expected_parity_len(max_payload_u32, params))
+        }
+        None => 0,
+    };
+    let limit = max_payload + max_ecc_overhead + Header::MAX_LEN as u64;
+    if size > limit {
+        return Err(crate::Error::DecompressedSizeTooLarge {
+            declared: size,
+            limit,
+        });
+    }
+    Ok(())
+}
+
 /// [`expected_parity_len`], rejecting a trailer above the payload hard cap
 /// ([`MAX_DECOMPRESSION_SIZE`]). A legitimately-written block never exceeds it —
 /// the writer enforces the same bound before emitting the trailer — so a larger
@@ -343,6 +377,17 @@ impl PreparedBlock<'_> {
             parity: self.parity,
             layout: self.layout,
         }
+    }
+
+    /// Bytes this block will occupy once written, under the ECC scheme it was
+    /// prepared with.
+    ///
+    /// Known before the write because the transform has already run, which is
+    /// what lets a writer lay out several blocks and record where each one
+    /// lands before any of them reaches the file.
+    #[cfg(feature = "columnar")]
+    pub(crate) fn on_disk_len(&self, ecc: Option<EccParams>) -> u32 {
+        self.header.on_disk_size_with(ecc)
     }
 
     /// Writes the framed block (header + payload + optional parity trailer)
@@ -1387,10 +1432,6 @@ impl Block {
     ///
     /// `on_issue` runs once, immediately before the frame is read, so a handle
     /// refused by the checks above never reaches it.
-    #[expect(
-        clippy::too_many_lines,
-        reason = "two ways to OBTAIN the payload (encrypted Vec vs zero-copy Slice), each with its own size caps and trailer classification"
-    )]
     pub(crate) fn read_verified_payload(
         file: &dyn FsFile,
         handle: BlockHandle,
@@ -1412,35 +1453,12 @@ impl Block {
         // A MAX_DECOMPRESSION_SIZE-only ECC bound would
         // under-approximate by ~enc_overhead/2 and reject legitimate
         // near-limit encrypted+ECC blocks the writer can produce.
-        let enc_overhead = encryption.map_or(0u64, |e| u64::from(e.max_overhead()));
-        let max_payload = u64::from(MAX_DECOMPRESSION_SIZE) + enc_overhead;
         // Pre-allocation sanity cap on `handle.size()`: reject an absurd on-disk
-        // size before allocating the read buffer. The ECC-OFF path adds NO ECC
-        // term and runs NO ECC math — when there is no parity, the cap is just
-        // payload + header. When ECC is on, the cap allows the block's ACTUAL
-        // scheme parity (from the per-SST descriptor carried by `transform`),
-        // never a hardcoded scheme. Self-describing blocks (Meta / Manifest)
-        // carry their own small RS parity but are orders of magnitude below
-        // `max_payload`, so they pass this cap without an explicit ECC term.
-        let max_ecc_overhead = match transform.ecc_params() {
-            Some(params) => {
-                #[expect(
-                    clippy::cast_possible_truncation,
-                    reason = "max_payload is MAX_DECOMPRESSION_SIZE (+ enc overhead), well below u32::MAX"
-                )]
-                let max_payload_u32 = max_payload.min(u64::from(u32::MAX)) as u32;
-                u64::from(expected_parity_len(max_payload_u32, params))
-            }
-            None => 0,
-        };
-        let max_on_disk_size = max_payload + max_ecc_overhead + Header::MAX_LEN as u64;
-
-        if u64::from(handle.size()) > max_on_disk_size {
-            return Err(crate::Error::DecompressedSizeTooLarge {
-                declared: u64::from(handle.size()),
-                limit: max_on_disk_size,
-            });
-        }
+        // size before allocating the read buffer. Self-describing blocks (Meta /
+        // Manifest) carry their own small RS parity but are orders of magnitude
+        // below the payload cap, so they pass it without an explicit ECC term.
+        check_on_disk_size(u64::from(handle.size()), encryption, transform.ecc_params())?;
+        let enc_overhead = encryption.map_or(0u64, |e| u64::from(e.max_overhead()));
 
         // When encryption is active, read the whole block into an owned
         // Vec (single I/O, single allocation), parse the header, then strip
@@ -1475,6 +1493,65 @@ impl Block {
                 )));
             }
 
+            Self::verify_encrypted_frame(buf, handle, identity, transform, enc, enc_overhead)?
+        } else {
+            // Single I/O read — header + payload in one Slice.
+            on_issue();
+            let buf = crate::file::read_exact(file, *handle.offset(), handle.size() as usize)?;
+            Self::verify_plain_frame(&buf, handle, transform)?
+        };
+
+        Ok((header, payload, ecc_status, recovery))
+    }
+
+    /// Verifies one block's on-disk frame, already read, and hands back its
+    /// verified payload one step short of decompression.
+    ///
+    /// The second half of [`Self::read_verified_payload`], split out so a
+    /// caller that read several blocks in one request — a columnar row
+    /// group's pages — verifies each of them through exactly the code a block
+    /// read on its own goes through: the same size caps, trailer
+    /// classification, checksum, ECC recovery and decrypt, and the same
+    /// [`EccStatus`] for auto-heal to act on. `frame` must be exactly the
+    /// bytes `handle` names; `handle` also supplies the file offset errors and
+    /// logs report.
+    ///
+    /// # Errors
+    ///
+    /// As [`Self::read_verified_payload`], minus the I/O.
+    #[cfg(feature = "columnar")]
+    pub(crate) fn verify_frame(
+        frame: alloc::vec::Vec<u8>,
+        handle: BlockHandle,
+        identity: BlockIdentity,
+        transform: &BlockTransform<'_>,
+    ) -> crate::Result<(Header, Slice, EccStatus, Option<EccRecoveryKind>)> {
+        if frame.len() != handle.size() as usize {
+            return Err(crate::Error::InvalidHeader(
+                "Block: frame length disagrees with its handle",
+            ));
+        }
+        match transform.encryption() {
+            Some(enc) => {
+                let enc_overhead = u64::from(enc.max_overhead());
+                Self::verify_encrypted_frame(frame, handle, identity, transform, enc, enc_overhead)
+            }
+            None => Self::verify_plain_frame(&Slice::from(frame), handle, transform),
+        }
+    }
+
+    /// Verifies and decrypts an encrypted block's frame, read into an owned
+    /// buffer so the decrypt can run in place.
+    fn verify_encrypted_frame(
+        mut buf: alloc::vec::Vec<u8>,
+        handle: BlockHandle,
+        identity: BlockIdentity,
+        transform: &BlockTransform<'_>,
+        enc: &dyn crate::encryption::EncryptionProvider,
+        enc_overhead: u64,
+    ) -> crate::Result<(Header, Slice, EccStatus, Option<EccRecoveryKind>)> {
+        let block_size = buf.len();
+        {
             // `decode_from` reads exactly the header (variable: 33 or 34
             // bytes per block_type) and stops, leaving the payload untouched.
             let parsed_header = Header::decode_from(&mut &buf[..])?;
@@ -1592,17 +1669,24 @@ impl Block {
 
             let decrypted = decrypt_block_payload(enc, &buf, &identity)?;
 
-            (
+            Ok((
                 parsed_header,
                 Slice::from(decrypted),
                 ecc_status,
                 payload_corrected,
-            )
-        } else {
-            // Single I/O read — header + payload in one Slice.
-            on_issue();
-            let buf = crate::file::read_exact(file, *handle.offset(), handle.size() as usize)?;
+            ))
+        }
+    }
 
+    /// Verifies an unencrypted block's frame. The payload comes back as a view
+    /// of `buf` on the clean path, so no byte is copied that the reader did
+    /// not have to copy.
+    fn verify_plain_frame(
+        buf: &Slice,
+        handle: BlockHandle,
+        transform: &BlockTransform<'_>,
+    ) -> crate::Result<(Header, Slice, EccStatus, Option<EccRecoveryKind>)> {
+        {
             let parsed_header = Header::decode_from(&mut &buf[..])?;
             refuse_encrypted_without_provider(&parsed_header)?;
             let header_len = Header::header_len(parsed_header.block_type);
@@ -1700,10 +1784,8 @@ impl Block {
                 ecc_status
             };
 
-            (parsed_header, payload_slice, ecc_status, payload_corrected)
-        };
-
-        Ok((header, payload, ecc_status, recovery))
+            Ok((parsed_header, payload_slice, ecc_status, payload_corrected))
+        }
     }
 
     /// In-place autoheal primitive: read this block's on-disk frame and, if its
@@ -1734,30 +1816,12 @@ impl Block {
         }
         // Pre-allocation sanity cap on `handle.size()` (mirrors
         // `from_file_with_recovery`): reject an absurd on-disk size from a corrupt
-        // handle before allocating the read buffer. Bound = max payload
-        // (+ encryption overhead) + its parity + the largest header.
-        let enc_overhead = transform
-            .encryption()
-            .map_or(0u64, |e| u64::from(e.max_overhead()));
-        let max_payload = u64::from(MAX_DECOMPRESSION_SIZE) + enc_overhead;
-        let max_ecc_overhead = match transform.ecc_params() {
-            Some(params) => {
-                #[expect(
-                    clippy::cast_possible_truncation,
-                    reason = "max_payload is MAX_DECOMPRESSION_SIZE (+ enc overhead), well below u32::MAX"
-                )]
-                let max_payload_u32 = max_payload.min(u64::from(u32::MAX)) as u32;
-                u64::from(expected_parity_len(max_payload_u32, params))
-            }
-            None => 0,
-        };
-        let max_on_disk_size = max_payload + max_ecc_overhead + Header::MAX_LEN as u64;
-        if u64::from(handle.size()) > max_on_disk_size {
-            return Err(crate::Error::DecompressedSizeTooLarge {
-                declared: u64::from(handle.size()),
-                limit: max_on_disk_size,
-            });
-        }
+        // handle before allocating the read buffer.
+        check_on_disk_size(
+            u64::from(handle.size()),
+            transform.encryption(),
+            transform.ecc_params(),
+        )?;
         let mut buf = alloc::vec![0u8; block_size];
         let n = file.read_at(&mut buf, *handle.offset())?;
         if n != block_size {

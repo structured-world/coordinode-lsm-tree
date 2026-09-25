@@ -18,6 +18,10 @@ const TAG_PARTIAL_BLOCK: u8 = 2;
 /// the owning SST's id + the user key's hash, so a repeat point read returns the
 /// decoded value without re-loading and re-decoding its data block.
 const TAG_ROW: u8 = 3;
+/// Decoded-directory tag: a columnar row group's page directory, decoded and
+/// checked once, keyed by the group's offset.
+#[cfg(feature = "columnar")]
+const TAG_DIRECTORY: u8 = 4;
 
 #[derive(Clone)]
 enum Item {
@@ -44,6 +48,17 @@ enum Item {
     /// only the touched fraction stays resident. See [`Cache::peek_partial_block`].
     #[cfg(feature = "zstd")]
     PartialBlock(PartialBlockEntry),
+    /// A columnar row group's page directory, decoded and checked, with the
+    /// directory block's on-disk length. Every read of a group starts from its
+    /// directory, and a directory of many row pages is dozens to hundreds of
+    /// entries whose decode sorts them to prove the page grid: caching it
+    /// decoded makes every later read of the group skip both, where caching
+    /// the raw block would repeat them per read.
+    #[cfg(feature = "columnar")]
+    Directory(
+        alloc::sync::Arc<crate::table::column_page::PageDirectory>,
+        u32,
+    ),
 }
 
 /// A cached partial-tier entry: the resumable decode state for a cold block plus
@@ -111,6 +126,8 @@ impl Weighter<CacheKey, Item> for BlockWeighter {
             Item::PartialBlock(entry) => {
                 entry.resume.window_prime.len() as u64 + entry.covered_upper.len() as u64 + 64
             }
+            #[cfg(feature = "columnar")]
+            Item::Directory(directory, _) => directory.heap_size() as u64 + 64,
         }
     }
 }
@@ -249,6 +266,8 @@ impl Cache {
             Item::Blob(..) | Item::Row(_) => unreachable!("invalid cache item"),
             #[cfg(feature = "zstd")]
             Item::PartialBlock(_) => unreachable!("invalid cache item"),
+            #[cfg(feature = "columnar")]
+            Item::Directory(..) => unreachable!("invalid cache item"),
         })
     }
 
@@ -264,7 +283,60 @@ impl Cache {
             Item::Blob(..) | Item::Row(_) => unreachable!("invalid cache item"),
             #[cfg(feature = "zstd")]
             Item::PartialBlock(_) => unreachable!("invalid cache item"),
+            #[cfg(feature = "columnar")]
+            Item::Directory(..) => unreachable!("invalid cache item"),
         })
+    }
+
+    /// The decoded directory of the row group at `offset`, with its block's
+    /// on-disk length, when it is cached. `touch` says whether the lookup may
+    /// promote the entry and count as a hit, as [`Self::get_block`] does, or
+    /// must leave both as they were, as [`Self::peek_block`] does.
+    #[cfg(feature = "columnar")]
+    #[must_use]
+    pub(crate) fn get_directory(
+        &self,
+        id: GlobalTableId,
+        offset: BlockOffset,
+        touch: bool,
+    ) -> Option<(
+        alloc::sync::Arc<crate::table::column_page::PageDirectory>,
+        u32,
+    )> {
+        let key: CacheKey = (TAG_DIRECTORY, id.tree_id(), id.table_id(), *offset).into();
+        let item = if touch {
+            self.data.get(&key)
+        } else {
+            self.data.peek(&key)
+        };
+        match item? {
+            Item::Directory(directory, len) => Some((directory, len)),
+            _ => unreachable!("invalid cache item"),
+        }
+    }
+
+    /// Caches the decoded directory of the row group at `offset`, with its
+    /// block's on-disk length. A directory is read before any page of its
+    /// group, like an index block before its data blocks, so it is pinned at
+    /// the same priority.
+    #[cfg(feature = "columnar")]
+    pub(crate) fn insert_directory(
+        &self,
+        id: GlobalTableId,
+        offset: BlockOffset,
+        directory: alloc::sync::Arc<crate::table::column_page::PageDirectory>,
+        len: u32,
+    ) {
+        let priority = if self.metadata_priority {
+            Priority::High
+        } else {
+            Priority::Normal
+        };
+        self.data.insert_with_priority(
+            (TAG_DIRECTORY, id.tree_id(), id.table_id(), *offset).into(),
+            Item::Directory(directory, len),
+            priority,
+        );
     }
 
     /// Whether a full (non-partial) data block is already resident for `offset`.
@@ -495,6 +567,8 @@ impl Cache {
             Item::Block(_) | Item::Row(_) => unreachable!("invalid cache item"),
             #[cfg(feature = "zstd")]
             Item::PartialBlock(_) => unreachable!("invalid cache item"),
+            #[cfg(feature = "columnar")]
+            Item::Directory(..) => unreachable!("invalid cache item"),
         }
     }
 }

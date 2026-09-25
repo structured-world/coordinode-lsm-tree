@@ -462,34 +462,40 @@ impl DataBlock {
     ///
     /// Returns [`crate::Error::InvalidTrailer`] if a footer-bearing block's
     /// footer is structurally malformed.
-    /// Reconstructs a row-major data block from a loaded columnar (PAX) block:
-    /// decode the `ColumnBatch`, rebuild the entries, and re-encode them
-    /// row-major in memory so every existing row read path is reused unchanged.
-    /// The caller must have loaded `block` with `BlockType::Columnar` (its AAD /
-    /// descriptor), so this is shared by both the random-access and scan paths.
-    /// Decodes a columnar block into its reconstructed row entries (block-index
-    /// order), WITHOUT re-encoding to a row-major block. The scan path iterates
-    /// these directly (no serialize + re-parse round-trip); [`Self::from_columnar_block`]
-    /// re-encodes on top of this for the byte-based point-read path.
+    /// Reconstructs a columnar row group's row entries from its row pages, in
+    /// block-index order, WITHOUT re-encoding them to a row-major block. The
+    /// scan path iterates these directly (no serialize + re-parse round-trip);
+    /// [`Self::from_column_batch`] re-encodes on top of this for the
+    /// byte-based point-read path.
     ///
-    /// Also adds to `gathered` the bytes gathered on the way, as each gather
-    /// runs, so a block refused after one still counts it: what the decode
-    /// copied out of the block (validity bitmaps, detached columns) plus the
-    /// values that had to be rebuilt from sub-columns, the latter zero when
-    /// every value is a view into the column buffer.
+    /// Adds to `gathered` the values that had to be rebuilt from sub-columns,
+    /// as each is rebuilt, so a group refused after one still counts it; zero
+    /// when every value is a view into the column buffer. What decoding the
+    /// pages copied is counted where they are decoded.
     #[cfg(feature = "columnar")]
-    pub(crate) fn columnar_block_entries(
-        block_data: &crate::Slice,
+    pub(crate) fn column_batch_entries(
+        pages: impl IntoIterator<Item = crate::table::columnar::ColumnBatch>,
         gathered: &mut usize,
     ) -> crate::Result<Vec<InternalValue>> {
-        let batch = crate::table::columnar::ColumnBatch::decode_counting_copies(
-            block_data, None, gathered,
-        )?;
-        // Consuming, zero-copy untranspose: row keys / values are views into the
-        // batch's column buffers rather than per-row copies.
-        let entries = crate::table::columnar::column_batch_into_entries(batch, gathered)?;
-        // The writer never spills an empty block, so a zero-row columnar block is
-        // corrupt; reject it before any consumer with a non-empty precondition.
+        let mut entries = Vec::new();
+        for batch in pages {
+            // Consuming, zero-copy untranspose: row keys / values are views
+            // into the page's column buffers rather than per-row copies.
+            let rows = crate::table::columnar::column_batch_into_entries(batch, gathered)?;
+            // The writer never writes an empty row page, so a zero-row one is
+            // corrupt; reject it before any consumer with a non-empty
+            // precondition.
+            if rows.is_empty() {
+                return Err(crate::Error::InvalidHeader(
+                    "columnar: empty reconstructed data block",
+                ));
+            }
+            if entries.is_empty() {
+                entries = rows;
+            } else {
+                entries.extend(rows);
+            }
+        }
         if entries.is_empty() {
             return Err(crate::Error::InvalidHeader(
                 "columnar: empty reconstructed data block",
@@ -498,19 +504,24 @@ impl DataBlock {
         Ok(entries)
     }
 
-    /// As [`Self::columnar_block_entries`], but drops rows whose global position
-    /// is marked deleted in `deletes`. `block_start_row` is the block's first
+    /// As [`Self::column_batch_entries`], but drops rows whose global position
+    /// is marked deleted in `deletes`. `block_start_row` is the group's first
     /// row position (block-index order). Returns `Ok(None)` when every row is
-    /// deleted (the caller skips the block). The rebuilt-byte count covers every
+    /// deleted (the caller skips the group). The rebuilt-byte count covers every
     /// row, masked ones included: they were rebuilt before the mask ran.
     #[cfg(feature = "columnar")]
-    pub(crate) fn columnar_block_entries_masked(
-        block_data: &crate::Slice,
+    pub(crate) fn column_batch_entries_masked(
+        pages: impl IntoIterator<Item = crate::table::columnar::ColumnBatch>,
         deletes: &crate::table::delete_bitmap::DeleteBitmap,
         block_start_row: u32,
         gathered: &mut usize,
     ) -> crate::Result<Option<Vec<InternalValue>>> {
-        let entries = Self::columnar_block_entries(block_data, gathered)?;
+        let entries = Self::column_batch_entries(pages, gathered)?;
+        // Each row's position is `block_start_row + index`. The bitmap is
+        // u32-positional and `build_position_bitmap` rejects segments past
+        // u32::MAX rows at write time, but a corrupt zone-map `block_start_row`
+        // could still push the sum over, so fail explicitly rather than wrapping
+        // back to 0 (which would mask the wrong rows).
         let mut kept = Vec::with_capacity(entries.len());
         for (index, entry) in entries.into_iter().enumerate() {
             let offset = u32::try_from(index).map_err(|_| {
@@ -531,72 +542,89 @@ impl DataBlock {
         Ok(Some(kept))
     }
 
-    /// Reconstructs a columnar block as a row-major block.
+    /// Reconstructs a row-major data block from a columnar row group: rebuild
+    /// the entries and re-encode them row-major in memory, so every existing
+    /// row read path is reused unchanged.
     ///
     /// Also adds to `gathered` the bytes of the values rebuilt from sub-columns
-    /// on the way, as [`Self::columnar_block_entries`] counts them: that
-    /// rebuild is a gather of its own, separate from the encode that then
-    /// copies the rebuilt values into the block.
+    /// on the way, as [`Self::column_batch_entries`] counts them: that rebuild
+    /// is a gather of its own, separate from the encode that then copies the
+    /// rebuilt values into the block.
     #[cfg(feature = "columnar")]
-    pub(crate) fn from_columnar_block(
-        block_data: &crate::Slice,
+    pub(crate) fn from_column_batch(
+        pages: impl IntoIterator<Item = crate::table::columnar::ColumnBatch>,
         restart_interval: u8,
         gathered: &mut usize,
     ) -> crate::Result<Self> {
-        let entries = Self::columnar_block_entries(block_data, gathered)?;
+        let entries = Self::column_batch_entries(pages, gathered)?;
         Self::encode_entries_to_block(&entries, restart_interval)
     }
 
-    /// Point-read fast path for a columnar block: reconstructs only the rows whose
-    /// key equals `needle` (skipping `deletes`-masked rows) into a tiny row block,
-    /// or `Ok(None)` when the key is absent / wholly deleted. The caller runs the
-    /// normal seqno-aware [`Self::point_read`] on the result. Avoids untransposing
-    /// and re-encoding the whole block per lookup.
+    /// Point-read fast path for a columnar row group: reconstructs only the
+    /// rows whose key equals `needle` (skipping `deletes`-masked rows) into a
+    /// tiny row block, or `Ok(None)` when the key is absent / wholly deleted.
+    /// The caller runs the normal seqno-aware [`Self::point_read`] on the
+    /// result. Avoids untransposing and re-encoding the whole group per lookup.
     ///
-    /// Also adds to `gathered` what the decode copied out of the block, plus
-    /// the matching rows' keys and values, which are copied out of the columns
-    /// before the encode copies them again.
+    /// `pages` are consecutive row pages of the group, and `deletes` carries
+    /// the position of the first one's first row: a key's versions can run
+    /// across a row page boundary, so every page that holds one is matched.
+    ///
+    /// Also adds to `gathered` the matching rows' keys and values, which are
+    /// copied out of the columns before the encode copies them again.
     #[cfg(feature = "columnar")]
     pub(crate) fn columnar_point_block(
-        block_data: &crate::Slice,
+        pages: &[crate::table::columnar::ColumnBatch],
         needle: &[u8],
         comparator: &crate::comparator::SharedComparator,
         restart_interval: u8,
         deletes: Option<(&crate::table::delete_bitmap::DeleteBitmap, u32)>,
         gathered: &mut usize,
     ) -> crate::Result<Option<Self>> {
-        let batch = crate::table::columnar::ColumnBatch::decode_counting_copies(
-            block_data, None, gathered,
-        )?;
-        // The matcher adds each row's copies as it makes them, so rows copied
-        // before a later row fails are still counted.
-        let entries = crate::table::columnar::column_batch_match_entries(
-            &batch, needle, comparator, deletes, gathered,
-        )?;
+        let overflow = || crate::Error::InvalidHeader("columnar: row position exceeds u32::MAX");
+        let mut entries = Vec::new();
+        let mut offset = 0u32;
+        for batch in pages {
+            let page_deletes = match deletes {
+                Some((bitmap, start)) => {
+                    Some((bitmap, start.checked_add(offset).ok_or_else(overflow)?))
+                }
+                None => None,
+            };
+            // The matcher adds each row's copies as it makes them, so rows
+            // copied before a later row fails are still counted.
+            entries.extend(crate::table::columnar::column_batch_match_entries(
+                batch,
+                needle,
+                comparator,
+                page_deletes,
+                gathered,
+            )?);
+            offset = offset.checked_add(batch.row_count).ok_or_else(overflow)?;
+        }
         if entries.is_empty() {
             return Ok(None);
         }
         Self::encode_entries_to_block(&entries, restart_interval).map(Some)
     }
 
-    /// As [`Self::from_columnar_block`], but drops rows whose global position is
+    /// As [`Self::from_column_batch`], but drops rows whose global position is
     /// marked deleted in `deletes`. `block_start_row` is the position of this
-    /// block's first row within the segment (block-index order).
+    /// group's first row within the segment (block-index order).
     ///
-    /// Returns `Ok(None)` when every row in the block is deleted: the row encoder
-    /// has a non-empty precondition, so a fully-deleted block is reported as
-    /// "nothing to yield" and the caller skips it. Also adds the rebuilt-value
-    /// bytes to `gathered`, as [`Self::from_columnar_block`] does.
+    /// Returns `Ok(None)` when every row in the group is deleted: the row
+    /// encoder has a non-empty precondition, so a fully-deleted group is
+    /// reported as "nothing to yield" and the caller skips it. Also adds the
+    /// rebuilt-value bytes to `gathered`, as [`Self::from_column_batch`] does.
     #[cfg(feature = "columnar")]
-    pub(crate) fn from_columnar_block_masked(
-        block_data: &crate::Slice,
+    pub(crate) fn from_column_batch_masked(
+        pages: impl IntoIterator<Item = crate::table::columnar::ColumnBatch>,
         restart_interval: u8,
         deletes: &crate::table::delete_bitmap::DeleteBitmap,
         block_start_row: u32,
         gathered: &mut usize,
     ) -> crate::Result<Option<Self>> {
-        let kept =
-            Self::columnar_block_entries_masked(block_data, deletes, block_start_row, gathered)?;
+        let kept = Self::column_batch_entries_masked(pages, deletes, block_start_row, gathered)?;
         kept.map(|kept| Self::encode_entries_to_block(&kept, restart_interval))
             .transpose()
     }

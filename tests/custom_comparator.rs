@@ -849,7 +849,7 @@ fn columnar_range_cardinality_is_not_skewed_by_a_reverse_comparator() -> lsm_tre
     let cmp: SharedComparator = Arc::new(ReverseComparator);
     let any = Config::new(&folder, Default::default(), Default::default())
         .comparator(cmp)
-        .data_block_size_policy(lsm_tree::config::BlockSizePolicy::all(256))
+        .columnar_row_group_size_policy(lsm_tree::config::BlockSizePolicy::all(256))
         .open()?;
     let lsm_tree::AnyTree::Standard(tree) = &any else {
         panic!("expected Standard tree");

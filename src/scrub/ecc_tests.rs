@@ -4334,10 +4334,12 @@ fn heal_in_place_skips_the_checksum_refresh_while_corruption_remains() -> crate:
 }
 
 /// A clean encrypted, columnar, Page-ECC SST heals in place with no findings.
-/// Its data blocks are sealed as
-/// [`BlockType::Columnar`](crate::table::block::BlockType::Columnar) and
-/// encrypted through the AAD block path; the heal read must decrypt, decompress,
-/// and verify them without reporting a healthy block as uncorrectable. (The AAD
+/// Its row groups are sealed as a
+/// [`BlockType::ColumnPageDirectory`](crate::table::block::BlockType::ColumnPageDirectory)
+/// followed by [`BlockType::ColumnPage`](crate::table::block::BlockType::ColumnPage)s,
+/// each encrypted through the AAD block path; the heal read must decrypt,
+/// decompress, and verify every one of them without reporting a healthy block
+/// as uncorrectable. (The AAD
 /// block-type byte is reconstructed from the on-disk frame, not the caller's
 /// block-type argument, so the heal read decrypts correctly regardless of the
 /// argument — this guards that the whole encrypted-columnar heal path stays
@@ -4363,8 +4365,8 @@ fn heal_in_place_leaves_a_clean_encrypted_columnar_sst_with_no_findings() -> cra
     .expect("open encrypted ecc tree") else {
         unreachable!("standard tree configured (no kv separation)");
     };
-    // Columnar layout: the flush transposes the memtable into
-    // `BlockType::Columnar` data blocks (encrypted through the tree's provider).
+    // Columnar layout: the flush transposes the memtable into row groups of
+    // pages (encrypted through the tree's provider).
     tree.update_runtime_config(|cfg| cfg.columnar = true)?;
 
     for i in 0u64..2_000 {
@@ -4374,7 +4376,7 @@ fn heal_in_place_leaves_a_clean_encrypted_columnar_sst_with_no_findings() -> cra
 
     // Precondition: the flush produced an encrypted columnar SST (columnar
     // layout + ECC parity + an encryption provider), so the heal read exercises
-    // the AAD block path over `BlockType::Columnar` blocks.
+    // the AAD block path over a row group's directory and pages.
     {
         let binding = tree.version_history.read().latest_version();
         let table = binding

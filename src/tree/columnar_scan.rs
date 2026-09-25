@@ -812,7 +812,7 @@ impl ColumnarScan {
         // recency rank — in lockstep so the dedup can compare versions across
         // segments with different bases and break equal-seqno ties the way the
         // read path does (newer source wins).
-        let mut combined: Option<ColumnBatch> = None;
+        let mut visible_batches: Vec<ColumnBatch> = Vec::new();
         let mut effective: Vec<SeqNo> = Vec::new();
         let mut source_rank: Vec<usize> = Vec::new();
         for seg in &group.segments {
@@ -854,21 +854,21 @@ impl ColumnarScan {
                 if visible.row_count == 0 {
                     continue;
                 }
-                match &mut combined {
-                    Some(acc) => {
-                        acc.append(&visible)?;
-                        // The accumulated batch, not the appended one: append
-                        // rebuilds the whole thing, so this is where the fold
-                        // over k batches shows its k-squared shape.
-                        self.record_gather(acc);
-                    }
-                    None => combined = Some(visible),
-                }
+                visible_batches.push(visible);
             }
         }
-        let Some(combined) = combined else {
+        if visible_batches.is_empty() {
             return Ok(Vec::new());
-        };
+        }
+        // Every visible batch joined once, each column framed once: a fold
+        // that appended them one by one would rebuild the accumulator per
+        // batch, a k-squared copy over a group's row pages. One batch is
+        // taken as it is, with nothing to join.
+        let joined = visible_batches.len() > 1;
+        let combined = ColumnBatch::concat(visible_batches)?;
+        if joined {
+            self.record_gather(&combined);
+        }
 
         // Extract every row's key once (fallible framing read), then sort indices
         // by (key asc, effective seqno desc) and keep the first per key.

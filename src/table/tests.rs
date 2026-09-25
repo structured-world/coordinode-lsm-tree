@@ -4440,7 +4440,7 @@ fn salvage_reads_of_a_columnar_table_count_no_bytes() -> crate::Result<()> {
         .data_block_handles()
         .next()
         .expect("the table has a data block")?;
-    let handle = BlockHandle::new(first.offset(), first.size());
+    let handle = *first.as_ref();
     let before = (metrics.bytes_read(), metrics.bytes_decoded());
     assert!(
         table.load_columnar_block_masked(&handle)?.is_some(),
@@ -5279,8 +5279,13 @@ fn predict_heal_streams_the_same_digest_as_materializing_corrections() -> crate:
     let mut corrections: Vec<(u64, Vec<u8>)> = Vec::new();
     for entry in table.block_index.iter() {
         let keyed = entry?;
-        if let Some(c) = table.heal_correction_for_block(fh.as_ref(), &keyed, &transform)? {
-            corrections.push(c);
+        let entry_handle = *keyed.as_ref();
+        for (handle, role) in table.data_unit_blocks(&entry_handle)? {
+            if let Some(c) =
+                table.heal_correction_for_block(fh.as_ref(), handle, role, &transform)?
+            {
+                corrections.push(c);
+            }
         }
     }
     let materialized =
@@ -6771,7 +6776,7 @@ fn restricted_columnar_scan_skips_punched_prefix_and_masks_sub_bound_rows() -> c
     let mut writer = Writer::new(file.clone(), 0, 0, Arc::new(StdFs))?
         .use_columnar(true)
         .use_zone_map(true)
-        .use_data_block_size(256);
+        .use_row_group_size(256);
     for key in &keys {
         writer.write(crate::InternalValue::from_components(
             key.as_slice(),
@@ -7699,5 +7704,1375 @@ fn recover_salvage_degrades_a_persistent_filter_index_read() -> crate::Result<()
         recovered.salvage_degraded_a_rebuildable_section(),
         "the recovered table must report the degraded rebuildable section",
     );
+    Ok(())
+}
+
+/// A columnar table stamped with a layout this release does not read is
+/// refused at OPEN, as the typed format error that names the converter.
+///
+/// The alternative is what makes this matter: the table would open, and the
+/// first read of a row group would fail as a block-role mismatch. Salvage and
+/// repair read that as damage — the bytes are not what the index says they
+/// are — and drop the table, so a store awaiting conversion would lose every
+/// columnar table the first time anyone repaired it.
+#[cfg(feature = "columnar")]
+#[test]
+fn a_columnar_table_in_a_superseded_layout_is_refused_at_open() -> crate::Result<()> {
+    let dir = tempdir()?;
+    let sst = dir.path().join("table");
+    let mut writer = Writer::new(sst.clone(), 0, 0, Arc::new(StdFs))?.use_columnar(true);
+    for i in 0..64_u32 {
+        writer.write(InternalValue::from_components(
+            alloc::format!("key{i:05}").into_bytes(),
+            b"v".as_slice(),
+            0,
+            crate::ValueType::Value,
+        ))?;
+    }
+    assert!(writer.finish()?.is_some(), "table is non-empty");
+
+    // Stamp the table as the layout before row groups had pages. Both meta
+    // mirrors agree, so this is not a mirror disagreement: the table simply
+    // says it is in a format this release does not read.
+    crate::test_forge::forge_meta_value_both_mirrors(&sst, b"descriptor#columnar_format", &[1])?;
+    let checksum = Checksum::from_raw(crate::repair::compute_table_checksum(&StdFs, &sst)?);
+
+    let Err(err) = Table::recover(test_recover_params(sst, checksum)) else {
+        panic!("a table in a superseded columnar layout must not open");
+    };
+    assert!(
+        matches!(
+            err,
+            crate::Error::UnsupportedFormat {
+                part: crate::FormatPart::Columnar,
+                found: Some(1),
+                expected: crate::table::meta::COLUMNAR_FORMAT_VERSION,
+            }
+        ),
+        "expected the columnar format refusal, got {err:?}",
+    );
+    assert!(
+        err.is_environmental(),
+        "repair must propagate the refusal rather than grade the table as damaged",
+    );
+    Ok(())
+}
+
+/// A one-segment columnar table of `rows` rows with `key_len`-byte keys and
+/// `value_len`-byte values, in row groups of up to `group_size` bytes, each
+/// one row page: every column of a group is one page.
+#[cfg(feature = "columnar")]
+fn columnar_table_file(
+    file: &std::path::Path,
+    rows: u32,
+    key_len: usize,
+    value_len: usize,
+    group_size: u32,
+) -> crate::Result<Checksum> {
+    // The largest page size: no group reaches it, so none is cut.
+    columnar_table_file_paged(
+        file,
+        rows,
+        key_len,
+        value_len,
+        group_size,
+        4 * 1_024 * 1_024,
+    )
+}
+
+/// As [`columnar_table_file`], with each group's rows cut into row pages of
+/// `page_size` bytes.
+#[cfg(feature = "columnar")]
+fn columnar_table_file_paged(
+    file: &std::path::Path,
+    rows: u32,
+    key_len: usize,
+    value_len: usize,
+    group_size: u32,
+    page_size: u32,
+) -> crate::Result<Checksum> {
+    let mut writer = Writer::new(file.to_path_buf(), 0, 0, Arc::new(StdFs))?
+        .use_columnar(true)
+        .use_row_group_size(group_size)
+        .use_columnar_page_size(page_size);
+    for i in 0..rows {
+        let mut key = alloc::format!("key{i:06}").into_bytes();
+        key.resize(key_len, b'k');
+        writer.write(InternalValue::from_components(
+            key,
+            alloc::vec![b'v'; value_len],
+            u64::from(i) + 1,
+            crate::ValueType::Value,
+        ))?;
+    }
+    let (_, checksum) = writer
+        .finish()?
+        .expect("finish() returns Some after writing data items");
+    Ok(checksum)
+}
+
+/// Where the page of `column_id` sits in the row group `group` names: its
+/// file offset and on-disk length.
+#[cfg(feature = "columnar")]
+fn page_extent(file: &std::path::Path, group: &BlockHandle, column_id: u16) -> (usize, usize) {
+    use crate::coding::Decode;
+    use crate::table::block::Header;
+
+    let bytes = std::fs::read(file).expect("read table");
+    let at = usize::try_from(*group.offset()).expect("offset fits");
+    let frame = bytes.get(at..).expect("group within the file");
+    let header = Header::decode_from(&mut &frame[..]).expect("directory header");
+    let payload_at = Header::header_len(header.block_type);
+    let payload = frame
+        .get(payload_at..payload_at + header.data_length as usize)
+        .expect("directory payload");
+    let directory =
+        crate::table::column_page::PageDirectory::decode(payload).expect("decode directory");
+    let entry = directory
+        .entries()
+        .iter()
+        .find(|e| e.id.column_id == column_id)
+        .expect("the group has a page for the column");
+    let directory_len = header.on_disk_size_with(None) as usize;
+    (
+        at + directory_len + entry.offset as usize,
+        entry.length as usize,
+    )
+}
+
+/// A columnar table cuts its row groups at the row group size and a
+/// row-major one its blocks at the data block size, each ignoring the other:
+/// the two are separate geometry, set separately.
+#[cfg(feature = "columnar")]
+#[test]
+fn a_columnar_writer_cuts_at_the_row_group_size_and_a_row_writer_at_the_block_size()
+-> crate::Result<()> {
+    let dir = tempdir()?;
+    let blocks = |columnar: bool| -> crate::Result<usize> {
+        let file = dir.path().join(if columnar { "columnar" } else { "rows" });
+        let mut writer = Writer::new(file.clone(), 0, 0, Arc::new(StdFs))?
+            .use_columnar(columnar)
+            .use_data_block_size(256)
+            .use_row_group_size(64 * 1_024);
+        for i in 0..400_u32 {
+            writer.write(InternalValue::from_components(
+                alloc::format!("key{i:06}").into_bytes(),
+                alloc::vec![b'v'; 64],
+                u64::from(i) + 1,
+                crate::ValueType::Value,
+            ))?;
+        }
+        let (_, checksum) = writer
+            .finish()?
+            .expect("finish() returns Some after writing data items");
+        let table = Table::recover(test_recover_params(file, checksum))?;
+        Ok(table.data_block_handles().count())
+    };
+    // 400 rows of about 73 bytes: some 29 KiB, one 64 KiB row group, and a
+    // 256-byte block every four rows.
+    assert_eq!(blocks(true)?, 1, "the columnar table is one row group");
+    assert!(
+        blocks(false)? >= 50,
+        "the row-major table is cut at the data block size",
+    );
+    Ok(())
+}
+
+/// A projection reads only the pages it asked for, so a page it did not ask
+/// for is never verified: a corrupt value page fails a read that wants it and
+/// is invisible to a key-only projection. That is what per-page integrity
+/// buys; a group verified as a whole would fail both.
+#[cfg(feature = "columnar")]
+#[test]
+fn a_projection_never_reads_a_corrupt_page_it_does_not_want() -> crate::Result<()> {
+    use crate::table::columnar::{COL_USER_KEY, COL_VALUE};
+    use crate::table::row_group::PageWant;
+
+    let dir = tempdir()?;
+    let file = dir.path().join("table");
+    let checksum = columnar_table_file(&file, 200, 12, 256, 64 * 1_024)?;
+    let group = {
+        let table = Table::recover(test_recover_params(file.clone(), checksum))?;
+        let first = table
+            .data_block_handles()
+            .next()
+            .expect("the table has a row group")?;
+        *first.as_ref()
+    };
+
+    // Flip one byte inside the value page's payload, past its block header.
+    let (value_at, value_len) = page_extent(&file, &group, COL_VALUE);
+    let mut bytes = std::fs::read(&file)?;
+    let target = value_at + value_len / 2;
+    let byte = bytes.get_mut(target).expect("byte within the page");
+    *byte ^= 0x5A;
+    std::fs::write(&file, &bytes)?;
+
+    let table = Table::recover(test_recover_params(file.clone(), checksum))?;
+    let keys = table.load_row_group(
+        &group,
+        &PageWant::projected(&[COL_USER_KEY], crate::table::row_group::RowPageSelect::All),
+        ReadCharge::Foreground,
+    )?;
+    assert!(keys.row_count() > 0, "the key projection reads its rows");
+
+    let table = Table::recover(test_recover_params(file, checksum))?;
+    assert!(
+        table
+            .load_row_group(&group, &PageWant::ALL, ReadCharge::Foreground)
+            .is_err(),
+        "a read that wants the corrupt page must fail its check",
+    );
+    Ok(())
+}
+
+/// A projection's pages come back exactly as a full read decodes them, on
+/// every way the reader can assemble a page's bytes: out of the directory
+/// prefix, straddling its end, and wholly beyond it, with a column skipped in
+/// between. Each projection is taken over a cold cache, so no page is served
+/// by another's read.
+#[cfg(feature = "columnar")]
+#[test]
+fn a_projection_decodes_the_same_columns_as_a_full_read() -> crate::Result<()> {
+    use crate::table::columnar::{COL_SEQNO, COL_USER_KEY, COL_VALUE};
+    use crate::table::row_group::PageWant;
+
+    let dir = tempdir()?;
+    let file = dir.path().join("table");
+    // 32-byte keys: the key page of a 64 KiB group outgrows the 4 KiB prefix
+    // it starts in, and the value page lies wholly past it.
+    let checksum = columnar_table_file(&file, 400, 32, 96, 64 * 1_024)?;
+    let fresh = || Table::recover(test_recover_params(file.clone(), checksum));
+    let group = {
+        let first = fresh()?
+            .data_block_handles()
+            .next()
+            .expect("the table has a row group")?;
+        *first.as_ref()
+    };
+    let (key_at, key_len) = page_extent(&file, &group, COL_USER_KEY);
+    let group_at = usize::try_from(*group.offset()).expect("offset fits");
+    assert!(
+        key_at < group_at + 4_096 && key_at + key_len > group_at + 4_096,
+        "the fixture must put the key page across the prefix's end",
+    );
+
+    let full = fresh()?
+        .load_row_group(&group, &PageWant::ALL, ReadCharge::Foreground)?
+        .into_batch()?;
+    let column = |id: u16| {
+        full.columns
+            .iter()
+            .find(|c| c.column_id == id)
+            .cloned()
+            .expect("the full read holds every column")
+    };
+    for projection in [
+        &[COL_USER_KEY][..],
+        &[COL_VALUE][..],
+        &[COL_USER_KEY, COL_VALUE][..],
+        &[COL_SEQNO][..],
+    ] {
+        let projected = fresh()?
+            .load_row_group(
+                &group,
+                &PageWant {
+                    columns: Some(projection),
+                    ..PageWant::ALL
+                },
+                ReadCharge::Foreground,
+            )?
+            .into_batch()?;
+        assert_eq!(projected.row_count, full.row_count);
+        let expected: Vec<_> = full
+            .columns
+            .iter()
+            .filter(|c| projection.contains(&c.column_id))
+            .map(|c| column(c.column_id))
+            .collect();
+        assert_eq!(
+            projected.columns, expected,
+            "projection {projection:?} must decode what the full read decodes",
+        );
+    }
+    Ok(())
+}
+
+/// A directory header claiming more bytes than the row group holds is
+/// refused before any page offset is derived from it.
+#[cfg(feature = "columnar")]
+#[test]
+fn a_projection_refuses_a_directory_longer_than_its_group() -> crate::Result<()> {
+    use crate::table::columnar::COL_USER_KEY;
+    use crate::table::row_group::PageWant;
+
+    let dir = tempdir()?;
+    let file = dir.path().join("table");
+    let checksum = columnar_table_file(&file, 200, 12, 256, 64 * 1_024)?;
+    let group = {
+        let table = Table::recover(test_recover_params(file.clone(), checksum))?;
+        let first = table
+            .data_block_handles()
+            .next()
+            .expect("the table has a row group")?;
+        *first.as_ref()
+    };
+    // A shorter index entry than the group really is: the directory header,
+    // which is intact, now claims more than the entry spans.
+    let clipped = BlockHandle::new(group.offset(), 64).with_group_tag(group.group_tag());
+    let table = Table::recover(test_recover_params(file, checksum))?;
+    let err = table
+        .load_row_group(
+            &clipped,
+            &PageWant::projected(&[COL_USER_KEY], crate::table::row_group::RowPageSelect::All),
+            ReadCharge::Foreground,
+        )
+        .expect_err("a directory past the group's end must be refused");
+    assert!(
+        matches!(err, crate::Error::InvalidHeader(_)),
+        "expected a framing refusal, got {err:?}",
+    );
+    Ok(())
+}
+
+/// The first row group of the table in `file`.
+#[cfg(feature = "columnar")]
+fn first_row_group(file: &std::path::Path, checksum: Checksum) -> crate::Result<BlockHandle> {
+    let table = Table::recover(test_recover_params(file.to_path_buf(), checksum))?;
+    let first = table
+        .data_block_handles()
+        .next()
+        .expect("the table has a row group")?;
+    Ok(*first.as_ref())
+}
+
+/// A group cut into many row pages reads back exactly what was written, both
+/// as a scan and key by key: the row pages are one group's rows in order, not
+/// groups of their own.
+#[cfg(feature = "columnar")]
+#[test]
+fn a_row_group_of_many_row_pages_reads_back_every_row() -> crate::Result<()> {
+    use crate::table::row_group::PageWant;
+
+    let dir = tempdir()?;
+    let file = dir.path().join("table");
+    let checksum = columnar_table_file_paged(&file, 400, 16, 100, 64 * 1_024, 1_024)?;
+    let group = first_row_group(&file, checksum)?;
+    let table = Table::recover(test_recover_params(file, checksum))?;
+    let pages = table.load_row_group(&group, &PageWant::ALL, ReadCharge::Foreground)?;
+    assert!(
+        pages.batches.len() > 4,
+        "the fixture must cut its group into row pages, got {}",
+        pages.batches.len(),
+    );
+
+    let key = |i: u32| {
+        let mut key = alloc::format!("key{i:06}").into_bytes();
+        key.resize(16, b'k');
+        key
+    };
+    let scanned: Vec<_> = table.iter().collect::<crate::Result<_>>()?;
+    assert_eq!(scanned.len(), 400, "the scan returns every row");
+    for (i, row) in (0..).zip(&scanned) {
+        assert_eq!(&*row.key.user_key, key(i).as_slice(), "row {i} in order");
+        assert_eq!(row.key.seqno, u64::from(i) + 1);
+    }
+    for i in 0..400 {
+        let key = key(i);
+        let got = table
+            .get(&key, SeqNo::MAX, hash64(&key))?
+            .expect("every written key is found");
+        assert_eq!(got.key.seqno, u64::from(i) + 1, "key {i}");
+        assert_eq!(&*got.value, &[b'v'; 100][..], "key {i}");
+    }
+    Ok(())
+}
+
+/// A page size small enough to give every row a page of its own, in a group
+/// large enough that its pages outnumber what the directory can list (a
+/// `u16` count of column pages), still writes the table: adjacent row pages
+/// are merged until the directory holds them, which coarsens pruning and
+/// changes no row. Refusing instead failed the flush, and every retry of it.
+#[cfg(feature = "columnar")]
+#[test]
+fn a_group_of_more_row_pages_than_the_directory_lists_merges_them() -> crate::Result<()> {
+    use crate::table::row_group::PageWant;
+
+    let dir = tempdir()?;
+    let file = dir.path().join("table");
+    // One row per page and 20,000 rows in one group: 80,000 column pages
+    // for the four columns, past the directory's 65,535.
+    let checksum = columnar_table_file_paged(&file, 20_000, 9, 8, 4 * 1_024 * 1_024, 1)?;
+    let group = first_row_group(&file, checksum)?;
+    let table = Table::recover(test_recover_params(file, checksum))?;
+    let pages = table.load_row_group(&group, &PageWant::ALL, ReadCharge::Foreground)?;
+    assert_eq!(pages.group_rows, 20_000, "the table is one group");
+    assert!(
+        u16::try_from(pages.batches.len() * 4).is_ok(),
+        "the directory lists every page: {} row pages",
+        pages.batches.len(),
+    );
+    assert!(
+        pages.batches.len() > 1_000,
+        "merging keeps the pages as fine as the directory allows: {}",
+        pages.batches.len(),
+    );
+    let scanned: Vec<_> = table.iter().collect::<crate::Result<_>>()?;
+    assert_eq!(scanned.len(), 20_000, "the scan returns every row");
+    for (i, row) in (0..).zip(&scanned) {
+        assert_eq!(
+            &*row.key.user_key,
+            alloc::format!("key{i:06}").as_bytes(),
+            "row {i} in order"
+        );
+    }
+    Ok(())
+}
+
+/// Under the default sizes, a page as large as the group, every group is one
+/// row page, including a group its last row took past the group size: the
+/// group is cut by the writer's size count and a page by the bytes its rows
+/// carry, and the two must not leave a sliver of a page behind.
+#[cfg(feature = "columnar")]
+#[test]
+fn a_page_size_at_the_group_size_writes_one_row_page_per_group() -> crate::Result<()> {
+    use crate::table::row_group::PageWant;
+
+    let dir = tempdir()?;
+    let file = dir.path().join("table");
+    let mut writer = Writer::new(file.clone(), 0, 0, Arc::new(StdFs))?
+        .use_columnar(true)
+        .use_row_group_size(crate::config::DEFAULT_COLUMNAR_ROW_GROUP_SIZE)
+        .use_columnar_page_size(crate::config::DEFAULT_COLUMNAR_PAGE_SIZE);
+    for i in 0..2_000u32 {
+        // Rows of varying width, so groups end at every distance past the
+        // group size.
+        let value = alloc::vec![b'v'; 40 + (i as usize * 37) % 300];
+        writer.write(InternalValue::from_components(
+            alloc::format!("key{i:06}").into_bytes(),
+            value,
+            u64::from(i) + 1,
+            crate::ValueType::Value,
+        ))?;
+    }
+    let (_, checksum) = writer.finish()?.expect("written");
+    let table = Table::recover(test_recover_params(file, checksum))?;
+    let mut groups = 0;
+    for keyed in table.data_block_handles() {
+        let keyed = keyed?;
+        let pages = table.load_row_group(keyed.as_ref(), &PageWant::ALL, ReadCharge::Foreground)?;
+        assert_eq!(pages.batches.len(), 1, "group {groups} is one row page");
+        groups += 1;
+    }
+    assert!(groups > 50, "the fixture spans many groups, got {groups}");
+    Ok(())
+}
+
+/// Rows [`versioned_key_rows`] puts before the versioned key: enough to start
+/// its run on a row page after the first.
+#[cfg(feature = "columnar")]
+const ROWS_BEFORE_THE_KEY: u32 = 20;
+
+/// One key, `k`, with `versions` versions from seqno `versions` down to 1,
+/// after [`ROWS_BEFORE_THE_KEY`] keys `a00`.. and before a key `z`, in
+/// 100-byte values that name the version: `versions` large enough makes the
+/// run cross row pages.
+#[cfg(feature = "columnar")]
+fn versioned_key_rows(versions: u64) -> Vec<InternalValue> {
+    let value = |s: u64| {
+        let mut v = alloc::format!("k{s:04}").into_bytes();
+        v.resize(100, b'.');
+        v
+    };
+    let mut rows: Vec<_> = (0..ROWS_BEFORE_THE_KEY)
+        .map(|i| {
+            InternalValue::from_components(
+                alloc::format!("a{i:02}").into_bytes(),
+                value(0),
+                1,
+                crate::ValueType::Value,
+            )
+        })
+        .collect();
+    for s in (1..=versions).rev() {
+        rows.push(InternalValue::from_components(
+            b"k".to_vec(),
+            value(s),
+            s,
+            crate::ValueType::Value,
+        ));
+    }
+    rows.push(InternalValue::from_components(
+        b"z".to_vec(),
+        value(0),
+        1,
+        crate::ValueType::Value,
+    ));
+    rows
+}
+
+/// A key whose versions run across several row pages is read from every page
+/// that holds one: each snapshot sees the version it should, including those
+/// on the pages after the first. A point read that took only the first page
+/// holding the key would lose the older versions.
+#[cfg(feature = "columnar")]
+#[test]
+fn a_key_whose_versions_cross_row_pages_reads_every_version() -> crate::Result<()> {
+    use crate::table::row_group::PageWant;
+
+    let dir = tempdir()?;
+    let file = dir.path().join("table");
+    let mut writer = Writer::new(file.clone(), 0, 0, Arc::new(StdFs))?
+        .use_columnar(true)
+        .use_row_group_size(64 * 1_024)
+        .use_columnar_page_size(1_024);
+    for row in versioned_key_rows(40) {
+        writer.write(row)?;
+    }
+    let (_, checksum) = writer.finish()?.expect("written");
+    let group = first_row_group(&file, checksum)?;
+    let table = Table::recover(test_recover_params(file, checksum))?;
+    assert!(
+        table
+            .load_row_group(&group, &PageWant::ALL, ReadCharge::Foreground)?
+            .batches
+            .len()
+            >= 4,
+        "the fixture must spread the key's versions over row pages",
+    );
+
+    for s in 1..=40u64 {
+        let got = table
+            .get(b"k", s + 1, hash64(b"k"))?
+            .expect("every version is visible at its own snapshot");
+        assert_eq!(got.key.seqno, s, "snapshot {}", s + 1);
+        assert_eq!(&got.value[..5], alloc::format!("k{s:04}").as_bytes());
+    }
+    assert!(
+        table.get(b"k", 1, hash64(b"k"))?.is_none(),
+        "before version 1"
+    );
+    assert!(table.get(b"a00", SeqNo::MAX, hash64(b"a00"))?.is_some());
+    assert!(table.get(b"a19", SeqNo::MAX, hash64(b"a19"))?.is_some());
+    assert!(table.get(b"z", SeqNo::MAX, hash64(b"z"))?.is_some());
+    assert!(table.get(b"m", SeqNo::MAX, hash64(b"m"))?.is_none());
+    Ok(())
+}
+
+/// Positional deletes land on the right rows of every row page: a point read
+/// counts a page's positions from where the group starts, not from the page.
+/// The key's run starts on a later row page than the group's first, and
+/// masking its newest version (on the first page holding the key) and one on
+/// a later page shows both: each read skips exactly the masked row.
+#[cfg(feature = "columnar")]
+#[test]
+fn positional_deletes_mask_the_right_rows_on_every_row_page() -> crate::Result<()> {
+    use crate::config::DeleteStrategy;
+
+    let dir = tempdir()?;
+    let file = dir.path().join("table");
+    let mut writer = Writer::new(file.clone(), 0, 0, Arc::new(StdFs))?
+        .use_columnar(true)
+        .use_zone_map(true)
+        .use_row_group_size(64 * 1_024)
+        .use_columnar_page_size(1_024)
+        .delete_strategy(DeleteStrategy::MergeOnRead);
+    for row in versioned_key_rows(40) {
+        writer.write(row)?;
+    }
+    // The key's first row holds version 40, and 29 rows on version 11.
+    writer.delete_bitmap_mut().insert(ROWS_BEFORE_THE_KEY);
+    writer.delete_bitmap_mut().insert(ROWS_BEFORE_THE_KEY + 29);
+    let (_, checksum) = writer.finish()?.expect("written");
+    let group = first_row_group(&file, checksum)?;
+    let table = Table::recover(test_recover_params(file, checksum))?;
+    let first_key_page = table
+        .load_row_group(
+            &group,
+            &crate::table::row_group::PageWant::ALL,
+            ReadCharge::Foreground,
+        )?
+        .batches
+        .first()
+        .map(|page| page.row_count)
+        .expect("a row page");
+    assert!(
+        first_key_page <= ROWS_BEFORE_THE_KEY,
+        "the key's run must start past the group's first row page",
+    );
+
+    let newest = table
+        .get(b"k", SeqNo::MAX, hash64(b"k"))?
+        .expect("older versions survive");
+    assert_eq!(newest.key.seqno, 39, "version 40 is masked");
+    let below_masked = table
+        .get(b"k", 12, hash64(b"k"))?
+        .expect("older versions survive");
+    assert_eq!(below_masked.key.seqno, 10, "version 11 is masked");
+    let above_masked = table
+        .get(b"k", 13, hash64(b"k"))?
+        .expect("version 12 is live");
+    assert_eq!(above_masked.key.seqno, 12);
+
+    let scanned: Vec<_> = table.iter().collect::<crate::Result<_>>()?;
+    assert_eq!(
+        scanned.len(),
+        ROWS_BEFORE_THE_KEY as usize + 39,
+        "every row less the two masked",
+    );
+    assert!(
+        scanned
+            .iter()
+            .all(|r| r.key.seqno != 40 && r.key.seqno != 11 || &*r.key.user_key != b"k"),
+        "the scan masks the same rows",
+    );
+    Ok(())
+}
+
+/// A page moved to another row page's place in the same group, with its bytes
+/// intact, is refused: each page's stamp names its row page, so a page that
+/// verifies as a block still cannot stand in for another.
+#[cfg(feature = "columnar")]
+#[test]
+fn a_page_swapped_with_another_row_page_is_refused() -> crate::Result<()> {
+    use crate::coding::Decode;
+    use crate::table::block::Header;
+    use crate::table::columnar::COL_SEQNO;
+    use crate::table::row_group::PageWant;
+
+    let dir = tempdir()?;
+    let file = dir.path().join("table");
+    // Fixed-width seqno pages of equal row counts are equal in length.
+    let checksum = columnar_table_file_paged(&file, 400, 16, 100, 64 * 1_024, 1_024)?;
+    let group = first_row_group(&file, checksum)?;
+
+    let mut bytes = std::fs::read(&file)?;
+    let at = usize::try_from(*group.offset()).expect("offset fits");
+    let (directory, directory_len) = {
+        let frame = bytes.get(at..).expect("group within the file");
+        let header = Header::decode_from(&mut &frame[..])?;
+        let payload_at = Header::header_len(header.block_type);
+        let payload = frame
+            .get(payload_at..payload_at + header.data_length as usize)
+            .expect("directory payload");
+        (
+            crate::table::column_page::PageDirectory::decode(payload)?,
+            header.on_disk_size_with(None) as usize,
+        )
+    };
+    let seqno_pages: Vec<_> = directory
+        .entries()
+        .iter()
+        .filter(|e| e.id.column_id == COL_SEQNO)
+        .collect();
+    let (first, second) = seqno_pages
+        .iter()
+        .zip(seqno_pages.iter().skip(1))
+        .find(|(a, b)| a.length == b.length)
+        .expect("two seqno pages of one length");
+    let extent = |e: &crate::table::column_page::PageEntry| {
+        let start = at + directory_len + e.offset as usize;
+        start..start + e.length as usize
+    };
+    let first_bytes = bytes.get(extent(first)).expect("page").to_vec();
+    let second_bytes = bytes.get(extent(second)).expect("page").to_vec();
+    assert_ne!(first_bytes, second_bytes, "the two pages hold other rows");
+    bytes
+        .get_mut(extent(first))
+        .expect("page")
+        .copy_from_slice(&second_bytes);
+    bytes
+        .get_mut(extent(second))
+        .expect("page")
+        .copy_from_slice(&first_bytes);
+    std::fs::write(&file, &bytes)?;
+
+    let table = Table::recover(test_recover_params(file, checksum))?;
+    let err = table
+        .load_row_group(&group, &PageWant::ALL, ReadCharge::Foreground)
+        .expect_err("a page in another row page's place must be refused");
+    assert!(
+        matches!(err, crate::Error::InvalidHeader(_)),
+        "expected a stamp refusal, got {err:?}",
+    );
+    Ok(())
+}
+
+/// A read that meets a page in another page's place fails and leaves nothing
+/// of it in the cache: once the right bytes are back (a transient misread,
+/// a repaired sector), the same read is served. A page cached before its
+/// stamp was checked would keep failing every read of the group until it was
+/// evicted, though nothing on disk was wrong any more.
+#[cfg(feature = "columnar")]
+#[test]
+fn a_page_refused_by_its_stamp_is_not_cached() -> crate::Result<()> {
+    use crate::coding::Decode;
+    use crate::table::block::Header;
+    use crate::table::columnar::COL_SEQNO;
+    use crate::table::row_group::PageWant;
+
+    let dir = tempdir()?;
+    let file = dir.path().join("table");
+    let checksum = columnar_table_file_paged(&file, 400, 16, 100, 64 * 1_024, 1_024)?;
+    let group = first_row_group(&file, checksum)?;
+
+    let original = std::fs::read(&file)?;
+    let mut bytes = original.clone();
+    let at = usize::try_from(*group.offset()).expect("offset fits");
+    let (directory, directory_len) = {
+        let frame = bytes.get(at..).expect("group within the file");
+        let header = Header::decode_from(&mut &frame[..])?;
+        let payload_at = Header::header_len(header.block_type);
+        let payload = frame
+            .get(payload_at..payload_at + header.data_length as usize)
+            .expect("directory payload");
+        (
+            crate::table::column_page::PageDirectory::decode(payload)?,
+            header.on_disk_size_with(None) as usize,
+        )
+    };
+    let seqno_pages: Vec<_> = directory
+        .entries()
+        .iter()
+        .filter(|e| e.id.column_id == COL_SEQNO)
+        .collect();
+    let (first, second) = seqno_pages
+        .iter()
+        .zip(seqno_pages.iter().skip(1))
+        .find(|(a, b)| a.length == b.length)
+        .expect("two seqno pages of one length");
+    let extent = |e: &crate::table::column_page::PageEntry| {
+        let start = at + directory_len + e.offset as usize;
+        start..start + e.length as usize
+    };
+    let first_bytes = bytes.get(extent(first)).expect("page").to_vec();
+    let second_bytes = bytes.get(extent(second)).expect("page").to_vec();
+    bytes
+        .get_mut(extent(first))
+        .expect("page")
+        .copy_from_slice(&second_bytes);
+    bytes
+        .get_mut(extent(second))
+        .expect("page")
+        .copy_from_slice(&first_bytes);
+    std::fs::write(&file, &bytes)?;
+
+    let table = Table::recover(test_recover_params(file.clone(), checksum))?;
+    assert!(
+        table
+            .load_row_group(&group, &PageWant::ALL, ReadCharge::Foreground)
+            .is_err(),
+        "a page in another row page's place is refused",
+    );
+
+    std::fs::write(&file, &original)?;
+    let pages = table.load_row_group(&group, &PageWant::ALL, ReadCharge::Foreground)?;
+    assert_eq!(
+        pages.group_rows,
+        pages.row_count(),
+        "with the right bytes back the same read is served whole",
+    );
+    Ok(())
+}
+
+/// A row group's blocks, as verification, salvage and scrub enumerate them,
+/// are refused when the directory does not carry the tag the index entry
+/// names: another group's directory in this group's place would otherwise be
+/// certified, or copied, as this group's.
+#[cfg(feature = "columnar")]
+#[test]
+fn a_row_groups_blocks_are_refused_under_another_groups_tag() -> crate::Result<()> {
+    let dir = tempdir()?;
+    let file = dir.path().join("table");
+    let checksum = columnar_table_file_paged(&file, 400, 16, 100, 16 * 1_024, 1_024)?;
+    let group = first_row_group(&file, checksum)?;
+    let table = Table::recover(test_recover_params(file, checksum))?;
+    assert!(
+        table.data_unit_blocks(&group).is_ok(),
+        "the group under its own tag"
+    );
+
+    let Some(tag) = group.group_tag() else {
+        panic!("a columnar index entry names its group");
+    };
+    let other = group.with_group_tag(tag.checked_add(1));
+    let refused = table.data_unit_blocks(&other);
+    assert!(
+        refused.is_err(),
+        "the group's blocks under another tag must be refused, got {refused:?}",
+    );
+    Ok(())
+}
+
+/// A scan that meets two row groups swapped whole, directory and pages
+/// together, is refused. Each group is consistent in itself, so its checksums
+/// and its pages' stamps pass; only the index knows which group belongs where,
+/// and a scan streams the data without it, so it would hand compaction the
+/// second group's rows before the first's.
+#[cfg(feature = "columnar")]
+#[test]
+fn a_scan_refuses_row_groups_swapped_whole() -> crate::Result<()> {
+    let dir = tempdir()?;
+    let file = dir.path().join("table");
+    let checksum = columnar_table_file_paged(&file, 400, 16, 100, 16 * 1_024, 1_024)?;
+    let (first, second) = {
+        let table = Table::recover(test_recover_params(file.clone(), checksum))?;
+        let mut groups = table.data_block_handles();
+        let (Some(first), Some(second)) = (groups.next(), groups.next()) else {
+            panic!("the table has two row groups");
+        };
+        (*first?.as_ref(), *second?.as_ref())
+    };
+    assert_eq!(
+        first.size(),
+        second.size(),
+        "the two groups are of one shape"
+    );
+
+    let mut bytes = std::fs::read(&file)?;
+    let extent = |group: &BlockHandle| {
+        let at = usize::try_from(*group.offset()).expect("offset fits");
+        at..at + group.size() as usize
+    };
+    let first_bytes = bytes.get(extent(&first)).expect("group").to_vec();
+    let second_bytes = bytes.get(extent(&second)).expect("group").to_vec();
+    bytes
+        .get_mut(extent(&first))
+        .expect("group")
+        .copy_from_slice(&second_bytes);
+    bytes
+        .get_mut(extent(&second))
+        .expect("group")
+        .copy_from_slice(&first_bytes);
+    std::fs::write(&file, &bytes)?;
+
+    let table = Table::recover(test_recover_params(file, checksum))?;
+    let scanned = table
+        .scan()
+        .and_then(Iterator::collect::<crate::Result<Vec<_>>>);
+    assert!(
+        scanned.is_err(),
+        "a scan over swapped row groups must be refused, got {} rows",
+        scanned.map_or(0, |rows| rows.len()),
+    );
+    Ok(())
+}
+
+/// Writes the second row group's directory over the first's, the two being of
+/// one shape, and returns the first group's handle from the index with the
+/// file's original bytes.
+#[cfg(feature = "columnar")]
+fn second_groups_directory_in_the_first(
+    file: &std::path::Path,
+    checksum: Checksum,
+) -> crate::Result<(BlockHandle, Vec<u8>)> {
+    use crate::coding::Decode;
+    use crate::table::block::Header;
+
+    let (first, second) = {
+        let table = Table::recover(test_recover_params(file.to_path_buf(), checksum))?;
+        let mut groups = table.data_block_handles();
+        let (Some(first), Some(second)) = (groups.next(), groups.next()) else {
+            panic!("the table has two row groups");
+        };
+        (*first?.as_ref(), *second?.as_ref())
+    };
+    assert_eq!(
+        first.size(),
+        second.size(),
+        "the two groups are of one shape"
+    );
+
+    let original = std::fs::read(file)?;
+    let mut bytes = original.clone();
+    let directory_at = |group: &BlockHandle| -> crate::Result<core::ops::Range<usize>> {
+        let at = usize::try_from(*group.offset()).expect("offset fits");
+        let frame = original.get(at..).expect("group within the file");
+        let len = Header::decode_from(&mut &frame[..])?.on_disk_size_with(None) as usize;
+        Ok(at..at + len)
+    };
+    let (into, from) = (directory_at(&first)?, directory_at(&second)?);
+    assert_eq!(
+        into.len(),
+        from.len(),
+        "the two directories are of one length"
+    );
+    let foreign = original.get(from).expect("directory").to_vec();
+    bytes
+        .get_mut(into)
+        .expect("directory")
+        .copy_from_slice(&foreign);
+    std::fs::write(file, &bytes)?;
+    Ok((first, original))
+}
+
+/// A point read that meets another group's directory in this group's place
+/// is refused, though the foreign directory's key zones prune every row page
+/// and so no page stamp is checked. Taking the directory on its word answered
+/// that the key is absent.
+#[cfg(feature = "columnar")]
+#[test]
+fn a_point_read_refuses_another_groups_directory_whose_zones_prune_every_page() -> crate::Result<()>
+{
+    let dir = tempdir()?;
+    let file = dir.path().join("table");
+    let checksum = columnar_table_file_paged(&file, 400, 16, 100, 16 * 1_024, 1_024)?;
+    let (_, original) = second_groups_directory_in_the_first(&file, checksum)?;
+
+    let mut key = b"key000000".to_vec();
+    key.resize(16, b'k');
+    let table = Table::recover(test_recover_params(file.clone(), checksum))?;
+    let got = table.get(&key, crate::MAX_SEQNO, crate::hash::hash64(&key));
+    assert!(
+        got.is_err(),
+        "a key of the first group, read through the second's directory, got {got:?}",
+    );
+
+    std::fs::write(&file, &original)?;
+    let got = table.get(&key, crate::MAX_SEQNO, crate::hash::hash64(&key))?;
+    assert!(got.is_some(), "with the right bytes back the key is found");
+    Ok(())
+}
+
+/// A read that meets another group's directory in this group's place fails on
+/// the first page and leaves the directory out of the cache: once the right
+/// bytes are back, the same read is served. A directory cached before the
+/// pages were checked against it would refuse every healthy page of the group
+/// until it was evicted.
+#[cfg(feature = "columnar")]
+#[test]
+fn a_directory_refused_by_its_pages_is_not_cached() -> crate::Result<()> {
+    use crate::table::row_group::PageWant;
+
+    let dir = tempdir()?;
+    let file = dir.path().join("table");
+    let checksum = columnar_table_file_paged(&file, 400, 16, 100, 16 * 1_024, 1_024)?;
+    let (first, original) = second_groups_directory_in_the_first(&file, checksum)?;
+
+    let table = Table::recover(test_recover_params(file.clone(), checksum))?;
+    assert!(
+        table
+            .load_row_group(&first, &PageWant::ALL, ReadCharge::Foreground)
+            .is_err(),
+        "another group's directory is refused by this group's pages",
+    );
+
+    std::fs::write(&file, &original)?;
+    let pages = table.load_row_group(&first, &PageWant::ALL, ReadCharge::Foreground)?;
+    assert_eq!(
+        pages.group_rows,
+        pages.row_count(),
+        "with the right bytes back the same read is served whole",
+    );
+    Ok(())
+}
+
+/// Row `i`'s key in [`zoned_table_file`].
+#[cfg(feature = "columnar")]
+fn zoned_key(i: u32) -> Vec<u8> {
+    alloc::format!("key{i:06}").into_bytes()
+}
+
+/// Row `i`'s value in [`zoned_table_file`]: distinct, ascending with the key,
+/// 100 bytes.
+#[cfg(feature = "columnar")]
+fn zoned_value(i: u32) -> Vec<u8> {
+    let mut value = alloc::format!("val{i:06}").into_bytes();
+    value.resize(100, b'v');
+    value
+}
+
+/// A columnar table of `rows` rows in 64 KiB groups of 1 KiB row pages, so
+/// each group carries statistics zones: the key column's in its directory,
+/// the value column's in its zone block. `deletes` are positional deletes.
+#[cfg(feature = "columnar")]
+fn zoned_table_file(file: &std::path::Path, rows: u32, deletes: &[u32]) -> crate::Result<Checksum> {
+    use crate::config::DeleteStrategy;
+
+    let mut writer = Writer::new(file.to_path_buf(), 0, 0, Arc::new(StdFs))?
+        .use_columnar(true)
+        .use_zone_map(true)
+        .use_row_group_size(64 * 1_024)
+        .use_columnar_page_size(1_024)
+        .delete_strategy(DeleteStrategy::MergeOnRead);
+    for i in 0..rows {
+        writer.write(InternalValue::from_components(
+            zoned_key(i),
+            zoned_value(i),
+            u64::from(i) + 1,
+            crate::ValueType::Value,
+        ))?;
+    }
+    for &pos in deletes {
+        writer.delete_bitmap_mut().insert(pos);
+    }
+    let (_, checksum) = writer.finish()?.expect("written");
+    Ok(checksum)
+}
+
+/// A read that fails on one page fails exactly the reads that need that page,
+/// plain, encrypted and under Page-ECC alike: a point read of a key on another
+/// row page and a projection that skips the value column are served, the key
+/// whose value lives on the page gets the error rather than a miss or another
+/// row's value, and once the fault clears the same read is served, so the
+/// failure left nothing behind in the cache.
+#[cfg(feature = "columnar")]
+#[test]
+fn a_failed_page_read_fails_only_the_reads_that_need_the_page() -> crate::Result<()> {
+    use crate::encryption::EncryptionProvider;
+    use crate::fs::{Fault, FaultFs, FaultOp, FaultRule};
+    use crate::io::ErrorKind;
+    use crate::table::columnar::{COL_USER_KEY, COL_VALUE};
+    use crate::table::row_group::{PageWant, RowPageSelect};
+
+    type Variant = (
+        &'static str,
+        Option<Arc<dyn EncryptionProvider>>,
+        fn(Writer) -> Writer,
+    );
+    #[cfg_attr(
+        not(any(feature = "encryption", feature = "page_ecc")),
+        expect(unused_mut, reason = "the other variants are feature-gated")
+    )]
+    let mut variants: Vec<Variant> = alloc::vec![("plain", None, |w| w)];
+    #[cfg(feature = "encryption")]
+    variants.push((
+        "encrypted",
+        Some(Arc::new(crate::encryption::Aes256GcmProvider::new(
+            &[7u8; 32],
+        ))),
+        |w| w,
+    ));
+    #[cfg(feature = "page_ecc")]
+    variants.push(("page-ecc", None, |w| {
+        w.use_page_ecc(
+            true,
+            crate::runtime_config::EccScheme::ReedSolomon {
+                data_shards: 4,
+                parity_shards: 2,
+            },
+        )
+    }));
+
+    for (label, encryption, configure) in variants {
+        let dir = tempdir()?;
+        let file = dir.path().join("table");
+        let writer = Writer::new(file.clone(), 0, 0, Arc::new(StdFs))?
+            .use_encryption(encryption.clone())
+            .use_columnar(true)
+            .use_zone_map(true)
+            .use_row_group_size(64 * 1_024)
+            .use_columnar_page_size(1_024);
+        let mut writer = configure(writer);
+        for i in 0..400 {
+            writer.write(InternalValue::from_components(
+                zoned_key(i),
+                zoned_value(i),
+                u64::from(i) + 1,
+                crate::ValueType::Value,
+            ))?;
+        }
+        let (_, checksum) = writer.finish()?.expect("written");
+        let open = |fs: Arc<dyn crate::fs::Fs>| {
+            let mut params = test_recover_params(file.clone(), checksum);
+            params.fs = fs;
+            params.encryption = encryption.clone();
+            Table::recover(params)
+        };
+
+        // Learn the geometry from a clean table: the group, the rows each
+        // row page starts at, and where the value page of row page 2 sits.
+        let (group, starts, victim_at) = {
+            let table = open(Arc::new(StdFs))?;
+            let Some(Ok(group)) = table.data_block_handles().next() else {
+                panic!("{label}: the table has a row group");
+            };
+            let group = group.into_inner();
+            let pages = table.load_row_group(&group, &PageWant::ALL, ReadCharge::Foreground)?;
+            let Some((directory, directory_len)) =
+                table
+                    .cache
+                    .get_directory(table.global_id(), group.offset(), false)
+            else {
+                panic!("{label}: the read cached the directory");
+            };
+            let Some(victim) = directory
+                .entries()
+                .iter()
+                .find(|e| e.id.column_id == COL_VALUE && e.row_page == 2)
+            else {
+                panic!("{label}: the group has a value page on row page 2");
+            };
+            let victim_at = *group.offset() + u64::from(directory_len) + u64::from(victim.offset);
+            (group, pages.starts, victim_at)
+        };
+        assert!(starts.len() > 4, "{label}: the group has several row pages");
+        let Some((&victim_row, &other_row)) = starts.get(2).zip(starts.get(4)) else {
+            panic!("{label}: row pages 2 and 4 exist");
+        };
+
+        let fault = FaultFs::new(StdFs);
+        let injector = fault.injector();
+        injector.arm(
+            FaultRule::new(FaultOp::ReadAt, Fault::Error(ErrorKind::Other)).at_offset(victim_at),
+        );
+        let table = open(Arc::new(fault))?;
+        let get = |i: u32| {
+            let key = zoned_key(i);
+            table.get(&key, crate::MAX_SEQNO, crate::hash::hash64(&key))
+        };
+
+        let Some(other) = get(other_row)? else {
+            panic!("{label}: a key on another row page is found");
+        };
+        assert_eq!(
+            &*other.value,
+            zoned_value(other_row).as_slice(),
+            "{label}: a key on another row page reads its own value",
+        );
+        let keys_only = table.load_row_group(
+            &group,
+            &PageWant::projected(&[COL_USER_KEY], RowPageSelect::All),
+            ReadCharge::Foreground,
+        )?;
+        assert_eq!(
+            keys_only.into_batch()?.row_count,
+            400,
+            "{label}: a projection that skips the value column reads every key",
+        );
+        let refused = get(victim_row);
+        assert!(
+            matches!(&refused, Err(crate::Error::Io(e)) if e.kind() == ErrorKind::Other),
+            "{label}: the key whose value page fails to read gets the error, got {refused:?}",
+        );
+
+        injector.clear();
+        let Some(healed) = get(victim_row)? else {
+            panic!("{label}: the key is found once the page reads again");
+        };
+        assert_eq!(
+            &*healed.value,
+            zoned_value(victim_row).as_slice(),
+            "{label}: the failed read left nothing behind",
+        );
+    }
+    Ok(())
+}
+
+/// A read of a group caches its directory decoded, not as the block it was
+/// read as: the next read of the group takes the decoded directory from the
+/// cache instead of parsing and checking a directory of dozens of entries
+/// again, which a point read would otherwise do twice per lookup. The pages
+/// are cached as blocks, and a read that must leave the cache as it found it
+/// caches nothing.
+#[cfg(feature = "columnar")]
+#[test]
+fn a_group_read_caches_its_directory_decoded() -> crate::Result<()> {
+    use crate::table::row_group::PageWant;
+
+    let dir = tempdir()?;
+    let file = dir.path().join("table");
+    let checksum = zoned_table_file(&file, 400, &[])?;
+    let group = first_row_group(&file, checksum)?;
+
+    let table = Table::recover(test_recover_params(file, checksum))?;
+    table.load_row_group(&group, &PageWant::ALL, ReadCharge::Untraced)?;
+    assert!(
+        table
+            .cache
+            .get_directory(table.global_id(), group.offset(), false)
+            .is_none(),
+        "an untraced read caches no directory",
+    );
+
+    table.load_row_group(&group, &PageWant::ALL, ReadCharge::Foreground)?;
+    let (cached, _) = table
+        .cache
+        .get_directory(table.global_id(), group.offset(), false)
+        .expect("the read cached the directory");
+    assert!(
+        !table.cache.has_block(table.global_id(), group.offset()),
+        "the directory is cached decoded, not as a raw block",
+    );
+    let pages = table.load_row_group(&group, &PageWant::ALL, ReadCharge::Foreground)?;
+    assert_eq!(
+        pages.group_rows,
+        cached.row_count(),
+        "a later read uses the cached directory",
+    );
+    Ok(())
+}
+
+/// A zone block moved into another group's place, its bytes intact, is
+/// refused: the block names the group it describes, as every page does.
+/// Without that, two groups' zone blocks of one length trade places, still
+/// verify as blocks, and a predicate scan prunes a group's row pages by the
+/// other group's bounds, silently dropping rows that match.
+#[cfg(feature = "columnar")]
+#[test]
+fn a_zone_block_moved_to_another_group_is_refused() -> crate::Result<()> {
+    use crate::table::columnar::{COL_USER_KEY, COL_VALUE};
+    use crate::table::columnar_predicate::ColumnRangePredicate;
+
+    let dir = tempdir()?;
+    let file = dir.path().join("table");
+    let checksum = zoned_table_file(&file, 1_500, &[])?;
+    let table = Table::recover(test_recover_params(file.clone(), checksum))?;
+    let groups: Vec<BlockHandle> = table
+        .data_block_handles()
+        .map(|handle| handle.map(KeyedBlockHandle::into_inner))
+        .collect::<crate::Result<_>>()?;
+    let zone_block = |group: &BlockHandle| -> crate::Result<BlockHandle> {
+        let blocks = table.data_unit_blocks(group)?;
+        let Some(&(block, BlockType::ColumnZones)) = blocks.last() else {
+            panic!("a group of several row pages ends in its zone block");
+        };
+        Ok(block)
+    };
+    let (Some(first), Some(second)) = (groups.first(), groups.get(1)) else {
+        panic!("the fixture spans several groups");
+    };
+    let (a, b) = (zone_block(first)?, zone_block(second)?);
+    assert_eq!(a.size(), b.size(), "the two zone blocks are of one length");
+    drop(table);
+
+    let mut bytes = std::fs::read(&file)?;
+    let extent = |h: &BlockHandle| {
+        let start = usize::try_from(*h.offset()).expect("offset fits");
+        start..start + h.size() as usize
+    };
+    let a_bytes = bytes.get(extent(&a)).expect("zone block").to_vec();
+    let b_bytes = bytes.get(extent(&b)).expect("zone block").to_vec();
+    assert_ne!(a_bytes, b_bytes, "the two groups hold other values");
+    bytes
+        .get_mut(extent(&a))
+        .expect("zone block")
+        .copy_from_slice(&b_bytes);
+    bytes
+        .get_mut(extent(&b))
+        .expect("zone block")
+        .copy_from_slice(&a_bytes);
+    std::fs::write(&file, &bytes)?;
+
+    // A value of the first group, which its moved-in zones do not cover.
+    let table = Table::recover(test_recover_params(file, checksum))?;
+    let predicate = ColumnRangePredicate {
+        column_id: COL_VALUE,
+        lower: Some(zoned_value(10)),
+        upper: Some(zoned_value(10)),
+    };
+    let result = table.columnar_scan(&[COL_USER_KEY, COL_VALUE], Some(&predicate));
+    assert!(
+        matches!(result, Err(crate::Error::InvalidHeader(_))),
+        "a zone block of another group must be refused, got {:?}",
+        result.map(|batches| batches.iter().map(|b| b.row_count).sum::<u32>()),
+    );
+    Ok(())
+}
+
+/// Patrol scrub walks every block of a group, the zone block included: a clean
+/// table scrubs clean with the zone block counted, and damage inside the zone
+/// block is reported rather than passed over, since a read that prunes by it
+/// would otherwise trust bytes nothing checked.
+#[cfg(feature = "columnar")]
+#[test]
+fn patrol_scrub_checks_a_groups_zone_block() -> crate::Result<()> {
+    let dir = tempdir()?;
+    let file = dir.path().join("table");
+    let checksum = zoned_table_file(&file, 400, &[])?;
+    let group = first_row_group(&file, checksum)?;
+    let table = Table::recover(test_recover_params(file.clone(), checksum))?;
+    let blocks = table.data_unit_blocks(&group)?;
+    let Some(&(zone_block, role)) = blocks.last() else {
+        panic!("a group has blocks");
+    };
+    assert_eq!(
+        role,
+        BlockType::ColumnZones,
+        "the group ends in its zone block"
+    );
+
+    let clean = table.scrub_data_blocks();
+    assert_eq!(clean.uncorrectable_blocks, 0, "a clean table scrubs clean");
+    assert!(
+        clean.blocks_scanned >= blocks.len(),
+        "every block of the group is scanned, the zone block included",
+    );
+    drop(table);
+
+    let mut bytes = std::fs::read(&file)?;
+    let at = usize::try_from(*zone_block.offset()).expect("offset fits")
+        + zone_block.size() as usize
+        - 1;
+    *bytes.get_mut(at).expect("byte within the zone block") ^= 0x40;
+    std::fs::write(&file, &bytes)?;
+    let table = Table::recover(test_recover_params(file, checksum))?;
+    let damaged = table.scrub_data_blocks();
+    assert_eq!(
+        damaged.uncorrectable_blocks, 1,
+        "the damaged zone block is reported: {damaged:?}",
+    );
+    Ok(())
+}
+
+/// A predicate scan prunes row pages by their zones, on the key column from
+/// the directory and on the value column from the zone block, and returns
+/// exactly what filtering every row returns. Positional deletes land on the
+/// right rows though the pages before them were never read: a page's rows
+/// are counted from the group's start, not from the pages the scan read.
+#[cfg(feature = "columnar")]
+#[test]
+fn a_predicate_scan_over_row_pages_returns_what_filtering_every_row_returns() -> crate::Result<()> {
+    use crate::table::columnar::{COL_USER_KEY, COL_VALUE, bytes_column_row};
+    use crate::table::columnar_predicate::ColumnRangePredicate;
+
+    const ROWS: u32 = 400;
+    const DELETES: [u32; 3] = [150, 151, 205];
+    let dir = tempdir()?;
+    let file = dir.path().join("table");
+    let checksum = zoned_table_file(&file, ROWS, &DELETES)?;
+    let table = Table::recover(test_recover_params(file, checksum))?;
+
+    let cases = [
+        (COL_USER_KEY, zoned_key(140), zoned_key(160)),
+        (COL_VALUE, zoned_value(200), zoned_value(209)),
+        (COL_USER_KEY, zoned_key(0), zoned_key(0)),
+        (COL_VALUE, zoned_value(ROWS - 1), zoned_value(ROWS - 1)),
+        (COL_USER_KEY, zoned_key(ROWS), zoned_key(ROWS + 10)),
+    ];
+    for (column_id, lower, upper) in cases {
+        let predicate = ColumnRangePredicate {
+            column_id,
+            lower: Some(lower.clone()),
+            upper: Some(upper.clone()),
+        };
+        let mut got = Vec::new();
+        for batch in table.columnar_scan(&[COL_USER_KEY, COL_VALUE], Some(&predicate))? {
+            let keys = batch
+                .columns
+                .iter()
+                .find(|c| c.column_id == COL_USER_KEY)
+                .expect("the key column");
+            for row in 0..batch.row_count {
+                got.push(bytes_column_row(&keys.data, batch.row_count, row)?.to_vec());
+            }
+        }
+        let expected: Vec<Vec<u8>> = (0..ROWS)
+            .filter(|i| !DELETES.contains(i))
+            .filter(|&i| {
+                let cell = if column_id == COL_USER_KEY {
+                    zoned_key(i)
+                } else {
+                    zoned_value(i)
+                };
+                lower <= cell && cell <= upper
+            })
+            .map(zoned_key)
+            .collect();
+        assert_eq!(
+            got, expected,
+            "column {column_id} in {lower:?}..={upper:?} returns what a filter of every row does",
+        );
+    }
     Ok(())
 }

@@ -1,18 +1,18 @@
 // SPDX-License-Identifier: Apache-2.0
 // Copyright (c) 2026-present, Dmitry Prudnikov
 
-//! Columnar (PAX / rowgroup) block format and the [`ColumnBatch`] read unit.
+//! Columnar (PAX / rowgroup) column format and the [`ColumnBatch`] read unit.
 //!
-//! A columnar block holds a row-group laid out column-by-column: each column is
-//! an opaque, typed, codec-tagged byte array plus an optional validity bitmap.
-//! The engine attaches no relational or graph meaning to a column; it knows
-//! only the physical [`TypeTag`], the [`CodecId`] used to encode the bytes, and
-//! a caller-assigned `column_id`. This is the payload of a
-//! [`BlockType::Columnar`](crate::table::block::BlockType::Columnar) block. The
-//! intrinsic-field transpose ([`entries_to_column_batch`] and back), the
-//! encode, and the decode path are all `core` + `alloc` and live here; wiring
-//! the transpose into the flush / compaction writer is std-only and lands
-//! separately.
+//! A row group is laid out column-by-column: each column is an opaque, typed,
+//! codec-tagged byte array plus an optional validity bitmap. The engine
+//! attaches no relational or graph meaning to a column; it knows only the
+//! physical [`TypeTag`], the [`CodecId`] used to encode the bytes, and a
+//! caller-assigned `column_id`. On disk each column is its own
+//! [`BlockType::ColumnPage`](crate::table::block::BlockType::ColumnPage),
+//! found through the group's page directory. The intrinsic-field transpose
+//! ([`entries_to_column_batch`] and back), the encode, and the decode path are
+//! all `core` + `alloc` and live here; wiring the transpose into the flush /
+//! compaction writer is std-only and lands separately.
 //!
 //! # Examples
 //!
@@ -256,8 +256,8 @@ pub struct Column {
     pub data: crate::Slice,
 }
 
-/// A decoded columnar row-group: the read unit obtained by decoding a
-/// [`BlockType::Columnar`](crate::table::block::BlockType::Columnar) block.
+/// A decoded columnar row-group: the read unit obtained by decoding a row
+/// group's [`BlockType::ColumnPage`](crate::table::block::BlockType::ColumnPage)s.
 #[derive(Clone, Debug, Eq, PartialEq)]
 pub struct ColumnBatch {
     /// Number of rows every column in the batch describes.
@@ -376,9 +376,314 @@ impl Column {
         }
         Ok(())
     }
+
+    /// Appends this column's wire form to `out`: its header, validity and data,
+    /// under a type-directed codec where one applies and `default_codec`
+    /// otherwise.
+    ///
+    /// This is the unit a column page carries, and the unit
+    /// [`ColumnBatch::encode`] concatenates, so the two cannot drift apart.
+    #[expect(
+        clippy::cast_possible_truncation,
+        reason = "a column's data length is bounded by the block size policy, far below u32::MAX"
+    )]
+    fn encode_into(&self, row_count: u32, default_codec: CodecId, out: &mut Vec<u8>) -> Result<()> {
+        self.validate(row_count)?;
+        // Pick a type-directed codec (e.g. Delta on the seqno column),
+        // falling back to the caller's default; record it per column.
+        let codec = auto_codec(self.column_id, self.type_tag).unwrap_or(default_codec);
+        // Plain is the identity, so its data is written straight from the
+        // column rather than through a copy that would only be copied again.
+        let recoded = match codec {
+            CodecId::Plain => None,
+            CodecId::Delta => Some(codec_encode(codec, self.type_tag, &self.data)?),
+        };
+        let data: &[u8] = recoded.as_deref().unwrap_or(&self.data);
+        let (type_tag, width) = self.type_tag.to_wire();
+        out.extend_from_slice(&self.column_id.to_le_bytes());
+        out.push(type_tag);
+        out.push(width);
+        out.push(codec.into());
+        out.push(u8::from(self.validity.is_some()));
+        out.extend_from_slice(&(data.len() as u32).to_le_bytes());
+        if let Some(v) = &self.validity {
+            out.extend_from_slice(v);
+        }
+        out.extend_from_slice(data);
+        Ok(())
+    }
+
+    /// The null count of rows `start..end` of this `Bytes` column of
+    /// `row_count` rows, and the byte-wise range of their non-null values
+    /// (`None` when every one is null): what a row page's statistics zone
+    /// records, before its bounds are cut.
+    ///
+    /// # Errors
+    ///
+    /// Returns [`Error::InvalidHeader`] when the column is not a `Bytes`
+    /// column, `start..end` is not within `row_count`, or a row's framing is
+    /// malformed.
+    pub(crate) fn bytes_range(
+        &self,
+        row_count: u32,
+        start: u32,
+        end: u32,
+    ) -> Result<NullsAndRange<'_>> {
+        if self.type_tag != TypeTag::Bytes {
+            return Err(Error::InvalidHeader(
+                "columnar: a zone describes a bytes column",
+            ));
+        }
+        if start > end || end > row_count {
+            return Err(Error::InvalidHeader(
+                "columnar: row range outside the column",
+            ));
+        }
+        let mut nulls = 0u32;
+        let mut range: Option<(&[u8], &[u8])> = None;
+        for row in start..end {
+            if !column_row_valid(self, row) {
+                nulls += 1;
+                continue;
+            }
+            let value = bytes_column_row(&self.data, row_count, row)?;
+            range = Some(match range {
+                None => (value, value),
+                Some((min, max)) => (min.min(value), max.max(value)),
+            });
+        }
+        Ok((nulls, range))
+    }
+
+    /// Rows `start..end` of this column of `row_count` rows, as a column of
+    /// their own: the unit one row page of the column holds.
+    ///
+    /// A fixed-width column's rows are a view of its data; a `Bytes` column's
+    /// are re-framed under offsets that start at zero, and the validity bitmap
+    /// is re-packed from bit `start`. The write path builds these, once per
+    /// page it writes.
+    ///
+    /// # Errors
+    ///
+    /// Returns [`Error::InvalidHeader`] when `start..end` is not within
+    /// `row_count`, or when the column is malformed for `row_count`.
+    pub(crate) fn rows(&self, row_count: u32, start: u32, end: u32) -> Result<Self> {
+        if start > end || end > row_count {
+            return Err(Error::InvalidHeader(
+                "columnar: row range outside the column",
+            ));
+        }
+        let data = match self.type_tag {
+            TypeTag::Fixed(w) => {
+                let w = usize::from(w);
+                let (from, to) = (start as usize * w, end as usize * w);
+                if to > self.data.len() {
+                    return Err(Error::InvalidHeader(
+                        "columnar: fixed column shorter than its rows",
+                    ));
+                }
+                self.data.slice(from..to)
+            }
+            TypeTag::Bytes => {
+                let cells = || (start..end).map(|i| bytes_column_row(&self.data, row_count, i));
+                // Checked once, so the framing below can take the cells as
+                // they are.
+                for cell in cells() {
+                    cell?;
+                }
+                frame_bytes_column((end - start) as usize, || {
+                    cells().map(Result::unwrap_or_default)
+                })?
+            }
+        };
+        let validity = self.validity.as_deref().map(|v| {
+            let rows = end - start;
+            let mut out = alloc::vec![0u8; validity_len(rows)];
+            for i in 0..rows {
+                if validity_bit(v, start + i)
+                    && let Some(byte) = out.get_mut((i / 8) as usize)
+                {
+                    *byte |= 1u8 << (i % 8);
+                }
+            }
+            out
+        });
+        Ok(Self {
+            column_id: self.column_id,
+            type_tag: self.type_tag,
+            validity,
+            data,
+        })
+    }
+
+    /// The payload of this column's page: `stamp`, then the column's wire form.
+    ///
+    /// # Errors
+    ///
+    /// As [`ColumnBatch::encode`], for this one column.
+    pub(crate) fn encode_page(
+        &self,
+        row_count: u32,
+        default_codec: CodecId,
+        stamp: crate::table::column_page::PageStamp,
+    ) -> Result<Vec<u8>> {
+        let mut out = Vec::new();
+        stamp.encode_into(&mut out);
+        self.encode_into(row_count, default_codec, &mut out)?;
+        Ok(out)
+    }
+
+    /// Decodes a column page's payload for a group of `row_count` rows,
+    /// refusing it unless it carries `expected` as its stamp.
+    ///
+    /// A `Plain` column comes back as a zero-copy view of `bytes`, which here
+    /// is the page's own payload rather than a whole row group's, so holding
+    /// the column keeps exactly its own page alive and nothing else.
+    ///
+    /// # Errors
+    ///
+    /// Returns [`Error::InvalidHeader`] for a stamp other than `expected`, for
+    /// a malformed column, or for bytes left over after it: a page holds one
+    /// column, and a tail means either a writer this build does not understand
+    /// or a corruption.
+    ///
+    /// Adds to `copied` the validity bitmap it copies out of the page.
+    pub(crate) fn decode_page(
+        bytes: &crate::Slice,
+        row_count: u32,
+        expected: crate::table::column_page::PageStamp,
+        copied: &mut usize,
+    ) -> Result<Self> {
+        use crate::table::column_page::PageStamp;
+
+        let mut cur = Cursor::new(bytes);
+        if PageStamp::decode(cur.read_array::<{ PageStamp::LEN }>()?) != expected {
+            return Err(Error::InvalidHeader(
+                "columnar: page belongs to another row group, column part or row page",
+            ));
+        }
+        let Some((column, _)) = Self::decode_from(&mut cur, bytes, row_count, |_| true, copied)?
+        else {
+            return Err(Error::InvalidHeader(
+                "columnar: page column was not decoded",
+            ));
+        };
+        if !cur.is_empty() {
+            return Err(Error::InvalidHeader(
+                "columnar: trailing bytes after the page's column",
+            ));
+        }
+        Ok(column)
+    }
+
+    /// Reads one column's wire form from `cur`, which walks `bytes`.
+    ///
+    /// Returns `None` when `want` is false: the column's validity and data are
+    /// stepped over — still bounds-checked — but never copied or
+    /// codec-decoded, which is what a projection pays for a column it did not
+    /// ask for. The second field is the length of a zero-copy view into
+    /// `bytes`, zero when the column had to be re-coded into its own buffer,
+    /// so a caller can decide whether keeping `bytes` alive for the view is
+    /// proportionate. Adds the validity bitmap it copies out to `copied` as
+    /// the copy is made, so a column refused afterwards still counts it.
+    fn decode_from(
+        cur: &mut Cursor<'_>,
+        bytes: &crate::Slice,
+        row_count: u32,
+        want: impl Fn(u16) -> bool,
+        copied: &mut usize,
+    ) -> Result<Option<(Self, usize)>> {
+        let column_id = cur.read_u16()?;
+        let type_tag = cur.read_u8()?;
+        let width = cur.read_u8()?;
+        let codec = CodecId::try_from(cur.read_u8()?)?;
+        let has_validity = match cur.read_u8()? {
+            0 => false,
+            1 => true,
+            _ => {
+                return Err(Error::InvalidHeader(
+                    "columnar: validity flag must be 0 or 1",
+                ));
+            }
+        };
+        let data_len = cur.read_u32()? as usize;
+        let type_tag = TypeTag::from_wire(type_tag, width)?;
+        let want = want(column_id);
+        let validity = if has_validity {
+            let v = cur.read_bytes(validity_len(row_count))?;
+            if want {
+                *copied += v.len();
+                Some(v.to_vec())
+            } else {
+                None
+            }
+        } else {
+            None
+        };
+        let data_start = cur.pos;
+        let raw = cur.read_bytes(data_len)?;
+        if !want {
+            return Ok(None);
+        }
+        // Restore the column's logical bytes from its stored codec form.
+        // Plain is the identity: the column is served as a zero-copy view
+        // of `bytes`. Delta re-codes into an owned buffer.
+        let (data, viewed) = match codec {
+            CodecId::Plain => (bytes.slice(data_start..data_start + data_len), data_len),
+            CodecId::Delta => (crate::Slice::from(codec_decode(codec, type_tag, raw)?), 0),
+        };
+        let column = Self {
+            column_id,
+            type_tag,
+            validity,
+            data,
+        };
+        // Same well-formedness gate the encoder runs, so a payload decodes
+        // iff it could have been produced by `encode_into`.
+        column.validate(row_count)?;
+        Ok(Some((column, viewed)))
+    }
 }
 
 impl ColumnBatch {
+    /// Cuts the batch's rows into row pages of at least `page_size` bytes
+    /// each, the last one excepted, returning the rows in each.
+    ///
+    /// A row's bytes are what it adds across every column: a fixed column's
+    /// width, a `Bytes` cell's length plus its offset. A page is closed once it
+    /// reaches `page_size`, so a row wider than the target is a page of its
+    /// own, and a `page_size` of zero puts every row on its own page.
+    ///
+    /// # Errors
+    ///
+    /// Returns [`Error::InvalidHeader`] when a `Bytes` column is malformed for
+    /// the batch's rows.
+    pub(crate) fn row_page_cuts(&self, page_size: u32) -> Result<Vec<u32>> {
+        let mut cuts = Vec::new();
+        let mut rows_in_page = 0u32;
+        let mut bytes_in_page = 0u64;
+        for row in 0..self.row_count {
+            for col in &self.columns {
+                bytes_in_page += match col.type_tag {
+                    TypeTag::Fixed(w) => u64::from(w),
+                    TypeTag::Bytes => {
+                        bytes_column_row(&col.data, self.row_count, row)?.len() as u64 + 4
+                    }
+                };
+            }
+            rows_in_page += 1;
+            if bytes_in_page >= u64::from(page_size) {
+                cuts.push(rows_in_page);
+                rows_in_page = 0;
+                bytes_in_page = 0;
+            }
+        }
+        if rows_in_page > 0 {
+            cuts.push(rows_in_page);
+        }
+        Ok(cuts)
+    }
+
     /// The first row's user key, or `None` for an empty batch. Reads only the
     /// intrinsic key column, so the ingest ordering guard can check a batch
     /// against the previously written key without decoding the whole batch.
@@ -520,76 +825,161 @@ impl ColumnBatch {
         stats
     }
 
-    /// Appends `other`'s rows after this batch's, in place, so a sequence of
-    /// small ingest batches can accumulate into one rowgroup before a block is
-    /// written. The two batches must share the same columns (id + type) in the
-    /// same order; a `Fixed` column concatenates verbatim, a `Bytes` column
-    /// re-frames the merged cells, and a validity bitmap is combined across both
-    /// (a `None` bitmap on either side counts that side's rows as present).
+    /// The statistics zones of this batch cut into row pages of `row_pages`
+    /// rows: one per row page and `Bytes` column, in column order.
+    ///
+    /// The writer records these in a group's directory, and the verification
+    /// gates re-derive them from the decoded group to authenticate it, so the
+    /// two share this computation.
     ///
     /// # Errors
     ///
-    /// Returns an error if the column counts or layouts differ, the combined row
-    /// count exceeds `u32::MAX`, or either batch's columns are malformed for
-    /// their own row count.
-    pub(crate) fn append(&mut self, other: &Self) -> Result<()> {
-        if self.columns.len() != other.columns.len() {
-            return Err(Error::InvalidHeader(
-                "columnar: append column-count mismatch",
-            ));
-        }
-        let old_rows = self.row_count;
-        let combined_rows = old_rows
-            .checked_add(other.row_count)
-            .ok_or(Error::InvalidHeader(
-                "columnar: appended row count exceeds u32",
+    /// Returns [`Error::InvalidHeader`] when the row pages overrun the batch
+    /// or a `Bytes` column is malformed.
+    pub(crate) fn page_zones(
+        &self,
+        row_pages: &[u32],
+    ) -> Result<crate::table::column_page::PageZones> {
+        let bytes_columns: Vec<&Column> = self
+            .columns
+            .iter()
+            .filter(|c| c.type_tag == TypeTag::Bytes)
+            .collect();
+        let mut zones = crate::table::column_page::PageZones::new(
+            bytes_columns.iter().map(|c| c.column_id).collect(),
+        );
+        let mut start = 0u32;
+        for &rows in row_pages {
+            let end = start.checked_add(rows).ok_or(Error::InvalidHeader(
+                "columnar: row pages overrun the batch",
             ))?;
-        // Validate the layout and framing of both batches before mutating, so an
-        // invalid append leaves this batch unchanged.
-        for (a, b) in self.columns.iter().zip(&other.columns) {
-            if a.column_id != b.column_id || a.type_tag != b.type_tag {
+            for col in &bytes_columns {
+                let (nulls, range) = col.bytes_range(self.row_count, start, end)?;
+                zones.push(nulls, range);
+            }
+            start = end;
+        }
+        Ok(zones)
+    }
+
+    /// The statistics zones of this batch as a row group cut into row pages of
+    /// `row_pages` rows lays them out: the key column's for its directory, and
+    /// the other columns' for its zone block. A group of one row page has
+    /// neither, since its zone is its zone-map entry.
+    ///
+    /// The writer lays a group out from these, and the verification gates
+    /// re-derive them from the decoded group and require the group to carry
+    /// exactly these, so the two share this one rule.
+    ///
+    /// # Errors
+    ///
+    /// As [`Self::page_zones`].
+    pub(crate) fn group_zones(
+        &self,
+        row_pages: &[u32],
+    ) -> Result<(
+        crate::table::column_page::PageZones,
+        crate::table::column_page::PageZones,
+    )> {
+        if row_pages.len() <= 1 {
+            return Ok(Default::default());
+        }
+        let zones = self.page_zones(row_pages)?;
+        Ok((
+            zones.only(|c| c == COL_USER_KEY),
+            zones.only(|c| c != COL_USER_KEY),
+        ))
+    }
+
+    /// The rows of `pages`, in order, as one batch: a row group read page by
+    /// page, put back together for a consumer that takes the group whole.
+    ///
+    /// One page is returned as it is. Several are joined column by column,
+    /// each column framed once: a `Fixed` column's bodies back to back, a
+    /// `Bytes` column's cells under one offset table, and a validity bitmap
+    /// wherever a page has one (a page without counts its rows as present).
+    ///
+    /// # Errors
+    ///
+    /// Returns [`Error::InvalidHeader`] for no pages, pages whose columns
+    /// differ (id, type or count), a row count past `u32::MAX`, or a column
+    /// malformed for its page's rows.
+    pub(crate) fn concat(pages: Vec<Self>) -> Result<Self> {
+        let mut pages = pages.into_iter();
+        let Some(first) = pages.next() else {
+            return Err(Error::InvalidHeader("columnar: row group has no row pages"));
+        };
+        let rest: Vec<Self> = pages.collect();
+        if rest.is_empty() {
+            return Ok(first);
+        }
+        let all = || core::iter::once(&first).chain(&rest);
+        let mut row_count = 0u32;
+        for page in all() {
+            if page.columns.len() != first.columns.len() {
                 return Err(Error::InvalidHeader(
-                    "columnar: append column layout mismatch",
+                    "columnar: row pages disagree on their columns",
                 ));
             }
-            a.validate(old_rows)?;
-            b.validate(other.row_count)?;
-        }
-        // Encode every merged column into temporaries first; only after all
-        // succeed do we mutate `self`. A fallible encode mid-loop would otherwise
-        // leave the batch half-appended (some columns longer) while `row_count`
-        // stays unchanged, corrupting the pending rowgroup.
-        let mut merged: Vec<(Slice, Option<Vec<u8>>)> = Vec::with_capacity(self.columns.len());
-        for (a, b) in self.columns.iter().zip(&other.columns) {
-            let new_validity = combine_validity(
-                a.validity.as_deref(),
-                old_rows,
-                b.validity.as_deref(),
-                other.row_count,
-            )?;
-            let new_data = match a.type_tag {
-                // Both sides validated as `rows * width` bytes, so the result
-                // is the two bodies back to back.
-                TypeTag::Fixed(_) => Slice::fused(&a.data, &b.data),
-                TypeTag::Bytes => {
-                    let mut cells: Vec<&[u8]> = Vec::with_capacity(combined_rows as usize);
-                    for i in 0..old_rows {
-                        cells.push(bytes_column_row(&a.data, old_rows, i)?);
-                    }
-                    for j in 0..other.row_count {
-                        cells.push(bytes_column_row(&b.data, other.row_count, j)?);
-                    }
-                    frame_bytes_column(cells.len(), || cells.iter().copied())?
+            for (a, b) in first.columns.iter().zip(&page.columns) {
+                if a.column_id != b.column_id || a.type_tag != b.type_tag {
+                    return Err(Error::InvalidHeader(
+                        "columnar: row pages disagree on their columns",
+                    ));
                 }
+                b.validate(page.row_count)?;
+            }
+            row_count = row_count
+                .checked_add(page.row_count)
+                .ok_or(Error::InvalidHeader(
+                    "columnar: row group row count exceeds u32",
+                ))?;
+        }
+        let mut columns = Vec::with_capacity(first.columns.len());
+        for (index, head) in first.columns.iter().enumerate() {
+            let parts = || all().filter_map(|page| page.columns.get(index).map(|c| (page, c)));
+            let data = match head.type_tag {
+                TypeTag::Fixed(_) => {
+                    let len = parts().map(|(_, c)| c.data.len()).sum();
+                    let mut out = Vec::with_capacity(len);
+                    for (_, c) in parts() {
+                        out.extend_from_slice(&c.data);
+                    }
+                    Slice::from(out)
+                }
+                TypeTag::Bytes => frame_bytes_column(row_count as usize, || {
+                    parts().flat_map(|(page, c)| {
+                        // Every page's framing was validated above.
+                        (0..page.row_count).map(move |i| {
+                            bytes_column_row(&c.data, page.row_count, i).unwrap_or_default()
+                        })
+                    })
+                })?,
             };
-            merged.push((new_data, new_validity));
+            let validity = if parts().any(|(_, c)| c.validity.is_some()) {
+                let mut out = alloc::vec![0u8; validity_len(row_count)];
+                let mut at = 0u32;
+                for (page, c) in parts() {
+                    for i in 0..page.row_count {
+                        let present = c.validity.as_deref().is_none_or(|v| validity_bit(v, i));
+                        if present && let Some(byte) = out.get_mut((at / 8) as usize) {
+                            *byte |= 1u8 << (at % 8);
+                        }
+                        at += 1;
+                    }
+                }
+                Some(out)
+            } else {
+                None
+            };
+            columns.push(Column {
+                column_id: head.column_id,
+                type_tag: head.type_tag,
+                validity,
+                data,
+            });
         }
-        for (col, (data, validity)) in self.columns.iter_mut().zip(merged) {
-            col.data = data;
-            col.validity = validity;
-        }
-        self.row_count = combined_rows;
-        Ok(())
+        Ok(Self { row_count, columns })
     }
 
     /// Encodes the batch into a columnar block payload using `codec` for every
@@ -613,22 +1003,7 @@ impl ColumnBatch {
         out.extend_from_slice(&self.row_count.to_le_bytes());
         out.extend_from_slice(&(self.columns.len() as u32).to_le_bytes());
         for col in &self.columns {
-            col.validate(self.row_count)?;
-            // Pick a type-directed codec (e.g. Delta on the seqno column),
-            // falling back to the caller's default; record it per column.
-            let col_codec = auto_codec(col.column_id, col.type_tag).unwrap_or(codec);
-            let encoded = codec_encode(col_codec, col.type_tag, &col.data)?;
-            let (type_tag, width) = col.type_tag.to_wire();
-            out.extend_from_slice(&col.column_id.to_le_bytes());
-            out.push(type_tag);
-            out.push(width);
-            out.push(col_codec.into());
-            out.push(u8::from(col.validity.is_some()));
-            out.extend_from_slice(&(encoded.len() as u32).to_le_bytes());
-            if let Some(v) = &col.validity {
-                out.extend_from_slice(v);
-            }
-            out.extend_from_slice(&encoded);
+            col.encode_into(self.row_count, codec, &mut out)?;
         }
         Ok(out)
     }
@@ -643,7 +1018,7 @@ impl ColumnBatch {
     /// validity flag, or any column that fails [`Column::validate`] (fixed-width
     /// length, `Bytes` offset framing, validity bitmap length / padding).
     pub fn decode(bytes: &crate::Slice) -> Result<Self> {
-        Self::decode_inner(bytes, None, &mut 0)
+        Self::decode_inner(bytes, None)
     }
 
     /// Decodes only the columns whose id is in `wanted`, advancing past every
@@ -657,19 +1032,7 @@ impl ColumnBatch {
     /// As [`ColumnBatch::decode`], evaluated only for the projected columns
     /// (the headers of skipped columns are still framing-checked).
     pub fn decode_projected(bytes: &crate::Slice, wanted: &[u16]) -> Result<Self> {
-        Self::decode_inner(bytes, Some(wanted), &mut 0)
-    }
-
-    /// [`ColumnBatch::decode`] or, with `Some(wanted)`,
-    /// [`ColumnBatch::decode_projected`], also adding to `copied` the bytes
-    /// the decode copied out of the block: validity bitmaps, and `Plain`
-    /// columns detached from it. Read paths charge those to the gather counter.
-    pub(crate) fn decode_counting_copies(
-        bytes: &crate::Slice,
-        wanted: Option<&[u16]>,
-        copied: &mut usize,
-    ) -> Result<Self> {
-        Self::decode_inner(bytes, wanted, copied)
+        Self::decode_inner(bytes, Some(wanted))
     }
 
     /// Shared decode body. `wanted == None` decodes every column; `Some(ids)`
@@ -679,14 +1042,10 @@ impl ColumnBatch {
     /// Takes the refcounted block bytes so `Plain` columns come back as
     /// zero-copy views of the block instead of per-column copies — as long as
     /// the projection covers enough of the block for a view to be worth what
-    /// it retains (see [`MAX_VIEW_AMPLIFICATION`]). Adds to `copied` each copy
-    /// out of the block as it is made, so a payload refused after one still
-    /// counts it.
-    fn decode_inner(
-        bytes: &crate::Slice,
-        wanted: Option<&[u16]>,
-        copied: &mut usize,
-    ) -> Result<Self> {
+    /// it retains (see [`MAX_VIEW_AMPLIFICATION`]). No read path decodes a
+    /// whole batch payload (a table's reads decode pages, and count their
+    /// copies there), so nothing here is counted.
+    fn decode_inner(bytes: &crate::Slice, wanted: Option<&[u16]>) -> Result<Self> {
         // Smallest possible column: id(2) + type(1) + width(1) + codec(1) +
         // has_validity(1) + data_len(4), with empty validity + data.
         const MIN_COLUMN_BYTES: usize = 10;
@@ -707,61 +1066,17 @@ impl ColumnBatch {
         // the whole block alive for them is proportionate.
         let mut viewed_bytes = 0usize;
         let mut view_columns: Vec<usize> = Vec::new();
+        let want = |id: u16| wanted.is_none_or(|w| w.contains(&id));
         for _ in 0..column_count {
-            let column_id = cur.read_u16()?;
-            let type_tag = cur.read_u8()?;
-            let width = cur.read_u8()?;
-            let codec = CodecId::try_from(cur.read_u8()?)?;
-            let has_validity = match cur.read_u8()? {
-                0 => false,
-                1 => true,
-                _ => {
-                    return Err(Error::InvalidHeader(
-                        "columnar: validity flag must be 0 or 1",
-                    ));
-                }
-            };
-            let data_len = cur.read_u32()? as usize;
-            let type_tag = TypeTag::from_wire(type_tag, width)?;
-            // A skipped column's validity + data are stepped over (the cursor
-            // still bounds-checks the lengths) but never copied or codec-decoded.
-            let want = wanted.is_none_or(|w| w.contains(&column_id));
-            let validity = if has_validity {
-                let v = cur.read_bytes(validity_len(row_count))?;
-                if want {
-                    *copied += v.len();
-                    Some(v.to_vec())
-                } else {
-                    None
-                }
-            } else {
-                None
-            };
-            let data_start = cur.pos;
-            let raw = cur.read_bytes(data_len)?;
-            if !want {
+            let Some((column, viewed)) =
+                Column::decode_from(&mut cur, bytes, row_count, want, &mut 0)?
+            else {
                 continue;
+            };
+            if viewed > 0 {
+                viewed_bytes += viewed;
+                view_columns.push(columns.len());
             }
-            // Restore the column's logical bytes from its stored codec form.
-            // Plain is the identity: the column is served as a zero-copy view
-            // of the block bytes. Delta re-codes into an owned buffer.
-            let data = match codec {
-                CodecId::Plain => {
-                    viewed_bytes += data_len;
-                    view_columns.push(columns.len());
-                    bytes.slice(data_start..data_start + data_len)
-                }
-                CodecId::Delta => crate::Slice::from(codec_decode(codec, type_tag, raw)?),
-            };
-            let column = Column {
-                column_id,
-                type_tag,
-                validity,
-                data,
-            };
-            // Same well-formedness gate the encoder runs, so a payload decodes
-            // iff it could have been produced by `encode`.
-            column.validate(row_count)?;
             columns.push(column);
         }
         // Checked before the retention detach below, so a refused payload is
@@ -782,7 +1097,6 @@ impl ColumnBatch {
         if !view_columns.is_empty() && bytes.len() > MAX_VIEW_AMPLIFICATION * viewed_bytes {
             for idx in view_columns {
                 if let Some(col) = columns.get_mut(idx) {
-                    *copied += col.data.len();
                     col.data = crate::Slice::from(&col.data[..]);
                 }
             }
@@ -813,14 +1127,12 @@ impl<'a> Cursor<'a> {
     }
 
     fn read_bytes(&mut self, n: usize) -> Result<&'a [u8]> {
-        let end = self
-            .pos
-            .checked_add(n)
-            .ok_or(Error::InvalidHeader("columnar: read length overflow"))?;
-        let slice = self
-            .buf
-            .get(self.pos..end)
-            .ok_or(Error::InvalidHeader("columnar: truncated block payload"))?;
+        let Some(end) = self.pos.checked_add(n) else {
+            return Err(Error::InvalidHeader("columnar: read length overflow"));
+        };
+        let Some(slice) = self.buf.get(self.pos..end) else {
+            return Err(Error::InvalidHeader("columnar: truncated block payload"));
+        };
         self.pos = end;
         Ok(slice)
     }
@@ -899,6 +1211,10 @@ fn column_row_valid(col: &Column, i: u32) -> bool {
         }
     }
 }
+
+/// A row range's null count and the `(min, max)` of its non-null values, or
+/// `None` for the range when every row is null.
+pub(crate) type NullsAndRange<'a> = (u32, Option<(&'a [u8], &'a [u8])>);
 
 /// Reads row `i` of a [`TypeTag::Bytes`] column body (offset table + payload),
 /// bounds-checked.
@@ -1041,37 +1357,6 @@ fn validity_bit(bitmap: &[u8], row: u32) -> bool {
     bitmap
         .get((row / 8) as usize)
         .is_some_and(|b| (b >> (row % 8)) & 1 == 1)
-}
-
-/// Combines two columns' validity bitmaps for an append: the result spans
-/// `a_rows + b_rows` rows, treating a `None` bitmap as all-present. Returns
-/// `None` only when both inputs are `None` (the appended column stays non-null).
-fn combine_validity(
-    a: Option<&[u8]>,
-    a_rows: u32,
-    b: Option<&[u8]>,
-    b_rows: u32,
-) -> Result<Option<Vec<u8>>> {
-    if a.is_none() && b.is_none() {
-        return Ok(None);
-    }
-    let total = a_rows.checked_add(b_rows).ok_or(Error::InvalidHeader(
-        "columnar: combined row count exceeds u32",
-    ))?;
-    let mut out = alloc::vec![0u8; validity_len(total)];
-    for idx in 0..total {
-        let present = if idx < a_rows {
-            a.is_none_or(|v| validity_bit(v, idx))
-        } else {
-            // idx >= a_rows here, so the subtraction does not underflow and
-            // idx - a_rows < b_rows.
-            b.is_none_or(|v| validity_bit(v, idx - a_rows))
-        };
-        if present && let Some(byte) = out.get_mut((idx / 8) as usize) {
-            *byte |= 1u8 << (idx % 8);
-        }
-    }
-    Ok(Some(out))
 }
 
 /// Reads row `i` of a `Fixed(8)` column body as a little-endian `u64`.
@@ -1494,28 +1779,10 @@ pub fn column_batch_match_entries(
         ));
     }
 
-    // Lower bound: first row whose key is `>= needle` (keys are block-index
-    // sorted: user_key ASC, seqno DESC).
-    let mut lo = 0u32;
-    let mut hi = row_count;
-    while lo < hi {
-        let mid = lo + (hi - lo) / 2;
-        let k = bytes_column_row(&key_col.data, row_count, mid)?;
-        if comparator.compare(k, needle) == core::cmp::Ordering::Less {
-            lo = mid + 1;
-        } else {
-            hi = mid;
-        }
-    }
-
-    // Collect the contiguous `== needle` run from `lo`, skipping masked rows.
+    // Collect the contiguous `== needle` run, skipping masked rows.
     let mut out = Vec::new();
-    let mut row = lo;
-    while row < row_count {
+    for row in key_rows(&key_col.data, row_count, needle, comparator)? {
         let k = bytes_column_row(&key_col.data, row_count, row)?;
-        if comparator.compare(k, needle) != core::cmp::Ordering::Equal {
-            break;
-        }
         let masked = if let Some((bitmap, start)) = deletes {
             // Fail closed on a corrupt block_start_row: an overflowing position
             // must error like the scan path, never silently expose the row.
@@ -1552,9 +1819,45 @@ pub fn column_batch_match_entries(
                 value,
             });
         }
-        row += 1;
     }
     Ok(out)
+}
+
+/// The rows of a key column whose key equals `needle`: one contiguous run,
+/// since a group's rows are sorted by user key ascending (seqno descending
+/// within a key). Found by binary search for the first row `>= needle`, then
+/// extended while the key still equals it.
+///
+/// # Errors
+///
+/// Returns an error when the key column's framing is malformed for
+/// `row_count`.
+pub(crate) fn key_rows(
+    key_data: &[u8],
+    row_count: u32,
+    needle: &[u8],
+    comparator: &crate::comparator::SharedComparator,
+) -> Result<core::ops::Range<u32>> {
+    let mut lo = 0u32;
+    let mut hi = row_count;
+    while lo < hi {
+        let mid = lo + (hi - lo) / 2;
+        let k = bytes_column_row(key_data, row_count, mid)?;
+        if comparator.compare(k, needle) == core::cmp::Ordering::Less {
+            lo = mid + 1;
+        } else {
+            hi = mid;
+        }
+    }
+    let mut end = lo;
+    while end < row_count {
+        let k = bytes_column_row(key_data, row_count, end)?;
+        if comparator.compare(k, needle) != core::cmp::Ordering::Equal {
+            break;
+        }
+        end += 1;
+    }
+    Ok(lo..end)
 }
 
 /// Frames one row's value sub-column cells into a single self-describing value

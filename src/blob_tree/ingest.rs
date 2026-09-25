@@ -280,6 +280,7 @@ impl<'a> BlobIngestion<'a> {
             table.bind_to_tree(&crate::table::TableSinks {
                 deletion_pause: &index.deletion_pause,
                 heal_hints: &index.heal_hints,
+                read_budget: index.config.columnar_read_budget,
                 #[cfg(feature = "std")]
                 background_deleter: Some(&index.background_deleter),
             });
@@ -293,6 +294,7 @@ impl<'a> BlobIngestion<'a> {
             blob_file.bind_to_tree(&crate::table::TableSinks {
                 deletion_pause: &index.deletion_pause,
                 heal_hints: &index.heal_hints,
+                read_budget: index.config.columnar_read_budget,
                 #[cfg(feature = "std")]
                 background_deleter: Some(&index.background_deleter),
             });

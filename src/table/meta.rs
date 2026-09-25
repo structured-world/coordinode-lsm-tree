@@ -11,6 +11,20 @@ use crate::{
 use alloc::vec::Vec;
 use core::ops::Deref;
 
+/// The columnar table layout this release writes and reads, stamped into
+/// every table's descriptor as `descriptor#columnar_format`.
+///
+/// `2` is a row group laid out as a page directory followed by its pages. The
+/// unstamped layout before it, which stored each row group as one block, is
+/// format `1` by implication and is not read: a columnar table carrying it is
+/// refused at open, so that it is converted rather than misread.
+///
+/// A property of the format rather than of the `columnar` feature, which is
+/// why it lives here: a build without the feature still writes the stamp for
+/// the tables it cannot make columnar, so every table records which layout a
+/// reader should expect.
+pub const COLUMNAR_FORMAT_VERSION: u8 = 2;
+
 /// Nanosecond timestamp.
 #[derive(Copy, Clone, Debug, PartialEq, Eq, Ord, PartialOrd)]
 pub struct Timestamp(u128);
@@ -182,6 +196,16 @@ pub struct ParsedMeta {
     /// first point read. A table with neither section is unaffected: there is
     /// nothing to misread.
     pub filter_format: Option<u8>,
+
+    /// Which columnar layout this table's row groups use, from the optional
+    /// `descriptor#columnar_format` property.
+    ///
+    /// `None` means the key is ABSENT: a table written before the stamp
+    /// existed, whose row groups are each one block. The recover path refuses
+    /// a COLUMNAR table that does not carry the current format, naming the
+    /// offline converter; a row-major table is unaffected, since it has no
+    /// row groups to misread.
+    pub columnar_format: Option<u8>,
 
     /// Bulk-ingest provenance from the optional `descriptor#bulk_ingested`
     /// property: `Some(true)` = bulk-ingested (every entry at LOCAL seqno 0, MVCC
@@ -423,6 +447,17 @@ impl ParsedMeta {
                 _ => return Err(crate::Error::InvalidHeader("TableMeta")),
             },
         };
+
+        // Optional columnar-layout stamp. Absent = a table written before the
+        // stamp existed; see the field's doc comment.
+        let columnar_format =
+            match block.point_read(b"descriptor#columnar_format", SeqNo::MAX, &cmp)? {
+                None => None,
+                Some(v) => match v.value.as_ref() {
+                    [b] => Some(*b),
+                    _ => return Err(crate::Error::InvalidHeader("TableMeta")),
+                },
+            };
 
         // Optional bulk-ingest provenance. `None` = the key is ABSENT: a legacy
         // SST (written before the flag existed) whose provenance is UNKNOWN, so
@@ -674,6 +709,7 @@ impl ParsedMeta {
             index_block_restart_interval,
             columnar,
             filter_format,
+            columnar_format,
             bulk_ingested,
             recency,
             lineage,

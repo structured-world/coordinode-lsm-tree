@@ -82,6 +82,105 @@ fn make_corrupted_index_block_with_invalid_binary_index_offset() -> IndexBlock {
     })
 }
 
+/// Every entry names a row group by its tag; the block mixes restart heads
+/// (full entries) with truncated ones.
+fn make_tagged_index_block(restart_interval: u8) -> (Vec<KeyedBlockHandle>, IndexBlock) {
+    let handles: Vec<_> = make_handles(16)
+        .into_iter()
+        .zip(1_u64..)
+        .map(|(h, tag)| {
+            KeyedBlockHandle::new(
+                h.end_key().clone(),
+                h.seqno(),
+                h.into_inner()
+                    .with_group_tag(core::num::NonZeroU64::new(tag << 40)),
+            )
+        })
+        .collect();
+    let bytes =
+        IndexBlock::encode_into_vec_with_restart_interval(&handles, restart_interval).unwrap();
+    let index = IndexBlock::new(Block {
+        data: bytes.into(),
+        header: Header::test_dummy(BlockType::Index),
+    });
+    (handles, index)
+}
+
+/// An entry naming a row group reads back with its tag, through a full walk
+/// and through a seek that probes the restart heads; an entry naming none
+/// reads back with none.
+#[test]
+fn a_tagged_entry_reads_back_its_group_tag() {
+    for restart_interval in [1, 4] {
+        let (handles, index) = make_tagged_index_block(restart_interval);
+        let read: Vec<_> = index
+            .iter(default_comparator())
+            .map(|item| item.materialize(index.as_slice()))
+            .collect();
+        assert_eq!(read.len(), handles.len());
+        for (read, written) in read.iter().zip(&handles) {
+            assert_eq!(read.end_key(), written.end_key());
+            assert_eq!(read.offset(), written.offset());
+            assert_eq!(read.size(), written.size());
+            assert_eq!(read.as_ref().group_tag(), written.as_ref().group_tag());
+        }
+
+        let mut iter = index.iter(default_comparator());
+        assert!(iter.seek(b"adj:out:vertex-0001:edge-0011", SeqNo::MAX));
+        let Some(found) = iter.next().map(|item| item.materialize(index.as_slice())) else {
+            panic!("the seek lands on an entry");
+        };
+        assert_eq!(found.end_key().as_ref(), b"adj:out:vertex-0001:edge-0011");
+        assert_eq!(
+            found.as_ref().group_tag(),
+            core::num::NonZeroU64::new(12 << 40)
+        );
+    }
+
+    let plain = make_index_block(4);
+    assert!(
+        plain.iter(default_comparator()).all(|item| item
+            .materialize(plain.as_slice())
+            .as_ref()
+            .group_tag()
+            .is_none()),
+        "an entry naming no row group carries no tag",
+    );
+}
+
+/// A tagged entry whose tag is zero, which no writer emits, ends the walk
+/// rather than reading back as an entry naming no group.
+#[test]
+fn a_tagged_entry_with_a_zero_tag_is_refused() {
+    let (_, index) = make_tagged_index_block(1);
+    let mut bytes = index.as_slice().to_vec();
+    // The first entry: marker, offset (0, one byte), size (4096, two bytes),
+    // seqno (0, one byte), then the tag.
+    assert_eq!(bytes.first(), Some(&4), "a tagged full entry");
+    let tag_at = 1 + 1 + 2 + 1;
+    let mut cursor = Cursor::new(&bytes[tag_at..]);
+    let tag_len = {
+        let _ = cursor.read_u64_varint().unwrap();
+        usize::try_from(cursor.position()).unwrap()
+    };
+    // A zero of the same width keeps every later byte where it was.
+    for (i, byte) in bytes[tag_at..tag_at + tag_len].iter_mut().enumerate() {
+        *byte = if i + 1 < tag_len { 0x80 } else { 0 };
+    }
+    let corrupt = IndexBlock::new(Block {
+        data: bytes.into(),
+        header: Header::test_dummy(BlockType::Index),
+    });
+    let first = corrupt
+        .iter(default_comparator())
+        .next()
+        .map(|item| item.materialize(corrupt.as_slice()));
+    assert!(
+        first.is_none(),
+        "a zero tag must not read back as an entry, got {first:?}"
+    );
+}
+
 #[test]
 fn seek_clears_stale_front_cache_before_reposition() {
     let index = make_index_block(8);

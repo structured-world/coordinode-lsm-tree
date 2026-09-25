@@ -169,12 +169,65 @@ pub fn load_block(
     // judged: a transform whose output the length or role check then refuses
     // still ran.
     #[cfg(feature = "metrics")]
-    if charge.is_counted() {
-        metrics
-            .block_bytes_decoded
-            .fetch_add(produced as u64, Relaxed);
-    }
+    record_block_decoded(metrics, charge, produced);
     let (block, ecc_status, recovery) = read?;
+    let block = admit_read_block(
+        table_id,
+        path,
+        file_accessor,
+        handle,
+        block_type,
+        compression,
+        encryption,
+        ecc,
+        #[cfg(zstd_any)]
+        zstd_dict,
+        heal_hints,
+        #[cfg(feature = "metrics")]
+        metrics,
+        charge,
+        block,
+        ecc_status,
+        recovery,
+    )?;
+    if charge.touches_cache() {
+        cache.insert_block(table_id, handle.offset(), block.clone());
+    }
+    Ok(block)
+}
+
+/// Takes a block just read from disk into the engine: counts it, checks its
+/// role, and schedules a heal when ECC had to correct it. Caching it is the
+/// caller's, which knows the form later reads want it in: a block as read, or
+/// a row group's directory already decoded.
+///
+/// Everything [`load_block`] does after the read and its decode charge, split
+/// out so a caller that read several blocks in one request — a columnar row
+/// group's directory and pages — accounts for each of them exactly as a block
+/// read on its own is accounted for. Two paths that disagreed here would make
+/// the counters, the cache and auto-heal depend on how a block happened to be
+/// fetched.
+#[expect(
+    clippy::too_many_arguments,
+    reason = "the whole block read context, plus the block it admits"
+)]
+pub(crate) fn admit_read_block(
+    table_id: GlobalTableId,
+    path: &Path,
+    file_accessor: &FileAccessor,
+    handle: &BlockHandle,
+    block_type: BlockType,
+    compression: CompressionType,
+    encryption: Option<&dyn EncryptionProvider>,
+    ecc: Option<crate::table::block::EccParams>,
+    #[cfg(zstd_any)] zstd_dict: Option<&crate::compression::ZstdDictionary>,
+    heal_hints: Option<&crate::heal_hints::HealHints>,
+    #[cfg(feature = "metrics")] metrics: &Metrics,
+    charge: ReadCharge,
+    block: Block,
+    ecc_status: crate::table::block::EccStatus,
+    recovery: Option<crate::table::block::EccRecoveryKind>,
+) -> crate::Result<Block> {
     // Count the on-read ECC recovery (by mechanism) at this primary read site,
     // whoever the reader is: it is a health signal about the medium. The
     // persistence-confirming re-read below goes through a path that does NOT
@@ -221,22 +274,27 @@ pub fn load_block(
         );
     }
 
-    if charge.touches_cache() {
-        cache.insert_block(table_id, handle.offset(), block.clone());
-    }
-
     Ok(block)
 }
 
 /// Counts one block served from the block cache under its role.
+///
+/// A columnar page directory counts as index: it is what turns a row group
+/// into the addresses of its pages, which is the index's job one level down.
+/// Counting it as data would make the data-block hit rate report an address
+/// lookup as a payload read.
 #[cfg(feature = "metrics")]
-fn record_block_load_cached(metrics: &Metrics, block_type: BlockType) {
+pub(crate) fn record_block_load_cached(metrics: &Metrics, block_type: BlockType) {
     use core::sync::atomic::Ordering::Relaxed;
     let cached = match block_type {
         BlockType::Filter => &metrics.filter_block_load_cached,
-        BlockType::Index => &metrics.index_block_load_cached,
+        BlockType::Index | BlockType::ColumnPageDirectory | BlockType::ColumnZones => {
+            &metrics.index_block_load_cached
+        }
         BlockType::RangeTombstone => &metrics.range_tombstone_block_load_cached,
-        BlockType::Data | BlockType::Meta | BlockType::Columnar => &metrics.data_block_load_cached,
+        BlockType::Data | BlockType::Meta | BlockType::ColumnPage => {
+            &metrics.data_block_load_cached
+        }
         // Manifest variants are rejected by `load_block`'s guard before any
         // cache lookup; the remaining sections are loaded once on open via
         // `Block::from_file`, never through this cached path.
@@ -261,9 +319,13 @@ pub(crate) fn record_block_read(metrics: &Metrics, block_type: BlockType, on_dis
     use core::sync::atomic::Ordering::Relaxed;
     let requested = match block_type {
         BlockType::Filter => &metrics.filter_block_io_requested,
-        BlockType::Index => &metrics.index_block_io_requested,
+        BlockType::Index | BlockType::ColumnPageDirectory | BlockType::ColumnZones => {
+            &metrics.index_block_io_requested
+        }
         BlockType::RangeTombstone => &metrics.range_tombstone_block_io_requested,
-        BlockType::Data | BlockType::Meta | BlockType::Columnar => &metrics.data_block_io_requested,
+        BlockType::Data | BlockType::Meta | BlockType::ColumnPage => {
+            &metrics.data_block_io_requested
+        }
         // Manifest variants never reach a table read path; the remaining
         // sections are loaded once on open via `Block::from_file`, outside
         // these per-read counters.
@@ -287,9 +349,11 @@ fn record_block_loaded(metrics: &Metrics, block_type: BlockType) {
     use core::sync::atomic::Ordering::Relaxed;
     let loads = match block_type {
         BlockType::Filter => &metrics.filter_block_load_io,
-        BlockType::Index => &metrics.index_block_load_io,
+        BlockType::Index | BlockType::ColumnPageDirectory | BlockType::ColumnZones => {
+            &metrics.index_block_load_io
+        }
         BlockType::RangeTombstone => &metrics.range_tombstone_block_load_io,
-        BlockType::Data | BlockType::Meta | BlockType::Columnar => &metrics.data_block_load_io,
+        BlockType::Data | BlockType::Meta | BlockType::ColumnPage => &metrics.data_block_load_io,
         BlockType::Manifest
         | BlockType::ManifestFooter
         | BlockType::BlockLayout
@@ -299,6 +363,19 @@ fn record_block_loaded(metrics: &Metrics, block_type: BlockType) {
         | BlockType::DeleteBitmap => return,
     };
     loads.fetch_add(1, Relaxed);
+}
+
+/// Charges what one block's transform produced to `bytes_decoded`, for a
+/// counted read. Called as soon as the transform ran, before its output is
+/// judged: a transform whose output the length or role check then refuses
+/// still ran.
+#[cfg(feature = "metrics")]
+pub(crate) fn record_block_decoded(metrics: &Metrics, charge: ReadCharge, produced: usize) {
+    if charge.is_counted() {
+        metrics
+            .block_bytes_decoded
+            .fetch_add(produced as u64, core::sync::atomic::Ordering::Relaxed);
+    }
 }
 
 /// Decodes pre-read block bytes into the cache: the decode half of a batched

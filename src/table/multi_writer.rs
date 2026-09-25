@@ -38,6 +38,10 @@ pub struct MultiWriter {
 
     data_block_size: u32,
 
+    row_group_size: u32,
+
+    columnar_page_size: u32,
+
     data_block_restart_interval: u8,
     index_block_restart_interval: u8,
 
@@ -232,6 +236,10 @@ impl MultiWriter {
             data_block_hash_ratio: 0.0,
 
             data_block_size: 4_096,
+
+            row_group_size: crate::config::DEFAULT_COLUMNAR_ROW_GROUP_SIZE,
+
+            columnar_page_size: crate::config::DEFAULT_COLUMNAR_PAGE_SIZE,
 
             data_block_restart_interval: 16,
             index_block_restart_interval: 1,
@@ -533,11 +541,29 @@ impl MultiWriter {
     #[must_use]
     pub(crate) fn use_data_block_size(mut self, size: u32) -> Self {
         assert!(
-            size <= 4 * 1_024 * 1_024,
+            size <= crate::config::MAX_BLOCK_SIZE,
             "data block size must be <= 4 MiB",
         );
         self.data_block_size = size;
         self.writer = self.writer.use_data_block_size(size);
+        self
+    }
+
+    /// Sets the size a columnar table's row groups are cut at; see
+    /// [`Writer::use_row_group_size`].
+    #[must_use]
+    pub(crate) fn use_row_group_size(mut self, size: u32) -> Self {
+        self.row_group_size = size;
+        self.writer = self.writer.use_row_group_size(size);
+        self
+    }
+
+    /// Sets the size a columnar row group's rows are cut into row pages at;
+    /// see [`Writer::use_columnar_page_size`].
+    #[must_use]
+    pub(crate) fn use_columnar_page_size(mut self, size: u32) -> Self {
+        self.columnar_page_size = size;
+        self.writer = self.writer.use_columnar_page_size(size);
         self
     }
 
@@ -773,6 +799,8 @@ impl MultiWriter {
             .use_data_block_compression(self.data_block_compression)
             .use_index_block_compression(self.index_block_compression)
             .use_data_block_size(self.data_block_size)
+            .use_row_group_size(self.row_group_size)
+            .use_columnar_page_size(self.columnar_page_size)
             .use_data_block_restart_interval(self.data_block_restart_interval)
             .use_index_block_restart_interval(self.index_block_restart_interval)
             .use_bloom_policy(self.bloom_policy)

@@ -1436,8 +1436,8 @@ fn point_read_zero_restart_interval_hash_path_returns_invalid_trailer() -> crate
 #[cfg(feature = "columnar")]
 #[test]
 #[expect(clippy::unwrap_used)]
-fn from_columnar_block_masked_drops_deleted_positions() {
-    use crate::table::columnar::{CodecId, entries_to_column_batch};
+fn from_column_batch_masked_drops_deleted_positions() {
+    use crate::table::columnar::entries_to_column_batch;
     use crate::table::delete_bitmap::DeleteBitmap;
 
     // A 4-row block (in-block positions 0..4): keys a, b, c, d.
@@ -1447,17 +1447,20 @@ fn from_columnar_block_masked_drops_deleted_positions() {
         InternalValue::from_components(Slice::from(b"c".as_slice()), Slice::from([]), 1, Value),
         InternalValue::from_components(Slice::from(b"d".as_slice()), Slice::from([]), 1, Value),
     ];
-    let data = entries_to_column_batch(&entries)
-        .unwrap()
-        .encode(CodecId::Plain)
-        .unwrap();
+    // Two row pages, [a] and [b, c, d]: the second page's rows keep counting
+    // positions from where the first page ended.
+    let (first, rest) = entries.split_at(1);
+    let pages = [
+        entries_to_column_batch(first).unwrap(),
+        entries_to_column_batch(rest).unwrap(),
+    ];
 
     // The block starts at global row 10, so delete global positions 10 (a)
     // and 12 (c); b and d must survive.
     let mut dv = DeleteBitmap::new();
     dv.insert(10);
     dv.insert(12);
-    let block = DataBlock::from_columnar_block_masked(&data.into(), 16, &dv, 10, &mut 0)
+    let block = DataBlock::from_column_batch_masked(pages, 16, &dv, 10, &mut 0)
         .unwrap()
         .expect("not all rows deleted");
 
@@ -1491,24 +1494,21 @@ fn from_columnar_block_masked_drops_deleted_positions() {
 #[cfg(feature = "columnar")]
 #[test]
 #[expect(clippy::unwrap_used)]
-fn from_columnar_block_masked_returns_none_when_all_deleted() {
-    use crate::table::columnar::{CodecId, entries_to_column_batch};
+fn from_column_batch_masked_returns_none_when_all_deleted() {
+    use crate::table::columnar::entries_to_column_batch;
     use crate::table::delete_bitmap::DeleteBitmap;
 
     let entries = [
         InternalValue::from_components(Slice::from(b"a".as_slice()), Slice::from([]), 1, Value),
         InternalValue::from_components(Slice::from(b"b".as_slice()), Slice::from([]), 1, Value),
     ];
-    let data = entries_to_column_batch(&entries)
-        .unwrap()
-        .encode(CodecId::Plain)
-        .unwrap();
+    let batch = entries_to_column_batch(&entries).unwrap();
 
     let mut dv = DeleteBitmap::new();
     dv.insert(0);
     dv.insert(1);
     assert!(
-        DataBlock::from_columnar_block_masked(&data.into(), 16, &dv, 0, &mut 0)
+        DataBlock::from_column_batch_masked([batch], 16, &dv, 0, &mut 0)
             .unwrap()
             .is_none()
     );

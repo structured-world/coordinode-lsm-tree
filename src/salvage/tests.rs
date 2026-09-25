@@ -568,7 +568,7 @@ fn salvage_drops_the_gap_tail_after_an_unframeable_block() -> crate::Result<()> 
     assert!(writer.finish()?.is_some(), "source SST is non-empty");
 
     // Smash the header of a block in the FIRST THIRD of the data section (its
-    // first byte, so `probe_block_handle_at` cannot frame it). The blocks after
+    // first byte, so `probe_block_handle_in` cannot frame it). The blocks after
     // it are reachable only by resync, so they must be dropped, not emitted.
     let smash_offset = {
         let table = open(source.clone(), &fs)?;
@@ -2482,6 +2482,195 @@ fn section_pos(path: &std::path::Path, name: &[u8]) -> u64 {
     entry.pos()
 }
 
+/// Re-stamps one block of an unencrypted, uncompressed SST in place: replaces
+/// its payload with `new_payload` (which must keep the payload's length, so
+/// every later block stays where the index says it is) and recomputes the
+/// header's data checksum, so the forgery stays checksum-consistent.
+#[cfg(feature = "columnar")]
+fn restamp_block(bytes: &mut [u8], at: usize, new_payload: &[u8]) -> crate::Result<()> {
+    use crate::coding::{Decode, Encode};
+    use crate::table::block::Header;
+
+    let Some(frame) = bytes.get(at..) else {
+        panic!("block start within the file");
+    };
+    let header = Header::decode_from(&mut &frame[..])?;
+    assert_eq!(
+        new_payload.len(),
+        header.data_length as usize,
+        "a restamp must keep the payload length",
+    );
+    let new_header = Header {
+        checksum: crate::Checksum::from_raw(crate::hash::hash128(new_payload)),
+        ..header
+    };
+    let mut new_block =
+        Vec::with_capacity(Header::header_len(header.block_type) + new_payload.len());
+    new_header.encode_into(&mut new_block)?;
+    new_block.extend_from_slice(new_payload);
+    let Some(target) = bytes.get_mut(at..at + new_block.len()) else {
+        panic!("block range within the file");
+    };
+    target.copy_from_slice(&new_block);
+    Ok(())
+}
+
+/// The payload of the block at `at` in an unencrypted, uncompressed SST.
+#[cfg(feature = "columnar")]
+fn block_payload(bytes: &[u8], at: usize) -> crate::Result<Vec<u8>> {
+    use crate::coding::Decode;
+    use crate::table::block::Header;
+
+    let Some(frame) = bytes.get(at..) else {
+        panic!("block start within the file");
+    };
+    let header = Header::decode_from(&mut &frame[..])?;
+    let start = Header::header_len(header.block_type);
+    let Some(payload) = frame.get(start..start + header.data_length as usize) else {
+        panic!("payload within the file");
+    };
+    Ok(payload.to_vec())
+}
+
+/// Where the `group`-th row group of a columnar SST sits, and its directory.
+#[cfg(feature = "columnar")]
+fn row_group(
+    source: &std::path::Path,
+    fs: &Arc<dyn Fs>,
+    group: usize,
+) -> crate::Result<(usize, crate::table::column_page::PageDirectory)> {
+    let table = open(source.to_path_buf(), fs)?;
+    let Some(kh) = table.data_block_handles().filter_map(Result::ok).nth(group) else {
+        panic!("source must have at least {} row groups", group + 1);
+    };
+    let at = usize::try_from(*kh.as_ref().offset()).unwrap_or(usize::MAX);
+    let bytes = std::fs::read(source)?;
+    let directory = crate::table::column_page::PageDirectory::decode(&block_payload(&bytes, at)?)?;
+    Ok((at, directory))
+}
+
+/// Forges the page of `column_id` in the `group`-th row group of a columnar
+/// SST: decodes the column, lets `mutate` alter it in place, re-encodes it at
+/// the SAME length and re-stamps the page's checksum. The group stays
+/// checksum-consistent, so whatever `mutate` broke surfaces as a CONTENT
+/// failure, not as an ordinary checksum drop. Returns the group's row count.
+#[cfg(feature = "columnar")]
+fn forge_row_group_column(
+    source: &std::path::Path,
+    fs: &Arc<dyn Fs>,
+    group: usize,
+    column_id: u16,
+    mutate: impl FnOnce(&mut crate::table::columnar::Column, u32),
+) -> crate::Result<u32> {
+    use crate::table::columnar::{CodecId, Column};
+
+    let (group_at, directory) = row_group(source, fs, group)?;
+    let row_count = directory.row_count();
+    let Some(page) = directory
+        .entries()
+        .iter()
+        .find(|e| e.id.column_id == column_id)
+    else {
+        panic!("row group holds a page for column {column_id}");
+    };
+    let directory_len = {
+        let bytes = std::fs::read(source)?;
+        let header = {
+            use crate::coding::Decode;
+            let Some(frame) = bytes.get(group_at..) else {
+                panic!("row group within the file");
+            };
+            crate::table::block::Header::decode_from(&mut &frame[..])?
+        };
+        header.on_disk_size_with(None) as usize
+    };
+    let page_at = group_at + directory_len + page.offset as usize;
+
+    // The page keeps its stamp: the forgery targets its content, not which
+    // group it claims to belong to.
+    let stamp = directory.stamp_for(page);
+    let mut bytes = std::fs::read(source)?;
+    let mut column = Column::decode_page(
+        &block_payload(&bytes, page_at)?.into(),
+        row_count,
+        stamp,
+        &mut 0,
+    )?;
+    mutate(&mut column, row_count);
+    let new_payload = column.encode_page(row_count, CodecId::Plain, stamp)?;
+    restamp_block(&mut bytes, page_at, &new_payload)?;
+    std::fs::write(source, &bytes)?;
+    Ok(row_count)
+}
+
+/// Swaps the first two rows' user keys inside a key column, in place.
+/// Equal-length keys keep the `Bytes` framing intact, so the column still
+/// decodes and its rows still materialize — only the ordering invariant is
+/// broken.
+#[cfg(feature = "columnar")]
+fn swap_first_two_keys(key_col: &mut crate::table::columnar::Column, row_count: u32) {
+    assert!(row_count >= 2, "group holds at least two rows");
+    // Key column framing: (row_count + 1) LE u32 offsets, then payload.
+    let table_len = (row_count as usize + 1) * 4;
+    let off = |data: &[u8], idx: usize| -> usize {
+        let Some(b) = data.get(idx * 4..idx * 4 + 4) else {
+            panic!("offset {idx} within the frame table");
+        };
+        u32::from_le_bytes(b.try_into().unwrap_or([0; 4])) as usize
+    };
+    let (o0, o1, o2) = (
+        off(&key_col.data, 0),
+        off(&key_col.data, 1),
+        off(&key_col.data, 2),
+    );
+    assert_eq!(o1 - o0, o2 - o1, "adjacent keys are equal-length");
+    let len = o1 - o0;
+    let Some(first) = key_col.data.get(table_len + o0..table_len + o0 + len) else {
+        panic!("first key within the column");
+    };
+    let first = first.to_vec();
+    let Some(second) = key_col.data.get(table_len + o1..table_len + o1 + len) else {
+        panic!("second key within the column");
+    };
+    let second = second.to_vec();
+    // Column bytes are an immutable view — rebuild the swapped column.
+    let mut swapped = key_col.data.to_vec();
+    let Some(dst0) = swapped.get_mut(table_len + o0..table_len + o0 + len) else {
+        panic!("first key range within the column");
+    };
+    dst0.copy_from_slice(&second);
+    let Some(dst1) = swapped.get_mut(table_len + o1..table_len + o1 + len) else {
+        panic!("second key range within the column");
+    };
+    dst1.copy_from_slice(&first);
+    key_col.data = swapped.into();
+}
+
+/// Forges the `group`-th row group's directory to declare `row_count` rows,
+/// leaving its row pages and pages alone, and re-stamps the directory's
+/// checksum. The directory keeps its length; only its row count field (after
+/// the version byte and the page count) changes, so it no longer agrees with
+/// its own row pages.
+#[cfg(feature = "columnar")]
+fn forge_row_group_row_count(
+    source: &std::path::Path,
+    fs: &Arc<dyn Fs>,
+    group: usize,
+    row_count: u32,
+) -> crate::Result<()> {
+    let (group_at, directory) = row_group(source, fs, group)?;
+    let mut payload = Vec::new();
+    directory.encode_into(&mut payload);
+    let Some(field) = payload.get_mut(3..7) else {
+        panic!("a directory holds its row count");
+    };
+    field.copy_from_slice(&row_count.to_le_bytes());
+    let mut bytes = std::fs::read(source)?;
+    restamp_block(&mut bytes, group_at, &payload)?;
+    std::fs::write(source, &bytes)?;
+    Ok(())
+}
+
 /// Opens an SST as a `Table`, stamping the open with the file's current digest
 /// (the source may be corrupt; per-block checksums catch the actual damage).
 fn open(path: std::path::PathBuf, fs: &Arc<dyn Fs>) -> crate::Result<Table> {
@@ -3167,7 +3356,7 @@ fn salvage_refuses_a_reordered_columnar_index_with_deletes() -> crate::Result<()
     let mut writer = Writer::new(source.clone(), 0, 0, Arc::clone(&fs))?
         .use_columnar(true)
         .use_zone_map(true)
-        .use_data_block_size(256)
+        .use_row_group_size(256)
         .delete_strategy(DeleteStrategy::MergeOnRead);
     for i in 0..n {
         writer.write(iv(i))?;
@@ -3598,6 +3787,133 @@ fn verify_zone_map_rejects_a_forged_columnar_column_id() -> crate::Result<()> {
     Ok(())
 }
 
+/// A columnar SST of one 64 KiB row group cut into 1 KiB row pages, so the
+/// group carries statistics zones in its directory and its zone block.
+#[cfg(feature = "columnar")]
+fn zoned_source(source: &std::path::Path, fs: &Arc<dyn Fs>) -> crate::Result<()> {
+    let mut writer = Writer::new(source.to_path_buf(), 0, 0, Arc::clone(fs))?
+        .use_columnar(true)
+        .use_zone_map(true)
+        .use_row_group_size(64 * 1_024)
+        .use_columnar_page_size(1_024);
+    for i in 0u32..400 {
+        writer.write(iv(i))?;
+    }
+    assert!(writer.finish()?.is_some(), "source SST is non-empty");
+    Ok(())
+}
+
+/// Narrows the zone of row page 1 to its upper bound alone, keeping every
+/// bound's length, so the zones stay well formed and the same size and only
+/// disagree with the rows they describe.
+#[cfg(feature = "columnar")]
+fn narrowed(
+    zones: &crate::table::column_page::PageZones,
+    columns: &[u16],
+    row_pages: usize,
+) -> crate::table::column_page::PageZones {
+    let mut out = crate::table::column_page::PageZones::new(columns.to_vec());
+    for (row_page, ordinal) in (0..row_pages).zip(0u16..) {
+        for &column_id in columns {
+            let Some(zone) = zones.zone(ordinal, column_id) else {
+                panic!("a zone per row page");
+            };
+            let Some(max) = zone.max else {
+                panic!("the fixture's zones are bounded");
+            };
+            let min = if row_page == 1 { max } else { zone.min };
+            assert_eq!(min.len(), zone.min.len(), "the forgery keeps the length");
+            out.push(zone.null_count, Some((min, max)));
+        }
+    }
+    out
+}
+
+/// A row page's statistics zones decide whether a read skips it, and nothing
+/// on the read path looks at the rows it skipped, so the gates authenticate
+/// them by re-deriving them from the decoded group. A zone narrowed past the
+/// rows it describes, checksum-consistent, in the directory or in the zone
+/// block, is refused.
+#[cfg(feature = "columnar")]
+#[test]
+fn verify_rejects_row_page_zones_that_disagree_with_their_rows() -> crate::Result<()> {
+    use crate::table::columnar::{COL_USER_KEY, COL_VALUE};
+
+    let dir = tempdir()?;
+    let fs: Arc<dyn Fs> = Arc::new(StdFs);
+
+    // The directory's key zones.
+    let source = dir.path().join("key_zones");
+    zoned_source(&source, &fs)?;
+    let honest = open(source.clone(), &fs)?;
+    reconcile_clean(&honest, None);
+    let (group_at, directory) = row_group(&source, &fs, 0)?;
+    let row_pages = directory.row_pages().len();
+    assert!(
+        row_pages > 2,
+        "the fixture must cut its group into row pages"
+    );
+    let forged = crate::table::column_page::PageDirectory::new(
+        directory.row_count(),
+        directory.group_tag(),
+        directory.row_pages().to_vec(),
+        directory.entries().to_vec(),
+        narrowed(directory.zones(), &[COL_USER_KEY], row_pages),
+        directory.zone_blocks().to_vec(),
+    )?;
+    let mut payload = Vec::new();
+    forged.encode_into(&mut payload);
+    let mut bytes = std::fs::read(&source)?;
+    restamp_block(&mut bytes, group_at, &payload)?;
+    std::fs::write(&source, &bytes)?;
+    let err = reconcile_error(
+        &open(source, &fs)?,
+        crate::table::ReconcileGate::BlockEntryCounts,
+        None,
+    );
+    assert!(
+        matches!(err, crate::Error::InvalidHeader(msg) if msg.contains("row page statistics")),
+        "a forged directory zone must be refused, got {err:?}",
+    );
+
+    // The value column's zone block.
+    let source = dir.path().join("block_zones");
+    zoned_source(&source, &fs)?;
+    let (group_at, directory) = row_group(&source, &fs, 0)?;
+    let mut bytes = std::fs::read(&source)?;
+    let directory_len = {
+        use crate::coding::Decode;
+        let Some(frame) = bytes.get(group_at..) else {
+            panic!("group within the file");
+        };
+        crate::table::block::Header::decode_from(&mut &frame[..])?.on_disk_size_with(None)
+    };
+    let Some((after_pages, _)) = directory.zone_block(COL_VALUE) else {
+        panic!("the value column has a zone block");
+    };
+    let zones_at =
+        group_at + directory_len as usize + directory.pages_len() as usize + after_pages as usize;
+    let zones = directory.decode_zone_block(COL_VALUE, &block_payload(&bytes, zones_at)?)?;
+    let mut payload = Vec::new();
+    crate::table::column_page::PageDirectory::encode_zone_block(
+        directory.group_tag(),
+        &narrowed(&zones, &[COL_VALUE], row_pages),
+        &mut payload,
+    );
+    restamp_block(&mut bytes, zones_at, &payload)?;
+    std::fs::write(&source, &bytes)?;
+    let err = reconcile_error(
+        &open(source, &fs)?,
+        crate::table::ReconcileGate::BlockEntryCounts,
+        None,
+    );
+    assert!(
+        matches!(err, crate::Error::InvalidHeader(msg) if msg.contains("row page statistics")),
+        "a forged zone block must be refused, got {err:?}",
+    );
+    Ok(())
+}
+
 /// A salvaged COLUMNAR table must keep its per-column zone-map statistics. The
 /// clean-block verbatim copy-through re-emits columnar blocks byte-for-byte via
 /// `append_verbatim_data_block`; if that path recorded the row-block synthetic
@@ -3617,7 +3933,7 @@ fn salvaged_columnar_table_keeps_per_column_zone_statistics() -> crate::Result<(
     let mut writer = Writer::new(source.clone(), 0, 0, Arc::clone(&fs))?
         .use_columnar(true)
         .use_zone_map(true)
-        .use_data_block_size(128);
+        .use_row_group_size(128);
     for i in 0u32..64 {
         writer.write(iv(i))?;
     }
@@ -3641,6 +3957,44 @@ fn salvaged_columnar_table_keeps_per_column_zone_statistics() -> crate::Result<(
     // The per-column stats the copy-through recorded must equal what the
     // verifier re-derives from each decoded columnar block.
     reconcile_clean(&table, None);
+    Ok(())
+}
+
+/// A clean group of row pages is copied verbatim with its zone blocks: the
+/// copy is the group whole, directory, pages and zones, so the salvaged
+/// table's groups still fill their extents, pass every gate, and prune and
+/// read as the source did.
+#[cfg(feature = "columnar")]
+#[test]
+fn salvage_copies_a_group_of_row_pages_with_its_zone_blocks() -> crate::Result<()> {
+    let dir = tempdir()?;
+    let source = dir.path().join("source");
+    let dest = dir.path().join("salvaged");
+    let fs: Arc<dyn Fs> = Arc::new(StdFs);
+    zoned_source(&source, &fs)?;
+    let (_, directory) = row_group(&source, &fs, 0)?;
+    assert!(
+        !directory.zone_blocks().is_empty(),
+        "the fixture group has zone blocks"
+    );
+
+    let report = salvage_sst(&source, dest.clone(), &fs)?;
+    assert!(
+        report.blocks_copied_verbatim > 0 && report.dropped.is_empty(),
+        "the clean group is copied verbatim: {report:?}",
+    );
+    let (_, copied) = row_group(&dest, &fs, 0)?;
+    assert_eq!(copied, directory, "the copy keeps the group's directory");
+
+    let table = open(dest, &fs)?;
+    reconcile_clean(&table, None);
+    for i in 0u32..400 {
+        let key = iv(i).key.user_key;
+        let Some(got) = table.get(&key, crate::SeqNo::MAX, crate::hash::hash64(&key))? else {
+            panic!("key {i} survives the salvage");
+        };
+        assert_eq!(got.value, iv(i).value, "key {i}");
+    }
     Ok(())
 }
 
@@ -4643,6 +4997,315 @@ fn salvage_regenerates_a_rotted_parity_trailer_rather_than_copying_it() -> crate
     Ok(())
 }
 
+/// Two row groups of an encrypted columnar table swap their value pages. Each
+/// page still authenticates, because the AEAD binds its table and its role but
+/// not the group it belongs to, and the two pages have the same length and row
+/// count. Unlike a block swap, which only costs a lookup miss because a value
+/// cannot leave its key's block, a page swap would serve one key's value under
+/// another key; the read must refuse the group instead.
+#[cfg(all(feature = "columnar", feature = "encryption"))]
+#[test]
+fn a_value_page_moved_between_row_groups_of_an_encrypted_table_is_refused() -> crate::Result<()> {
+    use crate::coding::Decode;
+    use crate::table::columnar::COL_VALUE;
+
+    let dir = tempdir()?;
+    let source = dir.path().join("source");
+    let fs: Arc<dyn Fs> = Arc::new(StdFs);
+    let enc: Arc<dyn crate::encryption::EncryptionProvider> =
+        Arc::new(crate::encryption::Aes256GcmProvider::new(&[0x42; 32]));
+    let mut writer = Writer::new(source.clone(), 0, 0, Arc::clone(&fs))?
+        .use_columnar(true)
+        .use_row_group_size(256)
+        .use_encryption(Some(Arc::clone(&enc)));
+    for i in 0..200_u32 {
+        writer.write(InternalValue::from_components(
+            format!("key{i:05}").into_bytes(),
+            format!("val{i:05}").into_bytes(),
+            1,
+            ValueType::Value,
+        ))?;
+    }
+    assert!(writer.finish()?.is_some(), "source is non-empty");
+
+    // Where the first two groups keep their value pages. The directory is
+    // encrypted, so it is read through the table; the page extents are then
+    // plain file ranges.
+    let pages = {
+        let table = open_encrypted(source.clone(), &fs, Arc::clone(&enc))?;
+        let handles: Vec<_> = table
+            .data_block_handles()
+            .filter_map(Result::ok)
+            .take(2)
+            .collect();
+        assert_eq!(handles.len(), 2, "source has at least two row groups");
+        let bytes = std::fs::read(&source)?;
+        let mut pages = Vec::new();
+        for kh in &handles {
+            let handle = kh.as_ref();
+            let directory = table.salvage_load_row_group(handle)?.group.directory;
+            let at = usize::try_from(*handle.offset()).unwrap_or(usize::MAX);
+            let Some(frame) = bytes.get(at..) else {
+                panic!("row group within the file");
+            };
+            let header = crate::table::block::Header::decode_from(&mut &frame[..])?;
+            let Some(value_page) = directory
+                .entries()
+                .iter()
+                .find(|e| e.id.column_id == COL_VALUE)
+            else {
+                panic!("row group holds a value page");
+            };
+            pages.push((
+                directory.row_count(),
+                at + header.on_disk_size_with(None) as usize + value_page.offset as usize,
+                value_page.length as usize,
+            ));
+        }
+        pages
+    };
+    let [(rows_a, at_a, len_a), (rows_b, at_b, len_b)] = pages[..] else {
+        panic!("two value pages located");
+    };
+    assert_eq!(
+        (rows_a, len_a),
+        (rows_b, len_b),
+        "the swap needs pages of the same length over the same row count",
+    );
+
+    let mut bytes = std::fs::read(&source)?;
+    let (Some(page_a), Some(page_b)) = (
+        bytes.get(at_a..at_a + len_a).map(<[u8]>::to_vec),
+        bytes.get(at_b..at_b + len_b).map(<[u8]>::to_vec),
+    ) else {
+        panic!("both value pages within the file");
+    };
+    for (at, page) in [(at_a, &page_b), (at_b, &page_a)] {
+        let Some(target) = bytes.get_mut(at..at + page.len()) else {
+            panic!("value page within the file");
+        };
+        target.copy_from_slice(page);
+    }
+    std::fs::write(&source, &bytes)?;
+
+    let table = open_encrypted(source, &fs, enc)?;
+    let key = b"key00000";
+    match table.get(key, crate::MAX_SEQNO, crate::hash::hash64(key)) {
+        Err(crate::Error::InvalidHeader(_)) => {}
+        other => panic!("a page from another row group must be refused, got {other:?}"),
+    }
+    Ok(())
+}
+
+/// A columnar SST of table `table_id`, encrypted under `enc` when given,
+/// holding `key{i}` rows whose values are `prefix{i}`, all values of one
+/// length, in one group.
+#[cfg(feature = "columnar")]
+fn columnar_source_as(
+    path: &std::path::Path,
+    fs: &Arc<dyn Fs>,
+    enc: Option<&Arc<dyn crate::encryption::EncryptionProvider>>,
+    table_id: crate::TableId,
+    prefix: &str,
+) -> crate::Result<()> {
+    let mut writer = Writer::new(path.to_path_buf(), table_id, 0, Arc::clone(fs))?
+        .use_columnar(true)
+        .use_encryption(enc.map(Arc::clone));
+    for i in 0..20_u32 {
+        writer.write(InternalValue::from_components(
+            format!("key{i:05}").into_bytes(),
+            format!("{prefix}{i:05}").into_bytes(),
+            1,
+            ValueType::Value,
+        ))?;
+    }
+    assert!(writer.finish()?.is_some(), "source is non-empty");
+    Ok(())
+}
+
+/// Opens the SST at `path`, encrypted under `enc` when given, as table
+/// `table_id`.
+#[cfg(any(feature = "columnar", feature = "encryption"))]
+fn open_as(
+    path: std::path::PathBuf,
+    fs: &Arc<dyn Fs>,
+    enc: Option<&Arc<dyn crate::encryption::EncryptionProvider>>,
+    table_id: crate::TableId,
+) -> crate::Result<Table> {
+    let checksum = crate::Checksum::from_raw(crate::repair::compute_table_checksum(&**fs, &path)?);
+    let mut params = crate::table::RecoverParams::new(
+        path,
+        checksum,
+        table_id,
+        Arc::clone(fs),
+        default_comparator(),
+        Arc::new(crate::cache::Cache::with_capacity_bytes(1 << 20)),
+    );
+    params.encryption = enc.map(Arc::clone);
+    Table::recover(params)
+}
+
+/// The file extent of the value page of the first group of `table`.
+#[cfg(feature = "columnar")]
+fn first_value_page(table: &Table, bytes: &[u8]) -> crate::Result<core::ops::Range<usize>> {
+    use crate::coding::Decode;
+    use crate::table::columnar::COL_VALUE;
+
+    let Some(Ok(first)) = table.data_block_handles().next() else {
+        panic!("the table has a row group");
+    };
+    let directory = table
+        .salvage_load_row_group(first.as_ref())?
+        .group
+        .directory;
+    let at = usize::try_from(*first.as_ref().offset()).unwrap_or(usize::MAX);
+    let Some(frame) = bytes.get(at..) else {
+        panic!("row group within the file");
+    };
+    let header = crate::table::block::Header::decode_from(&mut &frame[..])?;
+    let Some(page) = directory
+        .entries()
+        .iter()
+        .find(|e| e.id.column_id == COL_VALUE)
+    else {
+        panic!("row group holds a value page");
+    };
+    let start = at + header.on_disk_size_with(None) as usize + page.offset as usize;
+    Ok(start..start + page.length as usize)
+}
+
+/// A value page moved into another table, in the same place of a group of the
+/// same shape, is refused, encrypted or not and whether or not the two tables
+/// share an id. A page's values are separated from their keys, so a page
+/// taken for another table's would hand back that table's value under this
+/// table's key. Every table starts its group tags from its own identity, so
+/// the stamp names the table as well as the group, and under encryption the
+/// AEAD binds the table id on top.
+#[cfg(feature = "columnar")]
+#[test]
+fn a_value_page_moved_between_tables_is_refused() -> crate::Result<()> {
+    let dir = tempdir()?;
+    let fs: Arc<dyn Fs> = Arc::new(StdFs);
+    let mut providers: Vec<Option<Arc<dyn crate::encryption::EncryptionProvider>>> = vec![None];
+    #[cfg(feature = "encryption")]
+    providers.push(Some(Arc::new(crate::encryption::Aes256GcmProvider::new(
+        &[0x42; 32],
+    ))));
+
+    for (n, enc) in providers.iter().enumerate() {
+        let enc = enc.as_ref();
+        // Moves `from`'s first value page into `into`'s; the two tables were
+        // written with the same row count and value lengths, so the page fits.
+        let transplant = |into: &std::path::Path, into_id, from: &std::path::Path, from_id| {
+            let from_bytes = std::fs::read(from)?;
+            let page = {
+                let table = open_as(from.to_path_buf(), &fs, enc, from_id)?;
+                let range = first_value_page(&table, &from_bytes)?;
+                from_bytes.get(range).map(<[u8]>::to_vec)
+            };
+            let mut into_bytes = std::fs::read(into)?;
+            let range = {
+                let table = open_as(into.to_path_buf(), &fs, enc, into_id)?;
+                first_value_page(&table, &into_bytes)?
+            };
+            let Some(page) = page.filter(|p| p.len() == range.len()) else {
+                panic!("the two value pages are of one length");
+            };
+            let Some(target) = into_bytes.get_mut(range) else {
+                panic!("value page within the file");
+            };
+            target.copy_from_slice(&page);
+            std::fs::write(into, &into_bytes)?;
+            crate::Result::Ok(())
+        };
+        let key = b"key00000";
+
+        for (into_id, from_id) in [(3, 3), (3, 4)] {
+            let a = dir.path().join(format!("{n}-{into_id}-{from_id}-into"));
+            let b = dir.path().join(format!("{n}-{into_id}-{from_id}-from"));
+            columnar_source_as(&a, &fs, enc, into_id, "vala")?;
+            columnar_source_as(&b, &fs, enc, from_id, "valb")?;
+            transplant(&a, into_id, &b, from_id)?;
+            let table = open_as(a, &fs, enc, into_id)?;
+            let refused = table.get(key, crate::MAX_SEQNO, crate::hash::hash64(key));
+            assert!(
+                refused.is_err(),
+                "encrypted: {}, tables {into_id} and {from_id}: a page of another table \
+                 must be refused, got {refused:?}",
+                enc.is_some(),
+            );
+        }
+    }
+    Ok(())
+}
+
+/// A block of another role in a page's slot, its checksum intact, is refused
+/// by role, as a data-block handle landing on a block of another role is:
+/// relabelling a page as a zone block keeps its bytes valid as a block, and
+/// only the role says it is not the page the directory files there.
+#[cfg(feature = "columnar")]
+#[test]
+fn a_block_of_another_role_in_a_page_slot_is_refused() -> crate::Result<()> {
+    use crate::coding::{Decode, Encode};
+    use crate::table::block::{BlockType, Header};
+    use crate::table::columnar::COL_VALUE;
+    use crate::table::row_group::PageWant;
+    use crate::table::util::ReadCharge;
+
+    let dir = tempdir()?;
+    let source = dir.path().join("source");
+    let fs: Arc<dyn Fs> = Arc::new(StdFs);
+    zoned_source(&source, &fs)?;
+    let (group_at, directory) = row_group(&source, &fs, 0)?;
+    let mut bytes = std::fs::read(&source)?;
+    let directory_len = {
+        let Some(frame) = bytes.get(group_at..) else {
+            panic!("group within the file");
+        };
+        Header::decode_from(&mut &frame[..])?.on_disk_size_with(None)
+    };
+    let Some(page) = directory
+        .entries()
+        .iter()
+        .find(|e| e.id.column_id == COL_VALUE)
+    else {
+        panic!("the group has a value page");
+    };
+    let at = group_at + directory_len as usize + page.offset as usize;
+    let header = {
+        let Some(frame) = bytes.get(at..) else {
+            panic!("page within the file");
+        };
+        Header::decode_from(&mut &frame[..])?
+    };
+    assert_eq!(header.block_type, BlockType::ColumnPage);
+    let mut relabelled = Vec::new();
+    Header {
+        block_type: BlockType::ColumnZones,
+        ..header
+    }
+    .encode_into(&mut relabelled)?;
+    let Some(target) = bytes.get_mut(at..at + relabelled.len()) else {
+        panic!("page header within the file");
+    };
+    target.copy_from_slice(&relabelled);
+    std::fs::write(&source, &bytes)?;
+
+    let table = open(source, &fs)?;
+    let Some(Ok(first)) = table.data_block_handles().next() else {
+        panic!("the table has a row group");
+    };
+    let Err(err) = table.load_row_group(first.as_ref(), &PageWant::ALL, ReadCharge::Foreground)
+    else {
+        panic!("a zone block in a page slot must be refused");
+    };
+    assert!(
+        matches!(err, crate::Error::InvalidTag(("BlockType", _))),
+        "the refusal names the role, got {err:?}",
+    );
+    Ok(())
+}
+
 /// A columnar source with one corrupted PAX data block: the columnar loader
 /// fails to reconstruct that block (a torn sub-column frame), so salvage drops
 /// it and recovers every other block, writing the survivors as a plain row SST.
@@ -4659,7 +5322,7 @@ fn salvage_drops_a_corrupted_columnar_block_and_keeps_the_rest() -> crate::Resul
     let mut writer = Writer::new(source.clone(), 0, 0, Arc::clone(&fs))?
         .use_columnar(true)
         .use_zone_map(true)
-        .use_data_block_size(256);
+        .use_row_group_size(256);
     let n = 200u32;
     for i in 0..n {
         writer.write(iv(i))?;
@@ -4735,10 +5398,6 @@ fn salvage_drops_a_corrupted_columnar_block_and_keeps_the_rest() -> crate::Resul
 #[cfg(feature = "columnar")]
 #[test]
 fn salvage_drops_a_columnar_block_with_an_invalid_value_type() -> crate::Result<()> {
-    use crate::coding::{Decode, Encode};
-    use crate::table::block::Header;
-    use crate::table::columnar::{CodecId, ColumnBatch};
-
     let dir = tempdir()?;
     let source = dir.path().join("source");
     let dest = dir.path().join("salvaged");
@@ -4748,7 +5407,7 @@ fn salvage_drops_a_columnar_block_with_an_invalid_value_type() -> crate::Result<
     let mut writer = Writer::new(source.clone(), 0, 0, Arc::clone(&fs))?
         .use_columnar(true)
         .use_zone_map(true)
-        .use_data_block_size(256);
+        .use_row_group_size(256);
     for i in 0..n {
         writer.write(iv(i))?;
     }
@@ -4757,68 +5416,26 @@ fn salvage_drops_a_columnar_block_with_an_invalid_value_type() -> crate::Result<
         "source columnar SST is non-empty"
     );
 
-    // Poison the SECOND data block: decode its ColumnBatch, stamp an invalid
-    // value-type tag into the first row, re-encode under the writer's Plain
-    // codec (byte-identical framing => same length), and re-stamp the header
-    // checksum. The block stays checksum-consistent, so the failure surfaces
-    // in row materialization — not as an ordinary checksum drop.
-    let (block_off, block_size) = {
-        let table = open(source.clone(), &fs)?;
-        let Some(kh) = table.data_block_handles().filter_map(Result::ok).nth(1) else {
-            panic!("source must have at least two data blocks");
-        };
-        (
-            usize::try_from(*kh.as_ref().offset()).unwrap_or(usize::MAX),
-            kh.as_ref().size() as usize,
-        )
-    };
-    let mut bytes = std::fs::read(&source)?;
-    let Some(block) = bytes.get(block_off..block_off + block_size) else {
-        panic!("block range within the file");
-    };
-    let mut cursor = block;
-    let header = Header::decode_from(&mut cursor)?;
-    let header_len = Header::header_len(header.block_type);
-    let Some(payload) = block.get(header_len..header_len + header.data_length as usize) else {
-        panic!("payload range within the block");
-    };
-    let mut batch = ColumnBatch::decode(&payload.into())?;
-    let poisoned_rows = u64::from(batch.row_count);
-    // Columns are ordered (key, seqno, value-type, values...); 0xFF is not a
-    // defined ValueType tag.
-    // Column bytes are an immutable view now — rebuild the poisoned column.
-    let Some(col) = batch.columns.get_mut(2).filter(|c| !c.data.is_empty()) else {
-        panic!("value-type column present and non-empty");
-    };
-    let mut poisoned = col.data.to_vec();
-    let Some(first_byte) = poisoned.first_mut() else {
-        panic!("column is non-empty");
-    };
-    *first_byte = 0xFF;
-    col.data = poisoned.into();
-    let new_payload = batch.encode(CodecId::Plain)?;
-    assert_eq!(
-        new_payload.len(),
-        payload.len(),
-        "a one-byte in-place mutation re-encodes to the same length",
-    );
-    let new_header = Header {
-        checksum: crate::Checksum::from_raw(crate::hash::hash128(&new_payload)),
-        ..header
-    };
-    let mut new_block = Vec::with_capacity(header_len + new_payload.len());
-    new_header.encode_into(&mut new_block)?;
-    assert_eq!(
-        new_block.len(),
-        header_len,
-        "header re-encodes to its length"
-    );
-    new_block.extend_from_slice(&new_payload);
-    let Some(target) = bytes.get_mut(block_off..block_off + new_block.len()) else {
-        panic!("block range within the file");
-    };
-    target.copy_from_slice(&new_block);
-    std::fs::write(&source, &bytes)?;
+    // Poison the SECOND row group: stamp an invalid value-type tag into the
+    // first row of its value-type page, at the same length, and re-stamp the
+    // page's checksum. The group stays checksum-consistent, so the failure
+    // surfaces in row materialization — not as an ordinary checksum drop.
+    let poisoned_rows = u64::from(forge_row_group_column(
+        &source,
+        &fs,
+        1,
+        crate::table::columnar::COL_VALUE_TYPE,
+        |col, _| {
+            // 0xFF is not a defined ValueType tag. Column bytes are an
+            // immutable view — rebuild the poisoned column.
+            let mut poisoned = col.data.to_vec();
+            let Some(first_byte) = poisoned.first_mut() else {
+                panic!("value-type column is non-empty");
+            };
+            *first_byte = 0xFF;
+            col.data = poisoned.into();
+        },
+    )?);
 
     // Salvage drops exactly the poisoned block and recovers every other one.
     let report = salvage_sst(&source, dest.clone(), &fs)?;
@@ -4851,10 +5468,6 @@ fn salvage_drops_a_columnar_block_with_an_invalid_value_type() -> crate::Result<
 #[cfg(feature = "columnar")]
 #[test]
 fn salvage_drops_a_columnar_block_with_out_of_order_keys() -> crate::Result<()> {
-    use crate::coding::{Decode, Encode};
-    use crate::table::block::Header;
-    use crate::table::columnar::{CodecId, ColumnBatch};
-
     let dir = tempdir()?;
     let source = dir.path().join("source");
     let dest = dir.path().join("salvaged");
@@ -4864,7 +5477,7 @@ fn salvage_drops_a_columnar_block_with_out_of_order_keys() -> crate::Result<()> 
     let mut writer = Writer::new(source.clone(), 0, 0, Arc::clone(&fs))?
         .use_columnar(true)
         .use_zone_map(true)
-        .use_data_block_size(256);
+        .use_row_group_size(256);
     for i in 0..n {
         writer.write(iv(i))?;
     }
@@ -4873,91 +5486,17 @@ fn salvage_drops_a_columnar_block_with_out_of_order_keys() -> crate::Result<()> 
         "source columnar SST is non-empty"
     );
 
-    // Poison the SECOND data block: swap the first two rows' user keys inside
-    // the key column (equal-length keys keep the Bytes framing intact),
-    // re-encode, and re-stamp the header checksum. The block stays
+    // Poison the SECOND row group: swap the first two rows' user keys inside
+    // its key page and re-stamp the page's checksum. The group stays
     // checksum-consistent and its rows materialize fine — only the ordering
     // invariant is broken.
-    let (block_off, block_size) = {
-        let table = open(source.clone(), &fs)?;
-        let Some(kh) = table.data_block_handles().filter_map(Result::ok).nth(1) else {
-            panic!("source must have at least two data blocks");
-        };
-        (
-            usize::try_from(*kh.as_ref().offset()).unwrap_or(usize::MAX),
-            kh.as_ref().size() as usize,
-        )
-    };
-    let mut bytes = std::fs::read(&source)?;
-    let Some(block) = bytes.get(block_off..block_off + block_size) else {
-        panic!("block range within the file");
-    };
-    let mut cursor = block;
-    let header = Header::decode_from(&mut cursor)?;
-    let header_len = Header::header_len(header.block_type);
-    let Some(payload) = block.get(header_len..header_len + header.data_length as usize) else {
-        panic!("payload range within the block");
-    };
-    let mut batch = ColumnBatch::decode(&payload.into())?;
-    let poisoned_rows = u64::from(batch.row_count);
-    assert!(batch.row_count >= 2, "block holds at least two rows");
-    {
-        // Key column framing: (row_count + 1) LE u32 offsets, then payload.
-        let Some(key_col) = batch.columns.first_mut() else {
-            panic!("key column present");
-        };
-        let table_len = (batch.row_count as usize + 1) * 4;
-        let off = |data: &[u8], idx: usize| -> usize {
-            let Some(b) = data.get(idx * 4..idx * 4 + 4) else {
-                panic!("offset {idx} within the frame table");
-            };
-            u32::from_le_bytes(b.try_into().unwrap_or([0; 4])) as usize
-        };
-        let (o0, o1, o2) = (
-            off(&key_col.data, 0),
-            off(&key_col.data, 1),
-            off(&key_col.data, 2),
-        );
-        assert_eq!(o1 - o0, o2 - o1, "adjacent keys are equal-length");
-        let len = o1 - o0;
-        let Some(first) = key_col.data.get(table_len + o0..table_len + o0 + len) else {
-            panic!("first key within the column");
-        };
-        let first = first.to_vec();
-        let Some(second) = key_col.data.get(table_len + o1..table_len + o1 + len) else {
-            panic!("second key within the column");
-        };
-        let second = second.to_vec();
-        // Column bytes are an immutable view now — rebuild the swapped column.
-        let mut swapped = key_col.data.to_vec();
-        let Some(dst0) = swapped.get_mut(table_len + o0..table_len + o0 + len) else {
-            panic!("first key range within the column");
-        };
-        dst0.copy_from_slice(&second);
-        let Some(dst1) = swapped.get_mut(table_len + o1..table_len + o1 + len) else {
-            panic!("second key range within the column");
-        };
-        dst1.copy_from_slice(&first);
-        key_col.data = swapped.into();
-    }
-    let new_payload = batch.encode(CodecId::Plain)?;
-    assert_eq!(
-        new_payload.len(),
-        payload.len(),
-        "an in-place key swap re-encodes to the same length",
-    );
-    let new_header = Header {
-        checksum: crate::Checksum::from_raw(crate::hash::hash128(&new_payload)),
-        ..header
-    };
-    let mut new_block = Vec::with_capacity(header_len + new_payload.len());
-    new_header.encode_into(&mut new_block)?;
-    new_block.extend_from_slice(&new_payload);
-    let Some(target) = bytes.get_mut(block_off..block_off + new_block.len()) else {
-        panic!("block range within the file");
-    };
-    target.copy_from_slice(&new_block);
-    std::fs::write(&source, &bytes)?;
+    let poisoned_rows = u64::from(forge_row_group_column(
+        &source,
+        &fs,
+        1,
+        crate::table::columnar::COL_USER_KEY,
+        swap_first_two_keys,
+    )?);
 
     // Salvage drops exactly the out-of-order block and recovers every other one.
     let report = salvage_sst(&source, dest.clone(), &fs)?;
@@ -4991,10 +5530,6 @@ fn salvage_drops_a_columnar_block_with_out_of_order_keys() -> crate::Result<()> 
 #[cfg(feature = "columnar")]
 #[test]
 fn verify_point_read_reachability_rejects_a_reordered_columnar_block() -> crate::Result<()> {
-    use crate::coding::{Decode, Encode};
-    use crate::table::block::Header;
-    use crate::table::columnar::{CodecId, ColumnBatch};
-
     let dir = tempdir()?;
     let source = dir.path().join("source");
     let fs: Arc<dyn Fs> = Arc::new(StdFs);
@@ -5003,7 +5538,7 @@ fn verify_point_read_reachability_rejects_a_reordered_columnar_block() -> crate:
     let mut writer = Writer::new(source.clone(), 0, 0, Arc::clone(&fs))?
         .use_columnar(true)
         .use_zone_map(true)
-        .use_data_block_size(256);
+        .use_row_group_size(256);
     for i in 0..n {
         writer.write(iv(i))?;
     }
@@ -5012,83 +5547,16 @@ fn verify_point_read_reachability_rejects_a_reordered_columnar_block() -> crate:
         "source columnar SST is non-empty"
     );
 
-    // Swap the first two rows' user keys inside the second block's key column
-    // (equal-length keys keep the framing), re-encode, and re-stamp the header
-    // checksum: the block stays checksum-consistent and its rows materialize,
-    // only the ordering invariant is broken.
-    let (block_off, block_size) = {
-        let table = open(source.clone(), &fs)?;
-        let Some(kh) = table.data_block_handles().filter_map(Result::ok).nth(1) else {
-            panic!("source must have at least two data blocks");
-        };
-        (
-            usize::try_from(*kh.as_ref().offset()).unwrap_or(usize::MAX),
-            kh.as_ref().size() as usize,
-        )
-    };
-    let mut bytes = std::fs::read(&source)?;
-    let Some(block) = bytes.get(block_off..block_off + block_size) else {
-        panic!("block range within the file");
-    };
-    let mut cursor = block;
-    let header = Header::decode_from(&mut cursor)?;
-    let header_len = Header::header_len(header.block_type);
-    let Some(payload) = block.get(header_len..header_len + header.data_length as usize) else {
-        panic!("payload range within the block");
-    };
-    let mut batch = ColumnBatch::decode(&payload.into())?;
-    assert!(batch.row_count >= 2, "block holds at least two rows");
-    {
-        let Some(key_col) = batch.columns.first_mut() else {
-            panic!("key column present");
-        };
-        let table_len = (batch.row_count as usize + 1) * 4;
-        let off = |data: &[u8], idx: usize| -> usize {
-            let Some(b) = data.get(idx * 4..idx * 4 + 4) else {
-                panic!("offset {idx} within the frame table");
-            };
-            u32::from_le_bytes(b.try_into().unwrap_or([0; 4])) as usize
-        };
-        let (o0, o1, o2) = (
-            off(&key_col.data, 0),
-            off(&key_col.data, 1),
-            off(&key_col.data, 2),
-        );
-        assert_eq!(o1 - o0, o2 - o1, "adjacent keys are equal-length");
-        let len = o1 - o0;
-        let Some(first) = key_col.data.get(table_len + o0..table_len + o0 + len) else {
-            panic!("first key within the column");
-        };
-        let first = first.to_vec();
-        let Some(second) = key_col.data.get(table_len + o1..table_len + o1 + len) else {
-            panic!("second key within the column");
-        };
-        let second = second.to_vec();
-        // Column bytes are an immutable view now — rebuild the swapped column.
-        let mut swapped = key_col.data.to_vec();
-        let Some(dst0) = swapped.get_mut(table_len + o0..table_len + o0 + len) else {
-            panic!("first key range within the column");
-        };
-        dst0.copy_from_slice(&second);
-        let Some(dst1) = swapped.get_mut(table_len + o1..table_len + o1 + len) else {
-            panic!("second key range within the column");
-        };
-        dst1.copy_from_slice(&first);
-        key_col.data = swapped.into();
-    }
-    let new_payload = batch.encode(CodecId::Plain)?;
-    let new_header = Header {
-        checksum: crate::Checksum::from_raw(crate::hash::hash128(&new_payload)),
-        ..header
-    };
-    let mut new_block = Vec::with_capacity(header_len + new_payload.len());
-    new_header.encode_into(&mut new_block)?;
-    new_block.extend_from_slice(&new_payload);
-    let Some(target) = bytes.get_mut(block_off..block_off + new_block.len()) else {
-        panic!("block range within the file");
-    };
-    target.copy_from_slice(&new_block);
-    std::fs::write(&source, &bytes)?;
+    // Swap the first two rows' user keys inside the second row group's key
+    // page and re-stamp its checksum: the group stays checksum-consistent and
+    // its rows materialize, only the ordering invariant is broken.
+    forge_row_group_column(
+        &source,
+        &fs,
+        1,
+        crate::table::columnar::COL_USER_KEY,
+        swap_first_two_keys,
+    )?;
 
     let table = open(source, &fs)?;
     let err = reconcile_error(
@@ -5119,126 +5587,29 @@ fn verify_point_read_reachability_rejects_a_reordered_columnar_block() -> crate:
 #[cfg(feature = "columnar")]
 #[test]
 fn salvage_drops_a_zero_row_columnar_block() -> crate::Result<()> {
-    use crate::coding::{Decode, Encode};
-    use crate::table::block::Header;
-    use crate::table::columnar::{
-        COL_SEQNO, COL_USER_KEY, COL_VALUE, COL_VALUE_TYPE, CodecId, Column, ColumnBatch, TypeTag,
-    };
-
     let dir = tempdir()?;
     let source = dir.path().join("source");
     let dest = dir.path().join("salvaged");
     let fs: Arc<dyn Fs> = Arc::new(StdFs);
 
-    // A single-block columnar SST (few rows, default block size). An ODD row
-    // count lets the retry below flip the payload-length parity by growing
-    // every value one byte.
+    // A single-group columnar SST (few rows, default block size).
     let n = 9u32;
-    let build = |value_pad: usize| -> crate::Result<()> {
-        let _ = std::fs::remove_file(&source);
-        let mut writer = Writer::new(source.clone(), 0, 0, Arc::clone(&fs))?.use_columnar(true);
-        for i in 0..n {
-            writer.write(InternalValue::from_components(
-                format!("key{i:05}").into_bytes(),
-                format!("val{i:05}{}", "x".repeat(value_pad)).into_bytes(),
-                1,
-                ValueType::Value,
-            ))?;
-        }
-        assert!(writer.finish()?.is_some(), "source SST is non-empty");
-        Ok(())
-    };
-    build(0)?;
-
-    // The zero-row replacement encodes to 8 (row/column counts) + 44 bytes of
-    // intrinsic + value column headers, padded to the ORIGINAL payload length
-    // with extra empty value sub-columns (Fixed = 10 bytes, Bytes = 14 — every
-    // reachable length is even, so an odd source payload is rebuilt one byte
-    // per value larger to flip its parity).
-    let payload_len = |src: &std::path::Path| -> crate::Result<usize> {
-        let bytes = std::fs::read(src)?;
-        let mut cursor = bytes.as_slice();
-        let header = Header::decode_from(&mut cursor)?;
-        Ok(header.data_length as usize)
-    };
-    let mut target_len = payload_len(&source)?;
-    if target_len % 2 != 0 {
-        build(1)?;
-        target_len = payload_len(&source)?;
+    let mut writer = Writer::new(source.clone(), 0, 0, Arc::clone(&fs))?.use_columnar(true);
+    for i in 0..n {
+        writer.write(InternalValue::from_components(
+            format!("key{i:05}").into_bytes(),
+            format!("val{i:05}").into_bytes(),
+            1,
+            ValueType::Value,
+        ))?;
     }
-    assert_eq!(target_len % 2, 0, "an even payload length is reachable");
+    assert!(writer.finish()?.is_some(), "source SST is non-empty");
 
-    let empty_fixed = |id: u16, width: u8| Column {
-        column_id: id,
-        type_tag: TypeTag::Fixed(width),
-        validity: None,
-        data: Vec::new().into(),
-    };
-    let mut columns = vec![
-        Column {
-            column_id: COL_USER_KEY,
-            type_tag: TypeTag::Bytes,
-            validity: None,
-            // A zero-row Bytes column is exactly its (row_count + 1) * 4 = 4
-            // byte offset table.
-            data: vec![0u8; 4].into(),
-        },
-        empty_fixed(COL_SEQNO, 8),
-        empty_fixed(COL_VALUE_TYPE, 1),
-        empty_fixed(COL_VALUE, 1),
-    ];
-    let Some(mut rem) = target_len.checked_sub(8 + 14 + 10 + 10 + 10) else {
-        panic!("source payload larger than the zero-row skeleton");
-    };
-    let mut next_id = COL_VALUE + 1;
-    // Greedy fill: Bytes columns (+14) until the remainder is divisible by
-    // 10, then Fixed columns (+10).
-    while rem % 10 != 0 {
-        columns.push(Column {
-            column_id: next_id,
-            type_tag: TypeTag::Bytes,
-            validity: None,
-            data: vec![0u8; 4].into(),
-        });
-        next_id += 1;
-        let Some(next_rem) = rem.checked_sub(14) else {
-            panic!("remainder covers a Bytes column");
-        };
-        rem = next_rem;
-    }
-    while rem > 0 {
-        columns.push(empty_fixed(next_id, 1));
-        next_id += 1;
-        rem -= 10;
-    }
-    let batch = ColumnBatch {
-        row_count: 0,
-        columns,
-    };
-    let new_payload = batch.encode(CodecId::Plain)?;
-    assert_eq!(
-        new_payload.len(),
-        target_len,
-        "the zero-row batch pads to the original payload length",
-    );
-
-    // Splice it under a re-stamped checksum (frame length unchanged).
-    let mut bytes = std::fs::read(&source)?;
-    let mut cursor = bytes.as_slice();
-    let header = Header::decode_from(&mut cursor)?;
-    let header_len = Header::header_len(header.block_type);
-    let new_header = Header {
-        checksum: crate::Checksum::from_raw(crate::hash::hash128(&new_payload)),
-        ..header
-    };
-    let mut new_block: Vec<u8> = Vec::with_capacity(header_len + new_payload.len());
-    new_header.encode_into(&mut new_block)?;
-    new_block.extend_from_slice(&new_payload);
-    let Some(target) = bytes.get_mut(..new_block.len()) else {
-        panic!("block range within the file");
-    };
-    target.copy_from_slice(&new_block);
-    std::fs::write(&source, &bytes)?;
+    // Re-stamp the group's directory to declare zero rows. The directory
+    // keeps its length and stays checksum-consistent, so the group is
+    // refused for WHAT it declares — an empty group, which no writer emits —
+    // and not as an ordinary checksum drop.
+    forge_row_group_row_count(&source, &fs, 0, 0)?;
 
     // The zero-row block is DROPPED, so nothing is recoverable: no destination
     // is left behind and no salvaged path is reported (the pre-fix behavior
@@ -5377,7 +5748,7 @@ fn salvage_does_not_resurrect_deletes_in_an_index_omitted_block() -> crate::Resu
     let mut writer = Writer::new(source.clone(), 0, 0, Arc::clone(&fs))?
         .use_columnar(true)
         .use_zone_map(true)
-        .use_data_block_size(256)
+        .use_row_group_size(256)
         .delete_strategy(DeleteStrategy::MergeOnRead);
     for i in 0..n {
         writer.write(iv(i))?;
@@ -5442,10 +5813,7 @@ fn salvage_does_not_resurrect_deletes_in_an_index_omitted_block() -> crate::Resu
 #[cfg(feature = "columnar")]
 #[test]
 fn salvage_drops_an_out_of_order_columnar_block_in_a_delete_bearing_sst() -> crate::Result<()> {
-    use crate::coding::{Decode, Encode};
     use crate::config::DeleteStrategy;
-    use crate::table::block::Header;
-    use crate::table::columnar::{CodecId, ColumnBatch};
 
     let dir = tempdir()?;
     let source = dir.path().join("source");
@@ -5456,7 +5824,7 @@ fn salvage_drops_an_out_of_order_columnar_block_in_a_delete_bearing_sst() -> cra
     let mut writer = Writer::new(source.clone(), 0, 0, Arc::clone(&fs))?
         .use_columnar(true)
         .use_zone_map(true)
-        .use_data_block_size(256)
+        .use_row_group_size(256)
         .delete_strategy(DeleteStrategy::MergeOnRead);
     for i in 0..n {
         writer.write(iv(i))?;
@@ -5470,88 +5838,16 @@ fn salvage_drops_an_out_of_order_columnar_block_in_a_delete_bearing_sst() -> cra
         "source columnar+deletes SST is non-empty",
     );
 
-    // Poison the SECOND data block exactly like the delete-free variant: swap
-    // the first two rows' user keys inside the key column and re-stamp the
+    // Poison the SECOND row group exactly like the delete-free variant: swap
+    // the first two rows' user keys inside its key page and re-stamp the
     // checksum. Row counts stay intact, so the delete positions still verify.
-    let (block_off, block_size) = {
-        let table = open(source.clone(), &fs)?;
-        let Some(kh) = table.data_block_handles().filter_map(Result::ok).nth(1) else {
-            panic!("source must have at least two data blocks");
-        };
-        (
-            usize::try_from(*kh.as_ref().offset()).unwrap_or(usize::MAX),
-            kh.as_ref().size() as usize,
-        )
-    };
-    let mut bytes = std::fs::read(&source)?;
-    let Some(block) = bytes.get(block_off..block_off + block_size) else {
-        panic!("block range within the file");
-    };
-    let mut cursor = block;
-    let header = Header::decode_from(&mut cursor)?;
-    let header_len = Header::header_len(header.block_type);
-    let Some(payload) = block.get(header_len..header_len + header.data_length as usize) else {
-        panic!("payload range within the block");
-    };
-    let mut batch = ColumnBatch::decode(&payload.into())?;
-    let poisoned_rows = u64::from(batch.row_count);
-    assert!(batch.row_count >= 2, "block holds at least two rows");
-    {
-        let Some(key_col) = batch.columns.first_mut() else {
-            panic!("key column present");
-        };
-        let table_len = (batch.row_count as usize + 1) * 4;
-        let off = |data: &[u8], idx: usize| -> usize {
-            let Some(b) = data.get(idx * 4..idx * 4 + 4) else {
-                panic!("offset {idx} within the frame table");
-            };
-            u32::from_le_bytes(b.try_into().unwrap_or([0; 4])) as usize
-        };
-        let (o0, o1, o2) = (
-            off(&key_col.data, 0),
-            off(&key_col.data, 1),
-            off(&key_col.data, 2),
-        );
-        assert_eq!(o1 - o0, o2 - o1, "adjacent keys are equal-length");
-        let len = o1 - o0;
-        let Some(first) = key_col.data.get(table_len + o0..table_len + o0 + len) else {
-            panic!("first key within the column");
-        };
-        let first = first.to_vec();
-        let Some(second) = key_col.data.get(table_len + o1..table_len + o1 + len) else {
-            panic!("second key within the column");
-        };
-        let second = second.to_vec();
-        // Column bytes are an immutable view now — rebuild the swapped column.
-        let mut swapped = key_col.data.to_vec();
-        let Some(dst0) = swapped.get_mut(table_len + o0..table_len + o0 + len) else {
-            panic!("first key range within the column");
-        };
-        dst0.copy_from_slice(&second);
-        let Some(dst1) = swapped.get_mut(table_len + o1..table_len + o1 + len) else {
-            panic!("second key range within the column");
-        };
-        dst1.copy_from_slice(&first);
-        key_col.data = swapped.into();
-    }
-    let new_payload = batch.encode(CodecId::Plain)?;
-    assert_eq!(
-        new_payload.len(),
-        payload.len(),
-        "an in-place key swap re-encodes to the same length",
-    );
-    let new_header = Header {
-        checksum: crate::Checksum::from_raw(crate::hash::hash128(&new_payload)),
-        ..header
-    };
-    let mut new_block = Vec::with_capacity(header_len + new_payload.len());
-    new_header.encode_into(&mut new_block)?;
-    new_block.extend_from_slice(&new_payload);
-    let Some(target) = bytes.get_mut(block_off..block_off + new_block.len()) else {
-        panic!("block range within the file");
-    };
-    target.copy_from_slice(&new_block);
-    std::fs::write(&source, &bytes)?;
+    let poisoned_rows = u64::from(forge_row_group_column(
+        &source,
+        &fs,
+        1,
+        crate::table::columnar::COL_USER_KEY,
+        swap_first_two_keys,
+    )?);
 
     let report = salvage_sst(&source, dest.clone(), &fs)?;
     assert_eq!(
@@ -5660,7 +5956,7 @@ fn salvage_refuses_a_delete_bitmap_relabeled_to_a_full_filter() -> crate::Result
     let mut writer = Writer::new(source.clone(), 0, 0, Arc::clone(&fs))?
         .use_columnar(true)
         .use_zone_map(true)
-        .use_data_block_size(256)
+        .use_row_group_size(256)
         .use_bloom_policy(BloomConstructionPolicy::BitsPerKey(0.0))
         .delete_strategy(DeleteStrategy::MergeOnRead);
     for i in 0..n {
@@ -5720,7 +6016,7 @@ fn salvage_refuses_a_delete_bitmap_renamed_to_a_filter_without_reroling() -> cra
     let mut writer = Writer::new(source.clone(), 0, 0, Arc::clone(&fs))?
         .use_columnar(true)
         .use_zone_map(true)
-        .use_data_block_size(256)
+        .use_row_group_size(256)
         .use_bloom_policy(BloomConstructionPolicy::BitsPerKey(0.0))
         .delete_strategy(DeleteStrategy::MergeOnRead);
     for i in 0..n {
@@ -5779,7 +6075,7 @@ fn salvage_fails_closed_on_a_corrupt_delete_bitmap_by_default() -> crate::Result
     let mut writer = Writer::new(source.clone(), 0, 0, Arc::clone(&fs))?
         .use_columnar(true)
         .use_zone_map(true)
-        .use_data_block_size(256)
+        .use_row_group_size(256)
         .delete_strategy(DeleteStrategy::MergeOnRead);
     for i in 0..n {
         writer.write(iv(i))?;
@@ -5840,7 +6136,7 @@ fn salvage_fails_closed_on_an_unpositionable_delete_bitmap_by_default() -> crate
     let mut writer = Writer::new(source.clone(), 0, 0, Arc::clone(&fs))?
         .use_columnar(true)
         .use_zone_map(true)
-        .use_data_block_size(256)
+        .use_row_group_size(256)
         .delete_strategy(DeleteStrategy::MergeOnRead);
     for i in 0..n {
         writer.write(iv(i))?;
@@ -5904,7 +6200,7 @@ fn salvage_tolerates_a_corrupt_delete_bitmap_as_all_live() -> crate::Result<()> 
     let mut writer = Writer::new(source.clone(), 0, 0, Arc::clone(&fs))?
         .use_columnar(true)
         .use_zone_map(true)
-        .use_data_block_size(256)
+        .use_row_group_size(256)
         .delete_strategy(DeleteStrategy::MergeOnRead);
     for i in 0..n {
         writer.write(iv(i))?;
@@ -5996,7 +6292,7 @@ fn salvage_tolerates_a_persistently_unreadable_delete_bitmap_as_all_live() -> cr
     let mut writer = Writer::new(source.clone(), 0, 0, Arc::clone(&clean))?
         .use_columnar(true)
         .use_zone_map(true)
-        .use_data_block_size(256)
+        .use_row_group_size(256)
         .delete_strategy(DeleteStrategy::MergeOnRead);
     for i in 0..n {
         writer.write(iv(i))?;
@@ -6142,7 +6438,7 @@ fn salvage_fails_closed_on_an_unreadable_block_in_a_delete_bearing_sst() -> crat
     let mut writer = Writer::new(source.clone(), 0, 0, Arc::clone(&fs))?
         .use_columnar(true)
         .use_zone_map(true)
-        .use_data_block_size(256)
+        .use_row_group_size(256)
         .delete_strategy(DeleteStrategy::MergeOnRead);
     for i in 0..n {
         writer.write(iv(i))?;
@@ -6233,9 +6529,6 @@ fn salvage_fails_closed_on_a_zero_row_block_in_a_delete_bearing_sst() -> crate::
     use crate::coding::{Decode, Encode};
     use crate::config::DeleteStrategy;
     use crate::table::block::Header;
-    use crate::table::columnar::{
-        COL_SEQNO, COL_USER_KEY, COL_VALUE, COL_VALUE_TYPE, CodecId, Column, ColumnBatch, TypeTag,
-    };
 
     let dir = tempdir()?;
     let source = dir.path().join("source");
@@ -6246,7 +6539,7 @@ fn salvage_fails_closed_on_a_zero_row_block_in_a_delete_bearing_sst() -> crate::
     let mut writer = Writer::new(source.clone(), 0, 0, Arc::clone(&fs))?
         .use_columnar(true)
         .use_zone_map(true)
-        .use_data_block_size(256)
+        .use_row_group_size(256)
         .delete_strategy(DeleteStrategy::MergeOnRead);
     for i in 0..n {
         writer.write(iv(i))?;
@@ -6259,88 +6552,11 @@ fn salvage_fails_closed_on_a_zero_row_block_in_a_delete_bearing_sst() -> crate::
         "source columnar+deletes SST is non-empty",
     );
 
-    // Replace the SECOND data block with a length-preserving ZERO-ROW batch
-    // (skeleton + padding columns, checksum re-stamped) — the same forgery
-    // the plain zero-row test uses.
-    let (block_off, block_size) = {
-        let table = open(source.clone(), &fs)?;
-        let Some(kh) = table.data_block_handles().filter_map(Result::ok).nth(1) else {
-            panic!("source must have at least two data blocks");
-        };
-        (
-            usize::try_from(*kh.as_ref().offset()).unwrap_or(usize::MAX),
-            kh.as_ref().size() as usize,
-        )
-    };
+    // Re-stamp the SECOND row group's directory to declare zero rows —
+    // length-preserving and checksum-consistent, the same forgery the plain
+    // zero-row test uses.
+    forge_row_group_row_count(&source, &fs, 1, 0)?;
     let mut bytes = std::fs::read(&source)?;
-    let Some(block) = bytes.get(block_off..block_off + block_size) else {
-        panic!("block range within the file");
-    };
-    let mut cursor = block;
-    let header = Header::decode_from(&mut cursor)?;
-    let header_len = Header::header_len(header.block_type);
-    let target_len = header.data_length as usize;
-    assert_eq!(
-        target_len % 2,
-        0,
-        "the padded skeleton needs an even length"
-    );
-    let empty_fixed = |id: u16, width: u8| Column {
-        column_id: id,
-        type_tag: TypeTag::Fixed(width),
-        validity: None,
-        data: Vec::new().into(),
-    };
-    let mut columns = vec![
-        Column {
-            column_id: COL_USER_KEY,
-            type_tag: TypeTag::Bytes,
-            validity: None,
-            data: vec![0u8; 4].into(),
-        },
-        empty_fixed(COL_SEQNO, 8),
-        empty_fixed(COL_VALUE_TYPE, 1),
-        empty_fixed(COL_VALUE, 1),
-    ];
-    let Some(mut rem) = target_len.checked_sub(8 + 14 + 10 + 10 + 10) else {
-        panic!("source payload larger than the zero-row skeleton");
-    };
-    let mut next_id = COL_VALUE + 1;
-    while rem % 10 != 0 {
-        columns.push(Column {
-            column_id: next_id,
-            type_tag: TypeTag::Bytes,
-            validity: None,
-            data: vec![0u8; 4].into(),
-        });
-        next_id += 1;
-        let Some(next_rem) = rem.checked_sub(14) else {
-            panic!("remainder covers a Bytes column");
-        };
-        rem = next_rem;
-    }
-    while rem > 0 {
-        columns.push(empty_fixed(next_id, 1));
-        next_id += 1;
-        rem -= 10;
-    }
-    let new_payload = ColumnBatch {
-        row_count: 0,
-        columns,
-    }
-    .encode(CodecId::Plain)?;
-    assert_eq!(new_payload.len(), target_len, "length-preserving forgery");
-    let new_header = Header {
-        checksum: crate::Checksum::from_raw(crate::hash::hash128(&new_payload)),
-        ..header
-    };
-    let mut new_block: Vec<u8> = Vec::with_capacity(header_len + new_payload.len());
-    new_header.encode_into(&mut new_block)?;
-    new_block.extend_from_slice(&new_payload);
-    let Some(target) = bytes.get_mut(block_off..block_off + new_block.len()) else {
-        panic!("block range within the file");
-    };
-    target.copy_from_slice(&new_block);
 
     // Patch the zone map's row_count claim for the second block to 0 (the
     // first column's count drives the derived delete starts) and re-stamp
@@ -6551,7 +6767,7 @@ fn salvage_fails_closed_on_an_undecodable_checksum_clean_block_with_deletes() ->
     let mut writer = Writer::new(source.clone(), 0, 0, Arc::clone(&fs))?
         .use_columnar(true)
         .use_zone_map(true)
-        .use_data_block_size(256)
+        .use_row_group_size(256)
         .delete_strategy(DeleteStrategy::MergeOnRead);
     for i in 0..n {
         writer.write(iv(i))?;
@@ -6682,7 +6898,7 @@ fn salvage_fails_closed_on_a_zone_map_with_wrong_row_counts() -> crate::Result<(
     let mut writer = Writer::new(source.clone(), 0, 0, Arc::clone(&fs))?
         .use_columnar(true)
         .use_zone_map(true)
-        .use_data_block_size(256)
+        .use_row_group_size(256)
         .delete_strategy(DeleteStrategy::MergeOnRead);
     for i in 0..n {
         writer.write(iv(i))?;
@@ -6804,7 +7020,7 @@ fn salvage_ignores_a_delete_bitmap_without_a_readable_zone_map() -> crate::Resul
     let mut writer = Writer::new(source.clone(), 0, 0, Arc::clone(&fs))?
         .use_columnar(true)
         .use_zone_map(true)
-        .use_data_block_size(256)
+        .use_row_group_size(256)
         .delete_strategy(DeleteStrategy::MergeOnRead);
     for i in 0..n {
         writer.write(iv(i))?;
@@ -6966,7 +7182,7 @@ fn salvage_skips_a_wholly_deleted_block() -> crate::Result<()> {
     let mut writer = Writer::new(source.clone(), 0, 0, Arc::clone(&fs))?
         .use_columnar(true)
         .use_zone_map(true)
-        .use_data_block_size(256)
+        .use_row_group_size(256)
         .delete_strategy(DeleteStrategy::MergeOnRead);
     for i in 0..n {
         writer.write(iv(i))?;
@@ -7229,6 +7445,86 @@ fn salvage_recovers_an_encrypted_sst_with_the_provider() -> crate::Result<()> {
         reopened.metadata.item_count, report.entries_salvaged,
         "the encrypted salvaged copy reopens with exactly the recovered entries",
     );
+    Ok(())
+}
+
+/// A copy published under a new id reads back: an encrypted block is sealed
+/// under its table id, so a byte copy of the source's blocks would not decrypt
+/// under the copy's id. A plain source is still copied byte for byte.
+#[cfg(feature = "encryption")]
+#[test]
+fn a_salvaged_copy_under_a_new_id_reads_every_value() -> crate::Result<()> {
+    let dir = tempdir()?;
+    let fs: Arc<dyn Fs> = Arc::new(StdFs);
+    let key_provider: Arc<dyn crate::encryption::EncryptionProvider> =
+        Arc::new(crate::encryption::Aes256GcmProvider::new(&[0x42; 32]));
+    let (source_id, output_id) = (3, 4);
+
+    let layouts: &[bool] = if cfg!(feature = "columnar") {
+        &[false, true]
+    } else {
+        &[false]
+    };
+    for &columnar in layouts {
+        for enc in [None, Some(&key_provider)] {
+            let name = format!("{columnar}-{}", enc.is_some());
+            let source = dir.path().join(format!("{name}-source"));
+            let dest = dir.path().join(format!("{name}-copy"));
+            let mut writer = Writer::new(source.clone(), source_id, 0, Arc::clone(&fs))?
+                .use_columnar(columnar)
+                .use_encryption(enc.map(Arc::clone));
+            for i in 0..20_u32 {
+                writer.write(InternalValue::from_components(
+                    format!("key{i:05}").into_bytes(),
+                    format!("val{i:05}").into_bytes(),
+                    1,
+                    ValueType::Value,
+                ))?;
+            }
+            assert!(writer.finish()?.is_some(), "source is non-empty");
+
+            let options = SalvageOptions {
+                encryption: enc.map(Arc::clone),
+                #[cfg(zstd_any)]
+                zstd_dictionary: None,
+                #[cfg(zstd_any)]
+                zstd_dictionaries: crate::compression::ZstdDictionaries::new(),
+                table_id: source_id,
+                expected_stored_id: None,
+                output_id: Some(output_id),
+                allow_delete_resurrection: false,
+                sync_mode: crate::fs::SyncMode::Normal,
+                prefix_extractor: None,
+                blob_rewrite: None,
+                progress: None,
+            };
+            let report = salvage_sst_with_options(&source, dest.clone(), &fs, &options)?;
+            assert!(
+                report.dropped.is_empty(),
+                "{name}: a clean source: {report:?}"
+            );
+
+            let copy = open_as(dest, &fs, enc, output_id)?;
+            for i in 0..20_u32 {
+                let key = format!("key{i:05}");
+                let got = copy.get(
+                    key.as_bytes(),
+                    crate::MAX_SEQNO,
+                    crate::hash::hash64(key.as_bytes()),
+                );
+                let value = match got {
+                    Ok(Some(entry)) => entry.value,
+                    other => panic!("{name}: {key} in the copy, got {other:?}"),
+                };
+                assert_eq!(&*value, format!("val{i:05}").as_bytes(), "{name}: {key}");
+            }
+            assert_eq!(
+                report.blocks_copied_verbatim > 0,
+                enc.is_none(),
+                "{name}: only a plain source is copied byte for byte: {report:?}",
+            );
+        }
+    }
     Ok(())
 }
 
@@ -9628,6 +9924,113 @@ fn salvage_reencodes_an_ecc_recovered_columnar_block() -> crate::Result<()> {
     Ok(())
 }
 
+/// A salvage whose output mixes copied and re-encoded row groups after a lost
+/// one. A copy keeps its pages' group tag, so the copy's tags no longer match
+/// its ordinals, and a re-encoded group must take a tag no copy already holds:
+/// two groups sharing a tag would let their pages pass for each other's. Here
+/// group 0 is lost, group 1 is re-encoded because the loss suppresses its
+/// boundary key, group 2 is copied with its tag, and group 3 is healed from
+/// parity and re-encoded after it. Group 1, the copy's first, takes the tag it
+/// replaces, so group 2 can still be copied above it; group 3 takes the next
+/// tag above group 2's.
+#[cfg(all(feature = "columnar", feature = "page_ecc"))]
+#[test]
+fn salvage_keeps_row_group_tags_unique_when_copies_and_reencodes_mix() -> crate::Result<()> {
+    use crate::table::block::EccParams;
+    use crate::table::columnar::entries_to_column_batch;
+
+    let dir = tempdir()?;
+    let source = dir.path().join("source");
+    let dest = dir.path().join("salvaged");
+    let fs: Arc<dyn Fs> = Arc::new(StdFs);
+    let cmp = default_comparator();
+    let key = |i: u32| format!("k{i:04}").into_bytes();
+
+    let mut writer = Writer::new(source.clone(), 0, 0, Arc::clone(&fs))?
+        .use_columnar(true)
+        .use_ecc(Some(EccParams::RS_4_2));
+    for group in 0..4u32 {
+        let entries: Vec<InternalValue> = (0..4u32)
+            .map(|i| {
+                InternalValue::from_components(
+                    key(group * 4 + i),
+                    b"x".to_vec(),
+                    0,
+                    ValueType::Value,
+                )
+            })
+            .collect();
+        writer.write_columnar_batch(&entries_to_column_batch(&entries)?, &cmp)?;
+    }
+    assert!(writer.finish()?.is_some(), "source is non-empty");
+
+    let offsets: Vec<usize> = {
+        let table = open(source.clone(), &fs)?;
+        table
+            .data_block_handles()
+            .filter_map(Result::ok)
+            .map(|kh| usize::try_from(*kh.as_ref().offset()).unwrap_or(usize::MAX))
+            .collect()
+    };
+    let [lost, lost_end, _, healed] = offsets[..] else {
+        panic!("source has four row groups, got {offsets:?}");
+    };
+    let mut bytes = std::fs::read(&source)?;
+    // Past what RS(4,2) corrects: every byte of the lost group after its
+    // directory's header, parity included.
+    let header_len = crate::table::block::Header::MIN_LEN;
+    let Some(lost_bytes) = bytes.get_mut(lost + header_len..lost_end) else {
+        panic!("lost group within the file");
+    };
+    for b in lost_bytes {
+        *b ^= 0xFF;
+    }
+    // One byte, which parity restores: the healed group is re-encoded.
+    let Some(b) = bytes.get_mut(healed + header_len + 3) else {
+        panic!("healed group within the file");
+    };
+    *b ^= 0x80;
+    std::fs::write(&source, &bytes)?;
+
+    let report = salvage_sst(&source, dest.clone(), &fs)?;
+    assert_eq!(
+        report.dropped.len(),
+        1,
+        "only the first group is lost: {report:?}"
+    );
+    assert_eq!(report.blocks_salvaged, 3, "{report:?}");
+    assert_eq!(
+        report.blocks_copied_verbatim, 1,
+        "the clean group keeps its bytes, so the tag rule did not force a re-encode: {report:?}",
+    );
+
+    let recovered = open(dest, &fs)?;
+    let tags: Vec<u64> = recovered
+        .data_block_handles()
+        .filter_map(Result::ok)
+        .map(|kh| {
+            recovered
+                .salvage_load_row_group(kh.as_ref())
+                .map(|g| g.group.directory.group_tag())
+        })
+        .collect::<crate::Result<_>>()?;
+    assert!(
+        tags.is_sorted_by(|a, b| a < b),
+        "row group tags must strictly increase in the copy, got {tags:?}",
+    );
+    // Row 4 is the suppressed boundary key; every row after it survives.
+    for i in 5..16u32 {
+        let k = key(i);
+        assert!(
+            recovered
+                .get(&k, crate::MAX_SEQNO, crate::hash::hash64(&k))?
+                .is_some(),
+            "row {i} of a recovered group must read back",
+        );
+    }
+    Ok(())
+}
+
 /// Salvage decides key identity the way the rest of the engine does, so a
 /// version whose bytes differ is a DIFFERENT key and survives the loss of its
 /// neighbour. That is not a shortcut for ordering: a comparator that called two
@@ -10221,7 +10624,7 @@ fn salvage_drops_a_columnar_boundary_key_when_its_newest_version_is_lost() -> cr
     // block 2 and its older value the whole of block 3.
     let mut writer = Writer::new(source.clone(), 0, 0, Arc::clone(&fs))?
         .use_columnar(true)
-        .use_data_block_size(1);
+        .use_row_group_size(1);
     writer.write(InternalValue::from_components(
         b"a",
         b"v",

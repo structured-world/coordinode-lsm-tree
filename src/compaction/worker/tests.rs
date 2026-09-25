@@ -3051,6 +3051,7 @@ fn a_reopened_blob_view_needs_binding_to_carry_the_deletion_pause() -> crate::Re
     reopened.bind_to_tree(&crate::table::TableSinks {
         deletion_pause: &tree.index.deletion_pause,
         heal_hints: &tree.index.heal_hints,
+        read_budget: tree.index.config.columnar_read_budget,
         #[cfg(feature = "std")]
         background_deleter: None,
     });

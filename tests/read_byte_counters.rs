@@ -714,14 +714,13 @@ fn streaming_a_single_segment_copies_nothing() {
 }
 
 #[test]
-fn a_narrow_projection_over_wide_rows_counts_the_columns_it_detaches() {
-    // A key-only projection over rows carrying a large value covers a sliver
-    // of each block, so the decoder copies the key column out rather than
-    // keep the whole block alive for it. That copy is a gather like any
-    // other: without a predicate, delete mask or range bound no later stage
-    // charges anything, so if the decode-time copy went uncounted a
-    // projection would look zero-copy exactly when it copies every byte it
-    // returns.
+fn a_narrow_projection_over_wide_rows_copies_nothing() {
+    // A key-only projection over rows carrying a large value: each column is
+    // its own page, so the key column comes back as a view of the key page
+    // alone, which pins no value bytes, and nothing has to be detached to
+    // avoid holding the group. Without a predicate, delete mask or range bound
+    // no later stage gathers either. A copy charged here would be one the
+    // read did not make, or a view the reader started detaching again.
     let (_folder, tree) = columnar_segment(1_000, 4_096);
     let m = tree.metrics();
     let before = m.bytes_copied();
@@ -736,9 +735,295 @@ fn a_narrow_projection_over_wide_rows_counts_the_columns_it_detaches() {
     assert!(returned > 0, "the scan must return the keys");
 
     let copied = m.bytes_copied() - before;
+    assert_eq!(
+        copied, 0,
+        "the projection returned {returned} B of keys as page views but charged {copied} B",
+    );
+}
+
+/// A columnar segment whose row groups hold many rows: 128 KiB groups, the
+/// geometry pages are for. At a 4 KiB group of 4 KiB rows every group is one
+/// row and one device read, and no page layout can make a projection cheaper.
+fn wide_columnar_segment(n: u32, value_len: usize) -> (TempDir, Tree) {
+    let folder = get_tmp_folder();
+    let AnyTree::Standard(tree) = Config::new(
+        folder.path(),
+        SequenceNumberCounter::default(),
+        SequenceNumberCounter::default(),
+    )
+    .columnar_row_group_size_policy(lsm_tree::config::BlockSizePolicy::all(128 * 1_024))
+    .open()
+    .expect("open") else {
+        panic!("expected a standard tree");
+    };
+    tree.update_runtime_config(|cfg| {
+        cfg.columnar = true;
+        cfg.zone_map = true;
+    })
+    .expect("enable columnar");
+    for i in 0..n {
+        tree.insert(key(i), vec![b'v'; value_len], u64::from(i));
+    }
+    tree.flush_active_memtable(0).expect("flush");
+    (folder, tree)
+}
+
+/// Bytes read and decoded by one pass of `projection` over a fresh
+/// [`wide_columnar_segment`], so no pass is served by another's cache.
+fn projection_cost(n: u32, value_len: usize, projection: &[u16]) -> (u64, u64) {
+    let (_folder, tree) = wide_columnar_segment(n, value_len);
+    let m = tree.metrics();
+    let (read, decoded) = (m.bytes_read(), m.bytes_decoded());
+    let mut rows = 0;
+    for batch in tree
+        .columnar_scan(projection, None, SeqNo::MAX, ..)
+        .expect("scan")
+    {
+        rows += batch.expect("batch").row_count;
+    }
+    assert_eq!(rows, n, "the projection must return every row");
+    (m.bytes_read() - read, m.bytes_decoded() - decoded)
+}
+
+#[test]
+fn a_narrow_projection_over_wide_rows_reads_and_decodes_only_its_pages() {
+    // The acceptance the page layout exists for: projecting the keys out of
+    // rows that carry a 4 KiB value must not pay for the values. A smaller
+    // returned batch with the same bytes read would be a cosmetic projection,
+    // so both counters are held to it, against a pass that reads the values.
+    let (keys_read, keys_decoded) = projection_cost(1_000, 4_096, &[COL_USER_KEY]);
+    let (all_read, all_decoded) = projection_cost(1_000, 4_096, &[COL_USER_KEY, COL_VALUE]);
     assert!(
-        copied >= returned,
-        "the projection detached {returned} B of keys from the blocks but charged {copied} B",
+        keys_read > 0 && keys_decoded > 0,
+        "the key pass must read its pages",
+    );
+    assert!(
+        keys_read * 20 < all_read,
+        "a key-only projection read {keys_read} B against {all_read} B for keys and values",
+    );
+    assert!(
+        keys_decoded * 20 < all_decoded,
+        "a key-only projection decoded {keys_decoded} B against {all_decoded} B for keys and \
+         values",
+    );
+}
+
+#[test]
+fn a_columnar_point_read_that_misses_reads_a_fraction_of_its_group() {
+    // A point read asks the key page before anything else, so a key the group
+    // does not hold costs the directory prefix and the key page, not the
+    // group. Without a filter the miss reaches the group; with 128 KiB groups
+    // of 4 KiB rows the rest of the group is the values, which a miss never
+    // needs.
+    let folder = get_tmp_folder();
+    let AnyTree::Standard(tree) = Config::new(
+        folder.path(),
+        SequenceNumberCounter::default(),
+        SequenceNumberCounter::default(),
+    )
+    .filter_policy(lsm_tree::config::FilterPolicy::disabled())
+    .columnar_row_group_size_policy(lsm_tree::config::BlockSizePolicy::all(128 * 1_024))
+    .open()
+    .expect("open") else {
+        panic!("expected a standard tree");
+    };
+    tree.update_runtime_config(|cfg| cfg.columnar = true)
+        .expect("enable columnar");
+    for i in 0..200 {
+        tree.insert(key(2 * i), vec![b'v'; 4_096], u64::from(i));
+    }
+    tree.flush_active_memtable(0).expect("flush");
+
+    let m = tree.metrics();
+    let before = m.bytes_read();
+    assert!(
+        tree.get(key(7), SeqNo::MAX).expect("get").is_none(),
+        "an odd key was never written",
+    );
+    let miss = m.bytes_read() - before;
+    assert!(
+        miss > 0 && miss < 16 * 1_024,
+        "a miss read {miss} B of a 128 KiB group; it needs only the directory and key page",
+    );
+}
+
+#[test]
+fn a_columnar_point_read_that_hits_reads_only_the_row_page_holding_its_key() {
+    // A hit reads the key pages to find the key, then only the row page that
+    // holds it: with 128 KiB groups of 4 KiB rows cut into 4 KiB row pages,
+    // that is one row's value, not the group's.
+    let folder = get_tmp_folder();
+    let AnyTree::Standard(tree) = Config::new(
+        folder.path(),
+        SequenceNumberCounter::default(),
+        SequenceNumberCounter::default(),
+    )
+    .filter_policy(lsm_tree::config::FilterPolicy::disabled())
+    .columnar_row_group_size_policy(lsm_tree::config::BlockSizePolicy::all(128 * 1_024))
+    .columnar_page_size_policy(lsm_tree::config::BlockSizePolicy::all(4 * 1_024))
+    .open()
+    .expect("open") else {
+        panic!("expected a standard tree");
+    };
+    tree.update_runtime_config(|cfg| cfg.columnar = true)
+        .expect("enable columnar");
+    for i in 0..200 {
+        tree.insert(key(i), vec![b'v'; 4_096], u64::from(i));
+    }
+    tree.flush_active_memtable(0).expect("flush");
+
+    let m = tree.metrics();
+    let before = m.bytes_read();
+    let got = tree
+        .get(key(7), SeqNo::MAX)
+        .expect("get")
+        .expect("a written key");
+    assert_eq!(got.len(), 4_096);
+    let hit = m.bytes_read() - before;
+    assert!(
+        hit > 4_096 && hit < 16 * 1_024,
+        "a hit read {hit} B of a 128 KiB group; it needs the key pages and one row page",
+    );
+}
+
+/// Row `i`'s value in [`zoned_tree`]: distinct, ascending with the key.
+fn zoned_value(i: u32) -> Vec<u8> {
+    let mut value = format!("val{i:06}").into_bytes();
+    value.resize(100, b'v');
+    value
+}
+
+/// A columnar tree of `n` rows with [`zoned_value`]s in 128 KiB groups of
+/// 4 KiB row pages: some thirty row pages a group, each with its zones.
+fn zoned_tree(n: u32) -> (TempDir, Tree) {
+    let folder = get_tmp_folder();
+    let AnyTree::Standard(tree) = Config::new(
+        folder.path(),
+        SequenceNumberCounter::default(),
+        SequenceNumberCounter::default(),
+    )
+    .filter_policy(lsm_tree::config::FilterPolicy::disabled())
+    .columnar_row_group_size_policy(lsm_tree::config::BlockSizePolicy::all(128 * 1_024))
+    .columnar_page_size_policy(lsm_tree::config::BlockSizePolicy::all(4 * 1_024))
+    .open()
+    .expect("open") else {
+        panic!("expected a standard tree");
+    };
+    tree.update_runtime_config(|cfg| {
+        cfg.columnar = true;
+        cfg.zone_map = true;
+    })
+    .expect("enable columnar");
+    for i in 0..n {
+        tree.insert(key(i), zoned_value(i), u64::from(i));
+    }
+    tree.flush_active_memtable(0).expect("flush");
+    (folder, tree)
+}
+
+/// Bytes read and rows returned by one predicate scan of `predicate` over a
+/// fresh [`zoned_tree`] of 2000 rows.
+fn predicate_cost(predicate: &ColumnRangePredicate) -> (u64, u32) {
+    let (_folder, tree) = zoned_tree(2_000);
+    let m = tree.metrics();
+    let before = m.bytes_read();
+    let mut rows = 0;
+    for batch in tree
+        .columnar_scan(&[COL_USER_KEY, COL_VALUE], Some(predicate), SeqNo::MAX, ..)
+        .expect("scan")
+    {
+        rows += batch.expect("batch").row_count;
+    }
+    (m.bytes_read() - before, rows)
+}
+
+#[test]
+fn a_key_predicate_reads_the_row_pages_its_zones_admit_not_the_group() {
+    // The zone map admits the one group holding the keys; the key zones in
+    // its directory admit the one or two row pages holding them. What is read
+    // is the directory and those pages, not the group's 128 KiB.
+    let (read, rows) = predicate_cost(&ColumnRangePredicate {
+        column_id: COL_USER_KEY,
+        lower: Some(key(500)),
+        upper: Some(key(520)),
+    });
+    assert_eq!(rows, 21, "the predicate selects 21 keys");
+    assert!(
+        read < 24 * 1_024,
+        "a 21-row key range read {read} B; it needs the directory and a couple of row pages",
+    );
+}
+
+#[test]
+fn a_value_predicate_reads_its_zone_block_and_the_row_pages_it_admits() {
+    // Zones of the value column are in the zone block after the pages, so a
+    // predicate on it reads that block, then only the row pages whose value
+    // zones admit it.
+    let (read, rows) = predicate_cost(&ColumnRangePredicate {
+        column_id: COL_VALUE,
+        lower: Some(zoned_value(500)),
+        upper: Some(zoned_value(520)),
+    });
+    assert_eq!(rows, 21, "the predicate selects 21 values");
+    assert!(
+        read < 32 * 1_024,
+        "a 21-row value range read {read} B; it needs the directory, the zone block and a \
+         couple of row pages",
+    );
+}
+
+#[test]
+fn a_columnar_point_read_that_hits_reads_one_key_page_not_every_one() {
+    // The key zones name the row page that can hold the key, so a hit reads
+    // that row page's key page and its other pages, not the key pages of the
+    // whole group.
+    let (_folder, tree) = zoned_tree(2_000);
+    let m = tree.metrics();
+    let before = m.bytes_read();
+    let got = tree
+        .get(key(700), SeqNo::MAX)
+        .expect("get")
+        .expect("a written key");
+    assert_eq!(&*got, zoned_value(700).as_slice());
+    let hit = m.bytes_read() - before;
+    assert!(
+        hit < 12 * 1_024,
+        "a hit read {hit} B; it needs the directory, one key page and one row page",
+    );
+}
+
+#[test]
+fn a_projection_repeated_from_the_cache_reads_nothing_and_a_wider_one_only_new_pages() {
+    // Pages are cached one by one, so a second projection over the same rows
+    // is served from the cache, and a wider one reads only the pages the first
+    // did not: the directory and the key pages are already there.
+    let (_folder, tree) = wide_columnar_segment(1_000, 4_096);
+    let m = tree.metrics();
+    let scan = |projection: &[u16]| {
+        for batch in tree
+            .columnar_scan(projection, None, SeqNo::MAX, ..)
+            .expect("scan")
+        {
+            batch.expect("batch");
+        }
+    };
+
+    scan(&[COL_USER_KEY]);
+    let after_keys = m.bytes_read();
+    scan(&[COL_USER_KEY]);
+    assert_eq!(
+        m.bytes_read(),
+        after_keys,
+        "a repeated projection must be served from the cache",
+    );
+
+    scan(&[COL_USER_KEY, COL_VALUE]);
+    let widened = m.bytes_read() - after_keys;
+    let (all_read, _) = projection_cost(1_000, 4_096, &[COL_USER_KEY, COL_VALUE]);
+    assert!(
+        widened > 0 && widened < all_read,
+        "widening the projection read {widened} B; a cold pass for the same columns reads \
+         {all_read} B, and the cached directory and key pages must not be read again",
     );
 }
 
@@ -796,16 +1081,17 @@ fn a_merged_columnar_scan_counts_the_seqno_column_it_rewrites() -> lsm_tree::Res
     // the surviving rows and then writes each one's effective seqno into a new
     // column that replaces the gathered one. That second buffer is a gather of
     // its own: counting only the first charges every merged seqno once while
-    // it was copied twice. Each segment is one block, so every gather of the
-    // merge is known: each segment's visible rows, the accumulator rebuilt
-    // once over both, the surviving rows, and the rewritten seqnos.
+    // it was copied twice. Each segment is one block of one row page, so every
+    // gather of the merge is known: each segment's visible rows, the two
+    // joined once, the surviving rows, and the rewritten seqnos.
     let folder = get_tmp_folder();
     let AnyTree::Standard(tree) = Config::new(
         folder.path(),
         SequenceNumberCounter::default(),
         SequenceNumberCounter::default(),
     )
-    .data_block_size_policy(lsm_tree::config::BlockSizePolicy::all(1 << 20))
+    .columnar_row_group_size_policy(lsm_tree::config::BlockSizePolicy::all(1 << 20))
+    .columnar_page_size_policy(lsm_tree::config::BlockSizePolicy::all(1 << 20))
     .open()?
     else {
         panic!("expected a standard tree");
@@ -839,6 +1125,62 @@ fn a_merged_columnar_scan_counts_the_seqno_column_it_rewrites() -> lsm_tree::Res
         first + second + both + returned + 8 * rows,
         "each segment's rows, the accumulator over both, the surviving rows and \
          the rewritten seqnos are one gather each",
+    );
+    Ok(())
+}
+
+#[test]
+fn a_merged_columnar_scan_over_many_row_pages_copies_each_row_a_bounded_number_of_times()
+-> lsm_tree::Result<()> {
+    // The merge joins every visible row page of the overlapping segments into
+    // one batch. Joined once, that is one more copy of the rows; folded page by
+    // page into an accumulator, it re-copies everything gathered so far for
+    // each page, and a segment of many small row pages multiplies the copies.
+    let folder = get_tmp_folder();
+    let AnyTree::Standard(tree) = Config::new(
+        folder.path(),
+        SequenceNumberCounter::default(),
+        SequenceNumberCounter::default(),
+    )
+    .columnar_row_group_size_policy(lsm_tree::config::BlockSizePolicy::all(1 << 20))
+    .columnar_page_size_policy(lsm_tree::config::BlockSizePolicy::all(1_024))
+    .open()?
+    else {
+        panic!("expected a standard tree");
+    };
+    tree.update_runtime_config(|cfg| cfg.columnar = true)?;
+    for i in 0..1_000 {
+        tree.insert(key(i), vec![b'v'; 32], u64::from(i));
+    }
+    tree.flush_active_memtable(0)?;
+    for i in 500..1_500 {
+        tree.insert(key(i), vec![b'w'; 32], 2_000 + u64::from(i));
+    }
+    tree.flush_active_memtable(0)?;
+    let m = tree.metrics();
+    let before = m.bytes_copied();
+
+    let mut returned = 0;
+    let mut rows = 0_u64;
+    for batch in tree.columnar_scan(&[COL_USER_KEY, COL_SEQNO, COL_VALUE], None, SeqNo::MAX, ..)? {
+        let batch = batch?;
+        rows += u64::from(batch.row_count);
+        returned += batch_bytes(&batch);
+    }
+    assert_eq!(rows, 1_500, "the merge yields every key once");
+
+    // The gathers of one row page per segment, plus an offset table's worth
+    // for each of the row pages the segments hold (a 1 KiB page holds about
+    // twenty of these rows).
+    let rows_per_page = 20;
+    let pages = (1_000 + 1_000) / rows_per_page;
+    let first = key_seqno_value_bytes(0..1_000, 32);
+    let second = key_seqno_value_bytes(500..1_500, 32);
+    let linear = 2 * (first + second) + returned + 8 * rows + 2 * 2 * 4 * pages;
+    let copied = m.bytes_copied() - before;
+    assert!(
+        copied <= linear,
+        "the merge copied {copied} B; joining its row pages once copies at most {linear} B",
     );
     Ok(())
 }
@@ -1098,12 +1440,12 @@ fn a_predicate_scan_of_one_segment_counts_its_filter_gather() {
 }
 
 #[test]
-fn a_columnar_point_read_that_misses_counts_what_its_decode_copied() {
-    // A point read decodes the block before it knows whether the key is there,
-    // and decoding copies each nullable column's validity out of the block. A
-    // miss still did that copy, so the counter moves on a miss as on a hit.
-    // With no filter, a key absent from the segment but inside its key range
-    // reaches the block.
+fn a_columnar_point_read_that_misses_decodes_only_the_key_page() {
+    // A point read looks the key up in the key page before it reads anything
+    // else, so a miss never decodes the value page and never copies its
+    // validity; a hit then reads the value page and copies it. With no filter,
+    // a key absent from the segment but inside its key range reaches the
+    // group.
     let folder = get_tmp_folder();
     let AnyTree::Standard(tree) = Config::new(
         folder.path(),
@@ -1141,9 +1483,19 @@ fn a_columnar_point_read_that_misses_counts_what_its_decode_copied() {
         tree.get(key(3), SeqNo::MAX).expect("get").is_none(),
         "an odd key was never written",
     );
+    assert_eq!(
+        m.bytes_copied(),
+        before,
+        "a miss must not decode the nullable value page",
+    );
+
+    assert!(
+        tree.get(key(2), SeqNo::MAX).expect("get").is_some(),
+        "an even key was written",
+    );
     assert!(
         m.bytes_copied() > before,
-        "the miss decoded the block and copied its validity, but charged nothing",
+        "a hit decoded the value page and copied its validity, but charged nothing",
     );
 }
 
@@ -1318,6 +1670,103 @@ fn a_parallel_sub_compaction_counts_nothing_it_reads() -> lsm_tree::Result<()> {
         "the sub-compactions' copies were counted"
     );
     Ok(())
+}
+
+#[test]
+fn a_parallel_sub_compaction_of_columnar_segments_counts_nothing_it_reads() -> lsm_tree::Result<()>
+{
+    // The columnar twin of the test above. A columnar input is read one row
+    // group at a time, directory and pages in one request, through a loader of
+    // its own; it has to carry the maintenance charge exactly as the row-major
+    // loader does, or a compaction beside a measured read would count its
+    // whole input.
+    let folder = get_tmp_folder();
+    let AnyTree::Standard(tree) = Config::new(
+        folder.path(),
+        SequenceNumberCounter::default(),
+        SequenceNumberCounter::default(),
+    )
+    .columnar_row_group_size_policy(lsm_tree::config::BlockSizePolicy::all(512))
+    .compaction_threads(4)
+    .subcompaction_min_bytes(0)
+    .open()?
+    else {
+        panic!("expected a standard tree");
+    };
+    tree.update_runtime_config(|cfg| {
+        cfg.columnar = true;
+        cfg.zone_map = true;
+    })?;
+
+    let n = 2_000;
+    for i in 0..n {
+        tree.insert(key(i), vec![b'a'; 64], u64::from(i));
+    }
+    tree.flush_active_memtable(0)?;
+    tree.major_compact(4_096, 0)?;
+    assert!(
+        tree.table_count() > 1,
+        "the split needs several bottom tables"
+    );
+
+    for i in 0..n {
+        tree.insert(key(i), vec![b'b'; 64], u64::from(n + i));
+    }
+    tree.flush_active_memtable(0)?;
+
+    let m = tree.metrics();
+    let (read, decoded, copied) = (m.bytes_read(), m.bytes_decoded(), m.bytes_copied());
+    tree.major_compact(u64::MAX, 0)?;
+    assert!(
+        tree.table_count() > 1,
+        "the compaction must have split for the bounded path to run",
+    );
+    assert_eq!(
+        m.bytes_read(),
+        read,
+        "the sub-compactions' row-group reads were counted"
+    );
+    assert_eq!(
+        m.bytes_decoded(),
+        decoded,
+        "the sub-compactions' page decoding was counted"
+    );
+    assert_eq!(
+        m.bytes_copied(),
+        copied,
+        "the sub-compactions' page copies were counted"
+    );
+    Ok(())
+}
+
+#[test]
+fn a_columnar_read_served_from_the_block_cache_counts_no_bytes() {
+    // The columnar twin of the first test. A row group's directory and pages
+    // are cached as blocks of their own, and a group served whole from them
+    // asks the filesystem for nothing and runs no transform.
+    let (_folder, tree) = columnar_segment(2_000, 64);
+    let m = tree.metrics();
+
+    for i in 0..2_000 {
+        let _ = tree.get(key(i), SeqNo::MAX).expect("get");
+    }
+    let (read_cold, decoded_cold) = (m.bytes_read(), m.bytes_decoded());
+    assert!(read_cold > 0, "a cold pass must report bytes read");
+    assert!(decoded_cold > 0, "a cold pass must report bytes decoded");
+
+    for i in 0..2_000 {
+        let _ = tree.get(key(i), SeqNo::MAX).expect("get");
+    }
+    assert_eq!(
+        m.bytes_read(),
+        read_cold,
+        "a cached row group asked the filesystem for nothing, so read must not move",
+    );
+    assert_eq!(
+        m.bytes_decoded(),
+        decoded_cold,
+        "a cached row group is already decoded, so decoded must not move",
+    );
 }
 
 #[test]

@@ -61,14 +61,6 @@ pub enum BlockType {
     /// [`Self::SeqnoBounds`]) so point reads never load it. Off by default;
     /// absent unless the zone-map policy is enabled.
     ZoneMap,
-    /// A PAX / rowgroup columnar block: a row-group laid out as per-column
-    /// chunks rather than row-major key/value entries. Each chunk is a typed,
-    /// codec-tagged opaque byte array plus a validity bitmap. Produced by the
-    /// transpose on flush / major-compaction for a columnar tree / CF and read
-    /// as a `ColumnBatch`. The wire tag is reserved unconditionally; the codec
-    /// framework that fills these blocks is built only with the `columnar`
-    /// feature.
-    Columnar,
     /// Optional per-table positional delete-bitmap section: marks, by row
     /// position, which rows of the table's columnar segment are deleted. A pure
     /// membership set (MVCC reconciled at materialization via the compaction
@@ -76,6 +68,36 @@ pub enum BlockType {
     /// (like [`Self::ZoneMap`]) so a read without deletes pays nothing. Absent
     /// unless the segment has materialized deletes.
     DeleteBitmap,
+    /// The directory of one columnar row group's pages: for each page, where
+    /// it starts relative to the row group, how long it is, and which part of
+    /// which column's encoding it holds.
+    ///
+    /// The index points at this block, not at the pages, so a row group keeps
+    /// exactly one index entry and `block_id` keeps its meaning. It is written
+    /// first in the group, immediately ahead of the page holding keys and MVCC
+    /// metadata, so one coalesced read covers what every read of the group
+    /// needs before it knows anything else.
+    ColumnPageDirectory,
+    /// One page of a columnar row group: a single part of a single column's
+    /// encoding, for the group's rows. Row groups are produced by the transpose
+    /// on flush and compaction for a columnar tree, and by columnar ingest;
+    /// the codec framework that fills their pages is built only with the
+    /// `columnar` feature, while the wire tags are reserved unconditionally.
+    ///
+    /// An ordinary block in every other respect, and deliberately so: its
+    /// header, checksum, compression, encryption and ECC are the ones already
+    /// defined and tested. What it does not have is an index entry — it is
+    /// reached through [`Self::ColumnPageDirectory`], and its identity binds
+    /// its LOGICAL position (row group ordinal, page slot) to replace the
+    /// position integrity the index supplies for blocks it names.
+    ColumnPage,
+    /// The statistics zones of a columnar row group's row pages for its
+    /// columns other than the key: one zone per row page and column. Written
+    /// last in the group, after its pages, so only a read that prunes on one
+    /// of those columns reads it; a full scan or a projection that does not
+    /// prune never pays for it. The key column's zones live in the
+    /// [`Self::ColumnPageDirectory`], which every point read reads anyway.
+    ColumnZones,
 }
 
 // Wire tags are renumbered contiguously `0..=6` for V5. The previous
@@ -100,8 +122,14 @@ impl From<BlockType> for u8 {
             BlockType::Locator => 8,
             BlockType::SeqnoBounds => 9,
             BlockType::ZoneMap => 10,
-            BlockType::Columnar => 11,
+            // 11 is retired: it tagged the single-block columnar row group
+            // that pages replaced. Left unassigned rather than reused, so a
+            // block written under the old layout reads as an unknown role
+            // instead of being parsed as something it is not.
             BlockType::DeleteBitmap => 12,
+            BlockType::ColumnPageDirectory => 13,
+            BlockType::ColumnPage => 14,
+            BlockType::ColumnZones => 15,
         }
     }
 }
@@ -122,8 +150,10 @@ impl TryFrom<u8> for BlockType {
             8 => Ok(Self::Locator),
             9 => Ok(Self::SeqnoBounds),
             10 => Ok(Self::ZoneMap),
-            11 => Ok(Self::Columnar),
             12 => Ok(Self::DeleteBitmap),
+            13 => Ok(Self::ColumnPageDirectory),
+            14 => Ok(Self::ColumnPage),
+            15 => Ok(Self::ColumnZones),
             _ => Err(crate::Error::InvalidTag(("BlockType", value))),
         }
     }

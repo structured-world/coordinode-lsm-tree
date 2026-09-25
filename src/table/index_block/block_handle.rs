@@ -32,12 +32,28 @@ pub struct BlockHandle {
 
     /// Size of block in bytes
     size: u32,
+
+    /// The tag of the columnar row group the index entry names, which the
+    /// group's directory must carry. Carried by the index entry, not by this
+    /// handle's own encoding.
+    group_tag: Option<core::num::NonZeroU64>,
 }
 
 impl BlockHandle {
     #[must_use]
     pub fn new(offset: BlockOffset, size: u32) -> Self {
-        Self { offset, size }
+        Self {
+            offset,
+            size,
+            group_tag: None,
+        }
+    }
+
+    /// This handle, naming a columnar row group tagged `group_tag`.
+    #[must_use]
+    pub fn with_group_tag(mut self, group_tag: Option<core::num::NonZeroU64>) -> Self {
+        self.group_tag = group_tag;
+        self
     }
 
     #[must_use]
@@ -48,6 +64,13 @@ impl BlockHandle {
     #[must_use]
     pub fn offset(&self) -> BlockOffset {
         self.offset
+    }
+
+    /// The tag of the row group this handle names, when it came from a
+    /// columnar table's index.
+    #[must_use]
+    pub fn group_tag(&self) -> Option<core::num::NonZeroU64> {
+        self.group_tag
     }
 }
 
@@ -67,10 +90,7 @@ impl Decode for BlockHandle {
         let offset = reader.read_u64_varint()?;
         let size = reader.read_u32_varint()?;
 
-        Ok(Self {
-            offset: BlockOffset(offset),
-            size,
-        })
+        Ok(Self::new(BlockOffset(offset), size))
     }
 }
 
@@ -139,28 +159,62 @@ impl PartialEq for KeyedBlockHandle {
     }
 }
 
+/// A full entry.
+const FULL: u8 = 0;
+/// An entry whose end key shares a prefix with its restart head's.
+const TRUNCATED: u8 = 1;
+/// [`FULL`], naming a columnar row group by its tag.
+const TAGGED_FULL: u8 = 4;
+/// [`TRUNCATED`], naming a columnar row group by its tag.
+const TAGGED_TRUNCATED: u8 = 5;
+
+impl KeyedBlockHandle {
+    /// Writes the entry's marker (`plain`, or its tagged twin when the entry
+    /// names a row group), its handle, its seqno and, when tagged, the tag.
+    fn encode_head_into<W: crate::io::Write>(
+        &self,
+        writer: &mut W,
+        plain: u8,
+        tagged: u8,
+    ) -> crate::Result<()> {
+        writer.write_u8(if self.inner.group_tag.is_some() {
+            tagged
+        } else {
+            plain
+        })?;
+        self.inner.encode_into(writer)?;
+        writer.write_u64_varint(self.seqno)?;
+        if let Some(tag) = self.inner.group_tag {
+            writer.write_u64_varint(tag.get())?;
+        }
+        Ok(())
+    }
+}
+
+/// Reads the tag a tagged entry carries after its seqno; `None` when it cannot
+/// be read or is zero, which no writer emits.
+fn read_group_tag(reader: &mut Cursor<&[u8]>) -> Option<core::num::NonZeroU64> {
+    core::num::NonZeroU64::new(reader.read_u64_varint().ok()?)
+}
+
 impl Encodable<BlockOffset> for KeyedBlockHandle {
     fn encode_full_into<W: crate::io::Write>(
         &self,
         writer: &mut W,
         state: &mut BlockOffset,
     ) -> crate::Result<()> {
-        // Full entry (marker 0):
-        // [marker=0] [offset] [size] [seqno] [key len] [end key]
-        // 1          2        3      4       5         6
+        // Full entry (marker 0, or 4 naming a row group):
+        // [marker] [offset] [size] [seqno] [group tag, marker 4] [key len] [end key]
+        // 1        2        3      4       5                     6         7
         //
         // Per-block seqno bounds are NOT stored inline; they live in the
         // optional parallel `seqno_bounds` section keyed by block offset, so a
         // point read never pays for them. See `crate::table::seqno_bounds`.
-        writer.write_u8(0)?; // 1
-
-        self.inner.encode_into(writer)?; // 2, 3
-
-        writer.write_u64_varint(self.seqno)?; // 4
+        self.encode_head_into(writer, FULL, TAGGED_FULL)?; // 1-5
 
         #[expect(clippy::cast_possible_truncation, reason = "keys are u16 long max")]
-        writer.write_u16_varint(self.end_key.len() as u16)?; // 5
-        writer.write_all(&self.end_key)?; // 6
+        writer.write_u16_varint(self.end_key.len() as u16)?; // 6
+        writer.write_all(&self.end_key)?; // 7
 
         *state = BlockOffset(*self.offset() + u64::from(self.size()));
 
@@ -174,16 +228,13 @@ impl Encodable<BlockOffset> for KeyedBlockHandle {
         _state: &mut BlockOffset,
         shared_len: usize,
     ) -> crate::Result<()> {
-        // Truncated entry (marker 1):
-        // [marker=1] [offset] [size] [seqno] [shared prefix len] [rest key len] [rest key]
-        // 1          2        3      4       5                   6              7
+        // Truncated entry (marker 1, or 5 naming a row group):
+        // [marker] [offset] [size] [seqno] [group tag, marker 5] [shared prefix len] [rest key len] [rest key]
+        // 1        2        3      4       5                     6                   7              8
         //
         // Per-block seqno bounds live in the parallel `seqno_bounds` section,
         // never inline (see `encode_full_into`).
-        writer.write_u8(1)?;
-
-        self.inner.encode_into(writer)?;
-        writer.write_u64_varint(self.seqno)?;
+        self.encode_head_into(writer, TRUNCATED, TAGGED_TRUNCATED)?;
 
         #[expect(clippy::cast_possible_truncation, reason = "keys are u16 long max")]
         writer.write_u16_varint(shared_len as u16)?;
@@ -229,14 +280,20 @@ impl Decodable<IndexBlockParsedItem> for KeyedBlockHandle {
         if marker == TRAILER_START_MARKER {
             return None;
         }
-        // Full entries are marker 0. (Seqno bounds are no longer inline; they
-        // live in the parallel `seqno_bounds` section.)
-        if marker != 0 {
+        // Full entries are marker 0, or 4 when they name a row group. (Seqno
+        // bounds are no longer inline; they live in the parallel
+        // `seqno_bounds` section.)
+        if marker != FULL && marker != TAGGED_FULL {
             return None;
         }
 
         let handle = BlockHandle::decode_from(reader).ok()?;
         let seqno = reader.read_u64_varint().ok()?;
+        let group_tag = if marker == TAGGED_FULL {
+            Some(read_group_tag(reader)?)
+        } else {
+            None
+        };
 
         let key_len: usize = reader.read_u16_varint().ok()?.into();
         #[expect(
@@ -265,6 +322,7 @@ impl Decodable<IndexBlockParsedItem> for KeyedBlockHandle {
             offset: handle.offset(),
             size: handle.size(),
             seqno,
+            group_tag,
         })
     }
 
@@ -296,8 +354,9 @@ impl Decodable<IndexBlockParsedItem> for KeyedBlockHandle {
         if marker == TRAILER_START_MARKER {
             return None;
         }
-        // Restart heads are full entries: marker 0.
-        if marker != 0 {
+        // Restart heads are full entries: marker 0, or 4 naming a row group.
+        let tagged = marker == TAGGED_FULL;
+        if marker != FULL && !tagged {
             return None;
         }
 
@@ -314,6 +373,15 @@ impl Decodable<IndexBlockParsedItem> for KeyedBlockHandle {
         pos = np;
         let (seqno, np) = read_leb128!(buf, pos);
         pos = np;
+        if tagged {
+            // The probe does not need the tag, but a tag the entry cannot
+            // carry fails it here, as `parse_full` would.
+            let (tag, np) = read_leb128!(buf, pos);
+            if tag == 0 {
+                return None;
+            }
+            pos = np;
+        }
 
         let (key_len_raw, np) = read_leb128!(buf, pos);
         pos = np;
@@ -359,14 +427,20 @@ impl Decodable<IndexBlockParsedItem> for KeyedBlockHandle {
             return None;
         }
 
-        // Truncated entries are marker 1. (Seqno bounds live in the parallel
-        // `seqno_bounds` section, never inline.)
-        if marker != 1 {
+        // Truncated entries are marker 1, or 5 when they name a row group.
+        // (Seqno bounds live in the parallel `seqno_bounds` section, never
+        // inline.)
+        if marker != TRUNCATED && marker != TAGGED_TRUNCATED {
             return None;
         }
 
         let handle = BlockHandle::decode_from(reader).ok()?;
         let seqno = reader.read_u64_varint().ok()?;
+        let group_tag = if marker == TAGGED_TRUNCATED {
+            Some(read_group_tag(reader)?)
+        } else {
+            None
+        };
 
         let shared_prefix_len: usize = reader.read_u16_varint().ok()?.into();
         let rest_key_len: usize = reader.read_u16_varint().ok()?.into();
@@ -413,6 +487,7 @@ impl Decodable<IndexBlockParsedItem> for KeyedBlockHandle {
             offset: handle.offset(),
             size: handle.size(),
             seqno,
+            group_tag,
         })
     }
 }

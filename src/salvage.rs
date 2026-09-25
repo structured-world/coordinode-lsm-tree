@@ -1124,12 +1124,17 @@ fn salvage_attempt(
         _ => None,
     });
 
+    // An encrypted block is sealed under its table id, so a copy stamped with
+    // another id cannot carry the source's frames: they would not decrypt
+    // under the copy's id. Re-encode them instead.
+    let resealed =
+        options.encryption.is_some() && options.output_id.is_some_and(|id| id != table.metadata.id);
     let walk = match salvage_blocks(
         &table,
         writer,
         comparator,
         !delete_mask_unpositionable,
-        allow_verbatim,
+        allow_verbatim && !resealed,
         options.blob_rewrite.as_deref(),
         options.progress.as_deref(),
     ) {
@@ -1504,6 +1509,21 @@ fn publish_progress(
     };
 }
 
+/// Loads one data unit the way salvage would, to learn whether its bytes are
+/// real: a row-major table's single block under `row_role`, a columnar
+/// table's whole row group. Only the verdict is kept.
+fn load_data_unit(
+    table: &crate::table::Table,
+    handle: &crate::table::BlockHandle,
+    row_role: crate::table::block::BlockType,
+) -> crate::Result<()> {
+    #[cfg(feature = "columnar")]
+    if table.metadata.columnar {
+        return table.salvage_load_row_group(handle).map(|_| ());
+    }
+    table.salvage_load_block(handle, row_role).map(|_| ())
+}
+
 /// Walks `table`'s data blocks in index order, re-emitting every block that
 /// loads and decodes cleanly into `writer` and recording the rest.
 ///
@@ -1669,20 +1689,10 @@ fn salvage_blocks(
         // it. Advancing by that unvalidated size would skip the intact blocks
         // (the later load pass drops only the fake candidate, losing the rest).
         // So fully load each candidate here; the block type matches the SST.
-        let probe_block_type = {
-            #[cfg(feature = "columnar")]
-            {
-                if table.metadata.columnar {
-                    crate::table::block::BlockType::Columnar
-                } else {
-                    crate::table::block::BlockType::Data
-                }
-            }
-            #[cfg(not(feature = "columnar"))]
-            {
-                crate::table::block::BlockType::Data
-            }
-        };
+        // Only a row-major table's unit is loaded as one block under this role;
+        // a columnar table's unit is a row group, which `load_data_unit` loads
+        // through the group path instead.
+        let probe_block_type = crate::table::block::BlockType::Data;
         // A candidate is REAL only if its header frames AND its payload loads.
         // `Ok(Some)` = a framed, loaded block; `Ok(None)` = structurally not a
         // block, or one whose bytes are themselves unreadable (a header that did
@@ -1695,9 +1705,9 @@ fn salvage_blocks(
         // proven corrupt.
         let frames_and_loads =
             |at: u64, to: u64| -> crate::Result<Option<crate::table::BlockHandle>> {
-                match table.probe_block_handle_in(&*probe_file, at, to) {
-                    Ok(h) => match table.salvage_load_block(&h, probe_block_type) {
-                        Ok(_) => Ok(Some(h)),
+                match table.probe_data_unit_in(&*probe_file, at, to) {
+                    Ok(h) => match load_data_unit(table, &h, probe_block_type) {
+                        Ok(()) => Ok(Some(h)),
                         Err(crate::Error::Io(io)) if io.kind().is_environmental() => {
                             Err(crate::Error::Io(io))
                         }
@@ -1856,43 +1866,42 @@ fn salvage_blocks(
             // advance the cursor past back-to-back blocks the gap walk
             // should discover (the oversized non-ECC frame still decodes
             // its first payload, so nothing later would flag the loss).
-            let (handle, end_key) =
-                match table.probe_block_handle_in(&*probe_file, off, section_end) {
-                    Ok(probed) if probed.size() == keyed.as_ref().size() => {
-                        (*keyed.as_ref(), Some(keyed.end_key().clone()))
+            let (handle, end_key) = match table.probe_data_unit_in(&*probe_file, off, section_end) {
+                Ok(probed) if probed.size() == keyed.as_ref().size() => {
+                    (*keyed.as_ref(), Some(keyed.end_key().clone()))
+                }
+                // The physical frame disagrees: walk the physically framed
+                // block instead (the lying handle's separator is just as
+                // untrusted as its span).
+                Ok(probed) => (probed, None),
+                // An ENVIRONMENTAL read failure is retryable: propagate it
+                // rather than surrender the block (and, when untrusted, the
+                // whole tail) to a permanent drop over a fault that says
+                // nothing about the bytes. A read failure that DOES implicate
+                // them is not fixed by a retry, so it falls through to the
+                // unframeable-header arm below and drops just this block
+                // instead of aborting the whole salvage.
+                Err(crate::Error::Io(io)) if io.kind().is_environmental() => {
+                    return Err(crate::Error::Io(io));
+                }
+                // The indexed block's header does not frame, so its size is
+                // UNVERIFIED. With a TRUSTED index the block's offset is still
+                // an original boundary, so leave the cursor here and let the
+                // next handle's gap probe frame from it — it records the
+                // corrupt block as a drop and recovers the intact blocks after
+                // it by their trusted offsets (block-granular). With an
+                // UNTRUSTED index the byte range past this unframeable header
+                // cannot be proven to be original block starts (a nested forge
+                // would frame just as well), so surrender this block and every
+                // offset after it.
+                Err(_) => {
+                    if !tli_trusted {
+                        chain_anchored = false;
+                        drop_unanchored_handle(off, &mut dropped);
                     }
-                    // The physical frame disagrees: walk the physically framed
-                    // block instead (the lying handle's separator is just as
-                    // untrusted as its span).
-                    Ok(probed) => (probed, None),
-                    // An ENVIRONMENTAL read failure is retryable: propagate it
-                    // rather than surrender the block (and, when untrusted, the
-                    // whole tail) to a permanent drop over a fault that says
-                    // nothing about the bytes. A read failure that DOES implicate
-                    // them is not fixed by a retry, so it falls through to the
-                    // unframeable-header arm below and drops just this block
-                    // instead of aborting the whole salvage.
-                    Err(crate::Error::Io(io)) if io.kind().is_environmental() => {
-                        return Err(crate::Error::Io(io));
-                    }
-                    // The indexed block's header does not frame, so its size is
-                    // UNVERIFIED. With a TRUSTED index the block's offset is still
-                    // an original boundary, so leave the cursor here and let the
-                    // next handle's gap probe frame from it — it records the
-                    // corrupt block as a drop and recovers the intact blocks after
-                    // it by their trusted offsets (block-granular). With an
-                    // UNTRUSTED index the byte range past this unframeable header
-                    // cannot be proven to be original block starts (a nested forge
-                    // would frame just as well), so surrender this block and every
-                    // offset after it.
-                    Err(_) => {
-                        if !tli_trusted {
-                            chain_anchored = false;
-                            drop_unanchored_handle(off, &mut dropped);
-                        }
-                        continue;
-                    }
-                };
+                    continue;
+                }
+            };
             // Both surviving arms probed the frame within `section_end`, so the
             // block ends there by construction: `off + size <= section_end`,
             // which cannot overflow a `u64` bounded by the validated section.
@@ -2188,13 +2197,11 @@ fn salvage_blocks(
                     )),
                 }
             } else {
-                match table
-                    .salvage_load_block(&block_handle, crate::table::block::BlockType::Columnar)
-                {
+                match table.salvage_load_row_group(&block_handle) {
                     // Row materialization validates the batch content (framing,
                     // value-type tags, key invariants) beyond the outer frame
-                    // decode. A checksum-consistent block that fails EITHER step
-                    // is malformed content — drop this one block and keep
+                    // decode. A checksum-consistent group that fails EITHER step
+                    // is malformed content — drop this one group and keep
                     // walking, exactly like a row-major block whose entries fail
                     // to decode. Only writer errors (I/O to the destination)
                     // stay hard errors.
@@ -2203,12 +2210,16 @@ fn salvage_blocks(
                         if !allow_verbatim {
                             sb.verbatim = None;
                         }
-                        match crate::table::columnar::ColumnBatch::decode(&sb.block.data).and_then(
-                            |batch| {
+                        // Salvage is maintenance: what the page decode copies
+                        // is not a read's cost and is not charged.
+                        match sb
+                            .group
+                            .to_row_pages(&crate::table::row_group::PageWant::ALL, &mut 0)
+                            .and_then(crate::table::row_group::RowPages::into_batch)
+                            .and_then(|batch| {
                                 crate::table::columnar::column_batch_to_entries(&batch)
                                     .map(|entries| (batch, entries))
-                            },
-                        ) {
+                            }) {
                             // A real writer never emits an empty data block, so a
                             // checksum-clean ZERO-ROW batch is malformed input:
                             // the writer primitives below would emit NOTHING for
@@ -2358,8 +2369,14 @@ fn salvage_blocks(
                                 // consistent with the degraded-bitmap path.
                                 // A suppressed boundary key rebuilt the batch, so the
                                 // block's raw bytes no longer describe it — re-encode.
+                                // A copy keeps its pages' group tag, so one the copy
+                                // cannot take without repeating a tag is re-encoded
+                                // under a fresh one rather than dropped.
+                                let group_tag = sb.group.directory.group_tag();
+                                writer.start_group_tags_at(group_tag);
                                 let verbatim_source = if table.has_delete_bitmap_section()
                                     || rebuilt_by_suppression
+                                    || !writer.accepts_group_tag(group_tag)
                                 {
                                     None
                                 } else {
@@ -2369,16 +2386,16 @@ fn salvage_blocks(
                                 // is block-local malformed content — drop the block
                                 // and keep walking; destination I/O errors stay hard.
                                 let emitted = match verbatim_source {
-                                    // Clean: copy the block's raw bytes as-is,
-                                    // carrying the block's per-column zone-map
-                                    // stats (this is the columnar path, so the
-                                    // synthetic row-block stat would be rejected
-                                    // by the copy's own `verify_zone_map`).
-                                    Some((raw, header, layout)) => writer
-                                        .append_verbatim_data_block(
+                                    // Clean: copy the group's raw bytes as-is,
+                                    // carrying its per-column zone-map stats (this
+                                    // is the columnar path, so the synthetic
+                                    // row-block stat would be rejected by the
+                                    // copy's own `verify_zone_map`).
+                                    Some((raw, uncompressed)) => writer
+                                        .append_verbatim_row_group(
                                             &raw,
-                                            header,
-                                            layout,
+                                            uncompressed,
+                                            group_tag,
                                             &entries,
                                             Some(batch.zone_stats()),
                                             comparator,

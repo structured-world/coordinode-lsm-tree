@@ -796,3 +796,55 @@ fn columnar_ingest_range_scan_reconstructs_subcolumns() -> lsm_tree::Result<()> 
     );
     Ok(())
 }
+
+/// A one-row batch of `columns` columns: the key, seqno and value-type columns
+/// then one-byte value sub-columns numbered from 3.
+fn wide_batch(columns: u32) -> ColumnBatch {
+    let mut batch = entries_to_column_batch(&[InternalValue::from_components(
+        b"k0",
+        b"ignored",
+        0,
+        ValueType::Value,
+    )])
+    .expect("transpose");
+    batch.columns.pop();
+    for id in 3..columns {
+        batch.columns.push(Column {
+            column_id: u16::try_from(id).expect("column ids fit u16"),
+            type_tag: TypeTag::Fixed(1),
+            validity: None,
+            data: vec![7].into(),
+        });
+    }
+    batch
+}
+
+/// A row group's directory lists at most `u16::MAX` pages, one per column
+/// here: a batch of every column id, one more than that, is refused on the
+/// call that submits it. It was accepted, and failed only when its group was
+/// written, after every page had been prepared: with row groups large enough
+/// to defer that write, on a later call than the one that caused it.
+#[test]
+fn columnar_ingest_refuses_more_columns_than_a_group_can_list() -> lsm_tree::Result<()> {
+    let folder = get_tmp_folder();
+    let any = Config::new(
+        folder.path(),
+        SequenceNumberCounter::default(),
+        SequenceNumberCounter::default(),
+    )
+    .columnar_row_group_size_policy(lsm_tree::config::BlockSizePolicy::all(1 << 20))
+    .open()?;
+    let AnyTree::Standard(tree) = &any else {
+        panic!("expected standard tree");
+    };
+    tree.update_runtime_config(|cfg| cfg.columnar = true)
+        .expect("enable columnar");
+
+    let mut ingest = any.ingestion()?;
+    let refused = ingest.write_columnar_batch(&wide_batch(1 << 16));
+    assert!(
+        matches!(&refused, Err(lsm_tree::Error::InvalidHeader(msg)) if msg.contains("columns")),
+        "a batch of 65536 columns must be refused on submit, got {refused:?}",
+    );
+    Ok(())
+}

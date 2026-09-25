@@ -854,6 +854,8 @@ impl AbstractTree for Tree {
         .use_data_block_compression(data_block_compression)
         .use_index_block_compression(index_block_compression)
         .use_data_block_size(data_block_size)
+        .use_row_group_size(self.config.columnar_row_group_size_policy.get(0))
+        .use_columnar_page_size(self.config.columnar_page_size_policy.get(0))
         .use_data_block_hash_ratio(data_block_hash_ratio)
         .use_bloom_policy({
             use crate::config::FilterPolicyEntry::{Bloom, None};
@@ -1008,6 +1010,7 @@ impl AbstractTree for Tree {
         let sinks = crate::table::TableSinks {
             deletion_pause: &self.deletion_pause,
             heal_hints: &self.heal_hints,
+            read_budget: self.config.columnar_read_budget,
             #[cfg(feature = "std")]
             background_deleter: Some(&self.background_deleter),
         };
@@ -5116,6 +5119,7 @@ impl Tree {
         let sinks = crate::table::TableSinks {
             deletion_pause: &deletion_pause,
             heal_hints: &heal_hints,
+            read_budget: inner.config.columnar_read_budget,
             #[cfg(feature = "std")]
             background_deleter: Some(&background_deleter),
         };
