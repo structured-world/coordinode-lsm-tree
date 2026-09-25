@@ -7232,6 +7232,99 @@ fn salvage_recovers_an_encrypted_sst_with_the_provider() -> crate::Result<()> {
     Ok(())
 }
 
+/// A copy published under a new id reads back: an encrypted block is sealed
+/// under its table id, so a byte copy of the source's blocks would not decrypt
+/// under the copy's id. A plain source is still copied byte for byte.
+#[cfg(feature = "encryption")]
+#[test]
+fn a_salvaged_copy_under_a_new_id_reads_every_value() -> crate::Result<()> {
+    let dir = tempdir()?;
+    let fs: Arc<dyn Fs> = Arc::new(StdFs);
+    let key_provider: Arc<dyn crate::encryption::EncryptionProvider> =
+        Arc::new(crate::encryption::Aes256GcmProvider::new(&[0x42; 32]));
+    let (source_id, output_id) = (3, 4);
+
+    let layouts: &[bool] = if cfg!(feature = "columnar") {
+        &[false, true]
+    } else {
+        &[false]
+    };
+    for &columnar in layouts {
+        for enc in [None, Some(&key_provider)] {
+            let name = format!("{columnar}-{}", enc.is_some());
+            let source = dir.path().join(format!("{name}-source"));
+            let dest = dir.path().join(format!("{name}-copy"));
+            let mut writer = Writer::new(source.clone(), source_id, 0, Arc::clone(&fs))?
+                .use_columnar(columnar)
+                .use_encryption(enc.map(Arc::clone));
+            for i in 0..20_u32 {
+                writer.write(InternalValue::from_components(
+                    format!("key{i:05}").into_bytes(),
+                    format!("val{i:05}").into_bytes(),
+                    1,
+                    ValueType::Value,
+                ))?;
+            }
+            assert!(writer.finish()?.is_some(), "source is non-empty");
+
+            let options = SalvageOptions {
+                encryption: enc.map(Arc::clone),
+                #[cfg(zstd_any)]
+                zstd_dictionary: None,
+                #[cfg(zstd_any)]
+                zstd_dictionaries: crate::compression::ZstdDictionaries::new(),
+                table_id: source_id,
+                expected_stored_id: None,
+                output_id: Some(output_id),
+                allow_delete_resurrection: false,
+                sync_mode: crate::fs::SyncMode::Normal,
+                prefix_extractor: None,
+                blob_rewrite: None,
+                progress: None,
+            };
+            let report = salvage_sst_with_options(&source, dest.clone(), &fs, &options)?;
+            assert!(
+                report.dropped.is_empty(),
+                "{name}: a clean source: {report:?}"
+            );
+
+            let checksum =
+                crate::Checksum::from_raw(crate::repair::compute_table_checksum(&*fs, &dest)?);
+            let copy = {
+                let mut params = crate::table::RecoverParams::new(
+                    dest,
+                    checksum,
+                    output_id,
+                    Arc::clone(&fs),
+                    default_comparator(),
+                    Arc::new(crate::cache::Cache::with_capacity_bytes(1 << 20)),
+                );
+                params.encryption = enc.map(Arc::clone);
+                Table::recover(params)?
+            };
+            for i in 0..20_u32 {
+                let key = format!("key{i:05}");
+                let got = copy.get(
+                    key.as_bytes(),
+                    crate::MAX_SEQNO,
+                    crate::hash::hash64(key.as_bytes()),
+                );
+                let value = match got {
+                    Ok(Some(entry)) => entry.value,
+                    other => panic!("{name}: {key} in the copy, got {other:?}"),
+                };
+                assert_eq!(&*value, format!("val{i:05}").as_bytes(), "{name}: {key}");
+            }
+            assert_eq!(
+                report.blocks_copied_verbatim > 0,
+                enc.is_none(),
+                "{name}: only a plain source is copied byte for byte: {report:?}",
+            );
+        }
+    }
+    Ok(())
+}
+
 /// A zstd-dictionary-compressed source: salvage cannot decompress it without the
 /// dictionary, but with the dictionary in `SalvageOptions` it block-salvages and
 /// the recovered copy reopens under the same dictionary.
