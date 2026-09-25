@@ -7502,7 +7502,7 @@ fn write_columnar_batch_on_an_empty_batch_writes_no_block() -> crate::Result<()>
             },
             Column {
                 column_id: 1,
-                type_tag: TypeTag::Fixed(8),
+                type_tag: TypeTag::Number(crate::table::columnar::Number::U64_LE),
                 validity: None,
                 data: Vec::new().into(),
             },
@@ -8960,6 +8960,7 @@ fn a_zone_block_moved_to_another_group_is_refused() -> crate::Result<()> {
         column_id: COL_VALUE,
         lower: Some(zoned_value(10)),
         upper: Some(zoned_value(10)),
+        apply: crate::table::columnar_predicate::PredicateApply::Filter,
     };
     let result = table.columnar_scan(&[COL_USER_KEY, COL_VALUE], Some(&predicate));
     assert!(
@@ -9045,6 +9046,7 @@ fn a_predicate_scan_over_row_pages_returns_what_filtering_every_row_returns() ->
             column_id,
             lower: Some(lower.clone()),
             upper: Some(upper.clone()),
+            apply: crate::table::columnar_predicate::PredicateApply::Filter,
         };
         let mut got = Vec::new();
         for batch in table.columnar_scan(&[COL_USER_KEY, COL_VALUE], Some(&predicate))? {

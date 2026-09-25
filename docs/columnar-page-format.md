@@ -80,6 +80,45 @@ A key's versions are one run of rows, so they can cross a row page boundary.
 A point read therefore takes every row page from the first whose keys reach
 the needle through the one where its run ends, not only the first.
 
+### Column types and their order
+
+Each column's header names its physical type as a `(tag, width)` pair. The
+type decides the framing and, for the statistics and a predicate, the order
+the column's values have. The engine attaches no logical meaning to a column;
+a type is enough to order the values and nothing more.
+
+| Tag | Width | Type | Order |
+|---|---|---|---|
+| 0 | 1..=255 | opaque fixed-width | none |
+| 1 | 0 | variable-width bytes | byte-wise over the value |
+| 2 / 3 | 1, 2, 4, 8, 16 | unsigned integer, little / big endian | numeric |
+| 4 / 5 | 1, 2, 4, 8, 16 | two's-complement signed integer, little / big endian | numeric |
+| 6 / 7 | 4, 8 | IEEE 754 binary float, little / big endian | `totalOrder` (IEEE 754-2019 5.10) |
+
+An ordered column is compared through its **comparable encoding**: a bytes
+column's value itself, a number's `width` bytes most significant first, with
+the sign bit flipped for a signed integer and, for a float, every bit
+inverted when negative and the sign bit set when not. Byte-wise order of that
+encoding is the numbers' order: `-NaN < -inf < ... < -0 < +0 < ... < +inf <
++NaN` for floats, so every value, NaN and each zero included, has one place.
+Statistics record it and a predicate's bounds are given in it, so a range
+over a number column returns the rows the same range returns over the same
+values stored as bytes in that encoding. A null has no value: it is left out
+of the statistics and matches no range.
+
+An opaque column has no order. It gets no statistics, no block or row page is
+pruned on it, and a predicate over it does not run; the scan reports that
+rather than return an all-matching mask a caller cannot tell from a match.
+The engine never infers an order from a width: a fixed-width column whose
+writer declared no number type stays opaque. The engine's seqno column is an
+unsigned little-endian 8-byte number, so a seqno range prunes and filters.
+
+A table stores a row's seqno relative to its `global_seqno`, a bulk-ingested
+one every row at `0`, while a scan speaks effective seqnos. A seqno range is
+therefore moved into the table's coordinates, down by its `global_seqno`,
+before its statistics or its row filter see it, and a range wholly below a
+table's base rules the table out.
+
 ### The page directory
 
 A block of type `ColumnPageDirectory`. Its header carries the row group's
@@ -137,8 +176,10 @@ where 4 KiB groups read 330.
 ### Statistics zones
 
 A group of more than one row page carries a **statistics zone** per row page
-and bytes column: the row page's null count for the column, and a byte range
-holding every non-null value of the column in the row page. A read prunes the
+and ordered column (see [Column types](#column-types-and-their-order)): the
+row page's null count for the column, and a byte range of the column's
+comparable encoding holding every non-null value of the column in the row
+page. A read prunes the
 row pages whose zones cannot hold what it looks for, before reading them, so
 pruning is as fine as the pages it can skip rather than as coarse as the
 group. This is the statistics-zone granularity the issue separates from the
@@ -152,7 +193,7 @@ Zones live in two places, chosen by who reads them:
   directory first, and the key zones take it from there to the one key page
   that can hold its key, instead of reading every key page of the group. A key
   is short, so these cost a few dozen bytes per row page.
-- **Every other bytes column's zones are in a `ColumnZones` block of their
+- **Every other ordered column's zones are in a `ColumnZones` block of their
   own after the pages.** Only a read that prunes on that column reads it. A
   full scan and a projection that does not prune never pay for any; a read
   that prunes on a narrow column does not pay for a wide column's zones,

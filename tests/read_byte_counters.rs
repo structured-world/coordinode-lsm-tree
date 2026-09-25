@@ -26,7 +26,7 @@
 use lsm_tree::table::columnar::{
     COL_SEQNO, COL_USER_KEY, COL_VALUE, Column, ColumnBatch, TypeTag, entries_to_column_batch,
 };
-use lsm_tree::table::columnar_predicate::ColumnRangePredicate;
+use lsm_tree::table::columnar_predicate::{ColumnRangePredicate, PredicateApply};
 use lsm_tree::{
     AbstractTree, AnyTree, CompressionType, Config, Guard, InternalValue, SeqNo,
     SequenceNumberCounter, Tree, UserKey, ValueType, config::CompressionPolicy, get_tmp_folder,
@@ -946,6 +946,7 @@ fn a_key_predicate_reads_the_row_pages_its_zones_admit_not_the_group() {
         column_id: COL_USER_KEY,
         lower: Some(key(500)),
         upper: Some(key(520)),
+        apply: PredicateApply::Filter,
     });
     assert_eq!(rows, 21, "the predicate selects 21 keys");
     assert!(
@@ -963,6 +964,7 @@ fn a_value_predicate_reads_its_zone_block_and_the_row_pages_it_admits() {
         column_id: COL_VALUE,
         lower: Some(zoned_value(500)),
         upper: Some(zoned_value(520)),
+        apply: PredicateApply::Filter,
     });
     assert_eq!(rows, 21, "the predicate selects 21 values");
     assert!(
@@ -1419,6 +1421,7 @@ fn a_predicate_scan_of_one_segment_counts_its_filter_gather() {
         column_id: COL_USER_KEY,
         lower: Some(key(100)),
         upper: Some(key(199)),
+        apply: PredicateApply::Filter,
     };
     let mut returned = 0;
     let mut rows = 0;

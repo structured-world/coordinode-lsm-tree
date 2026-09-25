@@ -62,12 +62,21 @@ use crate::table::zone_map::ColumnStats;
 use crate::{Error, Result, Slice, ValueType, key::InternalKey, value::InternalValue};
 use alloc::vec::Vec;
 
-/// Physical layout category of a column's values. Drives codec selection and
-/// decode framing; it carries no logical (schema) meaning.
+/// Physical layout category of a column's values.
+///
+/// Drives codec selection, decode framing and, for a [`TypeTag::Number`], the
+/// order the engine filters and prunes by; it carries no logical (schema)
+/// meaning.
 #[derive(Copy, Clone, Debug, Eq, PartialEq)]
 pub enum TypeTag {
-    /// Fixed-width values: every row occupies exactly `N` bytes (`N > 0`).
+    /// Fixed-width opaque values: every row occupies exactly `N` bytes
+    /// (`N > 0`). The engine defines no order on them, so such a column has no
+    /// statistics, is never pruned on and a predicate over it does not run.
     Fixed(u8),
+    /// Fixed-width numbers: every row occupies [`Number::width`] bytes, ordered
+    /// as the [`Number`] describes. Statistics, pruning and row filtering run
+    /// on the column's comparable encoding ([`Number::comparable`]).
+    Number(Number),
     /// Variable-width opaque byte arrays. The column data is a
     /// `(row_count + 1)`-entry little-endian `u32` offset array followed by the
     /// concatenated value bytes; row `i` spans `offset[i]..offset[i + 1]`.
@@ -75,12 +84,36 @@ pub enum TypeTag {
 }
 
 impl TypeTag {
+    /// The byte width of every row, or `None` for the variable-width
+    /// [`TypeTag::Bytes`].
+    #[must_use]
+    pub const fn fixed_width(self) -> Option<u8> {
+        match self {
+            Self::Fixed(width) => Some(width),
+            Self::Number(number) => Some(number.width),
+            Self::Bytes => None,
+        }
+    }
+
     /// Wire form: a `(tag, width)` pair. `width` is the fixed byte width, or `0`
-    /// for the variable-width [`TypeTag::Bytes`].
+    /// for the variable-width [`TypeTag::Bytes`]. A [`TypeTag::Number`] takes
+    /// tags `2..=7`: kind in steps of two, byte order in the low bit.
     const fn to_wire(self) -> (u8, u8) {
         match self {
             Self::Fixed(width) => (0, width),
             Self::Bytes => (1, 0),
+            Self::Number(number) => {
+                let kind = match number.kind {
+                    NumberKind::Unsigned => 0,
+                    NumberKind::Signed => 1,
+                    NumberKind::Float => 2,
+                };
+                let order = match number.order {
+                    ByteOrder::Little => 0,
+                    ByteOrder::Big => 1,
+                };
+                (2 + kind * 2 + order, number.width)
+            }
         }
     }
 
@@ -100,7 +133,175 @@ impl TypeTag {
                 }
                 Ok(Self::Bytes)
             }
+            2..=7 => {
+                let kind = match (tag - 2) / 2 {
+                    0 => NumberKind::Unsigned,
+                    1 => NumberKind::Signed,
+                    _ => NumberKind::Float,
+                };
+                let order = if tag.is_multiple_of(2) {
+                    ByteOrder::Little
+                } else {
+                    ByteOrder::Big
+                };
+                Number::new(kind, width, order).map(Self::Number)
+            }
             _ => Err(Error::InvalidTag(("ColumnTypeTag", tag))),
+        }
+    }
+}
+
+/// What a fixed-width number is, as far as ordering it goes.
+#[derive(Copy, Clone, Debug, Eq, PartialEq, Hash)]
+pub enum NumberKind {
+    /// An unsigned integer.
+    Unsigned,
+    /// A two's-complement signed integer.
+    Signed,
+    /// An IEEE 754 binary floating-point number, ordered by the standard's
+    /// `totalOrder` predicate (IEEE 754-2019 5.10): `-NaN < -inf < ... < -0 <
+    /// +0 < ... < +inf < +NaN`, so `-0` sorts below `+0` and every NaN has a
+    /// place by its sign and payload.
+    Float,
+}
+
+/// The order of a fixed-width number's bytes in the column.
+#[derive(Copy, Clone, Debug, Eq, PartialEq, Hash)]
+pub enum ByteOrder {
+    /// Least significant byte first.
+    Little,
+    /// Most significant byte first.
+    Big,
+}
+
+/// The physical description of a fixed-width number column: its kind, byte
+/// width and byte order. Enough to order the values and nothing more; the
+/// engine still attaches no logical meaning to the column.
+///
+/// Nulls live in the column's validity bitmap: a null row has no value, so it
+/// is excluded from the statistics and matches no predicate.
+///
+/// # Examples
+///
+/// ```
+/// use lsm_tree::table::columnar::{ByteOrder, Number, NumberKind};
+///
+/// let n = Number::new(NumberKind::Signed, 4, ByteOrder::Little).unwrap();
+/// // -1 sorts below 1 in the comparable encoding.
+/// let minus_one = n.comparable(&(-1i32).to_le_bytes()).unwrap();
+/// let one = n.comparable(&1i32.to_le_bytes()).unwrap();
+/// assert!(minus_one < one);
+/// ```
+#[derive(Copy, Clone, Debug, Eq, PartialEq, Hash)]
+pub struct Number {
+    kind: NumberKind,
+    width: u8,
+    order: ByteOrder,
+}
+
+impl Number {
+    /// The engine's own seqno column: an unsigned little-endian `u64`.
+    pub const U64_LE: Self = Self {
+        kind: NumberKind::Unsigned,
+        width: 8,
+        order: ByteOrder::Little,
+    };
+
+    /// A number of `kind`, `width` bytes wide, stored in `order`.
+    ///
+    /// # Errors
+    ///
+    /// Returns [`Error::InvalidHeader`] for a width the kind has no encoding
+    /// at: an integer is 1, 2, 4, 8 or 16 bytes, a float 4 or 8.
+    pub fn new(kind: NumberKind, width: u8, order: ByteOrder) -> Result<Self> {
+        let valid = match kind {
+            NumberKind::Unsigned | NumberKind::Signed => matches!(width, 1 | 2 | 4 | 8 | 16),
+            NumberKind::Float => matches!(width, 4 | 8),
+        };
+        if !valid {
+            return Err(Error::InvalidHeader(
+                "columnar: no number of this kind has this width",
+            ));
+        }
+        Ok(Self { kind, width, order })
+    }
+
+    /// The kind of number.
+    #[must_use]
+    pub const fn kind(self) -> NumberKind {
+        self.kind
+    }
+
+    /// The byte width of every value.
+    #[must_use]
+    pub const fn width(self) -> u8 {
+        self.width
+    }
+
+    /// The byte order of every value.
+    #[must_use]
+    pub const fn order(self) -> ByteOrder {
+        self.order
+    }
+
+    /// The comparable encoding of one value stored as `native`: [`Self::width`]
+    /// bytes whose byte-wise order is the numbers' order. Predicate bounds over
+    /// a number column are given in this encoding.
+    ///
+    /// # Errors
+    ///
+    /// Returns [`Error::InvalidHeader`] when `native` is not
+    /// [`Self::width`] bytes long.
+    pub fn comparable(self, native: &[u8]) -> Result<Vec<u8>> {
+        if native.len() != usize::from(self.width) {
+            return Err(Error::InvalidHeader(
+                "columnar: a number value is not its column's width",
+            ));
+        }
+        Ok(comparable_bytes(self, self.ordinal(native)).to_vec())
+    }
+
+    /// The largest ordinal a value of this width has: `2^(8 * width) - 1`.
+    pub(crate) const fn max_ordinal(self) -> u128 {
+        // `width` is 1..=16, so the shift is 0..=120.
+        u128::MAX >> (128 - 8 * self.width as u32)
+    }
+
+    /// The comparable encoding of `native` read as an unsigned integer: the
+    /// number's position in its order. `native` is [`Self::width`] bytes; a
+    /// shorter slice reads as if zero-extended, which a caller that checked the
+    /// column's framing never passes.
+    #[inline]
+    pub(crate) fn ordinal(self, native: &[u8]) -> u128 {
+        let mut raw = 0u128;
+        match self.order {
+            ByteOrder::Big => {
+                for &b in native {
+                    raw = (raw << 8) | u128::from(b);
+                }
+            }
+            ByteOrder::Little => {
+                for &b in native.iter().rev() {
+                    raw = (raw << 8) | u128::from(b);
+                }
+            }
+        }
+        let sign = 1u128 << (8 * u32::from(self.width) - 1);
+        match self.kind {
+            NumberKind::Unsigned => raw,
+            // Flipping the sign bit moves the negatives below the positives
+            // and keeps each half in order.
+            NumberKind::Signed => raw ^ sign,
+            // IEEE 754-2019 5.10 totalOrder: a negative's magnitude grows as
+            // its bits do, so all of it is inverted; a positive only moves
+            // above the negatives.
+            NumberKind::Float => {
+                if raw & sign == 0 {
+                    raw | sign
+                } else {
+                    !raw & self.max_ordinal()
+                }
+            }
         }
     }
 }
@@ -151,7 +352,7 @@ const fn auto_codec(column_id: u16, type_tag: TypeTag) -> Option<CodecId> {
     // column (hashes, random ids) from being delta-encoded by accident, which
     // would only inflate its size.
     match (column_id, type_tag) {
-        (COL_SEQNO, TypeTag::Fixed(8)) => Some(CodecId::Delta),
+        (COL_SEQNO, TypeTag::Number(Number::U64_LE)) => Some(CodecId::Delta),
         _ => None,
     }
 }
@@ -203,13 +404,14 @@ fn delta_decode_u64(data: &[u8]) -> Result<Vec<u8>> {
     Ok(out)
 }
 
-/// Encodes a column's decoded bytes under `codec`. Delta requires a `Fixed(8)`
-/// column (it processes whole 8-byte values); applying it to any other type is
-/// rejected rather than silently truncating a partial trailing value.
+/// Encodes a column's decoded bytes under `codec`. Delta requires an 8-byte
+/// fixed-width column (it processes whole 8-byte values); applying it to any
+/// other type is rejected rather than silently truncating a partial trailing
+/// value.
 fn codec_encode(codec: CodecId, type_tag: TypeTag, data: &[u8]) -> Result<Vec<u8>> {
     match codec {
         CodecId::Plain => Ok(data.to_vec()),
-        CodecId::Delta if matches!(type_tag, TypeTag::Fixed(8)) => Ok(delta_encode_u64(data)),
+        CodecId::Delta if type_tag.fixed_width() == Some(8) => Ok(delta_encode_u64(data)),
         CodecId::Delta => Err(Error::InvalidHeader(
             "columnar: delta codec requires a fixed-8 column",
         )),
@@ -217,11 +419,12 @@ fn codec_encode(codec: CodecId, type_tag: TypeTag, data: &[u8]) -> Result<Vec<u8
 }
 
 /// Decodes a column's stored bytes under `codec` back to the logical bytes,
-/// rejecting Delta on a non-`Fixed(8)` column (the inverse of [`codec_encode`]).
+/// rejecting Delta on any column not 8 bytes wide (the inverse of
+/// [`codec_encode`]).
 fn codec_decode(codec: CodecId, type_tag: TypeTag, data: &[u8]) -> Result<Vec<u8>> {
     match codec {
         CodecId::Plain => Ok(data.to_vec()),
-        CodecId::Delta if matches!(type_tag, TypeTag::Fixed(8)) => delta_decode_u64(data),
+        CodecId::Delta if type_tag.fixed_width() == Some(8) => delta_decode_u64(data),
         CodecId::Delta => Err(Error::InvalidHeader(
             "columnar: delta codec requires a fixed-8 column",
         )),
@@ -352,11 +555,11 @@ impl Column {
     /// `encode` and `decode` both run this so a payload is accepted by one iff
     /// it is accepted by the other.
     fn validate(&self, row_count: u32) -> Result<()> {
-        match self.type_tag {
-            TypeTag::Fixed(0) => {
+        match self.type_tag.fixed_width() {
+            Some(0) => {
                 return Err(Error::InvalidHeader("columnar: fixed column width is zero"));
             }
-            TypeTag::Fixed(w) => {
+            Some(w) => {
                 let expected =
                     (row_count as usize)
                         .checked_mul(w as usize)
@@ -369,7 +572,7 @@ impl Column {
                     ));
                 }
             }
-            TypeTag::Bytes => check_bytes_framing(&self.data, row_count)?,
+            None => check_bytes_framing(&self.data, row_count)?,
         }
         if let Some(v) = &self.validity {
             check_validity(v, row_count)?;
@@ -455,6 +658,44 @@ impl Column {
         Ok((nulls, range))
     }
 
+    /// The null count of rows `start..end` of this number column, and the
+    /// ordinal range ([`Number::ordinal`]) of their non-null values (`None`
+    /// when every one is null): the number column's counterpart of
+    /// [`Self::bytes_range`].
+    ///
+    /// # Errors
+    ///
+    /// Returns [`Error::InvalidHeader`] when the column is not a
+    /// [`TypeTag::Number`] or `start..end` is not within its rows.
+    pub(crate) fn number_range(&self, start: u32, end: u32) -> Result<(u32, Option<(u128, u128)>)> {
+        let TypeTag::Number(number) = self.type_tag else {
+            return Err(Error::InvalidHeader(
+                "columnar: a number range describes a number column",
+            ));
+        };
+        let width = usize::from(number.width);
+        let cells = self
+            .data
+            .get(start as usize * width..end as usize * width)
+            .ok_or(Error::InvalidHeader(
+                "columnar: row range outside the column",
+            ))?;
+        let mut nulls = 0u32;
+        let mut range: Option<(u128, u128)> = None;
+        for (row, cell) in (start..end).zip(cells.chunks_exact(width)) {
+            if !column_row_valid(self, row) {
+                nulls += 1;
+                continue;
+            }
+            let value = number.ordinal(cell);
+            range = Some(match range {
+                None => (value, value),
+                Some((min, max)) => (min.min(value), max.max(value)),
+            });
+        }
+        Ok((nulls, range))
+    }
+
     /// Rows `start..end` of this column of `row_count` rows, as a column of
     /// their own: the unit one row page of the column holds.
     ///
@@ -473,28 +714,25 @@ impl Column {
                 "columnar: row range outside the column",
             ));
         }
-        let data = match self.type_tag {
-            TypeTag::Fixed(w) => {
-                let w = usize::from(w);
-                let (from, to) = (start as usize * w, end as usize * w);
-                if to > self.data.len() {
-                    return Err(Error::InvalidHeader(
-                        "columnar: fixed column shorter than its rows",
-                    ));
-                }
-                self.data.slice(from..to)
+        let data = if let Some(w) = self.type_tag.fixed_width() {
+            let w = usize::from(w);
+            let (from, to) = (start as usize * w, end as usize * w);
+            if to > self.data.len() {
+                return Err(Error::InvalidHeader(
+                    "columnar: fixed column shorter than its rows",
+                ));
             }
-            TypeTag::Bytes => {
-                let cells = || (start..end).map(|i| bytes_column_row(&self.data, row_count, i));
-                // Checked once, so the framing below can take the cells as
-                // they are.
-                for cell in cells() {
-                    cell?;
-                }
-                frame_bytes_column((end - start) as usize, || {
-                    cells().map(Result::unwrap_or_default)
-                })?
+            self.data.slice(from..to)
+        } else {
+            let cells = || (start..end).map(|i| bytes_column_row(&self.data, row_count, i));
+            // Checked once, so the framing below can take the cells as they
+            // are.
+            for cell in cells() {
+                cell?;
             }
+            frame_bytes_column((end - start) as usize, || {
+                cells().map(Result::unwrap_or_default)
+            })?
         };
         let validity = self.validity.as_deref().map(|v| {
             let rows = end - start;
@@ -664,11 +902,9 @@ impl ColumnBatch {
         let mut bytes_in_page = 0u64;
         for row in 0..self.row_count {
             for col in &self.columns {
-                bytes_in_page += match col.type_tag {
-                    TypeTag::Fixed(w) => u64::from(w),
-                    TypeTag::Bytes => {
-                        bytes_column_row(&col.data, self.row_count, row)?.len() as u64 + 4
-                    }
+                bytes_in_page += match col.type_tag.fixed_width() {
+                    Some(w) => u64::from(w),
+                    None => bytes_column_row(&col.data, self.row_count, row)?.len() as u64 + 4,
                 };
             }
             rows_in_page += 1;
@@ -769,18 +1005,17 @@ impl ColumnBatch {
     }
 
     /// Per-column zone-map statistics for this block: one [`ColumnStats`] entry
-    /// per [`TypeTag::Bytes`] column, in column order.
+    /// per [`TypeTag::Bytes`] and [`TypeTag::Number`] column, in column order.
     ///
-    /// A `Bytes` column's comparable encoding is its raw value bytes, so `min` /
-    /// `max` are the byte-wise minimum / maximum over the column's non-null rows
-    /// (an all-null column records an empty range and its null count).
-    /// Fixed-width columns are omitted: their comparable encoding is not yet
-    /// defined (they are not row-filterable either), and recording a raw-byte
-    /// min / max could mis-order them and let a block-skip drop matching rows.
-    /// Omitting them keeps
+    /// `min` / `max` are the byte-wise minimum / maximum of the column's
+    /// comparable encoding over its non-null rows (an all-null column records
+    /// an empty range and its null count): a `Bytes` column's raw value bytes,
+    /// a `Number` column's [`Number::comparable`] bytes. An opaque
+    /// [`TypeTag::Fixed`] column is omitted, since its bytes have no defined
+    /// order and a raw-byte min / max could let a block-skip drop matching
+    /// rows. Omitting it keeps
     /// [`can_skip_block`](super::columnar_predicate::ColumnRangePredicate::can_skip_block)
-    /// conservative for those columns (no entry means the block is never
-    /// skipped on them).
+    /// conservative for it (no entry means the block is never skipped on it).
     ///
     /// The table writer records these for every columnar block, and
     /// `verify_zone_map` re-derives them from the decoded block to authenticate
@@ -790,6 +1025,30 @@ impl ColumnBatch {
         let rows = self.row_count;
         let mut stats = Vec::new();
         for col in &self.columns {
+            if let TypeTag::Number(number) = col.type_tag {
+                // A column whose length is not its rows' is refused by every
+                // decode; recording nothing for it keeps the block unskipped.
+                let Ok((null_count, range)) = col.number_range(0, rows) else {
+                    continue;
+                };
+                let (min, max) = match range {
+                    Some((min, max)) => (
+                        comparable_bytes(number, min).to_vec(),
+                        comparable_bytes(number, max).to_vec(),
+                    ),
+                    None => (Vec::new(), Vec::new()),
+                };
+                stats.push(ColumnStats {
+                    column_id: u32::from(col.column_id),
+                    type_tag: col.type_tag.to_wire().0,
+                    codec_id: 0,
+                    null_count,
+                    row_count: rows,
+                    min,
+                    max,
+                });
+                continue;
+            }
             let TypeTag::Bytes = col.type_tag else {
                 continue;
             };
@@ -826,7 +1085,8 @@ impl ColumnBatch {
     }
 
     /// The statistics zones of this batch cut into row pages of `row_pages`
-    /// rows: one per row page and `Bytes` column, in column order.
+    /// rows: one per row page and ordered (`Bytes` or `Number`) column, in
+    /// column order, over the same comparable encoding as [`Self::zone_stats`].
     ///
     /// The writer records these in a group's directory, and the verification
     /// gates re-derive them from the decoded group to authenticate it, so the
@@ -835,27 +1095,41 @@ impl ColumnBatch {
     /// # Errors
     ///
     /// Returns [`Error::InvalidHeader`] when the row pages overrun the batch
-    /// or a `Bytes` column is malformed.
+    /// or an ordered column is malformed.
     pub(crate) fn page_zones(
         &self,
         row_pages: &[u32],
     ) -> Result<crate::table::column_page::PageZones> {
-        let bytes_columns: Vec<&Column> = self
+        let ordered: Vec<&Column> = self
             .columns
             .iter()
-            .filter(|c| c.type_tag == TypeTag::Bytes)
+            .filter(|c| matches!(c.type_tag, TypeTag::Bytes | TypeTag::Number(_)))
             .collect();
         let mut zones = crate::table::column_page::PageZones::new(
-            bytes_columns.iter().map(|c| c.column_id).collect(),
+            ordered.iter().map(|c| c.column_id).collect(),
         );
         let mut start = 0u32;
         for &rows in row_pages {
             let end = start.checked_add(rows).ok_or(Error::InvalidHeader(
                 "columnar: row pages overrun the batch",
             ))?;
-            for col in &bytes_columns {
-                let (nulls, range) = col.bytes_range(self.row_count, start, end)?;
-                zones.push(nulls, range);
+            for col in &ordered {
+                if let TypeTag::Number(number) = col.type_tag {
+                    let (nulls, range) = col.number_range(start, end)?;
+                    match range {
+                        Some((min, max)) => zones.push(
+                            nulls,
+                            Some((
+                                &comparable_bytes(number, min),
+                                &comparable_bytes(number, max),
+                            )),
+                        ),
+                        None => zones.push(nulls, None),
+                    }
+                } else {
+                    let (nulls, range) = col.bytes_range(self.row_count, start, end)?;
+                    zones.push(nulls, range);
+                }
             }
             start = end;
         }
@@ -939,7 +1213,7 @@ impl ColumnBatch {
         for (index, head) in first.columns.iter().enumerate() {
             let parts = || all().filter_map(|page| page.columns.get(index).map(|c| (page, c)));
             let data = match head.type_tag {
-                TypeTag::Fixed(_) => {
+                TypeTag::Fixed(_) | TypeTag::Number(_) => {
                     let len = parts().map(|(_, c)| c.data.len()).sum();
                     let mut out = Vec::with_capacity(len);
                     for (_, c) in parts() {
@@ -1359,6 +1633,31 @@ fn validity_bit(bitmap: &[u8], row: u32) -> bool {
         .is_some_and(|b| (b >> (row % 8)) & 1 == 1)
 }
 
+/// A number's comparable encoding held inline: at most 16 bytes, so building
+/// one for a statistic or a bound never allocates.
+pub(crate) struct Comparable {
+    bytes: [u8; 16],
+    width: usize,
+}
+
+impl core::ops::Deref for Comparable {
+    type Target = [u8];
+
+    fn deref(&self) -> &[u8] {
+        // `width` is a `Number`'s, at most 16.
+        self.bytes.get(16 - self.width..).unwrap_or_default()
+    }
+}
+
+/// `ordinal` as `number`'s comparable encoding: its low [`Number::width`]
+/// bytes, most significant first.
+pub(crate) fn comparable_bytes(number: Number, ordinal: u128) -> Comparable {
+    Comparable {
+        bytes: ordinal.to_be_bytes(),
+        width: usize::from(number.width),
+    }
+}
+
 /// Reads row `i` of a `Fixed(8)` column body as a little-endian `u64`.
 pub(crate) fn fixed_u64_row(data: &[u8], i: u32) -> Result<u64> {
     let base = i as usize * 8;
@@ -1398,7 +1697,7 @@ pub fn entries_to_column_batch(entries: &[InternalValue]) -> Result<ColumnBatch>
         },
         Column {
             column_id: COL_SEQNO,
-            type_tag: TypeTag::Fixed(8),
+            type_tag: TypeTag::Number(Number::U64_LE),
             validity: None,
             data: seqno_data.into(),
         },
@@ -1441,9 +1740,9 @@ fn fixed_column_row(data: &[u8], width: u8, row: u32) -> Result<&[u8]> {
 
 /// Returns row `row`'s cell bytes from `col`, dispatching on the column's type.
 fn column_cell(col: &Column, row_count: u32, row: u32) -> Result<&[u8]> {
-    match col.type_tag {
-        TypeTag::Fixed(width) => fixed_column_row(&col.data, width, row),
-        TypeTag::Bytes => bytes_column_row(&col.data, row_count, row),
+    match col.type_tag.fixed_width() {
+        Some(width) => fixed_column_row(&col.data, width, row),
+        None => bytes_column_row(&col.data, row_count, row),
     }
 }
 
@@ -1494,7 +1793,7 @@ fn validate_columnar_columns(
     if key_col.column_id != COL_USER_KEY
         || key_col.type_tag != TypeTag::Bytes
         || seqno_col.column_id != COL_SEQNO
-        || seqno_col.type_tag != TypeTag::Fixed(8)
+        || seqno_col.type_tag != TypeTag::Number(Number::U64_LE)
         || vt_col.column_id != COL_VALUE_TYPE
         || vt_col.type_tag != TypeTag::Fixed(1)
     {
@@ -1902,7 +2201,7 @@ pub fn frame_value_cells(cells: &[(TypeTag, &[u8])]) -> Result<Vec<u8>> {
             // Width recoverable from the tag: append verbatim, no length prefix.
             // The cell length must equal the tag width, or the blob would not
             // un-frame with the same tags (and would shift later cells).
-            TypeTag::Fixed(width) => {
+            TypeTag::Fixed(width) | TypeTag::Number(Number { width, .. }) => {
                 if cell.len() != usize::from(*width) {
                     return Err(Error::InvalidHeader(
                         "columnar: fixed value sub-cell length does not match its type tag",
@@ -1938,9 +2237,9 @@ pub fn unframe_value_cells<'a>(blob: &'a [u8], type_tags: &[TypeTag]) -> Result<
     let mut pos = 0usize;
     for tag in type_tags {
         match tag {
-            TypeTag::Fixed(width) => {
+            TypeTag::Fixed(width) | TypeTag::Number(Number { width, .. }) => {
                 let end = pos
-                    .checked_add(*width as usize)
+                    .checked_add(usize::from(*width))
                     .ok_or(Error::InvalidHeader("columnar: framed value overflow"))?;
                 let cell = blob.get(pos..end).ok_or(Error::InvalidHeader(
                     "columnar: framed value truncated (fixed)",
@@ -2025,7 +2324,7 @@ pub fn frame_value_cells_nullable(cells: &[(TypeTag, Option<&[u8]>)]) -> Result<
         ))?;
         *byte |= 1u8 << (i % 8);
         match tag {
-            TypeTag::Fixed(width) => {
+            TypeTag::Fixed(width) | TypeTag::Number(Number { width, .. }) => {
                 if c.len() != usize::from(*width) {
                     return Err(Error::InvalidHeader(
                         "columnar: fixed value sub-cell length does not match its type tag",
@@ -2072,9 +2371,9 @@ pub fn unframe_value_cells_nullable<'a>(
             continue;
         }
         match tag {
-            TypeTag::Fixed(width) => {
+            TypeTag::Fixed(width) | TypeTag::Number(Number { width, .. }) => {
                 let end = pos
-                    .checked_add(*width as usize)
+                    .checked_add(usize::from(*width))
                     .ok_or(Error::InvalidHeader("columnar: framed value overflow"))?;
                 let cell = blob.get(pos..end).ok_or(Error::InvalidHeader(
                     "columnar: nullable framed value truncated (fixed)",

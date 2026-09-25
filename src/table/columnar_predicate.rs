@@ -15,14 +15,48 @@
 //!
 //! Both compare the column's *comparable* encoding. For a [`TypeTag::Bytes`]
 //! column (the user-key column, and consumer byte sub-columns) the comparable
-//! encoding is the raw value bytes, so the row filter operates directly on the
-//! stored bytes. Fixed-width numeric columns need a separate comparable
-//! transform and are not yet filterable at the row level (block skip still
-//! works, since the zone-map min / max are already comparable-encoded).
+//! encoding is the raw value bytes. For a [`TypeTag::Number`] column it is
+//! [`Number::comparable`](super::columnar::Number::comparable), which orders
+//! the numbers as their descriptor says. An opaque [`TypeTag::Fixed`] column
+//! has no order, so a predicate over it does not run, and
+//! [`ColumnRangePredicate::support`] says so.
 
-use super::columnar::{Column, ColumnBatch, TypeTag, frame_bytes_column, gather_fixed_column};
+use super::columnar::{
+    Column, ColumnBatch, Number, TypeTag, frame_bytes_column, gather_fixed_column,
+};
 use super::zone_map::ColumnStats;
 use alloc::vec::Vec;
+
+/// How far the engine evaluated a predicate, so a caller knows whether the
+/// rows it got still need its own check.
+///
+/// Ordered weakest first: combining the answers of several segments keeps the
+/// weakest ([`Ord::min`]).
+#[derive(Copy, Clone, Debug, Eq, PartialEq, Ord, PartialOrd, Hash)]
+pub enum PredicateSupport {
+    /// The predicate did not run at all: every row is returned as if it
+    /// matched. Its column has no order ([`TypeTag::Fixed`]) or is absent.
+    Unsupported,
+    /// The predicate only skipped blocks and row pages it proved hold no
+    /// match; the rows returned are a superset and still need the caller's
+    /// check.
+    PruneOnly,
+    /// The predicate was evaluated fully: every row returned matches and no
+    /// residual check is needed.
+    Exact,
+}
+
+/// What a scan does with a predicate.
+#[derive(Copy, Clone, Debug, Default, Eq, PartialEq, Hash)]
+pub enum PredicateApply {
+    /// Skip what the statistics rule out, then filter the rows.
+    #[default]
+    Filter,
+    /// Only skip what the statistics rule out, leaving the row check to a
+    /// caller that evaluates a wider predicate itself and would otherwise pay
+    /// for the engine's row gather too.
+    Prune,
+}
 
 /// An inclusive byte-range filter over one column's comparable encoding.
 ///
@@ -36,9 +70,77 @@ pub struct ColumnRangePredicate {
     pub lower: Option<Vec<u8>>,
     /// Inclusive upper bound in comparable encoding, or `None` for unbounded.
     pub upper: Option<Vec<u8>>,
+    /// Whether the scan filters rows or only prunes.
+    pub apply: PredicateApply,
 }
 
 impl ColumnRangePredicate {
+    /// How far this predicate is evaluated over a column of `type_tag`, or over
+    /// an absent column when `None`.
+    #[must_use]
+    pub fn support(&self, type_tag: Option<TypeTag>) -> PredicateSupport {
+        match type_tag {
+            Some(TypeTag::Bytes | TypeTag::Number(_)) => match self.apply {
+                PredicateApply::Filter => PredicateSupport::Exact,
+                PredicateApply::Prune => PredicateSupport::PruneOnly,
+            },
+            Some(TypeTag::Fixed(_)) | None => PredicateSupport::Unsupported,
+        }
+    }
+
+    /// How far this predicate is evaluated over `batch`: [`Self::support`] for
+    /// the type its column has there.
+    #[must_use]
+    pub fn support_in(&self, batch: &ColumnBatch) -> PredicateSupport {
+        self.support(
+            batch
+                .columns
+                .iter()
+                .find(|c| c.column_id == self.column_id)
+                .map(|c| c.type_tag),
+        )
+    }
+
+    /// The inclusive range of ordinals ([`Number`]'s comparable encoding read
+    /// as an integer) whose comparable bytes fall within `[lower, upper]`, or
+    /// `None` when no value of `number` does.
+    ///
+    /// A bound need not be the column's width: it is a point in byte-wise
+    /// order like any other, so a shorter lower bound reads as zero-extended,
+    /// a longer one as past its own prefix, and an upper bound likewise from
+    /// the other side. The row filter then compares integers, and returns
+    /// exactly the rows a byte-wise comparison of the comparable bytes would.
+    pub(crate) fn ordinal_span(&self, number: Number) -> Option<(u128, u128)> {
+        let width = usize::from(number.width());
+        let max = number.max_ordinal();
+        // `bytes` is at most `width` (<= 16) bytes, so the shifts stay in range.
+        let be = |bytes: &[u8]| {
+            bytes
+                .iter()
+                .fold(0u128, |acc, &b| (acc << 8) | u128::from(b))
+        };
+        let lo = match self.lower.as_deref() {
+            None | Some([]) => 0,
+            Some(l) if l.len() <= width => be(l) << (8 * (width - l.len())),
+            // Every value equal to the prefix is a proper prefix of the bound,
+            // so below it.
+            Some(l) => be(l.get(..width)?).checked_add(1).filter(|&v| v <= max)?,
+        };
+        let hi = match self.upper.as_deref() {
+            None => max,
+            Some(u) if u.len() >= width => be(u.get(..width)?),
+            // A value whose prefix equals the bound is longer, so above it:
+            // the last value below is the prefix one lower, filled with 0xFF.
+            Some(u) => {
+                // An empty bound is below every value; otherwise `u` is 1 to
+                // `width - 1` bytes, so `fill` is at most 120 bits.
+                let below = be(u).checked_sub(1)?;
+                let fill = 8 * (width - u.len());
+                (below << fill) | ((1u128 << fill) - 1)
+            }
+        };
+        (lo <= hi).then_some((lo, hi))
+    }
     /// Returns `true` when the per-block zone-map `stats` prove the predicate's
     /// column lies entirely outside `[lower, upper]`, so the block holds no
     /// matching row and can be skipped without decoding it.
@@ -70,22 +172,40 @@ impl ColumnRangePredicate {
     /// where `true` marks a row whose value is within `[lower, upper]`.
     ///
     /// A row that is null (per the column's validity bitmap) never matches. If
-    /// the predicate's column was projected out of `batch`, every row is treated
-    /// as matching (the filter cannot run on an absent column). A non-`Bytes`
-    /// column is likewise treated as all-matching, since its comparable encoding
-    /// is not the stored encoding (block skip still applied at the block level).
+    /// the predicate's column is absent from `batch`, or is an opaque
+    /// [`TypeTag::Fixed`] column with no order, every row is treated as
+    /// matching: the filter cannot run, and [`Self::support_in`] reports
+    /// [`PredicateSupport::Unsupported`] for that batch.
     #[must_use]
     pub fn matching_rows(&self, batch: &ColumnBatch) -> Vec<bool> {
         let rows = batch.row_count as usize;
         let Some(col) = batch.columns.iter().find(|c| c.column_id == self.column_id) else {
             return alloc::vec![true; rows];
         };
-        if !matches!(col.type_tag, TypeTag::Bytes) {
-            return alloc::vec![true; rows];
+        match col.type_tag {
+            TypeTag::Bytes => (0..rows)
+                .map(|row| self.row_matches(col, rows, row))
+                .collect(),
+            TypeTag::Number(number) => self.number_rows(col, number, rows),
+            TypeTag::Fixed(_) => alloc::vec![true; rows],
         }
-        (0..rows)
-            .map(|row| self.row_matches(col, rows, row))
-            .collect()
+    }
+
+    /// [`Self::matching_rows`] over a number column: each non-null row's
+    /// ordinal against the bounds' ordinal span, integer comparisons only.
+    fn number_rows(&self, col: &Column, number: Number, rows: usize) -> Vec<bool> {
+        let mut mask = Vec::with_capacity(rows);
+        if let Some((lo, hi)) = self.ordinal_span(number) {
+            let cells = col.data.chunks_exact(usize::from(number.width()));
+            for (row, cell) in cells.take(rows).enumerate() {
+                let value = number.ordinal(cell);
+                mask.push(lo <= value && value <= hi && row_valid(col, row));
+            }
+        }
+        // No value is within an empty span; a column shorter than its rows (never
+        // one a decode accepted) matches nowhere past its end.
+        mask.resize(rows, false);
+        mask
     }
 
     /// Whether row `row` of a `Bytes` column is non-null and within the bounds.
@@ -162,10 +282,10 @@ pub(crate) fn take_rows(batch: &ColumnBatch, indices: &[u32]) -> crate::Result<C
 /// repacked) and its validity bitmap. The body is written once, straight into
 /// its final buffer.
 fn take_column(col: &Column, rows: usize, indices: &[u32]) -> crate::Result<Column> {
-    let data = match col.type_tag {
+    let data = match col.type_tag.fixed_width() {
         // Out-of-range index: zero-fill one cell so the fixed framing stays
         // `row_count * width` bytes long.
-        TypeTag::Fixed(width) => {
+        Some(width) => {
             let width = width as usize;
             gather_fixed_column(
                 width,
@@ -180,7 +300,7 @@ fn take_column(col: &Column, rows: usize, indices: &[u32]) -> crate::Result<Colu
         // offset table stays in lockstep with the output row count. A gather
         // may repeat an index, so its payload can outgrow the original: that
         // is refused before anything is written (see `frame_bytes_column`).
-        TypeTag::Bytes => frame_bytes_column(indices.len(), || {
+        None => frame_bytes_column(indices.len(), || {
             indices
                 .iter()
                 .map(|&i| bytes_row(&col.data, rows, i as usize).unwrap_or(&[]))
@@ -262,7 +382,7 @@ pub fn byte_eq_mask(batch: &ColumnBatch, column_id: u16, value: u8) -> Vec<bool>
     let Some(col) = batch.columns.iter().find(|c| c.column_id == column_id) else {
         return alloc::vec![true; rows];
     };
-    if !matches!(col.type_tag, TypeTag::Fixed(1)) {
+    if col.type_tag.fixed_width() != Some(1) {
         return alloc::vec![true; rows];
     }
     byte_eq_dispatch(&col.data, value)

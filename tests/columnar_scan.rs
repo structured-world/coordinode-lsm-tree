@@ -12,7 +12,7 @@ use lsm_tree::table::columnar::{
     COL_SEQNO, COL_USER_KEY, COL_VALUE, COL_VALUE_TYPE, Column, ColumnBatch, TypeTag,
     column_batch_to_entries, entries_to_column_batch,
 };
-use lsm_tree::table::columnar_predicate::ColumnRangePredicate;
+use lsm_tree::table::columnar_predicate::{ColumnRangePredicate, PredicateApply, PredicateSupport};
 use lsm_tree::{
     AbstractTree, AnyTree, Config, Error, InternalValue, SeqNo, SequenceNumberCounter, UserKey,
     ValueType, get_tmp_folder,
@@ -199,6 +199,7 @@ fn columnar_scan_predicate_equals_a_naive_filter() {
         column_id: COL_USER_KEY,
         lower: Some(lo.clone()),
         upper: Some(hi.clone()),
+        apply: PredicateApply::Filter,
     };
     let all = [COL_USER_KEY, COL_SEQNO, COL_VALUE_TYPE, COL_VALUE];
 
@@ -239,6 +240,7 @@ fn columnar_scan_predicate_on_an_unprojected_column_still_filters() {
         column_id: COL_USER_KEY,
         lower: Some(key(1000)),
         upper: Some(key(1999)),
+        apply: PredicateApply::Filter,
     };
     let batches = table
         .columnar_scan(&[COL_VALUE], Some(&pred))
@@ -387,6 +389,7 @@ fn tree_columnar_scan_predicate_filters_across_segments() {
         column_id: COL_USER_KEY,
         lower: Some(key(1)),
         upper: Some(key(4)),
+        apply: PredicateApply::Filter,
     };
     let got = scan_to_pairs(
         standard(&any),
@@ -720,6 +723,7 @@ fn tree_columnar_scan_singleton_predicate_runs_after_dedup() {
         column_id: COL_VALUE,
         lower: Some(b"match".to_vec()),
         upper: Some(b"match".to_vec()),
+        apply: PredicateApply::Filter,
     };
     let mut got: Vec<Vec<u8>> = Vec::new();
     for batch in tree
@@ -878,6 +882,7 @@ fn tree_columnar_scan_predicate_on_unprojected_column_still_filters() {
         column_id: COL_USER_KEY,
         lower: Some(key(1)),
         upper: Some(key(3)),
+        apply: PredicateApply::Filter,
     };
     let tree = standard(&any);
     let mut rows = 0u32;
@@ -932,6 +937,7 @@ fn tree_columnar_scan_block_decode_count_drops_with_predicate() {
         column_id: COL_USER_KEY,
         lower: Some(key(1000)),
         upper: Some(key(1099)),
+        apply: PredicateApply::Filter,
     };
     let before = metrics.data_block_load_count();
     for batch in tree
@@ -1382,6 +1388,7 @@ fn tree_columnar_scan_applies_predicate_after_newest_version_wins() {
         column_id: 3,
         lower: Some(b"aaa".to_vec()),
         upper: Some(b"aaa".to_vec()),
+        apply: PredicateApply::Filter,
     };
     let tree = standard(&any);
     let mut keys: Vec<Vec<u8>> = Vec::new();
@@ -1410,4 +1417,281 @@ fn tree_columnar_scan_applies_predicate_after_newest_version_wins() {
         "k1's newest version (zzz) fails the predicate, so k1 is omitted, not \
          returned as the stale older matching version; got {keys:?}",
     );
+}
+
+/// Opens an empty columnar tree whose seqno counter the test drives, so each
+/// ingestion's `global_seqno` is the value the test set.
+fn open_columnar_any_at(folder: &std::path::Path, seqno: &SequenceNumberCounter) -> AnyTree {
+    let any = Config::new(folder, seqno.clone(), SequenceNumberCounter::default())
+        .open()
+        .expect("open");
+    standard(&any)
+        .update_runtime_config(|cfg| {
+            cfg.columnar = true;
+            cfg.zone_map = true;
+        })
+        .expect("enable columnar + zone-map");
+    any
+}
+
+/// Ingests `rows` (key, fixed-4 sub-column value, value type) as one segment
+/// taking `global` as its seqno base.
+fn ingest_at(
+    any: &AnyTree,
+    seqno: &SequenceNumberCounter,
+    global: SeqNo,
+    rows: &[(Vec<u8>, u32, ValueType)],
+) {
+    seqno.set(global);
+    let entries: Vec<InternalValue> = rows
+        .iter()
+        .map(|(k, _, vt)| InternalValue::from_components(k.clone(), b"", 0, *vt))
+        .collect();
+    let mut batch = entries_to_column_batch(&entries).expect("transpose");
+    batch.columns.pop();
+    batch.columns.push(Column {
+        column_id: 3,
+        type_tag: TypeTag::Fixed(4),
+        validity: None,
+        data: rows
+            .iter()
+            .flat_map(|(_, a, _)| a.to_le_bytes())
+            .collect::<Vec<u8>>()
+            .into(),
+    });
+    let mut ingest = any.ingestion().expect("ingestion");
+    ingest.write_columnar_batch(&batch).expect("write");
+    ingest.finish().expect("finish");
+}
+
+/// A seqno range in the column's comparable (big-endian) encoding.
+fn seqno_range(lo: SeqNo, hi: SeqNo, apply: PredicateApply) -> ColumnRangePredicate {
+    ColumnRangePredicate {
+        column_id: COL_SEQNO,
+        lower: Some(lo.to_be_bytes().to_vec()),
+        upper: Some(hi.to_be_bytes().to_vec()),
+        apply,
+    }
+}
+
+/// The keys a tree-level scan under `pred` yields, and how far it reported
+/// the predicate ran once exhausted.
+fn scan_keys_under(
+    tree: &lsm_tree::Tree,
+    pred: &ColumnRangePredicate,
+) -> (Vec<Vec<u8>>, Option<PredicateSupport>) {
+    let mut scan = tree
+        .columnar_scan(&[COL_USER_KEY], Some(pred), SeqNo::MAX, ..)
+        .expect("scan");
+    let mut keys = Vec::new();
+    for batch in scan.by_ref() {
+        let batch = batch.expect("batch");
+        let key_col = &batch.columns[0];
+        let rows = batch.row_count as usize;
+        let off = |i: usize| {
+            u32::from_le_bytes(key_col.data[i * 4..i * 4 + 4].try_into().unwrap()) as usize
+        };
+        let payload = &key_col.data[(rows + 1) * 4..];
+        for i in 0..rows {
+            keys.push(payload[off(i)..off(i + 1)].to_vec());
+        }
+    }
+    (keys, scan.predicate_support())
+}
+
+/// The effective seqno bases of the tree's segments, ascending.
+fn globals(tree: &lsm_tree::Tree) -> Vec<SeqNo> {
+    let mut out: Vec<SeqNo> = tree
+        .current_version()
+        .iter_tables()
+        .map(lsm_tree::Table::global_seqno)
+        .collect();
+    out.sort_unstable();
+    out
+}
+
+fn live(keys: core::ops::Range<u32>) -> Vec<(Vec<u8>, u32, ValueType)> {
+    keys.map(|i| (key(i), i, ValueType::Value)).collect()
+}
+
+/// A bulk-ingested segment stores its rows at local seqno 0 and is based at its
+/// `global_seqno`; the scan speaks effective seqnos. A seqno predicate
+/// `[95, 105]` must therefore match the rows of the segment based at 100 and
+/// none of the one based at 200, with the zone map on, through the verbatim
+/// singleton path.
+#[test]
+fn a_seqno_predicate_matches_a_bulk_ingested_segment_by_its_effective_seqno() {
+    let folder = get_tmp_folder();
+    let seqno = SequenceNumberCounter::default();
+    let any = open_columnar_any_at(folder.path(), &seqno);
+    ingest_at(&any, &seqno, 100, &live(0..10));
+    ingest_at(&any, &seqno, 200, &live(10..20));
+    let tree = standard(&any);
+    assert_eq!(globals(tree), vec![100, 200], "the segments' bases");
+
+    let (keys, support) = scan_keys_under(tree, &seqno_range(95, 105, PredicateApply::Filter));
+    assert_eq!(
+        keys,
+        (0..10).map(key).collect::<Vec<_>>(),
+        "exactly the rows whose effective seqno is 100"
+    );
+    assert_eq!(support, Some(PredicateSupport::Exact));
+}
+
+/// The same predicate through the singleton DEDUP path: a segment that records
+/// a deletion is deduped, and the predicate there runs before the seqno column
+/// is globalized.
+#[test]
+fn a_seqno_predicate_matches_a_bulk_ingested_segment_on_the_dedup_path() {
+    let folder = get_tmp_folder();
+    let seqno = SequenceNumberCounter::default();
+    let any = open_columnar_any_at(folder.path(), &seqno);
+    let mut rows = live(0..10);
+    rows[3].2 = ValueType::Tombstone;
+    ingest_at(&any, &seqno, 100, &rows);
+    ingest_at(&any, &seqno, 200, &live(10..20));
+    let tree = standard(&any);
+
+    let (keys, support) = scan_keys_under(tree, &seqno_range(95, 105, PredicateApply::Filter));
+    let expected: Vec<Vec<u8>> = (0..10).filter(|&i| i != 3).map(key).collect();
+    assert_eq!(
+        keys, expected,
+        "the live rows based at 100, the deleted one gone"
+    );
+    assert_eq!(support, Some(PredicateSupport::Exact));
+}
+
+/// And through the OVERLAP merge: the newest version of each key decides, so a
+/// key overwritten by the segment based at 200 does not match `[95, 105]`, and
+/// is not served from its older matching version either.
+#[test]
+fn a_seqno_predicate_matches_effective_seqnos_across_overlapping_segments() {
+    let folder = get_tmp_folder();
+    let seqno = SequenceNumberCounter::default();
+    let any = open_columnar_any_at(folder.path(), &seqno);
+    ingest_at(&any, &seqno, 100, &live(0..10));
+    ingest_at(&any, &seqno, 200, &live(5..15));
+    let tree = standard(&any);
+
+    let (keys, support) = scan_keys_under(tree, &seqno_range(95, 105, PredicateApply::Filter));
+    assert_eq!(
+        keys,
+        (0..5).map(key).collect::<Vec<_>>(),
+        "the keys whose newest version is based at 100"
+    );
+    assert_eq!(support, Some(PredicateSupport::Exact));
+}
+
+/// A predicate that only prunes returns a superset and says so; one over an
+/// opaque fixed column does not run and says so.
+#[test]
+fn a_tree_scan_reports_how_far_its_predicate_ran() {
+    let folder = get_tmp_folder();
+    let seqno = SequenceNumberCounter::default();
+    let any = open_columnar_any_at(folder.path(), &seqno);
+    ingest_at(&any, &seqno, 100, &live(0..10));
+    ingest_at(&any, &seqno, 200, &live(10..20));
+    let tree = standard(&any);
+
+    // Pruning: the segment based at 200 is ruled out, the other is returned
+    // whole for the caller to check.
+    let (keys, support) = scan_keys_under(tree, &seqno_range(95, 100, PredicateApply::Prune));
+    assert_eq!(keys, (0..10).map(key).collect::<Vec<_>>());
+    assert_eq!(support, Some(PredicateSupport::PruneOnly));
+
+    // The fixed-4 sub-column has no declared order: every row comes back.
+    let opaque = ColumnRangePredicate {
+        column_id: 3,
+        lower: Some(vec![0; 4]),
+        upper: Some(vec![0; 4]),
+        apply: PredicateApply::Filter,
+    };
+    let (keys, support) = scan_keys_under(tree, &opaque);
+    assert_eq!(keys.len(), 20, "the predicate did not run");
+    assert_eq!(support, Some(PredicateSupport::Unsupported));
+
+    // No predicate, nothing to report.
+    let scan = tree
+        .columnar_scan(&[COL_USER_KEY], None, SeqNo::MAX, ..)
+        .expect("scan");
+    assert_eq!(scan.predicate_support(), None);
+}
+
+/// A flushed segment carries per-row seqnos, so a seqno range prunes its blocks
+/// and row pages; the pruned scan returns exactly the matching rows.
+#[test]
+fn a_seqno_predicate_over_a_flushed_segment_returns_every_matching_row() {
+    let folder = get_tmp_folder();
+    let tree = open_columnar(folder.path());
+    for i in 0..4000u32 {
+        tree.insert(key(i), vec![b'v'; 80], u64::from(i));
+    }
+    tree.flush_active_memtable(0).expect("flush");
+
+    let (keys, support) = scan_keys_under(&tree, &seqno_range(1000, 1099, PredicateApply::Filter));
+    assert_eq!(keys, (1000..1100).map(key).collect::<Vec<_>>());
+    assert_eq!(support, Some(PredicateSupport::Exact));
+}
+
+/// Block and page pruning on a number sub-column never drops a matching row:
+/// every random range returns what filtering a full, unpruned scan returns.
+#[test]
+fn a_number_predicate_prunes_without_dropping_a_matching_row() {
+    use lsm_tree::table::columnar::{ByteOrder, Number, NumberKind};
+
+    const ROWS: u32 = 6000;
+    let folder = get_tmp_folder();
+    let any = open_columnar_any(folder.path());
+    let number = Number::new(NumberKind::Signed, 4, ByteOrder::Little).expect("an i32");
+    // A fixed xorshift, so a failure reproduces.
+    let mut state = 0x683_u64;
+    let mut next = move |span: i32| {
+        state ^= state << 13;
+        state ^= state >> 7;
+        state ^= state << 17;
+        (state % u64::from(span.unsigned_abs())) as i32
+    };
+    // Clustered values, so blocks have narrow ranges a predicate can prune.
+    let values: Vec<i32> = (0..ROWS)
+        .map(|i| (i as i32 - 3000) * 7 + next(100) - 50)
+        .collect();
+    let entries: Vec<InternalValue> = (0..ROWS)
+        .map(|i| InternalValue::from_components(key(i), b"", 0, ValueType::Value))
+        .collect();
+    let mut batch = entries_to_column_batch(&entries).expect("transpose");
+    batch.columns.pop();
+    batch.columns.push(Column {
+        column_id: 3,
+        type_tag: TypeTag::Number(number),
+        validity: None,
+        data: values
+            .iter()
+            .flat_map(|v| v.to_le_bytes())
+            .collect::<Vec<u8>>()
+            .into(),
+    });
+    {
+        let mut ingest = any.ingestion().expect("ingestion");
+        ingest.write_columnar_batch(&batch).expect("write");
+        ingest.finish().expect("finish");
+    }
+    let tree = standard(&any);
+
+    for _ in 0..50 {
+        let a = next(50_000) - 25_000;
+        let b = a + next(3_000);
+        let pred = ColumnRangePredicate {
+            column_id: 3,
+            lower: Some(number.comparable(&a.to_le_bytes()).expect("i32")),
+            upper: Some(number.comparable(&b.to_le_bytes()).expect("i32")),
+            apply: PredicateApply::Filter,
+        };
+        let (keys, support) = scan_keys_under(tree, &pred);
+        let expected: Vec<Vec<u8>> = (0..ROWS)
+            .filter(|&i| (a..=b).contains(&values[i as usize]))
+            .map(key)
+            .collect();
+        assert_eq!(keys, expected, "range [{a}, {b}]");
+        assert_eq!(support, Some(PredicateSupport::Exact));
+    }
 }
