@@ -28,9 +28,9 @@ use alloc::vec::Vec;
 /// every byte it reads and rewrites to do so (`total`, the promoted bytes
 /// plus those it pulls in from the level below).
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
-pub(crate) struct MergeCost {
-    pub(crate) promoted: u64,
-    pub(crate) total: u64,
+struct MergeCost {
+    promoted: u64,
+    total: u64,
 }
 
 impl MergeCost {
@@ -55,11 +55,7 @@ impl MergeCost {
 /// wins, so a level is not asked to push down far more than it owes; when none
 /// is that small, the cheapest overall still makes progress. Ties go to the
 /// earliest candidate, so the choice is the same on every call.
-pub(crate) fn rank_by_promoted_ratio(
-    candidates: &[MergeCost],
-    overshoot: u64,
-    slack: u64,
-) -> Option<usize> {
+fn rank_by_promoted_ratio(candidates: &[MergeCost], overshoot: u64, slack: u64) -> Option<usize> {
     // A bound past `u64::MAX` admits every candidate, which is what clamping
     // to `u64::MAX` means: no promoted byte count can exceed it.
     let bound = overshoot.saturating_add(slack);
