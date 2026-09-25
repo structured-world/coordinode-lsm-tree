@@ -8475,6 +8475,60 @@ fn a_page_refused_by_its_stamp_is_not_cached() -> crate::Result<()> {
     Ok(())
 }
 
+/// A scan that meets two row groups swapped whole, directory and pages
+/// together, is refused. Each group is consistent in itself, so its checksums
+/// and its pages' stamps pass; only the index knows which group belongs where,
+/// and a scan streams the data without it, so it would hand compaction the
+/// second group's rows before the first's.
+#[cfg(feature = "columnar")]
+#[test]
+fn a_scan_refuses_row_groups_swapped_whole() -> crate::Result<()> {
+    let dir = tempdir()?;
+    let file = dir.path().join("table");
+    let checksum = columnar_table_file_paged(&file, 400, 16, 100, 16 * 1_024, 1_024)?;
+    let (first, second) = {
+        let table = Table::recover(test_recover_params(file.clone(), checksum))?;
+        let mut groups = table.data_block_handles();
+        let (Some(first), Some(second)) = (groups.next(), groups.next()) else {
+            panic!("the table has two row groups");
+        };
+        (*first?.as_ref(), *second?.as_ref())
+    };
+    assert_eq!(
+        first.size(),
+        second.size(),
+        "the two groups are of one shape"
+    );
+
+    let mut bytes = std::fs::read(&file)?;
+    let extent = |group: &BlockHandle| {
+        let at = usize::try_from(*group.offset()).expect("offset fits");
+        at..at + group.size() as usize
+    };
+    let first_bytes = bytes.get(extent(&first)).expect("group").to_vec();
+    let second_bytes = bytes.get(extent(&second)).expect("group").to_vec();
+    bytes
+        .get_mut(extent(&first))
+        .expect("group")
+        .copy_from_slice(&second_bytes);
+    bytes
+        .get_mut(extent(&second))
+        .expect("group")
+        .copy_from_slice(&first_bytes);
+    std::fs::write(&file, &bytes)?;
+
+    let table = Table::recover(test_recover_params(file, checksum))?;
+    let scanned = table
+        .scan()
+        .and_then(Iterator::collect::<crate::Result<Vec<_>>>);
+    assert!(
+        scanned.is_err(),
+        "a scan over swapped row groups must be refused, got {} rows",
+        scanned.map_or(0, |rows| rows.len()),
+    );
+    Ok(())
+}
+
 /// Writes the second row group's directory over the first's, the two being of
 /// one shape, and returns the first group's handle from the index with the
 /// file's original bytes.
@@ -8837,7 +8891,7 @@ fn a_zone_block_moved_to_another_group_is_refused() -> crate::Result<()> {
     let table = Table::recover(test_recover_params(file.clone(), checksum))?;
     let groups: Vec<BlockHandle> = table
         .data_block_handles()
-        .map(|handle| handle.map(|h| BlockHandle::new(h.offset(), h.size())))
+        .map(|handle| handle.map(KeyedBlockHandle::into_inner))
         .collect::<crate::Result<_>>()?;
     let zone_block = |group: &BlockHandle| -> crate::Result<BlockHandle> {
         let blocks = table.data_unit_blocks(group)?;

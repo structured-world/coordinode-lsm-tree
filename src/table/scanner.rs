@@ -61,6 +61,12 @@ pub struct Scanner {
     /// `true` while entries may still fall below `lower_bound`. Keys ascend,
     /// so once one entry reaches the bound the comparison is retired.
     filtering_below_bound: bool,
+
+    /// The tags the index names the groups still to be read by, in order: a
+    /// columnar scan streams the data without the index, and refuses a group
+    /// whose directory does not carry the tag its entry names. Empty for a
+    /// row-major table.
+    group_tags: alloc::vec::IntoIter<Option<core::num::NonZeroU64>>,
 }
 
 impl Scanner {
@@ -87,6 +93,7 @@ impl Scanner {
         restart_interval: u8,
         start_offset: u64,
         lower_bound: Option<crate::UserKey>,
+        group_tags: alloc::vec::Vec<Option<core::num::NonZeroU64>>,
     ) -> crate::Result<Self> {
         // 2 MiB buffer matches RocksDB's `compaction_readahead_size`
         // default and is large enough that the kernel can fold the
@@ -118,6 +125,7 @@ impl Scanner {
             file.seek(SeekFrom::Start(start_offset))?;
         }
         let mut reader = BufReader::with_capacity(SCANNER_READAHEAD_BYTES, file);
+        let mut group_tags = group_tags.into_iter();
 
         let block = Self::fetch_next_block(
             &mut reader,
@@ -128,6 +136,7 @@ impl Scanner {
             has_kv_footer,
             columnar,
             restart_interval,
+            group_tags.next().flatten(),
             #[cfg(zstd_any)]
             zstd_dictionary.as_deref(),
         )?;
@@ -158,6 +167,7 @@ impl Scanner {
 
             filtering_below_bound: lower_bound.is_some(),
             lower_bound,
+            group_tags,
         })
     }
 
@@ -174,6 +184,7 @@ impl Scanner {
         has_kv_footer: bool,
         columnar: bool,
         restart_interval: u8,
+        group_tag: Option<core::num::NonZeroU64>,
         #[cfg(zstd_any)] zstd_dict: Option<&crate::compression::ZstdDictionary>,
     ) -> crate::Result<DataBlock> {
         if columnar {
@@ -184,6 +195,7 @@ impl Scanner {
                 encryption,
                 ecc,
                 restart_interval,
+                group_tag,
                 #[cfg(zstd_any)]
                 zstd_dict,
             );
@@ -253,12 +265,18 @@ impl Scanner {
     /// pages, which follow it back to back, then its zone blocks if it has any
     /// — and reconstructs it into a row-major [`DataBlock`].
     ///
-    /// The stream has no index entry to check the group against, so each page
-    /// is checked against the directory instead: a page whose on-disk length
-    /// differs from the length the directory records means the stream and the
+    /// The directory must carry `group_tag`, the tag the group's index entry
+    /// names it by: a group consistent in itself but read in another group's
+    /// place is refused rather than streamed out of order. Each page is then
+    /// checked against the directory: a page whose on-disk length differs
+    /// from the length the directory records means the stream and the
     /// directory disagree about where the next block starts, and every block
     /// read after that point would be misframed.
     #[cfg(feature = "columnar")]
+    #[expect(
+        clippy::too_many_arguments,
+        reason = "per-group read threads each SST-level read parameter through, as `fetch_next_block` does"
+    )]
     fn fetch_next_row_group(
         reader: &mut BufReader<Box<dyn FsFile>>,
         table_id: crate::TableId,
@@ -266,6 +284,7 @@ impl Scanner {
         encryption: Option<&dyn EncryptionProvider>,
         ecc: Option<crate::table::block::EccParams>,
         restart_interval: u8,
+        group_tag: Option<core::num::NonZeroU64>,
         #[cfg(zstd_any)] zstd_dict: Option<&crate::compression::ZstdDictionary>,
     ) -> crate::Result<DataBlock> {
         let directory_block = Self::read_block(
@@ -285,6 +304,19 @@ impl Scanner {
             )));
         }
         let directory = crate::table::column_page::PageDirectory::decode(&directory_block.data)?;
+        match group_tag {
+            Some(tag) if tag.get() == directory.group_tag() => {}
+            Some(_) => {
+                return Err(crate::Error::InvalidHeader(
+                    "columnar: page directory belongs to another row group",
+                ));
+            }
+            None => {
+                return Err(crate::Error::InvalidHeader(
+                    "columnar: the index entry names no row group",
+                ));
+            }
+        }
         let mut pages = Vec::with_capacity(directory.entries().len());
         for entry in directory.entries() {
             let page = Self::read_block(
@@ -351,6 +383,13 @@ impl Scanner {
 
     /// Without the `columnar` feature a columnar SST cannot be read.
     #[cfg(not(feature = "columnar"))]
+    #[cfg_attr(
+        zstd_any,
+        expect(
+            clippy::too_many_arguments,
+            reason = "mirrors the columnar build's signature"
+        )
+    )]
     fn fetch_next_row_group(
         _reader: &mut BufReader<Box<dyn FsFile>>,
         _table_id: crate::TableId,
@@ -358,6 +397,7 @@ impl Scanner {
         _encryption: Option<&dyn EncryptionProvider>,
         _ecc: Option<crate::table::block::EccParams>,
         _restart_interval: u8,
+        _group_tag: Option<core::num::NonZeroU64>,
         #[cfg(zstd_any)] _zstd_dict: Option<&crate::compression::ZstdDictionary>,
     ) -> crate::Result<DataBlock> {
         Err(crate::Error::FeatureUnsupported("columnar"))
@@ -400,6 +440,7 @@ impl Iterator for Scanner {
                 self.has_kv_footer,
                 self.columnar,
                 self.restart_interval,
+                self.group_tags.next().flatten(),
                 #[cfg(zstd_any)]
                 self.zstd_dictionary.as_deref(),
             ) {

@@ -411,6 +411,18 @@ pub struct Writer {
     parallel_pending_bytes: u64,
 }
 
+/// Refuses a batch of more columns than a row group's directory can list: it
+/// counts the group's pages in a `u16`, and every column has at least one.
+#[cfg(feature = "columnar")]
+fn check_group_column_count(batch: &crate::table::columnar::ColumnBatch) -> crate::Result<()> {
+    if batch.columns.len() > usize::from(u16::MAX) {
+        return Err(crate::Error::InvalidHeader(
+            "columnar: more columns than a row group's directory can list",
+        ));
+    }
+    Ok(())
+}
+
 /// `tag` as the index names a row group, refusing the zero tag no group is
 /// written under.
 #[cfg(feature = "columnar")]
@@ -1548,6 +1560,7 @@ impl Writer {
         // plain so a reader never needs the codec or its dictionary to find
         // out where the pages are. Both are encrypted and ECC-protected exactly
         // like data.
+        check_group_column_count(batch)?;
         let page_transform = self.data_transform(self.data_block_compression)?;
         let directory_transform = self.data_transform(crate::CompressionType::None)?;
         let group_tag = self.next_group_tag()?;
@@ -1571,13 +1584,15 @@ impl Writer {
             // The directory counts the group's column pages in a `u16`, so a
             // page size that gives more row pages than it can list merges
             // adjacent ones: the grid stays complete and only pruning coarsens.
+            // The column count was checked against the same field, so at
+            // least one row page fits.
             let fit = usize::from(u16::MAX) / batch.columns.len().max(1);
             if cuts.len() <= fit {
                 cuts
             } else {
                 // Each merged page is a run of whole cuts, so its rows are at
                 // most the group's `u32` row count.
-                cuts.chunks(cuts.len().div_ceil(fit.max(1)))
+                cuts.chunks(cuts.len().div_ceil(fit))
                     .map(|run| run.iter().sum::<u32>())
                     .collect()
             }
@@ -1794,6 +1809,7 @@ impl Writer {
                 "columnar batch ingest requires the columnar layout",
             ));
         }
+        check_group_column_count(batch)?;
         // Validate the layout, framing, seqno-zero, and intra-batch key order
         // without decoding every row into an `InternalValue`: the batch is
         // re-validated and fully decoded once at flush (on the accumulated

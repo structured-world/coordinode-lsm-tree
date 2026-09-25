@@ -7524,20 +7524,33 @@ impl Table {
         // block always remains; the straddling block's sub-bound entries are
         // dropped by the scanner's key filter.
         let mut start_offset = 0u64;
-        if let Some(bound) = &self.1 {
+        // A columnar scan streams the data without the index, so the index
+        // hands it the tag of every group it will read: a group consistent in
+        // itself but in another group's place is refused against it, as an
+        // indexed read refuses it.
+        let mut group_tags = Vec::new();
+        if self.1.is_some() || self.metadata.columnar {
+            let mut started = self.1.is_none();
             for keyed in self.maintenance_index_walk() {
                 let keyed = keyed?;
-                if self.comparator.compare(keyed.end_key(), bound.as_ref())
-                    == core::cmp::Ordering::Less
-                {
-                    // Cannot underflow: this loop walks the block index the
-                    // count was derived from, so at most `block_count`
-                    // decrements can ever run.
-                    block_count -= 1;
-                    continue;
+                if !started {
+                    if let Some(bound) = &self.1
+                        && self.comparator.compare(keyed.end_key(), bound.as_ref())
+                            == core::cmp::Ordering::Less
+                    {
+                        // Cannot underflow: this loop walks the block index the
+                        // count was derived from, so at most `block_count`
+                        // decrements can ever run.
+                        block_count -= 1;
+                        continue;
+                    }
+                    start_offset = keyed.offset().0;
+                    started = true;
+                    if !self.metadata.columnar {
+                        break;
+                    }
                 }
-                start_offset = keyed.offset().0;
-                break;
+                group_tags.push(keyed.as_ref().group_tag());
             }
         }
 
@@ -7558,6 +7571,7 @@ impl Table {
             self.metadata.data_block_restart_interval,
             start_offset,
             self.1.clone(),
+            group_tags,
         )
     }
 
