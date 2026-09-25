@@ -2393,7 +2393,13 @@ fn salvage_blocks(
                                     // copy's own `verify_zone_map`).
                                     Some((raw, uncompressed)) => writer
                                         .append_verbatim_row_group(
-                                            &raw,
+                                            (
+                                                &raw,
+                                                crate::table::writer::VerbatimSource {
+                                                    table_id: table.id(),
+                                                    offset,
+                                                },
+                                            ),
                                             uncompressed,
                                             group_tag,
                                             &entries,
@@ -2644,9 +2650,18 @@ fn salvage_blocks(
                                 .validate_direct_block_order(&entries, comparator)
                                 .and_then(|()| {
                                     if let Some((raw, header, layout)) = sb.verbatim {
+                                        let source = crate::table::writer::VerbatimSource {
+                                            table_id: table.id(),
+                                            offset,
+                                        };
                                         writer
                                             .append_verbatim_data_block(
-                                                &raw, header, layout, &entries, None, comparator,
+                                                (&raw, source),
+                                                header,
+                                                layout,
+                                                &entries,
+                                                None,
+                                                comparator,
                                             )
                                             .map(|_| true)
                                     } else {

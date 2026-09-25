@@ -4021,7 +4021,10 @@ impl Tree {
         }
 
         for (task, buf) in chunk.iter().zip(buffers.iter()) {
-            if let Some(block) = task.table.decode_data_block_from_bytes(buf)? {
+            if let Some(block) = task
+                .table
+                .decode_data_block_from_bytes(buf, *task.handle.offset())?
+            {
                 for &kidx in &task.keys {
                     if let Some(item) = task.table.point_read_translated(
                         &block,

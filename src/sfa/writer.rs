@@ -33,6 +33,11 @@ impl<W: Write + Seek> Writer<W> {
         &mut self.writer
     }
 
+    /// Returns a reference to the underlying writer.
+    pub fn get_ref(&self) -> &W {
+        &self.writer
+    }
+
     /// Creates a new writer with the given I/O writer.
     #[must_use]
     pub fn from_writer(writer: W) -> Self {

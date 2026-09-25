@@ -6,11 +6,13 @@
 //! deferring the expensive re-transpose that copy-on-write pays.
 //!
 //! Because merge-on-read keeps all rows (deleted ones are masked by the bitmap,
-//! not dropped), the output segment is byte-identical to the source except for a
-//! new table id and an added `delete_bitmap` section. So this copies the data /
+//! not dropped), the output segment is identical to the source except for a new
+//! table id and an added `delete_bitmap` section. So this copies the data /
 //! index / filter / zone-map / seqno-bounds sections (and the torn-write
-//! defenses) verbatim, re-encodes only the two `meta` blocks with the new id,
-//! and appends the bitmap. The data section stays first, so the block-index /
+//! defenses) block by block with their payloads untouched, re-encodes only the
+//! two `meta` blocks with the new id, and appends the bitmap. Each copied block
+//! is re-stamped for the new table and the offset it lands at, since its stored
+//! checksum is bound to both. The data section stays first, so the block-index /
 //! zone-map / seqno-bounds absolute offsets stay valid; every other section is
 //! addressed through the table of contents.
 
@@ -114,15 +116,30 @@ impl Table {
                 writer.start(name)?;
                 if name == b"meta_mid" || name == b"meta" {
                     // Re-encoded copy (new id), not the source bytes. Non-encrypted
-                    // segment, so the two copies are byte-identical (no nonce).
+                    // segment, so the two copies are identical (no nonce) but
+                    // for the place their checksums are bound to.
+                    let at = super::block::ChecksumAt::block(
+                        new_table_id,
+                        BlockType::Meta,
+                        writer.get_ref().position(),
+                    );
                     Block::write_into(
                         &mut writer,
                         &meta_payload,
                         meta_identity,
                         &BlockTransform::PLAIN,
+                        at,
                     )?;
-                } else {
+                } else if RAW_SECTIONS.contains(&name) {
                     copy_section(&*src, &mut writer, entry.pos(), entry.len())?;
+                } else {
+                    copy_blocks(
+                        &*src,
+                        &mut writer,
+                        (entry.pos(), entry.len()),
+                        self.metadata.id,
+                        new_table_id,
+                    )?;
                 }
             }
 
@@ -131,6 +148,7 @@ impl Table {
             // sections. Same uncompressed envelope as the other meta sections.
             writer.start(b"delete_bitmap")?;
             let encoded = delete_bitmap.encode();
+            let at = super::writer::next_block_at(new_table_id, &writer);
             Block::write_into(
                 &mut writer,
                 &encoded,
@@ -141,6 +159,7 @@ impl Table {
                     window_log: 0,
                 },
                 &BlockTransform::PLAIN,
+                at,
             )?;
 
             let mut checksummed = writer.into_inner()?;
@@ -310,6 +329,69 @@ impl Table {
         DataBlock::encode_into(&mut payload, &entries, 1, 0.0)?;
         Ok(payload)
     }
+}
+
+/// The sections a table writes as raw bytes rather than as blocks: everything
+/// else is a run of blocks, each re-stamped as it is copied.
+const RAW_SECTIONS: [&[u8]; 3] = [b"linked_blob_files", b"table_version", b"meta_separator"];
+
+/// Copies the blocks of the section at `(pos, len)` of `src`, a table of id
+/// `from_table`, into `writer` for table `to_table`: each block's payload is
+/// written as it is, and its stored checksum is moved from where it was to
+/// where it lands.
+///
+/// The blocks are framed by their headers alone, which is exact for the
+/// segments a relocation accepts: they carry no parity trailer.
+///
+/// # Errors
+///
+/// Returns [`crate::Error::InvalidHeader`] when the section does not tile into
+/// whole blocks, and any I/O error.
+fn copy_blocks<W: crate::io::Write + crate::io::Seek>(
+    src: &dyn FsFile,
+    writer: &mut crate::sfa::Writer<ChecksummedWriter<W>>,
+    (pos, len): (u64, u64),
+    from_table: TableId,
+    to_table: TableId,
+) -> crate::Result<()> {
+    use super::block::{ChecksumAt, Header};
+    use crate::coding::Decode;
+    #[cfg(not(feature = "std"))]
+    use crate::io::Write;
+    #[cfg(feature = "std")]
+    use std::io::Write;
+
+    let end = pos
+        .checked_add(len)
+        .ok_or(crate::Error::InvalidHeader("relocate: section overflows"))?;
+    let mut offset = pos;
+    while offset < end {
+        let head = crate::file::read_exact(
+            src,
+            offset,
+            usize::try_from((end - offset).min(Header::MAX_LEN as u64)).unwrap_or(Header::MAX_LEN),
+        )?;
+        let header = Header::decode_from(&mut &head[..])?;
+        let frame_len =
+            Header::header_len(header.block_type) as u64 + u64::from(header.data_length);
+        if frame_len > end - offset {
+            return Err(crate::Error::InvalidHeader(
+                "relocate: a block runs past its section",
+            ));
+        }
+        let frame_len = usize::try_from(frame_len)
+            .map_err(|_| crate::Error::InvalidHeader("relocate: block too large"))?;
+        let mut frame = crate::file::read_exact(src, offset, frame_len)?.to_vec();
+        let to = ChecksumAt::block(to_table, header.block_type, writer.get_ref().position());
+        Header::rebind_frame(
+            &mut frame,
+            ChecksumAt::block(from_table, header.block_type, offset),
+            to,
+        )?;
+        writer.write_all(&frame)?;
+        offset += frame_len as u64;
+    }
+    Ok(())
 }
 
 /// Copies `len` bytes from `src` at absolute offset `pos` into `writer`,

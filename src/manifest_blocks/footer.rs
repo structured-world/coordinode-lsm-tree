@@ -65,7 +65,8 @@ pub struct TocEntry {
     pub block_size: u32,
 
     /// XXH3-128 of the section Block, copied verbatim from
-    /// [`crate::table::block::Header::checksum`] at write time.
+    /// [`crate::table::block::Header::stored_checksum`] at write time (an
+    /// unbound manifest block's stored checksum is its payload checksum).
     ///
     /// **Why it lives in the TOC:** the CURRENT pointer's content-
     /// binding digest is computed over the canonical TOC tuple

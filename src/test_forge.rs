@@ -27,6 +27,67 @@
     reason = "the cloned range is reused on branches other feature subsets compile"
 )]
 
+/// `header` with its stored checksum moved from the payload whose checksum
+/// was `old` to `new_payload`, keeping the place the block is bound to: that
+/// binding is what the stored checksum differs from the old payload's by, so
+/// a forge re-stamps a block without knowing its table or offset.
+pub fn restamp(
+    header: crate::table::block::Header,
+    old: u128,
+    new_payload: &[u8],
+) -> crate::table::block::Header {
+    let binding = header.stored_checksum.into_u128() ^ old;
+    crate::table::block::Header {
+        stored_checksum: crate::Checksum::from_raw(crate::hash::hash128(new_payload) ^ binding),
+        ..header
+    }
+}
+
+/// Re-binds the block frame at the start of `frame`, moved from `(table id,
+/// offset)` `from` to `to`, to its new place. Models a forger who relocates a
+/// block and recomputes its unkeyed checksum, so the test reaches the check
+/// behind it.
+pub fn rebind_moved_frame(
+    frame: &mut [u8],
+    (from_table, from): (crate::TableId, u64),
+    (to_table, to): (crate::TableId, u64),
+) -> crate::Result<()> {
+    use crate::table::block::{ChecksumAt, Header};
+    Header::rebind_frame(
+        frame,
+        ChecksumAt::table(from_table, from),
+        ChecksumAt::table(to_table, to),
+    )
+}
+
+/// [`rebind_moved_frame`] for every frame of a run of parity-less blocks (a
+/// row group: directory, pages, zone block) moved within table `table_id`
+/// from `from` to `to`.
+pub fn rebind_moved_extent(
+    extent: &mut [u8],
+    table_id: crate::TableId,
+    from: u64,
+    to: u64,
+) -> crate::Result<()> {
+    use crate::coding::Decode;
+    use crate::table::block::Header;
+    let mut at = 0usize;
+    while at < extent.len() {
+        let frame = extent.get_mut(at..).expect("frame within the extent");
+        let len = Header::decode_from(&mut &*frame)?.on_disk_size_with(None) as usize;
+        let shift = at as u64;
+        rebind_moved_frame(frame, (table_id, from + shift), (table_id, to + shift))?;
+        at += len;
+    }
+    Ok(())
+}
+
+/// The payload checksum `bytes[range]` hashes to, captured before a forge
+/// overwrites it.
+fn payload_hash(bytes: &[u8], range: core::ops::Range<usize>) -> u128 {
+    crate::hash::hash128(bytes.get(range).expect("payload within the file"))
+}
+
 /// Forges a STALE per-KV footer behind a RE-STAMPED block checksum in the
 /// first data block of the SST at `path`: flips one digest byte inside the
 /// footer's checksum array, then recomputes the block header checksum over
@@ -512,6 +573,7 @@ fn forge_meta_value_in_section(
     let header_len = Header::header_len(header.block_type);
     let payload_range =
         block_off + header_len..block_off + header_len + header.data_length as usize;
+    let old = payload_hash(&bytes, payload_range.clone());
     {
         let Some(payload) = bytes.get_mut(payload_range.clone()) else {
             panic!("meta payload within the file");
@@ -535,11 +597,7 @@ fn forge_meta_value_in_section(
     let Some(payload) = bytes.get(payload_range.clone()) else {
         panic!("meta payload within the file");
     };
-    let new_checksum = crate::Checksum::from_raw(crate::hash::hash128(payload));
-    let new_header = Header {
-        checksum: new_checksum,
-        ..header
-    };
+    let new_header = restamp(header, old, payload);
     let mut hdr_bytes = Vec::with_capacity(header_len);
     new_header.encode_into(&mut hdr_bytes)?;
     let Some(hdr_dst) = bytes.get_mut(block_off..block_off + header_len) else {
@@ -613,6 +671,7 @@ pub fn forge_inflated_item_count(path: &std::path::Path) -> crate::Result<()> {
     let header_len = Header::header_len(header.block_type);
     let payload_range =
         block_off + header_len..block_off + header_len + header.data_length as usize;
+    let old = payload_hash(&bytes, payload_range.clone());
 
     // The item count is the LAST u32 of the block payload (the trailer's
     // final field).
@@ -631,11 +690,7 @@ pub fn forge_inflated_item_count(path: &std::path::Path) -> crate::Result<()> {
     let Some(payload) = bytes.get(payload_range) else {
         panic!("data payload within the file");
     };
-    let new_checksum = crate::Checksum::from_raw(crate::hash::hash128(payload));
-    let new_header = Header {
-        checksum: new_checksum,
-        ..header
-    };
+    let new_header = restamp(header, old, payload);
     let mut hdr_bytes = Vec::with_capacity(header_len);
     new_header.encode_into(&mut hdr_bytes)?;
     let Some(hdr_dst) = bytes.get_mut(block_off..block_off + header_len) else {
@@ -736,6 +791,7 @@ pub fn forge_flip_section_last_payload_byte(
     let header_len = Header::header_len(header.block_type);
     let payload_range =
         block_off + header_len..block_off + header_len + header.data_length as usize;
+    let old = payload_hash(&bytes, payload_range.clone());
     {
         let Some(payload) = bytes.get_mut(payload_range.clone()) else {
             panic!("section payload within the file");
@@ -749,11 +805,7 @@ pub fn forge_flip_section_last_payload_byte(
     let Some(payload) = bytes.get(payload_range.clone()) else {
         panic!("section payload within the file");
     };
-    let new_checksum = crate::Checksum::from_raw(crate::hash::hash128(payload));
-    let new_header = Header {
-        checksum: new_checksum,
-        ..header
-    };
+    let new_header = restamp(header, old, payload);
     let mut hdr_bytes = Vec::with_capacity(header_len);
     new_header.encode_into(&mut hdr_bytes)?;
     let Some(hdr_dst) = bytes.get_mut(block_off..block_off + header_len) else {
@@ -835,17 +887,14 @@ pub fn forge_replace_section_payload(
         new_payload.len(),
         "the replacement payload must keep the frame geometry",
     );
+    let old = payload_hash(&bytes, payload_range.clone());
     {
         let Some(dst) = bytes.get_mut(payload_range.clone()) else {
             panic!("section payload within the file");
         };
         dst.copy_from_slice(new_payload);
     }
-    let new_checksum = crate::Checksum::from_raw(crate::hash::hash128(new_payload));
-    let new_header = Header {
-        checksum: new_checksum,
-        ..header
-    };
+    let new_header = restamp(header, old, new_payload);
     let mut hdr_bytes = Vec::with_capacity(header_len);
     new_header.encode_into(&mut hdr_bytes)?;
     let Some(hdr_dst) = bytes.get_mut(block_off..block_off + header_len) else {
@@ -922,10 +971,12 @@ pub fn forge_value_byte_in_first_data_block(
     };
 
     // Decode entries from a candidate payload; None when it fails to decode.
+    let old = crate::hash::hash128(payload);
     let decode = |payload: &[u8]| -> Option<alloc::vec::Vec<crate::InternalValue>> {
         let block = crate::table::Block {
+            // In memory only: the checksum is not consulted by the decode.
             header: Header {
-                checksum: crate::Checksum::from_raw(crate::hash::hash128(payload)),
+                stored_checksum: crate::Checksum::from_raw(crate::hash::hash128(payload)),
                 ..header
             },
             data: crate::Slice::from(payload.to_vec()),
@@ -978,11 +1029,7 @@ pub fn forge_value_byte_in_first_data_block(
         };
         dst.copy_from_slice(&candidate);
     }
-    let new_checksum = crate::Checksum::from_raw(crate::hash::hash128(&candidate));
-    let new_header = Header {
-        checksum: new_checksum,
-        ..header
-    };
+    let new_header = restamp(header, old, &candidate);
     let mut hdr_bytes = Vec::with_capacity(header_len);
     new_header.encode_into(&mut hdr_bytes)?;
     let Some(hdr_dst) = bytes.get_mut(block_off..block_off + header_len) else {
@@ -1178,6 +1225,7 @@ fn patch_first_data_block_hash_index(
     let Some(payload) = bytes.get(payload_range.clone()) else {
         panic!("data payload within the file");
     };
+    let old = crate::hash::hash128(payload);
 
     // Locate the hash index within the footer-stripped inner block. For an
     // uncompressed block the inner data is a prefix of the on-disk payload,
@@ -1207,11 +1255,7 @@ fn patch_first_data_block_hash_index(
     let Some(payload) = bytes.get(payload_range.clone()) else {
         panic!("data payload within the file");
     };
-    let new_checksum = crate::Checksum::from_raw(crate::hash::hash128(payload));
-    let new_header = Header {
-        checksum: new_checksum,
-        ..header
-    };
+    let new_header = restamp(header, old, payload);
     let mut hdr_bytes = Vec::with_capacity(header_len);
     new_header.encode_into(&mut hdr_bytes)?;
     let Some(hdr_dst) = bytes.get_mut(block_off..block_off + header_len) else {
@@ -1289,6 +1333,7 @@ pub fn forge_filter_false_negative(
         matches!(contains_hash_from_bytes(payload, target_hash), Ok(true)),
         "the target key must be present in the healthy filter",
     );
+    let old = crate::hash::hash128(payload);
     // Search for one byte whose flip turns the target hash into a false
     // negative while the filter still PARSES (a parse failure would be an
     // unreadable filter, not the silent-skip shape this forge models).
@@ -1317,11 +1362,7 @@ pub fn forge_filter_false_negative(
         };
         dst.copy_from_slice(&candidate);
     }
-    let new_checksum = crate::Checksum::from_raw(crate::hash::hash128(&candidate));
-    let new_header = Header {
-        checksum: new_checksum,
-        ..header
-    };
+    let new_header = restamp(header, old, &candidate);
     let mut hdr_bytes = Vec::with_capacity(header_len);
     new_header.encode_into(&mut hdr_bytes)?;
     let Some(hdr_dst) = bytes.get_mut(block_off..block_off + header_len) else {
@@ -1391,6 +1432,7 @@ pub fn forge_seqno_bounds_zeroed_entry(
     let header_len = Header::header_len(header.block_type);
     let payload_range =
         block_off + header_len..block_off + header_len + header.data_length as usize;
+    let old = payload_hash(&bytes, payload_range.clone());
     {
         let Some(payload) = bytes.get_mut(payload_range.clone()) else {
             panic!("seqno_bounds payload within the file");
@@ -1413,11 +1455,7 @@ pub fn forge_seqno_bounds_zeroed_entry(
     let Some(payload) = bytes.get(payload_range.clone()) else {
         panic!("seqno_bounds payload within the file");
     };
-    let new_checksum = crate::Checksum::from_raw(crate::hash::hash128(payload));
-    let new_header = Header {
-        checksum: new_checksum,
-        ..header
-    };
+    let new_header = restamp(header, old, payload);
     let mut hdr_bytes = Vec::with_capacity(header_len);
     new_header.encode_into(&mut hdr_bytes)?;
     let Some(hdr_dst) = bytes.get_mut(block_off..block_off + header_len) else {
@@ -1480,8 +1518,14 @@ pub fn forge_seqno_bounds_empty(
         window_log: 0,
     };
     let mut forged = Vec::new();
-    Block::write_into(&mut forged, &payload, identity, &BlockTransform::PLAIN)?;
-    replace_section_frame(path, b"seqno_bounds", &forged)
+    Block::write_into(
+        &mut forged,
+        &payload,
+        identity,
+        &BlockTransform::PLAIN,
+        crate::table::block::ChecksumAt::Unbound,
+    )?;
+    replace_section_frame(path, b"seqno_bounds", &forged, (table_id, None))
 }
 
 /// REPLACES the `block_layout` section with a valid, checksum-consistent block
@@ -1512,8 +1556,14 @@ pub fn forge_block_layout_empty(
         None => BlockTransform::PLAIN,
     };
     let mut forged = Vec::new();
-    Block::write_into(&mut forged, &payload, identity, &transform)?;
-    replace_section_frame(path, b"block_layout", &forged)
+    Block::write_into(
+        &mut forged,
+        &payload,
+        identity,
+        &transform,
+        crate::table::block::ChecksumAt::Unbound,
+    )?;
+    replace_section_frame(path, b"block_layout", &forged, (table_id, None))
 }
 
 /// REPLACES the `block_layout` section with a valid, checksum-consistent map
@@ -1613,8 +1663,9 @@ pub fn forge_block_layout_shifted_end(
             window_log: 0,
         },
         &BlockTransform::PLAIN,
+        crate::table::block::ChecksumAt::Unbound,
     )?;
-    replace_section_frame(path, b"block_layout", &forged)
+    replace_section_frame(path, b"block_layout", &forged, (table_id, None))
 }
 
 /// REPLACES the `zone_map` section with a valid, checksum-consistent `ZoneMap`
@@ -1635,8 +1686,14 @@ pub fn forge_zone_map_empty(path: &std::path::Path, table_id: crate::TableId) ->
         window_log: 0,
     };
     let mut forged = Vec::new();
-    Block::write_into(&mut forged, &payload, identity, &BlockTransform::PLAIN)?;
-    replace_section_frame(path, b"zone_map", &forged)
+    Block::write_into(
+        &mut forged,
+        &payload,
+        identity,
+        &BlockTransform::PLAIN,
+        crate::table::block::ChecksumAt::Unbound,
+    )?;
+    replace_section_frame(path, b"zone_map", &forged, (table_id, None))
 }
 
 /// REPLACES the `delete_bitmap` section with a valid, checksum-consistent
@@ -1660,8 +1717,14 @@ pub fn forge_delete_bitmap_empty(
         window_log: 0,
     };
     let mut forged = Vec::new();
-    Block::write_into(&mut forged, &payload, identity, &BlockTransform::PLAIN)?;
-    replace_section_frame(path, b"delete_bitmap", &forged)
+    Block::write_into(
+        &mut forged,
+        &payload,
+        identity,
+        &BlockTransform::PLAIN,
+        crate::table::block::ChecksumAt::Unbound,
+    )?;
+    replace_section_frame(path, b"delete_bitmap", &forged, (table_id, None))
 }
 
 /// REPLACES the `delete_bitmap` section with a valid, checksum-consistent
@@ -1689,8 +1752,14 @@ pub fn forge_delete_bitmap_substitute(
         window_log: 0,
     };
     let mut forged = Vec::new();
-    Block::write_into(&mut forged, &payload, identity, &BlockTransform::PLAIN)?;
-    replace_section_frame(path, b"delete_bitmap", &forged)
+    Block::write_into(
+        &mut forged,
+        &payload,
+        identity,
+        &BlockTransform::PLAIN,
+        crate::table::block::ChecksumAt::Unbound,
+    )?;
+    replace_section_frame(path, b"delete_bitmap", &forged, (table_id, None))
 }
 
 /// REPLACES the `filter` section with a valid, checksum-consistent Filter block
@@ -1709,8 +1778,14 @@ pub fn forge_filter_empty(path: &std::path::Path, table_id: crate::TableId) -> c
         window_log: 0,
     };
     let mut forged = Vec::new();
-    Block::write_into(&mut forged, &[], identity, &BlockTransform::PLAIN)?;
-    replace_section_frame(path, b"filter", &forged)
+    Block::write_into(
+        &mut forged,
+        &[],
+        identity,
+        &BlockTransform::PLAIN,
+        crate::table::block::ChecksumAt::Unbound,
+    )?;
+    replace_section_frame(path, b"filter", &forged, (table_id, None))
 }
 
 /// Empties the FIRST filter partition block IN PLACE: re-stamps its header to
@@ -1744,13 +1819,21 @@ pub fn forge_filter_first_partition_empty(path: &std::path::Path) -> crate::Resu
     let mut cursor = block;
     let header = Header::decode_from(&mut cursor)?;
     let header_len = Header::header_len(header.block_type);
-    // Empty payload sentinel: zero length, checksum over no bytes.
-    let new_header = Header {
-        data_length: 0,
-        uncompressed_length: 0,
-        checksum: crate::Checksum::from_raw(crate::hash::hash128(&[])),
-        ..header
-    };
+    let old = payload_hash(
+        &bytes,
+        block_off + header_len..block_off + header_len + header.data_length as usize,
+    );
+    // Empty payload sentinel: zero length, checksum over no bytes, bound
+    // where the partition is.
+    let new_header = restamp(
+        Header {
+            data_length: 0,
+            uncompressed_length: 0,
+            ..header
+        },
+        old,
+        &[],
+    );
     let mut hdr_bytes = Vec::with_capacity(header_len);
     new_header.encode_into(&mut hdr_bytes)?;
     let Some(hdr_dst) = bytes.get_mut(block_off..block_off + header_len) else {
@@ -1824,7 +1907,7 @@ pub fn forge_tli_tail_truncated(
     ecc: Option<crate::table::block::EccParams>,
 ) -> crate::Result<()> {
     let forged = truncated_tli_frame(path, table_id, ecc)?;
-    replace_section_frame(path, b"tli_tail", &forged)
+    replace_section_frame(path, b"tli_tail", &forged, (table_id, ecc))
 }
 
 /// As [`forge_tli_tail_truncated`], but applied to BOTH mirrors (`tli` and
@@ -1837,8 +1920,8 @@ pub fn forge_tli_mirrors_truncated(
     ecc: Option<crate::table::block::EccParams>,
 ) -> crate::Result<()> {
     let forged = truncated_tli_frame(path, table_id, ecc)?;
-    replace_section_frame(path, b"tli", &forged)?;
-    replace_section_frame(path, b"tli_tail", &forged)
+    replace_section_frame(path, b"tli", &forged, (table_id, ecc))?;
+    replace_section_frame(path, b"tli_tail", &forged, (table_id, ecc))
 }
 
 /// Re-encodes BOTH TLI mirrors (`tli`, `tli_tail`) after LOWERING the first
@@ -1869,8 +1952,8 @@ pub fn forge_tli_mirrors_lower_first_separator(
             *slot = rebuilt;
         }
     })?;
-    replace_section_frame(path, b"tli", &forged)?;
-    replace_section_frame(path, b"tli_tail", &forged)
+    replace_section_frame(path, b"tli", &forged, (table_id, ecc))?;
+    replace_section_frame(path, b"tli_tail", &forged, (table_id, ecc))
 }
 
 /// Re-stamps the LAST binary-index pointer of BOTH TLI mirrors (`tli`,
@@ -1916,9 +1999,15 @@ pub fn forge_tli_binary_index_pointer(
         .copy_from_slice(&first);
 
     let mut forged = Vec::new();
-    Block::write_into(&mut forged, &payload, identity, &transform)?;
-    replace_section_frame(path, b"tli", &forged)?;
-    replace_section_frame(path, b"tli_tail", &forged)
+    Block::write_into(
+        &mut forged,
+        &payload,
+        identity,
+        &transform,
+        crate::table::block::ChecksumAt::Unbound,
+    )?;
+    replace_section_frame(path, b"tli", &forged, (table_id, ecc))?;
+    replace_section_frame(path, b"tli_tail", &forged, (table_id, ecc))
 }
 
 /// Rebuilds the `locator` section from `entries` (`(key_hash, block_id,
@@ -1956,8 +2045,14 @@ pub fn forge_locator_slots(
     };
     let transform = crate::table::block::BlockTransform::PLAIN;
     let mut forged = Vec::new();
-    Block::write_into(&mut forged, &section, identity, &transform)?;
-    replace_section_frame(path, b"locator", &forged)
+    Block::write_into(
+        &mut forged,
+        &section,
+        identity,
+        &transform,
+        crate::table::block::ChecksumAt::Unbound,
+    )?;
+    replace_section_frame(path, b"locator", &forged, (table_id, None))
 }
 
 /// Re-encodes the `zone_map` section WITHOUT its LAST block entry (fresh
@@ -2033,8 +2128,14 @@ pub fn forge_zone_map_drop_last_entry(
     let mut payload = Vec::new();
     crate::table::zone_map::encode_zone_map(&mut payload, &blocks)?;
     let mut forged = Vec::new();
-    Block::write_into(&mut forged, &payload, identity, &transform)?;
-    replace_section_frame(path, b"zone_map", &forged)
+    Block::write_into(
+        &mut forged,
+        &payload,
+        identity,
+        &transform,
+        crate::table::block::ChecksumAt::Unbound,
+    )?;
+    replace_section_frame(path, b"zone_map", &forged, (table_id, None))
 }
 
 /// Re-stamps the `zone_map` so the FIRST data block's synthetic column carries
@@ -2114,8 +2215,14 @@ pub fn forge_zone_map_column_id(
     let mut payload = Vec::new();
     crate::table::zone_map::encode_zone_map(&mut payload, &blocks)?;
     let mut forged = Vec::new();
-    Block::write_into(&mut forged, &payload, identity, &transform)?;
-    replace_section_frame(path, b"zone_map", &forged)
+    Block::write_into(
+        &mut forged,
+        &payload,
+        identity,
+        &transform,
+        crate::table::block::ChecksumAt::Unbound,
+    )?;
+    replace_section_frame(path, b"zone_map", &forged, (table_id, None))
 }
 
 /// Shared preamble of the TLI forges: the Index identity, the uncompressed
@@ -2204,8 +2311,8 @@ pub fn forge_tli_mirrors_drop_interior(
         );
         handles.remove(handles.len() / 2);
     })?;
-    replace_section_frame(path, b"tli", &forged)?;
-    replace_section_frame(path, b"tli_tail", &forged)
+    replace_section_frame(path, b"tli", &forged, (table_id, ecc))?;
+    replace_section_frame(path, b"tli_tail", &forged, (table_id, ecc))
 }
 
 /// Re-encodes BOTH TLI mirrors (`tli`, `tli_tail`) as a SINGLE handle that
@@ -2242,8 +2349,8 @@ pub fn forge_tli_mirrors_span_single_handle(
         );
         *handles = vec![spanning];
     })?;
-    replace_section_frame(path, b"tli", &forged)?;
-    replace_section_frame(path, b"tli_tail", &forged)
+    replace_section_frame(path, b"tli", &forged, (table_id, None))?;
+    replace_section_frame(path, b"tli_tail", &forged, (table_id, None))
 }
 
 /// Re-encodes BOTH TLI mirrors with an EXTRA handle whose offset sits far
@@ -2272,8 +2379,8 @@ pub fn forge_tli_mirrors_offset_beyond_section(
         );
         handles.push(beyond);
     })?;
-    replace_section_frame(path, b"tli", &forged)?;
-    replace_section_frame(path, b"tli_tail", &forged)
+    replace_section_frame(path, b"tli", &forged, (table_id, None))?;
+    replace_section_frame(path, b"tli_tail", &forged, (table_id, None))
 }
 
 /// Re-encodes BOTH TLI mirrors (`tli`, `tli_tail`) with the FIRST TWO
@@ -2292,8 +2399,8 @@ pub fn forge_tli_mirrors_swap_first_two(
     let forged = rebuilt_tli_frame(path, table_id, ecc, |handles| {
         handles.swap(0, 1);
     })?;
-    replace_section_frame(path, b"tli", &forged)?;
-    replace_section_frame(path, b"tli_tail", &forged)
+    replace_section_frame(path, b"tli", &forged, (table_id, ecc))?;
+    replace_section_frame(path, b"tli_tail", &forged, (table_id, ecc))
 }
 
 /// Decodes the `tli_tail` mirror's handle list, drops the LAST handle, and
@@ -2342,20 +2449,79 @@ fn rebuilt_tli_frame(
     mutate(&mut handles);
 
     let payload = IndexBlock::encode_into_vec(&handles)?;
+    // Unbound: the splice binds the frame to where it lands.
     let mut forged = Vec::new();
-    Block::write_into(&mut forged, &payload, identity, &transform)?;
+    Block::write_into(
+        &mut forged,
+        &payload,
+        identity,
+        &transform,
+        crate::table::block::ChecksumAt::Unbound,
+    )?;
     Ok(forged)
+}
+
+/// The sections a table writes as raw bytes rather than as blocks.
+const RAW_SECTIONS: [&[u8]; 3] = [b"linked_blob_files", b"table_version", b"meta_separator"];
+
+/// Re-stamps the blocks of a section a splice moved from `old_pos` to
+/// `new_pos` in `out`, so their checksums stay bound to where they now are.
+/// The sections a table writes as raw bytes are left alone. A block is framed
+/// by its header and its parity trailer: a self-describing block declares its
+/// own, a table block carries the table's `ecc` scheme.
+fn rebind_shifted_section(
+    out: &mut [u8],
+    (name, old_pos, new_pos, len): (&[u8], u64, u64, u64),
+    table_id: crate::TableId,
+    ecc: Option<crate::table::block::EccParams>,
+) -> crate::Result<()> {
+    use crate::coding::Decode;
+    use crate::table::block::{ChecksumAt, EccParams, Header};
+
+    if RAW_SECTIONS.contains(&name) {
+        return Ok(());
+    }
+    let mut at = 0u64;
+    while at < len {
+        let start = usize::try_from(new_pos + at).expect("offset fits usize");
+        let frame = out.get_mut(start..).expect("shifted block within the file");
+        let header = Header::decode_from(&mut &*frame)?;
+        let scheme = if Header::has_block_flags(header.block_type) {
+            (header.block_flags & crate::table::block::header::block_flags::ECC_PARITY != 0)
+                .then_some(EccParams::RS_4_2)
+        } else {
+            ecc
+        };
+        let parity = scheme.map_or(0, |scheme| {
+            u64::from(crate::table::block::expected_parity_len(
+                header.data_length,
+                scheme,
+            ))
+        });
+        Header::rebind_frame(
+            frame,
+            ChecksumAt::block(table_id, header.block_type, old_pos + at),
+            ChecksumAt::block(table_id, header.block_type, new_pos + at),
+        )?;
+        at += Header::header_len(header.block_type) as u64 + u64::from(header.data_length) + parity;
+    }
+    Ok(())
 }
 
 /// Replaces the named single-block section's bytes with `forged`, shifting
 /// every later section, patching the TOC's length + positions, and
 /// re-stamping the trailer. The rebuilt archive stays internally consistent
-/// in every byte-level check.
+/// in every byte-level check: `forged` (written unbound) and every block the
+/// splice moves are bound to where they land in table `table_id`, whose
+/// blocks carry the `ecc` scheme.
 fn replace_section_frame(
     path: &std::path::Path,
     section: &[u8],
     forged: &[u8],
+    (table_id, ecc): (crate::TableId, Option<crate::table::block::EccParams>),
 ) -> crate::Result<()> {
+    use crate::table::block::{ChecksumAt, Header};
+
     let bytes = std::fs::read(path)?;
     const TRAILER_SIZE: usize = 4 + 1 + 1 + 16 + 8 + 8;
     let trailer_start = bytes.len() - TRAILER_SIZE;
@@ -2389,7 +2555,18 @@ fn replace_section_frame(
         - i64::try_from(section_len).expect("section fits i64");
     let mut out = Vec::with_capacity(bytes.len());
     out.extend_from_slice(bytes.get(..section_pos).expect("pre-section prefix"));
-    out.extend_from_slice(forged);
+    // The forged frame is written unbound; it is bound to where it lands.
+    let mut frame = forged.to_vec();
+    let forged_type = {
+        use crate::coding::Decode;
+        Header::decode_from(&mut &frame[..])?.block_type
+    };
+    Header::rebind_frame(
+        &mut frame,
+        ChecksumAt::Unbound,
+        ChecksumAt::block(table_id, forged_type, section_pos as u64),
+    )?;
+    out.extend_from_slice(&frame);
     out.extend_from_slice(
         bytes
             .get(section_pos + section_len..toc_pos)
@@ -2419,10 +2596,9 @@ fn replace_section_frame(
         let (new_pos, new_len) = if name == section {
             (pos, forged.len() as u64)
         } else if pos > section_pos as u64 {
-            (
-                pos.checked_add_signed(delta).expect("shifted pos fits u64"),
-                len,
-            )
+            let new_pos = pos.checked_add_signed(delta).expect("shifted pos fits u64");
+            rebind_shifted_section(&mut out, (name, pos, new_pos, len), table_id, ecc)?;
+            (new_pos, len)
         } else {
             (pos, len)
         };
@@ -2463,12 +2639,17 @@ fn replace_section_frame(
 /// zero-count `linked_blob_files`, or re-roled to an empty `block_layout`): the
 /// catalogue stays uniquely named and tiled, every byte-level check reads clean,
 /// yet the deletion metadata is gone. `to` may differ in length from `from`.
+/// A block-format `new_payload` is written unbound and bound where it lands;
+/// every block the splice moves is re-bound in table `table_id`, whose blocks
+/// carry the `ecc` scheme.
 pub fn forge_rename_and_replace_section(
     path: &std::path::Path,
-    from: &[u8],
-    to: &[u8],
+    (from, to): (&[u8], &[u8]),
     new_payload: &[u8],
+    (table_id, ecc): (crate::TableId, Option<crate::table::block::EccParams>),
 ) -> crate::Result<()> {
+    use crate::table::block::{ChecksumAt, Header};
+
     let bytes = std::fs::read(path)?;
     const TRAILER_SIZE: usize = 4 + 1 + 1 + 16 + 8 + 8;
     let trailer_start = bytes.len() - TRAILER_SIZE;
@@ -2499,7 +2680,19 @@ pub fn forge_rename_and_replace_section(
         - i64::try_from(section_len).expect("section fits i64");
     let mut out = Vec::with_capacity(bytes.len());
     out.extend_from_slice(bytes.get(..section_pos).expect("pre-section prefix"));
-    out.extend_from_slice(new_payload);
+    let mut replacement = new_payload.to_vec();
+    if !RAW_SECTIONS.contains(&to) {
+        let block_type = {
+            use crate::coding::Decode;
+            Header::decode_from(&mut &replacement[..])?.block_type
+        };
+        Header::rebind_frame(
+            &mut replacement,
+            ChecksumAt::Unbound,
+            ChecksumAt::block(table_id, block_type, section_pos as u64),
+        )?;
+    }
+    out.extend_from_slice(&replacement);
     out.extend_from_slice(
         bytes
             .get(section_pos + section_len..toc_pos)
@@ -2542,7 +2735,9 @@ pub fn forge_rename_and_replace_section(
             new_toc.extend_from_slice(to);
         } else {
             let new_pos = if pos > section_pos as u64 {
-                pos.checked_add_signed(delta).expect("shifted pos fits u64")
+                let new_pos = pos.checked_add_signed(delta).expect("shifted pos fits u64");
+                rebind_shifted_section(&mut out, (name, pos, new_pos, len), table_id, ecc)?;
+                new_pos
             } else {
                 pos
             };
@@ -2603,8 +2798,19 @@ pub fn forge_delete_bitmap_as_empty_block_layout(
         window_log: 0,
     };
     let mut frame = Vec::new();
-    Block::write_into(&mut frame, &payload, identity, &BlockTransform::PLAIN)?;
-    forge_rename_and_replace_section(path, b"delete_bitmap", b"block_layout", &frame)
+    Block::write_into(
+        &mut frame,
+        &payload,
+        identity,
+        &BlockTransform::PLAIN,
+        crate::table::block::ChecksumAt::Unbound,
+    )?;
+    forge_rename_and_replace_section(
+        path,
+        (b"delete_bitmap", b"block_layout"),
+        &frame,
+        (table_id, None),
+    )
 }
 
 /// Shared core: flips `payload[len - flip_from_end]` of the FIRST data
@@ -2639,6 +2845,7 @@ fn flip_and_restamp_first_data_block(
     let header_len = Header::header_len(header.block_type);
     let payload_range =
         block_off + header_len..block_off + header_len + header.data_length as usize;
+    let old = payload_hash(&bytes, payload_range.clone());
 
     {
         let Some(payload) = bytes.get_mut(payload_range.clone()) else {
@@ -2658,11 +2865,7 @@ fn flip_and_restamp_first_data_block(
     let Some(payload) = bytes.get(payload_range) else {
         panic!("data payload within the file");
     };
-    let new_checksum = crate::Checksum::from_raw(crate::hash::hash128(payload));
-    let new_header = Header {
-        checksum: new_checksum,
-        ..header
-    };
+    let new_header = restamp(header, old, payload);
     let mut hdr_bytes = Vec::with_capacity(header_len);
     new_header.encode_into(&mut hdr_bytes)?;
     let Some(hdr_dst) = bytes.get_mut(block_off..block_off + header_len) else {
@@ -2701,6 +2904,7 @@ pub fn forge_raise_data_block_first_seqno(
     let header_len = Header::header_len(header.block_type);
     let payload_range =
         block_off + header_len..block_off + header_len + header.data_length as usize;
+    let old_payload = payload_hash(&bytes, payload_range.clone());
     // payload[0] = value_type, payload[1] = the seqno varint (1 byte for < 128).
     let seqno_at = block_off + header_len + 1;
     let old = *bytes.get(seqno_at).expect("seqno byte within the payload");
@@ -2712,10 +2916,7 @@ pub fn forge_raise_data_block_first_seqno(
         *slot = new_seqno;
     }
     let payload = bytes.get(payload_range).expect("payload within the file");
-    let new_header = Header {
-        checksum: crate::Checksum::from_raw(crate::hash::hash128(payload)),
-        ..header
-    };
+    let new_header = restamp(header, old_payload, payload);
     let mut hdr_bytes = Vec::with_capacity(header_len);
     new_header.encode_into(&mut hdr_bytes)?;
     bytes

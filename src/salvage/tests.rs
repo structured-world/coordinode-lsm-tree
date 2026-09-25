@@ -2500,10 +2500,12 @@ fn restamp_block(bytes: &mut [u8], at: usize, new_payload: &[u8]) -> crate::Resu
         header.data_length as usize,
         "a restamp must keep the payload length",
     );
-    let new_header = Header {
-        checksum: crate::Checksum::from_raw(crate::hash::hash128(new_payload)),
-        ..header
+    let start = Header::header_len(header.block_type);
+    let Some(old_payload) = frame.get(start..start + new_payload.len()) else {
+        panic!("payload within the file");
     };
+    let old = crate::hash::hash128(old_payload);
+    let new_header = crate::test_forge::restamp(header, old, new_payload);
     let mut new_block =
         Vec::with_capacity(Header::header_len(header.block_type) + new_payload.len());
     new_header.encode_into(&mut new_block)?;
@@ -2890,9 +2892,9 @@ fn verify_blob_links_rejects_a_present_empty_section() -> crate::Result<()> {
     // linked_blob_files (raw shape valid, records no blob references).
     crate::test_forge::forge_rename_and_replace_section(
         &source,
-        b"delete_bitmap",
-        b"linked_blob_files",
+        (b"delete_bitmap", b"linked_blob_files"),
         &[0, 0, 0, 0],
+        (0, None),
     )?;
 
     let table = open(source, &fs)?;
@@ -5080,11 +5082,14 @@ fn a_value_page_moved_between_row_groups_of_an_encrypted_table_is_refused() -> c
     ) else {
         panic!("both value pages within the file");
     };
-    for (at, page) in [(at_a, &page_b), (at_b, &page_a)] {
+    // Each page is re-bound to where it moves, so its block checksum verifies
+    // and the encrypted stamp is the check left to refuse it.
+    for (at, from, page) in [(at_a, at_b, &page_b), (at_b, at_a, &page_a)] {
         let Some(target) = bytes.get_mut(at..at + page.len()) else {
             panic!("value page within the file");
         };
         target.copy_from_slice(page);
+        crate::test_forge::rebind_moved_frame(target, (0, from as u64), (0, at as u64))?;
     }
     std::fs::write(&source, &bytes)?;
 
@@ -5198,10 +5203,13 @@ fn a_value_page_moved_between_tables_is_refused() -> crate::Result<()> {
         // written with the same row count and value lengths, so the page fits.
         let transplant = |into: &std::path::Path, into_id, from: &std::path::Path, from_id| {
             let from_bytes = std::fs::read(from)?;
-            let page = {
+            let (page, from_at) = {
                 let table = open_as(from.to_path_buf(), &fs, enc, from_id)?;
                 let range = first_value_page(&table, &from_bytes)?;
-                from_bytes.get(range).map(<[u8]>::to_vec)
+                (
+                    from_bytes.get(range.clone()).map(<[u8]>::to_vec),
+                    range.start,
+                )
             };
             let mut into_bytes = std::fs::read(into)?;
             let range = {
@@ -5211,10 +5219,18 @@ fn a_value_page_moved_between_tables_is_refused() -> crate::Result<()> {
             let Some(page) = page.filter(|p| p.len() == range.len()) else {
                 panic!("the two value pages are of one length");
             };
+            let into_at = range.start;
             let Some(target) = into_bytes.get_mut(range) else {
                 panic!("value page within the file");
             };
             target.copy_from_slice(&page);
+            // Re-bound to its new table and place, so the page verifies as a
+            // block and the stamp (and the AEAD) are the checks left.
+            crate::test_forge::rebind_moved_frame(
+                target,
+                (from_id, from_at as u64),
+                (into_id, into_at as u64),
+            )?;
             std::fs::write(into, &into_bytes)?;
             crate::Result::Ok(())
         };
@@ -5687,10 +5703,13 @@ fn salvage_drops_a_row_block_with_out_of_order_keys() -> crate::Result<()> {
             "an adjacent equal-length key swap re-encodes to the same length",
         );
         let header_len = Header::header_len(header.block_type);
-        let new_header = Header {
-            checksum: crate::Checksum::from_raw(crate::hash::hash128(&new_payload)),
-            ..header
-        };
+        // Bound where the block is, in the table the writer above wrote as
+        // id 0.
+        let mut new_header = header;
+        new_header.bind_checksum(
+            crate::Checksum::from_raw(crate::hash::hash128(&new_payload)),
+            crate::table::block::ChecksumAt::table(0, block_off as u64),
+        );
         let mut new_block: alloc::vec::Vec<u8> =
             alloc::vec::Vec::with_capacity(header_len + new_payload.len());
         new_header.encode_into(&mut new_block)?;
@@ -6579,6 +6598,7 @@ fn salvage_fails_closed_on_a_zero_row_block_in_a_delete_bearing_sst() -> crate::
     let zm_header_len = Header::header_len(zm_header.block_type);
     let zm_payload_range =
         zm_pos + zm_header_len..zm_pos + zm_header_len + zm_header.data_length as usize;
+    let old = crate::hash::hash128(bytes.get(zm_payload_range.clone()).unwrap_or(&[]));
     {
         let Some(payload) = bytes.get_mut(zm_payload_range.clone()) else {
             panic!("zone_map payload within the file");
@@ -6625,13 +6645,8 @@ fn salvage_fails_closed_on_a_zero_row_block_in_a_delete_bearing_sst() -> crate::
         };
         rc.copy_from_slice(&0u32.to_le_bytes());
     }
-    let new_zm_checksum = crate::Checksum::from_raw(crate::hash::hash128(
-        bytes.get(zm_payload_range).unwrap_or(&[]),
-    ));
-    let new_zm_header = Header {
-        checksum: new_zm_checksum,
-        ..zm_header
-    };
+    let new_zm_header =
+        crate::test_forge::restamp(zm_header, old, bytes.get(zm_payload_range).unwrap_or(&[]));
     let mut zm_hdr_bytes: Vec<u8> = Vec::with_capacity(zm_header_len);
     new_zm_header.encode_into(&mut zm_hdr_bytes)?;
     let Some(zm_dst) = bytes.get_mut(zm_pos..zm_pos + zm_header_len) else {
@@ -6703,6 +6718,7 @@ fn salvage_drops_a_row_block_with_a_stale_kv_digest() -> crate::Result<()> {
     let header_len = Header::header_len(header.block_type);
     let payload_range =
         block_off + header_len..block_off + header_len + header.data_length as usize;
+    let old = crate::hash::hash128(bytes.get(payload_range.clone()).unwrap_or(&[]));
     {
         let Some(payload) = bytes.get_mut(payload_range.clone()) else {
             panic!("payload range within the block");
@@ -6714,13 +6730,8 @@ fn salvage_drops_a_row_block_with_a_stale_kv_digest() -> crate::Result<()> {
         };
         *b ^= 0xFF;
     }
-    let new_checksum = crate::Checksum::from_raw(crate::hash::hash128(
-        bytes.get(payload_range).unwrap_or(&[]),
-    ));
-    let new_header = Header {
-        checksum: new_checksum,
-        ..header
-    };
+    let new_header =
+        crate::test_forge::restamp(header, old, bytes.get(payload_range).unwrap_or(&[]));
     let mut hdr_bytes: Vec<u8> = Vec::with_capacity(header_len);
     new_header.encode_into(&mut hdr_bytes)?;
     let Some(hdr_dst) = bytes.get_mut(block_off..block_off + header_len) else {
@@ -6805,6 +6816,7 @@ fn salvage_fails_closed_on_an_undecodable_checksum_clean_block_with_deletes() ->
     let header_len = Header::header_len(header.block_type);
     let payload_range =
         block_off + header_len..block_off + header_len + header.data_length as usize;
+    let old = crate::hash::hash128(bytes.get(payload_range.clone()).unwrap_or(&[]));
     {
         let Some(payload) = bytes.get_mut(payload_range.clone()) else {
             panic!("payload range within the block");
@@ -6814,13 +6826,8 @@ fn salvage_fails_closed_on_an_undecodable_checksum_clean_block_with_deletes() ->
         };
         *tag = 0xEE;
     }
-    let new_checksum = crate::Checksum::from_raw(crate::hash::hash128(
-        bytes.get(payload_range).unwrap_or(&[]),
-    ));
-    let new_header = Header {
-        checksum: new_checksum,
-        ..header
-    };
+    let new_header =
+        crate::test_forge::restamp(header, old, bytes.get(payload_range).unwrap_or(&[]));
     let mut hdr_bytes = Vec::with_capacity(header_len);
     new_header.encode_into(&mut hdr_bytes)?;
     let Some(hdr_dst) = bytes.get_mut(block_off..block_off + header_len) else {
@@ -6935,6 +6942,7 @@ fn salvage_fails_closed_on_a_zone_map_with_wrong_row_counts() -> crate::Result<(
     let header = Header::decode_from(&mut cursor)?;
     let header_len = Header::header_len(header.block_type);
     let payload_range = zm_pos + header_len..zm_pos + header_len + header.data_length as usize;
+    let old = crate::hash::hash128(bytes.get(payload_range.clone()).unwrap_or(&[]));
     {
         let Some(payload) = bytes.get_mut(payload_range.clone()) else {
             panic!("zone_map payload within the file");
@@ -6946,13 +6954,8 @@ fn salvage_fails_closed_on_a_zone_map_with_wrong_row_counts() -> crate::Result<(
         assert!(claimed >= 2, "the first block holds at least two rows");
         rc.copy_from_slice(&(claimed - 1).to_le_bytes());
     }
-    let new_checksum = crate::Checksum::from_raw(crate::hash::hash128(
-        bytes.get(payload_range).unwrap_or(&[]),
-    ));
-    let new_header = Header {
-        checksum: new_checksum,
-        ..header
-    };
+    let new_header =
+        crate::test_forge::restamp(header, old, bytes.get(payload_range).unwrap_or(&[]));
     let mut hdr_bytes = Vec::with_capacity(header_len);
     new_header.encode_into(&mut hdr_bytes)?;
     let Some(hdr_dst) = bytes.get_mut(zm_pos..zm_pos + header_len) else {

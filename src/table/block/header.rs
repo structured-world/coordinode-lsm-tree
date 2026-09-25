@@ -123,6 +123,78 @@ pub mod block_flags {
     pub const KNOWN: u8 = KV_CHECKSUM_FOOTER | ECC_PARITY | COMPRESSED | ENCRYPTED;
 }
 
+/// Where a block's stored checksum is bound.
+///
+/// A table's block stores its payload checksum modified by a value derived
+/// from its table and its offset in the file (a context checksum): the payload
+/// still verifies wherever it is read, but the stored checksum only matches it
+/// at the one place it was written, so a
+/// checksum-valid block read in another block's place (a misdirected read or
+/// write, a remapped sector, a copy error) is refused as corruption. The
+/// modifier sits outside the payload and its encryption, so a verbatim copy
+/// of a block to another offset re-stamps only the stored checksum.
+///
+/// The table half of the binding is the table's id, which its encryption AAD
+/// binds too and which a reader knows before it reads a block (from the table
+/// file's path or the manifest). A copy into a table of another id (a
+/// relocation) re-stamps every block it copies, as a copy to another offset
+/// does.
+///
+/// Blocks outside a table (the manifest log, a blob file's meta) are framed
+/// by their own reader and stay [`ChecksumAt::Unbound`].
+#[derive(Copy, Clone, Debug, Eq, PartialEq)]
+pub enum ChecksumAt {
+    /// The stored checksum is the payload checksum itself.
+    Unbound,
+    /// Bound to the block's table and its byte offset in the table file.
+    Table {
+        /// The table's id.
+        table_id: u64,
+        /// The block's byte offset in the file.
+        offset: u64,
+    },
+}
+
+impl ChecksumAt {
+    /// Bound to `offset` in table `table_id`.
+    #[must_use]
+    pub const fn table(table_id: u64, offset: u64) -> Self {
+        Self::Table { table_id, offset }
+    }
+
+    /// Where a block of `block_type` at `offset` of table `table_id` is bound.
+    ///
+    /// A table's meta block is bound to its offset alone: the meta is what a
+    /// reader without the manifest learns the table's id from, so reading it
+    /// cannot require the id. Its own `table_id` field, checked against the id
+    /// the caller expects, and under encryption its AAD bind it to its table.
+    #[must_use]
+    pub const fn block(table_id: u64, block_type: super::BlockType, offset: u64) -> Self {
+        let table_id = match block_type {
+            super::BlockType::Meta => 0,
+            _ => table_id,
+        };
+        Self::table(table_id, offset)
+    }
+
+    /// The value the stored checksum differs from the payload checksum by:
+    /// zero when unbound, otherwise `(table_id << 64 | offset) + 1`.
+    ///
+    /// A block read at a place other than its own verifies only if the two
+    /// places share a modifier, so the modifier needs only to be injective,
+    /// not to hash: this one is, and no bound place shares zero with an
+    /// unbound block. It costs a shift and an add on every block read.
+    #[inline]
+    #[must_use]
+    pub const fn modifier(self) -> u128 {
+        match self {
+            Self::Unbound => 0,
+            // No block starts at offset `u64::MAX`, so the add cannot wrap.
+            Self::Table { table_id, offset } => (((table_id as u128) << 64) | offset as u128) + 1,
+        }
+    }
+}
+
 /// Header of a disk-based block
 #[derive(Copy, Clone, Debug, Eq, PartialEq)]
 pub struct Header {
@@ -133,8 +205,10 @@ pub struct Header {
     /// with no compression / encryption / ECC / per-KV footer.
     pub block_flags: u8,
 
-    /// Checksum value to verify integrity of data
-    pub checksum: Checksum,
+    /// The checksum as stored: the payload checksum bound to where the block
+    /// lives ([`ChecksumAt`]). [`Self::payload_checksum`] undoes the binding
+    /// for the place a read expects the block at.
+    pub stored_checksum: Checksum,
 
     /// On-disk size of data segment
     pub data_length: u32,
@@ -144,6 +218,53 @@ pub struct Header {
 }
 
 impl Header {
+    /// The payload checksum this header claims for a block read at `at`. Read
+    /// anywhere but where the block was written, it is not the payload's, and
+    /// verification refuses the block.
+    #[inline]
+    #[must_use]
+    pub fn payload_checksum(&self, at: ChecksumAt) -> Checksum {
+        Checksum::from_raw(self.stored_checksum.into_u128() ^ at.modifier())
+    }
+
+    /// Stores `payload` as this header's checksum, bound to `at`.
+    #[inline]
+    pub fn bind_checksum(&mut self, payload: Checksum, at: ChecksumAt) {
+        self.stored_checksum = Checksum::from_raw(payload.into_u128() ^ at.modifier());
+    }
+
+    /// Moves the stored checksum from `from` to `to`, for a verbatim copy of
+    /// the block: its payload is unchanged, so the payload checksum it binds
+    /// is too.
+    #[inline]
+    pub fn rebind_checksum(&mut self, from: ChecksumAt, to: ChecksumAt) {
+        let payload = self.payload_checksum(from);
+        self.bind_checksum(payload, to);
+    }
+
+    /// Re-stamps the block frame at the front of `frame`, which was written at
+    /// `from`, for `to`: its header is rewritten in place, the same length,
+    /// and its payload is not touched.
+    ///
+    /// # Errors
+    ///
+    /// Returns an error when `frame` does not start with a decodable header.
+    pub(crate) fn rebind_frame(
+        frame: &mut [u8],
+        from: ChecksumAt,
+        to: ChecksumAt,
+    ) -> crate::Result<()> {
+        let mut header = Self::decode_from(&mut &*frame)?;
+        header.rebind_checksum(from, to);
+        let mut encoded = alloc::vec::Vec::with_capacity(Self::MAX_LEN);
+        header.encode_into(&mut encoded)?;
+        frame
+            .get_mut(..encoded.len())
+            .ok_or(crate::Error::InvalidHeader("Block"))?
+            .copy_from_slice(&encoded);
+        Ok(())
+    }
+
     /// Header size WITHOUT the optional `block_flags` byte: the fixed part
     /// every block carries (magic + `block_type` + checksum + `data_length` +
     /// `uncompressed_length` + header checksum). Pre-decode lower bound; the
@@ -300,7 +421,7 @@ impl Encode for Header {
             }
 
             // Write data checksum
-            writer.write_u128::<LE>(self.checksum.into_u128())?;
+            writer.write_u128::<LE>(self.stored_checksum.into_u128())?;
 
             // Write on-disk size length
             writer.write_u32::<LE>(self.data_length)?;
@@ -390,7 +511,7 @@ impl Decode for Header {
         Ok(Self {
             block_type,
             block_flags,
-            checksum: Checksum::from_raw(checksum),
+            stored_checksum: Checksum::from_raw(checksum),
             data_length,
             uncompressed_length,
         })
@@ -424,7 +545,7 @@ impl Header {
         Self {
             block_type,
             block_flags: 0,
-            checksum: Checksum::from_raw(0),
+            stored_checksum: Checksum::from_raw(0),
             data_length: 0,
             uncompressed_length: 0,
         }

@@ -453,7 +453,13 @@ pub fn decode_prewarmed_blocks(
         // the read walk that then reads it authoritatively charges its own
         // decode on top.
         let mut produced = 0;
-        let decoded = Block::from_reader_counting(&mut reader, identity, &transform, &mut produced);
+        let at = crate::table::block::ChecksumAt::block(
+            identity.table_id,
+            identity.block_type,
+            *handle.offset(),
+        );
+        let decoded =
+            Block::from_reader_counting(&mut reader, identity, &transform, at, &mut produced);
         #[cfg(feature = "metrics")]
         metrics
             .block_bytes_decoded

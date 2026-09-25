@@ -68,7 +68,9 @@ fn take_next_returns_blocks_in_submission_order() {
             .expect("pending > 0 yields a block")
             .expect("plain block prepares without error");
         let mut buf = Vec::new();
-        prepared.write_to(&mut buf).expect("write to vec");
+        prepared
+            .write_to(&mut buf, crate::table::block::ChecksumAt::Unbound)
+            .expect("write to vec");
         out.push(buf);
     }
     assert_eq!(out.len(), 3);
@@ -108,7 +110,9 @@ fn take_next_reorders_out_of_order_completions() {
             .expect("pending > 0 yields a block")
             .expect("plain block prepares without error");
         let mut buf = Vec::new();
-        let header = prepared.write_to(&mut buf).expect("write to vec");
+        let header = prepared
+            .write_to(&mut buf, crate::table::block::ChecksumAt::Unbound)
+            .expect("write to vec");
         assert_eq!(
             header.uncompressed_length, expected_len,
             "blocks must drain in submission order regardless of completion order",

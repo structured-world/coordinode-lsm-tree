@@ -1679,7 +1679,14 @@ impl Table {
                 .checked_add(header.data_length as usize)
                 .and_then(|payload_end| raw.get(header_len..payload_end))
                 .is_some_and(|payload| {
-                    crate::hash::hash128(payload) == header.checksum.into_u128()
+                    crate::hash::hash128(payload)
+                        == header
+                            .payload_checksum(crate::table::block::ChecksumAt::block(
+                                table_id.table_id(),
+                                block_type,
+                                *handle.offset(),
+                            ))
+                            .into_u128()
                 });
             (header == block.header
                 && payload_checksum_ok
@@ -3100,7 +3107,14 @@ impl Table {
                             .checked_add(raw_header.data_length as usize)
                             .and_then(|payload_end| raw.get(header_len..payload_end))
                             .is_some_and(|payload| {
-                                crate::hash::hash128(payload) == raw_header.checksum.into_u128()
+                                crate::hash::hash128(payload)
+                                    == raw_header
+                                        .payload_checksum(crate::table::block::ChecksumAt::block(
+                                            self.id(),
+                                            role,
+                                            block_offset,
+                                        ))
+                                        .into_u128()
                             });
                         if !payload_ok {
                             report.uncorrectable_blocks += 1;
@@ -3208,6 +3222,7 @@ impl Table {
                         let frame = match crate::table::block::Block::heal_frame(
                             file.as_ref(),
                             handle,
+                            self.id(),
                             &transform,
                         ) {
                             Ok(Some((frame, _kind))) => frame,
@@ -3406,7 +3421,14 @@ impl Table {
                     .checked_add(raw_header.data_length as usize)
                     .and_then(|payload_end| raw.get(header_len..payload_end))
                     .is_some_and(|payload| {
-                        crate::hash::hash128(payload) == raw_header.checksum.into_u128()
+                        crate::hash::hash128(payload)
+                            == raw_header
+                                .payload_checksum(crate::table::block::ChecksumAt::block(
+                                    self.id(),
+                                    role,
+                                    block_offset,
+                                ))
+                                .into_u128()
                     });
                 if !payload_ok {
                     return Ok(None);
@@ -3424,7 +3446,7 @@ impl Table {
                 }
             }
             Ok(crate::table::util::BlockScrubOutcome::Corrected { .. }) => {
-                match crate::table::block::Block::heal_frame(file, handle, transform) {
+                match crate::table::block::Block::heal_frame(file, handle, self.id(), transform) {
                     Ok(Some((frame, _kind))) => Ok(Some((block_offset, frame))),
                     // A confirming re-read that is now clean: a transient fault the
                     // first read hit and this one did not, so nothing to persist.
@@ -7431,9 +7453,13 @@ impl Table {
     /// # Errors
     ///
     /// Propagates a corruption / decode error (the resolver surfaces it).
+    ///
+    /// `offset` is where in the table file `bytes` were read from, which the
+    /// block's stored checksum must be bound to.
     pub(crate) fn decode_data_block_from_bytes(
         &self,
         bytes: &[u8],
+        offset: u64,
     ) -> crate::Result<Option<DataBlock>> {
         let transform = crate::table::util::build_block_transform(
             self.metadata.data_block_compression,
@@ -7457,6 +7483,7 @@ impl Table {
             &mut crate::io::Cursor::new(bytes),
             identity,
             &transform,
+            crate::table::block::ChecksumAt::table(identity.table_id, offset),
             &mut produced,
         );
         #[cfg(feature = "metrics")]

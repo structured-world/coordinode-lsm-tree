@@ -19,7 +19,7 @@ mod r#type;
 
 pub(crate) use decoder::{Decodable, Decoder, DecoderMeta, ParsedItem};
 pub(crate) use encoder::{Encodable, Encoder};
-pub use header::Header;
+pub use header::{ChecksumAt, Header};
 pub use identity::BlockIdentity;
 pub use offset::BlockOffset;
 pub(crate) use trailer::{TRAILER_START_MARKER, Trailer};
@@ -350,7 +350,11 @@ fn classify_block_trailer(
 /// a transform produced a fresh buffer. A worker thread takes ownership via
 /// [`PreparedBlock::into_owned`] so the prepared block can outlive `data`.
 pub(crate) struct PreparedBlock<'a> {
+    /// The header, its stored checksum not yet bound: that needs the offset,
+    /// which only the write knows.
     header: Header,
+    /// Checksum of `payload`.
+    payload_checksum: Checksum,
     payload: Cow<'a, [u8]>,
     /// Reed-Solomon parity trailer, present only when page-ECC is active and
     /// the payload was non-empty. Always `None` without the `page_ecc` feature.
@@ -373,6 +377,7 @@ impl PreparedBlock<'_> {
     pub(crate) fn into_owned(self) -> PreparedBlock<'static> {
         PreparedBlock {
             header: self.header,
+            payload_checksum: self.payload_checksum,
             payload: Cow::Owned(self.payload.into_owned()),
             parity: self.parity,
             layout: self.layout,
@@ -391,9 +396,15 @@ impl PreparedBlock<'_> {
     }
 
     /// Writes the framed block (header + payload + optional parity trailer)
-    /// to `writer` and returns the header. This is the single point where
-    /// block bytes hit the file, so it must run in on-disk order.
-    pub(crate) fn write_to<W: crate::io::Write>(self, mut writer: &mut W) -> crate::Result<Header> {
+    /// to `writer`, its stored checksum bound to `at`, and returns the header.
+    /// This is the single point where block bytes hit the file, so it must
+    /// run in on-disk order.
+    pub(crate) fn write_to<W: crate::io::Write>(
+        mut self,
+        mut writer: &mut W,
+        at: ChecksumAt,
+    ) -> crate::Result<Header> {
+        self.header.bind_checksum(self.payload_checksum, at);
         self.header.encode_into(&mut writer)?;
         writer.write_all(&self.payload)?;
         if let Some(parity) = &self.parity {
@@ -744,18 +755,22 @@ impl Block {
     /// the mismatch before the call reaches `write_into`, so the
     /// guard is unreachable from any in-tree caller and exists purely
     /// as a "should-never-fire" assertion.
+    ///
+    /// `at` is where the block lands, which its stored checksum is bound to:
+    /// a table's block is bound to its byte offset in the table file.
     pub fn write_into<W: crate::io::Write>(
         writer: &mut W,
         data: &[u8],
         identity: BlockIdentity,
         transform: &BlockTransform<'_>,
+        at: ChecksumAt,
     ) -> crate::Result<Header> {
         // Most blocks carry no caller-supplied transform bits beyond what
         // the `transform` itself implies (compression / encryption / ECC).
         // The per-KV footer is the one bit `write_into` can't derive from
         // the payload, so the data-block writer routes through
         // `write_into_with_flags` to set it.
-        Self::write_into_with_flags(writer, data, identity, transform, 0)
+        Self::write_into_with_flags(writer, data, identity, transform, 0, at)
     }
 
     /// Like [`Self::write_into`] but lets the caller OR in
@@ -782,8 +797,9 @@ impl Block {
         identity: BlockIdentity,
         transform: &BlockTransform<'_>,
         extra_flags: u8,
+        at: ChecksumAt,
     ) -> crate::Result<Header> {
-        Self::prepare_with_flags(data, identity, transform, extra_flags)?.write_to(writer)
+        Self::prepare_with_flags(data, identity, transform, extra_flags)?.write_to(writer, at)
     }
 
     /// Runs the block transform pipeline (compress → encrypt → checksum → ecc)
@@ -859,8 +875,8 @@ impl Block {
         let mut header = Header {
             block_type,
             block_flags,
-            checksum: Checksum::from_raw(0), // <-- NOTE: Is set later on
-            data_length: 0,                  // <-- NOTE: Is set later on
+            stored_checksum: Checksum::from_raw(0), // <-- NOTE: bound by the write
+            data_length: 0,                         // <-- NOTE: Is set later on
 
             #[expect(clippy::cast_possible_truncation, reason = "blocks are limited to u32")]
             uncompressed_length: data.len() as u32,
@@ -1002,7 +1018,7 @@ impl Block {
         let payload_len = payload.len() as u32;
 
         header.data_length = payload_len;
-        header.checksum = Checksum::from_raw(crate::hash::hash128(&payload));
+        let payload_checksum = Checksum::from_raw(crate::hash::hash128(&payload));
 
         // Optional Reed-Solomon parity trailer. The parity LENGTH is not
         // stored in the header: it is `expected_parity_len(data_length)`,
@@ -1065,6 +1081,7 @@ impl Block {
 
         Ok(PreparedBlock {
             header,
+            payload_checksum,
             payload,
             parity: parity_buf,
             layout,
@@ -1213,12 +1230,16 @@ impl Block {
     // unencrypted reads into a `Slice` to stay zero-copy — but they no longer
     // duplicate what happens to it afterwards: both hand the verified payload
     // to `decompress_payload`.
+    ///
+    /// `at` is where the reader found the block, which its stored checksum
+    /// must be bound to (see [`ChecksumAt`]).
     pub fn from_reader<R: crate::io::Read>(
         reader: &mut R,
         identity: BlockIdentity,
         transform: &BlockTransform<'_>,
+        at: ChecksumAt,
     ) -> crate::Result<Self> {
-        Self::from_reader_counting(reader, identity, transform, &mut 0)
+        Self::from_reader_counting(reader, identity, transform, at, &mut 0)
     }
 
     /// [`Self::from_reader`] that also reports, in `produced`, the length the
@@ -1228,6 +1249,7 @@ impl Block {
         reader: &mut R,
         identity: BlockIdentity,
         transform: &BlockTransform<'_>,
+        at: ChecksumAt,
         produced: &mut usize,
     ) -> crate::Result<Self> {
         let encryption = transform.encryption();
@@ -1239,6 +1261,7 @@ impl Block {
         if encryption.is_none() {
             refuse_encrypted_without_provider(&header)?;
         }
+        let expected = header.payload_checksum(at);
 
         // Validate both size fields before any I/O or hashing to fail fast
         // on malformed headers. The on-disk data_length may include encryption
@@ -1287,7 +1310,7 @@ impl Block {
                 reader,
                 header.data_length,
                 ecc_length,
-                header.checksum,
+                expected,
                 block_ecc_params(&header, transform),
             )?;
 
@@ -1309,11 +1332,9 @@ impl Block {
             let raw_data = if ecc_length == 0 {
                 let s = Slice::from_reader(reader, header.data_length as usize)?;
                 let checksum = Checksum::from_raw(crate::hash::hash128(&s));
-                checksum.check(header.checksum).inspect_err(|_| {
+                checksum.check(expected).inspect_err(|_| {
                     log::error!(
-                        "Checksum mismatch for <bufreader>, got={}, expected={}",
-                        checksum,
-                        header.checksum,
+                        "Checksum mismatch for <bufreader>, got={checksum}, expected={expected}",
                     );
                 })?;
                 s
@@ -1323,7 +1344,7 @@ impl Block {
                     reader,
                     header.data_length,
                     ecc_length,
-                    header.checksum,
+                    expected,
                     block_ecc_params(&header, transform),
                 )?;
                 payload
@@ -1498,7 +1519,7 @@ impl Block {
             // Single I/O read — header + payload in one Slice.
             on_issue();
             let buf = crate::file::read_exact(file, *handle.offset(), handle.size() as usize)?;
-            Self::verify_plain_frame(&buf, handle, transform)?
+            Self::verify_plain_frame(&buf, handle, identity, transform)?
         };
 
         Ok((header, payload, ecc_status, recovery))
@@ -1536,7 +1557,7 @@ impl Block {
                 let enc_overhead = u64::from(enc.max_overhead());
                 Self::verify_encrypted_frame(frame, handle, identity, transform, enc, enc_overhead)
             }
-            None => Self::verify_plain_frame(&Slice::from(frame), handle, transform),
+            None => Self::verify_plain_frame(&Slice::from(frame), handle, identity, transform),
         }
     }
 
@@ -1556,6 +1577,12 @@ impl Block {
             // bytes per block_type) and stops, leaving the payload untouched.
             let parsed_header = Header::decode_from(&mut &buf[..])?;
             let header_len = Header::header_len(parsed_header.block_type);
+            // The block must have been written where the handle points.
+            let expected = parsed_header.payload_checksum(ChecksumAt::block(
+                identity.table_id,
+                identity.block_type,
+                *handle.offset(),
+            ));
 
             // Parity-trailer presence is keyed on a RECOGNIZED ECC layout
             // (`block_has_parity`: header bit for self-describing blocks,
@@ -1626,11 +1653,9 @@ impl Block {
                 let checksum = Checksum::from_raw(crate::hash::hash128(
                     &buf[header_len..header_len + actual_data_len],
                 ));
-                checksum.check(parsed_header.checksum).inspect_err(|_| {
+                checksum.check(expected).inspect_err(|_| {
                     log::error!(
-                        "Checksum mismatch for block {handle:?}, got={}, expected={}",
-                        checksum,
-                        parsed_header.checksum,
+                        "Checksum mismatch for block {handle:?}, got={checksum}, expected={expected}",
                     );
                 })?;
                 // Strip header prefix + any opaque trailer so buf is the payload.
@@ -1646,7 +1671,7 @@ impl Block {
                     &buf[header_len..],
                     parsed_header.data_length,
                     ecc_length,
-                    parsed_header.checksum,
+                    expected,
                     block_ecc_params(&parsed_header, transform),
                 )? {
                     None => {
@@ -1684,12 +1709,19 @@ impl Block {
     fn verify_plain_frame(
         buf: &Slice,
         handle: BlockHandle,
+        identity: BlockIdentity,
         transform: &BlockTransform<'_>,
     ) -> crate::Result<(Header, Slice, EccStatus, Option<EccRecoveryKind>)> {
         {
             let parsed_header = Header::decode_from(&mut &buf[..])?;
             refuse_encrypted_without_provider(&parsed_header)?;
             let header_len = Header::header_len(parsed_header.block_type);
+            // The block must have been written where the handle points.
+            let expected = parsed_header.payload_checksum(ChecksumAt::block(
+                identity.table_id,
+                identity.block_type,
+                *handle.offset(),
+            ));
 
             // Recognized-ECC presence keys on `block_has_parity`, not on
             // `ecc_length` (which is also 0 for a recognized scheme on an empty
@@ -1733,49 +1765,48 @@ impl Block {
             // opaque trailer); recognized-ECC blocks go through the
             // recovery-capable helper. The checksum covers exactly the
             // `data_length` payload bytes, so an opaque trailer is excluded.
-            let (payload_slice, payload_corrected): (Slice, Option<EccRecoveryKind>) =
-                if ecc_length == 0 {
-                    #[expect(
-                        clippy::indexing_slicing,
-                        reason = "actual_data_len <= post-header len"
-                    )]
-                    let checksum = Checksum::from_raw(crate::hash::hash128(
-                        &buf[header_len..header_len + actual_data_len],
-                    ));
-                    checksum.check(parsed_header.checksum).inspect_err(|_| {
+            let (payload_slice, payload_corrected): (Slice, Option<EccRecoveryKind>) = if ecc_length
+                == 0
+            {
+                #[expect(
+                    clippy::indexing_slicing,
+                    reason = "actual_data_len <= post-header len"
+                )]
+                let checksum = Checksum::from_raw(crate::hash::hash128(
+                    &buf[header_len..header_len + actual_data_len],
+                ));
+                checksum.check(expected).inspect_err(|_| {
                         log::error!(
-                            "Checksum mismatch for block {handle:?}, got={}, expected={}",
-                            checksum,
-                            parsed_header.checksum,
+                            "Checksum mismatch for block {handle:?}, got={checksum}, expected={expected}",
                         );
                     })?;
-                    (buf.slice(header_len..header_len + actual_data_len), None)
-                } else {
-                    // Resident-frame verify: the checksum runs in place over the
-                    // read buffer (no cursor copy of payload + parity). The clean
-                    // payload is then DETACHED into its own allocation rather
-                    // than served as a view of `buf`: a view would keep the whole
-                    // frame alive, parity trailer included, for as long as the
-                    // block sits in the block cache, whose weight charges only
-                    // header + payload. That would let the cache overshoot its
-                    // capacity by the parity ratio (12.5% SEC-DED, 50% RS(4,2)).
-                    // One payload copy per disk read is the price of exact cache
-                    // accounting; the parity bytes are never copied or touched.
-                    #[expect(clippy::indexing_slicing, reason = "header was decoded from buf")]
-                    match Self::verify_resident_payload(
-                        &buf[header_len..],
-                        parsed_header.data_length,
-                        ecc_length,
-                        parsed_header.checksum,
-                        block_ecc_params(&parsed_header, transform),
-                    )? {
-                        None => (
-                            Slice::from(&buf[header_len..header_len + actual_data_len]),
-                            None,
-                        ),
-                        Some((healed, kind)) => (healed, Some(kind)),
-                    }
-                };
+                (buf.slice(header_len..header_len + actual_data_len), None)
+            } else {
+                // Resident-frame verify: the checksum runs in place over the
+                // read buffer (no cursor copy of payload + parity). The clean
+                // payload is then DETACHED into its own allocation rather
+                // than served as a view of `buf`: a view would keep the whole
+                // frame alive, parity trailer included, for as long as the
+                // block sits in the block cache, whose weight charges only
+                // header + payload. That would let the cache overshoot its
+                // capacity by the parity ratio (12.5% SEC-DED, 50% RS(4,2)).
+                // One payload copy per disk read is the price of exact cache
+                // accounting; the parity bytes are never copied or touched.
+                #[expect(clippy::indexing_slicing, reason = "header was decoded from buf")]
+                match Self::verify_resident_payload(
+                    &buf[header_len..],
+                    parsed_header.data_length,
+                    ecc_length,
+                    expected,
+                    block_ecc_params(&parsed_header, transform),
+                )? {
+                    None => (
+                        Slice::from(&buf[header_len..header_len + actual_data_len]),
+                        None,
+                    ),
+                    Some((healed, kind)) => (healed, Some(kind)),
+                }
+            };
             // Fold a successful ECC repair into the status; the recovery
             // mechanism is carried out separately as `payload_corrected`.
             let ecc_status = if payload_corrected.is_some() {
@@ -1805,9 +1836,13 @@ impl Block {
     /// on-disk (post-compression, post-encryption) data bytes, so no decompress /
     /// decrypt is needed — `transform` is consulted only for the parity scheme.
     #[cfg(feature = "page_ecc")]
+    ///
+    /// `table_id` is the table the block belongs to: its stored checksum is
+    /// bound to that table and to the block's offset.
     pub(crate) fn heal_frame(
         file: &dyn FsFile,
         handle: BlockHandle,
+        table_id: u64,
         transform: &BlockTransform<'_>,
     ) -> crate::Result<Option<(alloc::vec::Vec<u8>, EccRecoveryKind)>> {
         let block_size = handle.size() as usize;
@@ -1874,7 +1909,11 @@ impl Block {
             &mut cursor,
             header.data_length,
             ecc_length,
-            header.checksum,
+            header.payload_checksum(ChecksumAt::block(
+                table_id,
+                header.block_type,
+                *handle.offset(),
+            )),
             ecc_params,
         )?;
         let Some(kind) = recovery else {

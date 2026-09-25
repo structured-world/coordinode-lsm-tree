@@ -423,6 +423,7 @@ fn verify_kv_checked_detects_corrupted_digest_under_valid_block_checksum() {
     // dropped on encode — the footer rides inside the payload structurally,
     // and `verify_kv_checked` splits it without consulting the header bit.
     let id = BlockIdentity::for_test(0, BlockType::Data);
+    let at = crate::table::block::ChecksumAt::table(0, 0);
     let mut buf = Vec::new();
     Block::write_into_with_flags(
         &mut buf,
@@ -430,11 +431,12 @@ fn verify_kv_checked_detects_corrupted_digest_under_valid_block_checksum() {
         id,
         &BlockTransform::PLAIN,
         block_flags::KV_CHECKSUM_FOOTER,
+        at,
     )
     .unwrap();
 
     // Block loads fine (block-level checksum matches the corrupted bytes).
-    let block = Block::from_reader(&mut &buf[..], id, &BlockTransform::PLAIN).unwrap();
+    let block = Block::from_reader(&mut &buf[..], id, &BlockTransform::PLAIN, at).unwrap();
 
     // Only the per-KV verifier catches the bad digest. `None` skips the
     // algorithm cross-check — this test exercises the digest-mismatch path.
@@ -474,6 +476,7 @@ fn verify_kv_checked_rejects_non_data_block_type() {
     DataBlock::encode_kv_checked_into(&mut payload, &items, &digests, algo, 2, 0.0).unwrap();
 
     let id = BlockIdentity::for_test(0, BlockType::Data);
+    let at = crate::table::block::ChecksumAt::table(0, 0);
     let mut buf = Vec::new();
     Block::write_into_with_flags(
         &mut buf,
@@ -481,9 +484,10 @@ fn verify_kv_checked_rejects_non_data_block_type() {
         id,
         &BlockTransform::PLAIN,
         block_flags::KV_CHECKSUM_FOOTER,
+        at,
     )
     .unwrap();
-    let block = Block::from_reader(&mut &buf[..], id, &BlockTransform::PLAIN).unwrap();
+    let block = Block::from_reader(&mut &buf[..], id, &BlockTransform::PLAIN, at).unwrap();
 
     // The footer + inner bytes form a valid data block, so only the
     // block_type gate can catch a tampered type: flip it to a non-Data
@@ -958,7 +962,7 @@ fn walk_block_region_reports_data_read_error_on_truncated_data_segment() -> crat
         // Arbitrary sentinel; the walker reaches `read_exact` and
         // bails BEFORE any data-segment XXH3 comparison, so this
         // value is never checked.
-        checksum: Checksum::from_raw(0xDEAD_BEEF_DEAD_BEEF),
+        stored_checksum: Checksum::from_raw(0xDEAD_BEEF_DEAD_BEEF),
         data_length: DATA_LENGTH,
         uncompressed_length: DATA_LENGTH,
         ..Header::test_dummy(BlockType::Data)
@@ -1085,12 +1089,15 @@ fn walk_block_region_reports_data_read_error_on_truncated_parity_trailer() -> cr
     const HEADER_LEN: u64 = Header::MIN_LEN as u64;
 
     let data = vec![0xABu8; DATA_LENGTH as usize];
-    let header = Header {
-        checksum: Checksum::from_raw(crate::hash::hash128(&data)),
+    let mut header = Header {
         data_length: DATA_LENGTH,
         uncompressed_length: DATA_LENGTH,
         ..Header::test_dummy(BlockType::Data)
     };
+    header.bind_checksum(
+        Checksum::from_raw(crate::hash::hash128(&data)),
+        crate::table::block::ChecksumAt::table(7, 0),
+    );
 
     // One `data` section: header + full payload, but no parity trailer.
     let mut archive_bytes: Vec<u8> = Vec::new();
@@ -1188,12 +1195,15 @@ fn walk_block_region_caps_an_absurd_parity_trailer_length() -> crate::Result<()>
     );
 
     let data = vec![0xABu8; DATA_LENGTH as usize];
-    let header = Header {
-        checksum: Checksum::from_raw(crate::hash::hash128(&data)),
+    let mut header = Header {
         data_length: DATA_LENGTH,
         uncompressed_length: DATA_LENGTH,
         ..Header::test_dummy(BlockType::Data)
     };
+    header.bind_checksum(
+        Checksum::from_raw(crate::hash::hash128(&data)),
+        crate::table::block::ChecksumAt::table(7, 0),
+    );
 
     // One `data` section: header + full payload, no parity bytes on disk.
     let mut archive_bytes: Vec<u8> = Vec::new();
@@ -1280,7 +1290,7 @@ fn walk_block_region_reports_header_crossing_section_boundary() -> crate::Result
 
     // `Meta` blocks carry the block_flags byte, so header_len == MIN_LEN + 1.
     let header = Header {
-        checksum: Checksum::from_raw(0xDEAD_BEEF_DEAD_BEEF),
+        stored_checksum: Checksum::from_raw(0xDEAD_BEEF_DEAD_BEEF),
         data_length: 0,
         uncompressed_length: 0,
         ..Header::test_dummy(BlockType::Meta)
@@ -1799,12 +1809,15 @@ fn codec_disagrees_everywhere_same_length_scheme_is_flagged_but_not_refused() ->
     // impostor pass for the wrong reason.
     let payload = discriminating_payload(DATA_LENGTH);
     let parity = crate::ecc::encode_parity(&payload, 4, 2).expect("RS(4,2) encodes the fixture");
-    let header = Header {
-        checksum: Checksum::from_raw(crate::hash::hash128(&payload)),
+    let mut header = Header {
         data_length: DATA_LENGTH,
         uncompressed_length: DATA_LENGTH,
         ..Header::test_dummy(BlockType::Data)
     };
+    header.bind_checksum(
+        Checksum::from_raw(crate::hash::hash128(&payload)),
+        crate::table::block::ChecksumAt::table(0, 0),
+    );
 
     let mut archive_bytes: Vec<u8> = Vec::new();
     {
@@ -1865,11 +1878,11 @@ fn codec_disagrees_everywhere_same_length_scheme_is_flagged_but_not_refused() ->
 
     // The trailer bytes separate them, and that difference is reported.
     assert!(
-        !codec_disagrees_everywhere(probe.as_ref(), toc, ScrubEcc::Scheme(real), 0, cap),
+        !codec_disagrees_everywhere((probe.as_ref(), 0), toc, ScrubEcc::Scheme(real), 0, cap),
         "the real scheme reproduces the trailer, so nothing is suspect",
     );
     assert!(
-        codec_disagrees_everywhere(probe.as_ref(), toc, ScrubEcc::Scheme(impostor), 0, cap),
+        codec_disagrees_everywhere((probe.as_ref(), 0), toc, ScrubEcc::Scheme(impostor), 0, cap),
         "the impostor reproduces no trailer — the signature of a mis-identified \
          scheme, which is what the operator is told",
     );
@@ -2030,12 +2043,15 @@ fn write_block_archive(
                     clippy::cast_possible_truncation,
                     reason = "test payloads are kilobytes"
                 )]
-                let header = Header {
-                    checksum: Checksum::from_raw(crate::hash::hash128(payload)),
+                let mut header = Header {
                     data_length: payload.len() as u32,
                     uncompressed_length: payload.len() as u32,
                     ..Header::test_dummy(BlockType::Data)
                 };
+                header.bind_checksum(
+                    Checksum::from_raw(crate::hash::hash128(payload)),
+                    crate::table::block::ChecksumAt::table(0, writer.get_ref().position()),
+                );
                 writer.write_all(&header.encode_into_vec()).unwrap();
                 writer.write_all(payload).unwrap();
                 writer.write_all(parity).unwrap();
@@ -2118,18 +2134,24 @@ fn codec_confirms_region_keeps_scanning_past_a_mismatch() -> crate::Result<()> {
     let (start, end) = (data.pos(), data.pos() + data.len());
 
     assert_eq!(
-        codec_confirms_region(probe.as_ref(), ScrubEcc::Scheme(real), start, end, cap),
+        codec_confirms_region((probe.as_ref(), 0), ScrubEcc::Scheme(real), start, end, cap),
         CodecVerdict::Confirmed,
         "the real codec reproduces both trailers",
     );
     assert_eq!(
-        codec_confirms_region(probe.as_ref(), ScrubEcc::Scheme(impostor), start, end, cap),
+        codec_confirms_region(
+            (probe.as_ref(), 0),
+            ScrubEcc::Scheme(impostor),
+            start,
+            end,
+            cap
+        ),
         CodecVerdict::Confirmed,
         "the second block's trailer IS reproduced, and a scan that stopped at \
          the first mismatch would never see it",
     );
     assert!(
-        !codec_disagrees_everywhere(probe.as_ref(), toc, ScrubEcc::Scheme(impostor), 0, cap),
+        !codec_disagrees_everywhere((probe.as_ref(), 0), toc, ScrubEcc::Scheme(impostor), 0, cap),
         "one reproduced trailer refutes the report's claim, so a table whose \
          mismatches are ordinary rot is not blamed on its scheme",
     );
@@ -2202,13 +2224,19 @@ fn codec_confirms_region_scan_stops_early_reports_incomplete() -> crate::Result<
     let cap = block_data_length_cap(0);
 
     assert_eq!(
-        codec_confirms_region(probe.as_ref(), ScrubEcc::Scheme(impostor), start, end, cap),
+        codec_confirms_region(
+            (probe.as_ref(), 0),
+            ScrubEcc::Scheme(impostor),
+            start,
+            end,
+            cap
+        ),
         CodecVerdict::Incomplete,
         "the region was not inspected to its end, so it cannot say the scheme \
          reproduces nothing",
     );
     assert!(
-        !codec_disagrees_everywhere(probe.as_ref(), toc, ScrubEcc::Scheme(impostor), 0, cap),
+        !codec_disagrees_everywhere((probe.as_ref(), 0), toc, ScrubEcc::Scheme(impostor), 0, cap),
         "and no diagnosis is reported off a truncated probe",
     );
     Ok(())
@@ -2250,7 +2278,7 @@ fn codec_confirms_region_empty_region_reports_no_evidence() -> crate::Result<()>
     assert_eq!(filter.len(), 0, "the fixture's filter section is empty");
     assert_eq!(
         codec_confirms_region(
-            probe.as_ref(),
+            (probe.as_ref(), 0),
             ScrubEcc::Scheme(real),
             filter.pos(),
             filter.pos() + filter.len(),
@@ -2261,7 +2289,7 @@ fn codec_confirms_region_empty_region_reports_no_evidence() -> crate::Result<()>
          traversal that stopped",
     );
     assert!(
-        codec_disagrees_everywhere(probe.as_ref(), toc, ScrubEcc::Scheme(real), 0, cap),
+        codec_disagrees_everywhere((probe.as_ref(), 0), toc, ScrubEcc::Scheme(real), 0, cap),
         "so it leaves the answer to the regions that do hold blocks, instead of \
          silencing the whole table",
     );
@@ -2327,7 +2355,7 @@ fn codec_disagrees_everywhere_is_silenced_by_a_region_it_could_not_finish() -> c
     let tli = toc.section(b"tli").expect("the fixture has a tli section");
     assert_eq!(
         codec_confirms_region(
-            probe.as_ref(),
+            (probe.as_ref(), 0),
             ScrubEcc::Scheme(real),
             data.pos(),
             data.pos() + data.len(),
@@ -2339,7 +2367,7 @@ fn codec_disagrees_everywhere_is_silenced_by_a_region_it_could_not_finish() -> c
     );
     assert_eq!(
         codec_confirms_region(
-            probe.as_ref(),
+            (probe.as_ref(), 0),
             ScrubEcc::Scheme(real),
             tli.pos(),
             tli.pos() + tli.len(),
@@ -2349,7 +2377,7 @@ fn codec_disagrees_everywhere_is_silenced_by_a_region_it_could_not_finish() -> c
         "and the other region was never finished — the other half",
     );
     assert!(
-        !codec_disagrees_everywhere(probe.as_ref(), toc, ScrubEcc::Scheme(real), 0, cap),
+        !codec_disagrees_everywhere((probe.as_ref(), 0), toc, ScrubEcc::Scheme(real), 0, cap),
         "an unfinished region leaves the table-wide claim unavailable, whatever \
          a finished one found",
     );
@@ -2402,7 +2430,7 @@ fn rotted_trailer_keeps_the_descriptor_and_is_not_reported_suspect() -> crate::R
         .expect("the fixture has a data section");
     assert_eq!(
         codec_confirms_region(
-            probe.as_ref(),
+            (probe.as_ref(), 0),
             ScrubEcc::Scheme(real),
             data.pos(),
             data.pos() + data.len(),
@@ -2418,7 +2446,7 @@ fn rotted_trailer_keeps_the_descriptor_and_is_not_reported_suspect() -> crate::R
          the section and name the damaged block",
     );
     assert!(
-        !codec_disagrees_everywhere(probe.as_ref(), toc, ScrubEcc::Scheme(real), 0, cap),
+        !codec_disagrees_everywhere((probe.as_ref(), 0), toc, ScrubEcc::Scheme(real), 0, cap),
         "a region that reproduces the trailer rules the scheme out as the \
          explanation, leaving the mismatch reported as what it is: damage",
     );
@@ -2457,7 +2485,7 @@ fn codec_confirms_region_skips_a_block_whose_declared_length_exceeds_the_cap() -
 
     assert_eq!(
         codec_confirms_region(
-            probe.as_ref(),
+            (probe.as_ref(), 0),
             ScrubEcc::Scheme(real),
             start,
             end,
@@ -2467,7 +2495,7 @@ fn codec_confirms_region_skips_a_block_whose_declared_length_exceeds_the_cap() -
         "under the real cap the block is read and confirms the codec",
     );
     assert_eq!(
-        codec_confirms_region(probe.as_ref(), ScrubEcc::Scheme(real), start, end, 16),
+        codec_confirms_region((probe.as_ref(), 0), ScrubEcc::Scheme(real), start, end, 16),
         CodecVerdict::Incomplete,
         "a declared length past the cap stops the traversal instead of sizing a \
          read, and a stopped traversal answers nothing about the region",
@@ -2529,12 +2557,18 @@ fn codec_confirms_region_scans_past_a_run_of_mismatches() -> crate::Result<()> {
     let (start, end) = (data.pos(), data.pos() + data.len());
 
     assert_eq!(
-        codec_confirms_region(probe.as_ref(), ScrubEcc::Scheme(real), start, end, cap),
+        codec_confirms_region((probe.as_ref(), 0), ScrubEcc::Scheme(real), start, end, cap),
         CodecVerdict::Confirmed,
         "the real codec reproduces every trailer",
     );
     assert_eq!(
-        codec_confirms_region(probe.as_ref(), ScrubEcc::Scheme(impostor), start, end, cap),
+        codec_confirms_region(
+            (probe.as_ref(), 0),
+            ScrubEcc::Scheme(impostor),
+            start,
+            end,
+            cap
+        ),
         CodecVerdict::Confirmed,
         "the ninth block's trailer IS reproduced, and a scan that gave up over \
          the eight before it would never reach the evidence",
@@ -2602,7 +2636,7 @@ fn arbitrate_by_framing_rejects_a_split_verdict() -> crate::Result<()> {
         .expect("the fixture has a data section");
     assert_eq!(
         codec_confirms_region(
-            probe.as_ref(),
+            (probe.as_ref(), 0),
             ScrubEcc::Scheme(real),
             data.pos(),
             data.pos() + data.len(),
@@ -2669,7 +2703,7 @@ fn codec_disagrees_everywhere_is_silenced_by_any_agreement() -> crate::Result<()
     let tli = toc.section(b"tli").expect("the fixture has a tli section");
     assert_eq!(
         codec_confirms_region(
-            probe.as_ref(),
+            (probe.as_ref(), 0),
             ScrubEcc::Scheme(impostor),
             tli.pos(),
             tli.pos() + tli.len(),
@@ -2679,7 +2713,7 @@ fn codec_disagrees_everywhere_is_silenced_by_any_agreement() -> crate::Result<()
         "the impostor agrees with the all-zero region — the premise of this test",
     );
     assert!(
-        !codec_disagrees_everywhere(probe.as_ref(), toc, ScrubEcc::Scheme(impostor), 0, cap),
+        !codec_disagrees_everywhere((probe.as_ref(), 0), toc, ScrubEcc::Scheme(impostor), 0, cap),
         "one region disagreed and another agreed, so the report's claim does \
          not hold and it stays silent",
     );
@@ -2759,7 +2793,7 @@ fn codec_disagrees_everywhere_consults_the_tli_tail_mirror() -> crate::Result<()
     let tli = toc.section(b"tli").expect("the fixture has a tli section");
     assert_eq!(
         codec_confirms_region(
-            probe.as_ref(),
+            (probe.as_ref(), 0),
             ScrubEcc::Scheme(real),
             tli.pos(),
             tli.pos() + tli.len(),
@@ -2774,7 +2808,7 @@ fn codec_disagrees_everywhere_consults_the_tli_tail_mirror() -> crate::Result<()
         "every region frames, so the descriptor stands whatever the trailers say",
     );
     assert!(
-        codec_disagrees_everywhere(probe.as_ref(), toc, ScrubEcc::Scheme(real), 0, cap),
+        codec_disagrees_everywhere((probe.as_ref(), 0), toc, ScrubEcc::Scheme(real), 0, cap),
         "only the tail mirror had anything to say, so a region set omitting it \
          would report nothing at all",
     );
@@ -2846,7 +2880,7 @@ fn codec_disagrees_everywhere_consults_sections_outside_the_mirrors() -> crate::
         .expect("the fixture has a data section");
     assert_eq!(
         codec_confirms_region(
-            probe.as_ref(),
+            (probe.as_ref(), 0),
             ScrubEcc::Scheme(impostor),
             rt.pos(),
             rt.pos() + rt.len(),
@@ -2858,7 +2892,7 @@ fn codec_disagrees_everywhere_consults_sections_outside_the_mirrors() -> crate::
     );
     assert_eq!(
         codec_confirms_region(
-            probe.as_ref(),
+            (probe.as_ref(), 0),
             ScrubEcc::Scheme(impostor),
             data.pos(),
             data.pos() + data.len(),
@@ -2868,7 +2902,7 @@ fn codec_disagrees_everywhere_consults_sections_outside_the_mirrors() -> crate::
         "and the data region says nothing, so it cannot silence the report",
     );
     assert!(
-        codec_disagrees_everywhere(probe.as_ref(), toc, ScrubEcc::Scheme(impostor), 0, cap),
+        codec_disagrees_everywhere((probe.as_ref(), 0), toc, ScrubEcc::Scheme(impostor), 0, cap),
         "a section the descriptor sizes is consulted wherever it sits",
     );
     Ok(())

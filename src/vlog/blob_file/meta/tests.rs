@@ -73,6 +73,7 @@ fn test_blob_file_meta_missing_field_returns_err() {
         &encoded,
         crate::table::block::BlockIdentity::for_test(0, BlockType::Meta),
         &crate::table::block::BlockTransform::PLAIN,
+        crate::table::block::ChecksumAt::Unbound,
     )
     .unwrap();
 

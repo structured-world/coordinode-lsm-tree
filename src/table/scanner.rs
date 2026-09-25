@@ -16,9 +16,18 @@ use crate::{
     table::{block::BlockType, iter::OwnedDataBlockIter},
 };
 
+/// The data section read as a stream of blocks, with the offset the next one
+/// starts at: every block is verified at the place it was read from, so a
+/// block of the right shape written at another block's place is refused
+/// rather than streamed out of order.
+struct BlockStream {
+    reader: BufReader<Box<dyn FsFile>>,
+    position: u64,
+}
+
 /// Table reader that is optimized for consuming an entire table
 pub struct Scanner {
-    reader: BufReader<Box<dyn FsFile>>,
+    reader: BlockStream,
     iter: OwnedDataBlockIter,
 
     compression: CompressionType,
@@ -124,7 +133,10 @@ impl Scanner {
             use std::io::{Seek, SeekFrom};
             file.seek(SeekFrom::Start(start_offset))?;
         }
-        let mut reader = BufReader::with_capacity(SCANNER_READAHEAD_BYTES, file);
+        let mut reader = BlockStream {
+            reader: BufReader::with_capacity(SCANNER_READAHEAD_BYTES, file),
+            position: start_offset,
+        };
         let mut group_tags = group_tags.into_iter();
 
         let block = Self::fetch_next_block(
@@ -176,7 +188,7 @@ impl Scanner {
         reason = "per-block read threads each SST-level read parameter through; a config struct would add indirection without removing a caller decision"
     )]
     fn fetch_next_block(
-        reader: &mut BufReader<Box<dyn FsFile>>,
+        reader: &mut BlockStream,
         table_id: crate::TableId,
         compression: CompressionType,
         encryption: Option<&dyn EncryptionProvider>,
@@ -222,9 +234,10 @@ impl Scanner {
         DataBlock::from_loaded(block, has_kv_footer)
     }
 
-    /// Reads the next block from the stream under `block_type`'s identity.
+    /// Reads the next block from the stream under `block_type`'s identity,
+    /// verified at the offset it was read from, and advances past it.
     fn read_block(
-        reader: &mut BufReader<Box<dyn FsFile>>,
+        stream: &mut BlockStream,
         table_id: crate::TableId,
         block_type: BlockType,
         compression: CompressionType,
@@ -232,8 +245,9 @@ impl Scanner {
         ecc: Option<crate::table::block::EccParams>,
         #[cfg(zstd_any)] zstd_dict: Option<&crate::compression::ZstdDictionary>,
     ) -> crate::Result<Block> {
-        Block::from_reader(
-            reader,
+        let at = crate::table::block::ChecksumAt::table(table_id, stream.position);
+        let block = Block::from_reader(
+            &mut stream.reader,
             crate::table::block::BlockIdentity {
                 table_id,
                 block_type,
@@ -258,7 +272,12 @@ impl Scanner {
                     t
                 }
             },
-        )
+            at,
+        )?;
+        // The block consumed its header, payload and parity trailer; an SST
+        // block's trailer is sized by the table's scheme, not its header.
+        stream.position += u64::from(block.header.on_disk_size_with(ecc));
+        Ok(block)
     }
 
     /// Reads one columnar row group from the stream — its directory, then its
@@ -278,7 +297,7 @@ impl Scanner {
         reason = "per-group read threads each SST-level read parameter through, as `fetch_next_block` does"
     )]
     fn fetch_next_row_group(
-        reader: &mut BufReader<Box<dyn FsFile>>,
+        reader: &mut BlockStream,
         table_id: crate::TableId,
         compression: CompressionType,
         encryption: Option<&dyn EncryptionProvider>,
@@ -379,7 +398,7 @@ impl Scanner {
         )
     )]
     fn fetch_next_row_group(
-        _reader: &mut BufReader<Box<dyn FsFile>>,
+        _reader: &mut BlockStream,
         _table_id: crate::TableId,
         _compression: CompressionType,
         _encryption: Option<&dyn EncryptionProvider>,

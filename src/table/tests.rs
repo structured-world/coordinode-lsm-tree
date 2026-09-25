@@ -4283,7 +4283,9 @@ fn a_block_refused_for_its_declared_length_counts_what_its_transform_decoded() -
 
     let decoded_before = metrics.bytes_decoded();
     assert!(
-        table.decode_data_block_from_bytes(&tampered).is_err(),
+        table
+            .decode_data_block_from_bytes(&tampered, table.regions.tli.offset().0)
+            .is_err(),
         "the chunked resolver refuses the block too",
     );
     assert_eq!(
@@ -4554,7 +4556,7 @@ fn a_chunk_decoded_block_rejected_for_its_role_counts_what_its_transform_decoded
     let (table, metrics, frame) = one_row_table_and_its_index_frame(&dir)?;
 
     let decoded_before = metrics.bytes_decoded();
-    let result = table.decode_data_block_from_bytes(&frame);
+    let result = table.decode_data_block_from_bytes(&frame, table.regions.tli.offset().0);
     assert!(
         matches!(&result, Err(crate::Error::InvalidTag(("BlockType", _)))),
         "the index block must be refused as a data block",
@@ -5567,7 +5569,14 @@ fn meta_seqno_kv_max_corruption_returns_invalid_data() -> crate::Result<()> {
         // Rebuild the header with the correct checksum over the
         // tampered payload so Block::from_file accepts the block.
         let mut orig_header = Header::decode_from(&mut &raw_block[..header_len])?;
-        orig_header.checksum = crate::Checksum::from_raw(crate::hash::hash128(&tampered_payload));
+        orig_header.bind_checksum(
+            crate::Checksum::from_raw(crate::hash::hash128(&tampered_payload)),
+            crate::table::block::ChecksumAt::block(
+                0,
+                crate::table::block::BlockType::Meta,
+                *meta_handle.offset(),
+            ),
+        );
         let new_header = orig_header.encode_into_vec();
 
         // Write the tampered block back into the file at the meta
@@ -8377,14 +8386,15 @@ fn a_page_swapped_with_another_row_page_is_refused() -> crate::Result<()> {
     let first_bytes = bytes.get(extent(first)).expect("page").to_vec();
     let second_bytes = bytes.get(extent(second)).expect("page").to_vec();
     assert_ne!(first_bytes, second_bytes, "the two pages hold other rows");
-    bytes
-        .get_mut(extent(first))
-        .expect("page")
-        .copy_from_slice(&second_bytes);
-    bytes
-        .get_mut(extent(second))
-        .expect("page")
-        .copy_from_slice(&first_bytes);
+    // Each page is re-bound to the place it moves to, so its block checksum
+    // verifies and the stamp is the check left to refuse it.
+    let (first_at, second_at) = (extent(first).start as u64, extent(second).start as u64);
+    let page = bytes.get_mut(extent(first)).expect("page");
+    page.copy_from_slice(&second_bytes);
+    crate::test_forge::rebind_moved_frame(page, (0, second_at), (0, first_at))?;
+    let page = bytes.get_mut(extent(second)).expect("page");
+    page.copy_from_slice(&first_bytes);
+    crate::test_forge::rebind_moved_frame(page, (0, first_at), (0, second_at))?;
     std::fs::write(&file, &bytes)?;
 
     let table = Table::recover(test_recover_params(file, checksum))?;
@@ -8447,22 +8457,24 @@ fn a_page_refused_by_its_stamp_is_not_cached() -> crate::Result<()> {
     };
     let first_bytes = bytes.get(extent(first)).expect("page").to_vec();
     let second_bytes = bytes.get(extent(second)).expect("page").to_vec();
-    bytes
-        .get_mut(extent(first))
-        .expect("page")
-        .copy_from_slice(&second_bytes);
-    bytes
-        .get_mut(extent(second))
-        .expect("page")
-        .copy_from_slice(&first_bytes);
+    // Re-bound to where they move, so the pages verify as blocks and the
+    // stamp is what refuses them, after the block reads that could cache them.
+    let (first_at, second_at) = (extent(first).start as u64, extent(second).start as u64);
+    let page = bytes.get_mut(extent(first)).expect("page");
+    page.copy_from_slice(&second_bytes);
+    crate::test_forge::rebind_moved_frame(page, (0, second_at), (0, first_at))?;
+    let page = bytes.get_mut(extent(second)).expect("page");
+    page.copy_from_slice(&first_bytes);
+    crate::test_forge::rebind_moved_frame(page, (0, first_at), (0, second_at))?;
     std::fs::write(&file, &bytes)?;
 
     let table = Table::recover(test_recover_params(file.clone(), checksum))?;
+    let err = table
+        .load_row_group(&group, &PageWant::ALL, ReadCharge::Foreground)
+        .expect_err("a page in another row page's place is refused");
     assert!(
-        table
-            .load_row_group(&group, &PageWant::ALL, ReadCharge::Foreground)
-            .is_err(),
-        "a page in another row page's place is refused",
+        matches!(err, crate::Error::InvalidHeader(_)),
+        "the stamp refuses it, got {err:?}",
     );
 
     std::fs::write(&file, &original)?;
@@ -8536,14 +8548,15 @@ fn a_scan_refuses_row_groups_swapped_whole() -> crate::Result<()> {
     };
     let first_bytes = bytes.get(extent(&first)).expect("group").to_vec();
     let second_bytes = bytes.get(extent(&second)).expect("group").to_vec();
-    bytes
-        .get_mut(extent(&first))
-        .expect("group")
-        .copy_from_slice(&second_bytes);
-    bytes
-        .get_mut(extent(&second))
-        .expect("group")
-        .copy_from_slice(&first_bytes);
+    // Every block is re-bound to where it moves, so each group verifies in
+    // itself and the index is the only thing left that places it.
+    let (first_at, second_at) = (*first.offset(), *second.offset());
+    let group = bytes.get_mut(extent(&first)).expect("group");
+    group.copy_from_slice(&second_bytes);
+    crate::test_forge::rebind_moved_extent(group, 0, second_at, first_at)?;
+    let group = bytes.get_mut(extent(&second)).expect("group");
+    group.copy_from_slice(&first_bytes);
+    crate::test_forge::rebind_moved_extent(group, 0, first_at, second_at)?;
     std::fs::write(&file, &bytes)?;
 
     let table = Table::recover(test_recover_params(file, checksum))?;
@@ -8597,11 +8610,16 @@ fn second_groups_directory_in_the_first(
         from.len(),
         "the two directories are of one length"
     );
-    let foreign = original.get(from).expect("directory").to_vec();
-    bytes
-        .get_mut(into)
-        .expect("directory")
-        .copy_from_slice(&foreign);
+    let foreign = original.get(from.clone()).expect("directory").to_vec();
+    // Re-bound to the first group's place, so it verifies as a block there and
+    // the pages are what refuse it.
+    let directory = bytes.get_mut(into.clone()).expect("directory");
+    directory.copy_from_slice(&foreign);
+    crate::test_forge::rebind_moved_frame(
+        directory,
+        (0, from.start as u64),
+        (0, into.start as u64),
+    )?;
     std::fs::write(file, &bytes)?;
     Ok((first, original))
 }
@@ -8944,14 +8962,15 @@ fn a_zone_block_moved_to_another_group_is_refused() -> crate::Result<()> {
     let a_bytes = bytes.get(extent(&a)).expect("zone block").to_vec();
     let b_bytes = bytes.get(extent(&b)).expect("zone block").to_vec();
     assert_ne!(a_bytes, b_bytes, "the two groups hold other values");
-    bytes
-        .get_mut(extent(&a))
-        .expect("zone block")
-        .copy_from_slice(&b_bytes);
-    bytes
-        .get_mut(extent(&b))
-        .expect("zone block")
-        .copy_from_slice(&a_bytes);
+    // Re-bound to where they move, so the zone blocks verify as blocks and the
+    // group they name is what refuses them.
+    let (a_at, b_at) = (*a.offset(), *b.offset());
+    let block = bytes.get_mut(extent(&a)).expect("zone block");
+    block.copy_from_slice(&b_bytes);
+    crate::test_forge::rebind_moved_frame(block, (0, b_at), (0, a_at))?;
+    let block = bytes.get_mut(extent(&b)).expect("zone block");
+    block.copy_from_slice(&a_bytes);
+    crate::test_forge::rebind_moved_frame(block, (0, a_at), (0, b_at))?;
     std::fs::write(&file, &bytes)?;
 
     // A value of the first group, which its moved-in zones do not cover.
