@@ -1,0 +1,161 @@
+<!doctype html>
+<html lang="en">
+<head>
+<meta charset="utf-8">
+<meta name="viewport" content="width=device-width, initial-scale=1">
+<title>lsm-tree db_bench by host</title>
+<style>
+  :root { --bg: #0d1117; --fg: #c9d1d9; --muted: #8b949e; --line: #30363d; --link: #58a6ff; }
+  body { margin: 0; background: var(--bg); color: var(--fg); font-family: system-ui, -apple-system, sans-serif; }
+  main { max-width: 1100px; margin: 0 auto; padding: 1.5rem 1rem 3rem; }
+  h1 { font-size: 1.4rem; margin: 0 0 .5rem; }
+  p { color: var(--muted); line-height: 1.5; margin: .25rem 0 1rem; }
+  a { color: var(--link); text-decoration: none; }
+  a:hover { text-decoration: underline; }
+  section { border-top: 1px solid var(--line); padding: 1rem 0; }
+  h2 { font-size: 1.05rem; margin: 0 0 .5rem; }
+  .chart { position: relative; height: 300px; }
+  #empty { display: none; }
+</style>
+</head>
+<body>
+<main>
+  <h1>lsm-tree db_bench, one line per host</h1>
+  <p>
+    Each chart overlays the same workload as measured on every bench host, so
+    a change of host reads as two lines rather than as a regression of one.
+    Higher is better. A point is one merge to main; click it to open the
+    commit. &middot; <a href="./">per-host dashboards &rarr;</a>
+    &middot; <a href="../compare/">RocksDB head-to-head &rarr;</a>
+  </p>
+  <p id="empty">No benchmark data has been published yet.</p>
+  <div id="charts"></div>
+</main>
+<script src="https://cdn.jsdelivr.net/npm/chart.js@4.4.4/dist/chart.umd.min.js"></script>
+<script src="data.js"></script>
+<script>
+(function () {
+  // The rate suites: one per host ("lsm-tree db_bench · <os> · <runner>"),
+  // plus the series recorded before hosts were told apart.
+  const PREFIX = "lsm-tree db_bench";
+  const LEGACY_LABEL = "all hosts, before the split";
+  const PALETTE = ["#58a6ff", "#f78166", "#3fb950", "#d2a8ff", "#e3b341", "#79c0ff", "#ff7b72"];
+
+  const data = window.BENCHMARK_DATA;
+  const suites = data ? Object.keys(data.entries).filter(function (name) {
+    return name === PREFIX || name.indexOf(PREFIX + " · ") === 0;
+  }) : [];
+  if (suites.length === 0) {
+    document.getElementById("empty").style.display = "block";
+    return;
+  }
+  const label = function (name) {
+    return name === PREFIX ? LEGACY_LABEL : name.slice(PREFIX.length + 3);
+  };
+  const repo = data.repoUrl || "";
+
+  // Every workload any host measured, in the order it first appears.
+  const benches = [];
+  const units = {};
+  suites.forEach(function (suite) {
+    data.entries[suite].forEach(function (entry) {
+      entry.benches.forEach(function (bench) {
+        if (!(bench.name in units)) {
+          benches.push(bench.name);
+          units[bench.name] = bench.unit;
+        }
+      });
+    });
+  });
+
+  const day = function (ms) {
+    return new Date(ms).toISOString().slice(0, 10);
+  };
+
+  benches.forEach(function (name, index) {
+    const section = document.createElement("section");
+    const title = document.createElement("h2");
+    title.textContent = name + " (" + units[name] + ")";
+    const box = document.createElement("div");
+    box.className = "chart";
+    const canvas = document.createElement("canvas");
+    box.appendChild(canvas);
+    section.appendChild(title);
+    section.appendChild(box);
+    document.getElementById("charts").appendChild(section);
+
+    const datasets = suites.map(function (suite, s) {
+      const color = PALETTE[s % PALETTE.length];
+      const points = [];
+      data.entries[suite].forEach(function (entry) {
+        const bench = entry.benches.find(function (b) { return b.name === name; });
+        if (!bench) {
+          return;
+        }
+        points.push({
+          x: Date.parse(entry.commit.timestamp),
+          y: bench.value,
+          commit: entry.commit,
+        });
+      });
+      points.sort(function (a, b) { return a.x - b.x; });
+      return {
+        label: label(suite),
+        data: points,
+        borderColor: color,
+        backgroundColor: color,
+        pointRadius: 2,
+        borderWidth: 1.5,
+        tension: 0,
+      };
+    }).filter(function (set) { return set.data.length > 0; });
+
+    new Chart(canvas, {
+      type: "line",
+      data: { datasets: datasets },
+      options: {
+        responsive: true,
+        maintainAspectRatio: false,
+        animation: false,
+        parsing: false,
+        interaction: { mode: "nearest", intersect: false },
+        scales: {
+          x: {
+            type: "linear",
+            ticks: { color: "#8b949e", callback: function (value) { return day(value); } },
+            grid: { color: "#21262d" },
+          },
+          y: {
+            beginAtZero: false,
+            ticks: { color: "#8b949e" },
+            grid: { color: "#21262d" },
+          },
+        },
+        plugins: {
+          legend: { labels: { color: "#c9d1d9" } },
+          tooltip: {
+            callbacks: {
+              title: function (items) {
+                const commit = items[0].raw.commit;
+                return commit.id.slice(0, 9) + "  " + day(items[0].raw.x);
+              },
+              afterTitle: function (items) {
+                return items[0].raw.commit.message.split("\n")[0];
+              },
+            },
+          },
+        },
+        onClick: function (_event, elements, chart) {
+          if (!elements.length || !repo) {
+            return;
+          }
+          const point = chart.data.datasets[elements[0].datasetIndex].data[elements[0].index];
+          window.open(repo + "/commit/" + point.commit.id, "_blank", "noopener");
+        },
+      },
+    });
+  });
+})();
+</script>
+</body>
+</html>
