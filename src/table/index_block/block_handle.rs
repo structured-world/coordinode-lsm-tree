@@ -192,7 +192,12 @@ const TAGGED_TRUNCATED: u8 = 5;
 impl KeyedBlockHandle {
     /// Writes the entry's marker (`plain`, or its tagged twin when the entry
     /// names a row group), its handle, its seqno and, when tagged, the group's
-    /// tag and directory length.
+    /// tag, directory length and head zone block length.
+    ///
+    /// The tagged form belongs to columnar format
+    /// [`COLUMNAR_FORMAT_VERSION`](crate::table::meta::COLUMNAR_FORMAT_VERSION)
+    /// of the storage `V6` contract, which changes in place until `V6` is
+    /// released.
     fn encode_head_into<W: crate::io::Write>(
         &self,
         writer: &mut W,
