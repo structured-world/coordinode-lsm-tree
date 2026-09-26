@@ -543,36 +543,40 @@ more stage to batch across tables rather than as a per-table stall.
 ## Row group size
 
 A columnar table cuts its row groups at `columnar_row_group_size_policy`,
-separately from the data block size a row-major table uses. The default is
-still 4 KiB, the size row groups had before pages existed, because the
-measurement below says a larger group is not yet a win on every read.
+separately from the data block size a row-major table uses, and a group's
+rows into row pages at the row page size. The default is still 4 KiB groups
+of one 4 KiB row page, the size row groups had before pages existed; the
+grid below is what a larger default is chosen from.
 
-`db_bench --benchmark mixed-layout --num 70000`, one pass per size, on the
+`db_bench --benchmark mixed-layout --num 70000`, one pass per layout, on the
 scenarios whose fixture is columnar:
 
-| Row group | near-full scan, B/row | its time | sparse scan, B/row | point reads over a columnar base, B/row | their time |
+| Row group / row page | near-full scan, B/row | its time | sparse scan, B/row | point reads over a columnar base, B/row | their time |
 |---|---|---|---|---|---|
-| 4 KiB | 363 | 33.5 ms | 4574 | 330 | 190 ms |
-| 16 KiB | 340 | 19.2 ms | 16196 | 225 | 213 ms |
-| 64 KiB | 324 | 11.7 ms | 28281 | 206 | 295 ms |
-| 128 KiB | 322 | 10.5 ms | 28088 | 205 | 405 ms |
-| 256 KiB | 322 | 10.2 ms | 28053 | 205 | 624 ms |
+| 4 KiB / 4 KiB | 341 | 34-38 ms | 4302 | 216 | 180 ms |
+| 16 KiB / 4 KiB | 341 | 26 ms | 4255 | 216 | 187 ms |
+| 64 KiB / 4 KiB | 339 | 21 ms | 4398 | 215 | 192 ms |
+| 32 KiB / 2 KiB | 356 | 32 ms | 2583 | 225 | 212 ms |
+| 64 KiB / 2 KiB | 354 | 27 ms | 2518 | 225 | 209 ms |
+| 64 KiB / 1 KiB | 377 | 38 ms | 1809 | 241 | 253 ms |
 
-Two costs grow with the group, and neither is the page layout's:
+Neither the sparse scan nor a point read grows with the group any more:
 
 - **Pruning granularity.** A zone-map entry covers a whole group, so a ~1%
-  predicate that prunes most 4 KiB groups prunes few 64 KiB ones, and the
-  sparse scan reads six times the bytes. Statistics zones finer than the
-  group are what the format separates them for.
-- **Work per point read.** A point hit decoded and validated its pages
-  whole, which was linear in the group's rows, so reads that the cache
-  served still slowed down as the group grew. Row pages bound it by the page
-  size instead: a hit decodes the key pages and the row pages that hold the
-  key.
+  predicate that prunes most 4 KiB groups admits most 64 KiB ones. The
+  statistics zones of an admitted group's row pages then prune it down to
+  the row pages that can match, so what the sparse scan reads follows the
+  row page size, not the group size.
+- **Work per point read.** A read resolves the row pages it selects, finds
+  the pages it wants from the directory's grid (a page's index is its
+  part's times the row page count plus its row page) and decodes those
+  alone, so its work follows the pages it reads, not the pages the group
+  has. Before, it walked every directory entry twice, and a point read at
+  64 KiB / 4 KiB took 262-271 ms where it now takes 190-195 ms.
 
-The dense scan is three times faster from 64 KiB up, which is what a larger
-default is for once pruning also scales with the zone rather than with the
-group.
+What a smaller row page still costs is its own framing: the near-full scan
+reads a little more per row, and a point read reads and decodes smaller pages
+that miss the cache more often.
 
 ### What a sparse scan pays per admitted group
 
@@ -588,10 +592,7 @@ rows), each group's reads by role, in bytes per returned row:
 | zone block of the predicate's column | 187 | none |
 | pages past the prefix | 4006 | 212 |
 | total | 6162 | 4308 |
-| **After:** directory | 126 | 76 |
-| zone block of the predicate's column | 82 | none |
-| pages | 4159 | 3937 |
-| total | 4367 | 4013 |
+| **After:** total | 4398 | 4302 |
 
 Four changes removed the difference between the two columns that the scan
 does not need: the index entry records the directory's length, so no fixed
@@ -602,13 +603,16 @@ only a read selecting by the key reads. Every byte left is the directory, the
 predicate column's zone block and the pages of the projected columns on the
 row pages holding a match; the zones prune every other row page.
 
-What remains between the two columns is geometry, not waste: 208 bytes a
-returned row of directory and zone block, spread over the 2.08 matches a
-64 KiB group holds, and a matching 4 KiB row page holding 14 rows where a
-4 KiB group holds 13, because the ingest path cuts a group by a size count
-that charges each one-row batch its own offset. Both are what the group and
-page sizes decide, and those are chosen by measurement over the whole grid of
-scenarios.
+A group and a row page are also cut by one count of a row's size, so a
+4 KiB group and a 4 KiB row page hold the same rows (14 of these records)
+and the two columns compare the same pages.
+
+What remains between them, 96 bytes a returned row, is geometry, not waste:
+a 64 KiB group's directory, which lists sixteen row pages, and the zone
+block of the predicate's column, a block with its own header and group tag,
+spread over the 2.08 matches such a group holds. Both are what the group and
+page sizes decide, and those are chosen by measurement over the whole grid
+of scenarios above.
 
 ## Relationship to the existing partial-decode section
 
