@@ -103,11 +103,13 @@ fn load_meta_from_items_expecting(
     let encoded = DataBlock::encode_into_vec(items, 1, 0.0).unwrap();
 
     let mut buf = Vec::new();
+    // At offset 0 of the file below, where the handle points.
     let _header = Block::write_into(
         &mut buf,
         &encoded,
         crate::table::block::BlockIdentity::for_test(0, BlockType::Meta),
         &crate::table::block::BlockTransform::PLAIN,
+        crate::table::block::ChecksumAt::block(0, BlockType::Meta, 0),
     )
     .unwrap();
 

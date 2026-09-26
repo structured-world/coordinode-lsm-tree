@@ -1,6 +1,10 @@
 use super::*;
 use test_log::test;
 
+/// Where the in-memory round trips below put their block: offset 0 of table
+/// 0, the place a read of the same buffer finds it at.
+const HERE: ChecksumAt = ChecksumAt::table(0, 0);
+
 /// A pathological-but-valid shard config (1 data shard, 255 parity shards)
 /// over a large block makes `shard_bytes * parity_shards` exceed u32. The
 /// parity length must saturate to `u32::MAX` (it is rejected against the actual
@@ -102,7 +106,9 @@ fn write_block_to_tempfile(
     // closes; sync_all flushes before close.
     let header = {
         let mut file = std::fs::File::create(&path)?;
-        let header = Block::write_into(&mut file, data, identity, transform)?;
+        // At offset 0 of the file, where `handle` below points.
+        let at = ChecksumAt::table(identity.table_id, 0);
+        let header = Block::write_into(&mut file, data, identity, transform, at)?;
         file.sync_all()?;
         header
     };
@@ -287,6 +293,7 @@ fn block_roundtrip_uncompressed() -> crate::Result<()> {
             #[cfg(zstd_any)]
             None,
         )?,
+        HERE,
     )?;
 
     {
@@ -300,6 +307,7 @@ fn block_roundtrip_uncompressed() -> crate::Result<()> {
                 #[cfg(zstd_any)]
                 None,
             )?,
+            HERE,
         )?;
         assert_eq!(b"abcdefabcdefabcdef", &*block.data);
     }
@@ -321,6 +329,7 @@ fn block_roundtrip_lz4() -> crate::Result<()> {
             #[cfg(zstd_any)]
             None,
         )?,
+        HERE,
     )?;
 
     {
@@ -334,6 +343,7 @@ fn block_roundtrip_lz4() -> crate::Result<()> {
                 #[cfg(zstd_any)]
                 None,
             )?,
+            HERE,
         )?;
         assert_eq!(b"abcdefabcdefabcdef", &*block.data);
     }
@@ -359,6 +369,7 @@ fn block_reject_absurd_uncompressed_length() {
             None,
         )
         .unwrap(),
+        HERE,
     )
     .unwrap();
 
@@ -386,6 +397,7 @@ fn block_reject_absurd_uncompressed_length() {
             None,
         )
         .unwrap(),
+        HERE,
     );
 
     assert!(
@@ -415,6 +427,7 @@ fn block_zero_uncompressed_length_with_data_fails_decompress() {
             None,
         )
         .unwrap(),
+        HERE,
     )
     .unwrap();
 
@@ -437,6 +450,7 @@ fn block_zero_uncompressed_length_with_data_fails_decompress() {
             None,
         )
         .unwrap(),
+        HERE,
     );
 
     assert!(
@@ -462,6 +476,7 @@ fn frame_with_overstated_length(
         payload,
         BlockIdentity::for_test(0, BlockType::Data),
         transform,
+        HERE,
     )?;
     let mut reader = &buf[..];
     let mut header = Header::decode_from(&mut reader)?;
@@ -491,6 +506,7 @@ fn a_refused_uncompressed_block_still_reports_what_it_produced() -> crate::Resul
         &mut &tampered[..],
         BlockIdentity::for_test(0, BlockType::Data),
         &transform,
+        HERE,
         &mut produced,
     );
     assert!(result.is_err(), "the length mismatch refuses the block");
@@ -563,12 +579,12 @@ fn lz4_corrupted_uncompressed_length_triggers_decompress_error() {
 
     let checksum = Checksum::from_raw(crate::hash::hash128(&compressed));
 
-    let header = Header {
+    let mut header = Header {
         data_length,
         uncompressed_length: uncompressed_length_corrupted,
-        checksum,
         ..Header::test_dummy(BlockType::Data)
     };
+    header.bind_checksum(checksum, HERE);
 
     let mut buf = header.encode_into_vec();
     buf.extend_from_slice(&compressed);
@@ -584,6 +600,7 @@ fn lz4_corrupted_uncompressed_length_triggers_decompress_error() {
             None,
         )
         .unwrap(),
+        HERE,
     );
 
     match result {
@@ -611,6 +628,7 @@ fn block_from_file_reject_absurd_uncompressed_length() {
             None,
         )
         .unwrap(),
+        HERE,
     )
     .unwrap();
 
@@ -671,6 +689,7 @@ fn block_from_file_zero_uncompressed_length_with_data_fails_decompress() {
             None,
         )
         .unwrap(),
+        HERE,
     )
     .unwrap();
 
@@ -724,6 +743,7 @@ fn block_from_reader_reject_absurd_data_length() {
             None,
         )
         .unwrap(),
+        HERE,
     )
     .unwrap();
 
@@ -747,6 +767,7 @@ fn block_from_reader_reject_absurd_data_length() {
             None,
         )
         .unwrap(),
+        HERE,
     );
 
     assert!(
@@ -804,12 +825,12 @@ fn zstd_corrupted_uncompressed_length_triggers_decompress_error() {
 
     let checksum = Checksum::from_raw(crate::hash::hash128(&compressed));
 
-    let header = Header {
+    let mut header = Header {
         data_length,
         uncompressed_length: uncompressed_length_corrupted,
-        checksum,
         ..Header::test_dummy(BlockType::Data)
     };
+    header.bind_checksum(checksum, HERE);
 
     let mut buf = header.encode_into_vec();
     buf.extend_from_slice(&compressed);
@@ -825,6 +846,7 @@ fn zstd_corrupted_uncompressed_length_triggers_decompress_error() {
             None,
         )
         .unwrap(),
+        HERE,
     );
 
     match result {
@@ -853,12 +875,12 @@ fn zstd_decreased_uncompressed_length_triggers_decompress_error() {
 
     let checksum = Checksum::from_raw(crate::hash::hash128(&compressed));
 
-    let header = Header {
+    let mut header = Header {
         data_length,
         uncompressed_length: uncompressed_length_too_small,
-        checksum,
         ..Header::test_dummy(BlockType::Data)
     };
+    header.bind_checksum(checksum, HERE);
 
     let mut buf = header.encode_into_vec();
     buf.extend_from_slice(&compressed);
@@ -874,6 +896,7 @@ fn zstd_decreased_uncompressed_length_triggers_decompress_error() {
             None,
         )
         .unwrap(),
+        HERE,
     );
 
     match result {
@@ -898,6 +921,7 @@ fn block_roundtrip_zstd() -> crate::Result<()> {
             #[cfg(zstd_any)]
             None,
         )?,
+        HERE,
     )?;
 
     {
@@ -911,6 +935,7 @@ fn block_roundtrip_zstd() -> crate::Result<()> {
                 #[cfg(zstd_any)]
                 None,
             )?,
+            HERE,
         )?;
         assert_eq!(b"abcdefabcdefabcdef", &*block.data);
     }
@@ -933,6 +958,7 @@ fn block_write_rejects_oversized_payload() {
             None,
         )
         .unwrap(),
+        HERE,
     );
     assert!(
         matches!(result, Err(crate::Error::DecompressedSizeTooLarge { .. })),
@@ -956,6 +982,7 @@ fn block_roundtrip_zstd_large_data() -> crate::Result<()> {
             #[cfg(zstd_any)]
             None,
         )?,
+        HERE,
     )?;
 
     // Verify compression actually reduced size
@@ -975,6 +1002,7 @@ fn block_roundtrip_zstd_large_data() -> crate::Result<()> {
                 #[cfg(zstd_any)]
                 None,
             )?,
+            HERE,
         )?;
         assert_eq!(&*block.data, &data[..]);
     }
@@ -991,6 +1019,7 @@ fn block_roundtrip_zstd_large_data() -> crate::Result<()> {
 
 #[cfg(feature = "encryption")]
 mod encrypted {
+    use super::HERE;
     use crate::table::block::*;
 
     fn test_provider() -> crate::encryption::Aes256GcmProvider {
@@ -1053,6 +1082,7 @@ mod encrypted {
                 #[cfg(zstd_any)]
                 None,
             )?,
+            HERE,
         )?;
 
         let mut reader = &writer[..];
@@ -1065,6 +1095,7 @@ mod encrypted {
                 #[cfg(zstd_any)]
                 None,
             )?,
+            HERE,
         )?;
         assert_eq!(data, &*block.data);
         Ok(())
@@ -1087,6 +1118,7 @@ mod encrypted {
                 #[cfg(zstd_any)]
                 None,
             )?,
+            HERE,
         )?;
 
         let mut reader = &writer[..];
@@ -1099,6 +1131,7 @@ mod encrypted {
                 #[cfg(zstd_any)]
                 None,
             )?,
+            HERE,
         )?;
         assert_eq!(data, &*block.data);
         Ok(())
@@ -1121,6 +1154,7 @@ mod encrypted {
                 #[cfg(zstd_any)]
                 None,
             )?,
+            HERE,
         )?;
 
         let mut reader = &writer[..];
@@ -1133,6 +1167,7 @@ mod encrypted {
                 #[cfg(zstd_any)]
                 None,
             )?,
+            HERE,
         )?;
         assert_eq!(data, &*block.data);
         Ok(())
@@ -1278,6 +1313,7 @@ mod encrypted {
                 #[cfg(zstd_any)]
                 None,
             )?,
+            HERE,
         )?;
 
         let mut reader = &writer[..];
@@ -1290,6 +1326,7 @@ mod encrypted {
                 #[cfg(zstd_any)]
                 None,
             )?,
+            HERE,
         );
         assert!(
             matches!(result, Err(crate::Error::Decrypt(_))),
@@ -1316,6 +1353,7 @@ mod encrypted {
                 #[cfg(zstd_any)]
                 None,
             )?,
+            HERE,
         )?;
 
         // Tamper a byte in the encrypted payload (after header)
@@ -1435,6 +1473,7 @@ mod encrypted {
                 #[cfg(zstd_any)]
                 None,
             )?,
+            HERE,
         )?;
 
         let mut reader = &writer[..];
@@ -1447,6 +1486,7 @@ mod encrypted {
                 #[cfg(zstd_any)]
                 None,
             )?,
+            HERE,
         )?;
         assert_eq!(&*block.data, &data[..]);
         Ok(())
@@ -1469,6 +1509,7 @@ mod encrypted {
                 #[cfg(zstd_any)]
                 None,
             )?,
+            HERE,
         )?;
 
         let mut reader = &writer[..];
@@ -1481,6 +1522,7 @@ mod encrypted {
                 #[cfg(zstd_any)]
                 None,
             )?,
+            HERE,
         )?;
         assert_eq!(&*block.data, &data[..]);
         Ok(())
@@ -1503,6 +1545,7 @@ mod encrypted {
                 #[cfg(zstd_any)]
                 None,
             )?,
+            HERE,
         )?;
 
         let mut reader = &writer[..];
@@ -1515,6 +1558,7 @@ mod encrypted {
                 #[cfg(zstd_any)]
                 None,
             )?,
+            HERE,
         )?;
         assert_eq!(&*block.data, &data[..]);
         Ok(())
@@ -1559,6 +1603,7 @@ mod zstd_dict {
                 #[cfg(zstd_any)]
                 Some(&dict),
             )?,
+            HERE,
         )?;
 
         let mut reader = &writer[..];
@@ -1571,6 +1616,7 @@ mod zstd_dict {
                 #[cfg(zstd_any)]
                 Some(&dict),
             )?,
+            HERE,
         )?;
         assert_eq!(data, &*block.data);
         Ok(())
@@ -1594,6 +1640,7 @@ mod zstd_dict {
                 #[cfg(zstd_any)]
                 Some(&dict),
             )?,
+            HERE,
         )?;
 
         let dir = tempfile::tempdir()?;
@@ -1637,6 +1684,7 @@ mod zstd_dict {
                 #[cfg(zstd_any)]
                 Some(&dict),
             )?,
+            HERE,
         )?;
 
         assert!(
@@ -1654,6 +1702,7 @@ mod zstd_dict {
                 #[cfg(zstd_any)]
                 Some(&dict),
             )?,
+            HERE,
         )?;
         assert_eq!(&*block.data, &data[..]);
         Ok(())
@@ -1742,6 +1791,7 @@ mod zstd_dict {
                 #[cfg(zstd_any)]
                 Some(&dict),
             )?,
+            HERE,
         )?;
 
         let mut reader = &writer[..];
@@ -1754,6 +1804,7 @@ mod zstd_dict {
                 #[cfg(zstd_any)]
                 Some(&dict),
             )?,
+            HERE,
         )?;
         assert_eq!(data, &*block.data);
         Ok(())
@@ -1779,6 +1830,7 @@ mod zstd_dict {
                 #[cfg(zstd_any)]
                 Some(&dict),
             )?,
+            HERE,
         )?;
 
         let dir = tempfile::tempdir()?;
@@ -1828,6 +1880,7 @@ mod page_ecc {
             PAYLOAD,
             BlockIdentity::for_test(0, BlockType::Data),
             &BlockTransform::PlainEcc(EccParams::RS_4_2),
+            HERE,
         )?;
 
         assert!(
@@ -1845,6 +1898,7 @@ mod page_ecc {
             &mut reader,
             BlockIdentity::for_test(0, BlockType::Data),
             &BlockTransform::PlainEcc(EccParams::RS_4_2),
+            HERE,
         )?;
         assert_eq!(&*block.data, PAYLOAD);
         Ok(())
@@ -1858,6 +1912,7 @@ mod page_ecc {
             PAYLOAD,
             BlockIdentity::for_test(0, BlockType::Data),
             &BlockTransform::PlainEcc(EccParams::RS_4_2),
+            HERE,
         )?;
 
         // Flip a single byte inside the payload region (after
@@ -1873,6 +1928,7 @@ mod page_ecc {
             &mut reader,
             BlockIdentity::for_test(0, BlockType::Data),
             &BlockTransform::PlainEcc(EccParams::RS_4_2),
+            HERE,
         )?;
         // ECC recovery reconstructs the original payload despite
         // the in-flight bit-flip.
@@ -1892,6 +1948,7 @@ mod page_ecc {
             PAYLOAD,
             BlockIdentity::for_test(0, BlockType::Data),
             &BlockTransform::PlainEcc(EccParams::SECDED),
+            HERE,
         )?;
 
         assert!(
@@ -1912,6 +1969,7 @@ mod page_ecc {
             &mut reader,
             BlockIdentity::for_test(0, BlockType::Data),
             &BlockTransform::PlainEcc(EccParams::SECDED),
+            HERE,
         )?;
         assert_eq!(&*block.data, PAYLOAD);
         Ok(())
@@ -1925,6 +1983,7 @@ mod page_ecc {
             PAYLOAD,
             BlockIdentity::for_test(0, BlockType::Data),
             &BlockTransform::PlainEcc(EccParams::SECDED),
+            HERE,
         )?;
 
         // Flip a SINGLE bit inside the payload region: SECDED heals one bit
@@ -1938,6 +1997,7 @@ mod page_ecc {
             &mut reader,
             BlockIdentity::for_test(0, BlockType::Data),
             &BlockTransform::PlainEcc(EccParams::SECDED),
+            HERE,
         )?;
         assert_eq!(
             &*block.data, PAYLOAD,
@@ -1954,6 +2014,7 @@ mod page_ecc {
             PAYLOAD,
             BlockIdentity::for_test(0, BlockType::Data),
             &BlockTransform::PlainEcc(EccParams::SECDED),
+            HERE,
         )?;
 
         // Two bit errors in the same byte (hence the same 8-byte word):
@@ -1967,6 +2028,7 @@ mod page_ecc {
             &mut reader,
             BlockIdentity::for_test(0, BlockType::Data),
             &BlockTransform::PlainEcc(EccParams::SECDED),
+            HERE,
         );
         assert!(
             matches!(&result, Err(crate::Error::PageEccUnrecoverable { .. })),
@@ -2129,7 +2191,7 @@ mod page_ecc {
             .map_err(|e| crate::Error::Io(crate::io::Error::other(e.to_string())))?;
         let oversized = BlockHandle::new(tmp.handle.offset(), oversized_size);
         let file = std::fs::File::open(&path)?;
-        let err = Block::heal_frame(&file, oversized, &transform)
+        let err = Block::heal_frame(&file, oversized, 0, &transform)
             .expect_err("an over-sized block (extra trailing bytes) must be rejected");
         assert!(
             matches!(err, crate::Error::InvalidHeader("Block")),
@@ -2149,7 +2211,7 @@ mod page_ecc {
             &BlockTransform::PLAIN,
         )?;
         assert!(
-            Block::heal_frame(&tmp.file, tmp.handle, &BlockTransform::PLAIN)?.is_none(),
+            Block::heal_frame(&tmp.file, tmp.handle, 0, &BlockTransform::PLAIN)?.is_none(),
             "a block without parity is a heal no-op",
         );
         Ok(())
@@ -2166,7 +2228,7 @@ mod page_ecc {
             &transform,
         )?;
         let oversized = BlockHandle::new(tmp.handle.offset(), u32::MAX);
-        let err = Block::heal_frame(&tmp.file, oversized, &transform)
+        let err = Block::heal_frame(&tmp.file, oversized, 0, &transform)
             .expect_err("oversized handle must be rejected");
         assert!(
             matches!(err, crate::Error::DecompressedSizeTooLarge { .. }),
@@ -2188,7 +2250,7 @@ mod page_ecc {
         // Claim 4 KiB more than the file actually contains: within the size cap,
         // but the read cannot fill the buffer.
         let short = BlockHandle::new(tmp.handle.offset(), tmp.handle.size() + 4096);
-        let err = Block::heal_frame(&tmp.file, short, &transform)
+        let err = Block::heal_frame(&tmp.file, short, 0, &transform)
             .expect_err("a handle past EOF must error, not act on a short read");
         assert!(
             matches!(&err, crate::Error::Io(e) if e.kind() == crate::io::ErrorKind::UnexpectedEof),
@@ -2401,6 +2463,7 @@ mod page_ecc {
                 CompressionContext::new(CompressionType::Lz4)?,
                 EccParams::RS_4_2,
             ),
+            HERE,
         )?;
         assert!(header.block_flags & crate::table::block::header::block_flags::ECC_PARITY != 0);
 
@@ -2417,6 +2480,7 @@ mod page_ecc {
                 CompressionContext::new(CompressionType::Lz4)?,
                 EccParams::RS_4_2,
             ),
+            HERE,
         )?;
         assert_eq!(
             &*block.data, PAYLOAD,
@@ -2443,6 +2507,7 @@ mod page_ecc {
             PAYLOAD,
             BlockIdentity::for_test(0, BlockType::Data),
             &BlockTransform::EncryptedEcc(&enc, EccParams::RS_4_2),
+            HERE,
         )?;
         assert!(header.block_flags & crate::table::block::header::block_flags::ECC_PARITY != 0);
 
@@ -2456,6 +2521,7 @@ mod page_ecc {
             &mut reader,
             BlockIdentity::for_test(0, BlockType::Data),
             &BlockTransform::EncryptedEcc(&enc, EccParams::RS_4_2),
+            HERE,
         )?;
         assert_eq!(
             &*block.data, PAYLOAD,
@@ -2479,6 +2545,7 @@ mod page_ecc {
             PAYLOAD,
             BlockIdentity::for_test(0, BlockType::Data),
             &BlockTransform::PlainEcc(EccParams::RS_4_2),
+            HERE,
         )?;
 
         // Shard size in bytes — same formula as crate::ecc::shard_bytes
@@ -2503,6 +2570,7 @@ mod page_ecc {
             &mut reader,
             BlockIdentity::for_test(0, BlockType::Data),
             &BlockTransform::PlainEcc(EccParams::RS_4_2),
+            HERE,
         );
         match result {
             Ok(_) => panic!(
@@ -2529,6 +2597,7 @@ mod page_ecc {
             &[],
             BlockIdentity::for_test(0, BlockType::Data),
             &BlockTransform::PlainEcc(EccParams::RS_4_2),
+            HERE,
         )?;
         assert_eq!(
             empty.block_flags & block_flags::ECC_PARITY,
@@ -2554,6 +2623,7 @@ mod page_ecc {
             PAYLOAD,
             BlockIdentity::for_test(0, BlockType::Data),
             &BlockTransform::PlainEcc(EccParams::RS_4_2),
+            HERE,
         )?;
         assert_ne!(
             full.block_flags & block_flags::ECC_PARITY,

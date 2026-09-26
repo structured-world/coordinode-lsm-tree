@@ -35,7 +35,8 @@
 //! 1. Block position and owning tree id are intentionally NOT bound in
 //!    AAD (offset-independent so encryption parallelises; tree id is
 //!    process-ephemeral). Same-table and shared-key cross-tree swaps are
-//!    therefore AAD-valid — caught one layer up by the authenticated
+//!    therefore AAD-valid: caught one layer up by the block checksum,
+//!    which is bound to the table id and the block's offset, by the
 //!    index + structural layout, and (cross-tree) by per-tree key
 //!    isolation, not by per-block AEAD.
 //! 2. Cross-table swap (same key, different table_id)
@@ -129,8 +130,9 @@ fn same_table_block_swap_is_not_bound_in_aad() {
     // data blocks of the SAME table are interchangeable at the AEAD layer:
     // presenting B's sealed bytes under A's identity VERIFIES and returns
     // B's plaintext. Block-position integrity is provided one layer up by
-    // the authenticated index (which maps key ranges to offsets) plus the
-    // structural file layout, not by per-block AEAD. If this assertion ever
+    // the block checksum, bound to the table id and the block's offset,
+    // plus the index (which maps key ranges to offsets) and the structural
+    // file layout, not by per-block AEAD. If this assertion ever
     // flips to a failure, someone re-introduced an offset (or other
     // position) field into AAD and broke parallel encryption.
     let chain = key_chain();

@@ -85,7 +85,8 @@ use std::io::Write;
 ///    - `block_size : u32 LE`
 ///    - `section_checksum : u128 LE` (XXH3-128 of the section's
 ///      on-disk Block, copied from the section's
-///      [`crate::table::block::Header::checksum`] at write time)
+///      [`crate::table::block::Header::stored_checksum`] at write time;
+///      manifest blocks are unbound, so it is the payload's checksum)
 ///
 /// The sort makes the digest order-independent: a writer that
 /// reorders sections without changing their content produces the

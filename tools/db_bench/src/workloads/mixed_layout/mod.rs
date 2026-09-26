@@ -50,7 +50,7 @@ use crate::reporter::{Direction, Reporter};
 use crate::workloads::Workload;
 use fixtures::{Fixture, FixtureFn};
 use lsm_tree::table::columnar::COL_USER_KEY;
-use lsm_tree::table::columnar_predicate::ColumnRangePredicate;
+use lsm_tree::table::columnar_predicate::{ColumnRangePredicate, PredicateApply};
 use lsm_tree::{AbstractTree, AnyTree, Guard, SeqNo};
 use std::path::Path;
 use std::sync::atomic::AtomicU64;
@@ -376,6 +376,7 @@ fn field_range(column_id: u16, lo: u64, hi: u64) -> ColumnRangePredicate {
         column_id,
         lower: Some(lo.to_be_bytes().to_vec()),
         upper: Some(hi.to_be_bytes().to_vec()),
+        apply: PredicateApply::Filter,
     }
 }
 

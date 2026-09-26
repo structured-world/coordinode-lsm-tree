@@ -152,6 +152,8 @@ impl PartitionedFilterWriter {
                     t
                 }
             },
+            // Framed ahead of its place in the file; `finish` binds it.
+            crate::table::block::ChecksumAt::Unbound,
         )?;
 
         let bytes_written = header.on_disk_size_with(self.ecc);
@@ -188,6 +190,7 @@ impl PartitionedFilterWriter {
         let mut bytes = vec![];
         IndexBlock::encode_into(&mut bytes, &self.tli_handles)?;
 
+        let at = super::super::next_block_at(self.table_id, file_writer);
         let header = Block::write_into(
             file_writer,
             &bytes,
@@ -216,6 +219,7 @@ impl PartitionedFilterWriter {
                     t
                 }
             },
+            at,
         )?;
 
         let bytes_written = header.on_disk_size_with(self.ecc);
@@ -329,6 +333,26 @@ impl<W: crate::io::Write + crate::io::Seek> FilterWriter<W> for PartitionedFilte
         }
 
         let index_base_offset = BlockOffset(file_writer.get_mut().stream_position()?);
+
+        // The partitions were framed before their place in the file was
+        // known: bind each one's checksum to where it lands now.
+        for handle in &self.tli_handles {
+            let relative = *handle.offset();
+            let frame = usize::try_from(relative)
+                .ok()
+                .and_then(|at| self.final_filter_buffer.get_mut(at..))
+                .ok_or(crate::Error::InvalidHeader(
+                    "filter partition outside its buffer",
+                ))?;
+            crate::table::block::Header::rebind_frame(
+                frame,
+                crate::table::block::ChecksumAt::Unbound,
+                crate::table::block::ChecksumAt::table(
+                    self.table_id,
+                    *index_base_offset + relative,
+                ),
+            )?;
+        }
 
         file_writer.start("filter")?;
         file_writer.write_all(&self.final_filter_buffer)?;

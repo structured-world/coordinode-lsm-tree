@@ -1178,7 +1178,7 @@ pub(crate) fn verify_sst_file_with_context(
             .any(|e| matches!(e, BlockVerifyError::EccParityMismatch { .. }))
         && codec_suspect_for(
             &**fs,
-            path,
+            (path, table_id),
             scheme,
             data_start,
             block_data_length_cap(max_enc_overhead),
@@ -1342,7 +1342,7 @@ fn arbitrate_by_framing(
 /// which is where that gate and the cost of asking at all are handled.
 #[cfg(feature = "std")]
 fn codec_disagrees_everywhere(
-    file: &dyn crate::fs::FsFile,
+    (file, table_id): (&dyn crate::fs::FsFile, crate::TableId),
     toc: &crate::sfa::Toc,
     scheme: ScrubEcc,
     data_start: u64,
@@ -1351,7 +1351,7 @@ fn codec_disagrees_everywhere(
     let regions = descriptor_sized_regions(toc, data_start);
     let mut judged = false;
     for &(start, end) in &regions {
-        match codec_confirms_region(file, scheme, start, end, payload_cap) {
+        match codec_confirms_region((file, table_id), scheme, start, end, payload_cap) {
             // Two different reasons to stay silent, one answer.
             //
             // AGREEMENT refutes the claim outright: a wrong codec does not
@@ -1444,7 +1444,7 @@ enum CodecVerdict {
 /// take the process down instead of reporting corruption.
 #[cfg(feature = "std")]
 fn codec_confirms_region(
-    file: &dyn crate::fs::FsFile,
+    (file, table_id): (&dyn crate::fs::FsFile, crate::TableId),
     scheme: ScrubEcc,
     start: u64,
     end: u64,
@@ -1465,7 +1465,7 @@ fn codec_confirms_region(
         // No codecs to recompute with. The walk cannot recompute parity either,
         // so a same-length impostor is behaviourally identical to the real
         // scheme here and there is nothing to confirm.
-        let _ = (file, params, start, end, payload_cap);
+        let _ = (file, table_id, params, start, end, payload_cap);
         CodecVerdict::NoEvidence
     }
     #[cfg(feature = "page_ecc")]
@@ -1548,8 +1548,14 @@ fn codec_confirms_region(
                 let payload = crate::file::read_exact(file, payload_at, payload_size);
                 let trailer = crate::file::read_exact(file, trailer_at, trailer_size);
                 if let (Ok(payload), Ok(trailer)) = (payload, trailer)
-                    // Only a checksum-clean payload is evidence about the codec.
-                    && Checksum::from_raw(crate::hash::hash128(&payload)) == header.checksum
+                    // Only a checksum-clean payload, at its own place, is
+                    // evidence about the codec.
+                    && Checksum::from_raw(crate::hash::hash128(&payload))
+                        == header.payload_checksum(crate::table::block::ChecksumAt::block(
+                            table_id,
+                            header.block_type,
+                            offset,
+                        ))
                 {
                     let fresh = match params {
                         crate::table::block::EccParams::Secded => {
@@ -1874,7 +1880,7 @@ fn read_ecc_params_out_of_band(
 #[cfg(feature = "std")]
 fn codec_suspect_for(
     fs: &dyn crate::fs::Fs,
-    path: &std::path::Path,
+    (path, table_id): (&std::path::Path, crate::TableId),
     scheme: ScrubEcc,
     data_start: u64,
     payload_cap: u64,
@@ -1886,7 +1892,7 @@ fn codec_suspect_for(
         return false;
     };
     codec_disagrees_everywhere(
-        probe.as_ref(),
+        (probe.as_ref(), table_id),
         sfa_reader.toc(),
         scheme,
         data_start,
@@ -2943,14 +2949,21 @@ fn walk_block_region(ctx: &mut WalkCtx<'_>, start_offset: u64, end_offset: u64) 
         }
 
         let computed = Checksum::from_raw(crate::hash::hash128(ctx.data_buf));
-        let payload_clean = computed == header.checksum;
+        // Verified at the offset the walk found it at: a block written at
+        // another block's place is corrupt here, however clean its payload.
+        let expected = header.payload_checksum(crate::table::block::ChecksumAt::block(
+            ctx.table_id,
+            header.block_type,
+            offset,
+        ));
+        let payload_clean = computed == expected;
         if !payload_clean {
             ctx.errors.push(BlockVerifyError::DataCorrupted {
                 table_id: ctx.table_id,
                 path: ctx.path.to_path_buf(),
                 offset,
                 data_length: header.data_length,
-                expected: header.checksum,
+                expected,
                 got: computed,
             });
         }

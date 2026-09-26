@@ -10,6 +10,7 @@ fn empty_scan(metrics: alloc::sync::Arc<crate::Metrics>) -> ColumnarScan {
         buffered: alloc::collections::VecDeque::new(),
         projection: Vec::new(),
         predicate: None,
+        support: PredicateSupport::Exact,
         comparator: crate::comparator::default_comparator(),
         seqno: SeqNo::MAX,
         lo: Bound::Unbounded,

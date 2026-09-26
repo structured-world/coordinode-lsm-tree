@@ -34,7 +34,7 @@ use crate::{
         footer::{FooterPayload, TocEntry},
     },
     runtime_config::RuntimeConfig,
-    table::block::{Block, BlockIdentity, BlockTransform, BlockType},
+    table::block::{Block, BlockIdentity, BlockTransform, BlockType, ChecksumAt},
 };
 use alloc::collections::BTreeSet;
 use alloc::sync::Arc;
@@ -274,12 +274,15 @@ impl ManifestArchiveWriter {
             window_log: 0,
         };
 
+        // Written byte for byte at the tail and, mirrored, at the head: one
+        // encoding serves both slots only unbound.
         let mut footer_block_bytes = Vec::new();
         Block::write_into(
             &mut footer_block_bytes,
             &payload_bytes,
             identity,
             &self.block_transform(),
+            ChecksumAt::Unbound,
         )?;
 
         // Safety-net check per Q12: hard 4 KiB ceiling on footer
@@ -384,12 +387,15 @@ impl ManifestArchiveWriter {
             window_log: 0,
         };
 
+        // A section is found through its TOC entry, which commits its checksum,
+        // so its stored checksum stays unbound.
         let mut block_bytes = Vec::new();
         Block::write_into(
             &mut block_bytes,
             &section.buf,
             identity,
             &self.block_transform(),
+            ChecksumAt::Unbound,
         )?;
 
         // Symmetric with the reader's `MAX_MANIFEST_BLOCK_SIZE`
@@ -441,7 +447,9 @@ impl ManifestArchiveWriter {
             use crate::coding::Decode;
             use crate::table::block::Header;
             let mut cursor = crate::io::Cursor::new(block_bytes.as_slice());
-            Header::decode_from(&mut cursor)?.checksum.into_u128()
+            Header::decode_from(&mut cursor)?
+                .stored_checksum
+                .into_u128()
         };
 
         self.toc.push(TocEntry {

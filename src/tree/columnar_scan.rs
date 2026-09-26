@@ -61,12 +61,17 @@ use core::ops::{Bound, RangeBounds};
 
 use alloc::{vec, vec::Vec};
 
+use alloc::borrow::Cow;
+
 use crate::comparator::UserComparator;
 use crate::table::SeqnoVisibility;
 use crate::table::columnar::{
-    COL_SEQNO, COL_USER_KEY, COL_VALUE_TYPE, ColumnBatch, TypeTag, bytes_column_row, fixed_u64_row,
+    COL_SEQNO, COL_USER_KEY, COL_VALUE_TYPE, ColumnBatch, Number, TypeTag, bytes_column_row,
+    fixed_u64_row,
 };
-use crate::table::columnar_predicate::{ColumnRangePredicate, filter_batch, take_rows};
+use crate::table::columnar_predicate::{
+    ColumnRangePredicate, PredicateApply, PredicateSupport, filter_batch, take_rows,
+};
 use crate::{Error, SeqNo, Table, Tree, UserKey};
 
 /// A visible columnar segment selected for the scan, with its cached key range,
@@ -226,6 +231,7 @@ impl Tree {
             buffered: Vec::new().into(),
             projection: projection.to_vec(),
             predicate: predicate.cloned(),
+            support: PredicateSupport::Exact,
             comparator,
             seqno,
             lo,
@@ -277,6 +283,8 @@ pub struct ColumnarScan {
     buffered: alloc::collections::VecDeque<ColumnBatch>,
     projection: Vec<u16>,
     predicate: Option<ColumnRangePredicate>,
+    /// The weakest [`PredicateSupport`] over the segments read so far.
+    support: PredicateSupport,
     comparator: alloc::sync::Arc<dyn UserComparator>,
     /// The query snapshot, used for per-row seqno visibility masking.
     seqno: SeqNo,
@@ -293,6 +301,19 @@ pub struct ColumnarScan {
 }
 
 impl ColumnarScan {
+    /// How far the scan's predicate ran over the segments read so far, or
+    /// `None` when the scan has no predicate: the weakest answer of any
+    /// segment, so it only ever falls as the scan goes, and is the answer for
+    /// the whole scan once it is exhausted.
+    ///
+    /// [`PredicateSupport::Exact`] means every row yielded matches;
+    /// [`PredicateSupport::PruneOnly`] and [`PredicateSupport::Unsupported`]
+    /// mean the rows still need the caller's own check.
+    #[must_use]
+    pub fn predicate_support(&self) -> Option<PredicateSupport> {
+        self.predicate.as_ref().map(|_| self.support)
+    }
+
     /// Records the bytes a gather moved.
     ///
     /// The figure is the SIZE OF THE RESULT — what the operation wrote into a
@@ -321,12 +342,39 @@ impl ColumnarScan {
     /// batches. A singleton group streams its segment's batches (masking by seqno
     /// only when the snapshot straddles the segment); an overlapping group is
     /// row-merged with newest-effective-seqno-wins dedup.
-    fn process_group(&self, group: &Group) -> crate::Result<Vec<ColumnBatch>> {
+    ///
+    /// Lowers `support` to how far the predicate ran over the group.
+    fn process_group(
+        &self,
+        group: &Group,
+        support: &mut PredicateSupport,
+    ) -> crate::Result<Vec<ColumnBatch>> {
         let rts = self.visible_group_range_tombstones(&group.segments)?;
         if let [seg] = group.segments.as_slice() {
-            return self.process_singleton(seg, &rts);
+            return self.process_singleton(seg, &rts, support);
         }
-        self.merge_group(group, &rts)
+        self.merge_group(group, &rts, support)
+    }
+
+    /// Applies the scan's predicate to `batch` after the dedup, when it filters,
+    /// and lowers `support` to how far it ran there.
+    fn filter_after_dedup(
+        &self,
+        batch: ColumnBatch,
+        pred: Option<&ColumnRangePredicate>,
+        support: &mut PredicateSupport,
+    ) -> crate::Result<ColumnBatch> {
+        let Some(pred) = pred else {
+            return Ok(batch);
+        };
+        *support = (*support).min(pred.support_in(&batch));
+        if pred.apply != PredicateApply::Filter {
+            return Ok(batch);
+        }
+        let mask = pred.matching_rows(&batch);
+        let filtered = filter_batch(&batch, &mask)?;
+        self.record_gather(&filtered);
+        Ok(filtered)
     }
 
     /// The range tombstones of `segments` visible to the scan snapshot, with
@@ -450,7 +498,23 @@ impl ColumnarScan {
         &self,
         seg: &Segment,
         rts: &[(UserKey, UserKey, SeqNo)],
+        support: &mut PredicateSupport,
     ) -> crate::Result<Vec<ColumnBatch>> {
+        // Every path below hands the predicate to the segment's table, or
+        // evaluates it before the seqno column is globalized, so it runs in
+        // the table's LOCAL seqno coordinates: a seqno bound is translated by
+        // the segment's base first. A predicate no row of the segment can
+        // satisfy (a seqno range wholly below its base) rules the segment out.
+        let predicate = if let Some(pred) = self.predicate.as_ref() {
+            let Some(local) = localize(pred, seg.global) else {
+                *support = (*support).min(pred.support(Some(TypeTag::Number(Number::U64_LE))));
+                return Ok(Vec::new());
+            };
+            Some(local)
+        } else {
+            None
+        };
+        let predicate = predicate.as_deref();
         // A segment that RECORDS deletions takes the dedup path even when its
         // keys are provably unique: a key whose single row is a tombstone would
         // otherwise stream through verbatim and surface a key the point read
@@ -463,22 +527,15 @@ impl ColumnarScan {
             || seg.table.weak_tombstone_count() > 0
             || !rts.is_empty()
         {
-            return self.process_singleton_dedup(seg, rts);
+            return self.process_singleton_dedup(seg, rts, predicate, support);
         }
         let range_filter = !self.range_is_full();
         if seg.visibility == SeqnoVisibility::All && !range_filter {
-            // The predicate is pushed down in the SST's LOCAL coordinates while
-            // the seqno column is globalized only afterwards. That is sound
-            // today because a `COL_SEQNO` predicate is inert at the SST level:
-            // the zone map omits fixed-width columns (no block-skip entry) and
-            // `matching_rows` treats non-`Bytes` columns as all-matching —
-            // both pinned by tests. Any future comparable encoding for fixed
-            // columns MUST translate seqno bounds by `seg.global` before this
-            // pushdown, or a bulk-ingested segment (rows stored at local
-            // seqnos, returned at global ones) would skip matching blocks.
-            let mut out = seg
-                .table
-                .columnar_scan(&self.projection, self.predicate.as_ref())?;
+            // Pushed down in local coordinates (translated above); the seqno
+            // column is globalized only on the way out.
+            let mut out =
+                seg.table
+                    .columnar_scan_reporting(&self.projection, predicate, support)?;
             out.retain(|b| b.row_count > 0);
             for batch in &mut out {
                 self.globalize_seqnos(batch, seg.global)?;
@@ -505,10 +562,10 @@ impl ColumnarScan {
         let cmp = self.comparator.as_ref();
 
         let mut out = Vec::new();
-        // Same local-coordinate pushdown note as the verbatim path above.
+        // Same local-coordinate pushdown as the verbatim path above.
         for batch in seg
             .table
-            .columnar_scan(&augmented, self.predicate.as_ref())?
+            .columnar_scan_reporting(&augmented, predicate, support)?
         {
             if batch.row_count == 0 {
                 continue;
@@ -585,10 +642,15 @@ impl ColumnarScan {
     /// (mirroring [`Self::merge_group`]): a key whose newest version fails the
     /// predicate is dropped, never served from an older matching version —
     /// which also rules out predicate-driven zone-map block-skip here.
+    ///
+    /// `predicate` is the scan's, in this segment's local coordinates: it runs
+    /// before the seqno column is globalized.
     fn process_singleton_dedup(
         &self,
         seg: &Segment,
         rts: &[(UserKey, UserKey, SeqNo)],
+        predicate: Option<&ColumnRangePredicate>,
+        support: &mut PredicateSupport,
     ) -> crate::Result<Vec<ColumnBatch>> {
         // Decode the columns the dedup needs even when the caller did not
         // project them (dropped again at the end): the key column always, the
@@ -606,7 +668,7 @@ impl ColumnarScan {
         if seqno_needed && !seqno_projected {
             augmented.push(COL_SEQNO);
         }
-        let predicate_col = self.predicate.as_ref().map(|p| p.column_id);
+        let predicate_col = predicate.map(|p| p.column_id);
         let predicate_col_projected = predicate_col.is_some_and(|c| self.projection.contains(&c));
         if let Some(pc) = predicate_col
             && !augmented.contains(&pc)
@@ -735,14 +797,10 @@ impl ColumnarScan {
                 mask.push(!range_filter || key_in_bounds(key, &self.lo, &self.hi, cmp));
             }
 
-            let mut visible = filter_batch(&batch, &mask)?;
+            let visible = filter_batch(&batch, &mask)?;
             self.record_gather(&visible);
             // The predicate runs on the deduped survivors only (see doc).
-            if let Some(pred) = self.predicate.as_ref() {
-                let pred_mask = pred.matching_rows(&visible);
-                visible = filter_batch(&visible, &pred_mask)?;
-                self.record_gather(&visible);
-            }
+            let mut visible = self.filter_after_dedup(visible, predicate, support)?;
             // Match the singleton contract: yield exactly the projected columns.
             if !key_projected {
                 visible.columns.retain(|c| c.column_id != COL_USER_KEY);
@@ -769,10 +827,14 @@ impl ColumnarScan {
     /// Row-merges an overlapping segment group: over the union of the segments'
     /// visible projected rows, keep the newest version of each key (highest
     /// effective seqno), gathered in key order.
+    ///
+    /// The predicate runs last, on the seqno column already rewritten to
+    /// effective seqnos, so it is evaluated in the scan's own coordinates.
     fn merge_group(
         &self,
         group: &Group,
         rts: &[(UserKey, UserKey, SeqNo)],
+        support: &mut PredicateSupport,
     ) -> crate::Result<Vec<ColumnBatch>> {
         // The merge needs each row's key and effective seqno, so decode the
         // intrinsic key + seqno columns even when the caller did not project them
@@ -998,11 +1060,7 @@ impl ColumnarScan {
         // now the newest visible version of its key, so a key whose newest version
         // fails the predicate is correctly dropped instead of falling back to an
         // older matching version.
-        if let Some(pred) = self.predicate.as_ref() {
-            let mask = pred.matching_rows(&merged);
-            merged = filter_batch(&merged, &mask)?;
-            self.record_gather(&merged);
-        }
+        let mut merged = self.filter_after_dedup(merged, self.predicate.as_ref(), support)?;
 
         // Match the singleton contract: yield exactly the projected columns.
         if !key_projected {
@@ -1024,6 +1082,36 @@ impl ColumnarScan {
         }
         Ok(vec![merged])
     }
+}
+
+/// `pred` in the LOCAL coordinates of a segment based at `global`, or `None`
+/// when no row of that segment can match it.
+///
+/// A segment's table stores each row's seqno locally (a bulk-ingested one at
+/// `0`, with one `global_seqno` for all of them) and the scan speaks effective
+/// ones (`local + global`), so a bound on the seqno column is moved down by
+/// `global` before the table's statistics or its row filter see it. A predicate
+/// on any other column is passed as it is.
+fn localize(pred: &ColumnRangePredicate, global: SeqNo) -> Option<Cow<'_, ColumnRangePredicate>> {
+    if pred.column_id != COL_SEQNO || global == 0 {
+        return Some(Cow::Borrowed(pred));
+    }
+    // An unsigned column's ordinal is its value.
+    let (lo, hi) = pred.ordinal_span(Number::U64_LE)?;
+    let global = u128::from(global);
+    // Every row of the segment is at `global` or above: an upper bound below
+    // it admits none, and a lower bound below it admits them from the first,
+    // which is exactly the clamp to local `0`.
+    let hi = hi.checked_sub(global)?;
+    let lo = lo.saturating_sub(global);
+    // Both are below `2^64`: the span is of 8-byte values.
+    let bound = |v: u128| u64::try_from(v).map(|v| v.to_be_bytes().to_vec());
+    Some(Cow::Owned(ColumnRangePredicate {
+        column_id: COL_SEQNO,
+        lower: Some(bound(lo).ok()?),
+        upper: Some(bound(hi).ok()?),
+        apply: pred.apply,
+    }))
 }
 
 /// Whether `key` lies within the requested `[lo, hi]` key bounds, per the tree
@@ -1058,7 +1146,10 @@ impl Iterator for ColumnarScan {
                 return Some(Ok(batch));
             }
             let group = self.groups.pop_front()?;
-            match self.process_group(&group) {
+            let mut support = self.support;
+            let processed = self.process_group(&group, &mut support);
+            self.support = support;
+            match processed {
                 Ok(batches) => self.buffered.extend(batches),
                 Err(e) => return Some(Err(e)),
             }

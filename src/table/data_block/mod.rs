@@ -643,7 +643,8 @@ impl DataBlock {
         let header = crate::table::block::Header {
             block_type: crate::table::block::BlockType::Data,
             block_flags: 0,
-            checksum: crate::checksum::Checksum::from_raw(crate::hash::hash128(&buf)),
+            // In memory only, never written, so bound to no place.
+            stored_checksum: crate::checksum::Checksum::from_raw(crate::hash::hash128(&buf)),
             data_length: len,
             uncompressed_length: len,
         };

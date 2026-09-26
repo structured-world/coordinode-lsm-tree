@@ -120,6 +120,7 @@ impl<W: crate::io::Write + crate::io::Seek> BlockIndexWriter<W> for FullIndexWri
             self.restart_interval,
         )?;
 
+        let at = super::super::next_block_at(self.table_id, file_writer);
         let header = Block::write_into(
             file_writer,
             &bytes,
@@ -152,6 +153,7 @@ impl<W: crate::io::Write + crate::io::Seek> BlockIndexWriter<W> for FullIndexWri
                     t
                 }
             },
+            at,
         )?;
 
         let bytes_written = header.on_disk_size_with(self.ecc);

@@ -55,7 +55,7 @@ use crate::{
         footer::{FooterPayload, TocEntry},
     },
     runtime_config::RuntimeConfig,
-    table::block::{Block, BlockIdentity, BlockTransform, BlockType, Header},
+    table::block::{Block, BlockIdentity, BlockTransform, BlockType, ChecksumAt, Header},
 };
 use alloc::sync::Arc;
 #[cfg(not(feature = "std"))]
@@ -369,10 +369,13 @@ impl ManifestArchiveReader {
             dict_id: 0,
             window_log: 0,
         };
+        // A manifest block is found through its TOC, which commits its
+        // checksum, so its stored checksum is not bound to an offset.
         let block = Block::from_reader(
             &mut Cursor::new(&block_bytes),
             identity,
             &build_transform(&self.runtime, self.encryption.as_deref()),
+            ChecksumAt::Unbound,
         )?;
         // Defence in depth: `Block::from_reader` today does NOT bind
         // `header.block_type` to the caller-supplied `identity.block_type`
@@ -401,7 +404,7 @@ impl ManifestArchiveReader {
         // `section_checksum` is what we hash into the CURRENT
         // pointer's canonical digest, so binding it here makes the
         // chain CURRENT → TOC → section bytes airtight.
-        if block.header.checksum.into_u128() != expected_section_checksum {
+        if block.header.stored_checksum.into_u128() != expected_section_checksum {
             return Err(crate::Error::ManifestSectionInvalid(
                 "section Block checksum does not match TOC entry section_checksum",
             ));
@@ -630,7 +633,14 @@ fn read_tail_footer(
         dict_id: 0,
         window_log: 0,
     };
-    let block = Block::from_reader(&mut Cursor::new(&footer_buf), identity, transform)?;
+    // The footer is written twice, byte for byte, at the head and the tail,
+    // so its checksum cannot be bound to either offset.
+    let block = Block::from_reader(
+        &mut Cursor::new(&footer_buf),
+        identity,
+        transform,
+        ChecksumAt::Unbound,
+    )?;
     if block.header.block_type != BlockType::ManifestFooter {
         return Err(crate::Error::ManifestFooterInvalid(
             "tail footer slot decoded as non-ManifestFooter block",
@@ -670,7 +680,13 @@ fn read_head_footer(
         dict_id: 0,
         window_log: 0,
     };
-    let block = Block::from_reader(&mut Cursor::new(&head_buf), identity, transform)?;
+    // Byte-identical to the tail footer, so unbound like it.
+    let block = Block::from_reader(
+        &mut Cursor::new(&head_buf),
+        identity,
+        transform,
+        ChecksumAt::Unbound,
+    )?;
     if block.header.block_type != BlockType::ManifestFooter {
         return Err(crate::Error::ManifestFooterInvalid(
             "head mirror slot decoded as non-ManifestFooter block",

@@ -59,6 +59,9 @@ impl Checksum {
 pub struct ChecksummedWriter<W: crate::io::Write> {
     inner: W,
     hasher: xxhash_rust::xxh3::Xxh3Default,
+    /// The stream position the next write lands at, counted rather than asked
+    /// for: asking a buffered writer flushes it.
+    position: u64,
 }
 
 // `crate::io::{Write,Seek}` is the std trait (via the std-mode supertrait
@@ -68,27 +71,38 @@ pub struct ChecksummedWriter<W: crate::io::Write> {
 #[cfg(feature = "std")]
 impl<W: crate::io::Write + crate::io::Seek> std::io::Seek for ChecksummedWriter<W> {
     fn seek(&mut self, pos: std::io::SeekFrom) -> std::io::Result<u64> {
-        self.inner.seek(pos)
+        let position = self.inner.seek(pos)?;
+        self.position = position;
+        Ok(position)
     }
 }
 
 #[cfg(not(feature = "std"))]
 impl<W: crate::io::Write + crate::io::Seek> crate::io::Seek for ChecksummedWriter<W> {
     fn seek(&mut self, pos: crate::io::SeekFrom) -> crate::io::Result<u64> {
-        self.inner.seek(pos)
+        let position = self.inner.seek(pos)?;
+        self.position = position;
+        Ok(position)
     }
 }
 
 impl<W: crate::io::Write> ChecksummedWriter<W> {
+    /// Wraps `writer`, which must be positioned at the start of its stream.
     pub fn new(writer: W) -> Self {
         Self {
             inner: writer,
             hasher: xxhash_rust::xxh3::Xxh3Default::new(),
+            position: 0,
         }
     }
 
     pub fn checksum(&self) -> Checksum {
         Checksum::from_raw(self.hasher.digest128())
+    }
+
+    /// The stream position the next write lands at.
+    pub fn position(&self) -> u64 {
+        self.position
     }
 
     pub fn inner_mut(&mut self) -> &mut W {
@@ -103,8 +117,13 @@ impl<W: crate::io::Write> std::io::Write for ChecksummedWriter<W> {
     }
 
     fn write(&mut self, buf: &[u8]) -> std::io::Result<usize> {
-        self.hasher.update(buf);
-        self.inner.write(buf)
+        // Only what the inner writer took is part of the stream: a short
+        // write is retried from its end, and hashing the whole buffer would
+        // hash the retried tail twice.
+        let n = self.inner.write(buf)?;
+        self.hasher.update(buf.get(..n).unwrap_or(buf));
+        self.position += n as u64;
+        Ok(n)
     }
 }
 
@@ -115,7 +134,13 @@ impl<W: crate::io::Write> crate::io::Write for ChecksummedWriter<W> {
     }
 
     fn write(&mut self, buf: &[u8]) -> crate::io::Result<usize> {
-        self.hasher.update(buf);
-        self.inner.write(buf)
+        // As the std impl: only the bytes taken are hashed and counted.
+        let n = self.inner.write(buf)?;
+        self.hasher.update(buf.get(..n).unwrap_or(buf));
+        self.position += n as u64;
+        Ok(n)
     }
 }
+
+#[cfg(all(test, feature = "std"))]
+mod tests;

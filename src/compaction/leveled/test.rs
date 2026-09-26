@@ -882,3 +882,208 @@ fn multi_level_with_both_flags() -> crate::Result<()> {
 
     Ok(())
 }
+
+const MIB: u64 = 1_024 * 1_024;
+
+/// The index the streaming ranking chooses among `candidates`, offered in order.
+fn rank_by_promoted_ratio(candidates: &[MergeCost], overshoot: u64, slack: u64) -> Option<usize> {
+    let mut ranking = MergeRanking::new(overshoot, slack);
+    for (index, cost) in candidates.iter().enumerate() {
+        ranking.offer(*cost, index);
+    }
+    ranking.finish().map(|((_, _, index), _)| index)
+}
+
+/// The runner-up the ranking reports is the cheapest candidate it did not
+/// choose: the overall cheapest when the bound excluded it, the second
+/// cheapest otherwise.
+#[test]
+fn the_ranking_reports_the_cheapest_candidate_it_did_not_choose() {
+    let within = cost(20 * MIB, 60 * MIB);
+    let cheaper_past_bound = cost(1_000 * MIB, 100 * MIB);
+    let dearer = cost(10 * MIB, 90 * MIB);
+    let mut ranking = MergeRanking::new(20 * MIB, 64 * MIB);
+    for (index, c) in [dearer, cheaper_past_bound, within].into_iter().enumerate() {
+        ranking.offer(c, index);
+    }
+    let Some(((_, _, chosen), runner_up)) = ranking.finish() else {
+        panic!("candidates were offered");
+    };
+    assert_eq!(chosen, 2);
+    assert_eq!(runner_up, Some(cheaper_past_bound));
+
+    let mut ranking = MergeRanking::new(u64::MAX, 0);
+    for (index, c) in [dearer, within, cheaper_past_bound].into_iter().enumerate() {
+        ranking.offer(c, index);
+    }
+    let Some(((_, _, chosen), runner_up)) = ranking.finish() else {
+        panic!("candidates were offered");
+    };
+    assert_eq!(chosen, 2);
+    assert_eq!(runner_up, Some(within));
+}
+
+fn cost(promoted: u64, pulled_in: u64) -> MergeCost {
+    MergeCost {
+        promoted,
+        total: promoted + pulled_in,
+    }
+}
+
+/// The smallest merge is not the cheapest way to pay down a level: a merge
+/// promoting 10 MiB into 90 MiB rewrites ten bytes per promoted byte, one
+/// promoting 100 MiB into 150 MiB rewrites 2.5. Ranking by total input alone
+/// took the first, and has to run it ten times to retire what the second
+/// retires once.
+#[test]
+fn a_merge_is_chosen_by_bytes_rewritten_per_promoted_byte() {
+    let small = cost(10 * MIB, 90 * MIB);
+    let large = cost(100 * MIB, 150 * MIB);
+    assert_eq!(
+        rank_by_promoted_ratio(&[small, large], 100 * MIB, 64 * MIB),
+        Some(1),
+        "the candidate that rewrites less per promoted byte wins",
+    );
+}
+
+/// A candidate that promotes far more than the level owes is passed over for
+/// one within the debt, however cheap its ratio, so a level is not asked to
+/// push down much more than its overshoot.
+#[test]
+fn a_merge_promoting_far_past_the_overshoot_loses_to_one_within_it() {
+    let within = cost(20 * MIB, 60 * MIB);
+    let far_past = cost(1_000 * MIB, 100 * MIB);
+    assert!(
+        far_past.cheaper_than(within),
+        "the oversized candidate has the better ratio"
+    );
+    assert_eq!(
+        rank_by_promoted_ratio(&[far_past, within], 20 * MIB, 64 * MIB),
+        Some(1),
+    );
+}
+
+/// When the debt is smaller than any candidate, the cheapest one overall is
+/// still taken: the level has to make progress.
+#[test]
+fn a_level_whose_debt_is_below_every_candidate_still_merges() {
+    let a = cost(200 * MIB, 600 * MIB);
+    let b = cost(300 * MIB, 300 * MIB);
+    assert_eq!(rank_by_promoted_ratio(&[a, b], MIB, 0), Some(1));
+    assert_eq!(rank_by_promoted_ratio(&[], MIB, 0), None);
+}
+
+/// The ratios are compared exactly at byte counts where a cross-product of two
+/// `u64`s would wrap: `u64::MAX / 3 * 2` promoted against `u64::MAX / 2`
+/// rewritten per side, where the rational answer is known.
+#[test]
+fn ratios_are_compared_exactly_near_the_top_of_the_range() {
+    let big = u64::MAX / 4;
+    // 1 rewritten byte per promoted byte against a hair over 1.
+    let exact = MergeCost {
+        promoted: big,
+        total: big,
+    };
+    let slightly_worse = MergeCost {
+        promoted: big - 1,
+        total: big,
+    };
+    assert!(
+        (u128::from(exact.total) * u128::from(slightly_worse.promoted)) > u128::from(u64::MAX),
+        "the cross-product is past what a u64 holds",
+    );
+    assert_eq!(
+        rank_by_promoted_ratio(&[slightly_worse, exact], u64::MAX, 0),
+        Some(1)
+    );
+    assert_eq!(
+        rank_by_promoted_ratio(&[exact, slightly_worse], u64::MAX, 0),
+        Some(0)
+    );
+}
+
+/// Equal ratios keep the earliest candidate, so the same version and hidden
+/// set give the same table set on every call.
+#[test]
+fn equal_ratios_keep_the_earliest_candidate() {
+    let a = cost(10 * MIB, 20 * MIB);
+    let b = cost(20 * MIB, 40 * MIB);
+    for _ in 0..3 {
+        assert_eq!(rank_by_promoted_ratio(&[a, b], u64::MAX, 0), Some(0));
+        assert_eq!(rank_by_promoted_ratio(&[b, a], u64::MAX, 0), Some(0));
+    }
+}
+
+/// Flushes `keys` with `value_len`-byte values as one table and moves it from
+/// L0 to `level`, returning its id.
+fn table_at_level(
+    tree: &crate::AnyTree,
+    seqno: &SequenceNumberCounter,
+    keys: &[&str],
+    value_len: usize,
+    level: u8,
+) -> crate::Result<TableId> {
+    for key in keys {
+        tree.insert(*key, vec![b'v'; value_len], seqno.next());
+    }
+    tree.flush_active_memtable(0)?;
+    let Some(id) = tree
+        .current_version()
+        .level(0)
+        .and_then(|l0| l0.iter().flat_map(|run| run.iter()).map(Table::id).max())
+    else {
+        panic!("the flush wrote a table to L0");
+    };
+    tree.compact(Arc::new(crate::compaction::MoveDown(0, level)), 0)?;
+    Ok(id)
+}
+
+/// The picker itself, over real levels shaped like the issue's example: a
+/// dense region of L2 that a small L1 table overlaps, and a sparser region a
+/// large L1 table overlaps. Merging the small table rewrites 100 KiB to promote
+/// 10; merging the large one rewrites 250 KiB to promote 100. Ranking by total
+/// input took the first.
+#[test]
+fn the_picker_chooses_the_merge_with_the_least_rewriting_per_promoted_byte() -> crate::Result<()> {
+    const KIB: usize = 1_024;
+    let dir = tempfile::tempdir()?;
+    let seqno = SequenceNumberCounter::default();
+    let tree = Config::new(dir.path(), seqno.clone(), SequenceNumberCounter::default())
+        .data_block_compression_policy(crate::config::CompressionPolicy::disabled())
+        .open()?;
+
+    let dense = ["a0", "a1", "a2", "a3", "a4", "a5", "a6", "a7", "a8", "a9"];
+    let sparse = ["b0", "b1", "b2", "b3", "b4", "b5", "b6", "b7", "b8", "b9"];
+    table_at_level(&tree, &seqno, &dense, 9 * KIB, 2)?;
+    let sparse_l2 = table_at_level(&tree, &seqno, &sparse, 15 * KIB, 2)?;
+    table_at_level(&tree, &seqno, &["a3", "a4"], 5 * KIB, 1)?;
+    let large_l1 = table_at_level(
+        &tree,
+        &seqno,
+        &["b1", "b2", "b3", "b4", "b5", "b6", "b7", "b8"],
+        12 * KIB + KIB / 2,
+        1,
+    )?;
+
+    let version = tree.current_version();
+    let (Some(l1), Some(l2)) = (version.level(1), version.level(2)) else {
+        panic!("the fixture fills L1 and L2");
+    };
+    let Some((chosen, _)) = pick_minimal_compaction(
+        l1,
+        l2,
+        &HiddenSet::default(),
+        u64::MAX,
+        64 * 1_024 * 1_024,
+        64 * 1_024 * 1_024,
+        &crate::comparator::DefaultUserComparator,
+    ) else {
+        panic!("a merge candidate exists");
+    };
+    assert_eq!(
+        chosen,
+        [sparse_l2, large_l1].into_iter().collect::<HashSet<_>>(),
+        "the large table over the sparse region is the cheaper merge per promoted byte",
+    );
+    Ok(())
+}

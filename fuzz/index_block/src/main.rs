@@ -50,7 +50,8 @@ fn main() {
                 let index_block = IndexBlock::new(Block {
                     data: bytes.into(),
                     header: lsm_tree::table::block::Header {
-                        checksum: lsm_tree::checksum::Checksum::from_raw(0),
+                        block_flags: 0,
+                        stored_checksum: lsm_tree::checksum::Checksum::from_raw(0),
                         data_length: 0,
                         uncompressed_length: 0,
                         block_type: lsm_tree::table::block::BlockType::Index,

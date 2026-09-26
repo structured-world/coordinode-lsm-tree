@@ -16,7 +16,7 @@ and cannot recover from.
 | Stage | Mechanism | Detects | Corrects | Default |
 |-------|-----------|---------|----------|---------|
 | Memtable (RAM) | Per-KV digest at insert (`AtInsert`) | RAM bit-flip during a record's memtable residence | n/a | off (opt-in) |
-| Data block (disk) | Block XXH3-128 | Bit-rot of the block as written | n/a | always on |
+| Data block (disk) | Block XXH3-128, bound to table id + offset | Bit-rot of the block as written; a valid block read in another block's place | n/a | always on |
 | Data block (disk) | Per-KV digest footer (`AtBlockCompile`) | Which record in a block diverged | n/a | off (opt-in) |
 | Data block (disk) | Page ECC parity trailer | Bit-rot of the block | yes (SEC-DED / XOR / Reed-Solomon) | off (opt-in) |
 | Data block (disk) | AAD-bound AEAD | Tampering, block-swap, codec/epoch relabel + confidentiality | n/a | off (opt-in) |
@@ -34,6 +34,22 @@ decoding, so a single flipped bit on disk surfaces as a typed
 `Error::ChecksumMismatch` rather than a silently wrong value. This baseline is
 part of the on-disk format and cannot be turned off: it is the floor every other
 layer builds on.
+
+A block of a table stores that checksum XORed with `(table_id << 64 | offset)
++ 1`, the table's id and the block's byte offset in the table file packed into
+128 bits (a context checksum).
+The payload still verifies wherever it is read, but the stored value matches it
+only at the place the block was written, so a checksum-valid block served from
+another place (a misdirected read or write, a remapped sector, two blocks
+swapped by a copy error) is refused as `Error::ChecksumMismatch` instead of
+being read as the block the index points at. A meta block is bound to its
+offset alone, since it is what a reader without the manifest learns the table's
+id from. Blocks outside a table (manifest sections, a blob file's meta) are not
+bound. Relocation and salvage, which copy blocks into another table or offset
+with their payloads untouched, re-bind each copied block to where it lands.
+
+The binding is unkeyed, so it detects accidents, not an adversary who can
+rewrite the file: that is what AAD-bound encryption is for.
 
 ## Per-KV checksums
 

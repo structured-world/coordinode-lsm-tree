@@ -165,7 +165,7 @@ fn columnar_groups_of_many_row_pages_survive_major_compaction() {
 #[test]
 fn row_pages_and_their_zones_read_back_under_encryption_and_ecc() {
     use lsm_tree::table::columnar::{COL_USER_KEY, COL_VALUE};
-    use lsm_tree::table::columnar_predicate::ColumnRangePredicate;
+    use lsm_tree::table::columnar_predicate::{ColumnRangePredicate, PredicateApply};
 
     let folder = get_tmp_folder();
     let any = Config::new(
@@ -212,12 +212,14 @@ fn row_pages_and_their_zones_read_back_under_encryption_and_ecc() {
             column_id: COL_USER_KEY,
             lower: Some(key(700)),
             upper: Some(key(709)),
+            apply: PredicateApply::Filter,
         };
         assert_eq!(rows(&by_key), 10, "{label}: a key range");
         let by_value = ColumnRangePredicate {
             column_id: COL_VALUE,
             lower: Some(value(1_500)),
             upper: Some(value(1_500)),
+            apply: PredicateApply::Filter,
         };
         assert_eq!(rows(&by_value), 1, "{label}: one value");
     };

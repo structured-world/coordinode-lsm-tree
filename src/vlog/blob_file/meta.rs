@@ -141,6 +141,9 @@ impl Metadata {
             // never encrypted (see TODO above on blob-level
             // encryption). Plain transform here.
             &crate::table::block::BlockTransform::PLAIN,
+            // A blob file is not a table: its meta is found through its own
+            // section, and its reader parses it from a slice with no place.
+            crate::table::block::ChecksumAt::Unbound,
         )?;
 
         Ok(())
@@ -176,6 +179,7 @@ impl Metadata {
             // never encrypted (see TODO above on blob-level
             // encryption). Plain transform here.
             &crate::table::block::BlockTransform::PLAIN,
+            crate::table::block::ChecksumAt::Unbound,
         )?;
         let block = DataBlock::new(block);
 

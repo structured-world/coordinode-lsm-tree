@@ -8,7 +8,7 @@ fn block_header_serde_roundtrip() -> crate::Result<()> {
     let header = Header {
         block_type: BlockType::Manifest,
         block_flags: block_flags::KV_CHECKSUM_FOOTER | block_flags::COMPRESSED,
-        checksum: Checksum::from_raw(5),
+        stored_checksum: Checksum::from_raw(5),
         data_length: 252_356,
         uncompressed_length: 124_124_124,
     };
@@ -29,7 +29,7 @@ fn block_header_serde_roundtrip_sst_omits_flags_byte() -> crate::Result<()> {
     let header = Header {
         block_type: BlockType::Data,
         block_flags: 0,
-        checksum: Checksum::from_raw(7),
+        stored_checksum: Checksum::from_raw(7),
         data_length: 42,
         uncompressed_length: 42,
     };
@@ -50,7 +50,7 @@ fn block_header_rejects_unknown_block_flags_bit() {
     let header = Header {
         block_type: BlockType::Manifest,
         block_flags: 1 << 4,
-        checksum: Checksum::from_raw(5),
+        stored_checksum: Checksum::from_raw(5),
         data_length: 10,
         uncompressed_length: 10,
     };
@@ -70,7 +70,7 @@ fn block_header_detect_corruption() {
     let header = Header {
         block_type: BlockType::Data,
         block_flags: 0,
-        checksum: Checksum::from_raw(5),
+        stored_checksum: Checksum::from_raw(5),
         data_length: 252_356,
         uncompressed_length: 124_124_124,
     };
@@ -88,4 +88,76 @@ fn block_header_detect_corruption() {
         ),
         "did not detect header corruption",
     );
+}
+
+/// A binding is undone only at the place it was made: one table's offset,
+/// another offset of it, or the same offset of another table all read back a
+/// different payload checksum, and an unbound checksum is the payload's own.
+#[test]
+fn a_bound_checksum_reads_back_only_where_it_was_bound() {
+    let payload = Checksum::from_raw(0x0123_4567_89ab_cdef);
+    let mut header = Header::test_dummy(BlockType::Data);
+    header.bind_checksum(payload, ChecksumAt::table(7, 4096));
+    assert_eq!(header.payload_checksum(ChecksumAt::table(7, 4096)), payload);
+    assert_ne!(header.payload_checksum(ChecksumAt::table(7, 8192)), payload);
+    assert_ne!(header.payload_checksum(ChecksumAt::table(8, 4096)), payload);
+    assert_ne!(header.payload_checksum(ChecksumAt::Unbound), payload);
+
+    header.bind_checksum(payload, ChecksumAt::Unbound);
+    assert_eq!(header.stored_checksum, payload);
+}
+
+/// The binding refuses a misplaced block only because no two places share a
+/// modifier, so the places a packing could confuse are pinned apart: the first
+/// block of table 0 against an unbound block, a table id against an offset,
+/// and neighbouring places at the extremes of both halves.
+#[test]
+fn distinct_places_never_share_a_modifier() {
+    let places = [
+        ChecksumAt::Unbound,
+        ChecksumAt::table(0, 0),
+        ChecksumAt::table(0, 1),
+        ChecksumAt::table(1, 0),
+        ChecksumAt::table(1, 1),
+        ChecksumAt::table(0, u64::MAX - 1),
+        ChecksumAt::table(u64::MAX, 0),
+        ChecksumAt::table(u64::MAX, u64::MAX - 1),
+    ];
+    for (i, a) in places.iter().enumerate() {
+        for b in places.iter().skip(i + 1) {
+            assert_ne!(
+                a.modifier(),
+                b.modifier(),
+                "{a:?} and {b:?} share a modifier"
+            );
+        }
+    }
+}
+
+/// Re-stamping a frame moves its binding and leaves its length and payload as
+/// they were, so a verbatim copy verifies at the place it lands.
+#[test]
+fn a_rebound_frame_verifies_at_its_new_place() -> crate::Result<()> {
+    let payload = Checksum::from_raw(42);
+    let mut header = Header {
+        data_length: 3,
+        uncompressed_length: 3,
+        ..Header::test_dummy(BlockType::Data)
+    };
+    header.bind_checksum(payload, ChecksumAt::table(1, 100));
+    let mut frame = header.encode_into_vec();
+    frame.extend_from_slice(b"abc");
+    let len = frame.len();
+
+    Header::rebind_frame(
+        &mut frame,
+        ChecksumAt::table(1, 100),
+        ChecksumAt::table(2, 900),
+    )?;
+    assert_eq!(frame.len(), len);
+    assert_eq!(frame.get(len - 3..), Some(&b"abc"[..]));
+    let moved = Header::decode_from(&mut &frame[..])?;
+    assert_eq!(moved.payload_checksum(ChecksumAt::table(2, 900)), payload);
+    assert_ne!(moved.payload_checksum(ChecksumAt::table(1, 100)), payload);
+    Ok(())
 }

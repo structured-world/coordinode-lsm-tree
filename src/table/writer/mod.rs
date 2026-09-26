@@ -423,6 +423,26 @@ fn check_group_column_count(batch: &crate::table::columnar::ColumnBatch) -> crat
     Ok(())
 }
 
+/// Where the raw bytes of a verbatim copy were read from: the table they
+/// belong to and the offset of their first block, which the copied blocks'
+/// stored checksums are bound to until the copy re-stamps them.
+#[derive(Clone, Copy, Debug)]
+pub(crate) struct VerbatimSource {
+    /// The source table's id.
+    pub table_id: TableId,
+    /// The source offset of the extent's first block.
+    pub offset: u64,
+}
+
+/// Where the next block `file_writer` receives lands in table `table_id`'s
+/// file: the place its stored checksum is bound to.
+pub(crate) fn next_block_at<W: crate::io::Write + crate::io::Seek>(
+    table_id: TableId,
+    file_writer: &crate::sfa::Writer<ChecksummedWriter<W>>,
+) -> crate::table::block::ChecksumAt {
+    crate::table::block::ChecksumAt::table(table_id, file_writer.get_ref().position())
+}
+
 /// `tag` as the index names a row group, refusing the zero tag no group is
 /// written under.
 #[cfg(feature = "columnar")]
@@ -1491,7 +1511,8 @@ impl Writer {
             kv_flags,
         )?;
         let layout = core::mem::take(&mut prepared.layout);
-        let header = prepared.write_to(&mut self.file_writer)?;
+        let at = next_block_at(self.table_id, &self.file_writer);
+        let header = prepared.write_to(&mut self.file_writer, at)?;
 
         self.register_written_block(
             header,
@@ -1719,9 +1740,10 @@ impl Writer {
         // which is exactly the layout `PageDirectory::contiguous` recorded,
         // then the zone blocks in the order the directory lists them.
         let mut bytes_written = directory_block.on_disk_len(self.ecc);
+        let at = next_block_at(self.table_id, &self.file_writer);
         let mut uncompressed = u64::from(
             directory_block
-                .write_to(&mut self.file_writer)?
+                .write_to(&mut self.file_writer, at)?
                 .uncompressed_length,
         );
         for prepared in pages
@@ -1729,7 +1751,8 @@ impl Writer {
             .map(|(_, _, prepared)| prepared)
             .chain(zone_blocks.into_iter().map(|(_, prepared)| prepared))
         {
-            let header = prepared.write_to(&mut self.file_writer)?;
+            let at = next_block_at(self.table_id, &self.file_writer);
+            let header = prepared.write_to(&mut self.file_writer, at)?;
             bytes_written = bytes_written
                 .checked_add(header.on_disk_size_with(self.ecc))
                 .ok_or(crate::Error::InvalidHeader(
@@ -2241,7 +2264,8 @@ impl Writer {
     /// bit-for-bit at the block's new file offset.
     ///
     /// `raw` MUST be the exact `header.on_disk_size_with(self.ecc)` bytes the
-    /// source wrote for this block (header + payload + ECC trailer); `layout` is
+    /// source wrote for this block (header + payload + ECC trailer), read from
+    /// `source`, whose binding the copy re-stamps for its new place; `layout` is
     /// its inner-zstd block layout (empty for a single-inner block). The inner
     /// layout offsets are decompressed-space and block-relative, so they stay
     /// valid at the new file offset. `entries` are the block's decoded rows, used
@@ -2262,7 +2286,7 @@ impl Writer {
     /// order ([`Self::validate_direct_block_order`]), or the write fails.
     pub(crate) fn append_verbatim_data_block(
         &mut self,
-        raw: &[u8],
+        (raw, source): (&[u8], VerbatimSource),
         header: crate::table::block::Header,
         layout: alloc::vec::Vec<u32>,
         entries: &[InternalValue],
@@ -2287,7 +2311,7 @@ impl Writer {
             ));
         }
         self.append_verbatim_extent(
-            raw,
+            (raw, source),
             u64::from(header.uncompressed_length),
             layout,
             entries,
@@ -2319,7 +2343,7 @@ impl Writer {
     #[cfg(feature = "columnar")]
     pub(crate) fn append_verbatim_row_group(
         &mut self,
-        raw: &[u8],
+        (raw, source): (&[u8], VerbatimSource),
         uncompressed_length: u64,
         group_tag: u64,
         entries: &[InternalValue],
@@ -2332,7 +2356,7 @@ impl Writer {
             ));
         }
         let first_key = self.append_verbatim_extent(
-            raw,
+            (raw, source),
             uncompressed_length,
             Vec::new(),
             entries,
@@ -2384,6 +2408,42 @@ impl Writer {
         }
     }
 
+    /// `raw`, the blocks of one extent copied from `source`, with each block's
+    /// stored checksum moved from its place there to the place it lands here.
+    /// The payloads are not touched.
+    ///
+    /// # Errors
+    ///
+    /// Returns [`crate::Error::InvalidHeader`] when `raw` does not tile into
+    /// whole blocks under this writer's ECC scheme.
+    fn restamp_extent(&self, raw: &[u8], source: VerbatimSource) -> crate::Result<Vec<u8>> {
+        use crate::coding::Decode;
+        use crate::table::block::{ChecksumAt, Header};
+
+        let dest = self.file_writer.get_ref().position();
+        let mut out = raw.to_vec();
+        let mut at = 0usize;
+        while at < out.len() {
+            let frame = out.get_mut(at..).ok_or(crate::Error::InvalidHeader(
+                "verbatim copy: block past the extent",
+            ))?;
+            let len = Header::decode_from(&mut &*frame)?.on_disk_size_with(self.ecc) as usize;
+            if len == 0 || len > frame.len() {
+                return Err(crate::Error::InvalidHeader(
+                    "verbatim copy: extent does not tile into blocks",
+                ));
+            }
+            let relative = at as u64;
+            Header::rebind_frame(
+                frame,
+                ChecksumAt::table(source.table_id, source.offset + relative),
+                ChecksumAt::table(self.table_id, dest + relative),
+            )?;
+            at += len;
+        }
+        Ok(out)
+    }
+
     /// Shared body of the verbatim copies: validates the entries' order,
     /// appends `raw` to the data region, and registers it as one index entry,
     /// naming the row group tagged `group_tag` when the copy is one.
@@ -2393,7 +2453,7 @@ impl Writer {
     )]
     fn append_verbatim_extent(
         &mut self,
-        raw: &[u8],
+        (raw, source): (&[u8], VerbatimSource),
         uncompressed_length: u64,
         layout: alloc::vec::Vec<u32>,
         entries: &[InternalValue],
@@ -2407,6 +2467,7 @@ impl Writer {
         // checksum-repatched) block; `account_direct_block` trusts their order,
         // so validate it before any state mutation.
         self.validate_direct_block_order(entries, comparator)?;
+        let restamped = self.restamp_extent(raw, source)?;
         let Some(inputs) = self.account_direct_block(entries)? else {
             return Ok(None);
         };
@@ -2417,7 +2478,7 @@ impl Writer {
             use std::io::Write;
             // Append straight into the active data region, exactly where
             // `Block::write_to` would have written a freshly-encoded block's bytes.
-            self.file_writer.write_all(raw)?;
+            self.file_writer.write_all(&restamped)?;
         }
         self.register_written_extent(
             bytes_written,
@@ -2540,7 +2601,9 @@ impl Writer {
         };
         // Take the inner-block layout before `write_to` consumes the block.
         let layout = core::mem::take(&mut prepared.layout);
-        let header = prepared.write_to(&mut self.file_writer)?;
+        // Bound here, where its place is known: the workers only prepare.
+        let at = next_block_at(self.table_id, &self.file_writer);
+        let header = prepared.write_to(&mut self.file_writer, at)?;
         // Header is Copy; read the in-flight size before handing it off.
         // Clamp-to-zero: this block's bytes were counted into the in-flight total
         // when queued, so the subtraction stays non-negative.
@@ -2675,6 +2738,7 @@ impl Writer {
                 &self.block_layouts,
             );
 
+            let at = next_block_at(self.table_id, &self.file_writer);
             Block::write_into(
                 &mut self.file_writer,
                 &self.block_buffer,
@@ -2698,6 +2762,7 @@ impl Writer {
                         t
                     }
                 },
+                at,
             )?;
         }
 
@@ -2711,6 +2776,7 @@ impl Writer {
                 &mut self.block_buffer,
                 &self.seqno_bounds_section,
             )?;
+            let at = next_block_at(self.table_id, &self.file_writer);
             Block::write_into(
                 &mut self.file_writer,
                 &self.block_buffer,
@@ -2731,6 +2797,7 @@ impl Writer {
                         t
                     }
                 },
+                at,
             )?;
         }
 
@@ -2744,6 +2811,7 @@ impl Writer {
                 &mut self.block_buffer,
                 &self.zone_map_section,
             )?;
+            let at = next_block_at(self.table_id, &self.file_writer);
             Block::write_into(
                 &mut self.file_writer,
                 &self.block_buffer,
@@ -2764,6 +2832,7 @@ impl Writer {
                         t
                     }
                 },
+                at,
             )?;
         }
 
@@ -2794,6 +2863,7 @@ impl Writer {
             self.block_buffer.clear();
             self.block_buffer
                 .extend_from_slice(delete_bitmap_bytes.as_deref().unwrap_or_default());
+            let at = next_block_at(self.table_id, &self.file_writer);
             Block::write_into(
                 &mut self.file_writer,
                 &self.block_buffer,
@@ -2814,6 +2884,7 @@ impl Writer {
                         t
                     }
                 },
+                at,
             )?;
         }
 
@@ -2826,6 +2897,7 @@ impl Writer {
                 crate::table::locator::build_locator_section(&self.locators, spec)
         {
             self.file_writer.start("locator")?;
+            let at = next_block_at(self.table_id, &self.file_writer);
             Block::write_into(
                 &mut self.file_writer,
                 &section,
@@ -2848,6 +2920,7 @@ impl Writer {
                         t
                     }
                 },
+                at,
             )?;
         }
 
@@ -2880,6 +2953,7 @@ impl Writer {
                 self.block_buffer.write_u64::<LE>(rt.seqno)?;
             }
 
+            let at = next_block_at(self.table_id, &self.file_writer);
             Block::write_into(
                 &mut self.file_writer,
                 &self.block_buffer,
@@ -2904,6 +2978,7 @@ impl Writer {
                         t
                     }
                 },
+                at,
             )?;
         }
 
@@ -3094,6 +3169,7 @@ impl Writer {
         // the two copies, but both decrypt to the same plaintext
         // IndexBlock.
         self.file_writer.start("tli_tail")?;
+        let at = next_block_at(self.table_id, &self.file_writer);
         Block::write_into(
             &mut self.file_writer,
             &tli_bytes,
@@ -3122,6 +3198,7 @@ impl Writer {
                     t
                 }
             },
+            at,
         )?;
 
         // TAIL meta — the canonical, authoritative copy. `file_size`
@@ -3567,6 +3644,11 @@ fn write_meta_section<W: crate::io::Write + crate::io::Seek>(
     block_buffer.clear();
     DataBlock::encode_into(block_buffer, &meta_items, 1, 0.0)?;
 
+    let at = crate::table::block::ChecksumAt::block(
+        table_id,
+        crate::table::block::BlockType::Meta,
+        file_writer.get_ref().position(),
+    );
     Block::write_into(
         file_writer,
         block_buffer,
@@ -3605,6 +3687,7 @@ fn write_meta_section<W: crate::io::Write + crate::io::Seek>(
                 t
             }
         },
+        at,
     )?;
 
     Ok(())

@@ -215,15 +215,15 @@ fn assert_entries_eq(a: &[InternalValue], b: &[InternalValue]) {
 
 #[test]
 fn delta_codec_round_trips_fixed8_column() {
-    // A fixed-8 (u64) column auto-selects Delta and must round-trip exactly,
-    // including a repeat and a decrease (wrapping delta).
+    // The seqno column (a u64 number) auto-selects Delta and must round-trip
+    // exactly, including a repeat and a decrease (wrapping delta).
     let seqnos: [u64; 5] = [100, 105, 105, 200, 199];
     let data: Vec<u8> = seqnos.iter().flat_map(|s| s.to_le_bytes()).collect();
     let batch = ColumnBatch {
         row_count: 5,
         columns: vec![Column {
             column_id: 1,
-            type_tag: TypeTag::Fixed(8),
+            type_tag: TypeTag::Number(crate::table::columnar::Number::U64_LE),
             validity: None,
             data: data.clone().into(),
         }],
@@ -1241,12 +1241,12 @@ fn column_batch_match_entries_rejects_a_zero_row_block() {
 }
 
 #[test]
-fn zone_stats_records_per_bytes_column_ranges_and_omits_fixed_columns() {
-    // A columnar block's zone map must carry one entry PER Bytes column (the
-    // user-key column AND the value column), each with the raw-byte min / max
-    // over its rows — not just a single synthetic key-range column. The fixed
-    // seqno and value-type columns have no comparable encoding and are omitted,
-    // so a block-skip over them stays conservative.
+fn zone_stats_records_every_ordered_column_and_omits_opaque_ones() {
+    // A columnar block's zone map must carry one entry PER ordered column (the
+    // user-key and value Bytes columns, and the seqno number column), each
+    // with the min / max of its comparable encoding over its rows — not just a
+    // single synthetic key-range column. The opaque fixed value-type column has
+    // no order and is omitted, so a block-skip over it stays conservative.
     let batch = entries_to_column_batch(&[
         entry(b"alpha", 3, ValueType::Value, b"mval"),
         entry(b"gamma", 2, ValueType::Value, b"aval"),
@@ -1256,14 +1256,21 @@ fn zone_stats_records_per_bytes_column_ranges_and_omits_fixed_columns() {
 
     let stats = batch.zone_stats();
 
-    // Exactly the two Bytes columns (user key = 0, value = 3), in column order;
-    // the fixed seqno (1) and value-type (2) columns are absent.
+    // User key = 0, seqno = 1 and value = 3, in column order; the value-type
+    // column (2) is absent.
     let ids: Vec<u32> = stats.iter().map(|s| s.column_id).collect();
     assert_eq!(
         ids,
-        vec![u32::from(COL_USER_KEY), u32::from(COL_VALUE)],
-        "only the Bytes columns get a zone-map entry, in column order",
+        vec![
+            u32::from(COL_USER_KEY),
+            u32::from(COL_SEQNO),
+            u32::from(COL_VALUE)
+        ],
+        "only the ordered columns get a zone-map entry, in column order",
     );
+    // The seqno range in its comparable (big-endian) encoding.
+    assert_eq!(stats[1].min, 1u64.to_be_bytes());
+    assert_eq!(stats[1].max, 3u64.to_be_bytes());
 
     let key_stat = &stats[0];
     assert_eq!(
@@ -1279,7 +1286,7 @@ fn zone_stats_records_per_bytes_column_ranges_and_omits_fixed_columns() {
     // Bytes wire tag (see `TypeTag::to_wire`).
     assert_eq!(key_stat.type_tag, 1);
 
-    let val_stat = &stats[1];
+    let val_stat = &stats[2];
     assert_eq!(
         val_stat.min, b"aval",
         "value min is the byte-wise minimum value, independent of key order",
@@ -1298,6 +1305,7 @@ fn zone_stats_records_per_bytes_column_ranges_and_omits_fixed_columns() {
         column_id: COL_VALUE,
         lower: None,
         upper: Some(b"aaaa".to_vec()),
+        apply: crate::table::columnar_predicate::PredicateApply::Filter,
     };
     assert!(
         below.can_skip_block(&stats),

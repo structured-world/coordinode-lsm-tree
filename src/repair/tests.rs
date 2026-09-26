@@ -6210,6 +6210,7 @@ fn forge_tail_meta_table_id(
     let header_len = Header::header_len(header.block_type);
     let payload_range =
         block_off + header_len..block_off + header_len + header.data_length as usize;
+    let old = crate::hash::hash128(bytes.get(payload_range.clone()).unwrap_or(&[]));
     {
         let Some(payload) = bytes.get_mut(payload_range.clone()) else {
             panic!("meta payload within the file");
@@ -6269,11 +6270,7 @@ fn forge_tail_meta_table_id(
     let Some(payload) = bytes.get(payload_range.clone()) else {
         panic!("meta payload within the file");
     };
-    let new_checksum = crate::Checksum::from_raw(crate::hash::hash128(payload));
-    let new_header = Header {
-        checksum: new_checksum,
-        ..header
-    };
+    let new_header = crate::test_forge::restamp(header, old, payload);
     let mut hdr_bytes = Vec::with_capacity(header_len);
     new_header.encode_into(&mut hdr_bytes)?;
     let Some(hdr_dst) = bytes.get_mut(block_off..block_off + header_len) else {
@@ -6461,6 +6458,7 @@ fn forge_unrecognized_ecc_descriptor(path: &std::path::Path) -> crate::Result<()
         let header_len = Header::header_len(header.block_type);
         let payload_range =
             block_off + header_len..block_off + header_len + header.data_length as usize;
+        let old = crate::hash::hash128(bytes.get(payload_range.clone()).unwrap_or(&[]));
         {
             let Some(payload) = bytes.get_mut(payload_range.clone()) else {
                 panic!("meta payload within the file");
@@ -6493,13 +6491,8 @@ fn forge_unrecognized_ecc_descriptor(path: &std::path::Path) -> crate::Result<()
             assert_ne!(value, forged, "descriptor not already forged");
             value.copy_from_slice(&forged);
         }
-        let new_checksum = crate::Checksum::from_raw(crate::hash::hash128(
-            bytes.get(payload_range).unwrap_or(&[]),
-        ));
-        let new_header = Header {
-            checksum: new_checksum,
-            ..header
-        };
+        let new_header =
+            crate::test_forge::restamp(header, old, bytes.get(payload_range).unwrap_or(&[]));
         let mut hdr_bytes = Vec::with_capacity(header_len);
         new_header.encode_into(&mut hdr_bytes)?;
         let Some(hdr_dst) = bytes.get_mut(block_off..block_off + header_len) else {

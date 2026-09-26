@@ -382,7 +382,7 @@ fn synthetic_header(len: usize) -> Header {
     Header {
         block_type: BlockType::Data,
         block_flags: 0,
-        checksum: Checksum::from_raw(0),
+        stored_checksum: Checksum::from_raw(0),
         data_length: len,
         uncompressed_length: len,
     }

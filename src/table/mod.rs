@@ -1679,7 +1679,14 @@ impl Table {
                 .checked_add(header.data_length as usize)
                 .and_then(|payload_end| raw.get(header_len..payload_end))
                 .is_some_and(|payload| {
-                    crate::hash::hash128(payload) == header.checksum.into_u128()
+                    crate::hash::hash128(payload)
+                        == header
+                            .payload_checksum(crate::table::block::ChecksumAt::block(
+                                table_id.table_id(),
+                                block_type,
+                                *handle.offset(),
+                            ))
+                            .into_u128()
                 });
             (header == block.header
                 && payload_checksum_ok
@@ -3100,7 +3107,14 @@ impl Table {
                             .checked_add(raw_header.data_length as usize)
                             .and_then(|payload_end| raw.get(header_len..payload_end))
                             .is_some_and(|payload| {
-                                crate::hash::hash128(payload) == raw_header.checksum.into_u128()
+                                crate::hash::hash128(payload)
+                                    == raw_header
+                                        .payload_checksum(crate::table::block::ChecksumAt::block(
+                                            self.id(),
+                                            role,
+                                            block_offset,
+                                        ))
+                                        .into_u128()
                             });
                         if !payload_ok {
                             report.uncorrectable_blocks += 1;
@@ -3208,6 +3222,7 @@ impl Table {
                         let frame = match crate::table::block::Block::heal_frame(
                             file.as_ref(),
                             handle,
+                            self.id(),
                             &transform,
                         ) {
                             Ok(Some((frame, _kind))) => frame,
@@ -3406,7 +3421,14 @@ impl Table {
                     .checked_add(raw_header.data_length as usize)
                     .and_then(|payload_end| raw.get(header_len..payload_end))
                     .is_some_and(|payload| {
-                        crate::hash::hash128(payload) == raw_header.checksum.into_u128()
+                        crate::hash::hash128(payload)
+                            == raw_header
+                                .payload_checksum(crate::table::block::ChecksumAt::block(
+                                    self.id(),
+                                    role,
+                                    block_offset,
+                                ))
+                                .into_u128()
                     });
                 if !payload_ok {
                     return Ok(None);
@@ -3424,7 +3446,7 @@ impl Table {
                 }
             }
             Ok(crate::table::util::BlockScrubOutcome::Corrected { .. }) => {
-                match crate::table::block::Block::heal_frame(file, handle, transform) {
+                match crate::table::block::Block::heal_frame(file, handle, self.id(), transform) {
                     Ok(Some((frame, _kind))) => Ok(Some((block_offset, frame))),
                     // A confirming re-read that is now clean: a transient fault the
                     // first read hit and this one did not, so nothing to persist.
@@ -7431,9 +7453,13 @@ impl Table {
     /// # Errors
     ///
     /// Propagates a corruption / decode error (the resolver surfaces it).
+    ///
+    /// `offset` is where in the table file `bytes` were read from, which the
+    /// block's stored checksum must be bound to.
     pub(crate) fn decode_data_block_from_bytes(
         &self,
         bytes: &[u8],
+        offset: u64,
     ) -> crate::Result<Option<DataBlock>> {
         let transform = crate::table::util::build_block_transform(
             self.metadata.data_block_compression,
@@ -7457,6 +7483,7 @@ impl Table {
             &mut crate::io::Cursor::new(bytes),
             identity,
             &transform,
+            crate::table::block::ChecksumAt::table(identity.table_id, offset),
             &mut produced,
         );
         #[cfg(feature = "metrics")]
@@ -7584,11 +7611,16 @@ impl Table {
     /// carrying only the projected columns.
     ///
     /// `projection` lists the column ids to decode; every other column is
-    /// stepped over without decoding. When `predicate` is set, a block whose
-    /// zone-map proves it out of range is skipped without being loaded, and each
-    /// surviving block is filtered to the rows that match.
+    /// stepped over without decoding. When `predicate` is set, a block or row
+    /// page whose statistics prove it out of range is skipped without being
+    /// loaded, and, unless the predicate only prunes, each surviving one is
+    /// filtered to the rows that match. How far the predicate ran is what
+    /// [`ColumnRangePredicate::support_in`] says for the returned batches'
+    /// column type; [`Tree::columnar_scan`](crate::Tree::columnar_scan)
+    /// reports it for a whole scan.
     ///
     /// [`ColumnBatch`]: crate::table::columnar::ColumnBatch
+    /// [`ColumnRangePredicate::support_in`]: crate::table::columnar_predicate::ColumnRangePredicate::support_in
     ///
     /// # Errors
     ///
@@ -7600,6 +7632,23 @@ impl Table {
         projection: &[u16],
         predicate: Option<&crate::table::columnar_predicate::ColumnRangePredicate>,
     ) -> crate::Result<Vec<crate::table::columnar::ColumnBatch>> {
+        let mut support = crate::table::columnar_predicate::PredicateSupport::Exact;
+        self.columnar_scan_reporting(projection, predicate, &mut support)
+    }
+
+    /// [`Self::columnar_scan`], lowering `support` to how far `predicate` ran
+    /// over every block it decoded. A block or row page the statistics skipped
+    /// leaves it as it is: only an ordered column has statistics, and the skip
+    /// proved none of its rows match.
+    #[cfg(feature = "columnar")]
+    pub(crate) fn columnar_scan_reporting(
+        &self,
+        projection: &[u16],
+        predicate: Option<&crate::table::columnar_predicate::ColumnRangePredicate>,
+        support: &mut crate::table::columnar_predicate::PredicateSupport,
+    ) -> crate::Result<Vec<crate::table::columnar::ColumnBatch>> {
+        use crate::table::columnar_predicate::PredicateApply;
+
         if !self.metadata.columnar {
             return Err(crate::Error::FeatureUnsupported("columnar"));
         }
@@ -7750,8 +7799,12 @@ impl Table {
                     }
                     None => None,
                 };
-                let mut batch = if predicate.is_some() || has_deletes || bound_mask.is_some() {
-                    let mut keep = match predicate {
+                if let Some(pred) = predicate {
+                    *support = (*support).min(pred.support_in(&batch));
+                }
+                let filter = predicate.filter(|p| p.apply == PredicateApply::Filter);
+                let mut batch = if filter.is_some() || has_deletes || bound_mask.is_some() {
+                    let mut keep = match filter {
                         Some(pred) => pred.matching_rows(&batch),
                         None => alloc::vec![true; row_count as usize],
                     };

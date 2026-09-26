@@ -791,7 +791,9 @@ fn run_hex(path: &std::path::Path, offset: u64, len: u64, no_header: bool) -> Ex
                     "  uncompressed_length: {} bytes",
                     header.uncompressed_length,
                 );
-                println!("  checksum (XXH3):     {:?}", header.checksum);
+                // As stored: a table block's XXH3 bound to its table id and
+                // offset, so it equals the payload's XXH3 only when unbound.
+                println!("  stored checksum:     {:?}", header.stored_checksum);
             }
             Err(e) => {
                 // Decode failure is informational — the caller may be

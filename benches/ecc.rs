@@ -188,8 +188,14 @@ fn bench_clean_read(c: &mut Criterion) {
                     &FsOpenOptions::new().write(true).create(true).read(true),
                 )
                 .expect("open mem file");
-            let header =
-                Block::write_into(&mut file, &payload, identity, &transform).expect("write block");
+            let header = Block::write_into(
+                &mut file,
+                &payload,
+                identity,
+                &transform,
+                lsm_tree::table::block::ChecksumAt::table(0, 0),
+            )
+            .expect("write block");
             // `on_disk_size_with` sizes the frame under the block's ACTUAL
             // scheme; the plain `on_disk_size` assumes the legacy RS(4,2)
             // layout for flagged blocks.

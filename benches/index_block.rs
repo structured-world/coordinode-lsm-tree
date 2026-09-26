@@ -51,7 +51,7 @@ fn bench_index_block_seek(c: &mut Criterion) {
             header: lsm_tree::table::block::Header {
                 block_type: lsm_tree::table::block::BlockType::Index,
                 block_flags: 0,
-                checksum: Checksum::from_raw(0),
+                stored_checksum: Checksum::from_raw(0),
                 data_length: data_len,
                 uncompressed_length: data_len,
             },

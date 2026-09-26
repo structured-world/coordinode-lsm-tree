@@ -178,6 +178,7 @@ impl<W: crate::io::Write + crate::io::Seek> FilterWriter<W> for FullFilterWriter
         #[cfg(not(feature = "std"))]
         log::trace!("Built BuRR filter ({}B)", filter_bytes.len());
 
+        let at = super::super::next_block_at(self.table_id, file_writer);
         Block::write_into(
             file_writer,
             &filter_bytes,
@@ -202,6 +203,7 @@ impl<W: crate::io::Write + crate::io::Seek> FilterWriter<W> for FullFilterWriter
                     t
                 }
             },
+            at,
         )?;
 
         Ok(1)
