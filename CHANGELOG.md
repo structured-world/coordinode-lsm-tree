@@ -11,6 +11,25 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 
 ## [Unreleased]
 
+## [6.0.0](https://github.com/structured-world/coordinode-lsm-tree/compare/v5.11.1...v6.0.0) - 2026-09-26
+
+### Added
+
+- *(columnar)* default to 16 KiB row groups of 4 KiB row pages ([#720](https://github.com/structured-world/coordinode-lsm-tree/pull/720))
+- *(columnar)* read column pages independently ([#709](https://github.com/structured-world/coordinode-lsm-tree/pull/709))
+- *(metrics)* measure bytes read, decoded and copied per emitted row ([#706](https://github.com/structured-world/coordinode-lsm-tree/pull/706))
+- *(filter)* [**breaking**] pack the BuRR solution matrix to r bits per row ([#690](https://github.com/structured-world/coordinode-lsm-tree/pull/690))
+
+### Fixed
+
+- rank merges by promoted cost, order number columns, bind block checksums ([#714](https://github.com/structured-world/coordinode-lsm-tree/pull/714))
+- *(manifest)* rotate when an edit outgrows one log record ([#703](https://github.com/structured-world/coordinode-lsm-tree/pull/703))
+- *(manifest)* name each table's place and refuse damage ([#698](https://github.com/structured-world/coordinode-lsm-tree/pull/698))
+
+### Performance
+
+- *(columnar)* make a sparse scan follow the row page, not the group ([#717](https://github.com/structured-world/coordinode-lsm-tree/pull/717))
+
 ## [5.11.1](https://github.com/structured-world/coordinode-lsm-tree/compare/v5.11.0...v5.11.1) - 2026-09-21
 
 ### Fixed
