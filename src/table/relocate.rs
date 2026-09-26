@@ -379,17 +379,29 @@ fn copy_blocks<W: crate::io::Write + crate::io::Seek>(
                 "relocate: a block runs past its section",
             ));
         }
-        let frame_len = usize::try_from(frame_len)
-            .map_err(|_| crate::Error::InvalidHeader("relocate: block too large"))?;
-        let mut frame = crate::file::read_exact(src, offset, frame_len)?.to_vec();
+        // Only the header changes: re-stamp it, then stream the payload through
+        // in bounded chunks, so a block near the size cap is never buffered.
+        let header_len = Header::header_len(header.block_type);
+        let mut header_bytes = head
+            .get(..header_len)
+            .ok_or(crate::Error::InvalidHeader(
+                "relocate: truncated block header",
+            ))?
+            .to_vec();
         let to = ChecksumAt::block(to_table, header.block_type, writer.get_ref().position());
         Header::rebind_frame(
-            &mut frame,
+            &mut header_bytes,
             ChecksumAt::block(from_table, header.block_type, offset),
             to,
         )?;
-        writer.write_all(&frame)?;
-        offset += frame_len as u64;
+        writer.write_all(&header_bytes)?;
+        copy_section(
+            src,
+            writer,
+            offset + header_len as u64,
+            u64::from(header.data_length),
+        )?;
+        offset += frame_len;
     }
     Ok(())
 }

@@ -1790,6 +1790,9 @@ fn validate_columnar_columns(
             "columnar: batch carries no value column",
         ));
     }
+    // The seqno column is a typed `u64` and nothing else: the engine reads one
+    // format, and an opaque 8-byte seqno from an older layout is rewritten by
+    // the offline converter, not accepted here.
     if key_col.column_id != COL_USER_KEY
         || key_col.type_tag != TypeTag::Bytes
         || seqno_col.column_id != COL_SEQNO
