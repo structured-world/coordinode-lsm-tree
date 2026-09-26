@@ -101,6 +101,96 @@ fn misplaced_tree(dir: &Path, config: impl Fn(Config) -> Config) -> lsm_tree::An
     open(dir, config)
 }
 
+/// Copies a data block over the next one of the same length, leaving the
+/// earlier block in both places.
+fn overwrite_next_block(file: &Path) {
+    let mut bytes = std::fs::read(file).expect("read table");
+    let blocks = data_blocks(&bytes);
+    let (a, b) = blocks
+        .windows(2)
+        .find_map(|w| (w[0].1 == w[1].1).then_some((w[0], w[1])))
+        .expect("two adjacent data blocks of one length");
+    let first = bytes[a.0..a.0 + a.1].to_vec();
+    bytes[b.0..b.0 + b.1].copy_from_slice(&first);
+    std::fs::write(file, bytes).expect("write table");
+}
+
+/// A block copied over the next one is read twice where the index expects two
+/// different blocks: a scan in either direction would repeat its rows out of
+/// order, and compaction would write them into a new table, so every path
+/// refuses it.
+#[test]
+fn a_block_copied_over_the_next_one_is_refused() {
+    let dir = tempfile::tempdir().expect("tempdir");
+    {
+        let tree = open(dir.path(), |c| c);
+        for i in 0..ROWS {
+            tree.insert(key(i), value(i), u64::from(i));
+        }
+        tree.flush_active_memtable(0).expect("flush");
+    }
+    overwrite_next_block(&table_file(dir.path()));
+    let tree = open(dir.path(), |c| c);
+
+    let forward: Result<Vec<_>, _> = tree
+        .iter(SeqNo::MAX, None)
+        .map(|g| g.into_inner().map(|(k, _)| k))
+        .collect();
+    assert!(forward.is_err(), "a forward scan repeats the copied block");
+    let reversed: Result<Vec<_>, _> = tree
+        .iter(SeqNo::MAX, None)
+        .rev()
+        .map(|g| g.into_inner().map(|(k, _)| k))
+        .collect();
+    assert!(reversed.is_err(), "a reverse scan repeats the copied block");
+    for i in 0..ROWS {
+        if let Ok(v) = tree.get(key(i), SeqNo::MAX) {
+            assert_eq!(v.as_deref(), Some(value(i).as_slice()), "key {i}");
+        }
+    }
+    assert!(
+        tree.major_compact(u64::MAX, SeqNo::MAX).is_err(),
+        "compaction must not write the copied block twice"
+    );
+}
+
+/// Versions of one hot key spread over several blocks that all end at that
+/// user key, and differ only in the sequence number they end at. A block of
+/// the key moved to another of its blocks' places is refused: a snapshot read
+/// there would otherwise miss the key, or answer with a version too old.
+#[test]
+fn a_block_of_a_hot_keys_versions_moved_to_another_of_its_places_is_refused() {
+    const VERSIONS: u64 = 400;
+    let dir = tempfile::tempdir().expect("tempdir");
+    let version_value = |seqno: u64| {
+        let mut v = format!("v{seqno:07}").into_bytes();
+        v.resize(100, b'.');
+        v
+    };
+    {
+        let tree = open(dir.path(), |c| c);
+        for seqno in 0..VERSIONS {
+            tree.insert(b"hot", version_value(seqno), seqno);
+        }
+        tree.flush_active_memtable(0).expect("flush");
+    }
+    swap_two_blocks(&table_file(dir.path()));
+    let tree = open(dir.path(), |c| c);
+
+    let mut refused = 0;
+    for snapshot in 1..=VERSIONS {
+        match tree.get(b"hot", snapshot) {
+            Ok(v) => assert_eq!(
+                v.as_deref(),
+                Some(version_value(snapshot - 1).as_slice()),
+                "snapshot {snapshot}"
+            ),
+            Err(_) => refused += 1,
+        }
+    }
+    assert!(refused > 0, "a read reached a moved block and refused it");
+}
+
 /// Every read path refuses the misplaced blocks.
 fn assert_refused(tree: &lsm_tree::AnyTree) {
     // Point reads: a key whose block was moved is an error, never a miss and

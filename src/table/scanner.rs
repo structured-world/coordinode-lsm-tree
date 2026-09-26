@@ -62,11 +62,11 @@ pub struct Scanner {
     /// so once one entry reaches the bound the comparison is retired.
     filtering_below_bound: bool,
 
-    /// The first key of the previous block, as `(user key, table-local seqno)`.
+    /// The last key of the previous block, as `(user key, table-local seqno)`.
     /// A table's blocks hold disjoint, ascending key ranges, so each block's
-    /// first key sorts after the previous one's: a block read in another
-    /// block's place breaks that order.
-    prev_block_first: Option<(crate::UserKey, SeqNo)>,
+    /// first key sorts after the previous block's last: a block read in
+    /// another block's place, or a block read twice, breaks that order.
+    prev_block_last: Option<(crate::UserKey, SeqNo)>,
     /// Where the current block stands in that check.
     block_order: BlockOrder,
 }
@@ -178,20 +178,19 @@ impl Scanner {
             filtering_below_bound: lower_bound.is_some(),
             lower_bound,
 
-            prev_block_first: None,
+            prev_block_last: None,
             block_order: BlockOrder::FirstPending,
         })
     }
 
-    /// Checks the first entry of a block against the previous block's first
-    /// entry, and records it.
+    /// Checks the first entry of a block against the previous block's last.
     ///
     /// # Errors
     ///
     /// Returns [`crate::Error::InvalidHeader`] when the block does not sort
     /// after the previous one.
-    fn check_block_order(&mut self, first: &InternalValue) -> crate::Result<()> {
-        if let Some((prev_key, prev_seqno)) = &self.prev_block_first {
+    fn check_block_order(&self, first: &InternalValue) -> crate::Result<()> {
+        if let Some((prev_key, prev_seqno)) = &self.prev_block_last {
             let ascends = match self.comparator.compare(prev_key, &first.key.user_key) {
                 core::cmp::Ordering::Less => true,
                 // Versions of one key descend by seqno across a block boundary,
@@ -206,8 +205,25 @@ impl Scanner {
                 ));
             }
         }
-        self.prev_block_first = Some((first.key.user_key.clone(), first.key.seqno));
         Ok(())
+    }
+
+    /// The last key of the block being scanned, recorded before the scan
+    /// moves to the next block.
+    ///
+    /// # Errors
+    ///
+    /// Propagates a block-decode failure.
+    fn current_block_last(&self) -> crate::Result<Option<(crate::UserKey, SeqNo)>> {
+        use crate::table::block::ParsedItem as _;
+        let block = self.iter.borrow_owner();
+        Ok(block
+            .try_iter(self.comparator.clone())?
+            .next_back()
+            .map(|item| {
+                let key = item.materialize(block.as_slice()).key;
+                (key.user_key, key.seqno)
+            }))
     }
 
     #[expect(
@@ -333,6 +349,15 @@ impl Iterator for Scanner {
 
             if self.read_count >= self.block_count {
                 return None;
+            }
+
+            match self.current_block_last() {
+                Ok(Some(last)) => self.prev_block_last = Some(last),
+                Ok(None) => {}
+                Err(e) => {
+                    self.block_order = BlockOrder::Failed;
+                    return Some(Err(e));
+                }
             }
 
             // Init new block

@@ -885,6 +885,44 @@ fn multi_level_with_both_flags() -> crate::Result<()> {
 
 const MIB: u64 = 1_024 * 1_024;
 
+/// The index the streaming ranking chooses among `candidates`, offered in order.
+fn rank_by_promoted_ratio(candidates: &[MergeCost], overshoot: u64, slack: u64) -> Option<usize> {
+    let mut ranking = MergeRanking::new(overshoot, slack);
+    for (index, cost) in candidates.iter().enumerate() {
+        ranking.offer(*cost, index);
+    }
+    ranking.finish().map(|((_, _, index), _)| index)
+}
+
+/// The runner-up the ranking reports is the cheapest candidate it did not
+/// choose: the overall cheapest when the bound excluded it, the second
+/// cheapest otherwise.
+#[test]
+fn the_ranking_reports_the_cheapest_candidate_it_did_not_choose() {
+    let within = cost(20 * MIB, 60 * MIB);
+    let cheaper_past_bound = cost(1_000 * MIB, 100 * MIB);
+    let dearer = cost(10 * MIB, 90 * MIB);
+    let mut ranking = MergeRanking::new(20 * MIB, 64 * MIB);
+    for (index, c) in [dearer, cheaper_past_bound, within].into_iter().enumerate() {
+        ranking.offer(c, index);
+    }
+    let Some(((_, _, chosen), runner_up)) = ranking.finish() else {
+        panic!("candidates were offered");
+    };
+    assert_eq!(chosen, 2);
+    assert_eq!(runner_up, Some(cheaper_past_bound));
+
+    let mut ranking = MergeRanking::new(u64::MAX, 0);
+    for (index, c) in [dearer, within, cheaper_past_bound].into_iter().enumerate() {
+        ranking.offer(c, index);
+    }
+    let Some(((_, _, chosen), runner_up)) = ranking.finish() else {
+        panic!("candidates were offered");
+    };
+    assert_eq!(chosen, 2);
+    assert_eq!(runner_up, Some(within));
+}
+
 fn cost(promoted: u64, pulled_in: u64) -> MergeCost {
     MergeCost {
         promoted,
