@@ -1,5 +1,5 @@
 window.BENCHMARK_DATA = {
-  "lastUpdate": 1790412493015,
+  "lastUpdate": 1790436651878,
   "repoUrl": "https://github.com/structured-world/coordinode-lsm-tree",
   "entries": {
     "lsm-tree db_bench costs": [
@@ -25014,6 +25014,90 @@ window.BENCHMARK_DATA = {
             "value": 390035.1617088316,
             "unit": "ops/sec",
             "extra": "P50: 1.9us | P99: 11.2us | P99.9: 78.5us\nthreads: 1 | elapsed: 0.51s | num: 200000 | iterations: 3"
+          }
+        ]
+      },
+      {
+        "commit": {
+          "author": {
+            "email": "mail@polaz.com",
+            "name": "Dmitry Prudnikov",
+            "username": "polaz"
+          },
+          "committer": {
+            "email": "noreply@github.com",
+            "name": "GitHub",
+            "username": "web-flow"
+          },
+          "distinct": true,
+          "id": "2cf4694f353083ce970b2cb85e422d2aab13e0f9",
+          "message": "perf(columnar): make a sparse scan follow the row page, not the group (#717)\n\n## Summary\n\nA selective columnar scan paid a fixed cost per admitted row group that\ngrew with the group, so any group larger than 4 KiB lost the sparse scan\nto the 4 KiB default. A point read also did work in proportion to every\npage of its group. This PR makes both follow the row pages a read\ntouches.\n\nOn-disk format:\n- the index entry of a row group records its directory's length and the\nlength of its key zone block;\n- the directory (version 3) stores each page as its length alone,\noffsets and ids derived from the canonical grid, counts and lengths as\nvarints;\n- zone bounds are written as what they add to the previous bound (shared\nprefix + suffix);\n- the key column's zones move out of the directory into a block between\nthe directory and the pages, read only by a read that selects by the key\n(a point read takes the directory and that block in one request when the\ntwo fit the read budget's I/O buffer).\n- the compaction scan checks each group's tag, directory length, head\nzone length and extent against its index entry, and decodes every zone\nblock against the directory, as an indexed read does.\n\nWrite path:\n- a row group and a row page are cut by one count of a row's size\n(`ColumnBatch::row_bytes`, `entry_row_bytes`), so a 4 KiB group and a 4\nKiB row page hold the same rows;\n- row pages are cut by the page size whatever the group size, so a group\nan ingested batch took past its size still reads a page at a time.\n\nRead path:\n- a read resolves its row pages as a range or a list, finds the pages it\nwants from the directory grid, and fetches, verifies and decodes only\nthose; decoding reuses the load's resolution instead of resolving again;\n- refusals on the per-row, per-page and per-group checks are built only\nwhen a read refuses (they were built and dropped on every successful\nread).\n\n## Measurements\n\n`db_bench --benchmark mixed-layout --num 70000` on macOS, bytes per\nreturned row and time.\n\nSparse scan, 64 KiB groups / 4 KiB row pages: 6162 -> 4398 B/row; 4 KiB\ngroups: 4308 -> 4302.\n\nPoint reads over a columnar base at 64 KiB / 4 KiB, interleaved A/B,\nthree runs each, identical bytes: 262 / 269 / 271 ms -> 195 / 192 / 190\nms.\n\nGrid after this PR:\n\n| Row group / row page | near-full, B/row | near-full time | sparse,\nB/row | point, B/row | point time |\n|---|---|---|---|---|---|\n| 4 KiB / 4 KiB | 341 | 34-38 ms | 4302 | 216 | 180 ms |\n| 16 KiB / 4 KiB | 341 | 26 ms | 4255 | 216 | 187 ms |\n| 64 KiB / 4 KiB | 339 | 21 ms | 4398 | 215 | 192 ms |\n| 32 KiB / 2 KiB | 356 | 32 ms | 2583 | 225 | 212 ms |\n| 64 KiB / 2 KiB | 354 | 27 ms | 2518 | 225 | 209 ms |\n| 64 KiB / 1 KiB | 377 | 38 ms | 1809 | 241 | 253 ms |\n\nAt 64 KiB / 4 KiB the sparse scan stays 96 B/row (2%) above 4 KiB\ngroups. What is left is the group's directory (sixteen row pages) and\nthe predicate column's zone block with its own block header and group\ntag, spread over the 2.08 matches such a group holds. 16 KiB / 4 KiB\nmeets every point of the acceptance criteria. Choosing the default\nlayout from this grid is #708.\n\nThe before/after breakdown and the grid are in\n`docs/columnar-page-format.md`.\n\n## Testing\n\n- regression tests: the directory and head zone lengths are refused when\nthey disagree with the index entry; a point read takes the directory and\nkey zones in one request; a read that does not select by the key never\nreads its zones; a sparse predicate scan reads the directory, its zone\nblock and the matching pages; a row group and a row page of one size\nhold the same rows (red on both old counts)\n- tests, doc tests, `cargo doc -D warnings`, clippy in every CI\nconfiguration and the no-std check pass on macOS; clippy and the full\nsuite also on Linux x86_64 with io_uring\n- columnar format `2` belongs to the unreleased storage V6 contract, so\nits index entry and directory change in place without a new format\nnumber\n\nCloses #707\n\n\n<!-- This is an auto-generated comment: release notes by coderabbit.ai\n-->\n\n## Summary by CodeRabbit\n\n* **New Features**\n* Columnar reads can load only the pages needed for a selection or scan,\nwith caching and zone-based pruning to reduce unnecessary data reads.\n* Row-group and row-page sizes are handled independently, including when\nbatches are larger than the configured page size.\n* **Bug Fixes**\n* Added validation for mismatched or malformed row-group metadata and\nzone blocks, helping detect corrupted or inconsistent data during reads\nand scans.\n* **Documentation**\n* Updated the columnar format specification, storage version guidance,\nand read-buffer behavior.\n\n<!-- end of auto-generated comment: release notes by coderabbit.ai -->",
+          "timestamp": "2026-09-26T18:23:56+03:00",
+          "tree_id": "f13c85a23b548dcb9fdc11fbcb3a05d3b0e4a2ea",
+          "url": "https://github.com/structured-world/coordinode-lsm-tree/commit/2cf4694f353083ce970b2cb85e422d2aab13e0f9"
+        },
+        "date": 1790436596736,
+        "tool": "customBiggerIsBetter",
+        "benches": [
+          {
+            "name": "mixed",
+            "value": 32993.53781629849,
+            "unit": "ops/sec",
+            "extra": "P50: 0.5us | P99: 13.0us | P99.9: 23.1us\nthreads: 1 | elapsed: 16.22s | num: 200000 | iterations: 3"
+          },
+          {
+            "name": "fillseq",
+            "value": 2495817.695891552,
+            "unit": "ops/sec",
+            "extra": "P50: 0.2us | P99: 4.2us | P99.9: 5.2us\nthreads: 1 | elapsed: 0.08s | num: 200000 | iterations: 3"
+          },
+          {
+            "name": "fillrandom",
+            "value": 756567.9889539559,
+            "unit": "ops/sec",
+            "extra": "P50: 1.1us | P99: 6.3us | P99.9: 11.4us\nthreads: 1 | elapsed: 0.26s | num: 200000 | iterations: 3"
+          },
+          {
+            "name": "readrandom",
+            "value": 523475.1406026745,
+            "unit": "ops/sec",
+            "extra": "P50: 1.8us | P99: 6.4us | P99.9: 20.0us\nthreads: 1 | elapsed: 0.38s | num: 200000 | iterations: 3"
+          },
+          {
+            "name": "readseq",
+            "value": 2341665.835082587,
+            "unit": "ops/sec",
+            "extra": "P50: 0.3us | P99: 4.6us | P99.9: 6.0us\nthreads: 1 | elapsed: 0.09s | num: 200000 | iterations: 3"
+          },
+          {
+            "name": "seekrandom",
+            "value": 271362.01797474595,
+            "unit": "ops/sec",
+            "extra": "P50: 3.2us | P99: 7.9us | P99.9: 14.3us\nthreads: 1 | elapsed: 0.74s | num: 200000 | iterations: 3"
+          },
+          {
+            "name": "prefixscan",
+            "value": 153497.1674093218,
+            "unit": "ops/sec",
+            "extra": "P50: 6.0us | P99: 10.9us | P99.9: 17.2us\nthreads: 1 | elapsed: 1.30s | num: 200000 | iterations: 3"
+          },
+          {
+            "name": "overwrite",
+            "value": 707556.7735595091,
+            "unit": "ops/sec",
+            "extra": "P50: 1.2us | P99: 6.4us | P99.9: 12.1us\nthreads: 1 | elapsed: 0.28s | num: 200000 | iterations: 3"
+          },
+          {
+            "name": "mergerandom",
+            "value": 719209.1478397909,
+            "unit": "ops/sec",
+            "extra": "P50: 0.5us | P99: 4.4us | P99.9: 10.8us\nthreads: 1 | elapsed: 0.28s | num: 200000 | iterations: 3"
+          },
+          {
+            "name": "readwhilewriting",
+            "value": 348855.8353644098,
+            "unit": "ops/sec",
+            "extra": "P50: 2.1us | P99: 11.7us | P99.9: 79.5us\nthreads: 1 | elapsed: 0.57s | num: 200000 | iterations: 3"
           }
         ]
       }
