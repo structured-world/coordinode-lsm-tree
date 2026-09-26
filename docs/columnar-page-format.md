@@ -574,10 +574,11 @@ the first and third but more on the sparse scan, whose group metadata (a
 longer directory, and a zone block with its own header and group tag) is
 spread over one or two matches a group; 8 KiB row pages read the least on
 scans and point reads and nearly twice as much on the sparse scan, where a
-match reads a whole 8 KiB page. In time, the near-full scan at 16 KiB / 4 KiB
-takes 28-31 ms where 4 KiB / 4 KiB takes 39-41 ms, and 25 ms where it takes
-35 ms with no cache; point reads take the same time within the run-to-run
-noise.
+match reads a whole 8 KiB page. In time, over two interleaved runs of five
+iterations each, the near-full scan at 16 KiB / 4 KiB takes 31.5-32.0 ms where
+4 KiB / 4 KiB takes 40.2-42.1 ms, and 24.0-24.6 ms where it takes 33.0-33.9 ms
+with no cache; point reads take 211-230 ms against 214-216 ms, the same within
+the run-to-run noise.
 
 Two costs of the larger group remain, both of its geometry:
 
@@ -585,11 +586,14 @@ Two costs of the larger group remain, both of its geometry:
   zone block of the predicate's column, then the matching pages: one more
   dependent read than a group of one row page, which has no zone block. Over
   a scan whose blocks are all uncached this is about a fifth of its time
-  (6.5-7.0 ms against 5.4-5.7 ms here). A zone block is cached like a page,
+  (6.6-7.4 ms against 5.5-5.7 ms here). A zone block is cached like a page,
   so a scan of a group already read does not pay it again.
-- **A point read with nothing cached** reads the group's directory and key
-  zones, which grow with the group's row pages: 2.2% more bytes than one-page
-  groups.
+- **A point read with nothing cached** reads and decodes the group's
+  directory and key zones, which grow with the group's row pages: 2.2% more
+  bytes than one-page groups, and a third more time (665-672 ms against
+  500 ms), most of it decoding the larger directory on every read. A cached
+  directory keeps its decoded key zones, so a read of a group already read
+  pays neither.
 
 The same trade shapes the defaults elsewhere. Row-oriented engines keep the
 unit a point read decodes small: RocksDB's data block is 4 KiB by default
