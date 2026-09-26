@@ -23,6 +23,11 @@ use core::ops::Deref;
 /// why it lives here: a build without the feature still writes the stamp for
 /// the tables it cannot make columnar, so every table records which layout a
 /// reader should expect.
+///
+/// Format `2` is part of the storage `V6` contract. Until a release ships
+/// `V6`, changes to its index entries, directory or pages are made in place
+/// under the same number; the number moves with the first change after `V6`
+/// is released.
 pub const COLUMNAR_FORMAT_VERSION: u8 = 2;
 
 /// Nanosecond timestamp.

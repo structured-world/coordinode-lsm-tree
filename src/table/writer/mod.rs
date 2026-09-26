@@ -1376,8 +1376,6 @@ impl Writer {
         Ok(())
     }
 
-    /// Writes a compressed block to disk.
-    ///
     /// What an entry of a `key_len`-byte key and a `value_len`-byte value
     /// counts toward the block or row group it is written into. A row group
     /// counts it as its row pages do, every column's share of the row, so a
@@ -1397,6 +1395,8 @@ impl Writer {
         key_len + value_len
     }
 
+    /// Writes a compressed block to disk.
+    ///
     /// This is triggered when a `Writer::write` causes the buffer to grow to the configured `block_size`.
     ///
     /// Should only be called when the block has items in it.
