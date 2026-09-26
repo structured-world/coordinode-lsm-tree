@@ -157,7 +157,7 @@ itself (an earlier layout spent 14 bytes a page on an offset, a length, the
 three names and a flags byte) could describe gaps, overlaps and missing
 pages, all of which a reader had to refuse; at 64 KiB groups of 4 KiB row
 pages over the mixed-layout records, the directory averaged 1892 bytes that
-way and is 390 bytes this way.
+way and averages 412 this way, with the zones below written the same way.
 
 Then, for each zone block in the order the blocks follow the pages, the
 column whose zones it holds (`u16`) and its on-disk length (`var`). The
@@ -166,8 +166,9 @@ its pages and its zone blocks fill the group exactly; a reader refuses a group
 whose index entry and directory disagree about where it ends.
 
 **A read caches the directory decoded**, not as the block it was read as. A
-directory of many row pages is dozens to hundreds of entries whose decode
-sorts them to prove the page grid, and every read of the group starts from it
+directory of many row pages is dozens to hundreds of pages whose decode
+rebuilds each one's placement and checks the zones, and every read of the
+group starts from it
 (a point read twice: once for the key pages, once for the row pages holding
 the key). On the mixed-layout point reads over a columnar base, at 64 KiB
 groups of 4 KiB row pages, re-decoding it per read took 1.43 s where 4 KiB
@@ -223,15 +224,26 @@ byte-wise zone contains them.
 
 | Zone field | Width | Meaning |
 |---|---|---|
-| `null_count` | `u32` | null rows of the column in the row page |
+| `null_count` | `var` | null rows of the column in the row page |
 | `flags` | `u8` | bit 0: no upper bound; other bits reserved and refused |
-| `min_len`, `min` | `u8` + bytes | lower bound, at most 64 bytes |
-| `max_len`, `max` | `u8` + bytes | upper bound, at most 64 bytes, empty without one |
+| `min` | bound | lower bound, at most 64 bytes |
+| `max` | bound | upper bound, at most 64 bytes; absent without one |
 
-Both places hold the same form: a `u16` count of the columns they describe,
-the column ids, then the zones row page by row page, each row page's in
-column order. A zone block opens with its group's `group_tag` (`u64`) before
-that form, as every page opens with its stamp. A zone set is refused unless it names distinct columns the
+A bound is written as what it adds to a reference: the length of the prefix
+it shares with it (`u8`), then the length of the rest (`u8`) and the rest. A
+lower bound's reference is the same column's zone on the row page before, its
+upper bound when it has one and its lower bound otherwise, and nothing on the
+first row page; an upper bound's reference is its own lower bound. A sorted
+column's neighbouring zones, and the two bounds of a narrow number, share
+most of their bytes: over the mixed-layout records at 64 KiB groups of 4 KiB
+row pages, the zone block of an 8-byte field averaged 390 bytes a group with
+whole bounds and a `u32` null count, and averages 171 this way.
+
+Both places hold the same form: a count of the columns they describe
+(`var`), the column ids (`u16`), then the zones row page by row page, each
+row page's in column order. A zone block opens with its group's `group_tag`
+(`u64`) before that form, as every page opens with its stamp. A zone set is
+refused unless it names distinct columns the
 group has, one zone per row page and column, no more nulls than rows, the
 empty range for an all-null row page, and a lower bound no greater than the
 upper one: each of those, read as written, would prune a row page holding a
@@ -363,28 +375,30 @@ with. Under encryption the block layer's AAD binds the table id on top.
 The acceptance this format is held to asks for the overhead as a measured
 figure rather than a promise of zero. Per row group, each page adds a block
 header (33 bytes: SST blocks carry no flags byte, their transform comes from
-the table descriptor), a 13-byte stamp and a 14-byte directory entry, 60
-bytes in all; each row page adds its 4-byte row count to the directory; and
-the group adds the directory's own 19-byte header, its 2-byte zone count and
-its block header once. With one row page per group, which has no zones:
+the table descriptor), a 13-byte stamp and its length in the directory (2
+bytes for a page under 16 KiB), 48 bytes in all; each column part adds 3
+bytes to the directory and each row page its row count (1 or 2 bytes); and
+the group adds the directory's own header (12 bytes for a few row pages), its
+zone count and its block header once. With one row page per group, which has
+no zones:
 
 | Row group | 8 pages | 20 pages |
 |---|---|---|
-| 32 KiB | 538 B (1.64%) | 1258 B (3.84%) |
-| 128 KiB | 538 B (0.41%) | 1258 B (0.96%) |
-| 256 KiB | 538 B (0.21%) | 1258 B (0.48%) |
+| 32 KiB | 456 B (1.39%) | 1068 B (3.26%) |
+| 128 KiB | 456 B (0.35%) | 1068 B (0.81%) |
+| 256 KiB | 456 B (0.17%) | 1068 B (0.41%) |
 
-Row pages multiply the pages: every column part pays its 60 bytes once per
-row page. Four parts in 4 KiB row pages cost 244 bytes per row page, about 6%
-of the data; in 16 KiB row pages, 1.5%. Their zones add 7 bytes per zone plus
-its bounds: some 30 bytes of key zone per row page for 12-byte keys, in the
-directory, and up to 135 bytes per wider column in that column's zone block
-(a 33-byte block header, its 8-byte group tag and a 6-byte directory listing
-per column and group),
-which only a read pruning on that column fetches. That is what the
-page size trades against the rows a point read decodes and the pages a
-predicate skips, and why its default is chosen by measurement together with
-the group size.
+Row pages multiply the pages: every column part pays its 48 bytes once per
+row page. Four parts in 4 KiB row pages cost 194 bytes per row page, about
+4.7% of the data; in 16 KiB row pages, 1.2%. Their zones add 2 bytes per zone
+and 2 per bound, plus the bytes each bound does not share with its reference:
+some 20 bytes of key zone per row page for sequential 16-byte keys, in the
+directory, and some 8 per zone of a narrow number in that column's zone
+block, which adds a 33-byte block header, its 8-byte group tag and a 3 or
+4-byte directory listing per column and group, and which only a read pruning
+on that column fetches. That is what the page size trades against the rows a
+point read decodes and the pages a predicate skips, and why its default is
+chosen by measurement together with the group size.
 
 Encryption adds its per-page tag and frame on top, roughly doubling those.
 Page-ECC does **not** scale with the page count in any meaningful way: its
@@ -393,7 +407,7 @@ paid with or without pages, and splitting only adds the rounding at each page
 boundary.
 
 These figures are a second reason the row group grows. At 32 KiB with a
-richly-encoded schema the framing is already 3.84%; at 128 KiB and above it is
+richly-encoded schema the framing is already 3.26%; at 128 KiB and above it is
 under 1% and stops being a term in the decision.
 
 ### Measured against the unpaged layout
@@ -403,7 +417,9 @@ A cold scan of every column of one table (20,000 rows, 16-byte keys,
 projection of all four columns, against the same scan of the layout before
 pages, where a row group was one block. Bytes and requests are exact; times
 are medians of 21 cold scans on an x86 Linux host with the file in the page
-cache, where a request costs a system call and nothing else.
+cache, where a request costs a system call and nothing else. They were taken
+with the directory that spent 14 bytes a page and whole bounds on its zones,
+so the byte figures are an upper bound for the current one.
 
 | Row group, row page | bytes read | requests | projection time |
 |---|---|---|---|
