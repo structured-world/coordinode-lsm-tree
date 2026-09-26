@@ -1234,8 +1234,14 @@ impl Table {
             // A group found by its frame has no index entry to name it; the
             // tag its own directory carries is the only one there is, and the
             // pages' stamps are still checked against it when they decode.
-            Ok(BlockHandle::new(BlockOffset(offset), size)
-                .with_group_tag(core::num::NonZeroU64::new(directory.group_tag())))
+            // A zero tag names no group, and every read then refuses it.
+            let row_group = core::num::NonZeroU64::new(directory.group_tag()).and_then(|tag| {
+                Some(crate::table::index_block::RowGroupRef {
+                    tag,
+                    directory_len: core::num::NonZeroU32::new(first.size())?,
+                })
+            });
+            Ok(BlockHandle::new(BlockOffset(offset), size).with_row_group(row_group))
         }
         #[cfg(not(feature = "columnar"))]
         {
@@ -2143,18 +2149,10 @@ impl Table {
         &self,
         group: &BlockHandle,
     ) -> crate::Result<alloc::vec::Vec<(BlockHandle, BlockType)>> {
-        use crate::coding::Decode;
-
         let (fd, _) = self
             .file_accessor
             .get_or_open_table(&self.global_id(), &self.path)?;
-        let prefix = crate::file::read_exact(
-            fd.as_ref(),
-            *group.offset(),
-            crate::table::block::Header::MIN_LEN.min(group.size() as usize),
-        )?;
-        let directory_len = crate::table::block::Header::decode_from(&mut &prefix[..])?
-            .on_disk_size_with(self.metadata.ecc_params);
+        let directory_len = crate::table::row_group::indexed_directory_len(group)?;
         let directory_handle = BlockHandle::new(group.offset(), directory_len);
         let directory_block = Block::from_file(
             fd.as_ref(),
@@ -2179,6 +2177,12 @@ impl Table {
                 directory_block.header.block_type.into(),
             )));
         }
+        crate::table::row_group::check_directory_len(
+            directory_len,
+            directory_block
+                .header
+                .on_disk_size_with(self.metadata.ecc_params),
+        )?;
         let directory = crate::table::column_page::PageDirectory::decode(&directory_block.data)?;
         crate::table::row_group::check_group_extent(group, directory_len, &directory)?;
         // Verification, salvage and scrub take the group's blocks from here, so

@@ -5,7 +5,7 @@
 mod block_handle;
 mod iter;
 
-pub use block_handle::{BlockHandle, KeyedBlockHandle};
+pub use block_handle::{BlockHandle, KeyedBlockHandle, RowGroupRef};
 pub use iter::Iter;
 
 use super::{
@@ -31,8 +31,8 @@ pub struct IndexBlockParsedItem {
     pub prefix: Option<SliceIndexes>,
     pub end_key: SliceIndexes,
     pub seqno: SeqNo,
-    /// The tag of the columnar row group the entry names, when it names one.
-    pub group_tag: Option<core::num::NonZeroU64>,
+    /// The columnar row group the entry names, when it names one.
+    pub row_group: Option<RowGroupRef>,
 }
 
 impl ParsedItem<KeyedBlockHandle> for IndexBlockParsedItem {
@@ -90,7 +90,7 @@ impl ParsedItem<KeyedBlockHandle> for IndexBlockParsedItem {
         KeyedBlockHandle::new(
             key,
             self.seqno,
-            BlockHandle::new(self.offset, self.size).with_group_tag(self.group_tag),
+            BlockHandle::new(self.offset, self.size).with_row_group(self.row_group),
         )
     }
 }

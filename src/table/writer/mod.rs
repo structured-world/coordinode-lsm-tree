@@ -443,13 +443,22 @@ pub(crate) fn next_block_at<W: crate::io::Write + crate::io::Seek>(
     crate::table::block::ChecksumAt::table(table_id, file_writer.get_ref().position())
 }
 
-/// `tag` as the index names a row group, refusing the zero tag no group is
-/// written under.
+/// The row group tagged `tag` whose directory is `directory_len` bytes on disk,
+/// as the index names it, refusing the zero tag and the empty directory no
+/// group is written with.
 #[cfg(feature = "columnar")]
-fn nonzero_group_tag(tag: u64) -> crate::Result<core::num::NonZeroU64> {
-    core::num::NonZeroU64::new(tag).ok_or(crate::Error::InvalidHeader(
-        "columnar: a row group's tag is zero",
-    ))
+fn row_group_ref(
+    tag: u64,
+    directory_len: u32,
+) -> crate::Result<crate::table::index_block::RowGroupRef> {
+    Ok(crate::table::index_block::RowGroupRef {
+        tag: core::num::NonZeroU64::new(tag).ok_or(crate::Error::InvalidHeader(
+            "columnar: a row group's tag is zero",
+        ))?,
+        directory_len: core::num::NonZeroU32::new(directory_len).ok_or(
+            crate::Error::InvalidHeader("columnar: a row group's directory is empty"),
+        )?,
+    })
 }
 
 impl Writer {
@@ -1739,7 +1748,8 @@ impl Writer {
         // The group is written directory first, then its pages back to back,
         // which is exactly the layout `PageDirectory::contiguous` recorded,
         // then the zone blocks in the order the directory lists them.
-        let mut bytes_written = directory_block.on_disk_len(self.ecc);
+        let directory_len = directory_block.on_disk_len(self.ecc);
+        let mut bytes_written = directory_len;
         let at = next_block_at(self.table_id, &self.file_writer);
         let mut uncompressed = u64::from(
             directory_block
@@ -1780,7 +1790,7 @@ impl Writer {
             item_count,
             zone_block_min,
             columnar_columns,
-            Some(nonzero_group_tag(group_tag)?),
+            Some(row_group_ref(group_tag, directory_len)?),
         )
     }
 
@@ -2046,7 +2056,8 @@ impl Writer {
     /// is still ONE entry: the index names row groups, so `block_id` keeps its
     /// meaning and every section keyed by a data block's file offset keeps
     /// working, since the group starts exactly where its directory does. The
-    /// entry carries the group's tag, which its directory must repeat.
+    /// entry carries the group's tag, which its directory must repeat, and its
+    /// directory's length, which its directory's header must repeat.
     #[expect(
         clippy::too_many_arguments,
         reason = "cohesive per-written-block fields; a param struct adds indirection without clarity"
@@ -2062,7 +2073,7 @@ impl Writer {
         item_count: usize,
         zone_block_min: Option<UserKey>,
         columnar_columns: Option<Vec<crate::table::zone_map::ColumnStats>>,
-        group_tag: Option<core::num::NonZeroU64>,
+        row_group: Option<crate::table::index_block::RowGroupRef>,
     ) -> crate::Result<()> {
         self.meta.uncompressed_size += uncompressed_length;
 
@@ -2077,7 +2088,7 @@ impl Writer {
         let handle = KeyedBlockHandle::new(
             last_key.clone(),
             last_seqno,
-            BlockHandle::new(self.meta.file_pos, bytes_written).with_group_tag(group_tag),
+            BlockHandle::new(self.meta.file_pos, bytes_written).with_row_group(row_group),
         );
         // Seqno bounds go into the parallel `seqno_bounds` section keyed by this
         // block's file offset, NOT inline in the index entry: keeping them out of
@@ -2350,18 +2361,23 @@ impl Writer {
         columnar_columns: Option<Vec<crate::table::zone_map::ColumnStats>>,
         comparator: &crate::SharedComparator,
     ) -> crate::Result<Option<crate::UserKey>> {
+        use crate::coding::Decode;
+
         if !self.accepts_group_tag(group_tag) {
             return Err(crate::Error::InvalidHeader(
                 "columnar: a copied row group's tag does not follow the table's last",
             ));
         }
+        // The group opens with its directory, whose header gives its length.
+        let directory_len =
+            crate::table::block::Header::decode_from(&mut &*raw)?.on_disk_size_with(self.ecc);
         let first_key = self.append_verbatim_extent(
             (raw, source),
             uncompressed_length,
             Vec::new(),
             entries,
             columnar_columns,
-            Some(nonzero_group_tag(group_tag)?),
+            Some(row_group_ref(group_tag, directory_len)?),
             comparator,
         )?;
         self.last_group_tag = Some(group_tag);
@@ -2446,7 +2462,7 @@ impl Writer {
 
     /// Shared body of the verbatim copies: validates the entries' order,
     /// appends `raw` to the data region, and registers it as one index entry,
-    /// naming the row group tagged `group_tag` when the copy is one.
+    /// naming the row group `row_group` when the copy is one.
     #[expect(
         clippy::too_many_arguments,
         reason = "cohesive per-copy fields, forwarded to `register_written_extent`"
@@ -2458,7 +2474,7 @@ impl Writer {
         layout: alloc::vec::Vec<u32>,
         entries: &[InternalValue],
         columnar_columns: Option<Vec<crate::table::zone_map::ColumnStats>>,
-        group_tag: Option<core::num::NonZeroU64>,
+        row_group: Option<crate::table::index_block::RowGroupRef>,
         comparator: &crate::SharedComparator,
     ) -> crate::Result<Option<crate::UserKey>> {
         let bytes_written = u32::try_from(raw.len())
@@ -2490,7 +2506,7 @@ impl Writer {
             inputs.item_count,
             inputs.zone_block_min,
             columnar_columns,
-            group_tag,
+            row_group,
         )?;
         if self.locator.is_some() {
             self.locator_block_id += 1;

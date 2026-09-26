@@ -39,17 +39,6 @@ pub struct RowGroupBlocks {
     pub zones: Option<PageZones>,
 }
 
-/// How much of a row group a selective read fetches before it knows the
-/// directory's length.
-///
-/// The index entry spans the whole group and does not record where the
-/// directory ends, but the directory's block header, at the front, does. One
-/// request of this size covers the directory of any realistic schema and,
-/// since the key page follows it, usually the key page too, which is what
-/// every read of the group needs next. A directory longer than this is
-/// completed by a second request.
-const DIRECTORY_PREFIX: usize = 4 * 1_024;
-
 /// Which row pages of a group a read wants.
 #[derive(Clone, Debug, Default)]
 pub enum RowPageSelect<'a> {
@@ -290,33 +279,32 @@ impl GroupRead<'_> {
     /// reads the rest of the group, not the key page again. When it is not, a
     /// read that expects every page ([`PageWant::whole`]) of a group that fits
     /// the I/O buffer takes it in ONE request, as a full scan wants, and any
-    /// other read takes the directory
-    /// first (a [`DIRECTORY_PREFIX`] of the group, no more than the I/O
-    /// buffer, extended if the directory is longer) and then the wanted pages
-    /// the same way, reusing any bytes the prefix brought in. Requests go out
+    /// other read takes exactly the directory first, whose length the index
+    /// entry records, and then the wanted pages the same way. Requests go out
     /// the budget's in-flight count at a time.
     ///
     /// Each request is charged when it is issued: the whole group and page
-    /// runs to the data role, the directory prefix to the index role. Each
-    /// block's load and decode are then counted under its own role as it is
-    /// verified.
+    /// runs to the data role, the directory to the index role. Each block's
+    /// load and decode are then counted under its own role as it is verified.
     ///
     /// # Errors
     ///
     /// Any block's verification error, or [`crate::Error::InvalidHeader`] when
-    /// the directory describes a layout that does not fill the group exactly:
-    /// a gap or an overrun means the index entry and the directory disagree
-    /// about where the group ends, and neither can be trusted to name the
-    /// right bytes.
+    /// the index entry names no row group, when the directory's length is not
+    /// the one the index entry records, or when the directory describes a
+    /// layout that does not fill the group exactly: a gap or an overrun means
+    /// the index entry and the directory disagree about where the group ends,
+    /// and neither can be trusted to name the right bytes.
     pub(crate) fn load(&self, want: &PageWant<'_>) -> crate::Result<RowGroupBlocks> {
         if let Some((directory, directory_len)) = self.cache.get_directory(
             self.table_id,
             self.group.offset(),
             self.charge.touches_cache(),
         ) {
-            // Decoded and checked when it was cached; its extent and tag are
-            // checked again against this read's index entry, which is what
-            // names the group here.
+            // Decoded and checked when it was cached; its length, extent and
+            // tag are checked again against this read's index entry, which is
+            // what names the group here.
+            check_directory_len(indexed_directory_len(self.group)?, directory_len)?;
             check_group_extent(self.group, directory_len, &directory)?;
             self.check_group_tag(&directory)?;
             let mut fd = None;
@@ -441,10 +429,9 @@ impl GroupRead<'_> {
         }
     }
 
-    /// The directory from a prefix of the group, then the wanted pages. A
-    /// read that expects every page and fits the I/O buffer takes the whole
-    /// group as its prefix, so the pages are served from it; any other read
-    /// takes [`DIRECTORY_PREFIX`].
+    /// The directory, then the wanted pages. A read that expects every page
+    /// and fits the I/O buffer takes the whole group in one request, so the
+    /// pages are served from it; any other read takes exactly the directory.
     fn read_selective(
         &self,
         fd: Arc<dyn FsFile>,
@@ -452,38 +439,24 @@ impl GroupRead<'_> {
     ) -> crate::Result<RowGroupBlocks> {
         let group_len = self.group.size() as usize;
         let io_buffer = self.budget.io_buffer() as usize;
+        let directory_len = indexed_directory_len(self.group)?;
+        self.check_block_len(directory_len)?;
+        if directory_len as usize > group_len {
+            return Err(crate::Error::InvalidHeader(
+                "columnar: page directory overruns its row group",
+            ));
+        }
         let prefix = if want.whole && group_len <= io_buffer {
             self.read(fd.as_ref(), 0, group_len, BlockType::ColumnPage)?
         } else {
             self.read(
                 fd.as_ref(),
                 0,
-                group_len.min(DIRECTORY_PREFIX).min(io_buffer),
+                directory_len as usize,
                 BlockType::ColumnPageDirectory,
             )?
         };
-        let directory_len = Header::decode_from(&mut &prefix[..])?.on_disk_size_with(self.ecc);
-        self.check_block_len(directory_len)?;
-        let directory_end = directory_len as usize;
-        if directory_end > group_len {
-            return Err(crate::Error::InvalidHeader(
-                "columnar: page directory overruns its row group",
-            ));
-        }
-        // A directory longer than the prefix: fetch the rest of it, and keep
-        // one buffer so the page reads below see a single contiguous prefix.
-        let prefix = if directory_end > prefix.len() {
-            let rest = self.read(
-                fd.as_ref(),
-                prefix.len(),
-                directory_end - prefix.len(),
-                BlockType::ColumnPageDirectory,
-            )?;
-            Slice::fused(&prefix, &rest)
-        } else {
-            prefix
-        };
-        let (directory, directory_len) = self.admit_directory(&prefix)?;
+        let directory = self.admit_directory(&prefix, directory_len)?;
         let mut fd = Some(fd);
         let zones = match want.zone_block_column(&directory) {
             Some(column_id) => {
@@ -531,11 +504,19 @@ impl GroupRead<'_> {
         })
     }
 
-    /// Verifies and admits the directory at the front of `front`, decodes it
-    /// and proves it fills the group. Returns it with its on-disk length; the
-    /// caller caches it once the blocks it names have checked out.
-    fn admit_directory(&self, front: &Slice) -> crate::Result<(Arc<PageDirectory>, u32)> {
-        let directory_len = Header::decode_from(&mut &front[..])?.on_disk_size_with(self.ecc);
+    /// Verifies and admits the directory of `directory_len` bytes, the length
+    /// the index entry records, at the front of `front`, decodes it and proves
+    /// it fills the group. The caller caches it once the blocks it names have
+    /// checked out.
+    fn admit_directory(
+        &self,
+        front: &Slice,
+        directory_len: u32,
+    ) -> crate::Result<Arc<PageDirectory>> {
+        check_directory_len(
+            directory_len,
+            Header::decode_from(&mut &front[..])?.on_disk_size_with(self.ecc),
+        )?;
         let handle = BlockHandle::new(self.group.offset(), directory_len);
         let bytes = front
             .get(..directory_len as usize)
@@ -552,7 +533,7 @@ impl GroupRead<'_> {
         let directory = Arc::new(PageDirectory::decode(&block.data)?);
         check_group_extent(self.group, directory_len, &directory)?;
         self.check_group_tag(&directory)?;
-        Ok((directory, directory_len))
+        Ok(directory)
     }
 
     /// Fetches every page `want` selects that `pages` does not hold yet.
@@ -1040,6 +1021,41 @@ pub fn check_group_tag(
         None => Err(crate::Error::InvalidHeader(
             "columnar: the index entry names no row group",
         )),
+    }
+}
+
+/// The on-disk length of `group`'s directory, as its index entry records it.
+///
+/// # Errors
+///
+/// [`crate::Error::InvalidHeader`] when the entry names no row group, which a
+/// columnar table's entries always do.
+pub fn indexed_directory_len(group: &BlockHandle) -> crate::Result<u32> {
+    group
+        .row_group()
+        .map(|group| group.directory_len.get())
+        .ok_or(crate::Error::InvalidHeader(
+            "columnar: the index entry names no row group",
+        ))
+}
+
+/// Refuses a directory whose on-disk length, `found`, is not the `indexed`
+/// one its group's index entry records.
+///
+/// A reader reads exactly the indexed length, so a directory of another
+/// length in the group's place would either be cut short or run into the
+/// first page; the two are independent statements a writer makes agree.
+///
+/// # Errors
+///
+/// [`crate::Error::InvalidHeader`] when they differ.
+pub fn check_directory_len(indexed: u32, found: u32) -> crate::Result<()> {
+    if indexed == found {
+        Ok(())
+    } else {
+        Err(crate::Error::InvalidHeader(
+            "columnar: page directory length disagrees with its index entry",
+        ))
     }
 }
 

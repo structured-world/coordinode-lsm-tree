@@ -202,8 +202,8 @@ Zones live in two places, chosen by who reads them:
 Every zone in the directory would make every partial read pay for all of
 them. Measured over 4 KiB values in 4 KiB row pages, a key-only projection
 then reads 1/15 of what a scan of keys and values reads, where the pages
-alone give it well under 1/20: the value zones push the directory past its
-4 KiB prefix. One zone block for every non-key column would make a pruning
+alone give it well under 1/20: every read of the directory pays for the
+value zones. One zone block for every non-key column would make a pruning
 read pay for the columns it does not prune on: on the mixed-layout sparse
 scan, a predicate on an 8-byte field read 7296 B per returned row with one
 block, and 6157 B with one per column. Parquet makes the same separation, an
@@ -338,12 +338,12 @@ for this group's: the page stamps catch it as soon as a page is read, but a
 point read whose key zones prune every row page reads none, and would answer
 from the foreign directory that the key is absent. A reader therefore refuses
 a directory whose tag is not the one the index entry names. The tag is a
-varint of at most 9 bytes per group in the index, and it costs a row-major
-table nothing: its entries
+varint of at most 9 bytes per group in the index, the directory length beside
+it one of at most 5, and they cost a row-major table nothing: its entries
 keep the markers they had, and only an entry that names a row group takes the
 tagged one. A group salvage finds by its frame rather than through the index
-has no entry to name it and is taken under its directory's own tag, its pages'
-stamps still checked against it.
+has no entry to name it and is taken under its directory's own tag and
+length, its pages' stamps still checked against it.
 
 A block of another role in a page slot (a zone block, a directory) is refused
 by the type its block header names, before its stamp is consulted. Moving a page **between
@@ -433,33 +433,33 @@ it is why every section keyed by a data block's file offset (zone map, seqno
 bounds, the delete-position lookup) keeps working unchanged: the group starts
 where its directory starts, which is where the block it replaces started.
 
-The entry also carries the group's tag, after its seqno, under markers of its
-own (4 for a full entry, 5 for a truncated one) beside the row-major entries'
-0 and 1. A tagged entry whose tag is zero is refused: no group is written
-under it.
+The entry also carries the group's tag and its directory's on-disk length,
+after its seqno, under markers of its own (4 for a full entry, 5 for a
+truncated one) beside the row-major entries' 0 and 1. A tagged entry whose tag
+is zero, or whose directory is empty or longer than the group, is refused: no
+group is written with one.
 
-A reader that wants only part of the group needs the directory's own length
-first, and the index does not record it. It does not have to: a block header
-is fixed-size and carries its on-disk length, so the reader fetches a
-speculative prefix of the group, reads the directory's length out of its
-header, and extends the read only if the directory did not fit. With the key
-page adjacent, a prefix sized for the directory plus the key page usually
-satisfies a point read in one request.
+A reader that wants only part of the group reads exactly the directory first,
+the length the entry records, and then each run of consecutive wanted pages
+that are not cached as one range. The directory's own header repeats its
+length, and a directory whose header disagrees with the entry is refused, as
+one carrying another group's tag is: a reader that took the entry's length
+would otherwise cut the directory short or read into the first page.
 
-The prefix is 4 KiB, or the whole group when it is smaller. A directory is
-21 bytes plus 4 per row page, 14 per page, 6 per zone block and the key
-zones, so 4 KiB holds
-the directory of some 250 pages, and the rest of it goes to the start of the
-key pages. A longer directory, which many row pages of a wide schema make, is
-completed by a second request. A
-page the prefix covers, wholly or in part, is served from it rather than
-asked for again; the reader then requests each run of consecutive wanted
-pages that are not cached as one range.
+The length costs the entry two bytes for a directory under 16 KiB. Without it
+a reader has to guess: an earlier layout read a fixed 4 KiB prefix and took
+the directory's length from its header, which cost a second request for a
+longer directory and, for a shorter one, read the rest of the prefix whether
+the read wanted those bytes or not. On the mixed-layout sparse scan at 64 KiB
+groups of 4 KiB row pages the directory averaged 1892 bytes, so more than half
+of every prefix was bytes the scan did not use: 6162 bytes read per returned
+row with the prefix, 5256 with the recorded length, the rows and every other
+byte the same.
 
 ## What a read does
 
-**Point read.** Index gives the row group's extent. One read covers
-the directory and the key pages (adjacent by construction). The key zones in
+**Point read.** Index gives the row group's extent and its directory's
+length. One read takes the directory. The key zones in
 the directory name the row pages whose key pages can hold the key, and only
 those key pages are read; a key none of them holds ends the read there.
 Otherwise they yield the row pages holding the key's versions, and the
@@ -491,7 +491,7 @@ under any budget return the same rows.
 - **The I/O buffer** is what one request may ask for. A run of adjacent wanted
   pages is one request up to it and is cut between pages past it; a single page
   larger than it is a request of its own. A read of every page takes a group
-  that fits it in one request. The directory prefix is no larger than it.
+  that fits it in one request.
 - **The in-flight count** is how many requests go out together, through the
   filesystem's batched read. A backend with batched I/O keeps them in flight at
   once; one without reads them in turn.

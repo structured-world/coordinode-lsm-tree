@@ -8007,8 +8007,8 @@ fn a_projection_decodes_the_same_columns_as_a_full_read() -> crate::Result<()> {
     Ok(())
 }
 
-/// A directory header claiming more bytes than the row group holds is
-/// refused before any page offset is derived from it.
+/// An index entry whose directory is longer than the row group it spans is
+/// refused before any byte of the group is read as the directory.
 #[cfg(feature = "columnar")]
 #[test]
 fn a_projection_refuses_a_directory_longer_than_its_group() -> crate::Result<()> {
@@ -8026,9 +8026,9 @@ fn a_projection_refuses_a_directory_longer_than_its_group() -> crate::Result<()>
             .expect("the table has a row group")?;
         *first.as_ref()
     };
-    // A shorter index entry than the group really is: the directory header,
-    // which is intact, now claims more than the entry spans.
-    let clipped = BlockHandle::new(group.offset(), 64).with_group_tag(group.group_tag());
+    // A shorter index entry than the group really is: the directory length
+    // it records, which is intact, now claims more than the entry spans.
+    let clipped = BlockHandle::new(group.offset(), 64).with_row_group(group.row_group());
     let table = Table::recover(test_recover_params(file, checksum))?;
     let err = table
         .load_row_group(
@@ -8041,6 +8041,60 @@ fn a_projection_refuses_a_directory_longer_than_its_group() -> crate::Result<()>
         matches!(err, crate::Error::InvalidHeader(_)),
         "expected a framing refusal, got {err:?}",
     );
+    Ok(())
+}
+
+/// A directory whose length is not the one its index entry records is
+/// refused, read cold, served from the cache, or enumerated by the walks that
+/// judge the bytes on disk: a reader takes exactly the recorded length as the
+/// directory, so a disagreement cuts it short or runs it into the first page.
+#[cfg(feature = "columnar")]
+#[test]
+fn a_directory_length_other_than_the_indexed_one_is_refused() -> crate::Result<()> {
+    use crate::table::columnar::COL_USER_KEY;
+    use crate::table::row_group::{PageWant, RowPageSelect};
+
+    let dir = tempdir()?;
+    let file = dir.path().join("table");
+    let checksum = columnar_table_file_paged(&file, 400, 16, 100, 16 * 1_024, 1_024)?;
+    let group = first_row_group(&file, checksum)?;
+    let Some(named) = group.row_group() else {
+        panic!("a columnar index entry names its group");
+    };
+    let want = PageWant::projected(&[COL_USER_KEY], RowPageSelect::All);
+    for delta in [-1_i64, 1] {
+        let wrong_len = u32::try_from(i64::from(named.directory_len.get()) + delta)
+            .ok()
+            .and_then(core::num::NonZeroU32::new)
+            .expect("the directory is longer than a byte and shorter than its group");
+        let wrong = group.with_row_group(Some(crate::table::index_block::RowGroupRef {
+            tag: named.tag,
+            directory_len: wrong_len,
+        }));
+
+        let cold = Table::recover(test_recover_params(file.clone(), checksum))?;
+        let err = cold
+            .load_row_group(&wrong, &want, ReadCharge::Foreground)
+            .expect_err("a cold read of a directory of another length must be refused");
+        assert!(
+            matches!(err, crate::Error::InvalidHeader(_)),
+            "delta {delta}: expected a framing refusal, got {err:?}",
+        );
+        assert!(
+            cold.data_unit_blocks(&wrong).is_err(),
+            "delta {delta}: the walks must refuse it too",
+        );
+
+        let warm = Table::recover(test_recover_params(file.clone(), checksum))?;
+        warm.load_row_group(&group, &want, ReadCharge::Foreground)?;
+        let err = warm
+            .load_row_group(&wrong, &want, ReadCharge::Foreground)
+            .expect_err("a cached directory of another length must be refused");
+        assert!(
+            matches!(err, crate::Error::InvalidHeader(_)),
+            "delta {delta}: expected a framing refusal, got {err:?}",
+        );
+    }
     Ok(())
 }
 
@@ -8504,10 +8558,15 @@ fn a_row_groups_blocks_are_refused_under_another_groups_tag() -> crate::Result<(
         "the group under its own tag"
     );
 
-    let Some(tag) = group.group_tag() else {
+    let Some(named) = group.row_group() else {
         panic!("a columnar index entry names its group");
     };
-    let other = group.with_group_tag(tag.checked_add(1));
+    let other = group.with_row_group(named.tag.checked_add(1).map(|tag| {
+        crate::table::index_block::RowGroupRef {
+            tag,
+            directory_len: named.directory_len,
+        }
+    }));
     let refused = table.data_unit_blocks(&other);
     assert!(
         refused.is_err(),
