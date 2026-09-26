@@ -2214,7 +2214,7 @@ fn salvage_blocks(
                         // is not a read's cost and is not charged.
                         match sb
                             .group
-                            .to_row_pages(&crate::table::row_group::PageWant::ALL, &mut 0)
+                            .to_row_pages(&mut 0)
                             .and_then(crate::table::row_group::RowPages::into_batch)
                             .and_then(|batch| {
                                 crate::table::columnar::column_batch_to_entries(&batch)

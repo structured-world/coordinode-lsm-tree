@@ -564,9 +564,7 @@ impl Iter {
                 // nothing. Charged before the result is judged: a group
                 // refused after a gather still did it.
                 let mut gathered = 0usize;
-                let batch = group
-                    .to_row_pages(&crate::table::row_group::PageWant::ALL, &mut gathered)
-                    .map(|pages| pages.batches);
+                let batch = group.to_row_pages(&mut gathered).map(|pages| pages.batches);
                 // Mask only when the segment has deletes AND this block's start row
                 // is known. The start-row map is built at open from the zone map
                 // (which covers every block), so an unmapped block is unreachable;

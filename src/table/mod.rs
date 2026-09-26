@@ -984,7 +984,7 @@ impl Table {
         }
         .load(want)?;
         let mut copied = 0usize;
-        let pages = group.to_row_pages(want, &mut copied);
+        let pages = group.to_row_pages(&mut copied);
         #[cfg(feature = "metrics")]
         if charge.is_counted() {
             self.metrics.record_gather(copied);
@@ -1791,15 +1791,14 @@ impl Table {
                         ))?;
                 decoded.decode_zone_block(column_id, &block.block.data)?;
             } else {
-                pages.push(Some(block.block));
+                pages.push(block.block);
             }
         }
         Ok(SalvageRowGroup {
-            group: crate::table::row_group::RowGroupBlocks {
-                directory: alloc::sync::Arc::new(decoded),
+            group: crate::table::row_group::RowGroupBlocks::whole(
+                alloc::sync::Arc::new(decoded),
                 pages,
-                zones: None,
-            },
+            ),
             verbatim,
             ecc_recovered,
         })
@@ -6339,19 +6338,16 @@ impl Table {
                         ))?;
                 block_zones.push(directory_decoded.decode_zone_block(column_id, &block.data)?);
             } else {
-                pages.push(Some(block));
+                pages.push(block);
             }
         }
-        let group = crate::table::row_group::RowGroupBlocks {
-            directory: alloc::sync::Arc::new(directory_decoded),
+        let group = crate::table::row_group::RowGroupBlocks::whole(
+            alloc::sync::Arc::new(directory_decoded),
             pages,
-            zones: None,
-        };
+        );
         // The gates are verification, which the counters leave out; they
         // re-derive per-group statistics, so the row pages are joined.
-        let batch = group
-            .to_row_pages(&crate::table::row_group::PageWant::ALL, &mut 0)?
-            .into_batch()?;
+        let batch = group.to_row_pages(&mut 0)?.into_batch()?;
         // The row pages' zones decide which pages a read skips, so they are
         // authenticated like the zone map: re-derived from the decoded rows,
         // every zone block's, in the order the writer lays them out, the key

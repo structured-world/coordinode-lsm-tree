@@ -355,7 +355,7 @@ impl Scanner {
                     "columnar: page length disagrees with its directory entry",
                 ));
             }
-            pages.push(Some(page));
+            pages.push(page);
         }
         for zone_block in directory.zone_blocks() {
             Self::skip_zone_block(reader, table_id, encryption, ecc, zone_block.length)?;
@@ -363,12 +363,9 @@ impl Scanner {
         // The scanner feeds compaction, which is maintenance and outside the
         // read counters, so neither the page copies nor the rebuilt values are
         // charged.
-        let pages = crate::table::row_group::RowGroupBlocks {
-            directory: alloc::sync::Arc::new(directory),
-            pages,
-            zones: None,
-        }
-        .to_row_pages(&crate::table::row_group::PageWant::ALL, &mut 0)?;
+        let pages =
+            crate::table::row_group::RowGroupBlocks::whole(alloc::sync::Arc::new(directory), pages)
+                .to_row_pages(&mut 0)?;
         DataBlock::from_column_batch(pages.batches, restart_interval, &mut 0)
     }
 
