@@ -121,45 +121,46 @@ table's base rules the table out.
 
 ### The page directory
 
-A block of type `ColumnPageDirectory`. Its header carries the row group's
-row count, because a reader needs it before any page is read: it bounds every
-slot, it is what the global row position sums, and a projection must not have
-to decode the key page just to count rows.
+A block of type `ColumnPageDirectory`. It gives a reader the row group's rows
+before any page is read, because they bound every slot, they are what the
+global row position sums, and a projection must not have to decode the key
+page just to count rows. Counts, row counts and lengths are LEB128 varints
+(`var`).
 
 | Header field | Width | Meaning |
 |---|---|---|
-| `version` | `u8` | directory wire version (2); an unknown one is refused |
-| `page_count` | `u16` | page entries that follow the row pages |
-| `row_count` | `u32` | rows in the group; the row pages sum to exactly this |
+| `version` | `u8` | directory wire version (3); an unknown one is refused |
 | `group_tag` | `u64` | names the group; every page repeats it in its stamp |
-| `row_page_count` | `u16` | row pages that follow |
-| `zone_block_count` | `u16` | zone blocks listed after the pages' entries |
+| `row_page_count` | `var` | row pages, at most `u16::MAX` |
+| `part_count` | `var` | column parts; parts times row pages is at most `u16::MAX` |
+| `zone_block_count` | `var` | zone blocks, at most `u16::MAX` |
 
-Then, for each row page in row order, its row count as a `u32`: none is zero,
-and together they are the group's rows. Then, for each page:
-
-| Field | Width | Meaning |
-|---|---|---|
-| `offset` | `u32` | start of the page, **relative to the end of the directory** |
-| `length` | `u32` | on-disk length of the page, header included |
-| `column_id` | `u16` | the column the page belongs to |
-| `part` | `u8` | which part of that column's encoding the page holds |
-| `flags` | `u8` | reserved; a reader rejects unknown bits rather than ignoring them |
-| `row_page` | `u16` | the row page whose rows the page holds |
+Then each column part once, in the order its pages lie: its `column_id`
+(`u16`) and `part` (`u8`). Then, for each row page in row order, its row count
+(`var`): none is zero, and the group's rows are their sum. Then one on-disk
+length (`var`, header included) per page, part by part and, within a part,
+row page by row page.
 
 A page is named by `(column_id, part, row_page)`. A column id alone is 16 bits
 wide already, so the three cannot share one field; keeping them separate is
 also what lets a column's parts be addressed individually once encodings name
 more than one.
 
-A directory is refused unless it is a complete grid: every column part has a
-page for every row page, and no `(column_id, part, row_page)` appears twice. A
-part missing a row page would hand back a batch short of a column for those
-rows, and a reader cannot tell a page that was never written from one that
-was lost.
+The directory records none of the three per page, nor where a page starts:
+the pages lie back to back from the directory's end in exactly the order of
+their lengths, so a page's offset is the sum of the lengths before it, and its
+place in the list is its column part and row page. That makes the grid
+complete by construction, every column part holding one page per row page,
+and leaves a writer one layout, the one that makes a run of one column's
+pages one contiguous read. A directory that named each page's placement
+itself (an earlier layout spent 14 bytes a page on an offset, a length, the
+three names and a flags byte) could describe gaps, overlaps and missing
+pages, all of which a reader had to refuse; at 64 KiB groups of 4 KiB row
+pages over the mixed-layout records, the directory averaged 1892 bytes that
+way and is 390 bytes this way.
 
 Then, for each zone block in the order the blocks follow the pages, the
-column whose zones it holds (`u16`) and its on-disk length (`u32`). The
+column whose zones it holds (`u16`) and its on-disk length (`var`). The
 directory ends with the key column's statistics zones (below). The directory,
 its pages and its zone blocks fill the group exactly; a reader refuses a group
 whose index entry and directory disagree about where it ends.

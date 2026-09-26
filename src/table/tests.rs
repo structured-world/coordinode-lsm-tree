@@ -8575,30 +8575,63 @@ fn a_row_groups_blocks_are_refused_under_another_groups_tag() -> crate::Result<(
     Ok(())
 }
 
+/// The first two row groups of `table`, in index order, whose extents,
+/// directories and, when `with_zone_block`, last zone blocks are each of one
+/// length: two groups a test can trade byte for byte.
+///
+/// Statistics zones are written as what each bound adds to the one before, so
+/// how long a group's directory and zone blocks are depends on its values, and
+/// not every two groups of one row count qualify.
+#[cfg(feature = "columnar")]
+fn two_groups_of_one_shape(
+    table: &Table,
+    with_zone_block: bool,
+) -> crate::Result<(KeyedBlockHandle, KeyedBlockHandle)> {
+    let groups: Vec<KeyedBlockHandle> = table.data_block_handles().collect::<crate::Result<_>>()?;
+    let shape =
+        |group: &KeyedBlockHandle| -> crate::Result<(u32, Option<core::num::NonZeroU32>, u32)> {
+            let zone_block = if with_zone_block {
+                match table.data_unit_blocks(group.as_ref())?.last() {
+                    Some(&(block, BlockType::ColumnZones)) => block.size(),
+                    _ => panic!("a group of several row pages ends in its zone block"),
+                }
+            } else {
+                0
+            };
+            Ok((
+                group.size(),
+                group.as_ref().row_group().map(|g| g.directory_len),
+                zone_block,
+            ))
+        };
+    let shapes = groups
+        .iter()
+        .map(shape)
+        .collect::<crate::Result<Vec<_>>>()?;
+    for (i, a) in shapes.iter().enumerate() {
+        if let Some(j) = (i + 1..shapes.len()).find(|&j| shapes.get(j) == Some(a)) {
+            return Ok((groups[i].clone(), groups[j].clone()));
+        }
+    }
+    panic!("the fixture holds two row groups of one shape");
+}
+
 /// A scan that meets two row groups swapped whole, directory and pages
 /// together, is refused. Each group is consistent in itself, so its checksums
 /// and its pages' stamps pass; only the index knows which group belongs where,
 /// and a scan streams the data without it, so it would hand compaction the
-/// second group's rows before the first's.
+/// later group's rows before the earlier one's.
 #[cfg(feature = "columnar")]
 #[test]
 fn a_scan_refuses_row_groups_swapped_whole() -> crate::Result<()> {
     let dir = tempdir()?;
     let file = dir.path().join("table");
-    let checksum = columnar_table_file_paged(&file, 400, 16, 100, 16 * 1_024, 1_024)?;
+    let checksum = columnar_table_file_paged(&file, 2_000, 16, 100, 16 * 1_024, 1_024)?;
     let (first, second) = {
         let table = Table::recover(test_recover_params(file.clone(), checksum))?;
-        let mut groups = table.data_block_handles();
-        let (Some(first), Some(second)) = (groups.next(), groups.next()) else {
-            panic!("the table has two row groups");
-        };
-        (*first?.as_ref(), *second?.as_ref())
+        let (first, second) = two_groups_of_one_shape(&table, false)?;
+        (first.into_inner(), second.into_inner())
     };
-    assert_eq!(
-        first.size(),
-        second.size(),
-        "the two groups are of one shape"
-    );
 
     let mut bytes = std::fs::read(&file)?;
     let extent = |group: &BlockHandle| {
@@ -8630,30 +8663,22 @@ fn a_scan_refuses_row_groups_swapped_whole() -> crate::Result<()> {
     Ok(())
 }
 
-/// Writes the second row group's directory over the first's, the two being of
-/// one shape, and returns the first group's handle from the index with the
-/// file's original bytes.
+/// Writes a later row group's directory over an earlier one's, the two being
+/// of one shape, and returns the earlier group's index entry with the file's
+/// original bytes.
 #[cfg(feature = "columnar")]
-fn second_groups_directory_in_the_first(
+fn a_later_groups_directory_in_an_earlier(
     file: &std::path::Path,
     checksum: Checksum,
-) -> crate::Result<(BlockHandle, Vec<u8>)> {
+) -> crate::Result<(KeyedBlockHandle, Vec<u8>)> {
     use crate::coding::Decode;
     use crate::table::block::Header;
 
-    let (first, second) = {
+    let (earlier, later) = {
         let table = Table::recover(test_recover_params(file.to_path_buf(), checksum))?;
-        let mut groups = table.data_block_handles();
-        let (Some(first), Some(second)) = (groups.next(), groups.next()) else {
-            panic!("the table has two row groups");
-        };
-        (*first?.as_ref(), *second?.as_ref())
+        two_groups_of_one_shape(&table, false)?
     };
-    assert_eq!(
-        first.size(),
-        second.size(),
-        "the two groups are of one shape"
-    );
+    let (first, second) = (*earlier.as_ref(), *later.as_ref());
 
     let original = std::fs::read(file)?;
     let mut bytes = original.clone();
@@ -8680,7 +8705,7 @@ fn second_groups_directory_in_the_first(
         (0, into.start as u64),
     )?;
     std::fs::write(file, &bytes)?;
-    Ok((first, original))
+    Ok((earlier, original))
 }
 
 /// A point read that meets another group's directory in this group's place
@@ -8693,16 +8718,16 @@ fn a_point_read_refuses_another_groups_directory_whose_zones_prune_every_page() 
 {
     let dir = tempdir()?;
     let file = dir.path().join("table");
-    let checksum = columnar_table_file_paged(&file, 400, 16, 100, 16 * 1_024, 1_024)?;
-    let (_, original) = second_groups_directory_in_the_first(&file, checksum)?;
+    let checksum = columnar_table_file_paged(&file, 2_000, 16, 100, 16 * 1_024, 1_024)?;
+    let (earlier, original) = a_later_groups_directory_in_an_earlier(&file, checksum)?;
 
-    let mut key = b"key000000".to_vec();
-    key.resize(16, b'k');
+    // The earlier group's last key: every key of the later group is above it.
+    let key = earlier.end_key().to_vec();
     let table = Table::recover(test_recover_params(file.clone(), checksum))?;
     let got = table.get(&key, crate::MAX_SEQNO, crate::hash::hash64(&key));
     assert!(
         got.is_err(),
-        "a key of the first group, read through the second's directory, got {got:?}",
+        "a key of the earlier group, read through the later one's directory, got {got:?}",
     );
 
     std::fs::write(&file, &original)?;
@@ -8723,8 +8748,9 @@ fn a_directory_refused_by_its_pages_is_not_cached() -> crate::Result<()> {
 
     let dir = tempdir()?;
     let file = dir.path().join("table");
-    let checksum = columnar_table_file_paged(&file, 400, 16, 100, 16 * 1_024, 1_024)?;
-    let (first, original) = second_groups_directory_in_the_first(&file, checksum)?;
+    let checksum = columnar_table_file_paged(&file, 2_000, 16, 100, 16 * 1_024, 1_024)?;
+    let (earlier, original) = a_later_groups_directory_in_an_earlier(&file, checksum)?;
+    let first = *earlier.as_ref();
 
     let table = Table::recover(test_recover_params(file.clone(), checksum))?;
     assert!(
@@ -8993,12 +9019,8 @@ fn a_zone_block_moved_to_another_group_is_refused() -> crate::Result<()> {
 
     let dir = tempdir()?;
     let file = dir.path().join("table");
-    let checksum = zoned_table_file(&file, 1_500, &[])?;
+    let checksum = zoned_table_file(&file, 6_000, &[])?;
     let table = Table::recover(test_recover_params(file.clone(), checksum))?;
-    let groups: Vec<BlockHandle> = table
-        .data_block_handles()
-        .map(|handle| handle.map(KeyedBlockHandle::into_inner))
-        .collect::<crate::Result<_>>()?;
     let zone_block = |group: &BlockHandle| -> crate::Result<BlockHandle> {
         let blocks = table.data_unit_blocks(group)?;
         let Some(&(block, BlockType::ColumnZones)) = blocks.last() else {
@@ -9006,11 +9028,13 @@ fn a_zone_block_moved_to_another_group_is_refused() -> crate::Result<()> {
         };
         Ok(block)
     };
-    let (Some(first), Some(second)) = (groups.first(), groups.get(1)) else {
-        panic!("the fixture spans several groups");
-    };
-    let (a, b) = (zone_block(first)?, zone_block(second)?);
-    assert_eq!(a.size(), b.size(), "the two zone blocks are of one length");
+    let (earlier, later) = two_groups_of_one_shape(&table, true)?;
+    let (a, b) = (zone_block(earlier.as_ref())?, zone_block(later.as_ref())?);
+    // The earlier group's last row: `zoned_key` writes its number after `key`.
+    let last_row: u32 = core::str::from_utf8(earlier.end_key().get(3..).expect("a zoned key"))
+        .ok()
+        .and_then(|digits| digits.parse().ok())
+        .expect("a zoned key ends in its row number");
     drop(table);
 
     let mut bytes = std::fs::read(&file)?;
@@ -9032,12 +9056,12 @@ fn a_zone_block_moved_to_another_group_is_refused() -> crate::Result<()> {
     crate::test_forge::rebind_moved_frame(block, (0, a_at), (0, b_at))?;
     std::fs::write(&file, &bytes)?;
 
-    // A value of the first group, which its moved-in zones do not cover.
+    // A value of the earlier group, which its moved-in zones do not cover.
     let table = Table::recover(test_recover_params(file, checksum))?;
     let predicate = ColumnRangePredicate {
         column_id: COL_VALUE,
-        lower: Some(zoned_value(10)),
-        upper: Some(zoned_value(10)),
+        lower: Some(zoned_value(last_row)),
+        upper: Some(zoned_value(last_row)),
         apply: crate::table::columnar_predicate::PredicateApply::Filter,
     };
     let result = table.columnar_scan(&[COL_USER_KEY, COL_VALUE], Some(&predicate));

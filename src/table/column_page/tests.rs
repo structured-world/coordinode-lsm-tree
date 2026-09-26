@@ -65,10 +65,6 @@ fn directory() -> PageDirectory {
     .expect("ascending, non-overlapping, a complete grid")
 }
 
-/// Byte offset of the first entry's `flags` field: the header, the two row
-/// pages, then the entry's offset, length, column id and part.
-const FIRST_FLAGS_AT: usize = (1 + 2 + 4 + 8 + 2 + 2) + 2 * 4 + (4 + 4 + 2 + 1);
-
 #[test]
 fn a_directory_round_trips_through_its_wire_form() {
     let original = directory();
@@ -156,38 +152,58 @@ fn an_unknown_version_is_refused_rather_than_parsed() {
 }
 
 #[test]
-fn overlapping_pages_are_refused_at_construction() {
-    // A directory that maps one byte into two pages has no correct reading,
-    // so it is rejected where it is still fixable rather than at read time.
-    let err = PageDirectory::new(
-        ROWS,
-        TAG,
-        vec![ROWS],
-        vec![entry(0, 200, 0, 0, 0), entry(128, 64, 1, 0, 0)],
-        no_zones(),
-        vec![],
-    )
-    .expect_err("overlapping pages must be refused");
-    assert!(
-        format!("{err:?}").contains("overlapping"),
-        "the error must name the overlap, got {err:?}",
-    );
+fn pages_that_do_not_lie_back_to_back_are_refused_at_construction() {
+    // A directory that maps one byte into two pages, leaves bytes between
+    // pages that no page covers, or lists its pages out of order has no
+    // correct reading, and the wire form, which records only lengths, could
+    // not say it: it is rejected where it is still fixable.
+    let placements = [
+        (
+            "an overlap",
+            vec![entry(0, 200, 0, 0, 0), entry(128, 64, 1, 0, 0)],
+        ),
+        (
+            "a gap",
+            vec![entry(0, 64, 0, 0, 0), entry(128, 64, 1, 0, 0)],
+        ),
+        (
+            "a descent",
+            vec![entry(64, 64, 1, 0, 0), entry(0, 64, 0, 0, 0)],
+        ),
+        ("a first page past the start", vec![entry(8, 64, 0, 0, 0)]),
+    ];
+    for (what, entries) in placements {
+        let err = PageDirectory::new(ROWS, TAG, vec![ROWS], entries, no_zones(), vec![])
+            .expect_err("pages that are not back to back must be refused");
+        assert!(
+            format!("{err:?}").contains("where the one before it ends"),
+            "{what}: the error must name the placement, got {err:?}",
+        );
+    }
 }
 
 #[test]
-fn descending_pages_are_refused_at_construction() {
+fn a_column_parts_pages_interleaved_with_anothers_are_refused() {
+    // Row page by row page rather than part by part: every page is there and
+    // back to back, but a reader taking each page's part and row page from
+    // its place would file them under the wrong ones.
     let err = PageDirectory::new(
         ROWS,
         TAG,
-        vec![ROWS],
-        vec![entry(4_096, 64, 1, 0, 0), entry(0, 128, 0, 0, 0)],
+        vec![200, 312],
+        vec![
+            entry(0, 64, 0, 0, 0),
+            entry(64, 64, 3, 0, 0),
+            entry(128, 64, 0, 0, 1),
+            entry(192, 64, 3, 0, 1),
+        ],
         no_zones(),
         vec![],
     )
-    .expect_err("descending pages must be refused");
+    .expect_err("interleaved parts must be refused");
     assert!(
-        format!("{err:?}").contains("ascending"),
-        "the error must name the ordering, got {err:?}",
+        format!("{err:?}").contains("missing a row page"),
+        "the error must name the broken run, got {err:?}",
     );
 }
 
@@ -299,7 +315,7 @@ fn a_page_extent_that_overflows_is_refused() {
         ROWS,
         TAG,
         vec![ROWS],
-        vec![entry(u32::MAX - 8, 16, 0, 0, 0)],
+        vec![entry(0, u32::MAX, 0, 0, 0), entry(u32::MAX, 16, 1, 0, 0)],
         no_zones(),
         vec![],
     )
@@ -397,18 +413,56 @@ fn a_truncated_payload_is_refused() {
 }
 
 #[test]
-fn a_set_reserved_flag_is_refused() {
-    // The flag field is the format's room to grow. A reader that ignored an
-    // unknown bit would read a page whose meaning has changed as if it had
-    // not, which is the failure the bit exists to prevent.
+fn the_wire_form_records_parts_row_pages_and_lengths_only() {
+    // Offsets, column parts and row pages of the pages are their place in the
+    // list, so the wire holds each part once and each page as its length. The
+    // exact bytes pin that: a field put back per page would change them.
     let mut bytes = Vec::new();
     directory().encode_into(&mut bytes);
-    bytes[FIRST_FLAGS_AT] = 1;
 
-    let err = PageDirectory::decode(&bytes).expect_err("a reserved flag must be refused");
+    let mut expected = vec![VERSION];
+    expected.extend_from_slice(&TAG.to_le_bytes());
+    // Two row pages, three column parts, no zone block.
+    expected.extend_from_slice(&[2, 3, 0]);
+    // Each part once, in the order its pages lie: (0, 0), (3, 0), (3, 1).
+    expected.extend_from_slice(&[0, 0, 0, 3, 0, 0, 3, 0, 1]);
+    // 200 and 312 rows, as varints.
+    expected.extend_from_slice(&[200, 1, 184, 2]);
+    // One length per page, part by part, row page by row page: 64 and 80,
+    // 2048 twice, 32 and 40.
+    expected.extend_from_slice(&[64, 80, 128, 16, 128, 16, 32, 40]);
+    assert_eq!(
+        bytes.get(..expected.len()),
+        Some(expected.as_slice()),
+        "everything before the zones",
+    );
+}
+
+#[test]
+fn a_count_or_length_past_its_field_is_refused() {
+    // Varints are as wide as their value, so a damaged one can decode to a
+    // number no field holds; each is refused rather than truncated into one.
+    let mut header = vec![VERSION];
+    header.extend_from_slice(&TAG.to_le_bytes());
+
+    // A row page count of 65536: three varint bytes, one past u16.
+    let mut too_many_row_pages = header.clone();
+    too_many_row_pages.extend_from_slice(&[0x80, 0x80, 0x04, 0, 0]);
+    PageDirectory::decode(&too_many_row_pages).expect_err("a row page count past u16");
+
+    // A varint running past the widest a u16 takes.
+    let mut overlong = header.clone();
+    overlong.extend_from_slice(&[0x81, 0x80, 0x80, 0x00, 0, 0]);
+    PageDirectory::decode(&overlong).expect_err("an overlong varint");
+
+    // 256 parts of 256 row pages each: 65536 pages, one more than the count
+    // the reader and the page stamps hold.
+    let mut too_many_pages = header;
+    too_many_pages.extend_from_slice(&[0x80, 0x02, 0x80, 0x02, 0]);
+    let err = PageDirectory::decode(&too_many_pages).expect_err("a page count past u16");
     assert!(
-        format!("{err:?}").contains("reserved"),
-        "the error must name the reserved flag, got {err:?}",
+        format!("{err:?}").contains("page count"),
+        "the error must name the page count, got {err:?}",
     );
 }
 
@@ -613,13 +667,20 @@ fn zones_that_do_not_match_the_grid_are_refused() {
     assert!(refused(twice).contains("two zones"));
 }
 
+/// The wire position of the last zone's `flags` in the fixture's directory.
+/// That zone holds `melon` and `zucchini` after a zone ending at `mango`, so
+/// it ends with `melon` as one shared byte and a four-byte suffix, then
+/// `zucchini` as nothing shared and an eight-byte suffix.
+fn last_zone_flags_at(bytes: &[u8]) -> usize {
+    bytes.len() - (2 + 8) - (2 + 4) - 1
+}
+
 #[test]
 fn a_zone_flag_the_reader_does_not_know_is_refused() {
-    // The flags byte of the last zone sits after its null count; the fixture's
-    // last zone holds `melon` and `zucchini`.
     let mut bytes = Vec::new();
     directory().encode_into(&mut bytes);
-    let flags_at = bytes.len() - (1 + 5 + 1 + 8) - 1;
+    let flags_at = last_zone_flags_at(&bytes);
+    assert_eq!(bytes[flags_at], 0, "the fixture's last zone is bounded");
     bytes[flags_at] = 2;
     let err = PageDirectory::decode(&bytes).expect_err("an unknown zone flag must be refused");
     assert!(
@@ -627,12 +688,72 @@ fn a_zone_flag_the_reader_does_not_know_is_refused() {
         "got {err:?}"
     );
 
+    // Unbounded, the upper bound that follows is bytes the zones do not
+    // declare.
     bytes[flags_at] = 1;
     let err = PageDirectory::decode(&bytes).expect_err("an unbounded zone with a bound");
-    assert!(
-        format!("{err:?}").contains("records an upper bound"),
-        "got {err:?}"
+    assert!(format!("{err:?}").contains("trailing"), "got {err:?}");
+}
+
+#[test]
+fn neighbouring_bounds_are_written_as_what_they_add_to_the_one_before() {
+    // A sorted column's zones share most of their bytes with the zone before,
+    // and a zone's upper bound with its lower one. The wire keeps only what
+    // each bound adds, so the key zones of a group cost a few bytes per row
+    // page rather than two whole keys; the exact bytes pin that.
+    let mut zones = PageZones::new(vec![0]);
+    zones.push(0, Some((b"key000100", b"key000199")));
+    zones.push(3, Some((b"key000200", b"key000299")));
+    let mut bytes = Vec::new();
+    zones.encode_into(&mut bytes);
+    let expected: &[u8] = &[
+        // One column, column 0.
+        1, 0, 0, //
+        // No nulls, bounded; `key000100` against nothing; `key000199`
+        // against it: seven shared bytes, then `99`.
+        0, 0, 0, 9, b'k', b'e', b'y', b'0', b'0', b'0', b'1', b'0', b'0', 7, 2, b'9', b'9',
+        // Three nulls, bounded; `key000200` against `key000199`: six shared
+        // bytes, then `200`; `key000299` against it: seven, then `99`.
+        3, 0, 6, 3, b'2', b'0', b'0', 7, 2, b'9', b'9',
+    ];
+    assert_eq!(bytes, expected);
+
+    let with_zones = with_zones(zones.clone()).expect("the zones fit the fixture's grid");
+    let mut directory_bytes = Vec::new();
+    with_zones.encode_into(&mut directory_bytes);
+    assert_eq!(
+        PageDirectory::decode(&directory_bytes)
+            .expect("decode")
+            .zones(),
+        &zones,
+        "the bounds come back whole",
     );
+}
+
+#[test]
+fn a_bound_that_cannot_be_rebuilt_is_refused() {
+    // A bound claims a prefix of its reference; one claiming more than the
+    // reference holds, or adding up to more than a zone keeps, has no
+    // reading, and taking it anyway would prune by bytes nobody wrote.
+    let mut bytes = Vec::new();
+    directory().encode_into(&mut bytes);
+    // The last zone's upper bound, `zucchini`, shares nothing with `melon`.
+    let shared_at = bytes.len() - (2 + 8);
+    assert_eq!(bytes[shared_at], 0);
+
+    let mut over_reference = bytes.clone();
+    over_reference[shared_at] = 6; // `melon` has five bytes
+    PageDirectory::decode(&over_reference).expect_err("a prefix longer than the reference");
+
+    // Five shared bytes and a suffix that takes the bound past what a zone
+    // keeps: the suffix length claims 60 bytes, of which only the eight of
+    // `zucchini` follow, so it is also truncated; a long enough payload is
+    // refused for its length alone.
+    let mut too_long = bytes;
+    too_long[shared_at] = 5;
+    too_long[shared_at + 1] = 60;
+    too_long.extend_from_slice(&[b'z'; 52]);
+    PageDirectory::decode(&too_long).expect_err("a bound past ZONE_BOUND_LEN");
 }
 
 /// The zones of column 3 over the fixture's two row pages, as a zone block

@@ -1060,7 +1060,8 @@ pub fn check_directory_len(indexed: u32, found: u32) -> crate::Result<()> {
 }
 
 /// Proves the directory describes a layout that fills the group exactly: the
-/// directory, its pages back to back, then its zone block when it has one.
+/// directory, its pages back to back (which a [`PageDirectory`] holds by
+/// construction), then its zone blocks.
 ///
 /// The index entry and the directory are two independent statements of where
 /// the group ends. A writer makes them agree by construction, so a
@@ -1071,23 +1072,11 @@ pub fn check_group_extent(
     directory_len: u32,
     directory: &PageDirectory,
 ) -> crate::Result<()> {
-    let described = directory.group_len(directory_len);
-    if described != Some(group.size()) {
-        return Err(crate::Error::InvalidHeader(
+    if directory.group_len(directory_len) == Some(group.size()) {
+        Ok(())
+    } else {
+        Err(crate::Error::InvalidHeader(
             "columnar: page directory does not fill its row group",
-        ));
+        ))
     }
-    // Contiguity, not only total length: a page offset that skips ahead would
-    // leave unverified bytes inside the group, and the sum alone would not
-    // see it if another page made up the difference.
-    let mut expected = 0_u32;
-    for entry in directory.entries() {
-        if entry.offset != expected {
-            return Err(crate::Error::InvalidHeader(
-                "columnar: row group pages are not contiguous",
-            ));
-        }
-        expected = expected.wrapping_add(entry.length);
-    }
-    Ok(())
 }

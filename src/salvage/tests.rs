@@ -3805,9 +3805,11 @@ fn zoned_source(source: &std::path::Path, fs: &Arc<dyn Fs>) -> crate::Result<()>
     Ok(())
 }
 
-/// Narrows the zone of row page 1 to its upper bound alone, keeping every
-/// bound's length, so the zones stay well formed and the same size and only
-/// disagree with the rows they describe.
+/// Narrows the zone of row page 1 by raising the last byte of its lower bound,
+/// so the zones stay well formed and only disagree with the rows they
+/// describe: the bound's first row now falls below it. The byte is one no
+/// neighbouring bound shares, so the zones keep their wire length, which the
+/// forged block's framing needs.
 #[cfg(feature = "columnar")]
 fn narrowed(
     zones: &crate::table::column_page::PageZones,
@@ -3823,11 +3825,21 @@ fn narrowed(
             let Some(max) = zone.max else {
                 panic!("the fixture's zones are bounded");
             };
-            let min = if row_page == 1 { max } else { zone.min };
-            assert_eq!(min.len(), zone.min.len(), "the forgery keeps the length");
-            out.push(zone.null_count, Some((min, max)));
+            let mut min = zone.min.to_vec();
+            if row_page == 1 {
+                let Some(last) = min.last_mut() else {
+                    panic!("the fixture's bounds are not empty");
+                };
+                *last += 1;
+                assert!(min.as_slice() <= max, "the forgery keeps the zone ordered");
+            }
+            out.push(zone.null_count, Some((&min, max)));
         }
     }
+    let (mut before, mut after) = (Vec::new(), Vec::new());
+    zones.encode_into(&mut before);
+    out.encode_into(&mut after);
+    assert_eq!(after.len(), before.len(), "the forgery keeps the length");
     out
 }
 
