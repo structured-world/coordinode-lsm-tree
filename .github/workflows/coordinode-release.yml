@@ -78,3 +78,30 @@ jobs:
           config: .release-plz.toml
         env:
           GITHUB_TOKEN: ${{ steps.app-token.outputs.token }}
+
+      # Step 3: The "Latest release" mark belongs to the highest version. This
+      # line's releases are the highest until a newer major ships from main,
+      # and must not take the mark after that; release-plz only has a static
+      # switch (`git_release_latest`, off here), so the mark is placed here
+      # instead. Re-checked on every run, so it also catches up on releases
+      # an earlier run published.
+      - name: Mark the highest release as latest
+        env:
+          GH_TOKEN: ${{ steps.app-token.outputs.token }}
+          REPO: ${{ github.repository }}
+        run: |
+          set -euo pipefail
+          highest=$(gh release list --repo "$REPO" --exclude-drafts --exclude-pre-releases \
+              --limit 1000 --json tagName --jq '.[].tagName' \
+            | grep -E '^v[0-9]+\.[0-9]+\.[0-9]+$' | sort -V | tail -n 1)
+          if [ -z "$highest" ]; then
+            echo "no published release"
+            exit 0
+          fi
+          current=$(gh release view --repo "$REPO" --json tagName --jq '.tagName' || true)
+          if [ "$current" = "$highest" ]; then
+            echo "$highest is already the latest release"
+            exit 0
+          fi
+          echo "latest release: ${current:-none} -> $highest"
+          gh release edit "$highest" --repo "$REPO" --latest
