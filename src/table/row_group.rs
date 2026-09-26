@@ -94,19 +94,22 @@ impl<'a> PageWant<'a> {
         }
     }
 
-    /// The column whose zone block resolving this want against `directory`
-    /// needs: it selects by a column the directory carries no zones for, and
-    /// the group has a zone block for it.
-    fn zone_block_column(&self, directory: &PageDirectory) -> Option<u16> {
+    /// The column this want selects row pages by, when it selects by zones.
+    fn zone_column(&self) -> Option<u16> {
         match self.row_pages {
-            RowPageSelect::Zone { column_id, .. }
-                if !directory.zones().describes(column_id)
-                    && directory.zone_block(column_id).is_some() =>
-            {
-                Some(column_id)
-            }
-            RowPageSelect::All | RowPageSelect::Range(_) | RowPageSelect::Zone { .. } => None,
+            RowPageSelect::Zone { column_id, .. } => Some(column_id),
+            RowPageSelect::All | RowPageSelect::Range(_) => None,
         }
+    }
+
+    /// The column whose zone block resolving this want against `directory`
+    /// needs: it selects by a column whose zones the directory does not keep,
+    /// and the group has a zone block for it.
+    fn zone_block_column(&self, directory: &PageDirectory) -> Option<u16> {
+        self.zone_column().filter(|&column_id| {
+            !directory.head_zones().describes(column_id)
+                && directory.zone_block(column_id).is_some()
+        })
     }
 
     /// This want resolved against `directory` and, when it was read, the
@@ -143,7 +146,7 @@ impl<'a> PageWant<'a> {
                 .zip(directory.row_pages())
                 .map(|(ordinal, &rows)| {
                     directory
-                        .zones()
+                        .head_zones()
                         .zone(ordinal, *column_id)
                         .or_else(|| block_zones.and_then(|z| z.zone(ordinal, *column_id)))
                         .is_none_or(|zone| zone_may_match(zone, rows, *lower, *upper))
@@ -306,8 +309,30 @@ impl GroupRead<'_> {
             // what names the group here.
             check_directory_len(indexed_directory_len(self.group)?, directory_len)?;
             check_group_extent(self.group, directory_len, &directory)?;
+            check_head_zones_len(self.group, &directory)?;
             self.check_group_tag(&directory)?;
             let mut fd = None;
+            // A directory cached by a read that did not select by its head
+            // zone block's column lacks those zones: the first read that does
+            // reads the block and caches the directory with them.
+            let directory = if want
+                .zone_column()
+                .is_some_and(|column_id| directory.lacks_head_zones_for(column_id))
+            {
+                let directory =
+                    self.with_head_zones(&mut fd, &directory, directory_len, &Slice::empty())?;
+                if self.charge.touches_cache() {
+                    self.cache.insert_directory(
+                        self.table_id,
+                        self.group.offset(),
+                        Arc::clone(&directory),
+                        directory_len,
+                    );
+                }
+                directory
+            } else {
+                directory
+            };
             let zones = match want.zone_block_column(&directory) {
                 Some(column_id) => Some(self.zone_block(
                     &mut fd,
@@ -315,6 +340,7 @@ impl GroupRead<'_> {
                     directory_len,
                     column_id,
                     &Slice::empty(),
+                    true,
                 )?),
                 None => None,
             };
@@ -355,10 +381,31 @@ impl GroupRead<'_> {
         self.read_selective(fd, want)
     }
 
+    /// `directory` with its head zone block's zones kept on it, the block
+    /// read, verified and admitted like any zone block. `front` holds the
+    /// group's first bytes when an earlier read brought them in.
+    fn with_head_zones(
+        &self,
+        fd: &mut Option<Arc<dyn FsFile>>,
+        directory: &Arc<PageDirectory>,
+        directory_len: u32,
+        front: &Slice,
+    ) -> crate::Result<Arc<PageDirectory>> {
+        let Some(head) = directory.head_zone_block() else {
+            return Ok(Arc::clone(directory));
+        };
+        // Kept decoded on the directory, so the block itself is not cached.
+        let zones = self.zone_block(fd, directory, directory_len, head.column_id, front, false)?;
+        Ok(Arc::new(
+            PageDirectory::clone(directory).with_head_zones(zones)?,
+        ))
+    }
+
     /// The group's zone block, from the cache or read, verified and admitted
-    /// like a page, decoded and checked against `directory`. `front` holds the
-    /// group's first bytes when an earlier read brought them in; `fd` is
-    /// opened here when the block has to be read and it is not yet.
+    /// like a page, decoded and checked against `directory`, and cached when
+    /// `cache` says so. `front` holds the group's first bytes when an earlier
+    /// read brought them in; `fd` is opened here when the block has to be
+    /// read and it is not yet.
     fn zone_block(
         &self,
         fd: &mut Option<Arc<dyn FsFile>>,
@@ -366,16 +413,17 @@ impl GroupRead<'_> {
         directory_len: u32,
         column_id: u16,
         front: &Slice,
+        cache: bool,
     ) -> crate::Result<PageZones> {
-        let (after_pages, length) =
+        let (after_directory, length) =
             directory
                 .zone_block(column_id)
                 .ok_or(crate::Error::InvalidHeader(
                     "columnar: the column has no zone block",
                 ))?;
-        // The extent check proved the directory, the pages and the zone
-        // blocks fill the group, and the group's length is a `u32`.
-        let start = directory_len as usize + directory.pages_len() as usize + after_pages as usize;
+        // The extent check proved the directory, its zone blocks and its
+        // pages fill the group, and the group's length is a `u32`.
+        let start = directory_len as usize + after_directory as usize;
         let end = start + length as usize;
         let handle = BlockHandle::new(BlockOffset(*self.group.offset() + start as u64), length);
         if let Some(block) = self.lookup(handle.offset(), BlockType::ColumnZones)? {
@@ -403,7 +451,9 @@ impl GroupRead<'_> {
             false,
         )?;
         let zones = directory.decode_zone_block(column_id, &block.data)?;
-        self.cache_block(&handle, block);
+        if cache {
+            self.cache_block(&handle, block);
+        }
         Ok(zones)
     }
 
@@ -431,7 +481,9 @@ impl GroupRead<'_> {
 
     /// The directory, then the wanted pages. A read that expects every page
     /// and fits the I/O buffer takes the whole group in one request, so the
-    /// pages are served from it; any other read takes exactly the directory.
+    /// pages are served from it; any other read takes exactly the directory,
+    /// with the head zone block after it when it selects by the key column,
+    /// whose zones a writer puts there.
     fn read_selective(
         &self,
         fd: Arc<dyn FsFile>,
@@ -441,7 +493,19 @@ impl GroupRead<'_> {
         let io_buffer = self.budget.io_buffer() as usize;
         let directory_len = indexed_directory_len(self.group)?;
         self.check_block_len(directory_len)?;
-        if directory_len as usize > group_len {
+        let head_len = if want.zone_column() == Some(crate::table::columnar::COL_USER_KEY) {
+            self.group
+                .row_group()
+                .map_or(0, |group| group.head_zones_len)
+        } else {
+            0
+        };
+        if head_len > 0 {
+            self.check_block_len(head_len)?;
+        }
+        // Both are u32s, and the index entry refused a sum past the group.
+        let head_end = directory_len as usize + head_len as usize;
+        if head_end > group_len {
             return Err(crate::Error::InvalidHeader(
                 "columnar: page directory overruns its row group",
             ));
@@ -449,19 +513,27 @@ impl GroupRead<'_> {
         let prefix = if want.whole && group_len <= io_buffer {
             self.read(fd.as_ref(), 0, group_len, BlockType::ColumnPage)?
         } else {
-            self.read(
-                fd.as_ref(),
-                0,
-                directory_len as usize,
-                BlockType::ColumnPageDirectory,
-            )?
+            self.read(fd.as_ref(), 0, head_end, BlockType::ColumnPageDirectory)?
         };
         let directory = self.admit_directory(&prefix, directory_len)?;
         let mut fd = Some(fd);
+        let directory = if want
+            .zone_column()
+            .is_some_and(|column_id| directory.lacks_head_zones_for(column_id))
+        {
+            self.with_head_zones(&mut fd, &directory, directory_len, &prefix)?
+        } else {
+            directory
+        };
         let zones = match want.zone_block_column(&directory) {
-            Some(column_id) => {
-                Some(self.zone_block(&mut fd, &directory, directory_len, column_id, &prefix)?)
-            }
+            Some(column_id) => Some(self.zone_block(
+                &mut fd,
+                &directory,
+                directory_len,
+                column_id,
+                &prefix,
+                true,
+            )?),
             None => None,
         };
         let fd = match fd {
@@ -532,6 +604,7 @@ impl GroupRead<'_> {
         )?;
         let directory = Arc::new(PageDirectory::decode(&block.data)?);
         check_group_extent(self.group, directory_len, &directory)?;
+        check_head_zones_len(self.group, &directory)?;
         self.check_group_tag(&directory)?;
         Ok(directory)
     }
@@ -588,9 +661,10 @@ impl GroupRead<'_> {
             requests
         };
         // Every offset below is within the group: the extent check proved
-        // that the directory and its pages fill it exactly, and the group's
-        // length is a `u32`.
-        let page_at = |entry: &PageEntry| directory_len as usize + entry.offset as usize;
+        // that the directory, its zone blocks and its pages fill it exactly,
+        // and the group's length is a `u32`.
+        let pages_at = directory_len as usize + directory.pages_start() as usize;
+        let page_at = |entry: &PageEntry| pages_at + entry.offset as usize;
         let span_of = |run: &core::ops::Range<usize>| {
             let first = entries.get(run.start)?;
             let last = entries.get(run.end.checked_sub(1)?)?;
@@ -652,7 +726,8 @@ impl GroupRead<'_> {
         pages: &mut [Option<Block>],
     ) -> crate::Result<()> {
         let entries = directory.entries();
-        let page_at = |entry: &PageEntry| directory_len as usize + entry.offset as usize;
+        let pages_at = directory_len as usize + directory.pages_start() as usize;
+        let page_at = |entry: &PageEntry| pages_at + entry.offset as usize;
         for index in run {
             let Some(entry) = entries.get(index) else {
                 continue;
@@ -759,10 +834,11 @@ impl GroupRead<'_> {
         want: &Wanted<'_>,
     ) -> crate::Result<Vec<Option<Block>>> {
         let mut pages = Vec::with_capacity(directory.entries().len());
+        let pages_at =
+            *self.group.offset() + u64::from(directory_len) + u64::from(directory.pages_start());
         for entry in directory.entries() {
             let page = if want.wants(entry) {
-                let offset =
-                    *self.group.offset() + u64::from(directory_len) + u64::from(entry.offset);
+                let offset = pages_at + u64::from(entry.offset);
                 self.lookup(BlockOffset(offset), BlockType::ColumnPage)?
             } else {
                 None
@@ -1055,6 +1131,31 @@ pub fn check_directory_len(indexed: u32, found: u32) -> crate::Result<()> {
     } else {
         Err(crate::Error::InvalidHeader(
             "columnar: page directory length disagrees with its index entry",
+        ))
+    }
+}
+
+/// Refuses a directory whose head zone block is not the length `group`'s index
+/// entry records: a read that selects by the key column takes that many bytes
+/// after the directory as the block, so a disagreement would cut it short or
+/// run it into the first page.
+///
+/// # Errors
+///
+/// [`crate::Error::InvalidHeader`] when they differ, or when the entry names
+/// no row group.
+pub fn check_head_zones_len(group: &BlockHandle, directory: &PageDirectory) -> crate::Result<()> {
+    let indexed = group
+        .row_group()
+        .ok_or(crate::Error::InvalidHeader(
+            "columnar: the index entry names no row group",
+        ))?
+        .head_zones_len;
+    if indexed == directory.pages_start() {
+        Ok(())
+    } else {
+        Err(crate::Error::InvalidHeader(
+            "columnar: head zone block length disagrees with its index entry",
         ))
     }
 }

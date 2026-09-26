@@ -324,6 +324,14 @@ impl Scanner {
         }
         let directory = crate::table::column_page::PageDirectory::decode(&directory_block.data)?;
         crate::table::row_group::check_group_tag(group_tag, &directory)?;
+        // The zone blocks a scan of every row has no use for are read and
+        // verified like the rest, both to reach the next block and so that a
+        // stream that ends or diverges there is refused rather than
+        // misframed: the head one between the directory and the pages, the
+        // others after the pages.
+        if let Some(head) = directory.head_zone_block() {
+            Self::skip_zone_block(reader, table_id, encryption, ecc, head.length)?;
+        }
         let mut pages = Vec::with_capacity(directory.entries().len());
         for entry in directory.entries() {
             let page = Self::read_block(
@@ -349,32 +357,8 @@ impl Scanner {
             }
             pages.push(Some(page));
         }
-        // The zone blocks, when the group has any, close the group. A scan of
-        // every row has no use for them, but they are read and verified like
-        // the rest, both to reach the next group and so that a stream that
-        // ends or diverges there is refused rather than misframed.
         for zone_block in directory.zone_blocks() {
-            let zones = Self::read_block(
-                reader,
-                table_id,
-                BlockType::ColumnZones,
-                CompressionType::None,
-                encryption,
-                ecc,
-                #[cfg(zstd_any)]
-                None,
-            )?;
-            if zones.header.block_type != BlockType::ColumnZones {
-                return Err(crate::Error::InvalidTag((
-                    "BlockType",
-                    zones.header.block_type.into(),
-                )));
-            }
-            if zones.header.on_disk_size_with(ecc) != zone_block.length {
-                return Err(crate::Error::InvalidHeader(
-                    "columnar: zone block length disagrees with its directory",
-                ));
-            }
+            Self::skip_zone_block(reader, table_id, encryption, ecc, zone_block.length)?;
         }
         // The scanner feeds compaction, which is maintenance and outside the
         // read counters, so neither the page copies nor the rebuilt values are
@@ -386,6 +370,40 @@ impl Scanner {
         }
         .to_row_pages(&crate::table::row_group::PageWant::ALL, &mut 0)?;
         DataBlock::from_column_batch(pages.batches, restart_interval, &mut 0)
+    }
+
+    /// Reads the next block as a zone block of `length` on-disk bytes and
+    /// verifies it, without decoding its zones.
+    #[cfg(feature = "columnar")]
+    fn skip_zone_block(
+        reader: &mut BlockStream,
+        table_id: crate::TableId,
+        encryption: Option<&dyn EncryptionProvider>,
+        ecc: Option<crate::table::block::EccParams>,
+        length: u32,
+    ) -> crate::Result<()> {
+        let zones = Self::read_block(
+            reader,
+            table_id,
+            BlockType::ColumnZones,
+            CompressionType::None,
+            encryption,
+            ecc,
+            #[cfg(zstd_any)]
+            None,
+        )?;
+        if zones.header.block_type != BlockType::ColumnZones {
+            return Err(crate::Error::InvalidTag((
+                "BlockType",
+                zones.header.block_type.into(),
+            )));
+        }
+        if zones.header.on_disk_size_with(ecc) != length {
+            return Err(crate::Error::InvalidHeader(
+                "columnar: zone block length disagrees with its directory",
+            ));
+        }
+        Ok(())
     }
 
     /// Without the `columnar` feature a columnar SST cannot be read.

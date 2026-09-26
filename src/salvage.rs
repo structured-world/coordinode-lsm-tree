@@ -2401,7 +2401,7 @@ fn salvage_blocks(
                                                 },
                                             ),
                                             uncompressed,
-                                            group_tag,
+                                            (group_tag, sb.group.directory.pages_start()),
                                             &entries,
                                             Some(batch.zone_stats()),
                                             comparator,

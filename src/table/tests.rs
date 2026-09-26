@@ -7844,7 +7844,7 @@ fn page_extent(file: &std::path::Path, group: &BlockHandle, column_id: u16) -> (
         .expect("the group has a page for the column");
     let directory_len = header.on_disk_size_with(None) as usize;
     (
-        at + directory_len + entry.offset as usize,
+        at + directory_len + directory.pages_start() as usize + entry.offset as usize,
         entry.length as usize,
     )
 }
@@ -8045,9 +8045,10 @@ fn a_projection_refuses_a_directory_longer_than_its_group() -> crate::Result<()>
 }
 
 /// A directory whose length is not the one its index entry records is
-/// refused, read cold, served from the cache, or enumerated by the walks that
-/// judge the bytes on disk: a reader takes exactly the recorded length as the
-/// directory, so a disagreement cuts it short or runs it into the first page.
+/// refused, and so is a head zone block of another length, read cold, served
+/// from the cache, or enumerated by the walks that judge the bytes on disk: a
+/// reader takes exactly the recorded lengths as the directory and the block
+/// after it, so a disagreement cuts one short or runs it into the next.
 #[cfg(feature = "columnar")]
 #[test]
 fn a_directory_length_other_than_the_indexed_one_is_refused() -> crate::Result<()> {
@@ -8061,39 +8062,64 @@ fn a_directory_length_other_than_the_indexed_one_is_refused() -> crate::Result<(
     let Some(named) = group.row_group() else {
         panic!("a columnar index entry names its group");
     };
-    let want = PageWant::projected(&[COL_USER_KEY], RowPageSelect::All);
-    for delta in [-1_i64, 1] {
-        let wrong_len = u32::try_from(i64::from(named.directory_len.get()) + delta)
-            .ok()
-            .and_then(core::num::NonZeroU32::new)
-            .expect("the directory is longer than a byte and shorter than its group");
+    assert!(
+        named.head_zones_len > 0,
+        "the fixture's groups carry a head zone block"
+    );
+    // A point read's selection, which takes the head zone block with the
+    // directory, and a projection, which takes the directory alone.
+    let key = b"key000010kkkkkkk";
+    let point = PageWant::projected(
+        &[COL_USER_KEY],
+        RowPageSelect::Zone {
+            column_id: COL_USER_KEY,
+            lower: Some(key),
+            upper: Some(key),
+        },
+    );
+    let projection = PageWant::projected(&[COL_USER_KEY], RowPageSelect::All);
+    let shifted = |delta: i64, of: u32| {
+        u32::try_from(i64::from(of) + delta).expect("a length a byte off stays a u32")
+    };
+    for (what, delta_directory, delta_head) in [
+        ("a shorter directory", -1_i64, 0_i64),
+        ("a longer directory", 1, 0),
+        ("a shorter head zone block", 0, -1),
+        ("a longer head zone block", 0, 1),
+    ] {
         let wrong = group.with_row_group(Some(crate::table::index_block::RowGroupRef {
             tag: named.tag,
-            directory_len: wrong_len,
+            directory_len: core::num::NonZeroU32::new(shifted(
+                delta_directory,
+                named.directory_len.get(),
+            ))
+            .expect("the directory is longer than a byte"),
+            head_zones_len: shifted(delta_head, named.head_zones_len),
         }));
+        for want in [&point, &projection] {
+            let cold = Table::recover(test_recover_params(file.clone(), checksum))?;
+            let err = cold
+                .load_row_group(&wrong, want, ReadCharge::Foreground)
+                .expect_err("a cold read of a directory of another length must be refused");
+            assert!(
+                matches!(err, crate::Error::InvalidHeader(_)),
+                "{what}: expected a framing refusal, got {err:?}",
+            );
+            assert!(
+                cold.data_unit_blocks(&wrong).is_err(),
+                "{what}: the walks must refuse it too",
+            );
 
-        let cold = Table::recover(test_recover_params(file.clone(), checksum))?;
-        let err = cold
-            .load_row_group(&wrong, &want, ReadCharge::Foreground)
-            .expect_err("a cold read of a directory of another length must be refused");
-        assert!(
-            matches!(err, crate::Error::InvalidHeader(_)),
-            "delta {delta}: expected a framing refusal, got {err:?}",
-        );
-        assert!(
-            cold.data_unit_blocks(&wrong).is_err(),
-            "delta {delta}: the walks must refuse it too",
-        );
-
-        let warm = Table::recover(test_recover_params(file.clone(), checksum))?;
-        warm.load_row_group(&group, &want, ReadCharge::Foreground)?;
-        let err = warm
-            .load_row_group(&wrong, &want, ReadCharge::Foreground)
-            .expect_err("a cached directory of another length must be refused");
-        assert!(
-            matches!(err, crate::Error::InvalidHeader(_)),
-            "delta {delta}: expected a framing refusal, got {err:?}",
-        );
+            let warm = Table::recover(test_recover_params(file.clone(), checksum))?;
+            warm.load_row_group(&group, want, ReadCharge::Foreground)?;
+            let err = warm
+                .load_row_group(&wrong, want, ReadCharge::Foreground)
+                .expect_err("a cached directory of another length must be refused");
+            assert!(
+                matches!(err, crate::Error::InvalidHeader(_)),
+                "{what}: expected a framing refusal, got {err:?}",
+            );
+        }
     }
     Ok(())
 }
@@ -8433,8 +8459,9 @@ fn a_page_swapped_with_another_row_page_is_refused() -> crate::Result<()> {
         .zip(seqno_pages.iter().skip(1))
         .find(|(a, b)| a.length == b.length)
         .expect("two seqno pages of one length");
+    let pages_at = at + directory_len + directory.pages_start() as usize;
     let extent = |e: &crate::table::column_page::PageEntry| {
-        let start = at + directory_len + e.offset as usize;
+        let start = pages_at + e.offset as usize;
         start..start + e.length as usize
     };
     let first_bytes = bytes.get(extent(first)).expect("page").to_vec();
@@ -8505,12 +8532,14 @@ fn a_page_refused_by_its_stamp_is_not_cached() -> crate::Result<()> {
         .zip(seqno_pages.iter().skip(1))
         .find(|(a, b)| a.length == b.length)
         .expect("two seqno pages of one length");
+    let pages_at = at + directory_len + directory.pages_start() as usize;
     let extent = |e: &crate::table::column_page::PageEntry| {
-        let start = at + directory_len + e.offset as usize;
+        let start = pages_at + e.offset as usize;
         start..start + e.length as usize
     };
     let first_bytes = bytes.get(extent(first)).expect("page").to_vec();
     let second_bytes = bytes.get(extent(second)).expect("page").to_vec();
+    assert_ne!(first_bytes, second_bytes, "the two pages hold other rows");
     // Re-bound to where they move, so the pages verify as blocks and the
     // stamp is what refuses them, after the block reads that could cache them.
     let (first_at, second_at) = (extent(first).start as u64, extent(second).start as u64);
@@ -8561,12 +8590,12 @@ fn a_row_groups_blocks_are_refused_under_another_groups_tag() -> crate::Result<(
     let Some(named) = group.row_group() else {
         panic!("a columnar index entry names its group");
     };
-    let other = group.with_row_group(named.tag.checked_add(1).map(|tag| {
-        crate::table::index_block::RowGroupRef {
-            tag,
-            directory_len: named.directory_len,
-        }
-    }));
+    let other = group.with_row_group(
+        named
+            .tag
+            .checked_add(1)
+            .map(|tag| crate::table::index_block::RowGroupRef { tag, ..named }),
+    );
     let refused = table.data_unit_blocks(&other);
     assert!(
         refused.is_err(),
@@ -8813,6 +8842,319 @@ fn zoned_table_file(file: &std::path::Path, rows: u32, deletes: &[u32]) -> crate
     Ok(checksum)
 }
 
+/// A table of [`zoned_table_file`] opened through a read-counting filesystem,
+/// with its own metrics and a cache that holds the whole file.
+#[cfg(all(feature = "columnar", feature = "metrics"))]
+fn zoned_table_counting_reads(
+    file: &std::path::Path,
+    checksum: Checksum,
+) -> crate::Result<(
+    Table,
+    Arc<crate::metrics::Metrics>,
+    Arc<crate::fs::FaultInjector>,
+)> {
+    use crate::fs::FaultFs;
+
+    let fault = FaultFs::new(StdFs);
+    let injector = fault.injector();
+    let metrics = Arc::new(crate::metrics::Metrics::default());
+    let mut params = test_recover_params(file.to_path_buf(), checksum);
+    params.fs = Arc::new(fault);
+    params.metrics = Arc::clone(&metrics);
+    params.cache = Arc::new(crate::Cache::with_capacity_bytes(64 * 1_024 * 1_024));
+    let table = Table::recover(params)?;
+    // What opening the table read is not what the tests below count.
+    injector.clear();
+    Ok((table, metrics, injector))
+}
+
+/// Bytes requested under the index role (directories and zone blocks) and
+/// the data role (pages) so far.
+#[cfg(all(feature = "columnar", feature = "metrics"))]
+fn requested(metrics: &crate::metrics::Metrics) -> (u64, u64) {
+    use core::sync::atomic::Ordering::Relaxed;
+    (
+        metrics.index_block_io_requested.load(Relaxed),
+        metrics.data_block_io_requested.load(Relaxed),
+    )
+}
+
+/// A point read takes a row group's directory and its key zones in one
+/// request, exactly as many bytes as the index entry records for the two, and
+/// keeps the zones on the cached directory: a later point read of the group
+/// reads neither again, though the key zones are a block of their own.
+#[cfg(all(feature = "columnar", feature = "metrics"))]
+#[test]
+fn a_point_read_takes_the_directory_and_the_key_zones_in_one_request() -> crate::Result<()> {
+    use crate::table::columnar::COL_USER_KEY;
+    use crate::table::row_group::{PageWant, RowPageSelect};
+
+    let dir = tempdir()?;
+    let file = dir.path().join("table");
+    let checksum = zoned_table_file(&file, 1_500, &[])?;
+    let (table, metrics, injector) = zoned_table_counting_reads(&file, checksum)?;
+    let group = first_row_group(&file, checksum)?;
+    let Some(named) = group.row_group() else {
+        panic!("a columnar index entry names its group");
+    };
+    assert!(named.head_zones_len > 0, "the key zones are a head block");
+    let point = |key: &[u8]| -> crate::Result<crate::table::row_group::RowPages> {
+        table.load_row_group(
+            &group,
+            &PageWant::projected(
+                &[COL_USER_KEY],
+                RowPageSelect::Zone {
+                    column_id: COL_USER_KEY,
+                    lower: Some(key),
+                    upper: Some(key),
+                },
+            ),
+            ReadCharge::Foreground,
+        )
+    };
+
+    let (index_before, _) = requested(&metrics);
+    let pages = point(&zoned_key(10))?;
+    assert_eq!(
+        pages.ordinals.len(),
+        1,
+        "the key zones select the one key page holding the key",
+    );
+    assert_eq!(
+        requested(&metrics).0 - index_before,
+        u64::from(named.directory_len.get()) + u64::from(named.head_zones_len),
+        "the directory and the key zones, and nothing past them",
+    );
+    assert_eq!(
+        injector.read_count(),
+        2,
+        "one request for the directory and the key zones, one for the key page",
+    );
+
+    let (index_before, _) = requested(&metrics);
+    let reads_before = injector.read_count();
+    let cached_before = metrics.index_block_load_cached_count();
+    let pages = point(&zoned_key(200))?;
+    assert_eq!(pages.ordinals.len(), 1);
+    assert_eq!(
+        requested(&metrics).0,
+        index_before,
+        "the cached directory serves the key zones"
+    );
+    assert_eq!(
+        injector.read_count() - reads_before,
+        1,
+        "only the other key page is read",
+    );
+    assert_eq!(
+        metrics.index_block_load_cached_count() - cached_before,
+        1,
+        "the directory is served from the cache and no zone block is looked up",
+    );
+    Ok(())
+}
+
+/// A read that does not select by the key never reads the key zones: a
+/// projection reads the directory alone and a scan pruning on the value
+/// column the directory and that column's zone block. A point read after
+/// them reads the key zones once, onto the cached directory.
+#[cfg(all(feature = "columnar", feature = "metrics"))]
+#[test]
+fn a_read_that_does_not_select_by_the_key_never_reads_its_zones() -> crate::Result<()> {
+    use crate::table::columnar::{COL_USER_KEY, COL_VALUE};
+    use crate::table::row_group::{PageWant, RowPageSelect};
+
+    let dir = tempdir()?;
+    let file = dir.path().join("table");
+    let checksum = zoned_table_file(&file, 1_500, &[])?;
+    let group = first_row_group(&file, checksum)?;
+    let Some(named) = group.row_group() else {
+        panic!("a columnar index entry names its group");
+    };
+    let directory_len = u64::from(named.directory_len.get());
+
+    let (table, metrics, _) = zoned_table_counting_reads(&file, checksum)?;
+    let (index_before, _) = requested(&metrics);
+    table.load_row_group(
+        &group,
+        &PageWant::projected(&[COL_USER_KEY], RowPageSelect::All),
+        ReadCharge::Foreground,
+    )?;
+    assert_eq!(
+        requested(&metrics).0 - index_before,
+        directory_len,
+        "a projection reads the directory alone",
+    );
+
+    let (table, metrics, _) = zoned_table_counting_reads(&file, checksum)?;
+    let value = zoned_value(10);
+    let (index_before, _) = requested(&metrics);
+    table.load_row_group(
+        &group,
+        &PageWant::projected(
+            &[COL_USER_KEY, COL_VALUE],
+            RowPageSelect::Zone {
+                column_id: COL_VALUE,
+                lower: Some(&value),
+                upper: Some(&value),
+            },
+        ),
+        ReadCharge::Foreground,
+    )?;
+    let Some((directory, _)) = table
+        .cache
+        .get_directory(table.global_id(), group.offset(), false)
+    else {
+        panic!("the read cached the directory");
+    };
+    assert!(
+        directory.lacks_head_zones_for(COL_USER_KEY),
+        "a read that did not select by the key cached no key zones",
+    );
+    let Some((_, value_zones_len)) = directory.zone_block(COL_VALUE) else {
+        panic!("the value column has a zone block");
+    };
+    assert_eq!(
+        requested(&metrics).0 - index_before,
+        directory_len + u64::from(value_zones_len),
+        "a scan pruning on the value reads the directory and the value's zone block",
+    );
+
+    let key = zoned_key(10);
+    let point = PageWant::projected(
+        &[COL_USER_KEY],
+        RowPageSelect::Zone {
+            column_id: COL_USER_KEY,
+            lower: Some(&key),
+            upper: Some(&key),
+        },
+    );
+    let (index_before, _) = requested(&metrics);
+    table.load_row_group(&group, &point, ReadCharge::Foreground)?;
+    assert_eq!(
+        requested(&metrics).0 - index_before,
+        u64::from(named.head_zones_len),
+        "the first point read takes the key zones alone",
+    );
+    let (index_before, _) = requested(&metrics);
+    table.load_row_group(&group, &point, ReadCharge::Foreground)?;
+    assert_eq!(
+        requested(&metrics).0,
+        index_before,
+        "and the cached directory keeps them for the next",
+    );
+    Ok(())
+}
+
+/// A sparse predicate scan over a group of many row pages reads the group's
+/// directory, the zone block of the predicate's column and the pages of the
+/// projected columns on the one row page holding the match, and not one byte
+/// more: not the key zones, not the other row pages, not a column it does not
+/// project.
+#[cfg(all(feature = "columnar", feature = "metrics"))]
+#[test]
+fn a_sparse_predicate_scan_reads_the_directory_its_zones_and_the_matching_pages()
+-> crate::Result<()> {
+    use crate::table::columnar::{COL_USER_KEY, COL_VALUE};
+    use crate::table::columnar_predicate::{ColumnRangePredicate, PredicateApply};
+
+    let dir = tempdir()?;
+    let file = dir.path().join("table");
+    let checksum = zoned_table_file(&file, 1_500, &[])?;
+    let group = first_row_group(&file, checksum)?;
+    let Some(named) = group.row_group() else {
+        panic!("a columnar index entry names its group");
+    };
+    let (table, metrics, _) = zoned_table_counting_reads(&file, checksum)?;
+
+    // A predicate the zone map rules out in every group walks the table's
+    // index and reads no group at all; the scan below then counts its groups
+    // alone.
+    let (index_before, data_before) = requested(&metrics);
+    let nothing = ColumnRangePredicate {
+        column_id: COL_VALUE,
+        lower: Some(b"zzz".to_vec()),
+        upper: None,
+        apply: PredicateApply::Filter,
+    };
+    assert!(
+        table
+            .columnar_scan(&[COL_USER_KEY, COL_VALUE], Some(&nothing))?
+            .is_empty()
+    );
+    let (index_walked, data_walked) = requested(&metrics);
+    assert_eq!(
+        data_walked, data_before,
+        "a group the zone map rules out is not read"
+    );
+    assert!(
+        table
+            .cache
+            .get_directory(table.global_id(), group.offset(), false)
+            .is_none(),
+        "nor its directory: {} index bytes were the table's index",
+        index_walked - index_before,
+    );
+
+    let row = 10;
+    let predicate = ColumnRangePredicate {
+        column_id: COL_VALUE,
+        lower: Some(zoned_value(row)),
+        upper: Some(zoned_value(row)),
+        apply: PredicateApply::Filter,
+    };
+    let (index_before, data_before) = requested(&metrics);
+    let batches = table.columnar_scan(&[COL_USER_KEY, COL_VALUE], Some(&predicate))?;
+    let (index_after, data_after) = requested(&metrics);
+    assert_eq!(
+        batches.iter().map(|b| b.row_count).sum::<u32>(),
+        1,
+        "the scan returns the one matching row",
+    );
+
+    let Some((directory, _)) = table
+        .cache
+        .get_directory(table.global_id(), group.offset(), false)
+    else {
+        panic!("the scan cached the directory");
+    };
+    let Some((_, value_zones_len)) = directory.zone_block(COL_VALUE) else {
+        panic!("the value column has a zone block");
+    };
+    let matching_page = (0u16..)
+        .zip(directory.row_pages())
+        .find(|&(ordinal, &rows)| {
+            directory
+                .row_page_start(ordinal)
+                .is_some_and(|start| start <= row && row < start + rows)
+        })
+        .map(|(ordinal, _)| ordinal)
+        .expect("a row page holds the row");
+    assert!(
+        directory.row_pages().len() > 2,
+        "the group has row pages to prune"
+    );
+    let pages: u64 = directory
+        .entries()
+        .iter()
+        .filter(|e| {
+            e.row_page == matching_page && [COL_USER_KEY, COL_VALUE].contains(&e.id.column_id)
+        })
+        .map(|e| u64::from(e.length))
+        .sum();
+    assert_eq!(
+        index_after - index_before,
+        u64::from(named.directory_len.get()) + u64::from(value_zones_len),
+        "the directory and the predicate column's zone block",
+    );
+    assert_eq!(
+        data_after - data_before,
+        pages,
+        "the projected columns' pages on the matching row page",
+    );
+    Ok(())
+}
+
 /// A read that fails on one page fails exactly the reads that need that page,
 /// plain, encrypted and under Page-ECC alike: a point read of a key on another
 /// row page and a projection that skips the value column are served, the key
@@ -8906,7 +9248,10 @@ fn a_failed_page_read_fails_only_the_reads_that_need_the_page() -> crate::Result
             else {
                 panic!("{label}: the group has a value page on row page 2");
             };
-            let victim_at = *group.offset() + u64::from(directory_len) + u64::from(victim.offset);
+            let victim_at = *group.offset()
+                + u64::from(directory_len)
+                + u64::from(directory.pages_start())
+                + u64::from(victim.offset);
             (group, pages.starts, victim_at)
         };
         assert!(starts.len() > 4, "{label}: the group has several row pages");

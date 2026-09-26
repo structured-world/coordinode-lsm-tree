@@ -82,8 +82,9 @@ fn make_corrupted_index_block_with_invalid_binary_index_offset() -> IndexBlock {
     })
 }
 
-/// Every entry names a row group by its tag and directory length; the block
-/// mixes restart heads (full entries) with truncated ones.
+/// Every entry names a row group by its tag, directory length and head zone
+/// block length; the block mixes restart heads (full entries) with truncated
+/// ones.
 fn make_tagged_index_block(restart_interval: u8) -> (Vec<KeyedBlockHandle>, IndexBlock) {
     let handles: Vec<_> = make_handles(16)
         .into_iter()
@@ -91,8 +92,10 @@ fn make_tagged_index_block(restart_interval: u8) -> (Vec<KeyedBlockHandle>, Inde
         .map(|(h, n)| {
             let row_group = crate::table::index_block::RowGroupRef {
                 tag: core::num::NonZeroU64::new(u64::from(n) << 40).unwrap(),
-                // Two varint bytes, as wide as a group size of up to 16 KiB.
+                // Two varint bytes each, as wide as a group size of up to
+                // 16 KiB.
                 directory_len: core::num::NonZeroU32::new(1_000 + n).unwrap(),
+                head_zones_len: 200 + n,
             };
             KeyedBlockHandle::new(
                 h.end_key().clone(),
@@ -140,6 +143,7 @@ fn a_tagged_entry_reads_back_its_row_group() {
             Some(crate::table::index_block::RowGroupRef {
                 tag: core::num::NonZeroU64::new(12 << 40).unwrap(),
                 directory_len: core::num::NonZeroU32::new(1_012).unwrap(),
+                head_zones_len: 212,
             })
         );
     }
@@ -156,8 +160,9 @@ fn a_tagged_entry_reads_back_its_row_group() {
 }
 
 /// The first entry of a tagged block, its varint field `field` (0 the tag, 1
-/// the directory length) replaced by `value` at the same width, so every later
-/// byte stays where it was; `None` when `value` does not fit that width.
+/// the directory length, 2 the head zone block length) replaced by `value` at
+/// the same width, so every later byte stays where it was; `None` when `value`
+/// does not fit that width.
 fn with_first_row_group_field(field: usize, value: u64) -> Option<IndexBlock> {
     let (_, index) = make_tagged_index_block(1);
     let mut bytes = index.as_slice().to_vec();
@@ -203,34 +208,47 @@ fn a_tagged_entry_with_a_zero_tag_is_refused() {
     );
 }
 
-/// A tagged entry recording an empty directory, or one longer than the group
-/// it names, which no writer emits, ends the walk and fails a seek's probe of
-/// it as a restart head: a reader would read that many bytes as the group's
-/// directory.
+/// A tagged entry recording an empty directory, or a directory and head zone
+/// block longer together than the group it names, which no writer emits, ends
+/// the walk and fails a seek's probe of it as a restart head: a reader would
+/// read that many bytes as the group's directory and head zone block.
 #[test]
 fn a_tagged_entry_with_an_impossible_directory_length_is_refused() {
     let (handles, _) = make_tagged_index_block(1);
     let size = u64::from(handles[0].size());
-    for directory_len in [0, size + 1] {
-        let corrupt = with_first_row_group_field(1, directory_len).unwrap();
+    let Some(named) = handles[0].as_ref().row_group() else {
+        panic!("the fixture's entries name row groups");
+    };
+    let directory_len = u64::from(named.directory_len.get());
+    let head_len = u64::from(named.head_zones_len);
+    let cases = [
+        ("an empty directory", 1, 0),
+        ("a directory past the group", 1, size + 1),
+        (
+            "a directory running the head past the group",
+            1,
+            size - head_len + 1,
+        ),
+        (
+            "a head zone block past the group",
+            2,
+            size - directory_len + 1,
+        ),
+    ];
+    for (what, field, value) in cases {
+        let corrupt = with_first_row_group_field(field, value).unwrap();
         let first = corrupt
             .iter(default_comparator())
             .next()
             .map(|item| item.materialize(corrupt.as_slice()));
-        assert!(
-            first.is_none(),
-            "directory length {directory_len} must not read back, got {first:?}"
-        );
+        assert!(first.is_none(), "{what} must not read back, got {first:?}");
         let mut iter = corrupt.iter(default_comparator());
         let landed = iter.seek(handles[0].end_key(), SeqNo::MAX)
             && iter
                 .next()
                 .map(|item| item.materialize(corrupt.as_slice()))
                 .is_some_and(|found| found.end_key() == handles[0].end_key());
-        assert!(
-            !landed,
-            "a seek must not land on an entry recording directory length {directory_len}"
-        );
+        assert!(!landed, "a seek must not land on an entry recording {what}");
     }
 }
 

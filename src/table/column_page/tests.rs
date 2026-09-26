@@ -14,11 +14,18 @@ fn id(column_id: u16, part: u8) -> PageId {
     PageId { column_id, part }
 }
 
-/// No statistics zones: the directories below that are about placement, not
+/// No head zone block: the directories below that are about placement, not
 /// statistics.
-fn no_zones() -> PageZones {
-    PageZones::default()
+fn no_head() -> Option<ZoneBlock> {
+    None
 }
+
+/// The fixture's head zone block: column 0's zones, between the directory and
+/// the pages.
+const HEAD: ZoneBlock = ZoneBlock {
+    column_id: 0,
+    length: 40,
+};
 
 /// Zones for column 0 over the fixture's two row pages: the first page's
 /// values run `apple..mango`, and the second has 12 nulls among its rows.
@@ -44,25 +51,37 @@ const ROWS: u32 = 512;
 /// would not round-trip by accident.
 const TAG: u64 = 0x0102_0304_0506_0708;
 
-/// Two row pages of 200 and 312 rows, and three column parts with a page for
-/// each: the grid a writer produces.
+/// The fixture's pages: two row pages of 200 and 312 rows, and three column
+/// parts with a page for each, the grid a writer produces.
+fn fixture_entries() -> Vec<PageEntry> {
+    vec![
+        entry(0, 64, 0, 0, 0),
+        entry(64, 80, 0, 0, 1),
+        entry(144, 2_048, 3, 0, 0),
+        entry(2_192, 2_048, 3, 0, 1),
+        entry(4_240, 32, 3, 1, 0),
+        entry(4_272, 40, 3, 1, 1),
+    ]
+}
+
+/// The fixture's grid with column 0's zones in a head zone block.
 fn directory() -> PageDirectory {
     PageDirectory::new(
         ROWS,
         TAG,
         vec![200, 312],
-        vec![
-            entry(0, 64, 0, 0, 0),
-            entry(64, 80, 0, 0, 1),
-            entry(144, 2_048, 3, 0, 0),
-            entry(2_192, 2_048, 3, 0, 1),
-            entry(4_240, 32, 3, 1, 0),
-            entry(4_272, 40, 3, 1, 1),
-        ],
-        key_zones(),
+        fixture_entries(),
+        Some(HEAD),
         vec![],
     )
-    .expect("ascending, non-overlapping, a complete grid")
+    .expect("back to back, a complete grid")
+}
+
+/// A zone block's payload holding `zones` for the fixture's group.
+fn zone_block_payload(zones: &PageZones) -> Vec<u8> {
+    let mut payload = Vec::new();
+    PageDirectory::encode_zone_block(TAG, zones, &mut payload);
+    payload
 }
 
 #[test]
@@ -82,6 +101,11 @@ fn a_directory_round_trips_through_its_wire_form() {
         decoded.group_tag(),
         TAG,
         "the tag must survive, since every page's stamp is checked against it",
+    );
+    assert_eq!(
+        decoded.head_zone_block(),
+        Some(HEAD),
+        "the head zone block must survive, since the pages start after it",
     );
     assert_eq!(decoded.row_pages(), [200, 312]);
     assert_eq!(
@@ -173,7 +197,7 @@ fn pages_that_do_not_lie_back_to_back_are_refused_at_construction() {
         ("a first page past the start", vec![entry(8, 64, 0, 0, 0)]),
     ];
     for (what, entries) in placements {
-        let err = PageDirectory::new(ROWS, TAG, vec![ROWS], entries, no_zones(), vec![])
+        let err = PageDirectory::new(ROWS, TAG, vec![ROWS], entries, no_head(), vec![])
             .expect_err("pages that are not back to back must be refused");
         assert!(
             format!("{err:?}").contains("where the one before it ends"),
@@ -197,7 +221,7 @@ fn a_column_parts_pages_interleaved_with_anothers_are_refused() {
             entry(128, 64, 0, 0, 1),
             entry(192, 64, 3, 0, 1),
         ],
-        no_zones(),
+        no_head(),
         vec![],
     )
     .expect_err("interleaved parts must be refused");
@@ -219,7 +243,7 @@ fn two_pages_claiming_one_column_part_and_row_page_are_refused() {
         TAG,
         vec![ROWS],
         vec![entry(0, 64, 3, 0, 0), entry(64, 64, 3, 0, 0)],
-        no_zones(),
+        no_head(),
         vec![],
     )
     .expect_err("a duplicated column part must be refused");
@@ -243,7 +267,7 @@ fn a_column_part_missing_a_row_page_is_refused() {
             entry(64, 64, 0, 0, 1),
             entry(128, 64, 3, 0, 0),
         ],
-        no_zones(),
+        no_head(),
         vec![],
     )
     .expect_err("an incomplete grid must be refused");
@@ -262,7 +286,7 @@ fn a_column_part_missing_a_middle_row_page_is_refused() {
         TAG,
         vec![100, 100, 100],
         vec![entry(0, 64, 0, 0, 0), entry(64, 64, 0, 0, 2)],
-        no_zones(),
+        no_head(),
         vec![],
     )
     .expect_err("a gap in a part's row pages must be refused");
@@ -274,7 +298,7 @@ fn a_column_part_missing_a_middle_row_page_is_refused() {
 
 #[test]
 fn row_pages_that_do_not_sum_to_the_group_are_refused() {
-    let err = PageDirectory::new(ROWS, TAG, vec![200, 200], vec![], no_zones(), vec![])
+    let err = PageDirectory::new(ROWS, TAG, vec![200, 200], vec![], no_head(), vec![])
         .expect_err("row pages short of the group must be refused");
     assert!(
         format!("{err:?}").contains("sum"),
@@ -284,7 +308,7 @@ fn row_pages_that_do_not_sum_to_the_group_are_refused() {
 
 #[test]
 fn an_empty_row_page_is_refused() {
-    let err = PageDirectory::new(ROWS, TAG, vec![ROWS, 0], vec![], no_zones(), vec![])
+    let err = PageDirectory::new(ROWS, TAG, vec![ROWS, 0], vec![], no_head(), vec![])
         .expect_err("an empty row page must be refused");
     assert!(
         format!("{err:?}").contains("empty row page"),
@@ -299,7 +323,7 @@ fn a_page_naming_a_row_page_that_does_not_exist_is_refused() {
         TAG,
         vec![ROWS],
         vec![entry(0, 64, 0, 0, 1)],
-        no_zones(),
+        no_head(),
         vec![],
     )
     .expect_err("a page past the last row page must be refused");
@@ -316,7 +340,7 @@ fn a_page_extent_that_overflows_is_refused() {
         TAG,
         vec![ROWS],
         vec![entry(0, u32::MAX, 0, 0, 0), entry(u32::MAX, 16, 1, 0, 0)],
-        no_zones(),
+        no_head(),
         vec![],
     )
     .expect_err("an extent past u32 must be refused");
@@ -343,7 +367,7 @@ fn more_pages_than_the_count_field_holds_are_refused_at_construction() {
             entry(i * 4, 4, column_id, part, 0)
         })
         .collect();
-    let err = PageDirectory::new(ROWS, TAG, vec![ROWS], too_many, no_zones(), vec![])
+    let err = PageDirectory::new(ROWS, TAG, vec![ROWS], too_many, no_head(), vec![])
         .expect_err("a page count past u16 must be refused");
     assert!(
         format!("{err:?}").contains("page count"),
@@ -369,7 +393,7 @@ fn a_directory_of_the_largest_declarable_size_decodes_in_bounded_time() {
         })
         .collect();
     let mut bytes = Vec::new();
-    PageDirectory::new(ROWS, TAG, vec![ROWS], entries.clone(), no_zones(), vec![])
+    PageDirectory::new(ROWS, TAG, vec![ROWS], entries.clone(), no_head(), vec![])
         .expect("distinct and ascending")
         .encode_into(&mut bytes);
 
@@ -415,15 +439,18 @@ fn a_truncated_payload_is_refused() {
 #[test]
 fn the_wire_form_records_parts_row_pages_and_lengths_only() {
     // Offsets, column parts and row pages of the pages are their place in the
-    // list, so the wire holds each part once and each page as its length. The
-    // exact bytes pin that: a field put back per page would change them.
+    // list, so the wire holds each part once and each page as its length, and
+    // no zone lives in the directory. The exact bytes pin that: a field put
+    // back per page would change them.
     let mut bytes = Vec::new();
     directory().encode_into(&mut bytes);
 
     let mut expected = vec![VERSION];
     expected.extend_from_slice(&TAG.to_le_bytes());
-    // Two row pages, three column parts, no zone block.
+    // Two row pages, three column parts, no zone block after the pages.
     expected.extend_from_slice(&[2, 3, 0]);
+    // The head zone block: 40 bytes, column 0.
+    expected.extend_from_slice(&[40, 0, 0]);
     // Each part once, in the order its pages lie: (0, 0), (3, 0), (3, 1).
     expected.extend_from_slice(&[0, 0, 0, 3, 0, 0, 3, 0, 1]);
     // 200 and 312 rows, as varints.
@@ -431,11 +458,7 @@ fn the_wire_form_records_parts_row_pages_and_lengths_only() {
     // One length per page, part by part, row page by row page: 64 and 80,
     // 2048 twice, 32 and 40.
     expected.extend_from_slice(&[64, 80, 128, 16, 128, 16, 32, 40]);
-    assert_eq!(
-        bytes.get(..expected.len()),
-        Some(expected.as_slice()),
-        "everything before the zones",
-    );
+    assert_eq!(bytes, expected);
 }
 
 #[test]
@@ -447,18 +470,18 @@ fn a_count_or_length_past_its_field_is_refused() {
 
     // A row page count of 65536: three varint bytes, one past u16.
     let mut too_many_row_pages = header.clone();
-    too_many_row_pages.extend_from_slice(&[0x80, 0x80, 0x04, 0, 0]);
+    too_many_row_pages.extend_from_slice(&[0x80, 0x80, 0x04, 0, 0, 0]);
     PageDirectory::decode(&too_many_row_pages).expect_err("a row page count past u16");
 
     // A varint running past the widest a u16 takes.
     let mut overlong = header.clone();
-    overlong.extend_from_slice(&[0x81, 0x80, 0x80, 0x00, 0, 0]);
+    overlong.extend_from_slice(&[0x81, 0x80, 0x80, 0x00, 0, 0, 0]);
     PageDirectory::decode(&overlong).expect_err("an overlong varint");
 
     // 256 parts of 256 row pages each: 65536 pages, one more than the count
     // the reader and the page stamps hold.
     let mut too_many_pages = header;
-    too_many_pages.extend_from_slice(&[0x80, 0x02, 0x80, 0x02, 0]);
+    too_many_pages.extend_from_slice(&[0x80, 0x02, 0x80, 0x02, 0, 0]);
     let err = PageDirectory::decode(&too_many_pages).expect_err("a page count past u16");
     assert!(
         format!("{err:?}").contains("page count"),
@@ -476,7 +499,7 @@ fn a_contiguous_layout_places_each_page_where_the_previous_one_ends() {
         TAG,
         vec![ROWS],
         [(id(0, 0), 0, 100), (id(1, 0), 0, 40), (id(2, 0), 0, 7)],
-        no_zones(),
+        no_head(),
         vec![],
     )
     .expect("three pages");
@@ -491,9 +514,14 @@ fn a_contiguous_layout_places_each_page_where_the_previous_one_ends() {
         147,
         "the pages' total is their summed length"
     );
+    assert_eq!(
+        directory.pages_start(),
+        0,
+        "without a head zone block the pages start at the directory's end",
+    );
 
     assert_eq!(
-        PageDirectory::contiguous(0, TAG, vec![], [], no_zones(), vec![])
+        PageDirectory::contiguous(0, TAG, vec![], [], no_head(), vec![])
             .expect("no pages")
             .pages_len(),
         0,
@@ -508,7 +536,7 @@ fn a_contiguous_layout_that_overflows_is_refused() {
         TAG,
         vec![ROWS],
         [(id(0, 0), 0, u32::MAX), (id(1, 0), 0, 1)],
-        no_zones(),
+        no_head(),
         vec![],
     )
     .expect_err("a group length past u32 must be refused");
@@ -518,30 +546,33 @@ fn a_contiguous_layout_that_overflows_is_refused() {
     );
 }
 
-/// A directory over the fixture's grid carrying `zones` in place of its own.
+/// The fixture's directory keeping `zones` as its head zone block's.
 fn with_zones(zones: PageZones) -> crate::Result<PageDirectory> {
-    let base = directory();
-    PageDirectory::new(
-        ROWS,
-        TAG,
-        base.row_pages().to_vec(),
-        base.entries().to_vec(),
-        zones,
-        vec![],
-    )
+    directory().with_head_zones(zones)
 }
 
 #[test]
-fn zones_round_trip_and_answer_per_row_page_and_column() {
+fn head_zones_round_trip_through_their_block_and_answer_per_row_page_and_column() {
     // A reader prunes a row page by its zone before reading it, so the zone
     // it looks up has to be that row page's, for that column, exactly as
     // written, and a column without zones must answer none rather than
     // another column's.
-    let mut bytes = Vec::new();
-    directory().encode_into(&mut bytes);
-    let decoded = PageDirectory::decode(&bytes).expect("decode");
+    let directory = directory();
+    assert!(
+        directory.lacks_head_zones_for(0),
+        "a decoded directory keeps no zones until a read attaches them",
+    );
+    assert!(
+        !directory.lacks_head_zones_for(3),
+        "column 3's zones are not in the head zone block",
+    );
+    let zones = directory
+        .decode_zone_block(0, &zone_block_payload(&key_zones()))
+        .expect("column 0's zones");
+    let directory = directory.with_head_zones(zones).expect("they fit the grid");
+    assert!(!directory.lacks_head_zones_for(0));
 
-    let zones = decoded.zones();
+    let zones = directory.head_zones();
     let first = zones.zone(0, 0).expect("row page 0 of column 0");
     assert_eq!((first.null_count, first.min), (0, &b"apple"[..]));
     assert_eq!(first.max, Some(&b"mango"[..]));
@@ -550,6 +581,36 @@ fn zones_round_trip_and_answer_per_row_page_and_column() {
     assert_eq!(second.max, Some(&b"zucchini"[..]));
     assert!(zones.zone(0, 3).is_none(), "column 3 has no zones");
     assert!(zones.zone(2, 0).is_none(), "there is no third row page");
+}
+
+#[test]
+fn head_zones_that_are_not_the_head_blocks_are_refused() {
+    // Kept on a cached directory, head zones answer every later read that
+    // selects by their column; another column's, or zones for a group with no
+    // head block, would prune its row pages by values that are not theirs.
+    let mut elsewhere = PageZones::new(vec![3]);
+    elsewhere.push(0, Some((b"a", b"b")));
+    elsewhere.push(0, Some((b"a", b"b")));
+    let err = with_zones(elsewhere).expect_err("another column's zones must be refused");
+    assert!(format!("{err:?}").contains("another column"), "got {err:?}");
+
+    let headless = PageDirectory::new(
+        ROWS,
+        TAG,
+        vec![200, 312],
+        fixture_entries(),
+        no_head(),
+        vec![],
+    )
+    .expect("a directory without a head zone block");
+    assert!(!headless.lacks_head_zones_for(0));
+    let err = headless
+        .with_head_zones(key_zones())
+        .expect_err("a group without a head zone block keeps no head zones");
+    assert!(
+        format!("{err:?}").contains("head zone block"),
+        "got {err:?}"
+    );
 }
 
 #[test]
@@ -566,7 +627,7 @@ fn a_long_minimum_is_cut_to_a_prefix_and_a_long_maximum_raised() {
     zones.push(0, Some((b"x", b"y")));
 
     let directory = with_zones(zones).expect("cut bounds are within the limit");
-    let zone = directory.zones().zone(0, 0).expect("zone");
+    let zone = directory.head_zones().zone(0, 0).expect("zone");
     assert_eq!(
         zone.min,
         &min[..ZONE_BOUND_LEN],
@@ -593,13 +654,13 @@ fn a_maximum_whose_prefix_is_all_ff_has_no_upper_bound() {
     let mut zones = PageZones::new(vec![0]);
     zones.push(0, Some((b"a", &max)));
     zones.push(0, Some((b"a", b"b")));
-    let original = with_zones(zones).expect("an unbounded zone is valid");
-    assert_eq!(original.zones().zone(0, 0).expect("zone").max, None);
+    let original = with_zones(zones.clone()).expect("an unbounded zone is valid");
+    assert_eq!(original.head_zones().zone(0, 0).expect("zone").max, None);
 
-    let mut bytes = Vec::new();
-    original.encode_into(&mut bytes);
-    let decoded = PageDirectory::decode(&bytes).expect("decode");
-    assert_eq!(decoded, original, "the missing bound survives the wire");
+    let decoded = directory()
+        .decode_zone_block(0, &zone_block_payload(&zones))
+        .expect("decode");
+    assert_eq!(decoded, zones, "the missing bound survives the wire");
 }
 
 #[test]
@@ -608,14 +669,14 @@ fn an_all_null_zone_records_the_empty_range() {
     zones.push(200, None);
     zones.push(0, Some((b"", b"")));
     let directory = with_zones(zones).expect("all-null and all-empty zones are valid");
-    let zone = directory.zones().zone(0, 0).expect("zone");
+    let zone = directory.head_zones().zone(0, 0).expect("zone");
     assert_eq!(
         (zone.null_count, zone.min, zone.max),
         (200, &[][..], Some(&[][..]))
     );
 }
 
-/// The refusal a directory carrying `zones` meets.
+/// The refusal a directory keeping `zones` meets.
 fn refused(zones: PageZones) -> String {
     format!(
         "{:?}",
@@ -655,34 +716,44 @@ fn zones_that_do_not_match_the_grid_are_refused() {
     missing_row_page.push(0, Some((b"a", b"b")));
     assert!(refused(missing_row_page).contains("every row page"));
 
+    // A zone block of a column the group does not have, read in the place of
+    // column 9's, which it also does not have.
     let mut unknown_column = PageZones::new(vec![9]);
     unknown_column.push(0, Some((b"a", b"b")));
     unknown_column.push(0, Some((b"a", b"b")));
-    assert!(refused(unknown_column).contains("does not have"));
+    let err = directory()
+        .decode_zone_block(9, &zone_block_payload(&unknown_column))
+        .expect_err("a column the group does not have");
+    assert!(format!("{err:?}").contains("does not have"), "got {err:?}");
 
     let mut twice = PageZones::new(vec![0, 0]);
     for _ in 0..4 {
         twice.push(0, Some((b"a", b"b")));
     }
-    assert!(refused(twice).contains("two zones"));
+    let err = directory()
+        .decode_zone_block(0, &zone_block_payload(&twice))
+        .expect_err("two columns in a zone block of one");
+    assert!(format!("{err:?}").contains("another column"), "got {err:?}");
 }
 
-/// The wire position of the last zone's `flags` in the fixture's directory.
-/// That zone holds `melon` and `zucchini` after a zone ending at `mango`, so
-/// it ends with `melon` as one shared byte and a four-byte suffix, then
-/// `zucchini` as nothing shared and an eight-byte suffix.
+/// The wire position of the last zone's `flags` in the fixture's head zone
+/// block payload. That zone holds `melon` and `zucchini` after a zone ending
+/// at `mango`, so it ends with `melon` as one shared byte and a four-byte
+/// suffix, then `zucchini` as nothing shared and an eight-byte suffix.
 fn last_zone_flags_at(bytes: &[u8]) -> usize {
     bytes.len() - (2 + 8) - (2 + 4) - 1
 }
 
 #[test]
 fn a_zone_flag_the_reader_does_not_know_is_refused() {
-    let mut bytes = Vec::new();
-    directory().encode_into(&mut bytes);
+    let directory = directory();
+    let mut bytes = zone_block_payload(&key_zones());
     let flags_at = last_zone_flags_at(&bytes);
     assert_eq!(bytes[flags_at], 0, "the fixture's last zone is bounded");
     bytes[flags_at] = 2;
-    let err = PageDirectory::decode(&bytes).expect_err("an unknown zone flag must be refused");
+    let err = directory
+        .decode_zone_block(0, &bytes)
+        .expect_err("an unknown zone flag must be refused");
     assert!(
         format!("{err:?}").contains("reserved zone flag"),
         "got {err:?}"
@@ -691,7 +762,9 @@ fn a_zone_flag_the_reader_does_not_know_is_refused() {
     // Unbounded, the upper bound that follows is bytes the zones do not
     // declare.
     bytes[flags_at] = 1;
-    let err = PageDirectory::decode(&bytes).expect_err("an unbounded zone with a bound");
+    let err = directory
+        .decode_zone_block(0, &bytes)
+        .expect_err("an unbounded zone with a bound");
     assert!(format!("{err:?}").contains("trailing"), "got {err:?}");
 }
 
@@ -718,14 +791,11 @@ fn neighbouring_bounds_are_written_as_what_they_add_to_the_one_before() {
     ];
     assert_eq!(bytes, expected);
 
-    let with_zones = with_zones(zones.clone()).expect("the zones fit the fixture's grid");
-    let mut directory_bytes = Vec::new();
-    with_zones.encode_into(&mut directory_bytes);
     assert_eq!(
-        PageDirectory::decode(&directory_bytes)
-            .expect("decode")
-            .zones(),
-        &zones,
+        directory()
+            .decode_zone_block(0, &zone_block_payload(&zones))
+            .expect("decode"),
+        zones,
         "the bounds come back whole",
     );
 }
@@ -735,15 +805,17 @@ fn a_bound_that_cannot_be_rebuilt_is_refused() {
     // A bound claims a prefix of its reference; one claiming more than the
     // reference holds, or adding up to more than a zone keeps, has no
     // reading, and taking it anyway would prune by bytes nobody wrote.
-    let mut bytes = Vec::new();
-    directory().encode_into(&mut bytes);
+    let directory = directory();
+    let bytes = zone_block_payload(&key_zones());
     // The last zone's upper bound, `zucchini`, shares nothing with `melon`.
     let shared_at = bytes.len() - (2 + 8);
     assert_eq!(bytes[shared_at], 0);
 
     let mut over_reference = bytes.clone();
     over_reference[shared_at] = 6; // `melon` has five bytes
-    PageDirectory::decode(&over_reference).expect_err("a prefix longer than the reference");
+    directory
+        .decode_zone_block(0, &over_reference)
+        .expect_err("a prefix longer than the reference");
 
     // Five shared bytes and a suffix that takes the bound past what a zone
     // keeps: the suffix length claims 60 bytes, of which only the eight of
@@ -753,7 +825,9 @@ fn a_bound_that_cannot_be_rebuilt_is_refused() {
     too_long[shared_at] = 5;
     too_long[shared_at + 1] = 60;
     too_long.extend_from_slice(&[b'z'; 52]);
-    PageDirectory::decode(&too_long).expect_err("a bound past ZONE_BOUND_LEN");
+    directory
+        .decode_zone_block(0, &too_long)
+        .expect_err("a bound past ZONE_BOUND_LEN");
 }
 
 /// The zones of column 3 over the fixture's two row pages, as a zone block
@@ -765,15 +839,15 @@ fn block_zones() -> PageZones {
     zones
 }
 
-/// The fixture's directory with a zone block for column 3 of `length` bytes.
+/// The fixture's directory with a zone block for column 3 of `length` bytes
+/// after the pages.
 fn with_zone_block(length: u32) -> crate::Result<PageDirectory> {
-    let base = directory();
     PageDirectory::new(
         ROWS,
         TAG,
-        base.row_pages().to_vec(),
-        base.entries().to_vec(),
-        key_zones(),
+        vec![200, 312],
+        fixture_entries(),
+        Some(HEAD),
         vec![ZoneBlock {
             column_id: 3,
             length,
@@ -794,17 +868,19 @@ fn a_zone_block_round_trips_against_its_directory() {
         decoded, directory,
         "the zone block listing survives the wire"
     );
-    assert_eq!(decoded.zone_block(3), Some((0, 96)));
+    // Measured from the directory's end: the head block, then the pages.
+    assert_eq!(
+        decoded.zone_block(3),
+        Some((HEAD.length + decoded.pages_len(), 96))
+    );
     assert_eq!(
         decoded.zone_block(0),
-        None,
-        "the key's zones are in the directory"
+        Some((0, HEAD.length)),
+        "the key's zones lie right after the directory",
     );
 
-    let mut payload = Vec::new();
-    PageDirectory::encode_zone_block(TAG, &block_zones(), &mut payload);
     let zones = directory
-        .decode_zone_block(3, &payload)
+        .decode_zone_block(3, &zone_block_payload(&block_zones()))
         .expect("column 3's zones for the group's row pages");
     assert_eq!(zones, block_zones());
     assert_eq!(zones.zone(1, 3).map(|z| z.null_count), Some(312));
@@ -813,18 +889,17 @@ fn a_zone_block_round_trips_against_its_directory() {
 #[test]
 fn zone_blocks_are_placed_one_after_another() {
     // A reader finds a column's zone block by the lengths of the blocks
-    // listed before it.
-    let base = directory();
-    let mut entries = base.entries().to_vec();
+    // before it: the head one, then the pages, then those listed before it.
+    let mut entries = fixture_entries();
     let last = entries.last().copied().expect("the fixture has pages");
     entries.push(entry(last.offset + last.length, 16, 5, 0, 0));
     entries.push(entry(last.offset + last.length + 16, 16, 5, 0, 1));
     let directory = PageDirectory::new(
         ROWS,
         TAG,
-        base.row_pages().to_vec(),
+        vec![200, 312],
         entries,
-        key_zones(),
+        Some(HEAD),
         vec![
             ZoneBlock {
                 column_id: 3,
@@ -837,45 +912,41 @@ fn zone_blocks_are_placed_one_after_another() {
         ],
     )
     .expect("two zone blocks");
-    assert_eq!(directory.zone_block(3), Some((0, 96)));
-    assert_eq!(directory.zone_block(5), Some((96, 40)));
+    let after_pages = HEAD.length + directory.pages_len();
+    assert_eq!(directory.pages_start(), HEAD.length);
+    assert_eq!(directory.zone_block(3), Some((after_pages, 96)));
+    assert_eq!(directory.zone_block(5), Some((after_pages + 96, 40)));
     assert_eq!(
         directory.group_len(100),
-        Some(100 + directory.pages_len() + 136),
+        Some(100 + HEAD.length + directory.pages_len() + 136),
         "the group ends after the last zone block",
     );
 }
 
 #[test]
 fn a_zone_block_listing_that_cannot_be_right_is_refused() {
-    let base = directory();
-    let listing = |blocks: Vec<ZoneBlock>| {
-        PageDirectory::new(
-            ROWS,
-            TAG,
-            base.row_pages().to_vec(),
-            base.entries().to_vec(),
-            key_zones(),
-            blocks,
-        )
+    let listing = |head: Option<ZoneBlock>, blocks: Vec<ZoneBlock>| {
+        PageDirectory::new(ROWS, TAG, vec![200, 312], fixture_entries(), head, blocks)
     };
     let block = |column_id, length| ZoneBlock { column_id, length };
-    let refusal = |blocks| format!("{:?}", listing(blocks).expect_err("must be refused"));
+    let refusal =
+        |head, blocks| format!("{:?}", listing(head, blocks).expect_err("must be refused"));
 
-    assert!(refusal(vec![block(3, 8), block(3, 8)]).contains("two zone blocks"));
-    assert!(refusal(vec![block(9, 8)]).contains("does not have"));
-    // Column 0's zones are in the directory; a second set would be a second
+    assert!(refusal(no_head(), vec![block(3, 8), block(3, 8)]).contains("two zone blocks"));
+    assert!(refusal(no_head(), vec![block(9, 8)]).contains("does not have"));
+    // Column 0's zones are in the head block; a second set would be a second
     // answer for the same row pages.
-    assert!(refusal(vec![block(0, 8)]).contains("directory and a zone block"));
-    assert!(refusal(vec![block(3, 0)]).contains("empty zone block"));
+    assert!(refusal(Some(HEAD), vec![block(0, 8)]).contains("two zone blocks"));
+    assert!(refusal(no_head(), vec![block(3, 0)]).contains("empty zone block"));
+    assert!(refusal(Some(block(0, 0)), vec![]).contains("empty zone block"));
+    assert!(refusal(Some(block(9, 8)), vec![]).contains("does not have"));
 }
 
 #[test]
 fn a_zone_block_that_does_not_fit_its_directory_is_refused() {
     let directory = with_zone_block(96).expect("a directory listing a zone block");
 
-    let mut trailing = Vec::new();
-    PageDirectory::encode_zone_block(TAG, &block_zones(), &mut trailing);
+    let mut trailing = zone_block_payload(&block_zones());
     trailing.push(0);
     let err = directory
         .decode_zone_block(3, &trailing)
@@ -887,10 +958,8 @@ fn a_zone_block_that_does_not_fit_its_directory_is_refused() {
     let mut elsewhere = PageZones::new(vec![0]);
     elsewhere.push(0, Some((b"a", b"b")));
     elsewhere.push(0, Some((b"a", b"b")));
-    let mut payload = Vec::new();
-    PageDirectory::encode_zone_block(TAG, &elsewhere, &mut payload);
     let err = directory
-        .decode_zone_block(3, &payload)
+        .decode_zone_block(3, &zone_block_payload(&elsewhere))
         .expect_err("another column's zones must be refused");
     assert!(format!("{err:?}").contains("another column"), "got {err:?}");
 
@@ -914,10 +983,8 @@ fn a_zone_block_that_does_not_fit_its_directory_is_refused() {
     // Zones for one row page of a group of two.
     let mut short = PageZones::new(vec![3]);
     short.push(0, Some((b"a", b"b")));
-    let mut payload = Vec::new();
-    PageDirectory::encode_zone_block(TAG, &short, &mut payload);
     let err = directory
-        .decode_zone_block(3, &payload)
+        .decode_zone_block(3, &zone_block_payload(&short))
         .expect_err("zones for fewer row pages than the group has must be refused");
     assert!(
         matches!(err, crate::Error::InvalidHeader("ColumnZones")),

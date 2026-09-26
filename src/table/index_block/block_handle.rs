@@ -25,15 +25,19 @@ use std::io::Seek;
 use varint_rs::{VarintReader, VarintWriter};
 
 /// What an index entry says about the columnar row group it names, besides
-/// its extent: the tag its directory must carry, and the directory's on-disk
-/// length, so a read that wants part of the group reads exactly the directory
-/// first.
+/// its extent: the tag its directory must carry, and the on-disk lengths of
+/// the directory and of the zone block after it, so a read that wants part of
+/// the group reads exactly the directory first, or the directory and that
+/// block together when it selects by their column.
 #[derive(Copy, Clone, Debug, Eq, PartialEq)]
 pub struct RowGroupRef {
     /// The tag the group's directory and every page stamp carry.
     pub tag: core::num::NonZeroU64,
     /// The directory's on-disk length, its block header included.
     pub directory_len: core::num::NonZeroU32,
+    /// The on-disk length of the zone block between the directory and the
+    /// pages, zero when the group has none.
+    pub head_zones_len: u32,
 }
 
 /// Points to a block on file
@@ -205,18 +209,24 @@ impl KeyedBlockHandle {
         if let Some(group) = self.inner.row_group {
             writer.write_u64_varint(group.tag.get())?;
             writer.write_u32_varint(group.directory_len.get())?;
+            writer.write_u32_varint(group.head_zones_len)?;
         }
         Ok(())
     }
 }
 
 /// Reads the row group a tagged entry names after its seqno; `None` when it
-/// cannot be read, or names a zero tag, an empty directory or one longer than
-/// the group `size`, none of which a writer emits.
+/// cannot be read, or names a zero tag, an empty directory, or a directory and
+/// head zone block longer than the group `size`, none of which a writer emits.
 fn read_row_group(reader: &mut Cursor<&[u8]>, size: u32) -> Option<RowGroupRef> {
     let tag = core::num::NonZeroU64::new(reader.read_u64_varint().ok()?)?;
     let directory_len = core::num::NonZeroU32::new(reader.read_u32_varint().ok()?)?;
-    (directory_len.get() <= size).then_some(RowGroupRef { tag, directory_len })
+    let head_zones_len = reader.read_u32_varint().ok()?;
+    (directory_len.get().checked_add(head_zones_len)? <= size).then_some(RowGroupRef {
+        tag,
+        directory_len,
+        head_zones_len,
+    })
 }
 
 impl Encodable<BlockOffset> for KeyedBlockHandle {
@@ -251,8 +261,8 @@ impl Encodable<BlockOffset> for KeyedBlockHandle {
         shared_len: usize,
     ) -> crate::Result<()> {
         // Truncated entry (marker 1, or 5 naming a row group):
-        // [marker] [offset] [size] [seqno] [group tag, directory len; marker 5] [shared prefix len] [rest key len] [rest key]
-        // 1        2        3      4       5                                    6                   7              8
+        // [marker] [offset] [size] [seqno] [group tag, directory len, head zones len; marker 5] [shared prefix len] [rest key len] [rest key]
+        // 1        2        3      4       5                                                    6                   7              8
         //
         // Per-block seqno bounds live in the parallel `seqno_bounds` section,
         // never inline (see `encode_full_into`).
@@ -404,10 +414,14 @@ impl Decodable<IndexBlockParsedItem> for KeyedBlockHandle {
             }
             pos = np;
             let (directory_len, np) = read_leb128!(buf, pos);
-            if directory_len == 0 || directory_len > u64::from(size) {
+            pos = np;
+            let (head_zones_len, np) = read_leb128!(buf, pos);
+            pos = np;
+            let head = directory_len.checked_add(head_zones_len)?;
+            if directory_len == 0 || head_zones_len > u64::from(u32::MAX) || head > u64::from(size)
+            {
                 return None;
             }
-            pos = np;
         }
 
         let (key_len_raw, np) = read_leb128!(buf, pos);
