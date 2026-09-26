@@ -11,6 +11,12 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 
 ## [Unreleased]
 
+## [5.11.4](https://github.com/structured-world/coordinode-lsm-tree/compare/v5.11.3...v5.11.4) - 2026-09-26
+
+### Fixed
+
+- backport the merge ranking, predicate refusal and misplaced-block checks to 5.x ([#715](https://github.com/structured-world/coordinode-lsm-tree/pull/715))
+
 ## [5.11.3](https://github.com/structured-world/coordinode-lsm-tree/compare/v5.11.2...v5.11.3) - 2026-09-25
 
 ### Fixed
