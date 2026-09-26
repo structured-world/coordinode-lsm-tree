@@ -8124,6 +8124,70 @@ fn a_directory_length_other_than_the_indexed_one_is_refused() -> crate::Result<(
     Ok(())
 }
 
+/// The compaction scan refuses a group whose directory or head zone block is
+/// not the length its index entry records, as an indexed read does, rather
+/// than rewriting it: the scan streams the data without the index, so only the
+/// entries it is handed can tell it the two disagree.
+#[cfg(feature = "columnar")]
+#[test]
+fn a_scan_refuses_a_group_whose_lengths_disagree_with_its_index_entry() -> crate::Result<()> {
+    let dir = tempdir()?;
+    let file = dir.path().join("table");
+    let checksum = columnar_table_file_paged(&file, 400, 16, 100, 16 * 1_024, 1_024)?;
+    let table = Table::recover(test_recover_params(file, checksum))?;
+    let groups = table
+        .data_block_handles()
+        .map(|keyed| keyed.map(|keyed| *keyed.as_ref()))
+        .collect::<crate::Result<Vec<_>>>()?;
+    let Some(named) = groups.first().and_then(BlockHandle::row_group) else {
+        panic!("a columnar index entry names its group");
+    };
+    assert!(
+        named.head_zones_len > 0,
+        "the fixture's groups carry a head zone block"
+    );
+    let scanned = |groups: Vec<BlockHandle>| {
+        table
+            .scan_groups(groups.len(), 0, groups)?
+            .collect::<crate::Result<Vec<_>>>()
+    };
+    assert_eq!(
+        scanned(groups.clone())?.len(),
+        400,
+        "the entries as written scan every row"
+    );
+
+    let shifted = |delta: i64, of: u32| {
+        u32::try_from(i64::from(of) + delta).expect("a length a byte off stays a u32")
+    };
+    for (what, delta_directory, delta_head) in [
+        ("a shorter directory", -1_i64, 0_i64),
+        ("a longer directory", 1, 0),
+        ("a shorter head zone block", 0, -1),
+        ("a longer head zone block", 0, 1),
+    ] {
+        let mut forged = groups.clone();
+        let Some(first) = forged.first_mut() else {
+            panic!("the table has a group");
+        };
+        *first = first.with_row_group(Some(crate::table::index_block::RowGroupRef {
+            tag: named.tag,
+            directory_len: core::num::NonZeroU32::new(shifted(
+                delta_directory,
+                named.directory_len.get(),
+            ))
+            .expect("the directory is longer than a byte"),
+            head_zones_len: shifted(delta_head, named.head_zones_len),
+        }));
+        let err = scanned(forged).expect_err("a group of other lengths must be refused");
+        assert!(
+            matches!(err, crate::Error::InvalidHeader(_)),
+            "{what}: expected a framing refusal, got {err:?}",
+        );
+    }
+    Ok(())
+}
+
 /// The first row group of the table in `file`.
 #[cfg(feature = "columnar")]
 fn first_row_group(file: &std::path::Path, checksum: Checksum) -> crate::Result<BlockHandle> {
@@ -8950,6 +9014,64 @@ fn a_point_read_takes_the_directory_and_the_key_zones_in_one_request() -> crate:
         metrics.index_block_load_cached_count() - cached_before,
         1,
         "the directory is served from the cache and no zone block is looked up",
+    );
+    Ok(())
+}
+
+/// A point read whose I/O buffer holds the directory but not the directory and
+/// the key zones together asks for them in two requests: one request never
+/// asks for more than the buffer, except for a single block larger than it.
+#[cfg(all(feature = "columnar", feature = "metrics"))]
+#[test]
+fn a_point_read_over_budget_reads_the_directory_and_the_key_zones_apart() -> crate::Result<()> {
+    use crate::table::columnar::COL_USER_KEY;
+    use crate::table::row_group::{PageWant, RowPageSelect};
+
+    let dir = tempdir()?;
+    let file = dir.path().join("table");
+    let checksum = zoned_table_file(&file, 1_500, &[])?;
+    let (table, metrics, injector) = zoned_table_counting_reads(&file, checksum)?;
+    let group = first_row_group(&file, checksum)?;
+    let Some(named) = group.row_group() else {
+        panic!("a columnar index entry names its group");
+    };
+    assert!(named.head_zones_len > 0, "the key zones are a head block");
+    let budget = crate::config::ReadBudget::new(named.directory_len.get(), 16);
+    assert_eq!(
+        budget.io_buffer(),
+        named.directory_len.get(),
+        "the buffer holds exactly the directory",
+    );
+    let _ = table.0.read_budget.set(Box::new(budget));
+
+    let (index_before, _) = requested(&metrics);
+    let key = zoned_key(10);
+    let pages = table.load_row_group(
+        &group,
+        &PageWant::projected(
+            &[COL_USER_KEY],
+            RowPageSelect::Zone {
+                column_id: COL_USER_KEY,
+                lower: Some(&key),
+                upper: Some(&key),
+            },
+        ),
+        ReadCharge::Foreground,
+    )?;
+    assert_eq!(
+        pages.ordinals.len(),
+        1,
+        "the key zones still select one page"
+    );
+    assert_eq!(
+        requested(&metrics).0 - index_before,
+        u64::from(named.directory_len.get()) + u64::from(named.head_zones_len),
+        "the directory and the key zones, and nothing past them",
+    );
+    assert_eq!(
+        injector.read_count(),
+        3,
+        "the directory, then the key zones, then the key page",
     );
     Ok(())
 }

@@ -71,11 +71,11 @@ pub struct Scanner {
     /// so once one entry reaches the bound the comparison is retired.
     filtering_below_bound: bool,
 
-    /// The tags the index names the groups still to be read by, in order: a
-    /// columnar scan streams the data without the index, and refuses a group
-    /// whose directory does not carry the tag its entry names. Empty for a
-    /// row-major table.
-    group_tags: alloc::vec::IntoIter<Option<core::num::NonZeroU64>>,
+    /// The index entries of the groups still to be read, in order: a columnar
+    /// scan streams the data without the index, and refuses a group whose
+    /// directory does not carry the tag and lengths its entry records. Empty
+    /// for a row-major table.
+    groups: alloc::vec::IntoIter<super::BlockHandle>,
 }
 
 impl Scanner {
@@ -102,7 +102,7 @@ impl Scanner {
         restart_interval: u8,
         start_offset: u64,
         lower_bound: Option<crate::UserKey>,
-        group_tags: alloc::vec::Vec<Option<core::num::NonZeroU64>>,
+        groups: alloc::vec::Vec<super::BlockHandle>,
     ) -> crate::Result<Self> {
         // 2 MiB buffer matches RocksDB's `compaction_readahead_size`
         // default and is large enough that the kernel can fold the
@@ -137,7 +137,7 @@ impl Scanner {
             reader: BufReader::with_capacity(SCANNER_READAHEAD_BYTES, file),
             position: start_offset,
         };
-        let mut group_tags = group_tags.into_iter();
+        let mut groups = groups.into_iter();
 
         let block = Self::fetch_next_block(
             &mut reader,
@@ -148,7 +148,7 @@ impl Scanner {
             has_kv_footer,
             columnar,
             restart_interval,
-            group_tags.next().flatten(),
+            groups.next(),
             #[cfg(zstd_any)]
             zstd_dictionary.as_deref(),
         )?;
@@ -179,7 +179,7 @@ impl Scanner {
 
             filtering_below_bound: lower_bound.is_some(),
             lower_bound,
-            group_tags,
+            groups,
         })
     }
 
@@ -196,7 +196,7 @@ impl Scanner {
         has_kv_footer: bool,
         columnar: bool,
         restart_interval: u8,
-        group_tag: Option<core::num::NonZeroU64>,
+        group: Option<super::BlockHandle>,
         #[cfg(zstd_any)] zstd_dict: Option<&crate::compression::ZstdDictionary>,
     ) -> crate::Result<DataBlock> {
         if columnar {
@@ -207,7 +207,7 @@ impl Scanner {
                 encryption,
                 ecc,
                 restart_interval,
-                group_tag,
+                group,
                 #[cfg(zstd_any)]
                 zstd_dict,
             );
@@ -284,9 +284,11 @@ impl Scanner {
     /// pages, which follow it back to back, then its zone blocks if it has any
     /// — and reconstructs it into a row-major [`DataBlock`].
     ///
-    /// The directory must carry `group_tag`, the tag the group's index entry
-    /// names it by: a group consistent in itself but read in another group's
-    /// place is refused rather than streamed out of order. Each page is then
+    /// The directory must carry the tag, and be the length and frame the head
+    /// zone block and group the length, that `group`, the group's index
+    /// entry, records: a group consistent in itself but read in another
+    /// group's place, or misdescribed by its entry, is refused rather than
+    /// streamed out of order or rewritten. Each page is then
     /// checked against the directory: a page whose on-disk length differs
     /// from the length the directory records means the stream and the
     /// directory disagree about where the next block starts, and every block
@@ -303,7 +305,7 @@ impl Scanner {
         encryption: Option<&dyn EncryptionProvider>,
         ecc: Option<crate::table::block::EccParams>,
         restart_interval: u8,
-        group_tag: Option<core::num::NonZeroU64>,
+        group: Option<super::BlockHandle>,
         #[cfg(zstd_any)] zstd_dict: Option<&crate::compression::ZstdDictionary>,
     ) -> crate::Result<DataBlock> {
         let directory_block = Self::read_block(
@@ -323,7 +325,22 @@ impl Scanner {
             )));
         }
         let directory = crate::table::column_page::PageDirectory::decode(&directory_block.data)?;
-        crate::table::row_group::check_group_tag(group_tag, &directory)?;
+        crate::table::row_group::check_group_tag(
+            group.and_then(|group| group.group_tag()),
+            &directory,
+        )?;
+        // The tag check refused a missing entry. The lengths are checked as an
+        // indexed read checks them, so that a group its entry misdescribes is
+        // refused here too rather than rewritten by the compaction.
+        if let Some(group) = &group {
+            let directory_len = directory_block.header.on_disk_size_with(ecc);
+            crate::table::row_group::check_directory_len(
+                crate::table::row_group::indexed_directory_len(group)?,
+                directory_len,
+            )?;
+            crate::table::row_group::check_group_extent(group, directory_len, &directory)?;
+            crate::table::row_group::check_head_zones_len(group, &directory)?;
+        }
         // The zone blocks a scan of every row has no use for are read and
         // verified like the rest, both to reach the next block and so that a
         // stream that ends or diverges there is refused rather than
@@ -419,7 +436,7 @@ impl Scanner {
         _encryption: Option<&dyn EncryptionProvider>,
         _ecc: Option<crate::table::block::EccParams>,
         _restart_interval: u8,
-        _group_tag: Option<core::num::NonZeroU64>,
+        _group: Option<super::BlockHandle>,
         #[cfg(zstd_any)] _zstd_dict: Option<&crate::compression::ZstdDictionary>,
     ) -> crate::Result<DataBlock> {
         Err(crate::Error::FeatureUnsupported("columnar"))
@@ -462,7 +479,7 @@ impl Iterator for Scanner {
                 self.has_kv_footer,
                 self.columnar,
                 self.restart_interval,
-                self.group_tags.next().flatten(),
+                self.groups.next(),
                 #[cfg(zstd_any)]
                 self.zstd_dictionary.as_deref(),
             ) {

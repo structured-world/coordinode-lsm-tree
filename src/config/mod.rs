@@ -81,9 +81,8 @@ pub struct ReadBudget {
 }
 
 impl ReadBudget {
-    /// The least a request may ask for: a block header's worth, so the first
-    /// request of a group can always read the directory's header and learn
-    /// the directory's length.
+    /// The least a request may ask for: a block header's worth, below which
+    /// no request holds even the header of the block it reads.
     pub const MIN_IO_BUFFER: u32 = 64;
 
     /// A budget of `io_buffer` bytes per request and `in_flight` requests at
@@ -91,8 +90,9 @@ impl ReadBudget {
     /// zero `in_flight` to one: a read needs at least one request of at least
     /// a header to make progress.
     ///
-    /// A request never splits a page: one page larger than the I/O buffer is
-    /// still one request.
+    /// A request never splits a block: a directory, zone block or page larger
+    /// than the I/O buffer is still one request, and blocks are asked for
+    /// together only while they fit it.
     #[must_use]
     pub const fn new(io_buffer: u32, in_flight: u16) -> Self {
         Self {

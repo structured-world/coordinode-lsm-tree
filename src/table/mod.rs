@@ -7589,10 +7589,10 @@ impl Table {
         // dropped by the scanner's key filter.
         let mut start_offset = 0u64;
         // A columnar scan streams the data without the index, so the index
-        // hands it the tag of every group it will read: a group consistent in
-        // itself but in another group's place is refused against it, as an
-        // indexed read refuses it.
-        let mut group_tags = Vec::new();
+        // hands it the entry of every group it will read: a group whose tag or
+        // lengths disagree with its entry is refused against it, as an indexed
+        // read refuses it.
+        let mut groups = Vec::new();
         if self.1.is_some() || self.metadata.columnar {
             let mut started = self.1.is_none();
             for keyed in self.maintenance_index_walk() {
@@ -7614,10 +7614,20 @@ impl Table {
                         break;
                     }
                 }
-                group_tags.push(keyed.as_ref().group_tag());
+                groups.push(*keyed.as_ref());
             }
         }
+        self.scan_groups(block_count, start_offset, groups)
+    }
 
+    /// A scanner of `block_count` blocks from `start_offset`, checking each
+    /// columnar group it streams against its index entry in `groups`.
+    fn scan_groups(
+        &self,
+        block_count: usize,
+        start_offset: u64,
+        groups: Vec<BlockHandle>,
+    ) -> crate::Result<Scanner> {
         Scanner::new(
             &self.fs,
             &self.path,
@@ -7635,7 +7645,7 @@ impl Table {
             self.metadata.data_block_restart_interval,
             start_offset,
             self.1.clone(),
-            group_tags,
+            groups,
         )
     }
 

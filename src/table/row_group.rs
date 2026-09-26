@@ -579,12 +579,20 @@ impl GroupRead<'_> {
             self.check_block_len(head_len)?;
         }
         // Both are u32s, and the index entry refused a sum past the group.
-        let head_end = directory_len as usize + head_len as usize;
-        if head_end > group_len {
+        let both = directory_len as usize + head_len as usize;
+        if both > group_len {
             return Err(crate::Error::InvalidHeader(
                 "columnar: page directory overruns its row group",
             ));
         }
+        // The key zones ride along only while the two fit one request; else
+        // the directory is read alone and the zones as a request of their own,
+        // each a single block the buffer may be smaller than.
+        let head_end = if both <= io_buffer {
+            both
+        } else {
+            directory_len as usize
+        };
         let prefix = if want.whole && group_len <= io_buffer {
             self.read(fd.as_ref(), 0, group_len, BlockType::ColumnPage)?
         } else {
