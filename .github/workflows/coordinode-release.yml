@@ -62,7 +62,7 @@ jobs:
 
       # Step 1: Create or update this line's release PR (version bump + changelog)
       - name: Create release PR
-        uses: release-plz/action@a80d79efe0a195618acb02a4089d55fe74d2505f  # v0.5.136
+        uses: release-plz/action@b8d6b54b02889ff2ae2bb82e8b57c3a8fc1683a5  # v0.5.139
         with:
           command: release-pr
           config: .release-plz.toml
@@ -72,9 +72,55 @@ jobs:
       # Step 2: If version in Cargo.toml > latest tag, create GitHub Release + tag
       # This triggers release.yml → cargo publish via OIDC
       - name: Create GitHub Release
-        uses: release-plz/action@a80d79efe0a195618acb02a4089d55fe74d2505f  # v0.5.136
+        uses: release-plz/action@b8d6b54b02889ff2ae2bb82e8b57c3a8fc1683a5  # v0.5.139
         with:
           command: release
           config: .release-plz.toml
         env:
           GITHUB_TOKEN: ${{ steps.app-token.outputs.token }}
+
+      # Step 3: The "Latest release" mark belongs to the highest version. This
+      # line's releases are the highest until a newer major ships from main,
+      # and must not take the mark after that; release-plz only has a static
+      # switch (`git_release_latest`, off here), so the mark is placed here
+      # instead. Re-checked on every run, so it also catches up on releases
+      # an earlier run published.
+      #
+      # Main's release workflow can publish a newer major while this step
+      # runs, and marks it latest as it creates it. After moving the mark,
+      # the step reads the releases again and repeats until the mark sits on
+      # the highest one, so a version it picked before that release appeared
+      # does not keep the mark: whichever happens last, the mark ends on the
+      # highest version.
+      - name: Mark the highest release as latest
+        env:
+          GH_TOKEN: ${{ steps.app-token.outputs.token }}
+          REPO: ${{ github.repository }}
+        run: |
+          set -euo pipefail
+          # Up to three moves of the mark; every one, the last included, is
+          # followed by a pass that checks where the mark ended up.
+          for attempt in 1 2 3 4; do
+            # Filtered in jq, so no matching release is an empty result, not a
+            # failed command.
+            tags=$(gh release list --repo "$REPO" --exclude-drafts --exclude-pre-releases \
+              --limit 1000 --json tagName \
+              --jq '.[].tagName | select(test("^v[0-9]+\\.[0-9]+\\.[0-9]+$"))')
+            highest=$(printf '%s\n' "$tags" | sort -V | tail -n 1)
+            if [ -z "$highest" ]; then
+              echo "no published release"
+              exit 0
+            fi
+            current=$(gh release view --repo "$REPO" --json tagName --jq '.tagName' || true)
+            if [ "$current" = "$highest" ]; then
+              echo "$highest is the latest release"
+              exit 0
+            fi
+            if [ "$attempt" -eq 4 ]; then
+              break
+            fi
+            echo "attempt $attempt: latest release ${current:-none} -> $highest"
+            gh release edit "$highest" --repo "$REPO" --latest
+          done
+          echo "::error::the latest release mark did not settle on the highest version"
+          exit 1
