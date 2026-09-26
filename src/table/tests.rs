@@ -8295,8 +8295,8 @@ fn a_page_size_at_the_group_size_writes_one_row_page_per_group() -> crate::Resul
     let file = dir.path().join("table");
     let mut writer = Writer::new(file.clone(), 0, 0, Arc::new(StdFs))?
         .use_columnar(true)
-        .use_row_group_size(crate::config::DEFAULT_COLUMNAR_ROW_GROUP_SIZE)
-        .use_columnar_page_size(crate::config::DEFAULT_COLUMNAR_PAGE_SIZE);
+        .use_row_group_size(4_096)
+        .use_columnar_page_size(4_096);
     for i in 0..2_000u32 {
         // Rows of varying width, so groups end at every distance past the
         // group size.

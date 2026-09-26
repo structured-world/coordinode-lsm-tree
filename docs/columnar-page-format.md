@@ -544,21 +544,70 @@ more stage to batch across tables rather than as a per-table stall.
 
 A columnar table cuts its row groups at `columnar_row_group_size_policy`,
 separately from the data block size a row-major table uses, and a group's
-rows into row pages at the row page size. The default is still 4 KiB groups
-of one 4 KiB row page, the size row groups had before pages existed; the
-grid below is what a larger default is chosen from.
+rows into row pages at `columnar_page_size_policy`. The defaults are 16 KiB
+groups of 4 KiB row pages, four row pages to a group.
 
-`db_bench --benchmark mixed-layout --num 70000`, one pass per layout, on the
-scenarios whose fixture is columnar:
+`db_bench --benchmark mixed-layout --num 70000 --iterations 3`, every cell on
+the same host and build, median of the three, with the default cache and with
+none (`--cache-mb 0`), bytes read per emitted row:
 
-| Row group / row page | near-full scan, B/row | its time | sparse scan, B/row | point reads over a columnar base, B/row | their time |
+| Row group / row page | near-full scan | sparse scan | point reads over a columnar base | near-full scan, no cache | point reads, no cache |
 |---|---|---|---|---|---|
-| 4 KiB / 4 KiB | 341 | 34-38 ms | 4302 | 216 | 180 ms |
-| 16 KiB / 4 KiB | 341 | 26 ms | 4255 | 216 | 187 ms |
-| 64 KiB / 4 KiB | 339 | 21 ms | 4398 | 215 | 192 ms |
-| 32 KiB / 2 KiB | 356 | 32 ms | 2583 | 225 | 212 ms |
-| 64 KiB / 2 KiB | 354 | 27 ms | 2518 | 225 | 209 ms |
-| 64 KiB / 1 KiB | 377 | 38 ms | 1809 | 241 | 253 ms |
+| 4 KiB / 4 KiB | 341.4 | 4302 | 216.5 | 344.4 | 6388 |
+| 8 KiB / 4 KiB | 342.9 | 4257 | 217.0 | 344.4 | 6497 |
+| **16 KiB / 4 KiB** | **340.6** | **4255** | **215.8** | **341.4** | **6548** |
+| 32 KiB / 4 KiB | 339.2 | 4359 | 215.2 | 339.6 | 6652 |
+| 64 KiB / 4 KiB | 338.6 | 4398 | 215.0 | 338.8 | 6845 |
+| 128 KiB / 4 KiB | 337.7 | 4376 | 214.8 | 337.8 | 7253 |
+| 32 KiB / 8 KiB | 330.9 | 8037 | 210.4 | 331.2 | 11099 |
+| 64 KiB / 8 KiB | 330.2 | 7988 | 210.1 | 330.4 | 11180 |
+| 128 KiB / 8 KiB | 329.9 | 7972 | 210.0 | 330.0 | 11389 |
+
+The point reads with no cache are before a point read took its directory once
+for both of its steps; since, they read 5820 B per row at 4 KiB / 4 KiB and
+5947 at 16 KiB / 4 KiB.
+
+16 KiB / 4 KiB is the only layout that reads fewer bytes than 4 KiB / 4 KiB
+on every one of the near-full scan, the sparse scan, point reads and the
+near-full scan with no cache. Larger groups of 4 KiB row pages read less on
+the first and third but more on the sparse scan, whose group metadata (a
+longer directory, and a zone block with its own header and group tag) is
+spread over one or two matches a group; 8 KiB row pages read the least on
+scans and point reads and nearly twice as much on the sparse scan, where a
+match reads a whole 8 KiB page. In time, the near-full scan at 16 KiB / 4 KiB
+takes 28-31 ms where 4 KiB / 4 KiB takes 39-41 ms, and 25 ms where it takes
+35 ms with no cache; point reads take the same time within the run-to-run
+noise.
+
+Two costs of the larger group remain, both of its geometry:
+
+- **A sparse scan's first touch of a group** reads the directory, then the
+  zone block of the predicate's column, then the matching pages: one more
+  dependent read than a group of one row page, which has no zone block. Over
+  a scan whose blocks are all uncached this is about a fifth of its time
+  (6.5-7.0 ms against 5.4-5.7 ms here). A zone block is cached like a page,
+  so a scan of a group already read does not pay it again.
+- **A point read with nothing cached** reads the group's directory and key
+  zones, which grow with the group's row pages: 2.2% more bytes than one-page
+  groups.
+
+The same trade shapes the defaults elsewhere. Row-oriented engines keep the
+unit a point read decodes small: RocksDB's data block is 4 KiB by default
+([tuning guide](https://github.com/facebook/rocksdb/wiki/RocksDB-Tuning-Guide)),
+Cassandra lowered its compression chunk from 64 KiB to 16 KiB in 4.0 because
+a large chunk makes reading a small record expensive
+([production recommendations](https://cassandra.apache.org/doc/latest/cassandra/getting-started/production.html)),
+and TiKV uses 16-32 KiB blocks
+([configuration](https://docs.pingcap.com/tidb/stable/tikv-configuration-file/)).
+Formats written once per dataset for scanning separate a coarse unit from
+fine statistics, as row groups and row pages do here, at far larger sizes:
+Parquet recommends 512 MB - 1 GB row groups of 8 KB pages
+([configurations](https://parquet.apache.org/docs/file-format/configurations/)),
+and ORC 64 MB stripes indexed every 10,000 rows
+([ORC](https://orc.apache.org/docs/)). An LSM table is written per flush and
+serves point reads, so its sizes are chosen by measurement over its own
+scenarios rather than adopted. Both policies are per level, so a deployment
+whose lower levels sit on slower media can give them larger groups.
 
 Neither the sparse scan nor a point read grows with the group any more:
 
