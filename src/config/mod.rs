@@ -49,7 +49,12 @@ use core::ops::Range;
 
 /// The size a columnar row group is cut at unless
 /// [`Config::columnar_row_group_size_policy`] says otherwise.
-pub const DEFAULT_COLUMNAR_ROW_GROUP_SIZE: u32 = 4_096;
+///
+/// Four row pages of [`DEFAULT_COLUMNAR_PAGE_SIZE`]: the smallest group that
+/// reads fewer bytes than one-page groups on a near-full scan and a point
+/// read without reading more on a sparse scan. The measured grid it was chosen
+/// from is in `docs/columnar-page-format.md`.
+pub const DEFAULT_COLUMNAR_ROW_GROUP_SIZE: u32 = 16 * 1_024;
 
 /// The size a columnar row group's rows are cut into row pages at unless
 /// [`Config::columnar_page_size_policy`] says otherwise.
@@ -1678,8 +1683,10 @@ impl Config {
     ///
     /// A row page closes once its rows reach this many uncompressed bytes, so
     /// a page holds at least one row and a group at least one page. A size at
-    /// or above the row group size writes one row page per group. The default
-    /// is [`DEFAULT_COLUMNAR_PAGE_SIZE`] at every level.
+    /// or above the row group size writes one row page per group the writer
+    /// closes at its size; a group an ingested batch took past it is still cut
+    /// into pages of this size. The default is [`DEFAULT_COLUMNAR_PAGE_SIZE`]
+    /// at every level, four row pages to a group of the default size.
     ///
     /// # Examples
     ///

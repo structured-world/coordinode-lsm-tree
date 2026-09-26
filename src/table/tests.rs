@@ -8295,8 +8295,8 @@ fn a_page_size_at_the_group_size_writes_one_row_page_per_group() -> crate::Resul
     let file = dir.path().join("table");
     let mut writer = Writer::new(file.clone(), 0, 0, Arc::new(StdFs))?
         .use_columnar(true)
-        .use_row_group_size(crate::config::DEFAULT_COLUMNAR_ROW_GROUP_SIZE)
-        .use_columnar_page_size(crate::config::DEFAULT_COLUMNAR_PAGE_SIZE);
+        .use_row_group_size(4_096)
+        .use_columnar_page_size(4_096);
     for i in 0..2_000u32 {
         // Rows of varying width, so groups end at every distance past the
         // group size.
@@ -9014,6 +9014,44 @@ fn a_point_read_takes_the_directory_and_the_key_zones_in_one_request() -> crate:
         metrics.index_block_load_cached_count() - cached_before,
         1,
         "the directory is served from the cache and no zone block is looked up",
+    );
+    Ok(())
+}
+
+/// A point read finds its row pages by the key column and then reads the rest
+/// of the row's columns on them; the second step goes on from the first, so
+/// with nothing cached the directory is read once, with the key zones, and the
+/// key page the first step read is not read again.
+#[cfg(feature = "columnar")]
+#[test]
+fn a_point_read_with_nothing_cached_reads_the_directory_once() -> crate::Result<()> {
+    use crate::fs::{Fault, FaultFs, FaultOp, FaultRule};
+
+    let dir = tempdir()?;
+    let file = dir.path().join("table");
+    let checksum = zoned_table_file(&file, 1_500, &[])?;
+    let group = first_row_group(&file, checksum)?;
+
+    let fault = FaultFs::new(StdFs);
+    let injector = fault.injector();
+    let mut params = test_recover_params(file, checksum);
+    params.fs = Arc::new(fault);
+    params.cache = Arc::new(crate::Cache::with_capacity_bytes(0));
+    let table = Table::recover(params)?;
+    injector.clear();
+    // The first read at the directory's offset passes; a second one fails.
+    injector.arm(
+        FaultRule::new(FaultOp::ReadAt, Fault::Error(crate::io::ErrorKind::Other))
+            .at_offset(*group.offset())
+            .skip(1),
+    );
+
+    let key = zoned_key(10);
+    let found = table.get(&key, SeqNo::MAX, hash64(&key))?;
+    assert_eq!(
+        found.map(|value| value.value.to_vec()),
+        Some(zoned_value(10)),
+        "one read of the directory serves both steps",
     );
     Ok(())
 }
