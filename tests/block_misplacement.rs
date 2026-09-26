@@ -244,8 +244,9 @@ fn assert_refused(tree: &lsm_tree::AnyTree) {
     // A batched read answers every key, or errors.
     let keys: Vec<Vec<u8>> = (0..ROWS).map(key).collect();
     if let Ok(values) = tree.multi_get(&keys, SeqNo::MAX) {
-        for (i, v) in values.iter().enumerate() {
-            assert!(v.is_some(), "multi_get reads key {i} as absent");
+        assert_eq!(values.len(), keys.len(), "multi_get result count");
+        for (i, (v, expected)) in values.iter().zip((0..ROWS).map(value)).enumerate() {
+            assert_eq!(v.as_deref(), Some(expected.as_slice()), "multi_get key {i}");
         }
     }
 
@@ -276,7 +277,7 @@ fn a_data_block_moved_to_another_blocks_place_is_refused() {
 /// A batch too large for a tiny cache goes through the chunked resolver,
 /// which reads blocks into a scratch and point-reads them without the cache.
 #[test]
-fn a_chunked_multi_get_refuses_a_misplaced_block() {
+fn a_chunked_multi_get_with_a_misplaced_block_is_refused() {
     let dir = tempfile::tempdir().expect("tempdir");
     let tree = misplaced_tree(dir.path(), |c| {
         c.use_cache(std::sync::Arc::new(lsm_tree::Cache::with_capacity_bytes(
@@ -286,8 +287,14 @@ fn a_chunked_multi_get_refuses_a_misplaced_block() {
     let keys: Vec<Vec<u8>> = (0..ROWS).chain(0..ROWS).map(key).collect();
     assert!(keys.len() > 512, "the batch must take the chunked path");
     if let Ok(values) = tree.multi_get(&keys, SeqNo::MAX) {
-        for (i, v) in values.iter().enumerate() {
-            assert!(v.is_some(), "multi_get reads position {i} as absent");
+        assert_eq!(values.len(), keys.len(), "multi_get result count");
+        let expected = (0..ROWS).chain(0..ROWS).map(value);
+        for (i, (v, expected)) in values.iter().zip(expected).enumerate() {
+            assert_eq!(
+                v.as_deref(),
+                Some(expected.as_slice()),
+                "multi_get position {i}"
+            );
         }
     }
 }
