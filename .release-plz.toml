@@ -12,8 +12,10 @@ git_release_enable = true
 changelog_update = true
 # Fork tags use v-prefix (v4.0.0) to distinguish from upstream (3.1.2)
 git_tag_name = "v{{ version }}"
-# This is a maintained release line; a newer major is released from main, so a
-# release from here must not take the "Latest release" mark from it.
+# This is a maintained release line: its releases are the highest version
+# until a newer major ships from main, and must not take the "Latest release"
+# mark after that. A static switch cannot follow that, so release-plz never sets
+# the mark here and the release workflow gives it to the highest version.
 git_release_latest = false
 # release-plz treats every open PR whose branch starts with this prefix as its
 # own release PR, closing all but one. main uses the default `release-plz-`, so
