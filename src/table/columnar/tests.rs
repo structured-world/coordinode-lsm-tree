@@ -1,5 +1,5 @@
 use super::{
-    COL_SEQNO, COL_USER_KEY, COL_VALUE, COL_VALUE_TYPE, CodecId, Column, ColumnBatch, TypeTag,
+    COL_SEQNO, COL_USER_KEY, COL_VALUE, COL_VALUE_TYPE, Column, ColumnBatch, TypeTag,
     column_batch_into_entries, column_batch_match_entries, column_batch_to_entries,
     entries_to_column_batch, frame_value_cells, frame_value_cells_nullable, unframe_value_cells,
     unframe_value_cells_nullable, unframe_value_cells_with_defaults,
@@ -213,71 +213,65 @@ fn assert_entries_eq(a: &[InternalValue], b: &[InternalValue]) {
     }
 }
 
+/// The expression a batch's one column was encoded as: the column header is
+/// `row_count` (4) + `column_count` (4) + id (2) + type (1) + width (1) +
+/// validity flag (1), then the values' length and the values.
+fn only_column_expression(batch: &ColumnBatch) -> super::Expression {
+    let encoded = batch.encode().expect("encode");
+    let column = &batch.columns[0];
+    let mut rest = &encoded[13..];
+    let len =
+        usize::try_from(crate::table::column_page::take_varint(&mut rest, 5).expect("length"))
+            .expect("a length a page holds");
+    super::Values::parse(column.type_tag, batch.row_count, &rest[..len])
+        .expect("parse")
+        .describe()
+}
+
 #[test]
-fn delta_codec_round_trips_fixed8_column() {
-    // The seqno column (a u64 number) auto-selects Delta and must round-trip
-    // exactly, including a repeat and a decrease (wrapping delta).
+fn a_seqno_column_is_encoded_by_its_ordinals_and_round_trips() {
+    // A u64 number column of nearby values packs into a few bits a row by its
+    // ordinals, a repeat and a decrease included, and decodes exactly.
     let seqnos: [u64; 5] = [100, 105, 105, 200, 199];
     let data: Vec<u8> = seqnos.iter().flat_map(|s| s.to_le_bytes()).collect();
     let batch = ColumnBatch {
         row_count: 5,
         columns: vec![Column {
-            column_id: 1,
+            column_id: COL_SEQNO,
             type_tag: TypeTag::Number(crate::table::columnar::Number::U64_LE),
             validity: None,
             data: data.clone().into(),
         }],
     };
-    let encoded = batch.encode(CodecId::Plain).expect("encode");
-    // The codec byte (row_count 4 + col_count 4 + id 2 + type 1 + width 1 =
-    // offset 12) must record Delta, auto-selected for the fixed-8 column.
-    assert_eq!(encoded[12], u8::from(CodecId::Delta));
-    let decoded = ColumnBatch::decode(&encoded.into()).expect("decode");
-    assert_eq!(
-        decoded.columns[0].data, data,
-        "delta column must round-trip"
+    assert!(
+        matches!(
+            only_column_expression(&batch),
+            super::Expression::Ordinals(_)
+        ),
+        "a narrow range of u64 numbers is encoded by its ordinals",
     );
+    let decoded = ColumnBatch::decode(&batch.encode().expect("encode").into()).expect("decode");
+    assert_eq!(decoded.columns[0].data, data, "the column must round-trip");
 }
 
 #[test]
-fn auto_codec_is_delta_only_for_the_seqno_column() {
-    // A fixed-8 column that is not the seqno column keeps the default codec
-    // (Plain): delta-encoding a non-monotonic column would only inflate it.
+fn an_opaque_fixed_column_is_never_encoded_by_ordinals() {
+    // An opaque fixed column has no number type, so it has no ordinals: its
+    // bytes are not integers the engine may reinterpret, however narrow they
+    // look. Distinct rows leave it plain.
+    let data: Vec<u8> = (0u64..8).flat_map(|i| (i * 3).to_le_bytes()).collect();
     let batch = ColumnBatch {
-        row_count: 2,
+        row_count: 8,
         columns: vec![Column {
-            column_id: 99, // not the intrinsic seqno column
+            column_id: 99,
             type_tag: TypeTag::Fixed(8),
             validity: None,
-            data: vec![0u8; 16].into(),
+            data: data.clone().into(),
         }],
     };
-    let encoded = batch.encode(CodecId::Plain).expect("encode");
-    assert_eq!(
-        encoded[12],
-        u8::from(CodecId::Plain),
-        "a non-seqno fixed-8 column must not auto-select Delta"
-    );
-}
-
-#[test]
-fn encode_rejects_delta_on_a_non_fixed8_column() {
-    // Forcing Delta on a Bytes column (via the fallback codec) is rejected
-    // rather than silently truncating its bytes.
-    let mut bytes_data = Vec::new();
-    bytes_data.extend_from_slice(&0u32.to_le_bytes());
-    bytes_data.extend_from_slice(&3u32.to_le_bytes());
-    bytes_data.extend_from_slice(b"abc");
-    let batch = ColumnBatch {
-        row_count: 1,
-        columns: vec![Column {
-            column_id: 50,
-            type_tag: TypeTag::Bytes,
-            validity: None,
-            data: bytes_data.into(),
-        }],
-    };
-    assert!(batch.encode(CodecId::Delta).is_err());
+    assert_eq!(only_column_expression(&batch), super::Expression::Plain);
+    let decoded = ColumnBatch::decode(&batch.encode().expect("encode").into()).expect("decode");
+    assert_eq!(decoded.columns[0].data, data);
 }
 
 #[test]
@@ -305,7 +299,7 @@ fn decode_projected_decodes_only_the_wanted_columns() {
     ];
     let bytes = entries_to_column_batch(&entries)
         .expect("transpose")
-        .encode(CodecId::Plain)
+        .encode()
         .expect("encode");
 
     let projected = ColumnBatch::decode_projected(&bytes.clone().into(), &[COL_USER_KEY])
@@ -344,15 +338,16 @@ fn decode_projected_detaches_a_narrow_projection_from_a_value_heavy_block() {
     // Keys are a few bytes, values are large: a key-only projection covers a
     // sliver of the block. Served as a view it would keep the whole block
     // (values included) alive per batch, so it must come back detached; a
-    // full decode covers the block and keeps the zero-copy view.
-    let big_value = vec![0xABu8; 4096];
+    // full decode covers the block and keeps the zero-copy view. The two
+    // values differ, so the value column is stored in its own layout rather
+    // than as a constant, and is served as a view.
     let entries = vec![
-        entry(b"a", 2, ValueType::Value, &big_value),
-        entry(b"b", 1, ValueType::Value, &big_value),
+        entry(b"a", 2, ValueType::Value, &[0xABu8; 4096]),
+        entry(b"b", 1, ValueType::Value, &[0xCDu8; 4096]),
     ];
     let block: Slice = entries_to_column_batch(&entries)
         .expect("transpose")
-        .encode(CodecId::Plain)
+        .encode()
         .expect("encode")
         .into();
 
@@ -395,7 +390,7 @@ fn intrinsic_transpose_round_trips_entries() {
 
     // And through the block encode / decode, so the transpose composes with
     // the on-disk columnar format.
-    let bytes = batch.encode(CodecId::Plain).expect("encode");
+    let bytes = batch.encode().expect("encode");
     let decoded = ColumnBatch::decode(&bytes.into()).expect("decode");
     let back2 = column_batch_to_entries(&decoded).expect("untranspose decoded");
     assert_entries_eq(&entries, &back2);
@@ -879,16 +874,16 @@ fn concat_refuses_no_pages_and_pages_with_other_columns() {
 }
 
 #[test]
-fn columnar_batch_round_trips_through_plain_codec() {
+fn columnar_batch_round_trips() {
     let batch = sample_batch();
-    let encoded = batch.encode(CodecId::Plain).expect("encode");
+    let encoded = batch.encode().expect("encode");
     let decoded = ColumnBatch::decode(&encoded.into()).expect("decode");
     assert_eq!(decoded, batch, "columnar batch must survive a round-trip");
 }
 
 #[test]
 fn columnar_decode_rejects_truncated_payload() {
-    let encoded = sample_batch().encode(CodecId::Plain).expect("encode");
+    let encoded = sample_batch().encode().expect("encode");
     // Drop the last byte: the final column's data is now short.
     let truncated = &encoded[..encoded.len() - 1];
     assert!(ColumnBatch::decode(&truncated.to_vec().into()).is_err());
@@ -907,15 +902,29 @@ fn columnar_encode_rejects_fixed_width_length_mismatch() {
             data: vec![0; 8].into(),
         }],
     };
-    assert!(bad.encode(CodecId::Plain).is_err());
+    assert!(bad.encode().is_err());
+}
+
+/// Where the sample batch's fields lie: the first column's header starts at
+/// 8 (after `row_count` and `column_count`), so its validity flag is at 12,
+/// its values length at 13, its one-byte bitmap at 14 and its operator at 15,
+/// then its 12 plain bytes. The second column starts at 28, its width at 31,
+/// and its values, encoded by their lengths, open at 34 with the lengths'
+/// FFOR: operator 35, base 36, bit width 37.
+#[test]
+fn sample_batch_encodes_as_the_layout_the_offset_tests_assume() {
+    let encoded = sample_batch().encode().expect("encode");
+    assert_eq!(encoded[12], 1, "the first column is nullable");
+    assert_eq!(encoded[15], 0, "the opaque fixed column is plain");
+    assert_eq!(encoded[31], 0, "the bytes column's width");
+    assert_eq!(encoded[34], 7, "the bytes column is encoded by its lengths");
+    assert_eq!(encoded[37], 2, "lengths 2, 0 and 3 pack in two bits");
 }
 
 #[test]
-fn columnar_decode_rejects_unknown_codec_tag() {
-    let mut encoded = sample_batch().encode(CodecId::Plain).expect("encode");
-    // Codec byte of the first column sits after row_count(4) + col_count(4)
-    // + column_id(2) + type_tag(1) + width(1) = offset 12.
-    encoded[12] = 0xFF;
+fn columnar_decode_rejects_an_unknown_operator() {
+    let mut encoded = sample_batch().encode().expect("encode");
+    encoded[15] = 0xFF;
     assert!(ColumnBatch::decode(&encoded.clone().into()).is_err());
 }
 
@@ -932,7 +941,7 @@ fn columnar_encode_rejects_zero_width_fixed_column() {
             data: Vec::new().into(),
         }],
     };
-    assert!(bad.encode(CodecId::Plain).is_err());
+    assert!(bad.encode().is_err());
 }
 
 #[test]
@@ -947,7 +956,7 @@ fn columnar_encode_rejects_wrong_validity_length() {
             data: vec![7].into(),
         }],
     };
-    assert!(bad.encode(CodecId::Plain).is_err());
+    assert!(bad.encode().is_err());
 }
 
 #[test]
@@ -962,22 +971,19 @@ fn columnar_encode_rejects_validity_padding_bits() {
             data: vec![7].into(),
         }],
     };
-    assert!(bad.encode(CodecId::Plain).is_err());
+    assert!(bad.encode().is_err());
 }
 
 #[test]
-fn columnar_decode_rejects_bytes_offset_out_of_bounds() {
-    let mut encoded = sample_batch().encode(CodecId::Plain).expect("encode");
-    // The Bytes column's first offset (must be 0) is at byte 41: col1 starts
-    // at 31 (id 2 + type 1 + width 1 + codec 1 + has_validity 1 + len 4 = 10
-    // header bytes), so its data / offset table begins at 41.
-    encoded[41] = 9;
+fn columnar_decode_rejects_a_bit_width_past_64() {
+    let mut encoded = sample_batch().encode().expect("encode");
+    encoded[37] = 65;
     assert!(ColumnBatch::decode(&encoded.clone().into()).is_err());
 }
 
 #[test]
 fn columnar_decode_rejects_trailing_bytes() {
-    let mut encoded = sample_batch().encode(CodecId::Plain).expect("encode");
+    let mut encoded = sample_batch().encode().expect("encode");
     encoded.push(0); // one byte past the last declared column
     assert!(ColumnBatch::decode(&encoded.clone().into()).is_err());
 }
@@ -999,7 +1005,7 @@ fn column_page_decode_refused_after_copying_still_counts_the_copy() {
         row_page: 0,
     };
     let mut page = nullable
-        .encode_page(batch.row_count, CodecId::Plain, stamp)
+        .encode_page(batch.row_count, stamp)
         .expect("encode page");
     page.push(0); // one byte past the page's column
     let mut copied = 0usize;
@@ -1127,17 +1133,15 @@ fn columnar_decode_rejects_huge_column_count() {
 
 #[test]
 fn columnar_decode_rejects_non_boolean_validity_flag() {
-    let mut encoded = sample_batch().encode(CodecId::Plain).expect("encode");
-    // has_validity flag of the first column is at byte 13.
-    encoded[13] = 2;
+    let mut encoded = sample_batch().encode().expect("encode");
+    encoded[12] = 2;
     assert!(ColumnBatch::decode(&encoded.clone().into()).is_err());
 }
 
 #[test]
 fn columnar_decode_rejects_non_zero_bytes_width() {
-    let mut encoded = sample_batch().encode(CodecId::Plain).expect("encode");
-    // The Bytes column's width byte (must be 0) is at byte 34.
-    encoded[34] = 5;
+    let mut encoded = sample_batch().encode().expect("encode");
+    encoded[31] = 5;
     assert!(ColumnBatch::decode(&encoded.clone().into()).is_err());
 }
 

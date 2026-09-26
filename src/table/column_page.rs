@@ -1217,7 +1217,7 @@ impl PageDirectory {
 }
 
 /// Appends `value` as a LEB128 varint.
-fn put_varint(out: &mut Vec<u8>, mut value: u64) {
+pub fn put_varint(out: &mut Vec<u8>, mut value: u64) {
     loop {
         // The low seven bits, a byte by construction.
         let low = (value & 0x7f) as u8;
@@ -1230,11 +1230,19 @@ fn put_varint(out: &mut Vec<u8>, mut value: u64) {
     }
 }
 
+/// The longest varint a `u64` field takes.
+pub const VAR_U64_MAX_LEN: usize = 10;
+
 /// Takes a LEB128 varint of at most `max_len` bytes off the front of `bytes`;
-/// `None` when it is truncated or runs longer.
-fn take_varint(bytes: &mut &[u8], max_len: usize) -> Option<u64> {
+/// `None` when it is truncated, runs longer, or carries bits past a `u64`.
+pub fn take_varint(bytes: &mut &[u8], max_len: usize) -> Option<u64> {
     let mut value = 0u64;
-    for (index, &byte) in bytes.iter().take(max_len).enumerate() {
+    for (index, &byte) in bytes.iter().take(max_len.min(VAR_U64_MAX_LEN)).enumerate() {
+        // The tenth byte holds bit 63 alone; anything above it names a value
+        // no `u64` has, which only a damaged or forged varint writes.
+        if index == VAR_U64_MAX_LEN - 1 && byte > 1 {
+            return None;
+        }
         value |= u64::from(byte & 0x7f) << (7 * index);
         if byte & 0x80 == 0 {
             *bytes = bytes.get(index + 1..)?;
@@ -1258,7 +1266,7 @@ fn take_var_u32(bytes: &mut &[u8]) -> Option<u32> {
 /// when fewer remain. Manual little-endian parsing keeps this codec
 /// `core` + `alloc` clean, like the sibling section codecs, and the fixed-size
 /// array makes every field read infallible once taken.
-fn take<const N: usize>(bytes: &mut &[u8]) -> Option<[u8; N]> {
+pub fn take<const N: usize>(bytes: &mut &[u8]) -> Option<[u8; N]> {
     let (head, tail) = bytes.split_first_chunk::<N>()?;
     *bytes = tail;
     Some(*head)
@@ -1266,7 +1274,7 @@ fn take<const N: usize>(bytes: &mut &[u8]) -> Option<[u8; N]> {
 
 /// Takes the next `len` bytes off the front of `bytes`, or `None` when fewer
 /// remain.
-fn take_slice<'a>(bytes: &mut &'a [u8], len: usize) -> Option<&'a [u8]> {
+pub fn take_slice<'a>(bytes: &mut &'a [u8], len: usize) -> Option<&'a [u8]> {
     let (head, tail) = bytes.split_at_checked(len)?;
     *bytes = tail;
     Some(head)

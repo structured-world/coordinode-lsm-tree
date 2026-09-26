@@ -969,6 +969,40 @@ impl Table {
         self.row_pages(&blocks, charge)
     }
 
+    /// Every page of every row group, with what its values were encoded as:
+    /// the per-page choice the writer made, laid out for a diagnosis of it.
+    /// Reads each group whole and decodes no values. A row-major table has
+    /// no pages and returns none.
+    ///
+    /// # Errors
+    ///
+    /// A block's verification error, or a malformed directory or page.
+    #[cfg(all(feature = "columnar", feature = "std"))]
+    #[doc(hidden)]
+    pub fn column_page_encodings(&self) -> crate::Result<Vec<crate::inspect::PageEncoding>> {
+        let mut out = Vec::new();
+        if !self.metadata.columnar {
+            return Ok(out);
+        }
+        for (group, handle) in (0u64..).zip(self.data_block_handles()) {
+            let handle = handle?;
+            let blocks = self
+                .group_read(handle.as_ref(), ReadCharge::Untraced)
+                .load(&crate::table::row_group::PageWant::ALL)?;
+            for (entry, rows, expression) in blocks.page_encodings()? {
+                out.push(crate::inspect::PageEncoding {
+                    group,
+                    column_id: entry.id.column_id,
+                    row_page: entry.row_page,
+                    rows,
+                    stored_len: entry.length,
+                    expression,
+                });
+            }
+        }
+        Ok(out)
+    }
+
     /// The context a read of the row group `handle` names needs, charged as
     /// `charge` says.
     #[cfg(feature = "columnar")]

@@ -33,7 +33,9 @@ path = "src/main.rs"
 # compressed blocks. `page_ecc` so the ECC parity trailers of protected
 # SSTs are genuinely VERIFIED rather than skipped with a warning — a
 # forensics tool must not silently report OK over unverifiable parity.
-lsm-tree = { package = "coordinode-lsm-tree", path = "../..", features = ["lz4", "zstd", "encryption", "page_ecc"] }
+# `columnar` so `columns` can read a columnar table's row groups and report
+# how each page's values are encoded.
+lsm-tree = { package = "coordinode-lsm-tree", path = "../..", features = ["lz4", "zstd", "encryption", "page_ecc", "columnar"] }
 clap = { version = "4", features = ["derive"] }
 
 [dev-dependencies]

@@ -1604,7 +1604,6 @@ impl Writer {
         zone_block_min: Option<crate::UserKey>,
     ) -> crate::Result<()> {
         use crate::table::column_page::{PageDirectory, PageId, PageStamp};
-        use crate::table::columnar::CodecId;
 
         // Pages carry the data and go through the table's data codec; the
         // directory is a handful of offsets that no codec shrinks, and is kept
@@ -1674,11 +1673,7 @@ impl Writer {
                     id,
                     row_page,
                 };
-                payloads.push((
-                    id,
-                    row_page,
-                    page_rows.encode_page(rows, CodecId::Plain, stamp)?,
-                ));
+                payloads.push((id, row_page, page_rows.encode_page(rows, stamp)?));
                 start = end;
             }
         }

@@ -328,6 +328,59 @@ pub struct IndexEntry {
     pub size: u32,
 }
 
+/// One page of a columnar table and what its values were encoded as.
+///
+/// Returned by [`read_column_encodings`]. `#[non_exhaustive]` so new fields
+/// can be added in a minor version bump.
+#[cfg(feature = "columnar")]
+#[derive(Debug, Clone)]
+#[non_exhaustive]
+pub struct PageEncoding {
+    /// The row group's ordinal in key order.
+    pub group: u64,
+    /// The column the page holds.
+    pub column_id: u16,
+    /// Which row page of the group.
+    pub row_page: u16,
+    /// Rows in the row page.
+    pub rows: u32,
+    /// The page's on-disk length, its block header included.
+    pub stored_len: u32,
+    /// What the page's values were encoded as, chosen for this page alone.
+    pub expression: crate::table::columnar::Expression,
+}
+
+/// Every page of a columnar SST, with what its values were encoded as.
+///
+/// Pages come in key order and, within a row group, column by column. A
+/// row-major SST has no pages and returns none.
+///
+/// Same out-of-band semantics as [`read_table_properties`]: [`StdFs`], no
+/// encryption provider and no zstd dictionary, so an SST that needs either
+/// fails to decode. No value is decoded; each page's encoding is read from
+/// its header, and the page itself still verifies as the block it is.
+///
+/// # Errors
+///
+/// Returns an error if the file cannot be read, its metadata or index fails
+/// to decode, or a row group's directory or page is malformed.
+#[cfg(feature = "columnar")]
+pub fn read_column_encodings(path: &Path) -> crate::Result<Vec<PageEncoding>> {
+    use alloc::sync::Arc;
+
+    let id = read_table_properties(path)?.id;
+    let table = crate::Table::recover(crate::table::RecoverParams::new(
+        path.to_path_buf(),
+        // Recovery keeps the checksum for the manifest; it does not check it.
+        crate::Checksum::from_raw(0),
+        id,
+        Arc::new(StdFs),
+        crate::comparator::default_comparator(),
+        Arc::new(crate::Cache::with_capacity_bytes(0)),
+    ))?;
+    table.column_page_encodings()
+}
+
 /// Reads `path` and returns the parsed entries of its top-level index
 /// (TLI) block.
 ///

@@ -1216,6 +1216,43 @@ impl RowGroupBlocks {
             every_page,
         })
     }
+
+    /// Each fetched page with the rows it holds and what its values were
+    /// encoded as, in the directory's order, without decoding the values.
+    ///
+    /// # Errors
+    ///
+    /// As [`Self::to_row_pages`], for everything but the values themselves.
+    #[cfg(feature = "std")]
+    pub(crate) fn page_encodings(
+        &self,
+    ) -> crate::Result<Vec<(PageEntry, u32, crate::table::columnar::Expression)>> {
+        let entries = self.directory.entries();
+        let unknown = || {
+            crate::Error::InvalidHeader("columnar: page names a row page the group does not have")
+        };
+        self.pages
+            .iter()
+            .map(|slot| {
+                let entry = *entries.get(slot.index).ok_or_else(unknown)?;
+                let Some(page) = &slot.block else {
+                    return Err(crate::Error::InvalidHeader(
+                        "columnar: a wanted page was not read",
+                    ));
+                };
+                let rows = self
+                    .directory
+                    .row_page_rows(entry.row_page)
+                    .ok_or_else(unknown)?;
+                let expression = crate::table::columnar::Column::page_expression(
+                    &page.data,
+                    rows,
+                    self.directory.stamp_for(&entry),
+                )?;
+                Ok((entry, rows, expression))
+            })
+            .collect()
+    }
 }
 
 /// Refuses a directory whose tag is not `expected`, the one the group's index
