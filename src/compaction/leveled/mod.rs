@@ -24,6 +24,102 @@ use crate::{
 #[cfg(not(feature = "std"))]
 use alloc::vec::Vec;
 
+/// A merge candidate's cost: the bytes it moves down a level (`promoted`) and
+/// every byte it reads and rewrites to do so (`total`, the promoted bytes
+/// plus those it pulls in from the level below).
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+struct MergeCost {
+    promoted: u64,
+    total: u64,
+}
+
+impl MergeCost {
+    /// Whether `self` rewrites fewer bytes per promoted byte than `other`.
+    ///
+    /// Cross-multiplied in `u128`: two `u64` byte counts multiply into at
+    /// most 128 bits, so the comparison is exact for every size a level can
+    /// hold, where dividing first would lose the low bits.
+    fn cheaper_than(self, other: Self) -> bool {
+        u128::from(self.total) * u128::from(other.promoted)
+            < u128::from(other.total) * u128::from(self.promoted)
+    }
+}
+
+/// Streams merge candidates and keeps the one that pays down a level's debt at
+/// the least rewriting per promoted byte.
+///
+/// Ranking by the total input alone prefers a small merge that promotes little
+/// into a dense level below, which has to be repeated many times to retire the
+/// same debt; the ratio ranks how much each promoted byte costs. Among the
+/// candidates that promote no more than `overshoot + slack`, the cheapest one
+/// wins, so a level is not asked to push down far more than it owes; when none
+/// is that small, the cheapest overall still makes progress. Ties go to the
+/// earliest candidate, so the choice is the same on every call.
+///
+/// Only the two leaders are held, whatever the number of candidates offered.
+struct MergeRanking<T> {
+    bound: u64,
+    offered: usize,
+    /// The cheapest candidate within the bound, with its offer index.
+    within: Option<(usize, MergeCost, T)>,
+    /// The cheapest candidate overall, with its offer index.
+    any: Option<(usize, MergeCost, T)>,
+    /// The cost of the cheapest candidate after `any`.
+    second: Option<MergeCost>,
+}
+
+impl<T: Copy> MergeRanking<T> {
+    fn new(overshoot: u64, slack: u64) -> Self {
+        Self {
+            // A bound past `u64::MAX` admits every candidate, which is what
+            // clamping to `u64::MAX` means: no promoted byte count exceeds it.
+            bound: overshoot.saturating_add(slack),
+            offered: 0,
+            within: None,
+            any: None,
+            second: None,
+        }
+    }
+
+    fn offer(&mut self, cost: MergeCost, candidate: T) {
+        let index = self.offered;
+        self.offered += 1;
+        if cost.promoted <= self.bound
+            && self
+                .within
+                .as_ref()
+                .is_none_or(|(_, best, _)| cost.cheaper_than(*best))
+        {
+            self.within = Some((index, cost, candidate));
+        }
+        match &self.any {
+            Some((_, best, _)) if !cost.cheaper_than(*best) => {
+                if self.second.is_none_or(|second| cost.cheaper_than(second)) {
+                    self.second = Some(cost);
+                }
+            }
+            previous => {
+                self.second = previous.as_ref().map(|(_, best, _)| *best);
+                self.any = Some((index, cost, candidate));
+            }
+        }
+    }
+
+    /// The chosen candidate with its offer index and cost, and the cost of the
+    /// cheapest candidate not chosen.
+    fn finish(self) -> Option<((usize, MergeCost, T), Option<MergeCost>)> {
+        match (self.within, self.any) {
+            (Some(within), Some(any)) if within.0 != any.0 => Some((within, Some(any.1))),
+            (Some(chosen), _) | (None, Some(chosen)) => Some((chosen, self.second)),
+            (None, None) => None,
+        }
+    }
+
+    fn offered(&self) -> usize {
+        self.offered
+    }
+}
+
 /// Tries to find the most optimal compaction set from one level into the other.
 ///
 /// Scans all runs in both levels to handle transient multi-run states from
@@ -32,8 +128,9 @@ fn pick_minimal_compaction(
     curr_level: &Level,
     next_level: &Level,
     hidden_set: &HiddenSet,
-    _overshoot: u64,
+    overshoot: u64,
     table_base_size: u64,
+    promotion_slack: u64,
     cmp: &dyn crate::comparator::UserComparator,
 ) -> Option<(HashSet<TableId>, bool)> {
     // NOTE: Find largest trivial move (if it exists)
@@ -68,54 +165,60 @@ fn pick_minimal_compaction(
         return None;
     }
 
-    next_level
-        .iter()
-        .flat_map(|run| {
-            // Cap per-run windows at 50x table_base_size. take_while is safe
-            // here because growing_windows within a single run are monotonically
-            // increasing in size — once one exceeds the cap, all subsequent will too.
-            run.growing_windows().take_while(|window| {
-                let size = window.iter().map(Table::file_size).sum::<u64>();
-                size <= (50 * table_base_size)
-            })
+    // The tables of `curr_level` a merge of `window` promotes, from all its runs.
+    let pull_in = |window: &[Table]| {
+        let key_range = aggregate_run_key_range(window);
+        curr_level
+            .iter()
+            .flat_map(|run| run.get_contained_cmp(&key_range, cmp))
+            .collect::<Vec<&Table>>()
+    };
+
+    // Candidates are ranked as they are enumerated, holding only a window and
+    // its cost for the leaders; the winner's pull-in is rebuilt at the end.
+    let mut ranking = MergeRanking::new(overshoot, promotion_slack);
+    let windows = next_level.iter().flat_map(|run| {
+        // Cap per-run windows at 50x table_base_size. take_while is safe
+        // here because growing_windows within a single run are monotonically
+        // increasing in size — once one exceeds the cap, all subsequent will too.
+        run.growing_windows().take_while(|window| {
+            let size = window.iter().map(Table::file_size).sum::<u64>();
+            size <= (50 * table_base_size)
         })
-        .filter_map(|window| {
-            if hidden_set.is_blocked(window.iter().map(Table::id)) {
-                return None;
-            }
+    });
+    for window in windows {
+        if hidden_set.is_blocked(window.iter().map(Table::id)) {
+            continue;
+        }
+        let curr_level_pull_in = pull_in(window);
+        let curr_level_size = curr_level_pull_in
+            .iter()
+            .map(|t| Table::file_size(t))
+            .sum::<u64>();
+        if curr_level_size == 0
+            || hidden_set.is_blocked(curr_level_pull_in.iter().map(|t| Table::id(t)))
+        {
+            continue;
+        }
+        let next_level_size = window.iter().map(Table::file_size).sum::<u64>();
+        ranking.offer(
+            MergeCost {
+                promoted: curr_level_size,
+                total: curr_level_size + next_level_size,
+            },
+            window,
+        );
+    }
 
-            let key_range = aggregate_run_key_range(window);
-
-            // Pull in contained tables from ALL runs in curr_level
-            let curr_level_pull_in: Vec<&Table> = curr_level
-                .iter()
-                .flat_map(|run| run.get_contained_cmp(&key_range, cmp))
-                .collect();
-
-            let curr_level_size = curr_level_pull_in
-                .iter()
-                .map(|t| Table::file_size(t))
-                .sum::<u64>();
-
-            if curr_level_size == 0 {
-                return None;
-            }
-
-            if hidden_set.is_blocked(curr_level_pull_in.iter().map(|t| Table::id(t))) {
-                return None;
-            }
-
-            let next_level_size = window.iter().map(Table::file_size).sum::<u64>();
-            let compaction_bytes = curr_level_size + next_level_size;
-
-            Some((window, curr_level_pull_in, compaction_bytes))
-        })
-        .min_by_key(|(_, _, bytes)| *bytes)
-        .map(|(window, curr_level_pull_in, _)| {
-            let mut ids: HashSet<_> = window.iter().map(Table::id).collect();
-            ids.extend(curr_level_pull_in.iter().map(|t| Table::id(t)));
-            (ids, false)
-        })
+    let offered = ranking.offered();
+    let ((chosen, cost, window), runner_up) = ranking.finish()?;
+    log::debug!(
+        "leveled: merge candidate {chosen} of {offered} chosen at {cost:?}, runner-up \
+         {runner_up:?} (overshoot {overshoot}, slack {promotion_slack})",
+    );
+    let mut ids: HashSet<_> = window.iter().map(Table::id).collect();
+    ids.extend(pull_in(window).iter().map(|t| Table::id(t)));
+    Some((ids, false))
 }
 
 #[doc(hidden)]
@@ -881,6 +984,9 @@ impl CompactionStrategy for Strategy {
             next_level,
             state.hidden_set(),
             overshoot_bytes,
+            self.target_size,
+            // A merge may promote up to one target table past the overshoot,
+            // the smallest step a merge can take, and still be preferred.
             self.target_size,
             cmp,
         ) else {

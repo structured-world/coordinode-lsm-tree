@@ -61,6 +61,25 @@ pub struct Scanner {
     /// `true` while entries may still fall below `lower_bound`. Keys ascend,
     /// so once one entry reaches the bound the comparison is retired.
     filtering_below_bound: bool,
+
+    /// The last key of the previous block, as `(user key, table-local seqno)`.
+    /// A table's blocks hold disjoint, ascending key ranges, so each block's
+    /// first key sorts after the previous block's last: a block read in
+    /// another block's place, or a block read twice, breaks that order.
+    prev_block_last: Option<(crate::UserKey, SeqNo)>,
+    /// Where the current block stands in that check.
+    block_order: BlockOrder,
+}
+
+/// The block-order check's state for the block being scanned.
+#[derive(Clone, Copy, PartialEq, Eq)]
+enum BlockOrder {
+    /// The block's first entry has not been checked yet.
+    FirstPending,
+    /// The block's first entry sorted after the previous block's.
+    Checked,
+    /// A block failed the check; the scan yields nothing more.
+    Failed,
 }
 
 impl Scanner {
@@ -158,7 +177,53 @@ impl Scanner {
 
             filtering_below_bound: lower_bound.is_some(),
             lower_bound,
+
+            prev_block_last: None,
+            block_order: BlockOrder::FirstPending,
         })
+    }
+
+    /// Checks the first entry of a block against the previous block's last.
+    ///
+    /// # Errors
+    ///
+    /// Returns [`crate::Error::InvalidHeader`] when the block does not sort
+    /// after the previous one.
+    fn check_block_order(&self, first: &InternalValue) -> crate::Result<()> {
+        if let Some((prev_key, prev_seqno)) = &self.prev_block_last {
+            let ascends = match self.comparator.compare(prev_key, &first.key.user_key) {
+                core::cmp::Ordering::Less => true,
+                // Versions of one key descend by seqno across a block boundary,
+                // with one legitimate tie: merge operands of one write batch
+                // share its seqno and can straddle the boundary.
+                core::cmp::Ordering::Equal => *prev_seqno >= first.key.seqno,
+                core::cmp::Ordering::Greater => false,
+            };
+            if !ascends {
+                return Err(crate::Error::InvalidHeader(
+                    "data block does not sort after the block before it",
+                ));
+            }
+        }
+        Ok(())
+    }
+
+    /// The last key of the block being scanned, recorded before the scan
+    /// moves to the next block.
+    ///
+    /// # Errors
+    ///
+    /// Propagates a block-decode failure.
+    fn current_block_last(&self) -> crate::Result<Option<(crate::UserKey, SeqNo)>> {
+        use crate::table::block::ParsedItem as _;
+        let block = self.iter.borrow_owner();
+        Ok(block
+            .try_iter(self.comparator.clone())?
+            .next_back()
+            .map(|item| {
+                let key = item.materialize(block.as_slice()).key;
+                (key.user_key, key.seqno)
+            }))
     }
 
     #[expect(
@@ -253,8 +318,19 @@ impl Iterator for Scanner {
     type Item = crate::Result<InternalValue>;
 
     fn next(&mut self) -> Option<Self::Item> {
+        if self.block_order == BlockOrder::Failed {
+            return None;
+        }
         loop {
             if let Some(mut item) = self.iter.next() {
+                if self.block_order == BlockOrder::FirstPending {
+                    if let Err(e) = self.check_block_order(&item) {
+                        // Poisoned: nothing after a misordered block is served.
+                        self.block_order = BlockOrder::Failed;
+                        return Some(Err(e));
+                    }
+                    self.block_order = BlockOrder::Checked;
+                }
                 // Sub-bound entries of the straddling first block belong to
                 // the slice output that superseded the punched prefix; keys
                 // ascend, so the comparison retires at the first live entry.
@@ -273,6 +349,15 @@ impl Iterator for Scanner {
 
             if self.read_count >= self.block_count {
                 return None;
+            }
+
+            match self.current_block_last() {
+                Ok(Some(last)) => self.prev_block_last = Some(last),
+                Ok(None) => {}
+                Err(e) => {
+                    self.block_order = BlockOrder::Failed;
+                    return Some(Err(e));
+                }
             }
 
             // Init new block
@@ -299,6 +384,7 @@ impl Iterator for Scanner {
                 Ok(iter) => {
                     self.iter = iter;
                     self.read_count += 1;
+                    self.block_order = BlockOrder::FirstPending;
                 }
                 Err(e) => {
                     // Poison the scanner so callers cannot silently skip

@@ -92,7 +92,7 @@ pub(crate) type BlockTaskPlan = (
     Arc<dyn crate::fs::FsFile>,
     SeqNo,
     bool,
-    Vec<(BlockHandle, Vec<usize>)>,
+    Vec<(KeyedBlockHandle, Vec<usize>)>,
 );
 
 /// How [`Table::recover_inner`] treats degraded sidecars and the metadata id
@@ -4559,10 +4559,10 @@ impl Table {
                 block.header.block_type.into(),
             )));
         }
-        let blocks: Vec<BlockHandle> = self
+        let blocks: Vec<(BlockHandle, u64)> = self
             .block_index
             .iter()
-            .map(|r| r.map(|kbh| *kbh.as_ref()))
+            .map(|r| r.map(|kbh| (*kbh.as_ref(), crate::hash::hash64(kbh.end_key()))))
             .collect::<crate::Result<Vec<_>>>()?;
         Ok(Some(crate::table::locator::LoadedLocator::new(
             block.data, blocks,
@@ -5960,7 +5960,9 @@ impl Table {
                 continue;
             };
 
-            if let Some(found) = data_block.point_read_value(key, seqno, &self.comparator)? {
+            let found = data_block.point_read_value(key, seqno, &self.comparator)?;
+            self.check_point_block(&data_block, &block_handle, key, found.is_some())?;
+            if let Some(found) = found {
                 return Ok(Some(found));
             }
 
@@ -6042,7 +6044,7 @@ impl Table {
         key_hash: u64,
     ) -> crate::Result<Option<crate::table::locator::Located>> {
         match &self.locator_index {
-            Some(loc) => loc.locate_block(key_hash),
+            Some(loc) => loc.locate_block_for_read(key_hash),
             None => Ok(None),
         }
     }
@@ -6099,7 +6101,9 @@ impl Table {
                 continue;
             };
 
-            if let Some(item) = data_block.point_read(key, seqno, &self.comparator)? {
+            let found = data_block.point_read(key, seqno, &self.comparator)?;
+            self.check_point_block(&data_block, &block_handle, key, found.is_some())?;
+            if let Some(item) = found {
                 return Ok(Some((item, data_block)));
             }
 
@@ -6112,6 +6116,68 @@ impl Table {
         }
 
         Ok(None)
+    }
+
+    /// Refuses a data block that does not end at the last key of `handle`, the
+    /// index entry it was read for: a checksum-valid block of this table found
+    /// in another block's place, whose reads would otherwise answer "absent"
+    /// or with a version too old. The sequence number is compared as well as
+    /// the user key, since the blocks holding one key's versions all end at it.
+    ///
+    /// Row tables only: a columnar block is rebuilt without its deleted rows,
+    /// so its last row can precede the entry's end key.
+    ///
+    /// # Errors
+    ///
+    /// Returns [`crate::Error::InvalidHeader`] for a misplaced block, and
+    /// propagates a block-decode failure.
+    pub(crate) fn ensure_block_ends_at(
+        &self,
+        block: &DataBlock,
+        handle: &KeyedBlockHandle,
+    ) -> crate::Result<()> {
+        if self.metadata.columnar {
+            return Ok(());
+        }
+        let last = block
+            .try_iter(self.comparator.clone())?
+            .next_back()
+            .map(|item| item.materialize(block.as_slice()).key);
+        match last {
+            Some(last)
+                if last.seqno == handle.seqno()
+                    && self.comparator.compare(&last.user_key, handle.end_key())
+                        == core::cmp::Ordering::Equal =>
+            {
+                Ok(())
+            }
+            _ => Err(crate::Error::InvalidHeader(
+                "data block does not end at the end key of its index entry",
+            )),
+        }
+    }
+
+    /// Checks a block a point read of `key` used, when the read's answer could
+    /// come from a misplaced block: always when it found nothing, and on a hit
+    /// when the entry ends at `key` itself, where a block of the same key's
+    /// older versions could stand in for it. A hit on any other key cannot: a
+    /// block holding `key` belongs where the index routes `key`.
+    fn check_point_block(
+        &self,
+        block: &DataBlock,
+        handle: &KeyedBlockHandle,
+        key: &[u8],
+        found: bool,
+    ) -> crate::Result<()> {
+        if !found || self.entry_ends_at_key(handle, key) {
+            self.ensure_block_ends_at(block, handle)?;
+        }
+        Ok(())
+    }
+
+    /// Whether the index entry `handle` ends at the user key `key`.
+    pub(crate) fn entry_ends_at_key(&self, handle: &KeyedBlockHandle, key: &[u8]) -> bool {
+        self.comparator.compare(handle.end_key(), key) == core::cmp::Ordering::Equal
     }
 
     fn point_read(
@@ -6382,6 +6448,10 @@ impl Table {
             //     key). On None, do NOT advance p — break out so
             //     the next outer iteration loads the next block
             //     and retries the same key.
+            // Whether an answer drawn from this block could come from a
+            // misplaced one: a miss, or any read of the key the entry ends at
+            // (see `check_point_block`).
+            let mut suspect = false;
             while p < passing.len() {
                 let key_idx = passing[p];
                 let key = sorted_keys[key_idx].0;
@@ -6398,10 +6468,13 @@ impl Table {
                             // contract).
                             item.key.seqno = apply_global_seqno(item.key.seqno, global_seqno);
                             results[key_idx] = Some(item);
+                        } else {
+                            suspect = true;
                         }
                         p += 1;
                     }
                     core::cmp::Ordering::Equal => {
+                        suspect = true;
                         if let Some(mut item) =
                             data_block.point_read(key, table_seqno, &self.comparator)?
                         {
@@ -6417,6 +6490,9 @@ impl Table {
                         }
                     }
                 }
+            }
+            if suspect {
+                self.ensure_block_ends_at(&data_block, &block_handle)?;
             }
         }
 
@@ -6640,7 +6716,7 @@ impl Table {
             return Ok(None);
         };
 
-        let mut blocks: Vec<(BlockHandle, Vec<usize>)> = Vec::new();
+        let mut blocks: Vec<(KeyedBlockHandle, Vec<usize>)> = Vec::new();
         let mut p = 0_usize;
         while p < passing.len() {
             // None ends the index; an Err (index-read / decode failure) is
@@ -6656,7 +6732,6 @@ impl Table {
             if self.comparator.compare(first_in_block, end_key) == core::cmp::Ordering::Greater {
                 continue;
             }
-            let handle = *block_handle.as_ref();
             let mut block_keys: Vec<usize> = Vec::new();
             while p < passing.len() {
                 let pos = passing[p];
@@ -6674,7 +6749,9 @@ impl Table {
                     }
                 }
             }
-            blocks.push((handle, block_keys));
+            // The end key rides along so a resolver that finds nothing in the
+            // block can check the block is the one this entry names.
+            blocks.push((block_handle, block_keys));
         }
         if blocks.is_empty() {
             return Ok(None);
@@ -6941,7 +7018,7 @@ impl Table {
             };
             let mut batch = if predicate.is_some() || has_deletes || bound_mask.is_some() {
                 let mut keep = match predicate {
-                    Some(pred) => pred.matching_rows(&batch),
+                    Some(pred) => pred.scan_mask(&batch)?,
                     None => alloc::vec![true; row_count as usize],
                 };
                 if has_deletes {
@@ -8198,9 +8275,9 @@ impl Table {
                 rebuildable_section_degraded = true;
                 return None;
             }
-            let blocks: Vec<BlockHandle> = block_index
+            let blocks: Vec<(BlockHandle, u64)> = block_index
                 .iter()
-                .map(|r| r.map(|kbh| *kbh.as_ref()))
+                .map(|r| r.map(|kbh| (*kbh.as_ref(), crate::hash::hash64(kbh.end_key()))))
                 .collect::<crate::Result<Vec<_>>>()
                 .inspect_err(|e| {
                     log::warn!("retrieval-ribbon locator disabled: index walk failed: {e:?}");

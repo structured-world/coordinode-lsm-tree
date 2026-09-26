@@ -2,7 +2,6 @@
 // Copyright (c) 2025-present, fjall-rs
 // Copyright (c) 2026-present, Dmitry Prudnikov
 
-#[cfg(feature = "zstd")]
 use super::KeyedBlockHandle;
 use super::{BlockOffset, DataBlock, GlobalTableId, data_block::Iter as DataBlockIter};
 use crate::{
@@ -396,6 +395,14 @@ pub struct Iter {
 
     range: Bounds,
 
+    /// The last key, `(user key, table-local seqno)`, of the index entry of the
+    /// block the forward side loaded last: the next block's entries sort after
+    /// it, or the block is not the one the index names.
+    lo_prev_end: Option<(UserKey, SeqNo)>,
+    /// The first key of the block the reverse side loaded last: the next,
+    /// lower index entry ends before it.
+    hi_next_first: Option<(UserKey, SeqNo)>,
+
     /// Set on unrecoverable block-init error so subsequent `next()` /
     /// `next_back()` calls return `None` instead of skipping past the
     /// corrupt block.
@@ -464,6 +471,8 @@ impl Iter {
             hi_data_block: None,
 
             range: (None, None),
+            lo_prev_end: None,
+            hi_next_first: None,
             poisoned: false,
 
             #[cfg(feature = "metrics")]
@@ -564,6 +573,8 @@ impl Iter {
         self.lo_data_block = None;
         self.hi_offset = BlockOffset(u64::MAX);
         self.hi_data_block = None;
+        self.lo_prev_end = None;
+        self.hi_next_first = None;
         // A fresh `table.range()` would produce a non-poisoned iterator; match
         // that so a re-seek past a previously-corrupt block can make progress
         // again (the block is re-read, and re-poisons only if still corrupt).
@@ -772,6 +783,122 @@ impl Iter {
         self.poisoned = true;
         Some(Err(err.into()))
     }
+
+    /// Refuses a block loaded for `handle` that is not the block the entry
+    /// names: a checksum-valid block of the table in another block's place.
+    ///
+    /// The first entry the block yields must not sort past the entry's end
+    /// key, which costs nothing: it is decoded anyway. A block that yields
+    /// nothing is checked in full, since a block at its own place ends at the
+    /// end key whatever window the read clamps it to; a misplaced one holding
+    /// only lower keys yields nothing to a read positioned inside its slot.
+    /// A partially decoded block does not hold its last entry, and a columnar
+    /// block is rebuilt without its deleted rows, so neither gets the full
+    /// check.
+    fn check_block_place(
+        &self,
+        handle: &KeyedBlockHandle,
+        first: Option<&InternalValue>,
+        partial: bool,
+    ) -> crate::Result<()> {
+        let end = (handle.end_key().as_ref(), handle.seqno());
+        if let Some(item) = first {
+            return if self.internal_cmp((&item.key.user_key, item.key.seqno), end)
+                == core::cmp::Ordering::Greater
+            {
+                Err(misplaced())
+            } else {
+                Ok(())
+            };
+        }
+        if partial || self.columnar {
+            return Ok(());
+        }
+        let Some(BlockSource::Row(block)) =
+            self.load_and_resolve(&BlockHandle::new(handle.offset(), handle.size()))?
+        else {
+            return Ok(());
+        };
+        let last = block
+            .try_iter(self.comparator.clone())?
+            .next_back()
+            .map(|item| item.materialize(block.as_slice()).key);
+        match last {
+            Some(last)
+                if self.internal_cmp((&last.user_key, last.seqno), end)
+                    == core::cmp::Ordering::Equal =>
+            {
+                Ok(())
+            }
+            _ => Err(misplaced()),
+        }
+    }
+
+    /// Orders two internal keys, `(user key, seqno)`: by user key, then by
+    /// seqno descending, as entries are stored.
+    fn internal_cmp(
+        &self,
+        (a, a_seqno): (&[u8], SeqNo),
+        (b, b_seqno): (&[u8], SeqNo),
+    ) -> core::cmp::Ordering {
+        self.comparator
+            .compare(a, b)
+            .then_with(|| b_seqno.cmp(&a_seqno))
+    }
+
+    /// Refuses a forward block whose first yielded entry sorts before
+    /// `prev_end`, the last key of the index entry before it: an earlier block
+    /// copied into this one's place. An equal key is accepted, since merge
+    /// operands of one write batch share a seqno and can straddle a boundary.
+    fn check_follows(
+        &self,
+        prev_end: Option<&(UserKey, SeqNo)>,
+        first: Option<&InternalValue>,
+    ) -> crate::Result<()> {
+        match (prev_end, first) {
+            (Some((prev, prev_seqno)), Some(item))
+                if self.internal_cmp((&item.key.user_key, item.key.seqno), (prev, *prev_seqno))
+                    == core::cmp::Ordering::Less =>
+            {
+                Err(misplaced())
+            }
+            _ => Ok(()),
+        }
+    }
+
+    /// Refuses a reverse block whose index entry ends after the first key of
+    /// the block the reverse side loaded before it, then records this block's
+    /// first key for the next one. Equal keys are accepted, as in
+    /// [`Self::check_follows`].
+    fn check_precedes(
+        &mut self,
+        handle: &KeyedBlockHandle,
+        block: &BlockSource,
+    ) -> crate::Result<()> {
+        if let Some((next, next_seqno)) = &self.hi_next_first
+            && self.internal_cmp((handle.end_key(), handle.seqno()), (next, *next_seqno))
+                == core::cmp::Ordering::Greater
+        {
+            return Err(misplaced());
+        }
+        let first = match block {
+            BlockSource::Row(block) => block
+                .try_iter(self.comparator.clone())?
+                .next()
+                .map(|item| item.materialize(block.as_slice()).key),
+            #[cfg(feature = "columnar")]
+            BlockSource::Columnar(entries) => entries.first().map(|e| e.key.clone()),
+        };
+        if let Some(first) = first {
+            self.hi_next_first = Some((first.user_key, first.seqno));
+        }
+        Ok(())
+    }
+}
+
+/// The error a block read in another block's place is refused with.
+fn misplaced() -> crate::Error {
+    crate::Error::InvalidHeader("data block is not the block its index entry names")
 }
 
 impl Iterator for Iter {
@@ -856,6 +983,9 @@ impl Iterator for Iter {
                 Ok(h) => h,
                 Err(e) => return self.poison(e),
             };
+            let prev_end = self
+                .lo_prev_end
+                .replace((handle.end_key().clone(), handle.seqno()));
 
             // Partial-decode fast path: for a large multi-inner-block zstd block
             // whose recorded layout lets us skip the inner blocks past the query
@@ -874,6 +1004,7 @@ impl Iterator for Iter {
             };
             #[cfg(not(feature = "zstd"))]
             let partial: Option<DataBlock> = None;
+            let is_partial = partial.is_some();
 
             let block = if let Some(db) = partial {
                 BlockSource::Row(db)
@@ -902,6 +1033,12 @@ impl Iterator for Iter {
             }
 
             let item = reader.next();
+            if let Err(e) = self
+                .check_follows(prev_end.as_ref(), item.as_ref())
+                .and_then(|()| self.check_block_place(&handle, item.as_ref(), is_partial))
+            {
+                return self.poison(e);
+            }
 
             self.lo_offset = handle.offset();
             self.lo_data_block = Some(reader);
@@ -1010,6 +1147,7 @@ impl DoubleEndedIterator for Iter {
             };
             #[cfg(not(feature = "zstd"))]
             let partial: Option<DataBlock> = None;
+            let is_partial = partial.is_some();
 
             let block = if let Some(db) = partial {
                 BlockSource::Row(db)
@@ -1021,6 +1159,9 @@ impl DoubleEndedIterator for Iter {
                     Err(e) => return self.poison(e),
                 }
             };
+            if let Err(e) = self.check_precedes(&handle, &block) {
+                return self.poison(e);
+            }
 
             let mut reader = match create_data_block_reader(block, self.comparator.clone()) {
                 Ok(r) => r,
@@ -1038,6 +1179,9 @@ impl DoubleEndedIterator for Iter {
             }
 
             let item = reader.next_back();
+            if let Err(e) = self.check_block_place(&handle, item.as_ref(), is_partial) {
+                return self.poison(e);
+            }
 
             self.hi_offset = handle.offset();
             self.hi_data_block = Some(reader);

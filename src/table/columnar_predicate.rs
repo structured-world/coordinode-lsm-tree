@@ -16,9 +16,9 @@
 //! Both compare the column's *comparable* encoding. For a [`TypeTag::Bytes`]
 //! column (the user-key column, and consumer byte sub-columns) the comparable
 //! encoding is the raw value bytes, so the row filter operates directly on the
-//! stored bytes. Fixed-width numeric columns need a separate comparable
-//! transform and are not yet filterable at the row level (block skip still
-//! works, since the zone-map min / max are already comparable-encoded).
+//! stored bytes. A fixed-width column has no order-preserving encoding, so it
+//! carries no zone-map statistics and a scan refuses a predicate on it with
+//! [`crate::Error::FeatureUnsupported`] rather than returning every row.
 
 use super::columnar::{Column, ColumnBatch, TypeTag};
 use super::zone_map::ColumnStats;
@@ -72,8 +72,9 @@ impl ColumnRangePredicate {
     /// A row that is null (per the column's validity bitmap) never matches. If
     /// the predicate's column was projected out of `batch`, every row is treated
     /// as matching (the filter cannot run on an absent column). A non-`Bytes`
-    /// column is likewise treated as all-matching, since its comparable encoding
-    /// is not the stored encoding (block skip still applied at the block level).
+    /// column also yields an all-matching mask, since its stored encoding is
+    /// not comparable; the columnar scans refuse such a predicate before
+    /// calling this.
     #[must_use]
     pub fn matching_rows(&self, batch: &ColumnBatch) -> Vec<bool> {
         let rows = batch.row_count as usize;
@@ -86,6 +87,31 @@ impl ColumnRangePredicate {
         (0..rows)
             .map(|row| self.row_matches(col, rows, row))
             .collect()
+    }
+
+    /// The row mask a scan applies, over a batch it decoded with the
+    /// predicate's column requested.
+    ///
+    /// A column missing from such a batch is one its table does not have, so
+    /// every row's value is null and no row matches; [`Self::matching_rows`]
+    /// takes a missing column as projected out instead and passes every row.
+    ///
+    /// # Errors
+    ///
+    /// Returns [`crate::Error::FeatureUnsupported`] for a fixed-width column:
+    /// its stored bytes are not an order-preserving encoding (a little-endian
+    /// integer compares wrong byte by byte), so the predicate cannot be
+    /// evaluated, and passing every row would answer as if all had matched.
+    pub(crate) fn scan_mask(&self, batch: &ColumnBatch) -> crate::Result<Vec<bool>> {
+        match batch.columns.iter().find(|c| c.column_id == self.column_id) {
+            None => Ok(alloc::vec![false; batch.row_count as usize]),
+            Some(col) if !matches!(col.type_tag, TypeTag::Bytes) => {
+                Err(crate::Error::FeatureUnsupported(
+                    "columnar_scan: a range predicate on a fixed-width column cannot be evaluated",
+                ))
+            }
+            Some(_) => Ok(self.matching_rows(batch)),
+        }
     }
 
     /// Whether row `row` of a `Bytes` column is non-null and within the bounds.

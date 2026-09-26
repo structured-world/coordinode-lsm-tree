@@ -129,7 +129,7 @@ struct RunResolve {
 struct BlockTask<'a> {
     table: &'a crate::Table,
     file: Arc<dyn crate::fs::FsFile>,
-    handle: crate::table::BlockHandle,
+    handle: crate::table::KeyedBlockHandle,
     table_seqno: SeqNo,
     special: bool,
     keys: Vec<usize>,
@@ -3993,14 +3993,23 @@ impl Tree {
 
         for (task, buf) in chunk.iter().zip(buffers.iter()) {
             if let Some(block) = task.table.decode_data_block_from_bytes(buf)? {
+                // A miss, or any read of the key the entry ends at, could be
+                // answered from a misplaced block (see `check_point_block`).
+                let mut suspect = false;
                 for &kidx in &task.keys {
-                    if let Some(item) = task.table.point_read_translated(
-                        &block,
-                        keys[kidx].as_ref(),
-                        task.table_seqno,
-                    )? {
+                    let key = keys[kidx].as_ref();
+                    suspect |= task.table.entry_ends_at_key(&task.handle, key);
+                    if let Some(item) =
+                        task.table
+                            .point_read_translated(&block, key, task.table_seqno)?
+                    {
                         Self::keep_highest(results, kidx, item);
+                    } else {
+                        suspect = true;
                     }
+                }
+                if suspect {
+                    task.table.ensure_block_ends_at(&block, &task.handle)?;
                 }
             }
         }

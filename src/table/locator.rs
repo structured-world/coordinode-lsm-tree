@@ -247,7 +247,8 @@ pub fn locate(section: &[u8], hash: u64) -> crate::Result<Option<(u64, u64)>> {
 #[derive(Debug)]
 pub struct LoadedLocator {
     section: crate::Slice,
-    blocks: Vec<crate::table::BlockHandle>,
+    /// Each data block's handle, with the hash of the user key it ends at.
+    blocks: Vec<(crate::table::BlockHandle, u64)>,
     /// The on-disk precision byte (`PRECISION_*`), governing how a recovered
     /// `slot` is interpreted on the read path.
     precision: u8,
@@ -260,11 +261,12 @@ pub struct LoadedLocator {
 pub type Located = (crate::table::BlockHandle, Option<(u64, bool)>);
 
 impl LoadedLocator {
-    /// Wrap the framed section bytes and the ordinal → handle map. The precision
-    /// is read from the section header (defaulting to per-block, the safe
-    /// no-slot-hint mode, if the header is somehow short).
+    /// Wrap the framed section bytes and the ordinal → handle map, each handle
+    /// paired with [`crate::hash::hash64`] of the user key its block ends at.
+    /// The precision is read from the section header (defaulting to
+    /// per-block, the safe no-slot-hint mode, if the header is somehow short).
     #[must_use]
-    pub fn new(section: crate::Slice, blocks: Vec<crate::table::BlockHandle>) -> Self {
+    pub fn new(section: crate::Slice, blocks: Vec<(crate::table::BlockHandle, u64)>) -> Self {
         let precision = section.get(1).copied().unwrap_or(PRECISION_BLOCK);
         Self {
             section,
@@ -284,11 +286,39 @@ impl LoadedLocator {
     /// # Errors
     ///
     /// Propagates a parse error from [`locate`].
+    #[cfg_attr(
+        not(feature = "std"),
+        expect(
+            dead_code,
+            reason = "the locator cross-check that consumes it is std-gated"
+        )
+    )]
     pub fn locate_block(&self, key_hash: u64) -> crate::Result<Option<Located>> {
+        Ok(self.locate(key_hash)?.map(|(located, _)| located))
+    }
+
+    /// [`Self::locate_block`] for a point read: a block that ends at the key is
+    /// not returned. The key's versions may continue into the next block, and
+    /// a block of its older versions read in this one's place would answer
+    /// with a version too old; the index walk checks such a block against its
+    /// entry.
+    ///
+    /// # Errors
+    ///
+    /// Propagates a parse error from [`locate`].
+    pub fn locate_block_for_read(&self, key_hash: u64) -> crate::Result<Option<Located>> {
+        Ok(self
+            .locate(key_hash)?
+            .filter(|(_, end_key_hash)| *end_key_hash != key_hash)
+            .map(|(located, _)| located))
+    }
+
+    /// The located block with the hash of the user key it ends at.
+    fn locate(&self, key_hash: u64) -> crate::Result<Option<(Located, u64)>> {
         let Some((block_id, slot)) = locate(&self.section, key_hash)? else {
             return Ok(None);
         };
-        let Some(handle) = usize::try_from(block_id)
+        let Some((handle, end_key_hash)) = usize::try_from(block_id)
             .ok()
             .and_then(|i| self.blocks.get(i))
             .copied()
@@ -302,7 +332,7 @@ impl LoadedLocator {
             // own point_read does the in-block lookup.
             _ => None,
         };
-        Ok(Some((handle, hint)))
+        Ok(Some(((handle, hint), end_key_hash)))
     }
 }
 
