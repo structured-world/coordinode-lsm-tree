@@ -443,13 +443,24 @@ pub(crate) fn next_block_at<W: crate::io::Write + crate::io::Seek>(
     crate::table::block::ChecksumAt::table(table_id, file_writer.get_ref().position())
 }
 
-/// `tag` as the index names a row group, refusing the zero tag no group is
-/// written under.
+/// The row group tagged `tag` whose directory and head zone block are
+/// `directory_len` and `head_zones_len` bytes on disk, as the index names it,
+/// refusing the zero tag and the empty directory no group is written with.
 #[cfg(feature = "columnar")]
-fn nonzero_group_tag(tag: u64) -> crate::Result<core::num::NonZeroU64> {
-    core::num::NonZeroU64::new(tag).ok_or(crate::Error::InvalidHeader(
-        "columnar: a row group's tag is zero",
-    ))
+fn row_group_ref(
+    tag: u64,
+    directory_len: u32,
+    head_zones_len: u32,
+) -> crate::Result<crate::table::index_block::RowGroupRef> {
+    Ok(crate::table::index_block::RowGroupRef {
+        tag: core::num::NonZeroU64::new(tag).ok_or(crate::Error::InvalidHeader(
+            "columnar: a row group's tag is zero",
+        ))?,
+        directory_len: core::num::NonZeroU32::new(directory_len).ok_or(
+            crate::Error::InvalidHeader("columnar: a row group's directory is empty"),
+        )?,
+        head_zones_len,
+    })
 }
 
 impl Writer {
@@ -1337,7 +1348,7 @@ impl Writer {
         // on the next entry); every other entry leaves no handle behind.
         let weak_tombstone_key = (value_type == ValueType::WeakTombstone).then(|| user_key.clone());
 
-        self.chunk_size += user_key_len + value_len;
+        self.chunk_size += self.entry_size(user_key_len, value_len);
         self.chunk.push(item);
         self.previous_type = Some(value_type);
         self.previous_weak_tombstone_key = weak_tombstone_key;
@@ -1363,6 +1374,25 @@ impl Writer {
         self.meta.highest_kv_seqno = self.meta.highest_kv_seqno.max(seqno);
 
         Ok(())
+    }
+
+    /// What an entry of a `key_len`-byte key and a `value_len`-byte value
+    /// counts toward the block or row group it is written into. A row group
+    /// counts it as its row pages do, every column's share of the row, so a
+    /// group size and a page size of the same bytes hold the same rows.
+    #[cfg_attr(
+        not(feature = "columnar"),
+        expect(
+            clippy::unused_self,
+            reason = "only a columnar writer counts differently"
+        )
+    )]
+    fn entry_size(&self, key_len: usize, value_len: usize) -> usize {
+        #[cfg(feature = "columnar")]
+        if self.use_columnar {
+            return crate::table::columnar::entry_row_bytes(key_len, value_len);
+        }
+        key_len + value_len
     }
 
     /// Writes a compressed block to disk.
@@ -1594,13 +1624,15 @@ impl Writer {
         // names several gets its pages per part here, and nothing downstream
         // changes, because pages are found by `(column_id, part, row_page)`
         // and never by position.
-        // A page size at or above the group size is one row page per group:
-        // the group is cut by the writer's own size count, the pages by the
-        // bytes the rows carry, and a group the last row took past its size
-        // must not grow a sliver of a page for that one row.
-        let row_pages = if self.columnar_page_size >= self.row_group_size {
-            alloc::vec![batch.row_count]
-        } else {
+        // Pages are cut by the page size whatever the group size: a group an
+        // ingested batch took far past its size (ingestion cuts after a whole
+        // batch) still reads a page at a time. Groups and pages are cut by the
+        // same count of the bytes each row adds, so a group the writer closed
+        // at its size is one page when the page size is the group size. A
+        // short tail page is kept rather than folded into the page before it:
+        // folding costs the sparse scan more, since the enlarged page is read
+        // whole whenever a match lands on it.
+        let row_pages = {
             let cuts = batch.row_page_cuts(self.columnar_page_size)?;
             // The directory counts the group's column pages in a `u16`, so a
             // page size that gives more row pages than it can list merges
@@ -1669,26 +1701,34 @@ impl Writer {
             .collect::<crate::Result<Vec<_>>>()?;
 
         // Statistics zones for a group of several row pages; one row page's
-        // zone is the group's zone-map entry. The key column's zones go into
-        // the directory, which a point read reads first anyway; every other
-        // column's into a zone block of its own after the pages, which only a
-        // read that prunes on that column reads.
+        // zone is the group's zone-map entry. Every column's zones go into a
+        // zone block of its own, which only a read that prunes on that column
+        // reads. The key column's lies right after the directory, so a point
+        // read takes both in one request; every other column's after the
+        // pages.
         let (key_zones, other_zones) = batch.group_zones(&row_pages)?;
+        let zone_block_payload = |zones: &crate::table::column_page::PageZones| {
+            let mut payload = Vec::new();
+            PageDirectory::encode_zone_block(group_tag, zones, &mut payload);
+            payload
+        };
+        let head_payload = key_zones
+            .columns()
+            .first()
+            .map(|&column_id| (column_id, zone_block_payload(&key_zones)));
         let zone_payloads: Vec<(u16, Vec<u8>)> = other_zones
             .columns()
             .iter()
             .map(|&column_id| {
-                let mut payload = Vec::new();
-                PageDirectory::encode_zone_block(
-                    group_tag,
-                    &other_zones.only(|c| c == column_id),
-                    &mut payload,
-                );
-                (column_id, payload)
+                (
+                    column_id,
+                    zone_block_payload(&other_zones.only(|c| c == column_id)),
+                )
             })
             .collect();
-        let zone_blocks = zone_payloads
+        let mut zone_blocks = head_payload
             .iter()
+            .chain(&zone_payloads)
             .map(|(column_id, payload)| {
                 let prepared = Block::prepare_with_flags(
                     payload,
@@ -1703,7 +1743,20 @@ impl Writer {
                 )?;
                 Ok((*column_id, prepared))
             })
-            .collect::<crate::Result<Vec<_>>>()?;
+            .collect::<crate::Result<Vec<_>>>()?
+            .into_iter();
+        let head_zone_block = if head_payload.is_some() {
+            zone_blocks.next()
+        } else {
+            None
+        };
+        let zone_blocks: Vec<_> = zone_blocks.collect();
+        let listing = |(column_id, prepared): &(u16, super::block::PreparedBlock<'_>)| {
+            crate::table::column_page::ZoneBlock {
+                column_id: *column_id,
+                length: prepared.on_disk_len(self.ecc),
+            }
+        };
         let directory = PageDirectory::contiguous(
             batch.row_count,
             group_tag,
@@ -1711,16 +1764,8 @@ impl Writer {
             pages
                 .iter()
                 .map(|(id, row_page, prepared)| (*id, *row_page, prepared.on_disk_len(self.ecc))),
-            key_zones,
-            zone_blocks
-                .iter()
-                .map(
-                    |(column_id, prepared)| crate::table::column_page::ZoneBlock {
-                        column_id: *column_id,
-                        length: prepared.on_disk_len(self.ecc),
-                    },
-                )
-                .collect(),
+            head_zone_block.as_ref().map(listing),
+            zone_blocks.iter().map(listing).collect(),
         )?;
         let mut directory_payload = Vec::new();
         directory.encode_into(&mut directory_payload);
@@ -1736,19 +1781,23 @@ impl Writer {
             0,
         )?;
 
-        // The group is written directory first, then its pages back to back,
-        // which is exactly the layout `PageDirectory::contiguous` recorded,
-        // then the zone blocks in the order the directory lists them.
-        let mut bytes_written = directory_block.on_disk_len(self.ecc);
+        // The group is written directory first, then its head zone block, then
+        // its pages back to back, which is exactly the layout
+        // `PageDirectory::contiguous` recorded, then the other zone blocks in
+        // the order the directory lists them.
+        let directory_len = directory_block.on_disk_len(self.ecc);
+        let head_zones_len = directory.pages_start();
+        let mut bytes_written = directory_len;
         let at = next_block_at(self.table_id, &self.file_writer);
         let mut uncompressed = u64::from(
             directory_block
                 .write_to(&mut self.file_writer, at)?
                 .uncompressed_length,
         );
-        for prepared in pages
+        for prepared in head_zone_block
             .into_iter()
-            .map(|(_, _, prepared)| prepared)
+            .map(|(_, prepared)| prepared)
+            .chain(pages.into_iter().map(|(_, _, prepared)| prepared))
             .chain(zone_blocks.into_iter().map(|(_, prepared)| prepared))
         {
             let at = next_block_at(self.table_id, &self.file_writer);
@@ -1780,7 +1829,7 @@ impl Writer {
             item_count,
             zone_block_min,
             columnar_columns,
-            Some(nonzero_group_tag(group_tag)?),
+            Some(row_group_ref(group_tag, directory_len, head_zones_len)?),
         )
     }
 
@@ -2046,7 +2095,8 @@ impl Writer {
     /// is still ONE entry: the index names row groups, so `block_id` keeps its
     /// meaning and every section keyed by a data block's file offset keeps
     /// working, since the group starts exactly where its directory does. The
-    /// entry carries the group's tag, which its directory must repeat.
+    /// entry carries the group's tag, which its directory must repeat, and its
+    /// directory's length, which its directory's header must repeat.
     #[expect(
         clippy::too_many_arguments,
         reason = "cohesive per-written-block fields; a param struct adds indirection without clarity"
@@ -2062,7 +2112,7 @@ impl Writer {
         item_count: usize,
         zone_block_min: Option<UserKey>,
         columnar_columns: Option<Vec<crate::table::zone_map::ColumnStats>>,
-        group_tag: Option<core::num::NonZeroU64>,
+        row_group: Option<crate::table::index_block::RowGroupRef>,
     ) -> crate::Result<()> {
         self.meta.uncompressed_size += uncompressed_length;
 
@@ -2077,7 +2127,7 @@ impl Writer {
         let handle = KeyedBlockHandle::new(
             last_key.clone(),
             last_seqno,
-            BlockHandle::new(self.meta.file_pos, bytes_written).with_group_tag(group_tag),
+            BlockHandle::new(self.meta.file_pos, bytes_written).with_row_group(row_group),
         );
         // Seqno bounds go into the parallel `seqno_bounds` section keyed by this
         // block's file offset, NOT inline in the index entry: keeping them out of
@@ -2332,7 +2382,8 @@ impl Writer {
     ///
     /// `raw` MUST be every block of one group, back to back, each already
     /// proved verbatim-safe by the salvage walk; `uncompressed_length` is the
-    /// sum over them, and `group_tag` is the tag its directory carries.
+    /// sum over them, and `group_tag` and `head_zones_len` are the tag and
+    /// head zone block length its directory carries.
     ///
     /// # Errors
     ///
@@ -2345,23 +2396,28 @@ impl Writer {
         &mut self,
         (raw, source): (&[u8], VerbatimSource),
         uncompressed_length: u64,
-        group_tag: u64,
+        (group_tag, head_zones_len): (u64, u32),
         entries: &[InternalValue],
         columnar_columns: Option<Vec<crate::table::zone_map::ColumnStats>>,
         comparator: &crate::SharedComparator,
     ) -> crate::Result<Option<crate::UserKey>> {
+        use crate::coding::Decode;
+
         if !self.accepts_group_tag(group_tag) {
             return Err(crate::Error::InvalidHeader(
                 "columnar: a copied row group's tag does not follow the table's last",
             ));
         }
+        // The group opens with its directory, whose header gives its length.
+        let directory_len =
+            crate::table::block::Header::decode_from(&mut &*raw)?.on_disk_size_with(self.ecc);
         let first_key = self.append_verbatim_extent(
             (raw, source),
             uncompressed_length,
             Vec::new(),
             entries,
             columnar_columns,
-            Some(nonzero_group_tag(group_tag)?),
+            Some(row_group_ref(group_tag, directory_len, head_zones_len)?),
             comparator,
         )?;
         self.last_group_tag = Some(group_tag);
@@ -2446,7 +2502,7 @@ impl Writer {
 
     /// Shared body of the verbatim copies: validates the entries' order,
     /// appends `raw` to the data region, and registers it as one index entry,
-    /// naming the row group tagged `group_tag` when the copy is one.
+    /// naming the row group `row_group` when the copy is one.
     #[expect(
         clippy::too_many_arguments,
         reason = "cohesive per-copy fields, forwarded to `register_written_extent`"
@@ -2458,7 +2514,7 @@ impl Writer {
         layout: alloc::vec::Vec<u32>,
         entries: &[InternalValue],
         columnar_columns: Option<Vec<crate::table::zone_map::ColumnStats>>,
-        group_tag: Option<core::num::NonZeroU64>,
+        row_group: Option<crate::table::index_block::RowGroupRef>,
         comparator: &crate::SharedComparator,
     ) -> crate::Result<Option<crate::UserKey>> {
         let bytes_written = u32::try_from(raw.len())
@@ -2490,7 +2546,7 @@ impl Writer {
             inputs.item_count,
             inputs.zone_block_min,
             columnar_columns,
-            group_tag,
+            row_group,
         )?;
         if self.locator.is_some() {
             self.locator_block_id += 1;

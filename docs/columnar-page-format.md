@@ -121,57 +121,65 @@ table's base rules the table out.
 
 ### The page directory
 
-A block of type `ColumnPageDirectory`. Its header carries the row group's
-row count, because a reader needs it before any page is read: it bounds every
-slot, it is what the global row position sums, and a projection must not have
-to decode the key page just to count rows.
+A block of type `ColumnPageDirectory`. It gives a reader the row group's rows
+before any page is read, because they bound every slot, they are what the
+global row position sums, and a projection must not have to decode the key
+page just to count rows. Counts, row counts and lengths are LEB128 varints
+(`var`).
 
 | Header field | Width | Meaning |
 |---|---|---|
-| `version` | `u8` | directory wire version (2); an unknown one is refused |
-| `page_count` | `u16` | page entries that follow the row pages |
-| `row_count` | `u32` | rows in the group; the row pages sum to exactly this |
+| `version` | `u8` | directory wire version (3); an unknown one is refused |
 | `group_tag` | `u64` | names the group; every page repeats it in its stamp |
-| `row_page_count` | `u16` | row pages that follow |
-| `zone_block_count` | `u16` | zone blocks listed after the pages' entries |
+| `row_page_count` | `var` | row pages, at most `u16::MAX` |
+| `part_count` | `var` | column parts; parts times row pages is at most `u16::MAX` |
+| `zone_block_count` | `var` | zone blocks after the pages, at most `u16::MAX` |
+| `head_zones_len` | `var` | on-disk length of the zone block between the directory and the pages, zero for none |
 
-Then, for each row page in row order, its row count as a `u32`: none is zero,
-and together they are the group's rows. Then, for each page:
-
-| Field | Width | Meaning |
-|---|---|---|
-| `offset` | `u32` | start of the page, **relative to the end of the directory** |
-| `length` | `u32` | on-disk length of the page, header included |
-| `column_id` | `u16` | the column the page belongs to |
-| `part` | `u8` | which part of that column's encoding the page holds |
-| `flags` | `u8` | reserved; a reader rejects unknown bits rather than ignoring them |
-| `row_page` | `u16` | the row page whose rows the page holds |
+When `head_zones_len` is not zero, the column whose zones that block holds
+follows (`u16`). Then each column part once, in the order its pages lie: its `column_id`
+(`u16`) and `part` (`u8`). Then, for each row page in row order, its row count
+(`var`): none is zero, and the group's rows are their sum. Then one on-disk
+length (`var`, header included) per page, part by part and, within a part,
+row page by row page.
 
 A page is named by `(column_id, part, row_page)`. A column id alone is 16 bits
 wide already, so the three cannot share one field; keeping them separate is
 also what lets a column's parts be addressed individually once encodings name
 more than one.
 
-A directory is refused unless it is a complete grid: every column part has a
-page for every row page, and no `(column_id, part, row_page)` appears twice. A
-part missing a row page would hand back a batch short of a column for those
-rows, and a reader cannot tell a page that was never written from one that
-was lost.
+The directory records none of the three per page, nor where a page starts:
+the pages lie back to back, from the end of the directory and of the head
+zone block, in exactly the order of their lengths, so a page's offset is the
+sum of the lengths before it, and its
+place in the list is its column part and row page. That makes the grid
+complete by construction, every column part holding one page per row page,
+and leaves a writer one layout, the one that makes a run of one column's
+pages one contiguous read. A directory that named each page's placement
+itself (an earlier layout spent 14 bytes a page on an offset, a length, the
+three names and a flags byte) could describe gaps, overlaps and missing
+pages, all of which a reader had to refuse; at 64 KiB groups of 4 KiB row
+pages over the mixed-layout records, the directory averaged 1892 bytes that
+way, the key column's zones included, and averages 262 this way, with the key
+zones in a block of their own (below).
 
-Then, for each zone block in the order the blocks follow the pages, the
-column whose zones it holds (`u16`) and its on-disk length (`u32`). The
-directory ends with the key column's statistics zones (below). The directory,
-its pages and its zone blocks fill the group exactly; a reader refuses a group
-whose index entry and directory disagree about where it ends.
+Then, for each zone block after the pages, in the order they follow them, the
+column whose zones it holds (`u16`) and its on-disk length (`var`). The
+directory, its head zone block, its pages and its other zone blocks fill the
+group exactly; a reader refuses a group whose index entry and directory
+disagree about where it ends.
 
-**A read caches the directory decoded**, not as the block it was read as. A
-directory of many row pages is dozens to hundreds of entries whose decode
-sorts them to prove the page grid, and every read of the group starts from it
+**A read caches the directory decoded**, not as the block it was read as, and
+keeps the head zone block's zones on it once a read has needed them. A
+directory of many row pages is dozens to hundreds of pages whose decode
+rebuilds each one's placement, and every read of the group starts from it
 (a point read twice: once for the key pages, once for the row pages holding
 the key). On the mixed-layout point reads over a columnar base, at 64 KiB
 groups of 4 KiB row pages, re-decoding it per read took 1.43 s where 4 KiB
 groups take 232 ms; cached decoded it takes 295 ms, reading 222 B per row
-where 4 KiB groups read 330.
+where 4 KiB groups read 330. A directory cached by a read that did not select
+by the key lacks the key zones; the first point read reads them once and
+caches the directory with them, so later ones decode no zone block.
 
 ### Statistics zones
 
@@ -187,28 +195,34 @@ compression unit and the read page, set equal to the read page because
 nothing finer can be left unread. A group of one row page has no zones: its
 zone is the group's zone-map entry, which prunes the whole group already.
 
-Zones live in two places, chosen by who reads them:
+Every ordered column's zones are a `ColumnZones` block of their own, read
+only by a read that prunes on that column. A full scan and a projection that
+does not prune never pay for any; a read that prunes on a narrow column does
+not pay for a wide column's zones, whose 64-byte bounds make them the widest.
+The blocks differ only in where they lie:
 
-- **The key column's zones are in the directory.** Every point read reads the
-  directory first, and the key zones take it from there to the one key page
-  that can hold its key, instead of reading every key page of the group. A key
-  is short, so these cost a few dozen bytes per row page.
-- **Every other ordered column's zones are in a `ColumnZones` block of their
-  own after the pages.** Only a read that prunes on that column reads it. A
-  full scan and a projection that does not prune never pay for any; a read
-  that prunes on a narrow column does not pay for a wide column's zones,
-  whose 64-byte bounds make them the widest.
+- **The key column's lies right after the directory**, before the pages, and
+  the index entry records its length beside the directory's. A point read
+  takes the directory and the key zones in one request, and the key zones
+  take it from there to the one key page that can hold its key, instead of
+  reading every key page of the group.
+- **Every other column's lies after the pages.**
 
-Every zone in the directory would make every partial read pay for all of
-them. Measured over 4 KiB values in 4 KiB row pages, a key-only projection
-then reads 1/15 of what a scan of keys and values reads, where the pages
-alone give it well under 1/20: the value zones push the directory past its
-4 KiB prefix. One zone block for every non-key column would make a pruning
-read pay for the columns it does not prune on: on the mixed-layout sparse
-scan, a predicate on an 8-byte field read 7296 B per returned row with one
-block, and 6157 B with one per column. Parquet makes the same separation, an
-offset index apart from a column index per column, each column's read only
-to prune on it.
+This is the separation Parquet makes with its page index: an `OffsetIndex`
+(where the pages lie) apart from a `ColumnIndex` (their statistics) per
+column chunk, the sort column's included, so a reader reads the statistics of
+only the columns it filters on. ORC keeps one `ROW_INDEX` stream per column
+and Vortex a zone map per column for the same reason. Any zones inside the
+directory make every read of it pay for them. With every zone there, a
+key-only projection over 4 KiB values in 4 KiB row pages read 1/15 of what a
+scan of keys and values reads, where the pages alone give it well under 1/20.
+With only the key's there, a scan pruning on another column paid for the key
+zones at every group it admitted: on the mixed-layout sparse scan at 64 KiB
+groups of 4 KiB row pages, 4439 B per returned row, and 4367 B with the key
+zones in their own block, point reads reading the same bytes as before. One
+zone block for every non-key column together would make a pruning read pay
+for the columns it does not prune on: a predicate on an 8-byte field read
+7296 B per returned row with one block, and 6157 B with one per column.
 
 A zone's bounds are cut to 64 bytes, Parquet's default for its page
 statistics. A prefix of the minimum is still a lower bound, and a prefix of
@@ -222,15 +236,26 @@ byte-wise zone contains them.
 
 | Zone field | Width | Meaning |
 |---|---|---|
-| `null_count` | `u32` | null rows of the column in the row page |
+| `null_count` | `var` | null rows of the column in the row page |
 | `flags` | `u8` | bit 0: no upper bound; other bits reserved and refused |
-| `min_len`, `min` | `u8` + bytes | lower bound, at most 64 bytes |
-| `max_len`, `max` | `u8` + bytes | upper bound, at most 64 bytes, empty without one |
+| `min` | bound | lower bound, at most 64 bytes |
+| `max` | bound | upper bound, at most 64 bytes; absent without one |
 
-Both places hold the same form: a `u16` count of the columns they describe,
-the column ids, then the zones row page by row page, each row page's in
-column order. A zone block opens with its group's `group_tag` (`u64`) before
-that form, as every page opens with its stamp. A zone set is refused unless it names distinct columns the
+A bound is written as what it adds to a reference: the length of the prefix
+it shares with it (`u8`), then the length of the rest (`u8`) and the rest. A
+lower bound's reference is the same column's zone on the row page before, its
+upper bound when it has one and its lower bound otherwise, and nothing on the
+first row page; an upper bound's reference is its own lower bound. A sorted
+column's neighbouring zones, and the two bounds of a narrow number, share
+most of their bytes: over the mixed-layout records at 64 KiB groups of 4 KiB
+row pages, the zone block of an 8-byte field averaged 390 bytes a group with
+whole bounds and a `u32` null count, and averages 171 this way.
+
+Both places hold the same form: a count of the columns they describe
+(`var`), the column ids (`u16`), then the zones row page by row page, each
+row page's in column order. A zone block opens with its group's `group_tag`
+(`u64`) before that form, as every page opens with its stamp. A zone set is
+refused unless it names distinct columns the
 group has, one zone per row page and column, no more nulls than rows, the
 empty range for an all-null row page, and a lower bound no greater than the
 upper one: each of those, read as written, would prune a row page holding a
@@ -338,12 +363,13 @@ for this group's: the page stamps catch it as soon as a page is read, but a
 point read whose key zones prune every row page reads none, and would answer
 from the foreign directory that the key is absent. A reader therefore refuses
 a directory whose tag is not the one the index entry names. The tag is a
-varint of at most 9 bytes per group in the index, and it costs a row-major
-table nothing: its entries
-keep the markers they had, and only an entry that names a row group takes the
-tagged one. A group salvage finds by its frame rather than through the index
-has no entry to name it and is taken under its directory's own tag, its pages'
-stamps still checked against it.
+varint of at most 9 bytes per group in the index, the directory's and head
+zone block's lengths beside it one of at most 5 each, and they cost a
+row-major table nothing: its entries keep the markers they had, and only an
+entry that names a row group takes the tagged one. A group salvage finds by
+its frame rather than through the index has no entry to name it and is taken
+under its directory's own tag and lengths, its pages' stamps still checked
+against it.
 
 A block of another role in a page slot (a zone block, a directory) is refused
 by the type its block header names, before its stamp is consulted. Moving a page **between
@@ -362,28 +388,30 @@ with. Under encryption the block layer's AAD binds the table id on top.
 The acceptance this format is held to asks for the overhead as a measured
 figure rather than a promise of zero. Per row group, each page adds a block
 header (33 bytes: SST blocks carry no flags byte, their transform comes from
-the table descriptor), a 13-byte stamp and a 14-byte directory entry, 60
-bytes in all; each row page adds its 4-byte row count to the directory; and
-the group adds the directory's own 19-byte header, its 2-byte zone count and
-its block header once. With one row page per group, which has no zones:
+the table descriptor), a 13-byte stamp and its length in the directory (2
+bytes for a page under 16 KiB), 48 bytes in all; each column part adds 3
+bytes to the directory and each row page its row count (1 or 2 bytes); and
+the group adds the directory's own header (12 bytes for a few row pages), its
+zone count and its block header once. With one row page per group, which has
+no zones:
 
 | Row group | 8 pages | 20 pages |
 |---|---|---|
-| 32 KiB | 538 B (1.64%) | 1258 B (3.84%) |
-| 128 KiB | 538 B (0.41%) | 1258 B (0.96%) |
-| 256 KiB | 538 B (0.21%) | 1258 B (0.48%) |
+| 32 KiB | 456 B (1.39%) | 1068 B (3.26%) |
+| 128 KiB | 456 B (0.35%) | 1068 B (0.81%) |
+| 256 KiB | 456 B (0.17%) | 1068 B (0.41%) |
 
-Row pages multiply the pages: every column part pays its 60 bytes once per
-row page. Four parts in 4 KiB row pages cost 244 bytes per row page, about 6%
-of the data; in 16 KiB row pages, 1.5%. Their zones add 7 bytes per zone plus
-its bounds: some 30 bytes of key zone per row page for 12-byte keys, in the
-directory, and up to 135 bytes per wider column in that column's zone block
-(a 33-byte block header, its 8-byte group tag and a 6-byte directory listing
-per column and group),
-which only a read pruning on that column fetches. That is what the
-page size trades against the rows a point read decodes and the pages a
-predicate skips, and why its default is chosen by measurement together with
-the group size.
+Row pages multiply the pages: every column part pays its 48 bytes once per
+row page. Four parts in 4 KiB row pages cost 194 bytes per row page, about
+4.7% of the data; in 16 KiB row pages, 1.2%. Their zones add 2 bytes per zone
+and 2 per bound, plus the bytes each bound does not share with its reference:
+some 20 bytes of key zone per row page for sequential 16-byte keys and some 8
+per zone of a narrow number. Each column's zones are a block of their own,
+which adds a 33-byte block header, its 8-byte group tag and a 3 or 4-byte
+directory listing per column and group, and which only a read pruning on that
+column fetches. That is what the page size trades against the rows a
+point read decodes and the pages a predicate skips, and why its default is
+chosen by measurement together with the group size.
 
 Encryption adds its per-page tag and frame on top, roughly doubling those.
 Page-ECC does **not** scale with the page count in any meaningful way: its
@@ -392,7 +420,7 @@ paid with or without pages, and splitting only adds the rounding at each page
 boundary.
 
 These figures are a second reason the row group grows. At 32 KiB with a
-richly-encoded schema the framing is already 3.84%; at 128 KiB and above it is
+richly-encoded schema the framing is already 3.26%; at 128 KiB and above it is
 under 1% and stops being a term in the decision.
 
 ### Measured against the unpaged layout
@@ -402,7 +430,9 @@ A cold scan of every column of one table (20,000 rows, 16-byte keys,
 projection of all four columns, against the same scan of the layout before
 pages, where a row group was one block. Bytes and requests are exact; times
 are medians of 21 cold scans on an x86 Linux host with the file in the page
-cache, where a request costs a system call and nothing else.
+cache, where a request costs a system call and nothing else. They were taken
+with the directory that spent 14 bytes a page and whole bounds on its zones,
+so the byte figures are an upper bound for the current one.
 
 | Row group, row page | bytes read | requests | projection time |
 |---|---|---|---|
@@ -433,34 +463,37 @@ it is why every section keyed by a data block's file offset (zone map, seqno
 bounds, the delete-position lookup) keeps working unchanged: the group starts
 where its directory starts, which is where the block it replaces started.
 
-The entry also carries the group's tag, after its seqno, under markers of its
-own (4 for a full entry, 5 for a truncated one) beside the row-major entries'
-0 and 1. A tagged entry whose tag is zero is refused: no group is written
-under it.
+The entry also carries the group's tag, its directory's on-disk length and
+its head zone block's, after its seqno, under markers of its own (4 for a
+full entry, 5 for a truncated one) beside the row-major entries' 0 and 1. A
+tagged entry whose tag is zero, whose directory is empty, or whose directory
+and head zone block run past the group, is refused: no group is written with
+one.
 
-A reader that wants only part of the group needs the directory's own length
-first, and the index does not record it. It does not have to: a block header
-is fixed-size and carries its on-disk length, so the reader fetches a
-speculative prefix of the group, reads the directory's length out of its
-header, and extends the read only if the directory did not fit. With the key
-page adjacent, a prefix sized for the directory plus the key page usually
-satisfies a point read in one request.
+A reader that wants only part of the group reads exactly the directory first,
+the length the entry records, with the head zone block in the same request
+when it selects by the key, and then each run of consecutive wanted pages
+that are not cached as one range. The directory's own header repeats its
+length and the directory the head zone block's, and a directory that
+disagrees with the entry on either is refused, as one carrying another
+group's tag is: a reader that took the entry's lengths would otherwise cut a
+block short or read into the next.
 
-The prefix is 4 KiB, or the whole group when it is smaller. A directory is
-21 bytes plus 4 per row page, 14 per page, 6 per zone block and the key
-zones, so 4 KiB holds
-the directory of some 250 pages, and the rest of it goes to the start of the
-key pages. A longer directory, which many row pages of a wide schema make, is
-completed by a second request. A
-page the prefix covers, wholly or in part, is served from it rather than
-asked for again; the reader then requests each run of consecutive wanted
-pages that are not cached as one range.
+The length costs the entry two bytes for a directory under 16 KiB. Without it
+a reader has to guess: an earlier layout read a fixed 4 KiB prefix and took
+the directory's length from its header, which cost a second request for a
+longer directory and, for a shorter one, read the rest of the prefix whether
+the read wanted those bytes or not. On the mixed-layout sparse scan at 64 KiB
+groups of 4 KiB row pages the directory averaged 1892 bytes, so more than half
+of every prefix was bytes the scan did not use: 6162 bytes read per returned
+row with the prefix, 5256 with the recorded length, the rows and every other
+byte the same.
 
 ## What a read does
 
-**Point read.** Index gives the row group's extent. One read covers
-the directory and the key pages (adjacent by construction). The key zones in
-the directory name the row pages whose key pages can hold the key, and only
+**Point read.** Index gives the row group's extent and the lengths of its
+directory and of the key zones after it. One read takes both. The key zones
+name the row pages whose key pages can hold the key, and only
 those key pages are read; a key none of them holds ends the read there.
 Otherwise they yield the row pages holding the key's versions, and the
 directory the pages of those row pages; one further read per column fetches
@@ -470,9 +503,9 @@ them.
 pages for the projected columns' parts, and only those are read.
 
 **Predicate scan.** The zone map admits or skips the group; for a group it
-admits, the zones of the predicate's column admit or skip each row page, from
-the directory for the key column and from that column's zone block for any
-other. Only the admitted row pages' pages of the projected columns are read.
+admits, the zones of the predicate's column, from that column's zone block,
+admit or skip each row page. Only the admitted row pages' pages of the
+projected columns are read.
 
 **Full scan.** Every page of the group is wanted, so a group that fits the
 I/O buffer is read in one request, directory and pages together, the single
@@ -491,7 +524,7 @@ under any budget return the same rows.
 - **The I/O buffer** is what one request may ask for. A run of adjacent wanted
   pages is one request up to it and is cut between pages past it; a single page
   larger than it is a request of its own. A read of every page takes a group
-  that fits it in one request. The directory prefix is no larger than it.
+  that fits it in one request.
 - **The in-flight count** is how many requests go out together, through the
   filesystem's batched read. A backend with batched I/O keeps them in flight at
   once; one without reads them in turn.
@@ -510,36 +543,76 @@ more stage to batch across tables rather than as a per-table stall.
 ## Row group size
 
 A columnar table cuts its row groups at `columnar_row_group_size_policy`,
-separately from the data block size a row-major table uses. The default is
-still 4 KiB, the size row groups had before pages existed, because the
-measurement below says a larger group is not yet a win on every read.
+separately from the data block size a row-major table uses, and a group's
+rows into row pages at the row page size. The default is still 4 KiB groups
+of one 4 KiB row page, the size row groups had before pages existed; the
+grid below is what a larger default is chosen from.
 
-`db_bench --benchmark mixed-layout --num 70000`, one pass per size, on the
+`db_bench --benchmark mixed-layout --num 70000`, one pass per layout, on the
 scenarios whose fixture is columnar:
 
-| Row group | near-full scan, B/row | its time | sparse scan, B/row | point reads over a columnar base, B/row | their time |
+| Row group / row page | near-full scan, B/row | its time | sparse scan, B/row | point reads over a columnar base, B/row | their time |
 |---|---|---|---|---|---|
-| 4 KiB | 363 | 33.5 ms | 4574 | 330 | 190 ms |
-| 16 KiB | 340 | 19.2 ms | 16196 | 225 | 213 ms |
-| 64 KiB | 324 | 11.7 ms | 28281 | 206 | 295 ms |
-| 128 KiB | 322 | 10.5 ms | 28088 | 205 | 405 ms |
-| 256 KiB | 322 | 10.2 ms | 28053 | 205 | 624 ms |
+| 4 KiB / 4 KiB | 341 | 34-38 ms | 4302 | 216 | 180 ms |
+| 16 KiB / 4 KiB | 341 | 26 ms | 4255 | 216 | 187 ms |
+| 64 KiB / 4 KiB | 339 | 21 ms | 4398 | 215 | 192 ms |
+| 32 KiB / 2 KiB | 356 | 32 ms | 2583 | 225 | 212 ms |
+| 64 KiB / 2 KiB | 354 | 27 ms | 2518 | 225 | 209 ms |
+| 64 KiB / 1 KiB | 377 | 38 ms | 1809 | 241 | 253 ms |
 
-Two costs grow with the group, and neither is the page layout's:
+Neither the sparse scan nor a point read grows with the group any more:
 
 - **Pruning granularity.** A zone-map entry covers a whole group, so a ~1%
-  predicate that prunes most 4 KiB groups prunes few 64 KiB ones, and the
-  sparse scan reads six times the bytes. Statistics zones finer than the
-  group are what the format separates them for.
-- **Work per point read.** A point hit decoded and validated its pages
-  whole, which was linear in the group's rows, so reads that the cache
-  served still slowed down as the group grew. Row pages bound it by the page
-  size instead: a hit decodes the key pages and the row pages that hold the
-  key.
+  predicate that prunes most 4 KiB groups admits most 64 KiB ones. The
+  statistics zones of an admitted group's row pages then prune it down to
+  the row pages that can match, so what the sparse scan reads follows the
+  row page size, not the group size.
+- **Work per point read.** A read resolves the row pages it selects, finds
+  the pages it wants from the directory's grid (a page's index is its
+  part's times the row page count plus its row page) and decodes those
+  alone, so its work follows the pages it reads, not the pages the group
+  has. Before, it walked every directory entry twice, and a point read at
+  64 KiB / 4 KiB took 262-271 ms where it now takes 190-195 ms.
 
-The dense scan is three times faster from 64 KiB up, which is what a larger
-default is for once pruning also scales with the zone rather than with the
-group.
+What a smaller row page still costs is its own framing: the near-full scan
+reads a little more per row, and a point read reads and decodes smaller pages
+that miss the cache more often.
+
+### What a sparse scan pays per admitted group
+
+Row pages and their zones took the sparse scan at 64 KiB groups to 6162 bytes
+read per returned row, against 4308 at 4 KiB groups: each admitted group cost
+more before its first matching row than the whole 4 KiB group it replaces.
+The same run (`--num 70000`, a predicate on an 8-byte field matching 722
+rows), each group's reads by role, in bytes per returned row:
+
+| Layout | 64 KiB groups, 4 KiB row pages | 4 KiB groups |
+|---|---|---|
+| **Before:** directory prefix read | 1969, of which the directory 910 | 4096 |
+| zone block of the predicate's column | 187 | none |
+| pages past the prefix | 4006 | 212 |
+| total | 6162 | 4308 |
+| **After:** total | 4398 | 4302 |
+
+Four changes removed the difference between the two columns that the scan
+does not need: the index entry records the directory's length, so no fixed
+prefix is read past it; the directory records each page as its length alone;
+the zones write each bound as what it adds to the one before; and the key
+column's zones moved out of the directory into a block of their own, which
+only a read selecting by the key reads. Every byte left is the directory, the
+predicate column's zone block and the pages of the projected columns on the
+row pages holding a match; the zones prune every other row page.
+
+A group and a row page are also cut by one count of a row's size, so a
+4 KiB group and a 4 KiB row page hold the same rows (14 of these records)
+and the two columns compare the same pages.
+
+What remains between them, 96 bytes a returned row, is geometry, not waste:
+a 64 KiB group's directory, which lists sixteen row pages, and the zone
+block of the predicate's column, a block with its own header and group tag,
+spread over the 2.08 matches such a group holds. Both are what the group and
+page sizes decide, and those are chosen by measurement over the whole grid
+of scenarios above.
 
 ## Relationship to the existing partial-decode section
 

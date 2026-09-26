@@ -2586,7 +2586,8 @@ fn forge_row_group_column(
         };
         header.on_disk_size_with(None) as usize
     };
-    let page_at = group_at + directory_len + page.offset as usize;
+    let page_at =
+        group_at + directory_len + directory.pages_start() as usize + page.offset as usize;
 
     // The page keeps its stamp: the forgery targets its content, not which
     // group it claims to belong to.
@@ -3805,9 +3806,11 @@ fn zoned_source(source: &std::path::Path, fs: &Arc<dyn Fs>) -> crate::Result<()>
     Ok(())
 }
 
-/// Narrows the zone of row page 1 to its upper bound alone, keeping every
-/// bound's length, so the zones stay well formed and the same size and only
-/// disagree with the rows they describe.
+/// Narrows the zone of row page 1 by raising the last byte of its lower bound,
+/// so the zones stay well formed and only disagree with the rows they
+/// describe: the bound's first row now falls below it. The byte is one no
+/// neighbouring bound shares, so the zones keep their wire length, which the
+/// forged block's framing needs.
 #[cfg(feature = "columnar")]
 fn narrowed(
     zones: &crate::table::column_page::PageZones,
@@ -3823,11 +3826,21 @@ fn narrowed(
             let Some(max) = zone.max else {
                 panic!("the fixture's zones are bounded");
             };
-            let min = if row_page == 1 { max } else { zone.min };
-            assert_eq!(min.len(), zone.min.len(), "the forgery keeps the length");
-            out.push(zone.null_count, Some((min, max)));
+            let mut min = zone.min.to_vec();
+            if row_page == 1 {
+                let Some(last) = min.last_mut() else {
+                    panic!("the fixture's bounds are not empty");
+                };
+                *last += 1;
+                assert!(min.as_slice() <= max, "the forgery keeps the zone ordered");
+            }
+            out.push(zone.null_count, Some((&min, max)));
         }
     }
+    let (mut before, mut after) = (Vec::new(), Vec::new());
+    zones.encode_into(&mut before);
+    out.encode_into(&mut after);
+    assert_eq!(after.len(), before.len(), "the forgery keeps the length");
     out
 }
 
@@ -3844,75 +3857,107 @@ fn verify_rejects_row_page_zones_that_disagree_with_their_rows() -> crate::Resul
     let dir = tempdir()?;
     let fs: Arc<dyn Fs> = Arc::new(StdFs);
 
-    // The directory's key zones.
-    let source = dir.path().join("key_zones");
-    zoned_source(&source, &fs)?;
-    let honest = open(source.clone(), &fs)?;
-    reconcile_clean(&honest, None);
-    let (group_at, directory) = row_group(&source, &fs, 0)?;
-    let row_pages = directory.row_pages().len();
-    assert!(
-        row_pages > 2,
-        "the fixture must cut its group into row pages"
-    );
-    let forged = crate::table::column_page::PageDirectory::new(
-        directory.row_count(),
-        directory.group_tag(),
-        directory.row_pages().to_vec(),
-        directory.entries().to_vec(),
-        narrowed(directory.zones(), &[COL_USER_KEY], row_pages),
-        directory.zone_blocks().to_vec(),
-    )?;
-    let mut payload = Vec::new();
-    forged.encode_into(&mut payload);
-    let mut bytes = std::fs::read(&source)?;
-    restamp_block(&mut bytes, group_at, &payload)?;
-    std::fs::write(&source, &bytes)?;
-    let err = reconcile_error(
-        &open(source, &fs)?,
-        crate::table::ReconcileGate::BlockEntryCounts,
-        None,
-    );
-    assert!(
-        matches!(err, crate::Error::InvalidHeader(msg) if msg.contains("row page statistics")),
-        "a forged directory zone must be refused, got {err:?}",
-    );
-
-    // The value column's zone block.
-    let source = dir.path().join("block_zones");
-    zoned_source(&source, &fs)?;
-    let (group_at, directory) = row_group(&source, &fs, 0)?;
-    let mut bytes = std::fs::read(&source)?;
-    let directory_len = {
-        use crate::coding::Decode;
-        let Some(frame) = bytes.get(group_at..) else {
-            panic!("group within the file");
+    // The key column's zones, in the head zone block before the pages, and
+    // the value column's, in a zone block after them.
+    for (name, column_id) in [("key_zones", COL_USER_KEY), ("value_zones", COL_VALUE)] {
+        let source = dir.path().join(name);
+        zoned_source(&source, &fs)?;
+        let honest = open(source.clone(), &fs)?;
+        reconcile_clean(&honest, None);
+        let (group_at, directory) = row_group(&source, &fs, 0)?;
+        let row_pages = directory.row_pages().len();
+        assert!(
+            row_pages > 2,
+            "the fixture must cut its group into row pages"
+        );
+        let mut bytes = std::fs::read(&source)?;
+        let directory_len = {
+            use crate::coding::Decode;
+            let Some(frame) = bytes.get(group_at..) else {
+                panic!("group within the file");
+            };
+            crate::table::block::Header::decode_from(&mut &frame[..])?.on_disk_size_with(None)
         };
-        crate::table::block::Header::decode_from(&mut &frame[..])?.on_disk_size_with(None)
-    };
-    let Some((after_pages, _)) = directory.zone_block(COL_VALUE) else {
-        panic!("the value column has a zone block");
-    };
-    let zones_at =
-        group_at + directory_len as usize + directory.pages_len() as usize + after_pages as usize;
-    let zones = directory.decode_zone_block(COL_VALUE, &block_payload(&bytes, zones_at)?)?;
-    let mut payload = Vec::new();
-    crate::table::column_page::PageDirectory::encode_zone_block(
-        directory.group_tag(),
-        &narrowed(&zones, &[COL_VALUE], row_pages),
-        &mut payload,
-    );
-    restamp_block(&mut bytes, zones_at, &payload)?;
-    std::fs::write(&source, &bytes)?;
-    let err = reconcile_error(
-        &open(source, &fs)?,
-        crate::table::ReconcileGate::BlockEntryCounts,
-        None,
-    );
-    assert!(
-        matches!(err, crate::Error::InvalidHeader(msg) if msg.contains("row page statistics")),
-        "a forged zone block must be refused, got {err:?}",
-    );
+        let Some((after_directory, _)) = directory.zone_block(column_id) else {
+            panic!("column {column_id} has a zone block");
+        };
+        let zones_at = group_at + directory_len as usize + after_directory as usize;
+        let zones = directory.decode_zone_block(column_id, &block_payload(&bytes, zones_at)?)?;
+        let mut payload = Vec::new();
+        crate::table::column_page::PageDirectory::encode_zone_block(
+            directory.group_tag(),
+            &narrowed(&zones, &[column_id], row_pages),
+            &mut payload,
+        );
+        restamp_block(&mut bytes, zones_at, &payload)?;
+        std::fs::write(&source, &bytes)?;
+        let err = reconcile_error(
+            &open(source, &fs)?,
+            crate::table::ReconcileGate::BlockEntryCounts,
+            None,
+        );
+        assert!(
+            matches!(err, crate::Error::InvalidHeader(msg) if msg.contains("row page statistics")),
+            "{name}: a forged zone block must be refused, got {err:?}",
+        );
+    }
+    Ok(())
+}
+
+/// The compaction scan decodes every zone block of a group it streams against
+/// the group's directory, as an indexed read does, so a checksum-consistent
+/// zone block naming another group is refused rather than rewritten with fresh
+/// statistics: the key column's in the head block and the value column's
+/// after the pages.
+#[cfg(feature = "columnar")]
+#[test]
+fn a_scan_refuses_a_zone_block_that_does_not_decode_against_its_directory() -> crate::Result<()> {
+    use crate::table::columnar::{COL_USER_KEY, COL_VALUE};
+
+    let dir = tempdir()?;
+    let fs: Arc<dyn Fs> = Arc::new(StdFs);
+
+    for (name, column_id) in [("key_zones", COL_USER_KEY), ("value_zones", COL_VALUE)] {
+        let source = dir.path().join(name);
+        zoned_source(&source, &fs)?;
+        let honest = open(source.clone(), &fs)?.scan()?.count();
+        assert!(honest > 0, "{name}: the honest table scans");
+        let (group_at, directory) = row_group(&source, &fs, 0)?;
+        let mut bytes = std::fs::read(&source)?;
+        let directory_len = {
+            use crate::coding::Decode;
+            let Some(frame) = bytes.get(group_at..) else {
+                panic!("group within the file");
+            };
+            crate::table::block::Header::decode_from(&mut &frame[..])?.on_disk_size_with(None)
+        };
+        let Some((after_directory, _)) = directory.zone_block(column_id) else {
+            panic!("column {column_id} has a zone block");
+        };
+        let zones_at = group_at + directory_len as usize + after_directory as usize;
+        let zones = directory.decode_zone_block(column_id, &block_payload(&bytes, zones_at)?)?;
+        let mut payload = Vec::new();
+        crate::table::column_page::PageDirectory::encode_zone_block(
+            directory.group_tag() + 1,
+            &zones,
+            &mut payload,
+        );
+        restamp_block(&mut bytes, zones_at, &payload)?;
+        std::fs::write(&source, &bytes)?;
+
+        // The scanner reads its first group as it is made, so the refusal
+        // comes from making it or from the iteration.
+        let Err(err) = open(source, &fs)?
+            .scan()
+            .and_then(Iterator::collect::<crate::Result<Vec<_>>>)
+        else {
+            panic!("{name}: a zone block of another group must be refused");
+        };
+        assert!(
+            matches!(err, crate::Error::InvalidHeader(_)),
+            "{name}: expected a framing refusal, got {err:?}",
+        );
+    }
     Ok(())
 }
 
@@ -5060,7 +5105,9 @@ fn a_value_page_moved_between_row_groups_of_an_encrypted_table_is_refused() -> c
             };
             pages.push((
                 directory.row_count(),
-                at + header.on_disk_size_with(None) as usize + value_page.offset as usize,
+                at + header.on_disk_size_with(None) as usize
+                    + directory.pages_start() as usize
+                    + value_page.offset as usize,
                 value_page.length as usize,
             ));
         }
@@ -5175,7 +5222,10 @@ fn first_value_page(table: &Table, bytes: &[u8]) -> crate::Result<core::ops::Ran
     else {
         panic!("row group holds a value page");
     };
-    let start = at + header.on_disk_size_with(None) as usize + page.offset as usize;
+    let start = at
+        + header.on_disk_size_with(None) as usize
+        + directory.pages_start() as usize
+        + page.offset as usize;
     Ok(start..start + page.length as usize)
 }
 
@@ -5287,7 +5337,8 @@ fn a_block_of_another_role_in_a_page_slot_is_refused() -> crate::Result<()> {
     else {
         panic!("the group has a value page");
     };
-    let at = group_at + directory_len as usize + page.offset as usize;
+    let at =
+        group_at + directory_len as usize + directory.pages_start() as usize + page.offset as usize;
     let header = {
         let Some(frame) = bytes.get(at..) else {
             panic!("page within the file");

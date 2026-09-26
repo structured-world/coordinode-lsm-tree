@@ -82,18 +82,25 @@ fn make_corrupted_index_block_with_invalid_binary_index_offset() -> IndexBlock {
     })
 }
 
-/// Every entry names a row group by its tag; the block mixes restart heads
-/// (full entries) with truncated ones.
+/// Every entry names a row group by its tag, directory length and head zone
+/// block length; the block mixes restart heads (full entries) with truncated
+/// ones.
 fn make_tagged_index_block(restart_interval: u8) -> (Vec<KeyedBlockHandle>, IndexBlock) {
     let handles: Vec<_> = make_handles(16)
         .into_iter()
-        .zip(1_u64..)
-        .map(|(h, tag)| {
+        .zip(1_u32..)
+        .map(|(h, n)| {
+            let row_group = crate::table::index_block::RowGroupRef {
+                tag: core::num::NonZeroU64::new(u64::from(n) << 40).unwrap(),
+                // Two varint bytes each, as wide as a group size of up to
+                // 16 KiB.
+                directory_len: core::num::NonZeroU32::new(1_000 + n).unwrap(),
+                head_zones_len: 200 + n,
+            };
             KeyedBlockHandle::new(
                 h.end_key().clone(),
                 h.seqno(),
-                h.into_inner()
-                    .with_group_tag(core::num::NonZeroU64::new(tag << 40)),
+                h.into_inner().with_row_group(Some(row_group)),
             )
         })
         .collect();
@@ -106,11 +113,11 @@ fn make_tagged_index_block(restart_interval: u8) -> (Vec<KeyedBlockHandle>, Inde
     (handles, index)
 }
 
-/// An entry naming a row group reads back with its tag, through a full walk
-/// and through a seek that probes the restart heads; an entry naming none
-/// reads back with none.
+/// An entry naming a row group reads back with its tag and directory length,
+/// through a full walk and through a seek that probes the restart heads; an
+/// entry naming none reads back with none.
 #[test]
-fn a_tagged_entry_reads_back_its_group_tag() {
+fn a_tagged_entry_reads_back_its_row_group() {
     for restart_interval in [1, 4] {
         let (handles, index) = make_tagged_index_block(restart_interval);
         let read: Vec<_> = index
@@ -122,7 +129,7 @@ fn a_tagged_entry_reads_back_its_group_tag() {
             assert_eq!(read.end_key(), written.end_key());
             assert_eq!(read.offset(), written.offset());
             assert_eq!(read.size(), written.size());
-            assert_eq!(read.as_ref().group_tag(), written.as_ref().group_tag());
+            assert_eq!(read.as_ref().row_group(), written.as_ref().row_group());
         }
 
         let mut iter = index.iter(default_comparator());
@@ -132,8 +139,12 @@ fn a_tagged_entry_reads_back_its_group_tag() {
         };
         assert_eq!(found.end_key().as_ref(), b"adj:out:vertex-0001:edge-0011");
         assert_eq!(
-            found.as_ref().group_tag(),
-            core::num::NonZeroU64::new(12 << 40)
+            found.as_ref().row_group(),
+            Some(crate::table::index_block::RowGroupRef {
+                tag: core::num::NonZeroU64::new(12 << 40).unwrap(),
+                directory_len: core::num::NonZeroU32::new(1_012).unwrap(),
+                head_zones_len: 212,
+            })
         );
     }
 
@@ -142,35 +153,51 @@ fn a_tagged_entry_reads_back_its_group_tag() {
         plain.iter(default_comparator()).all(|item| item
             .materialize(plain.as_slice())
             .as_ref()
-            .group_tag()
+            .row_group()
             .is_none()),
-        "an entry naming no row group carries no tag",
+        "an entry naming no row group carries none",
     );
+}
+
+/// The first entry of a tagged block, its varint field `field` (0 the tag, 1
+/// the directory length, 2 the head zone block length) replaced by `value` at
+/// the same width, so every later byte stays where it was; `None` when `value`
+/// does not fit that width.
+fn with_first_row_group_field(field: usize, value: u64) -> Option<IndexBlock> {
+    let (_, index) = make_tagged_index_block(1);
+    let mut bytes = index.as_slice().to_vec();
+    // The first entry: marker, offset (0, one byte), size (4096, two bytes),
+    // seqno (0, one byte), then the tag and the directory length.
+    assert_eq!(bytes.first(), Some(&4), "a tagged full entry");
+    let mut at = 1 + 1 + 2 + 1;
+    let varint_len = |bytes: &[u8]| {
+        let mut cursor = Cursor::new(bytes);
+        let _ = cursor.read_u64_varint().unwrap();
+        usize::try_from(cursor.position()).unwrap()
+    };
+    for _ in 0..field {
+        at += varint_len(&bytes[at..]);
+    }
+    let width = varint_len(&bytes[at..]);
+    let mut rest = value;
+    for (i, byte) in bytes[at..at + width].iter_mut().enumerate() {
+        let low = u8::try_from(rest & 0x7f).unwrap();
+        rest >>= 7;
+        *byte = if i + 1 < width { low | 0x80 } else { low };
+    }
+    (rest == 0).then(|| {
+        IndexBlock::new(Block {
+            data: bytes.into(),
+            header: Header::test_dummy(BlockType::Index),
+        })
+    })
 }
 
 /// A tagged entry whose tag is zero, which no writer emits, ends the walk
 /// rather than reading back as an entry naming no group.
 #[test]
 fn a_tagged_entry_with_a_zero_tag_is_refused() {
-    let (_, index) = make_tagged_index_block(1);
-    let mut bytes = index.as_slice().to_vec();
-    // The first entry: marker, offset (0, one byte), size (4096, two bytes),
-    // seqno (0, one byte), then the tag.
-    assert_eq!(bytes.first(), Some(&4), "a tagged full entry");
-    let tag_at = 1 + 1 + 2 + 1;
-    let mut cursor = Cursor::new(&bytes[tag_at..]);
-    let tag_len = {
-        let _ = cursor.read_u64_varint().unwrap();
-        usize::try_from(cursor.position()).unwrap()
-    };
-    // A zero of the same width keeps every later byte where it was.
-    for (i, byte) in bytes[tag_at..tag_at + tag_len].iter_mut().enumerate() {
-        *byte = if i + 1 < tag_len { 0x80 } else { 0 };
-    }
-    let corrupt = IndexBlock::new(Block {
-        data: bytes.into(),
-        header: Header::test_dummy(BlockType::Index),
-    });
+    let corrupt = with_first_row_group_field(0, 0).unwrap();
     let first = corrupt
         .iter(default_comparator())
         .next()
@@ -179,6 +206,50 @@ fn a_tagged_entry_with_a_zero_tag_is_refused() {
         first.is_none(),
         "a zero tag must not read back as an entry, got {first:?}"
     );
+}
+
+/// A tagged entry recording an empty directory, or a directory and head zone
+/// block longer together than the group it names, which no writer emits, ends
+/// the walk and fails a seek's probe of it as a restart head: a reader would
+/// read that many bytes as the group's directory and head zone block.
+#[test]
+fn a_tagged_entry_with_an_impossible_directory_length_is_refused() {
+    let (handles, _) = make_tagged_index_block(1);
+    let size = u64::from(handles[0].size());
+    let Some(named) = handles[0].as_ref().row_group() else {
+        panic!("the fixture's entries name row groups");
+    };
+    let directory_len = u64::from(named.directory_len.get());
+    let head_len = u64::from(named.head_zones_len);
+    let cases = [
+        ("an empty directory", 1, 0),
+        ("a directory past the group", 1, size + 1),
+        (
+            "a directory running the head past the group",
+            1,
+            size - head_len + 1,
+        ),
+        (
+            "a head zone block past the group",
+            2,
+            size - directory_len + 1,
+        ),
+    ];
+    for (what, field, value) in cases {
+        let corrupt = with_first_row_group_field(field, value).unwrap();
+        let first = corrupt
+            .iter(default_comparator())
+            .next()
+            .map(|item| item.materialize(corrupt.as_slice()));
+        assert!(first.is_none(), "{what} must not read back, got {first:?}");
+        let mut iter = corrupt.iter(default_comparator());
+        let landed = iter.seek(handles[0].end_key(), SeqNo::MAX)
+            && iter
+                .next()
+                .map(|item| item.materialize(corrupt.as_slice()))
+                .is_some_and(|found| found.end_key() == handles[0].end_key());
+        assert!(!landed, "a seek must not land on an entry recording {what}");
+    }
 }
 
 #[test]

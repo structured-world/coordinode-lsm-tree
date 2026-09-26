@@ -984,7 +984,7 @@ impl Table {
         }
         .load(want)?;
         let mut copied = 0usize;
-        let pages = group.to_row_pages(want, &mut copied);
+        let pages = group.to_row_pages(&mut copied);
         #[cfg(feature = "metrics")]
         if charge.is_counted() {
             self.metrics.record_gather(copied);
@@ -1234,8 +1234,15 @@ impl Table {
             // A group found by its frame has no index entry to name it; the
             // tag its own directory carries is the only one there is, and the
             // pages' stamps are still checked against it when they decode.
-            Ok(BlockHandle::new(BlockOffset(offset), size)
-                .with_group_tag(core::num::NonZeroU64::new(directory.group_tag())))
+            // A zero tag names no group, and every read then refuses it.
+            let row_group = core::num::NonZeroU64::new(directory.group_tag()).and_then(|tag| {
+                Some(crate::table::index_block::RowGroupRef {
+                    tag,
+                    directory_len: core::num::NonZeroU32::new(first.size())?,
+                    head_zones_len: directory.pages_start(),
+                })
+            });
+            Ok(BlockHandle::new(BlockOffset(offset), size).with_row_group(row_group))
         }
         #[cfg(not(feature = "columnar"))]
         {
@@ -1752,7 +1759,13 @@ impl Table {
             .verbatim
             .map(|(raw, header, _)| (raw, u64::from(header.uncompressed_length)));
         let mut pages = alloc::vec::Vec::with_capacity(decoded.entries().len());
-        let mut zone_blocks = decoded.zone_blocks().iter();
+        // The zone blocks in the order they lie: the head one, then the rest.
+        let listed: alloc::vec::Vec<crate::table::column_page::ZoneBlock> = decoded
+            .head_zone_block()
+            .into_iter()
+            .chain(decoded.zone_blocks().iter().copied())
+            .collect();
+        let mut zone_blocks = listed.iter();
         for (handle, role) in blocks {
             let block = self.salvage_load_block(&handle, role)?;
             ecc_recovered |= block.ecc_recovered;
@@ -1778,15 +1791,14 @@ impl Table {
                         ))?;
                 decoded.decode_zone_block(column_id, &block.block.data)?;
             } else {
-                pages.push(Some(block.block));
+                pages.push(block.block);
             }
         }
         Ok(SalvageRowGroup {
-            group: crate::table::row_group::RowGroupBlocks {
-                directory: alloc::sync::Arc::new(decoded),
+            group: crate::table::row_group::RowGroupBlocks::whole(
+                alloc::sync::Arc::new(decoded),
                 pages,
-                zones: None,
-            },
+            ),
             verbatim,
             ecc_recovered,
         })
@@ -2143,18 +2155,10 @@ impl Table {
         &self,
         group: &BlockHandle,
     ) -> crate::Result<alloc::vec::Vec<(BlockHandle, BlockType)>> {
-        use crate::coding::Decode;
-
         let (fd, _) = self
             .file_accessor
             .get_or_open_table(&self.global_id(), &self.path)?;
-        let prefix = crate::file::read_exact(
-            fd.as_ref(),
-            *group.offset(),
-            crate::table::block::Header::MIN_LEN.min(group.size() as usize),
-        )?;
-        let directory_len = crate::table::block::Header::decode_from(&mut &prefix[..])?
-            .on_disk_size_with(self.metadata.ecc_params);
+        let directory_len = crate::table::row_group::indexed_directory_len(group)?;
         let directory_handle = BlockHandle::new(group.offset(), directory_len);
         let directory_block = Block::from_file(
             fd.as_ref(),
@@ -2179,25 +2183,43 @@ impl Table {
                 directory_block.header.block_type.into(),
             )));
         }
+        crate::table::row_group::check_directory_len(
+            directory_len,
+            directory_block
+                .header
+                .on_disk_size_with(self.metadata.ecc_params),
+        )?;
         let directory = crate::table::column_page::PageDirectory::decode(&directory_block.data)?;
         crate::table::row_group::check_group_extent(group, directory_len, &directory)?;
+        crate::table::row_group::check_head_zones_len(group, &directory)?;
         // Verification, salvage and scrub take the group's blocks from here, so
         // another group's, in this one's place, is refused before it can be
         // certified or copied as this group's.
         crate::table::row_group::check_group_tag(group.group_tag(), &directory)?;
 
+        // The blocks in the order they lie: the directory, the head zone
+        // block, the pages, the other zone blocks.
         let mut blocks = alloc::vec::Vec::with_capacity(directory.entries().len() + 2);
         blocks.push((directory_handle, BlockType::ColumnPageDirectory));
+        let after_directory = *group.offset() + u64::from(directory_len);
+        if let Some(head) = directory.head_zone_block() {
+            blocks.push((
+                BlockHandle::new(
+                    crate::table::block::BlockOffset(after_directory),
+                    head.length,
+                ),
+                BlockType::ColumnZones,
+            ));
+        }
+        let pages_at = after_directory + u64::from(directory.pages_start());
         for page in directory.entries() {
-            let offset = *group.offset() + u64::from(directory_len) + u64::from(page.offset);
+            let offset = pages_at + u64::from(page.offset);
             blocks.push((
                 BlockHandle::new(crate::table::block::BlockOffset(offset), page.length),
                 BlockType::ColumnPage,
             ));
         }
-        // The zone blocks, in the order the directory lists them.
-        let mut offset =
-            *group.offset() + u64::from(directory_len) + u64::from(directory.pages_len());
+        let mut offset = pages_at + u64::from(directory.pages_len());
         for zone_block in directory.zone_blocks() {
             blocks.push((
                 BlockHandle::new(crate::table::block::BlockOffset(offset), zone_block.length),
@@ -6296,8 +6318,14 @@ impl Table {
         let (directory, frame) = self.load_block_from_disk(&directory_handle, directory_role)?;
         let directory_decoded = crate::table::column_page::PageDirectory::decode(&directory.data)?;
         let mut pages = alloc::vec::Vec::with_capacity(directory_decoded.entries().len());
-        let mut block_zones = alloc::vec::Vec::with_capacity(directory_decoded.zone_blocks().len());
-        let mut listed = directory_decoded.zone_blocks().iter();
+        // The zone blocks in the order they lie: the head one, then the rest.
+        let zone_blocks: alloc::vec::Vec<crate::table::column_page::ZoneBlock> = directory_decoded
+            .head_zone_block()
+            .into_iter()
+            .chain(directory_decoded.zone_blocks().iter().copied())
+            .collect();
+        let mut block_zones = alloc::vec::Vec::with_capacity(zone_blocks.len());
+        let mut listed = zone_blocks.iter();
         for (handle, role) in blocks {
             let block = self.load_block_from_disk(&handle, role)?.0;
             if role == BlockType::ColumnZones {
@@ -6310,33 +6338,38 @@ impl Table {
                         ))?;
                 block_zones.push(directory_decoded.decode_zone_block(column_id, &block.data)?);
             } else {
-                pages.push(Some(block));
+                pages.push(block);
             }
         }
-        let group = crate::table::row_group::RowGroupBlocks {
-            directory: alloc::sync::Arc::new(directory_decoded),
+        let group = crate::table::row_group::RowGroupBlocks::whole(
+            alloc::sync::Arc::new(directory_decoded),
             pages,
-            zones: None,
-        };
+        );
         // The gates are verification, which the counters leave out; they
         // re-derive per-group statistics, so the row pages are joined.
-        let batch = group
-            .to_row_pages(&crate::table::row_group::PageWant::ALL, &mut 0)?
-            .into_batch()?;
+        let batch = group.to_row_pages(&mut 0)?.into_batch()?;
         // The row pages' zones decide which pages a read skips, so they are
         // authenticated like the zone map: re-derived from the decoded rows,
-        // the directory's and every zone block's, in the order the writer
-        // lays them out; a zone block that should not exist is as wrong as
-        // one that is missing. A zone that disagrees would let a read prune a
-        // row page holding a match, and nothing on the read path looks at the
-        // rows it pruned.
+        // every zone block's, in the order the writer lays them out, the key
+        // column's as the head block before the pages; a zone block that
+        // should not exist, or lies elsewhere, is as wrong as one that is
+        // missing. A zone that disagrees would let a read prune a row page
+        // holding a match, and nothing on the read path looks at the rows it
+        // pruned.
         let (key_zones, other_zones) = batch.group_zones(group.directory.row_pages())?;
-        let expected: alloc::vec::Vec<_> = other_zones
-            .columns()
-            .iter()
-            .map(|&column_id| other_zones.only(|c| c == column_id))
+        let key_column = key_zones.columns().first().copied();
+        let expected: alloc::vec::Vec<_> = key_column
+            .map(|_| key_zones)
+            .into_iter()
+            .chain(
+                other_zones
+                    .columns()
+                    .iter()
+                    .map(|&column_id| other_zones.only(|c| c == column_id)),
+            )
             .collect();
-        if key_zones != *group.directory.zones() || expected != block_zones {
+        let head_column = group.directory.head_zone_block().map(|z| z.column_id);
+        if expected != block_zones || head_column != key_column {
             return Err(crate::Error::InvalidHeader(
                 "columnar: row page statistics disagree with the group's rows",
             ));
@@ -7556,10 +7589,10 @@ impl Table {
         // dropped by the scanner's key filter.
         let mut start_offset = 0u64;
         // A columnar scan streams the data without the index, so the index
-        // hands it the tag of every group it will read: a group consistent in
-        // itself but in another group's place is refused against it, as an
-        // indexed read refuses it.
-        let mut group_tags = Vec::new();
+        // hands it the entry of every group it will read: a group whose tag or
+        // lengths disagree with its entry is refused against it, as an indexed
+        // read refuses it.
+        let mut groups = Vec::new();
         if self.1.is_some() || self.metadata.columnar {
             let mut started = self.1.is_none();
             for keyed in self.maintenance_index_walk() {
@@ -7581,10 +7614,20 @@ impl Table {
                         break;
                     }
                 }
-                group_tags.push(keyed.as_ref().group_tag());
+                groups.push(*keyed.as_ref());
             }
         }
+        self.scan_groups(block_count, start_offset, groups)
+    }
 
+    /// A scanner of `block_count` blocks from `start_offset`, checking each
+    /// columnar group it streams against its index entry in `groups`.
+    fn scan_groups(
+        &self,
+        block_count: usize,
+        start_offset: u64,
+        groups: Vec<BlockHandle>,
+    ) -> crate::Result<Scanner> {
         Scanner::new(
             &self.fs,
             &self.path,
@@ -7602,7 +7645,7 @@ impl Table {
             self.metadata.data_block_restart_interval,
             start_offset,
             self.1.clone(),
-            group_tags,
+            groups,
         )
     }
 
