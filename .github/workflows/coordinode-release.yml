@@ -85,23 +85,37 @@ jobs:
       # switch (`git_release_latest`, off here), so the mark is placed here
       # instead. Re-checked on every run, so it also catches up on releases
       # an earlier run published.
+      #
+      # Main's release workflow can publish a newer major while this step
+      # runs, and marks it latest as it creates it. After moving the mark,
+      # the step reads the releases again and repeats until the mark sits on
+      # the highest one, so a version it picked before that release appeared
+      # does not keep the mark: whichever happens last, the mark ends on the
+      # highest version.
       - name: Mark the highest release as latest
         env:
           GH_TOKEN: ${{ steps.app-token.outputs.token }}
           REPO: ${{ github.repository }}
         run: |
           set -euo pipefail
-          highest=$(gh release list --repo "$REPO" --exclude-drafts --exclude-pre-releases \
-              --limit 1000 --json tagName --jq '.[].tagName' \
-            | grep -E '^v[0-9]+\.[0-9]+\.[0-9]+$' | sort -V | tail -n 1)
-          if [ -z "$highest" ]; then
-            echo "no published release"
-            exit 0
-          fi
-          current=$(gh release view --repo "$REPO" --json tagName --jq '.tagName' || true)
-          if [ "$current" = "$highest" ]; then
-            echo "$highest is already the latest release"
-            exit 0
-          fi
-          echo "latest release: ${current:-none} -> $highest"
-          gh release edit "$highest" --repo "$REPO" --latest
+          for attempt in 1 2 3; do
+            # Filtered in jq, so no matching release is an empty result, not a
+            # failed command.
+            tags=$(gh release list --repo "$REPO" --exclude-drafts --exclude-pre-releases \
+              --limit 1000 --json tagName \
+              --jq '.[].tagName | select(test("^v[0-9]+\\.[0-9]+\\.[0-9]+$"))')
+            highest=$(printf '%s\n' "$tags" | sort -V | tail -n 1)
+            if [ -z "$highest" ]; then
+              echo "no published release"
+              exit 0
+            fi
+            current=$(gh release view --repo "$REPO" --json tagName --jq '.tagName' || true)
+            if [ "$current" = "$highest" ]; then
+              echo "$highest is the latest release"
+              exit 0
+            fi
+            echo "attempt $attempt: latest release ${current:-none} -> $highest"
+            gh release edit "$highest" --repo "$REPO" --latest
+          done
+          echo "::error::the latest release mark did not settle on the highest version"
+          exit 1
