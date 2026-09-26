@@ -1,5 +1,5 @@
 window.BENCHMARK_DATA = {
-  "lastUpdate": 1790436656396,
+  "lastUpdate": 1790445522024,
   "repoUrl": "https://github.com/structured-world/coordinode-lsm-tree",
   "entries": {
     "lsm-tree db_bench costs": [
@@ -25284,6 +25284,90 @@ window.BENCHMARK_DATA = {
             "value": 348855.8353644098,
             "unit": "ops/sec",
             "extra": "P50: 2.1us | P99: 11.7us | P99.9: 79.5us\nthreads: 1 | elapsed: 0.57s | num: 200000 | iterations: 3"
+          }
+        ]
+      },
+      {
+        "commit": {
+          "author": {
+            "email": "mail@polaz.com",
+            "name": "Dmitry Prudnikov",
+            "username": "polaz"
+          },
+          "committer": {
+            "email": "noreply@github.com",
+            "name": "GitHub",
+            "username": "web-flow"
+          },
+          "distinct": true,
+          "id": "ba13fd7e64793390c76fa49b8e1af0f9186837fa",
+          "message": "feat(columnar): default to 16 KiB row groups of 4 KiB row pages (#720)\n\n## Summary\n\nColumnar tables now default to 16 KiB row groups of 4 KiB row pages\n(four row pages a group) instead of 4 KiB groups of one row page. The\nchoice comes from a measured grid, and the point-read path it exposed is\nfixed on the way.\n\n- `DEFAULT_COLUMNAR_ROW_GROUP_SIZE` is 16 KiB;\n`DEFAULT_COLUMNAR_PAGE_SIZE` stays 4 KiB. Tables already written keep\ntheir geometry and read as before.\n- A point read finds its row pages through the key column and then reads\nthe rest of the row's columns. The second step now goes on from the\nfirst (`GroupRead::load_after`), taking its directory and the pages it\nalready holds, instead of looking the directory up, checking it and,\nwith nothing cached, reading and decoding it again and re-reading the\nkey page.\n- The directory and zone decoders take every field in a branch that\nbuilds the refusal only when it refuses.\n- `docs/columnar-page-format.md` (\"Row group size\") carries the grid,\nthe reason for the choice, the two costs the larger group keeps and how\nother engines and formats size the same units; the page size policy's\ndocs are updated.\n\n## Measurements\n\n`db_bench --benchmark mixed-layout --num 70000`, same host and build,\nbytes read per emitted row:\n\n| Row group / row page | near-full | sparse | point | near-full, no\ncache |\n|---|---|---|---|---|\n| 4 KiB / 4 KiB | 341.4 | 4302 | 216.5 | 344.4 |\n| **16 KiB / 4 KiB** | **340.6** | **4255** | **215.8** | **341.4** |\n| 32-128 KiB / 4 KiB | 337.7-339.2 | 4359-4398 | 214.8-215.2 |\n337.8-339.6 |\n| 32-128 KiB / 8 KiB | 329.9-330.9 | 7972-8037 | 210.0-210.4 |\n330.0-331.2 |\n\n16 KiB / 4 KiB is the only layout that reads fewer bytes than 4 KiB / 4\nKiB on all four. In time (two interleaved runs, five iterations each),\nthe near-full scan takes 31.5-32.0 ms against 40.2-42.1 ms, and\n24.0-24.6 ms against 33.0-33.9 ms with no cache; point reads are the\nsame within the noise.\n\nPoint reads with no cache, bytes per row, before and after reading the\ndirectory once: 6388 -> 5820 at 4 KiB / 4 KiB, 6548 -> 5947 at 16 KiB /\n4 KiB.\n\nTwo costs of the larger group remain, both of its geometry and\ndocumented: a sparse scan's first touch of a group reads the predicate\ncolumn's zone block before its pages (6.6-7.4 ms against 5.5-5.7 ms over\nuncached blocks), and a point read with nothing cached decodes a larger\ndirectory (2.2% more bytes, 665-672 ms against 500 ms).\n\n## Testing\n\n- regression test: a point read with nothing cached fails if the\ndirectory's offset is read twice\n- the test of one row page per group names its 4 KiB geometry instead of\ntaking it from the defaults\n- tests, doc tests, `cargo doc -D warnings`, clippy in every CI\nconfiguration (library and db_bench) and the no-std check pass on macOS\n\nCloses #708\n\n\n<!-- This is an auto-generated comment: release notes by coderabbit.ai\n-->\n\n## Summary by CodeRabbit\n\n* **Performance**\n* The default columnar row-group size is now 16 KiB, with 4 KiB pages.\nBenchmarks show this layout reads fewer bytes than the previous default\nfor near-full scans, sparse scans, point reads, and uncached near-full\nscans.\n* Point reads can reuse data already loaded during the lookup, avoiding\na repeated read in the tested scenario.\n* **Documentation**\n* Updated columnar storage guidance and benchmark results, including\ntrade-offs for uncached sparse scans and point reads.\n* **Bug Fixes**\n* Added coverage confirming point reads return the expected value when a\ndirectory read fails on a repeat attempt.\n\n<!-- end of auto-generated comment: release notes by coderabbit.ai -->",
+          "timestamp": "2026-09-26T20:51:17+03:00",
+          "tree_id": "f8baa9901ba2017656997706415c628699547624",
+          "url": "https://github.com/structured-world/coordinode-lsm-tree/commit/ba13fd7e64793390c76fa49b8e1af0f9186837fa"
+        },
+        "date": 1790445465529,
+        "tool": "customBiggerIsBetter",
+        "benches": [
+          {
+            "name": "mixed",
+            "value": 32890.006305858034,
+            "unit": "ops/sec",
+            "extra": "P50: 0.5us | P99: 9.4us | P99.9: 17.0us\nthreads: 1 | elapsed: 16.27s | num: 200000 | iterations: 3"
+          },
+          {
+            "name": "fillseq",
+            "value": 2497108.3797101504,
+            "unit": "ops/sec",
+            "extra": "P50: 0.2us | P99: 4.1us | P99.9: 5.1us\nthreads: 1 | elapsed: 0.08s | num: 200000 | iterations: 3"
+          },
+          {
+            "name": "fillrandom",
+            "value": 767839.3881481049,
+            "unit": "ops/sec",
+            "extra": "P50: 1.1us | P99: 6.1us | P99.9: 11.4us\nthreads: 1 | elapsed: 0.26s | num: 200000 | iterations: 3"
+          },
+          {
+            "name": "readrandom",
+            "value": 502161.34511308104,
+            "unit": "ops/sec",
+            "extra": "P50: 1.9us | P99: 6.6us | P99.9: 20.6us\nthreads: 1 | elapsed: 0.40s | num: 200000 | iterations: 3"
+          },
+          {
+            "name": "readseq",
+            "value": 2373312.856390008,
+            "unit": "ops/sec",
+            "extra": "P50: 0.2us | P99: 4.6us | P99.9: 6.1us\nthreads: 1 | elapsed: 0.08s | num: 200000 | iterations: 3"
+          },
+          {
+            "name": "seekrandom",
+            "value": 254657.0941319639,
+            "unit": "ops/sec",
+            "extra": "P50: 3.4us | P99: 8.3us | P99.9: 21.0us\nthreads: 1 | elapsed: 0.79s | num: 200000 | iterations: 3"
+          },
+          {
+            "name": "prefixscan",
+            "value": 149299.61757798755,
+            "unit": "ops/sec",
+            "extra": "P50: 6.1us | P99: 11.3us | P99.9: 24.5us\nthreads: 1 | elapsed: 1.34s | num: 200000 | iterations: 3"
+          },
+          {
+            "name": "overwrite",
+            "value": 757578.830935333,
+            "unit": "ops/sec",
+            "extra": "P50: 1.1us | P99: 6.1us | P99.9: 12.5us\nthreads: 1 | elapsed: 0.26s | num: 200000 | iterations: 3"
+          },
+          {
+            "name": "mergerandom",
+            "value": 717871.2530140139,
+            "unit": "ops/sec",
+            "extra": "P50: 0.5us | P99: 4.3us | P99.9: 10.5us\nthreads: 1 | elapsed: 0.28s | num: 200000 | iterations: 3"
+          },
+          {
+            "name": "readwhilewriting",
+            "value": 343643.7618866807,
+            "unit": "ops/sec",
+            "extra": "P50: 2.0us | P99: 16.7us | P99.9: 89.9us\nthreads: 1 | elapsed: 0.58s | num: 200000 | iterations: 3"
           }
         ]
       }
