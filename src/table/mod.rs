@@ -965,7 +965,19 @@ impl Table {
         want: &crate::table::row_group::PageWant<'_>,
         charge: ReadCharge,
     ) -> crate::Result<crate::table::row_group::RowPages> {
-        let group = crate::table::row_group::GroupRead {
+        let blocks = self.group_read(handle, charge).load(want)?;
+        self.row_pages(&blocks, charge)
+    }
+
+    /// The context a read of the row group `handle` names needs, charged as
+    /// `charge` says.
+    #[cfg(feature = "columnar")]
+    fn group_read<'a>(
+        &'a self,
+        handle: &'a BlockHandle,
+        charge: ReadCharge,
+    ) -> crate::table::row_group::GroupRead<'a> {
+        crate::table::row_group::GroupRead {
             table_id: self.global_id(),
             path: &self.path,
             file_accessor: &self.file_accessor,
@@ -982,15 +994,28 @@ impl Table {
             charge,
             budget: self.read_budget(),
         }
-        .load(want)?;
+    }
+
+    /// `blocks` decoded into row pages, what decoding copied charged as
+    /// `charge` says.
+    #[cfg(feature = "columnar")]
+    #[cfg_attr(
+        not(feature = "metrics"),
+        expect(clippy::unused_self, reason = "the gather counter is behind `metrics`")
+    )]
+    fn row_pages(
+        &self,
+        blocks: &crate::table::row_group::RowGroupBlocks,
+        charge: ReadCharge,
+    ) -> crate::Result<crate::table::row_group::RowPages> {
         let mut copied = 0usize;
-        let pages = group.to_row_pages(&mut copied);
+        let pages = blocks.to_row_pages(&mut copied);
         #[cfg(feature = "metrics")]
         if charge.is_counted() {
             self.metrics.record_gather(copied);
         }
         #[cfg(not(feature = "metrics"))]
-        let _ = copied;
+        let _ = (copied, charge);
         pages
     }
 
@@ -1933,18 +1958,16 @@ impl Table {
         // A key equal to the needle is the needle's bytes (the comparator
         // contract makes equality byte equality), so it lies within the
         // byte-wise zone of the row page holding it, whatever the key order.
-        let keys = self.load_row_group(
-            handle,
-            &PageWant::projected(
-                &[COL_USER_KEY],
-                RowPageSelect::Zone {
-                    column_id: COL_USER_KEY,
-                    lower: Some(needle),
-                    upper: Some(needle),
-                },
-            ),
-            ReadCharge::Foreground,
-        )?;
+        let group = self.group_read(handle, ReadCharge::Foreground);
+        let key_blocks = group.load(&PageWant::projected(
+            &[COL_USER_KEY],
+            RowPageSelect::Zone {
+                column_id: COL_USER_KEY,
+                lower: Some(needle),
+                upper: Some(needle),
+            },
+        ))?;
+        let keys = self.row_pages(&key_blocks, ReadCharge::Foreground)?;
         // The key's versions are one run of rows, sorted with the rest of the
         // group, so they sit on consecutive row pages: the first page whose
         // keys reach it through the page where the run ends. Every page of
@@ -1985,15 +2008,17 @@ impl Table {
             return Ok(None);
         };
 
-        let pages = self.load_row_group(
-            handle,
+        // The rest of the row's columns on those row pages, through the
+        // directory and key pages the first step already has.
+        let blocks = group.load_after(
+            &key_blocks,
             &PageWant {
                 columns: None,
                 row_pages: RowPageSelect::Range(row_pages),
                 whole: false,
             },
-            ReadCharge::Foreground,
         )?;
+        let pages = self.row_pages(&blocks, ReadCharge::Foreground)?;
         let first_row = pages.starts.first().copied().unwrap_or(0);
         let deletes = match self
             .delete_block_starts

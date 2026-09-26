@@ -375,28 +375,45 @@ impl PageZones {
 
     /// Reads zones for `row_page_count` row pages off the front of `rest`.
     fn decode_from(rest: &mut &[u8], row_page_count: usize) -> Result<Self> {
+        // Each field is taken in a branch that builds the refusal only when it
+        // refuses, as the directory's decoder does: a zone block is decoded on
+        // every read that selects by its column.
         const ERR: Error = Error::InvalidHeader("ColumnZones");
 
-        let column_count = take_var_u16(rest).ok_or(ERR)?;
-        let column_count = usize::from(column_count);
+        let Some(column_count) = take_var_u16(rest).map(usize::from) else {
+            return Err(ERR);
+        };
         let mut columns = Vec::with_capacity(column_count.min(rest.len() / 2));
         for _ in 0..column_count {
-            columns.push(u16::from_le_bytes(take(rest).ok_or(ERR)?));
+            let Some(column_id) = take(rest).map(u16::from_le_bytes) else {
+                return Err(ERR);
+            };
+            columns.push(column_id);
         }
-        let count = row_page_count.checked_mul(column_count).ok_or(ERR)?;
+        let Some(count) = row_page_count.checked_mul(column_count) else {
+            return Err(ERR);
+        };
         let mut zones = Self::new(columns);
         zones.slots.reserve(count.min(rest.len() / ZONE_MIN_LEN));
         let mut min_buf = [0u8; ZONE_BOUND_LEN];
         let mut max_buf = [0u8; ZONE_BOUND_LEN];
         for index in 0..count {
-            let null_count = take_var_u32(rest).ok_or(ERR)?;
-            let [flags] = take::<1>(rest).ok_or(ERR)?;
-            let min_len = take_bound(rest, zones.min_reference(index), &mut min_buf).ok_or(ERR)?;
-            let min = min_buf.get(..min_len).ok_or(ERR)?;
+            let (Some(null_count), Some([flags])) = (take_var_u32(rest), take::<1>(rest)) else {
+                return Err(ERR);
+            };
+            let Some(min) = take_bound(rest, zones.min_reference(index), &mut min_buf)
+                .and_then(|len| min_buf.get(..len))
+            else {
+                return Err(ERR);
+            };
             let max = match flags {
                 0 => {
-                    let max_len = take_bound(rest, min, &mut max_buf).ok_or(ERR)?;
-                    Some(max_buf.get(..max_len).ok_or(ERR)?)
+                    let Some(max) =
+                        take_bound(rest, min, &mut max_buf).and_then(|len| max_buf.get(..len))
+                    else {
+                        return Err(ERR);
+                    };
+                    Some(max)
                 }
                 ZONE_MAX_UNBOUNDED => None,
                 _ => return Err(Error::InvalidHeader("ColumnZones: reserved zone flag set")),
@@ -1078,27 +1095,48 @@ impl PageDirectory {
     pub fn decode(bytes: &[u8]) -> Result<Self> {
         const ERR: Error = Error::InvalidHeader("ColumnPageDirectory");
 
+        // Every field is taken in a branch that builds the refusal only when
+        // it refuses: a directory is decoded on every read that finds none
+        // cached, and an eagerly built error would be built and dropped per
+        // field on the way to success.
         let mut rest = bytes;
-        let [version] = take::<1>(&mut rest).ok_or(ERR)?;
+        let Some([version]) = take::<1>(&mut rest) else {
+            return Err(ERR);
+        };
         if version != VERSION {
             return Err(Error::InvalidHeader(
                 "ColumnPageDirectory: unknown directory version",
             ));
         }
-        let group_tag = u64::from_le_bytes(take(&mut rest).ok_or(ERR)?);
-        let row_page_count = usize::from(take_var_u16(&mut rest).ok_or(ERR)?);
-        let part_count = usize::from(take_var_u16(&mut rest).ok_or(ERR)?);
-        let zone_block_count = usize::from(take_var_u16(&mut rest).ok_or(ERR)?);
-        let head_len = take_var_u32(&mut rest).ok_or(ERR)?;
+        let (Some(group_tag), Some(row_page_count), Some(part_count), Some(zone_block_count)) = (
+            take(&mut rest).map(u64::from_le_bytes),
+            take_var_u16(&mut rest),
+            take_var_u16(&mut rest),
+            take_var_u16(&mut rest),
+        ) else {
+            return Err(ERR);
+        };
+        let (row_page_count, part_count, zone_block_count) = (
+            usize::from(row_page_count),
+            usize::from(part_count),
+            usize::from(zone_block_count),
+        );
+        let Some(head_len) = take_var_u32(&mut rest) else {
+            return Err(ERR);
+        };
         let head_zone_block = if head_len == 0 {
             None
         } else {
+            let Some(column_id) = take(&mut rest).map(u16::from_le_bytes) else {
+                return Err(ERR);
+            };
             Some(ZoneBlock {
-                column_id: u16::from_le_bytes(take(&mut rest).ok_or(ERR)?),
+                column_id,
                 length: head_len,
             })
         };
-        let page_count = part_count.checked_mul(row_page_count).ok_or(ERR)?;
+        // Two counts of at most `u16::MAX` multiply within a `usize`.
+        let page_count = part_count * row_page_count;
         if page_count > usize::from(u16::MAX) {
             return Err(Error::InvalidHeader(
                 "column page: page count exceeds the u16 directory field",
@@ -1110,40 +1148,56 @@ impl PageDirectory {
         // payload can actually hold, not for what the header claims.
         let mut parts = Vec::with_capacity(part_count.min(rest.len() / PART_LEN));
         for _ in 0..part_count {
-            let column_id = u16::from_le_bytes(take(&mut rest).ok_or(ERR)?);
-            let [part] = take::<1>(&mut rest).ok_or(ERR)?;
+            let (Some(column_id), Some([part])) = (
+                take(&mut rest).map(u16::from_le_bytes),
+                take::<1>(&mut rest),
+            ) else {
+                return Err(ERR);
+            };
             parts.push(PageId { column_id, part });
         }
         let mut row_pages = Vec::with_capacity(row_page_count.min(rest.len()));
         let mut row_count: u32 = 0;
         for _ in 0..row_page_count {
-            let rows = take_var_u32(&mut rest).ok_or(ERR)?;
-            row_count = row_count.checked_add(rows).ok_or(Error::InvalidHeader(
-                "column page: row pages overflow the row count",
-            ))?;
+            let Some(rows) = take_var_u32(&mut rest) else {
+                return Err(ERR);
+            };
+            let Some(sum) = row_count.checked_add(rows) else {
+                return Err(Error::InvalidHeader(
+                    "column page: row pages overflow the row count",
+                ));
+            };
+            row_count = sum;
             row_pages.push(rows);
         }
         let mut entries = Vec::with_capacity(page_count.min(rest.len()));
         let mut offset: u32 = 0;
         for id in &parts {
-            for row_page in 0..row_page_count {
-                let length = take_var_u32(&mut rest).ok_or(ERR)?;
+            // At most `u16::MAX` row pages, a `u16` field.
+            for row_page in (0u16..).take(row_page_count) {
+                let Some(length) = take_var_u32(&mut rest) else {
+                    return Err(ERR);
+                };
                 entries.push(PageEntry {
                     offset,
                     length,
                     id: *id,
-                    // At most u16::MAX row pages, checked above.
-                    row_page: u16::try_from(row_page).map_err(|_| ERR)?,
+                    row_page,
                 });
-                offset = offset
-                    .checked_add(length)
-                    .ok_or(Error::InvalidHeader("column page: extent overflows u32"))?;
+                let Some(end) = offset.checked_add(length) else {
+                    return Err(Error::InvalidHeader("column page: extent overflows u32"));
+                };
+                offset = end;
             }
         }
         let mut zone_blocks = Vec::with_capacity(zone_block_count.min(rest.len() / 3));
         for _ in 0..zone_block_count {
-            let column_id = u16::from_le_bytes(take(&mut rest).ok_or(ERR)?);
-            let length = take_var_u32(&mut rest).ok_or(ERR)?;
+            let (Some(column_id), Some(length)) = (
+                take(&mut rest).map(u16::from_le_bytes),
+                take_var_u32(&mut rest),
+            ) else {
+                return Err(ERR);
+            };
             zone_blocks.push(ZoneBlock { column_id, length });
         }
         if !rest.is_empty() {

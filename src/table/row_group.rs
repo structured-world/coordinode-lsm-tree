@@ -426,8 +426,9 @@ impl GroupRead<'_> {
                 None => None,
             };
             let wanted = want.resolve(&directory, zones.as_ref())?;
-            let pages = self.cached_pages(&directory, directory_len, &wanted)?;
-            self.count_cached(true, &pages);
+            let mut pages = wanted.slots(&directory);
+            let found = self.fill_cached(&directory, directory_len, &mut pages)?;
+            self.count_cached(true, found);
             if pages.iter().all(|slot| slot.block.is_some()) {
                 return Ok(RowGroupBlocks {
                     directory,
@@ -455,6 +456,71 @@ impl GroupRead<'_> {
 
         let fd = self.open()?;
         self.read_selective(fd, want)
+    }
+
+    /// Loads the pages `want` selects in the group `earlier` read, [`load`]
+    /// having returned it for this same group: its directory, already read
+    /// and checked, is used as it is, and the pages it holds are taken from it
+    /// rather than looked up or read again. A read in two steps, such as a
+    /// point read that finds its row pages by the key column before reading
+    /// the rest of them, pays for the directory once.
+    ///
+    /// [`load`]: Self::load
+    ///
+    /// # Errors
+    ///
+    /// As [`Self::load`] for the pages and zone block it reads.
+    pub(crate) fn load_after(
+        &self,
+        earlier: &RowGroupBlocks,
+        want: &PageWant<'_>,
+    ) -> crate::Result<RowGroupBlocks> {
+        let directory = Arc::clone(&earlier.directory);
+        let directory_len = indexed_directory_len(self.group)?;
+        let mut fd = None;
+        let zones = match want.zone_block_column(&directory) {
+            Some(column_id) => Some(self.zone_block(
+                &mut fd,
+                &directory,
+                directory_len,
+                column_id,
+                &Slice::empty(),
+                true,
+            )?),
+            None => None,
+        };
+        let wanted = want.resolve(&directory, zones.as_ref())?;
+        let mut pages = wanted.slots(&directory);
+        // Both lists are in directory order, so one pass matches them.
+        let mut held = earlier.pages.iter().peekable();
+        for slot in &mut pages {
+            while held.next_if(|page| page.index < slot.index).is_some() {}
+            if let Some(page) = held.next_if(|page| page.index == slot.index) {
+                slot.block.clone_from(&page.block);
+            }
+        }
+        let found = self.fill_cached(&directory, directory_len, &mut pages)?;
+        self.count_cached(false, found);
+        let pages = if pages.iter().all(|slot| slot.block.is_some()) {
+            pages
+        } else {
+            let fd = match fd {
+                Some(fd) => fd,
+                None => self.open()?,
+            };
+            self.fetch_missing(
+                fd.as_ref(),
+                &directory,
+                directory_len,
+                &Slice::empty(),
+                pages,
+            )?
+        };
+        Ok(RowGroupBlocks {
+            directory,
+            row_pages: wanted.row_pages,
+            pages,
+        })
     }
 
     /// `directory` with its head zone block's zones kept on it, the block
@@ -624,15 +690,13 @@ impl GroupRead<'_> {
             None => self.open()?,
         };
         let wanted = want.resolve(&directory, zones.as_ref())?;
-        let pages = if prefix.len() == group_len {
-            // Every page is in hand already: a cache lookup per page would
-            // cost more than verifying it from the bytes just read.
-            wanted.slots(&directory)
-        } else {
-            let pages = self.cached_pages(&directory, directory_len, &wanted)?;
-            self.count_cached(false, &pages);
-            pages
-        };
+        let mut pages = wanted.slots(&directory);
+        // With every page in hand already, a cache lookup per page would cost
+        // more than verifying it from the bytes just read.
+        if prefix.len() != group_len {
+            let found = self.fill_cached(&directory, directory_len, &mut pages)?;
+            self.count_cached(false, found);
+        }
         let pages = self.fetch_missing(fd.as_ref(), &directory, directory_len, &prefix, pages)?;
         // Cached only now that the blocks it named carried the stamps it
         // implies: another group's directory read in this one's place fails
@@ -907,24 +971,26 @@ impl GroupRead<'_> {
         )?)
     }
 
-    /// The pages `want` selects that the cache already holds.
-    fn cached_pages(
+    /// Fills the empty slots of `pages` with the blocks the cache already
+    /// holds, returning how many it found.
+    fn fill_cached(
         &self,
         directory: &PageDirectory,
         directory_len: u32,
-        want: &Wanted<'_>,
-    ) -> crate::Result<Vec<PageSlot>> {
-        let mut pages = want.slots(directory);
+        pages: &mut [PageSlot],
+    ) -> crate::Result<usize> {
         let pages_at =
             *self.group.offset() + u64::from(directory_len) + u64::from(directory.pages_start());
         let entries = directory.entries();
-        for slot in &mut pages {
+        let mut found = 0;
+        for slot in pages.iter_mut().filter(|slot| slot.block.is_none()) {
             if let Some(entry) = entries.get(slot.index) {
                 let offset = pages_at + u64::from(entry.offset);
                 slot.block = self.lookup(BlockOffset(offset), BlockType::ColumnPage)?;
+                found += usize::from(slot.block.is_some());
             }
         }
-        Ok(pages)
+        Ok(found)
     }
 
     /// A cached block at `offset`, looked up without promoting it when this
@@ -945,18 +1011,18 @@ impl GroupRead<'_> {
     }
 
     /// Counts the cached blocks a read served: the directory when it came
-    /// from the cache, and each page it holds.
+    /// from the cache, and the `pages` it found there.
     #[cfg_attr(
         not(feature = "metrics"),
         expect(clippy::unused_self, reason = "the counters are behind `metrics`")
     )]
-    fn count_cached(&self, directory: bool, pages: &[PageSlot]) {
+    fn count_cached(&self, directory: bool, pages: usize) {
         #[cfg(feature = "metrics")]
         if self.charge.is_counted() {
             if directory {
                 record_block_load_cached(self.metrics, BlockType::ColumnPageDirectory);
             }
-            for _ in pages.iter().filter(|slot| slot.block.is_some()) {
+            for _ in 0..pages {
                 record_block_load_cached(self.metrics, BlockType::ColumnPage);
             }
         }
