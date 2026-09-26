@@ -1,5 +1,5 @@
 window.BENCHMARK_DATA = {
-  "lastUpdate": 1790412488201,
+  "lastUpdate": 1790412493015,
   "repoUrl": "https://github.com/structured-world/coordinode-lsm-tree",
   "entries": {
     "lsm-tree db_bench costs": [
@@ -372,6 +372,192 @@ window.BENCHMARK_DATA = {
             "value": 6222.25,
             "unit": "B/row",
             "extra": "keys: 10000 | rows: 10000 | read: 83123466 B | decoded: 82570298 B | copied: 62222500 B | elapsed: 59.345337ms\niterations: 3"
+          }
+        ]
+      },
+      {
+        "commit": {
+          "author": {
+            "email": "mail@polaz.com",
+            "name": "Dmitry Prudnikov",
+            "username": "polaz"
+          },
+          "committer": {
+            "email": "noreply@github.com",
+            "name": "GitHub",
+            "username": "web-flow"
+          },
+          "distinct": true,
+          "id": "83eb157b1cba9617e166c560ea6861cecffe3ae0",
+          "message": "fix: rank merges by promoted cost, order number columns, bind block checksums (#714)\n\n## Summary\n\nThree independent fixes, one commit each.\n\n### Leveled merges ranked by cost per promoted byte (#662)\n\nThe leveled picker took the smallest total merge and ignored the\novershoot it was handed, so against a dense next level it preferred the\ncandidate that rewrites the most per byte it moves down. Candidates are\nnow ranked by `(promoted + pulled_in) / promoted`, compared by\ncross-multiplication in `u128`, among those whose promoted bytes stay\nwithin the level's overshoot plus a slack\n(`Leveled::with_promotion_slack`), falling back to the best ratio\noverall. Trivial moves keep priority; ties keep the existing candidate\norder.\n\nMeasured with a sustained random-overwrite workload (16 B keys, 100 B\nvalues, flush every 50k writes, leveled compaction run to quiescence\nafter every flush, 2 MiB tables), against the previous picker on the\nsame seed:\n\n| workload | compaction bytes / logical byte | compactions | wall time |\nread p99 |\n|---|---:|---:|---:|---:|\n| 3M overwrites over 1M keys, seed A | 8.21 → 7.04 | 361 → 202 | 19.6 s\n→ 15.1 s | 34.0 → 33.6 µs |\n| 3M overwrites over 1M keys, seed B | 8.41 → 7.42 | 374 → 197 | 17.4 s\n→ 14.8 s | 33.3 → 30.9 µs |\n| 2M inserts, no overwrites | 7.07 → 6.03 | 206 → 102 | 11.1 s → 9.0 s |\n27.7 → 27.4 µs (repeat run) |\n\nLevel sizes at quiescence stay within a few percent of each other, so\nthe saving is not bought with carried debt.\n\n### Fixed-width number columns ordered, pruned and filtered (#683)\n\nA fixed-width column was an opaque byte string: a range predicate on it\ncompared bytes, so little-endian integers, signed integers and floats\nwere filtered and pruned in the wrong order. Columns now carry\n`TypeTag::Number { kind, order, width }` (unsigned, signed, IEEE 754\nfloat; little- or big-endian), compared through an order-preserving\nordinal (IEEE 754-2019 5.10 totalOrder for floats). Zone statistics\ncover number columns; opaque `Fixed` columns stay unstatted. A predicate\nreports how far it can be honoured (`PredicateSupport`) and can be\napplied as a filter or as pruning only (`PredicateApply`). The seqno\ncolumn is an unsigned little-endian `u64`, and a seqno bound is\ntranslated by each segment's global seqno before it is compared.\n\n### Block checksums bound to their table and offset (#713)\n\nA block's stored checksum covered only its payload, so a checksum-valid\nblock served from another place (a misdirected read or write, a remapped\nsector, two same-length blocks swapped by a copy error) was read as the\nblock the index points at: a point read of a key inside it answered\n\"absent\". A table block now stores its payload XXH3-128 XORed with\n`(table_id << 64 | offset) + 1`. The modifier only has to be injective\nfor a misplaced block to be refused, so it costs a shift and an add per\nblock read. Meta blocks bind to their offset alone (a reader without the\nmanifest learns the table id from them); manifest blocks and blob-file\nmeta stay unbound. Relocation, salvage verbatim copies and the\npartitioned index / filter re-bind every block they place somewhere\nother than where it was framed. `ChecksummedWriter` also hashed a whole\nbuffer on a short write; it now hashes only the bytes written.\n\nThe conversions both on-disk changes need from a 5.x store are listed in\n#672.\n\n## Testing\n\n- `tests/block_misplacement.rs`: two adjacent data blocks swapped, plain\nand encrypted; point reads, scans, `verify_block_checksums` and\ncompaction must all refuse the file. Before the fix a present key read\nas absent.\n- Every re-binding path was checked red by disabling it: salvage\nverbatim copies (12 tests fail), relocation (9), partitioned index (3),\npartitioned filter (11).\n- Forges that move blocks now re-bind them, so the page-stamp, group-tag\nand AEAD tests keep reaching the checks behind the block checksum.\n- Picker: synthetic A/B candidates, the overshoot bound, `u128`\ncomparison at byte counts where a `u64` product wraps, determinism\nacross calls.\n- Number columns: per-kind ordering proptests, zone pruning never drops\na matching row, seqno bounds across singleton, dedup and merge scan\npaths.\n- Gate: `cargo fmt --check`; clippy `-D warnings` with all features,\ndefault features and `--no-default-features --features zstd,lz4`;\nnextest all features 3688/3688, default 2779/2779, no-default 3026/3026;\ndoc tests; `cargo doc` clean with default and all features;\n`thumbv7em-none-eabihf` no-std check 0 errors; sst-dump and db_bench\nbuild and pass.\n- Not run locally: `tools/compare-rocksdb` (needs libclang for\nlibrocksdb-sys; it does not use the changed types).\n\nBackport of the three fixes to 5.x.x, within that line's format and API:\n#715.\n\nCloses #662\nCloses #683\nCloses #713\n\n\n<!-- This is an auto-generated comment: release notes by coderabbit.ai\n-->\n\n## Summary by CodeRabbit\n\n* **New Features**\n* Added numeric column types with ordered range filtering and\nstatistics-based pruning.\n  * Added predicate support reporting for columnar scans.\n* Leveled compaction now favors merges that rewrite fewer bytes per byte\npromoted, with configurable promotion slack.\n\n* **Bug Fixes**\n* Block checksums now account for table identity and file location,\nhelping detect misplaced blocks during reads, scans, and verification.\n  * Preserved checksum validity when blocks are relocated or salvaged.\n\n* **Documentation**\n  * Clarified columnar filtering, statistics, and checksum behavior.\n\n<!-- end of auto-generated comment: release notes by coderabbit.ai -->",
+          "timestamp": "2026-09-26T11:40:49+03:00",
+          "tree_id": "31b70367977364f68b247b396d9d7995bbbe04f2",
+          "url": "https://github.com/structured-world/coordinode-lsm-tree/commit/83eb157b1cba9617e166c560ea6861cecffe3ae0"
+        },
+        "date": 1790412491236,
+        "tool": "customSmallerIsBetter",
+        "benches": [
+          {
+            "name": "mixed-layout / narrow-records bytes read per row",
+            "value": 42.1442,
+            "unit": "B/row",
+            "extra": "keys: 200000 | rows: 200000 | read: 8428840 B | decoded: 8357098 B | copied: 9000000 B | elapsed: 311.943739ms\niterations: 3"
+          },
+          {
+            "name": "mixed-layout / narrow-records bytes decoded per row",
+            "value": 41.78549,
+            "unit": "B/row",
+            "extra": "keys: 200000 | rows: 200000 | read: 8428840 B | decoded: 8357098 B | copied: 9000000 B | elapsed: 311.943739ms\niterations: 3"
+          },
+          {
+            "name": "mixed-layout / narrow-records bytes copied per row",
+            "value": 45,
+            "unit": "B/row",
+            "extra": "keys: 200000 | rows: 200000 | read: 8428840 B | decoded: 8357098 B | copied: 9000000 B | elapsed: 311.943739ms\niterations: 3"
+          },
+          {
+            "name": "mixed-layout / wide-records-full-read bytes read per row",
+            "value": 4215,
+            "unit": "B/row",
+            "extra": "keys: 50000 | rows: 50000 | read: 210750000 B | decoded: 209100000 B | copied: 207050000 B | elapsed: 362.921694ms\niterations: 3"
+          },
+          {
+            "name": "mixed-layout / wide-records-full-read bytes decoded per row",
+            "value": 4182,
+            "unit": "B/row",
+            "extra": "keys: 50000 | rows: 50000 | read: 210750000 B | decoded: 209100000 B | copied: 207050000 B | elapsed: 362.921694ms\niterations: 3"
+          },
+          {
+            "name": "mixed-layout / wide-records-full-read bytes copied per row",
+            "value": 4141,
+            "unit": "B/row",
+            "extra": "keys: 50000 | rows: 50000 | read: 210750000 B | decoded: 209100000 B | copied: 207050000 B | elapsed: 362.921694ms\niterations: 3"
+          },
+          {
+            "name": "mixed-layout / mixed-value-sizes bytes read per row",
+            "value": 867.21184,
+            "unit": "B/row",
+            "extra": "keys: 100000 | rows: 100000 | read: 86721184 B | decoded: 86391151 B | copied: 86420000 B | elapsed: 251.016529ms\niterations: 3"
+          },
+          {
+            "name": "mixed-layout / mixed-value-sizes bytes decoded per row",
+            "value": 863.91151,
+            "unit": "B/row",
+            "extra": "keys: 100000 | rows: 100000 | read: 86721184 B | decoded: 86391151 B | copied: 86420000 B | elapsed: 251.016529ms\niterations: 3"
+          },
+          {
+            "name": "mixed-layout / mixed-value-sizes bytes copied per row",
+            "value": 864.2,
+            "unit": "B/row",
+            "extra": "keys: 100000 | rows: 100000 | read: 86721184 B | decoded: 86391151 B | copied: 86420000 B | elapsed: 251.016529ms\niterations: 3"
+          },
+          {
+            "name": "mixed-layout / row-updates-over-columnar-base bytes read per row",
+            "value": 330.30557,
+            "unit": "B/row",
+            "extra": "keys: 100000 | rows: 100000 | read: 33030557 B | decoded: 21069973 B | copied: 51100094 B | elapsed: 577.691047ms\niterations: 3"
+          },
+          {
+            "name": "mixed-layout / row-updates-over-columnar-base bytes decoded per row",
+            "value": 210.69973,
+            "unit": "B/row",
+            "extra": "keys: 100000 | rows: 100000 | read: 33030557 B | decoded: 21069973 B | copied: 51100094 B | elapsed: 577.691047ms\niterations: 3"
+          },
+          {
+            "name": "mixed-layout / row-updates-over-columnar-base bytes copied per row",
+            "value": 511.00094,
+            "unit": "B/row",
+            "extra": "keys: 100000 | rows: 100000 | read: 33030557 B | decoded: 21069973 B | copied: 51100094 B | elapsed: 577.691047ms\niterations: 3"
+          },
+          {
+            "name": "mixed-layout / versions-deletes-tombstones bytes read per row",
+            "value": 133.68026315789473,
+            "unit": "B/row",
+            "extra": "keys: 100000 | rows: 76000 | read: 10159700 B | decoded: 10076111 B | copied: 10013359 B | elapsed: 242.52571ms\niterations: 3"
+          },
+          {
+            "name": "mixed-layout / versions-deletes-tombstones bytes decoded per row",
+            "value": 132.58040789473685,
+            "unit": "B/row",
+            "extra": "keys: 100000 | rows: 76000 | read: 10159700 B | decoded: 10076111 B | copied: 10013359 B | elapsed: 242.52571ms\niterations: 3"
+          },
+          {
+            "name": "mixed-layout / versions-deletes-tombstones bytes copied per row",
+            "value": 131.75472368421052,
+            "unit": "B/row",
+            "extra": "keys: 100000 | rows: 76000 | read: 10159700 B | decoded: 10076111 B | copied: 10013359 B | elapsed: 242.52571ms\niterations: 3"
+          },
+          {
+            "name": "mixed-layout / selective-scan-sparse bytes read per row",
+            "value": 4308,
+            "unit": "B/row",
+            "extra": "keys: 100000 | rows: 1031 | read: 4441548 B | decoded: 4069357 B | copied: 310331 B | elapsed: 17.295975ms\niterations: 3"
+          },
+          {
+            "name": "mixed-layout / selective-scan-sparse bytes decoded per row",
+            "value": 3947,
+            "unit": "B/row",
+            "extra": "keys: 100000 | rows: 1031 | read: 4441548 B | decoded: 4069357 B | copied: 310331 B | elapsed: 17.295975ms\niterations: 3"
+          },
+          {
+            "name": "mixed-layout / selective-scan-sparse bytes copied per row",
+            "value": 301,
+            "unit": "B/row",
+            "extra": "keys: 100000 | rows: 1031 | read: 4441548 B | decoded: 4069357 B | copied: 310331 B | elapsed: 17.295975ms\niterations: 3"
+          },
+          {
+            "name": "mixed-layout / selective-scan-near-full bytes read per row",
+            "value": 368.55153333333334,
+            "unit": "B/row",
+            "extra": "keys: 100000 | rows: 90000 | read: 33169638 B | decoded: 30361670 B | copied: 26102316 B | elapsed: 113.022303ms\niterations: 3"
+          },
+          {
+            "name": "mixed-layout / selective-scan-near-full bytes decoded per row",
+            "value": 337.3518888888889,
+            "unit": "B/row",
+            "extra": "keys: 100000 | rows: 90000 | read: 33169638 B | decoded: 30361670 B | copied: 26102316 B | elapsed: 113.022303ms\niterations: 3"
+          },
+          {
+            "name": "mixed-layout / selective-scan-near-full bytes copied per row",
+            "value": 290.02573333333333,
+            "unit": "B/row",
+            "extra": "keys: 100000 | rows: 90000 | read: 33169638 B | decoded: 30361670 B | copied: 26102316 B | elapsed: 113.022303ms\niterations: 3"
+          },
+          {
+            "name": "mixed-layout / blobs-well-placed bytes read per row",
+            "value": 8297.8593,
+            "unit": "B/row",
+            "extra": "keys: 10000 | rows: 10000 | read: 82978593 B | decoded: 82426811 B | copied: 82911721 B | elapsed: 51.861856ms\niterations: 3"
+          },
+          {
+            "name": "mixed-layout / blobs-well-placed bytes decoded per row",
+            "value": 8242.6811,
+            "unit": "B/row",
+            "extra": "keys: 10000 | rows: 10000 | read: 82978593 B | decoded: 82426811 B | copied: 82911721 B | elapsed: 51.861856ms\niterations: 3"
+          },
+          {
+            "name": "mixed-layout / blobs-well-placed bytes copied per row",
+            "value": 8291.1721,
+            "unit": "B/row",
+            "extra": "keys: 10000 | rows: 10000 | read: 82978593 B | decoded: 82426811 B | copied: 82911721 B | elapsed: 51.861856ms\niterations: 3"
+          },
+          {
+            "name": "mixed-layout / blobs-scattered bytes read per row",
+            "value": 8312.3466,
+            "unit": "B/row",
+            "extra": "keys: 10000 | rows: 10000 | read: 83123466 B | decoded: 82570298 B | copied: 62222500 B | elapsed: 61.538667ms\niterations: 3"
+          },
+          {
+            "name": "mixed-layout / blobs-scattered bytes decoded per row",
+            "value": 8257.0298,
+            "unit": "B/row",
+            "extra": "keys: 10000 | rows: 10000 | read: 83123466 B | decoded: 82570298 B | copied: 62222500 B | elapsed: 61.538667ms\niterations: 3"
+          },
+          {
+            "name": "mixed-layout / blobs-scattered bytes copied per row",
+            "value": 6222.25,
+            "unit": "B/row",
+            "extra": "keys: 10000 | rows: 10000 | read: 83123466 B | decoded: 82570298 B | copied: 62222500 B | elapsed: 61.538667ms\niterations: 3"
           }
         ]
       }
