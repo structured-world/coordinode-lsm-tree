@@ -415,12 +415,11 @@ impl GroupRead<'_> {
         front: &Slice,
         cache: bool,
     ) -> crate::Result<PageZones> {
-        let (after_directory, length) =
-            directory
-                .zone_block(column_id)
-                .ok_or(crate::Error::InvalidHeader(
-                    "columnar: the column has no zone block",
-                ))?;
+        let Some((after_directory, length)) = directory.zone_block(column_id) else {
+            return Err(crate::Error::InvalidHeader(
+                "columnar: the column has no zone block",
+            ));
+        };
         // The extent check proved the directory, its zone blocks and its
         // pages fill the group, and the group's length is a `u32`.
         let start = directory_len as usize + after_directory as usize;
@@ -590,11 +589,9 @@ impl GroupRead<'_> {
             Header::decode_from(&mut &front[..])?.on_disk_size_with(self.ecc),
         )?;
         let handle = BlockHandle::new(self.group.offset(), directory_len);
-        let bytes = front
-            .get(..directory_len as usize)
-            .ok_or(crate::Error::InvalidHeader(
-                "columnar: page directory overruns its row group",
-            ))?;
+        let bytes = front.get(..directory_len as usize).ok_or_else(|| {
+            crate::Error::InvalidHeader("columnar: page directory overruns its row group")
+        })?;
         let block = self.verify_and_admit(
             bytes,
             &handle,
@@ -674,9 +671,9 @@ impl GroupRead<'_> {
             let spans = batch
                 .iter()
                 .map(|run| {
-                    span_of(run).ok_or(crate::Error::InvalidHeader(
-                        "columnar: page outside its row group",
-                    ))
+                    span_of(run).ok_or_else(|| {
+                        crate::Error::InvalidHeader("columnar: page outside its row group")
+                    })
                 })
                 .collect::<crate::Result<Vec<_>>>()?;
             // The requests the bytes already in hand do not reach at all go
@@ -690,9 +687,9 @@ impl GroupRead<'_> {
             let mut read = self.read_many(fd, &beyond)?.into_iter();
             for (run, &(start, end)) in batch.iter().zip(&spans) {
                 let span = if start >= front.len() {
-                    read.next().ok_or(crate::Error::InvalidHeader(
-                        "columnar: a request came back missing",
-                    ))?
+                    read.next().ok_or_else(|| {
+                        crate::Error::InvalidHeader("columnar: a request came back missing")
+                    })?
                 } else {
                     self.span(fd, front, start, end)?
                 };
@@ -1110,9 +1107,7 @@ pub fn indexed_directory_len(group: &BlockHandle) -> crate::Result<u32> {
     group
         .row_group()
         .map(|group| group.directory_len.get())
-        .ok_or(crate::Error::InvalidHeader(
-            "columnar: the index entry names no row group",
-        ))
+        .ok_or_else(|| crate::Error::InvalidHeader("columnar: the index entry names no row group"))
 }
 
 /// Refuses a directory whose on-disk length, `found`, is not the `indexed`
@@ -1145,12 +1140,11 @@ pub fn check_directory_len(indexed: u32, found: u32) -> crate::Result<()> {
 /// [`crate::Error::InvalidHeader`] when they differ, or when the entry names
 /// no row group.
 pub fn check_head_zones_len(group: &BlockHandle, directory: &PageDirectory) -> crate::Result<()> {
-    let indexed = group
-        .row_group()
-        .ok_or(crate::Error::InvalidHeader(
+    let Some(indexed) = group.row_group().map(|group| group.head_zones_len) else {
+        return Err(crate::Error::InvalidHeader(
             "columnar: the index entry names no row group",
-        ))?
-        .head_zones_len;
+        ));
+    };
     if indexed == directory.pages_start() {
         Ok(())
     } else {

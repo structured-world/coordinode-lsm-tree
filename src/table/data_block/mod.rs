@@ -527,11 +527,11 @@ impl DataBlock {
             let offset = u32::try_from(index).map_err(|_| {
                 crate::Error::InvalidHeader("columnar: block row index exceeds u32::MAX")
             })?;
-            let pos = block_start_row
-                .checked_add(offset)
-                .ok_or(crate::Error::InvalidHeader(
+            let Some(pos) = block_start_row.checked_add(offset) else {
+                return Err(crate::Error::InvalidHeader(
                     "columnar: row position exceeds u32::MAX",
-                ))?;
+                ));
+            };
             if !deletes.contains(pos) {
                 kept.push(entry);
             }
@@ -1322,12 +1322,12 @@ impl<'a> KvDigestProbe<'a> {
     pub(crate) fn observe(&mut self, item: &crate::InternalValue) -> crate::Result<()> {
         // Read the stored digest on demand from the borrowed footer bytes
         // (no owned Vec<u64> materialization — see `SplitFull`).
-        let stored = self
-            .split
-            .digest(self.seen)
-            .ok_or(crate::Error::InvalidTrailer)?;
-        let recomputed = super::block::kv_checksum::kv_digest(item, self.split.algo)
-            .ok_or(crate::Error::FeatureUnsupported("kv-checksum-algorithm"))?;
+        let Some(stored) = self.split.digest(self.seen) else {
+            return Err(crate::Error::InvalidTrailer);
+        };
+        let Some(recomputed) = super::block::kv_checksum::kv_digest(item, self.split.algo) else {
+            return Err(crate::Error::FeatureUnsupported("kv-checksum-algorithm"));
+        };
         if recomputed != stored {
             return Err(crate::Error::ChecksumMismatch {
                 got: crate::Checksum::from_raw(u128::from(recomputed)),

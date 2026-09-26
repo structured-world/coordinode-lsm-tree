@@ -503,25 +503,26 @@ fn check_validity(v: &[u8], row_count: u32) -> Result<()> {
 /// payload length (so `offset[i]..offset[i + 1]` slicing by a consumer is
 /// always in bounds).
 fn check_bytes_framing(data: &[u8], row_count: u32) -> Result<()> {
-    let off_count = (row_count as usize)
+    let Some(off_bytes) = (row_count as usize)
         .checked_add(1)
-        .ok_or(Error::InvalidHeader(
-            "columnar: bytes offset count overflow",
-        ))?;
-    let off_bytes = off_count.checked_mul(4).ok_or(Error::InvalidHeader(
-        "columnar: bytes offset table overflow",
-    ))?;
-    let table = data.get(..off_bytes).ok_or(Error::InvalidHeader(
-        "columnar: bytes column shorter than its offset table",
-    ))?;
+        .and_then(|count| count.checked_mul(4))
+    else {
+        return Err(Error::InvalidHeader(
+            "columnar: bytes offset table overflow",
+        ));
+    };
+    let Some(table) = data.get(..off_bytes) else {
+        return Err(Error::InvalidHeader(
+            "columnar: bytes column shorter than its offset table",
+        ));
+    };
     let payload_len = data.len() - off_bytes;
     let mut prev = 0usize;
     for (i, chunk) in table.chunks_exact(4).enumerate() {
-        let off = u32::from_le_bytes(
-            chunk
-                .try_into()
-                .map_err(|_| Error::InvalidHeader("columnar: short bytes offset"))?,
-        ) as usize;
+        let Some(chunk) = chunk.first_chunk::<4>() else {
+            return Err(Error::InvalidHeader("columnar: short bytes offset"));
+        };
+        let off = u32::from_le_bytes(*chunk) as usize;
         if i == 0 && off != 0 {
             return Err(Error::InvalidHeader(
                 "columnar: first bytes offset must be zero",
@@ -560,12 +561,11 @@ impl Column {
                 return Err(Error::InvalidHeader("columnar: fixed column width is zero"));
             }
             Some(w) => {
-                let expected =
-                    (row_count as usize)
-                        .checked_mul(w as usize)
-                        .ok_or(Error::InvalidHeader(
-                            "columnar: fixed column length overflow",
-                        ))?;
+                let Some(expected) = (row_count as usize).checked_mul(w as usize) else {
+                    return Err(Error::InvalidHeader(
+                        "columnar: fixed column length overflow",
+                    ));
+                };
                 if self.data.len() != expected {
                     return Err(Error::InvalidHeader(
                         "columnar: fixed column byte length is not row_count * width",
@@ -674,12 +674,11 @@ impl Column {
             ));
         };
         let width = usize::from(number.width);
-        let cells = self
-            .data
-            .get(start as usize * width..end as usize * width)
-            .ok_or(Error::InvalidHeader(
+        let Some(cells) = self.data.get(start as usize * width..end as usize * width) else {
+            return Err(Error::InvalidHeader(
                 "columnar: row range outside the column",
-            ))?;
+            ));
+        };
         let mut nulls = 0u32;
         let mut range: Option<(u128, u128)> = None;
         for (row, cell) in (start..end).zip(cells.chunks_exact(width)) {
@@ -958,13 +957,11 @@ impl ColumnBatch {
         if self.row_count == 0 {
             return Ok(None);
         }
-        let key_col = self
-            .columns
-            .first()
-            .filter(|c| c.column_id == COL_USER_KEY)
-            .ok_or(Error::InvalidHeader(
+        let Some(key_col) = self.columns.first().filter(|c| c.column_id == COL_USER_KEY) else {
+            return Err(Error::InvalidHeader(
                 "columnar: first column is not the user-key column",
-            ))?;
+            ));
+        };
         // This runs before the full `column_batch_to_entries` validation, so
         // confirm the intrinsic key column's shape (non-null `Bytes`, correctly
         // framed for `row_count`) before the low-level offset read.
@@ -989,13 +986,11 @@ impl ColumnBatch {
         let Some(last) = self.row_count.checked_sub(1) else {
             return Ok(None);
         };
-        let key_col = self
-            .columns
-            .first()
-            .filter(|c| c.column_id == COL_USER_KEY)
-            .ok_or(Error::InvalidHeader(
+        let Some(key_col) = self.columns.first().filter(|c| c.column_id == COL_USER_KEY) else {
+            return Err(Error::InvalidHeader(
                 "columnar: first column is not the user-key column",
-            ))?;
+            ));
+        };
         if key_col.type_tag != TypeTag::Bytes || key_col.validity.is_some() {
             return Err(Error::InvalidHeader(
                 "columnar: first column is not the non-null user-key column",
@@ -1136,9 +1131,11 @@ impl ColumnBatch {
         );
         let mut start = 0u32;
         for &rows in row_pages {
-            let end = start.checked_add(rows).ok_or(Error::InvalidHeader(
-                "columnar: row pages overrun the batch",
-            ))?;
+            let Some(end) = start.checked_add(rows) else {
+                return Err(Error::InvalidHeader(
+                    "columnar: row pages overrun the batch",
+                ));
+            };
             for col in &ordered {
                 if let TypeTag::Number(number) = col.type_tag {
                     let (nulls, range) = col.number_range(start, end)?;
@@ -1229,11 +1226,12 @@ impl ColumnBatch {
                 }
                 b.validate(page.row_count)?;
             }
-            row_count = row_count
-                .checked_add(page.row_count)
-                .ok_or(Error::InvalidHeader(
+            let Some(sum) = row_count.checked_add(page.row_count) else {
+                return Err(Error::InvalidHeader(
                     "columnar: row group row count exceeds u32",
-                ))?;
+                ));
+            };
+            row_count = sum;
         }
         let mut columns = Vec::with_capacity(first.columns.len());
         for (index, head) in first.columns.iter().enumerate() {
@@ -1489,9 +1487,10 @@ fn build_bytes_column<'a>(rows: impl Iterator<Item = &'a [u8]>) -> Result<Vec<u8
     for r in rows {
         let len = u32::try_from(r.len())
             .map_err(|_| Error::InvalidHeader("columnar: column value exceeds u32"))?;
-        off = off
-            .checked_add(len)
-            .ok_or(Error::InvalidHeader("columnar: column payload exceeds u32"))?;
+        let Some(end) = off.checked_add(len) else {
+            return Err(Error::InvalidHeader("columnar: column payload exceeds u32"));
+        };
+        off = end;
         payload.extend_from_slice(r);
         offsets.extend_from_slice(&off.to_le_bytes());
     }
@@ -1519,25 +1518,25 @@ pub(crate) type NullsAndRange<'a> = (u32, Option<(&'a [u8], &'a [u8])>);
 /// Reads row `i` of a [`TypeTag::Bytes`] column body (offset table + payload),
 /// bounds-checked.
 pub(crate) fn bytes_column_row(data: &[u8], row_count: u32, i: u32) -> Result<&[u8]> {
+    // Called per row on the read paths, so the errors are built only on the
+    // branch that returns them.
     let off_bytes = (row_count as usize + 1) * 4;
-    let read_off = |idx: u32| -> Result<usize> {
+    let read_off = |idx: u32| {
         let base = idx as usize * 4;
-        let b = data
-            .get(base..base + 4)
-            .ok_or(Error::InvalidHeader("columnar: bytes offset truncated"))?;
-        let arr: [u8; 4] = b
-            .try_into()
-            .map_err(|_| Error::InvalidHeader("columnar: short bytes offset"))?;
-        Ok(u32::from_le_bytes(arr) as usize)
+        data.get(base..)
+            .and_then(<[u8]>::first_chunk::<4>)
+            .map(|b| u32::from_le_bytes(*b) as usize)
     };
-    let start = read_off(i)?;
-    let end = read_off(i + 1)?;
-    let payload = data
-        .get(off_bytes..)
-        .ok_or(Error::InvalidHeader("columnar: bytes payload truncated"))?;
-    payload
-        .get(start..end)
-        .ok_or(Error::InvalidHeader("columnar: bytes row out of range"))
+    let (Some(start), Some(end)) = (read_off(i), read_off(i + 1)) else {
+        return Err(Error::InvalidHeader("columnar: bytes offset truncated"));
+    };
+    let Some(payload) = data.get(off_bytes..) else {
+        return Err(Error::InvalidHeader("columnar: bytes payload truncated"));
+    };
+    match payload.get(start..end) {
+        Some(row) => Ok(row),
+        None => Err(Error::InvalidHeader("columnar: bytes row out of range")),
+    }
 }
 
 /// Frames `count` variable-width cells as a [`TypeTag::Bytes`] column body: a
@@ -1687,13 +1686,10 @@ pub(crate) fn comparable_bytes(number: Number, ordinal: u128) -> Comparable {
 /// Reads row `i` of a `Fixed(8)` column body as a little-endian `u64`.
 pub(crate) fn fixed_u64_row(data: &[u8], i: u32) -> Result<u64> {
     let base = i as usize * 8;
-    let b = data
-        .get(base..base + 8)
-        .ok_or(Error::InvalidHeader("columnar: fixed8 row truncated"))?;
-    let arr: [u8; 8] = b
-        .try_into()
-        .map_err(|_| Error::InvalidHeader("columnar: short fixed8 row"))?;
-    Ok(u64::from_le_bytes(arr))
+    match data.get(base..).and_then(<[u8]>::first_chunk::<8>) {
+        Some(b) => Ok(u64::from_le_bytes(*b)),
+        None => Err(Error::InvalidHeader("columnar: fixed8 row truncated")),
+    }
 }
 
 /// The bytes an entry with a `key_len`-byte user key and a `value_len`-byte
@@ -1754,25 +1750,30 @@ pub fn entries_to_column_batch(entries: &[InternalValue]) -> Result<ColumnBatch>
     Ok(ColumnBatch { row_count, columns })
 }
 
-/// Reconstructs the entries from an intrinsic columnar batch produced by
-/// [`entries_to_column_batch`].
-///
-/// # Errors
-///
-/// Returns an error if the batch does not carry exactly the four intrinsic
-/// columns in order with the expected type tags, or if a row is truncated or
-/// carries an unknown value type.
+/// Reads row `i` of the value-type column: one byte a row, which must name a
+/// value type.
+fn value_type_row(data: &[u8], i: u32) -> Result<ValueType> {
+    let Some(&byte) = data.get(i as usize) else {
+        return Err(Error::InvalidHeader("columnar: value-type row truncated"));
+    };
+    ValueType::try_from(byte).map_err(|()| Error::InvalidTag(("ValueType", byte)))
+}
+
 /// Returns row `row`'s `width`-byte cell from a fixed-width column's data.
 fn fixed_column_row(data: &[u8], width: u8, row: u32) -> Result<&[u8]> {
     let w = width as usize;
-    let start = (row as usize).checked_mul(w).ok_or(Error::InvalidHeader(
-        "columnar: fixed column offset overflow",
-    ))?;
-    let end = start.checked_add(w).ok_or(Error::InvalidHeader(
-        "columnar: fixed column offset overflow",
-    ))?;
-    data.get(start..end)
-        .ok_or(Error::InvalidHeader("columnar: fixed column row truncated"))
+    let Some(end) = (row as usize)
+        .checked_add(1)
+        .and_then(|rows| rows.checked_mul(w))
+    else {
+        return Err(Error::InvalidHeader(
+            "columnar: fixed column offset overflow",
+        ));
+    };
+    match data.get(end - w..end) {
+        Some(cell) => Ok(cell),
+        None => Err(Error::InvalidHeader("columnar: fixed column row truncated")),
+    }
 }
 
 /// Returns row `row`'s cell bytes from `col`, dispatching on the column's type.
@@ -1924,6 +1925,14 @@ pub fn validate_columnar_ingest_batch(
     Ok(())
 }
 
+/// Reconstructs the entries from an intrinsic columnar batch produced by
+/// [`entries_to_column_batch`].
+///
+/// # Errors
+///
+/// Returns an error if the batch does not carry exactly the four intrinsic
+/// columns in order with the expected type tags, or if a row is truncated or
+/// carries an unknown value type.
 pub fn column_batch_to_entries(batch: &ColumnBatch) -> Result<Vec<InternalValue>> {
     let (key_col, seqno_col, vt_col, value_cols) = validate_columnar_columns(batch)?;
     let mut out = Vec::with_capacity(batch.row_count as usize);
@@ -1938,13 +1947,7 @@ pub fn column_batch_to_entries(batch: &ColumnBatch) -> Result<Vec<InternalValue>
             ));
         }
         let seqno = fixed_u64_row(&seqno_col.data, i)?;
-        let vt_byte = vt_col
-            .data
-            .get(i as usize)
-            .copied()
-            .ok_or(Error::InvalidHeader("columnar: value-type row truncated"))?;
-        let value_type =
-            ValueType::try_from(vt_byte).map_err(|()| Error::InvalidTag(("ValueType", vt_byte)))?;
+        let value_type = value_type_row(&vt_col.data, i)?;
         let value = reconstruct_row_value(value_cols, batch.row_count, i)?;
         out.push(InternalValue {
             key: InternalKey {
@@ -1985,25 +1988,21 @@ pub fn column_batch_into_entries(
     validate_columnar_columns(&batch)?;
     let row_count = batch.row_count;
     let mut cols = batch.columns.into_iter();
-    let key_col = cols
-        .next()
-        .ok_or(Error::InvalidHeader("columnar: missing key column"))?;
-    let seqno_col = cols
-        .next()
-        .ok_or(Error::InvalidHeader("columnar: missing seqno column"))?;
-    let vt_col = cols
-        .next()
-        .ok_or(Error::InvalidHeader("columnar: missing value-type column"))?;
+    let (Some(key_col), Some(seqno_col), Some(vt_col)) = (cols.next(), cols.next(), cols.next())
+    else {
+        return Err(Error::InvalidHeader(
+            "columnar: missing an intrinsic column",
+        ));
+    };
     let value_cols: Vec<Column> = cols.collect();
 
     // Shared key buffer: every row's key is a view into it.
     let key_data = key_col.data;
 
     let value_source = if values_are_views(&value_cols) {
-        let single = value_cols
-            .into_iter()
-            .next()
-            .ok_or(Error::InvalidHeader("columnar: value column vanished"))?;
+        let Some(single) = value_cols.into_iter().next() else {
+            return Err(Error::InvalidHeader("columnar: value column vanished"));
+        };
         ValueSource::SharedBytes(single.data)
     } else {
         ValueSource::Reconstruct(value_cols)
@@ -2019,13 +2018,7 @@ pub fn column_batch_into_entries(
             ));
         }
         let seqno = fixed_u64_row(&seqno_col.data, i)?;
-        let vt_byte = vt_col
-            .data
-            .get(i as usize)
-            .copied()
-            .ok_or(Error::InvalidHeader("columnar: value-type row truncated"))?;
-        let value_type =
-            ValueType::try_from(vt_byte).map_err(|()| Error::InvalidTag(("ValueType", vt_byte)))?;
+        let value_type = value_type_row(&vt_col.data, i)?;
         let value = match &value_source {
             ValueSource::SharedBytes(data) => bytes_row_slice(data, row_count, i)?,
             ValueSource::Reconstruct(cols) => {
@@ -2062,24 +2055,23 @@ enum ValueSource {
 fn bytes_row_slice(data: &Slice, row_count: u32, i: u32) -> Result<Slice> {
     let bytes: &[u8] = data.as_ref();
     let off_bytes = (row_count as usize + 1) * 4;
-    let read_off = |idx: u32| -> Result<usize> {
+    let read_off = |idx: u32| {
         let base = idx as usize * 4;
-        let b = bytes
-            .get(base..base + 4)
-            .ok_or(Error::InvalidHeader("columnar: bytes offset truncated"))?;
-        let arr: [u8; 4] = b
-            .try_into()
-            .map_err(|_| Error::InvalidHeader("columnar: short bytes offset"))?;
-        Ok(u32::from_le_bytes(arr) as usize)
+        bytes
+            .get(base..)
+            .and_then(<[u8]>::first_chunk::<4>)
+            .map(|b| u32::from_le_bytes(*b) as usize)
     };
-    let start = read_off(i)?;
-    let end = read_off(i + 1)?;
-    let payload_start = off_bytes.checked_add(start).ok_or(Error::InvalidHeader(
-        "columnar: bytes payload offset overflow",
-    ))?;
-    let payload_end = off_bytes.checked_add(end).ok_or(Error::InvalidHeader(
-        "columnar: bytes payload offset overflow",
-    ))?;
+    let (Some(start), Some(end)) = (read_off(i), read_off(i + 1)) else {
+        return Err(Error::InvalidHeader("columnar: bytes offset truncated"));
+    };
+    let (Some(payload_start), Some(payload_end)) =
+        (off_bytes.checked_add(start), off_bytes.checked_add(end))
+    else {
+        return Err(Error::InvalidHeader(
+            "columnar: bytes payload offset overflow",
+        ));
+    };
     if start > end || payload_end > bytes.len() {
         return Err(Error::InvalidHeader("columnar: bytes row out of range"));
     }
@@ -2125,9 +2117,11 @@ pub fn column_batch_match_entries(
         let masked = if let Some((bitmap, start)) = deletes {
             // Fail closed on a corrupt block_start_row: an overflowing position
             // must error like the scan path, never silently expose the row.
-            let pos = start.checked_add(row).ok_or(Error::InvalidHeader(
-                "columnar: row position exceeds u32::MAX",
-            ))?;
+            let Some(pos) = start.checked_add(row) else {
+                return Err(Error::InvalidHeader(
+                    "columnar: row position exceeds u32::MAX",
+                ));
+            };
             bitmap.contains(pos)
         } else {
             false
@@ -2140,13 +2134,7 @@ pub fn column_batch_match_entries(
                 ));
             }
             let seqno = fixed_u64_row(&seqno_col.data, row)?;
-            let vt_byte = vt_col
-                .data
-                .get(row as usize)
-                .copied()
-                .ok_or(Error::InvalidHeader("columnar: value-type row truncated"))?;
-            let value_type = ValueType::try_from(vt_byte)
-                .map_err(|()| Error::InvalidTag(("ValueType", vt_byte)))?;
+            let value_type = value_type_row(&vt_col.data, row)?;
             let value = reconstruct_row_value(value_cols, row_count, row)?;
             *copied += k.len() + value.len();
             out.push(InternalValue {
@@ -2280,30 +2268,30 @@ pub fn unframe_value_cells<'a>(blob: &'a [u8], type_tags: &[TypeTag]) -> Result<
             TypeTag::Fixed(width) | TypeTag::Number(Number { width, .. }) => {
                 let end = pos
                     .checked_add(usize::from(*width))
-                    .ok_or(Error::InvalidHeader("columnar: framed value overflow"))?;
-                let cell = blob.get(pos..end).ok_or(Error::InvalidHeader(
-                    "columnar: framed value truncated (fixed)",
-                ))?;
+                    .ok_or_else(|| Error::InvalidHeader("columnar: framed value overflow"))?;
+                let cell = blob.get(pos..end).ok_or_else(|| {
+                    Error::InvalidHeader("columnar: framed value truncated (fixed)")
+                })?;
                 out.push(cell);
                 pos = end;
             }
             TypeTag::Bytes => {
                 let len_end = pos
                     .checked_add(4)
-                    .ok_or(Error::InvalidHeader("columnar: framed value overflow"))?;
-                let len_bytes = blob.get(pos..len_end).ok_or(Error::InvalidHeader(
-                    "columnar: framed value truncated (length)",
-                ))?;
-                let len = u32::from_le_bytes(
-                    <[u8; 4]>::try_from(len_bytes)
-                        .map_err(|_| Error::InvalidHeader("columnar: framed value length"))?,
-                ) as usize;
+                    .ok_or_else(|| Error::InvalidHeader("columnar: framed value overflow"))?;
+                let len_bytes = blob
+                    .get(pos..len_end)
+                    .and_then(<[u8]>::first_chunk::<4>)
+                    .ok_or_else(|| {
+                        Error::InvalidHeader("columnar: framed value truncated (length)")
+                    })?;
+                let len = u32::from_le_bytes(*len_bytes) as usize;
                 let end = len_end
                     .checked_add(len)
-                    .ok_or(Error::InvalidHeader("columnar: framed value overflow"))?;
-                let cell = blob.get(len_end..end).ok_or(Error::InvalidHeader(
-                    "columnar: framed value truncated (bytes)",
-                ))?;
+                    .ok_or_else(|| Error::InvalidHeader("columnar: framed value overflow"))?;
+                let cell = blob.get(len_end..end).ok_or_else(|| {
+                    Error::InvalidHeader("columnar: framed value truncated (bytes)")
+                })?;
                 out.push(cell);
                 pos = end;
             }
@@ -2359,9 +2347,9 @@ pub fn frame_value_cells_nullable(cells: &[(TypeTag, Option<&[u8]>)]) -> Result<
         // `i / 8 < bitmap_len` always. Fail loudly rather than silently skip the
         // bit if a future refactor ever breaks that invariant: a clear bit on a
         // present cell would desync the bitmap from the appended body below.
-        let byte = out.get_mut(i / 8).ok_or(Error::InvalidHeader(
-            "columnar: presence bitmap index out of range",
-        ))?;
+        let byte = out
+            .get_mut(i / 8)
+            .ok_or_else(|| Error::InvalidHeader("columnar: presence bitmap index out of range"))?;
         *byte |= 1u8 << (i % 8);
         match tag {
             TypeTag::Fixed(width) | TypeTag::Number(Number { width, .. }) => {
@@ -2399,9 +2387,9 @@ pub fn unframe_value_cells_nullable<'a>(
     type_tags: &[TypeTag],
 ) -> Result<Vec<Option<&'a [u8]>>> {
     let bitmap_len = type_tags.len().div_ceil(8);
-    let bitmap = blob.get(0..bitmap_len).ok_or(Error::InvalidHeader(
-        "columnar: nullable framed value truncated (presence bitmap)",
-    ))?;
+    let bitmap = blob.get(0..bitmap_len).ok_or_else(|| {
+        Error::InvalidHeader("columnar: nullable framed value truncated (presence bitmap)")
+    })?;
     let mut pos = bitmap_len;
     let mut out = Vec::with_capacity(type_tags.len());
     for (i, tag) in type_tags.iter().enumerate() {
@@ -2414,30 +2402,30 @@ pub fn unframe_value_cells_nullable<'a>(
             TypeTag::Fixed(width) | TypeTag::Number(Number { width, .. }) => {
                 let end = pos
                     .checked_add(usize::from(*width))
-                    .ok_or(Error::InvalidHeader("columnar: framed value overflow"))?;
-                let cell = blob.get(pos..end).ok_or(Error::InvalidHeader(
-                    "columnar: nullable framed value truncated (fixed)",
-                ))?;
+                    .ok_or_else(|| Error::InvalidHeader("columnar: framed value overflow"))?;
+                let cell = blob.get(pos..end).ok_or_else(|| {
+                    Error::InvalidHeader("columnar: nullable framed value truncated (fixed)")
+                })?;
                 out.push(Some(cell));
                 pos = end;
             }
             TypeTag::Bytes => {
                 let len_end = pos
                     .checked_add(4)
-                    .ok_or(Error::InvalidHeader("columnar: framed value overflow"))?;
-                let len_bytes = blob.get(pos..len_end).ok_or(Error::InvalidHeader(
-                    "columnar: nullable framed value truncated (length)",
-                ))?;
-                let len = u32::from_le_bytes(
-                    <[u8; 4]>::try_from(len_bytes)
-                        .map_err(|_| Error::InvalidHeader("columnar: framed value length"))?,
-                ) as usize;
+                    .ok_or_else(|| Error::InvalidHeader("columnar: framed value overflow"))?;
+                let len_bytes = blob
+                    .get(pos..len_end)
+                    .and_then(<[u8]>::first_chunk::<4>)
+                    .ok_or_else(|| {
+                        Error::InvalidHeader("columnar: nullable framed value truncated (length)")
+                    })?;
+                let len = u32::from_le_bytes(*len_bytes) as usize;
                 let end = len_end
                     .checked_add(len)
-                    .ok_or(Error::InvalidHeader("columnar: framed value overflow"))?;
-                let cell = blob.get(len_end..end).ok_or(Error::InvalidHeader(
-                    "columnar: nullable framed value truncated (bytes)",
-                ))?;
+                    .ok_or_else(|| Error::InvalidHeader("columnar: framed value overflow"))?;
+                let cell = blob.get(len_end..end).ok_or_else(|| {
+                    Error::InvalidHeader("columnar: nullable framed value truncated (bytes)")
+                })?;
                 out.push(Some(cell));
                 pos = end;
             }
@@ -2498,11 +2486,11 @@ pub fn unframe_value_cells_with_defaults<'a>(
 /// nullable and the row's presence bit is clear.
 fn column_value_cell(col: &Column, row_count: u32, row: u32) -> Result<Option<&[u8]>> {
     if let Some(validity) = &col.validity {
-        let byte = *validity
-            .get((row / 8) as usize)
-            .ok_or(Error::InvalidHeader(
+        let Some(&byte) = validity.get((row / 8) as usize) else {
+            return Err(Error::InvalidHeader(
                 "columnar: validity bitmap shorter than row count",
-            ))?;
+            ));
+        };
         if (byte >> (row % 8)) & 1 == 0 {
             return Ok(None); // null row
         }
