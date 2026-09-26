@@ -566,6 +566,114 @@ fn columnar_ingest_rotates_the_rowgroup_at_the_size_threshold() -> lsm_tree::Res
     Ok(())
 }
 
+/// Opens a columnar tree cutting row groups at `group` and row pages at `page`
+/// bytes.
+fn columnar_tree(folder: &std::path::Path, group: u32, page: u32) -> lsm_tree::Result<AnyTree> {
+    use lsm_tree::config::BlockSizePolicy;
+
+    let any = Config::new(
+        folder,
+        SequenceNumberCounter::default(),
+        SequenceNumberCounter::default(),
+    )
+    .columnar_row_group_size_policy(BlockSizePolicy::all(group))
+    .columnar_page_size_policy(BlockSizePolicy::all(page))
+    .open()?;
+    let AnyTree::Standard(tree) = &any else {
+        panic!("expected standard tree");
+    };
+    tree.update_runtime_config(|cfg| cfg.columnar = true)
+        .expect("enable columnar");
+    Ok(any)
+}
+
+/// Rows in each unit a key-only scan of `any`'s one table returns: a row page
+/// of each group, in row order.
+fn rows_per_page(any: &AnyTree) -> lsm_tree::Result<Vec<u32>> {
+    let AnyTree::Standard(tree) = any else {
+        panic!("expected standard tree");
+    };
+    let version = tree.current_version();
+    let table = version.iter_tables().next().expect("one table");
+    Ok(table
+        .columnar_scan(&[lsm_tree::table::columnar::COL_USER_KEY], None)?
+        .iter()
+        .map(|b| b.row_count)
+        .collect())
+}
+
+/// Row `i` of the size-cut fixtures: a 5-byte key and a `value_len`-byte
+/// value, so a 4 KiB target is reached 13 or 14 rows in and where it is cut
+/// shows.
+fn sized_row(i: u32, value_len: usize) -> InternalValue {
+    InternalValue::from_components(
+        format!("k{i:04}").into_bytes(),
+        vec![b'v'; value_len],
+        0,
+        ValueType::Value,
+    )
+}
+
+/// A row group and a row page cut at the same size hold the same rows, however
+/// the rows arrive: a group of a stream of one-row batches is counted row by
+/// row, as its row pages are, not as the batches' column bytes, which carry
+/// one offset per `Bytes` column more than the batch has rows; and a group of
+/// flushed entries counts every column's share of a row, not the key and value
+/// alone. A group of 4 KiB and a 4 KiB row page of a larger group otherwise
+/// hold different rows, and every figure compared across the two sizes
+/// compares different amounts of data.
+#[test]
+fn a_row_group_and_a_row_page_of_one_size_hold_the_same_rows() -> lsm_tree::Result<()> {
+    const ROWS: u32 = 200;
+
+    // A row of these adds 312 bytes across its columns and 320 to a one-row
+    // batch's column bytes: 13 rows reach 4 KiB counted the second way and
+    // not the first.
+    let ingested = |group: u32, page: u32| -> lsm_tree::Result<Vec<u32>> {
+        let folder = get_tmp_folder();
+        let any = columnar_tree(folder.path(), group, page)?;
+        let mut ingest = any.ingestion()?;
+        for i in 0..ROWS {
+            ingest.write_columnar_batch(&entries_to_column_batch(&[sized_row(i, 290)])?)?;
+        }
+        ingest.finish()?;
+        rows_per_page(&any)
+    };
+    let small_groups = ingested(4_096, 4_096)?;
+    let row_pages = ingested(64 * 1_024, 4_096)?;
+    assert!(
+        row_pages.len() > 2,
+        "the large group holds several row pages"
+    );
+    assert_eq!(
+        small_groups.first(),
+        row_pages.first(),
+        "ingested: a 4 KiB group holds the rows a 4 KiB row page holds",
+    );
+
+    // A row of these adds 322 bytes across its columns and 305 as its key and
+    // value alone: 13 rows reach 4 KiB counted the first way and not the
+    // second.
+    let flushed = |group: u32, page: u32| -> lsm_tree::Result<Vec<u32>> {
+        let folder = get_tmp_folder();
+        let any = columnar_tree(folder.path(), group, page)?;
+        for i in 0..ROWS {
+            let row = sized_row(i, 300);
+            any.insert(row.key.user_key, row.value, u64::from(i));
+        }
+        any.flush_active_memtable(0)?;
+        rows_per_page(&any)
+    };
+    let small_groups = flushed(4_096, 4_096)?;
+    let row_pages = flushed(64 * 1_024, 4_096)?;
+    assert_eq!(
+        small_groups.first(),
+        row_pages.first(),
+        "flushed: a 4 KiB group holds the rows a 4 KiB row page holds",
+    );
+    Ok(())
+}
+
 #[test]
 fn columnar_ingest_round_trips_a_nullable_value_subcolumn() -> lsm_tree::Result<()> {
     // A value sub-column may be absent for some rows (a sparse field). Ingest a

@@ -901,12 +901,7 @@ impl ColumnBatch {
         let mut rows_in_page = 0u32;
         let mut bytes_in_page = 0u64;
         for row in 0..self.row_count {
-            for col in &self.columns {
-                bytes_in_page += match col.type_tag.fixed_width() {
-                    Some(w) => u64::from(w),
-                    None => bytes_column_row(&col.data, self.row_count, row)?.len() as u64 + 4,
-                };
-            }
+            bytes_in_page += self.row_bytes(row)?;
             rows_in_page += 1;
             if bytes_in_page >= u64::from(page_size) {
                 cuts.push(rows_in_page);
@@ -918,6 +913,37 @@ impl ColumnBatch {
             cuts.push(rows_in_page);
         }
         Ok(cuts)
+    }
+
+    /// The bytes row `row` adds across every column: a fixed column's width, a
+    /// `Bytes` cell's length plus its offset. The one measure row pages and
+    /// row groups are both cut by, so a page size and a group size of the same
+    /// bytes hold the same rows.
+    ///
+    /// # Errors
+    ///
+    /// Returns [`Error::InvalidHeader`] when a `Bytes` column is malformed for
+    /// the batch's rows.
+    fn row_bytes(&self, row: u32) -> Result<u64> {
+        let mut bytes = 0u64;
+        for col in &self.columns {
+            bytes += match col.type_tag.fixed_width() {
+                Some(w) => u64::from(w),
+                None => bytes_column_row(&col.data, self.row_count, row)?.len() as u64 + 4,
+            };
+        }
+        Ok(bytes)
+    }
+
+    /// The bytes every row adds across every column ([`Self::row_bytes`]
+    /// summed): what a row group accumulating this batch counts toward its
+    /// size.
+    ///
+    /// # Errors
+    ///
+    /// As [`Self::row_bytes`].
+    pub(crate) fn rows_bytes(&self) -> Result<u64> {
+        (0..self.row_count).try_fold(0u64, |sum, row| Ok(sum + self.row_bytes(row)?))
     }
 
     /// The first row's user key, or `None` for an empty batch. Reads only the
@@ -1668,6 +1694,17 @@ pub(crate) fn fixed_u64_row(data: &[u8], i: u32) -> Result<u64> {
         .try_into()
         .map_err(|_| Error::InvalidHeader("columnar: short fixed8 row"))?;
     Ok(u64::from_le_bytes(arr))
+}
+
+/// The bytes an entry with a `key_len`-byte user key and a `value_len`-byte
+/// value adds across the columns [`entries_to_column_batch`] lays it out in,
+/// counted as [`ColumnBatch::row_page_cuts`] counts a row: the key's and the
+/// value's lengths plus an offset each, the 8-byte seqno and the 1-byte value
+/// type. A writer cuts a row group of entries by it, so its groups and their
+/// row pages agree on what a size means.
+#[must_use]
+pub(crate) const fn entry_row_bytes(key_len: usize, value_len: usize) -> usize {
+    key_len + 4 + 8 + 1 + value_len + 4
 }
 
 /// Transposes a run of entries into the engine's intrinsic columnar layout: one

@@ -1348,7 +1348,7 @@ impl Writer {
         // on the next entry); every other entry leaves no handle behind.
         let weak_tombstone_key = (value_type == ValueType::WeakTombstone).then(|| user_key.clone());
 
-        self.chunk_size += user_key_len + value_len;
+        self.chunk_size += self.entry_size(user_key_len, value_len);
         self.chunk.push(item);
         self.previous_type = Some(value_type);
         self.previous_weak_tombstone_key = weak_tombstone_key;
@@ -1378,6 +1378,25 @@ impl Writer {
 
     /// Writes a compressed block to disk.
     ///
+    /// What an entry of a `key_len`-byte key and a `value_len`-byte value
+    /// counts toward the block or row group it is written into. A row group
+    /// counts it as its row pages do, every column's share of the row, so a
+    /// group size and a page size of the same bytes hold the same rows.
+    #[cfg_attr(
+        not(feature = "columnar"),
+        expect(
+            clippy::unused_self,
+            reason = "only a columnar writer counts differently"
+        )
+    )]
+    fn entry_size(&self, key_len: usize, value_len: usize) -> usize {
+        #[cfg(feature = "columnar")]
+        if self.use_columnar {
+            return crate::table::columnar::entry_row_bytes(key_len, value_len);
+        }
+        key_len + value_len
+    }
+
     /// This is triggered when a `Writer::write` causes the buffer to grow to the configured `block_size`.
     ///
     /// Should only be called when the block has items in it.
@@ -1606,9 +1625,9 @@ impl Writer {
         // changes, because pages are found by `(column_id, part, row_page)`
         // and never by position.
         // A page size at or above the group size is one row page per group:
-        // the group is cut by the writer's own size count, the pages by the
-        // bytes the rows carry, and a group the last row took past its size
-        // must not grow a sliver of a page for that one row.
+        // groups and pages are cut by the same count of the bytes each row
+        // adds, and a group that a batch took past its size (ingestion cuts
+        // after a whole batch) must not grow a sliver of a page for its tail.
         let row_pages = if self.columnar_page_size >= self.row_group_size {
             alloc::vec![batch.row_count]
         } else {

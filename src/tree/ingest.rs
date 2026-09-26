@@ -48,8 +48,10 @@ pub struct Ingestion<'a> {
 #[cfg(feature = "columnar")]
 struct PendingRowGroup {
     batches: Vec<crate::table::columnar::ColumnBatch>,
-    /// The batches' uncompressed size between them.
-    data_size: usize,
+    /// The bytes the batches' rows add between them, counted as the group's
+    /// row pages count them, so the group is cut where one batch of all its
+    /// rows would be.
+    rows_bytes: u64,
 }
 
 impl<'a> Ingestion<'a> {
@@ -389,6 +391,10 @@ impl<'a> Ingestion<'a> {
         // emitted lazily, once the rowgroup reaches the target data-block size
         // (below) or at `finish`, so a stream of small batches becomes a few
         // large columnar blocks instead of one block per call.
+        // Counted per row rather than as the batch's column bytes: those carry
+        // one offset more per `Bytes` column than the batch has rows, which a
+        // stream of small batches would add up into groups cut short.
+        let rows_bytes = batch.rows_bytes()?;
         match &mut self.pending_columnar {
             Some(pending)
                 if pending
@@ -396,14 +402,14 @@ impl<'a> Ingestion<'a> {
                     .first()
                     .is_some_and(|first| first.same_layout(batch)) =>
             {
-                pending.data_size += batch.data_size();
+                pending.rows_bytes += rows_bytes;
                 pending.batches.push(batch.clone());
             }
             _ => {
                 self.flush_pending_columnar()?;
                 self.pending_columnar = Some(PendingRowGroup {
                     batches: alloc::vec![batch.clone()],
-                    data_size: batch.data_size(),
+                    rows_bytes,
                 });
             }
         }
@@ -413,15 +419,16 @@ impl<'a> Ingestion<'a> {
         if let Some(last) = batch.last_user_key()? {
             self.last_key = Some(crate::UserKey::from(last));
         }
-        let target = self
-            .tree
-            .config
-            .columnar_row_group_size_policy
-            .get(INITIAL_CANONICAL_LEVEL) as usize;
+        let target = u64::from(
+            self.tree
+                .config
+                .columnar_row_group_size_policy
+                .get(INITIAL_CANONICAL_LEVEL),
+        );
         if self
             .pending_columnar
             .as_ref()
-            .is_some_and(|p| p.data_size >= target)
+            .is_some_and(|p| p.rows_bytes >= target)
         {
             self.flush_pending_columnar()?;
         }
@@ -434,14 +441,14 @@ impl<'a> Ingestion<'a> {
     #[cfg(feature = "columnar")]
     fn flush_pending_columnar(&mut self) -> crate::Result<()> {
         if let Some(pending) = self.pending_columnar.take() {
-            let data_size = pending.data_size;
+            let rows_bytes = pending.rows_bytes;
             let batch = crate::table::columnar::ColumnBatch::concat(pending.batches)?;
             // Restore the pending rowgroup if the write fails, so the buffered
             // rows are not silently dropped from ingestion state.
             if let Err(e) = self.writer.write_columnar_batch(&batch) {
                 self.pending_columnar = Some(PendingRowGroup {
                     batches: alloc::vec![batch],
-                    data_size,
+                    rows_bytes,
                 });
                 return Err(e);
             }
