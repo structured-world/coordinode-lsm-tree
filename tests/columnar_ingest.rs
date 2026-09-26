@@ -674,6 +674,30 @@ fn a_row_group_and_a_row_page_of_one_size_hold_the_same_rows() -> lsm_tree::Resu
     Ok(())
 }
 
+/// One ingested batch far past the group size is one group, and is still cut
+/// into row pages of the page size, even with the page size equal to the group
+/// size: a read of a few rows then decodes a page, not the batch.
+#[test]
+fn one_oversized_batch_is_cut_into_row_pages_of_the_page_size() -> lsm_tree::Result<()> {
+    let folder = get_tmp_folder();
+    let any = columnar_tree(folder.path(), 4_096, 4_096)?;
+    let mut ingest = any.ingestion()?;
+    // 312 bytes a row: 14 rows reach 4 KiB, and 200 rows are 14 full pages
+    // and a tail of 4 rows.
+    let rows: Vec<_> = (0..200).map(|i| sized_row(i, 290)).collect();
+    ingest.write_columnar_batch(&entries_to_column_batch(&rows)?)?;
+    ingest.finish()?;
+
+    let mut expected = vec![14; 14];
+    expected.push(4);
+    assert_eq!(
+        rows_per_page(&any)?,
+        expected,
+        "pages of the page size, then the tail"
+    );
+    Ok(())
+}
+
 #[test]
 fn columnar_ingest_round_trips_a_nullable_value_subcolumn() -> lsm_tree::Result<()> {
     // A value sub-column may be absent for some rows (a sparse field). Ingest a

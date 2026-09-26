@@ -3904,6 +3904,63 @@ fn verify_rejects_row_page_zones_that_disagree_with_their_rows() -> crate::Resul
     Ok(())
 }
 
+/// The compaction scan decodes every zone block of a group it streams against
+/// the group's directory, as an indexed read does, so a checksum-consistent
+/// zone block naming another group is refused rather than rewritten with fresh
+/// statistics: the key column's in the head block and the value column's
+/// after the pages.
+#[cfg(feature = "columnar")]
+#[test]
+fn a_scan_refuses_a_zone_block_that_does_not_decode_against_its_directory() -> crate::Result<()> {
+    use crate::table::columnar::{COL_USER_KEY, COL_VALUE};
+
+    let dir = tempdir()?;
+    let fs: Arc<dyn Fs> = Arc::new(StdFs);
+
+    for (name, column_id) in [("key_zones", COL_USER_KEY), ("value_zones", COL_VALUE)] {
+        let source = dir.path().join(name);
+        zoned_source(&source, &fs)?;
+        let honest = open(source.clone(), &fs)?.scan()?.count();
+        assert!(honest > 0, "{name}: the honest table scans");
+        let (group_at, directory) = row_group(&source, &fs, 0)?;
+        let mut bytes = std::fs::read(&source)?;
+        let directory_len = {
+            use crate::coding::Decode;
+            let Some(frame) = bytes.get(group_at..) else {
+                panic!("group within the file");
+            };
+            crate::table::block::Header::decode_from(&mut &frame[..])?.on_disk_size_with(None)
+        };
+        let Some((after_directory, _)) = directory.zone_block(column_id) else {
+            panic!("column {column_id} has a zone block");
+        };
+        let zones_at = group_at + directory_len as usize + after_directory as usize;
+        let zones = directory.decode_zone_block(column_id, &block_payload(&bytes, zones_at)?)?;
+        let mut payload = Vec::new();
+        crate::table::column_page::PageDirectory::encode_zone_block(
+            directory.group_tag() + 1,
+            &zones,
+            &mut payload,
+        );
+        restamp_block(&mut bytes, zones_at, &payload)?;
+        std::fs::write(&source, &bytes)?;
+
+        // The scanner reads its first group as it is made, so the refusal
+        // comes from making it or from the iteration.
+        let Err(err) = open(source, &fs)?
+            .scan()
+            .and_then(Iterator::collect::<crate::Result<Vec<_>>>)
+        else {
+            panic!("{name}: a zone block of another group must be refused");
+        };
+        assert!(
+            matches!(err, crate::Error::InvalidHeader(_)),
+            "{name}: expected a framing refusal, got {err:?}",
+        );
+    }
+    Ok(())
+}
+
 /// A salvaged COLUMNAR table must keep its per-column zone-map statistics. The
 /// clean-block verbatim copy-through re-emits columnar blocks byte-for-byte via
 /// `append_verbatim_data_block`; if that path recorded the row-block synthetic

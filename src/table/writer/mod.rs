@@ -1624,13 +1624,15 @@ impl Writer {
         // names several gets its pages per part here, and nothing downstream
         // changes, because pages are found by `(column_id, part, row_page)`
         // and never by position.
-        // A page size at or above the group size is one row page per group:
-        // groups and pages are cut by the same count of the bytes each row
-        // adds, and a group that a batch took past its size (ingestion cuts
-        // after a whole batch) must not grow a sliver of a page for its tail.
-        let row_pages = if self.columnar_page_size >= self.row_group_size {
-            alloc::vec![batch.row_count]
-        } else {
+        // Pages are cut by the page size whatever the group size: a group an
+        // ingested batch took far past its size (ingestion cuts after a whole
+        // batch) still reads a page at a time. Groups and pages are cut by the
+        // same count of the bytes each row adds, so a group the writer closed
+        // at its size is one page when the page size is the group size. A
+        // short tail page is kept rather than folded into the page before it:
+        // folding costs the sparse scan more, since the enlarged page is read
+        // whole whenever a match lands on it.
+        let row_pages = {
             let cuts = batch.row_page_cuts(self.columnar_page_size)?;
             // The directory counts the group's column pages in a `u16`, so a
             // page size that gives more row pages than it can list merges

@@ -347,7 +347,7 @@ impl Scanner {
         // misframed: the head one between the directory and the pages, the
         // others after the pages.
         if let Some(head) = directory.head_zone_block() {
-            Self::skip_zone_block(reader, table_id, encryption, ecc, head.length)?;
+            Self::check_zone_block(reader, table_id, encryption, ecc, &directory, head)?;
         }
         let mut pages = Vec::with_capacity(directory.entries().len());
         for entry in directory.entries() {
@@ -374,8 +374,8 @@ impl Scanner {
             }
             pages.push(page);
         }
-        for zone_block in directory.zone_blocks() {
-            Self::skip_zone_block(reader, table_id, encryption, ecc, zone_block.length)?;
+        for &zone_block in directory.zone_blocks() {
+            Self::check_zone_block(reader, table_id, encryption, ecc, &directory, zone_block)?;
         }
         // The scanner feeds compaction, which is maintenance and outside the
         // read counters, so neither the page copies nor the rebuilt values are
@@ -386,15 +386,19 @@ impl Scanner {
         DataBlock::from_column_batch(pages.batches, restart_interval, &mut 0)
     }
 
-    /// Reads the next block as a zone block of `length` on-disk bytes and
-    /// verifies it, without decoding its zones.
+    /// Reads the next block as the zone block `block` names and verifies it,
+    /// then decodes it against `directory` as an indexed read does: a scan has
+    /// no use for the zones, but one that took a zone block of another group
+    /// or column for this one would rewrite the group with statistics that
+    /// hide the damage.
     #[cfg(feature = "columnar")]
-    fn skip_zone_block(
+    fn check_zone_block(
         reader: &mut BlockStream,
         table_id: crate::TableId,
         encryption: Option<&dyn EncryptionProvider>,
         ecc: Option<crate::table::block::EccParams>,
-        length: u32,
+        directory: &crate::table::column_page::PageDirectory,
+        block: crate::table::column_page::ZoneBlock,
     ) -> crate::Result<()> {
         let zones = Self::read_block(
             reader,
@@ -412,11 +416,12 @@ impl Scanner {
                 zones.header.block_type.into(),
             )));
         }
-        if zones.header.on_disk_size_with(ecc) != length {
+        if zones.header.on_disk_size_with(ecc) != block.length {
             return Err(crate::Error::InvalidHeader(
                 "columnar: zone block length disagrees with its directory",
             ));
         }
+        directory.decode_zone_block(block.column_id, &zones.data)?;
         Ok(())
     }
 
