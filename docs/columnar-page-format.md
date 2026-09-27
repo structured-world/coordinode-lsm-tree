@@ -345,17 +345,19 @@ is told apart from the saving on the values.
 
 Plain is the default because a read that wants a column whole has to build
 an encoded page back into the layout, while it serves a plain page as a view.
-`db_bench --benchmark mixed-layout --num 70000`, two interleaved runs of five
-iterations each on one x86 Linux host, medians, the tables on tmpfs:
+`db_bench --benchmark mixed-layout --num 70000 --column-encoding plain|auto`,
+interleaved runs of five iterations each on one x86 Linux host (three with the
+default cache, two with none), medians, the tables on tmpfs:
 
 | | point reads | near-full scan | near-full scan, no cache |
 |---|---|---|---|
-| plain | 357 ms, 215 B read per row | 57.5 ms, 340 B | 48.4 ms |
-| auto | 368 ms, 203 B read per row | 61.1 ms, 331 B | 54.0 ms |
+| plain | 343 ms, 215 B read per row | 56.8 ms, 340 B | 49.3 ms |
+| auto | 351 ms, 203 B read per row | 60.4 ms, 331 B | 52.8 ms |
 
 On these records only the engine's own columns encode (keys by their lengths,
 seqnos by their ordinals, the value type as a constant): 3-6% fewer bytes for
-3-12% more time, since the read builds every one of them back. That trade
+2-7% more time, since the read builds every one of them back. Point reads
+with no cache take the same time under both, about 1.53 s. That trade
 pays where bytes cost more than the build, on a level whose tables are
 mostly stored rather than read, as a stronger compression does there, and on
 typed value columns whose values encode far below their layout.
