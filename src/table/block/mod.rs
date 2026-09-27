@@ -121,7 +121,9 @@ pub(crate) fn framed_len_bound(
 }
 
 /// Heap bytes writing such a block allocates beside its payload, bounded from
-/// above: nothing when it is written as is, else the transformed frame.
+/// above: nothing when it is written as is, else the transformed frame. A
+/// block both compressed and encrypted is sealed from the compressor's buffer
+/// into a new one, so the compressed bytes are live besides the frame.
 pub(crate) fn transform_scratch_bound(
     payload: u64,
     block_type: BlockType,
@@ -129,11 +131,17 @@ pub(crate) fn transform_scratch_bound(
     encryption: Option<&dyn crate::encryption::EncryptionProvider>,
     ecc: Option<EccParams>,
 ) -> u64 {
-    if compression == crate::CompressionType::None && encryption.is_none() && ecc.is_none() {
-        0
-    } else {
-        framed_len_bound(payload, block_type, compression, encryption, ecc)
+    let compressed = compression != crate::CompressionType::None;
+    if !compressed && encryption.is_none() && ecc.is_none() {
+        return 0;
     }
+    let sealed_from = if compressed && encryption.is_some() {
+        // A payload held in memory fits `usize`; the widening back is lossless.
+        usize::try_from(payload).map_or(payload, |len| compression.compressed_len_bound(len) as u64)
+    } else {
+        0
+    };
+    framed_len_bound(payload, block_type, compression, encryption, ecc) + sealed_from
 }
 
 /// Refuses an on-disk block size no block written under `encryption` and

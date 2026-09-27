@@ -137,7 +137,9 @@ impl<W: crate::io::Write + crate::io::Seek> FilterWriter<W> for FullFilterWriter
     }
 
     fn held_bytes(&self) -> u64 {
-        (self.bloom_hash_buffer.capacity() * core::mem::size_of::<u64>()) as u64
+        // The previous key's prefix hashes stay allocated until `finish`.
+        ((self.bloom_hash_buffer.capacity() + self.previous_prefixes.capacity())
+            * core::mem::size_of::<u64>()) as u64
     }
 
     fn finish_scratch_bytes(&self) -> u64 {
