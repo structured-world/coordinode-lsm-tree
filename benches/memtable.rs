@@ -258,8 +258,46 @@ fn memtable_highest_seqno(c: &mut Criterion) {
     });
 }
 
+/// Filling a fresh memtable with `n` entries of a 100-byte value: a small
+/// memtable stays in the arena's first block, a large one takes many, so both
+/// the start (with its block allocation) and the steady state are timed.
+/// This measures throughput; per-insert tails come from db_bench's write
+/// workloads, since timing each insert of a few hundred nanoseconds here would
+/// report the timer's own cost.
+fn memtable_insert(c: &mut Criterion) {
+    let mut group = c.benchmark_group("memtable insert");
+    for n in [1_000usize, 100_000, 1_000_000] {
+        let entries: Vec<InternalValue> = (0..n)
+            .map(|i| {
+                InternalValue::from_components(
+                    format!("key{i:010}").as_bytes(),
+                    vec![7u8; 100],
+                    0,
+                    lsm_tree::ValueType::Value,
+                )
+            })
+            .collect();
+        group.throughput(criterion::Throughput::Elements(n as u64));
+        group.bench_function(criterion::BenchmarkId::from_parameter(n), |b| {
+            // By reference, so the filled memtable is dropped outside the
+            // timed routine whatever the batch size.
+            b.iter_batched_ref(
+                || Memtable::new(0, default_cmp()),
+                |memtable| {
+                    for entry in &entries {
+                        memtable.insert(entry.clone());
+                    }
+                },
+                criterion::BatchSize::PerIteration,
+            );
+        });
+    }
+    group.finish();
+}
+
 criterion_group!(
     benches,
+    memtable_insert,
     memtable_get_hit,
     memtable_get_snapshot,
     memtable_get_miss,
