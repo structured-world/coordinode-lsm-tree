@@ -558,6 +558,29 @@ fn the_size_hint_before_finish_is_close_to_the_finished_table() -> crate::Result
     Ok(())
 }
 
+/// A table rotates on the estimates as they stand after its last block, so
+/// they must already count that block's index entry and section entries:
+/// recomputing them changes nothing.
+#[test]
+fn the_estimates_count_the_block_just_written() -> crate::Result<()> {
+    for layout in [
+        StateLayout::Full,
+        StateLayout::Partitioned,
+        StateLayout::Locator,
+    ] {
+        let dir = tempfile::tempdir()?;
+        let mut writer = state_writer(dir.path().join("1"), layout)?
+            .use_zone_map(true)
+            .use_seqno_in_index(true);
+        write_keys(&mut writer, 1_000, 8)?;
+        let (held, hint) = (writer.held_state_bytes(), writer.output_size_hint());
+        writer.refresh_state_estimates();
+        assert_eq!(held, writer.held_state_bytes(), "{layout:?}: held state");
+        assert_eq!(hint, writer.output_size_hint(), "{layout:?}: size hint");
+    }
+    Ok(())
+}
+
 /// The state a table holds for `finish` grows with its keys, not with its
 /// bytes: the same keys with values a hundred times larger hold about the same
 /// state, while their rows are twenty times larger. Only the index grows with the data,

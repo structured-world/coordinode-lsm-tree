@@ -325,7 +325,12 @@ impl<W: crate::io::Write + crate::io::Seek> FilterWriter<W> for PartitionedFilte
     fn held_bytes(&self) -> u64 {
         // The built partitions stay buffered until `finish` writes them.
         let hashes = self.bloom_hash_buffer.capacity() * core::mem::size_of::<u64>();
-        (self.final_filter_buffer.capacity() + hashes + self.tli_bytes) as u64
+        let tli = super::super::handles_held(
+            self.tli_bytes,
+            &self.tli_handles,
+            self.tli_handles.capacity(),
+        );
+        (self.final_filter_buffer.capacity() + hashes + tli) as u64
     }
 
     fn finish_scratch_bytes(&self) -> u64 {

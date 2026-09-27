@@ -43,7 +43,11 @@ fn an_unspilled_index_counts_its_encoding_twice_in_the_output() -> crate::Result
     let held = BlockIndexWriter::held_bytes(&writer);
     let scratch = BlockIndexWriter::finish_scratch_bytes(&writer);
     let output = BlockIndexWriter::finish_output_bytes(&writer);
-    assert_eq!(held, writer.buffered_bytes);
+    // 100 handles in a buffer grown to 128 slots.
+    assert_eq!(
+        held,
+        writer.buffered_bytes + 28 * core::mem::size_of::<KeyedBlockHandle>() as u64,
+    );
     assert_eq!(output, 2 * scratch);
     // 32-byte keys, each encoded with a handful of varints and a restart
     // pointer: under the in-memory entry, above the key alone.

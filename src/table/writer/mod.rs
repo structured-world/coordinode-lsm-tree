@@ -58,6 +58,12 @@ struct HandleMeta {
     zone_block_min: Option<UserKey>,
 }
 
+/// Heap bytes a vector of handles holds: `logical`, its entries and their
+/// end keys, plus the slots its allocation reserves past its `len` entries.
+fn handles_held(logical: usize, handles: &[KeyedBlockHandle], capacity: usize) -> usize {
+    logical + (capacity - handles.len()) * core::mem::size_of::<KeyedBlockHandle>()
+}
+
 /// The [`Writer::register_written_block`] inputs computed once by
 /// [`Writer::account_direct_block`] and shared by the columnar-ingest block path
 /// and the verbatim copy-through salvage path.
@@ -246,9 +252,8 @@ pub struct Writer {
     held_state_bytes: u64,
     finish_metadata_bytes: u64,
 
-    /// Heap bytes the per-block sections (`block_layouts`,
-    /// `seqno_bounds_section`, `zone_map_section`) hold, kept as their
-    /// entries are pushed.
+    /// Heap bytes the entries of the per-block sections (`block_layouts`,
+    /// `zone_map_section`) own beyond their slots, kept as they are pushed.
     section_bytes: u64,
 
     initial_level: u8,
@@ -658,9 +663,10 @@ impl Writer {
         self.held_state_bytes
     }
 
-    /// A data block was written: advances the locator ordinal and refreshes
-    /// the held-state and finish-metadata estimates the table rotates on.
-    fn block_written(&mut self) {
+    /// The keys of the forming block are all recorded: the next key belongs to
+    /// the next locator ordinal. Called where a block is cut, which on the
+    /// parallel path is before the block is written and registered.
+    fn locator_block_done(&mut self) {
         if let Some(spec) = self.locator {
             // Positions only grow within a block, so the block's last key
             // carries its largest slot.
@@ -682,11 +688,11 @@ impl Writer {
                 );
                 self.locator = None;
                 self.locators = Vec::new();
+                self.refresh_state_estimates();
             } else {
                 self.locator_block_id += 1;
             }
         }
-        self.refresh_state_estimates();
     }
 
     /// Refreshes the held-state and finish-metadata estimates.
@@ -704,8 +710,16 @@ impl Writer {
         let index_scratch = self.index_writer.finish_scratch_bytes();
         let filter_held = self.filter_writer.held_bytes();
         let filter_scratch = self.filter_writer.finish_scratch_bytes();
-        let sections =
-            self.section_bytes + self.delete_bitmap.len() * core::mem::size_of::<u32>() as u64;
+        // Each section's slots, by its allocation, and what its entries own.
+        let sections = (self.block_layouts.capacity()
+            * core::mem::size_of::<(BlockOffset, Vec<u32>)>()
+            + self.seqno_bounds_section.capacity()
+                * core::mem::size_of::<(BlockOffset, (u64, u64))>()
+            + self.zone_map_section.capacity()
+                * core::mem::size_of::<(BlockOffset, Vec<crate::table::zone_map::ColumnStats>)>())
+            as u64
+            + self.section_bytes
+            + self.delete_bitmap.len() * core::mem::size_of::<u32>() as u64;
 
         let mut metadata = self.filter_writer.finish_output_bytes()
             + self.index_writer.finish_output_bytes()
@@ -1541,7 +1555,7 @@ impl Writer {
         // `locator_block_id`, so the next block's keys belong to the next
         // ordinal. Done here (not per write path) so it stays correct for both
         // the serial and parallel spills.
-        self.block_written();
+        self.locator_block_done();
         // Per-block seqno bounds let a seqno-scoped scan skip this whole block
         // when its `max` is below the target: one fold over entries in hand.
         let seqno_bounds = self.use_seqno_in_index.then(|| {
@@ -2168,7 +2182,7 @@ impl Writer {
         // This block's keys were recorded with the current locator ordinal;
         // advance it so a following batch's keys belong to the next block (the
         // chunk-based path does this in `spill_block`).
-        self.block_written();
+        self.locator_block_done();
         Ok(Some(inputs.last_key))
     }
 
@@ -2276,9 +2290,7 @@ impl Writer {
         // multi-inner-block data blocks carry a non-empty layout, so single
         // (default 4 KiB) blocks add nothing.
         if !layout.is_empty() {
-            self.section_bytes += (core::mem::size_of::<(BlockOffset, Vec<u32>)>()
-                + layout.capacity() * core::mem::size_of::<u32>())
-                as u64;
+            self.section_bytes += (layout.capacity() * core::mem::size_of::<u32>()) as u64;
             self.block_layouts.push((self.meta.file_pos, layout));
         }
 
@@ -2292,7 +2304,6 @@ impl Writer {
         // the index keeps point-read index probes at their legacy cost while the
         // seqno-scoped scan loads the section.
         if let Some((seqno_min, seqno_max)) = seqno_bounds {
-            self.section_bytes += core::mem::size_of::<(BlockOffset, (u64, u64))>() as u64;
             self.seqno_bounds_section
                 .push((self.meta.file_pos, (seqno_min, seqno_max)));
         }
@@ -2322,16 +2333,14 @@ impl Writer {
             // this is non-empty in practice; guard defensively so an empty stats
             // vector never registers a column-less zone-map entry.
             if !columns.is_empty() {
-                // The entry, its column vector and each column's bounds.
+                // The entry's column vector and each column's bounds.
                 let bounds: usize = columns
                     .iter()
                     .map(|c| c.min.capacity() + c.max.capacity())
                     .sum();
-                self.section_bytes +=
-                    (core::mem::size_of::<(BlockOffset, Vec<crate::table::zone_map::ColumnStats>)>(
-                    ) + columns.capacity()
-                        * core::mem::size_of::<crate::table::zone_map::ColumnStats>()
-                        + bounds) as u64;
+                self.section_bytes += (columns.capacity()
+                    * core::mem::size_of::<crate::table::zone_map::ColumnStats>()
+                    + bounds) as u64;
                 self.zone_map_section.push((self.meta.file_pos, columns));
             }
         }
@@ -2345,6 +2354,9 @@ impl Writer {
         self.prev_pos.1 += u64::from(bytes_written);
 
         self.meta.last_key = Some(last_key);
+        // The table rotates on the estimates at its next key, which must count
+        // this block.
+        self.refresh_state_estimates();
         Ok(())
     }
 
@@ -2717,7 +2729,7 @@ impl Writer {
             columnar_columns,
             row_group,
         )?;
-        self.block_written();
+        self.locator_block_done();
         Ok(Some(inputs.last_key))
     }
 
