@@ -1,7 +1,7 @@
-use lsm_tree::{
-    AbstractTree, CompressionType, Config, PrefixExtractor, SeqNo, SequenceNumberCounter,
-    config::CompressionPolicy, get_tmp_folder,
-};
+use lsm_tree::{AbstractTree, Config, SeqNo, SequenceNumberCounter, get_tmp_folder};
+#[cfg(feature = "lz4")]
+use lsm_tree::{CompressionType, PrefixExtractor, config::CompressionPolicy};
+#[cfg(feature = "lz4")]
 use std::sync::Arc;
 use test_log::test;
 
@@ -23,8 +23,10 @@ fn noise(seed: u64, out: &mut [u8]) {
 }
 
 /// Every prefix of a key that ends at a colon.
+#[cfg(feature = "lz4")]
 struct ColonPrefixes;
 
+#[cfg(feature = "lz4")]
 impl PrefixExtractor for ColonPrefixes {
     fn prefixes<'a>(&self, key: &'a [u8]) -> Box<dyn Iterator<Item = &'a [u8]> + 'a> {
         Box::new(
