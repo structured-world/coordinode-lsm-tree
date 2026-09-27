@@ -1,5 +1,5 @@
 window.BENCHMARK_DATA = {
-  "lastUpdate": 1790445527644,
+  "lastUpdate": 1790519306293,
   "repoUrl": "https://github.com/structured-world/coordinode-lsm-tree",
   "entries": {
     "lsm-tree db_bench costs": [
@@ -25554,6 +25554,90 @@ window.BENCHMARK_DATA = {
             "value": 343643.7618866807,
             "unit": "ops/sec",
             "extra": "P50: 2.0us | P99: 16.7us | P99.9: 89.9us\nthreads: 1 | elapsed: 0.58s | num: 200000 | iterations: 3"
+          }
+        ]
+      },
+      {
+        "commit": {
+          "author": {
+            "email": "mail@polaz.com",
+            "name": "Dmitry Prudnikov",
+            "username": "polaz"
+          },
+          "committer": {
+            "email": "noreply@github.com",
+            "name": "GitHub",
+            "username": "web-flow"
+          },
+          "distinct": true,
+          "id": "32a9b3357c64537a444b9a00758250c16e3844e9",
+          "message": "feat(columnar): encode column pages as light codecs, chosen per level (#723)\n\n## Summary\n\nA column page's values are now an expression over light operators, and\nwhich encoding a level's pages get is a per-level policy, the way the\ndata block compression is.\n\n- **Expression encoding.** Constant, runs, a dictionary sorted in the\ncolumn's order, FFOR with exceptions patched in, zigzag delta, a number\ncolumn's ordinals and a bytes column's lengths in place of its offset\ntable, nested as the data needs; plain stays the column's own layout,\nserved as a view of the page. The whole expression of a page lives in\nthat page. Every operator, count, code, run end, exception position and\nlength is checked on read, and an unknown or misplaced operator fails\nthe page. `CodecId` and its delta codec are replaced.\n- **Choice by cost.** Under `Auto` the writer trial-encodes the\ncandidates and keeps the one that costs least to store and to read,\ncounting each operator's own fields, so a small page keeps its plain\nform when an encoding's overhead outweighs its saving; FFOR picks its\nwidth by the same cost, the patching of its exceptions included.\n`table::columnar::candidates` lays the decision out.\n- **Bounded decoding.** An encoding describes far more bytes than it\nstores, so a read bounds what a row group may build: the directory\nrefuses a group of more rows than a writer cuts (a group closes at 4 MiB\nof rows, each at least a byte; an ingested batch past the group size is\ncut into groups the same way), and a group may build at most twice that\npast its pages' own bytes over all its columns, and hold at most as many\nrows decoded to read them, a column past the bound refused before it is\nbuilt. A merge-on-read relocation keeps the pages it copies as encoded,\nas it keeps their compression.\n- **Per-level policy.**\n`Config::column_encoding_policy(ColumnEncodingPolicy)`, one\n`ColumnEncoding::{Plain, Auto}` per level, `Plain` at every level by\ndefault. Flush, compaction (by the level written into), ingestion and\nblob trees write under it; a plain level skips the trials entirely.\n`db_bench --column-encoding plain|auto`.\n- **Reads from the encoding.** A scan tests its predicate on the\nencoding (a constant once, runs once per run, a dictionary once per\nvalue and a code lookup per row, integers as they decode) and builds\nonly the rows that survive it and the delete and bound masks; a column\nread only for its predicate is never built. A point read takes single\nrows from an encoded page (a bytes column of one length by position),\nsearches the keys once and does not read the key pages again for the\nrest of the row.\n- **Diagnosis.** `sst-dump <table> columns [--summary]` lists every\npage's expression and, for a bytes column, the bytes it spends on its\noffsets apart from its values (`inspect::read_column_encodings`,\n`PageEncoding::offsets_len`).\n- `docs/columnar-page-format.md` gains \"Values encoding\" (operators,\npredicates, the policy and its measurement); \"How many pages\" now says\none page per column and row page.\n\n## Why plain is the default\n\nA read that wants a column whole has to build an encoded page back into\nthe column's layout, while it serves a plain page as a view. On the\nmixed-layout records only the engine's own columns encode (keys by their\nlengths, seqnos by their ordinals, the value type as a constant), so\n`Auto` reads fewer bytes for more time. `Auto` is for the levels whose\ntables are mostly stored rather than read, and for typed value columns\nwhose values encode far below their layout.\n\n## Measurements\n\n`db_bench --benchmark mixed-layout --num 70000`, x86 Linux host,\ninterleaved runs of five iterations (three with the default cache, two\nwith none), medians; base is `main` before this branch:\n\n| | point reads | near-full scan | sparse scan | near-full, no cache |\n|---|---|---|---|---|\n| base | 350.8 ms, 215.8 B read/row | 58.5 ms, 340.6 B | 15.3 ms | 49.6\nms |\n| **plain** (default) | **342.9 ms**, 215.5 B | **56.8 ms**, 340.1 B |\n15.7 ms | 49.3 ms |\n| auto | 351.0 ms, 202.8 B | 60.4 ms, 331.0 B | 15.3 ms | 52.8 ms |\n\nBytes copied per row: near-full 290.0 -> 277.7, sparse 301 -> 285 under\nboth. Point reads with no cache take about 1.53 s under all three.\n`Auto` reads 3-6% fewer bytes for 2-7% more time; that trade is why it\nis opt-in per level.\n\n## Testing\n\n- every candidate of every column type round-trips byte-exactly\n(proptests over number kinds, widths and orders, opaque and bytes\ncolumns, boundaries, single rows), and each is also read row by row,\nanswered for a predicate and gathered for a selection against the plain\nlayout\n- refusals: unknown or misplaced operator, depth, codes past the\ndictionary, run ends, exception positions, ordinals a width cannot hold,\nlengths that miss the payload, trailing bytes; each refused by a decode\nand by a point read\n- a row group past the rows a writer cuts is refused by the directory; a\npage decoding past the group's budget is refused before anything is\nbuilt, and a lookup holding more rows decoded than it allows is refused;\nan ingested batch far past the group size reads back whole\n- every candidate describes itself on read exactly as written, a run's\nends included; FFOR over 1000 rows of 0/1 with 50 ones takes width 1,\nnot the smaller but dearer width 0 with 50 patches\n- an FFOR outlier (values `0..=7`, one row of `1000`) is stored in 3\nbits with one exception and `value > 100` returns exactly that row\nthrough the zone map, the predicate, the selection and the rows built\n- a predicate over a column of runs copies exactly the keys it returns\nand never builds the predicate column (`bytes_copied`)\n- per-unit overhead: an encoding with the smaller payload but the larger\npage loses to plain\n- the level policy through flush (plain at L0) and a major compaction,\nencoded only because the last level it writes into asks for it; the\ndefault reported plain end to end by `sst-dump`, its page listing\nchecked against its summary, and a plain key page's offsets reported as\nits offset table\n- fmt, clippy in every CI configuration (library, db_bench, sst-dump),\nthe no-std check, full nextest (default and all features), doc tests and\n`cargo doc -D warnings` on macOS; clippy and the full nextest (3794\ntests, io_uring included) on x86 Linux\n- the decoding bound and the FFOR width against the commit before them,\n`mixed-layout` on macOS, eight interleaved rounds of five iterations:\nbytes read per row identical under both encodings, medians within 1-4%\neither way, the spread the unchanged plain point reads show\n\nCloses #684",
+          "timestamp": "2026-09-27T17:19:56+03:00",
+          "tree_id": "83b89c064abe597da56a21de5a0d573ce76357df",
+          "url": "https://github.com/structured-world/coordinode-lsm-tree/commit/32a9b3357c64537a444b9a00758250c16e3844e9"
+        },
+        "date": 1790519245906,
+        "tool": "customBiggerIsBetter",
+        "benches": [
+          {
+            "name": "mixed",
+            "value": 25054.03394100816,
+            "unit": "ops/sec",
+            "extra": "P50: 0.5us | P99: 13.5us | P99.9: 25.1us\nthreads: 1 | elapsed: 21.36s | num: 200000 | iterations: 3"
+          },
+          {
+            "name": "fillseq",
+            "value": 2488816.286246327,
+            "unit": "ops/sec",
+            "extra": "P50: 0.2us | P99: 4.1us | P99.9: 5.4us\nthreads: 1 | elapsed: 0.08s | num: 200000 | iterations: 3"
+          },
+          {
+            "name": "fillrandom",
+            "value": 726429.2900357746,
+            "unit": "ops/sec",
+            "extra": "P50: 1.1us | P99: 6.2us | P99.9: 13.8us\nthreads: 1 | elapsed: 0.28s | num: 200000 | iterations: 3"
+          },
+          {
+            "name": "readrandom",
+            "value": 524675.373967554,
+            "unit": "ops/sec",
+            "extra": "P50: 1.8us | P99: 6.4us | P99.9: 20.9us\nthreads: 1 | elapsed: 0.38s | num: 200000 | iterations: 3"
+          },
+          {
+            "name": "readseq",
+            "value": 2431922.494435549,
+            "unit": "ops/sec",
+            "extra": "P50: 0.2us | P99: 4.6us | P99.9: 6.3us\nthreads: 1 | elapsed: 0.08s | num: 200000 | iterations: 3"
+          },
+          {
+            "name": "seekrandom",
+            "value": 261546.01213040468,
+            "unit": "ops/sec",
+            "extra": "P50: 3.3us | P99: 8.0us | P99.9: 15.7us\nthreads: 1 | elapsed: 0.76s | num: 200000 | iterations: 3"
+          },
+          {
+            "name": "prefixscan",
+            "value": 138340.17813558414,
+            "unit": "ops/sec",
+            "extra": "P50: 5.9us | P99: 15.5us | P99.9: 49.1us\nthreads: 1 | elapsed: 1.45s | num: 200000 | iterations: 3"
+          },
+          {
+            "name": "overwrite",
+            "value": 577773.2246679793,
+            "unit": "ops/sec",
+            "extra": "P50: 1.2us | P99: 6.5us | P99.9: 16.7us\nthreads: 1 | elapsed: 0.35s | num: 200000 | iterations: 3"
+          },
+          {
+            "name": "mergerandom",
+            "value": 617608.3570316093,
+            "unit": "ops/sec",
+            "extra": "P50: 0.5us | P99: 4.4us | P99.9: 14.2us\nthreads: 1 | elapsed: 0.32s | num: 200000 | iterations: 3"
+          },
+          {
+            "name": "readwhilewriting",
+            "value": 192929.89530124815,
+            "unit": "ops/sec",
+            "extra": "P50: 2.5us | P99: 13.2us | P99.9: 343.8us\nthreads: 1 | elapsed: 1.04s | num: 200000 | iterations: 3"
           }
         ]
       }
