@@ -92,6 +92,11 @@ const fn node_size(height: usize) -> u32 {
     OFF_TOWER + (height as u32) * 4
 }
 
+/// Arena bytes taken by the smallest node: a one-level tower and an empty key.
+/// Every value in the store belongs to a node, so a memtable holds at most
+/// `2^32 / MIN_NODE_SIZE` values.
+pub(super) const MIN_NODE_SIZE: u32 = node_size(1);
+
 /// Outcome of reading a node's insert-time per-KV digest slot
 /// (`KvChecksumComputePoint::AtInsert`).
 enum NodeKvDigest {
