@@ -668,12 +668,15 @@ fn point_get_finds_the_key_when_another_is_inserted_before_it_during_the_seek() 
 /// at `max_seqno + 1`.
 #[test]
 fn point_get_never_returns_a_version_above_its_snapshot_inserted_during_the_seek() {
-    for newer in [9, 6] {
-        let map = new_map();
-        map.insert(&make_key(b"a", 1), make_value(b"a"));
-        map.insert(&make_key(b"k", 3), make_value(b"k3"));
-        insert_during_next_seek(&map, b"k", newer);
-        let got = map.point_get(b"k", 5).map(|v| v.key.seqno);
-        assert_eq!(got, Some(3), "a version at seqno {newer} leaked");
-    }
+    let got: Vec<(SeqNo, Option<SeqNo>)> = [9, 6]
+        .into_iter()
+        .map(|newer| {
+            let map = new_map();
+            map.insert(&make_key(b"a", 1), make_value(b"a"));
+            map.insert(&make_key(b"k", 3), make_value(b"k3"));
+            insert_during_next_seek(&map, b"k", newer);
+            (newer, map.point_get(b"k", 5).map(|v| v.key.seqno))
+        })
+        .collect();
+    assert_eq!(got, vec![(9, Some(3)), (6, Some(3))]);
 }
