@@ -226,6 +226,7 @@ fn only_column_expression(batch: &ColumnBatch) -> super::Expression {
     super::Values::parse(column.type_tag, batch.row_count, &rest[..len])
         .expect("parse")
         .describe()
+        .expect("describe")
 }
 
 #[test]
@@ -1010,12 +1011,104 @@ fn column_page_decode_refused_for_a_tail_copies_nothing() {
         .expect("encode page");
     page.push(0); // one byte past the page's column
     let mut copied = 0usize;
-    let decoded = Column::decode_page(&page.into(), batch.row_count, stamp, &mut copied);
+    let decoded = Column::decode_page(
+        &page.into(),
+        batch.row_count,
+        stamp,
+        &mut copied,
+        &mut super::DecodeBudget::default(),
+    );
     assert!(
         matches!(decoded, Err(crate::Error::InvalidHeader(m)) if m.contains("trailing bytes")),
         "trailing bytes must be refused, got {decoded:?}",
     );
     assert_eq!(copied, 0, "the refusal came before any copy");
+}
+
+/// A group whose pages decode to more bytes than any row group a writer cuts
+/// is refused before the column is built: 200 rows of one 64 KiB value
+/// encode as a constant of one value, while their layout is 12.5 MiB, past
+/// twice the 4 MiB a group is cut at beyond the page's own bytes. Without the
+/// bound a small forged page makes a read allocate what its rows decode to.
+/// The bound is the group's, not the page's: three pages of 64 such rows are
+/// each a page a writer could cut, but no writer puts all three in one group,
+/// so the third is refused. One page of 64 rows decodes.
+#[test]
+fn column_page_decoding_past_what_a_writer_cuts_is_refused() {
+    use crate::table::column_page::{PageId, PageStamp};
+
+    let value = vec![7u8; 64 * 1024];
+    let bytes_column = |rows: u32| Column {
+        column_id: 3,
+        type_tag: TypeTag::Bytes,
+        validity: None,
+        data: super::build_bytes_column((0..rows).map(|_| value.as_slice()))
+            .expect("build")
+            .into(),
+    };
+    let stamp = PageStamp {
+        group_tag: 7,
+        id: PageId {
+            column_id: 3,
+            part: 0,
+        },
+        row_page: 0,
+    };
+    let page_of = |rows: u32| -> crate::Slice {
+        let page = bytes_column(rows)
+            .encode_page(rows, stamp, ColumnEncoding::Auto)
+            .expect("encode page");
+        assert!(page.len() < 2 * value.len(), "the rows encode as one value");
+        page.into()
+    };
+
+    let refused = |result: crate::Result<Column>| {
+        matches!(result, Err(crate::Error::DecompressedSizeTooLarge { .. }))
+    };
+
+    let forged = page_of(200);
+    Column::parse_page(&forged, 200, stamp)
+        .expect("a parse builds nothing, so it has nothing to refuse");
+    let mut copied = 0usize;
+    assert!(
+        refused(Column::decode_page(
+            &forged,
+            200,
+            stamp,
+            &mut copied,
+            &mut super::DecodeBudget::default(),
+        )),
+        "a page past the bound must be refused",
+    );
+    assert_eq!(copied, 0, "refused before anything was built");
+
+    // 64 rows reach the 4 MiB a group is cut at, so a writer never puts more
+    // of these rows in one group.
+    let cut = page_of(64);
+    let mut group = super::DecodeBudget::default();
+    for page in 0..2 {
+        let column = Column::decode_page(&cut, 64, stamp, &mut copied, &mut group)
+            .unwrap_or_else(|e| panic!("page {page} of the group: {e:?}"));
+        assert_eq!(column.data.len(), 65 * 4 + 64 * value.len());
+    }
+    assert!(
+        refused(Column::decode_page(
+            &cut,
+            64,
+            stamp,
+            &mut copied,
+            &mut group
+        )),
+        "the third page takes the group past the bound",
+    );
+    Column::decode_page(
+        &cut,
+        64,
+        stamp,
+        &mut copied,
+        &mut super::DecodeBudget::default(),
+    )
+    .expect("the same page in a group of its own");
 }
 
 /// A block whose second row carries a bad value-type tag is refused only after

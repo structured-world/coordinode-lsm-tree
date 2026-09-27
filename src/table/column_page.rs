@@ -140,6 +140,16 @@ use alloc::vec::Vec;
 /// read; this one versions the directory block's own wire form.
 pub const VERSION: u8 = 3;
 
+/// The most rows a row group holds, and so any of its row pages. A writer
+/// closes a group once its rows reach the group size, which is at most
+/// [`MAX_BLOCK_SIZE`] bytes, and every row adds at least one byte (its seqno
+/// alone is a fixed width), so no group it writes exceeds this. An encoded
+/// page decodes to far more bytes than it stores, and this is what stops a
+/// forged row count from making a few small pages decode into gigabytes.
+///
+/// [`MAX_BLOCK_SIZE`]: crate::config::MAX_BLOCK_SIZE
+pub const MAX_GROUP_ROWS: u32 = crate::config::MAX_BLOCK_SIZE;
+
 /// The longest varint a `u16` field takes.
 const VAR_U16_MAX_LEN: usize = 3;
 
@@ -595,6 +605,13 @@ impl PageDirectory {
         if entries.len() > usize::from(u16::MAX) {
             return Err(Error::InvalidHeader(
                 "column page: page count exceeds the u16 directory field",
+            ));
+        }
+        // Checked before the row pages, which sum to it: each is then bounded
+        // too, and so is every run, code and length a page's rows can declare.
+        if row_count > MAX_GROUP_ROWS {
+            return Err(Error::InvalidHeader(
+                "column page: a row group of more rows than a writer cuts",
             ));
         }
         if row_pages.len() > usize::from(u16::MAX) {

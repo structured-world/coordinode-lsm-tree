@@ -2598,6 +2598,7 @@ fn forge_row_group_column(
         row_count,
         stamp,
         &mut 0,
+        &mut crate::table::columnar::DecodeBudget::default(),
     )?;
     mutate(&mut column, row_count);
     // Encoded as the tree wrote it, plain by default, so the forged page

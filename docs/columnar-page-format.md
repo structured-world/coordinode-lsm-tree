@@ -343,6 +343,17 @@ is told apart from the saving on the values.
   and a per-row cost of decoding it; plain stays a candidate and wins where
   nothing beats it.
 
+A flush writes under level 0's entry and a compaction under the entry of the
+level it writes into. A compaction that relocates a table's row groups whole
+to mask a sparse delete writes no page and keeps the ones it copies as they
+were encoded, as it keeps their compression; the next merge that rewrites
+those rows applies the level's policy.
+
+A read also bounds what a row group's pages may decode to: a writer closes a
+group once its rows reach at most 4 MiB, so a column of a group it cut never
+builds more than twice that past the bytes of its pages, and a page that
+would is refused before anything is built.
+
 Plain is the default because a read that wants a column whole has to build
 an encoded page back into the layout, while it serves a plain page as a view.
 `db_bench --benchmark mixed-layout --num 70000 --column-encoding plain|auto`,

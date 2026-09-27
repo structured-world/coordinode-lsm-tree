@@ -1145,12 +1145,13 @@ impl RowGroupBlocks {
     /// Adds to `copied` what decoding the pages copied out of them, as each
     /// copy is made.
     pub(crate) fn to_row_pages(&self, copied: &mut usize) -> crate::Result<RowPages> {
-        use crate::table::columnar::{Column, ColumnBatch};
+        use crate::table::columnar::{Column, ColumnBatch, DecodeBudget};
 
         let outside = || crate::Error::InvalidHeader("columnar: row page outside the group");
+        let mut budget = DecodeBudget::default();
         let (ordinals, columns) = self.by_row_page(
             |_| true,
-            |page, rows, stamp| Column::decode_page(page, rows, stamp, copied),
+            |page, rows, stamp| Column::decode_page(page, rows, stamp, copied, &mut budget),
             |column| column.column_id,
         )?;
         let mut batches = Vec::with_capacity(ordinals.len());

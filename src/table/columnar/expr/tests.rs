@@ -35,7 +35,7 @@ fn number_layout(number: Number, values: &[u128]) -> Vec<u8> {
 /// a read does.
 fn decode(type_tag: TypeTag, rows: u32, bytes: &[u8]) -> crate::Result<Slice> {
     let page = Slice::from(bytes);
-    Values::parse(type_tag, rows, &page)?.materialize(type_tag, rows, &page)
+    Values::parse(type_tag, rows, &page)?.materialize(type_tag, rows, &page, u64::MAX)
 }
 
 /// Every candidate the writer considers for `data` decodes back to `data`, and
@@ -52,11 +52,9 @@ fn assert_every_candidate_round_trips(type_tag: TypeTag, rows: u32, data: &[u8])
         let decoded = decode(type_tag, rows, &trial.bytes)
             .unwrap_or_else(|e| panic!("{} does not decode: {e:?}", trial.expression));
         assert_eq!(&*decoded, data, "{} does not round-trip", trial.expression);
+        // A read describes the page as it was written, a run's ends included.
         let parsed = Values::parse(type_tag, rows, &trial.bytes).expect("parse");
-        assert_eq!(
-            parsed.describe().to_string(),
-            describe_stored(&trial.expression)
-        );
+        assert_eq!(parsed.describe().expect("describe"), trial.expression);
         // A point read takes single rows from the encoding; each must be the
         // row the layout holds, and a row past the column must be refused.
         let access = parsed.rows(type_tag, rows).expect("rows");
@@ -135,7 +133,7 @@ fn assert_select_and_gather(
         every_other.insert(row);
     }
     let built = values()
-        .materialize_rows(type_tag, rows, &every_other)
+        .materialize_rows(type_tag, rows, &every_other, u64::MAX)
         .expect("materialize rows");
     let picked: Vec<&[u8]> = every_other.rows().map(layout).collect();
     let want = match type_tag.fixed_width() {
@@ -143,28 +141,6 @@ fn assert_select_and_gather(
         None => bytes_layout(&picked),
     };
     assert_eq!(&*built, &want[..], "{expression} builds other rows");
-}
-
-/// What a read describes a stored expression as: a run's ends are decoded on
-/// the parse and not described again.
-fn describe_stored(expression: &Expression) -> String {
-    fn stored(e: &Expression) -> Expression {
-        match e {
-            Expression::Rle { values, .. } => Expression::Rle {
-                values: Box::new(stored(values)),
-                ends: Box::new(Expression::Plain),
-            },
-            Expression::Dict { values, codes } => Expression::Dict {
-                values: Box::new(stored(values)),
-                codes: Box::new(stored(codes)),
-            },
-            Expression::Ordinals(inner) => Expression::Ordinals(Box::new(stored(inner))),
-            Expression::Delta(inner) => Expression::Delta(Box::new(stored(inner))),
-            Expression::Lengths(inner) => Expression::Lengths(Box::new(stored(inner))),
-            other => other.clone(),
-        }
-    }
-    stored(expression).to_string()
 }
 
 /// Every integer encoding the writer considers decodes back to `values`.
@@ -175,6 +151,11 @@ fn assert_every_int_trial_round_trips(values: &[u64]) {
         let ints = Ints::parse(&mut rest, n, 0)
             .unwrap_or_else(|e| panic!("{} does not parse: {e:?}", trial.expression));
         assert!(rest.is_empty(), "{} leaves bytes over", trial.expression);
+        assert_eq!(
+            ints.describe().expect("describe"),
+            trial.expression,
+            "described as written"
+        );
         let mut out = Vec::new();
         ints.decode_into(n, &mut out).expect("decode");
         assert_eq!(out, values, "{} does not round-trip", trial.expression);
@@ -330,6 +311,35 @@ fn one_outlier_is_an_exception_not_a_wider_width() {
     assert_every_int_trial_round_trips(&values);
 }
 
+/// The width is the one whose trial costs least, the patching of its
+/// exceptions included, not the one that stores smallest: 1000 rows of 0 and 1
+/// with 50 ones store in about 100 bytes at width 0, the ones as exceptions,
+/// against 125 packed at width 1, but patching 50 rows back costs more than
+/// the 25 bytes save. Only the chosen width becomes a trial, so choosing it by
+/// size alone would leave the dearer one for the page.
+#[test]
+fn ffor_width_is_chosen_by_cost_with_its_patches() {
+    let values: Vec<u64> = (0..1000).map(|i| u64::from(i % 20 == 0)).collect();
+    let trial = super::ffor(&values);
+    assert_eq!(
+        trial.expression,
+        Expression::Ffor {
+            bit_width: 1,
+            exceptions: 0
+        },
+    );
+    let patched = super::ffor_at(&values, 0, 0);
+    assert!(
+        patched.bytes.len() < trial.bytes.len() && trial.cost() < patched.cost(),
+        "width 0 is smaller ({} bytes against {}) but dearer ({} against {})",
+        patched.bytes.len(),
+        trial.bytes.len(),
+        patched.cost(),
+        trial.cost(),
+    );
+    assert_every_int_trial_round_trips(&values);
+}
+
 /// A vector of values no common width holds, every one of them wide, is not
 /// encoded as exceptions everywhere: FFOR falls back to the full width with
 /// none, and the column as a whole stays plain.
@@ -453,7 +463,7 @@ fn a_dictionary_is_sorted_in_the_column_order() {
         panic!("a dictionary");
     };
     let dictionary = values
-        .materialize(TypeTag::Number(i16_le), size, &page)
+        .materialize(TypeTag::Number(i16_le), size, &page, u64::MAX)
         .expect("dictionary");
     let decoded: Vec<i16> = dictionary
         .chunks_exact(2)

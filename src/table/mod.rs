@@ -7883,6 +7883,7 @@ impl Table {
                 _ => None,
             };
             let mut copied = 0usize;
+            let mut budget = crate::table::columnar::DecodeBudget::default();
             for page in pages {
                 let (ordinal, row_count) = (page.ordinal, page.rows);
                 let page_base = row_base.wrapping_add(page.start);
@@ -7967,8 +7968,8 @@ impl Table {
                     // A column read only for the predicate is never decoded.
                     .filter(|c| added_predicate_column != Some(c.column_id))
                     .map(|c| match &keep {
-                        Some(kept) => c.decode_rows(row_count, kept, &mut copied),
-                        None => c.decode(row_count, &mut copied),
+                        Some(kept) => c.decode_rows(row_count, kept, &mut copied, &mut budget),
+                        None => c.decode(row_count, &mut copied, &mut budget),
                     })
                     .collect::<crate::Result<Vec<_>>>()?;
                 out.push(crate::table::columnar::ColumnBatch {

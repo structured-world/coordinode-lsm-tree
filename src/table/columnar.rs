@@ -739,14 +739,16 @@ impl Column {
     /// As [`Self::parse_page`], and [`Error::InvalidHeader`] when the values
     /// do not decode to `row_count` rows.
     ///
-    /// Adds to `copied` the validity bitmap it copies out of the page.
+    /// Adds to `copied` the validity bitmap it copies out of the page, and
+    /// charges what it builds to `budget`, the page's group's.
     pub(crate) fn decode_page(
         bytes: &crate::Slice,
         row_count: u32,
         expected: crate::table::column_page::PageStamp,
         copied: &mut usize,
+        budget: &mut DecodeBudget,
     ) -> Result<Self> {
-        Self::parse_page(bytes, row_count, expected)?.decode(row_count, copied)
+        Self::parse_page(bytes, row_count, expected)?.decode(row_count, copied, budget)
     }
 
     /// What a column page's values were encoded as, and for a bytes column
@@ -764,7 +766,7 @@ impl Column {
     ) -> Result<(Expression, Option<usize>)> {
         let column = Self::parse_page(bytes, row_count, expected)?;
         Ok((
-            column.values.describe(),
+            column.values.describe()?,
             column.values.offsets_len(column.type_tag, row_count),
         ))
     }
@@ -777,13 +779,15 @@ impl Column {
     /// second field is the length of a zero-copy view into `bytes`, zero when
     /// the column had to be decoded into its own buffer, so a caller can
     /// decide whether keeping `bytes` alive for the view is proportionate.
-    /// Adds the validity bitmap it copies out to `copied`.
+    /// Adds the validity bitmap it copies out to `copied`, and charges what
+    /// it builds to `budget`, the group's.
     fn decode_from(
         cur: &mut Cursor<'_>,
         bytes: &crate::Slice,
         row_count: u32,
         want: impl Fn(u16) -> bool,
         copied: &mut usize,
+        budget: &mut DecodeBudget,
     ) -> Result<Option<(Self, usize)>> {
         let raw = RawColumn::read(cur, row_count)?;
         if !want(raw.column_id) {
@@ -794,7 +798,7 @@ impl Column {
             Values::Plain(data) => data.len(),
             _ => 0,
         };
-        Ok(Some((column.decode(row_count, copied)?, viewed)))
+        Ok(Some((column.decode(row_count, copied, budget)?, viewed)))
     }
 }
 
@@ -875,11 +879,18 @@ impl PageColumn<'_> {
     /// its page where it is stored that way. Adds to `copied` the validity
     /// bitmap it copies and the bytes it builds from any other encoding:
     /// building a column is a copy of its values, where a view is none.
-    pub(crate) fn decode(self, row_count: u32, copied: &mut usize) -> Result<Column> {
+    /// What it builds is charged to `budget`, its group's.
+    pub(crate) fn decode(
+        self,
+        row_count: u32,
+        copied: &mut usize,
+        budget: &mut DecodeBudget,
+    ) -> Result<Column> {
         let built = !matches!(self.values, Values::Plain(_));
-        let data = self
-            .values
-            .materialize(self.type_tag, row_count, self.page)?;
+        let data = budget.build(self.column_id, self.page.len(), |limit| {
+            self.values
+                .materialize(self.type_tag, row_count, self.page, limit)
+        })?;
         if built {
             *copied += data.len();
         }
@@ -923,22 +934,26 @@ impl PageColumn<'_> {
 
     /// The column's rows `keep` selects, of its `row_count`, as a column of
     /// their own, built straight from the encoding. Adds what it builds, and
-    /// the validity bits it gathers, to `copied`.
+    /// the validity bits it gathers, to `copied`, and charges what it builds
+    /// to `budget`, its group's.
     ///
     /// # Errors
     ///
     /// [`Error::InvalidHeader`] when the encoding does not describe
-    /// `row_count` rows.
+    /// `row_count` rows, [`Error::DecompressedSizeTooLarge`] when the rows
+    /// would take more than `budget` allows.
     pub(crate) fn decode_rows(
         self,
         row_count: u32,
         keep: &crate::table::columnar_predicate::Selection,
         copied: &mut usize,
+        budget: &mut DecodeBudget,
     ) -> Result<Column> {
         let rows = keep.count();
-        let data = self
-            .values
-            .materialize_rows(self.type_tag, row_count, keep)?;
+        let (column_id, type_tag, values) = (self.column_id, self.type_tag, self.values);
+        let data = budget.build(column_id, self.page.len(), |limit| {
+            values.materialize_rows(type_tag, row_count, keep, limit)
+        })?;
         *copied += data.len();
         let validity = self.validity.map(|v| {
             let mut out = alloc::vec![0u8; validity_len(rows)];
@@ -960,6 +975,85 @@ impl PageColumn<'_> {
         };
         column.validate(rows)?;
         Ok(column)
+    }
+}
+
+/// What a read of one row group may build from its pages' encodings past
+/// the pages' own bytes, per column.
+///
+/// A writer closes a group once its rows reach the group size, at most
+/// [`crate::config::MAX_BLOCK_SIZE`], so the rows before a group's last add
+/// up to less than that in every column, and the last row is either stored
+/// on its page or repeats a value of a row before it. A column of a group a
+/// writer cut therefore never builds more than twice that past its pages. An
+/// encoding can describe far more bytes than it stores, so this is what stops
+/// a forged group from decoding into gigabytes, whether from one page or
+/// spread over many.
+#[derive(Debug)]
+pub(crate) struct DecodeBudget {
+    /// What a column may build past its pages.
+    allowance: u64,
+    /// Each column's bytes built past its pages so far, at most `allowance`.
+    spent: Vec<(u16, u64)>,
+}
+
+impl Default for DecodeBudget {
+    /// The budget of one row group a writer cut.
+    fn default() -> Self {
+        Self {
+            allowance: 2 * u64::from(crate::config::MAX_BLOCK_SIZE),
+            spent: Vec::new(),
+        }
+    }
+}
+
+impl DecodeBudget {
+    /// No budget beyond what the `u32` offsets of a column hold: for a
+    /// caller's own batch payload, of any size its encoder accepts.
+    fn unbounded() -> Self {
+        Self {
+            allowance: u64::MAX / 2,
+            spent: Vec::new(),
+        }
+    }
+
+    /// Builds a page of `page_len` bytes of column `column_id` with `build`,
+    /// given the most bytes the column may take, and charges what it built
+    /// past the page.
+    ///
+    /// # Errors
+    ///
+    /// What `build` returns, which refuses a column past the limit before
+    /// building it.
+    pub(crate) fn build(
+        &mut self,
+        column_id: u16,
+        page_len: usize,
+        build: impl FnOnce(u64) -> Result<Slice>,
+    ) -> Result<Slice> {
+        let spent = self
+            .spent
+            .iter()
+            .find(|&&(id, _)| id == column_id)
+            .map_or(0, |&(_, spent)| spent);
+        debug_assert!(spent <= self.allowance, "charged within the allowance");
+        let page_len = page_len as u64;
+        // A page is at most what a u32 block length holds, and the allowance
+        // at most half a u64.
+        let limit = page_len + (self.allowance - spent);
+        let data = build(limit)?;
+        let len = data.len() as u64;
+        debug_assert!(len <= limit, "a build refuses a column past its limit");
+        // A column no larger than its page, a view of it among them, builds
+        // nothing past it.
+        if len > page_len {
+            let spent = spent + (len - page_len);
+            match self.spent.iter_mut().find(|(id, _)| *id == column_id) {
+                Some((_, charged)) => *charged = spent,
+                None => self.spent.push((column_id, spent)),
+            }
+        }
+        Ok(data)
     }
 }
 
@@ -1398,6 +1492,12 @@ impl ColumnBatch {
     /// could hold, carries an unknown type / codec tag, a non-canonical width /
     /// validity flag, or any column that fails [`Column::validate`] (fixed-width
     /// length, `Bytes` offset framing, validity bitmap length / padding).
+    ///
+    /// The payload is trusted for the size of its batch: it may describe up to
+    /// `u32::MAX` rows of one repeated value in a few bytes, and every row is
+    /// built. A table's reads bound what they build by the row group a writer
+    /// cuts; this decoder has no such bound, since [`ColumnBatch::encode`]
+    /// takes a batch of any size.
     pub fn decode(bytes: &crate::Slice) -> Result<Self> {
         Self::decode_inner(bytes, None)
     }
@@ -1449,9 +1549,10 @@ impl ColumnBatch {
         let mut viewed_bytes = 0usize;
         let mut view_columns: Vec<usize> = Vec::new();
         let want = |id: u16| wanted.is_none_or(|w| w.contains(&id));
+        let mut budget = DecodeBudget::unbounded();
         for _ in 0..column_count {
             let Some((column, viewed)) =
-                Column::decode_from(&mut cur, bytes, row_count, want, &mut 0)?
+                Column::decode_from(&mut cur, bytes, row_count, want, &mut 0, &mut budget)?
             else {
                 continue;
             };
@@ -1652,9 +1753,29 @@ pub(crate) fn frame_bytes_column<'a, I>(count: usize, cells: impl Fn() -> I) -> 
 where
     I: Iterator<Item = &'a [u8]>,
 {
+    frame_bytes_column_within(count, u64::MAX, cells)
+}
+
+/// [`frame_bytes_column`], refused before anything is allocated when the
+/// column would take more than `limit` bytes: what a read building a column
+/// from an encoding holds it to, since an encoding can describe far more
+/// bytes than it stores.
+///
+/// # Errors
+///
+/// As [`frame_bytes_column`], and [`Error::DecompressedSizeTooLarge`] for a
+/// column past `limit`.
+pub(crate) fn frame_bytes_column_within<'a, I>(
+    count: usize,
+    limit: u64,
+    cells: impl Fn() -> I,
+) -> Result<Slice>
+where
+    I: Iterator<Item = &'a [u8]>,
+{
     let too_large = |declared: u64| Error::DecompressedSizeTooLarge {
         declared,
-        limit: u64::from(u32::MAX),
+        limit: limit.min(u64::from(u32::MAX)),
     };
     let mut total = 0u32;
     let mut sized = 0usize;
@@ -1673,6 +1794,9 @@ where
     let len = table
         .checked_add(total as usize)
         .ok_or_else(|| too_large(u64::from(total)))?;
+    if len as u64 > limit {
+        return Err(too_large(len as u64));
+    }
     // SAFETY: the buffer is frozen (and so read) only after the fill below
     // wrote all of it: slot 0, one offset slot per cell for exactly `count`
     // cells, and the payload through exactly `total` bytes. Any other outcome

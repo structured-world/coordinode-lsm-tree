@@ -306,6 +306,36 @@ fn row_pages_that_do_not_sum_to_the_group_are_refused() {
     );
 }
 
+/// A row group no writer produces is refused: a writer closes a group once
+/// its rows reach the group size, at most 4 MiB, and every row adds at least
+/// one byte, so a group can never hold more rows than that. An encoded page
+/// holds far fewer bytes than its rows decode to, and a forged row count past
+/// the bound would make a few small pages decode into gigabytes, whether it
+/// sits on one row page or is spread over many that are each under it.
+#[test]
+fn a_row_group_of_more_rows_than_a_writer_cuts_is_refused() {
+    use crate::table::column_page::MAX_GROUP_ROWS;
+
+    let too_many = MAX_GROUP_ROWS + 1;
+    for row_pages in [vec![too_many], vec![MAX_GROUP_ROWS, 1]] {
+        let err = PageDirectory::new(too_many, TAG, row_pages.clone(), vec![], no_head(), vec![])
+            .expect_err("a group past the bound must be refused");
+        assert!(
+            format!("{err:?}").contains("more rows than"),
+            "row pages {row_pages:?}: the error must name the bound, got {err:?}",
+        );
+    }
+    PageDirectory::new(
+        MAX_GROUP_ROWS,
+        TAG,
+        vec![MAX_GROUP_ROWS],
+        vec![],
+        no_head(),
+        vec![],
+    )
+    .expect("a group at the bound is accepted");
+}
+
 #[test]
 fn an_empty_row_page_is_refused() {
     let err = PageDirectory::new(ROWS, TAG, vec![ROWS, 0], vec![], no_head(), vec![])

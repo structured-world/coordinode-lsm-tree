@@ -67,7 +67,10 @@
 //! column's type has no use for it, and every length, count, code, end or
 //! position the rows cannot hold, rather than decoding part of a page.
 
-use super::{Number, TypeTag, bytes_column_row, check_bytes_framing, frame_bytes_column};
+use super::{
+    Number, TypeTag, bytes_column_row, check_bytes_framing, frame_bytes_column,
+    frame_bytes_column_within,
+};
 use crate::config::ColumnEncoding;
 use crate::table::column_page::{VAR_U64_MAX_LEN, put_varint, take, take_slice, take_varint};
 use crate::table::columnar_predicate::Selection;
@@ -179,7 +182,12 @@ pub enum Ints<'a> {
     Delta(Box<Self>),
     /// Runs of equal integers; `ends` are decoded, since every read of the
     /// vector needs them and the parse proves them in order.
-    Rle { values: Box<Self>, ends: Vec<u32> },
+    Rle {
+        values: Box<Self>,
+        ends: Vec<u32>,
+        /// The ends as stored, kept to describe them.
+        stored_ends: &'a [u8],
+    },
 }
 
 /// A column page's values as stored, borrowed from the page.
@@ -190,7 +198,12 @@ pub enum Values<'a> {
     /// The one value of every row.
     Constant(&'a [u8]),
     /// The runs' values, `ends.len()` of them, and the row after each run.
-    Rle { values: Box<Self>, ends: Vec<u32> },
+    Rle {
+        values: Box<Self>,
+        ends: Vec<u32>,
+        /// The ends as stored, kept to describe them.
+        stored_ends: &'a [u8],
+    },
     /// `size` distinct values in the column's order and a code per row.
     Dict {
         values: Box<Self>,
@@ -311,17 +324,11 @@ impl<'a> Ints<'a> {
                     return Err(MALFORMED);
                 }
                 let values = Self::parse(rest, runs, depth + 1)?;
-                let ends = Self::parse(rest, runs, depth + 1)?;
-                let mut decoded = Vec::with_capacity(runs as usize);
-                ends.decode_into(runs, &mut decoded)?;
-                let ends: Vec<u32> = decoded
-                    .into_iter()
-                    .map(|end| u32::try_from(end).map_err(|_| MALFORMED))
-                    .collect::<Result<_>>()?;
-                check_ends(&ends, n)?;
+                let (ends, stored_ends) = parse_ends(rest, runs, n, depth + 1)?;
                 Ok(Self::Rle {
                     values: Box::new(values),
                     ends,
+                    stored_ends,
                 })
             }
             _ => Err(MALFORMED),
@@ -346,7 +353,7 @@ impl<'a> Ints<'a> {
                 }
                 Ok(())
             }
-            Self::Rle { values, ends } => {
+            Self::Rle { values, ends, .. } => {
                 let mut runs = Vec::with_capacity(ends.len());
                 values.decode_into(u32::try_from(ends.len()).map_err(|_| MALFORMED)?, &mut runs)?;
                 let mut start = 0u32;
@@ -360,22 +367,64 @@ impl<'a> Ints<'a> {
     }
 
     /// What the vector was encoded as.
-    fn describe(&self) -> Expression {
-        match self {
+    ///
+    /// # Errors
+    ///
+    /// As [`describe_ends`].
+    fn describe(&self) -> Result<Expression> {
+        Ok(match self {
             Self::Constant(_) => Expression::Constant,
             Self::Ffor(ffor) => Expression::Ffor {
                 bit_width: ffor.bit_width,
                 exceptions: ffor.exception_count,
             },
-            Self::Delta(inner) => Expression::Delta(Box::new(inner.describe())),
-            Self::Rle { values, .. } => Expression::Rle {
-                values: Box::new(values.describe()),
-                // The ends were decoded on the parse; what they were stored
-                // as is not kept, since no read needs it again.
-                ends: Box::new(Expression::Plain),
+            Self::Delta(inner) => Expression::Delta(Box::new(inner.describe()?)),
+            Self::Rle {
+                values,
+                ends,
+                stored_ends,
+            } => Expression::Rle {
+                values: Box::new(values.describe()?),
+                ends: Box::new(describe_ends(stored_ends, ends.len())?),
             },
-        }
+        })
     }
+}
+
+/// Reads a run's ends, `runs` of them covering `n` rows, off the front of
+/// `rest`: decoded, since every read of the runs needs them and the parse
+/// proves them in order, and the bytes they were stored in.
+fn parse_ends<'a>(
+    rest: &mut &'a [u8],
+    runs: u32,
+    n: u32,
+    depth: u8,
+) -> Result<(Vec<u32>, &'a [u8])> {
+    let start = *rest;
+    let ends = Ints::parse(rest, runs, depth)?;
+    let stored = start.get(..start.len() - rest.len()).unwrap_or_default();
+    let mut decoded = Vec::with_capacity(runs as usize);
+    ends.decode_into(runs, &mut decoded)?;
+    let ends: Vec<u32> = decoded
+        .into_iter()
+        .map(|end| u32::try_from(end).map_err(|_| MALFORMED))
+        .collect::<Result<_>>()?;
+    check_ends(&ends, n)?;
+    Ok((ends, stored))
+}
+
+/// What a run's ends, `runs` of them stored in `stored`, were encoded as. A
+/// read keeps them decoded and describes them only when asked, from the bytes
+/// the parse already accepted.
+///
+/// # Errors
+///
+/// [`Error::InvalidHeader`] if `stored` no longer parses, which only a
+/// caller other than the parse could cause.
+fn describe_ends(stored: &[u8], runs: usize) -> Result<Expression> {
+    let mut rest = stored;
+    let runs = u32::try_from(runs).map_err(|_| MALFORMED)?;
+    Ints::parse(&mut rest, runs, 0)?.describe()
 }
 
 impl Ffor<'_> {
@@ -500,17 +549,11 @@ impl<'a> Values<'a> {
                     return Err(MALFORMED);
                 }
                 let values = Self::parse_from(rest, type_tag, runs, depth + 1, false)?;
-                let ends = Ints::parse(rest, runs, depth + 1)?;
-                let mut decoded = Vec::with_capacity(runs as usize);
-                ends.decode_into(runs, &mut decoded)?;
-                let ends: Vec<u32> = decoded
-                    .into_iter()
-                    .map(|end| u32::try_from(end).map_err(|_| MALFORMED))
-                    .collect::<Result<_>>()?;
-                check_ends(&ends, n)?;
+                let (ends, stored_ends) = parse_ends(rest, runs, n, depth + 1)?;
                 Ok(Self::Rle {
                     values: Box::new(values),
                     ends,
+                    stored_ends,
                 })
             }
             (DICT, _) if outer => {
@@ -544,22 +587,30 @@ impl<'a> Values<'a> {
         }
     }
 
-    /// What the values were encoded as.
-    pub(crate) fn describe(&self) -> Expression {
-        match self {
+    /// What the values were encoded as, a run's ends as they were stored.
+    ///
+    /// # Errors
+    ///
+    /// As [`describe_ends`].
+    pub(crate) fn describe(&self) -> Result<Expression> {
+        Ok(match self {
             Self::Plain(_) => Expression::Plain,
             Self::Constant(_) => Expression::Constant,
-            Self::Rle { values, .. } => Expression::Rle {
-                values: Box::new(values.describe()),
-                ends: Box::new(Expression::Plain),
+            Self::Rle {
+                values,
+                ends,
+                stored_ends,
+            } => Expression::Rle {
+                values: Box::new(values.describe()?),
+                ends: Box::new(describe_ends(stored_ends, ends.len())?),
             },
             Self::Dict { values, codes, .. } => Expression::Dict {
-                values: Box::new(values.describe()),
-                codes: Box::new(codes.describe()),
+                values: Box::new(values.describe()?),
+                codes: Box::new(codes.describe()?),
             },
-            Self::Ordinals(ints) => Expression::Ordinals(Box::new(ints.describe())),
-            Self::Lengths { lengths, .. } => Expression::Lengths(Box::new(lengths.describe())),
-        }
+            Self::Ordinals(ints) => Expression::Ordinals(Box::new(ints.describe()?)),
+            Self::Lengths { lengths, .. } => Expression::Lengths(Box::new(lengths.describe()?)),
+        })
     }
 
     /// The bytes a bytes column of `n` rows spends on where its values
@@ -576,20 +627,31 @@ impl<'a> Values<'a> {
     }
 
     /// The column's layout for its `n` rows: the page itself for
-    /// [`Self::Plain`], a buffer built from the encoding otherwise.
+    /// [`Self::Plain`], a buffer built from the encoding otherwise, refused
+    /// past `limit` bytes before it is allocated.
     ///
     /// # Errors
     ///
     /// [`Error::InvalidHeader`] when the encoding does not describe `n` rows:
     /// a code past its dictionary, an ordinal no value has, or lengths that
-    /// do not add up to the payload.
-    pub(crate) fn materialize(&self, type_tag: TypeTag, n: u32, page: &Slice) -> Result<Slice> {
+    /// do not add up to the payload. [`Error::DecompressedSizeTooLarge`] for
+    /// a bytes column built past `limit`.
+    pub(crate) fn materialize(
+        &self,
+        type_tag: TypeTag,
+        n: u32,
+        page: &Slice,
+        limit: u64,
+    ) -> Result<Slice> {
+        if !matches!(self, Self::Plain(_)) {
+            fixed_within(type_tag, n, limit)?;
+        }
         match self {
             Self::Plain(data) => Ok(view_of(page, data)),
-            Self::Constant(value) => repeat(type_tag, n, value),
-            Self::Rle { values, ends } => {
+            Self::Constant(value) => repeat(type_tag, n, value, limit),
+            Self::Rle { values, ends, .. } => {
                 let runs = u32::try_from(ends.len()).map_err(|_| MALFORMED)?;
-                let heads = values.materialize(type_tag, runs, page)?;
+                let heads = values.materialize(type_tag, runs, page, limit)?;
                 let mut run = 0usize;
                 let mut rows = Vec::with_capacity(n as usize);
                 for row in 0..n {
@@ -598,14 +660,14 @@ impl<'a> Values<'a> {
                     }
                     rows.push(u32::try_from(run).map_err(|_| MALFORMED)?);
                 }
-                gather(type_tag, &heads, runs, &rows)
+                gather(type_tag, &heads, runs, &rows, limit)
             }
             Self::Dict {
                 values,
                 size,
                 codes,
             } => {
-                let dictionary = values.materialize(type_tag, *size, page)?;
+                let dictionary = values.materialize(type_tag, *size, page, limit)?;
                 let mut decoded = Vec::with_capacity(n as usize);
                 codes.decode_into(n, &mut decoded)?;
                 let rows: Vec<u32> = decoded
@@ -617,7 +679,7 @@ impl<'a> Values<'a> {
                             .ok_or(MALFORMED)
                     })
                     .collect::<Result<_>>()?;
-                gather(type_tag, &dictionary, *size, &rows)
+                gather(type_tag, &dictionary, *size, &rows, limit)
             }
             Self::Ordinals(ints) => {
                 let TypeTag::Number(number) = type_tag else {
@@ -648,7 +710,9 @@ impl<'a> Values<'a> {
                 if at != payload.len() {
                     return Err(MALFORMED);
                 }
-                frame_bytes_column(cells.len(), || cells.iter().copied())
+                // Every cell is a distinct span of the payload, but the
+                // offset table still grows with the rows the lengths declare.
+                frame_bytes_column_within(cells.len(), limit, || cells.iter().copied())
             }
         }
     }
@@ -718,7 +782,7 @@ impl Ints<'_> {
             } else {
                 Selection::none(n)
             }),
-            Self::Rle { values, ends } => {
+            Self::Rle { values, ends, .. } => {
                 let runs = u32::try_from(ends.len()).map_err(|_| MALFORMED)?;
                 let kept = values.select(runs, bounds)?;
                 let mut out = Selection::none(n);
@@ -772,7 +836,7 @@ impl Values<'_> {
             } else {
                 Selection::none(n)
             }),
-            Self::Rle { values, ends } => {
+            Self::Rle { values, ends, .. } => {
                 let runs = u32::try_from(ends.len()).map_err(|_| MALFORMED)?;
                 let kept = values.select(type_tag, runs, bounds)?;
                 let mut out = Selection::none(n);
@@ -922,7 +986,7 @@ impl<'a> IntRows<'a> {
                 delta.decode_into(n, &mut values)?;
                 Self::Decoded(values)
             }
-            Ints::Rle { values, ends } => {
+            Ints::Rle { values, ends, .. } => {
                 let runs = u32::try_from(ends.len()).map_err(|_| MALFORMED)?;
                 Self::Runs {
                     values: Box::new(Self::new(*values, runs)?),
@@ -1067,7 +1131,7 @@ impl<'a> Values<'a> {
         Ok(match self {
             Self::Plain(data) => Rows::Plain(data),
             Self::Constant(value) => Rows::Constant(value),
-            Self::Rle { values, ends } => {
+            Self::Rle { values, ends, .. } => {
                 let runs = u32::try_from(ends.len()).map_err(|_| MALFORMED)?;
                 Rows::Runs {
                     values: Box::new(values.rows(type_tag, runs)?),
@@ -1208,16 +1272,18 @@ impl Values<'_> {
     ///
     /// # Errors
     ///
-    /// As [`Self::materialize`], for the rows it reads.
+    /// As [`Self::materialize`], for the rows it reads and within `limit`.
     pub(crate) fn materialize_rows(
         self,
         type_tag: TypeTag,
         n: u32,
         keep: &Selection,
+        limit: u64,
     ) -> Result<Slice> {
         if let Self::Plain(data) = self {
             return gather_plain(type_tag, data, n, keep);
         }
+        fixed_within(type_tag, keep.count(), limit)?;
         let count = keep.count() as usize;
         let access = self.rows(type_tag, n)?;
         let cells = keep
@@ -1230,7 +1296,7 @@ impl Values<'_> {
                 count,
                 cells.iter().map(|c| Some(&**c)),
             )),
-            None => frame_bytes_column(count, || cells.iter().map(|c| &**c)),
+            None => frame_bytes_column_within(count, limit, || cells.iter().map(|c| &**c)),
         }
     }
 }
@@ -1257,15 +1323,34 @@ pub fn ordinal_width(type_tag: TypeTag) -> Option<u8> {
     }
 }
 
-/// `value` for each of `n` rows, in the column's layout.
-fn repeat(type_tag: TypeTag, n: u32, value: &[u8]) -> Result<Slice> {
+/// Refuses building `rows` rows of a fixed column of `type_tag` past `limit`
+/// bytes, before anything is allocated; a bytes column is sized as it is
+/// framed instead.
+fn fixed_within(type_tag: TypeTag, rows: u32, limit: u64) -> Result<()> {
+    let Some(width) = type_tag.fixed_width() else {
+        return Ok(());
+    };
+    // A u32 times a u8, well within a u64.
+    let len = u64::from(rows) * u64::from(width);
+    if len > limit {
+        return Err(Error::DecompressedSizeTooLarge {
+            declared: len,
+            limit,
+        });
+    }
+    Ok(())
+}
+
+/// `value` for each of `n` rows, in the column's layout; a bytes column is
+/// refused past `limit` bytes.
+fn repeat(type_tag: TypeTag, n: u32, value: &[u8], limit: u64) -> Result<Slice> {
     match type_tag.fixed_width() {
         Some(_) => Ok(super::gather_fixed_column(
             value.len(),
             n as usize,
             (0..n).map(|_| Some(value)),
         )),
-        None => frame_bytes_column(n as usize, || (0..n).map(|_| value)),
+        None => frame_bytes_column_within(n as usize, limit, || (0..n).map(|_| value)),
     }
 }
 
@@ -1372,8 +1457,15 @@ fn gather_plain(type_tag: TypeTag, data: &[u8], n: u32, keep: &Selection) -> Res
 }
 
 /// The rows of `source`, a layout of `source_rows` rows, that `rows` names,
-/// in that order, as a layout of their own.
-fn gather(type_tag: TypeTag, source: &[u8], source_rows: u32, rows: &[u32]) -> Result<Slice> {
+/// in that order, as a layout of their own; a bytes column is refused past
+/// `limit` bytes, since `rows` may name one row many times.
+fn gather(
+    type_tag: TypeTag,
+    source: &[u8],
+    source_rows: u32,
+    rows: &[u32],
+    limit: u64,
+) -> Result<Slice> {
     // Checked once, so the gather below can take each cell as found.
     for &row in rows {
         cell(type_tag, source, source_rows, row)?;
@@ -1386,7 +1478,7 @@ fn gather(type_tag: TypeTag, source: &[u8], source_rows: u32, rows: &[u32]) -> R
             rows.iter().map(|&row| Some(take(row))),
         ))
     } else {
-        frame_bytes_column(rows.len(), || rows.iter().map(|&row| take(row)))
+        frame_bytes_column_within(rows.len(), limit, || rows.iter().map(|&row| take(row)))
     }
 }
 
@@ -1515,8 +1607,9 @@ const fn var_len(value: u64) -> usize {
     }
 }
 
-/// `values` as FFOR at the bit width that makes it smallest, the values past
-/// that width patched in as exceptions.
+/// `values` as FFOR at the bit width that costs least to store and to patch,
+/// the values past that width patched in as exceptions. Only this width
+/// becomes a trial, so it is chosen by the same cost the trials are.
 fn ffor(values: &[u64]) -> Trial {
     let n = u32::try_from(values.len()).unwrap_or(u32::MAX);
     let base = values.iter().copied().min().unwrap_or(0);
@@ -1531,15 +1624,19 @@ fn ffor(values: &[u64]) -> Trial {
             *w += var_len(value) as u64;
         }
     }
-    // The size at width `w`: the packed offsets, plus every row needing more
-    // than `w` bits as a gap (a byte, near enough) and its value.
+    // The cost at width `w`: the packed offsets, plus every row needing more
+    // than `w` bits as a gap (a byte, near enough) and its value, stored, and
+    // each of those rows patched back. Unpacking costs the same per row at
+    // every width, so it does not decide.
     let mut best_width = 64u8;
-    let mut best_size = u64::MAX;
+    let mut best_cost = u64::MAX;
     let (mut above_count, mut above_whole) = (0u64, 0u64);
     for width in (0..=64u8).rev() {
         let size = (u64::from(n) * u64::from(width)).div_ceil(8) + above_count + above_whole;
-        if size <= best_size {
-            best_size = size;
+        // A page's rows and bytes are far below where this could overflow.
+        let cost = size * cost::STORED_BYTE + above_count * cost::PATCH;
+        if cost <= best_cost {
+            best_cost = cost;
             best_width = width;
         }
         above_count += count.get(usize::from(width)).copied().unwrap_or(0);
