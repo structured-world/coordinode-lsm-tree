@@ -124,20 +124,31 @@ fn an_allocation_past_the_last_block_is_refused() {
 }
 
 /// An allocation larger than the small blocks can hold skips past them to the
-/// first block that fits it, and reads back from there.
+/// first block that fits it, allocating only that block: the ones it skips
+/// could not have held it, and allocating them anyway would take the memory
+/// the small blocks exist to save. It reads back from where it landed.
 #[test]
 fn an_allocation_larger_than_the_small_blocks_lands_in_one_that_fits() {
     let arena = Arena::new();
     let big = BLOCK_SIZE - 64;
     let off = arena.alloc(big, 1).expect("ok");
-    assert_eq!(off >> BLOCK_SHIFT, first_full_block());
-    // SAFETY: freshly allocated, exclusive access.
+    let full = first_full_block();
+    assert_eq!(off >> BLOCK_SHIFT, full);
+    assert!(
+        arena.blocks[..full as usize]
+            .iter()
+            .all(|block| block.load(Ordering::Relaxed).is_null()),
+        "no block the allocation skipped was allocated",
+    );
+    // SAFETY: freshly allocated, exclusive access; the whole span is written
+    // before it is read back as a shared slice.
     unsafe {
         let bytes = arena.get_bytes_mut(off, big);
+        bytes.fill(0);
         bytes[0] = 1;
         bytes[big as usize - 1] = 2;
     }
-    // SAFETY: allocated and both bytes read here were written above.
+    // SAFETY: allocated and fully initialised above.
     let read = unsafe { arena.get_bytes(off, big) };
     assert_eq!((read[0], read[big as usize - 1]), (1, 2));
 }
