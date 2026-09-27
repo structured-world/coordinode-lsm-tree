@@ -597,3 +597,86 @@ fn tail_hint_keeps_internal_key_order_under_mixed_inserts() {
     );
     assert_eq!(map.len(), expected.len());
 }
+
+/// Arms the seek hook to insert `(user_key, seqno)` into the window between a
+/// seek's level-0 comparison and its return, the way a concurrent writer can.
+fn insert_during_next_seek(map: &SkipMap, user_key: &'static [u8], seqno: SeqNo) {
+    map.set_seek_hook(alloc::boxed::Box::new(move |map: &SkipMap| {
+        map.insert(&make_key(user_key, seqno), make_value(b"concurrent"));
+    }));
+}
+
+/// `(user key, seqno)` of every entry a range yields.
+fn yielded(range: Range<'_>) -> Vec<(Vec<u8>, SeqNo)> {
+    range
+        .map(|e| {
+            let k = e.key();
+            (k.user_key.to_vec(), k.seqno)
+        })
+        .collect()
+}
+
+/// A key linked below the lower bound after the seek compared its successor
+/// must not be yielded: the seek is the range's only lower-bound check.
+#[test]
+fn a_range_never_yields_a_key_inserted_below_its_bound_during_the_seek() {
+    let map = new_map();
+    map.insert(&make_key(b"a", 1), make_value(b"a"));
+    map.insert(&make_key(b"d", 1), make_value(b"d"));
+    insert_during_next_seek(&map, b"b", 1);
+    let got = yielded(map.range(make_key(b"c", SeqNo::MAX)..));
+    assert_eq!(got, vec![(b"d".to_vec(), 1)]);
+}
+
+/// The same when the compared successor was the end of the list: a key
+/// appended below the bound afterwards is not yielded either.
+#[test]
+fn a_range_past_the_last_key_never_yields_a_key_appended_below_its_bound() {
+    let map = new_map();
+    map.insert(&make_key(b"a", 1), make_value(b"a"));
+    insert_during_next_seek(&map, b"b", 1);
+    let got = yielded(map.range(make_key(b"c", SeqNo::MAX)..));
+    assert!(got.is_empty(), "yielded {got:?}");
+}
+
+/// An exclusive lower bound excludes a key equal to it, even one linked
+/// after the seek compared the successor.
+#[test]
+fn an_exclusive_bound_never_yields_an_equal_key_inserted_during_the_seek() {
+    let map = new_map();
+    map.insert(&make_key(b"a", 1), make_value(b"a"));
+    map.insert(&make_key(b"d", 1), make_value(b"d"));
+    insert_during_next_seek(&map, b"c", 1);
+    let got = yielded(map.range((Bound::Excluded(make_key(b"c", 1)), Bound::Unbounded)));
+    assert_eq!(got, vec![(b"d".to_vec(), 1)]);
+}
+
+/// Another key linked before the target during the seek must not hide the
+/// target: `point_get` finds the version it compared.
+#[test]
+fn point_get_finds_the_key_when_another_is_inserted_before_it_during_the_seek() {
+    let map = new_map();
+    map.insert(&make_key(b"a", 1), make_value(b"a"));
+    map.insert(&make_key(b"k", 3), make_value(b"k3"));
+    insert_during_next_seek(&map, b"b", 1);
+    let got = map.point_get(b"k", 5).map(|v| v.key.seqno);
+    assert_eq!(got, Some(3));
+}
+
+/// A newer version of the key sorts before the visible one; linked during the
+/// seek it must stay invisible to a read below its seqno, including one right
+/// at `max_seqno + 1`.
+#[test]
+fn point_get_never_returns_a_version_above_its_snapshot_inserted_during_the_seek() {
+    let got: Vec<(SeqNo, Option<SeqNo>)> = [9, 6]
+        .into_iter()
+        .map(|newer| {
+            let map = new_map();
+            map.insert(&make_key(b"a", 1), make_value(b"a"));
+            map.insert(&make_key(b"k", 3), make_value(b"k3"));
+            insert_during_next_seek(&map, b"k", newer);
+            (newer, map.point_get(b"k", 5).map(|v| v.key.seqno))
+        })
+        .collect();
+    assert_eq!(got, vec![(9, Some(3)), (6, Some(3))]);
+}
