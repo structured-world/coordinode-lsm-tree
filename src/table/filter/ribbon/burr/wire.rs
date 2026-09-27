@@ -76,6 +76,28 @@ const HEADER_LEN: usize = MAGIC_BYTES.len() + 6 + 8;
 /// Per-layer fixed header length: m + num_blocks + z_byte_len = 12.
 const LAYER_HEADER_LEN: usize = 12;
 
+/// Bytes [`encode`] writes for a filter over `n` keys built under `params`,
+/// estimated before the build: the header, and per layer its header, one
+/// threshold byte per block and `stride_words` words per slot. The first
+/// layer is sized as the build sizes it; the layers the bumped keys land in
+/// add about 15% on top of it, a property of the threshold scheme's load
+/// factor rather than of `n`.
+#[must_use]
+#[expect(
+    clippy::cast_precision_loss,
+    clippy::cast_possible_truncation,
+    clippy::cast_sign_loss,
+    reason = "an estimate over a key count a writer holds in memory"
+)]
+pub fn encoded_len_estimate(params: &super::params::BurrParams, n: usize) -> usize {
+    let b = usize::from(params.b);
+    let inflated = crate::f32_ceil((n as f32) * (1.0 + params.per_layer_overhead)) as usize;
+    let m0 = inflated.max(b).div_ceil(b) * b;
+    let stride_words = usize::from(params.r).div_ceil(64);
+    let first_layer = LAYER_HEADER_LEN + m0 / b + m0 * stride_words * 8;
+    HEADER_LEN + first_layer * 115 / 100
+}
+
 /// Serialize a built [`BurrFilter`] into the wire format.
 pub(crate) fn encode(filter: &BurrFilter) -> Vec<u8> {
     let params = filter.params();

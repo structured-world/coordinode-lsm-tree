@@ -102,7 +102,7 @@ pub fn section_size_estimate(n: usize, spec: LocatorSpec, max_block: u64, max_sl
     // it, in `u16`.
     let r = (u16::from(block_id_bits) + u16::from(slot_bits)).min(64);
     SECTION_HEADER_LEN
-        + crate::config::BloomConstructionPolicy::BitsPerKey(f32::from(r)).estimated_filter_size(n)
+        + crate::config::BloomConstructionPolicy::BitsPerKey(f32::from(r)).encoded_filter_size(n)
 }
 
 /// Build the `locator` section bytes from accumulated `(hash, block_id, slot)`

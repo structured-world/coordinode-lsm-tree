@@ -327,9 +327,14 @@ impl<W: crate::io::Write + crate::io::Seek> FilterWriter<W> for PartitionedFilte
     }
 
     fn finish_output_bytes(&self) -> u64 {
-        // The top-level index is counted at its in-memory size, above what
-        // its encoding takes.
-        (self.final_filter_buffer.len() + self.approx_filter_size + self.tli_bytes) as u64
+        // The open partition is counted by its wire layout, which the
+        // partition-split estimate does not model; the top-level index at its
+        // in-memory size, above what its encoding takes.
+        (self.final_filter_buffer.len()
+            + self
+                .bloom_policy
+                .encoded_filter_size(self.bloom_hash_buffer.len())
+            + self.tli_bytes) as u64
     }
 
     fn finish(

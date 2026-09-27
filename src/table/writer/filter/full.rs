@@ -123,14 +123,14 @@ impl<W: crate::io::Write + crate::io::Seek> FilterWriter<W> for FullFilterWriter
         let hashes = self.bloom_hash_buffer.capacity() * core::mem::size_of::<u64>();
         let n = self.bloom_hash_buffer.len();
         let build = crate::table::filter::ribbon::burr::builder::build_peak_bytes(n, false);
-        (hashes + build + self.bloom_policy.estimated_filter_size(n)) as u64
+        (hashes + build + self.bloom_policy.encoded_filter_size(n)) as u64
     }
 
     fn finish_output_bytes(&self) -> u64 {
-        // Prefix tokens repeat across keys and are deduplicated at `finish`,
-        // so this counts them before the dedup: an estimate from above.
+        // Every buffered token, prefix tokens included, is built into the
+        // filter.
         self.bloom_policy
-            .estimated_filter_size(self.bloom_hash_buffer.len()) as u64
+            .encoded_filter_size(self.bloom_hash_buffer.len()) as u64
     }
 
     fn finish(
