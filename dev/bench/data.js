@@ -1,5 +1,5 @@
 window.BENCHMARK_DATA = {
-  "lastUpdate": 1790519312397,
+  "lastUpdate": 1790536488192,
   "repoUrl": "https://github.com/structured-world/coordinode-lsm-tree",
   "entries": {
     "lsm-tree db_bench costs": [
@@ -25824,6 +25824,90 @@ window.BENCHMARK_DATA = {
             "value": 192929.89530124815,
             "unit": "ops/sec",
             "extra": "P50: 2.5us | P99: 13.2us | P99.9: 343.8us\nthreads: 1 | elapsed: 1.04s | num: 200000 | iterations: 3"
+          }
+        ]
+      },
+      {
+        "commit": {
+          "author": {
+            "email": "mail@polaz.com",
+            "name": "Dmitry Prudnikov",
+            "username": "polaz"
+          },
+          "committer": {
+            "email": "noreply@github.com",
+            "name": "GitHub",
+            "username": "web-flow"
+          },
+          "distinct": true,
+          "id": "16125ed216ce94b5cb4089a31c25a1eed7533f5c",
+          "message": "fix(memtable): return the successor a skiplist seek compared (#731)\n\n## Summary\n\n`SkipMap::seek_ge_parts` and `SkipMap::seek_gt` compared each level's\nsuccessor against the target, then returned a fresh `next_at(node, 0)`\ninstead of the level-0 successor they compared. A node a concurrent\nwriter linked between `node` and that successor after the comparison\ncame back without ever being compared; when the loop had reached the end\nof the list, the reload could return a node appended after `node` below\nthe target.\n\nUnder concurrent commits this let a range or prefix iterator yield a key\nbelow its lower bound (the seek is the iterator's only lower-bound\ncheck), let `point_get` miss a present key, and let `point_get` return a\nversion of the key newer than its `max_seqno`, since versions sort by\ndescending seqno and a newer one lands between the predecessor and the\ntarget.\n\nBoth helpers now return the successor they compared (UNSET at the end of\nthe list), as `find_splice` already does. That node was `node`'s\nsuccessor when it was compared; a node linked in between afterwards is a\nwrite concurrent with the seek. `seek_le`, `seek_lt` and\n`find_predecessor` return the node they validated and are unchanged. The\nread path loses one atomic load and gains nothing.\n\nBackport to 5.x.x: #732.\n\n## Testing\n\n- a test-only hook runs once inside a seek, between its level-0\ncomparison and its return, and links a node there; five regressions,\neach red before the fix:\n- a range never yields a key inserted below its lower bound, including\none appended past the last key\n  - an exclusive bound never yields an equal key\n  - `point_get` finds the key when another is inserted before it\n- `point_get` never returns a version inserted at `max_seqno + 4` or at\n`max_seqno + 1`\n- miri on the skiplist seek and range tests; fmt, clippy (default and\nall features), full nextest (default and all features), doc tests,\n`cargo doc` and the no-std check\n\nCloses #730",
+          "timestamp": "2026-09-27T22:08:28+03:00",
+          "tree_id": "5491f61911247a049137499b113a4434bcce315d",
+          "url": "https://github.com/structured-world/coordinode-lsm-tree/commit/16125ed216ce94b5cb4089a31c25a1eed7533f5c"
+        },
+        "date": 1790536485302,
+        "tool": "customBiggerIsBetter",
+        "benches": [
+          {
+            "name": "mixed",
+            "value": 32225.30069700428,
+            "unit": "ops/sec",
+            "extra": "P50: 0.5us | P99: 9.3us | P99.9: 16.4us\nthreads: 1 | elapsed: 16.61s | num: 200000 | iterations: 3"
+          },
+          {
+            "name": "fillseq",
+            "value": 2749187.7902686973,
+            "unit": "ops/sec",
+            "extra": "P50: 0.2us | P99: 0.8us | P99.9: 1.1us\nthreads: 1 | elapsed: 0.07s | num: 200000 | iterations: 3"
+          },
+          {
+            "name": "fillrandom",
+            "value": 741752.2105384134,
+            "unit": "ops/sec",
+            "extra": "P50: 1.2us | P99: 2.3us | P99.9: 12.6us\nthreads: 1 | elapsed: 0.27s | num: 200000 | iterations: 3"
+          },
+          {
+            "name": "readrandom",
+            "value": 512653.5139665939,
+            "unit": "ops/sec",
+            "extra": "P50: 1.8us | P99: 6.4us | P99.9: 20.2us\nthreads: 1 | elapsed: 0.39s | num: 200000 | iterations: 3"
+          },
+          {
+            "name": "readseq",
+            "value": 2306466.1813992523,
+            "unit": "ops/sec",
+            "extra": "P50: 0.3us | P99: 4.6us | P99.9: 6.2us\nthreads: 1 | elapsed: 0.09s | num: 200000 | iterations: 3"
+          },
+          {
+            "name": "seekrandom",
+            "value": 265047.5600347798,
+            "unit": "ops/sec",
+            "extra": "P50: 3.2us | P99: 7.9us | P99.9: 15.9us\nthreads: 1 | elapsed: 0.75s | num: 200000 | iterations: 3"
+          },
+          {
+            "name": "prefixscan",
+            "value": 152212.3704253763,
+            "unit": "ops/sec",
+            "extra": "P50: 6.0us | P99: 11.6us | P99.9: 27.6us\nthreads: 1 | elapsed: 1.31s | num: 200000 | iterations: 3"
+          },
+          {
+            "name": "overwrite",
+            "value": 765152.658591011,
+            "unit": "ops/sec",
+            "extra": "P50: 1.1us | P99: 2.4us | P99.9: 11.8us\nthreads: 1 | elapsed: 0.26s | num: 200000 | iterations: 3"
+          },
+          {
+            "name": "mergerandom",
+            "value": 755070.5051425832,
+            "unit": "ops/sec",
+            "extra": "P50: 0.4us | P99: 0.7us | P99.9: 6.7us\nthreads: 1 | elapsed: 0.26s | num: 200000 | iterations: 3"
+          },
+          {
+            "name": "readwhilewriting",
+            "value": 339438.53651577345,
+            "unit": "ops/sec",
+            "extra": "P50: 2.1us | P99: 16.7us | P99.9: 87.0us\nthreads: 1 | elapsed: 0.59s | num: 200000 | iterations: 3"
           }
         ]
       }
