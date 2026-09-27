@@ -1,5 +1,49 @@
 use super::*;
 
+/// A memtable holds at least one block, taken by the skiplist's head node, and
+/// a platform that commits heap allocations up front (Windows) charges the
+/// whole block to the process then. Blocks are 4 MiB on every target, so an
+/// idle memtable costs 4 MiB there; before, 64-bit targets took 64 MiB blocks.
+#[test]
+fn block_size_on_every_target_is_4_mib() {
+    assert_eq!(BLOCK_SIZE, 4 * 1024 * 1024);
+    assert_eq!(MAX_BLOCKS, 1024, "4 GiB of arena in 4 MiB blocks");
+}
+
+/// A lightly filled arena allocates only the block its data sits in.
+#[test]
+fn small_allocations_on_a_fresh_arena_take_only_block_0() {
+    let arena = Arena::new();
+    for _ in 0..1000 {
+        let off = arena.alloc(64, 4).expect("alloc");
+        assert_eq!(off >> BLOCK_SHIFT, 0);
+    }
+    assert!(!arena.blocks[0].load(Ordering::Relaxed).is_null());
+    assert!(
+        arena.blocks[1..]
+            .iter()
+            .all(|block| block.load(Ordering::Relaxed).is_null()),
+        "no block past the first was allocated",
+    );
+}
+
+/// A view that outlives the arena frees its block with the size the block was
+/// allocated at.
+#[cfg(not(feature = "bytes_1"))]
+#[test]
+fn a_view_into_a_block_outlives_the_arena() {
+    let arena = Arena::new();
+    let off = arena.alloc(40, 4).expect("alloc");
+    // SAFETY: freshly allocated, exclusive access.
+    unsafe {
+        arena.get_bytes_mut(off, 40).copy_from_slice(&[7u8; 40]);
+    }
+    // SAFETY: the span was allocated and fully written above.
+    let view = unsafe { arena.get_view(off, 40) };
+    drop(arena);
+    assert_eq!(&*view, &[7u8; 40][..]);
+}
+
 #[test]
 fn basic_alloc_and_read() {
     let arena = Arena::new();
@@ -36,6 +80,27 @@ fn alloc_crosses_block_boundary() {
 
     let off2 = arena.alloc(128, 4).expect("ok");
     assert_eq!(off2 >> BLOCK_SHIFT, 1);
+}
+
+/// Past the last block the arena is exhausted: an allocation that does not fit
+/// the last block is refused rather than wrapping to an earlier block, and one
+/// that fits still lands in it.
+#[test]
+fn an_allocation_past_the_last_block_is_refused() {
+    let arena = Arena::new();
+    let last = u32::try_from(MAX_BLOCKS - 1).expect("a block index fits u32");
+    arena.cursor.store(last << BLOCK_SHIFT, Ordering::Relaxed);
+    let big = BLOCK_SIZE - 64;
+    let off = arena.alloc(big, 1).expect("fits the last block");
+    assert_eq!(off >> BLOCK_SHIFT, last);
+    assert!(
+        arena.alloc(128, 4).is_none(),
+        "no block follows the last one"
+    );
+    let tail = arena
+        .alloc(8, 4)
+        .expect("the last block still has room for this");
+    assert_eq!(tail >> BLOCK_SHIFT, last);
 }
 
 #[test]
@@ -120,8 +185,8 @@ fn drop_with_multiple_blocks() {
 fn exact_block_fill_does_not_corrupt() {
     let arena = Arena::new();
 
-    // Jump the cursor directly to block 1, offset 0 — avoids allocating
-    // an entire block 0 (64 MiB on 64-bit) just to advance past it.
+    // Jump the cursor directly to block 1, offset 0, without allocating
+    // block 0 just to advance past it.
     arena.cursor.store(1 << BLOCK_SHIFT, Ordering::Relaxed);
 
     // Allocate (BLOCK_SIZE - 4) bytes to bring block 1's cursor to

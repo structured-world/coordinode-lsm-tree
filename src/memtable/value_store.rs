@@ -32,8 +32,12 @@ const SEGMENT_SIZE: usize = 1 << SEGMENT_SHIFT;
 )]
 const SEGMENT_MASK: u32 = SEGMENT_SIZE as u32 - 1;
 
-/// Maximum segments.  With 64 K entries/segment this supports ~4 billion entries.
-const MAX_SEGMENTS: usize = 1 << (32 - SEGMENT_SHIFT); // 65 536
+/// Maximum segments: enough for every value a memtable can hold. Each value
+/// belongs to a skiplist node of at least `MIN_NODE_SIZE` bytes in an arena of
+/// 2^32 bytes, so 2341 segments (an 18 KiB pointer table, written in full by
+/// [`ValueStore::new`]) cover them.
+const MAX_SEGMENTS: usize =
+    (u32::MAX as usize / super::skiplist::MIN_NODE_SIZE as usize) / SEGMENT_SIZE + 1;
 
 /// A lock-free append-only store for [`UserValue`] entries.
 ///
@@ -54,8 +58,7 @@ pub struct ValueStore {
 impl ValueStore {
     /// Creates a new empty store.
     ///
-    /// Allocates a fixed-size segment-pointer array (~512 KiB on 64-bit).
-    /// This is acceptable: one array per memtable, and memtables are few.
+    /// Allocates the segment-pointer array (~18 KiB on 64-bit).
     pub fn new() -> Self {
         // Vec optimizes the repeated-null pattern into a single memset.
         // Using Box::new_zeroed_slice would be cleaner but requires nightly.
@@ -77,37 +80,35 @@ impl ValueStore {
     ///
     /// # Panics
     ///
-    /// Panics when the index space is exhausted (`u32::MAX` reservations),
-    /// rather than wrapping and re-issuing a slot that live nodes still
-    /// reference. Unreachable in practice: the arena backing the nodes these
-    /// values belong to addresses 2^32 bytes and a node costs at least 28 of
-    /// them, so it reports exhaustion roughly 28x earlier.
+    /// Panics when the segment table is exhausted, rather than writing past
+    /// it. Unreachable in practice: the table covers every value the arena
+    /// backing their nodes can hold, and the arena reports exhaustion first.
     #[expect(
         clippy::indexing_slicing,
-        reason = "seg_idx < MAX_SEGMENTS enforced by u32 index range"
+        reason = "seg_idx < MAX_SEGMENTS enforced by the assert below"
     )]
     pub fn append(&self, value: UserValue) -> u32 {
-        // One atomic RMW rather than a CAS loop guarding `u32::MAX`: the
+        // One atomic RMW rather than a CAS loop guarding the bound: the
         // counter cannot get there. Every value belongs to one skiplist node,
-        // the node is allocated BEFORE this call and occupies at least 28
-        // arena bytes, and arena offsets are `u32` (2^32 bytes total), so a
-        // memtable holds fewer than 2^32 / 28 entries; the arena panics on
-        // exhaustion roughly 28x before this index space could wrap.
+        // the node is allocated BEFORE this call and occupies at least
+        // `MIN_NODE_SIZE` arena bytes, and arena offsets are `u32` (2^32
+        // bytes total), so the arena panics on exhaustion before the counter
+        // leaves the table.
         //
         // The assert is nonetheless a real one, not a `debug_assert`: the
         // bound above is an invariant spanning two modules, and if a future
-        // change breaks it the failure mode is silent data corruption (a
-        // wrapped index re-issues slot 0, `ptr::write` overwrites a value
-        // live skiplist nodes still point at, and a concurrent reader of
-        // that slot races the write). Failing loudly costs one compare
-        // against a constant on a perfectly predicted branch, touches no
-        // memory, and keeps the single-RMW reservation; a CAS loop would
-        // charge the hot path for a path that cannot be taken. The last
-        // index is spent on the guard rather than handed out, so the wrap
-        // is refused before any slot can be re-issued.
+        // change breaks it the failure mode must be loud rather than an
+        // out-of-bounds write. It costs one compare against a constant on a
+        // perfectly predicted branch, touches no memory, and keeps the
+        // single-RMW reservation; a CAS loop would charge the hot path for a
+        // path that cannot be taken. A refused index is never written, and
+        // `Drop` skips it: it lies past every segment.
         let idx = self.next_idx.fetch_add(1, Ordering::Relaxed);
-        assert!(idx != u32::MAX, "ValueStore::append: index space exhausted");
         let seg_idx = (idx >> SEGMENT_SHIFT) as usize;
+        assert!(
+            seg_idx < MAX_SEGMENTS,
+            "ValueStore::append: index space exhausted"
+        );
         let slot = (idx & SEGMENT_MASK) as usize;
 
         self.ensure_segment(seg_idx);
@@ -143,7 +144,7 @@ impl ValueStore {
     /// CAS chain) to ensure the value at `idx` has been fully written.
     #[expect(
         clippy::indexing_slicing,
-        reason = "seg_idx < MAX_SEGMENTS enforced by u32 index range"
+        reason = "idx came from append, which keeps seg_idx < MAX_SEGMENTS"
     )]
     pub unsafe fn get(&self, idx: u32) -> UserValue {
         let seg_idx = (idx >> SEGMENT_SHIFT) as usize;
@@ -221,8 +222,9 @@ impl Drop for ValueStore {
             return;
         }
 
-        // Only iterate segments that could contain initialised entries.
-        let max_seg_idx = ((total - 1) >> SEGMENT_SHIFT) as usize + 1;
+        // Only iterate segments that could contain initialised entries. An
+        // index `append` refused lies past the table and was never written.
+        let max_seg_idx = (((total - 1) >> SEGMENT_SHIFT) as usize + 1).min(MAX_SEGMENTS);
 
         for seg_idx in 0..max_seg_idx {
             #[expect(

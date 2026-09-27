@@ -6,6 +6,8 @@
 //!
 //! Blocks are allocated lazily — the arena never pre-allocates a large
 //! contiguous buffer, so it works on 32-bit targets with limited address space.
+//! Every block is 4 MiB (see [`BLOCK_SHIFT`]), so a memtable allocates close to
+//! what it holds and an empty one holds a single block.
 //! Once a block is full, a new one is allocated and the remaining space in the
 //! old block is abandoned (waste is negligible for typical node allocations of
 //! < 100 bytes).
@@ -27,16 +29,18 @@ use alloc::{boxed::Box, vec::Vec};
 use core::ptr;
 use core::sync::atomic::{AtomicPtr, AtomicU32, Ordering};
 
-/// Bits used for the within-block offset.
+/// Bits used for the within-block offset: 2^22 = 4 MiB per block, on every
+/// target.
 ///
-/// On 64-bit: 2^26 = 64 MiB per block (1M entries fit in block 0,
-/// avoiding multi-block decode overhead).
-/// On 32-bit: 2^22 = 4 MiB per block (keeps allocation within
-/// the limited virtual address space).
-#[cfg(target_pointer_width = "32")]
+/// Every memtable, an empty one included, holds at least one block, taken
+/// by the skiplist's head node. Freshly allocated memory is only reserved on
+/// some platforms, while on others (Windows) the whole allocation is charged
+/// to the process commit at once, so the block size is what an idle memtable
+/// costs there. A block holds the largest node (a tower and a key of at most
+/// `u16::MAX` bytes) many times over, and a larger memtable just takes more
+/// blocks of the same size; the offset decode is one shift and one mask
+/// whatever the block count.
 const BLOCK_SHIFT: u32 = 22;
-#[cfg(not(target_pointer_width = "32"))]
-const BLOCK_SHIFT: u32 = 26;
 
 /// Size of each arena block in bytes.
 const BLOCK_SIZE: u32 = 1 << BLOCK_SHIFT;
@@ -55,7 +59,7 @@ const MAX_BLOCKS: usize = 1 << (32 - BLOCK_SHIFT);
 ///
 /// The u32 offset returned by [`alloc`](Self::alloc) encodes the block
 /// index in the high bits and the within-block offset in the low
-/// `BLOCK_SHIFT` bits (26 on 64-bit, 22 on 32-bit).
+/// `BLOCK_SHIFT` bits.
 pub struct Arena {
     /// Block pointers.  Null means not yet allocated.  Once set to non-null,
     /// a block pointer is never modified — reads may use `Relaxed` ordering
@@ -105,7 +109,7 @@ impl Arena {
             let cur = self.cursor.load(Ordering::Acquire);
             let block_idx = cur >> BLOCK_SHIFT;
             let offset = cur & BLOCK_MASK;
-            // Cannot overflow: offset < BLOCK_SIZE (≤ 2^26), align < BLOCK_SIZE.
+            // Cannot overflow: offset < BLOCK_SIZE (2^22), align < BLOCK_SIZE.
             let aligned = (offset + align - 1) & !(align - 1);
 
             if let Some(new_end) = aligned.checked_add(size) {
@@ -308,9 +312,7 @@ impl Arena {
             // tower slots — BEFORE the node is published (linked via a
             // release CAS), and the head sentinel's tower is explicitly
             // UNSET-initialized at creation. No reader ever observes an
-            // unwritten byte, so eager zeroing is pure waste. Lazy
-            // page-faulting still zero-fills only the pages actually
-            // touched, at the OS level.
+            // unwritten byte, so eager zeroing is pure waste.
             let raw = crate::byteview::ByteView::alloc_shared_heap(BLOCK_SIZE);
 
             // CAS null → raw.  If another thread won, free our block.
