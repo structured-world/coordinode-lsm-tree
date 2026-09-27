@@ -81,7 +81,8 @@ const LAYER_HEADER_LEN: usize = 12;
 /// threshold byte per block and `stride_words` words per slot. The first
 /// layer is sized as the build sizes it; the layers the bumped keys land in
 /// add about 15% on top of it, a property of the threshold scheme's load
-/// factor rather than of `n`.
+/// factor rather than of `n`, for distinct hashes, which the filter writers
+/// pass: equal hashes are bumped together through every layer.
 #[must_use]
 #[expect(
     clippy::cast_precision_loss,
