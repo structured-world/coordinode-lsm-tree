@@ -31,19 +31,20 @@ fn page_expressions(tree: &AnyTree) -> lsm_tree::Result<Vec<Expression>> {
     Ok(out)
 }
 
-/// A columnar tree under `policy` holding 400 rows of one repeated value,
-/// flushed into one table at level 0.
+/// A columnar tree holding 400 rows of one repeated value, flushed into one
+/// table at level 0, under the policy `policy` builds for the tree's level
+/// count.
 fn flushed_tree(
     folder: &std::path::Path,
-    policy: ColumnEncodingPolicy,
+    policy: impl FnOnce(u8) -> ColumnEncodingPolicy,
 ) -> lsm_tree::Result<AnyTree> {
-    let tree = Config::new(
+    let config = Config::new(
         folder,
         SequenceNumberCounter::default(),
         SequenceNumberCounter::default(),
-    )
-    .column_encoding_policy(policy)
-    .open()?;
+    );
+    let levels = config.level_count;
+    let tree = config.column_encoding_policy(policy(levels)).open()?;
     let AnyTree::Standard(standard) = &tree else {
         panic!("a standard tree");
     };
@@ -55,13 +56,21 @@ fn flushed_tree(
     Ok(tree)
 }
 
+/// Each level's tables are written as that level's own policy entry says. A
+/// major compaction writes into the last level, the only one asking for the
+/// cheapest expression here: the repeated value turns into a constant only if
+/// the compaction took the entry of the level it wrote into, every other
+/// level's entry being plain.
 #[test]
-fn a_level_plain_by_policy_stores_plain_pages_and_one_below_encodes_them() -> lsm_tree::Result<()> {
+fn each_level_stores_its_pages_as_its_own_policy_entry_says() -> lsm_tree::Result<()> {
     let folder = get_tmp_folder();
-    let tree = flushed_tree(
-        folder.path(),
-        ColumnEncodingPolicy::new([ColumnEncoding::Plain, ColumnEncoding::Auto]),
-    )?;
+    let tree = flushed_tree(folder.path(), |levels| {
+        let mut policy = vec![ColumnEncoding::Plain; usize::from(levels)];
+        if let Some(last) = policy.last_mut() {
+            *last = ColumnEncoding::Auto;
+        }
+        ColumnEncodingPolicy::new(policy)
+    })?;
 
     // Level 0 asked for plain pages: the repeated value is stored whole.
     let flushed = page_expressions(&tree)?;
@@ -71,13 +80,12 @@ fn a_level_plain_by_policy_stores_plain_pages_and_one_below_encodes_them() -> ls
         "level 0 is plain; got {flushed:?}",
     );
 
-    // Compacted into level 1, which asks for the cheapest expression: the
-    // repeated value becomes a constant.
+    // Compacted into the last level, which asks for the cheapest expression.
     tree.major_compact(u64::MAX, SeqNo::MAX)?;
     let compacted = page_expressions(&tree)?;
     assert!(
         compacted.contains(&Expression::Constant),
-        "level 1 encodes the repeated value; got {compacted:?}",
+        "the last level encodes the repeated value; got {compacted:?}",
     );
     assert_eq!(tree.len(SeqNo::MAX, None)?, 400, "every row still reads");
     Ok(())

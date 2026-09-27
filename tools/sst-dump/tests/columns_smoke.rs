@@ -106,9 +106,49 @@ fn columns_reports_each_page_and_what_it_was_encoded_as() {
         pages.starts_with("group row_page column rows bytes offsets expression"),
         "a page listing first; got:\n{pages}",
     );
+    // The listing's rows, up to the blank line before the summary: group, row
+    // page, column, rows, bytes, offsets, then the expression.
+    let listed: Vec<Vec<&str>> = pages
+        .lines()
+        .skip(1)
+        .take_while(|l| !l.is_empty())
+        .map(|l| l.splitn(7, ' ').collect())
+        .collect();
+    let count = |field: &str| -> u64 {
+        field
+            .parse()
+            .unwrap_or_else(|_| panic!("{field:?} is a count"))
+    };
+    let listed_of = |column: u16| {
+        listed
+            .iter()
+            .filter(move |page| page.get(2) == Some(&column.to_string().as_str()))
+    };
+    assert_eq!(
+        listed_of(0).map(|page| count(page[3])).sum::<u64>(),
+        400,
+        "the listed key pages hold every row; got:\n{pages}",
+    );
+    assert!(
+        listed_of(3).all(|page| page[6] == "constant"),
+        "every listed page of the repeated value is a constant; got:\n{pages}",
+    );
 
     let summary = run(&sst, &["--summary"]);
     let lines: Vec<&str> = summary.lines().collect();
+    for column in 0..4u16 {
+        let summarized: u64 = lines
+            .iter()
+            .skip(1)
+            .filter(|l| l.split(' ').next() == Some(&column.to_string()))
+            .map(|l| count(l.split(' ').nth(1).unwrap_or_default()))
+            .sum();
+        assert_eq!(
+            listed_of(column).count() as u64,
+            summarized,
+            "column {column} lists as many pages as its summary counts",
+        );
+    }
     assert_eq!(
         lines.first().copied(),
         Some("column pages rows bytes offsets expression")
@@ -178,6 +218,9 @@ fn columns_under_the_default_encoding_are_all_plain() {
     );
 }
 
+/// A row-major table stores its rows in data blocks, not column pages, so it
+/// has no page encodings to report: the command says so instead of printing
+/// an empty listing that would read as a columnar table with no pages.
 #[test]
 fn columns_on_a_row_major_table_reports_no_pages() {
     let (_dir, sst) = build_one_sst(50, false, None);

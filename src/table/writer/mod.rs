@@ -817,9 +817,11 @@ impl Writer {
     }
 
     /// Sets how a columnar table's column pages store their values. Ignored
-    /// for a row-major table.
+    /// for a row-major table. Must be set before the first key is written, so
+    /// one table's pages follow one policy.
     #[must_use]
     pub fn use_column_encoding(mut self, encoding: crate::config::ColumnEncoding) -> Self {
+        self.assert_not_started("column encoding");
         self.column_encoding = encoding;
         self
     }
