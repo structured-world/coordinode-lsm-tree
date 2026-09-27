@@ -30,6 +30,9 @@ pub struct PartitionedFilterWriter {
 
     tli_handles: Vec<KeyedBlockHandle>,
 
+    /// Bytes the top-level index entries hold: each handle and its end key.
+    tli_bytes: usize,
+
     /// Key hashes for AMQ filter
     pub bloom_hash_buffer: Vec<u64>,
     approx_filter_size: usize,
@@ -75,6 +78,7 @@ impl PartitionedFilterWriter {
             approx_filter_size: 0,
 
             tli_handles: Vec::new(),
+            tli_bytes: 0,
             partition_size: 4_096,
             bloom_policy,
 
@@ -161,6 +165,7 @@ impl PartitionedFilterWriter {
             0,
             BlockHandle::new(BlockOffset(self.relative_file_pos), bytes_written),
         ));
+        self.tli_bytes += core::mem::size_of::<KeyedBlockHandle>() + key.len();
 
         log::trace!(
             "Built BuRR filter partition ({}B) with end_key={key:?} at +{:#X?}",
@@ -308,6 +313,23 @@ impl<W: crate::io::Write + crate::io::Seek> FilterWriter<W> for PartitionedFilte
         }
 
         Ok(())
+    }
+
+    fn held_bytes(&self) -> u64 {
+        // The built partitions stay buffered until `finish` writes them; only
+        // the open partition's hashes are still to be built.
+        let hashes = self.bloom_hash_buffer.capacity() * core::mem::size_of::<u64>();
+        let build = crate::table::filter::ribbon::burr::builder::build_peak_bytes(
+            self.bloom_hash_buffer.len(),
+            false,
+        );
+        (self.final_filter_buffer.capacity() + hashes + build + self.tli_bytes) as u64
+    }
+
+    fn finish_output_bytes(&self) -> u64 {
+        // The top-level index is counted at its in-memory size, above what
+        // its encoding takes.
+        (self.final_filter_buffer.len() + self.approx_filter_size + self.tli_bytes) as u64
     }
 
     fn finish(

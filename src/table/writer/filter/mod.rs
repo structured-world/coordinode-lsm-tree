@@ -24,6 +24,14 @@ pub trait FilterWriter<W: crate::io::Write + crate::io::Seek> {
     /// Registers a key in the block index.
     fn register_key(&mut self, key: &UserKey) -> crate::Result<()>;
 
+    /// Heap bytes this writer holds until [`finish`](Self::finish), and the
+    /// ones `finish` allocates on top to build the filter, at the peak.
+    fn held_bytes(&self) -> u64;
+
+    /// Bytes [`finish`](Self::finish) will append to the table file,
+    /// estimated from what is held now.
+    fn finish_output_bytes(&self) -> u64;
+
     /// Writes the filter to a file.
     ///
     /// Returns the number of filter blocks written (always 1 in case of full filter block).

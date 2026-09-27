@@ -34,6 +34,8 @@ pub struct PartitionedIndexWriter {
     zstd_two_pass_seed: bool,
 
     tli_handles: Vec<KeyedBlockHandle>,
+    /// Bytes the top-level index entries hold: each handle and its end key.
+    tli_bytes: usize,
     data_block_handles: Vec<KeyedBlockHandle>,
 
     buffer_size: u32,
@@ -72,6 +74,7 @@ impl PartitionedIndexWriter {
             zstd_two_pass_seed: true,
 
             tli_handles: Vec::new(),
+            tli_bytes: 0,
             data_block_handles: Vec::new(),
             block_buffer: Vec::with_capacity(4_096),
 
@@ -146,6 +149,8 @@ impl PartitionedIndexWriter {
             self.relative_file_pos,
         );
 
+        self.tli_bytes +=
+            core::mem::size_of::<KeyedBlockHandle>() + index_block_handle.end_key().len();
         self.tli_handles.push(index_block_handle);
         self.final_write_buffer.append(&mut self.block_buffer);
 
@@ -293,6 +298,20 @@ impl<W: crate::io::Write + crate::io::Seek> BlockIndexWriter<W> for PartitionedI
         }
 
         Ok(())
+    }
+
+    fn held_bytes(&self) -> u64 {
+        // The cut partitions stay buffered until `finish` writes them.
+        (self.final_write_buffer.capacity()
+            + self.block_buffer.capacity()
+            + self.buffer_size as usize
+            + self.tli_bytes) as u64
+    }
+
+    fn finish_output_bytes(&self) -> u64 {
+        // The open partition and the top-level index are counted at their
+        // in-memory size, above what their encoding takes.
+        (self.final_write_buffer.len() + self.buffer_size as usize + self.tli_bytes) as u64
     }
 
     fn finish(

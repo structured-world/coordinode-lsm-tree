@@ -869,6 +869,15 @@ impl MultiWriter {
         Ok(())
     }
 
+    /// The current table reached its target: by its bytes, counting what
+    /// `finish` will append, or by the heap its per-key state holds for
+    /// `finish`. Rows that compress well reach the second first: their data
+    /// stays small while the filter, index and locator state grow per key.
+    fn table_full(&self) -> bool {
+        self.writer.output_size_hint() >= self.target_size
+            || self.writer.held_state_bytes() >= self.target_size
+    }
+
     /// Writes an item
     pub fn write(&mut self, item: InternalValue) -> crate::Result<()> {
         // A new user key is a change of byte IDENTITY, never of byte order:
@@ -884,7 +893,7 @@ impl MultiWriter {
         if is_next_key {
             self.current_key = Some(item.key.user_key.clone());
 
-            if self.writer.output_size_hint() >= self.target_size {
+            if self.table_full() {
                 self.rotate()?;
             }
         }
@@ -910,7 +919,7 @@ impl MultiWriter {
         &mut self,
         batch: &crate::table::columnar::ColumnBatch,
     ) -> crate::Result<Option<crate::UserKey>> {
-        if self.writer.output_size_hint() >= self.target_size {
+        if self.table_full() {
             self.rotate()?;
         }
         let comparator = self.comparator.clone();

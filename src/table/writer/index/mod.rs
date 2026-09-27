@@ -22,6 +22,13 @@ pub trait BlockIndexWriter<W: crate::io::Write + crate::io::Seek> {
     /// Registers a data block in the block index.
     fn register_data_block(&mut self, block_handle: KeyedBlockHandle) -> crate::Result<()>;
 
+    /// Heap bytes this writer holds until [`finish`](Self::finish).
+    fn held_bytes(&self) -> u64;
+
+    /// Bytes [`finish`](Self::finish) will append to the table file,
+    /// estimated from what is held now.
+    fn finish_output_bytes(&self) -> u64;
+
     /// Writes the block index to a file.
     ///
     /// Returns the number of index blocks written and the raw

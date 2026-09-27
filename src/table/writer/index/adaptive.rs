@@ -26,9 +26,10 @@
 //! gets the best of both: single-level until the index is large enough
 //! that pinning it whole stops being cheap, then partitioned.
 //!
-//! Memory is bounded at `spill_threshold` (after spilling, the streaming
-//! partition writer flushes to the file as it goes), so even a huge SST
-//! never buffers its entire index.
+//! Either way the index stays in memory until `finish` writes it: the
+//! partitioned writer buffers its encoded partitions too. What bounds it is
+//! the table: the writer reports the bytes it holds, and a run of tables
+//! rotates to the next one before they reach its target size.
 
 use crate::{
     CompressionType,
@@ -151,6 +152,22 @@ impl<W: Write + Seek + 'static> BlockIndexWriter<W> for AdaptiveIndexWriter<W> {
             self.spill()?;
         }
         Ok(())
+    }
+
+    fn held_bytes(&self) -> u64 {
+        match &self.spilled {
+            Some(partitioned) => partitioned.held_bytes(),
+            // `finish` replays the buffer into a full writer, which encodes
+            // it into one block alongside.
+            None => 2 * self.buffered_bytes,
+        }
+    }
+
+    fn finish_output_bytes(&self) -> u64 {
+        match &self.spilled {
+            Some(partitioned) => partitioned.finish_output_bytes(),
+            None => self.buffered_bytes,
+        }
     }
 
     fn finish(

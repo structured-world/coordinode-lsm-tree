@@ -86,6 +86,30 @@ fn precision_byte(p: LocatorPrecision) -> u8 {
     }
 }
 
+/// Bytes a section over `n` keys will take: its header and a retrieval ribbon
+/// `r` bits per key, `r` chosen as [`build_locator_section`] chooses it from
+/// the largest block id and slot recorded so far. A width past 64 bits skips
+/// the section at build; it is counted at 64 here, an estimate from above.
+#[must_use]
+pub(crate) fn section_size_estimate(
+    n: usize,
+    spec: LocatorSpec,
+    max_block: u64,
+    max_slot: u64,
+) -> usize {
+    let block_id_bits = spec.block_id_bits.unwrap_or_else(|| bits_for(max_block));
+    let slot_bits = if spec.precision == LocatorPrecision::Block {
+        0
+    } else {
+        spec.slot_bits.unwrap_or_else(|| bits_for(max_slot))
+    };
+    // Explicit widths are the caller's, so the sum is taken as the build takes
+    // it, in `u16`.
+    let r = (u16::from(block_id_bits) + u16::from(slot_bits)).min(64);
+    SECTION_HEADER_LEN
+        + crate::config::BloomConstructionPolicy::BitsPerKey(f32::from(r)).estimated_filter_size(n)
+}
+
 /// Build the `locator` section bytes from accumulated `(hash, block_id, slot)`
 /// triples (one per unique key, the newest version's position).
 ///
