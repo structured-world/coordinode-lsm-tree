@@ -58,6 +58,36 @@ struct HandleMeta {
     zone_block_min: Option<UserKey>,
 }
 
+/// Bytes of the padding section between the two meta copies, so a bad sector
+/// cannot take both.
+const META_SEPARATOR_LEN: usize = 4_096;
+
+/// Every section a table can carry, which bounds its table of contents.
+const TABLE_SECTIONS: [&str; 17] = [
+    "data",
+    "index",
+    "tli",
+    "filter",
+    "filter_tli",
+    "block_layout",
+    "seqno_bounds",
+    "zone_map",
+    "delete_bitmap",
+    "locator",
+    "range_tombstones",
+    "meta_mid",
+    "linked_blob_files",
+    "table_version",
+    "meta_separator",
+    "tli_tail",
+    "meta",
+];
+
+/// Bytes every table ends with besides its two meta copies: the version
+/// byte, the separator, and its table of contents and trailer, from above.
+const FIXED_TAIL_LEN: u64 =
+    (1 + META_SEPARATOR_LEN + crate::sfa::toc_and_trailer_len(&TABLE_SECTIONS)) as u64;
+
 /// Heap bytes a vector of handles holds: `logical`, its entries and their
 /// end keys, plus the slots its allocation reserves past its `len` entries.
 fn handles_held(logical: usize, handles: &[KeyedBlockHandle], capacity: usize) -> usize {
@@ -246,6 +276,10 @@ pub struct Writer {
     /// beyond their slots, kept as they are pushed.
     layout_bytes: u64,
     zone_map_bytes: u64,
+
+    /// Bytes of the meta block payload besides its key bounds, taken at the
+    /// first block, once the table's settings are final.
+    meta_base_len: Option<u64>,
 
     initial_level: u8,
 
@@ -492,6 +526,7 @@ impl Writer {
             finish_metadata_bytes: 0,
             layout_bytes: 0,
             zone_map_bytes: 0,
+            meta_base_len: None,
 
             block_buffer: Vec::new(),
             file_writer: writer,
@@ -582,15 +617,114 @@ impl Writer {
         let Some(&(_, max_block, slot)) = self.locators.last() else {
             return;
         };
+        let slot_grew = slot > self.locator_max_slot;
         self.locator_max_slot = self.locator_max_slot.max(slot);
         // Widths the table has outgrown stay outgrown: the section would be
         // skipped at `finish`, so stop collecting for it now.
-        if crate::table::locator::section_widths(spec, max_block, self.locator_max_slot).is_none() {
+        let outgrown =
+            crate::table::locator::section_widths(spec, max_block, self.locator_max_slot).is_none();
+        if outgrown {
             log::debug!("locator section dropped at block {max_block}: explicit widths too narrow");
             self.locator = None;
             self.locators = Vec::new();
+        }
+        // A direct block registers before its slots are folded in here, so the
+        // estimates it left count neither a wider slot nor a dropped locator.
+        if slot_grew || outgrown {
             self.refresh_state_estimates();
         }
+    }
+
+    /// The meta block's contents for a table spanning `first_key..=last_key`.
+    /// `block_counts` are the index and filter block counts, `delete_bitmap`
+    /// the recorded bitmap length and content hash.
+    fn meta_section_params<'k>(
+        &self,
+        first_key: &'k [u8],
+        last_key: &'k [u8],
+        block_counts: (usize, usize),
+        range_tombstone_count: u64,
+        delete_bitmap: (u64, u128),
+        created_at_nanos: u128,
+    ) -> MetaSectionParams<'k> {
+        MetaSectionParams {
+            section_name: "meta_mid",
+            index_block_count: block_counts.0,
+            filter_block_count: block_counts.1,
+            // MID and TAIL must encode the SAME file_size — recovery
+            // falls back transparently and downstream consumers
+            // (compaction window picking, etc.) read it as if it were
+            // authoritative. `self.meta.file_pos` is only ever bumped
+            // inside spill_block, so its value is identical at MID
+            // and TAIL write time.
+            file_size: *self.meta.file_pos,
+            table_id: self.table_id,
+            data_block_count: self.meta.data_block_count as u64,
+            item_count: self.meta.item_count as u64,
+            tombstone_count: self.meta.tombstone_count as u64,
+            weak_tombstone_count: self.meta.weak_tombstone_count as u64,
+            weak_tombstone_reclaimable: self.meta.weak_tombstone_reclaimable_count as u64,
+            key_count: self.meta.key_count as u64,
+            sum_user_key_bytes: self.meta.sum_user_key_bytes,
+            sum_value_bytes: self.meta.sum_value_bytes,
+            uncompressed_size: self.meta.uncompressed_size,
+            first_key,
+            last_key,
+            lowest_seqno: self.meta.lowest_seqno,
+            highest_seqno: self.meta.highest_seqno,
+            highest_kv_seqno: self.meta.highest_kv_seqno,
+            data_block_compression: self.data_block_compression,
+            index_block_compression: self.index_block_compression,
+            // Evaluate the kv-checksum policy once for this table's
+            // (level, table_id). The result is constant across all the
+            // table's data blocks (homogeneous SST), so it doubles as
+            // the per-SST descriptor value — identical to the per-block
+            // decision `spill_block` makes via the same expression.
+            // Columnar blocks carry no per-KV footer (spill_columnar_block writes
+            // no footer flags), so a columnar SST must report no footer here
+            // rather than advertise one its blocks omit.
+            kv_checksum_algo: if self.use_columnar {
+                None
+            } else {
+                self.kv_checksum.and_then(|(policy, algo)| {
+                    policy
+                        .applies(self.initial_level, self.table_id)
+                        .then_some(algo)
+                })
+            },
+            data_block_hash_ratio: self.data_block_hash_ratio,
+            data_block_restart_interval: self.data_block_restart_interval,
+            index_block_restart_interval: self.index_block_restart_interval,
+            initial_level: self.initial_level,
+            use_columnar: self.use_columnar,
+            bulk_ingested: self.bulk_ingested,
+            recency: self.recency,
+            lineage: self.lineage.clone(),
+            lineage_prev: self.lineage_prev,
+            lineage_transformed: self.lineage_transformed,
+            lineage_last: self.lineage_last,
+            range_tombstone_count,
+            delete_bitmap_len: delete_bitmap.0,
+            delete_bitmap_hash: delete_bitmap.1,
+            created_at_nanos,
+            #[cfg(test)]
+            omit_delete_bitmap_hash: self.omit_delete_bitmap_hash_for_test,
+        }
+    }
+
+    /// Bytes of the meta block payload with empty key bounds, from above.
+    ///
+    /// Every other value it holds is fixed-width or fixed for the table once
+    /// writing starts, so the payload of the finished table is this plus its
+    /// key bounds. The lineage markers `finish` may still add are counted.
+    fn meta_payload_len_without_keys(&self) -> crate::Result<u64> {
+        let mut params = self.meta_section_params(&[], &[], (0, 0), 0, (0, 0), 0);
+        let has_lineage = params.lineage.is_some();
+        params.lineage_transformed |= has_lineage;
+        params.lineage_last |= has_lineage;
+        let mut payload = Vec::new();
+        encode_meta_payload(self.ecc, &params, &mut payload)?;
+        Ok(payload.len() as u64)
     }
 
     /// Refreshes the held-state and finish-metadata estimates.
@@ -652,17 +786,43 @@ impl Writer {
                 ) + self.zone_map_bytes,
                 BlockType::ZoneMap,
             ),
-            section(
-                self.delete_bitmap.is_empty(),
-                self.delete_bitmap.len() * core::mem::size_of::<u32>() as u64,
-                BlockType::DeleteBitmap,
-            ),
         ];
-        let sections_held: u64 = sections.iter().map(|&(held, _)| held).sum();
+        // The delete bitmap holds and encodes containers, not rows, so it is
+        // counted by its own accounting.
+        let bitmap = &self.delete_bitmap;
+        let sections_held: u64 =
+            sections.iter().map(|&(held, _)| held).sum::<u64>() + bitmap.heap_len_bound();
+        let bitmap_out = if bitmap.is_empty() {
+            0
+        } else {
+            framed_len_bound(
+                bitmap.encoded_len(),
+                BlockType::DeleteBitmap,
+                self.encryption.as_deref(),
+                self.ecc,
+            )
+        };
 
         let mut metadata = self.filter_writer.finish_output_bytes()
             + self.index_writer.finish_output_bytes()
-            + sections.iter().map(|&(_, out)| out).sum::<u64>();
+            + sections.iter().map(|&(_, out)| out).sum::<u64>()
+            + bitmap_out;
+
+        // The tail every table ends with. The meta block holds the key bounds
+        // besides its base, each with a length varint that grows from one byte
+        // to at most three (keys are at most `u16::MAX` bytes). It is written
+        // twice, under the fixed RS(4,2) parity when the table has any, since
+        // a reader decodes it before learning the table's scheme.
+        if let (Some(base), Some(first), Some(last)) = (
+            self.meta_base_len,
+            &self.meta.first_key,
+            &self.meta.last_key,
+        ) {
+            let payload = base + (first.len() + last.len()) as u64 + 4;
+            let ecc = self.ecc.map(|_| crate::table::block::EccParams::RS_4_2);
+            metadata += FIXED_TAIL_LEN
+                + 2 * framed_len_bound(payload, BlockType::Meta, self.encryption.as_deref(), ecc);
+        }
         let mut locator_held = 0;
         let mut locator_scratch = 0;
 
@@ -1950,6 +2110,9 @@ impl Writer {
         self.prev_pos.1 += u64::from(bytes_written);
 
         self.meta.last_key = Some(last_key);
+        if self.meta_base_len.is_none() {
+            self.meta_base_len = Some(self.meta_payload_len_without_keys()?);
+        }
         // The table rotates on the estimates at its next key, which must count
         // this block.
         self.refresh_state_estimates();
@@ -2384,13 +2547,19 @@ impl Writer {
             self.drain_one_parallel()?;
         }
 
-        // Write index
+        // The index and filter writers are taken out whole (their stand-ins
+        // hold no buffers), so the writer stays whole for the meta below.
         log::trace!("Finishing index writer");
-        let (index_block_count, tli_bytes) = self.index_writer.finish(&mut self.file_writer)?;
+        let index_writer =
+            core::mem::replace(&mut self.index_writer, Box::new(FullIndexWriter::new()));
+        let (index_block_count, tli_bytes) = index_writer.finish(&mut self.file_writer)?;
 
-        // Write filter
         log::trace!("Finishing filter writer");
-        let filter_block_count = self.filter_writer.finish(&mut self.file_writer)?;
+        let filter_writer = core::mem::replace(
+            &mut self.filter_writer,
+            Box::new(FullFilterWriter::new(self.bloom_policy)),
+        );
+        let filter_block_count = filter_writer.finish(&mut self.file_writer)?;
 
         // Write the optional inner-block layout section (only when at least one
         // data block split into >= 2 inner zstd blocks). Absent otherwise, so
@@ -2658,62 +2827,10 @@ impl Writer {
         // must report the SAME created_at so MID-fallback recovery
         // produces the same timestamp as a clean TAIL recovery.
         let created_at_nanos = unix_timestamp().as_nanos();
-        let mut meta_params = MetaSectionParams {
-            section_name: "meta_mid",
-            index_block_count,
-            filter_block_count,
-            // MID and TAIL must encode the SAME file_size — recovery
-            // falls back transparently and downstream consumers
-            // (compaction window picking, etc.) read it as if it were
-            // authoritative. `self.meta.file_pos` is only ever bumped
-            // inside spill_block, so its value is identical at MID
-            // and TAIL write time.
-            file_size: *self.meta.file_pos,
-            table_id: self.table_id,
-            data_block_count: self.meta.data_block_count as u64,
-            item_count: self.meta.item_count as u64,
-            tombstone_count: self.meta.tombstone_count as u64,
-            weak_tombstone_count: self.meta.weak_tombstone_count as u64,
-            weak_tombstone_reclaimable: self.meta.weak_tombstone_reclaimable_count as u64,
-            key_count: self.meta.key_count as u64,
-            sum_user_key_bytes: self.meta.sum_user_key_bytes,
-            sum_value_bytes: self.meta.sum_value_bytes,
-            uncompressed_size: self.meta.uncompressed_size,
+        let mut meta_params = self.meta_section_params(
             first_key,
             last_key,
-            lowest_seqno: self.meta.lowest_seqno,
-            highest_seqno: self.meta.highest_seqno,
-            highest_kv_seqno: self.meta.highest_kv_seqno,
-            data_block_compression: self.data_block_compression,
-            index_block_compression: self.index_block_compression,
-            // Evaluate the kv-checksum policy once for this table's
-            // (level, table_id). The result is constant across all the
-            // table's data blocks (homogeneous SST), so it doubles as
-            // the per-SST descriptor value — identical to the per-block
-            // decision `spill_block` makes via the same expression.
-            // Columnar blocks carry no per-KV footer (spill_columnar_block writes
-            // no footer flags), so a columnar SST must report no footer here
-            // rather than advertise one its blocks omit.
-            kv_checksum_algo: if self.use_columnar {
-                None
-            } else {
-                self.kv_checksum.and_then(|(policy, algo)| {
-                    policy
-                        .applies(self.initial_level, self.table_id)
-                        .then_some(algo)
-                })
-            },
-            data_block_hash_ratio: self.data_block_hash_ratio,
-            data_block_restart_interval: self.data_block_restart_interval,
-            index_block_restart_interval: self.index_block_restart_interval,
-            initial_level: self.initial_level,
-            use_columnar: self.use_columnar,
-            bulk_ingested: self.bulk_ingested,
-            recency: self.recency,
-            lineage: self.lineage.clone(),
-            lineage_prev: self.lineage_prev,
-            lineage_transformed: self.lineage_transformed,
-            lineage_last: self.lineage_last,
+            (index_block_count, filter_block_count),
             range_tombstone_count,
             // Record the count that corresponds to the delete_bitmap section
             // ACTUALLY written above, via the single `writes_delete_bitmap`
@@ -2721,11 +2838,7 @@ impl Writer {
             // applied its deletes, leaving the bitmap empty) writes no section
             // and records 0, so the reader's "count > 0 requires a section"
             // cross-check never fires on a legitimate table.
-            delete_bitmap_len: if writes_delete_bitmap {
-                self.delete_bitmap.len()
-            } else {
-                0
-            },
+            //
             // Bind the delete-bitmap CONTENTS, not just its count, into the meta:
             // an equal-cardinality but checksum-valid bitmap substituted for the
             // real one would otherwise pass the count cross-check and, during
@@ -2734,15 +2847,16 @@ impl Writer {
             // the exact encoded bytes written to the section above; the meta block
             // is itself checksum- and mirror-protected, so this authenticates the
             // section content transitively.
-            delete_bitmap_hash: if writes_delete_bitmap {
-                crate::hash::hash128(delete_bitmap_bytes.as_deref().unwrap_or_default())
+            if writes_delete_bitmap {
+                (
+                    self.delete_bitmap.len(),
+                    crate::hash::hash128(delete_bitmap_bytes.as_deref().unwrap_or_default()),
+                )
             } else {
-                0
+                (0, 0)
             },
             created_at_nanos,
-            #[cfg(test)]
-            omit_delete_bitmap_hash: self.omit_delete_bitmap_hash_for_test,
-        };
+        );
 
         // MID meta copy — defends against torn-write at the file tail
         // (incomplete fsync). Written at the current writer cursor,
@@ -2792,7 +2906,7 @@ impl Writer {
         // ~tens of bytes separate the linked_blob_files / table_version
         // sections between them).
         self.file_writer.start("meta_separator")?;
-        self.file_writer.write_all(&[0u8; 4096])?;
+        self.file_writer.write_all(&[0u8; META_SEPARATOR_LEN])?;
 
         // TLI mirror near the file tail. The head `tli` section was
         // emitted earlier in `finish()` by `index_writer.finish()` —
@@ -3073,7 +3187,16 @@ fn write_meta_section<W: crate::io::Write + crate::io::Seek>(
     p: &MetaSectionParams<'_>,
 ) -> crate::Result<()> {
     file_writer.start(p.section_name)?;
+    encode_meta_payload(ecc, p, block_buffer)?;
+    write_meta_block(file_writer, block_buffer, encryption, ecc, table_id)
+}
 
+/// Encodes the meta block payload for `p` into `block_buffer`.
+fn encode_meta_payload(
+    ecc: Option<crate::table::block::EccParams>,
+    p: &MetaSectionParams<'_>,
+    block_buffer: &mut Vec<u8>,
+) -> crate::Result<()> {
     // Record the EFFECTIVE Page-ECC scheme, not the requested one. On
     // builds without the `page_ecc` cargo feature, `with_ecc()` compiles to
     // the identity and no parity trailer is ever emitted, so the descriptor
@@ -3276,7 +3399,17 @@ fn write_meta_section<W: crate::io::Write + crate::io::Seek>(
 
     block_buffer.clear();
     DataBlock::encode_into(block_buffer, &meta_items, 1, 0.0)?;
+    Ok(())
+}
 
+/// Writes the meta block payload in `block_buffer` as the open section.
+fn write_meta_block<W: crate::io::Write + crate::io::Seek>(
+    file_writer: &mut crate::sfa::Writer<ChecksummedWriter<W>>,
+    block_buffer: &[u8],
+    encryption: Option<&dyn EncryptionProvider>,
+    ecc: Option<crate::table::block::EccParams>,
+    table_id: TableId,
+) -> crate::Result<()> {
     Block::write_into(
         file_writer,
         block_buffer,
@@ -3308,8 +3441,9 @@ fn write_meta_section<W: crate::io::Write + crate::io::Seek>(
             // FIXED RS(4,2) layout (matching the reader's fallback);
             // the configurable scheme applies only to the SST data /
             // index / filter blocks, whose scheme the reader learns
-            // from this descriptor.
-            if effective_ecc.is_some() {
+            // from this descriptor. Without the `page_ecc` feature
+            // `with_ecc` is the identity.
+            if ecc.is_some() {
                 t.with_ecc(crate::table::block::EccParams::RS_4_2)
             } else {
                 t

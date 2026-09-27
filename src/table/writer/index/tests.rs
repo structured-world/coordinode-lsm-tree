@@ -29,6 +29,34 @@ fn assert_counts_capacity(mut writer: Box<dyn BlockIndexWriter<W>>) -> crate::Re
     Ok(())
 }
 
+/// A partitioned index records its partitions at offsets relative to its own
+/// buffer and shifts them to file offsets when it writes the top-level index,
+/// which can widen every offset varint. Written after 3 MiB of data, the
+/// top-level index still fits what the writer counted for it.
+#[test]
+fn a_partitioned_top_level_index_fits_its_estimate_at_a_far_offset() -> crate::Result<()> {
+    use std::io::Write;
+
+    let mut writer: Box<dyn BlockIndexWriter<W>> =
+        Box::new(PartitionedIndexWriter::new()).use_partition_size(64);
+    for i in 0..2_000 {
+        writer.register_data_block(handle(i))?;
+    }
+    let counted = writer.finish_scratch_bytes();
+    let mut file = crate::sfa::Writer::from_writer(crate::checksum::ChecksummedWriter::new(
+        std::io::Cursor::new(Vec::new()),
+    ));
+    file.start("data")?;
+    file.write_all(&alloc::vec![0; 3 << 20])?;
+    let (_, tli) = writer.finish(&mut file)?;
+    assert!(
+        tli.len() as u64 <= counted,
+        "{} top-level index bytes, {counted} counted",
+        tli.len(),
+    );
+    Ok(())
+}
+
 #[test]
 fn a_full_index_counts_its_vector_capacity() -> crate::Result<()> {
     assert_counts_capacity(Box::new(FullIndexWriter::new()))

@@ -4,3 +4,7 @@
 
 pub mod reader;
 pub mod writer;
+
+/// Bytes the trailer takes: its magic, two flag bytes, the table-of-contents
+/// checksum, position and length.
+pub const TRAILER_LEN: usize = writer::TRAILER_MAGIC.len() + 1 + 1 + 16 + 8 + 8;

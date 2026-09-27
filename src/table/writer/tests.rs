@@ -389,6 +389,44 @@ fn write_columnar_batch_enforces_the_ingest_contract() -> crate::Result<()> {
     Ok(())
 }
 
+/// A columnar batch is written and registered before its locator slots are
+/// folded in; the estimates the table rotates on must still count them.
+#[cfg(feature = "columnar")]
+#[test]
+fn a_columnar_batch_leaves_the_estimates_current() -> crate::Result<()> {
+    use crate::comparator::default_comparator;
+    use crate::config::{LocatorPolicyEntry, LocatorPrecision};
+    use crate::table::columnar::entries_to_column_batch;
+
+    let dir = tempfile::tempdir()?;
+    let mut writer = Writer::new(dir.path().join("1"), 1, 0, Arc::new(StdFs))?
+        .use_columnar(true)
+        .use_locator(LocatorPolicyEntry::Enabled {
+            precision: LocatorPrecision::Entry,
+            block_id_bits: None,
+            slot_bits: None,
+        });
+    // One row group: its slots are the table's first, so they grow the
+    // locator's width from nothing.
+    let entries: alloc::vec::Vec<InternalValue> = (0..300u32)
+        .map(|i| {
+            InternalValue::from_components(
+                format!("key{i:06}").into_bytes(),
+                b"v".to_vec(),
+                0,
+                ValueType::Value,
+            )
+        })
+        .collect();
+    writer.write_columnar_batch(&entries_to_column_batch(&entries)?, &default_comparator())?;
+    assert_eq!(writer.meta.data_block_count, 1);
+    let (held, hint) = (writer.held_state_bytes(), writer.output_size_hint());
+    writer.refresh_state_estimates();
+    assert_eq!(held, writer.held_state_bytes(), "held state");
+    assert_eq!(hint, writer.output_size_hint(), "size hint");
+    Ok(())
+}
+
 /// Columnar bulk ingest with an `Entry`-precision locator records a per-key
 /// locator slot for every distinct key (the per-entry-index arm of the direct
 /// block accounting).
@@ -651,6 +689,46 @@ fn the_size_hint_counts_the_mirrored_index() -> crate::Result<()> {
     let mut writer = Writer::new(path.clone(), 1, 0, Arc::new(StdFs))?.use_data_block_size(64);
     write_long_keys(&mut writer, 5_000, 200)?;
     assert_hint_matches_the_table(writer, &path)
+}
+
+/// Every table ends with sections `finish` always writes: two copies of the
+/// meta block, the version byte, the 4 KiB separator between them, the table
+/// of contents and the trailer. A table of a few keys is mostly these.
+#[test]
+fn the_size_hint_counts_the_tail_every_table_writes() -> crate::Result<()> {
+    for key_len in [8, 1_000] {
+        let dir = tempfile::tempdir()?;
+        let path = dir.path().join("1");
+        let mut writer = Writer::new(path.clone(), 1, 0, Arc::new(StdFs))?;
+        write_long_keys(&mut writer, 3, key_len)?;
+        assert_hint_matches_the_table(writer, &path)?;
+    }
+    Ok(())
+}
+
+/// A delete bitmap stores each touched chunk with its index, kind and count,
+/// so sparse deletes cost more than their row count: both estimates count the
+/// bitmap as it will be encoded.
+#[test]
+fn the_estimates_count_a_sparse_delete_bitmap_as_encoded() -> crate::Result<()> {
+    let dir = tempfile::tempdir()?;
+    let mut writer = Writer::new(dir.path().join("1"), 1, 0, Arc::new(StdFs))?.use_zone_map(true);
+    write_keys(&mut writer, 100, 8)?;
+    let (held, hint) = (writer.held_state_bytes(), writer.output_size_hint());
+    for chunk in 0..1_000 {
+        writer
+            .delete_bitmap_mut()
+            .insert(chunk * crate::table::delete_bitmap::CHUNK_ROWS);
+    }
+    writer.refresh_state_estimates();
+    let encoded = writer.delete_bitmap.encode().len() as u64;
+    assert!(
+        writer.output_size_hint() - hint >= encoded,
+        "the hint grew by {} for a {encoded}-byte bitmap",
+        writer.output_size_hint() - hint,
+    );
+    assert!(writer.held_state_bytes() - held >= encoded);
+    Ok(())
 }
 
 /// Zone-map entries own copies of each block's bounds; under long keys those
