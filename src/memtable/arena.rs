@@ -167,10 +167,18 @@ impl Arena {
                         return Some((block_idx << BLOCK_SHIFT) | aligned);
                     }
                 } else {
-                    // Advance to the next block.  Ensure it exists BEFORE
+                    // Advance to the first later block that holds `size` from
+                    // its start. A small block that cannot is skipped and never
+                    // allocated: no offset ever names it, so it stays null and
+                    // costs nothing. Ensure the target exists BEFORE
                     // publishing the new cursor, so that any thread reading
                     // the cursor will find a valid block pointer.
-                    let new_block = block_idx + 1;
+                    let mut new_block = block_idx + 1;
+                    while (new_block as usize) < MAX_BLOCKS
+                        && size >= block_capacity(new_block as usize)
+                    {
+                        new_block += 1;
+                    }
                     if new_block as usize >= MAX_BLOCKS {
                         return None;
                     }

@@ -276,13 +276,14 @@ fn memtable_insert(c: &mut Criterion) {
             .collect();
         group.throughput(criterion::Throughput::Elements(n as u64));
         group.bench_function(criterion::BenchmarkId::from_parameter(n), |b| {
-            b.iter_batched(
+            // By reference, so the filled memtable is dropped outside the
+            // timed routine whatever the batch size.
+            b.iter_batched_ref(
                 || Memtable::new(0, default_cmp()),
                 |memtable| {
                     for entry in &entries {
                         memtable.insert(entry.clone());
                     }
-                    memtable
                 },
                 criterion::BatchSize::PerIteration,
             );
