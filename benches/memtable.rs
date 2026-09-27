@@ -258,8 +258,42 @@ fn memtable_highest_seqno(c: &mut Criterion) {
     });
 }
 
+/// Filling a fresh memtable with `n` entries of a 100-byte value: a small
+/// memtable stays in the arena's first blocks, a large one grows through them
+/// into full-size blocks, so both the start and the steady state are timed.
+fn memtable_insert(c: &mut Criterion) {
+    let mut group = c.benchmark_group("memtable insert");
+    for n in [1_000usize, 100_000, 1_000_000] {
+        let entries: Vec<InternalValue> = (0..n)
+            .map(|i| {
+                InternalValue::from_components(
+                    format!("key{i:010}").as_bytes(),
+                    vec![7u8; 100],
+                    0,
+                    lsm_tree::ValueType::Value,
+                )
+            })
+            .collect();
+        group.throughput(criterion::Throughput::Elements(n as u64));
+        group.bench_function(criterion::BenchmarkId::from_parameter(n), |b| {
+            b.iter_batched(
+                || Memtable::new(0, default_cmp()),
+                |memtable| {
+                    for entry in &entries {
+                        memtable.insert(entry.clone());
+                    }
+                    memtable
+                },
+                criterion::BatchSize::PerIteration,
+            );
+        });
+    }
+    group.finish();
+}
+
 criterion_group!(
     benches,
+    memtable_insert,
     memtable_get_hit,
     memtable_get_snapshot,
     memtable_get_miss,

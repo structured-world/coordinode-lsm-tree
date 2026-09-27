@@ -6,6 +6,9 @@
 //!
 //! Blocks are allocated lazily — the arena never pre-allocates a large
 //! contiguous buffer, so it works on 32-bit targets with limited address space.
+//! The first block holds 64 KiB and each next one doubles up to the full block
+//! size, so a memtable allocates about what it holds rather than a full block
+//! for its head node (see `block_capacity`).
 //! Once a block is full, a new one is allocated and the remaining space in the
 //! old block is abandoned (waste is negligible for typical node allocations of
 //! < 100 bytes).
@@ -44,8 +47,34 @@ const BLOCK_SIZE: u32 = 1 << BLOCK_SHIFT;
 /// Bitmask for extracting the within-block offset from an encoded u32.
 const BLOCK_MASK: u32 = BLOCK_SIZE - 1;
 
-/// Maximum number of blocks.  Supports up to 4 GiB total arena capacity.
+/// Maximum number of blocks. The encoding addresses 4 GiB; the smaller first
+/// blocks leave the arena a little under that.
 const MAX_BLOCKS: usize = 1 << (32 - BLOCK_SHIFT);
+
+/// Bits of the first block's capacity: 64 KiB.
+const FIRST_BLOCK_SHIFT: u32 = 16;
+
+/// Bytes block `idx` holds: 64 KiB for the first, doubling per block up to
+/// [`BLOCK_SIZE`], full size from there on.
+///
+/// Every block is addressed as if it were full size (`idx << BLOCK_SHIFT |
+/// offset`), so decoding an offset stays one shift and one mask; only the
+/// allocator, which bounds each block by what it holds, and the block's own
+/// allocation read this. Starting small is what keeps a memtable from
+/// allocating a full-size block for its head node alone: freshly allocated
+/// memory is only reserved on some platforms, while on others (Windows) the
+/// whole allocation is charged to the process commit at once.
+const fn block_capacity(idx: usize) -> u32 {
+    let growth = BLOCK_SHIFT - FIRST_BLOCK_SHIFT;
+    if idx >= growth as usize {
+        BLOCK_SIZE
+    } else {
+        // `idx < growth`, at most 10, so the shift stays below BLOCK_SHIFT.
+        #[expect(clippy::cast_possible_truncation, reason = "idx < growth <= 10")]
+        let shift = FIRST_BLOCK_SHIFT + idx as u32;
+        1 << shift
+    }
+}
 
 /// A multi-block bump-allocating arena.
 ///
@@ -109,7 +138,10 @@ impl Arena {
             let aligned = (offset + align - 1) & !(align - 1);
 
             if let Some(new_end) = aligned.checked_add(size) {
-                if new_end < BLOCK_SIZE {
+                if new_end < block_capacity(block_idx as usize) {
+                    // Bounded by what this block holds, which is less than
+                    // BLOCK_SIZE for the first blocks.
+                    //
                     // Strict `<`: when new_end == BLOCK_SIZE the bitwise OR
                     // on the next line would set bit BLOCK_SHIFT in new_end,
                     // colliding with the block_idx bits and wrapping the
@@ -168,8 +200,8 @@ impl Arena {
     pub unsafe fn get_bytes(&self, offset: u32, len: u32) -> &[u8] {
         let (ptr, off) = unsafe { self.decode(offset) };
         debug_assert!(
-            off + len as usize <= BLOCK_SIZE as usize,
-            "get_bytes: off={off} + len={len} exceeds BLOCK_SIZE={BLOCK_SIZE} (offset={offset})",
+            off + len as usize <= block_capacity((offset >> BLOCK_SHIFT) as usize) as usize,
+            "get_bytes: off={off} + len={len} exceeds its block (offset={offset})",
         );
         // SAFETY: caller guarantees the range is allocated and initialised.
         unsafe { core::slice::from_raw_parts(ptr.add(off), len as usize) }
@@ -193,9 +225,12 @@ impl Arena {
     #[cfg(not(feature = "bytes_1"))]
     pub unsafe fn get_view(&self, offset: u32, len: u32) -> crate::byteview::ByteView {
         let (ptr, off) = unsafe { self.decode(offset) };
+        // The view frees the block under the size it was allocated at when it
+        // is the last reference, so it must carry exactly that size.
+        let capacity = block_capacity((offset >> BLOCK_SHIFT) as usize);
         debug_assert!(
-            off + len as usize <= BLOCK_SIZE as usize,
-            "get_view: off={off} + len={len} exceeds BLOCK_SIZE={BLOCK_SIZE} (offset={offset})",
+            off + len as usize <= capacity as usize,
+            "get_view: off={off} + len={len} exceeds its block of {capacity} (offset={offset})",
         );
         // `off` fits u32: it is masked to BLOCK_SHIFT bits by decode.
         #[expect(
@@ -206,7 +241,7 @@ impl Arena {
         // arena holds a reference for its whole lifetime); the caller
         // guarantees the span is allocated, initialised and immutable.
         unsafe {
-            crate::byteview::ByteView::view_of_shared(ptr, off as u32, len, BLOCK_SIZE)
+            crate::byteview::ByteView::view_of_shared(ptr, off as u32, len, capacity)
         }
     }
 
@@ -295,7 +330,7 @@ impl Arena {
     fn ensure_block(&self, idx: usize) {
         if self.blocks[idx].load(Ordering::Acquire).is_null() {
             // Each block is a byteview shared-heap region (refcount header +
-            // BLOCK_SIZE data bytes, 8-byte aligned — more than the 4 bytes
+            // `block_capacity(idx)` data bytes, 8-byte aligned — more than the 4 bytes
             // AtomicU32 tower pointers need). The stored pointer is the DATA
             // base, so every offset computation below is unchanged; the
             // header is what lets `get_view` hand out zero-copy ByteViews
@@ -308,20 +343,19 @@ impl Arena {
             // tower slots — BEFORE the node is published (linked via a
             // release CAS), and the head sentinel's tower is explicitly
             // UNSET-initialized at creation. No reader ever observes an
-            // unwritten byte, so eager zeroing is pure waste. Lazy
-            // page-faulting still zero-fills only the pages actually
-            // touched, at the OS level.
-            let raw = crate::byteview::ByteView::alloc_shared_heap(BLOCK_SIZE);
+            // unwritten byte, so eager zeroing is pure waste.
+            let capacity = block_capacity(idx);
+            let raw = crate::byteview::ByteView::alloc_shared_heap(capacity);
 
             // CAS null → raw.  If another thread won, free our block.
             if self.blocks[idx]
                 .compare_exchange(ptr::null_mut(), raw, Ordering::AcqRel, Ordering::Acquire)
                 .is_err()
             {
-                // SAFETY: raw was just allocated as a BLOCK_SIZE shared heap
-                // region and holds only our own reference.
+                // SAFETY: raw was just allocated as a `capacity`-byte shared
+                // heap region and holds only our own reference.
                 unsafe {
-                    crate::byteview::ByteView::shared_heap_release(raw, BLOCK_SIZE);
+                    crate::byteview::ByteView::shared_heap_release(raw, capacity);
                 }
             }
         }
@@ -336,16 +370,16 @@ impl Default for Arena {
 
 impl Drop for Arena {
     fn drop(&mut self) {
-        for block in &*self.blocks {
+        for (idx, block) in self.blocks.iter().enumerate() {
             let ptr = block.load(Ordering::Relaxed);
             if !ptr.is_null() {
-                // SAFETY: `ptr` is the data base of a BLOCK_SIZE shared heap
-                // region allocated by ensure_block; this releases the arena's
-                // own reference. Outstanding views (ByteViews handed out by
-                // get_view) each hold their own reference, so the block stays
-                // alive until the last of them drops.
+                // SAFETY: `ptr` is the data base of a `block_capacity(idx)`
+                // shared heap region allocated by ensure_block; this releases
+                // the arena's own reference. Outstanding views (ByteViews
+                // handed out by get_view) each hold their own reference, so
+                // the block stays alive until the last of them drops.
                 unsafe {
-                    crate::byteview::ByteView::shared_heap_release(ptr, BLOCK_SIZE);
+                    crate::byteview::ByteView::shared_heap_release(ptr, block_capacity(idx));
                 }
             }
         }
