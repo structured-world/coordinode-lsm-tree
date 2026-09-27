@@ -738,6 +738,32 @@ fn the_size_hint_counts_the_tail_every_table_writes() -> crate::Result<()> {
     Ok(())
 }
 
+/// A large block gathers filter and locator state for many keys before it is
+/// cut; the estimates count that state within the block, not only once the
+/// block is written.
+#[test]
+fn the_estimates_follow_the_keys_of_a_block_not_yet_cut() -> crate::Result<()> {
+    let dir = tempfile::tempdir()?;
+    let mut writer =
+        Writer::new(dir.path().join("1"), 1, 0, Arc::new(StdFs))?.use_data_block_size(4 << 20);
+    for i in 0..20_000u32 {
+        writer.write(InternalValue::from_components(
+            format!("key{i:06}").into_bytes(),
+            b"v".to_vec(),
+            0,
+            ValueType::Value,
+        ))?;
+    }
+    assert_eq!(writer.meta.data_block_count, 0);
+    // One 8-byte hash per key, less the keys since the last refresh.
+    assert!(
+        writer.held_state_bytes() >= 19_000 * 8,
+        "{} held for 20 000 keys",
+        writer.held_state_bytes(),
+    );
+    Ok(())
+}
+
 /// `finish` encodes each section into a buffer it keeps to the end and frames
 /// it into another, while the section itself is still held: a large section
 /// counts three times at that point.

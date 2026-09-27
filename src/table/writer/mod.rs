@@ -88,6 +88,13 @@ const TABLE_SECTIONS: [&str; 17] = [
 const FIXED_TAIL_LEN: u64 =
     (1 + META_SEPARATOR_LEN + crate::sfa::toc_and_trailer_len(&TABLE_SECTIONS)) as u64;
 
+/// New keys between two refreshes of the estimates within a block: at least
+/// this many, and at least 1/[`REFRESH_KEY_FRACTION`] of the keys so far, so
+/// the per-key state they leave out stays within about 1.6% of the table's.
+/// Refreshing on every key cost 3% of ingestion time.
+const REFRESH_KEY_STEP: u64 = 256;
+const REFRESH_KEY_FRACTION: u64 = 64;
+
 /// Bytes the `linked_blob_files` section takes for `count` linked blob files:
 /// the count, then each file's id, entry count, bytes and on-disk bytes.
 #[must_use]
@@ -287,6 +294,10 @@ pub struct Writer {
     /// Bytes of the meta block payload besides its key bounds, taken at the
     /// first block, once the table's settings are final.
     meta_base_len: Option<u64>,
+
+    /// Key count at which the estimates are refreshed between blocks, so the
+    /// per-key state a large block gathers is counted before it completes.
+    next_refresh_keys: u64,
 
     initial_level: u8,
 
@@ -534,6 +545,7 @@ impl Writer {
             layout_bytes: 0,
             zone_map_bytes: 0,
             meta_base_len: None,
+            next_refresh_keys: 0,
 
             block_buffer: Vec::new(),
             file_writer: writer,
@@ -900,6 +912,9 @@ impl Writer {
             .max(section_phase)
             .max(locator_phase);
         self.finish_metadata_bytes = metadata;
+
+        let keys = self.meta.key_count as u64;
+        self.next_refresh_keys = keys + REFRESH_KEY_STEP.max(keys / REFRESH_KEY_FRACTION);
     }
 
     /// Enables parallel block compression on this writer using `spawner` to run
@@ -1577,6 +1592,12 @@ impl Writer {
                 };
                 self.locators
                     .push((crate::hash::hash64(user_key), self.locator_block_id, slot));
+            }
+
+            // The per-key state grows between blocks too; see
+            // `REFRESH_KEY_STEP`.
+            if self.meta.key_count as u64 >= self.next_refresh_keys {
+                self.refresh_state_estimates();
             }
         }
 
