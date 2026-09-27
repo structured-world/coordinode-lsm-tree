@@ -108,4 +108,9 @@ impl TombstoneShare {
     pub(super) fn bytes(&self, key: &[u8]) -> u64 {
         self.fixed + self.open * key.len() as u64
     }
+
+    /// The first tombstone, by start, not yet open.
+    pub(super) fn next_pending(&self) -> usize {
+        self.next_start
+    }
 }

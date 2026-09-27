@@ -372,8 +372,6 @@ impl MultiWriter {
         clip_upper: Option<&UserKey>,
         comparator: &dyn crate::comparator::UserComparator,
     ) {
-        use core::cmp::Ordering;
-
         if let (Some(first_key), Some(last_key)) =
             (writer.meta.first_key.clone(), writer.meta.last_key.clone())
         {
@@ -457,56 +455,64 @@ impl MultiWriter {
                     }
                 }
             } else {
-                // Flush mode: the outputs split the whole key space, so each
-                // tombstone is written once, cut into the zones it spans. The
-                // first output's zone opens below its first key and the last
-                // one's above its last key, so a tombstone reaching past this
-                // memtable's keys still covers them in older tables.
-                //
-                // The key range widens to each piece written, so a point read
-                // for a key under it, in older tables or in the gap before the
-                // next output, consults this table. Flush outputs are separate
-                // L0 runs, which may overlap, so the widening may reach the next
-                // output's first key. Using the exclusive end as an inclusive
-                // upper bound over-approximates but does not lose entries.
-                for rt in tombstones {
-                    let start = match lower {
-                        Some(lower) if comparator.compare(&rt.start, lower) == Ordering::Less => {
-                            lower
-                        }
-                        _ => &rt.start,
-                    };
-                    let end = match clip_upper {
-                        Some(upper) if comparator.compare(&rt.end, upper) == Ordering::Greater => {
-                            upper
-                        }
-                        _ => &rt.end,
-                    };
-                    if comparator.compare(start, end) != Ordering::Less {
-                        continue;
-                    }
-                    if let Some(existing) = &mut writer.meta.first_key
-                        && comparator.compare(start, existing.as_ref()) == Ordering::Less
-                    {
-                        *existing = start.clone();
-                    }
-                    if let Some(existing) = &mut writer.meta.last_key
-                        && comparator.compare(end, existing.as_ref()) == Ordering::Greater
-                    {
-                        *existing = end.clone();
-                    }
-                    writer.write_range_tombstone(RangeTombstone::new(
-                        start.clone(),
-                        end.clone(),
-                        rt.seqno,
-                    ));
-                }
+                Self::write_zone_cut(tombstones, writer, lower, clip_upper, comparator);
             }
-        } else {
-            // RT-only table (no KV items yet) — write all tombstones unclipped.
+        } else if clip {
+            // A compaction with no KV items at all: one output, tombstones whole.
             for rt in tombstones {
                 writer.write_range_tombstone(rt.clone());
             }
+        } else {
+            // A flush output of tombstones alone: its key range is taken from
+            // the pieces it holds.
+            Self::write_zone_cut(tombstones, writer, lower, clip_upper, comparator);
+        }
+    }
+
+    /// Flush mode: the outputs split the whole key space, so each tombstone is
+    /// written once, cut into the zones it spans, from `lower` (`None` for the
+    /// first output) to `upper` (`None` for the last). The first output's zone
+    /// opens below its first key and the last one's above its last key, so a
+    /// tombstone reaching past this memtable's keys still covers them in older
+    /// tables.
+    ///
+    /// The key range widens to each piece written, so a point read for a key
+    /// under it, in older tables or in the gap before the next output, consults
+    /// this table. Flush outputs are separate L0 runs, which may overlap, so the
+    /// widening may reach the next output's first key. Using the exclusive end
+    /// as an inclusive upper bound over-approximates but does not lose entries.
+    fn write_zone_cut(
+        tombstones: &[RangeTombstone],
+        writer: &mut Writer,
+        lower: Option<&UserKey>,
+        upper: Option<&UserKey>,
+        comparator: &dyn crate::comparator::UserComparator,
+    ) {
+        use core::cmp::Ordering;
+
+        for rt in tombstones {
+            let start = match lower {
+                Some(lower) if comparator.compare(&rt.start, lower) == Ordering::Less => lower,
+                _ => &rt.start,
+            };
+            let end = match upper {
+                Some(upper) if comparator.compare(&rt.end, upper) == Ordering::Greater => upper,
+                _ => &rt.end,
+            };
+            if comparator.compare(start, end) != Ordering::Less {
+                continue;
+            }
+            if let Some(existing) = &mut writer.meta.first_key
+                && comparator.compare(start, existing.as_ref()) == Ordering::Less
+            {
+                *existing = start.clone();
+            }
+            if let Some(existing) = &mut writer.meta.last_key
+                && comparator.compare(end, existing.as_ref()) == Ordering::Greater
+            {
+                *existing = end.clone();
+            }
+            writer.write_range_tombstone(RangeTombstone::new(start.clone(), end.clone(), rt.seqno));
         }
     }
 
@@ -904,15 +910,26 @@ impl MultiWriter {
     /// `finish`. Rows that compress well reach the second first: their data
     /// stays small while the filter, index and locator state grow per key.
     fn table_full(&self) -> bool {
+        // A table holds at least one record: closing an empty one would write
+        // its tombstones alone, unclipped, over its successors' keys.
+        if self.writer.meta.key_count == 0 {
+            return false;
+        }
         // The blob files this table links, and its share of the range
         // tombstones, are handed to its writer only when it rotates, and it
         // writes them at `finish`. The tombstone block is encoded into a buffer
         // it holds while writing.
-        let linked = crate::table::writer::linked_blob_files_len(self.linked_blobs.len());
         let tombstones = match &self.current_key {
             Some(key) if !self.range_tombstones.is_empty() => self.tombstone_share.bytes(key),
             _ => 0,
         };
+        self.full_with_tombstones(tombstones)
+    }
+
+    /// The current table reached its target if it closes holding `tombstones`
+    /// bytes of range-tombstone entries.
+    fn full_with_tombstones(&self, tombstones: u64) -> bool {
+        let linked = crate::table::writer::linked_blob_files_len(self.linked_blobs.len());
         let tombstone_block = if tombstones == 0 {
             0
         } else {
@@ -1002,10 +1019,44 @@ impl MultiWriter {
         self.writer.validate_columnar_batch(batch, &comparator)
     }
 
+    /// A flush's tombstones starting past its last key reach no rotation check
+    /// on a key, and the last output's zone is open above. They are checked at
+    /// their starts instead: where the output would pass its target, it closes
+    /// at that start and an output of tombstones alone takes the zone above.
+    /// Such outputs are separate L0 runs, like every flush output. Clipping
+    /// drops these tombstones from a compaction's outputs instead.
+    fn split_tombstones_past_the_last_key(&mut self) -> crate::Result<()> {
+        if self.clip_range_tombstones {
+            return Ok(());
+        }
+        let comparator = self.comparator.clone();
+        let mut at = self.tombstone_share.next_pending();
+        while let Some(start) = self.range_tombstones.get(at).map(|rt| rt.start.clone()) {
+            self.tombstone_share
+                .advance(&self.range_tombstones, &start, comparator.as_ref());
+            // An empty zone is never closed: that output would hold nothing.
+            let bytes = self.tombstone_share.bytes(&start);
+            if bytes > 0 && self.full_with_tombstones(bytes) {
+                self.current_key = Some(start.clone());
+                self.rotate()?;
+                self.tombstone_share.open_output(&start);
+            }
+            // Tombstones sharing this start open together at the next one.
+            while self.range_tombstones.get(at).is_some_and(|rt| {
+                comparator.compare(&rt.start, &start) == core::cmp::Ordering::Equal
+            }) {
+                at += 1;
+            }
+        }
+        Ok(())
+    }
+
     /// Finishes the last table, making sure all data is written durably
     ///
     /// Returns the metadata of created tables
     pub fn finish(mut self) -> crate::Result<Vec<(TableId, Checksum)>> {
+        self.split_tombstones_past_the_last_key()?;
+
         // Same judgment as `rotate` for the LAST output's window — by the
         // LIVE counter here: with no successor output, trailing verdicts
         // (removals after the final write) have nowhere else to land, and a
