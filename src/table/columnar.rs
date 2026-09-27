@@ -514,11 +514,16 @@ impl Column {
     ///
     /// This is the unit a column page carries, and the unit
     /// [`ColumnBatch::encode`] concatenates, so the two cannot drift apart.
-    fn encode_into(&self, row_count: u32, out: &mut Vec<u8>) -> Result<Expression> {
+    fn encode_into(
+        &self,
+        row_count: u32,
+        encoding: crate::config::ColumnEncoding,
+        out: &mut Vec<u8>,
+    ) -> Result<Expression> {
         self.validate(row_count)?;
         let Choice {
             bytes, expression, ..
-        } = expr::choose(self.type_tag, row_count, &self.data)?;
+        } = expr::choose(self.type_tag, row_count, &self.data, encoding)?;
         let (type_tag, width) = self.type_tag.to_wire();
         out.extend_from_slice(&self.column_id.to_le_bytes());
         out.push(type_tag);
@@ -669,7 +674,8 @@ impl Column {
         })
     }
 
-    /// The payload of this column's page: `stamp`, then the column's wire form.
+    /// The payload of this column's page: `stamp`, then the column's wire
+    /// form, its values stored as `encoding` says.
     ///
     /// # Errors
     ///
@@ -678,10 +684,11 @@ impl Column {
         &self,
         row_count: u32,
         stamp: crate::table::column_page::PageStamp,
+        encoding: crate::config::ColumnEncoding,
     ) -> Result<Vec<u8>> {
         let mut out = Vec::new();
         stamp.encode_into(&mut out);
-        self.encode_into(row_count, &mut out)?;
+        self.encode_into(row_count, encoding, &mut out)?;
         Ok(out)
     }
 
@@ -742,9 +749,10 @@ impl Column {
         Self::parse_page(bytes, row_count, expected)?.decode(row_count, copied)
     }
 
-    /// What a column page's values were encoded as, read from its payload for
-    /// a group of `row_count` rows without decoding the values, and refused
-    /// unless the page carries `expected` as its stamp.
+    /// What a column page's values were encoded as, and for a bytes column
+    /// the bytes it spends on where its values start, read from its payload
+    /// for a group of `row_count` rows without decoding the values, and
+    /// refused unless the page carries `expected` as its stamp.
     ///
     /// # Errors
     ///
@@ -753,10 +761,12 @@ impl Column {
         bytes: &crate::Slice,
         row_count: u32,
         expected: crate::table::column_page::PageStamp,
-    ) -> Result<Expression> {
-        Ok(Self::parse_page(bytes, row_count, expected)?
-            .values
-            .describe())
+    ) -> Result<(Expression, Option<usize>)> {
+        let column = Self::parse_page(bytes, row_count, expected)?;
+        Ok((
+            column.values.describe(),
+            column.values.offsets_len(column.type_tag, row_count),
+        ))
     }
 
     /// Reads one column's wire form from `cur`, which walks `bytes`.
@@ -1370,7 +1380,11 @@ impl ColumnBatch {
         out.extend_from_slice(&self.row_count.to_le_bytes());
         out.extend_from_slice(&(self.columns.len() as u32).to_le_bytes());
         for col in &self.columns {
-            col.encode_into(self.row_count, &mut out)?;
+            col.encode_into(
+                self.row_count,
+                crate::config::ColumnEncoding::Auto,
+                &mut out,
+            )?;
         }
         Ok(out)
     }

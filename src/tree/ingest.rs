@@ -150,6 +150,11 @@ impl<'a> Ingestion<'a> {
                 .columnar_page_size_policy
                 .get(INITIAL_CANONICAL_LEVEL),
         )
+        .use_column_encoding(
+            tree.config
+                .column_encoding_policy
+                .get(INITIAL_CANONICAL_LEVEL),
+        )
         .use_data_block_hash_ratio(
             tree.config
                 .data_block_hash_ratio_policy

@@ -7,7 +7,7 @@ mod reporter;
 mod tests;
 mod workloads;
 
-use crate::config::{BenchConfig, Compression};
+use crate::config::{BenchConfig, ColumnEncodingArg, Compression};
 use crate::reporter::{Direction, GithubSuites, JsonConfig, Reporter};
 use crate::workloads::{available_benchmarks, create_workload};
 use clap::Parser;
@@ -61,6 +61,11 @@ struct Cli {
     /// Size in bytes a columnar row group's rows are cut into row pages at.
     #[arg(long, default_value_t = lsm_tree::config::DEFAULT_COLUMNAR_PAGE_SIZE)]
     page_size: u32,
+
+    /// How a columnar table's column pages store their values, at every
+    /// level: plain (the tree's default) or the cheapest encoding.
+    #[arg(long, value_enum, default_value = "plain")]
+    column_encoding: ColumnEncodingArg,
 
     /// Bytes one columnar read request may ask for.
     #[arg(long, default_value_t = lsm_tree::config::ReadBudget::default().io_buffer())]
@@ -184,6 +189,7 @@ fn main() {
         block_size: cli.block_size,
         row_group_size: cli.row_group_size,
         page_size: cli.page_size,
+        column_encoding: cli.column_encoding,
         read_budget: lsm_tree::config::ReadBudget::new(cli.read_io_buffer, cli.read_in_flight),
         use_blob_tree: cli.use_blob_tree,
         metadata_priority: cli.metadata_priority,
@@ -327,8 +333,14 @@ fn run_single(
 ) -> Result<(), Box<dyn std::error::Error>> {
     eprintln!("=== db_bench: {benchmark_name} ===");
     eprintln!(
-        "num={} key_size={} value_size={} threads={} cache={}MB iterations={}",
-        cli.num, cli.key_size, cli.value_size, cli.threads, cli.cache_mb, iterations,
+        "num={} key_size={} value_size={} threads={} cache={}MB column_encoding={} iterations={}",
+        cli.num,
+        cli.key_size,
+        cli.value_size,
+        cli.threads,
+        cli.cache_mb,
+        cli.column_encoding,
+        iterations,
     );
 
     create_workload(benchmark_name)

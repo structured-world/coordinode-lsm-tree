@@ -3,6 +3,7 @@ use super::{
     values_trials, zigzag,
 };
 use crate::Slice;
+use crate::config::ColumnEncoding::{Auto, Plain};
 use crate::table::columnar::{ByteOrder, Number, NumberKind, TypeTag, frame_bytes_column};
 use alloc::vec::Vec;
 use proptest::prelude::*;
@@ -73,7 +74,7 @@ fn assert_every_candidate_round_trips(type_tag: TypeTag, rows: u32, data: &[u8])
         );
         assert_select_and_gather(type_tag, rows, data, &trial.bytes, &trial.expression);
     }
-    let Choice { bytes, .. } = choose(type_tag, rows, data).expect("choose");
+    let Choice { bytes, .. } = choose(type_tag, rows, data, Auto).expect("choose");
     let candidates = candidates(type_tag, rows, data).expect("candidates");
     let cheapest = candidates
         .iter()
@@ -352,7 +353,7 @@ fn a_column_of_outliers_falls_back_rather_than_degenerating() {
         "most rows fit the chosen width: {exceptions} exceptions of 32",
     );
     let data: Vec<u8> = values.iter().flat_map(|v| v.to_le_bytes()).collect();
-    let chosen = choose(TypeTag::Number(Number::U64_LE), 32, &data).expect("choose");
+    let chosen = choose(TypeTag::Number(Number::U64_LE), 32, &data, Auto).expect("choose");
     assert_eq!(chosen.expression, Expression::Plain);
 }
 
@@ -363,7 +364,7 @@ fn a_column_of_outliers_falls_back_rather_than_degenerating() {
 #[test]
 fn per_unit_overhead_decides_against_a_smaller_payload() {
     let data = [5u8, 5, 6, 6];
-    let chosen = choose(TypeTag::Fixed(1), 4, &data).expect("choose");
+    let chosen = choose(TypeTag::Fixed(1), 4, &data, Auto).expect("choose");
     assert_eq!(chosen.expression, Expression::Plain);
     let considered = candidates(TypeTag::Fixed(1), 4, &data).expect("candidates");
     let plain = &considered[0];
@@ -382,13 +383,27 @@ fn per_unit_overhead_decides_against_a_smaller_payload() {
     );
 }
 
+/// Under the plain encoding a page holds its column's layout whatever the
+/// values, even where a constant would be far smaller: the level asked for
+/// pages a read serves as views.
+#[test]
+fn the_plain_encoding_stores_the_layout_even_where_another_is_smaller() {
+    let one = bytes_layout(&[&b"status-ok"[..]; 50]);
+    let chosen = choose(TypeTag::Bytes, 50, &one, Plain).expect("choose");
+    assert_eq!(chosen.expression, Expression::Plain);
+    assert_eq!(chosen.bytes.first(), Some(&super::PLAIN));
+    assert_eq!(&chosen.bytes[1..], &one[..]);
+}
+
 /// A column of one repeated value is a constant; a sorted low-cardinality
 /// bytes column is a dictionary or runs, never plain.
 #[test]
 fn repetition_is_encoded_as_a_constant_runs_or_a_dictionary() {
     let one = bytes_layout(&[&b"status-ok"[..]; 50]);
     assert_eq!(
-        choose(TypeTag::Bytes, 50, &one).expect("choose").expression,
+        choose(TypeTag::Bytes, 50, &one, Auto)
+            .expect("choose")
+            .expression,
         Expression::Constant
     );
     let cells: Vec<&[u8]> = (0..60)
@@ -396,7 +411,7 @@ fn repetition_is_encoded_as_a_constant_runs_or_a_dictionary() {
         .collect();
     let mixed = bytes_layout(&cells);
     assert!(matches!(
-        choose(TypeTag::Bytes, 60, &mixed)
+        choose(TypeTag::Bytes, 60, &mixed, Auto)
             .expect("choose")
             .expression,
         Expression::Dict { .. }
@@ -406,7 +421,7 @@ fn repetition_is_encoded_as_a_constant_runs_or_a_dictionary() {
         .collect();
     let sorted = bytes_layout(&runs);
     assert!(matches!(
-        choose(TypeTag::Bytes, 60, &sorted)
+        choose(TypeTag::Bytes, 60, &sorted, Auto)
             .expect("choose")
             .expression,
         Expression::Rle { .. } | Expression::Dict { .. }

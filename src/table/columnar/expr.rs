@@ -68,6 +68,7 @@
 //! position the rows cannot hold, rather than decoding part of a page.
 
 use super::{Number, TypeTag, bytes_column_row, check_bytes_framing, frame_bytes_column};
+use crate::config::ColumnEncoding;
 use crate::table::column_page::{VAR_U64_MAX_LEN, put_varint, take, take_slice, take_varint};
 use crate::table::columnar_predicate::Selection;
 use crate::{Error, Result, Slice};
@@ -201,6 +202,9 @@ pub enum Values<'a> {
     /// A bytes column's values as their lengths and their bytes.
     Lengths {
         lengths: Ints<'a>,
+        /// The bytes the lengths are stored in, what replaces the offset
+        /// table.
+        lengths_len: usize,
         payload: &'a [u8],
     },
 }
@@ -526,10 +530,13 @@ impl<'a> Values<'a> {
                 Ok(Self::Ordinals(Ints::parse(rest, n, depth + 1)?))
             }
             (LENGTHS, None) => {
+                let before = rest.len();
                 let lengths = Ints::parse(rest, n, depth + 1)?;
+                let lengths_len = before - rest.len();
                 let len = var_u32(rest)? as usize;
                 Ok(Self::Lengths {
                     lengths,
+                    lengths_len,
                     payload: bytes(rest, len)?,
                 })
             }
@@ -552,6 +559,19 @@ impl<'a> Values<'a> {
             },
             Self::Ordinals(ints) => Expression::Ordinals(Box::new(ints.describe())),
             Self::Lengths { lengths, .. } => Expression::Lengths(Box::new(lengths.describe())),
+        }
+    }
+
+    /// The bytes a bytes column of `n` rows spends on where its values
+    /// start, apart from the values themselves: the offset table of a plain
+    /// page or the lengths that replace it. `None` for a column of another
+    /// type, or one whose encoding keeps no per-row position (a constant, a
+    /// dictionary, runs).
+    pub(crate) fn offsets_len(&self, type_tag: TypeTag, n: u32) -> Option<usize> {
+        match (self, type_tag) {
+            (Self::Plain(_), TypeTag::Bytes) => Some((n as usize + 1) * 4),
+            (Self::Lengths { lengths_len, .. }, _) => Some(*lengths_len),
+            _ => None,
         }
     }
 
@@ -607,7 +627,9 @@ impl<'a> Values<'a> {
                 ints.decode_into(n, &mut ordinals)?;
                 from_ordinals(number, &ordinals)
             }
-            Self::Lengths { lengths, payload } => {
+            Self::Lengths {
+                lengths, payload, ..
+            } => {
                 let mut decoded = Vec::with_capacity(n as usize);
                 lengths.decode_into(n, &mut decoded)?;
                 let mut at = 0usize;
@@ -789,7 +811,9 @@ impl Values<'_> {
                 Ok(out)
             }
             Self::Ordinals(ints) => ints.select(n, bounds),
-            Self::Lengths { lengths, payload } => {
+            Self::Lengths {
+                lengths, payload, ..
+            } => {
                 let mut decoded = Vec::with_capacity(n as usize);
                 lengths.decode_into(n, &mut decoded)?;
                 let mut out = Selection::none(n);
@@ -1073,6 +1097,7 @@ impl<'a> Values<'a> {
             Self::Lengths {
                 lengths: Ints::Constant(len),
                 payload,
+                ..
             } => {
                 let Some(len) = usize::try_from(len)
                     .ok()
@@ -1082,7 +1107,9 @@ impl<'a> Values<'a> {
                 };
                 Rows::Stride { len, payload }
             }
-            Self::Lengths { lengths, payload } => {
+            Self::Lengths {
+                lengths, payload, ..
+            } => {
                 let mut decoded = Vec::with_capacity(n as usize);
                 lengths.decode_into(n, &mut decoded)?;
                 let mut offsets = Vec::with_capacity(decoded.len() + 1);
@@ -1906,8 +1933,9 @@ pub struct Choice {
     pub expression: Expression,
 }
 
-/// Encodes `rows` rows of a column of `type_tag` whose layout is `data`,
-/// choosing the expression that costs least to store and to read.
+/// Encodes `rows` rows of a column of `type_tag` whose layout is `data` as
+/// `encoding` says: the layout itself, or the expression that costs least to
+/// store and to read.
 ///
 /// The choice is per page: every page of a column is encoded on its own.
 ///
@@ -1915,12 +1943,25 @@ pub struct Choice {
 ///
 /// [`Error::InvalidHeader`] when a bytes column's values do not fit its
 /// offsets, which a validated column cannot reach.
-pub fn choose(type_tag: TypeTag, rows: u32, data: &[u8]) -> Result<Choice> {
-    let trials = values_trials(&Cells {
+pub fn choose(
+    type_tag: TypeTag,
+    rows: u32,
+    data: &[u8],
+    encoding: ColumnEncoding,
+) -> Result<Choice> {
+    let cells = Cells {
         type_tag,
         rows,
         data,
-    })?;
+    };
+    if encoding == ColumnEncoding::Plain {
+        let plain = values_plain(&cells);
+        return Ok(Choice {
+            bytes: plain.bytes,
+            expression: plain.expression,
+        });
+    }
+    let trials = values_trials(&cells)?;
     let Some(best) = cheapest(trials) else {
         return Err(MALFORMED);
     };

@@ -3,6 +3,7 @@
 // Copyright (c) 2026-present, Dmitry Prudnikov
 
 mod block_size;
+mod column_encoding;
 mod compression;
 mod delete_strategy;
 mod filter;
@@ -12,6 +13,7 @@ mod pinning;
 mod restart_interval;
 
 pub use block_size::{BlockSizePolicy, MAX_BLOCK_SIZE};
+pub use column_encoding::{ColumnEncoding, ColumnEncodingPolicy};
 pub use compression::CompressionPolicy;
 pub use delete_strategy::{DeleteStrategy, DeleteStrategyPolicy};
 pub use filter::{BloomConstructionPolicy, FilterPolicy, FilterPolicyEntry};
@@ -462,6 +464,10 @@ pub struct Config {
     /// read of a few rows decodes only the pages that hold them.
     pub columnar_page_size_policy: BlockSizePolicy,
 
+    /// How a columnar table's column pages store their values, per level;
+    /// see [`ColumnEncoding`].
+    pub column_encoding_policy: ColumnEncodingPolicy,
+
     /// How columnar reads of this tree fetch their pages; see [`ReadBudget`].
     pub columnar_read_budget: ReadBudget,
 
@@ -777,6 +783,8 @@ impl Default for Config {
             columnar_row_group_size_policy: BlockSizePolicy::all(DEFAULT_COLUMNAR_ROW_GROUP_SIZE),
 
             columnar_page_size_policy: BlockSizePolicy::all(DEFAULT_COLUMNAR_PAGE_SIZE),
+
+            column_encoding_policy: ColumnEncodingPolicy::default(),
 
             columnar_read_budget: ReadBudget::default(),
 
@@ -1705,6 +1713,44 @@ impl Config {
     #[must_use]
     pub fn columnar_page_size_policy(mut self, policy: BlockSizePolicy) -> Self {
         self.columnar_page_size_policy = policy;
+        self
+    }
+
+    /// Sets how a columnar table's column pages store their values, per
+    /// level.
+    ///
+    /// The default is [`ColumnEncoding::Plain`] at every level: a read serves
+    /// a plain page as a view of itself, while an encoded one is built back
+    /// into its layout by each read that wants the column whole. Choose
+    /// [`ColumnEncoding::Auto`] for the levels whose tables are mostly stored
+    /// rather than read, as a stronger compression is chosen for them. A table
+    /// reads the same under either; only what its pages hold differs.
+    ///
+    /// # Examples
+    ///
+    /// ```
+    /// use lsm_tree::{
+    ///     Config, SequenceNumberCounter,
+    ///     config::{ColumnEncoding, ColumnEncodingPolicy},
+    /// };
+    /// # let folder = tempfile::tempdir()?;
+    /// // Plain in the first three levels, encoded below them.
+    /// let config = Config::new(
+    ///     folder.path(),
+    ///     SequenceNumberCounter::default(),
+    ///     SequenceNumberCounter::default(),
+    /// )
+    /// .column_encoding_policy(ColumnEncodingPolicy::new([
+    ///     ColumnEncoding::Plain,
+    ///     ColumnEncoding::Plain,
+    ///     ColumnEncoding::Plain,
+    ///     ColumnEncoding::Auto,
+    /// ]));
+    /// # Ok::<(), Box<dyn std::error::Error>>(())
+    /// ```
+    #[must_use]
+    pub fn column_encoding_policy(mut self, policy: ColumnEncodingPolicy) -> Self {
+        self.column_encoding_policy = policy;
         self
     }
 

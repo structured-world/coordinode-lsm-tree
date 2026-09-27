@@ -348,6 +348,11 @@ pub struct PageEncoding {
     pub stored_len: u32,
     /// What the page's values were encoded as, chosen for this page alone.
     pub expression: crate::table::columnar::Expression,
+    /// For a bytes column, the bytes the page spends on where its values
+    /// start rather than on the values: a plain page's offset table, or the
+    /// lengths an encoded one stores in its place. `None` for other columns
+    /// and for encodings that keep no per-row position.
+    pub offsets_len: Option<usize>,
 }
 
 /// Every page of a columnar SST, with what its values were encoded as.

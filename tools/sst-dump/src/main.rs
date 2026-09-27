@@ -351,38 +351,61 @@ fn run_columns(path: &std::path::Path, summary: bool) -> ExitCode {
         println!("no column pages: the table is row-major");
         return ExitCode::SUCCESS;
     }
+    // `offsets` is what a bytes column's page spends on where its values
+    // start (its offset table, or the lengths replacing it), `-` where that
+    // does not apply: the saving an encoding makes there is told apart from
+    // the one it makes on the values. The expression comes last, as the one
+    // field that may hold spaces.
+    let offsets = |len: Option<u64>| len.map_or_else(|| "-".to_owned(), |len| len.to_string());
     if !summary {
-        println!("group row_page column rows bytes expression");
+        println!("group row_page column rows bytes offsets expression");
         for page in &pages {
             println!(
-                "{} {} {} {} {} {}",
+                "{} {} {} {} {} {} {}",
                 page.group,
                 page.row_page,
                 page.column_id,
                 page.rows,
                 page.stored_len,
+                offsets(page.offsets_len.map(|len| len as u64)),
                 page.expression
             );
         }
         println!();
     }
-    // Per column and expression: pages, rows and on-disk bytes, in column
-    // order and, within a column, most pages first.
-    let mut totals: std::collections::BTreeMap<(u16, String), (u64, u64, u64)> =
+    // Per column and expression, in column order and, within a column, most
+    // pages first.
+    #[derive(Default)]
+    struct Totals {
+        pages: u64,
+        rows: u64,
+        bytes: u64,
+        offsets: Option<u64>,
+    }
+    let mut totals: std::collections::BTreeMap<(u16, String), Totals> =
         std::collections::BTreeMap::new();
     for page in &pages {
         let entry = totals
             .entry((page.column_id, page.expression.to_string()))
             .or_default();
-        entry.0 += 1;
-        entry.1 += u64::from(page.rows);
-        entry.2 += u64::from(page.stored_len);
+        entry.pages += 1;
+        entry.rows += u64::from(page.rows);
+        entry.bytes += u64::from(page.stored_len);
+        if let Some(len) = page.offsets_len {
+            entry.offsets = Some(entry.offsets.unwrap_or(0) + len as u64);
+        }
     }
-    println!("column pages rows bytes expression");
+    println!("column pages rows bytes offsets expression");
     let mut rows: Vec<_> = totals.into_iter().collect();
-    rows.sort_by(|((ca, _), (pa, ..)), ((cb, _), (pb, ..))| ca.cmp(cb).then(pb.cmp(pa)));
-    for ((column, expression), (count, rows, bytes)) in rows {
-        println!("{column} {count} {rows} {bytes} {expression}");
+    rows.sort_by(|((ca, _), a), ((cb, _), b)| ca.cmp(cb).then(b.pages.cmp(&a.pages)));
+    for ((column, expression), total) in rows {
+        println!(
+            "{column} {} {} {} {} {expression}",
+            total.pages,
+            total.rows,
+            total.bytes,
+            offsets(total.offsets)
+        );
     }
     ExitCode::SUCCESS
 }

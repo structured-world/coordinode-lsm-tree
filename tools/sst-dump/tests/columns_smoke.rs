@@ -6,25 +6,33 @@
 //! `sst-dump columns` against it and assert what it reports.
 
 use lsm_tree::{
-    AbstractTree, Config, SequenceNumberCounter, compression::CompressionType,
-    config::CompressionPolicy,
+    AbstractTree, Config, SequenceNumberCounter,
+    compression::CompressionType,
+    config::{ColumnEncoding, ColumnEncodingPolicy, CompressionPolicy},
 };
 use std::process::Command;
 
 const SST_DUMP_BIN: &str = env!("CARGO_BIN_EXE_sst-dump");
 
-/// One SST of `items` rows under `columnar`: sequential keys, seqnos in a
+/// One SST of `items` rows under `columnar`, its pages stored as `encoding`
+/// says or as the tree's default when `None`: sequential keys, seqnos in a
 /// narrow range, and one repeated value.
-fn build_one_sst(items: u64, columnar: bool) -> (tempfile::TempDir, std::path::PathBuf) {
+fn build_one_sst(
+    items: u64,
+    columnar: bool,
+    encoding: Option<ColumnEncoding>,
+) -> (tempfile::TempDir, std::path::PathBuf) {
     let dir = tempfile::tempdir().expect("tempdir");
-    let tree = Config::new(
+    let mut config = Config::new(
         dir.path(),
         SequenceNumberCounter::default(),
         SequenceNumberCounter::default(),
     )
-    .data_block_compression_policy(CompressionPolicy::all(CompressionType::None))
-    .open()
-    .expect("open tree");
+    .data_block_compression_policy(CompressionPolicy::all(CompressionType::None));
+    if let Some(encoding) = encoding {
+        config = config.column_encoding_policy(ColumnEncodingPolicy::all(encoding));
+    }
+    let tree = config.open().expect("open tree");
     let lsm_tree::AnyTree::Standard(standard) = &tree else {
         panic!("a standard tree");
     };
@@ -63,16 +71,39 @@ fn run(sst: &std::path::Path, args: &[&str]) -> String {
     stdout
 }
 
+/// The key column's pages, rows and offset bytes, summed over a summary's
+/// lines for column 0.
+fn key_column_offsets(summary: &str) -> (u64, u64, u64) {
+    summary
+        .lines()
+        .skip(1)
+        .filter(|l| l.starts_with("0 "))
+        .map(|l| {
+            let field = |i: usize| -> u64 {
+                l.split(' ')
+                    .nth(i)
+                    .and_then(|f| f.parse().ok())
+                    .unwrap_or_else(|| panic!("field {i} of {l:?} is a count"))
+            };
+            (field(1), field(2), field(4))
+        })
+        .fold((0, 0, 0), |(p, r, o), (pages, rows, offsets)| {
+            (p + pages, r + rows, o + offsets)
+        })
+}
+
 /// The summary reports every engine column, and the encodings the writer
-/// chose for these values: a repeated value as a constant, and seqnos in a
-/// narrow range by their ordinals, not stored whole.
+/// chose for these values under the automatic encoding: a repeated value as
+/// a constant, seqnos in a narrow range by their ordinals, not stored whole,
+/// and keys by their lengths, whose bytes are reported apart from the keys'
+/// and are fewer than the offset table they replace.
 #[test]
 fn columns_reports_each_page_and_what_it_was_encoded_as() {
-    let (_dir, sst) = build_one_sst(400, true);
+    let (_dir, sst) = build_one_sst(400, true, Some(ColumnEncoding::Auto));
 
     let pages = run(&sst, &[]);
     assert!(
-        pages.starts_with("group row_page column rows bytes expression"),
+        pages.starts_with("group row_page column rows bytes offsets expression"),
         "a page listing first; got:\n{pages}",
     );
 
@@ -80,16 +111,21 @@ fn columns_reports_each_page_and_what_it_was_encoded_as() {
     let lines: Vec<&str> = summary.lines().collect();
     assert_eq!(
         lines.first().copied(),
-        Some("column pages rows bytes expression")
+        Some("column pages rows bytes offsets expression")
     );
     let for_column = |column: u16| -> Vec<String> {
         lines
             .iter()
             .skip(1)
             .filter(|l| l.split(' ').next() == Some(&column.to_string()))
-            .map(|l| l.split(' ').skip(4).collect::<Vec<_>>().join(" "))
+            .map(|l| l.split(' ').skip(5).collect::<Vec<_>>().join(" "))
             .collect()
     };
+    let (key_pages, key_rows, key_offsets) = key_column_offsets(&summary);
+    assert!(
+        key_offsets < 4 * (key_rows + key_pages),
+        "the keys' lengths take fewer bytes than their offset tables; got:\n{summary}",
+    );
     for column in 0..4u16 {
         assert!(
             !for_column(column).is_empty(),
@@ -113,9 +149,38 @@ fn columns_reports_each_page_and_what_it_was_encoded_as() {
     assert_eq!(rows, 400, "the key column's pages hold every row");
 }
 
+/// A tree left at its default encoding stores every page plain, the same
+/// values that encode as a constant and by ordinals above included, and a
+/// plain key page spends four bytes per row and one more on its offsets.
+#[test]
+fn columns_under_the_default_encoding_are_all_plain() {
+    let (_dir, sst) = build_one_sst(400, true, None);
+    let summary = run(&sst, &["--summary"]);
+    let expressions: Vec<&str> = summary
+        .lines()
+        .skip(1)
+        .filter_map(|l| l.split(' ').nth(5))
+        .collect();
+    let (key_pages, key_rows, key_offsets) = key_column_offsets(&summary);
+    assert_eq!(key_rows, 400);
+    assert_eq!(
+        key_offsets,
+        4 * (key_rows + key_pages),
+        "a plain key page reports its offset table; got:\n{summary}",
+    );
+    assert!(
+        !expressions.is_empty(),
+        "pages are reported; got:\n{summary}"
+    );
+    assert!(
+        expressions.iter().all(|e| *e == "plain"),
+        "every page is plain; got:\n{summary}",
+    );
+}
+
 #[test]
 fn columns_on_a_row_major_table_reports_no_pages() {
-    let (_dir, sst) = build_one_sst(50, false);
+    let (_dir, sst) = build_one_sst(50, false, None);
     assert_eq!(
         run(&sst, &[]).trim(),
         "no column pages: the table is row-major"

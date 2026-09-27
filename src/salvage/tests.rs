@@ -2600,7 +2600,9 @@ fn forge_row_group_column(
         &mut 0,
     )?;
     mutate(&mut column, row_count);
-    let new_payload = column.encode_page(row_count, stamp)?;
+    // Encoded as the tree wrote it, plain by default, so the forged page
+    // keeps the length its frame was restamped around.
+    let new_payload = column.encode_page(row_count, stamp, crate::config::ColumnEncoding::Plain)?;
     restamp_block(&mut bytes, page_at, &new_payload)?;
     std::fs::write(source, &bytes)?;
     Ok(row_count)
@@ -5483,13 +5485,10 @@ fn salvage_drops_a_columnar_block_with_an_invalid_value_type() -> crate::Result<
         "source columnar SST is non-empty"
     );
 
-    // Poison the SECOND row group: stamp an invalid value-type tag into every
-    // row of its value-type page and re-stamp the page's checksum. The group
-    // stays checksum-consistent, so the failure surfaces in row
-    // materialization — not as an ordinary checksum drop. Every row, not one:
-    // the page's rows are all `Value`, so it is stored as a constant, and a
-    // constant of the invalid tag keeps the page's length, which a forge in
-    // place must.
+    // Poison the SECOND row group: stamp an invalid value-type tag into the
+    // first row of its value-type page, at the same length, and re-stamp the
+    // page's checksum. The group stays checksum-consistent, so the failure
+    // surfaces in row materialization — not as an ordinary checksum drop.
     let poisoned_rows = u64::from(forge_row_group_column(
         &source,
         &fs,
@@ -5498,7 +5497,12 @@ fn salvage_drops_a_columnar_block_with_an_invalid_value_type() -> crate::Result<
         |col, _| {
             // 0xFF is not a defined ValueType tag. Column bytes are an
             // immutable view — rebuild the poisoned column.
-            col.data = alloc::vec![0xFF; col.data.len()].into();
+            let mut poisoned = col.data.to_vec();
+            let Some(first_byte) = poisoned.first_mut() else {
+                panic!("value-type column is non-empty");
+            };
+            *first_byte = 0xFF;
+            col.data = poisoned.into();
         },
     )?);
 

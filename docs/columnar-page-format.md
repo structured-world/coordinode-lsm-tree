@@ -294,14 +294,71 @@ figures, is in `columnar-addressing.md`.
 
 ### How many pages
 
-Not a constant. A page holds one part of one column's encoding for one row
-page's rows, so a group has as many pages as its column parts times its row
-pages. How many parts a column has is a property of the encoding expression
-chosen for it — a dictionary-plus-bit-packed string column has five
-(dictionary bytes, dictionary offsets, codes, bases, bit widths), a constant
-column has none of its own, a dictionary-only column has one. The directory
-is therefore variable-length and the reader must not assume a fixed page
-count or a fixed part-to-page mapping.
+One per column and row page. A page holds a column's whole encoding for one
+row page's rows, however many operators the encoding nests (see
+[Values encoding](#values-encoding)), so every column has the one part `0`.
+Splitting an encoding into parts of their own pages would buy a read nothing,
+since no read wants a dictionary without its codes or bit-packed offsets
+without their exceptions, and would cost each part the 48 bytes of framing a
+page pays (see [Framing overhead](#framing-overhead)). The directory and the
+stamp keep the part field, and a reader refuses a part other than `0` rather
+than assemble a column from some of its parts.
+
+## Values encoding
+
+A page stores its column's values as an **expression**: an operator, its own
+fields, and the expressions of the vectors it is made of. The operators are
+light ones, each decoded by a pass over the values:
+
+| Operator | Stores | For |
+|---|---|---|
+| plain | the column's own layout | any column; served as a view of the page |
+| constant | one value for every row | a column of one value |
+| runs | each run's value and where it ends | long runs of one value |
+| dictionary | the distinct values in the column's order, then a code per row | few distinct values |
+| FFOR | integers as their offset from a base in the bits they need, the outliers stored whole | narrow integer ranges |
+| delta | integers as the zigzagged difference from the one before | sorted integers |
+| ordinals | a number column's values as integers in their order | numbers, which FFOR and delta then encode |
+| lengths | a bytes column's value lengths in place of its offset table | bytes columns |
+
+Because a dictionary is sorted in the column's order, a range over its values
+is a range over its codes. A predicate over a column is answered from its
+encoding: a constant with one comparison, runs with one per run, a dictionary
+with one per distinct value and a code lookup per row, integers as they
+decode; a column read only for its predicate is never decoded, and the rows
+a read keeps are built straight from the encoding. A point read takes single
+rows from an encoded page without decoding the rest of it. `sst-dump
+<table> columns` lists every page with what it was encoded as and, for a
+bytes column, the bytes it spends on where its values start (the offset
+table, or the lengths that replace it), so the saving an encoding makes there
+is told apart from the saving on the values.
+
+**Which encoding a page gets is a per-level policy**,
+`Config::column_encoding_policy`, like the data block compression:
+
+- **Plain**, the default at every level, stores every page in its column's
+  layout. A read hands a plain page out as a view of itself.
+- **Auto** encodes each page as the expression that costs least to store and
+  to read, over the candidates each operator offers, by the bytes each stores
+  and a per-row cost of decoding it; plain stays a candidate and wins where
+  nothing beats it.
+
+Plain is the default because a read that wants a column whole has to build
+an encoded page back into the layout, while it serves a plain page as a view.
+`db_bench --benchmark mixed-layout --num 70000`, two interleaved runs of five
+iterations each on one x86 Linux host, medians, the tables on tmpfs:
+
+| | point reads | near-full scan | near-full scan, no cache |
+|---|---|---|---|
+| plain | 357 ms, 215 B read per row | 57.5 ms, 340 B | 48.4 ms |
+| auto | 368 ms, 203 B read per row | 61.1 ms, 331 B | 54.0 ms |
+
+On these records only the engine's own columns encode (keys by their lengths,
+seqnos by their ordinals, the value type as a constant): 3-6% fewer bytes for
+3-12% more time, since the read builds every one of them back. That trade
+pays where bytes cost more than the build, on a level whose tables are
+mostly stored rather than read, as a stronger compression does there, and on
+typed value columns whose values encode far below their layout.
 
 ## Identity: what the page layer must add
 

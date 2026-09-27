@@ -111,6 +111,9 @@ pub struct Writer {
     /// Uncompressed bytes of row data a columnar row page is closed at.
     columnar_page_size: u32,
 
+    /// How a columnar table's column pages store their values.
+    column_encoding: crate::config::ColumnEncoding,
+
     data_block_hash_ratio: f32,
 
     /// Compression to use for data blocks
@@ -528,6 +531,7 @@ impl Writer {
 
             row_group_size: crate::config::DEFAULT_COLUMNAR_ROW_GROUP_SIZE,
             columnar_page_size: crate::config::DEFAULT_COLUMNAR_PAGE_SIZE,
+            column_encoding: crate::config::ColumnEncoding::Plain,
 
             data_block_compression: CompressionType::None,
             index_block_compression: CompressionType::None,
@@ -809,6 +813,14 @@ impl Writer {
             "columnar page size must be <= 4 MiB"
         );
         self.columnar_page_size = size;
+        self
+    }
+
+    /// Sets how a columnar table's column pages store their values. Ignored
+    /// for a row-major table.
+    #[must_use]
+    pub fn use_column_encoding(mut self, encoding: crate::config::ColumnEncoding) -> Self {
+        self.column_encoding = encoding;
         self
     }
 
@@ -1673,7 +1685,11 @@ impl Writer {
                     id,
                     row_page,
                 };
-                payloads.push((id, row_page, page_rows.encode_page(rows, stamp)?));
+                payloads.push((
+                    id,
+                    row_page,
+                    page_rows.encode_page(rows, stamp, self.column_encoding)?,
+                ));
                 start = end;
             }
         }

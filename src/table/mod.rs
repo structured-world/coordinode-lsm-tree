@@ -989,7 +989,7 @@ impl Table {
             let blocks = self
                 .group_read(handle.as_ref(), ReadCharge::Untraced)
                 .load(&crate::table::row_group::PageWant::ALL)?;
-            for (entry, rows, expression) in blocks.page_encodings()? {
+            for (entry, rows, expression, offsets) in blocks.page_encodings()? {
                 out.push(crate::inspect::PageEncoding {
                     group,
                     column_id: entry.id.column_id,
@@ -997,6 +997,7 @@ impl Table {
                     rows,
                     stored_len: entry.length,
                     expression,
+                    offsets_len: offsets,
                 });
             }
         }

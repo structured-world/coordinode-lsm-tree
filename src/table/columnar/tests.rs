@@ -5,7 +5,7 @@ use super::{
     unframe_value_cells_nullable, unframe_value_cells_with_defaults,
     validate_columnar_ingest_batch,
 };
-use crate::{Slice, ValueType, key::InternalKey, value::InternalValue};
+use crate::{Slice, ValueType, config::ColumnEncoding, key::InternalKey, value::InternalValue};
 
 #[test]
 fn fixed_only_value_framing_has_no_overhead_and_round_trips() {
@@ -1006,7 +1006,7 @@ fn column_page_decode_refused_for_a_tail_copies_nothing() {
         row_page: 0,
     };
     let mut page = nullable
-        .encode_page(batch.row_count, stamp)
+        .encode_page(batch.row_count, stamp, ColumnEncoding::Auto)
         .expect("encode page");
     page.push(0); // one byte past the page's column
     let mut copied = 0usize;
@@ -1182,7 +1182,7 @@ fn match_as_pages(
         .columns
         .iter()
         .map(|c| {
-            c.encode_page(batch.row_count, stamp(c.column_id))
+            c.encode_page(batch.row_count, stamp(c.column_id), ColumnEncoding::Auto)
                 .map(Slice::from)
         })
         .collect::<crate::Result<Vec<_>>>()?;
@@ -1336,7 +1336,12 @@ fn page_match_entries_refuses_a_run_outside_its_page() {
     let pages = batch
         .columns
         .iter()
-        .map(|c| Slice::from(c.encode_page(2, stamp(c.column_id)).expect("page")))
+        .map(|c| {
+            Slice::from(
+                c.encode_page(2, stamp(c.column_id), ColumnEncoding::Auto)
+                    .expect("page"),
+            )
+        })
         .collect::<Vec<_>>();
     for run in [1..3, 2..2, 0..0] {
         // Every column but the key's, as a lookup's second read takes them.

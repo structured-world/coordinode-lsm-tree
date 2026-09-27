@@ -1120,6 +1120,7 @@ impl AbstractTree for BlobTree {
         .use_data_block_size(data_block_size)
         .use_row_group_size(self.index.config.columnar_row_group_size_policy.get(0))
         .use_columnar_page_size(self.index.config.columnar_page_size_policy.get(0))
+        .use_column_encoding(self.index.config.column_encoding_policy.get(0))
         .use_data_block_hash_ratio(data_block_hash_ratio)
         .use_bloom_policy({
             use crate::config::FilterPolicyEntry::{Bloom, None};

@@ -1260,8 +1260,9 @@ impl RowGroupBlocks {
         Ok((ordinals, columns))
     }
 
-    /// Each fetched page with the rows it holds and what its values were
-    /// encoded as, in the directory's order, without decoding the values.
+    /// Each fetched page with the rows it holds, what its values were
+    /// encoded as and, for a bytes column, what it spends on where its values
+    /// start, in the directory's order, without decoding the values.
     ///
     /// # Errors
     ///
@@ -1269,7 +1270,14 @@ impl RowGroupBlocks {
     #[cfg(feature = "std")]
     pub(crate) fn page_encodings(
         &self,
-    ) -> crate::Result<Vec<(PageEntry, u32, crate::table::columnar::Expression)>> {
+    ) -> crate::Result<
+        Vec<(
+            PageEntry,
+            u32,
+            crate::table::columnar::Expression,
+            Option<usize>,
+        )>,
+    > {
         let entries = self.directory.entries();
         let unknown = || {
             crate::Error::InvalidHeader("columnar: page names a row page the group does not have")
@@ -1287,12 +1295,12 @@ impl RowGroupBlocks {
                     .directory
                     .row_page_rows(entry.row_page)
                     .ok_or_else(unknown)?;
-                let expression = crate::table::columnar::Column::page_expression(
+                let (expression, offsets) = crate::table::columnar::Column::page_expression(
                     &page.data,
                     rows,
                     self.directory.stamp_for(&entry),
                 )?;
-                Ok((entry, rows, expression))
+                Ok((entry, rows, expression, offsets))
             })
             .collect()
     }
