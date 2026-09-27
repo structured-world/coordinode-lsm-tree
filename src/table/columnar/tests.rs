@@ -1264,6 +1264,23 @@ fn match_as_pages(
     deletes: Option<(&crate::table::delete_bitmap::DeleteBitmap, u32)>,
     copied: &mut usize,
 ) -> crate::Result<Vec<InternalValue>> {
+    match_as_pages_within(
+        batch,
+        needle,
+        deletes,
+        copied,
+        &mut super::DecodeBudget::default(),
+    )
+}
+
+/// [`match_as_pages`] charging what the lookup holds decoded to `budget`.
+fn match_as_pages_within(
+    batch: &ColumnBatch,
+    needle: &[u8],
+    deletes: Option<(&crate::table::delete_bitmap::DeleteBitmap, u32)>,
+    copied: &mut usize,
+    budget: &mut super::DecodeBudget,
+) -> crate::Result<Vec<InternalValue>> {
     use crate::table::column_page::{PageId, PageStamp};
 
     let stamp = |column_id| PageStamp {
@@ -1282,13 +1299,19 @@ fn match_as_pages(
     let columns = pages
         .iter()
         .zip(&batch.columns)
-        .map(|(page, c)| Column::parse_page(page, batch.row_count, stamp(c.column_id)))
+        .map(|(page, c)| {
+            budget.parsed(Column::parse_page(
+                page,
+                batch.row_count,
+                stamp(c.column_id),
+            )?)
+        })
         .collect::<crate::Result<Vec<_>>>()?;
     let rows = batch.row_count;
     // The key pages are searched on their own; the matcher reads the rest.
     let mut columns: Vec<_> = columns;
     let key = columns.remove(0);
-    let keys = key.values.rows(TypeTag::Bytes, rows)?;
+    let keys = budget.rows(key.values, TypeTag::Bytes, rows)?;
     let run = super::key_rows(
         rows,
         needle,
@@ -1311,9 +1334,46 @@ fn match_as_pages(
         needle,
         deletes,
         copied,
+        budget,
         &mut out,
     )?;
     Ok(out)
+}
+
+/// A lookup holds decoded only what a group a writer cut lets it hold: each
+/// column it prepares for row reads, other than a layout or a constant read
+/// in place, holds up to a row's worth per row, and the group's budget counts
+/// them over every column and page. A forged group of many rows and columns
+/// encoded that way would otherwise make a lookup of one row hold gigabytes.
+/// Here 64 rows of one key under varied values: the seqnos by their ordinals
+/// and the values by their lengths each hold the page's 64 rows, so a budget
+/// of 100 rows refuses the lookup and one of 1000 serves it.
+#[test]
+fn a_lookup_holds_decoded_no_more_rows_than_its_group_budget() {
+    let entries: Vec<_> = (0..64u32)
+        .map(|i| {
+            entry(
+                b"dup",
+                u64::from(1_000 - i),
+                ValueType::Value,
+                &alloc::vec![b'v'; (i % 7) as usize],
+            )
+        })
+        .collect();
+    let batch = entries_to_column_batch(&entries).expect("batch");
+    let budget = |allowance| super::DecodeBudget {
+        allowance,
+        built: 0,
+        held: 0,
+    };
+    let refused = match_as_pages_within(&batch, b"dup", None, &mut 0, &mut budget(100));
+    assert!(
+        matches!(refused, Err(crate::Error::DecompressedSizeTooLarge { .. })),
+        "a lookup past the budget must be refused, got {refused:?}",
+    );
+    let found = match_as_pages_within(&batch, b"dup", None, &mut 0, &mut budget(1_000))
+        .expect("a lookup within the budget");
+    assert_eq!(found.len(), 64, "every version is found");
 }
 
 #[test]
@@ -1450,8 +1510,16 @@ fn page_match_entries_refuses_a_run_outside_its_page() {
             rows: 2,
             columns,
         };
-        let err = page_match_entries(page, run.clone(), b"k", None, &mut 0, &mut Vec::new())
-            .expect_err("a run outside the page must be refused");
+        let err = page_match_entries(
+            page,
+            run.clone(),
+            b"k",
+            None,
+            &mut 0,
+            &mut super::DecodeBudget::default(),
+            &mut Vec::new(),
+        )
+        .expect_err("a run outside the page must be refused");
         assert!(
             matches!(err, crate::Error::InvalidHeader(m) if m.contains("key run outside")),
             "run {run:?}: expected a run InvalidHeader, got {err:?}",

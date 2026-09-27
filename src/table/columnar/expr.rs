@@ -366,6 +366,15 @@ impl<'a> Ints<'a> {
         }
     }
 
+    /// The run ends the parse holds decoded, at any depth.
+    fn held_rows(&self) -> u64 {
+        match self {
+            Self::Constant(_) | Self::Ffor(_) => 0,
+            Self::Delta(inner) => inner.held_rows(),
+            Self::Rle { values, ends, .. } => ends.len() as u64 + values.held_rows(),
+        }
+    }
+
     /// What the vector was encoded as.
     ///
     /// # Errors
@@ -584,6 +593,17 @@ impl<'a> Values<'a> {
                 })
             }
             _ => Err(MALFORMED),
+        }
+    }
+
+    /// The run ends the parse holds decoded, at any depth: what a parsed
+    /// page keeps allocated until it is dropped.
+    pub(crate) fn held_rows(&self) -> u64 {
+        match self {
+            Self::Plain(_) | Self::Constant(_) => 0,
+            Self::Rle { values, ends, .. } => ends.len() as u64 + values.held_rows(),
+            Self::Dict { values, codes, .. } => values.held_rows() + codes.held_rows(),
+            Self::Ordinals(ints) | Self::Lengths { lengths: ints, .. } => ints.held_rows(),
         }
     }
 

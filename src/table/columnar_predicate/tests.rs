@@ -8,6 +8,25 @@ use crate::table::columnar::{
 use crate::{Slice, ValueType, key::InternalKey, value::InternalValue};
 use proptest::prelude::*;
 
+/// An intersection keeps only rows both selections select: a row past the
+/// other selection's rows is not selected by it, so it is cleared rather than
+/// left as it was.
+#[test]
+fn intersecting_with_a_shorter_selection_clears_the_rows_past_it() {
+    let mut all = super::Selection::all(128);
+    all.intersect(&super::Selection::none(64));
+    assert_eq!(
+        all.count(),
+        0,
+        "rows 64..128 are not in the other selection"
+    );
+
+    let mut all = super::Selection::all(128);
+    all.intersect(&super::Selection::all(64));
+    assert_eq!(all.count(), 64, "only the rows both select");
+    assert!(all.contains(63) && !all.contains(64));
+}
+
 /// A filtering predicate over `column_id`.
 fn filter(column_id: u16, lower: Option<Vec<u8>>, upper: Option<Vec<u8>>) -> ColumnRangePredicate {
     ColumnRangePredicate {

@@ -573,7 +573,8 @@ impl DataBlock {
     /// versions can run across a row page boundary.
     ///
     /// Also adds to `gathered` the matching rows' keys and values, which are
-    /// copied out of the columns before the encode copies them again.
+    /// copied out of the columns before the encode copies them again, and
+    /// charges what reading them holds decoded to `budget`, the group's.
     #[cfg(feature = "columnar")]
     pub(crate) fn columnar_point_block(
         pages: Vec<crate::table::columnar::RowPageColumns<'_>>,
@@ -582,6 +583,7 @@ impl DataBlock {
         restart_interval: u8,
         deletes: Option<(&crate::table::delete_bitmap::DeleteBitmap, u32)>,
         gathered: &mut usize,
+        budget: &mut crate::table::columnar::DecodeBudget,
     ) -> crate::Result<Option<Self>> {
         let overflow = || crate::Error::InvalidHeader("columnar: row position exceeds u32::MAX");
         if pages.len() != runs.len() {
@@ -607,6 +609,7 @@ impl DataBlock {
                 needle,
                 page_deletes,
                 gathered,
+                budget,
                 &mut entries,
             )?;
             offset = offset.checked_add(rows).ok_or_else(overflow)?;

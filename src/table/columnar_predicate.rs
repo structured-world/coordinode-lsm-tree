@@ -354,10 +354,12 @@ impl Selection {
             .is_some_and(|word| word >> (row % 64) & 1 == 1)
     }
 
-    /// Keeps only the rows `other` selects too.
+    /// Keeps only the rows `other` selects too; a row past `other`'s rows is
+    /// not selected by it.
     pub fn intersect(&mut self, other: &Self) {
-        for (word, theirs) in self.words.iter_mut().zip(&other.words) {
-            *word &= theirs;
+        let mut theirs = other.words.iter();
+        for word in &mut self.words {
+            *word &= theirs.next().copied().unwrap_or(0);
         }
     }
 

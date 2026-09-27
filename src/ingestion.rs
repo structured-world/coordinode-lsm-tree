@@ -75,8 +75,10 @@ impl AnyIngestion<'_> {
         }
     }
 
-    /// Writes a consumer-provided columnar batch (its value sub-columns) as one
-    /// columnar block, stored directly without re-transposing the value.
+    /// Writes a consumer-provided columnar batch (its value sub-columns) as
+    /// columnar row groups, stored directly without re-transposing the value.
+    /// Small batches of one layout share a group; a batch past the row group
+    /// size is cut into groups of that size.
     ///
     /// The batch carries the three intrinsic columns (`[key, seqno, value-type]`)
     /// plus one or more value sub-columns. Its keys must be strictly increasing

@@ -350,9 +350,12 @@ were encoded, as it keeps their compression; the next merge that rewrites
 those rows applies the level's policy.
 
 A read also bounds what a row group's pages may decode to: a writer closes a
-group once its rows reach at most 4 MiB, so a column of a group it cut never
-builds more than twice that past the bytes of its pages, and a page that
-would is refused before anything is built.
+group once its rows reach at most 4 MiB, an ingested batch past that cut into
+groups the same way, counting every column's bytes of each row. A group it
+cut therefore never builds more than twice that past the bytes of its pages,
+over all its columns, nor holds more rows decoded to read them (a run's ends,
+a row's offsets or integers), and a read refuses a group that would, a
+column past the bound before it is built.
 
 Plain is the default because a read that wants a column whole has to build
 an encoded page back into the layout, while it serves a plain page as a view.

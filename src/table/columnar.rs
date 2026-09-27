@@ -751,26 +751,6 @@ impl Column {
         Self::parse_page(bytes, row_count, expected)?.decode(row_count, copied, budget)
     }
 
-    /// What a column page's values were encoded as, and for a bytes column
-    /// the bytes it spends on where its values start, read from its payload
-    /// for a group of `row_count` rows without decoding the values, and
-    /// refused unless the page carries `expected` as its stamp.
-    ///
-    /// # Errors
-    ///
-    /// As [`Self::parse_page`].
-    pub(crate) fn page_expression(
-        bytes: &crate::Slice,
-        row_count: u32,
-        expected: crate::table::column_page::PageStamp,
-    ) -> Result<(Expression, Option<usize>)> {
-        let column = Self::parse_page(bytes, row_count, expected)?;
-        Ok((
-            column.values.describe()?,
-            column.values.offsets_len(column.type_tag, row_count),
-        ))
-    }
-
     /// Reads one column's wire form from `cur`, which walks `bytes`.
     ///
     /// Returns `None` when `want` is false: the column's validity and values
@@ -887,7 +867,7 @@ impl PageColumn<'_> {
         budget: &mut DecodeBudget,
     ) -> Result<Column> {
         let built = !matches!(self.values, Values::Plain(_));
-        let data = budget.build(self.column_id, self.page.len(), |limit| {
+        let data = budget.build(self.page.len(), |limit| {
             self.values
                 .materialize(self.type_tag, row_count, self.page, limit)
         })?;
@@ -950,8 +930,8 @@ impl PageColumn<'_> {
         budget: &mut DecodeBudget,
     ) -> Result<Column> {
         let rows = keep.count();
-        let (column_id, type_tag, values) = (self.column_id, self.type_tag, self.values);
-        let data = budget.build(column_id, self.page.len(), |limit| {
+        let (type_tag, values) = (self.type_tag, self.values);
+        let data = budget.build(self.page.len(), |limit| {
             values.materialize_rows(type_tag, row_count, keep, limit)
         })?;
         *copied += data.len();
@@ -978,23 +958,28 @@ impl PageColumn<'_> {
     }
 }
 
-/// What a read of one row group may build from its pages' encodings past
-/// the pages' own bytes, per column.
+/// What a read of one row group may make of its pages beyond their own bytes:
+/// the columns it builds from their encodings, and the rows it holds decoded
+/// to read them (a run's ends, a row's offset or integer).
 ///
 /// A writer closes a group once its rows reach the group size, at most
-/// [`crate::config::MAX_BLOCK_SIZE`], so the rows before a group's last add
-/// up to less than that in every column, and the last row is either stored
-/// on its page or repeats a value of a row before it. A column of a group a
-/// writer cut therefore never builds more than twice that past its pages. An
-/// encoding can describe far more bytes than it stores, so this is what stops
-/// a forged group from decoding into gigabytes, whether from one page or
-/// spread over many.
+/// [`crate::config::MAX_BLOCK_SIZE`], counting every column's bytes of each
+/// row, so the rows before a group's last add up to less than that over all
+/// its columns, and the last row is either stored on its pages or repeats
+/// values of the rows before it. A group a writer cut therefore never builds
+/// more than twice that past its pages, and since a column held decoded adds
+/// at least a byte to each row, never holds more rows than that decoded
+/// either. An encoding can describe far more bytes than it stores, so this is
+/// what stops a forged group from decoding into gigabytes, whether from one
+/// page or column or spread over thousands.
 #[derive(Debug)]
 pub(crate) struct DecodeBudget {
-    /// What a column may build past its pages.
+    /// What the group may build past its pages, and hold decoded, each.
     allowance: u64,
-    /// Each column's bytes built past its pages so far, at most `allowance`.
-    spent: Vec<(u16, u64)>,
+    /// Bytes built past the pages so far, at most `allowance`.
+    built: u64,
+    /// Rows held decoded so far, at most `allowance`.
+    held: u64,
 }
 
 impl Default for DecodeBudget {
@@ -1002,7 +987,8 @@ impl Default for DecodeBudget {
     fn default() -> Self {
         Self {
             allowance: 2 * u64::from(crate::config::MAX_BLOCK_SIZE),
-            spent: Vec::new(),
+            built: 0,
+            held: 0,
         }
     }
 }
@@ -1013,13 +999,14 @@ impl DecodeBudget {
     fn unbounded() -> Self {
         Self {
             allowance: u64::MAX / 2,
-            spent: Vec::new(),
+            built: 0,
+            held: 0,
         }
     }
 
-    /// Builds a page of `page_len` bytes of column `column_id` with `build`,
-    /// given the most bytes the column may take, and charges what it built
-    /// past the page.
+    /// Builds a column from a page of `page_len` bytes with `build`, given the
+    /// most bytes the column may take, and charges what it built past the
+    /// page.
     ///
     /// # Errors
     ///
@@ -1027,33 +1014,70 @@ impl DecodeBudget {
     /// building it.
     pub(crate) fn build(
         &mut self,
-        column_id: u16,
         page_len: usize,
         build: impl FnOnce(u64) -> Result<Slice>,
     ) -> Result<Slice> {
-        let spent = self
-            .spent
-            .iter()
-            .find(|&&(id, _)| id == column_id)
-            .map_or(0, |&(_, spent)| spent);
-        debug_assert!(spent <= self.allowance, "charged within the allowance");
+        debug_assert!(self.built <= self.allowance, "charged within the allowance");
         let page_len = page_len as u64;
         // A page is at most what a u32 block length holds, and the allowance
         // at most half a u64.
-        let limit = page_len + (self.allowance - spent);
+        let limit = page_len + (self.allowance - self.built);
         let data = build(limit)?;
         let len = data.len() as u64;
         debug_assert!(len <= limit, "a build refuses a column past its limit");
         // A column no larger than its page, a view of it among them, builds
         // nothing past it.
         if len > page_len {
-            let spent = spent + (len - page_len);
-            match self.spent.iter_mut().find(|(id, _)| *id == column_id) {
-                Some((_, charged)) => *charged = spent,
-                None => self.spent.push((column_id, spent)),
-            }
+            self.built += len - page_len;
         }
         Ok(data)
+    }
+
+    /// Charges `rows` rows held decoded, refused past the allowance.
+    ///
+    /// # Errors
+    ///
+    /// [`Error::DecompressedSizeTooLarge`] past the allowance.
+    pub(crate) fn hold(&mut self, rows: u64) -> Result<()> {
+        // At most the allowance, half a u64, plus a u32's worth of rows.
+        let held = self.held + rows;
+        if held > self.allowance {
+            return Err(Error::DecompressedSizeTooLarge {
+                declared: held,
+                limit: self.allowance,
+            });
+        }
+        self.held = held;
+        Ok(())
+    }
+
+    /// `values`, of `n` rows of a column of `type_tag`, prepared for row
+    /// reads, the rows the preparation may hold decoded charged first: none
+    /// for a layout or a constant, which are read in place.
+    ///
+    /// # Errors
+    ///
+    /// As [`Self::hold`] and [`Values::rows`].
+    pub(crate) fn rows<'a>(
+        &mut self,
+        values: Values<'a>,
+        type_tag: TypeTag,
+        n: u32,
+    ) -> Result<expr::Rows<'a>> {
+        if !matches!(values, Values::Plain(_) | Values::Constant(_)) {
+            self.hold(u64::from(n))?;
+        }
+        values.rows(type_tag, n)
+    }
+
+    /// `column` as parsed, the run ends its parse holds decoded charged.
+    ///
+    /// # Errors
+    ///
+    /// As [`Self::hold`].
+    pub(crate) fn parsed<'a>(&mut self, column: PageColumn<'a>) -> Result<PageColumn<'a>> {
+        self.hold(column.values.held_rows())?;
+        Ok(column)
     }
 }
 
@@ -1118,6 +1142,25 @@ impl ColumnBatch {
     /// As [`Self::row_bytes`].
     pub(crate) fn rows_bytes(&self) -> Result<u64> {
         (0..self.row_count).try_fold(0u64, |sum, row| Ok(sum + self.row_bytes(row)?))
+    }
+
+    /// The batch's rows `start..end` as a batch of their own, every column cut
+    /// the same way ([`Column::rows`]).
+    ///
+    /// # Errors
+    ///
+    /// As [`Column::rows`].
+    pub(crate) fn rows(&self, start: u32, end: u32) -> Result<Self> {
+        Ok(Self {
+            row_count: end.checked_sub(start).ok_or(Error::InvalidHeader(
+                "columnar: row range outside the batch",
+            ))?,
+            columns: self
+                .columns
+                .iter()
+                .map(|col| col.rows(self.row_count, start, end))
+                .collect::<Result<_>>()?,
+        })
     }
 
     /// The first row's user key, or `None` for an empty batch. Reads only the
@@ -2357,20 +2400,23 @@ pub(crate) struct RowPageColumns<'a> {
 /// plus its row.
 ///
 /// Adds to `copied` the key and value bytes of each row as it is copied out,
-/// so rows copied before a later row fails are still counted.
+/// so rows copied before a later row fails are still counted, and charges
+/// what preparing the columns for row reads holds decoded to `budget`, the
+/// group's.
 ///
 /// # Errors
 ///
 /// [`Error::InvalidHeader`] when the page does not carry the seqno and value
 /// type columns in order, carries no value column, holds no row, `run` falls
 /// outside it, or a row it reads is malformed; [`Error::InvalidTag`] for an
-/// unknown value type.
+/// unknown value type; [`Error::DecompressedSizeTooLarge`] past `budget`.
 pub(crate) fn page_match_entries(
     page: RowPageColumns<'_>,
     run: core::ops::Range<u32>,
     needle: &[u8],
     deletes: Option<(&crate::table::delete_bitmap::DeleteBitmap, u32)>,
     copied: &mut usize,
+    budget: &mut DecodeBudget,
     out: &mut Vec<InternalValue>,
 ) -> Result<()> {
     let rows = page.rows;
@@ -2412,8 +2458,8 @@ pub(crate) fn page_match_entries(
     // The layout was checked above, so the intrinsic columns' types are known.
     let seqno_type = TypeTag::Number(Number::U64_LE);
     let vt_type = TypeTag::Fixed(1);
-    let seqnos = seqno.values.rows(seqno_type, rows)?;
-    let types = vt.values.rows(vt_type, rows)?;
+    let seqnos = budget.rows(seqno.values, seqno_type, rows)?;
+    let types = budget.rows(vt.values, vt_type, rows)?;
     // The value sub-columns prepared for row reads in one pass, each id
     // checked against the ones before it.
     let mut values: Vec<(u16, TypeTag, Option<&[u8]>, expr::Rows<'_>)> =
@@ -2430,7 +2476,7 @@ pub(crate) fn page_match_entries(
             c.column_id,
             c.type_tag,
             c.validity,
-            c.values.rows(c.type_tag, rows)?,
+            budget.rows(c.values, c.type_tag, rows)?,
         ));
     }
     if values.is_empty() {

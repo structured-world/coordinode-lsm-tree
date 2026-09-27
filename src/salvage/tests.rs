@@ -2609,6 +2609,142 @@ fn forge_row_group_column(
     Ok(row_count)
 }
 
+/// A columnar scan that fails on a later page of a group still counts what it
+/// copied building the pages before it: those copies were made whatever the
+/// scan returns. Forged: the key page of the group's last row page keeps its
+/// length and still parses, but one flipped byte leaves its encoding unable to
+/// build the column, so it fails only once the earlier row pages were built.
+#[cfg(all(feature = "columnar", feature = "metrics"))]
+#[test]
+fn a_columnar_scan_failing_on_a_later_page_still_counts_its_copies() -> crate::Result<()> {
+    use crate::coding::Decode;
+    use crate::table::columnar::{COL_USER_KEY, Column, DecodeBudget};
+
+    let dir = tempdir()?;
+    let source = dir.path().join("source");
+    let fs: Arc<dyn Fs> = Arc::new(StdFs);
+    let mut writer = Writer::new(source.clone(), 0, 0, Arc::clone(&fs))?
+        .use_columnar(true)
+        .use_zone_map(true)
+        .use_column_encoding(crate::config::ColumnEncoding::Auto)
+        .use_row_group_size(4_096)
+        .use_columnar_page_size(256);
+    for i in 0..40 {
+        writer.write(iv(i))?;
+    }
+    assert!(
+        writer.finish()?.is_some(),
+        "source columnar SST is non-empty"
+    );
+
+    let (group_at, directory) = row_group(&source, &fs, 0)?;
+    let Some(last) = directory
+        .entries()
+        .iter()
+        .rfind(|e| e.id.column_id == COL_USER_KEY)
+    else {
+        panic!("the group holds key pages");
+    };
+    assert!(last.row_page > 0, "the group holds several row pages");
+    let rows = directory.row_page_rows(last.row_page).unwrap_or_default();
+    let stamp = directory.stamp_for(last);
+    let mut bytes = std::fs::read(&source)?;
+    let directory_len = {
+        let Some(frame) = bytes.get(group_at..) else {
+            panic!("row group within the file");
+        };
+        crate::table::block::Header::decode_from(&mut &frame[..])?.on_disk_size_with(None) as usize
+    };
+    let page_at =
+        group_at + directory_len + directory.pages_start() as usize + last.offset as usize;
+    let page = block_payload(&bytes, page_at)?;
+    let Some(forged) = (0..page.len()).find_map(|at| {
+        let mut flipped = page.clone();
+        *flipped.get_mut(at)? ^= 1;
+        let slice = crate::Slice::from(flipped.clone());
+        let builds = Column::decode_page(&slice, rows, stamp, &mut 0, &mut DecodeBudget::default());
+        (Column::parse_page(&slice, rows, stamp).is_ok() && builds.is_err()).then_some(flipped)
+    }) else {
+        panic!("some byte of the key page parses but no longer builds once flipped");
+    };
+    restamp_block(&mut bytes, page_at, &forged)?;
+    std::fs::write(&source, &bytes)?;
+
+    let table = open(source, &fs)?;
+    assert!(
+        table.columnar_scan(&[COL_USER_KEY], None).is_err(),
+        "the forged page fails the scan",
+    );
+    assert!(
+        table.metrics.bytes_copied() > 0,
+        "the key pages built before the forged one are counted",
+    );
+    Ok(())
+}
+
+/// Listing a table's page encodings refuses a page whose own column header
+/// names another column than the directory filed it under, as every read of
+/// the group does, rather than reporting its encoding as the directory's
+/// column. Forged: the value page's header renamed to column 9, its length
+/// and stamp kept and its checksum re-stamped.
+#[cfg(feature = "columnar")]
+#[test]
+fn listing_page_encodings_refuses_a_page_filed_under_another_column() -> crate::Result<()> {
+    use crate::coding::Decode;
+    use crate::table::column_page::PageStamp;
+    use crate::table::columnar::COL_VALUE;
+
+    let dir = tempdir()?;
+    let source = dir.path().join("source");
+    let fs: Arc<dyn Fs> = Arc::new(StdFs);
+    let mut writer = Writer::new(source.clone(), 0, 0, Arc::clone(&fs))?
+        .use_columnar(true)
+        .use_zone_map(true);
+    for i in 0..20 {
+        writer.write(iv(i))?;
+    }
+    assert!(
+        writer.finish()?.is_some(),
+        "source columnar SST is non-empty"
+    );
+    assert!(
+        crate::inspect::read_column_encodings(&source).is_ok(),
+        "the untouched table lists"
+    );
+
+    let (group_at, directory) = row_group(&source, &fs, 0)?;
+    let Some(value) = directory
+        .entries()
+        .iter()
+        .find(|e| e.id.column_id == COL_VALUE)
+    else {
+        panic!("the group holds a value page");
+    };
+    let mut bytes = std::fs::read(&source)?;
+    let directory_len = {
+        let Some(frame) = bytes.get(group_at..) else {
+            panic!("row group within the file");
+        };
+        crate::table::block::Header::decode_from(&mut &frame[..])?.on_disk_size_with(None) as usize
+    };
+    let page_at =
+        group_at + directory_len + directory.pages_start() as usize + value.offset as usize;
+    let mut page = block_payload(&bytes, page_at)?;
+    // The column header opens with its id, right after the stamp.
+    let Some(id) = page.get_mut(PageStamp::LEN..PageStamp::LEN + 2) else {
+        panic!("the page holds a column header");
+    };
+    id.copy_from_slice(&9u16.to_le_bytes());
+    restamp_block(&mut bytes, page_at, &page)?;
+    std::fs::write(&source, &bytes)?;
+
+    assert!(
+        crate::inspect::read_column_encodings(&source).is_err(),
+        "a page under another column's id is refused, not listed as the directory's column",
+    );
+    Ok(())
+}
+
 /// Swaps the first two rows' user keys inside a key column, in place.
 /// Equal-length keys keep the `Bytes` framing intact, so the column still
 /// decodes and its rows still materialize — only the ordering invariant is
