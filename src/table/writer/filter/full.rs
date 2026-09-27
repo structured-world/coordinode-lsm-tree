@@ -117,12 +117,15 @@ impl<W: crate::io::Write + crate::io::Seek> FilterWriter<W> for FullFilterWriter
     }
 
     fn held_bytes(&self) -> u64 {
+        (self.bloom_hash_buffer.capacity() * core::mem::size_of::<u64>()) as u64
+    }
+
+    fn finish_scratch_bytes(&self) -> u64 {
         // The hashes move into the build, which allocates its scratch and
         // the filter bytes on top of them.
-        let hashes = self.bloom_hash_buffer.capacity() * core::mem::size_of::<u64>();
         let n = self.bloom_hash_buffer.len();
         let build = crate::table::filter::ribbon::burr::builder::build_peak_bytes(n, false);
-        (hashes + build + self.bloom_policy.estimated_filter_size(n)) as u64
+        (build + self.bloom_policy.estimated_filter_size(n)) as u64
     }
 
     fn finish_output_bytes(&self) -> u64 {

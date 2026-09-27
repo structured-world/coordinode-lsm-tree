@@ -82,6 +82,8 @@ pub struct AdaptiveIndexWriter<W: Write + Seek + 'static> {
     // Pre-spill state: buffered handles + running size estimate.
     buffer: Vec<KeyedBlockHandle>,
     buffered_bytes: u64,
+    /// Bytes the buffered handles take encoded, bounded from above.
+    buffered_encoded: u64,
 
     /// `Some` once spilled — every subsequent handle is forwarded here
     /// and `finish` delegates to it.
@@ -103,6 +105,7 @@ impl<W: Write + Seek + 'static> AdaptiveIndexWriter<W> {
             spill_threshold,
             buffer: Vec::new(),
             buffered_bytes: 0,
+            buffered_encoded: 0,
             spilled: None,
         }
     }
@@ -126,10 +129,13 @@ impl<W: Write + Seek + 'static> AdaptiveIndexWriter<W> {
     /// current config and replay the buffered handles into it.
     fn spill(&mut self) -> crate::Result<()> {
         let mut partitioned = self.configure(Box::new(PartitionedIndexWriter::new()));
-        for handle in self.buffer.drain(..) {
+        // Taking the buffer frees its allocation once replayed; draining it
+        // would keep the capacity for the life of the table.
+        for handle in core::mem::take(&mut self.buffer) {
             partitioned.register_data_block(handle)?;
         }
         self.buffered_bytes = 0;
+        self.buffered_encoded = 0;
         self.spilled = Some(partitioned);
         Ok(())
     }
@@ -146,6 +152,7 @@ impl<W: Write + Seek + 'static> BlockIndexWriter<W> for AdaptiveIndexWriter<W> {
         let entry_size =
             (block_handle.end_key().len() + core::mem::size_of::<KeyedBlockHandle>()) as u64;
         self.buffered_bytes += entry_size;
+        self.buffered_encoded += block_handle.encoded_len_bound() as u64;
         self.buffer.push(block_handle);
 
         if self.buffered_bytes > self.spill_threshold {
@@ -157,16 +164,24 @@ impl<W: Write + Seek + 'static> BlockIndexWriter<W> for AdaptiveIndexWriter<W> {
     fn held_bytes(&self) -> u64 {
         match &self.spilled {
             Some(partitioned) => partitioned.held_bytes(),
-            // `finish` replays the buffer into a full writer, which encodes
-            // it into one block alongside.
-            None => 2 * self.buffered_bytes,
+            None => self.buffered_bytes,
+        }
+    }
+
+    fn finish_scratch_bytes(&self) -> u64 {
+        match &self.spilled {
+            Some(partitioned) => partitioned.finish_scratch_bytes(),
+            // The full writer takes the buffer over and encodes it into one
+            // block, which the table keeps until it writes the tail mirror.
+            None => self.buffered_encoded,
         }
     }
 
     fn finish_output_bytes(&self) -> u64 {
         match &self.spilled {
             Some(partitioned) => partitioned.finish_output_bytes(),
-            None => self.buffered_bytes,
+            // Written twice: at the head and as the tail mirror.
+            None => 2 * self.buffered_encoded,
         }
     }
 
@@ -174,19 +189,23 @@ impl<W: Write + Seek + 'static> BlockIndexWriter<W> for AdaptiveIndexWriter<W> {
         self: Box<Self>,
         file_writer: &mut crate::sfa::Writer<ChecksummedWriter<W>>,
     ) -> crate::Result<(usize, Vec<u8>)> {
-        let this = *self;
+        let mut this = *self;
 
         // Spilled → two-level index is already streaming; just finish it.
-        if let Some(partitioned) = this.spilled {
+        if let Some(partitioned) = this.spilled.take() {
             return partitioned.finish(file_writer);
         }
 
         // Stayed small → single-level (Full) index.
-        let mut full = this.configure(Box::new(FullIndexWriter::new()));
-        for handle in this.buffer {
-            full.register_data_block(handle)?;
-        }
-        full.finish(file_writer)
+        // The full writer takes the buffer over rather than a copy of it.
+        // Both sizes count bytes held in memory, so they fit in `usize`.
+        #[expect(clippy::cast_possible_truncation, reason = "bytes held in memory")]
+        let full = FullIndexWriter::with_handles(
+            core::mem::take(&mut this.buffer),
+            this.buffered_bytes as usize,
+            this.buffered_encoded as usize,
+        );
+        this.configure(Box::new(full)).finish(file_writer)
     }
 
     fn use_compression(
@@ -239,3 +258,6 @@ impl<W: Write + Seek + 'static> BlockIndexWriter<W> for AdaptiveIndexWriter<W> {
         self
     }
 }
+
+#[cfg(test)]
+mod tests;

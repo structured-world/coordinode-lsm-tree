@@ -591,3 +591,87 @@ fn held_state_follows_the_keys_not_the_value_bytes() -> crate::Result<()> {
     }
     Ok(())
 }
+
+/// Writes `n` keys of `key_len` bytes with 8-byte values and spills the last
+/// block.
+fn write_long_keys(writer: &mut Writer, n: u32, key_len: usize) -> crate::Result<()> {
+    for i in 0..n {
+        writer.write(InternalValue::from_components(
+            format!("{i:0key_len$}").into_bytes(),
+            b"value---".to_vec(),
+            0,
+            ValueType::Value,
+        ))?;
+    }
+    writer.spill_block()
+}
+
+/// The size hint before `finish` lands within 10% of the finished table.
+fn assert_hint_matches_the_table(writer: Writer, path: &std::path::Path) -> crate::Result<()> {
+    let hint = writer.output_size_hint();
+    writer.finish()?;
+    let size = std::fs::metadata(path)?.len();
+    assert!(
+        hint * 10 >= size * 9 && hint * 10 <= size * 11,
+        "hint {hint} for a {size}-byte table",
+    );
+    Ok(())
+}
+
+/// The top-level index is written twice, at its place and mirrored at the
+/// tail. Small blocks under long keys make it a large share of the table, so
+/// the hint lands near the finished size only if both copies are counted.
+#[test]
+fn the_size_hint_counts_the_mirrored_index() -> crate::Result<()> {
+    let dir = tempfile::tempdir()?;
+    let path = dir.path().join("1");
+    let mut writer = Writer::new(path.clone(), 1, 0, Arc::new(StdFs))?.use_data_block_size(64);
+    write_long_keys(&mut writer, 5_000, 200)?;
+    assert_hint_matches_the_table(writer, &path)
+}
+
+/// Zone-map entries own copies of each block's bounds; under long keys those
+/// dominate the section, and both estimates have to count them.
+#[test]
+fn the_estimates_count_the_zone_map_bounds() -> crate::Result<()> {
+    let dir = tempfile::tempdir()?;
+    let path = dir.path().join("1");
+    let mut writer = Writer::new(path.clone(), 1, 0, Arc::new(StdFs))?
+        .use_data_block_size(256)
+        .use_zone_map(true);
+    write_long_keys(&mut writer, 5_000, 200)?;
+    let blocks = writer.zone_map_section.len() as u64;
+    assert!(
+        writer.held_state_bytes() > blocks * 2 * 200,
+        "{} bytes held for {blocks} blocks of 200-byte bounds",
+        writer.held_state_bytes(),
+    );
+    assert_hint_matches_the_table(writer, &path)
+}
+
+/// Explicit locator widths too narrow for the table skip its section at
+/// `finish`. The widths only grow with the table, so once they no longer fit
+/// the writer holds nothing for the locator and charges nothing for it.
+#[test]
+fn a_locator_too_narrow_for_the_table_stops_holding_state() -> crate::Result<()> {
+    let dir = tempfile::tempdir()?;
+    let mut narrow = Writer::new(dir.path().join("1"), 1, 0, Arc::new(StdFs))?
+        .use_data_block_size(64)
+        .use_locator(crate::config::LocatorPolicyEntry::Enabled {
+            precision: crate::config::LocatorPrecision::Block,
+            block_id_bits: Some(1),
+            slot_bits: None,
+        });
+    let mut plain =
+        Writer::new(dir.path().join("2"), 1, 0, Arc::new(StdFs))?.use_data_block_size(64);
+    write_keys(&mut narrow, 5_000, 8)?;
+    write_keys(&mut plain, 5_000, 8)?;
+    assert!(
+        narrow.locators.is_empty(),
+        "{} triples held",
+        narrow.locators.len()
+    );
+    assert_eq!(narrow.held_state_bytes(), plain.held_state_bytes());
+    assert_eq!(narrow.output_size_hint(), plain.output_size_hint());
+    Ok(())
+}

@@ -98,18 +98,11 @@ impl PartitionedFilterWriter {
         }
     }
 
-    fn spill_filter_partition(&mut self, key: &UserKey) -> crate::Result<()> {
-        let hash_count = self.bloom_hash_buffer.len();
+    /// Builds the open partition from `hashes`, taken out of
+    /// `bloom_hash_buffer` by the caller.
+    fn spill_filter_partition(&mut self, key: &UserKey, hashes: Vec<u64>) -> crate::Result<()> {
+        let hash_count = hashes.len();
         let partition_index = self.tli_handles.len();
-        // mem::replace (rather than mem::take) preserves the buffer's
-        // grown capacity for the next partition. `take` leaves a
-        // capacity-0 Vec behind, which would force a reallocation on
-        // every register_key call following a spill. Tables with many
-        // partitions can spill thousands of times during a single
-        // flush/compaction, so the saved reallocations matter on the
-        // write hot path.
-        let old_cap = self.bloom_hash_buffer.capacity();
-        let hashes = core::mem::replace(&mut self.bloom_hash_buffer, Vec::with_capacity(old_cap));
         let filter_bytes = build_burr_filter_bytes(self.bloom_policy, hashes)?;
 
         // An empty BuRR build result means the policy is inactive for
@@ -313,21 +306,36 @@ impl<W: crate::io::Write + crate::io::Seek> FilterWriter<W> for PartitionedFilte
         self.last_key = Some(key.clone());
 
         if self.approx_filter_size >= self.partition_size as usize {
-            self.spill_filter_partition(key)?;
+            // mem::replace (rather than mem::take) preserves the buffer's
+            // grown capacity for the next partition. `take` leaves a
+            // capacity-0 Vec behind, which would force a reallocation on
+            // every register_key call following a spill. Tables with many
+            // partitions can spill thousands of times during a single
+            // flush/compaction, so the saved reallocations matter on the
+            // write hot path.
+            let old_cap = self.bloom_hash_buffer.capacity();
+            let hashes =
+                core::mem::replace(&mut self.bloom_hash_buffer, Vec::with_capacity(old_cap));
+            self.spill_filter_partition(key, hashes)?;
         }
 
         Ok(())
     }
 
     fn held_bytes(&self) -> u64 {
-        // The built partitions stay buffered until `finish` writes them; only
-        // the open partition's hashes are still to be built.
+        // The built partitions stay buffered until `finish` writes them.
         let hashes = self.bloom_hash_buffer.capacity() * core::mem::size_of::<u64>();
+        (self.final_filter_buffer.capacity() + hashes + self.tli_bytes) as u64
+    }
+
+    fn finish_scratch_bytes(&self) -> u64 {
+        // `finish` builds the open partition, then encodes the top-level
+        // index.
         let build = crate::table::filter::ribbon::burr::builder::build_peak_bytes(
             self.bloom_hash_buffer.len(),
             false,
         );
-        (self.final_filter_buffer.capacity() + hashes + build + self.tli_bytes) as u64
+        (build + self.approx_filter_size + self.tli_bytes) as u64
     }
 
     fn finish_output_bytes(&self) -> u64 {
@@ -351,7 +359,9 @@ impl<W: crate::io::Write + crate::io::Seek> FilterWriter<W> for PartitionedFilte
                 reason = "last key must exist because of initial check"
             )]
             let last_key = self.last_key.take().expect("last key should exist");
-            self.spill_filter_partition(&last_key)?;
+            // No partition follows the last one, so the buffer goes whole.
+            let hashes = core::mem::take(&mut self.bloom_hash_buffer);
+            self.spill_filter_partition(&last_key, hashes)?;
         }
 
         let index_base_offset = BlockOffset(file_writer.get_mut().stream_position()?);

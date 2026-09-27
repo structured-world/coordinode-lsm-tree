@@ -171,6 +171,28 @@ impl KeyedBlockHandle {
     pub fn end_key(&self) -> &UserKey {
         &self.end_key
     }
+
+    /// Bytes this entry takes in an index block, bounded from above: its full
+    /// encoding, which a truncated one never exceeds, and its restart pointer.
+    #[must_use]
+    pub fn encoded_len_bound(&self) -> usize {
+        /// LEB128 length of `v`.
+        const fn varint_len(v: u64) -> usize {
+            (64 - (v | 1).leading_zeros() as usize).div_ceil(7)
+        }
+        let group = self.inner.row_group.map_or(0, |g| {
+            varint_len(g.tag.get())
+                + varint_len(u64::from(g.directory_len.get()))
+                + varint_len(u64::from(g.head_zones_len))
+        });
+        1 + varint_len(*self.offset())
+            + varint_len(u64::from(self.size()))
+            + varint_len(self.seqno)
+            + group
+            + varint_len(self.end_key.len() as u64)
+            + self.end_key.len()
+            + core::mem::size_of::<u32>()
+    }
 }
 
 #[cfg(test)]

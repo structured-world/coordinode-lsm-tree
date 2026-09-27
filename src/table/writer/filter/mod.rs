@@ -24,9 +24,12 @@ pub trait FilterWriter<W: crate::io::Write + crate::io::Seek> {
     /// Registers a key in the block index.
     fn register_key(&mut self, key: &UserKey) -> crate::Result<()>;
 
-    /// Heap bytes this writer holds until [`finish`](Self::finish), and the
-    /// ones `finish` allocates on top to build the filter, at the peak.
+    /// Heap bytes this writer holds until [`finish`](Self::finish).
     fn held_bytes(&self) -> u64;
+
+    /// Heap bytes [`finish`](Self::finish) allocates on top of
+    /// [`held_bytes`](Self::held_bytes) while it builds, at its peak.
+    fn finish_scratch_bytes(&self) -> u64;
 
     /// Bytes [`finish`](Self::finish) will append to the table file,
     /// estimated from what is held now.

@@ -246,6 +246,11 @@ pub struct Writer {
     held_state_bytes: u64,
     finish_metadata_bytes: u64,
 
+    /// Heap bytes the per-block sections (`block_layouts`,
+    /// `seqno_bounds_section`, `zone_map_section`) hold, kept as their
+    /// entries are pushed.
+    section_bytes: u64,
+
     initial_level: u8,
 
     /// Block encryption provider (if encryption at rest is enabled)
@@ -571,6 +576,7 @@ impl Writer {
             locator_max_slot: 0,
             held_state_bytes: 0,
             finish_metadata_bytes: 0,
+            section_bytes: 0,
 
             #[cfg(feature = "columnar")]
             last_group_tag: None,
@@ -655,54 +661,87 @@ impl Writer {
     /// A data block was written: advances the locator ordinal and refreshes
     /// the held-state and finish-metadata estimates the table rotates on.
     fn block_written(&mut self) {
-        if self.locator.is_some() {
+        if let Some(spec) = self.locator {
             // Positions only grow within a block, so the block's last key
             // carries its largest slot.
             if let Some(&(_, _, slot)) = self.locators.last() {
                 self.locator_max_slot = self.locator_max_slot.max(slot);
             }
-            self.locator_block_id += 1;
+            // Widths the table has outgrown stay outgrown: the section would
+            // be skipped at `finish`, so stop collecting for it now.
+            if crate::table::locator::section_widths(
+                spec,
+                self.locator_block_id,
+                self.locator_max_slot,
+            )
+            .is_none()
+            {
+                log::debug!(
+                    "locator section dropped at block {}: explicit widths too narrow",
+                    self.locator_block_id,
+                );
+                self.locator = None;
+                self.locators = Vec::new();
+            } else {
+                self.locator_block_id += 1;
+            }
         }
         self.refresh_state_estimates();
     }
 
+    /// Refreshes the held-state and finish-metadata estimates.
+    ///
+    /// `finish` builds its sections one after another and frees each input
+    /// once built, so the state peaks at the largest of three phases, not at
+    /// the sum of every scratch: the block index built over everything still
+    /// held; the filter built once the index is gone; the locator built once
+    /// the filter is gone. The top-level index bytes stay held to the end,
+    /// for the tail mirror.
     fn refresh_state_estimates(&mut self) {
-        const WORD: usize = core::mem::size_of::<u64>();
+        const WORD: u64 = core::mem::size_of::<u64>() as u64;
 
-        let mut held = self.filter_writer.held_bytes() + self.index_writer.held_bytes();
-        let mut metadata =
-            self.filter_writer.finish_output_bytes() + self.index_writer.finish_output_bytes();
+        let index_held = self.index_writer.held_bytes();
+        let index_scratch = self.index_writer.finish_scratch_bytes();
+        let filter_held = self.filter_writer.held_bytes();
+        let filter_scratch = self.filter_writer.finish_scratch_bytes();
+        let sections =
+            self.section_bytes + self.delete_bitmap.len() * core::mem::size_of::<u32>() as u64;
+
+        let mut metadata = self.filter_writer.finish_output_bytes()
+            + self.index_writer.finish_output_bytes()
+            + sections;
+        let mut locator_held = 0;
+        let mut locator_scratch = 0;
 
         if let Some(spec) = self.locator
             && !self.locators.is_empty()
-        {
-            let n = self.locators.len();
-            let section = crate::table::locator::section_size_estimate(
-                n,
+            && let Some(section) = crate::table::locator::section_size_estimate(
+                self.locators.len(),
                 spec,
                 self.locator_block_id,
                 self.locator_max_slot,
-            );
-            // The triples, then at `finish` their split into hashes and packed
-            // values, the retrieval build over them, and the section bytes.
-            held += (self.locators.capacity() * core::mem::size_of::<(u64, u64, u64)>()
-                + n * 2 * WORD
-                + crate::table::filter::ribbon::burr::builder::build_peak_bytes(n, true)
-                + section) as u64;
-            metadata += section as u64;
+            )
+        {
+            let n = self.locators.len() as u64;
+            let section = section as u64;
+            locator_held =
+                (self.locators.capacity() * core::mem::size_of::<(u64, u64, u64)>()) as u64;
+            // The split into hashes and packed values, the retrieval build over
+            // them, and the section bytes.
+            locator_scratch = n * 2 * WORD
+                + crate::table::filter::ribbon::burr::builder::build_peak_bytes(
+                    self.locators.len(),
+                    true,
+                ) as u64
+                + section;
+            metadata += section;
         }
 
-        // Per-block sections, at their in-memory size.
-        let sections = (self.block_layouts.len() * core::mem::size_of::<(BlockOffset, Vec<u32>)>()
-            + self.seqno_bounds_section.len() * core::mem::size_of::<(BlockOffset, (u64, u64))>()
-            + self.zone_map_section.len()
-                * core::mem::size_of::<(BlockOffset, Vec<crate::table::zone_map::ColumnStats>)>())
-            as u64
-            + self.delete_bitmap.len() * core::mem::size_of::<u32>() as u64;
-        held += sections;
-        metadata += sections;
+        let index_phase = index_held + index_scratch + filter_held + locator_held + sections;
+        let filter_phase = index_scratch + filter_held + filter_scratch + locator_held + sections;
+        let locator_phase = index_scratch + locator_held + locator_scratch + sections;
 
-        self.held_state_bytes = held;
+        self.held_state_bytes = index_phase.max(filter_phase).max(locator_phase);
         self.finish_metadata_bytes = metadata;
     }
 
@@ -2237,6 +2276,9 @@ impl Writer {
         // multi-inner-block data blocks carry a non-empty layout, so single
         // (default 4 KiB) blocks add nothing.
         if !layout.is_empty() {
+            self.section_bytes += (core::mem::size_of::<(BlockOffset, Vec<u32>)>()
+                + layout.capacity() * core::mem::size_of::<u32>())
+                as u64;
             self.block_layouts.push((self.meta.file_pos, layout));
         }
 
@@ -2250,6 +2292,7 @@ impl Writer {
         // the index keeps point-read index probes at their legacy cost while the
         // seqno-scoped scan loads the section.
         if let Some((seqno_min, seqno_max)) = seqno_bounds {
+            self.section_bytes += core::mem::size_of::<(BlockOffset, (u64, u64))>() as u64;
             self.seqno_bounds_section
                 .push((self.meta.file_pos, (seqno_min, seqno_max)));
         }
@@ -2279,6 +2322,16 @@ impl Writer {
             // this is non-empty in practice; guard defensively so an empty stats
             // vector never registers a column-less zone-map entry.
             if !columns.is_empty() {
+                // The entry, its column vector and each column's bounds.
+                let bounds: usize = columns
+                    .iter()
+                    .map(|c| c.min.capacity() + c.max.capacity())
+                    .sum();
+                self.section_bytes +=
+                    (core::mem::size_of::<(BlockOffset, Vec<crate::table::zone_map::ColumnStats>)>(
+                    ) + columns.capacity()
+                        * core::mem::size_of::<crate::table::zone_map::ColumnStats>()
+                        + bounds) as u64;
                 self.zone_map_section.push((self.meta.file_pos, columns));
             }
         }
