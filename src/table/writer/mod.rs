@@ -693,14 +693,14 @@ impl Writer {
         }
 
         // Per-block sections, at their in-memory size.
-        let sections = self.block_layouts.len() * core::mem::size_of::<(BlockOffset, Vec<u32>)>()
+        let sections = (self.block_layouts.len() * core::mem::size_of::<(BlockOffset, Vec<u32>)>()
             + self.seqno_bounds_section.len() * core::mem::size_of::<(BlockOffset, (u64, u64))>()
             + self.zone_map_section.len()
-                * core::mem::size_of::<(BlockOffset, Vec<crate::table::zone_map::ColumnStats>)>()
-            // Rows are `u32`, so the count fits `usize` on every target.
-            + self.delete_bitmap.len() as usize * core::mem::size_of::<u32>();
-        held += sections as u64;
-        metadata += sections as u64;
+                * core::mem::size_of::<(BlockOffset, Vec<crate::table::zone_map::ColumnStats>)>())
+            as u64
+            + self.delete_bitmap.len() * core::mem::size_of::<u32>() as u64;
+        held += sections;
+        metadata += sections;
 
         self.held_state_bytes = held;
         self.finish_metadata_bytes = metadata;

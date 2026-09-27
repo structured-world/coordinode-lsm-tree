@@ -475,3 +475,119 @@ fn writer_keeps_the_two_pass_seed_on_by_default_across_subwriter_swaps() -> crat
 
     Ok(())
 }
+
+/// The layouts whose finish-time sections are estimated differently.
+#[derive(Clone, Copy, Debug)]
+enum StateLayout {
+    Full,
+    Partitioned,
+    Locator,
+}
+
+fn state_writer(path: crate::path::PathBuf, layout: StateLayout) -> crate::Result<Writer> {
+    let writer = Writer::new(path, 1, 0, Arc::new(StdFs))?;
+    Ok(match layout {
+        StateLayout::Full => writer,
+        StateLayout::Partitioned => writer.use_partitioned_index().use_partitioned_filter(),
+        StateLayout::Locator => writer.use_locator(crate::config::LocatorPolicyEntry::Enabled {
+            precision: crate::config::LocatorPrecision::Restart,
+            block_id_bits: None,
+            slot_bits: None,
+        }),
+    })
+}
+
+/// Writes `n` keys with `value_len`-byte values and spills the last block.
+fn write_keys(writer: &mut Writer, n: u32, value_len: usize) -> crate::Result<()> {
+    let value = alloc::vec![0x5a; value_len];
+    for i in 0..n {
+        writer.write(InternalValue::from_components(
+            format!("key{i:010}").into_bytes(),
+            value.clone(),
+            0,
+            ValueType::Value,
+        ))?;
+    }
+    writer.spill_block()
+}
+
+/// A writer that has seen no key holds no state for `finish` and expects it to
+/// append nothing past what is on disk.
+#[test]
+fn a_fresh_writer_holds_no_state_for_finish() -> crate::Result<()> {
+    for layout in [
+        StateLayout::Full,
+        StateLayout::Partitioned,
+        StateLayout::Locator,
+    ] {
+        let dir = tempfile::tempdir()?;
+        let writer = state_writer(dir.path().join("1"), layout)?;
+        assert_eq!(writer.held_state_bytes(), 0, "{layout:?}");
+        assert_eq!(writer.finish_metadata_bytes, 0, "{layout:?}");
+    }
+    Ok(())
+}
+
+/// A table rotates on the size hint before `finish` has written its filter,
+/// index and locator, so the hint must already count them: it lands close to
+/// the finished file, which only adds the meta block and the table of contents.
+#[test]
+fn the_size_hint_before_finish_is_close_to_the_finished_table() -> crate::Result<()> {
+    for layout in [
+        StateLayout::Full,
+        StateLayout::Partitioned,
+        StateLayout::Locator,
+    ] {
+        let dir = tempfile::tempdir()?;
+        let path = dir.path().join("1");
+        let mut writer = state_writer(path.clone(), layout)?;
+        write_keys(&mut writer, 50_000, 8)?;
+        let hint = writer.output_size_hint();
+        let data = *writer.meta.file_pos;
+        assert!(
+            hint > data,
+            "{layout:?}: the hint counts the sections to come"
+        );
+        writer.finish()?;
+        let size = std::fs::metadata(&path)?.len();
+        assert!(
+            hint * 10 >= size * 9 && hint * 10 <= size * 11,
+            "{layout:?}: hint {hint} for a {size}-byte table",
+        );
+    }
+    Ok(())
+}
+
+/// The state a table holds for `finish` grows with its keys, not with its
+/// bytes: the same keys with values a hundred times larger hold about the same
+/// state, while their rows are twenty times larger. Only the index grows with the data,
+/// by one entry per block.
+#[test]
+fn held_state_follows_the_keys_not_the_value_bytes() -> crate::Result<()> {
+    for layout in [
+        StateLayout::Full,
+        StateLayout::Partitioned,
+        StateLayout::Locator,
+    ] {
+        let dir = tempfile::tempdir()?;
+        let mut small = state_writer(dir.path().join("1"), layout)?;
+        let mut large = state_writer(dir.path().join("2"), layout)?;
+        write_keys(&mut small, 20_000, 4)?;
+        write_keys(&mut large, 20_000, 400)?;
+        let (small_state, large_state) = (small.held_state_bytes(), large.held_state_bytes());
+        assert!(
+            small_state > 20_000 * 8,
+            "{layout:?}: {small_state} bytes for 20 000 keys"
+        );
+        assert!(
+            large_state < 2 * small_state,
+            "{layout:?}: {large_state} bytes held for 400-byte values, {small_state} for 4-byte",
+        );
+        // 13-byte keys: rows of 17 and 413 bytes.
+        assert!(
+            large.output_size_hint() > 10 * small.output_size_hint(),
+            "{layout:?}: the data grew with the values",
+        );
+    }
+    Ok(())
+}

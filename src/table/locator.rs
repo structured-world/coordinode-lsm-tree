@@ -91,12 +91,7 @@ fn precision_byte(p: LocatorPrecision) -> u8 {
 /// the largest block id and slot recorded so far. A width past 64 bits skips
 /// the section at build; it is counted at 64 here, an estimate from above.
 #[must_use]
-pub(crate) fn section_size_estimate(
-    n: usize,
-    spec: LocatorSpec,
-    max_block: u64,
-    max_slot: u64,
-) -> usize {
+pub fn section_size_estimate(n: usize, spec: LocatorSpec, max_block: u64, max_slot: u64) -> usize {
     let block_id_bits = spec.block_id_bits.unwrap_or_else(|| bits_for(max_block));
     let slot_bits = if spec.precision == LocatorPrecision::Block {
         0
