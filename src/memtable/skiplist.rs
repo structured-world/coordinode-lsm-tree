@@ -149,7 +149,15 @@ pub struct SkipMap {
     /// splice search. Nodes are never freed while the map lives, so the
     /// offset stays dereferenceable.
     tail_hint: AtomicU32,
+    /// Test-only: runs once inside a seek, between its level-0 comparison and
+    /// its return, so a test can link a node into that window deterministically.
+    #[cfg(test)]
+    seek_hook: std::sync::Mutex<Option<SeekHook>>,
 }
+
+/// What [`SkipMap::seek_hook`] runs.
+#[cfg(test)]
+pub type SeekHook = alloc::boxed::Box<dyn FnOnce(&SkipMap) + Send>;
 
 impl SkipMap {
     /// Creates a new empty skiplist with the given user key comparator.
@@ -210,6 +218,31 @@ impl SkipMap {
             len: AtomicUsize::new(0),
             rng_state: AtomicU64::new(seed),
             tail_hint: AtomicU32::new(UNSET),
+            #[cfg(test)]
+            seek_hook: std::sync::Mutex::new(None),
+        }
+    }
+
+    /// Test-only: arms `hook` to run once inside the next seek, between its
+    /// level-0 comparison and its return.
+    #[cfg(test)]
+    pub(crate) fn set_seek_hook(&self, hook: SeekHook) {
+        *self
+            .seek_hook
+            .lock()
+            .unwrap_or_else(std::sync::PoisonError::into_inner) = Some(hook);
+    }
+
+    /// Test-only: runs the armed seek hook, if any, once.
+    #[cfg(test)]
+    fn run_seek_hook(&self) {
+        let hook = self
+            .seek_hook
+            .lock()
+            .unwrap_or_else(std::sync::PoisonError::into_inner)
+            .take();
+        if let Some(hook) = hook {
+            hook(self);
         }
     }
 
@@ -981,11 +1014,12 @@ impl SkipMap {
     /// [`Self::seek_ge`] against a borrowed `(user_key, seqno)` pair.
     fn seek_ge_parts(&self, target_uk: &[u8], target_seqno: SeqNo) -> u32 {
         let mut node = self.head;
+        let mut next = UNSET;
         let list_h = self.height.load(Ordering::Acquire);
 
         for level in (0..list_h).rev() {
             loop {
-                let next = self.next_at(node, level);
+                next = self.next_at(node, level);
                 if next == UNSET {
                     break;
                 }
@@ -997,7 +1031,14 @@ impl SkipMap {
             }
         }
 
-        self.next_at(node, 0)
+        #[cfg(test)]
+        self.run_seek_hook();
+        // The level-0 successor this search compared (UNSET at the end of the
+        // list), as `find_splice` keeps it. Re-reading `node`'s successor could
+        // return a node a concurrent insert linked after the comparison: one
+        // below the target, or a newer version of it. That insert is concurrent
+        // with the seek and not part of what it observed.
+        next
     }
 
     /// Point lookup: the entry for `key` with the highest seqno `<= max_seqno`,
@@ -1026,11 +1067,12 @@ impl SkipMap {
     /// Finds the first node whose key > `target`, or UNSET.
     fn seek_gt(&self, target: &InternalKey) -> u32 {
         let mut node = self.head;
+        let mut next = UNSET;
         let list_h = self.height.load(Ordering::Acquire);
 
         for level in (0..list_h).rev() {
             loop {
-                let next = self.next_at(node, level);
+                next = self.next_at(node, level);
                 if next == UNSET {
                     break;
                 }
@@ -1041,7 +1083,11 @@ impl SkipMap {
             }
         }
 
-        self.next_at(node, 0)
+        #[cfg(test)]
+        self.run_seek_hook();
+        // The compared level-0 successor, for the reason `seek_ge_parts` gives:
+        // a reload could return a node equal to the exclusive bound.
+        next
     }
 
     /// Finds the last node whose key <= `target`, or UNSET if all nodes > target.
