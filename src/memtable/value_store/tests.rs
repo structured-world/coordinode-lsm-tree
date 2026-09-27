@@ -56,6 +56,29 @@ fn append_at_the_end_of_the_index_space_panics_instead_of_wrapping_to_slot_zero(
     let _ = store.append(val(b"wraps-onto-slot-zero"));
 }
 
+/// `new` writes every segment pointer, so the table is sized to the values a
+/// memtable can hold: each belongs to a node of at least `MIN_NODE_SIZE` bytes
+/// in an arena of 2^32 bytes. A table for the whole `u32` index space was
+/// 512 KiB written per memtable.
+#[test]
+fn the_segment_table_covers_what_the_arena_can_hold_and_no_more() {
+    let store = ValueStore::new();
+    let max_values = u32::MAX as usize / super::super::skiplist::MIN_NODE_SIZE as usize + 1;
+    assert!(store.segments.len() * SEGMENT_SIZE >= max_values);
+    assert!((store.segments.len() - 1) * SEGMENT_SIZE < max_values);
+}
+
+/// Past the last segment the store refuses the value instead of writing out
+/// of bounds, and the store still drops cleanly afterwards.
+#[test]
+#[should_panic(expected = "index space exhausted")]
+fn append_past_the_last_segment_panics() {
+    let store = ValueStore::new();
+    let end = u32::try_from(store.segments.len() * SEGMENT_SIZE).unwrap();
+    store.set_next_idx_for_test(end);
+    let _ = store.append(val(b"past-the-end"));
+}
+
 #[test]
 fn concurrent_append_and_read() {
     use std::sync::Arc;
