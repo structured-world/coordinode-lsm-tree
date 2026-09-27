@@ -564,7 +564,9 @@ impl DataBlock {
     /// rows whose key equals `needle` (skipping `deletes`-masked rows) into a
     /// tiny row block, or `Ok(None)` when the key is absent / wholly deleted.
     /// The caller runs the normal seqno-aware [`Self::point_read`] on the
-    /// result. Avoids untransposing and re-encoding the whole group per lookup.
+    /// result. Reads the rows the key search visits and the ones it matches,
+    /// through the pages as stored: no page is decoded whole, and no row is
+    /// re-encoded but the key's.
     ///
     /// `pages` are consecutive row pages of the group, and `deletes` carries
     /// the position of the first one's first row: a key's versions can run
@@ -574,7 +576,7 @@ impl DataBlock {
     /// copied out of the columns before the encode copies them again.
     #[cfg(feature = "columnar")]
     pub(crate) fn columnar_point_block(
-        pages: &[crate::table::columnar::ColumnBatch],
+        pages: Vec<crate::table::columnar::RowPageColumns<'_>>,
         needle: &[u8],
         comparator: &crate::comparator::SharedComparator,
         restart_interval: u8,
@@ -584,7 +586,8 @@ impl DataBlock {
         let overflow = || crate::Error::InvalidHeader("columnar: row position exceeds u32::MAX");
         let mut entries = Vec::new();
         let mut offset = 0u32;
-        for batch in pages {
+        for page in pages {
+            let rows = page.rows;
             let page_deletes = match deletes {
                 Some((bitmap, start)) => {
                     Some((bitmap, start.checked_add(offset).ok_or_else(overflow)?))
@@ -593,14 +596,14 @@ impl DataBlock {
             };
             // The matcher adds each row's copies as it makes them, so rows
             // copied before a later row fails are still counted.
-            entries.extend(crate::table::columnar::column_batch_match_entries(
-                batch,
+            entries.extend(crate::table::columnar::page_match_entries(
+                page,
                 needle,
                 comparator,
                 page_deletes,
                 gathered,
             )?);
-            offset = offset.checked_add(batch.row_count).ok_or_else(overflow)?;
+            offset = offset.checked_add(rows).ok_or_else(overflow)?;
         }
         if entries.is_empty() {
             return Ok(None);

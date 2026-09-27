@@ -1,7 +1,7 @@
 use super::{
-    COL_SEQNO, COL_USER_KEY, COL_VALUE, COL_VALUE_TYPE, Column, ColumnBatch, TypeTag,
-    column_batch_into_entries, column_batch_match_entries, column_batch_to_entries,
-    entries_to_column_batch, frame_value_cells, frame_value_cells_nullable, unframe_value_cells,
+    COL_SEQNO, COL_USER_KEY, COL_VALUE, COL_VALUE_TYPE, Column, ColumnBatch, RowPageColumns,
+    TypeTag, column_batch_into_entries, column_batch_to_entries, entries_to_column_batch,
+    frame_value_cells, frame_value_cells_nullable, page_match_entries, unframe_value_cells,
     unframe_value_cells_nullable, unframe_value_cells_with_defaults,
     validate_columnar_ingest_batch,
 };
@@ -988,10 +988,11 @@ fn columnar_decode_rejects_trailing_bytes() {
     assert!(ColumnBatch::decode(&encoded.clone().into()).is_err());
 }
 
-/// A page decode that copied a validity bitmap and only then met a malformed
-/// tail did that copy: it is counted like the read a checksum later refuses.
+/// A page with bytes after its column is refused while it is parsed, before
+/// its validity bitmap or values are copied out: the refusal costs no copy,
+/// and none is counted.
 #[test]
-fn column_page_decode_refused_after_copying_still_counts_the_copy() {
+fn column_page_decode_refused_for_a_tail_copies_nothing() {
     use crate::table::column_page::{PageId, PageStamp};
 
     let batch = sample_batch();
@@ -1010,11 +1011,11 @@ fn column_page_decode_refused_after_copying_still_counts_the_copy() {
     page.push(0); // one byte past the page's column
     let mut copied = 0usize;
     let decoded = Column::decode_page(&page.into(), batch.row_count, stamp, &mut copied);
-    assert!(decoded.is_err(), "trailing bytes must be refused");
-    assert_eq!(
-        copied, 1,
-        "the first column's one-byte validity bitmap was copied before the refusal",
+    assert!(
+        matches!(decoded, Err(crate::Error::InvalidHeader(m)) if m.contains("trailing bytes")),
+        "trailing bytes must be refused, got {decoded:?}",
     );
+    assert_eq!(copied, 0, "the refusal came before any copy");
 }
 
 /// A block whose second row carries a bad value-type tag is refused only after
@@ -1161,17 +1162,87 @@ fn column_batch_into_entries_rejects_an_empty_key_row() {
     );
 }
 
+/// Runs the point-read matcher over `batch` as one row page, its columns
+/// written as the pages a writer writes and read back as a lookup reads them.
+fn match_as_pages(
+    batch: &ColumnBatch,
+    needle: &[u8],
+    deletes: Option<(&crate::table::delete_bitmap::DeleteBitmap, u32)>,
+    copied: &mut usize,
+) -> crate::Result<Vec<InternalValue>> {
+    use crate::table::column_page::{PageId, PageStamp};
+
+    let stamp = |column_id| PageStamp {
+        group_tag: 1,
+        id: PageId { column_id, part: 0 },
+        row_page: 0,
+    };
+    let pages = batch
+        .columns
+        .iter()
+        .map(|c| {
+            c.encode_page(batch.row_count, stamp(c.column_id))
+                .map(Slice::from)
+        })
+        .collect::<crate::Result<Vec<_>>>()?;
+    let columns = pages
+        .iter()
+        .zip(&batch.columns)
+        .map(|(page, c)| Column::parse_page(page, batch.row_count, stamp(c.column_id)))
+        .collect::<crate::Result<Vec<_>>>()?;
+    page_match_entries(
+        RowPageColumns {
+            ordinal: 0,
+            start: 0,
+            rows: batch.row_count,
+            columns,
+        },
+        needle,
+        &crate::comparator::default_comparator(),
+        deletes,
+        copied,
+    )
+}
+
 #[test]
-fn column_batch_match_entries_rejects_an_empty_key_row() {
+fn page_match_entries_finds_every_version_of_a_key_and_nothing_else() {
+    // Three keys, the middle one in two versions: a lookup returns exactly its
+    // versions, newest first, and a key between or past them returns none.
+    let batch = entries_to_column_batch(&[
+        entry(b"a", 9, ValueType::Value, b"va"),
+        entry(b"m", 7, ValueType::Value, b"new"),
+        entry(b"m", 4, ValueType::Tombstone, b""),
+        entry(b"z", 2, ValueType::Value, b"vz"),
+    ])
+    .expect("batch");
+    let found = match_as_pages(&batch, b"m", None, &mut 0).expect("lookup");
+    assert_entries_eq(
+        &found,
+        &[
+            entry(b"m", 7, ValueType::Value, b"new"),
+            entry(b"m", 4, ValueType::Tombstone, b""),
+        ],
+    );
+    for absent in [&b"b"[..], b"zz", b"0"] {
+        assert!(
+            match_as_pages(&batch, absent, None, &mut 0)
+                .expect("lookup")
+                .is_empty(),
+            "no row holds {absent:?}",
+        );
+    }
+}
+
+#[test]
+fn page_match_entries_rejects_an_empty_key_row() {
     // The point-read matcher applies the same non-empty-key invariant as the
     // scan path: a matched empty key in a corrupt block is an error, not a hit.
     let mut batch =
         entries_to_column_batch(&[entry(b"k", 5, ValueType::Value, b"v")]).expect("valid batch");
     let key_col = batch.columns.get_mut(0).expect("key column");
     key_col.data = alloc::vec![0u8; 8].into();
-    let cmp = crate::comparator::default_comparator();
-    let err = column_batch_match_entries(&batch, b"", &cmp, None, &mut 0)
-        .expect_err("matched empty key must be rejected");
+    let err =
+        match_as_pages(&batch, b"", None, &mut 0).expect_err("matched empty key must be rejected");
     assert!(
         matches!(err, crate::Error::InvalidHeader(m) if m.contains("user key is empty")),
         "expected an empty-key InvalidHeader, got {err:?}",
@@ -1179,7 +1250,7 @@ fn column_batch_match_entries_rejects_an_empty_key_row() {
 }
 
 #[test]
-fn column_batch_match_entries_fails_closed_when_a_delete_mask_position_overflows() {
+fn page_match_entries_fails_closed_when_a_delete_mask_position_overflows() {
     // Two rows share a key, so both match the needle. With `block_start_row` at
     // u32::MAX, the second matched row's position (start + 1) overflows u32. A
     // masked point-read lookup must fail closed (error) like the scan path, never
@@ -1190,8 +1261,7 @@ fn column_batch_match_entries_fails_closed_when_a_delete_mask_position_overflows
     ])
     .expect("two-row same-key batch");
     let bitmap = crate::table::delete_bitmap::DeleteBitmap::new();
-    let cmp = crate::comparator::default_comparator();
-    let err = column_batch_match_entries(&batch, b"dup", &cmp, Some((&bitmap, u32::MAX)), &mut 0)
+    let err = match_as_pages(&batch, b"dup", Some((&bitmap, u32::MAX)), &mut 0)
         .expect_err("an overflowing delete-mask position must fail closed");
     assert!(
         matches!(err, crate::Error::InvalidHeader(m) if m.contains("position exceeds u32::MAX")),
@@ -1200,7 +1270,7 @@ fn column_batch_match_entries_fails_closed_when_a_delete_mask_position_overflows
 }
 
 #[test]
-fn column_batch_match_entries_counts_the_rows_it_copied_before_a_later_row_fails() {
+fn page_match_entries_counts_the_rows_it_copied_before_a_later_row_fails() {
     // Two versions of one key; the second carries an invalid value-type byte.
     // The first version's key and value were already copied out of the columns
     // when the second is refused, and those copies must still be reported.
@@ -1213,9 +1283,8 @@ fn column_batch_match_entries_counts_the_rows_it_copied_before_a_later_row_fails
     let mut vt = vt_col.data.to_vec();
     vt[1] = 0xFF;
     vt_col.data = vt.into();
-    let cmp = crate::comparator::default_comparator();
     let mut copied = 0;
-    let err = column_batch_match_entries(&batch, b"dup", &cmp, None, &mut copied)
+    let err = match_as_pages(&batch, b"dup", None, &mut copied)
         .expect_err("the invalid value type must be refused");
     assert!(
         matches!(err, crate::Error::InvalidTag(("ValueType", 0xFF))),
@@ -1229,15 +1298,14 @@ fn column_batch_match_entries_counts_the_rows_it_copied_before_a_later_row_fails
 }
 
 #[test]
-fn column_batch_match_entries_rejects_a_zero_row_block() {
+fn page_match_entries_rejects_a_zero_row_block() {
     // A zero-row columnar block is malformed (the writer never emits one). The
     // point-read matcher must fail closed on it, not return an empty match that
     // load_columnar_point_block would turn into an absent-key miss, hiding the
     // on-disk corruption.
     let batch = entries_to_column_batch(&[]).expect("zero-row batch");
-    let cmp = crate::comparator::default_comparator();
-    let err = column_batch_match_entries(&batch, b"x", &cmp, None, &mut 0)
-        .expect_err("a zero-row block must fail closed");
+    let err =
+        match_as_pages(&batch, b"x", None, &mut 0).expect_err("a zero-row block must fail closed");
     assert!(
         matches!(err, crate::Error::InvalidHeader(m) if m.contains("empty reconstructed data block")),
         "expected an empty-block InvalidHeader, got {err:?}",

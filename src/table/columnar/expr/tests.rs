@@ -56,6 +56,21 @@ fn assert_every_candidate_round_trips(type_tag: TypeTag, rows: u32, data: &[u8])
             parsed.describe().to_string(),
             describe_stored(&trial.expression)
         );
+        // A point read takes single rows from the encoding; each must be the
+        // row the layout holds, and a row past the column must be refused.
+        let access = parsed.rows(type_tag, rows).expect("rows");
+        for row in 0..rows {
+            let got = access
+                .get(type_tag, rows, row)
+                .unwrap_or_else(|e| panic!("{} row {row}: {e:?}", trial.expression));
+            let want = super::cell(type_tag, data, rows, row).expect("layout row");
+            assert_eq!(&*got, want, "{} row {row} differs", trial.expression);
+        }
+        assert!(
+            access.get(type_tag, rows, rows).is_err(),
+            "{} serves a row past the column",
+            trial.expression
+        );
     }
     let Choice { bytes, .. } = choose(type_tag, rows, data).expect("choose");
     let candidates = candidates(type_tag, rows, data).expect("candidates");
@@ -393,11 +408,21 @@ fn ffor_bytes(base: u64, bit_width: u8, packed: &[u8], exceptions: &[(u64, u64)]
     out
 }
 
+/// `bytes` is refused by a decode and by a point read: the one-row access
+/// either fails to prepare or fails on some row, never serving one silently.
 fn assert_refused(type_tag: TypeTag, rows: u32, bytes: &[u8], what: &str) {
     let result = decode(type_tag, rows, bytes);
     assert!(
         matches!(result, Err(crate::Error::InvalidHeader(_))),
         "{what} must be refused, got {result:?}",
+    );
+    let read = Values::parse(type_tag, rows, bytes).and_then(|values| {
+        let access = values.rows(type_tag, rows)?;
+        (0..rows).try_for_each(|row| access.get(type_tag, rows, row).map(drop))
+    });
+    assert!(
+        matches!(read, Err(crate::Error::InvalidHeader(_))),
+        "{what} must be refused by a point read, got {read:?}",
     );
 }
 

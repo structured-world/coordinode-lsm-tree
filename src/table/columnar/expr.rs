@@ -69,6 +69,7 @@
 
 use super::{Number, TypeTag, bytes_column_row, check_bytes_framing, frame_bytes_column};
 use crate::table::column_page::{VAR_U64_MAX_LEN, put_varint, take, take_slice, take_varint};
+use crate::table::columnar_predicate::Selection;
 use crate::{Error, Result, Slice};
 use alloc::{boxed::Box, vec::Vec};
 use core::fmt;
@@ -631,6 +632,591 @@ impl<'a> Values<'a> {
     }
 }
 
+// --- Filtering -----------------------------------------------------------------
+
+/// What a filter asks of a column's values, in the form its encoding compares.
+#[derive(Clone, Copy, Debug)]
+pub enum Bounds<'b> {
+    /// An inclusive byte-wise range over a bytes column's values, either side
+    /// unbounded when `None`.
+    Bytes {
+        /// The lowest value kept.
+        lower: Option<&'b [u8]>,
+        /// The highest value kept.
+        upper: Option<&'b [u8]>,
+    },
+    /// An inclusive range of a number column's ordinals.
+    Ordinals {
+        /// The column's number type.
+        number: Number,
+        /// The lowest ordinal kept.
+        lo: u128,
+        /// The highest ordinal kept.
+        hi: u128,
+    },
+    /// No value is kept.
+    Nothing,
+}
+
+impl Bounds<'_> {
+    /// Whether one value, in its column's layout, is kept.
+    fn keeps(&self, cell: &[u8]) -> bool {
+        match *self {
+            Self::Bytes { lower, upper } => {
+                lower.is_none_or(|lo| cell >= lo) && upper.is_none_or(|hi| cell <= hi)
+            }
+            Self::Ordinals { number, lo, hi } => {
+                let ordinal = number.ordinal(cell);
+                lo <= ordinal && ordinal <= hi
+            }
+            Self::Nothing => false,
+        }
+    }
+
+    /// Whether one ordinal is kept.
+    fn keeps_ordinal(&self, ordinal: u64) -> bool {
+        match *self {
+            Self::Ordinals { lo, hi, .. } => {
+                let ordinal = u128::from(ordinal);
+                lo <= ordinal && ordinal <= hi
+            }
+            Self::Bytes { .. } | Self::Nothing => false,
+        }
+    }
+}
+
+impl Ints<'_> {
+    /// The rows of this vector of `n` values that `bounds` keeps, comparing
+    /// the integers as they decode: a constant is compared once and a run
+    /// once per run, never per row.
+    fn select(&self, n: u32, bounds: &Bounds<'_>) -> Result<Selection> {
+        match self {
+            Self::Constant(value) => Ok(if bounds.keeps_ordinal(*value) {
+                Selection::all(n)
+            } else {
+                Selection::none(n)
+            }),
+            Self::Rle { values, ends } => {
+                let runs = u32::try_from(ends.len()).map_err(|_| MALFORMED)?;
+                let kept = values.select(runs, bounds)?;
+                let mut out = Selection::none(n);
+                let mut start = 0u32;
+                for (run, &end) in (0u32..).zip(ends) {
+                    if kept.contains(run) {
+                        out.insert_range(start..end);
+                    }
+                    start = end;
+                }
+                Ok(out)
+            }
+            Self::Ffor(_) | Self::Delta(_) => {
+                let mut values = Vec::with_capacity(n as usize);
+                self.decode_into(n, &mut values)?;
+                let mut out = Selection::none(n);
+                for (row, value) in (0u32..).zip(values) {
+                    if bounds.keeps_ordinal(value) {
+                        out.insert(row);
+                    }
+                }
+                Ok(out)
+            }
+        }
+    }
+}
+
+impl Values<'_> {
+    /// The rows of these `n` values of a column of `type_tag` that `bounds`
+    /// keeps, answered from the encoding: a constant with one comparison, runs
+    /// with one per run, a dictionary with one per distinct value and a code
+    /// lookup per row, integers as they decode. No value is materialized, and
+    /// a null row is the caller's to drop, from the validity it holds.
+    ///
+    /// # Errors
+    ///
+    /// [`Error::InvalidHeader`] when the encoding does not describe `n` rows.
+    pub(crate) fn select(
+        &self,
+        type_tag: TypeTag,
+        n: u32,
+        bounds: &Bounds<'_>,
+    ) -> Result<Selection> {
+        if matches!(bounds, Bounds::Nothing) {
+            return Ok(Selection::none(n));
+        }
+        match self {
+            Self::Plain(data) => {
+                let mut out = Selection::none(n);
+                for row in 0..n {
+                    if bounds.keeps(cell(type_tag, data, n, row)?) {
+                        out.insert(row);
+                    }
+                }
+                Ok(out)
+            }
+            Self::Constant(value) => Ok(if bounds.keeps(value) {
+                Selection::all(n)
+            } else {
+                Selection::none(n)
+            }),
+            Self::Rle { values, ends } => {
+                let runs = u32::try_from(ends.len()).map_err(|_| MALFORMED)?;
+                let kept = values.select(type_tag, runs, bounds)?;
+                let mut out = Selection::none(n);
+                let mut start = 0u32;
+                for (run, &end) in (0u32..).zip(ends) {
+                    if kept.contains(run) {
+                        out.insert_range(start..end);
+                    }
+                    start = end;
+                }
+                Ok(out)
+            }
+            Self::Dict {
+                values,
+                size,
+                codes,
+            } => {
+                // A dictionary is sorted, but the kept codes are found by
+                // testing each entry: a range over a sorted dictionary is a
+                // run of codes either way, and testing does not trust the sort.
+                let kept = values.select(type_tag, *size, bounds)?;
+                if kept.count() == 0 {
+                    return Ok(Selection::none(n));
+                }
+                let mut decoded = Vec::with_capacity(n as usize);
+                codes.decode_into(n, &mut decoded)?;
+                let mut out = Selection::none(n);
+                for (row, code) in (0u32..).zip(decoded) {
+                    let Some(code) = u32::try_from(code).ok().filter(|c| c < size) else {
+                        return Err(MALFORMED);
+                    };
+                    if kept.contains(code) {
+                        out.insert(row);
+                    }
+                }
+                Ok(out)
+            }
+            Self::Ordinals(ints) => ints.select(n, bounds),
+            Self::Lengths { lengths, payload } => {
+                let mut decoded = Vec::with_capacity(n as usize);
+                lengths.decode_into(n, &mut decoded)?;
+                let mut out = Selection::none(n);
+                let mut at = 0usize;
+                for (row, len) in (0u32..).zip(decoded) {
+                    let end = usize::try_from(len)
+                        .ok()
+                        .and_then(|len| at.checked_add(len))
+                        .ok_or(MALFORMED)?;
+                    if bounds.keeps(payload.get(at..end).ok_or(MALFORMED)?) {
+                        out.insert(row);
+                    }
+                    at = end;
+                }
+                if at != payload.len() {
+                    return Err(MALFORMED);
+                }
+                Ok(out)
+            }
+        }
+    }
+}
+
+// --- Row access ----------------------------------------------------------------
+
+/// One row's value: a view of the page, or a number rebuilt from its ordinal,
+/// which has no bytes in the page to view.
+#[derive(Clone, Copy, Debug)]
+pub enum Cell<'a> {
+    /// The value's bytes, in the page.
+    Borrowed(&'a [u8]),
+    /// A value rebuilt in place, its first `len` bytes.
+    Inline {
+        /// The bytes, the value's first.
+        bytes: [u8; 16],
+        /// How many of them are the value.
+        len: u8,
+    },
+}
+
+impl core::ops::Deref for Cell<'_> {
+    type Target = [u8];
+
+    fn deref(&self) -> &[u8] {
+        match self {
+            Self::Borrowed(bytes) => bytes,
+            Self::Inline { bytes, len } => bytes.get(..usize::from(*len)).unwrap_or_default(),
+        }
+    }
+}
+
+/// An integer vector read one value at a time: what a lookup of a few rows
+/// needs, without decoding the rest.
+#[derive(Clone, Debug)]
+pub enum IntRows<'a> {
+    /// One value for every row.
+    Constant(u64),
+    /// Offsets from a base in `bit_width` bits, the exceptions sorted by row.
+    Ffor {
+        /// Added to every offset.
+        base: u64,
+        /// The bits each offset takes.
+        bit_width: u8,
+        /// The packed offsets.
+        packed: &'a [u8],
+        /// The rows stored whole, by row.
+        exceptions: Vec<(u32, u64)>,
+    },
+    /// Values a single row cannot be read from, decoded once.
+    Decoded(Vec<u64>),
+    /// Runs of equal integers and the row after each.
+    Runs {
+        /// The row after each run.
+        ends: Vec<u32>,
+        /// The runs' values.
+        values: Box<Self>,
+    },
+}
+
+impl<'a> IntRows<'a> {
+    /// The vector `ints` of `n` values, prepared for one-at-a-time reads.
+    fn new(ints: Ints<'a>, n: u32) -> Result<Self> {
+        Ok(match ints {
+            Ints::Constant(value) => Self::Constant(value),
+            Ints::Ffor(ffor) => {
+                let mut exceptions = Vec::with_capacity(ffor.exception_count as usize);
+                let mut rest = ffor.exceptions;
+                let mut next = 0u32;
+                for _ in 0..ffor.exception_count {
+                    // The parse proved every position below `n`, a u32.
+                    let position = next + var_u32(&mut rest)?;
+                    exceptions.push((position, var_u64(&mut rest)?));
+                    next = position + 1;
+                }
+                Self::Ffor {
+                    base: ffor.base,
+                    bit_width: ffor.bit_width,
+                    packed: ffor.packed,
+                    exceptions,
+                }
+            }
+            // A delta's value is the sum of every difference before it, so no
+            // row reads alone: decode the vector once.
+            delta @ Ints::Delta(_) => {
+                let mut values = Vec::with_capacity(n as usize);
+                delta.decode_into(n, &mut values)?;
+                Self::Decoded(values)
+            }
+            Ints::Rle { values, ends } => {
+                let runs = u32::try_from(ends.len()).map_err(|_| MALFORMED)?;
+                Self::Runs {
+                    values: Box::new(Self::new(*values, runs)?),
+                    ends,
+                }
+            }
+        })
+    }
+
+    /// The value of row `row`.
+    ///
+    /// # Errors
+    ///
+    /// [`Error::InvalidHeader`] for a row past the vector or an offset past
+    /// the base's range.
+    pub fn get(&self, row: u32) -> Result<u64> {
+        match self {
+            Self::Constant(value) => Ok(*value),
+            Self::Ffor {
+                base,
+                bit_width,
+                packed,
+                exceptions,
+            } => {
+                if !exceptions.is_empty()
+                    && let Ok(at) = exceptions.binary_search_by_key(&row, |&(position, _)| position)
+                    && let Some(&(_, value)) = exceptions.get(at)
+                {
+                    return Ok(value);
+                }
+                let offset = unpack_one(packed, *bit_width, row)?;
+                let Some(value) = base.checked_add(offset) else {
+                    return Err(MALFORMED);
+                };
+                Ok(value)
+            }
+            Self::Decoded(values) => {
+                let Some(&value) = values.get(row as usize) else {
+                    return Err(MALFORMED);
+                };
+                Ok(value)
+            }
+            Self::Runs { ends, values } => {
+                // At most `ends.len()` runs, which the parse bounded by a u32.
+                #[expect(clippy::cast_possible_truncation, reason = "a u32 run count")]
+                let run = ends.partition_point(|&end| end <= row) as u32;
+                values.get(run)
+            }
+        }
+    }
+}
+
+/// The `bit_width`-bit offset of row `row` in `packed`, least significant bit
+/// first.
+fn unpack_one(packed: &[u8], bit_width: u8, row: u32) -> Result<u64> {
+    if bit_width == 0 {
+        return Ok(0);
+    }
+    let width = u64::from(bit_width);
+    let bit = u64::from(row) * width;
+    let (Ok(first), Ok(last)) = (
+        usize::try_from(bit / 8),
+        usize::try_from((bit + width).div_ceil(8)),
+    ) else {
+        return Err(MALFORMED);
+    };
+    let Some(bytes) = packed.get(first..last) else {
+        return Err(MALFORMED);
+    };
+    // At most nine bytes, which a u128 holds whole.
+    let mut window = 0u128;
+    for (i, &b) in bytes.iter().enumerate() {
+        window |= u128::from(b) << (8 * i);
+    }
+    let mask = if width == 64 {
+        u128::from(u64::MAX)
+    } else {
+        (1u128 << width) - 1
+    };
+    // Masked to `width` bits, at most 64.
+    #[expect(clippy::cast_possible_truncation, reason = "masked to 64 bits")]
+    Ok(((window >> (bit % 8)) & mask) as u64)
+}
+
+/// A column page's values read one row at a time: what a lookup of a few rows
+/// needs, without decoding the page. Built from the page's parsed
+/// [`Values`], borrowing it.
+#[derive(Clone, Debug)]
+pub enum Rows<'a> {
+    /// The column's own layout.
+    Plain(&'a [u8]),
+    /// The one value of every row.
+    Constant(&'a [u8]),
+    /// Runs of equal values and the row after each.
+    Runs {
+        /// The row after each run.
+        ends: Vec<u32>,
+        /// The runs' values.
+        values: Box<Self>,
+    },
+    /// Distinct values and a code per row.
+    Dict {
+        /// The dictionary's size.
+        size: u32,
+        /// Each row's code.
+        codes: IntRows<'a>,
+        /// The distinct values.
+        values: Box<Self>,
+    },
+    /// A number column's values by their ordinals.
+    Ordinals {
+        /// The column's number type.
+        number: Number,
+        /// Each row's ordinal.
+        ordinals: IntRows<'a>,
+    },
+    /// A bytes column whose values all have one length: row `i` is
+    /// `payload[i * len..]`, found without reading any other row.
+    Stride {
+        /// Every value's length.
+        len: usize,
+        /// The values' bytes.
+        payload: &'a [u8],
+    },
+    /// A bytes column's values, each row's start in `payload` found once.
+    Lengths {
+        /// Where each row starts, and where the last ends.
+        offsets: Vec<u32>,
+        /// The values' bytes.
+        payload: &'a [u8],
+    },
+}
+
+impl<'a> Values<'a> {
+    /// These values of `n` rows of a column of `type_tag`, prepared for
+    /// one-row reads.
+    ///
+    /// # Errors
+    ///
+    /// [`Error::InvalidHeader`] when the encoding does not describe `n` rows.
+    pub(crate) fn rows(self, type_tag: TypeTag, n: u32) -> Result<Rows<'a>> {
+        Ok(match self {
+            Self::Plain(data) => Rows::Plain(data),
+            Self::Constant(value) => Rows::Constant(value),
+            Self::Rle { values, ends } => {
+                let runs = u32::try_from(ends.len()).map_err(|_| MALFORMED)?;
+                Rows::Runs {
+                    values: Box::new(values.rows(type_tag, runs)?),
+                    ends,
+                }
+            }
+            Self::Dict {
+                values,
+                size,
+                codes,
+            } => Rows::Dict {
+                size,
+                codes: IntRows::new(codes, n)?,
+                values: Box::new(values.rows(type_tag, size)?),
+            },
+            Self::Ordinals(ints) => {
+                let TypeTag::Number(number) = type_tag else {
+                    return Err(MALFORMED);
+                };
+                Rows::Ordinals {
+                    number,
+                    ordinals: IntRows::new(ints, n)?,
+                }
+            }
+            // One length for every row: a row's bytes are found by their
+            // position, so a lookup reads no other row's length.
+            Self::Lengths {
+                lengths: Ints::Constant(len),
+                payload,
+            } => {
+                let Some(len) = usize::try_from(len)
+                    .ok()
+                    .filter(|&len| len.checked_mul(n as usize) == Some(payload.len()))
+                else {
+                    return Err(MALFORMED);
+                };
+                Rows::Stride { len, payload }
+            }
+            Self::Lengths { lengths, payload } => {
+                let mut decoded = Vec::with_capacity(n as usize);
+                lengths.decode_into(n, &mut decoded)?;
+                let mut offsets = Vec::with_capacity(decoded.len() + 1);
+                let mut at = 0u32;
+                offsets.push(at);
+                for len in decoded {
+                    at = u32::try_from(len)
+                        .ok()
+                        .and_then(|len| at.checked_add(len))
+                        .ok_or(MALFORMED)?;
+                    offsets.push(at);
+                }
+                if at as usize != payload.len() {
+                    return Err(MALFORMED);
+                }
+                Rows::Lengths { offsets, payload }
+            }
+        })
+    }
+}
+
+impl<'a> Rows<'a> {
+    /// Row `row`'s value, of a column of `type_tag` with `n` rows.
+    ///
+    /// # Errors
+    ///
+    /// [`Error::InvalidHeader`] for a row past the column, a code past its
+    /// dictionary or an ordinal no value of the type has.
+    pub fn get(&self, type_tag: TypeTag, n: u32, row: u32) -> Result<Cell<'a>> {
+        // Checked here for every operator: a bit-packed vector's padding or a
+        // constant would otherwise answer for a row the column does not have.
+        if row >= n {
+            return Err(MALFORMED);
+        }
+        match self {
+            Self::Plain(data) => cell(type_tag, data, n, row).map(Cell::Borrowed),
+            Self::Constant(value) => Ok(Cell::Borrowed(value)),
+            Self::Runs { ends, values } => {
+                let run = ends.partition_point(|&end| end <= row);
+                let runs = u32::try_from(ends.len()).map_err(|_| MALFORMED)?;
+                values.get(type_tag, runs, u32::try_from(run).map_err(|_| MALFORMED)?)
+            }
+            Self::Dict {
+                size,
+                codes,
+                values,
+            } => {
+                let code = codes.get(row)?;
+                if code >= u64::from(*size) {
+                    return Err(MALFORMED);
+                }
+                // Below `size`, a u32.
+                #[expect(clippy::cast_possible_truncation, reason = "below a u32 size")]
+                values.get(type_tag, *size, code as u32)
+            }
+            Self::Ordinals { number, ordinals } => {
+                let mut bytes = [0u8; 16];
+                let len = number.width();
+                let ordinal = ordinals.get(row)?;
+                let Some(out) = bytes.get_mut(..usize::from(len)) else {
+                    return Err(MALFORMED);
+                };
+                if !number.write_ordinal(u128::from(ordinal), out) {
+                    return Err(MALFORMED);
+                }
+                Ok(Cell::Inline { bytes, len })
+            }
+            Self::Stride { len, payload } => {
+                // The parse proved `len * n` is the payload's length, so a row
+                // below `n` starts inside it without overflow.
+                let start = row as usize * len;
+                let Some(value) = payload.get(start..start + len) else {
+                    return Err(MALFORMED);
+                };
+                Ok(Cell::Borrowed(value))
+            }
+            Self::Lengths { offsets, payload } => {
+                let (Some(&start), Some(&end)) =
+                    (offsets.get(row as usize), offsets.get(row as usize + 1))
+                else {
+                    return Err(MALFORMED);
+                };
+                let Some(value) = payload.get(start as usize..end as usize) else {
+                    return Err(MALFORMED);
+                };
+                Ok(Cell::Borrowed(value))
+            }
+        }
+    }
+}
+
+impl Values<'_> {
+    /// The column's layout for the rows `keep` selects, `count` of them, read
+    /// straight from the encoding: a filtered read builds its survivors once
+    /// instead of decoding the page and then gathering from it.
+    ///
+    /// # Errors
+    ///
+    /// As [`Self::materialize`], for the rows it reads.
+    pub(crate) fn materialize_rows(
+        self,
+        type_tag: TypeTag,
+        n: u32,
+        keep: &Selection,
+    ) -> Result<Slice> {
+        let count = keep.count() as usize;
+        if let Self::Plain(data) = self {
+            let rows: Vec<u32> = keep.rows().collect();
+            return gather(type_tag, data, n, &rows);
+        }
+        let access = self.rows(type_tag, n)?;
+        let cells = keep
+            .rows()
+            .map(|row| access.get(type_tag, n, row))
+            .collect::<Result<Vec<_>>>()?;
+        match type_tag.fixed_width() {
+            Some(width) => Ok(super::gather_fixed_column(
+                usize::from(width),
+                count,
+                cells.iter().map(|c| Some(&**c)),
+            )),
+            None => frame_bytes_column(count, || cells.iter().map(|c| &**c)),
+        }
+    }
+}
+
 /// A view of `page` over `data`, which the parse took from it; a copy if it
 /// did not, which no parse of `page` produces.
 fn view_of(page: &Slice, data: &[u8]) -> Slice {
@@ -670,8 +1256,13 @@ fn cell(type_tag: TypeTag, data: &[u8], rows: u32, row: u32) -> Result<&[u8]> {
     match type_tag.fixed_width() {
         Some(width) => {
             let width = usize::from(width);
-            let start = (row as usize).checked_mul(width).ok_or(MALFORMED)?;
-            data.get(start..start + width).ok_or(MALFORMED)
+            let Some(value) = (row as usize)
+                .checked_mul(width)
+                .and_then(|start| data.get(start..start + width))
+            else {
+                return Err(MALFORMED);
+            };
+            Ok(value)
         }
         None => bytes_column_row(data, rows, row),
     }
