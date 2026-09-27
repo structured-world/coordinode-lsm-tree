@@ -330,11 +330,45 @@ impl<W: crate::io::Write + crate::io::Seek> FilterWriter<W> for PartitionedFilte
     }
 
     fn finish_scratch_bytes(&self) -> u64 {
-        // `finish` builds the open partition, by its wire layout, then
-        // encodes the top-level index.
-        let n = self.bloom_hash_buffer.len();
-        let build = crate::table::filter::ribbon::burr::builder::build_peak_bytes(n, false);
-        (build + self.bloom_policy.encoded_filter_size(n) + self.tli_bytes) as u64
+        use crate::table::block::{BlockType, framed_len_bound, transform_scratch_bound};
+        let encryption = self.encryption.as_deref();
+        // `finish` builds the open partition, by its wire layout, and frames
+        // it onto the partition buffer, which reallocates when it outgrows its
+        // capacity and holds both copies while it moves.
+        let open = if self.bloom_hash_buffer.is_empty() {
+            0
+        } else {
+            let n = self.bloom_hash_buffer.len();
+            let build =
+                crate::table::filter::ribbon::burr::builder::build_peak_bytes(n, false) as u64;
+            let filter = self.bloom_policy.encoded_filter_size(n) as u64;
+            let frame = framed_len_bound(
+                filter,
+                BlockType::Filter,
+                CompressionType::None,
+                encryption,
+                self.ecc,
+            );
+            let needed = self.final_filter_buffer.len() as u64 + frame;
+            let capacity = self.final_filter_buffer.capacity() as u64;
+            let growth = if needed > capacity {
+                needed.max(2 * capacity)
+            } else {
+                0
+            };
+            build + filter + frame + growth
+        };
+        // Then the top-level index, counted at its in-memory size, and its
+        // framed copy.
+        let tli = self.tli_bytes as u64;
+        open + tli
+            + transform_scratch_bound(
+                tli,
+                BlockType::Index,
+                self.compression,
+                encryption,
+                self.ecc,
+            )
     }
 
     fn finish_output_bytes(&self) -> u64 {
@@ -354,6 +388,7 @@ impl<W: crate::io::Write + crate::io::Seek> FilterWriter<W> for PartitionedFilte
                         .encoded_filter_size(self.bloom_hash_buffer.len())
                         as u64,
                     BlockType::Filter,
+                    CompressionType::None,
                     encryption,
                     self.ecc,
                 ),
@@ -364,7 +399,13 @@ impl<W: crate::io::Write + crate::io::Seek> FilterWriter<W> for PartitionedFilte
         };
         self.final_filter_buffer.len() as u64
             + open
-            + framed_len_bound(tli as u64, BlockType::Index, encryption, self.ecc)
+            + framed_len_bound(
+                tli as u64,
+                BlockType::Index,
+                self.compression,
+                encryption,
+                self.ecc,
+            )
     }
 
     fn finish(

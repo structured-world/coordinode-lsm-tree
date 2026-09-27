@@ -36,6 +36,47 @@ fn table_multi_writer_same_key_norotate() -> crate::Result<()> {
     Ok(())
 }
 
+/// The blob files a table links are handed to its writer only when it
+/// rotates, and it writes them at `finish`: the table is full once they no
+/// longer fit its target, before they reach the writer.
+#[test]
+fn the_linked_blob_files_count_toward_a_full_table() -> crate::Result<()> {
+    use crate::{InternalValue, UserKey, fs::StdFs, table::writer::LinkedFile};
+    use std::sync::Arc;
+
+    let folder = tempfile::tempdir()?;
+    let fs: Arc<dyn crate::fs::Fs> = Arc::new(StdFs);
+    let mut mw = super::MultiWriter::new(
+        folder.path().to_path_buf(),
+        SequenceNumberCounter::default(),
+        u64::MAX,
+        1,
+        fs,
+    )?;
+    mw.write(InternalValue::from_components(
+        UserKey::from(b"a" as &[u8]),
+        b"v".to_vec(),
+        0,
+        crate::ValueType::Value,
+    ))?;
+    mw.writer.spill_block()?;
+    mw.target_size = mw.writer.output_size_hint() + 100;
+    assert!(!mw.table_full());
+    for blob_file_id in 0..10 {
+        mw.linked_blobs.insert(
+            blob_file_id,
+            LinkedFile {
+                blob_file_id,
+                bytes: 1,
+                on_disk_bytes: 1,
+                len: 1,
+            },
+        );
+    }
+    assert!(mw.table_full(), "ten linked files take 324 bytes");
+    Ok(())
+}
+
 // Regression (#32): compaction clip must preserve RT covering gap between
 // output tables.  Before the fix, MultiWriter clipped each RT to
 // [first_key, upper_bound(last_key)) — RTs in the gap were dropped by all

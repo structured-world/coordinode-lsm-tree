@@ -738,6 +738,25 @@ fn the_size_hint_counts_the_tail_every_table_writes() -> crate::Result<()> {
     Ok(())
 }
 
+/// `finish` encodes each section into a buffer it keeps to the end and frames
+/// it into another, while the section itself is still held: a large section
+/// counts three times at that point.
+#[test]
+fn the_held_state_counts_the_section_encoding_buffers() -> crate::Result<()> {
+    let dir = tempfile::tempdir()?;
+    let mut writer = Writer::new(dir.path().join("1"), 1, 0, Arc::new(StdFs))?
+        .use_data_block_size(256)
+        .use_zone_map(true);
+    write_long_keys(&mut writer, 5_000, 200)?;
+    assert!(
+        writer.held_state_bytes() >= 3 * writer.zone_map_bytes,
+        "{} held for {} bytes of zone-map bounds",
+        writer.held_state_bytes(),
+        writer.zone_map_bytes,
+    );
+    Ok(())
+}
+
 /// A delete bitmap stores each touched chunk with its index, kind and count,
 /// so sparse deletes cost more than their row count: both estimates count the
 /// bitmap as it will be encoded.

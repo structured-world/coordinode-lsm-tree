@@ -141,8 +141,17 @@ impl<W: crate::io::Write + crate::io::Seek> BlockIndexWriter<W> for FullIndexWri
 
     fn finish_scratch_bytes(&self) -> u64 {
         // `finish` encodes every handle into one block buffer, which the
-        // table keeps until it writes the tail mirror.
-        self.encoded_bytes as u64
+        // table keeps until it writes the tail mirror, and frames it into a
+        // second when the block is transformed.
+        let encoded = self.encoded_bytes as u64;
+        encoded
+            + crate::table::block::transform_scratch_bound(
+                encoded,
+                crate::table::block::BlockType::Index,
+                self.compression,
+                self.encryption.as_deref(),
+                self.ecc,
+            )
     }
 
     fn finish_output_bytes(&self) -> u64 {
@@ -153,6 +162,7 @@ impl<W: crate::io::Write + crate::io::Seek> BlockIndexWriter<W> for FullIndexWri
         2 * crate::table::block::framed_len_bound(
             self.encoded_bytes as u64,
             crate::table::block::BlockType::Index,
+            self.compression,
             self.encryption.as_deref(),
             self.ecc,
         )
