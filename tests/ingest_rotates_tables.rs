@@ -71,7 +71,7 @@ fn one_large_ingestion_is_cut_into_tables_of_the_target_size() -> lsm_tree::Resu
     .open()?;
     // About 3.5 times the target of incompressible rows.
     ingest(&tree, 850_000, noise)?;
-    assert_tables_within_target(folder.path())?;
+    assert_tables_within_target(tree, folder.path())?;
     Ok(())
 }
 
@@ -84,7 +84,7 @@ fn a_compressible_ingestion_is_cut_into_tables_within_the_target() -> lsm_tree::
     let folder = get_tmp_folder();
     let tree = small_rows_tree(folder.path())?;
     ingest(&tree, 1_000_000, |_, buf| buf.fill(0x5a))?;
-    let sizes = table_sizes(folder.path())?;
+    let sizes = table_sizes(tree, folder.path())?;
     assert!(sizes.len() >= 2, "one ingestion wrote {sizes:?}");
     assert_within(&sizes, TARGET);
     Ok(())
@@ -116,10 +116,10 @@ fn a_flush_of_small_rows_is_cut_into_tables_within_the_target() -> lsm_tree::Res
         tree.insert(format!("node:{i:016}"), [0x5a], 0);
     }
     tree.flush_active_memtable(0)?;
-    let sizes = table_sizes(folder.path())?;
+    assert_eq!(tree.len(SeqNo::MAX, None)?, 1_000_000);
+    let sizes = table_sizes(tree, folder.path())?;
     assert!(sizes.len() >= 2, "one flush wrote {sizes:?}");
     assert_within(&sizes, TARGET);
-    assert_eq!(tree.len(SeqNo::MAX, None)?, 1_000_000);
     Ok(())
 }
 
@@ -136,15 +136,19 @@ fn a_compaction_of_small_rows_is_cut_into_tables_within_its_target() -> lsm_tree
     }
     tree.flush_active_memtable(0)?;
     tree.major_compact(COMPACTION_TARGET, SeqNo::MAX)?;
-    let sizes = table_sizes(folder.path())?;
+    assert_eq!(tree.len(SeqNo::MAX, None)?, 200_000);
+    let sizes = table_sizes(tree, folder.path())?;
     assert!(sizes.len() >= 2, "the compaction wrote {sizes:?}");
     assert_within(&sizes, COMPACTION_TARGET);
-    assert_eq!(tree.len(SeqNo::MAX, None)?, 200_000);
     Ok(())
 }
 
-/// Sizes of the table files under `folder`.
-fn table_sizes(folder: &std::path::Path) -> lsm_tree::Result<Vec<u64>> {
+/// Sizes of the table files under `folder`, once `tree` is closed. A replaced
+/// compaction input has its space released at once but stays listed until the
+/// last version referencing it drops, so counting while the tree is open
+/// would count it as an empty table.
+fn table_sizes(tree: lsm_tree::AnyTree, folder: &std::path::Path) -> lsm_tree::Result<Vec<u64>> {
+    drop(tree);
     let mut sizes = Vec::new();
     for entry in std::fs::read_dir(folder.join("tables"))? {
         let entry = entry?;
@@ -167,8 +171,11 @@ fn assert_within(sizes: &[u64], target: u64) {
 }
 
 /// Several tables were written under `folder`, none past the target.
-fn assert_tables_within_target(folder: &std::path::Path) -> lsm_tree::Result<()> {
-    let sizes = table_sizes(folder)?;
+fn assert_tables_within_target(
+    tree: lsm_tree::AnyTree,
+    folder: &std::path::Path,
+) -> lsm_tree::Result<()> {
+    let sizes = table_sizes(tree, folder)?;
     let total: u64 = sizes.iter().sum();
     assert!(
         sizes.len() as u64 >= total / TARGET,
