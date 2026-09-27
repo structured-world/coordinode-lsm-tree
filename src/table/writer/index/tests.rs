@@ -57,6 +57,63 @@ fn a_partitioned_top_level_index_fits_its_estimate_at_a_far_offset() -> crate::R
     Ok(())
 }
 
+/// A compressed index block keeps its compressed form even when that came out
+/// larger than its input, as it does for keys that do not compress. The
+/// index the writer counts still covers the block it writes.
+#[cfg(feature = "lz4")]
+#[test]
+fn a_compressed_index_that_expands_fits_its_estimate() -> crate::Result<()> {
+    use std::io::Seek;
+
+    let mut writer: Box<dyn BlockIndexWriter<W>> =
+        Box::new(FullIndexWriter::new()).use_compression(crate::CompressionType::Lz4);
+    for i in 0..500_u64 {
+        let key: alloc::vec::Vec<u8> = (0..4)
+            .flat_map(|j| crate::hash::hash64(&(i * 4 + j).to_le_bytes()).to_le_bytes())
+            .collect();
+        writer.register_data_block(KeyedBlockHandle::new(
+            key.into(),
+            0,
+            BlockHandle::new(BlockOffset(i * 4_096), 4_096),
+        ))?;
+    }
+    // Written twice by the table, once here.
+    let counted = writer.finish_output_bytes() / 2;
+    let mut file = crate::sfa::Writer::from_writer(crate::checksum::ChecksummedWriter::new(
+        std::io::Cursor::new(Vec::new()),
+    ));
+    file.start("data")?;
+    let before = file.get_mut().stream_position()?;
+    writer.finish(&mut file)?;
+    let written = file.get_mut().stream_position()? - before;
+    assert!(
+        written <= counted,
+        "{written} bytes written, {counted} counted"
+    );
+    Ok(())
+}
+
+/// A transformed index block is framed into a second buffer while the encoded
+/// one is still held, so its peak counts both.
+#[cfg(feature = "lz4")]
+#[test]
+fn a_transformed_index_counts_its_framed_copy() -> crate::Result<()> {
+    let fill = |mut writer: Box<dyn BlockIndexWriter<W>>| -> crate::Result<u64> {
+        for i in 0..100 {
+            writer.register_data_block(handle(i))?;
+        }
+        Ok(writer.finish_scratch_bytes())
+    };
+    let plain = fill(Box::new(FullIndexWriter::new()))?;
+    let compressed =
+        fill(Box::new(FullIndexWriter::new()).use_compression(crate::CompressionType::Lz4))?;
+    assert!(
+        compressed > plain,
+        "{compressed} with a codec, {plain} without"
+    );
+    Ok(())
+}
+
 #[test]
 fn a_full_index_counts_its_vector_capacity() -> crate::Result<()> {
     assert_counts_capacity(Box::new(FullIndexWriter::new()))

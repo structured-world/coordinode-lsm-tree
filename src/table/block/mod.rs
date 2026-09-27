@@ -97,15 +97,20 @@ pub(crate) fn expected_parity_len(data_length: u32, params: EccParams) -> u32 {
 }
 
 /// Bytes a `block_type` block of `payload` bytes takes on disk, bounded from
-/// above: its header, the encryption overhead and the parity trailer. Used to
-/// estimate a table's size before its blocks are written.
+/// above: its header, the codec's worst case, the encryption overhead and the
+/// parity trailer. Used to estimate a table's size before its blocks are
+/// written.
 pub(crate) fn framed_len_bound(
     payload: u64,
     block_type: BlockType,
+    compression: crate::CompressionType,
     encryption: Option<&dyn crate::encryption::EncryptionProvider>,
     ecc: Option<EccParams>,
 ) -> u64 {
-    let data = payload + encryption.map_or(0, |e| u64::from(e.max_overhead()));
+    // A payload held in memory fits `usize`; the widening back is lossless.
+    let compressed = usize::try_from(payload)
+        .map_or(payload, |len| compression.compressed_len_bound(len) as u64);
+    let data = compressed + encryption.map_or(0, |e| u64::from(e.max_overhead()));
     // A block past `u32::MAX` bytes is refused when it is written, so its
     // parity never reaches the file; the saturated length only has to keep
     // the estimate above the target that refusal protects.
@@ -113,6 +118,22 @@ pub(crate) fn framed_len_bound(
         expected_parity_len(u32::try_from(data).unwrap_or(u32::MAX), p)
     });
     Header::header_len(block_type) as u64 + data + u64::from(parity)
+}
+
+/// Heap bytes writing such a block allocates beside its payload, bounded from
+/// above: nothing when it is written as is, else the transformed frame.
+pub(crate) fn transform_scratch_bound(
+    payload: u64,
+    block_type: BlockType,
+    compression: crate::CompressionType,
+    encryption: Option<&dyn crate::encryption::EncryptionProvider>,
+    ecc: Option<EccParams>,
+) -> u64 {
+    if compression == crate::CompressionType::None && encryption.is_none() && ecc.is_none() {
+        0
+    } else {
+        framed_len_bound(payload, block_type, compression, encryption, ecc)
+    }
 }
 
 /// Refuses an on-disk block size no block written under `encryption` and

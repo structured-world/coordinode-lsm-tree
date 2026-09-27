@@ -334,9 +334,41 @@ impl<W: crate::io::Write + crate::io::Seek> BlockIndexWriter<W> for PartitionedI
     }
 
     fn finish_scratch_bytes(&self) -> u64 {
-        // `finish` encodes the open partition and then the top-level index,
-        // which the table keeps until it writes the tail mirror.
-        (self.open_encoded + self.tli_encoded) as u64
+        use crate::table::block::{BlockType, framed_len_bound, transform_scratch_bound};
+        let transform = |payload: usize| {
+            transform_scratch_bound(
+                payload as u64,
+                BlockType::Index,
+                self.compression,
+                self.encryption.as_deref(),
+                self.ecc,
+            )
+        };
+        // `finish` encodes the open partition and frames it, then appends the
+        // frame to the partition buffer, which reallocates when it outgrows
+        // its capacity and holds both copies while it moves.
+        let open = if self.data_block_handles.is_empty() {
+            0
+        } else {
+            let frame = framed_len_bound(
+                self.open_encoded as u64,
+                BlockType::Index,
+                self.compression,
+                self.encryption.as_deref(),
+                self.ecc,
+            );
+            let needed = self.final_write_buffer.len() as u64 + frame;
+            let capacity = self.final_write_buffer.capacity() as u64;
+            let growth = if needed > capacity {
+                needed.max(2 * capacity)
+            } else {
+                0
+            };
+            self.open_encoded as u64 + frame + growth
+        };
+        // Then the top-level index, which the table keeps until it writes the
+        // tail mirror, and its framed copy.
+        open + self.tli_encoded as u64 + transform(self.tli_encoded)
     }
 
     fn finish_output_bytes(&self) -> u64 {
@@ -345,6 +377,7 @@ impl<W: crate::io::Write + crate::io::Seek> BlockIndexWriter<W> for PartitionedI
             framed_len_bound(
                 payload as u64,
                 BlockType::Index,
+                self.compression,
                 self.encryption.as_deref(),
                 self.ecc,
             )

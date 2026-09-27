@@ -88,6 +88,13 @@ const TABLE_SECTIONS: [&str; 17] = [
 const FIXED_TAIL_LEN: u64 =
     (1 + META_SEPARATOR_LEN + crate::sfa::toc_and_trailer_len(&TABLE_SECTIONS)) as u64;
 
+/// Bytes the `linked_blob_files` section takes for `count` linked blob files:
+/// the count, then each file's id, entry count, bytes and on-disk bytes.
+#[must_use]
+pub(crate) const fn linked_blob_files_len(count: usize) -> u64 {
+    if count == 0 { 0 } else { 4 + 32 * count as u64 }
+}
+
 /// Heap bytes a vector of handles holds: `logical`, its entries and their
 /// end keys, plus the slots its allocation reserves past its `len` entries.
 fn handles_held(logical: usize, handles: &[KeyedBlockHandle], capacity: usize) -> usize {
@@ -847,13 +854,14 @@ impl Writer {
         // Each section's slots, by its allocation, and what its entries own.
         // Its in-memory size bounds its encoding from above; a section with
         // no entry writes no block.
+        let none = crate::CompressionType::None;
         let section = |empty: bool, held: u64, block_type| {
             (
                 held,
                 if empty {
                     0
                 } else {
-                    framed_len_bound(held, block_type, self.encryption.as_deref(), self.ecc)
+                    framed_len_bound(held, block_type, none, self.encryption.as_deref(), self.ecc)
                 },
             )
         };
@@ -895,10 +903,17 @@ impl Writer {
             framed_len_bound(
                 bitmap.encoded_len(),
                 BlockType::DeleteBitmap,
+                none,
                 self.encryption.as_deref(),
                 self.ecc,
             )
         };
+        // `finish` encodes each section into one buffer it keeps to the end,
+        // and frames it into a second; the largest section sizes both.
+        let section_scratch = sections
+            .iter()
+            .map(|&(_, out)| out)
+            .fold(bitmap_out, u64::max);
 
         let mut metadata = self.filter_writer.finish_output_bytes()
             + self.index_writer.finish_output_bytes()
@@ -918,7 +933,13 @@ impl Writer {
             let payload = base + (first.len() + last.len()) as u64 + 4;
             let ecc = self.ecc.map(|_| crate::table::block::EccParams::RS_4_2);
             metadata += FIXED_TAIL_LEN
-                + 2 * framed_len_bound(payload, BlockType::Meta, self.encryption.as_deref(), ecc);
+                + 2 * framed_len_bound(
+                    payload,
+                    BlockType::Meta,
+                    none,
+                    self.encryption.as_deref(),
+                    ecc,
+                );
         }
         let mut locator_held = 0;
         let mut locator_scratch = 0;
@@ -939,27 +960,42 @@ impl Writer {
             locator_held =
                 (self.locators.capacity() * core::mem::size_of::<(u64, u64, u64)>()) as u64;
             // The split into hashes and packed values, the retrieval build over
-            // them, and the section bytes.
+            // them, the section bytes and their framed copy.
             locator_scratch = n * 2 * WORD
                 + crate::table::filter::ribbon::burr::builder::build_peak_bytes(
                     self.locators.len(),
                     true,
                 ) as u64
-                + section;
+                + section
+                + crate::table::block::transform_scratch_bound(
+                    section,
+                    BlockType::Locator,
+                    none,
+                    self.encryption.as_deref(),
+                    self.ecc,
+                );
             metadata += framed_len_bound(
                 section,
                 BlockType::Locator,
+                none,
                 self.encryption.as_deref(),
                 self.ecc,
             );
         }
 
+        // The sections are written between the filter and the locator; the
+        // buffer they were encoded into stays allocated to the end.
         let index_phase = index_held + index_scratch + filter_held + locator_held + sections_held;
         let filter_phase =
             index_scratch + filter_held + filter_scratch + locator_held + sections_held;
-        let locator_phase = index_scratch + locator_held + locator_scratch + sections_held;
+        let section_phase = index_scratch + locator_held + sections_held + 2 * section_scratch;
+        let locator_phase =
+            index_scratch + locator_held + locator_scratch + sections_held + section_scratch;
 
-        self.held_state_bytes = index_phase.max(filter_phase).max(locator_phase);
+        self.held_state_bytes = index_phase
+            .max(filter_phase)
+            .max(section_phase)
+            .max(locator_phase);
         self.finish_metadata_bytes = metadata;
     }
 

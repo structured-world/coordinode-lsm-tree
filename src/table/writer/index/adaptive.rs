@@ -179,8 +179,18 @@ impl<W: Write + Seek + 'static> BlockIndexWriter<W> for AdaptiveIndexWriter<W> {
         match &self.spilled {
             Some(partitioned) => partitioned.finish_scratch_bytes(),
             // The full writer takes the buffer over and encodes it into one
-            // block, which the table keeps until it writes the tail mirror.
-            None => self.buffered_encoded,
+            // block, which the table keeps until it writes the tail mirror,
+            // and frames it into a second when the block is transformed.
+            None => {
+                self.buffered_encoded
+                    + crate::table::block::transform_scratch_bound(
+                        self.buffered_encoded,
+                        crate::table::block::BlockType::Index,
+                        self.compression,
+                        self.encryption.as_deref(),
+                        self.ecc,
+                    )
+            }
         }
     }
 
@@ -193,6 +203,7 @@ impl<W: Write + Seek + 'static> BlockIndexWriter<W> for AdaptiveIndexWriter<W> {
                 2 * crate::table::block::framed_len_bound(
                     self.buffered_encoded,
                     crate::table::block::BlockType::Index,
+                    self.compression,
                     self.encryption.as_deref(),
                     self.ecc,
                 )

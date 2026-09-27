@@ -914,7 +914,10 @@ impl MultiWriter {
     /// `finish`. Rows that compress well reach the second first: their data
     /// stays small while the filter, index and locator state grow per key.
     fn table_full(&self) -> bool {
-        self.writer.output_size_hint() >= self.target_size
+        // The blob files this table links are handed to its writer only when
+        // it rotates, and it writes them at `finish`.
+        let linked = crate::table::writer::linked_blob_files_len(self.linked_blobs.len());
+        self.writer.output_size_hint() + linked >= self.target_size
             || self.writer.held_state_bytes() >= self.target_size
     }
 

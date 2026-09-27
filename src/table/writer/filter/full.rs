@@ -23,6 +23,10 @@ pub struct FullFilterWriter {
 
     prefix_extractor: Option<Arc<dyn PrefixExtractor>>,
 
+    /// The previous key's prefix hashes, by position. Keys arrive sorted, so
+    /// the keys sharing a prefix are adjacent and its repeats are dropped here.
+    previous_prefixes: Vec<u64>,
+
     encryption: Option<Arc<dyn EncryptionProvider>>,
 
     /// Owning SST's table id. Set by the outer Writer via
@@ -41,12 +45,16 @@ impl FullFilterWriter {
             bloom_hash_buffer: Vec::new(),
             bloom_policy,
             prefix_extractor: None,
+            previous_prefixes: Vec::new(),
             encryption: None,
             table_id: 0,
             ecc: None,
         }
     }
 }
+
+#[cfg(test)]
+mod tests;
 
 impl<W: crate::io::Write + crate::io::Seek> FilterWriter<W> for FullFilterWriter {
     fn use_partition_size(self: Box<Self>, _: u32) -> Box<dyn FilterWriter<W>> {
@@ -104,12 +112,24 @@ impl<W: crate::io::Write + crate::io::Seek> FilterWriter<W> for FullFilterWriter
     fn register_key(&mut self, key: &UserKey) -> crate::Result<()> {
         self.bloom_hash_buffer.push(crate::hash::hash64(key));
 
-        // Prefix hashes are pushed as they come; `finish` sorts and dedups
-        // the buffer once, which is cheaper than keeping a set here on the
-        // per-key write path.
+        // A prefix the previous key had at the same position is a repeat and
+        // is dropped here, so the buffer, and the estimates taken from it, hold
+        // about one hash per distinct token. `finish` still sorts and dedups,
+        // for an extractor whose tokens are not prefixes of the key.
         if let Some(extractor) = &self.prefix_extractor {
-            for prefix in extractor.prefixes(key.as_ref()) {
-                self.bloom_hash_buffer.push(crate::hash::hash64(prefix));
+            for (position, prefix) in extractor.prefixes(key.as_ref()).enumerate() {
+                let hash = crate::hash::hash64(prefix);
+                match self.previous_prefixes.get_mut(position) {
+                    Some(previous) if *previous == hash => {}
+                    Some(previous) => {
+                        *previous = hash;
+                        self.bloom_hash_buffer.push(hash);
+                    }
+                    None => {
+                        self.previous_prefixes.push(hash);
+                        self.bloom_hash_buffer.push(hash);
+                    }
+                }
             }
         }
 
@@ -123,21 +143,33 @@ impl<W: crate::io::Write + crate::io::Seek> FilterWriter<W> for FullFilterWriter
     fn finish_scratch_bytes(&self) -> u64 {
         // The hashes move into the build, which allocates its scratch and
         // the filter bytes on top of them.
+        // When the block is transformed, the filter bytes are framed into a
+        // second buffer.
         let n = self.bloom_hash_buffer.len();
         let build = crate::table::filter::ribbon::burr::builder::build_peak_bytes(n, false);
-        (build + self.bloom_policy.estimated_filter_size(n)) as u64
+        let filter = self.bloom_policy.estimated_filter_size(n) as u64;
+        build as u64
+            + filter
+            + crate::table::block::transform_scratch_bound(
+                filter,
+                crate::table::block::BlockType::Filter,
+                CompressionType::None,
+                self.encryption.as_deref(),
+                self.ecc,
+            )
     }
 
     fn finish_output_bytes(&self) -> u64 {
         if self.bloom_hash_buffer.is_empty() {
             return 0;
         }
-        // Prefix tokens repeat across keys and are deduplicated at `finish`,
+        // Tokens that repeat out of order are deduplicated only at `finish`,
         // so this counts them before the dedup: an estimate from above.
         crate::table::block::framed_len_bound(
             self.bloom_policy
                 .estimated_filter_size(self.bloom_hash_buffer.len()) as u64,
             crate::table::block::BlockType::Filter,
+            CompressionType::None,
             self.encryption.as_deref(),
             self.ecc,
         )
