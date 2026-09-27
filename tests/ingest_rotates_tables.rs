@@ -73,28 +73,76 @@ fn one_large_ingestion_is_cut_into_tables_of_the_target_size() -> lsm_tree::Resu
     Ok(())
 }
 
-/// The same for rows that compress well, under a prefix extractor: the data
-/// alone never reaches the target, so only the per-key state the writer holds
-/// can bound the table.
+/// The same for rows that compress well, under a prefix extractor: their data
+/// stays far below the target, so only the per-key state the writer holds can
+/// bound the table, and it cuts one ingestion into several tables.
 #[cfg(feature = "lz4")]
 #[test]
-fn a_compressible_ingestion_is_cut_into_tables_of_the_target_size() -> lsm_tree::Result<()> {
+fn a_compressible_ingestion_is_cut_into_tables_within_the_target() -> lsm_tree::Result<()> {
     let folder = get_tmp_folder();
-    let tree = Config::new(
-        &folder,
+    let tree = small_rows_tree(folder.path())?;
+    ingest(&tree, 1_000_000, |_, buf| buf.fill(0x5a))?;
+    let sizes = table_sizes(folder.path())?;
+    assert!(sizes.len() >= 2, "one ingestion wrote {sizes:?}");
+    assert_within(&sizes, TARGET);
+    Ok(())
+}
+
+/// A tree of small, well-compressing rows under a prefix extractor.
+#[cfg(feature = "lz4")]
+fn small_rows_tree(folder: &std::path::Path) -> lsm_tree::Result<lsm_tree::AnyTree> {
+    Config::new(
+        folder,
         SequenceNumberCounter::default(),
         SequenceNumberCounter::default(),
     )
     .data_block_compression_policy(CompressionPolicy::all(CompressionType::Lz4))
     .prefix_extractor(Arc::new(ColonPrefixes))
-    .open()?;
-    ingest(&tree, 4_000_000, |_, buf| buf.fill(0x5a))?;
-    assert_tables_within_target(folder.path())?;
+    .open()
+}
+
+/// A flush writes through the same table writer as an ingestion: a memtable
+/// of keys with one-byte values holds far less data than the target, while
+/// the per-key state its table would hold does not, so it is cut into
+/// several tables.
+#[cfg(feature = "lz4")]
+#[test]
+fn a_flush_of_small_rows_is_cut_into_tables_within_the_target() -> lsm_tree::Result<()> {
+    let folder = get_tmp_folder();
+    let tree = small_rows_tree(folder.path())?;
+    for i in 0..1_000_000u64 {
+        tree.insert(format!("node:{i:016}"), [0x5a], 0);
+    }
+    tree.flush_active_memtable(0)?;
+    let sizes = table_sizes(folder.path())?;
+    assert!(sizes.len() >= 2, "one flush wrote {sizes:?}");
+    assert_within(&sizes, TARGET);
+    assert_eq!(tree.len(SeqNo::MAX, None)?, 1_000_000);
     Ok(())
 }
 
-/// Several tables were written under `folder`, none past the target.
-fn assert_tables_within_target(folder: &std::path::Path) -> lsm_tree::Result<()> {
+/// A compaction does the same at its own target size: the per-key state of
+/// small rows reaches it well before their compressed data.
+#[cfg(feature = "lz4")]
+#[test]
+fn a_compaction_of_small_rows_is_cut_into_tables_within_its_target() -> lsm_tree::Result<()> {
+    const COMPACTION_TARGET: u64 = 1_024 * 1_024;
+    let folder = get_tmp_folder();
+    let tree = small_rows_tree(folder.path())?;
+    for i in 0..200_000u64 {
+        tree.insert(format!("node:{i:016}"), [0x5a], 0);
+    }
+    tree.flush_active_memtable(0)?;
+    tree.major_compact(COMPACTION_TARGET, SeqNo::MAX)?;
+    let sizes = table_sizes(folder.path())?;
+    assert!(sizes.len() >= 2, "the compaction wrote {sizes:?}");
+    assert_within(&sizes, COMPACTION_TARGET);
+    assert_eq!(tree.len(SeqNo::MAX, None)?, 200_000);
+    Ok(())
+}
+
+/// Sizes of the table files under `folder`.
+fn table_sizes(folder: &std::path::Path) -> lsm_tree::Result<Vec<u64>> {
     let mut sizes = Vec::new();
     for entry in std::fs::read_dir(folder.join("tables"))? {
         let entry = entry?;
@@ -102,18 +150,29 @@ fn assert_tables_within_target(folder: &std::path::Path) -> lsm_tree::Result<()>
             sizes.push(entry.metadata()?.len());
         }
     }
+    Ok(sizes)
+}
+
+/// No table is past `target`. A table is cut at the first key boundary past
+/// it, so it may exceed it by one data block and the estimate error of the
+/// sections written after it.
+fn assert_within(sizes: &[u64], target: u64) {
+    let limit = target + target / 16;
+    assert!(
+        sizes.iter().all(|&size| size <= limit),
+        "tables past {limit} bytes: {sizes:?}",
+    );
+}
+
+/// Several tables were written under `folder`, none past the target.
+fn assert_tables_within_target(folder: &std::path::Path) -> lsm_tree::Result<()> {
+    let sizes = table_sizes(folder)?;
     let total: u64 = sizes.iter().sum();
     assert!(
         sizes.len() as u64 >= total / TARGET,
         "{total} bytes ingested into {} table(s): {sizes:?}",
         sizes.len(),
     );
-    // A table is cut at the first key boundary past the target, so it may
-    // exceed it by one data block and the index and filter written after it.
-    let limit = TARGET + TARGET / 16;
-    assert!(
-        sizes.iter().all(|&size| size <= limit),
-        "tables past {limit} bytes: {sizes:?}",
-    );
+    assert_within(&sizes, TARGET);
     Ok(())
 }
