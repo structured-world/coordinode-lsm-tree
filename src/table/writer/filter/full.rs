@@ -130,10 +130,18 @@ impl<W: crate::io::Write + crate::io::Seek> FilterWriter<W> for FullFilterWriter
     }
 
     fn finish_output_bytes(&self) -> u64 {
+        if self.bloom_hash_buffer.is_empty() {
+            return 0;
+        }
         // Every buffered token, prefix tokens included, is built into the
         // filter.
-        self.bloom_policy
-            .encoded_filter_size(self.bloom_hash_buffer.len()) as u64
+        crate::table::block::framed_len_bound(
+            self.bloom_policy
+                .encoded_filter_size(self.bloom_hash_buffer.len()) as u64,
+            crate::table::block::BlockType::Filter,
+            self.encryption.as_deref(),
+            self.ecc,
+        )
     }
 
     fn finish(

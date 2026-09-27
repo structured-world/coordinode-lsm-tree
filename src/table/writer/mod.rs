@@ -242,9 +242,10 @@ pub struct Writer {
     held_state_bytes: u64,
     finish_metadata_bytes: u64,
 
-    /// Heap bytes the entries of the per-block sections (`block_layouts`,
-    /// `zone_map_section`) own beyond their slots, kept as they are pushed.
-    section_bytes: u64,
+    /// Heap bytes the entries of `block_layouts` and of `zone_map_section` own
+    /// beyond their slots, kept as they are pushed.
+    layout_bytes: u64,
+    zone_map_bytes: u64,
 
     initial_level: u8,
 
@@ -489,7 +490,8 @@ impl Writer {
             locator_max_slot: 0,
             held_state_bytes: 0,
             finish_metadata_bytes: 0,
-            section_bytes: 0,
+            layout_bytes: 0,
+            zone_map_bytes: 0,
 
             block_buffer: Vec::new(),
             file_writer: writer,
@@ -607,35 +609,78 @@ impl Writer {
     /// the filter is gone. The top-level index bytes stay held to the end,
     /// for the tail mirror.
     fn refresh_state_estimates(&mut self) {
+        use crate::table::{
+            block::{BlockType, framed_len_bound},
+            zone_map::ColumnStats,
+        };
         const WORD: u64 = core::mem::size_of::<u64>() as u64;
 
         let index_held = self.index_writer.held_bytes();
         let index_scratch = self.index_writer.finish_scratch_bytes();
         let filter_held = self.filter_writer.held_bytes();
         let filter_scratch = self.filter_writer.finish_scratch_bytes();
+
         // Each section's slots, by its allocation, and what its entries own.
-        let sections = (self.block_layouts.capacity()
-            * core::mem::size_of::<(BlockOffset, Vec<u32>)>()
-            + self.seqno_bounds_section.capacity()
-                * core::mem::size_of::<(BlockOffset, (u64, u64))>()
-            + self.zone_map_section.capacity()
-                * core::mem::size_of::<(BlockOffset, Vec<crate::table::zone_map::ColumnStats>)>())
-            as u64
-            + self.section_bytes
-            + self.delete_bitmap.len() * core::mem::size_of::<u32>() as u64;
+        // Its in-memory size bounds its encoding from above; a section with
+        // no entry writes no block.
+        let section = |empty: bool, held: u64, block_type| {
+            (
+                held,
+                if empty {
+                    0
+                } else {
+                    framed_len_bound(held, block_type, self.encryption.as_deref(), self.ecc)
+                },
+            )
+        };
+        let slots = |capacity: usize, slot: usize| (capacity * slot) as u64;
+        let sections = [
+            section(
+                self.block_layouts.is_empty(),
+                slots(
+                    self.block_layouts.capacity(),
+                    core::mem::size_of::<(BlockOffset, Vec<u32>)>(),
+                ) + self.layout_bytes,
+                BlockType::BlockLayout,
+            ),
+            section(
+                self.seqno_bounds_section.is_empty(),
+                slots(
+                    self.seqno_bounds_section.capacity(),
+                    core::mem::size_of::<(BlockOffset, (u64, u64))>(),
+                ),
+                BlockType::SeqnoBounds,
+            ),
+            section(
+                self.zone_map_section.is_empty(),
+                slots(
+                    self.zone_map_section.capacity(),
+                    core::mem::size_of::<(BlockOffset, Vec<ColumnStats>)>(),
+                ) + self.zone_map_bytes,
+                BlockType::ZoneMap,
+            ),
+            section(
+                self.delete_bitmap.is_empty(),
+                self.delete_bitmap.len() * core::mem::size_of::<u32>() as u64,
+                BlockType::DeleteBitmap,
+            ),
+        ];
+        let sections_held: u64 = sections.iter().map(|&(held, _)| held).sum();
 
         let mut metadata = self.filter_writer.finish_output_bytes()
             + self.index_writer.finish_output_bytes()
-            + sections;
+            + sections.iter().map(|&(_, out)| out).sum::<u64>();
         let mut locator_held = 0;
         let mut locator_scratch = 0;
 
+        // Block ids only grow, so the last triple carries the largest one
+        // recorded; `locator_block_id` is already the next, unwritten block.
         if let Some(spec) = self.locator
-            && !self.locators.is_empty()
+            && let Some(&(_, max_block, _)) = self.locators.last()
             && let Some(section) = crate::table::locator::section_size_estimate(
                 self.locators.len(),
                 spec,
-                self.locator_block_id,
+                max_block,
                 self.locator_max_slot,
             )
         {
@@ -651,12 +696,18 @@ impl Writer {
                     true,
                 ) as u64
                 + section;
-            metadata += section;
+            metadata += framed_len_bound(
+                section,
+                BlockType::Locator,
+                self.encryption.as_deref(),
+                self.ecc,
+            );
         }
 
-        let index_phase = index_held + index_scratch + filter_held + locator_held + sections;
-        let filter_phase = index_scratch + filter_held + filter_scratch + locator_held + sections;
-        let locator_phase = index_scratch + locator_held + locator_scratch + sections;
+        let index_phase = index_held + index_scratch + filter_held + locator_held + sections_held;
+        let filter_phase =
+            index_scratch + filter_held + filter_scratch + locator_held + sections_held;
+        let locator_phase = index_scratch + locator_held + locator_scratch + sections_held;
 
         self.held_state_bytes = index_phase.max(filter_phase).max(locator_phase);
         self.finish_metadata_bytes = metadata;
@@ -1838,7 +1889,7 @@ impl Writer {
         // multi-inner-block data blocks carry a non-empty layout, so single
         // (default 4 KiB) blocks add nothing.
         if !layout.is_empty() {
-            self.section_bytes += (layout.capacity() * core::mem::size_of::<u32>()) as u64;
+            self.layout_bytes += (layout.capacity() * core::mem::size_of::<u32>()) as u64;
             self.block_layouts.push((self.meta.file_pos, layout));
         }
         // Size the block-handle with the scheme this writer actually wrote
@@ -1890,7 +1941,7 @@ impl Writer {
                     .iter()
                     .map(|c| c.min.capacity() + c.max.capacity())
                     .sum();
-                self.section_bytes += (columns.capacity()
+                self.zone_map_bytes += (columns.capacity()
                     * core::mem::size_of::<crate::table::zone_map::ColumnStats>()
                     + bounds) as u64;
                 self.zone_map_section.push((self.meta.file_pos, columns));

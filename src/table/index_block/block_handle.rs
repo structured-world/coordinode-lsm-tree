@@ -135,6 +135,8 @@ impl KeyedBlockHandle {
     /// encoding, which a truncated one never exceeds, and its restart pointer.
     #[must_use]
     pub fn encoded_len_bound(&self) -> usize {
+        // The `as` casts below widen: a bit count (at most 64) to `usize`, and
+        // a key length (a `usize`, at most 64 bits on every target) to `u64`.
         /// LEB128 length of `v`.
         const fn varint_len(v: u64) -> usize {
             (64 - (v | 1).leading_zeros() as usize).div_ceil(7)

@@ -672,6 +672,58 @@ fn the_estimates_count_the_zone_map_bounds() -> crate::Result<()> {
     assert_hint_matches_the_table(writer, &path)
 }
 
+/// Under page ECC every block `finish` writes carries a parity trailer, which
+/// the hint has to count: long keys over small blocks make the index a large
+/// share of the table.
+#[cfg(feature = "page_ecc")]
+#[test]
+fn the_size_hint_counts_the_parity_of_the_blocks_to_come() -> crate::Result<()> {
+    let dir = tempfile::tempdir()?;
+    let path = dir.path().join("1");
+    let mut writer = Writer::new(path.clone(), 1, 0, Arc::new(StdFs))?
+        .use_data_block_size(64)
+        .use_ecc(Some(crate::table::block::EccParams::RS_4_2));
+    write_long_keys(&mut writer, 5_000, 200)?;
+    assert_hint_matches_the_table(writer, &path)
+}
+
+/// A table of exactly `2^k` blocks fits explicit `k`-bit block ids, so its
+/// locator section is written and both estimates count it, although the next
+/// block ordinal no longer fits.
+#[test]
+fn a_locator_filled_to_its_last_block_id_is_counted() -> crate::Result<()> {
+    let locator = crate::config::LocatorPolicyEntry::Enabled {
+        precision: crate::config::LocatorPrecision::Block,
+        block_id_bits: Some(1),
+        slot_bits: None,
+    };
+    let dir = tempfile::tempdir()?;
+    let mut with = Writer::new(dir.path().join("1"), 1, 0, Arc::new(StdFs))?.use_locator(locator);
+    let mut without = Writer::new(dir.path().join("2"), 1, 0, Arc::new(StdFs))?;
+    for writer in [&mut with, &mut without] {
+        for block in 0..2 {
+            for i in 0..10 {
+                writer.write(InternalValue::from_components(
+                    format!("key{block}{i:02}").into_bytes(),
+                    b"value---".to_vec(),
+                    0,
+                    ValueType::Value,
+                ))?;
+            }
+            writer.spill_block()?;
+        }
+    }
+    assert_eq!(with.meta.data_block_count, 2);
+    assert!(
+        with.held_state_bytes() > without.held_state_bytes(),
+        "{} held with the locator, {} without",
+        with.held_state_bytes(),
+        without.held_state_bytes(),
+    );
+    assert!(with.output_size_hint() > without.output_size_hint());
+    Ok(())
+}
+
 /// Explicit locator widths too narrow for the table skip its section at
 /// `finish`. The widths only grow with the table, so once they no longer fit
 /// the writer holds nothing for the locator and charges nothing for it.

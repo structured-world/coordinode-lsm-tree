@@ -33,7 +33,7 @@ fn a_spill_frees_the_buffer() -> crate::Result<()> {
 
 /// Before a spill the writer holds the buffered handles once; `finish` hands
 /// them to the full writer and adds only their encoded block, which the table
-/// writes twice.
+/// writes twice, each copy under its block header.
 #[test]
 fn an_unspilled_index_counts_its_encoding_twice_in_the_output() -> crate::Result<()> {
     let mut writer = Writer::new(u64::MAX);
@@ -48,7 +48,8 @@ fn an_unspilled_index_counts_its_encoding_twice_in_the_output() -> crate::Result
         held,
         writer.buffered_bytes + 28 * core::mem::size_of::<KeyedBlockHandle>() as u64,
     );
-    assert_eq!(output, 2 * scratch);
+    let header = crate::table::block::Header::header_len(crate::table::block::BlockType::Index);
+    assert_eq!(output, 2 * (scratch + header as u64));
     // 32-byte keys, each encoded with a handful of varints and a restart
     // pointer: under the in-memory entry, above the key alone.
     assert!(scratch > 100 * 32 && scratch < held, "{scratch} vs {held}");
