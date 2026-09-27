@@ -691,6 +691,38 @@ fn the_size_hint_counts_the_mirrored_index() -> crate::Result<()> {
     assert_hint_matches_the_table(writer, &path)
 }
 
+/// A prefix shared by every key hashes to the same token once per key. The
+/// filter is built from distinct tokens, so the estimates, counted from every
+/// buffered token, stay above what `finish` builds and writes.
+#[test]
+fn a_prefix_shared_by_every_key_is_built_once() -> crate::Result<()> {
+    struct UpToColon;
+    impl crate::prefix::PrefixExtractor for UpToColon {
+        fn prefixes<'a>(&self, key: &'a [u8]) -> Box<dyn Iterator<Item = &'a [u8]> + 'a> {
+            let end = key.iter().position(|b| *b == b':').map_or(0, |i| i + 1);
+            Box::new(key.get(..end).into_iter())
+        }
+    }
+    let dir = tempfile::tempdir()?;
+    let path = dir.path().join("1");
+    let mut writer = Writer::new(path.clone(), 1, 0, Arc::new(StdFs))?
+        .use_prefix_extractor(Some(Arc::new(UpToColon)));
+    for i in 0..20_000u32 {
+        writer.write(InternalValue::from_components(
+            format!("p:{i:08}").into_bytes(),
+            b"v".to_vec(),
+            0,
+            ValueType::Value,
+        ))?;
+    }
+    writer.spill_block()?;
+    let hint = writer.output_size_hint();
+    writer.finish()?;
+    let size = std::fs::metadata(&path)?.len();
+    assert!(hint >= size, "hint {hint} for a {size}-byte table");
+    Ok(())
+}
+
 /// Every table ends with sections `finish` always writes: two copies of the
 /// meta block, the version byte, the 4 KiB separator between them, the table
 /// of contents and the trailer. A table of a few keys is mostly these.
