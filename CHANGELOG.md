@@ -11,6 +11,12 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 
 ## [Unreleased]
 
+## [5.11.6](https://github.com/structured-world/coordinode-lsm-tree/compare/v5.11.5...v5.11.6) - 2026-09-27
+
+### Fixed
+
+- *(memtable)* stop committing 64 MiB per memtable (5.x.x) ([#726](https://github.com/structured-world/coordinode-lsm-tree/pull/726))
+
 ## [5.11.4](https://github.com/structured-world/coordinode-lsm-tree/compare/v5.11.3...v5.11.4) - 2026-09-26
 
 ### Fixed
