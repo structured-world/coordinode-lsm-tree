@@ -1,5 +1,5 @@
 window.BENCHMARK_DATA = {
-  "lastUpdate": 1790519306293,
+  "lastUpdate": 1790519312397,
   "repoUrl": "https://github.com/structured-world/coordinode-lsm-tree",
   "entries": {
     "lsm-tree db_bench costs": [
@@ -930,6 +930,192 @@ window.BENCHMARK_DATA = {
             "value": 6222.25,
             "unit": "B/row",
             "extra": "keys: 10000 | rows: 10000 | read: 83123466 B | decoded: 82570298 B | copied: 62222500 B | elapsed: 60.854309ms\niterations: 3"
+          }
+        ]
+      },
+      {
+        "commit": {
+          "author": {
+            "email": "mail@polaz.com",
+            "name": "Dmitry Prudnikov",
+            "username": "polaz"
+          },
+          "committer": {
+            "email": "noreply@github.com",
+            "name": "GitHub",
+            "username": "web-flow"
+          },
+          "distinct": true,
+          "id": "32a9b3357c64537a444b9a00758250c16e3844e9",
+          "message": "feat(columnar): encode column pages as light codecs, chosen per level (#723)\n\n## Summary\n\nA column page's values are now an expression over light operators, and\nwhich encoding a level's pages get is a per-level policy, the way the\ndata block compression is.\n\n- **Expression encoding.** Constant, runs, a dictionary sorted in the\ncolumn's order, FFOR with exceptions patched in, zigzag delta, a number\ncolumn's ordinals and a bytes column's lengths in place of its offset\ntable, nested as the data needs; plain stays the column's own layout,\nserved as a view of the page. The whole expression of a page lives in\nthat page. Every operator, count, code, run end, exception position and\nlength is checked on read, and an unknown or misplaced operator fails\nthe page. `CodecId` and its delta codec are replaced.\n- **Choice by cost.** Under `Auto` the writer trial-encodes the\ncandidates and keeps the one that costs least to store and to read,\ncounting each operator's own fields, so a small page keeps its plain\nform when an encoding's overhead outweighs its saving; FFOR picks its\nwidth by the same cost, the patching of its exceptions included.\n`table::columnar::candidates` lays the decision out.\n- **Bounded decoding.** An encoding describes far more bytes than it\nstores, so a read bounds what a row group may build: the directory\nrefuses a group of more rows than a writer cuts (a group closes at 4 MiB\nof rows, each at least a byte; an ingested batch past the group size is\ncut into groups the same way), and a group may build at most twice that\npast its pages' own bytes over all its columns, and hold at most as many\nrows decoded to read them, a column past the bound refused before it is\nbuilt. A merge-on-read relocation keeps the pages it copies as encoded,\nas it keeps their compression.\n- **Per-level policy.**\n`Config::column_encoding_policy(ColumnEncodingPolicy)`, one\n`ColumnEncoding::{Plain, Auto}` per level, `Plain` at every level by\ndefault. Flush, compaction (by the level written into), ingestion and\nblob trees write under it; a plain level skips the trials entirely.\n`db_bench --column-encoding plain|auto`.\n- **Reads from the encoding.** A scan tests its predicate on the\nencoding (a constant once, runs once per run, a dictionary once per\nvalue and a code lookup per row, integers as they decode) and builds\nonly the rows that survive it and the delete and bound masks; a column\nread only for its predicate is never built. A point read takes single\nrows from an encoded page (a bytes column of one length by position),\nsearches the keys once and does not read the key pages again for the\nrest of the row.\n- **Diagnosis.** `sst-dump <table> columns [--summary]` lists every\npage's expression and, for a bytes column, the bytes it spends on its\noffsets apart from its values (`inspect::read_column_encodings`,\n`PageEncoding::offsets_len`).\n- `docs/columnar-page-format.md` gains \"Values encoding\" (operators,\npredicates, the policy and its measurement); \"How many pages\" now says\none page per column and row page.\n\n## Why plain is the default\n\nA read that wants a column whole has to build an encoded page back into\nthe column's layout, while it serves a plain page as a view. On the\nmixed-layout records only the engine's own columns encode (keys by their\nlengths, seqnos by their ordinals, the value type as a constant), so\n`Auto` reads fewer bytes for more time. `Auto` is for the levels whose\ntables are mostly stored rather than read, and for typed value columns\nwhose values encode far below their layout.\n\n## Measurements\n\n`db_bench --benchmark mixed-layout --num 70000`, x86 Linux host,\ninterleaved runs of five iterations (three with the default cache, two\nwith none), medians; base is `main` before this branch:\n\n| | point reads | near-full scan | sparse scan | near-full, no cache |\n|---|---|---|---|---|\n| base | 350.8 ms, 215.8 B read/row | 58.5 ms, 340.6 B | 15.3 ms | 49.6\nms |\n| **plain** (default) | **342.9 ms**, 215.5 B | **56.8 ms**, 340.1 B |\n15.7 ms | 49.3 ms |\n| auto | 351.0 ms, 202.8 B | 60.4 ms, 331.0 B | 15.3 ms | 52.8 ms |\n\nBytes copied per row: near-full 290.0 -> 277.7, sparse 301 -> 285 under\nboth. Point reads with no cache take about 1.53 s under all three.\n`Auto` reads 3-6% fewer bytes for 2-7% more time; that trade is why it\nis opt-in per level.\n\n## Testing\n\n- every candidate of every column type round-trips byte-exactly\n(proptests over number kinds, widths and orders, opaque and bytes\ncolumns, boundaries, single rows), and each is also read row by row,\nanswered for a predicate and gathered for a selection against the plain\nlayout\n- refusals: unknown or misplaced operator, depth, codes past the\ndictionary, run ends, exception positions, ordinals a width cannot hold,\nlengths that miss the payload, trailing bytes; each refused by a decode\nand by a point read\n- a row group past the rows a writer cuts is refused by the directory; a\npage decoding past the group's budget is refused before anything is\nbuilt, and a lookup holding more rows decoded than it allows is refused;\nan ingested batch far past the group size reads back whole\n- every candidate describes itself on read exactly as written, a run's\nends included; FFOR over 1000 rows of 0/1 with 50 ones takes width 1,\nnot the smaller but dearer width 0 with 50 patches\n- an FFOR outlier (values `0..=7`, one row of `1000`) is stored in 3\nbits with one exception and `value > 100` returns exactly that row\nthrough the zone map, the predicate, the selection and the rows built\n- a predicate over a column of runs copies exactly the keys it returns\nand never builds the predicate column (`bytes_copied`)\n- per-unit overhead: an encoding with the smaller payload but the larger\npage loses to plain\n- the level policy through flush (plain at L0) and a major compaction,\nencoded only because the last level it writes into asks for it; the\ndefault reported plain end to end by `sst-dump`, its page listing\nchecked against its summary, and a plain key page's offsets reported as\nits offset table\n- fmt, clippy in every CI configuration (library, db_bench, sst-dump),\nthe no-std check, full nextest (default and all features), doc tests and\n`cargo doc -D warnings` on macOS; clippy and the full nextest (3794\ntests, io_uring included) on x86 Linux\n- the decoding bound and the FFOR width against the commit before them,\n`mixed-layout` on macOS, eight interleaved rounds of five iterations:\nbytes read per row identical under both encodings, medians within 1-4%\neither way, the spread the unchanged plain point reads show\n\nCloses #684",
+          "timestamp": "2026-09-27T17:19:56+03:00",
+          "tree_id": "83b89c064abe597da56a21de5a0d573ce76357df",
+          "url": "https://github.com/structured-world/coordinode-lsm-tree/commit/32a9b3357c64537a444b9a00758250c16e3844e9"
+        },
+        "date": 1790519310442,
+        "tool": "customSmallerIsBetter",
+        "benches": [
+          {
+            "name": "mixed-layout / narrow-records bytes read per row",
+            "value": 42.1442,
+            "unit": "B/row",
+            "extra": "keys: 200000 | rows: 200000 | read: 8428840 B | decoded: 8357098 B | copied: 9000000 B | elapsed: 439.142406ms\niterations: 3"
+          },
+          {
+            "name": "mixed-layout / narrow-records bytes decoded per row",
+            "value": 41.78549,
+            "unit": "B/row",
+            "extra": "keys: 200000 | rows: 200000 | read: 8428840 B | decoded: 8357098 B | copied: 9000000 B | elapsed: 439.142406ms\niterations: 3"
+          },
+          {
+            "name": "mixed-layout / narrow-records bytes copied per row",
+            "value": 45,
+            "unit": "B/row",
+            "extra": "keys: 200000 | rows: 200000 | read: 8428840 B | decoded: 8357098 B | copied: 9000000 B | elapsed: 439.142406ms\niterations: 3"
+          },
+          {
+            "name": "mixed-layout / wide-records-full-read bytes read per row",
+            "value": 4215,
+            "unit": "B/row",
+            "extra": "keys: 50000 | rows: 50000 | read: 210750000 B | decoded: 209100000 B | copied: 207050000 B | elapsed: 372.522156ms\niterations: 3"
+          },
+          {
+            "name": "mixed-layout / wide-records-full-read bytes decoded per row",
+            "value": 4182,
+            "unit": "B/row",
+            "extra": "keys: 50000 | rows: 50000 | read: 210750000 B | decoded: 209100000 B | copied: 207050000 B | elapsed: 372.522156ms\niterations: 3"
+          },
+          {
+            "name": "mixed-layout / wide-records-full-read bytes copied per row",
+            "value": 4141,
+            "unit": "B/row",
+            "extra": "keys: 50000 | rows: 50000 | read: 210750000 B | decoded: 209100000 B | copied: 207050000 B | elapsed: 372.522156ms\niterations: 3"
+          },
+          {
+            "name": "mixed-layout / mixed-value-sizes bytes read per row",
+            "value": 867.21184,
+            "unit": "B/row",
+            "extra": "keys: 100000 | rows: 100000 | read: 86721184 B | decoded: 86391151 B | copied: 86420000 B | elapsed: 272.519513ms\niterations: 3"
+          },
+          {
+            "name": "mixed-layout / mixed-value-sizes bytes decoded per row",
+            "value": 863.91151,
+            "unit": "B/row",
+            "extra": "keys: 100000 | rows: 100000 | read: 86721184 B | decoded: 86391151 B | copied: 86420000 B | elapsed: 272.519513ms\niterations: 3"
+          },
+          {
+            "name": "mixed-layout / mixed-value-sizes bytes copied per row",
+            "value": 864.2,
+            "unit": "B/row",
+            "extra": "keys: 100000 | rows: 100000 | read: 86721184 B | decoded: 86391151 B | copied: 86420000 B | elapsed: 272.519513ms\niterations: 3"
+          },
+          {
+            "name": "mixed-layout / row-updates-over-columnar-base bytes read per row",
+            "value": 215.46455,
+            "unit": "B/row",
+            "extra": "keys: 100000 | rows: 100000 | read: 21546455 B | decoded: 20938463 B | copied: 51100094 B | elapsed: 533.63855ms\niterations: 3"
+          },
+          {
+            "name": "mixed-layout / row-updates-over-columnar-base bytes decoded per row",
+            "value": 209.38463,
+            "unit": "B/row",
+            "extra": "keys: 100000 | rows: 100000 | read: 21546455 B | decoded: 20938463 B | copied: 51100094 B | elapsed: 533.63855ms\niterations: 3"
+          },
+          {
+            "name": "mixed-layout / row-updates-over-columnar-base bytes copied per row",
+            "value": 511.00094,
+            "unit": "B/row",
+            "extra": "keys: 100000 | rows: 100000 | read: 21546455 B | decoded: 20938463 B | copied: 51100094 B | elapsed: 533.63855ms\niterations: 3"
+          },
+          {
+            "name": "mixed-layout / versions-deletes-tombstones bytes read per row",
+            "value": 133.68026315789473,
+            "unit": "B/row",
+            "extra": "keys: 100000 | rows: 76000 | read: 10159700 B | decoded: 10076111 B | copied: 10013359 B | elapsed: 267.331353ms\niterations: 3"
+          },
+          {
+            "name": "mixed-layout / versions-deletes-tombstones bytes decoded per row",
+            "value": 132.58040789473685,
+            "unit": "B/row",
+            "extra": "keys: 100000 | rows: 76000 | read: 10159700 B | decoded: 10076111 B | copied: 10013359 B | elapsed: 267.331353ms\niterations: 3"
+          },
+          {
+            "name": "mixed-layout / versions-deletes-tombstones bytes copied per row",
+            "value": 131.75472368421052,
+            "unit": "B/row",
+            "extra": "keys: 100000 | rows: 76000 | read: 10159700 B | decoded: 10076111 B | copied: 10013359 B | elapsed: 267.331353ms\niterations: 3"
+          },
+          {
+            "name": "mixed-layout / selective-scan-sparse bytes read per row",
+            "value": 4249.199806013579,
+            "unit": "B/row",
+            "extra": "keys: 100000 | rows: 1031 | read: 4380925 B | decoded: 4210810 B | copied: 293835 B | elapsed: 23.504074ms\niterations: 3"
+          },
+          {
+            "name": "mixed-layout / selective-scan-sparse bytes decoded per row",
+            "value": 4084.199806013579,
+            "unit": "B/row",
+            "extra": "keys: 100000 | rows: 1031 | read: 4380925 B | decoded: 4210810 B | copied: 293835 B | elapsed: 23.504074ms\niterations: 3"
+          },
+          {
+            "name": "mixed-layout / selective-scan-sparse bytes copied per row",
+            "value": 285,
+            "unit": "B/row",
+            "extra": "keys: 100000 | rows: 1031 | read: 4380925 B | decoded: 4210810 B | copied: 293835 B | elapsed: 23.504074ms\niterations: 3"
+          },
+          {
+            "name": "mixed-layout / selective-scan-near-full bytes read per row",
+            "value": 340.1047555555555,
+            "unit": "B/row",
+            "extra": "keys: 100000 | rows: 90000 | read: 30609428 B | decoded: 29737733 B | copied: 24990376 B | elapsed: 84.974504ms\niterations: 3"
+          },
+          {
+            "name": "mixed-layout / selective-scan-near-full bytes decoded per row",
+            "value": 330.41925555555554,
+            "unit": "B/row",
+            "extra": "keys: 100000 | rows: 90000 | read: 30609428 B | decoded: 29737733 B | copied: 24990376 B | elapsed: 84.974504ms\niterations: 3"
+          },
+          {
+            "name": "mixed-layout / selective-scan-near-full bytes copied per row",
+            "value": 277.67084444444447,
+            "unit": "B/row",
+            "extra": "keys: 100000 | rows: 90000 | read: 30609428 B | decoded: 29737733 B | copied: 24990376 B | elapsed: 84.974504ms\niterations: 3"
+          },
+          {
+            "name": "mixed-layout / blobs-well-placed bytes read per row",
+            "value": 8297.8593,
+            "unit": "B/row",
+            "extra": "keys: 10000 | rows: 10000 | read: 82978593 B | decoded: 82426811 B | copied: 82911721 B | elapsed: 65.90845ms\niterations: 3"
+          },
+          {
+            "name": "mixed-layout / blobs-well-placed bytes decoded per row",
+            "value": 8242.6811,
+            "unit": "B/row",
+            "extra": "keys: 10000 | rows: 10000 | read: 82978593 B | decoded: 82426811 B | copied: 82911721 B | elapsed: 65.90845ms\niterations: 3"
+          },
+          {
+            "name": "mixed-layout / blobs-well-placed bytes copied per row",
+            "value": 8291.1721,
+            "unit": "B/row",
+            "extra": "keys: 10000 | rows: 10000 | read: 82978593 B | decoded: 82426811 B | copied: 82911721 B | elapsed: 65.90845ms\niterations: 3"
+          },
+          {
+            "name": "mixed-layout / blobs-scattered bytes read per row",
+            "value": 8312.3466,
+            "unit": "B/row",
+            "extra": "keys: 10000 | rows: 10000 | read: 83123466 B | decoded: 82570298 B | copied: 62222500 B | elapsed: 67.515236ms\niterations: 3"
+          },
+          {
+            "name": "mixed-layout / blobs-scattered bytes decoded per row",
+            "value": 8257.0298,
+            "unit": "B/row",
+            "extra": "keys: 10000 | rows: 10000 | read: 83123466 B | decoded: 82570298 B | copied: 62222500 B | elapsed: 67.515236ms\niterations: 3"
+          },
+          {
+            "name": "mixed-layout / blobs-scattered bytes copied per row",
+            "value": 6222.25,
+            "unit": "B/row",
+            "extra": "keys: 10000 | rows: 10000 | read: 83123466 B | decoded: 82570298 B | copied: 62222500 B | elapsed: 67.515236ms\niterations: 3"
           }
         ]
       }
