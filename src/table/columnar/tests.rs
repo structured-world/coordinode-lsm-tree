@@ -1,11 +1,11 @@
 use super::{
-    COL_SEQNO, COL_USER_KEY, COL_VALUE, COL_VALUE_TYPE, CodecId, Column, ColumnBatch, TypeTag,
-    column_batch_into_entries, column_batch_match_entries, column_batch_to_entries,
-    entries_to_column_batch, frame_value_cells, frame_value_cells_nullable, unframe_value_cells,
+    COL_SEQNO, COL_USER_KEY, COL_VALUE, COL_VALUE_TYPE, Column, ColumnBatch, RowPageColumns,
+    TypeTag, column_batch_into_entries, column_batch_to_entries, entries_to_column_batch,
+    frame_value_cells, frame_value_cells_nullable, page_match_entries, unframe_value_cells,
     unframe_value_cells_nullable, unframe_value_cells_with_defaults,
     validate_columnar_ingest_batch,
 };
-use crate::{Slice, ValueType, key::InternalKey, value::InternalValue};
+use crate::{Slice, ValueType, config::ColumnEncoding, key::InternalKey, value::InternalValue};
 
 #[test]
 fn fixed_only_value_framing_has_no_overhead_and_round_trips() {
@@ -213,71 +213,66 @@ fn assert_entries_eq(a: &[InternalValue], b: &[InternalValue]) {
     }
 }
 
+/// The expression a batch's one column was encoded as: the column header is
+/// `row_count` (4) + `column_count` (4) + id (2) + type (1) + width (1) +
+/// validity flag (1), then the values' length and the values.
+fn only_column_expression(batch: &ColumnBatch) -> super::Expression {
+    let encoded = batch.encode().expect("encode");
+    let column = &batch.columns[0];
+    let mut rest = &encoded[13..];
+    let len =
+        usize::try_from(crate::table::column_page::take_varint(&mut rest, 5).expect("length"))
+            .expect("a length a page holds");
+    super::Values::parse(column.type_tag, batch.row_count, &rest[..len])
+        .expect("parse")
+        .describe()
+        .expect("describe")
+}
+
 #[test]
-fn delta_codec_round_trips_fixed8_column() {
-    // The seqno column (a u64 number) auto-selects Delta and must round-trip
-    // exactly, including a repeat and a decrease (wrapping delta).
+fn a_seqno_column_is_encoded_by_its_ordinals_and_round_trips() {
+    // A u64 number column of nearby values packs into a few bits a row by its
+    // ordinals, a repeat and a decrease included, and decodes exactly.
     let seqnos: [u64; 5] = [100, 105, 105, 200, 199];
     let data: Vec<u8> = seqnos.iter().flat_map(|s| s.to_le_bytes()).collect();
     let batch = ColumnBatch {
         row_count: 5,
         columns: vec![Column {
-            column_id: 1,
+            column_id: COL_SEQNO,
             type_tag: TypeTag::Number(crate::table::columnar::Number::U64_LE),
             validity: None,
             data: data.clone().into(),
         }],
     };
-    let encoded = batch.encode(CodecId::Plain).expect("encode");
-    // The codec byte (row_count 4 + col_count 4 + id 2 + type 1 + width 1 =
-    // offset 12) must record Delta, auto-selected for the fixed-8 column.
-    assert_eq!(encoded[12], u8::from(CodecId::Delta));
-    let decoded = ColumnBatch::decode(&encoded.into()).expect("decode");
-    assert_eq!(
-        decoded.columns[0].data, data,
-        "delta column must round-trip"
+    assert!(
+        matches!(
+            only_column_expression(&batch),
+            super::Expression::Ordinals(_)
+        ),
+        "a narrow range of u64 numbers is encoded by its ordinals",
     );
+    let decoded = ColumnBatch::decode(&batch.encode().expect("encode").into()).expect("decode");
+    assert_eq!(decoded.columns[0].data, data, "the column must round-trip");
 }
 
 #[test]
-fn auto_codec_is_delta_only_for_the_seqno_column() {
-    // A fixed-8 column that is not the seqno column keeps the default codec
-    // (Plain): delta-encoding a non-monotonic column would only inflate it.
+fn an_opaque_fixed_column_is_never_encoded_by_ordinals() {
+    // An opaque fixed column has no number type, so it has no ordinals: its
+    // bytes are not integers the engine may reinterpret, however narrow they
+    // look. Distinct rows leave it plain.
+    let data: Vec<u8> = (0u64..8).flat_map(|i| (i * 3).to_le_bytes()).collect();
     let batch = ColumnBatch {
-        row_count: 2,
+        row_count: 8,
         columns: vec![Column {
-            column_id: 99, // not the intrinsic seqno column
+            column_id: 99,
             type_tag: TypeTag::Fixed(8),
             validity: None,
-            data: vec![0u8; 16].into(),
+            data: data.clone().into(),
         }],
     };
-    let encoded = batch.encode(CodecId::Plain).expect("encode");
-    assert_eq!(
-        encoded[12],
-        u8::from(CodecId::Plain),
-        "a non-seqno fixed-8 column must not auto-select Delta"
-    );
-}
-
-#[test]
-fn encode_rejects_delta_on_a_non_fixed8_column() {
-    // Forcing Delta on a Bytes column (via the fallback codec) is rejected
-    // rather than silently truncating its bytes.
-    let mut bytes_data = Vec::new();
-    bytes_data.extend_from_slice(&0u32.to_le_bytes());
-    bytes_data.extend_from_slice(&3u32.to_le_bytes());
-    bytes_data.extend_from_slice(b"abc");
-    let batch = ColumnBatch {
-        row_count: 1,
-        columns: vec![Column {
-            column_id: 50,
-            type_tag: TypeTag::Bytes,
-            validity: None,
-            data: bytes_data.into(),
-        }],
-    };
-    assert!(batch.encode(CodecId::Delta).is_err());
+    assert_eq!(only_column_expression(&batch), super::Expression::Plain);
+    let decoded = ColumnBatch::decode(&batch.encode().expect("encode").into()).expect("decode");
+    assert_eq!(decoded.columns[0].data, data);
 }
 
 #[test]
@@ -305,7 +300,7 @@ fn decode_projected_decodes_only_the_wanted_columns() {
     ];
     let bytes = entries_to_column_batch(&entries)
         .expect("transpose")
-        .encode(CodecId::Plain)
+        .encode()
         .expect("encode");
 
     let projected = ColumnBatch::decode_projected(&bytes.clone().into(), &[COL_USER_KEY])
@@ -344,15 +339,16 @@ fn decode_projected_detaches_a_narrow_projection_from_a_value_heavy_block() {
     // Keys are a few bytes, values are large: a key-only projection covers a
     // sliver of the block. Served as a view it would keep the whole block
     // (values included) alive per batch, so it must come back detached; a
-    // full decode covers the block and keeps the zero-copy view.
-    let big_value = vec![0xABu8; 4096];
+    // full decode covers the block and keeps the zero-copy view. The two
+    // values differ, so the value column is stored in its own layout rather
+    // than as a constant, and is served as a view.
     let entries = vec![
-        entry(b"a", 2, ValueType::Value, &big_value),
-        entry(b"b", 1, ValueType::Value, &big_value),
+        entry(b"a", 2, ValueType::Value, &[0xABu8; 4096]),
+        entry(b"b", 1, ValueType::Value, &[0xCDu8; 4096]),
     ];
     let block: Slice = entries_to_column_batch(&entries)
         .expect("transpose")
-        .encode(CodecId::Plain)
+        .encode()
         .expect("encode")
         .into();
 
@@ -395,7 +391,7 @@ fn intrinsic_transpose_round_trips_entries() {
 
     // And through the block encode / decode, so the transpose composes with
     // the on-disk columnar format.
-    let bytes = batch.encode(CodecId::Plain).expect("encode");
+    let bytes = batch.encode().expect("encode");
     let decoded = ColumnBatch::decode(&bytes.into()).expect("decode");
     let back2 = column_batch_to_entries(&decoded).expect("untranspose decoded");
     assert_entries_eq(&entries, &back2);
@@ -879,16 +875,16 @@ fn concat_refuses_no_pages_and_pages_with_other_columns() {
 }
 
 #[test]
-fn columnar_batch_round_trips_through_plain_codec() {
+fn columnar_batch_round_trips() {
     let batch = sample_batch();
-    let encoded = batch.encode(CodecId::Plain).expect("encode");
+    let encoded = batch.encode().expect("encode");
     let decoded = ColumnBatch::decode(&encoded.into()).expect("decode");
     assert_eq!(decoded, batch, "columnar batch must survive a round-trip");
 }
 
 #[test]
 fn columnar_decode_rejects_truncated_payload() {
-    let encoded = sample_batch().encode(CodecId::Plain).expect("encode");
+    let encoded = sample_batch().encode().expect("encode");
     // Drop the last byte: the final column's data is now short.
     let truncated = &encoded[..encoded.len() - 1];
     assert!(ColumnBatch::decode(&truncated.to_vec().into()).is_err());
@@ -907,15 +903,29 @@ fn columnar_encode_rejects_fixed_width_length_mismatch() {
             data: vec![0; 8].into(),
         }],
     };
-    assert!(bad.encode(CodecId::Plain).is_err());
+    assert!(bad.encode().is_err());
+}
+
+/// Where the sample batch's fields lie: the first column's header starts at
+/// 8 (after `row_count` and `column_count`), so its validity flag is at 12,
+/// its values length at 13, its one-byte bitmap at 14 and its operator at 15,
+/// then its 12 plain bytes. The second column starts at 28, its width at 31,
+/// and its values, encoded by their lengths, open at 34 with the lengths'
+/// FFOR: operator 35, base 36, bit width 37.
+#[test]
+fn sample_batch_encodes_as_the_layout_the_offset_tests_assume() {
+    let encoded = sample_batch().encode().expect("encode");
+    assert_eq!(encoded[12], 1, "the first column is nullable");
+    assert_eq!(encoded[15], 0, "the opaque fixed column is plain");
+    assert_eq!(encoded[31], 0, "the bytes column's width");
+    assert_eq!(encoded[34], 7, "the bytes column is encoded by its lengths");
+    assert_eq!(encoded[37], 2, "lengths 2, 0 and 3 pack in two bits");
 }
 
 #[test]
-fn columnar_decode_rejects_unknown_codec_tag() {
-    let mut encoded = sample_batch().encode(CodecId::Plain).expect("encode");
-    // Codec byte of the first column sits after row_count(4) + col_count(4)
-    // + column_id(2) + type_tag(1) + width(1) = offset 12.
-    encoded[12] = 0xFF;
+fn columnar_decode_rejects_an_unknown_operator() {
+    let mut encoded = sample_batch().encode().expect("encode");
+    encoded[15] = 0xFF;
     assert!(ColumnBatch::decode(&encoded.clone().into()).is_err());
 }
 
@@ -932,7 +942,7 @@ fn columnar_encode_rejects_zero_width_fixed_column() {
             data: Vec::new().into(),
         }],
     };
-    assert!(bad.encode(CodecId::Plain).is_err());
+    assert!(bad.encode().is_err());
 }
 
 #[test]
@@ -947,7 +957,7 @@ fn columnar_encode_rejects_wrong_validity_length() {
             data: vec![7].into(),
         }],
     };
-    assert!(bad.encode(CodecId::Plain).is_err());
+    assert!(bad.encode().is_err());
 }
 
 #[test]
@@ -962,30 +972,28 @@ fn columnar_encode_rejects_validity_padding_bits() {
             data: vec![7].into(),
         }],
     };
-    assert!(bad.encode(CodecId::Plain).is_err());
+    assert!(bad.encode().is_err());
 }
 
 #[test]
-fn columnar_decode_rejects_bytes_offset_out_of_bounds() {
-    let mut encoded = sample_batch().encode(CodecId::Plain).expect("encode");
-    // The Bytes column's first offset (must be 0) is at byte 41: col1 starts
-    // at 31 (id 2 + type 1 + width 1 + codec 1 + has_validity 1 + len 4 = 10
-    // header bytes), so its data / offset table begins at 41.
-    encoded[41] = 9;
+fn columnar_decode_rejects_a_bit_width_past_64() {
+    let mut encoded = sample_batch().encode().expect("encode");
+    encoded[37] = 65;
     assert!(ColumnBatch::decode(&encoded.clone().into()).is_err());
 }
 
 #[test]
 fn columnar_decode_rejects_trailing_bytes() {
-    let mut encoded = sample_batch().encode(CodecId::Plain).expect("encode");
+    let mut encoded = sample_batch().encode().expect("encode");
     encoded.push(0); // one byte past the last declared column
     assert!(ColumnBatch::decode(&encoded.clone().into()).is_err());
 }
 
-/// A page decode that copied a validity bitmap and only then met a malformed
-/// tail did that copy: it is counted like the read a checksum later refuses.
+/// A page with bytes after its column is refused while it is parsed, before
+/// its validity bitmap or values are copied out: the refusal costs no copy,
+/// and none is counted.
 #[test]
-fn column_page_decode_refused_after_copying_still_counts_the_copy() {
+fn column_page_decode_refused_for_a_tail_copies_nothing() {
     use crate::table::column_page::{PageId, PageStamp};
 
     let batch = sample_batch();
@@ -999,16 +1007,108 @@ fn column_page_decode_refused_after_copying_still_counts_the_copy() {
         row_page: 0,
     };
     let mut page = nullable
-        .encode_page(batch.row_count, CodecId::Plain, stamp)
+        .encode_page(batch.row_count, stamp, ColumnEncoding::Auto)
         .expect("encode page");
     page.push(0); // one byte past the page's column
     let mut copied = 0usize;
-    let decoded = Column::decode_page(&page.into(), batch.row_count, stamp, &mut copied);
-    assert!(decoded.is_err(), "trailing bytes must be refused");
-    assert_eq!(
-        copied, 1,
-        "the first column's one-byte validity bitmap was copied before the refusal",
+    let decoded = Column::decode_page(
+        &page.into(),
+        batch.row_count,
+        stamp,
+        &mut copied,
+        &mut super::DecodeBudget::default(),
     );
+    assert!(
+        matches!(decoded, Err(crate::Error::InvalidHeader(m)) if m.contains("trailing bytes")),
+        "trailing bytes must be refused, got {decoded:?}",
+    );
+    assert_eq!(copied, 0, "the refusal came before any copy");
+}
+
+/// A group whose pages decode to more bytes than any row group a writer cuts
+/// is refused before the column is built: 200 rows of one 64 KiB value
+/// encode as a constant of one value, while their layout is 12.5 MiB, past
+/// twice the 4 MiB a group is cut at beyond the page's own bytes. Without the
+/// bound a small forged page makes a read allocate what its rows decode to.
+/// The bound is the group's, not the page's: three pages of 64 such rows are
+/// each a page a writer could cut, but no writer puts all three in one group,
+/// so the third is refused. One page of 64 rows decodes.
+#[test]
+fn column_page_decoding_past_what_a_writer_cuts_is_refused() {
+    use crate::table::column_page::{PageId, PageStamp};
+
+    let value = vec![7u8; 64 * 1024];
+    let bytes_column = |rows: u32| Column {
+        column_id: 3,
+        type_tag: TypeTag::Bytes,
+        validity: None,
+        data: super::build_bytes_column((0..rows).map(|_| value.as_slice()))
+            .expect("build")
+            .into(),
+    };
+    let stamp = PageStamp {
+        group_tag: 7,
+        id: PageId {
+            column_id: 3,
+            part: 0,
+        },
+        row_page: 0,
+    };
+    let page_of = |rows: u32| -> crate::Slice {
+        let page = bytes_column(rows)
+            .encode_page(rows, stamp, ColumnEncoding::Auto)
+            .expect("encode page");
+        assert!(page.len() < 2 * value.len(), "the rows encode as one value");
+        page.into()
+    };
+
+    let refused = |result: crate::Result<Column>| {
+        matches!(result, Err(crate::Error::DecompressedSizeTooLarge { .. }))
+    };
+
+    let forged = page_of(200);
+    Column::parse_page(&forged, 200, stamp)
+        .expect("a parse builds nothing, so it has nothing to refuse");
+    let mut copied = 0usize;
+    assert!(
+        refused(Column::decode_page(
+            &forged,
+            200,
+            stamp,
+            &mut copied,
+            &mut super::DecodeBudget::default(),
+        )),
+        "a page past the bound must be refused",
+    );
+    assert_eq!(copied, 0, "refused before anything was built");
+
+    // 64 rows reach the 4 MiB a group is cut at, so a writer never puts more
+    // of these rows in one group.
+    let cut = page_of(64);
+    let mut group = super::DecodeBudget::default();
+    for page in 0..2 {
+        let column = Column::decode_page(&cut, 64, stamp, &mut copied, &mut group)
+            .unwrap_or_else(|e| panic!("page {page} of the group: {e:?}"));
+        assert_eq!(column.data.len(), 65 * 4 + 64 * value.len());
+    }
+    assert!(
+        refused(Column::decode_page(
+            &cut,
+            64,
+            stamp,
+            &mut copied,
+            &mut group
+        )),
+        "the third page takes the group past the bound",
+    );
+    Column::decode_page(
+        &cut,
+        64,
+        stamp,
+        &mut copied,
+        &mut super::DecodeBudget::default(),
+    )
+    .expect("the same page in a group of its own");
 }
 
 /// A block whose second row carries a bad value-type tag is refused only after
@@ -1127,17 +1227,15 @@ fn columnar_decode_rejects_huge_column_count() {
 
 #[test]
 fn columnar_decode_rejects_non_boolean_validity_flag() {
-    let mut encoded = sample_batch().encode(CodecId::Plain).expect("encode");
-    // has_validity flag of the first column is at byte 13.
-    encoded[13] = 2;
+    let mut encoded = sample_batch().encode().expect("encode");
+    encoded[12] = 2;
     assert!(ColumnBatch::decode(&encoded.clone().into()).is_err());
 }
 
 #[test]
 fn columnar_decode_rejects_non_zero_bytes_width() {
-    let mut encoded = sample_batch().encode(CodecId::Plain).expect("encode");
-    // The Bytes column's width byte (must be 0) is at byte 34.
-    encoded[34] = 5;
+    let mut encoded = sample_batch().encode().expect("encode");
+    encoded[31] = 5;
     assert!(ColumnBatch::decode(&encoded.clone().into()).is_err());
 }
 
@@ -1157,17 +1255,166 @@ fn column_batch_into_entries_rejects_an_empty_key_row() {
     );
 }
 
+/// Runs the point read over `batch` as one row page, its columns written as
+/// the pages a writer writes and read back as a lookup reads them: the key
+/// search first, then the matcher over the run it found.
+fn match_as_pages(
+    batch: &ColumnBatch,
+    needle: &[u8],
+    deletes: Option<(&crate::table::delete_bitmap::DeleteBitmap, u32)>,
+    copied: &mut usize,
+) -> crate::Result<Vec<InternalValue>> {
+    match_as_pages_within(
+        batch,
+        needle,
+        deletes,
+        copied,
+        &mut super::DecodeBudget::default(),
+    )
+}
+
+/// [`match_as_pages`] charging what the lookup holds decoded to `budget`.
+fn match_as_pages_within(
+    batch: &ColumnBatch,
+    needle: &[u8],
+    deletes: Option<(&crate::table::delete_bitmap::DeleteBitmap, u32)>,
+    copied: &mut usize,
+    budget: &mut super::DecodeBudget,
+) -> crate::Result<Vec<InternalValue>> {
+    use crate::table::column_page::{PageId, PageStamp};
+
+    let stamp = |column_id| PageStamp {
+        group_tag: 1,
+        id: PageId { column_id, part: 0 },
+        row_page: 0,
+    };
+    let pages = batch
+        .columns
+        .iter()
+        .map(|c| {
+            c.encode_page(batch.row_count, stamp(c.column_id), ColumnEncoding::Auto)
+                .map(Slice::from)
+        })
+        .collect::<crate::Result<Vec<_>>>()?;
+    let columns = pages
+        .iter()
+        .zip(&batch.columns)
+        .map(|(page, c)| {
+            budget.parsed(Column::parse_page(
+                page,
+                batch.row_count,
+                stamp(c.column_id),
+            )?)
+        })
+        .collect::<crate::Result<Vec<_>>>()?;
+    let rows = batch.row_count;
+    // The key pages are searched on their own; the matcher reads the rest.
+    let mut columns: Vec<_> = columns;
+    let key = columns.remove(0);
+    let keys = budget.rows(key.values, TypeTag::Bytes, rows)?;
+    let run = super::key_rows(
+        rows,
+        needle,
+        &crate::comparator::default_comparator(),
+        |row| keys.get(TypeTag::Bytes, rows, row),
+    )?;
+    let mut out = Vec::new();
+    // A miss on a page that has rows reads nothing more, as in a lookup.
+    if run.is_empty() && rows > 0 {
+        return Ok(out);
+    }
+    page_match_entries(
+        RowPageColumns {
+            ordinal: 0,
+            start: 0,
+            rows,
+            columns,
+        },
+        run,
+        needle,
+        deletes,
+        copied,
+        budget,
+        &mut out,
+    )?;
+    Ok(out)
+}
+
+/// A lookup holds decoded only what a group a writer cut lets it hold: each
+/// column it prepares for row reads, other than a layout or a constant read
+/// in place, holds up to a row's worth per row, and the group's budget counts
+/// them over every column and page. A forged group of many rows and columns
+/// encoded that way would otherwise make a lookup of one row hold gigabytes.
+/// Here 64 rows of one key under varied values: the seqnos by their ordinals
+/// and the values by their lengths each hold the page's 64 rows, so a budget
+/// of 100 rows refuses the lookup and one of 1000 serves it.
 #[test]
-fn column_batch_match_entries_rejects_an_empty_key_row() {
+fn a_lookup_holds_decoded_no_more_rows_than_its_group_budget() {
+    let entries: Vec<_> = (0..64u32)
+        .map(|i| {
+            entry(
+                b"dup",
+                u64::from(1_000 - i),
+                ValueType::Value,
+                &alloc::vec![b'v'; (i % 7) as usize],
+            )
+        })
+        .collect();
+    let batch = entries_to_column_batch(&entries).expect("batch");
+    let budget = |allowance| super::DecodeBudget {
+        allowance,
+        built: 0,
+        held: 0,
+    };
+    let refused = match_as_pages_within(&batch, b"dup", None, &mut 0, &mut budget(100));
+    assert!(
+        matches!(refused, Err(crate::Error::DecompressedSizeTooLarge { .. })),
+        "a lookup past the budget must be refused, got {refused:?}",
+    );
+    let found = match_as_pages_within(&batch, b"dup", None, &mut 0, &mut budget(1_000))
+        .expect("a lookup within the budget");
+    assert_eq!(found.len(), 64, "every version is found");
+}
+
+#[test]
+fn page_match_entries_finds_every_version_of_a_key_and_nothing_else() {
+    // Three keys, the middle one in two versions: a lookup returns exactly its
+    // versions, newest first, and a key between or past them returns none.
+    let batch = entries_to_column_batch(&[
+        entry(b"a", 9, ValueType::Value, b"va"),
+        entry(b"m", 7, ValueType::Value, b"new"),
+        entry(b"m", 4, ValueType::Tombstone, b""),
+        entry(b"z", 2, ValueType::Value, b"vz"),
+    ])
+    .expect("batch");
+    let found = match_as_pages(&batch, b"m", None, &mut 0).expect("lookup");
+    assert_entries_eq(
+        &found,
+        &[
+            entry(b"m", 7, ValueType::Value, b"new"),
+            entry(b"m", 4, ValueType::Tombstone, b""),
+        ],
+    );
+    for absent in [&b"b"[..], b"zz", b"0"] {
+        assert!(
+            match_as_pages(&batch, absent, None, &mut 0)
+                .expect("lookup")
+                .is_empty(),
+            "no row holds {absent:?}",
+        );
+    }
+}
+
+#[test]
+fn page_match_entries_rejects_an_empty_key_row() {
     // The point-read matcher applies the same non-empty-key invariant as the
     // scan path: a matched empty key in a corrupt block is an error, not a hit.
     let mut batch =
         entries_to_column_batch(&[entry(b"k", 5, ValueType::Value, b"v")]).expect("valid batch");
     let key_col = batch.columns.get_mut(0).expect("key column");
     key_col.data = alloc::vec![0u8; 8].into();
-    let cmp = crate::comparator::default_comparator();
-    let err = column_batch_match_entries(&batch, b"", &cmp, None, &mut 0)
-        .expect_err("matched empty key must be rejected");
+    let err =
+        match_as_pages(&batch, b"", None, &mut 0).expect_err("matched empty key must be rejected");
     assert!(
         matches!(err, crate::Error::InvalidHeader(m) if m.contains("user key is empty")),
         "expected an empty-key InvalidHeader, got {err:?}",
@@ -1175,7 +1422,7 @@ fn column_batch_match_entries_rejects_an_empty_key_row() {
 }
 
 #[test]
-fn column_batch_match_entries_fails_closed_when_a_delete_mask_position_overflows() {
+fn page_match_entries_fails_closed_when_a_delete_mask_position_overflows() {
     // Two rows share a key, so both match the needle. With `block_start_row` at
     // u32::MAX, the second matched row's position (start + 1) overflows u32. A
     // masked point-read lookup must fail closed (error) like the scan path, never
@@ -1186,8 +1433,7 @@ fn column_batch_match_entries_fails_closed_when_a_delete_mask_position_overflows
     ])
     .expect("two-row same-key batch");
     let bitmap = crate::table::delete_bitmap::DeleteBitmap::new();
-    let cmp = crate::comparator::default_comparator();
-    let err = column_batch_match_entries(&batch, b"dup", &cmp, Some((&bitmap, u32::MAX)), &mut 0)
+    let err = match_as_pages(&batch, b"dup", Some((&bitmap, u32::MAX)), &mut 0)
         .expect_err("an overflowing delete-mask position must fail closed");
     assert!(
         matches!(err, crate::Error::InvalidHeader(m) if m.contains("position exceeds u32::MAX")),
@@ -1196,7 +1442,7 @@ fn column_batch_match_entries_fails_closed_when_a_delete_mask_position_overflows
 }
 
 #[test]
-fn column_batch_match_entries_counts_the_rows_it_copied_before_a_later_row_fails() {
+fn page_match_entries_counts_the_rows_it_copied_before_a_later_row_fails() {
     // Two versions of one key; the second carries an invalid value-type byte.
     // The first version's key and value were already copied out of the columns
     // when the second is refused, and those copies must still be reported.
@@ -1209,9 +1455,8 @@ fn column_batch_match_entries_counts_the_rows_it_copied_before_a_later_row_fails
     let mut vt = vt_col.data.to_vec();
     vt[1] = 0xFF;
     vt_col.data = vt.into();
-    let cmp = crate::comparator::default_comparator();
     let mut copied = 0;
-    let err = column_batch_match_entries(&batch, b"dup", &cmp, None, &mut copied)
+    let err = match_as_pages(&batch, b"dup", None, &mut copied)
         .expect_err("the invalid value type must be refused");
     assert!(
         matches!(err, crate::Error::InvalidTag(("ValueType", 0xFF))),
@@ -1225,15 +1470,72 @@ fn column_batch_match_entries_counts_the_rows_it_copied_before_a_later_row_fails
 }
 
 #[test]
-fn column_batch_match_entries_rejects_a_zero_row_block() {
+fn page_match_entries_refuses_a_run_outside_its_page() {
+    // The run comes from the key search over the same page; one that names
+    // rows the page does not have (or none) is an inconsistency to refuse,
+    // never rows to read past the page.
+    use crate::table::column_page::{PageId, PageStamp};
+
+    let batch = entries_to_column_batch(&[
+        entry(b"k", 5, ValueType::Value, b"v0"),
+        entry(b"k", 3, ValueType::Value, b"v1"),
+    ])
+    .expect("batch");
+    let stamp = |column_id| PageStamp {
+        group_tag: 1,
+        id: PageId { column_id, part: 0 },
+        row_page: 0,
+    };
+    let pages = batch
+        .columns
+        .iter()
+        .map(|c| {
+            Slice::from(
+                c.encode_page(2, stamp(c.column_id), ColumnEncoding::Auto)
+                    .expect("page"),
+            )
+        })
+        .collect::<Vec<_>>();
+    for run in [1..3, 2..2, 0..0] {
+        // Every column but the key's, as a lookup's second read takes them.
+        let columns = pages
+            .iter()
+            .zip(&batch.columns)
+            .skip(1)
+            .map(|(page, c)| Column::parse_page(page, 2, stamp(c.column_id)).expect("parse"))
+            .collect();
+        let page = RowPageColumns {
+            ordinal: 0,
+            start: 0,
+            rows: 2,
+            columns,
+        };
+        let err = page_match_entries(
+            page,
+            run.clone(),
+            b"k",
+            None,
+            &mut 0,
+            &mut super::DecodeBudget::default(),
+            &mut Vec::new(),
+        )
+        .expect_err("a run outside the page must be refused");
+        assert!(
+            matches!(err, crate::Error::InvalidHeader(m) if m.contains("key run outside")),
+            "run {run:?}: expected a run InvalidHeader, got {err:?}",
+        );
+    }
+}
+
+#[test]
+fn page_match_entries_rejects_a_zero_row_block() {
     // A zero-row columnar block is malformed (the writer never emits one). The
     // point-read matcher must fail closed on it, not return an empty match that
     // load_columnar_point_block would turn into an absent-key miss, hiding the
     // on-disk corruption.
     let batch = entries_to_column_batch(&[]).expect("zero-row batch");
-    let cmp = crate::comparator::default_comparator();
-    let err = column_batch_match_entries(&batch, b"x", &cmp, None, &mut 0)
-        .expect_err("a zero-row block must fail closed");
+    let err =
+        match_as_pages(&batch, b"x", None, &mut 0).expect_err("a zero-row block must fail closed");
     assert!(
         matches!(err, crate::Error::InvalidHeader(m) if m.contains("empty reconstructed data block")),
         "expected an empty-block InvalidHeader, got {err:?}",

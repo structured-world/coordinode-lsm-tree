@@ -8259,7 +8259,7 @@ fn a_group_of_more_row_pages_than_the_directory_lists_merges_them() -> crate::Re
     let group = first_row_group(&file, checksum)?;
     let table = Table::recover(test_recover_params(file, checksum))?;
     let pages = table.load_row_group(&group, &PageWant::ALL, ReadCharge::Foreground)?;
-    assert_eq!(pages.group_rows, 20_000, "the table is one group");
+    assert_eq!(pages.row_count(), 20_000, "the table is one group");
     assert!(
         u16::try_from(pages.batches.len() * 4).is_ok(),
         "the directory lists every page: {} row pages",
@@ -8627,7 +8627,7 @@ fn a_page_refused_by_its_stamp_is_not_cached() -> crate::Result<()> {
     std::fs::write(&file, &original)?;
     let pages = table.load_row_group(&group, &PageWant::ALL, ReadCharge::Foreground)?;
     assert_eq!(
-        pages.group_rows,
+        directory.row_count(),
         pages.row_count(),
         "with the right bytes back the same read is served whole",
     );
@@ -8855,10 +8855,13 @@ fn a_directory_refused_by_its_pages_is_not_cached() -> crate::Result<()> {
 
     std::fs::write(&file, &original)?;
     let pages = table.load_row_group(&first, &PageWant::ALL, ReadCharge::Foreground)?;
-    assert_eq!(
-        pages.group_rows,
-        pages.row_count(),
-        "with the right bytes back the same read is served whole",
+    assert!(
+        pages.row_count() > 0
+            && (0u16..)
+                .zip(&pages.ordinals)
+                .all(|(expected, &ordinal)| expected == ordinal),
+        "with the right bytes back the same read is served whole: row pages {:?}",
+        pages.ordinals,
     );
     Ok(())
 }
@@ -9412,7 +9415,16 @@ fn a_failed_page_read_fails_only_the_reads_that_need_the_page() -> crate::Result
                 + u64::from(directory_len)
                 + u64::from(directory.pages_start())
                 + u64::from(victim.offset);
-            (group, pages.starts, victim_at)
+            let starts: Vec<u32> = pages
+                .ordinals
+                .iter()
+                .map(|&ordinal| {
+                    directory
+                        .row_page_start(ordinal)
+                        .expect("a row page the read returned")
+                })
+                .collect();
+            (group, starts, victim_at)
         };
         assert!(starts.len() > 4, "{label}: the group has several row pages");
         let Some((&victim_row, &other_row)) = starts.get(2).zip(starts.get(4)) else {
@@ -9504,7 +9516,7 @@ fn a_group_read_caches_its_directory_decoded() -> crate::Result<()> {
     );
     let pages = table.load_row_group(&group, &PageWant::ALL, ReadCharge::Foreground)?;
     assert_eq!(
-        pages.group_rows,
+        pages.row_count(),
         cached.row_count(),
         "a later read uses the cached directory",
     );

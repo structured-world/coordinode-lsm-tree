@@ -150,6 +150,11 @@ impl<'a> Ingestion<'a> {
                 .columnar_page_size_policy
                 .get(INITIAL_CANONICAL_LEVEL),
         )
+        .use_column_encoding(
+            tree.config
+                .column_encoding_policy
+                .get(INITIAL_CANONICAL_LEVEL),
+        )
         .use_data_block_hash_ratio(
             tree.config
                 .data_block_hash_ratio_policy
@@ -342,8 +347,9 @@ impl<'a> Ingestion<'a> {
         Ok(())
     }
 
-    /// Writes a consumer-provided columnar batch (its value sub-columns) as one
-    /// columnar block.
+    /// Writes a consumer-provided columnar batch (its value sub-columns) as
+    /// columnar row groups: small batches of one layout share a group, and a
+    /// batch past the row group size is cut into groups of that size.
     ///
     /// The batch carries the three intrinsic columns ([key, seqno, value-type])
     /// plus one or more value sub-columns. Its keys must be strictly increasing

@@ -58,6 +58,19 @@ impl RowGroupBlocks {
     }
 }
 
+/// One page as [`RowGroupBlocks::page_encodings`] describes it.
+#[cfg(feature = "std")]
+pub struct PageDescription {
+    /// The page's directory entry.
+    pub entry: PageEntry,
+    /// The rows of its row page.
+    pub rows: u32,
+    /// What its values were encoded as.
+    pub expression: crate::table::columnar::Expression,
+    /// For a bytes column, the bytes it spends on where its values start.
+    pub offsets_len: Option<usize>,
+}
+
 /// A page a read wanted: its place in the directory's entries and its block
 /// once fetched.
 pub struct PageSlot {
@@ -289,17 +302,10 @@ impl Wanted<'_> {
 /// row order, each holding the columns the read projected.
 #[derive(Debug)]
 pub struct RowPages {
-    /// Rows in the whole group, the row pages not read included.
-    pub group_rows: u32,
     /// Each row page's ordinal, one per batch.
     pub ordinals: Vec<u16>,
-    /// The group row each row page starts at, one per batch.
-    pub starts: Vec<u32>,
     /// One batch per row page read, in row order.
     pub batches: Vec<crate::table::columnar::ColumnBatch>,
-    /// Whether the read wanted every page of the group: a scan that sees it
-    /// can expect the next group to be wanted whole too.
-    pub every_page: bool,
 }
 
 impl RowPages {
@@ -1139,19 +1145,76 @@ impl RowGroupBlocks {
     /// Adds to `copied` what decoding the pages copied out of them, as each
     /// copy is made.
     pub(crate) fn to_row_pages(&self, copied: &mut usize) -> crate::Result<RowPages> {
-        use crate::table::columnar::{Column, ColumnBatch};
+        use crate::table::columnar::{Column, ColumnBatch, DecodeBudget};
 
+        let outside = || crate::Error::InvalidHeader("columnar: row page outside the group");
+        let mut budget = DecodeBudget::default();
+        let (ordinals, columns) = self.by_row_page(
+            |_| true,
+            |page, rows, stamp| Column::decode_page(page, rows, stamp, copied, &mut budget),
+            |column| column.column_id,
+        )?;
+        let mut batches = Vec::with_capacity(ordinals.len());
+        for (columns, &ordinal) in columns.into_iter().zip(&ordinals) {
+            let row_count = self.directory.row_page_rows(ordinal).ok_or_else(outside)?;
+            batches.push(ColumnBatch { row_count, columns });
+        }
+        Ok(RowPages { ordinals, batches })
+    }
+
+    /// The pages of the columns `want` names among those the read selected,
+    /// parsed but not decoded, one list of columns per row page in row order:
+    /// what a lookup of a few rows reads them through. Each column borrows its
+    /// page; a page of a column not wanted is not read. What the parses hold
+    /// decoded, kept as long as the pages are, is charged to `budget`, the
+    /// group's.
+    ///
+    /// # Errors
+    ///
+    /// As [`Self::to_row_pages`], for everything but the values themselves,
+    /// and [`crate::Error::DecompressedSizeTooLarge`] past `budget`.
+    pub(crate) fn page_columns(
+        &self,
+        want: impl Fn(u16) -> bool,
+        budget: &mut crate::table::columnar::DecodeBudget,
+    ) -> crate::Result<Vec<crate::table::columnar::RowPageColumns<'_>>> {
+        use crate::table::columnar::{Column, RowPageColumns};
+
+        let (ordinals, columns) = self.by_row_page(
+            want,
+            |page, rows, stamp| budget.parsed(Column::parse_page(page, rows, stamp)?),
+            |column| column.column_id,
+        )?;
+        let outside = || crate::Error::InvalidHeader("columnar: row page outside the group");
+        columns
+            .into_iter()
+            .zip(ordinals)
+            .map(|(columns, ordinal)| {
+                Ok(RowPageColumns {
+                    ordinal,
+                    start: self.directory.row_page_start(ordinal).ok_or_else(outside)?,
+                    rows: self.directory.row_page_rows(ordinal).ok_or_else(outside)?,
+                    columns,
+                })
+            })
+            .collect()
+    }
+
+    /// Refuses a group no reading of it can trust: one of no rows, or holding
+    /// an encoding part this build does not decode.
+    fn check_readable(&self) -> crate::Result<()> {
         if self.directory.row_count() == 0 {
             return Err(crate::Error::InvalidHeader("columnar: zero-row data block"));
         }
-        let entries = self.directory.entries();
-        // Every column's encoding names a single part today. A part this
-        // build does not decode is refused rather than skipped: skipping it
-        // would hand back a column assembled from some of its parts. The
-        // directory proved each part's pages one run, so a run's first page
-        // names the part of all of them.
+        // Every column's encoding is one part, 0. A part this build does not
+        // read is refused rather than skipped: skipping it would hand back a
+        // column assembled from some of its parts. The directory proved each
+        // part's pages one run, so a run's first page names the part of all of
+        // them.
         let row_page_count = self.directory.row_pages().len();
-        if entries
+        if self
+            .directory
+            .entries()
             .iter()
             .step_by(row_page_count.max(1))
             .any(|entry| entry.id.part != 0)
@@ -1160,17 +1223,42 @@ impl RowGroupBlocks {
                 "columnar: page holds an encoding part this build does not decode",
             ));
         }
+        Ok(())
+    }
+
+    /// Reads every fetched page of a column `want` names with `read`, filing
+    /// what it returns under its row page: the selected row pages' ordinals
+    /// and, per row page in row order, its columns in write order.
+    /// `column_of` names the column a result holds, which must be the one the
+    /// directory filed its page under.
+    ///
+    /// The checks every reading of a group makes before trusting its pages
+    /// live here, so the decoded and the parsed readings cannot drift apart.
+    fn by_row_page<'s, T>(
+        &'s self,
+        want: impl Fn(u16) -> bool,
+        mut read: impl FnMut(&'s crate::Slice, u32, PageStamp) -> crate::Result<T>,
+        column_of: impl Fn(&T) -> u16,
+    ) -> crate::Result<(Vec<u16>, Vec<Vec<T>>)> {
+        self.check_readable()?;
+        let entries = self.directory.entries();
         let ordinals: Vec<u16> = self.row_pages.iter().collect();
-        // One column list per row page read. The slots are in directory
-        // order, which is column-major, so each row page's columns arrive in
-        // write order.
-        let mut columns: Vec<Vec<Column>> = ordinals.iter().map(|_| Vec::new()).collect();
-        let outside = || crate::Error::InvalidHeader("columnar: row page outside the group");
+        // One column list per row page read, sized for every column the read
+        // fetched. The slots are in directory order, which is column-major,
+        // so each row page's columns arrive in write order.
+        let per_page = self.pages.len() / ordinals.len().max(1);
+        let mut columns: Vec<Vec<T>> = ordinals
+            .iter()
+            .map(|_| Vec::with_capacity(per_page))
+            .collect();
         let unknown_row_page = || {
             crate::Error::InvalidHeader("columnar: page names a row page the group does not have")
         };
         for slot in &self.pages {
             let entry = entries.get(slot.index).ok_or_else(unknown_row_page)?;
+            if !want(entry.id.column_id) {
+                continue;
+            }
             let Some(page) = &slot.block else {
                 return Err(crate::Error::InvalidHeader(
                     "columnar: a wanted page was not read",
@@ -1180,9 +1268,8 @@ impl RowGroupBlocks {
                 .directory
                 .row_page_rows(entry.row_page)
                 .ok_or_else(unknown_row_page)?;
-            let column =
-                Column::decode_page(&page.data, rows, self.directory.stamp_for(entry), copied)?;
-            if column.column_id != entry.id.column_id {
+            let column = read(&page.data, rows, self.directory.stamp_for(entry))?;
+            if column_of(&column) != entry.id.column_id {
                 return Err(crate::Error::InvalidHeader(
                     "columnar: page column disagrees with its directory entry",
                 ));
@@ -1200,21 +1287,56 @@ impl RowGroupBlocks {
                 .ok_or_else(unknown_row_page)?
                 .push(column);
         }
-        let every_page = self.pages.len() == entries.len();
-        let mut starts = Vec::with_capacity(ordinals.len());
-        let mut batches = Vec::with_capacity(ordinals.len());
-        for (columns, &ordinal) in columns.into_iter().zip(&ordinals) {
-            starts.push(self.directory.row_page_start(ordinal).ok_or_else(outside)?);
-            let row_count = self.directory.row_page_rows(ordinal).ok_or_else(outside)?;
-            batches.push(ColumnBatch { row_count, columns });
-        }
-        Ok(RowPages {
-            group_rows: self.directory.row_count(),
-            ordinals,
-            starts,
-            batches,
-            every_page,
-        })
+        Ok((ordinals, columns))
+    }
+
+    /// Each fetched page with the rows it holds, what its values were
+    /// encoded as and, for a bytes column, what it spends on where its values
+    /// start, in the directory's order, without decoding the values.
+    ///
+    /// # Errors
+    ///
+    /// As [`Self::to_row_pages`], for everything but the values themselves.
+    #[cfg(feature = "std")]
+    pub(crate) fn page_encodings(&self) -> crate::Result<Vec<PageDescription>> {
+        self.check_readable()?;
+        let entries = self.directory.entries();
+        let unknown = || {
+            crate::Error::InvalidHeader("columnar: page names a row page the group does not have")
+        };
+        self.pages
+            .iter()
+            .map(|slot| {
+                let entry = *entries.get(slot.index).ok_or_else(unknown)?;
+                let Some(page) = &slot.block else {
+                    return Err(crate::Error::InvalidHeader(
+                        "columnar: a wanted page was not read",
+                    ));
+                };
+                let rows = self
+                    .directory
+                    .row_page_rows(entry.row_page)
+                    .ok_or_else(unknown)?;
+                let column = crate::table::columnar::Column::parse_page(
+                    &page.data,
+                    rows,
+                    self.directory.stamp_for(&entry),
+                )?;
+                // As every read of the group does: a page is described as the
+                // column it holds only if that is the column it is filed under.
+                if column.column_id != entry.id.column_id {
+                    return Err(crate::Error::InvalidHeader(
+                        "columnar: page column disagrees with its directory entry",
+                    ));
+                }
+                Ok(PageDescription {
+                    entry,
+                    rows,
+                    expression: column.values.describe()?,
+                    offsets_len: column.values.offsets_len(column.type_tag, rows),
+                })
+            })
+            .collect()
     }
 }
 

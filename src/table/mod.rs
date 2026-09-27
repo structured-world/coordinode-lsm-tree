@@ -969,6 +969,41 @@ impl Table {
         self.row_pages(&blocks, charge)
     }
 
+    /// Every page of every row group, with what its values were encoded as:
+    /// the per-page choice the writer made, laid out for a diagnosis of it.
+    /// Reads each group whole and decodes no values. A row-major table has
+    /// no pages and returns none.
+    ///
+    /// # Errors
+    ///
+    /// A block's verification error, or a malformed directory or page.
+    #[cfg(all(feature = "columnar", feature = "std"))]
+    #[doc(hidden)]
+    pub fn column_page_encodings(&self) -> crate::Result<Vec<crate::inspect::PageEncoding>> {
+        let mut out = Vec::new();
+        if !self.metadata.columnar {
+            return Ok(out);
+        }
+        for (group, handle) in (0u64..).zip(self.data_block_handles()) {
+            let handle = handle?;
+            let blocks = self
+                .group_read(handle.as_ref(), ReadCharge::Untraced)
+                .load(&crate::table::row_group::PageWant::ALL)?;
+            for page in blocks.page_encodings()? {
+                out.push(crate::inspect::PageEncoding {
+                    group,
+                    column_id: page.entry.id.column_id,
+                    row_page: page.entry.row_page,
+                    rows: page.rows,
+                    stored_len: page.entry.length,
+                    expression: page.expression,
+                    offsets_len: page.offsets_len,
+                });
+            }
+        }
+        Ok(out)
+    }
+
     /// The context a read of the row group `handle` names needs, charged as
     /// `charge` says.
     #[cfg(feature = "columnar")]
@@ -1967,40 +2002,49 @@ impl Table {
                 upper: Some(needle),
             },
         ))?;
-        let keys = self.row_pages(&key_blocks, ReadCharge::Foreground)?;
+        // The key pages as stored: the search reads the keys it compares and
+        // decodes no page whole. What both steps hold decoded is the group's.
+        let mut budget = crate::table::columnar::DecodeBudget::default();
+        let key_pages = key_blocks.page_columns(|_| true, &mut budget)?;
         // The key's versions are one run of rows, sorted with the rest of the
         // group, so they sit on consecutive row pages: the first page whose
         // keys reach it through the page where the run ends. Every page of
         // the run is selected, since each holds the needle.
         let mut hit: Option<core::ops::Range<u16>> = None;
-        for (&ordinal, page) in keys.ordinals.iter().zip(&keys.batches) {
+        // Each hit page's run of the needle's rows, so the second step reads
+        // those rows without searching the keys again.
+        let mut runs: Vec<core::ops::Range<u32>> = Vec::new();
+        for page in key_pages {
+            let (ordinal, row_count) = (page.ordinal, page.rows);
             let Some(key_col) = page
                 .columns
-                .first()
+                .into_iter()
+                .next()
                 .filter(|c| c.column_id == COL_USER_KEY && c.type_tag == TypeTag::Bytes)
             else {
                 return Err(crate::Error::InvalidHeader(
                     "columnar: row group has no user-key column",
                 ));
             };
-            let rows = crate::table::columnar::key_rows(
-                &key_col.data,
-                page.row_count,
-                needle,
-                &self.comparator,
-            )?;
+            let keys = budget.rows(key_col.values, TypeTag::Bytes, row_count)?;
+            let rows =
+                crate::table::columnar::key_rows(row_count, needle, &self.comparator, |row| {
+                    keys.get(TypeTag::Bytes, row_count, row)
+                })?;
             if rows.is_empty() {
                 // Every key of a page before the run is smaller than the
                 // needle, so the search stops at `row_count`; a run that has
                 // started, or a page past the needle, ends the search.
-                if hit.is_some() || rows.start < page.row_count {
+                if hit.is_some() || rows.start < row_count {
                     break;
                 }
                 continue;
             }
             let end = ordinal + 1;
             hit = Some(hit.map_or(ordinal..end, |h| h.start..end));
-            if rows.end < page.row_count {
+            let last = rows.end < row_count;
+            runs.push(rows);
+            if last {
                 break;
             }
         }
@@ -2018,8 +2062,10 @@ impl Table {
                 whole: false,
             },
         )?;
-        let pages = self.row_pages(&blocks, ReadCharge::Foreground)?;
-        let first_row = pages.starts.first().copied().unwrap_or(0);
+        // The key search already placed the needle's rows, whose key is the
+        // needle: the key pages are not read again.
+        let pages = blocks.page_columns(|column_id| column_id != COL_USER_KEY, &mut budget)?;
+        let first_row = pages.first().map_or(0, |page| page.start);
         let deletes = match self
             .delete_block_starts
             .as_ref()
@@ -2037,12 +2083,13 @@ impl Table {
         };
         let mut rows = 0usize;
         let rebuilt = DataBlock::columnar_point_block(
-            &pages.batches,
+            pages,
+            &runs,
             needle,
-            &self.comparator,
             self.metadata.data_block_restart_interval,
             deletes,
             &mut rows,
+            &mut budget,
         );
         // `rows` is the needle's keys and values copied out of the columns
         // when it is present (what decoding the pages copied was charged by
@@ -7715,8 +7762,6 @@ impl Table {
         predicate: Option<&crate::table::columnar_predicate::ColumnRangePredicate>,
         support: &mut crate::table::columnar_predicate::PredicateSupport,
     ) -> crate::Result<Vec<crate::table::columnar::ColumnBatch>> {
-        use crate::table::columnar_predicate::PredicateApply;
-
         if !self.metadata.columnar {
             return Err(crate::Error::FeatureUnsupported("columnar"));
         }
@@ -7809,19 +7854,20 @@ impl Table {
                 },
                 None => crate::table::row_group::RowPageSelect::All,
             };
-            let crate::table::row_group::RowPages {
-                group_rows,
-                ordinals,
-                starts,
-                batches,
-                every_page,
-            } = self.load_columnar_block_projected(
-                &handle,
-                &decode_projection,
-                select(),
-                expect_whole,
+            let blocks = self.group_read(&handle, ReadCharge::Foreground).load(
+                &crate::table::row_group::PageWant {
+                    columns: Some(&decode_projection),
+                    row_pages: select(),
+                    whole: expect_whole,
+                },
             )?;
-            expect_whole = every_page;
+            expect_whole = blocks.pages.len() == blocks.directory.entries().len();
+            let group_rows = blocks.directory.row_count();
+            // The pages parsed, not decoded: the predicate is tested from its
+            // column's encoding, and each page's survivors are then built
+            // straight from theirs.
+            let mut budget = crate::table::columnar::DecodeBudget::default();
+            let pages = blocks.page_columns(|_| true, &mut budget)?;
             // The straddling block's key column, decoded separately (one extra
             // cached read for at most one block per scan) so the main
             // projection stays untouched: it masks the rows below the bound.
@@ -7839,77 +7885,113 @@ impl Table {
                 )),
                 _ => None,
             };
-            for ((batch, &ordinal), &start) in batches.into_iter().zip(&ordinals).zip(&starts) {
-                let row_count = batch.row_count;
-                let page_base = row_base.wrapping_add(start);
-                let bound_mask: Option<Vec<bool>> = match &bound_keys {
-                    Some((bound, keys)) => {
-                        use crate::table::columnar::{COL_USER_KEY, bytes_column_row};
-                        let key_col = keys
-                            .ordinals
-                            .iter()
-                            .position(|&o| o == ordinal)
-                            .and_then(|i| keys.batches.get(i))
-                            .filter(|k| k.row_count == row_count)
-                            .and_then(|k| k.columns.iter().find(|c| c.column_id == COL_USER_KEY))
-                            .ok_or(crate::Error::InvalidHeader(
-                                "columnar_scan: straddling block is missing the key column",
-                            ))?;
-                        let mut mask = Vec::with_capacity(row_count as usize);
-                        for row in 0..row_count {
-                            let key = bytes_column_row(&key_col.data, row_count, row)?;
-                            mask.push(
-                                self.comparator.compare(key, bound.as_ref())
-                                    != core::cmp::Ordering::Less,
-                            );
+            let mut copied = 0usize;
+            // The group's pages read as one result, so the copies made before
+            // a page fails are recorded like those of a group that succeeds.
+            let read_pages = || -> crate::Result<()> {
+                for page in pages {
+                    let (ordinal, row_count) = (page.ordinal, page.rows);
+                    let page_base = row_base.wrapping_add(page.start);
+                    let bound_mask: Option<Vec<bool>> = match &bound_keys {
+                        Some((bound, keys)) => {
+                            use crate::table::columnar::{COL_USER_KEY, bytes_column_row};
+                            let key_col = keys
+                                .ordinals
+                                .iter()
+                                .position(|&o| o == ordinal)
+                                .and_then(|i| keys.batches.get(i))
+                                .filter(|k| k.row_count == row_count)
+                                .and_then(|k| {
+                                    k.columns.iter().find(|c| c.column_id == COL_USER_KEY)
+                                })
+                                .ok_or(crate::Error::InvalidHeader(
+                                    "columnar_scan: straddling block is missing the key column",
+                                ))?;
+                            let mut mask = Vec::with_capacity(row_count as usize);
+                            for row in 0..row_count {
+                                let key = bytes_column_row(&key_col.data, row_count, row)?;
+                                mask.push(
+                                    self.comparator.compare(key, bound.as_ref())
+                                        != core::cmp::Ordering::Less,
+                                );
+                            }
+                            Some(mask)
                         }
-                        Some(mask)
-                    }
-                    None => None,
-                };
-                if let Some(pred) = predicate {
-                    *support = (*support).min(pred.support_in(&batch));
-                }
-                let filter = predicate.filter(|p| p.apply == PredicateApply::Filter);
-                let mut batch = if filter.is_some() || has_deletes || bound_mask.is_some() {
-                    let mut keep = match filter {
-                        Some(pred) => pred.matching_rows(&batch),
-                        None => alloc::vec![true; row_count as usize],
+                        None => None,
                     };
-                    if has_deletes {
-                        let mut pos = page_base;
-                        for k in &mut keep {
-                            if self.delete_bitmap.contains(pos) {
-                                *k = false;
+                    use crate::table::columnar_predicate::{
+                        PredicateApply, PredicateSupport, Selection,
+                    };
+                    // What the predicate keeps, tested from its column's encoding
+                    // without decoding it. A page without the column, or with it
+                    // opaque, is handed out whole for the caller to check.
+                    let mut keep: Option<Selection> = None;
+                    if let Some(pred) = predicate {
+                        let tested = page
+                            .columns
+                            .iter()
+                            .find(|c| c.column_id == pred.column_id)
+                            .and_then(|c| Some((c, pred.bounds(c.type_tag)?)));
+                        match tested {
+                            None => *support = (*support).min(PredicateSupport::Unsupported),
+                            Some(_) if pred.apply == PredicateApply::Prune => {
+                                *support = (*support).min(PredicateSupport::PruneOnly);
                             }
-                            pos = pos.wrapping_add(1);
+                            Some((column, bounds)) => {
+                                *support = (*support).min(PredicateSupport::Exact);
+                                keep = Some(column.select(row_count, &bounds)?);
+                            }
                         }
                     }
-                    if let Some(mask) = &bound_mask {
-                        for (k, live) in keep.iter_mut().zip(mask) {
-                            if !live {
-                                *k = false;
+                    if has_deletes || bound_mask.is_some() {
+                        let kept = keep.get_or_insert_with(|| Selection::all(row_count));
+                        if has_deletes {
+                            for row in 0..row_count {
+                                if self.delete_bitmap.contains(page_base.wrapping_add(row)) {
+                                    kept.remove(row);
+                                }
+                            }
+                        }
+                        if let Some(mask) = &bound_mask {
+                            for (row, &live) in (0u32..).zip(mask) {
+                                if !live {
+                                    kept.remove(row);
+                                }
                             }
                         }
                     }
+                    // Every row kept: the page is handed out as decoded, a view
+                    // of it where a column is stored plain, with no gather.
+                    let keep = keep.filter(|kept| kept.count() < row_count);
                     // A row page none of whose rows survive yields nothing:
-                    // building an empty batch for it would be a gather no
-                    // caller receives.
-                    if !keep.contains(&true) {
+                    // building an empty batch for it would be a gather no caller
+                    // receives.
+                    if keep.as_ref().is_some_and(|kept| kept.count() == 0) {
                         continue;
                     }
-                    let filtered = crate::table::columnar_predicate::filter_batch(&batch, &keep)?;
-                    #[cfg(feature = "metrics")]
-                    self.metrics.record_gather(filtered.data_size());
-                    filtered
-                } else {
-                    batch
-                };
-                if let Some(column_id) = added_predicate_column {
-                    batch.columns.retain(|c| c.column_id != column_id);
+                    let columns = page
+                        .columns
+                        .into_iter()
+                        // A column read only for the predicate is never decoded.
+                        .filter(|c| added_predicate_column != Some(c.column_id))
+                        .map(|c| match &keep {
+                            Some(kept) => c.decode_rows(row_count, kept, &mut copied, &mut budget),
+                            None => c.decode(row_count, &mut copied, &mut budget),
+                        })
+                        .collect::<crate::Result<Vec<_>>>()?;
+                    out.push(crate::table::columnar::ColumnBatch {
+                        row_count: keep.as_ref().map_or(row_count, Selection::count),
+                        columns,
+                    });
                 }
-                out.push(batch);
-            }
+                Ok(())
+            };
+            let read = read_pages();
+            #[cfg(feature = "metrics")]
+            self.metrics.record_gather(copied);
+            #[cfg(not(feature = "metrics"))]
+            let _ = copied;
+            read?;
             // The whole group's rows, the row pages pruned included, so the
             // next group's positions start where this group's end.
             row_base = row_base.wrapping_add(group_rows);

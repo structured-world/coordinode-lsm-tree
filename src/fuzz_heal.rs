@@ -243,7 +243,7 @@ fn build_corpus(dir: &std::path::Path, fs: &Arc<dyn crate::fs::Fs>) -> Vec<Corpu
                 )
                 .unwrap();
             assert!(
-                pages.starts.len() > 1,
+                pages.ordinals.len() > 1,
                 "{}: a group spans several row pages",
                 variant.label,
             );

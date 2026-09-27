@@ -561,30 +561,40 @@ impl DataBlock {
     }
 
     /// Point-read fast path for a columnar row group: reconstructs only the
-    /// rows whose key equals `needle` (skipping `deletes`-masked rows) into a
-    /// tiny row block, or `Ok(None)` when the key is absent / wholly deleted.
-    /// The caller runs the normal seqno-aware [`Self::point_read`] on the
-    /// result. Avoids untransposing and re-encoding the whole group per lookup.
+    /// rows of `needle` (skipping `deletes`-masked rows) into a tiny row
+    /// block, or `Ok(None)` when every one is deleted. The caller runs the
+    /// normal seqno-aware [`Self::point_read`] on the result. Reads those rows
+    /// through the pages as stored: no page is decoded whole, and no row is
+    /// re-encoded but the key's.
     ///
-    /// `pages` are consecutive row pages of the group, and `deletes` carries
-    /// the position of the first one's first row: a key's versions can run
-    /// across a row page boundary, so every page that holds one is matched.
+    /// `pages` are consecutive row pages of the group, `runs` the rows of
+    /// each that the key search found holding `needle`, one per page, and
+    /// `deletes` carries the position of the first page's first row: a key's
+    /// versions can run across a row page boundary.
     ///
     /// Also adds to `gathered` the matching rows' keys and values, which are
-    /// copied out of the columns before the encode copies them again.
+    /// copied out of the columns before the encode copies them again, and
+    /// charges what reading them holds decoded to `budget`, the group's.
     #[cfg(feature = "columnar")]
     pub(crate) fn columnar_point_block(
-        pages: &[crate::table::columnar::ColumnBatch],
+        pages: Vec<crate::table::columnar::RowPageColumns<'_>>,
+        runs: &[core::ops::Range<u32>],
         needle: &[u8],
-        comparator: &crate::comparator::SharedComparator,
         restart_interval: u8,
         deletes: Option<(&crate::table::delete_bitmap::DeleteBitmap, u32)>,
         gathered: &mut usize,
+        budget: &mut crate::table::columnar::DecodeBudget,
     ) -> crate::Result<Option<Self>> {
         let overflow = || crate::Error::InvalidHeader("columnar: row position exceeds u32::MAX");
+        if pages.len() != runs.len() {
+            return Err(crate::Error::InvalidHeader(
+                "columnar: row pages read differ from the pages the key search hit",
+            ));
+        }
         let mut entries = Vec::new();
         let mut offset = 0u32;
-        for batch in pages {
+        for (page, run) in pages.into_iter().zip(runs) {
+            let rows = page.rows;
             let page_deletes = match deletes {
                 Some((bitmap, start)) => {
                     Some((bitmap, start.checked_add(offset).ok_or_else(overflow)?))
@@ -593,14 +603,16 @@ impl DataBlock {
             };
             // The matcher adds each row's copies as it makes them, so rows
             // copied before a later row fails are still counted.
-            entries.extend(crate::table::columnar::column_batch_match_entries(
-                batch,
+            crate::table::columnar::page_match_entries(
+                page,
+                run.clone(),
                 needle,
-                comparator,
                 page_deletes,
                 gathered,
-            )?);
-            offset = offset.checked_add(batch.row_count).ok_or_else(overflow)?;
+                budget,
+                &mut entries,
+            )?;
+            offset = offset.checked_add(rows).ok_or_else(overflow)?;
         }
         if entries.is_empty() {
             return Ok(None);
