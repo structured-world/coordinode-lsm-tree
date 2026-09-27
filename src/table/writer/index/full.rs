@@ -146,8 +146,16 @@ impl<W: crate::io::Write + crate::io::Seek> BlockIndexWriter<W> for FullIndexWri
     }
 
     fn finish_output_bytes(&self) -> u64 {
-        // Written twice: at the head and as the tail mirror.
-        (2 * self.encoded_bytes) as u64
+        if self.block_handles.is_empty() {
+            return 0;
+        }
+        // One block, written twice: at the head and as the tail mirror.
+        2 * crate::table::block::framed_len_bound(
+            self.encoded_bytes as u64,
+            crate::table::block::BlockType::Index,
+            self.encryption.as_deref(),
+            self.ecc,
+        )
     }
 
     fn finish(

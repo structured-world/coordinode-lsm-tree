@@ -336,9 +336,30 @@ impl<W: crate::io::Write + crate::io::Seek> BlockIndexWriter<W> for PartitionedI
     }
 
     fn finish_output_bytes(&self) -> u64 {
-        // The table writes the top-level index twice, at the head and as the
-        // tail mirror.
-        (self.final_write_buffer.len() + self.open_encoded + 2 * self.tli_encoded) as u64
+        use crate::table::block::{BlockType, framed_len_bound};
+        let frame = |payload: usize| {
+            framed_len_bound(
+                payload as u64,
+                BlockType::Index,
+                self.encryption.as_deref(),
+                self.ecc,
+            )
+        };
+        // The cut partitions are framed already. `finish` cuts the open one,
+        // which adds a top-level entry, and the table writes the top-level
+        // index twice, at the head and as the tail mirror.
+        let (open, tli) = match self.data_block_handles.last() {
+            None => (0, self.tli_encoded),
+            // The new top-level entry carries the open partition's last key.
+            Some(last) => (
+                frame(self.open_encoded),
+                self.tli_encoded + last.encoded_len_bound(),
+            ),
+        };
+        if tli == 0 {
+            return self.final_write_buffer.len() as u64;
+        }
+        self.final_write_buffer.len() as u64 + open + 2 * frame(tli)
     }
 
     fn finish(

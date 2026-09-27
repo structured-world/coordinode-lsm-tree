@@ -344,9 +344,30 @@ impl<W: crate::io::Write + crate::io::Seek> FilterWriter<W> for PartitionedFilte
     }
 
     fn finish_output_bytes(&self) -> u64 {
-        // The top-level index is counted at its in-memory size, above what
-        // its encoding takes.
-        (self.final_filter_buffer.len() + self.approx_filter_size + self.tli_bytes) as u64
+        use crate::table::block::{BlockType, framed_len_bound};
+        if self.last_key.is_none() {
+            return 0;
+        }
+        let encryption = self.encryption.as_deref();
+        // The built partitions are framed already; `finish` builds the open
+        // one and the top-level index, counted at its in-memory size, above
+        // what its encoding takes.
+        let (open, tli) = match &self.last_key {
+            Some(last) if !self.bloom_hash_buffer.is_empty() => (
+                framed_len_bound(
+                    self.approx_filter_size as u64,
+                    BlockType::Filter,
+                    encryption,
+                    self.ecc,
+                ),
+                // The open partition adds a top-level entry under its last key.
+                self.tli_bytes + core::mem::size_of::<KeyedBlockHandle>() + last.len(),
+            ),
+            _ => (0, self.tli_bytes),
+        };
+        self.final_filter_buffer.len() as u64
+            + open
+            + framed_len_bound(tli as u64, BlockType::Index, encryption, self.ecc)
     }
 
     fn finish(

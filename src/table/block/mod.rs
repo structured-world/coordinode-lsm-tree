@@ -96,6 +96,25 @@ pub(crate) fn expected_parity_len(data_length: u32, params: EccParams) -> u32 {
     shard_bytes.saturating_mul(parity_shards)
 }
 
+/// Bytes a `block_type` block of `payload` bytes takes on disk, bounded from
+/// above: its header, the encryption overhead and the parity trailer. Used to
+/// estimate a table's size before its blocks are written.
+pub(crate) fn framed_len_bound(
+    payload: u64,
+    block_type: BlockType,
+    encryption: Option<&dyn crate::encryption::EncryptionProvider>,
+    ecc: Option<EccParams>,
+) -> u64 {
+    let data = payload + encryption.map_or(0, |e| u64::from(e.max_overhead()));
+    // A block past `u32::MAX` bytes is refused when it is written, so its
+    // parity never reaches the file; the saturated length only has to keep
+    // the estimate above the target that refusal protects.
+    let parity = ecc.map_or(0, |p| {
+        expected_parity_len(u32::try_from(data).unwrap_or(u32::MAX), p)
+    });
+    Header::header_len(block_type) as u64 + data + u64::from(parity)
+}
+
 /// Refuses an on-disk block size no block written under `encryption` and
 /// `ecc` can have (the largest payload plus its encryption overhead, its
 /// parity and the largest header), so a corrupt size is rejected before a

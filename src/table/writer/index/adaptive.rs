@@ -187,8 +187,16 @@ impl<W: Write + Seek + 'static> BlockIndexWriter<W> for AdaptiveIndexWriter<W> {
     fn finish_output_bytes(&self) -> u64 {
         match &self.spilled {
             Some(partitioned) => partitioned.finish_output_bytes(),
-            // Written twice: at the head and as the tail mirror.
-            None => 2 * self.buffered_encoded,
+            None if self.buffer.is_empty() => 0,
+            // One block, written twice: at the head and as the tail mirror.
+            None => {
+                2 * crate::table::block::framed_len_bound(
+                    self.buffered_encoded,
+                    crate::table::block::BlockType::Index,
+                    self.encryption.as_deref(),
+                    self.ecc,
+                )
+            }
         }
     }
 
