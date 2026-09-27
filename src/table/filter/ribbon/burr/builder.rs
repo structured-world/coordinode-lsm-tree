@@ -43,7 +43,9 @@ pub struct BurrBuilder {
 /// ribbon solve's per-slot rows (`occupied`, two coefficient words, the RHS
 /// and the solution word) at one slot per key. A retrieval build also copies
 /// its hashes and values, pairs them for the split and unzips both halves. The
-/// first layer is the peak: the next ones solve only the keys it bumped.
+/// first layer is the peak: the next ones solve only the keys it bumped. That
+/// holds for distinct hashes, which the filter writers pass: equal hashes land
+/// on one offset and are bumped together through every layer.
 #[must_use]
 pub(crate) const fn build_peak_bytes(n: usize, retrieval: bool) -> usize {
     const WORD: usize = core::mem::size_of::<u64>();
