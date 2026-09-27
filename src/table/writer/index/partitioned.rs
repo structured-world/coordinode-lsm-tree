@@ -159,7 +159,8 @@ impl PartitionedIndexWriter {
 
         self.tli_bytes +=
             core::mem::size_of::<KeyedBlockHandle>() + index_block_handle.end_key().len();
-        self.tli_encoded += index_block_handle.encoded_len_bound();
+        // Its offset is relative until `finish` shifts it into the file.
+        self.tli_encoded += index_block_handle.encoded_len_bound_unplaced();
         self.tli_handles.push(index_block_handle);
         self.final_write_buffer.append(&mut self.block_buffer);
 
@@ -239,6 +240,9 @@ impl PartitionedIndexWriter {
         Ok(bytes)
     }
 }
+
+#[cfg(test)]
+mod tests;
 
 impl<W: crate::io::Write + crate::io::Seek> BlockIndexWriter<W> for PartitionedIndexWriter {
     fn use_encryption(
@@ -353,7 +357,7 @@ impl<W: crate::io::Write + crate::io::Seek> BlockIndexWriter<W> for PartitionedI
             // The new top-level entry carries the open partition's last key.
             Some(last) => (
                 frame(self.open_encoded),
-                self.tli_encoded + last.encoded_len_bound(),
+                self.tli_encoded + last.encoded_len_bound_unplaced(),
             ),
         };
         if tli == 0 {

@@ -125,6 +125,15 @@ impl Container {
         Self::Dense(words)
     }
 
+    /// Bytes [`DeleteBitmap::encode`] writes for this container: its kind and
+    /// its payload.
+    fn encoded_len(&self) -> u64 {
+        match self {
+            Self::Sparse(offs) => 1 + 2 + 2 * offs.len() as u64,
+            Self::Dense(_) => 1 + 8 * WORDS_PER_CHUNK as u64,
+        }
+    }
+
     #[expect(
         clippy::cast_possible_truncation,
         reason = "a chunk holds at most CHUNK_ROWS (2048) distinct offsets, well within u32"
@@ -165,13 +174,37 @@ impl Container {
 pub struct DeleteBitmap {
     /// Non-empty chunks, kept sorted by chunk index for `contains` lookups.
     chunks: Vec<(u32, Container)>,
+    /// Bytes [`Self::encode`] writes for the chunks, kept as they change.
+    chunks_encoded: u64,
+}
+
+/// Bytes a chunk takes in [`DeleteBitmap::encode`]: its index, then its
+/// container.
+fn chunk_encoded_len(container: &Container) -> u64 {
+    4 + container.encoded_len()
 }
 
 impl DeleteBitmap {
     /// Creates an empty delete set (no rows deleted).
     #[must_use]
     pub fn new() -> Self {
-        Self { chunks: Vec::new() }
+        Self::default()
+    }
+
+    /// Bytes [`Self::encode`] returns, in O(1).
+    #[must_use]
+    pub fn encoded_len(&self) -> u64 {
+        4 + self.chunks_encoded
+    }
+
+    /// Heap bytes this set holds, bounded from above in O(1): the chunk
+    /// slots, and at most twice each container's encoding (a sparse
+    /// container's vector holds at most twice its offsets, a dense one
+    /// exactly its words).
+    #[must_use]
+    pub fn heap_len_bound(&self) -> u64 {
+        (self.chunks.capacity() * core::mem::size_of::<(u32, Container)>()) as u64
+            + 2 * self.chunks_encoded
     }
 
     /// Returns `true` if no rows are marked deleted.
@@ -193,10 +226,19 @@ impl DeleteBitmap {
     pub fn insert(&mut self, row: u32) -> bool {
         let (chunk, off) = split(row);
         match self.chunks.binary_search_by_key(&chunk, |(c, _)| *c) {
-            Ok(pos) => self.chunks.get_mut(pos).is_some_and(|(_, c)| c.insert(off)),
+            Ok(pos) => {
+                let Some((_, container)) = self.chunks.get_mut(pos) else {
+                    return false;
+                };
+                let before = container.encoded_len();
+                let added = container.insert(off);
+                self.chunks_encoded = self.chunks_encoded - before + container.encoded_len();
+                added
+            }
             Err(pos) => {
-                self.chunks
-                    .insert(pos, (chunk, Container::Sparse(alloc::vec![off])));
+                let container = Container::Sparse(alloc::vec![off]);
+                self.chunks_encoded += chunk_encoded_len(&container);
+                self.chunks.insert(pos, (chunk, container));
                 true
             }
         }
@@ -228,12 +270,17 @@ impl DeleteBitmap {
             match self.chunks.binary_search_by_key(chunk, |(c, _)| *c) {
                 Ok(pos) => {
                     if let Some((_, dst)) = self.chunks.get_mut(pos) {
+                        let before = dst.encoded_len();
                         container.for_each(|off| {
                             dst.insert(off);
                         });
+                        self.chunks_encoded = self.chunks_encoded - before + dst.encoded_len();
                     }
                 }
-                Err(pos) => self.chunks.insert(pos, (*chunk, container.clone())),
+                Err(pos) => {
+                    self.chunks_encoded += chunk_encoded_len(container);
+                    self.chunks.insert(pos, (*chunk, container.clone()));
+                }
             }
         }
     }
@@ -370,7 +417,11 @@ impl DeleteBitmap {
                 "delete_bitmap: trailing bytes after chunks",
             ));
         }
-        Ok(Self { chunks })
+        let chunks_encoded = chunks.iter().map(|(_, c)| chunk_encoded_len(c)).sum();
+        Ok(Self {
+            chunks,
+            chunks_encoded,
+        })
     }
 }
 

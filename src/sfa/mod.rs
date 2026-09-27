@@ -61,3 +61,16 @@ pub use error::Error;
 pub use reader::Reader;
 pub use toc::{Toc, entry::TocEntry};
 pub use writer::Writer;
+
+/// Bytes the table of contents and the trailer take for an archive whose
+/// sections are named `names`: the magic and the entry count, each entry's
+/// position, length, name length and name, then the fixed trailer.
+pub(crate) const fn toc_and_trailer_len(names: &[&str]) -> usize {
+    let mut len = toc::writer::TOC_MAGIC.len() + 4 + trailer::TRAILER_LEN;
+    let mut rest = names;
+    while let [name, tail @ ..] = rest {
+        len += 8 + 8 + 2 + name.len();
+        rest = tail;
+    }
+    len
+}

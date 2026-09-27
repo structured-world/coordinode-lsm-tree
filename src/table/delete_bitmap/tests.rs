@@ -12,6 +12,36 @@ fn assert_decode_rejects(bytes: &[u8], expected: &str) {
     }
 }
 
+/// The encoded length kept in O(1) matches the encoding through every way the
+/// set changes: a new chunk, a repeated row, a sparse container turning dense,
+/// a union into both an existing and a new chunk, and a decode.
+#[test]
+fn encoded_len_follows_the_encoding() -> Result<()> {
+    let mut dv = DeleteBitmap::new();
+    assert_eq!(dv.encoded_len(), dv.encode().len() as u64);
+    for row in [0, 5, 5, CHUNK_ROWS * 7 + 3] {
+        dv.insert(row);
+        assert_eq!(dv.encoded_len(), dv.encode().len() as u64, "after {row}");
+    }
+    for row in 0..(SPARSE_MAX as u32 + 10) {
+        dv.insert(CHUNK_ROWS + row);
+    }
+    assert_eq!(
+        dv.encoded_len(),
+        dv.encode().len() as u64,
+        "after densifying"
+    );
+    let mut other = DeleteBitmap::new();
+    other.insert(7);
+    other.insert(CHUNK_ROWS * 20);
+    dv.union(&other);
+    assert_eq!(dv.encoded_len(), dv.encode().len() as u64, "after a union");
+    let decoded = DeleteBitmap::decode(&dv.encode())?;
+    assert_eq!(decoded.encoded_len(), dv.encoded_len());
+    assert!(dv.heap_len_bound() >= dv.encoded_len() - 4);
+    Ok(())
+}
+
 #[test]
 fn insert_and_contains_across_chunks() {
     let mut dv = DeleteBitmap::new();
