@@ -900,6 +900,31 @@ fn a_locator_filled_to_its_last_block_id_is_counted() -> crate::Result<()> {
     Ok(())
 }
 
+/// A compaction's lineage lists its inputs and stays in the writer to the end;
+/// the meta block then copies it into the parameters, the encoded ids and the
+/// meta entry, so the held state counts it once held and again encoded.
+#[test]
+fn the_held_state_counts_the_lineage_and_its_meta_encoding() -> crate::Result<()> {
+    const INPUTS: u64 = 100_000;
+    let dir = tempfile::tempdir()?;
+    let mut writer = Writer::new(dir.path().join("1"), 1, 0, Arc::new(StdFs))?
+        .use_lineage(Some((0..INPUTS).collect()));
+    writer.write(InternalValue::from_components(
+        b"key".to_vec(),
+        b"v".to_vec(),
+        0,
+        ValueType::Value,
+    ))?;
+    writer.spill_block()?;
+    let ids = INPUTS * 8;
+    assert!(
+        writer.held_state_bytes() >= 4 * ids,
+        "{} held for a lineage of {ids} bytes",
+        writer.held_state_bytes(),
+    );
+    Ok(())
+}
+
 /// Blocks in flight on the parallel pipeline are counted by the frames they
 /// will be written as, not by their payload: once drained, the bytes they
 /// take on disk stay within what the estimate counted for them.

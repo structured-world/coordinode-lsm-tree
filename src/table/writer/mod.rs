@@ -941,22 +941,35 @@ impl Writer {
         // twice, under the fixed RS(4,2) parity when the table has any, since
         // a reader decodes it before learning the table's scheme. The last key
         // written is the table's last key if it closes now.
+        let mut meta_payload = 0;
+        let mut meta_frame = 0;
         if let (Some(base), Some(first), Some(last)) = (
             self.meta_base_len,
             &self.meta.first_key,
             self.current_key.as_ref().or(self.meta.last_key.as_ref()),
         ) {
-            let payload = base + (first.len() + last.len()) as u64 + 4;
+            meta_payload = base + (first.len() + last.len()) as u64 + 4;
             let ecc = self.ecc.map(|_| crate::table::block::EccParams::RS_4_2);
-            metadata += FIXED_TAIL_LEN
-                + 2 * framed_len_bound(
-                    payload,
-                    BlockType::Meta,
-                    none,
-                    self.encryption.as_deref(),
-                    ecc,
-                );
+            meta_frame = framed_len_bound(
+                meta_payload,
+                BlockType::Meta,
+                none,
+                self.encryption.as_deref(),
+                ecc,
+            );
+            metadata += FIXED_TAIL_LEN + 2 * meta_frame;
         }
+        // A compaction's lineage stays in the writer to the end. Encoding the
+        // meta block clones it into the parameters and again into its encoded
+        // ids, copies those into the meta entries, and encodes the entries into
+        // the block buffer, which it then frames.
+        let lineage_held = self.lineage.as_ref().map_or(0, |ids| {
+            (ids.capacity() * core::mem::size_of::<TableId>()) as u64
+        });
+        let lineage_ids = self.lineage.as_ref().map_or(0, |ids| {
+            (ids.len() * core::mem::size_of::<TableId>()) as u64
+        });
+        let meta_scratch = 2 * lineage_ids + 2 * meta_payload + meta_frame;
         let mut locator_held = 0;
         let mut locator_scratch = 0;
 
@@ -1002,18 +1015,22 @@ impl Writer {
         }
 
         // The sections are written between the filter and the locator; the
-        // buffer they were encoded into stays allocated to the end.
+        // buffer they were encoded into stays allocated to the end. The meta
+        // block is encoded last.
         let index_phase = index_held + index_scratch + filter_held + locator_held + sections_held;
         let filter_phase =
             index_scratch + filter_held + filter_scratch + locator_held + sections_held;
         let section_phase = index_scratch + locator_held + sections_held + 2 * section_scratch;
         let locator_phase =
             index_scratch + locator_held + locator_scratch + sections_held + section_scratch;
+        let meta_phase = index_scratch + sections_held + section_scratch + meta_scratch;
 
-        self.held_state_bytes = index_phase
-            .max(filter_phase)
-            .max(section_phase)
-            .max(locator_phase);
+        self.held_state_bytes = lineage_held
+            + index_phase
+                .max(filter_phase)
+                .max(section_phase)
+                .max(locator_phase)
+                .max(meta_phase);
         self.finish_metadata_bytes = metadata;
 
         let keys = self.meta.key_count as u64;

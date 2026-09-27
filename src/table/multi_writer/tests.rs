@@ -631,6 +631,146 @@ fn a_flush_cuts_each_tombstone_into_the_outputs_it_spans() -> crate::Result<()> 
     Ok(())
 }
 
+/// A flush's tombstones starting past its last key reach no key's rotation
+/// check: they are checked at their starts, so they spread over outputs of
+/// tombstones alone near the target instead of all landing in the last one.
+#[test]
+fn a_flush_splits_its_tombstones_past_the_last_key() -> crate::Result<()> {
+    use crate::{InternalValue, UserKey, fs::StdFs, range_tombstone::RangeTombstone};
+    use std::sync::Arc;
+
+    const TARGET: u64 = 32 * 1_024;
+    const TOMBSTONES: usize = 2_000;
+
+    // Pseudo-random bounds, so no codec shrinks the tombstone block.
+    let bound = |seed: usize, mut key: Vec<u8>| {
+        let mut state = (seed as u64 + 1).wrapping_mul(0x9E37_79B9_7F4A_7C15);
+        while key.len() < 64 {
+            state ^= state << 13;
+            state ^= state >> 7;
+            state ^= state << 17;
+            key.extend_from_slice(&state.to_le_bytes());
+        }
+        key
+    };
+    let folder = tempfile::tempdir()?;
+    let base_path = folder.path().to_path_buf();
+    let fs: Arc<dyn crate::fs::Fs> = Arc::new(StdFs);
+    let mut mw = super::MultiWriter::new(
+        base_path.clone(),
+        SequenceNumberCounter::default(),
+        TARGET,
+        1,
+        fs,
+    )?;
+    let tombstones: Vec<_> = (0..TOMBSTONES)
+        .map(|i| {
+            let prefix = format!("z{i:08}").into_bytes();
+            let mut start = prefix.clone();
+            start.push(0);
+            let mut end = prefix;
+            end.push(1);
+            RangeTombstone::new(
+                UserKey::from(bound(2 * i, start)),
+                UserKey::from(bound(2 * i + 1, end)),
+                5,
+            )
+        })
+        .collect();
+    mw.set_range_tombstones(tombstones.clone());
+    for key in [b"a" as &[u8], b"b", b"c"] {
+        mw.write(InternalValue::from_components(
+            UserKey::from(key),
+            b"v".to_vec(),
+            1,
+            crate::ValueType::Value,
+        ))?;
+    }
+    let tables = recover_outputs(&base_path, &mw.finish()?)?;
+    assert!(tables.len() > 1, "the tombstones must spread over outputs");
+
+    let mut written: Vec<_> = tables
+        .iter()
+        .flat_map(|table| table.range_tombstones().iter())
+        .map(|rt| (rt.start.to_vec(), rt.end.to_vec()))
+        .collect();
+    written.sort();
+    let expected: Vec<_> = tombstones
+        .iter()
+        .map(|rt| (rt.start.to_vec(), rt.end.to_vec()))
+        .collect();
+    assert_eq!(written, expected, "each tombstone written once, whole");
+    // Each output closes at a tombstone start, before its next entry would
+    // pass the target; it then adds the tail, and the sentinel block an
+    // output of tombstones alone writes.
+    for table in &tables {
+        let file_size = std::fs::metadata(base_path.join(table.id().to_string()))?.len();
+        assert!(
+            file_size <= TARGET + 8 * 1_024,
+            "output of {file_size} bytes with {} tombstones overran the {TARGET}-byte target",
+            table.range_tombstones().len(),
+        );
+    }
+    Ok(())
+}
+
+/// Tombstones open at the first key can fill a small target before any record
+/// reaches the writer; the writer still takes that record, so no output holds
+/// tombstones alone, written whole past the clip, over its neighbours' keys.
+#[test]
+fn tombstones_open_at_the_first_key_do_not_rotate_an_empty_output() -> crate::Result<()> {
+    use crate::{InternalValue, UserKey, fs::StdFs, range_tombstone::RangeTombstone};
+    use std::sync::Arc;
+
+    let folder = tempfile::tempdir()?;
+    let base_path = folder.path().to_path_buf();
+    let fs: Arc<dyn crate::fs::Fs> = Arc::new(StdFs);
+    let mut mw = super::MultiWriter::new(
+        base_path.clone(),
+        SequenceNumberCounter::default(),
+        100,
+        1,
+        fs,
+    )?
+    .use_clip_range_tombstones();
+    mw.set_range_tombstones(
+        (0..10u8)
+            .map(|i| {
+                RangeTombstone::new(
+                    UserKey::from(vec![b'a', i]),
+                    UserKey::from(b"z" as &[u8]),
+                    20,
+                )
+            })
+            .collect(),
+    );
+    for key in [b"b" as &[u8], b"l", b"q"] {
+        mw.write(InternalValue::from_components(
+            UserKey::from(key),
+            vec![0u8; 4_000],
+            1,
+            crate::ValueType::Value,
+        ))?;
+    }
+    let tables = recover_outputs(&base_path, &mw.finish()?)?;
+    for table in &tables {
+        assert!(
+            table.metadata.item_count > 0,
+            "an output of tombstones alone: {:?}",
+            table.metadata.key_range,
+        );
+    }
+    for pair in tables.windows(2) {
+        assert!(
+            pair[0].metadata.key_range.max() < pair[1].metadata.key_range.min(),
+            "clipped outputs must not overlap: {:?} then {:?}",
+            pair[0].metadata.key_range,
+            pair[1].metadata.key_range,
+        );
+    }
+    Ok(())
+}
+
 /// A flush output's share of the range tombstones counts toward a full table,
 /// so an output carrying many of them still ends near its target.
 #[test]
