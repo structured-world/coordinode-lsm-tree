@@ -1,5 +1,58 @@
 use super::*;
 
+/// A memtable's first block is small, so an empty or lightly filled memtable
+/// holds kilobytes, not a whole full-size block: an allocation that does not
+/// fit the 64 KiB first block moves to the next one. Before, block 0 was a
+/// full `BLOCK_SIZE`, taken by the skiplist's head node alone, which on a
+/// platform that commits heap allocations up front is that many bytes
+/// committed per memtable.
+#[test]
+fn the_first_block_is_small_and_blocks_double_up_to_the_full_size() {
+    const FIRST: u32 = 64 * 1024;
+    let arena = Arena::new();
+    let head = arena.alloc(64, 4).expect("head");
+    assert_eq!(head >> BLOCK_SHIFT, 0, "the first allocation is in block 0");
+    let past = arena
+        .alloc(FIRST - 32, 1)
+        .expect("an allocation past 64 KiB");
+    assert_eq!(
+        past >> BLOCK_SHIFT,
+        1,
+        "block 0 holds only its 64 KiB, so this moves to block 1"
+    );
+    assert_eq!(block_capacity(0), FIRST);
+    assert_eq!(block_capacity(1), 2 * FIRST);
+    let full = (0..MAX_BLOCKS)
+        .find(|&idx| block_capacity(idx) == BLOCK_SIZE)
+        .expect("capacities reach the full block size");
+    assert!(
+        (0..full).all(|idx| block_capacity(idx + 1) == 2 * block_capacity(idx)),
+        "each block up to the full size doubles the one before it",
+    );
+    assert!(
+        (full..MAX_BLOCKS).all(|idx| block_capacity(idx) == BLOCK_SIZE),
+        "every block past that is full size",
+    );
+}
+
+/// A view into a small block that outlives the arena frees the block with the
+/// size it was allocated at: the view carries that size, and a mismatch would
+/// free the region under the wrong layout.
+#[cfg(not(feature = "bytes_1"))]
+#[test]
+fn a_view_into_a_small_block_outlives_the_arena() {
+    let arena = Arena::new();
+    let off = arena.alloc(40, 4).expect("alloc");
+    // SAFETY: freshly allocated, exclusive access.
+    unsafe {
+        arena.get_bytes_mut(off, 40).copy_from_slice(&[7u8; 40]);
+    }
+    // SAFETY: the span was allocated and fully written above.
+    let view = unsafe { arena.get_view(off, 40) };
+    drop(arena);
+    assert_eq!(&*view, &[7u8; 40][..]);
+}
+
 #[test]
 fn basic_alloc_and_read() {
     let arena = Arena::new();
@@ -27,15 +80,66 @@ fn alloc_respects_alignment() {
     assert!(b > a);
 }
 
+/// The first block that holds a full `BLOCK_SIZE`.
+fn first_full_block() -> u32 {
+    let idx = (0..MAX_BLOCKS)
+        .find(|&idx| block_capacity(idx) == BLOCK_SIZE)
+        .expect("capacities reach the full block size");
+    u32::try_from(idx).expect("a block index fits u32")
+}
+
 #[test]
 fn alloc_crosses_block_boundary() {
     let arena = Arena::new();
+    let full = first_full_block();
+    // Jump to the first full-size block rather than fill every smaller one.
+    arena.cursor.store(full << BLOCK_SHIFT, Ordering::Relaxed);
     let big = BLOCK_SIZE - 64;
     let off1 = arena.alloc(big, 1).expect("ok");
-    assert_eq!(off1 >> BLOCK_SHIFT, 0);
+    assert_eq!(off1 >> BLOCK_SHIFT, full);
 
     let off2 = arena.alloc(128, 4).expect("ok");
-    assert_eq!(off2 >> BLOCK_SHIFT, 1);
+    assert_eq!(off2 >> BLOCK_SHIFT, full + 1);
+}
+
+/// Past the last block the arena is exhausted: an allocation that does not fit
+/// the last block is refused rather than wrapping to an earlier block, and one
+/// that fits still lands in it.
+#[test]
+fn an_allocation_past_the_last_block_is_refused() {
+    let arena = Arena::new();
+    let last = u32::try_from(MAX_BLOCKS - 1).expect("a block index fits u32");
+    arena.cursor.store(last << BLOCK_SHIFT, Ordering::Relaxed);
+    let big = BLOCK_SIZE - 64;
+    let off = arena.alloc(big, 1).expect("fits the last block");
+    assert_eq!(off >> BLOCK_SHIFT, last);
+    assert!(
+        arena.alloc(128, 4).is_none(),
+        "no block follows the last one"
+    );
+    let tail = arena
+        .alloc(8, 4)
+        .expect("the last block still has room for this");
+    assert_eq!(tail >> BLOCK_SHIFT, last);
+}
+
+/// An allocation larger than the small blocks can hold skips past them to the
+/// first block that fits it, and reads back from there.
+#[test]
+fn an_allocation_larger_than_the_small_blocks_lands_in_one_that_fits() {
+    let arena = Arena::new();
+    let big = BLOCK_SIZE - 64;
+    let off = arena.alloc(big, 1).expect("ok");
+    assert_eq!(off >> BLOCK_SHIFT, first_full_block());
+    // SAFETY: freshly allocated, exclusive access.
+    unsafe {
+        let bytes = arena.get_bytes_mut(off, big);
+        bytes[0] = 1;
+        bytes[big as usize - 1] = 2;
+    }
+    // SAFETY: allocated and both bytes read here were written above.
+    let read = unsafe { arena.get_bytes(off, big) };
+    assert_eq!((read[0], read[big as usize - 1]), (1, 2));
 }
 
 #[test]
@@ -100,11 +204,13 @@ fn default_impl() {
 #[test]
 fn drop_with_multiple_blocks() {
     let arena = Arena::new();
-    // Allocate across 2 blocks to exercise Drop on both.
+    // A small first block, then a full-size one, then the one after it:
+    // Drop releases each at the size it was allocated at.
+    let _ = arena.alloc(64, 4).expect("block 0");
     let big = BLOCK_SIZE - 8;
-    let _ = arena.alloc(big, 1).expect("block 0");
-    let _ = arena.alloc(64, 4).expect("block 1");
-    // Drop runs here — deallocates both blocks.
+    let _ = arena.alloc(big, 1).expect("first full block");
+    let _ = arena.alloc(64, 4).expect("the block after it");
+    // Drop runs here — deallocates every block.
 }
 
 /// Regression test for #119: when an allocation fills a block exactly
@@ -120,15 +226,18 @@ fn drop_with_multiple_blocks() {
 fn exact_block_fill_does_not_corrupt() {
     let arena = Arena::new();
 
-    // Jump the cursor directly to block 1, offset 0 — avoids allocating
-    // an entire block 0 (64 MiB on 64-bit) just to advance past it.
-    arena.cursor.store(1 << BLOCK_SHIFT, Ordering::Relaxed);
+    // Jump the cursor directly to the first full-size block, at an index of
+    // at least 1 — the case the bug needs — without allocating every block
+    // before it.
+    let full = first_full_block();
+    assert!(full >= 1);
+    arena.cursor.store(full << BLOCK_SHIFT, Ordering::Relaxed);
 
-    // Allocate (BLOCK_SIZE - 4) bytes to bring block 1's cursor to
+    // Allocate (BLOCK_SIZE - 4) bytes to bring that block's cursor to
     // offset BLOCK_SIZE - 4.
     let filler = BLOCK_SIZE - 4;
     let f = arena.alloc(filler, 1).expect("filler");
-    assert_eq!(f >> BLOCK_SHIFT, 1, "filler should be in block 1");
+    assert_eq!(f >> BLOCK_SHIFT, full, "filler should be in the full block");
 
     // Write a sentinel pattern into the last allocated byte.
     // SAFETY: `f` was just returned by alloc(filler, 1), so
@@ -138,26 +247,26 @@ fn exact_block_fill_does_not_corrupt() {
         bytes[filler as usize - 1] = 0xAB;
     }
 
-    // Now cursor is at BLOCK_SIZE - 4 within block 1.  Allocate exactly
+    // Now cursor is at BLOCK_SIZE - 4 within that block.  Allocate exactly
     // 4 bytes (align=4): new_end = BLOCK_SIZE exactly.  With the fix,
-    // this allocation moves to block 2 (the tail bytes in block 1 are
-    // sacrificed).
+    // this allocation moves to the next block (the tail bytes of this one
+    // are sacrificed).
     let boundary = arena.alloc(4, 4).expect("boundary alloc");
     assert_eq!(
         boundary >> BLOCK_SHIFT,
-        2,
+        full + 1,
         "exact-fill allocation must advance to the next block"
     );
 
-    // A further allocation must also be in block 2 (not wrap to block 1).
+    // A further allocation must also be in the next block (not wrap back).
     let next = arena.alloc(8, 4).expect("next alloc");
     assert_eq!(
         next >> BLOCK_SHIFT,
-        2,
+        full + 1,
         "subsequent allocation must stay in the advanced block"
     );
 
-    // Verify the sentinel byte in block 1 was NOT overwritten.
+    // Verify the sentinel byte in the filled block was NOT overwritten.
     // SAFETY: `f` is the offset returned by alloc(filler, 1) above,
     // guaranteeing [f, f+filler) is allocated and initialised.
     let read_sentinel = unsafe { arena.get_bytes(f, filler) };
