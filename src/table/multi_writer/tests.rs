@@ -413,8 +413,10 @@ fn a_transform_on_the_rotation_boundary_belongs_to_the_new_output() -> crate::Re
     let fs: Arc<dyn crate::fs::Fs> = Arc::new(StdFs);
     let marker = Arc::new(portable_atomic::AtomicU64::new(0));
 
-    // Tiny target_size: rotation fires on the key AFTER the 4 KiB fillers.
-    let mut mw = super::MultiWriter::new(base_path.clone(), id_gen, 100, 1, fs)?
+    // A target the two 4 KiB fillers pass once their block is written, and a
+    // single key's filter and index do not: rotation fires on the key AFTER
+    // the fillers.
+    let mut mw = super::MultiWriter::new(base_path.clone(), id_gen, 5_000, 1, fs)?
         .use_lineage(Some(vec![7, 8]))
         .use_transform_marker(Arc::clone(&marker));
 
