@@ -18,6 +18,8 @@ use alloc::sync::Arc;
 #[cfg(not(feature = "std"))]
 use alloc::{boxed::Box, vec::Vec};
 
+use super::handles_held;
+
 pub trait BlockIndexWriter<W: crate::io::Write + crate::io::Seek> {
     /// Registers a data block in the block index.
     fn register_data_block(&mut self, block_handle: KeyedBlockHandle) -> crate::Result<()>;
@@ -95,3 +97,6 @@ pub trait BlockIndexWriter<W: crate::io::Write + crate::io::Seek> {
 // FilterWriter mirrors the use_page_ecc pattern via its own trait
 // method declared in `super::filter` — see
 // `super::filter::FilterWriter::use_page_ecc`.
+
+#[cfg(test)]
+mod tests;

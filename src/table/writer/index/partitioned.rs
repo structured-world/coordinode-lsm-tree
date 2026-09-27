@@ -313,8 +313,16 @@ impl<W: crate::io::Write + crate::io::Seek> BlockIndexWriter<W> for PartitionedI
         // The cut partitions stay buffered until `finish` writes them.
         (self.final_write_buffer.capacity()
             + self.block_buffer.capacity()
-            + self.buffer_size as usize
-            + self.tli_bytes) as u64
+            + super::handles_held(
+                self.buffer_size as usize,
+                &self.data_block_handles,
+                self.data_block_handles.capacity(),
+            )
+            + super::handles_held(
+                self.tli_bytes,
+                &self.tli_handles,
+                self.tli_handles.capacity(),
+            )) as u64
     }
 
     fn finish_scratch_bytes(&self) -> u64 {

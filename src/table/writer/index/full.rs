@@ -132,7 +132,11 @@ impl<W: crate::io::Write + crate::io::Seek> BlockIndexWriter<W> for FullIndexWri
     }
 
     fn held_bytes(&self) -> u64 {
-        self.handle_bytes as u64
+        super::handles_held(
+            self.handle_bytes,
+            &self.block_handles,
+            self.block_handles.capacity(),
+        ) as u64
     }
 
     fn finish_scratch_bytes(&self) -> u64 {

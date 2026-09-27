@@ -164,7 +164,14 @@ impl<W: Write + Seek + 'static> BlockIndexWriter<W> for AdaptiveIndexWriter<W> {
     fn held_bytes(&self) -> u64 {
         match &self.spilled {
             Some(partitioned) => partitioned.held_bytes(),
-            None => self.buffered_bytes,
+            // The buffer's size counts bytes held in memory, so it fits in
+            // `usize`.
+            #[expect(clippy::cast_possible_truncation, reason = "bytes held in memory")]
+            None => super::handles_held(
+                self.buffered_bytes as usize,
+                &self.buffer,
+                self.buffer.capacity(),
+            ) as u64,
         }
     }
 
