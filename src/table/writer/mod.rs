@@ -936,11 +936,12 @@ impl Writer {
         // besides its base, each with a length varint that grows from one byte
         // to at most three (keys are at most `u16::MAX` bytes). It is written
         // twice, under the fixed RS(4,2) parity when the table has any, since
-        // a reader decodes it before learning the table's scheme.
+        // a reader decodes it before learning the table's scheme. The last key
+        // written is the table's last key if it closes now.
         if let (Some(base), Some(first), Some(last)) = (
             self.meta_base_len,
             &self.meta.first_key,
-            &self.meta.last_key,
+            self.current_key.as_ref().or(self.meta.last_key.as_ref()),
         ) {
             let payload = base + (first.len() + last.len()) as u64 + 4;
             let ecc = self.ecc.map(|_| crate::table::block::EccParams::RS_4_2);
@@ -1703,6 +1704,15 @@ impl Writer {
             self.meta.key_count += 1;
             self.current_key = Some(user_key.clone());
 
+            // The tail is sized from the first key on, so a table that closes
+            // before its first block is written still counts it.
+            if self.meta.first_key.is_none() {
+                self.meta.first_key = Some(user_key.clone());
+                if self.meta_base_len.is_none() {
+                    self.meta_base_len = Some(self.meta_payload_len_without_keys()?);
+                }
+            }
+
             // IMPORTANT: Do not buffer *every* item's key
             // because there may be multiple versions
             // of the same key
@@ -1738,10 +1748,6 @@ impl Writer {
             if self.meta.key_count as u64 >= self.next_refresh_keys {
                 self.refresh_state_estimates();
             }
-        }
-
-        if self.meta.first_key.is_none() {
-            self.meta.first_key = Some(user_key.clone());
         }
 
         // Only a weak tombstone's key is retained (for the reclaimable check

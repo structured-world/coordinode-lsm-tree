@@ -1039,6 +1039,57 @@ fn range_tombstone_multi_table_flush_keeps_newer_values_reachable() -> lsm_tree:
     Ok(())
 }
 
+/// A rotated flush cuts a range tombstone into the zones of its outputs, the
+/// first reaching below the memtable's keys and the last above them: keys of
+/// an older table on both sides and between the outputs stay deleted, also
+/// after the tree reopens.
+#[test]
+#[ignore = "heavy: allocates ~68 MiB to force MultiWriter rotation; run with `cargo nextest run --run-ignored only`"]
+fn range_tombstone_cut_by_a_rotated_flush_covers_older_keys() -> lsm_tree::Result<()> {
+    use lsm_tree::CompressionType;
+    use lsm_tree::config::CompressionPolicy;
+
+    let folder = get_tmp_folder();
+    let open = || {
+        Config::new(
+            folder.path(),
+            SequenceNumberCounter::default(),
+            SequenceNumberCounter::default(),
+        )
+        .data_block_compression_policy(CompressionPolicy::all(CompressionType::None))
+        .open()
+    };
+    let tree = open()?;
+    let older = ["a", "bz", "d", "zz"];
+    for (seqno, key) in (1..).zip(older) {
+        tree.insert(key, "older", seqno);
+    }
+    tree.flush_active_memtable(0)?;
+    let tables_before = tree.table_count();
+
+    // Four 17 MiB values pass the 64 MiB flush target, so the flush rotates
+    // before "c5".
+    let large_value = "a".repeat(17 * 1_024 * 1_024);
+    for (seqno, key) in (5..).zip(["b0", "b1", "c0", "c1"]) {
+        tree.insert(key, &large_value, seqno);
+    }
+    tree.remove_range("a", "zzz", 10);
+    tree.insert("c5", "newer", 20);
+    tree.flush_active_memtable(0)?;
+    assert!(
+        tree.table_count() > tables_before + 1,
+        "test requires a rotated flush"
+    );
+    drop(tree);
+
+    let tree = open()?;
+    for key in older {
+        assert_eq!(None, tree.get(key, 21)?, "{key} must stay deleted");
+    }
+    assert_eq!(vec![b"c5".to_vec()], collect_keys(&tree, 21)?);
+    Ok(())
+}
+
 #[test]
 fn range_tombstone_suppresses_bulk_ingested_values() -> lsm_tree::Result<()> {
     let folder = get_tmp_folder();

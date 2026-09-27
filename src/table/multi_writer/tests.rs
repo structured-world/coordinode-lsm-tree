@@ -414,9 +414,9 @@ fn a_transform_on_the_rotation_boundary_belongs_to_the_new_output() -> crate::Re
     let marker = Arc::new(portable_atomic::AtomicU64::new(0));
 
     // A target the two 4 KiB fillers pass once their block is written, and a
-    // single key's filter and index do not: rotation fires on the key AFTER
-    // the fillers.
-    let mut mw = super::MultiWriter::new(base_path.clone(), id_gen, 5_000, 1, fs)?
+    // single key with the tail every table writes does not: rotation fires on
+    // the key AFTER the fillers.
+    let mut mw = super::MultiWriter::new(base_path.clone(), id_gen, 12_000, 1, fs)?
         .use_lineage(Some(vec![7, 8]))
         .use_transform_marker(Arc::clone(&marker));
 
@@ -533,5 +533,178 @@ fn multi_writer_rotates_under_a_non_lexicographic_comparator() -> crate::Result<
         3,
         "each new key exceeds the 100-byte target, so every key after the first opens a new output"
     );
+    Ok(())
+}
+
+fn recover_outputs(
+    base_path: &std::path::Path,
+    results: &[(crate::TableId, crate::Checksum)],
+) -> crate::Result<Vec<crate::Table>> {
+    use crate::fs::StdFs;
+    use std::sync::Arc;
+
+    let cache = Arc::new(crate::Cache::with_capacity_bytes(64 * 1_024));
+    let comparator: crate::SharedComparator = Arc::new(crate::DefaultUserComparator);
+    results
+        .iter()
+        .map(|(table_id, checksum)| {
+            crate::Table::recover(crate::table::RecoverParams::new(
+                base_path.join(table_id.to_string()),
+                *checksum,
+                *table_id,
+                Arc::new(StdFs),
+                comparator.clone(),
+                cache.clone(),
+            ))
+        })
+        .collect()
+}
+
+/// A flush cuts each range tombstone into the zones of the outputs it spans
+/// instead of copying the whole set into every output: the pieces of one
+/// tombstone chain up to exactly its range, the first output reaches below
+/// the memtable's first key and the last one above its last key.
+#[test]
+fn a_flush_cuts_each_tombstone_into_the_outputs_it_spans() -> crate::Result<()> {
+    use crate::{InternalValue, UserKey, fs::StdFs, range_tombstone::RangeTombstone};
+    use std::sync::Arc;
+
+    let folder = tempfile::tempdir()?;
+    let base_path = folder.path().to_path_buf();
+    let fs: Arc<dyn crate::fs::Fs> = Arc::new(StdFs);
+    let mut mw = super::MultiWriter::new(
+        base_path.clone(),
+        SequenceNumberCounter::default(),
+        100,
+        1,
+        fs,
+    )?;
+    let tombstones = [
+        (b"a" as &[u8], b"c" as &[u8], 20),
+        (b"k", b"r", 21),
+        (b"w", b"zz", 22),
+    ];
+    mw.set_range_tombstones(
+        tombstones
+            .iter()
+            .map(|&(start, end, seqno)| {
+                RangeTombstone::new(UserKey::from(start), UserKey::from(end), seqno)
+            })
+            .collect(),
+    );
+    // Each key passes the 100-byte target, so the outputs' zones are
+    // (.., l), [l, q), [q, x), [x, ..).
+    for key in [b"b" as &[u8], b"l", b"q", b"x"] {
+        mw.write(InternalValue::from_components(
+            UserKey::from(key),
+            vec![0u8; 4_000],
+            1,
+            crate::ValueType::Value,
+        ))?;
+    }
+    let tables = recover_outputs(&base_path, &mw.finish()?)?;
+    assert_eq!(tables.len(), 4);
+
+    let mut pieces: Vec<(SeqNo, Vec<u8>, Vec<u8>)> = tables
+        .iter()
+        .flat_map(|table| table.range_tombstones().iter())
+        .map(|rt| (rt.seqno, rt.start.to_vec(), rt.end.to_vec()))
+        .collect();
+    pieces.sort();
+    assert_eq!(pieces.len(), 6, "1 + 3 + 2 zones spanned: {pieces:?}");
+    for &(start, end, seqno) in &tombstones {
+        let own: Vec<_> = pieces.iter().filter(|p| p.0 == seqno).collect();
+        assert_eq!(own.first().map(|p| p.1.as_slice()), Some(start));
+        assert_eq!(own.last().map(|p| p.2.as_slice()), Some(end));
+        for pair in own.windows(2) {
+            assert_eq!(
+                pair[0].2, pair[1].1,
+                "pieces of @{seqno} must chain: {own:?}"
+            );
+        }
+    }
+    assert_eq!(tables[0].metadata.key_range.min().as_ref(), b"a");
+    assert_eq!(tables[3].metadata.key_range.max().as_ref(), b"zz");
+    Ok(())
+}
+
+/// A flush output's share of the range tombstones counts toward a full table,
+/// so an output carrying many of them still ends near its target.
+#[test]
+fn a_flush_output_counts_its_tombstones_toward_a_full_table() -> crate::Result<()> {
+    use crate::{InternalValue, UserKey, fs::StdFs, range_tombstone::RangeTombstone};
+    use std::sync::Arc;
+
+    const TARGET: u64 = 32 * 1_024;
+    const KEYS: usize = 2_000;
+
+    let key = |i: usize| format!("{i:08}").into_bytes();
+    // Tombstone bounds take pseudo-random tails, so no codec shrinks the
+    // tombstone block below the entries it holds.
+    let tail = |seed: usize, mut key: Vec<u8>, len: usize| {
+        let mut state = (seed as u64 + 1).wrapping_mul(0x9E37_79B9_7F4A_7C15);
+        while key.len() < len {
+            state ^= state << 13;
+            state ^= state >> 7;
+            state ^= state << 17;
+            key.extend_from_slice(&state.to_le_bytes());
+        }
+        key
+    };
+    let folder = tempfile::tempdir()?;
+    let base_path = folder.path().to_path_buf();
+    let fs: Arc<dyn crate::fs::Fs> = Arc::new(StdFs);
+    let mut mw = super::MultiWriter::new(
+        base_path.clone(),
+        SequenceNumberCounter::default(),
+        TARGET,
+        1,
+        fs,
+    )?;
+    // One tombstone in the gap after each key: about 140 bytes of block entry
+    // against a few dozen bytes of data.
+    mw.set_range_tombstones(
+        (0..KEYS)
+            .map(|i| {
+                let mut start = key(i);
+                start.push(0);
+                let mut end = key(i);
+                end.push(1);
+                RangeTombstone::new(
+                    UserKey::from(tail(2 * i, start, 64)),
+                    UserKey::from(tail(2 * i + 1, end, 64)),
+                    5,
+                )
+            })
+            .collect(),
+    );
+    for i in 0..KEYS {
+        mw.write(InternalValue::from_components(
+            UserKey::from(key(i)),
+            vec![0u8; 8],
+            1,
+            crate::ValueType::Value,
+        ))?;
+    }
+    let tables = recover_outputs(&base_path, &mw.finish()?)?;
+
+    let tombstones: usize = tables.iter().map(|t| t.range_tombstones().len()).sum();
+    assert_eq!(tombstones, KEYS, "each tombstone lies in one zone");
+    // The forming data block is outside the estimate, and the filter and index
+    // are re-estimated every 256 keys, so an output may pass its target by
+    // that block and those keys' entries (4 KiB covers 16 bytes a key). Each
+    // output here closes on its first block, whose size is the table's data
+    // size.
+    for table in &tables {
+        assert_eq!(table.metadata.data_block_count, 1);
+        let file_size = std::fs::metadata(base_path.join(table.id().to_string()))?.len();
+        assert!(
+            file_size <= TARGET + table.metadata.file_size + 4_096,
+            "output of {file_size} bytes with {} tombstones and {} data bytes \
+             overran the {TARGET}-byte target",
+            table.range_tombstones().len(),
+            table.metadata.file_size,
+        );
+    }
     Ok(())
 }

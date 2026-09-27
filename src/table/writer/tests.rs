@@ -738,6 +738,27 @@ fn the_size_hint_counts_the_tail_every_table_writes() -> crate::Result<()> {
     Ok(())
 }
 
+/// A table may close before its first block is cut, when what the multi-writer
+/// adds at rotation fills it: the tail is counted from the first key on.
+#[test]
+fn the_size_hint_counts_the_tail_before_a_block_is_cut() -> crate::Result<()> {
+    let dir = tempfile::tempdir()?;
+    let mut writer = Writer::new(dir.path().join("1"), 1, 0, Arc::new(StdFs))?;
+    writer.write(InternalValue::from_components(
+        b"key".to_vec(),
+        b"v".to_vec(),
+        0,
+        ValueType::Value,
+    ))?;
+    assert_eq!(writer.meta.data_block_count, 0);
+    assert!(
+        writer.output_size_hint() > FIXED_TAIL_LEN,
+        "hint {} before the first block",
+        writer.output_size_hint(),
+    );
+    Ok(())
+}
+
 /// A large block gathers filter and locator state for many keys before it is
 /// cut; the estimates count that state within the block, not only once the
 /// block is written.
