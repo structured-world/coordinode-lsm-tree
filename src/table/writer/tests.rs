@@ -724,6 +724,36 @@ fn a_locator_filled_to_its_last_block_id_is_counted() -> crate::Result<()> {
     Ok(())
 }
 
+/// Only a key's newest version gets a locator entry, so blocks holding older
+/// versions alone add no block id. Explicit widths that fit every recorded id
+/// keep the locator however many such blocks follow.
+#[test]
+fn blocks_of_older_versions_do_not_outgrow_the_locator() -> crate::Result<()> {
+    let dir = tempfile::tempdir()?;
+    let mut writer = Writer::new(dir.path().join("1"), 1, 0, Arc::new(StdFs))?.use_locator(
+        crate::config::LocatorPolicyEntry::Enabled {
+            precision: crate::config::LocatorPrecision::Block,
+            block_id_bits: Some(1),
+            slot_bits: None,
+        },
+    );
+    // One key, its versions spread over four blocks.
+    for block in 0..4_u64 {
+        for version in 0..10 {
+            writer.write(InternalValue::from_components(
+                b"key".to_vec(),
+                b"value---".to_vec(),
+                100 - (block * 10 + version),
+                ValueType::Value,
+            ))?;
+        }
+        writer.spill_block()?;
+    }
+    assert_eq!(writer.meta.data_block_count, 4);
+    assert_eq!(writer.locators.len(), 1, "the locator was dropped");
+    Ok(())
+}
+
 /// Explicit locator widths too narrow for the table skip its section at
 /// `finish`. The widths only grow with the table, so once they no longer fit
 /// the writer holds nothing for the locator and charges nothing for it.

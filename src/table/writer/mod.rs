@@ -669,31 +669,24 @@ impl Writer {
     /// the next locator ordinal. Called where a block is cut, which on the
     /// parallel path is before the block is written and registered.
     fn locator_block_done(&mut self) {
-        if let Some(spec) = self.locator {
-            // Positions only grow within a block, so the block's last key
-            // carries its largest slot.
-            if let Some(&(_, _, slot)) = self.locators.last() {
-                self.locator_max_slot = self.locator_max_slot.max(slot);
-            }
-            // Widths the table has outgrown stay outgrown: the section would
-            // be skipped at `finish`, so stop collecting for it now.
-            if crate::table::locator::section_widths(
-                spec,
-                self.locator_block_id,
-                self.locator_max_slot,
-            )
-            .is_none()
-            {
-                log::debug!(
-                    "locator section dropped at block {}: explicit widths too narrow",
-                    self.locator_block_id,
-                );
-                self.locator = None;
-                self.locators = Vec::new();
-                self.refresh_state_estimates();
-            } else {
-                self.locator_block_id += 1;
-            }
+        let Some(spec) = self.locator else {
+            return;
+        };
+        self.locator_block_id += 1;
+        // Positions only grow within a block and block ids across blocks, so
+        // the last triple carries the largest block id recorded and its
+        // block's largest slot. A block of older versions alone records none.
+        let Some(&(_, max_block, slot)) = self.locators.last() else {
+            return;
+        };
+        self.locator_max_slot = self.locator_max_slot.max(slot);
+        // Widths the table has outgrown stay outgrown: the section would be
+        // skipped at `finish`, so stop collecting for it now.
+        if crate::table::locator::section_widths(spec, max_block, self.locator_max_slot).is_none() {
+            log::debug!("locator section dropped at block {max_block}: explicit widths too narrow");
+            self.locator = None;
+            self.locators = Vec::new();
+            self.refresh_state_estimates();
         }
     }
 
