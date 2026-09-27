@@ -2003,12 +2003,15 @@ impl Table {
         ))?;
         // The key pages as stored: the search reads the keys it compares and
         // decodes no page whole.
-        let key_pages = key_blocks.page_columns()?;
+        let key_pages = key_blocks.page_columns(|_| true)?;
         // The key's versions are one run of rows, sorted with the rest of the
         // group, so they sit on consecutive row pages: the first page whose
         // keys reach it through the page where the run ends. Every page of
         // the run is selected, since each holds the needle.
         let mut hit: Option<core::ops::Range<u16>> = None;
+        // Each hit page's run of the needle's rows, so the second step reads
+        // those rows without searching the keys again.
+        let mut runs: Vec<core::ops::Range<u32>> = Vec::new();
         for page in key_pages {
             let (ordinal, row_count) = (page.ordinal, page.rows);
             let Some(key_col) = page
@@ -2037,7 +2040,9 @@ impl Table {
             }
             let end = ordinal + 1;
             hit = Some(hit.map_or(ordinal..end, |h| h.start..end));
-            if rows.end < row_count {
+            let last = rows.end < row_count;
+            runs.push(rows);
+            if last {
                 break;
             }
         }
@@ -2055,7 +2060,9 @@ impl Table {
                 whole: false,
             },
         )?;
-        let pages = blocks.page_columns()?;
+        // The key search already placed the needle's rows, whose key is the
+        // needle: the key pages are not read again.
+        let pages = blocks.page_columns(|column_id| column_id != COL_USER_KEY)?;
         let first_row = pages.first().map_or(0, |page| page.start);
         let deletes = match self
             .delete_block_starts
@@ -2075,8 +2082,8 @@ impl Table {
         let mut rows = 0usize;
         let rebuilt = DataBlock::columnar_point_block(
             pages,
+            &runs,
             needle,
-            &self.comparator,
             self.metadata.data_block_restart_interval,
             deletes,
             &mut rows,
@@ -7856,7 +7863,7 @@ impl Table {
             // The pages parsed, not decoded: the predicate is tested from its
             // column's encoding, and each page's survivors are then built
             // straight from theirs.
-            let pages = blocks.page_columns()?;
+            let pages = blocks.page_columns(|_| true)?;
             // The straddling block's key column, decoded separately (one extra
             // cached read for at most one block per scan) so the main
             // projection stays untouched: it masks the rows below the bound.

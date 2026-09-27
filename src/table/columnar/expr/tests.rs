@@ -71,6 +71,7 @@ fn assert_every_candidate_round_trips(type_tag: TypeTag, rows: u32, data: &[u8])
             "{} serves a row past the column",
             trial.expression
         );
+        assert_select_and_gather(type_tag, rows, data, &trial.bytes, &trial.expression);
     }
     let Choice { bytes, .. } = choose(type_tag, rows, data).expect("choose");
     let candidates = candidates(type_tag, rows, data).expect("candidates");
@@ -87,6 +88,60 @@ fn assert_every_candidate_round_trips(type_tag: TypeTag, rows: u32, data: &[u8])
         Some(bytes.len()),
         "the chosen encoding is the cheapest candidate",
     );
+}
+
+/// A predicate answered from the encoding keeps exactly the rows whose layout
+/// value it keeps, and the rows a selection names are built as the layout
+/// holds them.
+fn assert_select_and_gather(
+    type_tag: TypeTag,
+    rows: u32,
+    data: &[u8],
+    encoded: &[u8],
+    expression: &Expression,
+) {
+    let layout = |row| super::cell(type_tag, data, rows, row).expect("layout row");
+    let values = || Values::parse(type_tag, rows, encoded).expect("parse");
+    // Bounds from the first and last rows' values: some rows in, some out.
+    let (first, last) = (layout(0), layout(rows - 1));
+    let (lo, hi) = if first <= last {
+        (first, last)
+    } else {
+        (last, first)
+    };
+    let bounds = match type_tag {
+        TypeTag::Number(number) => super::Bounds::Ordinals {
+            number,
+            lo: number.ordinal(lo),
+            hi: number.ordinal(hi),
+        },
+        _ => super::Bounds::Bytes {
+            lower: Some(lo),
+            upper: Some(hi),
+        },
+    };
+    let kept = values().select(type_tag, rows, &bounds).expect("select");
+    for row in 0..rows {
+        assert_eq!(
+            kept.contains(row),
+            bounds.keeps(layout(row)),
+            "{expression} selects row {row} unlike its value",
+        );
+    }
+    // Every other row, gathered from the encoding and from the layout.
+    let mut every_other = crate::table::columnar_predicate::Selection::none(rows);
+    for row in (0..rows).step_by(2) {
+        every_other.insert(row);
+    }
+    let built = values()
+        .materialize_rows(type_tag, rows, &every_other)
+        .expect("materialize rows");
+    let picked: Vec<&[u8]> = every_other.rows().map(layout).collect();
+    let want = match type_tag.fixed_width() {
+        Some(_) => picked.concat(),
+        None => bytes_layout(&picked),
+    };
+    assert_eq!(&*built, &want[..], "{expression} builds other rows");
 }
 
 /// What a read describes a stored expression as: a run's ends are decoded on

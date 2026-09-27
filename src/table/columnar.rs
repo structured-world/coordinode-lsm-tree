@@ -2209,29 +2209,32 @@ pub(crate) struct RowPageColumns<'a> {
     pub(crate) columns: Vec<PageColumn<'a>>,
 }
 
-/// The rows of `page` whose key equals `needle`, as entries, reading those
-/// rows and the ones the key search visits and decoding nothing else: the
-/// columnar point read.
+/// The rows `run` of `page`, which the key search found holding `needle`,
+/// appended to `out` as entries, reading those rows and decoding nothing
+/// else: the columnar point read.
 ///
-/// The rows are one contiguous run, the group sorted by key ascending and
-/// seqno descending within a key. A row `deletes` masks is skipped: its
-/// position is the second field plus its row.
+/// Their key is `needle` itself: the search matched them by comparator
+/// equality, which is byte equality, so `page` carries every column but the
+/// key's. A row `deletes` masks is skipped: its position is the second field
+/// plus its row.
 ///
-/// Adds to `copied` the key and value bytes of each matching row as it is
-/// copied out, so rows copied before a later row fails are still counted.
+/// Adds to `copied` the key and value bytes of each row as it is copied out,
+/// so rows copied before a later row fails are still counted.
 ///
 /// # Errors
 ///
-/// [`Error::InvalidHeader`] when the page does not carry the intrinsic columns
-/// in order, carries no value column, holds no row, or a row it reads is
-/// malformed; [`Error::InvalidTag`] for an unknown value type.
+/// [`Error::InvalidHeader`] when the page does not carry the seqno and value
+/// type columns in order, carries no value column, holds no row, `run` falls
+/// outside it, or a row it reads is malformed; [`Error::InvalidTag`] for an
+/// unknown value type.
 pub(crate) fn page_match_entries(
     page: RowPageColumns<'_>,
+    run: core::ops::Range<u32>,
     needle: &[u8],
-    comparator: &crate::comparator::SharedComparator,
     deletes: Option<(&crate::table::delete_bitmap::DeleteBitmap, u32)>,
     copied: &mut usize,
-) -> Result<Vec<InternalValue>> {
+    out: &mut Vec<InternalValue>,
+) -> Result<()> {
     let rows = page.rows;
     if rows == 0 {
         // A zero-row page is malformed; fail closed like the scan path rather
@@ -2241,20 +2244,16 @@ pub(crate) fn page_match_entries(
         ));
     }
     let mut columns = page.columns.into_iter();
-    let (Some(key), Some(seqno), Some(vt)) = (columns.next(), columns.next(), columns.next())
-    else {
+    let (Some(seqno), Some(vt)) = (columns.next(), columns.next()) else {
         return Err(Error::InvalidHeader(
             "columnar: batch missing the intrinsic columns",
         ));
     };
     let values: Vec<PageColumn<'_>> = columns.collect();
-    if key.column_id != COL_USER_KEY
-        || key.type_tag != TypeTag::Bytes
-        || seqno.column_id != COL_SEQNO
+    if seqno.column_id != COL_SEQNO
         || seqno.type_tag != TypeTag::Number(Number::U64_LE)
         || vt.column_id != COL_VALUE_TYPE
         || vt.type_tag != TypeTag::Fixed(1)
-        || key.validity.is_some()
         || seqno.validity.is_some()
         || vt.validity.is_some()
     {
@@ -2281,15 +2280,20 @@ pub(crate) fn page_match_entries(
         }
     }
 
+    if run.start >= run.end || run.end > rows {
+        return Err(Error::InvalidHeader(
+            "columnar: key run outside its row page",
+        ));
+    }
+    if needle.is_empty() || needle.len() > u16::MAX as usize {
+        return Err(Error::InvalidHeader(
+            "columnar: user key is empty or longer than u16::MAX",
+        ));
+    }
+
     // The layout was checked above, so the intrinsic columns' types are known.
     let seqno_type = TypeTag::Number(Number::U64_LE);
     let vt_type = TypeTag::Fixed(1);
-    let keys = key.values.rows(TypeTag::Bytes, rows)?;
-    let key_at = |row| keys.get(TypeTag::Bytes, rows, row);
-    let run = key_rows(rows, needle, comparator, key_at)?;
-    if run.is_empty() {
-        return Ok(Vec::new());
-    }
     let seqnos = seqno.values.rows(seqno_type, rows)?;
     let types = vt.values.rows(vt_type, rows)?;
     let nullable = values.iter().any(|c| c.validity.is_some());
@@ -2297,8 +2301,10 @@ pub(crate) fn page_match_entries(
         .into_iter()
         .map(|c| Ok((c.type_tag, c.validity, c.values.rows(c.type_tag, rows)?)))
         .collect::<Result<Vec<_>>>()?;
+    // Copied once and shared by every version the run holds.
+    let user_key = Slice::from(needle);
+    *copied += user_key.len();
 
-    let mut out = Vec::new();
     for row in run {
         if let Some((bitmap, start)) = deletes {
             // Fail closed on a corrupt start row: an overflowing position must
@@ -2312,12 +2318,6 @@ pub(crate) fn page_match_entries(
                 continue;
             }
         }
-        let k = key_at(row)?;
-        if k.is_empty() || k.len() > u16::MAX as usize {
-            return Err(Error::InvalidHeader(
-                "columnar: user key is empty or longer than u16::MAX",
-            ));
-        }
         let Some(seqno) = seqnos
             .get(seqno_type, rows, row)?
             .first_chunk::<8>()
@@ -2330,43 +2330,47 @@ pub(crate) fn page_match_entries(
         };
         let value_type =
             ValueType::try_from(vt_byte).map_err(|()| Error::InvalidTag(("ValueType", vt_byte)))?;
-        let cells = values
-            .iter()
-            .map(|(type_tag, validity, access)| {
-                Ok((
-                    *type_tag,
-                    if validity.is_none_or(|v| validity_bit(v, row)) {
-                        Some(access.get(*type_tag, rows, row)?)
-                    } else {
-                        None
-                    },
-                ))
-            })
-            .collect::<Result<Vec<_>>>()?;
-        let value = if nullable {
-            let framed: Vec<(TypeTag, Option<&[u8]>)> =
-                cells.iter().map(|(t, c)| (*t, c.as_deref())).collect();
-            Slice::from(frame_value_cells_nullable(&framed)?)
-        } else if let [(_, Some(single))] = cells.as_slice() {
-            Slice::from(&**single)
+        let value = if let (false, [(type_tag, _, access)]) = (nullable, values.as_slice()) {
+            // One value column without nulls, the common shape: its cell is
+            // the value, with no framing to build.
+            Slice::from(&*access.get(*type_tag, rows, row)?)
         } else {
-            let framed: Vec<(TypeTag, &[u8])> = cells
+            let cells = values
                 .iter()
-                .map(|(t, c)| (*t, c.as_deref().unwrap_or_default()))
-                .collect();
-            Slice::from(frame_value_cells(&framed)?)
+                .map(|(type_tag, validity, access)| {
+                    Ok((
+                        *type_tag,
+                        if validity.is_none_or(|v| validity_bit(v, row)) {
+                            Some(access.get(*type_tag, rows, row)?)
+                        } else {
+                            None
+                        },
+                    ))
+                })
+                .collect::<Result<Vec<_>>>()?;
+            if nullable {
+                let framed: Vec<(TypeTag, Option<&[u8]>)> =
+                    cells.iter().map(|(t, c)| (*t, c.as_deref())).collect();
+                Slice::from(frame_value_cells_nullable(&framed)?)
+            } else {
+                let framed: Vec<(TypeTag, &[u8])> = cells
+                    .iter()
+                    .map(|(t, c)| (*t, c.as_deref().unwrap_or_default()))
+                    .collect();
+                Slice::from(frame_value_cells(&framed)?)
+            }
         };
-        *copied += k.len() + value.len();
+        *copied += value.len();
         out.push(InternalValue {
             key: InternalKey {
-                user_key: Slice::from(&*k),
+                user_key: user_key.clone(),
                 seqno: u64::from_le_bytes(seqno),
                 value_type,
             },
             value,
         });
     }
-    Ok(out)
+    Ok(())
 }
 
 /// Frames one row's value sub-column cells into a single self-describing value

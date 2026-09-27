@@ -1136,6 +1136,7 @@ impl RowGroupBlocks {
 
         let outside = || crate::Error::InvalidHeader("columnar: row page outside the group");
         let (ordinals, columns) = self.by_row_page(
+            |_| true,
             |page, rows, stamp| Column::decode_page(page, rows, stamp, copied),
             |column| column.column_id,
         )?;
@@ -1147,20 +1148,22 @@ impl RowGroupBlocks {
         Ok(RowPages { ordinals, batches })
     }
 
-    /// The pages the read selected, parsed but not decoded, one list of
-    /// columns per row page in row order: what a lookup of a few rows reads
-    /// them through. Each column borrows its page.
+    /// The pages of the columns `want` names among those the read selected,
+    /// parsed but not decoded, one list of columns per row page in row order:
+    /// what a lookup of a few rows reads them through. Each column borrows its
+    /// page; a page of a column not wanted is not read.
     ///
     /// # Errors
     ///
     /// As [`Self::to_row_pages`], for everything but the values themselves.
     pub(crate) fn page_columns(
         &self,
+        want: impl Fn(u16) -> bool,
     ) -> crate::Result<Vec<crate::table::columnar::RowPageColumns<'_>>> {
         use crate::table::columnar::{Column, RowPageColumns};
 
         let (ordinals, columns) =
-            self.by_row_page(Column::parse_page, |column| column.column_id)?;
+            self.by_row_page(want, Column::parse_page, |column| column.column_id)?;
         let outside = || crate::Error::InvalidHeader("columnar: row page outside the group");
         columns
             .into_iter()
@@ -1176,16 +1179,17 @@ impl RowGroupBlocks {
             .collect()
     }
 
-    /// Reads every fetched page with `read`, filing what it returns under its
-    /// row page: the selected row pages' ordinals and, per row page in row
-    /// order, its columns in write order. `column_of` names the column a
-    /// result holds, which must be the one the directory filed its page
-    /// under.
+    /// Reads every fetched page of a column `want` names with `read`, filing
+    /// what it returns under its row page: the selected row pages' ordinals
+    /// and, per row page in row order, its columns in write order.
+    /// `column_of` names the column a result holds, which must be the one the
+    /// directory filed its page under.
     ///
     /// The checks every reading of a group makes before trusting its pages
     /// live here, so the decoded and the parsed readings cannot drift apart.
     fn by_row_page<'s, T>(
         &'s self,
+        want: impl Fn(u16) -> bool,
         mut read: impl FnMut(&'s crate::Slice, u32, PageStamp) -> crate::Result<T>,
         column_of: impl Fn(&T) -> u16,
     ) -> crate::Result<(Vec<u16>, Vec<Vec<T>>)> {
@@ -1209,15 +1213,22 @@ impl RowGroupBlocks {
             ));
         }
         let ordinals: Vec<u16> = self.row_pages.iter().collect();
-        // One column list per row page read. The slots are in directory
-        // order, which is column-major, so each row page's columns arrive in
-        // write order.
-        let mut columns: Vec<Vec<T>> = ordinals.iter().map(|_| Vec::new()).collect();
+        // One column list per row page read, sized for every column the read
+        // fetched. The slots are in directory order, which is column-major,
+        // so each row page's columns arrive in write order.
+        let per_page = self.pages.len() / ordinals.len().max(1);
+        let mut columns: Vec<Vec<T>> = ordinals
+            .iter()
+            .map(|_| Vec::with_capacity(per_page))
+            .collect();
         let unknown_row_page = || {
             crate::Error::InvalidHeader("columnar: page names a row page the group does not have")
         };
         for slot in &self.pages {
             let entry = entries.get(slot.index).ok_or_else(unknown_row_page)?;
+            if !want(entry.id.column_id) {
+                continue;
+            }
             let Some(page) = &slot.block else {
                 return Err(crate::Error::InvalidHeader(
                     "columnar: a wanted page was not read",

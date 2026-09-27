@@ -744,15 +744,7 @@ impl Values<'_> {
             return Ok(Selection::none(n));
         }
         match self {
-            Self::Plain(data) => {
-                let mut out = Selection::none(n);
-                for row in 0..n {
-                    if bounds.keeps(cell(type_tag, data, n, row)?) {
-                        out.insert(row);
-                    }
-                }
-                Ok(out)
-            }
+            Self::Plain(data) => Ok(select_plain(type_tag, data, n, bounds)),
             Self::Constant(value) => Ok(if bounds.keeps(value) {
                 Selection::all(n)
             } else {
@@ -1196,11 +1188,10 @@ impl Values<'_> {
         n: u32,
         keep: &Selection,
     ) -> Result<Slice> {
-        let count = keep.count() as usize;
         if let Self::Plain(data) = self {
-            let rows: Vec<u32> = keep.rows().collect();
-            return gather(type_tag, data, n, &rows);
+            return gather_plain(type_tag, data, n, keep);
         }
+        let count = keep.count() as usize;
         let access = self.rows(type_tag, n)?;
         let cells = keep
             .rows()
@@ -1266,6 +1257,91 @@ fn cell(type_tag: TypeTag, data: &[u8], rows: u32, row: u32) -> Result<&[u8]> {
         }
         None => bytes_column_row(data, rows, row),
     }
+}
+
+/// Each row's value in a bytes column's layout `data` of `n` rows, in order:
+/// the offset table walked once. The parse checked the framing, so a cell it
+/// cannot slice ends the walk rather than being served.
+fn plain_bytes_cells(data: &[u8], n: u32) -> impl Iterator<Item = &[u8]> {
+    let table = (n as usize + 1) * 4;
+    let (offsets, payload) = data.split_at_checked(table).unwrap_or_default();
+    let mut start = 0usize;
+    offsets.chunks_exact(4).skip(1).map_while(move |end| {
+        let end = u32::from_le_bytes(end.try_into().ok()?) as usize;
+        let value = payload.get(start..end)?;
+        start = end;
+        Some(value)
+    })
+}
+
+/// The rows of a plain layout that `bounds` keeps, tested in one pass over
+/// the layout with the bounds' kind resolved once rather than per row.
+fn select_plain(type_tag: TypeTag, data: &[u8], n: u32, bounds: &Bounds<'_>) -> Selection {
+    let mut out = Selection::none(n);
+    match (type_tag.fixed_width().map(usize::from), *bounds) {
+        (Some(width @ 1..), Bounds::Ordinals { number, lo, hi }) => {
+            for (row, value) in (0u32..).zip(data.chunks_exact(width)) {
+                let ordinal = number.ordinal(value);
+                if lo <= ordinal && ordinal <= hi {
+                    out.insert(row);
+                }
+            }
+        }
+        (Some(width @ 1..), _) => {
+            for (row, value) in (0u32..).zip(data.chunks_exact(width)) {
+                if bounds.keeps(value) {
+                    out.insert(row);
+                }
+            }
+        }
+        // A zero-width column has no bytes to walk: every row is the empty
+        // value.
+        (Some(_), _) => {
+            if bounds.keeps(&[]) {
+                out.insert_range(0..n);
+            }
+        }
+        (None, _) => {
+            for (row, value) in (0u32..).zip(plain_bytes_cells(data, n)) {
+                if bounds.keeps(value) {
+                    out.insert(row);
+                }
+            }
+        }
+    }
+    out
+}
+
+/// The rows `keep` selects of a plain layout `data` of `n` rows, as a layout
+/// of their own, copied in one pass. The parse checked the layout, so every
+/// selected row is in it.
+fn gather_plain(type_tag: TypeTag, data: &[u8], n: u32, keep: &Selection) -> Result<Slice> {
+    let count = keep.count() as usize;
+    if let Some(width) = type_tag.fixed_width() {
+        let width = usize::from(width);
+        return Ok(super::gather_fixed_column(
+            width,
+            count,
+            keep.rows()
+                .map(|row| data.get(row as usize * width..row as usize * width + width)),
+        ));
+    }
+    let table = (n as usize + 1) * 4;
+    let (offsets, payload) = data.split_at_checked(table).unwrap_or_default();
+    let at = |i: u32| {
+        offsets
+            .get(i as usize * 4..i as usize * 4 + 4)
+            .and_then(|b| b.try_into().ok())
+            .map(|b| u32::from_le_bytes(b) as usize)
+    };
+    frame_bytes_column(count, || {
+        keep.rows().map(move |row| {
+            at(row)
+                .zip(at(row + 1))
+                .and_then(|(start, end)| payload.get(start..end))
+                .unwrap_or_default()
+        })
+    })
 }
 
 /// The rows of `source`, a layout of `source_rows` rows, that `rows` names,

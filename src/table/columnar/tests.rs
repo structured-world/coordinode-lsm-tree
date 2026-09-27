@@ -1162,8 +1162,9 @@ fn column_batch_into_entries_rejects_an_empty_key_row() {
     );
 }
 
-/// Runs the point-read matcher over `batch` as one row page, its columns
-/// written as the pages a writer writes and read back as a lookup reads them.
+/// Runs the point read over `batch` as one row page, its columns written as
+/// the pages a writer writes and read back as a lookup reads them: the key
+/// search first, then the matcher over the run it found.
 fn match_as_pages(
     batch: &ColumnBatch,
     needle: &[u8],
@@ -1190,18 +1191,36 @@ fn match_as_pages(
         .zip(&batch.columns)
         .map(|(page, c)| Column::parse_page(page, batch.row_count, stamp(c.column_id)))
         .collect::<crate::Result<Vec<_>>>()?;
+    let rows = batch.row_count;
+    // The key pages are searched on their own; the matcher reads the rest.
+    let mut columns: Vec<_> = columns;
+    let key = columns.remove(0);
+    let keys = key.values.rows(TypeTag::Bytes, rows)?;
+    let run = super::key_rows(
+        rows,
+        needle,
+        &crate::comparator::default_comparator(),
+        |row| keys.get(TypeTag::Bytes, rows, row),
+    )?;
+    let mut out = Vec::new();
+    // A miss on a page that has rows reads nothing more, as in a lookup.
+    if run.is_empty() && rows > 0 {
+        return Ok(out);
+    }
     page_match_entries(
         RowPageColumns {
             ordinal: 0,
             start: 0,
-            rows: batch.row_count,
+            rows,
             columns,
         },
+        run,
         needle,
-        &crate::comparator::default_comparator(),
         deletes,
         copied,
-    )
+        &mut out,
+    )?;
+    Ok(out)
 }
 
 #[test]
@@ -1295,6 +1314,51 @@ fn page_match_entries_counts_the_rows_it_copied_before_a_later_row_fails() {
         b"dup".len() + b"v0".len(),
         "the first version was copied before the second failed",
     );
+}
+
+#[test]
+fn page_match_entries_refuses_a_run_outside_its_page() {
+    // The run comes from the key search over the same page; one that names
+    // rows the page does not have (or none) is an inconsistency to refuse,
+    // never rows to read past the page.
+    use crate::table::column_page::{PageId, PageStamp};
+
+    let batch = entries_to_column_batch(&[
+        entry(b"k", 5, ValueType::Value, b"v0"),
+        entry(b"k", 3, ValueType::Value, b"v1"),
+    ])
+    .expect("batch");
+    let stamp = |column_id| PageStamp {
+        group_tag: 1,
+        id: PageId { column_id, part: 0 },
+        row_page: 0,
+    };
+    let pages = batch
+        .columns
+        .iter()
+        .map(|c| Slice::from(c.encode_page(2, stamp(c.column_id)).expect("page")))
+        .collect::<Vec<_>>();
+    for run in [1..3, 2..2, 0..0] {
+        // Every column but the key's, as a lookup's second read takes them.
+        let columns = pages
+            .iter()
+            .zip(&batch.columns)
+            .skip(1)
+            .map(|(page, c)| Column::parse_page(page, 2, stamp(c.column_id)).expect("parse"))
+            .collect();
+        let page = RowPageColumns {
+            ordinal: 0,
+            start: 0,
+            rows: 2,
+            columns,
+        };
+        let err = page_match_entries(page, run.clone(), b"k", None, &mut 0, &mut Vec::new())
+            .expect_err("a run outside the page must be refused");
+        assert!(
+            matches!(err, crate::Error::InvalidHeader(m) if m.contains("key run outside")),
+            "run {run:?}: expected a run InvalidHeader, got {err:?}",
+        );
+    }
 }
 
 #[test]
