@@ -1,6 +1,33 @@
 use super::*;
 use test_log::test;
 
+/// A block both compressed and encrypted is sealed from the compressor's
+/// buffer into a new ciphertext buffer, so both are live at once: the scratch
+/// bound counts the compressed bytes besides the frame.
+#[cfg(all(feature = "encryption", feature = "lz4"))]
+#[test]
+fn a_compressed_and_encrypted_block_counts_both_buffers() {
+    let enc = crate::encryption::Aes256GcmProvider::new(&[7; 32]);
+    let payload = 100_000;
+    let frame = framed_len_bound(
+        payload,
+        BlockType::Index,
+        CompressionType::Lz4,
+        Some(&enc),
+        None,
+    );
+    let compressed = CompressionType::Lz4.compressed_len_bound(100_000) as u64;
+    assert!(
+        transform_scratch_bound(
+            payload,
+            BlockType::Index,
+            CompressionType::Lz4,
+            Some(&enc),
+            None
+        ) >= frame + compressed,
+    );
+}
+
 /// A pathological-but-valid shard config (1 data shard, 255 parity shards)
 /// over a large block makes `shard_bytes * parity_shards` exceed u32. The
 /// parity length must saturate to `u32::MAX` (it is rejected against the actual

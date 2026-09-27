@@ -56,6 +56,9 @@ struct HandleMeta {
     /// The block's first (min) user key, captured for the zone-map synthetic
     /// column. `Some` only when the zone-map policy is on (else no clone).
     zone_block_min: Option<UserKey>,
+    /// The bound on the block's frame counted in flight, taken back out when
+    /// it is written.
+    frame_bound: u64,
 }
 
 /// Bytes of the padding section between the two meta copies, so a bad sector
@@ -862,13 +865,15 @@ impl Writer {
 
         // Block ids only grow, so the last triple carries the largest one
         // recorded; `locator_block_id` is already the next, unwritten block.
+        // Its slot is the largest of a block not yet cut, which
+        // `locator_max_slot` folds in only once the block is.
         if let Some(spec) = self.locator
-            && let Some(&(_, max_block, _)) = self.locators.last()
+            && let Some(&(_, max_block, slot)) = self.locators.last()
             && let Some(section) = crate::table::locator::section_size_estimate(
                 self.locators.len(),
                 spec,
                 max_block,
-                self.locator_max_slot,
+                self.locator_max_slot.max(slot),
             )
         {
             let n = self.locators.len() as u64;
@@ -1720,16 +1725,25 @@ impl Writer {
             while self.parallel.as_ref().map_or(0, BlockCompressor::pending) >= self.parallel_cap {
                 self.drain_one_parallel()?;
             }
+            // The rotation size hint counts the block by the frame it will be
+            // written as (file_pos only advances once it is drained): the
+            // header, and the codec, encryption and parity overheads.
+            let frame_bound = crate::table::block::framed_len_bound(
+                encoded.len() as u64,
+                super::block::BlockType::Data,
+                self.data_block_compression,
+                self.encryption.as_deref(),
+                self.ecc,
+            );
             self.pending_meta.push_back(HandleMeta {
                 last_key,
                 last_seqno,
                 seqno_bounds,
                 item_count,
                 zone_block_min,
+                frame_bound,
             });
-            // Track in-flight uncompressed bytes for the rotation size hint
-            // (file_pos only advances once the block is drained and written).
-            self.parallel_pending_bytes += encoded.len() as u64;
+            self.parallel_pending_bytes += frame_bound;
             if let Some(par) = self.parallel.as_mut() {
                 par.submit(encoded, kv_flags);
             }
@@ -2496,12 +2510,10 @@ impl Writer {
         // Take the inner-block layout before `write_to` consumes the block.
         let layout = core::mem::take(&mut prepared.layout);
         let header = prepared.write_to(&mut self.file_writer)?;
-        // Header is Copy; read the in-flight size before handing it off.
-        // Clamp-to-zero: this block's bytes were counted into the in-flight total
-        // when queued, so the subtraction stays non-negative.
-        self.parallel_pending_bytes = self
-            .parallel_pending_bytes
-            .saturating_sub(u64::from(header.uncompressed_length));
+        // The block's bound was added to the in-flight total when it was
+        // queued, so the total holds at least this much.
+        debug_assert!(self.parallel_pending_bytes >= meta.frame_bound);
+        self.parallel_pending_bytes -= meta.frame_bound;
         self.register_written_block(
             header,
             layout,

@@ -1245,3 +1245,21 @@ fn burr_builds_every_small_key_set_by_bumping_unplaceable_keys() {
         }
     }
 }
+
+/// The solver allocates its rows by slot, and a layer takes more slots than
+/// keys: 5% more, rounded up to whole blocks, one block at least. The build
+/// peak counts the first layer's slots, however few the keys.
+#[test]
+fn the_build_peak_counts_the_solver_rows_by_slot() {
+    for n in [1_usize, 20, 1_000, 100_000] {
+        let slots = BurrParams::with_bpk(n, 10.0).unwrap().layer_m(n);
+        let rows = slots * super::builder::SOLVE_PER_SLOT;
+        for retrieval in [false, true] {
+            let peak = super::builder::build_peak_bytes(n, retrieval);
+            assert!(
+                peak >= rows,
+                "n={n}: peak {peak} below {rows} of solver rows"
+            );
+        }
+    }
+}

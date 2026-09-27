@@ -53,14 +53,17 @@ fn the_linked_blob_files_count_toward_a_full_table() -> crate::Result<()> {
         1,
         fs,
     )?;
+    // A block large enough that the table's size, not the state it holds for
+    // `finish`, decides.
     mw.write(InternalValue::from_components(
         UserKey::from(b"a" as &[u8]),
-        b"v".to_vec(),
+        vec![0u8; 65_536],
         0,
         crate::ValueType::Value,
     ))?;
     mw.writer.spill_block()?;
     mw.target_size = mw.writer.output_size_hint() + 100;
+    assert!(mw.writer.held_state_bytes() < mw.target_size);
     assert!(!mw.table_full());
     for blob_file_id in 0..10 {
         mw.linked_blobs.insert(

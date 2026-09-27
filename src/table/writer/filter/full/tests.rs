@@ -54,3 +54,25 @@ fn a_prefix_shared_by_adjacent_keys_is_buffered_once() -> crate::Result<()> {
     assert_eq!(writer.bloom_hash_buffer.len(), 1_001);
     Ok(())
 }
+
+/// Every byte prefix of a key is a token.
+struct AllPrefixes;
+
+impl PrefixExtractor for AllPrefixes {
+    fn prefixes<'a>(&self, key: &'a [u8]) -> Box<dyn Iterator<Item = &'a [u8]> + 'a> {
+        Box::new((1..=key.len()).filter_map(|end| key.get(..end)))
+    }
+}
+
+/// The previous key's prefix hashes stay held until `finish`, one per token
+/// position: the held bytes count them besides the buffered hashes.
+#[test]
+fn the_previous_prefixes_are_held() -> crate::Result<()> {
+    let mut writer = FullFilterWriter::new(BloomConstructionPolicy::default());
+    writer.prefix_extractor = Some(Arc::new(AllPrefixes));
+    super::FilterWriter::<W>::register_key(&mut writer, &vec![b'k'; 10_000].into())?;
+    let word = core::mem::size_of::<u64>();
+    let held = (writer.bloom_hash_buffer.capacity() + writer.previous_prefixes.capacity()) * word;
+    assert_eq!(super::FilterWriter::<W>::held_bytes(&writer), held as u64);
+    Ok(())
+}
