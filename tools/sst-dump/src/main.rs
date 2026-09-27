@@ -264,6 +264,21 @@ enum Command {
         reconstruct_aad: bool,
     },
 
+    /// Print how a columnar SST's values are encoded: for every page (one
+    /// column's rows in one row page of a row group) its rows, its on-disk
+    /// bytes and the expression the writer chose for it, then a summary per
+    /// column and expression. The writer chooses per page by what the page
+    /// costs to store and to read, so a surprising choice shows up here with
+    /// the page it was made for. A row-major SST has no pages.
+    ///
+    /// Same out-of-band semantics as `properties`: no encryption, no zstd
+    /// dictionary.
+    Columns {
+        /// Print only the per-column summary, not every page.
+        #[arg(long)]
+        summary: bool,
+    },
+
     /// Salvage the readable data blocks of a (possibly corrupt) SST into a
     /// fresh SST at `<dest>`. Walks every data block, re-emits the ones that
     /// pass their checksum into a new file with fresh checksums / index /
@@ -320,7 +335,79 @@ fn main() -> ExitCode {
             dest,
             allow_delete_resurrection,
         } => run_salvage(&cli.path, &dest, allow_delete_resurrection),
+        Command::Columns { summary } => run_columns(&cli.path, summary),
     }
+}
+
+fn run_columns(path: &std::path::Path, summary: bool) -> ExitCode {
+    let pages = match lsm_tree::inspect::read_column_encodings(path) {
+        Ok(pages) => pages,
+        Err(e) => {
+            eprintln!("error: {e}");
+            return ExitCode::FAILURE;
+        }
+    };
+    if pages.is_empty() {
+        println!("no column pages: the table is row-major");
+        return ExitCode::SUCCESS;
+    }
+    // `offsets` is what a bytes column's page spends on where its values
+    // start (its offset table, or the lengths replacing it), `-` where that
+    // does not apply: the saving an encoding makes there is told apart from
+    // the one it makes on the values. The expression comes last, as the one
+    // field that may hold spaces.
+    let offsets = |len: Option<u64>| len.map_or_else(|| "-".to_owned(), |len| len.to_string());
+    if !summary {
+        println!("group row_page column rows bytes offsets expression");
+        for page in &pages {
+            println!(
+                "{} {} {} {} {} {} {}",
+                page.group,
+                page.row_page,
+                page.column_id,
+                page.rows,
+                page.stored_len,
+                offsets(page.offsets_len.map(|len| len as u64)),
+                page.expression
+            );
+        }
+        println!();
+    }
+    // Per column and expression, in column order and, within a column, most
+    // pages first.
+    #[derive(Default)]
+    struct Totals {
+        pages: u64,
+        rows: u64,
+        bytes: u64,
+        offsets: Option<u64>,
+    }
+    let mut totals: std::collections::BTreeMap<(u16, String), Totals> =
+        std::collections::BTreeMap::new();
+    for page in &pages {
+        let entry = totals
+            .entry((page.column_id, page.expression.to_string()))
+            .or_default();
+        entry.pages += 1;
+        entry.rows += u64::from(page.rows);
+        entry.bytes += u64::from(page.stored_len);
+        if let Some(len) = page.offsets_len {
+            entry.offsets = Some(entry.offsets.unwrap_or(0) + len as u64);
+        }
+    }
+    println!("column pages rows bytes offsets expression");
+    let mut rows: Vec<_> = totals.into_iter().collect();
+    rows.sort_by(|((ca, _), a), ((cb, _), b)| ca.cmp(cb).then(b.pages.cmp(&a.pages)));
+    for ((column, expression), total) in rows {
+        println!(
+            "{column} {} {} {} {} {expression}",
+            total.pages,
+            total.rows,
+            total.bytes,
+            offsets(total.offsets)
+        );
+    }
+    ExitCode::SUCCESS
 }
 
 /// Whether `blobs/` holds something that can actually BE a blob file.

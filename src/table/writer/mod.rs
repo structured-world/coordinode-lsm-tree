@@ -111,6 +111,9 @@ pub struct Writer {
     /// Uncompressed bytes of row data a columnar row page is closed at.
     columnar_page_size: u32,
 
+    /// How a columnar table's column pages store their values.
+    column_encoding: crate::config::ColumnEncoding,
+
     data_block_hash_ratio: f32,
 
     /// Compression to use for data blocks
@@ -528,6 +531,7 @@ impl Writer {
 
             row_group_size: crate::config::DEFAULT_COLUMNAR_ROW_GROUP_SIZE,
             columnar_page_size: crate::config::DEFAULT_COLUMNAR_PAGE_SIZE,
+            column_encoding: crate::config::ColumnEncoding::Plain,
 
             data_block_compression: CompressionType::None,
             index_block_compression: CompressionType::None,
@@ -809,6 +813,16 @@ impl Writer {
             "columnar page size must be <= 4 MiB"
         );
         self.columnar_page_size = size;
+        self
+    }
+
+    /// Sets how a columnar table's column pages store their values. Ignored
+    /// for a row-major table. Must be set before the first key is written, so
+    /// one table's pages follow one policy.
+    #[must_use]
+    pub fn use_column_encoding(mut self, encoding: crate::config::ColumnEncoding) -> Self {
+        self.assert_not_started("column encoding");
+        self.column_encoding = encoding;
         self
     }
 
@@ -1604,7 +1618,6 @@ impl Writer {
         zone_block_min: Option<crate::UserKey>,
     ) -> crate::Result<()> {
         use crate::table::column_page::{PageDirectory, PageId, PageStamp};
-        use crate::table::columnar::CodecId;
 
         // Pages carry the data and go through the table's data codec; the
         // directory is a handful of offsets that no codec shrinks, and is kept
@@ -1624,11 +1637,9 @@ impl Writer {
         // names several gets its pages per part here, and nothing downstream
         // changes, because pages are found by `(column_id, part, row_page)`
         // and never by position.
-        // Pages are cut by the page size whatever the group size: a group an
-        // ingested batch took far past its size (ingestion cuts after a whole
-        // batch) still reads a page at a time. Groups and pages are cut by the
-        // same count of the bytes each row adds, so a group the writer closed
-        // at its size is one page when the page size is the group size. A
+        // Pages are cut by the page size, groups by the group size, both by
+        // the same count of the bytes each row adds, so a group the writer
+        // closed at its size is one page when the page size is the group size. A
         // short tail page is kept rather than folded into the page before it:
         // folding costs the sparse scan more, since the enlarged page is read
         // whole whenever a match lands on it.
@@ -1677,7 +1688,7 @@ impl Writer {
                 payloads.push((
                     id,
                     row_page,
-                    page_rows.encode_page(rows, CodecId::Plain, stamp)?,
+                    page_rows.encode_page(rows, stamp, self.column_encoding)?,
                 ));
                 start = end;
             }
@@ -1891,13 +1902,14 @@ impl Writer {
     }
 
     /// Writes a consumer-provided [`ColumnBatch`](crate::table::columnar::ColumnBatch)
-    /// as a single columnar block, storing its value sub-columns directly instead
+    /// as columnar row groups, storing its value sub-columns directly instead
     /// of re-transposing the intrinsic value. The batch must carry the three
     /// intrinsic columns plus one or more value sub-columns; the columnar layout
     /// must be enabled. Keys must be strictly increasing by `comparator` (within
     /// the batch and across successive batches / row writes on this writer), and
     /// every per-row seqno must be `0` (the ingestion assigns one sequence
-    /// number). Each call appends one block.
+    /// number). Each call appends one row group, or several of the group size
+    /// for a batch past it.
     ///
     /// Returns the batch's last user key (or `None` for an empty batch) so a
     /// caller can track the ingest ordering across batches.
@@ -1996,7 +2008,44 @@ impl Writer {
         } else {
             self.validate_direct_block_order(&entries, comparator)?;
         }
-        let Some(inputs) = self.account_direct_block(&entries)? else {
+
+        // A batch past the group size is written as groups of that size, cut
+        // by the bytes each row adds as flushed rows are: a read bounds what a
+        // group decodes to by what a group of that size holds, so a group
+        // taking a whole oversized batch would be refused. The whole batch was
+        // checked above, so a bad batch writes nothing.
+        let groups = batch.row_page_cuts(self.row_group_size)?;
+        if groups.len() <= 1 {
+            return self.write_columnar_group(batch, &entries);
+        }
+        let mut last_key = None;
+        let mut start = 0u32;
+        for rows in groups {
+            // The cuts sum to the batch's rows, a u32.
+            let end = start + rows;
+            let group = batch.rows(start, end)?;
+            let group_entries =
+                entries
+                    .get(start as usize..end as usize)
+                    .ok_or(crate::Error::InvalidHeader(
+                        "columnar: row range outside the batch",
+                    ))?;
+            last_key = self
+                .write_columnar_group(&group, group_entries)?
+                .or(last_key);
+            start = end;
+        }
+        Ok(last_key)
+    }
+
+    /// Writes one row group of a checked columnar batch, `entries` its rows.
+    #[cfg(feature = "columnar")]
+    fn write_columnar_group(
+        &mut self,
+        batch: &crate::table::columnar::ColumnBatch,
+        entries: &[InternalValue],
+    ) -> crate::Result<Option<crate::UserKey>> {
+        let Some(inputs) = self.account_direct_block(entries)? else {
             return Ok(None); // empty batch: no block
         };
 

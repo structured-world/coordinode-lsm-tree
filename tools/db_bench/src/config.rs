@@ -1,7 +1,9 @@
 use clap::ValueEnum;
 use lsm_tree::{
     AnyTree, Cache, CompressionType, Config, SequenceNumberCounter,
-    config::{BlockSizePolicy, CompressionPolicy, PinningPolicy},
+    config::{
+        BlockSizePolicy, ColumnEncoding, ColumnEncodingPolicy, CompressionPolicy, PinningPolicy,
+    },
 };
 use std::path::Path;
 use std::sync::Arc;
@@ -41,6 +43,33 @@ impl Compression {
     }
 }
 
+/// How a benchmark tree's columnar pages store their values, at every level.
+#[derive(Debug, Clone, Copy, ValueEnum)]
+pub enum ColumnEncodingArg {
+    /// Every page in its column's layout, the tree's default.
+    Plain,
+    /// Each page as its cheapest encoding.
+    Auto,
+}
+
+impl std::fmt::Display for ColumnEncodingArg {
+    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        match self {
+            Self::Plain => f.write_str("plain"),
+            Self::Auto => f.write_str("auto"),
+        }
+    }
+}
+
+impl ColumnEncodingArg {
+    pub fn to_lsm(self) -> ColumnEncoding {
+        match self {
+            Self::Plain => ColumnEncoding::Plain,
+            Self::Auto => ColumnEncoding::Auto,
+        }
+    }
+}
+
 /// `--key-size` when the flag is not given.
 pub const DEFAULT_KEY_SIZE: usize = 16;
 
@@ -60,6 +89,8 @@ pub struct BenchConfig {
     pub row_group_size: u32,
     /// Uncompressed size a columnar row group's rows are cut into row pages at.
     pub page_size: u32,
+    /// How columnar pages store their values, at every level.
+    pub column_encoding: ColumnEncodingArg,
     /// How columnar reads fetch their pages.
     pub read_budget: lsm_tree::config::ReadBudget,
     pub use_blob_tree: bool,
@@ -117,6 +148,7 @@ pub fn tree_builder(path: &Path, config: &BenchConfig) -> lsm_tree::Result<Confi
     .data_block_size_policy(block_size_policy)
     .columnar_row_group_size_policy(BlockSizePolicy::all(config.row_group_size))
     .columnar_page_size_policy(BlockSizePolicy::all(config.page_size))
+    .column_encoding_policy(ColumnEncodingPolicy::all(config.column_encoding.to_lsm()))
     .columnar_read_budget(config.read_budget)
     .data_block_compression_policy(compression_policy)
     // A KV-separated tree writes most of its bytes as blobs, so the codec a

@@ -173,6 +173,9 @@ pub(super) fn prepare_table_writer(
         .use_data_block_size(data_block_size)
         .use_row_group_size(opts.config.columnar_row_group_size_policy.get(dst_lvl))
         .use_columnar_page_size(opts.config.columnar_page_size_policy.get(dst_lvl))
+        // What this writer writes. A merge-on-read relocation writes nothing
+        // and keeps the source's pages, as it keeps their compression.
+        .use_column_encoding(opts.config.column_encoding_policy.get(dst_lvl))
         .use_data_block_hash_ratio(data_block_hash_ratio)
         .use_index_block_compression(index_block_compression)
         // NOTE: prefix_extractor before bloom_policy is safe here because

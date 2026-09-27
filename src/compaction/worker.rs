@@ -2501,6 +2501,11 @@ fn plan_merge_on_read(
     {
         return Ok(None);
     }
+    // The relocation keeps the source's blocks as they were written: their
+    // compression, row group and page sizes and column encoding, not the
+    // destination level's policies. It exists to spare a sparse delete the
+    // rewrite of every page, which applying those policies would be; the next
+    // merge that copies these rows writes them under the destination's.
 
     // Positional bitmap from the segment's own below-watermark range tombstones,
     // over every stored version in block-index order (scan order = the writer's

@@ -42,6 +42,8 @@ pub struct MultiWriter {
 
     columnar_page_size: u32,
 
+    column_encoding: crate::config::ColumnEncoding,
+
     data_block_restart_interval: u8,
     index_block_restart_interval: u8,
 
@@ -240,6 +242,7 @@ impl MultiWriter {
             row_group_size: crate::config::DEFAULT_COLUMNAR_ROW_GROUP_SIZE,
 
             columnar_page_size: crate::config::DEFAULT_COLUMNAR_PAGE_SIZE,
+            column_encoding: crate::config::ColumnEncoding::Plain,
 
             data_block_restart_interval: 16,
             index_block_restart_interval: 1,
@@ -567,6 +570,14 @@ impl MultiWriter {
         self
     }
 
+    /// Sets how the tables' column pages store their values.
+    #[must_use]
+    pub(crate) fn use_column_encoding(mut self, encoding: crate::config::ColumnEncoding) -> Self {
+        self.column_encoding = encoding;
+        self.writer = self.writer.use_column_encoding(encoding);
+        self
+    }
+
     #[must_use]
     pub fn use_data_block_compression(mut self, compression: CompressionType) -> Self {
         self.data_block_compression = compression;
@@ -801,6 +812,7 @@ impl MultiWriter {
             .use_data_block_size(self.data_block_size)
             .use_row_group_size(self.row_group_size)
             .use_columnar_page_size(self.columnar_page_size)
+            .use_column_encoding(self.column_encoding)
             .use_data_block_restart_interval(self.data_block_restart_interval)
             .use_index_block_restart_interval(self.index_block_restart_interval)
             .use_bloom_policy(self.bloom_policy)

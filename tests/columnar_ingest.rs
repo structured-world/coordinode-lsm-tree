@@ -674,9 +674,10 @@ fn a_row_group_and_a_row_page_of_one_size_hold_the_same_rows() -> lsm_tree::Resu
     Ok(())
 }
 
-/// One ingested batch far past the group size is one group, and is still cut
-/// into row pages of the page size, even with the page size equal to the group
-/// size: a read of a few rows then decodes a page, not the batch.
+/// One ingested batch far past the group size is cut into groups and row pages
+/// by the same count of the bytes each row adds, so with the page size equal to
+/// the group size each group is one page: a read of a few rows then decodes a
+/// page, not the batch.
 #[test]
 fn one_oversized_batch_is_cut_into_row_pages_of_the_page_size() -> lsm_tree::Result<()> {
     let folder = get_tmp_folder();
@@ -694,6 +695,59 @@ fn one_oversized_batch_is_cut_into_row_pages_of_the_page_size() -> lsm_tree::Res
         rows_per_page(&any)?,
         expected,
         "pages of the page size, then the tail"
+    );
+    Ok(())
+}
+
+/// One ingested batch far past the group size is written as groups of the
+/// group size, as flushed rows are, so a read holds it to what a group of that
+/// size decodes to. 200 000 rows of one value encode as a constant per page,
+/// and as one group they decode to far more than a read lets one group build;
+/// cut at the group size, every group reads back whole.
+#[test]
+fn one_oversized_batch_is_written_as_groups_of_the_group_size() -> lsm_tree::Result<()> {
+    use lsm_tree::config::{ColumnEncoding, ColumnEncodingPolicy};
+
+    const ROWS: u32 = 200_000;
+    let folder = get_tmp_folder();
+    let any = Config::new(
+        folder.path(),
+        SequenceNumberCounter::default(),
+        SequenceNumberCounter::default(),
+    )
+    .column_encoding_policy(ColumnEncodingPolicy::all(ColumnEncoding::Auto))
+    .open()?;
+    let AnyTree::Standard(tree) = &any else {
+        panic!("expected standard tree");
+    };
+    tree.update_runtime_config(|cfg| cfg.columnar = true)
+        .expect("enable columnar");
+
+    let rows: Vec<_> = (0..ROWS)
+        .map(|i| {
+            InternalValue::from_components(
+                format!("k{i:06}").into_bytes(),
+                vec![b'v'; 64],
+                0,
+                ValueType::Value,
+            )
+        })
+        .collect();
+    let mut ingest = any.ingestion()?;
+    ingest.write_columnar_batch(&entries_to_column_batch(&rows)?)?;
+    ingest.finish()?;
+
+    let version = tree.current_version();
+    let table = version.iter_tables().next().expect("one ingested SST");
+    let batches = table.columnar_scan(&[lsm_tree::table::columnar::COL_VALUE], None)?;
+    assert_eq!(
+        batches.iter().map(|b| b.row_count).sum::<u32>(),
+        ROWS,
+        "every row reads back",
+    );
+    assert!(
+        any.get(format!("k{:06}", ROWS - 1), SeqNo::MAX)?.is_some(),
+        "the last row is found",
     );
     Ok(())
 }

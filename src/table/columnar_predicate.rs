@@ -101,6 +101,24 @@ impl ColumnRangePredicate {
         )
     }
 
+    /// What this predicate asks of a column of `type_tag`, in the form its
+    /// encoding compares, or `None` for an opaque column, which has no order
+    /// to compare in.
+    pub(crate) fn bounds(&self, type_tag: TypeTag) -> Option<super::columnar::Bounds<'_>> {
+        use super::columnar::Bounds;
+        match type_tag {
+            TypeTag::Bytes => Some(Bounds::Bytes {
+                lower: self.lower.as_deref(),
+                upper: self.upper.as_deref(),
+            }),
+            TypeTag::Number(number) => Some(match self.ordinal_span(number) {
+                Some((lo, hi)) => Bounds::Ordinals { number, lo, hi },
+                None => Bounds::Nothing,
+            }),
+            TypeTag::Fixed(_) => None,
+        }
+    }
+
     /// The inclusive range of ordinals ([`Number`]'s comparable encoding read
     /// as an integer) whose comparable bytes fall within `[lower, upper]`, or
     /// `None` when no value of `number` does.
@@ -227,6 +245,149 @@ impl ColumnRangePredicate {
             return false;
         }
         true
+    }
+}
+
+/// The rows of a row page a filter kept, one bit per row.
+///
+/// A filter narrows a selection instead of building a copy of the rows it
+/// keeps, and a later filter narrows it further; the rows are gathered once,
+/// by whoever finally receives them.
+#[derive(Clone, Debug, Eq, PartialEq)]
+pub struct Selection {
+    words: Vec<u64>,
+    len: u32,
+}
+
+impl Selection {
+    /// No row of `len`.
+    #[must_use]
+    pub fn none(len: u32) -> Self {
+        Self {
+            words: alloc::vec![0; (len as usize).div_ceil(64)],
+            len,
+        }
+    }
+
+    /// Every row of `len`.
+    #[must_use]
+    pub fn all(len: u32) -> Self {
+        let mut selection = Self::none(len);
+        selection.insert_range(0..len);
+        selection
+    }
+
+    /// The rows a validity bitmap marks present: one bit per row, least
+    /// significant first, the layout a column's validity is stored in.
+    #[must_use]
+    pub fn from_bitmap(bitmap: &[u8], len: u32) -> Self {
+        let mut selection = Self::none(len);
+        for (word, chunk) in selection.words.iter_mut().zip(bitmap.chunks(8)) {
+            let mut bytes = [0u8; 8];
+            for (dst, &src) in bytes.iter_mut().zip(chunk) {
+                *dst = src;
+            }
+            *word = u64::from_le_bytes(bytes);
+        }
+        // Bits past `len` are the bitmap's padding, not rows.
+        let tail = len % 64;
+        if tail != 0
+            && let Some(last) = selection.words.last_mut()
+        {
+            *last &= (1u64 << tail) - 1;
+        }
+        selection
+    }
+
+    /// The rows `len` spans.
+    #[must_use]
+    pub const fn len(&self) -> u32 {
+        self.len
+    }
+
+    /// Whether the selection spans no rows at all.
+    #[must_use]
+    pub const fn is_empty(&self) -> bool {
+        self.len == 0
+    }
+
+    /// Selects row `row`; a row past the span is ignored.
+    pub fn insert(&mut self, row: u32) {
+        if row < self.len
+            && let Some(word) = self.words.get_mut((row / 64) as usize)
+        {
+            *word |= 1 << (row % 64);
+        }
+    }
+
+    /// Drops row `row` from the selection.
+    pub fn remove(&mut self, row: u32) {
+        if let Some(word) = self.words.get_mut((row / 64) as usize) {
+            *word &= !(1 << (row % 64));
+        }
+    }
+
+    /// Selects every row of `rows` within the span.
+    pub fn insert_range(&mut self, rows: core::ops::Range<u32>) {
+        let end = rows.end.min(self.len);
+        let mut row = rows.start;
+        while row < end {
+            let bit = row % 64;
+            let count = (64 - bit).min(end - row);
+            let mask = if count == 64 {
+                u64::MAX
+            } else {
+                ((1u64 << count) - 1) << bit
+            };
+            if let Some(word) = self.words.get_mut((row / 64) as usize) {
+                *word |= mask;
+            }
+            row += count;
+        }
+    }
+
+    /// Whether row `row` is selected.
+    #[must_use]
+    pub fn contains(&self, row: u32) -> bool {
+        self.words
+            .get((row / 64) as usize)
+            .is_some_and(|word| word >> (row % 64) & 1 == 1)
+    }
+
+    /// Keeps only the rows `other` selects too; a row past `other`'s rows is
+    /// not selected by it.
+    pub fn intersect(&mut self, other: &Self) {
+        let mut theirs = other.words.iter();
+        for word in &mut self.words {
+            *word &= theirs.next().copied().unwrap_or(0);
+        }
+    }
+
+    /// How many rows are selected.
+    #[must_use]
+    pub fn count(&self) -> u32 {
+        self.words.iter().map(|w| w.count_ones()).sum()
+    }
+
+    /// The selected rows, ascending.
+    pub fn rows(&self) -> impl Iterator<Item = u32> + '_ {
+        (0u32..).zip(&self.words).flat_map(|(index, &word)| {
+            let mut rest = word;
+            core::iter::from_fn(move || {
+                if rest == 0 {
+                    return None;
+                }
+                let bit = rest.trailing_zeros();
+                rest &= rest - 1;
+                Some(index * 64 + bit)
+            })
+        })
+    }
+
+    /// One boolean per row, `true` where selected.
+    #[must_use]
+    pub fn to_mask(&self) -> Vec<bool> {
+        (0..self.len).map(|row| self.contains(row)).collect()
     }
 }
 
