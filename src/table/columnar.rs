@@ -2263,7 +2263,6 @@ pub(crate) fn page_match_entries(
             "columnar: batch missing the intrinsic columns",
         ));
     };
-    let values: Vec<PageColumn<'_>> = columns.collect();
     if seqno.column_id != COL_SEQNO
         || seqno.type_tag != TypeTag::Number(Number::U64_LE)
         || vt.column_id != COL_VALUE_TYPE
@@ -2275,25 +2274,6 @@ pub(crate) fn page_match_entries(
             "columnar: unexpected intrinsic column layout",
         ));
     }
-    if values.is_empty() {
-        return Err(Error::InvalidHeader(
-            "columnar: batch carries no value column",
-        ));
-    }
-    for (i, col) in values.iter().enumerate() {
-        if col.column_id < COL_VALUE
-            || values
-                .get(..i)
-                .unwrap_or_default()
-                .iter()
-                .any(|c| c.column_id == col.column_id)
-        {
-            return Err(Error::InvalidHeader(
-                "columnar: value sub-column ids must be unique and must not overlap intrinsic columns",
-            ));
-        }
-    }
-
     if run.start >= run.end || run.end > rows {
         return Err(Error::InvalidHeader(
             "columnar: key run outside its row page",
@@ -2310,11 +2290,30 @@ pub(crate) fn page_match_entries(
     let vt_type = TypeTag::Fixed(1);
     let seqnos = seqno.values.rows(seqno_type, rows)?;
     let types = vt.values.rows(vt_type, rows)?;
-    let nullable = values.iter().any(|c| c.validity.is_some());
-    let values = values
-        .into_iter()
-        .map(|c| Ok((c.type_tag, c.validity, c.values.rows(c.type_tag, rows)?)))
-        .collect::<Result<Vec<_>>>()?;
+    // The value sub-columns prepared for row reads in one pass, each id
+    // checked against the ones before it.
+    let mut values: Vec<(u16, TypeTag, Option<&[u8]>, expr::Rows<'_>)> =
+        Vec::with_capacity(columns.len());
+    let mut nullable = false;
+    for c in columns {
+        if c.column_id < COL_VALUE || values.iter().any(|&(id, ..)| id == c.column_id) {
+            return Err(Error::InvalidHeader(
+                "columnar: value sub-column ids must be unique and must not overlap intrinsic columns",
+            ));
+        }
+        nullable |= c.validity.is_some();
+        values.push((
+            c.column_id,
+            c.type_tag,
+            c.validity,
+            c.values.rows(c.type_tag, rows)?,
+        ));
+    }
+    if values.is_empty() {
+        return Err(Error::InvalidHeader(
+            "columnar: batch carries no value column",
+        ));
+    }
     // Copied once and shared by every version the run holds.
     let user_key = Slice::from(needle);
     *copied += user_key.len();
@@ -2344,14 +2343,14 @@ pub(crate) fn page_match_entries(
         };
         let value_type =
             ValueType::try_from(vt_byte).map_err(|()| Error::InvalidTag(("ValueType", vt_byte)))?;
-        let value = if let (false, [(type_tag, _, access)]) = (nullable, values.as_slice()) {
+        let value = if let (false, [(_, type_tag, _, access)]) = (nullable, values.as_slice()) {
             // One value column without nulls, the common shape: its cell is
             // the value, with no framing to build.
             Slice::from(&*access.get(*type_tag, rows, row)?)
         } else {
             let cells = values
                 .iter()
-                .map(|(type_tag, validity, access)| {
+                .map(|(_, type_tag, validity, access)| {
                     Ok((
                         *type_tag,
                         if validity.is_none_or(|v| validity_bit(v, row)) {

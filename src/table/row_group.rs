@@ -58,6 +58,19 @@ impl RowGroupBlocks {
     }
 }
 
+/// One page as [`RowGroupBlocks::page_encodings`] describes it.
+#[cfg(feature = "std")]
+pub struct PageDescription {
+    /// The page's directory entry.
+    pub entry: PageEntry,
+    /// The rows of its row page.
+    pub rows: u32,
+    /// What its values were encoded as.
+    pub expression: crate::table::columnar::Expression,
+    /// For a bytes column, the bytes it spends on where its values start.
+    pub offsets_len: Option<usize>,
+}
+
 /// A page a read wanted: its place in the directory's entries and its block
 /// once fetched.
 pub struct PageSlot {
@@ -1268,16 +1281,7 @@ impl RowGroupBlocks {
     ///
     /// As [`Self::to_row_pages`], for everything but the values themselves.
     #[cfg(feature = "std")]
-    pub(crate) fn page_encodings(
-        &self,
-    ) -> crate::Result<
-        Vec<(
-            PageEntry,
-            u32,
-            crate::table::columnar::Expression,
-            Option<usize>,
-        )>,
-    > {
+    pub(crate) fn page_encodings(&self) -> crate::Result<Vec<PageDescription>> {
         let entries = self.directory.entries();
         let unknown = || {
             crate::Error::InvalidHeader("columnar: page names a row page the group does not have")
@@ -1300,7 +1304,12 @@ impl RowGroupBlocks {
                     rows,
                     self.directory.stamp_for(&entry),
                 )?;
-                Ok((entry, rows, expression, offsets))
+                Ok(PageDescription {
+                    entry,
+                    rows,
+                    expression,
+                    offsets_len: offsets,
+                })
             })
             .collect()
     }

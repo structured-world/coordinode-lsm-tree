@@ -1975,8 +1975,8 @@ pub fn choose(
 ///
 /// The page holds `rows` rows of a column of `type_tag` whose layout is
 /// `data`. Each candidate carries what it would store and cost: the decision
-/// [`choose`] makes, laid out so a surprising choice can be explained. The
-/// cheapest is the one written.
+/// a level under [`ColumnEncoding::Auto`] makes, laid out so a surprising
+/// choice can be explained. The cheapest is the one written.
 ///
 /// # Errors
 ///

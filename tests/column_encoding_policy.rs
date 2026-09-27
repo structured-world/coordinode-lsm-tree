@@ -8,26 +8,25 @@ use lsm_tree::{
     AbstractTree, AnyTree, Config, SeqNo, SequenceNumberCounter,
     config::{ColumnEncoding, ColumnEncodingPolicy},
     get_tmp_folder,
-    inspect::read_column_encodings,
     table::columnar::Expression,
 };
 use test_log::test;
 
-/// The expressions of every page of every table under `folder`. A table a
-/// compaction replaced may be deleted in the background while the folder is
-/// listed; one gone by the time it is read is skipped.
-fn page_expressions(folder: &std::path::Path) -> lsm_tree::Result<Vec<Expression>> {
+/// The expressions of every page of every table the tree's current version
+/// holds: the tables a compaction replaced are no longer read, whatever the
+/// background deletion of their files has reached.
+fn page_expressions(tree: &AnyTree) -> lsm_tree::Result<Vec<Expression>> {
+    let AnyTree::Standard(tree) = tree else {
+        panic!("a standard tree");
+    };
     let mut out = Vec::new();
-    for entry in std::fs::read_dir(folder.join("tables"))? {
-        let entry = entry?;
-        if !entry.file_type()?.is_file() {
-            continue;
-        }
-        match read_column_encodings(&entry.path()) {
-            Ok(pages) => out.extend(pages.into_iter().map(|page| page.expression)),
-            Err(lsm_tree::Error::Io(e)) if e.kind() == lsm_tree::io::ErrorKind::NotFound => {}
-            Err(e) => return Err(e),
-        }
+    for table in tree.current_version().iter_tables() {
+        out.extend(
+            table
+                .column_page_encodings()?
+                .into_iter()
+                .map(|page| page.expression),
+        );
     }
     Ok(out)
 }
@@ -65,7 +64,7 @@ fn a_level_plain_by_policy_stores_plain_pages_and_one_below_encodes_them() -> ls
     )?;
 
     // Level 0 asked for plain pages: the repeated value is stored whole.
-    let flushed = page_expressions(folder.path())?;
+    let flushed = page_expressions(&tree)?;
     assert!(!flushed.is_empty(), "the flush wrote column pages");
     assert!(
         flushed.iter().all(|e| *e == Expression::Plain),
@@ -74,8 +73,8 @@ fn a_level_plain_by_policy_stores_plain_pages_and_one_below_encodes_them() -> ls
 
     // Compacted into level 1, which asks for the cheapest expression: the
     // repeated value becomes a constant.
-    tree.major_compact(64 * 1_024 * 1_024, SeqNo::MAX)?;
-    let compacted = page_expressions(folder.path())?;
+    tree.major_compact(u64::MAX, SeqNo::MAX)?;
+    let compacted = page_expressions(&tree)?;
     assert!(
         compacted.contains(&Expression::Constant),
         "level 1 encodes the repeated value; got {compacted:?}",

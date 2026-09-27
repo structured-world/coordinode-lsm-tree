@@ -989,15 +989,15 @@ impl Table {
             let blocks = self
                 .group_read(handle.as_ref(), ReadCharge::Untraced)
                 .load(&crate::table::row_group::PageWant::ALL)?;
-            for (entry, rows, expression, offsets) in blocks.page_encodings()? {
+            for page in blocks.page_encodings()? {
                 out.push(crate::inspect::PageEncoding {
                     group,
-                    column_id: entry.id.column_id,
-                    row_page: entry.row_page,
-                    rows,
-                    stored_len: entry.length,
-                    expression,
-                    offsets_len: offsets,
+                    column_id: page.entry.id.column_id,
+                    row_page: page.entry.row_page,
+                    rows: page.rows,
+                    stored_len: page.entry.length,
+                    expression: page.expression,
+                    offsets_len: page.offsets_len,
                 });
             }
         }
