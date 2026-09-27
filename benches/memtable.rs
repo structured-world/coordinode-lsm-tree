@@ -259,8 +259,11 @@ fn memtable_highest_seqno(c: &mut Criterion) {
 }
 
 /// Filling a fresh memtable with `n` entries of a 100-byte value: a small
-/// memtable stays in the arena's first blocks, a large one grows through them
-/// into full-size blocks, so both the start and the steady state are timed.
+/// memtable stays in the arena's first block, a large one takes many, so both
+/// the start (with its block allocation) and the steady state are timed.
+/// This measures throughput; per-insert tails come from db_bench's write
+/// workloads, since timing each insert of a few hundred nanoseconds here would
+/// report the timer's own cost.
 fn memtable_insert(c: &mut Criterion) {
     let mut group = c.benchmark_group("memtable insert");
     for n in [1_000usize, 100_000, 1_000_000] {

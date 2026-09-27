@@ -6,9 +6,8 @@
 //!
 //! Blocks are allocated lazily — the arena never pre-allocates a large
 //! contiguous buffer, so it works on 32-bit targets with limited address space.
-//! The first block holds 64 KiB and each next one doubles up to the full block
-//! size, so a memtable allocates about what it holds rather than a full block
-//! for its head node (see `block_capacity`).
+//! Every block is 4 MiB (see [`BLOCK_SHIFT`]), so a memtable allocates close to
+//! what it holds and an empty one holds a single block.
 //! Once a block is full, a new one is allocated and the remaining space in the
 //! old block is abandoned (waste is negligible for typical node allocations of
 //! < 100 bytes).
@@ -30,16 +29,18 @@ use alloc::{boxed::Box, vec::Vec};
 use core::ptr;
 use core::sync::atomic::{AtomicPtr, AtomicU32, Ordering};
 
-/// Bits used for the within-block offset.
+/// Bits used for the within-block offset: 2^22 = 4 MiB per block, on every
+/// target.
 ///
-/// On 64-bit: 2^26 = 64 MiB per block (1M entries fit in block 0,
-/// avoiding multi-block decode overhead).
-/// On 32-bit: 2^22 = 4 MiB per block (keeps allocation within
-/// the limited virtual address space).
-#[cfg(target_pointer_width = "32")]
+/// Every memtable, an empty one included, holds at least one block, taken
+/// by the skiplist's head node. Freshly allocated memory is only reserved on
+/// some platforms, while on others (Windows) the whole allocation is charged
+/// to the process commit at once, so the block size is what an idle memtable
+/// costs there. A block holds the largest node (a tower and a key of at most
+/// `u16::MAX` bytes) many times over, and a larger memtable just takes more
+/// blocks of the same size; the offset decode is one shift and one mask
+/// whatever the block count.
 const BLOCK_SHIFT: u32 = 22;
-#[cfg(not(target_pointer_width = "32"))]
-const BLOCK_SHIFT: u32 = 26;
 
 /// Size of each arena block in bytes.
 const BLOCK_SIZE: u32 = 1 << BLOCK_SHIFT;
@@ -47,34 +48,8 @@ const BLOCK_SIZE: u32 = 1 << BLOCK_SHIFT;
 /// Bitmask for extracting the within-block offset from an encoded u32.
 const BLOCK_MASK: u32 = BLOCK_SIZE - 1;
 
-/// Maximum number of blocks. The encoding addresses 4 GiB; the smaller first
-/// blocks leave the arena a little under that.
+/// Maximum number of blocks.  Supports up to 4 GiB total arena capacity.
 const MAX_BLOCKS: usize = 1 << (32 - BLOCK_SHIFT);
-
-/// Bits of the first block's capacity: 64 KiB.
-const FIRST_BLOCK_SHIFT: u32 = 16;
-
-/// Bytes block `idx` holds: 64 KiB for the first, doubling per block up to
-/// [`BLOCK_SIZE`], full size from there on.
-///
-/// Every block is addressed as if it were full size (`idx << BLOCK_SHIFT |
-/// offset`), so decoding an offset stays one shift and one mask; only the
-/// allocator, which bounds each block by what it holds, and the block's own
-/// allocation read this. Starting small is what keeps a memtable from
-/// allocating a full-size block for its head node alone: freshly allocated
-/// memory is only reserved on some platforms, while on others (Windows) the
-/// whole allocation is charged to the process commit at once.
-const fn block_capacity(idx: usize) -> u32 {
-    let growth = BLOCK_SHIFT - FIRST_BLOCK_SHIFT;
-    if idx >= growth as usize {
-        BLOCK_SIZE
-    } else {
-        // `idx < growth`, at most 10, so the shift stays below BLOCK_SHIFT.
-        #[expect(clippy::cast_possible_truncation, reason = "idx < growth <= 10")]
-        let shift = FIRST_BLOCK_SHIFT + idx as u32;
-        1 << shift
-    }
-}
 
 /// A multi-block bump-allocating arena.
 ///
@@ -84,7 +59,7 @@ const fn block_capacity(idx: usize) -> u32 {
 ///
 /// The u32 offset returned by [`alloc`](Self::alloc) encodes the block
 /// index in the high bits and the within-block offset in the low
-/// `BLOCK_SHIFT` bits (26 on 64-bit, 22 on 32-bit).
+/// `BLOCK_SHIFT` bits.
 pub struct Arena {
     /// Block pointers.  Null means not yet allocated.  Once set to non-null,
     /// a block pointer is never modified — reads may use `Relaxed` ordering
@@ -134,14 +109,11 @@ impl Arena {
             let cur = self.cursor.load(Ordering::Acquire);
             let block_idx = cur >> BLOCK_SHIFT;
             let offset = cur & BLOCK_MASK;
-            // Cannot overflow: offset < BLOCK_SIZE (≤ 2^26), align < BLOCK_SIZE.
+            // Cannot overflow: offset < BLOCK_SIZE (2^22), align < BLOCK_SIZE.
             let aligned = (offset + align - 1) & !(align - 1);
 
             if let Some(new_end) = aligned.checked_add(size) {
-                if new_end < block_capacity(block_idx as usize) {
-                    // Bounded by what this block holds, which is less than
-                    // BLOCK_SIZE for the first blocks.
-                    //
+                if new_end < BLOCK_SIZE {
                     // Strict `<`: when new_end == BLOCK_SIZE the bitwise OR
                     // on the next line would set bit BLOCK_SHIFT in new_end,
                     // colliding with the block_idx bits and wrapping the
@@ -167,18 +139,10 @@ impl Arena {
                         return Some((block_idx << BLOCK_SHIFT) | aligned);
                     }
                 } else {
-                    // Advance to the first later block that holds `size` from
-                    // its start. A small block that cannot is skipped and never
-                    // allocated: no offset ever names it, so it stays null and
-                    // costs nothing. Ensure the target exists BEFORE
+                    // Advance to the next block.  Ensure it exists BEFORE
                     // publishing the new cursor, so that any thread reading
                     // the cursor will find a valid block pointer.
-                    let mut new_block = block_idx + 1;
-                    while (new_block as usize) < MAX_BLOCKS
-                        && size >= block_capacity(new_block as usize)
-                    {
-                        new_block += 1;
-                    }
+                    let new_block = block_idx + 1;
                     if new_block as usize >= MAX_BLOCKS {
                         return None;
                     }
@@ -208,8 +172,8 @@ impl Arena {
     pub unsafe fn get_bytes(&self, offset: u32, len: u32) -> &[u8] {
         let (ptr, off) = unsafe { self.decode(offset) };
         debug_assert!(
-            off + len as usize <= block_capacity((offset >> BLOCK_SHIFT) as usize) as usize,
-            "get_bytes: off={off} + len={len} exceeds its block (offset={offset})",
+            off + len as usize <= BLOCK_SIZE as usize,
+            "get_bytes: off={off} + len={len} exceeds BLOCK_SIZE={BLOCK_SIZE} (offset={offset})",
         );
         // SAFETY: caller guarantees the range is allocated and initialised.
         unsafe { core::slice::from_raw_parts(ptr.add(off), len as usize) }
@@ -233,12 +197,9 @@ impl Arena {
     #[cfg(not(feature = "bytes_1"))]
     pub unsafe fn get_view(&self, offset: u32, len: u32) -> crate::byteview::ByteView {
         let (ptr, off) = unsafe { self.decode(offset) };
-        // The view frees the block under the size it was allocated at when it
-        // is the last reference, so it must carry exactly that size.
-        let capacity = block_capacity((offset >> BLOCK_SHIFT) as usize);
         debug_assert!(
-            off + len as usize <= capacity as usize,
-            "get_view: off={off} + len={len} exceeds its block of {capacity} (offset={offset})",
+            off + len as usize <= BLOCK_SIZE as usize,
+            "get_view: off={off} + len={len} exceeds BLOCK_SIZE={BLOCK_SIZE} (offset={offset})",
         );
         // `off` fits u32: it is masked to BLOCK_SHIFT bits by decode.
         #[expect(
@@ -249,7 +210,7 @@ impl Arena {
         // arena holds a reference for its whole lifetime); the caller
         // guarantees the span is allocated, initialised and immutable.
         unsafe {
-            crate::byteview::ByteView::view_of_shared(ptr, off as u32, len, capacity)
+            crate::byteview::ByteView::view_of_shared(ptr, off as u32, len, BLOCK_SIZE)
         }
     }
 
@@ -338,7 +299,7 @@ impl Arena {
     fn ensure_block(&self, idx: usize) {
         if self.blocks[idx].load(Ordering::Acquire).is_null() {
             // Each block is a byteview shared-heap region (refcount header +
-            // `block_capacity(idx)` data bytes, 8-byte aligned — more than the 4 bytes
+            // BLOCK_SIZE data bytes, 8-byte aligned — more than the 4 bytes
             // AtomicU32 tower pointers need). The stored pointer is the DATA
             // base, so every offset computation below is unchanged; the
             // header is what lets `get_view` hand out zero-copy ByteViews
@@ -352,18 +313,17 @@ impl Arena {
             // release CAS), and the head sentinel's tower is explicitly
             // UNSET-initialized at creation. No reader ever observes an
             // unwritten byte, so eager zeroing is pure waste.
-            let capacity = block_capacity(idx);
-            let raw = crate::byteview::ByteView::alloc_shared_heap(capacity);
+            let raw = crate::byteview::ByteView::alloc_shared_heap(BLOCK_SIZE);
 
             // CAS null → raw.  If another thread won, free our block.
             if self.blocks[idx]
                 .compare_exchange(ptr::null_mut(), raw, Ordering::AcqRel, Ordering::Acquire)
                 .is_err()
             {
-                // SAFETY: raw was just allocated as a `capacity`-byte shared
-                // heap region and holds only our own reference.
+                // SAFETY: raw was just allocated as a BLOCK_SIZE shared heap
+                // region and holds only our own reference.
                 unsafe {
-                    crate::byteview::ByteView::shared_heap_release(raw, capacity);
+                    crate::byteview::ByteView::shared_heap_release(raw, BLOCK_SIZE);
                 }
             }
         }
@@ -378,16 +338,16 @@ impl Default for Arena {
 
 impl Drop for Arena {
     fn drop(&mut self) {
-        for (idx, block) in self.blocks.iter().enumerate() {
+        for block in &*self.blocks {
             let ptr = block.load(Ordering::Relaxed);
             if !ptr.is_null() {
-                // SAFETY: `ptr` is the data base of a `block_capacity(idx)`
-                // shared heap region allocated by ensure_block; this releases
-                // the arena's own reference. Outstanding views (ByteViews
-                // handed out by get_view) each hold their own reference, so
-                // the block stays alive until the last of them drops.
+                // SAFETY: `ptr` is the data base of a BLOCK_SIZE shared heap
+                // region allocated by ensure_block; this releases the arena's
+                // own reference. Outstanding views (ByteViews handed out by
+                // get_view) each hold their own reference, so the block stays
+                // alive until the last of them drops.
                 unsafe {
-                    crate::byteview::ByteView::shared_heap_release(ptr, block_capacity(idx));
+                    crate::byteview::ByteView::shared_heap_release(ptr, BLOCK_SIZE);
                 }
             }
         }
