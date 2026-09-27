@@ -38,6 +38,31 @@ pub struct BurrBuilder {
     params: BurrParams,
 }
 
+/// Heap bytes a build over `n` keys allocates at its peak, beyond the hashes
+/// handed to it: the first layer's equations, its kept/bumped split, and the
+/// ribbon solve's per-slot rows (`occupied`, two coefficient words, the RHS
+/// and the solution word) at one slot per key. A retrieval build also copies
+/// its hashes and values, pairs them for the split and unzips both halves. The
+/// first layer is the peak: the next ones solve only the keys it bumped.
+#[must_use]
+pub(crate) const fn build_peak_bytes(n: usize, retrieval: bool) -> usize {
+    const WORD: usize = core::mem::size_of::<u64>();
+    const SOLVE_PER_SLOT: usize = core::mem::size_of::<bool>() + 4 * WORD;
+    const MEMBERSHIP_PER_KEY: usize =
+        core::mem::size_of::<StandardEquation>() + WORD + SOLVE_PER_SLOT;
+    // Hash and value copies, the (hash, value) pairs, the split of those
+    // pairs, and the two unzipped halves.
+    const RETRIEVAL_EXTRA_PER_KEY: usize = 2 * WORD + 2 * WORD + 2 * WORD + 2 * WORD;
+    let per_key = if retrieval {
+        MEMBERSHIP_PER_KEY + RETRIEVAL_EXTRA_PER_KEY
+    } else {
+        MEMBERSHIP_PER_KEY
+    };
+    // `n` counts keys a writer already holds in memory at a word or more
+    // each, so this product stays far below `usize::MAX`.
+    n * per_key
+}
+
 impl core::fmt::Debug for BurrBuilder {
     fn fmt(&self, f: &mut core::fmt::Formatter<'_>) -> core::fmt::Result {
         f.debug_struct("BurrBuilder")

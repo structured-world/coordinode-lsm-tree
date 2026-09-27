@@ -236,6 +236,16 @@ pub struct Writer {
     /// Stamped into each accumulated locator's `block_id`.
     locator_block_id: u64,
 
+    /// Largest locator slot recorded so far, which sizes the section's width.
+    locator_max_slot: u64,
+
+    /// Heap bytes the per-key and per-block state holds for `finish`, and the
+    /// bytes `finish` will append, as of the last data block. Refreshed once
+    /// per block rather than per key: a table rotates on them at a key
+    /// boundary, and one block's keys move neither by much.
+    held_state_bytes: u64,
+    finish_metadata_bytes: u64,
+
     initial_level: u8,
 
     /// Block encryption provider (if encryption at rest is enabled)
@@ -558,6 +568,9 @@ impl Writer {
             locator: None,
             locators: Vec::new(),
             locator_block_id: 0,
+            locator_max_slot: 0,
+            held_state_bytes: 0,
+            finish_metadata_bytes: 0,
 
             #[cfg(feature = "columnar")]
             last_group_tag: None,
@@ -620,18 +633,77 @@ impl Writer {
     }
 
     /// Current output-size estimate for table-rotation decisions: the bytes
-    /// already on disk plus the uncompressed size of blocks still in flight on
-    /// the parallel pipeline (whose on-disk size isn't known until written).
-    /// Equals `meta.file_pos` exactly on the serial path.
+    /// already on disk, the uncompressed size of blocks still in flight on the
+    /// parallel pipeline (whose on-disk size isn't known until written), and
+    /// the filter, index and other sections `finish` will append.
     pub(crate) fn output_size_hint(&self) -> u64 {
         #[cfg(feature = "std")]
-        {
-            *self.meta.file_pos + self.parallel_pending_bytes
-        }
+        let data = *self.meta.file_pos + self.parallel_pending_bytes;
         #[cfg(not(feature = "std"))]
-        {
-            *self.meta.file_pos
+        let data = *self.meta.file_pos;
+        data + self.finish_metadata_bytes
+    }
+
+    /// Heap bytes the per-key and per-block state holds until `finish`,
+    /// including what `finish` allocates on top to build its sections. It
+    /// grows with the keys, not the data bytes, so a table of well-compressing
+    /// rows can reach its memory before its size.
+    pub(crate) fn held_state_bytes(&self) -> u64 {
+        self.held_state_bytes
+    }
+
+    /// A data block was written: advances the locator ordinal and refreshes
+    /// the held-state and finish-metadata estimates the table rotates on.
+    fn block_written(&mut self) {
+        if self.locator.is_some() {
+            // Positions only grow within a block, so the block's last key
+            // carries its largest slot.
+            if let Some(&(_, _, slot)) = self.locators.last() {
+                self.locator_max_slot = self.locator_max_slot.max(slot);
+            }
+            self.locator_block_id += 1;
         }
+        self.refresh_state_estimates();
+    }
+
+    fn refresh_state_estimates(&mut self) {
+        const WORD: usize = core::mem::size_of::<u64>();
+
+        let mut held = self.filter_writer.held_bytes() + self.index_writer.held_bytes();
+        let mut metadata =
+            self.filter_writer.finish_output_bytes() + self.index_writer.finish_output_bytes();
+
+        if let Some(spec) = self.locator
+            && !self.locators.is_empty()
+        {
+            let n = self.locators.len();
+            let section = crate::table::locator::section_size_estimate(
+                n,
+                spec,
+                self.locator_block_id,
+                self.locator_max_slot,
+            );
+            // The triples, then at `finish` their split into hashes and packed
+            // values, the retrieval build over them, and the section bytes.
+            held += (self.locators.capacity() * core::mem::size_of::<(u64, u64, u64)>()
+                + n * 2 * WORD
+                + crate::table::filter::ribbon::burr::builder::build_peak_bytes(n, true)
+                + section) as u64;
+            metadata += section as u64;
+        }
+
+        // Per-block sections, at their in-memory size.
+        let sections = self.block_layouts.len() * core::mem::size_of::<(BlockOffset, Vec<u32>)>()
+            + self.seqno_bounds_section.len() * core::mem::size_of::<(BlockOffset, (u64, u64))>()
+            + self.zone_map_section.len()
+                * core::mem::size_of::<(BlockOffset, Vec<crate::table::zone_map::ColumnStats>)>()
+            // Rows are `u32`, so the count fits `usize` on every target.
+            + self.delete_bitmap.len() as usize * core::mem::size_of::<u32>();
+        held += sections as u64;
+        metadata += sections as u64;
+
+        self.held_state_bytes = held;
+        self.finish_metadata_bytes = metadata;
     }
 
     /// Enables parallel block compression on this writer using `spawner` to run
@@ -1419,21 +1491,18 @@ impl Writer {
             return Ok(());
         };
 
-        // Advance the locator block ordinal: this spill flushes the block whose
-        // keys were recorded with the current `locator_block_id`, so the next
-        // block's keys belong to the next ordinal. Done here (not per write
-        // path) so it stays correct for both the serial and parallel spills.
-        // Gated on the feature so an unenabled writer pays nothing.
-        if self.locator.is_some() {
-            self.locator_block_id += 1;
-        }
-
         // Order-independent index-handle data, captured before the chunk is
         // consumed. The parallel path needs it owned because the chunk is
         // cleared at submit time, before a worker has produced the block.
         let last_key = last.key.user_key.clone();
         let last_seqno = last.key.seqno;
         let item_count = self.chunk.len();
+
+        // This spill flushes the block whose keys were recorded with the current
+        // `locator_block_id`, so the next block's keys belong to the next
+        // ordinal. Done here (not per write path) so it stays correct for both
+        // the serial and parallel spills.
+        self.block_written();
         // Per-block seqno bounds let a seqno-scoped scan skip this whole block
         // when its `max` is below the target: one fold over entries in hand.
         let seqno_bounds = self.use_seqno_in_index.then(|| {
@@ -2060,9 +2129,7 @@ impl Writer {
         // This block's keys were recorded with the current locator ordinal;
         // advance it so a following batch's keys belong to the next block (the
         // chunk-based path does this in `spill_block`).
-        if self.locator.is_some() {
-            self.locator_block_id += 1;
-        }
+        self.block_written();
         Ok(Some(inputs.last_key))
     }
 
@@ -2597,9 +2664,7 @@ impl Writer {
             columnar_columns,
             row_group,
         )?;
-        if self.locator.is_some() {
-            self.locator_block_id += 1;
-        }
+        self.block_written();
         Ok(Some(inputs.last_key))
     }
 

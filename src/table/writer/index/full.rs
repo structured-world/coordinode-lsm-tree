@@ -21,6 +21,8 @@ pub struct FullIndexWriter {
     zstd_two_pass_seed: bool,
     restart_interval: u8,
     block_handles: Vec<KeyedBlockHandle>,
+    /// Bytes the handles hold: each handle and its end key.
+    handle_bytes: usize,
     encryption: Option<Arc<dyn EncryptionProvider>>,
     /// Owning SST's table id; passed by the outer Writer via
     /// `use_table_id` before `finish()`. Used to populate
@@ -42,6 +44,7 @@ impl FullIndexWriter {
             zstd_two_pass_seed: true,
             restart_interval: 1,
             block_handles: Vec::new(),
+            handle_bytes: 0,
             encryption: None,
             table_id: 0,
             ecc: None,
@@ -102,9 +105,21 @@ impl<W: crate::io::Write + crate::io::Seek> BlockIndexWriter<W> for FullIndexWri
             block_handle.end_key(),
         );
 
+        self.handle_bytes +=
+            core::mem::size_of::<KeyedBlockHandle>() + block_handle.end_key().len();
         self.block_handles.push(block_handle);
 
         Ok(())
+    }
+
+    fn held_bytes(&self) -> u64 {
+        // `finish` encodes every handle into one block buffer alongside them.
+        (2 * self.handle_bytes) as u64
+    }
+
+    fn finish_output_bytes(&self) -> u64 {
+        // The in-memory size bounds the encoded block from above.
+        self.handle_bytes as u64
     }
 
     fn finish(
