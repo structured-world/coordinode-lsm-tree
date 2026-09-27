@@ -25,8 +25,13 @@ pub trait BlockIndexWriter<W: crate::io::Write + crate::io::Seek> {
     /// Heap bytes this writer holds until [`finish`](Self::finish).
     fn held_bytes(&self) -> u64;
 
-    /// Bytes [`finish`](Self::finish) will append to the table file,
-    /// estimated from what is held now.
+    /// Heap bytes [`finish`](Self::finish) allocates on top of
+    /// [`held_bytes`](Self::held_bytes) while it encodes, at its peak.
+    fn finish_scratch_bytes(&self) -> u64;
+
+    /// Bytes the table file gets for this index, estimated from what is held
+    /// now: what [`finish`](Self::finish) appends, and the top-level index
+    /// again, which the table mirrors at its tail.
     fn finish_output_bytes(&self) -> u64;
 
     /// Writes the block index to a file.

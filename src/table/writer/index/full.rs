@@ -23,6 +23,8 @@ pub struct FullIndexWriter {
     block_handles: Vec<KeyedBlockHandle>,
     /// Bytes the handles hold: each handle and its end key.
     handle_bytes: usize,
+    /// Bytes the handles take encoded, bounded from above.
+    encoded_bytes: usize,
     encryption: Option<Arc<dyn EncryptionProvider>>,
     /// Owning SST's table id; passed by the outer Writer via
     /// `use_table_id` before `finish()`. Used to populate
@@ -45,9 +47,25 @@ impl FullIndexWriter {
             restart_interval: 1,
             block_handles: Vec::new(),
             handle_bytes: 0,
+            encoded_bytes: 0,
             encryption: None,
             table_id: 0,
             ecc: None,
+        }
+    }
+
+    /// A writer over handles already collected, which hold `handle_bytes` and
+    /// take `encoded_bytes` encoded.
+    pub(super) fn with_handles(
+        block_handles: Vec<KeyedBlockHandle>,
+        handle_bytes: usize,
+        encoded_bytes: usize,
+    ) -> Self {
+        Self {
+            block_handles,
+            handle_bytes,
+            encoded_bytes,
+            ..Self::new()
         }
     }
 }
@@ -107,19 +125,25 @@ impl<W: crate::io::Write + crate::io::Seek> BlockIndexWriter<W> for FullIndexWri
 
         self.handle_bytes +=
             core::mem::size_of::<KeyedBlockHandle>() + block_handle.end_key().len();
+        self.encoded_bytes += block_handle.encoded_len_bound();
         self.block_handles.push(block_handle);
 
         Ok(())
     }
 
     fn held_bytes(&self) -> u64 {
-        // `finish` encodes every handle into one block buffer alongside them.
-        (2 * self.handle_bytes) as u64
+        self.handle_bytes as u64
+    }
+
+    fn finish_scratch_bytes(&self) -> u64 {
+        // `finish` encodes every handle into one block buffer, which the
+        // table keeps until it writes the tail mirror.
+        self.encoded_bytes as u64
     }
 
     fn finish_output_bytes(&self) -> u64 {
-        // The in-memory size bounds the encoded block from above.
-        self.handle_bytes as u64
+        // Written twice: at the head and as the tail mirror.
+        (2 * self.encoded_bytes) as u64
     }
 
     fn finish(

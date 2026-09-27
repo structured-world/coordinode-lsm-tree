@@ -36,7 +36,11 @@ pub struct PartitionedIndexWriter {
     tli_handles: Vec<KeyedBlockHandle>,
     /// Bytes the top-level index entries hold: each handle and its end key.
     tli_bytes: usize,
+    /// Bytes the top-level index entries take encoded, bounded from above.
+    tli_encoded: usize,
     data_block_handles: Vec<KeyedBlockHandle>,
+    /// Bytes the open partition's entries take encoded, bounded from above.
+    open_encoded: usize,
 
     buffer_size: u32,
     partition_size: u32,
@@ -75,7 +79,9 @@ impl PartitionedIndexWriter {
 
             tli_handles: Vec::new(),
             tli_bytes: 0,
+            tli_encoded: 0,
             data_block_handles: Vec::new(),
+            open_encoded: 0,
             block_buffer: Vec::with_capacity(4_096),
 
             final_write_buffer: Vec::new(),
@@ -151,6 +157,7 @@ impl PartitionedIndexWriter {
 
         self.tli_bytes +=
             core::mem::size_of::<KeyedBlockHandle>() + index_block_handle.end_key().len();
+        self.tli_encoded += index_block_handle.encoded_len_bound();
         self.tli_handles.push(index_block_handle);
         self.final_write_buffer.append(&mut self.block_buffer);
 
@@ -161,6 +168,7 @@ impl PartitionedIndexWriter {
         // IMPORTANT: Clear buffer after everything else
         self.data_block_handles.clear();
         self.buffer_size = 0;
+        self.open_encoded = 0;
 
         Ok(())
     }
@@ -290,6 +298,7 @@ impl<W: crate::io::Write + crate::io::Seek> BlockIndexWriter<W> for PartitionedI
             (block_handle.end_key().len() + core::mem::size_of::<KeyedBlockHandle>()) as u32;
 
         self.buffer_size += block_handle_size;
+        self.open_encoded += block_handle.encoded_len_bound();
 
         self.data_block_handles.push(block_handle);
 
@@ -308,10 +317,16 @@ impl<W: crate::io::Write + crate::io::Seek> BlockIndexWriter<W> for PartitionedI
             + self.tli_bytes) as u64
     }
 
+    fn finish_scratch_bytes(&self) -> u64 {
+        // `finish` encodes the open partition and then the top-level index,
+        // which the table keeps until it writes the tail mirror.
+        (self.open_encoded + self.tli_encoded) as u64
+    }
+
     fn finish_output_bytes(&self) -> u64 {
-        // The open partition and the top-level index are counted at their
-        // in-memory size, above what their encoding takes.
-        (self.final_write_buffer.len() + self.buffer_size as usize + self.tli_bytes) as u64
+        // The table writes the top-level index twice, at the head and as the
+        // tail mirror.
+        (self.final_write_buffer.len() + self.open_encoded + 2 * self.tli_encoded) as u64
     }
 
     fn finish(

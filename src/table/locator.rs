@@ -86,23 +86,49 @@ fn precision_byte(p: LocatorPrecision) -> u8 {
     }
 }
 
-/// Bytes a section over `n` keys will take: its header and a retrieval ribbon
-/// `r` bits per key, `r` chosen as [`build_locator_section`] chooses it from
-/// the largest block id and slot recorded so far. A width past 64 bits skips
-/// the section at build; it is counted at 64 here, an estimate from above.
+/// The `(block_id_bits, slot_bits)` a section takes for a table whose largest
+/// block id and slot are `max_block` and `max_slot`, or `None` when `spec`'s
+/// explicit widths cannot hold them or their sum passes 64 bits.
+///
+/// Both maxima only grow as a table is written, so once this is `None` it
+/// stays `None`: the section is skipped whatever follows.
 #[must_use]
-pub fn section_size_estimate(n: usize, spec: LocatorSpec, max_block: u64, max_slot: u64) -> usize {
+pub fn section_widths(spec: LocatorSpec, max_block: u64, max_slot: u64) -> Option<(u8, u8)> {
+    // Per-block precision drops `slot` entirely (locator = block_id), so its
+    // width is 0 regardless of the recorded slot values and there is no slot
+    // fit to check.
+    let block_only = spec.precision == LocatorPrecision::Block;
     let block_id_bits = spec.block_id_bits.unwrap_or_else(|| bits_for(max_block));
-    let slot_bits = if spec.precision == LocatorPrecision::Block {
+    let slot_bits = if block_only {
         0
     } else {
         spec.slot_bits.unwrap_or_else(|| bits_for(max_slot))
     };
-    // Explicit widths are the caller's, so the sum is taken as the build takes
-    // it, in `u16`.
-    let r = (u16::from(block_id_bits) + u16::from(slot_bits)).min(64);
-    SECTION_HEADER_LEN
-        + crate::config::BloomConstructionPolicy::BitsPerKey(f32::from(r)).encoded_filter_size(n)
+
+    let block_fits = block_id_bits >= bits_for(max_block);
+    let slot_fits = block_only || slot_bits >= bits_for(max_slot);
+    // Explicit widths are the caller's, so the sum is taken in `u16`.
+    let r = u16::from(block_id_bits) + u16::from(slot_bits);
+    (block_fits && slot_fits && r != 0 && r <= 64).then_some((block_id_bits, slot_bits))
+}
+
+/// Bytes a section over `n` keys will take: its header and a retrieval ribbon
+/// `r` bits per key, `r` chosen by [`section_widths`] from the largest block id
+/// and slot recorded so far. `None` when the section will be skipped.
+#[must_use]
+pub fn section_size_estimate(
+    n: usize,
+    spec: LocatorSpec,
+    max_block: u64,
+    max_slot: u64,
+) -> Option<usize> {
+    let (block_id_bits, slot_bits) = section_widths(spec, max_block, max_slot)?;
+    let r = block_id_bits + slot_bits;
+    Some(
+        SECTION_HEADER_LEN
+            + crate::config::BloomConstructionPolicy::BitsPerKey(f32::from(r))
+                .encoded_filter_size(n),
+    )
 }
 
 /// Build the `locator` section bytes from accumulated `(hash, block_id, slot)`
@@ -128,28 +154,17 @@ pub fn build_locator_section(entries: &[(u64, u64, u64)], spec: LocatorSpec) -> 
     let max_block = entries.iter().map(|e| e.1).max().unwrap_or(0);
     let max_slot = entries.iter().map(|e| e.2).max().unwrap_or(0);
 
-    // Per-block precision drops `slot` entirely (locator = block_id), so its
-    // width is 0 regardless of the recorded slot values and there is no slot
-    // fit to check.
-    let block_only = spec.precision == LocatorPrecision::Block;
-    let block_id_bits = spec.block_id_bits.unwrap_or_else(|| bits_for(max_block));
-    let slot_bits = if block_only {
-        0
-    } else {
-        spec.slot_bits.unwrap_or_else(|| bits_for(max_slot))
-    };
-
     // Explicit widths that cannot hold the real layout → graceful skip.
-    let block_fits = block_id_bits >= bits_for(max_block);
-    let slot_fits = block_only || slot_bits >= bits_for(max_slot);
-    let r = u16::from(block_id_bits) + u16::from(slot_bits);
-    if !block_fits || !slot_fits || r == 0 || r > 64 {
+    let Some((block_id_bits, slot_bits)) = section_widths(spec, max_block, max_slot) else {
         log::debug!(
-            "locator section skipped: widths block_id_bits={block_id_bits} slot_bits={slot_bits} \
-             cannot represent max_block={max_block} max_slot={max_slot} (r={r})"
+            "locator section skipped: widths {:?}/{:?} cannot represent \
+             max_block={max_block} max_slot={max_slot}",
+            spec.block_id_bits,
+            spec.slot_bits,
         );
         return None;
-    }
+    };
+    let r = u16::from(block_id_bits) + u16::from(slot_bits);
     let slot_mask: u64 = if slot_bits == 0 {
         0
     } else if slot_bits >= 64 {
