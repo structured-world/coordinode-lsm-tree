@@ -32,6 +32,8 @@ pub(super) struct TombstoneShare {
     next_start: usize,
     /// Bytes of the current output's entries except the ends still open.
     fixed: u64,
+    /// Entries of the current output, one per tombstone piece.
+    pieces: u64,
 }
 
 impl TombstoneShare {
@@ -41,23 +43,19 @@ impl TombstoneShare {
             open: Vec::new(),
             next_start: 0,
             fixed: 0,
+            pieces: 0,
         }
     }
 
-    /// Moves to `key`, the next key written.
+    /// Moves to `key`, the next key written: opens the tombstones starting
+    /// before it, closes those ending at or before it.
     pub(super) fn advance(
         &mut self,
         tombstones: &[RangeTombstone],
         key: &[u8],
         comparator: &dyn UserComparator,
     ) {
-        while let Some(tombstone) = tombstones.get(self.next_start)
-            && comparator.compare(&tombstone.start, key) == Ordering::Less
-        {
-            self.fixed += ENTRY_OVERHEAD + tombstone.start.len() as u64;
-            push(&mut self.open, self.next_start, tombstones, comparator);
-            self.next_start += 1;
-        }
+        self.open_while(tombstones, key, comparator, Ordering::Less);
         while let Some(tombstone) = self.open.first().and_then(|&i| tombstones.get(i))
             && comparator.compare(&tombstone.end, key) != Ordering::Greater
         {
@@ -66,16 +64,89 @@ impl TombstoneShare {
         }
     }
 
+    /// Opens the tombstones starting at `key` too, the point last advanced to.
+    pub(super) fn open_through(
+        &mut self,
+        tombstones: &[RangeTombstone],
+        key: &[u8],
+        comparator: &dyn UserComparator,
+    ) {
+        self.open_while(tombstones, key, comparator, Ordering::Equal);
+    }
+
+    /// Opens pending tombstones whose start compares to `key` as `ordering`
+    /// or less.
+    fn open_while(
+        &mut self,
+        tombstones: &[RangeTombstone],
+        key: &[u8],
+        comparator: &dyn UserComparator,
+        ordering: Ordering,
+    ) {
+        while let Some(tombstone) = tombstones.get(self.next_start)
+            && comparator.compare(&tombstone.start, key) <= ordering
+        {
+            self.fixed += ENTRY_OVERHEAD + tombstone.start.len() as u64;
+            self.pieces += 1;
+            push(&mut self.open, self.next_start, tombstones, comparator);
+            self.next_start += 1;
+        }
+    }
+
     /// A new output begins at `lower`, the key last advanced to: it takes the
     /// tombstones still open, each starting at `lower`.
     pub(super) fn open_output(&mut self, lower: &[u8]) {
         self.fixed = self.open.len() as u64 * (ENTRY_OVERHEAD + lower.len() as u64);
+        self.pieces = self.open.len() as u64;
     }
 
     /// Bytes the current output's entries take if it closes at `key`, the key
     /// last advanced to.
     pub(super) fn bytes(&self, key: &[u8]) -> u64 {
         self.fixed + self.open.len() as u64 * key.len() as u64
+    }
+
+    /// Entries the current output holds.
+    pub(super) fn pieces(&self) -> u64 {
+        self.pieces
+    }
+
+    /// Bytes an output beginning at `key` starts with: a piece of every
+    /// tombstone still open, from `key`, its end at least as long.
+    pub(super) fn carry(&self, key: &[u8]) -> u64 {
+        self.open.len() as u64 * (ENTRY_OVERHEAD + 2 * key.len() as u64)
+    }
+
+    /// Bytes of the pending tombstones starting at `key`, whole.
+    pub(super) fn group_bytes(
+        &self,
+        tombstones: &[RangeTombstone],
+        key: &[u8],
+        comparator: &dyn UserComparator,
+    ) -> u64 {
+        tombstones
+            .get(self.next_start..)
+            .unwrap_or_default()
+            .iter()
+            .take_while(|rt| comparator.compare(&rt.start, key) == Ordering::Equal)
+            .map(|rt| ENTRY_OVERHEAD + (rt.start.len() + rt.end.len()) as u64)
+            .sum()
+    }
+
+    /// The least end among the open tombstones.
+    pub(super) fn first_open_end<'t>(
+        &self,
+        tombstones: &'t [RangeTombstone],
+    ) -> Option<&'t crate::UserKey> {
+        self.open
+            .first()
+            .and_then(|&i| tombstones.get(i))
+            .map(|rt| &rt.end)
+    }
+
+    /// Whether a tombstone remains open or pending.
+    pub(super) fn has_more(&self, tombstones: &[RangeTombstone]) -> bool {
+        !self.open.is_empty() || self.next_start < tombstones.len()
     }
 
     /// The first tombstone, by start, not yet open.

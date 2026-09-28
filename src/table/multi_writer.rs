@@ -997,26 +997,53 @@ impl MultiWriter {
             Some(key) if !self.range_tombstones.is_empty() => self.tombstone_share.bytes(key),
             _ => 0,
         };
-        self.full_with_tombstones(tombstones)
+        self.full_with_tombstones(tombstones, self.tombstone_share.pieces())
     }
 
-    /// The current table reached its target if it closes holding `tombstones`
-    /// bytes of range-tombstone entries.
-    fn full_with_tombstones(&self, tombstones: u64) -> bool {
+    /// The current table reached its target if it closes holding `pieces`
+    /// range-tombstone entries of `tombstones` encoded bytes. The writer holds
+    /// each entry until `finish`, which encodes them into a block buffer and
+    /// frames that when the block is transformed.
+    fn full_with_tombstones(&self, tombstones: u64, pieces: u64) -> bool {
+        use crate::table::block::{BlockType, framed_len_bound, transform_scratch_bound};
+
         let linked = crate::table::writer::linked_blob_files_len(self.linked_blobs.len());
-        let tombstone_block = if tombstones == 0 {
-            0
+        let (tombstone_block, tombstones_held) = if tombstones == 0 {
+            (0, 0)
         } else {
-            crate::table::block::framed_len_bound(
-                tombstones,
-                crate::table::block::BlockType::RangeTombstone,
-                CompressionType::None,
-                self.encryption.as_deref(),
-                self.ecc,
+            let encryption = self.encryption.as_deref();
+            let none = CompressionType::None;
+            (
+                framed_len_bound(
+                    tombstones,
+                    BlockType::RangeTombstone,
+                    none,
+                    encryption,
+                    self.ecc,
+                ),
+                pieces * core::mem::size_of::<RangeTombstone>() as u64
+                    + tombstones
+                    + transform_scratch_bound(
+                        tombstones,
+                        BlockType::RangeTombstone,
+                        none,
+                        encryption,
+                        self.ecc,
+                    ),
             )
         };
         self.writer.output_size_hint() + linked + tombstone_block >= self.target_size
-            || self.writer.held_state_bytes() + tombstones >= self.target_size
+            || self.writer.held_state_bytes() + tombstones_held >= self.target_size
+    }
+
+    /// Closing the current table at `key` sheds what it holds: the next one
+    /// starts with a piece of every tombstone open at `key`. When those alone
+    /// fill half the target, closing would carry them from output to output
+    /// without shedding any, so the table grows past its target instead; a
+    /// set of tombstones overlapping one another cannot be split below them.
+    fn rotation_sheds(&self, key: &[u8]) -> bool {
+        let carry = self.tombstone_share.carry(key);
+        carry == 0 || carry < self.target_size / 2
     }
 
     /// Writes an item
@@ -1047,7 +1074,7 @@ impl MultiWriter {
                 }
             }
 
-            if self.table_full() {
+            if self.table_full() && self.rotation_sheds(&item.key.user_key) {
                 self.rotate()?;
                 self.tombstone_share.open_output(&item.key.user_key);
             }
@@ -1093,34 +1120,59 @@ impl MultiWriter {
         self.writer.validate_columnar_batch(batch, &comparator)
     }
 
-    /// A flush's tombstones starting past its last key reach no rotation check
-    /// on a key, and the last output's zone is open above. They are checked at
-    /// their starts instead: where the output would pass its target, it closes
-    /// at that start and an output of tombstones alone takes the zone above.
-    /// Such outputs are separate L0 runs, like every flush output. Clipping
-    /// drops these tombstones from a compaction's outputs instead.
+    /// A flush's tombstones past its last key reach no rotation check on a
+    /// key, and the last output's zone is open above. They are checked at the
+    /// points where the entries change, each start and each end, in order:
+    /// where the output would pass its target, it closes at that point and an
+    /// output of tombstones alone takes the zone above. At a start, the check
+    /// counts the tombstones starting there, whole, so a group sharing the
+    /// last start is split from what came before. Such outputs are separate
+    /// L0 runs, like every flush output. Clipping drops these tombstones from
+    /// a compaction's outputs instead.
     fn split_tombstones_past_the_last_key(&mut self) -> crate::Result<()> {
+        use core::cmp::Ordering;
+
         if self.clip_range_tombstones {
             return Ok(());
         }
         let comparator = self.comparator.clone();
-        let mut at = self.tombstone_share.next_pending();
-        while let Some(start) = self.range_tombstones.get(at).map(|rt| rt.start.clone()) {
+        loop {
+            let tombstones = &self.range_tombstones;
+            let share = &self.tombstone_share;
+            let start = tombstones.get(share.next_pending()).map(|rt| &rt.start);
+            let end = share.first_open_end(tombstones);
+            let point = match (start, end) {
+                (Some(start), Some(end)) => {
+                    if comparator.compare(start, end) == Ordering::Greater {
+                        end.clone()
+                    } else {
+                        start.clone()
+                    }
+                }
+                (Some(point), None) | (None, Some(point)) => point.clone(),
+                (None, None) => break,
+            };
             self.tombstone_share
-                .advance(&self.range_tombstones, &start, comparator.as_ref());
-            // An empty zone is never closed: that output would hold nothing.
-            let bytes = self.tombstone_share.bytes(&start);
-            if bytes > 0 && self.full_with_tombstones(bytes) {
-                self.current_key = Some(start.clone());
+                .advance(&self.range_tombstones, &point, comparator.as_ref());
+            let bytes = self.tombstone_share.bytes(&point);
+            let group = self.tombstone_share.group_bytes(
+                &self.range_tombstones,
+                &point,
+                comparator.as_ref(),
+            );
+            // An empty zone is never closed: that output would hold nothing,
+            // nor is the last one, with nothing above it.
+            if bytes > 0
+                && self.tombstone_share.has_more(&self.range_tombstones)
+                && self.full_with_tombstones(bytes + group, self.tombstone_share.pieces())
+                && self.rotation_sheds(&point)
+            {
+                self.current_key = Some(point.clone());
                 self.rotate()?;
-                self.tombstone_share.open_output(&start);
+                self.tombstone_share.open_output(&point);
             }
-            // Tombstones sharing this start open together at the next one.
-            while self.range_tombstones.get(at).is_some_and(|rt| {
-                comparator.compare(&rt.start, &start) == core::cmp::Ordering::Equal
-            }) {
-                at += 1;
-            }
+            self.tombstone_share
+                .open_through(&self.range_tombstones, &point, comparator.as_ref());
         }
         Ok(())
     }
