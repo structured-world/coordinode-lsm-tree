@@ -683,12 +683,12 @@ fn a_flush_cuts_each_tombstone_into_the_outputs_it_spans() -> crate::Result<()> 
             })
             .collect(),
     );
-    // Each key passes the 100-byte target, so the outputs' zones are
-    // (.., l), [l, q), [q, x), [x, ..).
+    // Each key fills a block of its own and passes the target once written,
+    // so the outputs' zones are (.., l), [l, q), [q, x), [x, ..).
     for key in [b"b" as &[u8], b"l", b"q", b"x"] {
         mw.write(InternalValue::from_components(
             UserKey::from(key),
-            vec![0u8; 4_000],
+            vec![0u8; 5_000],
             1,
             crate::ValueType::Value,
         ))?;
@@ -937,6 +937,61 @@ fn outputs_of_tombstones_alone_count_their_sentinel_filter_build() -> crate::Res
     assert!(
         2 * with_prefixes >= 3 * plain,
         "{with_prefixes} outputs with the prefixes, {plain} without",
+    );
+    Ok(())
+}
+
+/// A tombstone spanning many keys is carried into every output, like the
+/// tail every table ends with, and closing one sheds none of it: with a
+/// target below that tail, the outputs still take a block's worth of keys
+/// each, not one key each.
+#[test]
+fn a_carried_tombstone_does_not_close_a_table_on_every_key() -> crate::Result<()> {
+    use crate::{UserKey, range_tombstone::RangeTombstone};
+
+    const KEYS: usize = 1_000;
+    let keys: Vec<Vec<u8>> = (0..KEYS).map(|i| format!("k{i:05}").into_bytes()).collect();
+    let keys: Vec<&[u8]> = keys.iter().map(Vec::as_slice).collect();
+    let tombstone = RangeTombstone::new(
+        UserKey::from(b"k" as &[u8]),
+        UserKey::from(b"l" as &[u8]),
+        5,
+    );
+    let (_folder, tables) = flush_outputs(4_096, &keys, vec![tombstone])?;
+    assert!(
+        tables.len() <= KEYS / 20,
+        "{} outputs for {KEYS} keys",
+        tables.len(),
+    );
+    Ok(())
+}
+
+/// A tombstone past the last key with a long bound sizes the synthetic table
+/// every output of tombstones alone is estimated with; the short ones before
+/// it still pack a block's worth into each such output, not one each.
+#[test]
+fn one_long_trailing_bound_does_not_fragment_the_tombstones_before_it() -> crate::Result<()> {
+    use crate::{UserKey, range_tombstone::RangeTombstone};
+
+    const TOMBSTONES: usize = 200;
+    let mut tombstones: Vec<_> = (0..TOMBSTONES)
+        .map(|i| {
+            let start = format!("x{i:05}").into_bytes();
+            let mut end = start.clone();
+            end.push(0);
+            RangeTombstone::new(UserKey::from(start), UserKey::from(end), 5)
+        })
+        .collect();
+    tombstones.push(RangeTombstone::new(
+        UserKey::from(random_bound_of(1, b"y".to_vec(), 20_000)),
+        UserKey::from(b"z" as &[u8]),
+        5,
+    ));
+    let (_folder, tables) = flush_outputs(4_096, &[b"a"], tombstones)?;
+    assert!(
+        tables.len() <= TOMBSTONES / 4,
+        "{} outputs for {TOMBSTONES} short tombstones",
+        tables.len(),
     );
     Ok(())
 }
