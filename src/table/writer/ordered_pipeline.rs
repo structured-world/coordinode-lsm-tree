@@ -62,6 +62,10 @@ struct State<J: OrderedJob> {
     slots: Box<[Option<J::Output>]>,
     /// Tokens spawned and not yet exited.
     tokens: usize,
+    /// Tokens parked waiting for a job to be queued.
+    idle: usize,
+    /// Set when the pipeline is dropped: parked tokens exit.
+    closed: bool,
     /// Whether the writer is parked waiting for a result, so a worker that
     /// publishes one has someone to wake.
     writer_waiting: bool,
@@ -95,37 +99,57 @@ impl<J: OrderedJob> State<J> {
 /// The pipeline's shared half, held by the writer and every live token.
 struct Shared<J: OrderedJob> {
     state: Mutex<State<J>>,
+    /// The writer parks here for a result.
     woke: Condvar,
+    /// Idle tokens park here for a job.
+    queued: Condvar,
+    /// The writer's thread: a token run there does not park, since only that
+    /// thread could queue the job it would wait for.
+    writer: std::thread::ThreadId,
     context: J::Context,
 }
+
+/// How long a token that finds the queue empty stays parked for the next job
+/// before it gives its thread back to the executor.
+const LINGER: std::time::Duration = std::time::Duration::from_millis(1);
 
 impl<J: OrderedJob> Shared<J> {
     fn lock(&self) -> MutexGuard<'_, State<J>> {
         self.state.lock().unwrap_or_else(PoisonError::into_inner)
     }
 
-    /// A token's body: runs queued jobs until the queue is empty, publishing
-    /// each result and claiming the next job under one lock, then exits.
+    /// A token's body: runs queued jobs, publishing each result and claiming
+    /// the next job under one lock. When the queue is empty it parks for up to
+    /// [`LINGER`] for the next one, then exits.
     fn work(&self) {
+        let may_park = std::thread::current().id() != self.writer;
         let mut done: Option<(u64, J::Output)> = None;
         loop {
-            let (next, wake) = {
-                let mut state = self.lock();
-                let wake = done
-                    .take()
-                    .is_some_and(|(seq, output)| state.publish(seq, output));
-                let next = state.queue.pop_front();
-                if next.is_none() {
-                    // Leaves under the lock the submitter checks, so a job
-                    // queued after this sees one token fewer and spawns one.
-                    state.tokens -= 1;
-                }
-                drop(state);
-                (next, wake)
-            };
-            if wake {
+            let mut state = self.lock();
+            if done
+                .take()
+                .is_some_and(|(seq, output)| state.publish(seq, output))
+            {
+                // Before parking: the writer must not wait out the linger.
                 self.woke.notify_one();
             }
+            let mut next = state.queue.pop_front();
+            if next.is_none() && may_park && !state.closed {
+                state.idle += 1;
+                state = self
+                    .queued
+                    .wait_timeout_while(state, LINGER, |s| s.queue.is_empty() && !s.closed)
+                    .unwrap_or_else(PoisonError::into_inner)
+                    .0;
+                state.idle -= 1;
+                next = state.queue.pop_front();
+            }
+            if next.is_none() {
+                // Leaves under the lock the submitter checks, so a job queued
+                // after this sees one token fewer and spawns one.
+                state.tokens -= 1;
+            }
+            drop(state);
             let Some((seq, job)) = next else {
                 return;
             };
@@ -177,9 +201,13 @@ impl<J: OrderedJob> OrderedPipeline<J> {
                     queue: VecDeque::with_capacity(capacity),
                     slots,
                     tokens: 0,
+                    idle: 0,
+                    closed: false,
                     writer_waiting: false,
                 }),
                 woke: Condvar::new(),
+                queued: Condvar::new(),
+                writer: std::thread::current().id(),
                 context,
             }),
             concurrency: concurrency.max(1),
@@ -207,7 +235,12 @@ impl<J: OrderedJob> OrderedPipeline<J> {
         let spawn = {
             let mut state = self.shared.lock();
             state.queue.push_back((seq, job));
-            let spawn = state.tokens < self.concurrency;
+            if state.idle > 0 {
+                self.shared.queued.notify_one();
+            }
+            // A parked token takes one queued job each; spawn only for jobs
+            // beyond what they cover.
+            let spawn = state.tokens < self.concurrency && state.queue.len() > state.idle;
             if spawn {
                 state.tokens += 1;
             }
@@ -272,6 +305,13 @@ impl<J: OrderedJob> OrderedPipeline<J> {
                     .unwrap_or_else(PoisonError::into_inner);
             }
         }
+    }
+}
+
+impl<J: OrderedJob> Drop for OrderedPipeline<J> {
+    fn drop(&mut self) {
+        self.shared.lock().closed = true;
+        self.shared.queued.notify_all();
     }
 }
 
