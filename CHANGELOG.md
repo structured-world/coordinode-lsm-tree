@@ -11,6 +11,13 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 
 ## [Unreleased]
 
+## [5.11.7](https://github.com/structured-world/coordinode-lsm-tree/compare/v5.11.6...v5.11.7) - 2026-09-28
+
+### Fixed
+
+- *(writer)* rotate tables on per-key state, not only data bytes (5.x.x) ([#729](https://github.com/structured-world/coordinode-lsm-tree/pull/729))
+- *(memtable)* return the successor a skiplist seek compared (5.x.x) ([#732](https://github.com/structured-world/coordinode-lsm-tree/pull/732))
+
 ## [5.11.6](https://github.com/structured-world/coordinode-lsm-tree/compare/v5.11.5...v5.11.6) - 2026-09-27
 
 ### Fixed
