@@ -266,10 +266,7 @@ impl MultiWriter {
             range_tombstones: Vec::new(),
             clip_range_tombstones: false,
             output_lower: None,
-            tombstone_share: tombstone_share::TombstoneShare::new(
-                &[],
-                crate::comparator::default_comparator().as_ref(),
-            ),
+            tombstone_share: tombstone_share::TombstoneShare::new(),
 
             prefix_extractor: None,
 
@@ -348,7 +345,7 @@ impl MultiWriter {
     pub fn set_range_tombstones(&mut self, mut tombstones: Vec<RangeTombstone>) {
         let comparator = self.comparator.as_ref();
         tombstones.sort_by(|a, b| comparator.compare(&a.start, &b.start));
-        self.tombstone_share = tombstone_share::TombstoneShare::new(&tombstones, comparator);
+        self.tombstone_share = tombstone_share::TombstoneShare::new();
         self.range_tombstones = tombstones;
     }
 
@@ -953,7 +950,9 @@ impl MultiWriter {
         // The blob files this table links, and its share of the range
         // tombstones, are handed to its writer only when it rotates, and it
         // writes them at `finish`. The tombstone block is encoded into a buffer
-        // it holds while writing.
+        // it holds while writing. The tombstones themselves are the caller's
+        // input and the share tracks only those open at the current key:
+        // neither grows with the table, and rotating frees neither.
         let tombstones = match &self.current_key {
             Some(key) if !self.range_tombstones.is_empty() => self.tombstone_share.bytes(key),
             _ => 0,
