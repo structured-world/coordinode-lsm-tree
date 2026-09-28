@@ -62,6 +62,14 @@ struct MergeSource {
     referenced: bool,
 }
 
+impl MergeSource {
+    /// Page bytes this source holds: its current batch and what its cursor
+    /// read ahead.
+    fn held_bytes(&self) -> u64 {
+        self.batch.as_ref().map_or(0, |b| b.data_size() as u64) + self.cursor.held_bytes()
+    }
+}
+
 /// Where a source stands after it was positioned.
 enum Position {
     /// At a visible row of a key not yet decided.
@@ -274,10 +282,7 @@ impl MergeStream {
     /// Page bytes the sources hold now: each one's current batch and what its
     /// cursor has read ahead.
     pub(super) fn held_bytes(&self) -> u64 {
-        self.sources
-            .iter()
-            .map(|s| s.batch.as_ref().map_or(0, |b| b.data_size() as u64) + s.cursor.held_bytes())
-            .sum()
+        self.sources.iter().map(MergeSource::held_bytes).sum()
     }
 
     /// Reads past a share the sources made since this was last called.
@@ -297,24 +302,29 @@ impl MergeStream {
         scan: &ColumnarScan,
         cmp: &dyn crate::comparator::UserComparator,
     ) -> crate::Result<Position> {
-        let (position, loaded) = self.position_source(i, cmp)?;
-        if loaded {
-            scan.observe_payload(self.held_bytes());
+        let (position, peak) = self.position_source(i, cmp)?;
+        if let Some(peak) = peak {
+            // The other sources did not move while this one loaded, so the
+            // most the merge held is theirs plus this source's peak.
+            let own = self.sources.get(i).map_or(0, MergeSource::held_bytes);
+            scan.observe_payload(self.held_bytes() - own + peak);
         }
         Ok(position)
     }
 
-    /// [`Self::position`] for source `i` alone, and whether it loaded a batch.
+    /// [`Self::position`] for source `i` alone, and the most it held after a
+    /// load, when it loaded: a batch it read and then passed over whole, all
+    /// its rows invisible or shadowed, was held all the same.
     fn position_source(
         &mut self,
         i: usize,
         cmp: &dyn crate::comparator::UserComparator,
-    ) -> crate::Result<(Position, bool)> {
+    ) -> crate::Result<(Position, Option<u64>)> {
         let last_key = self.last_key.as_deref();
         let Some(source) = self.sources.get_mut(i) else {
-            return Ok((Position::Exhausted, false));
+            return Ok((Position::Exhausted, None));
         };
-        let mut loaded = false;
+        let mut loaded: Option<u64> = None;
         loop {
             if let Some(batch) = &source.batch {
                 let keys = batch.columns.get(source.key_col).ok_or(MISSING_COLUMN)?;
@@ -379,7 +389,8 @@ impl MergeStream {
                     source.seqno_col = place(COL_SEQNO)?;
                     source.batch = Some(batch);
                     source.row = 0;
-                    loaded = true;
+                    let held = source.held_bytes();
+                    loaded = Some(loaded.map_or(held, |peak| peak.max(held)));
                 }
             }
         }

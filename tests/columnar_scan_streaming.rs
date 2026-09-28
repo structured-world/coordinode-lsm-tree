@@ -473,6 +473,44 @@ fn a_scan_whose_rows_are_all_filtered_still_reports_what_it_held() {
 }
 
 #[test]
+fn a_merge_reports_the_batches_it_read_past_even_when_it_kept_none_of_them() {
+    // A source whose first row pages hold only rows too new for the snapshot
+    // reads them and moves on to the one row it can see. Those pages were
+    // held while it looked, so the peak the scan reports is theirs, not the
+    // small page it settled on.
+    // Wide rows past the page size, each a page of its own; then narrow rows
+    // enough to fill pages without them, so the page the visible row lands
+    // in holds narrow rows only.
+    const WIDE: usize = 8_000;
+    let (_folder, tree) = columnar_tree_cut_at(4 * 1_024);
+    tree.insert(key(0), [b'a'], 2);
+    tree.insert(key(100), [b'a'], 3);
+    tree.flush_active_memtable(0).expect("flush");
+    for i in 1..20 {
+        tree.insert(key(i), vec![b'w'; WIDE], 1_000 + u64::from(i));
+    }
+    for i in 20..99 {
+        tree.insert(key(i), vec![b'n'; 100], 1_000 + u64::from(i));
+    }
+    tree.insert(key(99), [b'n'], 1);
+    tree.flush_active_memtable(0).expect("flush");
+
+    let mut scan = tree
+        .columnar_scan(&[COL_USER_KEY, COL_VALUE], None, 500, ..)
+        .expect("scan");
+    let mut rows = 0;
+    for batch in &mut scan {
+        rows += batch.expect("batch").row_count;
+    }
+    assert_eq!(rows, 3, "the three rows the snapshot sees");
+    assert!(
+        scan.peak_payload_bytes() >= WIDE as u64,
+        "the wide pages read past were held: peak {} B",
+        scan.peak_payload_bytes(),
+    );
+}
+
+#[test]
 fn a_single_segment_yields_its_first_batch_before_reading_the_rest() {
     // The first batch comes after a bounded prefix of the table, and a scan
     // dropped there reads nothing more: the whole table is not read up front.
