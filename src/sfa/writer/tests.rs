@@ -5,6 +5,34 @@ use std::fs::File;
 use std::io::Write;
 use test_log::test;
 
+/// The length a table budgets for an archive's table of contents and trailer
+/// is exactly what the writer appends after the sections.
+#[test]
+fn toc_and_trailer_len_matches_the_written_archive() -> crate::sfa::Result<()> {
+    let dir = tempfile::tempdir()?;
+    let path = dir.path().join("file.sfa");
+    let sections: [(&str, &[u8]); 3] =
+        [("a", b"one"), ("bc", b"three"), ("def", b"fifteen bytes!!")];
+
+    let mut file = File::create(&path)?;
+    let mut writer = Writer::from_writer(&mut file);
+    for (name, data) in sections {
+        writer.start(name)?;
+        writer.write_all(data)?;
+    }
+    writer.finish()?;
+    file.sync_all()?;
+    drop(file);
+
+    let data: usize = sections.iter().map(|(_, data)| data.len()).sum();
+    let names = sections.map(|(name, _)| name);
+    assert_eq!(
+        std::fs::metadata(&path)?.len(),
+        (data + crate::sfa::toc_and_trailer_len(&names)) as u64,
+    );
+    Ok(())
+}
+
 #[test]
 fn writer_empty() -> crate::sfa::Result<()> {
     let dir = tempfile::tempdir()?;

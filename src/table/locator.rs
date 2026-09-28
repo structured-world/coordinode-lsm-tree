@@ -156,12 +156,7 @@ pub fn build_locator_section(entries: &[(u64, u64, u64)], spec: LocatorSpec) -> 
 
     // Explicit widths that cannot hold the real layout → graceful skip.
     let Some((block_id_bits, slot_bits)) = section_widths(spec, max_block, max_slot) else {
-        log::debug!(
-            "locator section skipped: widths {:?}/{:?} cannot represent \
-             max_block={max_block} max_slot={max_slot}",
-            spec.block_id_bits,
-            spec.slot_bits,
-        );
+        log::debug!("locator skipped: {spec:?} too narrow for block {max_block}, slot {max_slot}");
         return None;
     };
     let r = u16::from(block_id_bits) + u16::from(slot_bits);
