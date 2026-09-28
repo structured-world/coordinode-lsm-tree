@@ -125,6 +125,46 @@ fn the_linked_blob_files_count_toward_the_held_state() -> crate::Result<()> {
     Ok(())
 }
 
+/// Rotation hands the linked blob files to the finishing writer and frees the
+/// map, so a large map does not stay allocated under the next table, where
+/// nothing counts it.
+#[test]
+fn rotation_frees_the_linked_blob_map() -> crate::Result<()> {
+    use crate::{InternalValue, UserKey, fs::StdFs, table::writer::LinkedFile};
+    use std::sync::Arc;
+
+    let folder = tempfile::tempdir()?;
+    let fs: Arc<dyn crate::fs::Fs> = Arc::new(StdFs);
+    let mut mw = super::MultiWriter::new(
+        folder.path().to_path_buf(),
+        SequenceNumberCounter::default(),
+        u64::MAX,
+        1,
+        fs,
+    )?;
+    mw.write(InternalValue::from_components(
+        UserKey::from(b"a" as &[u8]),
+        b"v".to_vec(),
+        0,
+        crate::ValueType::Value,
+    ))?;
+    for blob_file_id in 0..1_000 {
+        mw.linked_blobs.insert(
+            blob_file_id,
+            LinkedFile {
+                blob_file_id,
+                bytes: 1,
+                on_disk_bytes: 1,
+                len: 1,
+            },
+        );
+    }
+    mw.current_key = Some(UserKey::from(b"b" as &[u8]));
+    mw.rotate()?;
+    assert_eq!(mw.linked_blobs.capacity(), 0);
+    Ok(())
+}
+
 // Regression (#32): compaction clip must preserve RT covering gap between
 // output tables.  Before the fix, MultiWriter clipped each RT to
 // [first_key, upper_bound(last_key)) — RTs in the gap were dropped by all
@@ -841,6 +881,43 @@ fn a_flush_counts_the_last_start_group_before_it_lands() -> crate::Result<()> {
         assert!(
             file_size <= TARGET + 4 * 1_024,
             "output of {file_size} bytes with {} tombstones overran the {TARGET}-byte target",
+            table.range_tombstones().len(),
+        );
+    }
+    Ok(())
+}
+
+/// The check at the last start counts the group starting there by its
+/// entries in memory as well as its bytes: a group of short tombstones whose
+/// bytes fit but whose entries do not is split from what came before.
+#[test]
+fn a_flush_counts_the_entries_of_the_last_start_group() -> crate::Result<()> {
+    use crate::{UserKey, range_tombstone::RangeTombstone};
+
+    const TARGET: u64 = 32 * 1_024;
+    // Sized by an entry: the group alone fits the target, not with the rest.
+    let entry = core::mem::size_of::<RangeTombstone>() as u64;
+    let group_len = u16::try_from(TARGET * 7 / 8 / entry).unwrap_or(u16::MAX);
+    let disjoint_len = u16::try_from(TARGET / 4 / entry).unwrap_or(u16::MAX);
+    let disjoint = (0..disjoint_len).map(|i| {
+        let mut start = b"x".to_vec();
+        start.extend_from_slice(&i.to_be_bytes());
+        let mut end = start.clone();
+        end.push(0);
+        RangeTombstone::new(UserKey::from(start), UserKey::from(end), 5)
+    });
+    let group = (0..group_len).map(|i| {
+        let mut end = b"y\x01".to_vec();
+        end.extend_from_slice(&i.to_be_bytes());
+        RangeTombstone::new(UserKey::from(b"y" as &[u8]), UserKey::from(end), 5)
+    });
+    let tombstones: Vec<_> = disjoint.chain(group).collect();
+    let (_folder, tables) = flush_outputs(TARGET, &[b"a", b"b", b"c"], tombstones)?;
+    for table in &tables {
+        let held = table.range_tombstones().len() as u64 * entry;
+        assert!(
+            held <= TARGET,
+            "{} tombstone entries hold {held} bytes against the {TARGET}-byte target",
             table.range_tombstones().len(),
         );
     }

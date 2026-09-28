@@ -920,7 +920,8 @@ impl MultiWriter {
         }
         self.output_lower.clone_from(&self.current_key);
 
-        for linked in self.linked_blobs.values() {
+        // Taken out, so the map is freed rather than kept under the next table.
+        for linked in core::mem::take(&mut self.linked_blobs).into_values() {
             old_writer.link_blob_file(
                 linked.blob_file_id,
                 linked.len,
@@ -928,7 +929,6 @@ impl MultiWriter {
                 linked.on_disk_bytes,
             );
         }
-        self.linked_blobs.clear();
 
         if let Some((table_id, checksum)) = old_writer.finish()? {
             self.results.push((table_id, checksum));
@@ -1136,16 +1136,17 @@ impl MultiWriter {
             self.tombstone_share
                 .advance(&self.range_tombstones, &point, comparator.as_ref());
             let bytes = self.tombstone_share.bytes(&point);
-            let group = self.tombstone_share.group_bytes(
-                &self.range_tombstones,
-                &point,
-                comparator.as_ref(),
-            );
+            let (group_bytes, group_entries) =
+                self.tombstone_share
+                    .group(&self.range_tombstones, &point, comparator.as_ref());
             // An empty zone is never closed: that output would hold nothing,
             // nor is the last one, with nothing above it.
             if bytes > 0
                 && self.tombstone_share.has_more(&self.range_tombstones)
-                && self.full_with_tombstones(bytes + group, self.tombstone_share.pieces())
+                && self.full_with_tombstones(
+                    bytes + group_bytes,
+                    self.tombstone_share.pieces() + group_entries,
+                )
                 && self.rotation_sheds(&point)
             {
                 self.current_key = Some(point.clone());

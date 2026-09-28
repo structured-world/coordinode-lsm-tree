@@ -123,20 +123,24 @@ impl TombstoneShare {
         self.open.len() as u64 * (ENTRY_OVERHEAD + 2 * key.len() as u64)
     }
 
-    /// Bytes of the pending tombstones starting at `key`, whole.
-    pub(super) fn group_bytes(
+    /// Bytes and entries of the pending tombstones starting at `key`, whole.
+    pub(super) fn group(
         &self,
         tombstones: &[RangeTombstone],
         key: &[u8],
         comparator: &dyn UserComparator,
-    ) -> u64 {
+    ) -> (u64, u64) {
         tombstones
             .get(self.next_start..)
             .unwrap_or_default()
             .iter()
             .take_while(|rt| comparator.compare(&rt.start, key) == Ordering::Equal)
-            .map(|rt| ENTRY_OVERHEAD + (rt.start.len() + rt.end.len()) as u64)
-            .sum()
+            .fold((0, 0), |(bytes, entries), rt| {
+                (
+                    bytes + ENTRY_OVERHEAD + (rt.start.len() + rt.end.len()) as u64,
+                    entries + 1,
+                )
+            })
     }
 
     /// The least end among the open tombstones.
