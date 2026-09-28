@@ -37,6 +37,12 @@ pub(super) struct TombstoneShare {
     /// Length of the longest bound among the current output's pieces except
     /// the ends still open, which the key the output closes at bounds.
     longest: u64,
+    /// Indices of the tombstones open where the current output began, in
+    /// order by start: its zone's first pieces.
+    carried: Vec<usize>,
+    /// The first tombstone, by start, not yet open where the current output
+    /// began.
+    zone_first: usize,
 }
 
 impl TombstoneShare {
@@ -48,6 +54,8 @@ impl TombstoneShare {
             fixed: 0,
             pieces: 0,
             longest: 0,
+            carried: Vec::new(),
+            zone_first: 0,
         }
     }
 
@@ -105,6 +113,30 @@ impl TombstoneShare {
         self.fixed = self.open.len() as u64 * (ENTRY_OVERHEAD + lower.len() as u64);
         self.pieces = self.open.len() as u64;
         self.longest = lower.len() as u64;
+        self.carried.clone_from(&self.open);
+        // Indices follow the input's order by start.
+        self.carried.sort_unstable();
+        self.zone_first = self.next_start;
+    }
+
+    /// The tombstones that can overlap the current output's zone, in order by
+    /// start: those open where it began and those opened since, or, for the
+    /// `last` output, every one from there on. The others end at or before
+    /// its lower bound, or start at or past its upper one.
+    pub(super) fn zone<'t>(
+        &'t self,
+        tombstones: &'t [RangeTombstone],
+        last: bool,
+    ) -> impl Iterator<Item = &'t RangeTombstone> {
+        let end = if last {
+            tombstones.len()
+        } else {
+            self.next_start
+        };
+        self.carried
+            .iter()
+            .filter_map(|&i| tombstones.get(i))
+            .chain(tombstones.get(self.zone_first..end).unwrap_or_default())
     }
 
     /// Bytes the current output's entries take if it closes at `key`, the key

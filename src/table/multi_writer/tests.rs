@@ -125,6 +125,43 @@ fn the_linked_blob_files_count_toward_the_held_state() -> crate::Result<()> {
     Ok(())
 }
 
+/// A columnar batch lands whole, so what an output holds before it, not after,
+/// is what the next output carries anyway: a first batch holding more than the
+/// target fills its table, and the next batch goes to a new one.
+#[cfg(feature = "columnar")]
+#[test]
+fn a_first_columnar_batch_past_the_target_fills_its_table() -> crate::Result<()> {
+    use crate::{InternalValue, fs::StdFs, table::columnar::entries_to_column_batch};
+    use std::sync::Arc;
+
+    let folder = tempfile::tempdir()?;
+    let fs: Arc<dyn crate::fs::Fs> = Arc::new(StdFs);
+    let mut mw = super::MultiWriter::new(
+        folder.path().to_path_buf(),
+        SequenceNumberCounter::default(),
+        u64::MAX,
+        1,
+        fs,
+    )?
+    .use_columnar(true);
+    let entries: Vec<InternalValue> = (0..2_000u32)
+        .map(|i| {
+            InternalValue::from_components(
+                format!("key{i:06}").into_bytes(),
+                b"v".to_vec(),
+                0,
+                crate::ValueType::Value,
+            )
+        })
+        .collect();
+    mw.write_columnar_batch(&entries_to_column_batch(&entries)?)?;
+    // Its bytes fit the target; the state it holds for `finish` does not.
+    mw.target_size = mw.writer.output_size_hint() + 1;
+    assert!(mw.writer.held_state_bytes() >= mw.target_size);
+    assert!(mw.table_full(), "the first batch holds past the target");
+    Ok(())
+}
+
 /// Rotation hands the linked blob files to the finishing writer and frees the
 /// map, so a large map does not stay allocated under the next table, where
 /// nothing counts it.
@@ -1431,6 +1468,76 @@ fn an_output_of_tombstones_alone_orders_its_range_by_the_comparator() -> crate::
         assert_eq!(table.metadata.key_range.max().as_ref(), b"a");
     }
     assert_eq!(results.len(), 1);
+    Ok(())
+}
+
+/// Each output of a flush visits only the tombstones overlapping its zone, not
+/// the whole set: disjoint tombstones spread over many outputs cost a bounded
+/// number of comparisons each, however many outputs the flush writes.
+#[test]
+fn a_flush_cuts_each_zone_without_rescanning_every_tombstone() -> crate::Result<()> {
+    use crate::{InternalValue, UserKey, fs::StdFs, range_tombstone::RangeTombstone};
+    use std::sync::{
+        Arc,
+        atomic::{AtomicU64, Ordering},
+    };
+
+    #[derive(Debug, Default)]
+    struct CountingComparator(AtomicU64);
+    impl crate::comparator::UserComparator for CountingComparator {
+        fn name(&self) -> &'static str {
+            "counting-test"
+        }
+        fn compare(&self, a: &[u8], b: &[u8]) -> core::cmp::Ordering {
+            self.0.fetch_add(1, Ordering::Relaxed);
+            a.cmp(b)
+        }
+    }
+
+    // Comparisons a flush of `n` keys, each followed by a tombstone of its
+    // own and each filling an output, makes.
+    let comparisons = |n: u32| -> crate::Result<u64> {
+        let folder = tempfile::tempdir()?;
+        let fs: Arc<dyn crate::fs::Fs> = Arc::new(StdFs);
+        let comparator = Arc::new(CountingComparator::default());
+        let mut mw = super::MultiWriter::new(
+            folder.path().to_path_buf(),
+            SequenceNumberCounter::default(),
+            1,
+            1,
+            fs,
+        )?
+        .set_comparator(comparator.clone());
+        let key = |i: u32| format!("k{i:06}").into_bytes();
+        mw.set_range_tombstones(
+            (0..n)
+                .map(|i| {
+                    let (mut start, mut end) = (key(i), key(i));
+                    start.push(0);
+                    end.push(1);
+                    RangeTombstone::new(UserKey::from(start), UserKey::from(end), 5)
+                })
+                .collect(),
+        );
+        for i in 0..n {
+            mw.write(InternalValue::from_components(
+                UserKey::from(key(i)),
+                vec![0u8; 5_000],
+                1,
+                crate::ValueType::Value,
+            ))?;
+        }
+        let outputs = mw.finish()?.len();
+        assert!(outputs >= n as usize / 2, "{outputs} outputs for {n} keys");
+        Ok(comparator.0.load(Ordering::Relaxed))
+    };
+    let (small, large) = (comparisons(200)?, comparisons(800)?);
+    // Four times the keys, tombstones and outputs: a linear cost grows about
+    // fourfold, one rescanning every tombstone per output sixteenfold.
+    assert!(
+        large < 6 * small,
+        "{small} comparisons for 200 keys, {large} for 800"
+    );
     Ok(())
 }
 
