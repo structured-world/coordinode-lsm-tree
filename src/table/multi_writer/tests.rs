@@ -715,6 +715,158 @@ fn a_flush_splits_its_tombstones_past_the_last_key() -> crate::Result<()> {
     Ok(())
 }
 
+/// `key` extended to 64 bytes with a pseudo-random tail from `seed`, so no
+/// codec shrinks a block of such bounds.
+fn random_bound(seed: usize, mut key: Vec<u8>) -> Vec<u8> {
+    let mut state = (seed as u64 + 1).wrapping_mul(0x9E37_79B9_7F4A_7C15);
+    while key.len() < 64 {
+        state ^= state << 13;
+        state ^= state >> 7;
+        state ^= state << 17;
+        key.extend_from_slice(&state.to_le_bytes());
+    }
+    key
+}
+
+/// A flush over `keys` with `tombstones`, recovered.
+fn flush_outputs(
+    target: u64,
+    keys: &[&[u8]],
+    tombstones: Vec<crate::range_tombstone::RangeTombstone>,
+) -> crate::Result<(tempfile::TempDir, Vec<crate::Table>)> {
+    use crate::{InternalValue, UserKey, fs::StdFs};
+    use std::sync::Arc;
+
+    let folder = tempfile::tempdir()?;
+    let base_path = folder.path().to_path_buf();
+    let fs: Arc<dyn crate::fs::Fs> = Arc::new(StdFs);
+    let mut mw = super::MultiWriter::new(
+        base_path.clone(),
+        SequenceNumberCounter::default(),
+        target,
+        1,
+        fs,
+    )?;
+    mw.set_range_tombstones(tombstones);
+    for &key in keys {
+        mw.write(InternalValue::from_components(
+            UserKey::from(key),
+            b"v".to_vec(),
+            1,
+            crate::ValueType::Value,
+        ))?;
+    }
+    let tables = recover_outputs(&base_path, &mw.finish()?)?;
+    Ok((folder, tables))
+}
+
+/// The tombstones sharing the greatest start follow no later start at which
+/// the output could be checked: the check at their start counts them, so
+/// they are split from what came before instead of overrunning its output.
+#[test]
+fn a_flush_counts_the_last_start_group_before_it_lands() -> crate::Result<()> {
+    use crate::{UserKey, range_tombstone::RangeTombstone};
+
+    const TARGET: u64 = 32 * 1_024;
+    let disjoint = (0..100).map(|i| {
+        let prefix = format!("x{i:08}").into_bytes();
+        let mut start = prefix.clone();
+        start.push(0);
+        let mut end = prefix;
+        end.push(1);
+        RangeTombstone::new(
+            UserKey::from(random_bound(2 * i, start)),
+            UserKey::from(random_bound(2 * i + 1, end)),
+            5,
+        )
+    });
+    let group = (0..200).map(|i| {
+        RangeTombstone::new(
+            UserKey::from(b"y" as &[u8]),
+            UserKey::from(random_bound(1_000 + i, b"y\x01".to_vec())),
+            5,
+        )
+    });
+    let tombstones: Vec<_> = disjoint.chain(group).collect();
+    let (folder, tables) = flush_outputs(TARGET, &[b"a", b"b", b"c"], tombstones)?;
+    for table in &tables {
+        let file_size = std::fs::metadata(folder.path().join(table.id().to_string()))?.len();
+        assert!(
+            file_size <= TARGET + 4 * 1_024,
+            "output of {file_size} bytes with {} tombstones overran the {TARGET}-byte target",
+            table.range_tombstones().len(),
+        );
+    }
+    Ok(())
+}
+
+/// Tombstones overlapping one another cannot be split below their overlap:
+/// every output from their common span holds a piece of each. An output is
+/// not rotated when what it would carry into the next fills half the target,
+/// so such a set lands in one output instead of in one per key.
+#[test]
+fn an_overlapping_set_past_the_target_is_not_carried_from_output_to_output() -> crate::Result<()> {
+    use crate::{UserKey, range_tombstone::RangeTombstone};
+
+    const TOMBSTONES: usize = 3_000;
+    let tombstones = (0..TOMBSTONES)
+        .map(|i| {
+            RangeTombstone::new(
+                UserKey::from(b"a" as &[u8]),
+                UserKey::from(random_bound(i, b"z".to_vec())),
+                5,
+            )
+        })
+        .collect();
+    let keys: Vec<Vec<u8>> = (0..10).map(|i| format!("k{i}").into_bytes()).collect();
+    let keys: Vec<&[u8]> = keys.iter().map(Vec::as_slice).collect();
+    let (_folder, tables) = flush_outputs(32 * 1_024, &keys, tombstones)?;
+    let pieces: usize = tables.iter().map(|t| t.range_tombstones().len()).sum();
+    assert!(
+        pieces <= 2 * TOMBSTONES,
+        "{pieces} pieces over {} outputs for {TOMBSTONES} tombstones",
+        tables.len(),
+    );
+    Ok(())
+}
+
+/// An output of many short tombstone pieces holds each as an entry in memory
+/// until `finish`, far larger than its encoded bytes: the held state counts
+/// the entries, so such an output rotates by its memory near the target.
+#[test]
+fn a_flush_output_holds_its_tombstone_entries_within_the_target() -> crate::Result<()> {
+    use crate::{UserKey, range_tombstone::RangeTombstone};
+
+    const TARGET: u64 = 32 * 1_024;
+    const KEYS: usize = 4_000;
+    let key = |i: usize| format!("{i:05}").into_bytes();
+    // Four short tombstones in the gap after each key.
+    let tombstones = (0..KEYS)
+        .flat_map(|i| {
+            (0..4_u8).map(move |j| {
+                let mut start = key(i);
+                start.push(2 * j);
+                let mut end = key(i);
+                end.push(2 * j + 1);
+                RangeTombstone::new(UserKey::from(start), UserKey::from(end), 5)
+            })
+        })
+        .collect();
+    let keys: Vec<Vec<u8>> = (0..KEYS).map(key).collect();
+    let keys: Vec<&[u8]> = keys.iter().map(Vec::as_slice).collect();
+    let (_folder, tables) = flush_outputs(TARGET, &keys, tombstones)?;
+    let entry = core::mem::size_of::<RangeTombstone>() as u64;
+    for table in &tables {
+        let held = table.range_tombstones().len() as u64 * entry;
+        assert!(
+            held <= TARGET,
+            "{} tombstone entries hold {held} bytes against the {TARGET}-byte target",
+            table.range_tombstones().len(),
+        );
+    }
+    Ok(())
+}
+
 /// An output of tombstones alone takes its key range from them in the
 /// comparator's order, not in byte order: under a reversed comparator the
 /// byte-wise least start and greatest end leave the ends of the range out.
