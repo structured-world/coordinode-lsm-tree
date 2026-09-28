@@ -111,6 +111,12 @@ impl TombstoneShare {
         self.pieces
     }
 
+    /// Tombstones open at the key last advanced to: the entries an output
+    /// beginning there starts with.
+    pub(super) fn open_count(&self) -> u64 {
+        self.open.len() as u64
+    }
+
     /// Bytes an output beginning at `key` starts with: a piece of every
     /// tombstone still open, from `key`, its end at least as long.
     pub(super) fn carry(&self, key: &[u8]) -> u64 {

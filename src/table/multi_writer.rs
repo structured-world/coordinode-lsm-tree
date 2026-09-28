@@ -965,31 +965,21 @@ impl MultiWriter {
     /// each entry until `finish`, which encodes them into a block buffer and
     /// frames that when the block is transformed.
     fn full_with_tombstones(&self, tombstones: u64, pieces: u64) -> bool {
-        use crate::table::block::{BlockType, framed_len_bound, transform_scratch_bound};
+        use crate::table::block::{BlockType, framed_len_bound};
 
         let linked = crate::table::writer::linked_blob_files_len(self.linked_blobs.len());
         let (tombstone_block, tombstones_held) = if tombstones == 0 {
             (0, 0)
         } else {
-            let encryption = self.encryption.as_deref();
-            let none = CompressionType::None;
             (
                 framed_len_bound(
                     tombstones,
                     BlockType::RangeTombstone,
-                    none,
-                    encryption,
+                    CompressionType::None,
+                    self.encryption.as_deref(),
                     self.ecc,
                 ),
-                pieces * core::mem::size_of::<RangeTombstone>() as u64
-                    + tombstones
-                    + transform_scratch_bound(
-                        tombstones,
-                        BlockType::RangeTombstone,
-                        none,
-                        encryption,
-                        self.ecc,
-                    ),
+                self.tombstones_held(tombstones, pieces),
             )
         };
         // Each linked blob file is an entry in the map here and, at rotation,
@@ -1007,9 +997,34 @@ impl MultiWriter {
     /// fill half the target, closing would carry them from output to output
     /// without shedding any, so the table grows past its target instead; a
     /// set of tombstones overlapping one another cannot be split below them.
+    /// What is carried is judged as fullness is: by the bytes it encodes to
+    /// and by the entries it holds in memory, whichever is larger.
     fn rotation_sheds(&self, key: &[u8]) -> bool {
+        let entries = self.tombstone_share.open_count();
+        if entries == 0 {
+            return true;
+        }
         let carry = self.tombstone_share.carry(key);
-        carry == 0 || carry < self.target_size / 2
+        let held = self.tombstones_held(carry, entries);
+        carry.max(held) < self.target_size / 2
+    }
+
+    /// Heap an output holding `pieces` tombstone entries of `tombstones`
+    /// encoded bytes takes for them until `finish`: the entries, the block
+    /// buffer they are encoded into, and its frame when the block is
+    /// transformed.
+    fn tombstones_held(&self, tombstones: u64, pieces: u64) -> u64 {
+        use crate::table::block::{BlockType, transform_scratch_bound};
+
+        pieces * core::mem::size_of::<RangeTombstone>() as u64
+            + tombstones
+            + transform_scratch_bound(
+                tombstones,
+                BlockType::RangeTombstone,
+                CompressionType::None,
+                self.encryption.as_deref(),
+                self.ecc,
+            )
     }
 
     /// Writes an item
