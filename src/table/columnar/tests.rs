@@ -1614,3 +1614,28 @@ fn zone_stats_records_every_ordered_column_and_omits_opaque_ones() {
         "a value-column predicate below the block's value range skips the block",
     );
 }
+
+#[test]
+fn bytes_column_span_names_each_row_and_refuses_a_row_past_the_payload() {
+    use super::{bytes_column_row, bytes_column_span};
+
+    // Two rows, "ab" and "c": offsets 0, 2, 3 then the payload.
+    let mut data = Vec::new();
+    for offset in [0u32, 2, 3] {
+        data.extend_from_slice(&offset.to_le_bytes());
+    }
+    data.extend_from_slice(b"abc");
+    assert_eq!(bytes_column_span(&data, 2, 0).expect("row 0"), 12..14);
+    assert_eq!(bytes_column_row(&data, 2, 1).expect("row 1"), b"c");
+
+    // An offset past the payload names bytes the column does not hold: the
+    // span is refused rather than cut short or wrapped.
+    let mut forged = data.clone();
+    forged[8..12].copy_from_slice(&9u32.to_le_bytes());
+    assert!(bytes_column_span(&forged, 2, 1).is_err());
+    // So is an offset that runs backwards.
+    let mut backwards = data;
+    backwards[4..8].copy_from_slice(&3u32.to_le_bytes());
+    backwards[8..12].copy_from_slice(&2u32.to_le_bytes());
+    assert!(bytes_column_span(&backwards, 2, 1).is_err());
+}

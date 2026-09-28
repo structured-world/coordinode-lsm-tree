@@ -411,8 +411,10 @@ impl ColumnarScan {
     /// The most page bytes the scan held at once so far: the batches its
     /// segments have read and not yet handed to the merge or out. It stays
     /// within [`Config::columnar_scan_budget`](crate::Config::columnar_scan_budget)
-    /// except by the reads [`Self::oversized_reads`] counts. The batch being
-    /// yielded and the scan's per-segment bookkeeping are not counted: the
+    /// except by the reads [`Self::oversized_reads`] counts. What a read holds
+    /// only while it runs, such as the pages a filter drops, is what that
+    /// counter sees; this figure is what stays read between batches. A batch
+    /// handed out and the scan's per-segment bookkeeping are not counted: the
     /// first is the caller's, the second grows with the segments merged, not
     /// with the rows.
     #[must_use]
@@ -533,6 +535,10 @@ impl ColumnarScan {
                     Ok(batch) => batch,
                     Err(e) => return Some(Err(e)),
                 };
+                // Observed before the batch is shaped: a mask or dedup that
+                // keeps none of its rows drops it here, and what the cursor
+                // held with it would otherwise never be seen.
+                self.observe_payload(singleton.cursor.held_bytes() + batch.data_size() as u64);
                 *support = (*support).min(singleton.cursor.predicate_support());
                 let SingletonStream { global, mode, .. } = &mut **singleton;
                 match self.shape_singleton_batch(batch, *global, mode, support) {
@@ -553,9 +559,8 @@ impl ColumnarScan {
         mode: &mut SingletonMode,
         support: &mut PredicateSupport,
     ) -> crate::Result<Option<ColumnBatch>> {
-        if batch.row_count == 0 {
-            return Ok(None);
-        }
+        // A cursor yields a batch only for a row page that keeps a row.
+        debug_assert!(batch.row_count > 0, "a cursor yielded an empty batch");
         match mode {
             SingletonMode::Verbatim => {
                 let mut batch = batch;

@@ -55,6 +55,8 @@ pub struct ColumnarCursor {
     /// whole in one request.
     expect_whole: bool,
     pending: VecDeque<ColumnBatch>,
+    /// The bytes of the batches in `pending`, kept as they come and go.
+    pending_bytes: u64,
     /// The page bytes this cursor may hold at once, or `None` for a group at
     /// a time.
     share: Option<u64>,
@@ -128,6 +130,7 @@ impl ColumnarCursor {
             row_base: 0,
             expect_whole: false,
             pending: VecDeque::new(),
+            pending_bytes: 0,
             share,
             open: None,
             bytes_per_row,
@@ -163,7 +166,7 @@ impl ColumnarCursor {
 
     /// Bytes of the batches read and not yet yielded.
     pub(crate) fn held_bytes(&self) -> u64 {
-        self.pending.iter().map(|b| b.data_size() as u64).sum()
+        self.pending_bytes
     }
 
     /// Row count of a row group stepped over without decoding, from its zone
@@ -295,20 +298,20 @@ impl ColumnarCursor {
                     pages: Vec::new(),
                 },
                 next_page: 0,
+                share,
             };
-            self.take_run(&mut group, &first, 0..1, share)?;
+            self.take_run(&mut group, &first, 0..1)?;
             self.continue_group(group);
             return Ok(());
         }
         self.read_whole_group(&handle, straddled)
     }
 
-    /// Reads the next run of row pages of the group in progress: as many as
-    /// the share holds at the bytes a row decoded to so far, at least one.
-    fn read_run(&mut self) -> crate::Result<()> {
-        let (Some(group), Some(share)) = (self.open.take(), self.share) else {
-            return Ok(());
-        };
+    /// Reads the next run of row pages of `group`, the group in progress: as
+    /// many as its share holds at the bytes a row decoded to so far, at least
+    /// one.
+    fn read_run(&mut self, group: OpenGroup) -> crate::Result<()> {
+        let share = group.share;
         let directory = &group.directory.directory;
         let start = group.next_page;
         let mut end = start;
@@ -336,7 +339,7 @@ impl ColumnarCursor {
                 &PageWant::projected(&self.decode_projection, RowPageSelect::Range(start..end)),
             )?;
         let mut group = group;
-        self.take_run(&mut group, &blocks, start..end, share)?;
+        self.take_run(&mut group, &blocks, start..end)?;
         self.continue_group(group);
         Ok(())
     }
@@ -348,7 +351,6 @@ impl ColumnarCursor {
         group: &mut OpenGroup,
         blocks: &RowGroupBlocks,
         pages: core::ops::Range<u16>,
-        share: u64,
     ) -> crate::Result<()> {
         let bound_keys = match &group.straddled {
             Some(bound) => Some((
@@ -363,7 +365,7 @@ impl ColumnarCursor {
             None => None,
         };
         let (bytes, rows) = self.yield_pages(blocks, bound_keys.as_ref().map(|(b, k)| (*b, k)))?;
-        self.learn(bytes, rows, share);
+        self.learn(bytes, rows, group.share);
         group.next_page = pages.end;
         Ok(())
     }
@@ -472,6 +474,11 @@ impl ColumnarCursor {
         // from theirs.
         let mut budget = crate::table::columnar::DecodeBudget::default();
         let pages = blocks.page_columns(|_| true, &mut budget)?;
+        // The key pages read to mask a straddling group are held beside the
+        // projected ones, whether or not the scan projects the key.
+        let bound_bytes: u64 = bound_keys.as_ref().map_or(0, |(_, keys)| {
+            keys.batches.iter().map(|b| b.data_size() as u64).sum()
+        });
         let loaded: u64 = blocks
             .pages
             .iter()
@@ -592,7 +599,8 @@ impl ColumnarCursor {
         read?;
         let built: u64 = out.iter().map(|b| b.data_size() as u64).sum();
         self.pending.extend(out);
-        Ok((loaded.max(built), rows_read))
+        self.pending_bytes += built;
+        Ok((loaded.max(built) + bound_bytes, rows_read))
     }
 }
 
@@ -633,6 +641,8 @@ struct OpenGroup {
     directory: RowGroupBlocks,
     /// The first row page not read yet.
     next_page: u16,
+    /// The page bytes each run of the group may hold.
+    share: u64,
 }
 
 impl Iterator for ColumnarCursor {
@@ -641,10 +651,12 @@ impl Iterator for ColumnarCursor {
     fn next(&mut self) -> Option<Self::Item> {
         loop {
             if let Some(batch) = self.pending.pop_front() {
+                // Counted in when pushed, so it is never more than the total.
+                self.pending_bytes -= batch.data_size() as u64;
                 return Some(Ok(batch));
             }
-            let read = if self.open.is_some() {
-                self.read_run()
+            let read = if let Some(group) = self.open.take() {
+                self.read_run(group)
             } else {
                 self.index.as_ref()?;
                 self.step()

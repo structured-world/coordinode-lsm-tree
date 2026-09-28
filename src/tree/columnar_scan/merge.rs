@@ -251,8 +251,10 @@ impl MergeStream {
     ) -> crate::Result<()> {
         match self.position(i, scan, cmp)? {
             Position::At => {
+                // The push leaves the new source at the end.
+                let at = self.heap.len();
                 self.heap.push(i);
-                sift_up(&mut self.heap, &self.sources, cmp)
+                sift_up(&mut self.heap, at, &self.sources, cmp)
             }
             Position::Exhausted => Ok(()),
             // A source enters at the start or after the output that took its
@@ -540,15 +542,13 @@ fn before(
         .is_lt())
 }
 
-/// Restores the heap order after a source was pushed at its end.
+/// Restores the heap order above `at`, where a source was just pushed.
 fn sift_up(
     heap: &mut [usize],
+    mut at: usize,
     sources: &[MergeSource],
     cmp: &dyn crate::comparator::UserComparator,
 ) -> crate::Result<()> {
-    let Some(mut at) = heap.len().checked_sub(1) else {
-        return Ok(());
-    };
     while at > 0 {
         let parent = (at - 1) / 2;
         let (&child, &up) = (

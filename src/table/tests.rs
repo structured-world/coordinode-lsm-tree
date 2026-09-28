@@ -6854,6 +6854,180 @@ fn restricted_columnar_scan_skips_punched_prefix_and_masks_sub_bound_rows() -> c
     Ok(())
 }
 
+/// The keys of every row a cursor yields, in order.
+#[cfg(feature = "columnar")]
+fn cursor_keys(
+    cursor: crate::table::columnar_cursor::ColumnarCursor,
+) -> crate::Result<Vec<Vec<u8>>> {
+    use crate::table::columnar::{COL_USER_KEY, bytes_column_row};
+
+    let mut keys = Vec::new();
+    for batch in cursor {
+        let batch = batch?;
+        let column = batch
+            .columns
+            .iter()
+            .find(|c| c.column_id == COL_USER_KEY)
+            .expect("the key column is projected");
+        for row in 0..batch.row_count {
+            keys.push(bytes_column_row(&column.data, batch.row_count, row)?.to_vec());
+        }
+    }
+    Ok(keys)
+}
+
+/// A key range over a table with positional deletes walks the row groups below
+/// its lower bound instead of seeking past them: their row counts keep the
+/// delete positions of the groups it reads aligned.
+#[cfg(feature = "columnar")]
+#[test]
+fn a_key_range_over_positional_deletes_keeps_their_positions_past_the_skipped_groups()
+-> crate::Result<()> {
+    use crate::table::columnar::COL_USER_KEY;
+    use core::ops::Bound;
+
+    let dir = tempdir()?;
+    let file = dir.path().join("table");
+    let n = 256u32;
+    let key = |i: u32| format!("k{i:04}").into_bytes();
+    // One deleted row below the range and one inside it: the inside one is
+    // masked only if the skipped groups' rows were counted.
+    let deleted = [3u32, 200];
+
+    let mut writer = Writer::new(file.clone(), 0, 0, Arc::new(StdFs))?
+        .use_columnar(true)
+        .use_zone_map(true)
+        .use_row_group_size(256);
+    for i in 0..n {
+        writer.write(crate::InternalValue::from_components(
+            key(i),
+            b"v",
+            1,
+            crate::ValueType::Value,
+        ))?;
+    }
+    for &row in &deleted {
+        writer.delete_bitmap_mut().insert(row);
+    }
+    let (_, checksum) = writer.finish()?.expect("table written");
+    let table = recover_test_table(&file, checksum)?;
+
+    let cursor = table.columnar_cursor(
+        &[COL_USER_KEY],
+        None,
+        Bound::Included(crate::UserKey::from(key(100))),
+        Bound::Unbounded,
+        None,
+    )?;
+    // The group holding the bound is yielded whole, its rows below the bound
+    // left for the caller to mask, as the tree's scan does.
+    let got: Vec<Vec<u8>> = cursor_keys(cursor)?
+        .into_iter()
+        .filter(|k| k.as_slice() >= key(100).as_slice())
+        .collect();
+    let expected: Vec<Vec<u8>> = (100..n).filter(|&i| i != 200).map(key).collect();
+    assert_eq!(got, expected);
+    Ok(())
+}
+
+/// The key pages read to mask a straddling group's sub-bound rows are held
+/// with the pages the scan projects, so they count against its share even
+/// when the scan does not project the key.
+#[cfg(feature = "columnar")]
+#[test]
+fn a_straddling_groups_key_pages_count_against_the_share() -> crate::Result<()> {
+    use crate::table::columnar::COL_VALUE;
+    use core::ops::Bound;
+
+    let dir = tempdir()?;
+    let file = dir.path().join("table");
+    // Long keys and one-byte values: the value pages fit a small share, the
+    // key pages read beside them do not.
+    let key = |i: u32| format!("{i:0200}").into_bytes();
+
+    let mut writer = Writer::new(file.clone(), 0, 0, Arc::new(StdFs))?
+        .use_columnar(true)
+        .use_zone_map(true);
+    for i in 0..64 {
+        writer.write(crate::InternalValue::from_components(
+            key(i),
+            b"v",
+            1,
+            crate::ValueType::Value,
+        ))?;
+    }
+    let (_, checksum) = writer.finish()?.expect("table written");
+    let table = recover_test_table(&file, checksum)?;
+    let restricted = table.with_restriction(crate::UserKey::from(key(5)));
+
+    const SHARE: u64 = 2_048;
+    let mut cursor = restricted.columnar_cursor(
+        &[COL_VALUE],
+        None,
+        Bound::Unbounded,
+        Bound::Unbounded,
+        Some(SHARE),
+    )?;
+    let mut rows = 0;
+    for batch in &mut cursor {
+        rows += batch?.row_count;
+    }
+    assert_eq!(rows, 59, "the rows at or past the bound");
+    assert!(
+        cursor.take_oversized() > 0,
+        "the key pages read beside the values are past the {SHARE} B share",
+    );
+    Ok(())
+}
+
+/// A restricted table read in runs of row pages masks the straddling group's
+/// sub-bound rows run by run: each run's key column is read for the same row
+/// pages as the run itself.
+#[cfg(feature = "columnar")]
+#[test]
+fn a_restricted_table_read_in_runs_masks_the_straddling_rows_of_every_run() -> crate::Result<()> {
+    use crate::table::columnar::{COL_USER_KEY, COL_VALUE};
+    use core::ops::Bound;
+
+    let dir = tempdir()?;
+    let file = dir.path().join("table");
+    let n = 256u32;
+    let key = |i: u32| format!("k{i:04}").into_bytes();
+
+    // Groups of several small row pages, so a group is read in more than one
+    // run under a one-byte share.
+    let mut writer = Writer::new(file.clone(), 0, 0, Arc::new(StdFs))?
+        .use_columnar(true)
+        .use_zone_map(true)
+        .use_row_group_size(4_096)
+        .use_columnar_page_size(256);
+    for i in 0..n {
+        writer.write(crate::InternalValue::from_components(
+            key(i),
+            b"value",
+            1,
+            crate::ValueType::Value,
+        ))?;
+    }
+    let (_, checksum) = writer.finish()?.expect("table written");
+    let table = recover_test_table(&file, checksum)?;
+
+    // A bound inside the first group, past its first row pages: the group
+    // straddles it across several runs.
+    let bound = 40u32;
+    let restricted = table.with_restriction(crate::UserKey::from(key(bound)));
+    let cursor = restricted.columnar_cursor(
+        &[COL_USER_KEY, COL_VALUE],
+        None,
+        Bound::Unbounded,
+        Bound::Unbounded,
+        Some(1),
+    )?;
+    let expected: Vec<Vec<u8>> = (bound..n).map(key).collect();
+    assert_eq!(cursor_keys(cursor)?, expected);
+    Ok(())
+}
+
 /// The heal unshare copy must reproduce the source's ACTUAL hole pattern, not
 /// the logical restriction: a tight-space slice that committed but failed its
 /// restriction-sidecar write deliberately leaves the restricted SST unpunched

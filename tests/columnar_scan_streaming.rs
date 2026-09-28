@@ -292,6 +292,186 @@ fn a_read_past_the_share_is_counted_even_when_its_rows_are_filtered_out() {
     );
 }
 
+/// A columnar tree whose row groups and row pages are cut at `size` bytes.
+fn columnar_tree_cut_at(size: u32) -> (TempDir, Tree) {
+    use lsm_tree::config::BlockSizePolicy;
+
+    let folder = get_tmp_folder();
+    let AnyTree::Standard(tree) = Config::new(
+        folder.path(),
+        SequenceNumberCounter::default(),
+        SequenceNumberCounter::default(),
+    )
+    .columnar_row_group_size_policy(BlockSizePolicy::all(size))
+    .columnar_page_size_policy(BlockSizePolicy::all(size))
+    .open()
+    .expect("open") else {
+        panic!("expected a standard tree");
+    };
+    tree.update_runtime_config(|cfg| cfg.columnar = true)
+        .expect("enable columnar");
+    (folder, tree)
+}
+
+#[test]
+fn a_merge_over_large_row_pages_cuts_its_output_at_the_target_row_count() {
+    // Two segments whose keys interleave, each one row page holding every row:
+    // no source's page is spent before the end, so the output is cut by its
+    // row count alone, into batches of at most the target.
+    const TARGET: u32 = 4_096;
+    let (_folder, tree) = columnar_tree_cut_at(1 << 20);
+    for parity in 0..2 {
+        for i in (parity..ROWS).step_by(2) {
+            tree.insert(key(i), [b'v'], u64::from(i));
+        }
+        tree.flush_active_memtable(0).expect("flush");
+    }
+
+    let mut sizes = Vec::new();
+    for batch in tree
+        .columnar_scan(&[COL_USER_KEY], None, SeqNo::MAX, ..)
+        .expect("scan")
+    {
+        sizes.push(batch.expect("batch").row_count);
+    }
+    assert_eq!(sizes.iter().sum::<u32>(), ROWS, "every key once");
+    assert!(sizes.iter().all(|&n| n <= TARGET), "{sizes:?}");
+    assert_eq!(
+        sizes.first(),
+        Some(&TARGET),
+        "the first batch is cut at the target"
+    );
+}
+
+#[test]
+fn a_segment_holding_only_a_range_delete_merges_with_the_rows_it_covers() {
+    // A flush of a range delete alone writes a segment holding only the
+    // deletion, overlapping the rows it covers: the two merge, and the
+    // covered rows are not returned.
+    let (_folder, tree) = columnar_tree_cut_at(16 * 1_024);
+    for i in 0..100 {
+        tree.insert(key(i), vec![b'v'; 16], u64::from(i));
+    }
+    tree.flush_active_memtable(0).expect("flush");
+    tree.remove_range(key(10), key(20), 1_000);
+    tree.flush_active_memtable(0).expect("flush");
+
+    let mut keys = Vec::new();
+    for batch in tree
+        .columnar_scan(&[COL_USER_KEY], None, SeqNo::MAX, ..)
+        .expect("scan")
+    {
+        let batch = batch.expect("batch");
+        let column = &batch.columns[0];
+        for row in 0..batch.row_count {
+            keys.push(bytes_cell(&column.data, batch.row_count, row));
+        }
+    }
+    let expected: Vec<Vec<u8>> = (0..100)
+        .filter(|i| !(10..20).contains(i))
+        .map(key)
+        .collect();
+    assert_eq!(keys, expected);
+}
+
+/// Row `row` of a bytes column of `rows` rows.
+fn bytes_cell(data: &[u8], rows: u32, row: u32) -> Vec<u8> {
+    let offset = |i: u32| {
+        let at = i as usize * 4;
+        u32::from_le_bytes(data[at..at + 4].try_into().expect("offset")) as usize
+    };
+    let base = (rows as usize + 1) * 4;
+    data[base + offset(row)..base + offset(row + 1)].to_vec()
+}
+
+/// Every file beneath `dir`, deepest first.
+fn files_under(dir: &std::path::Path) -> Vec<std::path::PathBuf> {
+    let mut files = Vec::new();
+    for entry in std::fs::read_dir(dir).expect("read dir") {
+        let path = entry.expect("entry").path();
+        if path.is_dir() {
+            files.extend(files_under(&path));
+        } else {
+            files.push(path);
+        }
+    }
+    files
+}
+
+#[test]
+fn a_page_that_fails_to_read_ends_its_group_with_the_error() {
+    // A scan yields the batches read before a damaged page, then that page's
+    // error, then nothing more of the group: it neither stops at the first
+    // batch nor skips the damage.
+    let (folder, tree) = columnar_segment();
+    // Reopened after the damage, so the pages come from disk rather than
+    // from what the flush left cached.
+    drop(tree);
+    let largest = files_under(folder.path())
+        .into_iter()
+        .max_by_key(|p| std::fs::metadata(p).map(|m| m.len()).unwrap_or(0))
+        .expect("the table file");
+    let mut bytes = std::fs::read(&largest).expect("read table");
+    let middle = bytes.len() / 2;
+    for byte in &mut bytes[middle..middle + 64] {
+        *byte ^= 0xff;
+    }
+    std::fs::write(&largest, bytes).expect("damage table");
+    let AnyTree::Standard(tree) = Config::new(
+        folder.path(),
+        SequenceNumberCounter::default(),
+        SequenceNumberCounter::default(),
+    )
+    .open()
+    .expect("reopen") else {
+        panic!("expected a standard tree");
+    };
+
+    let mut scan = tree
+        .columnar_scan(&[COL_USER_KEY, COL_VALUE], None, SeqNo::MAX, ..)
+        .expect("scan");
+    let mut rows = 0;
+    let mut failed = false;
+    for batch in &mut scan {
+        match batch {
+            Ok(batch) => rows += batch.row_count,
+            Err(_) => {
+                failed = true;
+                break;
+            }
+        }
+    }
+    assert!(failed, "the damaged page is reported");
+    assert!(rows > 0, "the pages before it were yielded");
+    assert!(
+        scan.next().is_none(),
+        "the failed group yields nothing more"
+    );
+}
+
+#[test]
+fn a_scan_whose_rows_are_all_filtered_still_reports_what_it_held() {
+    // A range falling between two keys reads the row group around it and
+    // keeps none of its rows. The pages were held all the same, so the peak
+    // the scan reports is theirs, not zero.
+    let (_folder, tree) = columnar_tree_cut_at(16 * 1_024);
+    for i in (0..ROWS).step_by(2) {
+        tree.insert(key(i), vec![b'v'; 256], u64::from(i));
+    }
+    tree.flush_active_memtable(0).expect("flush");
+
+    let lo = UserKey::from(key(1_001));
+    let hi = UserKey::from(format!("k{:06}x", 1_001).into_bytes());
+    let mut scan = tree
+        .columnar_scan(&[COL_USER_KEY, COL_VALUE], None, SeqNo::MAX, lo..hi)
+        .expect("scan");
+    assert!(scan.next().is_none(), "no key lies in the range");
+    assert!(
+        scan.peak_payload_bytes() > 0,
+        "the row group read to find that out was held"
+    );
+}
+
 #[test]
 fn a_single_segment_yields_its_first_batch_before_reading_the_rest() {
     // The first batch comes after a bounded prefix of the table, and a scan
