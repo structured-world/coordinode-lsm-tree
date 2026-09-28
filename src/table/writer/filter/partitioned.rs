@@ -36,8 +36,11 @@ pub struct PartitionedFilterWriter {
     /// Key hashes for AMQ filter
     pub bloom_hash_buffer: Vec<u64>,
 
+    partition_size: u32,
+
     /// Keys a partition holds when it closes: the fewest whose filter encodes
-    /// to the partition size (see [`keys_per_partition`]).
+    /// to the partition size (see [`keys_per_partition`]). Recomputed when
+    /// either the policy or the partition size is set.
     keys_per_partition: usize,
 
     bloom_policy: BloomConstructionPolicy,
@@ -103,6 +106,7 @@ impl PartitionedFilterWriter {
             final_filter_buffer: Vec::new(),
 
             bloom_hash_buffer: Vec::new(),
+            partition_size: 4_096,
             keys_per_partition: keys_per_partition(bloom_policy, 4_096),
 
             tli_handles: Vec::new(),
@@ -292,6 +296,7 @@ impl<W: crate::io::Write + crate::io::Seek> FilterWriter<W> for PartitionedFilte
     }
 
     fn use_partition_size(mut self: Box<Self>, size: u32) -> Box<dyn FilterWriter<W>> {
+        self.partition_size = size;
         self.keys_per_partition = keys_per_partition(self.bloom_policy, size);
         self
     }
@@ -315,6 +320,7 @@ impl<W: crate::io::Write + crate::io::Seek> FilterWriter<W> for PartitionedFilte
         policy: BloomConstructionPolicy,
     ) -> Box<dyn FilterWriter<W>> {
         self.bloom_policy = policy;
+        self.keys_per_partition = keys_per_partition(policy, self.partition_size);
         self
     }
 

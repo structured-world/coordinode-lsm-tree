@@ -56,3 +56,26 @@ fn a_filter_partition_closes_near_the_partition_size() -> crate::Result<()> {
     );
     Ok(())
 }
+
+/// The keys a partition holds follow the policy and the partition size in
+/// whichever order they are set: a writer created under a policy that builds
+/// no filter, then given an active one, still closes its partitions, so the
+/// open partition, which `finish` builds, stays one partition's worth.
+#[test]
+fn a_policy_set_after_the_writer_still_closes_partitions() -> crate::Result<()> {
+    let writer: Box<dyn FilterWriter<W>> = Box::new(PartitionedFilterWriter::new(
+        BloomConstructionPolicy::BitsPerKey(0.0),
+    ));
+    let mut writer = writer
+        .use_partition_size(4_096)
+        .set_filter_policy(BloomConstructionPolicy::default());
+    for i in 0..50_000u32 {
+        writer.register_key(&format!("key{i:08}").into_bytes().into())?;
+    }
+    let scratch = writer.finish_scratch_bytes();
+    assert!(
+        scratch < 64 * 1_024,
+        "an open partition of {scratch} scratch bytes after 50 000 keys",
+    );
+    Ok(())
+}
