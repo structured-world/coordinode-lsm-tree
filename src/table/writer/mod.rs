@@ -59,6 +59,9 @@ struct HandleMeta {
     /// The bound on the block's frame counted in flight, taken back out when
     /// it is written.
     frame_bound: u64,
+    /// The heap the block holds in flight, its encoded payload and its frame,
+    /// taken back out when it is written.
+    heap_bound: u64,
 }
 
 /// Bytes of the padding section between the two meta copies, so a bad sector
@@ -228,6 +231,10 @@ pub struct Writer {
 
     /// Range tombstones to be written as a separate block
     range_tombstones: Vec<RangeTombstone>,
+
+    /// Their least start and greatest end under the tree's comparator, set by
+    /// the caller for a table that may hold no record.
+    range_tombstone_coverage: Option<(UserKey, UserKey)>,
 
     /// Inner zstd-block layout per data block, accumulated in write order and
     /// serialized into the optional `block_layout` SST section at finish. Only
@@ -488,6 +495,11 @@ pub struct Writer {
     /// [`Self::output_size_hint`]). Added on submit, subtracted on drain.
     #[cfg(feature = "std")]
     parallel_pending_bytes: u64,
+
+    /// Heap the submitted-but-not-yet-drained blocks hold: their payloads and
+    /// frames. Added on submit, subtracted on drain.
+    #[cfg(feature = "std")]
+    parallel_pending_heap: u64,
 }
 
 /// Refuses a batch of more columns than a row group's directory can list: it
@@ -667,6 +679,7 @@ impl Writer {
 
             linked_blob_files: Vec::new(),
             range_tombstones: Vec::new(),
+            range_tombstone_coverage: None,
 
             encryption: None,
 
@@ -699,6 +712,8 @@ impl Writer {
             pending_meta: VecDeque::new(),
             #[cfg(feature = "std")]
             parallel_pending_bytes: 0,
+            #[cfg(feature = "std")]
+            parallel_pending_heap: 0,
         })
     }
 
@@ -717,9 +732,14 @@ impl Writer {
     /// Heap bytes the per-key and per-block state holds until `finish`,
     /// including what `finish` allocates on top to build its sections. It
     /// grows with the keys, not the data bytes, so a table of well-compressing
-    /// rows can reach its memory before its size.
+    /// rows can reach its memory before its size. Blocks in flight on the
+    /// parallel pipeline hold their payloads and frames until written.
     pub(crate) fn held_state_bytes(&self) -> u64 {
-        self.held_state_bytes
+        #[cfg(feature = "std")]
+        let in_flight = self.parallel_pending_heap;
+        #[cfg(not(feature = "std"))]
+        let in_flight = 0;
+        self.held_state_bytes + in_flight
     }
 
     /// The keys of the forming block are all recorded: the next key belongs to
@@ -1679,6 +1699,13 @@ impl Writer {
         self.range_tombstones.push(rt);
     }
 
+    /// The least start and greatest end of the tombstones written, under the
+    /// tree's comparator: the key range of a table that holds no record, which
+    /// this writer, knowing only byte order, cannot take from them itself.
+    pub(crate) fn cover_range_tombstones(&mut self, start: UserKey, end: UserKey) {
+        self.range_tombstone_coverage = Some((start, end));
+    }
+
     /// Writes an item.
     ///
     /// # Note
@@ -1915,6 +1942,9 @@ impl Writer {
                 self.encryption.as_deref(),
                 self.ecc,
             );
+            // Its heap in flight: the encoded payload, and the frame a worker
+            // prepares from it.
+            let heap_bound = encoded.capacity() as u64 + frame_bound;
             self.pending_meta.push_back(HandleMeta {
                 last_key,
                 last_seqno,
@@ -1922,8 +1952,10 @@ impl Writer {
                 item_count,
                 zone_block_min,
                 frame_bound,
+                heap_bound,
             });
             self.parallel_pending_bytes += frame_bound;
+            self.parallel_pending_heap += heap_bound;
             if let Some(par) = self.parallel.as_mut() {
                 par.submit(encoded, kv_flags);
             }
@@ -3144,6 +3176,8 @@ impl Writer {
         // queued, so the total holds at least this much.
         debug_assert!(self.parallel_pending_bytes >= meta.frame_bound);
         self.parallel_pending_bytes -= meta.frame_bound;
+        debug_assert!(self.parallel_pending_heap >= meta.heap_bound);
+        self.parallel_pending_heap -= meta.heap_bound;
         self.register_written_block(
             header,
             layout,
@@ -3187,19 +3221,26 @@ impl Writer {
         // seqno and should not influence user-visible metadata.
         // Also ensure the table metadata key range covers all range tombstones.
         if self.meta.item_count == 0 {
-            // Compute the coverage of all range tombstones.
-            let mut min_start: Option<UserKey> = None;
-            let mut max_end: Option<UserKey> = None;
-            for rt in &self.range_tombstones {
-                match &min_start {
-                    None => min_start = Some(rt.start.clone()),
-                    Some(cur_min) if rt.start < *cur_min => min_start = Some(rt.start.clone()),
-                    _ => {}
-                }
-                match &max_end {
-                    None => max_end = Some(rt.end.clone()),
-                    Some(cur_max) if rt.end > *cur_max => max_end = Some(rt.end.clone()),
-                    _ => {}
+            // The coverage of all range tombstones: as the caller ordered it
+            // under its comparator, else in byte order.
+            let (mut min_start, mut max_end) = match self.range_tombstone_coverage.take() {
+                Some((start, end)) => (Some(start), Some(end)),
+                None => (None, None),
+            };
+            if min_start.is_none() {
+                for rt in &self.range_tombstones {
+                    match &min_start {
+                        None => min_start = Some(rt.start.clone()),
+                        Some(cur_min) if rt.start < *cur_min => {
+                            min_start = Some(rt.start.clone());
+                        }
+                        _ => {}
+                    }
+                    match &max_end {
+                        None => max_end = Some(rt.end.clone()),
+                        Some(cur_max) if rt.end > *cur_max => max_end = Some(rt.end.clone()),
+                        _ => {}
+                    }
                 }
             }
             // The sentinel uses the (seqno, start)-minimal tombstone's start and
