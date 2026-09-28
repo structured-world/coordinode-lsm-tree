@@ -727,7 +727,9 @@ fn a_flush_splits_its_tombstones_past_the_last_key() -> crate::Result<()> {
     use crate::{InternalValue, UserKey, fs::StdFs, range_tombstone::RangeTombstone};
     use std::sync::Arc;
 
-    const TARGET: u64 = 32 * 1_024;
+    // Small enough that the tail an output of tombstones alone writes is a
+    // good part of it.
+    const TARGET: u64 = 12 * 1_024;
     const TOMBSTONES: usize = 2_000;
 
     // Pseudo-random bounds, so no codec shrinks the tombstone block.
@@ -788,13 +790,13 @@ fn a_flush_splits_its_tombstones_past_the_last_key() -> crate::Result<()> {
         .map(|rt| (rt.start.to_vec(), rt.end.to_vec()))
         .collect();
     assert_eq!(written, expected, "each tombstone written once, whole");
-    // Each output closes at a tombstone start, before its next entry would
-    // pass the target; it then adds the tail, and the sentinel block an
-    // output of tombstones alone writes.
+    // Each output closes once it reaches the target, counting the tail, and
+    // the sentinel block an output of tombstones alone writes: it passes the
+    // target by the last entry at most.
     for table in &tables {
         let file_size = std::fs::metadata(base_path.join(table.id().to_string()))?.len();
         assert!(
-            file_size <= TARGET + 8 * 1_024,
+            file_size <= TARGET + 512,
             "output of {file_size} bytes with {} tombstones overran the {TARGET}-byte target",
             table.range_tombstones().len(),
         );
@@ -804,9 +806,14 @@ fn a_flush_splits_its_tombstones_past_the_last_key() -> crate::Result<()> {
 
 /// `key` extended to 64 bytes with a pseudo-random tail from `seed`, so no
 /// codec shrinks a block of such bounds.
-fn random_bound(seed: usize, mut key: Vec<u8>) -> Vec<u8> {
+fn random_bound(seed: usize, key: Vec<u8>) -> Vec<u8> {
+    random_bound_of(seed, key, 64)
+}
+
+/// `key` extended to at least `len` bytes with a pseudo-random tail.
+fn random_bound_of(seed: usize, mut key: Vec<u8>, len: usize) -> Vec<u8> {
     let mut state = (seed as u64 + 1).wrapping_mul(0x9E37_79B9_7F4A_7C15);
-    while key.len() < 64 {
+    while key.len() < len {
         state ^= state << 13;
         state ^= state >> 7;
         state ^= state << 17;
@@ -978,6 +985,52 @@ fn short_overlapping_tombstones_are_not_carried_by_their_memory() -> crate::Resu
         "{pieces} pieces over {} outputs for {TOMBSTONES} tombstones",
         tables.len(),
     );
+    Ok(())
+}
+
+/// Each tombstone piece holds its bounds in memory besides its entry, and
+/// the block buffer holds them again: an output of long-bounded tombstones
+/// is full by both copies, not by its encoded bytes alone.
+#[test]
+fn a_flush_output_holds_its_tombstone_bounds_within_the_target() -> crate::Result<()> {
+    use crate::{UserKey, range_tombstone::RangeTombstone};
+
+    const TARGET: u64 = 64 * 1_024;
+    const KEYS: usize = 400;
+    let key = |i: usize| format!("{i:05}").into_bytes();
+    let tombstones = (0..KEYS)
+        .map(|i| {
+            let mut start = key(i);
+            start.push(0);
+            let mut end = key(i);
+            end.push(1);
+            RangeTombstone::new(
+                UserKey::from(random_bound_of(2 * i, start, 500)),
+                UserKey::from(random_bound_of(2 * i + 1, end, 500)),
+                5,
+            )
+        })
+        .collect();
+    let keys: Vec<Vec<u8>> = (0..KEYS).map(key).collect();
+    let keys: Vec<&[u8]> = keys.iter().map(Vec::as_slice).collect();
+    let (_folder, tables) = flush_outputs(TARGET, &keys, tombstones)?;
+    let entry = core::mem::size_of::<RangeTombstone>() as u64;
+    for table in &tables {
+        // Entries, their bounds, and the block they are encoded into.
+        let held: u64 = table
+            .range_tombstones()
+            .iter()
+            .map(|rt| {
+                let bounds = (rt.start.len() + rt.end.len()) as u64;
+                entry + bounds + 12 + bounds
+            })
+            .sum();
+        assert!(
+            held <= TARGET + 2 * 1_024,
+            "{} tombstones hold {held} bytes against the {TARGET}-byte target",
+            table.range_tombstones().len(),
+        );
+    }
     Ok(())
 }
 

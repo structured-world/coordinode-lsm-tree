@@ -839,6 +839,35 @@ fn the_estimates_count_a_sparse_delete_bitmap_as_encoded() -> crate::Result<()> 
     Ok(())
 }
 
+/// `finish` encodes the delete bitmap once and keeps the bytes for the meta's
+/// content hash, while it copies them into the block buffer and seals that
+/// into a frame: with its containers, four copies are live at once.
+#[cfg(feature = "encryption")]
+#[test]
+fn the_held_state_counts_the_retained_delete_bitmap_encoding() -> crate::Result<()> {
+    let dir = tempfile::tempdir()?;
+    let mut writer = Writer::new(dir.path().join("1"), 1, 0, Arc::new(StdFs))?
+        .use_zone_map(true)
+        .use_encryption(Some(Arc::new(crate::encryption::Aes256GcmProvider::new(
+            &[7; 32],
+        ))));
+    write_keys(&mut writer, 100, 8)?;
+    for chunk in 0..10_000 {
+        writer
+            .delete_bitmap_mut()
+            .insert(chunk * crate::table::delete_bitmap::CHUNK_ROWS);
+    }
+    writer.refresh_state_estimates();
+    let encoded = writer.delete_bitmap.encode().len() as u64;
+    let containers = writer.delete_bitmap.heap_len_bound();
+    assert!(
+        writer.held_state_bytes() >= containers + 3 * encoded,
+        "the held state is {} for a {encoded}-byte bitmap in {containers} bytes",
+        writer.held_state_bytes(),
+    );
+    Ok(())
+}
+
 /// Zone-map entries own copies of each block's bounds; under long keys those
 /// dominate the section, and both estimates have to count them.
 #[test]

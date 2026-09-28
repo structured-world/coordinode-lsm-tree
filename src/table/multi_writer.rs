@@ -957,14 +957,15 @@ impl MultiWriter {
             Some(key) if !self.range_tombstones.is_empty() => self.tombstone_share.bytes(key),
             _ => 0,
         };
-        self.full_with_tombstones(tombstones, self.tombstone_share.pieces())
+        self.full_with_tombstones(tombstones, self.tombstone_share.pieces(), 0)
     }
 
     /// The current table reached its target if it closes holding `pieces`
-    /// range-tombstone entries of `tombstones` encoded bytes. The writer holds
-    /// each entry until `finish`, which encodes them into a block buffer and
-    /// frames that when the block is transformed.
-    fn full_with_tombstones(&self, tombstones: u64, pieces: u64) -> bool {
+    /// range-tombstone entries of `tombstones` encoded bytes, besides the
+    /// `overhead` its writer does not count. The writer holds each entry until
+    /// `finish`, which encodes them into a block buffer and frames that when
+    /// the block is transformed.
+    fn full_with_tombstones(&self, tombstones: u64, pieces: u64, overhead: u64) -> bool {
         use crate::table::block::{BlockType, framed_len_bound};
 
         let linked = crate::table::writer::linked_blob_files_len(self.linked_blobs.len());
@@ -988,7 +989,7 @@ impl MultiWriter {
             * (core::mem::size_of::<(BlobFileId, LinkedFile)>()
                 + 1
                 + core::mem::size_of::<LinkedFile>()) as u64;
-        self.writer.output_size_hint() + linked + tombstone_block >= self.target_size
+        self.writer.output_size_hint() + overhead + linked + tombstone_block >= self.target_size
             || self.writer.held_state_bytes() + tombstones_held + linked_held >= self.target_size
     }
 
@@ -1010,14 +1011,15 @@ impl MultiWriter {
     }
 
     /// Heap an output holding `pieces` tombstone entries of `tombstones`
-    /// encoded bytes takes for them until `finish`: the entries, the block
+    /// encoded bytes takes for them until `finish`: the entries and the
+    /// bounds they own, which the encoded bytes bound from above, the block
     /// buffer they are encoded into, and its frame when the block is
     /// transformed.
     fn tombstones_held(&self, tombstones: u64, pieces: u64) -> u64 {
         use crate::table::block::{BlockType, transform_scratch_bound};
 
         pieces * core::mem::size_of::<RangeTombstone>() as u64
-            + tombstones
+            + 2 * tombstones
             + transform_scratch_bound(
                 tombstones,
                 BlockType::RangeTombstone,
@@ -1117,6 +1119,13 @@ impl MultiWriter {
             return Ok(());
         }
         let comparator = self.comparator.clone();
+        // The longest bound any output's key range and sentinel can take.
+        let longest = self
+            .range_tombstones
+            .iter()
+            .map(|rt| rt.start.len().max(rt.end.len()))
+            .max()
+            .unwrap_or(0) as u64;
         loop {
             let tombstones = &self.range_tombstones;
             let share = &self.tombstone_share;
@@ -1139,6 +1148,13 @@ impl MultiWriter {
             let (group_bytes, group_entries) =
                 self.tombstone_share
                     .group(&self.range_tombstones, &point, comparator.as_ref());
+            // An output of tombstones alone writes a synthetic table around
+            // them, which its writer, holding no record, does not count yet.
+            let overhead = if self.writer.meta.key_count == 0 {
+                self.writer.tombstone_only_overhead(longest)?
+            } else {
+                0
+            };
             // An empty zone is never closed: that output would hold nothing,
             // nor is the last one, with nothing above it.
             if bytes > 0
@@ -1146,6 +1162,7 @@ impl MultiWriter {
                 && self.full_with_tombstones(
                     bytes + group_bytes,
                     self.tombstone_share.pieces() + group_entries,
+                    overhead,
                 )
                 && self.rotation_sheds(&point)
             {
