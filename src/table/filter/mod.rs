@@ -111,6 +111,49 @@ impl BloomConstructionPolicy {
         const TAIL_DEN: usize = 100;
         wire::HEADER_LEN + first_layer.saturating_mul(TAIL_NUM) / TAIL_DEN
     }
+
+    /// Bytes the filter over `n` distinct hashes encodes to, bounded from
+    /// above, for the writers to count a filter they have not built yet. The
+    /// first layer is exact. Each later one solves the keys the layer before
+    /// bumped. Over many key sets the second takes a tenth of the first's
+    /// slots, spread by about `2.5 / sqrt(n)` of them (18% at a thousand keys,
+    /// 10% at a hundred thousand), the third a hundredth, the last under that;
+    /// but a small filter builds them at their floors, two blocks, two and
+    /// four. They are taken at a tenth plus `3 / sqrt(n)`, a fiftieth and a
+    /// hundredth of the first, and at those floors.
+    ///
+    /// This bounds the filters real keys build, not the worst case: hashes
+    /// chosen to collide can bump a whole block, and in the limit every key,
+    /// into the next layer. Charging each later layer for all `n` keys would
+    /// double the estimate of every table to guard against inputs built to
+    /// defeat a 64-bit hash, so a table rotates on the bumps keys make in
+    /// practice.
+    #[must_use]
+    pub(crate) fn filter_size_bound(self, n: usize) -> usize {
+        use ribbon::burr::{packed, wire};
+
+        let Some(params) = self.burr_params(n) else {
+            return 0;
+        };
+        let b = usize::from(params.b);
+        // A layer too large to size stays at the top rather than wrapping.
+        let layer = |m: usize| {
+            wire::LAYER_HEADER_LEN
+                .saturating_add(m / b)
+                .saturating_add(packed::z_byte_len(m, params.r).unwrap_or(usize::MAX))
+        };
+        let first = layer(params.layer_m(n));
+        let spread = first.saturating_mul(3) / n.isqrt().max(1);
+        let second = layer(2 * b).max((first / 10).saturating_add(spread));
+        let third = layer(2 * b).max(first / 50);
+        let last = layer(4 * b).max(first / 100);
+        debug_assert_eq!(params.max_layers, 4, "the bound sizes four layers");
+        wire::HEADER_LEN
+            .saturating_add(first)
+            .saturating_add(second)
+            .saturating_add(third)
+            .saturating_add(last)
+    }
 }
 
 /// Build a `BuRR` filter block payload from pre-hashed keys under the given

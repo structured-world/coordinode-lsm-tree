@@ -21,8 +21,20 @@ use alloc::sync::Arc;
 pub trait FilterWriter<W: crate::io::Write + crate::io::Seek> {
     // NOTE: We purposefully use a UserKey instead of &[u8]
     // so we can clone it without heap allocation, if needed
-    /// Registers a key in the block index.
-    fn register_key(&mut self, key: &UserKey) -> crate::Result<()>;
+    /// Registers a key in the filter, and returns the hashes it buffered for
+    /// it: one, and one a new prefix under a prefix extractor.
+    fn register_key(&mut self, key: &UserKey) -> crate::Result<usize>;
+
+    /// Heap bytes this writer holds until [`finish`](Self::finish).
+    fn held_bytes(&self) -> u64;
+
+    /// Heap bytes [`finish`](Self::finish) allocates on top of
+    /// [`held_bytes`](Self::held_bytes) while it builds, at its peak.
+    fn finish_scratch_bytes(&self) -> u64;
+
+    /// Bytes [`finish`](Self::finish) will append to the table file,
+    /// estimated from what is held now.
+    fn finish_output_bytes(&self) -> u64;
 
     /// Writes the filter to a file.
     ///

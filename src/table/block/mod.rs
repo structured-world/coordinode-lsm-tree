@@ -22,7 +22,7 @@ pub(crate) use encoder::{Encodable, Encoder};
 pub use header::{ChecksumAt, Header};
 pub use identity::BlockIdentity;
 pub use offset::BlockOffset;
-pub(crate) use trailer::{TRAILER_START_MARKER, Trailer};
+pub(crate) use trailer::{TRAILER_LEN, TRAILER_START_MARKER, Trailer};
 pub use transform::{BlockTransform, CompressionContext, EccParams};
 pub use r#type::BlockType;
 
@@ -94,6 +94,54 @@ pub(crate) fn expected_parity_len(data_length: u32, params: EccParams) -> u32 {
     // shards the product CAN exceed u32 — saturate. An over-large parity length
     // is rejected against the actual block downstream, so the clamp is safe.
     shard_bytes.saturating_mul(parity_shards)
+}
+
+/// Bytes a `block_type` block of `payload` bytes takes on disk, bounded from
+/// above: its header, the codec's worst case, the encryption overhead and the
+/// parity trailer. Used to estimate a table's size before its blocks are
+/// written.
+pub(crate) fn framed_len_bound(
+    payload: u64,
+    block_type: BlockType,
+    compression: crate::CompressionType,
+    encryption: Option<&dyn crate::encryption::EncryptionProvider>,
+    ecc: Option<EccParams>,
+) -> u64 {
+    // A payload held in memory fits `usize`; the widening back is lossless.
+    let compressed = usize::try_from(payload)
+        .map_or(payload, |len| compression.compressed_len_bound(len) as u64);
+    let data = compressed + encryption.map_or(0, |e| u64::from(e.max_overhead()));
+    // A block past `u32::MAX` bytes is refused when it is written, so its
+    // parity never reaches the file; the saturated length only has to keep
+    // the estimate above the target that refusal protects.
+    let parity = ecc.map_or(0, |p| {
+        expected_parity_len(u32::try_from(data).unwrap_or(u32::MAX), p)
+    });
+    Header::header_len(block_type) as u64 + data + u64::from(parity)
+}
+
+/// Heap bytes writing such a block allocates beside its payload, bounded from
+/// above: nothing when it is written as is, else the transformed frame. A
+/// block both compressed and encrypted is sealed from the compressor's buffer
+/// into a new one, so the compressed bytes are live besides the frame.
+pub(crate) fn transform_scratch_bound(
+    payload: u64,
+    block_type: BlockType,
+    compression: crate::CompressionType,
+    encryption: Option<&dyn crate::encryption::EncryptionProvider>,
+    ecc: Option<EccParams>,
+) -> u64 {
+    let compressed = compression != crate::CompressionType::None;
+    if !compressed && encryption.is_none() && ecc.is_none() {
+        return 0;
+    }
+    let sealed_from = if compressed && encryption.is_some() {
+        // A payload held in memory fits `usize`; the widening back is lossless.
+        usize::try_from(payload).map_or(payload, |len| compression.compressed_len_bound(len) as u64)
+    } else {
+        0
+    };
+    framed_len_bound(payload, block_type, compression, encryption, ecc) + sealed_from
 }
 
 /// Refuses an on-disk block size no block written under `encryption` and

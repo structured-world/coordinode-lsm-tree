@@ -389,6 +389,44 @@ fn write_columnar_batch_enforces_the_ingest_contract() -> crate::Result<()> {
     Ok(())
 }
 
+/// A columnar batch is written and registered before its locator slots are
+/// folded in; the estimates the table rotates on must still count them.
+#[cfg(feature = "columnar")]
+#[test]
+fn a_columnar_batch_leaves_the_estimates_current() -> crate::Result<()> {
+    use crate::comparator::default_comparator;
+    use crate::config::{LocatorPolicyEntry, LocatorPrecision};
+    use crate::table::columnar::entries_to_column_batch;
+
+    let dir = tempfile::tempdir()?;
+    let mut writer = Writer::new(dir.path().join("1"), 1, 0, Arc::new(StdFs))?
+        .use_columnar(true)
+        .use_locator(LocatorPolicyEntry::Enabled {
+            precision: LocatorPrecision::Entry,
+            block_id_bits: None,
+            slot_bits: None,
+        });
+    // One row group: its slots are the table's first, so they grow the
+    // locator's width from nothing.
+    let entries: alloc::vec::Vec<InternalValue> = (0..300u32)
+        .map(|i| {
+            InternalValue::from_components(
+                format!("key{i:06}").into_bytes(),
+                b"v".to_vec(),
+                0,
+                ValueType::Value,
+            )
+        })
+        .collect();
+    writer.write_columnar_batch(&entries_to_column_batch(&entries)?, &default_comparator())?;
+    assert_eq!(writer.meta.data_block_count, 1);
+    let (held, hint) = (writer.held_state_bytes(), writer.output_size_hint());
+    writer.refresh_state_estimates();
+    assert_eq!(held, writer.held_state_bytes(), "held state");
+    assert_eq!(hint, writer.output_size_hint(), "size hint");
+    Ok(())
+}
+
 /// Columnar bulk ingest with an `Entry`-precision locator records a per-key
 /// locator slot for every distinct key (the per-entry-index arm of the direct
 /// block accounting).
@@ -473,5 +511,766 @@ fn writer_keeps_the_two_pass_seed_on_by_default_across_subwriter_swaps() -> crat
         "swapping subwriters leaves the default in force",
     );
 
+    Ok(())
+}
+
+/// The layouts whose finish-time sections are estimated differently.
+#[derive(Clone, Copy, Debug)]
+enum StateLayout {
+    Full,
+    Partitioned,
+    Locator,
+}
+
+fn state_writer(path: crate::path::PathBuf, layout: StateLayout) -> crate::Result<Writer> {
+    let writer = Writer::new(path, 1, 0, Arc::new(StdFs))?;
+    Ok(match layout {
+        StateLayout::Full => writer,
+        StateLayout::Partitioned => writer.use_partitioned_index().use_partitioned_filter(),
+        StateLayout::Locator => writer.use_locator(crate::config::LocatorPolicyEntry::Enabled {
+            precision: crate::config::LocatorPrecision::Restart,
+            block_id_bits: None,
+            slot_bits: None,
+        }),
+    })
+}
+
+/// Writes `n` keys with `value_len`-byte values and spills the last block.
+fn write_keys(writer: &mut Writer, n: u32, value_len: usize) -> crate::Result<()> {
+    let value = alloc::vec![0x5a; value_len];
+    for i in 0..n {
+        writer.write(InternalValue::from_components(
+            format!("key{i:010}").into_bytes(),
+            value.clone(),
+            0,
+            ValueType::Value,
+        ))?;
+    }
+    writer.spill_block()
+}
+
+/// A writer that has seen no key holds no state for `finish` and expects it to
+/// append nothing past what is on disk.
+#[test]
+fn a_fresh_writer_holds_no_state_for_finish() -> crate::Result<()> {
+    for layout in [
+        StateLayout::Full,
+        StateLayout::Partitioned,
+        StateLayout::Locator,
+    ] {
+        let dir = tempfile::tempdir()?;
+        let writer = state_writer(dir.path().join("1"), layout)?;
+        assert_eq!(writer.held_state_bytes(), 0, "{layout:?}");
+        assert_eq!(writer.finish_metadata_bytes, 0, "{layout:?}");
+    }
+    Ok(())
+}
+
+/// A table rotates on the size hint before `finish` has written its filter,
+/// index and locator, so the hint must already count them: it lands close to
+/// the finished file, which only adds the meta block and the table of contents.
+#[test]
+fn the_size_hint_before_finish_is_close_to_the_finished_table() -> crate::Result<()> {
+    for layout in [
+        StateLayout::Full,
+        StateLayout::Partitioned,
+        StateLayout::Locator,
+    ] {
+        let dir = tempfile::tempdir()?;
+        let path = dir.path().join("1");
+        let mut writer = state_writer(path.clone(), layout)?;
+        write_keys(&mut writer, 50_000, 8)?;
+        let hint = writer.output_size_hint();
+        let data = *writer.meta.file_pos;
+        assert!(
+            hint > data,
+            "{layout:?}: the hint counts the sections to come"
+        );
+        writer.finish()?;
+        let size = std::fs::metadata(&path)?.len();
+        assert!(
+            hint * 10 >= size * 9 && hint * 10 <= size * 11,
+            "{layout:?}: hint {hint} for a {size}-byte table",
+        );
+    }
+    Ok(())
+}
+
+/// A table rotates on the estimates as they stand after its last block, so
+/// they must already count that block's index entry and section entries:
+/// recomputing them changes nothing.
+#[test]
+fn the_estimates_count_the_block_just_written() -> crate::Result<()> {
+    for layout in [
+        StateLayout::Full,
+        StateLayout::Partitioned,
+        StateLayout::Locator,
+    ] {
+        let dir = tempfile::tempdir()?;
+        let mut writer = state_writer(dir.path().join("1"), layout)?
+            .use_zone_map(true)
+            .use_seqno_in_index(true);
+        write_keys(&mut writer, 1_000, 8)?;
+        let (held, hint) = (writer.held_state_bytes(), writer.output_size_hint());
+        writer.refresh_state_estimates();
+        assert_eq!(held, writer.held_state_bytes(), "{layout:?}: held state");
+        assert_eq!(hint, writer.output_size_hint(), "{layout:?}: size hint");
+    }
+    Ok(())
+}
+
+/// The state a table holds for `finish` grows with its keys, not with its
+/// bytes: the same keys with values a hundred times larger hold about the same
+/// state, while their rows are twenty times larger. Only the index grows with the data,
+/// by one entry per block.
+#[test]
+fn held_state_follows_the_keys_not_the_value_bytes() -> crate::Result<()> {
+    for layout in [
+        StateLayout::Full,
+        StateLayout::Partitioned,
+        StateLayout::Locator,
+    ] {
+        let dir = tempfile::tempdir()?;
+        let mut small = state_writer(dir.path().join("1"), layout)?;
+        let mut large = state_writer(dir.path().join("2"), layout)?;
+        write_keys(&mut small, 20_000, 4)?;
+        write_keys(&mut large, 20_000, 400)?;
+        let (small_state, large_state) = (small.held_state_bytes(), large.held_state_bytes());
+        assert!(
+            small_state > 20_000 * 8,
+            "{layout:?}: {small_state} bytes for 20 000 keys"
+        );
+        assert!(
+            large_state < 2 * small_state,
+            "{layout:?}: {large_state} bytes held for 400-byte values, {small_state} for 4-byte",
+        );
+        // 13-byte keys: rows of 17 and 413 bytes.
+        assert!(
+            large.output_size_hint() > 10 * small.output_size_hint(),
+            "{layout:?}: the data grew with the values",
+        );
+    }
+    Ok(())
+}
+
+/// Writes `n` keys of `key_len` bytes with 8-byte values and spills the last
+/// block.
+fn write_long_keys(writer: &mut Writer, n: u32, key_len: usize) -> crate::Result<()> {
+    for i in 0..n {
+        writer.write(InternalValue::from_components(
+            format!("{i:0key_len$}").into_bytes(),
+            b"value---".to_vec(),
+            0,
+            ValueType::Value,
+        ))?;
+    }
+    writer.spill_block()
+}
+
+/// The size hint before `finish` lands within 10% of the finished table.
+fn assert_hint_matches_the_table(writer: Writer, path: &std::path::Path) -> crate::Result<()> {
+    let hint = writer.output_size_hint();
+    writer.finish()?;
+    let size = std::fs::metadata(path)?.len();
+    assert!(
+        hint * 10 >= size * 9 && hint * 10 <= size * 11,
+        "hint {hint} for a {size}-byte table",
+    );
+    Ok(())
+}
+
+/// The top-level index is written twice, at its place and mirrored at the
+/// tail. Small blocks under long keys make it a large share of the table, so
+/// the hint lands near the finished size only if both copies are counted.
+#[test]
+fn the_size_hint_counts_the_mirrored_index() -> crate::Result<()> {
+    let dir = tempfile::tempdir()?;
+    let path = dir.path().join("1");
+    let mut writer = Writer::new(path.clone(), 1, 0, Arc::new(StdFs))?.use_data_block_size(64);
+    write_long_keys(&mut writer, 5_000, 200)?;
+    assert_hint_matches_the_table(writer, &path)
+}
+
+/// A prefix shared by every key hashes to the same token once per key. The
+/// filter is built from distinct tokens, so the estimates, counted from every
+/// buffered token, stay above what `finish` builds and writes.
+#[test]
+fn a_prefix_shared_by_every_key_is_built_once() -> crate::Result<()> {
+    struct UpToColon;
+    impl crate::prefix::PrefixExtractor for UpToColon {
+        fn prefixes<'a>(&self, key: &'a [u8]) -> Box<dyn Iterator<Item = &'a [u8]> + 'a> {
+            let end = key.iter().position(|b| *b == b':').map_or(0, |i| i + 1);
+            Box::new(key.get(..end).into_iter())
+        }
+    }
+    let dir = tempfile::tempdir()?;
+    let path = dir.path().join("1");
+    let mut writer = Writer::new(path.clone(), 1, 0, Arc::new(StdFs))?
+        .use_prefix_extractor(Some(Arc::new(UpToColon)));
+    for i in 0..20_000u32 {
+        writer.write(InternalValue::from_components(
+            format!("p:{i:08}").into_bytes(),
+            b"v".to_vec(),
+            0,
+            ValueType::Value,
+        ))?;
+    }
+    writer.spill_block()?;
+    let hint = writer.output_size_hint();
+    writer.finish()?;
+    let size = std::fs::metadata(&path)?.len();
+    assert!(hint >= size, "hint {hint} for a {size}-byte table");
+    Ok(())
+}
+
+/// Every table ends with sections `finish` always writes: two copies of the
+/// meta block, the version byte, the 4 KiB separator between them, the table
+/// of contents and the trailer. A table of a few keys is mostly these. The
+/// hint is not below the table, and above it by the 10% the other estimates
+/// allow plus the filter's bound: a small filter is counted as if it built
+/// every layer.
+#[test]
+fn the_size_hint_counts_the_tail_every_table_writes() -> crate::Result<()> {
+    for key_len in [8, 1_000] {
+        let dir = tempfile::tempdir()?;
+        let path = dir.path().join("1");
+        let mut writer = Writer::new(path.clone(), 1, 0, Arc::new(StdFs))?;
+        write_long_keys(&mut writer, 3, key_len)?;
+        let hint = writer.output_size_hint();
+        writer.finish()?;
+        let size = std::fs::metadata(&path)?.len();
+        let slack = crate::config::BloomConstructionPolicy::default().filter_size_bound(3) as u64;
+        assert!(
+            hint >= size && hint * 10 <= size * 11 + slack * 10,
+            "hint {hint} for a {size}-byte table, filter slack {slack}",
+        );
+    }
+    Ok(())
+}
+
+/// A table may close before its first block is cut, when what the multi-writer
+/// adds at rotation fills it: the tail is counted from the first key on.
+#[test]
+fn the_size_hint_counts_the_tail_before_a_block_is_cut() -> crate::Result<()> {
+    let dir = tempfile::tempdir()?;
+    let mut writer = Writer::new(dir.path().join("1"), 1, 0, Arc::new(StdFs))?;
+    writer.write(InternalValue::from_components(
+        b"key".to_vec(),
+        b"v".to_vec(),
+        0,
+        ValueType::Value,
+    ))?;
+    assert_eq!(writer.meta.data_block_count, 0);
+    assert!(
+        writer.output_size_hint() > FIXED_TAIL_LEN,
+        "hint {} before the first block",
+        writer.output_size_hint(),
+    );
+    Ok(())
+}
+
+/// A large block gathers filter and locator state for many keys before it is
+/// cut; the estimates count that state within the block, not only once the
+/// block is written.
+#[test]
+fn the_estimates_follow_the_keys_of_a_block_not_yet_cut() -> crate::Result<()> {
+    let dir = tempfile::tempdir()?;
+    let mut writer =
+        Writer::new(dir.path().join("1"), 1, 0, Arc::new(StdFs))?.use_data_block_size(4 << 20);
+    for i in 0..20_000u32 {
+        writer.write(InternalValue::from_components(
+            format!("key{i:06}").into_bytes(),
+            b"v".to_vec(),
+            0,
+            ValueType::Value,
+        ))?;
+    }
+    assert_eq!(writer.meta.data_block_count, 0);
+    // One 8-byte hash per key, less the keys since the last refresh.
+    assert!(
+        writer.held_state_bytes() >= 19_000 * 8,
+        "{} held for 20 000 keys",
+        writer.held_state_bytes(),
+    );
+    Ok(())
+}
+
+/// `finish` encodes each section into a buffer it keeps to the end and frames
+/// it into another, while the section itself is still held: a large section
+/// counts three times at that point.
+#[test]
+fn the_held_state_counts_the_section_encoding_buffers() -> crate::Result<()> {
+    let dir = tempfile::tempdir()?;
+    let mut writer = Writer::new(dir.path().join("1"), 1, 0, Arc::new(StdFs))?
+        .use_data_block_size(256)
+        .use_zone_map(true);
+    write_long_keys(&mut writer, 5_000, 200)?;
+    assert!(
+        writer.held_state_bytes() >= 3 * writer.zone_map_bytes,
+        "{} held for {} bytes of zone-map bounds",
+        writer.held_state_bytes(),
+        writer.zone_map_bytes,
+    );
+    Ok(())
+}
+
+/// A delete bitmap stores each touched chunk with its index, kind and count,
+/// so sparse deletes cost more than their row count: both estimates count the
+/// bitmap as it will be encoded.
+#[test]
+fn the_estimates_count_a_sparse_delete_bitmap_as_encoded() -> crate::Result<()> {
+    let dir = tempfile::tempdir()?;
+    let mut writer = Writer::new(dir.path().join("1"), 1, 0, Arc::new(StdFs))?.use_zone_map(true);
+    write_keys(&mut writer, 100, 8)?;
+    let (held, hint) = (writer.held_state_bytes(), writer.output_size_hint());
+    for chunk in 0..1_000 {
+        writer
+            .delete_bitmap_mut()
+            .insert(chunk * crate::table::delete_bitmap::CHUNK_ROWS);
+    }
+    writer.refresh_state_estimates();
+    let encoded = writer.delete_bitmap.encode().len() as u64;
+    assert!(
+        writer.output_size_hint() - hint >= encoded,
+        "the hint grew by {} for a {encoded}-byte bitmap",
+        writer.output_size_hint() - hint,
+    );
+    assert!(writer.held_state_bytes() - held >= encoded);
+    Ok(())
+}
+
+/// `finish` encodes the delete bitmap once and keeps the bytes for the meta's
+/// content hash, while it copies them into the block buffer and seals that
+/// into a frame: with its containers, four copies are live at once.
+#[cfg(feature = "encryption")]
+#[test]
+fn the_held_state_counts_the_retained_delete_bitmap_encoding() -> crate::Result<()> {
+    let dir = tempfile::tempdir()?;
+    let mut writer = Writer::new(dir.path().join("1"), 1, 0, Arc::new(StdFs))?
+        .use_zone_map(true)
+        .use_encryption(Some(Arc::new(crate::encryption::Aes256GcmProvider::new(
+            &[7; 32],
+        ))));
+    write_keys(&mut writer, 100, 8)?;
+    for chunk in 0..10_000 {
+        writer
+            .delete_bitmap_mut()
+            .insert(chunk * crate::table::delete_bitmap::CHUNK_ROWS);
+    }
+    writer.refresh_state_estimates();
+    let encoded = writer.delete_bitmap.encode().len() as u64;
+    let containers = writer.delete_bitmap.heap_len_bound();
+    assert!(
+        writer.held_state_bytes() >= containers + 3 * encoded,
+        "the held state is {} for a {encoded}-byte bitmap in {containers} bytes",
+        writer.held_state_bytes(),
+    );
+    Ok(())
+}
+
+/// Zone-map entries own copies of each block's bounds; under long keys those
+/// dominate the section, and both estimates have to count them.
+#[test]
+fn the_estimates_count_the_zone_map_bounds() -> crate::Result<()> {
+    let dir = tempfile::tempdir()?;
+    let path = dir.path().join("1");
+    let mut writer = Writer::new(path.clone(), 1, 0, Arc::new(StdFs))?
+        .use_data_block_size(256)
+        .use_zone_map(true);
+    write_long_keys(&mut writer, 5_000, 200)?;
+    let blocks = writer.zone_map_section.len() as u64;
+    assert!(
+        writer.held_state_bytes() > blocks * 2 * 200,
+        "{} bytes held for {blocks} blocks of 200-byte bounds",
+        writer.held_state_bytes(),
+    );
+    assert_hint_matches_the_table(writer, &path)
+}
+
+/// Under page ECC every block `finish` writes carries a parity trailer, which
+/// the hint has to count: long keys over small blocks make the index a large
+/// share of the table.
+#[cfg(feature = "page_ecc")]
+#[test]
+fn the_size_hint_counts_the_parity_of_the_blocks_to_come() -> crate::Result<()> {
+    let dir = tempfile::tempdir()?;
+    let path = dir.path().join("1");
+    let mut writer = Writer::new(path.clone(), 1, 0, Arc::new(StdFs))?
+        .use_data_block_size(64)
+        .use_ecc(Some(crate::table::block::EccParams::RS_4_2));
+    write_long_keys(&mut writer, 5_000, 200)?;
+    assert_hint_matches_the_table(writer, &path)
+}
+
+/// A table of exactly `2^k` blocks fits explicit `k`-bit block ids, so its
+/// locator section is written and both estimates count it, although the next
+/// block ordinal no longer fits.
+#[test]
+fn a_locator_filled_to_its_last_block_id_is_counted() -> crate::Result<()> {
+    let locator = crate::config::LocatorPolicyEntry::Enabled {
+        precision: crate::config::LocatorPrecision::Block,
+        block_id_bits: Some(1),
+        slot_bits: None,
+    };
+    let dir = tempfile::tempdir()?;
+    let mut with = Writer::new(dir.path().join("1"), 1, 0, Arc::new(StdFs))?.use_locator(locator);
+    let mut without = Writer::new(dir.path().join("2"), 1, 0, Arc::new(StdFs))?;
+    for writer in [&mut with, &mut without] {
+        for block in 0..2 {
+            for i in 0..10 {
+                writer.write(InternalValue::from_components(
+                    format!("key{block}{i:02}").into_bytes(),
+                    b"value---".to_vec(),
+                    0,
+                    ValueType::Value,
+                ))?;
+            }
+            writer.spill_block()?;
+        }
+    }
+    assert_eq!(with.meta.data_block_count, 2);
+    assert!(
+        with.held_state_bytes() > without.held_state_bytes(),
+        "{} held with the locator, {} without",
+        with.held_state_bytes(),
+        without.held_state_bytes(),
+    );
+    assert!(with.output_size_hint() > without.output_size_hint());
+    Ok(())
+}
+
+/// A compaction's lineage lists its inputs and stays in the writer to the end;
+/// the meta block then copies it into the parameters, the encoded ids and the
+/// meta entry, so the held state counts it once held and again encoded.
+#[test]
+fn the_held_state_counts_the_lineage_and_its_meta_encoding() -> crate::Result<()> {
+    const INPUTS: u64 = 100_000;
+    let dir = tempfile::tempdir()?;
+    let mut writer = Writer::new(dir.path().join("1"), 1, 0, Arc::new(StdFs))?
+        .use_lineage(Some((0..INPUTS).collect()));
+    writer.write(InternalValue::from_components(
+        b"key".to_vec(),
+        b"v".to_vec(),
+        0,
+        ValueType::Value,
+    ))?;
+    writer.spill_block()?;
+    let ids = INPUTS * 8;
+    assert!(
+        writer.held_state_bytes() >= 4 * ids,
+        "{} held for a lineage of {ids} bytes",
+        writer.held_state_bytes(),
+    );
+    Ok(())
+}
+
+/// Blocks in flight on the parallel pipeline are counted by the frames they
+/// will be written as, not by their payload: once drained, the bytes they
+/// take on disk stay within what the estimate counted for them.
+#[cfg(feature = "parallel")]
+#[test]
+fn blocks_in_flight_are_counted_by_their_frames() -> crate::Result<()> {
+    let dir = tempfile::tempdir()?;
+    let spawner = Arc::new(super::RayonSpawner::with_threads(4)?);
+    let mut writer = Writer::new(dir.path().join("1"), 1, 0, Arc::new(StdFs))?
+        .use_data_block_compression(crate::CompressionType::None)
+        .use_parallel_compression(spawner, 4);
+    for block in 0..3u32 {
+        for i in 0..10u32 {
+            writer.write(InternalValue::from_components(
+                format!("key{block}{i:02}").into_bytes(),
+                b"value---".to_vec(),
+                0,
+                ValueType::Value,
+            ))?;
+        }
+        writer.spill_block()?;
+    }
+    assert_eq!(*writer.meta.file_pos, 0, "all three blocks are in flight");
+    let counted = writer.output_size_hint() - writer.finish_metadata_bytes;
+    for _ in 0..3 {
+        writer.drain_one_parallel()?;
+    }
+    assert_eq!(writer.meta.data_block_count, 3);
+    assert!(
+        *writer.meta.file_pos <= counted,
+        "{} bytes written for {counted} counted in flight",
+        *writer.meta.file_pos,
+    );
+    Ok(())
+}
+
+/// Blocks in flight on the parallel pipeline hold their encoded payload and
+/// then their frame until they are written: the held state counts them.
+#[cfg(feature = "parallel")]
+#[test]
+fn blocks_in_flight_count_toward_the_held_state() -> crate::Result<()> {
+    let dir = tempfile::tempdir()?;
+    let spawner = Arc::new(super::RayonSpawner::with_threads(4)?);
+    let mut writer = Writer::new(dir.path().join("1"), 1, 0, Arc::new(StdFs))?
+        .use_data_block_compression(crate::CompressionType::None)
+        .use_parallel_compression(spawner, 4);
+    for block in 0..3u32 {
+        for i in 0..10u32 {
+            writer.write(InternalValue::from_components(
+                format!("key{block}{i:02}").into_bytes(),
+                vec![7u8; 1_000],
+                0,
+                ValueType::Value,
+            ))?;
+        }
+        writer.spill_block()?;
+    }
+    assert_eq!(*writer.meta.file_pos, 0, "all three blocks are in flight");
+    assert!(
+        writer.held_state_bytes() >= 3 * 10 * 1_000,
+        "{} held with three 10 KB blocks in flight",
+        writer.held_state_bytes(),
+    );
+    Ok(())
+}
+
+/// A block both compressed and encrypted on the parallel pipeline holds its
+/// payload, the compressed bytes and the sealed frame at once: the held state
+/// counts all three.
+#[cfg(all(feature = "parallel", feature = "encryption", feature = "lz4"))]
+#[test]
+fn blocks_in_flight_count_their_compression_and_encryption_buffers() -> crate::Result<()> {
+    let dir = tempfile::tempdir()?;
+    let held = |name: &str, encrypted: bool| -> crate::Result<u64> {
+        let spawner = Arc::new(super::RayonSpawner::with_threads(4)?);
+        let encryption: Option<Arc<dyn crate::encryption::EncryptionProvider>> =
+            encrypted.then(|| Arc::new(crate::encryption::Aes256GcmProvider::new(&[7; 32])) as _);
+        let mut writer = Writer::new(dir.path().join(name), 1, 0, Arc::new(StdFs))?
+            .use_data_block_compression(crate::CompressionType::Lz4)
+            .use_encryption(encryption)
+            .use_parallel_compression(spawner, 4);
+        for block in 0..3u32 {
+            for i in 0..10u32 {
+                writer.write(InternalValue::from_components(
+                    format!("key{block}{i:02}").into_bytes(),
+                    vec![7u8; 1_000],
+                    0,
+                    ValueType::Value,
+                ))?;
+            }
+            writer.spill_block()?;
+        }
+        assert_eq!(*writer.meta.file_pos, 0, "all three blocks are in flight");
+        Ok(writer.held_state_bytes())
+    };
+    let sealed = held("1", true)?;
+    let plain = held("2", false)?;
+    // Sealing keeps each block's compressed bytes besides its frame: about
+    // 10 KB more per block than compressing alone.
+    assert!(
+        sealed >= plain + 3 * 10_000,
+        "{sealed} held sealed against {plain} compressed alone",
+    );
+    Ok(())
+}
+
+/// Within a block not yet cut, an entry-precise locator records a slot per key,
+/// so its section needs slot bits a block-precise one does not: the estimates
+/// count the open block's slots, not only those of blocks already cut.
+#[test]
+fn the_estimates_count_the_locator_slots_of_a_block_not_yet_cut() -> crate::Result<()> {
+    let locator = |precision| crate::config::LocatorPolicyEntry::Enabled {
+        precision,
+        block_id_bits: None,
+        slot_bits: None,
+    };
+    let dir = tempfile::tempdir()?;
+    let hint = |name: &str, precision| -> crate::Result<u64> {
+        let mut writer = Writer::new(dir.path().join(name), 1, 0, Arc::new(StdFs))?
+            .use_data_block_size(4 << 20)
+            .use_locator(locator(precision));
+        for i in 0..20_000u32 {
+            writer.write(InternalValue::from_components(
+                format!("key{i:06}").into_bytes(),
+                b"v".to_vec(),
+                0,
+                ValueType::Value,
+            ))?;
+        }
+        assert_eq!(writer.meta.data_block_count, 0);
+        Ok(writer.output_size_hint())
+    };
+    let entry = hint("1", crate::config::LocatorPrecision::Entry)?;
+    let block = hint("2", crate::config::LocatorPrecision::Block)?;
+    // Slots up to 19 999 take 15 bits a key; count at least 14.
+    assert!(
+        entry >= block + 20_000 * 14 / 8,
+        "entry-precise hint {entry} against block-precise {block}",
+    );
+    Ok(())
+}
+
+/// Only a key's newest version gets a locator entry, so blocks holding older
+/// versions alone add no block id. Explicit widths that fit every recorded id
+/// keep the locator however many such blocks follow.
+#[test]
+fn blocks_of_older_versions_do_not_outgrow_the_locator() -> crate::Result<()> {
+    let dir = tempfile::tempdir()?;
+    let mut writer = Writer::new(dir.path().join("1"), 1, 0, Arc::new(StdFs))?.use_locator(
+        crate::config::LocatorPolicyEntry::Enabled {
+            precision: crate::config::LocatorPrecision::Block,
+            block_id_bits: Some(1),
+            slot_bits: None,
+        },
+    );
+    // One key, its versions spread over four blocks.
+    for block in 0..4_u64 {
+        for version in 0..10 {
+            writer.write(InternalValue::from_components(
+                b"key".to_vec(),
+                b"value---".to_vec(),
+                100 - (block * 10 + version),
+                ValueType::Value,
+            ))?;
+        }
+        writer.spill_block()?;
+    }
+    assert_eq!(writer.meta.data_block_count, 4);
+    assert_eq!(writer.locators.len(), 1, "the locator was dropped");
+    Ok(())
+}
+
+/// Explicit locator widths too narrow for the table skip its section at
+/// `finish`. The widths only grow with the table, so once they no longer fit
+/// the writer holds nothing for the locator and charges nothing for it.
+#[test]
+fn a_locator_too_narrow_for_the_table_stops_holding_state() -> crate::Result<()> {
+    let dir = tempfile::tempdir()?;
+    let mut narrow = Writer::new(dir.path().join("1"), 1, 0, Arc::new(StdFs))?
+        .use_data_block_size(64)
+        .use_locator(crate::config::LocatorPolicyEntry::Enabled {
+            precision: crate::config::LocatorPrecision::Block,
+            block_id_bits: Some(1),
+            slot_bits: None,
+        });
+    let mut plain =
+        Writer::new(dir.path().join("2"), 1, 0, Arc::new(StdFs))?.use_data_block_size(64);
+    write_keys(&mut narrow, 5_000, 8)?;
+    write_keys(&mut plain, 5_000, 8)?;
+    assert!(
+        narrow.locators.is_empty(),
+        "{} triples held",
+        narrow.locators.len()
+    );
+    assert_eq!(narrow.held_state_bytes(), plain.held_state_bytes());
+    assert_eq!(narrow.output_size_hint(), plain.output_size_hint());
+    Ok(())
+}
+
+/// A table of range tombstones alone whose caller gave no coverage takes its
+/// key range from the tombstones in byte order: the least start and the
+/// greatest end, whatever order they were written in.
+#[test]
+fn a_table_of_tombstones_alone_covers_them_without_a_given_range() -> crate::Result<()> {
+    use crate::range_tombstone::RangeTombstone;
+
+    let dir = tempfile::tempdir()?;
+    let path = dir.path().join("1");
+    let mut writer = Writer::new(path.clone(), 1, 0, Arc::new(StdFs))?;
+    for (start, end) in [(b"c", b"d"), (b"a", b"b"), (b"b", b"z")] {
+        writer.write_range_tombstone(RangeTombstone::new(
+            UserKey::from(start as &[u8]),
+            UserKey::from(end as &[u8]),
+            3,
+        ));
+    }
+    let Some((id, checksum)) = writer.finish()? else {
+        panic!("a table of tombstones alone is written");
+    };
+    let table = crate::Table::recover(crate::table::RecoverParams::new(
+        path,
+        checksum,
+        id,
+        Arc::new(StdFs),
+        crate::comparator::default_comparator(),
+        Arc::new(crate::Cache::with_capacity_bytes(64 * 1_024)),
+    ))?;
+    assert_eq!(table.metadata.key_range.min().as_ref(), b"a");
+    assert_eq!(table.metadata.key_range.max().as_ref(), b"z");
+    assert_eq!(table.range_tombstones().len(), 3);
+    Ok(())
+}
+
+/// Every byte prefix of a key is a token.
+struct AllPrefixes;
+
+impl crate::prefix::PrefixExtractor for AllPrefixes {
+    fn prefixes<'a>(&self, key: &'a [u8]) -> Box<dyn Iterator<Item = &'a [u8]> + 'a> {
+        Box::new((1..=key.len()).filter_map(|end| key.get(..end)))
+    }
+}
+
+/// A prefix extractor can register thousands of hashes per key, so the
+/// filter's state grows far faster than one hash a key: the estimates follow
+/// that growth between the refreshes the key count sets.
+#[test]
+fn the_estimates_follow_a_filter_growing_by_many_hashes_a_key() -> crate::Result<()> {
+    const KEYS: u8 = 20;
+    const LEN: usize = 5_000;
+    let dir = tempfile::tempdir()?;
+    let mut writer = Writer::new(dir.path().join("1"), 1, 0, Arc::new(StdFs))?
+        .use_data_block_size(1 << 20)
+        .use_prefix_extractor(Some(Arc::new(AllPrefixes)));
+    for i in 0..KEYS {
+        // Keys differ in their first byte, so no prefix repeats.
+        let mut key = alloc::vec![i];
+        key.resize(LEN, 0x5a);
+        writer.write(InternalValue::from_components(
+            key,
+            b"v".to_vec(),
+            0,
+            ValueType::Value,
+        ))?;
+    }
+    let hashes = u64::from(KEYS) * LEN as u64 * core::mem::size_of::<u64>() as u64;
+    assert!(
+        writer.held_state_bytes() >= hashes,
+        "held {} for {hashes} bytes of prefix hashes",
+        writer.held_state_bytes(),
+    );
+    Ok(())
+}
+
+/// A block that outgrows explicit slot widths drops the locator only when it
+/// is cut; until then its triples stay allocated and are held.
+#[test]
+fn a_forming_block_past_the_slot_width_still_holds_its_locators() -> crate::Result<()> {
+    let dir = tempfile::tempdir()?;
+    let mut writer = Writer::new(dir.path().join("1"), 1, 0, Arc::new(StdFs))?
+        .use_data_block_size(1 << 20)
+        .use_locator(crate::config::LocatorPolicyEntry::Enabled {
+            precision: crate::config::LocatorPrecision::Entry,
+            block_id_bits: None,
+            slot_bits: Some(2),
+        });
+    let mut plain =
+        Writer::new(dir.path().join("2"), 1, 0, Arc::new(StdFs))?.use_data_block_size(1 << 20);
+    for i in 0..5_000_u32 {
+        for w in [&mut writer, &mut plain] {
+            w.write(InternalValue::from_components(
+                format!("key{i:010}").into_bytes(),
+                b"value---".to_vec(),
+                0,
+                ValueType::Value,
+            ))?;
+        }
+    }
+    writer.refresh_state_estimates();
+    plain.refresh_state_estimates();
+    assert_eq!(writer.meta.data_block_count, 0, "the block was cut");
+    let triples = (writer.locators.capacity() * core::mem::size_of::<(u64, u64, u64)>()) as u64;
+    assert!(triples > 0, "the locator stopped collecting");
+    assert!(
+        writer.held_state_bytes() >= plain.held_state_bytes() + triples,
+        "held {} against {} without a locator and {triples} bytes of triples",
+        writer.held_state_bytes(),
+        plain.held_state_bytes(),
+    );
     Ok(())
 }

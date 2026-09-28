@@ -1498,6 +1498,36 @@ fn the_pre_build_estimate_lands_within_its_stated_tolerance() {
     );
 }
 
+/// The writers count a filter not yet built by a bound from above, so the
+/// table they rotate on is not larger than they counted. The bumped keys'
+/// layers vary with the hashes, and a small filter can reach the last layer's
+/// floor of four blocks, so the bound takes both over the predictor.
+#[test]
+fn every_built_filter_stays_within_the_size_bound() {
+    use crate::table::filter::BloomConstructionPolicy;
+
+    for n in (1..=300_usize).chain([500, 1_000, 2_000, 5_000, 20_000, 100_000]) {
+        for r in [1_u8, 10, 32] {
+            let policy = BloomConstructionPolicy::BitsPerKey(f32::from(r));
+            let bound = policy.filter_size_bound(n);
+            // Several hash sets: how many keys a layer bumps varies with them.
+            for set in 0..8_u64 {
+                let hashes: Vec<u64> = (0..n as u64)
+                    .map(|i| crate::hash::hash64(&(i ^ (set << 40)).to_le_bytes()))
+                    .collect();
+                let params = BurrParams::with_bpk(n, f32::from(r)).expect("params");
+                let builder = BurrBuilder::new(params).expect("builder");
+                let filter = builder.build_from_hashes(&hashes).expect("build");
+                let actual = filter.encoded_len();
+                assert!(
+                    actual <= bound,
+                    "n={n} r={r} set={set}: built {actual} over the bound {bound}",
+                );
+            }
+        }
+    }
+}
+
 #[test]
 fn a_hundred_thousand_keys_cost_about_r_bits_each_and_the_estimate_tracks_them() {
     measure_size_at(
@@ -1620,6 +1650,24 @@ fn burr_builds_every_small_key_set_by_bumping_unplaceable_keys() {
             assert!(
                 filter.contains_hash(*hash),
                 "n={n}: key {at} must be a member (a bumped key may not be lost)",
+            );
+        }
+    }
+}
+
+/// The solver allocates its rows by slot, and a layer takes more slots than
+/// keys: 5% more, rounded up to whole blocks, one block at least. The build
+/// peak counts the first layer's slots, however few the keys.
+#[test]
+fn the_build_peak_counts_the_solver_rows_by_slot() {
+    for n in [1_usize, 20, 1_000, 100_000] {
+        let slots = BurrParams::with_bpk(n, 10.0).unwrap().layer_m(n);
+        let rows = slots * super::builder::SOLVE_PER_SLOT;
+        for retrieval in [false, true] {
+            let peak = super::builder::build_peak_bytes(n, retrieval);
+            assert!(
+                peak >= rows,
+                "n={n}: peak {peak} below {rows} of solver rows"
             );
         }
     }

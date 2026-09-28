@@ -18,9 +18,29 @@ use alloc::sync::Arc;
 #[cfg(not(feature = "std"))]
 use alloc::{boxed::Box, vec::Vec};
 
+use super::handles_held;
+
+/// Bytes an index block takes whose entries encode to at most `entries`
+/// bytes: the entries and the block's trailer.
+const fn block_len(entries: usize) -> usize {
+    entries + crate::table::block::TRAILER_LEN
+}
+
 pub trait BlockIndexWriter<W: crate::io::Write + crate::io::Seek> {
     /// Registers a data block in the block index.
     fn register_data_block(&mut self, block_handle: KeyedBlockHandle) -> crate::Result<()>;
+
+    /// Heap bytes this writer holds until [`finish`](Self::finish).
+    fn held_bytes(&self) -> u64;
+
+    /// Heap bytes [`finish`](Self::finish) allocates on top of
+    /// [`held_bytes`](Self::held_bytes) while it encodes, at its peak.
+    fn finish_scratch_bytes(&self) -> u64;
+
+    /// Bytes the table file gets for this index, estimated from what is held
+    /// now: what [`finish`](Self::finish) appends, and the top-level index
+    /// again, which the table mirrors at its tail.
+    fn finish_output_bytes(&self) -> u64;
 
     /// Writes the block index to a file.
     ///
@@ -83,3 +103,6 @@ pub trait BlockIndexWriter<W: crate::io::Write + crate::io::Seek> {
 // FilterWriter mirrors the use_page_ecc pattern via its own trait
 // method declared in `super::filter` — see
 // `super::filter::FilterWriter::use_page_ecc`.
+
+#[cfg(test)]
+mod tests;
