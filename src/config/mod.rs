@@ -681,7 +681,7 @@ pub struct Config {
     /// Payload size (bytes) below which a block of a parallel-compressed table
     /// is prepared on the writer thread instead of a worker: its transform
     /// costs less than handing it to a worker and back. `None` (default)
-    /// derives it from the table's block length. Set via
+    /// derives it from the table's block codec. Set via
     /// [`Config::parallel_compression_inline_below`].
     #[cfg(feature = "std")]
     pub(crate) parallel_compression_inline_below: Option<u32>,
@@ -2068,7 +2068,9 @@ impl Config {
     /// in parallel is prepared on the writer thread instead of a worker. A
     /// block that small costs less to compress than to hand to a worker and
     /// back. `None` (default) derives the threshold from the table's block
-    /// length; `Some(0)` sends every block to the workers.
+    /// codec: 1 KiB for no compression and lz4, whose cost per block is
+    /// small, and 0 for zstd, whose per-frame setup makes any block worth a
+    /// worker. `Some(0)` sends every block to the workers.
     ///
     /// # Examples
     ///

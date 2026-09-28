@@ -103,14 +103,28 @@ fn blocks_below_the_inline_threshold_never_reach_a_worker() {
 }
 
 #[test]
-fn the_derived_threshold_is_a_share_of_the_block_length() {
+fn the_default_threshold_follows_the_codec_cost() {
+    // Cheap codecs keep blocks under 1 KiB on the writer thread; zstd sends
+    // every block to a worker, since its per-frame setup alone outweighs the
+    // handoff.
     assert_eq!(
-        derived_inline_below(4_096),
-        4_096 / INLINE_BELOW_BLOCK_DIVISOR
+        default_inline_below(CompressionType::None),
+        CHEAP_CODEC_INLINE_BELOW
     );
+    #[cfg(feature = "lz4")]
     assert_eq!(
-        derived_inline_below(0),
-        0,
-        "no block length, nothing inline"
+        default_inline_below(CompressionType::Lz4),
+        CHEAP_CODEC_INLINE_BELOW
     );
+    #[cfg(zstd_any)]
+    {
+        assert_eq!(default_inline_below(CompressionType::Zstd(1)), 0);
+        assert_eq!(
+            default_inline_below(CompressionType::ZstdDict {
+                level: 3,
+                dict_id: 7
+            }),
+            0
+        );
+    }
 }

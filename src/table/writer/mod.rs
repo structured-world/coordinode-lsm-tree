@@ -3364,7 +3364,7 @@ impl Writer {
         }
         if let Some(parallel) = self.parallel_settings.clone() {
             let inline_below = parallel.inline_below.map_or_else(
-                || parallel_compressor::derived_inline_below(self.block_len()),
+                || parallel_compressor::default_inline_below(self.data_block_compression),
                 u64::from,
             );
             self.parallel = Some(BlockCompressor::new(
