@@ -25,3 +25,34 @@ fn the_scratch_counts_the_top_level_entry_of_the_open_partition() -> crate::Resu
     );
     Ok(())
 }
+
+/// A partition closes by the bytes it encodes to, one word per slot, not by
+/// its bits per key: under the default policy the partitions average the
+/// partition size instead of several times past it. One partition may land a
+/// layer either side of it, as its build takes a later layer whole or not.
+#[test]
+fn a_filter_partition_closes_near_the_partition_size() -> crate::Result<()> {
+    const PARTITION: u64 = 4_096;
+    let mut writer = PartitionedFilterWriter::new(BloomConstructionPolicy::default());
+    for i in 0..50_000u32 {
+        FilterWriter::<W>::register_key(&mut writer, &format!("key{i:08}").into_bytes().into())?;
+    }
+    let sizes: Vec<u64> = writer
+        .tli_handles
+        .iter()
+        .map(|handle| u64::from(handle.size()))
+        .collect();
+    assert!(sizes.len() > 10, "the keys fill many partitions");
+    for &size in &sizes {
+        assert!(
+            (PARTITION / 2..=PARTITION * 8 / 5).contains(&size),
+            "a {size}-byte partition for a {PARTITION}-byte target",
+        );
+    }
+    let average = sizes.iter().sum::<u64>() / sizes.len() as u64;
+    assert!(
+        (PARTITION * 85 / 100..=PARTITION * 115 / 100).contains(&average),
+        "partitions average {average} bytes for a {PARTITION}-byte target",
+    );
+    Ok(())
+}
