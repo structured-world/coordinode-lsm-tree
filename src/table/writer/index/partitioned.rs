@@ -92,6 +92,16 @@ impl PartitionedIndexWriter {
         }
     }
 
+    /// The top-level index's encoded bytes once `finish` cuts the open
+    /// partition, which adds an entry under its last key.
+    fn tli_at_finish(&self) -> usize {
+        self.data_block_handles
+            .last()
+            .map_or(self.tli_encoded, |last| {
+                self.tli_encoded + last.encoded_len_bound_unplaced()
+            })
+    }
+
     fn cut_index_block(&mut self) -> crate::Result<()> {
         let mut bytes = vec![];
         IndexBlock::encode_into_with_restart_interval(
@@ -368,7 +378,8 @@ impl<W: crate::io::Write + crate::io::Seek> BlockIndexWriter<W> for PartitionedI
         };
         // Then the top-level index, which the table keeps until it writes the
         // tail mirror, and its framed copy.
-        open + self.tli_encoded as u64 + transform(self.tli_encoded)
+        let tli = self.tli_at_finish();
+        open + tli as u64 + transform(tli)
     }
 
     fn finish_output_bytes(&self) -> u64 {
@@ -383,16 +394,14 @@ impl<W: crate::io::Write + crate::io::Seek> BlockIndexWriter<W> for PartitionedI
             )
         };
         // The cut partitions are framed already. `finish` cuts the open one,
-        // which adds a top-level entry, and the table writes the top-level
-        // index twice, at the head and as the tail mirror.
-        let (open, tli) = match self.data_block_handles.last() {
-            None => (0, self.tli_encoded),
-            // The new top-level entry carries the open partition's last key.
-            Some(last) => (
-                frame(self.open_encoded),
-                self.tli_encoded + last.encoded_len_bound_unplaced(),
-            ),
+        // and the table writes the top-level index twice, at the head and as
+        // the tail mirror.
+        let open = if self.data_block_handles.is_empty() {
+            0
+        } else {
+            frame(self.open_encoded)
         };
+        let tli = self.tli_at_finish();
         if tli == 0 {
             return self.final_write_buffer.len() as u64;
         }
