@@ -106,11 +106,14 @@ struct Shared<J: OrderedJob> {
     /// The writer's thread: a token run there does not park, since only that
     /// thread could queue the job it would wait for.
     writer: std::thread::ThreadId,
+    /// How long a token that finds the queue empty stays parked for the next
+    /// job before it gives its thread back to the executor.
+    linger: std::time::Duration,
     context: J::Context,
 }
 
-/// How long a token that finds the queue empty stays parked for the next job
-/// before it gives its thread back to the executor.
+/// The linger of a pipeline: long enough to bridge the writer's gap between
+/// two blocks, short enough that a pool thread is not held once it stops.
 const LINGER: std::time::Duration = std::time::Duration::from_millis(1);
 
 impl<J: OrderedJob> Shared<J> {
@@ -120,7 +123,7 @@ impl<J: OrderedJob> Shared<J> {
 
     /// A token's body: runs queued jobs, publishing each result and claiming
     /// the next job under one lock. When the queue is empty it parks for up to
-    /// [`LINGER`] for the next one, then exits.
+    /// the linger for the next one, then exits.
     fn work(&self) {
         let may_park = std::thread::current().id() != self.writer;
         let mut done: Option<(u64, J::Output)> = None;
@@ -138,7 +141,7 @@ impl<J: OrderedJob> Shared<J> {
                 state.idle += 1;
                 state = self
                     .queued
-                    .wait_timeout_while(state, LINGER, |s| s.queue.is_empty() && !s.closed)
+                    .wait_timeout_while(state, self.linger, |s| s.queue.is_empty() && !s.closed)
                     .unwrap_or_else(PoisonError::into_inner)
                     .0;
                 state.idle -= 1;
@@ -192,6 +195,17 @@ impl<J: OrderedJob> OrderedPipeline<J> {
         concurrency: usize,
         capacity: usize,
     ) -> Self {
+        Self::with_linger(spawner, context, concurrency, capacity, LINGER)
+    }
+
+    /// As [`Self::new`], with idle tokens parked for `linger`.
+    fn with_linger(
+        spawner: Arc<dyn CompactionSpawner>,
+        context: J::Context,
+        concurrency: usize,
+        capacity: usize,
+        linger: std::time::Duration,
+    ) -> Self {
         let capacity = capacity.max(1);
         let slots = core::iter::repeat_with(|| None).take(capacity).collect();
         Self {
@@ -208,6 +222,7 @@ impl<J: OrderedJob> OrderedPipeline<J> {
                 woke: Condvar::new(),
                 queued: Condvar::new(),
                 writer: std::thread::current().id(),
+                linger,
                 context,
             }),
             concurrency: concurrency.max(1),

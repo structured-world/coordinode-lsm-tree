@@ -59,7 +59,7 @@ fn value(len: usize, state: &mut u64) -> Vec<u8> {
         let word = WORDS.get((*state % 16) as usize).copied().unwrap_or(b"x ");
         out.extend_from_slice(word);
         // A digit now and then keeps the stream from being pure dictionary.
-        if *state % 5 == 0 {
+        if state.is_multiple_of(5) {
             out.push(b'0' + (*state % 10) as u8);
         }
     }
