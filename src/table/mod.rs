@@ -10,6 +10,8 @@ pub(crate) mod column_page;
 #[cfg(feature = "columnar")]
 pub mod columnar;
 #[cfg(feature = "columnar")]
+pub mod columnar_cursor;
+#[cfg(feature = "columnar")]
 pub mod columnar_predicate;
 pub mod data_block;
 pub mod delete_bitmap;
@@ -7721,282 +7723,58 @@ impl Table {
         )
     }
 
-    /// Scans this columnar SST block by block, returning one [`ColumnBatch`] per
-    /// row page of every data block that survives the optional predicate, each
-    /// carrying only the projected columns.
+    /// Scans this columnar SST lazily, yielding one [`ColumnBatch`] per row page
+    /// of every data block that survives the optional predicate, each carrying
+    /// only the projected columns. A block is read when the scan reaches it, so
+    /// a caller that stops early reads nothing more.
     ///
     /// `projection` lists the column ids to decode; every other column is
     /// stepped over without decoding. When `predicate` is set, a block or row
     /// page whose statistics prove it out of range is skipped without being
     /// loaded, and, unless the predicate only prunes, each surviving one is
     /// filtered to the rows that match. How far the predicate ran is what
-    /// [`ColumnRangePredicate::support_in`] says for the returned batches'
-    /// column type; [`Tree::columnar_scan`](crate::Tree::columnar_scan)
-    /// reports it for a whole scan.
+    /// [`ColumnarCursor::predicate_support`] reports for the blocks read so far;
+    /// [`Tree::columnar_scan`](crate::Tree::columnar_scan) reports it for a
+    /// whole scan.
     ///
     /// [`ColumnBatch`]: crate::table::columnar::ColumnBatch
-    /// [`ColumnRangePredicate::support_in`]: crate::table::columnar_predicate::ColumnRangePredicate::support_in
+    /// [`ColumnarCursor::predicate_support`]: crate::table::columnar_cursor::ColumnarCursor::predicate_support
     ///
     /// # Errors
     ///
-    /// Returns an error if this SST is not columnar, or on a block read / decode
-    /// failure.
+    /// Returns an error if this SST is not columnar, and, while iterating, on a
+    /// block read / decode failure.
     #[cfg(feature = "columnar")]
     pub fn columnar_scan(
         &self,
         projection: &[u16],
         predicate: Option<&crate::table::columnar_predicate::ColumnRangePredicate>,
-    ) -> crate::Result<Vec<crate::table::columnar::ColumnBatch>> {
-        let mut support = crate::table::columnar_predicate::PredicateSupport::Exact;
-        self.columnar_scan_reporting(projection, predicate, &mut support)
+    ) -> crate::Result<crate::table::columnar_cursor::ColumnarCursor> {
+        self.columnar_cursor(
+            projection,
+            predicate,
+            core::ops::Bound::Unbounded,
+            core::ops::Bound::Unbounded,
+            None,
+        )
     }
 
-    /// [`Self::columnar_scan`], lowering `support` to how far `predicate` ran
-    /// over every block it decoded. A block or row page the statistics skipped
-    /// leaves it as it is: only an ordered column has statistics, and the skip
-    /// proved none of its rows match.
+    /// [`Self::columnar_scan`] over the rows within `lo..hi`: blocks wholly
+    /// outside the range are not read. Rows of a boundary block that fall
+    /// outside it are still yielded, for the caller to mask. With `share`,
+    /// a row group larger than it is read in runs of row pages that fit it.
     #[cfg(feature = "columnar")]
-    pub(crate) fn columnar_scan_reporting(
+    pub(crate) fn columnar_cursor(
         &self,
         projection: &[u16],
         predicate: Option<&crate::table::columnar_predicate::ColumnRangePredicate>,
-        support: &mut crate::table::columnar_predicate::PredicateSupport,
-    ) -> crate::Result<Vec<crate::table::columnar::ColumnBatch>> {
-        if !self.metadata.columnar {
-            return Err(crate::Error::FeatureUnsupported("columnar"));
-        }
-        // The predicate must see its own column, even when the caller did not
-        // project it; decode it too and drop it from each output batch, so a
-        // predicate on an unprojected column still filters instead of matching
-        // every row.
-        let mut decode_projection = projection.to_vec();
-        let added_predicate_column = match predicate {
-            Some(pred) if !decode_projection.contains(&pred.column_id) => {
-                decode_projection.push(pred.column_id);
-                Some(pred.column_id)
-            }
-            _ => None,
-        };
-        // Positional deletes are masked at scan time. The block index yields
-        // blocks in key (= write) order, the same order the writer assigned row
-        // positions, so `row_base` is each block's first global row position.
-        let has_deletes = !self.delete_bitmap.is_empty();
-        // Row count of a block that is stepped over without decoding, from its
-        // zone-map entry. A punched block CANNOT be decoded (it reads as
-        // zeros), so the zone map is the only source; without it every later
-        // row's positional delete mapping would silently shift — fail loudly
-        // instead.
-        let skipped_rows = |offset| {
-            self.zone_map
-                .columns_for(offset)
-                .and_then(|stats| stats.first())
-                .map(|s| s.row_count)
-                .ok_or(crate::Error::InvalidHeader(
-                    "columnar_scan: skipped block has no zone-map row count while positional deletes are present",
-                ))
-        };
-        // Tight-space restriction: data blocks wholly below the bound are
-        // hole-punched (they read as zeros), so they are stepped over, never
-        // decoded — the same key-based clamp the row-oriented scans apply.
-        // The first live block may STRADDLE the bound (the punch is
-        // block-aligned, the bound is a key), so its sub-bound rows are
-        // masked below.
-        let restrict = self.restrict_lower_bound();
-        let mut first_live_block = restrict.is_some();
-        let mut row_base: u32 = 0;
-        let mut out = Vec::new();
-        // A projection that took every page of the last group it read most
-        // likely takes every page of the next one too, so that one is read
-        // in one request rather than directory first. Being wrong costs only
-        // the bytes of the pages it turns out not to want.
-        let mut expect_whole = false;
-        for keyed in self.block_index.iter() {
-            let keyed = keyed?;
-            if let Some(bound) = restrict
-                && self.comparator.compare(keyed.end_key(), bound.as_ref())
-                    == core::cmp::Ordering::Less
-            {
-                // The whole block precedes the bound: superseded (and normally
-                // punched) — skip it, keeping the position cursor aligned.
-                if has_deletes {
-                    row_base = row_base.wrapping_add(skipped_rows(*keyed.offset())?);
-                }
-                continue;
-            }
-            // Only the FIRST block at or past the bound can straddle it: keys
-            // ascend across blocks, so every later block is entirely live.
-            let straddles_bound = first_live_block;
-            first_live_block = false;
-            // Zone-map block skip: prove the block is out of range and never
-            // load it. A missing entry is conservative (cannot skip).
-            if let Some(pred) = predicate
-                && let Some(stats) = self.zone_map.columns_for(*keyed.offset())
-                && pred.can_skip_block(stats)
-            {
-                // Advance the position cursor by the skipped block's row count
-                // (from its zone-map stats) so later blocks still map to the
-                // right delete positions. Skipped rows are predicate-excluded, so
-                // whether they are deleted does not affect the output.
-                if has_deletes {
-                    row_base = row_base.wrapping_add(skipped_rows(*keyed.offset())?);
-                }
-                continue;
-            }
-            let handle = *keyed.as_ref();
-            // Row-page pruning: a row page whose zone proves it out of range
-            // is never read, the same proof the zone map gives a whole group,
-            // at the granularity a read can skip.
-            let select = || match predicate {
-                Some(pred) => crate::table::row_group::RowPageSelect::Zone {
-                    column_id: pred.column_id,
-                    lower: pred.lower.as_deref(),
-                    upper: pred.upper.as_deref(),
-                },
-                None => crate::table::row_group::RowPageSelect::All,
-            };
-            let blocks = self.group_read(&handle, ReadCharge::Foreground).load(
-                &crate::table::row_group::PageWant {
-                    columns: Some(&decode_projection),
-                    row_pages: select(),
-                    whole: expect_whole,
-                },
-            )?;
-            expect_whole = blocks.pages.len() == blocks.directory.entries().len();
-            let group_rows = blocks.directory.row_count();
-            // The pages parsed, not decoded: the predicate is tested from its
-            // column's encoding, and each page's survivors are then built
-            // straight from theirs.
-            let mut budget = crate::table::columnar::DecodeBudget::default();
-            let pages = blocks.page_columns(|_| true, &mut budget)?;
-            // The straddling block's key column, decoded separately (one extra
-            // cached read for at most one block per scan) so the main
-            // projection stays untouched: it masks the rows below the bound.
-            // The same selection over the same directory reads the same row
-            // pages, one key batch per batch above.
-            let bound_keys = match restrict {
-                Some(bound) if straddles_bound => Some((
-                    bound,
-                    self.load_columnar_block_projected(
-                        &handle,
-                        &[crate::table::columnar::COL_USER_KEY],
-                        select(),
-                        false,
-                    )?,
-                )),
-                _ => None,
-            };
-            let mut copied = 0usize;
-            // The group's pages read as one result, so the copies made before
-            // a page fails are recorded like those of a group that succeeds.
-            let read_pages = || -> crate::Result<()> {
-                for page in pages {
-                    let (ordinal, row_count) = (page.ordinal, page.rows);
-                    let page_base = row_base.wrapping_add(page.start);
-                    let bound_mask: Option<Vec<bool>> = match &bound_keys {
-                        Some((bound, keys)) => {
-                            use crate::table::columnar::{COL_USER_KEY, bytes_column_row};
-                            let key_col = keys
-                                .ordinals
-                                .iter()
-                                .position(|&o| o == ordinal)
-                                .and_then(|i| keys.batches.get(i))
-                                .filter(|k| k.row_count == row_count)
-                                .and_then(|k| {
-                                    k.columns.iter().find(|c| c.column_id == COL_USER_KEY)
-                                })
-                                .ok_or(crate::Error::InvalidHeader(
-                                    "columnar_scan: straddling block is missing the key column",
-                                ))?;
-                            let mut mask = Vec::with_capacity(row_count as usize);
-                            for row in 0..row_count {
-                                let key = bytes_column_row(&key_col.data, row_count, row)?;
-                                mask.push(
-                                    self.comparator.compare(key, bound.as_ref())
-                                        != core::cmp::Ordering::Less,
-                                );
-                            }
-                            Some(mask)
-                        }
-                        None => None,
-                    };
-                    use crate::table::columnar_predicate::{
-                        PredicateApply, PredicateSupport, Selection,
-                    };
-                    // What the predicate keeps, tested from its column's encoding
-                    // without decoding it. A page without the column, or with it
-                    // opaque, is handed out whole for the caller to check.
-                    let mut keep: Option<Selection> = None;
-                    if let Some(pred) = predicate {
-                        let tested = page
-                            .columns
-                            .iter()
-                            .find(|c| c.column_id == pred.column_id)
-                            .and_then(|c| Some((c, pred.bounds(c.type_tag)?)));
-                        match tested {
-                            None => *support = (*support).min(PredicateSupport::Unsupported),
-                            Some(_) if pred.apply == PredicateApply::Prune => {
-                                *support = (*support).min(PredicateSupport::PruneOnly);
-                            }
-                            Some((column, bounds)) => {
-                                *support = (*support).min(PredicateSupport::Exact);
-                                keep = Some(column.select(row_count, &bounds)?);
-                            }
-                        }
-                    }
-                    if has_deletes || bound_mask.is_some() {
-                        let kept = keep.get_or_insert_with(|| Selection::all(row_count));
-                        if has_deletes {
-                            for row in 0..row_count {
-                                if self.delete_bitmap.contains(page_base.wrapping_add(row)) {
-                                    kept.remove(row);
-                                }
-                            }
-                        }
-                        if let Some(mask) = &bound_mask {
-                            for (row, &live) in (0u32..).zip(mask) {
-                                if !live {
-                                    kept.remove(row);
-                                }
-                            }
-                        }
-                    }
-                    // Every row kept: the page is handed out as decoded, a view
-                    // of it where a column is stored plain, with no gather.
-                    let keep = keep.filter(|kept| kept.count() < row_count);
-                    // A row page none of whose rows survive yields nothing:
-                    // building an empty batch for it would be a gather no caller
-                    // receives.
-                    if keep.as_ref().is_some_and(|kept| kept.count() == 0) {
-                        continue;
-                    }
-                    let columns = page
-                        .columns
-                        .into_iter()
-                        // A column read only for the predicate is never decoded.
-                        .filter(|c| added_predicate_column != Some(c.column_id))
-                        .map(|c| match &keep {
-                            Some(kept) => c.decode_rows(row_count, kept, &mut copied, &mut budget),
-                            None => c.decode(row_count, &mut copied, &mut budget),
-                        })
-                        .collect::<crate::Result<Vec<_>>>()?;
-                    out.push(crate::table::columnar::ColumnBatch {
-                        row_count: keep.as_ref().map_or(row_count, Selection::count),
-                        columns,
-                    });
-                }
-                Ok(())
-            };
-            let read = read_pages();
-            #[cfg(feature = "metrics")]
-            self.metrics.record_gather(copied);
-            #[cfg(not(feature = "metrics"))]
-            let _ = copied;
-            read?;
-            // The whole group's rows, the row pages pruned included, so the
-            // next group's positions start where this group's end.
-            row_base = row_base.wrapping_add(group_rows);
-        }
-        Ok(out)
+        lo: core::ops::Bound<UserKey>,
+        hi: core::ops::Bound<UserKey>,
+        share: Option<u64>,
+    ) -> crate::Result<crate::table::columnar_cursor::ColumnarCursor> {
+        crate::table::columnar_cursor::ColumnarCursor::new(
+            self, projection, predicate, lo, hi, share,
+        )
     }
 
     /// Creates an iterator over the `Table`.

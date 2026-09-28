@@ -49,7 +49,7 @@ use crate::config::{BenchConfig, DEFAULT_KEY_SIZE, DEFAULT_VALUE_SIZE};
 use crate::reporter::{Direction, Reporter};
 use crate::workloads::Workload;
 use fixtures::{Fixture, FixtureFn};
-use lsm_tree::table::columnar::COL_USER_KEY;
+use lsm_tree::table::columnar::{COL_USER_KEY, COL_VALUE};
 use lsm_tree::table::columnar_predicate::{ColumnRangePredicate, PredicateApply};
 use lsm_tree::{AbstractTree, AnyTree, Guard, SeqNo};
 use std::path::Path;
@@ -65,11 +65,28 @@ pub struct MixedLayout;
 /// that FAILS is returned instead, so the run reports the engine's error.
 type ReadFn = fn(&Fixture) -> lsm_tree::Result<u64>;
 
+/// A measured pass of a scan that yields in batches, reporting besides its
+/// rows what it took to reach the first batch and what it held at most.
+type ScanFn = fn(&Fixture) -> lsm_tree::Result<ScanPass>;
+
+/// What a batch scan measured beyond the tree's counters.
+struct ScanPass {
+    rows: u64,
+    /// Wall time and bytes read from the scan's creation to its first batch,
+    /// or `None` when it yielded none.
+    first_batch: Option<(Duration, u64)>,
+    /// The most page bytes the scan held at once, as the engine counts it.
+    retained: u64,
+}
+
 /// Whether a scenario's native path exists in this build.
 enum Support {
     /// Runs, through this read pass, and its figures mean what the scenario
     /// says they mean.
     Native(ReadFn),
+    /// Runs, through this batch scan, which also reports its first batch and
+    /// what it held.
+    Scan(ScanFn),
     /// The capability it measures has not landed. Carries the reason, which
     /// names the missing piece rather than saying "skipped". There is no read
     /// pass to hold, which is the point of pairing the two in one enum: a
@@ -88,6 +105,16 @@ struct Readings {
     bytes_decoded: u64,
     bytes_copied: u64,
     elapsed: std::time::Duration,
+    /// For a batch scan: its first batch and what it held.
+    scan: Option<ScanFigures>,
+}
+
+/// What a batch scan reports beyond the counters every scenario has.
+struct ScanFigures {
+    /// Wall time and bytes read until the first batch.
+    first_batch: Option<(Duration, u64)>,
+    /// The most page bytes the scan held at once.
+    retained: u64,
 }
 
 impl Readings {
@@ -113,7 +140,28 @@ impl Readings {
             bytes_decoded: m.bytes_decoded() - d0,
             bytes_copied: m.bytes_copied() - c0,
             elapsed,
+            scan: None,
         })
+    }
+
+    /// [`Self::measure`] around a batch scan, keeping what it reports of its
+    /// first batch and of what it held.
+    fn measure_scan(
+        tree: &AnyTree,
+        keys: u64,
+        body: impl FnOnce() -> lsm_tree::Result<ScanPass>,
+    ) -> lsm_tree::Result<Self> {
+        let mut figures = None;
+        let mut readings = Self::measure(tree, keys, || {
+            let pass = body()?;
+            figures = Some(ScanFigures {
+                first_batch: pass.first_batch,
+                retained: pass.retained,
+            });
+            Ok(pass.rows)
+        })?;
+        readings.scan = figures;
+        Ok(readings)
     }
 
     /// Bytes one counter moved per emitted row, or `None` when the scenario
@@ -163,6 +211,33 @@ impl Readings {
                 Direction::SmallerIsBetter,
             );
         }
+        let Some(scan) = &self.scan else {
+            return;
+        };
+        #[expect(
+            clippy::cast_precision_loss,
+            reason = "byte counts far below f64's exact range"
+        )]
+        let mut figures = vec![("retained payload", scan.retained as f64, "B")];
+        if let Some((time, bytes)) = scan.first_batch {
+            #[expect(
+                clippy::cast_precision_loss,
+                reason = "byte counts far below f64's exact range"
+            )]
+            figures.extend([
+                ("time to first batch", time.as_secs_f64() * 1e6, "us"),
+                ("bytes read to first batch", bytes as f64, "B"),
+            ]);
+        }
+        for (figure, value, unit) in figures {
+            reporter.publish_series(
+                format!("{scenario} {figure}"),
+                value,
+                unit,
+                annotation.clone(),
+                Direction::SmallerIsBetter,
+            );
+        }
     }
 
     /// The human-readable line. On stderr, like every other line the harness
@@ -188,6 +263,16 @@ impl Readings {
             fmt_ratio(ratio(self.bytes_copied, self.bytes_decoded), 2),
             self.elapsed,
         );
+        if let Some(scan) = &self.scan {
+            let first = scan.first_batch.map_or_else(
+                || "no batch".to_string(),
+                |(time, bytes)| format!("{time:?} after {bytes} B read"),
+            );
+            eprintln!(
+                "  {:<34} first batch: {first}, retained: {} B",
+                "", scan.retained,
+            );
+        }
     }
 }
 
@@ -419,6 +504,50 @@ fn scan_all(fixture: &Fixture) -> lsm_tree::Result<u64> {
     Ok(check.finish())
 }
 
+/// Every visible row of a columnar fixture, through the projected scan of its
+/// key and value, checked against the write history as it streams.
+///
+/// Times the first batch from the scan's creation, because a scan that reads
+/// the whole group before yielding pays for it there, and reports the most
+/// page bytes the engine says it held.
+#[expect(
+    clippy::expect_used,
+    reason = "a scan missing a projected column or row is a wrong result, and a verify pass panics on one"
+)]
+fn scan_columnar(fixture: &Fixture) -> lsm_tree::Result<ScanPass> {
+    let metrics = fixture.tree.metrics();
+    let (start, read_before) = (Instant::now(), metrics.bytes_read());
+    let mut scan = fixture
+        .tree
+        .columnar_scan(&[COL_USER_KEY, COL_VALUE], None, SeqNo::MAX, ..)?;
+    let mut check = lockstep(fixture, |_| true);
+    let mut first_batch = None;
+    for batch in &mut scan {
+        let batch = batch?;
+        first_batch.get_or_insert_with(|| (start.elapsed(), metrics.bytes_read() - read_before));
+        let column = |id| {
+            batch
+                .columns
+                .iter()
+                .find(|c| c.column_id == id)
+                .expect("the scan returns every projected column")
+        };
+        let (keys, values) = (column(COL_USER_KEY), column(COL_VALUE));
+        for row in 0..batch.row_count {
+            let cell = |c| {
+                fixtures::bytes_cell(c, batch.row_count, row)
+                    .expect("a returned column holds every row it counts")
+            };
+            check.check(cell(keys), cell(values), |v| Ok(v.bytes()))?;
+        }
+    }
+    Ok(ScanPass {
+        rows: check.finish(),
+        first_batch,
+        retained: scan.peak_payload_bytes(),
+    })
+}
+
 /// A scenario: a fixture, and either the read pass that measures it or the
 /// reason there is not one yet.
 struct Scenario {
@@ -493,6 +622,16 @@ fn scenarios(config: &BenchConfig) -> Vec<Scenario> {
             name: "selective-scan-near-full",
             fixture: fixtures::selectivity,
             support: Support::Native(scan_near_full),
+        },
+        Scenario {
+            name: "columnar-scan-one-segment",
+            fixture: fixtures::columnar_segment,
+            support: Support::Scan(scan_columnar),
+        },
+        Scenario {
+            name: "columnar-scan-overlap-8",
+            fixture: fixtures::columnar_overlap,
+            support: Support::Scan(scan_columnar),
         },
         Scenario {
             name: "blobs-well-placed",
@@ -590,6 +729,15 @@ impl Workload for MixedLayout {
                     let (readings, elapsed) =
                         measure_scenario(scenario.fixture, read, config, seqno, fixtures_in)?;
                     reporter.record_duration(elapsed);
+                    readings.report(name);
+                    readings.publish(name, reporter);
+                }
+                Support::Scan(scan) => {
+                    let fixture = (scenario.fixture)(config, seqno, fixtures_in)?;
+                    let t = Instant::now();
+                    let keys = fixture.oracle.rows.len() as u64;
+                    let readings = Readings::measure_scan(&fixture.tree, keys, || scan(&fixture))?;
+                    reporter.record_duration(t.elapsed());
                     readings.report(name);
                     readings.publish(name, reporter);
                 }

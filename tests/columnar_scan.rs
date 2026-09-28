@@ -166,7 +166,9 @@ fn columnar_scan_projects_only_the_requested_columns() {
     // column alone, proving the value column was never decoded.
     let batches = table
         .columnar_scan(&[COL_USER_KEY], None)
-        .expect("columnar scan");
+        .expect("columnar scan")
+        .collect::<lsm_tree::Result<Vec<_>>>()
+        .expect("columnar scan batch");
     assert!(batches.len() > 1, "test wants a multi-block SST");
     for batch in &batches {
         assert!(
@@ -205,7 +207,9 @@ fn columnar_scan_predicate_equals_a_naive_filter() {
 
     let batches = table
         .columnar_scan(&all, Some(&pred))
-        .expect("columnar scan with predicate");
+        .expect("columnar scan with predicate")
+        .collect::<lsm_tree::Result<Vec<_>>>()
+        .expect("columnar scan batch");
 
     // Flatten the surviving rows back to keys, in scan order.
     let mut got: Vec<Vec<u8>> = Vec::new();
@@ -244,7 +248,9 @@ fn columnar_scan_predicate_on_an_unprojected_column_still_filters() {
     };
     let batches = table
         .columnar_scan(&[COL_VALUE], Some(&pred))
-        .expect("columnar scan");
+        .expect("columnar scan")
+        .collect::<lsm_tree::Result<Vec<_>>>()
+        .expect("columnar scan batch");
 
     let total: usize = batches.iter().map(|b| b.row_count as usize).sum();
     assert_eq!(
@@ -1102,27 +1108,32 @@ fn tree_columnar_scan_merge_preserves_a_nullable_sub_column() {
     ingest_segment(&any, &[(key(1), 11)]);
 
     let tree = standard(&any);
-    let mut col3: Option<Column> = None;
+    // The merge streams, so the rows can come in more than one batch: each
+    // row's validity is read from its own batch, in key order.
+    let mut valid = Vec::new();
     for batch in tree
         .columnar_scan(&[COL_USER_KEY, 3], None, SeqNo::MAX, ..)
         .expect("scan")
     {
         let batch = batch.expect("batch");
-        // Output is one merged batch in key order: k0, k1, k2.
-        if let Some(c) = batch.columns.into_iter().find(|c| c.column_id == 3) {
-            assert!(col3.is_none(), "merge yields a single batch here");
-            col3 = Some(c);
+        let col3 = batch
+            .columns
+            .into_iter()
+            .find(|c| c.column_id == 3)
+            .expect("value sub-column present");
+        let validity = col3
+            .validity
+            .expect("nullable column keeps its validity bitmap");
+        for row in 0..batch.row_count as usize {
+            valid.push(validity[row / 8] & (1 << (row % 8)) != 0);
         }
     }
-    let col3 = col3.expect("value sub-column present");
-    let validity = col3
-        .validity
-        .expect("nullable column keeps its validity bitmap");
-    let is_valid = |row: usize| validity[row / 8] & (1 << (row % 8)) != 0;
-    // Key order: row0=k0 (valid), row1=k1 (valid), row2=k2 (NULL).
-    assert!(is_valid(0), "k0 is non-null");
-    assert!(is_valid(1), "k1 is non-null");
-    assert!(!is_valid(2), "k2's null survives the merge gather");
+    // Key order: k0 (valid), k1 (valid), k2 (NULL).
+    assert_eq!(
+        valid,
+        vec![true, true, false],
+        "k2's null survives the merge gather, k0 and k1 stay non-null",
+    );
 }
 
 /// Ingests a single-key segment whose value is one variable-width (Bytes) sub-

@@ -144,7 +144,9 @@ fn columnar_ingest_projects_individual_value_subcolumns() -> lsm_tree::Result<()
 
     // Project only the fixed-4 sub-column (id 3): every batch carries it alone,
     // and its bytes are the two ingested values verbatim.
-    let batches = table.columnar_scan(&[3], None)?;
+    let batches = table
+        .columnar_scan(&[3], None)?
+        .collect::<lsm_tree::Result<Vec<_>>>()?;
     let mut col3_data = Vec::new();
     let mut rows = 0u32;
     for b in &batches {
@@ -167,7 +169,9 @@ fn columnar_ingest_projects_individual_value_subcolumns() -> lsm_tree::Result<()
     // Project only the bytes sub-column (id 4): again decoded in isolation, and
     // its payload is the two ingested values verbatim (asserting the id alone
     // would also pass for an empty or wrong-row column).
-    let batches = table.columnar_scan(&[4], None)?;
+    let batches = table
+        .columnar_scan(&[4], None)?
+        .collect::<lsm_tree::Result<Vec<_>>>()?;
     let mut col4_data = Vec::new();
     let mut rows = 0u32;
     for b in &batches {
@@ -451,7 +455,9 @@ fn columnar_ingest_merges_small_batches_into_one_rowgroup() -> lsm_tree::Result<
 
     let version = tree.current_version();
     let table = version.iter_tables().next().expect("one ingested SST");
-    let batches = table.columnar_scan(&[3, 4], None)?;
+    let batches = table
+        .columnar_scan(&[3, 4], None)?
+        .collect::<lsm_tree::Result<Vec<_>>>()?;
     assert_eq!(
         batches.len(),
         1,
@@ -506,7 +512,9 @@ fn columnar_ingest_flushes_the_rowgroup_on_a_layout_change() -> lsm_tree::Result
 
     let version = tree.current_version();
     let table = version.iter_tables().next().expect("one ingested SST");
-    let batches = table.columnar_scan(&[3], None)?;
+    let batches = table
+        .columnar_scan(&[3], None)?
+        .collect::<lsm_tree::Result<Vec<_>>>()?;
     assert_eq!(
         batches.len(),
         2,
@@ -549,7 +557,9 @@ fn columnar_ingest_rotates_the_rowgroup_at_the_size_threshold() -> lsm_tree::Res
 
     let version = tree.current_version();
     let table = version.iter_tables().next().expect("one ingested SST");
-    let batches = table.columnar_scan(&[3, 4], None)?;
+    let batches = table
+        .columnar_scan(&[3, 4], None)?
+        .collect::<lsm_tree::Result<Vec<_>>>()?;
     assert!(
         batches.len() >= 2,
         "size-threshold rotation splits a large same-layout stream into multiple blocks (got {})",
@@ -595,11 +605,10 @@ fn rows_per_page(any: &AnyTree) -> lsm_tree::Result<Vec<u32>> {
     };
     let version = tree.current_version();
     let table = version.iter_tables().next().expect("one table");
-    Ok(table
+    table
         .columnar_scan(&[lsm_tree::table::columnar::COL_USER_KEY], None)?
-        .iter()
-        .map(|b| b.row_count)
-        .collect())
+        .map(|b| b.map(|b| b.row_count))
+        .collect()
 }
 
 /// Row `i` of the size-cut fixtures: a 5-byte key and a `value_len`-byte
@@ -739,7 +748,9 @@ fn one_oversized_batch_is_written_as_groups_of_the_group_size() -> lsm_tree::Res
 
     let version = tree.current_version();
     let table = version.iter_tables().next().expect("one ingested SST");
-    let batches = table.columnar_scan(&[lsm_tree::table::columnar::COL_VALUE], None)?;
+    let batches = table
+        .columnar_scan(&[lsm_tree::table::columnar::COL_VALUE], None)?
+        .collect::<lsm_tree::Result<Vec<_>>>()?;
     assert_eq!(
         batches.iter().map(|b| b.row_count).sum::<u32>(),
         ROWS,
@@ -895,7 +906,9 @@ fn columnar_scan_spans_segments_with_evolving_schema() -> lsm_tree::Result<()> {
     let mut without_col5 = 0;
     let mut col5_data = Vec::new();
     for table in &tables {
-        let batches = table.columnar_scan(&[5], None)?;
+        let batches = table
+            .columnar_scan(&[5], None)?
+            .collect::<lsm_tree::Result<Vec<_>>>()?;
         let present = batches
             .iter()
             .any(|b| b.columns.iter().any(|c| c.column_id == 5));
@@ -923,7 +936,9 @@ fn columnar_scan_spans_segments_with_evolving_schema() -> lsm_tree::Result<()> {
 
     // The shared sub-column 3 is satisfied by BOTH segments.
     for table in &tables {
-        let batches = table.columnar_scan(&[3], None)?;
+        let batches = table
+            .columnar_scan(&[3], None)?
+            .collect::<lsm_tree::Result<Vec<_>>>()?;
         assert!(
             batches
                 .iter()
