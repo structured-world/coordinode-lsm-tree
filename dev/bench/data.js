@@ -1,5 +1,5 @@
 window.BENCHMARK_DATA = {
-  "lastUpdate": 1790615055105,
+  "lastUpdate": 1790615060480,
   "repoUrl": "https://github.com/structured-world/coordinode-lsm-tree",
   "entries": {
     "lsm-tree db_bench costs": [
@@ -1488,6 +1488,192 @@ window.BENCHMARK_DATA = {
             "value": 6222.25,
             "unit": "B/row",
             "extra": "keys: 10000 | rows: 10000 | read: 83123466 B | decoded: 82570298 B | copied: 62222500 B | elapsed: 62.18353ms\niterations: 3"
+          }
+        ]
+      },
+      {
+        "commit": {
+          "author": {
+            "email": "mail@polaz.com",
+            "name": "Dmitry Prudnikov",
+            "username": "polaz"
+          },
+          "committer": {
+            "email": "noreply@github.com",
+            "name": "GitHub",
+            "username": "web-flow"
+          },
+          "distinct": true,
+          "id": "84ff57107e65bb6b57cc0a3d941016cc7f03936e",
+          "message": "fix(config): wire the partition size policies to the table writers (#738)\n\n## Summary\n\n`Config::index_block_partition_size_policy` and\n`Config::filter_block_partition_size_policy` existed with a 4 KiB\ndefault, but nothing read them: every table writer kept one built-in\npartition size for both its index and its filter, so a tree configured\nwith another size silently wrote 4 KiB partitions.\n\n- The table writer keeps the two sizes apart:\n`Writer::use_index_partition_size` and\n`Writer::use_filter_partition_size`, each applied whichever order the\nbuilder sets them in. `Writer::use_meta_partition_size` still sets both.\n- The multi-writer carries both sizes across rotations, and flush,\ncompaction, ingestion and the blob tree's flush pass each level's\npolicy.\n- `Config` gains `index_block_partition_size_policy` and\n`filter_block_partition_size_policy` builders, documented with examples.\nThe `TODO: implement` markers on the defaults are gone.\n\nThe 5.x.x line has the same bug; its fix is the backport #739, which\nkeeps that line's public API as released.\n\n## Testing\n\n- `the_configured_partition_sizes_reach_the_writers`: through a flush, a\ncompaction, an ingestion and a blob tree's flush, four times the filter\npartition size shrinks the filter's top-level index more than threefold,\na larger index partition size shrinks the block index's, and neither\nsize moves the other's index. Red before the fix (the same 884-byte\nfilter top-level index under both sizes); with the wiring of any one\npath removed, the test fails on that path.\n- `cargo fmt --check`, `cargo clippy --all-targets` (default and\n`--all-features`) with `-D warnings`, `cargo nextest run` (2861 default,\n3833 all features), `cargo test --doc --all-features`, `cargo doc\n--no-deps --all-features`, `cargo check --target thumbv7em-none-eabihf\n--no-default-features --features alloc`.\n\nCloses #735\n\n\n<!-- This is an auto-generated comment: release notes by coderabbit.ai\n-->\n\n## Summary by CodeRabbit\n\n* **New Features**\n* Added separate configuration options for index and filter partition\nsizes, allowing each to be set independently by table level.\n* Configured partition sizes are now applied when data is flushed,\ningested, or compacted, and when new table files are written.\n* **Documentation**\n* Expanded configuration guidance with per-level behavior, defaults, and\nexamples.\n\n<!-- end of auto-generated comment: release notes by coderabbit.ai -->",
+          "timestamp": "2026-09-28T19:55:02+03:00",
+          "tree_id": "610ca21ef5c7d5af165182f1a09fccf7c9be60d0",
+          "url": "https://github.com/structured-world/coordinode-lsm-tree/commit/84ff57107e65bb6b57cc0a3d941016cc7f03936e"
+        },
+        "date": 1790615058406,
+        "tool": "customSmallerIsBetter",
+        "benches": [
+          {
+            "name": "mixed-layout / narrow-records bytes read per row",
+            "value": 42.1442,
+            "unit": "B/row",
+            "extra": "keys: 200000 | rows: 200000 | read: 8428840 B | decoded: 8357098 B | copied: 9000000 B | elapsed: 749.441979ms\niterations: 3"
+          },
+          {
+            "name": "mixed-layout / narrow-records bytes decoded per row",
+            "value": 41.78549,
+            "unit": "B/row",
+            "extra": "keys: 200000 | rows: 200000 | read: 8428840 B | decoded: 8357098 B | copied: 9000000 B | elapsed: 749.441979ms\niterations: 3"
+          },
+          {
+            "name": "mixed-layout / narrow-records bytes copied per row",
+            "value": 45,
+            "unit": "B/row",
+            "extra": "keys: 200000 | rows: 200000 | read: 8428840 B | decoded: 8357098 B | copied: 9000000 B | elapsed: 749.441979ms\niterations: 3"
+          },
+          {
+            "name": "mixed-layout / wide-records-full-read bytes read per row",
+            "value": 4215,
+            "unit": "B/row",
+            "extra": "keys: 50000 | rows: 50000 | read: 210750000 B | decoded: 209100000 B | copied: 207050000 B | elapsed: 947.378577ms\niterations: 3"
+          },
+          {
+            "name": "mixed-layout / wide-records-full-read bytes decoded per row",
+            "value": 4182,
+            "unit": "B/row",
+            "extra": "keys: 50000 | rows: 50000 | read: 210750000 B | decoded: 209100000 B | copied: 207050000 B | elapsed: 947.378577ms\niterations: 3"
+          },
+          {
+            "name": "mixed-layout / wide-records-full-read bytes copied per row",
+            "value": 4141,
+            "unit": "B/row",
+            "extra": "keys: 50000 | rows: 50000 | read: 210750000 B | decoded: 209100000 B | copied: 207050000 B | elapsed: 947.378577ms\niterations: 3"
+          },
+          {
+            "name": "mixed-layout / mixed-value-sizes bytes read per row",
+            "value": 867.21184,
+            "unit": "B/row",
+            "extra": "keys: 100000 | rows: 100000 | read: 86721184 B | decoded: 86391151 B | copied: 86420000 B | elapsed: 608.200352ms\niterations: 3"
+          },
+          {
+            "name": "mixed-layout / mixed-value-sizes bytes decoded per row",
+            "value": 863.91151,
+            "unit": "B/row",
+            "extra": "keys: 100000 | rows: 100000 | read: 86721184 B | decoded: 86391151 B | copied: 86420000 B | elapsed: 608.200352ms\niterations: 3"
+          },
+          {
+            "name": "mixed-layout / mixed-value-sizes bytes copied per row",
+            "value": 864.2,
+            "unit": "B/row",
+            "extra": "keys: 100000 | rows: 100000 | read: 86721184 B | decoded: 86391151 B | copied: 86420000 B | elapsed: 608.200352ms\niterations: 3"
+          },
+          {
+            "name": "mixed-layout / row-updates-over-columnar-base bytes read per row",
+            "value": 215.46455,
+            "unit": "B/row",
+            "extra": "keys: 100000 | rows: 100000 | read: 21546455 B | decoded: 20938463 B | copied: 51100094 B | elapsed: 686.715624ms\niterations: 3"
+          },
+          {
+            "name": "mixed-layout / row-updates-over-columnar-base bytes decoded per row",
+            "value": 209.38463,
+            "unit": "B/row",
+            "extra": "keys: 100000 | rows: 100000 | read: 21546455 B | decoded: 20938463 B | copied: 51100094 B | elapsed: 686.715624ms\niterations: 3"
+          },
+          {
+            "name": "mixed-layout / row-updates-over-columnar-base bytes copied per row",
+            "value": 511.00094,
+            "unit": "B/row",
+            "extra": "keys: 100000 | rows: 100000 | read: 21546455 B | decoded: 20938463 B | copied: 51100094 B | elapsed: 686.715624ms\niterations: 3"
+          },
+          {
+            "name": "mixed-layout / versions-deletes-tombstones bytes read per row",
+            "value": 133.68026315789473,
+            "unit": "B/row",
+            "extra": "keys: 100000 | rows: 76000 | read: 10159700 B | decoded: 10076111 B | copied: 10013359 B | elapsed: 301.065293ms\niterations: 3"
+          },
+          {
+            "name": "mixed-layout / versions-deletes-tombstones bytes decoded per row",
+            "value": 132.58040789473685,
+            "unit": "B/row",
+            "extra": "keys: 100000 | rows: 76000 | read: 10159700 B | decoded: 10076111 B | copied: 10013359 B | elapsed: 301.065293ms\niterations: 3"
+          },
+          {
+            "name": "mixed-layout / versions-deletes-tombstones bytes copied per row",
+            "value": 131.75472368421052,
+            "unit": "B/row",
+            "extra": "keys: 100000 | rows: 76000 | read: 10159700 B | decoded: 10076111 B | copied: 10013359 B | elapsed: 301.065293ms\niterations: 3"
+          },
+          {
+            "name": "mixed-layout / selective-scan-sparse bytes read per row",
+            "value": 4249.199806013579,
+            "unit": "B/row",
+            "extra": "keys: 100000 | rows: 1031 | read: 4380925 B | decoded: 4210810 B | copied: 293835 B | elapsed: 25.505096ms\niterations: 3"
+          },
+          {
+            "name": "mixed-layout / selective-scan-sparse bytes decoded per row",
+            "value": 4084.199806013579,
+            "unit": "B/row",
+            "extra": "keys: 100000 | rows: 1031 | read: 4380925 B | decoded: 4210810 B | copied: 293835 B | elapsed: 25.505096ms\niterations: 3"
+          },
+          {
+            "name": "mixed-layout / selective-scan-sparse bytes copied per row",
+            "value": 285,
+            "unit": "B/row",
+            "extra": "keys: 100000 | rows: 1031 | read: 4380925 B | decoded: 4210810 B | copied: 293835 B | elapsed: 25.505096ms\niterations: 3"
+          },
+          {
+            "name": "mixed-layout / selective-scan-near-full bytes read per row",
+            "value": 340.1047555555555,
+            "unit": "B/row",
+            "extra": "keys: 100000 | rows: 90000 | read: 30609428 B | decoded: 29737733 B | copied: 24990376 B | elapsed: 85.823261ms\niterations: 3"
+          },
+          {
+            "name": "mixed-layout / selective-scan-near-full bytes decoded per row",
+            "value": 330.41925555555554,
+            "unit": "B/row",
+            "extra": "keys: 100000 | rows: 90000 | read: 30609428 B | decoded: 29737733 B | copied: 24990376 B | elapsed: 85.823261ms\niterations: 3"
+          },
+          {
+            "name": "mixed-layout / selective-scan-near-full bytes copied per row",
+            "value": 277.67084444444447,
+            "unit": "B/row",
+            "extra": "keys: 100000 | rows: 90000 | read: 30609428 B | decoded: 29737733 B | copied: 24990376 B | elapsed: 85.823261ms\niterations: 3"
+          },
+          {
+            "name": "mixed-layout / blobs-well-placed bytes read per row",
+            "value": 8297.8593,
+            "unit": "B/row",
+            "extra": "keys: 10000 | rows: 10000 | read: 82978593 B | decoded: 82426811 B | copied: 82911721 B | elapsed: 60.711382ms\niterations: 3"
+          },
+          {
+            "name": "mixed-layout / blobs-well-placed bytes decoded per row",
+            "value": 8242.6811,
+            "unit": "B/row",
+            "extra": "keys: 10000 | rows: 10000 | read: 82978593 B | decoded: 82426811 B | copied: 82911721 B | elapsed: 60.711382ms\niterations: 3"
+          },
+          {
+            "name": "mixed-layout / blobs-well-placed bytes copied per row",
+            "value": 8291.1721,
+            "unit": "B/row",
+            "extra": "keys: 10000 | rows: 10000 | read: 82978593 B | decoded: 82426811 B | copied: 82911721 B | elapsed: 60.711382ms\niterations: 3"
+          },
+          {
+            "name": "mixed-layout / blobs-scattered bytes read per row",
+            "value": 8312.3466,
+            "unit": "B/row",
+            "extra": "keys: 10000 | rows: 10000 | read: 83123466 B | decoded: 82570298 B | copied: 62222500 B | elapsed: 79.647522ms\niterations: 3"
+          },
+          {
+            "name": "mixed-layout / blobs-scattered bytes decoded per row",
+            "value": 8257.0298,
+            "unit": "B/row",
+            "extra": "keys: 10000 | rows: 10000 | read: 83123466 B | decoded: 82570298 B | copied: 62222500 B | elapsed: 79.647522ms\niterations: 3"
+          },
+          {
+            "name": "mixed-layout / blobs-scattered bytes copied per row",
+            "value": 6222.25,
+            "unit": "B/row",
+            "extra": "keys: 10000 | rows: 10000 | read: 83123466 B | decoded: 82570298 B | copied: 62222500 B | elapsed: 79.647522ms\niterations: 3"
           }
         ]
       }
