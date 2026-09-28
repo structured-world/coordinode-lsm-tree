@@ -674,6 +674,40 @@ impl Writer {
             + framed_len_bound(filter, BlockType::Filter, none, encryption, self.ecc))
     }
 
+    /// Bytes the table writes and holds on top of its estimates if range
+    /// tombstones widen its key range to bounds of up to `bound_len` bytes:
+    /// the meta block carries the range, is written twice, and is encoded and
+    /// framed in memory at `finish`. `(0, 0)` before the table has a key.
+    pub(crate) fn widened_range_growth(&self, bound_len: u64) -> (u64, u64) {
+        use crate::table::block::{BlockType, EccParams, framed_len_bound};
+
+        let (Some(base), Some(first), Some(last)) = (
+            self.meta_base_len,
+            &self.meta.first_key,
+            self.current_key.as_ref().or(self.meta.last_key.as_ref()),
+        ) else {
+            return (0, 0);
+        };
+        let (first, last) = (first.len() as u64, last.len() as u64);
+        let growth = (bound_len.max(first) - first) + (bound_len.max(last) - last);
+        if growth == 0 {
+            return (0, 0);
+        }
+        let payload = base + first + last + 4;
+        let frame = |payload| {
+            framed_len_bound(
+                payload,
+                BlockType::Meta,
+                CompressionType::None,
+                self.encryption.as_deref(),
+                self.ecc.map(|_| EccParams::RS_4_2),
+            )
+        };
+        // Framing only grows with its payload.
+        let frame_growth = frame(payload + growth) - frame(payload);
+        (2 * frame_growth, 2 * growth + frame_growth)
+    }
+
     /// Heap bytes the per-key and per-block state holds until `finish`,
     /// including what `finish` allocates on top to build its sections. It
     /// grows with the keys, not the data bytes, so a table of well-compressing
@@ -935,7 +969,11 @@ impl Writer {
             (ids.len() * core::mem::size_of::<TableId>()) as u64
         });
         let meta_scratch = 2 * lineage_ids + 2 * meta_payload + meta_frame;
-        let mut locator_held = 0;
+        // Triples of a block that outgrew explicit widths stay allocated until
+        // the block is cut and drops the locator, so they count whatever the
+        // section estimate says.
+        let locator_held =
+            (self.locators.capacity() * core::mem::size_of::<(u64, u64, u64)>()) as u64;
         let mut locator_scratch = 0;
 
         // Block ids only grow, so the last triple carries the largest one
@@ -953,8 +991,6 @@ impl Writer {
         {
             let n = self.locators.len() as u64;
             let section = section as u64;
-            locator_held =
-                (self.locators.capacity() * core::mem::size_of::<(u64, u64, u64)>()) as u64;
             // The split into hashes and packed values, the retrieval build over
             // them, the section bytes and their framed copy.
             locator_scratch = n * 2 * WORD

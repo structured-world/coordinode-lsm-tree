@@ -1126,3 +1126,41 @@ fn a_locator_too_narrow_for_the_table_stops_holding_state() -> crate::Result<()>
     assert_eq!(narrow.output_size_hint(), plain.output_size_hint());
     Ok(())
 }
+
+/// A block that outgrows explicit slot widths drops the locator only when it
+/// is cut; until then its triples stay allocated and are held.
+#[test]
+fn a_forming_block_past_the_slot_width_still_holds_its_locators() -> crate::Result<()> {
+    let dir = tempfile::tempdir()?;
+    let mut writer = Writer::new(dir.path().join("1"), 1, 0, Arc::new(StdFs))?
+        .use_data_block_size(1 << 20)
+        .use_locator(crate::config::LocatorPolicyEntry::Enabled {
+            precision: crate::config::LocatorPrecision::Entry,
+            block_id_bits: None,
+            slot_bits: Some(2),
+        });
+    let mut plain =
+        Writer::new(dir.path().join("2"), 1, 0, Arc::new(StdFs))?.use_data_block_size(1 << 20);
+    for i in 0..5_000_u32 {
+        for w in [&mut writer, &mut plain] {
+            w.write(InternalValue::from_components(
+                format!("key{i:010}").into_bytes(),
+                b"value---".to_vec(),
+                0,
+                ValueType::Value,
+            ))?;
+        }
+    }
+    writer.refresh_state_estimates();
+    plain.refresh_state_estimates();
+    assert_eq!(writer.meta.data_block_count, 0, "the block was cut");
+    let triples = (writer.locators.capacity() * core::mem::size_of::<(u64, u64, u64)>()) as u64;
+    assert!(triples > 0, "the locator stopped collecting");
+    assert!(
+        writer.held_state_bytes() >= plain.held_state_bytes() + triples,
+        "held {} against {} without a locator and {triples} bytes of triples",
+        writer.held_state_bytes(),
+        plain.held_state_bytes(),
+    );
+    Ok(())
+}

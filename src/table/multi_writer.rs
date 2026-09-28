@@ -952,26 +952,47 @@ impl MultiWriter {
         // writes them at `finish`. The tombstone block is encoded into a buffer
         // it holds while writing. The tombstones themselves are the caller's
         // input and the share tracks only those open at the current key:
-        // neither grows with the table, and rotating frees neither.
-        let tombstones = match &self.current_key {
-            Some(key) if !self.range_tombstones.is_empty() => self.tombstone_share.bytes(key),
-            _ => 0,
+        // neither grows with the table, and rotating frees neither. The
+        // tombstones starting at the key go where the key goes, and the last
+        // key has no successor whose check would count them, so they count here.
+        let (tombstones, pieces, longest) = match &self.current_key {
+            Some(key) if !self.range_tombstones.is_empty() => {
+                let group = self.tombstone_share.group(
+                    &self.range_tombstones,
+                    key,
+                    self.comparator.as_ref(),
+                );
+                (
+                    self.tombstone_share.bytes(key) + group.bytes,
+                    self.tombstone_share.pieces() + group.entries,
+                    self.tombstone_share.longest_bound(key).max(group.longest),
+                )
+            }
+            _ => (0, self.tombstone_share.pieces(), 0),
         };
-        self.full_with_tombstones(tombstones, self.tombstone_share.pieces(), 0)
+        self.full_with_tombstones(tombstones, pieces, longest, 0)
     }
 
     /// The current table reached its target if it closes holding `pieces`
-    /// range-tombstone entries of `tombstones` encoded bytes, besides the
-    /// `overhead` its writer does not count. The writer holds each entry until
-    /// `finish`, which encodes them into a block buffer and frames that when
-    /// the block is transformed.
-    fn full_with_tombstones(&self, tombstones: u64, pieces: u64, overhead: u64) -> bool {
+    /// range-tombstone entries of `tombstones` encoded bytes, with bounds of
+    /// up to `longest` bytes, besides the `overhead` its writer does not
+    /// count. The writer holds each entry until `finish`, which encodes them
+    /// into a block buffer and frames that when the block is transformed. The
+    /// table's key range widens to the entries' bounds.
+    fn full_with_tombstones(
+        &self,
+        tombstones: u64,
+        pieces: u64,
+        longest: u64,
+        overhead: u64,
+    ) -> bool {
         use crate::table::block::{BlockType, framed_len_bound};
 
         let linked = crate::table::writer::linked_blob_files_len(self.linked_blobs.len());
         let (tombstone_block, tombstones_held) = if tombstones == 0 {
             (0, 0)
         } else {
+            let (range_out, range_held) = self.writer.widened_range_growth(longest);
             (
                 framed_len_bound(
                     tombstones,
@@ -979,8 +1000,8 @@ impl MultiWriter {
                     CompressionType::None,
                     self.encryption.as_deref(),
                     self.ecc,
-                ),
-                self.tombstones_held(tombstones, pieces),
+                ) + range_out,
+                self.tombstones_held(tombstones, pieces) + range_held,
             )
         };
         // Each linked blob file is an entry in the map here and, at rotation,
@@ -1145,7 +1166,7 @@ impl MultiWriter {
             self.tombstone_share
                 .advance(&self.range_tombstones, &point, comparator.as_ref());
             let bytes = self.tombstone_share.bytes(&point);
-            let (group_bytes, group_entries) =
+            let group =
                 self.tombstone_share
                     .group(&self.range_tombstones, &point, comparator.as_ref());
             // An output of tombstones alone writes a synthetic table around
@@ -1160,8 +1181,11 @@ impl MultiWriter {
             if bytes > 0
                 && self.tombstone_share.has_more(&self.range_tombstones)
                 && self.full_with_tombstones(
-                    bytes + group_bytes,
-                    self.tombstone_share.pieces() + group_entries,
+                    bytes + group.bytes,
+                    self.tombstone_share.pieces() + group.entries,
+                    self.tombstone_share
+                        .longest_bound(&point)
+                        .max(group.longest),
                     overhead,
                 )
                 && self.rotation_sheds(&point)
