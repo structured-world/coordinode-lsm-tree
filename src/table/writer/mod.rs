@@ -731,13 +731,26 @@ impl Writer {
 
     /// Bytes a table holding range tombstones alone writes besides its
     /// tombstone block, bounded from above, with keys of up to `key_len`
-    /// bytes: the synthetic weak-tombstone block and its index entry, written
-    /// twice, its one-key filter, the two meta copies and the fixed tail.
-    pub(crate) fn tombstone_only_overhead(&self, key_len: u64) -> crate::Result<u64> {
-        use crate::table::block::{BlockType, EccParams, framed_len_bound};
+    /// bytes yielding up to `prefixes` filter prefixes: the synthetic
+    /// weak-tombstone block, the index and filter over it, every section the
+    /// writer records it in, the two meta copies and the fixed tail. The
+    /// index and filter are counted in their partitioned layout, which holds
+    /// the single-level one: a partition, the top level and its tail mirror.
+    pub(crate) fn tombstone_only_overhead(
+        &self,
+        key_len: u64,
+        prefixes: usize,
+    ) -> crate::Result<u64> {
+        use crate::table::{
+            block::{BlockType, EccParams, framed_len_bound},
+            zone_map::ColumnStats,
+        };
 
         let encryption = self.encryption.as_deref();
         let none = CompressionType::None;
+        let framed = |len, block_type, compression| {
+            framed_len_bound(len, block_type, compression, encryption, self.ecc)
+        };
         // An entry holds its key besides a few varints, a seqno and a type.
         let entry = key_len + 32;
         let base = match self.meta_base_len {
@@ -745,7 +758,35 @@ impl Writer {
             None => self.meta_payload_len_without_keys()?,
         };
         let meta = base + 2 * key_len + 4;
-        let filter = self.bloom_policy.filter_size_bound(1) as u64;
+        let index = framed(entry, BlockType::Index, self.index_block_compression);
+        let filter = self.bloom_policy.filter_size_bound(1 + prefixes) as u64;
+        let seqno_bounds = if self.use_seqno_in_index {
+            framed(
+                core::mem::size_of::<(BlockOffset, (u64, u64))>() as u64,
+                BlockType::SeqnoBounds,
+                none,
+            )
+        } else {
+            0
+        };
+        // One synthetic column holding the sentinel as both bounds.
+        let zone_map = if self.use_zone_map {
+            framed(
+                (core::mem::size_of::<(BlockOffset, Vec<ColumnStats>)>()
+                    + core::mem::size_of::<ColumnStats>()) as u64
+                    + 2 * key_len,
+                BlockType::ZoneMap,
+                none,
+            )
+        } else {
+            0
+        };
+        let locator = self
+            .locator
+            .and_then(|spec| crate::table::locator::section_size_estimate(1, spec, 0, 0))
+            .map_or(0, |section| {
+                framed(section as u64, BlockType::Locator, none)
+            });
         Ok(FIXED_TAIL_LEN
             + 2 * framed_len_bound(
                 meta,
@@ -754,21 +795,13 @@ impl Writer {
                 encryption,
                 self.ecc.map(|_| EccParams::RS_4_2),
             )
-            + framed_len_bound(
-                entry,
-                BlockType::Data,
-                self.data_block_compression,
-                encryption,
-                self.ecc,
-            )
-            + 2 * framed_len_bound(
-                entry,
-                BlockType::Index,
-                self.index_block_compression,
-                encryption,
-                self.ecc,
-            )
-            + framed_len_bound(filter, BlockType::Filter, none, encryption, self.ecc))
+            + framed(entry, BlockType::Data, self.data_block_compression)
+            + 3 * index
+            + framed(filter, BlockType::Filter, none)
+            + index
+            + seqno_bounds
+            + zone_map
+            + locator)
     }
 
     /// Bytes the table writes and holds on top of its estimates if range
@@ -810,6 +843,11 @@ impl Writer {
     /// grows with the keys, not the data bytes, so a table of well-compressing
     /// rows can reach its memory before its size. Blocks in flight on the
     /// parallel pipeline hold their payloads and frames until written.
+    ///
+    /// The forming block is not counted: it is bounded by the block size, not
+    /// by the table, and rotating does not free it, since the next table
+    /// builds the same block. Counting it would only close tables earlier
+    /// with the same peak.
     pub(crate) fn held_state_bytes(&self) -> u64 {
         #[cfg(feature = "std")]
         let in_flight = self.parallel_pending_heap;
