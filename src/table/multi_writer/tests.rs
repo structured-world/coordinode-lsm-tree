@@ -996,6 +996,39 @@ fn one_long_trailing_bound_does_not_fragment_the_tombstones_before_it() -> crate
     Ok(())
 }
 
+/// The first tombstones past a flush's last key can all share one start: the
+/// output holding the records has no tombstone yet, and the check at that
+/// start still counts the group, so it does not land on that output.
+#[test]
+fn a_flush_counts_a_first_start_group_past_its_records() -> crate::Result<()> {
+    use crate::{UserKey, range_tombstone::RangeTombstone};
+
+    const TARGET: u64 = 32 * 1_024;
+    let keys: Vec<Vec<u8>> = (0..100).map(|i| format!("k{i:05}").into_bytes()).collect();
+    let keys: Vec<&[u8]> = keys.iter().map(Vec::as_slice).collect();
+    // The group alone passes the target.
+    let group = (0..600)
+        .map(|i| {
+            RangeTombstone::new(
+                UserKey::from(b"y" as &[u8]),
+                UserKey::from(random_bound(i, b"y\x01".to_vec())),
+                5,
+            )
+        })
+        .collect();
+    let (folder, tables) = flush_outputs(TARGET, &keys, group)?;
+    let Some(records) = tables.first() else {
+        panic!("a flush writes an output");
+    };
+    let file_size = std::fs::metadata(folder.path().join(records.id().to_string()))?.len();
+    assert!(
+        file_size <= TARGET + 4 * 1_024,
+        "the output of records took {} tombstones in {file_size} bytes",
+        records.range_tombstones().len(),
+    );
+    Ok(())
+}
+
 /// Every byte prefix of a key is a token.
 struct AllPrefixes;
 

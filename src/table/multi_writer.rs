@@ -1262,8 +1262,9 @@ impl MultiWriter {
                 (0, 0)
             };
             // An empty zone is never closed: that output would hold nothing,
-            // nor is the last one, with nothing above it.
-            if bytes > 0
+            // nor is the last one, with nothing above it. An output holding
+            // records is not empty, whatever tombstones it has so far.
+            if (bytes > 0 || self.writer.meta.key_count > 0)
                 && self.tombstone_share.has_more(&self.range_tombstones)
                 && self.full_with_tombstones(
                     bytes + group.bytes,

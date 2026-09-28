@@ -300,7 +300,7 @@ impl<W: crate::io::Write + crate::io::Seek> FilterWriter<W> for PartitionedFilte
         self
     }
 
-    fn register_key(&mut self, key: &UserKey) -> crate::Result<()> {
+    fn register_key(&mut self, key: &UserKey) -> crate::Result<usize> {
         self.bloom_hash_buffer.push(crate::hash::hash64(key));
 
         // NOTE: Prefix hashes are NOT inserted for partitioned filters.
@@ -329,7 +329,7 @@ impl<W: crate::io::Write + crate::io::Seek> FilterWriter<W> for PartitionedFilte
             self.spill_filter_partition(key, hashes)?;
         }
 
-        Ok(())
+        Ok(1)
     }
 
     fn held_bytes(&self) -> u64 {

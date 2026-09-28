@@ -87,6 +87,13 @@ const LAYER_HEADER_LEN: usize = 12;
 /// floors, two blocks, two and four. They are taken at a tenth plus
 /// `3 / sqrt(n)`, a fiftieth and a hundredth of the first, and at those
 /// floors.
+///
+/// This bounds the filters real keys build, not the worst case: hashes
+/// chosen to collide can bump a whole block, and in the limit every key,
+/// into the next layer. Charging each later layer for all `n` keys would
+/// double the estimate of every table to guard against inputs built to
+/// defeat a 64-bit hash, so a table rotates on the bumps keys make in
+/// practice.
 #[must_use]
 pub(crate) fn encoded_len_bound(params: &super::params::BurrParams, n: usize) -> usize {
     let b = usize::from(params.b);
