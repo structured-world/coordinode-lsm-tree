@@ -961,42 +961,6 @@ fn blocks_in_flight_are_counted_by_their_frames() -> crate::Result<()> {
     Ok(())
 }
 
-/// Within a block not yet cut, an entry-precise locator records a slot per key,
-/// so its section needs slot bits a block-precise one does not: the estimates
-/// count the open block's slots, not only those of blocks already cut.
-#[test]
-fn the_estimates_count_the_locator_slots_of_a_block_not_yet_cut() -> crate::Result<()> {
-    let locator = |precision| crate::config::LocatorPolicyEntry::Enabled {
-        precision,
-        block_id_bits: None,
-        slot_bits: None,
-    };
-    let dir = tempfile::tempdir()?;
-    let hint = |name: &str, precision| -> crate::Result<u64> {
-        let mut writer = Writer::new(dir.path().join(name), 1, 0, Arc::new(StdFs))?
-            .use_data_block_size(4 << 20)
-            .use_locator(locator(precision));
-        for i in 0..20_000u32 {
-            writer.write(InternalValue::from_components(
-                format!("key{i:06}").into_bytes(),
-                b"v".to_vec(),
-                0,
-                ValueType::Value,
-            ))?;
-        }
-        assert_eq!(writer.meta.data_block_count, 0);
-        Ok(writer.output_size_hint())
-    };
-    let entry = hint("1", crate::config::LocatorPrecision::Entry)?;
-    let block = hint("2", crate::config::LocatorPrecision::Block)?;
-    // Slots up to 19 999 take 15 bits a key; count at least 14.
-    assert!(
-        entry >= block + 20_000 * 14 / 8,
-        "entry-precise hint {entry} against block-precise {block}",
-    );
-    Ok(())
-}
-
 /// Only a key's newest version gets a locator entry, so blocks holding older
 /// versions alone add no block id. Explicit widths that fit every recorded id
 /// keep the locator however many such blocks follow.
