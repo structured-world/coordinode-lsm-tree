@@ -1779,9 +1779,17 @@ impl Writer {
                 self.encryption.as_deref(),
                 self.ecc,
             );
-            // Its heap in flight: the encoded payload, and the frame a worker
-            // prepares from it.
-            let heap_bound = encoded.capacity() as u64 + frame_bound;
+            // Its heap in flight: the encoded payload, and what a worker
+            // prepares from it, the compressed bytes and the sealed frame both
+            // when the block is compressed and encrypted.
+            let heap_bound = encoded.capacity() as u64
+                + crate::table::block::transform_scratch_bound(
+                    encoded.len() as u64,
+                    super::block::BlockType::Data,
+                    self.data_block_compression,
+                    self.encryption.as_deref(),
+                    self.ecc,
+                );
             self.pending_meta.push_back(HandleMeta {
                 last_key,
                 last_seqno,

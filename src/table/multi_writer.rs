@@ -992,8 +992,14 @@ impl MultiWriter {
                     ),
             )
         };
+        // Each linked blob file is an entry in the map here and, at rotation,
+        // a copy in the writer's list.
+        let linked_held = self.linked_blobs.len() as u64
+            * (core::mem::size_of::<(BlobFileId, LinkedFile)>()
+                + 1
+                + core::mem::size_of::<LinkedFile>()) as u64;
         self.writer.output_size_hint() + linked + tombstone_block >= self.target_size
-            || self.writer.held_state_bytes() + tombstones_held >= self.target_size
+            || self.writer.held_state_bytes() + tombstones_held + linked_held >= self.target_size
     }
 
     /// Closing the current table at `key` sheds what it holds: the next one
@@ -1180,7 +1186,8 @@ impl MultiWriter {
             );
         }
 
-        for linked in self.linked_blobs.values() {
+        // Taken out, so the map is freed before the table is written.
+        for linked in core::mem::take(&mut self.linked_blobs).into_values() {
             self.writer.link_blob_file(
                 linked.blob_file_id,
                 linked.len,

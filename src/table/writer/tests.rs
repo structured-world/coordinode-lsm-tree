@@ -1001,6 +1001,46 @@ fn blocks_in_flight_count_toward_the_held_state() -> crate::Result<()> {
     Ok(())
 }
 
+/// A block both compressed and encrypted on the parallel pipeline holds its
+/// payload, the compressed bytes and the sealed frame at once: the held state
+/// counts all three.
+#[cfg(all(feature = "parallel", feature = "encryption", feature = "lz4"))]
+#[test]
+fn blocks_in_flight_count_their_compression_and_encryption_buffers() -> crate::Result<()> {
+    let dir = tempfile::tempdir()?;
+    let held = |name: &str, encrypted: bool| -> crate::Result<u64> {
+        let spawner = Arc::new(super::RayonSpawner::with_threads(4)?);
+        let encryption: Option<Arc<dyn crate::encryption::EncryptionProvider>> =
+            encrypted.then(|| Arc::new(crate::encryption::Aes256GcmProvider::new(&[7; 32])) as _);
+        let mut writer = Writer::new(dir.path().join(name), 1, 0, Arc::new(StdFs))?
+            .use_data_block_compression(crate::CompressionType::Lz4)
+            .use_encryption(encryption)
+            .use_parallel_compression(spawner, 4);
+        for block in 0..3u32 {
+            for i in 0..10u32 {
+                writer.write(InternalValue::from_components(
+                    format!("key{block}{i:02}").into_bytes(),
+                    vec![7u8; 1_000],
+                    0,
+                    ValueType::Value,
+                ))?;
+            }
+            writer.spill_block()?;
+        }
+        assert_eq!(*writer.meta.file_pos, 0, "all three blocks are in flight");
+        Ok(writer.held_state_bytes())
+    };
+    let sealed = held("1", true)?;
+    let plain = held("2", false)?;
+    // Sealing keeps each block's compressed bytes besides its frame: about
+    // 10 KB more per block than compressing alone.
+    assert!(
+        sealed >= plain + 3 * 10_000,
+        "{sealed} held sealed against {plain} compressed alone",
+    );
+    Ok(())
+}
+
 /// Only a key's newest version gets a locator entry, so blocks holding older
 /// versions alone add no block id. Explicit widths that fit every recorded id
 /// keep the locator however many such blocks follow.
