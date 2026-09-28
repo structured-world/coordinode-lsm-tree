@@ -98,6 +98,17 @@ impl PartitionedFilterWriter {
         }
     }
 
+    /// The top-level index's bytes once `finish` spills the open partition,
+    /// which adds an entry under its last key.
+    fn tli_at_finish(&self) -> usize {
+        match &self.last_key {
+            Some(last) if !self.bloom_hash_buffer.is_empty() => {
+                self.tli_bytes + core::mem::size_of::<KeyedBlockHandle>() + last.len()
+            }
+            _ => self.tli_bytes,
+        }
+    }
+
     /// Builds the open partition from `hashes`, taken out of
     /// `bloom_hash_buffer` by the caller.
     fn spill_filter_partition(&mut self, key: &UserKey, hashes: Vec<u64>) -> crate::Result<()> {
@@ -228,6 +239,9 @@ impl PartitionedFilterWriter {
         Ok(())
     }
 }
+
+#[cfg(test)]
+mod tests;
 
 impl<W: crate::io::Write + crate::io::Seek> FilterWriter<W> for PartitionedFilterWriter {
     fn use_encryption(
@@ -360,7 +374,7 @@ impl<W: crate::io::Write + crate::io::Seek> FilterWriter<W> for PartitionedFilte
         };
         // Then the top-level index, counted at its in-memory size, and its
         // framed copy.
-        let tli = self.tli_bytes as u64;
+        let tli = self.tli_at_finish() as u64;
         open + tli
             + transform_scratch_bound(
                 tli,
@@ -381,22 +395,19 @@ impl<W: crate::io::Write + crate::io::Seek> FilterWriter<W> for PartitionedFilte
         // one, counted by its wire layout, which the partition-split estimate
         // does not model, and the top-level index, counted at its in-memory
         // size, above what its encoding takes.
-        let (open, tli) = match &self.last_key {
-            Some(last) if !self.bloom_hash_buffer.is_empty() => (
-                framed_len_bound(
-                    self.bloom_policy
-                        .encoded_filter_size(self.bloom_hash_buffer.len())
-                        as u64,
-                    BlockType::Filter,
-                    CompressionType::None,
-                    encryption,
-                    self.ecc,
-                ),
-                // The open partition adds a top-level entry under its last key.
-                self.tli_bytes + core::mem::size_of::<KeyedBlockHandle>() + last.len(),
-            ),
-            _ => (0, self.tli_bytes),
+        let open = if self.bloom_hash_buffer.is_empty() {
+            0
+        } else {
+            framed_len_bound(
+                self.bloom_policy
+                    .encoded_filter_size(self.bloom_hash_buffer.len()) as u64,
+                BlockType::Filter,
+                CompressionType::None,
+                encryption,
+                self.ecc,
+            )
         };
+        let tli = self.tli_at_finish();
         self.final_filter_buffer.len() as u64
             + open
             + framed_len_bound(
