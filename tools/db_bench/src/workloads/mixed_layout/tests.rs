@@ -45,7 +45,7 @@ fn config() -> BenchConfig {
 /// Every fixture, including those of the unsupported scenarios. The tests that
 /// cover all of them read this one list, so a new fixture cannot be added to
 /// one of them and silently missed by another.
-const ALL_FIXTURES: [(&str, fixtures::FixtureFn); 8] = [
+const ALL_FIXTURES: [(&str, fixtures::FixtureFn); 10] = [
     ("narrow", fixtures::narrow),
     ("wide", fixtures::wide),
     ("mixed-sizes", fixtures::mixed_sizes),
@@ -58,6 +58,8 @@ const ALL_FIXTURES: [(&str, fixtures::FixtureFn); 8] = [
         fixtures::versions_deletes_tombstones,
     ),
     ("selectivity", fixtures::selectivity),
+    ("columnar-segment", fixtures::columnar_segment),
+    ("columnar-overlap", fixtures::columnar_overlap),
     ("blobs-well-placed", fixtures::blobs_well_placed),
     ("blobs-scattered", fixtures::blobs_scattered),
 ];
@@ -365,7 +367,37 @@ fn readings(rows: u64, read: u64, decoded: u64, copied: u64) -> super::Readings 
         bytes_decoded: decoded,
         bytes_copied: copied,
         elapsed: std::time::Duration::ZERO,
+        scan: None,
     }
+}
+
+#[test]
+fn columnar_scans_verify_every_row_and_report_their_first_batch() -> lsm_tree::Result<()> {
+    // Both scan scenarios check each row against the write history and report
+    // a first batch reached before the whole of what they read: the figures a
+    // streaming scan is measured by are only meaningful if it streams.
+    for (what, f) in [
+        (
+            "one segment",
+            fixtures::columnar_segment as fixtures::FixtureFn,
+        ),
+        ("overlap", fixtures::columnar_overlap),
+    ] {
+        let fixture = build(f)?;
+        let keys = fixture.oracle.rows.len() as u64;
+        let readings =
+            super::Readings::measure_scan(&fixture.tree, keys, || super::scan_columnar(&fixture))?;
+        assert_eq!(readings.rows, keys, "{what}: every row once");
+        let scan = readings.scan.expect("a scan reports its figures");
+        let (_, first) = scan.first_batch.expect("a scan of rows yields a batch");
+        assert!(
+            first < readings.bytes_read,
+            "{what}: the first batch came after {first} B of the {} B the scan read",
+            readings.bytes_read,
+        );
+        assert!(scan.retained > 0, "{what}: the scan held pages");
+    }
+    Ok(())
 }
 
 fn published(readings: &super::Readings) -> Vec<(String, f64, String, Direction)> {

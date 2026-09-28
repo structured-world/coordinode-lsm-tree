@@ -134,6 +134,11 @@ impl Default for ReadBudget {
     }
 }
 
+/// The page bytes a projected columnar scan holds at once unless
+/// [`Config::columnar_scan_budget`] says otherwise: what one read request of
+/// the default [`ReadBudget`] fetches.
+pub const DEFAULT_COLUMNAR_SCAN_BUDGET: u64 = 1 << 20;
+
 /// Per-level filesystem routing entry for tiered storage.
 ///
 /// Maps a range of LSM levels to a base directory and filesystem backend.
@@ -471,6 +476,10 @@ pub struct Config {
     /// How columnar reads of this tree fetch their pages; see [`ReadBudget`].
     pub columnar_read_budget: ReadBudget,
 
+    /// The page bytes one projected columnar scan holds at once, shared by
+    /// the segments it merges; see [`Self::columnar_scan_budget`].
+    pub columnar_scan_budget: u64,
+
     /// Whether to pin index blocks
     pub index_block_pinning_policy: PinningPolicy,
 
@@ -789,6 +798,7 @@ impl Default for Config {
             column_encoding_policy: ColumnEncodingPolicy::default(),
 
             columnar_read_budget: ReadBudget::default(),
+            columnar_scan_budget: DEFAULT_COLUMNAR_SCAN_BUDGET,
 
             index_block_pinning_policy: PinningPolicy::new([true, true, false]),
             filter_block_pinning_policy: PinningPolicy::new([true, false]),
@@ -1827,6 +1837,34 @@ impl Config {
     #[must_use]
     pub fn columnar_read_budget(mut self, budget: ReadBudget) -> Self {
         self.columnar_read_budget = budget;
+        self
+    }
+
+    /// Sets the page bytes a projected columnar scan of this tree holds at
+    /// once. A scan over overlapping segments shares it between them, so a
+    /// scan that merges more of them reads each in smaller runs of row pages
+    /// rather than holding proportionally more. A row page is the least a
+    /// read takes, so one larger than a segment's share is read on its own
+    /// and counted, not refused; so is a row group a pushed-down predicate
+    /// reads whole to select its row pages. A reader setting: the rows returned are the
+    /// same under any budget. The default is [`DEFAULT_COLUMNAR_SCAN_BUDGET`].
+    ///
+    /// # Examples
+    ///
+    /// ```
+    /// use lsm_tree::{Config, SequenceNumberCounter};
+    /// # let folder = tempfile::tempdir()?;
+    /// let config = Config::new(
+    ///     folder.path(),
+    ///     SequenceNumberCounter::default(),
+    ///     SequenceNumberCounter::default(),
+    /// )
+    /// .columnar_scan_budget(256 * 1_024);
+    /// # Ok::<(), Box<dyn std::error::Error>>(())
+    /// ```
+    #[must_use]
+    pub fn columnar_scan_budget(mut self, bytes: u64) -> Self {
+        self.columnar_scan_budget = bytes;
         self
     }
 

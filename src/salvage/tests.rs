@@ -2671,8 +2671,12 @@ fn a_columnar_scan_failing_on_a_later_page_still_counts_its_copies() -> crate::R
     std::fs::write(&source, &bytes)?;
 
     let table = open(source, &fs)?;
+    // The page fails when the scan reads its group, so the scan is drained.
     assert!(
-        table.columnar_scan(&[COL_USER_KEY], None).is_err(),
+        table
+            .columnar_scan(&[COL_USER_KEY], None)
+            .and_then(Iterator::collect::<crate::Result<Vec<_>>>)
+            .is_err(),
         "the forged page fails the scan",
     );
     assert!(
@@ -10026,7 +10030,9 @@ fn salvage_preserves_columnar_value_subcolumns() -> crate::Result<()> {
         recovered.metadata.columnar,
         "the recovered copy stays columnar"
     );
-    let batches = recovered.columnar_scan(&[3], None)?;
+    let batches = recovered
+        .columnar_scan(&[3], None)?
+        .collect::<crate::Result<Vec<_>>>()?;
     let rows: u32 = batches.iter().map(|b| b.row_count).sum();
     assert_eq!(rows, 8, "every row's sub-column is recovered");
     assert!(

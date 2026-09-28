@@ -495,7 +495,7 @@ impl Column {
     /// `Bytes` offset table, and a correctly sized / padded validity bitmap.
     /// `encode` and `decode` both run this so a payload is accepted by one iff
     /// it is accepted by the other.
-    fn validate(&self, row_count: u32) -> Result<()> {
+    pub(crate) fn validate(&self, row_count: u32) -> Result<()> {
         check_layout(self.type_tag, row_count, &self.data)?;
         if let Some(v) = &self.validity {
             check_validity(v, row_count)?;
@@ -1759,6 +1759,19 @@ pub(crate) type NullsAndRange<'a> = (u32, Option<(&'a [u8], &'a [u8])>);
 /// Reads row `i` of a [`TypeTag::Bytes`] column body (offset table + payload),
 /// bounds-checked.
 pub(crate) fn bytes_column_row(data: &[u8], row_count: u32, i: u32) -> Result<&[u8]> {
+    let span = bytes_column_span(data, row_count, i)?;
+    data.get(span)
+        .ok_or(Error::InvalidHeader("columnar: bytes row out of range"))
+}
+
+/// Where row `i` of a [`TypeTag::Bytes`] column body sits in `data`,
+/// bounds-checked: the span [`bytes_column_row`] reads, for a caller that
+/// keeps it to read the row again later.
+pub(crate) fn bytes_column_span(
+    data: &[u8],
+    row_count: u32,
+    i: u32,
+) -> Result<core::ops::Range<usize>> {
     // Called per row on the read paths, so the errors are built only on the
     // branch that returns them.
     let off_bytes = (row_count as usize + 1) * 4;
@@ -1771,12 +1784,12 @@ pub(crate) fn bytes_column_row(data: &[u8], row_count: u32, i: u32) -> Result<&[
     let (Some(start), Some(end)) = (read_off(i), read_off(i + 1)) else {
         return Err(Error::InvalidHeader("columnar: bytes offset truncated"));
     };
-    let Some(payload) = data.get(off_bytes..) else {
+    if off_bytes > data.len() {
         return Err(Error::InvalidHeader("columnar: bytes payload truncated"));
-    };
-    match payload.get(start..end) {
-        Some(row) => Ok(row),
-        None => Err(Error::InvalidHeader("columnar: bytes row out of range")),
+    }
+    match (off_bytes.checked_add(start), off_bytes.checked_add(end)) {
+        (Some(start), Some(end)) if start <= end && end <= data.len() => Ok(start..end),
+        _ => Err(Error::InvalidHeader("columnar: bytes row out of range")),
     }
 }
 

@@ -6737,8 +6737,9 @@ fn delete_bitmap_masks_rows_in_columnar_scan() -> crate::Result<()> {
     let (_, checksum) = writer.finish()?.expect("table written");
 
     let table = recover_test_table(&file, checksum)?;
-    let batches =
-        table.columnar_scan(&[COL_USER_KEY, COL_SEQNO, COL_VALUE_TYPE, COL_VALUE], None)?;
+    let batches = table
+        .columnar_scan(&[COL_USER_KEY, COL_SEQNO, COL_VALUE_TYPE, COL_VALUE], None)?
+        .collect::<crate::Result<Vec<_>>>()?;
 
     let mut got: Vec<Vec<u8>> = Vec::new();
     for batch in &batches {
@@ -6831,8 +6832,9 @@ fn restricted_columnar_scan_skips_punched_prefix_and_masks_sub_bound_rows() -> c
     f.write_all(&vec![0u8; usize::try_from(punch_off).unwrap()])?;
     f.sync_all()?;
 
-    let batches =
-        restricted.columnar_scan(&[COL_USER_KEY, COL_SEQNO, COL_VALUE_TYPE, COL_VALUE], None)?;
+    let batches = restricted
+        .columnar_scan(&[COL_USER_KEY, COL_SEQNO, COL_VALUE_TYPE, COL_VALUE], None)?
+        .collect::<crate::Result<Vec<_>>>()?;
     let mut got: Vec<Vec<u8>> = Vec::new();
     for batch in &batches {
         for entry in column_batch_to_entries(batch)? {
@@ -7231,7 +7233,9 @@ fn delete_bitmap_masks_value_subcolumns_in_point_and_projection_reads() -> crate
 
     // Projection path: a scan over sub-column 3 yields the survivors only, with
     // their fixed bytes; the masked rows never appear.
-    let batches = relocated.columnar_scan(&[3], None)?;
+    let batches = relocated
+        .columnar_scan(&[3], None)?
+        .collect::<crate::Result<Vec<_>>>()?;
     let mut col3 = Vec::new();
     let mut rows = 0u32;
     for b in &batches {
@@ -9240,10 +9244,13 @@ fn a_sparse_predicate_scan_reads_the_directory_its_zones_and_the_matching_pages(
         upper: None,
         apply: PredicateApply::Filter,
     };
+    // Drained to the end: a cursor that yields nothing has read every group
+    // it was going to.
     assert!(
         table
             .columnar_scan(&[COL_USER_KEY, COL_VALUE], Some(&nothing))?
-            .is_empty()
+            .next()
+            .is_none()
     );
     let (index_walked, data_walked) = requested(&metrics);
     assert_eq!(
@@ -9267,7 +9274,9 @@ fn a_sparse_predicate_scan_reads_the_directory_its_zones_and_the_matching_pages(
         apply: PredicateApply::Filter,
     };
     let (index_before, data_before) = requested(&metrics);
-    let batches = table.columnar_scan(&[COL_USER_KEY, COL_VALUE], Some(&predicate))?;
+    let batches = table
+        .columnar_scan(&[COL_USER_KEY, COL_VALUE], Some(&predicate))?
+        .collect::<crate::Result<Vec<_>>>()?;
     let (index_after, data_after) = requested(&metrics);
     assert_eq!(
         batches.iter().map(|b| b.row_count).sum::<u32>(),
@@ -9581,7 +9590,10 @@ fn a_zone_block_moved_to_another_group_is_refused() -> crate::Result<()> {
         upper: Some(zoned_value(last_row)),
         apply: crate::table::columnar_predicate::PredicateApply::Filter,
     };
-    let result = table.columnar_scan(&[COL_USER_KEY, COL_VALUE], Some(&predicate));
+    // The refusal comes from reading the group, so the scan is drained.
+    let result = table
+        .columnar_scan(&[COL_USER_KEY, COL_VALUE], Some(&predicate))
+        .and_then(Iterator::collect::<crate::Result<Vec<_>>>);
     assert!(
         matches!(result, Err(crate::Error::InvalidHeader(_))),
         "a zone block of another group must be refused, got {:?}",
@@ -9669,6 +9681,7 @@ fn a_predicate_scan_over_row_pages_returns_what_filtering_every_row_returns() ->
         };
         let mut got = Vec::new();
         for batch in table.columnar_scan(&[COL_USER_KEY, COL_VALUE], Some(&predicate))? {
+            let batch = batch?;
             let keys = batch
                 .columns
                 .iter()

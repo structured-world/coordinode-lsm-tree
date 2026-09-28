@@ -1079,13 +1079,13 @@ fn key_seqno_value_bytes(keys: core::ops::Range<u32>, value_len: usize) -> u64 {
 
 #[test]
 fn a_merged_columnar_scan_counts_the_seqno_column_it_rewrites() -> lsm_tree::Result<()> {
-    // Overlapping segments carry different seqno offsets, so the merge gathers
-    // the surviving rows and then writes each one's effective seqno into a new
-    // column that replaces the gathered one. That second buffer is a gather of
-    // its own: counting only the first charges every merged seqno once while
-    // it was copied twice. Each segment is one block of one row page, so every
-    // gather of the merge is known: each segment's visible rows, the two
-    // joined once, the surviving rows, and the rewritten seqnos.
+    // Overlapping segments carry different seqno offsets, so the merge writes
+    // each chosen row's effective seqno rather than the stored one. It builds
+    // every output column straight from the source batches its rows sit in,
+    // the seqno column from the effective seqnos, so what it copies is the
+    // output and nothing else: no join of the source batches, no second
+    // buffer for the seqnos. Each segment is one block of one row page, so
+    // every gather of the merge is known.
     let folder = get_tmp_folder();
     let AnyTree::Standard(tree) = Config::new(
         folder.path(),
@@ -1119,14 +1119,11 @@ fn a_merged_columnar_scan_counts_the_seqno_column_it_rewrites() -> lsm_tree::Res
     }
     assert_eq!(rows, 1_500, "the merge yields every key once");
 
-    let first = key_seqno_value_bytes(0..1_000, 32);
-    let second = key_seqno_value_bytes(500..1_500, 32);
-    let both = first + second - 4 * 2;
     assert_eq!(
         m.bytes_copied() - before,
-        first + second + both + returned + 8 * rows,
-        "each segment's rows, the accumulator over both, the surviving rows and \
-         the rewritten seqnos are one gather each",
+        returned,
+        "the merge copies the rows it returns, their effective seqnos included, \
+         and nothing else",
     );
     Ok(())
 }

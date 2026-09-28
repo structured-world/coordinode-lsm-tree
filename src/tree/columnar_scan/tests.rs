@@ -7,7 +7,7 @@ use test_log::test;
 fn empty_scan(metrics: alloc::sync::Arc<crate::Metrics>) -> ColumnarScan {
     ColumnarScan {
         groups: alloc::collections::VecDeque::new(),
-        buffered: alloc::collections::VecDeque::new(),
+        current: None,
         projection: Vec::new(),
         predicate: None,
         support: PredicateSupport::Exact,
@@ -15,6 +15,9 @@ fn empty_scan(metrics: alloc::sync::Arc<crate::Metrics>) -> ColumnarScan {
         seqno: SeqNo::MAX,
         lo: Bound::Unbounded,
         hi: Bound::Unbounded,
+        budget: crate::config::DEFAULT_COLUMNAR_SCAN_BUDGET,
+        peak_payload: core::cell::Cell::new(0),
+        oversized: core::cell::Cell::new(0),
         metrics,
     }
 }

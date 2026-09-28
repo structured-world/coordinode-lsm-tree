@@ -1,4 +1,4 @@
-//! The eight record shapes the mixed-layout work is measured over, each with
+//! The record shapes the mixed-layout work is measured over, each with
 //! the expectation a correct read must satisfy.
 //!
 //! # The oracle is the write history, not a second read
@@ -429,6 +429,80 @@ pub fn columnar_base_row_updates(
         rows[i as usize].expect = Some(value);
     }
     tree.flush_active_memtable(0)?;
+
+    Ok(Fixture {
+        tree,
+        oracle: Oracle { rows },
+        shape: Shape::Opaque,
+        _dir: dir,
+    })
+}
+
+/// One columnar segment of rows with 256-byte values, which a projected scan
+/// streams as it yields.
+pub fn columnar_segment(
+    config: &BenchConfig,
+    seqno: &AtomicU64,
+    base: &Path,
+) -> lsm_tree::Result<Fixture> {
+    columnar_segments(config, seqno, base, 1)
+}
+
+/// The same rows spread over eight flushed columnar segments whose keys
+/// interleave, so all eight form one overlapping group a projected scan merges.
+pub fn columnar_overlap(
+    config: &BenchConfig,
+    seqno: &AtomicU64,
+    base: &Path,
+) -> lsm_tree::Result<Fixture> {
+    columnar_segments(config, seqno, base, 8)
+}
+
+/// Rows with 256-byte values written round-robin into `segments` flushed
+/// columnar segments: key `i` lands in segment `i % segments`.
+fn columnar_segments(
+    config: &BenchConfig,
+    seqno: &AtomicU64,
+    base: &Path,
+    segments: u64,
+) -> lsm_tree::Result<Fixture> {
+    let dir = fixture_dir(base)?;
+    let tree = open(
+        &dir,
+        config,
+        Opening {
+            columnar: true,
+            ..Opening::default()
+        },
+    )?;
+    let n = config.num.min(100_000);
+
+    let rows: Vec<Row> = (0..n)
+        .map(|i| Row {
+            key: key(i),
+            expect: Some(Value {
+                seed: i,
+                len: HEADER_LEN + 224,
+            }),
+            selected: true,
+        })
+        .collect();
+    for segment in 0..segments {
+        for row in rows
+            .iter()
+            .skip(segment as usize)
+            .step_by(segments as usize)
+        {
+            if let Some(value) = row.expect {
+                tree.insert(
+                    row.key.clone(),
+                    value.bytes(),
+                    seqno.fetch_add(1, Ordering::Relaxed),
+                );
+            }
+        }
+        tree.flush_active_memtable(0)?;
+    }
 
     Ok(Fixture {
         tree,
