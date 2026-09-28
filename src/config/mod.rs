@@ -455,10 +455,10 @@ pub struct Config {
     /// Whether to partition filter blocks
     pub filter_block_partitioning_policy: PartitioningPolicy,
 
-    /// Partition size when using partitioned indexes
+    /// Partition size when using partitioned indexes, per level.
     pub index_block_partition_size_policy: BlockSizePolicy,
 
-    /// Partition size when using partitioned filters
+    /// Partition size when using partitioned filters, per level.
     pub filter_block_partition_size_policy: BlockSizePolicy,
 
     /// If `true`, the last level will not build filters, reducing the filter size of a database
@@ -768,8 +768,8 @@ impl Default for Config {
             // sufficient justification on its own.
             filter_block_partitioning_policy: PinningPolicy::new([false, false, false, true]),
 
-            index_block_partition_size_policy: BlockSizePolicy::all(4_096), // TODO: implement
-            filter_block_partition_size_policy: BlockSizePolicy::all(4_096), // TODO: implement
+            index_block_partition_size_policy: BlockSizePolicy::all(4_096),
+            filter_block_partition_size_policy: BlockSizePolicy::all(4_096),
 
             data_block_hash_ratio_policy: HashRatioPolicy::all(0.0),
 

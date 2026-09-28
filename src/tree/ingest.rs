@@ -128,6 +128,16 @@ impl<'a> Ingestion<'a> {
                 .data_block_size_policy
                 .get(INITIAL_CANONICAL_LEVEL),
         )
+        .use_index_partition_size(
+            tree.config
+                .index_block_partition_size_policy
+                .get(INITIAL_CANONICAL_LEVEL),
+        )
+        .use_filter_partition_size(
+            tree.config
+                .filter_block_partition_size_policy
+                .get(INITIAL_CANONICAL_LEVEL),
+        )
         .use_data_block_hash_ratio(
             tree.config
                 .data_block_hash_ratio_policy
