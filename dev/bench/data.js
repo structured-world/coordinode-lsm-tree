@@ -1,5 +1,5 @@
 window.BENCHMARK_DATA = {
-  "lastUpdate": 1790536493459,
+  "lastUpdate": 1790600808527,
   "repoUrl": "https://github.com/structured-world/coordinode-lsm-tree",
   "entries": {
     "lsm-tree db_bench costs": [
@@ -26094,6 +26094,90 @@ window.BENCHMARK_DATA = {
             "value": 339438.53651577345,
             "unit": "ops/sec",
             "extra": "P50: 2.1us | P99: 16.7us | P99.9: 87.0us\nthreads: 1 | elapsed: 0.59s | num: 200000 | iterations: 3"
+          }
+        ]
+      },
+      {
+        "commit": {
+          "author": {
+            "email": "mail@polaz.com",
+            "name": "Dmitry Prudnikov",
+            "username": "polaz"
+          },
+          "committer": {
+            "email": "noreply@github.com",
+            "name": "GitHub",
+            "username": "web-flow"
+          },
+          "distinct": true,
+          "id": "b03be3fa01ccdedefabd1638c07e0f5b2a7245ba",
+          "message": "fix(writer): rotate tables on per-key state, not only data bytes (#728)\n\n## Summary\n\nA table was rotated only when its written data blocks reached the target\nsize. The writer's per-key state (filter hashes, locator triples, index\nentries) and the BuRR builds `finish` runs over it grow with the number\nof keys, not with the table's bytes, so rows that compress well kept one\ntable open for a whole ingestion, flush or compaction, and its memory\ngrew with everything written.\n\n- **Filter and index writers report their state.** Each reports, in O(1)\nfrom running counters, the heap it holds until `finish`, the heap\n`finish` allocates on top while it builds, and the bytes the table gets\nfor it. Index entries are counted at their encoded length, and the\ntop-level index twice: the table writes it at its place and mirrors it\nat the tail. A filter or locator section not built yet is counted by a\nbound from above, not by the predictor that splits partitions: a small\nfilter can build every layer at its floor.\n- **The table writer adds its own.** Locator triples and their build at\n`finish` (hash and value copies, equations, the kept/bumped split, the\nsolver rows by slot), the per-block sections as their entries are\npushed, zone-map bounds included, a compaction's lineage and the meta\nblock encoded from it, and the blocks in flight on the parallel pipeline\n(by their frames in the size, by their payload and frame in the heap).\n`finish` builds the index, then the filter, then the locator, freeing\neach input once built, so the held state is the largest of those phases,\nnot the sum of every build. The tail every table writes is counted from\nthe first key on. The figures are refreshed per data block and every few\nhundred keys within one.\n- **`MultiWriter` rotates on either,** at a key or batch boundary, when\nthe bytes counting what `finish` will append, or the held state, reach\nthe target, and never before a table holds a record.\n- **Range tombstones in a flush are cut per output.** A rotated flush\ncopied every tombstone into every output. Each tombstone is now written\nonce, cut into the zones of the outputs it spans, the first zone open\nbelow the memtable's keys and the last above them, so older tables stay\ncovered; each output counts its share toward a full table. Tombstones\npast the last key are checked at their starts and spread over outputs of\ntombstones alone. Such an output takes its key range from its tombstones\nunder the tree's comparator.\n- An adaptive index frees its buffer when it spills to a partitioned\none, and hands it to the full writer instead of copying it when it does\nnot. The last filter partition takes the hash buffer whole.\n- The adaptive index documentation claimed a partitioned index streams\nto the file; it buffers its partitions until `finish` like the full one,\nand says so now.\n\nRows that compress this well are now cut by their state rather than\ntheir data: 4 M rows of 256-byte constant values make 12 tables of about\n6.7 MB instead of one of 71.8 MB.\n\nBackport to 5.x.x: #729.\n\n## Measurements\n\nOne ingestion of 21-byte keys and 256-byte constant values, lz4, a colon\nprefix extractor (macOS, `/usr/bin/time -l`):\n\n| rows | peak RSS before | after | tables before | after | time before |\nafter |\n|---|---|---|---|---|---|---|\n| 1 M | 195 MB | 78 MB | 1 | 3 | 0.88 s | 0.64 s |\n| 2 M | 380 MB | 77 MB | 1 | 6 | 1.84 s | 1.35 s |\n| 4 M | 747 MB | 100 MB | 1 | 12 | 3.70 s | 2.57 s |\n\nPeak live heap of the whole process at 4 M rows, from a counting\nallocator, against the 64 MiB target: 57.2 MB.\n\nWindows, `db_bench --num 1000000 --iterations 3`, five interleaved\nrounds, medians, taken at an earlier head of this branch (per-key\ncounting since unchanged): fillseq 3.138 → 3.137 M/s, fillrandom 0.786 →\n0.792, overwrite 0.764 → 0.756; two identical binaries differ by up to\n1.7% on these medians.\n\n## Testing\n\n- ingestion of 1 M compressible rows, a flush of 1 M small rows and a\ncompaction of 200 k small rows at a 1 MiB target each write several\ntables within the target (each one table before the fix); 850 k\nincompressible rows stay within the target\n- writer: the size hint lands within 10% of the finished table for full,\npartitioned and locator layouts, under long keys with small blocks and\nwith zone maps on; the tail is counted before the first block; the held\nstate follows the keys, not the value bytes; it counts the locator slots\nof a block not yet cut, the previous prefix hashes, the lineage and its\nmeta encoding, blocks in flight by frame and heap, and both buffers of a\ncompressed and encrypted block\n- filters: every built filter over 1 to 300 keys and up to 100 k, over\neight key sets, stays within the bound; the build peak counts the solver\nrows by slot\n- range tombstones: a flush cuts each tombstone into the outputs it\nspans (the pieces chain to the tombstone, the first and last outputs\nwidened); an output carrying many tombstones ends within its target;\ntombstones past the last key spread over outputs of tombstones alone,\neach written once; tombstones open at the first key do not rotate an\nempty output; an output of tombstones alone orders its range by the\ncomparator; a rotated tree flush keeps an older table's keys deleted on\nboth sides and after reopening\n- fmt, clippy (default and all features), full nextest (default and all\nfeatures), doc tests, `cargo doc` and the no-std check\n\nCloses #722\n\n\n<!-- This is an auto-generated comment: release notes by coderabbit.ai\n-->\n## Summary by CodeRabbit\n\n* **Improvements**\n* Table rotation now accounts for buffered data and range tombstones,\nhelping keep output tables closer to configured size targets during\ningestion, flushes, and compaction.\n* Range tombstones are correctly split and carried across output tables,\npreserving key visibility across table boundaries.\n* Output table key ranges remain disjoint, including when tombstones\nextend beyond the last data key.\n* Flushes with tombstones beyond the last data key can split output\ntables at tombstone boundaries when needed.\n<!-- end of auto-generated comment: release notes by coderabbit.ai -->",
+          "timestamp": "2026-09-28T15:58:50+03:00",
+          "tree_id": "87d49570bd6d7e12fc4a05e96a83f134ea5a17da",
+          "url": "https://github.com/structured-world/coordinode-lsm-tree/commit/b03be3fa01ccdedefabd1638c07e0f5b2a7245ba"
+        },
+        "date": 1790600715775,
+        "tool": "customBiggerIsBetter",
+        "benches": [
+          {
+            "name": "mixed",
+            "value": 33158.29380158819,
+            "unit": "ops/sec",
+            "extra": "P50: 0.5us | P99: 10.4us | P99.9: 20.4us\nthreads: 1 | elapsed: 16.14s | num: 200000 | iterations: 3"
+          },
+          {
+            "name": "fillseq",
+            "value": 2710060.737339233,
+            "unit": "ops/sec",
+            "extra": "P50: 0.2us | P99: 0.8us | P99.9: 1.0us\nthreads: 1 | elapsed: 0.07s | num: 200000 | iterations: 3"
+          },
+          {
+            "name": "fillrandom",
+            "value": 736321.7006003528,
+            "unit": "ops/sec",
+            "extra": "P50: 1.2us | P99: 2.5us | P99.9: 12.3us\nthreads: 1 | elapsed: 0.27s | num: 200000 | iterations: 3"
+          },
+          {
+            "name": "readrandom",
+            "value": 481810.81425191666,
+            "unit": "ops/sec",
+            "extra": "P50: 2.0us | P99: 6.6us | P99.9: 27.4us\nthreads: 1 | elapsed: 0.42s | num: 200000 | iterations: 3"
+          },
+          {
+            "name": "readseq",
+            "value": 2434129.237609059,
+            "unit": "ops/sec",
+            "extra": "P50: 0.2us | P99: 4.6us | P99.9: 6.3us\nthreads: 1 | elapsed: 0.08s | num: 200000 | iterations: 3"
+          },
+          {
+            "name": "seekrandom",
+            "value": 259507.06029245997,
+            "unit": "ops/sec",
+            "extra": "P50: 3.3us | P99: 8.4us | P99.9: 20.6us\nthreads: 1 | elapsed: 0.77s | num: 200000 | iterations: 3"
+          },
+          {
+            "name": "prefixscan",
+            "value": 148793.30987782875,
+            "unit": "ops/sec",
+            "extra": "P50: 6.1us | P99: 13.3us | P99.9: 40.0us\nthreads: 1 | elapsed: 1.34s | num: 200000 | iterations: 3"
+          },
+          {
+            "name": "overwrite",
+            "value": 777729.5615694644,
+            "unit": "ops/sec",
+            "extra": "P50: 1.1us | P99: 2.3us | P99.9: 12.0us\nthreads: 1 | elapsed: 0.26s | num: 200000 | iterations: 3"
+          },
+          {
+            "name": "mergerandom",
+            "value": 739480.2911069172,
+            "unit": "ops/sec",
+            "extra": "P50: 0.5us | P99: 0.7us | P99.9: 5.1us\nthreads: 1 | elapsed: 0.27s | num: 200000 | iterations: 3"
+          },
+          {
+            "name": "readwhilewriting",
+            "value": 358372.1529814173,
+            "unit": "ops/sec",
+            "extra": "P50: 2.2us | P99: 12.1us | P99.9: 91.5us\nthreads: 1 | elapsed: 0.56s | num: 200000 | iterations: 3"
           }
         ]
       }
