@@ -11,6 +11,13 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 
 ## [Unreleased]
 
+## [5.11.8](https://github.com/structured-world/coordinode-lsm-tree/compare/v5.11.7...v5.11.8) - 2026-09-28
+
+### Fixed
+
+- *(config)* wire the partition size policies to the table writers (5.x.x) ([#739](https://github.com/structured-world/coordinode-lsm-tree/pull/739))
+- *(filter)* size 5.x filter partitions by their encoded bytes ([#736](https://github.com/structured-world/coordinode-lsm-tree/pull/736))
+
 ## [5.11.7](https://github.com/structured-world/coordinode-lsm-tree/compare/v5.11.6...v5.11.7) - 2026-09-28
 
 ### Fixed
