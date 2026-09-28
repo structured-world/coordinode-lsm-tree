@@ -114,6 +114,30 @@ fn a_transformed_index_counts_its_framed_copy() -> crate::Result<()> {
     Ok(())
 }
 
+/// The block `finish` encodes is held until the table writes its tail mirror:
+/// the allocation it takes, trailer included, stays within what the writer
+/// counted for it, however the encoding grew.
+#[test]
+fn a_full_index_block_allocation_fits_its_estimate() -> crate::Result<()> {
+    let mut writer: Box<dyn BlockIndexWriter<W>> = Box::new(FullIndexWriter::new());
+    // Enough short handles that a buffer grown by doubling overshoots.
+    for i in 0..1_500 {
+        writer.register_data_block(handle(i))?;
+    }
+    let counted = writer.finish_scratch_bytes();
+    let mut file = crate::sfa::Writer::from_writer(crate::checksum::ChecksummedWriter::new(
+        std::io::Cursor::new(Vec::new()),
+    ));
+    let (_, block) = writer.finish(&mut file)?;
+    assert!(
+        block.capacity() as u64 <= counted,
+        "a {}-byte block in a {}-byte allocation, {counted} counted",
+        block.len(),
+        block.capacity(),
+    );
+    Ok(())
+}
+
 #[test]
 fn a_full_index_counts_its_vector_capacity() -> crate::Result<()> {
     assert_counts_capacity(Box::new(FullIndexWriter::new()))

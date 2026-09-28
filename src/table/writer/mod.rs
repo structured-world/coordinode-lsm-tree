@@ -637,20 +637,22 @@ impl Writer {
         self.finish_metadata_bytes
     }
 
-    /// Bytes a table holding range tombstones alone writes besides its
-    /// tombstone block, bounded from above, with keys of up to `key_len`
-    /// bytes yielding up to `prefixes` filter prefixes: the synthetic
-    /// weak-tombstone block, the index and filter over it, every section the
-    /// writer records it in, the two meta copies and the fixed tail. The
-    /// index and filter are counted in their partitioned layout, which holds
-    /// the single-level one: a partition, the top level and its tail mirror.
+    /// Bytes a table holding range tombstones alone writes, and holds at the
+    /// peak of `finish`, besides its tombstones, bounded from above, with
+    /// keys of up to `key_len` bytes yielding up to `prefixes` filter
+    /// prefixes: the synthetic weak-tombstone block, the index and filter over
+    /// it, every section the writer records it in, the two meta copies and
+    /// the fixed tail. The index and filter are counted in their partitioned
+    /// layout, which holds the single-level one: a partition, the top level
+    /// and its tail mirror. In memory, `finish` builds the filter over the
+    /// sentinel's hashes and encodes each piece before it frames it.
     pub(crate) fn tombstone_only_overhead(
         &self,
         key_len: u64,
         prefixes: usize,
-    ) -> crate::Result<u64> {
+    ) -> crate::Result<(u64, u64)> {
         use crate::table::{
-            block::{BlockType, EccParams, framed_len_bound},
+            block::{BlockType, EccParams, framed_len_bound, transform_scratch_bound},
             zone_map::ColumnStats,
         };
 
@@ -691,7 +693,7 @@ impl Writer {
             .map_or(0, |section| {
                 framed(section as u64, BlockType::Locator, none)
             });
-        Ok(FIXED_TAIL_LEN
+        let written = FIXED_TAIL_LEN
             + 2 * framed_len_bound(
                 meta,
                 BlockType::Meta,
@@ -705,7 +707,17 @@ impl Writer {
             + index
             + seqno_bounds
             + zone_map
-            + locator)
+            + locator;
+        // The sentinel's hashes, the build over them and the filter it makes,
+        // framed; every other piece is encoded before it is framed, which the
+        // written bytes bound twice over.
+        let members = 1 + prefixes;
+        let held = (members * core::mem::size_of::<u64>()) as u64
+            + crate::table::filter::ribbon::burr::builder::build_peak_bytes(members, false) as u64
+            + filter
+            + transform_scratch_bound(filter, BlockType::Filter, none, encryption, self.ecc)
+            + 2 * written;
+        Ok((written, held))
     }
 
     /// Bytes of data the table cuts a block at.

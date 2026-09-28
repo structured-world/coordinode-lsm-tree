@@ -844,6 +844,103 @@ fn a_target_below_the_table_tail_still_fills_a_block() -> crate::Result<()> {
     Ok(())
 }
 
+/// An output of tombstones alone carries its synthetic table, which closing
+/// it does not shed. With a target below that table, the outputs past the
+/// last key still take a block's worth of tombstones each, by their bytes or
+/// the entries they hold, not one tombstone each.
+#[test]
+fn outputs_of_tombstones_alone_below_their_fixed_table_fill_a_block() -> crate::Result<()> {
+    use crate::{UserKey, range_tombstone::RangeTombstone};
+
+    const TOMBSTONES: usize = 300;
+    let tombstones: Vec<_> = (0..TOMBSTONES)
+        .map(|i| {
+            let prefix = format!("z{i:08}").into_bytes();
+            let mut start = prefix.clone();
+            start.push(0);
+            let mut end = prefix;
+            end.push(1);
+            RangeTombstone::new(
+                UserKey::from(random_bound(2 * i, start)),
+                UserKey::from(random_bound(2 * i + 1, end)),
+                5,
+            )
+        })
+        .collect();
+    let (_folder, tables) = flush_outputs(4_096, &[b"a"], tombstones)?;
+    // A block's worth of these entries in memory is several of them. The
+    // first output holds the record, the last whatever is left.
+    let alone = tables
+        .get(1..tables.len().saturating_sub(1))
+        .unwrap_or_default();
+    assert!(!alone.is_empty(), "the tombstones must spread over outputs");
+    for table in alone {
+        assert!(
+            table.range_tombstones().len() >= 4,
+            "an output of {} tombstones among {} outputs",
+            table.range_tombstones().len(),
+            tables.len(),
+        );
+    }
+    Ok(())
+}
+
+/// An output of tombstones alone builds the filter over its sentinel at
+/// `finish`: with an extractor yielding every prefix of a long bound, that
+/// build takes a good part of the target, so such outputs close on fewer
+/// tombstones than without it.
+#[test]
+fn outputs_of_tombstones_alone_count_their_sentinel_filter_build() -> crate::Result<()> {
+    use crate::{InternalValue, UserKey, fs::StdFs, range_tombstone::RangeTombstone};
+    use std::sync::Arc;
+
+    const LEN: usize = 4_000;
+    let target =
+        2 * crate::table::filter::ribbon::burr::builder::build_peak_bytes(LEN + 1, false) as u64;
+    let outputs = |extractor: Option<Arc<dyn crate::prefix::PrefixExtractor>>| {
+        let folder = tempfile::tempdir()?;
+        let fs: Arc<dyn crate::fs::Fs> = Arc::new(StdFs);
+        let mut mw = super::MultiWriter::new(
+            folder.path().to_path_buf(),
+            SequenceNumberCounter::default(),
+            target,
+            1,
+            fs,
+        )?
+        .use_prefix_extractor(extractor);
+        mw.set_range_tombstones(
+            (0..64)
+                .map(|i| {
+                    let prefix = format!("z{i:08}").into_bytes();
+                    let mut start = prefix.clone();
+                    start.push(0);
+                    let mut end = prefix;
+                    end.push(1);
+                    RangeTombstone::new(
+                        UserKey::from(random_bound_of(2 * i, start, LEN)),
+                        UserKey::from(random_bound_of(2 * i + 1, end, LEN)),
+                        5,
+                    )
+                })
+                .collect(),
+        );
+        mw.write(InternalValue::from_components(
+            UserKey::from(b"a" as &[u8]),
+            b"v".to_vec(),
+            1,
+            crate::ValueType::Value,
+        ))?;
+        crate::Result::Ok(mw.finish()?.len())
+    };
+    let plain = outputs(None)?;
+    let with_prefixes = outputs(Some(Arc::new(AllPrefixes)))?;
+    assert!(
+        2 * with_prefixes >= 3 * plain,
+        "{with_prefixes} outputs with the prefixes, {plain} without",
+    );
+    Ok(())
+}
+
 /// Every byte prefix of a key is a token.
 struct AllPrefixes;
 
