@@ -11,9 +11,13 @@
 //! ## What a job costs to coordinate
 //!
 //! A worker is reached through a token task spawned on the executor, and a
-//! token does not run one job: it keeps taking jobs from the shared queue until
-//! the queue is empty, then exits. At most `concurrency` tokens are live, so a
-//! stream of jobs costs one spawn per worker that joins in, not one per job.
+//! token does not run one job: it keeps taking jobs from the shared queue, and
+//! when the queue is empty it parks briefly for the next one before it exits.
+//! A submit wakes a parked token before it spawns a new one. At most
+//! `concurrency` tokens are live, so a stream of jobs costs one spawn per
+//! worker that joins in, not one per job, and a worker is not handed back to
+//! the executor (whose idle threads spin before they sleep) between two jobs
+//! of the same table.
 //! A finished result goes into a ring of `capacity` slots indexed by its
 //! sequence number, so publishing and taking it neither allocates nor searches.
 //! A worker publishes its result and claims its next job under one lock.

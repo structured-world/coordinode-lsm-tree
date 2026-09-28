@@ -6,10 +6,11 @@
 //! median wall time of the flush and the median CPU time of the whole process
 //! during it (the workers included), each per MiB of rows written.
 //!
-//! Cases: data block size 4 KiB and 64 KiB, codec lz4, zstd 1 and zstd 19, one
+//! Cases: data block size 4 KiB and 64 KiB by default, codec lz4, zstd 1 and zstd 19, one
 //! thread (the serial path) and four. Environment knobs:
 //!
 //! - `BP_BLOCKS`: data blocks per flush.
+//! - `BP_BLOCK_SIZES`: comma-separated data block sizes in bytes.
 //! - `BP_REPS`: flushes per case; the median is reported.
 //! - `BP_FILTER`: run only the cases whose label contains this text.
 //! - `BP_INLINE`: comma-separated inline thresholds to sweep for the parallel
@@ -78,11 +79,8 @@ struct Case {
 impl Case {
     fn label(&self) -> String {
         format!(
-            "b{}k/{}/t{}/inline_{}",
-            self.block / 1024,
-            self.codec.0,
-            self.threads,
-            self.inline_label
+            "b{}/{}/t{}/inline_{}",
+            self.block, self.codec.0, self.threads, self.inline_label
         )
     }
 }
@@ -139,7 +137,12 @@ fn main() {
         ("zstd19", CompressionType::zstd(19).expect("level")),
     ];
     let mut cases = Vec::new();
-    for block in [4 * 1024, 64 * 1024] {
+    let block_sizes: Vec<u32> = std::env::var("BP_BLOCK_SIZES")
+        .unwrap_or_else(|_| "4096,65536".into())
+        .split(',')
+        .map(|v| v.trim().parse().expect("a block size"))
+        .collect();
+    for &block in &block_sizes {
         for codec in codecs {
             cases.push(Case {
                 block,
