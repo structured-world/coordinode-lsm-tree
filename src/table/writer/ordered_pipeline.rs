@@ -328,9 +328,17 @@ impl<J: OrderedJob> OrderedPipeline<J> {
 }
 
 impl<J: OrderedJob> Drop for OrderedPipeline<J> {
+    /// Releases parked tokens and abandons the jobs still queued: nobody will
+    /// take their results, so no worker should spend a pool thread on them.
     fn drop(&mut self) {
-        self.shared.lock().closed = true;
+        let abandoned = {
+            let mut state = self.shared.lock();
+            state.closed = true;
+            core::mem::take(&mut state.queue)
+        };
         self.shared.queued.notify_all();
+        // Outside the lock: a job's own drop never runs under it.
+        drop(abandoned);
     }
 }
 

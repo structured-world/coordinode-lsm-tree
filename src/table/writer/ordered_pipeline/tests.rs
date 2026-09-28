@@ -257,6 +257,29 @@ fn dropping_the_pipeline_releases_a_parked_token_at_once() {
 }
 
 #[test]
+fn dropping_the_pipeline_abandons_the_jobs_still_queued() {
+    // A writer that stops early (an error mid-table) drops its pipeline with
+    // jobs still queued; nobody will take their results, so a token that
+    // starts afterwards must not run them on a shared pool thread.
+    let spawner = Arc::new(DeferredSpawner::default());
+    let mut pipeline = OrderedPipeline::new(spawner.clone(), (), 2, 4);
+    let (done_tx, done_rx) = mpsc::channel();
+    for value in 0..3 {
+        pipeline.submit(Echo {
+            value,
+            wait: None,
+            done: Some(done_tx.clone()),
+        });
+    }
+    drop(pipeline);
+    spawner.run_all();
+    assert!(
+        done_rx.try_recv().is_err(),
+        "a job queued before the drop ran after it",
+    );
+}
+
+#[test]
 fn a_token_on_the_writer_thread_never_parks() {
     // Only the writer queues jobs, so a token running on its thread would
     // wait for a job that cannot come; it exits at once instead.
