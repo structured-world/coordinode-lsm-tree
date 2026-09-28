@@ -402,7 +402,9 @@ required-features = ["zstd"]
 name = "block_pipeline"
 harness = false
 path = "benches/block_pipeline.rs"
-required-features = ["lz4", "zstd"]
+# `parallel` builds the worker pool the four-thread cases measure;
+# `encryption` and `page_ecc` back the transform cases.
+required-features = ["parallel", "lz4", "zstd", "encryption", "page_ecc"]
 
 [[bench]]
 name = "flush"
