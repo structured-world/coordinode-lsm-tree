@@ -34,6 +34,9 @@ pub(super) struct TombstoneShare {
     fixed: u64,
     /// Entries of the current output, one per tombstone piece.
     pieces: u64,
+    /// Length of the longest bound among the current output's pieces except
+    /// the ends still open, which the key the output closes at bounds.
+    longest: u64,
 }
 
 impl TombstoneShare {
@@ -44,6 +47,7 @@ impl TombstoneShare {
             next_start: 0,
             fixed: 0,
             pieces: 0,
+            longest: 0,
         }
     }
 
@@ -60,6 +64,7 @@ impl TombstoneShare {
             && comparator.compare(&tombstone.end, key) != Ordering::Greater
         {
             self.fixed += tombstone.end.len() as u64;
+            self.longest = self.longest.max(tombstone.end.len() as u64);
             pop(&mut self.open, tombstones, comparator);
         }
     }
@@ -88,6 +93,7 @@ impl TombstoneShare {
         {
             self.fixed += ENTRY_OVERHEAD + tombstone.start.len() as u64;
             self.pieces += 1;
+            self.longest = self.longest.max(tombstone.start.len() as u64);
             push(&mut self.open, self.next_start, tombstones, comparator);
             self.next_start += 1;
         }
@@ -98,6 +104,7 @@ impl TombstoneShare {
     pub(super) fn open_output(&mut self, lower: &[u8]) {
         self.fixed = self.open.len() as u64 * (ENTRY_OVERHEAD + lower.len() as u64);
         self.pieces = self.open.len() as u64;
+        self.longest = lower.len() as u64;
     }
 
     /// Bytes the current output's entries take if it closes at `key`, the key
@@ -109,6 +116,13 @@ impl TombstoneShare {
     /// Entries the current output holds.
     pub(super) fn pieces(&self) -> u64 {
         self.pieces
+    }
+
+    /// Length of the longest bound among the current output's pieces if it
+    /// closes at `key`, the key last advanced to: its key range widens to
+    /// them.
+    pub(super) fn longest_bound(&self, key: &[u8]) -> u64 {
+        self.longest.max(key.len() as u64)
     }
 
     /// Tombstones open at the key last advanced to: the entries an output
@@ -123,23 +137,23 @@ impl TombstoneShare {
         self.open.len() as u64 * (ENTRY_OVERHEAD + 2 * key.len() as u64)
     }
 
-    /// Bytes and entries of the pending tombstones starting at `key`, whole.
+    /// Bytes, entries and the longest end of the pending tombstones starting
+    /// at `key`, whole.
     pub(super) fn group(
         &self,
         tombstones: &[RangeTombstone],
         key: &[u8],
         comparator: &dyn UserComparator,
-    ) -> (u64, u64) {
+    ) -> Group {
         tombstones
             .get(self.next_start..)
             .unwrap_or_default()
             .iter()
             .take_while(|rt| comparator.compare(&rt.start, key) == Ordering::Equal)
-            .fold((0, 0), |(bytes, entries), rt| {
-                (
-                    bytes + ENTRY_OVERHEAD + (rt.start.len() + rt.end.len()) as u64,
-                    entries + 1,
-                )
+            .fold(Group::default(), |group, rt| Group {
+                bytes: group.bytes + ENTRY_OVERHEAD + (rt.start.len() + rt.end.len()) as u64,
+                entries: group.entries + 1,
+                longest: group.longest.max(rt.end.len() as u64),
             })
     }
 
@@ -169,6 +183,17 @@ impl TombstoneShare {
     fn tracked(&self) -> usize {
         self.open.capacity()
     }
+}
+
+/// The pending tombstones starting at one key, whole.
+#[derive(Clone, Copy, Default)]
+pub(super) struct Group {
+    /// Bytes their block entries take.
+    pub(super) bytes: u64,
+    /// Their count.
+    pub(super) entries: u64,
+    /// Length of the longest end among them.
+    pub(super) longest: u64,
 }
 
 /// Whether tombstone `a` ends before tombstone `b`.

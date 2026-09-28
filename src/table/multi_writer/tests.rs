@@ -1192,6 +1192,106 @@ fn tombstones_open_at_the_first_key_do_not_rotate_an_empty_output() -> crate::Re
     Ok(())
 }
 
+/// Tombstones starting at a compaction's last key follow no later key whose
+/// check would count them: the check at that key counts them, since they go
+/// where the key goes, so they do not land on an output already near its
+/// target.
+#[test]
+fn a_compaction_counts_the_tombstones_starting_at_its_last_key() -> crate::Result<()> {
+    use crate::{InternalValue, UserKey, fs::StdFs, range_tombstone::RangeTombstone};
+    use std::sync::Arc;
+
+    const TARGET: u64 = 32 * 1_024;
+    let folder = tempfile::tempdir()?;
+    let base_path = folder.path().to_path_buf();
+    let fs: Arc<dyn crate::fs::Fs> = Arc::new(StdFs);
+    let mut mw = super::MultiWriter::new(
+        base_path.clone(),
+        SequenceNumberCounter::default(),
+        TARGET,
+        1,
+        fs,
+    )?
+    .use_clip_range_tombstones();
+    // Clipped to the last key, each piece is a short block entry; a thousand
+    // of them do not fit beside the keys before.
+    mw.set_range_tombstones(
+        (0..1_000)
+            .map(|i| {
+                RangeTombstone::new(
+                    UserKey::from(b"m" as &[u8]),
+                    UserKey::from(random_bound(i, b"m\x01".to_vec())),
+                    20,
+                )
+            })
+            .collect(),
+    );
+    let keys = (0..70).map(|i| format!("a{i:03}").into_bytes());
+    for (i, key) in keys.chain([b"m".to_vec()]).enumerate() {
+        mw.write(InternalValue::from_components(
+            UserKey::from(key),
+            random_bound_of(10_000 + i, Vec::new(), 250),
+            1,
+            crate::ValueType::Value,
+        ))?;
+    }
+    let tables = recover_outputs(&base_path, &mw.finish()?)?;
+    for table in &tables {
+        let file_size = std::fs::metadata(base_path.join(table.id().to_string()))?.len();
+        assert!(
+            file_size <= TARGET + 4 * 1_024,
+            "output of {file_size} bytes with {} tombstones overran the {TARGET}-byte target",
+            table.range_tombstones().len(),
+        );
+    }
+    Ok(())
+}
+
+/// A flush widens an output's key range to the tombstone pieces it writes, and
+/// the meta block holds that range twice: an output whose tombstone reaches
+/// below its first key with a long start counts the widened meta.
+#[test]
+fn a_flush_output_counts_its_key_range_widened_by_tombstones() -> crate::Result<()> {
+    use crate::{UserKey, range_tombstone::RangeTombstone};
+
+    const TARGET: u64 = 256 * 1_024;
+    let tombstone = RangeTombstone::new(
+        UserKey::from(random_bound_of(1, b"0".to_vec(), 30_000)),
+        UserKey::from(b"a" as &[u8]),
+        5,
+    );
+    let folder = tempfile::tempdir()?;
+    let base_path = folder.path().to_path_buf();
+    let fs: std::sync::Arc<dyn crate::fs::Fs> = std::sync::Arc::new(crate::fs::StdFs);
+    let mut mw = super::MultiWriter::new(
+        base_path.clone(),
+        SequenceNumberCounter::default(),
+        TARGET,
+        1,
+        fs,
+    )?;
+    mw.set_range_tombstones(vec![tombstone]);
+    for i in 0..2_000 {
+        mw.write(crate::InternalValue::from_components(
+            UserKey::from(format!("a{i:05}").into_bytes()),
+            random_bound_of(10_000 + i, Vec::new(), 250),
+            1,
+            crate::ValueType::Value,
+        ))?;
+    }
+    let tables = recover_outputs(&base_path, &mw.finish()?)?;
+    assert!(tables.len() > 1, "the keys must spread over outputs");
+    for table in &tables {
+        let file_size = std::fs::metadata(base_path.join(table.id().to_string()))?.len();
+        assert!(
+            file_size <= TARGET + 8 * 1_024,
+            "output of {file_size} bytes spanning {} bytes of keys overran the {TARGET}-byte target",
+            table.metadata.key_range.min().len() + table.metadata.key_range.max().len(),
+        );
+    }
+    Ok(())
+}
+
 /// A flush output's share of the range tombstones counts toward a full table,
 /// so an output carrying many of them still ends near its target.
 #[test]
