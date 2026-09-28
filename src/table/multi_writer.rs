@@ -357,6 +357,9 @@ impl MultiWriter {
     }
 
     /// Writes range tombstones to the given writer, respecting the clip mode.
+    /// `tombstones`, in order by start, are those that can overlap the table's
+    /// zone (see [`tombstone_share::TombstoneShare::zone`]), so a run of many
+    /// outputs visits each tombstone in the outputs it spans only.
     ///
     /// - **clip=true** (compaction): intersect each RT with the table's
     ///   "responsibility range".  For intermediate tables (rotation)
@@ -368,8 +371,8 @@ impl MultiWriter {
     ///   (`None` for the first output) to `clip_upper` (`None` for the last),
     ///   so the outputs together hold every RT once and still cover keys in
     ///   older SSTs outside this memtable's key range.
-    fn write_rts_to_writer(
-        tombstones: &[RangeTombstone],
+    fn write_rts_to_writer<'t>(
+        tombstones: impl IntoIterator<Item = &'t RangeTombstone>,
         clip: bool,
         writer: &mut Writer,
         lower: Option<&UserKey>,
@@ -516,8 +519,8 @@ impl MultiWriter {
     /// as an inclusive upper bound over-approximates but does not lose entries.
     ///
     /// Returns the coverage of the pieces written, under `comparator`.
-    fn write_zone_cut(
-        tombstones: &[RangeTombstone],
+    fn write_zone_cut<'t>(
+        tombstones: impl IntoIterator<Item = &'t RangeTombstone>,
         writer: &mut Writer,
         lower: Option<&UserKey>,
         upper: Option<&UserKey>,
@@ -914,10 +917,10 @@ impl MultiWriter {
 
         // Write range tombstones to the finishing writer, cut to its zone:
         // up to current_key, the first key of the NEW table, so the gap
-        // between tables stays covered.
+        // between tables stays covered. The share has advanced to that key.
         if !self.range_tombstones.is_empty() {
             Self::write_rts_to_writer(
-                &self.range_tombstones,
+                self.tombstone_share.zone(&self.range_tombstones, false),
                 self.clip_range_tombstones,
                 &mut old_writer,
                 self.output_lower.as_ref(),
@@ -1161,16 +1164,18 @@ impl MultiWriter {
         if self.table_full() {
             self.rotate()?;
         }
-        let comparator = self.comparator.clone();
-        let last = self.writer.write_columnar_batch(batch, &comparator)?;
+        // A batch lands whole, so the output's base is what it held before
+        // it: closing after the batch sheds all of the batch's state.
         self.note_output_base();
-        Ok(last)
+        let comparator = self.comparator.clone();
+        self.writer.write_columnar_batch(batch, &comparator)
     }
 
-    /// Records what the current output carries at its first record: the state
-    /// its writer holds and the tombstones carried into it.
+    /// Records what the current output carries at its first record, or before
+    /// its first batch: the state its writer holds and the tombstones carried
+    /// into it.
     fn note_output_base(&mut self) {
-        if self.output_base.is_none() && self.writer.meta.key_count > 0 {
+        if self.output_base.is_none() {
             let (tombstones, pieces, _) = self.tombstones_at_key();
             let tombstones_held = if tombstones == 0 {
                 0
@@ -1321,7 +1326,7 @@ impl MultiWriter {
         // under clipping, and leaves the flush zone open above.
         if !self.range_tombstones.is_empty() {
             Self::write_rts_to_writer(
-                &self.range_tombstones,
+                self.tombstone_share.zone(&self.range_tombstones, true),
                 self.clip_range_tombstones,
                 &mut self.writer,
                 self.output_lower.as_ref(),
