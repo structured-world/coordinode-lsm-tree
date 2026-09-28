@@ -1197,6 +1197,46 @@ fn a_table_of_tombstones_alone_covers_them_without_a_given_range() -> crate::Res
     Ok(())
 }
 
+/// Every byte prefix of a key is a token.
+struct AllPrefixes;
+
+impl crate::prefix::PrefixExtractor for AllPrefixes {
+    fn prefixes<'a>(&self, key: &'a [u8]) -> Box<dyn Iterator<Item = &'a [u8]> + 'a> {
+        Box::new((1..=key.len()).filter_map(|end| key.get(..end)))
+    }
+}
+
+/// A prefix extractor can register thousands of hashes per key, so the
+/// filter's state grows far faster than one hash a key: the estimates follow
+/// that growth between the refreshes the key count sets.
+#[test]
+fn the_estimates_follow_a_filter_growing_by_many_hashes_a_key() -> crate::Result<()> {
+    const KEYS: u8 = 20;
+    const LEN: usize = 5_000;
+    let dir = tempfile::tempdir()?;
+    let mut writer = Writer::new(dir.path().join("1"), 1, 0, Arc::new(StdFs))?
+        .use_data_block_size(1 << 20)
+        .use_prefix_extractor(Some(Arc::new(AllPrefixes)));
+    for i in 0..KEYS {
+        // Keys differ in their first byte, so no prefix repeats.
+        let mut key = alloc::vec![i];
+        key.resize(LEN, 0x5a);
+        writer.write(InternalValue::from_components(
+            key,
+            b"v".to_vec(),
+            0,
+            ValueType::Value,
+        ))?;
+    }
+    let hashes = u64::from(KEYS) * LEN as u64 * core::mem::size_of::<u64>() as u64;
+    assert!(
+        writer.held_state_bytes() >= hashes,
+        "held {} for {hashes} bytes of prefix hashes",
+        writer.held_state_bytes(),
+    );
+    Ok(())
+}
+
 /// A block that outgrows explicit slot widths drops the locator only when it
 /// is cut; until then its triples stay allocated and are held.
 #[test]

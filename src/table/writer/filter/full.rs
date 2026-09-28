@@ -109,7 +109,8 @@ impl<W: crate::io::Write + crate::io::Seek> FilterWriter<W> for FullFilterWriter
         self
     }
 
-    fn register_key(&mut self, key: &UserKey) -> crate::Result<()> {
+    fn register_key(&mut self, key: &UserKey) -> crate::Result<usize> {
+        let before = self.bloom_hash_buffer.len();
         self.bloom_hash_buffer.push(crate::hash::hash64(key));
 
         // A prefix the previous key had at the same position is a repeat and
@@ -133,7 +134,7 @@ impl<W: crate::io::Write + crate::io::Seek> FilterWriter<W> for FullFilterWriter
             }
         }
 
-        Ok(())
+        Ok(self.bloom_hash_buffer.len() - before)
     }
 
     fn held_bytes(&self) -> u64 {

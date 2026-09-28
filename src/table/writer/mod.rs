@@ -101,6 +101,10 @@ const FIXED_TAIL_LEN: u64 =
 const REFRESH_KEY_STEP: u64 = 256;
 const REFRESH_KEY_FRACTION: u64 = 64;
 
+/// Filter hashes a key may register, on average, before their count alone
+/// refreshes the estimates sooner than the key count does.
+const REFRESH_HASH_STEP_KEYS: u64 = 8;
+
 /// Bytes the `linked_blob_files` section takes for `count` linked blob files:
 /// the count, then each file's id, entry count, bytes and on-disk bytes.
 #[must_use]
@@ -318,6 +322,12 @@ pub struct Writer {
     /// Key count at which the estimates are refreshed between blocks, so the
     /// per-key state a large block gathers is counted before it completes.
     next_refresh_keys: u64,
+
+    /// Hashes registered in the filter, and the count at which the estimates
+    /// are refreshed too: a prefix extractor registers many hashes a key, far
+    /// more than the key count paces. Without one they equal the key count.
+    filter_hashes: u64,
+    next_refresh_hashes: u64,
 
     initial_level: u8,
 
@@ -653,6 +663,8 @@ impl Writer {
             zone_map_bytes: 0,
             meta_base_len: None,
             next_refresh_keys: 0,
+            filter_hashes: 0,
+            next_refresh_hashes: 0,
 
             #[cfg(feature = "columnar")]
             last_group_tag: None,
@@ -1209,6 +1221,12 @@ impl Writer {
 
         let keys = self.meta.key_count as u64;
         self.next_refresh_keys = keys + REFRESH_KEY_STEP.max(keys / REFRESH_KEY_FRACTION);
+        // The same fraction in hashes, from a step that leaves room for a few
+        // tokens a key, so an extractor yielding a handful never refreshes on
+        // them alone and one yielding thousands does within a key.
+        let hashes = self.filter_hashes;
+        self.next_refresh_hashes =
+            hashes + (REFRESH_HASH_STEP_KEYS * REFRESH_KEY_STEP).max(hashes / REFRESH_KEY_FRACTION);
     }
 
     /// Enables parallel block compression on this writer using `spawner` to run
@@ -1919,7 +1937,7 @@ impl Writer {
             // of the same key
 
             if self.bloom_policy.is_active() {
-                self.filter_writer.register_key(user_key)?;
+                self.filter_hashes += self.filter_writer.register_key(user_key)? as u64;
             }
 
             // Retrieval-ribbon locator: record this key's newest version (its
@@ -1945,8 +1963,11 @@ impl Writer {
             }
 
             // The per-key state grows between blocks too; see
-            // `REFRESH_KEY_STEP`.
-            if self.meta.key_count as u64 >= self.next_refresh_keys {
+            // `REFRESH_KEY_STEP`. A prefix extractor grows the filter by many
+            // hashes a key, so its state paces the refresh as well.
+            if self.meta.key_count as u64 >= self.next_refresh_keys
+                || self.filter_hashes >= self.next_refresh_hashes
+            {
                 self.refresh_state_estimates();
             }
         }
@@ -2938,7 +2959,7 @@ impl Writer {
                 self.meta.key_count += 1;
                 self.current_key = Some(user_key.clone());
                 if self.bloom_policy.is_active() {
-                    self.filter_writer.register_key(user_key)?;
+                    self.filter_hashes += self.filter_writer.register_key(user_key)? as u64;
                 }
                 if let Some(spec) = self.locator {
                     // `row` is this key's item index within the forming block;
