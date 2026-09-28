@@ -40,6 +40,10 @@ pub struct MultiWriter {
 
     data_block_size: u32,
 
+    index_partition_size: u32,
+
+    filter_partition_size: u32,
+
     row_group_size: u32,
 
     columnar_page_size: u32,
@@ -254,6 +258,10 @@ impl MultiWriter {
             data_block_hash_ratio: 0.0,
 
             data_block_size: 4_096,
+
+            index_partition_size: 4_096,
+
+            filter_partition_size: 4_096,
 
             row_group_size: crate::config::DEFAULT_COLUMNAR_ROW_GROUP_SIZE,
 
@@ -630,6 +638,24 @@ impl MultiWriter {
         self
     }
 
+    /// Sets the size a partitioned block index cuts its partitions at; see
+    /// [`Writer::use_index_partition_size`].
+    #[must_use]
+    pub(crate) fn use_index_partition_size(mut self, size: u32) -> Self {
+        self.index_partition_size = size;
+        self.writer = self.writer.use_index_partition_size(size);
+        self
+    }
+
+    /// Sets the size a partitioned filter cuts its partitions at; see
+    /// [`Writer::use_filter_partition_size`].
+    #[must_use]
+    pub(crate) fn use_filter_partition_size(mut self, size: u32) -> Self {
+        self.filter_partition_size = size;
+        self.writer = self.writer.use_filter_partition_size(size);
+        self
+    }
+
     /// Sets the size a columnar table's row groups are cut at; see
     /// [`Writer::use_row_group_size`].
     #[must_use]
@@ -889,6 +915,8 @@ impl MultiWriter {
             .use_data_block_compression(self.data_block_compression)
             .use_index_block_compression(self.index_block_compression)
             .use_data_block_size(self.data_block_size)
+            .use_index_partition_size(self.index_partition_size)
+            .use_filter_partition_size(self.filter_partition_size)
             .use_row_group_size(self.row_group_size)
             .use_columnar_page_size(self.columnar_page_size)
             .use_column_encoding(self.column_encoding)
