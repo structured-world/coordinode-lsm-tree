@@ -725,7 +725,10 @@ fn a_prefix_shared_by_every_key_is_built_once() -> crate::Result<()> {
 
 /// Every table ends with sections `finish` always writes: two copies of the
 /// meta block, the version byte, the 4 KiB separator between them, the table
-/// of contents and the trailer. A table of a few keys is mostly these.
+/// of contents and the trailer. A table of a few keys is mostly these. The
+/// hint is not below the table, and above it by the 10% the other estimates
+/// allow plus the filter's bound: a small filter is counted as if it built
+/// every layer.
 #[test]
 fn the_size_hint_counts_the_tail_every_table_writes() -> crate::Result<()> {
     for key_len in [8, 1_000] {
@@ -733,7 +736,14 @@ fn the_size_hint_counts_the_tail_every_table_writes() -> crate::Result<()> {
         let path = dir.path().join("1");
         let mut writer = Writer::new(path.clone(), 1, 0, Arc::new(StdFs))?;
         write_long_keys(&mut writer, 3, key_len)?;
-        assert_hint_matches_the_table(writer, &path)?;
+        let hint = writer.output_size_hint();
+        writer.finish()?;
+        let size = std::fs::metadata(&path)?.len();
+        let slack = crate::config::BloomConstructionPolicy::default().filter_size_bound(3) as u64;
+        assert!(
+            hint >= size && hint * 10 <= size * 11 + slack * 10,
+            "hint {hint} for a {size}-byte table, filter slack {slack}",
+        );
     }
     Ok(())
 }

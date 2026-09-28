@@ -98,6 +98,13 @@ impl PartitionedFilterWriter {
         }
     }
 
+    /// The open partition's filter bytes, bounded from above: what `finish`
+    /// builds it into. The prediction that splits partitions is not a bound.
+    fn open_partition_bound(&self) -> u64 {
+        self.bloom_policy
+            .filter_size_bound(self.bloom_hash_buffer.len()) as u64
+    }
+
     /// Builds the open partition from `hashes`, taken out of
     /// `bloom_hash_buffer` by the caller.
     fn spill_filter_partition(&mut self, key: &UserKey, hashes: Vec<u64>) -> crate::Result<()> {
@@ -346,8 +353,9 @@ impl<W: crate::io::Write + crate::io::Seek> FilterWriter<W> for PartitionedFilte
                 self.bloom_hash_buffer.len(),
                 false,
             ) as u64;
+            let filter = self.open_partition_bound();
             let frame = framed_len_bound(
-                self.approx_filter_size as u64,
+                filter,
                 BlockType::Filter,
                 CompressionType::None,
                 encryption,
@@ -360,7 +368,7 @@ impl<W: crate::io::Write + crate::io::Seek> FilterWriter<W> for PartitionedFilte
             } else {
                 0
             };
-            build + self.approx_filter_size as u64 + frame + growth
+            build + filter + frame + growth
         };
         // Then the top-level index, counted at its in-memory size, and its
         // framed copy.
@@ -387,7 +395,7 @@ impl<W: crate::io::Write + crate::io::Seek> FilterWriter<W> for PartitionedFilte
         let (open, tli) = match &self.last_key {
             Some(last) if !self.bloom_hash_buffer.is_empty() => (
                 framed_len_bound(
-                    self.approx_filter_size as u64,
+                    self.open_partition_bound(),
                     BlockType::Filter,
                     CompressionType::None,
                     encryption,

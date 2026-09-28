@@ -112,9 +112,10 @@ pub fn section_widths(spec: LocatorSpec, max_block: u64, max_slot: u64) -> Optio
     (block_fits && slot_fits && r != 0 && r <= 64).then_some((block_id_bits, slot_bits))
 }
 
-/// Bytes a section over `n` keys will take: its header and a retrieval ribbon
-/// `r` bits per key, `r` chosen by [`section_widths`] from the largest block id
-/// and slot recorded so far. `None` when the section will be skipped.
+/// Bytes a section over `n` keys will take, bounded from above: its header and
+/// a retrieval ribbon `r` bits per key, `r` chosen by [`section_widths`] from
+/// the largest block id and slot recorded so far. `None` when the section will
+/// be skipped.
 #[must_use]
 pub fn section_size_estimate(
     n: usize,
@@ -126,8 +127,7 @@ pub fn section_size_estimate(
     let r = block_id_bits + slot_bits;
     Some(
         SECTION_HEADER_LEN
-            + crate::config::BloomConstructionPolicy::BitsPerKey(f32::from(r))
-                .estimated_filter_size(n),
+            + crate::config::BloomConstructionPolicy::BitsPerKey(f32::from(r)).filter_size_bound(n),
     )
 }
 

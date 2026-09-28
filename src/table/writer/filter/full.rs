@@ -149,7 +149,7 @@ impl<W: crate::io::Write + crate::io::Seek> FilterWriter<W> for FullFilterWriter
         // second buffer.
         let n = self.bloom_hash_buffer.len();
         let build = crate::table::filter::ribbon::burr::builder::build_peak_bytes(n, false);
-        let filter = self.bloom_policy.estimated_filter_size(n) as u64;
+        let filter = self.bloom_policy.filter_size_bound(n) as u64;
         build as u64
             + filter
             + crate::table::block::transform_scratch_bound(
@@ -169,7 +169,7 @@ impl<W: crate::io::Write + crate::io::Seek> FilterWriter<W> for FullFilterWriter
         // so this counts them before the dedup: an estimate from above.
         crate::table::block::framed_len_bound(
             self.bloom_policy
-                .estimated_filter_size(self.bloom_hash_buffer.len()) as u64,
+                .filter_size_bound(self.bloom_hash_buffer.len()) as u64,
             crate::table::block::BlockType::Filter,
             CompressionType::None,
             self.encryption.as_deref(),
