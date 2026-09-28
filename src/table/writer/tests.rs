@@ -971,6 +971,36 @@ fn blocks_in_flight_are_counted_by_their_frames() -> crate::Result<()> {
     Ok(())
 }
 
+/// Blocks in flight on the parallel pipeline hold their encoded payload and
+/// then their frame until they are written: the held state counts them.
+#[cfg(feature = "parallel")]
+#[test]
+fn blocks_in_flight_count_toward_the_held_state() -> crate::Result<()> {
+    let dir = tempfile::tempdir()?;
+    let spawner = Arc::new(super::RayonSpawner::with_threads(4)?);
+    let mut writer = Writer::new(dir.path().join("1"), 1, 0, Arc::new(StdFs))?
+        .use_data_block_compression(crate::CompressionType::None)
+        .use_parallel_compression(spawner, 4);
+    for block in 0..3u32 {
+        for i in 0..10u32 {
+            writer.write(InternalValue::from_components(
+                format!("key{block}{i:02}").into_bytes(),
+                vec![7u8; 1_000],
+                0,
+                ValueType::Value,
+            ))?;
+        }
+        writer.spill_block()?;
+    }
+    assert_eq!(*writer.meta.file_pos, 0, "all three blocks are in flight");
+    assert!(
+        writer.held_state_bytes() >= 3 * 10 * 1_000,
+        "{} held with three 10 KB blocks in flight",
+        writer.held_state_bytes(),
+    );
+    Ok(())
+}
+
 /// Only a key's newest version gets a locator entry, so blocks holding older
 /// versions alone add no block id. Explicit widths that fit every recorded id
 /// keep the locator however many such blocks follow.

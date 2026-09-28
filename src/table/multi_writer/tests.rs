@@ -715,6 +715,71 @@ fn a_flush_splits_its_tombstones_past_the_last_key() -> crate::Result<()> {
     Ok(())
 }
 
+/// An output of tombstones alone takes its key range from them in the
+/// comparator's order, not in byte order: under a reversed comparator the
+/// byte-wise least start and greatest end leave the ends of the range out.
+#[test]
+fn an_output_of_tombstones_alone_orders_its_range_by_the_comparator() -> crate::Result<()> {
+    use crate::{UserKey, fs::StdFs, range_tombstone::RangeTombstone};
+    use std::sync::Arc;
+
+    #[derive(Debug)]
+    struct ReverseComparator;
+    impl crate::comparator::UserComparator for ReverseComparator {
+        fn name(&self) -> &'static str {
+            "reverse-test"
+        }
+        fn compare(&self, a: &[u8], b: &[u8]) -> core::cmp::Ordering {
+            b.cmp(a)
+        }
+        fn is_lexicographic(&self) -> bool {
+            false
+        }
+    }
+
+    let folder = tempfile::tempdir()?;
+    let base_path = folder.path().to_path_buf();
+    let fs: Arc<dyn crate::fs::Fs> = Arc::new(StdFs);
+    let comparator: crate::SharedComparator = Arc::new(ReverseComparator);
+    let mut mw = super::MultiWriter::new(
+        base_path.clone(),
+        SequenceNumberCounter::default(),
+        u64::MAX,
+        1,
+        fs,
+    )?
+    .set_comparator(comparator.clone());
+    // In reverse order "z" < "y" < "m" < "a".
+    mw.set_range_tombstones(vec![
+        RangeTombstone::new(
+            UserKey::from(b"z" as &[u8]),
+            UserKey::from(b"m" as &[u8]),
+            5,
+        ),
+        RangeTombstone::new(
+            UserKey::from(b"y" as &[u8]),
+            UserKey::from(b"a" as &[u8]),
+            6,
+        ),
+    ]);
+    let results = mw.finish()?;
+    let cache = Arc::new(crate::Cache::with_capacity_bytes(64 * 1_024));
+    for (table_id, checksum) in &results {
+        let table = crate::Table::recover(crate::table::RecoverParams::new(
+            base_path.join(table_id.to_string()),
+            *checksum,
+            *table_id,
+            Arc::new(StdFs),
+            comparator.clone(),
+            cache.clone(),
+        ))?;
+        assert_eq!(table.metadata.key_range.min().as_ref(), b"z");
+        assert_eq!(table.metadata.key_range.max().as_ref(), b"a");
+    }
+    assert_eq!(results.len(), 1);
+    Ok(())
+}
+
 /// Tombstones open at the first key can fill a small target before any record
 /// reaches the writer; the writer still takes that record, so no output holds
 /// tombstones alone, written whole past the clip, over its neighbours' keys.

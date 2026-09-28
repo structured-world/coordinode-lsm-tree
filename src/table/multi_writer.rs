@@ -457,15 +457,45 @@ impl MultiWriter {
             } else {
                 Self::write_zone_cut(tombstones, writer, lower, clip_upper, comparator);
             }
-        } else if clip {
-            // A compaction with no KV items at all: one output, tombstones whole.
-            for rt in tombstones {
-                writer.write_range_tombstone(rt.clone());
-            }
         } else {
-            // A flush output of tombstones alone: its key range is taken from
-            // the pieces it holds.
-            Self::write_zone_cut(tombstones, writer, lower, clip_upper, comparator);
+            // An output of tombstones alone takes its key range from them, in
+            // the comparator's order: a compaction with no KV items at all
+            // writes them whole, a flush cuts them to the output's zone.
+            let coverage = if clip {
+                let mut coverage = None;
+                for rt in tombstones {
+                    Self::widen_coverage(&mut coverage, &rt.start, &rt.end, comparator);
+                    writer.write_range_tombstone(rt.clone());
+                }
+                coverage
+            } else {
+                Self::write_zone_cut(tombstones, writer, lower, clip_upper, comparator)
+            };
+            if let Some((start, end)) = coverage {
+                writer.cover_range_tombstones(start, end);
+            }
+        }
+    }
+
+    /// Widens `coverage` to hold `start..end` under `comparator`.
+    fn widen_coverage(
+        coverage: &mut Option<(UserKey, UserKey)>,
+        start: &UserKey,
+        end: &UserKey,
+        comparator: &dyn crate::comparator::UserComparator,
+    ) {
+        use core::cmp::Ordering;
+
+        match coverage {
+            None => *coverage = Some((start.clone(), end.clone())),
+            Some((least, greatest)) => {
+                if comparator.compare(start, least) == Ordering::Less {
+                    *least = start.clone();
+                }
+                if comparator.compare(end, greatest) == Ordering::Greater {
+                    *greatest = end.clone();
+                }
+            }
         }
     }
 
@@ -481,15 +511,18 @@ impl MultiWriter {
     /// this table. Flush outputs are separate L0 runs, which may overlap, so the
     /// widening may reach the next output's first key. Using the exclusive end
     /// as an inclusive upper bound over-approximates but does not lose entries.
+    ///
+    /// Returns the coverage of the pieces written, under `comparator`.
     fn write_zone_cut(
         tombstones: &[RangeTombstone],
         writer: &mut Writer,
         lower: Option<&UserKey>,
         upper: Option<&UserKey>,
         comparator: &dyn crate::comparator::UserComparator,
-    ) {
+    ) -> Option<(UserKey, UserKey)> {
         use core::cmp::Ordering;
 
+        let mut coverage = None;
         for rt in tombstones {
             let start = match lower {
                 Some(lower) if comparator.compare(&rt.start, lower) == Ordering::Less => lower,
@@ -512,8 +545,10 @@ impl MultiWriter {
             {
                 *existing = end.clone();
             }
+            Self::widen_coverage(&mut coverage, start, end, comparator);
             writer.write_range_tombstone(RangeTombstone::new(start.clone(), end.clone(), rt.seqno));
         }
+        coverage
     }
 
     pub fn register_blob(&mut self, indirection: BlobIndirection) {
