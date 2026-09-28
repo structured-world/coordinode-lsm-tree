@@ -171,6 +171,8 @@ pub(super) fn prepare_table_writer(
         .use_index_block_restart_interval(index_block_restart_interval)
         .use_data_block_compression(data_block_compression)
         .use_data_block_size(data_block_size)
+        .use_index_partition_size(opts.config.index_block_partition_size_policy.get(dst_lvl))
+        .use_filter_partition_size(opts.config.filter_block_partition_size_policy.get(dst_lvl))
         .use_row_group_size(opts.config.columnar_row_group_size_policy.get(dst_lvl))
         .use_columnar_page_size(opts.config.columnar_page_size_policy.get(dst_lvl))
         // What this writer writes. A merge-on-read relocation writes nothing

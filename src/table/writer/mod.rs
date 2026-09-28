@@ -160,7 +160,11 @@ pub struct Writer {
     data_block_restart_interval: u8,
     index_block_restart_interval: u8,
 
-    meta_partition_size: u32,
+    /// Size a partitioned block index cuts its partitions at.
+    index_partition_size: u32,
+
+    /// Size a partitioned filter cuts its partitions at.
+    filter_partition_size: u32,
 
     data_block_size: u32,
 
@@ -623,7 +627,8 @@ impl Writer {
 
             data_block_hash_ratio: 0.0,
 
-            meta_partition_size: 4_096,
+            index_partition_size: 4_096,
+            filter_partition_size: 4_096,
 
             data_block_size: 4_096,
 
@@ -1283,7 +1288,7 @@ impl Writer {
         self.assert_not_started("partitioned filter");
         let filter_writer = Box::new(filter::PartitionedFilterWriter::new(self.bloom_policy))
             .use_tli_compression(self.index_block_compression)
-            .use_partition_size(self.meta_partition_size)
+            .use_partition_size(self.filter_partition_size)
             .set_prefix_extractor(self.prefix_extractor.clone())
             .use_encryption(self.encryption.clone())
             .use_table_id(self.table_id);
@@ -1300,7 +1305,7 @@ impl Writer {
         self.assert_not_started("partitioned index");
         let index_writer = Box::new(index::PartitionedIndexWriter::new())
             .use_compression(self.index_block_compression)
-            .use_partition_size(self.meta_partition_size)
+            .use_partition_size(self.index_partition_size)
             .use_restart_interval(self.index_block_restart_interval)
             .use_encryption(self.encryption.clone())
             .use_table_id(self.table_id)
@@ -1317,14 +1322,14 @@ impl Writer {
     /// Size-adaptive index: single-level until the index exceeds
     /// `spill_threshold` bytes, then a streaming two-level (partitioned)
     /// index. See [`index::AdaptiveIndexWriter`]. The per-bottom-partition
-    /// size (once spilled) is `meta_partition_size`, matching
+    /// size (once spilled) is the index partition size, matching
     /// [`Self::use_partitioned_index`].
     #[must_use]
     pub fn use_adaptive_index(mut self, spill_threshold: u64) -> Self {
         self.assert_not_started("adaptive index");
         let index_writer = Box::new(index::AdaptiveIndexWriter::new(spill_threshold))
             .use_compression(self.index_block_compression)
-            .use_partition_size(self.meta_partition_size)
+            .use_partition_size(self.index_partition_size)
             .use_restart_interval(self.index_block_restart_interval)
             .use_encryption(self.encryption.clone())
             .use_table_id(self.table_id)
@@ -1421,14 +1426,50 @@ impl Writer {
         self
     }
 
+    /// Sets the partition size of both the partitioned block index and the
+    /// partitioned filter; see [`Self::use_index_partition_size`] and
+    /// [`Self::use_filter_partition_size`] to set them apart.
+    ///
+    /// # Panics
+    ///
+    /// Panics when `size` exceeds 4 MiB.
     #[must_use]
-    pub fn use_meta_partition_size(mut self, size: u32) -> Self {
+    pub fn use_meta_partition_size(self, size: u32) -> Self {
+        self.use_index_partition_size(size)
+            .use_filter_partition_size(size)
+    }
+
+    /// Sets the size a partitioned block index cuts its partitions at. Takes
+    /// effect whether the index is made partitioned before or after.
+    ///
+    /// # Panics
+    ///
+    /// Panics when `size` exceeds 4 MiB.
+    #[must_use]
+    pub fn use_index_partition_size(mut self, size: u32) -> Self {
         assert!(
             size <= crate::config::MAX_BLOCK_SIZE,
-            "meta partition size must be <= 4 MiB",
+            "index partition size must be <= 4 MiB",
         );
-        self.meta_partition_size = size;
+        self.index_partition_size = size;
         self.index_writer = self.index_writer.use_partition_size(size);
+        self
+    }
+
+    /// Sets the size a partitioned filter cuts its partitions at, in the bytes
+    /// a partition takes on disk. Takes effect whether the filter is made
+    /// partitioned before or after.
+    ///
+    /// # Panics
+    ///
+    /// Panics when `size` exceeds 4 MiB.
+    #[must_use]
+    pub fn use_filter_partition_size(mut self, size: u32) -> Self {
+        assert!(
+            size <= crate::config::MAX_BLOCK_SIZE,
+            "filter partition size must be <= 4 MiB",
+        );
+        self.filter_partition_size = size;
         self.filter_writer = self.filter_writer.use_partition_size(size);
         self
     }

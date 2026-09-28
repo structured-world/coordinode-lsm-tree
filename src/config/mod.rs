@@ -492,10 +492,12 @@ pub struct Config {
     /// Whether to partition filter blocks
     pub filter_block_partitioning_policy: PartitioningPolicy,
 
-    /// Partition size when using partitioned indexes
+    /// Partition size when using partitioned indexes, per level; see
+    /// [`Self::index_block_partition_size_policy`].
     pub index_block_partition_size_policy: BlockSizePolicy,
 
-    /// Partition size when using partitioned filters
+    /// Partition size when using partitioned filters, per level; see
+    /// [`Self::filter_block_partition_size_policy`].
     pub filter_block_partition_size_policy: BlockSizePolicy,
 
     /// If `true`, the last level will not build filters, reducing the filter size of a database
@@ -813,8 +815,8 @@ impl Default for Config {
             // sufficient justification on its own.
             filter_block_partitioning_policy: PinningPolicy::new([false, false, false, true]),
 
-            index_block_partition_size_policy: BlockSizePolicy::all(4_096), // TODO: implement
-            filter_block_partition_size_policy: BlockSizePolicy::all(4_096), // TODO: implement
+            index_block_partition_size_policy: BlockSizePolicy::all(4_096),
+            filter_block_partition_size_policy: BlockSizePolicy::all(4_096),
 
             data_block_hash_ratio_policy: HashRatioPolicy::all(0.0),
 
@@ -1657,6 +1659,55 @@ impl Config {
     #[must_use]
     pub fn data_block_size_policy(mut self, policy: BlockSizePolicy) -> Self {
         self.data_block_size_policy = policy;
+        self
+    }
+
+    /// Sets the size a partitioned block index cuts its partitions at, per
+    /// level. Applies where [`Self::index_block_partitioning_policy`]
+    /// partitions the index. The default is 4 KiB at every level.
+    ///
+    /// # Examples
+    ///
+    /// ```
+    /// use lsm_tree::{Config, SequenceNumberCounter, config::BlockSizePolicy};
+    /// # let folder = tempfile::tempdir()?;
+    /// let config = Config::new(
+    ///     folder.path(),
+    ///     SequenceNumberCounter::default(),
+    ///     SequenceNumberCounter::default(),
+    /// )
+    /// .index_block_partition_size_policy(BlockSizePolicy::all(16 * 1_024));
+    /// # Ok::<(), Box<dyn std::error::Error>>(())
+    /// ```
+    #[must_use]
+    pub fn index_block_partition_size_policy(mut self, policy: BlockSizePolicy) -> Self {
+        self.index_block_partition_size_policy = policy;
+        self
+    }
+
+    /// Sets the size a partitioned filter cuts its partitions at, per level,
+    /// in the bytes a partition takes on disk. Applies where
+    /// [`Self::filter_block_partitioning_policy`] partitions the filter. A
+    /// point read that misses the block cache loads one partition, so a
+    /// smaller partition costs less per read and more top-level index
+    /// entries. The default is 4 KiB at every level.
+    ///
+    /// # Examples
+    ///
+    /// ```
+    /// use lsm_tree::{Config, SequenceNumberCounter, config::BlockSizePolicy};
+    /// # let folder = tempfile::tempdir()?;
+    /// let config = Config::new(
+    ///     folder.path(),
+    ///     SequenceNumberCounter::default(),
+    ///     SequenceNumberCounter::default(),
+    /// )
+    /// .filter_block_partition_size_policy(BlockSizePolicy::all(16 * 1_024));
+    /// # Ok::<(), Box<dyn std::error::Error>>(())
+    /// ```
+    #[must_use]
+    pub fn filter_block_partition_size_policy(mut self, policy: BlockSizePolicy) -> Self {
+        self.filter_block_partition_size_policy = policy;
         self
     }
 
