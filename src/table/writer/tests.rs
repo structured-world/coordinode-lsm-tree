@@ -1163,6 +1163,40 @@ fn a_locator_too_narrow_for_the_table_stops_holding_state() -> crate::Result<()>
     Ok(())
 }
 
+/// A table of range tombstones alone whose caller gave no coverage takes its
+/// key range from the tombstones in byte order: the least start and the
+/// greatest end, whatever order they were written in.
+#[test]
+fn a_table_of_tombstones_alone_covers_them_without_a_given_range() -> crate::Result<()> {
+    use crate::range_tombstone::RangeTombstone;
+
+    let dir = tempfile::tempdir()?;
+    let path = dir.path().join("1");
+    let mut writer = Writer::new(path.clone(), 1, 0, Arc::new(StdFs))?;
+    for (start, end) in [(b"c", b"d"), (b"a", b"b"), (b"b", b"z")] {
+        writer.write_range_tombstone(RangeTombstone::new(
+            UserKey::from(start as &[u8]),
+            UserKey::from(end as &[u8]),
+            3,
+        ));
+    }
+    let Some((id, checksum)) = writer.finish()? else {
+        panic!("a table of tombstones alone is written");
+    };
+    let table = crate::Table::recover(crate::table::RecoverParams::new(
+        path,
+        checksum,
+        id,
+        Arc::new(StdFs),
+        crate::comparator::default_comparator(),
+        Arc::new(crate::Cache::with_capacity_bytes(64 * 1_024)),
+    ))?;
+    assert_eq!(table.metadata.key_range.min().as_ref(), b"a");
+    assert_eq!(table.metadata.key_range.max().as_ref(), b"z");
+    assert_eq!(table.range_tombstones().len(), 3);
+    Ok(())
+}
+
 /// A block that outgrows explicit slot widths drops the locator only when it
 /// is cut; until then its triples stay allocated and are held.
 #[test]

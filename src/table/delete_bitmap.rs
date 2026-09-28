@@ -226,15 +226,12 @@ impl DeleteBitmap {
     pub fn insert(&mut self, row: u32) -> bool {
         let (chunk, off) = split(row);
         match self.chunks.binary_search_by_key(&chunk, |(c, _)| *c) {
-            Ok(pos) => {
-                let Some((_, container)) = self.chunks.get_mut(pos) else {
-                    return false;
-                };
+            Ok(pos) => self.chunks.get_mut(pos).is_some_and(|(_, container)| {
                 let before = container.encoded_len();
                 let added = container.insert(off);
                 self.chunks_encoded = self.chunks_encoded - before + container.encoded_len();
                 added
-            }
+            }),
             Err(pos) => {
                 let container = Container::Sparse(alloc::vec![off]);
                 self.chunks_encoded += chunk_encoded_len(&container);

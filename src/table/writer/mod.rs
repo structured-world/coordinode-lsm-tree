@@ -758,11 +758,7 @@ impl Writer {
         };
         // An entry holds its key besides a few varints, a seqno and a type.
         let entry = key_len + 32;
-        let base = match self.meta_base_len {
-            Some(base) => base,
-            None => self.meta_payload_len_without_keys()?,
-        };
-        let meta = base + 2 * key_len + 4;
+        let meta = self.meta_payload_len_without_keys()? + 2 * key_len + 4;
         let index = framed(entry, BlockType::Index, self.index_block_compression);
         let filter = self.bloom_policy.filter_size_bound(1 + prefixes) as u64;
         let seqno_bounds = if self.use_seqno_in_index {
@@ -881,10 +877,12 @@ impl Writer {
         self.locator_block_id += 1;
         // Positions only grow within a block and block ids across blocks, so
         // the last triple carries the largest block id recorded and its
-        // block's largest slot. A block of older versions alone records none.
-        let Some(&(_, max_block, slot)) = self.locators.last() else {
-            return;
-        };
+        // block's largest slot. A block of older versions alone records none;
+        // before any triple, block and slot 0 fit every width.
+        let (max_block, slot) = self
+            .locators
+            .last()
+            .map_or((0, 0), |&(_, block, slot)| (block, slot));
         let slot_grew = slot > self.locator_max_slot;
         self.locator_max_slot = self.locator_max_slot.max(slot);
         // Widths the table has outgrown stay outgrown: the section would be
@@ -1901,9 +1899,7 @@ impl Writer {
             // before its first block is written still counts it.
             if self.meta.first_key.is_none() {
                 self.meta.first_key = Some(user_key.clone());
-                if self.meta_base_len.is_none() {
-                    self.meta_base_len = Some(self.meta_payload_len_without_keys()?);
-                }
+                self.meta_base_len = Some(self.meta_payload_len_without_keys()?);
             }
 
             // IMPORTANT: Do not buffer *every* item's key

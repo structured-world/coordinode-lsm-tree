@@ -491,7 +491,8 @@ impl MultiWriter {
         }
     }
 
-    /// Widens `coverage` to hold `start..end` under `comparator`.
+    /// Widens `coverage` to hold `start..end` under `comparator`. The pieces
+    /// arrive in the order of their starts, so the first start is the least.
     fn widen_coverage(
         coverage: &mut Option<(UserKey, UserKey)>,
         start: &UserKey,
@@ -503,9 +504,7 @@ impl MultiWriter {
         match coverage {
             None => *coverage = Some((start.clone(), end.clone())),
             Some((least, greatest)) => {
-                if comparator.compare(start, least) == Ordering::Less {
-                    *least = start.clone();
-                }
+                debug_assert_ne!(comparator.compare(start, least), Ordering::Less);
                 if comparator.compare(end, greatest) == Ordering::Greater {
                     *greatest = end.clone();
                 }
@@ -1225,6 +1224,10 @@ impl MultiWriter {
                 .max()
                 .unwrap_or(0)
         });
+        // An output of tombstones alone writes a synthetic table around them,
+        // which its writer, holding no record, does not count yet. Every
+        // output is configured alike, so the table is the same for each.
+        let alone_overhead = self.writer.tombstone_only_overhead(longest, prefixes)?;
         loop {
             let tombstones = &self.range_tombstones;
             let share = &self.tombstone_share;
@@ -1247,10 +1250,8 @@ impl MultiWriter {
             let group =
                 self.tombstone_share
                     .group(&self.range_tombstones, &point, comparator.as_ref());
-            // An output of tombstones alone writes a synthetic table around
-            // them, which its writer, holding no record, does not count yet.
             let overhead = if self.writer.meta.key_count == 0 {
-                self.writer.tombstone_only_overhead(longest, prefixes)?
+                alone_overhead
             } else {
                 0
             };

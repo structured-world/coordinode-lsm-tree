@@ -203,10 +203,10 @@ fn ends_before(
     b: usize,
     comparator: &dyn UserComparator,
 ) -> bool {
-    match (tombstones.get(a), tombstones.get(b)) {
-        (Some(a), Some(b)) => comparator.compare(&a.end, &b.end) == Ordering::Less,
-        _ => false,
-    }
+    tombstones
+        .get(a)
+        .zip(tombstones.get(b))
+        .is_some_and(|(a, b)| comparator.compare(&a.end, &b.end) == Ordering::Less)
 }
 
 fn push(
@@ -230,10 +230,8 @@ fn push(
 }
 
 fn pop(heap: &mut Vec<usize>, tombstones: &[RangeTombstone], comparator: &dyn UserComparator) {
-    let Some(last) = heap.pop() else {
-        return;
-    };
-    let Some(root) = heap.first_mut() else {
+    // The last entry replaces the root, unless it was the root.
+    let (Some(last), Some(root)) = (heap.pop(), heap.first_mut()) else {
         return;
     };
     *root = last;
