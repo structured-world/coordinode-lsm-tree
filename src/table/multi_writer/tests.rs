@@ -803,6 +803,46 @@ fn a_flush_splits_its_tombstones_past_the_last_key() -> crate::Result<()> {
     Ok(())
 }
 
+/// Every table carries its tail, and closing a table does not shed it: a
+/// target below the tail and a block still gives tables of a block each, not
+/// of one key each.
+#[test]
+fn a_target_below_the_table_tail_still_fills_a_block() -> crate::Result<()> {
+    use crate::{InternalValue, UserKey, fs::StdFs};
+    use std::sync::Arc;
+
+    const KEYS: u32 = 4_000;
+    let folder = tempfile::tempdir()?;
+    let fs: Arc<dyn crate::fs::Fs> = Arc::new(StdFs);
+    let mut mw = super::MultiWriter::new(
+        folder.path().to_path_buf(),
+        SequenceNumberCounter::default(),
+        4_096,
+        1,
+        fs,
+    )?;
+    let mut bytes = 0;
+    for i in 0..KEYS {
+        let key = format!("key{i:06}").into_bytes();
+        let value = random_bound_of(i as usize, Vec::new(), 24);
+        bytes += key.len() + value.len();
+        mw.write(InternalValue::from_components(
+            UserKey::from(key),
+            value,
+            1,
+            crate::ValueType::Value,
+        ))?;
+    }
+    let tables = mw.finish()?.len();
+    // A 4 KiB block each, and a partial one at the end.
+    let blocks = bytes / 4_096 + 1;
+    assert!(
+        tables <= blocks,
+        "{tables} tables for {KEYS} keys in {blocks} blocks",
+    );
+    Ok(())
+}
+
 /// Every byte prefix of a key is a token.
 struct AllPrefixes;
 

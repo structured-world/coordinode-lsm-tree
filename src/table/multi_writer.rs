@@ -98,6 +98,11 @@ pub struct MultiWriter {
     /// The bytes of the current output's share of the range tombstones.
     tombstone_share: tombstone_share::TombstoneShare,
 
+    /// The current output's held state at its first record: what every
+    /// output carries, which closing one does not shed. `None` until the
+    /// output takes a record.
+    output_base: Option<u64>,
+
     /// Level the tables are written to
     initial_level: u8,
 
@@ -278,6 +283,7 @@ impl MultiWriter {
             clip_range_tombstones: false,
             output_lower: None,
             tombstone_share: tombstone_share::TombstoneShare::new(),
+            output_base: None,
 
             prefix_extractor: None,
 
@@ -871,6 +877,7 @@ impl MultiWriter {
     /// Flushes the current writer, stores its metadata, and sets up a new writer for the next table
     fn rotate(&mut self) -> crate::Result<()> {
         log::debug!("Rotating table writer");
+        self.output_base = None;
 
         let new_table_id = self.table_id_generator.next();
         let path = self.base_path.join(new_table_id.to_string());
@@ -1050,8 +1057,19 @@ impl MultiWriter {
             * (core::mem::size_of::<(BlobFileId, LinkedFile)>()
                 + 1
                 + core::mem::size_of::<LinkedFile>()) as u64;
-        self.writer.output_size_hint() + overhead + linked + tombstone_block >= self.target_size
-            || self.writer.held_state_bytes() + tombstones_held + linked_held >= self.target_size
+        // Closing a table sheds none of its metadata or of the state it held
+        // at its first record, which the next table carries alike. By size it
+        // closes only once it holds data or tombstones; by state, once it
+        // holds a block's worth past its first record. Otherwise a target
+        // below what every table carries would close one on every key.
+        let size_hint = self.writer.output_size_hint();
+        let holds_content =
+            size_hint > self.writer.finish_metadata_bytes() || tombstone_block > 0 || overhead > 0;
+        let held_target = self.output_base.map_or(self.target_size, |held| {
+            self.target_size.max(held + self.writer.block_len())
+        });
+        (holds_content && size_hint + overhead + linked + tombstone_block >= self.target_size)
+            || self.writer.held_state_bytes() + tombstones_held + linked_held >= held_target
     }
 
     /// Closing the current table at `key` sheds what it holds: the next one
@@ -1125,6 +1143,7 @@ impl MultiWriter {
         }
 
         self.writer.write(item)?;
+        self.note_output_base();
 
         // The transform-attribution milestone: verdicts ticked up to a
         // record that actually LANDED belong to the output holding it (see
@@ -1149,7 +1168,16 @@ impl MultiWriter {
             self.rotate()?;
         }
         let comparator = self.comparator.clone();
-        self.writer.write_columnar_batch(batch, &comparator)
+        let last = self.writer.write_columnar_batch(batch, &comparator)?;
+        self.note_output_base();
+        Ok(last)
+    }
+
+    /// Records what the current output carries at its first record.
+    fn note_output_base(&mut self) {
+        if self.output_base.is_none() && self.writer.meta.key_count > 0 {
+            self.output_base = Some(self.writer.held_state_bytes());
+        }
     }
 
     /// Validates a columnar batch against the ingest contract without writing,

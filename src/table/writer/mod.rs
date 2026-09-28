@@ -729,6 +729,11 @@ impl Writer {
         data + self.finish_metadata_bytes
     }
 
+    /// The part of [`Self::output_size_hint`] that `finish` appends.
+    pub(crate) fn finish_metadata_bytes(&self) -> u64 {
+        self.finish_metadata_bytes
+    }
+
     /// Bytes a table holding range tombstones alone writes besides its
     /// tombstone block, bounded from above, with keys of up to `key_len`
     /// bytes yielding up to `prefixes` filter prefixes: the synthetic
@@ -802,6 +807,16 @@ impl Writer {
             + seqno_bounds
             + zone_map
             + locator)
+    }
+
+    /// Bytes of data the table cuts a block at: a row group's for a columnar
+    /// table, a data block's otherwise.
+    pub(crate) fn block_len(&self) -> u64 {
+        u64::from(if self.use_columnar {
+            self.row_group_size
+        } else {
+            self.data_block_size
+        })
     }
 
     /// Bytes the table writes and holds on top of its estimates if range
