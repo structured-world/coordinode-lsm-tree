@@ -20,6 +20,12 @@ use alloc::{boxed::Box, vec::Vec};
 
 use super::handles_held;
 
+/// Bytes an index block takes whose entries encode to at most `entries`
+/// bytes: the entries and the block's trailer.
+const fn block_len(entries: usize) -> usize {
+    entries + crate::table::block::TRAILER_LEN
+}
+
 pub trait BlockIndexWriter<W: crate::io::Write + crate::io::Seek> {
     /// Registers a data block in the block index.
     fn register_data_block(&mut self, block_handle: KeyedBlockHandle) -> crate::Result<()>;

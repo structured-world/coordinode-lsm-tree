@@ -22,6 +22,10 @@ const TRAILER_SIZE: usize = 5 * core::mem::size_of::<u32>()
     + core::mem::size_of::<u8>()
     + core::mem::size_of::<u32>();
 
+/// Bytes a block ends with past its entries and its binary and hash indexes:
+/// the start marker and the fixed trailer.
+pub const TRAILER_LEN: usize = 1 + TRAILER_SIZE;
+
 /// Block trailer
 ///
 /// ## Format

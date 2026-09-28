@@ -95,15 +95,23 @@ impl PartitionedIndexWriter {
     /// The top-level index's encoded bytes once `finish` cuts the open
     /// partition, which adds an entry under its last key.
     fn tli_at_finish(&self) -> usize {
-        self.data_block_handles
+        let entries = self
+            .data_block_handles
             .last()
             .map_or(self.tli_encoded, |last| {
                 self.tli_encoded + last.encoded_len_bound_unplaced()
-            })
+            });
+        if entries == 0 {
+            0
+        } else {
+            super::block_len(entries)
+        }
     }
 
     fn cut_index_block(&mut self) -> crate::Result<()> {
-        let mut bytes = vec![];
+        // Sized to the bound the estimates charge, so the block never grows
+        // past it.
+        let mut bytes = Vec::with_capacity(super::block_len(self.open_encoded));
         IndexBlock::encode_into_with_restart_interval(
             &mut bytes,
             &self.data_block_handles,
@@ -197,7 +205,7 @@ impl PartitionedIndexWriter {
             item.shift(index_base_offset);
         }
 
-        let mut bytes = vec![];
+        let mut bytes = Vec::with_capacity(super::block_len(self.tli_encoded));
         IndexBlock::encode_into_with_restart_interval(
             &mut bytes,
             &self.tli_handles,
@@ -360,8 +368,9 @@ impl<W: crate::io::Write + crate::io::Seek> BlockIndexWriter<W> for PartitionedI
         let open = if self.data_block_handles.is_empty() {
             0
         } else {
+            let open = super::block_len(self.open_encoded) as u64;
             let frame = framed_len_bound(
-                self.open_encoded as u64,
+                open,
                 BlockType::Index,
                 self.compression,
                 self.encryption.as_deref(),
@@ -374,7 +383,7 @@ impl<W: crate::io::Write + crate::io::Seek> BlockIndexWriter<W> for PartitionedI
             } else {
                 0
             };
-            self.open_encoded as u64 + frame + growth
+            open + frame + growth
         };
         // Then the top-level index, which the table keeps until it writes the
         // tail mirror, and its framed copy.
@@ -399,7 +408,7 @@ impl<W: crate::io::Write + crate::io::Seek> BlockIndexWriter<W> for PartitionedI
         let open = if self.data_block_handles.is_empty() {
             0
         } else {
-            frame(self.open_encoded)
+            frame(super::block_len(self.open_encoded))
         };
         let tli = self.tli_at_finish();
         if tli == 0 {

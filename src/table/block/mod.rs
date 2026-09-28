@@ -22,7 +22,7 @@ pub(crate) use encoder::{Encodable, Encoder};
 pub use header::{ChecksumAt, Header};
 pub use identity::BlockIdentity;
 pub use offset::BlockOffset;
-pub(crate) use trailer::{TRAILER_START_MARKER, Trailer};
+pub(crate) use trailer::{TRAILER_LEN, TRAILER_START_MARKER, Trailer};
 pub use transform::{BlockTransform, CompressionContext, EccParams};
 pub use r#type::BlockType;
 

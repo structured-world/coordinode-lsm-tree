@@ -121,6 +121,13 @@ impl BloomConstructionPolicy {
     /// but a small filter builds them at their floors, two blocks, two and
     /// four. They are taken at a tenth plus `3 / sqrt(n)`, a fiftieth and a
     /// hundredth of the first, and at those floors.
+    ///
+    /// This bounds the filters real keys build, not the worst case: hashes
+    /// chosen to collide can bump a whole block, and in the limit every key,
+    /// into the next layer. Charging each later layer for all `n` keys would
+    /// double the estimate of every table to guard against inputs built to
+    /// defeat a 64-bit hash, so a table rotates on the bumps keys make in
+    /// practice.
     #[must_use]
     pub(crate) fn filter_size_bound(self, n: usize) -> usize {
         use ribbon::burr::{packed, wire};

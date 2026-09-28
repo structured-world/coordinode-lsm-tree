@@ -1016,21 +1016,23 @@ impl MultiWriter {
             }
             _ => (0, self.tombstone_share.pieces(), 0),
         };
-        self.full_with_tombstones(tombstones, pieces, longest, 0)
+        self.full_with_tombstones(tombstones, pieces, longest, (0, 0))
     }
 
     /// The current table reached its target if it closes holding `pieces`
     /// range-tombstone entries of `tombstones` encoded bytes, with bounds of
-    /// up to `longest` bytes, besides the `overhead` its writer does not
-    /// count. The writer holds each entry until `finish`, which encodes them
-    /// into a block buffer and frames that when the block is transformed. The
-    /// table's key range widens to the entries' bounds.
+    /// up to `longest` bytes. `alone` is what a table of tombstones alone
+    /// writes and holds for its synthetic entry, which its writer does not
+    /// count, and zero for a table with records. The writer holds each entry
+    /// until `finish`, which encodes them into a block buffer and frames that
+    /// when the block is transformed. The table's key range widens to the
+    /// entries' bounds.
     fn full_with_tombstones(
         &self,
         tombstones: u64,
         pieces: u64,
         longest: u64,
-        overhead: u64,
+        alone: (u64, u64),
     ) -> bool {
         use crate::table::block::{BlockType, framed_len_bound};
 
@@ -1056,19 +1058,29 @@ impl MultiWriter {
             * (core::mem::size_of::<(BlobFileId, LinkedFile)>()
                 + 1
                 + core::mem::size_of::<LinkedFile>()) as u64;
-        // Closing a table sheds none of its metadata or of the state it held
-        // at its first record, which the next table carries alike. By size it
-        // closes only once it holds data or tombstones; by state, once it
-        // holds a block's worth past its first record. Otherwise a target
-        // below what every table carries would close one on every key.
+        let (alone_written, alone_held) = alone;
         let size_hint = self.writer.output_size_hint();
-        let holds_content =
-            size_hint > self.writer.finish_metadata_bytes() || tombstone_block > 0 || overhead > 0;
-        let held_target = self.output_base.map_or(self.target_size, |held| {
-            self.target_size.max(held + self.writer.block_len())
-        });
-        (holds_content && size_hint + overhead + linked + tombstone_block >= self.target_size)
-            || self.writer.held_state_bytes() + tombstones_held + linked_held >= held_target
+        let writer_held = self.writer.held_state_bytes();
+        let size = size_hint + alone_written + linked + tombstone_block;
+        let held = writer_held + alone_held + tombstones_held + linked_held;
+        // Closing a table sheds none of its metadata or of the state it held
+        // at its first record, which the next table carries alike: a target
+        // below that counts only once the table holds more. A table with
+        // records closes by size once it holds data or tombstones, and by
+        // state once it holds a block's worth past its first record; one of
+        // tombstones alone, once they take a block past its synthetic table.
+        // Otherwise every key, or every tombstone, would get a table of its
+        // own, none of them smaller.
+        let block = self.writer.block_len();
+        if alone_written > 0 {
+            return size >= self.target_size.max(alone_written + block)
+                || held >= self.target_size.max(writer_held + alone_held + block);
+        }
+        let holds_content = size_hint > self.writer.finish_metadata_bytes() || tombstone_block > 0;
+        let held_target = self
+            .output_base
+            .map_or(self.target_size, |base| self.target_size.max(base + block));
+        (holds_content && size >= self.target_size) || held >= held_target
     }
 
     /// Closing the current table at `key` sheds what it holds: the next one
@@ -1077,15 +1089,25 @@ impl MultiWriter {
     /// without shedding any, so the table grows past its target instead; a
     /// set of tombstones overlapping one another cannot be split below them.
     /// What is carried is judged as fullness is: by the bytes it encodes to
-    /// and by the entries it holds in memory, whichever is larger.
-    fn rotation_sheds(&self, key: &[u8]) -> bool {
+    /// and by the entries it holds in memory, against the part of the target
+    /// left past what the next output carries anyway, `next_alone` for one of
+    /// tombstones alone (see [`Self::full_with_tombstones`]).
+    fn rotation_sheds(&self, key: &[u8], next_alone: (u64, u64)) -> bool {
         let entries = self.tombstone_share.open_count();
         if entries == 0 {
             return true;
         }
         let carry = self.tombstone_share.carry(key);
         let held = self.tombstones_held(carry, entries);
-        carry.max(held) < self.target_size / 2
+        let block = self.writer.block_len();
+        let budget = |fixed: u64| {
+            if fixed == 0 {
+                self.target_size
+            } else {
+                self.target_size.max(fixed + block) - fixed
+            }
+        };
+        carry < budget(next_alone.0) / 2 && held < budget(next_alone.1) / 2
     }
 
     /// Heap an output holding `pieces` tombstone entries of `tombstones`
@@ -1135,7 +1157,7 @@ impl MultiWriter {
                 }
             }
 
-            if self.table_full() && self.rotation_sheds(&item.key.user_key) {
+            if self.table_full() && self.rotation_sheds(&item.key.user_key, (0, 0)) {
                 self.rotate()?;
                 self.tombstone_share.open_output(&item.key.user_key);
             }
@@ -1250,10 +1272,10 @@ impl MultiWriter {
             let group =
                 self.tombstone_share
                     .group(&self.range_tombstones, &point, comparator.as_ref());
-            let overhead = if self.writer.meta.key_count == 0 {
+            let alone = if self.writer.meta.key_count == 0 {
                 alone_overhead
             } else {
-                0
+                (0, 0)
             };
             // An empty zone is never closed: that output would hold nothing,
             // nor is the last one, with nothing above it.
@@ -1265,9 +1287,10 @@ impl MultiWriter {
                     self.tombstone_share
                         .longest_bound(&point)
                         .max(group.longest),
-                    overhead,
+                    alone,
                 )
-                && self.rotation_sheds(&point)
+                // The output after this one holds tombstones alone.
+                && self.rotation_sheds(&point, alone_overhead)
             {
                 self.current_key = Some(point.clone());
                 self.rotate()?;

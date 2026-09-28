@@ -125,6 +125,11 @@ impl<W: Write + Seek + 'static> AdaptiveIndexWriter<W> {
             .use_ecc(self.ecc)
     }
 
+    /// Bytes the single block the buffered handles encode to takes.
+    fn buffered_block(&self) -> u64 {
+        self.buffered_encoded + crate::table::block::TRAILER_LEN as u64
+    }
+
     /// Transition to two-level: build a partitioned writer with the
     /// current config and replay the buffered handles into it.
     fn spill(&mut self) -> crate::Result<()> {
@@ -176,22 +181,21 @@ impl<W: Write + Seek + 'static> BlockIndexWriter<W> for AdaptiveIndexWriter<W> {
     }
 
     fn finish_scratch_bytes(&self) -> u64 {
-        match &self.spilled {
-            Some(partitioned) => partitioned.finish_scratch_bytes(),
-            // The full writer takes the buffer over and encodes it into one
-            // block, which the table keeps until it writes the tail mirror,
-            // and frames it into a second when the block is transformed.
-            None => {
-                self.buffered_encoded
-                    + crate::table::block::transform_scratch_bound(
-                        self.buffered_encoded,
-                        crate::table::block::BlockType::Index,
-                        self.compression,
-                        self.encryption.as_deref(),
-                        self.ecc,
-                    )
-            }
+        if let Some(partitioned) = &self.spilled {
+            return partitioned.finish_scratch_bytes();
         }
+        // The full writer takes the buffer over and encodes it into one
+        // block, which the table keeps until it writes the tail mirror, and
+        // frames it into a second when the block is transformed.
+        let block = self.buffered_block();
+        block
+            + crate::table::block::transform_scratch_bound(
+                block,
+                crate::table::block::BlockType::Index,
+                self.compression,
+                self.encryption.as_deref(),
+                self.ecc,
+            )
     }
 
     fn finish_output_bytes(&self) -> u64 {
@@ -201,7 +205,7 @@ impl<W: Write + Seek + 'static> BlockIndexWriter<W> for AdaptiveIndexWriter<W> {
             // One block, written twice: at the head and as the tail mirror.
             None => {
                 2 * crate::table::block::framed_len_bound(
-                    self.buffered_encoded,
+                    self.buffered_block(),
                     crate::table::block::BlockType::Index,
                     self.compression,
                     self.encryption.as_deref(),
