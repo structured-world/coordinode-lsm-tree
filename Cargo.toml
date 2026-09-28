@@ -431,6 +431,12 @@ harness = false
 path = "benches/at_insert.rs"
 required-features = []
 
+[[bench]]
+name = "partitioned_filter"
+harness = false
+path = "benches/partitioned_filter.rs"
+required-features = []
+
 # Deterministic code layout for anything measured: with the default 16
 # codegen units and no LTO, ANY code change reshuffles function placement and
 # moves hot loops across cache lines, stepping macro-benchmarks by several

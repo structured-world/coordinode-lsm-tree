@@ -97,13 +97,7 @@ const LAYER_HEADER_LEN: usize = 12;
 #[must_use]
 pub(crate) fn encoded_len_bound(params: &super::params::BurrParams, n: usize) -> usize {
     let b = usize::from(params.b);
-    let stride_words = usize::from(params.r).div_ceil(64);
-    // A layer too large to size stays at the top rather than wrapping.
-    let layer = |m: usize| {
-        LAYER_HEADER_LEN
-            .saturating_add(m / b)
-            .saturating_add(m.saturating_mul(stride_words).saturating_mul(8))
-    };
+    let layer = |m: usize| layer_len(params, m);
     let first = layer(params.layer_m(n));
     let spread = first.saturating_mul(3) / n.isqrt().max(1);
     let second = layer(2 * b).max((first / 10).saturating_add(spread));
@@ -115,6 +109,33 @@ pub(crate) fn encoded_len_bound(params: &super::params::BurrParams, n: usize) ->
         .saturating_add(second)
         .saturating_add(third)
         .saturating_add(last)
+}
+
+/// Bytes [`encode`] typically writes for a filter over `n` distinct hashes
+/// built under `params`: the header, the first layer as the build sizes it,
+/// and the layers the bumped keys land in as measured over built filters, a
+/// tenth of the first plus `12 * sqrt(first)` for the small layers built at
+/// their floors, and at least the one-block layer a small filter ends in.
+/// Averaged over key sets it lands within 1% of the build from a thousand
+/// keys to a hundred thousand. Below that a build takes a later layer whole
+/// or not at all, so one filter lands up to about a layer either side of it.
+#[must_use]
+pub(crate) fn estimated_len(params: &super::params::BurrParams, n: usize) -> usize {
+    let first = layer_len(params, params.layer_m(n));
+    let tail = (first / 10)
+        .saturating_add(first.isqrt().saturating_mul(12))
+        .max(layer_len(params, usize::from(params.b)));
+    HEADER_LEN.saturating_add(first).saturating_add(tail)
+}
+
+/// Bytes a layer of `m` slots encodes to: its header, one threshold byte per
+/// block and `stride_words` words per slot. A layer too large to size stays
+/// at the top rather than wrapping.
+fn layer_len(params: &super::params::BurrParams, m: usize) -> usize {
+    let stride_words = usize::from(params.r).div_ceil(64);
+    LAYER_HEADER_LEN
+        .saturating_add(m / usize::from(params.b))
+        .saturating_add(m.saturating_mul(stride_words).saturating_mul(8))
 }
 
 /// Serialize a built [`BurrFilter`] into the wire format.

@@ -50,29 +50,20 @@ impl BloomConstructionPolicy {
         }
     }
 
-    /// Returns the estimated filter size in bytes.
+    /// Returns the estimated filter size in bytes: what a filter over `n`
+    /// keys typically encodes to on disk, one 64-bit word per slot. From a
+    /// thousand keys up it lands within a few percent of the build; a smaller
+    /// filter takes its later layers whole or not at all, so one lands up to
+    /// about a layer either side of it.
     ///
     /// Returns `0` if the policy is inactive for the given `n`
-    /// (`burr_params` would return `None`). Otherwise estimates the
-    /// `BuRR` body size as `n * r * 1.05 / 8` — `r` is the fingerprint
-    /// width chosen by the params constructor, `1.05` is a flat 5%
-    /// overhead for layer thresholds + last-layer enlargement.
+    /// (`burr_params` would return `None`).
     #[must_use]
-    #[expect(
-        clippy::cast_precision_loss,
-        clippy::cast_possible_truncation,
-        clippy::cast_sign_loss,
-        reason = "estimation, precision loss is acceptable"
-    )]
     pub fn estimated_filter_size(&self, n: usize) -> usize {
         // Delegate to burr_params so the estimate is 0 exactly when the
-        // builder would also return empty — keeps memory accounting in
-        // sync with build behavior.
-        let Some(params) = self.burr_params(n) else {
-            return 0;
-        };
-        let r_bits = f32::from(params.r);
-        ((n as f32) * r_bits * 1.05 / 8.0) as usize
+        // builder would also return empty.
+        self.burr_params(n)
+            .map_or(0, |params| ribbon::burr::wire::estimated_len(&params, n))
     }
 
     /// Bytes a filter over `n` distinct hashes encodes to under this policy,

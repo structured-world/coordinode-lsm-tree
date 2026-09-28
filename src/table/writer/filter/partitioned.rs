@@ -35,9 +35,13 @@ pub struct PartitionedFilterWriter {
 
     /// Key hashes for AMQ filter
     pub bloom_hash_buffer: Vec<u64>,
-    approx_filter_size: usize,
 
     partition_size: u32,
+
+    /// Keys a partition holds when it closes: the fewest whose filter encodes
+    /// to the partition size (see [`keys_per_partition`]). Recomputed when
+    /// either the policy or the partition size is set.
+    keys_per_partition: usize,
 
     bloom_policy: BloomConstructionPolicy,
 
@@ -69,17 +73,44 @@ pub struct PartitionedFilterWriter {
     ecc: Option<crate::table::block::EccParams>,
 }
 
+/// The fewest keys whose filter partition encodes to `partition_size` bytes
+/// under `policy`, by the estimate of what it writes, a word per slot: the
+/// partition size counts the bytes a partition takes on disk, as `RocksDB`'s
+/// `ApproximateNumEntries` does. `usize::MAX` when no count reaches it, as
+/// for a policy that builds no filter.
+fn keys_per_partition(policy: BloomConstructionPolicy, partition_size: u32) -> usize {
+    let target = partition_size as usize;
+    let reaches = |n: usize| policy.estimated_filter_size(n) >= target;
+    // Each key takes a slot of more than a byte, so `target` keys reach it.
+    let mut at = target.max(1);
+    if !reaches(at) {
+        return usize::MAX;
+    }
+    // The estimate grows with the key count, so bisection finds the first
+    // count that reaches the target.
+    let mut below = 0;
+    while at - below > 1 {
+        let mid = below + (at - below) / 2;
+        if reaches(mid) {
+            at = mid;
+        } else {
+            below = mid;
+        }
+    }
+    at
+}
+
 impl PartitionedFilterWriter {
     pub fn new(bloom_policy: BloomConstructionPolicy) -> Self {
         Self {
             final_filter_buffer: Vec::new(),
 
             bloom_hash_buffer: Vec::new(),
-            approx_filter_size: 0,
+            partition_size: 4_096,
+            keys_per_partition: keys_per_partition(bloom_policy, 4_096),
 
             tli_handles: Vec::new(),
             tli_bytes: 0,
-            partition_size: 4_096,
             bloom_policy,
 
             relative_file_pos: 0,
@@ -177,7 +208,6 @@ impl PartitionedFilterWriter {
             self.relative_file_pos,
         );
 
-        self.approx_filter_size = 0;
         self.relative_file_pos += u64::from(bytes_written);
 
         Ok(())
@@ -267,6 +297,7 @@ impl<W: crate::io::Write + crate::io::Seek> FilterWriter<W> for PartitionedFilte
 
     fn use_partition_size(mut self: Box<Self>, size: u32) -> Box<dyn FilterWriter<W>> {
         self.partition_size = size;
+        self.keys_per_partition = keys_per_partition(self.bloom_policy, size);
         self
     }
 
@@ -289,6 +320,7 @@ impl<W: crate::io::Write + crate::io::Seek> FilterWriter<W> for PartitionedFilte
         policy: BloomConstructionPolicy,
     ) -> Box<dyn FilterWriter<W>> {
         self.bloom_policy = policy;
+        self.keys_per_partition = keys_per_partition(policy, self.partition_size);
         self
     }
 
@@ -309,13 +341,9 @@ impl<W: crate::io::Write + crate::io::Seek> FilterWriter<W> for PartitionedFilte
         // so prefix hashes would only increase CPU and filter size with no
         // read-side benefit.
 
-        self.approx_filter_size = self
-            .bloom_policy
-            .estimated_filter_size(self.bloom_hash_buffer.len());
-
         self.last_key = Some(key.clone());
 
-        if self.approx_filter_size >= self.partition_size as usize {
+        if self.bloom_hash_buffer.len() >= self.keys_per_partition {
             // mem::replace (rather than mem::take) preserves the buffer's
             // grown capacity for the next partition. `take` leaves a
             // capacity-0 Vec behind, which would force a reallocation on
