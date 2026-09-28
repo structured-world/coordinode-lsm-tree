@@ -417,9 +417,10 @@ fn a_transform_on_the_rotation_boundary_belongs_to_the_new_output() -> crate::Re
     let marker = Arc::new(portable_atomic::AtomicU64::new(0));
 
     // A target the two 4 KiB fillers pass once their block is written, and a
-    // single key with the tail every table writes does not: rotation fires on
-    // the key AFTER the fillers.
-    let mut mw = super::MultiWriter::new(base_path.clone(), id_gen, 12_000, 1, fs)?
+    // single key with the tail every table writes and its filter's bound (a
+    // word per slot at every layer's floor) does not: rotation fires on the
+    // key AFTER the fillers.
+    let mut mw = super::MultiWriter::new(base_path.clone(), id_gen, 16_000, 1, fs)?
         .use_lineage(Some(vec![7, 8]))
         .use_transform_marker(Arc::clone(&marker));
 
