@@ -1147,6 +1147,16 @@ impl MultiWriter {
             .map(|rt| rt.start.len().max(rt.end.len()))
             .max()
             .unwrap_or(0) as u64;
+        // The most filter prefixes an output's sentinel can yield: it is one of
+        // the tombstones' bounds.
+        let prefixes = self.prefix_extractor.as_ref().map_or(0, |extractor| {
+            self.range_tombstones
+                .iter()
+                .flat_map(|rt| [&rt.start, &rt.end])
+                .map(|bound| extractor.prefixes(bound).count())
+                .max()
+                .unwrap_or(0)
+        });
         loop {
             let tombstones = &self.range_tombstones;
             let share = &self.tombstone_share;
@@ -1172,7 +1182,7 @@ impl MultiWriter {
             // An output of tombstones alone writes a synthetic table around
             // them, which its writer, holding no record, does not count yet.
             let overhead = if self.writer.meta.key_count == 0 {
-                self.writer.tombstone_only_overhead(longest)?
+                self.writer.tombstone_only_overhead(longest, prefixes)?
             } else {
                 0
             };

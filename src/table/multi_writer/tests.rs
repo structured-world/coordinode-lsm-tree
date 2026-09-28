@@ -804,6 +804,80 @@ fn a_flush_splits_its_tombstones_past_the_last_key() -> crate::Result<()> {
     Ok(())
 }
 
+/// Every byte prefix of a key is a token.
+struct AllPrefixes;
+
+impl crate::prefix::PrefixExtractor for AllPrefixes {
+    fn prefixes<'a>(&self, key: &'a [u8]) -> Box<dyn Iterator<Item = &'a [u8]> + 'a> {
+        Box::new((1..=key.len()).filter_map(|end| key.get(..end)))
+    }
+}
+
+/// An output of tombstones alone writes a sentinel entry, and each section
+/// the writer is configured for records it: a partitioned index and filter,
+/// the zone map, the seqno bounds, the locator, and a filter holding the
+/// sentinel's prefixes. The split counts all of them, so such an output still
+/// ends near its target.
+#[test]
+fn a_flush_counts_every_section_of_an_output_of_tombstones_alone() -> crate::Result<()> {
+    use crate::{InternalValue, UserKey, fs::StdFs, range_tombstone::RangeTombstone};
+    use std::sync::Arc;
+
+    const TARGET: u64 = 32 * 1_024;
+    let folder = tempfile::tempdir()?;
+    let base_path = folder.path().to_path_buf();
+    let fs: Arc<dyn crate::fs::Fs> = Arc::new(StdFs);
+    let mut mw = super::MultiWriter::new(
+        base_path.clone(),
+        SequenceNumberCounter::default(),
+        TARGET,
+        1,
+        fs,
+    )?
+    .use_adaptive_index(0)
+    .use_partitioned_filter()
+    .use_zone_map(true)
+    .use_seqno_in_index(true)
+    .use_locator(crate::config::LocatorPolicyEntry::Enabled {
+        precision: crate::config::LocatorPrecision::Entry,
+        block_id_bits: None,
+        slot_bits: None,
+    })
+    .use_prefix_extractor(Some(Arc::new(AllPrefixes)));
+    let tombstones: Vec<_> = (0..40)
+        .map(|i| {
+            let prefix = format!("z{i:08}").into_bytes();
+            let mut start = prefix.clone();
+            start.push(0);
+            let mut end = prefix;
+            end.push(1);
+            RangeTombstone::new(
+                UserKey::from(random_bound_of(2 * i, start, 1_000)),
+                UserKey::from(random_bound_of(2 * i + 1, end, 1_000)),
+                5,
+            )
+        })
+        .collect();
+    mw.set_range_tombstones(tombstones);
+    mw.write(InternalValue::from_components(
+        UserKey::from(b"a" as &[u8]),
+        b"v".to_vec(),
+        1,
+        crate::ValueType::Value,
+    ))?;
+    let tables = recover_outputs(&base_path, &mw.finish()?)?;
+    assert!(tables.len() > 1, "the tombstones must spread over outputs");
+    for table in &tables {
+        let file_size = std::fs::metadata(base_path.join(table.id().to_string()))?.len();
+        assert!(
+            file_size <= TARGET + 512,
+            "output of {file_size} bytes with {} tombstones overran the {TARGET}-byte target",
+            table.range_tombstones().len(),
+        );
+    }
+    Ok(())
+}
+
 /// `key` extended to 64 bytes with a pseudo-random tail from `seed`, so no
 /// codec shrinks a block of such bounds.
 fn random_bound(seed: usize, key: Vec<u8>) -> Vec<u8> {
