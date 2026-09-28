@@ -6,7 +6,7 @@
 //! median wall time of the flush and the median CPU time of the whole process
 //! during it (the workers included), each per MiB of rows written.
 //!
-//! Cases: data block size 4 KiB and 64 KiB by default, codec lz4, zstd 1 and zstd 19, one
+//! Cases: data block size 4 KiB and 64 KiB by default, codec none, lz4, zstd 1 and zstd 19, one
 //! thread (the serial path) and four. Environment knobs:
 //!
 //! - `BP_BLOCKS`: data blocks per flush.
@@ -132,6 +132,7 @@ fn main() {
         .collect();
 
     let codecs = [
+        ("none", CompressionType::None),
         ("lz4", CompressionType::Lz4),
         ("zstd1", CompressionType::zstd(1).expect("level")),
         ("zstd19", CompressionType::zstd(19).expect("level")),
