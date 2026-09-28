@@ -620,10 +620,12 @@ fn a_flush_cuts_each_tombstone_into_the_outputs_it_spans() -> crate::Result<()> 
     let folder = tempfile::tempdir()?;
     let base_path = folder.path().to_path_buf();
     let fs: Arc<dyn crate::fs::Fs> = Arc::new(StdFs);
+    // Every key passes the target with the tail every table writes, and the
+    // few tombstones a rotation carries stay well under half of it.
     let mut mw = super::MultiWriter::new(
         base_path.clone(),
         SequenceNumberCounter::default(),
-        100,
+        4_000,
         1,
         fs,
     )?;
@@ -868,6 +870,33 @@ fn an_overlapping_set_past_the_target_is_not_carried_from_output_to_output() -> 
     let pieces: usize = tables.iter().map(|t| t.range_tombstones().len()).sum();
     assert!(
         pieces <= 2 * TOMBSTONES,
+        "{pieces} pieces over {} outputs for {TOMBSTONES} tombstones",
+        tables.len(),
+    );
+    Ok(())
+}
+
+/// Short overlapping tombstones fill an output by the entries they hold in
+/// memory long before their bytes do; what a rotation would carry is judged
+/// the same way, so they are not carried from output to output either.
+#[test]
+fn short_overlapping_tombstones_are_not_carried_by_their_memory() -> crate::Result<()> {
+    use crate::{UserKey, range_tombstone::RangeTombstone};
+
+    const TOMBSTONES: u16 = 800;
+    let tombstones = (0..TOMBSTONES)
+        .map(|i| {
+            let mut end = b"z".to_vec();
+            end.extend_from_slice(&i.to_be_bytes());
+            RangeTombstone::new(UserKey::from(b"a" as &[u8]), UserKey::from(end), 5)
+        })
+        .collect();
+    let keys: Vec<Vec<u8>> = (0..10).map(|i| format!("k{i}").into_bytes()).collect();
+    let keys: Vec<&[u8]> = keys.iter().map(Vec::as_slice).collect();
+    let (_folder, tables) = flush_outputs(32 * 1_024, &keys, tombstones)?;
+    let pieces: usize = tables.iter().map(|t| t.range_tombstones().len()).sum();
+    assert!(
+        pieces <= 2 * usize::from(TOMBSTONES),
         "{pieces} pieces over {} outputs for {TOMBSTONES} tombstones",
         tables.len(),
     );
