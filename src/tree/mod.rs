@@ -854,6 +854,8 @@ impl AbstractTree for Tree {
         .use_data_block_compression(data_block_compression)
         .use_index_block_compression(index_block_compression)
         .use_data_block_size(data_block_size)
+        .use_index_partition_size(self.config.index_block_partition_size_policy.get(0))
+        .use_filter_partition_size(self.config.filter_block_partition_size_policy.get(0))
         .use_data_block_hash_ratio(data_block_hash_ratio)
         .use_bloom_policy({
             use crate::config::FilterPolicyEntry::{Bloom, None};
@@ -6174,3 +6176,7 @@ mod dict_collect_tests;
 #[cfg(all(test, feature = "std", zstd_any))]
 #[expect(clippy::expect_used, reason = "test code")]
 mod live_compression_tests;
+
+#[cfg(test)]
+#[expect(clippy::expect_used, reason = "test code")]
+mod partition_size_tests;

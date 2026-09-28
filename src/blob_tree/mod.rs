@@ -1082,6 +1082,8 @@ impl AbstractTree for BlobTree {
         .use_data_block_compression(data_block_compression)
         .use_index_block_compression(index_block_compression)
         .use_data_block_size(data_block_size)
+        .use_index_partition_size(self.index.config.index_block_partition_size_policy.get(0))
+        .use_filter_partition_size(self.index.config.filter_block_partition_size_policy.get(0))
         .use_data_block_hash_ratio(data_block_hash_ratio)
         .use_bloom_policy({
             use crate::config::FilterPolicyEntry::{Bloom, None};
