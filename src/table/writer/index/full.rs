@@ -21,6 +21,10 @@ pub struct FullIndexWriter {
     zstd_two_pass_seed: bool,
     restart_interval: u8,
     block_handles: Vec<KeyedBlockHandle>,
+    /// Bytes the handles hold: each handle and its end key.
+    handle_bytes: usize,
+    /// Bytes the handles take encoded, bounded from above.
+    encoded_bytes: usize,
     encryption: Option<Arc<dyn EncryptionProvider>>,
     /// Owning SST's table id; passed by the outer Writer via
     /// `use_table_id` before `finish()`. Used to populate
@@ -42,9 +46,26 @@ impl FullIndexWriter {
             zstd_two_pass_seed: true,
             restart_interval: 1,
             block_handles: Vec::new(),
+            handle_bytes: 0,
+            encoded_bytes: 0,
             encryption: None,
             table_id: 0,
             ecc: None,
+        }
+    }
+
+    /// A writer over handles already collected, which hold `handle_bytes` and
+    /// take `encoded_bytes` encoded.
+    pub(super) fn with_handles(
+        block_handles: Vec<KeyedBlockHandle>,
+        handle_bytes: usize,
+        encoded_bytes: usize,
+    ) -> Self {
+        Self {
+            block_handles,
+            handle_bytes,
+            encoded_bytes,
+            ..Self::new()
         }
     }
 }
@@ -102,9 +123,49 @@ impl<W: crate::io::Write + crate::io::Seek> BlockIndexWriter<W> for FullIndexWri
             block_handle.end_key(),
         );
 
+        self.handle_bytes +=
+            core::mem::size_of::<KeyedBlockHandle>() + block_handle.end_key().len();
+        self.encoded_bytes += block_handle.encoded_len_bound();
         self.block_handles.push(block_handle);
 
         Ok(())
+    }
+
+    fn held_bytes(&self) -> u64 {
+        super::handles_held(
+            self.handle_bytes,
+            &self.block_handles,
+            self.block_handles.capacity(),
+        ) as u64
+    }
+
+    fn finish_scratch_bytes(&self) -> u64 {
+        // `finish` encodes every handle into one block buffer, which the
+        // table keeps until it writes the tail mirror, and frames it into a
+        // second when the block is transformed.
+        let encoded = super::block_len(self.encoded_bytes) as u64;
+        encoded
+            + crate::table::block::transform_scratch_bound(
+                encoded,
+                crate::table::block::BlockType::Index,
+                self.compression,
+                self.encryption.as_deref(),
+                self.ecc,
+            )
+    }
+
+    fn finish_output_bytes(&self) -> u64 {
+        if self.block_handles.is_empty() {
+            return 0;
+        }
+        // One block, written twice: at the head and as the tail mirror.
+        2 * crate::table::block::framed_len_bound(
+            super::block_len(self.encoded_bytes) as u64,
+            crate::table::block::BlockType::Index,
+            self.compression,
+            self.encryption.as_deref(),
+            self.ecc,
+        )
     }
 
     fn finish(
@@ -113,7 +174,9 @@ impl<W: crate::io::Write + crate::io::Seek> BlockIndexWriter<W> for FullIndexWri
     ) -> crate::Result<(usize, Vec<u8>)> {
         file_writer.start("tli")?;
 
-        let mut bytes = vec![];
+        // Sized to the bound the estimates charge, so the block never grows
+        // past it.
+        let mut bytes = Vec::with_capacity(super::block_len(self.encoded_bytes));
         IndexBlock::encode_into_with_restart_interval(
             &mut bytes,
             &self.block_handles,

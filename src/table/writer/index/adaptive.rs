@@ -26,9 +26,10 @@
 //! gets the best of both: single-level until the index is large enough
 //! that pinning it whole stops being cheap, then partitioned.
 //!
-//! Memory is bounded at `spill_threshold` (after spilling, the streaming
-//! partition writer flushes to the file as it goes), so even a huge SST
-//! never buffers its entire index.
+//! Either way the index stays in memory until `finish` writes it: the
+//! partitioned writer buffers its encoded partitions too. What bounds it is
+//! the table: the writer reports the bytes it holds, and a run of tables
+//! rotates to the next one before they reach its target size.
 
 use crate::{
     CompressionType,
@@ -81,6 +82,8 @@ pub struct AdaptiveIndexWriter<W: Write + Seek + 'static> {
     // Pre-spill state: buffered handles + running size estimate.
     buffer: Vec<KeyedBlockHandle>,
     buffered_bytes: u64,
+    /// Bytes the buffered handles take encoded, bounded from above.
+    buffered_encoded: u64,
 
     /// `Some` once spilled — every subsequent handle is forwarded here
     /// and `finish` delegates to it.
@@ -102,6 +105,7 @@ impl<W: Write + Seek + 'static> AdaptiveIndexWriter<W> {
             spill_threshold,
             buffer: Vec::new(),
             buffered_bytes: 0,
+            buffered_encoded: 0,
             spilled: None,
         }
     }
@@ -121,14 +125,22 @@ impl<W: Write + Seek + 'static> AdaptiveIndexWriter<W> {
             .use_ecc(self.ecc)
     }
 
+    /// Bytes the single block the buffered handles encode to takes.
+    fn buffered_block(&self) -> u64 {
+        self.buffered_encoded + crate::table::block::TRAILER_LEN as u64
+    }
+
     /// Transition to two-level: build a partitioned writer with the
     /// current config and replay the buffered handles into it.
     fn spill(&mut self) -> crate::Result<()> {
         let mut partitioned = self.configure(Box::new(PartitionedIndexWriter::new()));
-        for handle in self.buffer.drain(..) {
+        // Taking the buffer frees its allocation once replayed; draining it
+        // would keep the capacity for the life of the table.
+        for handle in core::mem::take(&mut self.buffer) {
             partitioned.register_data_block(handle)?;
         }
         self.buffered_bytes = 0;
+        self.buffered_encoded = 0;
         self.spilled = Some(partitioned);
         Ok(())
     }
@@ -145,6 +157,7 @@ impl<W: Write + Seek + 'static> BlockIndexWriter<W> for AdaptiveIndexWriter<W> {
         let entry_size =
             (block_handle.end_key().len() + core::mem::size_of::<KeyedBlockHandle>()) as u64;
         self.buffered_bytes += entry_size;
+        self.buffered_encoded += block_handle.encoded_len_bound() as u64;
         self.buffer.push(block_handle);
 
         if self.buffered_bytes > self.spill_threshold {
@@ -153,23 +166,76 @@ impl<W: Write + Seek + 'static> BlockIndexWriter<W> for AdaptiveIndexWriter<W> {
         Ok(())
     }
 
+    fn held_bytes(&self) -> u64 {
+        match &self.spilled {
+            Some(partitioned) => partitioned.held_bytes(),
+            // The buffer's size counts bytes held in memory, so it fits in
+            // `usize`.
+            #[expect(clippy::cast_possible_truncation, reason = "bytes held in memory")]
+            None => super::handles_held(
+                self.buffered_bytes as usize,
+                &self.buffer,
+                self.buffer.capacity(),
+            ) as u64,
+        }
+    }
+
+    fn finish_scratch_bytes(&self) -> u64 {
+        if let Some(partitioned) = &self.spilled {
+            return partitioned.finish_scratch_bytes();
+        }
+        // The full writer takes the buffer over and encodes it into one
+        // block, which the table keeps until it writes the tail mirror, and
+        // frames it into a second when the block is transformed.
+        let block = self.buffered_block();
+        block
+            + crate::table::block::transform_scratch_bound(
+                block,
+                crate::table::block::BlockType::Index,
+                self.compression,
+                self.encryption.as_deref(),
+                self.ecc,
+            )
+    }
+
+    fn finish_output_bytes(&self) -> u64 {
+        match &self.spilled {
+            Some(partitioned) => partitioned.finish_output_bytes(),
+            None if self.buffer.is_empty() => 0,
+            // One block, written twice: at the head and as the tail mirror.
+            None => {
+                2 * crate::table::block::framed_len_bound(
+                    self.buffered_block(),
+                    crate::table::block::BlockType::Index,
+                    self.compression,
+                    self.encryption.as_deref(),
+                    self.ecc,
+                )
+            }
+        }
+    }
+
     fn finish(
         self: Box<Self>,
         file_writer: &mut crate::sfa::Writer<ChecksummedWriter<W>>,
     ) -> crate::Result<(usize, Vec<u8>)> {
-        let this = *self;
+        let mut this = *self;
 
         // Spilled → two-level index is already streaming; just finish it.
-        if let Some(partitioned) = this.spilled {
+        if let Some(partitioned) = this.spilled.take() {
             return partitioned.finish(file_writer);
         }
 
         // Stayed small → single-level (Full) index.
-        let mut full = this.configure(Box::new(FullIndexWriter::new()));
-        for handle in this.buffer {
-            full.register_data_block(handle)?;
-        }
-        full.finish(file_writer)
+        // The full writer takes the buffer over rather than a copy of it.
+        // Both sizes count bytes held in memory, so they fit in `usize`.
+        #[expect(clippy::cast_possible_truncation, reason = "bytes held in memory")]
+        let full = FullIndexWriter::with_handles(
+            core::mem::take(&mut this.buffer),
+            this.buffered_bytes as usize,
+            this.buffered_encoded as usize,
+        );
+        this.configure(Box::new(full)).finish(file_writer)
     }
 
     fn use_compression(
@@ -222,3 +288,6 @@ impl<W: Write + Seek + 'static> BlockIndexWriter<W> for AdaptiveIndexWriter<W> {
         self
     }
 }
+
+#[cfg(test)]
+mod tests;

@@ -38,6 +38,54 @@ pub struct BurrBuilder {
     params: BurrParams,
 }
 
+/// Heap bytes the ribbon solve holds per slot: `occupied`, two coefficient
+/// words, the RHS and the solution word.
+pub(crate) const SOLVE_PER_SLOT: usize =
+    core::mem::size_of::<bool>() + 4 * core::mem::size_of::<u64>();
+
+/// Heap bytes a build over `n` keys allocates at its peak, beyond the hashes
+/// handed to it, under the default parameters every writer builds with: the
+/// first layer's equations and its kept/bumped split per key, and the ribbon
+/// solve's rows per slot of that layer. A retrieval build also copies its
+/// hashes and values, pairs them for the split and unzips both halves. The
+/// first layer is the peak: the next ones solve only the keys it bumped, on
+/// at least the last layer's floor of four blocks, which a small build can
+/// reach. That holds for distinct hashes, which the filter writers pass:
+/// equal hashes land on one offset and are bumped together through every
+/// layer.
+#[must_use]
+pub(crate) fn build_peak_bytes(n: usize, retrieval: bool) -> usize {
+    const WORD: usize = core::mem::size_of::<u64>();
+    const MEMBERSHIP_PER_KEY: usize = core::mem::size_of::<StandardEquation>() + WORD;
+    // Hash and value copies, the (hash, value) pairs, the split of those
+    // pairs, and the two unzipped halves.
+    const RETRIEVAL_EXTRA_PER_KEY: usize = 2 * WORD + 2 * WORD + 2 * WORD + 2 * WORD;
+    if n == 0 {
+        return 0;
+    }
+    let per_key = if retrieval {
+        MEMBERSHIP_PER_KEY + RETRIEVAL_EXTRA_PER_KEY
+    } else {
+        MEMBERSHIP_PER_KEY
+    };
+    let params = BurrParams {
+        n,
+        r: 1,
+        w: 64,
+        b: BurrParams::DEFAULT_B,
+        max_layers: BurrParams::DEFAULT_MAX_LAYERS,
+        per_layer_overhead: BurrParams::DEFAULT_PER_LAYER_OVERHEAD,
+        seed: 0,
+    };
+    let slots = params
+        .layer_m(n)
+        .max(4 * usize::from(BurrParams::DEFAULT_B));
+    // `n` counts keys a writer already holds in memory at a word or more
+    // each, and `slots` is within 5% and one block of it, so these products
+    // stay far below `usize::MAX`.
+    n * per_key + slots * SOLVE_PER_SLOT
+}
+
 impl core::fmt::Debug for BurrBuilder {
     fn fmt(&self, f: &mut core::fmt::Formatter<'_>) -> core::fmt::Result {
         f.debug_struct("BurrBuilder")

@@ -74,6 +74,17 @@ impl BloomConstructionPolicy {
         let r_bits = f32::from(params.r);
         ((n as f32) * r_bits * 1.05 / 8.0) as usize
     }
+
+    /// Bytes a filter over `n` distinct hashes encodes to under this policy,
+    /// bounded from above before the build from the wire layout itself (one
+    /// word per slot), so a table can count the filter it will write before
+    /// writing it. `0` when the policy builds no filter for `n`.
+    #[must_use]
+    pub(crate) fn encoded_filter_size(self, n: usize) -> usize {
+        self.burr_params(n).map_or(0, |params| {
+            ribbon::burr::wire::encoded_len_bound(&params, n)
+        })
+    }
 }
 
 /// Build a `BuRR` filter block payload from pre-hashed keys under the given

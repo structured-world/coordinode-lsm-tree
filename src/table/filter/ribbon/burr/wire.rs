@@ -76,6 +76,47 @@ const HEADER_LEN: usize = MAGIC_BYTES.len() + 6 + 8;
 /// Per-layer fixed header length: m + num_blocks + z_byte_len = 12.
 const LAYER_HEADER_LEN: usize = 12;
 
+/// Bytes [`encode`] writes for a filter over `n` distinct hashes built under
+/// `params`, bounded from above before the build: the header, and per layer
+/// its header, one threshold byte per block and `stride_words` words per
+/// slot. The first layer is sized as the build sizes it. Each later one
+/// solves the keys the layer before bumped. Over many key sets the second
+/// takes a tenth of the first's slots, spread by about `2.5 / sqrt(n)` of
+/// them (18% at a thousand keys, 10% at a hundred thousand), the third a
+/// hundredth, the last under that; but a small filter builds them at their
+/// floors, two blocks, two and four. They are taken at a tenth plus
+/// `3 / sqrt(n)`, a fiftieth and a hundredth of the first, and at those
+/// floors.
+///
+/// This bounds the filters real keys build, not the worst case: hashes
+/// chosen to collide can bump a whole block, and in the limit every key,
+/// into the next layer. Charging each later layer for all `n` keys would
+/// double the estimate of every table to guard against inputs built to
+/// defeat a 64-bit hash, so a table rotates on the bumps keys make in
+/// practice.
+#[must_use]
+pub(crate) fn encoded_len_bound(params: &super::params::BurrParams, n: usize) -> usize {
+    let b = usize::from(params.b);
+    let stride_words = usize::from(params.r).div_ceil(64);
+    // A layer too large to size stays at the top rather than wrapping.
+    let layer = |m: usize| {
+        LAYER_HEADER_LEN
+            .saturating_add(m / b)
+            .saturating_add(m.saturating_mul(stride_words).saturating_mul(8))
+    };
+    let first = layer(params.layer_m(n));
+    let spread = first.saturating_mul(3) / n.isqrt().max(1);
+    let second = layer(2 * b).max((first / 10).saturating_add(spread));
+    let third = layer(2 * b).max(first / 50);
+    let last = layer(4 * b).max(first / 100);
+    debug_assert_eq!(params.max_layers, 4, "the bound sizes four layers");
+    HEADER_LEN
+        .saturating_add(first)
+        .saturating_add(second)
+        .saturating_add(third)
+        .saturating_add(last)
+}
+
 /// Serialize a built [`BurrFilter`] into the wire format.
 pub(crate) fn encode(filter: &BurrFilter) -> Vec<u8> {
     let params = filter.params();

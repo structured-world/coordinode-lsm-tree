@@ -50,6 +50,43 @@ fn estimated_size_zero_n_returns_zero() {
     assert_eq!(policy_fpr.estimated_filter_size(0), 0);
 }
 
+/// A table counts its filter before building it, so the count has to follow
+/// the wire layout, one word per slot, not `r` bits per key, and bound the
+/// built filter from above: a small filter can build every layer at its floor.
+/// At scale it stays within twice the built length, and it is zero where no
+/// filter is built.
+#[test]
+fn encoded_filter_size_bounds_the_built_filter() -> crate::Result<()> {
+    for policy in [
+        BloomConstructionPolicy::BitsPerKey(10.0),
+        BloomConstructionPolicy::FalsePositiveRate(0.001),
+    ] {
+        assert_eq!(policy.encoded_filter_size(0), 0, "{policy:?}");
+        for n in (1..=300_u64).chain([500, 1_000, 2_000, 5_000, 20_000, 100_000]) {
+            // Several hash sets: how many keys a layer bumps varies with them.
+            for set in 0..8_u64 {
+                let hashes: Vec<u64> = (0..n)
+                    .map(|i| crate::hash::hash64(&(i ^ (set << 40)).to_le_bytes()))
+                    .collect();
+                let n = hashes.len();
+                let built = build_burr_filter_bytes(policy, hashes)?.len();
+                let bound = policy.encoded_filter_size(n);
+                assert!(
+                    built <= bound,
+                    "{policy:?} n={n} set={set}: bound {bound} under a {built}-byte filter",
+                );
+                if n >= 1_000 {
+                    assert!(
+                        bound <= 2 * built,
+                        "{policy:?} n={n}: bound {bound} for {built}"
+                    );
+                }
+            }
+        }
+    }
+    Ok(())
+}
+
 #[test]
 fn burr_params_returns_none_for_n_zero() {
     let policy = BloomConstructionPolicy::BitsPerKey(10.0);

@@ -569,6 +569,19 @@ pub enum CompressionType {
 }
 
 impl CompressionType {
+    /// Bytes this codec can produce for `len` input bytes at most. A block
+    /// keeps its compressed form even when it came out larger than its input.
+    #[must_use]
+    pub(crate) const fn compressed_len_bound(self, len: usize) -> usize {
+        match self {
+            Self::None => len,
+            #[cfg(feature = "lz4")]
+            Self::Lz4 => lz4_flex::block::get_maximum_output_size(len),
+            #[cfg(zstd_any)]
+            Self::Zstd(_) | Self::ZstdDict { .. } => structured_zstd::encoding::compress_bound(len),
+        }
+    }
+
     /// Returns the zstd dictionary id encoded in this compression
     /// configuration, or `0` when no dictionary applies. Used to
     /// populate [`crate::table::block::BlockIdentity::dict_id`]

@@ -30,6 +30,9 @@ pub struct PartitionedFilterWriter {
 
     tli_handles: Vec<KeyedBlockHandle>,
 
+    /// Bytes the top-level index entries hold: each handle and its end key.
+    tli_bytes: usize,
+
     /// Key hashes for AMQ filter
     pub bloom_hash_buffer: Vec<u64>,
     approx_filter_size: usize,
@@ -75,6 +78,7 @@ impl PartitionedFilterWriter {
             approx_filter_size: 0,
 
             tli_handles: Vec::new(),
+            tli_bytes: 0,
             partition_size: 4_096,
             bloom_policy,
 
@@ -94,18 +98,22 @@ impl PartitionedFilterWriter {
         }
     }
 
-    fn spill_filter_partition(&mut self, key: &UserKey) -> crate::Result<()> {
-        let hash_count = self.bloom_hash_buffer.len();
+    /// The top-level index's bytes once `finish` spills the open partition,
+    /// which adds an entry under its last key.
+    fn tli_at_finish(&self) -> usize {
+        match &self.last_key {
+            Some(last) if !self.bloom_hash_buffer.is_empty() => {
+                self.tli_bytes + core::mem::size_of::<KeyedBlockHandle>() + last.len()
+            }
+            _ => self.tli_bytes,
+        }
+    }
+
+    /// Builds the open partition from `hashes`, taken out of
+    /// `bloom_hash_buffer` by the caller.
+    fn spill_filter_partition(&mut self, key: &UserKey, hashes: Vec<u64>) -> crate::Result<()> {
+        let hash_count = hashes.len();
         let partition_index = self.tli_handles.len();
-        // mem::replace (rather than mem::take) preserves the buffer's
-        // grown capacity for the next partition. `take` leaves a
-        // capacity-0 Vec behind, which would force a reallocation on
-        // every register_key call following a spill. Tables with many
-        // partitions can spill thousands of times during a single
-        // flush/compaction, so the saved reallocations matter on the
-        // write hot path.
-        let old_cap = self.bloom_hash_buffer.capacity();
-        let hashes = core::mem::replace(&mut self.bloom_hash_buffer, Vec::with_capacity(old_cap));
         let filter_bytes = build_burr_filter_bytes(self.bloom_policy, hashes)?;
 
         // An empty BuRR build result means the policy is inactive for
@@ -161,6 +169,7 @@ impl PartitionedFilterWriter {
             0,
             BlockHandle::new(BlockOffset(self.relative_file_pos), bytes_written),
         ));
+        self.tli_bytes += core::mem::size_of::<KeyedBlockHandle>() + key.len();
 
         log::trace!(
             "Built BuRR filter partition ({}B) with end_key={key:?} at +{:#X?}",
@@ -231,6 +240,9 @@ impl PartitionedFilterWriter {
     }
 }
 
+#[cfg(test)]
+mod tests;
+
 impl<W: crate::io::Write + crate::io::Seek> FilterWriter<W> for PartitionedFilterWriter {
     fn use_encryption(
         mut self: Box<Self>,
@@ -288,7 +300,7 @@ impl<W: crate::io::Write + crate::io::Seek> FilterWriter<W> for PartitionedFilte
         self
     }
 
-    fn register_key(&mut self, key: &UserKey) -> crate::Result<()> {
+    fn register_key(&mut self, key: &UserKey) -> crate::Result<usize> {
         self.bloom_hash_buffer.push(crate::hash::hash64(key));
 
         // NOTE: Prefix hashes are NOT inserted for partitioned filters.
@@ -304,10 +316,107 @@ impl<W: crate::io::Write + crate::io::Seek> FilterWriter<W> for PartitionedFilte
         self.last_key = Some(key.clone());
 
         if self.approx_filter_size >= self.partition_size as usize {
-            self.spill_filter_partition(key)?;
+            // mem::replace (rather than mem::take) preserves the buffer's
+            // grown capacity for the next partition. `take` leaves a
+            // capacity-0 Vec behind, which would force a reallocation on
+            // every register_key call following a spill. Tables with many
+            // partitions can spill thousands of times during a single
+            // flush/compaction, so the saved reallocations matter on the
+            // write hot path.
+            let old_cap = self.bloom_hash_buffer.capacity();
+            let hashes =
+                core::mem::replace(&mut self.bloom_hash_buffer, Vec::with_capacity(old_cap));
+            self.spill_filter_partition(key, hashes)?;
         }
 
-        Ok(())
+        Ok(1)
+    }
+
+    fn held_bytes(&self) -> u64 {
+        // The built partitions stay buffered until `finish` writes them.
+        let hashes = self.bloom_hash_buffer.capacity() * core::mem::size_of::<u64>();
+        let tli = super::super::handles_held(
+            self.tli_bytes,
+            &self.tli_handles,
+            self.tli_handles.capacity(),
+        );
+        (self.final_filter_buffer.capacity() + hashes + tli) as u64
+    }
+
+    fn finish_scratch_bytes(&self) -> u64 {
+        use crate::table::block::{BlockType, framed_len_bound, transform_scratch_bound};
+        let encryption = self.encryption.as_deref();
+        // `finish` builds the open partition, by its wire layout, and frames
+        // it onto the partition buffer, which reallocates when it outgrows its
+        // capacity and holds both copies while it moves.
+        let open = if self.bloom_hash_buffer.is_empty() {
+            0
+        } else {
+            let n = self.bloom_hash_buffer.len();
+            let build =
+                crate::table::filter::ribbon::burr::builder::build_peak_bytes(n, false) as u64;
+            let filter = self.bloom_policy.encoded_filter_size(n) as u64;
+            let frame = framed_len_bound(
+                filter,
+                BlockType::Filter,
+                CompressionType::None,
+                encryption,
+                self.ecc,
+            );
+            let needed = self.final_filter_buffer.len() as u64 + frame;
+            let capacity = self.final_filter_buffer.capacity() as u64;
+            let growth = if needed > capacity {
+                needed.max(2 * capacity)
+            } else {
+                0
+            };
+            build + filter + frame + growth
+        };
+        // Then the top-level index, counted at its in-memory size, and its
+        // framed copy.
+        let tli = self.tli_at_finish() as u64;
+        open + tli
+            + transform_scratch_bound(
+                tli,
+                BlockType::Index,
+                self.compression,
+                encryption,
+                self.ecc,
+            )
+    }
+
+    fn finish_output_bytes(&self) -> u64 {
+        use crate::table::block::{BlockType, framed_len_bound};
+        if self.last_key.is_none() {
+            return 0;
+        }
+        let encryption = self.encryption.as_deref();
+        // The built partitions are framed already; `finish` builds the open
+        // one, counted by its wire layout, which the partition-split estimate
+        // does not model, and the top-level index, counted at its in-memory
+        // size, above what its encoding takes.
+        let open = if self.bloom_hash_buffer.is_empty() {
+            0
+        } else {
+            framed_len_bound(
+                self.bloom_policy
+                    .encoded_filter_size(self.bloom_hash_buffer.len()) as u64,
+                BlockType::Filter,
+                CompressionType::None,
+                encryption,
+                self.ecc,
+            )
+        };
+        let tli = self.tli_at_finish();
+        self.final_filter_buffer.len() as u64
+            + open
+            + framed_len_bound(
+                tli as u64,
+                BlockType::Index,
+                self.compression,
+                encryption,
+                self.ecc,
+            )
     }
 
     fn finish(
@@ -325,7 +434,9 @@ impl<W: crate::io::Write + crate::io::Seek> FilterWriter<W> for PartitionedFilte
                 reason = "last key must exist because of initial check"
             )]
             let last_key = self.last_key.take().expect("last key should exist");
-            self.spill_filter_partition(&last_key)?;
+            // No partition follows the last one, so the buffer goes whole.
+            let hashes = core::mem::take(&mut self.bloom_hash_buffer);
+            self.spill_filter_partition(&last_key, hashes)?;
         }
 
         let index_base_offset = BlockOffset(file_writer.get_mut().stream_position()?);

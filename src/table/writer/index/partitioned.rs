@@ -34,7 +34,13 @@ pub struct PartitionedIndexWriter {
     zstd_two_pass_seed: bool,
 
     tli_handles: Vec<KeyedBlockHandle>,
+    /// Bytes the top-level index entries hold: each handle and its end key.
+    tli_bytes: usize,
+    /// Bytes the top-level index entries take encoded, bounded from above.
+    tli_encoded: usize,
     data_block_handles: Vec<KeyedBlockHandle>,
+    /// Bytes the open partition's entries take encoded, bounded from above.
+    open_encoded: usize,
 
     buffer_size: u32,
     partition_size: u32,
@@ -72,7 +78,10 @@ impl PartitionedIndexWriter {
             zstd_two_pass_seed: true,
 
             tli_handles: Vec::new(),
+            tli_bytes: 0,
+            tli_encoded: 0,
             data_block_handles: Vec::new(),
+            open_encoded: 0,
             block_buffer: Vec::with_capacity(4_096),
 
             final_write_buffer: Vec::new(),
@@ -83,8 +92,26 @@ impl PartitionedIndexWriter {
         }
     }
 
+    /// The top-level index's encoded bytes once `finish` cuts the open
+    /// partition, which adds an entry under its last key.
+    fn tli_at_finish(&self) -> usize {
+        let entries = self
+            .data_block_handles
+            .last()
+            .map_or(self.tli_encoded, |last| {
+                self.tli_encoded + last.encoded_len_bound_unplaced()
+            });
+        if entries == 0 {
+            0
+        } else {
+            super::block_len(entries)
+        }
+    }
+
     fn cut_index_block(&mut self) -> crate::Result<()> {
-        let mut bytes = vec![];
+        // Sized to the bound the estimates charge, so the block never grows
+        // past it.
+        let mut bytes = Vec::with_capacity(super::block_len(self.open_encoded));
         IndexBlock::encode_into_with_restart_interval(
             &mut bytes,
             &self.data_block_handles,
@@ -146,6 +173,10 @@ impl PartitionedIndexWriter {
             self.relative_file_pos,
         );
 
+        self.tli_bytes +=
+            core::mem::size_of::<KeyedBlockHandle>() + index_block_handle.end_key().len();
+        // Its offset is relative until `finish` shifts it into the file.
+        self.tli_encoded += index_block_handle.encoded_len_bound_unplaced();
         self.tli_handles.push(index_block_handle);
         self.final_write_buffer.append(&mut self.block_buffer);
 
@@ -156,6 +187,7 @@ impl PartitionedIndexWriter {
         // IMPORTANT: Clear buffer after everything else
         self.data_block_handles.clear();
         self.buffer_size = 0;
+        self.open_encoded = 0;
 
         Ok(())
     }
@@ -171,7 +203,7 @@ impl PartitionedIndexWriter {
             item.shift(index_base_offset);
         }
 
-        let mut bytes = vec![];
+        let mut bytes = Vec::with_capacity(super::block_len(self.tli_encoded));
         IndexBlock::encode_into_with_restart_interval(
             &mut bytes,
             &self.tli_handles,
@@ -222,6 +254,9 @@ impl PartitionedIndexWriter {
         Ok(bytes)
     }
 }
+
+#[cfg(test)]
+mod tests;
 
 impl<W: crate::io::Write + crate::io::Seek> BlockIndexWriter<W> for PartitionedIndexWriter {
     fn use_encryption(
@@ -285,6 +320,7 @@ impl<W: crate::io::Write + crate::io::Seek> BlockIndexWriter<W> for PartitionedI
             (block_handle.end_key().len() + core::mem::size_of::<KeyedBlockHandle>()) as u32;
 
         self.buffer_size += block_handle_size;
+        self.open_encoded += block_handle.encoded_len_bound();
 
         self.data_block_handles.push(block_handle);
 
@@ -293,6 +329,88 @@ impl<W: crate::io::Write + crate::io::Seek> BlockIndexWriter<W> for PartitionedI
         }
 
         Ok(())
+    }
+
+    fn held_bytes(&self) -> u64 {
+        // The cut partitions stay buffered until `finish` writes them.
+        (self.final_write_buffer.capacity()
+            + self.block_buffer.capacity()
+            + super::handles_held(
+                self.buffer_size as usize,
+                &self.data_block_handles,
+                self.data_block_handles.capacity(),
+            )
+            + super::handles_held(
+                self.tli_bytes,
+                &self.tli_handles,
+                self.tli_handles.capacity(),
+            )) as u64
+    }
+
+    fn finish_scratch_bytes(&self) -> u64 {
+        use crate::table::block::{BlockType, framed_len_bound, transform_scratch_bound};
+        let transform = |payload: usize| {
+            transform_scratch_bound(
+                payload as u64,
+                BlockType::Index,
+                self.compression,
+                self.encryption.as_deref(),
+                self.ecc,
+            )
+        };
+        // `finish` encodes the open partition and frames it, then appends the
+        // frame to the partition buffer, which reallocates when it outgrows
+        // its capacity and holds both copies while it moves.
+        let open = if self.data_block_handles.is_empty() {
+            0
+        } else {
+            let open = super::block_len(self.open_encoded) as u64;
+            let frame = framed_len_bound(
+                open,
+                BlockType::Index,
+                self.compression,
+                self.encryption.as_deref(),
+                self.ecc,
+            );
+            let needed = self.final_write_buffer.len() as u64 + frame;
+            let capacity = self.final_write_buffer.capacity() as u64;
+            let growth = if needed > capacity {
+                needed.max(2 * capacity)
+            } else {
+                0
+            };
+            open + frame + growth
+        };
+        // Then the top-level index, which the table keeps until it writes the
+        // tail mirror, and its framed copy.
+        let tli = self.tli_at_finish();
+        open + tli as u64 + transform(tli)
+    }
+
+    fn finish_output_bytes(&self) -> u64 {
+        use crate::table::block::{BlockType, framed_len_bound};
+        let frame = |payload: usize| {
+            framed_len_bound(
+                payload as u64,
+                BlockType::Index,
+                self.compression,
+                self.encryption.as_deref(),
+                self.ecc,
+            )
+        };
+        // The cut partitions are framed already. `finish` cuts the open one,
+        // and the table writes the top-level index twice, at the head and as
+        // the tail mirror.
+        let open = if self.data_block_handles.is_empty() {
+            0
+        } else {
+            frame(super::block_len(self.open_encoded))
+        };
+        let tli = self.tli_at_finish();
+        if tli == 0 {
+            return self.final_write_buffer.len() as u64;
+        }
+        self.final_write_buffer.len() as u64 + open + 2 * frame(tli)
     }
 
     fn finish(

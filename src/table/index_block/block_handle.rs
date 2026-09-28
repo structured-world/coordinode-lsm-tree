@@ -130,6 +130,37 @@ impl KeyedBlockHandle {
     pub fn end_key(&self) -> &UserKey {
         &self.end_key
     }
+
+    /// Bytes this entry takes in an index block, bounded from above: its full
+    /// encoding, which a truncated one never exceeds, and its restart pointer.
+    #[must_use]
+    pub fn encoded_len_bound(&self) -> usize {
+        self.encoded_len_bound_with_offset(varint_len(*self.offset()))
+    }
+
+    /// [`encoded_len_bound`](Self::encoded_len_bound) for an entry whose
+    /// offset is still relative and gets shifted before it is encoded: the
+    /// offset is counted at its widest.
+    #[must_use]
+    pub fn encoded_len_bound_unplaced(&self) -> usize {
+        self.encoded_len_bound_with_offset(varint_len(u64::MAX))
+    }
+
+    fn encoded_len_bound_with_offset(&self, offset_len: usize) -> usize {
+        1 + offset_len
+            + varint_len(u64::from(self.size()))
+            + varint_len(self.seqno)
+            // Widens: a key length is a `usize`, at most 64 bits on every target.
+            + varint_len(self.end_key.len() as u64)
+            + self.end_key.len()
+            + core::mem::size_of::<u32>()
+    }
+}
+
+/// LEB128 length of `v`. The `as` casts widen: a bit count (at most 64) to
+/// `usize`.
+const fn varint_len(v: u64) -> usize {
+    (64 - (v | 1).leading_zeros() as usize).div_ceil(7)
 }
 
 #[cfg(test)]
