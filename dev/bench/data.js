@@ -1,5 +1,5 @@
 window.BENCHMARK_DATA = {
-  "lastUpdate": 1790600814417,
+  "lastUpdate": 1790615055105,
   "repoUrl": "https://github.com/structured-world/coordinode-lsm-tree",
   "entries": {
     "lsm-tree db_bench costs": [
@@ -26364,6 +26364,90 @@ window.BENCHMARK_DATA = {
             "value": 358372.1529814173,
             "unit": "ops/sec",
             "extra": "P50: 2.2us | P99: 12.1us | P99.9: 91.5us\nthreads: 1 | elapsed: 0.56s | num: 200000 | iterations: 3"
+          }
+        ]
+      },
+      {
+        "commit": {
+          "author": {
+            "email": "mail@polaz.com",
+            "name": "Dmitry Prudnikov",
+            "username": "polaz"
+          },
+          "committer": {
+            "email": "noreply@github.com",
+            "name": "GitHub",
+            "username": "web-flow"
+          },
+          "distinct": true,
+          "id": "84ff57107e65bb6b57cc0a3d941016cc7f03936e",
+          "message": "fix(config): wire the partition size policies to the table writers (#738)\n\n## Summary\n\n`Config::index_block_partition_size_policy` and\n`Config::filter_block_partition_size_policy` existed with a 4 KiB\ndefault, but nothing read them: every table writer kept one built-in\npartition size for both its index and its filter, so a tree configured\nwith another size silently wrote 4 KiB partitions.\n\n- The table writer keeps the two sizes apart:\n`Writer::use_index_partition_size` and\n`Writer::use_filter_partition_size`, each applied whichever order the\nbuilder sets them in. `Writer::use_meta_partition_size` still sets both.\n- The multi-writer carries both sizes across rotations, and flush,\ncompaction, ingestion and the blob tree's flush pass each level's\npolicy.\n- `Config` gains `index_block_partition_size_policy` and\n`filter_block_partition_size_policy` builders, documented with examples.\nThe `TODO: implement` markers on the defaults are gone.\n\nThe 5.x.x line has the same bug; its fix is the backport #739, which\nkeeps that line's public API as released.\n\n## Testing\n\n- `the_configured_partition_sizes_reach_the_writers`: through a flush, a\ncompaction, an ingestion and a blob tree's flush, four times the filter\npartition size shrinks the filter's top-level index more than threefold,\na larger index partition size shrinks the block index's, and neither\nsize moves the other's index. Red before the fix (the same 884-byte\nfilter top-level index under both sizes); with the wiring of any one\npath removed, the test fails on that path.\n- `cargo fmt --check`, `cargo clippy --all-targets` (default and\n`--all-features`) with `-D warnings`, `cargo nextest run` (2861 default,\n3833 all features), `cargo test --doc --all-features`, `cargo doc\n--no-deps --all-features`, `cargo check --target thumbv7em-none-eabihf\n--no-default-features --features alloc`.\n\nCloses #735\n\n\n<!-- This is an auto-generated comment: release notes by coderabbit.ai\n-->\n\n## Summary by CodeRabbit\n\n* **New Features**\n* Added separate configuration options for index and filter partition\nsizes, allowing each to be set independently by table level.\n* Configured partition sizes are now applied when data is flushed,\ningested, or compacted, and when new table files are written.\n* **Documentation**\n* Expanded configuration guidance with per-level behavior, defaults, and\nexamples.\n\n<!-- end of auto-generated comment: release notes by coderabbit.ai -->",
+          "timestamp": "2026-09-28T19:55:02+03:00",
+          "tree_id": "610ca21ef5c7d5af165182f1a09fccf7c9be60d0",
+          "url": "https://github.com/structured-world/coordinode-lsm-tree/commit/84ff57107e65bb6b57cc0a3d941016cc7f03936e"
+        },
+        "date": 1790614985166,
+        "tool": "customBiggerIsBetter",
+        "benches": [
+          {
+            "name": "mixed",
+            "value": 29204.476116211237,
+            "unit": "ops/sec",
+            "extra": "P50: 0.5us | P99: 9.8us | P99.9: 17.6us\nthreads: 1 | elapsed: 18.33s | num: 200000 | iterations: 3"
+          },
+          {
+            "name": "fillseq",
+            "value": 2641093.3820234747,
+            "unit": "ops/sec",
+            "extra": "P50: 0.2us | P99: 0.7us | P99.9: 1.9us\nthreads: 1 | elapsed: 0.08s | num: 200000 | iterations: 3"
+          },
+          {
+            "name": "fillrandom",
+            "value": 648335.9110304709,
+            "unit": "ops/sec",
+            "extra": "P50: 1.3us | P99: 3.3us | P99.9: 14.3us\nthreads: 1 | elapsed: 0.31s | num: 200000 | iterations: 3"
+          },
+          {
+            "name": "readrandom",
+            "value": 495758.2994264815,
+            "unit": "ops/sec",
+            "extra": "P50: 1.9us | P99: 6.7us | P99.9: 28.5us\nthreads: 1 | elapsed: 0.40s | num: 200000 | iterations: 3"
+          },
+          {
+            "name": "readseq",
+            "value": 2334288.508629141,
+            "unit": "ops/sec",
+            "extra": "P50: 0.2us | P99: 4.7us | P99.9: 7.1us\nthreads: 1 | elapsed: 0.09s | num: 200000 | iterations: 3"
+          },
+          {
+            "name": "seekrandom",
+            "value": 255338.6521370394,
+            "unit": "ops/sec",
+            "extra": "P50: 3.3us | P99: 8.8us | P99.9: 20.1us\nthreads: 1 | elapsed: 0.78s | num: 200000 | iterations: 3"
+          },
+          {
+            "name": "prefixscan",
+            "value": 146454.35150038783,
+            "unit": "ops/sec",
+            "extra": "P50: 6.2us | P99: 13.8us | P99.9: 37.9us\nthreads: 1 | elapsed: 1.37s | num: 200000 | iterations: 3"
+          },
+          {
+            "name": "overwrite",
+            "value": 696889.5491808963,
+            "unit": "ops/sec",
+            "extra": "P50: 1.2us | P99: 2.9us | P99.9: 13.0us\nthreads: 1 | elapsed: 0.29s | num: 200000 | iterations: 3"
+          },
+          {
+            "name": "mergerandom",
+            "value": 744358.3277272607,
+            "unit": "ops/sec",
+            "extra": "P50: 0.4us | P99: 0.7us | P99.9: 6.8us\nthreads: 1 | elapsed: 0.27s | num: 200000 | iterations: 3"
+          },
+          {
+            "name": "readwhilewriting",
+            "value": 322271.29486617865,
+            "unit": "ops/sec",
+            "extra": "P50: 2.3us | P99: 17.0us | P99.9: 94.5us\nthreads: 1 | elapsed: 0.62s | num: 200000 | iterations: 3"
           }
         ]
       }
