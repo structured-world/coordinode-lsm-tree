@@ -223,12 +223,10 @@ pub struct MultiWriter {
     #[cfg(zstd_any)]
     zstd_dictionary: Option<Arc<crate::compression::ZstdDictionary>>,
 
-    /// Optional parallel block-compression executor + worker count, preserved
-    /// here so every successor [`Writer`] of a rotated run shares the same pool.
+    /// Optional parallel block compression, preserved here so every successor
+    /// [`Writer`] of a rotated run shares the same pool and settings.
     #[cfg(feature = "std")]
-    spawner: Option<Arc<dyn crate::table::writer::CompactionSpawner>>,
-    #[cfg(feature = "std")]
-    parallel_threads: usize,
+    parallel: Option<crate::table::writer::ParallelCompression>,
 }
 
 impl MultiWriter {
@@ -323,26 +321,21 @@ impl MultiWriter {
             zstd_dictionary: None,
 
             #[cfg(feature = "std")]
-            spawner: None,
-            #[cfg(feature = "std")]
-            parallel_threads: 0,
+            parallel: None,
         })
     }
 
-    /// Enables parallel block compression for this run, sharing `spawner` across
-    /// every rotated successor table. `threads` sizes the in-flight cap. No-op
-    /// when `spawner` is `None`.
+    /// Enables parallel block compression for this run, shared by every
+    /// rotated successor table. No-op when `parallel` is `None`.
     #[cfg(feature = "std")]
     #[must_use]
     pub fn use_parallel_compression(
         mut self,
-        spawner: Option<Arc<dyn crate::table::writer::CompactionSpawner>>,
-        threads: usize,
+        parallel: Option<crate::table::writer::ParallelCompression>,
     ) -> Self {
-        if let Some(spawner) = spawner {
-            self.spawner = Some(Arc::clone(&spawner));
-            self.parallel_threads = threads;
-            self.writer = self.writer.use_parallel_compression(spawner, threads);
+        if let Some(parallel) = parallel {
+            self.writer = self.writer.use_parallel_compression(parallel.clone());
+            self.parallel = Some(parallel);
         }
         self
     }
@@ -963,8 +956,8 @@ impl MultiWriter {
         }
 
         #[cfg(feature = "std")]
-        if let Some(spawner) = self.spawner.clone() {
-            new_writer = new_writer.use_parallel_compression(spawner, self.parallel_threads);
+        if let Some(parallel) = self.parallel.clone() {
+            new_writer = new_writer.use_parallel_compression(parallel);
         }
 
         let mut old_writer = core::mem::replace(&mut self.writer, new_writer);
