@@ -729,6 +729,48 @@ impl Writer {
         data + self.finish_metadata_bytes
     }
 
+    /// Bytes a table holding range tombstones alone writes besides its
+    /// tombstone block, bounded from above, with keys of up to `key_len`
+    /// bytes: the synthetic weak-tombstone block and its index entry, written
+    /// twice, its one-key filter, the two meta copies and the fixed tail.
+    pub(crate) fn tombstone_only_overhead(&self, key_len: u64) -> crate::Result<u64> {
+        use crate::table::block::{BlockType, EccParams, framed_len_bound};
+
+        let encryption = self.encryption.as_deref();
+        let none = CompressionType::None;
+        // An entry holds its key besides a few varints, a seqno and a type.
+        let entry = key_len + 32;
+        let base = match self.meta_base_len {
+            Some(base) => base,
+            None => self.meta_payload_len_without_keys()?,
+        };
+        let meta = base + 2 * key_len + 4;
+        let filter = self.bloom_policy.filter_size_bound(1) as u64;
+        Ok(FIXED_TAIL_LEN
+            + 2 * framed_len_bound(
+                meta,
+                BlockType::Meta,
+                none,
+                encryption,
+                self.ecc.map(|_| EccParams::RS_4_2),
+            )
+            + framed_len_bound(
+                entry,
+                BlockType::Data,
+                self.data_block_compression,
+                encryption,
+                self.ecc,
+            )
+            + 2 * framed_len_bound(
+                entry,
+                BlockType::Index,
+                self.index_block_compression,
+                encryption,
+                self.ecc,
+            )
+            + framed_len_bound(filter, BlockType::Filter, none, encryption, self.ecc))
+    }
+
     /// Heap bytes the per-key and per-block state holds until `finish`,
     /// including what `finish` allocates on top to build its sections. It
     /// grows with the keys, not the data bytes, so a table of well-compressing
@@ -1040,10 +1082,23 @@ impl Writer {
         let index_phase = index_held + index_scratch + filter_held + locator_held + sections_held;
         let filter_phase =
             index_scratch + filter_held + filter_scratch + locator_held + sections_held;
-        let section_phase = index_scratch + locator_held + sections_held + 2 * section_scratch;
-        let locator_phase =
-            index_scratch + locator_held + locator_scratch + sections_held + section_scratch;
-        let meta_phase = index_scratch + sections_held + section_scratch + meta_scratch;
+        // The bitmap's encoding is kept past its frame for the meta's content
+        // hash, besides the copy the block buffer takes of it.
+        let bitmap_retained = if bitmap.is_empty() {
+            0
+        } else {
+            bitmap.encoded_len()
+        };
+        let section_phase =
+            index_scratch + locator_held + sections_held + 2 * section_scratch + bitmap_retained;
+        let locator_phase = index_scratch
+            + locator_held
+            + locator_scratch
+            + sections_held
+            + section_scratch
+            + bitmap_retained;
+        let meta_phase =
+            index_scratch + sections_held + section_scratch + meta_scratch + bitmap_retained;
 
         self.held_state_bytes = lineage_held
             + index_phase
