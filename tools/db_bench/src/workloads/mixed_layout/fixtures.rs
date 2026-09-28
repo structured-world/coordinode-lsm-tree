@@ -464,7 +464,7 @@ fn columnar_segments(
     config: &BenchConfig,
     seqno: &AtomicU64,
     base: &Path,
-    segments: u64,
+    segments: usize,
 ) -> lsm_tree::Result<Fixture> {
     let dir = fixture_dir(base)?;
     let tree = open(
@@ -488,11 +488,7 @@ fn columnar_segments(
         })
         .collect();
     for segment in 0..segments {
-        for row in rows
-            .iter()
-            .skip(segment as usize)
-            .step_by(segments as usize)
-        {
+        for row in rows.iter().skip(segment).step_by(segments) {
             if let Some(value) = row.expect {
                 tree.insert(
                     row.key.clone(),

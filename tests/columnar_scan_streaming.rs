@@ -9,6 +9,7 @@
 #![cfg(all(feature = "metrics", feature = "columnar"))]
 
 use lsm_tree::table::columnar::{COL_USER_KEY, COL_VALUE};
+use lsm_tree::table::columnar_predicate::{ColumnRangePredicate, PredicateApply};
 use lsm_tree::{
     AbstractTree, AnyTree, Config, SeqNo, SequenceNumberCounter, Tree, UserKey, get_tmp_folder,
 };
@@ -240,6 +241,54 @@ fn a_row_page_larger_than_its_share_is_read_and_counted() {
     assert!(
         scan.oversized_reads() > 0,
         "reads past a one-byte share are counted",
+    );
+}
+
+#[test]
+fn a_read_past_the_share_is_counted_even_when_its_rows_are_filtered_out() {
+    // A pushed-down predicate reads every row page its zones admit and then
+    // keeps one row of it. What the read held is the pages, not the one row it
+    // returns, so a page larger than the share is a read past it even though
+    // the batch it yields is tiny.
+    const BUDGET: u64 = 1_024;
+    let folder = get_tmp_folder();
+    let AnyTree::Standard(tree) = Config::new(
+        folder.path(),
+        SequenceNumberCounter::default(),
+        SequenceNumberCounter::default(),
+    )
+    .columnar_scan_budget(BUDGET)
+    .open()
+    .expect("open") else {
+        panic!("expected a standard tree");
+    };
+    tree.update_runtime_config(|cfg| {
+        cfg.columnar = true;
+        cfg.zone_map = true;
+    })
+    .expect("enable columnar");
+    for i in 0..ROWS {
+        tree.insert(key(i), vec![b'v'; 256], u64::from(i));
+    }
+    tree.flush_active_memtable(0).expect("flush");
+
+    let predicate = ColumnRangePredicate {
+        column_id: COL_USER_KEY,
+        lower: Some(key(5)),
+        upper: Some(key(5)),
+        apply: PredicateApply::Filter,
+    };
+    let mut scan = tree
+        .columnar_scan(&[COL_USER_KEY, COL_VALUE], Some(&predicate), SeqNo::MAX, ..)
+        .expect("scan");
+    let mut rows = 0;
+    for batch in &mut scan {
+        rows += batch.expect("batch").row_count;
+    }
+    assert_eq!(rows, 1, "the predicate keeps one row");
+    assert!(
+        scan.oversized_reads() > 0,
+        "the row page read to find that row is larger than the {BUDGET} B share",
     );
 }
 

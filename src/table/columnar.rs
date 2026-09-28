@@ -1231,8 +1231,8 @@ impl ColumnBatch {
     }
 
     /// Total size of the column bytes, data plus any validity bitmap: what a
-    /// gather that built this batch copied, which the read counters record.
-    #[cfg(feature = "metrics")]
+    /// gather that built this batch copied, which the read counters record,
+    /// and what a scan holding it counts against its payload budget.
     #[must_use]
     pub(crate) fn data_size(&self) -> usize {
         self.columns

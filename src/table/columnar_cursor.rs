@@ -381,7 +381,7 @@ impl ColumnarCursor {
         self.group_rows = u64::from(group_rows);
     }
 
-    /// Takes the bytes and rows one read yielded: what a row decodes to, for
+    /// Takes what one read held and the rows it read: what a row costs, for
     /// sizing the next run, and whether the read went past the share.
     fn learn(&mut self, bytes: u64, rows: u32, share: u64) {
         if rows > 0 {
@@ -453,8 +453,12 @@ impl ColumnarCursor {
     }
 
     /// Pushes onto `pending` one batch per page of `blocks` that keeps a row,
-    /// returning the bytes and rows pushed. `bound_keys` holds the key column
-    /// of the same row pages when the group straddles the restriction bound.
+    /// returning what the read held and the rows it read: the larger of the
+    /// pages loaded and the batches built from them, since a filter can keep
+    /// far less than it loaded and a decode can build more than it loaded,
+    /// and the rows before any filter, which is what a run is sized in.
+    /// `bound_keys` holds the key column of the same row pages when the group
+    /// straddles the restriction bound.
     fn yield_pages(
         &mut self,
         blocks: &RowGroupBlocks,
@@ -468,6 +472,14 @@ impl ColumnarCursor {
         // from theirs.
         let mut budget = crate::table::columnar::DecodeBudget::default();
         let pages = blocks.page_columns(|_| true, &mut budget)?;
+        let loaded: u64 = blocks
+            .pages
+            .iter()
+            .filter_map(|slot| slot.block.as_ref())
+            .map(|block| block.data.len() as u64)
+            .sum();
+        // The pages of one group, whose rows fit a `u32`.
+        let rows_read: u32 = pages.iter().map(|page| page.rows).sum();
         let row_base = self.row_base;
         let mut copied = 0usize;
         let mut support = self.support;
@@ -578,11 +590,9 @@ impl ColumnarCursor {
         let _ = copied;
         self.support = support;
         read?;
-        let bytes = out.iter().map(|b| b.data_size() as u64).sum();
-        // The pages of one group, whose rows fit a `u32`.
-        let rows = out.iter().map(|b| b.row_count).sum();
+        let built: u64 = out.iter().map(|b| b.data_size() as u64).sum();
         self.pending.extend(out);
-        Ok((bytes, rows))
+        Ok((loaded.max(built), rows_read))
     }
 }
 
