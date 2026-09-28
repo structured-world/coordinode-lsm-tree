@@ -1,5 +1,5 @@
 window.BENCHMARK_DATA = {
-  "lastUpdate": 1790615060480,
+  "lastUpdate": 1790629303301,
   "repoUrl": "https://github.com/structured-world/coordinode-lsm-tree",
   "entries": {
     "lsm-tree db_bench costs": [
@@ -26634,6 +26634,90 @@ window.BENCHMARK_DATA = {
             "value": 322271.29486617865,
             "unit": "ops/sec",
             "extra": "P50: 2.3us | P99: 17.0us | P99.9: 94.5us\nthreads: 1 | elapsed: 0.62s | num: 200000 | iterations: 3"
+          }
+        ]
+      },
+      {
+        "commit": {
+          "author": {
+            "email": "mail@polaz.com",
+            "name": "Dmitry Prudnikov",
+            "username": "polaz"
+          },
+          "committer": {
+            "email": "noreply@github.com",
+            "name": "GitHub",
+            "username": "web-flow"
+          },
+          "distinct": true,
+          "id": "5d911391493d4985795147a352037a3d75a4ffc1",
+          "message": "perf(columnar): stream the projected scan within a payload budget (#740)\n\n## Summary\n\nA projected columnar scan now streams instead of reading a whole table\nor a whole overlapping group before its first batch, and holds at most a\nconfigured payload budget.\n\n- `Table::columnar_scan` returns a `ColumnarCursor` that reads one row\ngroup at a time. A key range seeks past the groups below it and stops\nafter the group that reaches the upper bound.\n- An overlapping group is merged as it streams. Each segment is a source\non a binary heap ordered by key, effective seqno (newest first), then\nsegment recency. The newest visible version of each key is taken and\nolder ones are shadowed. Output rows are gathered straight from the\nsource batches, with the seqno column written from effective seqnos, so\nthe merge copies exactly the rows it returns.\n- `Config::columnar_scan_budget` (default 1 MiB) bounds the page bytes a\nscan holds, and the segments of a group share it equally.\n- A group that does not fit a segment's share is read in runs of row\npages, sized from the bytes a row decodes to.\n- A read past the share is admitted and counted in\n`ColumnarScan::oversized_reads`. That is a row page larger than the\nshare, a run whose rows decode wider than the rows before it, or a group\nread whole because a pushed-down predicate selects its row pages by\ntheir zones.\n  - `peak_payload_bytes` reports the most the scan held.\n- db_bench `mixed-layout` gains `columnar-scan-one-segment` and\n`columnar-scan-overlap-8`. Both report time and bytes read to the first\nbatch, and the retained payload.\n\n`Table::columnar_scan` now returns an iterator of `Result<ColumnBatch>`\ninstead of `Result<Vec<ColumnBatch>>`.\n\n## Measurements\n\ndb_bench `mixed-layout`, `--num 100000`, 256-byte values. The base is\n`84ff57107` (current `main`) with the same harness. The base has no\ncount of what a scan holds, so its retained figure is the sum of every\nbatch the group yields: a lower bound of what it materialised.\n\nMac:\n\n| Scenario | Figure | Base | This PR |\n|---|---|---|---|\n| one segment | first batch | 16-35 ms, 28.7 MB read | 0.12-0.21 ms,\n16.6 KB read |\n| one segment | retained | >= 27.8 MB | 11.9 KB |\n| 8 overlapping segments | first batch | 35-56 ms, 29.8 MB read |\n0.30-0.42 ms, 138 KB read |\n| 8 overlapping segments | retained | >= 27.7 MB | 132 KB |\n| 8 overlapping segments | copied per row | 863.6 B | 285.6 B |\n\nWindows, 15 interleaved passes per variant, distinct binaries verified\nby hash. The machine's noise floor is about 1.7%.\n\n| Scenario | Figure | Base | This PR |\n|---|---|---|---|\n| one segment | full pass, median | 42.40 ms | 42.81 ms (+1.0%, within\nnoise) |\n| one segment | first batch | 32-43 ms | 0.11-0.13 ms |\n| 8 overlapping segments | full pass, median | 79.69 ms | 77.74 ms\n(-2.4%) |\n| 8 overlapping segments | first batch | 69-83 ms | 0.56-0.62 ms |\n\nBytes read and decoded per row are unchanged in every scenario.\n\n## Testing\n\n- `tests/columnar_scan_streaming.rs`: a narrow range reads only its\nblocks; the first batch arrives after a bounded prefix for one segment\nand for an overlapping group; a scan dropped after its first batch reads\nnothing more; a wide overlapping group holds no more than the budget; a\nrow page larger than its share is read and counted. The first four\nfailed before the change.\n- `tests/prop_columnar_scan.rs`: property test comparing the scan\nagainst an oracle of the writes and the tree's row read, covering:\n- runs of keys with varying value widths, point deletes and range\ndeletes;\n  - keys rewritten at a seqno they already hold;\n  - flushes into overlapping segments, and compactions;\n  - random snapshots and key ranges;\n- predicates on the key, the value, an unprojected column and an absent\ncolumn;\n  - budgets from 1 byte to 1 MiB.\n- Existing counter test updated: the merge now copies exactly the bytes\nit returns.\n- Gates: `cargo fmt --check`, clippy with default and all features plus\ndb_bench, `cargo nextest run` (all features 3839 passed, default 2861\npassed), `cargo test --doc`, `cargo doc -D warnings`, no-std check\n(warning count unchanged).\n\nCloses #680\n\n\n<!-- This is an auto-generated comment: release notes by coderabbit.ai\n-->\n## Summary by CodeRabbit\n\n* **New Features**\n* Columnar scans now yield batches incrementally, so callers can stop\nearly and encounter read or decoding errors as batches are consumed.\n* Configure a shared byte budget for projected scans across merged\nsegments. Individual reads may exceed their share, while scans continue\nto return matching rows.\n* Scans support bounded key ranges, predicates, and overlapping segments\nwhile respecting visible updates and deletions.\n  * Scan results report peak retained payload and oversized reads.\n* **Documentation**\n* Added benchmark scenarios for scans across one and eight columnar\nsegments, including time to first batch and retained payload\nmeasurements.\n<!-- end of auto-generated comment: release notes by coderabbit.ai -->",
+          "timestamp": "2026-09-28T20:53:37Z",
+          "tree_id": "b0ab276c724ef9f2c8b12ab0adcd96537d36a70c",
+          "url": "https://github.com/structured-world/coordinode-lsm-tree/commit/5d911391493d4985795147a352037a3d75a4ffc1"
+        },
+        "date": 1790629284630,
+        "tool": "customBiggerIsBetter",
+        "benches": [
+          {
+            "name": "mixed",
+            "value": 30355.307228690297,
+            "unit": "ops/sec",
+            "extra": "P50: 0.6us | P99: 13.7us | P99.9: 28.3us\nthreads: 1 | elapsed: 17.63s | num: 200000 | iterations: 3"
+          },
+          {
+            "name": "fillseq",
+            "value": 2741260.6451888625,
+            "unit": "ops/sec",
+            "extra": "P50: 0.2us | P99: 0.8us | P99.9: 1.1us\nthreads: 1 | elapsed: 0.07s | num: 200000 | iterations: 3"
+          },
+          {
+            "name": "fillrandom",
+            "value": 784775.0932287306,
+            "unit": "ops/sec",
+            "extra": "P50: 1.1us | P99: 2.4us | P99.9: 12.0us\nthreads: 1 | elapsed: 0.25s | num: 200000 | iterations: 3"
+          },
+          {
+            "name": "readrandom",
+            "value": 501809.9645614025,
+            "unit": "ops/sec",
+            "extra": "P50: 1.8us | P99: 6.7us | P99.9: 28.0us\nthreads: 1 | elapsed: 0.40s | num: 200000 | iterations: 3"
+          },
+          {
+            "name": "readseq",
+            "value": 2274052.787087055,
+            "unit": "ops/sec",
+            "extra": "P50: 0.3us | P99: 4.8us | P99.9: 7.4us\nthreads: 1 | elapsed: 0.09s | num: 200000 | iterations: 3"
+          },
+          {
+            "name": "seekrandom",
+            "value": 250812.0699145166,
+            "unit": "ops/sec",
+            "extra": "P50: 3.4us | P99: 8.7us | P99.9: 21.0us\nthreads: 1 | elapsed: 0.80s | num: 200000 | iterations: 3"
+          },
+          {
+            "name": "prefixscan",
+            "value": 148698.11219151822,
+            "unit": "ops/sec",
+            "extra": "P50: 6.1us | P99: 12.5us | P99.9: 38.0us\nthreads: 1 | elapsed: 1.35s | num: 200000 | iterations: 3"
+          },
+          {
+            "name": "overwrite",
+            "value": 733055.9442309804,
+            "unit": "ops/sec",
+            "extra": "P50: 1.2us | P99: 2.7us | P99.9: 12.6us\nthreads: 1 | elapsed: 0.27s | num: 200000 | iterations: 3"
+          },
+          {
+            "name": "mergerandom",
+            "value": 751616.0995702526,
+            "unit": "ops/sec",
+            "extra": "P50: 0.5us | P99: 0.7us | P99.9: 1.0us\nthreads: 1 | elapsed: 0.27s | num: 200000 | iterations: 3"
+          },
+          {
+            "name": "readwhilewriting",
+            "value": 349756.5209327136,
+            "unit": "ops/sec",
+            "extra": "P50: 2.2us | P99: 12.2us | P99.9: 91.6us\nthreads: 1 | elapsed: 0.57s | num: 200000 | iterations: 3"
           }
         ]
       }
