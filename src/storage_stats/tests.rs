@@ -15,7 +15,66 @@ fn stats_with_avg(avg_entry_on_disk_bytes: u64) -> StorageStats {
         avg_value_bytes: None,
         reclaimable_bytes_estimate: 0,
         status: StorageStatus::Healthy,
+        blob_references: BlobReferenceStats::default(),
     }
+}
+
+/// `span_stats` over spans written as `(file, first, last)` byte strings.
+fn spans_of(spans: &[(u64, &str, &str)]) -> BlobReferenceStats {
+    let keys: Vec<(u64, crate::UserKey, crate::UserKey)> = spans
+        .iter()
+        .map(|&(id, first, last)| (id, first.into(), last.into()))
+        .collect();
+    span_stats(
+        keys.iter()
+            .map(|(id, first, last)| (*id, first, last))
+            .collect(),
+        crate::comparator::default_comparator().as_ref(),
+    )
+}
+
+/// Spans are closed: two files whose spans meet at one key both cover it, so
+/// a scan through that key reads both.
+#[test]
+fn spans_meeting_at_one_key_overlap() {
+    assert_eq!(
+        spans_of(&[(1, "a", "c"), (2, "c", "e")]),
+        BlobReferenceStats { count: 2, depth: 2 }
+    );
+    assert_eq!(
+        spans_of(&[(1, "a", "b"), (2, "c", "e")]),
+        BlobReferenceStats { count: 2, depth: 1 }
+    );
+}
+
+/// One blob file referenced by two tables is one file, however its spans
+/// overlap: depth counts distinct files over a key, not references.
+#[test]
+fn one_file_referenced_twice_counts_once() {
+    assert_eq!(
+        spans_of(&[(7, "a", "c"), (7, "b", "d")]),
+        BlobReferenceStats { count: 1, depth: 1 }
+    );
+    // Disjoint spans of one file, with another file between them.
+    assert_eq!(
+        spans_of(&[(7, "a", "b"), (7, "x", "y"), (8, "c", "d")]),
+        BlobReferenceStats { count: 2, depth: 1 }
+    );
+}
+
+/// Nested spans stack: a key inside all three covers all three files.
+#[test]
+fn nested_spans_stack() {
+    assert_eq!(
+        spans_of(&[(1, "a", "z"), (2, "m", "n"), (3, "m", "m")]),
+        BlobReferenceStats { count: 3, depth: 3 }
+    );
+}
+
+/// No spans: nothing referenced.
+#[test]
+fn no_spans_report_nothing() {
+    assert_eq!(spans_of(&[]), BlobReferenceStats::default());
 }
 
 #[test]

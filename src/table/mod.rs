@@ -694,24 +694,34 @@ impl Table {
         }
     }
 
+    /// On-disk bytes of the blob values this table references.
+    ///
+    /// # Errors
+    ///
+    /// When the table's `linked_blob_files` section cannot be read or parsed.
     pub fn referenced_blob_bytes(&self) -> crate::Result<u64> {
-        let cached = self
-            .0
-            .cached_blob_bytes
-            .load(core::sync::atomic::Ordering::Acquire);
-        if cached != u64::MAX {
-            return Ok(cached);
-        }
+        Ok(self.blob_links()?.iter().map(|f| f.on_disk_bytes).sum())
+    }
 
-        let sum = self
-            .list_blob_file_references()?
-            .map(|bf| bf.iter().map(|f| f.on_disk_bytes).sum::<u64>())
-            .unwrap_or_default();
-
+    /// The blob files this table references, with the key span each is
+    /// referenced over: read from the `linked_blob_files` section on first use
+    /// and kept. Empty for a table that references no blob file.
+    ///
+    /// # Errors
+    ///
+    /// When the section cannot be read or parsed; nothing is kept then, so a
+    /// later call reads it again.
+    pub fn blob_links(&self) -> crate::Result<&[LinkedFile]> {
         self.0
-            .cached_blob_bytes
-            .store(sum, core::sync::atomic::Ordering::Release);
-        Ok(sum)
+            .blob_links
+            .get_or_try_init(|| {
+                Ok(self
+                    .list_blob_file_references()?
+                    .unwrap_or_default()
+                    .into_boxed_slice()
+                    .into())
+            })
+            .map(|links| &**links)
     }
 
     pub fn list_blob_file_references(&self) -> crate::Result<Option<Vec<LinkedFile>>> {
@@ -9103,7 +9113,7 @@ impl Table {
                 #[cfg(feature = "metrics")]
                 metrics,
 
-                cached_blob_bytes: AtomicU64::new(u64::MAX),
+                blob_links: once_cell::race::OnceBox::new(),
                 read_count: AtomicU64::new(0),
                 last_access_secs: AtomicU64::new(0),
                 range_tombstones,

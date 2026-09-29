@@ -456,8 +456,8 @@ pub mod scrub;
 
 pub mod storage_stats;
 pub use storage_stats::{
-    ApproximateRangeStats, LevelStats, RangeCardinality, SegmentStats, StorageStatistics,
-    StorageStats, StorageStatus,
+    ApproximateRangeStats, BlobReferenceStats, LevelStats, RangeCardinality, SegmentStats,
+    StorageStatistics, StorageStats, StorageStatus,
 };
 
 mod version;

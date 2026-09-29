@@ -6,7 +6,8 @@
 //!
 //! Computed from the live version's table + blob-file metadata plus one
 //! size-stat per live file (the same accounting `Tree::create_checkpoint`
-//! uses), so it never touches the data blocks. See
+//! uses), so it never touches the data blocks. The blob reference figures also
+//! read each table's blob-link section, once: the table keeps it after. See
 //! [`crate::AbstractTree::storage_stats`].
 
 use crate::version::Version;
@@ -113,6 +114,136 @@ pub struct StorageStats {
 
     /// Coarse storage state.
     pub status: StorageStatus,
+
+    /// Blob files the tree's tables reference, and how many of them a scan
+    /// interleaves where their key spans overlap most, across every level. All
+    /// zero for a tree that does not separate values.
+    pub blob_references: BlobReferenceStats,
+}
+
+/// How scattered the blob values behind a set of tables are: a table, a level,
+/// or the whole tree.
+///
+/// The two figures answer different questions and must not be read as one.
+/// [`Self::count`] is how many blob files are referenced at all; thirty-two
+/// files each holding the values of one consecutive key range give a count of
+/// 32 while a scan still reads one file at a time. [`Self::depth`] is how many
+/// of those files a scan has to interleave where their key spans overlap most.
+#[must_use]
+#[derive(Copy, Clone, Debug, Default, Eq, PartialEq)]
+pub struct BlobReferenceStats {
+    /// Distinct blob files referenced (fan-out). A statistic, not a measure
+    /// of locality.
+    pub count: u64,
+    /// The largest number of distinct blob files whose referenced key spans
+    /// cover one key: an estimate of how many files a range scan through
+    /// that key interleaves.
+    ///
+    /// An estimate from key spans alone. A span runs from the first to the
+    /// last key that references its file, so keys inside it that point
+    /// elsewhere still count as covered; a restricted table still reports the
+    /// spans of the whole table it was cut from. The figure cannot see the
+    /// block cache, how reads coalesce, or that two logical reads may land in
+    /// one physical one: it is what a locality trigger can act on, and the
+    /// blob-file reads of a scan are what show whether acting paid off.
+    pub depth: u64,
+}
+
+/// Blob reference count and depth over the given tables' links. The tables
+/// must share one comparator (one tree's).
+///
+/// # Errors
+///
+/// When a table's `linked_blob_files` section cannot be read or parsed.
+pub(crate) fn blob_reference_stats<'a>(
+    tables: impl IntoIterator<Item = &'a crate::table::Table>,
+) -> crate::Result<BlobReferenceStats> {
+    let mut comparator = None;
+    let mut spans = Vec::new();
+    for table in tables {
+        comparator.get_or_insert_with(|| table.comparator.clone());
+        spans.extend(
+            table
+                .blob_links()?
+                .iter()
+                .map(|link| (link.blob_file_id, &link.first_key, &link.last_key)),
+        );
+    }
+    Ok(comparator.map_or_else(BlobReferenceStats::default, |cmp| {
+        span_stats(spans, cmp.as_ref())
+    }))
+}
+
+/// [`BlobReferenceStats`] of `(blob file, first key, last key)` spans ordered
+/// by `cmp`. Spans of one file (from different tables) are merged where they
+/// overlap, so the sweep counts distinct files, not references.
+fn span_stats<'k>(
+    mut spans: Vec<(
+        crate::vlog::BlobFileId,
+        &'k crate::UserKey,
+        &'k crate::UserKey,
+    )>,
+    cmp: &dyn crate::comparator::UserComparator,
+) -> BlobReferenceStats {
+    use core::cmp::Ordering;
+
+    // A span is closed at both ends. A recorded span is always ordered; one
+    // that is not is taken by its bounds rather than as an empty span.
+    for span in &mut spans {
+        if cmp.compare(span.1, span.2) == Ordering::Greater {
+            core::mem::swap(&mut span.1, &mut span.2);
+        }
+    }
+    spans.sort_by(|a, b| a.0.cmp(&b.0).then_with(|| cmp.compare(a.1, b.1)));
+
+    // Sorted by file, so each change of file is one more distinct file.
+    let mut merged: Vec<(&'k crate::UserKey, &'k crate::UserKey)> = Vec::with_capacity(spans.len());
+    let mut count = 0u64;
+    let mut current: Option<(
+        crate::vlog::BlobFileId,
+        &'k crate::UserKey,
+        &'k crate::UserKey,
+    )> = None;
+    for span in spans {
+        match &mut current {
+            Some((id, _, last))
+                if *id == span.0 && cmp.compare(span.1, last) != Ordering::Greater =>
+            {
+                if cmp.compare(span.2, last) == Ordering::Greater {
+                    *last = span.2;
+                }
+            }
+            _ => {
+                if current.is_none_or(|(id, _, _)| id != span.0) {
+                    count += 1;
+                }
+                if let Some((_, first, last)) = current.replace(span) {
+                    merged.push((first, last));
+                }
+            }
+        }
+    }
+    if let Some((_, first, last)) = current {
+        merged.push((first, last));
+    }
+
+    // Starts before ends at an equal key: spans that meet at one key overlap.
+    let mut events: Vec<(&crate::UserKey, bool)> = Vec::with_capacity(merged.len() * 2);
+    for (first, last) in merged {
+        events.push((first, false));
+        events.push((last, true));
+    }
+    events.sort_by(|a, b| cmp.compare(a.0, b.0).then(a.1.cmp(&b.1)));
+    let (mut open, mut depth) = (0u64, 0u64);
+    for (_, is_end) in events {
+        if is_end {
+            open -= 1;
+        } else {
+            open += 1;
+            depth = depth.max(open);
+        }
+    }
+    BlobReferenceStats { count, depth }
 }
 
 /// Approximate size of a key range, estimated from SST block-index offsets and
@@ -163,6 +294,9 @@ pub struct SegmentStats {
     /// Unix seconds of the segment's most recent data-consulting read, or `0` if
     /// never read (or on a no-std build, which keeps no clock).
     pub last_access_secs: u64,
+    /// Blob files the segment references, and how many of them a scan through
+    /// it interleaves where their key spans overlap most.
+    pub blob_references: BlobReferenceStats,
 }
 
 /// Per-LSM-level size + entry aggregates with the contributing segments, for
@@ -170,7 +304,8 @@ pub struct SegmentStats {
 /// to demote, EC-encode, or migrate).
 ///
 /// Cheap to read: derived from version metadata plus one file-size stat per
-/// segment, never a data-block scan. The per-level totals reconcile with the
+/// segment, never a data-block scan (the blob reference figures read each
+/// segment's blob-link section once). The per-level totals reconcile with the
 /// tree-level [`StorageStats`]: summed across levels they equal the SST portion
 /// of [`StorageStats::used_bytes`] and [`StorageStats::item_count`] (blob files
 /// are tracked separately).
@@ -190,6 +325,9 @@ pub struct LevelStats {
     /// Most recent point-read probe across the level's segments, in unix
     /// seconds, or `0` if none was ever read.
     pub last_access_secs: u64,
+    /// Blob files the level's segments reference, and how many of them a scan
+    /// through the level interleaves where their key spans overlap most.
+    pub blob_references: BlobReferenceStats,
     /// Per-segment breakdown, in level (run / table) order.
     pub segments: Vec<SegmentStats>,
 }
@@ -608,17 +746,20 @@ pub(crate) fn compute_storage_stats(
         avg_value_bytes,
         reclaimable_bytes_estimate,
         status,
+        blob_references: blob_reference_stats(version.iter_tables())?,
     })
 }
 
 /// Computes per-LSM-level and per-segment size + entry stats from a version.
 ///
 /// Cost is O(levels x segments) plus one file-size stat per segment (the same
-/// stat [`compute_storage_stats`] already performs); it never reads a data block.
+/// stat [`compute_storage_stats`] already performs), and the first time per
+/// segment a read of its blob-link section; it never reads a data block.
 ///
 /// # Errors
 ///
-/// Returns an error if a segment's file size cannot be stat-ed.
+/// Returns an error if a segment's file size cannot be stat-ed or its blob-link
+/// section cannot be read.
 pub(crate) fn compute_level_segment_stats(version: &Version) -> crate::Result<Vec<LevelStats>> {
     use core::sync::atomic::Ordering::Relaxed;
     let mut levels = Vec::with_capacity(version.level_count());
@@ -653,6 +794,7 @@ pub(crate) fn compute_level_segment_stats(version: &Version) -> crate::Result<Ve
                     item_count: items,
                     reads: seg_reads,
                     last_access_secs: seg_access,
+                    blob_references: blob_reference_stats([table])?,
                 });
             }
         }
@@ -663,6 +805,7 @@ pub(crate) fn compute_level_segment_stats(version: &Version) -> crate::Result<Ve
             item_count,
             reads,
             last_access_secs,
+            blob_references: blob_reference_stats(run_group.iter().flat_map(|run| run.iter()))?,
             segments,
         });
     }
