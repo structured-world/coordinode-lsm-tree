@@ -28,6 +28,7 @@ fn drain_blobs<I: Iterator<Item = crate::Result<(ScanEntry, BlobFileId)>>>(
     scanner: &mut Peekable<I>,
     key: &[u8],
     vptr: &BlobIndirection,
+    comparator: &dyn crate::comparator::UserComparator,
     record_consumed: &mut dyn FnMut(BlobFileId, u64),
 ) -> crate::Result<()> {
     loop {
@@ -43,7 +44,12 @@ fn drain_blobs<I: Iterator<Item = crate::Result<(ScanEntry, BlobFileId)>>>(
         };
         let (entry, blob_file_id) = blob?;
 
-        assert!(entry.key <= key, "vptr was not matched with blob");
+        // The scan and the table stream advance in the same comparator order,
+        // so everything drained before a key sorts at or before it.
+        assert!(
+            comparator.compare(&entry.key, key) != core::cmp::Ordering::Greater,
+            "vptr was not matched with blob"
+        );
         // A RESYNCED entry's boundary is unproven (see `ScanEntry::resynced`):
         // advancing the reclaim frontier to its `frame_end` could punch past —
         // and then skip on resume — a later frame that is actually valid. Drop
@@ -586,6 +592,9 @@ pub struct RelocatingCompaction {
     /// slice's scan there. Maintained unconditionally; the non-tight path ignores
     /// it.
     consumed_through: crate::HashMap<BlobFileId, u64>,
+    /// The tree's key order: the table stream and the blob scan both advance
+    /// in it, and draining compares keys by it.
+    comparator: crate::comparator::SharedComparator,
 }
 
 impl RelocatingCompaction {
@@ -596,6 +605,7 @@ impl RelocatingCompaction {
         rewriting_blob_files: Vec<BlobFile>,
         rate_limiter: alloc::sync::Arc<crate::rate_limiter::RateLimiter>,
         stop_signal: crate::stop_signal::StopSignal,
+        comparator: crate::comparator::SharedComparator,
     ) -> Self {
         Self {
             inner,
@@ -609,6 +619,7 @@ impl RelocatingCompaction {
             rate_limiter,
             stop_signal,
             consumed_through: crate::HashMap::default(),
+            comparator,
         }
     }
 
@@ -626,12 +637,19 @@ impl RelocatingCompaction {
         let Self {
             blob_scanner,
             consumed_through,
+            comparator,
             ..
         } = self;
-        drain_blobs(blob_scanner, key, indirection, &mut |id, frame_end| {
-            let slot = consumed_through.entry(id).or_insert(0);
-            *slot = (*slot).max(frame_end);
-        })
+        drain_blobs(
+            blob_scanner,
+            key,
+            indirection,
+            comparator.as_ref(),
+            &mut |id, frame_end| {
+                let slot = consumed_through.entry(id).or_insert(0);
+                *slot = (*slot).max(frame_end);
+            },
+        )
     }
 }
 

@@ -2192,6 +2192,7 @@ fn run_subcompaction(
                         }
                     })
                     .collect::<crate::Result<Vec<_>>>()?,
+                opts.config.comparator.clone(),
             );
 
             let writer = BlobFileWriter::new(
@@ -2223,6 +2224,7 @@ fn run_subcompaction(
                 reloc.stale_files,
                 opts.rate_limiter.clone(),
                 opts.stop_signal.clone(),
+                opts.config.comparator.clone(),
             ))
         }
         _ => Box::new(StandardCompaction::new(table_writer, tables_for_deletion)),
@@ -3091,6 +3093,7 @@ fn merge_tables(
                         .iter()
                         .map(|bf| BlobFileScanner::new(&bf.0.path, &*bf.0.fs, bf.id()))
                         .collect::<crate::Result<Vec<_>>>()?,
+                    opts.config.comparator.clone(),
                 );
 
                 let writer = BlobFileWriter::new(
@@ -3119,6 +3122,7 @@ fn merge_tables(
                     blob_files_to_rewrite,
                     opts.rate_limiter.clone(),
                     opts.stop_signal.clone(),
+                    opts.config.comparator.clone(),
                 ))
             }
         }
