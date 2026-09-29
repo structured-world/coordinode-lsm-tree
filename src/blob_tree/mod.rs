@@ -1048,6 +1048,10 @@ impl AbstractTree for BlobTree {
         self.index.pinned_filter_size()
     }
 
+    fn filter_memory(&self) -> crate::FilterMemory {
+        self.index.filter_memory()
+    }
+
     fn pinned_block_index_size(&self) -> usize {
         self.index.pinned_block_index_size()
     }

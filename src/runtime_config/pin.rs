@@ -18,10 +18,16 @@ use alloc::sync::Arc;
 /// from where their files are finished to where they are installed; a
 /// compaction, which does both in one call, holds its snapshot directly. Always
 /// empty in builds without zstd, which have no dictionaries to collect.
+///
+/// It also holds the filter bytes the write took in the tree's filter budget,
+/// when the tree sizes its filters by probe load: dropped before the install,
+/// the budget would hand that room to another rewrite while the files that
+/// take it are about to join the tree.
 #[derive(Default)]
 #[must_use = "dropping the pin before the files are installed lets a collection take their dictionary"]
 pub struct WritePin {
     snapshot: Option<Arc<RuntimeConfig>>,
+    filter_sizing: Option<Arc<crate::filter_budget::FilterSizing>>,
 }
 
 impl WritePin {
@@ -35,6 +41,7 @@ impl WritePin {
                 .write_dict_ids(true)
                 .next()
                 .map(|_| Arc::clone(snapshot)),
+            filter_sizing: None,
         }
     }
 
@@ -44,12 +51,22 @@ impl WritePin {
     pub(crate) fn new(_snapshot: &Arc<RuntimeConfig>) -> Self {
         Self::default()
     }
+
+    /// Also holds the filter budget `sizing` reserved until the install.
+    pub(crate) fn with_filter_sizing(
+        mut self,
+        sizing: Option<Arc<crate::filter_budget::FilterSizing>>,
+    ) -> Self {
+        self.filter_sizing = sizing;
+        self
+    }
 }
 
 impl core::fmt::Debug for WritePin {
     fn fmt(&self, f: &mut core::fmt::Formatter<'_>) -> core::fmt::Result {
         f.debug_struct("WritePin")
             .field("holds", &self.snapshot.is_some())
+            .field("filter_budget", &self.filter_sizing.is_some())
             .finish()
     }
 }

@@ -83,12 +83,12 @@ fn a_chunked_resolve_breaks_an_equal_seqno_tie_by_plan_order() -> crate::Result<
     let keys = ["key"];
     let remaining = [(0, crate::hash::hash64(b"key"))];
     let comparator = crate::comparator::default_comparator();
-    let tasks =
+    let (tasks, _) =
         Tree::plan_level_block_tasks(level, &remaining, &keys, SeqNo::MAX, comparator.as_ref())?;
     assert_eq!(tasks.len(), 2, "one block per table");
 
     let mut results: Vec<Option<InternalValue>> = alloc::vec![None];
-    Tree::resolve_block_task_chunk(&tasks, &keys, &mut results)?;
+    Tree::resolve_block_task_chunk(&tasks, &keys, &mut results, None)?;
     let Some(single) = tree.get("key", SeqNo::MAX)? else {
         panic!("the key was written");
     };

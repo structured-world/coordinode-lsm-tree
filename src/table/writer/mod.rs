@@ -380,6 +380,9 @@ pub struct Writer {
     bloom_policy: BloomConstructionPolicy,
 
     /// Stored so `use_partitioned_filter()` can re-apply it to the new writer
+    filter_sizing: Option<Arc<crate::filter_budget::FilterSizing>>,
+
+    /// Stored so `use_partitioned_filter()` can re-apply it to the new writer
     prefix_extractor: Option<Arc<dyn PrefixExtractor>>,
 
     /// Value type of the previously written item (merge-operand ordering
@@ -846,6 +849,7 @@ impl Writer {
             current_key_seqno: None,
 
             bloom_policy: BloomConstructionPolicy::default(),
+            filter_sizing: None,
 
             prefix_extractor: None,
 
@@ -1437,7 +1441,8 @@ impl Writer {
             .use_partition_size(self.filter_partition_size)
             .set_prefix_extractor(self.prefix_extractor.clone())
             .use_encryption(self.encryption.clone())
-            .use_table_id(self.table_id);
+            .use_table_id(self.table_id)
+            .use_sizing(self.filter_sizing.clone());
         // Replacing a subwriter re-applies the settings already chosen, so the
         // builder reads the same whatever order its methods are called in.
         #[cfg(zstd_any)]
@@ -2043,6 +2048,18 @@ impl Writer {
     pub fn use_bloom_policy(mut self, bloom_policy: BloomConstructionPolicy) -> Self {
         self.bloom_policy = bloom_policy;
         self.filter_writer = self.filter_writer.set_filter_policy(bloom_policy);
+        self
+    }
+
+    /// Sizes this table's filters by probe load against the tree's filter
+    /// budget; `None` builds them at the bloom policy.
+    #[must_use]
+    pub(crate) fn use_filter_sizing(
+        mut self,
+        sizing: Option<Arc<crate::filter_budget::FilterSizing>>,
+    ) -> Self {
+        self.filter_sizing.clone_from(&sizing);
+        self.filter_writer = self.filter_writer.use_sizing(sizing);
         self
     }
 
@@ -3679,10 +3696,13 @@ impl Writer {
         let (index_block_count, tli_bytes) = index_writer.finish(&mut self.file_writer)?;
 
         log::trace!("Finishing filter writer");
-        let filter_writer = core::mem::replace(
+        let mut filter_writer = core::mem::replace(
             &mut self.filter_writer,
             Box::new(FullFilterWriter::new(self.bloom_policy)),
         );
+        if let (Some(first), Some(last)) = (&self.meta.first_key, &self.meta.last_key) {
+            filter_writer.set_key_range(first, last);
+        }
         let filter_block_count = filter_writer.finish(&mut self.file_writer)?;
 
         // Write the optional inner-block layout section (only when at least one

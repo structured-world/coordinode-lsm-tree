@@ -777,6 +777,33 @@ pub trait AbstractTree: sealed::Sealed {
     /// Gets the memory usage of all pinned filters in the tree.
     fn pinned_filter_size(&self) -> usize;
 
+    /// The serialised and the resident bytes of the tree's filters, and how
+    /// they stand against a [`FilterAdvisor`](crate::config::FilterAdvisor)
+    /// budget.
+    ///
+    /// Looks up each live table's filter blocks in the block cache without
+    /// counting a hit.
+    ///
+    /// # Examples
+    ///
+    /// ```
+    /// use lsm_tree::{AbstractTree, Config, config::FilterAdvisor};
+    ///
+    /// # let folder = tempfile::tempdir()?;
+    /// let tree = Config::new(&folder, Default::default(), Default::default())
+    ///     .filter_advisor(Some(FilterAdvisor::new(64 * 1_024)))
+    ///     .open()?;
+    /// tree.insert("a", "value", 0);
+    /// tree.flush_active_memtable(0)?;
+    ///
+    /// let memory = tree.filter_memory();
+    /// assert_eq!(memory.serialised_bytes, tree.filter_size());
+    /// assert_eq!(memory.budget_bytes, Some(64 * 1_024));
+    /// assert!(!memory.over_budget);
+    /// # Ok::<(), lsm_tree::Error>(())
+    /// ```
+    fn filter_memory(&self) -> crate::FilterMemory;
+
     /// Gets the memory usage of all pinned index blocks in the tree.
     fn pinned_block_index_size(&self) -> usize;
 

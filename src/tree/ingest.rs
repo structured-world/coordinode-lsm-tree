@@ -587,6 +587,7 @@ impl<'a> Ingestion<'a> {
                 read_budget: self.tree.config.columnar_read_budget,
                 #[cfg(feature = "std")]
                 background_deleter: Some(&self.tree.background_deleter),
+                track_filter_probes: self.tree.config.filter_advisor.is_some(),
             });
         }
 

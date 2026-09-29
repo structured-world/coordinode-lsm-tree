@@ -3103,6 +3103,7 @@ fn a_reopened_blob_view_needs_binding_to_carry_the_deletion_pause() -> crate::Re
         read_budget: tree.index.config.columnar_read_budget,
         #[cfg(feature = "std")]
         background_deleter: None,
+        track_filter_probes: false,
     });
     assert!(
         reopened.deletion_pause_for_test().is_some(),

@@ -79,6 +79,9 @@ pub struct MultiWriter {
 
     bloom_policy: BloomConstructionPolicy,
 
+    /// Sizes every output's filters against the tree's filter budget.
+    filter_sizing: Option<Arc<crate::filter_budget::FilterSizing>>,
+
     current_key: Option<UserKey>,
     comparator: crate::SharedComparator,
 
@@ -281,6 +284,7 @@ impl MultiWriter {
             index_spill_threshold: None,
 
             bloom_policy: BloomConstructionPolicy::default(),
+            filter_sizing: None,
 
             current_key: None,
             comparator: crate::comparator::default_comparator(),
@@ -705,6 +709,24 @@ impl MultiWriter {
         self
     }
 
+    /// Sizes every output's filters by probe load against the tree's filter
+    /// budget; `None` builds them at the bloom policy.
+    #[must_use]
+    pub(crate) fn use_filter_sizing(
+        mut self,
+        sizing: Option<Arc<crate::filter_budget::FilterSizing>>,
+    ) -> Self {
+        self.filter_sizing.clone_from(&sizing);
+        self.writer = self.writer.use_filter_sizing(sizing);
+        self
+    }
+
+    /// The filter plan this writer sizes its outputs by, for its operation to
+    /// hold until the outputs are installed.
+    pub(crate) fn filter_sizing(&self) -> Option<Arc<crate::filter_budget::FilterSizing>> {
+        self.filter_sizing.clone()
+    }
+
     #[must_use]
     pub fn use_prefix_extractor(mut self, extractor: Option<Arc<dyn PrefixExtractor>>) -> Self {
         self.prefix_extractor.clone_from(&extractor);
@@ -925,6 +947,7 @@ impl MultiWriter {
             .use_data_block_restart_interval(self.data_block_restart_interval)
             .use_index_block_restart_interval(self.index_block_restart_interval)
             .use_bloom_policy(self.bloom_policy)
+            .use_filter_sizing(self.filter_sizing.clone())
             .use_data_block_hash_ratio(self.data_block_hash_ratio);
 
         if let Some(threshold) = self.index_spill_threshold {

@@ -83,3 +83,41 @@ fn build_burr_filter_bytes_invalid_policy_returns_empty() {
     let bytes = build_burr_filter_bytes(policy, hashes).unwrap();
     assert!(bytes.is_empty());
 }
+
+/// The expected size follows the layers a build makes: exact where every key
+/// set builds the same layers, which is where short filters bump a large
+/// share of their keys (301 keys over 320 slots), and within the sizes real
+/// builds take elsewhere. The partition-split estimate runs 30% short at 301
+/// keys, which a filter budget would charge to the filters after it.
+#[test]
+fn expected_filter_size_follows_the_layers_builds_make() {
+    for bits in [4.0f32, 10.0, 16.0] {
+        let policy = BloomConstructionPolicy::BitsPerKey(bits);
+        for n in [20usize, 50, 100, 200, 301, 500, 1000, 2621, 5000, 20000] {
+            let sizes: Vec<usize> = (0..20u64)
+                .map(|set| {
+                    let hashes: Vec<u64> = (0..n as u64)
+                        .map(|i| crate::hash::hash64(&(i + set * 1_000_000).to_le_bytes()))
+                        .collect();
+                    build_burr_filter_bytes(policy, hashes).unwrap().len()
+                })
+                .collect();
+            let min = *sizes.iter().min().unwrap();
+            let max = *sizes.iter().max().unwrap();
+            #[expect(
+                clippy::cast_possible_truncation,
+                clippy::cast_sign_loss,
+                reason = "a filter's byte count, non-negative and small"
+            )]
+            let expected = policy.expected_filter_size(n).round() as usize;
+            if min == max {
+                assert_eq!(expected, min, "{bits} bits per key over {n} keys");
+            } else {
+                assert!(
+                    (min..=max).contains(&expected),
+                    "{bits} bits per key over {n} keys: {expected} outside {min}..={max}",
+                );
+            }
+        }
+    }
+}

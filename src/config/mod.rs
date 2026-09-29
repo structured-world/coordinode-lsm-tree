@@ -16,7 +16,7 @@ pub use block_size::{BlockSizePolicy, MAX_BLOCK_SIZE};
 pub use column_encoding::{ColumnEncoding, ColumnEncodingPolicy};
 pub use compression::CompressionPolicy;
 pub use delete_strategy::{DeleteStrategy, DeleteStrategyPolicy};
-pub use filter::{BloomConstructionPolicy, FilterPolicy, FilterPolicyEntry};
+pub use filter::{BloomConstructionPolicy, FilterAdvisor, FilterPolicy, FilterPolicyEntry};
 pub use hash_ratio::HashRatioPolicy;
 pub use locator::{LocatorPolicy, LocatorPolicyEntry, LocatorPrecision};
 pub use pinning::PinningPolicy;
@@ -610,6 +610,10 @@ pub struct Config {
     /// Filter construction policy
     pub filter_policy: FilterPolicy,
 
+    /// Allocates filter memory by measured negative-probe load; `None` (the
+    /// default) leaves every filter to [`Self::filter_policy`].
+    pub filter_advisor: Option<FilterAdvisor>,
+
     /// Retrieval-ribbon locator policy (per level). Defaults to
     /// [`LocatorPolicy::block_level`]: written SSTs carry an optional `locator`
     /// section mapping each key to its data block for O(1) point reads (skipping
@@ -909,6 +913,7 @@ impl Default for Config {
             filter_policy: FilterPolicy::all(FilterPolicyEntry::Bloom(
                 BloomConstructionPolicy::BitsPerKey(10.0),
             )),
+            filter_advisor: None,
 
             compaction_filter_factory: None,
             merge_operator: None,
@@ -1673,6 +1678,34 @@ impl Config {
     #[must_use]
     pub fn filter_policy(mut self, policy: FilterPolicy) -> Self {
         self.filter_policy = policy;
+        self
+    }
+
+    /// Allocates filter memory by measured negative-probe load; see
+    /// [`FilterAdvisor`]. `None` (the default) leaves every filter to the
+    /// [`FilterPolicy`] and counts nothing on the read path, so the tables it
+    /// writes are the ones a tree without the advisor writes.
+    ///
+    /// With an advisor, each flush and compaction chooses the width of the
+    /// filters it writes; [`AbstractTree::filter_memory`](crate::AbstractTree::filter_memory)
+    /// reports the serialised and resident filter bytes against the budget.
+    ///
+    /// # Examples
+    ///
+    /// ```
+    /// use lsm_tree::{Config, config::FilterAdvisor};
+    ///
+    /// # let folder = tempfile::tempdir()?;
+    /// // 64 MiB of filters, widths from 8 to 16 bits per key.
+    /// let advisor = FilterAdvisor::new(64 << 20).with_bits_per_key([8, 10, 12, 14, 16]);
+    /// let tree = Config::new(&folder, Default::default(), Default::default())
+    ///     .filter_advisor(Some(advisor))
+    ///     .open()?;
+    /// # Ok::<(), lsm_tree::Error>(())
+    /// ```
+    #[must_use]
+    pub fn filter_advisor(mut self, advisor: Option<FilterAdvisor>) -> Self {
+        self.filter_advisor = advisor;
         self
     }
 

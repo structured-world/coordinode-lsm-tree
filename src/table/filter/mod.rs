@@ -154,6 +154,135 @@ impl BloomConstructionPolicy {
             .saturating_add(third)
             .saturating_add(last)
     }
+
+    /// The mean bytes a filter over `n` distinct hashes encodes to, for
+    /// sizing filters against a byte budget, where an estimate that runs
+    /// short on small filters would be charged to the filters after them.
+    ///
+    /// Follows the layers the build makes. A key's band starts in one of
+    /// `m - w + 1` rows, so every block but the last draws a Poisson number
+    /// of keys at `b` times the per-row rate, keeps up to the threshold
+    /// capacity and bumps the excess, plus the keys tied at the threshold,
+    /// into the next layer. Small filters bump a large share this way: 301
+    /// keys over 320 slots start in 257 rows, 75 keys a block against a
+    /// capacity of 57. A layer is built when at least one key is bumped
+    /// into it; the last one at twice its slots and four blocks at least.
+    ///
+    /// Each layer is taken at the mean count bumped into it, so where only
+    /// some key sets bump a key into the last layer, between about 500 and
+    /// 5000 keys, this comes out at the builds without it, up to a few
+    /// percent under the mean. A budget corrects such a proportional error
+    /// by what its builds take.
+    pub(crate) fn expected_filter_size(self, n: usize) -> f64 {
+        self.burr_params(n)
+            .map_or(0.0, |params| ExpectedSize::of(n).at(params.r))
+    }
+}
+
+/// The mean bytes of a filter over some number of keys, as a fixed part and
+/// a part per fingerprint bit: the layers a build makes depend on the keys,
+/// not on the width, so one shape serves every width.
+#[derive(Clone, Copy, Debug, Default)]
+pub(crate) struct ExpectedSize {
+    fixed: f64,
+    per_bit: f64,
+}
+
+impl ExpectedSize {
+    /// The mean bytes at `r` bits per key.
+    pub(crate) fn at(self, r: u8) -> f64 {
+        libm::fma(self.per_bit, f64::from(r), self.fixed)
+    }
+
+    /// The shape of a filter over `n` distinct hashes; see
+    /// [`BloomConstructionPolicy::expected_filter_size`].
+    pub(crate) fn of(n: usize) -> Self {
+        use ribbon::burr::{packed, wire};
+
+        // The layer layout is the same at every width.
+        let Ok(params) = BurrParams::with_bpk(n, 1.0) else {
+            return Self::default();
+        };
+        let b = usize::from(params.b);
+        let w = usize::from(params.w);
+        let capacity = as_f64(ribbon::burr::threshold::block_capacity(b));
+
+        let mut shape = Self {
+            fixed: as_f64(wire::HEADER_LEN),
+            per_bit: 0.0,
+        };
+        // A layer of `m` slots, built with chance `built`: its header and
+        // threshold bytes, and one bit-sliced word per segment and bit.
+        let mut add = |m: usize, built: f64| {
+            shape.fixed += built * as_f64(wire::LAYER_HEADER_LEN + m / b);
+            shape.per_bit += built * as_f64(packed::segments_for(m) * 8);
+        };
+        // Keys entering the layer, given that it is built, and the chance
+        // that it is.
+        let mut input = as_f64(n);
+        let mut built = 1.0;
+        for index in 0..params.max_layers {
+            #[expect(
+                clippy::cast_possible_truncation,
+                clippy::cast_sign_loss,
+                reason = "a key count below the filter's own"
+            )]
+            let keys = libm::ceil(input) as usize;
+            let slots = params.layer_m(keys);
+            if index + 1 == params.max_layers {
+                add((slots * 2).max(b * 4), built);
+                break;
+            }
+            add(slots, built);
+
+            // Rows a band can start in, and the full blocks they span; the
+            // last block holds the one row past them.
+            let rows = slots - w + 1;
+            let bumped = if rows == 1 {
+                // Every key starts in the one row, at one offset: a block
+                // over its capacity ties them all at the threshold.
+                if input > capacity { input } else { 0.0 }
+            } else {
+                let blocks = as_f64(rows / b);
+                blocks * overflow(input * as_f64(b) / as_f64(rows), capacity)
+            };
+            if bumped <= 0.0 {
+                break;
+            }
+            // At least one key is bumped with the chance that a Poisson count
+            // of this mean is not zero; the layer's input is that count given
+            // it is not.
+            let exists = -libm::expm1(-bumped);
+            built *= exists;
+            input = bumped / exists;
+        }
+        shape
+    }
+}
+
+/// The mean keys a block drawing a Poisson count of mean `mean` bumps at
+/// `capacity`: those past it, and about one more, the key the threshold ties
+/// with, whenever it overflows.
+fn overflow(mean: f64, capacity: f64) -> f64 {
+    if mean <= 0.0 {
+        return 0.0;
+    }
+    // The normal approximation of the count, with continuity correction.
+    let sd = libm::sqrt(mean);
+    let z = (mean - capacity - 0.5) / sd;
+    let density = libm::exp(-0.5 * z * z) / libm::sqrt(2.0 * core::f64::consts::PI);
+    let tail = 0.5 * libm::erfc(-z / core::f64::consts::SQRT_2);
+    // no-std: `f64::mul_add` needs std; `libm::fma` is the same operation.
+    libm::fma(sd, density, (mean - capacity + 0.5) * tail)
+}
+
+/// A count as `f64`: exact below 2^53, which every count here is.
+#[expect(
+    clippy::cast_precision_loss,
+    reason = "counts of keys and bytes, far below 2^53"
+)]
+const fn as_f64(n: usize) -> f64 {
+    n as f64
 }
 
 /// Build a `BuRR` filter block payload from pre-hashed keys under the given
