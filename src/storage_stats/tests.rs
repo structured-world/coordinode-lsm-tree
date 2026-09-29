@@ -26,9 +26,10 @@ fn spans_of(spans: &[(u64, &str, &str)]) -> BlobReferenceStats {
         .map(|&(id, first, last)| (id, first.into(), last.into()))
         .collect();
     span_stats(
-        keys.iter()
+        &mut keys
+            .iter()
             .map(|(id, first, last)| (*id, first, last))
-            .collect(),
+            .collect::<Vec<_>>(),
         crate::comparator::default_comparator().as_ref(),
     )
 }
@@ -85,11 +86,35 @@ fn depths_of(spans: &[(u64, &str, &str)]) -> Vec<(u64, u64)> {
         .map(|&(id, first, last)| (id, first.into(), last.into()))
         .collect();
     span_depths(
-        keys.iter()
+        &mut keys
+            .iter()
             .map(|(id, first, last)| (*id, first, last))
-            .collect(),
+            .collect::<Vec<_>>(),
         crate::comparator::default_comparator().as_ref(),
     )
+}
+
+/// A span recorded with its bounds reversed covers the keys between them, not
+/// nothing: it still overlaps the span beside it.
+#[test]
+fn a_reversed_span_is_taken_by_its_bounds() {
+    assert_eq!(
+        spans_of(&[(1, "m", "a"), (2, "c", "d")]),
+        BlobReferenceStats { count: 2, depth: 2 }
+    );
+    assert_eq!(
+        depths_of(&[(1, "m", "a"), (2, "c", "d")]),
+        vec![(1, 2), (2, 2)]
+    );
+}
+
+/// A span of a file inside another span of the same file adds nothing.
+#[test]
+fn a_span_nested_in_its_own_file_merges_away() {
+    assert_eq!(
+        spans_of(&[(7, "a", "z"), (7, "b", "c"), (8, "x", "y")]),
+        BlobReferenceStats { count: 2, depth: 2 }
+    );
 }
 
 /// A file's depth is the deepest point inside its own spans, not the tree's:

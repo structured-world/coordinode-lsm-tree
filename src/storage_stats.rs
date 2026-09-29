@@ -162,7 +162,7 @@ pub(crate) fn blob_reference_stats<'a>(
     let mut spans = Vec::new();
     collect_spans(tables, &mut comparator, &mut spans)?;
     Ok(comparator.map_or_else(BlobReferenceStats::default, |cmp| {
-        span_stats(spans, cmp.as_ref())
+        span_stats(&mut spans, cmp.as_ref())
     }))
 }
 
@@ -181,39 +181,45 @@ pub(crate) fn blob_file_depths<'a>(
     let mut comparator = None;
     let mut spans = Vec::new();
     collect_spans(tables, &mut comparator, &mut spans)?;
-    Ok(comparator.map_or_else(Vec::new, |cmp| span_depths(spans, cmp.as_ref())))
+    Ok(comparator.map_or_else(Vec::new, |cmp| span_depths(&mut spans, cmp.as_ref())))
 }
 
 /// [`blob_file_depths`] over `(blob file, first key, last key)` spans ordered
-/// by `cmp`.
+/// by `cmp`. Sorts `spans` in place.
 fn span_depths(
-    spans: Vec<Span<'_>>,
+    spans: &mut [Span<'_>],
     cmp: &dyn crate::comparator::UserComparator,
 ) -> Vec<(crate::vlog::BlobFileId, u64)> {
     let (merged, _) = merge_spans(spans, cmp);
 
     // Each start raises the depth of every span open at that key, so a span's
-    // figure is the largest open count seen while it is open. Quadratic in the
-    // depth, which a compaction's own tables keep small.
-    let mut per_span = alloc::vec![0u64; merged.len()];
-    let mut open: Vec<usize> = Vec::new();
-    for (index, is_end) in sweep_events(&merged, cmp) {
+    // figure is the largest open count seen while it is open, carried with it
+    // until its end. Quadratic in the depth, which a compaction's own tables
+    // keep small.
+    let mut open: Vec<(usize, u64)> = Vec::new();
+    let mut closed: Vec<(usize, u64)> = Vec::with_capacity(merged.len());
+    for (_, is_end, index) in sweep_events(&merged, cmp) {
         if is_end {
-            open.retain(|&o| o != index);
-        } else {
-            open.push(index);
-            let depth = open.len() as u64;
-            for &o in &open {
-                if let Some(slot) = per_span.get_mut(o) {
-                    *slot = (*slot).max(depth);
+            open.retain(|&span| {
+                let ends = span.0 == index;
+                if ends {
+                    closed.push(span);
                 }
+                !ends
+            });
+        } else {
+            open.push((index, 0));
+            let depth = open.len() as u64;
+            for (_, max) in &mut open {
+                *max = (*max).max(depth);
             }
         }
     }
+    closed.sort_unstable_by_key(|&(index, _)| index);
 
     // `merged` is sorted by file, so one pass folds a file's spans together.
     let mut per_file: Vec<(crate::vlog::BlobFileId, u64)> = Vec::new();
-    for ((id, _, _), depth) in merged.iter().zip(per_span) {
+    for ((id, _, _), (_, depth)) in merged.iter().zip(closed) {
         match per_file.last_mut() {
             Some((last, value)) if last == id => *value = (*value).max(depth),
             _ => per_file.push((*id, depth)),
@@ -249,14 +255,15 @@ fn collect_spans<'a>(
 
 /// [`BlobReferenceStats`] of `(blob file, first key, last key)` spans ordered
 /// by `cmp`. Spans of one file (from different tables) are merged where they
-/// overlap, so the sweep counts distinct files, not references.
+/// overlap, so the sweep counts distinct files, not references. Sorts `spans`
+/// in place.
 fn span_stats(
-    spans: Vec<Span<'_>>,
+    spans: &mut [Span<'_>],
     cmp: &dyn crate::comparator::UserComparator,
 ) -> BlobReferenceStats {
     let (merged, count) = merge_spans(spans, cmp);
     let (mut open, mut depth) = (0u64, 0u64);
-    for (_, is_end) in sweep_events(&merged, cmp) {
+    for (_, is_end, _) in sweep_events(&merged, cmp) {
         if is_end {
             open -= 1;
         } else {
@@ -268,16 +275,16 @@ fn span_stats(
 }
 
 /// Merges the overlapping spans of each file, sorted by file then first key,
-/// and counts the distinct files.
+/// and counts the distinct files. Sorts `spans` in place.
 fn merge_spans<'k>(
-    mut spans: Vec<Span<'k>>,
+    spans: &mut [Span<'k>],
     cmp: &dyn crate::comparator::UserComparator,
 ) -> (Vec<Span<'k>>, u64) {
     use core::cmp::Ordering;
 
     // A span is closed at both ends. A recorded span is always ordered; one
     // that is not is taken by its bounds rather than as an empty span.
-    for span in &mut spans {
+    for span in spans.iter_mut() {
         if cmp.compare(span.1, span.2) == Ordering::Greater {
             core::mem::swap(&mut span.1, &mut span.2);
         }
@@ -287,7 +294,7 @@ fn merge_spans<'k>(
     // Sorted by file, so each change of file is one more distinct file.
     let mut merged: Vec<Span<'k>> = Vec::with_capacity(spans.len());
     let mut count = 0u64;
-    for span in spans {
+    for &span in spans.iter() {
         match merged.last_mut() {
             Some((id, _, last))
                 if *id == span.0 && cmp.compare(span.1, last) != Ordering::Greater =>
@@ -307,25 +314,19 @@ fn merge_spans<'k>(
     (merged, count)
 }
 
-/// The start and end events of `merged`, as `(span index, is end)` in key
-/// order. Starts come before ends at an equal key: spans that meet at one key
-/// overlap.
-fn sweep_events(
-    merged: &[Span<'_>],
+/// The start and end events of `merged`, as `(key, is end, span index)` in
+/// key order. Starts come before ends at an equal key: spans that meet at one
+/// key overlap.
+fn sweep_events<'k>(
+    merged: &[Span<'k>],
     cmp: &dyn crate::comparator::UserComparator,
-) -> Vec<(usize, bool)> {
-    let mut events: Vec<(usize, bool)> = (0..merged.len())
-        .flat_map(|index| [(index, false), (index, true)])
+) -> Vec<(&'k crate::UserKey, bool, usize)> {
+    let mut events: Vec<(&'k crate::UserKey, bool, usize)> = merged
+        .iter()
+        .enumerate()
+        .flat_map(|(index, &(_, first, last))| [(first, false, index), (last, true, index)])
         .collect();
-    let key = |&(index, is_end): &(usize, bool)| {
-        merged
-            .get(index)
-            .map(|(_, first, last)| if is_end { *last } else { *first })
-    };
-    events.sort_by(|a, b| match (key(a), key(b)) {
-        (Some(ka), Some(kb)) => cmp.compare(ka, kb).then(a.1.cmp(&b.1)),
-        _ => a.cmp(b),
-    });
+    events.sort_by(|a, b| cmp.compare(a.0, b.0).then(a.1.cmp(&b.1)));
     events
 }
 
@@ -482,7 +483,8 @@ pub trait StorageStatistics {
     ///
     /// # Errors
     ///
-    /// Returns an error if a live file's size cannot be stat-ed.
+    /// Returns an error if a live file's size cannot be stat-ed, or a table's
+    /// blob-link section cannot be read or parsed.
     fn storage_stats(&self) -> crate::Result<StorageStats>;
 
     /// Per-LSM-level and per-segment size + entry-count stats, for tiering and
@@ -490,7 +492,9 @@ pub trait StorageStatistics {
     /// to demote, EC-encode, or migrate).
     ///
     /// Cheap: derived from the live version's metadata plus one file-size stat
-    /// per segment (no data-block scan). The per-level totals reconcile with
+    /// per segment (no data-block scan); in a tree that separates values, each
+    /// segment's blob-link section is also read once, then kept. The per-level
+    /// totals reconcile with
     /// [`storage_stats`](Self::storage_stats): summed across levels they equal
     /// the SST portion of [`StorageStats::used_bytes`] and
     /// [`StorageStats::item_count`].
@@ -518,7 +522,8 @@ pub trait StorageStatistics {
     ///
     /// # Errors
     ///
-    /// Returns an error if a segment's file size cannot be stat-ed.
+    /// Returns an error if a segment's file size cannot be stat-ed, or its
+    /// blob-link section cannot be read or parsed.
     fn level_segment_stats(&self) -> crate::Result<Vec<LevelStats>>;
 
     /// Estimated bytes pending compaction under `strategy`: on-disk data above
@@ -720,7 +725,8 @@ pub(crate) fn full_compaction_demand_bytes(version: &Version) -> crate::Result<u
 ///
 /// # Errors
 ///
-/// Returns an error if a live table or blob file's size cannot be stat-ed.
+/// Returns an error if a live table or blob file's size cannot be stat-ed, or a
+/// table's blob-link section cannot be read or parsed.
 pub(crate) fn compute_storage_stats(
     version: &Version,
     is_compacting: bool,
@@ -852,8 +858,20 @@ pub(crate) fn compute_level_segment_stats(version: &Version) -> crate::Result<Ve
         let mut item_count = 0u64;
         let mut reads = 0u64;
         let mut last_access_secs = 0u64;
+        // Each table's spans are collected once: they give its own figures,
+        // then join the level's, which the level sweep needs all together.
+        let mut comparator = None;
+        let mut level_spans = Vec::new();
+        let mut table_spans = Vec::new();
         for run in run_group.iter() {
             for table in run.iter() {
+                collect_spans([table], &mut comparator, &mut table_spans)?;
+                let blob_references = comparator
+                    .as_ref()
+                    .map_or_else(BlobReferenceStats::default, |cmp| {
+                        span_stats(&mut table_spans, cmp.as_ref())
+                    });
+                level_spans.append(&mut table_spans);
                 // Physical file size, NOT m.file_size (which undercounts), to
                 // reconcile with the tree-level `used_bytes` — including a
                 // restricted table's live restriction sidecar (the same basis
@@ -877,7 +895,7 @@ pub(crate) fn compute_level_segment_stats(version: &Version) -> crate::Result<Ve
                     item_count: items,
                     reads: seg_reads,
                     last_access_secs: seg_access,
-                    blob_references: blob_reference_stats([table])?,
+                    blob_references,
                 });
             }
         }
@@ -888,7 +906,9 @@ pub(crate) fn compute_level_segment_stats(version: &Version) -> crate::Result<Ve
             item_count,
             reads,
             last_access_secs,
-            blob_references: blob_reference_stats(run_group.iter().flat_map(|run| run.iter()))?,
+            blob_references: comparator.map_or_else(BlobReferenceStats::default, |cmp| {
+                span_stats(&mut level_spans, cmp.as_ref())
+            }),
             segments,
         });
     }

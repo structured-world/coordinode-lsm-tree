@@ -134,6 +134,11 @@ pub(crate) fn linked_blob_files_len<'a>(
 /// record count, then each record's fixed fields and its two length-prefixed
 /// keys. The records must fill the section exactly.
 ///
+/// This is the only layout the V6 format has; there is no key-less variant to
+/// fall back to. V6 tables were never released without the keys, and tables in
+/// the older format are converted by the offline migration tool, which derives
+/// each span from the table's own entries, instead of being read here.
+///
 /// # Errors
 ///
 /// [`crate::Error::InvalidHeader`] when the count, a key length or the section

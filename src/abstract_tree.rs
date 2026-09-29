@@ -227,7 +227,8 @@ pub trait AbstractTree: sealed::Sealed {
     ///
     /// # Errors
     ///
-    /// Returns an error if a live file's size cannot be stat-ed.
+    /// Returns an error if a live file's size cannot be stat-ed, or a table's
+    /// blob-link section cannot be read or parsed.
     fn storage_stats(&self) -> crate::Result<crate::StorageStats> {
         crate::storage_stats::compute_storage_stats(&self.current_version(), false, true)
     }
@@ -266,7 +267,8 @@ pub trait AbstractTree: sealed::Sealed {
     ///
     /// # Errors
     ///
-    /// Returns an error if a segment's file size cannot be stat-ed.
+    /// Returns an error if a segment's file size cannot be stat-ed, or its
+    /// blob-link section cannot be read or parsed.
     fn level_segment_stats(&self) -> crate::Result<Vec<crate::LevelStats>> {
         crate::storage_stats::compute_level_segment_stats(&self.current_version())
     }
