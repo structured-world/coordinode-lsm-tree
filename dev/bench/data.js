@@ -1,5 +1,5 @@
 window.BENCHMARK_DATA = {
-  "lastUpdate": 1790676567891,
+  "lastUpdate": 1790676577361,
   "repoUrl": "https://github.com/structured-world/coordinode-lsm-tree",
   "entries": {
     "lsm-tree db_bench costs": [
@@ -2448,6 +2448,264 @@ window.BENCHMARK_DATA = {
             "value": 6222.25,
             "unit": "B/row",
             "extra": "keys: 10000 | rows: 10000 | read: 83123466 B | decoded: 82570298 B | copied: 62222500 B | elapsed: 61.797625ms\niterations: 3"
+          }
+        ]
+      },
+      {
+        "commit": {
+          "author": {
+            "email": "mail@polaz.com",
+            "name": "Dmitry Prudnikov",
+            "username": "polaz"
+          },
+          "committer": {
+            "email": "noreply@github.com",
+            "name": "GitHub",
+            "username": "web-flow"
+          },
+          "distinct": true,
+          "id": "f91ed6df3ec5ac94aa7c043cf6b48bd2436ade4f",
+          "message": "perf(io_uring): submit a batch in one message and hand reads over as they complete (#744)\n\n## Summary\n- A batched io_uring read costs the caller one completion channel and\none submission-lock acquisition per batch, instead of one of each per\nrequest.\n- Finished reads are handed to the caller as they complete, so a\nmulti-get decodes blocks while the rest of the batch is still in flight.\n\n## Changes\n- The ring thread takes a whole batch as one message; its completions\ncome back on one channel tagged by request position.\n- Draining a batch waits for every read before returning, as before, and\nreports the failure at the lowest request position, whatever order\ncompletions arrive in; a read that never completes because the ring went\naway is a broken pipe at its position.\n- `Fs::read_blocks_batched_each(reqs, on_read)`: hands each filled\nrequest over as it completes. The default implementation reads the\nbatch, then hands the requests over in order; io_uring hands them over\nin completion order.\n- The multi-get block path decodes each block in that callback and keeps\nthe lowest-index decode error.\n- `BlockBuf::filled_bytes`.\n- `io_uring_multi_get` bench: cold multi-get latency and caller CPU per\nbatch at batch sizes 8, 64 and 512, plus the batched read alone.\n\n## Testing\n- Unit tests assert one channel and one lock per batch, the\nlowest-position failure under forward, reverse and shuffled completion\norders, a batch cut short by the ring, the hand-over interleaving,\nidentical results from the ordered and completion-ordered paths, and a\nstress test that mixes failing and succeeding reads in one batch. The\nfault-injection filesystem does not route batches to the ring, so that\nstress test covers the drain-everything invariant instead.\n- Linux, io_uring, caller CPU p50 for the batched read: batch 64 from 84\nto 55 µs, batch 512 from 445 to 270 µs (p99 1159 to 445 µs); batch 8 and\nwall time unchanged; multi-get end to end is neutral, its time is spent\nelsewhere.\n- fmt, clippy (all and default features, and `tools/db_bench`), the full\ntest suite in both feature sets on macOS and Linux with io_uring,\n`tools/sst-dump` tests, doc tests, docs and the no-std check pass.\n\nCloses #669\n\n\n<!-- This is an auto-generated comment: release notes by coderabbit.ai\n-->\n\n## Summary by CodeRabbit\n\n* **New Features**\n* Added a batched-read option that reports fully read requests through a\ncallback in their original order.\n  * Added access to the portion of a read buffer that has been filled.\n* **Improvements**\n* Batched reads can now be processed as they complete, rather than\nwaiting for the entire batch.\n* When multiple reads fail, the reported error follows request order,\nregardless of completion order.\n* **Benchmarks**\n  * Added a benchmark for batched reads using `io_uring`.\n\n<!-- end of auto-generated comment: release notes by coderabbit.ai -->",
+          "timestamp": "2026-09-29T13:02:38+03:00",
+          "tree_id": "5206b3592d789e3c55b4a63e3a621c1c30a622aa",
+          "url": "https://github.com/structured-world/coordinode-lsm-tree/commit/f91ed6df3ec5ac94aa7c043cf6b48bd2436ade4f"
+        },
+        "date": 1790676572543,
+        "tool": "customSmallerIsBetter",
+        "benches": [
+          {
+            "name": "mixed-layout / narrow-records bytes read per row",
+            "value": 42.1442,
+            "unit": "B/row",
+            "extra": "keys: 200000 | rows: 200000 | read: 8428840 B | decoded: 8357098 B | copied: 9000000 B | elapsed: 237.7354ms\niterations: 3"
+          },
+          {
+            "name": "mixed-layout / narrow-records bytes decoded per row",
+            "value": 41.78549,
+            "unit": "B/row",
+            "extra": "keys: 200000 | rows: 200000 | read: 8428840 B | decoded: 8357098 B | copied: 9000000 B | elapsed: 237.7354ms\niterations: 3"
+          },
+          {
+            "name": "mixed-layout / narrow-records bytes copied per row",
+            "value": 45,
+            "unit": "B/row",
+            "extra": "keys: 200000 | rows: 200000 | read: 8428840 B | decoded: 8357098 B | copied: 9000000 B | elapsed: 237.7354ms\niterations: 3"
+          },
+          {
+            "name": "mixed-layout / wide-records-full-read bytes read per row",
+            "value": 4215,
+            "unit": "B/row",
+            "extra": "keys: 50000 | rows: 50000 | read: 210750000 B | decoded: 209100000 B | copied: 207050000 B | elapsed: 355.3446ms\niterations: 3"
+          },
+          {
+            "name": "mixed-layout / wide-records-full-read bytes decoded per row",
+            "value": 4182,
+            "unit": "B/row",
+            "extra": "keys: 50000 | rows: 50000 | read: 210750000 B | decoded: 209100000 B | copied: 207050000 B | elapsed: 355.3446ms\niterations: 3"
+          },
+          {
+            "name": "mixed-layout / wide-records-full-read bytes copied per row",
+            "value": 4141,
+            "unit": "B/row",
+            "extra": "keys: 50000 | rows: 50000 | read: 210750000 B | decoded: 209100000 B | copied: 207050000 B | elapsed: 355.3446ms\niterations: 3"
+          },
+          {
+            "name": "mixed-layout / mixed-value-sizes bytes read per row",
+            "value": 867.21184,
+            "unit": "B/row",
+            "extra": "keys: 100000 | rows: 100000 | read: 86721184 B | decoded: 86391151 B | copied: 86420000 B | elapsed: 213.9011ms\niterations: 3"
+          },
+          {
+            "name": "mixed-layout / mixed-value-sizes bytes decoded per row",
+            "value": 863.91151,
+            "unit": "B/row",
+            "extra": "keys: 100000 | rows: 100000 | read: 86721184 B | decoded: 86391151 B | copied: 86420000 B | elapsed: 213.9011ms\niterations: 3"
+          },
+          {
+            "name": "mixed-layout / mixed-value-sizes bytes copied per row",
+            "value": 864.2,
+            "unit": "B/row",
+            "extra": "keys: 100000 | rows: 100000 | read: 86721184 B | decoded: 86391151 B | copied: 86420000 B | elapsed: 213.9011ms\niterations: 3"
+          },
+          {
+            "name": "mixed-layout / row-updates-over-columnar-base bytes read per row",
+            "value": 215.46455,
+            "unit": "B/row",
+            "extra": "keys: 100000 | rows: 100000 | read: 21546455 B | decoded: 20938463 B | copied: 51100094 B | elapsed: 475.6453ms\niterations: 3"
+          },
+          {
+            "name": "mixed-layout / row-updates-over-columnar-base bytes decoded per row",
+            "value": 209.38463,
+            "unit": "B/row",
+            "extra": "keys: 100000 | rows: 100000 | read: 21546455 B | decoded: 20938463 B | copied: 51100094 B | elapsed: 475.6453ms\niterations: 3"
+          },
+          {
+            "name": "mixed-layout / row-updates-over-columnar-base bytes copied per row",
+            "value": 511.00094,
+            "unit": "B/row",
+            "extra": "keys: 100000 | rows: 100000 | read: 21546455 B | decoded: 20938463 B | copied: 51100094 B | elapsed: 475.6453ms\niterations: 3"
+          },
+          {
+            "name": "mixed-layout / versions-deletes-tombstones bytes read per row",
+            "value": 133.68026315789473,
+            "unit": "B/row",
+            "extra": "keys: 100000 | rows: 76000 | read: 10159700 B | decoded: 10076111 B | copied: 10013359 B | elapsed: 178.4456ms\niterations: 3"
+          },
+          {
+            "name": "mixed-layout / versions-deletes-tombstones bytes decoded per row",
+            "value": 132.58040789473685,
+            "unit": "B/row",
+            "extra": "keys: 100000 | rows: 76000 | read: 10159700 B | decoded: 10076111 B | copied: 10013359 B | elapsed: 178.4456ms\niterations: 3"
+          },
+          {
+            "name": "mixed-layout / versions-deletes-tombstones bytes copied per row",
+            "value": 131.75472368421052,
+            "unit": "B/row",
+            "extra": "keys: 100000 | rows: 76000 | read: 10159700 B | decoded: 10076111 B | copied: 10013359 B | elapsed: 178.4456ms\niterations: 3"
+          },
+          {
+            "name": "mixed-layout / selective-scan-sparse bytes read per row",
+            "value": 4249.199806013579,
+            "unit": "B/row",
+            "extra": "keys: 100000 | rows: 1031 | read: 4380925 B | decoded: 4210810 B | copied: 293835 B | elapsed: 27.2687ms\niterations: 3"
+          },
+          {
+            "name": "mixed-layout / selective-scan-sparse bytes decoded per row",
+            "value": 4084.199806013579,
+            "unit": "B/row",
+            "extra": "keys: 100000 | rows: 1031 | read: 4380925 B | decoded: 4210810 B | copied: 293835 B | elapsed: 27.2687ms\niterations: 3"
+          },
+          {
+            "name": "mixed-layout / selective-scan-sparse bytes copied per row",
+            "value": 285,
+            "unit": "B/row",
+            "extra": "keys: 100000 | rows: 1031 | read: 4380925 B | decoded: 4210810 B | copied: 293835 B | elapsed: 27.2687ms\niterations: 3"
+          },
+          {
+            "name": "mixed-layout / selective-scan-near-full bytes read per row",
+            "value": 340.1047555555555,
+            "unit": "B/row",
+            "extra": "keys: 100000 | rows: 90000 | read: 30609428 B | decoded: 29737733 B | copied: 24990376 B | elapsed: 82.1915ms\niterations: 3"
+          },
+          {
+            "name": "mixed-layout / selective-scan-near-full bytes decoded per row",
+            "value": 330.41925555555554,
+            "unit": "B/row",
+            "extra": "keys: 100000 | rows: 90000 | read: 30609428 B | decoded: 29737733 B | copied: 24990376 B | elapsed: 82.1915ms\niterations: 3"
+          },
+          {
+            "name": "mixed-layout / selective-scan-near-full bytes copied per row",
+            "value": 277.67084444444447,
+            "unit": "B/row",
+            "extra": "keys: 100000 | rows: 90000 | read: 30609428 B | decoded: 29737733 B | copied: 24990376 B | elapsed: 82.1915ms\niterations: 3"
+          },
+          {
+            "name": "mixed-layout / columnar-scan-one-segment bytes read per row",
+            "value": 286.70793,
+            "unit": "B/row",
+            "extra": "keys: 100000 | rows: 100000 | read: 28670793 B | decoded: 28158666 B | copied: 0 B | elapsed: 47.0689ms\niterations: 3"
+          },
+          {
+            "name": "mixed-layout / columnar-scan-one-segment bytes decoded per row",
+            "value": 281.58666,
+            "unit": "B/row",
+            "extra": "keys: 100000 | rows: 100000 | read: 28670793 B | decoded: 28158666 B | copied: 0 B | elapsed: 47.0689ms\niterations: 3"
+          },
+          {
+            "name": "mixed-layout / columnar-scan-one-segment bytes copied per row",
+            "value": 0,
+            "unit": "B/row",
+            "extra": "keys: 100000 | rows: 100000 | read: 28670793 B | decoded: 28158666 B | copied: 0 B | elapsed: 47.0689ms\niterations: 3"
+          },
+          {
+            "name": "mixed-layout / columnar-scan-one-segment retained payload",
+            "value": 16098,
+            "unit": "B",
+            "extra": "keys: 100000 | rows: 100000 | read: 28670793 B | decoded: 28158666 B | copied: 0 B | elapsed: 47.0689ms\niterations: 3"
+          },
+          {
+            "name": "mixed-layout / columnar-scan-one-segment time to first batch",
+            "value": 148.89999999999998,
+            "unit": "us",
+            "extra": "keys: 100000 | rows: 100000 | read: 28670793 B | decoded: 28158666 B | copied: 0 B | elapsed: 47.0689ms\niterations: 3"
+          },
+          {
+            "name": "mixed-layout / columnar-scan-one-segment bytes read to first batch",
+            "value": 16629,
+            "unit": "B",
+            "extra": "keys: 100000 | rows: 100000 | read: 28670793 B | decoded: 28158666 B | copied: 0 B | elapsed: 47.0689ms\niterations: 3"
+          },
+          {
+            "name": "mixed-layout / columnar-scan-overlap-8 bytes read per row",
+            "value": 298.36368,
+            "unit": "B/row",
+            "extra": "keys: 100000 | rows: 100000 | read: 29836368 B | decoded: 29096640 B | copied: 28555168 B | elapsed: 86.9186ms\niterations: 3"
+          },
+          {
+            "name": "mixed-layout / columnar-scan-overlap-8 bytes decoded per row",
+            "value": 290.9664,
+            "unit": "B/row",
+            "extra": "keys: 100000 | rows: 100000 | read: 29836368 B | decoded: 29096640 B | copied: 28555168 B | elapsed: 86.9186ms\niterations: 3"
+          },
+          {
+            "name": "mixed-layout / columnar-scan-overlap-8 bytes copied per row",
+            "value": 285.55168,
+            "unit": "B/row",
+            "extra": "keys: 100000 | rows: 100000 | read: 29836368 B | decoded: 29096640 B | copied: 28555168 B | elapsed: 86.9186ms\niterations: 3"
+          },
+          {
+            "name": "mixed-layout / columnar-scan-overlap-8 retained payload",
+            "value": 132496,
+            "unit": "B",
+            "extra": "keys: 100000 | rows: 100000 | read: 29836368 B | decoded: 29096640 B | copied: 28555168 B | elapsed: 86.9186ms\niterations: 3"
+          },
+          {
+            "name": "mixed-layout / columnar-scan-overlap-8 time to first batch",
+            "value": 687.6,
+            "unit": "us",
+            "extra": "keys: 100000 | rows: 100000 | read: 29836368 B | decoded: 29096640 B | copied: 28555168 B | elapsed: 81.2061ms\niterations: 3"
+          },
+          {
+            "name": "mixed-layout / columnar-scan-overlap-8 bytes read to first batch",
+            "value": 138440,
+            "unit": "B",
+            "extra": "keys: 100000 | rows: 100000 | read: 29836368 B | decoded: 29096640 B | copied: 28555168 B | elapsed: 86.9186ms\niterations: 3"
+          },
+          {
+            "name": "mixed-layout / blobs-well-placed bytes read per row",
+            "value": 8297.8593,
+            "unit": "B/row",
+            "extra": "keys: 10000 | rows: 10000 | read: 82978593 B | decoded: 82426811 B | copied: 82911721 B | elapsed: 45.9707ms\niterations: 3"
+          },
+          {
+            "name": "mixed-layout / blobs-well-placed bytes decoded per row",
+            "value": 8242.6811,
+            "unit": "B/row",
+            "extra": "keys: 10000 | rows: 10000 | read: 82978593 B | decoded: 82426811 B | copied: 82911721 B | elapsed: 45.9707ms\niterations: 3"
+          },
+          {
+            "name": "mixed-layout / blobs-well-placed bytes copied per row",
+            "value": 8291.1721,
+            "unit": "B/row",
+            "extra": "keys: 10000 | rows: 10000 | read: 82978593 B | decoded: 82426811 B | copied: 82911721 B | elapsed: 45.9707ms\niterations: 3"
+          },
+          {
+            "name": "mixed-layout / blobs-scattered bytes read per row",
+            "value": 8312.3466,
+            "unit": "B/row",
+            "extra": "keys: 10000 | rows: 10000 | read: 83123466 B | decoded: 82570298 B | copied: 62222500 B | elapsed: 70.2581ms\niterations: 3"
+          },
+          {
+            "name": "mixed-layout / blobs-scattered bytes decoded per row",
+            "value": 8257.0298,
+            "unit": "B/row",
+            "extra": "keys: 10000 | rows: 10000 | read: 83123466 B | decoded: 82570298 B | copied: 62222500 B | elapsed: 70.2581ms\niterations: 3"
+          },
+          {
+            "name": "mixed-layout / blobs-scattered bytes copied per row",
+            "value": 6222.25,
+            "unit": "B/row",
+            "extra": "keys: 10000 | rows: 10000 | read: 83123466 B | decoded: 82570298 B | copied: 62222500 B | elapsed: 70.2581ms\niterations: 3"
           }
         ]
       }
