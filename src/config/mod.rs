@@ -285,11 +285,29 @@ pub struct KvSeparationOptions {
     #[doc(hidden)]
     pub scan_prefetch: u16,
 
+    /// Relocation of blob files for scan locality, off when `None`. See
+    /// [`Self::relocate_for_locality`].
+    #[doc(hidden)]
+    pub locality_relocation: Option<BlobLocalityRelocation>,
+
     /// A zstd dictionary to register with the tree at open, for the blob
     /// compression to name. See [`Self::dict`].
     #[cfg(zstd_any)]
     #[doc(hidden)]
     pub zstd_dictionary: Option<alloc::sync::Arc<crate::compression::ZstdDictionary>>,
+}
+
+/// When and how much a compaction relocates blob files to restore scan
+/// locality. Set through [`KvSeparationOptions::relocate_for_locality`].
+#[derive(Copy, Clone, Debug, PartialEq)]
+pub struct BlobLocalityRelocation {
+    /// The blob reference depth a compaction's inputs may reach before it
+    /// relocates for locality. Relocation fires only above it.
+    pub max_depth: core::num::NonZeroU64,
+
+    /// The extra I/O relocation may add, as a fraction of the bytes the
+    /// compaction writes anyway.
+    pub budget: f32,
 }
 
 impl Default for KvSeparationOptions {
@@ -302,6 +320,8 @@ impl Default for KvSeparationOptions {
             age_cutoff: 0.25,
 
             scan_prefetch: 64,
+
+            locality_relocation: None,
 
             #[cfg(zstd_any)]
             zstd_dictionary: None,
@@ -360,6 +380,52 @@ impl KvSeparationOptions {
     #[must_use]
     pub fn scan_prefetch(mut self, items: u16) -> Self {
         self.scan_prefetch = items;
+        self
+    }
+
+    /// Lets compactions relocate blob files to restore scan locality.
+    ///
+    /// Values keep the order they were flushed in, so keys written in
+    /// separate batches end up interleaved across many blob files, and a range
+    /// scan alternates between all of them. A compaction whose input tables
+    /// reference files interleaved deeper than `max_depth` (see
+    /// [`BlobReferenceStats::depth`](crate::BlobReferenceStats::depth)) rewrites
+    /// the deepest ones in key order, so each output file holds one run of
+    /// adjacent keys. A table a strategy would only move to another level is
+    /// merged instead when this applies to it, so the interleaving is not
+    /// carried down unchanged. Files written in consecutive key runs have a
+    /// depth of one and are never relocated for this, however many there are.
+    ///
+    /// Relocation copies values as they are stored, so files written under
+    /// different blob codecs are rewritten into one file per codec and do not
+    /// merge further; a file is relocated only together with another of its
+    /// codec that it overlaps.
+    ///
+    /// Relocation is bounded three ways:
+    /// - only whole files are rewritten, and only those no table outside the
+    ///   compaction references;
+    /// - reading and writing them together may cost at most `budget` times the
+    ///   bytes the compaction writes anyway (its tables, plus the stale blob
+    ///   files it already relocates, which are always served first);
+    /// - nothing is relocated for locality when the output would not leave the
+    ///   reserved free space intact.
+    ///
+    /// A `budget` of zero, negative or NaN relocates nothing. Off by default:
+    /// compactions then behave and write exactly as without this option.
+    ///
+    /// # Examples
+    ///
+    /// ```
+    /// use core::num::NonZeroU64;
+    /// use lsm_tree::KvSeparationOptions;
+    ///
+    /// let depth = NonZeroU64::new(4).expect("non-zero");
+    /// let opts = KvSeparationOptions::default().relocate_for_locality(depth, 0.5);
+    /// assert!(opts.locality_relocation.is_some());
+    /// ```
+    #[must_use]
+    pub fn relocate_for_locality(mut self, max_depth: core::num::NonZeroU64, budget: f32) -> Self {
+        self.locality_relocation = Some(BlobLocalityRelocation { max_depth, budget });
         self
     }
 

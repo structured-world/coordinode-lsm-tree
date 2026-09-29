@@ -227,7 +227,8 @@ pub trait AbstractTree: sealed::Sealed {
     ///
     /// # Errors
     ///
-    /// Returns an error if a live file's size cannot be stat-ed.
+    /// Returns an error if a live file's size cannot be stat-ed, or a table's
+    /// blob-link section cannot be read or parsed.
     fn storage_stats(&self) -> crate::Result<crate::StorageStats> {
         crate::storage_stats::compute_storage_stats(&self.current_version(), false, true)
     }
@@ -237,7 +238,9 @@ pub trait AbstractTree: sealed::Sealed {
     /// to demote, EC-encode, or migrate).
     ///
     /// Cheap: derived from the live version's metadata plus one file-size stat
-    /// per segment (no data-block scan). The per-level totals reconcile with
+    /// per segment (no data-block scan); in a tree that separates values, each
+    /// segment's blob-link section is also read once, then kept. The per-level
+    /// totals reconcile with
     /// [`storage_stats`](Self::storage_stats): summed across levels they equal
     /// the SST portion of [`StorageStats::used_bytes`](crate::StorageStats::used_bytes)
     /// and [`StorageStats::item_count`](crate::StorageStats::item_count).
@@ -264,7 +267,8 @@ pub trait AbstractTree: sealed::Sealed {
     ///
     /// # Errors
     ///
-    /// Returns an error if a segment's file size cannot be stat-ed.
+    /// Returns an error if a segment's file size cannot be stat-ed, or its
+    /// blob-link section cannot be read or parsed.
     fn level_segment_stats(&self) -> crate::Result<Vec<crate::LevelStats>> {
         crate::storage_stats::compute_level_segment_stats(&self.current_version())
     }

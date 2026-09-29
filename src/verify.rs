@@ -2583,8 +2583,9 @@ pub(crate) fn toc_may_hide_deletion_section(toc: &crate::sfa::Toc, toc_pos: u64)
 /// human-readable reason when the section's payload cannot have the shape
 /// the writer emits.
 ///
-/// - `linked_blob_files`: `u32 count` followed by `count` fixed 32-byte
-///   records — the length must be exactly `4 + count * 32`.
+/// - `linked_blob_files`: `u32 count` followed by `count` records, each 32
+///   fixed bytes then a first and a last key, each prefixed by its `u16`
+///   length; the records must end exactly at the section's end.
 /// - `table_version`: exactly one byte.
 /// - `meta_separator`: pure padding, any content is acceptable.
 ///
@@ -2600,7 +2601,6 @@ fn raw_section_shape_error(
     pos: u64,
     len: u64,
 ) -> Result<Option<String>, io::Error> {
-    use alloc::string::ToString as _;
     #[cfg(not(feature = "std"))]
     use io::{Read as _, Seek as _, SeekFrom};
     #[cfg(feature = "std")]
@@ -2616,16 +2616,43 @@ fn raw_section_shape_error(
             reader.seek(SeekFrom::Start(pos))?;
             let mut count_le = [0u8; 4];
             reader.read_exact(&mut count_le)?;
-            let count = u64::from(u32::from_le_bytes(count_le));
-            // 4 fixed u64 fields per record.
-            let expected = count
-                .checked_mul(32)
-                .and_then(|records| records.checked_add(4));
-            if expected != Some(len) {
+            let count = u32::from_le_bytes(count_le);
+            // Walk the records without holding them: each is its fixed fields,
+            // then two keys each preceded by a two-byte length. The walk must
+            // end exactly at the section's end.
+            let fixed = crate::table::writer::LINKED_BLOB_FILE_FIXED_LEN as u64;
+            let past_end = |record: u32| {
+                Some(format!(
+                    "blob-link count {count} disagrees with the section length {len}: \
+                     record {record} runs past it"
+                ))
+            };
+            let mut consumed = 4u64;
+            for record in 0..count {
+                let mut next = consumed + fixed;
+                if next > len {
+                    return Ok(past_end(record));
+                }
+                reader.seek(SeekFrom::Current(fixed.cast_signed()))?;
+                for _ in 0..2 {
+                    if next + 2 > len {
+                        return Ok(past_end(record));
+                    }
+                    let mut key_len_le = [0u8; 2];
+                    reader.read_exact(&mut key_len_le)?;
+                    let key_len = u64::from(u16::from_le_bytes(key_len_le));
+                    next += 2 + key_len;
+                    if next > len {
+                        return Ok(past_end(record));
+                    }
+                    reader.seek(SeekFrom::Current(key_len.cast_signed()))?;
+                }
+                consumed = next;
+            }
+            if consumed != len {
                 return Ok(Some(format!(
                     "blob-link count {count} disagrees with the section length {len} \
-                     (expected {} bytes)",
-                    expected.map_or_else(|| "overflowing".to_string(), |e| e.to_string()),
+                     ({consumed} bytes of records)"
                 )));
             }
             Ok(None)

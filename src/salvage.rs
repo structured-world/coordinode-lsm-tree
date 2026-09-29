@@ -1400,22 +1400,23 @@ fn rewrite_block_indirections(
 }
 
 /// Decodes the [`crate::blob_tree::handle::BlobIndirection`] of every
-/// indirection entry in `entries`. An entry TAGGED as an indirection whose
-/// value fails to decode is corrupt content the live read path could not
-/// follow either — the caller drops the block rather than laundering it into
-/// the recovered copy.
+/// indirection entry in `entries`, with the entry's key. An entry TAGGED as an
+/// indirection whose value fails to decode is corrupt content the live read
+/// path could not follow either — the caller drops the block rather than
+/// laundering it into the recovered copy.
 fn collect_indirections(
     entries: &[crate::InternalValue],
-) -> crate::Result<Vec<crate::blob_tree::handle::BlobIndirection>> {
+) -> crate::Result<Vec<(crate::UserKey, crate::blob_tree::handle::BlobIndirection)>> {
     use crate::coding::Decode;
 
     let mut out = Vec::new();
     for entry in entries {
         if entry.key.value_type == crate::ValueType::Indirection {
             let mut cursor = &entry.value[..];
-            out.push(crate::blob_tree::handle::BlobIndirection::decode_from(
-                &mut cursor,
-            )?);
+            out.push((
+                entry.key.user_key.clone(),
+                crate::blob_tree::handle::BlobIndirection::decode_from(&mut cursor)?,
+            ));
         }
     }
     Ok(out)
@@ -1427,7 +1428,7 @@ fn collect_indirections(
 #[cfg(feature = "columnar")]
 fn collect_columnar_indirections(
     batch: &crate::table::columnar::ColumnBatch,
-) -> crate::Result<Vec<crate::blob_tree::handle::BlobIndirection>> {
+) -> crate::Result<Vec<(crate::UserKey, crate::blob_tree::handle::BlobIndirection)>> {
     let tag = u8::from(crate::ValueType::Indirection);
     // Columns are key / seqno / value-type / values...; the value-type column
     // holds one tag byte per row.
@@ -1440,24 +1441,29 @@ fn collect_columnar_indirections(
 }
 
 /// Folds one block's recovered indirections into the walk's derived blob-link
-/// map, mirroring the accumulation the live write path does per entry.
+/// map, mirroring the accumulation the live write path does per entry. Blocks
+/// are folded in key order, so a blob file's first key is the first seen and
+/// its last key the latest.
 fn fold_blob_links(
     derived: &mut crate::HashMap<crate::vlog::BlobFileId, crate::table::writer::LinkedFile>,
-    indirections: &[crate::blob_tree::handle::BlobIndirection],
+    indirections: &[(crate::UserKey, crate::blob_tree::handle::BlobIndirection)],
 ) {
-    for ind in indirections {
+    for (key, ind) in indirections {
         derived
             .entry(ind.vhandle.blob_file_id)
             .and_modify(|link| {
                 link.bytes += u64::from(ind.size);
                 link.on_disk_bytes += u64::from(ind.vhandle.on_disk_size);
                 link.len += 1;
+                link.last_key.clone_from(key);
             })
             .or_insert_with(|| crate::table::writer::LinkedFile {
                 blob_file_id: ind.vhandle.blob_file_id,
                 bytes: u64::from(ind.size),
                 on_disk_bytes: u64::from(ind.vhandle.on_disk_size),
                 len: 1,
+                first_key: key.clone(),
+                last_key: key.clone(),
             });
     }
 }
@@ -2764,7 +2770,7 @@ fn salvage_blocks(
         // Deterministic section order regardless of hash-map iteration.
         links.sort_unstable_by_key(|l| l.blob_file_id);
         for link in links {
-            writer.link_blob_file(link.blob_file_id, link.len, link.bytes, link.on_disk_bytes);
+            writer.link_blob_file(link);
         }
         writer.finish()?;
     } else {

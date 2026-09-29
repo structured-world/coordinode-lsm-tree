@@ -36,12 +36,50 @@ fn table_multi_writer_same_key_norotate() -> crate::Result<()> {
     Ok(())
 }
 
+/// A compaction that cuts one table's values into many tables links each
+/// output to the shared blob file over its own keys only: the key span a
+/// link records restarts at every rotation instead of carrying the previous
+/// output's first key.
+#[test]
+fn each_rotated_table_links_its_blob_file_over_its_own_keys() -> crate::Result<()> {
+    let folder = tempfile::tempdir()?;
+    let tree = Config::new(
+        &folder,
+        SequenceNumberCounter::default(),
+        SequenceNumberCounter::default(),
+    )
+    .with_kv_separation(Some(crate::KvSeparationOptions::default()))
+    .open()?;
+    // Enough rows that the index side alone spans several data blocks.
+    for i in 0..3_000u32 {
+        tree.insert(format!("key{i:05}"), "v".repeat(2_048), u64::from(i));
+    }
+    tree.flush_active_memtable(0)?;
+    assert_eq!(tree.blob_file_count(), 1);
+
+    tree.major_compact(1_024, 1_000)?;
+    let version = tree.current_version();
+    let tables: Vec<_> = version.iter_tables().collect();
+    assert!(tables.len() > 1, "the compaction cut several tables");
+    for table in tables {
+        let Some(links) = table.list_blob_file_references()? else {
+            panic!("every value is separated");
+        };
+        let [link] = links.as_slice() else {
+            panic!("one blob file backs every value: {links:?}");
+        };
+        assert_eq!(&link.first_key, table.metadata.key_range.min());
+        assert_eq!(&link.last_key, table.metadata.key_range.max());
+    }
+    Ok(())
+}
+
 /// The blob files a table links are handed to its writer only when it
 /// rotates, and it writes them at `finish`: the table is full once they no
 /// longer fit its target, before they reach the writer.
 #[test]
 fn the_linked_blob_files_count_toward_a_full_table() -> crate::Result<()> {
-    use crate::{InternalValue, UserKey, fs::StdFs, table::writer::LinkedFile};
+    use crate::{InternalValue, UserKey, fs::StdFs};
     use std::sync::Arc;
 
     let folder = tempfile::tempdir()?;
@@ -65,18 +103,11 @@ fn the_linked_blob_files_count_toward_a_full_table() -> crate::Result<()> {
     mw.target_size = mw.writer.output_size_hint() + 100;
     assert!(mw.writer.held_state_bytes() < mw.target_size);
     assert!(!mw.table_full());
+    let key = UserKey::from(b"a" as &[u8]);
     for blob_file_id in 0..10 {
-        mw.linked_blobs.insert(
-            blob_file_id,
-            LinkedFile {
-                blob_file_id,
-                bytes: 1,
-                on_disk_bytes: 1,
-                len: 1,
-            },
-        );
+        mw.linked_blobs.register(blob_file_id, 1, 1, &key);
     }
-    assert!(mw.table_full(), "ten linked files take 324 bytes");
+    assert!(mw.table_full(), "ten linked files take 384 bytes");
     Ok(())
 }
 
@@ -86,7 +117,7 @@ fn the_linked_blob_files_count_toward_a_full_table() -> crate::Result<()> {
 /// by its memory before its size.
 #[test]
 fn the_linked_blob_files_count_toward_the_held_state() -> crate::Result<()> {
-    use crate::{InternalValue, UserKey, fs::StdFs, table::writer::LinkedFile};
+    use crate::{InternalValue, UserKey, fs::StdFs};
     use std::sync::Arc;
 
     const FILES: u64 = 1_000;
@@ -106,19 +137,12 @@ fn the_linked_blob_files_count_toward_the_held_state() -> crate::Result<()> {
         crate::ValueType::Value,
     ))?;
     mw.writer.spill_block()?;
+    let key = UserKey::from(b"a" as &[u8]);
     for blob_file_id in 0..FILES {
-        mw.linked_blobs.insert(
-            blob_file_id,
-            LinkedFile {
-                blob_file_id,
-                bytes: 1,
-                on_disk_bytes: 1,
-                len: 1,
-            },
-        );
+        mw.linked_blobs.register(blob_file_id, 1, 1, &key);
     }
     // Their bytes on disk fit; their entries in memory do not.
-    let linked = crate::table::writer::linked_blob_files_len(mw.linked_blobs.len());
+    let linked = mw.linked_blobs.section_len();
     mw.target_size = mw.writer.output_size_hint() + linked + 100;
     assert!(mw.writer.held_state_bytes() + FILES * 64 >= mw.target_size);
     assert!(mw.table_full(), "{FILES} linked files held in memory");
@@ -167,7 +191,7 @@ fn a_first_columnar_batch_past_the_target_fills_its_table() -> crate::Result<()>
 /// nothing counts it.
 #[test]
 fn rotation_frees_the_linked_blob_map() -> crate::Result<()> {
-    use crate::{InternalValue, UserKey, fs::StdFs, table::writer::LinkedFile};
+    use crate::{InternalValue, UserKey, fs::StdFs};
     use std::sync::Arc;
 
     let folder = tempfile::tempdir()?;
@@ -185,16 +209,9 @@ fn rotation_frees_the_linked_blob_map() -> crate::Result<()> {
         0,
         crate::ValueType::Value,
     ))?;
+    let key = UserKey::from(b"a" as &[u8]);
     for blob_file_id in 0..1_000 {
-        mw.linked_blobs.insert(
-            blob_file_id,
-            LinkedFile {
-                blob_file_id,
-                bytes: 1,
-                on_disk_bytes: 1,
-                len: 1,
-            },
-        );
+        mw.linked_blobs.register(blob_file_id, 1, 1, &key);
     }
     mw.current_key = Some(UserKey::from(b"b" as &[u8]));
     mw.rotate()?;

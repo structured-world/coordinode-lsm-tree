@@ -20,9 +20,10 @@ use crate::{
     file_accessor::FileAccessor,
     fs::Fs,
     range_tombstone::RangeTombstone,
-    table::{IndexBlock, filter::block::FilterBlock},
+    table::{IndexBlock, filter::block::FilterBlock, writer::LinkedFile},
     tree::inner::TreeId,
 };
+use alloc::boxed::Box;
 use alloc::sync::Arc;
 use core::sync::atomic::AtomicBool;
 
@@ -91,18 +92,12 @@ pub struct Inner {
     #[cfg(feature = "metrics")]
     pub(crate) metrics: Arc<Metrics>,
 
-    /// Cached sum of referenced blob file bytes for this table.
-    ///
-    /// Initialized to `AtomicU64::new(u64::MAX)`, the "not yet computed"
-    /// sentinel (a real sum can never reach 18 EiB). Lazily computed on first
-    /// access to avoid repeated I/O in compaction decisions:
-    /// `Table::referenced_blob_bytes` does an `Acquire` load, returns early
-    /// when the value is not `u64::MAX`, otherwise sums the table's
-    /// `LinkedFile.on_disk_bytes` and publishes it with a `Release` store.
-    /// The store is idempotent under races because the table's linked-blob-file
-    /// region is immutable after open, so every racing computer re-reads the
-    /// same on-disk byte counts and computes the same sum.
-    pub(crate) cached_blob_bytes: AtomicU64,
+    /// The table's `linked_blob_files` records, read on first use and kept, so
+    /// compaction decisions and the storage statistics do no I/O for them
+    /// after the first. Empty for a table that references no blob file. The
+    /// section is immutable after open, so two racing first readers parse the
+    /// same records and either result is the one kept.
+    pub(crate) blob_links: once_cell::race::OnceBox<Box<[LinkedFile]>>,
 
     /// Cumulative point reads that consulted this segment's data, bumped
     /// (`Relaxed`) once a read passes the segment's seqno-range and bloom gates

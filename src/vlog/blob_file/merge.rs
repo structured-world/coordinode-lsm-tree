@@ -3,10 +3,10 @@
 // Copyright (c) 2026-present, Dmitry Prudnikov
 
 use super::scanner::Scanner as BlobFileScanner;
+use crate::comparator::SharedComparator;
 use crate::vlog::{BlobFileId, blob_file::scanner::ScanEntry};
-use alloc::collections::BinaryHeap;
 use alloc::vec::Vec;
-use core::cmp::Reverse;
+use core::cmp::Ordering;
 
 type IteratorIndex = usize;
 
@@ -17,66 +17,94 @@ struct IteratorValue {
     blob_file_id: BlobFileId,
 }
 
-// PartialEq / Eq are derived from Ord so they STAY consistent: the
-// `Ord` contract requires `a == b` ⇔ `a.cmp(b) == Equal`. Defining
-// Eq on just `key` (the previous impl) violated that, because two
-// entries with the same key + different seqno would test equal but
-// `cmp` would order them. BinaryHeap doesn't call Eq today, but
-// breaking the contract is a latent footgun the moment any caller
-// puts these in a HashSet, BTreeSet, dedup() pass, etc.
-impl PartialEq for IteratorValue {
-    fn eq(&self, other: &Self) -> bool {
-        self.cmp(other) == core::cmp::Ordering::Equal
-    }
-}
-impl Eq for IteratorValue {}
-
-impl PartialOrd for IteratorValue {
-    fn partial_cmp(&self, other: &Self) -> Option<core::cmp::Ordering> {
-        Some(self.cmp(other))
-    }
-}
-
-impl Ord for IteratorValue {
-    fn cmp(&self, other: &Self) -> core::cmp::Ordering {
-        (&self.scan_entry.key, Reverse(&self.scan_entry.seqno))
-            .cmp(&(&other.scan_entry.key, Reverse(&other.scan_entry.seqno)))
-    }
-}
-
-/// Interleaves multiple blob file readers into a single, sorted stream.
+/// Interleaves multiple blob file readers into a single stream, ordered by
+/// key under the tree's comparator, newest version first.
 ///
-/// Uses `BinaryHeap<Reverse<_>>` for a min-heap. The merger only needs
-/// pop-min + push semantics — the previous `IntervalHeap` (double-ended)
-/// was overkill, and its `compare` transitive dep doesn't declare
-/// `#![no_std]`, blocking the crate's no-std-check job.
+/// A relocating compaction walks this stream alongside the merged table
+/// stream, which is in the comparator's order; merging by raw key bytes
+/// instead would put the two out of step under any other ordering. The heap
+/// is kept here rather than in a `BinaryHeap` because its ordering needs the
+/// comparator, which would otherwise have to ride along in every entry.
 pub struct MergeScanner {
     readers: Vec<BlobFileScanner>,
-    heap: BinaryHeap<Reverse<IteratorValue>>,
+    comparator: SharedComparator,
+    /// Min-heap by [`Self::order`].
+    heap: Vec<IteratorValue>,
+    started: bool,
 }
 
 impl MergeScanner {
-    /// Initializes a new merging reader
-    pub fn new(readers: Vec<BlobFileScanner>) -> Self {
-        let heap = BinaryHeap::with_capacity(readers.len());
-        Self { readers, heap }
+    /// Initializes a new merging reader over `readers`, ordering keys by
+    /// `comparator`.
+    pub fn new(readers: Vec<BlobFileScanner>, comparator: SharedComparator) -> Self {
+        let heap = Vec::with_capacity(readers.len());
+        Self {
+            readers,
+            comparator,
+            heap,
+            started: false,
+        }
+    }
+
+    /// Key ascending under the comparator, then seqno descending.
+    fn order(&self, a: &IteratorValue, b: &IteratorValue) -> Ordering {
+        self.comparator
+            .compare(&a.scan_entry.key, &b.scan_entry.key)
+            .then_with(|| b.scan_entry.seqno.cmp(&a.scan_entry.seqno))
+    }
+
+    fn push(&mut self, value: IteratorValue) {
+        self.heap.push(value);
+        let mut child = self.heap.len() - 1;
+        while child > 0 {
+            let parent = (child - 1) / 2;
+            match (self.heap.get(child), self.heap.get(parent)) {
+                (Some(c), Some(p)) if self.order(c, p) == Ordering::Less => {
+                    self.heap.swap(child, parent);
+                    child = parent;
+                }
+                _ => break,
+            }
+        }
+    }
+
+    fn pop(&mut self) -> Option<IteratorValue> {
+        if self.heap.is_empty() {
+            return None;
+        }
+        let head = self.heap.swap_remove(0);
+        let mut parent = 0;
+        loop {
+            let mut least = parent;
+            for child in [2 * parent + 1, 2 * parent + 2] {
+                if let (Some(c), Some(l)) = (self.heap.get(child), self.heap.get(least))
+                    && self.order(c, l) == Ordering::Less
+                {
+                    least = child;
+                }
+            }
+            if least == parent {
+                break;
+            }
+            self.heap.swap(parent, least);
+            parent = least;
+        }
+        Some(head)
     }
 
     fn advance_reader(&mut self, idx: usize) -> crate::Result<()> {
-        #[expect(clippy::indexing_slicing, reason = "we trust the caller")]
-        let reader = &mut self.readers[idx];
-
+        let Some(reader) = self.readers.get_mut(idx) else {
+            return Ok(());
+        };
         if let Some(value) = reader.next() {
             let scan_entry = value?;
             let blob_file_id = reader.blob_file_id;
-
-            self.heap.push(Reverse(IteratorValue {
+            self.push(IteratorValue {
                 index: idx,
                 blob_file_id,
                 scan_entry,
-            }));
+            });
         }
-
         Ok(())
     }
 
@@ -84,7 +112,6 @@ impl MergeScanner {
         for idx in 0..self.readers.len() {
             self.advance_reader(idx)?;
         }
-
         Ok(())
     }
 }
@@ -93,16 +120,14 @@ impl Iterator for MergeScanner {
     type Item = crate::Result<(ScanEntry, BlobFileId)>;
 
     fn next(&mut self) -> Option<Self::Item> {
-        if self.heap.is_empty() {
+        if !self.started {
+            self.started = true;
             fail_iter!(self.push_next());
         }
 
-        if let Some(Reverse(head)) = self.heap.pop() {
-            fail_iter!(self.advance_reader(head.index));
-            return Some(Ok((head.scan_entry, head.blob_file_id)));
-        }
-
-        None
+        let head = self.pop()?;
+        fail_iter!(self.advance_reader(head.index));
+        Some(Ok((head.scan_entry, head.blob_file_id)))
     }
 }
 

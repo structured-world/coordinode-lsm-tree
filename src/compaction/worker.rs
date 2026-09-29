@@ -264,8 +264,21 @@ pub fn do_compaction(opts: &Options) -> crate::Result<CompactionResult> {
                 }
             }
 
-            // Only a real trivial move has to answer this one: the rewrite
-            // above consolidates the same inputs into one sorted output, which
+            // A move carries its tables' blob layout down unchanged, and a
+            // table at the bottom level may never be merged again. When locality
+            // relocation would rewrite some of their blob files, the same inputs
+            // are merged instead, within the same budget and space check.
+            if moves_into_locality_relocation(
+                &version_history_lock.latest_version_ref().version,
+                opts,
+                &payload,
+            )? {
+                log::debug!("Converting trivial move to merge: blob locality relocation");
+                return merge_tables(compaction_state, version_history_lock, opts, &payload);
+            }
+
+            // Only a real trivial move has to answer this one: the rewrites
+            // above consolidate the same inputs into one sorted output, which
             // is the repair rather than the problem.
             if !moved_tables_can_share_a_run(
                 &version_history_lock.latest_version_ref().version,
@@ -365,6 +378,35 @@ pub fn space_fits_two_layer(
     sst_dest_level: u8,
     blob_bytes: u64,
 ) -> bool {
+    space_fits(
+        config,
+        quota_headroom,
+        sst_bytes,
+        sst_dest_level,
+        blob_bytes,
+        Reserve::MayConsume,
+    )
+}
+
+/// Whether a merge may eat into the reserved flush floor to fit.
+#[derive(Copy, Clone, PartialEq, Eq)]
+enum Reserve {
+    /// Only where the reserve stays intact: work that is optional.
+    Keep,
+    /// Also into the reserve, which breaks the no-space-to-free-space
+    /// deadlock for a merge that frees space.
+    MayConsume,
+}
+
+/// [`space_fits_two_layer`], with the reserve policy explicit.
+fn space_fits(
+    config: &Config,
+    quota_headroom: u64,
+    sst_bytes: u64,
+    sst_dest_level: u8,
+    blob_bytes: u64,
+    reserve: Reserve,
+) -> bool {
     const RESERVE: u64 = crate::tree::MIN_RESERVED_HEADROOM;
 
     // Layer 1: logical partition quota on the total new bytes. The sum of two
@@ -378,7 +420,8 @@ pub fn space_fits_two_layer(
     // no-space-to-free-space deadlock, when it fits raw free (emergency,
     // consuming the reserve). `>= RESERVE` guards the subtraction.
     let volume_fits = |demand: u64, free: u64| -> bool {
-        (free >= RESERVE && demand <= free - RESERVE) || demand <= free
+        (free >= RESERVE && demand <= free - RESERVE)
+            || (reserve == Reserve::MayConsume && demand <= free)
     };
 
     let (sst_path, sst_fs) = config.tables_folder_for_level(sst_dest_level);
@@ -2173,28 +2216,11 @@ fn run_subcompaction(
                     .stale_files
                     .iter()
                     .map(|bf| {
-                        // Never scan below the frontier the FILE itself
-                        // declares: a relocation that committed a slice and
-                        // then aborted leaves the stale file restricted with
-                        // its consumed prefix punched, and this run's map
-                        // starts empty. Reading from the data section would
-                        // hit those zeros, resynchronize byte-wise, and taint
-                        // every surviving frame, so the retry could never
-                        // relocate anything. Deciding it here (rather than
-                        // seeding the map) keeps the two from drifting apart.
-                        let off = reloc
-                            .resume_offsets
-                            .get(&bf.id())
-                            .copied()
-                            .unwrap_or(0)
-                            .max(bf.live_data_start());
-                        if off == 0 {
-                            BlobFileScanner::new(&bf.0.path, &*bf.0.fs, bf.id())
-                        } else {
-                            BlobFileScanner::resume(&bf.0.path, &*bf.0.fs, bf.id(), off)
-                        }
+                        let from = reloc.resume_offsets.get(&bf.id()).copied().unwrap_or(0);
+                        open_blob_scanner_at_frontier(bf, from)
                     })
                     .collect::<crate::Result<Vec<_>>>()?,
+                opts.config.comparator.clone(),
             );
 
             let writer = BlobFileWriter::new(
@@ -2226,6 +2252,7 @@ fn run_subcompaction(
                 reloc.stale_files,
                 opts.rate_limiter.clone(),
                 opts.stop_signal.clone(),
+                opts.config.comparator.clone(),
             ))
         }
         _ => Box::new(StandardCompaction::new(table_writer, tables_for_deletion)),
@@ -2438,6 +2465,240 @@ pub fn pick_blob_files_to_rewrite(
     }
 
     Ok(linked_blob_files.into_iter().cloned().collect::<Vec<_>>())
+}
+
+/// The blob files a merge relocates.
+struct BlobRewrite {
+    files: Vec<BlobFile>,
+    /// Some of `files` are relocated for locality rather than for staleness.
+    #[cfg_attr(
+        not(feature = "std"),
+        expect(dead_code, reason = "read only by the std merge-on-read fast path")
+    )]
+    for_locality: bool,
+}
+
+/// Blob files a merge of `tables` relocates: the stale set, then, when locality
+/// relocation is on, the files interleaved too deeply for scans.
+fn pick_blob_files_for_merge(
+    opts: &Options,
+    version: &Version,
+    payload: &CompactionPayload,
+    tables: &[Table],
+) -> crate::Result<BlobRewrite> {
+    let Some(blob_opts) = &opts.config.kv_separation_opts else {
+        return Ok(BlobRewrite {
+            files: Vec::new(),
+            for_locality: false,
+        });
+    };
+    let mut files = pick_blob_files_to_rewrite(&payload.table_ids, version, blob_opts)?;
+    let mut for_locality = false;
+    if let Some(locality) = blob_opts.locality_relocation {
+        let extra = pick_blob_files_for_locality(opts, version, payload, tables, locality, &files)?;
+        for_locality = !extra.is_empty();
+        files.extend(extra);
+    }
+    Ok(BlobRewrite {
+        files,
+        for_locality,
+    })
+}
+
+/// Opens a relocation scan of `bf` at `from`, or at the frontier the file
+/// itself declares when that lies further.
+///
+/// A relocation that committed a slice and then aborted leaves the file
+/// restricted with its consumed prefix punched. Reading from the data section
+/// would hit those zeros, resynchronize byte-wise and taint every surviving
+/// frame, so no later merge could relocate the file.
+fn open_blob_scanner_at_frontier(bf: &BlobFile, from: u64) -> crate::Result<BlobFileScanner> {
+    let off = from.max(bf.live_data_start());
+    if off == 0 {
+        BlobFileScanner::new(&bf.0.path, &*bf.0.fs, bf.id())
+    } else {
+        BlobFileScanner::resume(&bf.0.path, &*bf.0.fs, bf.id(), off)
+    }
+}
+
+/// Whether merging a move's tables instead would relocate blob files for
+/// locality. Stale files alone do not turn a move into a merge.
+fn moves_into_locality_relocation(
+    version: &Version,
+    opts: &Options,
+    payload: &CompactionPayload,
+) -> crate::Result<bool> {
+    let Some(blob_opts) = &opts.config.kv_separation_opts else {
+        return Ok(false);
+    };
+    let Some(locality) = blob_opts.locality_relocation else {
+        return Ok(false);
+    };
+    let Some(tables) = payload
+        .table_ids
+        .iter()
+        .map(|&id| version.get_table(id).cloned())
+        .collect::<Option<Vec<_>>>()
+    else {
+        return Ok(false);
+    };
+    let stale = pick_blob_files_to_rewrite(&payload.table_ids, version, blob_opts)?;
+    Ok(
+        !pick_blob_files_for_locality(opts, version, payload, &tables, locality, &stale)?
+            .is_empty(),
+    )
+}
+
+/// Blob files to relocate, beyond the stale ones already chosen, so a scan
+/// over the merged tables interleaves fewer files.
+///
+/// Relocation writes the chosen files' values in key order, so files whose
+/// key spans overlap come out as consecutive runs. Candidates are the files
+/// that take part in a region deeper than the limit, taken by depth per
+/// on-disk byte while reading and writing them fits the budget. Only whole
+/// files that no table outside the merge references are eligible, and
+/// nothing is picked when the output would not leave the reserved free space
+/// intact.
+fn pick_blob_files_for_locality(
+    opts: &Options,
+    version: &Version,
+    payload: &CompactionPayload,
+    tables: &[Table],
+    locality: crate::config::BlobLocalityRelocation,
+    stale: &[BlobFile],
+) -> crate::Result<Vec<BlobFile>> {
+    let max_depth = locality.max_depth.get();
+
+    // Cheapest first: a merge whose inputs stay within the limit, the
+    // consecutive layout included, never pays for more than the figure.
+    let depths = crate::storage_stats::blob_file_depths(tables)?;
+    log::trace!("Blob file depths of the merge: {depths:?}");
+    let mut candidates: Vec<(BlobFile, u64, u64)> = Vec::new();
+    for (id, depth) in depths {
+        if depth <= max_depth || stale.iter().any(|bf| bf.id() == id) {
+            continue;
+        }
+        let Some(blob_file) = version.blob_files.get(id) else {
+            continue;
+        };
+        if blob_file.is_dead(version.gc_stats()) {
+            continue;
+        }
+        candidates.push((blob_file.clone(), depth, blob_file.physical_size()?));
+    }
+    if candidates.is_empty() {
+        return Ok(Vec::new());
+    }
+
+    // A file another table still points into cannot move: its references
+    // would dangle.
+    for table in outside_tables(version, &payload.table_ids) {
+        let links = table.blob_links()?;
+        candidates.retain(|(bf, _, _)| !links.iter().any(|link| link.blob_file_id == bf.id()));
+    }
+
+    // The bytes the merge writes anyway: its tables, bounded by the length of
+    // their input files (a restricted input's punched prefix excluded), plus
+    // what relocating the stale files writes, which is their values these
+    // tables still reference rather than the files' whole length. Table
+    // files are measured by length, as blob files are: the recorded table size
+    // leaves out sections written after the data. Sums of on-disk sizes are
+    // bounded by filesystem capacity and cannot overflow.
+    let mut table_bytes = 0u64;
+    let mut stale_written = 0u64;
+    for table in tables {
+        let len = table.fs.metadata(&table.path)?.len;
+        table_bytes += len.checked_sub(table.punch_offset()?).unwrap_or(len);
+        for link in table.blob_links()? {
+            if stale.iter().any(|bf| bf.id() == link.blob_file_id) {
+                stale_written += link.on_disk_bytes;
+            }
+        }
+    }
+    // A float-to-int cast saturates, and NaN or a negative budget gives zero.
+    #[expect(
+        clippy::cast_possible_truncation,
+        clippy::cast_sign_loss,
+        clippy::cast_precision_loss,
+        reason = "the budget is a fraction of a byte count; rounding is fine"
+    )]
+    let budget = ((table_bytes + stale_written) as f64 * f64::from(locality.budget)) as u64;
+
+    // Most depth per byte first; ties go to the older file.
+    candidates.sort_by(|(a, a_depth, a_size), (b, b_depth, b_size)| {
+        let a_score = u128::from(*a_depth) * u128::from((*b_size).max(1));
+        let b_score = u128::from(*b_depth) * u128::from((*a_size).max(1));
+        b_score.cmp(&a_score).then_with(|| a.id().cmp(&b.id()))
+    });
+
+    // A file rewritten without another it overlaps keeps its span: its
+    // interleaving stays, and joining it to a disjoint run would only stretch
+    // that run's span across the gap. The partner must share its codec too:
+    // relocation copies frames verbatim, one output file per source codec, so
+    // files of different codecs stay apart however they overlap.
+    let mut codecs: Vec<crate::CompressionType> = Vec::new();
+    let mut group_of = |bf: &BlobFile| {
+        let codec = bf.compression();
+        codecs.iter().position(|c| *c == codec).unwrap_or_else(|| {
+            codecs.push(codec);
+            codecs.len() - 1
+        })
+    };
+    let mut fixed: Vec<(crate::vlog::BlobFileId, usize)> =
+        stale.iter().map(|bf| (bf.id(), group_of(bf))).collect();
+    fixed.sort_unstable_by_key(|&(id, _)| id);
+    // Each byte is read once and written once.
+    let ranked: Vec<(crate::vlog::BlobFileId, usize, u64)> = candidates
+        .iter()
+        .map(|(bf, _, size)| (bf.id(), group_of(bf), 2 * size))
+        .collect();
+    let (chosen, spent) =
+        crate::storage_stats::pick_overlapping_blob_files(tables, &fixed, &ranked, budget)?;
+    let picked: Vec<(BlobFile, u64)> = candidates
+        .into_iter()
+        .zip(chosen)
+        .filter_map(|((bf, _, size), chosen)| chosen.then_some((bf, size)))
+        .collect();
+
+    log::debug!(
+        "Locality relocation: {} of the candidates fit {spent} of {budget} budget bytes",
+        picked.len(),
+    );
+    if picked.is_empty() {
+        return Ok(Vec::new());
+    }
+
+    // The space check charges the whole length of every file relocated: the
+    // demand is not known more closely before the merge runs.
+    let mut stale_bytes = 0u64;
+    for bf in stale {
+        stale_bytes += bf.physical_size()?;
+    }
+    let picked_bytes: u64 = picked.iter().map(|(_, size)| size).sum();
+    let picked: Vec<BlobFile> = picked.into_iter().map(|(bf, _)| bf).collect();
+
+    let rc = opts.runtime_config.load_full();
+    let quota_headroom = match rc.storage_limit_bytes {
+        Some(limit) => limit.saturating_sub(crate::storage_stats::compute_used_bytes(version)?),
+        None => u64::MAX,
+    };
+    if !space_fits(
+        &opts.config,
+        quota_headroom,
+        table_bytes,
+        payload.dest_level,
+        stale_bytes + picked_bytes,
+        Reserve::Keep,
+    ) {
+        log::debug!("Skipping locality relocation: the output would eat into the reserve");
+        return Ok(Vec::new());
+    }
+
+    log::debug!(
+        "Relocating blob files for locality: {:?}",
+        picked.iter().map(BlobFile::id).collect::<Vec<_>>(),
+    );
+    Ok(picked)
 }
 
 fn hidden_guard<T>(
@@ -2700,16 +2961,24 @@ fn merge_tables(
     input_range_tombstones.sort();
     input_range_tombstones.dedup();
 
+    // Chosen once: the fast path and the split decision below and the
+    // relocating writer must agree on the set.
+    let blob_rewrite =
+        pick_blob_files_for_merge(opts, &current_super_version.version, payload, &tables)?;
+
     // Merge-on-read fast path: a lone columnar segment whose own range
     // tombstones (below the watermark) delete some of its rows is relocated (its
     // data blocks reused verbatim plus a positional delete-bitmap) instead of
     // being re-transposed. Detection is read-only, so it runs under the held
     // read lock; on a hit the lock is released before the relocation installs
     // its own version edit. Multi-input merges and any non-relocatable segment
-    // fall through to the normal copy-on-write merge below.
+    // fall through to the normal copy-on-write merge below. So does a segment
+    // whose blob files are relocated for locality: the verbatim copy would keep
+    // its blob links, and with them the interleaving.
     #[cfg(feature = "std")]
-    if let Some((source, bitmap)) =
-        plan_merge_on_read(opts, payload, &tables, &input_range_tombstones)?
+    if !blob_rewrite.for_locality
+        && let Some((source, bitmap)) =
+            plan_merge_on_read(opts, payload, &tables, &input_range_tombstones)?
     {
         drop(current_super_version);
         drop(version_history_lock);
@@ -2721,6 +2990,7 @@ fn merge_tables(
             &bitmap,
         );
     }
+    let blob_files_to_rewrite = blob_rewrite.files;
 
     // ---- Parallel sub-compaction (std only) ----
     // A non-relocating compaction can be split into disjoint key ranges that
@@ -2733,17 +3003,9 @@ fn merge_tables(
         let dst_lvl: usize = payload.canonical_level.into();
         let is_last_level = payload.dest_level == opts.config.level_count - 1;
 
-        // Only KV-separated trees with fragmented blob files relocate; that
-        // path is not split here.
-        let relocating = match &opts.config.kv_separation_opts {
-            Some(blob_opts) => !pick_blob_files_to_rewrite(
-                &payload.table_ids,
-                &current_super_version.version,
-                blob_opts,
-            )?
-            .is_empty(),
-            None => false,
-        };
+        // Only KV-separated trees with blob files to relocate get here with a
+        // non-empty set; that path is not split.
+        let relocating = !blob_files_to_rewrite.is_empty();
 
         let total_input_bytes: u64 = tables.iter().map(Table::file_size).sum();
 
@@ -3074,12 +3336,6 @@ fn merge_tables(
         Some(blob_opts) => {
             merge_iter = merge_iter.with_drop_callback(&mut blob_frag_map);
 
-            let blob_files_to_rewrite = pick_blob_files_to_rewrite(
-                &payload.table_ids,
-                &current_super_version.version,
-                blob_opts,
-            )?;
-
             if blob_files_to_rewrite.is_empty() {
                 log::debug!("No blob relocation needed");
 
@@ -3097,8 +3353,9 @@ fn merge_tables(
                 let scanner = BlobFileMergeScanner::new(
                     blob_files_to_rewrite
                         .iter()
-                        .map(|bf| BlobFileScanner::new(&bf.0.path, &*bf.0.fs, bf.id()))
+                        .map(|bf| open_blob_scanner_at_frontier(bf, 0))
                         .collect::<crate::Result<Vec<_>>>()?,
+                    opts.config.comparator.clone(),
                 );
 
                 let writer = BlobFileWriter::new(
@@ -3127,6 +3384,7 @@ fn merge_tables(
                     blob_files_to_rewrite,
                     opts.rate_limiter.clone(),
                     opts.stop_signal.clone(),
+                    opts.config.comparator.clone(),
                 ))
             }
         }

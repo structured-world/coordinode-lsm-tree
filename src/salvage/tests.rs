@@ -4463,8 +4463,8 @@ fn verify_tli_mirrors_rejects_a_forged_partition_boundary() -> crate::Result<()>
 }
 
 /// A `linked_blob_files` section that PARSES but under-reports its contents
-/// (count word forged to 0, record bytes left in place) must not be trusted
-/// as the sole source of the recovered copy's links: the recovered entries
+/// (the first record's blob id forged to one nothing references) must not be
+/// trusted as the sole source of the recovered copy's links: the recovered entries
 /// still hold `ValueHandle` indirections into the blob file, and blob GC /
 /// relocation consults the links to decide liveness — an under-reported list
 /// would let GC delete or rewrite a blob the copy still references. Salvage
@@ -4507,8 +4507,8 @@ fn salvage_rebuilds_blob_links_from_recovered_indirections() -> crate::Result<()
     };
     assert!(!true_links.is_empty(), "the source references blob files");
 
-    // Forge the count word to 0: the section still parses (the bound check
-    // passes trivially) but reports NO links.
+    // Forge the first record's blob id, right after the four-byte count: the
+    // section still parses but no longer lists that blob file.
     let pos = {
         let mut f = std::fs::File::open(&source)?;
         let reader = match crate::sfa::Reader::from_reader(&mut f) {
@@ -4524,18 +4524,25 @@ fn salvage_rebuilds_blob_links_from_recovered_indirections() -> crate::Result<()
         };
         usize::try_from(entry.pos()).unwrap_or(usize::MAX)
     };
-    let mut bytes = std::fs::read(&source)?;
-    let Some(count) = bytes.get_mut(pos..pos + 4) else {
-        panic!("linked_blob_files count header within the file");
+    const FORGED_ID: u64 = u64::MAX - 7;
+    let Some(hidden) = true_links.first().map(|link| link.blob_file_id) else {
+        panic!("the source references a first blob file");
     };
-    count.copy_from_slice(&0u32.to_le_bytes());
+    let mut bytes = std::fs::read(&source)?;
+    let Some(id) = bytes.get_mut(pos + 4..pos + 12) else {
+        panic!("linked_blob_files first record within the file");
+    };
+    id.copy_from_slice(&FORGED_ID.to_le_bytes());
     std::fs::write(&source, &bytes)?;
 
     // Sanity: the forgery took — the source now under-reports.
     let Some(forged) = open(source.clone(), &fs)?.list_blob_file_references()? else {
         panic!("the forged section still parses");
     };
-    assert!(forged.is_empty(), "the forged count hides every link");
+    assert!(
+        forged.iter().all(|link| link.blob_file_id != hidden),
+        "the forged id hides the first link"
+    );
 
     let dest = dir.path().join("salvaged");
     let report = salvage_sst(&source, dest.clone(), &fs)?;
