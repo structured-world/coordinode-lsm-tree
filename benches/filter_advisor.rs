@@ -157,15 +157,52 @@ fn prepare(
 }
 
 /// Runs `count` of the workload's lookups on a reopened tree, returning how
-/// many the filters let through to a data block read.
-fn false_positives(tree: &AnyTree, skewed: bool, count: u64) -> lsm_tree::Result<usize> {
+/// many the filters let through to a data block read. With `latencies`, each
+/// lookup's time is pushed there; the timed runs leave it out.
+fn false_positives(
+    tree: &AnyTree,
+    skewed: bool,
+    count: u64,
+    mut latencies: Option<&mut Vec<Duration>>,
+) -> lsm_tree::Result<usize> {
     let metrics = tree.metrics();
     let (queries, skipped) = (metrics.filter_queries(), metrics.io_skipped_by_filter());
     let mut lookups = Lookups(0xD1B5_4A32_D192_ED03);
     for _ in 0..count {
-        assert!(tree.get(lookups.absent(skewed), SeqNo::MAX)?.is_none());
+        let key = lookups.absent(skewed);
+        let found = if let Some(latencies) = latencies.as_deref_mut() {
+            let start = Instant::now();
+            let found = tree.get(key, SeqNo::MAX)?;
+            latencies.push(start.elapsed());
+            found
+        } else {
+            tree.get(key, SeqNo::MAX)?
+        };
+        assert!(found.is_none());
     }
     Ok((metrics.filter_queries() - queries) - (metrics.io_skipped_by_filter() - skipped))
+}
+
+/// The median, P99 and P999 of `samples`, for printing.
+fn tail(samples: &mut [Duration]) -> String {
+    samples.sort_unstable();
+    let at = |q: f64| {
+        let last = samples.len().saturating_sub(1);
+        #[expect(
+            clippy::cast_possible_truncation,
+            clippy::cast_sign_loss,
+            clippy::cast_precision_loss,
+            reason = "an index into the samples"
+        )]
+        let index = (last as f64 * q).round() as usize;
+        samples.get(index).copied().unwrap_or_default()
+    };
+    format!(
+        "p50 {:?}, p99 {:?}, p999 {:?}",
+        at(0.5),
+        at(0.99),
+        at(0.999)
+    )
 }
 
 fn bench_absent_lookups(c: &mut Criterion) {
@@ -189,13 +226,17 @@ fn bench_absent_lookups(c: &mut Criterion) {
                 // their own noise.
                 let counted = 10 * SIZE.lookups;
                 let tree = open(dir.path(), advisor.clone()).expect("open");
-                let fp = false_positives(&tree, skewed, counted).expect("lookups");
+                let mut latencies = Vec::new();
+                let fp =
+                    false_positives(&tree, skewed, counted, Some(&mut latencies)).expect("lookups");
                 let memory = tree.filter_memory();
                 println!(
                     "{workload}/{arm}: {fp} false positives of {counted} lookups, filters {} B \
-                     in {} tables (static {static_bytes} B, advisor {advised_bytes} B)",
+                     in {} tables (static {static_bytes} B, advisor {advised_bytes} B); \
+                     per lookup from a cold cache {}",
                     memory.serialised_bytes,
                     tree.table_count(),
+                    tail(&mut latencies),
                 );
             }
             group.bench_function(format!("{workload}/{arm}"), |b| {
@@ -205,7 +246,7 @@ fn bench_absent_lookups(c: &mut Criterion) {
                         let tree = open(dir.path(), advisor.clone()).expect("open");
                         let start = Instant::now();
                         std::hint::black_box(
-                            false_positives(&tree, skewed, SIZE.lookups).expect("lookups"),
+                            false_positives(&tree, skewed, SIZE.lookups, None).expect("lookups"),
                         );
                         total += start.elapsed();
                     }
@@ -228,6 +269,20 @@ fn bench_probe_counting(c: &mut Criterion) {
         }
         tree.flush_active_memtable(0).expect("flush");
         let mut i = 0;
+        // Each read's time over one pass of every key, for the tail the
+        // counters may add; the timed runs below measure the mean.
+        let mut latencies = Vec::new();
+        for _ in 0..SIZE.keys_per_range {
+            i = (i + 7_919) % SIZE.keys_per_range;
+            let k = key(0, 2 * i);
+            let start = Instant::now();
+            std::hint::black_box(tree.get(k, SeqNo::MAX).expect("get"));
+            latencies.push(start.elapsed());
+        }
+        println!(
+            "probe_counting/{arm}: per cached read {}",
+            tail(&mut latencies)
+        );
         group.bench_function(arm, |b| {
             b.iter_batched(
                 || {
@@ -252,6 +307,8 @@ fn bench_rewrite(c: &mut Criterion) {
         populate(dir.path(), None, true).expect("populate")
     };
     for (arm, advisor) in [("static", None), ("advisor", Some(advisor(budget)))] {
+        // One compaction is one sample, so the spread criterion reports over
+        // them is this arm's tail; ten samples carry no P99 of their own.
         group.bench_function(arm, |b| {
             b.iter_custom(|iters| {
                 let mut total = Duration::ZERO;
