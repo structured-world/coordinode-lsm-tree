@@ -1654,6 +1654,55 @@ fn a_relocation_retry_resumes_at_the_committed_blob_frontier() -> crate::Result<
     Ok(())
 }
 
+/// Once space frees up, the restricted blob file a crashed tight-space
+/// relocation left behind is relocated by an ordinary merge. That merge must
+/// also start the scan at the file's committed frontier: from the data section
+/// it reads the punched zeros and rejects the file.
+#[test]
+fn an_ordinary_merge_resumes_a_restricted_blob_file_at_its_frontier() -> crate::Result<()> {
+    let dir = tempfile::tempdir()?;
+    let mem = crate::fs::MemFs::with_capacity(u64::MAX);
+    let tree = blob_relocation_crash_and_reopen(dir.path(), &mem)?;
+
+    let restricted: Vec<_> = tree
+        .index
+        .current_version()
+        .blob_files
+        .iter()
+        .filter(|bf| bf.live_data_start() > 0)
+        .map(crate::vlog::BlobFile::id)
+        .collect();
+    assert!(
+        !restricted.is_empty(),
+        "the crashed relocation must leave a blob file with a committed frontier",
+    );
+
+    mem.set_capacity(u64::MAX);
+    tree.index.update_runtime_config(|c| {
+        c.tight_space_compaction = false;
+    })?;
+    tree.major_compact(64 * 1024 * 1024, BLOB_RELOC_WATERMARK)?;
+
+    let version = tree.index.current_version();
+    assert!(
+        version
+            .blob_files
+            .iter()
+            .all(|bf| !restricted.contains(&bf.id())),
+        "the ordinary merge must relocate the restricted blob file",
+    );
+    for i in 0..BLOB_RELOC_KEYS {
+        let expected = blob_reloc_value(i, u8::from(i % 2 == 0) + 1);
+        assert_eq!(
+            tree.get(blob_reloc_key(i).as_bytes(), crate::MAX_SEQNO)?
+                .as_deref(),
+            Some(expected.as_slice()),
+            "key {i} wrong/lost after the ordinary merge",
+        );
+    }
+    Ok(())
+}
+
 /// A restricted-blob reopen failure mid-slice — after `run_subcompaction`
 /// finalized the slice's output SSTs and blob files, before the install
 /// references them — must ROLL BACK those outputs like every other
@@ -4758,6 +4807,103 @@ mod locality_relocation {
         assert!(
             spent <= allowance,
             "locality spent {spent} B against an allowance of {allowance} B",
+        );
+        Ok(())
+    }
+
+    /// A pick that ends up without a partner gives its budget back. Here the
+    /// best-ranked file interleaves with two large files the budget cannot
+    /// take along, and ranking first it would crowd out half of a cheaper
+    /// overlapping pair; the pair is relocated instead of nothing.
+    #[test]
+    fn a_partnerless_pick_leaves_its_budget_to_an_overlapping_pair() -> crate::Result<()> {
+        let folder = tempfile::tempdir()?;
+        let flush_file = |tree: &AnyTree, keys: &[String], seqno: &mut u64| -> crate::Result<()> {
+            for key in keys {
+                tree.insert(key.as_str(), vec![b'v'; 2_048], *seqno);
+                *seqno += 1;
+            }
+            tree.flush_active_memtable(0)?;
+            Ok(())
+        };
+        let (small, pair) = {
+            let tree = open(folder.path(), KvSeparationOptions::default())?;
+            let mut seqno = 0;
+            // Region x: one file of 16 values interleaved with two of 32.
+            let x = |slots: &[u64]| -> Vec<String> {
+                (0..80u64)
+                    .filter(|k| slots.contains(&(k % 5)))
+                    .map(|k| format!("x{k:06}"))
+                    .collect()
+            };
+            flush_file(&tree, &x(&[0]), &mut seqno)?;
+            let small = blob_ids(&tree);
+            flush_file(&tree, &x(&[1, 2]), &mut seqno)?;
+            flush_file(&tree, &x(&[3, 4]), &mut seqno)?;
+            // Region y: two interleaved files of 16 values each.
+            let y = |parity: u64| -> Vec<String> {
+                (0..32u64)
+                    .filter(|k| k % 2 == parity)
+                    .map(|k| format!("y{k:06}"))
+                    .collect()
+            };
+            let before_pair = blob_ids(&tree);
+            flush_file(&tree, &y(0), &mut seqno)?;
+            flush_file(&tree, &y(1), &mut seqno)?;
+            let pair: BTreeSet<u64> = blob_ids(&tree).difference(&before_pair).copied().collect();
+            (small, pair)
+        };
+        assert_eq!(small.len(), 1);
+        assert_eq!(pair.len(), 2);
+
+        // Room for the small file and one of the pair, or for the whole pair,
+        // but never for the small file together with a large one.
+        let budget = {
+            let tree = open(folder.path(), KvSeparationOptions::default())?;
+            let version = tree.current_version();
+            let size = |id: u64| -> crate::Result<u64> {
+                let Some(bf) = version.blob_files.get(id) else {
+                    panic!("blob file {id} exists");
+                };
+                bf.physical_size()
+            };
+            let a = small
+                .iter()
+                .map(|&id| size(id))
+                .sum::<crate::Result<u64>>()?;
+            let mut pair_sizes = pair.iter().map(|&id| size(id));
+            let (Some(b), Some(c)) = (pair_sizes.next(), pair_sizes.next()) else {
+                panic!("two files in the pair");
+            };
+            let (b, c) = (b?, c?);
+            let allowance = 2 * (a + b) + c / 2;
+            assert!(2 * (b + c) <= allowance, "the pair alone must fit");
+            let mut table_bytes = 0;
+            for table in version.iter_tables() {
+                table_bytes += table.fs.metadata(&table.path)?.len;
+            }
+            #[expect(clippy::cast_precision_loss, reason = "test budget from byte counts")]
+            let ratio = allowance as f32 / table_bytes as f32;
+            ratio
+        };
+
+        let Some(max_depth) = NonZeroU64::new(1) else {
+            panic!("one is not zero");
+        };
+        let tree = open(
+            folder.path(),
+            KvSeparationOptions::default().relocate_for_locality(max_depth, budget),
+        )?;
+        let before = blob_ids(&tree);
+        tree.major_compact(u64::MAX, u64::MAX)?;
+        let after = blob_ids(&tree);
+        assert!(
+            pair.is_disjoint(&after),
+            "the pair was relocated: before {before:?}, after {after:?}",
+        );
+        assert!(
+            small.is_subset(&after),
+            "the small file stays: before {before:?}, after {after:?}",
         );
         Ok(())
     }
