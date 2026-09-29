@@ -75,7 +75,7 @@ impl FilterBudget {
     }
 
     /// Filter bytes of the published version.
-    #[cfg(test)]
+    #[cfg(all(test, zstd_any))]
     pub(crate) fn published(&self) -> u64 {
         self.published.load(Relaxed)
     }

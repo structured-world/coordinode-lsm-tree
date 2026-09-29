@@ -1069,6 +1069,7 @@ impl AbstractTree for BlobTree {
         &self,
         stream: impl Iterator<Item = crate::Result<InternalValue>>,
         range_tombstones: Vec<crate::range_tombstone::RangeTombstone>,
+        keys: u64,
     ) -> crate::Result<
         Option<(
             Vec<Table>,
@@ -1127,8 +1128,9 @@ impl AbstractTree for BlobTree {
         .use_row_group_size(self.index.config.columnar_row_group_size_policy.get(0))
         .use_columnar_page_size(self.index.config.columnar_page_size_policy.get(0))
         .use_column_encoding(self.index.config.column_encoding_policy.get(0))
-        .use_data_block_hash_ratio(data_block_hash_ratio)
-        .use_bloom_policy({
+        .use_data_block_hash_ratio(data_block_hash_ratio);
+
+        let bloom_policy = {
             use crate::config::FilterPolicyEntry::{Bloom, None};
             use crate::table::filter::BloomConstructionPolicy;
 
@@ -1136,7 +1138,10 @@ impl AbstractTree for BlobTree {
                 Bloom(policy) => policy,
                 None => BloomConstructionPolicy::BitsPerKey(0.0),
             }
-        });
+        };
+        table_writer = table_writer.use_bloom_policy(bloom_policy);
+        let filter_sizing = self.index.new_data_filter_sizing(0, bloom_policy, keys);
+        table_writer = table_writer.use_filter_sizing(filter_sizing.clone());
 
         if index_partitioning {
             // Size-adaptive index: single-level for small SSTs, spill to
@@ -1172,7 +1177,7 @@ impl AbstractTree for BlobTree {
                 .use_zstd_dictionary(dicts.for_compression(data_block_compression)?)
                 .use_zstd_two_pass_seed(rc.zstd_two_pass_seed);
         }
-        let write_pin = crate::runtime_config::WritePin::new(&rc);
+        let write_pin = crate::runtime_config::WritePin::new(&rc).with_filter_sizing(filter_sizing);
 
         // Parallel block compression for the flush writer, mirroring the
         // standard tree's flush: engaged only when the per-block transform does

@@ -826,6 +826,7 @@ impl AbstractTree for Tree {
         &self,
         stream: impl Iterator<Item = crate::Result<InternalValue>>,
         range_tombstones: Vec<crate::range_tombstone::RangeTombstone>,
+        keys: u64,
     ) -> crate::Result<
         Option<(
             Vec<Table>,
@@ -897,20 +898,7 @@ impl AbstractTree for Tree {
             }
         };
         table_writer = table_writer.use_bloom_policy(bloom_policy);
-        // A flushed table has no history of its own: its filter is sized by
-        // the load the live tables draw per key. The plan is held until the
-        // tables are installed (see `WritePin`).
-        let filter_sizing = self.config.filter_advisor.as_ref().and_then(|advisor| {
-            let version = self.current_version();
-            crate::filter_budget::plan(
-                advisor,
-                &self.filter_budget,
-                version.iter_tables(),
-                crate::filter_budget::Rewrite::default(),
-                bloom_policy,
-                filter_partitioning.then(|| self.config.filter_block_partition_size_policy.get(0)),
-            )
-        });
+        let filter_sizing = self.new_data_filter_sizing(0, bloom_policy, keys);
         table_writer = table_writer.use_filter_sizing(filter_sizing.clone());
 
         if index_partitioning {
@@ -1864,6 +1852,37 @@ impl AbstractTree for Tree {
 }
 
 impl Tree {
+    /// The filter plan of new data written into tables under the policies of
+    /// `level`, as a flush or an ingestion writes it: at most `keys` entries
+    /// (zero when unknown) under `bloom_policy`. `None` without an advisor.
+    /// New data has no probe history of its own: its filters are sized by the
+    /// load the live tables draw per key, and room is kept for every table the
+    /// write fills. The plan is held until the tables are installed (see
+    /// `WritePin`).
+    pub(crate) fn new_data_filter_sizing(
+        &self,
+        level: usize,
+        bloom_policy: crate::table::filter::BloomConstructionPolicy,
+        keys: u64,
+    ) -> Option<alloc::sync::Arc<crate::filter_budget::FilterSizing>> {
+        let advisor = self.config.filter_advisor.as_ref()?;
+        let version = self.current_version();
+        crate::filter_budget::plan(
+            advisor,
+            &self.filter_budget,
+            version.iter_tables(),
+            crate::filter_budget::Rewrite {
+                keys,
+                ..crate::filter_budget::Rewrite::default()
+            },
+            bloom_policy,
+            self.config
+                .filter_block_partitioning_policy
+                .get(level)
+                .then(|| self.config.filter_block_partition_size_policy.get(level)),
+        )
+    }
+
     /// Stores `dict` in the tree and records it in the current version, so it
     /// resolves after a reopen with no dictionary supplied in the config.
     ///

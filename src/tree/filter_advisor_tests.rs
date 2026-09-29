@@ -377,6 +377,110 @@ fn a_budget_nothing_fits_enters_the_over_budget_state() -> crate::Result<()> {
     Ok(())
 }
 
+/// A tree that separates large values flushes its tables through its own
+/// writer, and the advisor sizes their filters there too: a budget nothing
+/// fits writes the narrowest width, not the static policy's.
+#[test]
+fn a_blob_tree_flush_is_sized_by_the_advisor() -> crate::Result<()> {
+    let folder = tempfile::tempdir()?;
+    let tree = Config::new(
+        folder.path(),
+        SequenceNumberCounter::default(),
+        SequenceNumberCounter::default(),
+    )
+    .data_block_size_policy(BlockSizePolicy::all(1_024))
+    .with_kv_separation(Some(crate::KvSeparationOptions::default()))
+    .filter_advisor(Some(FilterAdvisor::new(1)))
+    .open()?;
+    assert!(matches!(tree, AnyTree::Blob(_)));
+    fill(&tree, &["hot"], KEYS)?;
+    probe_absent(&tree, "hot", 10)?;
+    fill(&tree, &["new"], KEYS)?;
+
+    let newest = under(&tables(&tree), "new");
+    assert!(!newest.is_empty());
+    for table in &newest {
+        assert!(
+            bits_per_key(table) < 8,
+            "{} bits a key, the narrowest width is 6",
+            bits_per_key(table)
+        );
+    }
+    assert!(tree.filter_memory().over_budget);
+    Ok(())
+}
+
+/// Ingested tables get their filters from the advisor as flushed ones do: a
+/// budget nothing fits writes the narrowest width, not the static policy's.
+#[test]
+fn an_ingestion_is_sized_by_the_advisor() -> crate::Result<()> {
+    let folder = tempfile::tempdir()?;
+    let tree = open(folder.path(), Some(FilterAdvisor::new(1)))?;
+    fill(&tree, &["hot"], KEYS)?;
+    probe_absent(&tree, "hot", 10)?;
+    let mut ingestion = tree.ingestion()?;
+    for i in 0..KEYS {
+        ingestion.write(key("new", 2 * i), "value")?;
+    }
+    ingestion.finish()?;
+
+    let newest = under(&tables(&tree), "new");
+    assert!(!newest.is_empty());
+    for table in &newest {
+        assert!(
+            bits_per_key(table) < 8,
+            "{} bits a key, the narrowest width is 6",
+            bits_per_key(table)
+        );
+    }
+    Ok(())
+}
+
+/// A flush large enough to write several tables keeps room for the later
+/// tables' filters at the narrowest width, as a compaction does: the first
+/// table does not take the budget at a wide width and push the later ones
+/// past it, when every table fits it at the narrowest.
+#[test]
+fn a_flush_into_several_tables_keeps_room_for_the_later_ones() -> crate::Result<()> {
+    // Large incompressible values, so the flush rotates into a second table
+    // (at 64 MiB) over few enough keys to keep the test quick.
+    const KEYS: usize = 6_000;
+    const VALUE: usize = 16 * 1_024;
+    let folder = tempfile::tempdir()?;
+    // Every filter fits at the narrowest width with a quarter to spare; the
+    // static policy's 10 bits for the first table leave too little for the
+    // rest.
+    let narrowest = BloomConstructionPolicy::BitsPerKey(6.0).filter_size_bound(KEYS) as u64;
+    let budget = narrowest * 5 / 4;
+    let tree = open(
+        folder.path(),
+        Some(FilterAdvisor::new(budget).with_bits_per_key([6u8, 10].to_vec())),
+    )?;
+    let mut state: u64 = 0x9E37_79B9_7F4A_7C15;
+    let mut value = vec![0u8; VALUE];
+    for i in 0..KEYS {
+        for byte in &mut value {
+            // xorshift: incompressible bytes.
+            state ^= state << 13;
+            state ^= state >> 7;
+            state ^= state << 17;
+            *byte = state.to_le_bytes()[0];
+        }
+        tree.insert(format!("key{i:06}"), value.as_slice(), i as SeqNo);
+    }
+    tree.flush_active_memtable(0)?;
+
+    let tables = tables(&tree);
+    assert!(tables.len() >= 2, "{} tables", tables.len());
+    let memory = tree.filter_memory();
+    let sizes: Vec<(u64, u32)> = tables
+        .iter()
+        .map(|table| (table.metadata.item_count, table.filter_size()))
+        .collect();
+    assert!(!memory.over_budget, "{memory:?} {sizes:?}");
+    Ok(())
+}
+
 /// Widths all wider than the static policy's: once probes are observed, a
 /// budget none of them fits writes the narrowest configured width, never the
 /// static policy's narrower one.

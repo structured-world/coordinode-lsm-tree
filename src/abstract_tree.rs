@@ -502,6 +502,12 @@ pub trait AbstractTree: sealed::Sealed {
             .collect::<Vec<_>>();
 
         let flushed_size = latest.sealed_memtables.iter().map(|mt| mt.size()).sum();
+        // Every version of every key: the stream writes no more entries.
+        let flushed_entries: u64 = latest
+            .sealed_memtables
+            .iter()
+            .map(|mt| u64::try_from(mt.len()).unwrap_or(u64::MAX))
+            .sum();
 
         // AtInsert residence check: verify each sealed memtable's insert-time
         // per-KV digests against a recompute over the entries' current bytes
@@ -555,7 +561,7 @@ pub trait AbstractTree: sealed::Sealed {
         // RT-only path (no KV data, tables.is_empty()) we re-insert RTs into the
         // active memtable. Flush is infrequent and RT count is small.
         if let Some((tables, blob_files, write_pin)) =
-            self.flush_to_tables_with_rt(stream, range_tombstones.clone())?
+            self.flush_to_tables_with_rt(stream, range_tombstones.clone(), flushed_entries)?
         {
             // If no tables were produced (RT-only memtable), re-insert RTs
             // into active memtable so they aren't lost
@@ -842,10 +848,18 @@ pub trait AbstractTree: sealed::Sealed {
         &self,
         stream: impl Iterator<Item = crate::Result<InternalValue>>,
     ) -> crate::Result<Option<FlushToTablesResult>> {
-        self.flush_to_tables_with_rt(stream, Vec::new())
+        // The stream's upper bound, when it tells one, is the most entries it
+        // holds.
+        let keys = stream
+            .size_hint()
+            .1
+            .map_or(0, |upper| u64::try_from(upper).unwrap_or(u64::MAX));
+        self.flush_to_tables_with_rt(stream, Vec::new(), keys)
     }
 
     /// Like [`AbstractTree::flush_to_tables`], but also writes range tombstones.
+    /// `keys` bounds the entries of `stream` from above, zero when unknown: a
+    /// filter advisor keeps room for every table the flush writes by it.
     ///
     /// This is an internal extension hook on the crate's sealed tree types and
     /// is hidden from generated documentation.
@@ -858,6 +872,7 @@ pub trait AbstractTree: sealed::Sealed {
         &self,
         stream: impl Iterator<Item = crate::Result<InternalValue>>,
         range_tombstones: Vec<crate::range_tombstone::RangeTombstone>,
+        keys: u64,
     ) -> crate::Result<Option<FlushToTablesResult>>;
 
     /// Atomically registers flushed tables into the tree, removing their associated sealed memtables.
