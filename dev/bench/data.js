@@ -1,5 +1,5 @@
 window.BENCHMARK_DATA = {
-  "lastUpdate": 1790676577361,
+  "lastUpdate": 1790697260154,
   "repoUrl": "https://github.com/structured-world/coordinode-lsm-tree",
   "entries": {
     "lsm-tree db_bench costs": [
@@ -26824,6 +26824,90 @@ window.BENCHMARK_DATA = {
             "value": 641349.3991357817,
             "unit": "ops/sec",
             "extra": "P50: 1.2us | P99: 6.4us | P99.9: 75.5us\nthreads: 1 | elapsed: 0.31s | num: 200000 | iterations: 3"
+          }
+        ]
+      },
+      {
+        "commit": {
+          "author": {
+            "email": "mail@polaz.com",
+            "name": "Dmitry Prudnikov",
+            "username": "polaz"
+          },
+          "committer": {
+            "email": "noreply@github.com",
+            "name": "GitHub",
+            "username": "web-flow"
+          },
+          "distinct": true,
+          "id": "1378cc27030f334b8f4f7aaf8ad002793c7d4b6a",
+          "message": "perf(writer): build filter partitions on the block pipeline's workers (#747)\n\n## Summary\n\n- A partitioned filter builds its partitions on the ordered block\npipeline's workers instead of the writer's thread, and publishes them in\nspill order, so the filter section is byte-identical to the serial\nbuild.\n- The writer thread spends less CPU per table where filter partitions\nare a noticeable share of the work.\n\n## Changes\n\n- Each spilled partition becomes a job on the pipeline the table's data\nblocks already use; at most twice the worker count are in flight, and\nthe writer helps build queued partitions itself when no worker is free.\n- Partitions on workers count toward the writer's held bytes, finish\nscratch and finish output.\n- An empty partition build still aborts the table with the same error.\n- A full filter is still built once at finish on the writer's thread.\n- `benches/block_pipeline.rs`: `BP_FILTER_PARTITION` partitions the\nflushed table's filter, and the writer thread's CPU time is reported\nnext to the process's.\n- Config docs: the compaction pool also builds filter partitions.\n\n## Measurements\n\nWindows, 1 KiB blocks, 48000 blocks, partitioned filter, interleaved\nA/B:\n\n| Threads | Wall (ms) before → after | Writer CPU (ms) before → after |\n|---|---|---|\n| 4 | 571.7 / 569.3 → 514.9 / 510.1 | 562.5 / 546.9 → 500 / 500 |\n| serial | unchanged | unchanged |\n\nAt 4 KiB blocks the filter is a small share of the work and the\ndifference is within noise (Windows CPU time is quantized at 15.6 ms).\n\n## Testing\n\nThe filter section is compared byte for byte against the serial build on\nfour workers, one, the writer's own thread and a saturated pool, for one\npartition and many, both filter policies and page ECC; partitions\nfinished in reverse keep their order; encrypted partitions keep their\nlayout; an empty partition aborts on workers too. Formatting, clippy in\nboth feature sets, the full test suite with and without all features,\ndoc tests, docs, the no-std check and `tools/sst-dump` pass.\n\nCloses #668\n\n\n<!-- This is an auto-generated comment: release notes by coderabbit.ai\n-->\n## Summary by CodeRabbit\n\n* **Performance**\n* Partitioned filters can now be built using configured\nparallel-compression workers. Results retain their original order and\noutput format, including for encrypted output.\n* Parallel-compression settings apply to partitioned filters regardless\nof the order in which writer options are configured. When parallel\ncompression is not configured, partition construction remains serial.\n* **Benchmarks**\n* Flush measurements now include writer-thread CPU time alongside\nwall-clock and process CPU time.\n* Set `BP_FILTER_PARTITION` to a valid `u32` to enable filter-block\npartitioning in benchmark fixtures and choose the partition size.\n<!-- end of auto-generated comment: release notes by coderabbit.ai -->",
+          "timestamp": "2026-09-29T18:46:50+03:00",
+          "tree_id": "20662f92550f276792083f23153853775578d2b4",
+          "url": "https://github.com/structured-world/coordinode-lsm-tree/commit/1378cc27030f334b8f4f7aaf8ad002793c7d4b6a"
+        },
+        "date": 1790697196011,
+        "tool": "customBiggerIsBetter",
+        "benches": [
+          {
+            "name": "mixed",
+            "value": 82325.13345841758,
+            "unit": "ops/sec",
+            "extra": "P50: 0.4us | P99: 7.9us | P99.9: 29.3us\nthreads: 1 | elapsed: 6.50s | num: 200000 | iterations: 3"
+          },
+          {
+            "name": "fillseq",
+            "value": 3090287.381275022,
+            "unit": "ops/sec",
+            "extra": "P50: 0.2us | P99: 0.6us | P99.9: 3.8us\nthreads: 1 | elapsed: 0.06s | num: 200000 | iterations: 3"
+          },
+          {
+            "name": "fillrandom",
+            "value": 1116814.309518385,
+            "unit": "ops/sec",
+            "extra": "P50: 0.8us | P99: 1.5us | P99.9: 5.0us\nthreads: 1 | elapsed: 0.18s | num: 200000 | iterations: 3"
+          },
+          {
+            "name": "readrandom",
+            "value": 745502.5693746053,
+            "unit": "ops/sec",
+            "extra": "P50: 1.1us | P99: 6.3us | P99.9: 73.7us\nthreads: 1 | elapsed: 0.27s | num: 200000 | iterations: 3"
+          },
+          {
+            "name": "readseq",
+            "value": 2552941.626989699,
+            "unit": "ops/sec",
+            "extra": "P50: 0.2us | P99: 4.7us | P99.9: 10.9us\nthreads: 1 | elapsed: 0.08s | num: 200000 | iterations: 3"
+          },
+          {
+            "name": "seekrandom",
+            "value": 296009.4959846312,
+            "unit": "ops/sec",
+            "extra": "P50: 2.7us | P99: 8.1us | P99.9: 14.6us\nthreads: 1 | elapsed: 0.68s | num: 200000 | iterations: 3"
+          },
+          {
+            "name": "prefixscan",
+            "value": 196773.2918823835,
+            "unit": "ops/sec",
+            "extra": "P50: 4.5us | P99: 5.8us | P99.9: 12.0us\nthreads: 1 | elapsed: 1.02s | num: 200000 | iterations: 3"
+          },
+          {
+            "name": "overwrite",
+            "value": 1096177.519372197,
+            "unit": "ops/sec",
+            "extra": "P50: 0.8us | P99: 1.5us | P99.9: 5.0us\nthreads: 1 | elapsed: 0.18s | num: 200000 | iterations: 3"
+          },
+          {
+            "name": "mergerandom",
+            "value": 436975.84747095854,
+            "unit": "ops/sec",
+            "extra": "P50: 0.3us | P99: 1.3us | P99.9: 4.3us\nthreads: 1 | elapsed: 0.46s | num: 200000 | iterations: 3"
+          },
+          {
+            "name": "readwhilewriting",
+            "value": 647415.1303505624,
+            "unit": "ops/sec",
+            "extra": "P50: 1.2us | P99: 6.4us | P99.9: 72.8us\nthreads: 1 | elapsed: 0.31s | num: 200000 | iterations: 3"
           }
         ]
       }
