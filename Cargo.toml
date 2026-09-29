@@ -381,6 +381,12 @@ path = "benches/batch_ops.rs"
 required-features = []
 
 [[bench]]
+name = "io_uring_multi_get"
+harness = false
+path = "benches/io_uring_multi_get.rs"
+required-features = ["io-uring"]
+
+[[bench]]
 name = "zstd_dict"
 harness = false
 path = "benches/zstd_dict.rs"

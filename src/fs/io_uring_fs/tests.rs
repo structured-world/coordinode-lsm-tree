@@ -1456,3 +1456,297 @@ fn volume_id_matches_the_kernel_mount() -> io::Result<()> {
     assert!(fs.volume_id(dir.path()).is_some(), "a real mount has an id");
     Ok(())
 }
+
+/// Two files of `len` bytes each, byte `i` of file `f` being `(i + f) % 251`.
+fn two_files(fs: &IoUringFs, dir: &Path, len: usize) -> io::Result<Vec<Box<dyn FsFile>>> {
+    let opts = FsOpenOptions::new().write(true).create(true).read(true);
+    let mut files = Vec::new();
+    for f in 0..2usize {
+        let mut file = fs.open(&dir.join(format!("f{f}.bin")), &opts)?;
+        let bytes: Vec<u8> = (0..len)
+            .map(|i| u8::try_from((i + f) % 251).expect("below 251"))
+            .collect();
+        file.write_all(&bytes)?;
+        file.sync_all()?;
+        files.push(file);
+    }
+    Ok(files)
+}
+
+/// What a caller spends per batch before the kernel sees it is one completion
+/// channel and one acquisition of the submission lock, however many reads the
+/// batch holds.
+#[test]
+fn a_batched_read_takes_one_channel_and_one_lock_per_batch() -> io::Result<()> {
+    let Some(fs) = try_io_uring() else {
+        return Ok(());
+    };
+    let dir = tempfile::tempdir()?;
+    let files = two_files(&fs, dir.path(), 64 * 16)?;
+    let mut buffers = vec![[0u8; 16]; 64];
+    let mut reqs: Vec<_> = buffers
+        .iter_mut()
+        .enumerate()
+        .map(|(i, buf)| crate::fs::BlockRead {
+            file: files[i % 2].as_ref(),
+            offset: (i * 16) as u64,
+            buf: crate::fs::BlockBuf::new(buf),
+        })
+        .collect();
+
+    let counts = &fs.inner.counts;
+    let channels = counts.channels.load(core::sync::atomic::Ordering::Relaxed);
+    let locks = counts.locks.load(core::sync::atomic::Ordering::Relaxed);
+    fs.read_blocks_batched(&mut reqs)?;
+    assert_eq!(
+        counts.channels.load(core::sync::atomic::Ordering::Relaxed) - channels,
+        1
+    );
+    assert_eq!(
+        counts.locks.load(core::sync::atomic::Ordering::Relaxed) - locks,
+        1
+    );
+    drop(reqs);
+    for (i, buf) in buffers.iter().enumerate() {
+        let expected: Vec<u8> = (0..16)
+            .map(|b| u8::try_from((i * 16 + b + i % 2) % 251).expect("below 251"))
+            .collect();
+        assert_eq!(buf.as_slice(), expected, "block {i}");
+    }
+    Ok(())
+}
+
+/// `drain_batch` over completions fed in the given order: `(position, result)`.
+fn drain_in(
+    expected: &[usize],
+    order: &[(usize, i32)],
+) -> (Result<(), (usize, io::Error)>, Vec<usize>) {
+    let mut feed = order.iter().copied();
+    let mut handed = Vec::new();
+    let verdict = drain_batch(expected, || feed.next(), "short", |p| handed.push(p));
+    (verdict, handed)
+}
+
+/// Which failure a batch reports is a rule over the requests, not a race: the
+/// lowest position, whatever order its completions arrive in.
+#[test]
+fn a_failed_batch_reports_the_lowest_failure_in_any_completion_order() {
+    // Position 1 fails with EIO, position 3 reads short, position 4 fails with
+    // ENOSPC; 0 and 2 succeed.
+    let expected = [8, 8, 8, 8, 8];
+    let events = [(0, 8), (1, -5), (2, 8), (3, 2), (4, -28)];
+    let forward: Vec<_> = events.to_vec();
+    let reverse: Vec<_> = events.iter().rev().copied().collect();
+    let shuffled = vec![events[3], events[0], events[4], events[2], events[1]];
+
+    for order in [forward, reverse, shuffled] {
+        let (verdict, mut handed) = drain_in(&expected, &order);
+        let Err((position, error)) = verdict else {
+            panic!("a batch with failures must fail ({order:?})");
+        };
+        assert_eq!(position, 1, "{order:?}");
+        assert_eq!(error.raw_os_error(), Some(5), "{order:?}");
+        handed.sort_unstable();
+        assert_eq!(
+            handed,
+            [0, 2],
+            "only full reads are handed over ({order:?})"
+        );
+    }
+}
+
+/// A read that never completes, because the ring went away, is a broken pipe
+/// at its position; a failure at a lower position still wins over it.
+#[test]
+fn a_batch_cut_short_reports_the_missing_read() {
+    let (verdict, _) = drain_in(&[4, 4, 4], &[(0, 4), (2, 4)]);
+    let Err((position, error)) = verdict else {
+        panic!("a read that never completed must fail the batch");
+    };
+    assert_eq!(position, 1);
+    assert_eq!(error.kind(), io::ErrorKind::BrokenPipe);
+
+    let (verdict, _) = drain_in(&[4, 4, 4], &[(2, 4), (0, -5)]);
+    assert!(matches!(verdict, Err((0, _))));
+}
+
+/// A finished read is handed over before later completions are even looked
+/// at: the caller works on it while the rest are still in flight.
+#[test]
+fn a_finished_read_is_handed_over_before_later_completions_arrive() {
+    let log = core::cell::RefCell::new(Vec::new());
+    let mut feed = [(2, 4), (0, 4), (1, 4)].into_iter();
+    let verdict = drain_batch(
+        &[4, 4, 4],
+        || {
+            let next = feed.next();
+            if let Some((position, _)) = next {
+                log.borrow_mut().push(format!("complete {position}"));
+            }
+            next
+        },
+        "short",
+        |position| log.borrow_mut().push(format!("hand {position}")),
+    );
+    assert!(verdict.is_ok());
+    assert_eq!(
+        log.into_inner(),
+        [
+            "complete 2",
+            "hand 2",
+            "complete 0",
+            "hand 0",
+            "complete 1",
+            "hand 1"
+        ]
+    );
+}
+
+/// Handing requests over as they complete returns exactly what the ordered
+/// path returns: the same requests, filled with the same bytes.
+#[test]
+fn read_blocks_batched_each_returns_what_the_ordered_path_returns() -> io::Result<()> {
+    let Some(fs) = try_io_uring() else {
+        return Ok(());
+    };
+    let dir = tempfile::tempdir()?;
+    let files = two_files(&fs, dir.path(), 32 * 64)?;
+    let read = |each: bool| -> io::Result<(Vec<[u8; 64]>, Vec<usize>)> {
+        let mut buffers = vec![[0u8; 64]; 32];
+        let mut handed = Vec::new();
+        {
+            let mut reqs: Vec<_> = buffers
+                .iter_mut()
+                .enumerate()
+                .map(|(i, buf)| crate::fs::BlockRead {
+                    file: files[i % 2].as_ref(),
+                    offset: (i * 64) as u64,
+                    buf: crate::fs::BlockBuf::new(buf),
+                })
+                .collect();
+            if each {
+                fs.read_blocks_batched_each(&mut reqs, &mut |i, req| {
+                    assert!(req.buf.is_full(), "request {i} handed over unfilled");
+                    handed.push(i);
+                })?;
+            } else {
+                fs.read_blocks_batched(&mut reqs)?;
+            }
+        }
+        handed.sort_unstable();
+        Ok((buffers, handed))
+    };
+    let (ordered, _) = read(false)?;
+    let (each, handed) = read(true)?;
+    assert_eq!(ordered, each);
+    assert_eq!(handed, (0..32).collect::<Vec<_>>());
+    Ok(())
+}
+
+/// A batch mixing reads that fail with reads that succeed, run many times:
+/// every successful read is filled and handed over, none that failed is, and
+/// the failure reported is always the lowest one. The buffers of reads still
+/// in flight when an earlier one fails are written before the call returns.
+#[test]
+fn a_mixed_batch_drains_every_read_and_reports_the_lowest_failure() -> io::Result<()> {
+    let Some(fs) = try_io_uring() else {
+        return Ok(());
+    };
+    let dir = tempfile::tempdir()?;
+    let files = two_files(&fs, dir.path(), 16 * 16)?;
+    for _ in 0..200 {
+        // Every third request reads past the end of its file.
+        let mut buffers = vec![[0xAAu8; 16]; 24];
+        let mut handed = Vec::new();
+        let verdict = {
+            let mut reqs: Vec<_> = buffers
+                .iter_mut()
+                .enumerate()
+                .map(|(i, buf)| crate::fs::BlockRead {
+                    file: files[i % 2].as_ref(),
+                    offset: if i % 3 == 1 {
+                        1 << 20
+                    } else {
+                        (i % 16 * 16) as u64
+                    },
+                    buf: crate::fs::BlockBuf::new(buf),
+                })
+                .collect();
+            fs.read_blocks_batched_each(&mut reqs, &mut |i, _| handed.push(i))
+        };
+        let Err(error) = verdict else {
+            panic!("reads past the end must fail the batch");
+        };
+        assert_eq!(error.kind(), crate::io::ErrorKind::UnexpectedEof);
+        handed.sort_unstable();
+        let succeeded: Vec<usize> = (0..24).filter(|i| i % 3 != 1).collect();
+        assert_eq!(handed, succeeded);
+        for &i in &succeeded {
+            assert_ne!(buffers[i], [0xAAu8; 16], "read {i} was drained and written");
+        }
+    }
+    Ok(())
+}
+
+/// A callback that panics must not cut the drain short: the reads still in
+/// flight write into buffers the unwind would free, so every completion is
+/// received before the panic carries on.
+#[test]
+fn a_panicking_callback_still_drains_every_completion() {
+    let received = core::cell::Cell::new(0usize);
+    let mut feed = [(0, 4), (1, 4), (2, 4)].into_iter();
+    let unwound = std::panic::catch_unwind(std::panic::AssertUnwindSafe(|| {
+        drain_batch(
+            &[4, 4, 4],
+            || {
+                let next = feed.next();
+                if next.is_some() {
+                    received.set(received.get() + 1);
+                }
+                next
+            },
+            "short",
+            |_| panic!("the caller's work on a finished read failed"),
+        )
+    }));
+    assert!(unwound.is_err(), "the callback's panic carries on");
+    assert_eq!(received.get(), 3, "every completion was received first");
+}
+
+/// An empty request is complete without a read, so it is handed over like
+/// every other finished one, as the default and the serial path do.
+#[test]
+fn an_empty_request_in_a_batch_is_handed_over() -> io::Result<()> {
+    let Some(fs) = try_io_uring() else {
+        return Ok(());
+    };
+    let dir = tempfile::tempdir()?;
+    let files = two_files(&fs, dir.path(), 64)?;
+    let mut first = [0u8; 16];
+    let mut empty = [0u8; 0];
+    let mut last = [0u8; 16];
+    let mut handed = Vec::new();
+    {
+        let mut reqs = vec![
+            crate::fs::BlockRead {
+                file: files[0].as_ref(),
+                offset: 0,
+                buf: crate::fs::BlockBuf::new(&mut first),
+            },
+            crate::fs::BlockRead {
+                file: files[1].as_ref(),
+                offset: 16,
+                buf: crate::fs::BlockBuf::new(&mut empty),
+            },
+            crate::fs::BlockRead {
+                file: files[1].as_ref(),
+                offset: 32,
+                buf: crate::fs::BlockBuf::new(&mut last),
+            },
+        ];
+        fs.read_blocks_batched_each(&mut reqs, &mut |i, _| handed.push(i))?;
+    }
+    handed.sort_unstable();
+    assert_eq!(handed, [0, 1, 2]);
+    Ok(())
+}

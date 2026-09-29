@@ -680,6 +680,16 @@ impl<'a> BlockBuf<'a> {
         self.filled == self.buf.len()
     }
 
+    /// The bytes written so far: the whole block once [`is_full`](Self::is_full).
+    #[must_use]
+    pub fn filled_bytes(&self) -> &[u8] {
+        #[expect(
+            clippy::indexing_slicing,
+            reason = "filled <= buf.len() is the type's invariant"
+        )]
+        &self.buf[..self.filled]
+    }
+
     /// Copies `bytes` into the unfilled part and counts them.
     ///
     /// The safe way to fill a request. Returns the number of bytes taken, which
@@ -806,6 +816,37 @@ pub trait Fs: Send + Sync + 'static {
                     "read_blocks_batched: short read on a fixed-size block",
                 ));
             }
+        }
+        Ok(())
+    }
+
+    /// [`read_blocks_batched`](Self::read_blocks_batched), handing each
+    /// request to `on_read` with its index as soon as it has been filled, so
+    /// the caller can work on a finished block while others are still being
+    /// read.
+    ///
+    /// `on_read` sees only completely filled requests, each once, in the order
+    /// they finish; when a request fails it is not called for it. Calls can
+    /// arrive while the reads of other requests are still in flight, so the
+    /// order is the implementation's: the default fills the whole batch first
+    /// and then hands the requests over in index order; `io_uring` hands each
+    /// over as its read completes.
+    ///
+    /// # Errors
+    ///
+    /// Returns the error of the lowest-indexed request whose read failed. A
+    /// request handed to `on_read` has succeeded whatever the call returns.
+    fn read_blocks_batched_each(
+        &self,
+        reqs: &mut [BlockRead<'_>],
+        on_read: &mut dyn FnMut(usize, &BlockRead<'_>),
+    ) -> io::Result<()> {
+        self.read_blocks_batched(reqs)?;
+        // An implementation can report success without filling a request (see
+        // `BlockBuf`); such a request is not handed over, and the caller finds
+        // it short.
+        for (index, req) in reqs.iter().enumerate().filter(|(_, r)| r.buf.is_full()) {
+            on_read(index, req);
         }
         Ok(())
     }
