@@ -825,8 +825,10 @@ impl Table {
     /// blocks it looks at resident.
     #[must_use]
     pub(crate) fn resident_filter_bytes(&self) -> u64 {
-        if let Some(block) = &self.pinned_filter_block {
-            return block.size() as u64;
+        // A pinned full filter is resident whole; its on-disk handle, not the
+        // decoded payload, carries the framing the other figures count.
+        if self.pinned_filter_block.is_some() {
+            return u64::from(self.filter_size());
         }
         let resident = |handle: &BlockHandle| {
             if self.cache.has_block(self.global_id(), handle.offset()) {

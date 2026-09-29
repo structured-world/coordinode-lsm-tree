@@ -161,10 +161,8 @@ pub struct FilterSizing {
     span: Option<Span>,
     /// The order of the tree's keys, when the rewrite has inputs to share out.
     key_order: Option<KeyOrder>,
-    /// Per key range, the lower bound of the last filter priced there: the
-    /// range's data from it on is still to be written. `None` before the
-    /// range's first filter.
-    cursors: Mutex<Vec<Option<Bound<crate::UserKey>>>>,
+    /// Per key range, where its data still to be written starts.
+    cursors: Mutex<Vec<RangeCursor>>,
     state: Arc<FilterBudget>,
 }
 
@@ -225,6 +223,17 @@ impl core::fmt::Debug for Span {
             .field("upper", &self.upper)
             .finish_non_exhaustive()
     }
+}
+
+/// Where a key range of a rewrite stands, by the lower bounds of its filters.
+#[derive(Clone, Debug, Default)]
+struct RangeCursor {
+    /// The latest filter priced: its data and everything after it is still
+    /// to come. `None` before the range's first filter.
+    last: Option<Bound<crate::UserKey>>,
+    /// Filters priced and not yet taken into the budget, whose data is still
+    /// to come too.
+    in_flight: Vec<Bound<crate::UserKey>>,
 }
 
 /// The order of the tree's keys, for the share of an input a key range holds.
@@ -504,7 +513,7 @@ pub fn plan(
         split,
         span,
         key_order: comparator.map(KeyOrder),
-        cursors: Mutex::new(alloc::vec![None; ranges]),
+        cursors: Mutex::new(alloc::vec![RangeCursor::default(); ranges]),
         state: Arc::clone(state),
     }))
 }
@@ -526,13 +535,17 @@ impl FilterSizing {
     /// width in turn until [`Self::admit`] takes the result.
     ///
     /// Before any probe is observed the static policy comes first.
+    ///
+    /// The filter counts as in flight from here until [`Self::admit`] takes
+    /// it: its data is still to come for every filter priced meanwhile.
     pub fn candidates(
         &self,
         bounds: (Bound<&[u8]>, Bound<&[u8]>),
         n: usize,
     ) -> crate::Result<Vec<BloomConstructionPolicy>> {
         let load = self.load(bounds, n)?;
-        let price = self.current_price(bounds.0)?;
+        self.enter(bounds.0);
+        let price = self.current_price()?;
         let mut candidates = self.preference(load, n, price);
         let narrowest = self.narrowest();
         candidates.retain(|&policy| policy != narrowest);
@@ -540,14 +553,17 @@ impl FilterSizing {
         Ok(candidates)
     }
 
-    /// The price of a filter byte for the rest of a compaction, pricing a
-    /// filter over keys from `lower` on: the price at which the inputs' data
-    /// still to come, at each input's load, fills what is left of the budget.
+    /// The price of a filter byte for the rest of a compaction: the price at
+    /// which the inputs' data still to come, at each input's load, fills what
+    /// is left of the budget.
     ///
-    /// The data still to come is every key range's from its last priced
-    /// filter on, so the ranges of a split compaction price alike in whatever
-    /// order their writers reach them: a range written first does not take
-    /// the room of the ranges beside it as if they were already written.
+    /// The data still to come is every key range's from its earliest filter
+    /// in flight on, or from its last priced filter when none is: so the
+    /// ranges of a split compaction price alike in whatever order their
+    /// writers reach them, and filters built side by side (the partitions of
+    /// one table on the writer's workers) price alike in whatever order they
+    /// are priced. A filter priced while an earlier one is in flight counts
+    /// that one's data as still to come, as it would were they built in turn.
     ///
     /// Set again for every filter, it follows what the rewrite actually
     /// spends. What is left is scaled by how far the builds so far ran from
@@ -555,7 +571,7 @@ impl FilterSizing {
     /// short partitions that end tables, is charged to the price rather than
     /// to the last filters, and no range of keys written early takes the room
     /// of the ones after it.
-    fn current_price(&self, lower: Bound<&[u8]>) -> crate::Result<f64> {
+    fn current_price(&self) -> crate::Result<f64> {
         if !self.observed || self.inputs.is_empty() {
             return Ok(self.price);
         }
@@ -570,7 +586,7 @@ impl FilterSizing {
         // Filters already over the budget leave no room at all.
         let left = as_f64(self.budget.saturating_sub(used)) / error;
 
-        let cursors = self.advance(lower);
+        let cursors = self.cursors();
         let mut remaining = Vec::with_capacity(self.inputs.len());
         for (input, &density) in self.inputs.iter().zip(&self.input_densities) {
             let mut share = 0.0;
@@ -622,22 +638,92 @@ impl FilterSizing {
         crate::table::probe_stats::fraction_of(input, bounds)
     }
 
-    /// Moves the cursor of the key range holding `lower` to it, and returns
-    /// every range's cursor.
-    fn advance(&self, lower: Bound<&[u8]>) -> Vec<Option<Bound<crate::UserKey>>> {
-        let range = match (&self.split, lower) {
+    /// The key range of the rewrite holding a filter over keys from `lower`.
+    fn range_of(&self, lower: Bound<&[u8]>) -> usize {
+        match (&self.split, lower) {
             (Some(split), Bound::Included(key) | Bound::Excluded(key)) => {
                 split.boundaries.partition_point(|boundary| {
                     split.comparator.compare(boundary, key) != core::cmp::Ordering::Greater
                 })
             }
             _ => 0,
-        };
+        }
+    }
+
+    /// Orders two lower bounds by the keys they start from.
+    fn lower_order(
+        &self,
+        a: &Bound<crate::UserKey>,
+        b: &Bound<crate::UserKey>,
+    ) -> core::cmp::Ordering {
+        use core::cmp::Ordering::{Equal, Greater, Less};
+        let order = self.key_order.as_ref().map(|order| &*order.0);
+        match (a, b) {
+            (Bound::Unbounded, Bound::Unbounded) => Equal,
+            (Bound::Unbounded, _) => Less,
+            (_, Bound::Unbounded) => Greater,
+            (
+                Bound::Included(a_key) | Bound::Excluded(a_key),
+                Bound::Included(b_key) | Bound::Excluded(b_key),
+            ) => {
+                let keys =
+                    order.map_or_else(|| a_key.cmp(b_key), |order| order.compare(a_key, b_key));
+                // From a key on starts before past it.
+                keys.then(match (a, b) {
+                    (Bound::Included(_), Bound::Excluded(_)) => Less,
+                    (Bound::Excluded(_), Bound::Included(_)) => Greater,
+                    _ => Equal,
+                })
+            }
+        }
+    }
+
+    /// Records a filter over keys from `lower` as priced and in flight.
+    fn enter(&self, lower: Bound<&[u8]>) {
+        let range = self.range_of(lower);
+        let lower = lower.map(crate::UserKey::from);
         let mut cursors = self.cursors.lock();
         if let Some(cursor) = cursors.get_mut(range) {
-            *cursor = Some(lower.map(crate::UserKey::from));
+            // The last priced filter only moves on: one priced after a later
+            // one, out of order, does not take the range back to it.
+            let later = cursor
+                .last
+                .as_ref()
+                .is_none_or(|last| self.lower_order(&lower, last) == core::cmp::Ordering::Greater);
+            if later {
+                cursor.last = Some(lower.clone());
+            }
+            cursor.in_flight.push(lower);
         }
-        cursors.clone()
+    }
+
+    /// Records a filter over keys from `lower` as taken into the budget.
+    fn leave(&self, lower: Bound<&[u8]>) {
+        let range = self.range_of(lower);
+        let lower = lower.map(crate::UserKey::from);
+        let mut cursors = self.cursors.lock();
+        if let Some(cursor) = cursors.get_mut(range)
+            && let Some(index) = cursor.in_flight.iter().position(|bound| *bound == lower)
+        {
+            cursor.in_flight.swap_remove(index);
+        }
+    }
+
+    /// Where each key range's data still to come starts: its earliest filter
+    /// in flight, or its last priced one, or `None` before its first.
+    fn cursors(&self) -> Vec<Option<Bound<crate::UserKey>>> {
+        let cursors = self.cursors.lock();
+        cursors
+            .iter()
+            .map(|cursor| {
+                cursor
+                    .in_flight
+                    .iter()
+                    .min_by(|a, b| self.lower_order(a, b))
+                    .or(cursor.last.as_ref())
+                    .cloned()
+            })
+            .collect()
     }
 
     /// The bounds of key range `index` of the rewrite.
@@ -689,8 +775,12 @@ impl FilterSizing {
     ///
     /// Charging the bytes a build wrote rather than a bound on them lets the
     /// filters fill the budget.
+    ///
+    /// `lower` is the lower bound [`Self::candidates`] priced the filter at:
+    /// once taken, the filter is no longer in flight.
     pub fn admit(
         &self,
+        lower: Bound<&[u8]>,
         n: usize,
         bytes: u64,
         estimated: u64,
@@ -795,6 +885,7 @@ impl FilterSizing {
                 .compare_exchange_weak(held, taken, Relaxed, Relaxed)
             {
                 Ok(_) => {
+                    self.leave(lower);
                     self.spent.fetch_add(bytes, Relaxed);
                     // The room kept for later filters is a reserve, not a
                     // limit. Whether the tree is over its budget follows the

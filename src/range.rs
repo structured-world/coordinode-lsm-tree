@@ -196,8 +196,15 @@ fn range_tombstone_overlaps_bounds(
 /// filter available), `false` if it can be safely skipped.
 fn bloom_passes(state: &IterState, table: &crate::table::Table) -> bool {
     if let Some(prefix_hash) = state.prefix_hash {
+        // A prefix answer counts as a key's does: the filter holds the
+        // prefix's hash beside the keys'.
+        use crate::table::probe_stats::ProbeCounts;
         match table.maybe_contains_prefix(prefix_hash) {
             Ok(false) => {
+                table.count_probes(ProbeCounts {
+                    probes: 1,
+                    negatives: 1,
+                });
                 #[cfg(feature = "metrics")]
                 if let Some(m) = &state.metrics {
                     m.prefix_bloom_skips
@@ -205,10 +212,16 @@ fn bloom_passes(state: &IterState, table: &crate::table::Table) -> bool {
                 }
                 return false;
             }
+            Ok(true) if table.key_check_consults_filter(false) => {
+                table.count_probes(ProbeCounts {
+                    probes: 1,
+                    negatives: 0,
+                });
+            }
             Err(e) => {
                 log::debug!("prefix bloom check failed for table {:?}: {e}", table.id(),);
             }
-            _ => {}
+            Ok(true) => {}
         }
     }
 

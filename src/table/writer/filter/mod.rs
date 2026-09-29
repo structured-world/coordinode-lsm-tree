@@ -136,7 +136,7 @@ fn framed_filter_len(
 }
 
 /// A filter budget plan, and the key range of the filter it sizes.
-type Sized<'a> = (
+type SizedFilter<'a> = (
     &'a crate::filter_budget::FilterSizing,
     (core::ops::Bound<&'a [u8]>, core::ops::Bound<&'a [u8]>),
 );
@@ -146,7 +146,7 @@ type Sized<'a> = (
 /// encoded block the filter budget admits.
 fn build_filter(
     policy: BloomConstructionPolicy,
-    sizing: Option<Sized<'_>>,
+    sizing: Option<SizedFilter<'_>>,
     hashes: Vec<u64>,
     encryption: Option<&dyn EncryptionProvider>,
     ecc: Option<crate::table::block::EccParams>,
@@ -172,6 +172,7 @@ fn build_filter(
         // builds from a copy.
         let bytes = crate::table::filter::build_burr_filter_bytes(candidate, hashes.clone())?;
         if sizing.admit(
+            bounds.0,
             n,
             frame(bytes.len() as u64),
             estimated(candidate),
@@ -184,6 +185,7 @@ fn build_filter(
     let bytes = crate::table::filter::build_burr_filter_bytes(narrowest, hashes)?;
     // The narrowest is taken whether or not it fits.
     let admitted = sizing.admit(
+        bounds.0,
         n,
         frame(bytes.len() as u64),
         estimated(narrowest),

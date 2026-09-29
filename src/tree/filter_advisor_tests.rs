@@ -343,12 +343,13 @@ fn concurrent_rewrites_share_the_budget() -> crate::Result<()> {
     };
     let (first, second) = (plan(), plan());
     let frame = |len: u64| len;
+    let lower = core::ops::Bound::Unbounded;
     assert!(
-        first.admit(1_000, room, room, &frame, false),
+        first.admit(lower, 1_000, room, room, &frame, false),
         "the room fits one"
     );
     assert!(
-        !second.admit(1_000, room, room, &frame, false),
+        !second.admit(lower, 1_000, room, room, &frame, false),
         "the room the first rewrite builds into is taken"
     );
     Ok(())
@@ -637,6 +638,96 @@ fn before_any_probe_the_filters_match_the_static_policy() -> crate::Result<()> {
         Ok(sizes)
     };
     assert_eq!(sizes(Some(FilterAdvisor::new(u64::MAX)))?, sizes(None)?);
+    Ok(())
+}
+
+/// A prefix scan asks a table's full filter for the prefix, and those answers
+/// count like a point read's: a scan of a prefix the table holds no key under
+/// is a negative probe of its filter.
+#[test]
+fn prefix_scans_count_their_filter_probes() -> crate::Result<()> {
+    use alloc::sync::Arc;
+
+    /// The key up to and including its first ':'.
+    struct UpToColon;
+    impl crate::PrefixExtractor for UpToColon {
+        fn prefixes<'a>(&self, key: &'a [u8]) -> Box<dyn Iterator<Item = &'a [u8]> + 'a> {
+            Box::new(
+                key.iter()
+                    .position(|&byte| byte == b':')
+                    .and_then(|end| key.get(..=end))
+                    .into_iter(),
+            )
+        }
+    }
+
+    let folder = tempfile::tempdir()?;
+    let tree = Config::new(
+        folder.path(),
+        SequenceNumberCounter::default(),
+        SequenceNumberCounter::default(),
+    )
+    .data_block_size_policy(BlockSizePolicy::all(1_024))
+    .prefix_extractor(Arc::new(UpToColon))
+    .filter_advisor(Some(FilterAdvisor::new(u64::MAX)))
+    .open()?;
+    // Even prefixes hold keys; the odd ones between them are absent and
+    // inside the table's range.
+    const PREFIXES: u32 = 400;
+    let mut seqno = 0;
+    for p in 0..PREFIXES {
+        for i in 0..5 {
+            tree.insert(format!("p{:04}:{i}", 2 * p), "value", seqno);
+            seqno += 1;
+        }
+    }
+    tree.flush_active_memtable(0)?;
+    let [table] = &tables(&tree)[..] else {
+        panic!("one table");
+    };
+    let negatives = || {
+        table
+            .probe_stats()
+            .map_or(0, crate::table::probe_stats::ProbeStats::negatives)
+    };
+    let before = negatives();
+    let scans = PREFIXES - 1;
+    for p in 0..scans {
+        assert_eq!(
+            tree.prefix(format!("p{:04}:", 2 * p + 1), SeqNo::MAX, None)
+                .count(),
+            0
+        );
+    }
+    // Nearly every scan finds the prefix absent in the filter.
+    let counted = negatives() - before;
+    assert!(
+        counted >= u64::from(scans) * 9 / 10,
+        "{counted} negative probes of {scans} prefix scans"
+    );
+    Ok(())
+}
+
+/// A pinned full filter is resident whole, and counts at the on-disk size the
+/// serialised figure counts it at, framing included, like a cached one.
+#[test]
+fn a_pinned_filter_is_resident_at_its_on_disk_size() -> crate::Result<()> {
+    use crate::config::PinningPolicy;
+
+    let folder = tempfile::tempdir()?;
+    let tree = Config::new(
+        folder.path(),
+        SequenceNumberCounter::default(),
+        SequenceNumberCounter::default(),
+    )
+    .data_block_size_policy(BlockSizePolicy::all(1_024))
+    .filter_block_pinning_policy(PinningPolicy::all(true))
+    .filter_advisor(Some(FilterAdvisor::new(u64::MAX)))
+    .open()?;
+    fill(&tree, &["hot"], KEYS)?;
+    let memory = tree.filter_memory();
+    assert!(memory.serialised_bytes > 0);
+    assert_eq!(memory.resident_bytes, memory.serialised_bytes, "{memory:?}");
     Ok(())
 }
 

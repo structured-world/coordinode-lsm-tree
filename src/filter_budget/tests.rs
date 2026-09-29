@@ -6,6 +6,13 @@ use crate::config::BloomConstructionPolicy;
 
 const WIDTHS: [u8; 6] = [6, 8, 10, 12, 14, 16];
 
+/// The price a filter over keys from `lower` is chosen at, as
+/// `FilterSizing::candidates` sets it: the filter enters flight first.
+fn priced_at(sizing: &super::FilterSizing, lower: core::ops::Bound<&[u8]>) -> crate::Result<f64> {
+    sizing.enter(lower);
+    sizing.current_price()
+}
+
 /// `(negative probes, keys)` of tables built alike: at a static policy of
 /// `fallback_bits`, partitioned into `partition_keys` keys when given.
 fn at(loads: &[(f64, usize)], fallback_bits: u8, partition_keys: Option<usize>) -> Vec<Load> {
@@ -351,6 +358,86 @@ fn live_tables_price_alike_whatever_the_destination() -> crate::Result<()> {
     Ok(())
 }
 
+/// Filters built side by side price alike in whatever order they are priced:
+/// a filter priced while an earlier one is still in flight counts that one's
+/// data as still to come, as it would were the earlier one priced alone; and
+/// the earlier one priced after it does not take the range back.
+#[test]
+fn a_filter_priced_past_one_in_flight_counts_its_data() -> crate::Result<()> {
+    use crate::config::{BlockSizePolicy, FilterAdvisor};
+    use crate::{AbstractTree, AnyTree, Config, SeqNo, SequenceNumberCounter};
+    use core::ops::Bound::{Excluded, Included};
+
+    const KEYS: u32 = 20_000;
+    let folder = tempfile::tempdir()?;
+    let advisor = FilterAdvisor::new(u64::from(2 * KEYS) * 12 / 8);
+    let any = Config::new(
+        folder.path(),
+        SequenceNumberCounter::default(),
+        SequenceNumberCounter::default(),
+    )
+    .data_block_size_policy(BlockSizePolicy::all(1_024))
+    .filter_advisor(Some(advisor.clone()))
+    .open()?;
+    let mut seqno = 0;
+    for prefix in ["a-hot", "z-cold"] {
+        for i in 0..KEYS {
+            any.insert(format!("{prefix}{:06}", 2 * i), "value", seqno);
+            seqno += 1;
+        }
+        any.flush_active_memtable(0)?;
+    }
+    for i in 0..KEYS {
+        assert!(
+            any.get(format!("a-hot{:06}", 2 * i + 1), SeqNo::MAX)?
+                .is_none()
+        );
+    }
+    let AnyTree::Standard(tree) = &any else {
+        panic!("a standard tree");
+    };
+    let version = tree.current_version();
+    let inputs: Vec<crate::Table> = version.iter_tables().cloned().collect();
+    let live = super::live(&version, &tree.config);
+    let plan = || {
+        super::plan(
+            &advisor,
+            &tree.filter_budget,
+            &live,
+            super::Rewrite {
+                inputs: inputs.clone(),
+                comparator: Some(crate::comparator::default_comparator()),
+                ..super::Rewrite::default()
+            },
+            BloomConstructionPolicy::BitsPerKey(10.0),
+            None,
+        )
+        .unwrap_or_else(|| panic!("the advisor plans the filters"))
+    };
+    let first = Included(&b"a-hot000000"[..]);
+    let second = Excluded(&b"a-hot019998"[..]);
+
+    // One plan at a time: each takes the credit for the inputs it replaces.
+    let alone = priced_at(&plan(), first)?;
+    let (past_one_in_flight, out_of_order) = {
+        let sizing = plan();
+        priced_at(&sizing, first)?;
+        let past = priced_at(&sizing, second)?;
+        // The first priced again after the second: still the same data.
+        (past, priced_at(&sizing, first)?)
+    };
+    for (what, price) in [
+        ("past one in flight", past_one_in_flight),
+        ("out of order", out_of_order),
+    ] {
+        assert!(
+            (price - alone).abs() <= alone * 1e-9,
+            "{what} {price}, alone {alone}"
+        );
+    }
+    Ok(())
+}
+
 /// The key ranges of a split compaction price alike in whatever order their
 /// writers reach them: before anything is built, the first filter of the
 /// upper range prices by all of the rewrite's data, as the first filter of an
@@ -409,12 +496,12 @@ fn split_ranges_price_by_all_data_still_to_come() -> crate::Result<()> {
     };
 
     // One plan at a time: each takes the credit for the inputs it replaces.
-    let unsplit = plan(None).current_price(Bound::Unbounded)?;
+    let unsplit = priced_at(&plan(None), Bound::Unbounded)?;
     let split = plan(Some(super::Split {
         boundaries: alloc::vec![crate::UserKey::from("m")],
         comparator: crate::comparator::default_comparator(),
     }));
-    let upper_first = split.current_price(Bound::Included(b"z-cold000000"))?;
+    let upper_first = priced_at(&split, Bound::Included(b"z-cold000000"))?;
     assert!(
         (upper_first - unsplit).abs() <= unsplit * 1e-9,
         "upper range first {upper_first}, unsplit {unsplit}"
