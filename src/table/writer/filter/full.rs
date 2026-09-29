@@ -109,6 +109,16 @@ impl<W: crate::io::Write + crate::io::Seek> FilterWriter<W> for FullFilterWriter
         self
     }
 
+    // The one filter is built at `finish`, with nothing left to overlap it
+    // with, so it stays on the writer's thread.
+    #[cfg(feature = "std")]
+    fn use_parallel(
+        self: Box<Self>,
+        _parallel: Option<crate::table::writer::ParallelCompression>,
+    ) -> Box<dyn FilterWriter<W>> {
+        self
+    }
+
     fn register_key(&mut self, key: &UserKey) -> crate::Result<usize> {
         let before = self.bloom_hash_buffer.len();
         self.bloom_hash_buffer.push(crate::hash::hash64(key));

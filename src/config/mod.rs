@@ -725,8 +725,9 @@ pub struct Config {
     pub(crate) compaction_rate_limit: u64,
 
     /// Worker-thread count for compaction parallelism (`std` only), used two
-    /// ways: it sizes the per-tree block-compression pool built at open when
-    /// [`Self::compaction_pool`] is `None`, and it caps how many range-parallel
+    /// ways: it sizes the per-tree pool built at open when
+    /// [`Self::compaction_pool`] is `None`, which prepares data blocks and
+    /// builds partitioned-filter partitions, and it caps how many range-parallel
     /// sub-compactions a single compaction is split into. Default
     /// `max(1, available_parallelism / 2)` — leaves half the cores for
     /// application work. `1` forces the serial path for both. Without the
@@ -2115,9 +2116,11 @@ impl Config {
 
     /// Sets the compaction worker-thread count.
     ///
-    /// Under `std` this both sizes the per-tree block-compression pool built at
-    /// open when no shared pool is supplied (see [`Self::compaction_pool`]) and
-    /// caps how many range-parallel sub-compactions a compaction splits into.
+    /// Under `std` this both sizes the per-tree pool built at open when no
+    /// shared pool is supplied (see [`Self::compaction_pool`]), which prepares
+    /// a table's data blocks and builds its partitioned filter's partitions,
+    /// and caps how many range-parallel sub-compactions a compaction splits
+    /// into.
     /// `1` keeps compaction serial. Default is `max(1, available_parallelism /
     /// 2)`. Without the `parallel` feature there is no built-in pool, so the
     /// work runs serially even for a value > 1.

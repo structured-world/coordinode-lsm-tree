@@ -1401,6 +1401,7 @@ impl Writer {
     #[must_use]
     pub(crate) fn use_parallel_compression(mut self, parallel: ParallelCompression) -> Self {
         self.parallel_cap = (parallel.threads * 2).max(1);
+        self.filter_writer = self.filter_writer.use_parallel(Some(parallel.clone()));
         self.parallel_settings = Some(parallel);
         self
     }
@@ -1441,6 +1442,8 @@ impl Writer {
         // builder reads the same whatever order its methods are called in.
         #[cfg(zstd_any)]
         let filter_writer = filter_writer.use_zstd_two_pass_seed(self.zstd_two_pass_seed);
+        #[cfg(feature = "std")]
+        let filter_writer = filter_writer.use_parallel(self.parallel_settings.clone());
         self.filter_writer = filter_writer;
         self
     }
