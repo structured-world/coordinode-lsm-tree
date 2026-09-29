@@ -546,8 +546,13 @@ impl FilterSizing {
         let load = self.load(bounds, n)?;
         self.enter(bounds.0);
         let price = self.current_price()?;
-        let mut candidates = self.preference(load, n, price);
         let narrowest = self.narrowest();
+        // Even the narrowest filters do not fit: a wider build is only ever
+        // refused, so it is not built at all.
+        if price.is_infinite() {
+            return Ok(alloc::vec![narrowest]);
+        }
+        let mut candidates = self.preference(load, n, price);
         candidates.retain(|&policy| policy != narrowest);
         candidates.push(narrowest);
         Ok(candidates)
