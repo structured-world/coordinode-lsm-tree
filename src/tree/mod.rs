@@ -898,7 +898,7 @@ impl AbstractTree for Tree {
             }
         };
         table_writer = table_writer.use_bloom_policy(bloom_policy);
-        let filter_sizing = self.new_data_filter_sizing(0, bloom_policy, keys);
+        let filter_sizing = self.new_data_filter_sizing(0, bloom_policy, keys, rc.ecc_scheme);
         table_writer = table_writer.use_filter_sizing(filter_sizing.clone());
 
         if index_partitioning {
@@ -1859,11 +1859,15 @@ impl Tree {
     /// load the live tables draw per key, and room is kept for every table the
     /// write fills. The plan is held until the tables are installed (see
     /// `WritePin`).
+    ///
+    /// `ecc_scheme` is the one the write's runtime snapshot frames its blocks
+    /// under.
     pub(crate) fn new_data_filter_sizing(
         &self,
         level: usize,
         bloom_policy: crate::table::filter::BloomConstructionPolicy,
         keys: u64,
+        ecc_scheme: crate::runtime_config::EccScheme,
     ) -> Option<alloc::sync::Arc<crate::filter_budget::FilterSizing>> {
         let advisor = self.config.filter_advisor.as_ref()?;
         let version = self.current_version();
@@ -1873,6 +1877,10 @@ impl Tree {
             &crate::filter_budget::live(&version, &self.config),
             crate::filter_budget::Rewrite {
                 keys,
+                framing: crate::filter_budget::Framing {
+                    encryption: self.config.encryption.clone(),
+                    ecc: crate::table::writer::resolve_ecc(self.config.page_ecc, ecc_scheme),
+                },
                 ..crate::filter_budget::Rewrite::default()
             },
             bloom_policy,

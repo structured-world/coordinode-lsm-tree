@@ -125,7 +125,8 @@ impl<'a> Ingestion<'a> {
             crate::config::BloomConstructionPolicy::BitsPerKey(0.0)
         };
         // The caller streams the entries in, so their count is not known.
-        let filter_sizing = tree.new_data_filter_sizing(INITIAL_CANONICAL_LEVEL, bloom_policy, 0);
+        let filter_sizing =
+            tree.new_data_filter_sizing(INITIAL_CANONICAL_LEVEL, bloom_policy, 0, rc.ecc_scheme);
 
         // TODO: maybe create a PrepareMultiWriter that can be used by flush, ingest and compaction worker
         let mut writer = MultiWriter::new(

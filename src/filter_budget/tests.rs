@@ -13,6 +13,11 @@ fn priced_at(sizing: &super::FilterSizing, lower: core::ops::Bound<&[u8]>) -> cr
     sizing.current_price()
 }
 
+/// Filter blocks without framing: the price in payload bytes alone.
+fn bare(len: u64) -> u64 {
+    len
+}
+
 /// `(negative probes, keys)` of tables built alike: at a static policy of
 /// `fallback_bits`, partitioned into `partition_keys` keys when given.
 fn at(loads: &[(f64, usize)], fallback_bits: u8, partition_keys: Option<usize>) -> Vec<Load> {
@@ -49,19 +54,37 @@ fn the_price_fills_the_budget() {
 
     // Exactly zero, the value returned when every widest choice fits.
     assert_eq!(
-        price(&loads, &WIDTHS, 2 * bytes(16)).to_bits(),
+        price(&loads, &WIDTHS, 2 * bytes(16), &bare).to_bits(),
         0.0f64.to_bits()
     );
-    assert!(price(&loads, &WIDTHS, 2 * bytes(6) - 1).is_infinite());
+    assert!(price(&loads, &WIDTHS, 2 * bytes(6) - 1, &bare).is_infinite());
 
     let budget = bytes(16) + bytes(6);
-    let p = price(&loads, &WIDTHS, budget);
+    let p = price(&loads, &WIDTHS, budget, &bare);
     assert!(p.is_finite() && p > 0.0, "price {p}");
     let hot = cheapest(1e6, 10_000, &WIDTHS, 10, p);
     let cold = cheapest(1.0, 10_000, &WIDTHS, 10, p);
     assert!(bytes(hot) + bytes(cold) <= budget, "{hot} + {cold} bits");
     // The memory goes where the negative probes are.
     assert!(hot > cold, "hot {hot}, cold {cold}");
+}
+
+/// The budget counts filter blocks as written on disk, framing included, and
+/// the price counts them the same way: a budget the widest payloads fit, but
+/// not their framed blocks, is not one every widest filter fits.
+#[test]
+fn the_price_counts_each_block_with_its_framing() {
+    let n = 1_000;
+    let loads = at(&[(1e6, n), (1e6, n), (1e6, n), (1e6, n)], 10, None);
+    let budget = 4 * estimate(n, 16);
+    // Framing per block, as a header, a tag and parity add it.
+    let framed = |len: u64| if len == 0 { 0 } else { len + 64 };
+    assert_eq!(
+        price(&loads, &WIDTHS, budget, &bare).to_bits(),
+        0.0f64.to_bits()
+    );
+    let p = price(&loads, &WIDTHS, budget, &framed);
+    assert!(p > 0.0, "price {p} with the framing counted");
 }
 
 /// Tables drawing no negative probe take the static policy's width while it
@@ -72,10 +95,10 @@ fn unprobed_tables_narrow_when_the_static_width_does_not_fit() {
     let n = 10_000;
     let idle = at(&[(0.0, n), (0.0, n)], 10, None);
     assert_eq!(
-        price(&idle, &WIDTHS, 2 * estimate(n, 10)).to_bits(),
+        price(&idle, &WIDTHS, 2 * estimate(n, 10), &bare).to_bits(),
         0.0f64.to_bits()
     );
-    let p = price(&idle, &WIDTHS, 2 * estimate(n, 10) - 1);
+    let p = price(&idle, &WIDTHS, 2 * estimate(n, 10) - 1, &bare);
     assert!(p.is_finite() && p > 0.0, "price {p}");
     assert_eq!(cheapest(0.0, n, &WIDTHS, 10, p), 6);
 }
@@ -86,7 +109,7 @@ fn a_uniform_load_splits_the_budget_evenly() {
     let n = 10_000;
     let budget = 2 * estimate(n, 11);
     let uniform = at(&[(1_000.0, n), (1_000.0, n)], 10, None);
-    let p = price(&uniform, &WIDTHS, budget);
+    let p = price(&uniform, &WIDTHS, budget, &bare);
     let first = cheapest(1_000.0, n, &WIDTHS, 10, p);
     let second = cheapest(1_000.0, n, &WIDTHS, 10, p);
     assert_eq!(first, second);
@@ -165,8 +188,8 @@ fn the_price_counts_partitioned_filters_as_partitions() {
 
     let loads = [(1_000.0, n), (1_000.0, n)];
     let budget = 2 * estimate(n, 10);
-    let whole = price(&at(&loads, 10, None), &WIDTHS, budget);
-    let split = price(&at(&loads, 10, Some(keys)), &WIDTHS, budget);
+    let whole = price(&at(&loads, 10, None), &WIDTHS, budget, &bare);
+    let split = price(&at(&loads, 10, Some(keys)), &WIDTHS, budget, &bare);
     assert!(split > whole, "whole {whole}, split {split}");
     let per_partition = 1_000.0 * as_f64(keys as u64) / as_f64(n as u64);
     assert!(

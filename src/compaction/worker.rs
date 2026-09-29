@@ -1584,6 +1584,7 @@ fn run_tight_space_compaction(
                 &slice_payload,
                 &[],
                 Some(span.clone()),
+                &rc,
             );
             let produced = run_subcompaction(
                 opts,
@@ -2009,6 +2010,7 @@ fn run_tight_space_compaction(
                 &slice_payload,
                 &[],
                 Some((lower.clone(), Bound::Unbounded)),
+                &rc,
             ),
         )?;
         drop(version);
@@ -3100,6 +3102,7 @@ fn merge_tables(
                 payload,
                 &boundaries,
                 None,
+                &rc,
             );
 
             let outputs: Vec<crate::Result<super::flavour::ProducedOutput>> =
@@ -3380,7 +3383,14 @@ fn merge_tables(
         &current_super_version.version,
         opts,
         payload,
-        super::flavour::plan_filters(&current_super_version.version, opts, payload, &[], None),
+        super::flavour::plan_filters(
+            &current_super_version.version,
+            opts,
+            payload,
+            &[],
+            None,
+            &rc,
+        ),
         true,
         transform_marker,
         true,

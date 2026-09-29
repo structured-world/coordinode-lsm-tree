@@ -105,6 +105,9 @@ pub(super) fn plan_filters(
         core::ops::Bound<crate::UserKey>,
         core::ops::Bound<crate::UserKey>,
     )>,
+    // The compaction's runtime-config snapshot, whose ECC scheme frames the
+    // filter blocks its writers write.
+    rc: &crate::runtime_config::RuntimeConfig,
 ) -> Option<alloc::sync::Arc<crate::filter_budget::FilterSizing>> {
     let advisor = opts.config.filter_advisor.as_ref()?;
     let inputs = version
@@ -132,6 +135,10 @@ pub(super) fn plan_filters(
             span,
             keys: 0,
             comparator: Some(opts.config.comparator.clone()),
+            framing: crate::filter_budget::Framing {
+                encryption: opts.config.encryption.clone(),
+                ecc: crate::table::writer::resolve_ecc(opts.config.page_ecc, rc.ecc_scheme),
+            },
         },
         output_bloom_policy(version, opts, payload),
         opts.config

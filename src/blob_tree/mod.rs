@@ -1140,7 +1140,9 @@ impl AbstractTree for BlobTree {
             }
         };
         table_writer = table_writer.use_bloom_policy(bloom_policy);
-        let filter_sizing = self.index.new_data_filter_sizing(0, bloom_policy, keys);
+        let filter_sizing = self
+            .index
+            .new_data_filter_sizing(0, bloom_policy, keys, rc.ecc_scheme);
         table_writer = table_writer.use_filter_sizing(filter_sizing.clone());
 
         if index_partitioning {

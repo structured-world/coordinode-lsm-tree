@@ -161,6 +161,8 @@ pub struct FilterSizing {
     span: Option<Span>,
     /// The order of the tree's keys, when the rewrite has inputs to share out.
     key_order: Option<KeyOrder>,
+    /// How the rewrite frames its filter blocks on disk.
+    framing: Framing,
     /// Per key range, where its data still to be written starts.
     cursors: Mutex<Vec<RangeCursor>>,
     state: Arc<FilterBudget>,
@@ -181,6 +183,8 @@ pub struct Rewrite {
     /// The order of the tree's keys, which reads an input's share of a key
     /// range from its key range alone where that settles it.
     pub comparator: Option<crate::comparator::SharedComparator>,
+    /// How its filter blocks are framed on disk.
+    pub framing: Framing,
 }
 
 /// The part of its inputs a rewrite writes: its keys from `lower` through
@@ -222,6 +226,40 @@ impl core::fmt::Debug for Span {
             .field("lower", &self.lower)
             .field("upper", &self.upper)
             .finish_non_exhaustive()
+    }
+}
+
+/// How a rewrite frames each filter block on disk: the budget counts the
+/// framed bytes, so the price does too.
+#[derive(Clone, Default)]
+pub struct Framing {
+    pub encryption: Option<Arc<dyn crate::encryption::EncryptionProvider>>,
+    pub ecc: Option<crate::table::block::EccParams>,
+}
+
+impl Framing {
+    /// On-disk bytes of a filter block of `len` payload bytes; none for an
+    /// empty filter, which is not written.
+    fn frame(&self, len: u64) -> u64 {
+        if len == 0 {
+            return 0;
+        }
+        crate::table::block::framed_len_bound(
+            len,
+            crate::table::block::BlockType::Filter,
+            crate::CompressionType::None,
+            self.encryption.as_deref(),
+            self.ecc,
+        )
+    }
+}
+
+impl core::fmt::Debug for Framing {
+    fn fmt(&self, f: &mut core::fmt::Formatter<'_>) -> core::fmt::Result {
+        f.debug_struct("Framing")
+            .field("encrypted", &self.encryption.is_some())
+            .field("ecc", &self.ecc)
+            .finish()
     }
 }
 
@@ -381,6 +419,7 @@ pub fn plan(
         span,
         keys,
         comparator,
+        framing,
     } = rewrite;
     let ranges = split.as_ref().map_or(1, |split| split.boundaries.len() + 1);
 
@@ -483,7 +522,7 @@ pub fn plan(
     // this many keys, each with its own fixed overhead; the price counts
     // them the way the writer will build them.
     let partition_keys = partition_bytes.map(|bytes| partition_keys(fallback, bytes));
-    let price = price(&loads, &widths, budget);
+    let price = price(&loads, &widths, budget, &|len| framing.frame(len));
     // The replaced filters leave with the install; the room they free is this
     // rewrite's to build into, and no other rewrite's.
     #[expect(
@@ -513,6 +552,7 @@ pub fn plan(
         split,
         span,
         key_order: comparator.map(KeyOrder),
+        framing,
         cursors: Mutex::new(alloc::vec![RangeCursor::default(); ranges]),
         state: Arc::clone(state),
     }))
@@ -624,7 +664,9 @@ impl FilterSizing {
             reason = "a non-negative byte count below the budget"
         )]
         let left = left as u64;
-        Ok(price(&remaining, &self.widths, left))
+        Ok(price(&remaining, &self.widths, left, &|len| {
+            self.framing.frame(len)
+        }))
     }
 
     /// The share of `input`'s data inside `bounds` (see
@@ -1047,7 +1089,7 @@ struct Load {
 /// The price of a filter byte at which the filters of `loads`, each at its
 /// cheapest width, fill `budget`: zero when the widest choices fit, infinite
 /// when even the narrowest do not.
-fn price(loads: &[Load], widths: &[u8], budget: u64) -> f64 {
+fn price(loads: &[Load], widths: &[u8], budget: u64, frame: &dyn Fn(u64) -> u64) -> f64 {
     // Each table's filter is decided the way its writer decides it: per
     // partition when partitioned, at the table's load density. Sizes and
     // rates do not depend on the price, so the search reads them from here.
@@ -1067,6 +1109,10 @@ fn price(loads: &[Load], widths: &[u8], budget: u64) -> f64 {
             .map_or(&entry.table_bytes[..], |(_, full)| &full[..])
     }
     let rates = rates(widths);
+    // On-disk bytes of each filter block at each width, as the budget counts
+    // them: a block's framing weighs on many small filters.
+    let sizes =
+        |n: usize, widths: &[u8]| -> Vec<u64> { sizes(n, widths).into_iter().map(frame).collect() };
     // A full partition's sizes depend on its key count alone, which the
     // tables of one level share: worked out once per count, not per table.
     let mut partitions: Vec<(usize, Vec<u64>)> = Vec::new();
