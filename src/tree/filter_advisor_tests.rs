@@ -329,11 +329,12 @@ fn concurrent_rewrites_share_the_budget() -> crate::Result<()> {
         panic!("a standard tree");
     };
     let version = tree.current_version();
+    let live = crate::filter_budget::live(&version, &tree.config);
     let plan = || {
         crate::filter_budget::plan(
             &advisor,
             &tree.filter_budget,
-            version.iter_tables(),
+            &live,
             crate::filter_budget::Rewrite::default(),
             BloomConstructionPolicy::BitsPerKey(10.0),
             None,

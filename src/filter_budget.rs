@@ -237,17 +237,83 @@ impl core::fmt::Debug for Split {
     }
 }
 
+/// A live table with the filter settings it was built under, which the price
+/// models its filter by.
+pub struct Live<'a> {
+    pub table: &'a Table,
+    /// Width in bits per key of its level's static policy, which breaks ties.
+    pub fallback_bits: u8,
+    /// Keys a partition of its filter holds, when the filter is partitioned.
+    pub partition_keys: Option<usize>,
+}
+
+/// The tables of `version` that have a filter, each with the settings of the
+/// level it lies in under `config`: a flush writing full filters prices the
+/// partitioned ones below it as partitions. Whether a filter is partitioned
+/// is read from the table itself, which a later policy change leaves as it
+/// was built.
+///
+/// A table without a filter takes no filter bytes and draws no filter
+/// probes; counting its keys would price the others for filters that are
+/// never built.
+pub fn live<'a>(version: &'a crate::version::Version, config: &crate::Config) -> Vec<Live<'a>> {
+    use crate::config::FilterPolicyEntry;
+
+    // Tables of a level share its settings; the partition search runs once
+    // per distinct setting, not per table.
+    let mut partitions: Vec<((u8, u32), usize)> = Vec::new();
+    let mut live = Vec::new();
+    for (level, tables) in version.iter_levels().enumerate() {
+        let level_policy = match config.filter_policy.get(level) {
+            FilterPolicyEntry::Bloom(policy) if policy.is_active() => Some(policy),
+            FilterPolicyEntry::Bloom(_) | FilterPolicyEntry::None => None,
+        };
+        let partition_bytes = config.filter_block_partition_size_policy.get(level);
+        for table in tables.iter().flat_map(|run| run.iter()) {
+            if table.filter_size() == 0 {
+                continue;
+            }
+            // A level whose policy no longer builds filters: the width the
+            // table's own filter has.
+            let fallback = level_policy.unwrap_or_else(|| {
+                let bits = u64::from(table.filter_size()) * 8 / filter_keys(table).max(1);
+                BloomConstructionPolicy::BitsPerKey(f32::from(
+                    u8::try_from(bits).unwrap_or(u8::MAX),
+                ))
+            });
+            let fallback_bits = bits_of(fallback);
+            let partition_keys = table.regions.filter_tli.is_some().then(|| {
+                let setting = (fallback_bits, partition_bytes);
+                if let Some(&(_, keys)) = partitions.iter().find(|(key, _)| *key == setting) {
+                    keys
+                } else {
+                    let keys = partition_keys(fallback, partition_bytes);
+                    partitions.push((setting, keys));
+                    keys
+                }
+            });
+            live.push(Live {
+                table,
+                fallback_bits,
+                partition_keys,
+            });
+        }
+    }
+    live
+}
+
 /// Plans the filters of one flush or compaction.
 ///
-/// `live` are the tables of the current version, `rewrite` what the rewrite
-/// replaces and how it runs, `fallback` what the static policy builds at the
-/// destination level, and `partition_bytes` the filter partition size there
-/// when its filters are partitioned. `None` when that policy builds no filter
-/// there: the advisor sizes filters, it does not add them.
-pub fn plan<'a>(
+/// `live` are the tables of the current version that have a filter (see
+/// [`live`]), `rewrite` what the rewrite replaces and how it runs, `fallback`
+/// what the static policy builds at the destination level, and
+/// `partition_bytes` the filter partition size there when its filters are
+/// partitioned. `None` when that policy builds no filter there: the advisor
+/// sizes filters, it does not add them.
+pub fn plan(
     advisor: &FilterAdvisor,
     state: &Arc<FilterBudget>,
-    live: impl Iterator<Item = &'a Table>,
+    live: &[Live<'_>],
     rewrite: Rewrite,
     fallback: BloomConstructionPolicy,
     partition_bytes: Option<u32>,
@@ -262,39 +328,42 @@ pub fn plan<'a>(
         keys,
     } = rewrite;
     let ranges = split.as_ref().map_or(1, |split| split.boundaries.len() + 1);
-    // A table without a filter takes no filter bytes and draws no filter
-    // probes; counting its keys would price the others for filters that are
-    // never built. An input without one takes the prior density.
-    let live: Vec<&Table> = live.filter(|table| table.filter_size() > 0).collect();
 
     // The window: halve every count once the live tables hold more probes
     // than it, before reading them for this plan.
     // A tree cannot see 2^64 probes.
     let observed: u64 = live
         .iter()
-        .filter_map(|table| table.probe_stats())
+        .filter_map(|live| live.table.probe_stats())
         .map(crate::table::probe_stats::ProbeStats::probes)
         .sum();
     if observed > advisor.window_probes() {
-        for stats in live.iter().filter_map(|table| table.probe_stats()) {
+        for stats in live.iter().filter_map(|live| live.table.probe_stats()) {
             stats.decay();
         }
     }
 
     let raw: Vec<(f64, usize)> = live
         .iter()
-        .map(|table| {
-            let negatives = table
+        .map(|live| {
+            let negatives = live
+                .table
                 .probe_stats()
                 .map_or(0, crate::table::probe_stats::ProbeStats::negatives);
-            (as_f64(negatives), key_count(table))
+            (as_f64(negatives), key_count(live.table))
         })
         .collect();
     let densities = shrunk_densities(&raw);
-    let loads: Vec<(f64, usize)> = raw
+    let loads: Vec<Load> = raw
         .iter()
         .zip(&densities)
-        .map(|(&(_, n), &density)| (density * as_f64(n as u64), n))
+        .zip(live)
+        .map(|((&(_, n), &density), live)| Load {
+            negatives: density * as_f64(n as u64),
+            keys: n,
+            fallback_bits: live.fallback_bits,
+            partition_keys: live.partition_keys,
+        })
         .collect();
     let total_keys: usize = raw.iter().map(|(_, n)| n).sum();
     let total_negatives: f64 = raw.iter().map(|(q, _)| q).sum();
@@ -303,11 +372,12 @@ pub fn plan<'a>(
     } else {
         total_negatives / as_f64(total_keys as u64)
     };
+    // An input without a filter takes the prior density.
     let input_densities: Vec<f64> = inputs
         .iter()
         .map(|input| {
             live.iter()
-                .position(|table| table.id() == input.id())
+                .position(|live| live.table.id() == input.id())
                 .and_then(|index| densities.get(index).copied())
                 .unwrap_or(prior_density)
         })
@@ -318,19 +388,19 @@ pub fn plan<'a>(
     let budget = advisor.budget_bytes();
     let live_bytes: u64 = live
         .iter()
-        .map(|table| u64::from(table.filter_size()))
+        .map(|live| u64::from(live.table.filter_size()))
         .sum();
     state.observe(live_bytes, budget);
     // Only an input the rewrite leaves nothing of drops out with the install;
     // one it rewrites part of stays live, filter and all.
     let replaced: u64 = live
         .iter()
-        .filter(|table| {
+        .filter(|live| {
             inputs.iter().any(|input| {
-                input.id() == table.id() && span.as_ref().is_none_or(|span| span.covers(input))
+                input.id() == live.table.id() && span.as_ref().is_none_or(|span| span.covers(input))
             })
         })
-        .map(|table| u64::from(table.filter_size()))
+        .map(|live| u64::from(live.table.filter_size()))
         .sum();
     // The inputs' keys within the span. A share that cannot be read counts
     // the input whole: the room kept for later keys errs on the large side.
@@ -358,7 +428,7 @@ pub fn plan<'a>(
     // this many keys, each with its own fixed overhead; the price counts
     // them the way the writer will build them.
     let partition_keys = partition_bytes.map(|bytes| partition_keys(fallback, bytes));
-    let price = price(&loads, &widths, fallback_bits, budget, partition_keys);
+    let price = price(&loads, &widths, budget);
     // The replaced filters leave with the install; the room they free is this
     // rewrite's to build into, and no other rewrite's.
     #[expect(
@@ -471,7 +541,13 @@ impl FilterSizing {
                     clippy::cast_sign_loss,
                     reason = "a positive key count below the table's own"
                 )]
-                remaining.push((keys * density, keys as usize));
+                // Written into the destination level, at its settings.
+                remaining.push(Load {
+                    negatives: keys * density,
+                    keys: keys as usize,
+                    fallback_bits: self.fallback_bits,
+                    partition_keys: self.partition_keys,
+                });
             }
         }
         #[expect(
@@ -480,13 +556,7 @@ impl FilterSizing {
             reason = "a non-negative byte count below the budget"
         )]
         let left = left as u64;
-        Ok(price(
-            &remaining,
-            &self.widths,
-            self.fallback_bits,
-            left,
-            self.partition_keys,
-        ))
+        Ok(price(&remaining, &self.widths, left))
     }
 
     /// Moves the cursor of the key range holding `lower` to it, and returns
@@ -804,49 +874,65 @@ impl Drop for FilterSizing {
     }
 }
 
-/// The price of a filter byte at which the live tables' filters, each at its
+/// A table's filter as the price models it: the negative probes it draws
+/// over `keys` keys, and the settings it is built under.
+#[derive(Clone, Copy, Debug)]
+struct Load {
+    negatives: f64,
+    keys: usize,
+    /// Width of the static policy it is built under, which breaks ties.
+    fallback_bits: u8,
+    /// Keys a partition of it holds, when it is partitioned.
+    partition_keys: Option<usize>,
+}
+
+/// The price of a filter byte at which the filters of `loads`, each at its
 /// cheapest width, fill `budget`: zero when the widest choices fit, infinite
 /// when even the narrowest do not.
-fn price(
-    loads: &[(f64, usize)],
-    widths: &[u8],
-    fallback_bits: u8,
-    budget: u64,
-    partition_keys: Option<usize>,
-) -> f64 {
+fn price(loads: &[Load], widths: &[u8], budget: u64) -> f64 {
     // Each table's filter is decided the way its writer decides it: per
-    // partition on a partitioned level, at the table's load density. Sizes
-    // and rates do not depend on the price, so the search reads them from
-    // here; a full partition's sizes are shared by every table.
+    // partition when partitioned, at the table's load density. Sizes and
+    // rates do not depend on the price, so the search reads them from here.
     struct Entry {
         filter_load: f64,
-        /// Whether the table's filter is decided as a full partition, whose
-        /// sizes every table shares, or as the table's one filter.
-        partitioned: bool,
+        fallback_bits: u8,
+        /// Bytes at each width of a full partition, when the width is decided
+        /// per partition; otherwise the table's one filter decides it.
+        partition_bytes: Option<Vec<u64>>,
         table_bytes: Vec<u64>,
     }
+    impl Entry {
+        /// Bytes at each width of the filter the width is decided for.
+        fn filter_bytes(&self) -> &[u64] {
+            self.partition_bytes.as_deref().unwrap_or(&self.table_bytes)
+        }
+    }
     let rates = rates(widths);
-    let (partition, full) = match partition_keys {
-        Some(keys) if keys > 0 => (keys, sizes(keys, widths)),
-        _ => (usize::MAX, Vec::new()),
-    };
     let entries: Vec<Entry> = loads
         .iter()
-        .map(|&(load, n)| {
-            let partitioned = n > partition;
-            let table_bytes = if partitioned {
+        .map(|load| {
+            let n = load.keys;
+            let partition = match load.partition_keys {
+                Some(keys) if keys > 0 => keys,
+                _ => usize::MAX,
+            };
+            let (partition_bytes, table_bytes) = if n > partition {
+                let full = sizes(partition, widths);
                 let count = (n / partition) as u64;
-                full.iter()
+                let table = full
+                    .iter()
                     .zip(sizes(n % partition, widths))
                     .map(|(&full, rest)| count * full + rest)
-                    .collect()
+                    .collect();
+                (Some(full), table)
             } else {
-                sizes(n, widths)
+                (None, sizes(n, widths))
             };
             let filter = partition.min(n).max(1);
             Entry {
-                filter_load: load * as_f64(filter as u64) / as_f64(n.max(1) as u64),
-                partitioned,
+                filter_load: load.negatives * as_f64(filter as u64) / as_f64(n.max(1) as u64),
+                fallback_bits: load.fallback_bits,
+                partition_bytes,
                 table_bytes,
             }
         })
@@ -856,17 +942,12 @@ fn price(
         entries
             .iter()
             .map(|entry| {
-                let filter_bytes = if entry.partitioned {
-                    &full
-                } else {
-                    &entry.table_bytes
-                };
                 let index = choose(
                     entry.filter_load,
-                    filter_bytes,
+                    entry.filter_bytes(),
                     &rates,
                     widths,
-                    fallback_bits,
+                    entry.fallback_bits,
                     price,
                 );
                 entry.table_bytes.get(index).copied().unwrap_or(0)
@@ -887,11 +968,7 @@ fn price(
     let mut steps: Vec<(f64, i128)> = Vec::new();
     let mut hull: Vec<usize> = Vec::with_capacity(widths.len());
     for entry in &entries {
-        let filter_bytes = if entry.partitioned {
-            &full
-        } else {
-            &entry.table_bytes
-        };
+        let filter_bytes = entry.filter_bytes();
         let point = |index: usize| {
             (
                 filter_bytes

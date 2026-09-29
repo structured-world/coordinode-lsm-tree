@@ -1870,7 +1870,7 @@ impl Tree {
         crate::filter_budget::plan(
             advisor,
             &self.filter_budget,
-            version.iter_tables(),
+            &crate::filter_budget::live(&version, &self.config),
             crate::filter_budget::Rewrite {
                 keys,
                 ..crate::filter_budget::Rewrite::default()

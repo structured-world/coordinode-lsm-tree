@@ -1,10 +1,24 @@
 // SPDX-License-Identifier: Apache-2.0
 // Copyright (c) 2026-present, Dmitry Prudnikov
 
-use super::{as_f64, cheapest, estimate, partition_keys, price, shrunk_densities};
+use super::{Load, as_f64, cheapest, estimate, partition_keys, price, shrunk_densities};
 use crate::config::BloomConstructionPolicy;
 
 const WIDTHS: [u8; 6] = [6, 8, 10, 12, 14, 16];
+
+/// `(negative probes, keys)` of tables built alike: at a static policy of
+/// `fallback_bits`, partitioned into `partition_keys` keys when given.
+fn at(loads: &[(f64, usize)], fallback_bits: u8, partition_keys: Option<usize>) -> Vec<Load> {
+    loads
+        .iter()
+        .map(|&(negatives, keys)| Load {
+            negatives,
+            keys,
+            fallback_bits,
+            partition_keys,
+        })
+        .collect()
+}
 
 /// A filter drawing many negative probes takes the widest width while bytes
 /// cost little; one drawing none takes the narrowest once bytes cost
@@ -23,22 +37,22 @@ fn the_cheapest_width_follows_the_load_and_the_price() {
 /// budget without passing it.
 #[test]
 fn the_price_fills_the_budget() {
-    let loads = [(1e6, 10_000), (1.0, 10_000)];
-    let at = |bits| estimate(10_000, bits);
+    let loads = at(&[(1e6, 10_000), (1.0, 10_000)], 10, None);
+    let bytes = |bits| estimate(10_000, bits);
 
     // Exactly zero, the value returned when every widest choice fits.
     assert_eq!(
-        price(&loads, &WIDTHS, 10, 2 * at(16), None).to_bits(),
+        price(&loads, &WIDTHS, 2 * bytes(16)).to_bits(),
         0.0f64.to_bits()
     );
-    assert!(price(&loads, &WIDTHS, 10, 2 * at(6) - 1, None).is_infinite());
+    assert!(price(&loads, &WIDTHS, 2 * bytes(6) - 1).is_infinite());
 
-    let budget = at(16) + at(6);
-    let p = price(&loads, &WIDTHS, 10, budget, None);
+    let budget = bytes(16) + bytes(6);
+    let p = price(&loads, &WIDTHS, budget);
     assert!(p.is_finite() && p > 0.0, "price {p}");
     let hot = cheapest(1e6, 10_000, &WIDTHS, 10, p);
     let cold = cheapest(1.0, 10_000, &WIDTHS, 10, p);
-    assert!(at(hot) + at(cold) <= budget, "{hot} + {cold} bits");
+    assert!(bytes(hot) + bytes(cold) <= budget, "{hot} + {cold} bits");
     // The memory goes where the negative probes are.
     assert!(hot > cold, "hot {hot}, cold {cold}");
 }
@@ -49,12 +63,12 @@ fn the_price_fills_the_budget() {
 #[test]
 fn unprobed_tables_narrow_when_the_static_width_does_not_fit() {
     let n = 10_000;
-    let idle = [(0.0, n), (0.0, n)];
+    let idle = at(&[(0.0, n), (0.0, n)], 10, None);
     assert_eq!(
-        price(&idle, &WIDTHS, 10, 2 * estimate(n, 10), None).to_bits(),
+        price(&idle, &WIDTHS, 2 * estimate(n, 10)).to_bits(),
         0.0f64.to_bits()
     );
-    let p = price(&idle, &WIDTHS, 10, 2 * estimate(n, 10) - 1, None);
+    let p = price(&idle, &WIDTHS, 2 * estimate(n, 10) - 1);
     assert!(p.is_finite() && p > 0.0, "price {p}");
     assert_eq!(cheapest(0.0, n, &WIDTHS, 10, p), 6);
 }
@@ -64,8 +78,8 @@ fn unprobed_tables_narrow_when_the_static_width_does_not_fit() {
 fn a_uniform_load_splits_the_budget_evenly() {
     let n = 10_000;
     let budget = 2 * estimate(n, 11);
-    let uniform = [(1_000.0, n), (1_000.0, n)];
-    let p = price(&uniform, &WIDTHS, 10, budget, None);
+    let uniform = at(&[(1_000.0, n), (1_000.0, n)], 10, None);
+    let p = price(&uniform, &WIDTHS, budget);
     let first = cheapest(1_000.0, n, &WIDTHS, 10, p);
     let second = cheapest(1_000.0, n, &WIDTHS, 10, p);
     assert_eq!(first, second);
@@ -144,8 +158,8 @@ fn the_price_counts_partitioned_filters_as_partitions() {
 
     let loads = [(1_000.0, n), (1_000.0, n)];
     let budget = 2 * estimate(n, 10);
-    let whole = price(&loads, &WIDTHS, 10, budget, None);
-    let split = price(&loads, &WIDTHS, 10, budget, Some(keys));
+    let whole = price(&at(&loads, 10, None), &WIDTHS, budget);
+    let split = price(&at(&loads, 10, Some(keys)), &WIDTHS, budget);
     assert!(split > whole, "whole {whole}, split {split}");
     let per_partition = 1_000.0 * as_f64(keys as u64) / as_f64(n as u64);
     assert!(
@@ -153,6 +167,77 @@ fn the_price_counts_partitioned_filters_as_partitions() {
             < cheapest(1_000.0, n, &WIDTHS, 10, whole),
         "the partitioned level takes a narrower width at the same budget"
     );
+}
+
+/// The price models each live table as its own level built it, so it does not
+/// depend on where the rewrite writes: a flush into a level of full filters
+/// prices the partitioned tables below as partitions, as a compaction into
+/// their level does.
+#[test]
+fn live_tables_price_alike_whatever_the_destination() -> crate::Result<()> {
+    use crate::config::{BlockSizePolicy, FilterAdvisor, PinningPolicy};
+    use crate::{AbstractTree, AnyTree, Config, SeqNo, SequenceNumberCounter};
+
+    const KEYS: u32 = 20_000;
+    let folder = tempfile::tempdir()?;
+    let advisor = FilterAdvisor::new(u64::from(2 * KEYS) * 11 / 8);
+    let any = Config::new(
+        folder.path(),
+        SequenceNumberCounter::default(),
+        SequenceNumberCounter::default(),
+    )
+    .data_block_size_policy(BlockSizePolicy::all(1_024))
+    .filter_block_partitioning_policy(PinningPolicy::all(true))
+    .filter_advisor(Some(advisor.clone()))
+    .open()?;
+    let mut seqno = 0;
+    for prefix in ["a-hot", "z-cold"] {
+        for i in 0..KEYS {
+            any.insert(format!("{prefix}{:06}", 2 * i), "value", seqno);
+            seqno += 1;
+        }
+        any.flush_active_memtable(0)?;
+    }
+    for i in 0..KEYS {
+        assert!(
+            any.get(format!("a-hot{:06}", 2 * i + 1), SeqNo::MAX)?
+                .is_none()
+        );
+    }
+    let AnyTree::Standard(tree) = &any else {
+        panic!("a standard tree");
+    };
+    assert!(
+        tree.current_version()
+            .iter_tables()
+            .all(|table| table.regions.filter_tli.is_some()),
+        "the live filters are partitioned"
+    );
+    let version = tree.current_version();
+    let live = super::live(&version, &tree.config);
+    let price_into = |partition_bytes: Option<u32>| {
+        let plan = super::plan(
+            &advisor,
+            &tree.filter_budget,
+            &live,
+            super::Rewrite::default(),
+            BloomConstructionPolicy::BitsPerKey(10.0),
+            partition_bytes,
+        )
+        .unwrap_or_else(|| panic!("the advisor plans the filters"));
+        plan.price
+    };
+    let (full, partitioned) = (price_into(None), price_into(Some(4_096)));
+    assert!(
+        partitioned.is_finite() && partitioned > 0.0,
+        "price {partitioned}"
+    );
+    assert_eq!(
+        full.to_bits(),
+        partitioned.to_bits(),
+        "into full filters {full}, into partitioned ones {partitioned}"
+    );
+    Ok(())
 }
 
 /// The key ranges of a split compaction price alike in whatever order their
@@ -195,11 +280,12 @@ fn split_ranges_price_by_all_data_still_to_come() -> crate::Result<()> {
     };
     let version = tree.current_version();
     let inputs: Vec<crate::Table> = version.iter_tables().cloned().collect();
+    let live = super::live(&version, &tree.config);
     let plan = |split: Option<super::Split>| {
         super::plan(
             &advisor,
             &tree.filter_budget,
-            version.iter_tables(),
+            &live,
             super::Rewrite {
                 inputs: inputs.clone(),
                 split,

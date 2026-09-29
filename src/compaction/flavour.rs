@@ -125,7 +125,7 @@ pub(super) fn plan_filters(
     crate::filter_budget::plan(
         advisor,
         &opts.filter_budget,
-        version.iter_tables(),
+        &crate::filter_budget::live(version, &opts.config),
         crate::filter_budget::Rewrite {
             inputs,
             split,
