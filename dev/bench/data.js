@@ -1,5 +1,5 @@
 window.BENCHMARK_DATA = {
-  "lastUpdate": 1790629357486,
+  "lastUpdate": 1790644405625,
   "repoUrl": "https://github.com/structured-world/coordinode-lsm-tree",
   "entries": {
     "lsm-tree db_bench costs": [
@@ -25882,6 +25882,90 @@ window.BENCHMARK_DATA = {
             "value": 295689.4102090317,
             "unit": "ops/sec",
             "extra": "P50: 2.4us | P99: 13.9us | P99.9: 170.5us\nthreads: 1 | elapsed: 0.68s | num: 200000 | iterations: 3"
+          }
+        ]
+      },
+      {
+        "commit": {
+          "author": {
+            "email": "mail@polaz.com",
+            "name": "Dmitry Prudnikov",
+            "username": "polaz"
+          },
+          "committer": {
+            "email": "noreply@github.com",
+            "name": "GitHub",
+            "username": "web-flow"
+          },
+          "distinct": true,
+          "id": "f628fbaf1fc0437849d321a72fd82d566e8880b7",
+          "message": "perf(writer): cut per-block coordination in parallel block prep (#741)\n\n## Summary\n\n- The parallel block-preparation pipeline pays its coordination per\nworker instead of per block: one token per worker, a ring of reorder\nslots, and an idle token that parks briefly for the next block instead\nof handing its thread back to the executor.\n- The ordered-execution machinery is a generic `OrderedPipeline`, so\nother writer stages that farm work to the same executor reuse it.\n- Blocks too cheap to be worth a worker are prepared on the writer\nthread, below a configurable threshold whose default follows the block\ncodec.\n\n## Changes\n\n- `table/writer/ordered_pipeline.rs`: `OrderedJob` + `OrderedPipeline`.\nA token runs queued jobs until the queue is empty, then parks on the\npipeline for up to 1 ms before it exits; a submit wakes a parked token\nbefore spawning a new one; at most `concurrency` tokens live. Results go\ninto a `capacity`-slot ring indexed by sequence number (debug-asserted\nnever to overflow), published and claimed under one lock; `notify_one`\nonly when the writer waits. Help-first draining is unchanged, so a\nsaturated, one-worker or re-entrant pool degrades to the writer doing\nthe work. Dropping the pipeline releases parked tokens at once; a token\non the writer's own thread never parks.\n- `table/writer/parallel_compressor.rs`: `BlockCompressor` is\n`OrderedPipeline<BlockJob>`; payloads below `inline_below` bytes are\nprepared inline and keep their place in order.\n- `Config::parallel_compression_inline_below(Option<u32>)`: the inline\nthreshold. `None` derives it from the cost of preparing a block rather\nthan from the block size as the issue proposed: 1 KiB for lz4, 8 KiB for\na table with no codec (which reaches the pipeline only for its\nencryption or page ECC), and 0 for zstd. A sweep of 256 B to 64 KiB\nblocks set each break-even: below 1 KiB an lz4 block doubles its CPU on\na worker with no wall-time gain, with or without encryption or ECC;\nencryption or ECC alone costs so little per block that workers only win\nwall time from 8 KiB; zstd's per-frame setup makes even a 256-byte block\nworth a worker.\n- Dropping the pipeline (a writer that stops early) abandons the jobs\nstill queued instead of letting a worker prepare blocks nobody will\nread.\n- `std::sync` locks are kept: a `parking_lot` swap measured neutral on\nthis pipeline (4 KiB lz4 and zstd1, CPU and wall), so it was not made.\n- `benches/block_pipeline.rs`: flush of at least 10^4 blocks, reporting\nwall time and whole-process CPU per MiB, over block sizes, codecs,\nencryption / page ECC, thread counts and inline thresholds, and reading\na sample of rows back after each flush.\n\n## Measurements\n\nWindows, 4 threads, flush of 10-12 thousand blocks, `origin/main` vs\nthis branch:\n\n| Case | CPU (main -> branch) | Wall |\n|------|----------------------|------|\n| 4 KiB, lz4 (serial CPU 234 ms) | 437-469 ms -> 328 ms (overhead above\nserial -57%) | unchanged, 172-189 ms |\n| 4 KiB, zstd 1 | 609-625 ms -> 562-594 ms | unchanged |\n| 64 KiB, lz4 | 1891-2016 ms -> 1781-1797 ms | unchanged |\n| 64 KiB, zstd 1 | 3781 ms -> 3641 ms | 950 ms both |\n| 64 KiB, zstd 19 | ~306 s both | within run-to-run noise (62-108 s on\nmain) |\n\n## Testing\n\n- The parallel-vs-serial test compares every data block frame byte for\nbyte against the serial writer for plain, seqno-in-index, per-KV\nchecksums, lz4, zstd with a dictionary and page ECC, at inline\nthresholds 0, max and the default; encrypted and columnar tables\n(per-block nonce, time-seeded row-group tag) are compared by their rows\nand block count. The pool deadlock tests pass unchanged.\n- fmt, clippy (all and default features), nextest (all and default\nfeatures), doc tests, docs, the no-std check, and the sst-dump and\ndb_bench tools pass on macOS.\n\nCloses #663\n\n\n<!-- This is an auto-generated comment: release notes by coderabbit.ai\n-->\n\n## Summary by CodeRabbit\n\n* **New Features**\n* Added an option to configure when small data blocks are compressed\ninline instead of being sent to parallel workers.\n* **Performance**\n* Improved parallel compression scheduling while preserving block order.\n* Added benchmarks covering compression codecs, block sizes, and worker\nsettings, with data integrity checks after each run.\n\n<!-- end of auto-generated comment: release notes by coderabbit.ai -->",
+          "timestamp": "2026-09-29T04:06:39+03:00",
+          "tree_id": "2f10b0118ea3dad799f454fa0c8bf10882135d9c",
+          "url": "https://github.com/structured-world/coordinode-lsm-tree/commit/f628fbaf1fc0437849d321a72fd82d566e8880b7"
+        },
+        "date": 1790644343196,
+        "tool": "customBiggerIsBetter",
+        "benches": [
+          {
+            "name": "mixed",
+            "value": 81824.47607279205,
+            "unit": "ops/sec",
+            "extra": "P50: 0.4us | P99: 7.7us | P99.9: 28.4us\nthreads: 1 | elapsed: 6.54s | num: 200000 | iterations: 3"
+          },
+          {
+            "name": "fillseq",
+            "value": 3086310.208125329,
+            "unit": "ops/sec",
+            "extra": "P50: 0.2us | P99: 0.6us | P99.9: 3.8us\nthreads: 1 | elapsed: 0.06s | num: 200000 | iterations: 3"
+          },
+          {
+            "name": "fillrandom",
+            "value": 1139748.5600701629,
+            "unit": "ops/sec",
+            "extra": "P50: 0.8us | P99: 1.4us | P99.9: 4.9us\nthreads: 1 | elapsed: 0.18s | num: 200000 | iterations: 3"
+          },
+          {
+            "name": "readrandom",
+            "value": 749387.001432828,
+            "unit": "ops/sec",
+            "extra": "P50: 1.0us | P99: 6.1us | P99.9: 73.4us\nthreads: 1 | elapsed: 0.27s | num: 200000 | iterations: 3"
+          },
+          {
+            "name": "readseq",
+            "value": 2582227.817049159,
+            "unit": "ops/sec",
+            "extra": "P50: 0.2us | P99: 4.7us | P99.9: 9.6us\nthreads: 1 | elapsed: 0.08s | num: 200000 | iterations: 3"
+          },
+          {
+            "name": "seekrandom",
+            "value": 323730.5150649614,
+            "unit": "ops/sec",
+            "extra": "P50: 2.5us | P99: 7.9us | P99.9: 14.9us\nthreads: 1 | elapsed: 0.62s | num: 200000 | iterations: 3"
+          },
+          {
+            "name": "prefixscan",
+            "value": 205317.518409282,
+            "unit": "ops/sec",
+            "extra": "P50: 4.3us | P99: 5.6us | P99.9: 11.5us\nthreads: 1 | elapsed: 0.97s | num: 200000 | iterations: 3"
+          },
+          {
+            "name": "overwrite",
+            "value": 1092100.0756825353,
+            "unit": "ops/sec",
+            "extra": "P50: 0.8us | P99: 1.5us | P99.9: 4.9us\nthreads: 1 | elapsed: 0.18s | num: 200000 | iterations: 3"
+          },
+          {
+            "name": "mergerandom",
+            "value": 446614.69411471253,
+            "unit": "ops/sec",
+            "extra": "P50: 0.4us | P99: 1.3us | P99.9: 3.7us\nthreads: 1 | elapsed: 0.45s | num: 200000 | iterations: 3"
+          },
+          {
+            "name": "readwhilewriting",
+            "value": 649379.7449366238,
+            "unit": "ops/sec",
+            "extra": "P50: 1.2us | P99: 6.3us | P99.9: 75.7us\nthreads: 1 | elapsed: 0.31s | num: 200000 | iterations: 3"
           }
         ]
       }
