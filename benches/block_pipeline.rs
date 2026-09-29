@@ -1,8 +1,8 @@
 // SPDX-License-Identifier: Apache-2.0
 // Copyright (c) 2026-present, Dmitry Prudnikov
 
-//! Cost of the parallel block pipeline per block: flushes one memtable of at
-//! least `BP_BLOCKS` data blocks (12 000 by default) and reports, per case, the
+//! Cost of the parallel block pipeline per block: flushes one memtable of
+//! `BP_BLOCKS` data blocks (12 000 by default) and reports, per case, the
 //! median wall time of the flush and the median CPU time of the whole process
 //! during it (the workers included), each per MiB of rows written. After each
 //! flush, outside both timings, a sample of the rows is read back and checked.
@@ -33,8 +33,16 @@ use std::time::{Duration, Instant};
 
 type BenchResult<T> = Result<T, Box<dyn std::error::Error>>;
 
-/// Rows per data block: the value length is the block size over this.
+/// Values are a block's size over this, so a block holds about as many rows.
 const ROWS_PER_BLOCK: u32 = 16;
+
+/// The key of row `i`: always `KEY_LEN` bytes.
+fn key(i: u64) -> String {
+    format!("key{i:016}")
+}
+
+/// Bytes of every key `key` returns.
+const KEY_LEN: u64 = 19;
 
 fn env_or<T: std::str::FromStr>(name: &str, default: T) -> T {
     std::env::var(name)
@@ -138,7 +146,7 @@ impl Case {
     }
 }
 
-/// A tree configured for `case`, one memtable of `rows` rows, the bytes of
+/// A tree configured for `case`, one memtable of `blocks` data blocks' rows, the bytes of
 /// those rows, and a few rows to read back after the flush.
 struct Fixture {
     tree: AnyTree,
@@ -147,7 +155,7 @@ struct Fixture {
     samples: Vec<(String, Vec<u8>)>,
 }
 
-fn filled_tree(case: &Case, rows: u64) -> BenchResult<Fixture> {
+fn filled_tree(case: &Case, blocks: u64) -> BenchResult<Fixture> {
     let folder = tempfile::tempdir()?;
     let mut config = Config::new(
         &folder,
@@ -168,14 +176,25 @@ fn filled_tree(case: &Case, rows: u64) -> BenchResult<Fixture> {
     }
     let tree = config.open()?;
 
-    let value_len = usize::try_from(case.block / ROWS_PER_BLOCK)?;
+    // The writer cuts a block once its keys and values reach the block size,
+    // so a block holds as many rows as it takes to reach it.
+    if u64::try_from(key(0).len())? != KEY_LEN {
+        return Err("KEY_LEN no longer matches the key format".into());
+    }
+    let value_len = case.block / ROWS_PER_BLOCK;
+    let entry_len = KEY_LEN + u64::from(value_len);
+    let rows_per_block = u64::from(case.block).div_ceil(entry_len);
+    let rows = blocks
+        .checked_mul(rows_per_block)
+        .ok_or("too many rows for one flush")?;
+    let value_len = usize::try_from(value_len)?;
     let last = rows.checked_sub(1).ok_or("a flush of no rows")?;
     let sampled = [0, rows / 2, last];
     let mut state = 0x9E37_79B9_7F4A_7C15_u64;
     let mut bytes = 0u64;
     let mut samples = Vec::with_capacity(sampled.len());
     for i in 0..rows {
-        let key = format!("key{i:016}");
+        let key = key(i);
         let value = value(value_len, &mut state);
         bytes += u64::try_from(key.len() + value.len())?;
         if sampled.contains(&i) {
@@ -275,12 +294,11 @@ fn main() -> BenchResult<()> {
 
     println!("case\tMiB\twall_ms\tcpu_ms\twall_ms_per_MiB\tcpu_ms_per_MiB");
     for case in cases.iter().filter(|c| c.label().contains(&filter)) {
-        let rows = blocks * u64::from(ROWS_PER_BLOCK);
         let mut walls = Vec::with_capacity(reps);
         let mut cpus = Vec::with_capacity(reps);
         let mut mib = 0.0;
         for _ in 0..reps {
-            let fixture = filled_tree(case, rows)?;
+            let fixture = filled_tree(case, blocks)?;
             mib = fixture.bytes as f64 / (1024.0 * 1024.0);
             let cpu = ProcessTime::now();
             let wall = Instant::now();
