@@ -190,11 +190,30 @@ fn range_tombstone_overlaps_bounds(
     overlaps_lo && overlaps_hi
 }
 
+/// What a table's filters said of a read's prefix and key.
+#[derive(Clone, Copy, PartialEq, Eq)]
+enum FilterAnswer {
+    /// A filter rules the table out.
+    Absent,
+    /// The key's filter was asked and let the key through, a probe counted:
+    /// a read of the table finding no version of the key is a false positive.
+    KeyPassed,
+    /// The table is read with no key probe counted: no key filter was asked,
+    /// or none could be read.
+    Unanswered,
+}
+
 /// Checks prefix and key bloom filters for a table.
 ///
 /// Returns `true` if the table should be included (bloom says "maybe" or no
 /// filter available), `false` if it can be safely skipped.
 fn bloom_passes(state: &IterState, table: &crate::table::Table) -> bool {
+    filter_answer(state, table) != FilterAnswer::Absent
+}
+
+/// Asks a table's prefix and key filters about the read, counting the probes
+/// they answer (see [`FilterAnswer`]).
+fn filter_answer(state: &IterState, table: &crate::table::Table) -> FilterAnswer {
     if let Some(prefix_hash) = state.prefix_hash {
         // A prefix answer counts as a key's does: the filter holds the
         // prefix's hash beside the keys'.
@@ -210,7 +229,7 @@ fn bloom_passes(state: &IterState, table: &crate::table::Table) -> bool {
                     m.prefix_bloom_skips
                         .fetch_add(1, core::sync::atomic::Ordering::Relaxed);
                 }
-                return false;
+                return FilterAnswer::Absent;
             }
             Ok(true) if table.key_check_consults_filter(false) => {
                 table.count_probes(ProbeCounts {
@@ -247,13 +266,14 @@ fn bloom_passes(state: &IterState, table: &crate::table::Table) -> bool {
                     probes: 1,
                     negatives: 1,
                 });
-                return false;
+                return FilterAnswer::Absent;
             }
             Ok(true) if table.key_check_consults_filter(state.bloom_key.is_some()) => {
                 table.count_probes(ProbeCounts {
                     probes: 1,
                     negatives: 0,
                 });
+                return FilterAnswer::KeyPassed;
             }
             Err(e) => {
                 log::debug!("key bloom check failed for table {:?}: {e}", table.id(),);
@@ -262,7 +282,7 @@ fn bloom_passes(state: &IterState, table: &crate::table::Table) -> bool {
         }
     }
 
-    true
+    FilterAnswer::Unanswered
 }
 
 /// One table's versions of a point key, read after its filter let the key
@@ -327,10 +347,10 @@ where
 }
 
 /// The reader of `table` for the point key in `user_range` at `seqno`, which
-/// its filter let through: it counts a miss when the tree counts filter
-/// probes and a filter answered.
+/// its filters did not rule out: it counts a miss when `answer` says the key's
+/// filter was asked and let the key through, the probe that miss belongs to.
 fn point_reader<'a, T>(
-    state: &IterState,
+    answer: FilterAnswer,
     table: T,
     user_range: (Bound<UserKey>, Bound<UserKey>),
     seqno: SeqNo,
@@ -339,10 +359,7 @@ where
     T: core::borrow::Borrow<crate::table::Table> + Send + 'a,
 {
     let reader = table.borrow().range(user_range);
-    let counts = table.borrow().probe_stats().is_some()
-        && table
-            .borrow()
-            .key_check_consults_filter(state.bloom_key.is_some());
+    let counts = answer == FilterAnswer::KeyPassed && table.borrow().probe_stats().is_some();
     let visible = move |item: &crate::Result<InternalValue>| match item {
         Ok(item) => seqno_filter(item.key.seqno, seqno),
         Err(_) => true,
@@ -447,28 +464,31 @@ impl TreeIter {
                         #[expect(clippy::expect_used, reason = "we checked for length")]
                         let table = run.first().expect("should exist");
 
-                        if table.check_key_range_overlap_cmp(&bounds, lock.comparator.as_ref())
-                            && bloom_passes(lock, table)
-                        {
-                            iters.push(point_reader(lock, table, user_range.clone(), seqno));
+                        if table.check_key_range_overlap_cmp(&bounds, lock.comparator.as_ref()) {
+                            let answer = filter_answer(lock, table);
+                            if answer != FilterAnswer::Absent {
+                                iters.push(point_reader(answer, table, user_range.clone(), seqno));
+                            }
                         }
                     }
                     _ => {
-                        let surviving: Vec<_> = run
+                        let mut surviving: Vec<(crate::table::Table, FilterAnswer)> = run
                             .iter()
                             .filter(|table| {
                                 table.check_key_range_overlap_cmp(&bounds, lock.comparator.as_ref())
-                                    && bloom_passes(lock, table)
                             })
-                            .cloned()
+                            .filter_map(|table| {
+                                let answer = filter_answer(lock, table);
+                                (answer != FilterAnswer::Absent).then(|| (table.clone(), answer))
+                            })
                             .collect();
 
                         match surviving.len() {
                             0 => {}
                             1 => {
-                                if let Some(table) = surviving.into_iter().next() {
+                                if let Some((table, answer)) = surviving.pop() {
                                     iters.push(point_reader(
-                                        lock,
+                                        answer,
                                         table,
                                         user_range.clone(),
                                         seqno,
@@ -476,6 +496,8 @@ impl TreeIter {
                                 }
                             }
                             _ => {
+                                let surviving =
+                                    surviving.into_iter().map(|(table, _)| table).collect();
                                 #[expect(
                                     clippy::expect_used,
                                     reason = "Run::new returns None only for empty vecs"

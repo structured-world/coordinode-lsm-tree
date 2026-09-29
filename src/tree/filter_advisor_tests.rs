@@ -556,6 +556,89 @@ fn merge_resolution_counts_its_filter_probes() -> crate::Result<()> {
     Ok(())
 }
 
+/// A filter that cannot be read answers nothing: merge resolution reads the
+/// table anyway, and a read finding no version then is no negative probe of a
+/// filter, so it counts neither a probe nor a miss.
+#[test]
+fn an_unreadable_filter_counts_no_miss() -> crate::Result<()> {
+    use crate::config::{FilterPolicy, FilterPolicyEntry};
+    use crate::fs::{Fault, FaultFs, FaultOp, FaultRule, StdFs};
+    use alloc::sync::Arc;
+
+    struct Concat;
+    impl crate::MergeOperator for Concat {
+        fn merge(
+            &self,
+            _key: &[u8],
+            base: Option<&[u8]>,
+            operands: &[&[u8]],
+        ) -> crate::Result<crate::UserValue> {
+            let mut merged = base.map(<[u8]>::to_vec).unwrap_or_default();
+            for operand in operands {
+                merged.extend_from_slice(operand);
+            }
+            Ok(merged.into())
+        }
+    }
+
+    let folder = tempfile::tempdir()?;
+    let fs = FaultFs::new(StdFs);
+    let injector = fs.injector();
+    let tree = Config::new(
+        folder.path(),
+        SequenceNumberCounter::default(),
+        SequenceNumberCounter::default(),
+    )
+    .with_fs(fs)
+    .data_block_size_policy(BlockSizePolicy::all(1_024))
+    .with_merge_operator(Some(Arc::new(Concat)))
+    .filter_policy(FilterPolicy::all(FilterPolicyEntry::Bloom(
+        BloomConstructionPolicy::BitsPerKey(10.0),
+    )))
+    .filter_advisor(Some(FilterAdvisor::new(u64::MAX)))
+    .open()?;
+    fill(&tree, &["k"], KEYS)?;
+    tree.major_compact(64 * 1_024 * 1_024, 0)?;
+    let older = tables(&tree);
+    let [older] = older.as_slice() else {
+        panic!("one older table");
+    };
+    for i in 0..KEYS {
+        tree.merge(key("k", 2 * i + 1), "x", u64::from(KEYS + i));
+    }
+    tree.flush_active_memtable(0)?;
+    let filter = older
+        .regions
+        .filter
+        .unwrap_or_else(|| panic!("the older table has an unpinned full filter"));
+    injector.arm(
+        FaultRule::new(FaultOp::ReadAt, Fault::Error(crate::io::ErrorKind::Other))
+            .on_path(older.path.to_string_lossy().into_owned())
+            .at_offset(*filter.offset()),
+    );
+    let counts = |table: &Table| {
+        table
+            .probe_stats()
+            .map_or((0, 0), |stats| (stats.probes(), stats.negatives()))
+    };
+    let before = counts(older);
+
+    let reads = KEYS - 1;
+    for i in 0..reads {
+        assert_eq!(
+            tree.get(key("k", 2 * i + 1), SeqNo::MAX)?.as_deref(),
+            Some(&b"x"[..])
+        );
+    }
+    let after = counts(older);
+    let (probes, negatives) = (after.0 - before.0, after.1 - before.1);
+    assert!(probes < u64::from(reads), "the filter read failed");
+    // Every key read is absent from the table, so each probe the filter
+    // answered is a negative one, and no negative comes without its probe.
+    assert_eq!(negatives, probes, "negatives against probes");
+    Ok(())
+}
+
 /// Widths all wider than the static policy's: once probes are observed, a
 /// budget none of them fits writes the narrowest configured width, never the
 /// static policy's narrower one.
