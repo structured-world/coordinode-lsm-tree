@@ -958,18 +958,22 @@ fn price(loads: &[Load], widths: &[u8], budget: u64) -> f64 {
     struct Entry {
         filter_load: f64,
         fallback_bits: u8,
-        /// Bytes at each width of a full partition, when the width is decided
+        /// Index into the full partitions' sizes when the width is decided
         /// per partition; otherwise the table's one filter decides it.
-        partition_bytes: Option<Vec<u64>>,
+        partition: Option<usize>,
         table_bytes: Vec<u64>,
     }
-    impl Entry {
-        /// Bytes at each width of the filter the width is decided for.
-        fn filter_bytes(&self) -> &[u64] {
-            self.partition_bytes.as_deref().unwrap_or(&self.table_bytes)
-        }
+    /// Bytes at each width of the filter an entry's width is decided for.
+    fn filter_bytes<'a>(entry: &'a Entry, partitions: &'a [(usize, Vec<u64>)]) -> &'a [u64] {
+        entry
+            .partition
+            .and_then(|index| partitions.get(index))
+            .map_or(&entry.table_bytes[..], |(_, full)| &full[..])
     }
     let rates = rates(widths);
+    // A full partition's sizes depend on its key count alone, which the
+    // tables of one level share: worked out once per count, not per table.
+    let mut partitions: Vec<(usize, Vec<u64>)> = Vec::new();
     let entries: Vec<Entry> = loads
         .iter()
         .map(|load| {
@@ -978,15 +982,23 @@ fn price(loads: &[Load], widths: &[u8], budget: u64) -> f64 {
                 Some(keys) if keys > 0 => keys,
                 _ => usize::MAX,
             };
-            let (partition_bytes, table_bytes) = if n > partition {
-                let full = sizes(partition, widths);
+            let (partition_index, table_bytes) = if n > partition {
+                let index = if let Some(index) =
+                    partitions.iter().position(|(keys, _)| *keys == partition)
+                {
+                    index
+                } else {
+                    partitions.push((partition, sizes(partition, widths)));
+                    partitions.len() - 1
+                };
                 let count = (n / partition) as u64;
+                let full = partitions.get(index).map_or(&[][..], |(_, full)| full);
                 let table = full
                     .iter()
                     .zip(sizes(n % partition, widths))
                     .map(|(&full, rest)| count * full + rest)
                     .collect();
-                (Some(full), table)
+                (Some(index), table)
             } else {
                 (None, sizes(n, widths))
             };
@@ -994,7 +1006,7 @@ fn price(loads: &[Load], widths: &[u8], budget: u64) -> f64 {
             Entry {
                 filter_load: load.negatives * as_f64(filter as u64) / as_f64(n.max(1) as u64),
                 fallback_bits: load.fallback_bits,
-                partition_bytes,
+                partition: partition_index,
                 table_bytes,
             }
         })
@@ -1006,7 +1018,7 @@ fn price(loads: &[Load], widths: &[u8], budget: u64) -> f64 {
             .map(|entry| {
                 let index = choose(
                     entry.filter_load,
-                    entry.filter_bytes(),
+                    filter_bytes(entry, &partitions),
                     &rates,
                     widths,
                     entry.fallback_bits,
@@ -1030,7 +1042,7 @@ fn price(loads: &[Load], widths: &[u8], budget: u64) -> f64 {
     let mut steps: Vec<(f64, i128)> = Vec::new();
     let mut hull: Vec<usize> = Vec::with_capacity(widths.len());
     for entry in &entries {
-        let filter_bytes = entry.filter_bytes();
+        let filter_bytes = filter_bytes(entry, &partitions);
         let point = |index: usize| {
             (
                 filter_bytes
@@ -1211,8 +1223,15 @@ fn rank(
 /// The expected false positives of a filter of `bytes` at false-positive
 /// rate `rate` drawing `load` negative probes, plus the price of its bytes.
 fn cost(load: f64, rate: f64, bytes: u64, price: f64) -> f64 {
-    // no-std: `f64::mul_add` needs std; `libm::fma` is the same operation.
-    libm::fma(load, rate, price * as_f64(bytes))
+    #[expect(
+        clippy::suboptimal_flops,
+        reason = "the cost only orders widths, which a fused multiply-add's extra \
+                  precision does not change, and a fused one is a software routine \
+                  (`libm::fma` without std, `mul_add` on targets built without the FMA \
+                  feature) on the price search's inner loop"
+    )]
+    let cost = load * rate + price * as_f64(bytes);
+    cost
 }
 
 /// Negative probes per key of each table, shrunk towards their mean.
