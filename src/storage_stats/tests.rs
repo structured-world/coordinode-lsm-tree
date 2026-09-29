@@ -94,29 +94,44 @@ fn depths_of(spans: &[(u64, &str, &str)]) -> Vec<(u64, u64)> {
     )
 }
 
-/// `span_overlaps` over spans written as `(file, first, last)` byte strings,
-/// every file in one group.
-fn overlaps_of(spans: &[(u64, &str, &str)]) -> Vec<u64> {
-    grouped_overlaps_of(spans, &|_| Some(0))
-}
-
-/// `span_overlaps` with each file's group given by `group_of`.
-fn grouped_overlaps_of(
+/// `pick_overlapping` over spans written as `(file, first, last)` byte
+/// strings: the chosen files of `ranked`, ascending, and the cost spent.
+fn picks_of(
     spans: &[(u64, &str, &str)],
-    group_of: &dyn Fn(u64) -> Option<usize>,
-) -> Vec<u64> {
+    fixed: &[(u64, usize)],
+    ranked: &[(u64, usize, u64)],
+    budget: u64,
+) -> (Vec<u64>, u64) {
     let keys: Vec<(u64, crate::UserKey, crate::UserKey)> = spans
         .iter()
         .map(|&(id, first, last)| (id, first.into(), last.into()))
         .collect();
-    span_overlaps(
+    let (chosen, spent) = pick_overlapping(
         &mut keys
             .iter()
             .map(|(id, first, last)| (*id, first, last))
             .collect::<Vec<_>>(),
-        group_of,
+        fixed,
+        ranked,
+        budget,
         crate::comparator::default_comparator().as_ref(),
-    )
+    );
+    let mut ids: Vec<u64> = ranked
+        .iter()
+        .zip(chosen)
+        .filter_map(|(&(id, _, _), chosen)| chosen.then_some(id))
+        .collect();
+    ids.sort_unstable();
+    (ids, spent)
+}
+
+/// Every file of `spans` a candidate of one group costing one, in id order.
+fn overlaps_of(spans: &[(u64, &str, &str)]) -> Vec<u64> {
+    let mut ids: Vec<u64> = spans.iter().map(|&(id, _, _)| id).collect();
+    ids.sort_unstable();
+    ids.dedup();
+    let ranked: Vec<(u64, usize, u64)> = ids.iter().map(|&id| (id, 0, 1)).collect();
+    picks_of(spans, &[], &ranked, u64::MAX).0
 }
 
 /// Nested spans of any count give every file the full depth: the outermost
@@ -138,20 +153,79 @@ fn nested_spans_give_every_file_the_full_depth() {
 }
 
 /// Files only merge within their group: overlapping files of different
-/// groups do not count as overlapping, those of one group do.
+/// groups are no partners, those of one group are.
 #[test]
-fn span_overlaps_counts_only_files_of_one_group() {
+fn only_files_of_one_group_are_partners() {
     let spans = [(1, "a", "m"), (2, "c", "k"), (3, "d", "e")];
     // 1 and 3 share a group; 2 is alone in its own.
-    let group_of = |id: u64| Some(usize::from(id == 2));
-    assert_eq!(grouped_overlaps_of(&spans, &group_of), vec![1, 3]);
+    let ranked = [(1, 0, 1), (2, 1, 1), (3, 0, 1)];
+    assert_eq!(picks_of(&spans, &[], &ranked, u64::MAX), (vec![1, 3], 2));
 }
 
-/// Deep interleaving is marked in one pass: every file of a thousand
-/// mutually overlapping ones overlaps another, and a file ending before the
-/// rest open overlaps nothing.
+/// A file relocated anyway is a partner at no cost: a candidate overlapping
+/// it is chosen for its own cost alone.
 #[test]
-fn span_overlaps_marks_a_deep_interleaving() {
+fn a_fixed_file_is_a_partner_at_no_cost() {
+    let spans = [(5, "a", "z"), (1, "c", "d"), (2, "d", "f")];
+    let ranked = [(1, 0, 10), (2, 0, 10)];
+    assert_eq!(picks_of(&spans, &[(5, 0)], &ranked, 10), (vec![1], 10));
+    // Of another group, it is no partner, and the two candidates only fit
+    // together.
+    assert_eq!(picks_of(&spans, &[(5, 1)], &ranked, 10), (vec![], 0));
+    assert_eq!(picks_of(&spans, &[(5, 1)], &ranked, 20), (vec![1, 2], 20));
+}
+
+/// A candidate whose partners cannot come along leaves the budget to the
+/// ones after it: a cheap file interleaved with two dear ones ranks first,
+/// but a cheaper overlapping pair further down is what fits.
+#[test]
+fn a_partnerless_candidate_leaves_the_budget_to_a_pair() {
+    let spans = [
+        (1, "a", "m"),
+        (2, "b", "n"),
+        (3, "c", "o"),
+        (4, "x", "y"),
+        (5, "x", "z"),
+    ];
+    // Ranked 1, 4, 5, 2, 3; 1 overlaps only 2 and 3.
+    let ranked = [(1, 0, 20), (4, 0, 20), (5, 0, 20), (2, 0, 40), (3, 0, 40)];
+    assert_eq!(picks_of(&spans, &[], &ranked, 50), (vec![4, 5], 40));
+}
+
+/// Many disjoint pairs whose first members all rank ahead of their partners,
+/// with a budget for one member of each: each pair is decided once, not the
+/// whole plan once per rejected candidate.
+#[test]
+fn many_disjoint_pairs_are_decided_in_one_pass() {
+    const PAIRS: u64 = 20_000;
+    let keys: Vec<(u64, String, String)> = (0..PAIRS)
+        .flat_map(|pair| {
+            [
+                (pair, format!("k{pair:06}a"), format!("k{pair:06}c")),
+                (PAIRS + pair, format!("k{pair:06}b"), format!("k{pair:06}d")),
+            ]
+        })
+        .collect();
+    let spans: Vec<(u64, &str, &str)> = keys
+        .iter()
+        .map(|(id, first, last)| (*id, first.as_str(), last.as_str()))
+        .collect();
+    let ranked: Vec<(u64, usize, u64)> = (0..2 * PAIRS).map(|id| (id, 0, 1)).collect();
+    // Room for every pair.
+    let (chosen, spent) = picks_of(&spans, &[], &ranked, 2 * PAIRS);
+    assert_eq!(chosen, (0..2 * PAIRS).collect::<Vec<_>>());
+    assert_eq!(spent, 2 * PAIRS);
+    // Room for half of them: the first pairs by rank, each whole.
+    let (chosen, spent) = picks_of(&spans, &[], &ranked, PAIRS);
+    let half: Vec<u64> = (0..PAIRS / 2).chain(PAIRS..PAIRS + PAIRS / 2).collect();
+    assert_eq!(chosen, half);
+    assert_eq!(spent, PAIRS);
+}
+
+/// A deep interleaving is chosen whole, and a file ending before the rest
+/// open overlaps nothing and stays.
+#[test]
+fn a_deep_interleaving_is_chosen_whole() {
     let keys: Vec<(u64, String, String)> = (0..1_000u64)
         .map(|f| (f, format!("k{f:05}"), format!("z{f:05}")))
         .chain([(5_000, "a".to_owned(), "b".to_owned())])
@@ -165,10 +239,10 @@ fn span_overlaps_marks_a_deep_interleaving() {
     assert_eq!(depths_of(&spans).last(), Some(&(5_000, 1)));
 }
 
-/// Only files whose spans meet another file's count as overlapping: a file
-/// off on its own range does not, even beside overlapping ones.
+/// Only files whose spans meet another file's are chosen: a file off on its
+/// own range is not, even beside overlapping ones.
 #[test]
-fn span_overlaps_names_the_files_that_meet_another() {
+fn only_files_that_meet_another_are_chosen() {
     assert_eq!(
         overlaps_of(&[(1, "a", "m"), (2, "c", "k"), (9, "x", "z")]),
         vec![1, 2],

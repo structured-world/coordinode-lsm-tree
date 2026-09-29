@@ -271,92 +271,285 @@ impl RangeMax {
     }
 }
 
-/// The files among `among` whose spans in `tables` overlap the span of another
-/// file among them in the same group: the ones a relocation of all of `among`
-/// would merge with something, when only files of one group can be merged
-/// into one output. `among` is `(file, group)`, sorted by file id. The result
-/// is sorted by file id.
+/// Chooses which of `ranked` to relocate along with `fixed`, best first while
+/// their cost fits `budget`. A file is chosen only when its spans in `tables`
+/// overlap those of another relocated file of its group, so relocating it
+/// merges it with something: either one already relocated, or the cheapest
+/// file it overlaps, chosen with it when both fit.
+///
+/// `fixed` is `(file, group)`, sorted by file id, relocated whatever the
+/// choice. `ranked` is `(file, group, cost)`, best first, disjoint from
+/// `fixed`. Returns whether each of `ranked` is chosen, and the cost spent.
 ///
 /// # Errors
 ///
 /// When a table's `linked_blob_files` section cannot be read or parsed.
-pub(crate) fn overlapping_blob_files<'a>(
+pub(crate) fn pick_overlapping_blob_files<'a>(
     tables: impl IntoIterator<Item = &'a crate::table::Table>,
-    among: &[(crate::vlog::BlobFileId, usize)],
-) -> crate::Result<Vec<crate::vlog::BlobFileId>> {
+    fixed: &[(crate::vlog::BlobFileId, usize)],
+    ranked: &[(crate::vlog::BlobFileId, usize, u64)],
+    budget: u64,
+) -> crate::Result<(Vec<bool>, u64)> {
     let mut comparator = None;
     let mut spans = Vec::new();
     collect_spans(tables, &mut comparator, &mut spans)?;
-    let group_of = |id: crate::vlog::BlobFileId| {
-        among
-            .binary_search_by_key(&id, |&(file, _)| file)
-            .ok()
-            .and_then(|at| among.get(at))
-            .map(|&(_, group)| group)
-    };
-    spans.retain(|&(id, _, _)| group_of(id).is_some());
-    Ok(comparator.map_or_else(Vec::new, |cmp| {
-        span_overlaps(&mut spans, &group_of, cmp.as_ref())
-    }))
+    Ok(match comparator {
+        Some(cmp) => pick_overlapping(&mut spans, fixed, ranked, budget, cmp.as_ref()),
+        None => (alloc::vec![false; ranked.len()], 0),
+    })
 }
 
-/// [`overlapping_blob_files`] over `(blob file, first key, last key)` spans
-/// ordered by `cmp`, each file's group given by `group_of`. Sorts `spans` in
-/// place.
-fn span_overlaps(
-    spans: &mut [Span<'_>],
-    group_of: &dyn Fn(crate::vlog::BlobFileId) -> Option<usize>,
-    cmp: &dyn crate::comparator::UserComparator,
-) -> Vec<crate::vlog::BlobFileId> {
-    let (merged, _) = merge_spans(spans, cmp);
-    let groups = merged
-        .iter()
-        .filter_map(|&(id, _, _)| group_of(id))
-        .max()
-        .map_or(0, |g| g + 1);
+/// How a relocation plan takes a file: relocated anyway, in a group, or a
+/// candidate at a rank.
+#[derive(Clone, Copy)]
+enum Role {
+    Fixed(usize),
+    Ranked(usize),
+}
 
-    // Per group, how many spans are open and the one open span not yet known
-    // to overlap anything: a second span starting while one is open marks
-    // both, so at most one unmarked span is ever open per group. Each span is
-    // marked once, whatever the depth. A file's merged spans never overlap
-    // each other, so anything open when a span starts belongs to another file.
-    let mut open_count = alloc::vec![0usize; groups];
-    let mut unmarked: Vec<Option<usize>> = alloc::vec![None; groups];
-    let mut marked = alloc::vec![false; merged.len()];
-    for (_, is_end, index) in sweep_events(&merged, cmp) {
-        let Some(group) = merged.get(index).and_then(|&(id, _, _)| group_of(id)) else {
+/// [`pick_overlapping_blob_files`] over `(blob file, first key, last key)`
+/// spans ordered by `cmp`. Drops the spans of other files and sorts the rest.
+fn pick_overlapping(
+    spans: &mut Vec<Span<'_>>,
+    fixed: &[(crate::vlog::BlobFileId, usize)],
+    ranked: &[(crate::vlog::BlobFileId, usize, u64)],
+    budget: u64,
+    cmp: &dyn crate::comparator::UserComparator,
+) -> (Vec<bool>, u64) {
+    let mut roles: Vec<(crate::vlog::BlobFileId, Role)> = fixed
+        .iter()
+        .map(|&(id, group)| (id, Role::Fixed(group)))
+        .chain(
+            ranked
+                .iter()
+                .enumerate()
+                .map(|(rank, &(id, _, _))| (id, Role::Ranked(rank))),
+        )
+        .collect();
+    roles.sort_unstable_by_key(|&(id, _)| id);
+    let role_of = |id: crate::vlog::BlobFileId| {
+        roles
+            .binary_search_by_key(&id, |&(file, _)| file)
+            .ok()
+            .and_then(|at| roles.get(at))
+            .map(|&(_, role)| role)
+    };
+    spans.retain(|&(id, _, _)| role_of(id).is_some());
+    let (merged, _) = merge_spans(spans, cmp);
+    let events = sweep_events(&merged, cmp);
+    let positions = events.len();
+
+    // Where each span starts and ends in the sweep. Where spans meet at one
+    // key, the start sorts first, so two spans overlap exactly when each
+    // starts before the other ends. A file's merged spans never overlap each
+    // other.
+    let mut bounds = alloc::vec![(0usize, 0usize); merged.len()];
+    for (position, &(_, is_end, index)) in events.iter().enumerate() {
+        if let Some(bound) = bounds.get_mut(index) {
+            if is_end {
+                bound.1 = position;
+            } else {
+                bound.0 = position;
+            }
+        }
+    }
+    let group_and_rank = |index: usize| {
+        let role = merged.get(index).and_then(|&(id, _, _)| role_of(id))?;
+        Some(match role {
+            Role::Fixed(group) => (group, None),
+            Role::Ranked(rank) => (ranked.get(rank)?.1, Some(rank)),
+        })
+    };
+    let groups = fixed
+        .iter()
+        .map(|&(_, group)| group)
+        .chain(ranked.iter().map(|&(_, group, _)| group))
+        .max()
+        .map_or(0, |group| group + 1);
+    let mut spans_of: Vec<Vec<(usize, usize)>> = alloc::vec![Vec::new(); ranked.len()];
+    for (index, &bound) in bounds.iter().enumerate() {
+        if let Some((_, Some(rank))) = group_and_rank(index)
+            && let Some(own) = spans_of.get_mut(rank)
+        {
+            own.push(bound);
+        }
+    }
+
+    // The cheapest candidate of another file each candidate overlaps, in one
+    // sweep: when a span ends, the spans of its group that started before
+    // that and end after its start are the ones it overlaps. Each span enters
+    // its group's index as it starts, keyed by its end; positions count down
+    // so the spans ending after a start form a prefix.
+    let mut partner: Vec<Option<(u64, usize)>> = alloc::vec![None; ranked.len()];
+    let mut started: Vec<PrefixCheapest> = (0..groups)
+        .map(|_| PrefixCheapest::new(positions))
+        .collect();
+    for &(_, is_end, index) in &events {
+        let Some((group, Some(rank))) = group_and_rank(index) else {
             continue;
         };
-        let (Some(count), Some(waiting)) = (open_count.get_mut(group), unmarked.get_mut(group))
+        let (Some(&(start, end)), Some(&(_, _, cost)), Some(index_of_group)) =
+            (bounds.get(index), ranked.get(rank), started.get_mut(group))
         else {
             continue;
         };
         if is_end {
-            *count -= 1;
-            if *waiting == Some(index) {
-                *waiting = None;
-            }
-            continue;
-        }
-        if *count > 0 {
-            for span in waiting.take().into_iter().chain(core::iter::once(index)) {
-                if let Some(flag) = marked.get_mut(span) {
-                    *flag = true;
-                }
+            let found = index_of_group
+                .before(positions - 1 - start)
+                .best_except(rank);
+            if let (Some(found), Some(best)) = (found, partner.get_mut(rank))
+                && best.is_none_or(|best| found < best)
+            {
+                *best = Some(found);
             }
         } else {
-            *waiting = Some(index);
+            index_of_group.add(positions - 1 - end, (cost, rank));
         }
-        *count += 1;
     }
 
-    let mut overlapping: Vec<crate::vlog::BlobFileId> = merged
-        .iter()
-        .zip(marked)
-        .filter_map(|(&(id, _, _), marked)| marked.then_some(id))
-        .collect();
-    overlapping.dedup();
-    overlapping
+    // Best first: a candidate joins when a relocated span of its group
+    // overlaps its own, which the relocated spans' largest end among those
+    // starting before its end tells; otherwise it joins together with its
+    // cheapest partner when both fit.
+    let mut relocated: Vec<PrefixMax> = (0..groups).map(|_| PrefixMax::new(positions)).collect();
+    for (index, &(start, end)) in bounds.iter().enumerate() {
+        if let Some((group, None)) = group_and_rank(index)
+            && let Some(tree) = relocated.get_mut(group)
+        {
+            tree.raise(start, end);
+        }
+    }
+    let mut chosen = alloc::vec![false; ranked.len()];
+    let mut spent = 0u64;
+    for (rank, &(_, group, cost)) in ranked.iter().enumerate() {
+        // Costs are sums of on-disk sizes, bounded by filesystem capacity.
+        if chosen.get(rank) != Some(&false) || spent + cost > budget {
+            continue;
+        }
+        let own = spans_of.get(rank).map_or(&[][..], Vec::as_slice);
+        let joins = relocated
+            .get(group)
+            .is_some_and(|tree| own.iter().any(|&(start, end)| tree.max_before(end) > start));
+        let with = if joins {
+            None
+        } else {
+            match partner.get(rank).copied().flatten() {
+                Some((partner_cost, partner_rank)) if spent + cost + partner_cost <= budget => {
+                    Some(partner_rank)
+                }
+                _ => continue,
+            }
+        };
+        for pick in core::iter::once(rank).chain(with) {
+            let (Some(flag), Some(&(_, _, pick_cost)), Some(tree)) = (
+                chosen.get_mut(pick),
+                ranked.get(pick),
+                relocated.get_mut(group),
+            ) else {
+                continue;
+            };
+            *flag = true;
+            spent += pick_cost;
+            for &(start, end) in spans_of.get(pick).map_or(&[][..], Vec::as_slice) {
+                tree.raise(start, end);
+            }
+        }
+    }
+    (chosen, spent)
+}
+
+/// Largest value over any prefix of positions, values only ever raised.
+struct PrefixMax(Vec<usize>);
+
+impl PrefixMax {
+    fn new(positions: usize) -> Self {
+        Self(alloc::vec![0; positions])
+    }
+
+    /// Raises position `at` to at least `value`.
+    fn raise(&mut self, at: usize, value: usize) {
+        let mut node = at + 1;
+        while let Some(slot) = self.0.get_mut(node - 1) {
+            *slot = (*slot).max(value);
+            node += node & node.wrapping_neg();
+        }
+    }
+
+    /// Largest value at positions `..before`; zero when there is none.
+    fn max_before(&self, before: usize) -> usize {
+        let mut node = before;
+        let mut max = 0;
+        while node > 0 {
+            if let Some(&value) = self.0.get(node - 1) {
+                max = max.max(value);
+            }
+            node &= node - 1;
+        }
+        max
+    }
+}
+
+/// The two cheapest `(cost, rank)` offers of distinct ranks.
+#[derive(Clone, Copy, Default)]
+struct TwoCheapest([Option<(u64, usize)>; 2]);
+
+impl TwoCheapest {
+    fn add(&mut self, offer: (u64, usize)) {
+        let [first, second] = self.0;
+        let mut all = [first, second, Some(offer)];
+        all.sort_unstable_by_key(|offer| offer.unwrap_or((u64::MAX, usize::MAX)));
+        let mut kept = [None; 2];
+        let mut slots = kept.iter_mut();
+        let mut first_rank = None;
+        for offer in all.into_iter().flatten() {
+            if first_rank == Some(offer.1) {
+                continue;
+            }
+            let Some(slot) = slots.next() else {
+                break;
+            };
+            first_rank.get_or_insert(offer.1);
+            *slot = Some(offer);
+        }
+        self.0 = kept;
+    }
+
+    /// The cheapest offer of a rank other than `rank`.
+    fn best_except(&self, rank: usize) -> Option<(u64, usize)> {
+        self.0.into_iter().flatten().find(|offer| offer.1 != rank)
+    }
+}
+
+/// [`TwoCheapest`] over any prefix of positions, offers only ever added.
+struct PrefixCheapest(Vec<TwoCheapest>);
+
+impl PrefixCheapest {
+    fn new(positions: usize) -> Self {
+        Self(alloc::vec![TwoCheapest::default(); positions])
+    }
+
+    fn add(&mut self, at: usize, offer: (u64, usize)) {
+        let mut node = at + 1;
+        while let Some(slot) = self.0.get_mut(node - 1) {
+            slot.add(offer);
+            node += node & node.wrapping_neg();
+        }
+    }
+
+    /// The offers at positions `..before`.
+    fn before(&self, before: usize) -> TwoCheapest {
+        let mut node = before;
+        let mut out = TwoCheapest::default();
+        while node > 0 {
+            if let Some(slot) = self.0.get(node - 1) {
+                for offer in slot.0.into_iter().flatten() {
+                    out.add(offer);
+                }
+            }
+            node &= node - 1;
+        }
+        out
+    }
 }
 
 /// A `(blob file, first key, last key)` span referenced from a table.

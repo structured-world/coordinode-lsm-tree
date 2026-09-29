@@ -2624,14 +2624,6 @@ fn pick_blob_files_for_locality(
     )]
     let budget = ((table_bytes + stale_written) as f64 * f64::from(locality.budget)) as u64;
 
-    // A file rewritten without another it overlaps keeps its span: its
-    // interleaving stays, and joining it to a disjoint run would only stretch
-    // that run's span across the gap. A file with no such partner even among
-    // all candidates can never be picked.
-    let reachable =
-        overlapping_among_relocated(tables, stale, candidates.iter().map(|(bf, ..)| bf))?;
-    candidates.retain(|(bf, ..)| reachable.binary_search(&bf.id()).is_ok());
-
     // Most depth per byte first; ties go to the older file.
     candidates.sort_by(|(a, a_depth, a_size), (b, b_depth, b_size)| {
         let a_score = u128::from(*a_depth) * u128::from((*b_size).max(1));
@@ -2639,53 +2631,33 @@ fn pick_blob_files_for_locality(
         b_score.cmp(&a_score).then_with(|| a.id().cmp(&b.id()))
     });
 
-    // Take candidates in rank order while the budget lasts. A pick whose
-    // partners did not fit is dropped from the ranking and the selection
-    // redone, so its budget goes to the files after it. Dropping only the
-    // best-ranked such pick is safe: every pick before it is made exactly as
-    // before, so it would stay without a partner. Each pass drops one
-    // candidate, which bounds the passes.
-    #[derive(Clone, Copy, PartialEq, Eq)]
-    enum Pick {
-        Taken,
-        Skipped,
-        Dropped,
-    }
-    let mut ranked: Vec<(BlobFile, u64, Pick)> = candidates
-        .into_iter()
-        .map(|(bf, _, size)| (bf, size, Pick::Skipped))
-        .collect();
-    let spent = loop {
-        let mut spent = 0u64;
-        for (_, size, pick) in &mut ranked {
-            if *pick == Pick::Dropped {
-                continue;
-            }
-            // Each byte is read once and written once.
-            let cost = 2 * *size;
-            *pick = if spent + cost <= budget {
-                spent += cost;
-                Pick::Taken
-            } else {
-                Pick::Skipped
-            };
-        }
-        let taken = ranked
-            .iter()
-            .filter(|(.., pick)| *pick == Pick::Taken)
-            .map(|(bf, ..)| bf);
-        let overlapping = overlapping_among_relocated(tables, stale, taken)?;
-        match ranked.iter_mut().find(|(bf, _, pick)| {
-            *pick == Pick::Taken && overlapping.binary_search(&bf.id()).is_err()
-        }) {
-            Some((.., pick)) => *pick = Pick::Dropped,
-            None => break spent,
-        }
+    // A file rewritten without another it overlaps keeps its span: its
+    // interleaving stays, and joining it to a disjoint run would only stretch
+    // that run's span across the gap. The partner must share its codec too:
+    // relocation copies frames verbatim, one output file per source codec, so
+    // files of different codecs stay apart however they overlap.
+    let mut codecs: Vec<crate::CompressionType> = Vec::new();
+    let mut group_of = |bf: &BlobFile| {
+        let codec = bf.compression();
+        codecs.iter().position(|c| *c == codec).unwrap_or_else(|| {
+            codecs.push(codec);
+            codecs.len() - 1
+        })
     };
-    let picked: Vec<(BlobFile, u64)> = ranked
+    let mut fixed: Vec<(crate::vlog::BlobFileId, usize)> =
+        stale.iter().map(|bf| (bf.id(), group_of(bf))).collect();
+    fixed.sort_unstable_by_key(|&(id, _)| id);
+    // Each byte is read once and written once.
+    let ranked: Vec<(crate::vlog::BlobFileId, usize, u64)> = candidates
+        .iter()
+        .map(|(bf, _, size)| (bf.id(), group_of(bf), 2 * size))
+        .collect();
+    let (chosen, spent) =
+        crate::storage_stats::pick_overlapping_blob_files(tables, &fixed, &ranked, budget)?;
+    let picked: Vec<(BlobFile, u64)> = candidates
         .into_iter()
-        .filter(|(.., pick)| *pick == Pick::Taken)
-        .map(|(bf, size, _)| (bf, size))
+        .zip(chosen)
+        .filter_map(|((bf, _, size), chosen)| chosen.then_some((bf, size)))
         .collect();
 
     log::debug!(
@@ -2727,30 +2699,6 @@ fn pick_blob_files_for_locality(
         picked.iter().map(BlobFile::id).collect::<Vec<_>>(),
     );
     Ok(picked)
-}
-
-/// Ids, ascending, of the files among `stale` and `extra` whose key span in
-/// `tables` meets that of another of them with the same codec.
-///
-/// Relocation copies frames verbatim, one output file per source codec, so
-/// files of different codecs stay apart however they overlap.
-fn overlapping_among_relocated<'a>(
-    tables: &[Table],
-    stale: &'a [BlobFile],
-    extra: impl Iterator<Item = &'a BlobFile>,
-) -> crate::Result<Vec<crate::vlog::BlobFileId>> {
-    let mut codecs: Vec<crate::CompressionType> = Vec::new();
-    let mut relocated: Vec<(crate::vlog::BlobFileId, usize)> = Vec::new();
-    for bf in stale.iter().chain(extra) {
-        let codec = bf.compression();
-        let group = codecs.iter().position(|c| *c == codec).unwrap_or_else(|| {
-            codecs.push(codec);
-            codecs.len() - 1
-        });
-        relocated.push((bf.id(), group));
-    }
-    relocated.sort_unstable_by_key(|&(id, _)| id);
-    crate::storage_stats::overlapping_blob_files(tables, &relocated)
 }
 
 fn hidden_guard<T>(

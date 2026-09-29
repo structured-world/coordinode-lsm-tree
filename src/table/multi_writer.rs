@@ -6,13 +6,13 @@ mod tombstone_share;
 
 use super::{filter::BloomConstructionPolicy, writer::Writer};
 use crate::{
-    Checksum, CompressionType, HashMap, SequenceNumberCounter, TableId, UserKey,
+    Checksum, CompressionType, SequenceNumberCounter, TableId, UserKey,
     blob_tree::handle::BlobIndirection,
     encryption::EncryptionProvider,
     fs::{Fs, SyncMode},
     prefix::PrefixExtractor,
     range_tombstone::RangeTombstone,
-    table::writer::LinkedFile,
+    table::writer::{LinkedBlobFiles, LinkedFile},
     value::InternalValue,
     vlog::BlobFileId,
 };
@@ -82,7 +82,7 @@ pub struct MultiWriter {
     current_key: Option<UserKey>,
     comparator: crate::SharedComparator,
 
-    linked_blobs: HashMap<BlobFileId, LinkedFile>,
+    linked_blobs: LinkedBlobFiles,
 
     /// Range tombstones to distribute across output tables, ordered by start.
     /// During compaction these are clipped to each table's key range; during
@@ -285,7 +285,7 @@ impl MultiWriter {
             current_key: None,
             comparator: crate::comparator::default_comparator(),
 
-            linked_blobs: HashMap::default(),
+            linked_blobs: LinkedBlobFiles::default(),
             range_tombstones: Vec::new(),
             clip_range_tombstones: false,
             output_lower: None,
@@ -586,22 +586,12 @@ impl MultiWriter {
         let Some(key) = self.current_key.as_ref() else {
             return;
         };
-        self.linked_blobs
-            .entry(indirection.vhandle.blob_file_id)
-            .and_modify(|entry| {
-                entry.bytes += u64::from(indirection.size);
-                entry.on_disk_bytes += u64::from(indirection.vhandle.on_disk_size);
-                entry.len += 1;
-                entry.last_key.clone_from(key);
-            })
-            .or_insert_with(|| LinkedFile {
-                blob_file_id: indirection.vhandle.blob_file_id,
-                bytes: u64::from(indirection.size),
-                on_disk_bytes: u64::from(indirection.vhandle.on_disk_size),
-                len: 1,
-                first_key: key.clone(),
-                last_key: key.clone(),
-            });
+        self.linked_blobs.register(
+            indirection.vhandle.blob_file_id,
+            u64::from(indirection.size),
+            u64::from(indirection.vhandle.on_disk_size),
+            key,
+        );
     }
 
     #[must_use]
@@ -1010,8 +1000,7 @@ impl MultiWriter {
         }
         self.output_lower.clone_from(&self.current_key);
 
-        // Taken out, so the map is freed rather than kept under the next table.
-        for linked in core::mem::take(&mut self.linked_blobs).into_values() {
+        for linked in self.linked_blobs.take() {
             old_writer.link_blob_file(linked);
         }
 
@@ -1082,7 +1071,7 @@ impl MultiWriter {
     ) -> bool {
         use crate::table::block::{BlockType, framed_len_bound};
 
-        let linked = crate::table::writer::linked_blob_files_len(self.linked_blobs.values());
+        let linked = self.linked_blobs.section_len();
         let (tombstone_block, tombstones_held) = if tombstones == 0 {
             (0, 0)
         } else {
@@ -1410,8 +1399,7 @@ impl MultiWriter {
             );
         }
 
-        // Taken out, so the map is freed before the table is written.
-        for linked in core::mem::take(&mut self.linked_blobs).into_values() {
+        for linked in self.linked_blobs.take() {
             self.writer.link_blob_file(linked);
         }
 

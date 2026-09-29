@@ -52,15 +52,37 @@ fn sample_links() -> Vec<LinkedFile> {
     ]
 }
 
-/// What the writer lays out, the parser reads back record for record, and the
-/// size estimate is exactly the bytes laid out.
+/// What the writer lays out, the parser reads back record for record.
 #[test]
 fn linked_blob_files_round_trip_with_their_key_spans() -> crate::Result<()> {
     let links = sample_links();
     let encoded = encode_links(&links);
     assert_eq!(parse_linked_blob_files(&encoded)?, links);
-    assert_eq!(linked_blob_files_len(links.iter()), encoded.len() as u64);
     Ok(())
+}
+
+/// The section size kept up to date as entries register is exactly the bytes
+/// the links encode to, whether a file's last key grows or shrinks, and none
+/// once the links are taken.
+#[test]
+fn linked_blob_files_track_their_section_len_as_entries_register() {
+    let mut linked = LinkedBlobFiles::default();
+    assert_eq!(linked.section_len(), 0);
+    for (file, key) in [
+        (3, "apple"),
+        (9, "banana-split"),
+        (3, "cherry-pie"),
+        (9, "date"),
+        (3, "elderberry"),
+        (5, "fig"),
+    ] {
+        linked.register(file, 10, 7, &UserKey::from(key.as_bytes()));
+        let links: Vec<LinkedFile> = linked.files.values().cloned().collect();
+        assert_eq!(linked.section_len(), encode_links(&links).len() as u64);
+    }
+    assert_eq!(linked.len(), 3);
+    assert_eq!(linked.take().count(), 3);
+    assert_eq!(linked.section_len(), 0);
 }
 
 /// The records must fill the section: bytes left past the last record mean

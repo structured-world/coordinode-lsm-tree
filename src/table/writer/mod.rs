@@ -113,21 +113,87 @@ const REFRESH_HASH_STEP_KEYS: u64 = 8;
 /// file's id, entry count, bytes and on-disk bytes.
 pub(crate) const LINKED_BLOB_FILE_FIXED_LEN: usize = 4 * core::mem::size_of::<u64>();
 
-/// Bytes the `linked_blob_files` section takes for `links`: the count, then
-/// each record's fixed fields and its first and last key, each preceded by a
-/// two-byte length.
+/// Bytes one `linked_blob_files` record takes: its fixed fields and its first
+/// and last key, each preceded by a two-byte length.
 #[must_use]
-pub(crate) fn linked_blob_files_len<'a>(
-    links: impl ExactSizeIterator<Item = &'a LinkedFile>,
-) -> u64 {
-    if links.len() == 0 {
-        return 0;
+fn linked_blob_file_record_len(first_key: &[u8], last_key: &[u8]) -> u64 {
+    (LINKED_BLOB_FILE_FIXED_LEN + 2 + first_key.len() + 2 + last_key.len()) as u64
+}
+
+/// The blob files the table being written links, keyed by file, with the
+/// bytes their `linked_blob_files` section takes kept up to date as entries
+/// register, since a writer asks for that size before every key.
+#[derive(Default)]
+pub(crate) struct LinkedBlobFiles {
+    files: crate::HashMap<BlobFileId, LinkedFile>,
+    /// The records' bytes, without the section's four-byte count.
+    records_len: u64,
+}
+
+impl LinkedBlobFiles {
+    /// Records that the table's entry at `key` points at a value of `bytes`
+    /// (`on_disk_bytes` stored) in `blob_file_id`. Keys arrive in order, so
+    /// the first key seen for a file is its first and the latest its last.
+    pub(crate) fn register(
+        &mut self,
+        blob_file_id: BlobFileId,
+        bytes: u64,
+        on_disk_bytes: u64,
+        key: &UserKey,
+    ) {
+        match self.files.entry(blob_file_id) {
+            hashbrown::hash_map::Entry::Occupied(mut entry) => {
+                let link = entry.get_mut();
+                link.bytes += bytes;
+                link.on_disk_bytes += on_disk_bytes;
+                link.len += 1;
+                // The record grows or shrinks by the change in its last key.
+                self.records_len = self.records_len - link.last_key.len() as u64 + key.len() as u64;
+                link.last_key.clone_from(key);
+            }
+            hashbrown::hash_map::Entry::Vacant(entry) => {
+                self.records_len += linked_blob_file_record_len(key, key);
+                entry.insert(LinkedFile {
+                    blob_file_id,
+                    bytes,
+                    on_disk_bytes,
+                    len: 1,
+                    first_key: key.clone(),
+                    last_key: key.clone(),
+                });
+            }
+        }
     }
-    4 + links
-        .map(|link| {
-            (LINKED_BLOB_FILE_FIXED_LEN + 2 + link.first_key.len() + 2 + link.last_key.len()) as u64
-        })
-        .sum::<u64>()
+
+    /// Bytes the `linked_blob_files` section takes: nothing without links,
+    /// else the count and the records.
+    #[must_use]
+    pub(crate) fn section_len(&self) -> u64 {
+        if self.files.is_empty() {
+            0
+        } else {
+            4 + self.records_len
+        }
+    }
+
+    /// Number of files linked.
+    #[must_use]
+    pub(crate) fn len(&self) -> usize {
+        self.files.len()
+    }
+
+    /// Entries the map has room for without reallocating.
+    #[cfg(test)]
+    pub(crate) fn capacity(&self) -> usize {
+        self.files.capacity()
+    }
+
+    /// Takes the links out, leaving none, so the map is freed rather than
+    /// kept under the next table.
+    pub(crate) fn take(&mut self) -> impl Iterator<Item = LinkedFile> {
+        self.records_len = 0;
+        core::mem::take(&mut self.files).into_values()
+    }
 }
 
 /// Parses a `linked_blob_files` section written by [`Writer::finish`]: the
