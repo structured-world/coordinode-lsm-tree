@@ -183,7 +183,7 @@ pub struct BlockCompressor {
 /// no threshold is configured. Measured on a flush of 12 000 blocks over four
 /// workers, with and without encryption or page ECC: below 1 KiB a worker costs
 /// twice the CPU and no less wall time; from 1 KiB up the workers win wall time.
-#[cfg(feature = "std")]
+#[cfg(all(feature = "std", feature = "lz4"))]
 const LZ4_INLINE_BELOW: u64 = 1_024;
 
 /// Payload bytes below which a block with no codec is prepared on the writer
