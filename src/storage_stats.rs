@@ -160,6 +160,81 @@ pub(crate) fn blob_reference_stats<'a>(
 ) -> crate::Result<BlobReferenceStats> {
     let mut comparator = None;
     let mut spans = Vec::new();
+    collect_spans(tables, &mut comparator, &mut spans)?;
+    Ok(comparator.map_or_else(BlobReferenceStats::default, |cmp| {
+        span_stats(spans, cmp.as_ref())
+    }))
+}
+
+/// Per blob file the tables reference, the depth where its key spans overlap
+/// most: the largest number of distinct files covering one key inside its
+/// spans. A file whose figure stays within a depth limit does not take part in
+/// any region that exceeds it. Ordered by file id; empty for tables without
+/// blob links.
+///
+/// # Errors
+///
+/// When a table's `linked_blob_files` section cannot be read or parsed.
+pub(crate) fn blob_file_depths<'a>(
+    tables: impl IntoIterator<Item = &'a crate::table::Table>,
+) -> crate::Result<Vec<(crate::vlog::BlobFileId, u64)>> {
+    let mut comparator = None;
+    let mut spans = Vec::new();
+    collect_spans(tables, &mut comparator, &mut spans)?;
+    Ok(comparator.map_or_else(Vec::new, |cmp| span_depths(spans, cmp.as_ref())))
+}
+
+/// [`blob_file_depths`] over `(blob file, first key, last key)` spans ordered
+/// by `cmp`.
+fn span_depths(
+    spans: Vec<Span<'_>>,
+    cmp: &dyn crate::comparator::UserComparator,
+) -> Vec<(crate::vlog::BlobFileId, u64)> {
+    let (merged, _) = merge_spans(spans, cmp);
+
+    // Each start raises the depth of every span open at that key, so a span's
+    // figure is the largest open count seen while it is open. Quadratic in the
+    // depth, which a compaction's own tables keep small.
+    let mut per_span = alloc::vec![0u64; merged.len()];
+    let mut open: Vec<usize> = Vec::new();
+    for (index, is_end) in sweep_events(&merged, cmp) {
+        if is_end {
+            open.retain(|&o| o != index);
+        } else {
+            open.push(index);
+            let depth = open.len() as u64;
+            for &o in &open {
+                if let Some(slot) = per_span.get_mut(o) {
+                    *slot = (*slot).max(depth);
+                }
+            }
+        }
+    }
+
+    // `merged` is sorted by file, so one pass folds a file's spans together.
+    let mut per_file: Vec<(crate::vlog::BlobFileId, u64)> = Vec::new();
+    for ((id, _, _), depth) in merged.iter().zip(per_span) {
+        match per_file.last_mut() {
+            Some((last, value)) if last == id => *value = (*value).max(depth),
+            _ => per_file.push((*id, depth)),
+        }
+    }
+    per_file
+}
+
+/// A `(blob file, first key, last key)` span referenced from a table.
+type Span<'k> = (
+    crate::vlog::BlobFileId,
+    &'k crate::UserKey,
+    &'k crate::UserKey,
+);
+
+/// Appends every blob-link span of `tables` and remembers their comparator.
+fn collect_spans<'a>(
+    tables: impl IntoIterator<Item = &'a crate::table::Table>,
+    comparator: &mut Option<crate::comparator::SharedComparator>,
+    spans: &mut Vec<Span<'a>>,
+) -> crate::Result<()> {
     for table in tables {
         comparator.get_or_insert_with(|| table.comparator.clone());
         spans.extend(
@@ -169,22 +244,35 @@ pub(crate) fn blob_reference_stats<'a>(
                 .map(|link| (link.blob_file_id, &link.first_key, &link.last_key)),
         );
     }
-    Ok(comparator.map_or_else(BlobReferenceStats::default, |cmp| {
-        span_stats(spans, cmp.as_ref())
-    }))
+    Ok(())
 }
 
 /// [`BlobReferenceStats`] of `(blob file, first key, last key)` spans ordered
 /// by `cmp`. Spans of one file (from different tables) are merged where they
 /// overlap, so the sweep counts distinct files, not references.
-fn span_stats<'k>(
-    mut spans: Vec<(
-        crate::vlog::BlobFileId,
-        &'k crate::UserKey,
-        &'k crate::UserKey,
-    )>,
+fn span_stats(
+    spans: Vec<Span<'_>>,
     cmp: &dyn crate::comparator::UserComparator,
 ) -> BlobReferenceStats {
+    let (merged, count) = merge_spans(spans, cmp);
+    let (mut open, mut depth) = (0u64, 0u64);
+    for (_, is_end) in sweep_events(&merged, cmp) {
+        if is_end {
+            open -= 1;
+        } else {
+            open += 1;
+            depth = depth.max(open);
+        }
+    }
+    BlobReferenceStats { count, depth }
+}
+
+/// Merges the overlapping spans of each file, sorted by file then first key,
+/// and counts the distinct files.
+fn merge_spans<'k>(
+    mut spans: Vec<Span<'k>>,
+    cmp: &dyn crate::comparator::UserComparator,
+) -> (Vec<Span<'k>>, u64) {
     use core::cmp::Ordering;
 
     // A span is closed at both ends. A recorded span is always ordered; one
@@ -197,15 +285,10 @@ fn span_stats<'k>(
     spans.sort_by(|a, b| a.0.cmp(&b.0).then_with(|| cmp.compare(a.1, b.1)));
 
     // Sorted by file, so each change of file is one more distinct file.
-    let mut merged: Vec<(&'k crate::UserKey, &'k crate::UserKey)> = Vec::with_capacity(spans.len());
+    let mut merged: Vec<Span<'k>> = Vec::with_capacity(spans.len());
     let mut count = 0u64;
-    let mut current: Option<(
-        crate::vlog::BlobFileId,
-        &'k crate::UserKey,
-        &'k crate::UserKey,
-    )> = None;
     for span in spans {
-        match &mut current {
+        match merged.last_mut() {
             Some((id, _, last))
                 if *id == span.0 && cmp.compare(span.1, last) != Ordering::Greater =>
             {
@@ -213,37 +296,37 @@ fn span_stats<'k>(
                     *last = span.2;
                 }
             }
-            _ => {
-                if current.is_none_or(|(id, _, _)| id != span.0) {
+            last => {
+                if last.is_none_or(|(id, _, _)| *id != span.0) {
                     count += 1;
                 }
-                if let Some((_, first, last)) = current.replace(span) {
-                    merged.push((first, last));
-                }
+                merged.push(span);
             }
         }
     }
-    if let Some((_, first, last)) = current {
-        merged.push((first, last));
-    }
+    (merged, count)
+}
 
-    // Starts before ends at an equal key: spans that meet at one key overlap.
-    let mut events: Vec<(&crate::UserKey, bool)> = Vec::with_capacity(merged.len() * 2);
-    for (first, last) in merged {
-        events.push((first, false));
-        events.push((last, true));
-    }
-    events.sort_by(|a, b| cmp.compare(a.0, b.0).then(a.1.cmp(&b.1)));
-    let (mut open, mut depth) = (0u64, 0u64);
-    for (_, is_end) in events {
-        if is_end {
-            open -= 1;
-        } else {
-            open += 1;
-            depth = depth.max(open);
-        }
-    }
-    BlobReferenceStats { count, depth }
+/// The start and end events of `merged`, as `(span index, is end)` in key
+/// order. Starts come before ends at an equal key: spans that meet at one key
+/// overlap.
+fn sweep_events(
+    merged: &[Span<'_>],
+    cmp: &dyn crate::comparator::UserComparator,
+) -> Vec<(usize, bool)> {
+    let mut events: Vec<(usize, bool)> = (0..merged.len())
+        .flat_map(|index| [(index, false), (index, true)])
+        .collect();
+    let key = |&(index, is_end): &(usize, bool)| {
+        merged
+            .get(index)
+            .map(|(_, first, last)| if is_end { *last } else { *first })
+    };
+    events.sort_by(|a, b| match (key(a), key(b)) {
+        (Some(ka), Some(kb)) => cmp.compare(ka, kb).then(a.1.cmp(&b.1)),
+        _ => a.cmp(b),
+    });
+    events
 }
 
 /// Approximate size of a key range, estimated from SST block-index offsets and

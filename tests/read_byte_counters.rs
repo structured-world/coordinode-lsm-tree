@@ -196,11 +196,19 @@ fn resolving_a_separated_value_counts_the_blob_it_read() {
 
     let m = tree.metrics();
     let before = (m.bytes_read(), m.blob_bytes_read(), m.bytes_decoded());
+    let requests_before = m.blob_read_count();
 
     for i in 0..n {
         let got = tree.get(key(i), SeqNo::MAX).expect("get").expect("present");
         assert_eq!(got.len(), value_len, "the whole value must come back");
     }
+
+    // A point read resolves its value on its own: one request per value.
+    assert_eq!(
+        m.blob_read_count() - requests_before,
+        n as usize,
+        "each cold point read of a separated value is one blob read request",
+    );
 
     let blob_read = m.blob_bytes_read() - before.1;
     let total_read = m.bytes_read() - before.0;
@@ -235,6 +243,7 @@ fn resolving_a_separated_value_counts_the_blob_it_read() {
     // Reading the same keys again is served from the blob cache, which asks
     // the filesystem for nothing — the same clause the block path is held to.
     let cached_from = m.blob_bytes_read();
+    let cached_requests = m.blob_read_count();
     for i in 0..n {
         let _ = tree.get(key(i), SeqNo::MAX).expect("get");
     }
@@ -242,6 +251,11 @@ fn resolving_a_separated_value_counts_the_blob_it_read() {
         m.blob_bytes_read(),
         cached_from,
         "a cached blob read asked the filesystem for nothing, so read must not move",
+    );
+    assert_eq!(
+        m.blob_read_count(),
+        cached_requests,
+        "a cached blob read issues no request",
     );
 }
 

@@ -75,6 +75,47 @@ fn nested_spans_stack() {
 #[test]
 fn no_spans_report_nothing() {
     assert_eq!(spans_of(&[]), BlobReferenceStats::default());
+    assert_eq!(depths_of(&[]), Vec::new());
+}
+
+/// `span_depths` over spans written as `(file, first, last)` byte strings.
+fn depths_of(spans: &[(u64, &str, &str)]) -> Vec<(u64, u64)> {
+    let keys: Vec<(u64, crate::UserKey, crate::UserKey)> = spans
+        .iter()
+        .map(|&(id, first, last)| (id, first.into(), last.into()))
+        .collect();
+    span_depths(
+        keys.iter()
+            .map(|(id, first, last)| (*id, first, last))
+            .collect(),
+        crate::comparator::default_comparator().as_ref(),
+    )
+}
+
+/// A file's depth is the deepest point inside its own spans, not the tree's:
+/// a file off to the side of a deep region keeps a depth of one, so a depth
+/// limit never selects it.
+#[test]
+fn a_file_outside_the_deep_region_keeps_its_own_depth() {
+    assert_eq!(
+        depths_of(&[(1, "a", "m"), (2, "c", "k"), (3, "e", "g"), (4, "x", "z")]),
+        vec![(1, 3), (2, 3), (3, 3), (4, 1)],
+    );
+}
+
+/// A file whose spans sit in two regions takes the deeper one, and a span
+/// that only touches a deep region at its edge key still shares its depth.
+#[test]
+fn a_file_takes_the_deepest_region_its_spans_reach() {
+    assert_eq!(
+        depths_of(&[(1, "a", "b"), (1, "p", "q"), (2, "p", "z"), (3, "q", "r")]),
+        vec![(1, 3), (2, 3), (3, 3)],
+    );
+    // Only file 2 overlaps file 1's first span, and only at its last key.
+    assert_eq!(
+        depths_of(&[(1, "a", "c"), (2, "c", "d"), (3, "e", "f")]),
+        vec![(1, 2), (2, 2), (3, 1)],
+    );
 }
 
 #[test]

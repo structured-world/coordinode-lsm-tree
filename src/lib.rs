@@ -523,7 +523,7 @@ pub use {
     cache::Cache,
     comparator::{DefaultUserComparator, SharedComparator, UserComparator},
     compression::CompressionType,
-    config::{Config, KvSeparationOptions, TreeType},
+    config::{BlobLocalityRelocation, Config, KvSeparationOptions, TreeType},
     error::{Error, FormatPart, Result},
     format_version::FormatVersion,
     iter_guard::IterGuard as Guard,
