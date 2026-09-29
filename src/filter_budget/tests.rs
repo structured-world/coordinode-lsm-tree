@@ -203,6 +203,7 @@ fn split_ranges_price_by_all_data_still_to_come() -> crate::Result<()> {
             super::Rewrite {
                 inputs: inputs.clone(),
                 split,
+                ..super::Rewrite::default()
             },
             BloomConstructionPolicy::BitsPerKey(10.0),
             None,

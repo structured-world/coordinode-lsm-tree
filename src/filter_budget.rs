@@ -74,6 +74,12 @@ impl FilterBudget {
         self.held.fetch_add(live as i64 - before as i64, Relaxed);
     }
 
+    /// Filter bytes of the published version.
+    #[cfg(test)]
+    pub(crate) fn published(&self) -> u64 {
+        self.published.load(Relaxed)
+    }
+
     /// The filter bytes the budget holds.
     pub(crate) fn held(&self) -> u64 {
         u64::try_from(self.held.load(Relaxed)).unwrap_or(0)
@@ -151,6 +157,8 @@ pub struct FilterSizing {
     /// How the rewrite is split into key ranges running side by side; `None`
     /// for one range, written in key order.
     split: Option<Split>,
+    /// The keys the rewrite writes, when only part of its inputs'.
+    span: Option<Span>,
     /// Per key range, the lower bound of the last filter priced there: the
     /// range's data from it on is still to be written. `None` before the
     /// range's first filter.
@@ -165,6 +173,53 @@ pub struct Rewrite {
     pub inputs: Vec<Table>,
     /// The key ranges a compaction runs side by side, when it is split.
     pub split: Option<Split>,
+    /// The keys it writes, when it rewrites only part of its inputs.
+    pub span: Option<Span>,
+    /// Keys it writes filters for, bounded from above, when it has no
+    /// inputs to count them from: a flush's memtable entries.
+    pub keys: u64,
+}
+
+/// The part of its inputs a rewrite writes: its keys from `lower` through
+/// `upper`, ordered by `comparator`. The inputs hold no key below `lower`
+/// still to be written, so an input ending before `upper` is rewritten
+/// whole and the ones reaching past it stay live.
+pub struct Span {
+    pub lower: Bound<crate::UserKey>,
+    pub upper: Bound<crate::UserKey>,
+    pub comparator: crate::comparator::SharedComparator,
+}
+
+impl Span {
+    /// Whether the rewrite leaves nothing of `input` behind.
+    fn covers(&self, input: &Table) -> bool {
+        let max = input.metadata.key_range.max();
+        match &self.upper {
+            Bound::Unbounded => true,
+            Bound::Excluded(upper) => {
+                self.comparator.compare(max, upper) == core::cmp::Ordering::Less
+            }
+            Bound::Included(upper) => {
+                self.comparator.compare(max, upper) != core::cmp::Ordering::Greater
+            }
+        }
+    }
+
+    fn bounds(&self) -> (Bound<&[u8]>, Bound<&[u8]>) {
+        (
+            self.lower.as_ref().map(AsRef::as_ref),
+            self.upper.as_ref().map(AsRef::as_ref),
+        )
+    }
+}
+
+impl core::fmt::Debug for Span {
+    fn fmt(&self, f: &mut core::fmt::Formatter<'_>) -> core::fmt::Result {
+        f.debug_struct("Span")
+            .field("lower", &self.lower)
+            .field("upper", &self.upper)
+            .finish_non_exhaustive()
+    }
 }
 
 /// Key ranges of one compaction that run side by side, each writing its own
@@ -200,7 +255,12 @@ pub fn plan<'a>(
     if !fallback.is_active() {
         return None;
     }
-    let Rewrite { inputs, split } = rewrite;
+    let Rewrite {
+        inputs,
+        split,
+        span,
+        keys,
+    } = rewrite;
     let ranges = split.as_ref().map_or(1, |split| split.boundaries.len() + 1);
     // A table without a filter takes no filter bytes and draws no filter
     // probes; counting its keys would price the others for filters that are
@@ -261,12 +321,38 @@ pub fn plan<'a>(
         .map(|table| u64::from(table.filter_size()))
         .sum();
     state.observe(live_bytes, budget);
+    // Only an input the rewrite leaves nothing of drops out with the install;
+    // one it rewrites part of stays live, filter and all.
     let replaced: u64 = live
         .iter()
-        .filter(|table| inputs.iter().any(|input| input.id() == table.id()))
+        .filter(|table| {
+            inputs.iter().any(|input| {
+                input.id() == table.id() && span.as_ref().is_none_or(|span| span.covers(input))
+            })
+        })
         .map(|table| u64::from(table.filter_size()))
         .sum();
-    let pending_keys: u64 = inputs.iter().map(filter_keys).sum();
+    // The inputs' keys within the span. A share that cannot be read counts
+    // the input whole: the room kept for later keys errs on the large side.
+    let pending_keys: u64 = if inputs.is_empty() {
+        keys
+    } else {
+        inputs
+            .iter()
+            .map(|input| {
+                let share = span.as_ref().map_or(1.0, |span| {
+                    crate::table::probe_stats::fraction_of(input, span.bounds()).unwrap_or(1.0)
+                });
+                #[expect(
+                    clippy::cast_possible_truncation,
+                    clippy::cast_sign_loss,
+                    reason = "a share of the input's own key count"
+                )]
+                let covered = libm::ceil(as_f64(filter_keys(input)) * share) as u64;
+                covered
+            })
+            .sum()
+    };
 
     // A partitioned level builds a table's filter as partitions of about
     // this many keys, each with its own fixed overhead; the price counts
@@ -300,6 +386,7 @@ pub fn plan<'a>(
         prior_density,
         observed: observed > 0,
         split,
+        span,
         cursors: Mutex::new(alloc::vec![None; ranges]),
         state: Arc::clone(state),
     }))
@@ -423,7 +510,10 @@ impl FilterSizing {
     /// The bounds of key range `index` of the rewrite.
     fn range(&self, index: usize) -> (Bound<&[u8]>, Bound<&[u8]>) {
         let Some(split) = &self.split else {
-            return (Bound::Unbounded, Bound::Unbounded);
+            return self
+                .span
+                .as_ref()
+                .map_or((Bound::Unbounded, Bound::Unbounded), Span::bounds);
         };
         let low = index
             .checked_sub(1)

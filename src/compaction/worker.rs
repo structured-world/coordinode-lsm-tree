@@ -1573,13 +1573,25 @@ fn run_tight_space_compaction(
                 None
             };
 
+            let span = (lower.clone(), Bound::Excluded(boundary.clone()));
+            // Planned per slice over its current views: a plan holds the views
+            // it inherits from, and a view held past its slice would block the
+            // punch of its consumed prefix. Held until the slice's install, so
+            // the filter budget keeps the room its outputs take until then.
+            let filter_sizing = super::flavour::plan_filters(
+                &version.version,
+                opts,
+                &slice_payload,
+                &[],
+                Some(span.clone()),
+            );
             let produced = run_subcompaction(
                 opts,
                 &slice_payload,
                 &version.version,
                 Vec::new(),
                 &rts,
-                (lower.clone(), Bound::Excluded(boundary.clone())),
+                span,
                 dst_lvl,
                 bottommost_gc,
                 // Slices apply no removal semantics; see the parameter docs.
@@ -1587,10 +1599,7 @@ fn run_tight_space_compaction(
                 &blobs_folder,
                 reloc,
                 &rc,
-                // Planned per slice over its current views: a plan holds the
-                // views it inherits from, and a view held past its slice
-                // would block the punch of its consumed prefix.
-                super::flavour::plan_filters(&version.version, opts, &slice_payload, &[]),
+                filter_sizing.clone(),
             )?;
             drop(version);
 
@@ -1809,6 +1818,11 @@ fn run_tight_space_compaction(
             #[cfg(test)]
             opts.config.fire_before_output_install();
 
+            // The edit drops the fully consumed inputs' filters from the
+            // published figure; the plan gives back its credit for them first.
+            if let Some(sizing) = &filter_sizing {
+                sizing.release_replaced();
+            }
             // Install one atomic, durable version edit for the slice.
             let install = opts.version_history.write().upgrade_version(
                 &opts.config.path,
@@ -1842,6 +1856,9 @@ fn run_tight_space_compaction(
                 // space is freed now instead of at the next orphan sweep.
                 return Err(rollback(e));
             }
+            // The published version counts the outputs' filters now, and the
+            // plan's views must not outlive the slice.
+            drop(filter_sizing);
 
             // Mark, then punch. The install committed, so now record each restricted
             // input's exact bound to its `.restrict-bound` sidecar — STRICTLY AFTER
@@ -1986,7 +2003,13 @@ fn run_tight_space_compaction(
             &blobs_folder,
             tail_reloc,
             &rc,
-            super::flavour::plan_filters(&version.version, opts, &slice_payload, &[]),
+            super::flavour::plan_filters(
+                &version.version,
+                opts,
+                &slice_payload,
+                &[],
+                Some((lower.clone(), Bound::Unbounded)),
+            ),
         )?;
         drop(version);
         let tail_out = produced.created_tables().len();
@@ -3076,6 +3099,7 @@ fn merge_tables(
                 opts,
                 payload,
                 &boundaries,
+                None,
             );
 
             let outputs: Vec<crate::Result<super::flavour::ProducedOutput>> =
@@ -3356,7 +3380,7 @@ fn merge_tables(
         &current_super_version.version,
         opts,
         payload,
-        super::flavour::plan_filters(&current_super_version.version, opts, payload, &[]),
+        super::flavour::plan_filters(&current_super_version.version, opts, payload, &[], None),
         true,
         transform_marker,
         true,

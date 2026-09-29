@@ -94,12 +94,17 @@ fn output_bloom_policy(
 /// filter memory by probe load. One plan serves every writer of the
 /// compaction, so its sub-compactions draw on one reservation of the budget;
 /// `boundaries` split it into the key ranges they run side by side (none for
-/// a compaction written in one key order).
+/// a compaction written in one key order); `span` names the keys it writes
+/// when it rewrites only part of its inputs, as a tight-space slice does.
 pub(super) fn plan_filters(
     version: &Version,
     opts: &Options,
     payload: &CompactionPayload,
     boundaries: &[crate::UserKey],
+    span: Option<(
+        core::ops::Bound<crate::UserKey>,
+        core::ops::Bound<crate::UserKey>,
+    )>,
 ) -> Option<alloc::sync::Arc<crate::filter_budget::FilterSizing>> {
     let advisor = opts.config.filter_advisor.as_ref()?;
     let inputs = version
@@ -111,12 +116,22 @@ pub(super) fn plan_filters(
         boundaries: boundaries.to_vec(),
         comparator: opts.config.comparator.clone(),
     });
+    let span = span.map(|(lower, upper)| crate::filter_budget::Span {
+        lower,
+        upper,
+        comparator: opts.config.comparator.clone(),
+    });
     let dst_lvl = payload.canonical_level.into();
     crate::filter_budget::plan(
         advisor,
         &opts.filter_budget,
         version.iter_tables(),
-        crate::filter_budget::Rewrite { inputs, split },
+        crate::filter_budget::Rewrite {
+            inputs,
+            split,
+            span,
+            keys: 0,
+        },
         output_bloom_policy(version, opts, payload),
         opts.config
             .filter_block_partitioning_policy

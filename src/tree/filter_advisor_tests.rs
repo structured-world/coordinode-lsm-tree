@@ -463,20 +463,29 @@ fn before_any_probe_the_filters_match_the_static_policy() -> crate::Result<()> {
 }
 
 /// The resident figure counts the filter blocks a read brought into the
-/// block cache, apart from the serialised one.
+/// block cache, apart from the serialised one: with filters left unpinned,
+/// none is resident until a probe loads one.
 #[test]
 fn resident_filter_bytes_follow_the_block_cache() -> crate::Result<()> {
+    use crate::config::PinningPolicy;
+
     let folder = tempfile::tempdir()?;
-    let tree = open(folder.path(), Some(FilterAdvisor::new(u64::MAX)))?;
+    let tree = Config::new(
+        folder.path(),
+        SequenceNumberCounter::default(),
+        SequenceNumberCounter::default(),
+    )
+    .data_block_size_policy(BlockSizePolicy::all(1_024))
+    .filter_block_pinning_policy(PinningPolicy::all(false))
+    .filter_advisor(Some(FilterAdvisor::new(u64::MAX)))
+    .open()?;
     fill(&tree, &["hot"], KEYS)?;
     let before = tree.filter_memory();
     assert!(before.serialised_bytes > 0);
+    assert_eq!(before.resident_bytes, 0, "{before:?}");
     probe_absent(&tree, "hot", 1)?;
     let after = tree.filter_memory();
     assert_eq!(after.serialised_bytes, before.serialised_bytes);
-    assert!(
-        after.resident_bytes >= before.resident_bytes && after.resident_bytes > 0,
-        "{before:?} -> {after:?}"
-    );
+    assert!(after.resident_bytes > 0, "{before:?} -> {after:?}");
     Ok(())
 }
