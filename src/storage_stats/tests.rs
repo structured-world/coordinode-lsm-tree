@@ -119,6 +119,24 @@ fn grouped_overlaps_of(
     )
 }
 
+/// Nested spans of any count give every file the full depth: the outermost
+/// span's range covers more events than the largest power of two below the
+/// event count, which the range-maximum table must still answer.
+#[test]
+fn nested_spans_give_every_file_the_full_depth() {
+    for n in 1..=12u64 {
+        let keys: Vec<(u64, String, String)> = (0..n)
+            .map(|f| (f, format!("a{f:02}"), format!("z{:02}", n - f)))
+            .collect();
+        let spans: Vec<(u64, &str, &str)> = keys
+            .iter()
+            .map(|(id, first, last)| (*id, first.as_str(), last.as_str()))
+            .collect();
+        let want: Vec<(u64, u64)> = (0..n).map(|f| (f, n)).collect();
+        assert_eq!(depths_of(&spans), want, "{n} nested spans");
+    }
+}
+
 /// Files only merge within their group: overlapping files of different
 /// groups do not count as overlapping, those of one group do.
 #[test]

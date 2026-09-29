@@ -240,8 +240,10 @@ impl RangeMax {
     fn new(values: Vec<u64>) -> Self {
         let mut levels = alloc::vec![values];
         let mut width = 1;
+        // Level `k` holds `n - 2^k + 1` maxima, so level `k + 1` exists while
+        // `n >= 2^(k + 1)`: while the current level is longer than its width.
         while let Some(previous) = levels.last()
-            && 2 * width <= previous.len()
+            && previous.len() > width
         {
             let next: Vec<u64> = previous
                 .iter()
