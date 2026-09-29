@@ -709,7 +709,10 @@ impl TreeIter {
             // ephemeral memtable RTs use their own index_seqno instead of the
             // outer scan seqno (see issue #33).
             let mut all_range_tombstones: Vec<(RangeTombstone, SeqNo)> = Vec::new();
-            let mut single_tables = Vec::new();
+            // The tables of each run the range reaches, whose filters are
+            // asked once the tombstones are known: a table a newer tombstone
+            // wholly covers is not read, so its filter is not asked either.
+            let mut candidates: Vec<Vec<crate::table::Table>> = Vec::new();
             let mut multi_runs = Vec::new();
 
             for run in lock
@@ -749,10 +752,7 @@ impl TreeIter {
                             ),
                             lock.comparator.as_ref(),
                         ) {
-                            let answer = filter_answer(lock, table);
-                            if answer != FilterAnswer::Absent {
-                                single_tables.push((table.clone(), answer));
-                            }
+                            candidates.push(alloc::vec![table.clone()]);
                         }
                     }
                     _ => {
@@ -785,67 +785,19 @@ impl TreeIter {
                                 user_range.1.as_ref().map(core::convert::AsRef::as_ref),
                             );
 
-                            let mut surviving: Vec<(crate::table::Table, FilterAnswer)> = run
-                                .iter()
-                                // Cheap key-range metadata check first to avoid
-                                // bloom filter I/O for non-overlapping tables.
-                                .filter(|table| {
-                                    table.check_key_range_overlap_cmp(
-                                        &bounds,
-                                        lock.comparator.as_ref(),
-                                    )
-                                })
-                                .filter_map(|table| {
-                                    let answer = filter_answer(lock, table);
-                                    (answer != FilterAnswer::Absent)
-                                        .then(|| (table.clone(), answer))
-                                })
-                                .collect();
-
-                            match surviving.len() {
-                                0 => {
-                                    // All tables in this run were filtered out.
-                                }
-                                1 => {
-                                    // Demote to single-table path so it also
-                                    // benefits from the range-tombstone table-skip
-                                    // optimization below.
-                                    if let Some(entry) = surviving.pop() {
-                                        single_tables.push(entry);
-                                    }
-                                }
-                                _ => {
-                                    // Tables of a run are disjoint and in key
-                                    // order, and a table's first key is a data
-                                    // key; only its last may be a range
-                                    // tombstone's end a compaction widened it
-                                    // to. So a read range reaching two or more
-                                    // holds keys of every one but perhaps the
-                                    // first, which is read on its own to count
-                                    // a pass that finds nothing; the others'
-                                    // passes are no false positives.
-                                    let first = surviving.remove(0);
-                                    single_tables.push(first);
-                                    if let [_] = surviving[..] {
-                                        if let Some(entry) = surviving.pop() {
-                                            single_tables.push(entry);
-                                        }
-                                    } else {
-                                        let rest =
-                                            surviving.into_iter().map(|(table, _)| table).collect();
-                                        // Two or more tables are left, so
-                                        // Run::new cannot return None (only
-                                        // empty vecs yield None).
-                                        #[expect(
-                                            clippy::expect_used,
-                                            reason = "Run::new returns None only for empty vecs"
-                                        )]
-                                        let new_run =
-                                            Run::new(rest).expect("non-empty surviving tables");
-                                        multi_runs.push(Arc::new(new_run));
-                                    }
-                                }
-                            }
+                            // Cheap key-range metadata check first; the
+                            // filters are asked below.
+                            candidates.push(
+                                run.iter()
+                                    .filter(|table| {
+                                        table.check_key_range_overlap_cmp(
+                                            &bounds,
+                                            lock.comparator.as_ref(),
+                                        )
+                                    })
+                                    .cloned()
+                                    .collect(),
+                            );
                         } else {
                             multi_runs.push(run.clone());
                         }
@@ -862,42 +814,73 @@ impl TreeIter {
             all_range_tombstones
                 .sort_unstable_by(|(a, _), (b, _)| lock.comparator.compare(&a.start, &b.start));
 
-            for (table, answer) in single_tables {
-                // Table-skip: if a range tombstone fully covers this table
-                // with a higher seqno, skip it entirely (avoid I/O).
-                //
-                // Uses get_highest_kv_seqno() which excludes RT seqnos, so a
-                // covering RT stored in the same table can now trigger skip.
-                //
-                // Binary search on sorted RT list: partition_point finds the
-                // first RT with start > table_min; only the prefix [0..idx]
-                // can have start <= table_min (required for fully_covers).
-                // key_range.max() is inclusive; fully_covers checks max < rt.end
-                // (half-open), so this is correct for inclusive upper bounds.
+            // Table-skip: a table a range tombstone fully covers with a higher
+            // seqno holds nothing visible, so it is not read (no I/O), and its
+            // filter is not asked.
+            //
+            // Uses get_highest_kv_seqno() which excludes RT seqnos, so a
+            // covering RT stored in the same table can trigger the skip.
+            //
+            // Binary search on sorted RT list: partition_point finds the first
+            // RT with start > table_min; only the prefix [0..idx] can have
+            // start <= table_min (required for fully_covers). key_range.max()
+            // is inclusive; fully_covers checks max < rt.end (half-open), so
+            // this is correct for inclusive upper bounds.
+            let is_covered = |table: &crate::table::Table| {
                 let table_min: &[u8] = table.metadata.key_range.min().as_ref();
                 let table_max: &[u8] = table.metadata.key_range.max().as_ref();
                 let table_kv_seqno = table.get_highest_kv_seqno();
-
                 let candidate_end = all_range_tombstones.partition_point(|(rt, _)| {
                     lock.comparator.compare(&rt.start, table_min) != core::cmp::Ordering::Greater
                 });
+                all_range_tombstones
+                    .iter()
+                    .take(candidate_end)
+                    .any(|(rt, cutoff)| {
+                        rt.visible_at(*cutoff)
+                            && rt.fully_covers_with(table_min, table_max, lock.comparator.as_ref())
+                            && rt.seqno > table_kv_seqno
+                    })
+            };
 
-                let is_covered =
-                    all_range_tombstones
-                        .iter()
-                        .take(candidate_end)
-                        .any(|(rt, cutoff)| {
-                            rt.visible_at(*cutoff)
-                                && rt.fully_covers_with(
-                                    table_min,
-                                    table_max,
-                                    lock.comparator.as_ref(),
-                                )
-                                && rt.seqno > table_kv_seqno
-                        });
-
-                if !is_covered {
-                    iters.push(table_reader(answer, table, user_range.clone(), seqno));
+            for run in candidates {
+                let mut surviving: Vec<(crate::table::Table, FilterAnswer)> = run
+                    .into_iter()
+                    .filter(|table| !is_covered(table))
+                    .filter_map(|table| {
+                        let answer = filter_answer(lock, &table);
+                        (answer != FilterAnswer::Absent).then_some((table, answer))
+                    })
+                    .collect();
+                if surviving.is_empty() {
+                    continue;
+                }
+                // Tables of a run are disjoint and in key order, and a table's
+                // first key is a data key; only its last may be a range
+                // tombstone's end a compaction widened it to. So a read range
+                // reaching two or more holds keys of every one but perhaps the
+                // first, which is read on its own to count a pass that finds
+                // nothing; the others' passes are no false positives.
+                let (first, answer) = surviving.remove(0);
+                iters.push(table_reader(answer, first, user_range.clone(), seqno));
+                match surviving.len() {
+                    0 => {}
+                    1 => {
+                        if let Some((table, answer)) = surviving.pop() {
+                            iters.push(table_reader(answer, table, user_range.clone(), seqno));
+                        }
+                    }
+                    _ => {
+                        let rest = surviving.into_iter().map(|(table, _)| table).collect();
+                        // Two or more tables are left, so Run::new cannot
+                        // return None (only empty vecs yield None).
+                        #[expect(
+                            clippy::expect_used,
+                            reason = "Run::new returns None only for empty vecs"
+                        )]
+                        let new_run = Run::new(rest).expect("non-empty surviving tables");
+                        multi_runs.push(Arc::new(new_run));
+                    }
                 }
             }
 

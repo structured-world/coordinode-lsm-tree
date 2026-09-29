@@ -36,7 +36,7 @@ pub struct FullFilterWriter {
 
     /// Chooses the width at `finish` when the tree allocates filter memory
     /// by probe load; `bloom_policy` decides otherwise.
-    sizing: Option<Arc<crate::filter_budget::FilterSizing>>,
+    sizing: Option<crate::filter_budget::FilterPlan>,
 
     /// The table's key range, which a sized filter draws its load over.
     key_range: Option<(UserKey, UserKey)>,
@@ -123,7 +123,7 @@ impl<W: crate::io::Write + crate::io::Seek> FilterWriter<W> for FullFilterWriter
 
     fn use_sizing(
         mut self: Box<Self>,
-        sizing: Option<Arc<crate::filter_budget::FilterSizing>>,
+        sizing: Option<crate::filter_budget::FilterPlan>,
     ) -> Box<dyn FilterWriter<W>> {
         self.sizing = sizing;
         self

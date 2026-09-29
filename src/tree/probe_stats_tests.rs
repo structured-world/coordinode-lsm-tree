@@ -562,6 +562,60 @@ fn a_restricted_view_keeps_the_trees_read_budget() -> crate::Result<()> {
     Ok(())
 }
 
+/// An input without a filter answers no probe, so its empty counts say
+/// nothing of the lookups over its keys: the output takes the newer filtered
+/// input's there, though the filterless one is older.
+#[test]
+fn a_filterless_input_leaves_the_counts_to_a_filtered_one() -> crate::Result<()> {
+    use crate::table::probe_stats::{ProbeCounts, inherited_counts};
+
+    let folder = tempfile::tempdir()?;
+    // Filters on level 0 only: the compacted table below builds none.
+    let any = Config::new(
+        folder.path(),
+        SequenceNumberCounter::default(),
+        SequenceNumberCounter::default(),
+    )
+    .filter_policy(FilterPolicy::new([
+        FilterPolicyEntry::Bloom(BloomConstructionPolicy::BitsPerKey(10.0)),
+        FilterPolicyEntry::None,
+    ]))
+    .filter_advisor(Some(FilterAdvisor::new(u64::MAX)))
+    .open()?;
+    for i in 0..KEYS {
+        any.insert(key(i), "value", u64::from(i));
+    }
+    any.flush_active_memtable(0)?;
+    any.major_compact(u64::MAX, 0)?;
+    for i in 0..KEYS {
+        any.insert(key(i), "newer", u64::from(KEYS + i));
+    }
+    any.flush_active_memtable(0)?;
+    let version = any.current_version();
+    let (filtered, filterless): (Vec<Table>, Vec<Table>) = version
+        .iter_tables()
+        .cloned()
+        .partition(|table| table.filter_size() > 0);
+    let ([newer], [older]) = (filtered.as_slice(), filterless.as_slice()) else {
+        panic!("one table with a filter and one without");
+    };
+    let Some(stats) = newer.probe_stats() else {
+        panic!("the table counts its probes");
+    };
+    stats.add(ProbeCounts {
+        probes: 1_000,
+        negatives: 1_000,
+    });
+
+    let inherited = inherited_counts(
+        key(0).as_bytes(),
+        key(KEYS - 1).as_bytes(),
+        &[older.clone(), newer.clone()],
+    )?;
+    assert_eq!(inherited.negatives, 1_000);
+    Ok(())
+}
+
 /// A range outside an input's keys inherits nothing from it.
 #[test]
 fn an_output_outside_an_input_inherits_nothing_from_it() -> crate::Result<()> {

@@ -77,7 +77,7 @@ pub struct PartitionedFilterWriter {
     /// Chooses each partition's width when the tree allocates filter memory
     /// by probe load; `bloom_policy` decides otherwise, and always decides
     /// where a partition splits.
-    sizing: Option<Arc<crate::filter_budget::FilterSizing>>,
+    sizing: Option<crate::filter_budget::FilterPlan>,
 
     /// The table's first key, the lower end of the first partition's range.
     /// Kept only for a sized filter.
@@ -164,7 +164,10 @@ impl PartitionedFilterWriter {
     fn partition_settings(&self) -> PartitionSettings {
         PartitionSettings {
             bloom_policy: self.bloom_policy,
-            sizing: self.sizing.clone(),
+            sizing: self
+                .sizing
+                .as_ref()
+                .map(crate::filter_budget::FilterPlan::sizing),
             table_id: self.table_id,
             encryption: self.encryption.clone(),
             ecc: self.ecc,
@@ -377,7 +380,9 @@ impl PartitionedFilterWriter {
 /// What every partition of one table is built and framed under.
 struct PartitionSettings {
     bloom_policy: BloomConstructionPolicy,
-    /// The filter budget plan a sized partition picks its width by.
+    /// The filter budget plan a sized partition picks its width by. Not a
+    /// [`crate::filter_budget::FilterPlan`]: a pool thread may let go of it
+    /// after the rewrite has ended, which must not delay the end.
     sizing: Option<Arc<crate::filter_budget::FilterSizing>>,
     table_id: crate::TableId,
     encryption: Option<Arc<dyn EncryptionProvider>>,
@@ -587,7 +592,7 @@ impl<W: crate::io::Write + crate::io::Seek> FilterWriter<W> for PartitionedFilte
 
     fn use_sizing(
         mut self: Box<Self>,
-        sizing: Option<Arc<crate::filter_budget::FilterSizing>>,
+        sizing: Option<crate::filter_budget::FilterPlan>,
     ) -> Box<dyn FilterWriter<W>> {
         self.sizing = sizing;
         self

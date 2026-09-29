@@ -987,6 +987,57 @@ fn concurrent_plans_reserve_room_for_each_others_later_filters() {
     );
 }
 
+/// A rewrite settles with the budget when its last plan handle goes, even
+/// while a pool thread still holds the sizing it built a partition with: the
+/// budget otherwise counts the rewrite's filters on top of the published
+/// version's until that thread lets go. A filter that thread admits after
+/// the end is never installed and takes nothing.
+#[test]
+fn a_rewrite_ends_with_its_plan_not_with_the_last_reference() {
+    use alloc::sync::Arc;
+    use core::ops::Bound::Unbounded;
+
+    const KEYS: usize = 4_000;
+    let framing = super::Framing::default();
+    let frame = |len: u64| framing.frame(len);
+    let narrow = estimate(KEYS, 6);
+    let advisor = crate::config::FilterAdvisor::new(u64::MAX).with_bits_per_key([6u8].to_vec());
+    let state = Arc::new(super::FilterBudget::default());
+    let plan = super::plan(
+        &advisor,
+        &state,
+        &[],
+        super::Rewrite {
+            keys: 2 * KEYS as u64,
+            ..super::Rewrite::default()
+        },
+        BloomConstructionPolicy::BitsPerKey(6.0),
+        None,
+    )
+    .unwrap_or_else(|| panic!("the advisor plans the filters"));
+    let owner = plan.clone();
+    let worker = plan.sizing();
+    assert!(worker.admit(Unbounded, KEYS, frame(narrow), narrow, &frame, true));
+    assert_eq!(state.held(), frame(narrow));
+
+    drop(plan);
+    assert_eq!(state.held(), frame(narrow), "one owner is still writing");
+    drop(owner);
+    assert_eq!(state.held(), 0, "the rewrite ended with its last owner");
+    assert_eq!(
+        state.reserved.load(core::sync::atomic::Ordering::Relaxed),
+        0
+    );
+
+    assert!(worker.admit(Unbounded, KEYS, frame(narrow), narrow, &frame, true));
+    drop(worker);
+    assert_eq!(
+        state.held(),
+        0,
+        "a filter admitted after the end holds nothing"
+    );
+}
+
 /// The over-budget state is logged once on entering it and once on leaving.
 #[test]
 fn the_over_budget_state_is_logged_on_entering_and_leaving() {

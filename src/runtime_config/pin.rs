@@ -27,7 +27,7 @@ use alloc::sync::Arc;
 #[must_use = "dropping the pin before the files are installed lets a collection take their dictionary"]
 pub struct WritePin {
     snapshot: Option<Arc<RuntimeConfig>>,
-    filter_sizing: Option<Arc<crate::filter_budget::FilterSizing>>,
+    filter_sizing: Option<crate::filter_budget::FilterPlan>,
 }
 
 impl WritePin {
@@ -55,7 +55,7 @@ impl WritePin {
     /// Also holds the filter budget `sizing` reserved until the install.
     pub(crate) fn with_filter_sizing(
         mut self,
-        sizing: Option<Arc<crate::filter_budget::FilterSizing>>,
+        sizing: Option<crate::filter_budget::FilterPlan>,
     ) -> Self {
         self.filter_sizing = sizing;
         self

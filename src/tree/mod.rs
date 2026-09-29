@@ -1868,7 +1868,7 @@ impl Tree {
         bloom_policy: crate::table::filter::BloomConstructionPolicy,
         keys: u64,
         ecc_scheme: crate::runtime_config::EccScheme,
-    ) -> Option<alloc::sync::Arc<crate::filter_budget::FilterSizing>> {
+    ) -> Option<crate::filter_budget::FilterPlan> {
         let advisor = self.config.filter_advisor.as_ref()?;
         let version = self.current_version();
         crate::filter_budget::plan(

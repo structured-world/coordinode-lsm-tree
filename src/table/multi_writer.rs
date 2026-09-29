@@ -80,7 +80,7 @@ pub struct MultiWriter {
     bloom_policy: BloomConstructionPolicy,
 
     /// Sizes every output's filters against the tree's filter budget.
-    filter_sizing: Option<Arc<crate::filter_budget::FilterSizing>>,
+    filter_sizing: Option<crate::filter_budget::FilterPlan>,
 
     current_key: Option<UserKey>,
     comparator: crate::SharedComparator,
@@ -714,7 +714,7 @@ impl MultiWriter {
     #[must_use]
     pub(crate) fn use_filter_sizing(
         mut self,
-        sizing: Option<Arc<crate::filter_budget::FilterSizing>>,
+        sizing: Option<crate::filter_budget::FilterPlan>,
     ) -> Self {
         self.filter_sizing.clone_from(&sizing);
         self.writer = self.writer.use_filter_sizing(sizing);
@@ -723,7 +723,7 @@ impl MultiWriter {
 
     /// The filter plan this writer sizes its outputs by, for its operation to
     /// hold until the outputs are installed.
-    pub(crate) fn filter_sizing(&self) -> Option<Arc<crate::filter_budget::FilterSizing>> {
+    pub(crate) fn filter_sizing(&self) -> Option<crate::filter_budget::FilterPlan> {
         self.filter_sizing.clone()
     }
 

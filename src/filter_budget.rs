@@ -22,7 +22,7 @@ use crate::table::Table;
 use alloc::sync::Arc;
 use alloc::vec::Vec;
 use core::ops::Bound;
-use core::sync::atomic::{AtomicBool, Ordering::Relaxed};
+use core::sync::atomic::{AtomicBool, AtomicUsize, Ordering::Relaxed};
 // no-std: spin mirrors parking_lot's Mutex API without an allocator.
 // parking_lot wins on the std path, so keep it for std.
 #[cfg(feature = "std")]
@@ -205,7 +205,61 @@ pub struct FilterSizing {
     framing: Framing,
     /// Per key range, where its data still to be written starts.
     cursors: Mutex<Vec<RangeCursor>>,
+    /// Live [`FilterPlan`] handles: the writers and installs of the rewrite.
+    owners: AtomicUsize,
+    /// Set, under the admission lock, when the last [`FilterPlan`] goes: the
+    /// rewrite has settled with the budget and takes no filter into it.
+    ended: AtomicBool,
     state: Arc<FilterBudget>,
+}
+
+/// The filter plan of one flush or compaction, held by what writes and
+/// installs its output. The last handle to go ends the rewrite with the
+/// budget: its reservation, its own filters and the credit for the ones it
+/// replaces all settle then.
+///
+/// The rewrite ends with its owners, not with the last reference to its
+/// [`FilterSizing`]: a pool thread that built a filter partition may let go
+/// of its reference only after the rewrite has returned, and the budget
+/// would hold the rewrite's filters twice until then.
+#[derive(Debug)]
+pub struct FilterPlan(Arc<FilterSizing>);
+
+impl FilterPlan {
+    fn new(sizing: Arc<FilterSizing>) -> Self {
+        sizing.owners.fetch_add(1, Relaxed);
+        Self(sizing)
+    }
+
+    /// The sizing alone, for work that outlives none of the plan's owners
+    /// yet may let go of it after them: a partition built on a pool thread.
+    pub fn sizing(&self) -> Arc<FilterSizing> {
+        Arc::clone(&self.0)
+    }
+}
+
+impl Clone for FilterPlan {
+    fn clone(&self) -> Self {
+        Self::new(Arc::clone(&self.0))
+    }
+}
+
+impl core::ops::Deref for FilterPlan {
+    type Target = FilterSizing;
+
+    fn deref(&self) -> &FilterSizing {
+        &self.0
+    }
+}
+
+impl Drop for FilterPlan {
+    fn drop(&mut self) {
+        // The count only falls from here, so exactly one handle sees it reach
+        // zero; `end` orders itself against the admissions by its lock.
+        if self.0.owners.fetch_sub(1, Relaxed) == 1 {
+            self.0.end();
+        }
+    }
 }
 
 /// What a flush or compaction rewrites, for its filter plan.
@@ -449,7 +503,7 @@ pub fn plan(
     rewrite: Rewrite,
     fallback: BloomConstructionPolicy,
     partition_bytes: Option<u32>,
-) -> Option<Arc<FilterSizing>> {
+) -> Option<FilterPlan> {
     if !fallback.is_active() {
         return None;
     }
@@ -559,7 +613,7 @@ pub fn plan(
     let partition_keys = partition_bytes.map(|bytes| partition_keys(fallback, bytes));
     let price = price(&loads, &widths, budget, &|len| framing.frame(len));
 
-    let sizing = Arc::new(FilterSizing {
+    let sizing = FilterPlan::new(Arc::new(FilterSizing {
         price,
         widths,
         fallback,
@@ -585,8 +639,10 @@ pub fn plan(
         key_order: comparator.map(KeyOrder),
         framing,
         cursors: Mutex::new(alloc::vec![RangeCursor::default(); ranges]),
+        owners: AtomicUsize::new(0),
+        ended: AtomicBool::new(false),
         state: Arc::clone(state),
-    });
+    }));
     // The replaced filters leave with the install; the room they free is this
     // rewrite's to build into, and no other rewrite's. It is exchanged, in one
     // step no admission sees half of, for the room every filter this rewrite
@@ -890,6 +946,11 @@ impl FilterSizing {
         // admitted side by side (a table's partitions) each see the others'
         // keys gone once taken.
         let admission = self.state.admission.lock();
+        // A rewrite that has ended installs nothing more: a filter a pool
+        // thread finishes after that is dropped unwritten and holds nothing.
+        if self.ended.load(Relaxed) {
+            return true;
+        }
         let per_filter = self.typical_keys.load(Relaxed).max(n);
         // The pending count bounds the rewrite's keys from above: a filter
         // over more keys than it holds leaves none pending.
@@ -911,6 +972,8 @@ impl FilterSizing {
             reason = "filter byte counts far below 2^63"
         )]
         self.state.held.fetch_add(bytes as i64, Relaxed);
+        // With the held bytes, so the end of the rewrite gives back all it took.
+        self.spent.fetch_add(bytes, Relaxed);
         self.set_reservation(mine, floor);
         self.pending_keys.store(later, Relaxed);
         self.admitted_keys.fetch_add(n, Relaxed);
@@ -918,7 +981,6 @@ impl FilterSizing {
         drop(admission);
 
         self.leave(lower);
-        self.spent.fetch_add(bytes, Relaxed);
         // The room kept for later filters is a reserve, not a limit. Whether
         // the tree is over its budget follows the filters its versions
         // publish, not the ones a rewrite is building, which it may never
@@ -1131,17 +1193,18 @@ impl FilterSizing {
     }
 }
 
-/// The rewrite has ended. Its own filters leave the held bytes: installed,
-/// the published version counts them; not installed, they are gone. The
-/// credit for what it replaces goes back the same way, if its install did not
-/// already take it.
-impl Drop for FilterSizing {
-    fn drop(&mut self) {
-        {
-            // Its later filters are written or will never be.
-            let _admission = self.state.admission.lock();
-            self.set_reservation(self.reservation.load(Relaxed), 0);
+impl FilterSizing {
+    /// The rewrite has ended. Its own filters leave the held bytes: installed,
+    /// the published version counts them; not installed, they are gone. The
+    /// credit for what it replaces goes back the same way, if its install did
+    /// not already take it.
+    fn end(&self) {
+        let _admission = self.state.admission.lock();
+        if self.ended.swap(true, Relaxed) {
+            return;
         }
+        // Its later filters are written or will never be.
+        self.set_reservation(self.reservation.load(Relaxed), 0);
         self.release_replaced();
         #[expect(
             clippy::cast_possible_wrap,

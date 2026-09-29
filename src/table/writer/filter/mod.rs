@@ -112,7 +112,7 @@ pub trait FilterWriter<W: crate::io::Write + crate::io::Seek> {
     /// builds at the policy.
     fn use_sizing(
         self: Box<Self>,
-        sizing: Option<Arc<crate::filter_budget::FilterSizing>>,
+        sizing: Option<crate::filter_budget::FilterPlan>,
     ) -> Box<dyn FilterWriter<W>>;
 
     /// The table's first and last key, given before [`finish`](Self::finish)

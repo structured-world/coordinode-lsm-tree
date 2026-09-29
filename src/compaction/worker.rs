@@ -2096,7 +2096,7 @@ fn run_subcompaction(
     rc: &Arc<crate::runtime_config::RuntimeConfig>,
     // The compaction's filter plan, shared by all of its sub-compactions (or
     // slices) so they draw on one reservation of the filter budget.
-    filter_sizing: Option<Arc<crate::filter_budget::FilterSizing>>,
+    filter_sizing: Option<crate::filter_budget::FilterPlan>,
 ) -> crate::Result<super::flavour::ProducedOutput> {
     use super::flavour::CompactionFlavour;
 

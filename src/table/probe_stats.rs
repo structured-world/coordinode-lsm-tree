@@ -94,7 +94,8 @@ impl core::ops::AddAssign for ProbeCounts {
 /// of the first and that slice of the second.
 ///
 /// Where inputs overlap, the same lookups probed each of them, so each part
-/// of the range takes one input's counts: the oldest one holding data there.
+/// of the range takes one input's counts: the oldest one holding data there
+/// and a filter to count them with.
 /// A point read goes from the newest table to the oldest and stops at the
 /// key, so the lookups reaching the oldest input are those every newer one
 /// let past, and its negatives are the keys none of them holds, the ones the
@@ -146,7 +147,11 @@ pub fn inherited_counts(
             None => Included(last),
         };
         for input in &by_age {
-            if !input.check_key_range_overlap_cmp(&(lower, upper), comparator.as_ref()) {
+            // An input without a filter answers no probe, so its counts say
+            // nothing of the lookups over its keys.
+            if !input.has_filter()
+                || !input.check_key_range_overlap_cmp(&(lower, upper), comparator.as_ref())
+            {
                 continue;
             }
             if let Some(share) = region_share(input, (lower, upper))? {

@@ -108,7 +108,7 @@ pub(super) fn plan_filters(
     // The compaction's runtime-config snapshot, whose ECC scheme frames the
     // filter blocks its writers write.
     rc: &crate::runtime_config::RuntimeConfig,
-) -> Option<alloc::sync::Arc<crate::filter_budget::FilterSizing>> {
+) -> Option<crate::filter_budget::FilterPlan> {
     let advisor = opts.config.filter_advisor.as_ref()?;
     let inputs = version
         .iter_tables()
@@ -160,7 +160,7 @@ pub(super) fn prepare_table_writer(
     payload: &CompactionPayload,
     // The compaction's filter plan (see `plan_filters`), shared by all of its
     // writers; `None` builds every filter at the level's policy.
-    filter_sizing: Option<alloc::sync::Arc<crate::filter_budget::FilterSizing>>,
+    filter_sizing: Option<crate::filter_budget::FilterPlan>,
     // When false, the writer compresses blocks serially. Used by parallel
     // sub-compactions, which already run on the compaction pool: with N ranges
     // occupying the pool's N workers, submitting block jobs there mostly
@@ -398,7 +398,7 @@ pub(super) struct ProducedOutput {
     /// The filter plan the output was sized by, held until the output is
     /// installed or dropped: the budget keeps the room its filters take until
     /// then (see [`crate::filter_budget::FilterSizing::release_replaced`]).
-    filter_sizing: Option<alloc::sync::Arc<crate::filter_budget::FilterSizing>>,
+    filter_sizing: Option<crate::filter_budget::FilterPlan>,
 }
 
 #[cfg_attr(

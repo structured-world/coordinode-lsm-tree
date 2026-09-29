@@ -1352,6 +1352,46 @@ fn a_prefix_reaching_a_table_by_a_range_tombstone_counts_its_miss() -> crate::Re
     Ok(())
 }
 
+/// A table a newer range tombstone wholly covers holds nothing a scan can
+/// see, so the scan does not read it and does not ask its filter: no probe
+/// is counted, whatever the filter would answer.
+#[test]
+fn a_table_a_tombstone_covers_is_not_probed() -> crate::Result<()> {
+    use alloc::sync::Arc;
+
+    let folder = tempfile::tempdir()?;
+    let tree = Config::new(
+        folder.path(),
+        SequenceNumberCounter::default(),
+        SequenceNumberCounter::default(),
+    )
+    .prefix_extractor(Arc::new(UpToColon))
+    .filter_advisor(Some(FilterAdvisor::new(u64::MAX)))
+    .open()?;
+    for i in 0..100u32 {
+        tree.insert(format!("p:{i:04}"), "value", u64::from(i));
+    }
+    tree.flush_active_memtable(0)?;
+    let covered = tables(&tree);
+    let [covered] = covered.as_slice() else {
+        panic!("one table");
+    };
+    // A newer table holding a tombstone over every key of the first.
+    tree.insert("z", "value", 100);
+    tree.remove_range("p:", "p;", 101);
+    tree.flush_active_memtable(0)?;
+
+    let counts = |table: &Table| {
+        table
+            .probe_stats()
+            .map_or((0, 0), |stats| (stats.probes(), stats.negatives()))
+    };
+    let before = counts(covered);
+    assert_eq!(tree.prefix("p:", SeqNo::MAX, None).count(), 0);
+    assert_eq!(counts(covered), before, "(probes, negatives)");
+    Ok(())
+}
+
 /// A table without a filter answers no key check: a merge read over it counts
 /// no probe of it, and no miss either.
 #[test]

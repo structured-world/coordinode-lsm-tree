@@ -380,7 +380,7 @@ pub struct Writer {
     bloom_policy: BloomConstructionPolicy,
 
     /// Stored so `use_partitioned_filter()` can re-apply it to the new writer
-    filter_sizing: Option<Arc<crate::filter_budget::FilterSizing>>,
+    filter_sizing: Option<crate::filter_budget::FilterPlan>,
 
     /// Stored so `use_partitioned_filter()` can re-apply it to the new writer
     prefix_extractor: Option<Arc<dyn PrefixExtractor>>,
@@ -2057,7 +2057,7 @@ impl Writer {
     #[must_use]
     pub(crate) fn use_filter_sizing(
         mut self,
-        sizing: Option<Arc<crate::filter_budget::FilterSizing>>,
+        sizing: Option<crate::filter_budget::FilterPlan>,
     ) -> Self {
         self.filter_sizing.clone_from(&sizing);
         self.filter_writer = self.filter_writer.use_sizing(sizing);
