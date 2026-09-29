@@ -160,6 +160,9 @@ pub struct FilterSizing {
     /// width over them, so a filter chosen early cannot crowd out the later
     /// ones. Zero for a flush.
     pending_keys: AtomicU64,
+    /// Keys the filters this rewrite has built hold, which a count of all its
+    /// keys learnt after the plan (see [`Self::expect_keys`]) is short of.
+    admitted_keys: AtomicU64,
     /// The most keys a filter of this rewrite has held: the later filters are
     /// taken to be that large, not the size of the last partition of a table.
     typical_keys: AtomicU64,
@@ -564,6 +567,7 @@ pub fn plan(
         spent_estimate: AtomicU64::new(0.0f64.to_bits()),
         partition_keys,
         pending_keys: AtomicU64::new(pending_keys),
+        admitted_keys: AtomicU64::new(0),
         typical_keys: AtomicU64::new(0),
         table_keys: AtomicU64::new(0),
         inputs,
@@ -969,6 +973,7 @@ impl FilterSizing {
                         self.state.log_entering(used + bytes, self.budget);
                     }
                     self.take_pending(n);
+                    self.admitted_keys.fetch_add(n, Relaxed);
                     self.typical_keys.fetch_max(n, Relaxed);
                     let mut spent = self.spent_estimate.load(Relaxed);
                     while let Err(actual) = self.spent_estimate.compare_exchange_weak(
@@ -1004,6 +1009,16 @@ impl FilterSizing {
     pub fn table_finished(&self, keys: usize) {
         self.table_keys
             .fetch_max(u64::try_from(keys).unwrap_or(u64::MAX), Relaxed);
+    }
+
+    /// Sets the keys this rewrite writes filters for in all, an upper bound,
+    /// for a writer that learns the count only after the plan (an ingestion
+    /// its caller tells): the ones no filter holds yet count as still to come.
+    pub fn expect_keys(&self, keys: u64) {
+        let admitted = self.admitted_keys.load(Relaxed);
+        // Fewer keys than the filters already hold leaves none to come.
+        self.pending_keys
+            .store(keys.saturating_sub(admitted), Relaxed);
     }
 
     /// Counts `n` keys as sized.

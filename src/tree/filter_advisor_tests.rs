@@ -483,6 +483,48 @@ fn a_flush_into_several_tables_keeps_room_for_the_later_ones() -> crate::Result<
     Ok(())
 }
 
+/// An ingestion told how many entries it writes keeps room for its later
+/// tables' filters as a flush does: across several tables, every filter fits
+/// the budget that fits them all at the narrowest width.
+#[test]
+fn an_ingestion_told_its_entries_keeps_room_for_the_later_tables() -> crate::Result<()> {
+    // As in the flush above: incompressible values rotate the ingestion into
+    // a second table at 64 MiB over few keys.
+    const KEYS: usize = 6_000;
+    const VALUE: usize = 16 * 1_024;
+    let folder = tempfile::tempdir()?;
+    let narrowest = BloomConstructionPolicy::BitsPerKey(6.0).filter_size_bound(KEYS) as u64;
+    let budget = narrowest * 5 / 4;
+    let tree = open(
+        folder.path(),
+        Some(FilterAdvisor::new(budget).with_bits_per_key([6u8, 10].to_vec())),
+    )?;
+    let mut ingestion = tree.ingestion()?.expected_entries(KEYS as u64);
+    let mut state: u64 = 0x9E37_79B9_7F4A_7C15;
+    let mut value = vec![0u8; VALUE];
+    for i in 0..KEYS {
+        for byte in &mut value {
+            // xorshift: incompressible bytes.
+            state ^= state << 13;
+            state ^= state >> 7;
+            state ^= state << 17;
+            *byte = state.to_le_bytes()[0];
+        }
+        ingestion.write(format!("key{i:06}"), value.as_slice())?;
+    }
+    ingestion.finish()?;
+
+    let tables = tables(&tree);
+    assert!(tables.len() >= 2, "{} tables", tables.len());
+    let memory = tree.filter_memory();
+    let sizes: Vec<(u64, u32)> = tables
+        .iter()
+        .map(|table| (table.metadata.item_count, table.filter_size()))
+        .collect();
+    assert!(!memory.over_budget, "{memory:?} {sizes:?}");
+    Ok(())
+}
+
 /// A read whose newest version is a merge operand resolves it over every
 /// older table, asking each one's filter again; those answers count as the
 /// point read's do. The older table here holds none of the keys read, so

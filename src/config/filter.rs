@@ -28,7 +28,9 @@ pub enum FilterPolicyEntry {
 /// width is chosen only when the table is written anyway, so the budget is a
 /// target each flush and compaction allocates against, not a bound the tree
 /// can always hold. The tree reports when its filters exceed it. A flush and
-/// a compaction running together draw on the one budget.
+/// a compaction running together draw on the one budget. An ingestion writing
+/// several tables keeps room for its later filters only when told its entry
+/// count ([`AnyIngestion::expected_entries`](crate::AnyIngestion::expected_entries)).
 ///
 /// The probe load of a table is the count of probes its filter answered for
 /// keys the table does not hold, over a window: whenever a flush or compaction

@@ -124,7 +124,8 @@ impl<'a> Ingestion<'a> {
         } else {
             crate::config::BloomConstructionPolicy::BitsPerKey(0.0)
         };
-        // The caller streams the entries in, so their count is not known.
+        // The caller streams the entries in, so their count is known only
+        // once it tells it (`AnyIngestion::expected_entries`).
         let filter_sizing =
             tree.new_data_filter_sizing(INITIAL_CANONICAL_LEVEL, bloom_policy, 0, rc.ecc_scheme);
 
