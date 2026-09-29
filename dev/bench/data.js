@@ -1,5 +1,5 @@
 window.BENCHMARK_DATA = {
-  "lastUpdate": 1790669128797,
+  "lastUpdate": 1790676567891,
   "repoUrl": "https://github.com/structured-world/coordinode-lsm-tree",
   "entries": {
     "lsm-tree db_bench costs": [
@@ -26482,6 +26482,90 @@ window.BENCHMARK_DATA = {
             "value": 649379.7449366238,
             "unit": "ops/sec",
             "extra": "P50: 1.2us | P99: 6.3us | P99.9: 75.7us\nthreads: 1 | elapsed: 0.31s | num: 200000 | iterations: 3"
+          }
+        ]
+      },
+      {
+        "commit": {
+          "author": {
+            "email": "mail@polaz.com",
+            "name": "Dmitry Prudnikov",
+            "username": "polaz"
+          },
+          "committer": {
+            "email": "noreply@github.com",
+            "name": "GitHub",
+            "username": "web-flow"
+          },
+          "distinct": true,
+          "id": "f91ed6df3ec5ac94aa7c043cf6b48bd2436ade4f",
+          "message": "perf(io_uring): submit a batch in one message and hand reads over as they complete (#744)\n\n## Summary\n- A batched io_uring read costs the caller one completion channel and\none submission-lock acquisition per batch, instead of one of each per\nrequest.\n- Finished reads are handed to the caller as they complete, so a\nmulti-get decodes blocks while the rest of the batch is still in flight.\n\n## Changes\n- The ring thread takes a whole batch as one message; its completions\ncome back on one channel tagged by request position.\n- Draining a batch waits for every read before returning, as before, and\nreports the failure at the lowest request position, whatever order\ncompletions arrive in; a read that never completes because the ring went\naway is a broken pipe at its position.\n- `Fs::read_blocks_batched_each(reqs, on_read)`: hands each filled\nrequest over as it completes. The default implementation reads the\nbatch, then hands the requests over in order; io_uring hands them over\nin completion order.\n- The multi-get block path decodes each block in that callback and keeps\nthe lowest-index decode error.\n- `BlockBuf::filled_bytes`.\n- `io_uring_multi_get` bench: cold multi-get latency and caller CPU per\nbatch at batch sizes 8, 64 and 512, plus the batched read alone.\n\n## Testing\n- Unit tests assert one channel and one lock per batch, the\nlowest-position failure under forward, reverse and shuffled completion\norders, a batch cut short by the ring, the hand-over interleaving,\nidentical results from the ordered and completion-ordered paths, and a\nstress test that mixes failing and succeeding reads in one batch. The\nfault-injection filesystem does not route batches to the ring, so that\nstress test covers the drain-everything invariant instead.\n- Linux, io_uring, caller CPU p50 for the batched read: batch 64 from 84\nto 55 µs, batch 512 from 445 to 270 µs (p99 1159 to 445 µs); batch 8 and\nwall time unchanged; multi-get end to end is neutral, its time is spent\nelsewhere.\n- fmt, clippy (all and default features, and `tools/db_bench`), the full\ntest suite in both feature sets on macOS and Linux with io_uring,\n`tools/sst-dump` tests, doc tests, docs and the no-std check pass.\n\nCloses #669\n\n\n<!-- This is an auto-generated comment: release notes by coderabbit.ai\n-->\n\n## Summary by CodeRabbit\n\n* **New Features**\n* Added a batched-read option that reports fully read requests through a\ncallback in their original order.\n  * Added access to the portion of a read buffer that has been filled.\n* **Improvements**\n* Batched reads can now be processed as they complete, rather than\nwaiting for the entire batch.\n* When multiple reads fail, the reported error follows request order,\nregardless of completion order.\n* **Benchmarks**\n  * Added a benchmark for batched reads using `io_uring`.\n\n<!-- end of auto-generated comment: release notes by coderabbit.ai -->",
+          "timestamp": "2026-09-29T13:02:38+03:00",
+          "tree_id": "5206b3592d789e3c55b4a63e3a621c1c30a622aa",
+          "url": "https://github.com/structured-world/coordinode-lsm-tree/commit/f91ed6df3ec5ac94aa7c043cf6b48bd2436ade4f"
+        },
+        "date": 1790676509079,
+        "tool": "customBiggerIsBetter",
+        "benches": [
+          {
+            "name": "mixed",
+            "value": 82110.71354277569,
+            "unit": "ops/sec",
+            "extra": "P50: 0.4us | P99: 8.0us | P99.9: 28.7us\nthreads: 1 | elapsed: 6.52s | num: 200000 | iterations: 3"
+          },
+          {
+            "name": "fillseq",
+            "value": 3135376.135398083,
+            "unit": "ops/sec",
+            "extra": "P50: 0.2us | P99: 0.6us | P99.9: 3.8us\nthreads: 1 | elapsed: 0.06s | num: 200000 | iterations: 3"
+          },
+          {
+            "name": "fillrandom",
+            "value": 1160749.9373195034,
+            "unit": "ops/sec",
+            "extra": "P50: 0.7us | P99: 1.4us | P99.9: 4.7us\nthreads: 1 | elapsed: 0.17s | num: 200000 | iterations: 3"
+          },
+          {
+            "name": "readrandom",
+            "value": 746815.6713294104,
+            "unit": "ops/sec",
+            "extra": "P50: 1.1us | P99: 6.1us | P99.9: 73.4us\nthreads: 1 | elapsed: 0.27s | num: 200000 | iterations: 3"
+          },
+          {
+            "name": "readseq",
+            "value": 2568647.093575814,
+            "unit": "ops/sec",
+            "extra": "P50: 0.2us | P99: 4.7us | P99.9: 10.5us\nthreads: 1 | elapsed: 0.08s | num: 200000 | iterations: 3"
+          },
+          {
+            "name": "seekrandom",
+            "value": 322835.0600166518,
+            "unit": "ops/sec",
+            "extra": "P50: 2.5us | P99: 7.9us | P99.9: 14.4us\nthreads: 1 | elapsed: 0.62s | num: 200000 | iterations: 3"
+          },
+          {
+            "name": "prefixscan",
+            "value": 204168.4875943654,
+            "unit": "ops/sec",
+            "extra": "P50: 4.4us | P99: 5.6us | P99.9: 11.0us\nthreads: 1 | elapsed: 0.98s | num: 200000 | iterations: 3"
+          },
+          {
+            "name": "overwrite",
+            "value": 1118520.6892771896,
+            "unit": "ops/sec",
+            "extra": "P50: 0.8us | P99: 1.5us | P99.9: 4.8us\nthreads: 1 | elapsed: 0.18s | num: 200000 | iterations: 3"
+          },
+          {
+            "name": "mergerandom",
+            "value": 456651.2394656267,
+            "unit": "ops/sec",
+            "extra": "P50: 0.3us | P99: 1.3us | P99.9: 3.1us\nthreads: 1 | elapsed: 0.44s | num: 200000 | iterations: 3"
+          },
+          {
+            "name": "readwhilewriting",
+            "value": 641349.3991357817,
+            "unit": "ops/sec",
+            "extra": "P50: 1.2us | P99: 6.4us | P99.9: 75.5us\nthreads: 1 | elapsed: 0.31s | num: 200000 | iterations: 3"
           }
         ]
       }
