@@ -1201,6 +1201,23 @@ impl RingThread {
             metas.push(Some((fd, len, offset)));
         }
 
+        // An empty request is complete without a read and never reaches the
+        // ring; it is handed over as every other backend hands it, before any
+        // buffer is given to the kernel.
+        let mut on_read = on_read;
+        if let Some(on_read) = on_read.as_deref_mut() {
+            for (at, (req, meta)) in reqs
+                .iter()
+                .map(core::borrow::Borrow::borrow)
+                .zip(&metas)
+                .enumerate()
+            {
+                if meta.is_none() {
+                    on_read(at, req);
+                }
+            }
+        }
+
         // One read per non-empty request, in request order, with the position
         // each occupies in `reqs`: a failure is attributed to the request that
         // failed, not to the batch it travelled in.
@@ -1331,17 +1348,38 @@ impl RingThread {
 ///
 /// `on_read` is called with a read's position as soon as that read has
 /// returned every byte it asked for, while later ones may still be in flight.
-fn drain_batch(
+/// When it panics, the completions still owed are received before the panic
+/// carries on, since the unwind frees the buffers those reads write into.
+fn drain_batch<N: FnMut() -> Option<(usize, i32)>>(
     expected: &[usize],
-    mut next: impl FnMut() -> Option<(usize, i32)>,
+    next: N,
     short_read: &'static str,
     mut on_read: impl FnMut(usize),
 ) -> Result<(), (usize, io::Error)> {
+    /// The completions not yet received; receiving them is what dropping it
+    /// does, which an unwind out of `on_read` does too.
+    struct Owed<N: FnMut() -> Option<(usize, i32)>> {
+        next: N,
+        count: usize,
+    }
+    impl<N: FnMut() -> Option<(usize, i32)>> Drop for Owed<N> {
+        fn drop(&mut self) {
+            while self.count > 0 && (self.next)().is_some() {
+                self.count -= 1;
+            }
+        }
+    }
+
+    let mut owed = Owed {
+        next,
+        count: expected.len(),
+    };
     let mut results: Vec<Option<i32>> = vec![None; expected.len()];
-    for _ in 0..expected.len() {
-        let Some((position, result)) = next() else {
+    while owed.count > 0 {
+        let Some((position, result)) = (owed.next)() else {
             break;
         };
+        owed.count -= 1;
         if let (Some(slot), Some(&want)) = (results.get_mut(position), expected.get(position)) {
             *slot = Some(result);
             if usize::try_from(result).is_ok_and(|n| n == want) {
@@ -1349,6 +1387,8 @@ fn drain_batch(
             }
         }
     }
+    // Nothing more is owed: either every completion arrived or the ring is gone.
+    owed.count = 0;
 
     for (position, (result, &want)) in results.into_iter().zip(expected).enumerate() {
         let failure = match result {

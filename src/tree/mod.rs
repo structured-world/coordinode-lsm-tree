@@ -4011,7 +4011,12 @@ impl Tree {
         // its group may still be in flight. A decode failure is held rather
         // than returned: it must not abandon reads still in flight, and when
         // several fail the lowest task wins, as a decode in task order would.
+        // Hits are applied in task order once every read is back: tasks follow
+        // the level's runs newest first, and at an equal seqno the first task's
+        // entry is the one a single-key read returns, whatever order the
+        // reads completed in.
         let mut decode_failure: Option<(usize, crate::Error)> = None;
+        let mut hits: Vec<(usize, usize, InternalValue)> = Vec::new();
         for BackendReads { fs, reqs, tasks } in &mut groups {
             // Charged as issued, group by group like the prewarm: these reads
             // bypass the per-block load path that charges every other read,
@@ -4030,7 +4035,7 @@ impl Tree {
                     return;
                 };
                 if let Err(e) =
-                    Self::resolve_block_task(task, req.buf.filled_bytes(), keys, results)
+                    Self::resolve_block_task(task, index, req.buf.filled_bytes(), keys, &mut hits)
                     && decode_failure
                         .as_ref()
                         .is_none_or(|(held, _)| index < *held)
@@ -4048,20 +4053,29 @@ impl Tree {
                 )));
             }
         }
-        decode_failure.map_or(Ok(()), |(_, e)| Err(e))
+        if let Some((_, e)) = decode_failure {
+            return Err(e);
+        }
+        // A task holds each key once, so only the order across tasks matters.
+        hits.sort_unstable_by_key(|&(task, _, _)| task);
+        for (_, kidx, item) in hits {
+            Self::keep_highest(results, kidx, item);
+        }
+        Ok(())
     }
 
-    /// Decodes one task's block from `bytes` and point-reads its keys, keeping
-    /// the highest-seqno hit per key in `results`.
+    /// Decodes the block of task `index` from `bytes` and point-reads its keys,
+    /// adding each hit to `hits` as `(task index, key index, entry)`.
     #[expect(
         clippy::indexing_slicing,
-        reason = "the task's key indices are valid (caller's keys/results aligned)"
+        reason = "the task's key indices are valid (caller's keys aligned)"
     )]
     fn resolve_block_task<K: AsRef<[u8]>>(
         task: &BlockTask<'_>,
+        index: usize,
         bytes: &[u8],
         keys: &[K],
-        results: &mut [Option<InternalValue>],
+        hits: &mut Vec<(usize, usize, InternalValue)>,
     ) -> crate::Result<()> {
         if let Some(block) = task
             .table
@@ -4073,7 +4087,7 @@ impl Tree {
                     keys[kidx].as_ref(),
                     task.table_seqno,
                 )? {
-                    Self::keep_highest(results, kidx, item);
+                    hits.push((index, kidx, item));
                 }
             }
         }
@@ -6243,3 +6257,6 @@ mod live_compression_tests;
 #[cfg(test)]
 #[expect(clippy::expect_used, reason = "test code")]
 mod partition_size_tests;
+
+#[cfg(all(test, feature = "std"))]
+mod chunk_order_tests;

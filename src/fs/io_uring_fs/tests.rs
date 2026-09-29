@@ -1687,3 +1687,66 @@ fn a_mixed_batch_drains_every_read_and_reports_the_lowest_failure() -> io::Resul
     }
     Ok(())
 }
+
+/// A callback that panics must not cut the drain short: the reads still in
+/// flight write into buffers the unwind would free, so every completion is
+/// received before the panic carries on.
+#[test]
+fn a_panicking_callback_still_drains_every_completion() {
+    let received = core::cell::Cell::new(0usize);
+    let mut feed = [(0, 4), (1, 4), (2, 4)].into_iter();
+    let unwound = std::panic::catch_unwind(std::panic::AssertUnwindSafe(|| {
+        drain_batch(
+            &[4, 4, 4],
+            || {
+                let next = feed.next();
+                if next.is_some() {
+                    received.set(received.get() + 1);
+                }
+                next
+            },
+            "short",
+            |_| panic!("the caller's work on a finished read failed"),
+        )
+    }));
+    assert!(unwound.is_err(), "the callback's panic carries on");
+    assert_eq!(received.get(), 3, "every completion was received first");
+}
+
+/// An empty request is complete without a read, so it is handed over like
+/// every other finished one, as the default and the serial path do.
+#[test]
+fn an_empty_request_in_a_batch_is_handed_over() -> io::Result<()> {
+    let Some(fs) = try_io_uring() else {
+        return Ok(());
+    };
+    let dir = tempfile::tempdir()?;
+    let files = two_files(&fs, dir.path(), 64)?;
+    let mut first = [0u8; 16];
+    let mut empty = [0u8; 0];
+    let mut last = [0u8; 16];
+    let mut handed = Vec::new();
+    {
+        let mut reqs = vec![
+            crate::fs::BlockRead {
+                file: files[0].as_ref(),
+                offset: 0,
+                buf: crate::fs::BlockBuf::new(&mut first),
+            },
+            crate::fs::BlockRead {
+                file: files[1].as_ref(),
+                offset: 16,
+                buf: crate::fs::BlockBuf::new(&mut empty),
+            },
+            crate::fs::BlockRead {
+                file: files[1].as_ref(),
+                offset: 32,
+                buf: crate::fs::BlockBuf::new(&mut last),
+            },
+        ];
+        fs.read_blocks_batched_each(&mut reqs, &mut |i, _| handed.push(i))?;
+    }
+    handed.sort_unstable();
+    assert_eq!(handed, [0, 1, 2]);
+    Ok(())
+}
