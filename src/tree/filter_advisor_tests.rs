@@ -532,7 +532,11 @@ fn merge_resolution_counts_its_filter_probes() -> crate::Result<()> {
         tree.merge(key("k", 2 * i + 1), "x", u64::from(KEYS + i));
     }
     tree.flush_active_memtable(0)?;
-    let negatives = |table: &Table| table.probe_stats().map_or(0, |s| s.negatives());
+    let negatives = |table: &Table| {
+        table
+            .probe_stats()
+            .map_or(0, crate::table::probe_stats::ProbeStats::negatives)
+    };
     let [older] = older.as_slice() else {
         panic!("one older table");
     };

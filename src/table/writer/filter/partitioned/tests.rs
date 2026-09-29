@@ -126,7 +126,7 @@ mod parallel {
             file.start("data")?;
             file.write_all(&[0; 64])?;
             let output = writer.finish(&mut file)?;
-            assert_eq!(output.hashes, self.keys as u64, "one hash per key");
+            assert_eq!(output.hashes, u64::from(self.keys), "one hash per key");
             Ok((file.get_mut().inner_mut().get_ref().clone(), output.blocks))
         }
     }
