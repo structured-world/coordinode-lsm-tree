@@ -228,6 +228,54 @@ fn span_depths(
     per_file
 }
 
+/// The files among `among` whose spans in `tables` overlap the span of another
+/// file among them: the ones a relocation of all of `among` would merge with
+/// something. Ordered by file id.
+///
+/// # Errors
+///
+/// When a table's `linked_blob_files` section cannot be read or parsed.
+pub(crate) fn overlapping_blob_files<'a>(
+    tables: impl IntoIterator<Item = &'a crate::table::Table>,
+    among: &[crate::vlog::BlobFileId],
+) -> crate::Result<Vec<crate::vlog::BlobFileId>> {
+    let mut comparator = None;
+    let mut spans = Vec::new();
+    collect_spans(tables, &mut comparator, &mut spans)?;
+    spans.retain(|(id, _, _)| among.contains(id));
+    Ok(comparator.map_or_else(Vec::new, |cmp| span_overlaps(&mut spans, cmp.as_ref())))
+}
+
+/// [`overlapping_blob_files`] over `(blob file, first key, last key)` spans
+/// ordered by `cmp`. Sorts `spans` in place.
+fn span_overlaps(
+    spans: &mut [Span<'_>],
+    cmp: &dyn crate::comparator::UserComparator,
+) -> Vec<crate::vlog::BlobFileId> {
+    let (merged, _) = merge_spans(spans, cmp);
+    // A file's merged spans never overlap each other, so anything open when a
+    // span starts belongs to another file.
+    let mut open: Vec<usize> = Vec::new();
+    let mut overlapping: Vec<crate::vlog::BlobFileId> = Vec::new();
+    for (_, is_end, index) in sweep_events(&merged, cmp) {
+        if is_end {
+            open.retain(|&o| o != index);
+            continue;
+        }
+        if !open.is_empty() {
+            for &o in open.iter().chain(core::iter::once(&index)) {
+                if let Some(&(id, _, _)) = merged.get(o) {
+                    overlapping.push(id);
+                }
+            }
+        }
+        open.push(index);
+    }
+    overlapping.sort_unstable();
+    overlapping.dedup();
+    overlapping
+}
+
 /// A `(blob file, first key, last key)` span referenced from a table.
 type Span<'k> = (
     crate::vlog::BlobFileId,

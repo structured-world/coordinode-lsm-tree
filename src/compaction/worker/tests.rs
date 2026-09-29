@@ -4534,6 +4534,234 @@ mod locality_relocation {
         Ok(())
     }
 
+    /// A lone columnar segment whose own range tombstone deletes rows would be
+    /// relocated verbatim with a delete bitmap, keeping its blob links as they
+    /// are. When locality relocation applies to it, the segment is rewritten
+    /// instead, so its interleaved files are relocated too.
+    #[cfg(feature = "columnar")]
+    #[test]
+    fn locality_relocation_takes_precedence_over_merge_on_read() -> crate::Result<()> {
+        use crate::config::{DeleteStrategy, DeleteStrategyPolicy};
+
+        let merge_on_read = |tree: &AnyTree| -> crate::Result<()> {
+            let AnyTree::Blob(blob) = tree else {
+                panic!("a tree that separates values");
+            };
+            blob.update_runtime_config(|c| {
+                c.columnar = true;
+                c.zone_map = true;
+                c.delete_strategy = DeleteStrategyPolicy::all(DeleteStrategy::MergeOnRead);
+            })
+        };
+
+        let folder = tempfile::tempdir()?;
+        {
+            // One interleaved columnar segment on level 1 that carries its own
+            // range tombstone, merged with relocation off and the tombstone
+            // kept.
+            let tree = open(folder.path(), KvSeparationOptions::default())?;
+            merge_on_read(&tree)?;
+            fill_interleaved(&tree)?;
+            tree.remove_range("key000000", "key000010", 10_000);
+            tree.flush_active_memtable(0)?;
+            let ids: Vec<_> = tree
+                .current_version()
+                .iter_tables()
+                .map(crate::Table::id)
+                .collect();
+            tree.compact(Arc::new(MergeInto(ids, 1)), 0)?;
+            assert_eq!(tree.table_count(), 1);
+            assert_eq!(tree.storage_stats()?.blob_references.depth, FILES);
+        }
+
+        let tree = open(folder.path(), relocating())?;
+        merge_on_read(&tree)?;
+        let Some(table) = tree
+            .current_version()
+            .iter_tables()
+            .next()
+            .map(crate::Table::id)
+        else {
+            panic!("the merge left one table");
+        };
+        let before = blob_ids(&tree);
+        tree.compact(Arc::new(RewriteOneTable(table, 1)), u64::MAX)?;
+        let after = blob_ids(&tree);
+        assert!(
+            before.intersection(&after).count() < before.len(),
+            "some interleaved files were rewritten: before {before:?}, after {after:?}",
+        );
+        assert_eq!(tree.storage_stats()?.blob_references.depth, 1);
+        Ok(())
+    }
+
+    /// A deeply interleaved file is relocated only together with another file
+    /// it overlaps. Here the budget covers one interleaved file and a stale
+    /// file in an unrelated key range is relocated anyway: moving the lone
+    /// interleaved file with it would keep its interleaving and stretch the new
+    /// file's span across the gap, so it stays.
+    #[test]
+    fn a_locality_pick_without_an_overlapping_partner_stays() -> crate::Result<()> {
+        let folder = tempfile::tempdir()?;
+        let staleness = || {
+            KvSeparationOptions::default()
+                .staleness_threshold(0.01)
+                .age_cutoff(1.0)
+        };
+        let interleaved: BTreeSet<u64>;
+        {
+            let tree = open(folder.path(), staleness())?;
+            fill_interleaved(&tree)?;
+            interleaved = blob_ids(&tree);
+            // A file of its own, far from the interleaved keys, most of whose
+            // values are then overwritten inline so it turns stale.
+            for i in 0..64u64 {
+                tree.insert(
+                    format!("key{:06}", 100_000 + i),
+                    vec![b's'; 2_048],
+                    1_000 + i,
+                );
+            }
+            tree.flush_active_memtable(0)?;
+            for i in 0..48u64 {
+                tree.insert(format!("key{:06}", 100_000 + i), "inline", 2_000 + i);
+            }
+            tree.flush_active_memtable(0)?;
+            tree.major_compact(u64::MAX, u64::MAX)?;
+            assert!(tree.stale_blob_bytes() > 0, "the separate file is stale");
+        }
+
+        // A budget that covers exactly one interleaved file, read and written,
+        // on top of what the merge writes anyway.
+        let budget = {
+            let tree = open(folder.path(), staleness())?;
+            let version = tree.current_version();
+            let Some(table) = version.iter_tables().next() else {
+                panic!("the merge left one table");
+            };
+            let table_len = table.fs.metadata(&table.path)?.len;
+            let mut stale_written = 0;
+            let mut smallest = u64::MAX;
+            for link in table.blob_links()? {
+                if interleaved.contains(&link.blob_file_id) {
+                    let Some(bf) = version.blob_files.get(link.blob_file_id) else {
+                        panic!("a linked file exists");
+                    };
+                    smallest = smallest.min(bf.physical_size()?);
+                } else {
+                    stale_written += link.on_disk_bytes;
+                }
+            }
+            #[expect(clippy::cast_precision_loss, reason = "test budget from byte counts")]
+            let ratio = (3 * smallest) as f32 / (table_len + stale_written) as f32;
+            ratio
+        };
+
+        let Some(max_depth) = NonZeroU64::new(2) else {
+            panic!("two is not zero");
+        };
+        let tree = open(
+            folder.path(),
+            staleness().relocate_for_locality(max_depth, budget),
+        )?;
+        let before = blob_ids(&tree);
+        tree.major_compact(u64::MAX, u64::MAX)?;
+        let after = blob_ids(&tree);
+        assert!(
+            interleaved.is_subset(&after),
+            "no interleaved file moved without a partner: before {before:?}, after {after:?}",
+        );
+        assert_eq!(tree.stale_blob_bytes(), 0, "the stale file was rewritten");
+        Ok(())
+    }
+
+    /// The budget is a share of what the merge writes anyway, which for a
+    /// stale file is its values the tables still reference, not its whole
+    /// length. A mostly dead stale file therefore adds little to the allowance.
+    #[test]
+    fn a_stale_file_adds_only_its_live_values_to_the_budget() -> crate::Result<()> {
+        let folder = tempfile::tempdir()?;
+        let staleness = || {
+            KvSeparationOptions::default()
+                .staleness_threshold(0.01)
+                .age_cutoff(1.0)
+        };
+        let interleaved: BTreeSet<u64>;
+        {
+            let tree = open(folder.path(), staleness())?;
+            fill_interleaved(&tree)?;
+            interleaved = blob_ids(&tree);
+            // A large separate file whose values are nearly all overwritten.
+            for i in 0..256u64 {
+                tree.insert(
+                    format!("key{:06}", 100_000 + i),
+                    vec![b's'; 2_048],
+                    1_000 + i,
+                );
+            }
+            tree.flush_active_memtable(0)?;
+            for i in 0..250u64 {
+                tree.insert(format!("key{:06}", 100_000 + i), "inline", 2_000 + i);
+            }
+            tree.flush_active_memtable(0)?;
+            tree.major_compact(u64::MAX, u64::MAX)?;
+            assert!(tree.stale_blob_bytes() > 0, "the separate file is stale");
+        }
+
+        // A budget that the stale file's whole length would stretch to every
+        // interleaved file, and its live values would not.
+        let (budget, allowance, sizes) = {
+            let tree = open(folder.path(), staleness())?;
+            let version = tree.current_version();
+            let Some(table) = version.iter_tables().next() else {
+                panic!("the merge left one table");
+            };
+            let table_len = table.fs.metadata(&table.path)?.len;
+            let mut stale_written = 0;
+            let mut stale_len = 0;
+            let mut sizes = std::collections::BTreeMap::new();
+            for link in table.blob_links()? {
+                let Some(bf) = version.blob_files.get(link.blob_file_id) else {
+                    panic!("a linked file exists");
+                };
+                if interleaved.contains(&link.blob_file_id) {
+                    sizes.insert(link.blob_file_id, bf.physical_size()?);
+                } else {
+                    stale_written += link.on_disk_bytes;
+                    stale_len += bf.physical_size()?;
+                }
+            }
+            let all: u64 = sizes.values().sum();
+            #[expect(clippy::cast_precision_loss, reason = "test budget from byte counts")]
+            let ratio = (2 * all) as f32 / (table_len + stale_len) as f32;
+            #[expect(clippy::cast_precision_loss, reason = "test budget from byte counts")]
+            let allowance = f64::from(ratio) * (table_len + stale_written) as f64;
+            (ratio, allowance, sizes)
+        };
+
+        let Some(max_depth) = NonZeroU64::new(2) else {
+            panic!("two is not zero");
+        };
+        let tree = open(
+            folder.path(),
+            staleness().relocate_for_locality(max_depth, budget),
+        )?;
+        tree.major_compact(u64::MAX, u64::MAX)?;
+        let after = blob_ids(&tree);
+        let relocated: u64 = sizes
+            .iter()
+            .filter(|(id, _)| !after.contains(id))
+            .map(|(_, size)| size)
+            .sum();
+        #[expect(clippy::cast_precision_loss, reason = "byte count to float")]
+        let spent = (2 * relocated) as f64;
+        assert!(
+            spent <= allowance,
+            "locality spent {spent} B against an allowance of {allowance} B",
+        );
+        Ok(())
+    }
+
     /// Relocation for locality is optional work: a quota that leaves room for
     /// the merged table but not for the rewritten values skips it, while the
     /// merge itself still runs.

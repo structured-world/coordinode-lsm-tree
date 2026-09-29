@@ -94,6 +94,41 @@ fn depths_of(spans: &[(u64, &str, &str)]) -> Vec<(u64, u64)> {
     )
 }
 
+/// `span_overlaps` over spans written as `(file, first, last)` byte strings.
+fn overlaps_of(spans: &[(u64, &str, &str)]) -> Vec<u64> {
+    let keys: Vec<(u64, crate::UserKey, crate::UserKey)> = spans
+        .iter()
+        .map(|&(id, first, last)| (id, first.into(), last.into()))
+        .collect();
+    span_overlaps(
+        &mut keys
+            .iter()
+            .map(|(id, first, last)| (*id, first, last))
+            .collect::<Vec<_>>(),
+        crate::comparator::default_comparator().as_ref(),
+    )
+}
+
+/// Only files whose spans meet another file's count as overlapping: a file
+/// off on its own range does not, even beside overlapping ones.
+#[test]
+fn span_overlaps_names_the_files_that_meet_another() {
+    assert_eq!(
+        overlaps_of(&[(1, "a", "m"), (2, "c", "k"), (9, "x", "z")]),
+        vec![1, 2],
+    );
+    // Meeting at one key is overlapping; two spans of one file are not.
+    assert_eq!(overlaps_of(&[(1, "a", "c"), (2, "c", "d")]), vec![1, 2]);
+    assert_eq!(
+        overlaps_of(&[(7, "a", "b"), (7, "c", "d")]),
+        Vec::<u64>::new()
+    );
+    assert_eq!(
+        overlaps_of(&[(1, "a", "b"), (9, "x", "z")]),
+        Vec::<u64>::new()
+    );
+}
+
 /// A span recorded with its bounds reversed covers the keys between them, not
 /// nothing: it still overlaps the span beside it.
 #[test]

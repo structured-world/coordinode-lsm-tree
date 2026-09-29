@@ -2485,6 +2485,17 @@ pub fn pick_blob_files_to_rewrite(
     Ok(linked_blob_files.into_iter().cloned().collect::<Vec<_>>())
 }
 
+/// The blob files a merge relocates.
+struct BlobRewrite {
+    files: Vec<BlobFile>,
+    /// Some of `files` are relocated for locality rather than for staleness.
+    #[cfg_attr(
+        not(feature = "std"),
+        expect(dead_code, reason = "read only by the std merge-on-read fast path")
+    )]
+    for_locality: bool,
+}
+
 /// Blob files a merge of `tables` relocates: the stale set, then, when locality
 /// relocation is on, the files interleaved too deeply for scans.
 fn pick_blob_files_for_merge(
@@ -2492,16 +2503,24 @@ fn pick_blob_files_for_merge(
     version: &Version,
     payload: &CompactionPayload,
     tables: &[Table],
-) -> crate::Result<Vec<BlobFile>> {
+) -> crate::Result<BlobRewrite> {
     let Some(blob_opts) = &opts.config.kv_separation_opts else {
-        return Ok(Vec::new());
+        return Ok(BlobRewrite {
+            files: Vec::new(),
+            for_locality: false,
+        });
     };
     let mut files = pick_blob_files_to_rewrite(&payload.table_ids, version, blob_opts)?;
+    let mut for_locality = false;
     if let Some(locality) = blob_opts.locality_relocation {
         let extra = pick_blob_files_for_locality(opts, version, payload, tables, locality, &files)?;
+        for_locality = !extra.is_empty();
         files.extend(extra);
     }
-    Ok(files)
+    Ok(BlobRewrite {
+        files,
+        for_locality,
+    })
 }
 
 /// Whether merging a move's tables instead would relocate blob files for
@@ -2582,18 +2601,21 @@ fn pick_blob_files_for_locality(
 
     // The bytes the merge writes anyway: its tables, bounded by the length of
     // their input files (a restricted input's punched prefix excluded), plus
-    // the stale files it relocates. Measured as blob files are, by file length:
-    // the recorded table size leaves out sections written after the data.
-    // Sums of on-disk sizes are bounded by filesystem capacity and cannot
-    // overflow.
+    // what relocating the stale files writes, which is their values these
+    // tables still reference rather than the files' whole length. Table
+    // files are measured by length, as blob files are: the recorded table size
+    // leaves out sections written after the data. Sums of on-disk sizes are
+    // bounded by filesystem capacity and cannot overflow.
     let mut table_bytes = 0u64;
+    let mut stale_written = 0u64;
     for table in tables {
         let len = table.fs.metadata(&table.path)?.len;
         table_bytes += len.checked_sub(table.punch_offset()?).unwrap_or(len);
-    }
-    let mut stale_bytes = 0u64;
-    for bf in stale {
-        stale_bytes += bf.physical_size()?;
+        for link in table.blob_links()? {
+            if stale.iter().any(|bf| bf.id() == link.blob_file_id) {
+                stale_written += link.on_disk_bytes;
+            }
+        }
     }
     // A float-to-int cast saturates, and NaN or a negative budget gives zero.
     #[expect(
@@ -2602,7 +2624,7 @@ fn pick_blob_files_for_locality(
         clippy::cast_precision_loss,
         reason = "the budget is a fraction of a byte count; rounding is fine"
     )]
-    let budget = ((table_bytes + stale_bytes) as f64 * f64::from(locality.budget)) as u64;
+    let budget = ((table_bytes + stale_written) as f64 * f64::from(locality.budget)) as u64;
 
     // Most depth per byte first; ties go to the older file.
     candidates.sort_by(|(a, a_depth, a_size), (b, b_depth, b_size)| {
@@ -2612,14 +2634,12 @@ fn pick_blob_files_for_locality(
     });
     let mut picked = Vec::new();
     let mut spent = 0u64;
-    let mut picked_bytes = 0u64;
     for (bf, _, size) in candidates {
         // Each byte is read once and written once.
         let cost = 2 * size;
         if spent + cost <= budget {
             spent += cost;
-            picked_bytes += size;
-            picked.push(bf);
+            picked.push((bf, size));
         }
     }
 
@@ -2628,11 +2648,36 @@ fn pick_blob_files_for_locality(
         picked.len(),
     );
 
-    // One file rewritten on its own keeps its span: it only helps together
-    // with another it overlaps.
-    if picked.len() + stale.len() < 2 {
+    // A file rewritten without another it overlaps keeps its span: its
+    // interleaving stays, and joining it to a disjoint run would only stretch
+    // that run's span across the gap. Keep the picks that overlap another file
+    // being relocated, again after each removal, since a removal can leave
+    // another pick without its partner.
+    loop {
+        let relocated: Vec<crate::vlog::BlobFileId> = stale
+            .iter()
+            .map(BlobFile::id)
+            .chain(picked.iter().map(|(bf, _)| bf.id()))
+            .collect();
+        let overlapping = crate::storage_stats::overlapping_blob_files(tables, &relocated)?;
+        let before = picked.len();
+        picked.retain(|(bf, _)| overlapping.contains(&bf.id()));
+        if picked.len() == before {
+            break;
+        }
+    }
+    if picked.is_empty() {
         return Ok(Vec::new());
     }
+
+    // The space check charges the whole length of every file relocated: the
+    // demand is not known more closely before the merge runs.
+    let mut stale_bytes = 0u64;
+    for bf in stale {
+        stale_bytes += bf.physical_size()?;
+    }
+    let picked_bytes: u64 = picked.iter().map(|(_, size)| size).sum();
+    let picked: Vec<BlobFile> = picked.into_iter().map(|(bf, _)| bf).collect();
 
     let rc = opts.runtime_config.load_full();
     let quota_headroom = match rc.storage_limit_bytes {
@@ -2918,16 +2963,24 @@ fn merge_tables(
     input_range_tombstones.sort();
     input_range_tombstones.dedup();
 
+    // Chosen once: the fast path and the split decision below and the
+    // relocating writer must agree on the set.
+    let blob_rewrite =
+        pick_blob_files_for_merge(opts, &current_super_version.version, payload, &tables)?;
+
     // Merge-on-read fast path: a lone columnar segment whose own range
     // tombstones (below the watermark) delete some of its rows is relocated (its
     // data blocks reused verbatim plus a positional delete-bitmap) instead of
     // being re-transposed. Detection is read-only, so it runs under the held
     // read lock; on a hit the lock is released before the relocation installs
     // its own version edit. Multi-input merges and any non-relocatable segment
-    // fall through to the normal copy-on-write merge below.
+    // fall through to the normal copy-on-write merge below. So does a segment
+    // whose blob files are relocated for locality: the verbatim copy would keep
+    // its blob links, and with them the interleaving.
     #[cfg(feature = "std")]
-    if let Some((source, bitmap)) =
-        plan_merge_on_read(opts, payload, &tables, &input_range_tombstones)?
+    if !blob_rewrite.for_locality
+        && let Some((source, bitmap)) =
+            plan_merge_on_read(opts, payload, &tables, &input_range_tombstones)?
     {
         drop(current_super_version);
         drop(version_history_lock);
@@ -2939,11 +2992,7 @@ fn merge_tables(
             &bitmap,
         );
     }
-
-    // Chosen once: the split decision below and the relocating writer must
-    // agree on the set.
-    let blob_files_to_rewrite =
-        pick_blob_files_for_merge(opts, &current_super_version.version, payload, &tables)?;
+    let blob_files_to_rewrite = blob_rewrite.files;
 
     // ---- Parallel sub-compaction (std only) ----
     // A non-relocating compaction can be split into disjoint key ranges that
