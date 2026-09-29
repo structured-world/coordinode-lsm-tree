@@ -179,24 +179,33 @@ pub struct BlockCompressor {
     inline_below: u64,
 }
 
-/// Payload bytes below which a block whose codec is cheap per byte (none, lz4)
-/// is prepared on the writer thread when no threshold is configured. Measured
-/// on a flush of 12 000 blocks over four workers: below 1 KiB an lz4 block
-/// costs twice the CPU on a worker and no less wall time; from 1 KiB up the
-/// workers win wall time.
+/// Payload bytes below which an lz4 block is prepared on the writer thread when
+/// no threshold is configured. Measured on a flush of 12 000 blocks over four
+/// workers, with and without encryption or page ECC: below 1 KiB a worker costs
+/// twice the CPU and no less wall time; from 1 KiB up the workers win wall time.
 #[cfg(feature = "std")]
-const CHEAP_CODEC_INLINE_BELOW: u64 = 1_024;
+const LZ4_INLINE_BELOW: u64 = 1_024;
+
+/// Payload bytes below which a block with no codec is prepared on the writer
+/// thread when no threshold is configured. Such a table reaches the pipeline
+/// only for its encryption or page ECC, which cost too little per byte for a
+/// worker to pay off on a small block: measured as above, the workers are no
+/// faster up to 4 KiB for 1.5 to 2.7 times the CPU, and win wall time from
+/// 8 KiB up.
+#[cfg(feature = "std")]
+const TRANSFORM_ONLY_INLINE_BELOW: u64 = 8 * 1_024;
 
 /// The inline threshold of a table compressing with `compression`, when none
-/// is configured. It follows the codec's cost per block, not the block size:
-/// zstd pays a per-frame setup that makes even a 256-byte block worth a
-/// worker, so every zstd block goes to one.
+/// is configured. It follows the cost of preparing a block, not the block
+/// size: zstd pays a per-frame setup that makes even a 256-byte block worth a
+/// worker, so every zstd block goes to one; encryption and page ECC cost less
+/// per block than lz4 and move the break-even no lower than the codec's.
 #[cfg(feature = "std")]
 pub fn default_inline_below(compression: CompressionType) -> u64 {
     match compression {
-        CompressionType::None => CHEAP_CODEC_INLINE_BELOW,
+        CompressionType::None => TRANSFORM_ONLY_INLINE_BELOW,
         #[cfg(feature = "lz4")]
-        CompressionType::Lz4 => CHEAP_CODEC_INLINE_BELOW,
+        CompressionType::Lz4 => LZ4_INLINE_BELOW,
         #[cfg(zstd_any)]
         CompressionType::Zstd(_) | CompressionType::ZstdDict { .. } => 0,
     }

@@ -2068,8 +2068,9 @@ impl Config {
     /// in parallel is prepared on the writer thread instead of a worker. A
     /// block that small costs less to compress than to hand to a worker and
     /// back. `None` (default) derives the threshold from the table's block
-    /// codec: 1 KiB for no compression and lz4, whose cost per block is
-    /// small, and 0 for zstd, whose per-frame setup makes any block worth a
+    /// codec: 1 KiB for lz4; 8 KiB with no codec, where only encryption or
+    /// page ECC brings a table to the workers and costs less per block than
+    /// lz4; and 0 for zstd, whose per-frame setup makes any block worth a
     /// worker. `Some(0)` sends every block to the workers.
     ///
     /// # Examples

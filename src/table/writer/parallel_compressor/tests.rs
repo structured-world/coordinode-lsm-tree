@@ -104,18 +104,15 @@ fn blocks_below_the_inline_threshold_never_reach_a_worker() {
 
 #[test]
 fn the_default_threshold_follows_the_codec_cost() {
-    // Cheap codecs keep blocks under 1 KiB on the writer thread; zstd sends
-    // every block to a worker, since its per-frame setup alone outweighs the
-    // handoff.
+    // A table with no codec (there for its encryption or ECC) keeps blocks
+    // under 8 KiB on the writer thread and lz4 under 1 KiB; zstd sends every
+    // block to a worker, since its per-frame setup alone outweighs the handoff.
     assert_eq!(
         default_inline_below(CompressionType::None),
-        CHEAP_CODEC_INLINE_BELOW
+        TRANSFORM_ONLY_INLINE_BELOW
     );
     #[cfg(feature = "lz4")]
-    assert_eq!(
-        default_inline_below(CompressionType::Lz4),
-        CHEAP_CODEC_INLINE_BELOW
-    );
+    assert_eq!(default_inline_below(CompressionType::Lz4), LZ4_INLINE_BELOW);
     #[cfg(zstd_any)]
     {
         assert_eq!(default_inline_below(CompressionType::Zstd(1)), 0);
