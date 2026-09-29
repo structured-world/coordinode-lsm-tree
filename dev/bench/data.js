@@ -1,5 +1,5 @@
 window.BENCHMARK_DATA = {
-  "lastUpdate": 1790644414673,
+  "lastUpdate": 1790669123717,
   "repoUrl": "https://github.com/structured-world/coordinode-lsm-tree",
   "entries": {
     "lsm-tree db_bench costs": [
@@ -27318,6 +27318,90 @@ window.BENCHMARK_DATA = {
             "value": 349756.5209327136,
             "unit": "ops/sec",
             "extra": "P50: 2.2us | P99: 12.2us | P99.9: 91.6us\nthreads: 1 | elapsed: 0.57s | num: 200000 | iterations: 3"
+          }
+        ]
+      },
+      {
+        "commit": {
+          "author": {
+            "email": "mail@polaz.com",
+            "name": "Dmitry Prudnikov",
+            "username": "polaz"
+          },
+          "committer": {
+            "email": "noreply@github.com",
+            "name": "GitHub",
+            "username": "web-flow"
+          },
+          "distinct": true,
+          "id": "02db3fda94c63504dcb5ce93f8700b97c920975c",
+          "message": "feat(compaction): measure blob locality and relocate deeply interleaved files (#742)\n\n## Summary\n- Measures blob locality correctly: per table, level and tree, the\nnumber of blob files referenced (count) and how many of them a scan\ninterleaves where their key spans overlap most (depth, documented as an\nestimate).\n- Adds an opt-in compaction trigger that rewrites deeply interleaved\nblob files in key order, within a bounded I/O budget.\n\n## Changes\n- Each table's `linked_blob_files` record carries the first and last key\nthat references the blob file. This changes the V6 on-disk format; the\nV5 to V6 converter must derive these spans when it converts V5 tables.\n- `BlobReferenceStats { count, depth }` on `StorageStats`, `LevelStats`\nand `SegmentStats`; a table keeps its parsed blob links after the first\nread.\n- `KvSeparationOptions::relocate_for_locality(max_depth, budget)`, off\nby default. A merge whose inputs are interleaved deeper than `max_depth`\nalso relocates the deepest blob files, ranked by depth per on-disk byte:\n- whole files only, and only files no table outside the merge\nreferences;\n- a file is relocated only together with another relocated file whose\nspan overlaps it;\n- reads plus writes stay within `budget` times the bytes the merge\nwrites anyway: its input table files plus the values of the stale blob\nfiles these tables still reference (stale files are always relocated\nfirst);\n- a segment whose files are relocated skips the merge-on-read fast path,\nwhich would keep its blob links;\n- nothing is relocated for locality when the output would eat into the\nreserved free space;\n- a move whose tables it would rewrite is merged instead, so the\ninterleaving is not carried down unchanged.\n- Blob relocation merges and drains in the tree's comparator order\nrather than key-byte order, which the table stream it walks alongside\nfollows; under a non-lexicographic comparator the byte order failed any\nrelocation that dropped values or spanned several files.\n- A table's blob links are read once and kept, without promoting or\ncaching its descriptor.\n- `Metrics::blob_read_count`: read requests behind `blob_bytes_read`,\nthe figure locality moves.\n- `blob_locality` bench: range scans over 4 KiB values by layout.\n\n## Testing\n- Fixtures: 32 consecutive blob files give count 32 and depth 1 and\nnever trigger; 32 interleaved files give count 32 and depth 32, and\nrelocation brings the depth to 1 with far fewer blob reads per scan.\nBudget, stale-first and space-pressure behaviour are each covered.\n- Windows, one eighth of the key space, cold cache: interleaved 3.19 ms\nand 513 blob reads, relocated 2.08 ms and 17 reads, consecutive 1.68 ms\nand 20 reads with the trigger off and on alike. `db_bench` on a blob\ntree against `main` is neutral for `fillrandom` and `readseq`.\n- fmt, clippy (all and default features, and `tools/db_bench`), the full\ntest suite in both feature sets, `tools/sst-dump` tests, doc tests, docs\nand the no-std check pass.\n\nCloses #665\n\n\n<!-- This is an auto-generated comment: release notes by coderabbit.ai\n-->\n\n## Summary by CodeRabbit\n\n* **New Features**\n* Added optional compaction that can rewrite deeply interleaved blob\nfiles in key order, subject to an I/O budget and available storage.\n* Storage statistics now report blob-reference counts and overlap depth\nby table, level, and tree, including key-span details.\n* Added a metric for blob read requests, alongside existing read-byte\nmeasurements.\n\n* **Bug Fixes**\n* Blob relocation and merging now respect custom key ordering, improving\ncompatibility with custom comparators.\n\n* **Documentation**\n* Updated benchmark guidance to explain blob read-request counts and\ntheir relationship to locality.\n* Added a benchmark comparing scans across different blob layouts and\nlocality settings.\n\n<!-- end of auto-generated comment: release notes by coderabbit.ai -->",
+          "timestamp": "2026-09-29T10:57:43+03:00",
+          "tree_id": "b6affc26d1900e02352bcfdd548b405b248f0a69",
+          "url": "https://github.com/structured-world/coordinode-lsm-tree/commit/02db3fda94c63504dcb5ce93f8700b97c920975c"
+        },
+        "date": 1790669055295,
+        "tool": "customBiggerIsBetter",
+        "benches": [
+          {
+            "name": "mixed",
+            "value": 31709.86755506658,
+            "unit": "ops/sec",
+            "extra": "P50: 0.5us | P99: 9.5us | P99.9: 18.5us\nthreads: 1 | elapsed: 16.88s | num: 200000 | iterations: 3"
+          },
+          {
+            "name": "fillseq",
+            "value": 2775589.302712292,
+            "unit": "ops/sec",
+            "extra": "P50: 0.2us | P99: 0.8us | P99.9: 1.4us\nthreads: 1 | elapsed: 0.07s | num: 200000 | iterations: 3"
+          },
+          {
+            "name": "fillrandom",
+            "value": 736354.2674605263,
+            "unit": "ops/sec",
+            "extra": "P50: 1.2us | P99: 2.4us | P99.9: 12.5us\nthreads: 1 | elapsed: 0.27s | num: 200000 | iterations: 3"
+          },
+          {
+            "name": "readrandom",
+            "value": 505521.0225719686,
+            "unit": "ops/sec",
+            "extra": "P50: 1.8us | P99: 6.5us | P99.9: 28.8us\nthreads: 1 | elapsed: 0.40s | num: 200000 | iterations: 3"
+          },
+          {
+            "name": "readseq",
+            "value": 2395508.832965709,
+            "unit": "ops/sec",
+            "extra": "P50: 0.2us | P99: 4.6us | P99.9: 7.2us\nthreads: 1 | elapsed: 0.08s | num: 200000 | iterations: 3"
+          },
+          {
+            "name": "seekrandom",
+            "value": 257371.85308732823,
+            "unit": "ops/sec",
+            "extra": "P50: 3.3us | P99: 8.3us | P99.9: 22.9us\nthreads: 1 | elapsed: 0.78s | num: 200000 | iterations: 3"
+          },
+          {
+            "name": "prefixscan",
+            "value": 150888.99897716724,
+            "unit": "ops/sec",
+            "extra": "P50: 6.0us | P99: 11.9us | P99.9: 37.8us\nthreads: 1 | elapsed: 1.33s | num: 200000 | iterations: 3"
+          },
+          {
+            "name": "overwrite",
+            "value": 730065.2320950562,
+            "unit": "ops/sec",
+            "extra": "P50: 1.2us | P99: 2.5us | P99.9: 11.7us\nthreads: 1 | elapsed: 0.27s | num: 200000 | iterations: 3"
+          },
+          {
+            "name": "mergerandom",
+            "value": 761698.2908880452,
+            "unit": "ops/sec",
+            "extra": "P50: 0.4us | P99: 0.7us | P99.9: 1.7us\nthreads: 1 | elapsed: 0.26s | num: 200000 | iterations: 3"
+          },
+          {
+            "name": "readwhilewriting",
+            "value": 340766.73773419455,
+            "unit": "ops/sec",
+            "extra": "P50: 2.1us | P99: 16.5us | P99.9: 96.8us\nthreads: 1 | elapsed: 0.59s | num: 200000 | iterations: 3"
           }
         ]
       }
