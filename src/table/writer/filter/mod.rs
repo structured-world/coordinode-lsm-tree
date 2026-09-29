@@ -88,4 +88,14 @@ pub trait FilterWriter<W: crate::io::Write + crate::io::Seek> {
         self: Box<Self>,
         ecc: Option<crate::table::block::EccParams>,
     ) -> Box<dyn FilterWriter<W>>;
+
+    /// Builds this writer's filter blocks on `parallel`'s workers, published
+    /// in the order they were spilled; `None` builds them on the writer's
+    /// thread. A writer with a single filter built at `finish` has nothing to
+    /// hand out and keeps building it there.
+    #[cfg(feature = "std")]
+    fn use_parallel(
+        self: Box<Self>,
+        parallel: Option<crate::table::writer::ParallelCompression>,
+    ) -> Box<dyn FilterWriter<W>>;
 }

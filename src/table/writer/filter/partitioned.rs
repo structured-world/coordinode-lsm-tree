@@ -67,6 +67,14 @@ pub struct PartitionedFilterWriter {
     /// `Some(params)` upgrades every partition + TLI block transform to
     /// its matching `*Ecc` variant; `None` = no parity.
     ecc: Option<crate::table::block::EccParams>,
+
+    /// Where partitions are built when the table is written in parallel.
+    #[cfg(feature = "std")]
+    parallel: Option<ParallelPartitions>,
+
+    /// The partitions handed to workers and not yet published, oldest first.
+    #[cfg(feature = "std")]
+    pending: std::collections::VecDeque<PendingPartition>,
 }
 
 impl PartitionedFilterWriter {
@@ -95,18 +103,27 @@ impl PartitionedFilterWriter {
             encryption: None,
             table_id: 0,
             ecc: None,
+            #[cfg(feature = "std")]
+            parallel: None,
+            #[cfg(feature = "std")]
+            pending: std::collections::VecDeque::new(),
         }
     }
 
-    /// The top-level index's bytes once `finish` spills the open partition,
-    /// which adds an entry under its last key.
+    /// The top-level index's bytes once `finish` publishes the partitions
+    /// still on workers and spills the open one, each adding an entry under
+    /// its last key.
     fn tli_at_finish(&self) -> usize {
-        match &self.last_key {
-            Some(last) if !self.bloom_hash_buffer.is_empty() => {
-                self.tli_bytes + core::mem::size_of::<KeyedBlockHandle>() + last.len()
-            }
-            _ => self.tli_bytes,
-        }
+        let entry = |key: &UserKey| core::mem::size_of::<KeyedBlockHandle>() + key.len();
+        #[cfg(feature = "std")]
+        let pending: usize = self.pending.iter().map(|p| entry(&p.key)).sum();
+        #[cfg(not(feature = "std"))]
+        let pending = 0;
+        let open = match &self.last_key {
+            Some(last) if !self.bloom_hash_buffer.is_empty() => entry(last),
+            _ => 0,
+        };
+        self.tli_bytes + pending + open
     }
 
     /// The open partition's filter bytes, bounded from above: what `finish`
@@ -116,80 +133,136 @@ impl PartitionedFilterWriter {
             .filter_size_bound(self.bloom_hash_buffer.len()) as u64
     }
 
-    /// Builds the open partition from `hashes`, taken out of
-    /// `bloom_hash_buffer` by the caller.
-    fn spill_filter_partition(&mut self, key: &UserKey, hashes: Vec<u64>) -> crate::Result<()> {
-        let hash_count = hashes.len();
-        let partition_index = self.tli_handles.len();
-        let filter_bytes = build_burr_filter_bytes(self.bloom_policy, hashes)?;
-
-        // An empty BuRR build result means the policy is inactive for
-        // this key population (e.g. fpr <= 0 or bpk out of [1, 64]).
-        // For PARTITIONED filters, silently skipping a partition AND
-        // its TLI entry causes false negatives at read time: keys in
-        // this range would binary-search to a later partition's
-        // filter, which doesn't contain them, and Table::check_bloom
-        // would report "definitely not present" → false negative on a
-        // live key.
-        //
-        // Fail closed: return Unrecoverable so the writer aborts table
-        // creation rather than persisting a partially-filtered table.
-        // In practice this path is unreachable — BloomConstructionPolicy::
-        // is_active() is checked upstream before any keys are buffered.
-        if filter_bytes.is_empty() {
-            log::error!(
-                "BuRR partitioned writer received empty filter bytes for partition {partition_index} \
-                 ({hash_count} hashes) — policy likely inactive (silent skip would cause false negatives)",
-            );
-            return Err(crate::Error::Unrecoverable);
+    /// The settings a partition is built and framed under.
+    fn partition_settings(&self) -> PartitionSettings {
+        PartitionSettings {
+            bloom_policy: self.bloom_policy,
+            table_id: self.table_id,
+            encryption: self.encryption.clone(),
+            ecc: self.ecc,
         }
+    }
 
-        let header = Block::write_into(
-            &mut self.final_filter_buffer,
-            &filter_bytes,
-            crate::table::block::BlockIdentity {
-                table_id: self.table_id,
-                block_type: crate::table::block::BlockType::Filter,
-                dict_id: 0,
-                window_log: 0,
-            },
-            // Per-partition filter bodies are uncompressed; layer
-            // ECC on top when the tree was opened with
-            // `Config::page_ecc(true)`.
-            &{
-                let t = match self.encryption.as_deref() {
-                    Some(enc) => crate::table::block::BlockTransform::Encrypted(enc),
-                    None => crate::table::block::BlockTransform::PLAIN,
-                };
-                if let Some(ecc) = self.ecc {
-                    t.with_ecc(ecc)
-                } else {
-                    t
+    /// Builds the open partition from `hashes`, taken out of
+    /// `bloom_hash_buffer` by the caller, on a worker when the writer has
+    /// any and here otherwise.
+    fn spill_filter_partition(&mut self, key: &UserKey, hashes: Vec<u64>) -> crate::Result<()> {
+        self.approx_filter_size = 0;
+        let partition_index = self.tli_handles.len() + self.pending_count();
+        #[cfg(feature = "std")]
+        if self.parallel.is_some() {
+            // At the cap, one built partition is published before the next
+            // is handed out, so a table with many partitions never holds
+            // them all unwritten at once.
+            if self
+                .parallel
+                .as_ref()
+                .is_some_and(|parallel| self.pending.len() >= parallel.cap())
+            {
+                self.publish_next()?;
+            }
+            self.pending.push_back(PendingPartition {
+                key: key.clone(),
+                hash_bytes: (hashes.len() * core::mem::size_of::<u64>()) as u64,
+                framed: self.partition_bound(hashes.len()),
+            });
+            // Started on the first partition, once every setting is final.
+            if self
+                .parallel
+                .as_ref()
+                .is_some_and(|parallel| !parallel.started())
+            {
+                let settings = self.partition_settings();
+                if let Some(parallel) = self.parallel.as_mut() {
+                    parallel.start(settings);
                 }
-            },
-            // Framed ahead of its place in the file; `finish` binds it.
-            crate::table::block::ChecksumAt::Unbound,
+            }
+            if let Some(parallel) = self.parallel.as_mut() {
+                parallel.submit(PartitionJob {
+                    hashes,
+                    partition_index,
+                });
+            }
+            return Ok(());
+        }
+        let bytes_written = build_partition(
+            &self.partition_settings(),
+            hashes,
+            partition_index,
+            &mut self.final_filter_buffer,
         )?;
+        self.record_partition(key, bytes_written);
+        Ok(())
+    }
 
-        let bytes_written = header.on_disk_size_with(self.ecc);
+    /// Partitions handed to workers and not yet published.
+    fn pending_count(&self) -> usize {
+        #[cfg(feature = "std")]
+        return self.pending.len();
+        #[cfg(not(feature = "std"))]
+        0
+    }
 
+    /// Adds the partition just appended to `final_filter_buffer`, `bytes`
+    /// long and ending at `key`, to the top-level index.
+    fn record_partition(&mut self, key: &UserKey, bytes: u32) {
         self.tli_handles.push(KeyedBlockHandle::new(
             key.clone(),
             0,
-            BlockHandle::new(BlockOffset(self.relative_file_pos), bytes_written),
+            BlockHandle::new(BlockOffset(self.relative_file_pos), bytes),
         ));
         self.tli_bytes += core::mem::size_of::<KeyedBlockHandle>() + key.len();
-
         log::trace!(
-            "Built BuRR filter partition ({}B) with end_key={key:?} at +{:#X?}",
-            filter_bytes.len(),
+            "Built BuRR filter partition ({bytes}B framed) with end_key={key:?} at +{:#X?}",
             self.relative_file_pos,
         );
+        self.relative_file_pos += u64::from(bytes);
+    }
 
-        self.approx_filter_size = 0;
-        self.relative_file_pos += u64::from(bytes_written);
-
+    /// Appends the oldest partition built on a worker and indexes it, in the
+    /// order the partitions were spilled.
+    #[cfg(feature = "std")]
+    fn publish_next(&mut self) -> crate::Result<()> {
+        let Some(partition) = self.pending.pop_front() else {
+            return Ok(());
+        };
+        let Some(built) = self
+            .parallel
+            .as_mut()
+            .and_then(ParallelPartitions::take_next)
+        else {
+            return Err(crate::Error::Io(crate::io::Error::other(
+                "parallel filter partitions out of step with their keys",
+            )));
+        };
+        let (framed, bytes) = built?;
+        debug_assert_eq!(framed.len(), bytes as usize, "a partition is its frame");
+        self.final_filter_buffer.extend_from_slice(&framed);
+        self.record_partition(&partition.key, bytes);
         Ok(())
+    }
+
+    /// Framed bytes a partition of `hashes` hashes takes, bounded from above.
+    #[cfg(feature = "std")]
+    fn partition_bound(&self, hashes: usize) -> u64 {
+        crate::table::block::framed_len_bound(
+            self.bloom_policy.filter_size_bound(hashes) as u64,
+            crate::table::block::BlockType::Filter,
+            CompressionType::None,
+            self.encryption.as_deref(),
+            self.ecc,
+        )
+    }
+
+    /// The hash bytes and the framed-output bound of the partitions handed
+    /// to workers and not yet published.
+    fn pending_bytes(&self) -> (u64, u64) {
+        #[cfg(feature = "std")]
+        return self.pending.iter().fold((0, 0), |(hashes, framed), p| {
+            (hashes + p.hash_bytes, framed + p.framed)
+        });
+        #[cfg(not(feature = "std"))]
+        (0, 0)
     }
 
     fn write_top_level_index<WR: Write + Seek>(
@@ -251,10 +324,165 @@ impl PartitionedFilterWriter {
     }
 }
 
+/// What every partition of one table is built and framed under.
+struct PartitionSettings {
+    bloom_policy: BloomConstructionPolicy,
+    table_id: crate::TableId,
+    encryption: Option<Arc<dyn EncryptionProvider>>,
+    ecc: Option<crate::table::block::EccParams>,
+}
+
+/// Builds the filter of `hashes` and frames it onto `out`, returning the
+/// framed length. The frame's checksum is left unbound: its place in the
+/// file is known only when `finish` writes the partitions out.
+fn build_partition(
+    settings: &PartitionSettings,
+    hashes: Vec<u64>,
+    partition_index: usize,
+    out: &mut Vec<u8>,
+) -> crate::Result<u32> {
+    let hash_count = hashes.len();
+    let filter_bytes = build_burr_filter_bytes(settings.bloom_policy, hashes)?;
+
+    // An empty BuRR build result means the policy is inactive for this key
+    // population (e.g. fpr <= 0 or bpk out of [1, 64]). For PARTITIONED
+    // filters, silently skipping a partition AND its TLI entry causes false
+    // negatives at read time: keys in this range would binary-search to a
+    // later partition's filter, which doesn't contain them, and
+    // Table::check_bloom would report "definitely not present" → false
+    // negative on a live key.
+    //
+    // Fail closed: return Unrecoverable so the writer aborts table creation
+    // rather than persisting a partially-filtered table. In practice this
+    // path is unreachable — BloomConstructionPolicy::is_active() is checked
+    // upstream before any keys are buffered.
+    if filter_bytes.is_empty() {
+        log::error!(
+            "BuRR partitioned writer received empty filter bytes for partition {partition_index} \
+             ({hash_count} hashes) — policy likely inactive (silent skip would cause false negatives)",
+        );
+        return Err(crate::Error::Unrecoverable);
+    }
+
+    let header = Block::write_into(
+        out,
+        &filter_bytes,
+        crate::table::block::BlockIdentity {
+            table_id: settings.table_id,
+            block_type: crate::table::block::BlockType::Filter,
+            dict_id: 0,
+            window_log: 0,
+        },
+        // Per-partition filter bodies are uncompressed; layer ECC on top when
+        // the tree was opened with `Config::page_ecc(true)`.
+        &{
+            let t = match settings.encryption.as_deref() {
+                Some(enc) => crate::table::block::BlockTransform::Encrypted(enc),
+                None => crate::table::block::BlockTransform::PLAIN,
+            };
+            if let Some(ecc) = settings.ecc {
+                t.with_ecc(ecc)
+            } else {
+                t
+            }
+        },
+        // Framed ahead of its place in the file; `finish` binds it.
+        crate::table::block::ChecksumAt::Unbound,
+    )?;
+    Ok(header.on_disk_size_with(settings.ecc))
+}
+
+/// One partition to build on a worker.
+#[cfg(feature = "std")]
+struct PartitionJob {
+    hashes: Vec<u64>,
+    /// Its place among the table's partitions, for the failure log.
+    partition_index: usize,
+}
+
+#[cfg(feature = "std")]
+impl crate::table::writer::ordered_pipeline::OrderedJob for PartitionJob {
+    type Context = PartitionSettings;
+    /// The framed partition and its framed length.
+    type Output = crate::Result<(Vec<u8>, u32)>;
+
+    fn run(self, settings: &PartitionSettings) -> Self::Output {
+        let mut framed = Vec::new();
+        let bytes = build_partition(settings, self.hashes, self.partition_index, &mut framed)?;
+        Ok((framed, bytes))
+    }
+}
+
+/// A partition handed to a worker and not yet published: what the writer
+/// indexes it under, and what it holds meanwhile.
+#[cfg(feature = "std")]
+struct PendingPartition {
+    key: UserKey,
+    /// The hashes it is built from.
+    hash_bytes: u64,
+    /// Its framed length, bounded from above.
+    framed: u64,
+}
+
+/// The ordered pipeline a table's partitions are built on, started on the
+/// first partition.
+#[cfg(feature = "std")]
+struct ParallelPartitions {
+    parallel: crate::table::writer::ParallelCompression,
+    pipeline: Option<crate::table::writer::ordered_pipeline::OrderedPipeline<PartitionJob>>,
+}
+
+#[cfg(feature = "std")]
+impl ParallelPartitions {
+    /// The most partitions a writer keeps on workers at once, the same bound
+    /// the table's blocks run under.
+    fn cap(&self) -> usize {
+        (self.parallel.threads * 2).max(1)
+    }
+
+    fn started(&self) -> bool {
+        self.pipeline.is_some()
+    }
+
+    fn start(&mut self, settings: PartitionSettings) {
+        let cap = self.cap();
+        self.pipeline = Some(
+            crate::table::writer::ordered_pipeline::OrderedPipeline::new(
+                Arc::clone(&self.parallel.spawner),
+                settings,
+                self.parallel.threads,
+                cap,
+            ),
+        );
+    }
+
+    fn submit(&mut self, job: PartitionJob) {
+        if let Some(pipeline) = self.pipeline.as_mut() {
+            pipeline.submit(job);
+        }
+    }
+
+    fn take_next(&mut self) -> Option<crate::Result<(Vec<u8>, u32)>> {
+        self.pipeline.as_mut()?.take_next()
+    }
+}
+
 #[cfg(test)]
 mod tests;
 
 impl<W: crate::io::Write + crate::io::Seek> FilterWriter<W> for PartitionedFilterWriter {
+    #[cfg(feature = "std")]
+    fn use_parallel(
+        mut self: Box<Self>,
+        parallel: Option<crate::table::writer::ParallelCompression>,
+    ) -> Box<dyn FilterWriter<W>> {
+        self.parallel = parallel.map(|parallel| ParallelPartitions {
+            parallel,
+            pipeline: None,
+        });
+        self
+    }
+
     fn use_encryption(
         mut self: Box<Self>,
         encryption: Option<Arc<dyn EncryptionProvider>>,
@@ -344,46 +572,55 @@ impl<W: crate::io::Write + crate::io::Seek> FilterWriter<W> for PartitionedFilte
     }
 
     fn held_bytes(&self) -> u64 {
-        // The built partitions stay buffered until `finish` writes them.
+        // The built partitions stay buffered until `finish` writes them, and
+        // those on workers hold their hashes and then their framed bytes.
         let hashes = self.bloom_hash_buffer.capacity() * core::mem::size_of::<u64>();
         let tli = super::super::handles_held(
             self.tli_bytes,
             &self.tli_handles,
             self.tli_handles.capacity(),
         );
+        let (pending_hashes, pending_framed) = self.pending_bytes();
         (self.final_filter_buffer.capacity() + hashes + tli) as u64
+            + pending_hashes
+            + pending_framed
     }
 
     fn finish_scratch_bytes(&self) -> u64 {
         use crate::table::block::{BlockType, framed_len_bound, transform_scratch_bound};
         let encryption = self.encryption.as_deref();
-        // `finish` builds the open partition and frames it onto the partition
-        // buffer, which reallocates when it outgrows its capacity and holds
-        // both copies while it moves.
-        let open = if self.bloom_hash_buffer.is_empty() {
-            0
+        // `finish` builds the open partition and frames it, and appends it and
+        // the partitions still on workers to the partition buffer, which
+        // reallocates when it outgrows its capacity and holds both copies
+        // while it moves.
+        let (build, filter, frame) = if self.bloom_hash_buffer.is_empty() {
+            (0, 0, 0)
         } else {
-            let build = crate::table::filter::ribbon::burr::builder::build_peak_bytes(
-                self.bloom_hash_buffer.len(),
-                false,
-            ) as u64;
             let filter = self.open_partition_bound();
-            let frame = framed_len_bound(
+            (
+                crate::table::filter::ribbon::burr::builder::build_peak_bytes(
+                    self.bloom_hash_buffer.len(),
+                    false,
+                ) as u64,
                 filter,
-                BlockType::Filter,
-                CompressionType::None,
-                encryption,
-                self.ecc,
-            );
-            let needed = self.final_filter_buffer.len() as u64 + frame;
-            let capacity = self.final_filter_buffer.capacity() as u64;
-            let growth = if needed > capacity {
-                needed.max(2 * capacity)
-            } else {
-                0
-            };
-            build + filter + frame + growth
+                framed_len_bound(
+                    filter,
+                    BlockType::Filter,
+                    CompressionType::None,
+                    encryption,
+                    self.ecc,
+                ),
+            )
         };
+        let (_, pending_framed) = self.pending_bytes();
+        let needed = self.final_filter_buffer.len() as u64 + pending_framed + frame;
+        let capacity = self.final_filter_buffer.capacity() as u64;
+        let growth = if needed > capacity {
+            needed.max(2 * capacity)
+        } else {
+            0
+        };
+        let open = build + filter + frame + growth;
         // Then the top-level index, counted at its in-memory size, and its
         // framed copy.
         let tli = self.tli_at_finish() as u64;
@@ -418,7 +655,9 @@ impl<W: crate::io::Write + crate::io::Seek> FilterWriter<W> for PartitionedFilte
             )
         };
         let tli = self.tli_at_finish();
+        let (_, pending_framed) = self.pending_bytes();
         self.final_filter_buffer.len() as u64
+            + pending_framed
             + open
             + framed_len_bound(
                 tli as u64,
@@ -447,6 +686,12 @@ impl<W: crate::io::Write + crate::io::Seek> FilterWriter<W> for PartitionedFilte
             // No partition follows the last one, so the buffer goes whole.
             let hashes = core::mem::take(&mut self.bloom_hash_buffer);
             self.spill_filter_partition(&last_key, hashes)?;
+        }
+        // Every partition is in the buffer, in spill order, before any of
+        // them is bound to its place in the file.
+        #[cfg(feature = "std")]
+        while !self.pending.is_empty() {
+            self.publish_next()?;
         }
 
         let index_base_offset = BlockOffset(file_writer.get_mut().stream_position()?);

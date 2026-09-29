@@ -6558,6 +6558,16 @@ fn parallel_compression_matches_serial_output() -> crate::Result<()> {
 
     check(&|w| w.use_data_block_size(256), &as_written, "plain", false)?;
     check(
+        &|w| {
+            w.use_data_block_size(256)
+                .use_partitioned_filter()
+                .use_filter_partition_size(256)
+        },
+        &as_written,
+        "partitioned filter",
+        false,
+    )?;
+    check(
         &|w| w.use_data_block_size(256).use_seqno_in_index(true),
         &as_written,
         "seqno_in_index",
