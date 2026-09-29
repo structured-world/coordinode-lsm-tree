@@ -21,7 +21,10 @@ fn blob_file_merger_seqno() -> crate::Result<()> {
     }
 
     {
-        let mut merger = MergeScanner::new(vec![Scanner::new(&blob_file_path, &StdFs, 0)?]);
+        let mut merger = MergeScanner::new(
+            vec![Scanner::new(&blob_file_path, &StdFs, 0)?],
+            crate::comparator::default_comparator(),
+        );
 
         assert_eq!(
             (Slice::from(b"a"), Slice::from(b"1".repeat(100))),
@@ -80,10 +83,13 @@ fn blob_file_merger() -> crate::Result<()> {
     }
 
     {
-        let mut merger = MergeScanner::new(vec![
-            Scanner::new(&blob_file_0_path, &StdFs, 0)?,
-            Scanner::new(&blob_file_1_path, &StdFs, 1)?,
-        ]);
+        let mut merger = MergeScanner::new(
+            vec![
+                Scanner::new(&blob_file_0_path, &StdFs, 0)?,
+                Scanner::new(&blob_file_1_path, &StdFs, 1)?,
+            ],
+            crate::comparator::default_comparator(),
+        );
 
         let merged_keys = [b"a", b"b", b"c", b"d", b"e"];
 
@@ -100,5 +106,51 @@ fn blob_file_merger() -> crate::Result<()> {
         assert!(merger.next().is_none());
     }
 
+    Ok(())
+}
+
+/// Files written in a reversed key order merge in that order: the merger
+/// follows the tree's comparator, not the key bytes.
+#[test]
+fn blob_file_merger_follows_the_tree_comparator() -> crate::Result<()> {
+    struct Reverse;
+    impl crate::comparator::UserComparator for Reverse {
+        fn name(&self) -> &'static str {
+            "reverse"
+        }
+        fn compare(&self, a: &[u8], b: &[u8]) -> core::cmp::Ordering {
+            b.cmp(a)
+        }
+    }
+
+    let dir = tempdir()?;
+    let paths = [dir.path().join("0"), dir.path().join("1")];
+    for (id, (path, keys)) in paths
+        .iter()
+        .zip([[b"e", b"c", b"a"].as_slice(), [b"f", b"d", b"b"].as_slice()])
+        .enumerate()
+    {
+        let mut writer = BlobFileWriter::new(path, id as u64, 0, &StdFs)?;
+        for key in keys {
+            writer.write(*key, 0, &key.repeat(100))?;
+        }
+        writer.finish()?;
+    }
+
+    let merger = MergeScanner::new(
+        vec![
+            Scanner::new(&paths[0], &StdFs, 0)?,
+            Scanner::new(&paths[1], &StdFs, 1)?,
+        ],
+        alloc::sync::Arc::new(Reverse),
+    );
+    let keys = merger
+        .map(|result| result.map(|(entry, _)| entry.key))
+        .collect::<crate::Result<Vec<_>>>()?;
+    let want: Vec<Slice> = [b"f", b"e", b"d", b"c", b"b", b"a"]
+        .into_iter()
+        .map(|k| Slice::from(k.as_slice()))
+        .collect();
+    assert_eq!(keys, want);
     Ok(())
 }

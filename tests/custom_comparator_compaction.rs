@@ -956,3 +956,54 @@ fn reverse_comparator_ingestion_tombstone_accepts_correct_order() -> lsm_tree::R
 
     Ok(())
 }
+
+// ===========================================================================
+// Blob relocation under a reverse comparator
+//
+// A relocating compaction walks the blob files it rewrites alongside the
+// merged table stream, so both must advance in the comparator's order.
+// ===========================================================================
+
+/// Over the default 1 KiB separation threshold, so it lands in a blob file.
+fn blob_value(i: u64) -> Vec<u8> {
+    format!("value-{i:04}-").repeat(128).into_bytes()
+}
+
+/// Rewriting a stale blob file skips the values nothing points at any more,
+/// in the order the table stream reaches their keys.
+#[test]
+fn reverse_comparator_relocates_a_stale_blob_file() -> lsm_tree::Result<()> {
+    let folder = tempfile::tempdir()?;
+    let tree = Config::new(
+        &folder,
+        SequenceNumberCounter::default(),
+        SequenceNumberCounter::default(),
+    )
+    .comparator(Arc::new(ReverseComparator))
+    .with_kv_separation(Some(
+        lsm_tree::KvSeparationOptions::default()
+            .staleness_threshold(0.01)
+            .age_cutoff(1.0),
+    ))
+    .open()?;
+    for i in 0..64u64 {
+        tree.insert(format!("key{i:04}"), blob_value(i), i);
+    }
+    tree.flush_active_memtable(0)?;
+    // Every other key is deleted, so the file keeps values nothing reaches.
+    for i in (0..64u64).step_by(2) {
+        tree.remove(format!("key{i:04}"), 100 + i);
+    }
+    tree.flush_active_memtable(0)?;
+    tree.major_compact(u64::MAX, u64::MAX)?;
+    assert!(tree.stale_blob_bytes() > 0, "the blob file must be stale");
+
+    tree.major_compact(u64::MAX, u64::MAX)?;
+    assert_eq!(tree.stale_blob_bytes(), 0, "the stale file was rewritten");
+    for i in 0..64u64 {
+        let got = tree.get(format!("key{i:04}"), SeqNo::MAX)?;
+        let want = (i % 2 == 1).then(|| blob_value(i));
+        assert_eq!(got.as_deref(), want.as_deref(), "key{i:04}");
+    }
+    Ok(())
+}

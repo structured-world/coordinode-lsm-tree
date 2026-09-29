@@ -71,15 +71,14 @@ impl Scanner {
 
     /// Re-opens a blob file mid-stream, positioning the reader at `start_offset`
     /// (an absolute data-section frame boundary captured from a previous scan's
-    /// [`ScanEntry::frame_end`]). Used by the tight-space blob relocation loop so
-    /// each slice resumes the stale-file scan where the prior slice stopped,
-    /// instead of re-reading a prefix that has already been hole-punched.
+    /// [`ScanEntry::frame_end`]), or at the committed frontier of a restricted
+    /// file. Relocation resumes there instead of re-reading a prefix that has
+    /// already been hole-punched.
     ///
     /// # Errors
     ///
     /// Returns `Err` if an IO error occurs, the blob file lacks a "data" section,
     /// or `start_offset` falls outside the data section.
-    #[cfg(feature = "std")]
     pub fn resume<P: AsRef<Path>>(
         path: P,
         fs: &dyn Fs,

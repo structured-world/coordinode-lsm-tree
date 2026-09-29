@@ -2170,28 +2170,11 @@ fn run_subcompaction(
                     .stale_files
                     .iter()
                     .map(|bf| {
-                        // Never scan below the frontier the FILE itself
-                        // declares: a relocation that committed a slice and
-                        // then aborted leaves the stale file restricted with
-                        // its consumed prefix punched, and this run's map
-                        // starts empty. Reading from the data section would
-                        // hit those zeros, resynchronize byte-wise, and taint
-                        // every surviving frame, so the retry could never
-                        // relocate anything. Deciding it here (rather than
-                        // seeding the map) keeps the two from drifting apart.
-                        let off = reloc
-                            .resume_offsets
-                            .get(&bf.id())
-                            .copied()
-                            .unwrap_or(0)
-                            .max(bf.live_data_start());
-                        if off == 0 {
-                            BlobFileScanner::new(&bf.0.path, &*bf.0.fs, bf.id())
-                        } else {
-                            BlobFileScanner::resume(&bf.0.path, &*bf.0.fs, bf.id(), off)
-                        }
+                        let from = reloc.resume_offsets.get(&bf.id()).copied().unwrap_or(0);
+                        open_blob_scanner_at_frontier(bf, from)
                     })
                     .collect::<crate::Result<Vec<_>>>()?,
+                opts.config.comparator.clone(),
             );
 
             let writer = BlobFileWriter::new(
@@ -2223,6 +2206,7 @@ fn run_subcompaction(
                 reloc.stale_files,
                 opts.rate_limiter.clone(),
                 opts.stop_signal.clone(),
+                opts.config.comparator.clone(),
             ))
         }
         _ => Box::new(StandardCompaction::new(table_writer, tables_for_deletion)),
@@ -2435,6 +2419,22 @@ pub fn pick_blob_files_to_rewrite(
     }
 
     Ok(linked_blob_files.into_iter().cloned().collect::<Vec<_>>())
+}
+
+/// Opens a relocation scan of `bf` at `from`, or at the frontier the file
+/// itself declares when that lies further.
+///
+/// A relocation that committed a slice and then aborted leaves the file
+/// restricted with its consumed prefix punched. Reading from the data section
+/// would hit those zeros, resynchronize byte-wise and taint every surviving
+/// frame, so no later merge could relocate the file.
+fn open_blob_scanner_at_frontier(bf: &BlobFile, from: u64) -> crate::Result<BlobFileScanner> {
+    let off = from.max(bf.live_data_start());
+    if off == 0 {
+        BlobFileScanner::new(&bf.0.path, &*bf.0.fs, bf.id())
+    } else {
+        BlobFileScanner::resume(&bf.0.path, &*bf.0.fs, bf.id(), off)
+    }
 }
 
 fn hidden_guard<T>(
@@ -3089,8 +3089,9 @@ fn merge_tables(
                 let scanner = BlobFileMergeScanner::new(
                     blob_files_to_rewrite
                         .iter()
-                        .map(|bf| BlobFileScanner::new(&bf.0.path, &*bf.0.fs, bf.id()))
+                        .map(|bf| open_blob_scanner_at_frontier(bf, 0))
                         .collect::<crate::Result<Vec<_>>>()?,
+                    opts.config.comparator.clone(),
                 );
 
                 let writer = BlobFileWriter::new(
@@ -3119,6 +3120,7 @@ fn merge_tables(
                     blob_files_to_rewrite,
                     opts.rate_limiter.clone(),
                     opts.stop_signal.clone(),
+                    opts.config.comparator.clone(),
                 ))
             }
         }
