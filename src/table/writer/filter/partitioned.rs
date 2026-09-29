@@ -354,12 +354,12 @@ fn build_partition(
     //
     // Fail closed: return Unrecoverable so the writer aborts table creation
     // rather than persisting a partially-filtered table. In practice this
-    // path is unreachable — BloomConstructionPolicy::is_active() is checked
+    // path is unreachable: BloomConstructionPolicy::is_active() is checked
     // upstream before any keys are buffered.
     if filter_bytes.is_empty() {
         log::error!(
             "BuRR partitioned writer received empty filter bytes for partition {partition_index} \
-             ({hash_count} hashes) — policy likely inactive (silent skip would cause false negatives)",
+             ({hash_count} hashes): policy likely inactive (silent skip would cause false negatives)",
         );
         return Err(crate::Error::Unrecoverable);
     }
