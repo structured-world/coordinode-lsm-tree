@@ -264,8 +264,21 @@ pub fn do_compaction(opts: &Options) -> crate::Result<CompactionResult> {
                 }
             }
 
-            // Only a real trivial move has to answer this one: the rewrite
-            // above consolidates the same inputs into one sorted output, which
+            // A move carries its tables' blob layout down unchanged, and a
+            // table at the bottom level may never be merged again. When locality
+            // relocation would rewrite some of their blob files, the same inputs
+            // are merged instead, within the same budget and space check.
+            if moves_into_locality_relocation(
+                &version_history_lock.latest_version_ref().version,
+                opts,
+                &payload,
+            )? {
+                log::debug!("Converting trivial move to merge: blob locality relocation");
+                return merge_tables(compaction_state, version_history_lock, opts, &payload);
+            }
+
+            // Only a real trivial move has to answer this one: the rewrites
+            // above consolidate the same inputs into one sorted output, which
             // is the repair rather than the problem.
             if !moved_tables_can_share_a_run(
                 &version_history_lock.latest_version_ref().version,
@@ -2225,6 +2238,7 @@ fn run_subcompaction(
                         }
                     })
                     .collect::<crate::Result<Vec<_>>>()?,
+                opts.config.comparator.clone(),
             );
 
             let writer = BlobFileWriter::new(
@@ -2256,6 +2270,7 @@ fn run_subcompaction(
                 reloc.stale_files,
                 opts.rate_limiter.clone(),
                 opts.stop_signal.clone(),
+                opts.config.comparator.clone(),
             ))
         }
         _ => Box::new(StandardCompaction::new(table_writer, tables_for_deletion)),
@@ -2487,6 +2502,34 @@ fn pick_blob_files_for_merge(
         files.extend(extra);
     }
     Ok(files)
+}
+
+/// Whether merging a move's tables instead would relocate blob files for
+/// locality. Stale files alone do not turn a move into a merge.
+fn moves_into_locality_relocation(
+    version: &Version,
+    opts: &Options,
+    payload: &CompactionPayload,
+) -> crate::Result<bool> {
+    let Some(blob_opts) = &opts.config.kv_separation_opts else {
+        return Ok(false);
+    };
+    let Some(locality) = blob_opts.locality_relocation else {
+        return Ok(false);
+    };
+    let Some(tables) = payload
+        .table_ids
+        .iter()
+        .map(|&id| version.get_table(id).cloned())
+        .collect::<Option<Vec<_>>>()
+    else {
+        return Ok(false);
+    };
+    let stale = pick_blob_files_to_rewrite(&payload.table_ids, version, blob_opts)?;
+    Ok(
+        !pick_blob_files_for_locality(opts, version, payload, &tables, locality, &stale)?
+            .is_empty(),
+    )
 }
 
 /// Blob files to relocate, beyond the stale ones already chosen, so a scan
@@ -3265,6 +3308,7 @@ fn merge_tables(
                         .iter()
                         .map(|bf| BlobFileScanner::new(&bf.0.path, &*bf.0.fs, bf.id()))
                         .collect::<crate::Result<Vec<_>>>()?,
+                    opts.config.comparator.clone(),
                 );
 
                 let writer = BlobFileWriter::new(
@@ -3293,6 +3337,7 @@ fn merge_tables(
                     blob_files_to_rewrite,
                     opts.rate_limiter.clone(),
                     opts.stop_signal.clone(),
+                    opts.config.comparator.clone(),
                 ))
             }
         }

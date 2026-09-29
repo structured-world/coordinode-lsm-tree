@@ -4468,6 +4468,72 @@ mod locality_relocation {
         Ok(())
     }
 
+    /// Merges exactly the named tables into `dest`.
+    struct MergeInto(Vec<crate::TableId>, u8);
+
+    impl crate::compaction::CompactionStrategy for MergeInto {
+        fn get_name(&self) -> &'static str {
+            "MergeIntoTest"
+        }
+
+        fn choose(
+            &self,
+            _: &crate::version::Version,
+            _: &Config,
+            _: &crate::compaction::state::CompactionState,
+        ) -> crate::compaction::Choice {
+            crate::compaction::Choice::Merge(crate::compaction::Input {
+                table_ids: self.0.iter().copied().collect(),
+                dest_level: self.1,
+                canonical_level: self.1,
+                target_size: u64::MAX,
+            })
+        }
+    }
+
+    /// A deeply interleaved table that a strategy only moves down is rewritten
+    /// on the way instead: a move would carry the interleaving to the bottom
+    /// level, where nothing may ever merge it again.
+    #[test]
+    fn a_move_of_a_deeply_interleaved_table_relocates_it() -> crate::Result<()> {
+        let folder = tempfile::tempdir()?;
+        {
+            // One interleaved table on level 1, merged with relocation off.
+            let tree = open(folder.path(), KvSeparationOptions::default())?;
+            fill_interleaved(&tree)?;
+            let ids: Vec<_> = tree
+                .current_version()
+                .iter_tables()
+                .map(crate::Table::id)
+                .collect();
+            tree.compact(Arc::new(MergeInto(ids, 1)), u64::MAX)?;
+            assert_eq!(tree.table_count(), 1);
+            assert_eq!(
+                tree.storage_stats()?.blob_references.depth,
+                FILES,
+                "the merge left the files interleaved",
+            );
+        }
+
+        let tree = open(folder.path(), relocating())?;
+        let Some(table) = tree
+            .current_version()
+            .iter_tables()
+            .next()
+            .map(crate::Table::id)
+        else {
+            panic!("the merge left one table");
+        };
+        let before = blob_ids(&tree);
+        tree.compact(Arc::new(super::MoveTables(vec![table], 6)), u64::MAX)?;
+        assert!(
+            before.is_disjoint(&blob_ids(&tree)),
+            "the interleaved files were rewritten on the way down",
+        );
+        assert_eq!(tree.storage_stats()?.blob_references.depth, 1);
+        Ok(())
+    }
+
     /// Relocation for locality is optional work: a quota that leaves room for
     /// the merged table but not for the rewritten values skips it, while the
     /// merge itself still runs.

@@ -715,11 +715,16 @@ impl Table {
         self.0
             .blob_links
             .get_or_try_init(|| {
-                Ok(self
-                    .list_blob_file_references()?
-                    .unwrap_or_default()
-                    .into_boxed_slice()
-                    .into())
+                // The links are kept once read, so the descriptor is needed
+                // this once only: it is taken without promoting or caching it,
+                // which keeps a statistics call over every table from churning
+                // the descriptors the workload is using.
+                let links = self.read_blob_file_references(|| {
+                    Ok(self
+                        .file_accessor
+                        .peek_or_open_table(&self.global_id(), &self.path)?)
+                })?;
+                Ok(links.unwrap_or_default().into_boxed_slice().into())
             })
             .map(|links| &**links)
     }

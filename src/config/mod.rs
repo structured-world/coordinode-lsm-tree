@@ -391,8 +391,10 @@ impl KvSeparationOptions {
     /// reference files interleaved deeper than `max_depth` (see
     /// [`BlobReferenceStats::depth`](crate::BlobReferenceStats::depth)) rewrites
     /// the deepest ones in key order, so each output file holds one run of
-    /// adjacent keys. Files written in consecutive key runs have a depth of one
-    /// and are never relocated for this, however many there are.
+    /// adjacent keys. A table a strategy would only move to another level is
+    /// merged instead when this applies to it, so the interleaving is not
+    /// carried down unchanged. Files written in consecutive key runs have a
+    /// depth of one and are never relocated for this, however many there are.
     ///
     /// Relocation is bounded three ways:
     /// - only whole files are rewritten, and only those no table outside the

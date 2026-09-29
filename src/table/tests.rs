@@ -907,6 +907,43 @@ fn restricted_view_clamps_visible_range_tombstones() -> crate::Result<()> {
 /// counts are right but whose span stops at `key00007` is rejected by the exact
 /// check, and by the restricted view's containment check too, since the suffix
 /// from `key00005` still reaches `key00009`.
+/// Reading a table's blob links, which the storage statistics do the first
+/// time, leaves the descriptor cache as it found it: a table whose descriptor
+/// was not cached is not cached by it, so a monitoring call over many tables
+/// cannot evict the descriptors the workload is using.
+#[test]
+fn blob_links_do_not_cache_the_tables_descriptor() -> crate::Result<()> {
+    use crate::AbstractTree;
+
+    let dir = tempdir()?;
+    let descriptors = Arc::new(crate::DescriptorTable::new(16));
+    let tree = crate::Config::new(
+        dir.path(),
+        crate::SequenceNumberCounter::default(),
+        crate::SequenceNumberCounter::default(),
+    )
+    .use_descriptor_table(Some(descriptors.clone()))
+    .with_kv_separation(Some(crate::KvSeparationOptions::default()))
+    .open()?;
+    for i in 0..10u64 {
+        tree.insert(format!("key{i:04}"), vec![b'v'; 2_048], i);
+    }
+    tree.flush_active_memtable(0)?;
+
+    let version = tree.current_version();
+    let Some(table) = version.iter_tables().next() else {
+        panic!("the flush wrote a table");
+    };
+    descriptors.remove_for_table(&table.global_id());
+
+    assert_eq!(table.blob_links()?.len(), 1, "one blob file is referenced");
+    assert!(
+        descriptors.peek_for_table(&table.global_id()).is_none(),
+        "the link read must not cache the descriptor",
+    );
+    Ok(())
+}
+
 #[cfg(feature = "std")]
 #[test]
 fn verify_blob_links_rejects_a_narrowed_key_span() -> crate::Result<()> {
