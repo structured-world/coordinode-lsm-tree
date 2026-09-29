@@ -2650,18 +2650,26 @@ fn pick_blob_files_for_locality(
 
     // A file rewritten without another it overlaps keeps its span: its
     // interleaving stays, and joining it to a disjoint run would only stretch
-    // that run's span across the gap. Keep the picks that overlap another file
-    // being relocated, again after each removal, since a removal can leave
-    // another pick without its partner.
+    // that run's span across the gap. The partner must share its codec too:
+    // relocation copies frames verbatim, one output file per source codec, so
+    // files of different codecs stay apart however they overlap. Keep the
+    // picks with such a partner among the files being relocated, again after
+    // each removal, since a removal can leave another pick without one.
+    let mut codecs: Vec<crate::CompressionType> = Vec::new();
     loop {
-        let relocated: Vec<crate::vlog::BlobFileId> = stale
-            .iter()
-            .map(BlobFile::id)
-            .chain(picked.iter().map(|(bf, _)| bf.id()))
-            .collect();
+        let mut relocated: Vec<(crate::vlog::BlobFileId, usize)> = Vec::new();
+        for bf in stale.iter().chain(picked.iter().map(|(bf, _)| bf)) {
+            let codec = bf.compression();
+            let group = codecs.iter().position(|c| *c == codec).unwrap_or_else(|| {
+                codecs.push(codec);
+                codecs.len() - 1
+            });
+            relocated.push((bf.id(), group));
+        }
+        relocated.sort_unstable_by_key(|&(id, _)| id);
         let overlapping = crate::storage_stats::overlapping_blob_files(tables, &relocated)?;
         let before = picked.len();
-        picked.retain(|(bf, _)| overlapping.contains(&bf.id()));
+        picked.retain(|(bf, _)| overlapping.binary_search(&bf.id()).is_ok());
         if picked.len() == before {
             break;
         }

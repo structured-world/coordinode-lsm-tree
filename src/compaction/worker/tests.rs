@@ -4762,6 +4762,52 @@ mod locality_relocation {
         Ok(())
     }
 
+    /// Relocation copies frames verbatim, one output file per source codec, so
+    /// interleaved files of two codecs collapse to one file per codec and no
+    /// further. A compaction after that has nothing to gain and rewrites
+    /// nothing, rather than rewriting the same two files over and over.
+    #[cfg(feature = "lz4")]
+    #[test]
+    fn locality_relocation_stops_at_one_file_per_codec() -> crate::Result<()> {
+        let folder = tempfile::tempdir()?;
+        let Some(max_depth) = NonZeroU64::new(1) else {
+            panic!("one is not zero");
+        };
+        let AnyTree::Blob(blob) = open(
+            folder.path(),
+            KvSeparationOptions::default().relocate_for_locality(max_depth, f32::MAX),
+        )?
+        else {
+            panic!("a tree that separates values");
+        };
+        let tree = AnyTree::Blob(blob.clone());
+        let mut seqno = 0;
+        for file in 0..FILES {
+            // Every other flush writes its blob file under lz4.
+            let codec = if file % 2 == 0 {
+                crate::CompressionType::None
+            } else {
+                crate::CompressionType::Lz4
+            };
+            blob.update_runtime_config(|c| c.blob_compression = codec)?;
+            for i in 0..KEYS_PER_FILE {
+                let k = i * FILES + file;
+                tree.insert(format!("key{k:06}"), vec![b'v'; 2_048], seqno);
+                seqno += 1;
+            }
+            tree.flush_active_memtable(0)?;
+        }
+
+        tree.major_compact(u64::MAX, u64::MAX)?;
+        let collapsed = blob_ids(&tree);
+        assert_eq!(collapsed.len(), 2, "one file per codec: {collapsed:?}");
+        assert_eq!(tree.storage_stats()?.blob_references.depth, 2);
+
+        tree.major_compact(u64::MAX, u64::MAX)?;
+        assert_eq!(blob_ids(&tree), collapsed, "nothing left to gain");
+        Ok(())
+    }
+
     /// Relocation for locality is optional work: a quota that leaves room for
     /// the merged table but not for the rewritten values skips it, while the
     /// merge itself still runs.

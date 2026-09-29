@@ -396,6 +396,11 @@ impl KvSeparationOptions {
     /// carried down unchanged. Files written in consecutive key runs have a
     /// depth of one and are never relocated for this, however many there are.
     ///
+    /// Relocation copies values as they are stored, so files written under
+    /// different blob codecs are rewritten into one file per codec and do not
+    /// merge further; a file is relocated only together with another of its
+    /// codec that it overlaps.
+    ///
     /// Relocation is bounded three ways:
     /// - only whole files are rewritten, and only those no table outside the
     ///   compaction references;

@@ -94,8 +94,17 @@ fn depths_of(spans: &[(u64, &str, &str)]) -> Vec<(u64, u64)> {
     )
 }
 
-/// `span_overlaps` over spans written as `(file, first, last)` byte strings.
+/// `span_overlaps` over spans written as `(file, first, last)` byte strings,
+/// every file in one group.
 fn overlaps_of(spans: &[(u64, &str, &str)]) -> Vec<u64> {
+    grouped_overlaps_of(spans, &|_| Some(0))
+}
+
+/// `span_overlaps` with each file's group given by `group_of`.
+fn grouped_overlaps_of(
+    spans: &[(u64, &str, &str)],
+    group_of: &dyn Fn(u64) -> Option<usize>,
+) -> Vec<u64> {
     let keys: Vec<(u64, crate::UserKey, crate::UserKey)> = spans
         .iter()
         .map(|&(id, first, last)| (id, first.into(), last.into()))
@@ -105,8 +114,37 @@ fn overlaps_of(spans: &[(u64, &str, &str)]) -> Vec<u64> {
             .iter()
             .map(|(id, first, last)| (*id, first, last))
             .collect::<Vec<_>>(),
+        group_of,
         crate::comparator::default_comparator().as_ref(),
     )
+}
+
+/// Files only merge within their group: overlapping files of different
+/// groups do not count as overlapping, those of one group do.
+#[test]
+fn span_overlaps_counts_only_files_of_one_group() {
+    let spans = [(1, "a", "m"), (2, "c", "k"), (3, "d", "e")];
+    // 1 and 3 share a group; 2 is alone in its own.
+    let group_of = |id: u64| Some(usize::from(id == 2));
+    assert_eq!(grouped_overlaps_of(&spans, &group_of), vec![1, 3]);
+}
+
+/// Deep interleaving is marked in one pass: every file of a thousand
+/// mutually overlapping ones overlaps another, and a file ending before the
+/// rest open overlaps nothing.
+#[test]
+fn span_overlaps_marks_a_deep_interleaving() {
+    let keys: Vec<(u64, String, String)> = (0..1_000u64)
+        .map(|f| (f, format!("k{f:05}"), format!("z{f:05}")))
+        .chain([(5_000, "a".to_owned(), "b".to_owned())])
+        .collect();
+    let spans: Vec<(u64, &str, &str)> = keys
+        .iter()
+        .map(|(id, first, last)| (*id, first.as_str(), last.as_str()))
+        .collect();
+    assert_eq!(overlaps_of(&spans), (0..1_000u64).collect::<Vec<_>>());
+    assert_eq!(depths_of(&spans).first(), Some(&(0, 1_000)));
+    assert_eq!(depths_of(&spans).last(), Some(&(5_000, 1)));
 }
 
 /// Only files whose spans meet another file's count as overlapping: a file

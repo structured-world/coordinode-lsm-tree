@@ -192,34 +192,36 @@ fn span_depths(
 ) -> Vec<(crate::vlog::BlobFileId, u64)> {
     let (merged, _) = merge_spans(spans, cmp);
 
-    // Each start raises the depth of every span open at that key, so a span's
-    // figure is the largest open count seen while it is open, carried with it
-    // until its end. Quadratic in the depth, which a compaction's own tables
-    // keep small.
-    let mut open: Vec<(usize, u64)> = Vec::new();
-    let mut closed: Vec<(usize, u64)> = Vec::with_capacity(merged.len());
-    for (_, is_end, index) in sweep_events(&merged, cmp) {
-        if is_end {
-            open.retain(|&span| {
-                let ends = span.0 == index;
-                if ends {
-                    closed.push(span);
-                }
-                !ends
-            });
-        } else {
-            open.push((index, 0));
-            let depth = open.len() as u64;
-            for (_, max) in &mut open {
-                *max = (*max).max(depth);
+    // The open count after each event, and where each span starts and ends in
+    // that sequence: a span's figure is the largest open count between its
+    // start and its end. Answered by a range-maximum table, so a deeply
+    // interleaved merge costs O(n log n) rather than a pass over every open
+    // span at every start.
+    let events = sweep_events(&merged, cmp);
+    let mut open_after = Vec::with_capacity(events.len());
+    let mut bounds = alloc::vec![(0usize, 0usize); merged.len()];
+    let mut open = 0u64;
+    for (position, &(_, is_end, index)) in events.iter().enumerate() {
+        if let Some(bound) = bounds.get_mut(index) {
+            if is_end {
+                open -= 1;
+                bound.1 = position;
+            } else {
+                open += 1;
+                bound.0 = position;
             }
         }
+        open_after.push(open);
     }
-    closed.sort_unstable_by_key(|&(index, _)| index);
+    let range_max = RangeMax::new(open_after);
 
     // `merged` is sorted by file, so one pass folds a file's spans together.
+    // A span's end event sorts after its start, so its open counts are those
+    // from its start up to just before its end.
     let mut per_file: Vec<(crate::vlog::BlobFileId, u64)> = Vec::new();
-    for ((id, _, _), (_, depth)) in merged.iter().zip(closed) {
+    for ((id, _, _), (start, end)) in merged.iter().zip(bounds) {
+        debug_assert!(end > start, "a span ends after it starts");
+        let depth = range_max.max(start, end - 1);
         match per_file.last_mut() {
             Some((last, value)) if last == id => *value = (*value).max(depth),
             _ => per_file.push((*id, depth)),
@@ -228,50 +230,129 @@ fn span_depths(
     per_file
 }
 
+/// Maximum over any range of a fixed sequence in O(1), after an
+/// O(n log n) build: `levels[k][i]` is the maximum of `2^k` values from `i`.
+struct RangeMax {
+    levels: Vec<Vec<u64>>,
+}
+
+impl RangeMax {
+    fn new(values: Vec<u64>) -> Self {
+        let mut levels = alloc::vec![values];
+        let mut width = 1;
+        while let Some(previous) = levels.last()
+            && 2 * width <= previous.len()
+        {
+            let next: Vec<u64> = previous
+                .iter()
+                .zip(previous.iter().skip(width))
+                .map(|(a, b)| (*a).max(*b))
+                .collect();
+            levels.push(next);
+            width *= 2;
+        }
+        Self { levels }
+    }
+
+    /// The maximum of the values at `from..=to`, `from <= to`.
+    fn max(&self, from: usize, to: usize) -> u64 {
+        debug_assert!(from <= to, "an empty range has no maximum");
+        let len = to - from + 1;
+        let level = (usize::BITS - 1 - len.leading_zeros()) as usize;
+        let Some(values) = self.levels.get(level) else {
+            return 0;
+        };
+        // `2^level <= len`, so the second window starts at or after `from`.
+        let right = to + 1 - (1 << level);
+        let left = values.get(from).copied().unwrap_or(0);
+        left.max(values.get(right).copied().unwrap_or(0))
+    }
+}
+
 /// The files among `among` whose spans in `tables` overlap the span of another
-/// file among them: the ones a relocation of all of `among` would merge with
-/// something. Ordered by file id.
+/// file among them in the same group: the ones a relocation of all of `among`
+/// would merge with something, when only files of one group can be merged
+/// into one output. `among` is `(file, group)`, sorted by file id. The result
+/// is sorted by file id.
 ///
 /// # Errors
 ///
 /// When a table's `linked_blob_files` section cannot be read or parsed.
 pub(crate) fn overlapping_blob_files<'a>(
     tables: impl IntoIterator<Item = &'a crate::table::Table>,
-    among: &[crate::vlog::BlobFileId],
+    among: &[(crate::vlog::BlobFileId, usize)],
 ) -> crate::Result<Vec<crate::vlog::BlobFileId>> {
     let mut comparator = None;
     let mut spans = Vec::new();
     collect_spans(tables, &mut comparator, &mut spans)?;
-    spans.retain(|(id, _, _)| among.contains(id));
-    Ok(comparator.map_or_else(Vec::new, |cmp| span_overlaps(&mut spans, cmp.as_ref())))
+    let group_of = |id: crate::vlog::BlobFileId| {
+        among
+            .binary_search_by_key(&id, |&(file, _)| file)
+            .ok()
+            .and_then(|at| among.get(at))
+            .map(|&(_, group)| group)
+    };
+    spans.retain(|&(id, _, _)| group_of(id).is_some());
+    Ok(comparator.map_or_else(Vec::new, |cmp| {
+        span_overlaps(&mut spans, &group_of, cmp.as_ref())
+    }))
 }
 
 /// [`overlapping_blob_files`] over `(blob file, first key, last key)` spans
-/// ordered by `cmp`. Sorts `spans` in place.
+/// ordered by `cmp`, each file's group given by `group_of`. Sorts `spans` in
+/// place.
 fn span_overlaps(
     spans: &mut [Span<'_>],
+    group_of: &dyn Fn(crate::vlog::BlobFileId) -> Option<usize>,
     cmp: &dyn crate::comparator::UserComparator,
 ) -> Vec<crate::vlog::BlobFileId> {
     let (merged, _) = merge_spans(spans, cmp);
-    // A file's merged spans never overlap each other, so anything open when a
-    // span starts belongs to another file.
-    let mut open: Vec<usize> = Vec::new();
-    let mut overlapping: Vec<crate::vlog::BlobFileId> = Vec::new();
+    let groups = merged
+        .iter()
+        .filter_map(|&(id, _, _)| group_of(id))
+        .max()
+        .map_or(0, |g| g + 1);
+
+    // Per group, how many spans are open and the one open span not yet known
+    // to overlap anything: a second span starting while one is open marks
+    // both, so at most one unmarked span is ever open per group. Each span is
+    // marked once, whatever the depth. A file's merged spans never overlap
+    // each other, so anything open when a span starts belongs to another file.
+    let mut open_count = alloc::vec![0usize; groups];
+    let mut unmarked: Vec<Option<usize>> = alloc::vec![None; groups];
+    let mut marked = alloc::vec![false; merged.len()];
     for (_, is_end, index) in sweep_events(&merged, cmp) {
+        let Some(group) = merged.get(index).and_then(|&(id, _, _)| group_of(id)) else {
+            continue;
+        };
+        let (Some(count), Some(waiting)) = (open_count.get_mut(group), unmarked.get_mut(group))
+        else {
+            continue;
+        };
         if is_end {
-            open.retain(|&o| o != index);
+            *count -= 1;
+            if *waiting == Some(index) {
+                *waiting = None;
+            }
             continue;
         }
-        if !open.is_empty() {
-            for &o in open.iter().chain(core::iter::once(&index)) {
-                if let Some(&(id, _, _)) = merged.get(o) {
-                    overlapping.push(id);
+        if *count > 0 {
+            for span in waiting.take().into_iter().chain(core::iter::once(index)) {
+                if let Some(flag) = marked.get_mut(span) {
+                    *flag = true;
                 }
             }
+        } else {
+            *waiting = Some(index);
         }
-        open.push(index);
+        *count += 1;
     }
-    overlapping.sort_unstable();
+
+    let mut overlapping: Vec<crate::vlog::BlobFileId> = merged
+        .iter()
+        .zip(marked)
+        .filter_map(|(&(id, _, _), marked)| marked.then_some(id))
+        .collect();
     overlapping.dedup();
     overlapping
 }
