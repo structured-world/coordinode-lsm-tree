@@ -1654,6 +1654,55 @@ fn a_relocation_retry_resumes_at_the_committed_blob_frontier() -> crate::Result<
     Ok(())
 }
 
+/// Once space frees up, the restricted blob file a crashed tight-space
+/// relocation left behind is relocated by an ordinary merge. That merge must
+/// also start the scan at the file's committed frontier: from the data section
+/// it reads the punched zeros and rejects the file.
+#[test]
+fn an_ordinary_merge_resumes_a_restricted_blob_file_at_its_frontier() -> crate::Result<()> {
+    let dir = tempfile::tempdir()?;
+    let mem = crate::fs::MemFs::with_capacity(u64::MAX);
+    let tree = blob_relocation_crash_and_reopen(dir.path(), &mem)?;
+
+    let restricted: Vec<_> = tree
+        .index
+        .current_version()
+        .blob_files
+        .iter()
+        .filter(|bf| bf.live_data_start() > 0)
+        .map(crate::vlog::BlobFile::id)
+        .collect();
+    assert!(
+        !restricted.is_empty(),
+        "the crashed relocation must leave a blob file with a committed frontier",
+    );
+
+    mem.set_capacity(u64::MAX);
+    tree.index.update_runtime_config(|c| {
+        c.tight_space_compaction = false;
+    })?;
+    tree.major_compact(64 * 1024 * 1024, BLOB_RELOC_WATERMARK)?;
+
+    let version = tree.index.current_version();
+    assert!(
+        version
+            .blob_files
+            .iter()
+            .all(|bf| !restricted.contains(&bf.id())),
+        "the ordinary merge must relocate the restricted blob file",
+    );
+    for i in 0..BLOB_RELOC_KEYS {
+        let expected = blob_reloc_value(i, u8::from(i % 2 == 0) + 1);
+        assert_eq!(
+            tree.get(blob_reloc_key(i).as_bytes(), crate::MAX_SEQNO)?
+                .as_deref(),
+            Some(expected.as_slice()),
+            "key {i} wrong/lost after the ordinary merge",
+        );
+    }
+    Ok(())
+}
+
 /// A restricted-blob reopen failure mid-slice — after `run_subcompaction`
 /// finalized the slice's output SSTs and blob files, before the install
 /// references them — must ROLL BACK those outputs like every other
