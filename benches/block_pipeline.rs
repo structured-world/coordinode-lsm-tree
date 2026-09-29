@@ -24,9 +24,16 @@
 //! - `BP_FILTER`: run only the cases whose label contains this text.
 //! - `BP_INLINE`: comma-separated inline thresholds to sweep for the parallel
 //!   cases, each `default`, `max` or a byte count (`default` only if unset).
+//! - `BP_FILTER_PARTITION`: partition the filter at this many bytes, so the
+//!   flush builds its filter partitions on the pipeline too (a full filter if
+//!   unset).
+//!
+//! Besides the process's CPU time, the CPU time of the writer's own thread is
+//! reported: the flush runs on the calling thread, so that is what the writer
+//! spends outside the workers.
 
-use cpu_time::ProcessTime;
-use lsm_tree::config::{BlockSizePolicy, CompressionPolicy};
+use cpu_time::{ProcessTime, ThreadTime};
+use lsm_tree::config::{BlockSizePolicy, CompressionPolicy, PinningPolicy};
 use lsm_tree::{AbstractTree, AnyTree, CompressionType, Config, SeqNo, SequenceNumberCounter};
 use std::sync::Arc;
 use std::time::{Duration, Instant};
@@ -155,7 +162,7 @@ struct Fixture {
     samples: Vec<(String, Vec<u8>)>,
 }
 
-fn filled_tree(case: &Case, blocks: u64) -> BenchResult<Fixture> {
+fn filled_tree(case: &Case, blocks: u64, filter_partition: Option<u32>) -> BenchResult<Fixture> {
     let folder = tempfile::tempdir()?;
     let mut config = Config::new(
         &folder,
@@ -173,6 +180,11 @@ fn filled_tree(case: &Case, blocks: u64) -> BenchResult<Fixture> {
                 config.with_encryption(Some(Arc::new(lsm_tree::Aes256GcmProvider::new(&[7; 32]))));
         }
         Transform::Ecc => config = config.page_ecc(true),
+    }
+    if let Some(size) = filter_partition {
+        config = config
+            .filter_block_partitioning_policy(PinningPolicy::all(true))
+            .filter_block_partition_size_policy(BlockSizePolicy::all(size));
     }
     let tree = config.open()?;
 
@@ -238,6 +250,10 @@ fn main() -> BenchResult<()> {
     let blocks: u64 = env_or("BP_BLOCKS", 12_000);
     let reps: usize = env_or("BP_REPS", 5);
     let filter = std::env::var("BP_FILTER").unwrap_or_default();
+    let filter_partition: Option<u32> = std::env::var("BP_FILTER_PARTITION")
+        .ok()
+        .map(|v| v.parse())
+        .transpose()?;
     let inline = list("BP_INLINE", "default")
         .into_iter()
         .map(|v| match v.as_str() {
@@ -292,27 +308,31 @@ fn main() -> BenchResult<()> {
         }
     }
 
-    println!("case\tMiB\twall_ms\tcpu_ms\twall_ms_per_MiB\tcpu_ms_per_MiB");
+    println!("case\tMiB\twall_ms\tcpu_ms\twriter_cpu_ms\twall_ms_per_MiB\tcpu_ms_per_MiB");
     for case in cases.iter().filter(|c| c.label().contains(&filter)) {
         let mut walls = Vec::with_capacity(reps);
         let mut cpus = Vec::with_capacity(reps);
+        let mut writer_cpus = Vec::with_capacity(reps);
         let mut mib = 0.0;
         for _ in 0..reps {
-            let fixture = filled_tree(case, blocks)?;
+            let fixture = filled_tree(case, blocks, filter_partition)?;
             mib = fixture.bytes as f64 / (1024.0 * 1024.0);
             let cpu = ProcessTime::now();
+            let writer_cpu = ThreadTime::now();
             let wall = Instant::now();
             fixture.tree.flush_active_memtable(0)?;
             walls.push(wall.elapsed());
+            writer_cpus.push(writer_cpu.elapsed());
             cpus.push(cpu.elapsed());
             verify(&fixture, &case.label())?;
         }
-        let (wall, cpu) = (median(walls), median(cpus));
+        let (wall, cpu, writer_cpu) = (median(walls), median(cpus), median(writer_cpus));
         println!(
-            "{}\t{mib:.0}\t{:.1}\t{:.1}\t{:.3}\t{:.3}",
+            "{}\t{mib:.0}\t{:.1}\t{:.1}\t{:.1}\t{:.3}\t{:.3}",
             case.label(),
             wall.as_secs_f64() * 1e3,
             cpu.as_secs_f64() * 1e3,
+            writer_cpu.as_secs_f64() * 1e3,
             wall.as_secs_f64() * 1e3 / mib,
             cpu.as_secs_f64() * 1e3 / mib,
         );
