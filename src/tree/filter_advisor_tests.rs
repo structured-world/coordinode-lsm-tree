@@ -516,6 +516,121 @@ fn a_flush_into_several_tables_keeps_room_for_the_later_ones() -> crate::Result<
     Ok(())
 }
 
+/// A compaction split into parallel sub-compactions plans its filters once
+/// over the key ranges they write: its outputs, across the ranges, stay
+/// within a budget that holds every filter at the narrowest width, and the
+/// budget holds exactly the published filters once it ends.
+#[test]
+fn a_split_compaction_sizes_its_filters_within_the_budget() -> crate::Result<()> {
+    const KEYS: u32 = 4_000;
+    let folder = tempfile::tempdir()?;
+    let narrowest = BloomConstructionPolicy::BitsPerKey(6.0).filter_size_bound(KEYS as usize);
+    let budget = narrowest as u64 * 2;
+    let tree = Config::new(
+        folder.path(),
+        SequenceNumberCounter::default(),
+        SequenceNumberCounter::default(),
+    )
+    .data_block_size_policy(BlockSizePolicy::all(512))
+    .compaction_threads(4)
+    .subcompaction_min_bytes(0)
+    .filter_advisor(Some(
+        FilterAdvisor::new(budget).with_bits_per_key([6u8, 8, 10].to_vec()),
+    ))
+    .open()?;
+    // A bottom level of several tables, the split's boundaries, and the whole
+    // key space again above it.
+    fill(&tree, &["k"], KEYS)?;
+    tree.major_compact(4_096, 0)?;
+    fill(&tree, &["k"], KEYS)?;
+    probe_absent(&tree, "k", KEYS / 2)?;
+    tree.major_compact(u64::MAX, 0)?;
+
+    let tables = tables(&tree);
+    let memory = tree.filter_memory();
+    assert!(!memory.over_budget, "{memory:?}");
+    assert!(memory.serialised_bytes <= budget, "{memory:?}");
+    let AnyTree::Standard(standard) = &tree else {
+        panic!("a standard tree");
+    };
+    assert_eq!(
+        standard.filter_budget.held(),
+        tables
+            .iter()
+            .map(|table| u64::from(table.filter_size()))
+            .sum::<u64>(),
+        "the budget holds the published filters"
+    );
+    Ok(())
+}
+
+/// Tables a caller flushes from its own stream are sized by the advisor, the
+/// stream's length bounding their keys, and once registered the budget holds
+/// exactly their filters.
+#[test]
+fn a_caller_flushed_stream_is_sized_and_registered() -> crate::Result<()> {
+    let folder = tempfile::tempdir()?;
+    let tree = open(folder.path(), Some(FilterAdvisor::new(u64::MAX)))?;
+    // A range's stream tells its exact length.
+    let entries = (0..KEYS).map(|i| {
+        Ok(crate::InternalValue::from_components(
+            key("k", 2 * i),
+            "value",
+            u64::from(i),
+            crate::ValueType::Value,
+        ))
+    });
+    let Some((tables, _, pin)) = tree.flush_to_tables(entries)? else {
+        panic!("the stream writes tables");
+    };
+    assert!(tables.iter().all(|table| table.filter_size() > 0));
+    tree.register_tables(&tables, None, None, &[], 0, false)?;
+
+    assert!(tree.get(key("k", 2), SeqNo::MAX)?.is_some());
+    let AnyTree::Standard(standard) = &tree else {
+        panic!("a standard tree");
+    };
+    let published: u64 = self::tables(&tree)
+        .iter()
+        .map(|table| u64::from(table.filter_size()))
+        .sum();
+    assert!(published > 0);
+    // The pin holds the flush's plan; once dropped, the budget holds the
+    // published filters alone.
+    assert!(
+        format!("{pin:?}").contains("filter_budget: true"),
+        "{pin:?}"
+    );
+    drop(pin);
+    assert_eq!(standard.filter_budget.held(), published);
+    Ok(())
+}
+
+/// The advisor sizes the filters a level's static policy builds; it adds none
+/// where that policy builds none.
+#[test]
+fn a_level_without_filters_gets_none_from_the_advisor() -> crate::Result<()> {
+    use crate::config::{FilterPolicy, FilterPolicyEntry};
+
+    let folder = tempfile::tempdir()?;
+    let tree = Config::new(
+        folder.path(),
+        SequenceNumberCounter::default(),
+        SequenceNumberCounter::default(),
+    )
+    .filter_policy(FilterPolicy::all(FilterPolicyEntry::None))
+    .filter_advisor(Some(FilterAdvisor::new(u64::MAX)))
+    .open()?;
+    fill(&tree, &["a", "b"], KEYS)?;
+    rewrite_all(&tree, "a", "b")?;
+    let tables = tables(&tree);
+    assert!(!tables.is_empty());
+    for table in &tables {
+        assert_eq!(table.filter_size(), 0);
+    }
+    Ok(())
+}
+
 /// Tables holding the same keys are probed by the same lookups: an absent key
 /// read once is one negative probe of each. Merged, the output is probed once
 /// for it, so it inherits the lookups once, not once per input.
@@ -626,6 +741,38 @@ fn an_ingestion_told_its_entries_keeps_room_for_the_later_tables() -> crate::Res
         .map(|table| (table.metadata.item_count, table.filter_size()))
         .collect();
     assert!(!memory.over_budget, "{memory:?} {sizes:?}");
+    Ok(())
+}
+
+/// A blob tree's ingestion takes the entry count as a standard one does, for
+/// the filters of the index tables it writes.
+#[test]
+fn a_blob_ingestion_takes_its_entry_count() -> crate::Result<()> {
+    use crate::KvSeparationOptions;
+
+    let folder = tempfile::tempdir()?;
+    let tree = Config::new(
+        folder.path(),
+        SequenceNumberCounter::default(),
+        SequenceNumberCounter::default(),
+    )
+    .with_kv_separation(Some(KvSeparationOptions::default().separation_threshold(1)))
+    .filter_advisor(Some(FilterAdvisor::new(u64::MAX)))
+    .open()?;
+    assert!(matches!(tree, AnyTree::Blob(_)));
+    let mut ingestion = tree.ingestion()?.expected_entries(u64::from(KEYS));
+    for i in 0..KEYS {
+        ingestion.write(key("k", 2 * i), "value")?;
+    }
+    ingestion.finish()?;
+
+    assert_eq!(
+        tree.get(key("k", 2), SeqNo::MAX)?.as_deref(),
+        Some(&b"value"[..])
+    );
+    let tables = tables(&tree);
+    assert!(!tables.is_empty());
+    assert!(tables.iter().all(|table| table.filter_size() > 0));
     Ok(())
 }
 
@@ -1005,6 +1152,102 @@ fn a_prefix_scan_finding_nothing_after_its_filter_passed_counts_a_negative() -> 
         (u64::from(scans), u64::from(scans)),
         "(probes, negatives) of {scans} scans of absent prefixes"
     );
+
+    // Scanned backwards, the same.
+    for p in 0..scans {
+        assert_eq!(
+            tree.prefix(format!("p{:04}:", 2 * p + 1), SeqNo::MAX, None)
+                .rev()
+                .count(),
+            0
+        );
+    }
+    let reversed = counts();
+    assert_eq!(
+        (reversed.0 - after.0, reversed.1 - after.1),
+        (u64::from(scans), u64::from(scans)),
+        "(probes, negatives) of {scans} reversed scans"
+    );
+    Ok(())
+}
+
+/// A prefix whose keys fill several tables of one level is read across all
+/// of them: each holds keys under it, so its filter's pass is no false
+/// positive, and the scan counts no negative.
+#[test]
+fn a_prefix_spanning_several_tables_counts_no_negative() -> crate::Result<()> {
+    use alloc::sync::Arc;
+
+    const PREFIXED: u32 = 4_000;
+    let folder = tempfile::tempdir()?;
+    let tree = Config::new(
+        folder.path(),
+        SequenceNumberCounter::default(),
+        SequenceNumberCounter::default(),
+    )
+    .data_block_size_policy(BlockSizePolicy::all(512))
+    .prefix_extractor(Arc::new(UpToColon))
+    .filter_advisor(Some(FilterAdvisor::new(u64::MAX)))
+    .open()?;
+    for i in 0..PREFIXED {
+        tree.insert(format!("x:{i:06}"), "value", u64::from(i));
+    }
+    tree.flush_active_memtable(0)?;
+    tree.major_compact(4_096, 0)?;
+    let tables = tables(&tree);
+    assert!(tables.len() > 2, "{} tables", tables.len());
+    let negatives = |tables: &[Table]| -> u64 {
+        tables
+            .iter()
+            .map(|table| {
+                table
+                    .probe_stats()
+                    .map_or(0, crate::table::probe_stats::ProbeStats::negatives)
+            })
+            .sum()
+    };
+    let before = negatives(&tables);
+    assert_eq!(
+        tree.prefix("x:", SeqNo::MAX, None).count(),
+        PREFIXED as usize
+    );
+    assert_eq!(negatives(&tables), before);
+    Ok(())
+}
+
+/// A table without a filter answers no key check: a merge read over it counts
+/// no probe of it, and no miss either.
+#[test]
+fn a_merge_read_over_a_filterless_table_counts_nothing() -> crate::Result<()> {
+    use crate::config::{FilterPolicy, FilterPolicyEntry};
+
+    let folder = tempfile::tempdir()?;
+    let tree = Config::new(
+        folder.path(),
+        SequenceNumberCounter::default(),
+        SequenceNumberCounter::default(),
+    )
+    .with_merge_operator(Some(alloc::sync::Arc::new(Concat)))
+    .filter_policy(FilterPolicy::all(FilterPolicyEntry::None))
+    .filter_advisor(Some(FilterAdvisor::new(u64::MAX)))
+    .open()?;
+    fill(&tree, &["k"], KEYS)?;
+    let older = tables(&tree);
+    for i in 0..100 {
+        tree.merge(key("k", 2 * i + 1), "x", u64::from(KEYS + i));
+    }
+    for i in 0..100 {
+        assert_eq!(
+            tree.get(key("k", 2 * i + 1), SeqNo::MAX)?.as_deref(),
+            Some(&b"x"[..])
+        );
+    }
+    for table in &older {
+        let counts = table
+            .probe_stats()
+            .map_or((0, 0), |stats| (stats.probes(), stats.negatives()));
+        assert_eq!(counts, (0, 0));
+    }
     Ok(())
 }
 

@@ -745,5 +745,208 @@ fn split_ranges_price_by_all_data_still_to_come() -> crate::Result<()> {
         (upper_first - unsplit).abs() <= unsplit * 1e-9,
         "upper range first {upper_first}, unsplit {unsplit}"
     );
+    assert!(
+        format!("{split:?}").contains("Split"),
+        "a plan names its key ranges: {split:?}"
+    );
     Ok(())
+}
+
+/// A level whose policy no longer builds filters still holds the tables that
+/// have one: each is priced at the width its own filter was built at.
+#[test]
+fn a_table_on_a_level_without_filters_prices_at_its_own_width() -> crate::Result<()> {
+    use crate::config::FilterPolicyEntry;
+    use crate::{AbstractTree, AnyTree, Config, SequenceNumberCounter};
+
+    let folder = tempfile::tempdir()?;
+    let any = Config::new(
+        folder.path(),
+        SequenceNumberCounter::default(),
+        SequenceNumberCounter::default(),
+    )
+    .filter_policy(crate::config::FilterPolicy::all(FilterPolicyEntry::Bloom(
+        BloomConstructionPolicy::BitsPerKey(10.0),
+    )))
+    .open()?;
+    for i in 0..20_000u32 {
+        any.insert(format!("k{i:06}"), "value", u64::from(i));
+    }
+    any.flush_active_memtable(0)?;
+    let AnyTree::Standard(tree) = &any else {
+        panic!("a standard tree");
+    };
+    let version = tree.current_version();
+    let without = Config::clone(&tree.config)
+        .filter_policy(crate::config::FilterPolicy::all(FilterPolicyEntry::None));
+    let live = super::live(&version, &without);
+    let [table] = live.as_slice() else {
+        panic!("one live table");
+    };
+    assert!(
+        (10..=11).contains(&table.fallback_bits),
+        "{} bits a key",
+        table.fallback_bits
+    );
+    Ok(())
+}
+
+/// A rewrite leaves nothing of an input whose last key is at or below the
+/// upper bound of what it writes, and something of one reaching past it.
+#[test]
+fn a_span_covers_the_inputs_it_writes_to_their_end() -> crate::Result<()> {
+    use crate::{AbstractTree, AnyTree, Config, SequenceNumberCounter, UserKey};
+    use core::ops::Bound::{self, Excluded, Included, Unbounded};
+
+    let folder = tempfile::tempdir()?;
+    let any = Config::new(
+        folder.path(),
+        SequenceNumberCounter::default(),
+        SequenceNumberCounter::default(),
+    )
+    .open()?;
+    for i in 0..100u32 {
+        any.insert(format!("k{i:03}"), "value", u64::from(i));
+    }
+    any.flush_active_memtable(0)?;
+    let AnyTree::Standard(tree) = &any else {
+        panic!("a standard tree");
+    };
+    let version = tree.current_version();
+    let [table] = version.iter_tables().collect::<Vec<_>>()[..] else {
+        panic!("one table");
+    };
+    let span = |upper: Bound<UserKey>| super::Span {
+        lower: Unbounded,
+        upper,
+        comparator: crate::comparator::default_comparator(),
+    };
+    assert!(span(Unbounded).covers(table));
+    assert!(span(Included(UserKey::from("k099"))).covers(table));
+    assert!(!span(Included(UserKey::from("k098"))).covers(table));
+    assert!(!span(Excluded(UserKey::from("k099"))).covers(table));
+    assert!(span(Excluded(UserKey::from("k100"))).covers(table));
+    assert!(format!("{:?}", span(Unbounded)).contains("Span"));
+    Ok(())
+}
+
+/// Lower bounds order by the keys they start from: none before every key,
+/// and from a key before past it.
+#[test]
+fn lower_bounds_order_by_where_they_start() -> crate::Result<()> {
+    use crate::{AbstractTree, AnyTree, Config, SequenceNumberCounter, UserKey};
+    use core::cmp::Ordering::{Equal, Greater, Less};
+    use core::ops::Bound::{self, Excluded, Included, Unbounded};
+
+    let folder = tempfile::tempdir()?;
+    let advisor = crate::config::FilterAdvisor::new(u64::MAX);
+    let any = Config::new(
+        folder.path(),
+        SequenceNumberCounter::default(),
+        SequenceNumberCounter::default(),
+    )
+    .filter_advisor(Some(advisor.clone()))
+    .open()?;
+    let AnyTree::Standard(tree) = &any else {
+        panic!("a standard tree");
+    };
+    let version = tree.current_version();
+    let sizing = super::plan(
+        &advisor,
+        &tree.filter_budget,
+        &super::live(&version, &tree.config),
+        super::Rewrite {
+            comparator: Some(crate::comparator::default_comparator()),
+            ..super::Rewrite::default()
+        },
+        BloomConstructionPolicy::BitsPerKey(10.0),
+        None,
+    )
+    .unwrap_or_else(|| panic!("the advisor plans the filters"));
+    let key = UserKey::from("m");
+    let order = |a: &Bound<UserKey>, b: &Bound<UserKey>| sizing.lower_order(a, b);
+    assert_eq!(order(&Unbounded, &Unbounded), Equal);
+    assert_eq!(order(&Unbounded, &Included(key.clone())), Less);
+    assert_eq!(order(&Excluded(key.clone()), &Unbounded), Greater);
+    assert_eq!(order(&Included(key.clone()), &Excluded(key.clone())), Less);
+    assert_eq!(order(&Excluded(key.clone()), &Included(key)), Greater);
+    let debug = format!("{sizing:?}");
+    assert!(
+        debug.contains("KeyOrder") && debug.contains("Framing"),
+        "{debug}"
+    );
+    Ok(())
+}
+
+/// An empty filter is not written, so it takes no bytes framed; any other
+/// block takes at least its payload.
+#[test]
+fn an_empty_filter_is_framed_to_nothing() {
+    let framing = super::Framing::default();
+    assert_eq!(framing.frame(0), 0);
+    assert!(framing.frame(100) >= 100);
+}
+
+/// A policy by false-positive rate builds at the narrowest width reaching it.
+#[test]
+fn a_false_positive_rate_builds_at_the_narrowest_width_reaching_it() {
+    use BloomConstructionPolicy::FalsePositiveRate;
+    // 2^-7 is the first power of two at or below one in a hundred.
+    assert_eq!(super::bits_of(FalsePositiveRate(0.01)), 7);
+    assert_eq!(super::bits_of(FalsePositiveRate(0.5)), 1);
+}
+
+/// Where every table fits at its widest useful width, the price is set
+/// below the last step, where each takes it: a loaded table the widest, one
+/// drawing no negative probe the narrowest, though with bytes free the
+/// static policy's wider width would have come first.
+#[test]
+fn a_budget_every_useful_width_fits_takes_them_all() {
+    let n = 10_000;
+    let mut loads = at(&[(1e6, n)], 16, None);
+    loads.extend(at(&[(0.0, n)], 16, None));
+    let budget = estimate(n, 16) + estimate(n, 6);
+    assert!(estimate(n, 16) * 2 > budget, "the static widths do not fit");
+    let p = price(&loads, &WIDTHS, budget, &bare);
+    assert!(p.is_finite() && p > 0.0, "price {p}");
+    assert_eq!(cheapest(1e6, n, &WIDTHS, 16, p), 16);
+    assert_eq!(cheapest(0.0, n, &WIDTHS, 16, p), 6);
+}
+
+/// A width whose framed size jumps past the next one's worth is never worth
+/// taking: the price passes over it, stepping from the width below straight
+/// to the one above, and the choice at that price stays within the budget.
+#[test]
+fn a_width_its_framing_makes_dear_is_passed_over() {
+    let n = 1_000;
+    let widths = [6u8, 8, 16];
+    let jump = 4 * estimate(n, 6);
+    // Blocks past the narrowest width's size carry a large fixed frame.
+    let threshold = estimate(n, 6);
+    let frame = move |len: u64| if len > threshold { len + jump } else { len };
+    let framed: Vec<u64> = super::sizes(n, &widths).into_iter().map(frame).collect();
+    let [six, _, sixteen] = framed[..] else {
+        panic!("three widths");
+    };
+    let budget = sixteen - 1;
+    let loads = at(&[(1e6, n)], 6, None);
+    let p = price(&loads, &widths, budget, &frame);
+    assert!(p.is_finite() && p > 0.0, "price {p}");
+    let chosen = super::choose(1e6, &framed, &super::rates(&widths), &widths, 6, p);
+    assert_eq!(widths.get(chosen), Some(&6), "at {p}");
+    assert!(six <= budget);
+}
+
+/// The over-budget state is logged once on entering it and once on leaving.
+#[test]
+fn the_over_budget_state_is_logged_on_entering_and_leaving() {
+    use core::sync::atomic::Ordering::Relaxed;
+
+    let state = super::FilterBudget::default();
+    state.observe(10, 5);
+    assert!(state.logged.load(Relaxed));
+    state.observe(10, 5);
+    assert!(state.logged.load(Relaxed));
+    state.observe(1, 5);
+    assert!(!state.logged.load(Relaxed));
 }

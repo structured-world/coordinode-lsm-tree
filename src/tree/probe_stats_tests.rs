@@ -217,6 +217,97 @@ fn nothing_is_counted_without_an_advisor() -> crate::Result<()> {
     Ok(())
 }
 
+/// A pinned read and a table's batch read count their probes as a plain read
+/// does: each absent key is one probe and one negative, whether the one-bit
+/// filter ruled it out or let it through to a read that found nothing, and so
+/// is a key past the table's last block the filter let through.
+#[test]
+fn pinned_and_batch_reads_count_absent_keys_once() -> crate::Result<()> {
+    let folder = tempfile::tempdir()?;
+    let tree = tree_of_even_keys(folder.path(), 1.0, true)?;
+    let table = only_table(&tree);
+    let absent: Vec<String> = (1..KEYS).step_by(2).map(key).collect();
+    let count = absent.len() as u64;
+
+    for key in &absent {
+        assert!(tree.get_pinned(key, SeqNo::MAX)?.is_none());
+    }
+    assert_eq!(counts(&table), (count, count), "pinned reads");
+
+    let hashed = |keys: &[String]| -> Vec<(Vec<u8>, u64)> {
+        keys.iter()
+            .map(|key| (key.as_bytes().to_vec(), crate::hash::hash64(key.as_bytes())))
+            .collect()
+    };
+    let absent_hashed = hashed(&absent);
+    let sorted: Vec<(&[u8], u64)> = absent_hashed
+        .iter()
+        .map(|(key, hash)| (key.as_slice(), *hash))
+        .collect();
+    let found = table.batch_get(&sorted, SeqNo::MAX)?;
+    assert!(found.iter().all(Option::is_none));
+    assert_eq!(counts(&table), (2 * count, 2 * count), "batch read");
+
+    // Past every block: no block walk, the passed keys still count.
+    let beyond: Vec<String> = (0..100).map(|i| format!("zz{i:04}")).collect();
+    let beyond_hashed = hashed(&beyond);
+    let sorted: Vec<(&[u8], u64)> = beyond_hashed
+        .iter()
+        .map(|(key, hash)| (key.as_slice(), *hash))
+        .collect();
+    let found = table.batch_get(&sorted, SeqNo::MAX)?;
+    assert!(found.iter().all(Option::is_none));
+    assert_eq!(
+        counts(&table),
+        (2 * count + 100, 2 * count + 100),
+        "batch read past every block"
+    );
+    Ok(())
+}
+
+/// A level resolved in chunks counts its probes as the serial resolve does:
+/// every key its filter answered is a probe, and an absent key is a negative
+/// one, whether the filter ruled it out or let it through to reads that found
+/// no version (a one-bit filter lets about half through).
+#[test]
+fn a_chunked_resolve_counts_false_positives_once() -> crate::Result<()> {
+    let folder = tempfile::tempdir()?;
+    let any = tree_of_even_keys(folder.path(), 1.0, true)?;
+    let AnyTree::Standard(tree) = &any else {
+        panic!("a standard tree");
+    };
+    let keys: Vec<String> = (0..KEYS).map(key).collect();
+    let mut remaining: Vec<(usize, u64)> = keys
+        .iter()
+        .enumerate()
+        .map(|(index, key)| (index, crate::hash::hash64(key.as_bytes())))
+        .collect();
+    let mut results: Vec<Option<crate::value::InternalValue>> = alloc::vec![None; keys.len()];
+    let version = tree.current_version();
+    let Some(level) = version.level(0) else {
+        panic!("level 0 exists");
+    };
+    let comparator = crate::comparator::default_comparator();
+    let resolved = crate::Tree::resolve_level_chunked(
+        level,
+        &mut remaining,
+        &keys,
+        SeqNo::MAX,
+        comparator.as_ref(),
+        &mut results,
+    )?;
+    assert!(resolved, "the level has blocks to read");
+    let present = results.iter().filter(|result| result.is_some()).count();
+    let absent = keys.len() - present;
+    assert_eq!(present, keys.len() / 2, "every even key is found");
+    assert_eq!(
+        counts(&only_table(&any)),
+        (keys.len() as u64, absent as u64),
+        "(probes, negatives)"
+    );
+    Ok(())
+}
+
 /// Two tables over one key range: an older hot narrow one holding
 /// `key(100..200)` with 10000 negative probes, and a newer cold wide one
 /// holding `key(0..1000)` with 1000.
