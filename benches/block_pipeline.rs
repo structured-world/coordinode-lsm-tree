@@ -308,7 +308,9 @@ fn main() -> BenchResult<()> {
         }
     }
 
-    println!("case\tMiB\twall_ms\tcpu_ms\twriter_cpu_ms\twall_ms_per_MiB\tcpu_ms_per_MiB");
+    println!(
+        "case\tMiB\twall_ms\tcpu_ms\twriter_cpu_ms\twall_ms_per_MiB\tcpu_ms_per_MiB\twriter_cpu_ms_per_MiB"
+    );
     for case in cases.iter().filter(|c| c.label().contains(&filter)) {
         let mut walls = Vec::with_capacity(reps);
         let mut cpus = Vec::with_capacity(reps);
@@ -328,13 +330,14 @@ fn main() -> BenchResult<()> {
         }
         let (wall, cpu, writer_cpu) = (median(walls), median(cpus), median(writer_cpus));
         println!(
-            "{}\t{mib:.0}\t{:.1}\t{:.1}\t{:.1}\t{:.3}\t{:.3}",
+            "{}\t{mib:.0}\t{:.1}\t{:.1}\t{:.1}\t{:.3}\t{:.3}\t{:.3}",
             case.label(),
             wall.as_secs_f64() * 1e3,
             cpu.as_secs_f64() * 1e3,
             writer_cpu.as_secs_f64() * 1e3,
             wall.as_secs_f64() * 1e3 / mib,
             cpu.as_secs_f64() * 1e3 / mib,
+            writer_cpu.as_secs_f64() * 1e3 / mib,
         );
     }
     Ok(())
