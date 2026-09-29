@@ -217,9 +217,9 @@ fn nothing_is_counted_without_an_advisor() -> crate::Result<()> {
     Ok(())
 }
 
-/// Two tables over one key range: a cold wide one holding `key(0..1000)`
-/// with 1000 negative probes, and a hot narrow one holding `key(100..200)`
-/// with 10000.
+/// Two tables over one key range: an older hot narrow one holding
+/// `key(100..200)` with 10000 negative probes, and a newer cold wide one
+/// holding `key(0..1000)` with 1000.
 fn hot_narrow_and_cold_wide(folder: &std::path::Path) -> crate::Result<(AnyTree, Table, Table)> {
     use crate::config::BlockSizePolicy;
     use crate::table::probe_stats::ProbeCounts;
@@ -233,11 +233,11 @@ fn hot_narrow_and_cold_wide(folder: &std::path::Path) -> crate::Result<(AnyTree,
     .data_block_size_policy(BlockSizePolicy::all(256))
     .filter_advisor(Some(FilterAdvisor::new(u64::MAX)))
     .open()?;
-    for i in 0..1_000 {
+    for i in 100..200 {
         tree.insert(key(i), "value", 1);
     }
     tree.flush_active_memtable(0)?;
-    for i in 100..200 {
+    for i in 0..1_000 {
         tree.insert(key(i), "value", 2);
     }
     tree.flush_active_memtable(0)?;
@@ -260,9 +260,11 @@ fn hot_narrow_and_cold_wide(folder: &std::path::Path) -> crate::Result<(AnyTree,
     Ok((tree, hot, cold))
 }
 
-/// An output merging the hot narrow input with the slice of the cold wide one
-/// it overlaps inherits all of the first and that slice (a tenth) of the
-/// second, not the sum of both.
+/// An output takes each part of its range from one input, the oldest holding
+/// data there, by the share of that input's data the part holds: over the
+/// hot narrow input's keys its counts whole, and around them the cold wide
+/// one's slices (nine tenths of its 1000), not the cold one's counts again
+/// over the keys both hold.
 #[test]
 fn an_output_inherits_each_input_by_the_range_it_covers() -> crate::Result<()> {
     use crate::table::probe_stats::inherited_counts;
@@ -271,15 +273,16 @@ fn an_output_inherits_each_input_by_the_range_it_covers() -> crate::Result<()> {
     let (_tree, hot, cold) = hot_narrow_and_cold_wide(folder.path())?;
     let inputs = [hot, cold];
 
+    // Over the keys both inputs hold, the older one alone.
     let narrow = inherited_counts(key(100).as_bytes(), key(199).as_bytes(), &inputs)?;
-    let cold_share = narrow.negatives - 10_000;
-    // A tenth of 1000, give or take the two boundary blocks.
-    assert!((90..=130).contains(&cold_share), "cold share {cold_share}");
+    assert_eq!(narrow.negatives, 10_000);
     assert_eq!(narrow.probes, narrow.negatives);
 
-    // The whole range takes both inputs whole.
+    // The whole range: the hot input whole, and the cold one's nine tenths
+    // around it, give or take the two boundary blocks.
     let whole = inherited_counts(key(0).as_bytes(), key(999).as_bytes(), &inputs)?;
-    assert_eq!(whole.negatives, 11_000);
+    let cold_share = whole.negatives - 10_000;
+    assert!((870..=910).contains(&cold_share), "cold share {cold_share}");
 
     // Merged whole, the output's density per key lies between the hot input's
     // (100 a key) and the cold one's (1 a key).
@@ -290,25 +293,40 @@ fn an_output_inherits_each_input_by_the_range_it_covers() -> crate::Result<()> {
     // hot input lies wholly in the first half.
     let low = inherited_counts(key(0).as_bytes(), key(499).as_bytes(), &inputs)?;
     let high = inherited_counts(key(500).as_bytes(), key(999).as_bytes(), &inputs)?;
-    assert!(low.negatives >= 10_000 + 450, "low {low:?}");
+    assert!(low.negatives >= 10_000 + 350, "low {low:?}");
     assert!(high.negatives <= 550, "high {high:?}");
-    // Each block goes to one half, so the halves create no count; each loses
-    // at most one to rounding per input.
+    // Each block goes to one half, so the halves create no count; each part
+    // loses at most one to rounding.
     let halves = low.negatives + high.negatives;
-    assert!((11_000 - 4..=11_000).contains(&halves), "halves {halves}");
+    assert!(
+        halves <= whole.negatives + 4 && halves + 4 >= whole.negatives,
+        "halves {halves}, whole {}",
+        whole.negatives
+    );
     Ok(())
 }
 
 /// A compaction hands its outputs the inputs' counts: merged into one table,
-/// the output carries both inputs whole; split into several, the outputs
-/// share them by range without creating any.
+/// the output carries the hot input whole and the cold one's slices around
+/// it; split into several, the outputs share them by range without creating
+/// any.
 #[test]
 fn a_compaction_hands_the_inputs_counts_to_its_outputs() -> crate::Result<()> {
     let folder = tempfile::tempdir()?;
     let (tree, hot, cold) = hot_narrow_and_cold_wide(folder.path())?;
+    let inherited = crate::table::probe_stats::inherited_counts(
+        key(0).as_bytes(),
+        key(999).as_bytes(),
+        &[hot.clone(), cold.clone()],
+    )?
+    .negatives;
     drop((hot, cold));
     tree.major_compact(u64::MAX, 0)?;
-    assert_eq!(counts(&only_table(&tree)), (11_000, 11_000));
+    assert_eq!(counts(&only_table(&tree)), (inherited, inherited));
+    assert!(
+        (10_870..=10_910).contains(&inherited),
+        "inherited {inherited}"
+    );
 
     let folder = tempfile::tempdir()?;
     let (tree, hot, cold) = hot_narrow_and_cold_wide(folder.path())?;
@@ -320,10 +338,10 @@ fn a_compaction_hands_the_inputs_counts_to_its_outputs() -> crate::Result<()> {
     assert!(outputs.len() > 2, "{} outputs", outputs.len());
     let total: u64 = outputs.iter().map(|table| counts(table).1).sum();
     // Each input block goes to one output, so the outputs create no count;
-    // each loses at most one to rounding per input.
-    let rounding = 2 * outputs.len() as u64;
+    // each part of each output loses at most one to rounding.
+    let rounding = 4 * outputs.len() as u64;
     assert!(
-        (11_000 - rounding..=11_000).contains(&total),
+        (inherited - rounding..=inherited + rounding).contains(&total),
         "total {total} over {} outputs",
         outputs.len()
     );

@@ -198,9 +198,21 @@ enum FilterAnswer {
     /// The key's filter was asked and let the key through, a probe counted:
     /// a read of the table finding no version of the key is a false positive.
     KeyPassed,
-    /// The table is read with no key probe counted: no key filter was asked,
-    /// or none could be read.
+    /// The prefix's filter was asked and let the prefix through, a probe
+    /// counted: the scan is over exactly that prefix, so a table holding no
+    /// key under it is a false positive.
+    PrefixPassed,
+    /// The table is read with no probe counted: no filter was asked, or none
+    /// could be read.
     Unanswered,
+}
+
+impl FilterAnswer {
+    /// A filter let the read through: a read of the table finding nothing is
+    /// the false positive of the probe already counted.
+    fn passed(self) -> bool {
+        matches!(self, Self::KeyPassed | Self::PrefixPassed)
+    }
 }
 
 /// Checks prefix and key bloom filters for a table.
@@ -214,6 +226,7 @@ fn bloom_passes(state: &IterState, table: &crate::table::Table) -> bool {
 /// Asks a table's prefix and key filters about the read, counting the probes
 /// they answer (see [`FilterAnswer`]).
 fn filter_answer(state: &IterState, table: &crate::table::Table) -> FilterAnswer {
+    let mut answer = FilterAnswer::Unanswered;
     if let Some(prefix_hash) = state.prefix_hash {
         // A prefix answer counts as a key's does: the filter holds the
         // prefix's hash beside the keys'.
@@ -236,6 +249,7 @@ fn filter_answer(state: &IterState, table: &crate::table::Table) -> FilterAnswer
                     probes: 1,
                     negatives: 0,
                 });
+                answer = FilterAnswer::PrefixPassed;
             }
             Err(e) => {
                 log::debug!("prefix bloom check failed for table {:?}: {e}", table.id(),);
@@ -251,24 +265,35 @@ fn filter_answer(state: &IterState, table: &crate::table::Table) -> FilterAnswer
     );
 
     if let Some(key_hash) = state.key_hash {
+        use crate::table::KeyFilterAnswer;
         let result = if let Some(bloom_key) = &state.bloom_key {
             // UserKey (Slice) implements Deref<Target=[u8]>, coerces to &[u8]
-            table.bloom_may_contain_key(bloom_key, key_hash)
+            table.key_filter_answer(bloom_key, key_hash)
         } else {
-            table.bloom_may_contain_key_hash(key_hash)
+            table.bloom_may_contain_key_hash(key_hash).map(|may| {
+                if may {
+                    KeyFilterAnswer::MayContain
+                } else {
+                    KeyFilterAnswer::Absent
+                }
+            })
         };
         // The filter's answers count as a point read's do; a key passed for
-        // want of a filter is no probe of one.
+        // want of a filter, or ruled out by the partition index alone, is no
+        // probe of one.
         use crate::table::probe_stats::ProbeCounts;
         match result {
-            Ok(false) => {
+            Ok(KeyFilterAnswer::Absent) => {
                 table.count_probes(ProbeCounts {
                     probes: 1,
                     negatives: 1,
                 });
                 return FilterAnswer::Absent;
             }
-            Ok(true) if table.key_check_consults_filter(state.bloom_key.is_some()) => {
+            Ok(KeyFilterAnswer::PastPartitions) => return FilterAnswer::Absent,
+            Ok(KeyFilterAnswer::MayContain)
+                if table.key_check_consults_filter(state.bloom_key.is_some()) =>
+            {
                 table.count_probes(ProbeCounts {
                     probes: 1,
                     negatives: 0,
@@ -278,19 +303,19 @@ fn filter_answer(state: &IterState, table: &crate::table::Table) -> FilterAnswer
             Err(e) => {
                 log::debug!("key bloom check failed for table {:?}: {e}", table.id(),);
             }
-            Ok(true) => {}
+            Ok(KeyFilterAnswer::MayContain) => {}
         }
     }
 
-    FilterAnswer::Unanswered
+    answer
 }
 
-/// One table's versions of a point key, read after its filter let the key
-/// through. A reader that ends having found none shows the filter answered
-/// for a key the table holds no version of, and counts it as the point read
-/// counts a false positive. It reads every version whatever the snapshot, so
-/// finding none is conclusive; a reader dropped before it ends counts
-/// nothing.
+/// One table's versions of a point key or of the keys under a prefix, read
+/// after its filter let the key or prefix through. A reader that ends having
+/// found none shows the filter answered for what the table holds no version
+/// of, and counts it as the point read counts a false positive. It reads
+/// every version whatever the snapshot, so finding none is conclusive; a
+/// reader dropped before it ends counts nothing.
 struct FilterPassReader<I, T> {
     inner: I,
     table: T,
@@ -346,10 +371,10 @@ where
     }
 }
 
-/// The reader of `table` for the point key in `user_range` at `seqno`, which
-/// its filters did not rule out: it counts a miss when `answer` says the key's
-/// filter was asked and let the key through, the probe that miss belongs to.
-fn point_reader<'a, T>(
+/// The reader of `table` over `user_range` at `seqno`, which its filters did
+/// not rule out: it counts a miss when `answer` says a filter was asked and
+/// let the read through, the probe that miss belongs to.
+fn table_reader<'a, T>(
     answer: FilterAnswer,
     table: T,
     user_range: (Bound<UserKey>, Bound<UserKey>),
@@ -359,7 +384,7 @@ where
     T: core::borrow::Borrow<crate::table::Table> + Send + 'a,
 {
     let reader = table.borrow().range(user_range);
-    let counts = answer == FilterAnswer::KeyPassed && table.borrow().probe_stats().is_some();
+    let counts = answer.passed() && table.borrow().probe_stats().is_some();
     let visible = move |item: &crate::Result<InternalValue>| match item {
         Ok(item) => seqno_filter(item.key.seqno, seqno),
         Err(_) => true,
@@ -467,7 +492,7 @@ impl TreeIter {
                         if table.check_key_range_overlap_cmp(&bounds, lock.comparator.as_ref()) {
                             let answer = filter_answer(lock, table);
                             if answer != FilterAnswer::Absent {
-                                iters.push(point_reader(answer, table, user_range.clone(), seqno));
+                                iters.push(table_reader(answer, table, user_range.clone(), seqno));
                             }
                         }
                     }
@@ -487,7 +512,7 @@ impl TreeIter {
                             0 => {}
                             1 => {
                                 if let Some((table, answer)) = surviving.pop() {
-                                    iters.push(point_reader(
+                                    iters.push(table_reader(
                                         answer,
                                         table,
                                         user_range.clone(),
@@ -723,9 +748,11 @@ impl TreeIter {
                                 user_range.1.as_ref().map(core::convert::AsRef::as_ref),
                             ),
                             lock.comparator.as_ref(),
-                        ) && bloom_passes(lock, table)
-                        {
-                            single_tables.push(table.clone());
+                        ) {
+                            let answer = filter_answer(lock, table);
+                            if answer != FilterAnswer::Absent {
+                                single_tables.push((table.clone(), answer));
+                            }
                         }
                     }
                     _ => {
@@ -758,21 +785,21 @@ impl TreeIter {
                                 user_range.1.as_ref().map(core::convert::AsRef::as_ref),
                             );
 
-                            let surviving: Vec<_> = run
+                            let mut surviving: Vec<(crate::table::Table, FilterAnswer)> = run
                                 .iter()
+                                // Cheap key-range metadata check first to avoid
+                                // bloom filter I/O for non-overlapping tables.
                                 .filter(|table| {
-                                    // Cheap key-range metadata check first to avoid
-                                    // bloom filter I/O for non-overlapping tables.
-                                    if !table.check_key_range_overlap_cmp(
+                                    table.check_key_range_overlap_cmp(
                                         &bounds,
                                         lock.comparator.as_ref(),
-                                    ) {
-                                        return false;
-                                    }
-
-                                    bloom_passes(lock, table)
+                                    )
                                 })
-                                .cloned()
+                                .filter_map(|table| {
+                                    let answer = filter_answer(lock, table);
+                                    (answer != FilterAnswer::Absent)
+                                        .then(|| (table.clone(), answer))
+                                })
                                 .collect();
 
                             match surviving.len() {
@@ -783,11 +810,18 @@ impl TreeIter {
                                     // Demote to single-table path so it also
                                     // benefits from the range-tombstone table-skip
                                     // optimization below.
-                                    if let Some(table) = surviving.into_iter().next() {
-                                        single_tables.push(table);
+                                    if let Some(entry) = surviving.pop() {
+                                        single_tables.push(entry);
                                     }
                                 }
                                 _ => {
+                                    // Tables of a run are disjoint, so a read
+                                    // range reaching two or more of them holds
+                                    // keys of each (their bounds are keys, save
+                                    // a range tombstone's end): their filters'
+                                    // passes are no false positives to count.
+                                    let surviving =
+                                        surviving.into_iter().map(|(table, _)| table).collect();
                                     // surviving.len() >= 2, so Run::new cannot
                                     // return None (only empty vecs yield None).
                                     #[expect(
@@ -815,7 +849,7 @@ impl TreeIter {
             all_range_tombstones
                 .sort_unstable_by(|(a, _), (b, _)| lock.comparator.compare(&a.start, &b.start));
 
-            for table in single_tables {
+            for (table, answer) in single_tables {
                 // Table-skip: if a range tombstone fully covers this table
                 // with a higher seqno, skip it entirely (avoid I/O).
                 //
@@ -850,14 +884,7 @@ impl TreeIter {
                         });
 
                 if !is_covered {
-                    let reader = table
-                        .range(user_range.clone())
-                        .filter(move |item| match item {
-                            Ok(item) => seqno_filter(item.key.seqno, seqno),
-                            Err(_) => true,
-                        });
-
-                    iters.push(Box::new(reader));
+                    iters.push(table_reader(answer, table, user_range.clone(), seqno));
                 }
             }
 

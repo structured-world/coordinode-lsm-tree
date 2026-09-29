@@ -207,7 +207,7 @@ pub struct Rewrite {
     /// The keys it writes, when it rewrites only part of its inputs.
     pub span: Option<Span>,
     /// Keys it writes filters for, bounded from above, when it has no
-    /// inputs to count them from: a flush's memtable entries.
+    /// inputs to count them from: the filter hashes of a flush's memtables.
     pub keys: u64,
     /// The order of the tree's keys, which reads an input's share of a key
     /// range from its key range alone where that settles it.

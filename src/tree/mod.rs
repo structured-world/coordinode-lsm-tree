@@ -1853,8 +1853,8 @@ impl AbstractTree for Tree {
 
 impl Tree {
     /// The filter plan of new data written into tables under the policies of
-    /// `level`, as a flush or an ingestion writes it: at most `keys` entries
-    /// (zero when unknown) under `bloom_policy`. `None` without an advisor.
+    /// `level`, as a flush or an ingestion writes it: at most `keys` filter
+    /// hashes (zero when unknown) under `bloom_policy`. `None` without an advisor.
     /// New data has no probe history of its own: its filters are sized by the
     /// load the live tables draw per key, and room is kept for every table the
     /// write fills. The plan is held until the tables are installed (see

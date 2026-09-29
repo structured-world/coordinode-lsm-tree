@@ -344,6 +344,9 @@ pub(crate) struct DataSpan {
 enum BloomResult {
     /// Bloom says key is definitely absent — skip point read.
     Skip,
+    /// The key sorts past the last filter partition: absent by the partition
+    /// index alone, with no filter answering, so no probe of one.
+    PastPartitions,
     /// Point read should proceed.
     Proceed {
         /// Whether a filter was present, for metrics and probe accounting.
@@ -351,9 +354,22 @@ enum BloomResult {
     },
 }
 
+/// What a key check of a table's filters found (see
+/// [`Table::key_filter_answer`]).
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+pub(crate) enum KeyFilterAnswer {
+    /// A filter answered absent.
+    Absent,
+    /// The key sorts past the last filter partition: absent by the partition
+    /// index alone, with no filter answering.
+    PastPartitions,
+    /// The key may be present, or nothing could rule it out.
+    MayContain,
+}
+
 impl BloomResult {
     fn should_skip(&self) -> bool {
-        matches!(self, Self::Skip)
+        matches!(self, Self::Skip | Self::PastPartitions)
     }
 
     fn has_filter(&self) -> bool {
@@ -366,7 +382,7 @@ impl BloomResult {
         let (probes, negatives) = match self {
             Self::Skip => (1, 1),
             Self::Proceed { has_filter: true } => (1, 0),
-            Self::Proceed { has_filter: false } => (0, 0),
+            Self::PastPartitions | Self::Proceed { has_filter: false } => (0, 0),
         };
         crate::table::probe_stats::ProbeCounts { probes, negatives }
     }
@@ -6578,7 +6594,7 @@ impl Table {
                     self.metrics.filter_queries.fetch_add(1, Relaxed);
                     self.metrics.io_skipped_by_filter.fetch_add(1, Relaxed);
                 }
-                return Ok(BloomResult::Skip);
+                return Ok(BloomResult::PastPartitions);
             }
         } else if let Some(_filter_tli_handle) = &self.regions.filter_tli {
             unimplemented!("unpinned filter TLI not supported");
@@ -10156,17 +10172,35 @@ impl Table {
     /// `key_hash` must be the xxh3 hash of `key` (pre-computed by the caller
     /// to avoid redundant hashing — same pattern as [`Table::get`]).
     pub(crate) fn bloom_may_contain_key(&self, key: &[u8], key_hash: u64) -> crate::Result<bool> {
+        self.key_filter_answer(key, key_hash)
+            .map(|answer| answer == KeyFilterAnswer::MayContain)
+    }
+
+    /// [`Self::bloom_may_contain_key`], telling a filter's absent answer
+    /// apart from a key the partition index alone rules out.
+    pub(crate) fn key_filter_answer(
+        &self,
+        key: &[u8],
+        key_hash: u64,
+    ) -> crate::Result<KeyFilterAnswer> {
         debug_assert_eq!(
             crate::hash::hash64(key),
             key_hash,
             "bloom_may_contain_key: key_hash must be crate::hash::hash64(key)"
         );
+        let by_hash = |may: bool| {
+            if may {
+                KeyFilterAnswer::MayContain
+            } else {
+                KeyFilterAnswer::Absent
+            }
+        };
 
         // Full (non-partitioned) filter — delegate to hash-only path.
         // A table has either pinned_filter_block (full) or pinned_filter_index
         // (partitioned), never both — checked at construction time.
         if self.pinned_filter_block.is_some() {
-            return self.bloom_may_contain_hash(key_hash);
+            return self.bloom_may_contain_hash(key_hash).map(by_hash);
         }
 
         // Partitioned filter with pinned TLI — seek to the matching partition
@@ -10185,19 +10219,19 @@ impl Table {
                     None,
                 )?;
                 let block = FilterBlock::new(block);
-                return block.maybe_contains_hash(key_hash);
+                return block.maybe_contains_hash(key_hash).map(by_hash);
             }
 
             // iter.next() == None means the key is beyond all partition
             // boundaries (seek found no ceiling entry in the TLI, which is
             // ordered by each partition's last user key). The key cannot
-            // exist in this table. Same logic as Table::get (line ~265).
-            return Ok(false);
+            // exist in this table, as in `check_bloom`.
+            return Ok(KeyFilterAnswer::PastPartitions);
         }
 
         // Unpinned filter — fall through to hash-only path (handles both
         // unpinned full filters and the no-filter case)
-        self.bloom_may_contain_hash(key_hash)
+        self.bloom_may_contain_hash(key_hash).map(by_hash)
     }
 
     /// Whether a key check answers from a filter rather than passing the key

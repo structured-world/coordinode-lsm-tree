@@ -4,6 +4,8 @@
 //! How often a table's filter is probed, and how often for a key the table
 //! does not hold: what filter memory is allocated against.
 
+#[cfg(not(feature = "std"))]
+use alloc::vec::Vec;
 use core::sync::atomic::Ordering::Relaxed;
 // 32-bit targets without native 64-bit atomics get them from the crate.
 use portable_atomic::AtomicU64;
@@ -86,10 +88,18 @@ impl core::ops::AddAssign for ProbeCounts {
 /// The counts a table covering `first..=last` inherits from `inputs`, the
 /// tables a compaction rewrote into it.
 ///
-/// Each input gives the share of its counts that its own data inside the
-/// range holds, measured by data block offsets in its index: an output taking
-/// a hot narrow input whole and a slice of a cold wide one carries all of the
-/// first and that slice of the second, not the sum of both.
+/// An input gives the share of its counts that its own data inside a part of
+/// the range holds, measured by data block offsets in its index: an output
+/// taking a hot narrow input whole and a slice of a cold wide one carries all
+/// of the first and that slice of the second.
+///
+/// Where inputs overlap, the same lookups probed each of them, so each part
+/// of the range takes one input's counts: the oldest one holding data there.
+/// A point read goes from the newest table to the oldest and stops at the
+/// key, so the lookups reaching the oldest input are those every newer one
+/// let past, and its negatives are the keys none of them holds, the ones the
+/// output will be probed for and not hold; it has also watched longest.
+/// Inputs that do not overlap, the tables of one level, each give their own.
 ///
 /// This is a heuristic, and its limit is the counter's: one scalar per table
 /// carries no spatial distribution, so an input split across several outputs
@@ -99,15 +109,56 @@ pub fn inherited_counts(
     last: &[u8],
     inputs: &[crate::table::Table],
 ) -> crate::Result<ProbeCounts> {
-    use core::ops::Bound::Included;
+    use core::cmp::Ordering::{Equal, Greater, Less};
+    use core::ops::Bound::{Excluded, Included};
+
+    let Some(comparator) = inputs.first().map(|input| input.comparator.clone()) else {
+        return Ok(ProbeCounts::default());
+    };
+    let cmp = |a: &[u8], b: &[u8]| comparator.compare(a, b);
+
+    // Where the parts of the range start: where an input's data starts, and
+    // just past where it ends (`true`).
+    let mut starts: Vec<(&[u8], bool)> = Vec::new();
+    for input in inputs {
+        let range = &input.metadata.key_range;
+        let (min, max) = (range.min().as_ref(), range.max().as_ref());
+        if cmp(min, first) == Greater && cmp(min, last) != Greater {
+            starts.push((min, false));
+        }
+        if cmp(max, first) != Less && cmp(max, last) == Less {
+            starts.push((max, true));
+        }
+    }
+    starts.sort_by(|a, b| cmp(a.0, b.0).then(a.1.cmp(&b.1)));
+    starts.dedup_by(|a, b| cmp(a.0, b.0) == Equal && a.1 == b.1);
+
+    let mut by_age: Vec<&crate::table::Table> = inputs.iter().collect();
+    by_age.sort_by_key(|input| input.get_highest_seqno());
 
     let mut inherited = ProbeCounts::default();
-    for input in inputs {
-        let share = share_of(input, (Included(first), Included(last)))?;
-        // Each share is at most a count a table held, and a table cannot see
-        // 2^64 probes, so neither can the handful a compaction merges.
-        inherited.probes += share.probes;
-        inherited.negatives += share.negatives;
+    let mut lower = Included(first);
+    for index in 0..=starts.len() {
+        let next = starts.get(index).copied();
+        let upper = match next {
+            Some((key, true)) => Included(key),
+            Some((key, false)) => Excluded(key),
+            None => Included(last),
+        };
+        for input in &by_age {
+            if !input.check_key_range_overlap_cmp(&(lower, upper), comparator.as_ref()) {
+                continue;
+            }
+            if let Some(share) = region_share(input, (lower, upper))? {
+                // Each share is at most a count a table held, and a table
+                // cannot see 2^64 probes, so neither can the parts of one.
+                inherited += share;
+                break;
+            }
+        }
+        if let Some((key, past)) = next {
+            lower = if past { Excluded(key) } else { Included(key) };
+        }
     }
     Ok(inherited)
 }
@@ -152,24 +203,38 @@ pub fn fraction_of(
 
 /// The share of `table`'s counts its data inside `bounds` holds, by data
 /// block offsets over the part of the table its view serves.
+// Called by the restricted view a tight-space slice opens, which is std-only.
+#[cfg(feature = "std")]
 pub fn share_of(
     table: &crate::table::Table,
     bounds: (core::ops::Bound<&[u8]>, core::ops::Bound<&[u8]>),
 ) -> crate::Result<ProbeCounts> {
-    let Some(stats) = table.probe_stats() else {
+    if table.probe_stats().is_none() {
         return Ok(ProbeCounts::default());
-    };
+    }
+    Ok(region_share(table, bounds)?.unwrap_or_default())
+}
+
+/// [`share_of`], or `None` when `table`'s view holds no data block inside
+/// `bounds`: its counts say nothing of that part of the key space.
+fn region_share(
+    table: &crate::table::Table,
+    bounds: (core::ops::Bound<&[u8]>, core::ops::Bound<&[u8]>),
+) -> crate::Result<Option<ProbeCounts>> {
     // Each block goes to the range holding its last key, so the outputs of
     // one compaction share an input's counts without counting any block twice.
     let Some(span) =
         table.data_span(bounds, crate::SeqNo::MAX, crate::table::SpanEdge::ByLastKey)?
     else {
-        return Ok(ProbeCounts::default());
+        return Ok(None);
     };
     let live = span.data_end - span.live_start;
-    if live == 0 {
-        return Ok(ProbeCounts::default());
+    if live == 0 || span.covered == 0 {
+        return Ok(None);
     }
+    let Some(stats) = table.probe_stats() else {
+        return Ok(Some(ProbeCounts::default()));
+    };
     // `covered <= live`, so a share is at most the table's count.
     let share = |count: u64| {
         #[expect(
@@ -179,10 +244,10 @@ pub fn share_of(
         let share = (u128::from(count) * u128::from(span.covered) / u128::from(live)) as u64;
         share
     };
-    Ok(ProbeCounts {
+    Ok(Some(ProbeCounts {
         probes: share(stats.probes()),
         negatives: share(stats.negatives()),
-    })
+    }))
 }
 
 #[cfg(test)]

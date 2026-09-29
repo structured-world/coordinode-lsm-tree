@@ -502,12 +502,24 @@ pub trait AbstractTree: sealed::Sealed {
             .collect::<Vec<_>>();
 
         let flushed_size = latest.sealed_memtables.iter().map(|mt| mt.size()).sum();
-        // Every version of every key: the stream writes no more entries.
-        let flushed_entries: u64 = latest
-            .sealed_memtables
-            .iter()
-            .map(|mt| u64::try_from(mt.len()).unwrap_or(u64::MAX))
-            .sum();
+        // The hashes the flush's filters hold, which the filter plan keeps room
+        // for: counted only when a filter budget plans them. A key in several
+        // memtables counts in each, a bound from above.
+        let flushed_hashes: u64 = if self.tree_config().filter_advisor.is_some() {
+            // A partitioned filter holds no prefix hashes.
+            let prefixes = if self.tree_config().filter_block_partitioning_policy.get(0) {
+                None
+            } else {
+                self.tree_config().prefix_extractor.as_deref()
+            };
+            latest
+                .sealed_memtables
+                .iter()
+                .map(|mt| mt.filter_hashes(prefixes))
+                .sum()
+        } else {
+            0
+        };
 
         // AtInsert residence check: verify each sealed memtable's insert-time
         // per-KV digests against a recompute over the entries' current bytes
@@ -561,7 +573,7 @@ pub trait AbstractTree: sealed::Sealed {
         // RT-only path (no KV data, tables.is_empty()) we re-insert RTs into the
         // active memtable. Flush is infrequent and RT count is small.
         if let Some((tables, blob_files, write_pin)) =
-            self.flush_to_tables_with_rt(stream, range_tombstones.clone(), flushed_entries)?
+            self.flush_to_tables_with_rt(stream, range_tombstones.clone(), flushed_hashes)?
         {
             // If no tables were produced (RT-only memtable), re-insert RTs
             // into active memtable so they aren't lost
@@ -858,8 +870,9 @@ pub trait AbstractTree: sealed::Sealed {
     }
 
     /// Like [`AbstractTree::flush_to_tables`], but also writes range tombstones.
-    /// `keys` bounds the entries of `stream` from above, zero when unknown: a
-    /// filter advisor keeps room for every table the flush writes by it.
+    /// `keys` bounds the filter hashes of `stream` from above, zero when
+    /// unknown: a filter advisor keeps room for every table the flush writes
+    /// by it.
     ///
     /// This is an internal extension hook on the crate's sealed tree types and
     /// is hidden from generated documentation.

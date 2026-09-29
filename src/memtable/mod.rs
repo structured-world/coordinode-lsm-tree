@@ -188,6 +188,44 @@ impl Memtable {
             .load(core::sync::atomic::Ordering::Acquire)
     }
 
+    /// The hashes a table filter built over this memtable's keys holds: one
+    /// per distinct key and, with `prefixes`, one per prefix at a position
+    /// where the key before had another, as a full filter registers them.
+    /// Versions of a key add none.
+    pub(crate) fn filter_hashes(&self, prefixes: Option<&dyn crate::PrefixExtractor>) -> u64 {
+        let mut hashes = 0u64;
+        let mut previous: Option<crate::UserKey> = None;
+        let mut previous_prefixes: Vec<u64> = Vec::new();
+        for entry in self.items.iter() {
+            let key = entry.key().user_key;
+            if previous
+                .as_ref()
+                .is_some_and(|previous| crate::comparator::same_user_key(previous, &key))
+            {
+                continue;
+            }
+            hashes += 1;
+            if let Some(extractor) = prefixes {
+                for (position, prefix) in extractor.prefixes(&key).enumerate() {
+                    let hash = crate::hash::hash64(prefix);
+                    match previous_prefixes.get_mut(position) {
+                        Some(previous) if *previous == hash => {}
+                        Some(previous) => {
+                            *previous = hash;
+                            hashes += 1;
+                        }
+                        None => {
+                            previous_prefixes.push(hash);
+                            hashes += 1;
+                        }
+                    }
+                }
+            }
+            previous = Some(key);
+        }
+        hashes
+    }
+
     /// Counts the number of items in the memtable.
     pub fn len(&self) -> usize {
         self.items.len()

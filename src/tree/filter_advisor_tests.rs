@@ -86,6 +86,39 @@ fn under(tables: &[Table], prefix: &str) -> Vec<Table> {
 
 const KEYS: u32 = 4_000;
 
+/// The key up to and including its first ':'.
+struct UpToColon;
+
+impl crate::PrefixExtractor for UpToColon {
+    fn prefixes<'a>(&self, key: &'a [u8]) -> Box<dyn Iterator<Item = &'a [u8]> + 'a> {
+        Box::new(
+            key.iter()
+                .position(|&byte| byte == b':')
+                .and_then(|end| key.get(..=end))
+                .into_iter(),
+        )
+    }
+}
+
+/// Appends the operands to the base: a merge operator for the reads that
+/// resolve merge operands.
+struct Concat;
+
+impl crate::MergeOperator for Concat {
+    fn merge(
+        &self,
+        _key: &[u8],
+        base: Option<&[u8]>,
+        operands: &[&[u8]],
+    ) -> crate::Result<crate::UserValue> {
+        let mut merged = base.map(<[u8]>::to_vec).unwrap_or_default();
+        for operand in operands {
+            merged.extend_from_slice(operand);
+        }
+        Ok(merged.into())
+    }
+}
+
 /// With negative lookups concentrated on one half of the key space, a
 /// compaction at a budget that cannot give every filter the widest width
 /// spends it on the tables of that half.
@@ -483,6 +516,77 @@ fn a_flush_into_several_tables_keeps_room_for_the_later_ones() -> crate::Result<
     Ok(())
 }
 
+/// Tables holding the same keys are probed by the same lookups: an absent key
+/// read once is one negative probe of each. Merged, the output is probed once
+/// for it, so it inherits the lookups once, not once per input.
+#[test]
+fn overlapping_inputs_hand_down_a_lookup_once() -> crate::Result<()> {
+    let folder = tempfile::tempdir()?;
+    let tree = open(folder.path(), Some(FilterAdvisor::new(u64::MAX)))?;
+    // An older table on a level below and a newer one over the same keys.
+    fill(&tree, &["k"], KEYS)?;
+    tree.major_compact(64 * 1_024 * 1_024, 0)?;
+    fill(&tree, &["k"], KEYS)?;
+    let before = tables(&tree);
+    assert_eq!(before.len(), 2, "two overlapping tables");
+    probe_absent(&tree, "k", KEYS - 1)?;
+    let negatives = |tables: &[Table]| -> u64 {
+        tables
+            .iter()
+            .map(|table| {
+                table
+                    .probe_stats()
+                    .map_or(0, crate::table::probe_stats::ProbeStats::negatives)
+            })
+            .sum()
+    };
+    // Every lookup reached both tables.
+    for table in &before {
+        assert_eq!(negatives(core::slice::from_ref(table)), u64::from(KEYS - 1));
+    }
+
+    tree.major_compact(64 * 1_024 * 1_024, 0)?;
+    let after = negatives(&tables(&tree));
+    let lookups = u64::from(KEYS - 1);
+    assert!(
+        after.abs_diff(lookups) <= lookups / 20,
+        "{after} negatives inherited from {lookups} lookups"
+    );
+    Ok(())
+}
+
+/// A flush keeps room for the hashes still to come, not for the versions:
+/// five versions of every key make one filter hash each, so a flush into one
+/// table keeps no room for later tables and takes the static width the
+/// budget fits, where counting versions would reserve room for four times
+/// the keys and leave only the narrowest.
+#[test]
+fn a_flush_reserves_by_filter_hashes_not_versions() -> crate::Result<()> {
+    const KEYS: usize = 4_000;
+    let folder = tempfile::tempdir()?;
+    let wide = BloomConstructionPolicy::BitsPerKey(10.0).filter_size_bound(KEYS) as u64;
+    let tree = open(
+        folder.path(),
+        Some(FilterAdvisor::new(wide * 11 / 10).with_bits_per_key([6u8, 10].to_vec())),
+    )?;
+    let mut seqno = 0;
+    for _ in 0..5 {
+        for i in 0..KEYS {
+            tree.insert(format!("key{i:06}"), "value", seqno);
+            seqno += 1;
+        }
+    }
+    tree.flush_active_memtable(0)?;
+
+    let tables = tables(&tree);
+    let [table] = tables.as_slice() else {
+        panic!("one table");
+    };
+    let bits = u64::from(table.filter_size()) * 8 / KEYS as u64;
+    assert!(bits >= 9, "{bits} bits a key: the static 10 fit the budget");
+    Ok(())
+}
+
 /// An ingestion told how many entries it writes keeps room for its later
 /// tables' filters as a flush does: across several tables, every filter fits
 /// the budget that fits them all at the narrowest width.
@@ -525,6 +629,64 @@ fn an_ingestion_told_its_entries_keeps_room_for_the_later_tables() -> crate::Res
     Ok(())
 }
 
+/// A key past a partitioned filter's last partition, yet inside the table's
+/// key range (a range tombstone reaches past its last key), is ruled out by
+/// the partition index alone: no filter answers for it, so it is no probe,
+/// and no filter width would change it.
+#[test]
+fn a_key_past_the_last_filter_partition_is_no_probe() -> crate::Result<()> {
+    use crate::config::PinningPolicy;
+
+    let folder = tempfile::tempdir()?;
+    let tree = Config::new(
+        folder.path(),
+        SequenceNumberCounter::default(),
+        SequenceNumberCounter::default(),
+    )
+    .data_block_size_policy(BlockSizePolicy::all(1_024))
+    .filter_block_partitioning_policy(PinningPolicy::all(true))
+    .with_merge_operator(Some(alloc::sync::Arc::new(Concat)))
+    .filter_advisor(Some(FilterAdvisor::new(u64::MAX)))
+    .open()?;
+    for i in 0..KEYS {
+        tree.insert(key("a", 2 * i), "value", u64::from(i));
+    }
+    tree.remove_range("b", "c", u64::from(KEYS));
+    tree.flush_active_memtable(0)?;
+    let tables = tables(&tree);
+    let [table] = tables.as_slice() else {
+        panic!("one table");
+    };
+    assert!(
+        table.metadata.key_range.max().as_ref() >= b"b".as_slice(),
+        "the range tombstone widens the key range"
+    );
+    let counts = |table: &Table| {
+        table
+            .probe_stats()
+            .map_or((0, 0), |stats| (stats.probes(), stats.negatives()))
+    };
+    let before = counts(table);
+
+    for i in 0..100u32 {
+        assert!(tree.get(key("b", i), SeqNo::MAX)?.is_none());
+    }
+    assert_eq!(counts(table), before, "point reads (probes, negatives)");
+
+    // Merge-operand resolution asks the table's filters the same way.
+    for i in 0..100u32 {
+        tree.merge(key("b", i), "x", u64::from(KEYS + 1 + i));
+    }
+    for i in 0..100u32 {
+        assert_eq!(
+            tree.get(key("b", i), SeqNo::MAX)?.as_deref(),
+            Some(&b"x"[..])
+        );
+    }
+    assert_eq!(counts(table), before, "merge reads (probes, negatives)");
+    Ok(())
+}
+
 /// A read whose newest version is a merge operand resolves it over every
 /// older table, asking each one's filter again; those answers count as the
 /// point read's do. The older table here holds none of the keys read, so
@@ -535,22 +697,6 @@ fn an_ingestion_told_its_entries_keeps_room_for_the_later_tables() -> crate::Res
 fn merge_resolution_counts_its_filter_probes() -> crate::Result<()> {
     use crate::config::{FilterPolicy, FilterPolicyEntry};
     use alloc::sync::Arc;
-
-    struct Concat;
-    impl crate::MergeOperator for Concat {
-        fn merge(
-            &self,
-            _key: &[u8],
-            base: Option<&[u8]>,
-            operands: &[&[u8]],
-        ) -> crate::Result<crate::UserValue> {
-            let mut merged = base.map(<[u8]>::to_vec).unwrap_or_default();
-            for operand in operands {
-                merged.extend_from_slice(operand);
-            }
-            Ok(merged.into())
-        }
-    }
 
     let folder = tempfile::tempdir()?;
     let tree = Config::new(
@@ -606,22 +752,6 @@ fn an_unreadable_filter_counts_no_miss() -> crate::Result<()> {
     use crate::config::{FilterPolicy, FilterPolicyEntry};
     use crate::fs::{Fault, FaultFs, FaultOp, FaultRule, StdFs};
     use alloc::sync::Arc;
-
-    struct Concat;
-    impl crate::MergeOperator for Concat {
-        fn merge(
-            &self,
-            _key: &[u8],
-            base: Option<&[u8]>,
-            operands: &[&[u8]],
-        ) -> crate::Result<crate::UserValue> {
-            let mut merged = base.map(<[u8]>::to_vec).unwrap_or_default();
-            for operand in operands {
-                merged.extend_from_slice(operand);
-            }
-            Ok(merged.into())
-        }
-    }
 
     let folder = tempfile::tempdir()?;
     let fs = FaultFs::new(StdFs);
@@ -773,19 +903,6 @@ fn before_any_probe_the_filters_match_the_static_policy() -> crate::Result<()> {
 fn prefix_scans_count_their_filter_probes() -> crate::Result<()> {
     use alloc::sync::Arc;
 
-    /// The key up to and including its first ':'.
-    struct UpToColon;
-    impl crate::PrefixExtractor for UpToColon {
-        fn prefixes<'a>(&self, key: &'a [u8]) -> Box<dyn Iterator<Item = &'a [u8]> + 'a> {
-            Box::new(
-                key.iter()
-                    .position(|&byte| byte == b':')
-                    .and_then(|end| key.get(..=end))
-                    .into_iter(),
-            )
-        }
-    }
-
     let folder = tempfile::tempdir()?;
     let tree = Config::new(
         folder.path(),
@@ -829,6 +946,64 @@ fn prefix_scans_count_their_filter_probes() -> crate::Result<()> {
     assert!(
         counted >= u64::from(scans) * 9 / 10,
         "{counted} negative probes of {scans} prefix scans"
+    );
+    Ok(())
+}
+
+/// A prefix the filter lets through, whose scan then finds no key under it,
+/// is a false positive and counts as a negative probe, as a point read's is:
+/// with a one-bit filter about half the absent prefixes pass, and every scan
+/// of an absent prefix counts one probe and one negative.
+#[test]
+fn a_prefix_scan_finding_nothing_after_its_filter_passed_counts_a_negative() -> crate::Result<()> {
+    use crate::config::{FilterPolicy, FilterPolicyEntry};
+    use alloc::sync::Arc;
+
+    let folder = tempfile::tempdir()?;
+    let tree = Config::new(
+        folder.path(),
+        SequenceNumberCounter::default(),
+        SequenceNumberCounter::default(),
+    )
+    .data_block_size_policy(BlockSizePolicy::all(1_024))
+    .prefix_extractor(Arc::new(UpToColon))
+    .filter_policy(FilterPolicy::all(FilterPolicyEntry::Bloom(
+        BloomConstructionPolicy::BitsPerKey(1.0),
+    )))
+    .filter_advisor(Some(FilterAdvisor::new(u64::MAX)))
+    .open()?;
+    const PREFIXES: u32 = 400;
+    let mut seqno = 0;
+    for p in 0..PREFIXES {
+        for i in 0..5 {
+            tree.insert(format!("p{:04}:{i}", 2 * p), "value", seqno);
+            seqno += 1;
+        }
+    }
+    tree.flush_active_memtable(0)?;
+    let tables = tables(&tree);
+    let [table] = tables.as_slice() else {
+        panic!("one table");
+    };
+    let counts = || {
+        table
+            .probe_stats()
+            .map_or((0, 0), |stats| (stats.probes(), stats.negatives()))
+    };
+    let before = counts();
+    let scans = PREFIXES - 1;
+    for p in 0..scans {
+        assert_eq!(
+            tree.prefix(format!("p{:04}:", 2 * p + 1), SeqNo::MAX, None)
+                .count(),
+            0
+        );
+    }
+    let after = counts();
+    assert_eq!(
+        (after.0 - before.0, after.1 - before.1),
+        (u64::from(scans), u64::from(scans)),
+        "(probes, negatives) of {scans} scans of absent prefixes"
     );
     Ok(())
 }
