@@ -159,6 +159,8 @@ pub struct FilterSizing {
     split: Option<Split>,
     /// The keys the rewrite writes, when only part of its inputs'.
     span: Option<Span>,
+    /// The order of the tree's keys, when the rewrite has inputs to share out.
+    key_order: Option<KeyOrder>,
     /// Per key range, the lower bound of the last filter priced there: the
     /// range's data from it on is still to be written. `None` before the
     /// range's first filter.
@@ -178,6 +180,9 @@ pub struct Rewrite {
     /// Keys it writes filters for, bounded from above, when it has no
     /// inputs to count them from: a flush's memtable entries.
     pub keys: u64,
+    /// The order of the tree's keys, which reads an input's share of a key
+    /// range from its key range alone where that settles it.
+    pub comparator: Option<crate::comparator::SharedComparator>,
 }
 
 /// The part of its inputs a rewrite writes: its keys from `lower` through
@@ -219,6 +224,46 @@ impl core::fmt::Debug for Span {
             .field("lower", &self.lower)
             .field("upper", &self.upper)
             .finish_non_exhaustive()
+    }
+}
+
+/// The order of the tree's keys, for the share of an input a key range holds.
+struct KeyOrder(crate::comparator::SharedComparator);
+
+impl core::fmt::Debug for KeyOrder {
+    fn fmt(&self, f: &mut core::fmt::Formatter<'_>) -> core::fmt::Result {
+        f.write_str("KeyOrder")
+    }
+}
+
+impl KeyOrder {
+    /// The share of `input`'s data inside `bounds` when its key range alone
+    /// settles it: none when the range lies wholly outside the bounds, all of
+    /// it when wholly inside. `None` when the range crosses a bound, and only
+    /// the block index can tell.
+    fn settled_share(&self, input: &Table, bounds: (Bound<&[u8]>, Bound<&[u8]>)) -> Option<f64> {
+        use core::cmp::Ordering::{Greater, Less};
+
+        let order = &*self.0;
+        let before_lower = |key: &[u8]| match bounds.0 {
+            Bound::Unbounded => false,
+            Bound::Included(lower) => order.compare(key, lower) == Less,
+            Bound::Excluded(lower) => order.compare(key, lower) != Greater,
+        };
+        let past_upper = |key: &[u8]| match bounds.1 {
+            Bound::Unbounded => false,
+            Bound::Included(upper) => order.compare(key, upper) == Greater,
+            Bound::Excluded(upper) => order.compare(key, upper) != Less,
+        };
+        let range = &input.metadata.key_range;
+        let (min, max) = (range.min(), range.max());
+        if before_lower(max) || past_upper(min) {
+            Some(0.0)
+        } else if !before_lower(min) && !past_upper(max) {
+            Some(1.0)
+        } else {
+            None
+        }
     }
 }
 
@@ -326,6 +371,7 @@ pub fn plan(
         split,
         span,
         keys,
+        comparator,
     } = rewrite;
     let ranges = split.as_ref().map_or(1, |split| split.boundaries.len() + 1);
 
@@ -457,6 +503,7 @@ pub fn plan(
         observed: observed > 0,
         split,
         span,
+        key_order: comparator.map(KeyOrder),
         cursors: Mutex::new(alloc::vec![None; ranges]),
         state: Arc::clone(state),
     }))
@@ -532,7 +579,7 @@ impl FilterSizing {
                 let from = cursor
                     .as_ref()
                     .map_or(low, |bound| bound.as_ref().map(AsRef::as_ref));
-                share += crate::table::probe_stats::fraction_of(input, (from, high))?;
+                share += self.share_of(input, (from, high))?;
             }
             let keys = as_f64(filter_keys(input)) * share;
             if keys >= 1.0 {
@@ -557,6 +604,22 @@ impl FilterSizing {
         )]
         let left = left as u64;
         Ok(price(&remaining, &self.widths, left))
+    }
+
+    /// The share of `input`'s data inside `bounds` (see
+    /// [`crate::table::probe_stats::fraction_of`]). Asked for every input
+    /// before every filter, it walks the block index only for an input whose
+    /// key range crosses a bound: of a compaction's many inputs, most lie
+    /// wholly on one side of a filter's range.
+    fn share_of(&self, input: &Table, bounds: (Bound<&[u8]>, Bound<&[u8]>)) -> crate::Result<f64> {
+        if let Some(share) = self
+            .key_order
+            .as_ref()
+            .and_then(|order| order.settled_share(input, bounds))
+        {
+            return Ok(share);
+        }
+        crate::table::probe_stats::fraction_of(input, bounds)
     }
 
     /// Moves the cursor of the key range holding `lower` to it, and returns
@@ -805,8 +868,7 @@ impl FilterSizing {
     fn load(&self, bounds: (Bound<&[u8]>, Bound<&[u8]>), n: usize) -> crate::Result<f64> {
         let (mut keys, mut probes) = (0.0, 0.0);
         for (input, density) in self.inputs.iter().zip(&self.input_densities) {
-            let covered =
-                as_f64(filter_keys(input)) * crate::table::probe_stats::fraction_of(input, bounds)?;
+            let covered = as_f64(filter_keys(input)) * self.share_of(input, bounds)?;
             keys += covered;
             probes += covered * density;
         }

@@ -131,6 +131,7 @@ pub(super) fn plan_filters(
             split,
             span,
             keys: 0,
+            comparator: Some(opts.config.comparator.clone()),
         },
         output_bloom_policy(version, opts, payload),
         opts.config

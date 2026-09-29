@@ -169,6 +169,70 @@ fn the_price_counts_partitioned_filters_as_partitions() {
     );
 }
 
+/// Wherever a table's key range settles its share of a key range, the share
+/// is the one its block index gives: none outside, all inside, at every kind
+/// of bound, including bounds on the table's first and last key.
+#[test]
+fn a_share_settled_by_the_key_range_matches_the_index() -> crate::Result<()> {
+    use crate::{AbstractTree, AnyTree, Config, SequenceNumberCounter, UserKey};
+    use core::ops::Bound::{Excluded, Included, Unbounded};
+
+    let folder = tempfile::tempdir()?;
+    let any = Config::new(
+        folder.path(),
+        SequenceNumberCounter::default(),
+        SequenceNumberCounter::default(),
+    )
+    .data_block_size_policy(crate::config::BlockSizePolicy::all(1_024))
+    .open()?;
+    let mut seqno = 0;
+    for prefix in ["b", "d", "f"] {
+        for i in 0..2_000u32 {
+            any.insert(format!("{prefix}{i:06}"), "value", seqno);
+            seqno += 1;
+        }
+        any.flush_active_memtable(0)?;
+    }
+    let AnyTree::Standard(tree) = &any else {
+        panic!("a standard tree");
+    };
+    let order = super::KeyOrder(crate::comparator::default_comparator());
+    let keys: Vec<UserKey> = [
+        "a", "b000000", "b000999", "b001999", "c", "d000000", "d001999", "e", "f001999", "g",
+    ]
+    .into_iter()
+    .map(UserKey::from)
+    .collect();
+    fn bounds(key: &UserKey) -> [core::ops::Bound<&[u8]>; 3] {
+        [Unbounded, Included(key.as_ref()), Excluded(key.as_ref())]
+    }
+    let version = tree.current_version();
+    let mut settled = 0;
+    for table in version.iter_tables() {
+        for low_key in &keys {
+            for high_key in &keys {
+                for low in bounds(low_key) {
+                    for high in bounds(high_key) {
+                        let Some(share) = order.settled_share(table, (low, high)) else {
+                            continue;
+                        };
+                        settled += 1;
+                        let indexed = crate::table::probe_stats::fraction_of(table, (low, high))?;
+                        assert_eq!(
+                            share.to_bits(),
+                            indexed.to_bits(),
+                            "{:?} over {low:?}..{high:?}",
+                            table.metadata.key_range
+                        );
+                    }
+                }
+            }
+        }
+    }
+    assert!(settled > 0, "some shares are settled by the key range");
+    Ok(())
+}
+
 /// Under a prefix extractor a full filter holds each distinct prefix's hash
 /// beside each key's, and the advisor counts the filter by those hashes, not
 /// by the keys: here two prefixes of every key make three hashes a key.
