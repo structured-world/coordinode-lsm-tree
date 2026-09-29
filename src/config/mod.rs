@@ -678,6 +678,14 @@ pub struct Config {
     #[cfg(feature = "std")]
     pub(crate) compaction_pool: Option<Arc<dyn crate::table::writer::CompactionSpawner>>,
 
+    /// Payload size (bytes) below which a block of a parallel-compressed table
+    /// is prepared on the writer thread instead of a worker: its transform
+    /// costs less than handing it to a worker and back. `None` (default)
+    /// derives it from the table's block codec. Set via
+    /// [`Config::parallel_compression_inline_below`].
+    #[cfg(feature = "std")]
+    pub(crate) parallel_compression_inline_below: Option<u32>,
+
     /// Minimum total input size (bytes) for a compaction to be split into
     /// parallel sub-compactions. Below it the compaction stays single-threaded
     /// (per-thread setup + extra output tables outweigh the parallelism on small
@@ -871,6 +879,8 @@ impl Default for Config {
                 .map_or(1, |n| (n.get() / 2).max(1)),
             #[cfg(feature = "std")]
             compaction_pool: None,
+            #[cfg(feature = "std")]
+            parallel_compression_inline_below: None,
             #[cfg(feature = "std")]
             subcompaction_min_bytes: crate::compaction::worker::SUBCOMPACTION_MIN_INPUT_BYTES,
             #[cfg(all(test, feature = "std"))]
@@ -2052,6 +2062,48 @@ impl Config {
         // 0-thread pool would be an invalid state.
         self.compaction_threads = threads.max(1);
         self
+    }
+
+    /// Sets the payload size (bytes) below which a block of a table compressed
+    /// in parallel is prepared on the writer thread instead of a worker. A
+    /// block that small costs less to compress than to hand to a worker and
+    /// back. `None` (default) derives the threshold from the table's block
+    /// codec: 1 KiB for lz4; 8 KiB with no codec, where only encryption or
+    /// page ECC brings a table to the workers and costs less per block than
+    /// lz4; and 0 for zstd, whose per-frame setup makes any block worth a
+    /// worker. `Some(0)` sends every block to the workers.
+    ///
+    /// # Examples
+    ///
+    /// ```
+    /// use lsm_tree::{Config, SequenceNumberCounter};
+    /// # let folder = tempfile::tempdir()?;
+    /// let config = Config::new(
+    ///     folder.path(),
+    ///     SequenceNumberCounter::default(),
+    ///     SequenceNumberCounter::default(),
+    /// )
+    /// .parallel_compression_inline_below(Some(1_024));
+    /// # Ok::<(), Box<dyn std::error::Error>>(())
+    /// ```
+    #[cfg(feature = "std")]
+    #[must_use]
+    pub fn parallel_compression_inline_below(mut self, bytes: Option<u32>) -> Self {
+        self.parallel_compression_inline_below = bytes;
+        self
+    }
+
+    /// The parallel block compression a table writer of this tree uses, or
+    /// `None` when no pool is configured.
+    #[cfg(feature = "std")]
+    pub(crate) fn parallel_compression(&self) -> Option<crate::table::writer::ParallelCompression> {
+        self.compaction_pool
+            .clone()
+            .map(|spawner| crate::table::writer::ParallelCompression {
+                spawner,
+                threads: self.compaction_threads,
+                inline_below: self.parallel_compression_inline_below,
+            })
     }
 
     /// Sets the minimum total input size (bytes) for a compaction to be split

@@ -931,10 +931,8 @@ impl AbstractTree for Tree {
                 || self.config.encryption.is_some()
                 || self.config.page_ecc;
             if transform_does_work {
-                table_writer = table_writer.use_parallel_compression(
-                    self.config.compaction_pool.clone(),
-                    self.config.compaction_threads,
-                );
+                table_writer =
+                    table_writer.use_parallel_compression(self.config.parallel_compression());
             }
         }
 

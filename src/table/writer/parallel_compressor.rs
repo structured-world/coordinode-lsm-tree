@@ -16,29 +16,28 @@
 //! no threads below `std`, so a `no_std` build simply never constructs a
 //! pipeline and the writer takes its flat serial path.
 //!
-//! ## Ordering and backpressure
+//! ## Ordering, backpressure and deadlock freedom
 //!
-//! Each submitted block gets a monotonically increasing sequence number.
-//! Workers store their finished [`PreparedBlock`] under that number in a shared
-//! reorder map; the writer drains strictly in sequence order via
-//! [`BlockCompressor::take_next`], so on-disk block order is identical to the
-//! serial path regardless of which worker finishes first. The writer caps the
-//! number of in-flight blocks (submitted but not yet drained) so a huge SST
-//! never buffers its entire compressed output: when the cap is reached it
-//! drains (and writes) one block before submitting the next.
+//! The blocks run on an [`OrderedPipeline`]: the writer takes them back
+//! strictly in submission order, so on-disk block order is identical to the
+//! serial path whichever worker finishes first, and it helps run queued blocks
+//! rather than wait on a pool that cannot reach them. The writer caps the
+//! blocks in flight (submitted but not yet written) so a huge SST never
+//! buffers its whole compressed output: at the cap it writes one block before
+//! submitting the next, and the pipeline's ring is sized to that cap.
 //!
-//! ## Deadlock freedom (help-first draining)
+//! ## Small blocks stay on the writer
 //!
-//! Jobs live in a shared queue; a spawned task is only a TOKEN that claims one
-//! queued job. When the writer needs a block that is not ready, it first claims
-//! and runs queued jobs on its own thread, and parks only once the queue is
-//! empty (every remaining job is then executing on a worker). A writer running
-//! ON one of the spawner's own threads — or against a fully saturated or
-//! one-worker pool — therefore degrades to the serial path instead of waiting
-//! on a token task that can never run.
+//! A block whose payload is below the inline threshold is prepared on the
+//! writer thread as it is submitted: its transform costs less than handing it
+//! to a worker and back.
+//!
+//! [`OrderedPipeline`]: super::ordered_pipeline::OrderedPipeline
 
 // `Box` for the (no_std-able) CompactionSpawner trait; under std it's in the
 // prelude. Everything below the trait is the std-only parallel pipeline.
+#[cfg(feature = "std")]
+use super::ordered_pipeline::{OrderedJob, OrderedPipeline};
 #[cfg(feature = "std")]
 use crate::{
     CompressionType, TableId,
@@ -47,10 +46,7 @@ use crate::{
 #[cfg(not(feature = "std"))]
 use alloc::boxed::Box;
 #[cfg(feature = "std")]
-use std::{
-    collections::{BTreeMap, VecDeque},
-    sync::{Arc, Condvar, Mutex, PoisonError},
-};
+use std::sync::Arc;
 
 #[cfg(all(feature = "std", zstd_any))]
 use crate::compression::ZstdDictionary;
@@ -113,26 +109,18 @@ impl CompactionSpawner for RayonSpawner {
     }
 }
 
-/// One submitted, not-yet-executed transform job. Lives in the shared queue so
-/// that ANY thread — a pool worker via its token task, or the writer itself
-/// inside [`BlockCompressor::take_next`] — can claim and run it.
+/// One block to prepare: its encoded payload and the per-KV checksum-footer
+/// bit the transform cannot derive.
 #[cfg(feature = "std")]
-struct PendingJob {
-    seq: u64,
+struct BlockJob {
     encoded: Vec<u8>,
     extra_flags: u8,
 }
 
-/// Shared pipeline state: the job queue, the reorder slot for finished blocks
-/// (keyed by submission sequence number), and the constant per-SST transform
-/// parameters every job needs.
+/// The transform settings of one table, read by whichever thread prepares a
+/// block of it.
 #[cfg(feature = "std")]
-struct Shared {
-    queue: Mutex<VecDeque<PendingJob>>,
-    ready: Mutex<BTreeMap<u64, crate::Result<PreparedBlock<'static>>>>,
-    woke: Condvar,
-
-    // Constant transform parameters, read by whichever thread runs a job.
+struct BlockSettings {
     table_id: TableId,
     compression: CompressionType,
     encryption: Option<Arc<dyn EncryptionProvider>>,
@@ -144,60 +132,99 @@ struct Shared {
 }
 
 #[cfg(feature = "std")]
-impl Shared {
-    /// Claims one queued job and runs it to completion, publishing the result
-    /// into the reorder slot. Returns `false` when the queue was empty (the
-    /// job this token was spawned for was already helped to completion by
-    /// another thread — a cheap no-op).
-    fn run_one(&self) -> bool {
-        let job = {
-            let mut queue = self.queue.lock().unwrap_or_else(PoisonError::into_inner);
-            queue.pop_front()
-        };
-        let Some(job) = job else {
-            return false;
-        };
-        let result = prepare_owned(
-            &job.encoded,
-            self.table_id,
+impl OrderedJob for BlockJob {
+    type Context = BlockSettings;
+    type Output = crate::Result<PreparedBlock<'static>>;
+
+    fn run(self, settings: &BlockSettings) -> Self::Output {
+        prepare_owned(
+            &self.encoded,
+            settings.table_id,
             TransformParams {
-                compression: self.compression,
-                encryption: self.encryption.as_deref(),
+                compression: settings.compression,
+                encryption: settings.encryption.as_deref(),
                 #[cfg(zstd_any)]
-                zstd_dict: self.zstd_dict.as_deref(),
+                zstd_dict: settings.zstd_dict.as_deref(),
                 #[cfg(zstd_any)]
-                two_pass_seed: self.two_pass_seed,
-                ecc: self.ecc,
+                two_pass_seed: settings.two_pass_seed,
+                ecc: settings.ecc,
             },
-            job.extra_flags,
-        );
-        let mut ready = self.ready.lock().unwrap_or_else(PoisonError::into_inner);
-        ready.insert(job.seq, result);
-        drop(ready);
-        self.woke.notify_all();
-        true
+            self.extra_flags,
+        )
     }
 }
 
-/// Ordered parallel block-preparation pipeline.
+/// How a writer runs its block preparation on worker threads.
+#[cfg(feature = "std")]
+#[derive(Clone)]
+pub struct ParallelCompression {
+    /// Where the workers run.
+    pub spawner: Arc<dyn CompactionSpawner>,
+    /// How many workers a writer keeps busy at once.
+    pub threads: usize,
+    /// Blocks whose payload is below this many bytes are prepared on the
+    /// writer thread; `None` derives it from the block codec.
+    pub inline_below: Option<u32>,
+}
+
+/// Ordered parallel block-preparation pipeline for one table.
 ///
-/// Holds the per-writer transform parameters (constant across the SST) and the
-/// shared reorder slot. The writer feeds encoded block buffers in via
-/// [`Self::submit`] and pulls finished blocks back out, in submission order,
-/// via [`Self::take_next`].
+/// The writer feeds encoded block buffers in via [`Self::submit`] and pulls
+/// finished blocks back out, in submission order, via [`Self::take_next`].
 #[cfg(feature = "std")]
 pub struct BlockCompressor {
-    spawner: Arc<dyn CompactionSpawner>,
-    shared: Arc<Shared>,
+    pipeline: OrderedPipeline<BlockJob>,
+    /// Payloads shorter than this many bytes are prepared on the writer
+    /// thread.
+    inline_below: u64,
+}
 
-    next_submit: u64,
-    next_drain: u64,
+/// Payload bytes below which an lz4 block is prepared on the writer thread when
+/// no threshold is configured. Measured on a flush of 12 000 blocks over four
+/// workers, with and without encryption or page ECC: below 1 KiB a worker costs
+/// twice the CPU and no less wall time; from 1 KiB up the workers win wall time.
+#[cfg(all(feature = "std", feature = "lz4"))]
+const LZ4_INLINE_BELOW: u64 = 1_024;
+
+/// Payload bytes below which a block with no codec is prepared on the writer
+/// thread when no threshold is configured. Such a table reaches the pipeline
+/// only for its encryption or page ECC, which cost too little per byte for a
+/// worker to pay off on a small block: measured as above, the workers are no
+/// faster up to 4 KiB for 1.5 to 2.7 times the CPU, and win wall time from
+/// 8 KiB up.
+#[cfg(feature = "std")]
+const TRANSFORM_ONLY_INLINE_BELOW: u64 = 8 * 1_024;
+
+/// The inline threshold of a table compressing with `compression`, when none
+/// is configured. It follows the cost of preparing a block, not the block
+/// size: zstd pays a per-frame setup that makes even a 256-byte block worth a
+/// worker, so every zstd block goes to one; encryption and page ECC cost less
+/// per block than lz4 and move the break-even no lower than the codec's.
+#[cfg(feature = "std")]
+pub fn default_inline_below(compression: CompressionType) -> u64 {
+    match compression {
+        CompressionType::None => TRANSFORM_ONLY_INLINE_BELOW,
+        #[cfg(feature = "lz4")]
+        CompressionType::Lz4 => LZ4_INLINE_BELOW,
+        #[cfg(zstd_any)]
+        CompressionType::Zstd(_) | CompressionType::ZstdDict { .. } => 0,
+    }
 }
 
 #[cfg(feature = "std")]
 impl BlockCompressor {
+    /// A pipeline on `spawner` with up to `threads` workers, for a writer that
+    /// keeps at most `in_flight` blocks outstanding, preparing payloads under
+    /// `inline_below` bytes on the writer thread.
+    #[expect(
+        clippy::too_many_arguments,
+        reason = "the table's transform settings, each feature-gated, plus the pipeline's shape"
+    )]
     pub fn new(
         spawner: Arc<dyn CompactionSpawner>,
+        threads: usize,
+        in_flight: usize,
+        inline_below: u64,
         table_id: TableId,
         compression: CompressionType,
         encryption: Option<Arc<dyn EncryptionProvider>>,
@@ -205,128 +232,60 @@ impl BlockCompressor {
         #[cfg(zstd_any)] two_pass_seed: bool,
         ecc: Option<crate::table::block::EccParams>,
     ) -> Self {
+        let settings = BlockSettings {
+            table_id,
+            compression,
+            encryption,
+            #[cfg(zstd_any)]
+            zstd_dict,
+            #[cfg(zstd_any)]
+            two_pass_seed,
+            ecc,
+        };
         Self {
-            spawner,
-            shared: Arc::new(Shared {
-                queue: Mutex::new(VecDeque::new()),
-                ready: Mutex::new(BTreeMap::new()),
-                woke: Condvar::new(),
-                table_id,
-                compression,
-                encryption,
-                #[cfg(zstd_any)]
-                zstd_dict,
-                #[cfg(zstd_any)]
-                two_pass_seed,
-                ecc,
-            }),
-            next_submit: 0,
-            next_drain: 0,
+            pipeline: OrderedPipeline::new(spawner, settings, threads, in_flight),
+            inline_below,
         }
     }
 
     /// Number of blocks submitted but not yet drained (in flight or buffered).
     pub fn pending(&self) -> usize {
-        // next_submit >= next_drain always holds (drain never outruns submit).
-        usize::try_from(self.next_submit - self.next_drain).unwrap_or(usize::MAX)
+        self.pipeline.pending()
     }
 
-    /// Submits an encoded block buffer for preparation on a worker thread.
+    /// Submits an encoded block buffer for preparation, on a worker thread or,
+    /// below the inline threshold, right here.
     ///
     /// `extra_flags` carries the per-KV checksum-footer bit (the one bit the
     /// transform can't derive), mirroring the serial
     /// [`Block::write_into_with_flags`] contract.
     pub fn submit(&mut self, encoded: Vec<u8>, extra_flags: u8) {
-        let seq = self.next_submit;
-        self.next_submit += 1;
-
-        // The job goes into the shared queue, not into the spawned closure:
-        // the spawned task is only a TOKEN that claims one queued job. Any
-        // thread can claim — including the writer itself in `take_next` — so
-        // a job is never stranded behind a saturated or re-entrant pool.
-        {
-            let mut queue = self
-                .shared
-                .queue
-                .lock()
-                .unwrap_or_else(PoisonError::into_inner);
-            queue.push_back(PendingJob {
-                seq,
-                encoded,
-                extra_flags,
-            });
+        let inline = (encoded.len() as u64) < self.inline_below;
+        let job = BlockJob {
+            encoded,
+            extra_flags,
+        };
+        if inline {
+            self.pipeline.submit_inline(job);
+        } else {
+            self.pipeline.submit(job);
         }
-
-        let shared = Arc::clone(&self.shared);
-        self.spawner.spawn(Box::new(move || {
-            let _ = shared.run_one();
-        }));
     }
 
-    /// Returns the next-in-sequence block, running queued transform jobs on
-    /// THIS thread while it is not ready ("help-first" draining).
-    ///
-    /// Helping is what makes the pipeline deadlock-free by construction: if
-    /// the spawner's workers are all busy — or the caller itself is running ON
-    /// one of the spawner's threads, so its token tasks are queued behind this
-    /// very call — the drain claims the pending jobs from the shared queue and
-    /// executes them inline instead of parking. A one-worker (or fully
-    /// saturated) pool degrades to the serial path, never to a deadlock. The
-    /// writer only parks once the queue is empty, which means every remaining
-    /// in-flight job is already EXECUTING on some worker and will publish.
+    /// Returns the next block in submission order, preparing queued blocks on
+    /// this thread while it is not ready: a saturated or one-worker pool, or a
+    /// writer running on one of the pool's own threads, degrades to the
+    /// serial path instead of a deadlock.
     ///
     /// Returns `None` only when nothing is in flight ([`Self::pending`] is 0).
     /// The inner `Result` carries any transform error raised on the worker.
     pub fn take_next(&mut self) -> Option<crate::Result<PreparedBlock<'static>>> {
-        if self.next_drain == self.next_submit {
-            return None;
-        }
-        let seq = self.next_drain;
-        loop {
-            {
-                let mut ready = self
-                    .shared
-                    .ready
-                    .lock()
-                    .unwrap_or_else(PoisonError::into_inner);
-                if let Some(result) = ready.remove(&seq) {
-                    self.next_drain += 1;
-                    return Some(result);
-                }
-            }
-
-            // Not ready: help. Jobs are queued FIFO and `seq` is the oldest
-            // undrained submission, so the first claimed job is `seq` itself
-            // unless a worker already claimed it.
-            if self.shared.run_one() {
-                continue;
-            }
-
-            // Queue empty: `seq` is executing on a worker right now (this
-            // writer thread is the only submitter, so no new job can appear
-            // while it sits here). Park until the worker publishes.
-            let mut ready = self
-                .shared
-                .ready
-                .lock()
-                .unwrap_or_else(PoisonError::into_inner);
-            loop {
-                if let Some(result) = ready.remove(&seq) {
-                    self.next_drain += 1;
-                    return Some(result);
-                }
-                ready = self
-                    .shared
-                    .woke
-                    .wait(ready)
-                    .unwrap_or_else(PoisonError::into_inner);
-            }
-        }
+        self.pipeline.take_next()
     }
 }
 
-/// The transform settings a block is written under, borrowed from [`Shared`]
-/// for the duration of one job. Grouped rather than passed one by one: they are
+/// The transform settings a block is written under, borrowed from
+/// [`BlockSettings`] for the duration of one job. Grouped rather than passed one by one: they are
 /// read together, they are constant for a whole table, and every one of them
 /// describes the same thing, how this block is encoded.
 #[cfg(feature = "std")]

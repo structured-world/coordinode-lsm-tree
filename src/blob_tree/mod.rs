@@ -1181,10 +1181,8 @@ impl AbstractTree for BlobTree {
                 || self.index.config.encryption.is_some()
                 || self.index.config.page_ecc;
             if transform_does_work {
-                table_writer = table_writer.use_parallel_compression(
-                    self.index.config.compaction_pool.clone(),
-                    self.index.config.compaction_threads,
-                );
+                table_writer =
+                    table_writer.use_parallel_compression(self.index.config.parallel_compression());
             }
         }
 

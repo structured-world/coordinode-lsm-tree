@@ -269,10 +269,7 @@ pub(super) fn prepare_table_writer(
         || opts.config.page_ecc;
     #[cfg(feature = "std")]
     let table_writer = if block_parallel && transform_does_work {
-        table_writer.use_parallel_compression(
-            opts.config.compaction_pool.clone(),
-            opts.config.compaction_threads,
-        )
+        table_writer.use_parallel_compression(opts.config.parallel_compression())
     } else {
         table_writer
     };

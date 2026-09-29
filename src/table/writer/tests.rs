@@ -964,6 +964,17 @@ fn the_held_state_counts_the_lineage_and_its_meta_encoding() -> crate::Result<()
     Ok(())
 }
 
+/// Parallel compression on a private four-worker pool, the inline threshold
+/// derived from the block size.
+#[cfg(feature = "parallel")]
+fn four_workers() -> crate::Result<super::ParallelCompression> {
+    Ok(super::ParallelCompression {
+        spawner: Arc::new(super::RayonSpawner::with_threads(4)?),
+        threads: 4,
+        inline_below: None,
+    })
+}
+
 /// Blocks in flight on the parallel pipeline are counted by the frames they
 /// will be written as, not by their payload: once drained, the bytes they
 /// take on disk stay within what the estimate counted for them.
@@ -971,10 +982,9 @@ fn the_held_state_counts_the_lineage_and_its_meta_encoding() -> crate::Result<()
 #[test]
 fn blocks_in_flight_are_counted_by_their_frames() -> crate::Result<()> {
     let dir = tempfile::tempdir()?;
-    let spawner = Arc::new(super::RayonSpawner::with_threads(4)?);
     let mut writer = Writer::new(dir.path().join("1"), 1, 0, Arc::new(StdFs))?
         .use_data_block_compression(crate::CompressionType::None)
-        .use_parallel_compression(spawner, 4);
+        .use_parallel_compression(four_workers()?);
     for block in 0..3u32 {
         for i in 0..10u32 {
             writer.write(InternalValue::from_components(
@@ -1006,10 +1016,9 @@ fn blocks_in_flight_are_counted_by_their_frames() -> crate::Result<()> {
 #[test]
 fn blocks_in_flight_count_toward_the_held_state() -> crate::Result<()> {
     let dir = tempfile::tempdir()?;
-    let spawner = Arc::new(super::RayonSpawner::with_threads(4)?);
     let mut writer = Writer::new(dir.path().join("1"), 1, 0, Arc::new(StdFs))?
         .use_data_block_compression(crate::CompressionType::None)
-        .use_parallel_compression(spawner, 4);
+        .use_parallel_compression(four_workers()?);
     for block in 0..3u32 {
         for i in 0..10u32 {
             writer.write(InternalValue::from_components(
@@ -1038,13 +1047,12 @@ fn blocks_in_flight_count_toward_the_held_state() -> crate::Result<()> {
 fn blocks_in_flight_count_their_compression_and_encryption_buffers() -> crate::Result<()> {
     let dir = tempfile::tempdir()?;
     let held = |name: &str, encrypted: bool| -> crate::Result<u64> {
-        let spawner = Arc::new(super::RayonSpawner::with_threads(4)?);
         let encryption: Option<Arc<dyn crate::encryption::EncryptionProvider>> =
             encrypted.then(|| Arc::new(crate::encryption::Aes256GcmProvider::new(&[7; 32])) as _);
         let mut writer = Writer::new(dir.path().join(name), 1, 0, Arc::new(StdFs))?
             .use_data_block_compression(crate::CompressionType::Lz4)
             .use_encryption(encryption)
-            .use_parallel_compression(spawner, 4);
+            .use_parallel_compression(four_workers()?);
         for block in 0..3u32 {
             for i in 0..10u32 {
                 writer.write(InternalValue::from_components(

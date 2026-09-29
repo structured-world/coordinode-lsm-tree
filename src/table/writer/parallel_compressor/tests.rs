@@ -1,8 +1,11 @@
 #![expect(clippy::expect_used, reason = "test code")]
 use super::*;
+use std::sync::{
+    Mutex,
+    atomic::{AtomicUsize, Ordering},
+};
 
 /// Deterministic spawner that runs each task synchronously on submit.
-/// Exercises the full reorder/box machinery without thread timing.
 struct InlineSpawner;
 impl CompactionSpawner for InlineSpawner {
     fn spawn(&self, task: Box<dyn FnOnce() + Send + 'static>) {
@@ -10,40 +13,35 @@ impl CompactionSpawner for InlineSpawner {
     }
 }
 
-fn encode_plain(payload: &[u8]) -> Vec<u8> {
-    payload.to_vec()
-}
-
-/// Defers tasks and runs them in REVERSE submission order on demand, so the
-/// reorder buffer receives out-of-order completions (the inline spawner only
-/// ever completes in order, leaving the reordering logic untested).
+/// Keeps spawned tasks until asked to run them, counting how many were
+/// spawned.
 #[derive(Default)]
-struct ReverseSpawner {
+struct DeferredSpawner {
     tasks: Mutex<Vec<Box<dyn FnOnce() + Send + 'static>>>,
+    spawned: AtomicUsize,
 }
-impl ReverseSpawner {
-    fn run_all_reverse(&self) {
-        let mut tasks =
-            std::mem::take(&mut *self.tasks.lock().unwrap_or_else(PoisonError::into_inner));
-        tasks.reverse();
+impl DeferredSpawner {
+    fn run_all(&self) {
+        let tasks = std::mem::take(&mut *self.tasks.lock().expect("lock"));
         for task in tasks {
             task();
         }
     }
 }
-impl CompactionSpawner for ReverseSpawner {
+impl CompactionSpawner for DeferredSpawner {
     fn spawn(&self, task: Box<dyn FnOnce() + Send + 'static>) {
-        self.tasks
-            .lock()
-            .unwrap_or_else(PoisonError::into_inner)
-            .push(task);
+        self.spawned.fetch_add(1, Ordering::SeqCst);
+        self.tasks.lock().expect("lock").push(task);
     }
 }
 
-#[test]
-fn take_next_returns_blocks_in_submission_order() {
-    let mut c = BlockCompressor::new(
-        Arc::new(InlineSpawner),
+/// A compressor of plain (uncompressed, unencrypted) blocks.
+fn plain(spawner: Arc<dyn CompactionSpawner>, inline_below: u64) -> BlockCompressor {
+    BlockCompressor::new(
+        spawner,
+        2,
+        4,
+        inline_below,
         7,
         CompressionType::None,
         None,
@@ -52,71 +50,78 @@ fn take_next_returns_blocks_in_submission_order() {
         #[cfg(zstd_any)]
         true,
         None,
-    );
-    assert_eq!(c.pending(), 0);
-    assert!(c.take_next().is_none());
-
-    c.submit(encode_plain(b"alpha"), 0);
-    c.submit(encode_plain(b"beta"), 0);
-    c.submit(encode_plain(b"gamma"), 0);
-    assert_eq!(c.pending(), 3);
-
-    let mut out = Vec::new();
-    while c.pending() > 0 {
-        let prepared = c
-            .take_next()
-            .expect("pending > 0 yields a block")
-            .expect("plain block prepares without error");
-        let mut buf = Vec::new();
-        prepared
-            .write_to(&mut buf, crate::table::block::ChecksumAt::Unbound)
-            .expect("write to vec");
-        out.push(buf);
-    }
-    assert_eq!(out.len(), 3);
-    assert!(c.take_next().is_none());
+    )
 }
 
-#[test]
-fn take_next_reorders_out_of_order_completions() {
-    let spawner = Arc::new(ReverseSpawner::default());
-    let mut c = BlockCompressor::new(
-        spawner.clone() as Arc<dyn CompactionSpawner>,
-        7,
-        CompressionType::None,
-        None,
-        #[cfg(zstd_any)]
-        None,
-        #[cfg(zstd_any)]
-        true,
-        None,
-    );
-
-    // Distinct uncompressed lengths (1, 2, 3) tag each block by submission
-    // order; with no compression `uncompressed_length` == input length.
-    c.submit(vec![0u8; 1], 0);
-    c.submit(vec![0u8; 2], 0);
-    c.submit(vec![0u8; 3], 0);
-    assert_eq!(c.pending(), 3);
-
-    // Complete the tasks in REVERSE order — the reorder buffer is filled
-    // last-seq-first before any drain.
-    spawner.run_all_reverse();
-
-    // Despite reverse completion, take_next must yield submission order.
-    for expected_len in [1u32, 2, 3] {
-        let prepared = c
-            .take_next()
-            .expect("pending > 0 yields a block")
-            .expect("plain block prepares without error");
+/// The uncompressed lengths of the blocks drained, in drain order: with no
+/// compression each is the length of the payload submitted.
+fn drained_lengths(c: &mut BlockCompressor) -> Vec<u32> {
+    let mut lengths = Vec::new();
+    while let Some(prepared) = c.take_next() {
+        let prepared = prepared.expect("plain block prepares without error");
         let mut buf = Vec::new();
         let header = prepared
             .write_to(&mut buf, crate::table::block::ChecksumAt::Unbound)
             .expect("write to vec");
+        lengths.push(header.uncompressed_length);
+    }
+    lengths
+}
+
+#[test]
+fn take_next_returns_blocks_in_submission_order() {
+    let mut c = plain(Arc::new(InlineSpawner), 0);
+    assert_eq!(c.pending(), 0);
+    assert!(c.take_next().is_none());
+
+    c.submit(vec![0u8; 1], 0);
+    c.submit(vec![0u8; 2], 0);
+    c.submit(vec![0u8; 3], 0);
+    assert_eq!(c.pending(), 3);
+    assert_eq!(drained_lengths(&mut c), [1, 2, 3]);
+    assert!(c.take_next().is_none());
+}
+
+#[test]
+fn blocks_below_the_inline_threshold_never_reach_a_worker() {
+    // Payloads under the threshold are prepared as they are submitted, on
+    // the writer thread; only the larger ones are handed to a worker, and
+    // every block still drains in submission order.
+    let spawner = Arc::new(DeferredSpawner::default());
+    let mut c = plain(spawner.clone(), 100);
+    c.submit(vec![0u8; 10], 0);
+    c.submit(vec![0u8; 99], 0);
+    assert_eq!(spawner.spawned.load(Ordering::SeqCst), 0, "both ran inline");
+    c.submit(vec![0u8; 100], 0);
+    assert_eq!(
+        spawner.spawned.load(Ordering::SeqCst),
+        1,
+        "a payload at the threshold goes to a worker",
+    );
+    spawner.run_all();
+    assert_eq!(drained_lengths(&mut c), [10, 99, 100]);
+}
+
+#[test]
+fn the_default_threshold_follows_the_codec_cost() {
+    // A table with no codec (there for its encryption or ECC) keeps blocks
+    // under 8 KiB on the writer thread and lz4 under 1 KiB; zstd sends every
+    // block to a worker, since its per-frame setup alone outweighs the handoff.
+    assert_eq!(
+        default_inline_below(CompressionType::None),
+        TRANSFORM_ONLY_INLINE_BELOW
+    );
+    #[cfg(feature = "lz4")]
+    assert_eq!(default_inline_below(CompressionType::Lz4), LZ4_INLINE_BELOW);
+    #[cfg(zstd_any)]
+    {
+        assert_eq!(default_inline_below(CompressionType::Zstd(1)), 0);
         assert_eq!(
-            header.uncompressed_length, expected_len,
-            "blocks must drain in submission order regardless of completion order",
+            default_inline_below(CompressionType::ZstdDict {
+                level: 3,
+                dict_id: 7
+            }),
+            0
         );
     }
-    assert!(c.take_next().is_none());
 }

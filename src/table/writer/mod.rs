@@ -6,11 +6,15 @@ mod filter;
 mod index;
 mod meta;
 #[cfg(feature = "std")] // no-std: parallel compaction unavailable (no threads)
+pub(crate) mod ordered_pipeline;
+#[cfg(feature = "std")] // no-std: parallel compaction unavailable (no threads)
 pub(crate) mod parallel_compressor;
 
 pub(crate) use index::DEFAULT_SPILL_THRESHOLD;
 #[cfg(feature = "std")]
 pub use parallel_compressor::CompactionSpawner;
+#[cfg(feature = "std")]
+pub(crate) use parallel_compressor::ParallelCompression;
 #[cfg(feature = "parallel")]
 pub use parallel_compressor::RayonSpawner;
 
@@ -480,15 +484,16 @@ pub struct Writer {
     #[cfg(zstd_any)]
     zstd_two_pass_seed: bool,
 
-    /// Optional executor for parallel block compression. `None` (default) =
-    /// serial path: each block is compressed and written inline. `Some` =
-    /// blocks are compressed on worker threads while writes stay ordered here.
-    /// Wired from the tree's compaction pool via [`Self::use_parallel_compression`].
+    /// Optional parallel block compression. `None` (default) = serial path:
+    /// each block is compressed and written inline. `Some` = blocks are
+    /// compressed on worker threads while writes stay ordered here. Wired from
+    /// the tree's compaction pool via [`Self::use_parallel_compression`].
     #[cfg(feature = "std")]
-    spawner: Option<Arc<dyn CompactionSpawner>>,
+    parallel_settings: Option<ParallelCompression>,
 
     /// Lazily built on the first spill once all transform params are finalized,
-    /// so builder-call order doesn't matter. Only `Some` when `spawner` is set.
+    /// so builder-call order doesn't matter. Only `Some` when
+    /// `parallel_settings` is set.
     #[cfg(feature = "std")]
     parallel: Option<BlockCompressor>,
 
@@ -720,7 +725,7 @@ impl Writer {
             zstd_two_pass_seed: true,
 
             #[cfg(feature = "std")]
-            spawner: None,
+            parallel_settings: None,
             #[cfg(feature = "std")]
             parallel: None,
             #[cfg(feature = "std")]
@@ -1234,20 +1239,16 @@ impl Writer {
             hashes + (REFRESH_HASH_STEP_KEYS * REFRESH_KEY_STEP).max(hashes / REFRESH_KEY_FRACTION);
     }
 
-    /// Enables parallel block compression on this writer using `spawner` to run
-    /// per-block transform work on worker threads. `threads` sizes the in-flight
-    /// cap (`2 * threads`), bounding buffered-output memory. The compressor is
-    /// built lazily on the first spill, so this may be called in any builder
-    /// order. Default (not called) keeps the serial path.
+    /// Enables parallel block compression on this writer: per-block transform
+    /// work runs on `parallel`'s workers, up to its thread count at once, and
+    /// the in-flight cap (`2 * threads`) bounds buffered-output memory. The
+    /// compressor is built lazily on the first spill, so this may be called in
+    /// any builder order. Default (not called) keeps the serial path.
     #[cfg(feature = "std")]
     #[must_use]
-    pub(crate) fn use_parallel_compression(
-        mut self,
-        spawner: Arc<dyn CompactionSpawner>,
-        threads: usize,
-    ) -> Self {
-        self.spawner = Some(spawner);
-        self.parallel_cap = (threads * 2).max(1);
+    pub(crate) fn use_parallel_compression(mut self, parallel: ParallelCompression) -> Self {
+        self.parallel_cap = (parallel.threads * 2).max(1);
+        self.parallel_settings = Some(parallel);
         self
     }
 
@@ -2132,7 +2133,7 @@ impl Writer {
         // block_buffer can't serve here — it would be in flight on a worker),
         // submit it, and let an ordered drain write it later.
         #[cfg(feature = "std")]
-        if self.spawner.is_some() {
+        if self.parallel_settings.is_some() {
             self.ensure_parallel();
             let mut encoded = Vec::new();
             let kv_flags = Self::encode_chunk_into(
@@ -3354,15 +3355,23 @@ impl Writer {
     }
 
     /// Builds the parallel compressor on first use, capturing the now-finalized
-    /// transform params. No-op once built. Only reachable when `spawner` is set.
+    /// transform params. No-op once built. Only reachable when
+    /// `parallel_settings` is set.
     #[cfg(feature = "std")]
     fn ensure_parallel(&mut self) {
         if self.parallel.is_some() {
             return;
         }
-        if let Some(spawner) = self.spawner.clone() {
+        if let Some(parallel) = self.parallel_settings.clone() {
+            let inline_below = parallel.inline_below.map_or_else(
+                || parallel_compressor::default_inline_below(self.data_block_compression),
+                u64::from,
+            );
             self.parallel = Some(BlockCompressor::new(
-                spawner,
+                parallel.spawner,
+                parallel.threads,
+                self.parallel_cap,
+                inline_below,
                 self.table_id,
                 self.data_block_compression,
                 self.encryption.clone(),
