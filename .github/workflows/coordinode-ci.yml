@@ -46,18 +46,15 @@ env:
 
 jobs:
   # Detect whether the change set touches code we want to validate.
-  # Used to gate the inner steps of `lint` and `test (stable,
-  # ubuntu-latest)` — both of which are REQUIRED checks in the
-  # branch ruleset — so their job names always surface to GitHub
-  # (satisfying the ruleset) while heavy work is skipped on
-  # docs-only / repo-meta-only PRs. Non-required downstream jobs
-  # (`no-std-check`, `cross-matrix`, `cross`,
+  # Used to gate the inner steps of `lint` and `test`, so their job
+  # names always surface to GitHub while heavy work is skipped on
+  # docs-only / repo-meta-only PRs. The other downstream jobs
+  # (`fuzz-heal`, `no-std-check`, `cross-matrix`, `cross`,
   # `codecov`) gate at the job level via `if:` and skip outright
-  # when no code changes — they aren't required so a "skipped"
-  # status is fine for them, but a required check that reports
-  # "skipped" is treated as "not yet satisfied" by the ruleset
-  # engine, hence the in-job conditional pattern below for the
-  # two required jobs.
+  # when no code changes. The branch ruleset requires `ci-passed`
+  # (at the end of this file), which accepts a skipped job; a
+  # required check that itself reports "skipped" would be treated
+  # as "not yet satisfied" by the ruleset engine.
   changes:
     runs-on: ubuntu-latest
     # Bumped from the original 2 min — generous timeout so a slow
@@ -95,11 +92,10 @@ jobs:
         # GitHub Actions invokes the default `bash` step with
         # `bash --noprofile --norc -eo pipefail {0}`, so a script
         # that just adds `set -u` STILL inherits `-e` + pipefail
-        # from the runner. This job is a hard dependency of the
-        # required `lint` + `test (stable, ubuntu-latest)` checks
-        # (they `needs: changes`); any non-zero exit cascades to
-        # "required check never reports" and blocks merges, which
-        # is exactly the failure mode we built the safe-default
+        # from the runner. Every other job `needs: changes`; a
+        # non-zero exit here fails the required `ci-passed` check
+        # and blocks merges on an infrastructure hiccup, which is
+        # exactly the failure mode we built the safe-default
         # output for. Keep `--noprofile --norc` so we still match
         # the runner's clean-env defaults (no inherited dotfiles
         # from a self-hosted runner with profile.d / bashrc) —
@@ -186,46 +182,31 @@ jobs:
 
   lint:
     needs: changes
-    # `always() && !cancelled()` so the required `lint` check
-    # still runs (and emits its name to the ruleset) even if
+    # `always() && !cancelled()` so `lint` still runs even if
     # `changes` itself fails / is skipped — `!cancelled()` alone
     # is NOT enough because GitHub's default needs-gating skips
     # this job when a dependency fails. `always()` overrides that
     # gating; the `!cancelled()` half lets a user-cancelled
     # workflow run still report cancellation honestly. Empty
     # `needs.changes.outputs.code` (changes job failed before
-    # emitting output) is caught below by the `!= 'false'` step
-    # guards, which default to running the real lint work (safe
-    # fallback).
-    if: ${{ always() && !cancelled() }}
+    # emitting output) passes the `!= 'false'` guard, so the real
+    # lint work runs (safe fallback).
+    if: ${{ always() && !cancelled() && needs.changes.outputs.code != 'false' }}
     timeout-minutes: 10
     runs-on: ubuntu-latest
     steps:
-      # Surfaces a notice in the run log + summary so docs-only PRs
-      # leave an obvious trail explaining why the check passed
-      # without doing real work. Only fires on the explicit
-      # `code=false` signal — empty/unset (changes job failed)
-      # falls through to the real lint work below.
-      - name: Path-conditional skip notice
-        if: needs.changes.outputs.code == 'false'
-        run: |
-          echo "::notice::No code paths changed — skipping format + clippy. Required-check name still emitted as success."
       # Pinning policy: first-party actions (actions/*, dependabot/*) track a
       # MAJOR tag; third-party actions stay pinned to a commit digest with a
       # version comment. See coordinode-release.yml for the reasoning.
       - uses: actions/checkout@v7
-        if: needs.changes.outputs.code != 'false'
         with:
           persist-credentials: false
       - uses: dtolnay/rust-toolchain@29eef336d9b2848a0b548edc03f92a220660cdb8  # stable
-        if: needs.changes.outputs.code != 'false'
         with:
           toolchain: stable
           components: rustfmt, clippy
       - uses: Swatinem/rust-cache@6323deb102c322ba6fcbdcafc7e3dddab59af2b6  # v2.9.2
-        if: needs.changes.outputs.code != 'false'
       - name: Format
-        if: needs.changes.outputs.code != 'false'
         # `--all` covers the workspace MEMBERS only. The tool and fuzz crates
         # are `workspace.exclude`d, so nothing checked their formatting and one
         # of them had drifted to the pre-2024 import order unnoticed.
@@ -241,7 +222,6 @@ jobs:
           find tools fuzz -name '*.rs' -not -path '*/target/*' -print0 \
             | xargs -0 rustfmt --check --
       - name: Manifest metadata limits
-        if: needs.changes.outputs.code != 'false'
         # crates.io rejects a description over 255 characters, and nothing
         # local catches it: `cargo package` and `cargo publish --dry-run`
         # both accept an oversized one, so the first refusal comes from the
@@ -256,12 +236,10 @@ jobs:
             exit 1
           fi
       - name: Clippy (strict)
-        if: needs.changes.outputs.code != 'false'
         # `--all-targets` lints tests + benches too, not just the lib; without
         # it, test-harness code under `--all-features` is never clippy-checked.
         run: cargo clippy --all-features --all-targets -- -D warnings
       - name: Clippy (default features)
-        if: needs.changes.outputs.code != 'false'
         # The feature set a consumer gets by simply depending on the crate.
         # `--all-features` does NOT cover it: code reachable only when a
         # feature is OFF is never compiled there, so this configuration rotted
@@ -269,7 +247,6 @@ jobs:
         # the one nobody builds is the one that breaks.
         run: cargo clippy --all-targets -- -D warnings
       - name: Clippy (db_bench)
-        if: needs.changes.outputs.code != 'false'
         # The workspace gates above cover MEMBERS only, and the tool crates
         # carry their own `[workspace]`, so nothing was linting this one. Its
         # formatting was already checked (the `find tools` pass above); its
@@ -278,7 +255,6 @@ jobs:
         working-directory: tools/db_bench
         run: cargo clippy --all-features --all-targets -- -D warnings
       - name: Clippy (db_bench, default features)
-        if: needs.changes.outputs.code != 'false'
         # The build the dashboard's rate workloads run from. The workload
         # behind `counters` is left out of it, so code that is dead without
         # that feature is only seen here.
@@ -287,28 +263,14 @@ jobs:
 
   test:
     needs: [changes, lint]
-    # `always() && !cancelled()` so the matrix entries still
-    # emit their names to the ruleset even if `changes` or
-    # `lint` fails / is skipped. `!cancelled()` alone is NOT
-    # enough because GitHub's default needs-gating skips this
-    # job when a dependency fails; `always()` overrides that
-    # gating, the `!cancelled()` half lets a user-cancelled
-    # workflow run still report cancellation honestly. Empty
-    # `needs.changes.outputs.code` is treated as "run real
-    # tests" via the `!= 'false'` step guards.
-    #
-    # Matrix-aware skip (run only the required entry on docs-
-    # only PRs) was attempted via a job-level
-    # `matrix.rust == 'stable' && matrix.os == 'ubuntu-latest'`
-    # branch in this `if:`, but the `matrix` context is NOT
-    # available at job-level expression evaluation — only at
-    # step-level and in job names. All 6 matrix entries run on
-    # docs-only PRs and emit the skip notice from their own
-    # step-level guards; if optimising runner-minute waste is
-    # later required, the right shape is a dynamic matrix via
-    # `fromJSON(needs.changes.outputs.matrix)` (with `changes`
-    # emitting two pre-baked JSON values), not job-level `if:`.
-    if: ${{ always() && !cancelled() }}
+    # Skipped on docs-only PRs and after a lint failure (running
+    # tests adds noise on an already-failed PR); `ci-passed`
+    # accepts the skip and reports the lint failure itself.
+    # `always() && !cancelled()` so an empty
+    # `needs.changes.outputs.code` (changes job failed) still
+    # runs the real tests rather than inheriting the default
+    # needs-gating skip.
+    if: ${{ always() && !cancelled() && needs.lint.result == 'success' && needs.changes.outputs.code != 'false' }}
     timeout-minutes: 20
     strategy:
       fail-fast: true
@@ -317,37 +279,13 @@ jobs:
         os: [ubuntu-latest, windows-latest, macos-latest]
     runs-on: ${{ matrix.os }}
     steps:
-      # Same path-conditional skip pattern as `lint`. ALL matrix
-      # entries emit their job name regardless of whether the inner
-      # steps ran, so `test (stable, ubuntu-latest)` — the entry
-      # listed in the branch ruleset as a required check — is
-      # always satisfied on docs-only PRs / lint-failed PRs
-      # without paying the full test cost.
-      #
-      # Three step-level cases for the inner work:
-      #   - code == 'false'                            → skip notice (docs-only PR)
-      #   - lint.result != 'success'                   → skip notice (lint broken; running tests adds noise on an already-failed PR)
-      #   - code != 'false' AND lint.result == 'success' → real work
-      # The job-level `if: always() && !cancelled()` keeps the
-      # required check name surfacing in all three cases.
-      - name: Path-conditional skip notice
-        if: needs.changes.outputs.code == 'false'
-        run: |
-          echo "::notice::No code paths changed — skipping nextest + doc tests + tools/. Required-check name still emitted as success."
-      - name: Lint-failed skip notice
-        if: needs.changes.outputs.code != 'false' && needs.lint.result != 'success'
-        run: |
-          echo "::notice::Lint failed (result=${{ needs.lint.result }}) — skipping test work to avoid duplicate noise on an already-failed PR. Required-check name still emitted; fix the lint failure to unblock real test runs."
       - uses: actions/checkout@v7
-        if: needs.changes.outputs.code != 'false' && needs.lint.result == 'success'
         with:
           persist-credentials: false
       - uses: dtolnay/rust-toolchain@29eef336d9b2848a0b548edc03f92a220660cdb8  # stable
-        if: needs.changes.outputs.code != 'false' && needs.lint.result == 'success'
         with:
           toolchain: ${{ matrix.rust }}
       - uses: Swatinem/rust-cache@6323deb102c322ba6fcbdcafc7e3dddab59af2b6  # v2.9.2
-        if: needs.changes.outputs.code != 'false' && needs.lint.result == 'success'
         with:
           prefix-key: ${{ runner.os }}-cargo
       # The installer downloads a prebuilt binary from GitHub Releases. That
@@ -359,13 +297,11 @@ jobs:
       # nothing is skipped, the tests still run or CI still goes red.
       - uses: taiki-e/install-action@1ef5c5f58e85d25baaaa1704478fdd6c2921f2b5  # nextest
         id: install-nextest
-        if: needs.changes.outputs.code != 'false' && needs.lint.result == 'success'
         continue-on-error: true
       - name: Install nextest from crates.io (fallback)
-        if: needs.changes.outputs.code != 'false' && needs.lint.result == 'success' && steps.install-nextest.outcome == 'failure'
+        if: steps.install-nextest.outcome == 'failure'
         run: cargo install cargo-nextest --locked
       - name: Run tests
-        if: needs.changes.outputs.code != 'false' && needs.lint.result == 'success'
         # tools/db_bench is a standalone crate, not in workspace — built separately
         env:
           # 32 cases is plenty for CI; PROPTEST_MAX_SHRINK trims the
@@ -376,10 +312,8 @@ jobs:
           PROPTEST_MAX_SHRINK: "100"
         run: cargo nextest run --profile ci --all-features
       - name: Run doc tests
-        if: needs.changes.outputs.code != 'false' && needs.lint.result == 'success'
         run: cargo test --doc --features lz4
       - name: Build + test db_bench crate
-        if: needs.changes.outputs.code != 'false' && needs.lint.result == 'success'
         # Standalone crate (not in workspace). Its tests build every
         # mixed-layout fixture, including the ones whose scenario has no read
         # path yet and which the benchmark therefore never builds — an
@@ -390,7 +324,6 @@ jobs:
         working-directory: tools/db_bench
         run: cargo nextest run --all-features
       - name: Build + test sst-dump crate
-        if: needs.changes.outputs.code != 'false' && needs.lint.result == 'success'
         # Standalone crate (not in workspace), exercise both the bin
         # build and the integration smoke tests so any drift in the
         # public verify::verify_sst_file API or the SST writer layout
@@ -622,3 +555,28 @@ jobs:
           files: lcov.info
         env:
           CODECOV_TOKEN: ${{ secrets.CODECOV_TOKEN }}
+
+  # The one required check of this workflow. Listing the jobs in the ruleset
+  # instead does not hold: `cross` names its entries from a dynamic matrix, and
+  # the job-level skips below `lint` would leave those checks "not satisfied"
+  # on docs-only PRs. This job waits for every other one, so auto-merge cannot
+  # fire while any of them is still running. A `skipped` result passes: jobs
+  # skip only on docs-only changes or after `lint` failed, and that failure is
+  # reported here on its own.
+  ci-passed:
+    needs: [changes, lint, test, fuzz-heal, no-std-check, cross-matrix, cross, codecov]
+    if: ${{ always() }}
+    timeout-minutes: 5
+    runs-on: ubuntu-latest
+    steps:
+      - name: Every job succeeded or was skipped
+        env:
+          RESULTS: ${{ toJSON(needs) }}
+        run: |
+          set -euo pipefail
+          echo "$RESULTS" | jq -r 'to_entries[] | "\(.key): \(.value.result)"'
+          BAD=$(echo "$RESULTS" | jq -r '[to_entries[] | select(.value.result == "failure" or .value.result == "cancelled") | .key] | join(", ")')
+          if [ -n "$BAD" ]; then
+            echo "::error::failed or cancelled: $BAD"
+            exit 1
+          fi
