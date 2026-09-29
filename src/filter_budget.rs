@@ -55,6 +55,9 @@ pub struct FilterBudget {
     held: AtomicI64,
     /// Filter bytes of the published version, whose changes `held` follows.
     published: AtomicU64,
+    /// Held while a plan checks the probe window and halves the counts, so
+    /// rewrites planning together halve one crossing of it once.
+    window: Mutex<()>,
 }
 
 impl FilterBudget {
@@ -83,6 +86,26 @@ impl FilterBudget {
     /// The filter bytes the budget holds.
     pub(crate) fn held(&self) -> u64 {
         u64::try_from(self.held.load(Relaxed)).unwrap_or(0)
+    }
+
+    /// Halves every count of the `live` tables once they hold more probes than
+    /// `window`, and returns the probes they held before. Without the lock two
+    /// plans could both read the total past the window and quarter the counts
+    /// where one after the other halves them once.
+    fn slide_window(&self, live: &[Live<'_>], window: u64) -> u64 {
+        let _window = self.window.lock();
+        // A tree cannot see 2^64 probes.
+        let observed: u64 = live
+            .iter()
+            .filter_map(|live| live.table.probe_stats())
+            .map(crate::table::probe_stats::ProbeStats::probes)
+            .sum();
+        if observed > window {
+            for stats in live.iter().filter_map(|live| live.table.probe_stats()) {
+                stats.decay();
+            }
+        }
+        observed
     }
 
     /// A rewrite found the live filters `used` bytes large.
@@ -149,6 +172,9 @@ pub struct FilterSizing {
     /// Negative probes per key of each of `inputs`, shrunk towards the mean
     /// by the noise in its count (see [`shrunk_densities`]).
     input_densities: Vec<f64>,
+    /// Keys each of `inputs` serves (see [`served_keys`]), which its shares of
+    /// a key range are shares of.
+    input_keys: Vec<u64>,
     /// Negative probes a key drew across the live tables, the load a flushed
     /// table is expected to take.
     prior_density: f64,
@@ -425,18 +451,10 @@ pub fn plan(
 
     // The window: halve every count once the live tables hold more probes
     // than it, before reading them for this plan.
-    // A tree cannot see 2^64 probes.
-    let observed: u64 = live
-        .iter()
-        .filter_map(|live| live.table.probe_stats())
-        .map(crate::table::probe_stats::ProbeStats::probes)
-        .sum();
-    if observed > advisor.window_probes() {
-        for stats in live.iter().filter_map(|live| live.table.probe_stats()) {
-            stats.decay();
-        }
-    }
+    let observed = state.slide_window(live, advisor.window_probes());
 
+    // Densities are over the keys a table serves; its filter, and so its
+    // bytes, over all it holds.
     let raw: Vec<(f64, usize)> = live
         .iter()
         .map(|live| {
@@ -444,7 +462,8 @@ pub fn plan(
                 .table
                 .probe_stats()
                 .map_or(0, crate::table::probe_stats::ProbeStats::negatives);
-            (as_f64(negatives), key_count(live.table))
+            let served = usize::try_from(served_keys(live.table)).unwrap_or(usize::MAX);
+            (as_f64(negatives), served)
         })
         .collect();
     let densities = shrunk_densities(&raw);
@@ -452,9 +471,9 @@ pub fn plan(
         .iter()
         .zip(&densities)
         .zip(live)
-        .map(|((&(_, n), &density), live)| Load {
-            negatives: density * as_f64(n as u64),
-            keys: n,
+        .map(|((&(_, served), &density), live)| Load {
+            negatives: density * as_f64(served as u64),
+            keys: key_count(live.table),
             fallback_bits: live.fallback_bits,
             partition_keys: live.partition_keys,
         })
@@ -476,6 +495,7 @@ pub fn plan(
                 .unwrap_or(prior_density)
         })
         .collect();
+    let input_keys: Vec<u64> = inputs.iter().map(served_keys).collect();
 
     let widths = advisor.bits_per_key().to_vec();
     let fallback_bits = bits_of(fallback);
@@ -503,7 +523,8 @@ pub fn plan(
     } else {
         inputs
             .iter()
-            .map(|input| {
+            .zip(&input_keys)
+            .map(|(input, &keys)| {
                 let share = span.as_ref().map_or(1.0, |span| {
                     crate::table::probe_stats::fraction_of(input, span.bounds()).unwrap_or(1.0)
                 });
@@ -512,7 +533,7 @@ pub fn plan(
                     clippy::cast_sign_loss,
                     reason = "a share of the input's own key count"
                 )]
-                let covered = libm::ceil(as_f64(filter_keys(input)) * share) as u64;
+                let covered = libm::ceil(as_f64(keys) * share) as u64;
                 covered
             })
             .sum()
@@ -547,6 +568,7 @@ pub fn plan(
         table_keys: AtomicU64::new(0),
         inputs,
         input_densities,
+        input_keys,
         prior_density,
         observed: observed > 0,
         split,
@@ -633,7 +655,12 @@ impl FilterSizing {
 
         let cursors = self.cursors();
         let mut remaining = Vec::with_capacity(self.inputs.len());
-        for (input, &density) in self.inputs.iter().zip(&self.input_densities) {
+        for ((input, &density), &keys) in self
+            .inputs
+            .iter()
+            .zip(&self.input_densities)
+            .zip(&self.input_keys)
+        {
             let mut share = 0.0;
             for (range, cursor) in cursors.iter().enumerate() {
                 let (low, high) = self.range(range);
@@ -642,7 +669,7 @@ impl FilterSizing {
                     .map_or(low, |bound| bound.as_ref().map(AsRef::as_ref));
                 share += self.share_of(input, (from, high))?;
             }
-            let keys = as_f64(filter_keys(input)) * share;
+            let keys = as_f64(keys) * share;
             if keys >= 1.0 {
                 #[expect(
                     clippy::cast_possible_truncation,
@@ -1005,8 +1032,13 @@ impl FilterSizing {
     /// widths on the error of that estimate.
     fn load(&self, bounds: (Bound<&[u8]>, Bound<&[u8]>), n: usize) -> crate::Result<f64> {
         let (mut keys, mut probes) = (0.0, 0.0);
-        for (input, density) in self.inputs.iter().zip(&self.input_densities) {
-            let covered = as_f64(filter_keys(input)) * self.share_of(input, bounds)?;
+        for ((input, density), &input_keys) in self
+            .inputs
+            .iter()
+            .zip(&self.input_densities)
+            .zip(&self.input_keys)
+        {
+            let covered = as_f64(input_keys) * self.share_of(input, bounds)?;
             keys += covered;
             probes += covered * density;
         }
@@ -1096,8 +1128,9 @@ fn price(loads: &[Load], widths: &[u8], budget: u64, frame: &dyn Fn(u64) -> u64)
     struct Entry {
         filter_load: f64,
         fallback_bits: u8,
-        /// Index into the full partitions' sizes when the width is decided
-        /// per partition; otherwise the table's one filter decides it.
+        /// Index into the full partitions' sizes for a table's full
+        /// partitions, whose width one of them decides; otherwise the entry
+        /// is one filter, a table's or its short last partition.
         partition: Option<usize>,
         table_bytes: Vec<u64>,
     }
@@ -1116,43 +1149,52 @@ fn price(loads: &[Load], widths: &[u8], budget: u64, frame: &dyn Fn(u64) -> u64)
     // A full partition's sizes depend on its key count alone, which the
     // tables of one level share: worked out once per count, not per table.
     let mut partitions: Vec<(usize, Vec<u64>)> = Vec::new();
-    let entries: Vec<Entry> = loads
-        .iter()
-        .map(|load| {
-            let n = load.keys;
-            let partition = match load.partition_keys {
-                Some(keys) if keys > 0 => keys,
-                _ => usize::MAX,
-            };
-            let (partition_index, table_bytes) = if n > partition {
-                let index = if let Some(index) =
-                    partitions.iter().position(|(keys, _)| *keys == partition)
-                {
-                    index
-                } else {
-                    partitions.push((partition, sizes(partition, widths)));
-                    partitions.len() - 1
-                };
-                let count = (n / partition) as u64;
-                let full = partitions.get(index).map_or(&[][..], |(_, full)| full);
-                let table = full
-                    .iter()
-                    .zip(sizes(n % partition, widths))
-                    .map(|(&full, rest)| count * full + rest)
-                    .collect();
-                (Some(index), table)
-            } else {
-                (None, sizes(n, widths))
-            };
-            let filter = partition.min(n).max(1);
-            Entry {
-                filter_load: load.negatives * as_f64(filter as u64) / as_f64(n.max(1) as u64),
+    let mut entries: Vec<Entry> = Vec::with_capacity(loads.len());
+    for load in loads {
+        let n = load.keys;
+        // The load a filter over `keys` of the table's keys draws.
+        let load_of = |keys: usize| load.negatives * as_f64(keys as u64) / as_f64(n.max(1) as u64);
+        let partition = match load.partition_keys {
+            Some(keys) if keys > 0 => keys,
+            _ => usize::MAX,
+        };
+        if n <= partition {
+            entries.push(Entry {
+                filter_load: load_of(n.max(1)),
                 fallback_bits: load.fallback_bits,
-                partition: partition_index,
-                table_bytes,
-            }
-        })
-        .collect();
+                partition: None,
+                table_bytes: sizes(n, widths),
+            });
+            continue;
+        }
+        let index = if let Some(index) = partitions.iter().position(|(keys, _)| *keys == partition)
+        {
+            index
+        } else {
+            partitions.push((partition, sizes(partition, widths)));
+            partitions.len() - 1
+        };
+        let count = (n / partition) as u64;
+        let full = partitions.get(index).map_or(&[][..], |(_, full)| full);
+        entries.push(Entry {
+            filter_load: load_of(partition),
+            fallback_bits: load.fallback_bits,
+            partition: Some(index),
+            table_bytes: full.iter().map(|&full| count * full).collect(),
+        });
+        // The short last partition: its writer prices it over its own keys,
+        // where a filter's bytes per key run higher, so it can take a
+        // narrower width than the full ones.
+        let rest = n % partition;
+        if rest > 0 {
+            entries.push(Entry {
+                filter_load: load_of(rest),
+                fallback_bits: load.fallback_bits,
+                partition: None,
+                table_bytes: sizes(rest, widths),
+            });
+        }
+    }
     // Filter sizes of real tables sum far below 2^64 bytes.
     let filled = |price: f64| -> u64 {
         entries
@@ -1471,6 +1513,33 @@ fn filter_keys(table: &Table) -> u64 {
         .filter_hashes
         .or(table.metadata.key_count)
         .unwrap_or(table.metadata.item_count)
+}
+
+/// The part of [`filter_keys`] a table's view serves: a view a tight-space
+/// slice restricted serves only its suffix and keeps only the suffix's probe
+/// counts, while its filter and metadata still hold the whole file's keys. The
+/// suffix's share is its share of the data section; one that cannot be read
+/// counts the table whole.
+fn served_keys(table: &Table) -> u64 {
+    let keys = filter_keys(table);
+    if table.restrict_lower_bound().is_none() {
+        return keys;
+    }
+    let Ok(Some(span)) = table.data_span(
+        (Bound::Unbounded, Bound::Unbounded),
+        crate::SeqNo::MAX,
+        crate::table::SpanEdge::ByLastKey,
+    ) else {
+        return keys;
+    };
+    // `live_start <= data_end`, and `data_end > 0` for a span that exists.
+    let live = span.data_end - span.live_start;
+    #[expect(
+        clippy::cast_possible_truncation,
+        reason = "live <= data_end, so the quotient never exceeds the u64 count"
+    )]
+    let served = (u128::from(keys) * u128::from(live) / u128::from(span.data_end)) as u64;
+    served
 }
 
 /// [`filter_keys`] as a count of hashes.

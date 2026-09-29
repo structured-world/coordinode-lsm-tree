@@ -199,6 +199,222 @@ fn the_price_counts_partitioned_filters_as_partitions() {
     );
 }
 
+/// A table's short last partition is sized on its own, as its writer sizes
+/// it: over few keys a filter's bytes per key run higher, so it takes a
+/// narrower width than the full partitions at one price. A budget holding the
+/// full partitions at their width and the tail at its own narrower one leaves
+/// the full partitions that width, rather than pricing the tail at theirs.
+#[test]
+fn a_short_last_partition_is_priced_on_its_own() {
+    let partition = partition_keys(BloomConstructionPolicy::BitsPerKey(10.0), 4_096);
+    let tail = 3;
+    let n = 2 * partition + tail;
+    let density = 1.0;
+    let full_load = density * as_f64(partition as u64);
+    let tail_load = density * as_f64(tail as u64);
+
+    // A price at which the full partitions take a wider width than the tail.
+    let (p, full_bits, tail_bits) = (-400..0)
+        .map(|step| libm::exp2(f64::from(step) / 8.0))
+        .find_map(|p| {
+            let full = cheapest(full_load, partition, &WIDTHS, 10, p);
+            let short = cheapest(tail_load, tail, &WIDTHS, 10, p);
+            (full > short).then_some((p, full, short))
+        })
+        .unwrap_or_else(|| panic!("the tail narrows before the full partitions"));
+    let budget = 2 * estimate(partition, full_bits) + estimate(tail, tail_bits);
+
+    let q = price(
+        &at(&[(density * as_f64(n as u64), n)], 10, Some(partition)),
+        &WIDTHS,
+        budget,
+        &bare,
+    );
+    let full = cheapest(full_load, partition, &WIDTHS, 10, q);
+    let short = cheapest(tail_load, tail, &WIDTHS, 10, q);
+    assert!(
+        full >= full_bits,
+        "full partitions {full} bits at {q}, {full_bits} fit at {p}"
+    );
+    assert!(
+        2 * estimate(partition, full) + estimate(tail, short) <= budget,
+        "{full} and {short} bits past the budget"
+    );
+}
+
+/// A restricted table serves only the suffix a tight-space slice left it and
+/// keeps only that suffix's probe counts, while its metadata still counts the
+/// whole file's keys. Its density is over the keys it serves, so a suffix
+/// probed like its neighbour prices like it; and a rewrite of it has only
+/// those keys still to write.
+#[test]
+fn a_restricted_table_is_priced_by_the_keys_it_serves() -> crate::Result<()> {
+    use crate::config::{BlockSizePolicy, FilterAdvisor};
+    use crate::{AbstractTree, AnyTree, Config, SeqNo, SequenceNumberCounter};
+
+    const KEYS: u32 = 20_000;
+    let folder = tempfile::tempdir()?;
+    let advisor = FilterAdvisor::new(u64::from(2 * KEYS) * 12 / 8);
+    let any = Config::new(
+        folder.path(),
+        SequenceNumberCounter::default(),
+        SequenceNumberCounter::default(),
+    )
+    .data_block_size_policy(BlockSizePolicy::all(1_024))
+    .filter_advisor(Some(advisor.clone()))
+    .open()?;
+    let mut seqno = 0;
+    for prefix in ["a", "b"] {
+        for i in 0..KEYS {
+            any.insert(format!("{prefix}{:06}", 2 * i), "value", seqno);
+            seqno += 1;
+        }
+        any.flush_active_memtable(0)?;
+    }
+    for prefix in ["a", "b"] {
+        for i in 0..KEYS {
+            assert!(
+                any.get(format!("{prefix}{:06}", 2 * i + 1), SeqNo::MAX)?
+                    .is_none()
+            );
+        }
+    }
+    let AnyTree::Standard(tree) = &any else {
+        panic!("a standard tree");
+    };
+    let version = tree.current_version();
+    let tables: Vec<&crate::Table> = version.iter_tables().collect();
+    let [a, b] = tables[..] else {
+        panic!("two tables");
+    };
+    let (a, b) = if a.metadata.key_range.min().starts_with(b"a") {
+        (a, b)
+    } else {
+        (b, a)
+    };
+    // The top tenth of `a` stays live.
+    let restricted = a.reopen_restricted(crate::UserKey::from(format!("a{:06}", 2 * 18_000)))?;
+    let live = [
+        super::Live {
+            table: &restricted,
+            fallback_bits: 10,
+            partition_keys: None,
+        },
+        super::Live {
+            table: b,
+            fallback_bits: 10,
+            partition_keys: None,
+        },
+    ];
+    let sizing = super::plan(
+        &advisor,
+        &tree.filter_budget,
+        &live,
+        super::Rewrite {
+            inputs: alloc::vec![restricted.clone(), b.clone()],
+            comparator: Some(crate::comparator::default_comparator()),
+            ..super::Rewrite::default()
+        },
+        BloomConstructionPolicy::BitsPerKey(10.0),
+        None,
+    )
+    .unwrap_or_else(|| panic!("the advisor plans the filters"));
+
+    let [suffix, whole] = sizing.input_densities[..] else {
+        panic!("one density per input");
+    };
+    assert!(
+        (suffix - whole).abs() <= whole * 0.2,
+        "suffix {suffix}, whole table {whole}"
+    );
+    let served = u64::from(KEYS) / 10 + u64::from(KEYS);
+    let pending = sizing
+        .pending_keys
+        .load(core::sync::atomic::Ordering::Relaxed);
+    assert!(
+        pending.abs_diff(served) <= served / 10,
+        "{pending} keys still to write, {served} served"
+    );
+    Ok(())
+}
+
+/// Rewrites planning together halve a window the live tables crossed once,
+/// as one after the other would: the second finds the counts already halved
+/// below the window.
+#[test]
+fn one_crossed_window_is_halved_once_by_concurrent_plans() -> crate::Result<()> {
+    use crate::config::FilterAdvisor;
+    use crate::{AbstractTree, AnyTree, Config, SequenceNumberCounter};
+    use core::sync::atomic::{AtomicBool, Ordering};
+
+    const TABLES: u64 = 32;
+    const EACH: u64 = 100;
+    let folder = tempfile::tempdir()?;
+    let advisor = FilterAdvisor::new(1 << 20).with_window_probes(TABLES * EACH - 1);
+    let any = Config::new(
+        folder.path(),
+        SequenceNumberCounter::default(),
+        SequenceNumberCounter::default(),
+    )
+    .filter_advisor(Some(advisor.clone()))
+    .open()?;
+    let mut seqno = 0;
+    for table in 0..TABLES {
+        for i in 0..10u64 {
+            any.insert(format!("{table:03}-{i:03}"), "value", seqno);
+            seqno += 1;
+        }
+        any.flush_active_memtable(0)?;
+    }
+    let AnyTree::Standard(tree) = &any else {
+        panic!("a standard tree");
+    };
+    let version = tree.current_version();
+    let live = super::live(&version, &tree.config);
+    assert_eq!(live.len() as u64, TABLES);
+    let stats: Vec<_> = live
+        .iter()
+        .map(|live| {
+            live.table
+                .probe_stats()
+                .unwrap_or_else(|| panic!("the advisor counts probes"))
+        })
+        .collect();
+
+    for round in 0..2_000 {
+        for stats in &stats {
+            let probes = stats.probes();
+            stats.add(crate::table::probe_stats::ProbeCounts {
+                probes: EACH - probes,
+                negatives: 0,
+            });
+        }
+        let go = AtomicBool::new(false);
+        std::thread::scope(|scope| {
+            for _ in 0..2 {
+                scope.spawn(|| {
+                    while !go.load(Ordering::Acquire) {
+                        core::hint::spin_loop();
+                    }
+                    super::plan(
+                        &advisor,
+                        &tree.filter_budget,
+                        &live,
+                        super::Rewrite::default(),
+                        BloomConstructionPolicy::BitsPerKey(10.0),
+                        None,
+                    )
+                });
+            }
+            go.store(true, Ordering::Release);
+        });
+        for stats in &stats {
+            assert_eq!(stats.probes(), EACH / 2, "round {round}");
+        }
+    }
+    Ok(())
+}
+
 /// Wherever a table's key range settles its share of a key range, the share
 /// is the one its block index gives: none outside, all inside, at every kind
 /// of bound, including bounds on the table's first and last key.

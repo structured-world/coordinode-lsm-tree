@@ -12,6 +12,8 @@
 //! - `skewed`: nine in ten lookups fall in one tenth of the key space;
 //! - `uniform`: lookups spread evenly. The advisor must tie here.
 //!
+//! `FA_PARTITIONED=1` partitions every filter.
+//!
 //! Each iteration reopens its tree outside the timer, so the lookups start
 //! with a cold cache. The false positives (lookups the filters let through
 //! to a data block read) and the filter bytes of each tree are printed once
@@ -72,8 +74,15 @@ fn static_bits() -> f32 {
         .unwrap_or(10.0)
 }
 
+/// Whether filters are partitioned, from `FA_PARTITIONED` (off unless `1`).
+fn partitioned() -> bool {
+    std::env::var("FA_PARTITIONED").is_ok_and(|value| value == "1")
+}
+
 fn open(path: &std::path::Path, advisor: Option<FilterAdvisor>) -> lsm_tree::Result<AnyTree> {
-    use lsm_tree::config::{BloomConstructionPolicy, FilterPolicy, FilterPolicyEntry};
+    use lsm_tree::config::{
+        BloomConstructionPolicy, FilterPolicy, FilterPolicyEntry, PinningPolicy,
+    };
 
     Config::new(
         path,
@@ -83,6 +92,7 @@ fn open(path: &std::path::Path, advisor: Option<FilterAdvisor>) -> lsm_tree::Res
     .filter_policy(FilterPolicy::all(FilterPolicyEntry::Bloom(
         BloomConstructionPolicy::BitsPerKey(static_bits()),
     )))
+    .filter_block_partitioning_policy(PinningPolicy::all(partitioned()))
     .filter_advisor(advisor)
     .open()
 }
