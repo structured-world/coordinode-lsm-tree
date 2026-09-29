@@ -558,13 +558,6 @@ pub fn plan(
     // them the way the writer will build them.
     let partition_keys = partition_bytes.map(|bytes| partition_keys(fallback, bytes));
     let price = price(&loads, &widths, budget, &|len| framing.frame(len));
-    // The replaced filters leave with the install; the room they free is this
-    // rewrite's to build into, and no other rewrite's.
-    #[expect(
-        clippy::cast_possible_wrap,
-        reason = "filter byte counts far below 2^63"
-    )]
-    state.held.fetch_sub(replaced as i64, Relaxed);
 
     let sizing = Arc::new(FilterSizing {
         price,
@@ -594,9 +587,20 @@ pub fn plan(
         cursors: Mutex::new(alloc::vec![RangeCursor::default(); ranges]),
         state: Arc::clone(state),
     });
-    // The room for every filter this rewrite writes, reserved before any of
-    // them, so a rewrite admitting a filter first leaves it.
-    sizing.reserve_for(pending_keys);
+    // The replaced filters leave with the install; the room they free is this
+    // rewrite's to build into, and no other rewrite's. It is exchanged, in one
+    // step no admission sees half of, for the room every filter this rewrite
+    // writes takes, reserved before any of them.
+    let floor = sizing.floor_for(pending_keys);
+    {
+        let _admission = state.admission.lock();
+        #[expect(
+            clippy::cast_possible_wrap,
+            reason = "filter byte counts far below 2^63"
+        )]
+        state.held.fetch_sub(replaced as i64, Relaxed);
+        sizing.set_reservation(0, floor);
+    }
     Some(sizing)
 }
 
@@ -882,13 +886,15 @@ impl FilterSizing {
         last: bool,
     ) -> bool {
         let n = u64::try_from(n).unwrap_or(u64::MAX);
+        // The keys still to come are claimed under the lock too: filters
+        // admitted side by side (a table's partitions) each see the others'
+        // keys gone once taken.
+        let admission = self.state.admission.lock();
         let per_filter = self.typical_keys.load(Relaxed).max(n);
         // The pending count bounds the rewrite's keys from above: a filter
         // over more keys than it holds leaves none pending.
         let later = self.pending_keys.load(Relaxed).saturating_sub(n);
         let floor = self.floor(later, per_filter, frame);
-
-        let admission = self.state.admission.lock();
         let used = self.state.held();
         let mine = self.reservation.load(Relaxed);
         // Every reservation changes under the admission lock, and this
@@ -906,6 +912,9 @@ impl FilterSizing {
         )]
         self.state.held.fetch_add(bytes as i64, Relaxed);
         self.set_reservation(mine, floor);
+        self.pending_keys.store(later, Relaxed);
+        self.admitted_keys.fetch_add(n, Relaxed);
+        self.typical_keys.fetch_max(n, Relaxed);
         drop(admission);
 
         self.leave(lower);
@@ -917,9 +926,6 @@ impl FilterSizing {
         if used + bytes > self.budget {
             self.state.log_entering(used + bytes, self.budget);
         }
-        self.take_pending(n);
-        self.admitted_keys.fetch_add(n, Relaxed);
-        self.typical_keys.fetch_max(n, Relaxed);
         let mut spent = self.spent_estimate.load(Relaxed);
         while let Err(actual) = self.spent_estimate.compare_exchange_weak(
             spent,
@@ -1005,17 +1011,15 @@ impl FilterSizing {
         (per_key + tables * tail_overhead + strays * spread).max(final_filter)
     }
 
-    /// Reserves in the tree's budget the room `pending` keys still to come
-    /// take at the narrowest width, in place of this rewrite's reservation.
-    fn reserve_for(&self, pending: u64) {
+    /// The room `pending` keys still to come take at the narrowest width,
+    /// framed as this rewrite frames its blocks.
+    fn floor_for(&self, pending: u64) -> u64 {
         let per_filter = match self.typical_keys.load(Relaxed) {
             // Before any filter, the keys as one filter's.
             0 => pending,
             keys => keys,
         };
-        let floor = self.floor(pending, per_filter, &|len| self.framing.frame(len));
-        let _admission = self.state.admission.lock();
-        self.set_reservation(self.reservation.load(Relaxed), floor);
+        self.floor(pending, per_filter, &|len| self.framing.frame(len))
     }
 
     /// Replaces this rewrite's reservation `mine` with `floor` in the tree's
@@ -1051,26 +1055,12 @@ impl FilterSizing {
     /// for a writer that learns the count only after the plan (an ingestion
     /// its caller tells): the ones no filter holds yet count as still to come.
     pub fn expect_keys(&self, keys: u64) {
+        let _admission = self.state.admission.lock();
         let admitted = self.admitted_keys.load(Relaxed);
         // Fewer keys than the filters already hold leaves none to come.
         let pending = keys.saturating_sub(admitted);
         self.pending_keys.store(pending, Relaxed);
-        self.reserve_for(pending);
-    }
-
-    /// Counts `n` keys as sized.
-    fn take_pending(&self, n: u64) {
-        let mut pending = self.pending_keys.load(Relaxed);
-        // The pending count bounds the keys from above: a filter over more
-        // keys than it holds leaves none pending, not a debt.
-        while let Err(actual) = self.pending_keys.compare_exchange_weak(
-            pending,
-            pending.saturating_sub(n),
-            Relaxed,
-            Relaxed,
-        ) {
-            pending = actual;
-        }
+        self.set_reservation(self.reservation.load(Relaxed), self.floor_for(pending));
     }
 
     /// The negative probes a filter over `n` keys in `bounds` is expected to

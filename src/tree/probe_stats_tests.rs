@@ -217,6 +217,67 @@ fn nothing_is_counted_without_an_advisor() -> crate::Result<()> {
     Ok(())
 }
 
+/// A level resolved in chunks counts a key its filter let through as a miss
+/// even when the table has no block to read it in: its key range reaches past
+/// its last block (a range tombstone ends there), and another table of the
+/// level supplies the blocks the chunks read.
+#[test]
+fn a_chunked_resolve_counts_a_passed_key_with_no_block() -> crate::Result<()> {
+    let folder = tempfile::tempdir()?;
+    let any = Config::new(
+        folder.path(),
+        SequenceNumberCounter::default(),
+        SequenceNumberCounter::default(),
+    )
+    .filter_policy(FilterPolicy::all(FilterPolicyEntry::Bloom(
+        BloomConstructionPolicy::BitsPerKey(1.0),
+    )))
+    .filter_advisor(Some(FilterAdvisor::new(u64::MAX)))
+    .open()?;
+    for i in 0..KEYS {
+        any.insert(format!("a{i:06}"), "value", u64::from(i));
+    }
+    any.remove_range("b", "c", u64::from(KEYS));
+    any.flush_active_memtable(0)?;
+    for i in (0..KEYS).step_by(2) {
+        any.insert(format!("b{i:06}"), "value", u64::from(KEYS + 1 + i));
+    }
+    any.flush_active_memtable(0)?;
+    let AnyTree::Standard(tree) = &any else {
+        panic!("a standard tree");
+    };
+    let version = tree.current_version();
+    let widened = version
+        .iter_tables()
+        .find(|table| table.metadata.key_range.min().starts_with(b"a"))
+        .cloned()
+        .unwrap_or_else(|| panic!("the table the range tombstone widens"));
+
+    let keys: Vec<String> = (1..KEYS).step_by(2).map(|i| format!("b{i:06}")).collect();
+    let mut remaining: Vec<(usize, u64)> = keys
+        .iter()
+        .enumerate()
+        .map(|(index, key)| (index, crate::hash::hash64(key.as_bytes())))
+        .collect();
+    let mut results: Vec<Option<crate::value::InternalValue>> = alloc::vec![None; keys.len()];
+    let Some(level) = version.level(0) else {
+        panic!("level 0 exists");
+    };
+    let comparator = crate::comparator::default_comparator();
+    let resolved = crate::Tree::resolve_level_chunked(
+        level,
+        &mut remaining,
+        &keys,
+        SeqNo::MAX,
+        comparator.as_ref(),
+        &mut results,
+    )?;
+    assert!(resolved, "the other table has blocks to read");
+    let count = keys.len() as u64;
+    assert_eq!(counts(&widened), (count, count), "(probes, negatives)");
+    Ok(())
+}
+
 /// A pinned read and a table's batch read count their probes as a plain read
 /// does: each absent key is one probe and one negative, whether the one-bit
 /// filter ruled it out or let it through to a read that found nothing, and so
@@ -276,7 +337,8 @@ fn a_chunked_resolve_counts_false_positives_once() -> crate::Result<()> {
     let AnyTree::Standard(tree) = &any else {
         panic!("a standard tree");
     };
-    let keys: Vec<String> = (0..KEYS).map(key).collect();
+    // Up to the table's last key, which ends its last block.
+    let keys: Vec<String> = (0..=KEYS).map(key).collect();
     let mut remaining: Vec<(usize, u64)> = keys
         .iter()
         .enumerate()
@@ -299,7 +361,7 @@ fn a_chunked_resolve_counts_false_positives_once() -> crate::Result<()> {
     assert!(resolved, "the level has blocks to read");
     let present = results.iter().filter(|result| result.is_some()).count();
     let absent = keys.len() - present;
-    assert_eq!(present, keys.len() / 2, "every even key is found");
+    assert_eq!(present, keys.len() / 2 + 1, "every even key is found");
     assert_eq!(
         counts(&only_table(&any)),
         (keys.len() as u64, absent as u64),

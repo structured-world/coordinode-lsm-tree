@@ -503,8 +503,8 @@ pub trait AbstractTree: sealed::Sealed {
 
         let flushed_size = latest.sealed_memtables.iter().map(|mt| mt.size()).sum();
         // The hashes the flush's filters hold, which the filter plan keeps room
-        // for: counted only when a filter budget plans them. A key in several
-        // memtables counts in each, a bound from above.
+        // for: counted only when a filter budget plans them, over the merge
+        // the flush writes, so a key in several memtables counts once.
         let flushed_hashes: u64 = if self.tree_config().filter_advisor.is_some() {
             // A partitioned filter holds no prefix hashes.
             let prefixes = if self.tree_config().filter_block_partitioning_policy.get(0) {
@@ -512,11 +512,19 @@ pub trait AbstractTree: sealed::Sealed {
             } else {
                 self.tree_config().prefix_extractor.as_deref()
             };
-            latest
-                .sealed_memtables
-                .iter()
-                .map(|mt| mt.filter_hashes(prefixes))
-                .sum()
+            let merged = Merger::new(
+                latest
+                    .sealed_memtables
+                    .iter()
+                    .map(|mt| mt.iter().map(Ok))
+                    .collect::<Vec<_>>(),
+                self.tree_config().comparator.clone(),
+            );
+            // Memtable entries read without I/O: the merge yields no error.
+            crate::memtable::filter_hashes(
+                merged.filter_map(|item| item.ok().map(|item| item.key.user_key)),
+                prefixes,
+            )
         } else {
             0
         };

@@ -29,6 +29,46 @@ use spin::RwLock;
 
 pub use crate::tree::inner::MemtableId;
 
+/// The hashes a table filter built over `keys`, in the table's key order,
+/// holds: one per distinct key and, with `prefixes`, one per prefix at a
+/// position where the key before had another, as a full filter registers
+/// them. Versions of a key add none.
+pub fn filter_hashes(
+    keys: impl Iterator<Item = crate::UserKey>,
+    prefixes: Option<&dyn crate::PrefixExtractor>,
+) -> u64 {
+    let mut hashes = 0u64;
+    let mut previous: Option<crate::UserKey> = None;
+    let mut previous_prefixes: Vec<u64> = Vec::new();
+    for key in keys {
+        if previous
+            .as_ref()
+            .is_some_and(|previous| crate::comparator::same_user_key(previous, &key))
+        {
+            continue;
+        }
+        hashes += 1;
+        if let Some(extractor) = prefixes {
+            for (position, prefix) in extractor.prefixes(&key).enumerate() {
+                let hash = crate::hash::hash64(prefix);
+                match previous_prefixes.get_mut(position) {
+                    Some(previous) if *previous == hash => {}
+                    Some(previous) => {
+                        *previous = hash;
+                        hashes += 1;
+                    }
+                    None => {
+                        previous_prefixes.push(hash);
+                        hashes += 1;
+                    }
+                }
+            }
+        }
+        previous = Some(key);
+    }
+    hashes
+}
+
 /// The memtable serves as an intermediary, ephemeral, sorted storage for new items
 ///
 /// When the Memtable exceeds some size, it should be flushed to a table.
@@ -186,44 +226,6 @@ impl Memtable {
     pub fn size(&self) -> u64 {
         self.approximate_size
             .load(core::sync::atomic::Ordering::Acquire)
-    }
-
-    /// The hashes a table filter built over this memtable's keys holds: one
-    /// per distinct key and, with `prefixes`, one per prefix at a position
-    /// where the key before had another, as a full filter registers them.
-    /// Versions of a key add none.
-    pub(crate) fn filter_hashes(&self, prefixes: Option<&dyn crate::PrefixExtractor>) -> u64 {
-        let mut hashes = 0u64;
-        let mut previous: Option<crate::UserKey> = None;
-        let mut previous_prefixes: Vec<u64> = Vec::new();
-        for entry in self.items.iter() {
-            let key = entry.key().user_key;
-            if previous
-                .as_ref()
-                .is_some_and(|previous| crate::comparator::same_user_key(previous, &key))
-            {
-                continue;
-            }
-            hashes += 1;
-            if let Some(extractor) = prefixes {
-                for (position, prefix) in extractor.prefixes(&key).enumerate() {
-                    let hash = crate::hash::hash64(prefix);
-                    match previous_prefixes.get_mut(position) {
-                        Some(previous) if *previous == hash => {}
-                        Some(previous) => {
-                            *previous = hash;
-                            hashes += 1;
-                        }
-                        None => {
-                            previous_prefixes.push(hash);
-                            hashes += 1;
-                        }
-                    }
-                }
-            }
-            previous = Some(key);
-        }
-        hashes
     }
 
     /// Counts the number of items in the memtable.

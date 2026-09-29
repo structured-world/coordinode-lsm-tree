@@ -7441,9 +7441,27 @@ impl Table {
             .block_index
             .forward_reader(sorted_keys[passing[0]].0, table_seqno)
         else {
+            // Every passed key lies past the last block: none is held.
+            if let Some(tally) = tally {
+                self.tally_blockless(tally, table_seqno, passing.len());
+            }
             return Ok(None);
         };
         Ok(Some((passing, block_iter, table_seqno)))
+    }
+
+    /// Counts in `tally` the `keys` the filter let through that no block of
+    /// the table can hold, read at `table_seqno`: each a false positive, as
+    /// [`Self::count_false_positive`] counts one.
+    fn tally_blockless(
+        &self,
+        tally: &mut crate::table::probe_stats::ProbeCounts,
+        table_seqno: SeqNo,
+        keys: usize,
+    ) {
+        if self.has_filter() && table_seqno > self.metadata.seqnos.1 {
+            tally.negatives += keys as u64;
+        }
     }
 
     /// Plans the COLD (uncached) data blocks [`Table::batch_get`] will read for
@@ -7658,6 +7676,15 @@ impl Table {
             }
             blocks.push((handle, block_keys));
         }
+        // The passed keys past the last block. A key equal to that block's
+        // end key is listed in it and left for a next block there is not.
+        let listed = blocks.last().map(|(_, keys)| keys.as_slice());
+        let blockless = passing
+            .iter()
+            .skip(p)
+            .filter(|pos| !listed.is_some_and(|keys| keys.contains(pos)))
+            .count();
+        self.tally_blockless(tally, table_seqno, blockless);
         if blocks.is_empty() {
             return Ok(None);
         }

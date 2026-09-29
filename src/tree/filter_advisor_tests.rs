@@ -702,6 +702,37 @@ fn a_flush_reserves_by_filter_hashes_not_versions() -> crate::Result<()> {
     Ok(())
 }
 
+/// Keys rewritten across several sealed memtables make one filter hash each
+/// in the flush that merges them: a flush of three memtables over the same
+/// keys keeps no room for later tables and takes the width the budget fits.
+#[test]
+fn a_flush_counts_a_key_in_several_memtables_once() -> crate::Result<()> {
+    const KEYS: usize = 4_000;
+    let folder = tempfile::tempdir()?;
+    let wide = BloomConstructionPolicy::BitsPerKey(10.0).filter_size_bound(KEYS) as u64;
+    let tree = open(
+        folder.path(),
+        Some(FilterAdvisor::new(wide * 11 / 10).with_bits_per_key([6u8, 10].to_vec())),
+    )?;
+    let mut seqno = 0;
+    for _ in 0..3 {
+        for i in 0..KEYS {
+            tree.insert(format!("key{i:06}"), "value", seqno);
+            seqno += 1;
+        }
+        assert!(tree.rotate_memtable().is_some());
+    }
+    tree.flush_active_memtable(0)?;
+
+    let tables = tables(&tree);
+    let [table] = tables.as_slice() else {
+        panic!("one table");
+    };
+    let bits = u64::from(table.filter_size()) * 8 / KEYS as u64;
+    assert!(bits >= 9, "{bits} bits a key: the static 10 fit the budget");
+    Ok(())
+}
+
 /// An ingestion told how many entries it writes keeps room for its later
 /// tables' filters as a flush does: across several tables, every filter fits
 /// the budget that fits them all at the narrowest width.
@@ -1186,6 +1217,8 @@ fn a_prefix_spanning_several_tables_counts_no_negative() -> crate::Result<()> {
         SequenceNumberCounter::default(),
     )
     .data_block_size_policy(BlockSizePolicy::all(512))
+    // Full filters hold the prefixes; partitioned ones answer no prefix.
+    .filter_block_partitioning_policy(crate::config::PinningPolicy::all(false))
     .prefix_extractor(Arc::new(UpToColon))
     .filter_advisor(Some(FilterAdvisor::new(u64::MAX)))
     .open()?;
@@ -1196,22 +1229,126 @@ fn a_prefix_spanning_several_tables_counts_no_negative() -> crate::Result<()> {
     tree.major_compact(4_096, 0)?;
     let tables = tables(&tree);
     assert!(tables.len() > 2, "{} tables", tables.len());
-    let negatives = |tables: &[Table]| -> u64 {
+    let counts = |tables: &[Table]| -> (u64, u64) {
         tables
             .iter()
-            .map(|table| {
-                table
-                    .probe_stats()
-                    .map_or(0, crate::table::probe_stats::ProbeStats::negatives)
+            .filter_map(Table::probe_stats)
+            .fold((0, 0), |(probes, negatives), stats| {
+                (probes + stats.probes(), negatives + stats.negatives())
             })
-            .sum()
     };
-    let before = negatives(&tables);
+    let before = counts(&tables);
     assert_eq!(
         tree.prefix("x:", SeqNo::MAX, None).count(),
         PREFIXED as usize
     );
-    assert_eq!(negatives(&tables), before);
+    let after = counts(&tables);
+    // Each table's filter answered, and each holds keys under the prefix.
+    assert_eq!(after.0 - before.0, tables.len() as u64, "probes");
+    assert_eq!(after.1, before.1, "negatives");
+    Ok(())
+}
+
+/// A table of a level whose key range reaches into a prefix only by a range
+/// tombstone's end holds no key under it; when its filter lets the prefix
+/// through and a scan reads it among other tables of its level, the scan
+/// finding nothing in it counts the false positive.
+#[test]
+fn a_prefix_reaching_a_table_by_a_range_tombstone_counts_its_miss() -> crate::Result<()> {
+    use alloc::sync::Arc;
+
+    /// `UpToColon`, and for a key under `w` the token `x:`, so that table's
+    /// filter lets the prefix `x:` through without holding a key under it.
+    struct WithDecoy;
+    impl crate::PrefixExtractor for WithDecoy {
+        fn prefixes<'a>(&self, key: &'a [u8]) -> Box<dyn Iterator<Item = &'a [u8]> + 'a> {
+            if key.starts_with(b"w") {
+                return Box::new(core::iter::once(&b"x:"[..]));
+            }
+            UpToColon.prefixes(key)
+        }
+    }
+
+    let folder = tempfile::tempdir()?;
+    let tree = Config::new(
+        folder.path(),
+        SequenceNumberCounter::default(),
+        SequenceNumberCounter::default(),
+    )
+    .data_block_size_policy(BlockSizePolicy::all(512))
+    // Uncompressed, so the tables the compaction cuts are the same whatever
+    // codecs are built in.
+    .data_block_compression_policy(crate::config::CompressionPolicy::disabled())
+    // Full filters hold the prefixes; partitioned ones answer no prefix.
+    .filter_block_partitioning_policy(crate::config::PinningPolicy::all(false))
+    .prefix_extractor(Arc::new(WithDecoy))
+    .filter_advisor(Some(FilterAdvisor::new(u64::MAX)))
+    .open()?;
+    let mut seqno = 0;
+    for i in 0..2_000u32 {
+        tree.insert(format!("w{i:06}"), "value", seqno);
+        seqno += 1;
+    }
+    // An older key the tombstone below deletes, so it has something to
+    // cover; its large incompressible value ends its table right after it,
+    // so the compaction's next table starts at the first key under x:.
+    let mut state: u64 = 0x9E37_79B9_7F4A_7C15;
+    let value: Vec<u8> = (0..8_192)
+        .map(|_| {
+            // xorshift: incompressible bytes.
+            state ^= state << 13;
+            state ^= state >> 7;
+            state ^= state << 17;
+            state.to_le_bytes()[0]
+        })
+        .collect();
+    tree.insert("w999999z", value, seqno);
+    seqno += 1;
+    tree.flush_active_memtable(0)?;
+    // Past the last w key and short of the first live x key: the compaction
+    // widens the w table's range into x: to cover it.
+    tree.remove_range("w999999", "x:000300", seqno);
+    seqno += 1;
+    tree.flush_active_memtable(0)?;
+    for i in 500..2_500u32 {
+        tree.insert(format!("x:{i:06}"), "value", seqno);
+        seqno += 1;
+    }
+    tree.flush_active_memtable(0)?;
+    tree.major_compact(4_096, 0)?;
+
+    let tables = tables(&tree);
+    let shape: Vec<(String, String)> = tables
+        .iter()
+        .map(|table| {
+            let range = &table.metadata.key_range;
+            (
+                String::from_utf8_lossy(range.min()).into_owned(),
+                String::from_utf8_lossy(range.max()).into_owned(),
+            )
+        })
+        .collect();
+    let decoy = tables
+        .iter()
+        .find(|table| {
+            let range = &table.metadata.key_range;
+            range.min().starts_with(b"w") && range.max().starts_with(b"x:")
+        })
+        .unwrap_or_else(|| panic!("a table reaching into x: by the tombstone: {shape:?}"));
+    let counts = |table: &Table| {
+        table
+            .probe_stats()
+            .map_or((0, 0), |stats| (stats.probes(), stats.negatives()))
+    };
+    let before = counts(decoy);
+    // The keys under x: are newer than the tombstone: all are read.
+    assert_eq!(tree.prefix("x:", SeqNo::MAX, None).count(), 2_000);
+    let after = counts(decoy);
+    assert_eq!(
+        (after.0 - before.0, after.1 - before.1),
+        (1, 1),
+        "(probes, negatives) of the scan in {shape:?}"
+    );
     Ok(())
 }
 

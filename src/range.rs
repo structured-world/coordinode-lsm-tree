@@ -815,22 +815,35 @@ impl TreeIter {
                                     }
                                 }
                                 _ => {
-                                    // Tables of a run are disjoint, so a read
-                                    // range reaching two or more of them holds
-                                    // keys of each (their bounds are keys, save
-                                    // a range tombstone's end): their filters'
-                                    // passes are no false positives to count.
-                                    let surviving =
-                                        surviving.into_iter().map(|(table, _)| table).collect();
-                                    // surviving.len() >= 2, so Run::new cannot
-                                    // return None (only empty vecs yield None).
-                                    #[expect(
-                                        clippy::expect_used,
-                                        reason = "Run::new returns None only for empty vecs"
-                                    )]
-                                    let new_run =
-                                        Run::new(surviving).expect("non-empty surviving tables");
-                                    multi_runs.push(Arc::new(new_run));
+                                    // Tables of a run are disjoint and in key
+                                    // order, and a table's first key is a data
+                                    // key; only its last may be a range
+                                    // tombstone's end a compaction widened it
+                                    // to. So a read range reaching two or more
+                                    // holds keys of every one but perhaps the
+                                    // first, which is read on its own to count
+                                    // a pass that finds nothing; the others'
+                                    // passes are no false positives.
+                                    let first = surviving.remove(0);
+                                    single_tables.push(first);
+                                    if let [_] = surviving[..] {
+                                        if let Some(entry) = surviving.pop() {
+                                            single_tables.push(entry);
+                                        }
+                                    } else {
+                                        let rest =
+                                            surviving.into_iter().map(|(table, _)| table).collect();
+                                        // Two or more tables are left, so
+                                        // Run::new cannot return None (only
+                                        // empty vecs yield None).
+                                        #[expect(
+                                            clippy::expect_used,
+                                            reason = "Run::new returns None only for empty vecs"
+                                        )]
+                                        let new_run =
+                                            Run::new(rest).expect("non-empty surviving tables");
+                                        multi_runs.push(Arc::new(new_run));
+                                    }
                                 }
                             }
                         } else {
