@@ -89,6 +89,132 @@ impl IoUringFs {
             inner: Arc::new(inner),
         })
     }
+
+    /// [`Fs::read_blocks_batched`], and with `on_read`
+    /// [`Fs::read_blocks_batched_each`].
+    fn read_blocks(
+        &self,
+        reqs: &mut [BlockRead<'_>],
+        mut on_read: Option<OnRead<'_>>,
+    ) -> crate::io::Result<()> {
+        // Every request that has an fd goes to the one shared ring in a single
+        // batched submission (the kernel fans each read out to its file's
+        // device). A request without one (a non-io_uring file mixed into the
+        // batch) cannot be submitted, so it is read serially — but only it:
+        // degrading the whole batch would forfeit the ring for the requests
+        // that were perfectly submittable.
+        if reqs.iter().all(|r| r.file.backing_fd().is_some()) {
+            // The common case: nothing to split, and no borrow-gathering pass.
+            // Every request is in the one group, so its position IS its index
+            // and nothing has to be mapped back.
+            return self
+                .inner
+                .submit_reads_multi(reqs, on_read)
+                .map_err(|(_, e)| crate::io::Error::from(e));
+        }
+
+        // Indices travel with the requests: the contract is "the FIRST failing
+        // block's error", and first means first in the caller's order, not
+        // first in whichever group happened to run earlier. Splitting the batch
+        // must not reorder which failure wins.
+        let (mut submittable, mut serial): (IndexedReads<'_, '_>, IndexedReads<'_, '_>) = reqs
+            .iter_mut()
+            .enumerate()
+            .partition(|(_, r)| r.file.backing_fd().is_some());
+        log::debug!(
+            "io_uring batched read: {} of {} requests lack a descriptor and are read serially",
+            serial.len(),
+            submittable.len() + serial.len(),
+        );
+
+        // The ring group runs first and is waited out inside
+        // `submit_reads_multi` (it drains every completion before returning, so
+        // no buffer is still being written while the serial reads run). Its
+        // verdict is held rather than returned: a serial request EARLIER in the
+        // caller's order may fail too, and that one owns the result.
+        let ring_failure = if submittable.is_empty() {
+            None
+        } else {
+            // The caller-order index of each group position: the submission
+            // reports a failure, and hands a finished request over, by its
+            // position in the group. An earlier request that succeeded must
+            // not be blamed for a later one's failure.
+            let caller_index: Vec<usize> = submittable.iter().map(|(i, _)| *i).collect();
+            let mut group: Vec<&mut BlockRead<'_>> =
+                submittable.iter_mut().map(|(_, r)| &mut **r).collect();
+            let mut in_caller_order = on_read.as_deref_mut().map(|on_read| {
+                any_request(move |position, req| {
+                    if let Some(&index) = caller_index.get(position) {
+                        on_read(index, req);
+                    }
+                })
+            });
+            self.inner
+                .submit_reads_multi(
+                    &mut group,
+                    in_caller_order
+                        .as_mut()
+                        .map(|f| f as &mut dyn FnMut(usize, &BlockRead<'_>)),
+                )
+                .err()
+                .map(|(at, e)| {
+                    let caller_index = submittable.get(at).map_or(usize::MAX, |(i, _)| *i);
+                    (caller_index, crate::io::Error::from(e))
+                })
+        };
+
+        let mut serial_failure: Option<(usize, crate::io::Error)> = None;
+        for (idx, req) in &mut serial {
+            // A partly filled destination owns the block's first `filled`
+            // bytes already; complete it from `offset + filled`.
+            let Some(offset) = req.offset.checked_add(req.buf.filled() as u64) else {
+                serial_failure = Some((
+                    *idx,
+                    crate::io::Error::from(io::Error::new(
+                        io::ErrorKind::InvalidInput,
+                        "read_blocks_batched: request offset overflows",
+                    )),
+                ));
+                break;
+            };
+            let dst = req.buf.unfilled_mut();
+            let want = dst.len();
+            match req.file.read_at(dst, offset) {
+                Ok(n) => {
+                    req.buf.advance(n);
+                    if n != want {
+                        serial_failure = Some((
+                            *idx,
+                            crate::io::Error::from(io::Error::new(
+                                io::ErrorKind::UnexpectedEof,
+                                "read_blocks_batched: short read on a fixed-size block",
+                            )),
+                        ));
+                        break;
+                    }
+                    if let Some(on_read) = on_read.as_deref_mut() {
+                        on_read(*idx, req);
+                    }
+                }
+                Err(e) => {
+                    serial_failure = Some((*idx, e));
+                    break;
+                }
+            }
+        }
+
+        match (ring_failure, serial_failure) {
+            (Some((ring_at, ring_err)), Some((serial_at, serial_err))) => {
+                if serial_at < ring_at {
+                    Err(serial_err)
+                } else {
+                    Err(ring_err)
+                }
+            }
+            (Some((_, e)), None) | (None, Some((_, e))) => Err(e),
+            (None, None) => Ok(()),
+        }
+    }
 }
 
 impl Clone for IoUringFs {
@@ -103,6 +229,15 @@ impl std::fmt::Debug for IoUringFs {
     fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
         f.debug_struct("IoUringFs").finish_non_exhaustive()
     }
+}
+
+/// The callback [`Fs::read_blocks_batched_each`] hands each finished request to.
+type OnRead<'f> = &'f mut dyn for<'a, 'b> FnMut(usize, &'a BlockRead<'b>);
+
+/// Makes `f` a callback over requests of any lifetime, which a closure only
+/// infers when its signature is fixed from outside.
+fn any_request<F: FnMut(usize, &BlockRead<'_>)>(f: F) -> F {
+    f
 }
 
 /// Requests paired with their position in the caller's batch. The position is
@@ -163,108 +298,15 @@ impl Fs for IoUringFs {
     }
 
     fn read_blocks_batched(&self, reqs: &mut [BlockRead<'_>]) -> crate::io::Result<()> {
-        // Every request that has an fd goes to the one shared ring in a single
-        // batched submission (the kernel fans each read out to its file's
-        // device). A request without one (a non-io_uring file mixed into the
-        // batch) cannot be submitted, so it is read serially — but only it:
-        // degrading the whole batch would forfeit the ring for the requests
-        // that were perfectly submittable.
-        if reqs.iter().all(|r| r.file.backing_fd().is_some()) {
-            // The common case: nothing to split, and no borrow-gathering pass.
-            // Every request is in the one group, so its position IS its index
-            // and nothing has to be mapped back.
-            return self
-                .inner
-                .submit_reads_multi(reqs)
-                .map_err(|(_, e)| crate::io::Error::from(e));
-        }
+        self.read_blocks(reqs, None)
+    }
 
-        // Indices travel with the requests: the contract is "the FIRST failing
-        // block's error", and first means first in the caller's order, not
-        // first in whichever group happened to run earlier. Splitting the batch
-        // must not reorder which failure wins.
-        let (mut submittable, mut serial): (IndexedReads<'_, '_>, IndexedReads<'_, '_>) = reqs
-            .iter_mut()
-            .enumerate()
-            .partition(|(_, r)| r.file.backing_fd().is_some());
-        log::debug!(
-            "io_uring batched read: {} of {} requests lack a descriptor and are read serially",
-            serial.len(),
-            submittable.len() + serial.len(),
-        );
-
-        // The ring group runs first and is waited out inside
-        // `submit_reads_multi` (it drains every completion before returning, so
-        // no buffer is still being written while the serial reads run). Its
-        // verdict is held rather than returned: a serial request EARLIER in the
-        // caller's order may fail too, and that one owns the result.
-        let ring_failure = if submittable.is_empty() {
-            None
-        } else {
-            let mut group: Vec<&mut BlockRead<'_>> =
-                submittable.iter_mut().map(|(_, r)| &mut **r).collect();
-            // The submission reports WHICH of its requests failed, as a
-            // position in the group; mapping it back through the group's own
-            // index list gives the caller-order index the comparison needs. An
-            // earlier request that succeeded must not be blamed for a later
-            // one's failure.
-            self.inner
-                .submit_reads_multi(&mut group)
-                .err()
-                .map(|(at, e)| {
-                    let caller_index = submittable.get(at).map_or(usize::MAX, |(i, _)| *i);
-                    (caller_index, crate::io::Error::from(e))
-                })
-        };
-
-        let mut serial_failure: Option<(usize, crate::io::Error)> = None;
-        for (idx, req) in &mut serial {
-            // A partly filled destination owns the block's first `filled`
-            // bytes already; complete it from `offset + filled`.
-            let Some(offset) = req.offset.checked_add(req.buf.filled() as u64) else {
-                serial_failure = Some((
-                    *idx,
-                    crate::io::Error::from(io::Error::new(
-                        io::ErrorKind::InvalidInput,
-                        "read_blocks_batched: request offset overflows",
-                    )),
-                ));
-                break;
-            };
-            let dst = req.buf.unfilled_mut();
-            let want = dst.len();
-            match req.file.read_at(dst, offset) {
-                Ok(n) => {
-                    req.buf.advance(n);
-                    if n != want {
-                        serial_failure = Some((
-                            *idx,
-                            crate::io::Error::from(io::Error::new(
-                                io::ErrorKind::UnexpectedEof,
-                                "read_blocks_batched: short read on a fixed-size block",
-                            )),
-                        ));
-                        break;
-                    }
-                }
-                Err(e) => {
-                    serial_failure = Some((*idx, e));
-                    break;
-                }
-            }
-        }
-
-        match (ring_failure, serial_failure) {
-            (Some((ring_at, ring_err)), Some((serial_at, serial_err))) => {
-                if serial_at < ring_at {
-                    Err(serial_err)
-                } else {
-                    Err(ring_err)
-                }
-            }
-            (Some((_, e)), None) | (None, Some((_, e))) => Err(e),
-            (None, None) => Ok(()),
-        }
+    fn read_blocks_batched_each(
+        &self,
+        reqs: &mut [BlockRead<'_>],
+        on_read: &mut dyn FnMut(usize, &BlockRead<'_>),
+    ) -> crate::io::Result<()> {
+        self.read_blocks(reqs, Some(on_read))
     }
 
     fn create_dir_all(&self, path: &Path) -> crate::io::Result<()> {
@@ -649,13 +691,67 @@ struct Op {
     result_tx: mpsc::SyncSender<i32>,
 }
 
+/// One read of a batch. Its completion is reported with its position in the
+/// batch, so one channel serves the whole batch.
+struct BatchRead {
+    fd: i32,
+    buf: UnsafeSendMutPtr,
+    len: u32,
+    offset: u64,
+}
+
+/// What the ring thread is sent: a single operation, or a whole batch of
+/// reads handed over in one message, so the caller takes the submission lock
+/// and sends once per batch rather than once per read.
+enum Submission {
+    One(Op),
+    Batch {
+        reads: Vec<BatchRead>,
+        /// Receives `(position, result)` for each read, in completion order.
+        /// Bounded by the batch size, so the ring thread never blocks on it.
+        done: mpsc::SyncSender<(usize, i32)>,
+    },
+}
+
+/// Where the ring thread delivers one operation's result.
+enum Completion {
+    One(mpsc::SyncSender<i32>),
+    InBatch {
+        done: mpsc::SyncSender<(usize, i32)>,
+        position: usize,
+    },
+}
+
+impl Completion {
+    /// Hands `result` to the waiting caller. A caller that has gone away
+    /// (only possible once it saw the ring fail) needs nothing more.
+    fn deliver(self, result: i32) {
+        match self {
+            Self::One(tx) => tx.send(result).ok(),
+            Self::InBatch { done, position } => done.send((position, result)).ok(),
+        };
+    }
+}
+
+/// Per-ring counts of what callers spend before the kernel sees a request:
+/// completion channels created and submission-lock acquisitions. Test-only.
+#[cfg(test)]
+#[derive(Default)]
+struct SubmitCounts {
+    channels: core::sync::atomic::AtomicUsize,
+    locks: core::sync::atomic::AtomicUsize,
+}
+
 /// Dedicated thread that owns the `io_uring` ring.
 ///
 /// Operations are submitted via bounded `mpsc::SyncSender` (sized to match
-/// the ring) and results are returned through per-operation channels.
+/// the ring). A single operation's result comes back on its own channel; a
+/// batch's results share one channel, tagged with each read's position.
 struct RingThread {
-    tx: Mutex<Option<mpsc::SyncSender<Op>>>,
+    tx: Mutex<Option<mpsc::SyncSender<Submission>>>,
     handle: Mutex<Option<thread::JoinHandle<()>>>,
+    #[cfg(test)]
+    counts: SubmitCounts,
 }
 
 impl RingThread {
@@ -685,6 +781,8 @@ impl RingThread {
         Ok(Self {
             tx: Mutex::new(Some(tx)),
             handle: Mutex::new(Some(handle)),
+            #[cfg(test)]
+            counts: SubmitCounts::default(),
         })
     }
 
@@ -702,13 +800,12 @@ impl RingThread {
         clippy::needless_pass_by_value,
         reason = "rx is moved into the spawned thread — must be owned"
     )]
-    fn event_loop(mut ring: IoUring, rx: mpsc::Receiver<Op>) {
+    fn event_loop(mut ring: IoUring, rx: mpsc::Receiver<Submission>) {
         // ManuallyDrop ensures that on panic, pending's SyncSenders are NOT
         // dropped during stack unwinding. This keeps callers blocked on their
         // result channels until catch_unwind + abort kills the process,
         // preventing them from dropping buffers that the kernel may still access.
-        let mut pending =
-            std::mem::ManuallyDrop::new(HashMap::<u64, mpsc::SyncSender<i32>>::default());
+        let mut pending = std::mem::ManuallyDrop::new(HashMap::<u64, Completion>::default());
         let mut next_id: u64 = 0;
 
         loop {
@@ -731,12 +828,12 @@ impl RingThread {
                 }
             };
 
-            if let Some(op) = first {
-                Self::enqueue(&mut ring, &mut pending, &mut next_id, op);
+            if let Some(submission) = first {
+                Self::accept(&mut ring, &mut pending, &mut next_id, submission);
 
-                // Batch: drain as many additional ops as available.
-                while let Ok(op) = rx.try_recv() {
-                    Self::enqueue(&mut ring, &mut pending, &mut next_id, op);
+                // Batch: drain as many additional submissions as available.
+                while let Ok(submission) = rx.try_recv() {
+                    Self::accept(&mut ring, &mut pending, &mut next_id, submission);
                 }
             }
 
@@ -767,9 +864,8 @@ impl RingThread {
 
             // Phase 3: harvest completions.
             for cqe in ring.completion() {
-                let id = cqe.user_data();
-                if let Some(tx) = pending.remove(&id) {
-                    let _ = tx.send(cqe.result());
+                if let Some(completion) = pending.remove(&cqe.user_data()) {
+                    completion.deliver(cqe.result());
                 }
             }
         }
@@ -784,18 +880,54 @@ impl RingThread {
         }
     }
 
-    /// Builds an SQE from `op` and pushes it onto the submission queue.
+    /// Queues every operation of `submission`, each with where its result goes.
+    fn accept(
+        ring: &mut IoUring,
+        pending: &mut HashMap<u64, Completion>,
+        next_id: &mut u64,
+        submission: Submission,
+    ) {
+        match submission {
+            Submission::One(op) => {
+                Self::enqueue(
+                    ring,
+                    pending,
+                    next_id,
+                    op.kind,
+                    Completion::One(op.result_tx),
+                );
+            }
+            Submission::Batch { reads, done } => {
+                for (position, read) in reads.into_iter().enumerate() {
+                    let kind = OpKind::Read {
+                        fd: read.fd,
+                        buf: read.buf,
+                        len: read.len,
+                        offset: read.offset,
+                    };
+                    let completion = Completion::InBatch {
+                        done: done.clone(),
+                        position,
+                    };
+                    Self::enqueue(ring, pending, next_id, kind, completion);
+                }
+            }
+        }
+    }
+
+    /// Builds an SQE from `kind` and pushes it onto the submission queue.
     #[cfg_attr(coverage_nightly, coverage(off))]
     fn enqueue(
         ring: &mut IoUring,
-        pending: &mut HashMap<u64, mpsc::SyncSender<i32>>,
+        pending: &mut HashMap<u64, Completion>,
         next_id: &mut u64,
-        op: Op,
+        kind: OpKind,
+        completion: Completion,
     ) {
         let id = *next_id;
         *next_id = next_id.wrapping_add(1);
 
-        let sqe = match op.kind {
+        let sqe = match kind {
             OpKind::Read {
                 fd,
                 buf,
@@ -847,18 +979,76 @@ impl RingThread {
                     }
                 }
                 for cqe in ring.completion() {
-                    let cid = cqe.user_data();
-                    if let Some(tx) = pending.remove(&cid) {
-                        let _ = tx.send(cqe.result());
+                    if let Some(done) = pending.remove(&cqe.user_data()) {
+                        done.deliver(cqe.result());
                     }
                 }
             }
         }
 
-        pending.insert(id, op.result_tx);
+        pending.insert(id, completion);
     }
 
     // -- Submission helpers --------------------------------------------------
+
+    /// A completion channel for `bound` results.
+    #[cfg_attr(
+        not(test),
+        expect(
+            clippy::unused_self,
+            reason = "self carries the test-only channel count"
+        )
+    )]
+    fn channel<T>(&self, bound: usize) -> (mpsc::SyncSender<T>, mpsc::Receiver<T>) {
+        #[cfg(test)]
+        self.counts
+            .channels
+            .fetch_add(1, core::sync::atomic::Ordering::Relaxed);
+        mpsc::sync_channel(bound)
+    }
+
+    /// Hands `submission` to the ring thread under one acquisition of the
+    /// submission lock. On error nothing was queued: the submission is dropped
+    /// with the failed send, so no read it describes ever reaches the kernel.
+    fn send(&self, submission: Submission) -> io::Result<()> {
+        #[cfg(test)]
+        self.counts
+            .locks
+            .fetch_add(1, core::sync::atomic::Ordering::Relaxed);
+        // Mutex guards Option<Sender> for clean shutdown (Drop sets to None).
+        // Lock is held only for send() duration (~ns) — negligible vs I/O
+        // latency (~µs). A lock-free channel would eliminate this but adds
+        // an external dependency for no measurable gain.
+        self.tx
+            .lock()
+            .unwrap_or_else(std::sync::PoisonError::into_inner)
+            .as_ref()
+            .ok_or_else(|| io::Error::new(io::ErrorKind::BrokenPipe, "io_uring thread shut down"))?
+            .send(submission)
+            .map_err(|_| io::Error::new(io::ErrorKind::BrokenPipe, "io_uring thread exited"))
+    }
+
+    /// Submits `reads` as one batch and waits for every one of them; see
+    /// [`drain_batch`] for the verdict and `on_read`. `expected[i]` is the byte
+    /// count `reads[i]` must return.
+    fn submit_batch(
+        &self,
+        reads: Vec<BatchRead>,
+        expected: &[usize],
+        short_read: &'static str,
+        on_read: impl FnMut(usize),
+    ) -> Result<(), (usize, io::Error)> {
+        if reads.is_empty() {
+            return Ok(());
+        }
+        let (done, results) = self.channel(reads.len());
+        // A failed send drops the batch with it, so nothing was submitted and
+        // no buffer is in the kernel's hands; the failure belongs to the
+        // batch's first read.
+        self.send(Submission::Batch { reads, done })
+            .map_err(|e| (0, e))?;
+        drain_batch(expected, || results.recv().ok(), short_read, on_read)
+    }
 
     /// Submits a pread to the ring and blocks until completion.
     fn submit_read(&self, fd: i32, buf: &mut [u8], offset: u64) -> io::Result<u32> {
@@ -868,7 +1058,7 @@ impl RingThread {
         let len: u32 = i32::try_from(buf.len())
             .map_err(|_| io::Error::new(io::ErrorKind::InvalidInput, "buffer exceeds i32::MAX"))?
             .unsigned_abs();
-        let (tx, rx) = mpsc::sync_channel(1);
+        let (tx, rx) = self.channel(1);
         let op = Op {
             kind: OpKind::Read {
                 fd,
@@ -891,18 +1081,16 @@ impl RingThread {
     /// batch (block reads are fixed-size, so the caller treats a failure as
     /// "could not batch-read" and falls back to per-block reads).
     fn submit_reads(&self, fd: i32, regions: &mut [(u64, &mut [u8])]) -> io::Result<()> {
-        // Phase 1: send every op, collecting one result receiver per region. The
-        // op holds a raw pointer into the caller's buffer; `regions` is borrowed
-        // for the whole call and we block on the receivers below, so every buffer
-        // outlives the kernel's access (the UnsafeSend safety contract).
-        // Pre-pass: validate EVERY region length BEFORE submitting any op. A
-        // length over the i32 SQE cap must be rejected here, not mid-loop: once a
-        // read is sent the kernel may be writing its raw-ptr buffer, so an early
-        // `?` after earlier sends would strand those ops un-drained (Phase 2 only
-        // waits on receivers it already holds) and let the caller free the
-        // buffers mid-write. Validating up front keeps the send loop infallible
-        // on length. (SQE length is u32, CQE result i32 — block reads are KBs,
-        // never near the cap, so this only fires on misuse of the general API.)
+        // Every read holds a raw pointer into the caller's buffer; `regions` is
+        // borrowed for the whole call and the wait below covers every read, so
+        // every buffer outlives the kernel's access (the UnsafeSend safety
+        // contract).
+        // Phase 1: validate EVERY region length BEFORE submitting anything. A
+        // length over the i32 SQE cap must be rejected here: once the batch is
+        // sent the kernel may be writing its buffers, and the batch goes out
+        // whole, so there is no later point at which to refuse one read of it.
+        // (SQE length is u32, CQE result i32 — block reads are KBs, never near
+        // the cap, so this only fires on misuse of the general API.)
         let mut lens: Vec<u32> = Vec::with_capacity(regions.len());
         for (_, buf) in regions.iter() {
             let len = if buf.is_empty() {
@@ -917,75 +1105,29 @@ impl RingThread {
             lens.push(len);
         }
 
-        let mut receivers: Vec<(mpsc::Receiver<i32>, usize)> = Vec::with_capacity(regions.len());
+        // Phase 2: the whole batch in one message, one completion channel for
+        // it, and a wait for every read (see `drain_batch`).
+        let mut reads = Vec::with_capacity(regions.len());
+        let mut expected = Vec::with_capacity(regions.len());
         for ((offset, buf), &len) in regions.iter_mut().zip(&lens) {
             if buf.is_empty() {
                 continue;
             }
-            let (tx, rx) = mpsc::sync_channel(1);
-            let op = Op {
-                kind: OpKind::Read {
-                    fd,
-                    buf: UnsafeSendMutPtr(buf.as_mut_ptr()),
-                    len,
-                    offset: *offset,
-                },
-                result_tx: tx,
-            };
-            // Send without waiting so the next op queues behind it; the event
-            // loop's try_recv drain coalesces them. The bounded channel applies
-            // backpressure past ring capacity, and the loop keeps draining +
-            // submitting, so a send beyond capacity makes progress (no deadlock).
-            self.tx
-                .lock()
-                .unwrap_or_else(std::sync::PoisonError::into_inner)
-                .as_ref()
-                .ok_or_else(|| {
-                    io::Error::new(io::ErrorKind::BrokenPipe, "io_uring thread shut down")
-                })?
-                .send(op)
-                .map_err(|_| io::Error::new(io::ErrorKind::BrokenPipe, "io_uring thread exited"))?;
-            receivers.push((rx, buf.len()));
+            reads.push(BatchRead {
+                fd,
+                buf: UnsafeSendMutPtr(buf.as_mut_ptr()),
+                len,
+                offset: *offset,
+            });
+            expected.push(buf.len());
         }
-
-        // Phase 2: drain EVERY receiver before returning, even on error. Each
-        // `recv()` blocks until that op's CQE arrives, so a short read or a
-        // negative result must NOT short-circuit the loop: any op left
-        // un-recv'd may still have the kernel writing into its Phase-1 raw-ptr
-        // buffer, and returning early lets the caller free those buffers
-        // mid-write (use-after-free). Drain all, surface the first error.
-        let mut first_err: Option<io::Error> = None;
-        for (rx, expected) in receivers {
-            let recv = rx.recv();
-            if first_err.is_some() {
-                continue; // already failing; just wait this op out, do not record
-            }
-            match recv {
-                Err(_) => {
-                    first_err = Some(io::Error::new(
-                        io::ErrorKind::BrokenPipe,
-                        "io_uring thread exited",
-                    ));
-                }
-                Ok(result) if result < 0 => {
-                    first_err = Some(io::Error::from_raw_os_error(-result));
-                }
-                Ok(result) => {
-                    #[expect(clippy::cast_sign_loss, reason = "guarded by result < 0 above")]
-                    let n = result as usize;
-                    if n != expected {
-                        first_err = Some(io::Error::new(
-                            io::ErrorKind::UnexpectedEof,
-                            "io_uring read_many: short read on a fixed-size block region",
-                        ));
-                    }
-                }
-            }
-        }
-        match first_err {
-            Some(e) => Err(e),
-            None => Ok(()),
-        }
+        self.submit_batch(
+            reads,
+            &expected,
+            "io_uring read_many: short read on a fixed-size block region",
+            |_| {},
+        )
+        .map_err(|(_, e)| e)
     }
 
     /// Like [`Self::submit_reads`], but each request carries its OWN fd, so
@@ -997,9 +1139,15 @@ impl RingThread {
     /// is and the rest are read serially. Monomorphised, so the common
     /// whole-batch path pays nothing for the subset one and neither has to
     /// gather its requests into a fresh allocation.
+    ///
+    /// With `on_read`, each request is counted as filled and handed over the
+    /// moment its read completes, while the others may still be in flight;
+    /// without it, the requests are counted only once every read succeeded, so
+    /// a failed batch leaves none of them counted.
     fn submit_reads_multi<'r, T: core::borrow::BorrowMut<BlockRead<'r>>>(
         &self,
         reqs: &mut [T],
+        on_read: Option<OnRead<'_>>,
     ) -> Result<(), (usize, io::Error)> {
         // Pre-pass: resolve every request's fd and validate its length BEFORE
         // submitting any op (same un-drained-in-flight hazard as submit_reads: a
@@ -1053,11 +1201,12 @@ impl RingThread {
             metas.push(Some((fd, len, offset)));
         }
 
-        // The position each receiver's request occupies in `reqs`, so a failure
-        // is attributed to the request that actually failed rather than to the
-        // group it belonged to.
-        let mut receivers: Vec<(mpsc::Receiver<i32>, usize, usize)> =
-            Vec::with_capacity(reqs.len());
+        // One read per non-empty request, in request order, with the position
+        // each occupies in `reqs`: a failure is attributed to the request that
+        // failed, not to the batch it travelled in.
+        let mut reads = Vec::with_capacity(reqs.len());
+        let mut expected = Vec::with_capacity(reqs.len());
+        let mut ats = Vec::with_capacity(reqs.len());
         for (at, (req, meta)) in reqs
             .iter_mut()
             .map(core::borrow::BorrowMut::borrow_mut)
@@ -1067,88 +1216,49 @@ impl RingThread {
             let Some((fd, len, offset)) = *meta else {
                 continue;
             };
-            let (tx, rx) = mpsc::sync_channel(1);
-            let expected = req.buf.capacity() - req.buf.filled();
-            let dst = req.buf.unfilled_mut().as_mut_ptr();
-            let op = Op {
-                kind: OpKind::Read {
-                    fd,
-                    buf: UnsafeSendMutPtr(dst),
-                    len,
-                    offset,
-                },
-                result_tx: tx,
-            };
-            self.tx
-                .lock()
-                .unwrap_or_else(std::sync::PoisonError::into_inner)
-                .as_ref()
-                .ok_or_else(|| {
-                    (
-                        at,
-                        io::Error::new(io::ErrorKind::BrokenPipe, "io_uring thread shut down"),
-                    )
-                })?
-                .send(op)
-                .map_err(|_| {
-                    (
-                        at,
-                        io::Error::new(io::ErrorKind::BrokenPipe, "io_uring thread exited"),
-                    )
-                })?;
-            receivers.push((rx, expected, at));
+            expected.push(req.buf.capacity() - req.buf.filled());
+            reads.push(BatchRead {
+                fd,
+                buf: UnsafeSendMutPtr(req.buf.unfilled_mut().as_mut_ptr()),
+                len,
+                offset,
+            });
+            ats.push(at);
         }
 
-        // Drain EVERY receiver before returning, even on error: an un-recv'd op
-        // may still have the kernel writing into its raw-ptr buffer, so a short
-        // read or negative result must not short-circuit the loop and let the
-        // caller free those buffers mid-write (use-after-free). See `submit_reads`.
-        // Receivers are in submission order, so the first failure found is also
-        // the earliest-indexed one.
-        let mut first_err: Option<(usize, io::Error)> = None;
-        for (rx, expected, at) in receivers {
-            let recv = rx.recv();
-            if first_err.is_some() {
-                continue;
-            }
-            match recv {
-                Err(_) => {
-                    first_err = Some((
-                        at,
-                        io::Error::new(io::ErrorKind::BrokenPipe, "io_uring thread exited"),
-                    ));
-                }
-                Ok(result) if result < 0 => {
-                    first_err = Some((at, io::Error::from_raw_os_error(-result)));
-                }
-                Ok(result) => {
-                    #[expect(clippy::cast_sign_loss, reason = "guarded by result < 0 above")]
-                    let n = result as usize;
-                    if n != expected {
-                        first_err = Some((
-                            at,
-                            io::Error::new(
-                                io::ErrorKind::UnexpectedEof,
-                                "io_uring read_blocks_batched: short read on a fixed-size block",
-                            ),
-                        ));
+        const SHORT_READ: &str = "io_uring read_blocks_batched: short read on a fixed-size block";
+        let blame =
+            |(position, e): (usize, io::Error)| (ats.get(position).copied().unwrap_or_default(), e);
+
+        // The kernel filled a request exactly when its completion matched the
+        // length it asked for; counting it covers the same unfilled span the
+        // submission described.
+        let count_filled = |req: &mut BlockRead<'r>| {
+            let remaining = req.buf.capacity() - req.buf.filled();
+            req.buf.advance(remaining);
+        };
+
+        if let Some(on_read) = on_read {
+            return self
+                .submit_batch(reads, &expected, SHORT_READ, |position| {
+                    // Only this request's own buffer is touched: the others
+                    // may still have the kernel writing into theirs.
+                    if let Some(&at) = ats.get(position)
+                        && let Some(req) = reqs.get_mut(at)
+                    {
+                        let req = req.borrow_mut();
+                        count_filled(req);
+                        on_read(at, req);
                     }
-                }
-            }
+                })
+                .map_err(blame);
         }
-        if first_err.is_none() {
-            // Every completion matched the length its request asked for, so the
-            // kernel filled every destination. Count it, the same unfilled span
-            // the submission described.
-            for req in reqs.iter_mut().map(core::borrow::BorrowMut::borrow_mut) {
-                let remaining = req.buf.capacity() - req.buf.filled();
-                req.buf.advance(remaining);
-            }
+        self.submit_batch(reads, &expected, SHORT_READ, |_| {})
+            .map_err(blame)?;
+        for req in reqs.iter_mut().map(core::borrow::BorrowMut::borrow_mut) {
+            count_filled(req);
         }
-        match first_err {
-            Some(e) => Err(e),
-            None => Ok(()),
-        }
+        Ok(())
     }
 
     /// Submits a pwrite to the ring and blocks until completion.
@@ -1159,7 +1269,7 @@ impl RingThread {
         let len: u32 = i32::try_from(buf.len())
             .map_err(|_| io::Error::new(io::ErrorKind::InvalidInput, "buffer exceeds i32::MAX"))?
             .unsigned_abs();
-        let (tx, rx) = mpsc::sync_channel(1);
+        let (tx, rx) = self.channel(1);
         let op = Op {
             kind: OpKind::Write {
                 fd,
@@ -1174,7 +1284,7 @@ impl RingThread {
 
     /// Submits an fsync or fdatasync and blocks until completion.
     fn submit_fsync(&self, fd: i32, datasync: bool) -> io::Result<u32> {
-        let (tx, rx) = mpsc::sync_channel(1);
+        let (tx, rx) = self.channel(1);
         let op = Op {
             kind: OpKind::Fsync { fd, datasync },
             result_tx: tx,
@@ -1187,17 +1297,7 @@ impl RingThread {
     /// Returns the non-negative CQE result as `u32`. Negative results
     /// (kernel errors) are converted to [`io::Error`].
     fn send_and_wait(&self, op: Op, rx: &mpsc::Receiver<i32>) -> io::Result<u32> {
-        // Mutex guards Option<Sender> for clean shutdown (Drop sets to None).
-        // Lock is held only for send() duration (~ns) — negligible vs I/O
-        // latency (~µs). A lock-free channel would eliminate this but adds
-        // an external dependency for no measurable gain.
-        self.tx
-            .lock()
-            .unwrap_or_else(std::sync::PoisonError::into_inner)
-            .as_ref()
-            .ok_or_else(|| io::Error::new(io::ErrorKind::BrokenPipe, "io_uring thread shut down"))?
-            .send(op)
-            .map_err(|_| io::Error::new(io::ErrorKind::BrokenPipe, "io_uring thread exited"))?;
+        self.send(Submission::One(op))?;
 
         let result = rx
             .recv()
@@ -1211,6 +1311,58 @@ impl RingThread {
             Err(io::Error::from_raw_os_error(-result))
         }
     }
+}
+
+/// Waits out a batch of `expected.len()` reads whose `(position, result)`
+/// completions `next` yields in whatever order they finish, and returns the
+/// failure at the LOWEST position, if any, with that position.
+///
+/// Every completion is awaited before returning, even once a failure is
+/// known: a read not yet completed may still have the kernel writing into its
+/// buffer, and returning early would let the caller free it mid-write. `next`
+/// returning `None` means the ring thread is gone, which it only is once no
+/// read of its is still in flight; a read that never completed is then
+/// reported as a broken pipe.
+///
+/// The verdict does not depend on the arrival order. Completions arrive in
+/// whatever order the kernel finishes them, so taking the first failure
+/// OBSERVED would make one batch with one set of failures report different
+/// errors from run to run; the lowest position is a rule over the requests.
+///
+/// `on_read` is called with a read's position as soon as that read has
+/// returned every byte it asked for, while later ones may still be in flight.
+fn drain_batch(
+    expected: &[usize],
+    mut next: impl FnMut() -> Option<(usize, i32)>,
+    short_read: &'static str,
+    mut on_read: impl FnMut(usize),
+) -> Result<(), (usize, io::Error)> {
+    let mut results: Vec<Option<i32>> = vec![None; expected.len()];
+    for _ in 0..expected.len() {
+        let Some((position, result)) = next() else {
+            break;
+        };
+        if let (Some(slot), Some(&want)) = (results.get_mut(position), expected.get(position)) {
+            *slot = Some(result);
+            if usize::try_from(result).is_ok_and(|n| n == want) {
+                on_read(position);
+            }
+        }
+    }
+
+    for (position, (result, &want)) in results.into_iter().zip(expected).enumerate() {
+        let failure = match result {
+            None => io::Error::new(io::ErrorKind::BrokenPipe, "io_uring thread exited"),
+            Some(result) if result < 0 => io::Error::from_raw_os_error(-result),
+            #[expect(clippy::cast_sign_loss, reason = "guarded by result < 0 above")]
+            Some(result) if result as usize != want => {
+                io::Error::new(io::ErrorKind::UnexpectedEof, short_read)
+            }
+            Some(_) => continue,
+        };
+        return Err((position, failure));
+    }
+    Ok(())
 }
 
 impl Drop for RingThread {

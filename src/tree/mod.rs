@@ -3964,10 +3964,6 @@ impl Tree {
     /// decodes each from its scratch buffer, and point-reads its keys, keeping the
     /// highest-seqno hit per key in `results`. Every task is row-format (the caller
     /// routes any level with a Page-ECC / columnar table to the serial resolve).
-    #[expect(
-        clippy::indexing_slicing,
-        reason = "buffers is built from chunk so indices align; key indices are valid (caller's keys/results aligned)"
-    )]
     fn resolve_block_task_chunk<K: AsRef<[u8]>>(
         chunk: &[BlockTask<'_>],
         keys: &[K],
@@ -3977,63 +3973,107 @@ impl Tree {
             .iter()
             .map(|t| vec![0u8; t.handle.size() as usize])
             .collect();
-        {
-            // One submission per backend, for the reason `prewarm_level_cross_sst`
-            // states: a table's reads belong to the backend it was opened
-            // through, which a reopen with a changed routing map can leave
-            // different from the level's current route.
-            let mut groups: Vec<(&Arc<dyn crate::fs::Fs>, Vec<crate::fs::BlockRead<'_>>)> =
-                Vec::new();
-            for (task, buf) in chunk.iter().zip(buffers.iter_mut()) {
-                let req = crate::fs::BlockRead {
-                    file: task.file.as_ref(),
-                    offset: *task.handle.offset(),
-                    buf: crate::fs::BlockBuf::new(&mut buf[..]),
-                };
-                match groups
-                    .iter_mut()
-                    .find(|(fs, _)| Arc::ptr_eq(fs, &task.table.fs))
-                {
-                    Some((_, reqs)) => reqs.push(req),
-                    None => groups.push((&task.table.fs, vec![req])),
+
+        // One submission per backend, for the reason `prewarm_level_cross_sst`
+        // states: a table's reads belong to the backend it was opened through,
+        // which a reopen with a changed routing map can leave different from
+        // the level's current route. Each group remembers which task each of
+        // its requests reads for.
+        struct BackendReads<'f, 'b> {
+            fs: &'f Arc<dyn crate::fs::Fs>,
+            reqs: Vec<crate::fs::BlockRead<'b>>,
+            tasks: Vec<usize>,
+        }
+        let mut groups: Vec<BackendReads<'_, '_>> = Vec::new();
+        for (index, (task, buf)) in chunk.iter().zip(buffers.iter_mut()).enumerate() {
+            let req = crate::fs::BlockRead {
+                file: task.file.as_ref(),
+                offset: *task.handle.offset(),
+                buf: crate::fs::BlockBuf::new(&mut buf[..]),
+            };
+            match groups
+                .iter_mut()
+                .find(|group| Arc::ptr_eq(group.fs, &task.table.fs))
+            {
+                Some(group) => {
+                    group.reqs.push(req);
+                    group.tasks.push(index);
                 }
-            }
-            for (fs, reqs) in &mut groups {
-                // Charged as issued, group by group like the prewarm: these
-                // reads bypass the per-block load path that charges every
-                // other read, and a group after a failure is never asked.
-                for task in chunk {
-                    if Arc::ptr_eq(&task.table.fs, fs) {
-                        task.table
-                            .record_batched_read(core::slice::from_ref(&task.handle));
-                    }
-                }
-                fs.read_blocks_batched(reqs)?;
-                // An implementation that reported success without filling a
-                // request leaves it short; refuse to decode a block out of bytes
-                // it never wrote.
-                if !reqs.iter().all(|r| r.buf.is_full()) {
-                    return Err(crate::Error::Io(crate::io::Error::new(
-                        crate::io::ErrorKind::UnexpectedEof,
-                        "read_blocks_batched reported success on an unfilled block",
-                    )));
-                }
+                None => groups.push(BackendReads {
+                    fs: &task.table.fs,
+                    reqs: vec![req],
+                    tasks: vec![index],
+                }),
             }
         }
 
-        for (task, buf) in chunk.iter().zip(buffers.iter()) {
-            if let Some(block) = task
-                .table
-                .decode_data_block_from_bytes(buf, *task.handle.offset())?
-            {
-                for &kidx in &task.keys {
-                    if let Some(item) = task.table.point_read_translated(
-                        &block,
-                        keys[kidx].as_ref(),
-                        task.table_seqno,
-                    )? {
-                        Self::keep_highest(results, kidx, item);
-                    }
+        // A block is decoded the moment its read completes, while the rest of
+        // its group may still be in flight. A decode failure is held rather
+        // than returned: it must not abandon reads still in flight, and when
+        // several fail the lowest task wins, as a decode in task order would.
+        let mut decode_failure: Option<(usize, crate::Error)> = None;
+        for BackendReads { fs, reqs, tasks } in &mut groups {
+            // Charged as issued, group by group like the prewarm: these reads
+            // bypass the per-block load path that charges every other read,
+            // and a group after a failure is never asked.
+            for task in chunk {
+                if Arc::ptr_eq(&task.table.fs, fs) {
+                    task.table
+                        .record_batched_read(core::slice::from_ref(&task.handle));
+                }
+            }
+            fs.read_blocks_batched_each(reqs, &mut |position, req| {
+                let Some((index, task)) = tasks
+                    .get(position)
+                    .and_then(|&index| chunk.get(index).map(|task| (index, task)))
+                else {
+                    return;
+                };
+                if let Err(e) =
+                    Self::resolve_block_task(task, req.buf.filled_bytes(), keys, results)
+                    && decode_failure
+                        .as_ref()
+                        .is_none_or(|(held, _)| index < *held)
+                {
+                    decode_failure = Some((index, e));
+                }
+            })?;
+            // An implementation that reported success without filling a
+            // request leaves it short; refuse to decode a block out of bytes
+            // it never wrote.
+            if !reqs.iter().all(|r| r.buf.is_full()) {
+                return Err(crate::Error::Io(crate::io::Error::new(
+                    crate::io::ErrorKind::UnexpectedEof,
+                    "read_blocks_batched reported success on an unfilled block",
+                )));
+            }
+        }
+        decode_failure.map_or(Ok(()), |(_, e)| Err(e))
+    }
+
+    /// Decodes one task's block from `bytes` and point-reads its keys, keeping
+    /// the highest-seqno hit per key in `results`.
+    #[expect(
+        clippy::indexing_slicing,
+        reason = "the task's key indices are valid (caller's keys/results aligned)"
+    )]
+    fn resolve_block_task<K: AsRef<[u8]>>(
+        task: &BlockTask<'_>,
+        bytes: &[u8],
+        keys: &[K],
+        results: &mut [Option<InternalValue>],
+    ) -> crate::Result<()> {
+        if let Some(block) = task
+            .table
+            .decode_data_block_from_bytes(bytes, *task.handle.offset())?
+        {
+            for &kidx in &task.keys {
+                if let Some(item) = task.table.point_read_translated(
+                    &block,
+                    keys[kidx].as_ref(),
+                    task.table_seqno,
+                )? {
+                    Self::keep_highest(results, kidx, item);
                 }
             }
         }

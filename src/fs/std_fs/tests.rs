@@ -337,6 +337,77 @@ fn fs_read_blocks_batched_partly_filled_request_resumes_at_offset_plus_filled() 
     Ok(())
 }
 
+/// The default `read_blocks_batched_each` fills the batch, then hands every
+/// request over in index order, each filled with its own bytes.
+#[test]
+fn fs_read_blocks_batched_each_hands_over_every_filled_request_in_order() -> io::Result<()> {
+    let dir = tempfile::tempdir()?;
+    let fs = StdFs;
+    let opts = FsOpenOptions::new().write(true).create(true).read(true);
+    let mut file = fs.open(&dir.path().join("each.bin"), &opts)?;
+    file.write_all(&(0..=255u8).collect::<Vec<_>>())?;
+
+    let mut bufs = [[0u8; 4]; 3];
+    let mut handed = Vec::new();
+    {
+        let mut reqs: Vec<_> = bufs
+            .iter_mut()
+            .zip([40u64, 0, 200])
+            .map(|(buf, offset)| crate::fs::BlockRead {
+                file: file.as_ref(),
+                offset,
+                buf: crate::fs::BlockBuf::new(buf),
+            })
+            .collect();
+        fs.read_blocks_batched_each(&mut reqs, &mut |i, req| {
+            handed.push((i, req.buf.filled_bytes().to_vec()));
+        })?;
+    }
+    assert_eq!(
+        handed,
+        [
+            (0, vec![40, 41, 42, 43]),
+            (1, vec![0, 1, 2, 3]),
+            (2, vec![200, 201, 202, 203]),
+        ]
+    );
+    Ok(())
+}
+
+/// A failed batch hands nothing over from the default: the batch fails as a
+/// whole before any request is handed on.
+#[test]
+fn fs_read_blocks_batched_each_hands_nothing_over_from_a_failed_batch() -> io::Result<()> {
+    let dir = tempfile::tempdir()?;
+    let fs = StdFs;
+    let opts = FsOpenOptions::new().write(true).create(true).read(true);
+    let mut file = fs.open(&dir.path().join("each_fail.bin"), &opts)?;
+    file.write_all(&[0u8; 10])?;
+
+    let mut ok = [0u8; 4];
+    let mut short = [0u8; 64];
+    let mut handed = 0;
+    let err = {
+        let mut reqs = vec![
+            crate::fs::BlockRead {
+                file: file.as_ref(),
+                offset: 0,
+                buf: crate::fs::BlockBuf::new(&mut ok),
+            },
+            crate::fs::BlockRead {
+                file: file.as_ref(),
+                offset: 0,
+                buf: crate::fs::BlockBuf::new(&mut short),
+            },
+        ];
+        fs.read_blocks_batched_each(&mut reqs, &mut |_, _| handed += 1)
+            .unwrap_err()
+    };
+    assert_eq!(err.kind(), io::ErrorKind::UnexpectedEof);
+    assert_eq!(handed, 0);
+    Ok(())
+}
+
 #[test]
 fn fs_file_read_many_short_read_at_eof_errors() -> io::Result<()> {
     let dir = tempfile::tempdir()?;
