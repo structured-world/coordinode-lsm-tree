@@ -122,6 +122,11 @@ pub struct Metrics {
     /// value served from the blob cache asks the filesystem for nothing.
     pub(crate) blob_bytes_io_requested: AtomicU64,
 
+    /// Read requests issued to the `Fs` trait for blob records: one per
+    /// single-value read and one per coalesced read-ahead span. Counted on the
+    /// same terms as `blob_bytes_io_requested`.
+    pub(crate) blob_read_io: AtomicUsize,
+
     /// Blob value bytes produced after decompression, decryption and
     /// validation — the blob-side twin of `block_bytes_decoded`, summed into
     /// [`Metrics::bytes_decoded`] for the same reason.
@@ -288,6 +293,16 @@ impl Metrics {
     /// whether it paid for the blobs of rows it then discarded.
     pub fn blob_bytes_read(&self) -> u64 {
         self.blob_bytes_io_requested.load(Relaxed)
+    }
+
+    /// Read requests issued for separated values: one per value read on its
+    /// own, one per coalesced read-ahead span.
+    ///
+    /// The count that blob locality moves. Values a scan finds in one file
+    /// next to each other coalesce into few requests; the same values spread
+    /// across interleaved files need a request per file per stretch.
+    pub fn blob_read_count(&self) -> usize {
+        self.blob_read_io.load(Relaxed)
     }
 
     /// Bytes moved by a gather — accumulation, filtering, row gathering and

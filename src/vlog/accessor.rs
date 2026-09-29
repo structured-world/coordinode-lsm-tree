@@ -40,24 +40,42 @@ impl<'a> Accessor<'a> {
         }
     }
 
-    /// Records one uncached blob read: what was asked of the filesystem, and
-    /// what came out of the record's validation and decompression.
+    /// Records one read request issued to the filesystem for blob records,
+    /// covering `on_disk` bytes.
     #[cfg_attr(
         not(feature = "metrics"),
         expect(
             unused_variables,
             clippy::unused_self,
-            reason = "the arguments and the accessor's counters are both the feature's payload"
+            reason = "the argument and the accessor's counters are both the feature's payload"
         )
     )]
     #[inline]
-    fn count_read(&self, on_disk: usize, decoded: usize) {
+    fn count_request(&self, on_disk: usize) {
         #[cfg(feature = "metrics")]
         if let Some(metrics) = self.metrics {
             use core::sync::atomic::Ordering::Relaxed;
+            metrics.blob_read_io.fetch_add(1, Relaxed);
             metrics
                 .blob_bytes_io_requested
                 .fetch_add(on_disk as u64, Relaxed);
+        }
+    }
+
+    /// Records what came out of one record's validation and decompression.
+    #[cfg_attr(
+        not(feature = "metrics"),
+        expect(
+            unused_variables,
+            clippy::unused_self,
+            reason = "the argument and the accessor's counters are both the feature's payload"
+        )
+    )]
+    #[inline]
+    fn count_decoded(&self, decoded: usize) {
+        #[cfg(feature = "metrics")]
+        if let Some(metrics) = self.metrics {
+            use core::sync::atomic::Ordering::Relaxed;
             metrics
                 .blob_bytes_decoded
                 .fetch_add(decoded as u64, Relaxed);
@@ -101,13 +119,13 @@ impl<'a> Accessor<'a> {
         // filesystem then fails, or whose bytes then fail their checksum or
         // decompression, was still asked of it.
         let len = crate::vlog::blob_file::reader::record_len(key.len(), vhandle)?;
-        self.count_read(len, 0);
+        self.count_request(len);
         let record = reader.read_record(vhandle, len)?;
         // Charged before the result is judged, like the read above: a record
         // refused after decompression was still decompressed.
         let mut decoded = 0;
         let parsed = reader.parse_record(key, vhandle, &record, &mut decoded);
-        self.count_read(0, decoded);
+        self.count_decoded(decoded);
         let value = parsed?;
         let detached = cache.insert_blob(tree_id, vhandle, key, value.clone());
         self.count_gather(detached);
@@ -311,7 +329,7 @@ impl<'a> Accessor<'a> {
         // Charged once, before the read is issued, so a read the filesystem
         // then fails is counted, and whether or not every record it covers is
         // then parsed.
-        self.count_read(span_len, 0);
+        self.count_request(span_len);
         let Ok(span) = crate::file::read_exact(file.as_ref(), span_start, span_len) else {
             return;
         };
@@ -356,7 +374,7 @@ impl<'a> Accessor<'a> {
             // whether or not the record is then accepted.
             let mut decoded = 0;
             let parsed = reader.parse_record(key, &vhandle, &record, &mut decoded);
-            self.count_read(0, decoded);
+            self.count_decoded(decoded);
             if let Ok(value) = parsed {
                 // Checked BEFORE inserting, against the full weight the cache
                 // charges (key as well as value), and against the DECODED

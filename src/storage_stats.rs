@@ -6,7 +6,8 @@
 //!
 //! Computed from the live version's table + blob-file metadata plus one
 //! size-stat per live file (the same accounting `Tree::create_checkpoint`
-//! uses), so it never touches the data blocks. See
+//! uses), so it never touches the data blocks. The blob reference figures also
+//! read each table's blob-link section, once: the table keeps it after. See
 //! [`crate::AbstractTree::storage_stats`].
 
 use crate::version::Version;
@@ -113,6 +114,544 @@ pub struct StorageStats {
 
     /// Coarse storage state.
     pub status: StorageStatus,
+
+    /// Blob files the tree's tables reference, and how many of them a scan
+    /// interleaves where their key spans overlap most, across every level. All
+    /// zero for a tree that does not separate values.
+    pub blob_references: BlobReferenceStats,
+}
+
+/// How scattered the blob values behind a set of tables are: a table, a level,
+/// or the whole tree.
+///
+/// The two figures answer different questions and must not be read as one.
+/// [`Self::count`] is how many blob files are referenced at all; thirty-two
+/// files each holding the values of one consecutive key range give a count of
+/// 32 while a scan still reads one file at a time. [`Self::depth`] is how many
+/// of those files a scan has to interleave where their key spans overlap most.
+#[must_use]
+#[derive(Copy, Clone, Debug, Default, Eq, PartialEq)]
+pub struct BlobReferenceStats {
+    /// Distinct blob files referenced (fan-out). A statistic, not a measure
+    /// of locality.
+    pub count: u64,
+    /// The largest number of distinct blob files whose referenced key spans
+    /// cover one key: an estimate of how many files a range scan through
+    /// that key interleaves.
+    ///
+    /// An estimate from key spans alone. A span runs from the first to the
+    /// last key that references its file, so keys inside it that point
+    /// elsewhere still count as covered; a restricted table still reports the
+    /// spans of the whole table it was cut from. The figure cannot see the
+    /// block cache, how reads coalesce, or that two logical reads may land in
+    /// one physical one: it is what a locality trigger can act on, and the
+    /// blob-file reads of a scan are what show whether acting paid off.
+    pub depth: u64,
+}
+
+/// Blob reference count and depth over the given tables' links. The tables
+/// must share one comparator (one tree's).
+///
+/// # Errors
+///
+/// When a table's `linked_blob_files` section cannot be read or parsed.
+pub(crate) fn blob_reference_stats<'a>(
+    tables: impl IntoIterator<Item = &'a crate::table::Table>,
+) -> crate::Result<BlobReferenceStats> {
+    let mut comparator = None;
+    let mut spans = Vec::new();
+    collect_spans(tables, &mut comparator, &mut spans)?;
+    Ok(comparator.map_or_else(BlobReferenceStats::default, |cmp| {
+        span_stats(&mut spans, cmp.as_ref())
+    }))
+}
+
+/// Per blob file the tables reference, the depth where its key spans overlap
+/// most: the largest number of distinct files covering one key inside its
+/// spans. A file whose figure stays within a depth limit does not take part in
+/// any region that exceeds it. Ordered by file id; empty for tables without
+/// blob links.
+///
+/// # Errors
+///
+/// When a table's `linked_blob_files` section cannot be read or parsed.
+pub(crate) fn blob_file_depths<'a>(
+    tables: impl IntoIterator<Item = &'a crate::table::Table>,
+) -> crate::Result<Vec<(crate::vlog::BlobFileId, u64)>> {
+    let mut comparator = None;
+    let mut spans = Vec::new();
+    collect_spans(tables, &mut comparator, &mut spans)?;
+    Ok(comparator.map_or_else(Vec::new, |cmp| span_depths(&mut spans, cmp.as_ref())))
+}
+
+/// [`blob_file_depths`] over `(blob file, first key, last key)` spans ordered
+/// by `cmp`. Sorts `spans` in place.
+fn span_depths(
+    spans: &mut [Span<'_>],
+    cmp: &dyn crate::comparator::UserComparator,
+) -> Vec<(crate::vlog::BlobFileId, u64)> {
+    let (merged, _) = merge_spans(spans, cmp);
+
+    // The open count after each event, and where each span starts and ends in
+    // that sequence: a span's figure is the largest open count between its
+    // start and its end. Answered by a range-maximum table, so a deeply
+    // interleaved merge costs O(n log n) rather than a pass over every open
+    // span at every start.
+    let events = sweep_events(&merged, cmp);
+    let mut open_after = Vec::with_capacity(events.len());
+    let mut bounds = alloc::vec![(0usize, 0usize); merged.len()];
+    let mut open = 0u64;
+    for (position, &(_, is_end, index)) in events.iter().enumerate() {
+        if let Some(bound) = bounds.get_mut(index) {
+            if is_end {
+                open -= 1;
+                bound.1 = position;
+            } else {
+                open += 1;
+                bound.0 = position;
+            }
+        }
+        open_after.push(open);
+    }
+    let range_max = RangeMax::new(open_after);
+
+    // `merged` is sorted by file, so one pass folds a file's spans together.
+    // A span's end event sorts after its start, so its open counts are those
+    // from its start up to just before its end.
+    let mut per_file: Vec<(crate::vlog::BlobFileId, u64)> = Vec::new();
+    for ((id, _, _), (start, end)) in merged.iter().zip(bounds) {
+        debug_assert!(end > start, "a span ends after it starts");
+        let depth = range_max.max(start, end - 1);
+        match per_file.last_mut() {
+            Some((last, value)) if last == id => *value = (*value).max(depth),
+            _ => per_file.push((*id, depth)),
+        }
+    }
+    per_file
+}
+
+/// Maximum over any range of a fixed sequence in O(1), after an
+/// O(n log n) build: `levels[k][i]` is the maximum of `2^k` values from `i`.
+struct RangeMax {
+    levels: Vec<Vec<u64>>,
+}
+
+impl RangeMax {
+    fn new(values: Vec<u64>) -> Self {
+        let mut levels = alloc::vec![values];
+        let mut width = 1;
+        // Level `k` holds `n - 2^k + 1` maxima, so level `k + 1` exists while
+        // `n >= 2^(k + 1)`: while the current level is longer than its width.
+        while let Some(previous) = levels.last()
+            && previous.len() > width
+        {
+            let next: Vec<u64> = previous
+                .iter()
+                .zip(previous.iter().skip(width))
+                .map(|(a, b)| (*a).max(*b))
+                .collect();
+            levels.push(next);
+            width *= 2;
+        }
+        Self { levels }
+    }
+
+    /// The maximum of the values at `from..=to`, `from <= to`.
+    fn max(&self, from: usize, to: usize) -> u64 {
+        debug_assert!(from <= to, "an empty range has no maximum");
+        let len = to - from + 1;
+        let level = (usize::BITS - 1 - len.leading_zeros()) as usize;
+        let Some(values) = self.levels.get(level) else {
+            return 0;
+        };
+        // `2^level <= len`, so the second window starts at or after `from`.
+        let right = to + 1 - (1 << level);
+        let left = values.get(from).copied().unwrap_or(0);
+        left.max(values.get(right).copied().unwrap_or(0))
+    }
+}
+
+/// Chooses which of `ranked` to relocate along with `fixed`, best first while
+/// their cost fits `budget`. A file is chosen only when its spans in `tables`
+/// overlap those of another relocated file of its group, so relocating it
+/// merges it with something: either one already relocated, or the cheapest
+/// file it overlaps, chosen with it when both fit.
+///
+/// `fixed` is `(file, group)`, sorted by file id, relocated whatever the
+/// choice. `ranked` is `(file, group, cost)`, best first, disjoint from
+/// `fixed`. Returns whether each of `ranked` is chosen, and the cost spent.
+///
+/// # Errors
+///
+/// When a table's `linked_blob_files` section cannot be read or parsed.
+pub(crate) fn pick_overlapping_blob_files<'a>(
+    tables: impl IntoIterator<Item = &'a crate::table::Table>,
+    fixed: &[(crate::vlog::BlobFileId, usize)],
+    ranked: &[(crate::vlog::BlobFileId, usize, u64)],
+    budget: u64,
+) -> crate::Result<(Vec<bool>, u64)> {
+    let mut comparator = None;
+    let mut spans = Vec::new();
+    collect_spans(tables, &mut comparator, &mut spans)?;
+    Ok(match comparator {
+        Some(cmp) => pick_overlapping(&mut spans, fixed, ranked, budget, cmp.as_ref()),
+        None => (alloc::vec![false; ranked.len()], 0),
+    })
+}
+
+/// How a relocation plan takes a file: relocated anyway, in a group, or a
+/// candidate at a rank.
+#[derive(Clone, Copy)]
+enum Role {
+    Fixed(usize),
+    Ranked(usize),
+}
+
+/// [`pick_overlapping_blob_files`] over `(blob file, first key, last key)`
+/// spans ordered by `cmp`. Drops the spans of other files and sorts the rest.
+fn pick_overlapping(
+    spans: &mut Vec<Span<'_>>,
+    fixed: &[(crate::vlog::BlobFileId, usize)],
+    ranked: &[(crate::vlog::BlobFileId, usize, u64)],
+    budget: u64,
+    cmp: &dyn crate::comparator::UserComparator,
+) -> (Vec<bool>, u64) {
+    let mut roles: Vec<(crate::vlog::BlobFileId, Role)> = fixed
+        .iter()
+        .map(|&(id, group)| (id, Role::Fixed(group)))
+        .chain(
+            ranked
+                .iter()
+                .enumerate()
+                .map(|(rank, &(id, _, _))| (id, Role::Ranked(rank))),
+        )
+        .collect();
+    roles.sort_unstable_by_key(|&(id, _)| id);
+    let role_of = |id: crate::vlog::BlobFileId| {
+        roles
+            .binary_search_by_key(&id, |&(file, _)| file)
+            .ok()
+            .and_then(|at| roles.get(at))
+            .map(|&(_, role)| role)
+    };
+    spans.retain(|&(id, _, _)| role_of(id).is_some());
+    let (merged, _) = merge_spans(spans, cmp);
+    let events = sweep_events(&merged, cmp);
+    let positions = events.len();
+
+    // Where each span starts and ends in the sweep. Where spans meet at one
+    // key, the start sorts first, so two spans overlap exactly when each
+    // starts before the other ends. A file's merged spans never overlap each
+    // other.
+    let mut bounds = alloc::vec![(0usize, 0usize); merged.len()];
+    for (position, &(_, is_end, index)) in events.iter().enumerate() {
+        if let Some(bound) = bounds.get_mut(index) {
+            if is_end {
+                bound.1 = position;
+            } else {
+                bound.0 = position;
+            }
+        }
+    }
+    let group_and_rank = |index: usize| {
+        let role = merged.get(index).and_then(|&(id, _, _)| role_of(id))?;
+        Some(match role {
+            Role::Fixed(group) => (group, None),
+            Role::Ranked(rank) => (ranked.get(rank)?.1, Some(rank)),
+        })
+    };
+    let groups = fixed
+        .iter()
+        .map(|&(_, group)| group)
+        .chain(ranked.iter().map(|&(_, group, _)| group))
+        .max()
+        .map_or(0, |group| group + 1);
+    let mut spans_of: Vec<Vec<(usize, usize)>> = alloc::vec![Vec::new(); ranked.len()];
+    for (index, &bound) in bounds.iter().enumerate() {
+        if let Some((_, Some(rank))) = group_and_rank(index)
+            && let Some(own) = spans_of.get_mut(rank)
+        {
+            own.push(bound);
+        }
+    }
+
+    // The cheapest candidate of another file each candidate overlaps, in one
+    // sweep: when a span ends, the spans of its group that started before
+    // that and end after its start are the ones it overlaps. Each span enters
+    // its group's index as it starts, keyed by its end; positions count down
+    // so the spans ending after a start form a prefix.
+    let mut partner: Vec<Option<(u64, usize)>> = alloc::vec![None; ranked.len()];
+    let mut started: Vec<PrefixCheapest> = (0..groups)
+        .map(|_| PrefixCheapest::new(positions))
+        .collect();
+    for &(_, is_end, index) in &events {
+        let Some((group, Some(rank))) = group_and_rank(index) else {
+            continue;
+        };
+        let (Some(&(start, end)), Some(&(_, _, cost)), Some(index_of_group)) =
+            (bounds.get(index), ranked.get(rank), started.get_mut(group))
+        else {
+            continue;
+        };
+        if is_end {
+            let found = index_of_group
+                .before(positions - 1 - start)
+                .best_except(rank);
+            if let (Some(found), Some(best)) = (found, partner.get_mut(rank))
+                && best.is_none_or(|best| found < best)
+            {
+                *best = Some(found);
+            }
+        } else {
+            index_of_group.add(positions - 1 - end, (cost, rank));
+        }
+    }
+
+    // Best first: a candidate joins when a relocated span of its group
+    // overlaps its own, which the relocated spans' largest end among those
+    // starting before its end tells; otherwise it joins together with its
+    // cheapest partner when both fit.
+    let mut relocated: Vec<PrefixMax> = (0..groups).map(|_| PrefixMax::new(positions)).collect();
+    for (index, &(start, end)) in bounds.iter().enumerate() {
+        if let Some((group, None)) = group_and_rank(index)
+            && let Some(tree) = relocated.get_mut(group)
+        {
+            tree.raise(start, end);
+        }
+    }
+    let mut chosen = alloc::vec![false; ranked.len()];
+    let mut spent = 0u64;
+    for (rank, &(_, group, cost)) in ranked.iter().enumerate() {
+        // Costs are sums of on-disk sizes, bounded by filesystem capacity.
+        if chosen.get(rank) != Some(&false) || spent + cost > budget {
+            continue;
+        }
+        let own = spans_of.get(rank).map_or(&[][..], Vec::as_slice);
+        let joins = relocated
+            .get(group)
+            .is_some_and(|tree| own.iter().any(|&(start, end)| tree.max_before(end) > start));
+        let with = if joins {
+            None
+        } else {
+            match partner.get(rank).copied().flatten() {
+                Some((partner_cost, partner_rank)) if spent + cost + partner_cost <= budget => {
+                    Some(partner_rank)
+                }
+                _ => continue,
+            }
+        };
+        for pick in core::iter::once(rank).chain(with) {
+            let (Some(flag), Some(&(_, _, pick_cost)), Some(tree)) = (
+                chosen.get_mut(pick),
+                ranked.get(pick),
+                relocated.get_mut(group),
+            ) else {
+                continue;
+            };
+            *flag = true;
+            spent += pick_cost;
+            for &(start, end) in spans_of.get(pick).map_or(&[][..], Vec::as_slice) {
+                tree.raise(start, end);
+            }
+        }
+    }
+    (chosen, spent)
+}
+
+/// Largest value over any prefix of positions, values only ever raised.
+struct PrefixMax(Vec<usize>);
+
+impl PrefixMax {
+    fn new(positions: usize) -> Self {
+        Self(alloc::vec![0; positions])
+    }
+
+    /// Raises position `at` to at least `value`.
+    fn raise(&mut self, at: usize, value: usize) {
+        let mut node = at + 1;
+        while let Some(slot) = self.0.get_mut(node - 1) {
+            *slot = (*slot).max(value);
+            node += node & node.wrapping_neg();
+        }
+    }
+
+    /// Largest value at positions `..before`; zero when there is none.
+    fn max_before(&self, before: usize) -> usize {
+        let mut node = before;
+        let mut max = 0;
+        while node > 0 {
+            if let Some(&value) = self.0.get(node - 1) {
+                max = max.max(value);
+            }
+            node &= node - 1;
+        }
+        max
+    }
+}
+
+/// The two cheapest `(cost, rank)` offers of distinct ranks.
+#[derive(Clone, Copy, Default)]
+struct TwoCheapest([Option<(u64, usize)>; 2]);
+
+impl TwoCheapest {
+    fn add(&mut self, offer: (u64, usize)) {
+        let [first, second] = self.0;
+        let mut all = [first, second, Some(offer)];
+        all.sort_unstable_by_key(|offer| offer.unwrap_or((u64::MAX, usize::MAX)));
+        let mut kept = [None; 2];
+        let mut slots = kept.iter_mut();
+        let mut first_rank = None;
+        for offer in all.into_iter().flatten() {
+            if first_rank == Some(offer.1) {
+                continue;
+            }
+            let Some(slot) = slots.next() else {
+                break;
+            };
+            first_rank.get_or_insert(offer.1);
+            *slot = Some(offer);
+        }
+        self.0 = kept;
+    }
+
+    /// The cheapest offer of a rank other than `rank`.
+    fn best_except(&self, rank: usize) -> Option<(u64, usize)> {
+        self.0.into_iter().flatten().find(|offer| offer.1 != rank)
+    }
+}
+
+/// [`TwoCheapest`] over any prefix of positions, offers only ever added.
+struct PrefixCheapest(Vec<TwoCheapest>);
+
+impl PrefixCheapest {
+    fn new(positions: usize) -> Self {
+        Self(alloc::vec![TwoCheapest::default(); positions])
+    }
+
+    fn add(&mut self, at: usize, offer: (u64, usize)) {
+        let mut node = at + 1;
+        while let Some(slot) = self.0.get_mut(node - 1) {
+            slot.add(offer);
+            node += node & node.wrapping_neg();
+        }
+    }
+
+    /// The offers at positions `..before`.
+    fn before(&self, before: usize) -> TwoCheapest {
+        let mut node = before;
+        let mut out = TwoCheapest::default();
+        while node > 0 {
+            if let Some(slot) = self.0.get(node - 1) {
+                for offer in slot.0.into_iter().flatten() {
+                    out.add(offer);
+                }
+            }
+            node &= node - 1;
+        }
+        out
+    }
+}
+
+/// A `(blob file, first key, last key)` span referenced from a table.
+type Span<'k> = (
+    crate::vlog::BlobFileId,
+    &'k crate::UserKey,
+    &'k crate::UserKey,
+);
+
+/// Appends every blob-link span of `tables` and remembers their comparator.
+fn collect_spans<'a>(
+    tables: impl IntoIterator<Item = &'a crate::table::Table>,
+    comparator: &mut Option<crate::comparator::SharedComparator>,
+    spans: &mut Vec<Span<'a>>,
+) -> crate::Result<()> {
+    for table in tables {
+        comparator.get_or_insert_with(|| table.comparator.clone());
+        spans.extend(
+            table
+                .blob_links()?
+                .iter()
+                .map(|link| (link.blob_file_id, &link.first_key, &link.last_key)),
+        );
+    }
+    Ok(())
+}
+
+/// [`BlobReferenceStats`] of `(blob file, first key, last key)` spans ordered
+/// by `cmp`. Spans of one file (from different tables) are merged where they
+/// overlap, so the sweep counts distinct files, not references. Sorts `spans`
+/// in place.
+fn span_stats(
+    spans: &mut [Span<'_>],
+    cmp: &dyn crate::comparator::UserComparator,
+) -> BlobReferenceStats {
+    let (merged, count) = merge_spans(spans, cmp);
+    let (mut open, mut depth) = (0u64, 0u64);
+    for (_, is_end, _) in sweep_events(&merged, cmp) {
+        if is_end {
+            open -= 1;
+        } else {
+            open += 1;
+            depth = depth.max(open);
+        }
+    }
+    BlobReferenceStats { count, depth }
+}
+
+/// Merges the overlapping spans of each file, sorted by file then first key,
+/// and counts the distinct files. Sorts `spans` in place.
+fn merge_spans<'k>(
+    spans: &mut [Span<'k>],
+    cmp: &dyn crate::comparator::UserComparator,
+) -> (Vec<Span<'k>>, u64) {
+    use core::cmp::Ordering;
+
+    // A span is closed at both ends. A recorded span is always ordered; one
+    // that is not is taken by its bounds rather than as an empty span.
+    for span in spans.iter_mut() {
+        if cmp.compare(span.1, span.2) == Ordering::Greater {
+            core::mem::swap(&mut span.1, &mut span.2);
+        }
+    }
+    spans.sort_by(|a, b| a.0.cmp(&b.0).then_with(|| cmp.compare(a.1, b.1)));
+
+    // Sorted by file, so each change of file is one more distinct file.
+    let mut merged: Vec<Span<'k>> = Vec::with_capacity(spans.len());
+    let mut count = 0u64;
+    for &span in spans.iter() {
+        match merged.last_mut() {
+            Some((id, _, last))
+                if *id == span.0 && cmp.compare(span.1, last) != Ordering::Greater =>
+            {
+                if cmp.compare(span.2, last) == Ordering::Greater {
+                    *last = span.2;
+                }
+            }
+            last => {
+                if last.is_none_or(|(id, _, _)| *id != span.0) {
+                    count += 1;
+                }
+                merged.push(span);
+            }
+        }
+    }
+    (merged, count)
+}
+
+/// The start and end events of `merged`, as `(key, is end, span index)` in
+/// key order. Starts come before ends at an equal key: spans that meet at one
+/// key overlap.
+fn sweep_events<'k>(
+    merged: &[Span<'k>],
+    cmp: &dyn crate::comparator::UserComparator,
+) -> Vec<(&'k crate::UserKey, bool, usize)> {
+    let mut events: Vec<(&'k crate::UserKey, bool, usize)> = merged
+        .iter()
+        .enumerate()
+        .flat_map(|(index, &(_, first, last))| [(first, false, index), (last, true, index)])
+        .collect();
+    events.sort_by(|a, b| cmp.compare(a.0, b.0).then(a.1.cmp(&b.1)));
+    events
 }
 
 /// Approximate size of a key range, estimated from SST block-index offsets and
@@ -163,6 +702,9 @@ pub struct SegmentStats {
     /// Unix seconds of the segment's most recent data-consulting read, or `0` if
     /// never read (or on a no-std build, which keeps no clock).
     pub last_access_secs: u64,
+    /// Blob files the segment references, and how many of them a scan through
+    /// it interleaves where their key spans overlap most.
+    pub blob_references: BlobReferenceStats,
 }
 
 /// Per-LSM-level size + entry aggregates with the contributing segments, for
@@ -170,7 +712,8 @@ pub struct SegmentStats {
 /// to demote, EC-encode, or migrate).
 ///
 /// Cheap to read: derived from version metadata plus one file-size stat per
-/// segment, never a data-block scan. The per-level totals reconcile with the
+/// segment, never a data-block scan (the blob reference figures read each
+/// segment's blob-link section once). The per-level totals reconcile with the
 /// tree-level [`StorageStats`]: summed across levels they equal the SST portion
 /// of [`StorageStats::used_bytes`] and [`StorageStats::item_count`] (blob files
 /// are tracked separately).
@@ -190,6 +733,9 @@ pub struct LevelStats {
     /// Most recent point-read probe across the level's segments, in unix
     /// seconds, or `0` if none was ever read.
     pub last_access_secs: u64,
+    /// Blob files the level's segments reference, and how many of them a scan
+    /// through the level interleaves where their key spans overlap most.
+    pub blob_references: BlobReferenceStats,
     /// Per-segment breakdown, in level (run / table) order.
     pub segments: Vec<SegmentStats>,
 }
@@ -261,7 +807,8 @@ pub trait StorageStatistics {
     ///
     /// # Errors
     ///
-    /// Returns an error if a live file's size cannot be stat-ed.
+    /// Returns an error if a live file's size cannot be stat-ed, or a table's
+    /// blob-link section cannot be read or parsed.
     fn storage_stats(&self) -> crate::Result<StorageStats>;
 
     /// Per-LSM-level and per-segment size + entry-count stats, for tiering and
@@ -269,7 +816,9 @@ pub trait StorageStatistics {
     /// to demote, EC-encode, or migrate).
     ///
     /// Cheap: derived from the live version's metadata plus one file-size stat
-    /// per segment (no data-block scan). The per-level totals reconcile with
+    /// per segment (no data-block scan); in a tree that separates values, each
+    /// segment's blob-link section is also read once, then kept. The per-level
+    /// totals reconcile with
     /// [`storage_stats`](Self::storage_stats): summed across levels they equal
     /// the SST portion of [`StorageStats::used_bytes`] and
     /// [`StorageStats::item_count`].
@@ -297,7 +846,8 @@ pub trait StorageStatistics {
     ///
     /// # Errors
     ///
-    /// Returns an error if a segment's file size cannot be stat-ed.
+    /// Returns an error if a segment's file size cannot be stat-ed, or its
+    /// blob-link section cannot be read or parsed.
     fn level_segment_stats(&self) -> crate::Result<Vec<LevelStats>>;
 
     /// Estimated bytes pending compaction under `strategy`: on-disk data above
@@ -499,7 +1049,8 @@ pub(crate) fn full_compaction_demand_bytes(version: &Version) -> crate::Result<u
 ///
 /// # Errors
 ///
-/// Returns an error if a live table or blob file's size cannot be stat-ed.
+/// Returns an error if a live table or blob file's size cannot be stat-ed, or a
+/// table's blob-link section cannot be read or parsed.
 pub(crate) fn compute_storage_stats(
     version: &Version,
     is_compacting: bool,
@@ -608,17 +1159,20 @@ pub(crate) fn compute_storage_stats(
         avg_value_bytes,
         reclaimable_bytes_estimate,
         status,
+        blob_references: blob_reference_stats(version.iter_tables())?,
     })
 }
 
 /// Computes per-LSM-level and per-segment size + entry stats from a version.
 ///
 /// Cost is O(levels x segments) plus one file-size stat per segment (the same
-/// stat [`compute_storage_stats`] already performs); it never reads a data block.
+/// stat [`compute_storage_stats`] already performs), and the first time per
+/// segment a read of its blob-link section; it never reads a data block.
 ///
 /// # Errors
 ///
-/// Returns an error if a segment's file size cannot be stat-ed.
+/// Returns an error if a segment's file size cannot be stat-ed or its blob-link
+/// section cannot be read.
 pub(crate) fn compute_level_segment_stats(version: &Version) -> crate::Result<Vec<LevelStats>> {
     use core::sync::atomic::Ordering::Relaxed;
     let mut levels = Vec::with_capacity(version.level_count());
@@ -628,8 +1182,20 @@ pub(crate) fn compute_level_segment_stats(version: &Version) -> crate::Result<Ve
         let mut item_count = 0u64;
         let mut reads = 0u64;
         let mut last_access_secs = 0u64;
+        // Each table's spans are collected once: they give its own figures,
+        // then join the level's, which the level sweep needs all together.
+        let mut comparator = None;
+        let mut level_spans = Vec::new();
+        let mut table_spans = Vec::new();
         for run in run_group.iter() {
             for table in run.iter() {
+                collect_spans([table], &mut comparator, &mut table_spans)?;
+                let blob_references = comparator
+                    .as_ref()
+                    .map_or_else(BlobReferenceStats::default, |cmp| {
+                        span_stats(&mut table_spans, cmp.as_ref())
+                    });
+                level_spans.append(&mut table_spans);
                 // Physical file size, NOT m.file_size (which undercounts), to
                 // reconcile with the tree-level `used_bytes` — including a
                 // restricted table's live restriction sidecar (the same basis
@@ -653,6 +1219,7 @@ pub(crate) fn compute_level_segment_stats(version: &Version) -> crate::Result<Ve
                     item_count: items,
                     reads: seg_reads,
                     last_access_secs: seg_access,
+                    blob_references,
                 });
             }
         }
@@ -663,6 +1230,9 @@ pub(crate) fn compute_level_segment_stats(version: &Version) -> crate::Result<Ve
             item_count,
             reads,
             last_access_secs,
+            blob_references: comparator.map_or_else(BlobReferenceStats::default, |cmp| {
+                span_stats(&mut level_spans, cmp.as_ref())
+            }),
             segments,
         });
     }

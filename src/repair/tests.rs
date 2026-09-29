@@ -9262,7 +9262,14 @@ fn repair_drops_a_blob_referenced_only_by_a_lineage_excluded_output() -> crate::
         let mut w = crate::table::Writer::new(tables.join("2"), 2, 0, Arc::clone(&fs_dyn))?
             .use_recency(Some(0))
             .use_lineage(Some(vec![0, 1]));
-        w.link_blob_file(7, 1, 300, u64::from(on_disk_size));
+        w.link_blob_file(crate::table::writer::LinkedFile {
+            blob_file_id: 7,
+            len: 1,
+            bytes: 300,
+            on_disk_bytes: u64::from(on_disk_size),
+            first_key: b"k".into(),
+            last_key: b"k".into(),
+        });
         w.write(InternalValue::from_components(
             b"k".to_vec(),
             indirection.encode_into_vec(),
@@ -12211,7 +12218,14 @@ fn a_corrupt_reference_section_does_not_abort_the_blob_repair() -> crate::Result
     };
     let checksum = {
         let mut w = crate::table::Writer::new(tables.join("1"), 1, 0, Arc::clone(&fs_dyn))?;
-        w.link_blob_file(7, 1, 300, u64::from(on_disk_size));
+        w.link_blob_file(crate::table::writer::LinkedFile {
+            blob_file_id: 7,
+            len: 1,
+            bytes: 300,
+            on_disk_bytes: u64::from(on_disk_size),
+            first_key: b"m".into(),
+            last_key: b"m".into(),
+        });
         let ind = crate::blob_tree::handle::BlobIndirection {
             vhandle: crate::vlog::ValueHandle {
                 blob_file_id: 7,
@@ -12320,7 +12334,14 @@ fn a_corrupt_reference_section_is_never_published_as_standard() -> crate::Result
     };
     let checksum = {
         let mut w = crate::table::Writer::new(tables.join("1"), 1, 0, Arc::clone(&fs_dyn))?;
-        w.link_blob_file(7, 1, 300, u64::from(on_disk_size));
+        w.link_blob_file(crate::table::writer::LinkedFile {
+            blob_file_id: 7,
+            len: 1,
+            bytes: 300,
+            on_disk_bytes: u64::from(on_disk_size),
+            first_key: b"m".into(),
+            last_key: b"m".into(),
+        });
         let ind = crate::blob_tree::handle::BlobIndirection {
             vhandle: crate::vlog::ValueHandle {
                 blob_file_id: 7,
@@ -12437,8 +12458,22 @@ fn blob_salvage_never_allocates_a_missing_referenced_id() -> crate::Result<()> {
     // pre-fix allocator would hand the salvage replacement.
     {
         let mut w = crate::table::Writer::new(tables.join("0"), 0, 0, Arc::clone(&fs_dyn))?;
-        w.link_blob_file(0, 1, 300, u64::from(on_disk0));
-        w.link_blob_file(1, 1, 300, 100);
+        w.link_blob_file(crate::table::writer::LinkedFile {
+            blob_file_id: 0,
+            len: 1,
+            bytes: 300,
+            on_disk_bytes: u64::from(on_disk0),
+            first_key: b"a".into(),
+            last_key: b"a".into(),
+        });
+        w.link_blob_file(crate::table::writer::LinkedFile {
+            blob_file_id: 1,
+            len: 1,
+            bytes: 300,
+            on_disk_bytes: 100,
+            first_key: b"m".into(),
+            last_key: b"m".into(),
+        });
         let ind0 = crate::blob_tree::handle::BlobIndirection {
             vhandle: crate::vlog::ValueHandle {
                 blob_file_id: 0,
@@ -15270,7 +15305,14 @@ fn repair_rejects_an_exhausted_blob_id_space() -> crate::Result<()> {
     };
     {
         let mut w = crate::table::Writer::new(tables.join("0"), 0, 0, Arc::clone(&fs_dyn))?;
-        w.link_blob_file(u64::MAX, 1, 300, u64::from(on_disk_size));
+        w.link_blob_file(crate::table::writer::LinkedFile {
+            blob_file_id: u64::MAX,
+            len: 1,
+            bytes: 300,
+            on_disk_bytes: u64::from(on_disk_size),
+            first_key: b"k".into(),
+            last_key: b"k".into(),
+        });
         w.write(InternalValue::from_components(
             b"k".to_vec(),
             indirection.encode_into_vec(),

@@ -48,6 +48,7 @@ fn drain_blobs_simple() -> crate::Result<()> {
                 on_disk_size: 0,
             },
         },
+        crate::comparator::default_comparator().as_ref(),
         &mut |_, _| {},
     )?;
 
@@ -79,11 +80,49 @@ fn drain_blobs_multiple_keys() -> crate::Result<()> {
                 on_disk_size: 0,
             },
         },
+        crate::comparator::default_comparator().as_ref(),
         &mut |_, _| {},
     )?;
 
     assert_eq!(entry(0, b"e", 0)?, iter.next().unwrap()?);
 
+    Ok(())
+}
+
+/// Under a comparator that reverses byte order the scan runs from high keys
+/// to low: draining towards a lower key passes higher ones, which sort before
+/// it in the tree's order.
+#[test]
+fn drain_blobs_follows_the_tree_comparator() -> crate::Result<()> {
+    struct Reverse;
+    impl crate::comparator::UserComparator for Reverse {
+        fn name(&self) -> &'static str {
+            "reverse"
+        }
+        fn compare(&self, a: &[u8], b: &[u8]) -> core::cmp::Ordering {
+            b.cmp(a)
+        }
+    }
+
+    let mut iter = [entry(0, b"e", 0), entry(0, b"c", 1), entry(0, b"a", 2)]
+        .into_iter()
+        .peekable();
+    drain_blobs(
+        &mut iter,
+        b"a",
+        &BlobIndirection {
+            size: 0,
+            vhandle: ValueHandle {
+                blob_file_id: 0,
+                offset: 2,
+                on_disk_size: 0,
+            },
+        },
+        &Reverse,
+        &mut |_, _| {},
+    )?;
+
+    assert_eq!(entry(0, b"a", 2)?, iter.next().unwrap()?);
     Ok(())
 }
 
@@ -111,6 +150,7 @@ fn drain_blobs_does_not_advance_the_frontier_past_a_resynced_frame() -> crate::R
                 on_disk_size: 0,
             },
         },
+        crate::comparator::default_comparator().as_ref(),
         &mut |_, frame_end| max_recorded = max_recorded.max(frame_end),
     )?;
 

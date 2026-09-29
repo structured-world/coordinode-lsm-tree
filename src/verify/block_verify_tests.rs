@@ -1540,8 +1540,8 @@ fn verify_sst_file_flags_a_corrupt_blob_link_count() {
     };
     drop(tree);
 
-    // Corrupt the section's u32 count prefix: the payload length no longer
-    // matches `4 + count * 32`.
+    // Corrupt the section's u32 count prefix: the declared records no longer
+    // end at the section's end.
     let pos = {
         let mut f = std::fs::File::open(&sst_path).unwrap();
         let reader = crate::sfa::Reader::from_reader(&mut f).expect("SFA trailer reads");
@@ -1566,6 +1566,111 @@ fn verify_sst_file_flags_a_corrupt_blob_link_count() {
         )),
         "a corrupt blob-link count must fail the out-of-band walk, not be \
          skipped as an unchecked raw section: {report:?}",
+    );
+}
+
+/// The shape walk over a `linked_blob_files` section holding `bytes`.
+fn blob_link_shape(bytes: &[u8]) -> Option<String> {
+    use crate::fs::{Fs as _, FsOpenOptions};
+
+    let fs = crate::fs::MemFs::new();
+    let path = std::path::Path::new("/linked_blob_files");
+    {
+        let mut file = fs
+            .open(path, &FsOpenOptions::new().write(true).create(true))
+            .expect("create");
+        file.write_all(bytes).expect("write");
+    }
+    let file = fs
+        .open(path, &FsOpenOptions::new().read(true))
+        .expect("open");
+    let mut reader = std::io::BufReader::new(file);
+    let len = u64::try_from(bytes.len()).expect("test section fits u64");
+    raw_section_shape_error(&mut reader, b"linked_blob_files", 0, len).expect("in-memory read")
+}
+
+/// One record: 32 fixed bytes, then the first and last key, each behind its
+/// two-byte length.
+fn blob_link_record(first: &[u8], last: &[u8]) -> Vec<u8> {
+    let mut record = vec![0u8; crate::table::writer::LINKED_BLOB_FILE_FIXED_LEN];
+    for key in [first, last] {
+        let len = u16::try_from(key.len()).expect("test key fits u16");
+        record.extend_from_slice(&len.to_le_bytes());
+        record.extend_from_slice(key);
+    }
+    record
+}
+
+fn blob_link_section(count: u32, records: &[Vec<u8>]) -> Vec<u8> {
+    let mut section = count.to_le_bytes().to_vec();
+    for record in records {
+        section.extend_from_slice(record);
+    }
+    section
+}
+
+/// Records whose keys fill the section exactly pass the shape walk.
+#[test]
+fn blob_link_shape_accepts_records_that_fill_the_section() {
+    let records = [blob_link_record(b"a", b"m"), blob_link_record(b"", b"zz")];
+    assert_eq!(blob_link_shape(&blob_link_section(2, &records)), None);
+}
+
+/// Each way a record can overrun its section is named with the record that
+/// overran: the fixed fields, a key's length prefix, and the key bytes.
+#[test]
+fn blob_link_shape_names_the_record_that_runs_past_the_section() {
+    let record = blob_link_record(b"a", b"b");
+
+    // Fixed fields of the second record past the end.
+    let fixed = blob_link_shape(&blob_link_section(2, core::slice::from_ref(&record)));
+    assert!(
+        fixed
+            .as_deref()
+            .is_some_and(|r| r.contains("record 1 runs past")),
+        "{fixed:?}"
+    );
+
+    // The second record's fixed fields fit, the length of its first key does not.
+    let mut prefix = blob_link_section(2, core::slice::from_ref(&record));
+    prefix.extend_from_slice(&[0u8; crate::table::writer::LINKED_BLOB_FILE_FIXED_LEN + 1]);
+    let short = blob_link_shape(&prefix);
+    assert!(
+        short
+            .as_deref()
+            .is_some_and(|r| r.contains("record 1 runs past")),
+        "{short:?}"
+    );
+
+    // A key length that points past the section.
+    let mut long_key = blob_link_record(b"a", b"b");
+    let last_len_at = crate::table::writer::LINKED_BLOB_FILE_FIXED_LEN + 2 + 1;
+    long_key
+        .get_mut(last_len_at..last_len_at + 2)
+        .expect("last key length")
+        .copy_from_slice(&u16::MAX.to_le_bytes());
+    let past = blob_link_shape(&blob_link_section(1, &[long_key]));
+    assert!(
+        past.as_deref()
+            .is_some_and(|r| r.contains("record 0 runs past")),
+        "{past:?}"
+    );
+}
+
+/// Bytes left over after the declared records are a count that disagrees
+/// with the section, reported with how much the records took.
+#[test]
+fn blob_link_shape_rejects_bytes_past_the_declared_records() {
+    let record = blob_link_record(b"a", b"b");
+    let mut section = blob_link_section(1, core::slice::from_ref(&record));
+    section.push(0);
+    let reason = blob_link_shape(&section);
+    let taken = 4 + record.len();
+    assert!(
+        reason
+            .as_deref()
+            .is_some_and(|r| r.contains(&format!("({taken} bytes of records)"))),
+        "{reason:?}"
     );
 }
 

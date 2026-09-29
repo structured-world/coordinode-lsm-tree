@@ -2,6 +2,138 @@ use super::*;
 use crate::fs::StdFs;
 use test_log::test;
 
+/// The encoded bytes of a `linked_blob_files` section holding `links`, as the
+/// writer lays them out.
+fn encode_links(links: &[LinkedFile]) -> Vec<u8> {
+    let narrow = |n: usize| -> u64 {
+        let Ok(n) = u64::try_from(n) else {
+            panic!("{n} fits a u64");
+        };
+        n
+    };
+    let Ok(count) = u32::try_from(links.len()) else {
+        panic!("a test section holds few links");
+    };
+    let mut out = count.to_le_bytes().to_vec();
+    for link in links {
+        out.extend_from_slice(&link.blob_file_id.to_le_bytes());
+        out.extend_from_slice(&narrow(link.len).to_le_bytes());
+        out.extend_from_slice(&link.bytes.to_le_bytes());
+        out.extend_from_slice(&link.on_disk_bytes.to_le_bytes());
+        for key in [&link.first_key, &link.last_key] {
+            let Ok(len) = u16::try_from(key.len()) else {
+                panic!("a test key is short");
+            };
+            out.extend_from_slice(&len.to_le_bytes());
+            out.extend_from_slice(key);
+        }
+    }
+    out
+}
+
+fn sample_links() -> Vec<LinkedFile> {
+    vec![
+        LinkedFile {
+            blob_file_id: 3,
+            len: 2,
+            bytes: 200,
+            on_disk_bytes: 120,
+            first_key: b"apple".into(),
+            last_key: b"banana".into(),
+        },
+        LinkedFile {
+            blob_file_id: 9,
+            len: 1,
+            bytes: 50,
+            on_disk_bytes: 40,
+            first_key: b"cherry".into(),
+            last_key: b"cherry".into(),
+        },
+    ]
+}
+
+/// What the writer lays out, the parser reads back record for record.
+#[test]
+fn linked_blob_files_round_trip_with_their_key_spans() -> crate::Result<()> {
+    let links = sample_links();
+    let encoded = encode_links(&links);
+    assert_eq!(parse_linked_blob_files(&encoded)?, links);
+    Ok(())
+}
+
+/// The section size kept up to date as entries register is exactly the bytes
+/// the links encode to, whether a file's last key grows or shrinks, and none
+/// once the links are taken.
+#[test]
+fn linked_blob_files_track_their_section_len_as_entries_register() {
+    let mut linked = LinkedBlobFiles::default();
+    assert_eq!(linked.section_len(), 0);
+    for (file, key) in [
+        (3, "apple"),
+        (9, "banana-split"),
+        (3, "cherry-pie"),
+        (9, "date"),
+        (3, "elderberry"),
+        (5, "fig"),
+    ] {
+        linked.register(file, 10, 7, &UserKey::from(key.as_bytes()));
+        let links: Vec<LinkedFile> = linked.files.values().cloned().collect();
+        assert_eq!(linked.section_len(), encode_links(&links).len() as u64);
+    }
+    assert_eq!(linked.len(), 3);
+    assert_eq!(linked.take().count(), 3);
+    assert_eq!(linked.section_len(), 0);
+}
+
+/// The records must fill the section: bytes left past the last record mean
+/// the count was forged down (or the section grew), not a shorter list.
+#[test]
+fn linked_blob_files_reject_bytes_past_the_records() {
+    let mut encoded = encode_links(&sample_links());
+    encoded.extend_from_slice(&[0; 3]);
+    assert!(matches!(
+        parse_linked_blob_files(&encoded),
+        Err(crate::Error::InvalidHeader(
+            "linked_blob_files: bytes remain past the declared records"
+        ))
+    ));
+}
+
+/// A key length that reaches past the section is corrupt, not a key to read
+/// from whatever follows.
+#[test]
+fn linked_blob_files_reject_a_key_running_past_the_section() {
+    let mut encoded = encode_links(&sample_links());
+    let last_key_len_at = encoded.len() - b"cherry".len() - 2;
+    let Some(len) = encoded.get_mut(last_key_len_at..last_key_len_at + 2) else {
+        panic!("the last key's length is within the section");
+    };
+    len.copy_from_slice(&100u16.to_le_bytes());
+    assert!(matches!(
+        parse_linked_blob_files(&encoded),
+        Err(crate::Error::InvalidHeader(
+            "linked_blob_files: a key runs past the section"
+        ))
+    ));
+}
+
+/// A forged count far beyond what the bytes can hold fails before anything is
+/// reserved for it.
+#[test]
+fn linked_blob_files_reject_a_count_the_section_cannot_hold() {
+    let mut encoded = encode_links(&sample_links());
+    let Some(count) = encoded.get_mut(..4) else {
+        panic!("the count is within the section");
+    };
+    count.copy_from_slice(&u32::MAX.to_le_bytes());
+    assert!(matches!(
+        parse_linked_blob_files(&encoded),
+        Err(crate::Error::InvalidHeader(
+            "linked_blob_files: declared record count exceeds section size"
+        ))
+    ));
+}
+
 #[test]
 fn finish_rejects_a_delete_bitmap_without_a_zone_map() -> crate::Result<()> {
     // The positional mask resolves each block's start row from the zone map,

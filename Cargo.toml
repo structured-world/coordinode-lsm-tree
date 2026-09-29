@@ -339,6 +339,12 @@ path = "benches/blob_scan_prefetch.rs"
 required-features = []
 
 [[bench]]
+name = "blob_locality"
+harness = false
+path = "benches/blob_locality.rs"
+required-features = ["metrics"]
+
+[[bench]]
 name = "dict_ratio"
 harness = false
 path = "benches/dict_ratio.rs"

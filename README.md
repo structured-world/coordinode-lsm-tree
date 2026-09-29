@@ -57,7 +57,7 @@ tree.flush_active_memtable(0)?;
 - Single deletion tombstones (`remove_weak`).
 - Range tombstones (`delete_range` / `delete_prefix`).
 - Merge operators for commutative LSM operations.
-- Optional key-value separation (BlobTree) for large-value workloads with automatic garbage collection. Scans read their separated values ahead: where the upcoming values are neighbours in the blob file, which is the usual shape after a flush, their reads merge into one instead of one small read per value.
+- Optional key-value separation (BlobTree) for large-value workloads with automatic garbage collection. Scans read their separated values ahead: where the upcoming values are neighbours in the blob file, which is the usual shape after a flush, their reads merge into one instead of one small read per value. Storage statistics report how many blob files each table, level and the tree reference, and how deeply their key spans interleave; an opt-in compaction trigger rewrites deeply interleaved files in key order within a bounded I/O budget.
 
 ### Compaction
 
