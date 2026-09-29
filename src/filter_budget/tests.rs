@@ -937,6 +937,56 @@ fn a_width_its_framing_makes_dear_is_passed_over() {
     assert!(six <= budget);
 }
 
+/// Rewrites running together keep room for each other's later filters: a
+/// budget all their filters fit at the narrowest width does not let one take
+/// a wide filter first and push the other's past it.
+#[test]
+fn concurrent_plans_reserve_room_for_each_others_later_filters() {
+    use alloc::sync::Arc;
+    use core::ops::Bound::Unbounded;
+
+    const KEYS: usize = 4_000;
+    let framing = super::Framing::default();
+    let frame = |len: u64| framing.frame(len);
+    let narrow = estimate(KEYS, 6);
+    let wide = estimate(KEYS, 16);
+    let bound = frame(BloomConstructionPolicy::BitsPerKey(6.0).filter_size_bound(KEYS) as u64);
+    let budget = 4 * bound;
+    // One plan alone may take a wide filter first: its later one still fits.
+    assert!(frame(wide) + bound <= budget);
+    let advisor = crate::config::FilterAdvisor::new(budget).with_bits_per_key([6u8, 16].to_vec());
+    let state = Arc::new(super::FilterBudget::default());
+    let plan = || {
+        super::plan(
+            &advisor,
+            &state,
+            &[],
+            super::Rewrite {
+                keys: 2 * KEYS as u64,
+                ..super::Rewrite::default()
+            },
+            BloomConstructionPolicy::BitsPerKey(16.0),
+            None,
+        )
+        .unwrap_or_else(|| panic!("the advisor plans the filters"))
+    };
+    let (a, b) = (plan(), plan());
+
+    // A tries its first filter wide, then narrow; each plan then writes the
+    // rest narrow, taken whatever the budget says.
+    if !a.admit(Unbounded, KEYS, frame(wide), wide, &frame, false) {
+        assert!(a.admit(Unbounded, KEYS, frame(narrow), narrow, &frame, true));
+    }
+    assert!(b.admit(Unbounded, KEYS, frame(narrow), narrow, &frame, true));
+    assert!(b.admit(Unbounded, KEYS, frame(narrow), narrow, &frame, true));
+    assert!(a.admit(Unbounded, KEYS, frame(narrow), narrow, &frame, true));
+    assert!(
+        state.held() <= budget,
+        "{} filter bytes against {budget}",
+        state.held()
+    );
+}
+
 /// The over-budget state is logged once on entering it and once on leaving.
 #[test]
 fn the_over_budget_state_is_logged_on_entering_and_leaving() {

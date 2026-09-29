@@ -58,6 +58,14 @@ pub struct FilterBudget {
     /// Held while a plan checks the probe window and halves the counts, so
     /// rewrites planning together halve one crossing of it once.
     window: Mutex<()>,
+    /// The room each rewrite in progress keeps for its later filters at the
+    /// narrowest width, summed: a filter one rewrite admits leaves room for
+    /// the others' too.
+    reserved: AtomicU64,
+    /// Held while a filter is checked against the budget and taken into it,
+    /// and while a rewrite's reservation changes, so two rewrites cannot both
+    /// fit into one gap.
+    admission: Mutex<()>,
 }
 
 impl FilterBudget {
@@ -163,6 +171,9 @@ pub struct FilterSizing {
     /// Keys the filters this rewrite has built hold, which a count of all its
     /// keys learnt after the plan (see [`Self::expect_keys`]) is short of.
     admitted_keys: AtomicU64,
+    /// This rewrite's part of [`FilterBudget::reserved`]: the room it keeps
+    /// for the keys it has still to write filters for.
+    reservation: AtomicU64,
     /// The most keys a filter of this rewrite has held: the later filters are
     /// taken to be that large, not the size of the last partition of a table.
     typical_keys: AtomicU64,
@@ -555,7 +566,7 @@ pub fn plan(
     )]
     state.held.fetch_sub(replaced as i64, Relaxed);
 
-    Some(Arc::new(FilterSizing {
+    let sizing = Arc::new(FilterSizing {
         price,
         widths,
         fallback,
@@ -568,6 +579,7 @@ pub fn plan(
         partition_keys,
         pending_keys: AtomicU64::new(pending_keys),
         admitted_keys: AtomicU64::new(0),
+        reservation: AtomicU64::new(0),
         typical_keys: AtomicU64::new(0),
         table_keys: AtomicU64::new(0),
         inputs,
@@ -581,7 +593,11 @@ pub fn plan(
         framing,
         cursors: Mutex::new(alloc::vec![RangeCursor::default(); ranges]),
         state: Arc::clone(state),
-    }))
+    });
+    // The room for every filter this rewrite writes, reserved before any of
+    // them, so a rewrite admitting a filter first leaves it.
+    sizing.reserve_for(pending_keys);
+    Some(sizing)
 }
 
 impl FilterSizing {
@@ -865,8 +881,63 @@ impl FilterSizing {
         frame: &dyn Fn(u64) -> u64,
         last: bool,
     ) -> bool {
-        let keys = u64::try_from(n).unwrap_or(u64::MAX);
-        let per_filter = self.typical_keys.load(Relaxed).max(keys);
+        let n = u64::try_from(n).unwrap_or(u64::MAX);
+        let per_filter = self.typical_keys.load(Relaxed).max(n);
+        // The pending count bounds the rewrite's keys from above: a filter
+        // over more keys than it holds leaves none pending.
+        let later = self.pending_keys.load(Relaxed).saturating_sub(n);
+        let floor = self.floor(later, per_filter, frame);
+
+        let admission = self.state.admission.lock();
+        let used = self.state.held();
+        let mine = self.reservation.load(Relaxed);
+        // Every reservation changes under the admission lock, and this
+        // rewrite's is one part of the sum.
+        let others = self.state.reserved.load(Relaxed) - mine;
+        // Filters already over the budget leave no room at all.
+        let fits = bytes + floor + others <= self.budget.saturating_sub(used);
+        if !fits && !last {
+            return false;
+        }
+        // A table cannot hold 2^63 filter bytes, so neither can the sum.
+        #[expect(
+            clippy::cast_possible_wrap,
+            reason = "filter byte counts far below 2^63"
+        )]
+        self.state.held.fetch_add(bytes as i64, Relaxed);
+        self.set_reservation(mine, floor);
+        drop(admission);
+
+        self.leave(lower);
+        self.spent.fetch_add(bytes, Relaxed);
+        // The room kept for later filters is a reserve, not a limit. Whether
+        // the tree is over its budget follows the filters its versions
+        // publish, not the ones a rewrite is building, which it may never
+        // install.
+        if used + bytes > self.budget {
+            self.state.log_entering(used + bytes, self.budget);
+        }
+        self.take_pending(n);
+        self.admitted_keys.fetch_add(n, Relaxed);
+        self.typical_keys.fetch_max(n, Relaxed);
+        let mut spent = self.spent_estimate.load(Relaxed);
+        while let Err(actual) = self.spent_estimate.compare_exchange_weak(
+            spent,
+            (f64::from_bits(spent) + as_f64(estimated)).to_bits(),
+            Relaxed,
+            Relaxed,
+        ) {
+            spent = actual;
+        }
+        true
+    }
+
+    /// The room `later` keys still to come take at the narrowest width, in
+    /// filters of `per_filter` keys framed by `frame`.
+    fn floor(&self, later: u64, per_filter: u64, frame: &dyn Fn(u64) -> u64) -> u64 {
+        if later == 0 || per_filter == 0 {
+            return 0;
+        }
         let mean = |keys: u64| {
             #[expect(
                 clippy::cast_possible_truncation,
@@ -898,97 +969,62 @@ impl FilterSizing {
         } else {
             0
         };
-        let n = keys;
-        let mut held = self.state.held.load(Relaxed);
-        loop {
-            let used = u64::try_from(held).unwrap_or(0);
-            // The pending count bounds the rewrite's keys from above: a
-            // filter over more keys than it holds leaves none pending.
-            let later = self.pending_keys.load(Relaxed).saturating_sub(n);
-            // Charged per key rather than per whole filter: the pending count
-            // runs a little over the keys (versions of one key, overwritten
-            // keys), and rounding that excess up to a filter would refuse the
-            // last ones room they have.
-            let floor = if later == 0 || per_filter == 0 {
-                0
-            } else {
-                // `later` and the mean are both far below 2^32 in practice;
-                // the product in u128 cannot overflow either way.
-                #[expect(
-                    clippy::cast_possible_truncation,
-                    reason = "later * bytes / per_filter <= later * bytes, far below 2^64"
-                )]
-                let per_key = (u128::from(later) * u128::from(narrowest_bytes))
-                    .div_ceil(u128::from(per_filter)) as u64;
-                let table_keys = self.table_keys.load(Relaxed);
-                let tables = if table_keys == 0 {
-                    1
-                } else {
-                    later.div_ceil(table_keys)
-                };
-                // Each filter's later layers come out by chance, one filter's
-                // independently of another's, so their sum strays from the
-                // mean by about the square root of the filters' count times
-                // one filter's spread.
-                #[expect(
-                    clippy::cast_possible_truncation,
-                    clippy::cast_sign_loss,
-                    reason = "the square root of a filter count, non-negative and small"
-                )]
-                let strays = libm::ceil(libm::sqrt(as_f64(later.div_ceil(per_filter)))) as u64;
-                // The last keys may go into one short filter of their own,
-                // bounded from above: it is the one no later filter makes up
-                // for.
-                let final_filter = frame(
-                    self.narrowest()
-                        .filter_size_bound(usize::try_from(later).unwrap_or(usize::MAX))
-                        as u64,
-                );
-                (per_key + tables * tail_overhead + strays * spread).max(final_filter)
-            };
-            // Filters already over the budget leave no room at all.
-            let fits = bytes + floor <= self.budget.saturating_sub(used);
-            if !fits && !last {
-                return false;
-            }
-            // A table cannot hold 2^63 filter bytes, so neither can the sum.
-            #[expect(
-                clippy::cast_possible_wrap,
-                reason = "filter byte counts far below 2^63"
-            )]
-            let taken = held + bytes as i64;
-            match self
-                .state
-                .held
-                .compare_exchange_weak(held, taken, Relaxed, Relaxed)
-            {
-                Ok(_) => {
-                    self.leave(lower);
-                    self.spent.fetch_add(bytes, Relaxed);
-                    // The room kept for later filters is a reserve, not a
-                    // limit. Whether the tree is over its budget follows the
-                    // filters its versions publish, not the ones a rewrite is
-                    // building, which it may never install.
-                    if used + bytes > self.budget {
-                        self.state.log_entering(used + bytes, self.budget);
-                    }
-                    self.take_pending(n);
-                    self.admitted_keys.fetch_add(n, Relaxed);
-                    self.typical_keys.fetch_max(n, Relaxed);
-                    let mut spent = self.spent_estimate.load(Relaxed);
-                    while let Err(actual) = self.spent_estimate.compare_exchange_weak(
-                        spent,
-                        (f64::from_bits(spent) + as_f64(estimated)).to_bits(),
-                        Relaxed,
-                        Relaxed,
-                    ) {
-                        spent = actual;
-                    }
-                    return true;
-                }
-                Err(actual) => held = actual,
-            }
-        }
+        // Charged per key rather than per whole filter: the pending count
+        // runs a little over the keys (versions of one key, overwritten keys),
+        // and rounding that excess up to a filter would refuse the last ones
+        // room they have. `later` and the mean are both far below 2^32 in
+        // practice; the product in u128 cannot overflow either way.
+        #[expect(
+            clippy::cast_possible_truncation,
+            reason = "later * bytes / per_filter <= later * bytes, far below 2^64"
+        )]
+        let per_key = (u128::from(later) * u128::from(narrowest_bytes))
+            .div_ceil(u128::from(per_filter)) as u64;
+        let table_keys = self.table_keys.load(Relaxed);
+        let tables = if table_keys == 0 {
+            1
+        } else {
+            later.div_ceil(table_keys)
+        };
+        // Each filter's later layers come out by chance, one filter's
+        // independently of another's, so their sum strays from the mean by
+        // about the square root of the filters' count times one filter's
+        // spread.
+        #[expect(
+            clippy::cast_possible_truncation,
+            clippy::cast_sign_loss,
+            reason = "the square root of a filter count, non-negative and small"
+        )]
+        let strays = libm::ceil(libm::sqrt(as_f64(later.div_ceil(per_filter)))) as u64;
+        // The last keys may go into one short filter of their own, bounded
+        // from above: it is the one no later filter makes up for.
+        let final_filter = frame(
+            self.narrowest()
+                .filter_size_bound(usize::try_from(later).unwrap_or(usize::MAX)) as u64,
+        );
+        (per_key + tables * tail_overhead + strays * spread).max(final_filter)
+    }
+
+    /// Reserves in the tree's budget the room `pending` keys still to come
+    /// take at the narrowest width, in place of this rewrite's reservation.
+    fn reserve_for(&self, pending: u64) {
+        let per_filter = match self.typical_keys.load(Relaxed) {
+            // Before any filter, the keys as one filter's.
+            0 => pending,
+            keys => keys,
+        };
+        let floor = self.floor(pending, per_filter, &|len| self.framing.frame(len));
+        let _admission = self.state.admission.lock();
+        self.set_reservation(self.reservation.load(Relaxed), floor);
+    }
+
+    /// Replaces this rewrite's reservation `mine` with `floor` in the tree's
+    /// sum. The admission lock is held.
+    fn set_reservation(&self, mine: u64, floor: u64) {
+        // `mine` is part of the sum, which changes only under the lock.
+        let others = self.state.reserved.load(Relaxed) - mine;
+        self.state.reserved.store(others + floor, Relaxed);
+        self.reservation.store(floor, Relaxed);
     }
 
     /// Gives back the credit for the filters this rewrite replaces, before
@@ -1017,8 +1053,9 @@ impl FilterSizing {
     pub fn expect_keys(&self, keys: u64) {
         let admitted = self.admitted_keys.load(Relaxed);
         // Fewer keys than the filters already hold leaves none to come.
-        self.pending_keys
-            .store(keys.saturating_sub(admitted), Relaxed);
+        let pending = keys.saturating_sub(admitted);
+        self.pending_keys.store(pending, Relaxed);
+        self.reserve_for(pending);
     }
 
     /// Counts `n` keys as sized.
@@ -1110,6 +1147,11 @@ impl FilterSizing {
 /// already take it.
 impl Drop for FilterSizing {
     fn drop(&mut self) {
+        {
+            // Its later filters are written or will never be.
+            let _admission = self.state.admission.lock();
+            self.set_reservation(self.reservation.load(Relaxed), 0);
+        }
         self.release_replaced();
         #[expect(
             clippy::cast_possible_wrap,
