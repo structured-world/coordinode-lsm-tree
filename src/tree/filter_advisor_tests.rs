@@ -481,6 +481,75 @@ fn a_flush_into_several_tables_keeps_room_for_the_later_ones() -> crate::Result<
     Ok(())
 }
 
+/// A read whose newest version is a merge operand resolves it over every
+/// older table, asking each one's filter again; those answers count as the
+/// point read's do. The older table here holds none of the keys read, so
+/// every read is one negative probe of it: its one-bit filter answers absent
+/// about half the time, and otherwise lets the key through to a read that
+/// finds no version, a false positive.
+#[test]
+fn merge_resolution_counts_its_filter_probes() -> crate::Result<()> {
+    use crate::config::{FilterPolicy, FilterPolicyEntry};
+    use alloc::sync::Arc;
+
+    struct Concat;
+    impl crate::MergeOperator for Concat {
+        fn merge(
+            &self,
+            _key: &[u8],
+            base: Option<&[u8]>,
+            operands: &[&[u8]],
+        ) -> crate::Result<crate::UserValue> {
+            let mut merged = base.map(<[u8]>::to_vec).unwrap_or_default();
+            for operand in operands {
+                merged.extend_from_slice(operand);
+            }
+            Ok(merged.into())
+        }
+    }
+
+    let folder = tempfile::tempdir()?;
+    let tree = Config::new(
+        folder.path(),
+        SequenceNumberCounter::default(),
+        SequenceNumberCounter::default(),
+    )
+    .data_block_size_policy(BlockSizePolicy::all(1_024))
+    .with_merge_operator(Some(Arc::new(Concat)))
+    .filter_policy(FilterPolicy::all(FilterPolicyEntry::Bloom(
+        BloomConstructionPolicy::BitsPerKey(1.0),
+    )))
+    .filter_advisor(Some(FilterAdvisor::new(u64::MAX)))
+    .open()?;
+    // The older table, on a level below, holds the even keys; the newer one an
+    // operand for each odd key between them. The read finds the operand
+    // before it reaches the older level.
+    fill(&tree, &["k"], KEYS)?;
+    tree.major_compact(64 * 1_024 * 1_024, 0)?;
+    let older = tables(&tree);
+    for i in 0..KEYS {
+        tree.merge(key("k", 2 * i + 1), "x", u64::from(KEYS + i));
+    }
+    tree.flush_active_memtable(0)?;
+    let negatives = |table: &Table| table.probe_stats().map_or(0, |s| s.negatives());
+    let [older] = older.as_slice() else {
+        panic!("one older table");
+    };
+    let before = negatives(older);
+
+    // The odd keys below the older table's last one, which its key range
+    // does not rule out before its filter is asked.
+    let reads = KEYS - 1;
+    for i in 0..reads {
+        assert_eq!(
+            tree.get(key("k", 2 * i + 1), SeqNo::MAX)?.as_deref(),
+            Some(&b"x"[..])
+        );
+    }
+    assert_eq!(negatives(older) - before, u64::from(reads));
+    Ok(())
+}
+
 /// Widths all wider than the static policy's: once probes are observed, a
 /// budget none of them fits writes the narrowest configured width, never the
 /// static policy's narrower one.

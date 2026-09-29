@@ -225,16 +225,127 @@ fn bloom_passes(state: &IterState, table: &crate::table::Table) -> bool {
         } else {
             table.bloom_may_contain_key_hash(key_hash)
         };
+        // The filter's answers count as a point read's do; a key passed for
+        // want of a filter is no probe of one.
+        use crate::table::probe_stats::ProbeCounts;
         match result {
-            Ok(false) => return false,
+            Ok(false) => {
+                table.count_probes(ProbeCounts {
+                    probes: 1,
+                    negatives: 1,
+                });
+                return false;
+            }
+            Ok(true) if table.key_check_consults_filter(state.bloom_key.is_some()) => {
+                table.count_probes(ProbeCounts {
+                    probes: 1,
+                    negatives: 0,
+                });
+            }
             Err(e) => {
                 log::debug!("key bloom check failed for table {:?}: {e}", table.id(),);
             }
-            _ => {}
+            Ok(true) => {}
         }
     }
 
     true
+}
+
+/// One table's versions of a point key, read after its filter let the key
+/// through. A reader that ends having found none shows the filter answered
+/// for a key the table holds no version of, and counts it as the point read
+/// counts a false positive. It reads every version whatever the snapshot, so
+/// finding none is conclusive; a reader dropped before it ends counts
+/// nothing.
+struct FilterPassReader<I, T> {
+    inner: I,
+    table: T,
+    /// A version was found, or the miss was already counted.
+    settled: bool,
+}
+
+impl<I, T> FilterPassReader<I, T>
+where
+    I: DoubleEndedIterator<Item = crate::Result<InternalValue>>,
+    T: core::borrow::Borrow<crate::table::Table>,
+{
+    fn settle(
+        &mut self,
+        item: Option<crate::Result<InternalValue>>,
+    ) -> Option<crate::Result<InternalValue>> {
+        if !self.settled {
+            self.settled = true;
+            if item.is_none() {
+                self.table
+                    .borrow()
+                    .count_probes(crate::table::probe_stats::ProbeCounts {
+                        probes: 0,
+                        negatives: 1,
+                    });
+            }
+        }
+        item
+    }
+}
+
+impl<I, T> Iterator for FilterPassReader<I, T>
+where
+    I: DoubleEndedIterator<Item = crate::Result<InternalValue>>,
+    T: core::borrow::Borrow<crate::table::Table>,
+{
+    type Item = crate::Result<InternalValue>;
+
+    fn next(&mut self) -> Option<Self::Item> {
+        let item = self.inner.next();
+        self.settle(item)
+    }
+}
+
+impl<I, T> DoubleEndedIterator for FilterPassReader<I, T>
+where
+    I: DoubleEndedIterator<Item = crate::Result<InternalValue>>,
+    T: core::borrow::Borrow<crate::table::Table>,
+{
+    fn next_back(&mut self) -> Option<Self::Item> {
+        let item = self.inner.next_back();
+        self.settle(item)
+    }
+}
+
+/// The reader of `table` for the point key in `user_range` at `seqno`, which
+/// its filter let through: it counts a miss when the tree counts filter
+/// probes and a filter answered.
+fn point_reader<'a, T>(
+    state: &IterState,
+    table: T,
+    user_range: (Bound<UserKey>, Bound<UserKey>),
+    seqno: SeqNo,
+) -> BoxedIterator<'a>
+where
+    T: core::borrow::Borrow<crate::table::Table> + Send + 'a,
+{
+    let reader = table.borrow().range(user_range);
+    let counts = table.borrow().probe_stats().is_some()
+        && table
+            .borrow()
+            .key_check_consults_filter(state.bloom_key.is_some());
+    let visible = move |item: &crate::Result<InternalValue>| match item {
+        Ok(item) => seqno_filter(item.key.seqno, seqno),
+        Err(_) => true,
+    };
+    if counts {
+        Box::new(
+            FilterPassReader {
+                inner: reader,
+                table,
+                settled: false,
+            }
+            .filter(visible),
+        )
+    } else {
+        Box::new(reader.filter(visible))
+    }
 }
 
 impl TreeIter {
@@ -326,14 +437,7 @@ impl TreeIter {
                         if table.check_key_range_overlap_cmp(&bounds, lock.comparator.as_ref())
                             && bloom_passes(lock, table)
                         {
-                            let reader =
-                                table
-                                    .range(user_range.clone())
-                                    .filter(move |item| match item {
-                                        Ok(item) => seqno_filter(item.key.seqno, seqno),
-                                        Err(_) => true,
-                                    });
-                            iters.push(Box::new(reader));
+                            iters.push(point_reader(lock, table, user_range.clone(), seqno));
                         }
                     }
                     _ => {
@@ -350,14 +454,12 @@ impl TreeIter {
                             0 => {}
                             1 => {
                                 if let Some(table) = surviving.into_iter().next() {
-                                    let reader =
-                                        table.range(user_range.clone()).filter(move |item| {
-                                            match item {
-                                                Ok(item) => seqno_filter(item.key.seqno, seqno),
-                                                Err(_) => true,
-                                            }
-                                        });
-                                    iters.push(Box::new(reader));
+                                    iters.push(point_reader(
+                                        lock,
+                                        table,
+                                        user_range.clone(),
+                                        seqno,
+                                    ));
                                 }
                             }
                             _ => {

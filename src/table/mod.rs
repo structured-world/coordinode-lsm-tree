@@ -10198,6 +10198,18 @@ impl Table {
         self.bloom_may_contain_hash(key_hash)
     }
 
+    /// Whether a key check answers from a filter rather than passing the key
+    /// for want of one: [`Self::bloom_may_contain_key`] when `by_key`, which
+    /// reaches a partitioned filter through its pinned index, otherwise
+    /// [`Self::bloom_may_contain_key_hash`], which reaches only a full one.
+    pub(crate) fn key_check_consults_filter(&self, by_key: bool) -> bool {
+        self.pinned_filter_block.is_some()
+            || (by_key && self.pinned_filter_index.is_some())
+            || (self.regions.filter.is_some()
+                && self.regions.filter_tli.is_none()
+                && self.pinned_filter_index.is_none())
+    }
+
     /// Returns the highest effective sequence number in the table.
     ///
     /// For tables produced by flush/compaction (`global_seqno == 0`), this
