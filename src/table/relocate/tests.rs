@@ -304,7 +304,14 @@ fn relocated_mor_table_passes_the_blob_link_cross_check() -> crate::Result<()> {
             crate::ValueType::Indirection,
         ))?;
     }
-    writer.link_blob_file(5, n as usize, bytes_sum, on_disk_sum);
+    writer.link_blob_file(crate::table::writer::LinkedFile {
+        blob_file_id: 5,
+        len: n as usize,
+        bytes: bytes_sum,
+        on_disk_bytes: on_disk_sum,
+        first_key: b"k0000".into(),
+        last_key: format!("k{:04}", n - 1).into_bytes().into(),
+    });
     let (_, src_checksum) = writer.finish()?.expect("source table written");
     let source = recover_at(&src_path, src_checksum, 0)?;
 

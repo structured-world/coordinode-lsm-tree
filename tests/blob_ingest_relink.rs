@@ -28,13 +28,17 @@ fn blob_tree_ingest_relink() -> lsm_tree::Result<()> {
         assert_eq!(1, tree.table_count());
         assert_eq!(1, tree.blob_file_count());
 
+        // Only `big` is separated, so it is the whole key span of the link.
+        let expected = Some(vec![lsm_tree::table::writer::LinkedFile {
+            blob_file_id: 0,
+            bytes: big_value.len() as u64,
+            on_disk_bytes: big_value.len() as u64,
+            len: 1,
+            first_key: "big".into(),
+            last_key: "big".into(),
+        }]);
         assert_eq!(
-            Some(vec![lsm_tree::table::writer::LinkedFile {
-                blob_file_id: 0,
-                bytes: big_value.len() as u64,
-                on_disk_bytes: big_value.len() as u64,
-                len: 1,
-            }]),
+            expected,
             tree.current_version()
                 .iter_tables()
                 .next()
@@ -47,12 +51,7 @@ fn blob_tree_ingest_relink() -> lsm_tree::Result<()> {
         assert_eq!(1, tree.blob_file_count());
 
         assert_eq!(
-            Some(vec![lsm_tree::table::writer::LinkedFile {
-                blob_file_id: 0,
-                bytes: big_value.len() as u64,
-                on_disk_bytes: big_value.len() as u64,
-                len: 1,
-            }]),
+            expected,
             tree.current_version()
                 .iter_tables()
                 .next()

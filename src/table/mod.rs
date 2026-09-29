@@ -740,8 +740,6 @@ impl Table {
         &self,
         open: impl FnOnce() -> crate::Result<Arc<dyn FsFile>>,
     ) -> crate::Result<Option<Vec<LinkedFile>>> {
-        use crate::io::{LE, ReadBytesExt};
-
         Ok(if let Some(handle) = &self.regions.linked_blob_files {
             let fd = open()?;
 
@@ -749,41 +747,7 @@ impl Table {
             let buf =
                 crate::file::read_exact(fd.as_ref(), *handle.offset(), handle.size() as usize)?;
 
-            // Parse the buffer
-            let mut reader = &buf[..];
-            let len = reader.read_u32::<LE>()?;
-            // Bound the declared record count by the bytes that remain BEFORE
-            // reserving: each record is 4 u64s (32 bytes), so a corrupt or
-            // forged count header (e.g. u32::MAX) must fail as invalid data
-            // here rather than trigger a multi-GB Vec pre-allocation (which
-            // aborts the process on allocators that don't overcommit).
-            const RECORD_SIZE: usize = 4 * core::mem::size_of::<u64>();
-            if len as usize > reader.len() / RECORD_SIZE {
-                return Err(crate::Error::InvalidHeader(
-                    "linked_blob_files: declared record count exceeds section size",
-                ));
-            }
-            let mut blob_files = Vec::with_capacity(len as usize);
-
-            for _ in 0..len {
-                let blob_file_id = reader.read_u64::<LE>()?;
-                let len = reader.read_u64::<LE>()?;
-                let bytes = reader.read_u64::<LE>()?;
-                let on_disk_bytes = reader.read_u64::<LE>()?;
-
-                #[expect(
-                    clippy::cast_possible_truncation,
-                    reason = "truncation is not expected to happen"
-                )]
-                blob_files.push(LinkedFile {
-                    blob_file_id,
-                    bytes,
-                    len: len as usize,
-                    on_disk_bytes,
-                });
-            }
-
-            Some(blob_files)
+            Some(crate::table::writer::parse_linked_blob_files(&buf)?)
         } else {
             None
         })
@@ -3848,18 +3812,25 @@ impl Table {
         // consults `list_blob_file_references()` to decide whether other tables
         // reference a blob, so an accepted table with hidden indirections lets
         // GC rewrite / drop a blob file this table still points into.
-        // (len, bytes, on_disk_bytes) per blob id, accumulated exactly the
-        // way the writer folds them from indirections.
-        let mut derived: BTreeMap<crate::vlog::BlobFileId, (usize, u64, u64)> = BTreeMap::new();
+        // (len, bytes, on_disk_bytes, first key, last key) per blob id,
+        // accumulated exactly the way the writer folds them from indirections:
+        // the scan yields keys in order, so the first key seen is the first
+        // and the latest the last.
+        let mut derived: BTreeMap<crate::vlog::BlobFileId, (usize, u64, u64, UserKey, UserKey)> =
+            BTreeMap::new();
         {
             let mut accumulate = |kv: InternalValue| -> crate::Result<()> {
                 if kv.key.value_type == crate::ValueType::Indirection {
                     let mut cursor = &kv.value[..];
                     let ind = crate::blob_tree::handle::BlobIndirection::decode_from(&mut cursor)?;
-                    let slot = derived.entry(ind.vhandle.blob_file_id).or_insert((0, 0, 0));
+                    let key = &kv.key.user_key;
+                    let slot = derived
+                        .entry(ind.vhandle.blob_file_id)
+                        .or_insert_with(|| (0, 0, 0, key.clone(), key.clone()));
                     slot.0 += 1;
                     slot.1 += u64::from(ind.size);
                     slot.2 += u64::from(ind.vhandle.on_disk_size);
+                    slot.4.clone_from(key);
                 }
                 Ok(())
             };
@@ -3902,13 +3873,21 @@ impl Table {
                 "linked_blob_files section is present but records no blob references",
             ));
         }
-        let mut recorded_map: BTreeMap<crate::vlog::BlobFileId, (usize, u64, u64)> =
-            BTreeMap::new();
-        for link in &recorded {
+        let mut recorded_map: BTreeMap<
+            crate::vlog::BlobFileId,
+            (usize, u64, u64, UserKey, UserKey),
+        > = BTreeMap::new();
+        for link in recorded {
             if recorded_map
                 .insert(
                     link.blob_file_id,
-                    (link.len, link.bytes, link.on_disk_bytes),
+                    (
+                        link.len,
+                        link.bytes,
+                        link.on_disk_bytes,
+                        link.first_key,
+                        link.last_key,
+                    ),
                 )
                 .is_some()
             {
@@ -3924,12 +3903,19 @@ impl Table {
             // from the section, or recorded below the suffix's derived total,
             // means the section dropped or under-counted a live reference — reject
             // so blob GC cannot retire a file the suffix still addresses.
+            // The recorded key span covers the whole table's references, so it
+            // must enclose the span the suffix derives.
+            let cmp = self.comparator.as_ref();
             for (id, derived_counts) in &derived {
                 match recorded_map.get(id) {
                     Some(rec)
                         if rec.0 >= derived_counts.0
                             && rec.1 >= derived_counts.1
-                            && rec.2 >= derived_counts.2 => {}
+                            && rec.2 >= derived_counts.2
+                            && cmp.compare(&rec.3, &derived_counts.3)
+                                != core::cmp::Ordering::Greater
+                            && cmp.compare(&rec.4, &derived_counts.4)
+                                != core::cmp::Ordering::Less => {}
                     _ => {
                         return Err(crate::Error::InvalidHeader(
                             "linked_blob_files omits or under-counts a blob id the \

@@ -36,6 +36,44 @@ fn table_multi_writer_same_key_norotate() -> crate::Result<()> {
     Ok(())
 }
 
+/// A compaction that cuts one table's values into many tables links each
+/// output to the shared blob file over its own keys only: the key span a
+/// link records restarts at every rotation instead of carrying the previous
+/// output's first key.
+#[test]
+fn each_rotated_table_links_its_blob_file_over_its_own_keys() -> crate::Result<()> {
+    let folder = tempfile::tempdir()?;
+    let tree = Config::new(
+        &folder,
+        SequenceNumberCounter::default(),
+        SequenceNumberCounter::default(),
+    )
+    .with_kv_separation(Some(crate::KvSeparationOptions::default()))
+    .open()?;
+    // Enough rows that the index side alone spans several data blocks.
+    for i in 0..3_000u32 {
+        tree.insert(format!("key{i:05}"), "v".repeat(2_048), u64::from(i));
+    }
+    tree.flush_active_memtable(0)?;
+    assert_eq!(tree.blob_file_count(), 1);
+
+    tree.major_compact(1_024, 1_000)?;
+    let version = tree.current_version();
+    let tables: Vec<_> = version.iter_tables().collect();
+    assert!(tables.len() > 1, "the compaction cut several tables");
+    for table in tables {
+        let Some(links) = table.list_blob_file_references()? else {
+            panic!("every value is separated");
+        };
+        let [link] = links.as_slice() else {
+            panic!("one blob file backs every value: {links:?}");
+        };
+        assert_eq!(&link.first_key, table.metadata.key_range.min());
+        assert_eq!(&link.last_key, table.metadata.key_range.max());
+    }
+    Ok(())
+}
+
 /// The blob files a table links are handed to its writer only when it
 /// rotates, and it writes them at `finish`: the table is full once they no
 /// longer fit its target, before they reach the writer.
@@ -73,10 +111,12 @@ fn the_linked_blob_files_count_toward_a_full_table() -> crate::Result<()> {
                 bytes: 1,
                 on_disk_bytes: 1,
                 len: 1,
+                first_key: UserKey::from(b"a" as &[u8]),
+                last_key: UserKey::from(b"a" as &[u8]),
             },
         );
     }
-    assert!(mw.table_full(), "ten linked files take 324 bytes");
+    assert!(mw.table_full(), "ten linked files take 384 bytes");
     Ok(())
 }
 
@@ -114,11 +154,13 @@ fn the_linked_blob_files_count_toward_the_held_state() -> crate::Result<()> {
                 bytes: 1,
                 on_disk_bytes: 1,
                 len: 1,
+                first_key: UserKey::from(b"a" as &[u8]),
+                last_key: UserKey::from(b"a" as &[u8]),
             },
         );
     }
     // Their bytes on disk fit; their entries in memory do not.
-    let linked = crate::table::writer::linked_blob_files_len(mw.linked_blobs.len());
+    let linked = crate::table::writer::linked_blob_files_len(mw.linked_blobs.values());
     mw.target_size = mw.writer.output_size_hint() + linked + 100;
     assert!(mw.writer.held_state_bytes() + FILES * 64 >= mw.target_size);
     assert!(mw.table_full(), "{FILES} linked files held in memory");
@@ -193,6 +235,8 @@ fn rotation_frees_the_linked_blob_map() -> crate::Result<()> {
                 bytes: 1,
                 on_disk_bytes: 1,
                 len: 1,
+                first_key: UserKey::from(b"a" as &[u8]),
+                last_key: UserKey::from(b"a" as &[u8]),
             },
         );
     }

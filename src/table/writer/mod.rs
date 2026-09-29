@@ -109,11 +109,87 @@ const REFRESH_KEY_FRACTION: u64 = 64;
 /// refreshes the estimates sooner than the key count does.
 const REFRESH_HASH_STEP_KEYS: u64 = 8;
 
-/// Bytes the `linked_blob_files` section takes for `count` linked blob files:
-/// the count, then each file's id, entry count, bytes and on-disk bytes.
+/// Bytes a `linked_blob_files` record takes before its two keys: the blob
+/// file's id, entry count, bytes and on-disk bytes.
+pub(crate) const LINKED_BLOB_FILE_FIXED_LEN: usize = 4 * core::mem::size_of::<u64>();
+
+/// Bytes the `linked_blob_files` section takes for `links`: the count, then
+/// each record's fixed fields and its first and last key, each preceded by a
+/// two-byte length.
 #[must_use]
-pub(crate) const fn linked_blob_files_len(count: usize) -> u64 {
-    if count == 0 { 0 } else { 4 + 32 * count as u64 }
+pub(crate) fn linked_blob_files_len<'a>(
+    links: impl ExactSizeIterator<Item = &'a LinkedFile>,
+) -> u64 {
+    if links.len() == 0 {
+        return 0;
+    }
+    4 + links
+        .map(|link| {
+            (LINKED_BLOB_FILE_FIXED_LEN + 2 + link.first_key.len() + 2 + link.last_key.len()) as u64
+        })
+        .sum::<u64>()
+}
+
+/// Parses a `linked_blob_files` section written by [`Writer::finish`]: the
+/// record count, then each record's fixed fields and its two length-prefixed
+/// keys. The records must fill the section exactly.
+///
+/// # Errors
+///
+/// [`crate::Error::InvalidHeader`] when the count, a key length or the section
+/// length disagree with each other.
+pub(crate) fn parse_linked_blob_files(buf: &[u8]) -> crate::Result<Vec<LinkedFile>> {
+    use crate::io::{LE, ReadBytesExt};
+
+    /// A record with two empty keys: the fewest bytes one can take.
+    const MIN_RECORD_LEN: usize = LINKED_BLOB_FILE_FIXED_LEN + 2 + 2;
+
+    fn read_key(reader: &mut &[u8]) -> crate::Result<UserKey> {
+        let len = usize::from(reader.read_u16::<LE>()?);
+        let Some((key, rest)) = reader.split_at_checked(len) else {
+            return Err(crate::Error::InvalidHeader(
+                "linked_blob_files: a key runs past the section",
+            ));
+        };
+        *reader = rest;
+        Ok(UserKey::from(key))
+    }
+
+    let mut reader = buf;
+    let count = reader.read_u32::<LE>()? as usize;
+    // Bound the declared count by the bytes that remain BEFORE reserving, so a
+    // forged count header fails as invalid data rather than as a multi-GB
+    // allocation.
+    if count > reader.len() / MIN_RECORD_LEN {
+        return Err(crate::Error::InvalidHeader(
+            "linked_blob_files: declared record count exceeds section size",
+        ));
+    }
+    let mut links = Vec::with_capacity(count);
+    for _ in 0..count {
+        let blob_file_id = reader.read_u64::<LE>()?;
+        let len = usize::try_from(reader.read_u64::<LE>()?).map_err(|_| {
+            crate::Error::InvalidHeader("linked_blob_files: entry count exceeds usize")
+        })?;
+        let bytes = reader.read_u64::<LE>()?;
+        let on_disk_bytes = reader.read_u64::<LE>()?;
+        let first_key = read_key(&mut reader)?;
+        let last_key = read_key(&mut reader)?;
+        links.push(LinkedFile {
+            blob_file_id,
+            bytes,
+            on_disk_bytes,
+            len,
+            first_key,
+            last_key,
+        });
+    }
+    if !reader.is_empty() {
+        return Err(crate::Error::InvalidHeader(
+            "linked_blob_files: bytes remain past the declared records",
+        ));
+    }
+    Ok(links)
 }
 
 /// Heap bytes a vector of handles holds: `logical`, its entries and their
@@ -133,12 +209,18 @@ struct DirectBlockInputs {
     zone_block_min: Option<UserKey>,
 }
 
-#[derive(Copy, Clone, PartialEq, Eq, Debug, core::hash::Hash)]
+/// One blob file a table references: how many of its values the table points
+/// at, their bytes, and the span of the table's keys that point there.
+#[derive(Clone, PartialEq, Eq, Debug, core::hash::Hash)]
 pub struct LinkedFile {
     pub blob_file_id: BlobFileId,
     pub bytes: u64,
     pub on_disk_bytes: u64,
     pub len: usize,
+    /// The table's first key whose value lives in this blob file.
+    pub first_key: UserKey,
+    /// The table's last key whose value lives in this blob file.
+    pub last_key: UserKey,
 }
 
 /// Serializes and compresses values into blocks and writes them to disk as a table.
@@ -1252,19 +1334,10 @@ impl Writer {
         self
     }
 
-    pub fn link_blob_file(
-        &mut self,
-        blob_file_id: BlobFileId,
-        len: usize,
-        bytes: u64,
-        on_disk_bytes: u64,
-    ) {
-        self.linked_blob_files.push(LinkedFile {
-            blob_file_id,
-            bytes,
-            on_disk_bytes,
-            len,
-        });
+    /// Records that this table references `link`'s blob file, for the
+    /// `linked_blob_files` section.
+    pub fn link_blob_file(&mut self, link: LinkedFile) {
+        self.linked_blob_files.push(link);
     }
 
     fn assert_not_started(&self, setting: &str) {
@@ -3883,6 +3956,15 @@ impl Writer {
                 self.file_writer.write_u64::<LE>(file.len as u64)?;
                 self.file_writer.write_u64::<LE>(file.bytes)?;
                 self.file_writer.write_u64::<LE>(file.on_disk_bytes)?;
+                for key in [&file.first_key, &file.last_key] {
+                    // A user key is at most `u16::MAX` bytes: the writer
+                    // rejects longer keys before they reach a table.
+                    let len = u16::try_from(key.len()).map_err(|_| {
+                        crate::Error::InvalidHeader("linked_blob_files: key exceeds u16::MAX bytes")
+                    })?;
+                    self.file_writer.write_u16::<LE>(len)?;
+                    self.file_writer.write_all(key)?;
+                }
             }
         }
 

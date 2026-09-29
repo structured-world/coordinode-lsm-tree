@@ -569,19 +569,38 @@ impl MultiWriter {
         coverage
     }
 
+    /// Records that the entry just written points into `indirection`'s blob
+    /// file. Called after [`Self::write`] of that entry: rotation happens
+    /// before a write, so the entry's key is the current key and belongs to
+    /// the current table, and keys arrive in order, so the first key seen for
+    /// a blob file is its first and the latest its last.
+    ///
+    /// # Panics
+    ///
+    /// In debug builds, if no entry has been written yet.
     pub fn register_blob(&mut self, indirection: BlobIndirection) {
+        debug_assert!(
+            self.current_key.is_some(),
+            "a blob is registered after the entry that points into it"
+        );
+        let Some(key) = self.current_key.as_ref() else {
+            return;
+        };
         self.linked_blobs
             .entry(indirection.vhandle.blob_file_id)
             .and_modify(|entry| {
                 entry.bytes += u64::from(indirection.size);
                 entry.on_disk_bytes += u64::from(indirection.vhandle.on_disk_size);
                 entry.len += 1;
+                entry.last_key.clone_from(key);
             })
             .or_insert_with(|| LinkedFile {
                 blob_file_id: indirection.vhandle.blob_file_id,
                 bytes: u64::from(indirection.size),
                 on_disk_bytes: u64::from(indirection.vhandle.on_disk_size),
                 len: 1,
+                first_key: key.clone(),
+                last_key: key.clone(),
             });
     }
 
@@ -993,12 +1012,7 @@ impl MultiWriter {
 
         // Taken out, so the map is freed rather than kept under the next table.
         for linked in core::mem::take(&mut self.linked_blobs).into_values() {
-            old_writer.link_blob_file(
-                linked.blob_file_id,
-                linked.len,
-                linked.bytes,
-                linked.on_disk_bytes,
-            );
+            old_writer.link_blob_file(linked);
         }
 
         if let Some((table_id, checksum)) = old_writer.finish()? {
@@ -1068,7 +1082,7 @@ impl MultiWriter {
     ) -> bool {
         use crate::table::block::{BlockType, framed_len_bound};
 
-        let linked = crate::table::writer::linked_blob_files_len(self.linked_blobs.len());
+        let linked = crate::table::writer::linked_blob_files_len(self.linked_blobs.values());
         let (tombstone_block, tombstones_held) = if tombstones == 0 {
             (0, 0)
         } else {
@@ -1398,12 +1412,7 @@ impl MultiWriter {
 
         // Taken out, so the map is freed before the table is written.
         for linked in core::mem::take(&mut self.linked_blobs).into_values() {
-            self.writer.link_blob_file(
-                linked.blob_file_id,
-                linked.len,
-                linked.bytes,
-                linked.on_disk_bytes,
-            );
+            self.writer.link_blob_file(linked);
         }
 
         if let Some((table_id, checksum)) = self.writer.finish()? {

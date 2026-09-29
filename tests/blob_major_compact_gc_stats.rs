@@ -156,6 +156,8 @@ fn blob_tree_major_compact_gc_stats_tombstone() -> lsm_tree::Result<()> {
                 bytes: 2 * big_value.len() as u64,
                 on_disk_bytes: 2 * big_value.len() as u64,
                 len: 2,
+                first_key: "another_big".into(),
+                last_key: "big".into(),
             }]),
             tree.current_version()
                 .iter_tables()
@@ -184,11 +186,14 @@ fn blob_tree_major_compact_gc_stats_tombstone() -> lsm_tree::Result<()> {
         );
 
         assert_eq!(
+            // `big` is gone, leaving `another_big` as the only reference.
             Some(vec![lsm_tree::table::writer::LinkedFile {
                 blob_file_id: 0,
                 bytes: big_value.len() as u64,
                 on_disk_bytes: big_value.len() as u64,
                 len: 1,
+                first_key: "another_big".into(),
+                last_key: "another_big".into(),
             }]),
             tree.current_version()
                 .iter_tables()

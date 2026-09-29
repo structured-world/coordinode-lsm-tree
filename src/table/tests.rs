@@ -900,6 +900,77 @@ fn restricted_view_clamps_visible_range_tombstones() -> crate::Result<()> {
     )
 }
 
+/// The key span a `linked_blob_files` record carries is cross-checked like its
+/// counts: the section has no checksum, and a span narrower than the keys that
+/// point into the blob file would understate how far that file's values spread
+/// through the table. Here ten keys all point into blob file 0; a record whose
+/// counts are right but whose span stops at `key00007` is rejected by the exact
+/// check, and by the restricted view's containment check too, since the suffix
+/// from `key00005` still reaches `key00009`.
+#[cfg(feature = "std")]
+#[test]
+fn verify_blob_links_rejects_a_narrowed_key_span() -> crate::Result<()> {
+    use crate::blob_tree::handle::BlobIndirection;
+    use crate::coding::Encode;
+    use crate::table::Writer;
+    use crate::vlog::ValueHandle;
+    use crate::{InternalValue, ValueType};
+
+    let dir = tempdir()?;
+    let write = |name: &str, last_key: &str| -> crate::Result<Table> {
+        let file = dir.path().join(name);
+        let checksum = {
+            let mut w = Writer::new(file.clone(), 0, 0, Arc::new(StdFs))?.use_data_block_size(128);
+            for i in 0u64..10 {
+                let value = BlobIndirection {
+                    size: 1000,
+                    vhandle: ValueHandle {
+                        blob_file_id: 0,
+                        on_disk_size: 500,
+                        offset: i * 500,
+                    },
+                }
+                .encode_into_vec();
+                w.write(InternalValue::from_components(
+                    format!("key{i:05}").into_bytes(),
+                    value,
+                    i + 1,
+                    ValueType::Indirection,
+                ))?;
+            }
+            w.link_blob_file(crate::table::writer::LinkedFile {
+                blob_file_id: 0,
+                len: 10,
+                bytes: 10_000,
+                on_disk_bytes: 5_000,
+                first_key: b"key00000".into(),
+                last_key: last_key.as_bytes().into(),
+            });
+            w.finish()?.expect("the SST is non-empty").1
+        };
+        Table::recover(test_recover_params(file, checksum))
+    };
+    let suffix = || crate::UserKey::from(&b"key00005"[..]);
+
+    let honest = write("honest", "key00009")?;
+    honest.verify_blob_links()?;
+    honest.reopen_restricted(suffix())?.verify_blob_links()?;
+
+    let narrowed = write("narrowed", "key00007")?;
+    assert!(
+        narrowed.verify_blob_links().is_err(),
+        "the exact check must reject a span that stops short of the last key",
+    );
+    assert!(
+        narrowed
+            .reopen_restricted(suffix())?
+            .verify_blob_links()
+            .is_err(),
+        "the containment check must reject a span the suffix reaches past",
+    );
+    Ok(())
+}
+
 /// A restricted view must still cross-check its `linked_blob_files` section: the
 /// section carries no checksum, so a same-size rot that under-counts (or drops) a
 /// blob id the READABLE SUFFIX still references passes the block walk, and blob GC
@@ -945,7 +1016,15 @@ fn verify_blob_links_rejects_an_undercounted_suffix_id_on_a_restricted_view() ->
         }
         for i in 0u64..10 {
             let bytes = if i == 9 { 1 } else { 1000 };
-            w.link_blob_file(i, 1, bytes, 500);
+            let key = crate::UserKey::from(format!("key{i:05}").into_bytes());
+            w.link_blob_file(crate::table::writer::LinkedFile {
+                blob_file_id: i,
+                len: 1,
+                bytes,
+                on_disk_bytes: 500,
+                first_key: key.clone(),
+                last_key: key,
+            });
         }
         w.finish()?.expect("the SST is non-empty").1
     };
@@ -1002,7 +1081,15 @@ fn verify_blob_links_on_a_restricted_view_counts_and_caches_nothing() -> crate::
                 i + 1,
                 ValueType::Indirection,
             ))?;
-            w.link_blob_file(i, 1, 1000, 500);
+            let key = crate::UserKey::from(format!("key{i:05}").into_bytes());
+            w.link_blob_file(crate::table::writer::LinkedFile {
+                blob_file_id: i,
+                len: 1,
+                bytes: 1000,
+                on_disk_bytes: 500,
+                first_key: key.clone(),
+                last_key: key,
+            });
         }
         w.finish()?.expect("the SST is non-empty").1
     };
@@ -1070,7 +1157,15 @@ fn verify_blob_links_leaves_the_descriptor_table_as_it_found_it() -> crate::Resu
                 i + 1,
                 ValueType::Indirection,
             ))?;
-            w.link_blob_file(i, 1, 1000, 500);
+            let key = crate::UserKey::from(format!("key{i:05}").into_bytes());
+            w.link_blob_file(crate::table::writer::LinkedFile {
+                blob_file_id: i,
+                len: 1,
+                bytes: 1000,
+                on_disk_bytes: 500,
+                first_key: key.clone(),
+                last_key: key,
+            });
         }
         w.finish()?.expect("the SST is non-empty").1
     };
