@@ -3,16 +3,18 @@
 
 //! Cold `multi_get` on `io_uring`: latency and caller-thread CPU per batch.
 //!
-//! The tree's block cache is far smaller than any batch's blocks and the row
-//! cache is off, so every batch reads its blocks through the ring in chunks
-//! rather than from memory. What changes between builds is what the caller
-//! spends submitting and collecting those reads, which is why the caller's own
-//! CPU time is reported next to the wall time.
+//! Index and filter blocks are pinned to their tables, the block cache is far
+//! smaller than any batch's data blocks and the row cache is off, so every
+//! batch reads its data blocks through the ring in chunks rather than from
+//! memory, and reads nothing else. What changes between builds is what the
+//! caller spends submitting and collecting those reads, which is why the
+//! caller's own CPU time is reported next to the wall time.
 //!
 //! Prints the median and p99 of both per batch size. Linux only.
 
 #[cfg(target_os = "linux")]
 fn run() {
+    use lsm_tree::config::PinningPolicy;
     use lsm_tree::{AbstractTree, Cache, Config, SeqNo, SequenceNumberCounter};
     use std::sync::Arc;
     use std::time::{Duration, Instant};
@@ -43,6 +45,10 @@ fn run() {
         SequenceNumberCounter::default(),
     )
     .with_shared_fs(fs)
+    // Index and filter blocks stay with their tables, so what a batch reads
+    // from the ring is its data blocks and nothing else.
+    .filter_block_pinning_policy(PinningPolicy::all(true))
+    .index_block_pinning_policy(PinningPolicy::all(true))
     .use_cache(Arc::new(
         Cache::with_capacity_bytes(16 * 1_024).with_row_cache(false),
     ))
@@ -66,6 +72,17 @@ fn run() {
         state % KEYS
     };
 
+    let report = |what: &str, batch: usize, wall: &mut [Duration], cpu: &mut [Duration]| {
+        println!(
+            "{what} batch {batch}: wall p50 {:?} p99 {:?}, caller cpu p50 {:?} p99 {:?} ({} batches)",
+            quantile(wall, 0.5),
+            quantile(wall, 0.99),
+            quantile(cpu, 0.5),
+            quantile(cpu, 0.99),
+            wall.len(),
+        );
+    };
+
     for batch in [8usize, 64, 512] {
         let rounds = (40_000 / batch).max(200);
         let mut wall = Vec::with_capacity(rounds);
@@ -79,13 +96,48 @@ fn run() {
             wall.push(start.elapsed());
             assert!(found.iter().all(Option::is_some), "every key exists");
         }
-        println!(
-            "batch {batch}: wall p50 {:?} p99 {:?}, caller cpu p50 {:?} p99 {:?} ({rounds} batches)",
-            quantile(&mut wall, 0.5),
-            quantile(&mut wall, 0.99),
-            quantile(&mut cpu, 0.5),
-            quantile(&mut cpu, 0.99),
-        );
+        report("multi_get", batch, &mut wall, &mut cpu);
+    }
+
+    // The batched read alone: 4 KiB blocks at random offsets across four
+    // files, so the figure is the submission and its completions, with no
+    // lookup around it.
+    use lsm_tree::fs::{BlockBuf, BlockRead, Fs, FsOpenOptions};
+    const BLOCK: usize = 4_096;
+    const BLOCKS_PER_FILE: u64 = 4_096;
+    let raw_fs = lsm_tree::fs::IoUringFs::new().expect("io_uring available");
+    let files: Vec<_> = (0..4)
+        .map(|f| {
+            let path = dir.path().join(format!("raw{f}.bin"));
+            let opts = FsOpenOptions::new().write(true).create(true).read(true);
+            let mut file = raw_fs.open(&path, &opts).expect("create");
+            std::io::Write::write_all(&mut file, &vec![0x5Au8; BLOCK * BLOCKS_PER_FILE as usize])
+                .expect("fill");
+            file
+        })
+        .collect();
+    for batch in [8usize, 64, 512] {
+        let rounds = (40_000 / batch).max(200);
+        let mut wall = Vec::with_capacity(rounds);
+        let mut cpu = Vec::with_capacity(rounds);
+        let mut buffers = vec![[0u8; BLOCK]; batch];
+        for _ in 0..rounds {
+            let mut reqs: Vec<_> = buffers
+                .iter_mut()
+                .enumerate()
+                .map(|(i, buf)| BlockRead {
+                    file: files[i % files.len()].as_ref(),
+                    offset: (next() % BLOCKS_PER_FILE) * BLOCK as u64,
+                    buf: BlockBuf::new(buf),
+                })
+                .collect();
+            let start = Instant::now();
+            let thread = cpu_time::ThreadTime::now();
+            raw_fs.read_blocks_batched(&mut reqs).expect("batched read");
+            cpu.push(thread.elapsed());
+            wall.push(start.elapsed());
+        }
+        report("read_blocks_batched", batch, &mut wall, &mut cpu);
     }
 }
 
