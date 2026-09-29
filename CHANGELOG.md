@@ -11,6 +11,12 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 
 ## [Unreleased]
 
+## [5.11.9](https://github.com/structured-world/coordinode-lsm-tree/compare/v5.11.8...v5.11.9) - 2026-09-29
+
+### Fixed
+
+- *(compaction)* relocate blobs in key order and from the live frontier ([#743](https://github.com/structured-world/coordinode-lsm-tree/pull/743))
+
 ## [5.11.8](https://github.com/structured-world/coordinode-lsm-tree/compare/v5.11.7...v5.11.8) - 2026-09-28
 
 ### Fixed
