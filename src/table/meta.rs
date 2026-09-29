@@ -90,6 +90,11 @@ pub struct ParsedMeta {
     /// (duplicate versions assumed).
     pub key_count: Option<u64>,
 
+    /// Hashes the table's filter holds (the `filter_hashes` meta key): one
+    /// per distinct key, and under a prefix extractor one per distinct
+    /// prefix. `None` for a table without a filter.
+    pub filter_hashes: Option<u64>,
+
     pub tombstone_count: u64,
 
     /// Number of RANGE tombstones the writer emitted into the
@@ -655,6 +660,7 @@ impl ParsedMeta {
         let delete_bitmap_len = read_opt_u64(b"descriptor#delete_bitmap_len")?;
         let delete_bitmap_hash = read_opt_u128(b"descriptor#delete_bitmap_hash")?;
         let key_count = read_opt_u64(b"key_count")?;
+        let filter_hashes = read_opt_u64(b"filter_hashes")?;
         let recency = read_opt_u64(b"recency")?;
         // Compaction lineage: consecutive little-endian input ids. A payload
         // that is not a whole number of ids is corrupt meta.
@@ -696,6 +702,7 @@ impl ParsedMeta {
             file_size,
             item_count,
             key_count,
+            filter_hashes,
             tombstone_count,
             range_tombstone_count,
             delete_bitmap_len,

@@ -16,6 +16,16 @@ use alloc::sync::Arc;
 #[cfg(not(feature = "std"))]
 use alloc::{boxed::Box, vec::Vec};
 
+/// What a filter writer wrote into its table.
+#[derive(Clone, Copy, Debug, Default, PartialEq, Eq)]
+pub struct FilterOutput {
+    /// Filter blocks written: one for a full filter, one per partition.
+    pub blocks: usize,
+    /// Hashes the filters hold: a key's, and under a prefix extractor each
+    /// distinct prefix's. Zero when no filter was written.
+    pub hashes: u64,
+}
+
 // All methods are required (no defaults) by design so that implementations must
 // explicitly handle configuration changes (e.g., filter policies, prefix extractors).
 pub trait FilterWriter<W: crate::io::Write + crate::io::Seek> {
@@ -36,13 +46,11 @@ pub trait FilterWriter<W: crate::io::Write + crate::io::Seek> {
     /// estimated from what is held now.
     fn finish_output_bytes(&self) -> u64;
 
-    /// Writes the filter to a file.
-    ///
-    /// Returns the number of filter blocks written (always 1 in case of full filter block).
+    /// Writes the filter to a file, and returns what it wrote.
     fn finish(
         self: Box<Self>,
         file_writer: &mut crate::sfa::Writer<ChecksummedWriter<W>>,
-    ) -> crate::Result<usize>;
+    ) -> crate::Result<FilterOutput>;
 
     fn set_filter_policy(
         self: Box<Self>,

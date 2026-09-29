@@ -1238,13 +1238,15 @@ fn bits_of(policy: BloomConstructionPolicy) -> u8 {
     }
 }
 
-/// Keys a table's filter holds: one hash per distinct key, however many
-/// versions of it the table keeps. Metadata without the distinct count gives
-/// the entries, which bound it from above.
+/// Hashes a table's filter holds: one per distinct key, however many versions
+/// of it the table keeps, and under a prefix extractor one per distinct
+/// prefix, as its metadata records them. Without that record, the distinct
+/// keys, or the entries, which bound them from above.
 fn filter_keys(table: &Table) -> u64 {
     table
         .metadata
-        .key_count
+        .filter_hashes
+        .or(table.metadata.key_count)
         .unwrap_or(table.metadata.item_count)
 }
 

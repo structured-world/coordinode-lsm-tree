@@ -125,8 +125,9 @@ mod parallel {
             );
             file.start("data")?;
             file.write_all(&[0; 64])?;
-            let partitions = writer.finish(&mut file)?;
-            Ok((file.get_mut().inner_mut().get_ref().clone(), partitions))
+            let output = writer.finish(&mut file)?;
+            assert_eq!(output.hashes, self.keys as u64, "one hash per key");
+            Ok((file.get_mut().inner_mut().get_ref().clone(), output.blocks))
         }
     }
 

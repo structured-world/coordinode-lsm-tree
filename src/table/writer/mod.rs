@@ -1122,6 +1122,7 @@ impl Writer {
             weak_tombstone_count: self.meta.weak_tombstone_count as u64,
             weak_tombstone_reclaimable: self.meta.weak_tombstone_reclaimable_count as u64,
             key_count: self.meta.key_count as u64,
+            filter_hashes: self.meta.filter_hashes,
             sum_user_key_bytes: self.meta.sum_user_key_bytes,
             sum_value_bytes: self.meta.sum_value_bytes,
             uncompressed_size: self.meta.uncompressed_size,
@@ -3703,7 +3704,9 @@ impl Writer {
         if let (Some(first), Some(last)) = (&self.meta.first_key, &self.meta.last_key) {
             filter_writer.set_key_range(first, last);
         }
-        let filter_block_count = filter_writer.finish(&mut self.file_writer)?;
+        let filter = filter_writer.finish(&mut self.file_writer)?;
+        let filter_block_count = filter.blocks;
+        self.meta.filter_hashes = filter.hashes;
 
         // Write the optional inner-block layout section (only when at least one
         // data block split into >= 2 inner zstd blocks). Absent otherwise, so
@@ -4231,6 +4234,9 @@ struct MetaSectionParams<'a> {
     weak_tombstone_count: u64,
     weak_tombstone_reclaimable: u64,
     key_count: u64,
+    /// Hashes the filter holds: `> 0` writes `filter_hashes`, zero (no
+    /// filter) omits it.
+    filter_hashes: u64,
     sum_user_key_bytes: u64,
     sum_value_bytes: u64,
     uncompressed_size: u64,
@@ -4542,6 +4548,12 @@ fn encode_meta_payload(
     // all along.
     if let Some(recency) = p.recency {
         meta_items.push(meta("recency", &recency.to_le_bytes()));
+    }
+
+    // Hashes the filter holds, which a prefix extractor makes more than the
+    // keys: what a filter's size follows. Emitted only when there is a filter.
+    if p.filter_hashes > 0 {
+        meta_items.push(meta("filter_hashes", &p.filter_hashes.to_le_bytes()));
     }
 
     // Compaction lineage: the sorted input ids this output merges, as

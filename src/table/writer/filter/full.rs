@@ -225,10 +225,10 @@ impl<W: crate::io::Write + crate::io::Seek> FilterWriter<W> for FullFilterWriter
     fn finish(
         self: Box<Self>,
         file_writer: &mut crate::sfa::Writer<ChecksummedWriter<W>>,
-    ) -> crate::Result<usize> {
+    ) -> crate::Result<super::FilterOutput> {
         if self.bloom_hash_buffer.is_empty() {
             log::trace!("Filter writer has no buffered hashes - not building filter");
-            return Ok(0);
+            return Ok(super::FilterOutput::default());
         }
 
         // A prefix extractor emits one token per prefix per key, and prefixes
@@ -287,7 +287,7 @@ impl<W: crate::io::Write + crate::io::Seek> FilterWriter<W> for FullFilterWriter
 
         if filter_bytes.is_empty() {
             log::trace!("BuRR policy produced empty filter — skipping block write");
-            return Ok(0);
+            return Ok(super::FilterOutput::default());
         }
 
         file_writer.start("filter")?;
@@ -329,6 +329,9 @@ impl<W: crate::io::Write + crate::io::Seek> FilterWriter<W> for FullFilterWriter
             at,
         )?;
 
-        Ok(1)
+        Ok(super::FilterOutput {
+            blocks: 1,
+            hashes: n as u64,
+        })
     }
 }

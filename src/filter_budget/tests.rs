@@ -169,6 +169,53 @@ fn the_price_counts_partitioned_filters_as_partitions() {
     );
 }
 
+/// Under a prefix extractor a full filter holds each distinct prefix's hash
+/// beside each key's, and the advisor counts the filter by those hashes, not
+/// by the keys: here two prefixes of every key make three hashes a key.
+#[test]
+fn a_filter_is_counted_by_the_hashes_it_holds() -> crate::Result<()> {
+    use crate::{AbstractTree, AnyTree, Config, PrefixExtractor, SequenceNumberCounter};
+    use alloc::sync::Arc;
+
+    /// The key less its last byte, and less its last two.
+    struct TwoPrefixes;
+    impl PrefixExtractor for TwoPrefixes {
+        fn prefixes<'a>(&self, key: &'a [u8]) -> Box<dyn Iterator<Item = &'a [u8]> + 'a> {
+            let len = key.len();
+            Box::new(
+                [len.checked_sub(2), len.checked_sub(1)]
+                    .into_iter()
+                    .flatten()
+                    .filter_map(move |end| key.get(..end)),
+            )
+        }
+    }
+
+    const KEYS: u64 = 5_000;
+    let folder = tempfile::tempdir()?;
+    let any = Config::new(
+        folder.path(),
+        SequenceNumberCounter::default(),
+        SequenceNumberCounter::default(),
+    )
+    .prefix_extractor(Arc::new(TwoPrefixes))
+    .open()?;
+    for i in 0..KEYS {
+        any.insert(format!("k{i:06}xy"), "value", i);
+    }
+    any.flush_active_memtable(0)?;
+    let AnyTree::Standard(tree) = &any else {
+        panic!("a standard tree");
+    };
+    let version = tree.current_version();
+    let [table] = version.iter_tables().collect::<Vec<_>>()[..] else {
+        panic!("one table");
+    };
+    assert_eq!(table.metadata.key_count, Some(KEYS));
+    assert_eq!(super::filter_keys(table), 3 * KEYS);
+    Ok(())
+}
+
 /// The price models each live table as its own level built it, so it does not
 /// depend on where the rewrite writes: a flush into a level of full filters
 /// prices the partitioned tables below as partitions, as a compaction into

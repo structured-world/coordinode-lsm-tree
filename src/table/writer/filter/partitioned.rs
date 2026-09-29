@@ -88,8 +88,7 @@ pub struct PartitionedFilterWriter {
     /// partitions are on workers. Kept only for a sized filter.
     spilled_key: Option<UserKey>,
 
-    /// Hashes the table's partitions hold so far, which a sized filter
-    /// reports once the table's last partition is built.
+    /// Hashes the table's partitions hold so far, which `finish` reports.
     table_hashes: usize,
 }
 
@@ -191,8 +190,8 @@ impl PartitionedFilterWriter {
         self.approx_filter_size = 0;
         let partition_index = self.tli_handles.len() + self.pending_count();
         let range = self.partition_range(key);
+        self.table_hashes += hashes.len();
         if self.sizing.is_some() {
-            self.table_hashes += hashes.len();
             self.spilled_key = Some(key.clone());
         }
         #[cfg(feature = "std")]
@@ -775,10 +774,10 @@ impl<W: crate::io::Write + crate::io::Seek> FilterWriter<W> for PartitionedFilte
     fn finish(
         mut self: Box<Self>,
         file_writer: &mut crate::sfa::Writer<ChecksummedWriter<W>>,
-    ) -> crate::Result<usize> {
+    ) -> crate::Result<super::FilterOutput> {
         if self.last_key.is_none() {
             log::trace!("Filter writer has not seen any writes - not building filter");
-            return Ok(0);
+            return Ok(super::FilterOutput::default());
         }
 
         if !self.bloom_hash_buffer.is_empty() {
@@ -831,6 +830,13 @@ impl<W: crate::io::Write + crate::io::Seek> FilterWriter<W> for PartitionedFilte
 
         self.write_top_level_index(file_writer, index_base_offset)?;
 
-        Ok(block_count)
+        Ok(super::FilterOutput {
+            blocks: block_count,
+            hashes: if block_count == 0 {
+                0
+            } else {
+                self.table_hashes as u64
+            },
+        })
     }
 }

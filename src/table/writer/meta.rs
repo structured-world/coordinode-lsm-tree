@@ -23,6 +23,10 @@ pub struct Metadata {
     /// Written key count (unique keys)
     pub key_count: usize,
 
+    /// Hashes the table's filter holds, set when the filter is written; zero
+    /// without one.
+    pub filter_hashes: u64,
+
     /// Sum of user-key byte lengths across all written entries (every version,
     /// pairs with `item_count`). Drives the average-entry-shape introspection.
     pub sum_user_key_bytes: u64,
@@ -67,6 +71,7 @@ impl Default for Metadata {
             weak_tombstone_count: 0,
             weak_tombstone_reclaimable_count: 0,
             key_count: 0,
+            filter_hashes: 0,
             sum_user_key_bytes: 0,
             sum_value_bytes: 0,
             file_pos: BlockOffset(0),
