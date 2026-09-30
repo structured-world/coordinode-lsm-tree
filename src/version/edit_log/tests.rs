@@ -18,6 +18,35 @@ fn edit(id: u64) -> VersionEdit {
     }
 }
 
+/// A log named by a bare file name lies in the current directory: its first
+/// append syncs that directory as `.`, the name every backend accepts, not
+/// as the empty parent the name has.
+#[test]
+fn the_first_append_to_a_log_in_the_current_directory_syncs_it() -> crate::Result<()> {
+    let dir = tempfile::tempdir()?;
+    // Nextest runs each test in a process of its own.
+    std::env::set_current_dir(dir.path())?;
+    let mut scratch = Vec::new();
+    append_edit(
+        &StdFs,
+        Path::new("edits-0"),
+        &edit(1),
+        &mut scratch,
+        SyncMode::Normal,
+        true,
+    )?;
+    assert_eq!(
+        replay_log(
+            &StdFs,
+            Path::new("edits-0"),
+            ManifestRecoveryMode::AbsoluteConsistency,
+            None,
+        )?,
+        vec![edit(1)]
+    );
+    Ok(())
+}
+
 #[test]
 fn append_then_replay_roundtrips_all_edits() {
     let dir = tempfile::tempdir().expect("tempdir");

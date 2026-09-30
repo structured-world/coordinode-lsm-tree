@@ -182,6 +182,12 @@ pub struct SuperVersions {
     /// `seek` syscall pair on every flush / compaction install.
     log_bytes: Option<u64>,
 
+    /// Whether the current log's directory entry is known durable: synced by
+    /// an append of this history. Not the log's size: a first append whose
+    /// directory sync failed leaves a log that is not empty yet may still
+    /// vanish, and a log found at open may not have been synced before.
+    log_entry_synced: bool,
+
     /// Reusable payload-assembly buffer for edit appends — the scratch
     /// `edit_log::append_edit` documents as reusable; allocating it per
     /// install defeated that.
@@ -238,6 +244,7 @@ impl SuperVersions {
             snapshot_id,
             log_rotate_bytes,
             log_bytes: None,
+            log_entry_synced: false,
             edit_scratch: Vec::new(),
         }
     }
@@ -420,10 +427,11 @@ impl SuperVersions {
                 &edit,
                 &mut self.edit_scratch,
                 self.sync_mode,
-                log_size == 0,
+                !self.log_entry_synced,
             ) {
                 Ok(Some(appended)) => {
                     self.log_bytes = Some(log_size + appended);
+                    self.log_entry_synced = true;
                     return Ok(());
                 }
                 // The edit is too large for one appended record and nothing
@@ -454,6 +462,7 @@ impl SuperVersions {
         // The new generation's log: empty, or the one record completing a
         // version wider than a snapshot.
         self.log_bytes = Some(new_log_bytes);
+        self.log_entry_synced = false;
 
         // The durable commit point of a rotation is the CURRENT repoint inside
         // `persist_version` above — past it, the rotation has SUCCEEDED. Deleting

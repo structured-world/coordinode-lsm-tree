@@ -142,6 +142,55 @@ fn the_edit_log_of_acknowledged_flushes_survives_a_crash() -> crate::Result<()> 
     Ok(())
 }
 
+/// A failed sync of the new edit log's directory fails the flush, and the
+/// next flush syncs it again: the log is no longer empty then, but its
+/// directory entry is still not durable, and a flush acknowledged over it
+/// would be lost with it.
+#[test]
+fn a_failed_sync_of_the_edit_log_directory_is_retried() -> crate::Result<()> {
+    use crate::{AbstractTree, SequenceNumberCounter};
+
+    let crash = CrashFs::new(MemFs::new()).tracking_directory_entries();
+    let fault = FaultFs::new(crash.clone());
+    let injector = fault.injector();
+    let open = |fs: Arc<dyn Fs>| {
+        crate::Config::new(
+            "/db",
+            SequenceNumberCounter::default(),
+            SequenceNumberCounter::default(),
+        )
+        .with_shared_fs(fs)
+        .open()
+    };
+
+    {
+        let tree = open(Arc::new(fault))?;
+        // A flush syncs its table's directory, then, on the first edit of a
+        // generation, the log's: fail the second.
+        injector.arm(
+            FaultRule::new(FaultOp::SyncDirectory, Fault::Error(ErrorKind::Other))
+                .skip(1)
+                .once(),
+        );
+        tree.insert("a", "1", 0);
+        match tree.flush_active_memtable(0) {
+            Ok(()) => panic!("the injected directory sync fault must fail the flush"),
+            Err(e) => assert!(format!("{e}").contains("injected fault"), "{e}"),
+        }
+        tree.insert("b", "2", 1);
+        tree.flush_active_memtable(0)?;
+    }
+
+    crash.crash();
+
+    let tree = open(crash.inner())?;
+    assert!(
+        tree.contains_key("b", u64::MAX)?,
+        "the acknowledged flush survives the crash"
+    );
+    Ok(())
+}
+
 #[test]
 fn synced_content_survives_crash() {
     let fs = CrashFs::new(MemFs::new());

@@ -281,7 +281,10 @@ impl CrashFs {
 impl Fs for CrashFs {
     fn open(&self, path: &Path, opts: &FsOpenOptions) -> io::Result<Box<dyn FsFile>> {
         let writable = opts.write || opts.create || opts.create_new || opts.append || opts.truncate;
-        let creates = (opts.create || opts.create_new) && !self.inner.exists(path)?;
+        // Probed only while entries are tracked, so the wrapper otherwise
+        // makes no call the backend would not have seen.
+        let tracking = self.state.lock().track_entries;
+        let creates = tracking && (opts.create || opts.create_new) && !self.inner.exists(path)?;
         if writable {
             // Capture the pre-existing durable image BEFORE the open (which may
             // truncate); a brand-new file captures nothing, so a crash before its
