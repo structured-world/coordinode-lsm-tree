@@ -24,6 +24,7 @@ use alloc::vec::Vec;
 use super::projection::{MISTYPED, ProjectedField, conform, conform_lenient};
 use super::rows::SourceCursor;
 use super::{ColumnarScan, Segment, SegmentCursor, drop_columns, key_in_bounds};
+use super::{Resolved, UNREADABLE_BY_ID};
 use crate::table::columnar::{
     COL_SEQNO, COL_USER_KEY, COL_VALUE, COL_VALUE_TYPE, Column, ColumnBatch, TypeTag,
     bytes_column_row, bytes_column_span, fixed_u64_row, frame_bytes_column,
@@ -548,12 +549,12 @@ impl MergeStream {
             }
             (merged, resolved)
         } else {
-            (merged, false)
+            (merged, Resolved::default())
         };
         // An operand resolved to a value is read whole, so its cell in a
         // column no field declares is the operand's own: a loose predicate
         // cannot judge it.
-        let judged = judged && !(resolved && self.loose_predicate.is_some());
+        let judged = judged && !(resolved.any() && self.loose_predicate.is_some());
         let mut merged = if early {
             merged
         } else if judged {
@@ -565,15 +566,27 @@ impl MergeStream {
         if merged.row_count == 0 {
             return Ok(None);
         }
-        // A row returned from a batch that stores a projected field under
-        // another type fails the scan; a shadowed or filtered one did not.
-        if pending.iter().any(|pick| self.taken_from_mistyped(pick))
-            && self
-                .returned_picks(&merged, &pending)?
+        // Only a returned row is held to what its fields can be read as: a
+        // row a field projected by id cannot be read for fails the scan, and
+        // so does one from a batch that stores a projected field under another
+        // type, unless its operand was resolved and its fields read out of the
+        // merged value instead. A shadowed or filtered row did not.
+        if pending.iter().any(|pick| self.taken_from_mistyped(pick)) || resolved.any() {
+            let returned = self.returned_picks(&merged, &pending)?;
+            let keys = merged
+                .columns
                 .iter()
-                .any(|pick| self.taken_from_mistyped(pick))
-        {
-            return Err(MISTYPED);
+                .find(|c| c.column_id == COL_USER_KEY)
+                .ok_or(MISSING_COLUMN)?;
+            for (row, pick) in (0..merged.row_count).zip(&returned) {
+                let key = bytes_column_row(&keys.data, merged.row_count, row)?;
+                if resolved.unreadable(key) {
+                    return Err(UNREADABLE_BY_ID);
+                }
+                if self.taken_from_mistyped(pick) && !resolved.holds(key) {
+                    return Err(MISTYPED);
+                }
+            }
         }
         // A projected column left out because some chosen row lacked it is
         // brought back for the rows the predicate kept, when they all have it.

@@ -1097,6 +1097,67 @@ fn a_split_bytes_field_under_the_value_id_is_not_read_off_a_resolved_operand()
     Ok(())
 }
 
+/// A resolved operand a field projected by id cannot be read for fails the
+/// scan only when it is returned: filtered out by a predicate over a declared
+/// field read out of its merged value, it does not.
+#[test]
+fn a_resolved_operand_the_predicate_drops_does_not_fail_the_scan() -> lsm_tree::Result<()> {
+    use lsm_tree::table::columnar::{ByteOrder, Number, NumberKind};
+    use lsm_tree::table::columnar_predicate::{ColumnRangePredicate, PredicateApply};
+
+    let u32_le = Number::new(NumberKind::Unsigned, 4, ByteOrder::Little)?;
+    let folder = get_tmp_folder();
+    let any = split_operand_over_a_whole_value(folder.path(), 5, TypeTag::Number(u32_le))?;
+    // Field 4 is read out of the merged value, `row_value(10, 42)`; column 5
+    // is the operand's own and cannot be read out of it.
+    let projection = Projection::new()
+        .column(COL_USER_KEY)
+        .field(ProjectedField::new(
+            4,
+            TypeTag::Number(u32_le),
+            Absent::Null,
+        )?)
+        .column(5)
+        .projector(std::sync::Arc::new(TwoCells));
+    let scan_with = |fourth: u32| -> lsm_tree::Result<u32> {
+        let bound = u32_le.comparable(&fourth.to_le_bytes())?;
+        let predicate = ColumnRangePredicate {
+            column_id: 4,
+            lower: Some(bound.clone()),
+            upper: Some(bound),
+            apply: PredicateApply::Filter,
+        };
+        let mut returned = 0;
+        for batch in standard(&any).columnar_scan(&projection, Some(&predicate), SeqNo::MAX, ..)? {
+            returned += batch?.row_count;
+        }
+        Ok(returned)
+    };
+    assert_eq!(0, scan_with(999)?, "dropped by the predicate");
+    assert!(
+        matches!(scan_with(42), Err(Error::Projection(_))),
+        "returned, the row fails the scan"
+    );
+    Ok(())
+}
+
+/// A resolved operand's declared fields are read out of its merged value, so
+/// a field the operand itself stored under another type does not fail the
+/// scan: the row returned holds the field under the declared type.
+#[test]
+fn a_resolved_operand_storing_a_field_under_another_type_is_returned() -> lsm_tree::Result<()> {
+    use lsm_tree::table::columnar::{ByteOrder, Number, NumberKind};
+
+    let number = TypeTag::Number(Number::new(NumberKind::Unsigned, 4, ByteOrder::Little)?);
+    let folder = get_tmp_folder();
+    let any = split_operand_over_a_whole_value(folder.path(), 4, number)?;
+    assert_eq!(
+        vec![(key(0), Some(42))],
+        rows(standard(&any), &projected())?
+    );
+    Ok(())
+}
+
 /// A fixed-width field of width zero has no cell to hold, and a column of it
 /// is one no batch may carry, so declaring one is refused up front instead of
 /// failing, or panicking, once rows are projected into it.

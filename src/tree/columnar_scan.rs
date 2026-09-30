@@ -584,6 +584,42 @@ impl GroupStream {
     }
 }
 
+/// The rows of a batch whose operand was resolved to a value, by key.
+#[derive(Debug, Default)]
+pub(super) struct Resolved {
+    /// The keys resolved, sorted: their declared fields are read out of the
+    /// merged value, not out of the cells the operand carried.
+    keys: Vec<crate::Slice>,
+    /// Among them, sorted, the keys of rows a field projected by id alone
+    /// cannot be read for: returned, such a row fails the scan.
+    unreadable: Vec<crate::Slice>,
+}
+
+impl Resolved {
+    /// Whether any operand was resolved to a value.
+    pub(super) fn any(&self) -> bool {
+        !self.keys.is_empty()
+    }
+
+    /// Whether `key`'s operand was resolved to a value.
+    pub(super) fn holds(&self, key: &[u8]) -> bool {
+        self.keys.binary_search_by(|k| (**k).cmp(key)).is_ok()
+    }
+
+    /// Whether `key`'s row cannot be returned: a field projected by id alone
+    /// cannot be read out of its merged value.
+    pub(super) fn unreadable(&self, key: &[u8]) -> bool {
+        self.unreadable.binary_search_by(|k| (**k).cmp(key)).is_ok()
+    }
+}
+
+/// A returned row's operand was resolved to a value read whole, which a field
+/// projected by id alone cannot be read out of.
+pub(super) const UNREADABLE_BY_ID: Error = Error::Projection(
+    "projection: a merged value is read whole, and a field projected by id alone cannot be \
+     read out of it",
+);
+
 /// A batch lacks a column the scan decoded for itself.
 const MISSING_BATCH_COLUMN: Error =
     Error::InvalidHeader("columnar_scan: a batch is missing a column the scan decoded");
@@ -844,9 +880,9 @@ impl ColumnarScan {
     /// of each row carrying a whole value read out of it, and the carried
     /// value column dropped. Only returned rows get here, so a shadowed,
     /// deleted or invisible version is never resolved or projected. Also
-    /// returns whether an operand was resolved to a value: such a row holds
-    /// no cell of its own for a column no field declares.
-    pub(super) fn read_late(&self, batch: ColumnBatch) -> crate::Result<(ColumnBatch, bool)> {
+    /// returns which keys were resolved to a value: such a row holds no cell
+    /// of its own for a column no field declares.
+    pub(super) fn read_late(&self, batch: ColumnBatch) -> crate::Result<(ColumnBatch, Resolved)> {
         let (batch, resolved) = self.resolve_operands(batch)?;
         let mut batch = if self.declared {
             projection::project_decided(
@@ -866,21 +902,22 @@ impl ColumnarScan {
     /// scan's snapshot returns for its key, through the tree's own operator
     /// exactly as the read path resolves it: that value, carried as the row's
     /// whole value (and in the value column when it is projected by id), or
-    /// the row dropped when the read finds the key absent. Also returns
-    /// whether an operand was resolved to a value.
+    /// the row dropped when the read finds the key absent. Also returns which
+    /// keys were resolved to a value (see [`Resolved`]).
     ///
     /// The value an operand resolves to is read whole, like any row value: a
-    /// value field projected by id alone cannot be read out of it, so the
-    /// scan fails as it does for a whole value, instead of returning the
-    /// cell the operand itself carried.
-    fn resolve_operands(&self, batch: ColumnBatch) -> crate::Result<(ColumnBatch, bool)> {
+    /// value field projected by id alone cannot be read out of it, so such a
+    /// row is named unreadable, and the scan fails as it does for a whole
+    /// value if the row is returned, instead of returning the cell the
+    /// operand itself carried.
+    fn resolve_operands(&self, batch: ColumnBatch) -> crate::Result<(ColumnBatch, Resolved)> {
         use crate::table::columnar::{COL_VALUE, Column, frame_bytes_column};
 
         let Some(resolver) = &self.resolver else {
-            return Ok((batch, false));
+            return Ok((batch, Resolved::default()));
         };
         if !holds_operand(&batch) {
-            return Ok((batch, false));
+            return Ok((batch, Resolved::default()));
         }
         let row_count = batch.row_count;
         let rows = row_count as usize;
@@ -928,23 +965,29 @@ impl ColumnarScan {
         // its value whole holds the raw value under the value column's id: a
         // row of a table that splits its values carries no whole value, and
         // its cell under that id is a field like any other.
-        let resolved_any = resolved.iter().any(|fix| matches!(fix, Some(Some(_))));
         let whole = column(whole_at)?;
-        let split_resolved = (0..row_count)
-            .zip(&resolved)
-            .any(|(row, fix)| matches!(fix, Some(Some(_))) && !whole.is_valid(row));
-        if resolved_any
-            && self.fields.iter().any(|f| {
-                f.type_tag().is_none()
-                    && !(f.column_id() == COL_VALUE && raw_at.is_some() && !split_resolved)
-                    && batch.columns.iter().any(|c| c.column_id == f.column_id())
+        let by_id: Vec<u16> = self
+            .fields
+            .iter()
+            .filter(|f| {
+                f.type_tag().is_none() && batch.columns.iter().any(|c| c.column_id == f.column_id())
             })
-        {
-            return Err(crate::Error::Projection(
-                "projection: a merged value is read whole, and a field projected by id alone \
-                 cannot be read out of it",
-            ));
+            .map(projection::ProjectedField::column_id)
+            .collect();
+        let mut outcome = Resolved::default();
+        for (row, fix) in (0..row_count).zip(&resolved) {
+            if !matches!(fix, Some(Some(_))) {
+                continue;
+            }
+            let key = crate::Slice::from(bytes_column_row(&keys.data, row_count, row)?);
+            let raw_rewritten = raw_at.is_some() && whole.is_valid(row);
+            if by_id.iter().any(|&id| !(id == COL_VALUE && raw_rewritten)) {
+                outcome.unreadable.push(key.clone());
+            }
+            outcome.keys.push(key);
         }
+        outcome.keys.sort_unstable();
+        outcome.unreadable.sort_unstable();
 
         // The cells of bytes column `at` with the resolved rows' values in
         // place: a resolved row's cell is its value, the others as read.
@@ -1011,7 +1054,7 @@ impl ColumnarScan {
             batch
         };
         self.record_gather(&batch);
-        Ok((batch, resolved_any))
+        Ok((batch, outcome))
     }
 
     /// The next output batch of `stream`, or `None` once it is exhausted.
