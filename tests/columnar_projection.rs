@@ -333,6 +333,55 @@ fn a_shadowed_version_without_a_column_projected_by_id_does_not_fail_the_scan()
     Ok(())
 }
 
+/// A column projected by id that only some merged segments carry is held
+/// only to the rows the predicate returns: rows without it that the
+/// predicate drops fail nothing, and neither does an output it empties.
+#[test]
+fn a_column_projected_by_id_is_held_only_to_the_rows_the_predicate_returns() -> lsm_tree::Result<()>
+{
+    use lsm_tree::table::columnar::{COL_SEQNO, Number};
+    use lsm_tree::table::columnar_predicate::{ColumnRangePredicate, PredicateApply};
+
+    let folder = get_tmp_folder();
+    let any = open_columnar(folder.path());
+    // An older segment without column 4 around a newer one with it: one
+    // merged output takes rows of both.
+    ingest(&any, &[0, 2], &[(3, &[10, 12])]);
+    ingest(&any, &[1], &[(3, &[11]), (4, &[41])]);
+    let tree = standard(&any);
+    let newest = tree.get_highest_seqno().expect("ingested");
+    let by_id = Projection::new().column(COL_USER_KEY).column(4);
+    let scan_seqnos = |lower: u64, upper: u64| -> lsm_tree::Result<Vec<(Vec<u8>, u32)>> {
+        let predicate = ColumnRangePredicate {
+            column_id: COL_SEQNO,
+            lower: Some(Number::U64_LE.comparable(&lower.to_le_bytes())?),
+            upper: Some(Number::U64_LE.comparable(&upper.to_le_bytes())?),
+            apply: PredicateApply::Filter,
+        };
+        let mut got = Vec::new();
+        for batch in tree.columnar_scan(&by_id, Some(&predicate), SeqNo::MAX, ..)? {
+            let batch = batch?;
+            let (keys, fourth) = (&batch.columns[0], &batch.columns[1]);
+            for row in 0..batch.row_count {
+                let at = row as usize * 4;
+                got.push((
+                    bytes_cell(&keys.data, batch.row_count, row),
+                    u32::from_le_bytes(fourth.data[at..at + 4].try_into().expect("u32 cell")),
+                ));
+            }
+        }
+        Ok(got)
+    };
+    // Only the newer segment's row passes.
+    assert_eq!(vec![(key(1), 41)], scan_seqnos(newest, newest)?);
+    // No row passes.
+    assert_eq!(
+        Vec::<(Vec<u8>, u32)>::new(),
+        scan_seqnos(newest + 10, newest + 20)?
+    );
+    Ok(())
+}
+
 /// A newer version written without field 4 does not take the older
 /// version's field 4: absence reads as declared, not by inheritance.
 #[test]
@@ -411,10 +460,10 @@ fn declared_fields_over_whole_values_without_a_projector_are_refused() {
     let got = rows(tree, &projection(Absent::Null));
     assert!(matches!(got, Err(Error::Projection(_))), "got {got:?}");
     // By id the value column still reads as stored.
-    assert!(
-        tree.columnar_scan(&[COL_USER_KEY, 3], None, SeqNo::MAX, ..)
-            .is_ok()
-    );
+    let by_id = tree
+        .columnar_scan(&[COL_USER_KEY, 3], None, SeqNo::MAX, ..)
+        .and_then(|scan| scan.collect::<lsm_tree::Result<Vec<_>>>());
+    assert!(by_id.is_ok(), "got {by_id:?}");
 }
 
 /// A row value holding fields 3 and 4, in the form a read of a two-column

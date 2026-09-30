@@ -495,7 +495,7 @@ impl MergeStream {
         for source in &mut self.sources {
             source.referenced = false;
         }
-        let Some((merged, judged)) = built else {
+        let Some((merged, judged, left_out)) = built else {
             return Ok(None);
         };
         scan.record_gather(&merged);
@@ -519,11 +519,128 @@ impl MergeStream {
             *support = (*support).min(PredicateSupport::Unsupported);
             merged
         };
+        if merged.row_count == 0 {
+            return Ok(None);
+        }
+        // A projected column left out because some chosen row lacked it is
+        // brought back for the rows the predicate kept, when they all have it.
+        if !left_out.is_empty() {
+            self.fill_left_out(&mut merged, &pending, &left_out, &scan.fields)?;
+        }
         // Match the singleton contract: yield exactly the projected columns.
         drop_columns(&mut merged, &self.dropped);
         // The rows returned are decided: each is held to the declarations.
         let merged = conform(merged, &scan.fields)?;
-        Ok((merged.row_count > 0).then_some(merged))
+        Ok(Some(merged))
+    }
+
+    /// Adds to `merged`, the rows returned out of the chosen `pending` ones,
+    /// each `left_out` column a field of `fields` projects, gathered from the
+    /// batches those rows come from, when every one of them carries it under
+    /// one type. A column some returned row lacks stays out, and the row
+    /// fails the conform that follows.
+    fn fill_left_out(
+        &self,
+        merged: &mut ColumnBatch,
+        pending: &[Pick],
+        left_out: &[u16],
+        fields: &[ProjectedField],
+    ) -> crate::Result<()> {
+        let keys = merged
+            .columns
+            .iter()
+            .find(|c| c.column_id == COL_USER_KEY)
+            .ok_or(MISSING_COLUMN)?;
+        // The returned rows keep the order they were chosen in and their keys
+        // are distinct, so each is the next chosen row with its key.
+        let mut returned: Vec<&Pick> = Vec::with_capacity(merged.row_count as usize);
+        let mut picks = pending.iter();
+        for row in 0..merged.row_count {
+            let key = bytes_column_row(&keys.data, merged.row_count, row)?;
+            let pick = picks
+                .find(|pick| {
+                    self.sources
+                        .get(pick.source)
+                        .and_then(|s| {
+                            let batch = s.batch.as_ref()?;
+                            let column = batch.columns.get(s.key_col)?;
+                            bytes_column_row(&column.data, batch.row_count, pick.row).ok()
+                        })
+                        .is_some_and(|chosen| chosen == key)
+                })
+                .ok_or(Error::InvalidHeader(
+                    "columnar_scan: a returned row is not among the rows chosen",
+                ))?;
+            returned.push(pick);
+        }
+
+        let rows = returned.len();
+        for &id in left_out {
+            if !fields.iter().any(|f| f.column_id() == id) {
+                continue;
+            }
+            // Each returned row's cell in the column, or `None` when its batch
+            // lacks the column.
+            let mut located: Vec<(&Column, u32, u32)> = Vec::with_capacity(rows);
+            for pick in &returned {
+                let Some(batch) = self.sources.get(pick.source).and_then(|s| s.batch.as_ref())
+                else {
+                    break;
+                };
+                let Some(column) = batch.columns.iter().find(|c| c.column_id == id) else {
+                    break;
+                };
+                located.push((column, batch.row_count, pick.row));
+            }
+            let Some(&(first, _, _)) = located.first() else {
+                continue;
+            };
+            let type_tag = first.type_tag;
+            if located.len() != rows || located.iter().any(|(c, _, _)| c.type_tag != type_tag) {
+                continue;
+            }
+            let data = if let Some(width) = type_tag.fixed_width() {
+                let width = usize::from(width);
+                let mut out = Vec::with_capacity(rows * width);
+                for &(column, _, row) in &located {
+                    let start = row as usize * width;
+                    out.extend_from_slice(
+                        column
+                            .data
+                            .get(start..start + width)
+                            .ok_or(MISSING_COLUMN)?,
+                    );
+                }
+                crate::Slice::from(out)
+            } else {
+                let mut cells: Vec<&[u8]> = Vec::with_capacity(rows);
+                for &(column, count, row) in &located {
+                    cells.push(bytes_column_row(&column.data, count, row)?);
+                }
+                frame_bytes_column(rows, || cells.iter().copied())?
+            };
+            let validity = located
+                .iter()
+                .any(|(c, _, _)| c.validity.is_some())
+                .then(|| {
+                    let mut bits = alloc::vec![0u8; rows.div_ceil(8)];
+                    for (at, &(column, _, row)) in located.iter().enumerate() {
+                        if column.is_valid(row)
+                            && let Some(byte) = bits.get_mut(at / 8)
+                        {
+                            *byte |= 1 << (at % 8);
+                        }
+                    }
+                    bits
+                });
+            merged.columns.push(Column {
+                column_id: id,
+                type_tag,
+                validity,
+                data,
+            });
+        }
+        Ok(())
     }
 
     /// The chosen rows as one batch, in the order they were chosen, each column
@@ -532,10 +649,10 @@ impl MergeStream {
     /// seqno, since the rows come from segments with different bases.
     ///
     /// A loose column the chosen rows do not all carry under one type is left
-    /// out, so a projected one fails the rows once they are conformed. Also
-    /// returns whether the predicate can judge the rows: `false` when its
-    /// loose column is left out.
-    fn build(&self, pending: &[Pick]) -> crate::Result<(ColumnBatch, bool)> {
+    /// out and named in the third result, for [`Self::fill_left_out`] to bring
+    /// back for the rows returned. Also returns whether the predicate can
+    /// judge the rows: `false` when its loose column is left out.
+    fn build(&self, pending: &[Pick]) -> crate::Result<(ColumnBatch, bool, Vec<u16>)> {
         use crate::table::columnar::{Column, frame_bytes_column, gather_fixed_column};
 
         const NOT_KEPT: Error =
@@ -686,7 +803,7 @@ impl MergeStream {
                 data,
             });
         }
-        Ok((ColumnBatch { row_count, columns }, judged))
+        Ok((ColumnBatch { row_count, columns }, judged, left_out))
     }
 }
 
