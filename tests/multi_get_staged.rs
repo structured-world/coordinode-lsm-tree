@@ -374,6 +374,46 @@ fn a_refused_stage_still_answers_the_query() -> lsm_tree::Result<()> {
     Ok(())
 }
 
+/// A read that fails at any point of a cold level read, in the filter, the
+/// index or the data stage, leaves the tables it was for to the serial path,
+/// which reads them again: under the fault-injection filesystem, one failed
+/// read at every position in turn, the answer is always the key-by-key one.
+#[test]
+fn a_read_failing_at_any_stage_under_fault_injection_still_answers() -> lsm_tree::Result<()> {
+    use lsm_tree::fs::{Fault, FaultFs, FaultOp, FaultRule};
+
+    let reads = |skip: Option<u64>| -> lsm_tree::Result<(usize, bool)> {
+        let dir = tempfile::tempdir()?;
+        let faulty = FaultFs::new(StdFs);
+        let injector = faulty.injector();
+        let fs: Arc<dyn Fs> = Arc::new(faulty);
+        let (tree, keys) = tree_on(dir.path(), Shape::Partitioned, 4, LARGE_CACHE, &fs)?;
+        if let Some(skip) = skip {
+            injector.arm(
+                FaultRule::new(
+                    FaultOp::ReadAt,
+                    Fault::Error(io::ErrorKind::PermissionDenied),
+                )
+                .skip(skip)
+                .once(),
+            );
+        }
+        let before = injector.read_count();
+        let values = tree.multi_get(&keys, SeqNo::MAX)?;
+        let count = injector.read_count() - before;
+        injector.clear();
+        Ok((count, values == one_by_one(&tree, &keys)?))
+    };
+    let (count, agree) = reads(None)?;
+    assert!(agree);
+    assert!(count > 2, "a cold level read reads its stages, got {count}");
+    for skip in 0..count as u64 {
+        let (_, agree) = reads(Some(skip))?;
+        assert!(agree, "read {skip} of {count} failed");
+    }
+    Ok(())
+}
+
 /// What a [`SlowFirstFs`] saw: the reads submitted before its queue was first
 /// waited on, and the reads submitted by the time the first of them finished.
 #[derive(Default)]

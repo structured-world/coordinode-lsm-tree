@@ -8,7 +8,8 @@
 //! partitions, index partitions and data blocks through the ring. Level 0
 //! holds `t` tables that all span the key range, each holding every `t`-th
 //! key, so a batch consults the filter of every one of them and finds each key
-//! in exactly one.
+//! in exactly one. The last layout puts half the keys in the last level under
+//! four such level-0 tables, so half a batch is read through two levels.
 //!
 //! Prints, per table count and batch size, the median, p99 and p999 wall time
 //! per batch over at least a thousand batches, and the filter, index and data
@@ -49,7 +50,10 @@ fn run() -> Result<(), Box<dyn std::error::Error>> {
         state % KEYS
     };
 
-    for tables in [1u64, 4, 16] {
+    // Level 0 holding `tables` tables, over a last level holding the other
+    // half of the keys when `deep`: a key of the last level is read through
+    // the level-0 filters first.
+    for (tables, deep) in [(1u64, false), (4, false), (16, false), (4, true)] {
         let dir = tempfile::tempdir()?;
         let tree = Config::new(
             dir.path(),
@@ -74,13 +78,30 @@ fn run() -> Result<(), Box<dyn std::error::Error>> {
         .open()?;
 
         let mut seqno = 0;
-        for table in 0..tables {
-            for i in (table..KEYS).step_by(usize::try_from(tables)?) {
+        let level0: Vec<u64> = if deep {
+            for i in (0..KEYS).step_by(2) {
+                tree.insert(key(i), vec![0xABu8; 256], seqno);
+                seqno += 1;
+            }
+            tree.flush_active_memtable(0)?;
+            tree.major_compact(64 * 1_024 * 1_024, u64::MAX)?;
+            (1..KEYS).step_by(2).collect()
+        } else {
+            (0..KEYS).collect()
+        };
+        let stride = usize::try_from(tables)?;
+        for table in 0..stride {
+            for &i in level0.iter().skip(table).step_by(stride) {
                 tree.insert(key(i), vec![0xABu8; 256], seqno);
                 seqno += 1;
             }
             tree.flush_active_memtable(0)?;
         }
+        let layout = if deep {
+            format!("{tables} tables over the last level")
+        } else {
+            format!("{tables} tables")
+        };
 
         for batch in [8usize, 64] {
             let mut wall = Vec::with_capacity(ROUNDS);
@@ -100,7 +121,7 @@ fn run() -> Result<(), Box<dyn std::error::Error>> {
             let rounds = u64::try_from(ROUNDS)?;
             let metrics = tree.metrics();
             println!(
-                "{tables} tables, batch {batch}: wall p50 {:?} p99 {:?} p999 {:?}; \
+                "{layout}, batch {batch}: wall p50 {:?} p99 {:?} p999 {:?}; \
                  bytes per batch: filter {} index {} data {}",
                 quantile(&mut wall, 0.5),
                 quantile(&mut wall, 0.99),
