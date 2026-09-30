@@ -98,6 +98,158 @@ fn request_interruptible_zero_rate_is_immediate_passthrough() {
     assert!(start.elapsed() < ms(500), "rate 0 must not sleep");
 }
 
+/// A new rate is what the next request is measured against: with the burst
+/// drained, a 1000 B request at 2000 B/s owes half a second, not one.
+#[test]
+fn a_raised_rate_takes_effect_on_the_next_request() {
+    let rl = RateLimiter::new(1_000);
+    assert_eq!(Duration::ZERO, rl.acquire_wait(1_000, ms(0)));
+    rl.set_rate_at(2_000, ms(0));
+    assert_eq!(2_000, rl.rate());
+    assert_eq!(ms(500), rl.acquire_wait(1_000, ms(0)));
+}
+
+/// The burst ceiling is one second of the CURRENT rate: after a raise from
+/// 1000 to 5000 B/s, ten idle seconds refill 5000 B, not the old 1000 B.
+#[test]
+fn a_raised_rate_raises_the_burst_ceiling() {
+    let rl = RateLimiter::new(1_000);
+    rl.set_rate_at(5_000, Duration::from_secs(10));
+    assert_eq!(
+        Duration::ZERO,
+        rl.acquire_wait(5_000, Duration::from_secs(20))
+    );
+    assert_eq!(
+        Duration::from_secs(1),
+        rl.acquire_wait(5_000, Duration::from_secs(20))
+    );
+}
+
+/// Credit above the new ceiling is dropped on a lower rate: a full 1000 B
+/// bucket lowered to 100 B/s keeps 100 B, so the second 100 B request waits
+/// a full second.
+#[test]
+fn a_lowered_rate_drops_credit_above_the_new_ceiling() {
+    let rl = RateLimiter::new(1_000);
+    rl.set_rate_at(100, ms(0));
+    assert_eq!(Duration::ZERO, rl.acquire_wait(100, ms(0)));
+    assert_eq!(Duration::from_secs(1), rl.acquire_wait(100, ms(0)));
+}
+
+/// Debt is owed bytes and stays owed across a change: 1000 B of debt at
+/// 1000 B/s is a second; at 2000 B/s the same debt is half a second.
+#[test]
+fn debt_is_kept_in_bytes_across_a_rate_change() {
+    let rl = RateLimiter::new(1_000);
+    assert_eq!(Duration::ZERO, rl.acquire_wait(1_000, ms(0)));
+    assert_eq!(Duration::from_secs(1), rl.acquire_wait(1_000, ms(0)));
+    rl.set_rate_at(2_000, ms(0));
+    // A zero-byte request reports what is still owed.
+    assert_eq!(ms(500), rl.acquire_wait(0, ms(0)));
+}
+
+/// Settling up to the change uses the old rate: half a second at 1000 B/s
+/// refills 500 B, carried into the 2000 B/s bucket.
+#[test]
+fn time_before_a_change_refills_at_the_old_rate() {
+    let rl = RateLimiter::new(1_000);
+    assert_eq!(Duration::ZERO, rl.acquire_wait(1_000, ms(0)));
+    rl.set_rate_at(2_000, ms(500));
+    assert_eq!(Duration::ZERO, rl.acquire_wait(500, ms(500)));
+    assert_eq!(ms(250), rl.acquire_wait(500, ms(500)));
+}
+
+/// A limiter switched on from 0 starts as if built at that moment: a
+/// one-second burst of the new rate and no credit for the unthrottled time.
+#[test]
+fn switching_on_from_zero_starts_a_fresh_one_second_burst() {
+    let rl = RateLimiter::new(0);
+    rl.set_rate_at(1_000, Duration::from_secs(100));
+    assert_eq!(
+        Duration::ZERO,
+        rl.acquire_wait(1_000, Duration::from_secs(100))
+    );
+    assert_eq!(
+        Duration::from_secs(1),
+        rl.acquire_wait(1_000, Duration::from_secs(100))
+    );
+}
+
+/// A long unthrottled period between two throttled ones earns nothing: the
+/// bucket switched back on holds one second of rate, not the idle time.
+#[test]
+fn an_unthrottled_period_grants_no_credit() {
+    let rl = RateLimiter::new(1_000);
+    assert_eq!(Duration::ZERO, rl.acquire_wait(1_000, ms(0)));
+    assert_eq!(Duration::from_secs(1), rl.acquire_wait(1_000, ms(0)));
+    rl.set_rate_at(0, ms(0));
+    rl.set_rate_at(1_000, Duration::from_secs(1_000));
+    assert_eq!(
+        Duration::ZERO,
+        rl.acquire_wait(1_000, Duration::from_secs(1_000))
+    );
+    assert_eq!(
+        Duration::from_secs(1),
+        rl.acquire_wait(1_000, Duration::from_secs(1_000))
+    );
+}
+
+/// Switched off, every request is immediate, whatever debt the bucket held.
+#[test]
+fn switching_off_makes_requests_immediate() {
+    let rl = RateLimiter::new(1_000);
+    assert_eq!(Duration::ZERO, rl.acquire_wait(1_000, ms(0)));
+    assert_eq!(Duration::from_secs(1), rl.acquire_wait(1_000, ms(0)));
+    rl.set_rate_at(0, ms(0));
+    assert_eq!(0, rl.rate());
+    assert_eq!(Duration::ZERO, rl.acquire_wait(1_000_000, ms(0)));
+}
+
+/// A caller already sleeping out a debt is released when throttling is
+/// switched off, instead of sleeping the wait computed at the old rate.
+#[cfg(feature = "std")]
+#[test]
+fn switching_off_releases_a_caller_mid_wait() {
+    let rl = alloc::sync::Arc::new(RateLimiter::new(1));
+    let waiter = {
+        let rl = alloc::sync::Arc::clone(&rl);
+        std::thread::spawn(move || {
+            let start = std::time::Instant::now();
+            // 1 B/s: roughly an hour of debt.
+            let stopped = rl.request_interruptible(3_600, || false);
+            (stopped, start.elapsed())
+        })
+    };
+    std::thread::sleep(ms(300));
+    rl.set_rate(0);
+    let (stopped, took) = waiter.join().unwrap();
+    assert!(!stopped, "a released caller proceeds, it is not stopped");
+    assert!(took < Duration::from_secs(5), "released after {took:?}");
+}
+
+/// A caller mid-wait pays the rest of its debt at the new rate: a two-second
+/// wait at 1000 B/s ends within a second once the rate is raised a
+/// thousandfold.
+#[cfg(feature = "std")]
+#[test]
+fn a_caller_mid_wait_finishes_at_the_new_rate() {
+    let rl = alloc::sync::Arc::new(RateLimiter::new(1_000));
+    let waiter = {
+        let rl = alloc::sync::Arc::clone(&rl);
+        std::thread::spawn(move || {
+            let start = std::time::Instant::now();
+            // 1000 B of burst, then 2000 B of debt: two seconds at 1000 B/s.
+            let stopped = rl.request_interruptible(3_000, || false);
+            (stopped, start.elapsed())
+        })
+    };
+    std::thread::sleep(ms(150));
+    rl.set_rate(1_000_000);
+    let (stopped, took) = waiter.join().unwrap();
+    assert!(!stopped);
+    assert!(took < Duration::from_secs(1), "finished after {took:?}");
+}
+
 #[test]
 fn backwards_clock_step_does_not_underflow() {
     // A non-monotonic `now` (earlier than last_refill) must not panic

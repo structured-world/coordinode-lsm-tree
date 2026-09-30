@@ -72,29 +72,89 @@ struct Bucket {
     last_refill_nanos: u128,
 }
 
-/// Compaction I/O rate limiter (leaky token bucket).
-///
-/// Share across compaction invocations by wrapping in `Arc`; the limiter
-/// is `Sync` (all mutable state is behind a lock / atomics).
-///
-/// A `rate_bytes_per_sec` of `0` disables throttling entirely: every
-/// request returns immediately.
-#[derive(Debug)]
 #[cfg_attr(
     not(feature = "std"),
     allow(
         dead_code,
-        reason = "no_std-ready limiter fields read only by acquire_wait, which awaits a clock-injecting no_std caller"
+        reason = "no_std-ready token-bucket state; awaits a clock-injecting no_std caller"
     )
 )]
+impl Bucket {
+    /// A bucket holding one second of `rate`, refilled as of `now_nanos`, so
+    /// the first request is not penalised.
+    fn full(rate: u64, now_nanos: u128) -> Self {
+        Self {
+            available: i64::try_from(rate).unwrap_or(i64::MAX),
+            last_refill_nanos: now_nanos,
+        }
+    }
+
+    /// Adds what `rate` accrued since the last refill, capped at one second
+    /// of it. `saturating_sub` guards against a non-monotonic `now` (the
+    /// clock should be monotonic, but a backwards step must not underflow).
+    fn refill(&mut self, rate: u64, now_nanos: u128) {
+        let elapsed = now_nanos.saturating_sub(self.last_refill_nanos);
+        if elapsed == 0 {
+            return;
+        }
+        let refilled = elapsed.saturating_mul(u128::from(rate)) / NANOS_PER_SEC;
+        // Fits in i64 for any realistic elapsed/rate; clamped so an absurd
+        // elapsed cannot overflow the add.
+        let refilled = i64::try_from(refilled).unwrap_or(i64::MAX);
+        self.available = self.available.saturating_add(refilled);
+        self.cap(rate);
+        self.last_refill_nanos = now_nanos;
+    }
+
+    /// Drops credit above one second of `rate`; debt is left as it is.
+    fn cap(&mut self, rate: u64) {
+        let ceiling = i64::try_from(rate).unwrap_or(i64::MAX);
+        if self.available > ceiling {
+            self.available = ceiling;
+        }
+    }
+}
+
+/// Compaction I/O rate limiter (leaky token bucket).
+///
+/// One limiter bounds every compaction that holds it: a tree builds its own
+/// from [`Config::compaction_rate_limit`](crate::Config::compaction_rate_limit),
+/// or several trees are handed one through
+/// [`Config::compaction_rate_limiter`](crate::Config::compaction_rate_limiter)
+/// and share its budget. The limiter owns the rate, so a retune through
+/// [`set_rate`](Self::set_rate) is seen by every holder on its next request.
+///
+/// A rate of `0` disables throttling entirely: every request returns
+/// immediately. The bucket holds at most one second of the current rate, so
+/// an idle limiter grants a one-second burst and no more.
+///
+/// **Fairness.** Each caller debits the bucket per item and sleeps out its
+/// own deficit, so a long compaction yields between items rather than
+/// holding a reservation. Beyond that there is no ordering between callers:
+/// whoever debits first pays first.
+///
+/// # Examples
+///
+/// ```
+/// use lsm_tree::rate_limiter::RateLimiter;
+/// use std::time::Duration;
+///
+/// let limiter = RateLimiter::new(1_000);
+/// // The first second of rate is available at once.
+/// assert_eq!(limiter.acquire_wait(1_000, Duration::ZERO), Duration::ZERO);
+/// // Raising the rate shortens what the next request owes.
+/// limiter.set_rate_at(2_000, Duration::ZERO);
+/// assert_eq!(
+///     limiter.acquire_wait(1_000, Duration::ZERO),
+///     Duration::from_millis(500),
+/// );
+/// ```
+#[derive(Debug)]
 pub struct RateLimiter {
     /// Refill rate in bytes per second. `0` means unlimited (disabled).
+    /// Written only under the bucket lock, so a request that holds the lock
+    /// sees the rate its bucket state was settled against.
     rate_bytes_per_sec: AtomicU64,
-    /// Maximum positive budget the bucket may accumulate, in bytes: one
-    /// second of rate, so an idle limiter grants a one-second burst but no
-    /// more (prevents a long-idle compactor from dumping an unbounded
-    /// backlog at full speed).
-    burst_bytes: u64,
     bucket: Mutex<Bucket>,
 }
 
@@ -107,14 +167,59 @@ impl RateLimiter {
     pub fn new(rate_bytes_per_sec: u64) -> Self {
         Self {
             rate_bytes_per_sec: AtomicU64::new(rate_bytes_per_sec),
-            burst_bytes: rate_bytes_per_sec,
-            bucket: Mutex::new(Bucket {
-                // Start with a full one-second burst so the first request
-                // after construction is not penalised.
-                available: i64::try_from(rate_bytes_per_sec).unwrap_or(i64::MAX),
-                last_refill_nanos: 0,
-            }),
+            bucket: Mutex::new(Bucket::full(rate_bytes_per_sec, 0)),
         }
+    }
+
+    /// The current rate in bytes per second; `0` when throttling is off.
+    #[must_use]
+    pub fn rate(&self) -> u64 {
+        self.rate_bytes_per_sec.load(Ordering::Relaxed)
+    }
+
+    /// Changes the rate at monotonic time `now`, for every holder of this
+    /// limiter; the next request is measured against it.
+    ///
+    /// What the bucket holds across the change:
+    ///
+    /// - time up to `now` refills at the old rate;
+    /// - credit above one second of the new rate is dropped, so a lower rate
+    ///   does not keep an old, larger burst;
+    /// - debt is owed bytes and stays owed, repaid at the new rate;
+    /// - switching on from `0` starts a fresh bucket, one second of the new
+    ///   rate, as [`new`](Self::new) does: the unthrottled time earns no
+    ///   credit;
+    /// - switching to `0` makes every request immediate, and a caller already
+    ///   sleeping in [`request_interruptible`](Self::request_interruptible)
+    ///   stops sleeping.
+    ///
+    /// `now` is on the same clock as [`acquire_wait`](Self::acquire_wait);
+    /// with the `std` feature, [`set_rate`](Self::set_rate) reads it.
+    pub fn set_rate_at(&self, bytes_per_sec: u64, now: Duration) {
+        let now_nanos = now.as_nanos();
+        let mut bucket = self.bucket.lock();
+        let old = self.rate_bytes_per_sec.load(Ordering::Relaxed);
+        if old == bytes_per_sec {
+            return;
+        }
+        if old == 0 {
+            *bucket = Bucket::full(bytes_per_sec, now_nanos);
+        } else {
+            bucket.refill(old, now_nanos);
+            if bytes_per_sec != 0 {
+                bucket.cap(bytes_per_sec);
+            }
+        }
+        self.rate_bytes_per_sec
+            .store(bytes_per_sec, Ordering::Relaxed);
+    }
+
+    /// Changes the rate now; see [`set_rate_at`](Self::set_rate_at) for what
+    /// the bucket holds across the change.
+    // no-std: set_rate_at with a caller-provided monotonic clock
+    #[cfg(feature = "std")]
+    pub fn set_rate(&self, bytes_per_sec: u64) {
+        self.set_rate_at(bytes_per_sec, Self::std_now());
     }
 
     /// Core decision: how long the caller must wait before issuing an I/O
@@ -134,32 +239,21 @@ impl RateLimiter {
         )
     )]
     pub fn acquire_wait(&self, bytes: u64, now: Duration) -> Duration {
+        if self.rate_bytes_per_sec.load(Ordering::Relaxed) == 0 {
+            return Duration::ZERO;
+        }
+        let now_nanos = now.as_nanos();
+
+        let mut bucket = self.bucket.lock();
+        // Read again under the lock: the rate the bucket was last settled
+        // against, which a concurrent change may have moved since the check
+        // above.
         let rate = self.rate_bytes_per_sec.load(Ordering::Relaxed);
         if rate == 0 {
             return Duration::ZERO;
         }
-        let now_nanos = now.as_nanos();
         let rate_u128 = u128::from(rate);
-
-        let mut bucket = self.bucket.lock();
-
-        // Refill: add the bytes that accrued since the last refill, then
-        // cap at the burst ceiling. `saturating_sub` guards against a
-        // non-monotonic `now` (clock should be monotonic, but never let a
-        // backwards step underflow).
-        let elapsed = now_nanos.saturating_sub(bucket.last_refill_nanos);
-        if elapsed > 0 {
-            let refilled = elapsed.saturating_mul(rate_u128) / NANOS_PER_SEC;
-            // refilled fits in i64 for any realistic elapsed/rate; clamp
-            // defensively so an absurd elapsed can't overflow the add.
-            let refilled = i64::try_from(refilled).unwrap_or(i64::MAX);
-            bucket.available = bucket.available.saturating_add(refilled);
-            let burst_i64 = i64::try_from(self.burst_bytes).unwrap_or(i64::MAX);
-            if bucket.available > burst_i64 {
-                bucket.available = burst_i64;
-            }
-            bucket.last_refill_nanos = now_nanos;
-        }
+        bucket.refill(rate, now_nanos);
 
         // Debit the request. Going negative is the debt the caller pays
         // off by waiting.
@@ -213,16 +307,37 @@ impl RateLimiter {
             return true;
         }
         // Debit once, then sleep the computed wait in interruptible chunks.
+        let mut rate = self.rate_bytes_per_sec.load(Ordering::Relaxed);
         let mut remaining = self.acquire_wait(bytes, Self::std_now());
         while !remaining.is_zero() {
             if should_stop() {
                 return true;
+            }
+            // A rate changed mid-wait applies to what is still owed: switched
+            // off, the caller goes; otherwise the rest is repaid at the new
+            // rate (owed bytes = remaining time × old rate).
+            let now_rate = self.rate_bytes_per_sec.load(Ordering::Relaxed);
+            if now_rate == 0 {
+                return false;
+            }
+            if now_rate != rate {
+                remaining = Self::rescale(remaining, rate, now_rate);
+                rate = now_rate;
+                continue;
             }
             let chunk = remaining.min(Self::POLL_INTERVAL);
             std::thread::sleep(chunk);
             remaining = remaining.saturating_sub(chunk);
         }
         false
+    }
+
+    /// `remaining` owed at `from` bytes/s, expressed at `to` bytes/s. Both
+    /// rates are nonzero.
+    #[cfg(feature = "std")]
+    fn rescale(remaining: Duration, from: u64, to: u64) -> Duration {
+        let nanos = remaining.as_nanos().saturating_mul(u128::from(from)) / u128::from(to);
+        Duration::from_nanos(u64::try_from(nanos).unwrap_or(u64::MAX))
     }
 
     /// `no_std` variant: there is no ambient monotonic clock to throttle
