@@ -30,6 +30,15 @@ json="${body#"$prefix"}"
 # Unversioned suites: the costs suite and the per-host rate suites, named
 # before a version line was part of the name.
 unversioned='. == "lsm-tree db_bench costs" or startswith("lsm-tree db_bench · ")'
+
+# The rate suite once had no host in its name either. The published data no
+# longer holds it (its points live in the suite of the host that measured
+# them), and a split cannot tell which host such points came from, so a file
+# that still has it is refused rather than split without them.
+if jq -e '.entries | has("lsm-tree db_bench")' <<<"$json" >/dev/null; then
+  echo "split-bench-series: $file still has the suite 'lsm-tree db_bench' with no host; assign its points to a host suite first" >&2
+  exit 1
+fi
 ids="$(jq -r "[.entries | to_entries[] | select(.key | $unversioned) | .value[].commit.id] | unique[]" <<<"$json")"
 if [ -z "$ids" ]; then
   echo "split-bench-series: no unversioned suite in $file" >&2

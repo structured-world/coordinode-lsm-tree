@@ -597,8 +597,24 @@ jobs:
           HTML_HEAD
             # The overlay is a snapshot replaced on every run, from main or a
             # manual dispatch, so it says which line and commit it measured.
+            # A branch name may hold `&`, `<`, `>` and `"` (git check-ref-format
+            # allows them), so it is escaped for HTML, with shell built-ins
+            # only: the Git for Windows shell may ship no sed.
+            ref_html=""
+            rest="$MEASURED_REF"
+            while [ -n "$rest" ]; do
+              c="${rest%"${rest#?}"}"
+              rest="${rest#?}"
+              case "$c" in
+                '&') ref_html="$ref_html&amp;" ;;
+                '<') ref_html="$ref_html&lt;" ;;
+                '>') ref_html="$ref_html&gt;" ;;
+                '"') ref_html="$ref_html&quot;" ;;
+                *) ref_html="$ref_html$c" ;;
+              esac
+            done
             printf '<p class="intro">Measured on the <strong>%s.x</strong> line: <code>%s</code> at <a href="https://github.com/%s/commit/%s">%s</a>.</p>\n' \
-              "$LINE_MAJOR" "$MEASURED_REF" "$REPO" "$MEASURED_SHA" "${MEASURED_SHA:0:9}"
+              "$LINE_MAJOR" "$ref_html" "$REPO" "$MEASURED_SHA" "${MEASURED_SHA:0:9}"
             for d in "$work"/dev/compare/*/; do
               name="$(basename "$d")"
               [ -f "$d/report/lines.svg" ] || continue
