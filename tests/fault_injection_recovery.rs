@@ -137,6 +137,58 @@ fn blob_files_of_an_acknowledged_write_survive_a_crash() -> lsm_tree::Result<()>
     Ok(())
 }
 
+/// A failed sync of the new edit log's directory fails the flush, and the
+/// next flush syncs it again: the log is no longer empty then, but its
+/// directory entry is still not durable, and a flush acknowledged over it
+/// would be lost with it.
+#[test]
+fn a_failed_sync_of_the_edit_log_directory_is_retried() -> lsm_tree::Result<()> {
+    let crash = CrashFs::new(MemFs::new());
+    let fault = FaultFs::new(crash.clone());
+    let injector = fault.injector();
+    let db = "/db";
+
+    {
+        let tree = lsm_tree::Config::new(
+            db,
+            SequenceNumberCounter::default(),
+            SequenceNumberCounter::default(),
+        )
+        .with_shared_fs(Arc::new(fault))
+        .open()?;
+
+        // A flush syncs its table's directory, then, on the first edit of a
+        // generation, the log's: fail the second.
+        injector.arm(
+            FaultRule::new(FaultOp::SyncDirectory, Fault::Error(ErrorKind::Other))
+                .skip(1)
+                .once(),
+        );
+        tree.insert("a", "1", 0);
+        match tree.flush_active_memtable(0) {
+            Ok(_) => panic!("the injected directory sync fault must fail the flush"),
+            Err(e) => assert!(format!("{e}").contains("injected fault"), "{e}"),
+        }
+        tree.insert("b", "2", 1);
+        tree.flush_active_memtable(0)?;
+    }
+
+    crash.crash();
+
+    let tree = lsm_tree::Config::new(
+        db,
+        SequenceNumberCounter::default(),
+        SequenceNumberCounter::default(),
+    )
+    .with_shared_fs(crash.inner())
+    .open()?;
+    assert!(
+        tree.contains_key("b", u64::MAX)?,
+        "the acknowledged flush survives the crash"
+    );
+    Ok(())
+}
+
 /// Exhaustive crash-point sweep: for every durability barrier (`sync_all` on a
 /// table or the manifest edit log) of a flush workload, fail that one barrier,
 /// simulate a power loss, reopen, and assert recovery yields a *consistent

@@ -33,10 +33,10 @@ use std::io::{Seek, SeekFrom};
 /// acknowledges the flush / compaction. `scratch` is reused for payload
 /// assembly across calls (no per-edit heap allocation after warm-up).
 ///
-/// `first` says the log is empty and may be created by this append: its
-/// directory is then synced too, since a new file's entry is durable only
-/// once its directory is, and a log lost with its entry takes every edit in
-/// it along.
+/// `first` says the log's directory entry is not known durable yet (a log
+/// this append may create, or one no append has synced): its directory is
+/// then synced too, since a new file's entry is durable only once its
+/// directory is, and a log lost with its entry takes every edit in it along.
 ///
 /// Returns the appended record's on-disk size in bytes (framing header +
 /// payload), so the caller can keep its cached log size exact without a
@@ -70,7 +70,13 @@ pub fn append_edit(
         .map_err(crate::Error::from)?;
     super::framing::write_frame(&mut file, scratch)?;
     file.sync_all_with(sync_mode).map_err(crate::Error::from)?;
-    if first && let Some(directory) = path.parent() {
+    if first {
+        // A bare file name's parent is empty: the current directory, which
+        // every backend accepts as `.`.
+        let directory = path
+            .parent()
+            .filter(|parent| *parent != Path::new(""))
+            .unwrap_or_else(|| Path::new("."));
         crate::file::fsync_directory(directory, fs, sync_mode)?;
     }
     // The framing header (u32 len + u64 XXH3) precedes the payload on disk.
