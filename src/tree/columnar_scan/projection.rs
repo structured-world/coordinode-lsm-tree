@@ -79,14 +79,15 @@ impl ProjectedField {
     }
 
     /// A field projected by id alone: an intrinsic column, or a value column
-    /// whose type is whatever the segments store and whose absence is an
-    /// error.
+    /// whose type is whatever the segments store. Its null cells stay null; a
+    /// segment written without the column is an error, since nothing declares
+    /// the type a stand-in column would need.
     #[must_use]
     pub fn by_id(column_id: u16) -> Self {
         Self {
             column_id,
             type_tag: intrinsic_type(column_id),
-            absent: Absent::Error,
+            absent: Absent::Null,
         }
     }
 

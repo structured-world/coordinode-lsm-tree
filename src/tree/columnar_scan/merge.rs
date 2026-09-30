@@ -21,6 +21,7 @@
 
 use alloc::vec::Vec;
 
+use super::projection::{ProjectedField, conform};
 use super::{ColumnarScan, Segment, drop_columns, key_in_bounds};
 use crate::table::columnar::{
     COL_SEQNO, COL_USER_KEY, COL_VALUE_TYPE, ColumnBatch, TypeTag, bytes_column_row,
@@ -95,6 +96,10 @@ pub(super) struct MergeStream {
     /// Columns decoded only for the merge and the predicate, dropped from each
     /// output batch.
     dropped: Vec<u16>,
+    /// The projected fields followed by the merge's own columns: every batch
+    /// a source loads is brought to them, so the sources agree on their
+    /// columns even where a segment was written without a projected one.
+    fields: Vec<ProjectedField>,
     /// Whether a segment of the group records deletions, so the value type is
     /// decoded.
     deletes: bool,
@@ -133,6 +138,22 @@ impl MergeStream {
             needed.push(COL_VALUE_TYPE);
         }
         let (augmented, dropped) = scan.augment(&needed);
+        // The merge's own intrinsic columns are always present. An unprojected
+        // predicate column is not a projected field, so no absence rule
+        // applies to it: a segment without it leaves the predicate to report
+        // how far it ran.
+        let fields = scan
+            .fields
+            .iter()
+            .cloned()
+            .chain(
+                dropped
+                    .iter()
+                    .copied()
+                    .map(ProjectedField::by_id)
+                    .filter(|field| field.type_tag().is_some()),
+            )
+            .collect();
         // The sources share the scan's budget: each holds its current batch
         // and what its cursor read ahead within an equal part of it.
         let share = scan.budget / (segments.len() as u64).max(1);
@@ -162,6 +183,7 @@ impl MergeStream {
         Ok(Self {
             sources,
             dropped,
+            fields,
             deletes,
             rts,
             last_key: None,
@@ -321,6 +343,7 @@ impl MergeStream {
         cmp: &dyn crate::comparator::UserComparator,
     ) -> crate::Result<(Position, Option<u64>)> {
         let last_key = self.last_key.as_deref();
+        let fields = &self.fields;
         let Some(source) = self.sources.get_mut(i) else {
             return Ok((Position::Exhausted, None));
         };
@@ -361,7 +384,7 @@ impl MergeStream {
             match source.cursor.next() {
                 None => return Ok((Position::Exhausted, loaded)),
                 Some(batch) => {
-                    let batch = batch?;
+                    let batch = conform(batch?, fields)?;
                     // Keys are read row by row from their framing, which only
                     // a bytes column carries.
                     if batch

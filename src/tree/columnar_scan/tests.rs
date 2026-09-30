@@ -9,6 +9,7 @@ fn empty_scan(metrics: alloc::sync::Arc<crate::Metrics>) -> ColumnarScan {
         groups: alloc::collections::VecDeque::new(),
         current: None,
         projection: Vec::new(),
+        fields: Vec::new(),
         predicate: None,
         support: PredicateSupport::Exact,
         comparator: crate::comparator::default_comparator(),

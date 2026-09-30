@@ -257,7 +257,7 @@ impl AnyTree {
     #[cfg(feature = "columnar")]
     pub fn columnar_scan<R: core::ops::RangeBounds<crate::UserKey>>(
         &self,
-        projection: &[u16],
+        projection: impl Into<crate::Projection>,
         predicate: Option<&crate::table::columnar_predicate::ColumnRangePredicate>,
         seqno: crate::SeqNo,
         range: R,

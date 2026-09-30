@@ -147,11 +147,12 @@ impl Tree {
     /// group.
     pub fn columnar_scan<R: RangeBounds<UserKey>>(
         &self,
-        projection: &[u16],
+        projection: impl Into<projection::Projection>,
         predicate: Option<&ColumnRangePredicate>,
         seqno: SeqNo,
         range: R,
     ) -> crate::Result<ColumnarScan> {
+        let projection = projection.into();
         // A merge chain is not a version chain: its older rows are the merge's
         // INPUTS, not data the newest row shadows. The newest-version-wins dedup
         // below would hand back the raw operand where a read hands back the
@@ -234,7 +235,8 @@ impl Tree {
         Ok(ColumnarScan {
             groups: groups.into_iter().collect(),
             current: None,
-            projection: projection.to_vec(),
+            projection: projection.column_ids(),
+            fields: projection.fields().to_vec(),
             predicate: predicate.cloned(),
             support: PredicateSupport::Exact,
             comparator,
@@ -381,7 +383,11 @@ fn drop_columns(batch: &mut ColumnBatch, dropped: &[u16]) {
 pub struct ColumnarScan {
     groups: alloc::collections::VecDeque<Group>,
     current: Option<GroupStream>,
+    /// The projected column ids, in output order.
     projection: Vec<u16>,
+    /// The projected fields, whose declarations every yielded batch is
+    /// brought to.
+    fields: Vec<projection::ProjectedField>,
     predicate: Option<ColumnRangePredicate>,
     /// The weakest [`PredicateSupport`] over the segments read so far.
     support: PredicateSupport,
@@ -543,7 +549,9 @@ impl ColumnarScan {
                 *support = (*support).min(singleton.cursor.predicate_support());
                 let SingletonStream { global, mode, .. } = &mut **singleton;
                 match self.shape_singleton_batch(batch, *global, mode, support) {
-                    Ok(Some(batch)) => return Some(Ok(batch)),
+                    // A segment written without a projected column, or with
+                    // null cells in one, reads as the field declares.
+                    Ok(Some(batch)) => return Some(projection::conform(batch, &self.fields)),
                     Ok(None) => {}
                     Err(e) => return Some(Err(e)),
                 }
