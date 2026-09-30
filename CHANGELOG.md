@@ -11,6 +11,12 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 
 ## [Unreleased]
 
+## [5.11.10](https://github.com/structured-world/coordinode-lsm-tree/compare/v5.11.9...v5.11.10) - 2026-09-30
+
+### Fixed
+
+- *(durability)* sync the directory of new blob files and edit logs ([#752](https://github.com/structured-world/coordinode-lsm-tree/pull/752))
+
 ## [5.11.9](https://github.com/structured-world/coordinode-lsm-tree/compare/v5.11.8...v5.11.9) - 2026-09-29
 
 ### Fixed
