@@ -1168,6 +1168,33 @@ pub trait AbstractTree: sealed::Sealed {
     /// such install.
     fn retention_floor(&self) -> SeqNo;
 
+    /// Returns the limiter that throttles this tree's compactions: the one
+    /// supplied through
+    /// [`Config::compaction_rate_limiter`](crate::Config::compaction_rate_limiter),
+    /// which other trees may share, or the tree's own built from
+    /// [`Config::compaction_rate_limit`](crate::Config::compaction_rate_limit).
+    ///
+    /// Change the rate while the tree runs, with no restart, through
+    /// [`RateLimiter::set_rate`](crate::rate_limiter::RateLimiter::set_rate):
+    /// every tree holding the limiter is bounded by the new rate from its next
+    /// request.
+    ///
+    /// # Examples
+    ///
+    /// ```
+    /// use lsm_tree::{AbstractTree, Config};
+    ///
+    /// let folder = tempfile::tempdir()?;
+    /// let tree = Config::new(&folder, Default::default(), Default::default())
+    ///     .compaction_rate_limit(16 * 1_024 * 1_024)
+    ///     .open()?;
+    /// tree.compaction_rate_limiter().set_rate(64 * 1_024 * 1_024);
+    /// assert_eq!(tree.compaction_rate_limiter().rate(), 64 * 1_024 * 1_024);
+    /// #
+    /// # Ok::<(), lsm_tree::Error>(())
+    /// ```
+    fn compaction_rate_limiter(&self) -> alloc::sync::Arc<crate::rate_limiter::RateLimiter>;
+
     /// Scans the entire tree, returning the number of items.
     ///
     /// ###### Caution

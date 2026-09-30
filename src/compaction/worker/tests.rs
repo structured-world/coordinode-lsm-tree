@@ -4471,6 +4471,129 @@ fn a_reopened_tree_starts_with_a_fresh_budget() -> crate::Result<()> {
     Ok(())
 }
 
+/// Opens a standard tree at `dir` with the given configuration tail.
+fn open_standard(
+    dir: &std::path::Path,
+    configure: impl FnOnce(Config) -> Config,
+) -> crate::Result<crate::Tree> {
+    match configure(Config::new(
+        dir,
+        SequenceNumberCounter::default(),
+        SequenceNumberCounter::default(),
+    ))
+    .open()?
+    {
+        crate::AnyTree::Standard(t) => Ok(t),
+        crate::AnyTree::Blob(_) => panic!("expected Standard tree"),
+    }
+}
+
+/// Two trees handed one limiter are bounded by it together: what one tree's
+/// compaction spent is still spent when the other's asks, whatever rate each
+/// tree was configured with.
+#[test]
+fn trees_sharing_a_limiter_draw_on_one_budget() -> crate::Result<()> {
+    use core::time::Duration;
+
+    let rate = 1_024 * 1_024;
+    let shared = Arc::new(crate::rate_limiter::RateLimiter::new(rate));
+    let (a_dir, b_dir) = (tempfile::tempdir()?, tempfile::tempdir()?);
+    let a = open_standard(a_dir.path(), |c| {
+        c.compaction_rate_limit(rate * 100)
+            .compaction_rate_limiter(Arc::clone(&shared))
+    })?;
+    let b = open_standard(b_dir.path(), |c| {
+        c.compaction_rate_limiter(Arc::clone(&shared))
+    })?;
+    let strategy: Arc<dyn CompactionStrategy> =
+        Arc::new(crate::compaction::major::Strategy::new(64 * 1024 * 1024));
+
+    let on_a = super::Options::from_tree(&a, Arc::clone(&strategy));
+    assert!(
+        !on_a
+            .rate_limiter
+            .acquire_wait(rate * 4, Duration::ZERO)
+            .is_zero(),
+        "four seconds of budget at once leaves a debt",
+    );
+    let on_b = super::Options::from_tree(&b, strategy);
+    assert!(
+        !on_b.rate_limiter.acquire_wait(1, Duration::ZERO).is_zero(),
+        "the other tree's compaction meets the debt the first one left",
+    );
+
+    Ok(())
+}
+
+/// Without a shared limiter each tree keeps its own budget: one tree's debt
+/// does not hold back another's compaction.
+#[test]
+fn trees_without_a_shared_limiter_keep_their_own_budget() -> crate::Result<()> {
+    use core::time::Duration;
+
+    let rate = 1_024 * 1_024;
+    let (a_dir, b_dir) = (tempfile::tempdir()?, tempfile::tempdir()?);
+    let a = open_standard(a_dir.path(), |c| c.compaction_rate_limit(rate))?;
+    let b = open_standard(b_dir.path(), |c| c.compaction_rate_limit(rate))?;
+    let strategy: Arc<dyn CompactionStrategy> =
+        Arc::new(crate::compaction::major::Strategy::new(64 * 1024 * 1024));
+
+    let on_a = super::Options::from_tree(&a, Arc::clone(&strategy));
+    assert!(
+        !on_a
+            .rate_limiter
+            .acquire_wait(rate * 4, Duration::ZERO)
+            .is_zero()
+    );
+    let on_b = super::Options::from_tree(&b, strategy);
+    assert!(
+        on_b.rate_limiter.acquire_wait(1, Duration::ZERO).is_zero(),
+        "a tree's own budget is untouched by another tree's debt",
+    );
+
+    Ok(())
+}
+
+/// A retune through one holder is seen by every tree sharing the limiter,
+/// with one value, and the compactions each runs are measured against it,
+/// not against either tree's configured rate.
+#[test]
+fn a_retune_through_one_tree_binds_every_tree_sharing_the_limiter() -> crate::Result<()> {
+    use crate::AbstractTree;
+    use core::time::Duration;
+
+    let shared = Arc::new(crate::rate_limiter::RateLimiter::new(1_000));
+    let (a_dir, b_dir) = (tempfile::tempdir()?, tempfile::tempdir()?);
+    let a = open_standard(a_dir.path(), |c| {
+        c.compaction_rate_limit(1_000_000)
+            .compaction_rate_limiter(Arc::clone(&shared))
+    })?;
+    let b = open_standard(b_dir.path(), |c| {
+        c.compaction_rate_limit(5)
+            .compaction_rate_limiter(Arc::clone(&shared))
+    })?;
+    assert_eq!(a.compaction_rate_limiter().rate(), 1_000);
+    assert_eq!(b.compaction_rate_limiter().rate(), 1_000);
+
+    a.compaction_rate_limiter()
+        .set_rate_at(2_000, Duration::ZERO);
+    assert_eq!(b.compaction_rate_limiter().rate(), 2_000);
+
+    // b's compaction owes at the retuned rate: the bucket still holds the
+    // 1000 B it had (a raise grants no new credit), so 2000 B of debt is one
+    // second at 2000 B/s, where the old rate would have made it two.
+    let on_b = super::Options::from_tree(
+        &b,
+        Arc::new(crate::compaction::major::Strategy::new(64 * 1024 * 1024)),
+    );
+    assert_eq!(
+        on_b.rate_limiter.acquire_wait(3_000, Duration::ZERO),
+        Duration::from_secs(1),
+    );
+
+    Ok(())
+}
+
 mod locality_relocation {
     use super::RewriteOneTable;
     use crate::{AbstractTree, AnyTree, Config, KvSeparationOptions, SequenceNumberCounter};

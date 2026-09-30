@@ -318,7 +318,7 @@ mod manifest;
 pub mod manifest_blocks;
 mod memtable;
 mod merge_operator;
-pub(crate) mod rate_limiter;
+pub mod rate_limiter;
 mod reseek;
 mod run_reader;
 mod run_scanner;

@@ -2326,7 +2326,7 @@ fn run_subcompaction(
         let io_bytes = item.key.user_key.len() as u64 + item.value.len() as u64;
         if opts
             .rate_limiter
-            .request_interruptible(io_bytes, || opts.stop_signal.is_stopped())
+            .request_abortable(io_bytes, || opts.stop_signal.is_stopped())
         {
             // Abort, do not produce: a truncated sub-range would be installed
             // atomically alongside its siblings, dropping the unwritten tail of
@@ -3515,21 +3515,20 @@ fn merge_tables(
             // load when `compaction_rate_limit` is 0 (the default), so the
             // unthrottled hot path stays cheap. The wait is interruptible by
             // the stop signal so a low limit plus a large item can't stall
-            // tree drop / shutdown for the whole wait.
+            // tree drop / shutdown for the whole wait; a stopped item is not
+            // written, so its debit goes back to the shared budget.
             //
             // Accounting here covers the SST entry's key + value bytes
             // (for KV-separated entries `item.value` is the encoded handle).
-            // Each length is widened to u64 before the add, so there is no
-            // intermediate usize sum; the saturating add only guards the
-            // (practically impossible) u64 overflow. The relocated blob
-            // payload of KV-separated compactions is debited separately at
-            // its write site in `RelocatingCompaction::write`, where the
-            // real moved bytes are known.
+            // The relocated blob payload of KV-separated compactions is
+            // debited separately at its write site in
+            // `RelocatingCompaction::write`, where the real moved bytes are
+            // known.
             // One key + value length; the sum is far below u64::MAX → plain add.
             let io_bytes = item.key.user_key.len() as u64 + item.value.len() as u64;
             if opts
                 .rate_limiter
-                .request_interruptible(io_bytes, || opts.stop_signal.is_stopped())
+                .request_abortable(io_bytes, || opts.stop_signal.is_stopped())
             {
                 // Same reason as the stop check below: the item was not even
                 // written, so committing here would drop it and everything
