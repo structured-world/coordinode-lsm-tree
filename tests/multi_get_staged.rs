@@ -10,6 +10,7 @@ use lsm_tree::{
         ReadQueue, StdFs,
     },
     io,
+    runtime_config::RuntimeConfig,
 };
 use std::path::Path;
 use std::sync::{Arc, Mutex, PoisonError};
@@ -158,6 +159,13 @@ fn tree_on(
         match shape {
             Shape::Whole => config,
             Shape::Partitioned => config
+                // The index partitions from its first entry, not only past the
+                // default size.
+                .with_runtime_config({
+                    let mut runtime = RuntimeConfig::default();
+                    runtime.index_partition_spill_threshold = 0;
+                    runtime
+                })
                 .filter_block_partitioning_policy(PinningPolicy::all(true))
                 .index_block_partitioning_policy(PinningPolicy::all(true))
                 .filter_block_partition_size_policy(BlockSizePolicy::all(128))
@@ -250,6 +258,35 @@ fn a_cold_level_is_read_in_as_many_batches_whatever_its_table_count() -> lsm_tre
             );
         }
     }
+    Ok(())
+}
+
+/// The partitioned shape reads its index by partition: one key reads less of
+/// the index than keys spread over the whole table. A whole index is one
+/// block, read in full for any key, and would read the same for both; the
+/// partitioned cases above would then not reach an index partition at all.
+#[cfg(feature = "metrics")]
+#[test]
+fn the_partitioned_shape_reads_its_index_by_partition() -> lsm_tree::Result<()> {
+    let dir = tempfile::tempdir()?;
+    let record = Record::default();
+    let (tree, _) = tree(dir.path(), Shape::Partitioned, 1, 0, &record)?;
+    let index_read = |keys: &[String]| -> lsm_tree::Result<u64> {
+        let before = tree.metrics().index_block_io();
+        tree.multi_get(keys, SeqNo::MAX)?;
+        Ok(tree.metrics().index_block_io() - before)
+    };
+    let one = index_read(&["t000r0100".to_owned()])?;
+    let spread: Vec<String> = (0..200)
+        .step_by(10)
+        .map(|row| format!("t000r{row:04}"))
+        .collect();
+    let many = index_read(&spread)?;
+    assert!(one > 0, "the index was read");
+    assert!(
+        many > one,
+        "one key read {one} index bytes, keys over the whole table {many}"
+    );
     Ok(())
 }
 

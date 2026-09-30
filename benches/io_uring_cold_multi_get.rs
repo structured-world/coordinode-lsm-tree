@@ -57,6 +57,13 @@ fn run() -> Result<(), Box<dyn std::error::Error>> {
             SequenceNumberCounter::default(),
         )
         .with_shared_fs(Arc::new(lsm_tree::fs::IoUringFs::new()?))
+        // The index partitions from its first entry, not only past the
+        // default size.
+        .with_runtime_config({
+            let mut runtime = lsm_tree::runtime_config::RuntimeConfig::default();
+            runtime.index_partition_spill_threshold = 0;
+            runtime
+        })
         .filter_block_partitioning_policy(PinningPolicy::all(true))
         .index_block_partitioning_policy(PinningPolicy::all(true))
         .filter_block_pinning_policy(PinningPolicy::all(false))
