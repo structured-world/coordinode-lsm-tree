@@ -1,0 +1,239 @@
+#![expect(clippy::expect_used, clippy::unwrap_used, reason = "test code")]
+
+use super::*;
+use crate::table::{RecoverParams, Writer};
+use crate::{Cache, DescriptorTable, InternalValue, ValueType, fs::StdFs, hash::hash64};
+use alloc::sync::Arc;
+use tempfile::tempdir;
+use test_log::test;
+
+/// Every block a staged read walks through for a key batch, in the order it
+/// asked for them, with the stage that asked.
+type Asked = Vec<(BlockType, u64)>;
+
+/// Writes 500 keys `key000000..key000998` (even numbers only, so every odd
+/// number is a miss inside the key range) into one table shaped by `shape`,
+/// and opens it with a cache of `cache_bytes`, pinning as asked.
+fn table(
+    dir: &std::path::Path,
+    shape: impl Fn(Writer) -> Writer,
+    pin_filter: bool,
+    pin_index: bool,
+    cache_bytes: u64,
+) -> Table {
+    let file = dir.join("table");
+    let fs: Arc<dyn crate::fs::Fs> = Arc::new(StdFs);
+    let mut writer = shape(Writer::new(file.clone(), 0, 0, Arc::clone(&fs)).expect("writer"));
+    for i in (0u32..1000).step_by(2) {
+        writer
+            .write(InternalValue::from_components(
+                format!("key{i:06}").into_bytes(),
+                b"v".to_vec(),
+                1,
+                ValueType::Value,
+            ))
+            .expect("write");
+    }
+    let checksum = writer.finish().expect("finish").expect("a table").1;
+    let mut params = RecoverParams::new(
+        file,
+        checksum,
+        0,
+        fs,
+        crate::comparator::default_comparator(),
+        Arc::new(Cache::with_capacity_bytes(cache_bytes)),
+    );
+    params.descriptor_table = Some(Arc::new(DescriptorTable::new(10)));
+    params.pin_filter = pin_filter;
+    params.pin_index = pin_index;
+    Table::recover(params).expect("recover")
+}
+
+/// Drives a staged read of `table` for `keys` to its plan, serving each
+/// block it asks for from the table file, and returns the plan and what it
+/// asked for.
+fn drive(
+    table: &Table,
+    keys: &[(&[u8], u64)],
+) -> Option<(SeqNo, Vec<(BlockHandle, Vec<usize>)>, ProbeCounts, Asked)> {
+    let StagedStart::Staged(mut read) = StagedRead::start(table, keys, SeqNo::MAX) else {
+        return None;
+    };
+    let file = std::fs::read(&*table.path).expect("table file");
+    let mut asked = Asked::new();
+    loop {
+        let (block_type, need) = read.need();
+        let need: Vec<BlockHandle> = need.to_vec();
+        for handle in need {
+            asked.push((block_type, *handle.offset()));
+            let start = *handle.offset() as usize;
+            let bytes = &file[start..start + handle.size() as usize];
+            read.supply(handle, bytes).expect("supply");
+        }
+        if read.is_done() {
+            break;
+        }
+        read.advance(keys).expect("advance");
+        if read.is_done() && read.need().1.is_empty() {
+            break;
+        }
+    }
+    let (seqno, blocks, tally) = read.into_plan();
+    Some((seqno, blocks, tally, asked))
+}
+
+/// A plan as comparable values: each block's offset and size with its keys.
+fn plan_of(blocks: &[(BlockHandle, Vec<usize>)]) -> Vec<(u64, u32, Vec<usize>)> {
+    blocks
+        .iter()
+        .map(|(handle, keys)| (*handle.offset(), handle.size(), keys.clone()))
+        .collect()
+}
+
+/// Hits and misses spread over the table: every tenth even key and the odd
+/// one after it.
+fn batch() -> Vec<(Vec<u8>, u64)> {
+    (0u32..1000)
+        .step_by(20)
+        .flat_map(|i| [i, i + 1])
+        .map(|i| {
+            let key = format!("key{i:06}").into_bytes();
+            let hash = hash64(&key);
+            (key, hash)
+        })
+        .collect()
+}
+
+/// The table shapes: filter whole or partitioned, pinned or not; index
+/// pinned whole, whole read on demand, or partitioned.
+fn shapes() -> Vec<(&'static str, fn(Writer) -> Writer, bool, bool)> {
+    fn whole(w: Writer) -> Writer {
+        w
+    }
+    fn partitioned_filter(w: Writer) -> Writer {
+        w.use_partitioned_filter().use_meta_partition_size(8)
+    }
+    fn partitioned_index(w: Writer) -> Writer {
+        w.use_adaptive_index(0)
+    }
+    fn partitioned_both(w: Writer) -> Writer {
+        w.use_partitioned_filter()
+            .use_meta_partition_size(8)
+            .use_adaptive_index(0)
+    }
+    vec![
+        ("pinned filter, pinned index", whole, true, true),
+        ("pinned filter, index read", whole, true, false),
+        ("filter read, index read", whole, false, false),
+        (
+            "filter partitions, index read",
+            partitioned_filter,
+            false,
+            false,
+        ),
+        (
+            "pinned filter, index partitions",
+            partitioned_index,
+            true,
+            false,
+        ),
+        (
+            "filter and index partitions",
+            partitioned_both,
+            false,
+            false,
+        ),
+    ]
+}
+
+/// A staged read plans the same data blocks, for the same keys, with the same
+/// filter answers, as the serial planner, on every table shape.
+#[test]
+fn a_staged_read_plans_what_the_serial_planner_plans() -> crate::Result<()> {
+    let batch = batch();
+    let keys: Vec<(&[u8], u64)> = batch.iter().map(|(k, h)| (k.as_slice(), *h)).collect();
+    for (name, shape, pin_filter, pin_index) in shapes() {
+        let dir = tempdir()?;
+        let serial_table = table(dir.path(), shape, pin_filter, pin_index, 1_000_000);
+        let mut serial_tally = ProbeCounts::default();
+        let (_, serial_seqno, _, serial_blocks) = serial_table
+            .plan_block_tasks(&keys, SeqNo::MAX, &mut serial_tally)?
+            .expect("keys in range");
+
+        let dir = tempdir()?;
+        let staged_table = table(dir.path(), shape, pin_filter, pin_index, 1_000_000);
+        let (seqno, blocks, tally, asked) = drive(&staged_table, &keys).expect("staged");
+        // A cold table's unpinned filter and index are read in their stages.
+        assert_eq!(
+            !pin_filter,
+            asked.iter().any(|(t, _)| *t == BlockType::Filter),
+            "{name}: filter stage asked for {asked:?}"
+        );
+        assert_eq!(
+            !pin_index,
+            asked.iter().any(|(t, _)| *t == BlockType::Index),
+            "{name}: index stage asked for {asked:?}"
+        );
+        assert_eq!(serial_seqno, seqno, "{name}");
+        assert_eq!(plan_of(&serial_blocks), plan_of(&blocks), "{name}");
+        assert_eq!(serial_tally, tally, "{name}");
+    }
+    Ok(())
+}
+
+/// A warm table asks for nothing: every filter and index block is taken from
+/// the cache.
+#[test]
+fn a_warm_table_is_planned_without_a_read() {
+    let batch = batch();
+    let keys: Vec<(&[u8], u64)> = batch.iter().map(|(k, h)| (k.as_slice(), *h)).collect();
+    for (name, shape, pin_filter, pin_index) in shapes() {
+        let dir = tempdir().expect("dir");
+        let table = table(dir.path(), shape, pin_filter, pin_index, 1_000_000);
+        let (_, cold, _, _) = drive(&table, &keys).expect("staged");
+        let (_, warm, _, asked) = drive(&table, &keys).expect("staged");
+        assert_eq!(plan_of(&cold), plan_of(&warm), "{name}");
+        assert!(asked.is_empty(), "{name}: a warm table asked for {asked:?}");
+    }
+}
+
+/// With a cache that keeps nothing, the read answers from the blocks it holds:
+/// each block is asked for once, and the plan is the one a warm read makes.
+#[test]
+fn a_read_answers_from_what_it_holds_when_the_cache_keeps_nothing() {
+    let batch = batch();
+    let keys: Vec<(&[u8], u64)> = batch.iter().map(|(k, h)| (k.as_slice(), *h)).collect();
+    for (name, shape, pin_filter, pin_index) in shapes() {
+        let dir = tempdir().expect("dir");
+        let cached = table(dir.path(), shape, pin_filter, pin_index, 1_000_000);
+        let (_, expected, _, _) = drive(&cached, &keys).expect("staged");
+
+        let dir = tempdir().expect("dir");
+        let uncached = table(dir.path(), shape, pin_filter, pin_index, 0);
+        let (_, blocks, _, asked) = drive(&uncached, &keys).expect("staged");
+        assert_eq!(plan_of(&expected), plan_of(&blocks), "{name}");
+        let mut offsets: Vec<u64> = asked.iter().map(|(_, offset)| *offset).collect();
+        offsets.sort_unstable();
+        let before = offsets.len();
+        offsets.dedup();
+        assert_eq!(before, offsets.len(), "{name}: a block was asked for twice");
+    }
+}
+
+/// A table whose blocks need the load path's own recovery or reconstruction is
+/// read serially, and a snapshot below the table reads nothing of it.
+#[test]
+fn a_staged_read_starts_only_where_it_can_answer() {
+    let batch = batch();
+    let keys: Vec<(&[u8], u64)> = batch.iter().map(|(k, h)| (k.as_slice(), *h)).collect();
+    let dir = tempdir().expect("dir");
+    let table = table(dir.path(), |w| w, false, false, 1_000_000);
+    assert!(matches!(
+        StagedRead::start(&table, &keys, 1),
+        StagedStart::Nothing
+    ));
+    assert!(matches!(
+        StagedRead::start(&table, &[], SeqNo::MAX),
+        StagedStart::Nothing
+    ));
+}

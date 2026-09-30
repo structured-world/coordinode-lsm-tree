@@ -33,6 +33,7 @@ mod relocate;
 pub(crate) mod row_group;
 mod scanner;
 pub(crate) mod seqno_bounds;
+pub(crate) mod staged;
 pub mod util;
 pub mod writer;
 pub(crate) mod zone_map;
