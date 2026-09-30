@@ -1,5 +1,5 @@
 window.BENCHMARK_DATA = {
-  "lastUpdate": 1790752892315,
+  "lastUpdate": 1790784500696,
   "repoUrl": "https://github.com/structured-world/coordinode-lsm-tree",
   "entries": {
     "lsm-tree db_bench costs": [
@@ -27508,6 +27508,90 @@ window.BENCHMARK_DATA = {
             "value": 475648.23720006814,
             "unit": "ops/sec",
             "extra": "P50: 1.6us | P99: 11.1us | P99.9: 85.8us\nthreads: 1 | elapsed: 0.42s | num: 200000 | iterations: 3"
+          }
+        ]
+      },
+      {
+        "commit": {
+          "author": {
+            "email": "mail@polaz.com",
+            "name": "Dmitry Prudnikov",
+            "username": "polaz"
+          },
+          "committer": {
+            "email": "noreply@github.com",
+            "name": "GitHub",
+            "username": "web-flow"
+          },
+          "distinct": true,
+          "id": "ed5aa5bc69cccbbd79c933e143e9937a5690e048",
+          "message": "feat(compaction): share one rate limiter across trees and retune it live (#755)\n\n## Summary\n\n- Several trees on one device can share one compaction budget: hand them\nthe same `Arc<RateLimiter>` and their compactions are bounded by it\ntogether.\n- The compaction rate can be changed while a tree runs, with no restart.\nThe limiter owns the rate, so a retune through any holder binds every\ntree that shares it, whatever rate each tree was configured with.\n\n## Changes\n\n- `rate_limiter` is public. `RateLimiter` gains `rate`, `set_rate` (std\nclock), `set_rate_at` (caller clock) and `request_abortable`.\n- The burst ceiling is one second of the current rate. It is no longer\nfixed at construction, so a limiter built at `0` and switched on gets\nits burst.\n- Across a rate change:\n  - time before the change refills at the old rate;\n  - credit above the new ceiling is dropped;\n- debt stays owed in bytes, including the debt of callers already\nwaiting;\n- switching on from `0` starts a fresh bucket with no credit for the\nunthrottled time;\n- switching to `0` releases every waiter, even if it is switched back on\nbefore the waiter looks.\n- The bucket keeps running totals of debited and repaid bytes, so every\ndebit has a place in line and is repaid in order. A waiter re-derives\nits wait from the shared totals on every poll (at most 100 ms apart), so\na rate change applies from the instant it happened.\n- Two ways to wait: `request_abortable` returns the debit when the\ncaller stops, and the debit then stops delaying the waiters behind it\n(the ones ahead are unaffected); `request_interruptible` keeps the\ndebit, for a caller that still does the I/O after a stop. The compaction\nmerge loops use the first, the blob relocation the second.\n- `Config::compaction_rate_limiter(Arc<RateLimiter>)` injects a shared\nlimiter; it overrides `compaction_rate_limit`. Without one a tree builds\nits own, as before.\n- `AbstractTree::compaction_rate_limiter()` returns the limiter a tree\nthrottles with (a blob tree's is its index tree's).\n- At a rate of `0` the per-item path stays one relaxed atomic load.\n\n## Testing\n\nFormatting, clippy in both feature sets, the full test suite with and\nwithout all features, doc tests, docs, the no-std check,\n`tools/sst-dump` tests and `tools/db_bench` clippy pass on macOS. Unit\ntests pin every rate transition, waiters across a change, a switch off\nand a withdrawn debit, and the order of the line. Tree-level tests cover\ntwo trees sharing a limiter, two trees keeping their own, and a retune\nthrough one tree binding the other.\n\nCloses #675",
+          "timestamp": "2026-09-30T19:00:29+03:00",
+          "tree_id": "76c8cafac1c7942b292351458f52fb85d03dc2a5",
+          "url": "https://github.com/structured-world/coordinode-lsm-tree/commit/ed5aa5bc69cccbbd79c933e143e9937a5690e048"
+        },
+        "date": 1790784429643,
+        "tool": "customBiggerIsBetter",
+        "benches": [
+          {
+            "name": "mixed",
+            "value": 82616.5267103951,
+            "unit": "ops/sec",
+            "extra": "P50: 0.4us | P99: 8.1us | P99.9: 29.0us\nthreads: 1 | elapsed: 6.48s | num: 200000 | iterations: 3"
+          },
+          {
+            "name": "fillseq",
+            "value": 3048896.680513739,
+            "unit": "ops/sec",
+            "extra": "P50: 0.2us | P99: 0.6us | P99.9: 3.7us\nthreads: 1 | elapsed: 0.07s | num: 200000 | iterations: 3"
+          },
+          {
+            "name": "fillrandom",
+            "value": 1159191.8114690438,
+            "unit": "ops/sec",
+            "extra": "P50: 0.7us | P99: 1.4us | P99.9: 4.8us\nthreads: 1 | elapsed: 0.17s | num: 200000 | iterations: 3"
+          },
+          {
+            "name": "readrandom",
+            "value": 763760.1899929849,
+            "unit": "ops/sec",
+            "extra": "P50: 1.0us | P99: 6.3us | P99.9: 74.2us\nthreads: 1 | elapsed: 0.26s | num: 200000 | iterations: 3"
+          },
+          {
+            "name": "readseq",
+            "value": 2570892.356737023,
+            "unit": "ops/sec",
+            "extra": "P50: 0.2us | P99: 4.8us | P99.9: 8.4us\nthreads: 1 | elapsed: 0.08s | num: 200000 | iterations: 3"
+          },
+          {
+            "name": "seekrandom",
+            "value": 332218.5187240018,
+            "unit": "ops/sec",
+            "extra": "P50: 2.4us | P99: 8.2us | P99.9: 14.1us\nthreads: 1 | elapsed: 0.60s | num: 200000 | iterations: 3"
+          },
+          {
+            "name": "prefixscan",
+            "value": 196994.1063303268,
+            "unit": "ops/sec",
+            "extra": "P50: 4.4us | P99: 6.9us | P99.9: 12.2us\nthreads: 1 | elapsed: 1.02s | num: 200000 | iterations: 3"
+          },
+          {
+            "name": "overwrite",
+            "value": 1134011.2074327632,
+            "unit": "ops/sec",
+            "extra": "P50: 0.8us | P99: 1.5us | P99.9: 4.8us\nthreads: 1 | elapsed: 0.18s | num: 200000 | iterations: 3"
+          },
+          {
+            "name": "mergerandom",
+            "value": 461584.6200004616,
+            "unit": "ops/sec",
+            "extra": "P50: 0.3us | P99: 1.3us | P99.9: 3.5us\nthreads: 1 | elapsed: 0.43s | num: 200000 | iterations: 3"
+          },
+          {
+            "name": "readwhilewriting",
+            "value": 659769.6546204824,
+            "unit": "ops/sec",
+            "extra": "P50: 1.2us | P99: 6.5us | P99.9: 75.3us\nthreads: 1 | elapsed: 0.30s | num: 200000 | iterations: 3"
           }
         ]
       }
