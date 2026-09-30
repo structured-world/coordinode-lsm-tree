@@ -583,6 +583,111 @@ fn declared_fields_over_memtable_rows_without_a_projector_are_refused() {
     assert!(matches!(got, Some(Error::Projection(_))), "got {got:?}");
 }
 
+/// The keys a scan with `predicate` over column 5 yields, and how far the
+/// predicate ran.
+fn keys_filtered_on_five(
+    tree: &lsm_tree::Tree,
+    projection: Projection,
+    value: u32,
+) -> lsm_tree::Result<(
+    Vec<Vec<u8>>,
+    Option<lsm_tree::table::columnar_predicate::PredicateSupport>,
+)> {
+    use lsm_tree::table::columnar::{ByteOrder, Number, NumberKind};
+    use lsm_tree::table::columnar_predicate::{ColumnRangePredicate, PredicateApply};
+
+    let bound = Number::new(NumberKind::Unsigned, 4, ByteOrder::Little)?
+        .comparable(&value.to_le_bytes())?;
+    let predicate = ColumnRangePredicate {
+        column_id: 5,
+        lower: Some(bound.clone()),
+        upper: Some(bound),
+        apply: PredicateApply::Filter,
+    };
+    let mut scan = tree.columnar_scan(projection, Some(&predicate), SeqNo::MAX, ..)?;
+    let mut keys = Vec::new();
+    for batch in &mut scan {
+        let batch = batch?;
+        let at = batch
+            .columns
+            .iter()
+            .position(|c| c.column_id == COL_USER_KEY)
+            .expect("key column");
+        for row in 0..batch.row_count {
+            keys.push(bytes_cell(&batch.columns[at].data, batch.row_count, row));
+        }
+    }
+    Ok((keys, scan.predicate_support()))
+}
+
+/// A predicate over a column no field declares, which one merged segment was
+/// written without, does not fail the merge: the rows lacking it cannot be
+/// judged, so they come back and the predicate reports it did not run.
+#[test]
+fn a_predicate_over_an_undeclared_column_one_merged_segment_lacks_is_not_run()
+-> lsm_tree::Result<()> {
+    use lsm_tree::table::columnar::{ByteOrder, Number, NumberKind};
+    use lsm_tree::table::columnar_predicate::PredicateSupport;
+
+    let number = TypeTag::Number(Number::new(NumberKind::Unsigned, 4, ByteOrder::Little)?);
+    let folder = get_tmp_folder();
+    let any = open_columnar(folder.path());
+    ingest_typed(
+        &any,
+        &[0, 2],
+        &[(3, TypeTag::Fixed(4), &[10, 12]), (5, number, &[50, 52])],
+    );
+    ingest(&any, &[1], &[(3, &[11])]);
+    let projection = Projection::new().column(COL_USER_KEY).column(3);
+    let (keys, support) = keys_filtered_on_five(standard(&any), projection, 50)?;
+    // Which of the rows carrying the column are judged depends on where the
+    // merge cuts its output; the matching one and the one lacking it are
+    // returned either way.
+    assert_eq!(Some(PredicateSupport::Unsupported), support);
+    assert!(
+        keys.contains(&key(0)) && keys.contains(&key(1)),
+        "got {keys:?}"
+    );
+    Ok(())
+}
+
+/// The same over a memtable row merged with a columnar segment holding the
+/// column: the row's value is whole, so the undeclared column is not read
+/// out of it and the predicate reports it did not run.
+#[test]
+fn a_predicate_over_an_undeclared_column_across_a_memtable_row_is_not_run() -> lsm_tree::Result<()>
+{
+    use lsm_tree::table::columnar::{ByteOrder, Number, NumberKind};
+    use lsm_tree::table::columnar_predicate::PredicateSupport;
+
+    let number = TypeTag::Number(Number::new(NumberKind::Unsigned, 4, ByteOrder::Little)?);
+    let folder = get_tmp_folder();
+    let any = open_columnar(folder.path());
+    ingest_typed(
+        &any,
+        &[0, 1, 2],
+        &[
+            (3, TypeTag::Fixed(4), &[10, 11, 12]),
+            (4, TypeTag::Fixed(4), &[40, 41, 42]),
+            (5, number, &[50, 51, 52]),
+        ],
+    );
+    let tree = standard(&any);
+    let seqno = tree.get_highest_seqno().map_or(0, |s| s + 1);
+    // Memtable rows on both sides of a columnar one: one output takes rows
+    // of both layouts.
+    tree.insert(key(0), row_value(100, 400), seqno);
+    tree.insert(key(2), row_value(102, 402), seqno + 1);
+    assert_eq!(
+        (
+            vec![key(0), key(1), key(2)],
+            Some(PredicateSupport::Unsupported)
+        ),
+        keys_filtered_on_five(tree, projected(), 51)?,
+    );
+    Ok(())
+}
+
 /// A segment that stores a declared field under another type is refused, not
 /// misread.
 #[test]

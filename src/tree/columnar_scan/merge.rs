@@ -103,6 +103,10 @@ pub(super) struct MergeStream {
     /// a source loads is brought to them, so the sources agree on their
     /// columns even where a segment was written without a projected one.
     fields: Vec<ProjectedField>,
+    /// The predicate's column when no field names it and it is not intrinsic:
+    /// a source may be written without it, or hold it inside a whole value,
+    /// and nothing says how such a row reads for it.
+    loose: Option<u16>,
     /// Whether a segment of the group records deletions, so the value type is
     /// decoded.
     deletes: bool,
@@ -157,6 +161,10 @@ impl MergeStream {
                     .filter(|field| field.type_tag().is_some()),
             )
             .collect();
+        let loose =
+            scan.predicate.as_ref().map(|p| p.column_id).filter(|&id| {
+                dropped.contains(&id) && ProjectedField::by_id(id).type_tag().is_none()
+            });
         // The sources share the scan's budget: each holds its current batch
         // and what its cursor read ahead within an equal part of it.
         let share = scan.budget / (segments.len() as u64).max(1);
@@ -190,6 +198,7 @@ impl MergeStream {
             sources,
             dropped,
             fields,
+            loose,
             deletes,
             rts,
             last_key: None,
@@ -442,7 +451,7 @@ impl MergeStream {
         support: &mut PredicateSupport,
     ) -> crate::Result<Option<ColumnBatch>> {
         let pending = core::mem::take(&mut self.pending);
-        let merged = if pending.is_empty() {
+        let built = if pending.is_empty() {
             None
         } else {
             Some(self.build(&pending)?)
@@ -450,7 +459,7 @@ impl MergeStream {
         for source in &mut self.sources {
             source.referenced = false;
         }
-        let Some(merged) = merged else {
+        let Some((merged, judged)) = built else {
             return Ok(None);
         };
         scan.record_gather(&merged);
@@ -459,7 +468,13 @@ impl MergeStream {
         // visible version of its key, so a key whose newest version fails the
         // predicate is dropped instead of falling back to an older matching
         // version. It runs in the scan's coordinates, on effective seqnos.
-        let mut merged = scan.filter_after_dedup(merged, scan.predicate.as_ref(), support)?;
+        // Rows that do not all carry its column are returned unjudged.
+        let mut merged = if judged {
+            scan.filter_after_dedup(merged, scan.predicate.as_ref(), support)?
+        } else {
+            *support = (*support).min(PredicateSupport::Unsupported);
+            merged
+        };
         // Match the singleton contract: yield exactly the projected columns.
         drop_columns(&mut merged, &self.dropped);
         // The rows returned are decided: each is held to the declarations.
@@ -471,28 +486,79 @@ impl MergeStream {
     /// built straight from the batches its rows sit in: nothing is copied but
     /// the chosen cells. The seqno column is written with each row's effective
     /// seqno, since the rows come from segments with different bases.
-    fn build(&self, pending: &[Pick]) -> crate::Result<ColumnBatch> {
+    ///
+    /// Also returns whether the predicate can judge the rows: `false` when
+    /// they do not all carry its loose column under one type, which the batch
+    /// then leaves out.
+    fn build(&self, pending: &[Pick]) -> crate::Result<(ColumnBatch, bool)> {
         use crate::table::columnar::{Column, frame_bytes_column, gather_fixed_column};
 
+        const NOT_KEPT: Error =
+            Error::InvalidHeader("columnar_scan: a chosen row's batch was not kept");
         let batch_of = |pick: &Pick| self.sources.get(pick.source).and_then(|s| s.batch.as_ref());
-        let template = pending
-            .first()
-            .and_then(batch_of)
-            .ok_or(Error::InvalidHeader(
-                "columnar_scan: a chosen row's batch was not kept",
-            ))?;
-        // Every batch a row is taken from carries the template's columns in
-        // its order, so one column index names the same column in each.
-        for source in self.sources.iter().filter(|s| s.referenced) {
-            let batch = source.batch.as_ref().ok_or(Error::InvalidHeader(
-                "columnar_scan: a chosen row's batch was not kept",
-            ))?;
-            let agree = batch.columns.len() == template.columns.len()
-                && batch
+        let template = pending.first().and_then(batch_of).ok_or(NOT_KEPT)?;
+        let loose_of = |batch: &ColumnBatch| {
+            self.loose.and_then(|id| {
+                batch
                     .columns
                     .iter()
-                    .zip(&template.columns)
-                    .all(|(a, b)| a.column_id == b.column_id && a.type_tag == b.type_tag);
+                    .find(|c| c.column_id == id)
+                    .map(|c| c.type_tag)
+            })
+        };
+        let loose_type = loose_of(template);
+        let mut judged = true;
+        for source in self.sources.iter().filter(|s| s.referenced) {
+            let batch = source.batch.as_ref().ok_or(NOT_KEPT)?;
+            judged &= loose_of(batch) == loose_type;
+        }
+        let kept = |id: u16| judged || Some(id) != self.loose;
+        let heads: Vec<(u16, TypeTag)> = template
+            .columns
+            .iter()
+            .filter(|c| kept(c.column_id))
+            .map(|c| (c.column_id, c.type_tag))
+            .collect();
+        // Every batch a row is taken from carries the kept columns in the
+        // template's order. Where each batch keeps them all, one column index
+        // names the same column in each; otherwise each source's places of
+        // the kept columns are found once.
+        let mut places: Option<Vec<Vec<usize>>> =
+            (!judged).then(|| alloc::vec![Vec::new(); self.sources.len()]);
+        for (i, source) in self
+            .sources
+            .iter()
+            .enumerate()
+            .filter(|(_, s)| s.referenced)
+        {
+            let batch = source.batch.as_ref().ok_or(NOT_KEPT)?;
+            let agree = if let Some(places) = places.as_mut() {
+                let at: Vec<usize> = batch
+                    .columns
+                    .iter()
+                    .enumerate()
+                    .filter(|(_, c)| kept(c.column_id))
+                    .map(|(at, _)| at)
+                    .collect();
+                let agree = at.len() == heads.len()
+                    && at.iter().zip(&heads).all(|(&at, &(id, type_tag))| {
+                        batch
+                            .columns
+                            .get(at)
+                            .is_some_and(|c| c.column_id == id && c.type_tag == type_tag)
+                    });
+                if let Some(slot) = places.get_mut(i) {
+                    *slot = at;
+                }
+                agree
+            } else {
+                batch.columns.len() == heads.len()
+                    && batch
+                        .columns
+                        .iter()
+                        .zip(&heads)
+                        .all(|(c, &(id, type_tag))| c.column_id == id && c.type_tag == type_tag)
+            };
             if !agree {
                 return Err(Error::InvalidHeader(
                     "columnar_scan: merged segments disagree on their columns",
@@ -507,17 +573,21 @@ impl MergeStream {
         // Each source batch was validated when it was loaded, so every cell a
         // pick names is there: the fallbacks below are never taken.
         let cell = |pick: &Pick, index: usize| {
-            batch_of(pick).and_then(|b| Some((b.columns.get(index)?, b.row_count)))
+            let at = match &places {
+                None => index,
+                Some(places) => *places.get(pick.source)?.get(index)?,
+            };
+            batch_of(pick).and_then(|b| Some((b.columns.get(at)?, b.row_count)))
         };
-        let mut columns = Vec::with_capacity(template.columns.len());
-        for (index, head) in template.columns.iter().enumerate() {
-            let data = if head.column_id == COL_SEQNO {
+        let mut columns = Vec::with_capacity(heads.len());
+        for (index, &(column_id, type_tag)) in heads.iter().enumerate() {
+            let data = if column_id == COL_SEQNO {
                 let mut out = Vec::with_capacity(count * 8);
                 for pick in pending {
                     out.extend_from_slice(&pick.eff.to_le_bytes());
                 }
                 crate::Slice::from(out)
-            } else if let Some(width) = head.type_tag.fixed_width() {
+            } else if let Some(width) = type_tag.fixed_width() {
                 let width = usize::from(width);
                 gather_fixed_column(
                     width,
@@ -558,13 +628,13 @@ impl MergeStream {
                     bits
                 });
             columns.push(Column {
-                column_id: head.column_id,
-                type_tag: head.type_tag,
+                column_id,
+                type_tag,
                 validity,
                 data,
             });
         }
-        Ok(ColumnBatch { row_count, columns })
+        Ok((ColumnBatch { row_count, columns }, judged))
     }
 }
 

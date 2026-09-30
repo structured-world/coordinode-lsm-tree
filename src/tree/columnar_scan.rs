@@ -864,12 +864,24 @@ impl ColumnarScan {
                 columns.get(type_at).ok_or(MISSING_BATCH_COLUMN)?,
                 columns.get(value_at).ok_or(MISSING_BATCH_COLUMN)?,
             );
+            // A read depends only on the key and the snapshot, and the versions
+            // of a key sit next to each other, so a chain of operands costs
+            // one read rather than one per operand.
+            let mut last: Option<(&[u8], Option<crate::Slice>)> = None;
             for row in 0..row_count {
                 let byte = *kinds.data.get(row as usize).ok_or(MISSING_BATCH_COLUMN)?;
                 let value = bytes_column_row(&cells.data, row_count, row)?;
                 if crate::ValueType::try_from(byte) == Ok(crate::ValueType::MergeOperand) {
                     let key = bytes_column_row(&keys.data, row_count, row)?;
-                    if let Some(merged) = crate::AbstractTree::get(tree, key, self.seqno)? {
+                    let merged = match &last {
+                        Some((read, merged)) if *read == key => merged.clone(),
+                        _ => {
+                            let merged = crate::AbstractTree::get(tree, key, self.seqno)?;
+                            last = Some((key, merged.clone()));
+                            merged
+                        }
+                    };
+                    if let Some(merged) = merged {
                         types.push(u8::from(crate::ValueType::Value));
                         values.push(merged);
                     } else {
