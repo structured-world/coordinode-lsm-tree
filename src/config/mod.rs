@@ -728,6 +728,12 @@ pub struct Config {
     /// [`Config::compaction_rate_limit`].
     pub(crate) compaction_rate_limit: u64,
 
+    /// Optional shared compaction rate limiter. `None` (default) = the tree
+    /// builds its own from [`Self::compaction_rate_limit`]. `Some` = every
+    /// tree holding this `Arc` is bounded by it together, at the rate it
+    /// holds. Set via [`Config::compaction_rate_limiter`].
+    pub(crate) compaction_rate_limiter: Option<Arc<crate::rate_limiter::RateLimiter>>,
+
     /// Worker-thread count for compaction parallelism (`std` only), used two
     /// ways: it sizes the per-tree pool built at open when
     /// [`Self::compaction_pool`] is `None`, which prepares data blocks and
@@ -945,6 +951,7 @@ impl Default for Config {
             manifest_log_rotate_bytes: 1024 * 1024,
             repair_retention_floor: 0,
             compaction_rate_limit: 0,
+            compaction_rate_limiter: None,
 
             #[cfg(feature = "std")]
             compaction_threads: std::thread::available_parallelism()
@@ -2141,10 +2148,64 @@ impl Config {
     /// compaction does not saturate the device and spike user read P99.
     /// `0` (the default) disables throttling. Only compaction is limited;
     /// flush and user reads always pass through.
+    ///
+    /// The tree builds its own limiter from this figure at open; change it
+    /// later through [`AbstractTree::compaction_rate_limiter`](crate::AbstractTree::compaction_rate_limiter).
+    /// Ignored when a shared limiter is supplied through
+    /// [`Self::compaction_rate_limiter`].
     #[must_use]
     pub fn compaction_rate_limit(mut self, bytes_per_sec: u64) -> Self {
         self.compaction_rate_limit = bytes_per_sec;
         self
+    }
+
+    /// Supplies a compaction rate limiter shared with other trees, used in
+    /// place of the per-tree one built from [`Self::compaction_rate_limit`].
+    ///
+    /// Hand the same `Arc` to every tree on one device: their compactions are
+    /// then bounded by it together, at the rate it holds, whatever each
+    /// tree's configured [`Self::compaction_rate_limit`] says. A retune through
+    /// [`RateLimiter::set_rate`](crate::rate_limiter::RateLimiter::set_rate)
+    /// on any holder applies to all of them on their next request.
+    ///
+    /// # Examples
+    ///
+    /// ```
+    /// use lsm_tree::rate_limiter::RateLimiter;
+    /// use lsm_tree::Config;
+    /// use std::sync::Arc;
+    ///
+    /// # let a = tempfile::tempdir()?;
+    /// # let b = tempfile::tempdir()?;
+    /// let device = Arc::new(RateLimiter::new(64 * 1_024 * 1_024));
+    /// let first = Config::new(a.path(), Default::default(), Default::default())
+    ///     .compaction_rate_limiter(Arc::clone(&device))
+    ///     .open()?;
+    /// let second = Config::new(b.path(), Default::default(), Default::default())
+    ///     .compaction_rate_limiter(Arc::clone(&device))
+    ///     .open()?;
+    /// // Both trees now share the device's 64 MiB/s.
+    /// # drop((first, second));
+    /// # Ok::<(), lsm_tree::Error>(())
+    /// ```
+    #[must_use]
+    pub fn compaction_rate_limiter(
+        mut self,
+        limiter: Arc<crate::rate_limiter::RateLimiter>,
+    ) -> Self {
+        self.compaction_rate_limiter = Some(limiter);
+        self
+    }
+
+    /// The limiter a tree opened with this configuration throttles its
+    /// compactions with: the shared one if supplied, else its own built from
+    /// [`Self::compaction_rate_limit`].
+    pub(crate) fn tree_compaction_rate_limiter(&self) -> Arc<crate::rate_limiter::RateLimiter> {
+        self.compaction_rate_limiter.clone().unwrap_or_else(|| {
+            Arc::new(crate::rate_limiter::RateLimiter::new(
+                self.compaction_rate_limit,
+            ))
+        })
     }
 
     /// Sets the compaction worker-thread count.

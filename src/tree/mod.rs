@@ -1667,6 +1667,10 @@ impl AbstractTree for Tree {
             .retention_floor()
     }
 
+    fn compaction_rate_limiter(&self) -> Arc<crate::rate_limiter::RateLimiter> {
+        Arc::clone(&self.compaction_rate_limiter)
+    }
+
     fn get<K: AsRef<[u8]>>(&self, key: K, seqno: SeqNo) -> crate::Result<Option<UserValue>> {
         let key = key.as_ref();
 
@@ -5208,8 +5212,8 @@ impl Tree {
         // move.
         let initial_runtime = config.initial_runtime_config.clone();
         let sync_mode = config.sync_mode;
-        // Same reason: read before the move.
-        let compaction_rate_limit = config.compaction_rate_limit;
+        // Same reason: built before the move.
+        let compaction_rate_limiter = config.tree_compaction_rate_limiter();
         let filter_budget = Arc::<crate::filter_budget::FilterBudget>::default();
         let mut super_versions = SuperVersions::new(
             version,
@@ -5243,9 +5247,7 @@ impl Tree {
             background_deleter: Arc::clone(&background_deleter),
             heal_hints: Arc::clone(&heal_hints),
             filter_budget,
-            compaction_rate_limiter: Arc::new(crate::rate_limiter::RateLimiter::new(
-                compaction_rate_limit,
-            )),
+            compaction_rate_limiter,
             kv_digest_at_insert: portable_atomic::AtomicU8::new(inner::kv_digest_at_insert_gate(
                 &initial_runtime,
             )),
