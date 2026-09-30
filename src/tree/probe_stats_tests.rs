@@ -168,11 +168,11 @@ fn multi_get_counts_each_key_once() -> crate::Result<()> {
     Ok(())
 }
 
-/// A chunked resolve that hands the level back to the serial one, here
-/// because every key is filtered out, counts none of its planning probes:
-/// the serial resolve probes the same filters again and counts them.
+/// A level whose filter rules out every key has no block to read: the staged
+/// resolve answers it with nothing found and counts each key once, as a probe
+/// and a negative one.
 #[test]
-fn a_chunked_resolve_handed_back_counts_nothing() -> crate::Result<()> {
+fn a_level_every_key_is_filtered_out_of_is_answered_and_counted_once() -> crate::Result<()> {
     let folder = tempfile::tempdir()?;
     // Wide enough that no absent key passes the filter.
     let any = tree_of_even_keys(folder.path(), 24.0, true)?;
@@ -191,7 +191,7 @@ fn a_chunked_resolve_handed_back_counts_nothing() -> crate::Result<()> {
         panic!("level 0 exists");
     };
     let comparator = crate::comparator::default_comparator();
-    let resolved = crate::Tree::resolve_level_chunked(
+    let resolved = crate::Tree::resolve_level_staged(
         level,
         &mut remaining,
         &keys,
@@ -199,8 +199,14 @@ fn a_chunked_resolve_handed_back_counts_nothing() -> crate::Result<()> {
         comparator.as_ref(),
         &mut results,
     )?;
-    assert!(!resolved, "no block to read, the serial resolve takes over");
-    assert_eq!(counts(&only_table(&any)), (0, 0));
+    assert!(resolved, "the level is answered: nothing in it");
+    assert!(results.iter().all(Option::is_none));
+    let count = keys.len() as u64;
+    assert_eq!(
+        counts(&only_table(&any)),
+        (count, count),
+        "(probes, negatives)"
+    );
     Ok(())
 }
 
@@ -264,7 +270,7 @@ fn a_chunked_resolve_counts_a_passed_key_with_no_block() -> crate::Result<()> {
         panic!("level 0 exists");
     };
     let comparator = crate::comparator::default_comparator();
-    let resolved = crate::Tree::resolve_level_chunked(
+    let resolved = crate::Tree::resolve_level_staged(
         level,
         &mut remaining,
         &keys,
@@ -350,7 +356,7 @@ fn a_chunked_resolve_counts_false_positives_once() -> crate::Result<()> {
         panic!("level 0 exists");
     };
     let comparator = crate::comparator::default_comparator();
-    let resolved = crate::Tree::resolve_level_chunked(
+    let resolved = crate::Tree::resolve_level_staged(
         level,
         &mut remaining,
         &keys,

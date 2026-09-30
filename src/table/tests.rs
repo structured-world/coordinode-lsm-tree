@@ -4350,7 +4350,7 @@ fn a_block_refused_for_its_declared_length_counts_what_its_transform_decoded() -
         coding::{Decode, Encode},
         table::{
             block::{BlockType, Header},
-            util::{decode_prewarmed_blocks, load_block},
+            util::load_block,
         },
     };
     use std::io::{Seek, Write};
@@ -4395,31 +4395,23 @@ fn a_block_refused_for_its_declared_length_counts_what_its_transform_decoded() -
         "the file read's transform ran, so its output must be counted",
     );
 
-    let cache = Cache::with_capacity_bytes(10_000_000);
     let decoded_before = metrics.bytes_decoded();
-    decode_prewarmed_blocks(
-        table.global_id(),
-        &cache,
-        &[table.regions.tli],
-        &[&tampered],
-        BlockType::Index,
-        CompressionType::None,
-        None,
-        None,
-        #[cfg(zstd_any)]
-        None,
-        &metrics,
+    assert!(
+        table
+            .decode_block_from_bytes(&tampered, table.regions.tli.offset().0, BlockType::Index)
+            .is_err(),
+        "the staged read refuses the block too",
     );
     assert_eq!(
         metrics.bytes_decoded() - decoded_before,
         produced,
-        "the prewarm's transform ran, so its output must be counted",
+        "the staged read's transform ran, so its output must be counted",
     );
 
     let decoded_before = metrics.bytes_decoded();
     assert!(
         table
-            .decode_data_block_from_bytes(&tampered, table.regions.tli.offset().0)
+            .decode_data_block_keeping(&tampered, &table.regions.tli, false)
             .is_err(),
         "the chunked resolver refuses the block too",
     );
@@ -4635,42 +4627,22 @@ fn a_handle_refused_before_reading_counts_no_bytes() -> crate::Result<()> {
     Ok(())
 }
 
-/// A batched prewarm decodes each block before checking its role, so a block it
-/// then refuses to cache still counts what its transform produced; the read
-/// walk that falls back to reading it again counts its own decode on top.
+/// A staged read decodes each block before checking its role, so a block it
+/// then refuses still counts what its transform produced.
 #[cfg(feature = "metrics")]
 #[test]
-fn a_prewarmed_block_rejected_for_its_role_counts_what_its_transform_decoded() -> crate::Result<()>
-{
-    use crate::{
-        CompressionType,
-        cache::Cache,
-        table::{block::BlockType, util::decode_prewarmed_blocks},
-    };
+fn a_staged_block_rejected_for_its_role_counts_what_its_transform_decoded() -> crate::Result<()> {
+    use crate::table::block::BlockType;
 
     let dir = tempdir()?;
     let (table, metrics, frame) = one_row_table_and_its_index_frame(&dir)?;
-    let cache = Cache::with_capacity_bytes(10_000_000);
 
     let decoded_before = metrics.bytes_decoded();
-    decode_prewarmed_blocks(
-        table.global_id(),
-        &cache,
-        &[table.regions.tli],
-        &[&frame],
-        BlockType::Data,
-        CompressionType::None,
-        None,
-        None,
-        #[cfg(zstd_any)]
-        None,
-        &metrics,
-    );
+    let result =
+        table.decode_block_from_bytes(&frame, table.regions.tli.offset().0, BlockType::Filter);
     assert!(
-        cache
-            .get_block(table.global_id(), table.regions.tli.offset())
-            .is_none(),
-        "the index block must not be cached as a data block",
+        matches!(&result, Err(crate::Error::InvalidTag(("BlockType", _)))),
+        "the index block must be refused as a filter block",
     );
     assert_eq!(
         metrics.bytes_decoded() - decoded_before,
@@ -4691,7 +4663,7 @@ fn a_chunk_decoded_block_rejected_for_its_role_counts_what_its_transform_decoded
     let (table, metrics, frame) = one_row_table_and_its_index_frame(&dir)?;
 
     let decoded_before = metrics.bytes_decoded();
-    let result = table.decode_data_block_from_bytes(&frame, table.regions.tli.offset().0);
+    let result = table.decode_data_block_keeping(&frame, &table.regions.tli, false);
     assert!(
         matches!(&result, Err(crate::Error::InvalidTag(("BlockType", _)))),
         "the index block must be refused as a data block",

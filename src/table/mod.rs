@@ -7499,101 +7499,8 @@ impl Table {
         }
     }
 
-    /// Plans the COLD (uncached) data blocks [`Table::batch_get`] will read for
-    /// `sorted_keys`, returning this table's file handle alongside them so the
-    /// caller can read the blocks of MANY SSTs in one cross-file batch (see the
-    /// multi-get level prewarm). Returns `None` when there is nothing to prewarm:
-    /// no cold block, or a Page-ECC SST (the serial path observes auto-heal) or a
-    /// columnar SST (its blocks are reconstructed on the load path).
-    ///
-    /// Best-effort: an over- or under-estimate only affects warming, never a
-    /// query result, since `batch_get` re-reads every block authoritatively.
-    #[expect(
-        clippy::indexing_slicing,
-        reason = "`passing` positions index into `sorted_keys` (< its len); `passing[p]` \
-                  is guarded by `p < passing.len()` each iteration."
-    )]
-    pub(crate) fn plan_prewarm(
-        &self,
-        sorted_keys: &[(&[u8], u64)],
-        seqno: SeqNo,
-    ) -> Option<(Arc<dyn crate::fs::FsFile>, Vec<BlockHandle>)> {
-        if self.metadata.ecc_params.is_some() {
-            return None;
-        }
-        #[cfg(feature = "columnar")]
-        if self.metadata.columnar {
-            return None;
-        }
-        // Best-effort warming: a bloom-probe error here just skips this table's
-        // prewarm (`.ok().flatten()` maps it to None; the authoritative resolve
-        // re-probes and surfaces it).
-        let (passing, mut block_iter, _table_seqno) = self
-            // A prewarm probes ahead of the read it warms, which probes again.
-            .plan_block_walk_setup(sorted_keys, seqno, None)
-            .ok()
-            .flatten()?;
-
-        // Conservative block-boundary walk (mirrors batch_get's span-retry),
-        // collecting only the COLD (uncached) blocks.
-        let mut handles: Vec<BlockHandle> = Vec::new();
-        let mut p = 0_usize;
-        while p < passing.len() {
-            let Some(Ok(block_handle)) = block_iter.next() else {
-                break;
-            };
-            let end_key = block_handle.end_key();
-            let first_in_block = sorted_keys[passing[p]].0;
-            if self.comparator.compare(first_in_block, end_key) == core::cmp::Ordering::Greater {
-                continue;
-            }
-            let handle = *block_handle.as_ref();
-            // Presence only: `get_block` would clone the block out to be
-            // dropped a line later, and count a cache hit for a block this
-            // plan is deciding NOT to read.
-            if !self.cache.has_block(self.global_id(), handle.offset()) {
-                handles.push(handle);
-            }
-            while p < passing.len() {
-                let key = sorted_keys[passing[p]].0;
-                match self.comparator.compare(key, end_key) {
-                    core::cmp::Ordering::Greater | core::cmp::Ordering::Equal => break,
-                    core::cmp::Ordering::Less => p += 1,
-                }
-            }
-        }
-        if handles.is_empty() {
-            return None;
-        }
-
-        let (file, _) = self
-            .file_accessor
-            .get_or_open_table(&self.global_id(), &self.path)
-            .ok()?;
-        Some((file, handles))
-    }
-
-    /// Decodes blocks read by the level prewarm into the cache (`buffers[i]` is
-    /// the on-disk bytes of `handles[i]`, both from [`Table::plan_prewarm`]).
-    pub(crate) fn decode_prewarmed(&self, handles: &[BlockHandle], buffers: &[&[u8]]) {
-        crate::table::util::decode_prewarmed_blocks(
-            self.global_id(),
-            &self.cache,
-            handles,
-            buffers,
-            BlockType::Data,
-            self.metadata.data_block_compression,
-            self.encryption.as_deref(),
-            self.metadata.ecc_params,
-            #[cfg(zstd_any)]
-            self.zstd_dictionary.as_deref(),
-            #[cfg(feature = "metrics")]
-            &self.metrics,
-        );
-    }
-
-    /// Charges data blocks a batched multi-get read (prewarm or chunked
-    /// resolve) is about to ask of the filesystem, at the moment it is issued.
+    /// Charges blocks of `block_type` a batched multi-get read is about to ask
+    /// of the filesystem, at the moment it is issued.
     #[cfg_attr(
         not(feature = "metrics"),
         expect(
@@ -7601,23 +7508,31 @@ impl Table {
             reason = "the table's counters are the feature's payload"
         )
     )]
-    pub(crate) fn record_batched_read(&self, handles: &[BlockHandle]) {
+    pub(crate) fn record_batched_read(&self, block_type: BlockType, handles: &[BlockHandle]) {
         #[cfg(feature = "metrics")]
         for handle in handles {
-            crate::table::util::record_block_read(
-                &self.metrics,
-                BlockType::Data,
-                handle.size().into(),
-            );
+            crate::table::util::record_block_read(&self.metrics, block_type, handle.size().into());
         }
         #[cfg(not(feature = "metrics"))]
-        let _ = handles;
+        let _ = (block_type, handles);
     }
 
     /// Capacity in bytes of this table's (shared) block cache, for the level
     /// prewarm's eviction-avoiding size bound.
     pub(crate) fn cache_capacity(&self) -> u64 {
         self.cache.capacity()
+    }
+
+    /// This table's file, for a caller that reads its blocks itself.
+    ///
+    /// # Errors
+    ///
+    /// Propagates a failure to open the file.
+    pub(crate) fn open_file(&self) -> crate::Result<Arc<dyn crate::fs::FsFile>> {
+        let (file, _) = self
+            .file_accessor
+            .get_or_open_table(&self.global_id(), &self.path)?;
+        Ok(file)
     }
 
     /// Whether this table's data blocks need the special load path rather than a
@@ -7730,25 +7645,38 @@ impl Table {
         Ok(Some((file, table_seqno, self.is_chunk_special(), blocks)))
     }
 
-    /// Decodes a data block from its on-disk bytes (read by the chunked resolver),
-    /// using the same path as [`Table::load_data_block`] for a non-special table
-    /// ([`Block::from_reader`] shares the header / decrypt helpers), so the block
-    /// is byte-identical. Not for Page-ECC / columnar tables ([`is_chunk_special`]).
+    /// Decodes the data block at `handle` from its on-disk `bytes` (read by the
+    /// batched multi-get), using the same path as [`Table::load_data_block`]
+    /// for a non-special table ([`Block::from_reader`] shares the header /
+    /// decrypt helpers), so the block is byte-identical, and puts it in the
+    /// cache when `keep`. Not for Page-ECC / columnar tables
+    /// ([`is_chunk_special`]).
     ///
     /// # Errors
     ///
     /// Propagates a corruption / decode error (the resolver surfaces it).
-    ///
-    /// `offset` is where in the table file `bytes` were read from, which the
-    /// block's stored checksum must be bound to.
-    pub(crate) fn decode_data_block_from_bytes(
+    pub(crate) fn decode_data_block_keeping(
         &self,
         bytes: &[u8],
-        offset: u64,
-    ) -> crate::Result<Option<DataBlock>> {
-        let block = self.decode_block_from_bytes(bytes, offset, BlockType::Data)?;
+        handle: &BlockHandle,
+        keep: bool,
+    ) -> crate::Result<DataBlock> {
+        let block = self.decode_block_from_bytes(bytes, *handle.offset(), BlockType::Data)?;
+        if keep {
+            self.cache
+                .insert_block(self.global_id(), handle.offset(), block.clone());
+        }
         let has_kv_footer = self.metadata.kv_checksum_algo.is_some();
-        DataBlock::from_loaded(block, has_kv_footer).map(Some)
+        DataBlock::from_loaded(block, has_kv_footer)
+    }
+
+    /// The data block at `handle`, when the cache holds it.
+    pub(crate) fn cached_data_block(&self, handle: &BlockHandle) -> Option<DataBlock> {
+        let block = self
+            .cache
+            .get_block(self.global_id(), handle.offset())
+            .filter(|block| block.header.block_type == BlockType::Data)?;
+        DataBlock::from_loaded(block, self.metadata.kv_checksum_algo.is_some()).ok()
     }
 
     /// Decodes the on-disk `bytes` of this table's block of `block_type` read
@@ -7765,6 +7693,14 @@ impl Table {
         offset: u64,
         block_type: BlockType,
     ) -> crate::Result<Block> {
+        // Never an ECC table's block: `from_reader` repairs an ECC-corrected
+        // payload silently, and a corrected block kept in the cache as clean
+        // would let later cache hits skip the heal scheduling the load path
+        // does, leaving the latent fault on disk.
+        debug_assert!(
+            self.metadata.ecc_params.is_none(),
+            "a Page-ECC table's blocks are read through the load path, which heals"
+        );
         // Filter blocks are written uncompressed and without the dictionary,
         // index blocks with the index codec, data blocks with the data codec
         // and its dictionary: the same choice each block's load makes.
