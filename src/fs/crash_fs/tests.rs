@@ -68,6 +68,59 @@ fn a_rename_without_a_directory_sync_is_lost() {
     );
 }
 
+/// A rename onto its own path changes nothing on disk (POSIX rename(2): same
+/// file, no-op), so a file that was durable before it stays durable.
+#[test]
+fn a_rename_onto_itself_keeps_a_durable_file() {
+    let fs = CrashFs::new(MemFs::new()).tracking_directory_entries();
+    fs.create_dir_all(Path::new("/d")).unwrap();
+
+    let mut f = fs
+        .open(
+            Path::new("/d/a"),
+            &FsOpenOptions::new().write(true).create(true),
+        )
+        .unwrap();
+    f.write_all(b"durable").unwrap();
+    f.sync_all().unwrap();
+    drop(f);
+    fs.sync_directory(Path::new("/d")).unwrap();
+    fs.rename(Path::new("/d/a"), Path::new("/d/a")).unwrap();
+
+    fs.crash();
+    assert_eq!(read(&fs, "/d/a"), b"durable");
+}
+
+/// A rename between two hard links of one file is a no-op on a POSIX
+/// filesystem (rename(2): both names refer to the same file), so both durable
+/// names survive a crash.
+#[cfg(unix)]
+#[test]
+fn a_rename_between_links_of_one_file_keeps_both_names() {
+    let dir = tempfile::tempdir().unwrap();
+    let fs = CrashFs::new(crate::fs::StdFs).tracking_directory_entries();
+    let src = dir.path().join("src");
+    let link = dir.path().join("link");
+
+    let mut f = fs
+        .open(&src, &FsOpenOptions::new().write(true).create(true))
+        .unwrap();
+    f.write_all(b"durable").unwrap();
+    f.sync_all().unwrap();
+    drop(f);
+    fs.hard_link(&src, &link).unwrap();
+    fs.sync_directory(dir.path()).unwrap();
+    fs.rename(&link, &src).unwrap();
+    assert!(
+        fs.exists(&link).unwrap(),
+        "the backend treated the rename as a no-op"
+    );
+
+    fs.crash();
+    assert_eq!(read(&fs, src.to_str().unwrap()), b"durable");
+    assert_eq!(read(&fs, link.to_str().unwrap()), b"durable");
+}
+
 /// The blob files a flush and an ingestion write survive a power loss once
 /// the write returns: the manifest that names them must not outlive them.
 #[test]
