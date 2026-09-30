@@ -230,7 +230,9 @@ rewrite that re-emits a source's blocks unchanged keeps the source's layout.
 A reader asks for a field by id only of a split table. Of a whole one it reads
 the value and hands it to the caller's projector, the only party that knows
 how the value encodes its fields; a missing column of a whole table says
-nothing about whether the field exists.
+nothing about whether the field exists. The scan does this only for the rows
+it returns, once the newest visible version of each key is chosen, so a
+shadowed, deleted or too-new version is never read through the projector.
 
 ## What this means for the conversion
 

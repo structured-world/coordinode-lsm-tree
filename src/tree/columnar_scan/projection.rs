@@ -124,9 +124,8 @@ fn intrinsic_type(column_id: u16) -> Option<TypeTag> {
 /// a value in a memtable or a row-oriented table, or the result of a merge.
 ///
 /// The engine does not guess an encoding; the caller that wrote the values
-/// knows it. It is called for the versions the scan's snapshot sees, before
-/// the newest of each key is chosen, so an older version a newer one shadows
-/// may be read too; never for a version newer than the snapshot.
+/// knows it. It is called only for the rows the scan returns: never for a
+/// version a newer one shadows, a deleted one or one newer than the snapshot.
 pub trait ValueProjector: Send + Sync {
     /// Writes into `row` the cell of each field the row value `value` of `key`
     /// has. A field left unset is absent from the row and reads as its
@@ -285,47 +284,34 @@ pub fn is_declared(field: &ProjectedField) -> bool {
     field.type_tag.is_some() && intrinsic_type(field.column_id).is_none()
 }
 
-/// Replaces, in a batch of a table that stores each value whole, the value
-/// column by the declared `fields` read out of it through `projector`, each
-/// row's value given with its key. A field the projector leaves unset is null
-/// here, and reads as declared once the batch is conformed. A row that is not
-/// a value (a deletion, a merge operand) carries no fields: it is decided by
-/// its type, not read. The value column stays when a field projects it by id.
-pub fn project_whole(
+/// Reads, in a batch of rows a scan returns, the declared `fields` of each row
+/// carrying a whole value in column `whole_id` out of that value through
+/// `projector`, each value given with its key, in place of the cells the row
+/// holds for them. A row without a whole value keeps its cells as its source
+/// stored them, and a row that is not a value (a deletion) is not read. A
+/// field the projector leaves unset is null here, and reads as declared once
+/// the batch is conformed. A whole value to read with no projector set is an
+/// error: its fields lie inside it and only the caller knows how.
+pub fn project_decided(
     batch: ColumnBatch,
     fields: &[ProjectedField],
-    projector: &dyn ValueProjector,
+    projector: Option<&dyn ValueProjector>,
+    whole_id: u16,
 ) -> crate::Result<ColumnBatch> {
-    use crate::table::columnar::COL_VALUE;
-
-    let ColumnBatch {
-        row_count,
-        mut columns,
-    } = batch;
-    let at = columns
-        .iter()
-        .position(|c| c.column_id == COL_VALUE)
-        .ok_or(MISSING_SCAN_COLUMN)?;
-    let keep_value = fields
-        .iter()
-        .any(|f| f.column_id == COL_VALUE && !is_declared(f));
-    let values = if keep_value {
-        columns.get(at).cloned().ok_or(MISSING_SCAN_COLUMN)?
-    } else {
-        columns.remove(at)
+    let row_count = batch.row_count;
+    let rows = row_count as usize;
+    let find = |id: u16| batch.columns.iter().find(|c| c.column_id == id);
+    let (Some(values), Some(keys)) = (find(whole_id), find(COL_USER_KEY)) else {
+        return Err(MISSING_SCAN_COLUMN);
     };
-    let keys = columns
-        .iter()
-        .find(|c| c.column_id == COL_USER_KEY)
-        .ok_or(MISSING_SCAN_COLUMN)?;
-    let types = columns.iter().find(|c| c.column_id == COL_VALUE_TYPE);
+    let types = find(COL_VALUE_TYPE);
     let declared: Vec<ProjectedField> = fields.iter().filter(|f| is_declared(f)).cloned().collect();
 
+    // Per declared field, the cells a projected row read; `None` in `read`
+    // marks a row the projector did not read, which keeps its own cells.
+    let mut read: Vec<Option<Vec<Option<Vec<u8>>>>> = Vec::with_capacity(rows);
     let mut cells: Vec<Option<Vec<u8>>> = alloc::vec![None; declared.len()];
-    let mut out: Vec<Vec<Option<Vec<u8>>>> =
-        alloc::vec![Vec::with_capacity(row_count as usize); declared.len()];
     for row in 0..row_count {
-        cells.fill(None);
         let is_value = match types {
             Some(types) => {
                 let byte = *types.data.get(row as usize).ok_or(MISSING_SCAN_COLUMN)?;
@@ -336,20 +322,67 @@ pub fn project_whole(
             }
             None => true,
         };
-        if is_value {
-            let key = bytes_column_row(&keys.data, row_count, row)?;
-            let value = bytes_column_row(&values.data, row_count, row)?;
-            projector.project(key, value, &mut ProjectedRow::new(&declared, &mut cells))?;
+        if !(is_value && values.is_valid(row)) {
+            read.push(None);
+            continue;
         }
-        for (column, cell) in out.iter_mut().zip(&mut cells) {
-            column.push(cell.take());
-        }
+        let projector = projector.ok_or(UNREADABLE)?;
+        cells.fill(None);
+        let key = bytes_column_row(&keys.data, row_count, row)?;
+        let value = bytes_column_row(&values.data, row_count, row)?;
+        projector.project(key, value, &mut ProjectedRow::new(&declared, &mut cells))?;
+        read.push(Some(core::mem::take(&mut cells)));
+        cells = alloc::vec![None; declared.len()];
     }
-    for (field, column) in declared.iter().zip(out) {
-        columns.push(built_column(field, &column)?);
+    if read.iter().all(Option::is_none) {
+        return Ok(batch);
+    }
+
+    let ColumnBatch {
+        row_count,
+        mut columns,
+    } = batch;
+    for (index, field) in declared.iter().enumerate() {
+        let Some(at) = columns.iter().position(|c| c.column_id == field.column_id) else {
+            return Err(MISSING_SCAN_COLUMN);
+        };
+        let old = columns.get(at).ok_or(MISSING_SCAN_COLUMN)?;
+        let mut column: Vec<Option<Vec<u8>>> = Vec::with_capacity(rows);
+        for (row, projected) in (0..row_count).zip(&read) {
+            column.push(match projected {
+                Some(cells) => cells.get(index).cloned().flatten(),
+                None if old.is_valid(row) => Some(cell_of(old, row_count, row)?.to_vec()),
+                None => None,
+            });
+        }
+        let built = built_column(field, &column)?;
+        if let Some(slot) = columns.get_mut(at) {
+            *slot = built;
+        }
     }
     Ok(ColumnBatch { row_count, columns })
 }
+
+/// Row `row` of `column`, of `rows` rows, as stored.
+fn cell_of(column: &Column, rows: u32, row: u32) -> crate::Result<&[u8]> {
+    match column.type_tag.fixed_width() {
+        Some(width) => {
+            let width = usize::from(width);
+            let start = row as usize * width;
+            column
+                .data
+                .get(start..start + width)
+                .ok_or(MISSING_SCAN_COLUMN)
+        }
+        None => bytes_column_row(&column.data, rows, row),
+    }
+}
+
+/// A whole value holds declared fields and no projector is set to read them.
+const UNREADABLE: Error = Error::Projection(
+    "projection: a row returned stores its value whole, and declared fields are read out \
+     of it through a projector, which is not set",
+);
 
 /// Whether a row of `value_type` is returned with a value: a value, or a merge
 /// operand left unresolved, which is what a read of a tree without a merge

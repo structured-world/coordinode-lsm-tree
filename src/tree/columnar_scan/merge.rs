@@ -23,10 +23,10 @@ use alloc::vec::Vec;
 
 use super::projection::{ProjectedField, conform, conform_lenient};
 use super::rows::SourceCursor;
-use super::{ColumnarScan, Segment, SegmentCursor, WholeRead, drop_columns, key_in_bounds};
+use super::{ColumnarScan, Segment, SegmentCursor, drop_columns, key_in_bounds};
 use crate::table::columnar::{
-    COL_SEQNO, COL_USER_KEY, COL_VALUE_TYPE, ColumnBatch, TypeTag, bytes_column_row,
-    bytes_column_span, fixed_u64_row,
+    COL_SEQNO, COL_USER_KEY, COL_VALUE, COL_VALUE_TYPE, Column, ColumnBatch, TypeTag,
+    bytes_column_row, bytes_column_span, fixed_u64_row, frame_bytes_column,
 };
 use crate::table::columnar_predicate::PredicateSupport;
 use crate::{Error, SeqNo, UserKey};
@@ -34,12 +34,18 @@ use crate::{Error, SeqNo, UserKey};
 /// Rows an output batch of the merge is cut at.
 const TARGET_ROWS: usize = 4_096;
 
+/// The id under which a merge carries each row's whole value from a
+/// whole-value source to the rows it returns, null for a row of a source
+/// that splits its values. It never reaches the caller, and a projection may
+/// not name it.
+pub(super) const COL_WHOLE_VALUE: u16 = u16::MAX;
+
 /// One segment of an overlapping group, read through its cursor.
 struct MergeSource {
     cursor: SourceCursor,
-    /// For a whole-value segment read for declared fields, how its batches
-    /// become those fields.
-    whole: Option<WholeRead>,
+    /// Whether the segment carries each row's whole value (see
+    /// [`COL_WHOLE_VALUE`]).
+    whole: bool,
     /// The batch the source is in, `None` before the first and once the
     /// cursor is exhausted.
     batch: Option<ColumnBatch>,
@@ -111,6 +117,10 @@ pub(super) struct MergeStream {
     /// The predicate's column when it is loose: rows chosen from batches
     /// that do not all carry it cannot be judged.
     loose_predicate: Option<u16>,
+    /// Whether the rows returned have their values read (see
+    /// [`ColumnarScan::read_late`]), so every batch carries the whole-value
+    /// column.
+    late: bool,
     /// Whether a segment of the group records deletions, so the value type is
     /// decoded.
     deletes: bool,
@@ -212,12 +222,14 @@ impl MergeStream {
                 })
             })
             .collect::<crate::Result<Vec<_>>>()?;
+        let late = segments.iter().any(|seg| scan.reads_late(seg));
         Ok(Self {
             sources,
             dropped,
             fields,
             loose,
             loose_predicate,
+            late,
             deletes,
             rts,
             last_key: None,
@@ -358,7 +370,7 @@ impl MergeStream {
         scan: &ColumnarScan,
         cmp: &dyn crate::comparator::UserComparator,
     ) -> crate::Result<Position> {
-        let (position, peak) = self.position_source(i, scan, cmp)?;
+        let (position, peak) = self.position_source(i, cmp)?;
         if let Some(peak) = peak {
             // The other sources did not move while this one loaded, so the
             // most the merge held is theirs plus this source's peak.
@@ -374,11 +386,10 @@ impl MergeStream {
     fn position_source(
         &mut self,
         i: usize,
-        scan: &ColumnarScan,
         cmp: &dyn crate::comparator::UserComparator,
     ) -> crate::Result<(Position, Option<u64>)> {
         let last_key = self.last_key.as_deref();
-        let fields = &self.fields;
+        let (fields, late) = (&self.fields, self.late);
         let Some(source) = self.sources.get_mut(i) else {
             return Ok((Position::Exhausted, None));
         };
@@ -419,14 +430,20 @@ impl MergeStream {
             match source.cursor.next() {
                 None => return Ok((Position::Exhausted, loaded)),
                 Some(batch) => {
-                    // A whole-value segment's operands are resolved and its
-                    // declared fields read out of its values first, so every
-                    // source brings the same columns to the conform below.
-                    let batch = scan.read_whole(batch?, source.whole.as_ref())?;
+                    // A whole value moves aside before the conform, where a
+                    // declared field may share the value column's id.
+                    let batch = carry_whole_value(batch?, source.whole, fields);
                     // Its rows are not decided yet: a shadowed or deleted
                     // one must not fail the scan, and the predicate after
                     // the dedup sees the declared defaults.
                     let batch = conform_lenient(batch, fields)?;
+                    // Every source then carries the whole value last, null
+                    // where it splits its values, so the sources agree.
+                    let batch = if late {
+                        last_whole_value(batch)?
+                    } else {
+                        batch
+                    };
                     // Keys are read row by row from their framing, which only
                     // a bytes column carries.
                     if batch
@@ -482,6 +499,14 @@ impl MergeStream {
             return Ok(None);
         };
         scan.record_gather(&merged);
+        // The rows are decided: their operands are resolved and their fields
+        // read out of their values now, and read as declared before the
+        // predicate sees them.
+        let merged = if self.late {
+            conform_lenient(scan.read_late(merged)?, &scan.fields)?
+        } else {
+            merged
+        };
 
         // The row predicate runs AFTER the dedup: each row is the newest
         // visible version of its key, so a key whose newest version fails the
@@ -663,6 +688,57 @@ impl MergeStream {
         }
         Ok((ColumnBatch { row_count, columns }, judged))
     }
+}
+
+/// `batch` of a source that carries whole values (`whole`) with its value
+/// column under [`COL_WHOLE_VALUE`]: renamed, or copied when a field of
+/// `fields` projects the raw value by id and it stays too.
+fn carry_whole_value(
+    mut batch: ColumnBatch,
+    whole: bool,
+    fields: &[ProjectedField],
+) -> ColumnBatch {
+    if !whole {
+        return batch;
+    }
+    let raw_kept = fields
+        .iter()
+        .any(|f| f.column_id() == COL_VALUE && !super::projection::is_declared(f));
+    if let Some(at) = batch.columns.iter().position(|c| c.column_id == COL_VALUE) {
+        if raw_kept {
+            if let Some(value) = batch.columns.get(at).cloned() {
+                batch.columns.push(Column {
+                    column_id: COL_WHOLE_VALUE,
+                    ..value
+                });
+            }
+        } else if let Some(value) = batch.columns.get_mut(at) {
+            value.column_id = COL_WHOLE_VALUE;
+        }
+    }
+    batch
+}
+
+/// `batch` with its whole-value column last, or with a null one appended when
+/// its source splits its values.
+fn last_whole_value(mut batch: ColumnBatch) -> crate::Result<ColumnBatch> {
+    let at = batch
+        .columns
+        .iter()
+        .position(|c| c.column_id == COL_WHOLE_VALUE);
+    let column = if let Some(at) = at {
+        batch.columns.remove(at)
+    } else {
+        let rows = batch.row_count as usize;
+        Column {
+            column_id: COL_WHOLE_VALUE,
+            type_tag: TypeTag::Bytes,
+            validity: Some(alloc::vec![0u8; rows.div_ceil(8)]),
+            data: frame_bytes_column(rows, || core::iter::repeat_n(&[][..], rows))?,
+        }
+    };
+    batch.columns.push(column);
+    Ok(batch)
 }
 
 /// A merge source index that names no source.

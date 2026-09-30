@@ -398,7 +398,8 @@ fn a_field_folded_into_the_value_by_a_compaction_is_read_through_the_projector()
 
 /// Rows flushed into a columnar tree keep each value whole; a declared field
 /// lies inside it, which only a projector reads, so a scan without one is
-/// refused rather than reading the field as absent.
+/// refused rather than reading the field as absent, once such a row is
+/// returned.
 #[test]
 fn declared_fields_over_whole_values_without_a_projector_are_refused() {
     let folder = get_tmp_folder();
@@ -407,10 +408,8 @@ fn declared_fields_over_whole_values_without_a_projector_are_refused() {
     tree.insert(key(0), 7u32.to_le_bytes(), 0);
     tree.flush_active_memtable(0).expect("flush");
 
-    let got = tree
-        .columnar_scan(projection(Absent::Null), None, SeqNo::MAX, ..)
-        .err();
-    assert!(matches!(got, Some(Error::Projection(_))), "got {got:?}");
+    let got = rows(tree, &projection(Absent::Null));
+    assert!(matches!(got, Err(Error::Projection(_))), "got {got:?}");
     // By id the value column still reads as stored.
     assert!(
         tree.columnar_scan(&[COL_USER_KEY, 3], None, SeqNo::MAX, ..)
@@ -708,17 +707,97 @@ fn a_compaction_during_the_scan_changes_nothing_it_returns() -> lsm_tree::Result
 }
 
 /// A row source's declared fields are read through the projector, so a scan
-/// without one is refused rather than reading them as absent.
+/// without one is refused rather than reading them as absent, once such a row
+/// is returned.
 #[test]
 fn declared_fields_over_memtable_rows_without_a_projector_are_refused() {
     let folder = get_tmp_folder();
     let any = open_columnar(folder.path());
     let tree = standard(&any);
     tree.insert(key(0), row_value(10, 40), 0);
-    let got = tree
-        .columnar_scan(projection(Absent::Null), None, SeqNo::MAX, ..)
-        .err();
-    assert!(matches!(got, Some(Error::Projection(_))), "got {got:?}");
+    let got = rows(tree, &projection(Absent::Null));
+    assert!(matches!(got, Err(Error::Projection(_))), "got {got:?}");
+}
+
+/// Whole values a newer split table shadows, and a flushed table holding
+/// only deletions, are never returned, so a scan of split tables needs no
+/// projector because of them; and a shadowed whole value the projector
+/// cannot read is not handed to it.
+#[test]
+fn shadowed_or_deleted_whole_values_need_no_projector() -> lsm_tree::Result<()> {
+    let folder = get_tmp_folder();
+    let any = open_columnar(folder.path());
+    let tree = standard(&any);
+    // Older whole values, one the projector cannot read.
+    let mut ingestion = any.ingestion()?;
+    ingestion.write(key(0), b"not two cells".to_vec())?;
+    ingestion.write(key(1), row_value(11, 41))?;
+    ingestion.finish()?;
+    // A newer split table over both keys.
+    ingest(&any, &[0, 1], &[(3, &[100, 101]), (4, &[400, 401])]);
+    assert_eq!(
+        vec![(key(0), Some(400)), (key(1), Some(401))],
+        rows(tree, &projection(Absent::Null))?,
+        "shadowed, no projector"
+    );
+    assert_eq!(
+        vec![(key(0), Some(400)), (key(1), Some(401))],
+        rows(tree, &projected())?,
+        "shadowed, with a projector that cannot read one of them"
+    );
+
+    // A table holding only a deletion over the split one.
+    let mut ingestion = any.ingestion()?;
+    ingestion.write_tombstone(key(0))?;
+    ingestion.finish()?;
+    assert_eq!(
+        vec![(key(1), Some(401))],
+        rows(tree, &projection(Absent::Null))?,
+        "a flushed deletion"
+    );
+    Ok(())
+}
+
+/// A merge operand ingested into a split table is resolved as a read resolves
+/// it, and its fields read out of the merged value.
+#[test]
+fn an_operand_in_a_split_table_is_resolved_as_the_read_resolves_it() -> lsm_tree::Result<()> {
+    let folder = get_tmp_folder();
+    let any = Config::new(
+        folder.path(),
+        SequenceNumberCounter::default(),
+        SequenceNumberCounter::default(),
+    )
+    .with_merge_operator(Some(std::sync::Arc::new(AddToFourth)))
+    .open()?;
+    standard(&any).update_runtime_config(|cfg| cfg.columnar = true)?;
+    let tree = standard(&any);
+    tree.insert(key(0), row_value(10, 40), 1);
+    tree.flush_active_memtable(0)?;
+    // A split batch whose row is an operand.
+    let entries = [InternalValue::from_components(
+        key(0),
+        b"ignored",
+        0,
+        ValueType::MergeOperand,
+    )];
+    let mut batch = entries_to_column_batch(&entries).expect("transpose");
+    batch.columns.pop();
+    batch.columns.push(Column {
+        column_id: 3,
+        type_tag: TypeTag::Fixed(4),
+        validity: None,
+        data: 2u32.to_le_bytes().to_vec().into(),
+    });
+    let mut ingestion = any.ingestion()?;
+    ingestion.write_columnar_batch(&batch)?;
+    ingestion.finish()?;
+
+    let read = tree.get(key(0), SeqNo::MAX)?.expect("the key is present");
+    let cells = unframe_value_cells(&read, &[TypeTag::Fixed(4), TypeTag::Fixed(4)])?;
+    let fourth = u32::from_le_bytes(cells[1].try_into().expect("fixed-4"));
+    assert_eq!(vec![(key(0), Some(fourth))], rows(tree, &projected())?);
+    Ok(())
 }
 
 /// A memtable holding only deletions has no value to read a field out of, so a
