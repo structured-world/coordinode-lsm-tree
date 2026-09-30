@@ -849,6 +849,247 @@ fn an_operand_in_a_split_table_is_resolved_as_the_read_resolves_it() -> lsm_tree
     Ok(())
 }
 
+/// A version a newer one shadows is never returned, so a field it stores
+/// under another type than declared does not fail the scan; returned, it
+/// does.
+#[test]
+fn a_shadowed_version_storing_a_field_under_another_type_does_not_fail_the_scan()
+-> lsm_tree::Result<()> {
+    use lsm_tree::table::columnar::{ByteOrder, Number, NumberKind};
+
+    let number = TypeTag::Number(Number::new(NumberKind::Unsigned, 4, ByteOrder::Little)?);
+    let folder = get_tmp_folder();
+    let any = open_columnar(folder.path());
+    ingest_typed(
+        &any,
+        &[0, 1],
+        &[(3, TypeTag::Fixed(4), &[10, 11]), (4, number, &[40, 41])],
+    );
+    ingest(&any, &[0], &[(3, &[100]), (4, &[400])]);
+    let got = rows(standard(&any), &projection(Absent::Null));
+    assert!(
+        matches!(got, Err(Error::Projection(_))),
+        "key 1 is returned from the mistyped version, got {got:?}"
+    );
+
+    ingest(&any, &[1], &[(3, &[101]), (4, &[401])]);
+    assert_eq!(
+        vec![(key(0), Some(400)), (key(1), Some(401))],
+        rows(standard(&any), &projection(Absent::Null))?,
+        "every mistyped version is shadowed"
+    );
+    Ok(())
+}
+
+/// The same on a segment streamed alone: rows of it a predicate filters out
+/// are not returned, so the field it stores under another type does not fail
+/// the scan.
+#[test]
+fn filtered_out_rows_storing_a_field_under_another_type_do_not_fail_the_scan()
+-> lsm_tree::Result<()> {
+    use lsm_tree::table::columnar::{ByteOrder, Number, NumberKind};
+    use lsm_tree::table::columnar_predicate::{ColumnRangePredicate, PredicateApply};
+
+    let u32_le = Number::new(NumberKind::Unsigned, 4, ByteOrder::Little)?;
+    let number = TypeTag::Number(u32_le);
+    let folder = get_tmp_folder();
+    let any = open_columnar(folder.path());
+    ingest_typed(
+        &any,
+        &[0, 1],
+        &[(3, number, &[10, 11]), (4, number, &[40, 41])],
+    );
+    // Field 3 is stored as declared and judged by the predicate once the
+    // batch is read, which keeps no row; field 4 is stored under another type.
+    let judged = Projection::new()
+        .column(COL_USER_KEY)
+        .field(ProjectedField::new(3, number, Absent::Null)?)
+        .field(field(4, Absent::Null));
+    let bound = u32_le.comparable(&1_000u32.to_le_bytes())?;
+    let predicate = ColumnRangePredicate {
+        column_id: 3,
+        lower: Some(bound.clone()),
+        upper: Some(bound),
+        apply: PredicateApply::Filter,
+    };
+    let mut returned = 0;
+    for batch in standard(&any).columnar_scan(&judged, Some(&predicate), SeqNo::MAX, ..)? {
+        returned += batch?.row_count;
+    }
+    assert_eq!(0, returned);
+    assert!(
+        matches!(
+            rows(standard(&any), &projection(Absent::Null)),
+            Err(Error::Projection(_))
+        ),
+        "returned, the rows fail the scan"
+    );
+    Ok(())
+}
+
+/// A predicate over a column the values do not hold, here the seqno, runs
+/// before any value is read: a row it filters out is never handed to the
+/// projector, so a value the projector cannot read does not fail the scan.
+#[test]
+fn a_row_the_predicate_filters_out_is_not_projected() -> lsm_tree::Result<()> {
+    use lsm_tree::table::columnar::{COL_SEQNO, Number};
+    use lsm_tree::table::columnar_predicate::{ColumnRangePredicate, PredicateApply};
+
+    let folder = get_tmp_folder();
+    let any = open_columnar(folder.path());
+    let tree = standard(&any);
+    tree.insert(key(0), row_value(10, 40), 0);
+    tree.insert(key(1), b"not two cells".to_vec(), 1);
+    let bound = Number::U64_LE.comparable(&0u64.to_le_bytes())?;
+    let predicate = ColumnRangePredicate {
+        column_id: COL_SEQNO,
+        lower: Some(bound.clone()),
+        upper: Some(bound),
+        apply: PredicateApply::Filter,
+    };
+    let mut got = Vec::new();
+    for batch in tree.columnar_scan(projected(), Some(&predicate), SeqNo::MAX, ..)? {
+        let batch = batch?;
+        for row in 0..batch.row_count {
+            got.push(bytes_cell(&batch.columns[0].data, batch.row_count, row));
+        }
+    }
+    assert_eq!(vec![key(0)], got);
+    Ok(())
+}
+
+/// A scan at the latest snapshot reads what the tree held when it was
+/// created: a write that lands in the memtable afterwards, whose key lies past
+/// every key the scan grouped, is not returned, nor is a deletion that lands
+/// afterwards applied.
+#[test]
+fn a_write_after_the_scan_was_created_is_not_returned() -> lsm_tree::Result<()> {
+    let folder = get_tmp_folder();
+    let any = open_columnar(folder.path());
+    let tree = standard(&any);
+    // The ingestion seals the memtable it finds, so the row that makes the
+    // active memtable a segment of the scan is written after it.
+    ingest(&any, &[1], &[(3, &[11]), (4, &[41])]);
+    let seqno = tree.get_highest_seqno().map_or(0, |s| s + 1);
+    tree.insert(key(0), row_value(10, 40), seqno);
+
+    let scan = tree.columnar_scan(projected(), None, SeqNo::MAX, ..)?;
+    let seqno = tree.get_highest_seqno().map_or(0, |s| s + 1);
+    tree.insert(key(5), row_value(15, 45), seqno);
+    tree.remove(key(1), seqno + 1);
+    let mut got = Vec::new();
+    for batch in scan {
+        let batch = batch?;
+        for row in 0..batch.row_count {
+            got.push(bytes_cell(&batch.columns[0].data, batch.row_count, row));
+        }
+    }
+    assert_eq!(vec![key(0), key(1)], got);
+    Ok(())
+}
+
+/// A fixed-width field of width zero has no cell to hold, and a column of it
+/// is one no batch may carry, so declaring one is refused up front instead of
+/// failing, or panicking, once rows are projected into it.
+#[test]
+fn a_zero_width_field_is_refused() {
+    for absent in [
+        Absent::Null,
+        Absent::Error,
+        Absent::Default(Slice::from(&[][..])),
+    ] {
+        let got = ProjectedField::new(5, TypeTag::Fixed(0), absent.clone());
+        assert!(
+            matches!(got, Err(Error::Projection(_))),
+            "{absent:?}: got {got:?}"
+        );
+    }
+}
+
+/// A tree merging with [`AddToFourth`] whose key 0 is a flushed whole value
+/// `row_value(10, 40)` under a split table holding an operand for it: one
+/// column `id` of type `type_tag` whose cell is 2.
+fn split_operand_over_a_whole_value(
+    folder: &std::path::Path,
+    id: u16,
+    type_tag: TypeTag,
+) -> lsm_tree::Result<AnyTree> {
+    let any = Config::new(
+        folder,
+        SequenceNumberCounter::default(),
+        SequenceNumberCounter::default(),
+    )
+    .with_merge_operator(Some(std::sync::Arc::new(AddToFourth)))
+    .open()?;
+    standard(&any).update_runtime_config(|cfg| cfg.columnar = true)?;
+    let tree = standard(&any);
+    tree.insert(key(0), row_value(10, 40), 1);
+    tree.flush_active_memtable(0)?;
+    let entries = [InternalValue::from_components(
+        key(0),
+        b"ignored",
+        0,
+        ValueType::MergeOperand,
+    )];
+    let mut batch = entries_to_column_batch(&entries).expect("transpose");
+    batch.columns.pop();
+    batch.columns.push(Column {
+        column_id: id,
+        type_tag,
+        validity: None,
+        data: 2u32.to_le_bytes().to_vec().into(),
+    });
+    let mut ingestion = any.ingestion()?;
+    ingestion.write_columnar_batch(&batch)?;
+    ingestion.finish()?;
+    Ok(any)
+}
+
+/// A resolved operand is the merged value, read whole: a field projected by
+/// id alone cannot be read out of it, as out of any whole value, so the scan
+/// refuses it instead of returning the operand's own cell.
+#[test]
+fn a_field_projected_by_id_is_not_read_off_a_resolved_operand() -> lsm_tree::Result<()> {
+    let folder = get_tmp_folder();
+    let any = split_operand_over_a_whole_value(folder.path(), 3, TypeTag::Fixed(4))?;
+    let projection = Projection::new().column(COL_USER_KEY).column(3);
+    let mut got = Vec::new();
+    let outcome = (|| -> lsm_tree::Result<()> {
+        for batch in standard(&any).columnar_scan(&projection, None, SeqNo::MAX, ..)? {
+            let batch = batch?;
+            let third = &batch.columns[1];
+            for row in 0..batch.row_count {
+                let at = row as usize * 4;
+                got.push(third.data[at..at + 4].to_vec());
+            }
+        }
+        Ok(())
+    })();
+    assert!(
+        matches!(outcome, Err(Error::Projection(_))),
+        "got {outcome:?} with cells {got:?}"
+    );
+    Ok(())
+}
+
+/// A predicate over a column no field declares cannot judge a resolved
+/// operand, whose merged value is read whole: the row comes back and the
+/// predicate reports it did not run, instead of judging the operand's cell.
+#[test]
+fn a_predicate_over_an_undeclared_column_does_not_judge_a_resolved_operand() -> lsm_tree::Result<()>
+{
+    use lsm_tree::table::columnar::{ByteOrder, Number, NumberKind};
+    use lsm_tree::table::columnar_predicate::PredicateSupport;
+
+    let number = TypeTag::Number(Number::new(NumberKind::Unsigned, 4, ByteOrder::Little)?);
+    let folder = get_tmp_folder();
+    let any = split_operand_over_a_whole_value(folder.path(), 5, number)?;
+    let (keys, support) = keys_filtered_on_five(standard(&any), projected(), 2)?;
+    assert_eq!(Some(PredicateSupport::Unsupported), support);
+    assert_eq!(vec![key(0)], keys);
+    Ok(())
+}
+
 /// A memtable holding only deletions has no value to read a field out of, so a
 /// scan of split tables under it needs no projector: the deletions apply.
 #[test]

@@ -21,7 +21,7 @@
 
 use alloc::vec::Vec;
 
-use super::projection::{ProjectedField, conform, conform_lenient};
+use super::projection::{MISTYPED, ProjectedField, conform, conform_lenient};
 use super::rows::SourceCursor;
 use super::{ColumnarScan, Segment, SegmentCursor, drop_columns, key_in_bounds};
 use crate::table::columnar::{
@@ -49,6 +49,8 @@ struct MergeSource {
     /// The batch the source is in, `None` before the first and once the
     /// cursor is exhausted.
     batch: Option<ColumnBatch>,
+    /// How `batch` stores the projected fields.
+    types: FieldTypes,
     /// The next row of `batch` to consider.
     row: u32,
     /// Where `batch` keeps the key and seqno columns.
@@ -70,6 +72,16 @@ struct MergeSource {
     /// Whether a row of `batch` is chosen for the output being built, so the
     /// batch must stay until the output is gathered.
     referenced: bool,
+}
+
+/// How a source's batch stores the projected fields.
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+enum FieldTypes {
+    /// Each under the type its field declares.
+    AsDeclared,
+    /// One under another type: a row of the batch the scan returns fails the
+    /// scan, one shadowed or filtered out does not.
+    Mistyped,
 }
 
 impl MergeSource {
@@ -209,6 +221,7 @@ impl MergeStream {
                     cursor,
                     whole,
                     batch: None,
+                    types: FieldTypes::AsDeclared,
                     row: 0,
                     key_col: 0,
                     seqno_col: 0,
@@ -436,7 +449,7 @@ impl MergeStream {
                     // Its rows are not decided yet: a shadowed or deleted
                     // one must not fail the scan, and the predicate after
                     // the dedup sees the declared defaults.
-                    let batch = conform_lenient(batch, fields)?;
+                    let (batch, mistyped) = conform_lenient(batch, fields)?;
                     // Every source then carries the whole value last, null
                     // where it splits its values, so the sources agree.
                     let batch = if late {
@@ -470,6 +483,11 @@ impl MergeStream {
                     source.key_col = place(COL_USER_KEY)?;
                     source.seqno_col = place(COL_SEQNO)?;
                     source.batch = Some(batch);
+                    source.types = if mistyped {
+                        FieldTypes::Mistyped
+                    } else {
+                        FieldTypes::AsDeclared
+                    };
                     source.row = 0;
                     let held = source.held_bytes();
                     loaded = Some(loaded.map_or(held, |peak| peak.max(held)));
@@ -499,21 +517,46 @@ impl MergeStream {
             return Ok(None);
         };
         scan.record_gather(&merged);
-        // The rows are decided: their operands are resolved and their fields
-        // read out of their values now, and read as declared before the
-        // predicate sees them.
-        let merged = if self.late {
-            conform_lenient(scan.read_late(merged)?, &scan.fields)?
-        } else {
-            merged
-        };
-
         // The row predicate runs AFTER the dedup: each row is the newest
         // visible version of its key, so a key whose newest version fails the
         // predicate is dropped instead of falling back to an older matching
         // version. It runs in the scan's coordinates, on effective seqnos.
         // Rows that do not all carry its column are returned unjudged.
-        let mut merged = if judged {
+        //
+        // Over a column reading the values does not change, it runs before
+        // they are read, so a row it drops is never resolved or handed to the
+        // projector.
+        let early = judged && scan.predicate_precedes_values(&merged);
+        let merged = if early {
+            scan.filter_after_dedup(merged, scan.predicate.as_ref(), support)?
+        } else {
+            merged
+        };
+        if merged.row_count == 0 {
+            return Ok(None);
+        }
+        // The rows are decided: their operands are resolved and their fields
+        // read out of their values now, and read as declared before the
+        // predicate sees them.
+        let (merged, resolved) = if self.late {
+            let (merged, resolved) = scan.read_late(merged)?;
+            // Every declared column now holds its declared type: read out of
+            // a value, or conformed when its source was loaded.
+            let (merged, mistyped) = conform_lenient(merged, &scan.fields)?;
+            if mistyped {
+                return Err(MISTYPED);
+            }
+            (merged, resolved)
+        } else {
+            (merged, false)
+        };
+        // An operand resolved to a value is read whole, so its cell in a
+        // column no field declares is the operand's own: a loose predicate
+        // cannot judge it.
+        let judged = judged && !(resolved && self.loose_predicate.is_some());
+        let mut merged = if early {
+            merged
+        } else if judged {
             scan.filter_after_dedup(merged, scan.predicate.as_ref(), support)?
         } else {
             *support = (*support).min(PredicateSupport::Unsupported);
@@ -521,6 +564,16 @@ impl MergeStream {
         };
         if merged.row_count == 0 {
             return Ok(None);
+        }
+        // A row returned from a batch that stores a projected field under
+        // another type fails the scan; a shadowed or filtered one did not.
+        if pending.iter().any(|pick| self.taken_from_mistyped(pick))
+            && self
+                .returned_picks(&merged, &pending)?
+                .iter()
+                .any(|pick| self.taken_from_mistyped(pick))
+        {
+            return Err(MISTYPED);
         }
         // A projected column left out because some chosen row lacked it is
         // brought back for the rows the predicate kept, when they all have it.
@@ -534,18 +587,13 @@ impl MergeStream {
         Ok(Some(merged))
     }
 
-    /// Adds to `merged`, the rows returned out of the chosen `pending` ones,
-    /// each `left_out` column a field of `fields` projects, gathered from the
-    /// batches those rows come from, when every one of them carries it under
-    /// one type. A column some returned row lacks stays out, and the row
-    /// fails the conform that follows.
-    fn fill_left_out(
+    /// The chosen row of `pending` each row of `merged`, the rows returned out
+    /// of them, was taken from.
+    fn returned_picks<'p>(
         &self,
-        merged: &mut ColumnBatch,
-        pending: &[Pick],
-        left_out: &[u16],
-        fields: &[ProjectedField],
-    ) -> crate::Result<()> {
+        merged: &ColumnBatch,
+        pending: &'p [Pick],
+    ) -> crate::Result<Vec<&'p Pick>> {
         let keys = merged
             .columns
             .iter()
@@ -573,7 +621,30 @@ impl MergeStream {
                 ))?;
             returned.push(pick);
         }
+        Ok(returned)
+    }
 
+    /// Whether `pick` was taken from a batch that stores a projected field
+    /// under another type than declared.
+    fn taken_from_mistyped(&self, pick: &Pick) -> bool {
+        self.sources
+            .get(pick.source)
+            .is_some_and(|s| s.types == FieldTypes::Mistyped)
+    }
+
+    /// Adds to `merged`, the rows returned out of the chosen `pending` ones,
+    /// each `left_out` column a field of `fields` projects, gathered from the
+    /// batches those rows come from, when every one of them carries it under
+    /// one type. A column some returned row lacks stays out, and the row
+    /// fails the conform that follows.
+    fn fill_left_out(
+        &self,
+        merged: &mut ColumnBatch,
+        pending: &[Pick],
+        left_out: &[u16],
+        fields: &[ProjectedField],
+    ) -> crate::Result<()> {
+        let returned = self.returned_picks(merged, pending)?;
         let rows = returned.len();
         for &id in left_out {
             if !fields.iter().any(|f| f.column_id() == id) {

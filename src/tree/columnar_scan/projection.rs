@@ -56,12 +56,18 @@ impl ProjectedField {
     /// # Errors
     ///
     /// Returns an error if `absent` is a default that does not fit `type_tag`
-    /// (a fixed-width type takes exactly its width), or if `column_id` names
-    /// an intrinsic column, whose type and presence are fixed.
+    /// (a fixed-width type takes exactly its width), if `type_tag` is a fixed
+    /// width of zero, which no column may carry, or if `column_id` names an
+    /// intrinsic column, whose type and presence are fixed.
     pub fn new(column_id: u16, type_tag: TypeTag, absent: Absent) -> crate::Result<Self> {
         if intrinsic_type(column_id).is_some() {
             return Err(Error::Projection(
                 "projection: an intrinsic column is projected by id, not declared",
+            ));
+        }
+        if type_tag.fixed_width() == Some(0) {
+            return Err(Error::Projection(
+                "projection: a fixed-width field has a width of zero",
             ));
         }
         if let (Absent::Default(value), Some(width)) = (&absent, type_tag.fixed_width())
@@ -487,7 +493,7 @@ const ABSENT_FIELD: Error = Error::Projection(
 /// operand, which the batch's value-type column names when it carries one,
 /// has none, and is decided by its type before it could be returned.
 pub fn conform(batch: ColumnBatch, fields: &[ProjectedField]) -> crate::Result<ColumnBatch> {
-    conform_with(batch, fields, true)
+    conform_with(batch, fields, true).map(|(batch, _)| batch)
 }
 
 /// [`conform`] for a batch whose rows are not yet decided: a field declared
@@ -495,20 +501,29 @@ pub fn conform(batch: ColumnBatch, fields: &[ProjectedField]) -> crate::Result<C
 /// batch sees every other declaration applied, and the rows a scan returns
 /// are held to the declarations by [`conform`] once they are decided. A row
 /// that is shadowed, deleted or filtered out never fails the scan.
+///
+/// A column stored under another type than its field declares reads as null
+/// here, and the batch is reported mistyped: a row of it the scan returns
+/// fails it with [`MISTYPED`], one shadowed or filtered out does not.
 pub fn conform_lenient(
     batch: ColumnBatch,
     fields: &[ProjectedField],
-) -> crate::Result<ColumnBatch> {
+) -> crate::Result<(ColumnBatch, bool)> {
     conform_with(batch, fields, false)
 }
 
-/// [`conform`], holding the rows that are values to [`Absent::Error`] only
-/// when `strict`.
+/// A segment stores a projected field under another type than declared.
+pub const MISTYPED: Error =
+    Error::Projection("projection: a segment stores a projected field under another type");
+
+/// [`conform`], holding the rows that are values to [`Absent::Error`] and a
+/// mistyped column to [`MISTYPED`] only when `strict`; also returns whether a
+/// column was mistyped.
 fn conform_with(
     batch: ColumnBatch,
     fields: &[ProjectedField],
     strict: bool,
-) -> crate::Result<ColumnBatch> {
+) -> crate::Result<(ColumnBatch, bool)> {
     let ColumnBatch {
         row_count,
         mut columns,
@@ -526,6 +541,7 @@ fn conform_with(
                     .is_some_and(returns_a_value)
             })
     };
+    let mut mistyped = false;
     let mut out = Vec::with_capacity(fields.len().max(columns.len()));
     for field in fields {
         let at = columns.iter().position(|c| c.column_id == field.column_id);
@@ -533,9 +549,18 @@ fn conform_with(
             Some(at) => {
                 let column = columns.remove(at);
                 if field.type_tag.is_some_and(|t| t != column.type_tag) {
-                    return Err(Error::Projection(
-                        "projection: a segment stores a projected field under another type",
-                    ));
+                    if strict {
+                        return Err(MISTYPED);
+                    }
+                    // Null under the declared type, so the batch agrees with
+                    // the other sources; its rows fail only if returned.
+                    mistyped = true;
+                    let null = ProjectedField {
+                        absent: Absent::Null,
+                        ..field.clone()
+                    };
+                    out.push(absent_column(&null, row_count, &|_| false)?);
+                    continue;
                 }
                 fill_nulls(column, field, row_count, &is_value)?
             }
@@ -547,10 +572,13 @@ fn conform_with(
         out.push(column);
     }
     out.extend(columns);
-    Ok(ColumnBatch {
-        row_count,
-        columns: out,
-    })
+    Ok((
+        ColumnBatch {
+            row_count,
+            columns: out,
+        },
+        mistyped,
+    ))
 }
 
 /// `column` with its null cells read as `field` declares: kept for

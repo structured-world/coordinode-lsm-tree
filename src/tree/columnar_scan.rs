@@ -289,6 +289,18 @@ impl Tree {
         // mid-scan cannot turn a row-major tree columnar (or the reverse)
         // underneath it, and the per-segment recency ranking is the ranking
         // THAT version has.
+        //
+        // The active memtable in that version stays writable, and its span is
+        // taken now while its rows are read later: the snapshot is capped at
+        // what the tree holds now, so a write or deletion that lands after the
+        // scan is created is invisible to it, as it is outside the span and
+        // the groups computed here.
+        let seqno = match crate::AbstractTree::get_highest_seqno(self) {
+            Some(highest) => highest
+                .checked_add(1)
+                .map_or(seqno, |next: SeqNo| seqno.min(next)),
+            None => 0,
+        };
         let super_version = self.get_version_for_snapshot(seqno)?;
         // Operands are resolved in that same version, so a version installed
         // mid-scan changes no row the scan returns.
@@ -822,9 +834,11 @@ impl ColumnarScan {
     /// key (a key the read finds absent is dropped), then the declared fields
     /// of each row carrying a whole value read out of it, and the carried
     /// value column dropped. Only returned rows get here, so a shadowed,
-    /// deleted or invisible version is never resolved or projected.
-    pub(super) fn read_late(&self, batch: ColumnBatch) -> crate::Result<ColumnBatch> {
-        let batch = self.resolve_operands(batch)?;
+    /// deleted or invisible version is never resolved or projected. Also
+    /// returns whether an operand was resolved to a value: such a row holds
+    /// no cell of its own for a column no field declares.
+    pub(super) fn read_late(&self, batch: ColumnBatch) -> crate::Result<(ColumnBatch, bool)> {
+        let (batch, resolved) = self.resolve_operands(batch)?;
         let mut batch = if self.declared {
             projection::project_decided(
                 batch,
@@ -836,22 +850,28 @@ impl ColumnarScan {
             batch
         };
         drop_columns(&mut batch, &[merge::COL_WHOLE_VALUE]);
-        Ok(batch)
+        Ok((batch, resolved))
     }
 
     /// `batch` with each merge operand row replaced by what a read at the
     /// scan's snapshot returns for its key, through the tree's own operator
     /// exactly as the read path resolves it: that value, carried as the row's
     /// whole value (and in the value column when it is projected by id), or
-    /// the row dropped when the read finds the key absent.
-    fn resolve_operands(&self, batch: ColumnBatch) -> crate::Result<ColumnBatch> {
+    /// the row dropped when the read finds the key absent. Also returns
+    /// whether an operand was resolved to a value.
+    ///
+    /// The value an operand resolves to is read whole, like any row value: a
+    /// value field projected by id alone cannot be read out of it, so the
+    /// scan fails as it does for a whole value, instead of returning the
+    /// cell the operand itself carried.
+    fn resolve_operands(&self, batch: ColumnBatch) -> crate::Result<(ColumnBatch, bool)> {
         use crate::table::columnar::{COL_VALUE, Column, frame_bytes_column};
 
         let Some(resolver) = &self.resolver else {
-            return Ok(batch);
+            return Ok((batch, false));
         };
         if !holds_operand(&batch) {
-            return Ok(batch);
+            return Ok((batch, false));
         }
         let row_count = batch.row_count;
         let rows = row_count as usize;
@@ -894,6 +914,22 @@ impl ColumnarScan {
                 Some(&resolver.operator),
                 self.comparator.as_ref(),
             )?));
+        }
+        // Only the raw value, a bytes column, is rewritten below; a split
+        // table's sub-column under the value column's id is a field like any
+        // other.
+        let resolved_any = resolved.iter().any(|fix| matches!(fix, Some(Some(_))));
+        if resolved_any
+            && self.fields.iter().any(|f| {
+                f.type_tag().is_none()
+                    && !(f.column_id() == COL_VALUE && raw_at.is_some())
+                    && batch.columns.iter().any(|c| c.column_id == f.column_id())
+            })
+        {
+            return Err(crate::Error::Projection(
+                "projection: a merged value is read whole, and a field projected by id alone \
+                 cannot be read out of it",
+            ));
         }
 
         // The cells of bytes column `at` with the resolved rows' values in
@@ -961,7 +997,7 @@ impl ColumnarScan {
             batch
         };
         self.record_gather(&batch);
-        Ok(batch)
+        Ok((batch, resolved_any))
     }
 
     /// The next output batch of `stream`, or `None` once it is exhausted.
@@ -988,12 +1024,15 @@ impl ColumnarScan {
                 // cells in one, reads as the field declares before its rows
                 // are decided, so a predicate after the dedup sees the
                 // declared defaults, as it does on the merge path.
-                let batch = match projection::conform_lenient(batch, &self.fields) {
-                    Ok(batch) => batch,
+                let (batch, mistyped) = match projection::conform_lenient(batch, &self.fields) {
+                    Ok(conformed) => conformed,
                     Err(e) => return Some(Err(e)),
                 };
                 let SingletonStream { global, mode, .. } = &mut **singleton;
                 match self.shape_singleton_batch(batch, *global, mode, support) {
+                    // A column's type is the batch's, so any row it returns
+                    // stores the field under the other type.
+                    Ok(Some(_)) if mistyped => return Some(Err(projection::MISTYPED)),
                     // The rows returned are decided: each is held to the
                     // declarations.
                     Ok(Some(batch)) => return Some(projection::conform(batch, &self.fields)),
@@ -1028,6 +1067,33 @@ impl ColumnarScan {
             } => self.mask_singleton_batch(&batch, global, *partial, *threshold, dropped),
             SingletonMode::Dedup(state) => {
                 self.dedup_singleton_batch(&batch, global, state, support)
+            }
+        }
+    }
+
+    /// Whether the scan's predicate judges the decided rows of `batch` before
+    /// their values are read: its column is one reading the values does not
+    /// change. The key and the seqno never change; a column no field
+    /// declares is the row's own physical cell, unless an operand of the
+    /// batch is still to be resolved into a value read whole. A declared
+    /// field is read out of the value, and resolving an operand rewrites the
+    /// value column and the value type, so a predicate over those runs after.
+    pub(super) fn predicate_precedes_values(&self, batch: &ColumnBatch) -> bool {
+        use crate::table::columnar::{COL_SEQNO, COL_VALUE};
+
+        let Some(pred) = &self.predicate else {
+            return false;
+        };
+        match pred.column_id {
+            COL_USER_KEY | COL_SEQNO => true,
+            COL_VALUE | COL_VALUE_TYPE => false,
+            id => {
+                let declared = self
+                    .fields
+                    .iter()
+                    .any(|f| f.column_id() == id && projection::is_declared(f));
+                let unresolved = self.resolver.is_some() && holds_operand(batch);
+                !(declared || unresolved)
             }
         }
     }
