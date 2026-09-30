@@ -69,17 +69,14 @@ pub fn append_edit(
             &FsOpenOptions::new().write(true).create(true).append(true),
         )
         .map_err(crate::Error::from)?;
+    if first {
+        // Before the record: a failed sync then leaves no edit in the log,
+        // where one written first would be made durable by the next append's
+        // sync although the operation it records was reported failed.
+        crate::file::fsync_directory(crate::file::entry_directory(path), fs, sync_mode)?;
+    }
     super::framing::write_frame(&mut file, scratch)?;
     file.sync_all_with(sync_mode).map_err(crate::Error::from)?;
-    if first {
-        // A bare file name's parent is empty: the current directory, which
-        // every backend accepts as `.`.
-        let directory = path
-            .parent()
-            .filter(|parent| *parent != Path::new(""))
-            .unwrap_or_else(|| Path::new("."));
-        crate::file::fsync_directory(directory, fs, sync_mode)?;
-    }
     // The framing header (u32 len + u64 XXH3) precedes the payload on disk.
     Ok(Some(
         (super::framing::FRAME_HEADER_LEN + scratch.len()) as u64,

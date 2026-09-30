@@ -20,29 +20,45 @@ fn edit(id: u64) -> VersionEdit {
 
 /// A log named by a bare file name lies in the current directory: its first
 /// append syncs that directory as `.`, the name every backend accepts, not
-/// as the empty parent the name has.
+/// as the empty parent the name has, so its entry survives a crash.
 #[test]
 fn the_first_append_to_a_log_in_the_current_directory_syncs_it() -> crate::Result<()> {
-    let dir = tempfile::tempdir()?;
-    // Nextest runs each test in a process of its own.
-    std::env::set_current_dir(dir.path())?;
+    let fs = crate::fs::CrashFs::new(crate::fs::MemFs::new()).tracking_directory_entries();
+    let path = Path::new("edits-0");
     let mut scratch = Vec::new();
-    append_edit(
-        &StdFs,
-        Path::new("edits-0"),
-        &edit(1),
-        &mut scratch,
-        SyncMode::Normal,
-        true,
-    )?;
+    append_edit(&fs, path, &edit(1), &mut scratch, SyncMode::Normal, true)?;
+
+    fs.crash();
     assert_eq!(
-        replay_log(
-            &StdFs,
-            Path::new("edits-0"),
-            ManifestRecoveryMode::AbsoluteConsistency,
-            None,
-        )?,
+        replay_log(&fs, path, ManifestRecoveryMode::AbsoluteConsistency, None)?,
         vec![edit(1)]
+    );
+    Ok(())
+}
+
+/// A first append whose directory sync fails writes no edit: a record left
+/// in the log would be made durable by the next append's sync, though the
+/// operation it records was reported failed.
+#[test]
+fn a_first_append_whose_directory_sync_fails_writes_nothing() -> crate::Result<()> {
+    use crate::fs::{Fault, FaultFs, FaultOp, FaultRule, MemFs};
+
+    let fs = FaultFs::new(MemFs::new());
+    fs.create_dir_all(Path::new("/db"))?;
+    fs.injector().arm(
+        FaultRule::new(
+            FaultOp::SyncDirectory,
+            Fault::Error(crate::io::ErrorKind::Other),
+        )
+        .once(),
+    );
+    let path = Path::new("/db/edits-0");
+    let mut scratch = Vec::new();
+    assert!(append_edit(&fs, path, &edit(1), &mut scratch, SyncMode::Normal, true).is_err());
+    assert_eq!(
+        replay_log(&fs, path, ManifestRecoveryMode::AbsoluteConsistency, None)?,
+        Vec::new(),
+        "the failed append left no record"
     );
     Ok(())
 }

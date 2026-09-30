@@ -235,12 +235,25 @@ impl CrashFs {
         }
     }
 
-    /// Makes the entries of `directory` durable, after a sync of it.
-    fn entries_synced(&self, directory: &Path) {
+    /// The pending entries of `directory`, taken before a sync of it: the ones
+    /// that sync makes durable. An entry made while the sync runs is left for
+    /// the next one.
+    fn entries_of(&self, directory: &Path) -> Vec<PathBuf> {
         self.state
             .lock()
             .pending_entries
-            .retain(|entry| entry.parent() != Some(directory));
+            .iter()
+            .filter(|entry| crate::file::entry_directory(entry) == directory)
+            .cloned()
+            .collect()
+    }
+
+    /// Makes `entries` durable, after a sync of their directory.
+    fn entries_synced(&self, entries: &[PathBuf]) {
+        let mut state = self.state.lock();
+        for entry in entries {
+            state.pending_entries.remove(entry);
+        }
     }
 
     /// Records the destination of a copy-style op (`hard_link` / `reflink`): it
@@ -371,14 +384,16 @@ impl Fs for CrashFs {
     }
 
     fn sync_directory(&self, path: &Path) -> io::Result<()> {
+        let entries = self.entries_of(path);
         self.inner.sync_directory(path)?;
-        self.entries_synced(path);
+        self.entries_synced(&entries);
         Ok(())
     }
 
     fn sync_directory_with(&self, path: &Path, mode: SyncMode) -> io::Result<()> {
+        let entries = self.entries_of(path);
         self.inner.sync_directory_with(path, mode)?;
-        self.entries_synced(path);
+        self.entries_synced(&entries);
         Ok(())
     }
 
