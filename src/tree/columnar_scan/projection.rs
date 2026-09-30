@@ -271,15 +271,106 @@ impl From<&Vec<u16>> for Projection {
     }
 }
 
-impl From<&Projection> for Projection {
-    fn from(projection: &Projection) -> Self {
+impl From<&Self> for Projection {
+    fn from(projection: &Self) -> Self {
         projection.clone()
     }
 }
 
+/// Whether `field` was declared with a type, rather than projected by id: the
+/// fields a projector writes and a whole value is read through.
+pub fn is_declared(field: &ProjectedField) -> bool {
+    field.type_tag.is_some() && intrinsic_type(field.column_id).is_none()
+}
+
+/// Replaces, in a batch of a table that stores each value whole, the value
+/// column by the declared `fields` read out of it through `projector`, each
+/// row's value given with its key. A field the projector leaves unset is null
+/// here, and reads as declared once the batch is conformed.
+pub fn project_whole(
+    batch: ColumnBatch,
+    fields: &[ProjectedField],
+    projector: &dyn ValueProjector,
+) -> crate::Result<ColumnBatch> {
+    use crate::table::columnar::COL_VALUE;
+
+    let ColumnBatch {
+        row_count,
+        mut columns,
+    } = batch;
+    let at = columns
+        .iter()
+        .position(|c| c.column_id == COL_VALUE)
+        .ok_or(MISSING_SCAN_COLUMN)?;
+    let values = columns.remove(at);
+    let keys = columns
+        .iter()
+        .find(|c| c.column_id == COL_USER_KEY)
+        .ok_or(MISSING_SCAN_COLUMN)?;
+    let declared: Vec<ProjectedField> = fields.iter().filter(|f| is_declared(f)).cloned().collect();
+
+    let mut cells: Vec<Option<Vec<u8>>> = alloc::vec![None; declared.len()];
+    let mut out: Vec<Vec<Option<Vec<u8>>>> =
+        alloc::vec![Vec::with_capacity(row_count as usize); declared.len()];
+    for row in 0..row_count {
+        let key = bytes_column_row(&keys.data, row_count, row)?;
+        let value = bytes_column_row(&values.data, row_count, row)?;
+        cells.fill(None);
+        projector.project(key, value, &mut ProjectedRow::new(&declared, &mut cells))?;
+        for (column, cell) in out.iter_mut().zip(&mut cells) {
+            column.push(cell.take());
+        }
+    }
+    for (field, column) in declared.iter().zip(out) {
+        columns.push(built_column(field, &column)?);
+    }
+    Ok(ColumnBatch { row_count, columns })
+}
+
+/// A column of `field` holding `cells`, a missing cell null.
+fn built_column(field: &ProjectedField, cells: &[Option<Vec<u8>>]) -> crate::Result<Column> {
+    let type_tag = field.type_tag.ok_or(ABSENT_FIELD)?;
+    let count = cells.len();
+    let validity = cells.iter().any(Option::is_none).then(|| {
+        let mut bits = alloc::vec![0u8; count.div_ceil(8)];
+        for (row, cell) in cells.iter().enumerate() {
+            if cell.is_some()
+                && let Some(byte) = bits.get_mut(row / 8)
+            {
+                *byte |= 1 << (row % 8);
+            }
+        }
+        bits
+    });
+    let data = match type_tag.fixed_width() {
+        Some(width) => {
+            let width = usize::from(width);
+            let mut data = alloc::vec![0u8; count * width];
+            for (slot, cell) in data.chunks_exact_mut(width).zip(cells) {
+                if let Some(cell) = cell {
+                    slot.copy_from_slice(cell);
+                }
+            }
+            Slice::from(data)
+        }
+        None => frame_bytes_column(count, || cells.iter().map(|c| c.as_deref().unwrap_or(&[])))?,
+    };
+    Ok(Column {
+        column_id: field.column_id,
+        type_tag,
+        validity,
+        data,
+    })
+}
+
+/// A batch of a whole-value table lacks a column the scan decoded to read the
+/// value through the projector.
+const MISSING_SCAN_COLUMN: Error =
+    Error::InvalidHeader("columnar_scan: a whole-value batch is missing its key or value column");
+
 /// The column that stands for `field` in a batch of `rows` rows whose source
 /// does not have it, or the error its declaration asks for.
-pub(crate) fn absent_column(field: &ProjectedField, rows: u32) -> crate::Result<Column> {
+pub fn absent_column(field: &ProjectedField, rows: u32) -> crate::Result<Column> {
     let type_tag = field.type_tag.ok_or(ABSENT_FIELD)?;
     let count = rows as usize;
     let (validity, data) = match &field.absent {
@@ -319,7 +410,7 @@ const ABSENT_FIELD: Error = Error::Projection(
 /// another type than the one declared is an error. The columns come back in
 /// the order of `fields`; a column the batch holds that no field names is
 /// kept after them, in its place.
-pub(crate) fn conform(batch: ColumnBatch, fields: &[ProjectedField]) -> crate::Result<ColumnBatch> {
+pub fn conform(batch: ColumnBatch, fields: &[ProjectedField]) -> crate::Result<ColumnBatch> {
     let ColumnBatch {
         row_count,
         mut columns,
@@ -372,30 +463,27 @@ fn fill_nulls(column: Column, field: &ProjectedField, rows: u32) -> crate::Resul
         Absent::Default(value) => value,
     };
     let count = rows as usize;
-    let data = match column.type_tag.fixed_width() {
-        Some(width) => {
-            let width = usize::from(width);
-            let mut data = column.data.to_vec();
-            for row in (0..rows).filter(|&row| is_null(row)) {
-                let at = row as usize * width;
-                data.get_mut(at..at + width)
-                    .ok_or(Error::InvalidHeader("columnar: fixed column row truncated"))?
-                    .copy_from_slice(value);
-            }
-            Slice::from(data)
+    let data = if let Some(width) = column.type_tag.fixed_width() {
+        let width = usize::from(width);
+        let mut data = column.data.to_vec();
+        for row in (0..rows).filter(|&row| is_null(row)) {
+            let at = row as usize * width;
+            data.get_mut(at..at + width)
+                .ok_or(Error::InvalidHeader("columnar: fixed column row truncated"))?
+                .copy_from_slice(value);
         }
-        None => {
-            let cells = (0..rows)
-                .map(|row| {
-                    if is_null(row) {
-                        Ok(&**value)
-                    } else {
-                        bytes_column_row(&column.data, rows, row)
-                    }
-                })
-                .collect::<crate::Result<Vec<&[u8]>>>()?;
-            frame_bytes_column(count, || cells.iter().copied())?
-        }
+        Slice::from(data)
+    } else {
+        let cells = (0..rows)
+            .map(|row| {
+                if is_null(row) {
+                    Ok(&**value)
+                } else {
+                    bytes_column_row(&column.data, rows, row)
+                }
+            })
+            .collect::<crate::Result<Vec<&[u8]>>>()?;
+        frame_bytes_column(count, || cells.iter().copied())?
     };
     Ok(Column {
         column_id: column.column_id,

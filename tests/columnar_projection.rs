@@ -8,11 +8,11 @@
 #![cfg(feature = "columnar")]
 
 use lsm_tree::table::columnar::{
-    COL_USER_KEY, Column, ColumnBatch, TypeTag, entries_to_column_batch,
+    COL_USER_KEY, Column, ColumnBatch, TypeTag, entries_to_column_batch, unframe_value_cells,
 };
 use lsm_tree::{
-    Absent, AnyTree, Config, Error, InternalValue, ProjectedField, Projection, SeqNo,
-    SequenceNumberCounter, Slice, ValueType, get_tmp_folder,
+    Absent, AbstractTree, AnyTree, Config, Error, InternalValue, ProjectedField, ProjectedRow,
+    Projection, SeqNo, SequenceNumberCounter, Slice, ValueProjector, ValueType, get_tmp_folder,
 };
 use test_log::test;
 
@@ -205,6 +205,76 @@ fn a_newer_version_without_a_field_does_not_inherit_the_older_value() -> lsm_tre
         rows(standard(&any), &projection(Absent::Null))?,
     );
     Ok(())
+}
+
+/// Reads fields 3 and 4 out of a row value framed from those two fixed-4
+/// cells, the form a read returns for a row of a two-column segment.
+struct TwoCells;
+
+impl ValueProjector for TwoCells {
+    fn project(
+        &self,
+        _key: &[u8],
+        value: &[u8],
+        row: &mut ProjectedRow<'_>,
+    ) -> lsm_tree::Result<()> {
+        let cells = unframe_value_cells(value, &[TypeTag::Fixed(4), TypeTag::Fixed(4)])?;
+        for (index, id) in row
+            .fields()
+            .iter()
+            .map(ProjectedField::column_id)
+            .enumerate()
+            .collect::<Vec<_>>()
+        {
+            if let Some(cell) = id.checked_sub(3).and_then(|at| cells.get(usize::from(at))) {
+                row.set(index, cell)?;
+            }
+        }
+        Ok(())
+    }
+}
+
+/// A compaction that rewrites segments whose value was split into columns
+/// folds those columns into one value; a field is still read out of it through
+/// the projector instead of reading as absent.
+#[test]
+fn a_field_folded_into_the_value_by_a_compaction_is_read_through_the_projector()
+-> lsm_tree::Result<()> {
+    let folder = get_tmp_folder();
+    let any = open_columnar(folder.path());
+    ingest(&any, &[0, 2], &[(3, &[10, 12]), (4, &[40, 42])]);
+    ingest(&any, &[1], &[(3, &[11]), (4, &[41])]);
+    let tree = standard(&any);
+    tree.major_compact(64 * 1024 * 1024, 0)?;
+
+    let projection = projection(Absent::Null).projector(std::sync::Arc::new(TwoCells));
+    assert_eq!(
+        vec![(key(0), Some(40)), (key(1), Some(41)), (key(2), Some(42))],
+        rows(tree, &projection)?,
+    );
+    Ok(())
+}
+
+/// Rows flushed into a columnar tree keep each value whole; a declared field
+/// lies inside it, which only a projector reads, so a scan without one is
+/// refused rather than reading the field as absent.
+#[test]
+fn declared_fields_over_whole_values_without_a_projector_are_refused() {
+    let folder = get_tmp_folder();
+    let any = open_columnar(folder.path());
+    let tree = standard(&any);
+    tree.insert(key(0), 7u32.to_le_bytes(), 0);
+    tree.flush_active_memtable(0).expect("flush");
+
+    let got = tree
+        .columnar_scan(projection(Absent::Null), None, SeqNo::MAX, ..)
+        .err();
+    assert!(matches!(got, Some(Error::Projection(_))), "got {got:?}");
+    // By id the value column still reads as stored.
+    assert!(
+        tree.columnar_scan(&[COL_USER_KEY, 3], None, SeqNo::MAX, ..)
+            .is_ok()
+    );
 }
 
 /// A segment that stores a declared field under another type is refused, not

@@ -30,6 +30,35 @@ use core::ops::Deref;
 /// is released.
 pub const COLUMNAR_FORMAT_VERSION: u8 = 2;
 
+/// How a columnar table stores each row's value, from the optional
+/// `descriptor#value_layout` property.
+///
+/// The two layouts can hold a column of the same id: the whole value sits in
+/// [`COL_VALUE`](crate::table::columnar::COL_VALUE), which is also the first id
+/// a caller may give a field. Only the table can say which one its column
+/// is, so it records it.
+#[derive(Copy, Clone, Debug, Eq, PartialEq)]
+pub enum ValueLayout {
+    /// The whole value in one column: rows written through the row path and
+    /// transposed at a flush or a compaction, whose value is read back as it
+    /// was written. A table without the property stores this layout.
+    Whole,
+    /// The value split into caller fields, one column each: a columnar batch
+    /// ingested as it was built. A field without a column is not in the table.
+    Split,
+}
+
+impl ValueLayout {
+    /// The property's one-byte encoding.
+    #[must_use]
+    pub(crate) const fn to_byte(self) -> u8 {
+        match self {
+            Self::Whole => 0,
+            Self::Split => 1,
+        }
+    }
+}
+
 /// Nanosecond timestamp.
 #[derive(Copy, Clone, Debug, PartialEq, Eq, Ord, PartialOrd)]
 pub struct Timestamp(u128);
@@ -225,6 +254,11 @@ pub struct ParsedMeta {
     /// offline converter; a row-major table is unaffected, since it has no
     /// row groups to misread.
     pub columnar_format: Option<u8>,
+
+    /// How the table stores each row's value; [`ValueLayout::Whole`] for a
+    /// table without the property, and for a row-major table, which has no
+    /// value columns.
+    pub value_layout: ValueLayout,
 
     /// Bulk-ingest provenance from the optional `descriptor#bulk_ingested`
     /// property: `Some(true)` = bulk-ingested (every entry at LOCAL seqno 0, MVCC
@@ -477,6 +511,18 @@ impl ParsedMeta {
                     _ => return Err(crate::Error::InvalidHeader("TableMeta")),
                 },
             };
+
+        // Optional value layout. Absent = a table whose rows were transposed
+        // whole, which is what every columnar table written before the
+        // property stored unless it was ingested; one byte otherwise.
+        let value_layout = match block.point_read(b"descriptor#value_layout", SeqNo::MAX, &cmp)? {
+            None => ValueLayout::Whole,
+            Some(v) => match v.value.as_ref() {
+                [0] => ValueLayout::Whole,
+                [1] => ValueLayout::Split,
+                _ => return Err(crate::Error::InvalidHeader("TableMeta")),
+            },
+        };
 
         // Optional bulk-ingest provenance. `None` = the key is ABSENT: a legacy
         // SST (written before the flag existed) whose provenance is UNKNOWN, so
@@ -742,6 +788,7 @@ impl ParsedMeta {
             columnar,
             filter_format,
             columnar_format,
+            value_layout,
             bulk_ingested,
             recency,
             lineage,

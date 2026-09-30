@@ -21,8 +21,8 @@
 
 use alloc::vec::Vec;
 
-use super::projection::{ProjectedField, conform};
-use super::{ColumnarScan, Segment, drop_columns, key_in_bounds};
+use super::projection::{ProjectedField, conform, project_whole};
+use super::{ColumnarScan, Segment, SegmentCursor, WholeRead, drop_columns, key_in_bounds};
 use crate::table::columnar::{
     COL_SEQNO, COL_USER_KEY, COL_VALUE_TYPE, ColumnBatch, TypeTag, bytes_column_row,
     bytes_column_span, fixed_u64_row,
@@ -37,6 +37,9 @@ const TARGET_ROWS: usize = 4_096;
 /// One segment of an overlapping group, read through its cursor.
 struct MergeSource {
     cursor: ColumnarCursor,
+    /// For a whole-value segment read for declared fields, how its batches
+    /// become those fields.
+    whole: Option<WholeRead>,
     /// The batch the source is in, `None` before the first and once the
     /// cursor is exhausted.
     batch: Option<ColumnBatch>,
@@ -164,8 +167,11 @@ impl MergeStream {
                 // version (including a newest one that fails the predicate but
                 // shadows an older matching version) has to be seen, and the
                 // zone-map skip it would drive is unsafe for the same reason.
+                let SegmentCursor { cursor, whole } =
+                    scan.segment_cursor(seg, &augmented, None, share)?;
                 Ok(MergeSource {
-                    cursor: scan.segment_cursor(seg, &augmented, None, share)?,
+                    cursor,
+                    whole,
                     batch: None,
                     row: 0,
                     key_col: 0,
@@ -384,7 +390,15 @@ impl MergeStream {
             match source.cursor.next() {
                 None => return Ok((Position::Exhausted, loaded)),
                 Some(batch) => {
-                    let batch = conform(batch?, fields)?;
+                    let mut batch = batch?;
+                    // A whole-value segment's declared fields are read out of
+                    // its values first, so every source brings the same
+                    // columns to the conform below.
+                    if let Some(whole) = &source.whole {
+                        batch = project_whole(batch, fields, whole.projector.as_ref())?;
+                        drop_columns(&mut batch, &whole.extra);
+                    }
+                    let batch = conform(batch, fields)?;
                     // Keys are read row by row from their framing, which only
                     // a bytes column carries.
                     if batch

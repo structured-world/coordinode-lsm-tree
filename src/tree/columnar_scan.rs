@@ -77,7 +77,7 @@ use crate::table::columnar_predicate::{
 use crate::{Error, SeqNo, Table, Tree, UserKey};
 
 mod merge;
-pub(crate) mod projection;
+pub mod projection;
 
 /// A visible columnar segment selected for the scan, with its cached key range,
 /// sequence base, and snapshot-visibility class.
@@ -103,6 +103,9 @@ struct Segment {
     /// because `group_by_overlap` re-sorts segments by minimum key and the
     /// concatenation order alone says nothing about recency.
     recency_rank: usize,
+    /// Whether the segment stores each value whole, so its declared fields
+    /// are read out of the value through the projector.
+    whole: bool,
 }
 
 /// One key-disjoint group of segments: either a single segment (streamed
@@ -226,8 +229,19 @@ impl Tree {
                 visibility,
                 may_dup,
                 recency_rank,
+                whole: table.metadata.value_layout == crate::table::meta::ValueLayout::Whole,
                 table: table.clone(),
             });
+        }
+
+        // A declared field of a segment that stores each value whole lies
+        // inside the value, which only the caller's projector reads.
+        let declared = projection.fields().iter().any(projection::is_declared);
+        if declared && projection.value_projector().is_none() && segments.iter().any(|s| s.whole) {
+            return Err(Error::Projection(
+                "projection: a segment stores whole row values, and declared fields are \
+                 read out of them through a projector, which is not set",
+            ));
         }
 
         let groups = group_by_overlap(segments, comparator.as_ref());
@@ -237,6 +251,9 @@ impl Tree {
             current: None,
             projection: projection.column_ids(),
             fields: projection.fields().to_vec(),
+            projector: declared
+                .then(|| projection.value_projector().cloned())
+                .flatten(),
             predicate: predicate.cloned(),
             support: PredicateSupport::Exact,
             comparator,
@@ -325,9 +342,25 @@ struct DedupState {
     last_key: Option<Vec<u8>>,
 }
 
+/// How a segment of a whole-value table is read for declared fields.
+pub(super) struct WholeRead {
+    /// The projector the fields are read through.
+    projector: alloc::sync::Arc<dyn projection::ValueProjector>,
+    /// Columns decoded only to read the fields, dropped once they are read.
+    extra: Vec<u16>,
+}
+
+/// A segment's cursor and, for a whole-value segment read for declared
+/// fields, how its batches become those fields.
+pub(super) struct SegmentCursor {
+    cursor: crate::table::columnar_cursor::ColumnarCursor,
+    whole: Option<WholeRead>,
+}
+
 /// A singleton group streamed from its table's cursor.
 struct SingletonStream {
     cursor: crate::table::columnar_cursor::ColumnarCursor,
+    whole: Option<WholeRead>,
     /// The segment's `global_seqno` base.
     global: SeqNo,
     mode: SingletonMode,
@@ -388,6 +421,9 @@ pub struct ColumnarScan {
     /// The projected fields, whose declarations every yielded batch is
     /// brought to.
     fields: Vec<projection::ProjectedField>,
+    /// The projector the declared fields of a whole-value segment are read
+    /// through; `None` when no field is declared.
+    projector: Option<alloc::sync::Arc<dyn projection::ValueProjector>>,
     predicate: Option<ColumnRangePredicate>,
     /// The weakest [`PredicateSupport`] over the segments read so far.
     support: PredicateSupport,
@@ -517,14 +553,71 @@ impl ColumnarScan {
         projection: &[u16],
         predicate: Option<&ColumnRangePredicate>,
         share: u64,
-    ) -> crate::Result<crate::table::columnar_cursor::ColumnarCursor> {
-        seg.table.columnar_cursor(
-            projection,
-            predicate,
-            self.lo.clone(),
-            self.hi.clone(),
-            Some(share),
-        )
+    ) -> crate::Result<SegmentCursor> {
+        let Some(projector) = self.projector.clone().filter(|_| seg.whole) else {
+            return Ok(SegmentCursor {
+                cursor: seg.table.columnar_cursor(
+                    projection,
+                    predicate,
+                    self.lo.clone(),
+                    self.hi.clone(),
+                    Some(share),
+                )?,
+                whole: None,
+            });
+        };
+        // The declared fields lie inside the value: decode it and its key in
+        // their place. A declared field's id may be the value column's own, so
+        // no predicate is pushed down; the caller filters after the fields are
+        // read.
+        let declared: Vec<u16> = self
+            .fields
+            .iter()
+            .filter(|f| projection::is_declared(f))
+            .map(projection::ProjectedField::column_id)
+            .collect();
+        let mut ids: Vec<u16> = projection
+            .iter()
+            .copied()
+            .filter(|id| !declared.contains(id))
+            .collect();
+        // The value column is consumed by reading the fields; the key is
+        // dropped after it unless the caller or the scan projects it. The
+        // value column's id may be a declared field's, so it is never named
+        // among the columns dropped afterwards.
+        let mut extra = Vec::new();
+        if !ids.contains(&COL_USER_KEY) {
+            ids.push(COL_USER_KEY);
+            extra.push(COL_USER_KEY);
+        }
+        if !ids.contains(&crate::table::columnar::COL_VALUE) {
+            ids.push(crate::table::columnar::COL_VALUE);
+        }
+        Ok(SegmentCursor {
+            cursor: seg.table.columnar_cursor(
+                &ids,
+                None,
+                self.lo.clone(),
+                self.hi.clone(),
+                Some(share),
+            )?,
+            whole: Some(WholeRead { projector, extra }),
+        })
+    }
+
+    /// `batch` as `whole` says: its declared fields read out of its values,
+    /// and the columns decoded only for that dropped.
+    fn read_whole(
+        &self,
+        batch: ColumnBatch,
+        whole: Option<&WholeRead>,
+    ) -> crate::Result<ColumnBatch> {
+        let Some(whole) = whole else {
+            return Ok(batch);
+        };
+        let mut batch = projection::project_whole(batch, &self.fields, whole.projector.as_ref())?;
+        drop_columns(&mut batch, &whole.extra);
+        Ok(batch)
     }
 
     /// The next output batch of `stream`, or `None` once it is exhausted.
@@ -547,6 +640,10 @@ impl ColumnarScan {
                 // held with it would otherwise never be seen.
                 self.observe_payload(singleton.cursor.held_bytes() + batch.data_size() as u64);
                 *support = (*support).min(singleton.cursor.predicate_support());
+                let batch = match self.read_whole(batch, singleton.whole.as_ref()) {
+                    Ok(batch) => batch,
+                    Err(e) => return Some(Err(e)),
+                };
                 let SingletonStream { global, mode, .. } = &mut **singleton;
                 match self.shape_singleton_batch(batch, *global, mode, support) {
                     // A segment written without a projected column, or with
@@ -752,10 +849,14 @@ impl ColumnarScan {
         // that lives there. A visible RANGE tombstone routes there for the
         // same reason: covered rows must be suppressed, and that needs each
         // row's seqno, which the verbatim path never decodes.
+        // A segment whose declared fields are read out of whole values cannot
+        // take a pushed-down predicate either (see `segment_cursor`): the
+        // dedup path filters after the fields are read.
         if seg.may_dup
             || seg.table.tombstone_count() > 0
             || seg.table.weak_tombstone_count() > 0
             || !rts.is_empty()
+            || (seg.whole && self.projector.is_some() && predicate.is_some())
         {
             return self.open_singleton_dedup(seg, rts, predicate);
         }
@@ -763,13 +864,11 @@ impl ColumnarScan {
         if seg.visibility == SeqnoVisibility::All && !range_filter {
             // Pushed down in local coordinates (translated above); the seqno
             // column is globalized only on the way out.
+            let SegmentCursor { cursor, whole } =
+                self.segment_cursor(seg, &self.projection, predicate.as_ref(), self.budget)?;
             return Ok(GroupStream::Singleton(Box::new(SingletonStream {
-                cursor: self.segment_cursor(
-                    seg,
-                    &self.projection,
-                    predicate.as_ref(),
-                    self.budget,
-                )?,
+                cursor,
+                whole,
                 global: seg.global,
                 mode: SingletonMode::Verbatim,
             })));
@@ -788,8 +887,11 @@ impl ColumnarScan {
         }
         let (augmented, dropped) = self.augment(&needed);
         // Same local-coordinate pushdown as the verbatim path above.
+        let SegmentCursor { cursor, whole } =
+            self.segment_cursor(seg, &augmented, predicate.as_ref(), self.budget)?;
         Ok(GroupStream::Singleton(Box::new(SingletonStream {
-            cursor: self.segment_cursor(seg, &augmented, predicate.as_ref(), self.budget)?,
+            cursor,
+            whole,
             global: seg.global,
             mode: SingletonMode::Masked {
                 partial,
@@ -930,9 +1032,12 @@ impl ColumnarScan {
             needed.push(COL_VALUE_TYPE);
         }
         let (augmented, dropped) = self.augment(&needed);
+        // No predicate pushed down: it runs after the dedup (see above).
+        let SegmentCursor { cursor, whole } =
+            self.segment_cursor(seg, &augmented, None, self.budget)?;
         Ok(GroupStream::Singleton(Box::new(SingletonStream {
-            // No predicate pushed down: it runs after the dedup (see above).
-            cursor: self.segment_cursor(seg, &augmented, None, self.budget)?,
+            cursor,
+            whole,
             global: seg.global,
             mode: SingletonMode::Dedup(DedupState {
                 predicate,

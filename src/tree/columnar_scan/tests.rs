@@ -10,6 +10,7 @@ fn empty_scan(metrics: alloc::sync::Arc<crate::Metrics>) -> ColumnarScan {
         current: None,
         projection: Vec::new(),
         fields: Vec::new(),
+        projector: None,
         predicate: None,
         support: PredicateSupport::Exact,
         comparator: crate::comparator::default_comparator(),
@@ -44,6 +45,61 @@ fn globalize_seqnos_charges_the_rows_rewritten_before_an_overflow() -> crate::Re
         metrics.bytes_copied(),
         8,
         "the first row's rewritten seqno was written before the overflow",
+    );
+    Ok(())
+}
+
+/// A table records one value layout, so an ingestion that writes a row and
+/// then a columnar batch leaves each in a table of its own layout: the row's
+/// value whole, the batch's split into its fields.
+#[test]
+fn an_ingestion_of_rows_and_batches_writes_one_value_layout_per_table() -> crate::Result<()> {
+    use crate::AbstractTree;
+    use crate::table::columnar::{Column, TypeTag};
+    use crate::table::meta::ValueLayout;
+
+    let folder = crate::get_tmp_folder();
+    let any = crate::Config::new(
+        folder.path(),
+        crate::SequenceNumberCounter::default(),
+        crate::SequenceNumberCounter::default(),
+    )
+    .open()?;
+    let crate::AnyTree::Standard(tree) = &any else {
+        panic!("a standard tree");
+    };
+    tree.update_runtime_config(|cfg| cfg.columnar = true)?;
+
+    let mut batch = entries_to_column_batch(&[InternalValue::from_components(
+        b"b",
+        b"ignored",
+        0,
+        ValueType::Value,
+    )])?;
+    batch.columns.pop();
+    batch.columns.push(Column {
+        column_id: 3,
+        type_tag: TypeTag::Fixed(4),
+        validity: None,
+        data: alloc::vec![1, 0, 0, 0].into(),
+    });
+    let mut ingestion = any.ingestion()?;
+    ingestion.write(b"a".to_vec(), b"row".to_vec())?;
+    ingestion.write_columnar_batch(&batch)?;
+    ingestion.finish()?;
+
+    let version = tree.current_version();
+    let mut layouts: Vec<(Vec<u8>, ValueLayout)> = version
+        .iter_tables()
+        .map(|t| (t.metadata.key_range.min().to_vec(), t.metadata.value_layout))
+        .collect();
+    layouts.sort_by(|a, b| a.0.cmp(&b.0));
+    assert_eq!(
+        alloc::vec![
+            (b"a".to_vec(), ValueLayout::Whole),
+            (b"b".to_vec(), ValueLayout::Split),
+        ],
+        layouts,
     );
     Ok(())
 }
