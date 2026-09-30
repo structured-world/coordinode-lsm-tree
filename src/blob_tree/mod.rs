@@ -1460,6 +1460,11 @@ impl AbstractTree for BlobTree {
         self.index.retention_floor()
     }
 
+    fn compaction_rate_limiter(&self) -> alloc::sync::Arc<crate::rate_limiter::RateLimiter> {
+        // Compactions run through the index tree, so its limiter is the one.
+        self.index.compaction_rate_limiter()
+    }
+
     fn apply_batch(&self, batch: crate::WriteBatch, seqno: SeqNo) -> crate::Result<(u64, u64)> {
         self.index.apply_batch(batch, seqno)
     }

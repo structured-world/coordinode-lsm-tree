@@ -29,9 +29,14 @@
 //! [`RateLimiter::request_interruptible`] (which reads the system clock and
 //! sleeps in pollable chunks) is gated behind the `std` feature.
 //!
-//! A priority-class extension (flush / user I/O also debiting the bucket
-//! but draining ahead of compaction) is a planned refinement; this
-//! revision throttles compaction alone.
+//! # Sharing and retuning
+//!
+//! A tree builds its own limiter from
+//! [`Config::compaction_rate_limit`](crate::Config::compaction_rate_limit),
+//! or several trees share one handed to them through
+//! [`Config::compaction_rate_limiter`](crate::Config::compaction_rate_limiter)
+//! and are bounded by it together. The limiter owns the rate:
+//! [`RateLimiter::set_rate`] changes it for every holder, with no restart.
 
 use core::sync::atomic::Ordering;
 use core::time::Duration;
@@ -282,12 +287,12 @@ impl RateLimiter {
     /// The budget is debited at most once (via a single
     /// [`acquire_wait`](Self::acquire_wait)) — the early returns for
     /// `rate == 0` and for an already-pending stop skip the debit entirely.
-    /// When a wait is computed it is slept in
-    /// <= [`POLL_INTERVAL`](Self::POLL_INTERVAL) chunks with a `should_stop`
-    /// check before each, so even a multi-gigabyte item under a low limit
-    /// cannot stall shutdown for more than one poll interval. Re-calling
-    /// `acquire_wait` in the loop would wrongly re-debit the bucket each
-    /// iteration, so the wait is computed once up front.
+    /// When a wait is computed it is slept in chunks of at most 100 ms with a
+    /// `should_stop` check and a rate check before each, so even a
+    /// multi-gigabyte item under a low limit cannot stall shutdown, or a
+    /// retune, for more than one chunk. Re-calling `acquire_wait` in the loop
+    /// would wrongly re-debit the bucket each iteration, so the wait is
+    /// computed once up front and rescaled if the rate changes.
     ///
     /// A no-op returning `false` when the rate is `0` (no clock read).
     /// Only with the `std` feature; `no_std` callers drive `acquire_wait`
@@ -372,4 +377,5 @@ impl RateLimiter {
 }
 
 #[cfg(test)]
+#[expect(clippy::unwrap_used, reason = "test code")]
 mod tests;
