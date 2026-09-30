@@ -20,6 +20,40 @@ pub enum AnyIngestion<'a> {
 }
 
 impl AnyIngestion<'_> {
+    /// Tells the ingestion how many entries it will write in all, an upper
+    /// bound. An ingestion streams its entries, so without it the filters of
+    /// its first tables can take the room a filter budget
+    /// ([`Config::filter_advisor`](crate::Config::filter_advisor)) has left
+    /// and push the later tables' filters past it; with it, each filter keeps
+    /// room for the entries still to come, as a flush's do. Without a filter
+    /// advisor it changes nothing.
+    ///
+    /// # Examples
+    ///
+    /// ```
+    /// # use lsm_tree::Config;
+    /// # let folder = tempfile::tempdir()?;
+    /// # let tree = Config::new(folder, Default::default(), Default::default()).open()?;
+    /// #
+    /// let mut ingestion = tree.ingestion()?.expected_entries(2);
+    /// ingestion.write("a", "abc")?;
+    /// ingestion.write("b", "def")?;
+    /// ingestion.finish()?;
+    /// #
+    /// # Ok::<(), lsm_tree::Error>(())
+    /// ```
+    #[must_use]
+    pub fn expected_entries(self, entries: u64) -> Self {
+        let table = match &self {
+            Self::Standard(i) => i,
+            Self::Blob(b) => &b.table,
+        };
+        if let Some(sizing) = table.writer.filter_sizing() {
+            sizing.expect_keys(entries);
+        }
+        self
+    }
+
     /// Writes a key-value pair.
     ///
     /// # Errors

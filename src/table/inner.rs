@@ -113,6 +113,11 @@ pub struct Inner {
     /// signal for demotion / tiering decisions.
     pub(crate) last_access_secs: AtomicU64,
 
+    /// This table's filter probes, installed when its tree allocates filter
+    /// memory by probe load and absent otherwise, so a tree that does not
+    /// pays no counting on the probe path.
+    pub(crate) probe_stats: once_cell::race::OnceBox<crate::table::probe_stats::ProbeStats>,
+
     /// Range tombstones stored in this table. Loaded on open.
     pub(crate) range_tombstones: Vec<RangeTombstone>,
 

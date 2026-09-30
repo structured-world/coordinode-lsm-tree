@@ -188,9 +188,15 @@ pub struct TreeInner {
     /// the read path can record without a back-reference to the tree.
     pub(crate) heal_hints: Arc<crate::heal_hints::HealHints>,
 
-    /// The tree's compaction I/O budget, built once from
-    /// [`Config::compaction_rate_limit`](crate::Config::compaction_rate_limit)
-    /// and shared by every compaction this tree runs.
+    /// Whether the tree's filters exceed the budget its filter advisor
+    /// allocates, shared with its flushes and compactions.
+    pub(crate) filter_budget: Arc<crate::filter_budget::FilterBudget>,
+
+    /// The tree's compaction I/O budget, shared by every compaction this tree
+    /// runs: the limiter supplied through
+    /// [`Config::compaction_rate_limiter`](crate::Config::compaction_rate_limiter),
+    /// which other trees may hold too, or one built once from
+    /// [`Config::compaction_rate_limit`](crate::Config::compaction_rate_limit).
     ///
     /// It lives here, rather than being built per invocation, because the
     /// configured figure is bytes per second for the TREE: a bucket per
@@ -204,7 +210,9 @@ pub struct TreeInner {
     /// under `no_std` it does not throttle: there is no ambient monotonic clock
     /// there, so
     /// [`request_interruptible`](crate::rate_limiter::RateLimiter::request_interruptible)
-    /// only honours the stop signal. Holding the bucket per tree is what makes
+    /// and
+    /// [`request_abortable`](crate::rate_limiter::RateLimiter::request_abortable)
+    /// only honour the stop signal. Holding the bucket per tree is what makes
     /// the rate correct once a caller-provided clock is wired in.
     pub(crate) compaction_rate_limiter: Arc<crate::rate_limiter::RateLimiter>,
 
@@ -319,19 +327,23 @@ impl TreeInner {
 
         let comparator = config.comparator.clone();
         let sync_mode = config.sync_mode;
-        // Read before `config` is moved into the Arc below.
-        let config_rate_limit = config.compaction_rate_limit;
+        // Built before `config` is moved into the Arc below.
+        let compaction_rate_limiter = config.tree_compaction_rate_limiter();
 
         // The first persist above wrote the full snapshot `v{version.id()}` and
         // pointed CURRENT at it, so that id is the initial manifest snapshot.
         let snapshot_id = version.id();
-        let super_versions = SuperVersions::new(
+        let filter_budget = Arc::<crate::filter_budget::FilterBudget>::default();
+        let mut super_versions = SuperVersions::new(
             version,
             &comparator,
             sync_mode,
             snapshot_id,
             config.manifest_log_rotate_bytes,
         );
+        if config.filter_advisor.is_some() {
+            super_versions = super_versions.with_filter_budget(Arc::clone(&filter_budget));
+        }
         #[cfg(feature = "std")]
         let latest_super_version = super_versions.latest_handle();
 
@@ -354,9 +366,8 @@ impl TreeInner {
             #[cfg(feature = "std")]
             background_deleter: Arc::new(crate::BackgroundDeleter::new(None)),
             heal_hints: crate::heal_hints::HealHints::new_shared(initial_runtime.auto_heal),
-            compaction_rate_limiter: Arc::new(crate::rate_limiter::RateLimiter::new(
-                config_rate_limit,
-            )),
+            filter_budget,
+            compaction_rate_limiter,
             kv_digest_at_insert: portable_atomic::AtomicU8::new(kv_digest_at_insert_gate(
                 &initial_runtime,
             )),

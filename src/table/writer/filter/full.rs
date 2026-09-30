@@ -4,12 +4,8 @@
 
 use super::FilterWriter;
 use crate::{
-    CompressionType, UserKey,
-    checksum::ChecksummedWriter,
-    config::BloomConstructionPolicy,
-    encryption::EncryptionProvider,
-    prefix::PrefixExtractor,
-    table::{Block, filter::build_burr_filter_bytes},
+    CompressionType, UserKey, checksum::ChecksummedWriter, config::BloomConstructionPolicy,
+    encryption::EncryptionProvider, prefix::PrefixExtractor, table::Block,
 };
 use alloc::sync::Arc;
 #[cfg(not(feature = "std"))]
@@ -37,6 +33,16 @@ pub struct FullFilterWriter {
     /// `Some(params)` upgrades the filter block's `BlockTransform` to
     /// the matching `*Ecc` variant; `None` = no parity.
     ecc: Option<crate::table::block::EccParams>,
+
+    /// Chooses the width at `finish` when the tree allocates filter memory
+    /// by probe load; `bloom_policy` decides otherwise.
+    sizing: Option<crate::filter_budget::FilterPlan>,
+
+    /// The table's key range, which a sized filter draws its load over.
+    key_range: Option<(UserKey, UserKey)>,
+
+    /// Keys registered, fewer than the hashes under a prefix extractor.
+    keys: usize,
 }
 
 impl FullFilterWriter {
@@ -49,7 +55,17 @@ impl FullFilterWriter {
             encryption: None,
             table_id: 0,
             ecc: None,
+            sizing: None,
+            key_range: None,
+            keys: 0,
         }
+    }
+
+    /// The widest filter `finish` may build, which the size estimates bound.
+    fn bound_policy(&self) -> BloomConstructionPolicy {
+        self.sizing
+            .as_ref()
+            .map_or(self.bloom_policy, |sizing| sizing.bound_policy())
     }
 }
 
@@ -109,6 +125,20 @@ impl<W: crate::io::Write + crate::io::Seek> FilterWriter<W> for FullFilterWriter
         self
     }
 
+    fn use_sizing(
+        mut self: Box<Self>,
+        sizing: Option<crate::filter_budget::FilterPlan>,
+    ) -> Box<dyn FilterWriter<W>> {
+        self.sizing = sizing;
+        self
+    }
+
+    fn set_key_range(&mut self, first: &UserKey, last: &UserKey) {
+        if self.sizing.is_some() {
+            self.key_range = Some((first.clone(), last.clone()));
+        }
+    }
+
     // The one filter is built at `finish`, with nothing left to overlap it
     // with, so it stays on the writer's thread.
     #[cfg(feature = "std")]
@@ -121,6 +151,7 @@ impl<W: crate::io::Write + crate::io::Seek> FilterWriter<W> for FullFilterWriter
 
     fn register_key(&mut self, key: &UserKey) -> crate::Result<usize> {
         let before = self.bloom_hash_buffer.len();
+        self.keys += 1;
         self.bloom_hash_buffer.push(crate::hash::hash64(key));
 
         // A prefix the previous key had at the same position is a repeat and
@@ -160,8 +191,16 @@ impl<W: crate::io::Write + crate::io::Seek> FilterWriter<W> for FullFilterWriter
         // second buffer.
         let n = self.bloom_hash_buffer.len();
         let build = crate::table::filter::ribbon::burr::builder::build_peak_bytes(n, false);
-        let filter = self.bloom_policy.filter_size_bound(n) as u64;
+        let filter = self.bound_policy().filter_size_bound(n) as u64;
+        // A sized filter builds from a copy of the hashes while a narrower
+        // retry may still need them.
+        let retry_copy = if self.sizing.is_some() {
+            (n * core::mem::size_of::<u64>()) as u64
+        } else {
+            0
+        };
         build as u64
+            + retry_copy
             + filter
             + crate::table::block::transform_scratch_bound(
                 filter,
@@ -179,7 +218,7 @@ impl<W: crate::io::Write + crate::io::Seek> FilterWriter<W> for FullFilterWriter
         // Tokens that repeat out of order are deduplicated only at `finish`,
         // so this counts them before the dedup: an estimate from above.
         crate::table::block::framed_len_bound(
-            self.bloom_policy
+            self.bound_policy()
                 .filter_size_bound(self.bloom_hash_buffer.len()) as u64,
             crate::table::block::BlockType::Filter,
             CompressionType::None,
@@ -191,10 +230,10 @@ impl<W: crate::io::Write + crate::io::Seek> FilterWriter<W> for FullFilterWriter
     fn finish(
         self: Box<Self>,
         file_writer: &mut crate::sfa::Writer<ChecksummedWriter<W>>,
-    ) -> crate::Result<usize> {
+    ) -> crate::Result<super::FilterOutput> {
         if self.bloom_hash_buffer.is_empty() {
             log::trace!("Filter writer has no buffered hashes - not building filter");
-            return Ok(0);
+            return Ok(super::FilterOutput::default());
         }
 
         // A prefix extractor emits one token per prefix per key, and prefixes
@@ -217,10 +256,7 @@ impl<W: crate::io::Write + crate::io::Seek> FilterWriter<W> for FullFilterWriter
         }
         let n = hashes.len();
 
-        log::trace!(
-            "Constructing BuRR filter with {n} entries ({raw} before dedup): {:?}",
-            self.bloom_policy,
-        );
+        log::trace!("Constructing BuRR filter with {n} entries ({raw} before dedup)");
 
         // no-std: caller-provided Clock trait (timing is trace-only here)
         #[cfg(feature = "std")]
@@ -232,11 +268,32 @@ impl<W: crate::io::Write + crate::io::Seek> FilterWriter<W> for FullFilterWriter
         // was actually written.
         // `finish` consumes `Box<Self>`, so we can move `bloom_hash_buffer`
         // into the BuRR builder directly — no `to_vec()` clone.
-        let filter_bytes = build_burr_filter_bytes(self.bloom_policy, hashes)?;
+        // A sized filter picks its width now that its hashes are counted.
+        let sizing = match (&self.sizing, &self.key_range) {
+            (Some(sizing), Some((first, last))) => Some((
+                &**sizing,
+                (
+                    core::ops::Bound::Included(first.as_ref()),
+                    core::ops::Bound::Included(last.as_ref()),
+                ),
+            )),
+            _ => None,
+        };
+        let filter_bytes = super::build_filter(
+            self.bloom_policy,
+            sizing,
+            hashes,
+            self.keys,
+            self.encryption.as_deref(),
+            self.ecc,
+        )?;
+        if let Some(sizing) = &self.sizing {
+            sizing.table_finished(n);
+        }
 
         if filter_bytes.is_empty() {
             log::trace!("BuRR policy produced empty filter — skipping block write");
-            return Ok(0);
+            return Ok(super::FilterOutput::default());
         }
 
         file_writer.start("filter")?;
@@ -278,6 +335,10 @@ impl<W: crate::io::Write + crate::io::Seek> FilterWriter<W> for FullFilterWriter
             at,
         )?;
 
-        Ok(1)
+        Ok(super::FilterOutput {
+            blocks: 1,
+            hashes: n as u64,
+            partition_hashes: 0,
+        })
     }
 }

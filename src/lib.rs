@@ -280,6 +280,8 @@ mod error;
 #[doc(hidden)]
 pub mod file;
 
+pub(crate) mod filter_budget;
+
 /// Pluggable filesystem abstraction for I/O backends.
 pub mod fs;
 
@@ -316,7 +318,7 @@ mod manifest;
 pub mod manifest_blocks;
 mod memtable;
 mod merge_operator;
-pub(crate) mod rate_limiter;
+pub mod rate_limiter;
 mod reseek;
 mod run_reader;
 mod run_scanner;
@@ -456,8 +458,8 @@ pub mod scrub;
 
 pub mod storage_stats;
 pub use storage_stats::{
-    ApproximateRangeStats, BlobReferenceStats, LevelStats, RangeCardinality, SegmentStats,
-    StorageStatistics, StorageStats, StorageStatus,
+    ApproximateRangeStats, BlobReferenceStats, FilterMemory, LevelStats, RangeCardinality,
+    SegmentStats, StorageStatistics, StorageStats, StorageStatus,
 };
 
 mod version;

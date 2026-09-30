@@ -25,6 +25,7 @@ pub(crate) mod lazy_block;
 pub(crate) mod locator;
 pub(crate) mod meta;
 pub(crate) mod multi_writer;
+pub(crate) mod probe_stats;
 pub(crate) mod regions;
 #[cfg(feature = "std")]
 mod relocate;
@@ -256,6 +257,9 @@ pub(crate) struct TableSinks<'a> {
     /// to come back now rather than when a background pass gets to it.
     #[cfg(feature = "std")]
     pub background_deleter: Option<&'a Arc<crate::BackgroundDeleter>>,
+    /// Whether the tree counts the table's filter probes: it does when it
+    /// allocates filter memory by probe load.
+    pub track_filter_probes: bool,
 }
 
 /// Tables can be merged together to improve read performance and free unneeded disk space by removing outdated item versions.
@@ -311,32 +315,76 @@ pub(crate) enum SeqnoVisibility {
     Partial,
 }
 
+/// Which data blocks a key range boundary takes in [`Table::data_span`].
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+pub(crate) enum SpanEdge {
+    /// Every block holding a key of the range, boundary blocks whole: a range
+    /// inside one block covers that block rather than nothing.
+    Whole,
+    /// The blocks whose last key lies in the range. Ranges that do not
+    /// overlap take disjoint blocks, so splitting a table's blocks between
+    /// several ranges hands each block out once.
+    ByLastKey,
+}
+
+/// The part of a table's data section a key range covers, in byte offsets
+/// (see [`Table::data_span`]).
+#[derive(Clone, Copy, Debug)]
+pub(crate) struct DataSpan {
+    /// Bytes of data blocks the range covers, within the live part.
+    pub covered: u64,
+    /// Where the live part starts: past the prefix a restricted view punched
+    /// out, 0 otherwise.
+    pub live_start: u64,
+    /// The end of the data section.
+    pub data_end: u64,
+}
+
 /// Result of a bloom filter check.
 enum BloomResult {
     /// Bloom says key is definitely absent — skip point read.
     Skip,
+    /// The key sorts past the last filter partition: absent by the partition
+    /// index alone, with no filter answering, so no probe of one.
+    PastPartitions,
     /// Point read should proceed.
     Proceed {
-        /// Whether a filter was present (used for metrics accounting).
-        #[cfg_attr(
-            not(feature = "metrics"),
-            expect(
-                dead_code,
-                reason = "read by BloomResult::has_filter under metrics feature"
-            )
-        )]
+        /// Whether a filter was present, for metrics and probe accounting.
         has_filter: bool,
     },
 }
 
+/// What a key check of a table's filters found (see
+/// [`Table::key_filter_answer`]).
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+pub(crate) enum KeyFilterAnswer {
+    /// A filter answered absent.
+    Absent,
+    /// The key sorts past the last filter partition: absent by the partition
+    /// index alone, with no filter answering.
+    PastPartitions,
+    /// The key may be present, or nothing could rule it out.
+    MayContain,
+}
+
 impl BloomResult {
     fn should_skip(&self) -> bool {
-        matches!(self, Self::Skip)
+        matches!(self, Self::Skip | Self::PastPartitions)
     }
 
-    #[cfg(feature = "metrics")]
     fn has_filter(&self) -> bool {
         matches!(self, Self::Proceed { has_filter: true })
+    }
+
+    /// What this answer adds to its table's probe counts: a probe when a
+    /// filter answered, and a negative one when it answered absent.
+    const fn probe_counts(&self) -> crate::table::probe_stats::ProbeCounts {
+        let (probes, negatives) = match self {
+            Self::Skip => (1, 1),
+            Self::Proceed { has_filter: true } => (1, 0),
+            Self::PastPartitions | Self::Proceed { has_filter: false } => (0, 0),
+        };
+        crate::table::probe_stats::ProbeCounts { probes, negatives }
     }
 }
 
@@ -785,6 +833,35 @@ impl Table {
             .as_ref()
             .map(FilterBlock::size)
             .unwrap_or_default()
+    }
+
+    /// Filter bytes held in memory now: the pinned filter, or the filter
+    /// blocks resident in the block cache, counted at their on-disk size.
+    /// Asks the cache without counting a hit, so a report does not keep the
+    /// blocks it looks at resident.
+    #[must_use]
+    pub(crate) fn resident_filter_bytes(&self) -> u64 {
+        // A pinned full filter is resident whole; its on-disk handle, not the
+        // decoded payload, carries the framing the other figures count.
+        if self.pinned_filter_block.is_some() {
+            return u64::from(self.filter_size());
+        }
+        let resident = |handle: &BlockHandle| {
+            if self.cache.has_block(self.global_id(), handle.offset()) {
+                u64::from(handle.size())
+            } else {
+                0
+            }
+        };
+        if let Some(filter_idx) = &self.pinned_filter_index {
+            // A partitioned filter's partitions, each cached on its own.
+            filter_idx
+                .iter(self.comparator.clone())
+                .map(|handle| resident(handle.materialize(filter_idx.as_slice()).as_ref()))
+                .sum()
+        } else {
+            self.regions.filter.as_ref().map_or(0, resident)
+        }
     }
 
     #[must_use]
@@ -6517,7 +6594,7 @@ impl Table {
                     self.metrics.filter_queries.fetch_add(1, Relaxed);
                     self.metrics.io_skipped_by_filter.fetch_add(1, Relaxed);
                 }
-                return Ok(BloomResult::Skip);
+                return Ok(BloomResult::PastPartitions);
             }
         } else if let Some(_filter_tli_handle) = &self.regions.filter_tli {
             unimplemented!("unpinned filter TLI not supported");
@@ -6594,6 +6671,7 @@ impl Table {
         }
 
         let bloom = self.check_bloom(key, key_hash)?;
+        self.count_probe(&bloom);
         if bloom.should_skip() {
             return Ok(None);
         }
@@ -6663,6 +6741,9 @@ impl Table {
                 self.metrics.filter_queries.fetch_add(1, Relaxed);
             }
         }
+        if item.is_none() && bloom.has_filter() {
+            self.count_false_positive(seqno);
+        }
 
         Ok(item)
     }
@@ -6698,6 +6779,7 @@ impl Table {
         }
 
         let bloom = self.check_bloom(key, key_hash)?;
+        self.count_probe(&bloom);
         if bloom.should_skip() {
             return Ok(None);
         }
@@ -6745,6 +6827,9 @@ impl Table {
             if item.is_none() && bloom.has_filter() {
                 self.metrics.filter_queries.fetch_add(1, Relaxed);
             }
+        }
+        if item.is_none() && bloom.has_filter() {
+            self.count_false_positive(seqno);
         }
 
         Ok(item)
@@ -6847,6 +6932,7 @@ impl Table {
         }
 
         let bloom = self.check_bloom(key, key_hash)?;
+        self.count_probe(&bloom);
         if bloom.should_skip() {
             return Ok(None);
         }
@@ -6868,6 +6954,9 @@ impl Table {
             if result.is_none() && bloom.has_filter() {
                 self.metrics.filter_queries.fetch_add(1, Relaxed);
             }
+        }
+        if result.is_none() && bloom.has_filter() {
+            self.count_false_positive(seqno);
         }
 
         Ok(result)
@@ -7126,13 +7215,12 @@ impl Table {
         // check_bloom on the first call; subsequent calls reuse
         // it through the table-internal cache.
         let mut passing: Vec<usize> = Vec::with_capacity(sorted_keys.len());
-        #[cfg(feature = "metrics")]
         let mut had_filter = false;
         for (i, (key, hash)) in sorted_keys.iter().enumerate() {
             let bloom = self.check_bloom(key, *hash)?;
+            self.count_probe(&bloom);
             if !bloom.should_skip() {
                 passing.push(i);
-                #[cfg(feature = "metrics")]
                 if bloom.has_filter() {
                     had_filter = true;
                 }
@@ -7141,6 +7229,17 @@ impl Table {
         if passing.is_empty() {
             return Ok(results);
         }
+        // The filter let these keys through; the ones no read below finds are
+        // its false positives.
+        let count_false_positives = |results: &[Option<InternalValue>]| {
+            if had_filter && self.probe_stats().is_some() {
+                for &i in &passing {
+                    if results.get(i).is_some_and(Option::is_none) {
+                        self.count_false_positive(table_seqno);
+                    }
+                }
+            }
+        };
 
         // Seek the block index once at the smallest passing key.
         // forward_reader returns the first block whose end_key
@@ -7169,6 +7268,7 @@ impl Table {
                         .fetch_add(passing.len(), Relaxed);
                 }
             }
+            count_false_positives(&results);
             return Ok(results);
         };
 
@@ -7284,6 +7384,7 @@ impl Table {
                 }
             }
         }
+        count_false_positives(&results);
 
         Ok(results)
     }
@@ -7300,6 +7401,9 @@ impl Table {
     /// propagated so the authoritative chunked planner surfaces it instead of
     /// mistaking it for a miss; the best-effort prewarm planner maps it back to
     /// `None`.
+    ///
+    /// The filter answers are added to `tally` when one is given, for the
+    /// caller to count once it answers from this plan.
     #[expect(
         clippy::indexing_slicing,
         reason = "passing[0] is valid after the emptiness check"
@@ -7308,6 +7412,7 @@ impl Table {
         &self,
         sorted_keys: &[(&[u8], u64)],
         seqno: SeqNo,
+        mut tally: Option<&mut crate::table::probe_stats::ProbeCounts>,
     ) -> crate::Result<Option<(Vec<usize>, block_index::BlockIndexIterImpl, SeqNo)>> {
         if sorted_keys.is_empty() {
             return Ok(None);
@@ -7321,7 +7426,11 @@ impl Table {
         }
         let mut passing: Vec<usize> = Vec::with_capacity(sorted_keys.len());
         for (i, (key, hash)) in sorted_keys.iter().enumerate() {
-            if !self.check_bloom(key, *hash)?.should_skip() {
+            let bloom = self.check_bloom(key, *hash)?;
+            if let Some(tally) = tally.as_deref_mut() {
+                *tally += bloom.probe_counts();
+            }
+            if !bloom.should_skip() {
                 passing.push(i);
             }
         }
@@ -7332,9 +7441,27 @@ impl Table {
             .block_index
             .forward_reader(sorted_keys[passing[0]].0, table_seqno)
         else {
+            // Every passed key lies past the last block: none is held.
+            if let Some(tally) = tally {
+                self.tally_blockless(tally, table_seqno, passing.len());
+            }
             return Ok(None);
         };
         Ok(Some((passing, block_iter, table_seqno)))
+    }
+
+    /// Counts in `tally` the `keys` the filter let through that no block of
+    /// the table can hold, read at `table_seqno`: each a false positive, as
+    /// [`Self::count_false_positive`] counts one.
+    fn tally_blockless(
+        &self,
+        tally: &mut crate::table::probe_stats::ProbeCounts,
+        table_seqno: SeqNo,
+        keys: usize,
+    ) {
+        if self.has_filter() && table_seqno > self.metadata.seqnos.1 {
+            tally.negatives += keys as u64;
+        }
     }
 
     /// Plans the COLD (uncached) data blocks [`Table::batch_get`] will read for
@@ -7367,7 +7494,8 @@ impl Table {
         // prewarm (`.ok().flatten()` maps it to None; the authoritative resolve
         // re-probes and surfaces it).
         let (passing, mut block_iter, _table_seqno) = self
-            .plan_block_walk_setup(sorted_keys, seqno)
+            // A prewarm probes ahead of the read it warms, which probes again.
+            .plan_block_walk_setup(sorted_keys, seqno, None)
             .ok()
             .flatten()?;
 
@@ -7491,6 +7619,10 @@ impl Table {
     /// # Errors
     ///
     /// Propagates a bloom-probe ([`Table::check_bloom`]) or table-open failure.
+    ///
+    /// The filter answers are added to `tally`: the chunked resolve counts
+    /// them once it answers from its plan, and not when it hands the level to
+    /// the serial resolve, which probes the same filters again.
     #[expect(
         clippy::indexing_slicing,
         reason = "`passing` positions index into `sorted_keys` (< its len); `passing[p]` \
@@ -7500,9 +7632,10 @@ impl Table {
         &self,
         sorted_keys: &[(&[u8], u64)],
         seqno: SeqNo,
+        tally: &mut crate::table::probe_stats::ProbeCounts,
     ) -> crate::Result<Option<BlockTaskPlan>> {
         let Some((passing, mut block_iter, table_seqno)) =
-            self.plan_block_walk_setup(sorted_keys, seqno)?
+            self.plan_block_walk_setup(sorted_keys, seqno, Some(tally))?
         else {
             return Ok(None);
         };
@@ -7543,6 +7676,15 @@ impl Table {
             }
             blocks.push((handle, block_keys));
         }
+        // The passed keys past the last block. A key equal to that block's
+        // end key is listed in it and left for a next block there is not.
+        let listed = blocks.last().map(|(_, keys)| keys.as_slice());
+        let blockless = passing
+            .iter()
+            .skip(p)
+            .filter(|pos| !listed.is_some_and(|keys| keys.contains(pos)))
+            .count();
+        self.tally_blockless(tally, table_seqno, blockless);
         if blocks.is_empty() {
             return Ok(None);
         }
@@ -7629,6 +7771,14 @@ impl Table {
                 item.key.seqno = apply_global_seqno(item.key.seqno, global_seqno);
                 item
             }))
+    }
+
+    /// Whether the table has a filter to probe.
+    pub(crate) fn has_filter(&self) -> bool {
+        self.pinned_filter_block.is_some()
+            || self.pinned_filter_index.is_some()
+            || self.regions.filter.is_some()
+            || self.regions.filter_tli.is_some()
     }
 
     /// Creates a scanner over the `Table`.
@@ -9121,6 +9271,7 @@ impl Table {
                 blob_links: once_cell::race::OnceBox::new(),
                 read_count: AtomicU64::new(0),
                 last_access_secs: AtomicU64::new(0),
+                probe_stats: once_cell::race::OnceBox::new(),
                 range_tombstones,
                 block_layout,
                 seqno_bounds,
@@ -9273,6 +9424,23 @@ impl Table {
         // is never scheduled for a durable rewrite.
         if let Some(hints) = self.0.heal_hints.get() {
             reopened.install_heal_hints(Arc::clone(hints));
+        }
+        // And the columnar read budget, or the suffix's scans fall back to the
+        // default budget whatever the tree was configured with.
+        if let Some(budget) = self.0.read_budget.get() {
+            reopened.0.read_budget.get_or_init(|| Box::new(*budget));
+        }
+        // The suffix keeps the share of the probe counts its data holds; the
+        // slice outputs take the prefix's share from this view.
+        if self.probe_stats().is_some() {
+            let suffix = crate::table::probe_stats::share_of(
+                self,
+                (
+                    core::ops::Bound::Included(lower.as_ref()),
+                    core::ops::Bound::Unbounded,
+                ),
+            )?;
+            reopened.0.probe_stats.get_or_init(Box::default).add(suffix);
         }
         Ok(reopened.with_restriction(lower))
     }
@@ -9579,6 +9747,140 @@ impl Table {
         if let Some(deleter) = sinks.background_deleter {
             self.install_background_deleter(Arc::clone(deleter));
         }
+        // A second bind keeps the counts the first one started.
+        if sinks.track_filter_probes {
+            self.0.probe_stats.get_or_init(Box::default);
+        }
+    }
+
+    /// This table's filter probes, when its tree counts them.
+    pub(crate) fn probe_stats(&self) -> Option<&crate::table::probe_stats::ProbeStats> {
+        self.0.probe_stats.get()
+    }
+
+    /// Counts a probe the filter answered, and whether it answered absent.
+    /// Only the reads that produce the answer count: a prewarm that probes
+    /// ahead of the read it warms does not.
+    fn count_probe(&self, bloom: &BloomResult) {
+        if let Some(stats) = self.probe_stats() {
+            let counts = bloom.probe_counts();
+            if counts.probes != 0 {
+                stats.probe();
+            }
+            if counts.negatives != 0 {
+                stats.negative();
+            }
+        }
+    }
+
+    /// Counts the probes a read tallied while planning, once it answers from
+    /// that plan.
+    pub(crate) fn count_probes(&self, counts: crate::table::probe_stats::ProbeCounts) {
+        if let Some(stats) = self.probe_stats() {
+            stats.add(counts);
+        }
+    }
+
+    /// Counts a probe the filter let through whose read found no version of
+    /// the key.
+    ///
+    /// That is a false positive only when the read could see every version the
+    /// table holds (`table_seqno` above its newest): at an older snapshot the
+    /// key may be held only in versions the snapshot cannot see, and the index
+    /// walk skips the blocks holding them, so telling the two apart would cost
+    /// a read the probe did not make. Those probes are left uncounted.
+    pub(crate) fn count_false_positive(&self, table_seqno: SeqNo) {
+        if let Some(stats) = self.probe_stats()
+            && table_seqno > self.metadata.seqnos.1
+        {
+            stats.negative();
+        }
+    }
+
+    /// The bytes of this table's data section a key range covers, at data
+    /// block granularity and read from the block index alone (no data block
+    /// is read), or `None` when the table has no data block.
+    ///
+    /// `edge` says which blocks a range boundary takes (see [`SpanEdge`]).
+    /// `table_seqno` is table-local.
+    pub(crate) fn data_span(
+        &self,
+        bounds: (core::ops::Bound<&[u8]>, core::ops::Bound<&[u8]>),
+        table_seqno: SeqNo,
+        edge: SpanEdge,
+    ) -> crate::Result<Option<DataSpan>> {
+        use crate::table::block_index::BlockIndex;
+        use core::cmp::Ordering;
+        use core::ops::Bound;
+
+        // data_end = the data section's byte extent = last data block's end.
+        let Some(last) = self.block_index.iter().next_back() else {
+            return Ok(None);
+        };
+        let last = last?;
+        let data_end = *last.offset() + u64::from(last.size());
+        if data_end == 0 {
+            return Ok(None);
+        }
+
+        // The data block that would contain `key`, as (start, end) byte
+        // offsets, or `None` when `key` is past the last block.
+        let block_span = |key: &[u8]| -> crate::Result<Option<(u64, u64)>> {
+            let Some(mut iter) = self.block_index.forward_reader(key, table_seqno) else {
+                return Ok(None);
+            };
+            let Some(handle) = iter.next() else {
+                return Ok(None);
+            };
+            let h = handle?;
+            let start = *h.offset();
+            Ok(Some((start, (start + u64::from(h.size())).min(data_end))))
+        };
+        // Tight-space restriction: a restricted table view serves only keys
+        // at or above its lower bound, with the punched-out prefix served by
+        // the replacement table, so the data below it is not this view's.
+        let live_start = match self.restrict_lower_bound() {
+            Some(rb) => block_span(rb.as_ref())?.map_or(data_end, |(start, _)| start),
+            None => 0,
+        };
+        // Where the first block whose last key is at or past `key` starts, or
+        // strictly past it when `past`; the data end when there is none. The
+        // versions of one key can fill several blocks, all ending at it.
+        let first_block_from = |key: &[u8], past: bool| -> crate::Result<u64> {
+            let Some(iter) = self.block_index.forward_reader(key, table_seqno) else {
+                return Ok(data_end);
+            };
+            for handle in iter {
+                let h = handle?;
+                if !past || self.comparator.compare(h.end_key(), key) != Ordering::Equal {
+                    return Ok(*h.offset());
+                }
+            }
+            Ok(data_end)
+        };
+        let off_lo = match (bounds.0, edge) {
+            (Bound::Unbounded, _) => 0,
+            (Bound::Included(k) | Bound::Excluded(k), SpanEdge::Whole) => {
+                block_span(k)?.map_or(data_end, |(start, _)| start)
+            }
+            (Bound::Included(k), SpanEdge::ByLastKey) => first_block_from(k, false)?,
+            (Bound::Excluded(k), SpanEdge::ByLastKey) => first_block_from(k, true)?,
+        }
+        .max(live_start);
+        let off_hi = match (bounds.1, edge) {
+            (Bound::Unbounded, _) => data_end,
+            (Bound::Included(k) | Bound::Excluded(k), SpanEdge::Whole) => {
+                block_span(k)?.map_or(data_end, |(_, end)| end)
+            }
+            (Bound::Included(k), SpanEdge::ByLastKey) => first_block_from(k, true)?,
+            (Bound::Excluded(k), SpanEdge::ByLastKey) => first_block_from(k, false)?,
+        };
+        Ok(Some(DataSpan {
+            // A range ending before it starts covers nothing.
+            covered: off_hi.saturating_sub(off_lo),
+            live_start,
+            data_end,
+        }))
     }
 
     /// How this table's columnar reads fetch their pages: the budget its tree
@@ -9897,17 +10199,35 @@ impl Table {
     /// `key_hash` must be the xxh3 hash of `key` (pre-computed by the caller
     /// to avoid redundant hashing — same pattern as [`Table::get`]).
     pub(crate) fn bloom_may_contain_key(&self, key: &[u8], key_hash: u64) -> crate::Result<bool> {
+        self.key_filter_answer(key, key_hash)
+            .map(|answer| answer == KeyFilterAnswer::MayContain)
+    }
+
+    /// [`Self::bloom_may_contain_key`], telling a filter's absent answer
+    /// apart from a key the partition index alone rules out.
+    pub(crate) fn key_filter_answer(
+        &self,
+        key: &[u8],
+        key_hash: u64,
+    ) -> crate::Result<KeyFilterAnswer> {
         debug_assert_eq!(
             crate::hash::hash64(key),
             key_hash,
             "bloom_may_contain_key: key_hash must be crate::hash::hash64(key)"
         );
+        let by_hash = |may: bool| {
+            if may {
+                KeyFilterAnswer::MayContain
+            } else {
+                KeyFilterAnswer::Absent
+            }
+        };
 
         // Full (non-partitioned) filter — delegate to hash-only path.
         // A table has either pinned_filter_block (full) or pinned_filter_index
         // (partitioned), never both — checked at construction time.
         if self.pinned_filter_block.is_some() {
-            return self.bloom_may_contain_hash(key_hash);
+            return self.bloom_may_contain_hash(key_hash).map(by_hash);
         }
 
         // Partitioned filter with pinned TLI — seek to the matching partition
@@ -9926,19 +10246,31 @@ impl Table {
                     None,
                 )?;
                 let block = FilterBlock::new(block);
-                return block.maybe_contains_hash(key_hash);
+                return block.maybe_contains_hash(key_hash).map(by_hash);
             }
 
             // iter.next() == None means the key is beyond all partition
             // boundaries (seek found no ceiling entry in the TLI, which is
             // ordered by each partition's last user key). The key cannot
-            // exist in this table. Same logic as Table::get (line ~265).
-            return Ok(false);
+            // exist in this table, as in `check_bloom`.
+            return Ok(KeyFilterAnswer::PastPartitions);
         }
 
         // Unpinned filter — fall through to hash-only path (handles both
         // unpinned full filters and the no-filter case)
-        self.bloom_may_contain_hash(key_hash)
+        self.bloom_may_contain_hash(key_hash).map(by_hash)
+    }
+
+    /// Whether a key check answers from a filter rather than passing the key
+    /// for want of one: [`Self::bloom_may_contain_key`] when `by_key`, which
+    /// reaches a partitioned filter through its pinned index, otherwise
+    /// [`Self::bloom_may_contain_key_hash`], which reaches only a full one.
+    pub(crate) fn key_check_consults_filter(&self, by_key: bool) -> bool {
+        self.pinned_filter_block.is_some()
+            || (by_key && self.pinned_filter_index.is_some())
+            || (self.regions.filter.is_some()
+                && self.regions.filter_tli.is_none()
+                && self.pinned_filter_index.is_none())
     }
 
     /// Returns the highest effective sequence number in the table.

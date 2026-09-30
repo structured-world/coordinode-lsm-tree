@@ -62,6 +62,16 @@ fn burr_estimated_size_fpr() {
     );
 }
 
+/// No keys build no filter, so the expected size of one is zero at every
+/// width; and a block drawing no keys bumps none.
+#[test]
+fn expected_size_of_no_keys_is_zero() {
+    for bits in [1u8, 10, 16] {
+        assert_eq!(ExpectedSize::of(0).at(bits).to_bits(), 0.0f64.to_bits());
+    }
+    assert_eq!(overflow(0.0, 16.0).to_bits(), 0.0f64.to_bits());
+}
+
 #[test]
 fn build_burr_filter_bytes_empty_returns_empty() {
     let policy = BloomConstructionPolicy::BitsPerKey(10.0);

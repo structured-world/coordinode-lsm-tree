@@ -1332,6 +1332,60 @@ fn tight_space_install_failure_rolls_back_outputs_and_leaves_no_sidecar() -> cra
     Ok(())
 }
 
+/// While a tight-space slice installs, the filter budget holds its outputs'
+/// filters on top of the published ones: the input it restricts keeps its
+/// filter live, so it gives no credit, and the slice's own plan is not given
+/// back before the install.
+#[cfg(zstd_any)]
+#[test]
+fn tight_space_slice_holds_its_filter_budget_until_the_install() -> crate::Result<()> {
+    let dir = tempfile::tempdir()?;
+    let capfs = capfs::CapacityFs::new();
+    let shared: Arc<dyn crate::fs::Fs> = Arc::new(capfs.clone());
+    let config = Config::new(
+        dir.path(),
+        SequenceNumberCounter::default(),
+        SequenceNumberCounter::default(),
+    )
+    .data_block_size_policy(BlockSizePolicy::all(512))
+    .filter_advisor(Some(crate::config::FilterAdvisor::new(u64::MAX)))
+    .with_shared_fs(Arc::clone(&shared));
+    let tree = match config.open()? {
+        crate::AnyTree::Standard(t) => t,
+        crate::AnyTree::Blob(_) => panic!("expected Standard tree"),
+    };
+    for i in 0..TIGHT_SPACE_KEYS {
+        tree.insert(tight_space_key(i).as_bytes(), vec![0xCDu8; 64], i);
+    }
+    tree.flush_active_memtable(0)?;
+    let used = tree.storage_stats()?.used_bytes;
+
+    capfs.set_available_space(used / 4);
+    tree.update_runtime_config(|c| {
+        c.storage_admission_check = true;
+        c.tight_space_compaction = true;
+    })?;
+    let seen: Arc<parking_lot::Mutex<Option<(u64, u64)>>> = Arc::default();
+    {
+        let budget = Arc::clone(&tree.filter_budget);
+        let seen = Arc::clone(&seen);
+        tree.config.arm_before_output_install(move || {
+            *seen.lock() = Some((budget.held(), budget.published()));
+        });
+    }
+    tree.major_compact(64 * 1024 * 1024, 0)?;
+
+    let Some((held, published)) = *seen.lock() else {
+        panic!("the tight-space path installed a slice");
+    };
+    assert!(
+        held > published,
+        "held {held} bytes before the first slice's install, the published filters \
+         alone take {published}"
+    );
+    Ok(())
+}
+
 /// A tight-space slice must NOT garbage-collect a tombstone whose deleted key also
 /// lives in a SURVIVING (restricted) input's consumed prefix. If it did, a crash
 /// window that leaves the survivor unrestricted (sidecar not written, prefix not
@@ -3103,6 +3157,7 @@ fn a_reopened_blob_view_needs_binding_to_carry_the_deletion_pause() -> crate::Re
         read_budget: tree.index.config.columnar_read_budget,
         #[cfg(feature = "std")]
         background_deleter: None,
+        track_filter_probes: false,
     });
     assert!(
         reopened.deletion_pause_for_test().is_some(),
@@ -4411,6 +4466,129 @@ fn a_reopened_tree_starts_with_a_fresh_budget() -> crate::Result<()> {
     assert!(
         opts.rate_limiter.acquire_wait(1, Duration::ZERO).is_zero(),
         "a new process gets a new bucket; the debt does not outlive the tree",
+    );
+
+    Ok(())
+}
+
+/// Opens a standard tree at `dir` with the given configuration tail.
+fn open_standard(
+    dir: &std::path::Path,
+    configure: impl FnOnce(Config) -> Config,
+) -> crate::Result<crate::Tree> {
+    match configure(Config::new(
+        dir,
+        SequenceNumberCounter::default(),
+        SequenceNumberCounter::default(),
+    ))
+    .open()?
+    {
+        crate::AnyTree::Standard(t) => Ok(t),
+        crate::AnyTree::Blob(_) => panic!("expected Standard tree"),
+    }
+}
+
+/// Two trees handed one limiter are bounded by it together: what one tree's
+/// compaction spent is still spent when the other's asks, whatever rate each
+/// tree was configured with.
+#[test]
+fn trees_sharing_a_limiter_draw_on_one_budget() -> crate::Result<()> {
+    use core::time::Duration;
+
+    let rate = 1_024 * 1_024;
+    let shared = Arc::new(crate::rate_limiter::RateLimiter::new(rate));
+    let (a_dir, b_dir) = (tempfile::tempdir()?, tempfile::tempdir()?);
+    let a = open_standard(a_dir.path(), |c| {
+        c.compaction_rate_limit(rate * 100)
+            .compaction_rate_limiter(Arc::clone(&shared))
+    })?;
+    let b = open_standard(b_dir.path(), |c| {
+        c.compaction_rate_limiter(Arc::clone(&shared))
+    })?;
+    let strategy: Arc<dyn CompactionStrategy> =
+        Arc::new(crate::compaction::major::Strategy::new(64 * 1024 * 1024));
+
+    let on_a = super::Options::from_tree(&a, Arc::clone(&strategy));
+    assert!(
+        !on_a
+            .rate_limiter
+            .acquire_wait(rate * 4, Duration::ZERO)
+            .is_zero(),
+        "four seconds of budget at once leaves a debt",
+    );
+    let on_b = super::Options::from_tree(&b, strategy);
+    assert!(
+        !on_b.rate_limiter.acquire_wait(1, Duration::ZERO).is_zero(),
+        "the other tree's compaction meets the debt the first one left",
+    );
+
+    Ok(())
+}
+
+/// Without a shared limiter each tree keeps its own budget: one tree's debt
+/// does not hold back another's compaction.
+#[test]
+fn trees_without_a_shared_limiter_keep_their_own_budget() -> crate::Result<()> {
+    use core::time::Duration;
+
+    let rate = 1_024 * 1_024;
+    let (a_dir, b_dir) = (tempfile::tempdir()?, tempfile::tempdir()?);
+    let a = open_standard(a_dir.path(), |c| c.compaction_rate_limit(rate))?;
+    let b = open_standard(b_dir.path(), |c| c.compaction_rate_limit(rate))?;
+    let strategy: Arc<dyn CompactionStrategy> =
+        Arc::new(crate::compaction::major::Strategy::new(64 * 1024 * 1024));
+
+    let on_a = super::Options::from_tree(&a, Arc::clone(&strategy));
+    assert!(
+        !on_a
+            .rate_limiter
+            .acquire_wait(rate * 4, Duration::ZERO)
+            .is_zero()
+    );
+    let on_b = super::Options::from_tree(&b, strategy);
+    assert!(
+        on_b.rate_limiter.acquire_wait(1, Duration::ZERO).is_zero(),
+        "a tree's own budget is untouched by another tree's debt",
+    );
+
+    Ok(())
+}
+
+/// A retune through one holder is seen by every tree sharing the limiter,
+/// with one value, and the compactions each runs are measured against it,
+/// not against either tree's configured rate.
+#[test]
+fn a_retune_through_one_tree_binds_every_tree_sharing_the_limiter() -> crate::Result<()> {
+    use crate::AbstractTree;
+    use core::time::Duration;
+
+    let shared = Arc::new(crate::rate_limiter::RateLimiter::new(1_000));
+    let (a_dir, b_dir) = (tempfile::tempdir()?, tempfile::tempdir()?);
+    let a = open_standard(a_dir.path(), |c| {
+        c.compaction_rate_limit(1_000_000)
+            .compaction_rate_limiter(Arc::clone(&shared))
+    })?;
+    let b = open_standard(b_dir.path(), |c| {
+        c.compaction_rate_limit(5)
+            .compaction_rate_limiter(Arc::clone(&shared))
+    })?;
+    assert_eq!(a.compaction_rate_limiter().rate(), 1_000);
+    assert_eq!(b.compaction_rate_limiter().rate(), 1_000);
+
+    a.compaction_rate_limiter()
+        .set_rate_at(2_000, Duration::ZERO);
+    assert_eq!(b.compaction_rate_limiter().rate(), 2_000);
+
+    // b's compaction owes at the retuned rate: the bucket still holds the
+    // 1000 B it had (a raise grants no new credit), so 2000 B of debt is one
+    // second at 2000 B/s, where the old rate would have made it two.
+    let on_b = super::Options::from_tree(
+        &b,
+        Arc::new(crate::compaction::major::Strategy::new(64 * 1024 * 1024)),
+    );
+    assert_eq!(
+        on_b.rate_limiter.acquire_wait(3_000, Duration::ZERO),
+        Duration::from_secs(1),
     );
 
     Ok(())

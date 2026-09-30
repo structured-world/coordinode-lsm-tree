@@ -115,6 +115,24 @@ impl<'a> Ingestion<'a> {
             .data_block_compression_policy
             .get(INITIAL_CANONICAL_LEVEL);
 
+        let bloom_policy = if tree.config.expect_point_read_hits {
+            crate::config::BloomConstructionPolicy::BitsPerKey(0.0)
+        } else if let FilterPolicyEntry::Bloom(p) =
+            tree.config.filter_policy.get(INITIAL_CANONICAL_LEVEL)
+        {
+            p
+        } else {
+            crate::config::BloomConstructionPolicy::BitsPerKey(0.0)
+        };
+        // The caller streams the entries in, so their count is known only
+        // once it tells it (`AnyIngestion::expected_entries`).
+        let filter_sizing = tree.new_data_filter_sizing(
+            INITIAL_CANONICAL_LEVEL,
+            bloom_policy,
+            crate::filter_budget::FilterCount::default(),
+            rc.ecc_scheme,
+        );
+
         // TODO: maybe create a PrepareMultiWriter that can be used by flush, ingest and compaction worker
         let mut writer = MultiWriter::new(
             folder.clone(),
@@ -124,17 +142,8 @@ impl<'a> Ingestion<'a> {
             level_fs.clone(),
         )?
         .set_comparator(tree.config.comparator.clone())
-        .use_bloom_policy({
-            if tree.config.expect_point_read_hits {
-                crate::config::BloomConstructionPolicy::BitsPerKey(0.0)
-            } else if let FilterPolicyEntry::Bloom(p) =
-                tree.config.filter_policy.get(INITIAL_CANONICAL_LEVEL)
-            {
-                p
-            } else {
-                crate::config::BloomConstructionPolicy::BitsPerKey(0.0)
-            }
-        })
+        .use_bloom_policy(bloom_policy)
+        .use_filter_sizing(filter_sizing.clone())
         .use_data_block_size(
             tree.config
                 .data_block_size_policy
@@ -236,7 +245,7 @@ impl<'a> Ingestion<'a> {
             level_fs,
             tree,
             writer,
-            write_pin: crate::runtime_config::WritePin::new(rc),
+            write_pin: crate::runtime_config::WritePin::new(rc).with_filter_sizing(filter_sizing),
             seqno: 0,
             last_key: None,
             #[cfg(feature = "columnar")]
@@ -587,6 +596,7 @@ impl<'a> Ingestion<'a> {
                 read_budget: self.tree.config.columnar_read_budget,
                 #[cfg(feature = "std")]
                 background_deleter: Some(&self.tree.background_deleter),
+                track_filter_probes: self.tree.config.filter_advisor.is_some(),
             });
         }
 

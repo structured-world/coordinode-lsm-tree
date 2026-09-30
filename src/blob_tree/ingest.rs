@@ -283,6 +283,7 @@ impl<'a> BlobIngestion<'a> {
                 read_budget: index.config.columnar_read_budget,
                 #[cfg(feature = "std")]
                 background_deleter: Some(&index.background_deleter),
+                track_filter_probes: index.config.filter_advisor.is_some(),
             });
         }
         // The blob files this ingestion wrote become reachable through the same
@@ -297,6 +298,8 @@ impl<'a> BlobIngestion<'a> {
                 read_budget: index.config.columnar_read_budget,
                 #[cfg(feature = "std")]
                 background_deleter: Some(&index.background_deleter),
+                // A blob file has no filter.
+                track_filter_probes: false,
             });
         }
 

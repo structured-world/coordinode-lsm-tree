@@ -64,10 +64,103 @@ fn drain_blobs<I: Iterator<Item = crate::Result<(ScanEntry, BlobFileId)>>>(
     Ok(())
 }
 
+/// The filter policy of a compaction's destination level: none at the last
+/// level when point reads are expected to hit.
+fn output_bloom_policy(
+    version: &Version,
+    opts: &Options,
+    payload: &CompactionPayload,
+) -> crate::table::filter::BloomConstructionPolicy {
+    use crate::config::FilterPolicyEntry::{Bloom, None};
+    use crate::table::filter::BloomConstructionPolicy;
+
+    #[expect(clippy::cast_possible_truncation, reason = "max key size = u16")]
+    let last_level = (version.level_count() - 1) as u8;
+    if payload.dest_level == last_level && opts.config.expect_point_read_hits {
+        BloomConstructionPolicy::BitsPerKey(0.0)
+    } else {
+        match opts
+            .config
+            .filter_policy
+            .get(usize::from(payload.dest_level))
+        {
+            Bloom(policy) => policy,
+            None => BloomConstructionPolicy::BitsPerKey(0.0),
+        }
+    }
+}
+
+/// Plans the filter widths of a compaction's outputs when the tree allocates
+/// filter memory by probe load. One plan serves every writer of the
+/// compaction, so its sub-compactions draw on one reservation of the budget;
+/// `boundaries` split it into the key ranges they run side by side (none for
+/// a compaction written in one key order); `span` names the keys it writes
+/// when it rewrites only part of its inputs, as a tight-space slice does.
+pub(super) fn plan_filters(
+    version: &Version,
+    opts: &Options,
+    payload: &CompactionPayload,
+    boundaries: &[crate::UserKey],
+    span: Option<(
+        core::ops::Bound<crate::UserKey>,
+        core::ops::Bound<crate::UserKey>,
+    )>,
+    // The compaction's runtime-config snapshot, whose ECC scheme frames the
+    // filter blocks its writers write.
+    rc: &crate::runtime_config::RuntimeConfig,
+) -> Option<crate::filter_budget::FilterPlan> {
+    let advisor = opts.config.filter_advisor.as_ref()?;
+    let inputs = version
+        .iter_tables()
+        .filter(|table| payload.table_ids.contains(&table.id()))
+        .cloned()
+        .collect();
+    let split = (!boundaries.is_empty()).then(|| crate::filter_budget::Split {
+        boundaries: boundaries.to_vec(),
+        comparator: opts.config.comparator.clone(),
+    });
+    let span = span.map(|(lower, upper)| crate::filter_budget::Span {
+        lower,
+        upper,
+        comparator: opts.config.comparator.clone(),
+    });
+    let dst_lvl = payload.canonical_level.into();
+    crate::filter_budget::plan(
+        advisor,
+        &opts.filter_budget,
+        &crate::filter_budget::live(version),
+        crate::filter_budget::Rewrite {
+            inputs,
+            split,
+            span,
+            count: crate::filter_budget::FilterCount::default(),
+            comparator: Some(opts.config.comparator.clone()),
+            framing: crate::filter_budget::Framing {
+                encryption: opts.config.encryption.clone(),
+                ecc: crate::table::writer::resolve_ecc(opts.config.page_ecc, rc.ecc_scheme),
+            },
+        },
+        output_bloom_policy(version, opts, payload),
+        opts.config
+            .filter_block_partitioning_policy
+            .get(dst_lvl)
+            .then(|| opts.config.filter_block_partition_size_policy.get(dst_lvl)),
+    )
+}
+
+#[expect(
+    clippy::too_many_arguments,
+    reason = "each argument is a per-compaction choice its writers share (the filter \
+              plan, the transform counter, the runtime snapshot); bundling them would \
+              only move the list"
+)]
 pub(super) fn prepare_table_writer(
     version: &Version,
     opts: &Options,
     payload: &CompactionPayload,
+    // The compaction's filter plan (see `plan_filters`), shared by all of its
+    // writers; `None` builds every filter at the level's policy.
+    filter_sizing: Option<crate::filter_budget::FilterPlan>,
     // When false, the writer compresses blocks serially. Used by parallel
     // sub-compactions, which already run on the compaction pool: with N ranges
     // occupying the pool's N workers, submitting block jobs there mostly
@@ -168,10 +261,6 @@ pub(super) fn prepare_table_writer(
         table_writer = table_writer.use_partitioned_filter();
     }
 
-    #[expect(clippy::cast_possible_truncation, reason = "max key size = u16")]
-    let last_level = (version.level_count() - 1) as u8;
-    let is_last_level = payload.dest_level == last_level;
-
     let table_writer = table_writer
         .use_data_block_restart_interval(data_block_restart_interval)
         .use_index_block_restart_interval(index_block_restart_interval)
@@ -211,23 +300,8 @@ pub(super) fn prepare_table_writer(
         // migrates segments at the next compaction.
         .delete_strategy(rc.delete_strategy.get(dst_lvl))
         .use_disable_cow_on_sst(rc.disable_cow_on_sst_files)
-        .use_bloom_policy({
-            use crate::config::FilterPolicyEntry::{Bloom, None};
-            use crate::table::filter::BloomConstructionPolicy;
-
-            if is_last_level && opts.config.expect_point_read_hits {
-                BloomConstructionPolicy::BitsPerKey(0.0)
-            } else {
-                match opts
-                    .config
-                    .filter_policy
-                    .get(usize::from(payload.dest_level))
-                {
-                    Bloom(policy) => policy,
-                    None => BloomConstructionPolicy::BitsPerKey(0.0),
-                }
-            }
-        });
+        .use_bloom_policy(output_bloom_policy(version, opts, payload))
+        .use_filter_sizing(filter_sizing);
 
     // Per-KV checksums follow the LIVE runtime config snapshot, so a toggle
     // via `update_runtime_config` migrates data through compaction: each
@@ -321,6 +395,10 @@ pub(super) struct ProducedOutput {
     /// must not raise the retention floor: doing so refuses snapshots whose
     /// data is still on disk.
     collected_below_watermark: bool,
+    /// The filter plan the output was sized by, held until the output is
+    /// installed or dropped: the budget keeps the room its filters take until
+    /// then (see [`crate::filter_budget::FilterSizing::release_replaced`]).
+    filter_sizing: Option<crate::filter_budget::FilterPlan>,
 }
 
 #[cfg_attr(
@@ -408,6 +486,8 @@ impl ProducedOutput {
             // physically removed and no filter acted, so neither of the other
             // two signals catches it: say it here.
             collected_below_watermark: true,
+            // The source's filter is reused verbatim, not sized again.
+            filter_sizing: None,
         }
     }
 }
@@ -450,8 +530,12 @@ pub(super) fn install_merge(
     let mut blob_frag_map = FragmentationMap::default();
     let mut filter_transformed = false;
     let mut collected_below_watermark = false;
+    // Held to the end of the install, success or failure: the filter budget
+    // keeps the outputs' room until then.
+    let mut filter_sizings = Vec::new();
 
     for out in outputs {
+        filter_sizings.extend(out.filter_sizing);
         created_tables.extend(out.created_tables);
         created_blob_files.extend(out.created_blob_files);
         blob_files_to_drop.extend(out.rewritten_blob_files_to_drop);
@@ -492,6 +576,7 @@ pub(super) fn install_merge(
         read_budget: opts.config.columnar_read_budget,
         #[cfg(feature = "std")]
         background_deleter: None,
+        track_filter_probes: opts.config.filter_advisor.is_some(),
     };
     for table in &created_tables {
         table.bind_to_tree(&sinks);
@@ -511,11 +596,36 @@ pub(super) fn install_merge(
         }
     }
 
+    // The outputs take the probe counts of the inputs they replace, by the
+    // range each covers. Read off the payload rather than the outputs' delete
+    // lists, which parallel sub-compactions each fill with the same inputs.
+    if opts.config.filter_advisor.is_some() {
+        let inputs: Vec<Table> = payload
+            .table_ids
+            .iter()
+            .filter_map(|id| current_version.version.get_table(*id).cloned())
+            .collect();
+        crate::table::probe_stats::inherit_into(&created_tables, &inputs).inspect_err(|_| {
+            for table in &created_tables {
+                table.mark_as_deleted();
+            }
+            for blob_file in &created_blob_files {
+                blob_file.mark_as_deleted();
+            }
+        })?;
+    }
+
     // Handles kept for rollback: the output SSTs and blob files are already
     // finalized on disk, so if the version edit fails they must be marked
     // deleted here or they leak (the caller only un-hides the input tables).
     // `created_blob_files` is moved into the closure, so clone for cleanup.
     let rollback_blob_files = created_blob_files.clone();
+    // The version edit drops the inputs' filters from the published figure:
+    // the plans give back their credit for them first, so the budget holds
+    // no fewer bytes than there are at any point of the install.
+    for sizing in &filter_sizings {
+        sizing.release_replaced();
+    }
     super_version
         .upgrade_version(
             &opts.config.path,
@@ -566,6 +676,8 @@ pub(super) fn install_merge(
     for blob_file in blob_files_to_drop {
         blob_file.mark_as_deleted();
     }
+    // The published version now counts the outputs' filters.
+    drop(filter_sizings);
 
     Ok(tables_out)
 }
@@ -732,7 +844,8 @@ impl CompactionFlavour for RelocatingCompaction {
                 // only has the encoded handle). Interruptible so a low
                 // limit can't stall shutdown; the return is ignored because
                 // the blob is already read and must be written to keep the
-                // new vptr valid — only the *wait* is shortened on stop.
+                // new vptr valid — only the *wait* is shortened on stop, and
+                // the debit stays spent for the write that follows.
                 let _ = self
                     .rate_limiter
                     .request_interruptible(blob_entry.value.len() as u64, || {
@@ -813,6 +926,7 @@ impl CompactionFlavour for RelocatingCompaction {
 
         let tables_to_delete = core::mem::take(&mut self.inner.tables_to_rewrite);
 
+        let filter_sizing = self.inner.table_writer.filter_sizing();
         let created_tables = self.inner.consume_writer(opts, dst_lvl)?;
         // The output SSTs are already finalized; if blob finalization fails the
         // compaction aborts, so delete them here or they orphan on disk.
@@ -833,6 +947,7 @@ impl CompactionFlavour for RelocatingCompaction {
             // The producer owns the filter counter and marks this after.
             filter_transformed: false,
             collected_below_watermark: false,
+            filter_sizing,
         })
     }
 }
@@ -927,6 +1042,7 @@ impl CompactionFlavour for StandardCompaction {
         log::debug!("Compaction done in {:?}", self.start.elapsed());
 
         let tables_to_delete = core::mem::take(&mut self.tables_to_rewrite);
+        let filter_sizing = self.table_writer.filter_sizing();
         let created_tables = self.consume_writer(opts, dst_lvl)?;
 
         Ok(ProducedOutput {
@@ -943,6 +1059,7 @@ impl CompactionFlavour for StandardCompaction {
             // The producer owns the filter counter and marks this after.
             filter_transformed: false,
             collected_below_watermark: false,
+            filter_sizing,
         })
     }
 }

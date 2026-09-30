@@ -23,7 +23,7 @@ use crate::{
     range_tombstone::RangeTombstone,
     scan_since::ScanSinceEvent,
     slice::Slice,
-    table::Table,
+    table::{Table, probe_stats::ProbeCounts},
     value::InternalValue,
     version::{SuperVersion, SuperVersions, Version, recovery::recover},
     vlog::BlobFile,
@@ -134,6 +134,10 @@ struct BlockTask<'a> {
     special: bool,
     keys: Vec<usize>,
 }
+
+/// A level's block tasks, and per table the filter probes planning them took,
+/// not yet counted.
+type LevelTasks<'a> = (Vec<BlockTask<'a>>, Vec<(&'a Table, ProbeCounts)>);
 
 impl TablePointLookup for TableEntry {
     fn lookup(
@@ -781,6 +785,28 @@ impl AbstractTree for Tree {
             .sum()
     }
 
+    fn filter_memory(&self) -> crate::FilterMemory {
+        let version = self.current_version();
+        let serialised_bytes = version
+            .iter_tables()
+            .map(|table| u64::from(table.filter_size()))
+            .sum();
+        let budget_bytes = self
+            .config
+            .filter_advisor
+            .as_ref()
+            .map(crate::config::FilterAdvisor::budget_bytes);
+        crate::FilterMemory {
+            serialised_bytes,
+            resident_bytes: version
+                .iter_tables()
+                .map(Table::resident_filter_bytes)
+                .sum(),
+            budget_bytes,
+            over_budget: budget_bytes.is_some_and(|budget| serialised_bytes > budget),
+        }
+    }
+
     fn pinned_block_index_size(&self) -> usize {
         self.current_version()
             .iter_tables()
@@ -800,6 +826,8 @@ impl AbstractTree for Tree {
         &self,
         stream: impl Iterator<Item = crate::Result<InternalValue>>,
         range_tombstones: Vec<crate::range_tombstone::RangeTombstone>,
+        keys: u64,
+        hashes: u64,
     ) -> crate::Result<
         Option<(
             Vec<Table>,
@@ -859,8 +887,9 @@ impl AbstractTree for Tree {
         .use_row_group_size(self.config.columnar_row_group_size_policy.get(0))
         .use_columnar_page_size(self.config.columnar_page_size_policy.get(0))
         .use_column_encoding(self.config.column_encoding_policy.get(0))
-        .use_data_block_hash_ratio(data_block_hash_ratio)
-        .use_bloom_policy({
+        .use_data_block_hash_ratio(data_block_hash_ratio);
+
+        let bloom_policy = {
             use crate::config::FilterPolicyEntry::{Bloom, None};
             use crate::table::filter::BloomConstructionPolicy;
 
@@ -868,7 +897,15 @@ impl AbstractTree for Tree {
                 Bloom(policy) => policy,
                 None => BloomConstructionPolicy::BitsPerKey(0.0),
             }
-        });
+        };
+        table_writer = table_writer.use_bloom_policy(bloom_policy);
+        let filter_sizing = self.new_data_filter_sizing(
+            0,
+            bloom_policy,
+            crate::filter_budget::FilterCount { keys, hashes },
+            rc.ecc_scheme,
+        );
+        table_writer = table_writer.use_filter_sizing(filter_sizing.clone());
 
         if index_partitioning {
             // Size-adaptive: single-level index for small SSTs (where pinning
@@ -915,7 +952,7 @@ impl AbstractTree for Tree {
                 )
                 .use_zstd_two_pass_seed(rc.zstd_two_pass_seed);
         }
-        let write_pin = crate::runtime_config::WritePin::new(&rc);
+        let write_pin = crate::runtime_config::WritePin::new(&rc).with_filter_sizing(filter_sizing);
 
         // Parallel block compression for the flush writer, on the same pool the
         // compaction writers use. Engaged only when the per-block transform does
@@ -1014,6 +1051,7 @@ impl AbstractTree for Tree {
             read_budget: self.config.columnar_read_budget,
             #[cfg(feature = "std")]
             background_deleter: Some(&self.background_deleter),
+            track_filter_probes: self.config.filter_advisor.is_some(),
         };
         for table in tables {
             table.bind_to_tree(&sinks);
@@ -1194,7 +1232,6 @@ impl AbstractTree for Tree {
         range: R,
         seqno: SeqNo,
     ) -> crate::Result<crate::ApproximateRangeStats> {
-        use crate::table::block_index::BlockIndex;
         use core::ops::Bound;
 
         // A query planner asks for this estimate as part of the query it
@@ -1273,55 +1310,14 @@ impl AbstractTree for Tree {
                 continue;
             }
 
-            // data_end = the data section's byte extent = last data block's end.
-            let Some(last) = table.block_index.iter().next_back() else {
+            // A restricted view's punched-out prefix is served by its
+            // replacement table, so the span starts past it and the prefix is
+            // not double-counted (matching how scans skip it).
+            let Some(span) = table.data_span(bounds, table_seqno, crate::table::SpanEdge::Whole)?
+            else {
                 continue;
             };
-            let last = last?;
-            let data_end = *last.offset() + u64::from(last.size());
-            if data_end == 0 {
-                continue;
-            }
-
-            // The data block that would contain `key`, as (start, end) byte
-            // offsets, or `None` when `key` is past the last block. The full
-            // extent is returned so the lower bound counts from the block start
-            // and the upper bound INCLUDES it (a range inside a single block must
-            // not collapse to zero bytes).
-            let block_span = |key: &[u8]| -> crate::Result<Option<(u64, u64)>> {
-                let Some(mut iter) = table.block_index.forward_reader(key, table_seqno) else {
-                    return Ok(None);
-                };
-                let Some(handle) = iter.next() else {
-                    return Ok(None);
-                };
-                let h = handle?;
-                let start = *h.offset();
-                Ok(Some((start, (start + u64::from(h.size())).min(data_end))))
-            };
-            let off_lo = match lo {
-                Bound::Included(k) | Bound::Excluded(k) => {
-                    block_span(k)?.map_or(data_end, |(start, _)| start)
-                }
-                Bound::Unbounded => 0,
-            };
-            // Tight-space restriction: a restricted table view serves only keys
-            // at or above its lower bound, with the punched-out prefix served by
-            // the replacement table. Raise the lower offset to that bound so the
-            // prefix is not double-counted (matching how scans skip it).
-            let off_lo = match table.restrict_lower_bound() {
-                Some(rb) => {
-                    off_lo.max(block_span(rb.as_ref())?.map_or(data_end, |(start, _)| start))
-                }
-                None => off_lo,
-            };
-            let off_hi = match hi {
-                Bound::Included(k) | Bound::Excluded(k) => {
-                    block_span(k)?.map_or(data_end, |(_, end)| end)
-                }
-                Bound::Unbounded => data_end,
-            };
-            let idx_bytes = off_hi.saturating_sub(off_lo);
+            let (idx_bytes, data_end) = (span.covered, span.data_end);
             if idx_bytes == 0 {
                 continue;
             }
@@ -1671,6 +1667,10 @@ impl AbstractTree for Tree {
             .retention_floor()
     }
 
+    fn compaction_rate_limiter(&self) -> Arc<crate::rate_limiter::RateLimiter> {
+        Arc::clone(&self.compaction_rate_limiter)
+    }
+
     fn get<K: AsRef<[u8]>>(&self, key: K, seqno: SeqNo) -> crate::Result<Option<UserValue>> {
         let key = key.as_ref();
 
@@ -1862,6 +1862,46 @@ impl AbstractTree for Tree {
 }
 
 impl Tree {
+    /// The filter plan of new data written into tables under the policies of
+    /// `level`, as a flush or an ingestion writes it: at most `count` keys and
+    /// filter hashes (zero when unknown) under `bloom_policy`. `None` without
+    /// an advisor.
+    /// New data has no probe history of its own: its filters are sized by the
+    /// load the live tables draw per key, and room is kept for every table the
+    /// write fills. The plan is held until the tables are installed (see
+    /// `WritePin`).
+    ///
+    /// `ecc_scheme` is the one the write's runtime snapshot frames its blocks
+    /// under.
+    pub(crate) fn new_data_filter_sizing(
+        &self,
+        level: usize,
+        bloom_policy: crate::table::filter::BloomConstructionPolicy,
+        count: crate::filter_budget::FilterCount,
+        ecc_scheme: crate::runtime_config::EccScheme,
+    ) -> Option<crate::filter_budget::FilterPlan> {
+        let advisor = self.config.filter_advisor.as_ref()?;
+        let version = self.current_version();
+        crate::filter_budget::plan(
+            advisor,
+            &self.filter_budget,
+            &crate::filter_budget::live(&version),
+            crate::filter_budget::Rewrite {
+                count,
+                framing: crate::filter_budget::Framing {
+                    encryption: self.config.encryption.clone(),
+                    ecc: crate::table::writer::resolve_ecc(self.config.page_ecc, ecc_scheme),
+                },
+                ..crate::filter_budget::Rewrite::default()
+            },
+            bloom_policy,
+            self.config
+                .filter_block_partitioning_policy
+                .get(level)
+                .then(|| self.config.filter_block_partition_size_policy.get(level)),
+        )
+    }
+
     /// Stores `dict` in the tree and records it in the current version, so it
     /// resolves after a reopen with no dictionary supplied in the config.
     ///
@@ -3836,7 +3876,9 @@ impl Tree {
 
     /// Plans every data block this level's SSTs will read for `remaining`,
     /// grouping keys by covering table per run (mirrors `resolve_run_batched`'s
-    /// walk). Each task carries the ORIGINAL key indices (into `keys`).
+    /// walk). Each task carries the ORIGINAL key indices (into `keys`). The
+    /// filter probes of the plan come back per table, uncounted: the caller
+    /// counts them only if it answers from this plan.
     ///
     /// # Errors
     ///
@@ -3852,8 +3894,9 @@ impl Tree {
         keys: &[K],
         seqno: SeqNo,
         comparator: &dyn crate::comparator::UserComparator,
-    ) -> crate::Result<Vec<BlockTask<'a>>> {
+    ) -> crate::Result<LevelTasks<'a>> {
         let mut tasks: Vec<BlockTask<'a>> = Vec::new();
+        let mut probes: Vec<(&'a Table, ProbeCounts)> = Vec::new();
         // Reused across the level's tables, cleared per table: both are read by
         // the plan below and are done with before the next table fills them.
         let mut batch: Vec<(&[u8], u64)> = Vec::new();
@@ -3882,9 +3925,12 @@ impl Tree {
                         _ => break,
                     }
                 }
-                if let Some((file, table_seqno, special, blocks)) =
-                    table.plan_block_tasks(&batch, seqno)?
-                {
+                let mut tally = ProbeCounts::default();
+                let plan = table.plan_block_tasks(&batch, seqno, &mut tally)?;
+                if tally != ProbeCounts::default() {
+                    probes.push((table, tally));
+                }
+                if let Some((file, table_seqno, special, blocks)) = plan {
                     for (handle, positions) in blocks {
                         let task_keys: Vec<usize> =
                             positions.iter().map(|&pos| batch_idx[pos]).collect();
@@ -3900,7 +3946,7 @@ impl Tree {
                 }
             }
         }
-        Ok(tasks)
+        Ok((tasks, probes))
     }
 
     /// Resolves an ENTIRE level by reading its blocks in chunks into a scratch and
@@ -3923,7 +3969,8 @@ impl Tree {
         comparator: &dyn crate::comparator::UserComparator,
         results: &mut [Option<InternalValue>],
     ) -> crate::Result<bool> {
-        let tasks = Self::plan_level_block_tasks(level, still_remaining, keys, seqno, comparator)?;
+        let (tasks, probes) =
+            Self::plan_level_block_tasks(level, still_remaining, keys, seqno, comparator)?;
         let Some(first) = tasks.first() else {
             return Ok(false);
         };
@@ -3935,11 +3982,25 @@ impl Tree {
         if tasks.iter().any(|t| t.special) {
             return Ok(false);
         }
+        // This resolve answers the level from its plan: its filter probes are
+        // the level's, where a level handed back is probed and counted by the
+        // serial resolve instead.
+        for (table, counts) in probes {
+            table.count_probes(counts);
+        }
         // Read blocks in chunks of at most half the shared cache, so a chunk's
         // scratch never dwarfs the cache it is meant to spare. `.max(1)` keeps the
         // chunk loop's `end > start` guard the sole progress condition when the
         // cache is disabled (capacity 0).
         let budget = (first.table.cache_capacity() / 2).max(1);
+        // The (table, key) pairs a read found, when some table counts its
+        // filter probes: a key whose version may continue past a block's end
+        // is read in that block and the next, so a miss is a pair no read of
+        // it found, not one block that came back empty.
+        let mut found: Option<Vec<(crate::TableId, usize)>> = tasks
+            .iter()
+            .any(|task| task.table.probe_stats().is_some())
+            .then(Vec::new);
 
         let mut start = 0;
         while start < tasks.len() {
@@ -3953,11 +4014,41 @@ impl Tree {
                 bytes += sz;
                 end += 1;
             }
-            Self::resolve_block_task_chunk(&tasks[start..end], keys, results)?;
+            Self::resolve_block_task_chunk(&tasks[start..end], keys, results, found.as_mut())?;
             start = end;
+        }
+        if let Some(found) = found {
+            Self::count_chunked_false_positives(&tasks, found);
         }
         still_remaining.retain(|&(idx, _)| results[idx].is_none());
         Ok(true)
+    }
+
+    /// Counts, once per (table, key), the keys a table's filter let through
+    /// that no read of that table found.
+    #[expect(
+        clippy::indexing_slicing,
+        reason = "task indices come from enumerating `tasks`"
+    )]
+    fn count_chunked_false_positives(
+        tasks: &[BlockTask<'_>],
+        mut found: Vec<(crate::TableId, usize)>,
+    ) {
+        found.sort_unstable();
+        found.dedup();
+        let mut missed: Vec<(crate::TableId, usize, usize)> = tasks
+            .iter()
+            .enumerate()
+            .filter(|(_, task)| task.table.probe_stats().is_some() && task.table.has_filter())
+            .flat_map(|(at, task)| task.keys.iter().map(move |&key| (task.table.id(), key, at)))
+            .filter(|&(table, key, _)| found.binary_search(&(table, key)).is_err())
+            .collect();
+        missed.sort_unstable_by_key(|&(table, key, _)| (table, key));
+        missed.dedup_by_key(|&mut (table, key, _)| (table, key));
+        for (_, _, at) in missed {
+            let task = &tasks[at];
+            task.table.count_false_positive(task.table_seqno);
+        }
     }
 
     /// Reads one chunk of block-tasks in ONE cross-file `read_blocks_batched`,
@@ -3968,6 +4059,7 @@ impl Tree {
         chunk: &[BlockTask<'_>],
         keys: &[K],
         results: &mut [Option<InternalValue>],
+        found: Option<&mut Vec<(crate::TableId, usize)>>,
     ) -> crate::Result<()> {
         let mut buffers: Vec<Vec<u8>> = chunk
             .iter()
@@ -4058,6 +4150,12 @@ impl Tree {
         }
         // A task holds each key once, so only the order across tasks matters.
         hits.sort_unstable_by_key(|&(task, _, _)| task);
+        if let Some(found) = found {
+            found.extend(
+                hits.iter()
+                    .filter_map(|&(task, kidx, _)| Some((chunk.get(task)?.table.id(), kidx))),
+            );
+        }
         for (_, kidx, item) in hits {
             Self::keep_highest(results, kidx, item);
         }
@@ -5114,15 +5212,19 @@ impl Tree {
         // move.
         let initial_runtime = config.initial_runtime_config.clone();
         let sync_mode = config.sync_mode;
-        // Same reason: read before the move.
-        let compaction_rate_limit = config.compaction_rate_limit;
-        let super_versions = SuperVersions::new(
+        // Same reason: built before the move.
+        let compaction_rate_limiter = config.tree_compaction_rate_limiter();
+        let filter_budget = Arc::<crate::filter_budget::FilterBudget>::default();
+        let mut super_versions = SuperVersions::new(
             version,
             &comparator,
             sync_mode,
             snapshot_id,
             config.manifest_log_rotate_bytes,
         );
+        if config.filter_advisor.is_some() {
+            super_versions = super_versions.with_filter_budget(Arc::clone(&filter_budget));
+        }
         #[cfg(feature = "std")]
         let latest_super_version = super_versions.latest_handle();
         let inner = TreeInner {
@@ -5144,9 +5246,8 @@ impl Tree {
             #[cfg(feature = "std")]
             background_deleter: Arc::clone(&background_deleter),
             heal_hints: Arc::clone(&heal_hints),
-            compaction_rate_limiter: Arc::new(crate::rate_limiter::RateLimiter::new(
-                compaction_rate_limit,
-            )),
+            filter_budget,
+            compaction_rate_limiter,
             kv_digest_at_insert: portable_atomic::AtomicU8::new(inner::kv_digest_at_insert_gate(
                 &initial_runtime,
             )),
@@ -5180,6 +5281,7 @@ impl Tree {
             read_budget: inner.config.columnar_read_budget,
             #[cfg(feature = "std")]
             background_deleter: Some(&background_deleter),
+            track_filter_probes: inner.config.filter_advisor.is_some(),
         };
         for table in &recovered_tables {
             table.bind_to_tree(&sinks);
@@ -6260,3 +6362,9 @@ mod partition_size_tests;
 
 #[cfg(all(test, feature = "std"))]
 mod chunk_order_tests;
+
+#[cfg(all(test, feature = "std"))]
+mod probe_stats_tests;
+
+#[cfg(all(test, feature = "std"))]
+mod filter_advisor_tests;
