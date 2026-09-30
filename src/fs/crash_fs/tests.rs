@@ -87,71 +87,73 @@ fn a_rename_without_a_directory_sync_is_lost() {
     );
 }
 
-/// A directory sync makes durable the entries it saw, not a later entry at the
-/// same path: an entry removed and made again while the sync runs was made
-/// after the barrier, so it stays pending and a crash removes it.
+/// Every operation that makes or removes a directory entry, and a directory
+/// sync, runs with the namespace held, so none lands inside another: not a
+/// creation between a sync's backend call and what the sync is credited
+/// with, not a removal between an open's existence probe and the open, not a
+/// new entry at a renamed-away path before the rename checks it. Each waits
+/// while another holds the namespace.
 #[test]
-fn an_entry_made_again_while_its_directory_syncs_stays_pending() {
+fn namespace_operations_wait_for_one_in_flight() {
     let fs = CrashFs::new(MemFs::new());
     fs.create_dir_all(Path::new("/d")).unwrap();
-    let write = |bytes: &[u8]| {
+    for name in ["/d/gone", "/d/src", "/d/linked"] {
         let mut f = fs
             .open(
-                Path::new("/d/a"),
-                &FsOpenOptions::new().write(true).create(true).truncate(true),
+                Path::new(name),
+                &FsOpenOptions::new().write(true).create(true),
             )
             .unwrap();
-        f.write_all(bytes).unwrap();
-        f.sync_all().unwrap();
-    };
-    write(b"first");
+        f.write_all(b"x").unwrap();
+    }
 
-    // The sync of /d starts: it takes the entries it will make durable.
-    let seen = fs.entries_of(Path::new("/d"));
-    // While it runs, the entry is removed and made again.
-    fs.remove_file(Path::new("/d/a")).unwrap();
-    write(b"second");
-    // The sync returns.
-    fs.entries_synced(&seen);
-
-    fs.crash();
-    assert!(
-        !fs.exists(Path::new("/d/a")).unwrap(),
-        "an entry made after the directory sync began is not durable"
-    );
-}
-
-/// A directory sync takes its snapshot only once no entry-making operation is
-/// between its backend call and its registration: an entry the backend
-/// already made is then in the snapshot, instead of being left pending and
-/// removed by a crash though the sync covered it.
-#[test]
-fn a_directory_sync_waits_for_an_entry_being_registered() {
-    let fs = CrashFs::new(MemFs::new());
-    fs.create_dir_all(Path::new("/d")).unwrap();
-
-    // An entry-making operation in flight: past its backend call, not yet
-    // registered.
-    let in_flight = fs.entry_order.read();
-    let (done_tx, done_rx) = std::sync::mpsc::channel();
-    let syncer = {
-        let fs = fs.clone();
-        std::thread::spawn(move || {
+    type Operation = (&'static str, fn(&CrashFs));
+    let operations: [Operation; 6] = [
+        ("directory sync", |fs| {
             fs.sync_directory(Path::new("/d")).unwrap();
-            done_tx.send(()).unwrap();
-        })
-    };
-    assert!(
+        }),
+        ("create", |fs| {
+            fs.open(
+                Path::new("/d/new"),
+                &FsOpenOptions::new().write(true).create(true),
+            )
+            .unwrap();
+        }),
+        ("remove", |fs| fs.remove_file(Path::new("/d/gone")).unwrap()),
+        ("rename", |fs| {
+            fs.rename(Path::new("/d/src"), Path::new("/d/moved"))
+                .unwrap();
+        }),
+        ("hard link", |fs| {
+            fs.hard_link(Path::new("/d/linked"), Path::new("/d/link"))
+                .unwrap();
+        }),
+        ("directory removal", |fs| {
+            fs.remove_dir_all(Path::new("/d")).unwrap();
+        }),
+    ];
+    for (name, operation) in operations {
+        let held = fs.namespace.lock();
+        let (done_tx, done_rx) = std::sync::mpsc::channel();
+        let worker = {
+            let fs = fs.clone();
+            std::thread::spawn(move || {
+                operation(&fs);
+                done_tx.send(()).unwrap();
+            })
+        };
+        assert!(
+            done_rx
+                .recv_timeout(std::time::Duration::from_millis(200))
+                .is_err(),
+            "{name} must wait while the namespace is held"
+        );
+        drop(held);
         done_rx
-            .recv_timeout(std::time::Duration::from_millis(200))
-            .is_err(),
-        "the sync snapshot must wait for the operation in flight"
-    );
-    drop(in_flight);
-    done_rx
-        .recv_timeout(std::time::Duration::from_secs(5))
-        .expect("the sync proceeds once the operation registered its entry");
-    syncer.join().unwrap();
+            .recv_timeout(std::time::Duration::from_secs(5))
+            .unwrap_or_else(|_| panic!("{name} proceeds once the namespace is free"));
+        worker.join().unwrap();
+    }
 }
 
 /// A rename onto its own path changes nothing on disk (POSIX rename(2): same

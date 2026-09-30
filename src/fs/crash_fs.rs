@@ -33,7 +33,10 @@
 //! even when its content was synced. Removed entries are not brought back, and
 //! directories themselves are not rolled back. A directory is matched by the
 //! path it is named with: an entry made through one spelling of a directory
-//! and synced through another (a symlink, `..`) stays pending.
+//! and synced through another (a symlink, `..`) stays pending. Operations
+//! that make or remove entries, and directory syncs, are linearized: each
+//! happens wholly before or wholly after any other, so an entry is made
+//! either before a sync that then covers it or after one that does not.
 //!
 //! This is a test/dev surface: it is gated behind the `std` feature and is not
 //! part of the production storage path.
@@ -70,23 +73,8 @@ struct CrashState {
     /// `crash()` visits these (plus `durable` keys) to roll back or remove.
     touched: HashSet<PathBuf>,
     /// Paths whose directory entry was made this run and whose parent
-    /// directory has not been synced since: `crash()` removes them. Each maps
-    /// to the generation it was made in, so a sync clears only the entries it
-    /// saw and not one made again at the same path while it ran.
-    pending_entries: HashMap<PathBuf, u64>,
-    /// Generation of the last entry made.
-    entry_generation: u64,
-}
-
-impl CrashState {
-    /// Records a new directory entry at `path`, durable once its directory is
-    /// synced.
-    fn mark_pending(&mut self, path: &Path) {
-        // One step per entry made in a run: a u64 does not wrap.
-        self.entry_generation += 1;
-        self.pending_entries
-            .insert(path.to_path_buf(), self.entry_generation);
-    }
+    /// directory has not been synced since: `crash()` removes them.
+    pending_entries: HashSet<PathBuf>,
 }
 
 /// A power-loss crash simulator wrapping an inner [`Fs`].
@@ -99,11 +87,15 @@ impl CrashState {
 pub struct CrashFs {
     inner: Arc<dyn Fs>,
     state: Arc<spin::Mutex<CrashState>>,
-    /// Orders entry-making operations against directory-sync snapshots: an
-    /// operation holds it shared from the backend call until its entry is
-    /// registered, a sync takes it exclusively to snapshot. An entry the
-    /// backend made before a snapshot is then always in it.
-    entry_order: Arc<spin::RwLock<()>>,
+    /// Linearizes the namespace: every operation that makes or removes a
+    /// directory entry holds it from its checks through the backend call to
+    /// the state it records, and a directory sync holds it from the backend
+    /// sync to clearing what that sync made durable. An entry is then made
+    /// either before a sync, and covered by it, or after, and pending; and
+    /// whether an open or a rename made an entry is decided by probes no
+    /// other entry change can interleave with. Blocking, not spinning: a
+    /// directory sync holds it across a system call.
+    namespace: Arc<parking_lot::Mutex<()>>,
 }
 
 impl CrashFs {
@@ -121,7 +113,7 @@ impl CrashFs {
         Self {
             inner,
             state: Arc::new(spin::Mutex::new(CrashState::default())),
-            entry_order: Arc::new(spin::RwLock::new(())),
+            namespace: Arc::new(parking_lot::Mutex::new(())),
         }
     }
 
@@ -146,11 +138,7 @@ impl CrashFs {
         let mut state = self.state.lock();
         // An entry its directory never made durable is lost with whatever
         // content it had.
-        let lost: Vec<PathBuf> = state
-            .pending_entries
-            .drain()
-            .map(|(path, _)| path)
-            .collect();
+        let lost: Vec<PathBuf> = state.pending_entries.drain().collect();
         for path in &lost {
             state.durable.remove(path);
             state.touched.insert(path.clone());
@@ -245,38 +233,27 @@ impl CrashFs {
     /// Records that `path` got a new directory entry, durable once its parent
     /// directory is synced.
     fn new_entry(&self, path: &Path) {
-        self.state.lock().mark_pending(path);
+        self.state.lock().pending_entries.insert(path.to_path_buf());
     }
 
-    /// The pending entries of `directory` with their generations, taken
-    /// before a sync of it: the ones that sync makes durable. An entry made
-    /// while the sync runs, at a new path or again at one of these, is left
-    /// for the next one.
-    fn entries_of(&self, directory: &Path) -> Vec<(PathBuf, u64)> {
-        // Waits out entry-making operations in flight, so one whose backend
-        // call already made the entry is registered before the snapshot.
-        let _order = self.entry_order.write();
+    /// Runs the backend sync of `directory` and then makes its pending
+    /// entries durable, with the namespace held throughout: no entry can be
+    /// made or removed between the backend sync and what it is credited with.
+    fn sync_entries_of(
+        &self,
+        directory: &Path,
+        sync: impl FnOnce() -> io::Result<()>,
+    ) -> io::Result<()> {
+        let _namespace = self.namespace.lock();
+        sync()?;
         // Directories are matched by spelling: an entry made through one
         // spelling of a directory and synced through another (a symlink,
         // `..`) stays pending. The engine names both from its tree folder.
         self.state
             .lock()
             .pending_entries
-            .iter()
-            .filter(|(entry, _)| crate::file::entry_directory(entry) == directory)
-            .map(|(entry, generation)| (entry.clone(), *generation))
-            .collect()
-    }
-
-    /// Makes `entries` durable, after a sync of their directory: each one
-    /// that is still the generation the sync saw.
-    fn entries_synced(&self, entries: &[(PathBuf, u64)]) {
-        let mut state = self.state.lock();
-        for (entry, generation) in entries {
-            if state.pending_entries.get(entry) == Some(generation) {
-                state.pending_entries.remove(entry);
-            }
-        }
+            .retain(|entry| crate::file::entry_directory(entry) != directory);
+        Ok(())
     }
 
     /// Records the destination of a copy-style op (`hard_link` / `reflink`): it
@@ -307,7 +284,7 @@ impl CrashFs {
             state.durable.insert(dst.to_path_buf(), bytes);
         }
         state.touched.insert(dst.to_path_buf());
-        state.mark_pending(dst);
+        state.pending_entries.insert(dst.to_path_buf());
         Ok(())
     }
 }
@@ -315,19 +292,22 @@ impl CrashFs {
 impl Fs for CrashFs {
     fn open(&self, path: &Path, opts: &FsOpenOptions) -> io::Result<Box<dyn FsFile>> {
         let writable = opts.write || opts.create || opts.create_new || opts.append || opts.truncate;
-        let creates = (opts.create || opts.create_new) && !self.inner.exists(path)?;
+        // An open that may create holds the namespace from the probe to the
+        // registration, so whether it made the entry is what the open did.
+        let may_create = opts.create || opts.create_new;
+        let namespace = may_create.then(|| self.namespace.lock());
+        let creates = may_create && !self.inner.exists(path)?;
         if writable {
             // Capture the pre-existing durable image BEFORE the open (which may
             // truncate); a brand-new file captures nothing, so a crash before its
             // first sync removes it.
             self.capture_first_touch(path)?;
         }
-        let order = creates.then(|| self.entry_order.read());
         let inner = self.inner.open(path, opts)?;
         if creates {
             self.new_entry(path);
         }
-        drop(order);
+        drop(namespace);
         Ok(Box::new(CrashFile {
             inner,
             path: path.to_path_buf(),
@@ -349,6 +329,7 @@ impl Fs for CrashFs {
     }
 
     fn remove_file(&self, path: &Path) -> io::Result<()> {
+        let _namespace = self.namespace.lock();
         self.inner.remove_file(path)?;
         let mut state = self.state.lock();
         state.durable.remove(path);
@@ -358,6 +339,7 @@ impl Fs for CrashFs {
     }
 
     fn remove_dir_all(&self, path: &Path) -> io::Result<()> {
+        let _namespace = self.namespace.lock();
         self.inner.remove_dir_all(path)?;
         // Purge crash state for every tracked path under the removed directory,
         // so crash() neither resurrects nor panics recreating a file whose
@@ -365,7 +347,7 @@ impl Fs for CrashFs {
         let mut state = self.state.lock();
         state.durable.retain(|k, _| !k.starts_with(path));
         state.touched.retain(|k| !k.starts_with(path));
-        state.pending_entries.retain(|k, _| !k.starts_with(path));
+        state.pending_entries.retain(|k| !k.starts_with(path));
         Ok(())
     }
 
@@ -374,12 +356,14 @@ impl Fs for CrashFs {
     }
 
     fn rename(&self, from: &Path, to: &Path) -> io::Result<()> {
-        let _order = self.entry_order.read();
+        let _namespace = self.namespace.lock();
         self.inner.rename(from, to)?;
         // POSIX rename(2): when both names refer to the same file (one path,
         // or two hard links of one inode) the call succeeds and changes
         // nothing, so `from` is still there and the crash state stays as it
-        // was. A probe that fails is read as an ordinary rename.
+        // was. The namespace is held, so no other operation can have made
+        // `from` again since the rename. A probe that fails is read as an
+        // ordinary rename.
         if from == to || matches!(self.inner.exists(from), Ok(true)) {
             return Ok(());
         }
@@ -401,7 +385,7 @@ impl Fs for CrashFs {
         }
         // The destination's entry is new until its directory is synced.
         state.pending_entries.remove(from);
-        state.mark_pending(to);
+        state.pending_entries.insert(to.to_path_buf());
         Ok(())
     }
 
@@ -410,17 +394,11 @@ impl Fs for CrashFs {
     }
 
     fn sync_directory(&self, path: &Path) -> io::Result<()> {
-        let entries = self.entries_of(path);
-        self.inner.sync_directory(path)?;
-        self.entries_synced(&entries);
-        Ok(())
+        self.sync_entries_of(path, || self.inner.sync_directory(path))
     }
 
     fn sync_directory_with(&self, path: &Path, mode: SyncMode) -> io::Result<()> {
-        let entries = self.entries_of(path);
-        self.inner.sync_directory_with(path, mode)?;
-        self.entries_synced(&entries);
-        Ok(())
+        self.sync_entries_of(path, || self.inner.sync_directory_with(path, mode))
     }
 
     fn exists(&self, path: &Path) -> io::Result<bool> {
@@ -428,7 +406,7 @@ impl Fs for CrashFs {
     }
 
     fn hard_link(&self, src: &Path, dst: &Path) -> io::Result<()> {
-        let _order = self.entry_order.read();
+        let _namespace = self.namespace.lock();
         self.inner.hard_link(src, dst)?;
         self.track_copy(src, dst)?;
         Ok(())
@@ -458,7 +436,7 @@ impl Fs for CrashFs {
     }
 
     fn reflink_file(&self, src: &Path, dst: &Path) -> io::Result<()> {
-        let _order = self.entry_order.read();
+        let _namespace = self.namespace.lock();
         self.inner.reflink_file(src, dst)?;
         self.track_copy(src, dst)?;
         Ok(())
