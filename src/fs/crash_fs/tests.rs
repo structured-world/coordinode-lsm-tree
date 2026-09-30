@@ -14,6 +14,134 @@ fn read(fs: &dyn Fs, path: &str) -> Vec<u8> {
     buf
 }
 
+/// With directory entries tracked, a new file's entry is durable only once
+/// its directory is synced: a file whose content was synced but whose
+/// directory never was is lost, and a sync of another directory does not
+/// save it.
+#[test]
+fn a_synced_file_in_an_unsynced_directory_is_lost() {
+    let fs = CrashFs::new(MemFs::new()).tracking_directory_entries();
+    fs.create_dir_all(Path::new("/d")).unwrap();
+    fs.create_dir_all(Path::new("/e")).unwrap();
+
+    let mut f = fs
+        .open(
+            Path::new("/d/a"),
+            &FsOpenOptions::new().write(true).create(true),
+        )
+        .unwrap();
+    f.write_all(b"synced").unwrap();
+    f.sync_all().unwrap();
+    drop(f);
+    fs.sync_directory(Path::new("/e")).unwrap();
+
+    fs.crash();
+    assert!(
+        !fs.exists(Path::new("/d/a")).unwrap(),
+        "a file whose directory entry was never synced does not survive a crash"
+    );
+}
+
+/// With directory entries tracked, a rename's new name is an entry of its
+/// own: without a sync of its directory it is lost.
+#[test]
+fn a_rename_without_a_directory_sync_is_lost() {
+    let fs = CrashFs::new(MemFs::new()).tracking_directory_entries();
+    fs.create_dir_all(Path::new("/d")).unwrap();
+
+    let mut f = fs
+        .open(
+            Path::new("/d/src"),
+            &FsOpenOptions::new().write(true).create(true),
+        )
+        .unwrap();
+    f.write_all(b"data").unwrap();
+    f.sync_all().unwrap();
+    drop(f);
+    fs.sync_directory(Path::new("/d")).unwrap();
+    fs.rename(Path::new("/d/src"), Path::new("/d/dst")).unwrap();
+
+    fs.crash();
+    assert!(
+        !fs.exists(Path::new("/d/dst")).unwrap(),
+        "a renamed-to name whose directory was not synced does not survive a crash"
+    );
+}
+
+/// The blob files a flush and an ingestion write survive a power loss once
+/// the write returns: the manifest that names them must not outlive them.
+#[test]
+fn blob_files_of_an_acknowledged_write_survive_a_crash() -> crate::Result<()> {
+    use crate::{AbstractTree, KvSeparationOptions, SequenceNumberCounter};
+
+    let crash = CrashFs::new(MemFs::new()).tracking_directory_entries();
+    let open = |fs: Arc<dyn Fs>| {
+        crate::Config::new(
+            "/db",
+            SequenceNumberCounter::default(),
+            SequenceNumberCounter::default(),
+        )
+        .with_kv_separation(Some(KvSeparationOptions::default().separation_threshold(1)))
+        .with_shared_fs(fs)
+        .open()
+    };
+
+    {
+        let tree = open(Arc::new(crash.clone()))?;
+        tree.insert("flushed", "blob value of a flush", 0);
+        tree.flush_active_memtable(0)?;
+        let mut ingestion = tree.ingestion()?;
+        ingestion.write("ingested", "blob value of an ingestion")?;
+        ingestion.finish()?;
+    }
+
+    crash.crash();
+
+    let tree = open(crash.inner())?;
+    assert_eq!(
+        tree.get("flushed", u64::MAX)?.as_deref(),
+        Some(&b"blob value of a flush"[..]),
+    );
+    assert_eq!(
+        tree.get("ingested", u64::MAX)?.as_deref(),
+        Some(&b"blob value of an ingestion"[..]),
+    );
+    Ok(())
+}
+
+/// The manifest's edit log, created by the first flush after a snapshot,
+/// survives a power loss with the flushes it recorded.
+#[test]
+fn the_edit_log_of_acknowledged_flushes_survives_a_crash() -> crate::Result<()> {
+    use crate::{AbstractTree, SequenceNumberCounter};
+
+    let crash = CrashFs::new(MemFs::new()).tracking_directory_entries();
+    let open = |fs: Arc<dyn Fs>| {
+        crate::Config::new(
+            "/db",
+            SequenceNumberCounter::default(),
+            SequenceNumberCounter::default(),
+        )
+        .with_shared_fs(fs)
+        .open()
+    };
+
+    {
+        let tree = open(Arc::new(crash.clone()))?;
+        tree.insert("a", "1", 0);
+        tree.flush_active_memtable(0)?;
+        tree.insert("b", "2", 1);
+        tree.flush_active_memtable(0)?;
+    }
+
+    crash.crash();
+
+    let tree = open(crash.inner())?;
+    assert!(tree.contains_key("a", u64::MAX)?);
+    assert!(tree.contains_key("b", u64::MAX)?);
+    Ok(())
+}
+
 #[test]
 fn synced_content_survives_crash() {
     let fs = CrashFs::new(MemFs::new());

@@ -64,6 +64,12 @@ struct CrashState {
     /// Every path opened for writing this run, whether or not yet synced.
     /// `crash()` visits these (plus `durable` keys) to roll back or remove.
     touched: HashSet<PathBuf>,
+    /// Whether directory entries are tracked (see
+    /// [`CrashFs::tracking_directory_entries`]).
+    track_entries: bool,
+    /// Paths whose directory entry was made this run and whose parent
+    /// directory has not been synced since: `crash()` removes them.
+    pending_entries: HashSet<PathBuf>,
 }
 
 /// A power-loss crash simulator wrapping an inner [`Fs`].
@@ -96,6 +102,17 @@ impl CrashFs {
         }
     }
 
+    /// Also models directory entries: a created file, a rename's destination,
+    /// a hard link or a reflink is durable only once its parent directory is
+    /// synced, as POSIX promises, and [`Self::crash`] removes one whose
+    /// directory never was, even when its content was synced.
+    #[cfg(test)]
+    #[must_use]
+    pub(crate) fn tracking_directory_entries(self) -> Self {
+        self.state.lock().track_entries = true;
+        self
+    }
+
     /// Returns a clone of the wrapped backend handle, for reopening the engine
     /// on the same store after a [`crash`](Self::crash).
     #[must_use]
@@ -115,6 +132,13 @@ impl CrashFs {
     /// surfaced loudly rather than swallowed. In-memory backends never hit this.
     pub fn crash(&self) {
         let mut state = self.state.lock();
+        // An entry its directory never made durable is lost with whatever
+        // content it had.
+        let lost: Vec<PathBuf> = state.pending_entries.drain().collect();
+        for path in &lost {
+            state.durable.remove(path);
+            state.touched.insert(path.clone());
+        }
         // Visit every path we wrote, plus any durable path (defensive: a file
         // synced in a prior life but only read this run still gets its durable
         // image reasserted).
@@ -202,6 +226,23 @@ impl CrashFs {
         Ok(())
     }
 
+    /// Records that `path` got a new directory entry, durable once its parent
+    /// directory is synced, when entries are tracked.
+    fn new_entry(&self, path: &Path) {
+        let mut state = self.state.lock();
+        if state.track_entries {
+            state.pending_entries.insert(path.to_path_buf());
+        }
+    }
+
+    /// Makes the entries of `directory` durable, after a sync of it.
+    fn entries_synced(&self, directory: &Path) {
+        self.state
+            .lock()
+            .pending_entries
+            .retain(|entry| entry.parent() != Some(directory));
+    }
+
     /// Records the destination of a copy-style op (`hard_link` / `reflink`): it
     /// mirrors the source's durability so a crash either restores the
     /// linked/cloned bytes (durable source) or removes an un-synced copy.
@@ -225,11 +266,14 @@ impl CrashFs {
             None if !src_touched => self.read_baseline(src)?,
             None => None,
         };
-        let mut state = self.state.lock();
-        if let Some(bytes) = dst_image {
-            state.durable.insert(dst.to_path_buf(), bytes);
+        {
+            let mut state = self.state.lock();
+            if let Some(bytes) = dst_image {
+                state.durable.insert(dst.to_path_buf(), bytes);
+            }
+            state.touched.insert(dst.to_path_buf());
         }
-        state.touched.insert(dst.to_path_buf());
+        self.new_entry(dst);
         Ok(())
     }
 }
@@ -237,6 +281,7 @@ impl CrashFs {
 impl Fs for CrashFs {
     fn open(&self, path: &Path, opts: &FsOpenOptions) -> io::Result<Box<dyn FsFile>> {
         let writable = opts.write || opts.create || opts.create_new || opts.append || opts.truncate;
+        let creates = (opts.create || opts.create_new) && !self.inner.exists(path)?;
         if writable {
             // Capture the pre-existing durable image BEFORE the open (which may
             // truncate); a brand-new file captures nothing, so a crash before its
@@ -244,6 +289,9 @@ impl Fs for CrashFs {
             self.capture_first_touch(path)?;
         }
         let inner = self.inner.open(path, opts)?;
+        if creates {
+            self.new_entry(path);
+        }
         Ok(Box::new(CrashFile {
             inner,
             path: path.to_path_buf(),
@@ -269,6 +317,7 @@ impl Fs for CrashFs {
         let mut state = self.state.lock();
         state.durable.remove(path);
         state.touched.remove(path);
+        state.pending_entries.remove(path);
         Ok(())
     }
 
@@ -280,6 +329,7 @@ impl Fs for CrashFs {
         let mut state = self.state.lock();
         state.durable.retain(|k, _| !k.starts_with(path));
         state.touched.retain(|k| !k.starts_with(path));
+        state.pending_entries.retain(|k| !k.starts_with(path));
         Ok(())
     }
 
@@ -305,6 +355,11 @@ impl Fs for CrashFs {
         if from_touched {
             state.touched.insert(to.to_path_buf());
         }
+        // The destination's entry is new until its directory is synced.
+        state.pending_entries.remove(from);
+        if state.track_entries {
+            state.pending_entries.insert(to.to_path_buf());
+        }
         Ok(())
     }
 
@@ -313,11 +368,15 @@ impl Fs for CrashFs {
     }
 
     fn sync_directory(&self, path: &Path) -> io::Result<()> {
-        self.inner.sync_directory(path)
+        self.inner.sync_directory(path)?;
+        self.entries_synced(path);
+        Ok(())
     }
 
     fn sync_directory_with(&self, path: &Path, mode: SyncMode) -> io::Result<()> {
-        self.inner.sync_directory_with(path, mode)
+        self.inner.sync_directory_with(path, mode)?;
+        self.entries_synced(path);
+        Ok(())
     }
 
     fn exists(&self, path: &Path) -> io::Result<bool> {
