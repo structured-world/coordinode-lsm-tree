@@ -95,6 +95,15 @@ pub struct ParsedMeta {
     /// prefix. `None` for a table without a filter.
     pub filter_hashes: Option<u64>,
 
+    /// Hashes of the largest partition of the table's filter (the
+    /// `filter_partition_hashes` meta key): how its filter was split, which
+    /// the level it lies in does not tell. `None` for a full filter or none.
+    pub filter_partition_hashes: Option<u64>,
+
+    /// Width in bits per key of the static filter policy the table was
+    /// written under (the `filter_bits` meta key). `None` without a filter.
+    pub filter_bits: Option<u8>,
+
     pub tombstone_count: u64,
 
     /// Number of RANGE tombstones the writer emitted into the
@@ -661,6 +670,15 @@ impl ParsedMeta {
         let delete_bitmap_hash = read_opt_u128(b"descriptor#delete_bitmap_hash")?;
         let key_count = read_opt_u64(b"key_count")?;
         let filter_hashes = read_opt_u64(b"filter_hashes")?;
+        let filter_partition_hashes = read_opt_u64(b"filter_partition_hashes")?;
+        // One byte of width; present-but-wrong-width is corrupt meta.
+        let filter_bits = match block.point_read(b"filter_bits", SeqNo::MAX, &cmp)? {
+            Some(item) => match *item.value {
+                [bits] => Some(bits),
+                _ => return Err(crate::Error::InvalidHeader("TableMeta")),
+            },
+            None => None,
+        };
         let recency = read_opt_u64(b"recency")?;
         // Compaction lineage: consecutive little-endian input ids. A payload
         // that is not a whole number of ids is corrupt meta.
@@ -703,6 +721,8 @@ impl ParsedMeta {
             item_count,
             key_count,
             filter_hashes,
+            filter_partition_hashes,
+            filter_bits,
             tombstone_count,
             range_tombstone_count,
             delete_bitmap_len,

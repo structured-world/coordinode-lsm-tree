@@ -40,6 +40,9 @@ pub struct FullFilterWriter {
 
     /// The table's key range, which a sized filter draws its load over.
     key_range: Option<(UserKey, UserKey)>,
+
+    /// Keys registered, fewer than the hashes under a prefix extractor.
+    keys: usize,
 }
 
 impl FullFilterWriter {
@@ -54,6 +57,7 @@ impl FullFilterWriter {
             ecc: None,
             sizing: None,
             key_range: None,
+            keys: 0,
         }
     }
 
@@ -147,6 +151,7 @@ impl<W: crate::io::Write + crate::io::Seek> FilterWriter<W> for FullFilterWriter
 
     fn register_key(&mut self, key: &UserKey) -> crate::Result<usize> {
         let before = self.bloom_hash_buffer.len();
+        self.keys += 1;
         self.bloom_hash_buffer.push(crate::hash::hash64(key));
 
         // A prefix the previous key had at the same position is a repeat and
@@ -278,6 +283,7 @@ impl<W: crate::io::Write + crate::io::Seek> FilterWriter<W> for FullFilterWriter
             self.bloom_policy,
             sizing,
             hashes,
+            self.keys,
             self.encryption.as_deref(),
             self.ecc,
         )?;
@@ -332,6 +338,7 @@ impl<W: crate::io::Write + crate::io::Seek> FilterWriter<W> for FullFilterWriter
         Ok(super::FilterOutput {
             blocks: 1,
             hashes: n as u64,
+            partition_hashes: 0,
         })
     }
 }

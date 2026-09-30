@@ -90,6 +90,9 @@ pub struct PartitionedFilterWriter {
 
     /// Hashes the table's partitions hold so far, which `finish` reports.
     table_hashes: usize,
+
+    /// Hashes of the largest partition so far, which `finish` reports.
+    largest_partition: usize,
 }
 
 impl PartitionedFilterWriter {
@@ -126,6 +129,7 @@ impl PartitionedFilterWriter {
             first_key: None,
             spilled_key: None,
             table_hashes: 0,
+            largest_partition: 0,
         }
     }
 
@@ -194,6 +198,7 @@ impl PartitionedFilterWriter {
         let partition_index = self.tli_handles.len() + self.pending_count();
         let range = self.partition_range(key);
         self.table_hashes += hashes.len();
+        self.largest_partition = self.largest_partition.max(hashes.len());
         if self.sizing.is_some() {
             self.spilled_key = Some(key.clone());
         }
@@ -414,10 +419,12 @@ fn build_partition(
             ),
         )
     });
+    // A partition holds key hashes only (see `register_key`).
     let filter_bytes = super::build_filter(
         settings.bloom_policy,
         sizing,
         hashes,
+        hash_count,
         settings.encryption.as_deref(),
         settings.ecc,
     )?;
@@ -841,6 +848,11 @@ impl<W: crate::io::Write + crate::io::Seek> FilterWriter<W> for PartitionedFilte
                 0
             } else {
                 self.table_hashes as u64
+            },
+            partition_hashes: if block_count == 0 {
+                0
+            } else {
+                self.largest_partition as u64
             },
         })
     }

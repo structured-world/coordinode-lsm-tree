@@ -1874,7 +1874,7 @@ impl Tree {
         crate::filter_budget::plan(
             advisor,
             &self.filter_budget,
-            &crate::filter_budget::live(&version, &self.config),
+            &crate::filter_budget::live(&version),
             crate::filter_budget::Rewrite {
                 keys,
                 framing: crate::filter_budget::Framing {

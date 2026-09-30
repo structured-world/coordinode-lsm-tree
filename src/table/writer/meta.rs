@@ -27,6 +27,10 @@ pub struct Metadata {
     /// without one.
     pub filter_hashes: u64,
 
+    /// Hashes of the filter's largest partition, set when a partitioned
+    /// filter is written; zero for a full filter or none.
+    pub filter_partition_hashes: u64,
+
     /// Sum of user-key byte lengths across all written entries (every version,
     /// pairs with `item_count`). Drives the average-entry-shape introspection.
     pub sum_user_key_bytes: u64,
@@ -72,6 +76,7 @@ impl Default for Metadata {
             weak_tombstone_reclaimable_count: 0,
             key_count: 0,
             filter_hashes: 0,
+            filter_partition_hashes: 0,
             sum_user_key_bytes: 0,
             sum_value_bytes: 0,
             file_pos: BlockOffset(0),

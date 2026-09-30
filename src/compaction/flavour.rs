@@ -128,7 +128,7 @@ pub(super) fn plan_filters(
     crate::filter_budget::plan(
         advisor,
         &opts.filter_budget,
-        &crate::filter_budget::live(version, &opts.config),
+        &crate::filter_budget::live(version),
         crate::filter_budget::Rewrite {
             inputs,
             split,

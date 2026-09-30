@@ -168,9 +168,19 @@ pub struct FilterSizing {
     /// width over them, so a filter chosen early cannot crowd out the later
     /// ones. Zero for a flush.
     pending_keys: AtomicU64,
-    /// Keys the filters this rewrite has built hold, which a count of all its
-    /// keys learnt after the plan (see [`Self::expect_keys`]) is short of.
+    /// Keys the filters this rewrite has built cover, which a count of all
+    /// its entries learnt after the plan (see [`Self::expect_keys`]) is short
+    /// of.
     admitted_keys: AtomicU64,
+    /// The entries a count learnt after the plan names (see
+    /// [`Self::expect_keys`]), `u64::MAX` before one is: the keys still to
+    /// come are then those entries less the ones admitted, in hashes.
+    expected_entries: AtomicU64,
+    /// The most hashes a filter of this rewrite has held per key it covers,
+    /// as a fraction: under a prefix extractor a full filter holds a hash per
+    /// prefix besides one per key, and the entries still to come are counted
+    /// in hashes by it.
+    hashes_per_key: (AtomicU64, AtomicU64),
     /// This rewrite's part of [`FilterBudget::reserved`]: the room it keeps
     /// for the keys it has still to write filters for.
     reservation: AtomicU64,
@@ -427,65 +437,52 @@ impl core::fmt::Debug for Split {
 /// models its filter by.
 pub struct Live<'a> {
     pub table: &'a Table,
-    /// Width in bits per key of its level's static policy, which breaks ties.
+    /// Width in bits per key of the static policy it was built under, which
+    /// breaks ties.
     pub fallback_bits: u8,
     /// Keys a partition of its filter holds, when the filter is partitioned.
     pub partition_keys: Option<usize>,
 }
 
-/// The tables of `version` that have a filter, each with the settings of the
-/// level it lies in under `config`: a flush writing full filters prices the
-/// partitioned ones below it as partitions. Whether a filter is partitioned
-/// is read from the table itself, which a later policy change leaves as it
-/// was built.
+/// The tables of `version` that have a filter, each with the settings it was
+/// built under, as the table records them: a flush writing full filters
+/// prices the partitioned ones below it as partitions.
+///
+/// The settings of the level a table lies in do not tell them. A compaction
+/// builds by the level it is written for, which differs from the level it
+/// lands in while the levels above the last are empty, and a table keeps its
+/// filter when it is moved down whole or the policy changes.
 ///
 /// A table without a filter takes no filter bytes and draws no filter
 /// probes; counting its keys would price the others for filters that are
 /// never built.
-pub fn live<'a>(version: &'a crate::version::Version, config: &crate::Config) -> Vec<Live<'a>> {
-    use crate::config::FilterPolicyEntry;
-
-    // Tables of a level share its settings; the partition search runs once
-    // per distinct setting, not per table.
-    let mut partitions: Vec<((u8, u32), usize)> = Vec::new();
-    let mut live = Vec::new();
-    for (level, tables) in version.iter_levels().enumerate() {
-        let level_policy = match config.filter_policy.get(level) {
-            FilterPolicyEntry::Bloom(policy) if policy.is_active() => Some(policy),
-            FilterPolicyEntry::Bloom(_) | FilterPolicyEntry::None => None,
-        };
-        let partition_bytes = config.filter_block_partition_size_policy.get(level);
-        for table in tables.iter().flat_map(|run| run.iter()) {
-            if table.filter_size() == 0 {
-                continue;
-            }
-            // A level whose policy no longer builds filters: the width the
-            // table's own filter has.
-            let fallback = level_policy.unwrap_or_else(|| {
+pub fn live(version: &crate::version::Version) -> Vec<Live<'_>> {
+    version
+        .iter_tables()
+        .filter(|table| table.filter_size() > 0)
+        .map(|table| {
+            // A table that does not record its static width: the width its
+            // own filter has.
+            let fallback_bits = table.metadata.filter_bits.unwrap_or_else(|| {
                 let bits = u64::from(table.filter_size()) * 8 / filter_keys(table).max(1);
-                BloomConstructionPolicy::BitsPerKey(f32::from(
-                    u8::try_from(bits).unwrap_or(u8::MAX),
-                ))
+                u8::try_from(bits).unwrap_or(u8::MAX)
             });
-            let fallback_bits = bits_of(fallback);
+            // A partitioned filter that does not record its partitions is
+            // taken as one.
             let partition_keys = table.regions.filter_tli.is_some().then(|| {
-                let setting = (fallback_bits, partition_bytes);
-                if let Some(&(_, keys)) = partitions.iter().find(|(key, _)| *key == setting) {
-                    keys
-                } else {
-                    let keys = partition_keys(fallback, partition_bytes);
-                    partitions.push((setting, keys));
-                    keys
-                }
+                let keys = table
+                    .metadata
+                    .filter_partition_hashes
+                    .unwrap_or_else(|| filter_keys(table));
+                usize::try_from(keys).unwrap_or(usize::MAX)
             });
-            live.push(Live {
+            Live {
                 table,
                 fallback_bits,
                 partition_keys,
-            });
-        }
-    }
-    live
+            }
+        })
+        .collect()
 }
 
 /// Plans the filters of one flush or compaction.
@@ -626,6 +623,8 @@ pub fn plan(
         partition_keys,
         pending_keys: AtomicU64::new(pending_keys),
         admitted_keys: AtomicU64::new(0),
+        expected_entries: AtomicU64::new(u64::MAX),
+        hashes_per_key: (AtomicU64::new(1), AtomicU64::new(1)),
         reservation: AtomicU64::new(0),
         typical_keys: AtomicU64::new(0),
         table_keys: AtomicU64::new(0),
@@ -932,16 +931,25 @@ impl FilterSizing {
     ///
     /// `lower` is the lower bound [`Self::candidates`] priced the filter at:
     /// once taken, the filter is no longer in flight.
+    ///
+    /// `keys` are the keys the filter covers, fewer than its `n` hashes under
+    /// a prefix extractor.
+    #[expect(
+        clippy::too_many_arguments,
+        reason = "the filter's place, counts and bytes, as the build produced them"
+    )]
     pub fn admit(
         &self,
         lower: Bound<&[u8]>,
         n: usize,
+        keys: usize,
         bytes: u64,
         estimated: u64,
         frame: &dyn Fn(u64) -> u64,
         last: bool,
     ) -> bool {
         let n = u64::try_from(n).unwrap_or(u64::MAX);
+        let keys = u64::try_from(keys).unwrap_or(u64::MAX);
         // The keys still to come are claimed under the lock too: filters
         // admitted side by side (a table's partitions) each see the others'
         // keys gone once taken.
@@ -952,9 +960,16 @@ impl FilterSizing {
             return true;
         }
         let per_filter = self.typical_keys.load(Relaxed).max(n);
-        // The pending count bounds the rewrite's keys from above: a filter
-        // over more keys than it holds leaves none pending.
-        let later = self.pending_keys.load(Relaxed).saturating_sub(n);
+        let ratio = self.ratio_with(n, keys);
+        let admitted = self.admitted_keys.load(Relaxed) + keys;
+        let later = match self.expected_entries.load(Relaxed) {
+            // The pending count bounds the rewrite's keys from above: a
+            // filter over more keys than it holds leaves none pending.
+            u64::MAX => self.pending_keys.load(Relaxed).saturating_sub(n),
+            // Counted in entries, as the caller told them: the ones still to
+            // come hold hashes at the highest rate a filter has shown.
+            entries => in_hashes(entries.saturating_sub(admitted), ratio),
+        };
         let floor = self.floor(later, per_filter, frame);
         let used = self.state.held();
         let mine = self.reservation.load(Relaxed);
@@ -976,7 +991,9 @@ impl FilterSizing {
         self.spent.fetch_add(bytes, Relaxed);
         self.set_reservation(mine, floor);
         self.pending_keys.store(later, Relaxed);
-        self.admitted_keys.fetch_add(n, Relaxed);
+        self.admitted_keys.store(admitted, Relaxed);
+        self.hashes_per_key.0.store(ratio.0, Relaxed);
+        self.hashes_per_key.1.store(ratio.1, Relaxed);
         self.typical_keys.fetch_max(n, Relaxed);
         drop(admission);
 
@@ -1118,11 +1135,33 @@ impl FilterSizing {
     /// its caller tells): the ones no filter holds yet count as still to come.
     pub fn expect_keys(&self, keys: u64) {
         let _admission = self.state.admission.lock();
+        self.expected_entries.store(keys, Relaxed);
         let admitted = self.admitted_keys.load(Relaxed);
+        let ratio = (
+            self.hashes_per_key.0.load(Relaxed),
+            self.hashes_per_key.1.load(Relaxed),
+        );
         // Fewer keys than the filters already hold leaves none to come.
-        let pending = keys.saturating_sub(admitted);
+        let pending = in_hashes(keys.saturating_sub(admitted), ratio);
         self.pending_keys.store(pending, Relaxed);
         self.set_reservation(self.reservation.load(Relaxed), self.floor_for(pending));
+    }
+
+    /// The most hashes per key a filter of this rewrite holds once one of `n`
+    /// hashes over `keys` keys is counted, as a fraction. The admission lock
+    /// is held.
+    fn ratio_with(&self, n: u64, keys: u64) -> (u64, u64) {
+        let held = (
+            self.hashes_per_key.0.load(Relaxed),
+            self.hashes_per_key.1.load(Relaxed),
+        );
+        // Filter hash and key counts, far below 2^32 each, so the products
+        // fit; a filter over no key says nothing of the rate.
+        if keys > 0 && u128::from(n) * u128::from(held.1) > u128::from(held.0) * u128::from(keys) {
+            (n, keys)
+        } else {
+            held
+        }
     }
 
     /// The negative probes a filter over `n` keys in `bounds` is expected to
@@ -1214,6 +1253,15 @@ impl FilterSizing {
             .held
             .fetch_sub(self.spent.load(Relaxed) as i64, Relaxed);
     }
+}
+
+/// The hashes `keys` keys hold at `ratio` hashes a key, rounded up.
+fn in_hashes(keys: u64, ratio: (u64, u64)) -> u64 {
+    let (hashes, per) = ratio;
+    // `per` is a key count of a filter, at least one; the quotient is at most
+    // `keys` times the hashes a filter held per key.
+    u64::try_from((u128::from(keys) * u128::from(hashes)).div_ceil(u128::from(per.max(1))))
+        .unwrap_or(u64::MAX)
 }
 
 /// A table's filter as the price models it: the negative probes it draws
@@ -1599,7 +1647,7 @@ fn estimate(n: usize, bits: u8) -> u64 {
 
 /// The width in bits per key a policy builds at: its own for bits per key,
 /// the narrowest reaching the rate for a false-positive rate.
-fn bits_of(policy: BloomConstructionPolicy) -> u8 {
+pub fn bits_of(policy: BloomConstructionPolicy) -> u8 {
     match policy {
         #[expect(
             clippy::cast_possible_truncation,

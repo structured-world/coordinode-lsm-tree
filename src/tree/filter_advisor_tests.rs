@@ -362,7 +362,7 @@ fn concurrent_rewrites_share_the_budget() -> crate::Result<()> {
         panic!("a standard tree");
     };
     let version = tree.current_version();
-    let live = crate::filter_budget::live(&version, &tree.config);
+    let live = crate::filter_budget::live(&version);
     let plan = || {
         crate::filter_budget::plan(
             &advisor,
@@ -378,11 +378,11 @@ fn concurrent_rewrites_share_the_budget() -> crate::Result<()> {
     let frame = |len: u64| len;
     let lower = core::ops::Bound::Unbounded;
     assert!(
-        first.admit(lower, 1_000, room, room, &frame, false),
+        first.admit(lower, 1_000, 1_000, room, room, &frame, false),
         "the room fits one"
     );
     assert!(
-        !second.admit(lower, 1_000, room, room, &frame, false),
+        !second.admit(lower, 1_000, 1_000, room, room, &frame, false),
         "the room the first rewrite builds into is taken"
     );
     Ok(())
@@ -761,6 +761,55 @@ fn an_ingestion_told_its_entries_keeps_room_for_the_later_tables() -> crate::Res
             *byte = state.to_le_bytes()[0];
         }
         ingestion.write(format!("key{i:06}"), value.as_slice())?;
+    }
+    ingestion.finish()?;
+
+    let tables = tables(&tree);
+    assert!(tables.len() >= 2, "{} tables", tables.len());
+    let memory = tree.filter_memory();
+    let sizes: Vec<(u64, u32)> = tables
+        .iter()
+        .map(|table| (table.metadata.item_count, table.filter_size()))
+        .collect();
+    assert!(!memory.over_budget, "{memory:?} {sizes:?}");
+    Ok(())
+}
+
+/// Under a prefix extractor a full filter holds a hash per prefix besides one
+/// per key, so an ingestion told its entries keeps room for the later tables'
+/// hashes, not their entries: a first table claiming its hashes against the
+/// entry count would leave the later ones none.
+#[test]
+fn an_ingestion_told_its_entries_keeps_room_for_the_later_prefix_hashes() -> crate::Result<()> {
+    const KEYS: usize = 6_000;
+    const VALUE: usize = 16 * 1_024;
+    let folder = tempfile::tempdir()?;
+    // Every key has its own prefix: two hashes a key.
+    let narrowest = BloomConstructionPolicy::BitsPerKey(6.0).filter_size_bound(2 * KEYS) as u64;
+    let budget = narrowest * 5 / 4;
+    let tree = Config::new(
+        folder.path(),
+        SequenceNumberCounter::default(),
+        SequenceNumberCounter::default(),
+    )
+    .data_block_size_policy(BlockSizePolicy::all(1_024))
+    .prefix_extractor(std::sync::Arc::new(UpToColon))
+    .filter_advisor(Some(
+        FilterAdvisor::new(budget).with_bits_per_key([6u8, 10].to_vec()),
+    ))
+    .open()?;
+    let mut ingestion = tree.ingestion()?.expected_entries(KEYS as u64);
+    let mut state: u64 = 0x9E37_79B9_7F4A_7C15;
+    let mut value = vec![0u8; VALUE];
+    for i in 0..KEYS {
+        for byte in &mut value {
+            // xorshift: incompressible bytes.
+            state ^= state << 13;
+            state ^= state >> 7;
+            state ^= state << 17;
+            *byte = state.to_le_bytes()[0];
+        }
+        ingestion.write(format!("key{i:06}:x"), value.as_slice())?;
     }
     ingestion.finish()?;
 

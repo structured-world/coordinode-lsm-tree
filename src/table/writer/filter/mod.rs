@@ -24,6 +24,9 @@ pub struct FilterOutput {
     /// Hashes the filters hold: a key's, and under a prefix extractor each
     /// distinct prefix's. Zero when no filter was written.
     pub hashes: u64,
+    /// Hashes of the largest partition of a partitioned filter; zero for a
+    /// full filter.
+    pub partition_hashes: u64,
 }
 
 // All methods are required (no defaults) by design so that implementations must
@@ -141,13 +144,15 @@ type SizedFilter<'a> = (
     (core::ops::Bound<&'a [u8]>, core::ops::Bound<&'a [u8]>),
 );
 
-/// Builds the filter over `hashes`: at `policy`, or, when the tree sizes its
-/// filters, at the first candidate width over the keys in `bounds` whose
-/// encoded block the filter budget admits.
+/// Builds the filter over `hashes`, those of `keys` keys and their prefixes:
+/// at `policy`, or, when the tree sizes its filters, at the first candidate
+/// width over the keys in `bounds` whose encoded block the filter budget
+/// admits.
 fn build_filter(
     policy: BloomConstructionPolicy,
     sizing: Option<SizedFilter<'_>>,
     hashes: Vec<u64>,
+    keys: usize,
     encryption: Option<&dyn EncryptionProvider>,
     ecc: Option<crate::table::block::EccParams>,
 ) -> crate::Result<Vec<u8>> {
@@ -174,6 +179,7 @@ fn build_filter(
         if sizing.admit(
             bounds.0,
             n,
+            keys,
             frame(bytes.len() as u64),
             estimated(candidate),
             &frame,
@@ -187,6 +193,7 @@ fn build_filter(
     let admitted = sizing.admit(
         bounds.0,
         n,
+        keys,
         frame(bytes.len() as u64),
         estimated(narrowest),
         &frame,

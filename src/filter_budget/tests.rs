@@ -370,7 +370,7 @@ fn one_crossed_window_is_halved_once_by_concurrent_plans() -> crate::Result<()> 
         panic!("a standard tree");
     };
     let version = tree.current_version();
-    let live = super::live(&version, &tree.config);
+    let live = super::live(&version);
     assert_eq!(live.len() as u64, TABLES);
     let stats: Vec<_> = live
         .iter()
@@ -571,7 +571,7 @@ fn live_tables_price_alike_whatever_the_destination() -> crate::Result<()> {
         "the live filters are partitioned"
     );
     let version = tree.current_version();
-    let live = super::live(&version, &tree.config);
+    let live = super::live(&version);
     let price_into = |partition_bytes: Option<u32>| {
         let plan = super::plan(
             &advisor,
@@ -637,7 +637,7 @@ fn a_filter_priced_past_one_in_flight_counts_its_data() -> crate::Result<()> {
     };
     let version = tree.current_version();
     let inputs: Vec<crate::Table> = version.iter_tables().cloned().collect();
-    let live = super::live(&version, &tree.config);
+    let live = super::live(&version);
     let plan = || {
         super::plan(
             &advisor,
@@ -717,7 +717,7 @@ fn split_ranges_price_by_all_data_still_to_come() -> crate::Result<()> {
     };
     let version = tree.current_version();
     let inputs: Vec<crate::Table> = version.iter_tables().cloned().collect();
-    let live = super::live(&version, &tree.config);
+    let live = super::live(&version);
     let plan = |split: Option<super::Split>| {
         super::plan(
             &advisor,
@@ -752,42 +752,50 @@ fn split_ranges_price_by_all_data_still_to_come() -> crate::Result<()> {
     Ok(())
 }
 
-/// A level whose policy no longer builds filters still holds the tables that
-/// have one: each is priced at the width its own filter was built at.
+/// A table is priced by the settings it was built under, as it records them,
+/// not by those of the level it lies in: reopened under a policy that builds
+/// no filter and splits partitions four times finer, it keeps its static
+/// width and the partitions it was written with.
 #[test]
-fn a_table_on_a_level_without_filters_prices_at_its_own_width() -> crate::Result<()> {
-    use crate::config::FilterPolicyEntry;
+fn a_table_is_priced_by_the_settings_it_was_built_under() -> crate::Result<()> {
+    use crate::config::{FilterPolicyEntry, PinningPolicy};
     use crate::{AbstractTree, AnyTree, Config, SequenceNumberCounter};
 
+    const PARTITION: u32 = 4_096;
+    let config = |folder: &std::path::Path, policy, partition| {
+        Config::new(
+            folder,
+            SequenceNumberCounter::default(),
+            SequenceNumberCounter::default(),
+        )
+        .filter_policy(crate::config::FilterPolicy::all(policy))
+        .filter_block_partitioning_policy(PinningPolicy::all(true))
+        .filter_block_partition_size_policy(crate::config::BlockSizePolicy::all(partition))
+    };
     let folder = tempfile::tempdir()?;
-    let any = Config::new(
-        folder.path(),
-        SequenceNumberCounter::default(),
-        SequenceNumberCounter::default(),
-    )
-    .filter_policy(crate::config::FilterPolicy::all(FilterPolicyEntry::Bloom(
-        BloomConstructionPolicy::BitsPerKey(10.0),
-    )))
-    .open()?;
-    for i in 0..20_000u32 {
-        any.insert(format!("k{i:06}"), "value", u64::from(i));
+    let built = BloomConstructionPolicy::BitsPerKey(10.0);
+    {
+        let any = config(folder.path(), FilterPolicyEntry::Bloom(built), PARTITION).open()?;
+        for i in 0..20_000u32 {
+            any.insert(format!("k{i:06}"), "value", u64::from(i));
+        }
+        any.flush_active_memtable(0)?;
     }
-    any.flush_active_memtable(0)?;
+    let any = config(folder.path(), FilterPolicyEntry::None, PARTITION / 4).open()?;
     let AnyTree::Standard(tree) = &any else {
         panic!("a standard tree");
     };
     let version = tree.current_version();
-    let without = Config::clone(&tree.config)
-        .filter_policy(crate::config::FilterPolicy::all(FilterPolicyEntry::None));
-    let live = super::live(&version, &without);
+    let live = super::live(&version);
     let [table] = live.as_slice() else {
         panic!("one live table");
     };
-    assert!(
-        (10..=11).contains(&table.fallback_bits),
-        "{} bits a key",
-        table.fallback_bits
-    );
+    assert_eq!(table.fallback_bits, 10);
+    let partition = table
+        .partition_keys
+        .unwrap_or_else(|| panic!("the filter is partitioned"));
+    // The writer splits a partition where its estimate reaches the size.
+    assert_eq!(partition, super::partition_keys(built, PARTITION));
     Ok(())
 }
 
@@ -854,7 +862,7 @@ fn lower_bounds_order_by_where_they_start() -> crate::Result<()> {
     let sizing = super::plan(
         &advisor,
         &tree.filter_budget,
-        &super::live(&version, &tree.config),
+        &super::live(&version),
         super::Rewrite {
             comparator: Some(crate::comparator::default_comparator()),
             ..super::Rewrite::default()
@@ -974,12 +982,12 @@ fn concurrent_plans_reserve_room_for_each_others_later_filters() {
 
     // A tries its first filter wide, then narrow; each plan then writes the
     // rest narrow, taken whatever the budget says.
-    if !a.admit(Unbounded, KEYS, frame(wide), wide, &frame, false) {
-        assert!(a.admit(Unbounded, KEYS, frame(narrow), narrow, &frame, true));
+    if !a.admit(Unbounded, KEYS, KEYS, frame(wide), wide, &frame, false) {
+        assert!(a.admit(Unbounded, KEYS, KEYS, frame(narrow), narrow, &frame, true));
     }
-    assert!(b.admit(Unbounded, KEYS, frame(narrow), narrow, &frame, true));
-    assert!(b.admit(Unbounded, KEYS, frame(narrow), narrow, &frame, true));
-    assert!(a.admit(Unbounded, KEYS, frame(narrow), narrow, &frame, true));
+    assert!(b.admit(Unbounded, KEYS, KEYS, frame(narrow), narrow, &frame, true));
+    assert!(b.admit(Unbounded, KEYS, KEYS, frame(narrow), narrow, &frame, true));
+    assert!(a.admit(Unbounded, KEYS, KEYS, frame(narrow), narrow, &frame, true));
     assert!(
         state.held() <= budget,
         "{} filter bytes against {budget}",
@@ -1017,7 +1025,7 @@ fn a_rewrite_ends_with_its_plan_not_with_the_last_reference() {
     .unwrap_or_else(|| panic!("the advisor plans the filters"));
     let owner = plan.clone();
     let worker = plan.sizing();
-    assert!(worker.admit(Unbounded, KEYS, frame(narrow), narrow, &frame, true));
+    assert!(worker.admit(Unbounded, KEYS, KEYS, frame(narrow), narrow, &frame, true));
     assert_eq!(state.held(), frame(narrow));
 
     drop(plan);
@@ -1029,7 +1037,7 @@ fn a_rewrite_ends_with_its_plan_not_with_the_last_reference() {
         0
     );
 
-    assert!(worker.admit(Unbounded, KEYS, frame(narrow), narrow, &frame, true));
+    assert!(worker.admit(Unbounded, KEYS, KEYS, frame(narrow), narrow, &frame, true));
     drop(worker);
     assert_eq!(
         state.held(),

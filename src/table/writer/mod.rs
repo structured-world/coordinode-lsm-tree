@@ -1123,6 +1123,8 @@ impl Writer {
             weak_tombstone_reclaimable: self.meta.weak_tombstone_reclaimable_count as u64,
             key_count: self.meta.key_count as u64,
             filter_hashes: self.meta.filter_hashes,
+            filter_bits: crate::filter_budget::bits_of(self.bloom_policy),
+            filter_partition_hashes: self.meta.filter_partition_hashes,
             sum_user_key_bytes: self.meta.sum_user_key_bytes,
             sum_value_bytes: self.meta.sum_value_bytes,
             uncompressed_size: self.meta.uncompressed_size,
@@ -3707,6 +3709,7 @@ impl Writer {
         let filter = filter_writer.finish(&mut self.file_writer)?;
         let filter_block_count = filter.blocks;
         self.meta.filter_hashes = filter.hashes;
+        self.meta.filter_partition_hashes = filter.partition_hashes;
 
         // Write the optional inner-block layout section (only when at least one
         // data block split into >= 2 inner zstd blocks). Absent otherwise, so
@@ -4237,6 +4240,11 @@ struct MetaSectionParams<'a> {
     /// Hashes the filter holds: `> 0` writes `filter_hashes`, zero (no
     /// filter) omits it.
     filter_hashes: u64,
+    /// Width in bits per key of the static filter policy the table was
+    /// written under, written with `filter_hashes`.
+    filter_bits: u8,
+    /// Hashes of the largest filter partition, zero for a full filter.
+    filter_partition_hashes: u64,
     sum_user_key_bytes: u64,
     sum_value_bytes: u64,
     uncompressed_size: u64,
@@ -4554,6 +4562,17 @@ fn encode_meta_payload(
     // keys: what a filter's size follows. Emitted only when there is a filter.
     if p.filter_hashes > 0 {
         meta_items.push(meta("filter_hashes", &p.filter_hashes.to_le_bytes()));
+        // How the filter was built, which a later filter budget prices it
+        // by: the width of the static policy it was written under, and the
+        // hashes of a full partition when it is partitioned. The level it lies
+        // in does not tell either: a table keeps its filter through a move.
+        meta_items.push(meta("filter_bits", &[p.filter_bits]));
+        if p.filter_partition_hashes > 0 {
+            meta_items.push(meta(
+                "filter_partition_hashes",
+                &p.filter_partition_hashes.to_le_bytes(),
+            ));
+        }
     }
 
     // Compaction lineage: the sorted input ids this output merges, as
