@@ -75,6 +75,22 @@ struct Bucket {
     /// Monotonic time of the last refill, as nanoseconds since the
     /// limiter's origin.
     last_refill_nanos: u128,
+    /// Rate changes so far; a waiter compares it with the count its debit
+    /// was taken at to see that the rate moved under it.
+    changes: u64,
+    /// The value of `changes` at the last switch to `0`. A waiter whose debit
+    /// predates it is released, and its debit is gone with the old bucket,
+    /// even if the rate was switched back on before it looked.
+    last_off: u64,
+}
+
+/// A debit taken from the bucket: what the caller owes, at which rate, and
+/// the change count it was taken at, all read under one lock.
+#[cfg(feature = "std")]
+struct Debit {
+    wait: Duration,
+    rate: u64,
+    changes: u64,
 }
 
 #[cfg_attr(
@@ -88,10 +104,21 @@ impl Bucket {
     /// A bucket holding one second of `rate`, refilled as of `now_nanos`, so
     /// the first request is not penalised.
     fn full(rate: u64, now_nanos: u128) -> Self {
-        Self {
-            available: i64::try_from(rate).unwrap_or(i64::MAX),
-            last_refill_nanos: now_nanos,
-        }
+        let mut bucket = Self {
+            available: 0,
+            last_refill_nanos: 0,
+            changes: 0,
+            last_off: 0,
+        };
+        bucket.fill(rate, now_nanos);
+        bucket
+    }
+
+    /// Refills to one second of `rate` as of `now_nanos`, as a new bucket
+    /// would hold, keeping the change counts.
+    fn fill(&mut self, rate: u64, now_nanos: u128) {
+        self.available = i64::try_from(rate).unwrap_or(i64::MAX);
+        self.last_refill_nanos = now_nanos;
     }
 
     /// Adds what `rate` accrued since the last refill, capped at one second
@@ -208,12 +235,17 @@ impl RateLimiter {
             return;
         }
         if old == 0 {
-            *bucket = Bucket::full(bytes_per_sec, now_nanos);
+            bucket.fill(bytes_per_sec, now_nanos);
         } else {
             bucket.refill(old, now_nanos);
             if bytes_per_sec != 0 {
                 bucket.cap(bytes_per_sec);
             }
+        }
+        // One step per rate change: a u64 does not wrap.
+        bucket.changes += 1;
+        if bytes_per_sec == 0 {
+            bucket.last_off = bucket.changes;
         }
         self.rate_bytes_per_sec
             .store(bytes_per_sec, Ordering::Relaxed);
@@ -247,18 +279,18 @@ impl RateLimiter {
         if self.rate_bytes_per_sec.load(Ordering::Relaxed) == 0 {
             return Duration::ZERO;
         }
-        let now_nanos = now.as_nanos();
-
         let mut bucket = self.bucket.lock();
-        // Read again under the lock: the rate the bucket was last settled
-        // against, which a concurrent change may have moved since the check
-        // above.
-        let rate = self.rate_bytes_per_sec.load(Ordering::Relaxed);
+        Self::debit_locked(&mut bucket, self.rate(), bytes, now).0
+    }
+
+    /// Debits `bytes` from `bucket` at `rate`, read under the bucket lock the
+    /// caller holds, and returns the wait it owes with the rate it was
+    /// measured at. A rate of `0` debits nothing.
+    fn debit_locked(bucket: &mut Bucket, rate: u64, bytes: u64, now: Duration) -> (Duration, u64) {
         if rate == 0 {
-            return Duration::ZERO;
+            return (Duration::ZERO, 0);
         }
-        let rate_u128 = u128::from(rate);
-        bucket.refill(rate, now_nanos);
+        bucket.refill(rate, now.as_nanos());
 
         // Debit the request. Going negative is the debt the caller pays
         // off by waiting.
@@ -266,13 +298,44 @@ impl RateLimiter {
         bucket.available = bucket.available.saturating_sub(debit);
 
         if bucket.available >= 0 {
-            return Duration::ZERO;
+            return (Duration::ZERO, rate);
         }
 
         // Wait long enough for the refill rate to repay the deficit.
         let deficit = bucket.available.unsigned_abs();
-        let wait_nanos = u128::from(deficit).saturating_mul(NANOS_PER_SEC) / rate_u128;
-        Duration::from_nanos(u64::try_from(wait_nanos).unwrap_or(u64::MAX))
+        let wait_nanos = u128::from(deficit).saturating_mul(NANOS_PER_SEC) / u128::from(rate);
+        (
+            Duration::from_nanos(u64::try_from(wait_nanos).unwrap_or(u64::MAX)),
+            rate,
+        )
+    }
+
+    /// Takes a debit for [`request_interruptible`](Self::request_interruptible):
+    /// the wait, its rate and the change count, under one lock, so a rate
+    /// change cannot fall between them. `None` when the rate is `0`.
+    #[cfg(feature = "std")]
+    fn debit(&self, bytes: u64, now: Duration) -> Option<Debit> {
+        let mut bucket = self.bucket.lock();
+        let (wait, rate) = Self::debit_locked(&mut bucket, self.rate(), bytes, now);
+        (rate != 0).then_some(Debit {
+            wait,
+            rate,
+            changes: bucket.changes,
+        })
+    }
+
+    /// Returns a debit taken at change count `taken_at`, for a request that
+    /// then did no I/O. Nothing is returned once the rate was switched off
+    /// since: that bucket, and the debit with it, is already gone.
+    #[cfg(feature = "std")]
+    fn refund(&self, bytes: u64, taken_at: u64) {
+        let mut bucket = self.bucket.lock();
+        if bucket.last_off > taken_at {
+            return;
+        }
+        let credit = i64::try_from(bytes).unwrap_or(i64::MAX);
+        bucket.available = bucket.available.saturating_add(credit);
+        bucket.cap(self.rate());
     }
 
     /// Interruptible blocking request: waits (sleeping the current thread)
@@ -312,22 +375,34 @@ impl RateLimiter {
             return true;
         }
         // Debit once, then sleep the computed wait in interruptible chunks.
-        let mut rate = self.rate_bytes_per_sec.load(Ordering::Relaxed);
-        let mut remaining = self.acquire_wait(bytes, Self::std_now());
+        let Some(debit) = self.debit(bytes, Self::std_now()) else {
+            return false;
+        };
+        let mut rate = debit.rate;
+        let mut seen = debit.changes;
+        let mut remaining = debit.wait;
         while !remaining.is_zero() {
             if should_stop() {
+                // No I/O follows, so the debit is withdrawn: a caller sharing
+                // the limiter does not wait out work that never happened.
+                self.refund(bytes, debit.changes);
                 return true;
             }
-            // A rate changed mid-wait applies to what is still owed: switched
-            // off, the caller goes; otherwise the rest is repaid at the new
-            // rate (owed bytes = remaining time × old rate).
-            let now_rate = self.rate_bytes_per_sec.load(Ordering::Relaxed);
-            if now_rate == 0 {
+            // A change since the debit applies to what is still owed. Any
+            // switch off releases the caller, even one already undone; any
+            // other change repays the rest at the rate now in force (owed
+            // bytes = remaining time × the rate it was counted at).
+            let (off_since, now_rate, changes) = {
+                let bucket = self.bucket.lock();
+                (bucket.last_off > debit.changes, self.rate(), bucket.changes)
+            };
+            if off_since {
                 return false;
             }
-            if now_rate != rate {
+            if changes != seen {
                 remaining = Self::rescale(remaining, rate, now_rate);
                 rate = now_rate;
+                seen = changes;
                 continue;
             }
             let chunk = remaining.min(Self::POLL_INTERVAL);
@@ -377,5 +452,5 @@ impl RateLimiter {
 }
 
 #[cfg(test)]
-#[expect(clippy::unwrap_used, reason = "test code")]
+#[expect(clippy::unwrap_used, clippy::expect_used, reason = "test code")]
 mod tests;

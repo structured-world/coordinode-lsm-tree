@@ -250,6 +250,59 @@ fn a_caller_mid_wait_finishes_at_the_new_rate() {
     assert!(took < Duration::from_secs(1), "finished after {took:?}");
 }
 
+/// Switching throttling off releases a waiter even when it is switched back
+/// on before the waiter looks again: the release is an event, not a rate
+/// the waiter has to catch at 0.
+#[cfg(feature = "std")]
+#[test]
+fn a_brief_switch_off_still_releases_a_caller_mid_wait() {
+    let rl = alloc::sync::Arc::new(RateLimiter::new(1));
+    let (done_tx, done_rx) = std::sync::mpsc::channel();
+    let waiter = {
+        let rl = alloc::sync::Arc::clone(&rl);
+        std::thread::spawn(move || {
+            // 1 B/s: roughly an hour of debt.
+            let stopped = rl.request_interruptible(3_600, || false);
+            done_tx.send(stopped).unwrap();
+        })
+    };
+    std::thread::sleep(ms(300));
+    // Off and back on, well inside one sleep chunk.
+    rl.set_rate(0);
+    rl.set_rate(1);
+    let stopped = done_rx
+        .recv_timeout(Duration::from_secs(5))
+        .expect("a switch off must release the waiter");
+    assert!(!stopped, "a released caller proceeds, it is not stopped");
+    waiter.join().unwrap();
+}
+
+/// A request abandoned mid-wait did no I/O, so its debit is returned: the
+/// next caller on the limiter, possibly another tree's, does not wait out
+/// work that never happened.
+#[cfg(feature = "std")]
+#[test]
+fn a_cancelled_request_returns_its_debit() {
+    let rl = alloc::sync::Arc::new(RateLimiter::new(1_000));
+    let stop = alloc::sync::Arc::new(core::sync::atomic::AtomicBool::new(false));
+    let waiter = {
+        let rl = alloc::sync::Arc::clone(&rl);
+        let stop = alloc::sync::Arc::clone(&stop);
+        std::thread::spawn(move || {
+            // 1000 B of burst, then 5000 B of debt: five seconds at 1000 B/s.
+            rl.request_interruptible(6_000, || stop.load(core::sync::atomic::Ordering::Relaxed))
+        })
+    };
+    std::thread::sleep(ms(150));
+    stop.store(true, core::sync::atomic::Ordering::Relaxed);
+    assert!(waiter.join().unwrap(), "the request was cancelled");
+    let owed = rl.acquire_wait(100, RateLimiter::std_now());
+    assert!(
+        owed < ms(500),
+        "the cancelled debit must not burden the next request (owes {owed:?})"
+    );
+}
+
 #[test]
 fn backwards_clock_step_does_not_underflow() {
     // A non-monotonic `now` (earlier than last_refill) must not panic
