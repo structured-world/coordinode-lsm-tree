@@ -827,6 +827,7 @@ impl AbstractTree for Tree {
         stream: impl Iterator<Item = crate::Result<InternalValue>>,
         range_tombstones: Vec<crate::range_tombstone::RangeTombstone>,
         keys: u64,
+        hashes: u64,
     ) -> crate::Result<
         Option<(
             Vec<Table>,
@@ -898,7 +899,12 @@ impl AbstractTree for Tree {
             }
         };
         table_writer = table_writer.use_bloom_policy(bloom_policy);
-        let filter_sizing = self.new_data_filter_sizing(0, bloom_policy, keys, rc.ecc_scheme);
+        let filter_sizing = self.new_data_filter_sizing(
+            0,
+            bloom_policy,
+            crate::filter_budget::FilterCount { keys, hashes },
+            rc.ecc_scheme,
+        );
         table_writer = table_writer.use_filter_sizing(filter_sizing.clone());
 
         if index_partitioning {
@@ -1853,8 +1859,9 @@ impl AbstractTree for Tree {
 
 impl Tree {
     /// The filter plan of new data written into tables under the policies of
-    /// `level`, as a flush or an ingestion writes it: at most `keys` filter
-    /// hashes (zero when unknown) under `bloom_policy`. `None` without an advisor.
+    /// `level`, as a flush or an ingestion writes it: at most `count` keys and
+    /// filter hashes (zero when unknown) under `bloom_policy`. `None` without
+    /// an advisor.
     /// New data has no probe history of its own: its filters are sized by the
     /// load the live tables draw per key, and room is kept for every table the
     /// write fills. The plan is held until the tables are installed (see
@@ -1866,7 +1873,7 @@ impl Tree {
         &self,
         level: usize,
         bloom_policy: crate::table::filter::BloomConstructionPolicy,
-        keys: u64,
+        count: crate::filter_budget::FilterCount,
         ecc_scheme: crate::runtime_config::EccScheme,
     ) -> Option<crate::filter_budget::FilterPlan> {
         let advisor = self.config.filter_advisor.as_ref()?;
@@ -1876,7 +1883,7 @@ impl Tree {
             &self.filter_budget,
             &crate::filter_budget::live(&version),
             crate::filter_budget::Rewrite {
-                keys,
+                count,
                 framing: crate::filter_budget::Framing {
                     encryption: self.config.encryption.clone(),
                     ecc: crate::table::writer::resolve_ecc(self.config.page_ecc, ecc_scheme),

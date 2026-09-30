@@ -163,23 +163,17 @@ pub struct FilterSizing {
     spent_estimate: AtomicU64,
     /// Keys a partition of the destination level holds, when partitioned.
     partition_keys: Option<usize>,
-    /// Keys this rewrite has still to write filters for, bounded from above
-    /// by its inputs' entries: each filter leaves room for the narrowest
-    /// width over them, so a filter chosen early cannot crowd out the later
-    /// ones. Zero for a flush.
-    pending_keys: AtomicU64,
-    /// Keys the filters this rewrite has built cover, which a count of all
-    /// its entries learnt after the plan (see [`Self::expect_keys`]) is short
-    /// of.
+    /// Keys this rewrite writes filters for, bounded from above: each filter
+    /// leaves room for the narrowest width over the ones not yet covered, so
+    /// a filter chosen early cannot crowd out the later ones.
+    total_keys: AtomicU64,
+    /// Keys the filters this rewrite has built cover.
     admitted_keys: AtomicU64,
-    /// The entries a count learnt after the plan names (see
-    /// [`Self::expect_keys`]), `u64::MAX` before one is: the keys still to
-    /// come are then those entries less the ones admitted, in hashes.
-    expected_entries: AtomicU64,
-    /// The most hashes a filter of this rewrite has held per key it covers,
-    /// as a fraction: under a prefix extractor a full filter holds a hash per
-    /// prefix besides one per key, and the entries still to come are counted
-    /// in hashes by it.
+    /// Hashes a key still to come holds, as a fraction: under a prefix
+    /// extractor a full filter holds a hash per prefix besides one per key.
+    /// The plan's estimate until a filter is built, then the most any filter
+    /// of this rewrite has held, since where the rewrite writes, not where
+    /// its inputs lie, decides whether prefixes are hashed.
     hashes_per_key: (AtomicU64, AtomicU64),
     /// This rewrite's part of [`FilterBudget::reserved`]: the room it keeps
     /// for the keys it has still to write filters for.
@@ -281,14 +275,23 @@ pub struct Rewrite {
     pub split: Option<Split>,
     /// The keys it writes, when it rewrites only part of its inputs.
     pub span: Option<Span>,
-    /// Keys it writes filters for, bounded from above, when it has no
-    /// inputs to count them from: the filter hashes of a flush's memtables.
-    pub keys: u64,
+    /// Keys it writes filters for and the hashes they hold, bounded from
+    /// above, when it has no inputs to count them from: a flush's memtables.
+    pub count: FilterCount,
     /// The order of the tree's keys, which reads an input's share of a key
     /// range from its key range alone where that settles it.
     pub comparator: Option<crate::comparator::SharedComparator>,
     /// How its filter blocks are framed on disk.
     pub framing: Framing,
+}
+
+/// Keys a filter covers, and the hashes it holds over them: more than the
+/// keys under a prefix extractor, which a full filter hashes each distinct
+/// prefix for.
+#[derive(Clone, Copy, Debug, Default, PartialEq, Eq)]
+pub struct FilterCount {
+    pub keys: u64,
+    pub hashes: u64,
 }
 
 /// The part of its inputs a rewrite writes: its keys from `lower` through
@@ -508,7 +511,7 @@ pub fn plan(
         inputs,
         split,
         span,
-        keys,
+        count,
         comparator,
         framing,
     } = rewrite;
@@ -581,27 +584,28 @@ pub fn plan(
         })
         .map(|live| u64::from(live.table.filter_size()))
         .sum();
-    // The inputs' keys within the span. A share that cannot be read counts
-    // the input whole: the room kept for later keys errs on the large side.
-    let pending_keys: u64 = if inputs.is_empty() {
-        keys
+    // The inputs' keys within the span, and their hashes. A share that cannot
+    // be read counts the input whole: the room kept for later keys errs on
+    // the large side.
+    let pending = if inputs.is_empty() {
+        count
     } else {
-        inputs
-            .iter()
-            .zip(&input_keys)
-            .map(|(input, &keys)| {
-                let share = span.as_ref().map_or(1.0, |span| {
-                    crate::table::probe_stats::fraction_of(input, span.bounds()).unwrap_or(1.0)
-                });
-                #[expect(
-                    clippy::cast_possible_truncation,
-                    clippy::cast_sign_loss,
-                    reason = "a share of the input's own key count"
-                )]
-                let covered = libm::ceil(as_f64(keys) * share) as u64;
-                covered
-            })
-            .sum()
+        let mut pending = FilterCount::default();
+        for (input, &hashes) in inputs.iter().zip(&input_keys) {
+            let share = span.as_ref().map_or(1.0, |span| {
+                crate::table::probe_stats::fraction_of(input, span.bounds()).unwrap_or(1.0)
+            });
+            #[expect(
+                clippy::cast_possible_truncation,
+                clippy::cast_sign_loss,
+                reason = "a share of the input's own key count"
+            )]
+            let covered = |count: u64| libm::ceil(as_f64(count) * share) as u64;
+            // An input's counts are far below 2^63, and so are their sums.
+            pending.keys += covered(served_distinct_keys(input));
+            pending.hashes += covered(hashes);
+        }
+        pending
     };
 
     // A partitioned level builds a table's filter as partitions of about
@@ -621,10 +625,18 @@ pub fn plan(
         replaced_released: AtomicBool::new(false),
         spent_estimate: AtomicU64::new(0.0f64.to_bits()),
         partition_keys,
-        pending_keys: AtomicU64::new(pending_keys),
+        total_keys: AtomicU64::new(pending.keys),
         admitted_keys: AtomicU64::new(0),
-        expected_entries: AtomicU64::new(u64::MAX),
-        hashes_per_key: (AtomicU64::new(1), AtomicU64::new(1)),
+        // Until a filter is built, the hashes a key holds in what it replaces;
+        // one a key without a count.
+        hashes_per_key: if pending.keys == 0 {
+            (AtomicU64::new(1), AtomicU64::new(1))
+        } else {
+            (
+                AtomicU64::new(pending.hashes.max(pending.keys)),
+                AtomicU64::new(pending.keys),
+            )
+        },
         reservation: AtomicU64::new(0),
         typical_keys: AtomicU64::new(0),
         table_keys: AtomicU64::new(0),
@@ -646,7 +658,7 @@ pub fn plan(
     // rewrite's to build into, and no other rewrite's. It is exchanged, in one
     // step no admission sees half of, for the room every filter this rewrite
     // writes takes, reserved before any of them.
-    let floor = sizing.floor_for(pending_keys);
+    let floor = sizing.floor_for(sizing.pending_hashes(0));
     {
         let _admission = state.admission.lock();
         #[expect(
@@ -962,14 +974,7 @@ impl FilterSizing {
         let per_filter = self.typical_keys.load(Relaxed).max(n);
         let ratio = self.ratio_with(n, keys);
         let admitted = self.admitted_keys.load(Relaxed) + keys;
-        let later = match self.expected_entries.load(Relaxed) {
-            // The pending count bounds the rewrite's keys from above: a
-            // filter over more keys than it holds leaves none pending.
-            u64::MAX => self.pending_keys.load(Relaxed).saturating_sub(n),
-            // Counted in entries, as the caller told them: the ones still to
-            // come hold hashes at the highest rate a filter has shown.
-            entries => in_hashes(entries.saturating_sub(admitted), ratio),
-        };
+        let later = self.pending_at(admitted, ratio);
         let floor = self.floor(later, per_filter, frame);
         let used = self.state.held();
         let mine = self.reservation.load(Relaxed);
@@ -990,7 +995,6 @@ impl FilterSizing {
         // With the held bytes, so the end of the rewrite gives back all it took.
         self.spent.fetch_add(bytes, Relaxed);
         self.set_reservation(mine, floor);
-        self.pending_keys.store(later, Relaxed);
         self.admitted_keys.store(admitted, Relaxed);
         self.hashes_per_key.0.store(ratio.0, Relaxed);
         self.hashes_per_key.1.store(ratio.1, Relaxed);
@@ -1135,29 +1139,51 @@ impl FilterSizing {
     /// its caller tells): the ones no filter holds yet count as still to come.
     pub fn expect_keys(&self, keys: u64) {
         let _admission = self.state.admission.lock();
-        self.expected_entries.store(keys, Relaxed);
-        let admitted = self.admitted_keys.load(Relaxed);
-        let ratio = (
-            self.hashes_per_key.0.load(Relaxed),
-            self.hashes_per_key.1.load(Relaxed),
-        );
-        // Fewer keys than the filters already hold leaves none to come.
-        let pending = in_hashes(keys.saturating_sub(admitted), ratio);
-        self.pending_keys.store(pending, Relaxed);
+        self.total_keys.store(keys, Relaxed);
+        let pending = self.pending_hashes(self.admitted_keys.load(Relaxed));
         self.set_reservation(self.reservation.load(Relaxed), self.floor_for(pending));
     }
 
-    /// The most hashes per key a filter of this rewrite holds once one of `n`
-    /// hashes over `keys` keys is counted, as a fraction. The admission lock
-    /// is held.
+    /// The hashes the keys still to come hold once `admitted` keys have
+    /// filters, at the current rate.
+    fn pending_hashes(&self, admitted: u64) -> u64 {
+        self.pending_at(
+            admitted,
+            (
+                self.hashes_per_key.0.load(Relaxed),
+                self.hashes_per_key.1.load(Relaxed),
+            ),
+        )
+    }
+
+    /// The hashes the keys still to come hold once `admitted` keys have
+    /// filters, at `ratio` hashes a key.
+    fn pending_at(&self, admitted: u64, ratio: (u64, u64)) -> u64 {
+        // The total bounds the keys from above: filters over more keys than
+        // it leave none to come.
+        in_hashes(
+            self.total_keys.load(Relaxed).saturating_sub(admitted),
+            ratio,
+        )
+    }
+
+    /// The hashes a key still to come holds once a filter of `n` hashes over
+    /// `keys` keys is counted, as a fraction: the plan's estimate gives way
+    /// to the first filter's, and after that the most any filter has held.
+    /// The admission lock is held.
     fn ratio_with(&self, n: u64, keys: u64) -> (u64, u64) {
         let held = (
             self.hashes_per_key.0.load(Relaxed),
             self.hashes_per_key.1.load(Relaxed),
         );
+        // A filter over no key says nothing of the rate.
+        if keys == 0 {
+            return held;
+        }
+        let first = self.admitted_keys.load(Relaxed) == 0;
         // Filter hash and key counts, far below 2^32 each, so the products
-        // fit; a filter over no key says nothing of the rate.
-        if keys > 0 && u128::from(n) * u128::from(held.1) > u128::from(held.0) * u128::from(keys) {
+        // fit.
+        if first || u128::from(n) * u128::from(held.1) > u128::from(held.0) * u128::from(keys) {
             (n, keys)
         } else {
             held
@@ -1679,7 +1705,23 @@ fn filter_keys(table: &Table) -> u64 {
 /// suffix's share is its share of the data section; one that cannot be read
 /// counts the table whole.
 fn served_keys(table: &Table) -> u64 {
-    let keys = filter_keys(table);
+    served(table, filter_keys(table))
+}
+
+/// The distinct keys a table's view serves, the entries bounding them from
+/// above where the table does not record them (see [`served_keys`]).
+fn served_distinct_keys(table: &Table) -> u64 {
+    served(
+        table,
+        table
+            .metadata
+            .key_count
+            .unwrap_or(table.metadata.item_count),
+    )
+}
+
+/// The part of `keys`, a count over the whole of `table`, its view serves.
+fn served(table: &Table, keys: u64) -> u64 {
     if table.restrict_lower_bound().is_none() {
         return keys;
     }

@@ -329,7 +329,7 @@ fn a_restricted_table_is_priced_by_the_keys_it_serves() -> crate::Result<()> {
     );
     let served = u64::from(KEYS) / 10 + u64::from(KEYS);
     let pending = sizing
-        .pending_keys
+        .total_keys
         .load(core::sync::atomic::Ordering::Relaxed);
     assert!(
         pending.abs_diff(served) <= served / 10,
@@ -970,7 +970,10 @@ fn concurrent_plans_reserve_room_for_each_others_later_filters() {
             &state,
             &[],
             super::Rewrite {
-                keys: 2 * KEYS as u64,
+                count: super::FilterCount {
+                    keys: 2 * KEYS as u64,
+                    hashes: 2 * KEYS as u64,
+                },
                 ..super::Rewrite::default()
             },
             BloomConstructionPolicy::BitsPerKey(16.0),
@@ -1016,7 +1019,10 @@ fn a_rewrite_ends_with_its_plan_not_with_the_last_reference() {
         &state,
         &[],
         super::Rewrite {
-            keys: 2 * KEYS as u64,
+            count: super::FilterCount {
+                keys: 2 * KEYS as u64,
+                hashes: 2 * KEYS as u64,
+            },
             ..super::Rewrite::default()
         },
         BloomConstructionPolicy::BitsPerKey(6.0),

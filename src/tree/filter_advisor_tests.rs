@@ -824,6 +824,71 @@ fn an_ingestion_told_its_entries_keeps_room_for_the_later_prefix_hashes() -> cra
     Ok(())
 }
 
+/// A compaction keeps room for its later outputs in the hashes they hold, not
+/// in the hashes its inputs held: inputs of partitioned filters hold a hash a
+/// key, outputs of full filters under a prefix extractor one more for each
+/// key's prefix, and a first output claiming its hashes against the inputs'
+/// would leave the later ones none.
+#[test]
+fn a_compaction_keeps_room_for_the_later_outputs_prefix_hashes() -> crate::Result<()> {
+    use crate::config::PinningPolicy;
+
+    const KEYS: usize = 6_000;
+    const VALUE: usize = 1_024;
+    let folder = tempfile::tempdir()?;
+    // Every key has its own prefix: two hashes a key in a full filter.
+    let narrowest = BloomConstructionPolicy::BitsPerKey(6.0).filter_size_bound(2 * KEYS) as u64;
+    let budget = narrowest * 5 / 4;
+    let tree = Config::new(
+        folder.path(),
+        SequenceNumberCounter::default(),
+        SequenceNumberCounter::default(),
+    )
+    .data_block_size_policy(BlockSizePolicy::all(1_024))
+    .filter_block_partitioning_policy(PinningPolicy::new([true, false]))
+    .prefix_extractor(std::sync::Arc::new(UpToColon))
+    .filter_advisor(Some(
+        FilterAdvisor::new(budget).with_bits_per_key([6u8, 10].to_vec()),
+    ))
+    .open()?;
+    let mut state: u64 = 0x9E37_79B9_7F4A_7C15;
+    let mut value = vec![0u8; VALUE];
+    for i in 0..KEYS {
+        for byte in &mut value {
+            // xorshift: incompressible bytes.
+            state ^= state << 13;
+            state ^= state >> 7;
+            state ^= state << 17;
+            *byte = state.to_le_bytes()[0];
+        }
+        tree.insert(format!("key{i:06}:x"), value.as_slice(), i as u64);
+    }
+    tree.flush_active_memtable(0)?;
+    assert!(
+        tables(&tree)
+            .iter()
+            .all(|table| table.regions.filter_tli.is_some()),
+        "the inputs' filters are partitioned"
+    );
+    tree.major_compact(1_024 * 1_024, 0)?;
+
+    let tables = tables(&tree);
+    assert!(tables.len() >= 3, "{} tables", tables.len());
+    assert!(
+        tables
+            .iter()
+            .all(|table| table.regions.filter_tli.is_none()),
+        "the outputs' filters are full"
+    );
+    let memory = tree.filter_memory();
+    let sizes: Vec<(u64, u32)> = tables
+        .iter()
+        .map(|table| (table.metadata.item_count, table.filter_size()))
+        .collect();
+    assert!(!memory.over_budget, "{memory:?} {sizes:?}");
+    Ok(())
+}
+
 /// A blob tree's ingestion takes the entry count as a standard one does, for
 /// the filters of the index tables it writes.
 #[test]

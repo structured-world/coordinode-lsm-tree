@@ -29,14 +29,15 @@ use spin::RwLock;
 
 pub use crate::tree::inner::MemtableId;
 
-/// The hashes a table filter built over `keys`, in the table's key order,
-/// holds: one per distinct key and, with `prefixes`, one per prefix at a
-/// position where the key before had another, as a full filter registers
-/// them. Versions of a key add none.
-pub fn filter_hashes(
+/// The distinct keys among `keys`, in the table's key order, and the hashes a
+/// table filter built over them holds: one per distinct key and, with
+/// `prefixes`, one per prefix at a position where the key before had another,
+/// as a full filter registers them. Versions of a key add none.
+pub fn filter_count(
     keys: impl Iterator<Item = crate::UserKey>,
     prefixes: Option<&dyn crate::PrefixExtractor>,
-) -> u64 {
+) -> crate::filter_budget::FilterCount {
+    let mut distinct = 0u64;
     let mut hashes = 0u64;
     let mut previous: Option<crate::UserKey> = None;
     let mut previous_prefixes: Vec<u64> = Vec::new();
@@ -47,6 +48,7 @@ pub fn filter_hashes(
         {
             continue;
         }
+        distinct += 1;
         hashes += 1;
         if let Some(extractor) = prefixes {
             for (position, prefix) in extractor.prefixes(&key).enumerate() {
@@ -66,7 +68,10 @@ pub fn filter_hashes(
         }
         previous = Some(key);
     }
-    hashes
+    crate::filter_budget::FilterCount {
+        keys: distinct,
+        hashes,
+    }
 }
 
 /// The memtable serves as an intermediary, ephemeral, sorted storage for new items

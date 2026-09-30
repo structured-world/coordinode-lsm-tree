@@ -1070,6 +1070,7 @@ impl AbstractTree for BlobTree {
         stream: impl Iterator<Item = crate::Result<InternalValue>>,
         range_tombstones: Vec<crate::range_tombstone::RangeTombstone>,
         keys: u64,
+        hashes: u64,
     ) -> crate::Result<
         Option<(
             Vec<Table>,
@@ -1140,9 +1141,12 @@ impl AbstractTree for BlobTree {
             }
         };
         table_writer = table_writer.use_bloom_policy(bloom_policy);
-        let filter_sizing = self
-            .index
-            .new_data_filter_sizing(0, bloom_policy, keys, rc.ecc_scheme);
+        let filter_sizing = self.index.new_data_filter_sizing(
+            0,
+            bloom_policy,
+            crate::filter_budget::FilterCount { keys, hashes },
+            rc.ecc_scheme,
+        );
         table_writer = table_writer.use_filter_sizing(filter_sizing.clone());
 
         if index_partitioning {

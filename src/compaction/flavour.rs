@@ -133,7 +133,7 @@ pub(super) fn plan_filters(
             inputs,
             split,
             span,
-            keys: 0,
+            count: crate::filter_budget::FilterCount::default(),
             comparator: Some(opts.config.comparator.clone()),
             framing: crate::filter_budget::Framing {
                 encryption: opts.config.encryption.clone(),

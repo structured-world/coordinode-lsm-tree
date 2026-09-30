@@ -502,10 +502,11 @@ pub trait AbstractTree: sealed::Sealed {
             .collect::<Vec<_>>();
 
         let flushed_size = latest.sealed_memtables.iter().map(|mt| mt.size()).sum();
-        // The hashes the flush's filters hold, which the filter plan keeps room
-        // for: counted only when a filter budget plans them, over the merge
-        // the flush writes, so a key in several memtables counts once.
-        let flushed_hashes: u64 = if self.tree_config().filter_advisor.is_some() {
+        // The keys the flush's filters cover and the hashes they hold, which
+        // the filter plan keeps room for: counted only when a filter budget
+        // plans them, over the merge the flush writes, so a key in several
+        // memtables counts once.
+        let flushed = if self.tree_config().filter_advisor.is_some() {
             // A partitioned filter holds no prefix hashes.
             let prefixes = if self.tree_config().filter_block_partitioning_policy.get(0) {
                 None
@@ -521,12 +522,12 @@ pub trait AbstractTree: sealed::Sealed {
                 self.tree_config().comparator.clone(),
             );
             // Memtable entries read without I/O: the merge yields no error.
-            crate::memtable::filter_hashes(
+            crate::memtable::filter_count(
                 merged.filter_map(|item| item.ok().map(|item| item.key.user_key)),
                 prefixes,
             )
         } else {
-            0
+            crate::filter_budget::FilterCount::default()
         };
 
         // AtInsert residence check: verify each sealed memtable's insert-time
@@ -580,9 +581,12 @@ pub trait AbstractTree: sealed::Sealed {
         // Clone needed: flush_to_tables_with_rt consumes the Vec, but on the
         // RT-only path (no KV data, tables.is_empty()) we re-insert RTs into the
         // active memtable. Flush is infrequent and RT count is small.
-        if let Some((tables, blob_files, write_pin)) =
-            self.flush_to_tables_with_rt(stream, range_tombstones.clone(), flushed_hashes)?
-        {
+        if let Some((tables, blob_files, write_pin)) = self.flush_to_tables_with_rt(
+            stream,
+            range_tombstones.clone(),
+            flushed.keys,
+            flushed.hashes,
+        )? {
             // If no tables were produced (RT-only memtable), re-insert RTs
             // into active memtable so they aren't lost
             if tables.is_empty() && !range_tombstones.is_empty() {
@@ -869,18 +873,18 @@ pub trait AbstractTree: sealed::Sealed {
         stream: impl Iterator<Item = crate::Result<InternalValue>>,
     ) -> crate::Result<Option<FlushToTablesResult>> {
         // The stream's upper bound, when it tells one, is the most entries it
-        // holds.
+        // holds; the hashes over them are learnt from the first filter.
         let keys = stream
             .size_hint()
             .1
             .map_or(0, |upper| u64::try_from(upper).unwrap_or(u64::MAX));
-        self.flush_to_tables_with_rt(stream, Vec::new(), keys)
+        self.flush_to_tables_with_rt(stream, Vec::new(), keys, keys)
     }
 
     /// Like [`AbstractTree::flush_to_tables`], but also writes range tombstones.
-    /// `keys` bounds the filter hashes of `stream` from above, zero when
-    /// unknown: a filter advisor keeps room for every table the flush writes
-    /// by it.
+    /// `keys` bounds the distinct keys of `stream` from above and `hashes` the
+    /// filter hashes over them, zero when unknown: a filter advisor keeps room
+    /// for every table the flush writes by them.
     ///
     /// This is an internal extension hook on the crate's sealed tree types and
     /// is hidden from generated documentation.
@@ -894,6 +898,7 @@ pub trait AbstractTree: sealed::Sealed {
         stream: impl Iterator<Item = crate::Result<InternalValue>>,
         range_tombstones: Vec<crate::range_tombstone::RangeTombstone>,
         keys: u64,
+        hashes: u64,
     ) -> crate::Result<Option<FlushToTablesResult>>;
 
     /// Atomically registers flushed tables into the tree, removing their associated sealed memtables.
