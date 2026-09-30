@@ -1,5 +1,5 @@
 window.BENCHMARK_DATA = {
-  "lastUpdate": 1790697268835,
+  "lastUpdate": 1790752881180,
   "repoUrl": "https://github.com/structured-world/coordinode-lsm-tree",
   "entries": {
     "lsm-tree db_bench costs": [
@@ -27166,6 +27166,90 @@ window.BENCHMARK_DATA = {
             "value": 647415.1303505624,
             "unit": "ops/sec",
             "extra": "P50: 1.2us | P99: 6.4us | P99.9: 72.8us\nthreads: 1 | elapsed: 0.31s | num: 200000 | iterations: 3"
+          }
+        ]
+      },
+      {
+        "commit": {
+          "author": {
+            "email": "mail@polaz.com",
+            "name": "Dmitry Prudnikov",
+            "username": "polaz"
+          },
+          "committer": {
+            "email": "noreply@github.com",
+            "name": "GitHub",
+            "username": "web-flow"
+          },
+          "distinct": true,
+          "id": "397e9b07389ebc04754c6301497811daaece23a4",
+          "message": "perf(filter): size filters by measured negative-probe load (#748)\n\n## Summary\n\n- An optional filter advisor sizes each filter a flush, ingestion or\ncompaction writes by the negative probes its key range draws, against a\ntree-wide budget of serialised filter bytes, instead of one static width\nper level.\n- Off by default; with it off, tables are byte-identical to the static\npolicy apart from the filter meta keys (below) and the probe path does\nnot count.\n\n## Changes\n\n- Per-table probe statistics: probes that reached a filter, and among\nthem keys the table holds no version of (true negatives and false\npositives). Keys invisible at the snapshot, tombstoned keys,\nrange-pruned reads, tables a range tombstone covers and keys a partition\nindex rules out alone do not count. Point reads, prefix scans and the\nfilter checks of merge-operand resolution count alike, a pass whose read\nthen finds nothing as a false positive. Counts halve once the live\ntables hold more probes than the window, once per crossing however many\nrewrites plan together.\n- A compaction output inherits its inputs' counts by the share of their\ndata blocks it covers (the block goes to the output holding its last\nkey); where inputs overlap, each part of the range takes the counts of\nthe oldest input with a filter there, since the same lookups probed\neach; a restricted table keeps its suffix's share, and its density and\nthe keys still to write are over the keys it serves.\n- The advisor chooses each filter's width from a discrete set by\nexpected false positives plus a price per filter byte, the price set so\nthe filters fill the budget and set again before each filter from the\ndata and the budget a compaction has left. Each live table is priced as\nits own level builds it (static width, partitioned or not, a short last\npartition as its own filter), whatever level the rewrite writes.\nPer-table densities are shrunk towards their mean by the noise in their\ncounts, so an even load gets one width.\n- Filters are admitted by their encoded bytes, retried narrower when\nthey leave no room for the keys still to come; the narrowest is always\nwritten, and built alone when even the narrowest widths do not fit. The\ntree reports the over-budget state while the live filters exceed the\nbudget (a lowered budget, or keys no configured width fits).\n- Filters built side by side (a table's partitions on the writer's\nworkers) price as they would built in turn: one priced while an earlier\none is in flight counts that one's data as still to come.\n- The price search reads an input's share of a key range from its key\nrange where that settles it, and works out a full partition's sizes once\nper key count.\n- Every writer of new tables plans its filters: a flush of either tree\nkind, an ingestion, a compaction and each tight-space slice. Each keeps\nroom for every table it rotates into by the keys still to come: a flush\ncounts its memtables' distinct keys, a compaction its inputs', an\ningestion takes its entry count when given one\n(`AnyIngestion::expected_entries`). The keys are converted to filter\nhashes at the plan's estimate until the first filter, then at the\nhighest rate any filter of the rewrite has held, since where a rewrite\nwrites decides whether prefixes are hashed. A compaction's estimate from\nits inputs' shares (which counts a key in several overlapping inputs\nonce in each, and reads a slice's share of data bytes as one of keys) is\ncorrected by the keys each built filter covers against the estimate for\nits range; the price groups the data still to come into output tables in\nkey order rather than one filter per input, and before any filter is\nbuilt takes the correction from the filter being priced.\n- The held filter bytes are one figure per tree: the published version's\nfilters plus what each rewrite in progress has built. Rewrites running\ntogether draw on it, each reserving in it the room its later filters\ntake at the narrowest width. The room a compaction's install would free\nis its own to build into: the held bytes keep counting the filters it\nreplaces, since it may still fail and leave them live, and the others\nkeep room only for the part of its floor those do not cover. A rewrite\nsettles when the last of its writers and installs lets go of its plan;\none that fails gives its room back.\n- A table with a filter records how it was built in meta keys: the\nhashes it holds (`filter_hashes`, under a prefix extractor more than its\nkeys), the static width it was written under (`filter_bits`) and a\npartitioned filter's largest partition (`filter_partition_hashes`). The\nadvisor prices each table by these rather than by the level it lies in,\nwhich a compaction written for another level or a move leaves out of\nstep. Densities count distinct keys, not versions; tables without a\nfilter stay out of the price; a split compaction prices by what every\nkey range has still to write.\n- `AbstractTree::filter_memory` reports serialised and resident filter\nbytes (both at on-disk size), the budget and the over-budget state.\n- Config: `Config::filter_advisor`, `FilterAdvisor` (budget, width set,\nwindow).\n- The price counts each filter block at its on-disk size, framing\n(header, encryption tag, parity) included, as the budget does.\n- The expected size of a BuRR filter follows the layers a build makes,\nexact for short filters where the partition-split estimate runs up to\n30% short.\n- `benches/filter_advisor.rs`: cold absent-key lookups at the static\npolicy's filter bytes, skewed and uniform; probe-counting cost; rewrite\ncost; per-read p50/p99/p999; tree size from `FA_RANGES`, `FA_KEYS`,\n`FA_LOOKUPS`; `FA_PARTITIONED=1` partitions the filters.\n\n## Measurements\n\nAbsent-key lookups at the static policy's filter bytes, false positives\nper 200k lookups (macOS and Windows alike), every rewrite within the\nbudget:\n\n| Static width | Skewed | Uniform |\n|---|---|---|\n| 10 bits | 253 → 34 | 209 → 211 |\n| 4 bits | 12551 → 2162 | 12483 → 12567 |\n\nWindows cold lookup time: skewed at 4 bits 15.86 → 14.43 ms; at 10 bits\nwithin 0.5% (false positives are too rare there to move it). Advisor off\nagainst the base: cached point reads 262-264 ns against 273-276 ns. The\nrewrite of the skewed tree: 108.9 ms static, 116.6 ms with the advisor\n(macOS). At 396 inputs (724 tables) one compaction takes 1.93 s static\nand 2.17-2.23 s with the advisor (macOS, one run of each arm on the same\nmachine).\n\n## Testing\n\nFormatting, clippy in both feature sets, the full test suite with and\nwithout all features, doc tests, docs, the no-std check,\n`tools/sst-dump` and the `tools/db_bench` lints pass on macOS; the\nbenchmarks also ran on Windows.\n\nCloses #667",
+          "timestamp": "2026-09-30T10:13:23+03:00",
+          "tree_id": "589eaf20a94d9f4885b0b9cc9b79d80f96d6c3fd",
+          "url": "https://github.com/structured-world/coordinode-lsm-tree/commit/397e9b07389ebc04754c6301497811daaece23a4"
+        },
+        "date": 1790752819635,
+        "tool": "customBiggerIsBetter",
+        "benches": [
+          {
+            "name": "mixed",
+            "value": 69059.2426475531,
+            "unit": "ops/sec",
+            "extra": "P50: 0.4us | P99: 8.0us | P99.9: 27.4us\nthreads: 1 | elapsed: 7.75s | num: 200000 | iterations: 3"
+          },
+          {
+            "name": "fillseq",
+            "value": 2654195.486805994,
+            "unit": "ops/sec",
+            "extra": "P50: 0.2us | P99: 0.9us | P99.9: 4.8us\nthreads: 1 | elapsed: 0.08s | num: 200000 | iterations: 3"
+          },
+          {
+            "name": "fillrandom",
+            "value": 1048967.370296496,
+            "unit": "ops/sec",
+            "extra": "P50: 0.8us | P99: 1.7us | P99.9: 5.1us\nthreads: 1 | elapsed: 0.19s | num: 200000 | iterations: 3"
+          },
+          {
+            "name": "readrandom",
+            "value": 722614.0998631008,
+            "unit": "ops/sec",
+            "extra": "P50: 1.1us | P99: 6.3us | P99.9: 74.6us\nthreads: 1 | elapsed: 0.28s | num: 200000 | iterations: 3"
+          },
+          {
+            "name": "readseq",
+            "value": 2044607.1951771807,
+            "unit": "ops/sec",
+            "extra": "P50: 0.2us | P99: 7.7us | P99.9: 13.9us\nthreads: 1 | elapsed: 0.10s | num: 200000 | iterations: 3"
+          },
+          {
+            "name": "seekrandom",
+            "value": 317102.9977490443,
+            "unit": "ops/sec",
+            "extra": "P50: 2.6us | P99: 8.0us | P99.9: 13.2us\nthreads: 1 | elapsed: 0.63s | num: 200000 | iterations: 3"
+          },
+          {
+            "name": "prefixscan",
+            "value": 181074.27929494384,
+            "unit": "ops/sec",
+            "extra": "P50: 4.7us | P99: 10.9us | P99.9: 17.3us\nthreads: 1 | elapsed: 1.10s | num: 200000 | iterations: 3"
+          },
+          {
+            "name": "overwrite",
+            "value": 747178.0951292206,
+            "unit": "ops/sec",
+            "extra": "P50: 1.1us | P99: 3.1us | P99.9: 7.7us\nthreads: 1 | elapsed: 0.27s | num: 200000 | iterations: 3"
+          },
+          {
+            "name": "mergerandom",
+            "value": 214403.9810531202,
+            "unit": "ops/sec",
+            "extra": "P50: 0.5us | P99: 2.2us | P99.9: 6.7us\nthreads: 1 | elapsed: 0.93s | num: 200000 | iterations: 3"
+          },
+          {
+            "name": "readwhilewriting",
+            "value": 475648.23720006814,
+            "unit": "ops/sec",
+            "extra": "P50: 1.6us | P99: 11.1us | P99.9: 85.8us\nthreads: 1 | elapsed: 0.42s | num: 200000 | iterations: 3"
           }
         ]
       }
