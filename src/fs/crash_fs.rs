@@ -336,6 +336,13 @@ impl Fs for CrashFs {
 
     fn rename(&self, from: &Path, to: &Path) -> io::Result<()> {
         self.inner.rename(from, to)?;
+        // POSIX rename(2): when both names refer to the same file (one path,
+        // or two hard links of one inode) the call succeeds and changes
+        // nothing, so `from` is still there and the crash state stays as it
+        // was. A probe that fails is read as an ordinary rename.
+        if from == to || matches!(self.inner.exists(from), Ok(true)) {
+            return Ok(());
+        }
         let mut state = self.state.lock();
         // The destination is replaced on disk: drop its prior durable image and
         // write-tracking first, then carry the source's across (the rename is
