@@ -331,6 +331,63 @@ fn a_staged_read_counts_its_loads_and_cache_hits() -> lsm_tree::Result<()> {
     Ok(())
 }
 
+/// A Page-ECC table in a level leaves only itself to its own load path: the
+/// level's other tables are still read stage by stage in batches, and the
+/// answer is the key-by-key one.
+#[cfg(feature = "page_ecc")]
+#[test]
+fn a_page_ecc_table_leaves_the_rest_of_its_level_staged() -> lsm_tree::Result<()> {
+    use lsm_tree::runtime_config::EccScheme;
+
+    let dir = tempfile::tempdir()?;
+    let record = Record::default();
+    let config = |ecc: bool| {
+        Config::new(
+            dir.path(),
+            SequenceNumberCounter::default(),
+            SequenceNumberCounter::default(),
+        )
+        .with_shared_fs(Arc::new(StageFs(record.clone())))
+        .use_cache(Arc::new(Cache::with_capacity_bytes(0)))
+        .filter_block_pinning_policy(PinningPolicy::all(false))
+        .index_block_pinning_policy(PinningPolicy::all(false))
+        .page_ecc(ecc)
+        .ecc_scheme(EccScheme::Secded)
+    };
+    for (table, ecc) in [(0u32, false), (1, true), (2, false)] {
+        let tree = config(ecc).open()?;
+        for row in 0..200u32 {
+            tree.insert(
+                format!("t{table:03}r{row:04}"),
+                vec![b'v'; 64],
+                u64::from(table * 1_000 + row),
+            );
+        }
+        tree.flush_active_memtable(0)?;
+    }
+    let tree = config(false).open()?;
+    let keys: Vec<String> = (0..3u32)
+        .flat_map(|table| [format!("t{table:03}r0010"), format!("t{table:03}r0150")])
+        .collect();
+    record.reset(None);
+
+    let values = tree.multi_get(&keys, SeqNo::MAX)?;
+    let calls = record.calls();
+    assert!(
+        calls.first().is_some_and(|&(requests, _)| requests >= 2),
+        "the plain tables' filters are read in one batch, got {calls:?}"
+    );
+    // Past the filter and index batches, the plain tables' data blocks are
+    // read in batches too, rather than the level handed to the serial path.
+    assert!(
+        calls.len() > 2,
+        "the plain tables' data blocks are read in batches, got {calls:?}"
+    );
+    assert_eq!(values, one_by_one(&tree, &keys)?);
+    assert!(values.iter().all(Option::is_some));
+    Ok(())
+}
+
 /// A warm level reads nothing: the filter and index blocks the first read
 /// fetched, and the data blocks it kept, are all taken from the cache.
 #[test]

@@ -199,6 +199,45 @@ fn a_staged_read_plans_what_the_serial_planner_plans() -> crate::Result<()> {
     Ok(())
 }
 
+/// A handle whose size no block of the table can have is refused before a
+/// buffer is allocated for it, as the load path refuses it: a corrupt size
+/// is an error, not a request for gigabytes of memory.
+#[test]
+fn a_block_buffer_is_refused_for_a_size_no_block_can_have() {
+    use crate::table::block::BlockOffset;
+
+    let dir = tempdir().expect("dir");
+    let table = table(dir.path(), |w| w, false, false, 0);
+    assert!(
+        table
+            .block_buffer(&BlockHandle::new(BlockOffset(0), u32::MAX))
+            .is_err()
+    );
+    let buf = table
+        .block_buffer(&BlockHandle::new(BlockOffset(0), 4_096))
+        .expect("a block's size");
+    assert_eq!(4_096, buf.len());
+}
+
+/// A table file a staged read opens is counted in the descriptor cache's
+/// hits and misses, as the load path counts the file it opens.
+#[cfg(feature = "metrics")]
+#[test]
+fn opening_a_table_file_for_a_staged_read_counts_in_the_descriptor_cache() {
+    use core::sync::atomic::Ordering::Relaxed;
+
+    let dir = tempdir().expect("dir");
+    let table = table(dir.path(), |w| w, false, false, 0);
+    let opened = |t: &Table| {
+        t.metrics.table_file_opened_cached.load(Relaxed)
+            + t.metrics.table_file_opened_uncached.load(Relaxed)
+    };
+    let before = opened(&table);
+    table.open_file().expect("open");
+    table.open_file().expect("open");
+    assert_eq!(before + 2, opened(&table));
+}
+
 /// Tiny data blocks and index partitions, so the table's index is split into
 /// dozens of partitions.
 fn many_partitions(w: Writer) -> Writer {

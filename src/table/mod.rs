@@ -7546,9 +7546,24 @@ impl Table {
     ///
     /// Propagates a failure to open the file.
     pub(crate) fn open_file(&self) -> crate::Result<Arc<dyn crate::fs::FsFile>> {
-        let (file, _) = self
+        let (file, cache_event) = self
             .file_accessor
             .get_or_open_table(&self.global_id(), &self.path)?;
+        // Counted as the load path counts the file it opens; a pinned
+        // descriptor is no cache event.
+        #[cfg(feature = "metrics")]
+        if let Some(hit) = cache_event {
+            use core::sync::atomic::Ordering::Relaxed;
+            if hit {
+                self.metrics.table_file_opened_cached.fetch_add(1, Relaxed);
+            } else {
+                self.metrics
+                    .table_file_opened_uncached
+                    .fetch_add(1, Relaxed);
+            }
+        }
+        #[cfg(not(feature = "metrics"))]
+        let _ = cache_event;
         Ok(file)
     }
 
@@ -7692,6 +7707,22 @@ impl Table {
         }
         let has_kv_footer = self.metadata.kv_checksum_algo.is_some();
         DataBlock::from_loaded(block, has_kv_footer)
+    }
+
+    /// A zeroed buffer for the on-disk bytes of the block at `handle`,
+    /// refused when its size is one no block of this table can have, as the
+    /// load path refuses it before it allocates.
+    ///
+    /// # Errors
+    ///
+    /// The size is past the largest block this table can hold.
+    pub(crate) fn block_buffer(&self, handle: &BlockHandle) -> crate::Result<Vec<u8>> {
+        crate::table::block::check_on_disk_size(
+            u64::from(handle.size()),
+            self.encryption.as_deref(),
+            self.metadata.ecc_params,
+        )?;
+        Ok(vec![0u8; handle.size() as usize])
     }
 
     /// The data block at `handle`, when the cache holds it, counted as a cache

@@ -149,6 +149,17 @@ struct LevelTable<'a, 'k> {
     read: Option<crate::table::staged::StagedRead<'a>>,
 }
 
+/// A data block task's block before its chunk is read.
+enum TaskBlock {
+    /// At hand: taken from the cache, or loaded through a Page-ECC or
+    /// columnar table's own path.
+    Held(crate::table::DataBlock),
+    /// A columnar block its delete mask removes whole: it holds no key.
+    Empty,
+    /// To be read in the chunk's batch.
+    Read,
+}
+
 /// The read queues of the backends a level's tables were opened through, one
 /// per backend.
 type LevelQueues<'a> = Vec<(
@@ -3877,6 +3888,17 @@ impl Tree {
                         continue;
                     }
                     let table: &'a Table = entry.table;
+                    // A size no block can have is refused before any buffer
+                    // is allocated for it; the serial planner then reports
+                    // the corruption as the load path does.
+                    let Ok(buffers) = need
+                        .iter()
+                        .map(|handle| table.block_buffer(handle))
+                        .collect::<crate::Result<Vec<_>>>()
+                    else {
+                        entry.read = None;
+                        break;
+                    };
                     let Ok(file) = table.open_file() else {
                         entry.read = None;
                         break;
@@ -3891,12 +3913,12 @@ impl Tree {
                         queues.len() - 1
                     };
                     let queue = &mut queues[slot].1;
-                    for handle in need {
+                    for (handle, buf) in need.iter().zip(buffers) {
                         queue.submit(crate::fs::QueuedRead {
                             tag: asked.len(),
                             file: Arc::clone(&file),
                             offset: *handle.offset(),
-                            buf: vec![0u8; handle.size() as usize],
+                            buf,
                         });
                         asked.push((at, *handle));
                         waiting[at] += 1;
@@ -3951,10 +3973,12 @@ impl Tree {
     /// the blocks read. A cold set that fits in half the cache is kept in it;
     /// a larger one is not, so it never evicts the cache it would not fit.
     ///
+    /// A Page-ECC or columnar table is planned serially and its data blocks
+    /// loaded through their own path; the level's other tables stay staged.
+    ///
     /// Returns `Ok(true)` when it resolved the level (results updated, found
-    /// keys dropped from `still_remaining`), and `Ok(false)` when the level
-    /// holds a Page-ECC or columnar table, which the caller's serial resolve
-    /// loads through its format-aware path.
+    /// keys dropped from `still_remaining`), and `Ok(false)` when a batch the
+    /// backend refused hands the level to the caller's serial resolve.
     #[expect(
         clippy::indexing_slicing,
         reason = "start/end stay within tasks by construction"
@@ -3969,12 +3993,6 @@ impl Tree {
     ) -> crate::Result<bool> {
         let (tasks, probes) =
             Self::plan_level_block_tasks(level, still_remaining, keys, seqno, comparator)?;
-        // A Page-ECC / columnar table covers some of these keys. The scratch
-        // decode path is row-format only, so hand the whole level to the serial
-        // resolve, which loads those blocks through their format-aware path.
-        if tasks.iter().any(|t| t.special) {
-            return Ok(false);
-        }
         let Some(first) = tasks.first() else {
             // No key of the batch reaches a block of this level: the filter
             // probes that found so are the level's answer.
@@ -3983,16 +4001,28 @@ impl Tree {
             }
             return Ok(true);
         };
-        // Each task's block, when the cache holds it; the others are read.
-        let cached: Vec<Option<crate::table::DataBlock>> = tasks
-            .iter()
-            .map(|task| task.table.cached_data_block(&task.handle))
-            .collect();
+        // Each task's block, when the cache holds it; the others are read. A
+        // Page-ECC or columnar table's block is loaded through its own path,
+        // which heals a corrected ECC block and reconstructs a columnar one,
+        // the same load a point read makes: the scratch decode is row-format
+        // only. The level's other tables are read in batches all the same.
+        let mut cached: Vec<TaskBlock> = Vec::with_capacity(tasks.len());
+        for task in &tasks {
+            cached.push(if task.special {
+                task.table
+                    .load_data_block(&task.handle)?
+                    .map_or(TaskBlock::Empty, TaskBlock::Held)
+            } else {
+                task.table
+                    .cached_data_block(&task.handle)
+                    .map_or(TaskBlock::Read, TaskBlock::Held)
+            });
+        }
         let capacity = first.table.cache_capacity();
         let cold: u64 = tasks
             .iter()
             .zip(&cached)
-            .filter(|(_, block)| block.is_none())
+            .filter(|(_, block)| matches!(block, TaskBlock::Read))
             .map(|(task, _)| u64::from(task.handle.size()))
             .sum();
         // A cold set within half the shared cache is kept in it, for the reads
@@ -4017,10 +4047,10 @@ impl Tree {
             let mut bytes = 0u64;
             let mut end = start;
             while end < tasks.len() {
-                let sz = if cached[end].is_some() {
-                    0
-                } else {
+                let sz = if matches!(cached[end], TaskBlock::Read) {
                     u64::from(tasks[end].handle.size())
+                } else {
+                    0
                 };
                 if end > start && bytes + sz > budget {
                     break;
@@ -4086,16 +4116,16 @@ impl Tree {
         }
     }
 
-    /// Resolves one chunk of block-tasks: a task whose block is `cached` is
-    /// point-read in it, the others are read in ONE cross-file
-    /// `read_blocks_batched` per backend, decoded from their scratch buffers
-    /// (and put in the cache when `keep`) and point-read, keeping the
-    /// highest-seqno hit per key in `results`. Every task is row-format (the
-    /// caller routes any level with a Page-ECC / columnar table to the serial
-    /// resolve).
+    /// Resolves one chunk of block-tasks: a task whose block is held is
+    /// point-read in it, one whose block is empty reads nothing, and the
+    /// others are read in ONE cross-file `read_blocks_batched` per backend,
+    /// decoded from their scratch buffers (and put in the cache when `keep`)
+    /// and point-read, keeping the highest-seqno hit per key in `results`. A
+    /// task to be read is row-format: a Page-ECC or columnar table's block is
+    /// held already, loaded through its own path.
     fn resolve_block_task_chunk<K: AsRef<[u8]>>(
         chunk: &[BlockTask<'_>],
-        cached: &[Option<crate::table::DataBlock>],
+        cached: &[TaskBlock],
         keep: bool,
         keys: &[K],
         results: &mut [Option<InternalValue>],
@@ -4103,22 +4133,20 @@ impl Tree {
     ) -> crate::Result<()> {
         let mut hits: Vec<(usize, usize, InternalValue)> = Vec::new();
         for (index, (task, block)) in chunk.iter().zip(cached).enumerate() {
-            if let Some(block) = block {
+            if let TaskBlock::Held(block) = block {
                 Self::read_task_keys(task, index, block, keys, &mut hits)?;
             }
         }
-        // Scratch for the blocks the cache does not hold, empty for the others.
+        // Scratch for the blocks to be read, empty for the others; a size no
+        // block can have fails the chunk before it is allocated.
         let mut buffers: Vec<Vec<u8>> = chunk
             .iter()
             .zip(cached)
-            .map(|(t, block)| {
-                if block.is_some() {
-                    Vec::new()
-                } else {
-                    vec![0u8; t.handle.size() as usize]
-                }
+            .map(|(t, block)| match block {
+                TaskBlock::Read => t.table.block_buffer(&t.handle),
+                TaskBlock::Held(_) | TaskBlock::Empty => Ok(Vec::new()),
             })
-            .collect();
+            .collect::<crate::Result<_>>()?;
 
         // One submission per backend: a table's reads belong to the backend it
         // was opened through, which a reopen with a changed routing map can
@@ -4133,7 +4161,7 @@ impl Tree {
         for (index, ((task, buf), block)) in
             chunk.iter().zip(buffers.iter_mut()).zip(cached).enumerate()
         {
-            if block.is_some() {
+            if !matches!(block, TaskBlock::Read) {
                 continue;
             }
             let req = crate::fs::BlockRead {

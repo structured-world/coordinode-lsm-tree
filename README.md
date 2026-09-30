@@ -44,7 +44,7 @@ tree.flush_active_memtable(0)?;
 
 ### Read path
 
-- Point reads via `get` / `multi_get`. A `multi_get` reads each level stage by stage across all its tables: the filter blocks every table needs in one batch, then their index blocks, then their data blocks, and a table moves on to its next stage as soon as its blocks are back. The answer comes from the blocks read, so a cache eviction mid-query re-reads nothing.
+- Point reads via `get` / `multi_get`. A `multi_get` reads each level stage by stage across all its tables: the filter blocks every table needs in one batch, then their index blocks, then their data blocks, and a table moves on to its next stage as soon as its blocks are back. The answer comes from the blocks read, so a cache eviction mid-query re-reads nothing. Page-ECC and columnar tables, tables with unpinned filter partitions, and a table whose staged read fails are read through the serial path instead, which loads its blocks through the cache.
 - `PinnableSlice` for zero-copy reads.
 - `BurrFilter` AMQ filter (Bumped Ribbon Retrieval, Walzer & Dillinger 2022): ~1% memory overhead vs the information-theoretic minimum: ~30% smaller filter blocks than a same-FPR Bloom filter, or ~10× tighter FPR at the same memory budget. Used for both per-key and per-prefix membership checks.
 - Forward and reverse range / prefix iteration.

@@ -1,11 +1,15 @@
 // SPDX-License-Identifier: Apache-2.0
 // Copyright (c) 2026-present, Dmitry Prudnikov
 
-//! Cold `multi_get` on `io_uring` when the filter and index are read too.
+//! `multi_get` on `io_uring` over a cold block cache, when the filter and
+//! index are read too.
 //!
 //! Filters and indexes are partitioned and left unpinned, the block cache is
 //! far smaller than the tree and the row cache is off, so a batch reads filter
-//! partitions, index partitions and data blocks through the ring. Level 0
+//! partitions, index partitions and data blocks through the ring. The OS page
+//! cache is left as the writes warmed it, so the reads complete from memory:
+//! the figures are the engine's cost of a cold block cache, the requests it
+//! makes and waits on, not a device's latency. Level 0
 //! holds `t` tables that all span the key range, each holding every `t`-th
 //! key, so a batch consults the filter of every one of them and finds each key
 //! in exactly one. The last layout puts half the keys in the last level under
