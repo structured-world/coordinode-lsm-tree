@@ -199,8 +199,8 @@ and compression flags (`--compression` reaches blob files too), so
 All three are costs with one denominator, the rows the scenario emitted, so
 they read the same way and compare directly: a projection that stops loading a
 payload moves read and decoded per row down together. They live in a
-smaller-is-better suite of their own, `lsm-tree db_bench costs`, because the
-dashboard fixes one direction per suite and the rates are bigger-is-better.
+smaller-is-better suite of their own, `lsm-tree db_bench costs <N>.x`, because
+the dashboard fixes one direction per suite and the rates are bigger-is-better.
 Zero is the best value there (a read that gathers nothing copies nothing), and
 a scenario whose copies go from zero to anything alerts. A scenario that
 emitted no row publishes nothing, since its cost per row does not exist. The
@@ -209,6 +209,39 @@ diagnostics, `n/a` where the denominator is zero; they are not series.
 `db_bench --github-json` writes the bigger-is-better series to stdout, or
 appends them to the array in a file with `--github-json-append <PATH>`, and
 `--github-json-costs <PATH>` writes the costs.
+
+## Dashboard series
+
+The `db_bench` dashboard (`dev/bench` on the project's GitHub Pages) keeps one
+suite per **major version line**, so a commit is only ever compared with
+points of its own line and the regression alert never judges a 6.0 commit
+against a 5.x baseline:
+
+| Suite | Holds |
+|---|---|
+| `lsm-tree db_bench <N>.x · <os> · <runner>` | The rates of one line measured on one bench host. A rate measured on one machine is no baseline for another, so each host has its own suite. |
+| `lsm-tree db_bench costs <N>.x` | The bytes-per-row costs of one line. They are counted, not timed, so one suite serves every host. |
+
+**Where the line comes from.** `<N>` is the major of the next version
+release-plz computes for the measured commit, the version it will ship as: the
+bench job runs `release-plz update` on its checkout and reads the version it
+writes. It is not the version already in `Cargo.toml`, because that one moves
+only when the release PR merges, so it names the previous line from the first
+breaking commit until the release (`main` carried `5.11.1` while it was already
+the 6.0 line). release-plz reads the same conventional-commit markers the
+release does (`!`, `BREAKING CHANGE`), so the dashboard and the release agree
+on every commit's line. A maintained branch (`5.x.x`) gets its own line the
+same way.
+
+**What writes where.** Only a push to `main` appends to its line's suites. A
+manual dispatch from any branch is compared against the suites of the line it
+measures and writes nothing.
+
+**Where to look.** The per-host dashboard (`dev/bench/`) has one chart per
+suite. The overlay page (`dev/bench/overlay.html`) draws every host of one line
+on one chart per workload, newest line first. The RocksDB head-to-head page
+(`dev/compare/`) is a snapshot replaced on every run; it names the line, branch
+and commit it measured.
 
 ## Checklist for format-changing PRs
 
