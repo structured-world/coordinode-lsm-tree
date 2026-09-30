@@ -100,6 +100,11 @@ impl CrashState {
 pub struct CrashFs {
     inner: Arc<dyn Fs>,
     state: Arc<spin::Mutex<CrashState>>,
+    /// Orders entry-making operations against directory-sync snapshots: an
+    /// operation holds it shared from the backend call until its entry is
+    /// registered, a sync takes it exclusively to snapshot. An entry the
+    /// backend made before a snapshot is then always in it.
+    entry_order: Arc<spin::RwLock<()>>,
 }
 
 impl CrashFs {
@@ -117,13 +122,16 @@ impl CrashFs {
         Self {
             inner,
             state: Arc::new(spin::Mutex::new(CrashState::default())),
+            entry_order: Arc::new(spin::RwLock::new(())),
         }
     }
 
     /// Also models directory entries: a created file, a rename's destination,
     /// a hard link or a reflink is durable only once its parent directory is
     /// synced, as POSIX promises, and [`Self::crash`] removes one whose
-    /// directory never was, even when its content was synced.
+    /// directory never was, even when its content was synced. A directory is
+    /// matched by the path it is named with: an entry made through one
+    /// spelling of a directory and synced through another stays pending.
     #[cfg(test)]
     #[must_use]
     pub(crate) fn tracking_directory_entries(self) -> Self {
@@ -259,6 +267,12 @@ impl CrashFs {
     /// while the sync runs, at a new path or again at one of these, is left
     /// for the next one.
     fn entries_of(&self, directory: &Path) -> Vec<(PathBuf, u64)> {
+        // Waits out entry-making operations in flight, so one whose backend
+        // call already made the entry is registered before the snapshot.
+        let _order = self.entry_order.write();
+        // Directories are matched by spelling: an entry made through one
+        // spelling of a directory and synced through another (a symlink,
+        // `..`) stays pending. The engine names both from its tree folder.
         self.state
             .lock()
             .pending_entries
@@ -327,10 +341,12 @@ impl Fs for CrashFs {
             // first sync removes it.
             self.capture_first_touch(path)?;
         }
+        let order = creates.then(|| self.entry_order.read());
         let inner = self.inner.open(path, opts)?;
         if creates {
             self.new_entry(path);
         }
+        drop(order);
         Ok(Box::new(CrashFile {
             inner,
             path: path.to_path_buf(),
@@ -377,6 +393,7 @@ impl Fs for CrashFs {
     }
 
     fn rename(&self, from: &Path, to: &Path) -> io::Result<()> {
+        let _order = self.entry_order.read();
         self.inner.rename(from, to)?;
         // POSIX rename(2): when both names refer to the same file (one path,
         // or two hard links of one inode) the call succeeds and changes
@@ -432,6 +449,7 @@ impl Fs for CrashFs {
     }
 
     fn hard_link(&self, src: &Path, dst: &Path) -> io::Result<()> {
+        let _order = self.entry_order.read();
         self.inner.hard_link(src, dst)?;
         self.track_copy(src, dst)?;
         Ok(())
@@ -461,6 +479,7 @@ impl Fs for CrashFs {
     }
 
     fn reflink_file(&self, src: &Path, dst: &Path) -> io::Result<()> {
+        let _order = self.entry_order.read();
         self.inner.reflink_file(src, dst)?;
         self.track_copy(src, dst)?;
         Ok(())
