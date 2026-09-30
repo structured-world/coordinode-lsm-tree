@@ -41,8 +41,77 @@ concurrency:
   group: bench-self-hosted
   cancel-in-progress: false
 
+# The workflow token only reads the repository for checkout: every write
+# (gh-pages, alert comments) goes through the App token generated per job.
+permissions:
+  contents: read
+
 jobs:
+  # The suites were once named without a version line, so 5.x and 6.0 points
+  # shared one chart and one alert baseline. This moves every point of an
+  # unversioned suite into the suite of its line, once: 6.x from the first
+  # commit of the 6.0 line, 5.x before it. With no unversioned suite left it
+  # changes nothing. It runs before the bench stores anything, on a hosted
+  # runner, since the transform needs jq and the full history of main.
+  split-series:
+    if: github.event_name == 'push' && github.ref == 'refs/heads/main'
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v7
+        with:
+          persist-credentials: false
+          fetch-depth: 0
+
+      - name: Generate bot token
+        id: bot-token
+        uses: actions/create-github-app-token@v3
+        with:
+          app-id: ${{ secrets.RELEASER_APP_ID }}
+          private-key: ${{ secrets.RELEASER_APP_PRIVATE_KEY }}
+          # Pushes the rewritten data file to gh-pages; nothing else.
+          permission-contents: write
+
+      - name: Split unversioned suites by version line
+        env:
+          GH_TOKEN: ${{ steps.bot-token.outputs.token }}
+          REPO: ${{ github.repository }}
+        run: |
+          set -euo pipefail
+          work="$(mktemp -d "${TMPDIR:-/tmp}/split-ghpages.XXXXXXXX")"
+          trap 'rm -rf "$work"' EXIT
+          # The token reaches git through a credential helper reading the
+          # environment, never argv or .git/config (see the compare publish
+          # step of the benchmark job for the reasoning).
+          export GIT_CONFIG_COUNT=1
+          export GIT_CONFIG_KEY_0=credential.helper
+          # shellcheck disable=SC2016
+          export GIT_CONFIG_VALUE_0='!f() { echo username=x-access-token; echo "password=${GH_TOKEN}"; }; f'
+          git clone --depth 1 --branch gh-pages \
+            "https://github.com/${REPO}.git" "$work"
+          # 8b03201bb opens the 6.0 line: the first breaking commit on main
+          # after the last 5.x release.
+          status=0
+          bash .github/scripts/split-bench-series.sh "$work/dev/bench/data.js" \
+            8b03201bb82fab1bf486819a0f0a54d460583fed 5 6 || status=$?
+          case "$status" in
+            0) ;;
+            3) echo "::notice::no unversioned suite left, nothing to split"; exit 0 ;;
+            *) exit "$status" ;;
+          esac
+          cd "$work"
+          git config user.name "github-actions[bot]"
+          git config user.email "41898282+github-actions[bot]@users.noreply.github.com"
+          git add dev/bench/data.js
+          git commit -m "bench: split the dashboard suites by version line (dev/bench)"
+          git push origin gh-pages
+
   benchmark:
+    # After the split, so the first store of a push lands in a data file that
+    # already has its versioned suites; a dispatch skips the split and runs.
+    needs: split-series
+    if: >
+      !cancelled() &&
+      (needs.split-series.result == 'success' || needs.split-series.result == 'skipped')
     # Two passes in one job: (1) the single-engine db_bench trend (regression
     # guard + dev/bench dashboard) and (2) the RocksDB head-to-head compare
     # (public dev/compare overlay dashboard). The name reflects both so it does
@@ -100,9 +169,13 @@ jobs:
       # Pinning policy: first-party actions (actions/*, dependabot/*) track a
       # MAJOR tag; third-party actions stay pinned to a commit digest with a
       # version comment. See coordinode-release.yml for the reasoning.
+      # Full history and tags: the version line of the measured commit is the
+      # next version release-plz computes for it, from the commits since the
+      # last release tag.
       - uses: actions/checkout@v7
         with:
           persist-credentials: false
+          fetch-depth: 0
 
       - name: Generate bot token
         id: bot-token
@@ -136,6 +209,50 @@ jobs:
         with:
           toolchain: stable
 
+      # Each major version line has its own suites, so a 6.0 commit is never
+      # judged against a 5.x baseline. The line is the major of the next
+      # version release-plz computes for the measured commit, not the version
+      # in Cargo.toml: that one moves only when the release PR merges, so it
+      # names the previous line from the first breaking commit until the
+      # release. release-plz reads the same conventional-commit markers the
+      # release does, so the dashboard and the release agree on every commit.
+      # Installed the way the release workflow's release-plz action installs
+      # it (prebuilt binary through cargo-binstall), at the version that action
+      # runs, so both compute the same next version.
+      - uses: cargo-bins/cargo-binstall@b874e25ea559687bec77e281e9b271aa1367b624  # v1.23.0
+        env:
+          BINSTALL_VERSION: 1.23.0
+
+      - name: Install release-plz
+        run: cargo binstall release-plz@0.3.169 --strategies crate-meta-data,compile --no-confirm
+
+      - name: Version line of the measured commit
+        id: line
+        run: |
+          set -euo pipefail
+          # release-plz compares the branch against its upstream, so it needs
+          # the branch the checkout created, not a detached HEAD.
+          if [ -z "$(git branch --show-current)" ]; then
+            echo "::error::the checkout is a detached HEAD; release-plz computes the next version only on a branch"
+            exit 1
+          fi
+          release-plz update --no-changelog --config .release-plz.toml
+          id="$(cargo pkgid)"
+          version="${id##*@}"
+          # The update rewrites the manifest's version; the measured tree is
+          # the commit as it is.
+          git restore --source=HEAD --worktree -- Cargo.toml
+          major="${version%%.*}"
+          case "$major" in
+            '' | *[!0-9]*)
+              echo "::error::cannot read a major version from '$id'"
+              exit 1
+              ;;
+          esac
+          echo "Measured commit ships as $version: suites of the $major.x line"
+          echo "major=$major" >> "$GITHUB_OUTPUT"
+          echo "version=$version" >> "$GITHUB_OUTPUT"
+
       # The checkout above runs `git clean -ffdx`, which removes every ignored
       # `target/` in the workspace, so nothing built survives on the runner
       # from one run to the next. The one build worth carrying over is
@@ -163,16 +280,18 @@ jobs:
         if: steps.bot-token.outputs.token != ''
         run: git branch --delete --force gh-pages 2>/dev/null || true
 
-      # One series per host: the job lands on whichever registered runner is
-      # up (the bench box under Windows or Linux, or the CI host), and a rate
-      # measured on one machine is no baseline for another. Keyed by the
-      # runner's name as well as its OS, since two hosts can share an OS. The
-      # overlay page published below draws every host's series on one chart.
+      # One series per version line and host: the job lands on whichever
+      # registered runner is up (the bench box under Windows or Linux, or the
+      # CI host), and a rate measured on one machine is no baseline for
+      # another. Keyed by the runner's name as well as its OS, since two hosts
+      # can share an OS. A manual dispatch is compared against the suite of the
+      # line it measures. The overlay page published below draws every host's
+      # series of one line on one chart.
       - name: Store benchmark results
         if: steps.bot-token.outputs.token != ''
         uses: benchmark-action/github-action-benchmark@4322e5726e6334590d251fc4f92bec0efafc45dc  # v1.22.2
         with:
-          name: "lsm-tree db_bench · ${{ runner.os }} · ${{ runner.name }}"
+          name: "lsm-tree db_bench ${{ steps.line.outputs.major }}.x · ${{ runner.os }} · ${{ runner.name }}"
           tool: customBiggerIsBetter
           output-file-path: benchmark-results.json
           github-token: ${{ steps.bot-token.outputs.token }}
@@ -209,12 +328,12 @@ jobs:
       # their own smaller-is-better suite on the same dashboard. A cost that was
       # zero and becomes nonzero alerts: the action divides by the previous
       # value and treats 0/0 as unchanged. Bytes are counted by the engine,
-      # not timed, so the costs stay one series across hosts.
+      # not timed, so the costs stay one series across hosts, one per line.
       - name: Store benchmark costs
         if: steps.bot-token.outputs.token != ''
         uses: benchmark-action/github-action-benchmark@4322e5726e6334590d251fc4f92bec0efafc45dc  # v1.22.2
         with:
-          name: "lsm-tree db_bench costs"
+          name: "lsm-tree db_bench costs ${{ steps.line.outputs.major }}.x"
           tool: customSmallerIsBetter
           output-file-path: benchmark-costs.json
           github-token: ${{ steps.bot-token.outputs.token }}
@@ -406,6 +525,9 @@ jobs:
         env:
           GH_TOKEN: ${{ steps.bot-token.outputs.token }}
           REPO: ${{ github.repository }}
+          LINE_MAJOR: ${{ steps.line.outputs.major }}
+          MEASURED_REF: ${{ github.ref_name }}
+          MEASURED_SHA: ${{ github.sha }}
         run: |
           set -euo pipefail
           src="tools/compare-rocksdb/target/criterion"
@@ -473,6 +595,26 @@ jobs:
           &nbsp;&middot;&nbsp; <a href="../bench/overlay.html">single-engine db_bench trend, every host &rarr;</a>
           &nbsp;&middot;&nbsp; <a href="report/">raw criterion index &rarr;</a></p>
           HTML_HEAD
+            # The overlay is a snapshot replaced on every run, from main or a
+            # manual dispatch, so it says which line and commit it measured.
+            # A branch name may hold `&`, `<`, `>` and `"` (git check-ref-format
+            # allows them), so it is escaped for HTML, with shell built-ins
+            # only: the Git for Windows shell may ship no sed.
+            ref_html=""
+            rest="$MEASURED_REF"
+            while [ -n "$rest" ]; do
+              c="${rest%"${rest#?}"}"
+              rest="${rest#?}"
+              case "$c" in
+                '&') ref_html="$ref_html&amp;" ;;
+                '<') ref_html="$ref_html&lt;" ;;
+                '>') ref_html="$ref_html&gt;" ;;
+                '"') ref_html="$ref_html&quot;" ;;
+                *) ref_html="$ref_html$c" ;;
+              esac
+            done
+            printf '<p class="intro">Measured on the <strong>%s.x</strong> line: <code>%s</code> at <a href="https://github.com/%s/commit/%s">%s</a>.</p>\n' \
+              "$LINE_MAJOR" "$ref_html" "$REPO" "$MEASURED_SHA" "${MEASURED_SHA:0:9}"
             for d in "$work"/dev/compare/*/; do
               name="$(basename "$d")"
               [ -f "$d/report/lines.svg" ] || continue
