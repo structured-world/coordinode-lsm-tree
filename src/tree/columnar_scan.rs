@@ -929,16 +929,14 @@ impl ColumnarScan {
         ) else {
             return Err(MISSING_BATCH_COLUMN);
         };
-        // The raw value projected by id reads the resolved value too.
+        // The raw value, read by id or by the predicate, reads the resolved
+        // value too.
         let raw_at = find(COL_VALUE).filter(|&at| {
             batch
                 .columns
                 .get(at)
                 .is_some_and(|c| c.type_tag == TypeTag::Bytes)
-                && self
-                    .fields
-                    .iter()
-                    .any(|f| f.column_id() == COL_VALUE && !projection::is_declared(f))
+                && self.raw_value_read()
         });
         let column = |at: usize| batch.columns.get(at).ok_or(MISSING_BATCH_COLUMN);
         let (keys, kinds) = (column(key_at)?, column(type_at)?);
@@ -1126,6 +1124,28 @@ impl ColumnarScan {
                 self.dedup_singleton_batch(&batch, global, state, support)
             }
         }
+    }
+
+    /// Whether the raw value is read by id, beside any declared field read
+    /// out of it: a field projects it by id, or the predicate runs on it and
+    /// no field declares its id.
+    pub(super) fn raw_value_read(&self) -> bool {
+        use crate::table::columnar::COL_VALUE;
+
+        let by_id = self
+            .fields
+            .iter()
+            .any(|f| f.column_id() == COL_VALUE && !projection::is_declared(f));
+        let declared = self
+            .fields
+            .iter()
+            .any(|f| f.column_id() == COL_VALUE && projection::is_declared(f));
+        by_id
+            || (!declared
+                && self
+                    .predicate
+                    .as_ref()
+                    .is_some_and(|p| p.column_id == COL_VALUE))
     }
 
     /// Whether the scan's predicate judges the decided rows of `batch` before

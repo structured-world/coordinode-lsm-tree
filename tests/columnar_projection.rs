@@ -1158,6 +1158,46 @@ fn a_resolved_operand_storing_a_field_under_another_type_is_returned() -> lsm_tr
     Ok(())
 }
 
+/// A predicate over the raw value, which no field projects, runs on the rows
+/// a whole-value source carries into the merge: the value stays in place for
+/// it beside the copy the declared fields are read out of.
+#[test]
+fn a_predicate_over_the_raw_value_runs_on_the_late_read_path() -> lsm_tree::Result<()> {
+    use lsm_tree::table::columnar::COL_VALUE;
+    use lsm_tree::table::columnar_predicate::{
+        ColumnRangePredicate, PredicateApply, PredicateSupport,
+    };
+
+    let folder = get_tmp_folder();
+    let any = open_columnar(folder.path());
+    let tree = standard(&any);
+    tree.insert(key(0), row_value(10, 40), 0);
+    tree.insert(key(1), row_value(11, 41), 1);
+    let wanted = row_value(10, 40);
+    let predicate = ColumnRangePredicate {
+        column_id: COL_VALUE,
+        lower: Some(wanted.clone()),
+        upper: Some(wanted),
+        apply: PredicateApply::Filter,
+    };
+    // A declared field under another id than the raw value's.
+    let projection = Projection::new()
+        .column(COL_USER_KEY)
+        .field(field(4, Absent::Null))
+        .projector(std::sync::Arc::new(TwoCells));
+    let mut scan = tree.columnar_scan(&projection, Some(&predicate), SeqNo::MAX, ..)?;
+    let mut keys = Vec::new();
+    for batch in &mut scan {
+        let batch = batch?;
+        for row in 0..batch.row_count {
+            keys.push(bytes_cell(&batch.columns[0].data, batch.row_count, row));
+        }
+    }
+    assert_eq!(Some(PredicateSupport::Exact), scan.predicate_support());
+    assert_eq!(vec![key(0)], keys);
+    Ok(())
+}
+
 /// A fixed-width field of width zero has no cell to hold, and a column of it
 /// is one no batch may carry, so declaring one is refused up front instead of
 /// failing, or panicking, once rows are projected into it.

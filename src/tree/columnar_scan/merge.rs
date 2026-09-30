@@ -134,6 +134,8 @@ pub(super) struct MergeStream {
     /// [`ColumnarScan::read_late`]), so every batch carries the whole-value
     /// column.
     late: bool,
+    /// Whether the raw value stays beside the whole value a source carries.
+    raw: RawValue,
     /// Whether a segment of the group records deletions, so the value type is
     /// decoded.
     deletes: bool,
@@ -244,6 +246,11 @@ impl MergeStream {
             loose,
             loose_predicate,
             late,
+            raw: if scan.raw_value_read() {
+                RawValue::Kept
+            } else {
+                RawValue::Moved
+            },
             deletes,
             rts,
             last_key: None,
@@ -403,7 +410,7 @@ impl MergeStream {
         cmp: &dyn crate::comparator::UserComparator,
     ) -> crate::Result<(Position, Option<u64>)> {
         let last_key = self.last_key.as_deref();
-        let (fields, late) = (&self.fields, self.late);
+        let (fields, late, raw) = (&self.fields, self.late, self.raw);
         let Some(source) = self.sources.get_mut(i) else {
             return Ok((Position::Exhausted, None));
         };
@@ -446,7 +453,7 @@ impl MergeStream {
                 Some(batch) => {
                     // A whole value moves aside before the conform, where a
                     // declared field may share the value column's id.
-                    let batch = carry_whole_value(batch?, source.whole, fields);
+                    let batch = carry_whole_value(batch?, source.whole, raw);
                     // Its rows are not decided yet: a shadowed or deleted
                     // one must not fail the scan, and the predicate after
                     // the dedup sees the declared defaults.
@@ -891,22 +898,25 @@ impl MergeStream {
     }
 }
 
+/// What becomes of a whole-value source's value column when it moves under
+/// [`COL_WHOLE_VALUE`].
+#[derive(Clone, Copy, PartialEq, Eq)]
+enum RawValue {
+    /// Nothing reads the raw value: the column is renamed.
+    Moved,
+    /// The raw value is read too (see [`ColumnarScan::raw_value_read`]): the
+    /// column is copied and stays.
+    Kept,
+}
+
 /// `batch` of a source that carries whole values (`whole`) with its value
-/// column under [`COL_WHOLE_VALUE`]: renamed, or copied when a field of
-/// `fields` projects the raw value by id and it stays too.
-fn carry_whole_value(
-    mut batch: ColumnBatch,
-    whole: bool,
-    fields: &[ProjectedField],
-) -> ColumnBatch {
+/// column under [`COL_WHOLE_VALUE`], as `raw` says.
+fn carry_whole_value(mut batch: ColumnBatch, whole: bool, raw: RawValue) -> ColumnBatch {
     if !whole {
         return batch;
     }
-    let raw_kept = fields
-        .iter()
-        .any(|f| f.column_id() == COL_VALUE && !super::projection::is_declared(f));
     if let Some(at) = batch.columns.iter().position(|c| c.column_id == COL_VALUE) {
-        if raw_kept {
+        if raw == RawValue::Kept {
             if let Some(value) = batch.columns.get(at).cloned() {
                 batch.columns.push(Column {
                     column_id: COL_WHOLE_VALUE,
