@@ -900,6 +900,55 @@ fn overlapping_inputs_keep_no_room_for_keys_written_once() -> crate::Result<()> 
     Ok(())
 }
 
+/// The first filter of a compaction over overlapping inputs is priced by
+/// the keys the merge writes once, not by each input's: a budget its one
+/// output fits at the static width, though the inputs' filters together do
+/// not fit even at the narrowest, lets it take that width, with probes
+/// observed or not.
+#[test]
+fn the_first_filter_over_overlapping_inputs_prices_keys_written_once() -> crate::Result<()> {
+    const KEYS: usize = 4_000;
+    for probed in [false, true] {
+        let folder = tempfile::tempdir()?;
+        let wide = BloomConstructionPolicy::BitsPerKey(10.0).filter_size_bound(KEYS);
+        let tree = Config::new(
+            folder.path(),
+            SequenceNumberCounter::default(),
+            SequenceNumberCounter::default(),
+        )
+        .data_block_size_policy(BlockSizePolicy::all(1_024))
+        .filter_block_partitioning_policy(crate::config::PinningPolicy::all(false))
+        .filter_advisor(Some(
+            FilterAdvisor::new(u64_of(wide) * 11 / 10).with_bits_per_key([6u8, 10].to_vec()),
+        ))
+        .open()?;
+        let count = u32::try_from(KEYS).unwrap_or(u32::MAX);
+        let mut seqno = 0;
+        for _ in 0..4 {
+            for i in 0..count {
+                tree.insert(key("k", 2 * i), "value", seqno);
+                seqno += 1;
+            }
+            tree.flush_active_memtable(0)?;
+        }
+        if probed {
+            probe_absent(&tree, "k", count)?;
+        }
+        tree.major_compact(u64::MAX, 0)?;
+
+        let tables = tables(&tree);
+        let [table] = tables.as_slice() else {
+            panic!("one output, {} tables", tables.len());
+        };
+        let bits = u64::from(table.filter_size()) * 8 / u64_of(KEYS);
+        assert!(
+            bits >= 9,
+            "{bits} bits a key (probed: {probed}): the static 10 fit the budget"
+        );
+    }
+    Ok(())
+}
+
 /// Many small inputs merged into one output are priced as the one filter it
 /// writes, not as a filter each: a filter's fixed overhead charged once per
 /// input would raise the price past what the budget, which fits the output's

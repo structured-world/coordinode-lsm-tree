@@ -10,7 +10,7 @@ const WIDTHS: [u8; 6] = [6, 8, 10, 12, 14, 16];
 /// `FilterSizing::candidates` sets it: the filter enters flight first.
 fn priced_at(sizing: &super::FilterSizing, lower: core::ops::Bound<&[u8]>) -> crate::Result<f64> {
     sizing.enter(lower);
-    sizing.current_price()
+    sizing.current_price(None)
 }
 
 /// Filter blocks without framing: the price in payload bytes alone.

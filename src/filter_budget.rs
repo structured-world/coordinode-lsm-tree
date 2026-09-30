@@ -709,7 +709,7 @@ impl FilterSizing {
     ) -> crate::Result<Vec<BloomConstructionPolicy>> {
         let load = self.load(bounds, n)?;
         self.enter(bounds.0);
-        let price = self.current_price()?;
+        let price = self.current_price(Some((n, bounds)))?;
         let narrowest = self.narrowest();
         // Even the narrowest filters do not fit: a wider build is only ever
         // refused, so it is not built at all.
@@ -740,8 +740,16 @@ impl FilterSizing {
     /// short partitions that end tables, is charged to the price rather than
     /// to the last filters, and no range of keys written early takes the room
     /// of the ones after it.
-    fn current_price(&self) -> crate::Result<f64> {
-        if !self.observed || self.inputs.is_empty() {
+    ///
+    /// `priced` is the filter being priced, its hashes and its bounds: before
+    /// any filter is built it is the one that tells how far the inputs'
+    /// estimate runs from the keys written (see `remaining_loads`).
+    ///
+    /// Before any probe is observed the price only tells whether even the
+    /// narrowest widths fit, and does so over what the rewrite leaves, not
+    /// over the live tables it replaces.
+    fn current_price(&self, priced: Option<Priced<'_>>) -> crate::Result<f64> {
+        if self.inputs.is_empty() {
             return Ok(self.price);
         }
         let used = self.used();
@@ -755,7 +763,7 @@ impl FilterSizing {
         // Filters already over the budget leave no room at all.
         let left = as_f64(self.budget.saturating_sub(used)) / error;
 
-        let remaining = self.remaining_loads()?;
+        let remaining = self.remaining_loads(priced)?;
         #[expect(
             clippy::cast_possible_truncation,
             clippy::cast_sign_loss,
@@ -778,16 +786,28 @@ impl FilterSizing {
     /// The destination groups the keys by its target size, not by input: a
     /// filter per input would charge a filter's fixed overhead for each of
     /// many small inputs merged into one output.
-    fn remaining_loads(&self) -> crate::Result<Vec<Load>> {
+    ///
+    /// Before any filter is built, `priced`, the filter being priced, tells
+    /// how far the estimate runs: its hashes are known, and overlapping inputs
+    /// counted each of its keys once per input holding it.
+    fn remaining_loads(&self, priced: Option<Priced<'_>>) -> crate::Result<Vec<Load>> {
+        let hashes_per_key = as_f64(self.hashes_per_key.0.load(Relaxed))
+            / as_f64(self.hashes_per_key.1.load(Relaxed).max(1));
         let admitted = as_f64(self.admitted_keys.load(Relaxed));
         let estimated_admitted = as_f64(self.estimated_admitted.load(Relaxed));
         let written = if estimated_admitted > 0.0 {
             admitted / estimated_admitted
+        } else if let Some((n, bounds)) = priced {
+            // Its keys, at the rate the plan estimates a key's hashes.
+            let estimated = as_f64(self.estimated_keys(bounds)?);
+            if estimated > 0.0 {
+                as_f64(u64::try_from(n).unwrap_or(u64::MAX)) / hashes_per_key / estimated
+            } else {
+                1.0
+            }
         } else {
             1.0
         };
-        let hashes_per_key = as_f64(self.hashes_per_key.0.load(Relaxed))
-            / as_f64(self.hashes_per_key.1.load(Relaxed).max(1));
 
         // (where the part starts, its hashes, its negative probes)
         let cursors = self.cursors();
@@ -1426,6 +1446,9 @@ impl FilterSizing {
             .fetch_sub(self.spent.load(Relaxed) as i64, Relaxed);
     }
 }
+
+/// A filter being priced: its hashes and the key range it covers.
+type Priced<'a> = (usize, (Bound<&'a [u8]>, Bound<&'a [u8]>));
 
 /// The hashes `keys` keys hold at `ratio` hashes a key, rounded up.
 fn in_hashes(keys: u64, ratio: (u64, u64)) -> u64 {
