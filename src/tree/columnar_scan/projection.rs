@@ -286,7 +286,9 @@ pub fn is_declared(field: &ProjectedField) -> bool {
 /// Replaces, in a batch of a table that stores each value whole, the value
 /// column by the declared `fields` read out of it through `projector`, each
 /// row's value given with its key. A field the projector leaves unset is null
-/// here, and reads as declared once the batch is conformed.
+/// here, and reads as declared once the batch is conformed. A row that is not
+/// a value (a deletion, a merge operand) carries no fields: it is decided by
+/// its type, not read. The value column stays when a field projects it by id.
 pub fn project_whole(
     batch: ColumnBatch,
     fields: &[ProjectedField],
@@ -302,21 +304,40 @@ pub fn project_whole(
         .iter()
         .position(|c| c.column_id == COL_VALUE)
         .ok_or(MISSING_SCAN_COLUMN)?;
-    let values = columns.remove(at);
+    let keep_value = fields
+        .iter()
+        .any(|f| f.column_id == COL_VALUE && !is_declared(f));
+    let values = if keep_value {
+        columns.get(at).cloned().ok_or(MISSING_SCAN_COLUMN)?
+    } else {
+        columns.remove(at)
+    };
     let keys = columns
         .iter()
         .find(|c| c.column_id == COL_USER_KEY)
         .ok_or(MISSING_SCAN_COLUMN)?;
+    let types = columns.iter().find(|c| c.column_id == COL_VALUE_TYPE);
     let declared: Vec<ProjectedField> = fields.iter().filter(|f| is_declared(f)).cloned().collect();
 
     let mut cells: Vec<Option<Vec<u8>>> = alloc::vec![None; declared.len()];
     let mut out: Vec<Vec<Option<Vec<u8>>>> =
         alloc::vec![Vec::with_capacity(row_count as usize); declared.len()];
     for row in 0..row_count {
-        let key = bytes_column_row(&keys.data, row_count, row)?;
-        let value = bytes_column_row(&values.data, row_count, row)?;
         cells.fill(None);
-        projector.project(key, value, &mut ProjectedRow::new(&declared, &mut cells))?;
+        let is_value = match types {
+            Some(types) => {
+                let byte = *types.data.get(row as usize).ok_or(MISSING_SCAN_COLUMN)?;
+                crate::ValueType::try_from(byte)
+                    .map_err(|()| Error::InvalidTag(("ValueType", byte)))?
+                    == crate::ValueType::Value
+            }
+            None => true,
+        };
+        if is_value {
+            let key = bytes_column_row(&keys.data, row_count, row)?;
+            let value = bytes_column_row(&values.data, row_count, row)?;
+            projector.project(key, value, &mut ProjectedRow::new(&declared, &mut cells))?;
+        }
         for (column, cell) in out.iter_mut().zip(&mut cells) {
             column.push(cell.take());
         }
@@ -369,13 +390,18 @@ const MISSING_SCAN_COLUMN: Error =
     Error::InvalidHeader("columnar_scan: a whole-value batch is missing its key or value column");
 
 /// The column that stands for `field` in a batch of `rows` rows whose source
-/// does not have it, or the error its declaration asks for.
-pub fn absent_column(field: &ProjectedField, rows: u32) -> crate::Result<Column> {
+/// does not have it, or the error its declaration asks for when a row of it
+/// is a value (`is_value`): a deletion carries no fields and is not refused.
+pub fn absent_column(
+    field: &ProjectedField,
+    rows: u32,
+    is_value: &dyn Fn(u32) -> bool,
+) -> crate::Result<Column> {
     let type_tag = field.type_tag.ok_or(ABSENT_FIELD)?;
     let count = rows as usize;
     let (validity, data) = match &field.absent {
-        Absent::Error => return Err(ABSENT_FIELD),
-        Absent::Null => {
+        Absent::Error if (0..rows).any(is_value) => return Err(ABSENT_FIELD),
+        Absent::Null | Absent::Error => {
             let data = match type_tag.fixed_width() {
                 Some(width) => Slice::from(alloc::vec![0u8; count * usize::from(width)]),
                 None => frame_bytes_column(count, || core::iter::repeat_n(&[][..], count))?,
@@ -410,11 +436,24 @@ const ABSENT_FIELD: Error = Error::Projection(
 /// another type than the one declared is an error. The columns come back in
 /// the order of `fields`; a column the batch holds that no field names is
 /// kept after them, in its place.
+///
+/// Only a row that is a value is held to its fields: a deletion or a merge
+/// operand, which the batch's value-type column names when it carries one,
+/// has none, and is decided by its type before it could be returned.
 pub fn conform(batch: ColumnBatch, fields: &[ProjectedField]) -> crate::Result<ColumnBatch> {
     let ColumnBatch {
         row_count,
         mut columns,
     } = batch;
+    let types = columns
+        .iter()
+        .find(|c| c.column_id == COL_VALUE_TYPE)
+        .map(|c| c.data.clone());
+    let is_value = |row: u32| {
+        types.as_ref().is_none_or(|types| {
+            types.get(row as usize).copied() == Some(u8::from(crate::ValueType::Value))
+        })
+    };
     let mut out = Vec::with_capacity(fields.len().max(columns.len()));
     for field in fields {
         let at = columns.iter().position(|c| c.column_id == field.column_id);
@@ -426,9 +465,9 @@ pub fn conform(batch: ColumnBatch, fields: &[ProjectedField]) -> crate::Result<C
                         "projection: a segment stores a projected field under another type",
                     ));
                 }
-                fill_nulls(column, field, row_count)?
+                fill_nulls(column, field, row_count, &is_value)?
             }
-            None => absent_column(field, row_count)?,
+            None => absent_column(field, row_count, &is_value)?,
         };
         out.push(column);
     }
@@ -441,8 +480,13 @@ pub fn conform(batch: ColumnBatch, fields: &[ProjectedField]) -> crate::Result<C
 
 /// `column` with its null cells read as `field` declares: kept for
 /// [`Absent::Null`], set to the default for [`Absent::Default`], an error for
-/// [`Absent::Error`].
-fn fill_nulls(column: Column, field: &ProjectedField, rows: u32) -> crate::Result<Column> {
+/// [`Absent::Error`] when a null row is a value (`is_value`).
+fn fill_nulls(
+    column: Column,
+    field: &ProjectedField,
+    rows: u32,
+    is_value: &dyn Fn(u32) -> bool,
+) -> crate::Result<Column> {
     let Some(validity) = &column.validity else {
         return Ok(column);
     };
@@ -458,8 +502,10 @@ fn fill_nulls(column: Column, field: &ProjectedField, rows: u32) -> crate::Resul
         });
     }
     let value = match &field.absent {
-        Absent::Null => return Ok(column),
-        Absent::Error => return Err(ABSENT_FIELD),
+        Absent::Error if (0..rows).any(|row| is_null(row) && is_value(row)) => {
+            return Err(ABSENT_FIELD);
+        }
+        Absent::Null | Absent::Error => return Ok(column),
         Absent::Default(value) => value,
     };
     let count = rows as usize;

@@ -808,9 +808,10 @@ fn tree_columnar_scan_applies_delete_bitmap_masking() {
 }
 
 #[test]
-fn tree_columnar_scan_errors_on_mixed_mode_tree() {
-    // If a non-columnar segment overlaps the range (a mixed-mode tree), the scan
-    // must reject the request rather than silently skip that segment's data.
+fn tree_columnar_scan_reads_row_segments_and_memtables_in_range() {
+    // A row-major segment and memtable rows in the range are sources of the
+    // scan like a columnar segment, never skipped: every key a read sees is
+    // returned.
     let folder = get_tmp_folder();
     let any = Config::new(
         folder.path(),
@@ -832,13 +833,19 @@ fn tree_columnar_scan_errors_on_mixed_mode_tree() {
     })
     .expect("enable columnar");
     ingest_segment(&any, &[(key(1), 11)]);
+    // Memtable rows: one new key, one deleting the row segment's key.
+    tree.insert(key(2), vec![b'w'; 8], 20);
+    tree.remove(key(0), 21);
 
-    assert!(
-        matches!(
-            tree.columnar_scan(&[3], None, SeqNo::MAX, ..),
-            Err(Error::FeatureUnsupported(_))
-        ),
-        "a non-columnar segment overlapping the range must be rejected"
+    assert_eq!(
+        scan_keys(tree, SeqNo::MAX),
+        vec![key(1), key(2)],
+        "the memtable deletion hides the row segment's key; the others are read",
+    );
+    assert_eq!(
+        scan_keys(tree, 21),
+        vec![key(0), key(1), key(2)],
+        "below the deletion the row segment's key is read",
     );
 }
 

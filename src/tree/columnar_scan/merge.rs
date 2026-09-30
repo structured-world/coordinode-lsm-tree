@@ -22,12 +22,12 @@
 use alloc::vec::Vec;
 
 use super::projection::{ProjectedField, conform, project_whole};
+use super::rows::SourceCursor;
 use super::{ColumnarScan, Segment, SegmentCursor, WholeRead, drop_columns, key_in_bounds};
 use crate::table::columnar::{
     COL_SEQNO, COL_USER_KEY, COL_VALUE_TYPE, ColumnBatch, TypeTag, bytes_column_row,
     bytes_column_span, fixed_u64_row,
 };
-use crate::table::columnar_cursor::ColumnarCursor;
 use crate::table::columnar_predicate::PredicateSupport;
 use crate::{Error, SeqNo, UserKey};
 
@@ -36,7 +36,7 @@ const TARGET_ROWS: usize = 4_096;
 
 /// One segment of an overlapping group, read through its cursor.
 struct MergeSource {
-    cursor: ColumnarCursor,
+    cursor: SourceCursor,
     /// For a whole-value segment read for declared fields, how its batches
     /// become those fields.
     whole: Option<WholeRead>,
@@ -130,9 +130,7 @@ impl MergeStream {
         // them; the predicate's column for the filter after the dedup; the
         // value type where a segment records deletions, because the newest
         // version of a key can BE a deletion and then the key yields nothing.
-        let deletes = segments
-            .iter()
-            .any(|s| s.table.tombstone_count() > 0 || s.table.weak_tombstone_count() > 0);
+        let deletes = segments.iter().any(Segment::records_deletions);
         let mut needed = alloc::vec![COL_USER_KEY, COL_SEQNO];
         if let Some(pred) = &scan.predicate {
             needed.push(pred.column_id);

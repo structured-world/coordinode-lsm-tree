@@ -8,7 +8,8 @@
 #![cfg(feature = "columnar")]
 
 use lsm_tree::table::columnar::{
-    COL_USER_KEY, Column, ColumnBatch, TypeTag, entries_to_column_batch, unframe_value_cells,
+    COL_USER_KEY, Column, ColumnBatch, TypeTag, entries_to_column_batch, frame_value_cells,
+    unframe_value_cells,
 };
 use lsm_tree::{
     Absent, AbstractTree, AnyTree, Config, Error, InternalValue, ProjectedField, ProjectedRow,
@@ -275,6 +276,119 @@ fn declared_fields_over_whole_values_without_a_projector_are_refused() {
         tree.columnar_scan(&[COL_USER_KEY, 3], None, SeqNo::MAX, ..)
             .is_ok()
     );
+}
+
+/// A row value holding fields 3 and 4, in the form a read of a two-column
+/// segment returns and `TwoCells` reads.
+fn row_value(third: u32, fourth: u32) -> Vec<u8> {
+    frame_value_cells(&[
+        (TypeTag::Fixed(4), &third.to_le_bytes()[..]),
+        (TypeTag::Fixed(4), &fourth.to_le_bytes()[..]),
+    ])
+    .expect("frame")
+}
+
+/// The projection of the key and fields 3 and 4, read through `TwoCells`.
+fn projected() -> Projection {
+    projection(Absent::Null).projector(std::sync::Arc::new(TwoCells))
+}
+
+/// An update in the memtable over a columnar base is what the scan returns,
+/// read through the projector, as a read returns it.
+#[test]
+fn an_update_in_the_memtable_over_a_columnar_base_is_returned() -> lsm_tree::Result<()> {
+    let folder = get_tmp_folder();
+    let any = open_columnar(folder.path());
+    ingest(&any, &[0, 1], &[(3, &[10, 11]), (4, &[40, 41])]);
+    let tree = standard(&any);
+    let seqno = tree.get_highest_seqno().map_or(0, |s| s + 1);
+    tree.insert(key(0), row_value(100, 400), seqno);
+    assert_eq!(
+        vec![(key(0), Some(400)), (key(1), Some(41))],
+        rows(tree, &projected())?,
+    );
+    Ok(())
+}
+
+/// A deletion in the memtable over a columnar base hides the key, as a read
+/// reports it absent.
+#[test]
+fn a_delete_in_the_memtable_over_a_columnar_base_hides_the_key() -> lsm_tree::Result<()> {
+    let folder = get_tmp_folder();
+    let any = open_columnar(folder.path());
+    ingest(&any, &[0, 1], &[(3, &[10, 11]), (4, &[40, 41])]);
+    let tree = standard(&any);
+    let seqno = tree.get_highest_seqno().map_or(0, |s| s + 1);
+    tree.remove(key(0), seqno);
+    assert_eq!(vec![(key(1), Some(41))], rows(tree, &projected())?);
+    Ok(())
+}
+
+/// A range tombstone spanning a columnar segment, a row segment and memtable
+/// rows removes the keys of all three that it is newer than.
+#[test]
+fn a_range_tombstone_spanning_both_layouts_removes_their_keys() -> lsm_tree::Result<()> {
+    let folder = get_tmp_folder();
+    let any = open_columnar(folder.path());
+    let tree = standard(&any);
+    // A row segment, written with the columnar layout off.
+    tree.update_runtime_config(|cfg| cfg.columnar = false)?;
+    tree.insert(key(1), row_value(11, 41), 1);
+    tree.flush_active_memtable(0)?;
+    tree.update_runtime_config(|cfg| cfg.columnar = true)?;
+    ingest(&any, &[0, 2, 4], &[(3, &[10, 12, 14]), (4, &[40, 42, 44])]);
+    let seqno = tree.get_highest_seqno().map_or(0, |s| s + 1);
+    tree.insert(key(3), row_value(13, 43), seqno);
+    tree.remove_range(key(0), key(4), seqno + 1);
+    // A row written after the deletion is not covered by it.
+    tree.insert(key(2), row_value(102, 402), seqno + 2);
+    assert_eq!(
+        vec![(key(2), Some(402)), (key(4), Some(44))],
+        rows(tree, &projected())?,
+    );
+    Ok(())
+}
+
+/// The same rows read the same whether they sit in the memtable, a row
+/// segment or a columnar segment.
+#[test]
+fn the_same_rows_read_the_same_from_every_source() -> lsm_tree::Result<()> {
+    let expected = vec![(key(0), Some(40)), (key(1), Some(41))];
+
+    let folder = get_tmp_folder();
+    let any = open_columnar(folder.path());
+    let tree = standard(&any);
+    tree.insert(key(0), row_value(10, 40), 1);
+    tree.insert(key(1), row_value(11, 41), 2);
+    assert_eq!(expected, rows(tree, &projected())?, "from the memtable");
+
+    tree.update_runtime_config(|cfg| cfg.columnar = false)?;
+    tree.flush_active_memtable(0)?;
+    assert_eq!(expected, rows(tree, &projected())?, "from a row segment");
+
+    let folder = get_tmp_folder();
+    let any = open_columnar(folder.path());
+    ingest(&any, &[0, 1], &[(3, &[10, 11]), (4, &[40, 41])]);
+    assert_eq!(
+        expected,
+        rows(standard(&any), &projected())?,
+        "from a columnar segment"
+    );
+    Ok(())
+}
+
+/// A row source's declared fields are read through the projector, so a scan
+/// without one is refused rather than reading them as absent.
+#[test]
+fn declared_fields_over_memtable_rows_without_a_projector_are_refused() {
+    let folder = get_tmp_folder();
+    let any = open_columnar(folder.path());
+    let tree = standard(&any);
+    tree.insert(key(0), row_value(10, 40), 0);
+    let got = tree
+        .columnar_scan(projection(Absent::Null), None, SeqNo::MAX, ..)
+        .err();
+    assert!(matches!(got, Some(Error::Projection(_))), "got {got:?}");
 }
 
 /// A segment that stores a declared field under another type is refused, not
