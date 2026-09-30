@@ -121,6 +121,39 @@ fn an_entry_made_again_while_its_directory_syncs_stays_pending() {
     );
 }
 
+/// A directory sync takes its snapshot only once no entry-making operation is
+/// between its backend call and its registration: an entry the backend
+/// already made is then in the snapshot, instead of being left pending and
+/// removed by a crash though the sync covered it.
+#[test]
+fn a_directory_sync_waits_for_an_entry_being_registered() {
+    let fs = CrashFs::new(MemFs::new());
+    fs.create_dir_all(Path::new("/d")).unwrap();
+
+    // An entry-making operation in flight: past its backend call, not yet
+    // registered.
+    let in_flight = fs.entry_order.read();
+    let (done_tx, done_rx) = std::sync::mpsc::channel();
+    let syncer = {
+        let fs = fs.clone();
+        std::thread::spawn(move || {
+            fs.sync_directory(Path::new("/d")).unwrap();
+            done_tx.send(()).unwrap();
+        })
+    };
+    assert!(
+        done_rx
+            .recv_timeout(std::time::Duration::from_millis(200))
+            .is_err(),
+        "the sync snapshot must wait for the operation in flight"
+    );
+    drop(in_flight);
+    done_rx
+        .recv_timeout(std::time::Duration::from_secs(5))
+        .expect("the sync proceeds once the operation registered its entry");
+    syncer.join().unwrap();
+}
+
 /// A rename onto its own path changes nothing on disk (POSIX rename(2): same
 /// file, no-op), so a file that was durable before it stays durable.
 #[test]
