@@ -421,6 +421,7 @@ impl SuperVersions {
                 &edit,
                 &mut self.edit_scratch,
                 self.sync_mode,
+                log_size == 0,
             ) {
                 Ok(Some(appended)) => {
                     self.log_bytes = Some(log_size + appended);

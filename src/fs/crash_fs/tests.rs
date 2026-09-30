@@ -28,9 +28,63 @@ fn synced_content_survives_crash() {
     f.write_all(b"durable").unwrap();
     f.sync_all().unwrap();
     drop(f);
+    fs.sync_directory(Path::new("/d")).unwrap();
 
     fs.crash();
     assert_eq!(read(&fs, "/d/a"), b"durable");
+}
+
+/// A new file's directory entry is durable only once its directory is synced:
+/// a file whose content was synced but whose directory never was is lost,
+/// and a sync of another directory does not save it.
+#[test]
+fn a_synced_file_in_an_unsynced_directory_is_lost() {
+    let fs = CrashFs::new(MemFs::new());
+    fs.create_dir_all(Path::new("/d")).unwrap();
+    fs.create_dir_all(Path::new("/e")).unwrap();
+
+    let mut f = fs
+        .open(
+            Path::new("/d/a"),
+            &FsOpenOptions::new().write(true).create(true),
+        )
+        .unwrap();
+    f.write_all(b"synced").unwrap();
+    f.sync_all().unwrap();
+    drop(f);
+    fs.sync_directory(Path::new("/e")).unwrap();
+
+    fs.crash();
+    assert!(
+        !fs.exists(Path::new("/d/a")).unwrap(),
+        "a file whose directory entry was never synced does not survive a crash"
+    );
+}
+
+/// A rename's new name is an entry of its own: without a sync of its
+/// directory it is lost, and the old name was removed.
+#[test]
+fn a_rename_without_a_directory_sync_is_lost() {
+    let fs = CrashFs::new(MemFs::new());
+    fs.create_dir_all(Path::new("/d")).unwrap();
+
+    let mut f = fs
+        .open(
+            Path::new("/d/src"),
+            &FsOpenOptions::new().write(true).create(true),
+        )
+        .unwrap();
+    f.write_all(b"data").unwrap();
+    f.sync_all().unwrap();
+    drop(f);
+    fs.sync_directory(Path::new("/d")).unwrap();
+    fs.rename(Path::new("/d/src"), Path::new("/d/dst")).unwrap();
+
+    fs.crash();
+    assert!(
+        !fs.exists(Path::new("/d/dst")).unwrap(),
+        "a renamed-to name whose directory was not synced does not survive a crash"
+    );
 }
 
 #[test]
@@ -49,6 +103,7 @@ fn unsynced_tail_is_rolled_back() {
     // Append more, but never sync: this tail must vanish on crash.
     f.write_all(b"+volatile").unwrap();
     drop(f);
+    fs.sync_directory(Path::new("/d")).unwrap();
 
     fs.crash();
     assert_eq!(
@@ -90,6 +145,7 @@ fn re_sync_advances_the_durable_image() {
     f.write_all(b"v1").unwrap();
     f.sync_all().unwrap();
     drop(f);
+    fs.sync_directory(Path::new("/d")).unwrap();
 
     let mut f = fs.open(Path::new("/d/a"), &opts).unwrap();
     f.write_all(b"v2-longer").unwrap();
@@ -124,6 +180,7 @@ fn unsynced_truncate_is_rolled_back() {
     // Shrink without syncing: the truncate must not be durable.
     f.set_len(2).unwrap();
     drop(f);
+    fs.sync_directory(Path::new("/d")).unwrap();
 
     fs.crash();
     assert_eq!(
@@ -149,6 +206,7 @@ fn rename_carries_the_durable_image() {
     drop(f);
 
     fs.rename(Path::new("/d/src"), Path::new("/d/dst")).unwrap();
+    fs.sync_directory(Path::new("/d")).unwrap();
 
     // Append to the renamed file without syncing.
     let mut f = fs
@@ -357,6 +415,7 @@ fn hard_linked_durable_file_rolls_back_not_removed() {
 
     fs.hard_link(Path::new("/d/src"), Path::new("/d/link"))
         .unwrap();
+    fs.sync_directory(Path::new("/d")).unwrap();
 
     // Open the durable copy for an unsynced write, then crash.
     let mut l = fs
@@ -393,6 +452,7 @@ fn reflinked_durable_file_rolls_back_not_removed() {
 
     fs.reflink_file(Path::new("/d/src"), Path::new("/d/clone"))
         .unwrap();
+    fs.sync_directory(Path::new("/d")).unwrap();
 
     let mut c = fs
         .open(
@@ -434,6 +494,7 @@ fn hard_linked_pre_existing_untouched_source_survives_crash() {
     // no captured durable image yet; the link must still inherit its baseline.
     fs.hard_link(Path::new("/d/src"), Path::new("/d/link"))
         .unwrap();
+    fs.sync_directory(Path::new("/d")).unwrap();
 
     fs.crash();
     assert!(
@@ -466,6 +527,7 @@ fn reflinked_pre_existing_untouched_source_survives_crash() {
 
     fs.reflink_file(Path::new("/d/src"), Path::new("/d/clone"))
         .unwrap();
+    fs.sync_directory(Path::new("/d")).unwrap();
 
     fs.crash();
     assert!(
@@ -523,6 +585,7 @@ fn crash_panics_when_restore_open_fails() {
     f.write_all(b"data").unwrap();
     f.sync_all().unwrap(); // durable image recorded
     drop(f);
+    fs.sync_directory(Path::new("/d")).unwrap();
     // The rollback reopen now fails.
     inj.arm(FaultRule::new(
         FaultOp::Open,
@@ -547,6 +610,7 @@ fn crash_panics_when_restore_write_fails() {
     f.write_all(b"data").unwrap();
     f.sync_all().unwrap();
     drop(f);
+    fs.sync_directory(Path::new("/d")).unwrap();
     // Rollback reopen succeeds (Open not armed), but the rewrite fails.
     inj.arm(FaultRule::new(
         FaultOp::Write,
@@ -684,6 +748,7 @@ fn independent_files_have_independent_durability() {
         .unwrap();
     b.write_all(b"B").unwrap();
     drop(b);
+    fs.sync_directory(Path::new("/d")).unwrap();
 
     fs.crash();
     assert_eq!(read(&fs, "/d/a"), b"A", "synced file survives");

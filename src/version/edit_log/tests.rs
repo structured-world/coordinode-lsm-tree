@@ -25,7 +25,7 @@ fn append_then_replay_roundtrips_all_edits() {
     let mut scratch = Vec::new();
     let edits: Vec<VersionEdit> = (1..=4).map(edit).collect();
     for e in &edits {
-        append_edit(&StdFs, &path, e, &mut scratch, SyncMode::Normal).expect("append");
+        append_edit(&StdFs, &path, e, &mut scratch, SyncMode::Normal, false).expect("append");
     }
     let replayed =
         replay_log(&StdFs, &path, ManifestRecoveryMode::AbsoluteConsistency).expect("replay");
@@ -54,7 +54,7 @@ fn an_edit_too_large_for_one_record_writes_nothing() -> crate::Result<()> {
         ..Default::default()
     };
 
-    let appended = append_edit(&StdFs, &path, &wide, &mut scratch, SyncMode::Normal)?;
+    let appended = append_edit(&StdFs, &path, &wide, &mut scratch, SyncMode::Normal, false)?;
     assert_eq!(appended, None);
     assert!(!path.exists(), "a declined edit must not create the log");
     Ok(())
@@ -79,7 +79,15 @@ fn log_with_torn_tail(dir: &std::path::Path, count: u64) -> std::path::PathBuf {
     let path = dir.join("edits-torn");
     let mut scratch = Vec::new();
     for i in 1..=count {
-        append_edit(&StdFs, &path, &edit(i), &mut scratch, SyncMode::Normal).expect("append");
+        append_edit(
+            &StdFs,
+            &path,
+            &edit(i),
+            &mut scratch,
+            SyncMode::Normal,
+            false,
+        )
+        .expect("append");
     }
     let clean = log_size(&StdFs, &path).expect("size");
     append_edit(
@@ -88,6 +96,7 @@ fn log_with_torn_tail(dir: &std::path::Path, count: u64) -> std::path::PathBuf {
         &edit(count + 1),
         &mut scratch,
         SyncMode::Normal,
+        false,
     )
     .expect("append");
     let f = std::fs::OpenOptions::new()
@@ -144,7 +153,7 @@ fn clean_log_replays_under_strict() {
     let mut scratch = Vec::new();
     let edits: Vec<VersionEdit> = (1..=3).map(edit).collect();
     for e in &edits {
-        append_edit(&StdFs, &path, e, &mut scratch, SyncMode::Normal).expect("append");
+        append_edit(&StdFs, &path, e, &mut scratch, SyncMode::Normal, false).expect("append");
     }
     let replayed = replay_log(&StdFs, &path, ManifestRecoveryMode::AbsoluteConsistency)
         .expect("strict must accept a clean log");
@@ -160,7 +169,15 @@ fn checksum_mismatch_tail_aborts_in_every_mode() {
     let path = dir.path().join("edits-bitrot");
     let mut scratch = Vec::new();
     for i in 1..=3 {
-        append_edit(&StdFs, &path, &edit(i), &mut scratch, SyncMode::Normal).expect("append");
+        append_edit(
+            &StdFs,
+            &path,
+            &edit(i),
+            &mut scratch,
+            SyncMode::Normal,
+            false,
+        )
+        .expect("append");
     }
     // Flip the last payload byte of the final (fully written) record.
     let mut bytes = std::fs::read(&path).expect("read");
@@ -191,9 +208,25 @@ fn log_size_grows_with_appends() {
     let path = dir.path().join("edits-size");
     let mut scratch = Vec::new();
     let s0 = log_size(&StdFs, &path).expect("size");
-    append_edit(&StdFs, &path, &edit(1), &mut scratch, SyncMode::Normal).expect("append");
+    append_edit(
+        &StdFs,
+        &path,
+        &edit(1),
+        &mut scratch,
+        SyncMode::Normal,
+        false,
+    )
+    .expect("append");
     let s1 = log_size(&StdFs, &path).expect("size");
-    append_edit(&StdFs, &path, &edit(2), &mut scratch, SyncMode::Normal).expect("append");
+    append_edit(
+        &StdFs,
+        &path,
+        &edit(2),
+        &mut scratch,
+        SyncMode::Normal,
+        false,
+    )
+    .expect("append");
     let s2 = log_size(&StdFs, &path).expect("size");
     assert_eq!(s0, 0);
     assert!(s1 > s0 && s2 > s1, "log grows with each appended edit");

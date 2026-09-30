@@ -93,6 +93,50 @@ fn flush_with_torn_manifest_commit_recovers_to_last_durable_state() -> lsm_tree:
     Ok(())
 }
 
+/// The blob files a flush and an ingestion write survive a power loss once
+/// the write returns: a new file's directory entry is durable only after its
+/// directory is synced, and the manifest that names the file must not outlive
+/// it.
+#[test]
+fn blob_files_of_an_acknowledged_write_survive_a_crash() -> lsm_tree::Result<()> {
+    use lsm_tree::KvSeparationOptions;
+
+    let crash = CrashFs::new(MemFs::new());
+    let db = "/db";
+    let open = |fs: Arc<dyn lsm_tree::fs::Fs>| {
+        lsm_tree::Config::new(
+            db,
+            SequenceNumberCounter::default(),
+            SequenceNumberCounter::default(),
+        )
+        .with_kv_separation(Some(KvSeparationOptions::default().separation_threshold(1)))
+        .with_shared_fs(fs)
+        .open()
+    };
+
+    {
+        let tree = open(Arc::new(crash.clone()))?;
+        tree.insert("flushed", "blob value of a flush", 0);
+        tree.flush_active_memtable(0)?;
+        let mut ingestion = tree.ingestion()?;
+        ingestion.write("ingested", "blob value of an ingestion")?;
+        ingestion.finish()?;
+    }
+
+    crash.crash();
+
+    let tree = open(crash.inner())?;
+    assert_eq!(
+        tree.get("flushed", u64::MAX)?.as_deref(),
+        Some(&b"blob value of a flush"[..]),
+    );
+    assert_eq!(
+        tree.get("ingested", u64::MAX)?.as_deref(),
+        Some(&b"blob value of an ingestion"[..]),
+    );
+    Ok(())
+}
+
 /// Exhaustive crash-point sweep: for every durability barrier (`sync_all` on a
 /// table or the manifest edit log) of a flush workload, fail that one barrier,
 /// simulate a power loss, reopen, and assert recovery yields a *consistent
