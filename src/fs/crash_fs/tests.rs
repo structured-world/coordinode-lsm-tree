@@ -14,6 +14,321 @@ fn read(fs: &dyn Fs, path: &str) -> Vec<u8> {
     buf
 }
 
+/// With directory entries tracked, a new file's entry is durable only once
+/// its directory is synced: a file whose content was synced but whose
+/// directory never was is lost, and a sync of another directory does not
+/// save it.
+#[test]
+fn a_synced_file_in_an_unsynced_directory_is_lost() {
+    let fs = CrashFs::new(MemFs::new()).tracking_directory_entries();
+    fs.create_dir_all(Path::new("/d")).unwrap();
+    fs.create_dir_all(Path::new("/e")).unwrap();
+
+    let mut f = fs
+        .open(
+            Path::new("/d/a"),
+            &FsOpenOptions::new().write(true).create(true),
+        )
+        .unwrap();
+    f.write_all(b"synced").unwrap();
+    f.sync_all().unwrap();
+    drop(f);
+    fs.sync_directory(Path::new("/e")).unwrap();
+
+    fs.crash();
+    assert!(
+        !fs.exists(Path::new("/d/a")).unwrap(),
+        "a file whose directory entry was never synced does not survive a crash"
+    );
+}
+
+/// With directory entries tracked, a rename's new name is an entry of its
+/// own: without a sync of its directory it is lost.
+#[test]
+fn a_rename_without_a_directory_sync_is_lost() {
+    let fs = CrashFs::new(MemFs::new()).tracking_directory_entries();
+    fs.create_dir_all(Path::new("/d")).unwrap();
+
+    let mut f = fs
+        .open(
+            Path::new("/d/src"),
+            &FsOpenOptions::new().write(true).create(true),
+        )
+        .unwrap();
+    f.write_all(b"data").unwrap();
+    f.sync_all().unwrap();
+    drop(f);
+    fs.sync_directory(Path::new("/d")).unwrap();
+    fs.rename(Path::new("/d/src"), Path::new("/d/dst")).unwrap();
+
+    fs.crash();
+    assert!(
+        !fs.exists(Path::new("/d/dst")).unwrap(),
+        "a renamed-to name whose directory was not synced does not survive a crash"
+    );
+}
+
+/// Every operation that makes or removes a directory entry, and a directory
+/// sync, runs with the namespace held while entries are tracked, so none
+/// lands inside another: not a creation between a sync's backend call and
+/// what the sync is credited with, not a removal between an open's existence
+/// probe and the open, not a new entry at a renamed-away path before the
+/// rename checks it. Each waits while another holds the namespace.
+#[test]
+fn namespace_operations_wait_for_one_in_flight() {
+    let fs = CrashFs::new(MemFs::new()).tracking_directory_entries();
+    fs.create_dir_all(Path::new("/d")).unwrap();
+    for name in ["/d/gone", "/d/src", "/d/linked"] {
+        let mut f = fs
+            .open(
+                Path::new(name),
+                &FsOpenOptions::new().write(true).create(true),
+            )
+            .unwrap();
+        f.write_all(b"x").unwrap();
+    }
+
+    type Operation = (&'static str, fn(&CrashFs));
+    let operations: [Operation; 6] = [
+        ("directory sync", |fs| {
+            fs.sync_directory(Path::new("/d")).unwrap();
+        }),
+        ("create", |fs| {
+            fs.open(
+                Path::new("/d/new"),
+                &FsOpenOptions::new().write(true).create(true),
+            )
+            .unwrap();
+        }),
+        ("remove", |fs| fs.remove_file(Path::new("/d/gone")).unwrap()),
+        ("rename", |fs| {
+            fs.rename(Path::new("/d/src"), Path::new("/d/moved"))
+                .unwrap();
+        }),
+        ("hard link", |fs| {
+            fs.hard_link(Path::new("/d/linked"), Path::new("/d/link"))
+                .unwrap();
+        }),
+        ("directory removal", |fs| {
+            fs.remove_dir_all(Path::new("/d")).unwrap();
+        }),
+    ];
+    for (name, operation) in operations {
+        let held = fs.namespace.lock();
+        let (done_tx, done_rx) = std::sync::mpsc::channel();
+        let worker = {
+            let fs = fs.clone();
+            std::thread::spawn(move || {
+                operation(&fs);
+                done_tx.send(()).unwrap();
+            })
+        };
+        assert!(
+            done_rx
+                .recv_timeout(std::time::Duration::from_millis(200))
+                .is_err(),
+            "{name} must wait while the namespace is held"
+        );
+        drop(held);
+        done_rx
+            .recv_timeout(std::time::Duration::from_secs(5))
+            .unwrap_or_else(|_| panic!("{name} proceeds once the namespace is free"));
+        worker.join().unwrap();
+    }
+}
+
+/// Outside the directory-entry mode the wrapper orders nothing: a namespace
+/// operation does not wait for the lock that mode uses.
+#[test]
+fn without_entry_tracking_namespace_operations_do_not_wait() {
+    let fs = CrashFs::new(MemFs::new());
+    fs.create_dir_all(Path::new("/d")).unwrap();
+    let _held = fs.namespace.lock();
+    fs.sync_directory(Path::new("/d")).unwrap();
+    fs.open(
+        Path::new("/d/new"),
+        &FsOpenOptions::new().write(true).create(true),
+    )
+    .unwrap();
+    fs.remove_file(Path::new("/d/new")).unwrap();
+}
+
+/// A rename onto its own path changes nothing on disk (POSIX rename(2): same
+/// file, no-op), so a file that was durable before it stays durable.
+#[test]
+fn a_rename_onto_itself_keeps_a_durable_file() {
+    let fs = CrashFs::new(MemFs::new()).tracking_directory_entries();
+    fs.create_dir_all(Path::new("/d")).unwrap();
+
+    let mut f = fs
+        .open(
+            Path::new("/d/a"),
+            &FsOpenOptions::new().write(true).create(true),
+        )
+        .unwrap();
+    f.write_all(b"durable").unwrap();
+    f.sync_all().unwrap();
+    drop(f);
+    fs.sync_directory(Path::new("/d")).unwrap();
+    fs.rename(Path::new("/d/a"), Path::new("/d/a")).unwrap();
+
+    fs.crash();
+    assert_eq!(read(&fs, "/d/a"), b"durable");
+}
+
+/// A rename between two hard links of one file is a no-op on a POSIX
+/// filesystem (rename(2): both names refer to the same file), so both durable
+/// names survive a crash.
+#[cfg(unix)]
+#[test]
+fn a_rename_between_links_of_one_file_keeps_both_names() {
+    let dir = tempfile::tempdir().unwrap();
+    let fs = CrashFs::new(crate::fs::StdFs).tracking_directory_entries();
+    let src = dir.path().join("src");
+    let link = dir.path().join("link");
+
+    let mut f = fs
+        .open(&src, &FsOpenOptions::new().write(true).create(true))
+        .unwrap();
+    f.write_all(b"durable").unwrap();
+    f.sync_all().unwrap();
+    drop(f);
+    fs.hard_link(&src, &link).unwrap();
+    fs.sync_directory(dir.path()).unwrap();
+    fs.rename(&link, &src).unwrap();
+    assert!(
+        fs.exists(&link).unwrap(),
+        "the backend treated the rename as a no-op"
+    );
+
+    fs.crash();
+    assert_eq!(read(&fs, src.to_str().unwrap()), b"durable");
+    assert_eq!(read(&fs, link.to_str().unwrap()), b"durable");
+}
+
+/// The blob files a flush and an ingestion write survive a power loss once
+/// the write returns: the manifest that names them must not outlive them.
+#[test]
+fn blob_files_of_an_acknowledged_write_survive_a_crash() -> crate::Result<()> {
+    use crate::{AbstractTree, KvSeparationOptions, SequenceNumberCounter};
+
+    let crash = CrashFs::new(MemFs::new()).tracking_directory_entries();
+    let open = |fs: Arc<dyn Fs>| {
+        crate::Config::new(
+            "/db",
+            SequenceNumberCounter::default(),
+            SequenceNumberCounter::default(),
+        )
+        .with_kv_separation(Some(KvSeparationOptions::default().separation_threshold(1)))
+        .with_shared_fs(fs)
+        .open()
+    };
+
+    {
+        let tree = open(Arc::new(crash.clone()))?;
+        tree.insert("flushed", "blob value of a flush", 0);
+        tree.flush_active_memtable(0)?;
+        let mut ingestion = tree.ingestion()?;
+        ingestion.write("ingested", "blob value of an ingestion")?;
+        ingestion.finish()?;
+    }
+
+    crash.crash();
+
+    let tree = open(crash.inner())?;
+    assert_eq!(
+        tree.get("flushed", u64::MAX)?.as_deref(),
+        Some(&b"blob value of a flush"[..]),
+    );
+    assert_eq!(
+        tree.get("ingested", u64::MAX)?.as_deref(),
+        Some(&b"blob value of an ingestion"[..]),
+    );
+    Ok(())
+}
+
+/// The manifest's edit log, created by the first flush after a snapshot,
+/// survives a power loss with the flushes it recorded.
+#[test]
+fn the_edit_log_of_acknowledged_flushes_survives_a_crash() -> crate::Result<()> {
+    use crate::{AbstractTree, SequenceNumberCounter};
+
+    let crash = CrashFs::new(MemFs::new()).tracking_directory_entries();
+    let open = |fs: Arc<dyn Fs>| {
+        crate::Config::new(
+            "/db",
+            SequenceNumberCounter::default(),
+            SequenceNumberCounter::default(),
+        )
+        .with_shared_fs(fs)
+        .open()
+    };
+
+    {
+        let tree = open(Arc::new(crash.clone()))?;
+        tree.insert("a", "1", 0);
+        tree.flush_active_memtable(0)?;
+        tree.insert("b", "2", 1);
+        tree.flush_active_memtable(0)?;
+    }
+
+    crash.crash();
+
+    let tree = open(crash.inner())?;
+    assert!(tree.contains_key("a", u64::MAX)?);
+    assert!(tree.contains_key("b", u64::MAX)?);
+    Ok(())
+}
+
+/// A failed sync of the new edit log's directory fails the flush, and the
+/// next flush syncs it again: the log is no longer empty then, but its
+/// directory entry is still not durable, and a flush acknowledged over it
+/// would be lost with it.
+#[test]
+fn a_failed_sync_of_the_edit_log_directory_is_retried() -> crate::Result<()> {
+    use crate::{AbstractTree, SequenceNumberCounter};
+
+    let crash = CrashFs::new(MemFs::new()).tracking_directory_entries();
+    let fault = FaultFs::new(crash.clone());
+    let injector = fault.injector();
+    let open = |fs: Arc<dyn Fs>| {
+        crate::Config::new(
+            "/db",
+            SequenceNumberCounter::default(),
+            SequenceNumberCounter::default(),
+        )
+        .with_shared_fs(fs)
+        .open()
+    };
+
+    {
+        let tree = open(Arc::new(fault))?;
+        // A flush syncs its table's directory, then, on the first edit of a
+        // generation, the log's: fail the second.
+        injector.arm(
+            FaultRule::new(FaultOp::SyncDirectory, Fault::Error(ErrorKind::Other))
+                .skip(1)
+                .once(),
+        );
+        tree.insert("a", "1", 0);
+        match tree.flush_active_memtable(0) {
+            Ok(()) => panic!("the injected directory sync fault must fail the flush"),
+            Err(e) => assert!(format!("{e}").contains("injected fault"), "{e}"),
+        }
+        tree.insert("b", "2", 1);
+        tree.flush_active_memtable(0)?;
+    }
+
+    crash.crash();
+
+    let tree = open(crash.inner())?;
+    assert!(
+        tree.contains_key("b", u64::MAX)?,
+        "the acknowledged flush survives the crash"
+    );
+    Ok(())
+}
+
 #[test]
 fn synced_content_survives_crash() {
     let fs = CrashFs::new(MemFs::new());
@@ -585,6 +900,46 @@ fn baseline_read_failure_surfaces_from_open() {
         )
         .is_err(),
         "a failed baseline read surfaces from open(), it is not silently dropped"
+    );
+}
+
+/// A hard link the backend made is a new entry even when reading its source's
+/// baseline then fails: its directory was never synced, so a crash removes it
+/// rather than keeping an entry the simulator never recorded.
+#[test]
+fn a_hard_link_whose_baseline_read_fails_does_not_survive_a_crash() {
+    let fault = FaultFs::new(MemFs::new());
+    let inj = fault.injector();
+    fault.create_dir_all(Path::new("/d")).unwrap();
+    {
+        let mut f = fault
+            .open(
+                Path::new("/d/pre"),
+                &FsOpenOptions::new().write(true).create(true),
+            )
+            .unwrap();
+        std::io::Write::write_all(&mut f, b"original").unwrap();
+    }
+    let fs = CrashFs::from_shared(Arc::new(fault)).tracking_directory_entries();
+
+    // The link is made; reading the untouched source's baseline then fails.
+    inj.arm(FaultRule::new(
+        FaultOp::Read,
+        Fault::Error(ErrorKind::Other),
+    ));
+    assert!(
+        fs.hard_link(Path::new("/d/pre"), Path::new("/d/link"))
+            .is_err()
+    );
+    assert!(
+        fs.exists(Path::new("/d/link")).unwrap(),
+        "the backend made it"
+    );
+
+    fs.crash();
+    assert!(
+        !fs.exists(Path::new("/d/link")).unwrap(),
+        "an entry whose directory was never synced does not survive a crash"
     );
 }
 
