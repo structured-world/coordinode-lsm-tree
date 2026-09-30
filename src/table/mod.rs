@@ -7711,17 +7711,48 @@ impl Table {
         bytes: &[u8],
         offset: u64,
     ) -> crate::Result<Option<DataBlock>> {
+        let block = self.decode_block_from_bytes(bytes, offset, BlockType::Data)?;
+        let has_kv_footer = self.metadata.kv_checksum_algo.is_some();
+        DataBlock::from_loaded(block, has_kv_footer).map(Some)
+    }
+
+    /// Decodes the on-disk `bytes` of this table's block of `block_type` read
+    /// at `offset`, with the codec that block type is written with, exactly as
+    /// the load path decodes it; a block of another type is refused. Not for
+    /// Page-ECC tables, whose recovery needs the re-reading load path.
+    ///
+    /// # Errors
+    ///
+    /// Propagates a corruption or decode error.
+    pub(crate) fn decode_block_from_bytes(
+        &self,
+        bytes: &[u8],
+        offset: u64,
+        block_type: BlockType,
+    ) -> crate::Result<Block> {
+        // Filter blocks are written uncompressed and without the dictionary,
+        // index blocks with the index codec, data blocks with the data codec
+        // and its dictionary: the same choice each block's load makes.
+        let compression = match block_type {
+            BlockType::Filter => CompressionType::None,
+            BlockType::Index => self.metadata.index_block_compression,
+            _ => self.metadata.data_block_compression,
+        };
         let transform = crate::table::util::build_block_transform(
-            self.metadata.data_block_compression,
+            compression,
             self.encryption.as_deref(),
             self.metadata.ecc_params,
             #[cfg(zstd_any)]
-            self.zstd_dictionary.as_deref(),
+            if block_type == BlockType::Data {
+                self.zstd_dictionary.as_deref()
+            } else {
+                None
+            },
         )?;
         let identity = crate::table::block::BlockIdentity {
             table_id: self.global_id().table_id(),
-            block_type: BlockType::Data,
-            dict_id: self.metadata.data_block_compression.dict_id(),
+            block_type,
+            dict_id: compression.dict_id(),
             window_log: 0,
         };
         // The transform runs here, outside the block cache, so its output is
@@ -7733,7 +7764,7 @@ impl Table {
             &mut crate::io::Cursor::new(bytes),
             identity,
             &transform,
-            crate::table::block::ChecksumAt::table(identity.table_id, offset),
+            crate::table::block::ChecksumAt::block(identity.table_id, block_type, offset),
             &mut produced,
         );
         #[cfg(feature = "metrics")]
@@ -7741,14 +7772,13 @@ impl Table {
             .block_bytes_decoded
             .fetch_add(produced as u64, core::sync::atomic::Ordering::Relaxed);
         let block = decoded?;
-        if block.header.block_type != BlockType::Data {
+        if block.header.block_type != block_type {
             return Err(crate::Error::InvalidTag((
                 "BlockType",
                 block.header.block_type.into(),
             )));
         }
-        let has_kv_footer = self.metadata.kv_checksum_algo.is_some();
-        DataBlock::from_loaded(block, has_kv_footer).map(Some)
+        Ok(block)
     }
 
     /// Point-reads `key` in an already-decoded `block`, translating the
