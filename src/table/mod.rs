@@ -73,7 +73,6 @@ use crate::{
         writer::LinkedFile,
     },
 };
-use alloc::borrow::Cow;
 use alloc::sync::Arc;
 #[cfg(not(feature = "std"))]
 use alloc::{boxed::Box, vec::Vec};
@@ -352,6 +351,21 @@ enum BloomResult {
         /// Whether a filter was present, for metrics and probe accounting.
         has_filter: bool,
     },
+}
+
+/// Where the filter a key is checked against lives (see
+/// [`Table::filter_source`]).
+pub(crate) enum FilterSource<'a> {
+    /// The table has no filter.
+    None,
+    /// The table's whole filter, pinned in memory.
+    Pinned(&'a FilterBlock),
+    /// The filter block, or the filter partition holding the key, to read.
+    Block(BlockHandle),
+    /// The key sorts past the last filter partition.
+    PastPartitions,
+    /// The filter is partitioned and its partition index is not pinned.
+    UnpinnedPartitions,
 }
 
 /// What a key check of a table's filters found (see
@@ -6566,56 +6580,77 @@ impl Table {
             "key_hash must match the hash of the provided key"
         );
 
-        let filter_block = if let Some(block) = &self.pinned_filter_block {
-            Some(Cow::Borrowed(block))
+        match self.filter_source(key) {
+            FilterSource::None => self.answer_bloom(None, key_hash),
+            FilterSource::Pinned(block) => self.answer_bloom(Some(block), key_hash),
+            FilterSource::Block(handle) => {
+                let block = self.load_block(
+                    &handle,
+                    BlockType::Filter,
+                    CompressionType::None,
+                    #[cfg(zstd_any)]
+                    None,
+                )?;
+                self.answer_bloom(Some(&FilterBlock::new(block)), key_hash)
+            }
+            FilterSource::PastPartitions => Ok(self.past_partitions()),
+            FilterSource::UnpinnedPartitions => {
+                unimplemented!("unpinned filter TLI not supported")
+            }
+        }
+    }
+
+    /// Where the filter `key` is checked against lives, found without a read:
+    /// the pinned filter, the block of the filter or of the filter partition
+    /// holding the key, or no filter at all.
+    pub(crate) fn filter_source(&self, key: &[u8]) -> FilterSource<'_> {
+        if let Some(block) = &self.pinned_filter_block {
+            FilterSource::Pinned(block)
         } else if let Some(filter_idx) = &self.pinned_filter_index {
             let mut iter = filter_idx.iter(self.comparator.clone());
             // Filter partitions are written with seqno=0, making the seqno
             // parameter irrelevant to partition selection. Use MAX_SEQNO
             // consistently to match the index-block seek in Table::range().
             iter.seek(key, crate::seqno::MAX_SEQNO);
-
-            if let Some(filter_block_handle) = iter.next() {
-                let filter_block_handle = filter_block_handle.materialize(filter_idx.as_slice());
-
-                let block = self.load_block(
-                    &filter_block_handle.into_inner(),
-                    BlockType::Filter,
-                    CompressionType::None,
-                    #[cfg(zstd_any)]
-                    None,
-                )?;
-                Some(Cow::Owned(FilterBlock::new(block)))
-            } else {
-                // Key sorts past the last filter partition — definite miss.
-                #[cfg(feature = "metrics")]
-                {
-                    use core::sync::atomic::Ordering::Relaxed;
-                    self.metrics.filter_queries.fetch_add(1, Relaxed);
-                    self.metrics.io_skipped_by_filter.fetch_add(1, Relaxed);
+            match iter.next() {
+                Some(handle) => {
+                    FilterSource::Block(handle.materialize(filter_idx.as_slice()).into_inner())
                 }
-                return Ok(BloomResult::PastPartitions);
+                // Key sorts past the last filter partition: a definite miss.
+                None => FilterSource::PastPartitions,
             }
-        } else if let Some(_filter_tli_handle) = &self.regions.filter_tli {
-            unimplemented!("unpinned filter TLI not supported");
-        } else if let Some(filter_block_handle) = &self.regions.filter {
-            let block = self.load_block(
-                filter_block_handle,
-                BlockType::Filter,
-                CompressionType::None,
-                #[cfg(zstd_any)]
-                None,
-            )?;
-            Some(Cow::Owned(FilterBlock::new(block)))
+        } else if self.regions.filter_tli.is_some() {
+            FilterSource::UnpinnedPartitions
+        } else if let Some(handle) = &self.regions.filter {
+            FilterSource::Block(*handle)
         } else {
-            None
-        };
+            FilterSource::None
+        }
+    }
 
-        let has_filter = filter_block.is_some();
-
-        if let Some(filter_block) = &filter_block
-            && !filter_block.maybe_contains_hash(key_hash)?
+    /// The answer for a key sorting past the last filter partition, counted
+    /// as a filter skip.
+    fn past_partitions(&self) -> BloomResult {
+        #[cfg(feature = "metrics")]
         {
+            use core::sync::atomic::Ordering::Relaxed;
+            self.metrics.filter_queries.fetch_add(1, Relaxed);
+            self.metrics.io_skipped_by_filter.fetch_add(1, Relaxed);
+        }
+        BloomResult::PastPartitions
+    }
+
+    /// The answer of `filter` (none: nothing rules the key out) for a key
+    /// hashing to `key_hash`, a skip counted as one.
+    fn answer_bloom(
+        &self,
+        filter: Option<&FilterBlock>,
+        key_hash: u64,
+    ) -> crate::Result<BloomResult> {
+        let Some(filter) = filter else {
+            return Ok(BloomResult::Proceed { has_filter: false });
+        };
+        if !filter.maybe_contains_hash(key_hash)? {
             #[cfg(feature = "metrics")]
             {
                 use core::sync::atomic::Ordering::Relaxed;
@@ -6624,8 +6659,7 @@ impl Table {
             }
             return Ok(BloomResult::Skip);
         }
-
-        Ok(BloomResult::Proceed { has_filter })
+        Ok(BloomResult::Proceed { has_filter: true })
     }
 
     /// Records a data-consulting point read for per-segment tiering / placement
