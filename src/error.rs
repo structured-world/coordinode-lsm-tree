@@ -548,6 +548,15 @@ pub enum Error {
         /// servable.
         oldest_retained: SeqNo,
     },
+
+    /// A projected columnar scan cannot produce a field as its projection
+    /// declares: the field is absent from a row and declared an error, a
+    /// segment stores it under another type, a row value has to be read and
+    /// no projector is set, or the projector wrote a cell that does not fit.
+    ///
+    /// A caller-side mismatch between the projection and the data, not damage.
+    /// The payload names which of these it is.
+    Projection(&'static str),
 }
 
 impl core::fmt::Display for Error {

@@ -77,6 +77,7 @@ use crate::table::columnar_predicate::{
 use crate::{Error, SeqNo, Table, Tree, UserKey};
 
 mod merge;
+pub(crate) mod projection;
 
 /// A visible columnar segment selected for the scan, with its cached key range,
 /// sequence base, and snapshot-visibility class.

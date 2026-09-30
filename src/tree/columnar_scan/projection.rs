@@ -1,0 +1,409 @@
+// SPDX-License-Identifier: Apache-2.0
+// Copyright (c) 2026-present, Dmitry Prudnikov
+
+//! What a projected columnar scan returns, and what a field a row does not
+//! have reads as.
+//!
+//! Sources disagree about which fields a row has: an older segment predates a
+//! column, a row value a [`ValueProjector`] reads may not carry one. Each
+//! projected field therefore declares what its absence means
+//! ([`Absent`]), and the scan applies that declaration the same way to every
+//! source, so one query over the same data returns the same rows wherever
+//! they are stored. A null cell counts as absent: a row either has a value for
+//! a field or it does not.
+//!
+//! Absence never means "take the field from an older version". Filling a
+//! field from history is partial-update semantics, which a caller asks for
+//! through a merge operator.
+
+use alloc::sync::Arc;
+use alloc::vec::Vec;
+
+use crate::table::columnar::{
+    COL_SEQNO, COL_USER_KEY, COL_VALUE_TYPE, Column, ColumnBatch, Number, TypeTag,
+    bytes_column_row, frame_bytes_column,
+};
+use crate::{Error, Slice};
+
+/// What a projected field reads as in a row that does not have it: a segment
+/// written without the column, a null cell, or a row value the
+/// [`ValueProjector`] finds no such field in.
+#[derive(Clone, Debug, Eq, PartialEq)]
+pub enum Absent {
+    /// The cell is null: the column carries a validity bitmap and the row's
+    /// bit is clear.
+    Null,
+    /// The cell reads as this value, which must fit the field's type.
+    Default(Slice),
+    /// The scan fails, naming the field.
+    Error,
+}
+
+/// One field of a [`Projection`]: its column id, its physical type and what
+/// its absence means.
+#[derive(Clone, Debug, Eq, PartialEq)]
+pub struct ProjectedField {
+    column_id: u16,
+    /// The declared type, or `None` for a field projected by id alone, whose
+    /// type is whatever the segments store.
+    type_tag: Option<TypeTag>,
+    absent: Absent,
+}
+
+impl ProjectedField {
+    /// A field with a declared type and absence.
+    ///
+    /// # Errors
+    ///
+    /// Returns an error if `absent` is a default that does not fit `type_tag`
+    /// (a fixed-width type takes exactly its width), or if `column_id` names
+    /// an intrinsic column, whose type and presence are fixed.
+    pub fn new(column_id: u16, type_tag: TypeTag, absent: Absent) -> crate::Result<Self> {
+        if intrinsic_type(column_id).is_some() {
+            return Err(Error::Projection(
+                "projection: an intrinsic column is projected by id, not declared",
+            ));
+        }
+        if let (Absent::Default(value), Some(width)) = (&absent, type_tag.fixed_width())
+            && value.len() != usize::from(width)
+        {
+            return Err(Error::Projection(
+                "projection: a default does not fit its field's width",
+            ));
+        }
+        Ok(Self {
+            column_id,
+            type_tag: Some(type_tag),
+            absent,
+        })
+    }
+
+    /// A field projected by id alone: an intrinsic column, or a value column
+    /// whose type is whatever the segments store and whose absence is an
+    /// error.
+    #[must_use]
+    pub fn by_id(column_id: u16) -> Self {
+        Self {
+            column_id,
+            type_tag: intrinsic_type(column_id),
+            absent: Absent::Error,
+        }
+    }
+
+    /// The field's column id.
+    #[must_use]
+    pub fn column_id(&self) -> u16 {
+        self.column_id
+    }
+
+    /// The field's declared type, or `None` when it was projected by id alone.
+    #[must_use]
+    pub fn type_tag(&self) -> Option<TypeTag> {
+        self.type_tag
+    }
+
+    /// What the field reads as where a row does not have it.
+    #[must_use]
+    pub fn absent(&self) -> &Absent {
+        &self.absent
+    }
+}
+
+/// The type of an intrinsic column, or `None` for a value column.
+fn intrinsic_type(column_id: u16) -> Option<TypeTag> {
+    match column_id {
+        COL_USER_KEY => Some(TypeTag::Bytes),
+        COL_SEQNO => Some(TypeTag::Number(Number::U64_LE)),
+        COL_VALUE_TYPE => Some(TypeTag::Fixed(1)),
+        _ => None,
+    }
+}
+
+/// Reads the projected fields out of a row value the engine cannot interpret:
+/// a value in a memtable or a row-oriented table, or the result of a merge.
+///
+/// The engine does not guess an encoding; the caller that wrote the values
+/// knows it.
+pub trait ValueProjector: Send + Sync {
+    /// Writes into `row` the cell of each field the row value `value` of `key`
+    /// has. A field left unset is absent from the row and reads as its
+    /// declaration says.
+    ///
+    /// # Errors
+    ///
+    /// Returns an error when `value` is not a value this projector reads; the
+    /// scan fails with it.
+    fn project(&self, key: &[u8], value: &[u8], row: &mut ProjectedRow<'_>) -> crate::Result<()>;
+}
+
+/// The cells a [`ValueProjector`] writes for one row.
+pub struct ProjectedRow<'a> {
+    fields: &'a [ProjectedField],
+    cells: &'a mut [Option<Vec<u8>>],
+}
+
+impl<'a> ProjectedRow<'a> {
+    /// A row of `fields`, whose cells are written into `cells`, one per field.
+    pub(crate) fn new(fields: &'a [ProjectedField], cells: &'a mut [Option<Vec<u8>>]) -> Self {
+        Self { fields, cells }
+    }
+
+    /// The fields to write, in the order `set` indexes them.
+    #[must_use]
+    pub fn fields(&self) -> &[ProjectedField] {
+        self.fields
+    }
+
+    /// Sets field `index` of the row to `cell`.
+    ///
+    /// # Errors
+    ///
+    /// Returns an error if `index` names no field, if the field was projected
+    /// by id alone (a row value has no type the engine could check it
+    /// against), or if `cell` does not fit the field's fixed width.
+    pub fn set(&mut self, index: usize, cell: &[u8]) -> crate::Result<()> {
+        let field = self.fields.get(index).ok_or(Error::Projection(
+            "projection: the projector set a field the projection does not have",
+        ))?;
+        let type_tag = field.type_tag.ok_or(Error::Projection(
+            "projection: a row value is projected into a field with no declared type",
+        ))?;
+        if let Some(width) = type_tag.fixed_width()
+            && cell.len() != usize::from(width)
+        {
+            return Err(Error::Projection(
+                "projection: the projector wrote a cell of the wrong width",
+            ));
+        }
+        let slot = self.cells.get_mut(index).ok_or(Error::Projection(
+            "projection: the projector set a field the projection does not have",
+        ))?;
+        let buf = slot.get_or_insert_with(Vec::new);
+        buf.clear();
+        buf.extend_from_slice(cell);
+        Ok(())
+    }
+}
+
+/// The columns a projected scan returns: intrinsic columns and value fields,
+/// in the order the scan yields them, and the projector that reads the fields
+/// out of row values.
+#[derive(Clone, Default)]
+pub struct Projection {
+    fields: Vec<ProjectedField>,
+    projector: Option<Arc<dyn ValueProjector>>,
+}
+
+impl core::fmt::Debug for Projection {
+    fn fmt(&self, f: &mut core::fmt::Formatter<'_>) -> core::fmt::Result {
+        f.debug_struct("Projection")
+            .field("fields", &self.fields)
+            .field("projector", &self.projector.is_some())
+            .finish()
+    }
+}
+
+impl Projection {
+    /// An empty projection.
+    #[must_use]
+    pub fn new() -> Self {
+        Self::default()
+    }
+
+    /// Adds a column projected by id alone (see [`ProjectedField::by_id`]).
+    #[must_use]
+    pub fn column(mut self, column_id: u16) -> Self {
+        self.fields.push(ProjectedField::by_id(column_id));
+        self
+    }
+
+    /// Adds a declared field.
+    #[must_use]
+    pub fn field(mut self, field: ProjectedField) -> Self {
+        self.fields.push(field);
+        self
+    }
+
+    /// Sets the projector that reads the fields out of row values.
+    #[must_use]
+    pub fn projector(mut self, projector: Arc<dyn ValueProjector>) -> Self {
+        self.projector = Some(projector);
+        self
+    }
+
+    /// The projected fields, in output order.
+    #[must_use]
+    pub fn fields(&self) -> &[ProjectedField] {
+        &self.fields
+    }
+
+    /// The projector, when one is set.
+    #[must_use]
+    pub fn value_projector(&self) -> Option<&Arc<dyn ValueProjector>> {
+        self.projector.as_ref()
+    }
+
+    /// The projected column ids, in output order.
+    pub(crate) fn column_ids(&self) -> Vec<u16> {
+        self.fields.iter().map(|f| f.column_id).collect()
+    }
+}
+
+impl From<&[u16]> for Projection {
+    fn from(ids: &[u16]) -> Self {
+        Self {
+            fields: ids.iter().copied().map(ProjectedField::by_id).collect(),
+            projector: None,
+        }
+    }
+}
+
+impl<const N: usize> From<&[u16; N]> for Projection {
+    fn from(ids: &[u16; N]) -> Self {
+        Self::from(ids.as_slice())
+    }
+}
+
+impl From<&Vec<u16>> for Projection {
+    fn from(ids: &Vec<u16>) -> Self {
+        Self::from(ids.as_slice())
+    }
+}
+
+impl From<&Projection> for Projection {
+    fn from(projection: &Projection) -> Self {
+        projection.clone()
+    }
+}
+
+/// The column that stands for `field` in a batch of `rows` rows whose source
+/// does not have it, or the error its declaration asks for.
+pub(crate) fn absent_column(field: &ProjectedField, rows: u32) -> crate::Result<Column> {
+    let type_tag = field.type_tag.ok_or(ABSENT_FIELD)?;
+    let count = rows as usize;
+    let (validity, data) = match &field.absent {
+        Absent::Error => return Err(ABSENT_FIELD),
+        Absent::Null => {
+            let data = match type_tag.fixed_width() {
+                Some(width) => Slice::from(alloc::vec![0u8; count * usize::from(width)]),
+                None => frame_bytes_column(count, || core::iter::repeat_n(&[][..], count))?,
+            };
+            (Some(alloc::vec![0u8; count.div_ceil(8)]), data)
+        }
+        Absent::Default(value) => {
+            let data = match type_tag.fixed_width() {
+                Some(_) => Slice::from(value.repeat(count)),
+                None => frame_bytes_column(count, || core::iter::repeat_n(&**value, count))?,
+            };
+            (None, data)
+        }
+    };
+    Ok(Column {
+        column_id: field.column_id,
+        type_tag,
+        validity,
+        data,
+    })
+}
+
+/// A projected field is absent from a row and declared an error, or was
+/// projected by id alone.
+const ABSENT_FIELD: Error = Error::Projection(
+    "projection: a projected field is absent from a row and its declaration does not allow it",
+);
+
+/// Applies the absence rule of `fields` to a batch a columnar segment yielded:
+/// a declared column the segment does not have is filled in as declared, a
+/// null cell reads as its field's declaration, and a column stored under
+/// another type than the one declared is an error. The columns come back in
+/// the order of `fields`; a column the batch holds that no field names is
+/// kept after them, in its place.
+pub(crate) fn conform(batch: ColumnBatch, fields: &[ProjectedField]) -> crate::Result<ColumnBatch> {
+    let ColumnBatch {
+        row_count,
+        mut columns,
+    } = batch;
+    let mut out = Vec::with_capacity(fields.len().max(columns.len()));
+    for field in fields {
+        let at = columns.iter().position(|c| c.column_id == field.column_id);
+        let column = match at {
+            Some(at) => {
+                let column = columns.remove(at);
+                if field.type_tag.is_some_and(|t| t != column.type_tag) {
+                    return Err(Error::Projection(
+                        "projection: a segment stores a projected field under another type",
+                    ));
+                }
+                fill_nulls(column, field, row_count)?
+            }
+            None => absent_column(field, row_count)?,
+        };
+        out.push(column);
+    }
+    out.extend(columns);
+    Ok(ColumnBatch {
+        row_count,
+        columns: out,
+    })
+}
+
+/// `column` with its null cells read as `field` declares: kept for
+/// [`Absent::Null`], set to the default for [`Absent::Default`], an error for
+/// [`Absent::Error`].
+fn fill_nulls(column: Column, field: &ProjectedField, rows: u32) -> crate::Result<Column> {
+    let Some(validity) = &column.validity else {
+        return Ok(column);
+    };
+    let is_null = |row: u32| {
+        validity
+            .get(row as usize / 8)
+            .is_none_or(|byte| byte >> (row % 8) & 1 == 0)
+    };
+    if !(0..rows).any(is_null) {
+        return Ok(Column {
+            validity: None,
+            ..column
+        });
+    }
+    let value = match &field.absent {
+        Absent::Null => return Ok(column),
+        Absent::Error => return Err(ABSENT_FIELD),
+        Absent::Default(value) => value,
+    };
+    let count = rows as usize;
+    let data = match column.type_tag.fixed_width() {
+        Some(width) => {
+            let width = usize::from(width);
+            let mut data = column.data.to_vec();
+            for row in (0..rows).filter(|&row| is_null(row)) {
+                let at = row as usize * width;
+                data.get_mut(at..at + width)
+                    .ok_or(Error::InvalidHeader("columnar: fixed column row truncated"))?
+                    .copy_from_slice(value);
+            }
+            Slice::from(data)
+        }
+        None => {
+            let cells = (0..rows)
+                .map(|row| {
+                    if is_null(row) {
+                        Ok(&**value)
+                    } else {
+                        bytes_column_row(&column.data, rows, row)
+                    }
+                })
+                .collect::<crate::Result<Vec<&[u8]>>>()?;
+            frame_bytes_column(count, || cells.iter().copied())?
+        }
+    };
+    Ok(Column {
+        column_id: column.column_id,
+        type_tag: column.type_tag,
+        validity: None,
+        data,
+    })
+}
+
+#[cfg(test)]
+#[expect(clippy::unwrap_used, reason = "test code")]
+mod tests;
