@@ -916,14 +916,21 @@ impl ColumnarScan {
                 // held with it would otherwise never be seen.
                 self.observe_payload(singleton.cursor.held_bytes() + batch.data_size() as u64);
                 *support = (*support).min(singleton.cursor.predicate_support());
-                let batch = match self.read_whole(batch, singleton.whole.as_ref()) {
+                // A segment written without a projected column, or with null
+                // cells in one, reads as the field declares before its rows
+                // are decided, so a predicate after the dedup sees the
+                // declared defaults, as it does on the merge path.
+                let batch = match self
+                    .read_whole(batch, singleton.whole.as_ref())
+                    .and_then(|batch| projection::conform_lenient(batch, &self.fields))
+                {
                     Ok(batch) => batch,
                     Err(e) => return Some(Err(e)),
                 };
                 let SingletonStream { global, mode, .. } = &mut **singleton;
                 match self.shape_singleton_batch(batch, *global, mode, support) {
-                    // A segment written without a projected column, or with
-                    // null cells in one, reads as the field declares.
+                    // The rows returned are decided: each is held to the
+                    // declarations.
                     Ok(Some(batch)) => return Some(projection::conform(batch, &self.fields)),
                     Ok(None) => {}
                     Err(e) => return Some(Err(e)),
@@ -1129,10 +1136,19 @@ impl ColumnarScan {
         // take a pushed-down predicate either (see `segment_cursor`): the
         // dedup path filters after the fields are read.
         // A tree that merges routes there too: an operand can resolve to a
-        // deletion, which deciding a run consumes.
+        // deletion, which deciding a run consumes. So does a predicate over a
+        // declared field: a segment may lack its column, which reads as its
+        // declaration only once the batch is read, and a table's own
+        // predicate would find nothing to run on.
+        let predicate_on_declared = self.predicate.as_ref().is_some_and(|p| {
+            self.fields
+                .iter()
+                .any(|f| f.column_id() == p.column_id && projection::is_declared(f))
+        });
         if seg.may_dup
             || seg.records_deletions()
             || self.resolver.is_some()
+            || predicate_on_declared
             || !rts.is_empty()
             || (seg.whole && self.projector.is_some() && predicate.is_some())
         {

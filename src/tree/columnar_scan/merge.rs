@@ -21,7 +21,7 @@
 
 use alloc::vec::Vec;
 
-use super::projection::{ProjectedField, conform};
+use super::projection::{ProjectedField, conform, conform_lenient};
 use super::rows::SourceCursor;
 use super::{ColumnarScan, Segment, SegmentCursor, WholeRead, drop_columns, key_in_bounds};
 use crate::table::columnar::{
@@ -395,7 +395,10 @@ impl MergeStream {
                     // declared fields read out of its values first, so every
                     // source brings the same columns to the conform below.
                     let batch = scan.read_whole(batch?, source.whole.as_ref())?;
-                    let batch = conform(batch, fields)?;
+                    // Its rows are not decided yet: a shadowed or deleted
+                    // one must not fail the scan, and the predicate after
+                    // the dedup sees the declared defaults.
+                    let batch = conform_lenient(batch, fields)?;
                     // Keys are read row by row from their framing, which only
                     // a bytes column carries.
                     if batch
@@ -459,6 +462,8 @@ impl MergeStream {
         let mut merged = scan.filter_after_dedup(merged, scan.predicate.as_ref(), support)?;
         // Match the singleton contract: yield exactly the projected columns.
         drop_columns(&mut merged, &self.dropped);
+        // The rows returned are decided: each is held to the declarations.
+        let merged = conform(merged, &scan.fields)?;
         Ok((merged.row_count > 0).then_some(merged))
     }
 

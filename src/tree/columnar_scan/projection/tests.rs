@@ -131,16 +131,17 @@ fn a_null_cell_reads_as_declared() {
     ));
 }
 
-/// A validity bitmap with no null row is dropped, so a column reads the same
-/// whether its segment stored it nullable or not.
+/// A column with a validity bitmap and no null row is returned as stored, and
+/// a required field is satisfied by it.
 #[test]
-fn a_validity_bitmap_without_nulls_is_dropped() {
+fn a_validity_bitmap_without_nulls_is_kept_and_satisfies_a_required_field() {
+    let column = fixed_column(5, &[[1; 4], [2; 4]], Some(vec![0b11]));
     let batch = ColumnBatch {
         row_count: 2,
-        columns: vec![fixed_column(5, &[[1; 4], [2; 4]], Some(vec![0b11]))],
+        columns: vec![column.clone()],
     };
     let out = conform(batch, &[u32_field(5, Absent::Error)]).unwrap();
-    assert_eq!(None, out.columns.first().unwrap().validity);
+    assert_eq!(vec![column], out.columns);
 }
 
 /// A segment that stores a declared field under another type is an error,

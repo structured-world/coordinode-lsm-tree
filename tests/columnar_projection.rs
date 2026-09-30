@@ -41,17 +41,26 @@ fn open_columnar(folder: &std::path::Path) -> AnyTree {
 /// Ingests one segment of `keys`, whose value sub-columns are `columns`: each
 /// an id and one fixed-4 cell per key.
 fn ingest(any: &AnyTree, keys: &[u32], columns: &[(u16, &[u32])]) {
+    let typed: Vec<(u16, TypeTag, &[u32])> = columns
+        .iter()
+        .map(|&(id, cells)| (id, TypeTag::Fixed(4), cells))
+        .collect();
+    ingest_typed(any, keys, &typed);
+}
+
+/// [`ingest`] with each column's type named: a 4-byte cell per key.
+fn ingest_typed(any: &AnyTree, keys: &[u32], columns: &[(u16, TypeTag, &[u32])]) {
     let entries: Vec<InternalValue> = keys
         .iter()
         .map(|&k| InternalValue::from_components(key(k), b"ignored", 0, ValueType::Value))
         .collect();
     let mut batch = entries_to_column_batch(&entries).expect("transpose");
     batch.columns.pop();
-    for &(id, cells) in columns {
+    for &(id, type_tag, cells) in columns {
         assert_eq!(keys.len(), cells.len());
         batch.columns.push(Column {
             column_id: id,
-            type_tag: TypeTag::Fixed(4),
+            type_tag,
             validity: None,
             data: cells
                 .iter()
@@ -191,6 +200,99 @@ fn a_field_a_segment_lacks_fails_the_scan_when_declared_required() {
             "a required field is missing, got {got:?}"
         );
     }
+}
+
+/// A required field an older, shadowed version lacks does not fail the scan:
+/// only the rows returned are held to their declarations.
+#[test]
+fn a_shadowed_version_without_a_required_field_does_not_fail_the_scan() -> lsm_tree::Result<()> {
+    let folder = get_tmp_folder();
+    let any = open_columnar(folder.path());
+    ingest(&any, &[0], &[(3, &[10])]);
+    ingest(&any, &[0], &[(3, &[100]), (4, &[400])]);
+    assert_eq!(
+        vec![(key(0), Some(400))],
+        rows(standard(&any), &projection(Absent::Error))?,
+    );
+    Ok(())
+}
+
+/// A predicate over a field some segments lack runs against the declared
+/// default, exactly, on the merged group and on a segment streamed alone
+/// alike: the rows it yields never depend on which segment a row came from.
+#[test]
+fn a_predicate_over_a_missing_field_runs_against_the_declared_default() -> lsm_tree::Result<()> {
+    use lsm_tree::table::columnar::{ByteOrder, Number, NumberKind};
+    use lsm_tree::table::columnar_predicate::{
+        ColumnRangePredicate, PredicateApply, PredicateSupport,
+    };
+
+    // Field 4 is an ordered number, so a predicate over it runs.
+    let u32_le = Number::new(NumberKind::Unsigned, 4, ByteOrder::Little)?;
+    let number = TypeTag::Number(u32_le);
+    let folder = get_tmp_folder();
+    let any = open_columnar(folder.path());
+    // Older segments without field 4: one overlapped by a newer segment with
+    // it (merged), one disjoint (streamed alone).
+    ingest(&any, &[0, 2], &[(3, &[10, 12])]);
+    ingest_typed(
+        &any,
+        &[1],
+        &[(3, TypeTag::Fixed(4), &[11]), (4, number, &[41])],
+    );
+    ingest(&any, &[10], &[(3, &[20])]);
+
+    let projection = Projection::new()
+        .column(COL_USER_KEY)
+        .field(field(3, Absent::Error))
+        .field(ProjectedField::new(
+            4,
+            number,
+            Absent::Default(Slice::from(&7u32.to_le_bytes()[..])),
+        )?);
+    // The rows a scan yields, each key with its field 4, and how far its
+    // predicate ran.
+    type Scanned = (Vec<(Vec<u8>, u32)>, Option<PredicateSupport>);
+    let scan_equal_to = |value: u32| -> lsm_tree::Result<Scanned> {
+        let bound = u32_le.comparable(&value.to_le_bytes())?;
+        let predicate = ColumnRangePredicate {
+            column_id: 4,
+            lower: Some(bound.clone()),
+            upper: Some(bound),
+            apply: PredicateApply::Filter,
+        };
+        let mut scan =
+            standard(&any).columnar_scan(projection.clone(), Some(&predicate), SeqNo::MAX, ..)?;
+        let mut got = Vec::new();
+        for batch in &mut scan {
+            let batch = batch?;
+            let (keys, fourth) = (&batch.columns[0], &batch.columns[2]);
+            for row in 0..batch.row_count {
+                let at = row as usize * 4;
+                got.push((
+                    bytes_cell(&keys.data, batch.row_count, row),
+                    u32::from_le_bytes(fourth.data[at..at + 4].try_into().expect("u32 cell")),
+                ));
+            }
+        }
+        Ok((got, scan.predicate_support()))
+    };
+    // The default matches: the rows without the field, from the merged group
+    // and from the segment streamed alone alike.
+    assert_eq!(
+        (
+            vec![(key(0), 7), (key(2), 7), (key(10), 7)],
+            Some(PredicateSupport::Exact),
+        ),
+        scan_equal_to(7)?,
+    );
+    // The default does not match: no row without the field comes back, from
+    // either path.
+    assert_eq!(
+        (vec![(key(1), 41)], Some(PredicateSupport::Exact)),
+        scan_equal_to(41)?,
+    );
+    Ok(())
 }
 
 /// A newer version written without field 4 does not take the older

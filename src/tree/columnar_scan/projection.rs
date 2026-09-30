@@ -441,6 +441,28 @@ const ABSENT_FIELD: Error = Error::Projection(
 /// operand, which the batch's value-type column names when it carries one,
 /// has none, and is decided by its type before it could be returned.
 pub fn conform(batch: ColumnBatch, fields: &[ProjectedField]) -> crate::Result<ColumnBatch> {
+    conform_with(batch, fields, true)
+}
+
+/// [`conform`] for a batch whose rows are not yet decided: a field declared
+/// an error where absent reads as null instead, so a predicate over the
+/// batch sees every other declaration applied, and the rows a scan returns
+/// are held to the declarations by [`conform`] once they are decided. A row
+/// that is shadowed, deleted or filtered out never fails the scan.
+pub fn conform_lenient(
+    batch: ColumnBatch,
+    fields: &[ProjectedField],
+) -> crate::Result<ColumnBatch> {
+    conform_with(batch, fields, false)
+}
+
+/// [`conform`], holding the rows that are values to [`Absent::Error`] only
+/// when `strict`.
+fn conform_with(
+    batch: ColumnBatch,
+    fields: &[ProjectedField],
+    strict: bool,
+) -> crate::Result<ColumnBatch> {
     let ColumnBatch {
         row_count,
         mut columns,
@@ -450,9 +472,10 @@ pub fn conform(batch: ColumnBatch, fields: &[ProjectedField]) -> crate::Result<C
         .find(|c| c.column_id == COL_VALUE_TYPE)
         .map(|c| c.data.clone());
     let is_value = |row: u32| {
-        types.as_ref().is_none_or(|types| {
-            types.get(row as usize).copied() == Some(u8::from(crate::ValueType::Value))
-        })
+        strict
+            && types.as_ref().is_none_or(|types| {
+                types.get(row as usize).copied() == Some(u8::from(crate::ValueType::Value))
+            })
     };
     let mut out = Vec::with_capacity(fields.len().max(columns.len()));
     for field in fields {
@@ -496,10 +519,7 @@ fn fill_nulls(
             .is_none_or(|byte| byte >> (row % 8) & 1 == 0)
     };
     if !(0..rows).any(is_null) {
-        return Ok(Column {
-            validity: None,
-            ..column
-        });
+        return Ok(column);
     }
     let value = match &field.absent {
         Absent::Error if (0..rows).any(|row| is_null(row) && is_value(row)) => {
