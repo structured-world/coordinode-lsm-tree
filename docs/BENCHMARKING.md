@@ -77,6 +77,21 @@ LSM_BENCH_PRESET=lsm-paranoid cargo bench
 The active preset is printed once to stderr at the start of the run, so it is
 recorded in the dashboard provenance.
 
+## Dashboard series
+
+The `db_bench` dashboard (`dev/bench` on the project's GitHub Pages) keeps one
+rate suite per **major version line** and bench host,
+`lsm-tree db_bench <N>.x · <os> · <runner>`, so a commit is only ever compared
+with points of its own line measured on the same machine.
+
+`<N>` is the major of the next version release-plz computes for the measured
+commit, the version it will ship as, not the version already in `Cargo.toml`:
+that one moves only when the release PR merges. A manual dispatch from this
+branch is therefore compared against the `5.x` suites and writes nothing; only
+a push to the default branch extends a suite. The RocksDB head-to-head page
+(`dev/compare/`) is a snapshot replaced on every run and names the line, branch
+and commit it measured.
+
 ## Checklist for format-changing PRs
 
 A PR that adds or changes an on-disk format feature MUST:

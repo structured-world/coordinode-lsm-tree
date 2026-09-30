@@ -41,6 +41,11 @@ concurrency:
   group: bench-self-hosted
   cancel-in-progress: false
 
+# The workflow token only reads the repository for checkout: every write
+# (gh-pages, alert comments) goes through the App token generated below.
+permissions:
+  contents: read
+
 jobs:
   benchmark:
     # Two passes in one job: (1) the single-engine db_bench trend (regression
@@ -100,9 +105,13 @@ jobs:
       # Pinning policy: first-party actions (actions/*, dependabot/*) track a
       # MAJOR tag; third-party actions stay pinned to a commit digest with a
       # version comment. See coordinode-release.yml for the reasoning.
+      # Full history and tags: the version line of the measured commit is the
+      # next version release-plz computes for it, from the commits since the
+      # last release tag.
       - uses: actions/checkout@v7
         with:
           persist-credentials: false
+          fetch-depth: 0
 
       - name: Generate bot token
         id: bot-token
@@ -136,6 +145,50 @@ jobs:
         with:
           toolchain: stable
 
+      # Each major version line has its own suites, so a 5.x commit is never
+      # judged against a 6.0 baseline. The line is the major of the next
+      # version release-plz computes for the measured commit, not the version
+      # in Cargo.toml: that one moves only when the release PR merges, so it
+      # names the previous line from the first breaking commit until the
+      # release. release-plz reads the same conventional-commit markers the
+      # release does, so the dashboard and the release agree on every commit.
+      # Installed the way the release workflow's release-plz action installs
+      # it (prebuilt binary through cargo-binstall), at the version that action
+      # runs, so both compute the same next version.
+      - uses: cargo-bins/cargo-binstall@b874e25ea559687bec77e281e9b271aa1367b624  # v1.23.0
+        env:
+          BINSTALL_VERSION: 1.23.0
+
+      - name: Install release-plz
+        run: cargo binstall release-plz@0.3.169 --strategies crate-meta-data,compile --no-confirm
+
+      - name: Version line of the measured commit
+        id: line
+        run: |
+          set -euo pipefail
+          # release-plz compares the branch against its upstream, so it needs
+          # the branch the checkout created, not a detached HEAD.
+          if [ -z "$(git branch --show-current)" ]; then
+            echo "::error::the checkout is a detached HEAD; release-plz computes the next version only on a branch"
+            exit 1
+          fi
+          release-plz update --no-changelog --config .release-plz.toml
+          id="$(cargo pkgid)"
+          version="${id##*@}"
+          # The update rewrites the manifest's version; the measured tree is
+          # the commit as it is.
+          git restore --source=HEAD --worktree -- Cargo.toml
+          major="${version%%.*}"
+          case "$major" in
+            '' | *[!0-9]*)
+              echo "::error::cannot read a major version from '$id'"
+              exit 1
+              ;;
+          esac
+          echo "Measured commit ships as $version: suites of the $major.x line"
+          echo "major=$major" >> "$GITHUB_OUTPUT"
+          echo "version=$version" >> "$GITHUB_OUTPUT"
+
       - uses: Swatinem/rust-cache@6323deb102c322ba6fcbdcafc7e3dddab59af2b6  # v2.9.2
         with:
           prefix-key: bench
@@ -155,11 +208,14 @@ jobs:
         if: steps.bot-token.outputs.token != ''
         run: git branch --delete --force gh-pages 2>/dev/null || true
 
+      # One series per version line and host, named as on main: a rate
+      # measured on one machine is no baseline for another, and a dispatch from
+      # this branch is compared against the suite of the line it measures.
       - name: Store benchmark results
         if: steps.bot-token.outputs.token != ''
         uses: benchmark-action/github-action-benchmark@52576c92bccf6ac60c8223ec7eb2565637cae9ba  # v1.22.1
         with:
-          name: "lsm-tree db_bench"
+          name: "lsm-tree db_bench ${{ steps.line.outputs.major }}.x · ${{ runner.os }} · ${{ runner.name }}"
           tool: customBiggerIsBetter
           output-file-path: benchmark-results.json
           github-token: ${{ steps.bot-token.outputs.token }}
@@ -295,6 +351,9 @@ jobs:
         env:
           GH_TOKEN: ${{ steps.bot-token.outputs.token }}
           REPO: ${{ github.repository }}
+          LINE_MAJOR: ${{ steps.line.outputs.major }}
+          MEASURED_REF: ${{ github.ref_name }}
+          MEASURED_SHA: ${{ github.sha }}
         run: |
           set -euo pipefail
           src="tools/compare-rocksdb/target/criterion"
@@ -362,6 +421,10 @@ jobs:
           &nbsp;&middot;&nbsp; <a href="../bench/">single-engine db_bench trend &rarr;</a>
           &nbsp;&middot;&nbsp; <a href="report/">raw criterion index &rarr;</a></p>
           HTML_HEAD
+            # The overlay is a snapshot replaced on every run, from main or a
+            # manual dispatch, so it says which line and commit it measured.
+            printf '<p class="intro">Measured on the <strong>%s.x</strong> line: <code>%s</code> at <a href="https://github.com/%s/commit/%s">%s</a>.</p>\n' \
+              "$LINE_MAJOR" "$MEASURED_REF" "$REPO" "$MEASURED_SHA" "${MEASURED_SHA:0:9}"
             for d in "$work"/dev/compare/*/; do
               name="$(basename "$d")"
               [ -f "$d/report/lines.svg" ] || continue
