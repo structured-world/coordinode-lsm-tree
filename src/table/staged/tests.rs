@@ -1,4 +1,4 @@
-#![expect(clippy::expect_used, clippy::unwrap_used, reason = "test code")]
+#![expect(clippy::expect_used, reason = "test code")]
 
 use super::*;
 use crate::table::{RecoverParams, Writer};
@@ -10,6 +10,14 @@ use test_log::test;
 /// Every block a staged read walks through for a key batch, in the order it
 /// asked for them, with the stage that asked.
 type Asked = Vec<(BlockType, u64)>;
+
+/// A staged read's plan (snapshot, data blocks with their keys, filter
+/// answers) and what it asked for.
+type Driven = (SeqNo, Vec<(BlockHandle, Vec<usize>)>, ProbeCounts, Asked);
+
+/// A table shape: its name, how the writer is set up, and whether the filter
+/// and the index are pinned.
+type Shape = (&'static str, fn(Writer) -> Writer, bool, bool);
 
 /// Writes 500 keys `key000000..key000998` (even numbers only, so every odd
 /// number is a miss inside the key range) into one table shaped by `shape`,
@@ -52,10 +60,7 @@ fn table(
 /// Drives a staged read of `table` for `keys` to its plan, serving each
 /// block it asks for from the table file, and returns the plan and what it
 /// asked for.
-fn drive(
-    table: &Table,
-    keys: &[(&[u8], u64)],
-) -> Option<(SeqNo, Vec<(BlockHandle, Vec<usize>)>, ProbeCounts, Asked)> {
+fn drive(table: &Table, keys: &[(&[u8], u64)]) -> Option<Driven> {
     let StagedStart::Staged(mut read) = StagedRead::start(table, keys, SeqNo::MAX) else {
         return None;
     };
@@ -66,8 +71,11 @@ fn drive(
         let need: Vec<BlockHandle> = need.to_vec();
         for handle in need {
             asked.push((block_type, *handle.offset()));
-            let start = *handle.offset() as usize;
-            let bytes = &file[start..start + handle.size() as usize];
+            let start = usize::try_from(*handle.offset()).expect("offset fits");
+            let bytes = file
+                .get(start..)
+                .and_then(|rest| rest.get(..handle.size() as usize))
+                .expect("the block lies in the table file");
             read.supply(handle, bytes).expect("supply");
         }
         if read.is_done() {
@@ -106,7 +114,7 @@ fn batch() -> Vec<(Vec<u8>, u64)> {
 
 /// The table shapes: filter whole or partitioned, pinned or not; index
 /// pinned whole, whole read on demand, or partitioned.
-fn shapes() -> Vec<(&'static str, fn(Writer) -> Writer, bool, bool)> {
+fn shapes() -> Vec<Shape> {
     fn whole(w: Writer) -> Writer {
         w
     }

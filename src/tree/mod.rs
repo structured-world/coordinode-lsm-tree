@@ -149,6 +149,13 @@ struct LevelTable<'a, 'k> {
     read: Option<crate::table::staged::StagedRead<'a>>,
 }
 
+/// The read queues of the backends a level's tables were opened through, one
+/// per backend.
+type LevelQueues<'a> = Vec<(
+    &'a Arc<dyn crate::fs::Fs>,
+    Box<dyn crate::fs::ReadQueue + 'a>,
+)>;
+
 impl TablePointLookup for TableEntry {
     fn lookup(
         table: &Table,
@@ -3832,128 +3839,107 @@ impl Tree {
         Ok((tasks, probes))
     }
 
-    /// Drives the staged reads of a level's `tables` until each is planned: in
-    /// every round the blocks all of them lack are read in one batch per
-    /// backend and handed to their reads, which then move on. A read whose
+    /// Drives the staged reads of a level's `tables` until each is planned. A
+    /// table's blocks go to the read queue of the backend it was opened
+    /// through, and the moment the last of them is back its read moves on and
+    /// asks for its next stage, while other tables' blocks may still be in
+    /// flight: no table waits on the slowest file of the level. A read whose
     /// block cannot be opened, read or decoded is dropped, leaving its table
     /// to the serial planner.
     #[expect(
         clippy::indexing_slicing,
-        reason = "request positions index `wanted`, and `wanted` entries index `tables`, both by construction"
+        reason = "a tag indexes `asked`, and `asked` entries index `tables` and `waiting`, all by construction"
     )]
-    fn read_level_stages(tables: &mut [LevelTable<'_, '_>]) {
-        loop {
-            // A read that has every block of its stage moves on.
-            for entry in tables.iter_mut() {
-                if let Some(read) = &mut entry.read
-                    && !read.is_done()
-                    && read.need().1.is_empty()
-                    && read.advance(&entry.batch).is_err()
-                {
-                    entry.read = None;
-                }
-            }
+    fn read_level_stages<'a>(tables: &mut [LevelTable<'a, '_>]) {
+        // One queue per backend, opened when a table first asks it for a
+        // block, so a level answered from the cache opens none.
+        let mut queues: LevelQueues<'a> = Vec::new();
+        // What each submitted read is for: its tag is its position here.
+        let mut asked: Vec<(usize, crate::table::BlockHandle)> = Vec::new();
+        // Each table's reads still in flight.
+        let mut waiting: Vec<usize> = vec![0; tables.len()];
 
-            // What every read lacks now, and the file each is read from.
-            let mut wanted: Vec<(
-                usize,
-                crate::table::block::BlockType,
-                crate::table::BlockHandle,
-            )> = Vec::new();
-            let mut files: Vec<Option<Arc<dyn crate::fs::FsFile>>> = vec![None; tables.len()];
+        loop {
+            // A table with none of its blocks in flight moves on, and asks for
+            // the next stage's blocks once its read lacks some.
             for (at, entry) in tables.iter_mut().enumerate() {
-                let Some(read) = &entry.read else {
-                    continue;
-                };
-                let (block_type, need) = read.need();
-                if need.is_empty() {
+                if waiting[at] > 0 {
                     continue;
                 }
-                match entry.table.open_file() {
-                    Ok(file) => files[at] = Some(file),
-                    Err(_) => {
-                        entry.read = None;
+                while let Some(read) = &mut entry.read
+                    && !read.is_done()
+                {
+                    let (block_type, need) = read.need();
+                    if need.is_empty() {
+                        if read.advance(&entry.batch).is_err() {
+                            entry.read = None;
+                        }
                         continue;
                     }
-                }
-                wanted.extend(need.iter().map(|handle| (at, block_type, *handle)));
-            }
-            if wanted.is_empty() {
-                return;
-            }
-
-            let mut buffers: Vec<Vec<u8>> = wanted
-                .iter()
-                .map(|(_, _, handle)| vec![0u8; handle.size() as usize])
-                .collect();
-            // One submission per backend each table was opened through, as the
-            // data reads group theirs.
-            let mut groups: Vec<(
-                &Arc<dyn crate::fs::Fs>,
-                Vec<crate::fs::BlockRead<'_>>,
-                Vec<usize>,
-            )> = Vec::new();
-            for (position, ((at, _, handle), buf)) in
-                wanted.iter().zip(buffers.iter_mut()).enumerate()
-            {
-                let Some(file) = &files[*at] else {
-                    continue;
-                };
-                let table = tables[*at].table;
-                let req = crate::fs::BlockRead {
-                    file: file.as_ref(),
-                    offset: *handle.offset(),
-                    buf: crate::fs::BlockBuf::new(&mut buf[..]),
-                };
-                match groups
-                    .iter_mut()
-                    .find(|(fs, _, _)| Arc::ptr_eq(fs, &table.fs))
-                {
-                    Some((_, reqs, positions)) => {
-                        reqs.push(req);
-                        positions.push(position);
-                    }
-                    None => groups.push((&table.fs, vec![req], vec![position])),
-                }
-            }
-
-            let mut failed: Vec<usize> = Vec::new();
-            for (fs, reqs, positions) in &mut groups {
-                for &position in positions.iter() {
-                    let (at, block_type, handle) = wanted[position];
-                    tables[at]
-                        .table
-                        .record_batched_read(block_type, core::slice::from_ref(&handle));
-                }
-                // A block is handed to its read the moment it is back.
-                let outcome = fs.read_blocks_batched_each(reqs, &mut |index, req| {
-                    let Some(&position) = positions.get(index) else {
-                        return;
+                    let table: &'a Table = entry.table;
+                    let Ok(file) = table.open_file() else {
+                        entry.read = None;
+                        break;
                     };
-                    let (at, _, handle) = wanted[position];
-                    if let Some(read) = &mut tables[at].read
-                        && read.supply(handle, req.buf.filled_bytes()).is_err()
+                    table.record_batched_read(block_type, need);
+                    let slot = if let Some(slot) =
+                        queues.iter().position(|(fs, _)| Arc::ptr_eq(fs, &table.fs))
                     {
-                        failed.push(at);
+                        slot
+                    } else {
+                        queues.push((&table.fs, table.fs.read_queue()));
+                        queues.len() - 1
+                    };
+                    let queue = &mut queues[slot].1;
+                    for handle in need {
+                        queue.submit(crate::fs::QueuedRead {
+                            tag: asked.len(),
+                            file: Arc::clone(&file),
+                            offset: *handle.offset(),
+                            buf: vec![0u8; handle.size() as usize],
+                        });
+                        asked.push((at, *handle));
+                        waiting[at] += 1;
                     }
-                });
-                if let Err(error) = outcome {
-                    log::debug!(
-                        "a staged level read lost a block, its table is planned serially: {error}"
-                    );
-                }
-                // A request not handed over failed, or was reported read
-                // without being filled.
-                for (index, req) in reqs.iter().enumerate() {
-                    if !req.buf.is_full()
-                        && let Some(&position) = positions.get(index)
-                    {
-                        failed.push(wanted[position].0);
-                    }
+                    break;
                 }
             }
-            for at in failed {
-                tables[at].read = None;
+
+            // A block is handed to its read the moment it is back; a read
+            // that loses one is dropped, and its table planned serially.
+            let mut on_done = |done: crate::fs::ReadDone| {
+                let (at, handle) = asked[done.tag];
+                waiting[at] -= 1;
+                let Some(read) = &mut tables[at].read else {
+                    return;
+                };
+                let supplied = match done.result {
+                    Ok(()) => read.supply(handle, &done.buf).is_ok(),
+                    Err(error) => {
+                        log::debug!(
+                            "a staged level read lost a block, its table is planned serially: {error}"
+                        );
+                        false
+                    }
+                };
+                if !supplied {
+                    tables[at].read = None;
+                }
+            };
+            // What has finished on any backend, without waiting; when nothing
+            // has, a wait for one read of the first backend still reading.
+            let mut handed = 0usize;
+            for (_, queue) in &mut queues {
+                queue.wait(0, &mut |done| {
+                    handed += 1;
+                    on_done(done);
+                });
+            }
+            if handed == 0 {
+                let Some((_, queue)) = queues.iter_mut().find(|(_, q)| q.outstanding() > 0) else {
+                    return;
+                };
+                queue.wait(1, &mut on_done);
             }
         }
     }

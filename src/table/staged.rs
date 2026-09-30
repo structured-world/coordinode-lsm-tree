@@ -23,7 +23,7 @@ use super::{Block, BlockHandle, BlockType, FilterSource, IndexBlock, KeyedBlockH
 use crate::SeqNo;
 
 /// How a table enters a staged read of a key batch.
-pub(crate) enum StagedStart<'t> {
+pub enum StagedStart<'t> {
     /// The table holds nothing any key of the batch can read: the batch is
     /// empty, or the table lies above the snapshot.
     Nothing,
@@ -47,7 +47,7 @@ enum Stage {
 }
 
 /// A staged read of one table for a key batch; see the module docs.
-pub(crate) struct StagedRead<'t> {
+pub struct StagedRead<'t> {
     table: &'t Table,
     /// The snapshot in the table's local seqno space.
     table_seqno: SeqNo,

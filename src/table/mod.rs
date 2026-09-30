@@ -6631,6 +6631,10 @@ impl Table {
 
     /// The answer for a key sorting past the last filter partition, counted
     /// as a filter skip.
+    #[cfg_attr(
+        not(feature = "metrics"),
+        expect(clippy::unused_self, reason = "self carries the metrics-only counters")
+    )]
     fn past_partitions(&self) -> BloomResult {
         #[cfg(feature = "metrics")]
         {
@@ -6643,6 +6647,10 @@ impl Table {
 
     /// The answer of `filter` (none: nothing rules the key out) for a key
     /// hashing to `key_hash`, a skip counted as one.
+    #[cfg_attr(
+        not(feature = "metrics"),
+        expect(clippy::unused_self, reason = "self carries the metrics-only counters")
+    )]
     fn answer_bloom(
         &self,
         filter: Option<&FilterBlock>,

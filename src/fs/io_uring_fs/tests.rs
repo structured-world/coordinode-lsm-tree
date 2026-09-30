@@ -1750,3 +1750,127 @@ fn an_empty_request_in_a_batch_is_handed_over() -> io::Result<()> {
     assert_eq!(handed, [0, 1, 2]);
     Ok(())
 }
+
+/// The bytes a [`two_files`] file `f` holds at `offset`, `len` of them.
+fn expected_bytes(f: usize, offset: usize, len: usize) -> Vec<u8> {
+    (offset..offset + len)
+        .map(|i| u8::try_from((i + f) % 251).expect("below 251"))
+        .collect()
+}
+
+/// Reads submitted to the queue across two files come back with their tags
+/// and bytes, and reads submitted after a wait, while earlier ones may still
+/// be on the ring, are told apart from them.
+#[test]
+fn a_read_queue_hands_back_reads_of_several_submissions() -> io::Result<()> {
+    let Some(fs) = try_io_uring() else {
+        return Ok(());
+    };
+    let dir = tempfile::tempdir()?;
+    let files: Vec<Arc<dyn FsFile>> = two_files(&fs, dir.path(), 64 * 64)?
+        .into_iter()
+        .map(Arc::from)
+        .collect();
+    let mut queue = fs.read_queue();
+    let mut got: Vec<(usize, Vec<u8>)> = Vec::new();
+    for round in 0..4usize {
+        for i in 0..16usize {
+            let tag = round * 16 + i;
+            queue.submit(QueuedRead {
+                tag,
+                file: Arc::clone(&files[tag % 2]),
+                offset: (tag * 64) as u64,
+                buf: vec![0; 64],
+            });
+        }
+        // Issues this round's reads and takes whatever has come back.
+        queue.wait(0, &mut |done| {
+            assert!(done.result.is_ok(), "read {} failed", done.tag);
+            got.push((done.tag, done.buf));
+        });
+    }
+    while queue.outstanding() > 0 {
+        queue.wait(1, &mut |done| {
+            assert!(done.result.is_ok(), "read {} failed", done.tag);
+            got.push((done.tag, done.buf));
+        });
+    }
+    got.sort_unstable_by_key(|(tag, _)| *tag);
+    let expected: Vec<(usize, Vec<u8>)> = (0..64)
+        .map(|tag| (tag, expected_bytes(tag % 2, tag * 64, 64)))
+        .collect();
+    assert_eq!(got, expected);
+    Ok(())
+}
+
+/// A read past the end of its file comes back failed as a short read, and
+/// the reads beside it still come back read.
+#[test]
+fn a_read_queue_reports_a_short_read_as_failed() -> io::Result<()> {
+    let Some(fs) = try_io_uring() else {
+        return Ok(());
+    };
+    let dir = tempfile::tempdir()?;
+    let files: Vec<Arc<dyn FsFile>> = two_files(&fs, dir.path(), 256)?
+        .into_iter()
+        .map(Arc::from)
+        .collect();
+    let mut queue = fs.read_queue();
+    for (tag, offset) in [(0usize, 0u64), (1, 1 << 20), (2, 64)] {
+        queue.submit(QueuedRead {
+            tag,
+            file: Arc::clone(&files[0]),
+            offset,
+            buf: vec![0; 64],
+        });
+    }
+    let mut got = Vec::new();
+    while queue.outstanding() > 0 {
+        queue.wait(1, &mut |done| {
+            got.push((done.tag, done.result.map_err(|e| e.kind())));
+        });
+    }
+    got.sort_unstable_by_key(|(tag, _)| *tag);
+    assert_eq!(
+        got,
+        [
+            (0, Ok(())),
+            (1, Err(crate::io::ErrorKind::UnexpectedEof)),
+            (2, Ok(()))
+        ]
+    );
+    Ok(())
+}
+
+/// Dropping a queue with reads on the ring waits their completions out
+/// before their buffers go, and the backend stays usable after.
+#[test]
+fn dropping_a_read_queue_with_reads_in_flight_leaves_the_backend_usable() -> io::Result<()> {
+    let Some(fs) = try_io_uring() else {
+        return Ok(());
+    };
+    let dir = tempfile::tempdir()?;
+    let files: Vec<Arc<dyn FsFile>> = two_files(&fs, dir.path(), 128 * 64)?
+        .into_iter()
+        .map(Arc::from)
+        .collect();
+    for _ in 0..50 {
+        let mut queue = fs.read_queue();
+        for tag in 0..128usize {
+            queue.submit(QueuedRead {
+                tag,
+                file: Arc::clone(&files[tag % 2]),
+                offset: (tag * 64) as u64,
+                buf: vec![0; 64],
+            });
+        }
+        // Puts every read on the ring without waiting for any.
+        queue.wait(0, &mut |_| {});
+        drop(queue);
+    }
+    let mut buf = [0u8; 64];
+    let n = files[1].read_at(&mut buf, 64)?;
+    assert_eq!(n, 64);
+    assert_eq!(buf.to_vec(), expected_bytes(1, 64, 64));
+    Ok(())
+}

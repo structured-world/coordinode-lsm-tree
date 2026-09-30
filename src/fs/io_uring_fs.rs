@@ -14,7 +14,9 @@
 //! Cold-path operations (mkdir, readdir, stat, rename, unlink) delegate
 //! to [`std::fs`] since they do not benefit from `io_uring`.
 
-use super::{BlockRead, Fs, FsDirEntry, FsFile, FsMetadata, FsOpenOptions};
+use super::{
+    BlockRead, Fs, FsDirEntry, FsFile, FsMetadata, FsOpenOptions, QueuedRead, ReadDone, ReadQueue,
+};
 use crate::HashMap;
 use core::sync::atomic::AtomicU64;
 use io_uring::{IoUring, opcode, types};
@@ -307,6 +309,10 @@ impl Fs for IoUringFs {
         on_read: &mut dyn FnMut(usize, &BlockRead<'_>),
     ) -> crate::io::Result<()> {
         self.read_blocks(reqs, Some(on_read))
+    }
+
+    fn read_queue(&self) -> Box<dyn ReadQueue + '_> {
+        Box::new(UringReadQueue::new(&self.inner))
     }
 
     fn create_dir_all(&self, path: &Path) -> crate::io::Result<()> {
@@ -711,6 +717,16 @@ enum Submission {
         /// Bounded by the batch size, so the ring thread never blocks on it.
         done: mpsc::SyncSender<(usize, i32)>,
     },
+    /// Reads of a [`UringReadQueue`], each reporting on the queue's channel
+    /// with its position in the queue.
+    Queued {
+        reads: Vec<BatchRead>,
+        /// The queue position of the first read; the others follow it.
+        first: usize,
+        /// Unbounded: a queue has reads of several submissions in flight at
+        /// once, and the ring thread must never block on a completion.
+        done: mpsc::Sender<(usize, i32)>,
+    },
 }
 
 /// Where the ring thread delivers one operation's result.
@@ -718,6 +734,10 @@ enum Completion {
     One(mpsc::SyncSender<i32>),
     InBatch {
         done: mpsc::SyncSender<(usize, i32)>,
+        position: usize,
+    },
+    InQueue {
+        done: mpsc::Sender<(usize, i32)>,
         position: usize,
     },
 }
@@ -729,6 +749,7 @@ impl Completion {
         match self {
             Self::One(tx) => tx.send(result).ok(),
             Self::InBatch { done, position } => done.send((position, result)).ok(),
+            Self::InQueue { done, position } => done.send((position, result)).ok(),
         };
     }
 }
@@ -908,6 +929,21 @@ impl RingThread {
                     let completion = Completion::InBatch {
                         done: done.clone(),
                         position,
+                    };
+                    Self::enqueue(ring, pending, next_id, kind, completion);
+                }
+            }
+            Submission::Queued { reads, first, done } => {
+                for (index, read) in reads.into_iter().enumerate() {
+                    let kind = OpKind::Read {
+                        fd: read.fd,
+                        buf: read.buf,
+                        len: read.len,
+                        offset: read.offset,
+                    };
+                    let completion = Completion::InQueue {
+                        done: done.clone(),
+                        position: first + index,
                     };
                     Self::enqueue(ring, pending, next_id, kind, completion);
                 }
@@ -1326,6 +1362,201 @@ impl RingThread {
             Ok(result as u32)
         } else {
             Err(io::Error::from_raw_os_error(-result))
+        }
+    }
+}
+
+/// The [`ReadQueue`] of an [`IoUringFs`]: the reads submitted since the last
+/// wait go to the ring in one message when the queue is waited on, and each
+/// is handed back the moment its completion arrives, while reads submitted
+/// earlier or later may still be in flight.
+///
+/// The queue owns every buffer on the ring until its completion is received,
+/// and dropping it receives the completions still owed first, so no buffer is
+/// freed while the kernel may still write into it. That receive cannot hang:
+/// the queue borrows the backend, which keeps the ring thread alive, and the
+/// ring thread delivers every completion it was handed.
+struct UringReadQueue<'r> {
+    ring: &'r RingThread,
+    done_tx: mpsc::Sender<(usize, i32)>,
+    done_rx: mpsc::Receiver<(usize, i32)>,
+    /// Submitted since the last wait, not yet on the ring.
+    submitted: Vec<QueuedRead>,
+    /// The reads sent to the ring, by the position their completion reports;
+    /// `None` once handed back.
+    sent: Vec<Option<QueuedRead>>,
+    /// Reads on the ring whose completion has not arrived.
+    on_ring: usize,
+    /// Reads finished without the ring (empty, no descriptor, or refused),
+    /// waiting to be handed back.
+    finished: Vec<ReadDone>,
+}
+
+impl<'r> UringReadQueue<'r> {
+    fn new(ring: &'r RingThread) -> Self {
+        let (done_tx, done_rx) = mpsc::channel();
+        Self {
+            ring,
+            done_tx,
+            done_rx,
+            submitted: Vec::new(),
+            sent: Vec::new(),
+            on_ring: 0,
+            finished: Vec::new(),
+        }
+    }
+
+    /// Sends every read submitted since the last wait to the ring in one
+    /// message. A read the ring cannot take is finished here: an empty one is
+    /// read, one without a descriptor is read serially, one too long for an
+    /// SQE fails.
+    fn issue(&mut self) {
+        if self.submitted.is_empty() {
+            return;
+        }
+        let first = self.sent.len();
+        let mut reads = Vec::with_capacity(self.submitted.len());
+        for mut read in core::mem::take(&mut self.submitted) {
+            if read.buf.is_empty() {
+                self.finished.push(done(read, Ok(())));
+                continue;
+            }
+            let Some(fd) = read.file.backing_fd() else {
+                let want = read.buf.len();
+                let result = match read.file.read_at(&mut read.buf, read.offset) {
+                    Ok(n) if n == want => Ok(()),
+                    Ok(_) => Err(short_read()),
+                    Err(error) => Err(error),
+                };
+                self.finished.push(done(read, result));
+                continue;
+            };
+            let Ok(len) = i32::try_from(read.buf.len()) else {
+                self.finished.push(done(
+                    read,
+                    Err(crate::io::Error::from(io::Error::new(
+                        io::ErrorKind::InvalidInput,
+                        "buffer exceeds i32::MAX",
+                    ))),
+                ));
+                continue;
+            };
+            // The pointer is into the Vec's heap allocation, which moving the
+            // Vec into `sent` does not move; the buffer is not touched again
+            // until its completion is received (see the type's docs).
+            reads.push(BatchRead {
+                fd,
+                buf: UnsafeSendMutPtr(read.buf.as_mut_ptr()),
+                len: len.unsigned_abs(),
+                offset: read.offset,
+            });
+            self.sent.push(Some(read));
+        }
+        if reads.is_empty() {
+            return;
+        }
+        let count = reads.len();
+        let submission = Submission::Queued {
+            reads,
+            first,
+            done: self.done_tx.clone(),
+        };
+        match self.ring.send(submission) {
+            Ok(()) => self.on_ring += count,
+            // Nothing was queued: the submission went down with the send, so
+            // no buffer is in the kernel's hands.
+            Err(error) => {
+                for slot in self.sent.iter_mut().skip(first) {
+                    if let Some(read) = slot.take() {
+                        let failure = io::Error::new(error.kind(), error.to_string());
+                        self.finished
+                            .push(done(read, Err(crate::io::Error::from(failure))));
+                    }
+                }
+            }
+        }
+    }
+
+    /// The read at `position` with the ring's `result` for it.
+    fn complete(&mut self, position: usize, result: i32) -> Option<ReadDone> {
+        let read = self.sent.get_mut(position)?.take()?;
+        self.on_ring -= 1;
+        let want = read.buf.len();
+        let result = match usize::try_from(result) {
+            Ok(n) if n == want => Ok(()),
+            Ok(_) => Err(short_read()),
+            // A negative completion is `-errno`, never `i32::MIN`.
+            Err(_) => Err(crate::io::Error::from(io::Error::from_raw_os_error(
+                -result,
+            ))),
+        };
+        Some(done(read, result))
+    }
+}
+
+/// `read` handed back with `result`.
+fn done(read: QueuedRead, result: crate::io::Result<()>) -> ReadDone {
+    ReadDone {
+        tag: read.tag,
+        buf: read.buf,
+        result,
+    }
+}
+
+/// A read that returned fewer bytes than its fixed-size block.
+fn short_read() -> crate::io::Error {
+    crate::io::Error::from(io::Error::new(
+        io::ErrorKind::UnexpectedEof,
+        "io_uring read queue: short read on a fixed-size block",
+    ))
+}
+
+impl ReadQueue for UringReadQueue<'_> {
+    fn submit(&mut self, read: QueuedRead) {
+        self.submitted.push(read);
+    }
+
+    fn outstanding(&self) -> usize {
+        self.submitted.len() + self.on_ring + self.finished.len()
+    }
+
+    fn wait(&mut self, min: usize, on_done: &mut dyn FnMut(ReadDone)) {
+        self.issue();
+        let mut handed = 0usize;
+        for read in core::mem::take(&mut self.finished) {
+            on_done(read);
+            handed += 1;
+        }
+        // What has arrived, then, while fewer than `min` were handed over,
+        // what arrives next.
+        while self.on_ring > 0 {
+            let next = if handed < min {
+                self.done_rx.recv().ok()
+            } else {
+                self.done_rx.try_recv().ok()
+            };
+            let Some((position, result)) = next else {
+                break;
+            };
+            if let Some(read) = self.complete(position, result) {
+                on_done(read);
+                handed += 1;
+            }
+        }
+    }
+}
+
+impl Drop for UringReadQueue<'_> {
+    fn drop(&mut self) {
+        // The kernel may still be writing into the buffers of reads on the
+        // ring: receive their completions before `sent` frees them.
+        while self.on_ring > 0 {
+            let Ok((position, _)) = self.done_rx.recv() else {
+                break;
+            };
+            if self.sent.get_mut(position).and_then(Option::take).is_some() {
+                self.on_ring -= 1;
+            }
         }
     }
 }
