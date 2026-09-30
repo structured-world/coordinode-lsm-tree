@@ -148,8 +148,15 @@ impl Bucket {
     /// would hold, keeping the change counts.
     fn fill(&mut self, rate: u64, now_nanos: u128) {
         self.credited = self.outstanding() + u128::from(rate);
-        self.last_refill_nanos = now_nanos;
+        self.advance_clock(now_nanos);
         self.settle_withdrawn();
+    }
+
+    /// Moves the refill clock to `now_nanos`, never back: a caller whose
+    /// reading predates a refill already counted would otherwise have the
+    /// time between the two repaid a second time.
+    fn advance_clock(&mut self, now_nanos: u128) {
+        self.last_refill_nanos = self.last_refill_nanos.max(now_nanos);
     }
 
     /// Adds what `rate` accrued since the last refill, capped at one second
@@ -331,7 +338,7 @@ impl RateLimiter {
             bucket.refill(old, now_nanos);
             // Time the old rate did not turn into a whole byte is dropped
             // with it: it is not owed at the new rate.
-            bucket.last_refill_nanos = now_nanos;
+            bucket.advance_clock(now_nanos);
             if bytes_per_sec != 0 {
                 bucket.cap(bytes_per_sec);
             }

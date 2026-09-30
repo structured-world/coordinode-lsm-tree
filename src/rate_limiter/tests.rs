@@ -373,6 +373,20 @@ fn a_rate_lowered_mid_wait_applies_from_the_change() {
     assert_eq!(None, rl.remaining(&ticket, ms(550)));
 }
 
+/// A retune stamped earlier than a refill the bucket already counted does not
+/// move the bucket's clock back: the interval between the two is repaid once,
+/// not a second time as phantom credit.
+#[test]
+fn a_retune_stamped_before_the_last_refill_grants_no_phantom_credit() {
+    let rl = RateLimiter::new(1_000);
+    // Refilled as of 1 s, then 1000 B of debt: one second at 1000 B/s.
+    assert_eq!(Duration::from_secs(1), rl.acquire_wait(2_000, ms(1_000)));
+    // A retune whose clock was read before that refill.
+    rl.set_rate_at(2_000, ms(500));
+    // Still at 1 s: the 1000 B are owed at 2000 B/s.
+    assert_eq!(ms(500), rl.acquire_wait(0, ms(1_000)));
+}
+
 #[test]
 fn backwards_clock_step_does_not_underflow() {
     // A non-monotonic `now` (earlier than last_refill) must not panic
