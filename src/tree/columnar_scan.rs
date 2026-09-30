@@ -464,6 +464,50 @@ fn memtable_span(
     span
 }
 
+/// The tighter of two lower bounds: the greater key, an excluded one when
+/// both name the same key.
+fn tighter_lower(
+    a: Bound<UserKey>,
+    b: &Bound<UserKey>,
+    cmp: &dyn UserComparator,
+) -> Bound<UserKey> {
+    use core::cmp::Ordering;
+
+    match (&a, b) {
+        (_, Bound::Unbounded) => a,
+        (Bound::Unbounded, _) => b.clone(),
+        (Bound::Included(x) | Bound::Excluded(x), Bound::Included(y) | Bound::Excluded(y)) => {
+            match cmp.compare(x, y) {
+                Ordering::Less => b.clone(),
+                Ordering::Equal if matches!(b, Bound::Excluded(_)) => b.clone(),
+                Ordering::Greater | Ordering::Equal => a,
+            }
+        }
+    }
+}
+
+/// The tighter of two upper bounds: the lesser key, an excluded one when
+/// both name the same key.
+fn tighter_upper(
+    a: Bound<UserKey>,
+    b: &Bound<UserKey>,
+    cmp: &dyn UserComparator,
+) -> Bound<UserKey> {
+    use core::cmp::Ordering;
+
+    match (&a, b) {
+        (_, Bound::Unbounded) => a,
+        (Bound::Unbounded, _) => b.clone(),
+        (Bound::Included(x) | Bound::Excluded(x), Bound::Included(y) | Bound::Excluded(y)) => {
+            match cmp.compare(x, y) {
+                Ordering::Greater => b.clone(),
+                Ordering::Equal if matches!(b, Bound::Excluded(_)) => b.clone(),
+                Ordering::Less | Ordering::Equal => a,
+            }
+        }
+    }
+}
+
 /// Partitions `segments` into key-disjoint overlap groups, ordered by ascending
 /// minimum key. Segments are sorted by their minimum key, then greedily extended
 /// into the current group while the next segment's minimum key is `<=` the
@@ -858,18 +902,28 @@ impl ColumnarScan {
                 self.hi.clone(),
                 self.seqno,
                 ids,
+                share,
             )),
             // Within the span its group was formed on: the active memtable
             // stays writable, and a row landing outside that span after the
             // scan was created would be read out of order, or beside a
-            // version of its key another group returns.
-            Source::Memtable(memtable) => SourceCursor::Rows(RowCursor::memtable(
-                memtable.clone(),
-                &Bound::Included(seg.min.clone()),
-                &Bound::Included(seg.max.clone()),
-                self.seqno,
-                ids,
-            )),
+            // version of its key another group returns. A range tombstone
+            // widens that span past the scan's range, so the cursor reads
+            // only where the two meet: every row beyond is dropped by the
+            // range check anyway.
+            Source::Memtable(memtable) => {
+                let cmp = self.comparator.as_ref();
+                let lo = tighter_lower(Bound::Included(seg.min.clone()), &self.lo, cmp);
+                let hi = tighter_upper(Bound::Included(seg.max.clone()), &self.hi, cmp);
+                SourceCursor::Rows(RowCursor::memtable(
+                    memtable.clone(),
+                    &lo,
+                    &hi,
+                    self.seqno,
+                    ids,
+                    share,
+                ))
+            }
         };
         Ok(SegmentCursor { cursor, whole })
     }
@@ -1156,14 +1210,16 @@ impl ColumnarScan {
     /// field is read out of the value, and resolving an operand rewrites the
     /// value column and the value type, so a predicate over those runs after.
     pub(super) fn predicate_precedes_values(&self, batch: &ColumnBatch) -> bool {
-        use crate::table::columnar::{COL_SEQNO, COL_VALUE};
+        use crate::table::columnar::COL_SEQNO;
 
         let Some(pred) = &self.predicate else {
             return false;
         };
+        // The raw value and the value type are the row's own cells too: a
+        // whole-value source keeps its raw value in place when the predicate
+        // reads it, and only an operand still to be resolved rewrites them.
         match pred.column_id {
             COL_USER_KEY | COL_SEQNO => true,
-            COL_VALUE | COL_VALUE_TYPE => false,
             id => {
                 let declared = self
                     .fields

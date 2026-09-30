@@ -39,65 +39,93 @@ pub(super) struct RowCursor {
     input: RowInput,
     snapshot: SeqNo,
     columns: Vec<u16>,
+    /// The payload bytes one batch may gather: the source's part of the
+    /// scan's budget.
+    share: u64,
+    /// Rows larger than `share` read since [`Self::take_oversized`] was last
+    /// called: each forms a batch of its own.
+    oversized: u64,
 }
 
 impl RowCursor {
-    /// A cursor over `table`'s rows in `lo..hi`.
+    /// A cursor over `table`'s rows in `lo..hi`, gathering at most `share`
+    /// payload bytes a batch.
     pub(super) fn table(
         table: &crate::Table,
         lo: Bound<UserKey>,
         hi: Bound<UserKey>,
         snapshot: SeqNo,
         columns: Vec<u16>,
+        share: u64,
     ) -> Self {
         Self {
             input: RowInput::Table(alloc::boxed::Box::new(table.range((lo, hi)))),
             snapshot,
             columns,
+            share,
+            oversized: 0,
         }
     }
 
-    /// A cursor over `memtable`'s rows in `lo..hi`.
+    /// A cursor over `memtable`'s rows in `lo..hi`, gathering at most `share`
+    /// payload bytes a batch.
     pub(super) fn memtable(
         memtable: Arc<Memtable>,
         lo: &Bound<UserKey>,
         hi: &Bound<UserKey>,
         snapshot: SeqNo,
         columns: Vec<u16>,
+        share: u64,
     ) -> Self {
         let (lo, hi) = internal_bounds(lo, hi);
         Self {
             input: RowInput::Memtable { memtable, lo, hi },
             snapshot,
             columns,
+            share,
+            oversized: 0,
         }
     }
 
     /// The next batch of rows visible at the snapshot, or `None` once the
-    /// source is read.
+    /// source is read. A batch ends at [`ROWS_PER_BATCH`] rows or once its
+    /// payload reaches the share; a row larger than the share alone is
+    /// still read, and counted.
     fn next_batch(&mut self) -> Option<crate::Result<ColumnBatch>> {
         let snapshot = self.snapshot;
-        let mut entries = Vec::with_capacity(ROWS_PER_BATCH);
+        let share = self.share;
+        let mut entries = Vec::new();
+        let mut bytes: u64 = 0;
+        let mut take = |row: InternalValue| {
+            // Lengths of in-memory slices: their sum stays far below u64.
+            bytes += (row.key.user_key.len() + row.value.len()) as u64;
+            entries.push(row);
+            entries.len() < ROWS_PER_BATCH && bytes < share
+        };
         match &mut self.input {
-            RowInput::Table(rows) => {
-                while entries.len() < ROWS_PER_BATCH {
-                    match rows.next() {
-                        // A table read to its end yields what was gathered.
-                        None => break,
-                        Some(Err(e)) => return Some(Err(e)),
-                        // Exclusive MVCC, as every read at a snapshot.
-                        Some(Ok(row)) if row.key.seqno < snapshot => entries.push(row),
-                        Some(Ok(_)) => {}
+            RowInput::Table(rows) => loop {
+                match rows.next() {
+                    // A table read to its end yields what was gathered.
+                    None => break,
+                    Some(Err(e)) => return Some(Err(e)),
+                    // Exclusive MVCC, as every read at a snapshot.
+                    Some(Ok(row)) if row.key.seqno < snapshot => {
+                        if !take(row) {
+                            break;
+                        }
+                    }
+                    Some(Ok(_)) => {}
+                }
+            },
+            RowInput::Memtable { memtable, lo, hi } => {
+                for row in memtable
+                    .range_internal((lo.clone(), hi.clone()))
+                    .filter(|row| row.key.seqno < snapshot)
+                {
+                    if !take(row) {
+                        break;
                     }
                 }
-            }
-            RowInput::Memtable { memtable, lo, hi } => {
-                entries.extend(
-                    memtable
-                        .range_internal((lo.clone(), hi.clone()))
-                        .filter(|row| row.key.seqno < snapshot)
-                        .take(ROWS_PER_BATCH),
-                );
                 if let Some(last) = entries.last() {
                     *lo = Bound::Excluded(last.key.clone());
                 }
@@ -106,7 +134,15 @@ impl RowCursor {
         if entries.is_empty() {
             return None;
         }
+        if entries.len() == 1 && bytes > share {
+            self.oversized += 1;
+        }
         Some(self.build(&entries))
+    }
+
+    /// Rows read past the share since this was last called.
+    fn take_oversized(&mut self) -> u64 {
+        core::mem::take(&mut self.oversized)
     }
 
     /// `entries` as a batch of this cursor's columns, in their order.
@@ -192,7 +228,7 @@ impl SourceCursor {
     pub(super) fn take_oversized(&mut self) -> u64 {
         match self {
             Self::Columnar(cursor) => cursor.take_oversized(),
-            Self::Rows(_) => 0,
+            Self::Rows(rows) => rows.take_oversized(),
         }
     }
 

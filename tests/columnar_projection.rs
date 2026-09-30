@@ -1037,6 +1037,36 @@ fn a_late_write_outside_the_memtable_span_is_not_read() -> lsm_tree::Result<()> 
     Ok(())
 }
 
+/// A range tombstone in the memtable that reaches past the requested range
+/// widens nothing the scan returns: a newer memtable row it does not cover,
+/// outside the range, is not read.
+#[test]
+fn a_memtable_tombstone_past_the_range_brings_in_no_row_outside_it() -> lsm_tree::Result<()> {
+    let folder = get_tmp_folder();
+    let any = open_columnar(folder.path());
+    let tree = standard(&any);
+    let seqno = 1;
+    tree.insert(key(5), row_value(15, 45), seqno);
+    tree.remove_range(key(0), key(9), seqno + 1);
+    tree.insert(key(2), row_value(12, 42), seqno + 2);
+    tree.insert(key(6), row_value(66, 66), seqno + 3);
+
+    let mut got = Vec::new();
+    for batch in tree.columnar_scan(
+        projected(),
+        None,
+        SeqNo::MAX,
+        Slice::from(key(4))..=Slice::from(key(7)),
+    )? {
+        let batch = batch?;
+        for row in 0..batch.row_count {
+            got.push(bytes_cell(&batch.columns[0].data, batch.row_count, row));
+        }
+    }
+    assert_eq!(vec![key(6)], got);
+    Ok(())
+}
+
 /// A split table's field under the value column's id is a field like any
 /// other, even stored as bytes: after its row's operand is resolved, it is
 /// refused, not replaced by the whole merged value.
@@ -1196,6 +1226,65 @@ fn a_predicate_over_the_raw_value_runs_on_the_late_read_path() -> lsm_tree::Resu
     assert_eq!(Some(PredicateSupport::Exact), scan.predicate_support());
     assert_eq!(vec![key(0)], keys);
     Ok(())
+}
+
+/// A predicate over the raw value judges a row before the projector reads
+/// it: a value the predicate drops is never handed to the projector, so one
+/// the projector cannot read does not fail the scan.
+#[test]
+fn a_raw_value_the_predicate_drops_is_not_projected() -> lsm_tree::Result<()> {
+    use lsm_tree::table::columnar::COL_VALUE;
+    use lsm_tree::table::columnar_predicate::{
+        ColumnRangePredicate, PredicateApply, PredicateSupport,
+    };
+
+    let folder = get_tmp_folder();
+    let any = open_columnar(folder.path());
+    let tree = standard(&any);
+    tree.insert(key(0), row_value(10, 40), 0);
+    tree.insert(key(1), REFUSED.to_vec(), 1);
+    let wanted = row_value(10, 40);
+    let predicate = ColumnRangePredicate {
+        column_id: COL_VALUE,
+        lower: Some(wanted.clone()),
+        upper: Some(wanted),
+        apply: PredicateApply::Filter,
+    };
+    let projection = Projection::new()
+        .column(COL_USER_KEY)
+        .field(field(4, Absent::Null))
+        .projector(std::sync::Arc::new(RefusesMarked));
+    let mut scan = tree.columnar_scan(&projection, Some(&predicate), SeqNo::MAX, ..)?;
+    let mut keys = Vec::new();
+    for batch in &mut scan {
+        let batch = batch?;
+        for row in 0..batch.row_count {
+            keys.push(bytes_cell(&batch.columns[0].data, batch.row_count, row));
+        }
+    }
+    assert_eq!(Some(PredicateSupport::Exact), scan.predicate_support());
+    assert_eq!(vec![key(0)], keys);
+    Ok(())
+}
+
+/// A value [`RefusesMarked`] fails on.
+const REFUSED: &[u8] = b"refused";
+
+/// [`TwoCells`], failing on the value [`REFUSED`].
+struct RefusesMarked;
+
+impl ValueProjector for RefusesMarked {
+    fn project(
+        &self,
+        key: &[u8],
+        value: &[u8],
+        row: &mut ProjectedRow<'_>,
+    ) -> lsm_tree::Result<()> {
+        if value == REFUSED {
+            return Err(Error::Projection("a value the projector refuses"));
+        }
+        TwoCells.project(key, value, row)
+    }
 }
 
 /// A fixed-width field of width zero has no cell to hold, and a column of it
