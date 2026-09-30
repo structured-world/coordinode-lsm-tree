@@ -155,8 +155,13 @@ impl<'t> StagedRead<'t> {
             match self.stage {
                 Stage::Filter => {
                     self.check_filters(sorted_keys)?;
+                    // The filters are answered: none of their blocks is read
+                    // again, so none is kept beyond what the cache keeps.
+                    self.held
+                        .retain(|(_, block)| block.header.block_type != BlockType::Filter);
                     if self.passing.is_empty() {
                         self.stage = Stage::Done;
+                        self.held.clear();
                         return Ok(());
                     }
                     self.stage = Stage::Index;
@@ -164,7 +169,9 @@ impl<'t> StagedRead<'t> {
                 }
                 Stage::Index => {
                     if self.walk_index(sorted_keys)? {
+                        // Planned: the index blocks are not walked again.
                         self.stage = Stage::Done;
+                        self.held.clear();
                     }
                 }
                 Stage::Done => return Ok(()),
@@ -190,12 +197,7 @@ impl<'t> StagedRead<'t> {
         {
             return;
         }
-        match self
-            .table
-            .cache
-            .get_block(self.table.global_id(), handle.offset())
-            .filter(|block| block.header.block_type == block_type)
-        {
+        match self.table.cached_block(&handle, block_type) {
             Some(block) => self.held.push((offset, block)),
             None => self.need.push(handle),
         }

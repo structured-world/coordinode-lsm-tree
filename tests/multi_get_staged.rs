@@ -290,6 +290,47 @@ fn the_partitioned_shape_reads_its_index_by_partition() -> lsm_tree::Result<()> 
     Ok(())
 }
 
+/// The load counters see a staged read as they see a block loaded on its own:
+/// each block the batches read counts one load from disk, and each block a
+/// warm read takes from the cache counts one cache hit, so the hit rates stay
+/// true on the multi-get path.
+#[cfg(feature = "metrics")]
+#[test]
+fn a_staged_read_counts_its_loads_and_cache_hits() -> lsm_tree::Result<()> {
+    for shape in SHAPES {
+        let dir = tempfile::tempdir()?;
+        let record = Record::default();
+        let (tree, keys) = tree(dir.path(), shape, 4, LARGE_CACHE, &record)?;
+        record.reset(None);
+
+        let metrics = tree.metrics();
+        let io = metrics.block_load_io_count();
+        tree.multi_get(&keys, SeqNo::MAX)?;
+        let read: usize = record.calls().iter().map(|&(requests, _)| requests).sum();
+        assert_eq!(
+            read,
+            metrics.block_load_io_count() - io,
+            "{shape:?}: a load per block read"
+        );
+
+        let (io, cached_cold) = (
+            metrics.block_load_io_count(),
+            metrics.block_load_cached_count(),
+        );
+        tree.multi_get(&keys, SeqNo::MAX)?;
+        assert_eq!(
+            io,
+            metrics.block_load_io_count(),
+            "{shape:?}: a warm read loads nothing"
+        );
+        assert!(
+            metrics.block_load_cached_count() > cached_cold,
+            "{shape:?}: a warm read counts its cache hits"
+        );
+    }
+    Ok(())
+}
+
 /// A warm level reads nothing: the filter and index blocks the first read
 /// fetched, and the data blocks it kept, are all taken from the cache.
 #[test]

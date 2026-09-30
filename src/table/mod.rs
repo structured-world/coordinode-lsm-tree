@@ -7694,13 +7694,27 @@ impl Table {
         DataBlock::from_loaded(block, has_kv_footer)
     }
 
-    /// The data block at `handle`, when the cache holds it.
+    /// The data block at `handle`, when the cache holds it, counted as a cache
+    /// hit as the load path counts one.
     pub(crate) fn cached_data_block(&self, handle: &BlockHandle) -> Option<DataBlock> {
+        let block = self.cached_block(handle, BlockType::Data)?;
+        DataBlock::from_loaded(block, self.metadata.kv_checksum_algo.is_some()).ok()
+    }
+
+    /// The block of `block_type` at `handle`, when the cache holds it, counted
+    /// as a cache hit as the load path counts one.
+    pub(crate) fn cached_block(
+        &self,
+        handle: &BlockHandle,
+        block_type: BlockType,
+    ) -> Option<Block> {
         let block = self
             .cache
             .get_block(self.global_id(), handle.offset())
-            .filter(|block| block.header.block_type == BlockType::Data)?;
-        DataBlock::from_loaded(block, self.metadata.kv_checksum_algo.is_some()).ok()
+            .filter(|block| block.header.block_type == block_type)?;
+        #[cfg(feature = "metrics")]
+        crate::table::util::record_block_load_cached(&self.metrics, block_type);
+        Some(block)
     }
 
     /// Decodes the on-disk `bytes` of this table's block of `block_type` read
@@ -7773,6 +7787,10 @@ impl Table {
                 block.header.block_type.into(),
             )));
         }
+        // Loaded from disk, as the load path counts a block once it passed
+        // every check.
+        #[cfg(feature = "metrics")]
+        crate::table::util::record_block_loaded(&self.metrics, block_type);
         Ok(block)
     }
 

@@ -82,10 +82,20 @@ fn drive(table: &Table, keys: &[(&[u8], u64)]) -> Option<Driven> {
             break;
         }
         read.advance(keys).expect("advance");
+        // Past its stage, a filter block is never consulted again.
+        assert!(
+            read.stage == Stage::Filter
+                || read
+                    .held
+                    .iter()
+                    .all(|(_, block)| block.header.block_type != BlockType::Filter),
+            "a read past its filters still holds a filter block"
+        );
         if read.is_done() && read.need().1.is_empty() {
             break;
         }
     }
+    assert!(read.held.is_empty(), "a planned read holds no block");
     let (seqno, blocks, tally) = read.into_plan();
     Some((seqno, blocks, tally, asked))
 }

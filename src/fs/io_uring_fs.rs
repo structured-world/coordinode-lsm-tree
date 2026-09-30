@@ -1382,9 +1382,13 @@ struct UringReadQueue<'r> {
     done_rx: mpsc::Receiver<(usize, i32)>,
     /// Submitted since the last wait, not yet on the ring.
     submitted: Vec<QueuedRead>,
-    /// The reads sent to the ring, by the position their completion reports;
-    /// `None` once handed back.
-    sent: Vec<Option<QueuedRead>>,
+    /// The reads sent to the ring, by the position their completion reports
+    /// less `base`; `None` once handed back. Handed-back reads at either end
+    /// are dropped, so a long-lived queue keeps the span of its reads in
+    /// flight, not one slot per read it ever sent.
+    sent: std::collections::VecDeque<Option<QueuedRead>>,
+    /// The position of `sent`'s first slot.
+    base: usize,
     /// Reads on the ring whose completion has not arrived.
     on_ring: usize,
     /// Reads finished without the ring (empty, no descriptor, or refused),
@@ -1400,7 +1404,8 @@ impl<'r> UringReadQueue<'r> {
             done_tx,
             done_rx,
             submitted: Vec::new(),
-            sent: Vec::new(),
+            sent: std::collections::VecDeque::new(),
+            base: 0,
             on_ring: 0,
             finished: Vec::new(),
         }
@@ -1414,7 +1419,7 @@ impl<'r> UringReadQueue<'r> {
         if self.submitted.is_empty() {
             return;
         }
-        let first = self.sent.len();
+        let first = self.base + self.sent.len();
         let mut reads = Vec::with_capacity(self.submitted.len());
         for mut read in core::mem::take(&mut self.submitted) {
             if read.buf.is_empty() {
@@ -1450,7 +1455,7 @@ impl<'r> UringReadQueue<'r> {
                 len: len.unsigned_abs(),
                 offset: read.offset,
             });
-            self.sent.push(Some(read));
+            self.sent.push_back(Some(read));
         }
         if reads.is_empty() {
             return;
@@ -1466,20 +1471,43 @@ impl<'r> UringReadQueue<'r> {
             // Nothing was queued: the submission went down with the send, so
             // no buffer is in the kernel's hands.
             Err(error) => {
-                for slot in self.sent.iter_mut().skip(first) {
+                for slot in self.sent.iter_mut().skip(first - self.base) {
                     if let Some(read) = slot.take() {
                         let failure = io::Error::new(error.kind(), error.to_string());
                         self.finished
                             .push(done(read, Err(crate::io::Error::from(failure))));
                     }
                 }
+                self.trim();
             }
+        }
+    }
+
+    /// Takes the read sent at `position` out of its slot.
+    fn take_sent(&mut self, position: usize) -> Option<QueuedRead> {
+        let read = self
+            .sent
+            .get_mut(position.checked_sub(self.base)?)?
+            .take()?;
+        self.trim();
+        Some(read)
+    }
+
+    /// Drops the handed-back slots at either end, keeping the positions of
+    /// the reads still in flight.
+    fn trim(&mut self) {
+        while self.sent.front().is_some_and(Option::is_none) {
+            self.sent.pop_front();
+            self.base += 1;
+        }
+        while self.sent.back().is_some_and(Option::is_none) {
+            self.sent.pop_back();
         }
     }
 
     /// The read at `position` with the ring's `result` for it.
     fn complete(&mut self, position: usize, result: i32) -> Option<ReadDone> {
-        let read = self.sent.get_mut(position)?.take()?;
+        let read = self.take_sent(position)?;
         self.on_ring -= 1;
         let want = read.buf.len();
         let result = match usize::try_from(result) {
@@ -1554,7 +1582,7 @@ impl Drop for UringReadQueue<'_> {
             let Ok((position, _)) = self.done_rx.recv() else {
                 break;
             };
-            if self.sent.get_mut(position).and_then(Option::take).is_some() {
+            if self.take_sent(position).is_some() {
                 self.on_ring -= 1;
             }
         }

@@ -1842,6 +1842,42 @@ fn a_read_queue_reports_a_short_read_as_failed() -> io::Result<()> {
     Ok(())
 }
 
+/// A queue reused for many rounds keeps no slot for a read it handed back:
+/// its bookkeeping follows the reads in flight, not every read it has sent.
+#[test]
+fn a_reused_read_queue_keeps_no_slot_for_a_read_handed_back() -> io::Result<()> {
+    let Some(fs) = try_io_uring() else {
+        return Ok(());
+    };
+    let dir = tempfile::tempdir()?;
+    let files: Vec<Arc<dyn FsFile>> = two_files(&fs, dir.path(), 8 * 64)?
+        .into_iter()
+        .map(Arc::from)
+        .collect();
+    let mut queue = UringReadQueue::new(&fs.inner);
+    for round in 0..100usize {
+        for i in 0..8usize {
+            queue.submit(QueuedRead {
+                tag: round * 8 + i,
+                file: Arc::clone(&files[i % 2]),
+                offset: (i * 64) as u64,
+                buf: vec![0; 64],
+            });
+        }
+        while queue.outstanding() > 0 {
+            queue.wait(1, &mut |done| {
+                assert!(done.result.is_ok(), "read {} failed", done.tag);
+            });
+        }
+        assert!(
+            queue.sent.is_empty(),
+            "round {round} kept {} slots",
+            queue.sent.len()
+        );
+    }
+    Ok(())
+}
+
 /// Dropping a queue with reads on the ring waits their completions out
 /// before their buffers go, and the backend stays usable after.
 #[test]

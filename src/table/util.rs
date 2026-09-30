@@ -345,7 +345,7 @@ pub(crate) fn record_block_read(metrics: &Metrics, block_type: BlockType, on_dis
 /// filesystem for bytes ([`record_block_read`]) but loaded nothing, so it must
 /// not lower the cache hit rates the load counters feed.
 #[cfg(feature = "metrics")]
-fn record_block_loaded(metrics: &Metrics, block_type: BlockType) {
+pub(crate) fn record_block_loaded(metrics: &Metrics, block_type: BlockType) {
     use core::sync::atomic::Ordering::Relaxed;
     let loads = match block_type {
         BlockType::Filter => &metrics.filter_block_load_io,
