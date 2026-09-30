@@ -14,8 +14,8 @@ use lsm_tree::table::columnar::{
 };
 use lsm_tree::table::columnar_predicate::{ColumnRangePredicate, PredicateApply, PredicateSupport};
 use lsm_tree::{
-    AbstractTree, AnyTree, Config, Error, InternalValue, SeqNo, SequenceNumberCounter, UserKey,
-    ValueType, get_tmp_folder,
+    AbstractTree, AnyTree, Config, InternalValue, SeqNo, SequenceNumberCounter, UserKey, ValueType,
+    get_tmp_folder,
 };
 use test_log::test;
 
@@ -1328,11 +1328,11 @@ fn tree_columnar_scan_suppresses_a_deleted_key_across_overlapping_segments() {
 
 /// A merge chain is not a version chain: the older rows are the merge's INPUTS,
 /// not data the newest row shadows. Newest-version-wins dedup would hand back
-/// the raw operand while a point read hands back the merged value, and it drops
-/// the base row, so the consumer cannot even resolve the chain itself. The scan
-/// must refuse rather than disagree with the read path.
+/// the raw operand while a point read hands back the merged value; the scan
+/// resolves the chain through the same operator and returns what the read
+/// returns, whether the chain is flushed or still in the memtable.
 #[test]
-fn tree_columnar_scan_refuses_a_tree_that_merges() {
+fn tree_columnar_scan_resolves_a_merge_chain_as_the_read_path_does() {
     use std::sync::Arc;
 
     struct Append;
@@ -1381,13 +1381,58 @@ fn tree_columnar_scan_refuses_a_tree_that_merges() {
          would have to reproduce",
     );
 
-    let err = tree
-        .columnar_scan(&[COL_USER_KEY, COL_VALUE], None, SeqNo::MAX, ..)
-        .err()
-        .expect("a merging tree must be refused, not served raw operands");
-    assert!(
-        matches!(err, Error::FeatureUnsupported(_)),
-        "the refusal names the unsupported combination, got {err:?}",
+    // A further operand in the memtable, over the flushed chain; and a chain
+    // whose operands merge into nothing but a deletion base.
+    tree.merge(key(1), b"C".to_vec(), 3);
+    tree.insert(key(2), b"X".to_vec(), 4);
+    tree.remove(key(2), 5);
+    tree.merge(key(2), b"Y".to_vec(), 6);
+
+    let values = |seqno: SeqNo| {
+        let mut out = Vec::new();
+        for batch in tree
+            .columnar_scan(&[COL_USER_KEY, COL_VALUE], None, seqno, ..)
+            .expect("scan")
+        {
+            let batch = batch.expect("batch");
+            // A bytes column: a `(rows + 1)`-entry little-endian `u32` offset
+            // table, then the payload.
+            let cells = |column: &Column| {
+                let rows = batch.row_count as usize;
+                let offset = |i: usize| {
+                    u32::from_le_bytes(column.data[i * 4..i * 4 + 4].try_into().expect("offset"))
+                        as usize
+                };
+                let payload = (rows + 1) * 4;
+                (0..rows)
+                    .map(|i| column.data[payload + offset(i)..payload + offset(i + 1)].to_vec())
+                    .collect::<Vec<_>>()
+            };
+            out.extend(
+                cells(&batch.columns[0])
+                    .into_iter()
+                    .zip(cells(&batch.columns[1])),
+            );
+        }
+        out
+    };
+    for seqno in [3, SeqNo::MAX] {
+        let expected: Vec<(Vec<u8>, Vec<u8>)> = [key(1), key(2)]
+            .into_iter()
+            .filter_map(|k| {
+                let v = tree.get(&k, seqno).expect("get")?;
+                Some((k, v.to_vec()))
+            })
+            .collect();
+        assert_eq!(
+            expected,
+            values(seqno),
+            "the scan returns what a read returns at {seqno}"
+        );
+    }
+    assert_eq!(
+        values(SeqNo::MAX),
+        vec![(key(1), b"ABC".to_vec()), (key(2), b"Y".to_vec())],
     );
 }
 

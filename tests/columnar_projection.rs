@@ -377,6 +377,96 @@ fn the_same_rows_read_the_same_from_every_source() -> lsm_tree::Result<()> {
     Ok(())
 }
 
+/// Adds its operand to field 4 of a value framed as `row_value` frames it,
+/// keeping field 3; a missing base counts as both fields zero.
+struct AddToFourth;
+
+impl lsm_tree::MergeOperator for AddToFourth {
+    fn merge(
+        &self,
+        _key: &[u8],
+        base: Option<&[u8]>,
+        operands: &[&[u8]],
+    ) -> lsm_tree::Result<lsm_tree::UserValue> {
+        let fixed = |cell: &[u8]| u32::from_le_bytes(cell.try_into().expect("fixed-4"));
+        let (third, mut fourth) = match base {
+            Some(base) => {
+                let cells = unframe_value_cells(base, &[TypeTag::Fixed(4), TypeTag::Fixed(4)])?;
+                (fixed(cells[0]), fixed(cells[1]))
+            }
+            None => (0, 0),
+        };
+        for operand in operands {
+            fourth += fixed(operand);
+        }
+        Ok(row_value(third, fourth).into())
+    }
+}
+
+/// A merge chain whose base is a columnar row split into fields and whose
+/// operand is a memtable row returns the merged value's fields, as a read
+/// returns the merged value, not the raw operand.
+#[test]
+fn a_merge_chain_over_a_columnar_base_returns_the_merged_fields() -> lsm_tree::Result<()> {
+    let folder = get_tmp_folder();
+    let any = Config::new(
+        folder.path(),
+        SequenceNumberCounter::default(),
+        SequenceNumberCounter::default(),
+    )
+    .with_merge_operator(Some(std::sync::Arc::new(AddToFourth)))
+    .open()?;
+    standard(&any).update_runtime_config(|cfg| cfg.columnar = true)?;
+    ingest(&any, &[0, 1], &[(3, &[10, 11]), (4, &[40, 41])]);
+    let tree = standard(&any);
+    let seqno = tree.get_highest_seqno().map_or(0, |s| s + 1);
+    tree.merge(key(0), 2u32.to_le_bytes(), seqno);
+    assert_eq!(
+        vec![(key(0), Some(42)), (key(1), Some(41))],
+        rows(tree, &projected())?,
+    );
+    Ok(())
+}
+
+/// The scan reads the version it started on: a compaction that rewrites the
+/// segments while the scan is open, into another layout, changes nothing it
+/// returns.
+#[test]
+fn a_compaction_during_the_scan_changes_nothing_it_returns() -> lsm_tree::Result<()> {
+    let folder = get_tmp_folder();
+    let any = open_columnar(folder.path());
+    ingest(&any, &[0, 2], &[(3, &[10, 12]), (4, &[40, 42])]);
+    ingest(&any, &[1], &[(3, &[11]), (4, &[41])]);
+    let tree = standard(&any);
+    let seqno = tree.get_highest_seqno().map_or(0, |s| s + 1);
+    tree.insert(key(3), row_value(13, 43), seqno);
+
+    let scan = tree.columnar_scan(projected(), None, SeqNo::MAX, ..)?;
+    tree.flush_active_memtable(0)?;
+    tree.major_compact(64 * 1024 * 1024, 0)?;
+    let mut got = Vec::new();
+    for batch in scan {
+        let batch = batch?;
+        got.push(batch.row_count);
+    }
+    assert_eq!(
+        4,
+        got.iter().sum::<u32>(),
+        "every row of the version scanned"
+    );
+    assert_eq!(
+        vec![
+            (key(0), Some(40)),
+            (key(1), Some(41)),
+            (key(2), Some(42)),
+            (key(3), Some(43)),
+        ],
+        rows(tree, &projected())?,
+        "the compacted layout reads the same",
+    );
+    Ok(())
+}
+
 /// A row source's declared fields are read through the projector, so a scan
 /// without one is refused rather than reading them as absent.
 #[test]

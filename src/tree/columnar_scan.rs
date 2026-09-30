@@ -209,24 +209,13 @@ impl Tree {
     ) -> crate::Result<ColumnarScan> {
         let projection = projection.into();
         // A merge chain is not a version chain: its older rows are the merge's
-        // INPUTS, not data the newest row shadows. The newest-version-wins dedup
-        // below would hand back the raw operand where a read hands back the
-        // merged value, and it drops the base row, so the consumer cannot
-        // resolve the chain itself either. Refuse instead of disagreeing with
-        // the read path.
-        //
-        // Gated on the OPERATOR rather than on the rows: without one the read
-        // path returns the newest entry unchanged — the raw operand — which is
-        // exactly what this scan yields, so nothing diverges. With one, no
-        // metadata says whether a segment holds operands, and finding out means
-        // decoding the value-type column of every batch, which would cost the
-        // zero-copy fast path on every scan of every tree that merges.
-        if self.config.merge_operator.is_some() {
-            return Err(Error::FeatureUnsupported(
-                "columnar scan of a tree with a merge operator: merge chains \
-                 would be returned unresolved",
-            ));
-        }
+        // INPUTS, not data the newest row shadows, and a read hands back the
+        // merged value. An operand row is therefore replaced by what a read at
+        // the snapshot returns for its key, through the same operator, before
+        // anything is projected from it. Without an operator the read path
+        // returns the newest entry unchanged, the raw operand, which is what
+        // the scan yields, so no resolution runs and no value type is decoded.
+        let resolver = self.config.merge_operator.is_some().then(|| self.clone());
 
         let comparator = self.config.comparator.clone();
 
@@ -338,6 +327,7 @@ impl Tree {
             projector: declared
                 .then(|| projection.value_projector().cloned())
                 .flatten(),
+            resolver,
             predicate: predicate.cloned(),
             support: PredicateSupport::Exact,
             comparator,
@@ -468,10 +458,12 @@ struct DedupState {
     last_key: Option<Vec<u8>>,
 }
 
-/// How a segment of a whole-value table is read for declared fields.
+/// How a segment of a whole-value table is read: its merge operands resolved,
+/// and its declared fields read out of the values.
 pub(super) struct WholeRead {
-    /// The projector the fields are read through.
-    projector: alloc::sync::Arc<dyn projection::ValueProjector>,
+    /// The projector the fields are read through; `None` when no field is
+    /// declared and the read only resolves operands.
+    projector: Option<alloc::sync::Arc<dyn projection::ValueProjector>>,
     /// Columns decoded only to read the fields, dropped once they are read.
     extra: Vec<u16>,
 }
@@ -524,6 +516,25 @@ impl GroupStream {
     }
 }
 
+/// A batch lacks a column the scan decoded for itself.
+const MISSING_BATCH_COLUMN: Error =
+    Error::InvalidHeader("columnar_scan: a batch is missing a column the scan decoded");
+
+/// Whether a row of `batch` is a merge operand; `false` for a batch without a
+/// value-type column.
+fn holds_operand(batch: &ColumnBatch) -> bool {
+    batch
+        .columns
+        .iter()
+        .find(|c| c.column_id == COL_VALUE_TYPE)
+        .is_some_and(|types| {
+            types
+                .data
+                .iter()
+                .any(|&byte| crate::ValueType::try_from(byte) == Ok(crate::ValueType::MergeOperand))
+        })
+}
+
 /// Drops from `batch` the columns decoded only for the scan's own use.
 fn drop_columns(batch: &mut ColumnBatch, dropped: &[u16]) {
     if !dropped.is_empty() {
@@ -550,6 +561,9 @@ pub struct ColumnarScan {
     /// The projector the declared fields of a whole-value segment are read
     /// through; `None` when no field is declared.
     projector: Option<alloc::sync::Arc<dyn projection::ValueProjector>>,
+    /// The tree whose point read resolves a merge operand row, when the tree
+    /// merges; `None` when it has no merge operator.
+    resolver: Option<Tree>,
     predicate: Option<ColumnRangePredicate>,
     /// The weakest [`PredicateSupport`] over the segments read so far.
     support: PredicateSupport,
@@ -684,14 +698,17 @@ impl ColumnarScan {
         predicate: Option<&ColumnRangePredicate>,
         share: u64,
     ) -> crate::Result<SegmentCursor> {
-        let whole = self.projector.clone().filter(|_| seg.whole);
+        // A whole value is read for its declared fields, and for the merge
+        // operands it may hold when the tree merges.
+        let whole = (seg.whole && (self.projector.is_some() || self.resolver.is_some()))
+            .then(|| self.projector.clone());
         // The declared fields of a whole value lie inside it: decode it, its
         // key and its value type in their place. A declared field's id may be
         // the value column's own, so no predicate is pushed down; the caller
         // filters after the fields are read.
         let mut ids: Vec<u16> = projection.to_vec();
         let mut extra = Vec::new();
-        if whole.is_some() {
+        if let Some(projector) = &whole {
             let declared: Vec<u16> = self
                 .fields
                 .iter()
@@ -711,6 +728,10 @@ impl ColumnarScan {
             }
             if !ids.contains(&crate::table::columnar::COL_VALUE) {
                 ids.push(crate::table::columnar::COL_VALUE);
+                // Read only to resolve operands, no field shares its id.
+                if projector.is_none() {
+                    extra.push(crate::table::columnar::COL_VALUE);
+                }
             }
         }
         let predicate = predicate.filter(|_| whole.is_none());
@@ -743,18 +764,97 @@ impl ColumnarScan {
         })
     }
 
-    /// `batch` as `whole` says: its declared fields read out of its values,
-    /// and the columns decoded only for that dropped.
-    fn read_whole(
+    /// `batch` as `whole` says: its merge operands resolved, its declared
+    /// fields read out of its values, and the columns decoded only for that
+    /// dropped. A batch of a split table is refused an operand it cannot
+    /// resolve.
+    pub(super) fn read_whole(
         &self,
         batch: ColumnBatch,
         whole: Option<&WholeRead>,
     ) -> crate::Result<ColumnBatch> {
         let Some(whole) = whole else {
+            if self.resolver.is_some() && holds_operand(&batch) {
+                return Err(Error::Projection(
+                    "projection: a table storing values split into fields holds a merge \
+                     operand, which is resolved only from a whole value",
+                ));
+            }
             return Ok(batch);
         };
-        let mut batch = projection::project_whole(batch, &self.fields, whole.projector.as_ref())?;
+        let batch = self.resolve_operands(batch)?;
+        let mut batch = match &whole.projector {
+            Some(projector) => projection::project_whole(batch, &self.fields, projector.as_ref())?,
+            None => batch,
+        };
         drop_columns(&mut batch, &whole.extra);
+        Ok(batch)
+    }
+
+    /// `batch` with each merge operand row replaced by what a read at the
+    /// scan's snapshot returns for its key: that value, or a deletion when the
+    /// read finds the key absent. The chain is resolved through the tree's own
+    /// operator, exactly as the read path resolves it.
+    fn resolve_operands(&self, batch: ColumnBatch) -> crate::Result<ColumnBatch> {
+        use crate::table::columnar::COL_VALUE;
+
+        let Some(tree) = &self.resolver else {
+            return Ok(batch);
+        };
+        if !holds_operand(&batch) {
+            return Ok(batch);
+        }
+        let ColumnBatch {
+            row_count,
+            mut columns,
+        } = batch;
+        let find = |id: u16| {
+            columns
+                .iter()
+                .position(|c| c.column_id == id)
+                .ok_or(Error::InvalidHeader(
+                    "columnar_scan: a whole-value batch is missing its key, value type or value",
+                ))
+        };
+        let (key_at, type_at, value_at) =
+            (find(COL_USER_KEY)?, find(COL_VALUE_TYPE)?, find(COL_VALUE)?);
+        let mut types = Vec::with_capacity(row_count as usize);
+        let mut values: Vec<crate::Slice> = Vec::with_capacity(row_count as usize);
+        {
+            let (keys, kinds, cells) = (
+                columns.get(key_at).ok_or(MISSING_BATCH_COLUMN)?,
+                columns.get(type_at).ok_or(MISSING_BATCH_COLUMN)?,
+                columns.get(value_at).ok_or(MISSING_BATCH_COLUMN)?,
+            );
+            for row in 0..row_count {
+                let byte = *kinds.data.get(row as usize).ok_or(MISSING_BATCH_COLUMN)?;
+                let value = bytes_column_row(&cells.data, row_count, row)?;
+                if crate::ValueType::try_from(byte) == Ok(crate::ValueType::MergeOperand) {
+                    let key = bytes_column_row(&keys.data, row_count, row)?;
+                    if let Some(merged) = crate::AbstractTree::get(tree, key, self.seqno)? {
+                        types.push(u8::from(crate::ValueType::Value));
+                        values.push(merged);
+                    } else {
+                        types.push(u8::from(crate::ValueType::Tombstone));
+                        values.push(crate::Slice::empty());
+                    }
+                } else {
+                    types.push(byte);
+                    values.push(crate::Slice::from(value));
+                }
+            }
+        }
+        let value_data = crate::table::columnar::frame_bytes_column(row_count as usize, || {
+            values.iter().map(|v| &**v)
+        })?;
+        if let Some(column) = columns.get_mut(type_at) {
+            column.data = crate::Slice::from(types);
+        }
+        if let Some(column) = columns.get_mut(value_at) {
+            column.data = value_data;
+        }
+        let batch = ColumnBatch { row_count, columns };
+        self.record_gather(&batch);
         Ok(batch)
     }
 
@@ -990,8 +1090,11 @@ impl ColumnarScan {
         // A segment whose declared fields are read out of whole values cannot
         // take a pushed-down predicate either (see `segment_cursor`): the
         // dedup path filters after the fields are read.
+        // A tree that merges routes there too: an operand can resolve to a
+        // deletion, which deciding a run consumes.
         if seg.may_dup
             || seg.records_deletions()
+            || self.resolver.is_some()
             || !rts.is_empty()
             || (seg.whole && self.projector.is_some() && predicate.is_some())
         {
@@ -1164,7 +1267,7 @@ impl ColumnarScan {
         // not project the type column cannot tell that row from a live one with
         // an empty value. Decoded only for a segment that RECORDS deletions; one
         // without them keeps its columns untouched.
-        let deletes = seg.records_deletions();
+        let deletes = seg.records_deletions() || self.resolver.is_some();
         if deletes {
             needed.push(COL_VALUE_TYPE);
         }

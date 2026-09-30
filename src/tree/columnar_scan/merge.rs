@@ -21,7 +21,7 @@
 
 use alloc::vec::Vec;
 
-use super::projection::{ProjectedField, conform, project_whole};
+use super::projection::{ProjectedField, conform};
 use super::rows::SourceCursor;
 use super::{ColumnarScan, Segment, SegmentCursor, WholeRead, drop_columns, key_in_bounds};
 use crate::table::columnar::{
@@ -130,7 +130,9 @@ impl MergeStream {
         // them; the predicate's column for the filter after the dedup; the
         // value type where a segment records deletions, because the newest
         // version of a key can BE a deletion and then the key yields nothing.
-        let deletes = segments.iter().any(Segment::records_deletions);
+        // An operand can resolve to a deletion, so a tree that merges decodes
+        // the value type of every source.
+        let deletes = scan.resolver.is_some() || segments.iter().any(Segment::records_deletions);
         let mut needed = alloc::vec![COL_USER_KEY, COL_SEQNO];
         if let Some(pred) = &scan.predicate {
             needed.push(pred.column_id);
@@ -328,7 +330,7 @@ impl MergeStream {
         scan: &ColumnarScan,
         cmp: &dyn crate::comparator::UserComparator,
     ) -> crate::Result<Position> {
-        let (position, peak) = self.position_source(i, cmp)?;
+        let (position, peak) = self.position_source(i, scan, cmp)?;
         if let Some(peak) = peak {
             // The other sources did not move while this one loaded, so the
             // most the merge held is theirs plus this source's peak.
@@ -344,6 +346,7 @@ impl MergeStream {
     fn position_source(
         &mut self,
         i: usize,
+        scan: &ColumnarScan,
         cmp: &dyn crate::comparator::UserComparator,
     ) -> crate::Result<(Position, Option<u64>)> {
         let last_key = self.last_key.as_deref();
@@ -388,14 +391,10 @@ impl MergeStream {
             match source.cursor.next() {
                 None => return Ok((Position::Exhausted, loaded)),
                 Some(batch) => {
-                    let mut batch = batch?;
-                    // A whole-value segment's declared fields are read out of
-                    // its values first, so every source brings the same
-                    // columns to the conform below.
-                    if let Some(whole) = &source.whole {
-                        batch = project_whole(batch, fields, whole.projector.as_ref())?;
-                        drop_columns(&mut batch, &whole.extra);
-                    }
+                    // A whole-value segment's operands are resolved and its
+                    // declared fields read out of its values first, so every
+                    // source brings the same columns to the conform below.
+                    let batch = scan.read_whole(batch?, source.whole.as_ref())?;
                     let batch = conform(batch, fields)?;
                     // Keys are read row by row from their framing, which only
                     // a bytes column carries.
