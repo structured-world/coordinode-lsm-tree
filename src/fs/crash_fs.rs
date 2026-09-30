@@ -299,7 +299,15 @@ impl CrashFs {
     /// [`Self::capture_first_touch`]) so backend I/O never runs under the mutex.
     fn track_copy(&self, src: &Path, dst: &Path) -> io::Result<()> {
         let (src_durable, src_touched) = {
-            let state = self.state.lock();
+            let mut state = self.state.lock();
+            // While entries are tracked, the backend made `dst` already:
+            // record it as a written, pending entry before the fallible
+            // baseline read, so a read that fails leaves an entry a crash
+            // removes rather than one it never saw.
+            if state.track_entries {
+                state.touched.insert(dst.to_path_buf());
+                state.mark_pending(dst);
+            }
             (state.durable.get(src).cloned(), state.touched.contains(src))
         };
         let dst_image = match src_durable {
@@ -314,7 +322,6 @@ impl CrashFs {
             }
             state.touched.insert(dst.to_path_buf());
         }
-        self.new_entry(dst);
         Ok(())
     }
 }

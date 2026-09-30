@@ -903,6 +903,46 @@ fn baseline_read_failure_surfaces_from_open() {
     );
 }
 
+/// A hard link the backend made is a new entry even when reading its source's
+/// baseline then fails: its directory was never synced, so a crash removes it
+/// rather than keeping an entry the simulator never recorded.
+#[test]
+fn a_hard_link_whose_baseline_read_fails_does_not_survive_a_crash() {
+    let fault = FaultFs::new(MemFs::new());
+    let inj = fault.injector();
+    fault.create_dir_all(Path::new("/d")).unwrap();
+    {
+        let mut f = fault
+            .open(
+                Path::new("/d/pre"),
+                &FsOpenOptions::new().write(true).create(true),
+            )
+            .unwrap();
+        std::io::Write::write_all(&mut f, b"original").unwrap();
+    }
+    let fs = CrashFs::from_shared(Arc::new(fault)).tracking_directory_entries();
+
+    // The link is made; reading the untouched source's baseline then fails.
+    inj.arm(FaultRule::new(
+        FaultOp::Read,
+        Fault::Error(ErrorKind::Other),
+    ));
+    assert!(
+        fs.hard_link(Path::new("/d/pre"), Path::new("/d/link"))
+            .is_err()
+    );
+    assert!(
+        fs.exists(Path::new("/d/link")).unwrap(),
+        "the backend made it"
+    );
+
+    fs.crash();
+    assert!(
+        !fs.exists(Path::new("/d/link")).unwrap(),
+        "an entry whose directory was never synced does not survive a crash"
+    );
+}
+
 #[test]
 fn hard_link_of_unsynced_source_does_not_survive_crash() {
     let fs = CrashFs::new(MemFs::new());
