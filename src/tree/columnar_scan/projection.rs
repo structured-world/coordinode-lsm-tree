@@ -124,7 +124,9 @@ fn intrinsic_type(column_id: u16) -> Option<TypeTag> {
 /// a value in a memtable or a row-oriented table, or the result of a merge.
 ///
 /// The engine does not guess an encoding; the caller that wrote the values
-/// knows it.
+/// knows it. It is called for the versions the scan's snapshot sees, before
+/// the newest of each key is chosen, so an older version a newer one shadows
+/// may be read too; never for a version newer than the snapshot.
 pub trait ValueProjector: Send + Sync {
     /// Writes into `row` the cell of each field the row value `value` of `key`
     /// has. A field left unset is absent from the row and reads as its
@@ -327,9 +329,10 @@ pub fn project_whole(
         let is_value = match types {
             Some(types) => {
                 let byte = *types.data.get(row as usize).ok_or(MISSING_SCAN_COLUMN)?;
-                crate::ValueType::try_from(byte)
-                    .map_err(|()| Error::InvalidTag(("ValueType", byte)))?
-                    == crate::ValueType::Value
+                returns_a_value(
+                    crate::ValueType::try_from(byte)
+                        .map_err(|()| Error::InvalidTag(("ValueType", byte)))?,
+                )
             }
             None => true,
         };
@@ -346,6 +349,16 @@ pub fn project_whole(
         columns.push(built_column(field, &column)?);
     }
     Ok(ColumnBatch { row_count, columns })
+}
+
+/// Whether a row of `value_type` is returned with a value: a value, or a merge
+/// operand left unresolved, which is what a read of a tree without a merge
+/// operator returns (a tree with one has its operands resolved by then).
+fn returns_a_value(value_type: crate::ValueType) -> bool {
+    matches!(
+        value_type,
+        crate::ValueType::Value | crate::ValueType::MergeOperand
+    )
 }
 
 /// A column of `field` holding `cells`, a missing cell null.
@@ -474,7 +487,10 @@ fn conform_with(
     let is_value = |row: u32| {
         strict
             && types.as_ref().is_none_or(|types| {
-                types.get(row as usize).copied() == Some(u8::from(crate::ValueType::Value))
+                types
+                    .get(row as usize)
+                    .and_then(|&byte| crate::ValueType::try_from(byte).ok())
+                    .is_some_and(returns_a_value)
             })
     };
     let mut out = Vec::with_capacity(fields.len().max(columns.len()));
@@ -490,6 +506,9 @@ fn conform_with(
                 }
                 fill_nulls(column, field, row_count, &is_value)?
             }
+            // A column of no declared type has no absent form; its rows are
+            // held to it once they are decided.
+            None if !strict && field.type_tag.is_none() => continue,
             None => absent_column(field, row_count, &is_value)?,
         };
         out.push(column);

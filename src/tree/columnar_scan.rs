@@ -570,6 +570,10 @@ pub(super) struct WholeRead {
     projector: Option<alloc::sync::Arc<dyn projection::ValueProjector>>,
     /// Columns decoded only to read the fields, dropped once they are read.
     extra: Vec<u16>,
+    /// For a table the snapshot straddles, the snapshot in its local seqno
+    /// space: a row at or above it is newer than the snapshot and is dropped
+    /// before anything is read out of its value.
+    visible_below: Option<SeqNo>,
 }
 
 /// A segment's cursor and, for a whole-value segment read for declared
@@ -848,7 +852,17 @@ impl ColumnarScan {
                     extra.push(crate::table::columnar::COL_VALUE);
                 }
             }
+            // A row source yields only the rows the snapshot sees; a table the
+            // snapshot straddles is masked here, before any value is read.
+            if seg.visibility == SeqnoVisibility::Partial && !ids.contains(&COL_SEQNO) {
+                ids.push(COL_SEQNO);
+                extra.push(COL_SEQNO);
+            }
         }
+        // Rows the snapshot does not see: the snapshot in the segment's local
+        // seqno space. A snapshot below the segment's base sees none of it.
+        let visible_below = (seg.visibility == SeqnoVisibility::Partial)
+            .then(|| self.seqno.saturating_sub(seg.global));
         let predicate = predicate.filter(|_| whole.is_none());
         let cursor = match &seg.source {
             Source::Columnar(table) => SourceCursor::Columnar(Box::new(table.columnar_cursor(
@@ -875,7 +889,11 @@ impl ColumnarScan {
         };
         Ok(SegmentCursor {
             cursor,
-            whole: whole.map(|projector| WholeRead { projector, extra }),
+            whole: whole.map(|projector| WholeRead {
+                projector,
+                extra,
+                visible_below,
+            }),
         })
     }
 
@@ -897,6 +915,10 @@ impl ColumnarScan {
             }
             return Ok(batch);
         };
+        let batch = match whole.visible_below {
+            Some(threshold) => self.drop_invisible(batch, threshold)?,
+            None => batch,
+        };
         let batch = self.resolve_operands(batch)?;
         let mut batch = match &whole.projector {
             Some(projector) => projection::project_whole(batch, &self.fields, projector.as_ref())?,
@@ -904,6 +926,26 @@ impl ColumnarScan {
         };
         drop_columns(&mut batch, &whole.extra);
         Ok(batch)
+    }
+
+    /// `batch` without the rows at or above the local seqno `threshold`, the
+    /// ones newer than the snapshot; the batch itself when it has none.
+    fn drop_invisible(&self, batch: ColumnBatch, threshold: SeqNo) -> crate::Result<ColumnBatch> {
+        let seqnos = batch
+            .columns
+            .iter()
+            .find(|c| c.column_id == COL_SEQNO)
+            .ok_or(MISSING_BATCH_COLUMN)?;
+        let mut mask = Vec::with_capacity(batch.row_count as usize);
+        for row in 0..batch.row_count {
+            mask.push(crate::table::columnar::fixed_u64_row(&seqnos.data, row)? < threshold);
+        }
+        if mask.iter().all(|&visible| visible) {
+            return Ok(batch);
+        }
+        let visible = filter_batch(&batch, &mask)?;
+        self.record_gather(&visible);
+        Ok(visible)
     }
 
     /// `batch` with each merge operand row replaced by what a read at the
@@ -1022,6 +1064,10 @@ impl ColumnarScan {
                     Ok(batch) => batch,
                     Err(e) => return Some(Err(e)),
                 };
+                // Every row of it newer than the snapshot.
+                if batch.row_count == 0 {
+                    continue;
+                }
                 let SingletonStream { global, mode, .. } = &mut **singleton;
                 match self.shape_singleton_batch(batch, *global, mode, support) {
                     // The rows returned are decided: each is held to the

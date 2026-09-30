@@ -103,10 +103,14 @@ pub(super) struct MergeStream {
     /// a source loads is brought to them, so the sources agree on their
     /// columns even where a segment was written without a projected one.
     fields: Vec<ProjectedField>,
-    /// The predicate's column when no field names it and it is not intrinsic:
-    /// a source may be written without it, or hold it inside a whole value,
-    /// and nothing says how such a row reads for it.
-    loose: Option<u16>,
+    /// The columns of no declared type the merge decodes: projected by id, or
+    /// the predicate's when no field names it. A source may be written
+    /// without one, or hold it inside a whole value, and nothing says how
+    /// such a row reads for it, so only the rows chosen are held to it.
+    loose: Vec<u16>,
+    /// The predicate's column when it is loose: rows chosen from batches
+    /// that do not all carry it cannot be judged.
+    loose_predicate: Option<u16>,
     /// Whether a segment of the group records deletions, so the value type is
     /// decoded.
     deletes: bool,
@@ -161,10 +165,24 @@ impl MergeStream {
                     .filter(|field| field.type_tag().is_some()),
             )
             .collect();
-        let loose =
-            scan.predicate.as_ref().map(|p| p.column_id).filter(|&id| {
-                dropped.contains(&id) && ProjectedField::by_id(id).type_tag().is_none()
-            });
+        let mut loose: Vec<u16> = scan
+            .fields
+            .iter()
+            .filter(|f| f.type_tag().is_none())
+            .map(ProjectedField::column_id)
+            .collect();
+        let loose_predicate = scan.predicate.as_ref().map(|p| p.column_id).filter(|&id| {
+            ProjectedField::by_id(id).type_tag().is_none()
+                && scan
+                    .fields
+                    .iter()
+                    .all(|f| f.column_id() != id || f.type_tag().is_none())
+        });
+        if let Some(id) = loose_predicate
+            && !loose.contains(&id)
+        {
+            loose.push(id);
+        }
         // The sources share the scan's budget: each holds its current batch
         // and what its cursor read ahead within an equal part of it.
         let share = scan.budget / (segments.len() as u64).max(1);
@@ -199,6 +217,7 @@ impl MergeStream {
             dropped,
             fields,
             loose,
+            loose_predicate,
             deletes,
             rts,
             last_key: None,
@@ -487,9 +506,10 @@ impl MergeStream {
     /// the chosen cells. The seqno column is written with each row's effective
     /// seqno, since the rows come from segments with different bases.
     ///
-    /// Also returns whether the predicate can judge the rows: `false` when
-    /// they do not all carry its loose column under one type, which the batch
-    /// then leaves out.
+    /// A loose column the chosen rows do not all carry under one type is left
+    /// out, so a projected one fails the rows once they are conformed. Also
+    /// returns whether the predicate can judge the rows: `false` when its
+    /// loose column is left out.
     fn build(&self, pending: &[Pick]) -> crate::Result<(ColumnBatch, bool)> {
         use crate::table::columnar::{Column, frame_bytes_column, gather_fixed_column};
 
@@ -497,22 +517,29 @@ impl MergeStream {
             Error::InvalidHeader("columnar_scan: a chosen row's batch was not kept");
         let batch_of = |pick: &Pick| self.sources.get(pick.source).and_then(|s| s.batch.as_ref());
         let template = pending.first().and_then(batch_of).ok_or(NOT_KEPT)?;
-        let loose_of = |batch: &ColumnBatch| {
-            self.loose.and_then(|id| {
-                batch
-                    .columns
-                    .iter()
-                    .find(|c| c.column_id == id)
-                    .map(|c| c.type_tag)
-            })
+        let type_of = |batch: &ColumnBatch, id: u16| {
+            batch
+                .columns
+                .iter()
+                .find(|c| c.column_id == id)
+                .map(|c| c.type_tag)
         };
-        let loose_type = loose_of(template);
-        let mut judged = true;
-        for source in self.sources.iter().filter(|s| s.referenced) {
-            let batch = source.batch.as_ref().ok_or(NOT_KEPT)?;
-            judged &= loose_of(batch) == loose_type;
+        let mut left_out: Vec<u16> = Vec::new();
+        for &id in &self.loose {
+            let expected = type_of(template, id);
+            for source in self.sources.iter().filter(|s| s.referenced) {
+                let batch = source.batch.as_ref().ok_or(NOT_KEPT)?;
+                if type_of(batch, id) != expected {
+                    left_out.push(id);
+                    break;
+                }
+            }
         }
-        let kept = |id: u16| judged || Some(id) != self.loose;
+        let judged = self
+            .loose_predicate
+            .is_none_or(|id| !left_out.contains(&id));
+        let uniform = left_out.is_empty();
+        let kept = |id: u16| !left_out.contains(&id);
         let heads: Vec<(u16, TypeTag)> = template
             .columns
             .iter()
@@ -524,7 +551,7 @@ impl MergeStream {
         // names the same column in each; otherwise each source's places of
         // the kept columns are found once.
         let mut places: Option<Vec<Vec<usize>>> =
-            (!judged).then(|| alloc::vec![Vec::new(); self.sources.len()]);
+            (!uniform).then(|| alloc::vec![Vec::new(); self.sources.len()]);
         for (i, source) in self
             .sources
             .iter()

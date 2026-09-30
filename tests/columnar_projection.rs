@@ -295,6 +295,44 @@ fn a_predicate_over_a_missing_field_runs_against_the_declared_default() -> lsm_t
     Ok(())
 }
 
+/// A column projected by id alone that an older, fully shadowed segment lacks
+/// does not fail the scan; a row returned without it does.
+#[test]
+fn a_shadowed_version_without_a_column_projected_by_id_does_not_fail_the_scan()
+-> lsm_tree::Result<()> {
+    let by_id = Projection::new().column(COL_USER_KEY).column(4);
+    let fourth = |tree: &lsm_tree::Tree| -> lsm_tree::Result<Vec<(Vec<u8>, u32)>> {
+        let mut got = Vec::new();
+        for batch in tree.columnar_scan(&by_id, None, SeqNo::MAX, ..)? {
+            let batch = batch?;
+            let (keys, fourth) = (&batch.columns[0], &batch.columns[1]);
+            for row in 0..batch.row_count {
+                let at = row as usize * 4;
+                got.push((
+                    bytes_cell(&keys.data, batch.row_count, row),
+                    u32::from_le_bytes(fourth.data[at..at + 4].try_into().expect("u32 cell")),
+                ));
+            }
+        }
+        Ok(got)
+    };
+
+    let folder = get_tmp_folder();
+    let any = open_columnar(folder.path());
+    ingest(&any, &[0], &[(3, &[10])]);
+    ingest(&any, &[0], &[(3, &[100]), (4, &[400])]);
+    assert_eq!(vec![(key(0), 400)], fourth(standard(&any))?);
+
+    // The newest version lacks it: the row returned is refused.
+    let folder = get_tmp_folder();
+    let any = open_columnar(folder.path());
+    ingest(&any, &[0], &[(3, &[10]), (4, &[40])]);
+    ingest(&any, &[0], &[(3, &[100])]);
+    let got = fourth(standard(&any));
+    assert!(matches!(got, Err(Error::Projection(_))), "got {got:?}");
+    Ok(())
+}
+
 /// A newer version written without field 4 does not take the older
 /// version's field 4: absence reads as declared, not by inheritance.
 #[test]
@@ -525,6 +563,70 @@ fn a_merge_chain_over_a_columnar_base_returns_the_merged_fields() -> lsm_tree::R
     tree.merge(key(0), 2u32.to_le_bytes(), seqno);
     assert_eq!(
         vec![(key(0), Some(42)), (key(1), Some(41))],
+        rows(tree, &projected())?,
+    );
+    Ok(())
+}
+
+/// A version newer than the snapshot is never handed to the projector, so one
+/// it cannot read does not fail a scan of an older snapshot; on a table read
+/// alone and on overlapping tables merged alike.
+#[test]
+fn a_version_newer_than_the_snapshot_is_not_projected() -> lsm_tree::Result<()> {
+    let folder = get_tmp_folder();
+    let any = open_columnar(folder.path());
+    let tree = standard(&any);
+    tree.insert(key(0), row_value(10, 40), 1);
+    tree.insert(key(0), b"not two cells".to_vec(), 4);
+    tree.flush_active_memtable(0)?;
+    let scan_at = |snapshot: SeqNo| -> lsm_tree::Result<Vec<(Vec<u8>, u32)>> {
+        let mut got = Vec::new();
+        for batch in tree.columnar_scan(projected(), None, snapshot, ..)? {
+            let batch = batch?;
+            let (keys, fourth) = (&batch.columns[0], &batch.columns[2]);
+            for row in 0..batch.row_count {
+                let at = row as usize * 4;
+                got.push((
+                    bytes_cell(&keys.data, batch.row_count, row),
+                    u32::from_le_bytes(fourth.data[at..at + 4].try_into().expect("u32 cell")),
+                ));
+            }
+        }
+        Ok(got)
+    };
+    assert_eq!(vec![(key(0), 40)], scan_at(3)?, "a table read alone");
+
+    // A second table over the same keys, also newer than the snapshot in
+    // part: the two are merged.
+    tree.insert(key(1), row_value(11, 41), 2);
+    tree.insert(key(1), b"not two cells".to_vec(), 5);
+    tree.flush_active_memtable(0)?;
+    assert_eq!(
+        vec![(key(0), 40), (key(1), 41)],
+        scan_at(3)?,
+        "overlapping tables merged"
+    );
+    Ok(())
+}
+
+/// Without a merge operator a read returns an operand's bytes as the value,
+/// so the scan reads its fields through the projector the same way.
+#[test]
+fn an_operand_without_a_merge_operator_is_projected_as_the_read_returns_it() -> lsm_tree::Result<()>
+{
+    let folder = get_tmp_folder();
+    let any = open_columnar(folder.path());
+    ingest(&any, &[0, 1], &[(3, &[10, 11]), (4, &[40, 41])]);
+    let tree = standard(&any);
+    let seqno = tree.get_highest_seqno().map_or(0, |s| s + 1);
+    tree.merge(key(0), row_value(100, 400), seqno);
+    assert_eq!(
+        Some(row_value(100, 400).into()),
+        tree.get(key(0), SeqNo::MAX)?,
+        "a read returns the operand"
+    );
+    assert_eq!(
+        vec![(key(0), Some(400)), (key(1), Some(41))],
         rows(tree, &projected())?,
     );
     Ok(())
