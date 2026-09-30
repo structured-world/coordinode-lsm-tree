@@ -68,8 +68,23 @@ struct CrashState {
     /// `crash()` visits these (plus `durable` keys) to roll back or remove.
     touched: HashSet<PathBuf>,
     /// Paths whose directory entry was made this run and whose parent
-    /// directory has not been synced since: `crash()` removes them.
-    pending_entries: HashSet<PathBuf>,
+    /// directory has not been synced since: `crash()` removes them. Each maps
+    /// to the generation it was made in, so a sync clears only the entries it
+    /// saw and not one made again at the same path while it ran.
+    pending_entries: HashMap<PathBuf, u64>,
+    /// Generation of the last entry made.
+    entry_generation: u64,
+}
+
+impl CrashState {
+    /// Records a new directory entry at `path`, durable once its directory is
+    /// synced.
+    fn mark_pending(&mut self, path: &Path) {
+        // One step per entry made in a run: a u64 does not wrap.
+        self.entry_generation += 1;
+        self.pending_entries
+            .insert(path.to_path_buf(), self.entry_generation);
+    }
 }
 
 /// A power-loss crash simulator wrapping an inner [`Fs`].
@@ -123,7 +138,11 @@ impl CrashFs {
         let mut state = self.state.lock();
         // An entry its directory never made durable is lost with whatever
         // content it had.
-        let lost: Vec<PathBuf> = state.pending_entries.drain().collect();
+        let lost: Vec<PathBuf> = state
+            .pending_entries
+            .drain()
+            .map(|(path, _)| path)
+            .collect();
         for path in &lost {
             state.durable.remove(path);
             state.touched.insert(path.clone());
@@ -218,27 +237,31 @@ impl CrashFs {
     /// Records that `path` got a new directory entry, durable once its parent
     /// directory is synced.
     fn new_entry(&self, path: &Path) {
-        self.state.lock().pending_entries.insert(path.to_path_buf());
+        self.state.lock().mark_pending(path);
     }
 
-    /// The pending entries of `directory`, taken before a sync of it: the ones
-    /// that sync makes durable. An entry made while the sync runs is left for
-    /// the next one.
-    fn entries_of(&self, directory: &Path) -> Vec<PathBuf> {
+    /// The pending entries of `directory` with their generations, taken
+    /// before a sync of it: the ones that sync makes durable. An entry made
+    /// while the sync runs, at a new path or again at one of these, is left
+    /// for the next one.
+    fn entries_of(&self, directory: &Path) -> Vec<(PathBuf, u64)> {
         self.state
             .lock()
             .pending_entries
             .iter()
-            .filter(|entry| crate::file::entry_directory(entry) == directory)
-            .cloned()
+            .filter(|(entry, _)| crate::file::entry_directory(entry) == directory)
+            .map(|(entry, generation)| (entry.clone(), *generation))
             .collect()
     }
 
-    /// Makes `entries` durable, after a sync of their directory.
-    fn entries_synced(&self, entries: &[PathBuf]) {
+    /// Makes `entries` durable, after a sync of their directory: each one
+    /// that is still the generation the sync saw.
+    fn entries_synced(&self, entries: &[(PathBuf, u64)]) {
         let mut state = self.state.lock();
-        for entry in entries {
-            state.pending_entries.remove(entry);
+        for (entry, generation) in entries {
+            if state.pending_entries.get(entry) == Some(generation) {
+                state.pending_entries.remove(entry);
+            }
         }
     }
 
@@ -270,7 +293,7 @@ impl CrashFs {
             state.durable.insert(dst.to_path_buf(), bytes);
         }
         state.touched.insert(dst.to_path_buf());
-        state.pending_entries.insert(dst.to_path_buf());
+        state.mark_pending(dst);
         Ok(())
     }
 }
@@ -326,7 +349,7 @@ impl Fs for CrashFs {
         let mut state = self.state.lock();
         state.durable.retain(|k, _| !k.starts_with(path));
         state.touched.retain(|k| !k.starts_with(path));
-        state.pending_entries.retain(|k| !k.starts_with(path));
+        state.pending_entries.retain(|k, _| !k.starts_with(path));
         Ok(())
     }
 
@@ -361,7 +384,7 @@ impl Fs for CrashFs {
         }
         // The destination's entry is new until its directory is synced.
         state.pending_entries.remove(from);
-        state.pending_entries.insert(to.to_path_buf());
+        state.mark_pending(to);
         Ok(())
     }
 

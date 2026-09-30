@@ -87,6 +87,40 @@ fn a_rename_without_a_directory_sync_is_lost() {
     );
 }
 
+/// A directory sync makes durable the entries it saw, not a later entry at the
+/// same path: an entry removed and made again while the sync runs was made
+/// after the barrier, so it stays pending and a crash removes it.
+#[test]
+fn an_entry_made_again_while_its_directory_syncs_stays_pending() {
+    let fs = CrashFs::new(MemFs::new());
+    fs.create_dir_all(Path::new("/d")).unwrap();
+    let write = |bytes: &[u8]| {
+        let mut f = fs
+            .open(
+                Path::new("/d/a"),
+                &FsOpenOptions::new().write(true).create(true).truncate(true),
+            )
+            .unwrap();
+        f.write_all(bytes).unwrap();
+        f.sync_all().unwrap();
+    };
+    write(b"first");
+
+    // The sync of /d starts: it takes the entries it will make durable.
+    let seen = fs.entries_of(Path::new("/d"));
+    // While it runs, the entry is removed and made again.
+    fs.remove_file(Path::new("/d/a")).unwrap();
+    write(b"second");
+    // The sync returns.
+    fs.entries_synced(&seen);
+
+    fs.crash();
+    assert!(
+        !fs.exists(Path::new("/d/a")).unwrap(),
+        "an entry made after the directory sync began is not durable"
+    );
+}
+
 /// A rename onto its own path changes nothing on disk (POSIX rename(2): same
 /// file, no-op), so a file that was durable before it stays durable.
 #[test]
