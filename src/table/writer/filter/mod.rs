@@ -12,9 +12,22 @@ use crate::{
     CompressionType, UserKey, checksum::ChecksummedWriter, config::BloomConstructionPolicy,
     encryption::EncryptionProvider, prefix::PrefixExtractor,
 };
-#[cfg(not(feature = "std"))]
-use alloc::boxed::Box;
 use alloc::sync::Arc;
+#[cfg(not(feature = "std"))]
+use alloc::{boxed::Box, vec::Vec};
+
+/// What a filter writer wrote into its table.
+#[derive(Clone, Copy, Debug, Default, PartialEq, Eq)]
+pub struct FilterOutput {
+    /// Filter blocks written: one for a full filter, one per partition.
+    pub blocks: usize,
+    /// Hashes the filters hold: a key's, and under a prefix extractor each
+    /// distinct prefix's. Zero when no filter was written.
+    pub hashes: u64,
+    /// Hashes of the largest partition of a partitioned filter; zero for a
+    /// full filter.
+    pub partition_hashes: u64,
+}
 
 // All methods are required (no defaults) by design so that implementations must
 // explicitly handle configuration changes (e.g., filter policies, prefix extractors).
@@ -36,13 +49,11 @@ pub trait FilterWriter<W: crate::io::Write + crate::io::Seek> {
     /// estimated from what is held now.
     fn finish_output_bytes(&self) -> u64;
 
-    /// Writes the filter to a file.
-    ///
-    /// Returns the number of filter blocks written (always 1 in case of full filter block).
+    /// Writes the filter to a file, and returns what it wrote.
     fn finish(
         self: Box<Self>,
         file_writer: &mut crate::sfa::Writer<ChecksummedWriter<W>>,
-    ) -> crate::Result<usize>;
+    ) -> crate::Result<FilterOutput>;
 
     fn set_filter_policy(
         self: Box<Self>,
@@ -98,4 +109,96 @@ pub trait FilterWriter<W: crate::io::Write + crate::io::Seek> {
         self: Box<Self>,
         parallel: Option<crate::table::writer::ParallelCompression>,
     ) -> Box<dyn FilterWriter<W>>;
+
+    /// Chooses each filter's width by probe load against the tree's filter
+    /// budget instead of building every one at the filter policy. `None`
+    /// builds at the policy.
+    fn use_sizing(
+        self: Box<Self>,
+        sizing: Option<crate::filter_budget::FilterPlan>,
+    ) -> Box<dyn FilterWriter<W>>;
+
+    /// The table's first and last key, given before [`finish`](Self::finish)
+    /// so a sized filter knows the key range its load is drawn over.
+    fn set_key_range(&mut self, first: &UserKey, last: &UserKey);
+}
+
+/// The on-disk bytes of an uncompressed filter block of `len` payload bytes.
+fn framed_filter_len(
+    len: u64,
+    encryption: Option<&dyn EncryptionProvider>,
+    ecc: Option<crate::table::block::EccParams>,
+) -> u64 {
+    crate::table::block::framed_len_bound(
+        len,
+        crate::table::block::BlockType::Filter,
+        CompressionType::None,
+        encryption,
+        ecc,
+    )
+}
+
+/// A filter budget plan, and the key range of the filter it sizes.
+type SizedFilter<'a> = (
+    &'a crate::filter_budget::FilterSizing,
+    (core::ops::Bound<&'a [u8]>, core::ops::Bound<&'a [u8]>),
+);
+
+/// Builds the filter over `hashes`, those of `keys` keys and their prefixes:
+/// at `policy`, or, when the tree sizes its filters, at the first candidate
+/// width over the keys in `bounds` whose encoded block the filter budget
+/// admits.
+fn build_filter(
+    policy: BloomConstructionPolicy,
+    sizing: Option<SizedFilter<'_>>,
+    hashes: Vec<u64>,
+    keys: usize,
+    encryption: Option<&dyn EncryptionProvider>,
+    ecc: Option<crate::table::block::EccParams>,
+) -> crate::Result<Vec<u8>> {
+    let Some((sizing, bounds)) = sizing else {
+        return crate::table::filter::build_burr_filter_bytes(policy, hashes);
+    };
+    let n = hashes.len();
+    let frame = |len: u64| framed_filter_len(len, encryption, ecc);
+    #[expect(
+        clippy::cast_possible_truncation,
+        clippy::cast_sign_loss,
+        reason = "a non-negative byte count of one filter"
+    )]
+    let estimated =
+        |policy: BloomConstructionPolicy| frame(libm::round(policy.expected_filter_size(n)) as u64);
+    let mut candidates = sizing.candidates(bounds, n)?;
+    let Some(narrowest) = candidates.pop() else {
+        return crate::table::filter::build_burr_filter_bytes(policy, hashes);
+    };
+    for candidate in candidates {
+        // A refused build is retried narrower, so each attempt but the last
+        // builds from a copy.
+        let bytes = crate::table::filter::build_burr_filter_bytes(candidate, hashes.clone())?;
+        if sizing.admit(
+            bounds,
+            n,
+            keys,
+            frame(bytes.len() as u64),
+            estimated(candidate),
+            &frame,
+            false,
+        ) {
+            return Ok(bytes);
+        }
+    }
+    let bytes = crate::table::filter::build_burr_filter_bytes(narrowest, hashes)?;
+    // The narrowest is taken whether or not it fits.
+    let admitted = sizing.admit(
+        bounds,
+        n,
+        keys,
+        frame(bytes.len() as u64),
+        estimated(narrowest),
+        &frame,
+        true,
+    );
+    debug_assert!(admitted, "the last candidate is always taken");
+    Ok(bytes)
 }

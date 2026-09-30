@@ -41,6 +41,35 @@ pub enum StorageStatus {
     CompactionInProgress,
 }
 
+/// A point-in-time view of the memory a tree's filters take, from
+/// [`crate::AbstractTree::filter_memory`].
+///
+/// Two figures, because they differ: every live filter is serialised on disk,
+/// but only a pinned filter or a filter block the block cache holds is in
+/// memory. A [`FilterAdvisor`](crate::config::FilterAdvisor) budget bounds
+/// the serialised bytes.
+#[must_use]
+#[derive(Copy, Clone, Debug, Eq, PartialEq)]
+pub struct FilterMemory {
+    /// On-disk bytes of the live tables' filter sections, what
+    /// [`crate::AbstractTree::filter_size`] reports.
+    pub serialised_bytes: u64,
+
+    /// Filter bytes in memory now: pinned filters, plus filter blocks the
+    /// block cache holds, at their on-disk size.
+    pub resident_bytes: u64,
+
+    /// The budget a filter advisor allocates against, when the tree has one.
+    pub budget_bytes: Option<u64>,
+
+    /// Whether the live filters exceed that budget: `serialised_bytes` past
+    /// `budget_bytes`. Existing filters shrink only when their tables are
+    /// rewritten, and a rewrite with no narrower width left writes past the
+    /// budget, so the tree can stay here for a while after the budget is
+    /// lowered or the keys outgrow it.
+    pub over_budget: bool,
+}
+
 /// A point-in-time snapshot of a tree's on-disk storage footprint and the
 /// average shape of a stored entry.
 ///

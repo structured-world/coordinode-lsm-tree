@@ -502,6 +502,33 @@ pub trait AbstractTree: sealed::Sealed {
             .collect::<Vec<_>>();
 
         let flushed_size = latest.sealed_memtables.iter().map(|mt| mt.size()).sum();
+        // The keys the flush's filters cover and the hashes they hold, which
+        // the filter plan keeps room for: counted only when a filter budget
+        // plans them, over the merge the flush writes, so a key in several
+        // memtables counts once.
+        let flushed = if self.tree_config().filter_advisor.is_some() {
+            // A partitioned filter holds no prefix hashes.
+            let prefixes = if self.tree_config().filter_block_partitioning_policy.get(0) {
+                None
+            } else {
+                self.tree_config().prefix_extractor.as_deref()
+            };
+            let merged = Merger::new(
+                latest
+                    .sealed_memtables
+                    .iter()
+                    .map(|mt| mt.iter().map(Ok))
+                    .collect::<Vec<_>>(),
+                self.tree_config().comparator.clone(),
+            );
+            // Memtable entries read without I/O: the merge yields no error.
+            crate::memtable::filter_count(
+                merged.filter_map(|item| item.ok().map(|item| item.key.user_key)),
+                prefixes,
+            )
+        } else {
+            crate::filter_budget::FilterCount::default()
+        };
 
         // AtInsert residence check: verify each sealed memtable's insert-time
         // per-KV digests against a recompute over the entries' current bytes
@@ -554,9 +581,12 @@ pub trait AbstractTree: sealed::Sealed {
         // Clone needed: flush_to_tables_with_rt consumes the Vec, but on the
         // RT-only path (no KV data, tables.is_empty()) we re-insert RTs into the
         // active memtable. Flush is infrequent and RT count is small.
-        if let Some((tables, blob_files, write_pin)) =
-            self.flush_to_tables_with_rt(stream, range_tombstones.clone())?
-        {
+        if let Some((tables, blob_files, write_pin)) = self.flush_to_tables_with_rt(
+            stream,
+            range_tombstones.clone(),
+            flushed.keys,
+            flushed.hashes,
+        )? {
             // If no tables were produced (RT-only memtable), re-insert RTs
             // into active memtable so they aren't lost
             if tables.is_empty() && !range_tombstones.is_empty() {
@@ -777,6 +807,33 @@ pub trait AbstractTree: sealed::Sealed {
     /// Gets the memory usage of all pinned filters in the tree.
     fn pinned_filter_size(&self) -> usize;
 
+    /// The serialised and the resident bytes of the tree's filters, and how
+    /// they stand against a [`FilterAdvisor`](crate::config::FilterAdvisor)
+    /// budget.
+    ///
+    /// Looks up each live table's filter blocks in the block cache without
+    /// counting a hit.
+    ///
+    /// # Examples
+    ///
+    /// ```
+    /// use lsm_tree::{AbstractTree, Config, config::FilterAdvisor};
+    ///
+    /// # let folder = tempfile::tempdir()?;
+    /// let tree = Config::new(&folder, Default::default(), Default::default())
+    ///     .filter_advisor(Some(FilterAdvisor::new(64 * 1_024)))
+    ///     .open()?;
+    /// tree.insert("a", "value", 0);
+    /// tree.flush_active_memtable(0)?;
+    ///
+    /// let memory = tree.filter_memory();
+    /// assert_eq!(memory.serialised_bytes, tree.filter_size());
+    /// assert_eq!(memory.budget_bytes, Some(64 * 1_024));
+    /// assert!(!memory.over_budget);
+    /// # Ok::<(), lsm_tree::Error>(())
+    /// ```
+    fn filter_memory(&self) -> crate::FilterMemory;
+
     /// Gets the memory usage of all pinned index blocks in the tree.
     fn pinned_block_index_size(&self) -> usize;
 
@@ -815,10 +872,19 @@ pub trait AbstractTree: sealed::Sealed {
         &self,
         stream: impl Iterator<Item = crate::Result<InternalValue>>,
     ) -> crate::Result<Option<FlushToTablesResult>> {
-        self.flush_to_tables_with_rt(stream, Vec::new())
+        // The stream's upper bound, when it tells one, is the most entries it
+        // holds; the hashes over them are learnt from the first filter.
+        let keys = stream
+            .size_hint()
+            .1
+            .map_or(0, |upper| u64::try_from(upper).unwrap_or(u64::MAX));
+        self.flush_to_tables_with_rt(stream, Vec::new(), keys, keys)
     }
 
     /// Like [`AbstractTree::flush_to_tables`], but also writes range tombstones.
+    /// `keys` bounds the distinct keys of `stream` from above and `hashes` the
+    /// filter hashes over them, zero when unknown: a filter advisor keeps room
+    /// for every table the flush writes by them.
     ///
     /// This is an internal extension hook on the crate's sealed tree types and
     /// is hidden from generated documentation.
@@ -831,6 +897,8 @@ pub trait AbstractTree: sealed::Sealed {
         &self,
         stream: impl Iterator<Item = crate::Result<InternalValue>>,
         range_tombstones: Vec<crate::range_tombstone::RangeTombstone>,
+        keys: u64,
+        hashes: u64,
     ) -> crate::Result<Option<FlushToTablesResult>>;
 
     /// Atomically registers flushed tables into the tree, removing their associated sealed memtables.

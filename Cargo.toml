@@ -345,6 +345,12 @@ path = "benches/blob_locality.rs"
 required-features = ["metrics"]
 
 [[bench]]
+name = "filter_advisor"
+harness = false
+path = "benches/filter_advisor.rs"
+required-features = ["metrics"]
+
+[[bench]]
 name = "dict_ratio"
 harness = false
 path = "benches/dict_ratio.rs"

@@ -201,6 +201,11 @@ pub struct SuperVersions {
     /// without the lock-free mirror.
     #[cfg(feature = "std")]
     latest: Arc<ArcSwap<SuperVersion>>,
+
+    /// The tree's filter budget, when it allocates filter memory by probe
+    /// load: every version this history publishes updates the filter bytes
+    /// it holds.
+    filter_budget: Option<Arc<crate::filter_budget::FilterBudget>>,
 }
 
 impl SuperVersions {
@@ -239,7 +244,20 @@ impl SuperVersions {
             log_rotate_bytes,
             log_bytes: None,
             edit_scratch: Vec::new(),
+            filter_budget: None,
         }
+    }
+
+    /// Makes every version this history publishes, the current one first,
+    /// update `budget`'s held filter bytes.
+    #[must_use]
+    pub(crate) fn with_filter_budget(
+        mut self,
+        budget: Arc<crate::filter_budget::FilterBudget>,
+    ) -> Self {
+        budget.publish(&self.current.version);
+        self.filter_budget = Some(budget);
+        self
     }
 
     /// Modifies the level manifest atomically.
@@ -491,6 +509,9 @@ impl SuperVersions {
     /// Makes `version` the current one. The replaced version stays alive only
     /// in the readers that already hold it.
     pub fn append_version(&mut self, version: SuperVersion) {
+        if let Some(budget) = &self.filter_budget {
+            budget.publish(&version.version);
+        }
         // Mirror it into the lock-free pointer so reads see it without taking
         // the history lock.
         #[cfg(feature = "std")]

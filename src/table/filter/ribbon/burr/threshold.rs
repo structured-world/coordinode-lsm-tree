@@ -34,6 +34,11 @@ use alloc::vec::Vec;
 const CAP_NUM: usize = 9;
 const CAP_DEN: usize = 10;
 
+/// The keys a block of `b` rows keeps before its threshold bumps the rest.
+pub(crate) const fn block_capacity(b: usize) -> usize {
+    (b * CAP_NUM) / CAP_DEN
+}
+
 /// Compute per-block thresholds for a layer.
 ///
 /// Returns `Vec<u8>` of length `block_count = ceil(m / b)`. Entry `i` is
@@ -74,7 +79,7 @@ pub(crate) fn compute_thresholds(equations: &[StandardEquation], m: usize, b: u8
 
     let b_usize = usize::from(b);
     let block_count = m.div_ceil(b_usize);
-    let cap_per_block = (b_usize * CAP_NUM) / CAP_DEN;
+    let cap_per_block = block_capacity(b_usize);
 
     // First pass: count keys per block to size each bucket exactly.
     let mut block_counts = vec![0_usize; block_count];

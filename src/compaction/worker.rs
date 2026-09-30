@@ -100,6 +100,10 @@ pub struct Options {
     /// healing rewrite, so the bitrot stays on disk indefinitely.
     pub heal_hints: Arc<crate::heal_hints::HealHints>,
 
+    /// Whether the tree's filters exceed their budget, which a compaction's
+    /// filter plan reads and updates.
+    pub filter_budget: Arc<crate::filter_budget::FilterBudget>,
+
     /// Shared handle to the live runtime config. Compaction loads
     /// a fresh snapshot via [`crate::runtime_config::handle::RuntimeConfigHandle::load_full`]
     /// each time it writes the manifest, so toggles applied via
@@ -140,6 +144,7 @@ impl Options {
             compaction_state: tree.compaction_state.clone(),
             deletion_pause: tree.deletion_pause.clone(),
             heal_hints: tree.heal_hints.clone(),
+            filter_budget: tree.filter_budget.clone(),
             runtime_config: tree.runtime_config.clone(),
             encryption: tree.config.encryption.clone(),
             // The tree's one budget, not a fresh one: see
@@ -1568,13 +1573,26 @@ fn run_tight_space_compaction(
                 None
             };
 
+            let span = (lower.clone(), Bound::Excluded(boundary.clone()));
+            // Planned per slice over its current views: a plan holds the views
+            // it inherits from, and a view held past its slice would block the
+            // punch of its consumed prefix. Held until the slice's install, so
+            // the filter budget keeps the room its outputs take until then.
+            let filter_sizing = super::flavour::plan_filters(
+                &version.version,
+                opts,
+                &slice_payload,
+                &[],
+                Some(span.clone()),
+                &rc,
+            );
             let produced = run_subcompaction(
                 opts,
                 &slice_payload,
                 &version.version,
                 Vec::new(),
                 &rts,
-                (lower.clone(), Bound::Excluded(boundary.clone())),
+                span,
                 dst_lvl,
                 bottommost_gc,
                 // Slices apply no removal semantics; see the parameter docs.
@@ -1582,6 +1600,7 @@ fn run_tight_space_compaction(
                 &blobs_folder,
                 reloc,
                 &rc,
+                filter_sizing.clone(),
             )?;
             drop(version);
 
@@ -1602,6 +1621,7 @@ fn run_tight_space_compaction(
                     read_budget: opts.config.columnar_read_budget,
                     #[cfg(feature = "std")]
                     background_deleter: None,
+                    track_filter_probes: opts.config.filter_advisor.is_some(),
                 });
             }
             // KV-separation: blob files this slice relocated live entries into,
@@ -1692,6 +1712,10 @@ fn run_tight_space_compaction(
                 }
                 e
             };
+
+            // The slice's outputs take the share of the probe counts the prefix
+            // they rewrote holds; the restricted views keep the suffix's.
+            crate::table::probe_stats::inherit_into(&outputs, &current_views).map_err(rollback)?;
 
             // Re-open each stale blob file as a distinct Inner: the re-opened view
             // replaces the original in the new version (same id), and the original
@@ -1787,12 +1811,19 @@ fn run_tight_space_compaction(
                     read_budget: opts.config.columnar_read_budget,
                     #[cfg(feature = "std")]
                     background_deleter: None,
+                    // A blob file has no filter.
+                    track_filter_probes: false,
                 });
             }
 
             #[cfg(test)]
             opts.config.fire_before_output_install();
 
+            // The edit drops the fully consumed inputs' filters from the
+            // published figure; the plan gives back its credit for them first.
+            if let Some(sizing) = &filter_sizing {
+                sizing.release_replaced();
+            }
             // Install one atomic, durable version edit for the slice.
             let install = opts.version_history.write().upgrade_version(
                 &opts.config.path,
@@ -1826,6 +1857,9 @@ fn run_tight_space_compaction(
                 // space is freed now instead of at the next orphan sweep.
                 return Err(rollback(e));
             }
+            // The published version counts the outputs' filters now, and the
+            // plan's views must not outlive the slice.
+            drop(filter_sizing);
 
             // Mark, then punch. The install committed, so now record each restricted
             // input's exact bound to its `.restrict-bound` sidecar — STRICTLY AFTER
@@ -1970,6 +2004,14 @@ fn run_tight_space_compaction(
             &blobs_folder,
             tail_reloc,
             &rc,
+            super::flavour::plan_filters(
+                &version.version,
+                opts,
+                &slice_payload,
+                &[],
+                Some((lower.clone(), Bound::Unbounded)),
+                &rc,
+            ),
         )?;
         drop(version);
         let tail_out = produced.created_tables().len();
@@ -2052,6 +2094,9 @@ fn run_subcompaction(
     // (or slices): one configuration for everything the compaction writes, the
     // filter's blob files included, held until the output is installed.
     rc: &Arc<crate::runtime_config::RuntimeConfig>,
+    // The compaction's filter plan, shared by all of its sub-compactions (or
+    // slices) so they draw on one reservation of the filter budget.
+    filter_sizing: Option<crate::filter_budget::FilterPlan>,
 ) -> crate::Result<super::flavour::ProducedOutput> {
     use super::flavour::CompactionFlavour;
 
@@ -2194,6 +2239,7 @@ fn run_subcompaction(
         version,
         opts,
         payload,
+        filter_sizing,
         false,
         transform_marker,
         false,
@@ -3048,6 +3094,16 @@ fn merge_tables(
             // One runtime snapshot for the whole compaction, taken before it
             // splits: every range writes under the same configuration.
             let rc = opts.runtime_config.load_full();
+            // One filter plan too, so the ranges share one filter budget, and
+            // price by what every range has still to write.
+            let filter_sizing = super::flavour::plan_filters(
+                &current_super_version.version,
+                opts,
+                payload,
+                &boundaries,
+                None,
+                &rc,
+            );
 
             let outputs: Vec<crate::Result<super::flavour::ProducedOutput>> =
                 if let Some(spawner) = opts.config.compaction_pool.clone() {
@@ -3066,6 +3122,7 @@ fn merge_tables(
                         let rts = Arc::clone(&rts);
                         let blobs = Arc::clone(&blobs);
                         let rc = Arc::clone(&rc);
+                        let filter_sizing = filter_sizing.clone();
                         let tables_for_deletion = only_first_owns_inputs(idx);
                         spawner.spawn(Box::new(move || {
                             let out = run_subcompaction(
@@ -3083,6 +3140,7 @@ fn merge_tables(
                                 // blob defrag is the serial slice loop's domain.
                                 None,
                                 &rc,
+                                filter_sizing,
                             );
                             // The receiver outlives every send (it drains N
                             // items below), so this cannot fail.
@@ -3129,6 +3187,7 @@ fn merge_tables(
                                 &blobs_folder,
                                 None,
                                 &rc,
+                                filter_sizing.clone(),
                             )
                         })
                         .collect()
@@ -3324,6 +3383,14 @@ fn merge_tables(
         &current_super_version.version,
         opts,
         payload,
+        super::flavour::plan_filters(
+            &current_super_version.version,
+            opts,
+            payload,
+            &[],
+            None,
+            &rc,
+        ),
         true,
         transform_marker,
         true,

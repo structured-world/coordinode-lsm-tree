@@ -9,14 +9,12 @@ use crate::{
     config::BloomConstructionPolicy,
     encryption::EncryptionProvider,
     prefix::PrefixExtractor,
-    table::{
-        Block, BlockHandle, BlockOffset, IndexBlock, KeyedBlockHandle,
-        filter::build_burr_filter_bytes,
-    },
+    table::{Block, BlockHandle, BlockOffset, IndexBlock, KeyedBlockHandle},
 };
 use alloc::sync::Arc;
 #[cfg(not(feature = "std"))]
 use alloc::{boxed::Box, vec::Vec};
+use core::ops::Bound;
 
 // Concrete writers (sfa::Writer / ChecksummedWriter) carry the io trait via
 // their own impls; the defining trait must be in scope for raw method calls.
@@ -75,6 +73,26 @@ pub struct PartitionedFilterWriter {
     /// The partitions handed to workers and not yet published, oldest first.
     #[cfg(feature = "std")]
     pending: std::collections::VecDeque<PendingPartition>,
+
+    /// Chooses each partition's width when the tree allocates filter memory
+    /// by probe load; `bloom_policy` decides otherwise, and always decides
+    /// where a partition splits.
+    sizing: Option<crate::filter_budget::FilterPlan>,
+
+    /// The table's first key, the lower end of the first partition's range.
+    /// Kept only for a sized filter.
+    first_key: Option<UserKey>,
+
+    /// The last key of the partition spilled last, the lower end (excluded)
+    /// of the next one's range; the top-level index lags it while
+    /// partitions are on workers. Kept only for a sized filter.
+    spilled_key: Option<UserKey>,
+
+    /// Hashes the table's partitions hold so far, which `finish` reports.
+    table_hashes: usize,
+
+    /// Hashes of the largest partition so far, which `finish` reports.
+    largest_partition: usize,
 }
 
 impl PartitionedFilterWriter {
@@ -107,7 +125,20 @@ impl PartitionedFilterWriter {
             parallel: None,
             #[cfg(feature = "std")]
             pending: std::collections::VecDeque::new(),
+            sizing: None,
+            first_key: None,
+            spilled_key: None,
+            table_hashes: 0,
+            largest_partition: 0,
         }
+    }
+
+    /// The widest partition a build may produce, which the size estimates
+    /// bound.
+    fn bound_policy(&self) -> BloomConstructionPolicy {
+        self.sizing
+            .as_ref()
+            .map_or(self.bloom_policy, |sizing| sizing.bound_policy())
     }
 
     /// The top-level index's bytes once `finish` publishes the partitions
@@ -129,7 +160,7 @@ impl PartitionedFilterWriter {
     /// The open partition's filter bytes, bounded from above: what `finish`
     /// builds it into. The prediction that splits partitions is not a bound.
     fn open_partition_bound(&self) -> u64 {
-        self.bloom_policy
+        self.bound_policy()
             .filter_size_bound(self.bloom_hash_buffer.len()) as u64
     }
 
@@ -137,10 +168,26 @@ impl PartitionedFilterWriter {
     fn partition_settings(&self) -> PartitionSettings {
         PartitionSettings {
             bloom_policy: self.bloom_policy,
+            sizing: self
+                .sizing
+                .as_ref()
+                .map(crate::filter_budget::FilterPlan::sizing),
             table_id: self.table_id,
             encryption: self.encryption.clone(),
             ecc: self.ecc,
         }
+    }
+
+    /// The key range of the partition ending at `key`, which a sized
+    /// partition picks its width over: past the previous partition's last
+    /// key, or from the table's first key.
+    fn partition_range(&self, key: &UserKey) -> PartitionRange {
+        let lower = match (&self.spilled_key, &self.first_key) {
+            (Some(previous), _) => Bound::Excluded(previous.clone()),
+            (None, Some(first)) => Bound::Included(first.clone()),
+            (None, None) => Bound::Unbounded,
+        };
+        (lower, key.clone())
     }
 
     /// Builds the open partition from `hashes`, taken out of
@@ -149,6 +196,12 @@ impl PartitionedFilterWriter {
     fn spill_filter_partition(&mut self, key: &UserKey, hashes: Vec<u64>) -> crate::Result<()> {
         self.approx_filter_size = 0;
         let partition_index = self.tli_handles.len() + self.pending_count();
+        let range = self.partition_range(key);
+        self.table_hashes += hashes.len();
+        self.largest_partition = self.largest_partition.max(hashes.len());
+        if self.sizing.is_some() {
+            self.spilled_key = Some(key.clone());
+        }
         #[cfg(feature = "std")]
         if self.parallel.is_some() {
             // At the cap, one built partition is published before the next
@@ -161,9 +214,12 @@ impl PartitionedFilterWriter {
             {
                 self.publish_next()?;
             }
+            // A sized partition builds from a copy of its hashes while a
+            // narrower retry may still need them.
+            let copies = if self.sizing.is_some() { 2 } else { 1 };
             self.pending.push_back(PendingPartition {
                 key: key.clone(),
-                hash_bytes: (hashes.len() * core::mem::size_of::<u64>()) as u64,
+                hash_bytes: (copies * hashes.len() * core::mem::size_of::<u64>()) as u64,
                 framed: self.partition_bound(hashes.len()),
             });
             // Started on the first partition, once every setting is final.
@@ -181,6 +237,7 @@ impl PartitionedFilterWriter {
                 parallel.submit(PartitionJob {
                     hashes,
                     partition_index,
+                    range,
                 });
             }
             return Ok(());
@@ -189,6 +246,7 @@ impl PartitionedFilterWriter {
             &self.partition_settings(),
             hashes,
             partition_index,
+            &range,
             &mut self.final_filter_buffer,
         )?;
         self.record_partition(key, bytes_written);
@@ -246,7 +304,7 @@ impl PartitionedFilterWriter {
     #[cfg(feature = "std")]
     fn partition_bound(&self, hashes: usize) -> u64 {
         crate::table::block::framed_len_bound(
-            self.bloom_policy.filter_size_bound(hashes) as u64,
+            self.bound_policy().filter_size_bound(hashes) as u64,
             crate::table::block::BlockType::Filter,
             CompressionType::None,
             self.encryption.as_deref(),
@@ -327,22 +385,49 @@ impl PartitionedFilterWriter {
 /// What every partition of one table is built and framed under.
 struct PartitionSettings {
     bloom_policy: BloomConstructionPolicy,
+    /// The filter budget plan a sized partition picks its width by. Not a
+    /// [`crate::filter_budget::FilterPlan`]: a pool thread may let go of it
+    /// after the rewrite has ended, which must not delay the end.
+    sizing: Option<Arc<crate::filter_budget::FilterSizing>>,
     table_id: crate::TableId,
     encryption: Option<Arc<dyn EncryptionProvider>>,
     ecc: Option<crate::table::block::EccParams>,
 }
 
-/// Builds the filter of `hashes` and frames it onto `out`, returning the
-/// framed length. The frame's checksum is left unbound: its place in the
-/// file is known only when `finish` writes the partitions out.
+/// A partition's key range: from its lower bound through its last key.
+type PartitionRange = (Bound<UserKey>, UserKey);
+
+/// Builds the filter of `hashes`, over the keys of `range`, and frames it
+/// onto `out`, returning the framed length. The frame's checksum is left
+/// unbound: its place in the file is known only when `finish` writes the
+/// partitions out.
 fn build_partition(
     settings: &PartitionSettings,
     hashes: Vec<u64>,
     partition_index: usize,
+    range: &PartitionRange,
     out: &mut Vec<u8>,
 ) -> crate::Result<u32> {
     let hash_count = hashes.len();
-    let filter_bytes = build_burr_filter_bytes(settings.bloom_policy, hashes)?;
+    let sizing = settings.sizing.as_deref().map(|sizing| {
+        let (lower, upper) = range;
+        (
+            sizing,
+            (
+                lower.as_ref().map(AsRef::as_ref),
+                Bound::Included(upper.as_ref()),
+            ),
+        )
+    });
+    // A partition holds key hashes only (see `register_key`).
+    let filter_bytes = super::build_filter(
+        settings.bloom_policy,
+        sizing,
+        hashes,
+        hash_count,
+        settings.encryption.as_deref(),
+        settings.ecc,
+    )?;
 
     // An empty BuRR build result means the policy is inactive for this key
     // population (e.g. fpr <= 0 or bpk out of [1, 64]). For PARTITIONED
@@ -398,6 +483,8 @@ struct PartitionJob {
     hashes: Vec<u64>,
     /// Its place among the table's partitions, for the failure log.
     partition_index: usize,
+    /// The keys it covers, which a sized partition picks its width over.
+    range: PartitionRange,
 }
 
 #[cfg(feature = "std")]
@@ -408,7 +495,13 @@ impl crate::table::writer::ordered_pipeline::OrderedJob for PartitionJob {
 
     fn run(self, settings: &PartitionSettings) -> Self::Output {
         let mut framed = Vec::new();
-        let bytes = build_partition(settings, self.hashes, self.partition_index, &mut framed)?;
+        let bytes = build_partition(
+            settings,
+            self.hashes,
+            self.partition_index,
+            &self.range,
+            &mut framed,
+        )?;
         Ok((framed, bytes))
     }
 }
@@ -504,6 +597,18 @@ impl<W: crate::io::Write + crate::io::Seek> FilterWriter<W> for PartitionedFilte
         self
     }
 
+    fn use_sizing(
+        mut self: Box<Self>,
+        sizing: Option<crate::filter_budget::FilterPlan>,
+    ) -> Box<dyn FilterWriter<W>> {
+        self.sizing = sizing;
+        self
+    }
+
+    // Partitions are sized as they spill, before the table's last key is
+    // known; the first key is kept as keys arrive.
+    fn set_key_range(&mut self, _: &UserKey, _: &UserKey) {}
+
     fn use_partition_size(mut self: Box<Self>, size: u32) -> Box<dyn FilterWriter<W>> {
         self.partition_size = size;
         self
@@ -552,6 +657,9 @@ impl<W: crate::io::Write + crate::io::Seek> FilterWriter<W> for PartitionedFilte
             .bloom_policy
             .estimated_filter_size(self.bloom_hash_buffer.len());
 
+        if self.sizing.is_some() && self.first_key.is_none() {
+            self.first_key = Some(key.clone());
+        }
         self.last_key = Some(key.clone());
 
         if self.approx_filter_size >= self.partition_size as usize {
@@ -620,7 +728,14 @@ impl<W: crate::io::Write + crate::io::Seek> FilterWriter<W> for PartitionedFilte
         } else {
             0
         };
-        let open = build + filter + frame + growth;
+        // A sized partition builds from a copy of the hashes while a narrower
+        // retry may still need them.
+        let retry_copy = if self.sizing.is_some() {
+            (self.bloom_hash_buffer.len() * core::mem::size_of::<u64>()) as u64
+        } else {
+            0
+        };
+        let open = build + filter + frame + growth + retry_copy;
         // Then the top-level index, counted at its in-memory size, and its
         // framed copy.
         let tli = self.tli_at_finish() as u64;
@@ -671,10 +786,10 @@ impl<W: crate::io::Write + crate::io::Seek> FilterWriter<W> for PartitionedFilte
     fn finish(
         mut self: Box<Self>,
         file_writer: &mut crate::sfa::Writer<ChecksummedWriter<W>>,
-    ) -> crate::Result<usize> {
+    ) -> crate::Result<super::FilterOutput> {
         if self.last_key.is_none() {
             log::trace!("Filter writer has not seen any writes - not building filter");
-            return Ok(0);
+            return Ok(super::FilterOutput::default());
         }
 
         if !self.bloom_hash_buffer.is_empty() {
@@ -692,6 +807,9 @@ impl<W: crate::io::Write + crate::io::Seek> FilterWriter<W> for PartitionedFilte
         #[cfg(feature = "std")]
         while !self.pending.is_empty() {
             self.publish_next()?;
+        }
+        if let Some(sizing) = &self.sizing {
+            sizing.table_finished(self.table_hashes);
         }
 
         let index_base_offset = BlockOffset(file_writer.get_mut().stream_position()?);
@@ -724,6 +842,18 @@ impl<W: crate::io::Write + crate::io::Seek> FilterWriter<W> for PartitionedFilte
 
         self.write_top_level_index(file_writer, index_base_offset)?;
 
-        Ok(block_count)
+        Ok(super::FilterOutput {
+            blocks: block_count,
+            hashes: if block_count == 0 {
+                0
+            } else {
+                self.table_hashes as u64
+            },
+            partition_hashes: if block_count == 0 {
+                0
+            } else {
+                self.largest_partition as u64
+            },
+        })
     }
 }
