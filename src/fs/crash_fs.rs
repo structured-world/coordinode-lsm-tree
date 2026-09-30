@@ -270,8 +270,13 @@ impl CrashFs {
     /// Reads the baseline outside the state lock (mirroring
     /// [`Self::capture_first_touch`]) so backend I/O never runs under the mutex.
     fn track_copy(&self, src: &Path, dst: &Path) -> io::Result<()> {
+        // The backend made `dst` already: record it as a written, pending
+        // entry before the fallible baseline read, so a read that fails
+        // leaves an entry a crash removes rather than one it never saw.
         let (src_durable, src_touched) = {
-            let state = self.state.lock();
+            let mut state = self.state.lock();
+            state.touched.insert(dst.to_path_buf());
+            state.pending_entries.insert(dst.to_path_buf());
             (state.durable.get(src).cloned(), state.touched.contains(src))
         };
         let dst_image = match src_durable {
@@ -279,12 +284,9 @@ impl CrashFs {
             None if !src_touched => self.read_baseline(src)?,
             None => None,
         };
-        let mut state = self.state.lock();
         if let Some(bytes) = dst_image {
-            state.durable.insert(dst.to_path_buf(), bytes);
+            self.state.lock().durable.insert(dst.to_path_buf(), bytes);
         }
-        state.touched.insert(dst.to_path_buf());
-        state.pending_entries.insert(dst.to_path_buf());
         Ok(())
     }
 }
