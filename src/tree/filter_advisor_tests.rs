@@ -86,6 +86,11 @@ fn under(tables: &[Table], prefix: &str) -> Vec<Table> {
 
 const KEYS: u32 = 4_000;
 
+/// `n` as a `u64`: every count these tests use fits one.
+fn u64_of(n: usize) -> u64 {
+    u64::try_from(n).unwrap_or_else(|_| panic!("{n} does not fit a u64"))
+}
+
 /// The key up to and including its first ':'.
 struct UpToColon;
 
@@ -376,13 +381,13 @@ fn concurrent_rewrites_share_the_budget() -> crate::Result<()> {
     };
     let (first, second) = (plan(), plan());
     let frame = |len: u64| len;
-    let lower = core::ops::Bound::Unbounded;
+    let bounds = (core::ops::Bound::Unbounded, core::ops::Bound::Unbounded);
     assert!(
-        first.admit(lower, 1_000, 1_000, room, room, &frame, false),
+        first.admit(bounds, 1_000, 1_000, room, room, &frame, false),
         "the room fits one"
     );
     assert!(
-        !second.admit(lower, 1_000, 1_000, room, room, &frame, false),
+        !second.admit(bounds, 1_000, 1_000, room, room, &frame, false),
         "the room the first rewrite builds into is taken"
     );
     Ok(())
@@ -485,8 +490,8 @@ fn a_flush_into_several_tables_keeps_room_for_the_later_ones() -> crate::Result<
     // Every filter fits at the narrowest width with a quarter to spare; the
     // static policy's 10 bits for the first table leave too little for the
     // rest.
-    let narrowest = BloomConstructionPolicy::BitsPerKey(6.0).filter_size_bound(KEYS) as u64;
-    let budget = narrowest * 5 / 4;
+    let narrowest = BloomConstructionPolicy::BitsPerKey(6.0).filter_size_bound(KEYS);
+    let budget = u64_of(narrowest) * 5 / 4;
     let tree = open(
         folder.path(),
         Some(FilterAdvisor::new(budget).with_bits_per_key([6u8, 10].to_vec())),
@@ -501,7 +506,7 @@ fn a_flush_into_several_tables_keeps_room_for_the_later_ones() -> crate::Result<
             state ^= state << 17;
             *byte = state.to_le_bytes()[0];
         }
-        tree.insert(format!("key{i:06}"), value.as_slice(), i as SeqNo);
+        tree.insert(format!("key{i:06}"), value.as_slice(), u64_of(i));
     }
     tree.flush_active_memtable(0)?;
 
@@ -524,8 +529,9 @@ fn a_flush_into_several_tables_keeps_room_for_the_later_ones() -> crate::Result<
 fn a_split_compaction_sizes_its_filters_within_the_budget() -> crate::Result<()> {
     const KEYS: u32 = 4_000;
     let folder = tempfile::tempdir()?;
-    let narrowest = BloomConstructionPolicy::BitsPerKey(6.0).filter_size_bound(KEYS as usize);
-    let budget = narrowest as u64 * 2;
+    let narrowest = BloomConstructionPolicy::BitsPerKey(6.0)
+        .filter_size_bound(usize::try_from(KEYS).unwrap_or(usize::MAX));
+    let budget = u64_of(narrowest) * 2;
     let tree = Config::new(
         folder.path(),
         SequenceNumberCounter::default(),
@@ -679,10 +685,10 @@ fn overlapping_inputs_hand_down_a_lookup_once() -> crate::Result<()> {
 fn a_flush_reserves_by_filter_hashes_not_versions() -> crate::Result<()> {
     const KEYS: usize = 4_000;
     let folder = tempfile::tempdir()?;
-    let wide = BloomConstructionPolicy::BitsPerKey(10.0).filter_size_bound(KEYS) as u64;
+    let wide = BloomConstructionPolicy::BitsPerKey(10.0).filter_size_bound(KEYS);
     let tree = open(
         folder.path(),
-        Some(FilterAdvisor::new(wide * 11 / 10).with_bits_per_key([6u8, 10].to_vec())),
+        Some(FilterAdvisor::new(u64_of(wide) * 11 / 10).with_bits_per_key([6u8, 10].to_vec())),
     )?;
     let mut seqno = 0;
     for _ in 0..5 {
@@ -697,7 +703,7 @@ fn a_flush_reserves_by_filter_hashes_not_versions() -> crate::Result<()> {
     let [table] = tables.as_slice() else {
         panic!("one table");
     };
-    let bits = u64::from(table.filter_size()) * 8 / KEYS as u64;
+    let bits = u64::from(table.filter_size()) * 8 / u64_of(KEYS);
     assert!(bits >= 9, "{bits} bits a key: the static 10 fit the budget");
     Ok(())
 }
@@ -709,10 +715,10 @@ fn a_flush_reserves_by_filter_hashes_not_versions() -> crate::Result<()> {
 fn a_flush_counts_a_key_in_several_memtables_once() -> crate::Result<()> {
     const KEYS: usize = 4_000;
     let folder = tempfile::tempdir()?;
-    let wide = BloomConstructionPolicy::BitsPerKey(10.0).filter_size_bound(KEYS) as u64;
+    let wide = BloomConstructionPolicy::BitsPerKey(10.0).filter_size_bound(KEYS);
     let tree = open(
         folder.path(),
-        Some(FilterAdvisor::new(wide * 11 / 10).with_bits_per_key([6u8, 10].to_vec())),
+        Some(FilterAdvisor::new(u64_of(wide) * 11 / 10).with_bits_per_key([6u8, 10].to_vec())),
     )?;
     let mut seqno = 0;
     for _ in 0..3 {
@@ -728,7 +734,7 @@ fn a_flush_counts_a_key_in_several_memtables_once() -> crate::Result<()> {
     let [table] = tables.as_slice() else {
         panic!("one table");
     };
-    let bits = u64::from(table.filter_size()) * 8 / KEYS as u64;
+    let bits = u64::from(table.filter_size()) * 8 / u64_of(KEYS);
     assert!(bits >= 9, "{bits} bits a key: the static 10 fit the budget");
     Ok(())
 }
@@ -743,13 +749,13 @@ fn an_ingestion_told_its_entries_keeps_room_for_the_later_tables() -> crate::Res
     const KEYS: usize = 6_000;
     const VALUE: usize = 16 * 1_024;
     let folder = tempfile::tempdir()?;
-    let narrowest = BloomConstructionPolicy::BitsPerKey(6.0).filter_size_bound(KEYS) as u64;
-    let budget = narrowest * 5 / 4;
+    let narrowest = BloomConstructionPolicy::BitsPerKey(6.0).filter_size_bound(KEYS);
+    let budget = u64_of(narrowest) * 5 / 4;
     let tree = open(
         folder.path(),
         Some(FilterAdvisor::new(budget).with_bits_per_key([6u8, 10].to_vec())),
     )?;
-    let mut ingestion = tree.ingestion()?.expected_entries(KEYS as u64);
+    let mut ingestion = tree.ingestion()?.expected_entries(u64_of(KEYS));
     let mut state: u64 = 0x9E37_79B9_7F4A_7C15;
     let mut value = vec![0u8; VALUE];
     for i in 0..KEYS {
@@ -785,8 +791,8 @@ fn an_ingestion_told_its_entries_keeps_room_for_the_later_prefix_hashes() -> cra
     const VALUE: usize = 16 * 1_024;
     let folder = tempfile::tempdir()?;
     // Every key has its own prefix: two hashes a key.
-    let narrowest = BloomConstructionPolicy::BitsPerKey(6.0).filter_size_bound(2 * KEYS) as u64;
-    let budget = narrowest * 5 / 4;
+    let narrowest = BloomConstructionPolicy::BitsPerKey(6.0).filter_size_bound(2 * KEYS);
+    let budget = u64_of(narrowest) * 5 / 4;
     let tree = Config::new(
         folder.path(),
         SequenceNumberCounter::default(),
@@ -798,7 +804,7 @@ fn an_ingestion_told_its_entries_keeps_room_for_the_later_prefix_hashes() -> cra
         FilterAdvisor::new(budget).with_bits_per_key([6u8, 10].to_vec()),
     ))
     .open()?;
-    let mut ingestion = tree.ingestion()?.expected_entries(KEYS as u64);
+    let mut ingestion = tree.ingestion()?.expected_entries(u64_of(KEYS));
     let mut state: u64 = 0x9E37_79B9_7F4A_7C15;
     let mut value = vec![0u8; VALUE];
     for i in 0..KEYS {
@@ -824,6 +830,120 @@ fn an_ingestion_told_its_entries_keeps_room_for_the_later_prefix_hashes() -> cra
     Ok(())
 }
 
+/// The hashes a flush counts for its filters are the distinct ones, as the
+/// writer deduplicates them before building: an extractor whose token is the
+/// key itself, or repeats a token out of position, adds none.
+#[test]
+fn a_flush_counts_its_filter_hashes_as_the_writer_deduplicates_them() {
+    /// The whole key, then its first byte twice at two positions.
+    struct Repeating;
+
+    impl crate::PrefixExtractor for Repeating {
+        fn prefixes<'a>(&self, key: &'a [u8]) -> Box<dyn Iterator<Item = &'a [u8]> + 'a> {
+            let first = key.get(..1).unwrap_or(key);
+            Box::new([key, first, first].into_iter())
+        }
+    }
+
+    let keys = ["a1", "a2", "b1"].map(crate::UserKey::from);
+    let count = crate::memtable::filter_count(keys.into_iter(), Some(&Repeating));
+    // Three key hashes (the whole-key tokens repeat them) and the prefixes
+    // "a" and "b".
+    assert_eq!(count.keys, 3);
+    assert_eq!(count.hashes, 5);
+}
+
+/// A compaction of overlapping inputs writes each key once, however many of
+/// them hold it: the keys its first filter covers correct the estimate that
+/// counted the key in each, and a budget one output's filter fits at the
+/// static width lets it take that width, not the narrowest.
+#[test]
+fn overlapping_inputs_keep_no_room_for_keys_written_once() -> crate::Result<()> {
+    const KEYS: usize = 4_000;
+    let folder = tempfile::tempdir()?;
+    let wide = BloomConstructionPolicy::BitsPerKey(10.0).filter_size_bound(KEYS);
+    // Full filters on every level: the output is one filter.
+    let tree = Config::new(
+        folder.path(),
+        SequenceNumberCounter::default(),
+        SequenceNumberCounter::default(),
+    )
+    .data_block_size_policy(BlockSizePolicy::all(1_024))
+    .filter_block_partitioning_policy(crate::config::PinningPolicy::all(false))
+    // The four inputs fit at the narrowest width (about 2.4 wide filters),
+    // and the output's wide filter with room for three more inputs' keys at
+    // the narrowest (about 2.8) does not.
+    .filter_advisor(Some(
+        FilterAdvisor::new(u64_of(wide) * 26 / 10).with_bits_per_key([6u8, 10].to_vec()),
+    ))
+    .open()?;
+    let mut seqno = 0;
+    for _ in 0..4 {
+        for i in 0..KEYS {
+            tree.insert(
+                key("k", 2 * u32::try_from(i).unwrap_or(u32::MAX)),
+                "value",
+                seqno,
+            );
+            seqno += 1;
+        }
+        tree.flush_active_memtable(0)?;
+    }
+    tree.major_compact(u64::MAX, 0)?;
+
+    let tables = tables(&tree);
+    let [table] = tables.as_slice() else {
+        panic!("one output, {} tables", tables.len());
+    };
+    let bits = u64::from(table.filter_size()) * 8 / u64_of(KEYS);
+    assert!(bits >= 9, "{bits} bits a key: the static 10 fit the budget");
+    Ok(())
+}
+
+/// Many small inputs merged into one output are priced as the one filter it
+/// writes, not as a filter each: a filter's fixed overhead charged once per
+/// input would raise the price past what the budget, which fits the output's
+/// filter at the static width, calls for.
+#[test]
+fn many_small_inputs_merged_into_one_output_are_priced_as_one_filter() -> crate::Result<()> {
+    const INPUTS: u32 = 30;
+    const PER_INPUT: u32 = 100;
+    let folder = tempfile::tempdir()?;
+    let keys = usize::try_from(INPUTS * PER_INPUT).unwrap_or(usize::MAX);
+    let wide = BloomConstructionPolicy::BitsPerKey(10.0).filter_size_bound(keys);
+    let tree = Config::new(
+        folder.path(),
+        SequenceNumberCounter::default(),
+        SequenceNumberCounter::default(),
+    )
+    .data_block_size_policy(BlockSizePolicy::all(1_024))
+    .filter_block_partitioning_policy(crate::config::PinningPolicy::all(false))
+    .filter_advisor(Some(
+        FilterAdvisor::new(u64_of(wide) * 21 / 20).with_bits_per_key([6u8, 10].to_vec()),
+    ))
+    .open()?;
+    let mut seqno = 0;
+    for input in 0..INPUTS {
+        for i in 0..PER_INPUT {
+            tree.insert(key(&format!("p{input:02}-"), 2 * i), "value", seqno);
+            seqno += 1;
+        }
+        tree.flush_active_memtable(0)?;
+    }
+    for input in 0..INPUTS {
+        probe_absent(&tree, &format!("p{input:02}-"), PER_INPUT)?;
+    }
+    tree.major_compact(u64::MAX, 0)?;
+
+    let tables = tables(&tree);
+    let [table] = tables.as_slice() else {
+        panic!("one output, {} tables", tables.len());
+    };
+    let bits = u64::from(table.filter_size()) * 8 / u64_of(keys);
+    assert!(bits >= 9, "{bits} bits a key: the static 10 fit the budget");
+    Ok(())
+}
+
 /// A compaction keeps room for its later outputs in the hashes they hold, not
 /// in the hashes its inputs held: inputs of partitioned filters hold a hash a
 /// key, outputs of full filters under a prefix extractor one more for each
@@ -837,8 +957,8 @@ fn a_compaction_keeps_room_for_the_later_outputs_prefix_hashes() -> crate::Resul
     const VALUE: usize = 1_024;
     let folder = tempfile::tempdir()?;
     // Every key has its own prefix: two hashes a key in a full filter.
-    let narrowest = BloomConstructionPolicy::BitsPerKey(6.0).filter_size_bound(2 * KEYS) as u64;
-    let budget = narrowest * 5 / 4;
+    let narrowest = BloomConstructionPolicy::BitsPerKey(6.0).filter_size_bound(2 * KEYS);
+    let budget = u64_of(narrowest) * 5 / 4;
     let tree = Config::new(
         folder.path(),
         SequenceNumberCounter::default(),
@@ -861,7 +981,7 @@ fn a_compaction_keeps_room_for_the_later_outputs_prefix_hashes() -> crate::Resul
             state ^= state << 17;
             *byte = state.to_le_bytes()[0];
         }
-        tree.insert(format!("key{i:06}:x"), value.as_slice(), i as u64);
+        tree.insert(format!("key{i:06}:x"), value.as_slice(), u64_of(i));
     }
     tree.flush_active_memtable(0)?;
     assert!(

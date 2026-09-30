@@ -338,6 +338,190 @@ fn a_restricted_table_is_priced_by_the_keys_it_serves() -> crate::Result<()> {
     Ok(())
 }
 
+/// The room a compaction's install would free is its own to build into, and
+/// no other rewrite's: the compaction may still fail and leave the filters it
+/// replaces live, and a filter another rewrite had admitted into that room
+/// would then take the budget past its limit.
+#[test]
+fn another_rewrite_cannot_spend_the_room_a_compaction_would_free() -> crate::Result<()> {
+    use crate::{AbstractTree, AnyTree, Config, SequenceNumberCounter};
+    use alloc::sync::Arc;
+    use core::ops::Bound::Unbounded;
+
+    const KEYS: u32 = 20_000;
+    let folder = tempfile::tempdir()?;
+    let any = Config::new(
+        folder.path(),
+        SequenceNumberCounter::default(),
+        SequenceNumberCounter::default(),
+    )
+    .open()?;
+    for i in 0..KEYS {
+        any.insert(format!("a{i:06}"), "value", u64::from(i));
+    }
+    any.flush_active_memtable(0)?;
+    let AnyTree::Standard(tree) = &any else {
+        panic!("a standard tree");
+    };
+    let version = tree.current_version();
+    let live = super::live(&version);
+    let live_bytes: u64 = live
+        .iter()
+        .map(|live| u64::from(live.table.filter_size()))
+        .sum();
+    let state = Arc::new(super::FilterBudget::default());
+    state.publish(&version);
+    let advisor = crate::config::FilterAdvisor::new(live_bytes + live_bytes / 10)
+        .with_bits_per_key([6u8, 10].to_vec());
+    let policy = BloomConstructionPolicy::BitsPerKey(10.0);
+    let compaction = super::plan(
+        &advisor,
+        &state,
+        &live,
+        super::Rewrite {
+            inputs: version.iter_tables().cloned().collect(),
+            comparator: Some(crate::comparator::default_comparator()),
+            ..super::Rewrite::default()
+        },
+        policy,
+        None,
+    )
+    .unwrap_or_else(|| panic!("the advisor plans the compaction"));
+    let flush = super::plan(
+        &advisor,
+        &state,
+        &live,
+        super::Rewrite {
+            count: super::FilterCount {
+                keys: 1_000,
+                hashes: 1_000,
+            },
+            ..super::Rewrite::default()
+        },
+        policy,
+        None,
+    )
+    .unwrap_or_else(|| panic!("the advisor plans the flush"));
+    let framing = super::Framing::default();
+    let frame = |len: u64| framing.frame(len);
+
+    let wide = live_bytes / 3;
+    assert!(
+        !flush.admit(
+            (Unbounded, Unbounded),
+            1_000,
+            1_000,
+            wide,
+            wide,
+            &frame,
+            false
+        ),
+        "a {wide}-byte filter fits only the room the compaction would free"
+    );
+    let keys = usize::try_from(KEYS).unwrap_or(usize::MAX);
+    assert!(
+        compaction.admit(
+            (Unbounded, Unbounded),
+            keys,
+            keys,
+            live_bytes / 2,
+            live_bytes / 2,
+            &frame,
+            false
+        ),
+        "the compaction builds into the room its install frees"
+    );
+    Ok(())
+}
+
+/// A slice of an input estimates its keys by its share of the input's data
+/// bytes, which is not its share of keys: the keys its first filter covers
+/// correct the estimate, and the room for the rest is kept though the bytes
+/// said there were none.
+#[test]
+fn a_slice_keeps_room_for_the_keys_its_byte_share_misses() -> crate::Result<()> {
+    use crate::config::BlockSizePolicy;
+    use crate::{AbstractTree, AnyTree, Config, SequenceNumberCounter};
+    use alloc::sync::Arc;
+    use core::ops::Bound::{Excluded, Included, Unbounded};
+
+    const SMALL: u32 = 4_000;
+    let folder = tempfile::tempdir()?;
+    let any = Config::new(
+        folder.path(),
+        SequenceNumberCounter::default(),
+        SequenceNumberCounter::default(),
+    )
+    .data_block_size_policy(BlockSizePolicy::all(1_024))
+    .open()?;
+    // Many small keys, then a few large values that hold most of the bytes.
+    for i in 0..SMALL {
+        any.insert(format!("a{i:06}"), "v", u64::from(i));
+    }
+    let large = alloc::vec![7u8; 8 * 1_024];
+    for i in 0..100u32 {
+        any.insert(format!("b{i:06}"), large.as_slice(), u64::from(SMALL + i));
+    }
+    any.flush_active_memtable(0)?;
+    let AnyTree::Standard(tree) = &any else {
+        panic!("a standard tree");
+    };
+    let version = tree.current_version();
+    let live = super::live(&version);
+    let live_bytes: u64 = live
+        .iter()
+        .map(|live| u64::from(live.table.filter_size()))
+        .sum();
+    let state = Arc::new(super::FilterBudget::default());
+    state.publish(&version);
+    let small = usize::try_from(SMALL).unwrap_or(usize::MAX);
+    let narrowest = BloomConstructionPolicy::BitsPerKey(6.0).filter_size_bound(small) as u64;
+    // The input stays live beside the slice's filters, which fit at the
+    // narrowest width with some room to spare.
+    let advisor = crate::config::FilterAdvisor::new(live_bytes + narrowest * 115 / 100)
+        .with_bits_per_key([6u8, 10].to_vec());
+    let comparator = crate::comparator::default_comparator();
+    let slice = super::plan(
+        &advisor,
+        &state,
+        &live,
+        super::Rewrite {
+            inputs: version.iter_tables().cloned().collect(),
+            span: Some(super::Span {
+                lower: Unbounded,
+                upper: Excluded(crate::UserKey::from("b")),
+                comparator: comparator.clone(),
+            }),
+            comparator: Some(comparator),
+            ..super::Rewrite::default()
+        },
+        BloomConstructionPolicy::BitsPerKey(10.0),
+        None,
+    )
+    .unwrap_or_else(|| panic!("the advisor plans the slice"));
+    let framing = super::Framing::default();
+    let frame = |len: u64| framing.frame(len);
+
+    // The first half of the slice's keys, at the wide width, leaves too
+    // little for the other half at the narrowest.
+    let half = small / 2;
+    let wide = frame(BloomConstructionPolicy::BitsPerKey(10.0).filter_size_bound(half) as u64);
+    let last = format!("a{:06}", half - 1);
+    assert!(
+        !slice.admit(
+            (Unbounded, Included(last.as_bytes())),
+            half,
+            half,
+            wide,
+            wide,
+            &frame,
+            false
+        ),
+        "a {wide}-byte filter over half the slice leaves no room for the other half"
+    );
+    Ok(())
+}
+
 /// Rewrites planning together halve a window the live tables crossed once,
 /// as one after the other would: the second finds the counts already halved
 /// below the window.
@@ -985,12 +1169,52 @@ fn concurrent_plans_reserve_room_for_each_others_later_filters() {
 
     // A tries its first filter wide, then narrow; each plan then writes the
     // rest narrow, taken whatever the budget says.
-    if !a.admit(Unbounded, KEYS, KEYS, frame(wide), wide, &frame, false) {
-        assert!(a.admit(Unbounded, KEYS, KEYS, frame(narrow), narrow, &frame, true));
+    if !a.admit(
+        (Unbounded, Unbounded),
+        KEYS,
+        KEYS,
+        frame(wide),
+        wide,
+        &frame,
+        false,
+    ) {
+        assert!(a.admit(
+            (Unbounded, Unbounded),
+            KEYS,
+            KEYS,
+            frame(narrow),
+            narrow,
+            &frame,
+            true
+        ));
     }
-    assert!(b.admit(Unbounded, KEYS, KEYS, frame(narrow), narrow, &frame, true));
-    assert!(b.admit(Unbounded, KEYS, KEYS, frame(narrow), narrow, &frame, true));
-    assert!(a.admit(Unbounded, KEYS, KEYS, frame(narrow), narrow, &frame, true));
+    assert!(b.admit(
+        (Unbounded, Unbounded),
+        KEYS,
+        KEYS,
+        frame(narrow),
+        narrow,
+        &frame,
+        true
+    ));
+    assert!(b.admit(
+        (Unbounded, Unbounded),
+        KEYS,
+        KEYS,
+        frame(narrow),
+        narrow,
+        &frame,
+        true
+    ));
+    assert!(a.admit(
+        (Unbounded, Unbounded),
+        KEYS,
+        KEYS,
+        frame(narrow),
+        narrow,
+        &frame,
+        true
+    ));
     assert!(
         state.held() <= budget,
         "{} filter bytes against {budget}",
@@ -1031,7 +1255,15 @@ fn a_rewrite_ends_with_its_plan_not_with_the_last_reference() {
     .unwrap_or_else(|| panic!("the advisor plans the filters"));
     let owner = plan.clone();
     let worker = plan.sizing();
-    assert!(worker.admit(Unbounded, KEYS, KEYS, frame(narrow), narrow, &frame, true));
+    assert!(worker.admit(
+        (Unbounded, Unbounded),
+        KEYS,
+        KEYS,
+        frame(narrow),
+        narrow,
+        &frame,
+        true
+    ));
     assert_eq!(state.held(), frame(narrow));
 
     drop(plan);
@@ -1043,7 +1275,15 @@ fn a_rewrite_ends_with_its_plan_not_with_the_last_reference() {
         0
     );
 
-    assert!(worker.admit(Unbounded, KEYS, KEYS, frame(narrow), narrow, &frame, true));
+    assert!(worker.admit(
+        (Unbounded, Unbounded),
+        KEYS,
+        KEYS,
+        frame(narrow),
+        narrow,
+        &frame,
+        true
+    ));
     drop(worker);
     assert_eq!(
         state.held(),

@@ -177,7 +177,7 @@ fn build_filter(
         // builds from a copy.
         let bytes = crate::table::filter::build_burr_filter_bytes(candidate, hashes.clone())?;
         if sizing.admit(
-            bounds.0,
+            bounds,
             n,
             keys,
             frame(bytes.len() as u64),
@@ -191,7 +191,7 @@ fn build_filter(
     let bytes = crate::table::filter::build_burr_filter_bytes(narrowest, hashes)?;
     // The narrowest is taken whether or not it fits.
     let admitted = sizing.admit(
-        bounds.0,
+        bounds,
         n,
         keys,
         frame(bytes.len() as u64),

@@ -29,17 +29,22 @@ use spin::RwLock;
 
 pub use crate::tree::inner::MemtableId;
 
-/// The distinct keys among `keys`, in the table's key order, and the hashes a
-/// table filter built over them holds: one per distinct key and, with
-/// `prefixes`, one per prefix at a position where the key before had another,
-/// as a full filter registers them. Versions of a key add none.
+/// The distinct keys among `keys`, in the table's key order, and the distinct
+/// hashes a table filter built over them holds: one per key and, with
+/// `prefixes`, one per prefix, as a full filter deduplicates them before it
+/// builds. Versions of a key add none.
+///
+/// Counted over all of `keys` at once: a flush rotating into several tables
+/// hashes a prefix spanning two of them in each, so the count runs short by
+/// at most one prefix per rotation.
 pub fn filter_count(
     keys: impl Iterator<Item = crate::UserKey>,
     prefixes: Option<&dyn crate::PrefixExtractor>,
 ) -> crate::filter_budget::FilterCount {
     let mut distinct = 0u64;
-    let mut hashes = 0u64;
     let mut previous: Option<crate::UserKey> = None;
+    // Without an extractor a filter holds one hash a key, and needs no list.
+    let mut hashes: Vec<u64> = Vec::new();
     let mut previous_prefixes: Vec<u64> = Vec::new();
     for key in keys {
         if previous
@@ -49,25 +54,36 @@ pub fn filter_count(
             continue;
         }
         distinct += 1;
-        hashes += 1;
         if let Some(extractor) = prefixes {
+            hashes.push(crate::hash::hash64(&key));
+            // A prefix the key before had at the same position is a repeat,
+            // dropped here to keep the list short, as the writer does.
             for (position, prefix) in extractor.prefixes(&key).enumerate() {
                 let hash = crate::hash::hash64(prefix);
                 match previous_prefixes.get_mut(position) {
                     Some(previous) if *previous == hash => {}
                     Some(previous) => {
                         *previous = hash;
-                        hashes += 1;
+                        hashes.push(hash);
                     }
                     None => {
                         previous_prefixes.push(hash);
-                        hashes += 1;
+                        hashes.push(hash);
                     }
                 }
             }
         }
         previous = Some(key);
     }
+    let hashes = if prefixes.is_some() {
+        // Tokens equal to a key, or repeated out of position, the writer
+        // drops when it sorts its hashes.
+        hashes.sort_unstable();
+        hashes.dedup();
+        u64::try_from(hashes.len()).unwrap_or(u64::MAX)
+    } else {
+        distinct
+    };
     crate::filter_budget::FilterCount {
         keys: distinct,
         hashes,

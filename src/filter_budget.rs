@@ -151,11 +151,13 @@ pub struct FilterSizing {
     /// Filter bytes this rewrite has built, held in the tree's budget until
     /// it ends: installed, they are the published version's, otherwise gone.
     spent: AtomicU64,
-    /// Filter bytes of the tables this rewrite replaces, taken off the held
-    /// bytes when it plans and given back before its install (see
-    /// [`Self::release_replaced`]) or when it ends.
+    /// Filter bytes of the tables this rewrite replaces: room its install
+    /// frees, which it builds into and no other rewrite does, until it gives
+    /// the credit up before its install (see [`Self::release_replaced`]) or
+    /// ends. The held bytes keep counting them meanwhile, since the rewrite
+    /// may still fail and leave them live.
     replaced: u64,
-    /// Whether `replaced` has been given back.
+    /// Whether the credit for `replaced` has been given up.
     replaced_released: AtomicBool,
     /// Estimated bytes of the filters this rewrite has built, as `f64` bits:
     /// against what they took, it corrects the estimate the price is set
@@ -169,14 +171,24 @@ pub struct FilterSizing {
     total_keys: AtomicU64,
     /// Keys the filters this rewrite has built cover.
     admitted_keys: AtomicU64,
+    /// The keys `total_keys` estimates the built filters to cover: the
+    /// inputs' keys inside their ranges, by the same measure. Against
+    /// `admitted_keys` it tells how far the estimate runs from the keys the
+    /// rewrite writes, where inputs overlap (a key in several counts once)
+    /// or a share of data bytes is not one of keys.
+    estimated_admitted: AtomicU64,
     /// Hashes a key still to come holds, as a fraction: under a prefix
     /// extractor a full filter holds a hash per prefix besides one per key.
     /// The plan's estimate until a filter is built, then the most any filter
     /// of this rewrite has held, since where the rewrite writes, not where
     /// its inputs lie, decides whether prefixes are hashed.
     hashes_per_key: (AtomicU64, AtomicU64),
-    /// This rewrite's part of [`FilterBudget::reserved`]: the room it keeps
-    /// for the keys it has still to write filters for.
+    /// The room the filters this rewrite has still to write take at the
+    /// narrowest width.
+    floor: AtomicU64,
+    /// This rewrite's part of [`FilterBudget::reserved`]: its floor, less
+    /// the filters it replaces until it gives their credit up (see
+    /// [`Self::published_floor`]).
     reservation: AtomicU64,
     /// The most keys a filter of this rewrite has held: the later filters are
     /// taken to be that large, not the size of the last partition of a table.
@@ -193,6 +205,8 @@ pub struct FilterSizing {
     /// Keys each of `inputs` serves (see [`served_keys`]), which its shares of
     /// a key range are shares of.
     input_keys: Vec<u64>,
+    /// Distinct keys each of `inputs` serves (see [`served_distinct_keys`]).
+    input_distinct: Vec<u64>,
     /// Negative probes a key drew across the live tables, the load a flushed
     /// table is expected to take.
     prior_density: f64,
@@ -584,14 +598,15 @@ pub fn plan(
         })
         .map(|live| u64::from(live.table.filter_size()))
         .sum();
-    // The inputs' keys within the span, and their hashes. A share that cannot
-    // be read counts the input whole: the room kept for later keys errs on
-    // the large side.
+    // The inputs' keys within the span, and their hashes: an estimate, which
+    // the filters the rewrite builds correct as it goes (see `pending_at`).
+    // A share that cannot be read counts the input whole.
+    let input_distinct: Vec<u64> = inputs.iter().map(served_distinct_keys).collect();
     let pending = if inputs.is_empty() {
         count
     } else {
         let mut pending = FilterCount::default();
-        for (input, &hashes) in inputs.iter().zip(&input_keys) {
+        for ((input, &hashes), &distinct) in inputs.iter().zip(&input_keys).zip(&input_distinct) {
             let share = span.as_ref().map_or(1.0, |span| {
                 crate::table::probe_stats::fraction_of(input, span.bounds()).unwrap_or(1.0)
             });
@@ -602,7 +617,7 @@ pub fn plan(
             )]
             let covered = |count: u64| libm::ceil(as_f64(count) * share) as u64;
             // An input's counts are far below 2^63, and so are their sums.
-            pending.keys += covered(served_distinct_keys(input));
+            pending.keys += covered(distinct);
             pending.hashes += covered(hashes);
         }
         pending
@@ -627,6 +642,7 @@ pub fn plan(
         partition_keys,
         total_keys: AtomicU64::new(pending.keys),
         admitted_keys: AtomicU64::new(0),
+        estimated_admitted: AtomicU64::new(0),
         // Until a filter is built, the hashes a key holds in what it replaces;
         // one a key without a count.
         hashes_per_key: if pending.keys == 0 {
@@ -637,12 +653,14 @@ pub fn plan(
                 AtomicU64::new(pending.keys),
             )
         },
+        floor: AtomicU64::new(0),
         reservation: AtomicU64::new(0),
         typical_keys: AtomicU64::new(0),
         table_keys: AtomicU64::new(0),
         inputs,
         input_densities,
         input_keys,
+        input_distinct,
         prior_density,
         observed: observed > 0,
         split,
@@ -654,18 +672,11 @@ pub fn plan(
         ended: AtomicBool::new(false),
         state: Arc::clone(state),
     }));
-    // The replaced filters leave with the install; the room they free is this
-    // rewrite's to build into, and no other rewrite's. It is exchanged, in one
-    // step no admission sees half of, for the room every filter this rewrite
-    // writes takes, reserved before any of them.
-    let floor = sizing.floor_for(sizing.pending_hashes(0));
+    // The room every filter this rewrite writes takes is reserved before any
+    // of them, less what its install frees (see `published_floor`).
+    let floor = sizing.floor_for(sizing.pending_hashes());
     {
         let _admission = state.admission.lock();
-        #[expect(
-            clippy::cast_possible_wrap,
-            reason = "filter byte counts far below 2^63"
-        )]
-        state.held.fetch_sub(replaced as i64, Relaxed);
         sizing.set_reservation(0, floor);
     }
     Some(sizing)
@@ -733,7 +744,7 @@ impl FilterSizing {
         if !self.observed || self.inputs.is_empty() {
             return Ok(self.price);
         }
-        let used = self.state.held();
+        let used = self.used();
         let spent = as_f64(self.spent.load(Relaxed));
         let estimated = f64::from_bits(self.spent_estimate.load(Relaxed));
         let error = if estimated > 0.0 {
@@ -744,38 +755,7 @@ impl FilterSizing {
         // Filters already over the budget leave no room at all.
         let left = as_f64(self.budget.saturating_sub(used)) / error;
 
-        let cursors = self.cursors();
-        let mut remaining = Vec::with_capacity(self.inputs.len());
-        for ((input, &density), &keys) in self
-            .inputs
-            .iter()
-            .zip(&self.input_densities)
-            .zip(&self.input_keys)
-        {
-            let mut share = 0.0;
-            for (range, cursor) in cursors.iter().enumerate() {
-                let (low, high) = self.range(range);
-                let from = cursor
-                    .as_ref()
-                    .map_or(low, |bound| bound.as_ref().map(AsRef::as_ref));
-                share += self.share_of(input, (from, high))?;
-            }
-            let keys = as_f64(keys) * share;
-            if keys >= 1.0 {
-                #[expect(
-                    clippy::cast_possible_truncation,
-                    clippy::cast_sign_loss,
-                    reason = "a positive key count below the table's own"
-                )]
-                // Written into the destination level, at its settings.
-                remaining.push(Load {
-                    negatives: keys * density,
-                    keys: keys as usize,
-                    fallback_bits: self.fallback_bits,
-                    partition_keys: self.partition_keys,
-                });
-            }
-        }
+        let remaining = self.remaining_loads()?;
         #[expect(
             clippy::cast_possible_truncation,
             clippy::cast_sign_loss,
@@ -785,6 +765,102 @@ impl FilterSizing {
         Ok(price(&remaining, &self.widths, left, &|len| {
             self.framing.frame(len)
         }))
+    }
+
+    /// The filters the inputs' data still to come makes, as the price models
+    /// them: output tables of as many hashes as the largest this rewrite has
+    /// written, filled in key order from the inputs' parts, each part at its
+    /// input's load. The parts are the inputs' distinct keys past each key
+    /// range's cursor, scaled by how far the estimate ran from the keys the
+    /// built filters cover (see `pending_at`) and counted in the hashes the
+    /// destination writes a key as.
+    ///
+    /// The destination groups the keys by its target size, not by input: a
+    /// filter per input would charge a filter's fixed overhead for each of
+    /// many small inputs merged into one output.
+    fn remaining_loads(&self) -> crate::Result<Vec<Load>> {
+        let admitted = as_f64(self.admitted_keys.load(Relaxed));
+        let estimated_admitted = as_f64(self.estimated_admitted.load(Relaxed));
+        let written = if estimated_admitted > 0.0 {
+            admitted / estimated_admitted
+        } else {
+            1.0
+        };
+        let hashes_per_key = as_f64(self.hashes_per_key.0.load(Relaxed))
+            / as_f64(self.hashes_per_key.1.load(Relaxed).max(1));
+
+        // (where the part starts, its hashes, its negative probes)
+        let cursors = self.cursors();
+        let mut parts = Vec::with_capacity(self.inputs.len());
+        for ((input, &density), (&hashes, &distinct)) in self
+            .inputs
+            .iter()
+            .zip(&self.input_densities)
+            .zip(self.input_keys.iter().zip(&self.input_distinct))
+        {
+            let mut share = 0.0;
+            for (range, cursor) in cursors.iter().enumerate() {
+                let (low, high) = self.range(range);
+                let from = cursor
+                    .as_ref()
+                    .map_or(low, |bound| bound.as_ref().map(AsRef::as_ref));
+                share += self.share_of(input, (from, high))?;
+            }
+            let out = as_f64(distinct) * share * written * hashes_per_key;
+            if out >= 1.0 {
+                // The input's probes fall on the keys it holds, its own hashes.
+                let negatives = as_f64(hashes) * share * written * density;
+                parts.push((input.metadata.key_range.min().as_ref(), out, negatives));
+            }
+        }
+        match &self.key_order {
+            Some(order) => parts.sort_by(|a, b| order.0.compare(a.0, b.0)),
+            None => parts.sort_by(|a, b| a.0.cmp(b.0)),
+        }
+
+        // Before a table is written its size is unknown: the data still to
+        // come is taken as one.
+        let table = match self.table_keys.load(Relaxed) {
+            0 => f64::INFINITY,
+            hashes => as_f64(hashes),
+        };
+        let mut loads = Vec::new();
+        let (mut hashes, mut negatives) = (0.0, 0.0);
+        let mut close = |hashes: f64, negatives: f64| {
+            if hashes >= 1.0 {
+                #[expect(
+                    clippy::cast_possible_truncation,
+                    clippy::cast_sign_loss,
+                    reason = "a positive hash count below the inputs' own"
+                )]
+                // Written into the destination level, at its settings.
+                loads.push(Load {
+                    negatives,
+                    keys: hashes as usize,
+                    fallback_bits: self.fallback_bits,
+                    partition_keys: self.partition_keys,
+                });
+            }
+        };
+        for (_, mut out, mut probes) in parts {
+            loop {
+                let taken = table - hashes;
+                if out <= taken {
+                    break;
+                }
+                // The table fills with part of this input's; the rest opens
+                // the next one, at the same load.
+                let taken_probes = probes * taken / out;
+                close(table, negatives + taken_probes);
+                (hashes, negatives) = (0.0, 0.0);
+                out -= taken;
+                probes -= taken_probes;
+            }
+            hashes += out;
+            negatives += probes;
+        }
+        close(hashes, negatives);
+        Ok(loads)
     }
 
     /// The share of `input`'s data inside `bounds` (see
@@ -941,8 +1017,8 @@ impl FilterSizing {
     /// Charging the bytes a build wrote rather than a bound on them lets the
     /// filters fill the budget.
     ///
-    /// `lower` is the lower bound [`Self::candidates`] priced the filter at:
-    /// once taken, the filter is no longer in flight.
+    /// `bounds` are the ones [`Self::candidates`] priced the filter at: once
+    /// taken, the filter is no longer in flight.
     ///
     /// `keys` are the keys the filter covers, fewer than its `n` hashes under
     /// a prefix extractor.
@@ -952,7 +1028,7 @@ impl FilterSizing {
     )]
     pub fn admit(
         &self,
-        lower: Bound<&[u8]>,
+        bounds: (Bound<&[u8]>, Bound<&[u8]>),
         n: usize,
         keys: usize,
         bytes: u64,
@@ -962,6 +1038,9 @@ impl FilterSizing {
     ) -> bool {
         let n = u64::try_from(n).unwrap_or(u64::MAX);
         let keys = u64::try_from(keys).unwrap_or(u64::MAX);
+        // Read before the lock: it may walk the inputs' block indexes. One
+        // that cannot be read estimates the filter's own keys.
+        let estimated_keys = self.estimated_keys(bounds).unwrap_or(keys);
         // The keys still to come are claimed under the lock too: filters
         // admitted side by side (a table's partitions) each see the others'
         // keys gone once taken.
@@ -974,9 +1053,10 @@ impl FilterSizing {
         let per_filter = self.typical_keys.load(Relaxed).max(n);
         let ratio = self.ratio_with(n, keys);
         let admitted = self.admitted_keys.load(Relaxed) + keys;
-        let later = self.pending_at(admitted, ratio);
+        let estimated_admitted = self.estimated_admitted.load(Relaxed) + estimated_keys;
+        let later = self.pending_at(admitted, estimated_admitted, ratio);
         let floor = self.floor(later, per_filter, frame);
-        let used = self.state.held();
+        let used = self.used();
         let mine = self.reservation.load(Relaxed);
         // Every reservation changes under the admission lock, and this
         // rewrite's is one part of the sum.
@@ -996,12 +1076,13 @@ impl FilterSizing {
         self.spent.fetch_add(bytes, Relaxed);
         self.set_reservation(mine, floor);
         self.admitted_keys.store(admitted, Relaxed);
+        self.estimated_admitted.store(estimated_admitted, Relaxed);
         self.hashes_per_key.0.store(ratio.0, Relaxed);
         self.hashes_per_key.1.store(ratio.1, Relaxed);
         self.typical_keys.fetch_max(n, Relaxed);
         drop(admission);
 
-        self.leave(lower);
+        self.leave(bounds.0);
         // The room kept for later filters is a reserve, not a limit. Whether
         // the tree is over its budget follows the filters its versions
         // publish, not the ones a rewrite is building, which it may never
@@ -1105,26 +1186,57 @@ impl FilterSizing {
         self.floor(pending, per_filter, &|len| self.framing.frame(len))
     }
 
-    /// Replaces this rewrite's reservation `mine` with `floor` in the tree's
-    /// sum. The admission lock is held.
+    /// Sets this rewrite's floor to `floor` and replaces its reservation
+    /// `mine` in the tree's sum with the part the others keep room for. The
+    /// admission lock is held.
     fn set_reservation(&self, mine: u64, floor: u64) {
+        let published = self.published_floor(floor);
         // `mine` is part of the sum, which changes only under the lock.
         let others = self.state.reserved.load(Relaxed) - mine;
-        self.state.reserved.store(others + floor, Relaxed);
-        self.reservation.store(floor, Relaxed);
+        self.state.reserved.store(others + published, Relaxed);
+        self.reservation.store(published, Relaxed);
+        self.floor.store(floor, Relaxed);
     }
 
-    /// Gives back the credit for the filters this rewrite replaces, before
-    /// its install drops them from the published version. Held bytes then
-    /// count both the replaced filters and the new ones until the install
-    /// and the end of the rewrite settle them, never fewer than there are.
+    /// The part of `floor` the other rewrites keep room for. The held bytes
+    /// still count the filters this rewrite replaces, so while it holds
+    /// their credit its floor asks only for what they do not cover: should it
+    /// install, its later filters take the room they leave; should it fail,
+    /// they stay and its own filters go.
+    fn published_floor(&self, floor: u64) -> u64 {
+        if self.replaced_released.load(Relaxed) {
+            floor
+        } else {
+            // Room the replaced filters leave beyond the floor is a credit
+            // only this rewrite spends: none of it goes to the others.
+            floor.saturating_sub(self.replaced)
+        }
+    }
+
+    /// The held bytes as this rewrite sees them: less the filters it
+    /// replaces while it holds their credit, the room it builds into.
+    fn used(&self) -> u64 {
+        let held = self.state.held();
+        if self.replaced_released.load(Relaxed) {
+            held
+        } else {
+            // The held bytes count the replaced filters while they are live.
+            held.saturating_sub(self.replaced)
+        }
+    }
+
+    /// Gives up the credit for the filters this rewrite replaces, before its
+    /// install drops them from the published version: from then on the room
+    /// it builds into is what the held bytes leave, as for any rewrite.
     pub fn release_replaced(&self) {
+        let _admission = self.state.admission.lock();
+        self.release_locked();
+    }
+
+    /// [`Self::release_replaced`], with the admission lock held.
+    fn release_locked(&self) {
         if !self.replaced_released.swap(true, Relaxed) {
-            #[expect(
-                clippy::cast_possible_wrap,
-                reason = "filter byte counts far below 2^63"
-            )]
-            self.state.held.fetch_add(self.replaced as i64, Relaxed);
+            self.set_reservation(self.reservation.load(Relaxed), self.floor.load(Relaxed));
         }
     }
 
@@ -1140,15 +1252,16 @@ impl FilterSizing {
     pub fn expect_keys(&self, keys: u64) {
         let _admission = self.state.admission.lock();
         self.total_keys.store(keys, Relaxed);
-        let pending = self.pending_hashes(self.admitted_keys.load(Relaxed));
+        let pending = self.pending_hashes();
         self.set_reservation(self.reservation.load(Relaxed), self.floor_for(pending));
     }
 
-    /// The hashes the keys still to come hold once `admitted` keys have
-    /// filters, at the current rate.
-    fn pending_hashes(&self, admitted: u64) -> u64 {
+    /// The hashes the keys still to come hold, as the filters built so far
+    /// have corrected the estimate.
+    fn pending_hashes(&self) -> u64 {
         self.pending_at(
-            admitted,
+            self.admitted_keys.load(Relaxed),
+            self.estimated_admitted.load(Relaxed),
             (
                 self.hashes_per_key.0.load(Relaxed),
                 self.hashes_per_key.1.load(Relaxed),
@@ -1156,15 +1269,48 @@ impl FilterSizing {
         )
     }
 
-    /// The hashes the keys still to come hold once `admitted` keys have
-    /// filters, at `ratio` hashes a key.
-    fn pending_at(&self, admitted: u64, ratio: (u64, u64)) -> u64 {
-        // The total bounds the keys from above: filters over more keys than
-        // it leave none to come.
-        in_hashes(
-            self.total_keys.load(Relaxed).saturating_sub(admitted),
-            ratio,
-        )
+    /// The hashes the keys still to come hold once filters over `admitted`
+    /// keys, estimated at `estimated_admitted`, are built, at `ratio` hashes
+    /// a key.
+    ///
+    /// A rewrite with inputs estimates its keys by their shares of the
+    /// inputs, which count a key in several overlapping inputs once in each
+    /// and read a share of data bytes as one of keys. What the estimate has
+    /// left is scaled by how far it ran from the keys the built filters
+    /// cover, as the price is by its own error. A rewrite without inputs was
+    /// told its keys, bounded from above.
+    fn pending_at(&self, admitted: u64, estimated_admitted: u64, ratio: (u64, u64)) -> u64 {
+        let total = self.total_keys.load(Relaxed);
+        let keys = if self.inputs.is_empty() || estimated_admitted == 0 {
+            // A bound from above: filters over more keys than it leave none
+            // to come.
+            total.saturating_sub(admitted)
+        } else {
+            // An estimate that ran past the inputs leaves none either.
+            let left = total.saturating_sub(estimated_admitted);
+            // `left` and `admitted` are key counts far below 2^32 each.
+            u64::try_from(
+                (u128::from(left) * u128::from(admitted)).div_ceil(u128::from(estimated_admitted)),
+            )
+            .unwrap_or(u64::MAX)
+        };
+        in_hashes(keys, ratio)
+    }
+
+    /// The inputs' distinct keys inside `bounds`, by the measure `total_keys`
+    /// estimates them with; none for a rewrite without inputs.
+    fn estimated_keys(&self, bounds: (Bound<&[u8]>, Bound<&[u8]>)) -> crate::Result<u64> {
+        let mut keys = 0.0;
+        for (input, &distinct) in self.inputs.iter().zip(&self.input_distinct) {
+            keys += as_f64(distinct) * self.share_of(input, bounds)?;
+        }
+        #[expect(
+            clippy::cast_possible_truncation,
+            clippy::cast_sign_loss,
+            reason = "a non-negative sum of shares of the inputs' key counts"
+        )]
+        let keys = libm::ceil(keys) as u64;
+        Ok(keys)
     }
 
     /// The hashes a key still to come holds once a filter of `n` hashes over
@@ -1261,16 +1407,16 @@ impl FilterSizing {
 impl FilterSizing {
     /// The rewrite has ended. Its own filters leave the held bytes: installed,
     /// the published version counts them; not installed, they are gone. The
-    /// credit for what it replaces goes back the same way, if its install did
-    /// not already take it.
+    /// credit for what it replaces is given up, if its install did not
+    /// already give it up.
     fn end(&self) {
         let _admission = self.state.admission.lock();
         if self.ended.swap(true, Relaxed) {
             return;
         }
+        self.release_locked();
         // Its later filters are written or will never be.
         self.set_reservation(self.reservation.load(Relaxed), 0);
-        self.release_replaced();
         #[expect(
             clippy::cast_possible_wrap,
             reason = "filter byte counts far below 2^63"
