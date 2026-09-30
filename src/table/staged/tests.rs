@@ -189,6 +189,77 @@ fn a_staged_read_plans_what_the_serial_planner_plans() -> crate::Result<()> {
     Ok(())
 }
 
+/// Tiny data blocks and index partitions, so the table's index is split into
+/// dozens of partitions.
+fn many_partitions(w: Writer) -> Writer {
+    w.use_data_block_size(64)
+        .use_adaptive_index(0)
+        .use_index_partition_size(64)
+}
+
+/// Two keys at either end of the table.
+fn sparse_batch() -> Vec<(Vec<u8>, u64)> {
+    ["key000000", "key000998"]
+        .iter()
+        .map(|key| (key.as_bytes().to_vec(), hash64(key.as_bytes())))
+        .collect()
+}
+
+/// The serial planner and the serial batch read over the same sparse batch
+/// seek the index at each key too: with nothing cached, each loads only the
+/// index partitions its keys fall in.
+#[cfg(feature = "metrics")]
+#[test]
+fn a_sparse_serial_read_loads_only_the_index_partitions_its_keys_fall_in() -> crate::Result<()> {
+    let batch = sparse_batch();
+    let keys: Vec<(&[u8], u64)> = batch.iter().map(|(k, h)| (k.as_slice(), *h)).collect();
+    let dir = tempdir()?;
+    let table = table(dir.path(), many_partitions, true, false, 0);
+
+    let before = table.metrics.index_block_load_count();
+    table.plan_block_tasks(&keys, SeqNo::MAX, &mut ProbeCounts::default())?;
+    let planned = table.metrics.index_block_load_count() - before;
+    assert!(
+        planned <= 3,
+        "the planner loaded {planned} index partitions"
+    );
+
+    let before = table.metrics.index_block_load_count();
+    let found = table.batch_get(&keys, SeqNo::MAX)?;
+    let read = table.metrics.index_block_load_count() - before;
+    assert!(read <= 3, "the batch read loaded {read} index partitions");
+    assert!(found.iter().all(Option::is_some), "both keys are found");
+    Ok(())
+}
+
+/// A sparse batch over a table with many index partitions reads the
+/// partitions its keys fall in, not every partition between its first key and
+/// its last: the walk is sought at each key instead of stepped through the
+/// index, and plans what the serial planner plans.
+#[test]
+fn a_sparse_batch_reads_only_the_index_partitions_its_keys_fall_in() -> crate::Result<()> {
+    let batch = sparse_batch();
+    let keys: Vec<(&[u8], u64)> = batch.iter().map(|(k, h)| (k.as_slice(), *h)).collect();
+
+    let dir = tempdir()?;
+    let serial_table = table(dir.path(), many_partitions, true, false, 0);
+    let mut serial_tally = ProbeCounts::default();
+    let (_, _, _, serial_blocks) = serial_table
+        .plan_block_tasks(&keys, SeqNo::MAX, &mut serial_tally)?
+        .expect("keys in range");
+
+    let dir = tempdir()?;
+    let staged_table = table(dir.path(), many_partitions, true, false, 0);
+    let (_, blocks, _, asked) = drive(&staged_table, &keys).expect("staged");
+    let partitions = asked.iter().filter(|(t, _)| *t == BlockType::Index).count();
+    assert!(
+        partitions <= 3,
+        "two keys asked for {partitions} index partitions: {asked:?}"
+    );
+    assert_eq!(plan_of(&serial_blocks), plan_of(&blocks));
+    Ok(())
+}
+
 /// A warm table asks for nothing: every filter and index block is taken from
 /// the cache.
 #[test]

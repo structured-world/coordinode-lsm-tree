@@ -268,9 +268,13 @@ impl<'t> StagedRead<'t> {
         }
     }
 
-    /// Walks the index from the first passing key, planning the data blocks.
-    /// `Ok(false)` when the walk reached an index partition not yet held,
-    /// which is then what the read lacks.
+    /// Walks the index over the passing keys, planning the data blocks: it is
+    /// sought at each key that lies past the entry before it, so a sparse
+    /// batch over a large table reads and decodes only the entries and
+    /// partitions its keys fall in, and it steps to the next entry only where
+    /// a key equal to an entry's end may continue into it. `Ok(false)` when
+    /// the walk reached an index partition not yet held, which is then what
+    /// the read lacks.
     fn walk_index(&mut self, sorted_keys: &[(&[u8], u64)]) -> crate::Result<bool> {
         let Some(&first) = self.passing.first() else {
             return Ok(true);
@@ -278,72 +282,126 @@ impl<'t> StagedRead<'t> {
         let Some(&(first_key, _)) = sorted_keys.get(first) else {
             return Ok(true);
         };
-        let lo = Some((first_key, self.table_seqno));
+        let seqno = self.table_seqno;
         let comparator = self.table.comparator.clone();
         let mut plan = DataPlan::new(&self.passing);
+        let mut lacks: Option<BlockHandle> = None;
 
         match &*self.table.block_index {
             BlockIndexImpl::Full(index) => {
-                if let Some(walk) = index.forward_reader(first_key, self.table_seqno) {
-                    for handle in walk {
-                        if !plan.feed(&handle?, sorted_keys, self.table) {
-                            break;
-                        }
+                let mut walk = index.forward_reader(first_key, seqno);
+                while let Some(handle) = walk.as_mut().and_then(Iterator::next) {
+                    let handle = handle?;
+                    if !plan.feed(&handle, sorted_keys, self.table) {
+                        break;
+                    }
+                    if let Some(key) = plan.seek_past(&handle, sorted_keys, self.table) {
+                        walk = index.forward_reader(key, seqno);
                     }
                 }
             }
             BlockIndexImpl::VolatileFull(index) => {
-                let block = self.held(*index.handle.offset()).ok_or(NOT_HELD)?;
-                if let Some(walk) = OwnedIndexBlockIter::from_block_with_bounds(
-                    IndexBlock::new(block.clone()),
-                    comparator,
-                    lo,
-                    None,
-                )? {
-                    for handle in walk {
-                        if !plan.feed(&handle, sorted_keys, self.table) {
-                            break;
-                        }
+                let block =
+                    IndexBlock::new(self.held(*index.handle.offset()).ok_or(NOT_HELD)?.clone());
+                let open = |key: &[u8]| {
+                    OwnedIndexBlockIter::from_block_with_bounds(
+                        block.clone(),
+                        comparator.clone(),
+                        Some((key, seqno)),
+                        None,
+                    )
+                };
+                let mut walk = open(first_key)?;
+                while let Some(handle) = walk.as_mut().and_then(Iterator::next) {
+                    if !plan.feed(&handle, sorted_keys, self.table) {
+                        break;
+                    }
+                    if let Some(key) = plan.seek_past(&handle, sorted_keys, self.table) {
+                        walk = open(key)?;
                     }
                 }
             }
             BlockIndexImpl::TwoLevel(index) => {
-                if let Some(partitions) = OwnedIndexBlockIter::from_block_with_bounds(
-                    index.top_level_index.clone(),
-                    comparator.clone(),
-                    lo,
-                    None,
-                )? {
-                    'walk: for partition in partitions {
-                        let handle = *partition.as_ref();
-                        let Some(block) = self.held(*handle.offset()) else {
-                            self.want(handle, BlockType::Index);
-                            if self.need.is_empty() {
-                                // The cache had it and it is held now.
-                                return self.walk_index(sorted_keys);
-                            }
-                            return Ok(false);
-                        };
-                        let Some(walk) = OwnedIndexBlockIter::from_block_with_bounds(
-                            IndexBlock::new(block.clone()),
+                let held = &self.held;
+                let partition_of = |handle: &KeyedBlockHandle| {
+                    let handle = *handle.as_ref();
+                    held.iter()
+                        .find(|(at, _)| *at == *handle.offset())
+                        .map(|(_, block)| IndexBlock::new(block.clone()))
+                        .ok_or(handle)
+                };
+                // The top-level entries from the partition being walked on,
+                // and the entries of that partition.
+                let mut partitions: Option<OwnedIndexBlockIter> = None;
+                let mut entries: Option<OwnedIndexBlockIter> = None;
+                let mut seek: Option<&[u8]> = Some(first_key);
+                'walk: loop {
+                    if let Some(key) = seek.take() {
+                        let bound = Some((key, seqno));
+                        partitions = OwnedIndexBlockIter::from_block_with_bounds(
+                            index.top_level_index.clone(),
                             comparator.clone(),
-                            lo,
+                            bound,
                             None,
-                        )?
-                        else {
-                            continue;
+                        )?;
+                        let Some(partition) = partitions.as_mut().and_then(Iterator::next) else {
+                            break;
                         };
-                        for handle in walk {
-                            if !plan.feed(&handle, sorted_keys, self.table) {
-                                break 'walk;
+                        match partition_of(&partition) {
+                            Ok(block) => {
+                                entries = OwnedIndexBlockIter::from_block_with_bounds(
+                                    block,
+                                    comparator.clone(),
+                                    bound,
+                                    None,
+                                )?;
+                            }
+                            Err(handle) => {
+                                lacks = Some(handle);
+                                break;
                             }
                         }
                     }
+                    let handle = loop {
+                        if let Some(handle) = entries.as_mut().and_then(Iterator::next) {
+                            break handle;
+                        }
+                        // The partition is walked: its next one continues it.
+                        let Some(partition) = partitions.as_mut().and_then(Iterator::next) else {
+                            break 'walk;
+                        };
+                        match partition_of(&partition) {
+                            Ok(block) => {
+                                entries = OwnedIndexBlockIter::from_block_with_bounds(
+                                    block,
+                                    comparator.clone(),
+                                    None,
+                                    None,
+                                )?;
+                            }
+                            Err(handle) => {
+                                lacks = Some(handle);
+                                break 'walk;
+                            }
+                        }
+                    };
+                    if !plan.feed(&handle, sorted_keys, self.table) {
+                        break;
+                    }
+                    seek = plan.seek_past(&handle, sorted_keys, self.table);
                 }
             }
             BlockIndexImpl::Closed => {}
         }
 
+        if let Some(handle) = lacks {
+            self.want(handle, BlockType::Index);
+            if self.need.is_empty() {
+                // The cache had it and it is held now.
+                return self.walk_index(sorted_keys);
+            }
+            return Ok(false);
+        }
         let blockless = plan.blockless();
         self.table
             .tally_blockless(&mut self.tally, self.table_seqno, blockless);
@@ -374,6 +432,22 @@ impl<'p> DataPlan<'p> {
             p: 0,
             blocks: Vec::new(),
         }
+    }
+
+    /// Where the walk continues after `handle`: the next passing key to place
+    /// when it lies past `handle`'s end, so the index is sought there instead
+    /// of walked entry by entry; `None` to take the entry after `handle`,
+    /// which a key equal to its end continues into.
+    fn seek_past<'k>(
+        &self,
+        handle: &KeyedBlockHandle,
+        sorted_keys: &[(&'k [u8], u64)],
+        table: &Table,
+    ) -> Option<&'k [u8]> {
+        let &pos = self.passing.get(self.p)?;
+        let &(key, _) = sorted_keys.get(pos)?;
+        (table.comparator.compare(key, handle.end_key()) == core::cmp::Ordering::Greater)
+            .then_some(key)
     }
 
     /// Places the keys the index entry `handle` covers; `false` once every

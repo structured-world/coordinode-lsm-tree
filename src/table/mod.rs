@@ -7177,9 +7177,11 @@ impl Table {
     ///    partitioned filters amortise loads across keys that
     ///    land in the same partition rather than across the
     ///    whole batch.
-    /// 2. Block-index seek runs once at the smallest passing
-    ///    key, then the iterator walks forward across the
-    ///    sorted input — no re-seek per key.
+    /// 2. Block-index seek runs at the smallest passing key and
+    ///    again only at a passing key past the block before it;
+    ///    keys in the same or the next block share the walk, and
+    ///    a sparse batch over a large table never steps through
+    ///    the entries and partitions between its keys.
     /// 3. Each data block is loaded at most once for the entire
     ///    batch. Multiple input keys that fall in the same block
     ///    share a single load.
@@ -7337,9 +7339,16 @@ impl Table {
             // which case we skip the load.
             let first_in_block = sorted_keys[passing[p]].0;
             if self.comparator.compare(first_in_block, end_key) == core::cmp::Ordering::Greater {
-                // The next passing key is BEYOND this block's
-                // range. Skip the load and advance to the next
-                // block in the index.
+                // The next passing key is BEYOND this block's range: skip
+                // the load and seek the index at that key, so a sparse
+                // batch over a large table reads only the entries and
+                // partitions its keys fall in instead of stepping through
+                // every one between them.
+                let Some(reader) = self.block_index.forward_reader(first_in_block, table_seqno)
+                else {
+                    break;
+                };
+                block_iter = reader;
                 continue;
             }
 
@@ -7612,6 +7621,13 @@ impl Table {
             let end_key = block_handle.end_key();
             let first_in_block = sorted_keys[passing[p]].0;
             if self.comparator.compare(first_in_block, end_key) == core::cmp::Ordering::Greater {
+                // Sought at the next key, as `batch_get` does, instead of
+                // stepped through every entry between.
+                let Some(reader) = self.block_index.forward_reader(first_in_block, table_seqno)
+                else {
+                    break;
+                };
+                block_iter = reader;
                 continue;
             }
             let handle = *block_handle.as_ref();
