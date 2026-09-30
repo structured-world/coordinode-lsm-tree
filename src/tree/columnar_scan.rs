@@ -294,14 +294,19 @@ impl Tree {
         // taken now while its rows are read later: the snapshot is capped at
         // what the tree holds now, so a write or deletion that lands after the
         // scan is created is invisible to it, as it is outside the span and
-        // the groups computed here.
+        // the groups computed here. The version is the one the requested
+        // snapshot is served by: a compaction can raise the retention floor
+        // past every seqno the tree still holds, and a snapshot at or below the
+        // floor is refused because it may need a version the compaction
+        // collected. The cap never needs one: it lies above every seqno the
+        // tree holds, so it reads what the latest snapshot reads.
+        let super_version = self.get_version_for_snapshot(seqno)?;
         let seqno = match crate::AbstractTree::get_highest_seqno(self) {
             Some(highest) => highest
                 .checked_add(1)
                 .map_or(seqno, |next: SeqNo| seqno.min(next)),
             None => 0,
         };
-        let super_version = self.get_version_for_snapshot(seqno)?;
         // Operands are resolved in that same version, so a version installed
         // mid-scan changes no row the scan returns.
         let resolver = self.config.merge_operator.clone().map(|operator| Resolver {
@@ -818,10 +823,14 @@ impl ColumnarScan {
                 self.seqno,
                 ids,
             )),
+            // Within the span its group was formed on: the active memtable
+            // stays writable, and a row landing outside that span after the
+            // scan was created would be read out of order, or beside a
+            // version of its key another group returns.
             Source::Memtable(memtable) => SourceCursor::Rows(RowCursor::memtable(
                 memtable.clone(),
-                &self.lo,
-                &self.hi,
+                &Bound::Included(seg.min.clone()),
+                &Bound::Included(seg.max.clone()),
                 self.seqno,
                 ids,
             )),
@@ -915,14 +924,19 @@ impl ColumnarScan {
                 self.comparator.as_ref(),
             )?));
         }
-        // Only the raw value, a bytes column, is rewritten below; a split
-        // table's sub-column under the value column's id is a field like any
-        // other.
+        // Only the raw value is rewritten below, and only a row that carried
+        // its value whole holds the raw value under the value column's id: a
+        // row of a table that splits its values carries no whole value, and
+        // its cell under that id is a field like any other.
         let resolved_any = resolved.iter().any(|fix| matches!(fix, Some(Some(_))));
+        let whole = column(whole_at)?;
+        let split_resolved = (0..row_count)
+            .zip(&resolved)
+            .any(|(row, fix)| matches!(fix, Some(Some(_))) && !whole.is_valid(row));
         if resolved_any
             && self.fields.iter().any(|f| {
                 f.type_tag().is_none()
-                    && !(f.column_id() == COL_VALUE && raw_at.is_some())
+                    && !(f.column_id() == COL_VALUE && raw_at.is_some() && !split_resolved)
                     && batch.columns.iter().any(|c| c.column_id == f.column_id())
             })
         {

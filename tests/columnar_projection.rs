@@ -988,6 +988,115 @@ fn a_write_after_the_scan_was_created_is_not_returned() -> lsm_tree::Result<()> 
     Ok(())
 }
 
+/// A scan at the latest snapshot after a compaction raised the retention
+/// floor past every seqno the tree still holds reads that version, as a point
+/// read does, instead of capping itself below the floor.
+#[test]
+fn a_latest_scan_after_the_floor_passed_every_held_seqno_reads_the_tree() -> lsm_tree::Result<()> {
+    let folder = get_tmp_folder();
+    let any = open_columnar(folder.path());
+    let tree = standard(&any);
+    tree.insert(key(0), row_value(10, 40), 0);
+    tree.flush_active_memtable(0)?;
+    tree.insert(key(0), row_value(11, 41), 1);
+    tree.flush_active_memtable(0)?;
+    tree.major_compact(64 * 1024 * 1024, 100)?;
+    assert!(
+        tree.retention_floor() >= 2,
+        "the floor reached past every held seqno: {}",
+        tree.retention_floor()
+    );
+    assert!(tree.get(key(0), SeqNo::MAX)?.is_some());
+    assert_eq!(vec![(key(0), Some(41))], rows(tree, &projected())?);
+    Ok(())
+}
+
+/// A write landing in the memtable after the scan was created, past the keys
+/// the memtable held, is not read out of the memtable's group: it neither
+/// comes out of order nor beside the version another group returns.
+#[test]
+fn a_late_write_outside_the_memtable_span_is_not_read() -> lsm_tree::Result<()> {
+    let folder = get_tmp_folder();
+    let any = open_columnar(folder.path());
+    let tree = standard(&any);
+    ingest(&any, &[1, 5], &[(3, &[11, 15]), (4, &[41, 45])]);
+    let seqno = tree.get_highest_seqno().map_or(0, |s| s + 1);
+    tree.insert(key(0), row_value(10, 40), seqno + 10);
+
+    let scan = tree.columnar_scan(projected(), None, SeqNo::MAX, ..)?;
+    // Below every snapshot the scan could hold, past the memtable's span.
+    tree.insert(key(5), row_value(55, 55), 0);
+    let mut got = Vec::new();
+    for batch in scan {
+        let batch = batch?;
+        for row in 0..batch.row_count {
+            got.push(bytes_cell(&batch.columns[0].data, batch.row_count, row));
+        }
+    }
+    assert_eq!(vec![key(0), key(1), key(5)], got);
+    Ok(())
+}
+
+/// A split table's field under the value column's id is a field like any
+/// other, even stored as bytes: after its row's operand is resolved, it is
+/// refused, not replaced by the whole merged value.
+#[test]
+fn a_split_bytes_field_under_the_value_id_is_not_read_off_a_resolved_operand()
+-> lsm_tree::Result<()> {
+    let folder = get_tmp_folder();
+    let any = Config::new(
+        folder.path(),
+        SequenceNumberCounter::default(),
+        SequenceNumberCounter::default(),
+    )
+    .with_merge_operator(Some(std::sync::Arc::new(AddToFourth)))
+    .open()?;
+    standard(&any).update_runtime_config(|cfg| cfg.columnar = true)?;
+    let tree = standard(&any);
+    tree.insert(key(0), row_value(10, 40), 1);
+    tree.flush_active_memtable(0)?;
+    // A split batch whose row is an operand and whose field 3 is a bytes
+    // cell: one row, offsets 0 and 4, then the 4-byte operand.
+    let entries = [InternalValue::from_components(
+        key(0),
+        b"ignored",
+        0,
+        ValueType::MergeOperand,
+    )];
+    let mut batch = entries_to_column_batch(&entries).expect("transpose");
+    batch.columns.pop();
+    let mut cell = Vec::new();
+    cell.extend_from_slice(&0u32.to_le_bytes());
+    cell.extend_from_slice(&4u32.to_le_bytes());
+    cell.extend_from_slice(&2u32.to_le_bytes());
+    batch.columns.push(Column {
+        column_id: 3,
+        type_tag: TypeTag::Bytes,
+        validity: None,
+        data: cell.into(),
+    });
+    let mut ingestion = any.ingestion()?;
+    ingestion.write_columnar_batch(&batch)?;
+    ingestion.finish()?;
+
+    let projection = Projection::new().column(COL_USER_KEY).column(3);
+    let outcome = (|| -> lsm_tree::Result<Vec<Vec<u8>>> {
+        let mut cells = Vec::new();
+        for batch in tree.columnar_scan(&projection, None, SeqNo::MAX, ..)? {
+            let batch = batch?;
+            for row in 0..batch.row_count {
+                cells.push(bytes_cell(&batch.columns[1].data, batch.row_count, row));
+            }
+        }
+        Ok(cells)
+    })();
+    assert!(
+        matches!(outcome, Err(Error::Projection(_))),
+        "got {outcome:?}"
+    );
+    Ok(())
+}
+
 /// A fixed-width field of width zero has no cell to hold, and a column of it
 /// is one no batch may carry, so declaring one is refused up front instead of
 /// failing, or panicking, once rows are projected into it.
