@@ -55,9 +55,27 @@
 //! surfacing a row a caller who did not project the value-type column could not
 //! tell from a live one. Only a segment that RECORDS deletions pays for it: one
 //! whose metadata counts none keeps its columns untouched (and its zero-copy
-//! verbatim path). Memtable rows are not consulted —
-//! columnar data lives only in segments — and a visible non-columnar segment
-//! overlapping the range is rejected (a mixed-mode tree is unsupported here).
+//! verbatim path).
+//!
+//! # Row sources
+//!
+//! The memtables and the row-oriented tables in the range are sources too, so
+//! fresh writes are seen before they reach a columnar table. Each is read at
+//! the snapshot into batches of its keys, versions, value types and whole
+//! values, and always merged, since it holds every version of its keys. A
+//! merge operand row, in a tree with a merge operator, is replaced by what a
+//! point read at the snapshot returns for its key, so a chain reads as the read
+//! path resolves it.
+//!
+//! # Projected fields
+//!
+//! What a batch carries is a [`Projection`](projection::Projection): columns by
+//! id, and declared fields with a type and what their absence reads as. A table
+//! that stores each value whole (rows transposed at a flush or a compaction,
+//! and every row source) yields its declared fields through the projection's
+//! [`ValueProjector`](projection::ValueProjector); a table that stores the
+//! value split into fields yields them as its columns, and a field it lacks is
+//! absent. See [`projection`] for the absence rule every source follows.
 
 use core::ops::{Bound, RangeBounds};
 
@@ -171,12 +189,15 @@ struct Group {
 impl Tree {
     /// Runs a projected columnar scan across the whole tree.
     ///
-    /// Iterates the columnar segments intersecting `range` and visible at
-    /// `seqno`, applies each segment's positional delete-bitmap and the optional
-    /// `predicate` (zone-map block-skip + row filter), and yields projected
-    /// [`ColumnBatch`]es in ascending key order. Overlapping segments are merged
-    /// with newest-`seqno`-wins semantics so an overwritten key is returned once
-    /// (its newest version); disjoint segments stream without merge overhead.
+    /// Reads every source intersecting `range` at snapshot `seqno`: the
+    /// memtables, the row-oriented tables and the columnar ones. It applies
+    /// deletions and range tombstones from any source to the keys of every
+    /// other, resolves merge chains as a read does, applies the optional
+    /// `predicate` (zone-map block-skip + row filter, after the newest version
+    /// of each key is chosen) and yields projected [`ColumnBatch`]es in
+    /// ascending key order, one row per key: its newest visible version. A
+    /// columnar segment no other source overlaps streams without merge
+    /// overhead.
     ///
     /// `range` bounds the result at row granularity: a segment that only
     /// partially overlaps `range` contributes only the rows whose keys fall
@@ -184,22 +205,39 @@ impl Tree {
     /// fully unbounded range keeps the zero-copy fast path for an all-visible
     /// segment.
     ///
-    /// `projection` lists the column ids to decode (value sub-column ids, plus
-    /// optionally the intrinsic [`COL_USER_KEY`] / seqno / value-type columns);
-    /// every other column is stepped over without decoding. Each yielded batch
-    /// carries exactly the projected columns.
-    ///
-    /// This reads only segments; memtable rows are not consulted (columnar data
-    /// is written directly to segments via
-    /// [`write_columnar_batch`](crate::AnyIngestion::write_columnar_batch)).
+    /// `projection` names the columns each batch carries, in its order: column
+    /// ids (the intrinsic [`COL_USER_KEY`] / seqno / value-type columns, or a
+    /// value column typed by what the tables store), converted from a slice of
+    /// ids, or a [`Projection`](projection::Projection) of declared fields,
+    /// which says what a field a row lacks reads as and carries the projector
+    /// the fields are read out of whole values through. Every other column of a
+    /// columnar table is stepped over without decoding.
     ///
     /// # Errors
     ///
-    /// Returns an error if a visible non-columnar segment overlaps `range` (a
-    /// mixed-mode tree is unsupported here), if the tree carries a merge
-    /// operator (see below), or — lazily, while iterating — on a block read /
-    /// decode failure or a layout mismatch between segments of an overlapping
-    /// group.
+    /// Returns [`Error::Projection`] when a declared field lies inside whole
+    /// values and no projector is set, and, lazily, while iterating, when the
+    /// data does not satisfy the projection. Returns an error on a block read
+    /// or decode failure, or on a failed point read resolving a merge chain.
+    ///
+    /// # Examples
+    ///
+    /// ```
+    /// use lsm_tree::table::columnar::COL_USER_KEY;
+    /// use lsm_tree::{AbstractTree, Config, SeqNo};
+    ///
+    /// let folder = tempfile::tempdir()?;
+    /// let tree = Config::new(folder, Default::default(), Default::default()).open()?;
+    /// // Rows in the memtable are read like any other source.
+    /// tree.insert("a", "1", 0);
+    /// tree.insert("b", "2", 1);
+    /// let rows: u32 = tree
+    ///     .columnar_scan(&[COL_USER_KEY], None, SeqNo::MAX, ..)?
+    ///     .map(|batch| batch.map(|b| b.row_count))
+    ///     .sum::<lsm_tree::Result<u32>>()?;
+    /// assert_eq!(rows, 2);
+    /// # Ok::<(), lsm_tree::Error>(())
+    /// ```
     pub fn columnar_scan<R: RangeBounds<UserKey>>(
         &self,
         projection: impl Into<projection::Projection>,

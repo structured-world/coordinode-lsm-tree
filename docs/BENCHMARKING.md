@@ -157,7 +157,8 @@ measured on.
 | `wide-records-full-read` | Small fields plus a 4 KiB payload, read whole. The baseline a projection is compared against. |
 | `wide-records-projected` | **Unsupported.** Needs a projection that returns the header fields without the payload. |
 | `mixed-value-sizes` | Short and long values in one key space, so no single block geometry fits both. |
-| `row-updates-over-columnar-base` | A columnar base flushed first, then the layout switched off and a third of the keys rewritten, so the newest version of those lives in a row-major run above a columnar one. |
+| `row-updates-over-columnar-base` | A columnar base flushed first, then the layout switched off and a third of the keys rewritten, so the newest version of those lives in a row-major run above a columnar one. Read by point reads. |
+| `row-updates-over-columnar-base-scan` | The same fixture read by the projected columnar scan of key and value, which merges the row-major run with the columnar base. Same extra figures as the columnar scans below. |
 | `versions-deletes-tombstones` | Several versions per key, a fifth point-deleted, a contiguous slice covered by a range tombstone, read at `SeqNo::MAX`. |
 | `selective-scan-sparse` | A predicate matching ~1% of rows, handed to the columnar scan over a field stored in a sub-column of its own, with zone maps on. Where materializing before the predicate runs wastes nearly all the work. |
 | `selective-scan-near-full` | A predicate matching ~90%, over the same fixture. Deferring materialization buys almost nothing here and its bookkeeping can cost more than it saves, so the two are read together. |

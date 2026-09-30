@@ -203,18 +203,17 @@ impl AnyTree {
     /// Runs a projected columnar scan across the tree.
     ///
     /// Delegates to [`Tree::columnar_scan`](crate::Tree::columnar_scan) on a
-    /// standard tree: iterates the columnar segments intersecting `range` and
-    /// visible at `seqno`, applies each segment's positional delete-bitmap and the
-    /// optional `predicate`, and yields projected
-    /// [`ColumnBatch`](crate::table::columnar::ColumnBatch)es in key order,
-    /// merging overlapping segments newest-seqno-wins. See
+    /// standard tree: reads the memtables and every table intersecting `range`
+    /// at `seqno`, and yields projected
+    /// [`ColumnBatch`](crate::table::columnar::ColumnBatch)es in key order, one
+    /// row per key, its newest visible version. See
     /// [`Tree::columnar_scan`](crate::Tree::columnar_scan) for the full contract.
     ///
     /// # Errors
     ///
     /// Returns an error if the tree is a blob tree (columnar scan does not support
-    /// KV separation), if a visible non-columnar segment overlaps `range`, or —
-    /// lazily, while iterating — on a block read / decode failure.
+    /// KV separation), and otherwise as
+    /// [`Tree::columnar_scan`](crate::Tree::columnar_scan).
     ///
     /// # Examples
     ///

@@ -227,6 +227,25 @@ fn versions_fixture_deletes_and_range_tombstone_remove_exactly_covered_rows() ->
 }
 
 #[test]
+fn row_updates_over_a_columnar_base_read_through_the_projected_scan() -> lsm_tree::Result<()> {
+    // The newest version of a third of the keys sits in a row-major run above
+    // the columnar base: the projected scan merges the two layouts, and every
+    // row it returns is checked against the write history as it streams.
+    let config = BenchConfig {
+        num: 3_000,
+        ..config()
+    };
+    let fixture = build_with(fixtures::columnar_base_row_updates, &config)?;
+    let pass = super::scan_columnar(&fixture)?;
+    assert_eq!(
+        pass.rows,
+        fixture.oracle.visible(),
+        "every visible row is returned once",
+    );
+    Ok(())
+}
+
+#[test]
 fn blob_placement_scenarios_zero_cache_report_unsupported() {
     // Placement moves the counters only through the scan's blob prefetch,
     // which a zero-capacity cache turns off. A figure published then would
