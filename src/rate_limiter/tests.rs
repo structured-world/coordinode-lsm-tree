@@ -277,28 +277,16 @@ fn a_brief_switch_off_still_releases_a_caller_mid_wait() {
     waiter.join().unwrap();
 }
 
-/// Starts `request` on its own thread with a stop flag, and returns the flag
-/// and the handle, whose result is whether the request was stopped.
+/// A stop signal that is clear on the entry check and set from the first poll
+/// of the wait on, so the request is stopped after it took its debit, with
+/// no dependence on thread timing.
 #[cfg(feature = "std")]
-fn spawn_request(
-    rl: &alloc::sync::Arc<RateLimiter>,
-    request: fn(&RateLimiter, u64, &dyn Fn() -> bool) -> bool,
-    bytes: u64,
-) -> (
-    alloc::sync::Arc<core::sync::atomic::AtomicBool>,
-    std::thread::JoinHandle<bool>,
-) {
-    let stop = alloc::sync::Arc::new(core::sync::atomic::AtomicBool::new(false));
-    let handle = {
-        let rl = alloc::sync::Arc::clone(rl);
-        let stop = alloc::sync::Arc::clone(&stop);
-        std::thread::spawn(move || {
-            request(&rl, bytes, &|| {
-                stop.load(core::sync::atomic::Ordering::Relaxed)
-            })
-        })
-    };
-    (stop, handle)
+fn stop_after_the_debit() -> impl Fn() -> bool {
+    let calls = core::cell::Cell::new(0u32);
+    move || {
+        calls.set(calls.get() + 1);
+        calls.get() > 1
+    }
 }
 
 /// A request abandoned mid-wait through `request_abortable` does no I/O, so
@@ -307,12 +295,9 @@ fn spawn_request(
 #[cfg(feature = "std")]
 #[test]
 fn an_aborted_request_returns_its_debit() {
-    let rl = alloc::sync::Arc::new(RateLimiter::new(1_000));
+    let rl = RateLimiter::new(1_000);
     // 1000 B of burst, then 5000 B of debt: five seconds at 1000 B/s.
-    let (stop, waiter) = spawn_request(&rl, |rl, b, s| rl.request_abortable(b, s), 6_000);
-    std::thread::sleep(ms(150));
-    stop.store(true, core::sync::atomic::Ordering::Relaxed);
-    assert!(waiter.join().unwrap(), "the request was stopped");
+    assert!(rl.request_abortable(6_000, stop_after_the_debit()));
     let owed = rl.acquire_wait(100, RateLimiter::std_now());
     assert!(
         owed < ms(500),
@@ -325,11 +310,8 @@ fn an_aborted_request_returns_its_debit() {
 #[cfg(feature = "std")]
 #[test]
 fn an_interrupted_request_keeps_its_debit() {
-    let rl = alloc::sync::Arc::new(RateLimiter::new(1_000));
-    let (stop, waiter) = spawn_request(&rl, |rl, b, s| rl.request_interruptible(b, s), 6_000);
-    std::thread::sleep(ms(150));
-    stop.store(true, core::sync::atomic::Ordering::Relaxed);
-    assert!(waiter.join().unwrap(), "the request was stopped");
+    let rl = RateLimiter::new(1_000);
+    assert!(rl.request_interruptible(6_000, stop_after_the_debit()));
     let owed = rl.acquire_wait(100, RateLimiter::std_now());
     assert!(
         owed > Duration::from_secs(4),
@@ -342,22 +324,17 @@ fn an_interrupted_request_keeps_its_debit() {
 #[cfg(feature = "std")]
 #[test]
 fn an_aborted_debit_shortens_a_later_wait() {
-    let rl = alloc::sync::Arc::new(RateLimiter::new(1_000));
-    // The first request takes the burst and owes 4000 B.
-    let (stop_first, first) = spawn_request(&rl, |rl, b, s| rl.request_abortable(b, s), 5_000);
-    std::thread::sleep(ms(50));
-    // The second is queued behind it: 5000 B owed, five seconds.
-    let (_, second) = spawn_request(&rl, |rl, b, s| rl.request_interruptible(b, s), 1_000);
-    std::thread::sleep(ms(100));
-    let start = std::time::Instant::now();
-    stop_first.store(true, core::sync::atomic::Ordering::Relaxed);
-    assert!(first.join().unwrap());
-    assert!(!second.join().unwrap());
-    assert!(
-        start.elapsed() < Duration::from_secs(2),
-        "the later request is released once the earlier debit is returned \
-         (took {:?})",
-        start.elapsed()
+    let rl = RateLimiter::new(1_000);
+    // The first debit takes the burst and owes 4000 B; the second is queued
+    // behind it and owes 5000 B.
+    let first = rl.take_ticket(5_000, ms(0)).unwrap();
+    let second = rl.take_ticket(1_000, ms(0)).unwrap();
+    assert_eq!(Some(Duration::from_secs(5)), rl.remaining(&second, ms(0)));
+    rl.withdraw(&first, 5_000);
+    assert_eq!(
+        None,
+        rl.remaining(&second, ms(0)),
+        "the later debit is covered once the earlier one is returned"
     );
 }
 
@@ -366,42 +343,34 @@ fn an_aborted_debit_shortens_a_later_wait() {
 #[cfg(feature = "std")]
 #[test]
 fn an_aborted_debit_does_not_release_an_earlier_waiter() {
-    let rl = alloc::sync::Arc::new(RateLimiter::new(1_000));
-    let start = std::time::Instant::now();
-    // The first request takes the burst and owes 1000 B: one second.
-    let (_, first) = spawn_request(&rl, |rl, b, s| rl.request_interruptible(b, s), 2_000);
-    std::thread::sleep(ms(50));
-    let (stop_second, second) = spawn_request(&rl, |rl, b, s| rl.request_abortable(b, s), 5_000);
-    std::thread::sleep(ms(100));
-    stop_second.store(true, core::sync::atomic::Ordering::Relaxed);
-    assert!(second.join().unwrap());
-    assert!(!first.join().unwrap());
-    assert!(
-        start.elapsed() >= ms(900),
-        "the earlier request still repays its own debt (took {:?})",
-        start.elapsed()
+    let rl = RateLimiter::new(1_000);
+    // The first debit takes the burst and owes 1000 B: one second.
+    let first = rl.take_ticket(2_000, ms(0)).unwrap();
+    let second = rl.take_ticket(5_000, ms(0)).unwrap();
+    rl.withdraw(&second, 5_000);
+    assert_eq!(
+        Some(Duration::from_secs(1)),
+        rl.remaining(&first, ms(0)),
+        "the earlier debit still repays its own place in line"
     );
+    assert_eq!(None, rl.remaining(&first, ms(1_000)));
 }
 
-/// A rate lowered in the middle of a sleep applies from the moment it
-/// changed: the part of the debt left at that moment is repaid at the new
-/// rate, not the whole sleep counted at the old one.
+/// A rate lowered in the middle of a wait applies from the moment it changed:
+/// the part of the debt left at that moment is repaid at the new rate, not the
+/// time slept so far counted at the old one.
 #[cfg(feature = "std")]
 #[test]
-fn a_rate_lowered_mid_sleep_applies_from_the_change() {
-    let rl = alloc::sync::Arc::new(RateLimiter::new(100_000));
-    let start = std::time::Instant::now();
+fn a_rate_lowered_mid_wait_applies_from_the_change() {
+    let rl = RateLimiter::new(100_000);
     // The burst, then 10000 B of debt: 100 ms at 100000 B/s.
-    let (_, waiter) = spawn_request(&rl, |rl, b, s| rl.request_interruptible(b, s), 110_000);
-    std::thread::sleep(ms(50));
-    // About 5000 B are left, now at 10000 B/s: about 500 ms more.
-    rl.set_rate(10_000);
-    assert!(!waiter.join().unwrap());
-    assert!(
-        start.elapsed() >= ms(400),
-        "the rest of the debt is repaid at the lowered rate (took {:?})",
-        start.elapsed()
-    );
+    let ticket = rl.take_ticket(110_000, ms(0)).unwrap();
+    assert_eq!(Some(ms(100)), rl.remaining(&ticket, ms(0)));
+    // 5000 B repaid by then; the other 5000 B at 10000 B/s take 500 ms.
+    rl.set_rate_at(10_000, ms(50));
+    assert_eq!(Some(ms(500)), rl.remaining(&ticket, ms(50)));
+    assert_eq!(Some(ms(450)), rl.remaining(&ticket, ms(100)));
+    assert_eq!(None, rl.remaining(&ticket, ms(550)));
 }
 
 #[test]
