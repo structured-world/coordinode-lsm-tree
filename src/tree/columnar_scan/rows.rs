@@ -20,10 +20,54 @@ use crate::{InternalValue, SeqNo, UserKey};
 /// Rows a row source reads into one batch.
 const ROWS_PER_BATCH: usize = 1_024;
 
+/// Encoding bytes of a batch before its first row: the leading offset of its
+/// key and value columns.
+const BATCH_BASE_BYTES: u64 = 8;
+
+/// Encoding bytes a row adds besides its key and value: an offset in each of
+/// the key and value columns, its seqno and its value type.
+const ROW_OVERHEAD_BYTES: u64 = 4 + 4 + 8 + 1;
+
+/// The encoded size a row adds to a batch.
+fn row_bytes(row: &InternalValue) -> u64 {
+    // Lengths of in-memory slices: their sum stays far below u64.
+    (row.key.user_key.len() + row.value.len()) as u64 + ROW_OVERHEAD_BYTES
+}
+
+/// The rows of one batch as they are gathered, and the size their encoding
+/// takes: every intrinsic column, so the batch as held never exceeds it.
+struct Gather {
+    entries: Vec<InternalValue>,
+    bytes: u64,
+    share: u64,
+}
+
+impl Gather {
+    /// Whether `row` joins the batch: the first row always does, a later one
+    /// only within the share.
+    fn fits(&self, row: &InternalValue) -> bool {
+        self.entries.is_empty() || self.bytes + row_bytes(row) <= self.share
+    }
+
+    fn push(&mut self, row: InternalValue) {
+        self.bytes += row_bytes(&row);
+        self.entries.push(row);
+    }
+
+    /// Whether the batch takes more rows.
+    fn open(&self) -> bool {
+        self.entries.len() < ROWS_PER_BATCH && self.bytes < self.share
+    }
+}
+
 /// Where a row source reads from.
 enum RowInput {
     /// A row-oriented table, read by its own range iterator.
-    Table(alloc::boxed::Box<dyn Iterator<Item = crate::Result<InternalValue>> + Send>),
+    Table {
+        rows: alloc::boxed::Box<dyn Iterator<Item = crate::Result<InternalValue>> + Send>,
+        /// The row read that did not fit the last batch.
+        carry: Option<InternalValue>,
+    },
     /// A memtable, read from the entry after the last one read, so the source
     /// holds the memtable rather than a borrow of it.
     Memtable {
@@ -59,7 +103,10 @@ impl RowCursor {
         share: u64,
     ) -> Self {
         Self {
-            input: RowInput::Table(alloc::boxed::Box::new(table.range((lo, hi)))),
+            input: RowInput::Table {
+                rows: alloc::boxed::Box::new(table.range((lo, hi))),
+                carry: None,
+            },
             snapshot,
             columns,
             share,
@@ -88,56 +135,66 @@ impl RowCursor {
     }
 
     /// The next batch of rows visible at the snapshot, or `None` once the
-    /// source is read. A batch ends at [`ROWS_PER_BATCH`] rows or once its
-    /// payload reaches the share; a row larger than the share alone is
-    /// still read, and counted.
+    /// source is read. A batch ends at [`ROWS_PER_BATCH`] rows or before the
+    /// row that would take its encoding past the share; a row larger than the
+    /// share alone is still read, and counted.
     fn next_batch(&mut self) -> Option<crate::Result<ColumnBatch>> {
         let snapshot = self.snapshot;
-        let share = self.share;
-        let mut entries = Vec::new();
-        let mut bytes: u64 = 0;
-        let mut take = |row: InternalValue| {
-            // Lengths of in-memory slices: their sum stays far below u64.
-            bytes += (row.key.user_key.len() + row.value.len()) as u64;
-            entries.push(row);
-            entries.len() < ROWS_PER_BATCH && bytes < share
+        let mut gather = Gather {
+            entries: Vec::new(),
+            bytes: BATCH_BASE_BYTES,
+            share: self.share,
         };
         match &mut self.input {
-            RowInput::Table(rows) => loop {
-                match rows.next() {
-                    // A table read to its end yields what was gathered.
-                    None => break,
-                    Some(Err(e)) => return Some(Err(e)),
-                    // Exclusive MVCC, as every read at a snapshot.
-                    Some(Ok(row)) if row.key.seqno < snapshot => {
-                        if !take(row) {
-                            break;
-                        }
-                    }
-                    Some(Ok(_)) => {}
+            RowInput::Table { rows, carry } => {
+                // The row that did not fit the last batch opens this one.
+                if let Some(row) = carry.take() {
+                    gather.push(row);
                 }
-            },
+                while gather.open() {
+                    match rows.next() {
+                        // A table read to its end yields what was gathered.
+                        None => break,
+                        Some(Err(e)) => return Some(Err(e)),
+                        // Exclusive MVCC, as every read at a snapshot.
+                        Some(Ok(row)) if row.key.seqno < snapshot => {
+                            if !gather.fits(&row) {
+                                *carry = Some(row);
+                                break;
+                            }
+                            gather.push(row);
+                        }
+                        Some(Ok(_)) => {}
+                    }
+                }
+            }
             RowInput::Memtable { memtable, lo, hi } => {
+                // A row that does not fit stays past `lo`, read by the next
+                // batch.
                 for row in memtable
                     .range_internal((lo.clone(), hi.clone()))
                     .filter(|row| row.key.seqno < snapshot)
                 {
-                    if !take(row) {
+                    if !gather.fits(&row) {
+                        break;
+                    }
+                    gather.push(row);
+                    if !gather.open() {
                         break;
                     }
                 }
-                if let Some(last) = entries.last() {
+                if let Some(last) = gather.entries.last() {
                     *lo = Bound::Excluded(last.key.clone());
                 }
             }
         }
-        if entries.is_empty() {
+        if gather.entries.is_empty() {
             return None;
         }
-        if entries.len() == 1 && bytes > share {
+        if gather.bytes > gather.share {
             self.oversized += 1;
         }
-        Some(self.build(&entries))
+        Some(self.build(&gather.entries))
     }
 
     /// Rows read past the share since this was last called.

@@ -248,6 +248,57 @@ fn memtable_rows_merged_over_a_segment_hold_no_more_than_the_scan_budget() {
 }
 
 #[test]
+fn small_memtable_rows_hold_their_encoding_within_the_scan_budget() {
+    // Rows whose keys and values are small are mostly encoding: each carries
+    // two offsets, a seqno and a value type besides its bytes. The budget
+    // counts the batch as it is held, encoding included.
+    // The same from a memtable and from a row-oriented table.
+    const BUDGET: u64 = 4_096;
+    const SOURCE_ROWS: u32 = 2_000;
+    for flushed in [false, true] {
+        let folder = get_tmp_folder();
+        let AnyTree::Standard(tree) = Config::new(
+            folder.path(),
+            SequenceNumberCounter::default(),
+            SequenceNumberCounter::default(),
+        )
+        .columnar_scan_budget(BUDGET)
+        .open()
+        .expect("open") else {
+            panic!("expected a standard tree");
+        };
+        for i in 0..SOURCE_ROWS {
+            tree.insert(key(i), Vec::new(), u64::from(i));
+        }
+        if flushed {
+            tree.flush_active_memtable(0).expect("flush");
+        }
+
+        let mut scan = tree
+            .columnar_scan(&[COL_USER_KEY, COL_VALUE], None, SeqNo::MAX, ..)
+            .expect("scan");
+        let mut keys = Vec::new();
+        for batch in &mut scan {
+            let batch = batch.expect("batch");
+            for row in 0..batch.row_count {
+                keys.push(bytes_cell(&batch.columns[0].data, batch.row_count, row));
+            }
+        }
+        let expected: Vec<Vec<u8>> = (0..SOURCE_ROWS).map(key).collect();
+        assert_eq!(
+            expected, keys,
+            "every key once, in order (flushed: {flushed})"
+        );
+        assert_eq!(scan.oversized_reads(), 0, "every row fits the share");
+        assert!(
+            scan.peak_payload_bytes() <= BUDGET,
+            "the scan held {} B under a {BUDGET} B budget (flushed: {flushed})",
+            scan.peak_payload_bytes(),
+        );
+    }
+}
+
+#[test]
 fn a_memtable_row_larger_than_its_share_is_read_and_counted() {
     // A budget smaller than one memtable row cannot be kept either: each row
     // is read on its own, returned, and counted as a read past the share.
