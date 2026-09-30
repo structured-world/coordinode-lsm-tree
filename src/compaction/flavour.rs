@@ -844,7 +844,8 @@ impl CompactionFlavour for RelocatingCompaction {
                 // only has the encoded handle). Interruptible so a low
                 // limit can't stall shutdown; the return is ignored because
                 // the blob is already read and must be written to keep the
-                // new vptr valid — only the *wait* is shortened on stop.
+                // new vptr valid — only the *wait* is shortened on stop, and
+                // the debit stays spent for the write that follows.
                 let _ = self
                     .rate_limiter
                     .request_interruptible(blob_entry.value.len() as u64, || {

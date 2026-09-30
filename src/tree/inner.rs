@@ -210,7 +210,9 @@ pub struct TreeInner {
     /// under `no_std` it does not throttle: there is no ambient monotonic clock
     /// there, so
     /// [`request_interruptible`](crate::rate_limiter::RateLimiter::request_interruptible)
-    /// only honours the stop signal. Holding the bucket per tree is what makes
+    /// and
+    /// [`request_abortable`](crate::rate_limiter::RateLimiter::request_abortable)
+    /// only honour the stop signal. Holding the bucket per tree is what makes
     /// the rate correct once a caller-provided clock is wired in.
     pub(crate) compaction_rate_limiter: Arc<crate::rate_limiter::RateLimiter>,
 
