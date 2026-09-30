@@ -1,5 +1,5 @@
 window.BENCHMARK_DATA = {
-  "lastUpdate": 1790752881180,
+  "lastUpdate": 1790752892315,
   "repoUrl": "https://github.com/structured-world/coordinode-lsm-tree",
   "entries": {
     "lsm-tree db_bench costs": [
@@ -2964,6 +2964,264 @@ window.BENCHMARK_DATA = {
             "value": 6222.25,
             "unit": "B/row",
             "extra": "keys: 10000 | rows: 10000 | read: 83123466 B | decoded: 82570298 B | copied: 62222500 B | elapsed: 77.5104ms\niterations: 3"
+          }
+        ]
+      },
+      {
+        "commit": {
+          "author": {
+            "email": "mail@polaz.com",
+            "name": "Dmitry Prudnikov",
+            "username": "polaz"
+          },
+          "committer": {
+            "email": "noreply@github.com",
+            "name": "GitHub",
+            "username": "web-flow"
+          },
+          "distinct": true,
+          "id": "397e9b07389ebc04754c6301497811daaece23a4",
+          "message": "perf(filter): size filters by measured negative-probe load (#748)\n\n## Summary\n\n- An optional filter advisor sizes each filter a flush, ingestion or\ncompaction writes by the negative probes its key range draws, against a\ntree-wide budget of serialised filter bytes, instead of one static width\nper level.\n- Off by default; with it off, tables are byte-identical to the static\npolicy apart from the filter meta keys (below) and the probe path does\nnot count.\n\n## Changes\n\n- Per-table probe statistics: probes that reached a filter, and among\nthem keys the table holds no version of (true negatives and false\npositives). Keys invisible at the snapshot, tombstoned keys,\nrange-pruned reads, tables a range tombstone covers and keys a partition\nindex rules out alone do not count. Point reads, prefix scans and the\nfilter checks of merge-operand resolution count alike, a pass whose read\nthen finds nothing as a false positive. Counts halve once the live\ntables hold more probes than the window, once per crossing however many\nrewrites plan together.\n- A compaction output inherits its inputs' counts by the share of their\ndata blocks it covers (the block goes to the output holding its last\nkey); where inputs overlap, each part of the range takes the counts of\nthe oldest input with a filter there, since the same lookups probed\neach; a restricted table keeps its suffix's share, and its density and\nthe keys still to write are over the keys it serves.\n- The advisor chooses each filter's width from a discrete set by\nexpected false positives plus a price per filter byte, the price set so\nthe filters fill the budget and set again before each filter from the\ndata and the budget a compaction has left. Each live table is priced as\nits own level builds it (static width, partitioned or not, a short last\npartition as its own filter), whatever level the rewrite writes.\nPer-table densities are shrunk towards their mean by the noise in their\ncounts, so an even load gets one width.\n- Filters are admitted by their encoded bytes, retried narrower when\nthey leave no room for the keys still to come; the narrowest is always\nwritten, and built alone when even the narrowest widths do not fit. The\ntree reports the over-budget state while the live filters exceed the\nbudget (a lowered budget, or keys no configured width fits).\n- Filters built side by side (a table's partitions on the writer's\nworkers) price as they would built in turn: one priced while an earlier\none is in flight counts that one's data as still to come.\n- The price search reads an input's share of a key range from its key\nrange where that settles it, and works out a full partition's sizes once\nper key count.\n- Every writer of new tables plans its filters: a flush of either tree\nkind, an ingestion, a compaction and each tight-space slice. Each keeps\nroom for every table it rotates into by the keys still to come: a flush\ncounts its memtables' distinct keys, a compaction its inputs', an\ningestion takes its entry count when given one\n(`AnyIngestion::expected_entries`). The keys are converted to filter\nhashes at the plan's estimate until the first filter, then at the\nhighest rate any filter of the rewrite has held, since where a rewrite\nwrites decides whether prefixes are hashed. A compaction's estimate from\nits inputs' shares (which counts a key in several overlapping inputs\nonce in each, and reads a slice's share of data bytes as one of keys) is\ncorrected by the keys each built filter covers against the estimate for\nits range; the price groups the data still to come into output tables in\nkey order rather than one filter per input, and before any filter is\nbuilt takes the correction from the filter being priced.\n- The held filter bytes are one figure per tree: the published version's\nfilters plus what each rewrite in progress has built. Rewrites running\ntogether draw on it, each reserving in it the room its later filters\ntake at the narrowest width. The room a compaction's install would free\nis its own to build into: the held bytes keep counting the filters it\nreplaces, since it may still fail and leave them live, and the others\nkeep room only for the part of its floor those do not cover. A rewrite\nsettles when the last of its writers and installs lets go of its plan;\none that fails gives its room back.\n- A table with a filter records how it was built in meta keys: the\nhashes it holds (`filter_hashes`, under a prefix extractor more than its\nkeys), the static width it was written under (`filter_bits`) and a\npartitioned filter's largest partition (`filter_partition_hashes`). The\nadvisor prices each table by these rather than by the level it lies in,\nwhich a compaction written for another level or a move leaves out of\nstep. Densities count distinct keys, not versions; tables without a\nfilter stay out of the price; a split compaction prices by what every\nkey range has still to write.\n- `AbstractTree::filter_memory` reports serialised and resident filter\nbytes (both at on-disk size), the budget and the over-budget state.\n- Config: `Config::filter_advisor`, `FilterAdvisor` (budget, width set,\nwindow).\n- The price counts each filter block at its on-disk size, framing\n(header, encryption tag, parity) included, as the budget does.\n- The expected size of a BuRR filter follows the layers a build makes,\nexact for short filters where the partition-split estimate runs up to\n30% short.\n- `benches/filter_advisor.rs`: cold absent-key lookups at the static\npolicy's filter bytes, skewed and uniform; probe-counting cost; rewrite\ncost; per-read p50/p99/p999; tree size from `FA_RANGES`, `FA_KEYS`,\n`FA_LOOKUPS`; `FA_PARTITIONED=1` partitions the filters.\n\n## Measurements\n\nAbsent-key lookups at the static policy's filter bytes, false positives\nper 200k lookups (macOS and Windows alike), every rewrite within the\nbudget:\n\n| Static width | Skewed | Uniform |\n|---|---|---|\n| 10 bits | 253 → 34 | 209 → 211 |\n| 4 bits | 12551 → 2162 | 12483 → 12567 |\n\nWindows cold lookup time: skewed at 4 bits 15.86 → 14.43 ms; at 10 bits\nwithin 0.5% (false positives are too rare there to move it). Advisor off\nagainst the base: cached point reads 262-264 ns against 273-276 ns. The\nrewrite of the skewed tree: 108.9 ms static, 116.6 ms with the advisor\n(macOS). At 396 inputs (724 tables) one compaction takes 1.93 s static\nand 2.17-2.23 s with the advisor (macOS, one run of each arm on the same\nmachine).\n\n## Testing\n\nFormatting, clippy in both feature sets, the full test suite with and\nwithout all features, doc tests, docs, the no-std check,\n`tools/sst-dump` and the `tools/db_bench` lints pass on macOS; the\nbenchmarks also ran on Windows.\n\nCloses #667",
+          "timestamp": "2026-09-30T10:13:23+03:00",
+          "tree_id": "589eaf20a94d9f4885b0b9cc9b79d80f96d6c3fd",
+          "url": "https://github.com/structured-world/coordinode-lsm-tree/commit/397e9b07389ebc04754c6301497811daaece23a4"
+        },
+        "date": 1790752887840,
+        "tool": "customSmallerIsBetter",
+        "benches": [
+          {
+            "name": "mixed-layout / narrow-records bytes read per row",
+            "value": 42.1442,
+            "unit": "B/row",
+            "extra": "keys: 200000 | rows: 200000 | read: 8428840 B | decoded: 8357098 B | copied: 9000000 B | elapsed: 242.421ms\niterations: 3"
+          },
+          {
+            "name": "mixed-layout / narrow-records bytes decoded per row",
+            "value": 41.78549,
+            "unit": "B/row",
+            "extra": "keys: 200000 | rows: 200000 | read: 8428840 B | decoded: 8357098 B | copied: 9000000 B | elapsed: 242.421ms\niterations: 3"
+          },
+          {
+            "name": "mixed-layout / narrow-records bytes copied per row",
+            "value": 45,
+            "unit": "B/row",
+            "extra": "keys: 200000 | rows: 200000 | read: 8428840 B | decoded: 8357098 B | copied: 9000000 B | elapsed: 242.421ms\niterations: 3"
+          },
+          {
+            "name": "mixed-layout / wide-records-full-read bytes read per row",
+            "value": 4215,
+            "unit": "B/row",
+            "extra": "keys: 50000 | rows: 50000 | read: 210750000 B | decoded: 209100000 B | copied: 207050000 B | elapsed: 358.5274ms\niterations: 3"
+          },
+          {
+            "name": "mixed-layout / wide-records-full-read bytes decoded per row",
+            "value": 4182,
+            "unit": "B/row",
+            "extra": "keys: 50000 | rows: 50000 | read: 210750000 B | decoded: 209100000 B | copied: 207050000 B | elapsed: 358.5274ms\niterations: 3"
+          },
+          {
+            "name": "mixed-layout / wide-records-full-read bytes copied per row",
+            "value": 4141,
+            "unit": "B/row",
+            "extra": "keys: 50000 | rows: 50000 | read: 210750000 B | decoded: 209100000 B | copied: 207050000 B | elapsed: 358.5274ms\niterations: 3"
+          },
+          {
+            "name": "mixed-layout / mixed-value-sizes bytes read per row",
+            "value": 867.21184,
+            "unit": "B/row",
+            "extra": "keys: 100000 | rows: 100000 | read: 86721184 B | decoded: 86391151 B | copied: 86420000 B | elapsed: 211.0952ms\niterations: 3"
+          },
+          {
+            "name": "mixed-layout / mixed-value-sizes bytes decoded per row",
+            "value": 863.91151,
+            "unit": "B/row",
+            "extra": "keys: 100000 | rows: 100000 | read: 86721184 B | decoded: 86391151 B | copied: 86420000 B | elapsed: 211.0952ms\niterations: 3"
+          },
+          {
+            "name": "mixed-layout / mixed-value-sizes bytes copied per row",
+            "value": 864.2,
+            "unit": "B/row",
+            "extra": "keys: 100000 | rows: 100000 | read: 86721184 B | decoded: 86391151 B | copied: 86420000 B | elapsed: 211.0952ms\niterations: 3"
+          },
+          {
+            "name": "mixed-layout / row-updates-over-columnar-base bytes read per row",
+            "value": 215.46455,
+            "unit": "B/row",
+            "extra": "keys: 100000 | rows: 100000 | read: 21546455 B | decoded: 20938463 B | copied: 51100094 B | elapsed: 471.9833ms\niterations: 3"
+          },
+          {
+            "name": "mixed-layout / row-updates-over-columnar-base bytes decoded per row",
+            "value": 209.38463,
+            "unit": "B/row",
+            "extra": "keys: 100000 | rows: 100000 | read: 21546455 B | decoded: 20938463 B | copied: 51100094 B | elapsed: 471.9833ms\niterations: 3"
+          },
+          {
+            "name": "mixed-layout / row-updates-over-columnar-base bytes copied per row",
+            "value": 511.00094,
+            "unit": "B/row",
+            "extra": "keys: 100000 | rows: 100000 | read: 21546455 B | decoded: 20938463 B | copied: 51100094 B | elapsed: 471.9833ms\niterations: 3"
+          },
+          {
+            "name": "mixed-layout / versions-deletes-tombstones bytes read per row",
+            "value": 133.68026315789473,
+            "unit": "B/row",
+            "extra": "keys: 100000 | rows: 76000 | read: 10159700 B | decoded: 10076111 B | copied: 10013359 B | elapsed: 181.3041ms\niterations: 3"
+          },
+          {
+            "name": "mixed-layout / versions-deletes-tombstones bytes decoded per row",
+            "value": 132.58040789473685,
+            "unit": "B/row",
+            "extra": "keys: 100000 | rows: 76000 | read: 10159700 B | decoded: 10076111 B | copied: 10013359 B | elapsed: 181.3041ms\niterations: 3"
+          },
+          {
+            "name": "mixed-layout / versions-deletes-tombstones bytes copied per row",
+            "value": 131.75472368421052,
+            "unit": "B/row",
+            "extra": "keys: 100000 | rows: 76000 | read: 10159700 B | decoded: 10076111 B | copied: 10013359 B | elapsed: 181.3041ms\niterations: 3"
+          },
+          {
+            "name": "mixed-layout / selective-scan-sparse bytes read per row",
+            "value": 4249.199806013579,
+            "unit": "B/row",
+            "extra": "keys: 100000 | rows: 1031 | read: 4380925 B | decoded: 4210810 B | copied: 293835 B | elapsed: 26.9925ms\niterations: 3"
+          },
+          {
+            "name": "mixed-layout / selective-scan-sparse bytes decoded per row",
+            "value": 4084.199806013579,
+            "unit": "B/row",
+            "extra": "keys: 100000 | rows: 1031 | read: 4380925 B | decoded: 4210810 B | copied: 293835 B | elapsed: 26.9925ms\niterations: 3"
+          },
+          {
+            "name": "mixed-layout / selective-scan-sparse bytes copied per row",
+            "value": 285,
+            "unit": "B/row",
+            "extra": "keys: 100000 | rows: 1031 | read: 4380925 B | decoded: 4210810 B | copied: 293835 B | elapsed: 26.9925ms\niterations: 3"
+          },
+          {
+            "name": "mixed-layout / selective-scan-near-full bytes read per row",
+            "value": 340.1047555555555,
+            "unit": "B/row",
+            "extra": "keys: 100000 | rows: 90000 | read: 30609428 B | decoded: 29737733 B | copied: 24990376 B | elapsed: 80.528ms\niterations: 3"
+          },
+          {
+            "name": "mixed-layout / selective-scan-near-full bytes decoded per row",
+            "value": 330.41925555555554,
+            "unit": "B/row",
+            "extra": "keys: 100000 | rows: 90000 | read: 30609428 B | decoded: 29737733 B | copied: 24990376 B | elapsed: 80.528ms\niterations: 3"
+          },
+          {
+            "name": "mixed-layout / selective-scan-near-full bytes copied per row",
+            "value": 277.67084444444447,
+            "unit": "B/row",
+            "extra": "keys: 100000 | rows: 90000 | read: 30609428 B | decoded: 29737733 B | copied: 24990376 B | elapsed: 80.528ms\niterations: 3"
+          },
+          {
+            "name": "mixed-layout / columnar-scan-one-segment bytes read per row",
+            "value": 286.70793,
+            "unit": "B/row",
+            "extra": "keys: 100000 | rows: 100000 | read: 28670793 B | decoded: 28158666 B | copied: 0 B | elapsed: 47.8937ms\niterations: 3"
+          },
+          {
+            "name": "mixed-layout / columnar-scan-one-segment bytes decoded per row",
+            "value": 281.58666,
+            "unit": "B/row",
+            "extra": "keys: 100000 | rows: 100000 | read: 28670793 B | decoded: 28158666 B | copied: 0 B | elapsed: 47.8937ms\niterations: 3"
+          },
+          {
+            "name": "mixed-layout / columnar-scan-one-segment bytes copied per row",
+            "value": 0,
+            "unit": "B/row",
+            "extra": "keys: 100000 | rows: 100000 | read: 28670793 B | decoded: 28158666 B | copied: 0 B | elapsed: 47.8937ms\niterations: 3"
+          },
+          {
+            "name": "mixed-layout / columnar-scan-one-segment retained payload",
+            "value": 16098,
+            "unit": "B",
+            "extra": "keys: 100000 | rows: 100000 | read: 28670793 B | decoded: 28158666 B | copied: 0 B | elapsed: 47.8937ms\niterations: 3"
+          },
+          {
+            "name": "mixed-layout / columnar-scan-one-segment time to first batch",
+            "value": 120.8,
+            "unit": "us",
+            "extra": "keys: 100000 | rows: 100000 | read: 28670793 B | decoded: 28158666 B | copied: 0 B | elapsed: 56.1005ms\niterations: 3"
+          },
+          {
+            "name": "mixed-layout / columnar-scan-one-segment bytes read to first batch",
+            "value": 16629,
+            "unit": "B",
+            "extra": "keys: 100000 | rows: 100000 | read: 28670793 B | decoded: 28158666 B | copied: 0 B | elapsed: 47.8937ms\niterations: 3"
+          },
+          {
+            "name": "mixed-layout / columnar-scan-overlap-8 bytes read per row",
+            "value": 298.36368,
+            "unit": "B/row",
+            "extra": "keys: 100000 | rows: 100000 | read: 29836368 B | decoded: 29096640 B | copied: 28555168 B | elapsed: 89.1809ms\niterations: 3"
+          },
+          {
+            "name": "mixed-layout / columnar-scan-overlap-8 bytes decoded per row",
+            "value": 290.9664,
+            "unit": "B/row",
+            "extra": "keys: 100000 | rows: 100000 | read: 29836368 B | decoded: 29096640 B | copied: 28555168 B | elapsed: 89.1809ms\niterations: 3"
+          },
+          {
+            "name": "mixed-layout / columnar-scan-overlap-8 bytes copied per row",
+            "value": 285.55168,
+            "unit": "B/row",
+            "extra": "keys: 100000 | rows: 100000 | read: 29836368 B | decoded: 29096640 B | copied: 28555168 B | elapsed: 89.1809ms\niterations: 3"
+          },
+          {
+            "name": "mixed-layout / columnar-scan-overlap-8 retained payload",
+            "value": 132496,
+            "unit": "B",
+            "extra": "keys: 100000 | rows: 100000 | read: 29836368 B | decoded: 29096640 B | copied: 28555168 B | elapsed: 89.1809ms\niterations: 3"
+          },
+          {
+            "name": "mixed-layout / columnar-scan-overlap-8 time to first batch",
+            "value": 683.3,
+            "unit": "us",
+            "extra": "keys: 100000 | rows: 100000 | read: 29836368 B | decoded: 29096640 B | copied: 28555168 B | elapsed: 89.1809ms\niterations: 3"
+          },
+          {
+            "name": "mixed-layout / columnar-scan-overlap-8 bytes read to first batch",
+            "value": 138440,
+            "unit": "B",
+            "extra": "keys: 100000 | rows: 100000 | read: 29836368 B | decoded: 29096640 B | copied: 28555168 B | elapsed: 89.1809ms\niterations: 3"
+          },
+          {
+            "name": "mixed-layout / blobs-well-placed bytes read per row",
+            "value": 8297.8593,
+            "unit": "B/row",
+            "extra": "keys: 10000 | rows: 10000 | read: 82978593 B | decoded: 82426811 B | copied: 82911721 B | elapsed: 46.9771ms\niterations: 3"
+          },
+          {
+            "name": "mixed-layout / blobs-well-placed bytes decoded per row",
+            "value": 8242.6811,
+            "unit": "B/row",
+            "extra": "keys: 10000 | rows: 10000 | read: 82978593 B | decoded: 82426811 B | copied: 82911721 B | elapsed: 46.9771ms\niterations: 3"
+          },
+          {
+            "name": "mixed-layout / blobs-well-placed bytes copied per row",
+            "value": 8291.1721,
+            "unit": "B/row",
+            "extra": "keys: 10000 | rows: 10000 | read: 82978593 B | decoded: 82426811 B | copied: 82911721 B | elapsed: 46.9771ms\niterations: 3"
+          },
+          {
+            "name": "mixed-layout / blobs-scattered bytes read per row",
+            "value": 8312.3466,
+            "unit": "B/row",
+            "extra": "keys: 10000 | rows: 10000 | read: 83123466 B | decoded: 82570298 B | copied: 62222500 B | elapsed: 57.3541ms\niterations: 3"
+          },
+          {
+            "name": "mixed-layout / blobs-scattered bytes decoded per row",
+            "value": 8257.0298,
+            "unit": "B/row",
+            "extra": "keys: 10000 | rows: 10000 | read: 83123466 B | decoded: 82570298 B | copied: 62222500 B | elapsed: 57.3541ms\niterations: 3"
+          },
+          {
+            "name": "mixed-layout / blobs-scattered bytes copied per row",
+            "value": 6222.25,
+            "unit": "B/row",
+            "extra": "keys: 10000 | rows: 10000 | read: 83123466 B | decoded: 82570298 B | copied: 62222500 B | elapsed: 57.3541ms\niterations: 3"
           }
         ]
       }
