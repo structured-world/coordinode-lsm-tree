@@ -145,6 +145,11 @@ impl Segment {
         !matches!(self.source, Source::Columnar(_))
     }
 
+    /// Whether the source is a memtable.
+    fn is_memtable(&self) -> bool {
+        matches!(self.source, Source::Memtable(_))
+    }
+
     /// Whether the source can hold a deletion, so the value type is decoded.
     fn records_deletions(&self) -> bool {
         match &self.source {
@@ -215,9 +220,11 @@ impl Tree {
     ///
     /// # Errors
     ///
-    /// Returns [`Error::Projection`] when a declared field lies inside whole
-    /// values and no projector is set, and, lazily, while iterating, when the
-    /// data does not satisfy the projection. Returns an error on a block read
+    /// Returns [`Error::Projection`] when the projection names one column id
+    /// twice, when a declared field may lie inside a whole value the scan
+    /// returns and no projector is set (a memtable holding only deletions
+    /// needs none), and, lazily, while iterating, when the data does not
+    /// satisfy the projection. Returns an error on a block read
     /// or decode failure, or on a failed point read resolving a merge chain.
     ///
     /// # Examples
@@ -246,6 +253,19 @@ impl Tree {
         range: R,
     ) -> crate::Result<ColumnarScan> {
         let projection = projection.into();
+        // A batch names its columns by id, so one id projected twice (say a
+        // declared field and the raw value by id) would come out as two
+        // columns no reader can tell apart.
+        let fields = projection.fields();
+        if fields.iter().enumerate().any(|(at, f)| {
+            fields
+                .get(..at)
+                .is_some_and(|before| before.iter().any(|b| b.column_id() == f.column_id()))
+        }) {
+            return Err(Error::Projection(
+                "projection: a column id is projected twice",
+            ));
+        }
         // A merge chain is not a version chain: its older rows are the merge's
         // INPUTS, not data the newest row shadows, and a read hands back the
         // merged value. An operand row is therefore replaced by what a read at
@@ -253,8 +273,6 @@ impl Tree {
         // anything is projected from it. Without an operator the read path
         // returns the newest entry unchanged, the raw operand, which is what
         // the scan yields, so no resolution runs and no value type is decoded.
-        let resolver = self.config.merge_operator.is_some().then(|| self.clone());
-
         let comparator = self.config.comparator.clone();
 
         // Owned bounds keep the returned iterator free of borrows from `range`.
@@ -268,6 +286,21 @@ impl Tree {
         // underneath it, and the per-segment recency ranking is the ranking
         // THAT version has.
         let super_version = self.get_version_for_snapshot(seqno)?;
+        // Operands are resolved in that same version, so a version installed
+        // mid-scan changes no row the scan returns.
+        let resolver = self.config.merge_operator.clone().map(|operator| Resolver {
+            version: super_version.clone(),
+            operator,
+        });
+
+        // A declared field of a segment that stores each value whole lies
+        // inside the value, which only the caller's projector reads.
+        let declared = projection.fields().iter().any(projection::is_declared);
+        let unreadable = declared && projection.value_projector().is_none();
+        const UNREADABLE: Error = Error::Projection(
+            "projection: a segment stores whole row values, and declared fields are \
+             read out of them through a projector, which is not set",
+        );
 
         let mut segments: Vec<Segment> = Vec::new();
         // Memtables are newer than every table, the active one newest; the
@@ -277,6 +310,13 @@ impl Tree {
         let mut recency_rank = 0;
         for memtable in memtables {
             if let Some((min, max)) = memtable_span(&memtable, &lo, &hi, comparator.as_ref()) {
+                // A memtable whose keys it decides are all deleted returns no
+                // value, so it needs no projector: its rows only delete.
+                if unreadable
+                    && memtable_decides_a_value(&memtable, &lo, &hi, seqno, comparator.as_ref())
+                {
+                    return Err(UNREADABLE);
+                }
                 segments.push(Segment {
                     min,
                     max,
@@ -345,14 +385,8 @@ impl Tree {
             });
         }
 
-        // A declared field of a segment that stores each value whole lies
-        // inside the value, which only the caller's projector reads.
-        let declared = projection.fields().iter().any(projection::is_declared);
-        if declared && projection.value_projector().is_none() && segments.iter().any(|s| s.whole) {
-            return Err(Error::Projection(
-                "projection: a segment stores whole row values, and declared fields are \
-                 read out of them through a projector, which is not set",
-            ));
+        if unreadable && segments.iter().any(|s| s.whole && !s.is_memtable()) {
+            return Err(UNREADABLE);
         }
 
         let groups = group_by_overlap(segments, comparator.as_ref());
@@ -365,6 +399,7 @@ impl Tree {
             projector: declared
                 .then(|| projection.value_projector().cloned())
                 .flatten(),
+            declared,
             resolver,
             predicate: predicate.cloned(),
             support: PredicateSupport::Exact,
@@ -421,6 +456,37 @@ fn memtable_span(
         });
     }
     span
+}
+
+/// Whether the newest version `memtable` holds, visible at `seqno`, of some key
+/// in `lo..hi` is not a deletion. A value it holds under a newer deletion of
+/// its own is never returned, so it does not count.
+fn memtable_decides_a_value(
+    memtable: &crate::memtable::Memtable,
+    lo: &Bound<UserKey>,
+    hi: &Bound<UserKey>,
+    seqno: SeqNo,
+    cmp: &dyn UserComparator,
+) -> bool {
+    let (ilo, ihi) = rows::internal_bounds(lo, hi);
+    let mut decided: Option<UserKey> = None;
+    for row in memtable.range_internal((ilo, ihi)) {
+        if row.key.seqno >= seqno {
+            continue;
+        }
+        // Versions of a key come newest first: the first visible one decides.
+        if decided
+            .as_ref()
+            .is_some_and(|key| cmp.compare(key, &row.key.user_key).is_eq())
+        {
+            continue;
+        }
+        if !row.key.value_type.is_tombstone() {
+            return true;
+        }
+        decided = Some(row.key.user_key);
+    }
+    false
 }
 
 /// Partitions `segments` into key-disjoint overlap groups, ordered by ascending
@@ -580,6 +646,13 @@ fn drop_columns(batch: &mut ColumnBatch, dropped: &[u16]) {
     }
 }
 
+/// Resolves a merge operand row as a point read at the scan's snapshot would,
+/// in the version the scan reads.
+struct Resolver {
+    version: crate::version::SuperVersion,
+    operator: alloc::sync::Arc<dyn crate::merge_operator::MergeOperator>,
+}
+
 /// Iterator over a tree-level projected columnar scan.
 ///
 /// Yields projected [`ColumnBatch`]es in ascending key order. Created by
@@ -599,9 +672,13 @@ pub struct ColumnarScan {
     /// The projector the declared fields of a whole-value segment are read
     /// through; `None` when no field is declared.
     projector: Option<alloc::sync::Arc<dyn projection::ValueProjector>>,
-    /// The tree whose point read resolves a merge operand row, when the tree
-    /// merges; `None` when it has no merge operator.
-    resolver: Option<Tree>,
+    /// Whether a field is declared, so a whole-value segment is read without
+    /// its value column in the declared ids' place even with no projector,
+    /// which only a memtable holding nothing but deletions allows.
+    declared: bool,
+    /// What resolves a merge operand row, when the tree merges; `None` when
+    /// it has no merge operator.
+    resolver: Option<Resolver>,
     predicate: Option<ColumnRangePredicate>,
     /// The weakest [`PredicateSupport`] over the segments read so far.
     support: PredicateSupport,
@@ -738,7 +815,7 @@ impl ColumnarScan {
     ) -> crate::Result<SegmentCursor> {
         // A whole value is read for its declared fields, and for the merge
         // operands it may hold when the tree merges.
-        let whole = (seg.whole && (self.projector.is_some() || self.resolver.is_some()))
+        let whole = (seg.whole && (self.declared || self.resolver.is_some()))
             .then(|| self.projector.clone());
         // The declared fields of a whole value lie inside it: decode it, its
         // key and its value type in their place. A declared field's id may be
@@ -836,7 +913,7 @@ impl ColumnarScan {
     fn resolve_operands(&self, batch: ColumnBatch) -> crate::Result<ColumnBatch> {
         use crate::table::columnar::COL_VALUE;
 
-        let Some(tree) = &self.resolver else {
+        let Some(resolver) = &self.resolver else {
             return Ok(batch);
         };
         if !holds_operand(&batch) {
@@ -876,7 +953,13 @@ impl ColumnarScan {
                     let merged = match &last {
                         Some((read, merged)) if *read == key => merged.clone(),
                         _ => {
-                            let merged = crate::AbstractTree::get(tree, key, self.seqno)?;
+                            let merged = Tree::resolve_or_passthrough(
+                                &resolver.version,
+                                key,
+                                self.seqno,
+                                Some(&resolver.operator),
+                                self.comparator.as_ref(),
+                            )?;
                             last = Some((key, merged.clone()));
                             merged
                         }

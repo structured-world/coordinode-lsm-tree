@@ -530,6 +530,42 @@ fn a_merge_chain_over_a_columnar_base_returns_the_merged_fields() -> lsm_tree::R
     Ok(())
 }
 
+/// A merge chain is resolved in the version the scan started on: clearing the
+/// tree while the scan is open changes nothing it returns.
+#[test]
+fn a_merge_chain_is_resolved_in_the_version_the_scan_started_on() -> lsm_tree::Result<()> {
+    let folder = get_tmp_folder();
+    let any = Config::new(
+        folder.path(),
+        SequenceNumberCounter::default(),
+        SequenceNumberCounter::default(),
+    )
+    .with_merge_operator(Some(std::sync::Arc::new(AddToFourth)))
+    .open()?;
+    standard(&any).update_runtime_config(|cfg| cfg.columnar = true)?;
+    ingest(&any, &[0, 1], &[(3, &[10, 11]), (4, &[40, 41])]);
+    let tree = standard(&any);
+    let seqno = tree.get_highest_seqno().map_or(0, |s| s + 1);
+    tree.merge(key(0), 2u32.to_le_bytes(), seqno);
+
+    let scan = tree.columnar_scan(projected(), None, SeqNo::MAX, ..)?;
+    tree.clear()?;
+    let mut got = Vec::new();
+    for batch in scan {
+        let batch = batch?;
+        let (keys, fourth) = (&batch.columns[0], &batch.columns[2]);
+        for row in 0..batch.row_count {
+            let at = row as usize * 4;
+            got.push((
+                bytes_cell(&keys.data, batch.row_count, row),
+                u32::from_le_bytes(fourth.data[at..at + 4].try_into().expect("u32 cell")),
+            ));
+        }
+    }
+    assert_eq!(vec![(key(0), 42), (key(1), 41)], got);
+    Ok(())
+}
+
 /// The scan reads the version it started on: a compaction that rewrites the
 /// segments while the scan is open, into another layout, changes nothing it
 /// returns.
@@ -581,6 +617,36 @@ fn declared_fields_over_memtable_rows_without_a_projector_are_refused() {
         .columnar_scan(projection(Absent::Null), None, SeqNo::MAX, ..)
         .err();
     assert!(matches!(got, Some(Error::Projection(_))), "got {got:?}");
+}
+
+/// A memtable holding only deletions has no value to read a field out of, so a
+/// scan of split tables under it needs no projector: the deletions apply.
+#[test]
+fn deletions_in_the_memtable_need_no_projector() -> lsm_tree::Result<()> {
+    let folder = get_tmp_folder();
+    let any = open_columnar(folder.path());
+    ingest(
+        &any,
+        &[0, 1, 2, 3],
+        &[(3, &[10, 11, 12, 13]), (4, &[40, 41, 42, 43])],
+    );
+    let tree = standard(&any);
+    let seqno = tree.get_highest_seqno().map_or(0, |s| s + 1);
+    tree.remove_range(key(0), key(2), seqno);
+    assert_eq!(
+        vec![(key(2), Some(42)), (key(3), Some(43))],
+        rows(tree, &projection(Absent::Null))?,
+        "a range deletion alone"
+    );
+    // A value written and then deleted is shadowed within the memtable.
+    tree.insert(key(3), row_value(103, 403), seqno + 1);
+    tree.remove(key(3), seqno + 2);
+    assert_eq!(
+        vec![(key(2), Some(42))],
+        rows(tree, &projection(Absent::Null))?,
+        "a point deletion over a shadowed value"
+    );
+    Ok(())
 }
 
 /// The keys a scan with `predicate` over column 5 yields, and how far the
@@ -686,6 +752,32 @@ fn a_predicate_over_an_undeclared_column_across_a_memtable_row_is_not_run() -> l
         keys_filtered_on_five(tree, projected(), 51)?,
     );
     Ok(())
+}
+
+/// A column id named twice (a declared field and the raw value by id, in
+/// either order) leaves the output with two columns under one id, so the scan
+/// is refused rather than picking one by position.
+#[test]
+fn a_column_id_projected_twice_is_refused() {
+    let folder = get_tmp_folder();
+    let any = open_columnar(folder.path());
+    let tree = standard(&any);
+    tree.insert(key(0), row_value(10, 40), 0);
+    tree.flush_active_memtable(0).expect("flush");
+    let twice = [
+        Projection::new()
+            .field(field(3, Absent::Null))
+            .column(3)
+            .projector(std::sync::Arc::new(TwoCells)),
+        Projection::new()
+            .column(3)
+            .field(field(3, Absent::Null))
+            .projector(std::sync::Arc::new(TwoCells)),
+    ];
+    for projection in twice {
+        let got = tree.columnar_scan(&projection, None, SeqNo::MAX, ..).err();
+        assert!(matches!(got, Some(Error::Projection(_))), "got {got:?}");
+    }
 }
 
 /// A segment that stores a declared field under another type is refused, not

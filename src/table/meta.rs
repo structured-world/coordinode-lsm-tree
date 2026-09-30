@@ -512,9 +512,11 @@ impl ParsedMeta {
                 },
             };
 
-        // Optional value layout. Absent = a table whose rows were transposed
-        // whole, which is what every columnar table written before the
-        // property stored unless it was ingested; one byte otherwise.
+        // Optional value layout, one byte. Every columnar table this format
+        // writes carries it, and a store of the previous format reaches this
+        // one only through the offline conversion, which stamps it on each
+        // columnar table; so it is absent only from a row table, and a row
+        // table holds its values whole.
         let value_layout = match block.point_read(b"descriptor#value_layout", SeqNo::MAX, &cmp)? {
             None => ValueLayout::Whole,
             Some(v) => match v.value.as_ref() {
