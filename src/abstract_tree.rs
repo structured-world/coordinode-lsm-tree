@@ -428,6 +428,16 @@ pub trait AbstractTree: sealed::Sealed {
     /// backends (e.g. [`MemFs`](crate::fs::MemFs) → [`StdFs`](crate::fs::StdFs)
     /// in tests).
     ///
+    /// # Durability
+    ///
+    /// `Ok` means the checkpoint's files and directories are persisted under
+    /// [`Config::sync_mode`](crate::Config::sync_mode): durable under
+    /// [`SyncMode::Full`](crate::fs::SyncMode::Full); under
+    /// [`SyncMode::Barrier`](crate::fs::SyncMode::Barrier) synced in order, one
+    /// barrier per file, and durable once a later
+    /// [`Fs::sync_device`](crate::fs::Fs::sync_device) of `target_path` returns
+    /// `Ok`.
+    ///
     /// # Concurrency
     ///
     /// While the checkpoint is being built, compaction continues normally
@@ -450,16 +460,113 @@ pub trait AbstractTree: sealed::Sealed {
     #[cfg(feature = "std")]
     fn create_checkpoint(&self, target_path: &crate::path::Path) -> crate::Result<CheckpointInfo>;
 
-    /// Seals the active memtable and flushes to table(s).
+    /// Seals the active memtable and flushes it, with every memtable sealed
+    /// before it, to tables: the durability barrier for a caller that keeps
+    /// its own journal of the writes.
     ///
-    /// If there are already other sealed memtables lined up, those will be flushed as well.
+    /// `Ok` means the tables, their directories and the manifest edits that
+    /// name them are persisted under [`Config::sync_mode`](crate::Config::sync_mode)
+    /// for the memtable active at the call and for every memtable sealed before
+    /// it, in sealing order, including one another thread began flushing: the
+    /// call waits for that flush and, should it fail, flushes the memtable
+    /// itself. A caller may release the journal entries those memtables hold
+    /// once the call returns `Ok`; under
+    /// [`SyncMode::Barrier`](crate::fs::SyncMode::Barrier) the writes are only
+    /// ordered then, and the entries may go once
+    /// [`sync_devices`](Self::sync_devices) has returned `Ok` too.
     ///
-    /// Only used in tests.
-    #[doc(hidden)]
+    /// `gc_watermark` has the meaning documented at
+    /// [`major_compact`](Self::major_compact); pass `0` to collect nothing.
+    ///
+    /// # Errors
+    ///
+    /// Returns the error of [`flush`](Self::flush); the memtables it could not
+    /// persist stay sealed, and the next call flushes them.
+    ///
+    /// # Examples
+    ///
+    /// ```
+    /// use lsm_tree::{AbstractTree, Config, SequenceNumberCounter};
+    ///
+    /// let folder = tempfile::tempdir()?;
+    /// let tree = Config::new(
+    ///     &folder,
+    ///     SequenceNumberCounter::default(),
+    ///     SequenceNumberCounter::default(),
+    /// )
+    /// .open()?;
+    /// tree.insert("key", "value", 0);
+    /// // The write is on disk now (the default sync mode is not `Barrier`): a
+    /// // journal that holds it can drop it.
+    /// tree.flush_active_memtable(0)?;
+    /// assert_eq!(tree.table_count(), 1);
+    /// # Ok::<(), lsm_tree::Error>(())
+    /// ```
     fn flush_active_memtable(&self, gc_watermark: SeqNo) -> crate::Result<()> {
         let lock = self.get_flush_lock();
         self.rotate_memtable();
         self.flush(&lock, gc_watermark)?;
+        Ok(())
+    }
+
+    /// Makes durable everything this tree synced on each device it lies on:
+    /// the tree folder's, that of every level's tables, that of the
+    /// dictionaries folder and, with KV separation, that of the blobs folder.
+    ///
+    /// Under [`SyncMode::Barrier`](crate::fs::SyncMode::Barrier) a
+    /// [`flush_active_memtable`](Self::flush_active_memtable) that returns `Ok`
+    /// has its writes ordered, and they are durable once this returns `Ok`; a
+    /// caller releases its journal after both. Under any other mode the flush
+    /// alone is durable and this only flushes the device caches.
+    ///
+    /// # Errors
+    ///
+    /// Returns the error of a device flush that failed; the devices not yet
+    /// flushed are not.
+    fn sync_devices(&self) -> crate::Result<()> {
+        let config = self.tree_config();
+        let mut flushed: Vec<(Arc<dyn crate::fs::Fs>, crate::path::PathBuf)> = Vec::new();
+        let levels = (0..config.level_count).map(|level| {
+            let (folder, fs) = config.tables_folder_for_level(level);
+            (fs, folder)
+        });
+        // The blobs folder may be a mount of its own under the tree folder.
+        let blobs = config.kv_separation_opts.is_some().then(|| {
+            (
+                Arc::clone(&config.fs),
+                config.path.join(crate::file::BLOBS_FOLDER),
+            )
+        });
+        // So may the dictionaries folder, which the tables written against a
+        // dictionary need to be read.
+        #[cfg(zstd_any)]
+        let dicts = Some((
+            Arc::clone(&config.fs),
+            config.path.join(crate::file::DICTS_FOLDER),
+        ));
+        #[cfg(not(zstd_any))]
+        let dicts: Option<(Arc<dyn crate::fs::Fs>, crate::path::PathBuf)> = None;
+        for (fs, path) in core::iter::once((Arc::clone(&config.fs), config.path.clone()))
+            .chain(levels)
+            .chain(blobs)
+            .chain(dicts)
+        {
+            // One flush per device: a folder on a device already flushed
+            // gains nothing from another.
+            let volume = fs.volume_id(&path);
+            if flushed.iter().any(|(done, at)| {
+                (Arc::ptr_eq(done, &fs) && *at == path)
+                    || volume.is_some_and(|volume| done.volume_id(at) == Some(volume))
+            }) {
+                continue;
+            }
+            match fs.sync_device(&path) {
+                Ok(()) => flushed.push((fs, path)),
+                // A folder never made holds nothing to flush.
+                Err(e) if e.kind() == crate::io::ErrorKind::NotFound => {}
+                Err(e) => return Err(e.into()),
+            }
+        }
         Ok(())
     }
 
@@ -578,24 +685,16 @@ pub trait AbstractTree: sealed::Sealed {
 
         drop(version_history);
 
-        // Clone needed: flush_to_tables_with_rt consumes the Vec, but on the
-        // RT-only path (no KV data, tables.is_empty()) we re-insert RTs into the
-        // active memtable. Flush is infrequent and RT count is small.
-        if let Some((tables, blob_files, write_pin)) = self.flush_to_tables_with_rt(
-            stream,
-            range_tombstones.clone(),
-            flushed.keys,
-            flushed.hashes,
-        )? {
-            // If no tables were produced (RT-only memtable), re-insert RTs
-            // into active memtable so they aren't lost
-            if tables.is_empty() && !range_tombstones.is_empty() {
-                let active = self.active_memtable();
-                for rt in &range_tombstones {
-                    let _ =
-                        active.insert_range_tombstone(rt.start.clone(), rt.end.clone(), rt.seqno);
-                }
-            }
+        let has_range_tombstones = !range_tombstones.is_empty();
+        if let Some((tables, blob_files, write_pin)) =
+            self.flush_to_tables_with_rt(stream, range_tombstones, flushed.keys, flushed.hashes)?
+        {
+            // A writer given range tombstones and no key writes a table around
+            // them, so a flush that acknowledges a deletion has put it on disk.
+            debug_assert!(
+                !tables.is_empty() || !has_range_tombstones,
+                "a flush of range tombstones wrote no table"
+            );
 
             #[cfg(all(test, feature = "std"))]
             self.tree_config().fire_before_output_install();

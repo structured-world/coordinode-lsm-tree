@@ -507,10 +507,17 @@ pub struct Writer {
     /// via [`Self::use_ecc`] before the first key is added.
     ecc: Option<crate::table::block::EccParams>,
 
-    /// Durability level for the SST file + folder fsync at finish. Default
+    /// Durability level for the SST file sync at finish. Default
     /// [`SyncMode::Normal`]; caller wires `Config::sync_mode` via
     /// [`Self::use_sync_mode`].
     sync_mode: SyncMode,
+
+    /// Bytes gathered between writebacks the writer starts while writing; `0`
+    /// starts none. Set via [`Self::use_writeback_bytes`].
+    writeback_bytes: u64,
+
+    /// Where the last writeback ended: every byte before it was handed over.
+    written_back: u64,
 
     /// Per-KV checksum policy + algorithm for data blocks. `None` (default)
     /// means no per-KV checksums: data blocks carry no per-KV footer, with
@@ -869,6 +876,8 @@ impl Writer {
 
             ecc: None,
             sync_mode: SyncMode::Normal,
+            writeback_bytes: 0,
+            written_back: 0,
 
             kv_checksum: None,
             use_seqno_in_index: false,
@@ -1836,12 +1845,46 @@ impl Writer {
         self.use_ecc(resolve_ecc(page_ecc, scheme))
     }
 
-    /// Wires the tree's `Config::sync_mode` into this writer's final SST +
-    /// folder fsync.
+    /// Wires the tree's `Config::sync_mode` into this writer's final SST
+    /// sync.
     #[must_use]
     pub fn use_sync_mode(mut self, sync_mode: SyncMode) -> Self {
         self.sync_mode = sync_mode;
         self
+    }
+
+    /// Starts writing back every `bytes` the table gathers while it is
+    /// written ([`FsFile::start_writeback`]), so its final sync is short;
+    /// `0` starts none.
+    #[must_use]
+    pub fn use_writeback_bytes(mut self, bytes: u64) -> Self {
+        self.writeback_bytes = bytes;
+        self
+    }
+
+    /// Starts writing back what the table wrote since the last writeback,
+    /// once at least `writeback_bytes` of it gathered.
+    fn writeback_if_due(&mut self) -> crate::Result<()> {
+        // `written_back` only ever takes a value of `file_pos`, which grows.
+        let pending = *self.meta.file_pos - self.written_back;
+        if self.writeback_bytes == 0 || pending < self.writeback_bytes {
+            return Ok(());
+        }
+        #[cfg(not(feature = "std"))]
+        use crate::io::Write;
+        #[cfg(feature = "std")]
+        use std::io::Write;
+        // The range is in the buffer until it is flushed to the file.
+        let buffered = self.file_writer.get_mut().inner_mut();
+        buffered.flush()?;
+        crate::fs::hint_writeback(
+            &**buffered.get_ref(),
+            self.written_back,
+            pending,
+            &mut self.writeback_bytes,
+        );
+        self.written_back = *self.meta.file_pos;
+        Ok(())
     }
 
     /// Wires the tree's runtime `kv_checksums` policy + algorithm into this
@@ -3118,6 +3161,7 @@ impl Writer {
         self.meta.file_pos += u64::from(bytes_written);
         self.meta.item_count += item_count;
         self.meta.data_block_count += 1;
+        self.writeback_if_due()?;
 
         self.prev_pos.0 = self.prev_pos.1;
         self.prev_pos.1 += u64::from(bytes_written);
@@ -3637,10 +3681,31 @@ impl Writer {
         )
     }
 
+    /// Finishes the table, making it durable: its file is synced and so is the
+    /// directory entry that names it.
+    ///
+    /// # Errors
+    ///
+    /// Will return `Err` if an IO error occurs.
+    pub fn finish(self) -> crate::Result<Option<(TableId, Checksum)>> {
+        let fs = Arc::clone(&self.fs);
+        let sync_mode = self.sync_mode;
+        let folder = crate::file::entry_directory(&self.path).to_path_buf();
+        let finished = self.finish_deferring_dir_sync()?;
+        if finished.is_some() {
+            crate::file::fsync_directory(&folder, &*fs, sync_mode)?;
+        }
+        Ok(finished)
+    }
+
+    /// [`Self::finish`] without the directory sync, for a caller that syncs
+    /// the folder itself once it is done with it: the version install syncs
+    /// each folder its new tables went to once for the whole transition.
     // TODO: split meta writing into new function
     #[expect(clippy::too_many_lines)]
-    /// Finishes the table, making sure all data is written durably
-    pub fn finish(mut self) -> crate::Result<Option<(TableId, Checksum)>> {
+    pub(crate) fn finish_deferring_dir_sync(
+        mut self,
+    ) -> crate::Result<Option<(TableId, Checksum)>> {
         #[cfg(not(feature = "std"))]
         use crate::io::Write;
         #[cfg(feature = "std")]
@@ -3764,7 +3829,12 @@ impl Writer {
         // data block split into >= 2 inner zstd blocks). Absent otherwise, so
         // default small-block tables gain no bytes.
         if !self.block_layouts.is_empty() {
-            self.file_writer.start("block_layout")?;
+            start_section(
+                &mut self.file_writer,
+                &mut self.written_back,
+                &mut self.writeback_bytes,
+                "block_layout",
+            )?;
 
             self.block_buffer.clear();
             crate::table::block_layout::encode_block_layouts(
@@ -3804,7 +3874,12 @@ impl Writer {
         // and at least one block was written). Parallel to the index, keyed by
         // data-block offset; absent otherwise, so the index stays legacy-sized.
         if !self.seqno_bounds_section.is_empty() {
-            self.file_writer.start("seqno_bounds")?;
+            start_section(
+                &mut self.file_writer,
+                &mut self.written_back,
+                &mut self.writeback_bytes,
+                "seqno_bounds",
+            )?;
             self.block_buffer.clear();
             crate::table::seqno_bounds::encode_seqno_bounds(
                 &mut self.block_buffer,
@@ -3839,7 +3914,12 @@ impl Writer {
         // least one block was written). Parallel to the index, keyed by
         // data-block offset; absent otherwise, so a point read pays nothing.
         if !self.zone_map_section.is_empty() {
-            self.file_writer.start("zone_map")?;
+            start_section(
+                &mut self.file_writer,
+                &mut self.written_back,
+                &mut self.writeback_bytes,
+                "zone_map",
+            )?;
             self.block_buffer.clear();
             crate::table::zone_map::encode_zone_map(
                 &mut self.block_buffer,
@@ -3893,7 +3973,12 @@ impl Writer {
                     "delete-bitmap requires the zone map (use_zone_map(true))",
                 ));
             }
-            self.file_writer.start("delete_bitmap")?;
+            start_section(
+                &mut self.file_writer,
+                &mut self.written_back,
+                &mut self.writeback_bytes,
+                "delete_bitmap",
+            )?;
             self.block_buffer.clear();
             self.block_buffer
                 .extend_from_slice(delete_bitmap_bytes.as_deref().unwrap_or_default());
@@ -3930,7 +4015,12 @@ impl Writer {
             && let Some(section) =
                 crate::table::locator::build_locator_section(&self.locators, spec)
         {
-            self.file_writer.start("locator")?;
+            start_section(
+                &mut self.file_writer,
+                &mut self.written_back,
+                &mut self.writeback_bytes,
+                "locator",
+            )?;
             let at = next_block_at(self.table_id, &self.file_writer);
             Block::write_into(
                 &mut self.file_writer,
@@ -3962,7 +4052,12 @@ impl Writer {
         if !self.range_tombstones.is_empty() {
             use crate::io::{LE, WriteBytesExt};
 
-            self.file_writer.start("range_tombstones")?;
+            start_section(
+                &mut self.file_writer,
+                &mut self.written_back,
+                &mut self.writeback_bytes,
+                "range_tombstones",
+            )?;
 
             // Wire format (repeated): [start_len:u16_le][start][end_len:u16_le][end][seqno:u64_le]
             self.block_buffer.clear();
@@ -4091,7 +4186,12 @@ impl Writer {
         if !self.linked_blob_files.is_empty() {
             use crate::io::{LE, WriteBytesExt};
 
-            self.file_writer.start("linked_blob_files")?;
+            start_section(
+                &mut self.file_writer,
+                &mut self.written_back,
+                &mut self.writeback_bytes,
+                "linked_blob_files",
+            )?;
 
             #[expect(
                 clippy::cast_possible_truncation,
@@ -4117,7 +4217,12 @@ impl Writer {
             }
         }
 
-        self.file_writer.start("table_version")?;
+        start_section(
+            &mut self.file_writer,
+            &mut self.written_back,
+            &mut self.writeback_bytes,
+            "table_version",
+        )?;
         self.file_writer.write_all(&[0x3])?;
 
         // 4 KiB padding section so MID copy and TAIL copy live on
@@ -4125,7 +4230,12 @@ impl Writer {
         // bad sector at the tail could take out both copies (only
         // ~tens of bytes separate the linked_blob_files / table_version
         // sections between them).
-        self.file_writer.start("meta_separator")?;
+        start_section(
+            &mut self.file_writer,
+            &mut self.written_back,
+            &mut self.writeback_bytes,
+            "meta_separator",
+        )?;
         self.file_writer.write_all(&[0u8; META_SEPARATOR_LEN])?;
 
         // TLI mirror near the file tail. The head `tli` section was
@@ -4156,7 +4266,12 @@ impl Writer {
         // so the resulting ciphertext differs byte-for-byte across
         // the two copies, but both decrypt to the same plaintext
         // IndexBlock.
-        self.file_writer.start("tli_tail")?;
+        start_section(
+            &mut self.file_writer,
+            &mut self.written_back,
+            &mut self.writeback_bytes,
+            "tli_tail",
+        )?;
         let at = next_block_at(self.table_id, &self.file_writer);
         Block::write_into(
             &mut self.file_writer,
@@ -4203,6 +4318,13 @@ impl Writer {
         // `file_pos` hasn't moved since (no intermediate write touches it), so
         // re-assigning is a no-op. Kept explicit for readability.
         meta_params.file_size = *self.meta.file_pos;
+        // The index mirror above can outgrow a writeback step on a large
+        // partitioned index; what follows it is a few KiB.
+        write_back_tail(
+            &mut self.file_writer,
+            &mut self.written_back,
+            &mut self.writeback_bytes,
+        )?;
         write_meta_section(
             &mut self.file_writer,
             &mut self.block_buffer,
@@ -4236,17 +4358,7 @@ impl Writer {
         }
         let checksum = checksum.checksum();
 
-        // IMPORTANT: fsync folder on Unix
-
-        #[expect(
-            clippy::expect_used,
-            reason = "if there's no parent folder, something has gone horribly wrong"
-        )]
-        crate::file::fsync_directory(
-            self.path.parent().expect("should have folder"),
-            &*self.fs,
-            self.sync_mode,
-        )?;
+        // The folder is not synced here; see `finish`.
 
         log::debug!(
             "Written {} items in {} blocks into new table file #{}, written {} MiB",
@@ -4258,6 +4370,52 @@ impl Writer {
 
         Ok(Some((self.table_id, checksum)))
     }
+}
+
+/// Starts the section `name` of a table's tail on `file_writer`, first
+/// writing back what was written before it ([`write_back_tail`]).
+fn start_section(
+    file_writer: &mut crate::sfa::Writer<ChecksummedWriter<BufWriter<Box<dyn FsFile>>>>,
+    written_back: &mut u64,
+    writeback_bytes: &mut u64,
+    name: &str,
+) -> crate::Result<()> {
+    write_back_tail(file_writer, written_back, writeback_bytes)?;
+    file_writer.start(name)?;
+    Ok(())
+}
+
+/// Writes back what a table's tail wrote on `file_writer` since `written_back`
+/// once at least `writeback_bytes` gathered (`0` writes nothing back).
+/// Free-standing so `finish` can call it while it borrows other fields of the
+/// writer.
+fn write_back_tail(
+    file_writer: &mut crate::sfa::Writer<ChecksummedWriter<BufWriter<Box<dyn FsFile>>>>,
+    written_back: &mut u64,
+    writeback_bytes: &mut u64,
+) -> crate::Result<()> {
+    if *writeback_bytes > 0 {
+        #[cfg(not(feature = "std"))]
+        use crate::io::Seek;
+        #[cfg(feature = "std")]
+        use std::io::Seek;
+        let buffered = file_writer.get_mut().inner_mut();
+        // Flushes the buffer, as the section start every call precedes does
+        // anyway.
+        let position = buffered.stream_position()?;
+        // `written_back` is a position the file already reached.
+        let pending = position - *written_back;
+        if pending >= *writeback_bytes {
+            crate::fs::hint_writeback(
+                &**buffered.get_ref(),
+                *written_back,
+                pending,
+                writeback_bytes,
+            );
+            *written_back = position;
+        }
+    }
+    Ok(())
 }
 
 /// Parameters bundle for [`write_meta_section`]. Free-standing struct

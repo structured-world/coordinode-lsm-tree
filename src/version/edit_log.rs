@@ -29,7 +29,7 @@ use crate::path::Path;
 use std::io::{Seek, SeekFrom};
 
 /// Appends one framed [`VersionEdit`] to the log at `path` (created on first
-/// write) and fsyncs per `sync_mode`, so the edit is durable before the caller
+/// write) and syncs its data per `sync_mode`, so the edit is durable before the caller
 /// acknowledges the flush / compaction. `scratch` is reused for payload
 /// assembly across calls (no per-edit heap allocation after warm-up).
 ///
@@ -75,7 +75,10 @@ pub fn append_edit(
         crate::file::fsync_directory(crate::file::entry_directory(path), fs, sync_mode)?;
     }
     super::framing::write_frame(&mut file, scratch)?;
-    file.sync_all_with(sync_mode).map_err(crate::Error::from)?;
+    // `sync_data` persists the file size with the data (its contract, POSIX
+    // `fdatasync`), which is all replay reads; the log's name is covered by
+    // the directory sync above.
+    file.sync_data_with(sync_mode).map_err(crate::Error::from)?;
     // The framing header (u32 len + u64 XXH3) precedes the payload on disk.
     let appended = u64::try_from(super::framing::FRAME_HEADER_LEN + scratch.len())
         .map_err(|_| crate::Error::Unrecoverable)?;

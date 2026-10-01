@@ -925,7 +925,9 @@ impl AbstractTree for Tree {
         // / `kv_checksums` below), so a flush after a scheme change writes the
         // SST with the current scheme rather than the startup one.
         table_writer = table_writer.use_page_ecc(self.config.page_ecc, rc.ecc_scheme);
-        table_writer = table_writer.use_sync_mode(self.config.sync_mode);
+        table_writer = table_writer
+            .use_sync_mode(self.config.sync_mode)
+            .use_writeback_bytes(self.config.writeback_bytes);
 
         table_writer = table_writer.use_seqno_in_index(rc.seqno_in_index);
         table_writer = table_writer.use_zone_map(rc.zone_map);

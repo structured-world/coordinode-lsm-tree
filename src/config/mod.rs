@@ -670,9 +670,14 @@ pub struct Config {
     /// Defaults to [`SyncMode::Normal`] (plain `fsync`), matching the
     /// out-of-the-box durability of `RocksDB` and `SQLite`. Only observable on
     /// macOS, where [`SyncMode::Full`] opts into the much slower
-    /// `F_FULLFSYNC` barrier; on other platforms both modes are plain
-    /// `fsync`. Set via [`Config::sync_mode`].
+    /// `F_FULLFSYNC` barrier and [`SyncMode::Barrier`] into ordered syncs;
+    /// on other platforms all modes are plain `fsync`. Set via
+    /// [`Config::sync_mode`].
     pub(crate) sync_mode: SyncMode,
+
+    /// Bytes a table or blob file gathers between the writebacks its writer
+    /// starts. Set via [`Config::writeback_bytes`].
+    pub(crate) writeback_bytes: u64,
 
     /// When `true` (the default), [`Config::open`] and [`Config::repair`]
     /// acquire an exclusive cross-process lock on a `LOCK` file in the tree
@@ -945,6 +950,7 @@ impl Default for Config {
             encryption: None,
             manifest_recovery_mode: ManifestRecoveryMode::AbsoluteConsistency,
             sync_mode: SyncMode::Normal,
+            writeback_bytes: 1_024 * 1_024,
             directory_lock: true,
             #[cfg(feature = "std")]
             recovery_progress: None,
@@ -2096,11 +2102,45 @@ impl Config {
     /// Defaults to [`SyncMode::Normal`] (plain `fsync`, matching `RocksDB` /
     /// `SQLite` defaults). Pass [`SyncMode::Full`] to force `F_FULLFSYNC` on
     /// macOS for power-loss durability without an external journal — at a
-    /// large per-flush cost. On non-macOS platforms both modes are
-    /// identical (plain `fsync`).
+    /// large per-flush cost. Pass [`SyncMode::Barrier`] to keep writes in
+    /// order at a barrier's cost and make them durable with
+    /// [`AbstractTree::sync_devices`](crate::AbstractTree::sync_devices), once
+    /// per batch of flushes. On non-macOS platforms all three are plain
+    /// `fsync`.
     #[must_use]
     pub fn sync_mode(mut self, mode: SyncMode) -> Self {
         self.sync_mode = mode;
+        self
+    }
+
+    /// Sets how many bytes a table or blob file gathers before its writer
+    /// starts writing them back, without waiting (default 1 MiB; `0` starts
+    /// none).
+    ///
+    /// The final sync of a large file otherwise writes all its dirty pages at
+    /// once, and on a device shared with the caller's journal that burst
+    /// delays the journal's own syncs. Writeback makes nothing durable; the
+    /// final sync still does. Only Linux starts one
+    /// (`sync_file_range(SYNC_FILE_RANGE_WRITE)`); elsewhere this is unused.
+    ///
+    /// # Examples
+    ///
+    /// ```
+    /// use lsm_tree::{Config, SequenceNumberCounter};
+    ///
+    /// let folder = tempfile::tempdir()?;
+    /// let tree = Config::new(
+    ///     &folder,
+    ///     SequenceNumberCounter::default(),
+    ///     SequenceNumberCounter::default(),
+    /// )
+    /// .writeback_bytes(4 * 1_024 * 1_024)
+    /// .open()?;
+    /// # Ok::<(), lsm_tree::Error>(())
+    /// ```
+    #[must_use]
+    pub fn writeback_bytes(mut self, bytes: u64) -> Self {
+        self.writeback_bytes = bytes;
         self
     }
 

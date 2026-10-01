@@ -1554,3 +1554,97 @@ fn independent_files_have_independent_durability() {
         "un-synced sibling vanishes independently"
     );
 }
+
+/// Writes `content` to the new file `path` and syncs it and its directory
+/// `dir` under `mode`.
+fn write_synced(fs: &CrashFs, dir: &str, path: &str, content: &[u8], mode: SyncMode) {
+    let mut file = fs
+        .open(
+            Path::new(path),
+            &FsOpenOptions::new().write(true).create(true),
+        )
+        .unwrap();
+    file.write_all(content).unwrap();
+    file.sync_all_with(mode).unwrap();
+    drop(file);
+    fs.sync_directory_with(Path::new(dir), mode).unwrap();
+}
+
+/// A barrier keeps writes in order but makes none durable: a power loss
+/// before the device is flushed loses what it synced.
+#[test]
+fn a_barrier_sync_is_lost_without_a_device_flush() {
+    let fs = CrashFs::new(MemFs::new());
+    fs.create_dir_all(Path::new("/d")).unwrap();
+    write_synced(&fs, "/d", "/d/a", b"A", SyncMode::Barrier);
+
+    assert_eq!(
+        fs.ordered_syncs(),
+        2,
+        "the file sync and the directory sync"
+    );
+    fs.crash();
+    assert!(!fs.exists(Path::new("/d/a")).unwrap());
+}
+
+/// A device flush makes durable everything synced on the device before it.
+#[test]
+fn a_device_flush_makes_the_barrier_syncs_durable() {
+    let fs = CrashFs::new(MemFs::new());
+    fs.create_dir_all(Path::new("/d")).unwrap();
+    write_synced(&fs, "/d", "/d/a", b"A", SyncMode::Barrier);
+    fs.sync_device(Path::new("/d")).unwrap();
+
+    assert_eq!(fs.ordered_syncs(), 0);
+    fs.crash();
+    assert_eq!(read(&fs, "/d/a"), b"A");
+}
+
+/// A power loss keeps a prefix of the barrier syncs, in the order they were
+/// issued: a file synced after another never survives without it.
+#[test]
+fn a_crash_keeps_a_prefix_of_the_barrier_syncs() {
+    let fs = CrashFs::new(MemFs::new());
+    fs.create_dir_all(Path::new("/d")).unwrap();
+    write_synced(&fs, "/d", "/d/a", b"A", SyncMode::Barrier);
+    write_synced(&fs, "/d", "/d/b", b"B", SyncMode::Barrier);
+
+    // The first file and its entry, not the second.
+    fs.crash_keeping(2);
+    assert_eq!(read(&fs, "/d/a"), b"A");
+    assert!(!fs.exists(Path::new("/d/b")).unwrap());
+}
+
+/// A full sync flushes the device cache with everything ordered before it.
+#[test]
+fn a_full_sync_makes_the_earlier_barrier_syncs_durable() {
+    let fs = CrashFs::new(MemFs::new());
+    fs.create_dir_all(Path::new("/d")).unwrap();
+    write_synced(&fs, "/d", "/d/a", b"A", SyncMode::Barrier);
+    write_synced(&fs, "/d", "/d/b", b"B", SyncMode::Full);
+
+    fs.crash();
+    assert_eq!(read(&fs, "/d/a"), b"A");
+    assert_eq!(read(&fs, "/d/b"), b"B");
+}
+
+/// The content a barrier synced follows its file through a rename, and a
+/// removed file takes what was ordered for it along.
+#[test]
+fn a_barrier_sync_follows_a_rename_and_goes_with_a_removal() {
+    let fs = CrashFs::new(MemFs::new());
+    fs.create_dir_all(Path::new("/d")).unwrap();
+    write_synced(&fs, "/d", "/d/tmp", b"T", SyncMode::Barrier);
+    fs.rename(Path::new("/d/tmp"), Path::new("/d/current"))
+        .unwrap();
+    fs.sync_directory_with(Path::new("/d"), SyncMode::Barrier)
+        .unwrap();
+    write_synced(&fs, "/d", "/d/gone", b"G", SyncMode::Barrier);
+    fs.remove_file(Path::new("/d/gone")).unwrap();
+    fs.sync_device(Path::new("/d")).unwrap();
+
+    fs.crash();
+    assert_eq!(read(&fs, "/d/current"), b"T");
+    assert!(!fs.exists(Path::new("/d/tmp")).unwrap());
+    assert!(!fs.exists(Path::new("/d/gone")).unwrap());
+}

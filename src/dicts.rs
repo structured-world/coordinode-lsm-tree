@@ -144,7 +144,8 @@ pub fn write(
 /// the id over a folder a power loss can still take away. Syncing an already
 /// durable directory costs one call; this runs once per registration.
 fn sync_entries(fs: &dyn Fs, folder: &Path, sync_mode: SyncMode) -> crate::Result<()> {
-    fs.sync_directory_with(folder, sync_mode)?;
+    // The version edit naming the dictionary goes to the tree root above.
+    fs.sync_directory_with(folder, crate::file::folder_sync_mode(fs, folder, sync_mode))?;
     if let Some(parent) = folder.parent() {
         fs.sync_directory_with(parent, sync_mode)?;
     }

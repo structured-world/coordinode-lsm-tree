@@ -63,6 +63,30 @@ fn a_first_append_whose_directory_sync_fails_writes_nothing() -> crate::Result<(
     Ok(())
 }
 
+/// An append syncs the log's data, not its full metadata: a record and the
+/// length that reaches it are what replay reads, and `fdatasync` makes both
+/// durable, so a backend refusing every full sync still takes the append.
+#[test]
+fn an_append_syncs_the_data_of_the_log_not_its_metadata() -> crate::Result<()> {
+    use crate::fs::{Fault, FaultFs, FaultOp, FaultRule, MemFs};
+
+    let fs = FaultFs::new(MemFs::new());
+    fs.create_dir_all(Path::new("/db"))?;
+    fs.injector().arm(FaultRule::new(
+        FaultOp::SyncAll,
+        Fault::Error(crate::io::ErrorKind::Other),
+    ));
+    let path = Path::new("/db/edits-0");
+    let mut scratch = Vec::new();
+    append_edit(&fs, path, &edit(1), &mut scratch, SyncMode::Normal, true)?;
+    append_edit(&fs, path, &edit(2), &mut scratch, SyncMode::Normal, false)?;
+    assert_eq!(
+        replay_log(&fs, path, ManifestRecoveryMode::AbsoluteConsistency)?,
+        alloc::vec![edit(1), edit(2)],
+    );
+    Ok(())
+}
+
 #[test]
 fn append_then_replay_roundtrips_all_edits() {
     let dir = tempfile::tempdir().expect("tempdir");

@@ -393,6 +393,16 @@ pub enum SyncMode {
     /// [`Self::Normal`]. Slower - opt in only when the workload needs
     /// power-loss durability without an external journal.
     Full,
+
+    /// Ordered durability. On macOS this issues `fcntl(F_BARRIERFSYNC)`
+    /// (about 0.7 ms against `F_FULLFSYNC`'s 5.7 ms): the writes synced on a
+    /// device reach its medium in the order they were synced, and all of them
+    /// are durable once a later [`Fs::sync_device`] of that device returns
+    /// `Ok`. The last sync of a transition on one device before a step on
+    /// another is issued as [`Self::Full`], so a step never outlives one on
+    /// another device it depends on. Elsewhere it is identical to
+    /// [`Self::Normal`], where `fsync` already reaches the medium.
+    Barrier,
 }
 
 /// Filesystem operations on an open file handle.
@@ -411,7 +421,11 @@ pub trait FsFile: Read + Write + Seek + Send + Sync {
     /// Returns an I/O error if the sync operation fails.
     fn sync_all(&self) -> io::Result<()>;
 
-    /// Flushes file data (but not necessarily metadata) to durable storage.
+    /// Flushes file data, and the metadata a later read of that data needs
+    /// (the file size), to durable storage; other metadata (timestamps) need
+    /// not be. This is POSIX `fdatasync` (IEEE Std 1003.1, "synchronized I/O
+    /// data integrity completion"), and the engine relies on it: an appended
+    /// log is synced this way, and a size left behind would lose the append.
     ///
     /// Equivalent to [`sync_data_with`](Self::sync_data_with) with
     /// [`SyncMode::Full`].
@@ -436,7 +450,8 @@ pub trait FsFile: Read + Write + Seek + Send + Sync {
         self.sync_all()
     }
 
-    /// Flushes file data at the requested durability [`SyncMode`].
+    /// Flushes file data, and the file size, at the requested durability
+    /// [`SyncMode`], with the same contract as [`sync_data`](Self::sync_data).
     ///
     /// The default implementation ignores `mode` and delegates to
     /// [`sync_data`](Self::sync_data).
@@ -611,6 +626,35 @@ pub trait FsFile: Read + Write + Seek + Send + Sync {
     /// requirement.
     fn hint(&self, _hint: FileHint) -> io::Result<()> {
         Ok(())
+    }
+
+    /// Starts writing back the `len` bytes written at `offset` without
+    /// waiting for them: a later sync then has little left to write, and a
+    /// large file does not hold the device for one long flush at its end.
+    ///
+    /// It makes nothing durable; only a sync does. The default is a no-op;
+    /// the std backend issues `sync_file_range(SYNC_FILE_RANGE_WRITE)` on
+    /// Linux.
+    ///
+    /// # Errors
+    ///
+    /// Returns the error of the system call.
+    fn start_writeback(&self, offset: u64, len: u64) -> io::Result<()> {
+        let _ = (offset, len);
+        Ok(())
+    }
+}
+
+/// Asks `file` to start writing back `len` bytes at `offset` for a writer that
+/// writes back every `writeback_bytes`. The request is a hint: a refusal turns
+/// writeback off for the file (`*writeback_bytes = 0`) instead of failing the
+/// write, since the file's final sync still writes it and reports a failed
+/// write. On Linux `sync_file_range` without `SYNC_FILE_RANGE_WAIT_AFTER` does
+/// not consume the file's writeback error, so that sync still sees it.
+pub(crate) fn hint_writeback(file: &dyn FsFile, offset: u64, len: u64, writeback_bytes: &mut u64) {
+    if let Err(error) = file.start_writeback(offset, len) {
+        log::warn!("writeback hint refused, the file is written back by its final sync: {error}");
+        *writeback_bytes = 0;
     }
 }
 
@@ -1015,6 +1059,20 @@ pub trait Fs: Send + Sync + 'static {
     fn sync_directory_with(&self, path: &Path, mode: SyncMode) -> io::Result<()> {
         let _ = mode;
         self.sync_directory(path)
+    }
+
+    /// Makes durable everything synced on the device holding `path` before
+    /// the call, including what [`SyncMode::Barrier`] synced only in order.
+    ///
+    /// The default is a no-op, for a backend whose syncs already reach the
+    /// medium; the std backend issues one `fcntl(F_FULLFSYNC)` on macOS.
+    ///
+    /// # Errors
+    ///
+    /// Returns an I/O error if `path` cannot be opened or the flush fails.
+    fn sync_device(&self, path: &Path) -> io::Result<()> {
+        let _ = path;
+        Ok(())
     }
 
     /// Returns `Ok(true)` if a file or directory exists at `path`.

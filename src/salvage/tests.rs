@@ -1206,17 +1206,15 @@ fn salvage_removes_the_mid_copy_when_the_publish_dir_sync_fails() -> crate::Resu
 
     // Fail the publish's post-rename directory sync. The tail attempt
     // mis-decodes under the forged codec and drops its only block, so it
-    // never finishes (no sync); the MID writer's finish syncs the parent
-    // once, and the publish after the MID rename syncs it again. Skip the
-    // MID writer's sync and fire on the publish.
-    injector.arm(FaultRule::new(FaultOp::SyncDirectory, Fault::Error(ErrorKind::Other)).skip(1));
+    // never finishes; a table writer syncs only its file, so the publish
+    // after the MID rename is the first directory sync. Fire on it.
+    injector.arm(FaultRule::new(FaultOp::SyncDirectory, Fault::Error(ErrorKind::Other)).once());
 
     // The error must be the INJECTED directory-sync fault: only the publish
     // path both consumes the fault and propagates it. If a future change
-    // adds an earlier directory sync, `skip(1)` fires on the MID writer's
-    // finish instead — `mid` fails, the arbitration returns the tail
-    // attempt's (different) mis-decode error, and this assertion flags that
-    // the test no longer covers the publish-sync cleanup path.
+    // adds an earlier directory sync, the fault fires there instead and this
+    // assertion flags that the test no longer covers the publish-sync
+    // cleanup path.
     let Err(err) = salvage_sst(&source, dest.clone(), &fs) else {
         panic!("a failed publish directory sync must fail the salvage");
     };

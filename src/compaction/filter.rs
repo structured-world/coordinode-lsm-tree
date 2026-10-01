@@ -291,7 +291,8 @@ impl<'a, 'b: 'a> StreamFilterAdapter<'a, 'b> {
             )?
             .use_target_size(blob_opts.file_target_size)
             .use_compression(rc.blob_compression)
-            .use_sync_mode(self.shared.opts.config.sync_mode);
+            .use_sync_mode(self.shared.opts.config.sync_mode)
+            .use_writeback_bytes(self.shared.opts.config.writeback_bytes);
 
             // A filter that rewrites a separated value writes a NEW blob file
             // under the tree's blob policy, so it needs both halves: the

@@ -53,6 +53,9 @@ pub struct MultiWriter {
     /// rotated blob writer.
     sync_mode: SyncMode,
 
+    /// `Config::writeback_bytes`, stamped on every rotated blob writer.
+    writeback_bytes: u64,
+
     /// Dictionary for `ZstdDict` compression, shared across all rotated writers.
     #[cfg(zstd_any)]
     zstd_dictionary: Option<alloc::sync::Arc<crate::compression::ZstdDictionary>>,
@@ -109,6 +112,7 @@ impl MultiWriter {
             compression: CompressionType::None,
             passthrough_compression: CompressionType::None,
             sync_mode: SyncMode::Normal,
+            writeback_bytes: 0,
 
             #[cfg(zstd_any)]
             zstd_dictionary: None,
@@ -129,6 +133,15 @@ impl MultiWriter {
     pub fn use_sync_mode(mut self, sync_mode: SyncMode) -> Self {
         self.sync_mode = sync_mode;
         self.active_writer.sync_mode = sync_mode;
+        self
+    }
+
+    /// Wires the tree's `Config::writeback_bytes` through to every blob file
+    /// this writer writes (active + rotated).
+    #[must_use]
+    pub fn use_writeback_bytes(mut self, bytes: u64) -> Self {
+        self.writeback_bytes = bytes;
+        self.active_writer = self.active_writer.use_writeback_bytes(bytes);
         self
     }
 
@@ -195,7 +208,8 @@ impl MultiWriter {
         let path = self.folder.join(id.to_string());
         let mut w = Writer::new(path, id, self.tree_id, &*self.fs)?
             .use_compression(self.compression)
-            .use_sync_mode(self.sync_mode);
+            .use_sync_mode(self.sync_mode)
+            .use_writeback_bytes(self.writeback_bytes);
         // Carry the passthrough metadata codec onto the new writer so every
         // file in a relocation records the real compression.
         if passthrough != CompressionType::None {
@@ -500,9 +514,12 @@ impl MultiWriter {
         }
         // A new file's directory entry is durable only once its directory is
         // synced (POSIX `fsync(2)`), and the manifest edit that names these
-        // files follows: synced once here for every file the write made.
+        // files follows: synced once here for every file the write made. The
+        // manifest is in the folder above; on another device (a nested mount)
+        // a barrier would not order this sync before it, so that is in full.
+        let mode = crate::file::folder_sync_mode(&*self.fs, &self.folder, self.sync_mode);
         if !self.results.is_empty()
-            && let Err(e) = crate::file::fsync_directory(&self.folder, &*self.fs, self.sync_mode)
+            && let Err(e) = crate::file::fsync_directory(&self.folder, &*self.fs, mode)
         {
             // Not durable, so no version may name them.
             for file in &self.results {
