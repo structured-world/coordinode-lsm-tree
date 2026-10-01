@@ -242,6 +242,82 @@ fn a_rename_between_symlinks_to_one_file_moves_the_entry() {
     assert_eq!(read(&fs, target.to_str().unwrap()), b"durable");
 }
 
+/// Two hard links of one file share its bytes, so a sync through one name
+/// makes them durable under the other: with the synced name removed, a crash
+/// leaves the other name holding the synced bytes, not the ones it was linked
+/// with.
+#[cfg(unix)]
+#[test]
+fn a_sync_through_one_hard_link_is_durable_through_the_other() {
+    let dir = tempfile::tempdir().unwrap();
+    let fs = CrashFs::new(crate::fs::StdFs);
+    let src = dir.path().join("src");
+    let link = dir.path().join("link");
+
+    let mut f = fs
+        .open(&src, &FsOpenOptions::new().write(true).create(true))
+        .unwrap();
+    f.write_all(b"v1").unwrap();
+    f.sync_all().unwrap();
+    drop(f);
+    fs.hard_link(&src, &link).unwrap();
+    fs.sync_directory(dir.path()).unwrap();
+    let mut f = fs
+        .open(&link, &FsOpenOptions::new().write(true).truncate(true))
+        .unwrap();
+    f.write_all(b"v2").unwrap();
+    f.sync_all().unwrap();
+    drop(f);
+    fs.remove_file(&link).unwrap();
+    fs.sync_directory(dir.path()).unwrap();
+
+    fs.crash();
+    assert_eq!(read(&fs, src.to_str().unwrap()), b"v2");
+}
+
+/// An open that creates through a dangling symlink makes the symlink's
+/// target, not the symlink: the target is the new entry, lost on a crash
+/// before its directory is synced, and the symlink, already durable, stays.
+#[cfg(unix)]
+#[test]
+fn a_create_through_a_dangling_symlink_makes_its_target() {
+    let dir = tempfile::tempdir().unwrap();
+    let fs = CrashFs::new(crate::fs::StdFs);
+    let link = dir.path().join("link");
+    let target = dir.path().join("target");
+    std::os::unix::fs::symlink("target", &link).unwrap();
+    fs.sync_directory(dir.path()).unwrap();
+
+    let mut f = fs
+        .open(&link, &FsOpenOptions::new().write(true).create(true))
+        .unwrap();
+    f.write_all(b"data").unwrap();
+    f.sync_all().unwrap();
+    drop(f);
+    assert!(target.exists(), "the open created the target");
+
+    fs.crash();
+    assert!(
+        std::fs::symlink_metadata(&link).is_ok(),
+        "the durable symlink survives"
+    );
+    assert!(
+        !target.exists(),
+        "a created entry whose directory was not synced does not survive a crash"
+    );
+
+    // Once the directory is synced, the created target is durable.
+    let mut f = fs
+        .open(&link, &FsOpenOptions::new().write(true).create(true))
+        .unwrap();
+    f.write_all(b"data").unwrap();
+    f.sync_all().unwrap();
+    drop(f);
+    fs.sync_directory(dir.path()).unwrap();
+    fs.crash();
+    assert_eq!(read(&fs, target.to_str().unwrap()), b"data");
+}
+
 /// A fault layer composes above the simulator, so the probes the simulator
 /// makes for its own bookkeeping see the disk: a fault that makes the source
 /// look absent to the caller does not turn a rename between two links of one

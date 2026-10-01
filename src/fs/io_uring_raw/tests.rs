@@ -137,6 +137,58 @@ fn raw_fs_directory_and_file_ops() {
     assert!(!fs.exists(dir).expect("dir gone"));
 }
 
+/// Two hard links of one inode are one file and a separate file with the same
+/// bytes is not, by device and inode as the other kernel backends answer; a
+/// name that does not exist has no identity, and the probe says so.
+#[test]
+fn raw_fs_same_file_answers_by_identity() {
+    use crate::fs::Fs;
+
+    let tmp = tempfile::tempdir().expect("tempdir");
+    let fs = IoUringRawFs::new(8).expect("fs setup");
+    let a = tmp.path().join("a");
+    let b = tmp.path().join("b");
+    let c = tmp.path().join("c");
+    std::fs::write(&a, b"payload").expect("write a");
+    std::fs::hard_link(&a, &b).expect("link b");
+    std::fs::write(&c, b"payload").expect("write c");
+
+    assert!(
+        fs.same_file(&a, &b).expect("probe"),
+        "two names of one inode"
+    );
+    assert!(!fs.same_file(&a, &c).expect("probe"), "two inodes");
+    let missing = fs
+        .same_file(&a, &tmp.path().join("missing"))
+        .expect_err("a missing name has no identity");
+    assert_eq!(missing.kind(), ErrorKind::NotFound);
+}
+
+/// A symlink's target is read as stored, without following it; a regular
+/// file and a missing name are not symlinks.
+#[test]
+fn raw_fs_read_link_reports_only_symlinks() {
+    use crate::fs::Fs;
+
+    let tmp = tempfile::tempdir().expect("tempdir");
+    let fs = IoUringRawFs::new(8).expect("fs setup");
+    let file = tmp.path().join("file");
+    let link = tmp.path().join("link");
+    std::fs::write(&file, b"payload").expect("write");
+    std::os::unix::fs::symlink("dangling", &link).expect("symlink");
+
+    assert_eq!(
+        fs.read_link(&link).expect("read_link"),
+        Some(crate::path::PathBuf::from("dangling"))
+    );
+    assert_eq!(fs.read_link(&file).expect("read_link"), None);
+    assert_eq!(
+        fs.read_link(&tmp.path().join("missing"))
+            .expect("read_link"),
+        None
+    );
+}
+
 #[test]
 fn raw_file_append_writes_accumulate_at_eof() {
     // O_APPEND writes always land at end of file: two sequential appends

@@ -941,6 +941,22 @@ pub trait Fs: Send + Sync + 'static {
         Ok(a == b)
     }
 
+    /// The target named by `path` when `path` is itself a symbolic link, read
+    /// without following it; `None` when `path` is anything else or does not
+    /// exist. A relative target is returned as stored, relative to the
+    /// directory holding `path`.
+    ///
+    /// The default answers `None`: a backend without symbolic links
+    /// ([`MemFs`]) has nothing to report.
+    ///
+    /// # Errors
+    ///
+    /// Returns an I/O error if `path` cannot be inspected.
+    fn read_link(&self, path: &Path) -> io::Result<Option<PathBuf>> {
+        let _ = path;
+        Ok(None)
+    }
+
     /// Renames a file from `from` to `to`.
     ///
     /// If `to` already exists as a regular file, it is atomically replaced —
