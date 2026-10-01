@@ -206,6 +206,73 @@ fn a_rename_between_links_of_one_file_keeps_both_names() {
     assert_eq!(read(&fs, link.to_str().unwrap()), b"durable");
 }
 
+/// A rename between two symlinks to one file moves the source entry over the
+/// destination, as rename(2) acts on the entries and not on what they point
+/// to: the destination is a new entry, lost on a crash before its directory
+/// is synced.
+#[cfg(unix)]
+#[test]
+fn a_rename_between_symlinks_to_one_file_moves_the_entry() {
+    let dir = tempfile::tempdir().unwrap();
+    let fs = CrashFs::new(crate::fs::StdFs).tracking_directory_entries();
+    let target = dir.path().join("target");
+    let a = dir.path().join("a");
+    let b = dir.path().join("b");
+
+    let mut f = fs
+        .open(&target, &FsOpenOptions::new().write(true).create(true))
+        .unwrap();
+    f.write_all(b"durable").unwrap();
+    f.sync_all().unwrap();
+    drop(f);
+    std::os::unix::fs::symlink(&target, &a).unwrap();
+    std::os::unix::fs::symlink(&target, &b).unwrap();
+    fs.sync_directory(dir.path()).unwrap();
+    fs.rename(&a, &b).unwrap();
+    assert!(!fs.exists(&a).unwrap(), "the source entry was moved");
+
+    fs.crash();
+    assert!(
+        !b.exists(),
+        "a renamed-to entry whose directory was not synced does not survive a crash"
+    );
+    assert_eq!(read(&fs, target.to_str().unwrap()), b"durable");
+}
+
+/// A fault layer composes above the simulator, so the probes the simulator
+/// makes for its own bookkeeping see the disk: a fault that makes the source
+/// look absent to the caller does not turn a rename between two links of one
+/// file into a move, and both durable names survive a crash.
+#[cfg(unix)]
+#[test]
+fn a_fault_above_the_simulator_leaves_a_no_op_rename_a_no_op() {
+    let dir = tempfile::tempdir().unwrap();
+    let crash = CrashFs::new(crate::fs::StdFs).tracking_directory_entries();
+    let fs = FaultFs::new(crash.clone());
+    let injector = fs.injector();
+    let src = dir.path().join("src");
+    let link = dir.path().join("link");
+
+    let mut f = fs
+        .open(&src, &FsOpenOptions::new().write(true).create(true))
+        .unwrap();
+    f.write_all(b"durable").unwrap();
+    f.sync_all().unwrap();
+    drop(f);
+    fs.hard_link(&src, &link).unwrap();
+    fs.sync_directory(dir.path()).unwrap();
+    injector.arm(
+        FaultRule::new(FaultOp::Metadata, Fault::Error(crate::io::ErrorKind::Other))
+            .on_path(link.display().to_string()),
+    );
+    fs.rename(&link, &src).unwrap();
+    injector.clear();
+
+    crash.crash();
+    assert_eq!(read(&crash, src.to_str().unwrap()), b"durable");
+    assert_eq!(read(&crash, link.to_str().unwrap()), b"durable");
+}
+
 /// The blob files a flush and an ingestion write survive a power loss once
 /// the write returns: the manifest that names them must not outlive them.
 #[test]

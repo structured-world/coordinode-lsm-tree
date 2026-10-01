@@ -401,13 +401,17 @@ impl Fs for CrashFs {
     fn rename(&self, from: &Path, to: &Path) -> io::Result<()> {
         let _namespace = self.hold_namespace();
         self.inner.rename(from, to)?;
-        // POSIX rename(2): when both names refer to the same file (one path,
+        // POSIX rename(2): when both entries are links to one file (one path,
         // or two hard links of one inode) the call succeeds and changes
         // nothing, so `from` is still there and the crash state stays as it
-        // was. Probed only in the directory-entry mode, the one this matters
-        // to, with the namespace held so no other operation can have made
-        // `from` again since the rename; a probe that fails is read as an
-        // ordinary rename.
+        // was. Whether it is still there is what tells, on every backend: a
+        // file-identity probe follows symlinks, which rename does not, and
+        // not every backend can answer one. Probed only in the directory-entry
+        // mode, the one this matters to, with the namespace held so no other
+        // operation can have made `from` again since the rename; the inner
+        // backend is the disk this simulates, so its answer is the truth: a
+        // fault layer composes above the simulator, never below it. A probe
+        // that fails is read as an ordinary rename.
         let tracking = self.state.lock().track_entries;
         if from == to || (tracking && matches!(self.inner.exists(from), Ok(true))) {
             return Ok(());
