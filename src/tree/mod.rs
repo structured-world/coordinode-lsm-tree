@@ -149,9 +149,9 @@ struct LevelTable<'a, 'k> {
     read: Option<crate::table::staged::StagedRead<'a>>,
     /// The file the first stage opened, held for every later stage and the
     /// data reads: on a level wider than the descriptor cache, the cache has
-    /// evicted it by then, and opening it again is a cold open per stage. The
-    /// data tasks hold every table's file at once anyway, so holding it from
-    /// the first stage raises no peak of open files.
+    /// evicted it by then, and opening it again is a cold open per stage. It
+    /// is let go once the table needs no more stages and no data block, so a
+    /// table the filters answered does not keep a descriptor open.
     file: Option<Arc<dyn crate::fs::FsFile>>,
 }
 
@@ -3987,6 +3987,18 @@ impl Tree {
                         waiting[at] += 1;
                     }
                     break;
+                }
+                // A table whose stages are over and that reads no data block,
+                // or that is left to the serial planner, needs its file no
+                // more: holding it would keep a descriptor per table of the
+                // level open until the whole level is read.
+                if waiting[at] == 0
+                    && entry
+                        .read
+                        .as_ref()
+                        .is_none_or(|read| read.is_done() && !read.plans_blocks())
+                {
+                    entry.file = None;
                 }
             }
 

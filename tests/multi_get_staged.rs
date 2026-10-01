@@ -1323,6 +1323,127 @@ fn a_level_wider_than_the_descriptor_cache_opens_each_table_once() -> lsm_tree::
     Ok(())
 }
 
+/// The descriptors this process has open.
+#[cfg(unix)]
+fn open_descriptors() -> usize {
+    std::fs::read_dir("/dev/fd").map_or(0, Iterator::count)
+}
+
+/// A backend recording, at each batched read, how many descriptors the
+/// process has open, delegating to [`StdFs`].
+#[cfg(unix)]
+struct FdCountFs(Arc<Mutex<Vec<usize>>>);
+
+#[cfg(unix)]
+impl Fs for FdCountFs {
+    fn read_blocks_batched(&self, reqs: &mut [BlockRead<'_>]) -> io::Result<()> {
+        self.0
+            .lock()
+            .unwrap_or_else(PoisonError::into_inner)
+            .push(open_descriptors());
+        StdFs.read_blocks_batched(reqs)
+    }
+
+    fn open(&self, path: &Path, opts: &FsOpenOptions) -> io::Result<Box<dyn FsFile>> {
+        StdFs.open(path, opts)
+    }
+
+    fn create_dir_all(&self, path: &Path) -> io::Result<()> {
+        StdFs.create_dir_all(path)
+    }
+
+    fn read_dir(&self, path: &Path) -> io::Result<Vec<FsDirEntry>> {
+        StdFs.read_dir(path)
+    }
+
+    fn remove_file(&self, path: &Path) -> io::Result<()> {
+        StdFs.remove_file(path)
+    }
+
+    fn remove_dir_all(&self, path: &Path) -> io::Result<()> {
+        StdFs.remove_dir_all(path)
+    }
+
+    fn rename(&self, from: &Path, to: &Path) -> io::Result<()> {
+        StdFs.rename(from, to)
+    }
+
+    fn metadata(&self, path: &Path) -> io::Result<FsMetadata> {
+        StdFs.metadata(path)
+    }
+
+    fn sync_directory(&self, path: &Path) -> io::Result<()> {
+        StdFs.sync_directory(path)
+    }
+
+    fn exists(&self, path: &Path) -> io::Result<bool> {
+        StdFs.exists(path)
+    }
+}
+
+/// A table whose filters answer every key of the batch gives its file back as
+/// soon as they do: while the one table the batch reads further goes through
+/// its index, the files of the level's other tables are not held open.
+#[cfg(unix)]
+#[test]
+fn a_table_the_filters_answer_lets_its_file_go() -> lsm_tree::Result<()> {
+    // Well past the descriptor cache, whose shards keep an entry each.
+    const TABLES: u32 = 64;
+    let dir = tempfile::tempdir()?;
+    let counts = Arc::new(Mutex::new(Vec::new()));
+    let fs: Arc<dyn Fs> = Arc::new(FdCountFs(Arc::clone(&counts)));
+    let config = || {
+        Config::new(
+            dir.path(),
+            SequenceNumberCounter::default(),
+            SequenceNumberCounter::default(),
+        )
+        .with_shared_fs(Arc::clone(&fs))
+        // No cache, so the index is read in a stage after the filters.
+        .use_cache(Arc::new(Cache::with_capacity_bytes(0)))
+        .use_descriptor_table(Some(Arc::new(lsm_tree::DescriptorTable::new(2))))
+        .filter_block_pinning_policy(PinningPolicy::all(false))
+        .index_block_pinning_policy(PinningPolicy::all(false))
+    };
+    {
+        let tree = config().open()?;
+        let mut seqno = 0;
+        for table in 0..TABLES {
+            for row in 0..200u32 {
+                tree.insert(format!("t{table:03}r{row:04}"), vec![b'v'; 64], seqno);
+                seqno += 1;
+            }
+            tree.flush_active_memtable(0)?;
+        }
+    }
+    // One present key in the first table; elsewhere a key inside each
+    // table's range that it does not hold, which its filter answers.
+    let keys: Vec<String> = core::iter::once("t000r0010".to_owned())
+        .chain((1..TABLES).map(|table| format!("t{table:03}r0010x")))
+        .collect();
+    let tree = config().open()?;
+    let expected = one_by_one(&tree, &keys)?;
+    counts
+        .lock()
+        .unwrap_or_else(PoisonError::into_inner)
+        .clear();
+
+    let values = tree.multi_get(&keys, SeqNo::MAX)?;
+    let counts = counts
+        .lock()
+        .unwrap_or_else(PoisonError::into_inner)
+        .clone();
+    let (Some(&filters), Some(&later)) = (counts.first(), counts.get(1)) else {
+        panic!("a filter batch and a later one, got {counts:?}");
+    };
+    assert!(
+        later + (TABLES as usize) / 2 <= filters,
+        "{filters} descriptors open at the filter batch, still {later} at the next"
+    );
+    assert_eq!(values, expected);
+    Ok(())
+}
+
 /// A tree whose level 0 holds two tables on `primary` and two on `routed`, as
 /// after level 0 was routed away from the primary folder, reopened with no
 /// cache; and the keys a batch reads: one present and one absent per table.
