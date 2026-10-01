@@ -400,24 +400,20 @@ impl Fs for CrashFs {
 
     fn rename(&self, from: &Path, to: &Path) -> io::Result<()> {
         let _namespace = self.hold_namespace();
-        // POSIX rename(2): when both names refer to the same file (one path,
-        // or two hard links of one inode) the call succeeds and changes
-        // nothing, so the crash state stays as it was. That is decided from
-        // the files the names refer to before the rename, since afterwards
-        // only a probe of `from` could tell, and a probe can be wrong. Probed
-        // only in the directory-entry mode, the one this matters to: an
-        // absent name is an ordinary rename, and any other probe failure
-        // fails the rename before anything moves.
-        let tracking = self.state.lock().track_entries;
-        let same = from == to
-            || (tracking
-                && match self.inner.same_file(from, to) {
-                    Ok(same) => same,
-                    Err(error) if error.kind() == io::ErrorKind::NotFound => false,
-                    Err(error) => return Err(error),
-                });
         self.inner.rename(from, to)?;
-        if same {
+        // POSIX rename(2): when both entries are links to one file (one path,
+        // or two hard links of one inode) the call succeeds and changes
+        // nothing, so `from` is still there and the crash state stays as it
+        // was. Whether it is still there is what tells, on every backend: a
+        // file-identity probe follows symlinks, which rename does not, and
+        // not every backend can answer one. Probed only in the directory-entry
+        // mode, the one this matters to, with the namespace held so no other
+        // operation can have made `from` again since the rename; the inner
+        // backend is the disk this simulates, so its answer is the truth: a
+        // fault layer composes above the simulator, never below it. A probe
+        // that fails is read as an ordinary rename.
+        let tracking = self.state.lock().track_entries;
+        if from == to || (tracking && matches!(self.inner.exists(from), Ok(true))) {
             return Ok(());
         }
         let mut state = self.state.lock();
