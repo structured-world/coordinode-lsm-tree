@@ -861,7 +861,7 @@ fn allocated_size_missing_path_is_err_not_none() {
 /// while naming one inode — like the two mount-point spellings of a
 /// bind-mount alias, where a "distinct" verdict authorizes a deletion
 /// that destroys the retained copy too.
-#[cfg(unix)]
+#[cfg(any(unix, windows))]
 #[test]
 fn same_file_answers_by_identity_not_spelling() -> io::Result<()> {
     let dir = tempfile::tempdir().unwrap();
@@ -880,5 +880,25 @@ fn same_file_answers_by_identity_not_spelling() -> io::Result<()> {
         !StdFs.same_file(&a, &c)?,
         "distinct inodes are distinct files",
     );
+    Ok(())
+}
+
+/// A symlink's target is read as stored, without following it, a dangling one
+/// included; a regular file and a missing name are not symlinks.
+#[cfg(unix)]
+#[test]
+fn read_link_reports_only_symlinks() -> io::Result<()> {
+    let dir = tempfile::tempdir().unwrap();
+    let file = dir.path().join("file");
+    let link = dir.path().join("link");
+    std::fs::write(&file, b"payload")?;
+    std::os::unix::fs::symlink("dangling", &link)?;
+
+    assert_eq!(
+        StdFs.read_link(&link)?,
+        Some(crate::path::PathBuf::from("dangling"))
+    );
+    assert_eq!(StdFs.read_link(&file)?, None);
+    assert_eq!(StdFs.read_link(&dir.path().join("missing"))?, None);
     Ok(())
 }

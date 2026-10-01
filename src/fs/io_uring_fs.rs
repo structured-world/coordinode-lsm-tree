@@ -319,6 +319,10 @@ impl Fs for IoUringFs {
         Ok(ma.dev() == mb.dev() && ma.ino() == mb.ino())
     }
 
+    fn read_link(&self, path: &Path) -> crate::io::Result<Option<crate::path::PathBuf>> {
+        super::StdFs.read_link(path)
+    }
+
     fn rename(&self, from: &Path, to: &Path) -> crate::io::Result<()> {
         std::fs::rename(from, to).map_err(crate::io::Error::from)
     }
