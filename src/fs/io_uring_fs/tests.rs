@@ -2143,7 +2143,244 @@ fn a_reused_read_queue_keeps_no_slot_for_a_read_handed_back() -> io::Result<()> 
     Ok(())
 }
 
-/// Dropping a queue with reads on the ring waits their completions out
+/// The results of draining `queue` to empty, by tag, with each error's kind.
+fn drain_results(queue: &mut dyn ReadQueue) -> Vec<(usize, Result<(), crate::io::ErrorKind>)> {
+    let mut got = Vec::new();
+    while queue.outstanding() > 0 {
+        queue.wait(1, &mut |done| {
+            got.push((done.tag, done.result.map_err(|e| e.kind())));
+        });
+    }
+    got.sort_unstable_by_key(|(tag, _)| *tag);
+    got
+}
+
+/// A read the ring need not take is handed back without it: an empty one at
+/// once, and one too long for a submission queue entry as failed, beside a
+/// read the ring serves.
+#[test]
+fn a_read_queue_hands_back_reads_the_ring_cannot_take() -> io::Result<()> {
+    let Some(fs) = try_io_uring() else {
+        return Ok(());
+    };
+    let dir = tempfile::tempdir()?;
+    let files: Vec<Arc<dyn FsFile>> = two_files(&fs, dir.path(), 256)?
+        .into_iter()
+        .map(Arc::from)
+        .collect();
+    let mut queue = fs.read_queue();
+    queue.submit(QueuedRead {
+        tag: 0,
+        file: Arc::clone(&files[0]),
+        offset: 0,
+        buf: Vec::new(),
+    });
+    // Zeroed and never touched, so it costs address space, not memory.
+    let too_long = usize::try_from(i32::MAX).expect("fits") + 1;
+    queue.submit(QueuedRead {
+        tag: 1,
+        file: Arc::clone(&files[0]),
+        offset: 0,
+        buf: vec![0; too_long],
+    });
+    queue.submit(QueuedRead {
+        tag: 2,
+        file: Arc::clone(&files[0]),
+        offset: 64,
+        buf: vec![0; 64],
+    });
+    assert_eq!(
+        drain_results(&mut *queue),
+        [
+            (0, Ok(())),
+            (1, Err(crate::io::ErrorKind::InvalidInput)),
+            (2, Ok(())),
+        ]
+    );
+    Ok(())
+}
+
+/// A file with no descriptor is read serially, and what that read returns is
+/// handed back as is: short of its block as failed, a refused read with its
+/// error.
+#[test]
+fn a_serial_read_reports_a_short_read_and_a_refused_one() -> io::Result<()> {
+    use crate::fs::{Fault, FaultFs, FaultOp, FaultRule, MemFs};
+
+    let Some(fs) = try_io_uring() else {
+        return Ok(());
+    };
+    let mem = MemFs::new();
+    let path = Path::new("/m");
+    mem.open(path, &FsOpenOptions::new().write(true).create(true))?
+        .write_all(b"hello, world")?;
+    let short: Arc<dyn FsFile> = Arc::from(mem.open(path, &FsOpenOptions::new().read(true))?);
+    let faulty = FaultFs::new(mem.clone());
+    faulty.injector().arm(FaultRule::new(
+        FaultOp::ReadAt,
+        Fault::Error(crate::io::ErrorKind::PermissionDenied),
+    ));
+    let refused: Arc<dyn FsFile> = Arc::from(faulty.open(path, &FsOpenOptions::new().read(true))?);
+
+    let mut queue = fs.read_queue();
+    queue.submit(QueuedRead {
+        tag: 0,
+        file: short,
+        offset: 7,
+        buf: vec![0; 64],
+    });
+    queue.submit(QueuedRead {
+        tag: 1,
+        file: refused,
+        offset: 0,
+        buf: vec![0; 5],
+    });
+    assert_eq!(
+        drain_results(&mut *queue),
+        [
+            (0, Err(crate::io::ErrorKind::UnexpectedEof)),
+            (1, Err(crate::io::ErrorKind::PermissionDenied)),
+        ]
+    );
+    Ok(())
+}
+
+/// Reads sent to a ring thread that has shut down fail, whether the wait
+/// would block for room or not, and none is left outstanding.
+#[test]
+fn a_read_queue_fails_its_reads_once_the_ring_thread_is_gone() -> io::Result<()> {
+    let Some(fs) = try_io_uring() else {
+        return Ok(());
+    };
+    let dir = tempfile::tempdir()?;
+    let files: Vec<Arc<dyn FsFile>> = two_files(&fs, dir.path(), 256)?
+        .into_iter()
+        .map(Arc::from)
+        .collect();
+    // What a shutdown leaves: no sender to the ring thread.
+    drop(
+        fs.inner
+            .tx
+            .lock()
+            .unwrap_or_else(std::sync::PoisonError::into_inner)
+            .take(),
+    );
+    for min in [0usize, 1] {
+        let mut queue = fs.read_queue();
+        queue.submit(QueuedRead {
+            tag: 0,
+            file: Arc::clone(&files[0]),
+            offset: 0,
+            buf: vec![0; 64],
+        });
+        let mut got = Vec::new();
+        queue.wait(min, &mut |done| {
+            got.push((done.tag, done.result.map_err(|e| e.kind())));
+        });
+        assert_eq!(
+            got,
+            [(0, Err(crate::io::ErrorKind::BrokenPipe))],
+            "a wait for {min}"
+        );
+        assert_eq!(queue.outstanding(), 0, "a wait for {min}");
+    }
+    Ok(())
+}
+
+/// A submission lock poisoned by a panicking sender still sends: the
+/// channel it guards is intact, so a wait for none puts the reads on the ring.
+#[test]
+fn a_poisoned_submission_lock_still_sends() -> io::Result<()> {
+    let Some(fs) = try_io_uring() else {
+        return Ok(());
+    };
+    let dir = tempfile::tempdir()?;
+    let files: Vec<Arc<dyn FsFile>> = two_files(&fs, dir.path(), 256)?
+        .into_iter()
+        .map(Arc::from)
+        .collect();
+    std::thread::scope(|scope| {
+        let poisoner = scope.spawn(|| {
+            let _held = fs
+                .inner
+                .tx
+                .lock()
+                .unwrap_or_else(std::sync::PoisonError::into_inner);
+            panic!("a sender panics holding the submission lock");
+        });
+        assert!(poisoner.join().is_err(), "the sender panicked");
+    });
+    assert!(fs.inner.tx.is_poisoned(), "the lock is poisoned");
+
+    let mut queue = fs.read_queue();
+    queue.submit(QueuedRead {
+        tag: 0,
+        file: Arc::clone(&files[0]),
+        offset: 64,
+        buf: vec![0; 64],
+    });
+    let mut got = Vec::new();
+    while queue.outstanding() > 0 {
+        queue.wait(0, &mut |done| got.push((done.tag, done.result.is_ok())));
+        std::thread::yield_now();
+    }
+    assert_eq!(got, [(0, true)]);
+    Ok(())
+}
+
+/// The ring's result for a read is handed back as the read's verdict: a
+/// negative result is the read's `errno`. Completions may arrive in any order:
+/// the slots of handed-back reads are dropped from either end, and a
+/// completion for a read already handed back hands back nothing.
+#[test]
+fn a_read_queue_hands_back_completions_in_any_order() -> io::Result<()> {
+    let Some(fs) = try_io_uring() else {
+        return Ok(());
+    };
+    let dir = tempfile::tempdir()?;
+    let files: Vec<Arc<dyn FsFile>> = two_files(&fs, dir.path(), 256)?
+        .into_iter()
+        .map(Arc::from)
+        .collect();
+    let mut queue = UringReadQueue::new(&fs.inner);
+    // Two reads as if on the ring, at positions 0 and 1.
+    for tag in 0..2usize {
+        queue.sent.push_back(Some(QueuedRead {
+            tag,
+            file: Arc::clone(&files[0]),
+            offset: 0,
+            buf: vec![0; 64],
+        }));
+    }
+    queue.on_ring = 2;
+
+    /// `EBADF` on Linux.
+    const EBADF: i32 = 9;
+    let last = queue.complete(1, -EBADF).expect("the read at 1");
+    let error = last.result.expect_err("a negative result fails the read");
+    assert_eq!(
+        io::Error::from(error).raw_os_error(),
+        Some(EBADF),
+        "the read's errno"
+    );
+    assert_eq!(
+        queue.sent.len(),
+        1,
+        "the handed-back slot at the end is dropped"
+    );
+    assert!(
+        queue.complete(1, 64).is_none(),
+        "a completion for a read handed back hands back nothing"
+    );
+
+    let first = queue.complete(0, 64).expect("the read at 0");
+    assert!(first.result.is_ok());
+    assert!(queue.sent.is_empty(), "no slot outlives its read");
+    assert_eq!(queue.on_ring, 0);
+    Ok(())
+}
+
+/// Dropping a queue with reads in flight waits their completions out
 /// before their buffers go, and the backend stays usable after.
 #[test]
 fn dropping_a_read_queue_with_reads_in_flight_leaves_the_backend_usable() -> io::Result<()> {
