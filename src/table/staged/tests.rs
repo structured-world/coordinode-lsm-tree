@@ -19,6 +19,63 @@ type Driven = (SeqNo, Vec<(BlockHandle, Vec<usize>)>, PlanCounts, Asked);
 /// and the index are pinned.
 type Shape = (&'static str, fn(Writer) -> Writer, bool, bool);
 
+/// A level read bounds the blocks a read holds by their decoded bytes: a
+/// compressed index block is held as far more than it is read as, and a
+/// filter block stops counting once the filters have answered.
+#[cfg(feature = "lz4")]
+#[test]
+fn a_read_holds_its_blocks_at_their_decoded_size() {
+    let dir = tempdir().expect("tempdir");
+    let table = table(
+        dir.path(),
+        // A data block per few keys: an index of hundreds of similar entries.
+        |w| {
+            w.use_data_block_size(64)
+                .use_index_block_compression(crate::CompressionType::Lz4)
+        },
+        false,
+        false,
+        1_000_000,
+    );
+    let keys = batch();
+    let keys: Vec<(&[u8], u64)> = keys.iter().map(|(k, h)| (k.as_slice(), *h)).collect();
+    let StagedStart::Staged(mut read) = StagedRead::start(&table, &keys, SeqNo::MAX) else {
+        panic!("an unpinned table is staged");
+    };
+    let file = std::fs::read(&*table.path).expect("table file");
+    let supply = |read: &mut StagedRead<'_>| -> u64 {
+        let need: Vec<BlockHandle> = read.need().1.to_vec();
+        let mut read_as = 0;
+        for handle in need {
+            let start = usize::try_from(*handle.offset()).expect("offset fits");
+            let bytes = file
+                .get(start..)
+                .and_then(|rest| rest.get(..handle.size() as usize))
+                .expect("the block lies in the table file");
+            read.supply(handle, bytes).expect("supply");
+            read_as += u64::from(handle.size());
+        }
+        read_as
+    };
+
+    supply(&mut read);
+    assert!(read.held_bytes() > 0, "the filter block is held");
+    read.advance(&keys).expect("advance");
+    assert_eq!(read.held_bytes(), 0, "the answered filters count no more");
+
+    let read_as = supply(&mut read);
+    let decoded: u64 = read
+        .held
+        .iter()
+        .map(|(_, block)| block.data.len() as u64)
+        .sum();
+    assert_eq!(read.held_bytes(), decoded);
+    assert!(
+        decoded > read_as,
+        "the compressed index ({read_as} bytes read) is held decoded ({decoded} bytes)"
+    );
+}
+
 /// Writes 500 keys `key000000..key000998` (even numbers only, so every odd
 /// number is a miss inside the key range) into one table shaped by `shape`,
 /// and opens it with a cache of `cache_bytes`, pinning as asked.

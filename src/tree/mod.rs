@@ -176,6 +176,37 @@ struct LevelQueue<'a> {
     wakes: bool,
 }
 
+/// The filter and index bytes each table of a staged level read holds, and
+/// their sum: the buffers of its blocks in flight, at the size they are read
+/// as, and the blocks its read holds, at their decoded size.
+struct MetaHeld {
+    in_flight: Vec<u64>,
+    held: Vec<u64>,
+    total: u64,
+}
+
+impl MetaHeld {
+    fn new(tables: usize) -> Self {
+        Self {
+            in_flight: vec![0; tables],
+            held: vec![0; tables],
+            total: 0,
+        }
+    }
+
+    /// Counts the table at `at` anew, its read holding `read_held` bytes.
+    #[expect(
+        clippy::indexing_slicing,
+        reason = "`at` indexes the level's tables, which both vectors are sized to"
+    )]
+    fn settle(&mut self, at: usize, read_held: u64) {
+        let now = self.in_flight[at] + read_held;
+        // `total` sums `held`, so it is at least the share replaced here.
+        self.total = self.total - self.held[at] + now;
+        self.held[at] = now;
+    }
+}
+
 /// Woken by any queue of a level when one of its reads is back: each wake
 /// moves the generation on and unparks the thread driving the level, so a
 /// wake landing between its look at the queues and its park is not lost.
@@ -3937,10 +3968,7 @@ impl Tree {
         let open_cap = Self::open_cap(tables.iter().map(|entry| entry.table));
         let mut staged: Vec<bool> = vec![false; tables.len()];
         let mut in_stage = 0usize;
-        // The bytes each table's stages asked for, held until it is planned,
-        // and their sum across the level.
-        let mut meta_held: Vec<u64> = vec![0; tables.len()];
-        let mut meta_total = 0u64;
+        let mut meta = MetaHeld::new(tables.len());
 
         loop {
             // Whether a table waits for a place under the cap, or for room
@@ -3962,8 +3990,12 @@ impl Tree {
                 {
                     let (block_type, need) = read.need();
                     if need.is_empty() {
-                        if read.advance(&entry.batch).is_err() {
+                        // A stage passed lets go of the blocks it alone read.
+                        if read.advance(&entry.batch).is_ok() {
+                            meta.settle(at, read.held_bytes());
+                        } else {
                             entry.read = None;
+                            meta.settle(at, 0);
                         }
                         continue;
                     }
@@ -3979,7 +4011,7 @@ impl Tree {
                     // no table before this one holds blocks: then it goes on
                     // even alone above the budget, or the level would stop.
                     let asked_bytes: u64 = need.iter().map(|handle| u64::from(handle.size())).sum();
-                    if !first_holder && meta_total + asked_bytes > metadata_budget {
+                    if !first_holder && meta.total + asked_bytes > metadata_budget {
                         deferred = true;
                         break;
                     }
@@ -4007,8 +4039,8 @@ impl Tree {
                         file
                     };
                     table.record_batched_read(block_type, need);
-                    meta_held[at] += asked_bytes;
-                    meta_total += asked_bytes;
+                    meta.in_flight[at] += asked_bytes;
+                    meta.settle(at, read.held_bytes());
                     let slot = if let Some(slot) =
                         queues.iter().position(|q| Arc::ptr_eq(q.fs, &table.fs))
                     {
@@ -4059,10 +4091,9 @@ impl Tree {
                     }
                     // Planned, or left to the serial planner: the blocks its
                     // stages held are its read's no more.
-                    meta_total -= meta_held[at];
-                    meta_held[at] = 0;
+                    meta.settle(at, 0);
                 }
-                held_before |= meta_held[at] > 0;
+                held_before |= meta.held[at] > 0;
             }
 
             // A block is handed to its read the moment it is back; a read
@@ -4070,7 +4101,10 @@ impl Tree {
             let mut on_done = |done: crate::fs::ReadDone| {
                 let (at, handle) = asked[done.tag];
                 waiting[at] -= 1;
+                // Back from flight: held from here on decoded, if at all.
+                meta.in_flight[at] -= u64::from(handle.size());
                 let Some(read) = &mut tables[at].read else {
+                    meta.settle(at, 0);
                     return;
                 };
                 let supplied = match done.result {
@@ -4082,8 +4116,11 @@ impl Tree {
                         false
                     }
                 };
-                if !supplied {
+                if supplied {
+                    meta.settle(at, read.held_bytes());
+                } else {
                     tables[at].read = None;
+                    meta.settle(at, 0);
                 }
             };
             // What has finished on any backend, without waiting. The wake's

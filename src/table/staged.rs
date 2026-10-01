@@ -134,6 +134,15 @@ impl<'t> StagedRead<'t> {
         self.stage == Stage::Done
     }
 
+    /// The decoded bytes of the blocks this read holds, which a compressed
+    /// block can make far more than it was read as.
+    pub(crate) fn held_bytes(&self) -> u64 {
+        self.held
+            .iter()
+            .map(|(_, block)| block.data.len() as u64)
+            .sum()
+    }
+
     /// Holds `bytes`, the on-disk bytes of the needed block at `handle`, and
     /// puts the decoded block in the cache.
     ///
