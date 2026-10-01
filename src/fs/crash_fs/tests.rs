@@ -477,6 +477,31 @@ fn hard_linking_a_dangling_symlink_succeeds() {
     );
 }
 
+/// A rename between two hard links of one dangling symlink changes nothing
+/// (rename(2): both names refer to the same file), though the link points
+/// nowhere: both durable names survive a crash.
+#[cfg(target_os = "linux")]
+#[test]
+fn a_rename_between_links_of_a_dangling_symlink_keeps_both_names() {
+    let dir = tempfile::tempdir().unwrap();
+    let fs = CrashFs::new(crate::fs::StdFs).tracking_directory_entries();
+    let link = dir.path().join("link");
+    let alias = dir.path().join("alias");
+    std::os::unix::fs::symlink("missing", &link).unwrap();
+    fs.hard_link(&link, &alias).unwrap();
+    fs.sync_directory(dir.path()).unwrap();
+
+    fs.rename(&alias, &link).unwrap();
+    assert!(
+        std::fs::symlink_metadata(&alias).is_ok(),
+        "the backend treated the rename as a no-op"
+    );
+
+    fs.crash();
+    assert!(std::fs::symlink_metadata(&link).is_ok());
+    assert!(std::fs::symlink_metadata(&alias).is_ok());
+}
+
 /// An open that creates through a dangling symlink makes the symlink's
 /// target, not the symlink: the target is the new entry, lost on a crash
 /// before its directory is synced, and the symlink, already durable, stays.
