@@ -11,6 +11,12 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 
 ## [Unreleased]
 
+## [5.11.11](https://github.com/structured-world/coordinode-lsm-tree/compare/v5.11.10...v5.11.11) - 2026-10-01
+
+### Testing
+
+- *(test-fs)* pin how a no-op rename is told ([#759](https://github.com/structured-world/coordinode-lsm-tree/pull/759))
+
 ## [5.11.10](https://github.com/structured-world/coordinode-lsm-tree/compare/v5.11.9...v5.11.10) - 2026-09-30
 
 ### Fixed
