@@ -50,7 +50,7 @@ pub fn is_io_uring_available() -> bool {
 /// dedicated `io_uring` ring thread. Directory and metadata operations
 /// delegate to [`std::fs`] since they do not benefit from `io_uring`.
 ///
-/// Multiple `IoUringFs` clones and all [`IoUringFile`] handles opened
+/// Multiple `IoUringFs` clones and all the file handles opened
 /// through them share the same ring thread.
 ///
 /// # Example
