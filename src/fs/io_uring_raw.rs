@@ -392,6 +392,8 @@ const LOCK_NB: i32 = 4;
 const AT_EMPTY_PATH: i32 = 0x1000;
 /// `statx` mask: request the basic stat fields (type, mode, size, …).
 const STATX_BASIC_STATS: u32 = 0x0000_07ff;
+/// `statx` mask bit: `stx_ino` was filled.
+const STATX_INO: u32 = 0x0000_0100;
 /// `st_mode` file-type mask and the regular-file / directory type bits.
 const S_IFMT: u16 = 0o170_000;
 const S_IFDIR: u16 = 0o040_000;
@@ -677,6 +679,14 @@ pub fn statx_identity_raw(path: &core::ffi::CStr) -> Result<(u32, u32, u64), Err
         )
     }
     .map_err(|e| err("statx", e))?;
+    // A filesystem that cannot report an inode leaves `stx_ino` zero; two
+    // files would then compare as one, so the identity is not known.
+    if buf.stx_mask & STATX_INO == 0 {
+        return Err(Error::new(
+            ErrorKind::Unsupported,
+            "statx: the filesystem reports no inode",
+        ));
+    }
     Ok((buf.stx_dev_major, buf.stx_dev_minor, buf.stx_ino))
 }
 
