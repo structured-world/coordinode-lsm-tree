@@ -1318,6 +1318,96 @@ fn a_raw_value_beside_an_operand_the_predicate_drops_is_not_projected() -> lsm_t
     Ok(())
 }
 
+/// A field merged segments lack reads as its declared default only for the
+/// rows the scan returns: the default is not laid out for every row a
+/// source holds before the merge chooses, so the scan keeps within its
+/// budget however wide the default is.
+#[test]
+fn a_wide_default_is_laid_out_only_for_the_rows_returned() -> lsm_tree::Result<()> {
+    use lsm_tree::table::columnar_predicate::{ColumnRangePredicate, PredicateApply};
+
+    const WIDE: usize = 64 * 1_024;
+    let folder = get_tmp_folder();
+    let any = open_columnar(folder.path());
+    let evens: Vec<u32> = (0..100).map(|i| i * 2).collect();
+    let odds: Vec<u32> = (0..100).map(|i| i * 2 + 1).collect();
+    ingest(&any, &evens, &[(3, &evens)]);
+    ingest(&any, &odds, &[(3, &odds)]);
+    let default = Slice::from(vec![b'd'; WIDE]);
+    let projection = Projection::new()
+        .column(COL_USER_KEY)
+        .field(ProjectedField::new(
+            5,
+            TypeTag::Bytes,
+            Absent::Default(default),
+        )?);
+    let predicate = ColumnRangePredicate {
+        column_id: COL_USER_KEY,
+        lower: Some(key(0)),
+        upper: Some(key(0)),
+        apply: PredicateApply::Filter,
+    };
+    let mut scan = standard(&any).columnar_scan(&projection, Some(&predicate), SeqNo::MAX, ..)?;
+    let mut returned = Vec::new();
+    for batch in &mut scan {
+        let batch = batch?;
+        for row in 0..batch.row_count {
+            returned.push((
+                bytes_cell(&batch.columns[0].data, batch.row_count, row),
+                bytes_cell(&batch.columns[1].data, batch.row_count, row).len(),
+            ));
+        }
+    }
+    assert_eq!(
+        vec![(key(0), WIDE)],
+        returned,
+        "the default, for the row returned"
+    );
+    let budget = lsm_tree::config::DEFAULT_COLUMNAR_SCAN_BUDGET;
+    assert!(
+        scan.peak_payload_bytes() <= budget,
+        "the scan held {} B under a {budget} B budget",
+        scan.peak_payload_bytes()
+    );
+    Ok(())
+}
+
+/// A row written after a small batch, one the ingestion still holds to fill
+/// its row group, lands after it: the batch is written out first, so the
+/// ingestion finishes and both are read back.
+#[test]
+fn a_row_after_a_held_batch_is_ingested_after_it() -> lsm_tree::Result<()> {
+    let folder = get_tmp_folder();
+    let any = open_columnar(folder.path());
+    let entries = [InternalValue::from_components(
+        key(0),
+        b"ignored",
+        0,
+        ValueType::Value,
+    )];
+    let mut batch = entries_to_column_batch(&entries)?;
+    batch.columns.pop();
+    batch.columns.push(Column {
+        column_id: 4,
+        type_tag: TypeTag::Fixed(4),
+        validity: None,
+        data: 40u32.to_le_bytes().to_vec().into(),
+    });
+    let mut ingestion = any.ingestion()?;
+    ingestion.write_columnar_batch(&batch)?;
+    ingestion.write(key(1), row_value(11, 41))?;
+    ingestion.finish()?;
+
+    let tree = standard(&any);
+    assert!(tree.get(key(0), SeqNo::MAX)?.is_some(), "the batch's row");
+    assert_eq!(
+        tree.get(key(1), SeqNo::MAX)?.as_deref(),
+        Some(&row_value(11, 41)[..]),
+        "the row written after it"
+    );
+    Ok(())
+}
+
 /// A value [`RefusesMarked`] fails on.
 const REFUSED: &[u8] = b"refused";
 

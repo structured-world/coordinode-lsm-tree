@@ -493,14 +493,16 @@ const ABSENT_FIELD: Error = Error::Projection(
 /// operand, which the batch's value-type column names when it carries one,
 /// has none, and is decided by its type before it could be returned.
 pub fn conform(batch: ColumnBatch, fields: &[ProjectedField]) -> crate::Result<ColumnBatch> {
-    conform_with(batch, fields, true).map(|(batch, _)| batch)
+    conform_with(batch, fields, Conform::Strict).map(|(batch, _)| batch)
 }
 
 /// [`conform`] for a batch whose rows are not yet decided: a field declared
-/// an error where absent reads as null instead, so a predicate over the
-/// batch sees every other declaration applied, and the rows a scan returns
-/// are held to the declarations by [`conform`] once they are decided. A row
-/// that is shadowed, deleted or filtered out never fails the scan.
+/// an error where absent reads as null instead, and so does one with a
+/// default unless it is the predicate's column `judged`, so a predicate over
+/// the batch sees its own field as declared, and the rows a scan returns are
+/// held to the declarations by [`conform`] once they are decided. A row that
+/// is shadowed, deleted or filtered out never fails the scan, and no default
+/// is laid out for it.
 ///
 /// A column stored under another type than its field declares reads as null
 /// here, and its id is returned: a row of the batch the scan returns fails it
@@ -509,22 +511,42 @@ pub fn conform(batch: ColumnBatch, fields: &[ProjectedField]) -> crate::Result<C
 pub fn conform_lenient(
     batch: ColumnBatch,
     fields: &[ProjectedField],
+    judged: Option<u16>,
 ) -> crate::Result<(ColumnBatch, Vec<u16>)> {
-    conform_with(batch, fields, false)
+    conform_with(batch, fields, Conform::Lenient { judged })
 }
 
 /// A segment stores a projected field under another type than declared.
 pub const MISTYPED: Error =
     Error::Projection("projection: a segment stores a projected field under another type");
 
+/// How [`conform_with`] holds a batch to its fields.
+#[derive(Clone, Copy)]
+enum Conform {
+    /// The rows are decided: each value row is held to every declaration.
+    Strict,
+    /// The rows are not decided yet; `judged` is the predicate's column.
+    Lenient { judged: Option<u16> },
+}
+
 /// [`conform`], holding the rows that are values to [`Absent::Error`] and a
-/// mistyped column to [`MISTYPED`] only when `strict`; also returns the ids
-/// of the columns that were mistyped.
+/// mistyped column to [`MISTYPED`] only when strict, and laying out a default
+/// only when strict or for the judged column; also returns the ids of the
+/// columns that were mistyped.
 fn conform_with(
     batch: ColumnBatch,
     fields: &[ProjectedField],
-    strict: bool,
+    mode: Conform,
 ) -> crate::Result<(ColumnBatch, Vec<u16>)> {
+    let strict = matches!(mode, Conform::Strict);
+    // A default left out reads as null until the rows are decided, when the
+    // strict pass lays it out for the rows returned.
+    let defers = |field: &ProjectedField| match mode {
+        Conform::Strict => false,
+        Conform::Lenient { judged } => {
+            judged != Some(field.column_id) && matches!(field.absent, Absent::Default(_))
+        }
+    };
     let ColumnBatch {
         row_count,
         mut columns,
@@ -563,11 +585,22 @@ fn conform_with(
                     out.push(absent_column(&null, row_count, &|_| false)?);
                     continue;
                 }
-                fill_nulls(column, field, row_count, &is_value)?
+                if defers(field) {
+                    column
+                } else {
+                    fill_nulls(column, field, row_count, &is_value)?
+                }
             }
             // A column of no declared type has no absent form; its rows are
             // held to it once they are decided.
             None if !strict && field.type_tag.is_none() => continue,
+            None if defers(field) => {
+                let null = ProjectedField {
+                    absent: Absent::Null,
+                    ..field.clone()
+                };
+                absent_column(&null, row_count, &|_| false)?
+            }
             None => absent_column(field, row_count, &is_value)?,
         };
         out.push(column);

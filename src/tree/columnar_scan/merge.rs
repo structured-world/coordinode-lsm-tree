@@ -21,10 +21,10 @@
 
 use alloc::vec::Vec;
 
-use super::PredicateTiming;
 use super::projection::{MISTYPED, ProjectedField, conform, conform_lenient};
 use super::rows::SourceCursor;
 use super::{ColumnarScan, Segment, SegmentCursor, drop_columns, key_in_bounds};
+use super::{PredicateTiming, TombstoneSweep};
 use super::{Resolved, UNREADABLE_BY_ID};
 use crate::table::columnar::{
     COL_SEQNO, COL_USER_KEY, COL_VALUE, COL_VALUE_TYPE, Column, ColumnBatch, TypeTag,
@@ -146,7 +146,8 @@ pub(super) struct MergeStream {
     /// Whether a segment of the group records deletions, so the value type is
     /// decoded.
     deletes: bool,
-    rts: Vec<(UserKey, UserKey, SeqNo)>,
+    /// The group's visible range tombstones.
+    rts: TombstoneSweep,
     /// The user key last decided: its remaining rows are shadowed.
     last_key: Option<Vec<u8>>,
     pending: Vec<Pick>,
@@ -260,7 +261,7 @@ impl MergeStream {
             },
             predicate_column: scan.predicate.as_ref().map(|p| p.column_id),
             deletes,
-            rts,
+            rts: TombstoneSweep::new(rts, scan.comparator.as_ref()),
             last_key: None,
             pending: Vec::new(),
             heap: Vec::with_capacity(segments.len()),
@@ -306,7 +307,7 @@ impl MergeStream {
             let keep = if shadowed {
                 false
             } else {
-                let keep = decide(scan, source, self.deletes, &self.rts, key, eff)?;
+                let keep = decide(scan, source, self.deletes, &mut self.rts, key, eff)?;
                 let last = self.last_key.get_or_insert_with(Vec::new);
                 last.clear();
                 last.extend_from_slice(key);
@@ -466,7 +467,7 @@ impl MergeStream {
                     // Its rows are not decided yet: a shadowed or deleted
                     // one must not fail the scan, and the predicate after
                     // the dedup sees the declared defaults.
-                    let (batch, mistyped) = conform_lenient(batch, fields)?;
+                    let (batch, mistyped) = conform_lenient(batch, fields, predicate_column)?;
                     // Every source then carries the whole value last, null
                     // where it splits its values, so the sources agree.
                     let batch = if late {
@@ -568,7 +569,7 @@ impl MergeStream {
             let (merged, resolved) = scan.read_late(merged)?;
             // Every declared column now holds its declared type: read out of
             // a value, or conformed when its source was loaded.
-            let (merged, mistyped) = conform_lenient(merged, &scan.fields)?;
+            let (merged, mistyped) = conform_lenient(merged, &scan.fields, self.predicate_column)?;
             if !mistyped.is_empty() {
                 return Err(MISTYPED);
             }
@@ -1095,7 +1096,7 @@ fn decide(
     scan: &ColumnarScan,
     source: &MergeSource,
     deletes: bool,
-    rts: &[(UserKey, UserKey, SeqNo)],
+    rts: &mut TombstoneSweep,
     key: &[u8],
     eff: SeqNo,
 ) -> crate::Result<bool> {
@@ -1122,7 +1123,7 @@ fn decide(
     // A visible range tombstone covering the newest visible version deletes
     // the key (older versions are older still); an uncovered newest version
     // shadows the covered older ones.
-    Ok(!scan.rt_covered(rts, key, eff))
+    Ok(rts.is_empty() || !rts.covers(key, eff, cmp))
 }
 
 /// The data of `batch`'s column `column_id`.

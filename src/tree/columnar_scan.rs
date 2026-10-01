@@ -582,7 +582,8 @@ enum SingletonMode {
 struct DedupState {
     /// The scan's predicate in the segment's local coordinates.
     predicate: Option<ColumnRangePredicate>,
-    rts: Vec<(UserKey, UserKey, SeqNo)>,
+    /// The segment's visible range tombstones.
+    rts: TombstoneSweep,
     /// Whether the snapshot straddles the segment, so rows are masked by
     /// seqno.
     partial: bool,
@@ -717,6 +718,64 @@ fn operand_rows(batch: &ColumnBatch) -> Vec<bool> {
                 operands
             },
         )
+}
+
+/// The visible range tombstones of a group, swept in the ascending key order
+/// its rows are decided in: each tombstone is entered once the keys reach its
+/// start and dropped once they pass its end, so a row is checked against the
+/// newest tombstone over it, not against every tombstone of the group.
+pub(super) struct TombstoneSweep {
+    /// `(start, end, effective seqno)`, by start key.
+    rts: Vec<(UserKey, UserKey, SeqNo)>,
+    /// The first tombstone the keys have not reached yet.
+    next: usize,
+    /// The tombstones entered, newest first, each with its place in `rts`;
+    /// one the keys have passed is dropped when it comes to the top.
+    open: alloc::collections::BinaryHeap<(SeqNo, usize)>,
+}
+
+impl TombstoneSweep {
+    /// The sweep over `rts`, ordered by `cmp`.
+    pub(super) fn new(mut rts: Vec<(UserKey, UserKey, SeqNo)>, cmp: &dyn UserComparator) -> Self {
+        rts.sort_by(|a, b| cmp.compare(&a.0, &b.0));
+        Self {
+            rts,
+            next: 0,
+            open: alloc::collections::BinaryHeap::new(),
+        }
+    }
+
+    /// Whether the group has no visible range tombstone.
+    pub(super) fn is_empty(&self) -> bool {
+        self.rts.is_empty()
+    }
+
+    /// Whether a row at `key`, no lower than any key asked before, at the
+    /// tree-global seqno `eff` is deleted: inside a tombstone's half-open
+    /// `[start, end)` span and older than it.
+    pub(super) fn covers(&mut self, key: &[u8], eff: SeqNo, cmp: &dyn UserComparator) -> bool {
+        use core::cmp::Ordering;
+
+        while let Some((start, _, seqno)) = self.rts.get(self.next)
+            && cmp.compare(start, key) != Ordering::Greater
+        {
+            self.open.push((*seqno, self.next));
+            self.next += 1;
+        }
+        // The newest open tombstone the keys have passed can cover no later
+        // key either; one below it is dropped once it comes to the top.
+        while let Some(&(_, at)) = self.open.peek() {
+            let passed = self
+                .rts
+                .get(at)
+                .is_none_or(|(_, end, _)| cmp.compare(key, end) != Ordering::Less);
+            if !passed {
+                break;
+            }
+            self.open.pop();
+        }
+        self.open.peek().is_some_and(|&(seqno, _)| eff < seqno)
+    }
 }
 
 /// When a scan's predicate judges the rows the dedup decided: see
@@ -1182,10 +1241,12 @@ impl ColumnarScan {
                 // cells in one, reads as the field declares before its rows
                 // are decided, so a predicate after the dedup sees the
                 // declared defaults, as it does on the merge path.
-                let (batch, mistyped) = match projection::conform_lenient(batch, &self.fields) {
-                    Ok(conformed) => conformed,
-                    Err(e) => return Some(Err(e)),
-                };
+                let judged = self.predicate.as_ref().map(|p| p.column_id);
+                let (batch, mistyped) =
+                    match projection::conform_lenient(batch, &self.fields, judged) {
+                        Ok(conformed) => conformed,
+                        Err(e) => return Some(Err(e)),
+                    };
                 let SingletonStream { global, mode, .. } = &mut **singleton;
                 // A predicate over a column the batch stores under another
                 // type cannot judge its rows: it is set aside for this batch,
@@ -1376,18 +1437,6 @@ impl ColumnarScan {
             }
         }
         Ok(rts)
-    }
-
-    /// Whether a row (`key` at tree-global `eff` seqno) is deleted by one of
-    /// the group's visible range tombstones: inside the half-open
-    /// `[start, end)` span and older than the deletion.
-    fn rt_covered(&self, rts: &[(UserKey, UserKey, SeqNo)], key: &[u8], eff: SeqNo) -> bool {
-        let cmp = self.comparator.as_ref();
-        rts.iter().any(|(start, end, rt_eff)| {
-            eff < *rt_eff
-                && cmp.compare(key, start.as_ref()) != core::cmp::Ordering::Less
-                && cmp.compare(key, end.as_ref()) == core::cmp::Ordering::Less
-        })
     }
 
     /// Whether the requested key range is fully unbounded, so no per-row range
@@ -1681,7 +1730,7 @@ impl ColumnarScan {
             global: seg.global,
             mode: SingletonMode::Dedup(DedupState {
                 predicate,
-                rts,
+                rts: TombstoneSweep::new(rts, self.comparator.as_ref()),
                 partial,
                 deletes,
                 // Visible iff `local < threshold` (the snapshot in this
@@ -1784,7 +1833,7 @@ impl ColumnarScan {
                             .ok_or(Error::InvalidHeader(
                                 "columnar_scan: effective seqno overflows",
                             ))?;
-                    if self.rt_covered(&state.rts, key, eff) {
+                    if state.rts.covers(key, eff, cmp) {
                         mask.push(false);
                         continue;
                     }
