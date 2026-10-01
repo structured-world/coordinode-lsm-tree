@@ -3915,8 +3915,25 @@ impl Tree {
         let mut asked: Vec<(usize, crate::table::BlockHandle)> = Vec::new();
         // Each table's reads still in flight.
         let mut waiting: Vec<usize> = vec![0; tables.len()];
+        // At most as many tables hold a file open for their stages as the
+        // descriptor cache keeps open: a level wider than that, read stage by
+        // stage all at once, would otherwise open a file per table and run
+        // the process out of descriptors. A table whose stages are over no
+        // longer counts, whether it lets its file go or keeps it for its data
+        // blocks, so the tables waiting for a place always get one.
+        let open_cap = tables
+            .iter()
+            .filter_map(|entry| entry.table.descriptor_capacity())
+            .min()
+            .map_or(usize::MAX, |cap| {
+                usize::try_from(cap).unwrap_or(usize::MAX).max(1)
+            });
+        let mut staged: Vec<bool> = vec![false; tables.len()];
+        let mut in_stage = 0usize;
 
         loop {
+            // Whether a table waits for a place under the cap this pass.
+            let mut deferred = false;
             // A table with none of its blocks in flight moves on, and asks for
             // the next stage's blocks once its read lacks some.
             for (at, entry) in tables.iter_mut().enumerate() {
@@ -3948,11 +3965,17 @@ impl Tree {
                     let file = if let Some(file) = &entry.file {
                         Arc::clone(file)
                     } else {
+                        if in_stage >= open_cap {
+                            deferred = true;
+                            break;
+                        }
                         let Ok(file) = table.open_file() else {
                             entry.read = None;
                             break;
                         };
                         entry.file = Some(Arc::clone(&file));
+                        staged[at] = true;
+                        in_stage += 1;
                         file
                     };
                     table.record_batched_read(block_type, need);
@@ -3992,13 +4015,22 @@ impl Tree {
                 // or that is left to the serial planner, needs its file no
                 // more: holding it would keep a descriptor per table of the
                 // level open until the whole level is read.
-                if waiting[at] == 0
-                    && entry
+                if waiting[at] == 0 {
+                    let over = entry
+                        .read
+                        .as_ref()
+                        .is_none_or(crate::table::staged::StagedRead::is_done);
+                    if over && staged[at] {
+                        staged[at] = false;
+                        in_stage -= 1;
+                    }
+                    if entry
                         .read
                         .as_ref()
                         .is_none_or(|read| read.is_done() && !read.plans_blocks())
-                {
-                    entry.file = None;
+                    {
+                        entry.file = None;
+                    }
                 }
             }
 
@@ -4047,6 +4079,11 @@ impl Tree {
             let must_wait = |q: &LevelQueue<'_>| !q.wakes || q.queue.held() > 0;
             let mut reading = queues.iter_mut().filter(|q| q.queue.outstanding() > 0);
             let Some(first) = reading.next() else {
+                // Nothing in flight, so every table that held a place has
+                // moved on and given it back: the ones waiting start now.
+                if deferred {
+                    continue;
+                }
                 return;
             };
             let second = reading.next();

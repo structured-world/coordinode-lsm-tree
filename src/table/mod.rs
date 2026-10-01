@@ -7538,6 +7538,14 @@ impl Table {
         self.cache.capacity()
     }
 
+    /// How many files the descriptor cache this table opens through keeps
+    /// open, or `None` when its descriptor is pinned and always open.
+    pub(crate) fn descriptor_capacity(&self) -> Option<u64> {
+        self.file_accessor
+            .as_descriptor_table()
+            .map(crate::descriptor_table::DescriptorTable::capacity)
+    }
+
     /// This table's file, for a caller that reads its blocks itself.
     ///
     /// # Errors

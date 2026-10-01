@@ -1451,12 +1451,13 @@ impl Fs for LiveCountFs {
     }
 }
 
-/// A table whose filters answer every key of the batch gives its file back as
-/// soon as they do: while the one table the batch reads further goes through
-/// its index, the files of the level's other tables are not held open.
+/// A level read stage by stage keeps at most as many tables' files open for
+/// their stages as the descriptor cache keeps, and a table whose filters
+/// answered every key gives its file back: a level far wider than the cache
+/// does not open, or keep, a file per table, and still answers every key.
 #[test]
-fn a_table_the_filters_answer_lets_its_file_go() -> lsm_tree::Result<()> {
-    // Well past the descriptor cache, whose shards keep an entry each.
+fn a_staged_level_read_opens_no_more_files_than_the_descriptor_cache_holds() -> lsm_tree::Result<()>
+{
     const TABLES: u32 = 64;
     let dir = tempfile::tempdir()?;
     let counts = Arc::new(Mutex::new(Vec::new()));
@@ -1471,7 +1472,6 @@ fn a_table_the_filters_answer_lets_its_file_go() -> lsm_tree::Result<()> {
             SequenceNumberCounter::default(),
         )
         .with_shared_fs(Arc::clone(&fs))
-        // No cache, so the index is read in a stage after the filters.
         .use_cache(Arc::new(Cache::with_capacity_bytes(0)))
         .use_descriptor_table(Some(Arc::new(lsm_tree::DescriptorTable::new(2))))
         .filter_block_pinning_policy(PinningPolicy::all(false))
@@ -1488,13 +1488,12 @@ fn a_table_the_filters_answer_lets_its_file_go() -> lsm_tree::Result<()> {
             tree.flush_active_memtable(0)?;
         }
     }
-    // One present key in the first table; elsewhere a key inside each
-    // table's range that it does not hold, which its filter answers.
-    let keys: Vec<String> = core::iter::once("t000r0010".to_owned())
-        .chain((1..TABLES).map(|table| format!("t{table:03}r0010x")))
+    // A key inside each table's range that it does not hold: every table's
+    // filter is read, and none has a data block to read.
+    let keys: Vec<String> = (0..TABLES)
+        .map(|table| format!("t{table:03}r0010x"))
         .collect();
     let tree = config().open()?;
-    let expected = one_by_one(&tree, &keys)?;
     counts
         .lock()
         .unwrap_or_else(PoisonError::into_inner)
@@ -1505,14 +1504,13 @@ fn a_table_the_filters_answer_lets_its_file_go() -> lsm_tree::Result<()> {
         .lock()
         .unwrap_or_else(PoisonError::into_inner)
         .clone();
-    let (Some(&filters), Some(&later)) = (counts.first(), counts.get(1)) else {
-        panic!("a filter batch and a later one, got {counts:?}");
-    };
+    let peak = counts.iter().copied().max().unwrap_or_default();
     assert!(
-        later + (TABLES as usize) / 2 <= filters,
-        "{filters} descriptors open at the filter batch, still {later} at the next"
+        !counts.is_empty() && peak <= (TABLES as usize) / 2,
+        "{TABLES} tables, peak of {peak} files open at a batch: {counts:?}"
     );
-    assert_eq!(values, expected);
+    assert!(values.iter().all(Option::is_none));
+    assert_eq!(values, one_by_one(&tree, &keys)?);
     Ok(())
 }
 
