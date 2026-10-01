@@ -1860,6 +1860,74 @@ fn a_read_queue_wakes_once_a_read_is_ready_to_hand_over() -> io::Result<()> {
     Ok(())
 }
 
+/// A read of a file the ring cannot take is read serially, which blocks, so
+/// a wait for none leaves it held, and a wait for one reads it.
+#[test]
+fn a_read_without_a_descriptor_waits_for_a_wait_for_one() -> io::Result<()> {
+    use crate::fs::MemFs;
+
+    let Some(fs) = try_io_uring() else {
+        return Ok(());
+    };
+    let mem = MemFs::new();
+    let path = Path::new("/m");
+    mem.open(path, &FsOpenOptions::new().write(true).create(true))?
+        .write_all(b"hello, world")?;
+    let file: Arc<dyn FsFile> = Arc::from(mem.open(path, &FsOpenOptions::new().read(true))?);
+    assert!(
+        file.backing_fd().is_none(),
+        "an in-memory file has no descriptor"
+    );
+
+    let mut queue = fs.read_queue();
+    queue.submit(QueuedRead {
+        tag: 1,
+        file,
+        offset: 7,
+        buf: vec![0; 5],
+    });
+    let mut got = Vec::new();
+    queue.wait(0, &mut |done| got.push(done.buf));
+    assert!(got.is_empty(), "a wait for none reads nothing");
+    assert_eq!((queue.outstanding(), queue.held()), (1, 1));
+    queue.wait(1, &mut |done| got.push(done.buf));
+    assert_eq!(got, [b"world".to_vec()]);
+    assert_eq!((queue.outstanding(), queue.held()), (0, 0));
+    Ok(())
+}
+
+/// A wake asked for once reads are on the ring is declined: those reads
+/// report to a sink without it, and a caller sleeping on it would not wake.
+#[test]
+fn a_wake_asked_for_with_reads_in_flight_is_declined() -> io::Result<()> {
+    let Some(fs) = try_io_uring() else {
+        return Ok(());
+    };
+    let dir = tempfile::tempdir()?;
+    let files: Vec<Arc<dyn FsFile>> = two_files(&fs, dir.path(), 64)?
+        .into_iter()
+        .map(Arc::from)
+        .collect();
+    let wake = Arc::new(CountWake(core::sync::atomic::AtomicUsize::new(0)));
+    let mut queue = UringReadQueue::new(&fs.inner);
+    queue.submit(QueuedRead {
+        tag: 0,
+        file: Arc::clone(&files[0]),
+        offset: 0,
+        buf: vec![0; 64],
+    });
+    queue.issue();
+    assert!(!queue.set_wake(Arc::clone(&wake) as Arc<dyn crate::fs::ReadWake>));
+    while queue.outstanding() > 0 {
+        queue.wait(1, &mut |done| assert!(done.result.is_ok()));
+    }
+    assert!(
+        queue.set_wake(wake as Arc<dyn crate::fs::ReadWake>),
+        "nothing in flight"
+    );
+    Ok(())
+}
+
 /// A read past the end of its file comes back failed as a short read, and
 /// the reads beside it still come back read.
 #[test]

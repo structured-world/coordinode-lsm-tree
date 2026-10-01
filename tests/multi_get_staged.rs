@@ -895,10 +895,119 @@ impl ReadQueue for WakeQueue {
         }
     }
 
+    fn held(&self) -> usize {
+        // Its worker reads every read on its own.
+        0
+    }
+
     fn set_wake(&mut self, wake: Arc<dyn ReadWake>) -> bool {
         *self.wake.lock().unwrap_or_else(PoisonError::into_inner) = Some(wake);
         true
     }
+}
+
+/// A backend whose queue takes a wake but reads only while waited on for a
+/// read: every read it holds is one only a wait carries out.
+struct HoldingFs;
+
+/// The queue of a [`HoldingFs`].
+struct HoldingQueue(Vec<QueuedRead>);
+
+impl ReadQueue for HoldingQueue {
+    fn submit(&mut self, read: QueuedRead) {
+        self.0.push(read);
+    }
+
+    fn outstanding(&self) -> usize {
+        self.0.len()
+    }
+
+    fn wait(&mut self, min: usize, on_done: &mut dyn FnMut(ReadDone)) {
+        if min == 0 {
+            return;
+        }
+        for mut read in core::mem::take(&mut self.0) {
+            let want = read.buf.len();
+            let result = match read.file.read_at(&mut read.buf, read.offset) {
+                Ok(n) if n == want => Ok(()),
+                Ok(_) => Err(io::Error::new(io::ErrorKind::UnexpectedEof, "short read")),
+                Err(error) => Err(error),
+            };
+            on_done(ReadDone {
+                tag: read.tag,
+                buf: read.buf,
+                result,
+            });
+        }
+    }
+
+    fn set_wake(&mut self, _wake: Arc<dyn ReadWake>) -> bool {
+        true
+    }
+}
+
+impl Fs for HoldingFs {
+    fn read_queue(&self) -> Box<dyn ReadQueue + '_> {
+        Box::new(HoldingQueue(Vec::new()))
+    }
+
+    fn open(&self, path: &Path, opts: &FsOpenOptions) -> io::Result<Box<dyn FsFile>> {
+        StdFs.open(path, opts)
+    }
+
+    fn create_dir_all(&self, path: &Path) -> io::Result<()> {
+        StdFs.create_dir_all(path)
+    }
+
+    fn read_dir(&self, path: &Path) -> io::Result<Vec<FsDirEntry>> {
+        StdFs.read_dir(path)
+    }
+
+    fn remove_file(&self, path: &Path) -> io::Result<()> {
+        StdFs.remove_file(path)
+    }
+
+    fn remove_dir_all(&self, path: &Path) -> io::Result<()> {
+        StdFs.remove_dir_all(path)
+    }
+
+    fn rename(&self, from: &Path, to: &Path) -> io::Result<()> {
+        StdFs.rename(from, to)
+    }
+
+    fn metadata(&self, path: &Path) -> io::Result<FsMetadata> {
+        StdFs.metadata(path)
+    }
+
+    fn sync_directory(&self, path: &Path) -> io::Result<()> {
+        StdFs.sync_directory(path)
+    }
+
+    fn exists(&self, path: &Path) -> io::Result<bool> {
+        StdFs.exists(path)
+    }
+}
+
+/// A level on two backends whose queues take a wake but hold their reads for
+/// a wait is waited on through them: the level does not sleep on a wake no
+/// read of theirs gives.
+#[test]
+fn a_level_on_queues_holding_their_reads_for_a_wait_is_read() -> lsm_tree::Result<()> {
+    let dir = tempfile::tempdir()?;
+    let primary: Arc<dyn Fs> = Arc::new(HoldingFs);
+    let routed: Arc<dyn Fs> = Arc::new(HoldingFs);
+    let (tree, keys) = two_backend_tree(dir.path(), &primary, &routed)?;
+    let expected = one_by_one(&tree, &keys)?;
+
+    let (answer, answered) = std::sync::mpsc::channel();
+    std::thread::spawn(move || {
+        answer.send(tree.multi_get(&keys, SeqNo::MAX)).ok();
+    });
+    let values = answered
+        .recv_timeout(std::time::Duration::from_secs(20))
+        .expect("the batch was answered, not left sleeping")?;
+    assert_eq!(values, expected);
+    Ok(())
 }
 
 impl Drop for WakeQueue {

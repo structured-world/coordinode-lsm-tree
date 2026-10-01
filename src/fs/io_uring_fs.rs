@@ -1416,9 +1416,13 @@ struct UringReadQueue<'r> {
     base: usize,
     /// Reads on the ring whose completion has not arrived.
     on_ring: usize,
-    /// Reads finished without the ring (empty, no descriptor, or refused),
+    /// Reads finished without the ring (empty, read serially, or refused),
     /// waiting to be handed back.
     finished: Vec<ReadDone>,
+    /// Reads of a file with no descriptor the ring can take: read serially
+    /// on the calling thread, so only by a wait for at least one read, never
+    /// by a look at what is ready.
+    serial: Vec<QueuedRead>,
 }
 
 impl<'r> UringReadQueue<'r> {
@@ -1433,13 +1437,27 @@ impl<'r> UringReadQueue<'r> {
             base: 0,
             on_ring: 0,
             finished: Vec::new(),
+            serial: Vec::new(),
+        }
+    }
+
+    /// Reads the reads held for a serial read, each into its own buffer.
+    fn read_serial(&mut self) {
+        for mut read in core::mem::take(&mut self.serial) {
+            let want = read.buf.len();
+            let result = match read.file.read_at(&mut read.buf, read.offset) {
+                Ok(n) if n == want => Ok(()),
+                Ok(_) => Err(short_read()),
+                Err(error) => Err(error),
+            };
+            self.finished.push(done(read, result));
         }
     }
 
     /// Sends every read submitted since the last wait to the ring in one
-    /// message. A read the ring cannot take is finished here: an empty one is
-    /// read, one without a descriptor is read serially, one too long for an
-    /// SQE fails.
+    /// message. A read the ring cannot take is finished here or held: an
+    /// empty one is read, one without a descriptor is held for a serial read,
+    /// one too long for an SQE fails.
     fn issue(&mut self) {
         if self.submitted.is_empty() {
             return;
@@ -1452,13 +1470,7 @@ impl<'r> UringReadQueue<'r> {
                 continue;
             }
             let Some(fd) = read.file.backing_fd() else {
-                let want = read.buf.len();
-                let result = match read.file.read_at(&mut read.buf, read.offset) {
-                    Ok(n) if n == want => Ok(()),
-                    Ok(_) => Err(short_read()),
-                    Err(error) => Err(error),
-                };
-                self.finished.push(done(read, result));
+                self.serial.push(read);
                 continue;
             };
             let Ok(len) = i32::try_from(read.buf.len()) else {
@@ -1570,11 +1582,20 @@ impl ReadQueue for UringReadQueue<'_> {
     }
 
     fn outstanding(&self) -> usize {
-        self.submitted.len() + self.on_ring + self.finished.len()
+        self.submitted.len() + self.on_ring + self.finished.len() + self.serial.len()
+    }
+
+    fn held(&self) -> usize {
+        self.serial.len()
     }
 
     fn wait(&mut self, min: usize, on_done: &mut dyn FnMut(ReadDone)) {
         self.issue();
+        // A serial read blocks the calling thread, which a wait for none
+        // must not.
+        if min > 0 {
+            self.read_serial();
+        }
         let mut handed = 0usize;
         for read in core::mem::take(&mut self.finished) {
             on_done(read);
@@ -1599,6 +1620,11 @@ impl ReadQueue for UringReadQueue<'_> {
     }
 
     fn set_wake(&mut self, wake: Arc<dyn crate::fs::ReadWake>) -> bool {
+        // A read already sent reports to the sink it went with, which has no
+        // wake: declined, so no caller sleeps waiting for it.
+        if self.on_ring > 0 {
+            return false;
+        }
         self.sink = Arc::new(QueueSink {
             done: self.sink.done.clone(),
             wake: Some(wake),

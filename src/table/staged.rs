@@ -278,11 +278,25 @@ impl<'t> StagedRead<'t> {
     /// the walk reached an index partition not yet held, which is then what
     /// the read lacks.
     fn walk_index(&mut self, sorted_keys: &[(&[u8], u64)]) -> crate::Result<bool> {
+        // A partition the cache has is held at once and the walk starts over,
+        // in this loop rather than by recursion, however many cached
+        // partitions the keys cross.
+        loop {
+            match self.walk_index_once(sorted_keys)? {
+                Walk::Planned => return Ok(true),
+                Walk::Lacks => return Ok(false),
+                Walk::Again => {}
+            }
+        }
+    }
+
+    /// One walk of the index for [`Self::walk_index`].
+    fn walk_index_once(&mut self, sorted_keys: &[(&[u8], u64)]) -> crate::Result<Walk> {
         let Some(&first) = self.passing.first() else {
-            return Ok(true);
+            return Ok(Walk::Planned);
         };
         let Some(&(first_key, _)) = sorted_keys.get(first) else {
-            return Ok(true);
+            return Ok(Walk::Planned);
         };
         let seqno = self.table_seqno;
         let comparator = self.table.comparator.clone();
@@ -398,18 +412,29 @@ impl<'t> StagedRead<'t> {
 
         if let Some(handle) = lacks {
             self.want(handle, BlockType::Index);
-            if self.need.is_empty() {
-                // The cache had it and it is held now.
-                return self.walk_index(sorted_keys);
-            }
-            return Ok(false);
+            // The cache had it and it is held now: walk again.
+            return Ok(if self.need.is_empty() {
+                Walk::Again
+            } else {
+                Walk::Lacks
+            });
         }
         let blockless = plan.blockless();
         self.table
             .tally_blockless(&mut self.tally, self.table_seqno, blockless);
         self.blocks = plan.blocks;
-        Ok(true)
+        Ok(Walk::Planned)
     }
+}
+
+/// How one walk of the index ended.
+enum Walk {
+    /// The data blocks are planned.
+    Planned,
+    /// An index partition is to be read.
+    Lacks,
+    /// An index partition the cache held was taken: the walk starts over.
+    Again,
 }
 
 /// A block the stage needs was not supplied before it advanced.

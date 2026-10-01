@@ -811,6 +811,15 @@ pub trait ReadQueue {
     /// Reads submitted and not yet handed back.
     fn outstanding(&self) -> usize;
 
+    /// Reads among the [`outstanding`](Self::outstanding) ones that only a
+    /// [`wait`](Self::wait) for at least one read carries out: none of them
+    /// finishes on its own, so a caller does not sleep on a
+    /// [`ReadWake`] for them. The default counts every outstanding read, as
+    /// for a queue that reads only while it is waited on.
+    fn held(&self) -> usize {
+        self.outstanding()
+    }
+
     /// Issues every read not yet issued, then hands reads to `on_done` as they
     /// finish, each once, until at least `min` have been handed over in this
     /// call or none is left outstanding. A read that has finished by then is
@@ -820,7 +829,8 @@ pub trait ReadQueue {
     /// Asks the queue to call `wake` each time a read it issued finishes off
     /// the calling thread, after the read is ready for [`wait`](Self::wait)
     /// to hand over, so a caller reading through several queues can sleep
-    /// until any of them has a read back. Returns whether it will.
+    /// until any of them has a read back. Returns whether it will, for every
+    /// read it issues: a queue may decline once reads are in flight.
     ///
     /// The default declines: a queue that reads only while it is waited on
     /// has nothing finishing in between.

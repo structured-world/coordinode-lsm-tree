@@ -4013,17 +4013,19 @@ impl Tree {
             // A level whose tables sit on several (after a route change, until
             // compaction moves them) sleeps until any of them has a read back,
             // so a fast backend's tables move on while a slow one is still
-            // reading; a queue that cannot wake the level is waited on itself.
+            // reading. A queue that cannot wake the level, or holds reads only
+            // a wait carries out, is waited on itself.
+            let must_wait = |q: &LevelQueue<'_>| !q.wakes || q.queue.held() > 0;
             let mut reading = queues.iter_mut().filter(|q| q.queue.outstanding() > 0);
             let Some(first) = reading.next() else {
                 return;
             };
             let second = reading.next();
-            if second.is_none() || !first.wakes {
+            if second.is_none() || must_wait(first) {
                 first.queue.wait(1, &mut on_done);
                 continue;
             }
-            if let Some(q) = second.into_iter().chain(reading).find(|q| !q.wakes) {
+            if let Some(q) = second.into_iter().chain(reading).find(|q| must_wait(q)) {
                 q.queue.wait(1, &mut on_done);
                 continue;
             }
