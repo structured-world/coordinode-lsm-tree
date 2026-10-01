@@ -808,6 +808,34 @@ fn a_rename_that_changes_only_the_case_is_a_rename() {
     );
 }
 
+/// A rename from another case of an existing name to that name changes
+/// nothing on a filesystem that ignores case: the durable file survives a
+/// crash under its name.
+#[test]
+fn a_rename_from_another_case_onto_the_same_name_is_a_no_op() {
+    let dir = tempfile::tempdir().unwrap();
+    let probe = dir.path().join("probe");
+    std::fs::write(&probe, b"").unwrap();
+    if !dir.path().join("PROBE").exists() {
+        // A case-sensitive filesystem: the two spellings are two files.
+        return;
+    }
+    let fs = CrashFs::new(crate::fs::StdFs).tracking_directory_entries();
+    let name = dir.path().join("Foo");
+    let mut f = fs
+        .open(&name, &FsOpenOptions::new().write(true).create(true))
+        .unwrap();
+    f.write_all(b"data").unwrap();
+    f.sync_all().unwrap();
+    drop(f);
+    fs.sync_directory(dir.path()).unwrap();
+
+    fs.rename(&dir.path().join("FOO"), &name).unwrap();
+
+    fs.crash();
+    assert_eq!(read(&fs, name.to_str().unwrap()), b"data");
+}
+
 /// A backend that does not resolve `..` keeps a name through it as a name of
 /// its own: `MemFs` holds `/d/../a` apart from `/a`, so the simulator tracks
 /// it under that spelling and a crash makes no file at `/a`.
