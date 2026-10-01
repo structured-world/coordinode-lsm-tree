@@ -390,6 +390,22 @@ impl Fs for CrashFs {
         // registration, so whether it made the entry is what the open did.
         let may_create = opts.create || opts.create_new;
         let namespace = may_create.then(|| self.namespace.lock());
+        // An open that may only create (`O_EXCL`) does not follow a final
+        // symlink and refuses any existing name: the backend answers whether
+        // it can, and if it does the file is new, at the path itself, with no
+        // prior image to capture.
+        if opts.create_new {
+            let inner = self.inner.open(path, opts)?;
+            self.state.lock().touched.insert(path.to_path_buf());
+            self.new_entry(path);
+            drop(namespace);
+            return Ok(Box::new(CrashFile {
+                inner,
+                path: path.to_path_buf(),
+                fs: Arc::clone(&self.inner),
+                state: Arc::clone(&self.state),
+            }));
+        }
         // A write follows symlinks: through a dangling one it creates the
         // target, so the target is the entry made and the file tracked.
         let entry = if writable {
