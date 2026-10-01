@@ -244,6 +244,39 @@ fn a_no_op_rename_is_known_before_it_runs() {
     assert_eq!(read(&fs, link.to_str().unwrap()), b"durable");
 }
 
+/// A rename whose names cannot be told apart fails before it runs: the probe's
+/// error is returned, nothing is renamed, and both durable names survive.
+#[cfg(unix)]
+#[test]
+fn a_rename_whose_identity_probe_fails_moves_nothing() {
+    let dir = tempfile::tempdir().unwrap();
+    let faulty = FaultFs::new(crate::fs::StdFs);
+    let injector = faulty.injector();
+    let fs = CrashFs::new(faulty);
+    let src = dir.path().join("src");
+    let link = dir.path().join("link");
+
+    let mut f = fs
+        .open(&src, &FsOpenOptions::new().write(true).create(true))
+        .unwrap();
+    f.write_all(b"durable").unwrap();
+    f.sync_all().unwrap();
+    drop(f);
+    fs.hard_link(&src, &link).unwrap();
+    fs.sync_directory(dir.path()).unwrap();
+    injector.arm(
+        FaultRule::new(FaultOp::SameFile, Fault::Error(ErrorKind::Other))
+            .on_path(link.display().to_string()),
+    );
+    let error = fs.rename(&link, &src).unwrap_err();
+    injector.clear();
+    assert_eq!(error.kind(), ErrorKind::Other);
+
+    fs.crash();
+    assert_eq!(read(&fs, src.to_str().unwrap()), b"durable");
+    assert_eq!(read(&fs, link.to_str().unwrap()), b"durable");
+}
+
 #[test]
 fn unsynced_tail_is_rolled_back() {
     let fs = CrashFs::new(MemFs::new());
