@@ -1174,7 +1174,9 @@ impl AbstractTree for BlobTree {
         // blob tree's index honors columnar, zone maps, ECC, seqno-in-index,
         // per-KV checksums, locator policy, sync mode, and CoW disable.
         table_writer = table_writer.use_page_ecc(self.index.config.page_ecc, rc.ecc_scheme);
-        table_writer = table_writer.use_sync_mode(self.index.config.sync_mode);
+        table_writer = table_writer
+            .use_sync_mode(self.index.config.sync_mode)
+            .use_writeback_bytes(self.index.config.writeback_bytes);
         table_writer = table_writer.use_seqno_in_index(rc.seqno_in_index);
         table_writer = table_writer.use_zone_map(rc.zone_map);
         table_writer = table_writer.use_columnar(rc.columnar);
@@ -1231,7 +1233,8 @@ impl AbstractTree for BlobTree {
             )?
             .use_target_size(kv_opts.file_target_size)
             .use_compression(rc.blob_compression)
-            .use_sync_mode(self.index.config.sync_mode);
+            .use_sync_mode(self.index.config.sync_mode)
+            .use_writeback_bytes(self.index.config.writeback_bytes);
             #[cfg(zstd_any)]
             let w = w
                 .use_zstd_dictionary(dicts.for_compression(rc.blob_compression)?)

@@ -287,6 +287,7 @@ pub(super) fn prepare_table_writer(
         // with the current scheme, not the startup one.
         .use_page_ecc(opts.config.page_ecc, rc.ecc_scheme)
         .use_sync_mode(opts.config.sync_mode)
+        .use_writeback_bytes(opts.config.writeback_bytes)
         // `seqno_in_index` is a live runtime config: read off the current
         // snapshot so a compaction started after a toggle rewrites its
         // output SSTs in the new index format (compaction is the migration

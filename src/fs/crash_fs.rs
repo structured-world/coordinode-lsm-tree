@@ -45,6 +45,13 @@
 //! happens wholly before or wholly after any other, so an entry is made
 //! either before a sync that then covers it or after one that does not.
 //!
+//! One `CrashFs` is one device. A sync under [`SyncMode::Barrier`], of a file
+//! or a directory, keeps writes in order without making them durable: it is
+//! queued, and [`Fs::sync_device`], or any other sync on the device, makes
+//! every queued one durable. [`CrashFs::crash`] loses them all;
+//! [`CrashFs::crash_keeping`] keeps a prefix of them in the order they were
+//! issued, the most a power loss can leave.
+//!
 //! This is a test/dev surface: it is gated behind the `std` feature and is not
 //! part of the production storage path.
 //!
@@ -88,9 +95,55 @@ struct CrashState {
     link_group: HashMap<PathBuf, u64>,
     /// The id the next link group takes.
     next_link_group: u64,
+    /// What [`SyncMode::Barrier`] synced, in order, and no device flush or
+    /// full sync has made durable since: a crash keeps a prefix of it.
+    ordered: Vec<Ordered>,
+}
+
+/// One sync [`SyncMode::Barrier`] issued, durable once the device is flushed.
+enum Ordered {
+    /// A file's content as of its sync.
+    Image(PathBuf, Vec<u8>),
+    /// The entries a directory sync covered.
+    Entries(Vec<PathBuf>),
 }
 
 impl CrashState {
+    /// Makes durable the first `count` ordered syncs, in the order they were
+    /// issued, and drops the rest.
+    fn settle(&mut self, count: usize) {
+        let ordered = core::mem::take(&mut self.ordered);
+        for sync in ordered.into_iter().take(count) {
+            match sync {
+                Ordered::Image(path, bytes) => self.set_durable(&path, bytes),
+                Ordered::Entries(entries) => {
+                    for entry in &entries {
+                        self.pending_entries.remove(entry);
+                    }
+                }
+            }
+        }
+    }
+
+    /// Makes durable every ordered sync: a device flush, or a full sync that
+    /// flushes the device cache with it.
+    fn settle_all(&mut self) {
+        self.settle(self.ordered.len());
+    }
+
+    /// Drops what the ordered syncs still owe the name `path`, removed or
+    /// replaced: a sync of its old file or its old entry does not carry over
+    /// to whatever takes the name.
+    fn forget_ordered(&mut self, path: &Path) {
+        self.ordered.retain_mut(|sync| match sync {
+            Ordered::Image(name, _) => name != path,
+            Ordered::Entries(entries) => {
+                entries.retain(|entry| entry != path);
+                true
+            }
+        });
+    }
+
     /// `path` and every name linked to the same file.
     fn names_of(&self, path: &Path) -> Vec<PathBuf> {
         match self.link_group.get(path) {
@@ -120,6 +173,7 @@ impl CrashState {
     /// stays with them: a write through the removed name that was never
     /// synced is still unsynced under each of them.
     fn forget_name(&mut self, path: &Path) {
+        self.forget_ordered(path);
         self.durable.remove(path);
         self.pending_entries.remove(path);
         let touched = self.touched.remove(path);
@@ -247,7 +301,27 @@ impl CrashFs {
     /// the durable image would silently under-test recovery, so the failure is
     /// surfaced loudly rather than swallowed. In-memory backends never hit this.
     pub fn crash(&self) {
+        self.crash_keeping(0);
+    }
+
+    /// How many syncs [`SyncMode::Barrier`] issued that no device flush has
+    /// made durable yet: a power loss keeps some prefix of them, which
+    /// [`crash_keeping`](Self::crash_keeping) picks.
+    #[must_use]
+    pub fn ordered_syncs(&self) -> usize {
+        self.state.lock().ordered.len()
+    }
+
+    /// Simulates a power loss that keeps the first `kept` of the
+    /// [ordered syncs](Self::ordered_syncs), in the order they were issued,
+    /// and loses the rest, then rolls back as [`crash`](Self::crash) does.
+    ///
+    /// # Panics
+    ///
+    /// As [`crash`](Self::crash).
+    pub fn crash_keeping(&self, kept: usize) {
         let mut state = self.state.lock();
+        state.settle(kept);
         // An entry its directory never made durable is lost with whatever
         // content it had.
         let lost: Vec<PathBuf> = state.pending_entries.drain().collect();
@@ -481,6 +555,7 @@ impl CrashFs {
     fn sync_entries_of(
         &self,
         directory: &Path,
+        mode: SyncMode,
         sync: impl FnOnce() -> io::Result<()>,
     ) -> io::Result<()> {
         let _namespace = self.namespace.lock();
@@ -505,6 +580,13 @@ impl CrashFs {
             })
             .collect();
         let mut state = self.state.lock();
+        // A barrier makes the entries durable only once the device is
+        // flushed; any other sync flushes what was ordered before it too.
+        if mode == SyncMode::Barrier {
+            state.ordered.push(Ordered::Entries(covered));
+            return Ok(());
+        }
+        state.settle_all();
         for entry in &covered {
             state.pending_entries.remove(entry);
         }
@@ -650,6 +732,13 @@ impl Fs for CrashFs {
         state.durable.retain(|k, _| !k.starts_with(path));
         state.touched.retain(|k| !k.starts_with(path));
         state.pending_entries.retain(|k| !k.starts_with(path));
+        state.ordered.retain_mut(|sync| match sync {
+            Ordered::Image(name, _) => !name.starts_with(path),
+            Ordered::Entries(entries) => {
+                entries.retain(|entry| !entry.starts_with(path));
+                true
+            }
+        });
         Ok(())
     }
 
@@ -705,6 +794,16 @@ impl Fs for CrashFs {
         // crash), and what its file went through stays with the file's other
         // hard links.
         state.forget_name(to);
+        // An ordered sync of the source's content follows its file; one of
+        // its entry does not, since the new entry is pending until its own
+        // directory is synced.
+        for sync in &mut state.ordered {
+            match sync {
+                Ordered::Image(name, _) if name.as_path() == from => *name = to.to_path_buf(),
+                Ordered::Image(..) => {}
+                Ordered::Entries(entries) => entries.retain(|entry| entry != from),
+            }
+        }
         // The rename is as durable as the source was.
         if let Some(bytes) = from_durable {
             state.durable.insert(to.to_path_buf(), bytes);
@@ -725,11 +824,18 @@ impl Fs for CrashFs {
     }
 
     fn sync_directory(&self, path: &Path) -> io::Result<()> {
-        self.sync_entries_of(path, || self.inner.sync_directory(path))
+        self.sync_entries_of(path, SyncMode::Full, || self.inner.sync_directory(path))
     }
 
     fn sync_directory_with(&self, path: &Path, mode: SyncMode) -> io::Result<()> {
-        self.sync_entries_of(path, || self.inner.sync_directory_with(path, mode))
+        self.sync_entries_of(path, mode, || self.inner.sync_directory_with(path, mode))
+    }
+
+    fn sync_device(&self, path: &Path) -> io::Result<()> {
+        let _namespace = self.namespace.lock();
+        self.inner.sync_device(path)?;
+        self.state.lock().settle_all();
+        Ok(())
     }
 
     fn exists(&self, path: &Path) -> io::Result<bool> {
@@ -848,11 +954,19 @@ impl CrashFile {
     /// Captures this path's full current content as its durable image. Called
     /// after a successful `fsync`. Reopens the path read-only because the write
     /// handle being synced is not necessarily readable.
-    fn snapshot(&self) -> io::Result<()> {
+    fn snapshot(&self, mode: SyncMode) -> io::Result<()> {
         let mut rf = self.fs.open(&self.path, &FsOpenOptions::new().read(true))?;
         let mut buf = Vec::new();
         std::io::Read::read_to_end(&mut rf, &mut buf)?;
-        self.state.lock().set_durable(&self.path, buf);
+        let mut state = self.state.lock();
+        // A barrier makes the content durable only once the device is
+        // flushed; any other sync flushes what was ordered before it too.
+        if mode == SyncMode::Barrier {
+            state.ordered.push(Ordered::Image(self.path.clone(), buf));
+        } else {
+            state.settle_all();
+            state.set_durable(&self.path, buf);
+        }
         Ok(())
     }
 }
@@ -884,22 +998,27 @@ impl std::io::Seek for CrashFile {
 impl FsFile for CrashFile {
     fn sync_all(&self) -> io::Result<()> {
         self.inner.sync_all()?;
-        self.snapshot()
+        self.snapshot(SyncMode::Full)
     }
 
     fn sync_data(&self) -> io::Result<()> {
         self.inner.sync_data()?;
-        self.snapshot()
+        self.snapshot(SyncMode::Full)
     }
 
     fn sync_all_with(&self, mode: SyncMode) -> io::Result<()> {
         self.inner.sync_all_with(mode)?;
-        self.snapshot()
+        self.snapshot(mode)
     }
 
     fn sync_data_with(&self, mode: SyncMode) -> io::Result<()> {
         self.inner.sync_data_with(mode)?;
-        self.snapshot()
+        self.snapshot(mode)
+    }
+
+    fn start_writeback(&self, offset: u64, len: u64) -> io::Result<()> {
+        // Writeback makes nothing durable; only a sync does.
+        self.inner.start_writeback(offset, len)
     }
 
     fn metadata(&self) -> io::Result<FsMetadata> {

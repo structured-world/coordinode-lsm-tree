@@ -52,7 +52,7 @@ pub fn is_io_uring_available() -> bool {
 /// dedicated `io_uring` ring thread. Directory and metadata operations
 /// delegate to [`std::fs`] since they do not benefit from `io_uring`.
 ///
-/// Multiple `IoUringFs` clones and all [`IoUringFile`] handles opened
+/// Multiple `IoUringFs` clones and all the file handles opened
 /// through them share the same ring thread.
 ///
 /// # Example
@@ -562,6 +562,10 @@ impl FsFile for IoUringFile {
     // many files (SSTs) to this handle's shared ring in one batch.
     fn backing_fd(&self) -> Option<i32> {
         Some(self.file.as_raw_fd())
+    }
+
+    fn start_writeback(&self, offset: u64, len: u64) -> crate::io::Result<()> {
+        FsFile::start_writeback(&self.file, offset, len)
     }
 
     fn lock_exclusive(&self) -> crate::io::Result<()> {

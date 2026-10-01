@@ -40,12 +40,12 @@ fn flush_with_torn_manifest_commit_recovers_to_last_durable_state() -> lsm_tree:
         tree.insert("b", "2", 1);
         tree.flush_active_memtable(0)?;
 
-        // Arm a one-shot fault on the next edit-log fsync: the flush of "c"
+        // Arm a one-shot fault on the next edit-log sync: the flush of "c"
         // writes and fsyncs its table, then fails to durably commit the manifest
         // edit. CrashFs therefore never records the edit-log's "c" tail as
         // durable.
         injector.arm(
-            FaultRule::new(FaultOp::SyncAll, Fault::Error(ErrorKind::Other))
+            FaultRule::new(FaultOp::SyncData, Fault::Error(ErrorKind::Other))
                 .on_path("edits")
                 .once(),
         );
@@ -190,7 +190,7 @@ fn a_failed_sync_of_the_edit_log_directory_is_retried() -> lsm_tree::Result<()> 
 }
 
 /// Exhaustive crash-point sweep: for every durability barrier (`sync_all` on a
-/// table or the manifest edit log) of a flush workload, fail that one barrier,
+/// table, `sync_data` on the manifest edit log) of a flush workload, fail that one barrier,
 /// simulate a power loss, reopen, and assert recovery yields a *consistent
 /// prefix* of the inserted keys.
 ///
@@ -208,7 +208,10 @@ fn flush_crash_point_sweep_recovers_a_consistent_prefix() -> lsm_tree::Result<()
 
     let key = |i: usize| format!("k{i:02}");
 
-    for fail_after in 0..SWEEP {
+    for (op, fail_after) in [FaultOp::SyncAll, FaultOp::SyncData]
+        .into_iter()
+        .flat_map(|op| (0..SWEEP).map(move |fail_after| (op, fail_after)))
+    {
         let crash = CrashFs::new(MemFs::new());
         let fault = FaultFs::new(crash.clone());
         let injector = fault.injector();
@@ -224,9 +227,9 @@ fn flush_crash_point_sweep_recovers_a_consistent_prefix() -> lsm_tree::Result<()
             .open()?;
 
             // Arm only AFTER open so the fault counts flush barriers, not the
-            // open-time syncs: fail the (fail_after + 1)-th `sync_all`.
+            // open-time syncs: fail the (fail_after + 1)-th barrier of `op`.
             injector.arm(
-                FaultRule::new(FaultOp::SyncAll, Fault::Error(ErrorKind::Other))
+                FaultRule::new(op, Fault::Error(ErrorKind::Other))
                     .skip(fail_after as u64)
                     .once(),
             );
@@ -261,7 +264,7 @@ fn flush_crash_point_sweep_recovers_a_consistent_prefix() -> lsm_tree::Result<()
             assert_eq!(
                 tree.contains_key(key(i), u64::MAX)?,
                 i < prefix,
-                "fail_after={fail_after}: key {i} should be {} (recovered prefix len {prefix})",
+                "{op:?} fail_after={fail_after}: key {i} should be {} (recovered prefix len {prefix})",
                 if i < prefix { "present" } else { "absent" },
             );
         }

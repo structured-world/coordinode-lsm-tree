@@ -140,6 +140,13 @@ pub struct Writer {
     /// [`Self::use_sync_mode`].
     pub(crate) sync_mode: SyncMode,
 
+    /// Bytes gathered between writebacks the writer starts while writing; `0`
+    /// starts none. Set via [`Self::use_writeback_bytes`].
+    writeback_bytes: u64,
+
+    /// Where the last writeback ended: every byte before it was handed over.
+    written_back: u64,
+
     /// Dictionary for `ZstdDict` compression.  Must be supplied when
     /// `compression` is [`CompressionType::ZstdDict`].
     #[cfg(zstd_any)]
@@ -213,6 +220,8 @@ impl Writer {
             compression: CompressionType::None,
             metadata_compression_override: None,
             sync_mode: SyncMode::Normal,
+            writeback_bytes: 0,
+            written_back: 0,
 
             #[cfg(zstd_any)]
             zstd_dictionary: None,
@@ -231,6 +240,40 @@ impl Writer {
     pub fn use_sync_mode(mut self, sync_mode: SyncMode) -> Self {
         self.sync_mode = sync_mode;
         self
+    }
+
+    /// Starts writing back every `bytes` the file gathers while it is written
+    /// ([`FsFile::start_writeback`]), so its final sync is short; `0` starts
+    /// none.
+    #[must_use]
+    pub fn use_writeback_bytes(mut self, bytes: u64) -> Self {
+        self.writeback_bytes = bytes;
+        self
+    }
+
+    /// Starts writing back what the file wrote since the last writeback, once
+    /// at least `writeback_bytes` of it gathered.
+    fn writeback_if_due(&mut self) -> crate::Result<()> {
+        // `written_back` only ever takes a value of `offset`, which grows.
+        let pending = self.offset - self.written_back;
+        if self.writeback_bytes == 0 || pending < self.writeback_bytes {
+            return Ok(());
+        }
+        #[cfg(not(feature = "std"))]
+        use crate::io::Write;
+        #[cfg(feature = "std")]
+        use std::io::Write;
+        // The range is in the buffer until it is flushed to the file.
+        let buffered = self.writer.get_mut().inner_mut();
+        buffered.flush()?;
+        crate::fs::hint_writeback(
+            &**buffered.get_ref(),
+            self.written_back,
+            pending,
+            &mut self.writeback_bytes,
+        );
+        self.written_back = self.offset;
+        Ok(())
     }
 
     /// Selects whether zstd levels 19-22 run the `btultra2` two-pass seed.
@@ -413,6 +456,7 @@ impl Writer {
         // Update metadata
         self.written_blob_bytes += value.len() as u64;
         self.item_count += 1;
+        self.writeback_if_due()?;
 
         // TODO: if we store the offset before writing, we can return a vhandle here
         // instead of needing to call offset() and blob_file_id() before write()

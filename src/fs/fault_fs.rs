@@ -122,6 +122,9 @@ pub enum FaultOp {
     /// strategy the filesystem admits, without depending on the host's
     /// reflink support. Matched against the DESTINATION path.
     Reflink,
+    /// [`FsFile::start_writeback`] — the writeback hint a writer gives as it
+    /// goes. Failing it models a backend or kernel that refuses the hint.
+    StartWriteback,
 }
 
 /// What a matched [`FaultRule`] does to the operation.
@@ -273,6 +276,9 @@ pub struct FaultInjector {
     /// mode a component synced its files at (e.g. a salvage writer honouring
     /// `Config::sync_mode`), which the pass-through delegation cannot show.
     sync_log: spin::Mutex<Vec<(PathBuf, SyncMode)>>,
+    /// Observed `(path, offset, len)` of every `start_writeback`, in call
+    /// order: a writeback changes no byte, so only this shows it was asked.
+    writeback_log: spin::Mutex<Vec<(PathBuf, u64, u64)>>,
     /// Positional reads served, counted whether or not a rule matched — the
     /// pass-through delegation is otherwise invisible, so a test that cares
     /// about how MUCH a path reads (a verification walking each block once
@@ -332,6 +338,7 @@ impl FaultInjector {
     pub fn clear(&self) {
         self.rules.lock().clear();
         self.sync_log.lock().clear();
+        self.writeback_log.lock().clear();
         self.reads.store(0, core::sync::atomic::Ordering::Relaxed);
         self.opens.store(0, core::sync::atomic::Ordering::Relaxed);
     }
@@ -351,6 +358,18 @@ impl FaultInjector {
             .iter()
             .filter(|(p, _)| p.to_string_lossy().contains(substr))
             .map(|(_, m)| *m)
+            .collect()
+    }
+
+    /// The `(offset, len)` ranges `start_writeback` was asked for on files
+    /// whose path contains `substr`, in call order.
+    #[must_use]
+    pub fn writebacks_for(&self, substr: &str) -> Vec<(u64, u64)> {
+        self.writeback_log
+            .lock()
+            .iter()
+            .filter(|(p, ..)| p.to_string_lossy().contains(substr))
+            .map(|&(_, offset, len)| (offset, len))
             .collect()
     }
 
@@ -539,6 +558,10 @@ impl<F: Fs> Fs for FaultFs<F> {
             return Err(fault_error(kind, FaultOp::SyncDirectory));
         }
         self.inner.sync_directory_with(path, mode)
+    }
+
+    fn sync_device(&self, path: &Path) -> io::Result<()> {
+        self.inner.sync_device(path)
     }
 
     fn exists(&self, path: &Path) -> io::Result<bool> {
@@ -764,6 +787,20 @@ impl FsFile for FaultFile {
 
     fn hint(&self, hint: FileHint) -> io::Result<()> {
         self.inner.hint(hint)
+    }
+
+    fn start_writeback(&self, offset: u64, len: u64) -> io::Result<()> {
+        self.injector
+            .writeback_log
+            .lock()
+            .push((self.path.clone(), offset, len));
+        if let Some(Fault::Error(kind)) = self
+            .injector
+            .check(FaultOp::StartWriteback, Some(&self.path))
+        {
+            return Err(fault_error(kind, FaultOp::StartWriteback));
+        }
+        self.inner.start_writeback(offset, len)
     }
 }
 

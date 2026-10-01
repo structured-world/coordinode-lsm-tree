@@ -53,11 +53,11 @@ fn level_manifest_atomicity() -> crate::Result<()> {
     };
 
     // Arm the fault only now, so all setup flushes / the first compaction
-    // commit succeed: the NEXT durable manifest-edit `fsync` (a `sync_all` on
+    // commit succeed: the NEXT durable manifest-edit sync (a `sync_data` on
     // the `edits-*` log) fails, forcing the second compaction's version commit
     // to error after the output table has already been written.
     injector.arm(
-        FaultRule::new(FaultOp::SyncAll, Fault::Error(ErrorKind::Other))
+        FaultRule::new(FaultOp::SyncData, Fault::Error(ErrorKind::Other))
             .on_path("edits")
             .once(),
     );

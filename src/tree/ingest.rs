@@ -210,7 +210,9 @@ impl<'a> Ingestion<'a> {
         // `kv_checksums` below, so an ingestion started after a scheme change
         // writes its SST with the current scheme rather than the startup one.
         writer = writer.use_page_ecc(tree.config.page_ecc, rc.ecc_scheme);
-        writer = writer.use_sync_mode(tree.config.sync_mode);
+        writer = writer
+            .use_sync_mode(tree.config.sync_mode)
+            .use_writeback_bytes(tree.config.writeback_bytes);
 
         writer = writer.use_seqno_in_index(rc.seqno_in_index);
         writer = writer.use_zone_map(rc.zone_map);
