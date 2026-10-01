@@ -326,6 +326,32 @@ fn a_write_follows_as_many_symlinks_as_linux_and_no_more() {
     assert_eq!(error.kind(), ErrorKind::InvalidInput);
 }
 
+/// An open that may only create (`create_new`, `O_EXCL`) does not follow a
+/// final symlink: the backend refuses an existing symlink with
+/// `AlreadyExists`, whatever the link points to, a cycle included, and the
+/// simulator gives that answer, not one of its own.
+#[cfg(unix)]
+#[test]
+fn a_create_new_open_of_a_symlink_is_refused_as_existing() {
+    let dir = tempfile::tempdir().unwrap();
+    let a = dir.path().join("a");
+    let b = dir.path().join("b");
+    std::os::unix::fs::symlink("b", &a).unwrap();
+    std::os::unix::fs::symlink("a", &b).unwrap();
+
+    // With and without the directory-entry model.
+    for fs in [
+        CrashFs::new(crate::fs::StdFs),
+        CrashFs::new(crate::fs::StdFs).tracking_directory_entries(),
+    ] {
+        let error = fs
+            .open(&a, &FsOpenOptions::new().write(true).create_new(true))
+            .err()
+            .expect("an existing name is refused");
+        assert_eq!(error.kind(), ErrorKind::AlreadyExists);
+    }
+}
+
 /// Hard-linking a dangling symlink links the symlink itself (Linux
 /// `linkat(2)` without `AT_SYMLINK_FOLLOW`): the link the backend made is
 /// reported as made, though no file stands behind it to compare.
