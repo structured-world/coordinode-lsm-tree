@@ -7,7 +7,7 @@ use lsm_tree::{
     config::{BlockSizePolicy, CompressionPolicy, LocatorPolicy, PinningPolicy},
     fs::{
         BlockRead, Fs, FsDirEntry, FsFile, FsMetadata, FsOpenOptions, QueuedRead, ReadDone,
-        ReadQueue, StdFs,
+        ReadQueue, ReadWake, StdFs,
     },
     io,
     runtime_config::RuntimeConfig,
@@ -648,4 +648,306 @@ fn a_table_moves_on_while_a_slower_file_of_its_stage_is_read() -> lsm_tree::Resu
     drop(seen);
     assert_eq!(values, one_by_one(&tree, &keys)?);
     Ok(())
+}
+
+/// What the backends of a [`WakeFs`] pair share: how many queues they opened,
+/// whether the fast one took a read after one of its reads was back, and
+/// whether the slow one's first read was let go by that or by its timeout.
+#[derive(Default)]
+struct Pair {
+    /// Whether the first queue opened is slow.
+    slow_first: bool,
+    queues: usize,
+    fast_moved_on: bool,
+    slow_released_by_progress: Option<bool>,
+}
+
+#[derive(Default)]
+struct PairState {
+    pair: Mutex<Pair>,
+    moved: std::sync::Condvar,
+}
+
+impl PairState {
+    fn lock(&self) -> std::sync::MutexGuard<'_, Pair> {
+        self.pair.lock().unwrap_or_else(PoisonError::into_inner)
+    }
+}
+
+/// How long the slow queue holds its first read when nothing moves on.
+const SLOW_HOLD: std::time::Duration = std::time::Duration::from_secs(2);
+
+/// A backend whose queue reads on a thread of its own and wakes its waker
+/// after each read. With [`Pair::slow_first`], the first queue opened is
+/// slow: it holds its first read
+/// until the other queue takes a read after one of its own was back, or until
+/// [`SLOW_HOLD`] passes. The others read each block after a short delay.
+struct WakeFs(Arc<PairState>);
+
+/// The queue of a [`WakeFs`].
+struct WakeQueue {
+    slow: bool,
+    state: Arc<PairState>,
+    to_worker: Option<std::sync::mpsc::Sender<QueuedRead>>,
+    from_worker: std::sync::mpsc::Receiver<ReadDone>,
+    wake: Arc<Mutex<Option<Arc<dyn ReadWake>>>>,
+    worker: Option<std::thread::JoinHandle<()>>,
+    outstanding: usize,
+    handed_any: bool,
+}
+
+impl WakeQueue {
+    fn new(state: Arc<PairState>) -> Self {
+        let slow = {
+            let mut pair = state.lock();
+            pair.queues += 1;
+            pair.slow_first && pair.queues == 1
+        };
+        let (to_worker, reads) = std::sync::mpsc::channel::<QueuedRead>();
+        let (done, from_worker) = std::sync::mpsc::channel();
+        let wake: Arc<Mutex<Option<Arc<dyn ReadWake>>>> = Arc::default();
+        let worker = {
+            let state = Arc::clone(&state);
+            let wake = Arc::clone(&wake);
+            std::thread::spawn(move || {
+                let mut first = true;
+                for mut read in reads {
+                    if slow && first {
+                        let pair = state.lock();
+                        let (mut pair, _) = state
+                            .moved
+                            .wait_timeout_while(pair, SLOW_HOLD, |pair| !pair.fast_moved_on)
+                            .unwrap_or_else(PoisonError::into_inner);
+                        pair.slow_released_by_progress = Some(pair.fast_moved_on);
+                    } else if !slow {
+                        std::thread::sleep(std::time::Duration::from_millis(20));
+                    }
+                    first = false;
+                    let want = read.buf.len();
+                    let result = match read.file.read_at(&mut read.buf, read.offset) {
+                        Ok(n) if n == want => Ok(()),
+                        Ok(_) => Err(io::Error::new(io::ErrorKind::UnexpectedEof, "short read")),
+                        Err(error) => Err(error),
+                    };
+                    if done
+                        .send(ReadDone {
+                            tag: read.tag,
+                            buf: read.buf,
+                            result,
+                        })
+                        .is_err()
+                    {
+                        return;
+                    }
+                    let waker = wake.lock().unwrap_or_else(PoisonError::into_inner).clone();
+                    if let Some(waker) = waker {
+                        waker.wake();
+                    }
+                }
+            })
+        };
+        Self {
+            slow,
+            state,
+            to_worker: Some(to_worker),
+            from_worker,
+            wake,
+            worker: Some(worker),
+            outstanding: 0,
+            handed_any: false,
+        }
+    }
+}
+
+impl ReadQueue for WakeQueue {
+    fn submit(&mut self, read: QueuedRead) {
+        if !self.slow && self.handed_any {
+            self.state.lock().fast_moved_on = true;
+            self.state.moved.notify_all();
+        }
+        if let Some(to_worker) = &self.to_worker
+            && to_worker.send(read).is_ok()
+        {
+            self.outstanding += 1;
+        }
+    }
+
+    fn outstanding(&self) -> usize {
+        self.outstanding
+    }
+
+    fn wait(&mut self, min: usize, on_done: &mut dyn FnMut(ReadDone)) {
+        let mut handed = 0;
+        while self.outstanding > 0 {
+            let next = if handed < min {
+                self.from_worker.recv().ok()
+            } else {
+                self.from_worker.try_recv().ok()
+            };
+            let Some(done) = next else {
+                break;
+            };
+            self.outstanding -= 1;
+            self.handed_any = true;
+            handed += 1;
+            on_done(done);
+        }
+    }
+
+    fn set_wake(&mut self, wake: Arc<dyn ReadWake>) -> bool {
+        *self.wake.lock().unwrap_or_else(PoisonError::into_inner) = Some(wake);
+        true
+    }
+}
+
+impl Drop for WakeQueue {
+    fn drop(&mut self) {
+        self.to_worker = None;
+        if let Some(worker) = self.worker.take() {
+            worker.join().expect("the queue's worker panicked");
+        }
+    }
+}
+
+impl Fs for WakeFs {
+    fn read_queue(&self) -> Box<dyn ReadQueue + '_> {
+        Box::new(WakeQueue::new(Arc::clone(&self.0)))
+    }
+
+    fn open(&self, path: &Path, opts: &FsOpenOptions) -> io::Result<Box<dyn FsFile>> {
+        StdFs.open(path, opts)
+    }
+
+    fn create_dir_all(&self, path: &Path) -> io::Result<()> {
+        StdFs.create_dir_all(path)
+    }
+
+    fn read_dir(&self, path: &Path) -> io::Result<Vec<FsDirEntry>> {
+        StdFs.read_dir(path)
+    }
+
+    fn remove_file(&self, path: &Path) -> io::Result<()> {
+        StdFs.remove_file(path)
+    }
+
+    fn remove_dir_all(&self, path: &Path) -> io::Result<()> {
+        StdFs.remove_dir_all(path)
+    }
+
+    fn rename(&self, from: &Path, to: &Path) -> io::Result<()> {
+        StdFs.rename(from, to)
+    }
+
+    fn metadata(&self, path: &Path) -> io::Result<FsMetadata> {
+        StdFs.metadata(path)
+    }
+
+    fn sync_directory(&self, path: &Path) -> io::Result<()> {
+        StdFs.sync_directory(path)
+    }
+
+    fn exists(&self, path: &Path) -> io::Result<bool> {
+        StdFs.exists(path)
+    }
+}
+
+/// A level whose tables sit on two backends, as after its route moved and
+/// before compaction rewrote them: the blocks back from the fast backend move
+/// their tables on while the slow one still holds its first read, instead of
+/// the level waiting on the slow backend.
+#[test]
+fn a_level_on_two_backends_moves_on_with_the_faster_one() -> lsm_tree::Result<()> {
+    let dir = tempfile::tempdir()?;
+    let state = Arc::new(PairState::default());
+    let primary: Arc<dyn Fs> = Arc::new(WakeFs(Arc::clone(&state)));
+    let routed: Arc<dyn Fs> = Arc::new(WakeFs(Arc::clone(&state)));
+    let (tree, keys) = two_backend_tree(dir.path(), &primary, &routed)?;
+    *state.lock() = Pair {
+        slow_first: true,
+        ..Pair::default()
+    };
+
+    let values = tree.multi_get(&keys, SeqNo::MAX)?;
+    let pair = state.lock();
+    assert_eq!(pair.queues, 2, "the level is read through both backends");
+    assert_eq!(
+        pair.slow_released_by_progress,
+        Some(true),
+        "the fast backend's tables waited for the slow backend's first read"
+    );
+    drop(pair);
+    assert_eq!(values, one_by_one(&tree, &keys)?);
+    Ok(())
+}
+
+/// A level on two backends, one whose queue cannot wake the level and reads
+/// only when waited on, is waited on through that queue: the level neither
+/// sleeps on a wake that queue never gives nor loses its reads.
+#[test]
+fn a_level_beside_a_queue_that_cannot_wake_it_is_still_read() -> lsm_tree::Result<()> {
+    let dir = tempfile::tempdir()?;
+    let state = Arc::new(PairState::default());
+    let record = Record::default();
+    let primary: Arc<dyn Fs> = Arc::new(StageFs(record.clone()));
+    let routed: Arc<dyn Fs> = Arc::new(WakeFs(Arc::clone(&state)));
+    let (tree, keys) = two_backend_tree(dir.path(), &primary, &routed)?;
+    *state.lock() = Pair::default();
+    record.reset(None);
+
+    let values = tree.multi_get(&keys, SeqNo::MAX)?;
+    assert_eq!(state.lock().queues, 1, "the waking backend was read");
+    assert!(!record.calls().is_empty(), "the other backend was read");
+    assert_eq!(values, one_by_one(&tree, &keys)?);
+    Ok(())
+}
+
+/// A tree whose level 0 holds two tables on `primary` and two on `routed`, as
+/// after level 0 was routed away from the primary folder, reopened with no
+/// cache; and the keys a batch reads: one present and one absent per table.
+fn two_backend_tree(
+    dir: &Path,
+    primary: &Arc<dyn Fs>,
+    routed: &Arc<dyn Fs>,
+) -> lsm_tree::Result<(AnyTree, Vec<String>)> {
+    let config = |route: bool| {
+        let config = Config::new(
+            dir.join("primary"),
+            SequenceNumberCounter::default(),
+            SequenceNumberCounter::default(),
+        )
+        .with_shared_fs(Arc::clone(primary))
+        // No cache, so every table's index is read in a stage after its
+        // filter.
+        .use_cache(Arc::new(Cache::with_capacity_bytes(0)))
+        .filter_block_pinning_policy(PinningPolicy::all(false))
+        .index_block_pinning_policy(PinningPolicy::all(false));
+        if route {
+            config.level_routes(vec![lsm_tree::config::LevelRoute {
+                levels: 0..7,
+                path: dir.join("routed"),
+                fs: Arc::clone(routed),
+            }])
+        } else {
+            config
+        }
+    };
+    let write = |tree: &AnyTree, tables: core::ops::Range<u32>| -> lsm_tree::Result<()> {
+        for table in tables {
+            for row in 0..200u32 {
+                tree.insert(
+                    format!("t{table:03}r{row:04}"),
+                    vec![b'v'; 64],
+                    u64::from(table * 200 + row),
+                );
+            }
+            tree.flush_active_memtable(0)?;
+        }
+        Ok(())
+    };
+    write(&config(false).open()?, 0..2)?;
+    write(&config(true).open()?, 2..4)?;
+    let keys = (0..4)
+        .flat_map(|table| [format!("t{table:03}r0010"), format!("t{table:03}r0150x")])
+        .collect();
+    Ok((config(true).open()?, keys))
 }

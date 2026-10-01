@@ -1803,6 +1803,63 @@ fn a_read_queue_hands_back_reads_of_several_submissions() -> io::Result<()> {
     Ok(())
 }
 
+/// Counts the wakes a queue gives it.
+struct CountWake(core::sync::atomic::AtomicUsize);
+
+impl crate::fs::ReadWake for CountWake {
+    fn wake(&self) {
+        self.0.fetch_add(1, core::sync::atomic::Ordering::SeqCst);
+    }
+}
+
+/// A queue given a wake rings it once per read the ring finished, and only
+/// once that read is ready: after `n` wakes, a wait that does not block hands
+/// over at least `n` reads in all.
+#[test]
+fn a_read_queue_wakes_once_a_read_is_ready_to_hand_over() -> io::Result<()> {
+    use core::sync::atomic::Ordering::SeqCst;
+
+    let Some(fs) = try_io_uring() else {
+        return Ok(());
+    };
+    let dir = tempfile::tempdir()?;
+    let files: Vec<Arc<dyn FsFile>> = two_files(&fs, dir.path(), 32 * 64)?
+        .into_iter()
+        .map(Arc::from)
+        .collect();
+    let wake = Arc::new(CountWake(core::sync::atomic::AtomicUsize::new(0)));
+    let mut queue = fs.read_queue();
+    assert!(queue.set_wake(Arc::clone(&wake) as Arc<dyn crate::fs::ReadWake>));
+    for tag in 0..32usize {
+        queue.submit(QueuedRead {
+            tag,
+            file: Arc::clone(&files[tag % 2]),
+            offset: (tag * 64) as u64,
+            buf: vec![0; 64],
+        });
+    }
+    let mut handed = 0usize;
+    while queue.outstanding() > 0 {
+        let rung = wake.0.load(SeqCst);
+        queue.wait(0, &mut |done| {
+            assert!(done.result.is_ok(), "read {} failed", done.tag);
+            handed += 1;
+        });
+        assert!(
+            handed >= rung,
+            "{rung} wakes rung but {handed} reads handed over"
+        );
+        std::thread::yield_now();
+    }
+    assert_eq!(handed, 32);
+    assert_eq!(
+        wake.0.load(SeqCst),
+        32,
+        "one wake per read the ring finished"
+    );
+    Ok(())
+}
+
 /// A read past the end of its file comes back failed as a short read, and
 /// the reads beside it still come back read.
 #[test]

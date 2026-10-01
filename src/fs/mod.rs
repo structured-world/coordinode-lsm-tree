@@ -816,6 +816,30 @@ pub trait ReadQueue {
     /// call or none is left outstanding. A read that has finished by then is
     /// handed over too, so `min = 0` collects what is ready without waiting.
     fn wait(&mut self, min: usize, on_done: &mut dyn FnMut(ReadDone));
+
+    /// Asks the queue to call `wake` each time a read it issued finishes off
+    /// the calling thread, after the read is ready for [`wait`](Self::wait)
+    /// to hand over, so a caller reading through several queues can sleep
+    /// until any of them has a read back. Returns whether it will.
+    ///
+    /// The default declines: a queue that reads only while it is waited on
+    /// has nothing finishing in between.
+    fn set_wake(&mut self, wake: alloc::sync::Arc<dyn ReadWake>) -> bool {
+        drop(wake);
+        false
+    }
+}
+
+/// Told by a [`ReadQueue`] that one of its reads is back: see
+/// [`ReadQueue::set_wake`]. Called from whatever thread finished the read.
+#[diagnostic::on_unimplemented(
+    message = "`{Self}` cannot be woken by a read queue",
+    label = "this type does not implement `ReadWake`",
+    note = "a caller waiting on several `ReadQueue`s implements `ReadWake` to learn that one of them has a read back"
+)]
+pub trait ReadWake: Send + Sync {
+    /// A read is ready to be handed over.
+    fn wake(&self);
 }
 
 /// The [`ReadQueue`] of a backend that cannot take reads while others are in

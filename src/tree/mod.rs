@@ -160,12 +160,33 @@ enum TaskBlock {
     Read,
 }
 
-/// The read queues of the backends a level's tables were opened through, one
-/// per backend.
-type LevelQueues<'a> = Vec<(
-    &'a Arc<dyn crate::fs::Fs>,
-    Box<dyn crate::fs::ReadQueue + 'a>,
-)>;
+/// The read queue of one backend a level's tables were opened through.
+struct LevelQueue<'a> {
+    fs: &'a Arc<dyn crate::fs::Fs>,
+    queue: Box<dyn crate::fs::ReadQueue + 'a>,
+    /// Whether the queue wakes the level's [`LevelWake`] as its reads come
+    /// back, so the level can sleep on all its queues at once.
+    wakes: bool,
+}
+
+/// Woken by any queue of a level when one of its reads is back: each wake
+/// moves the generation on and unparks the thread driving the level, so a
+/// wake landing between its look at the queues and its park is not lost.
+// no-std: without a thread to park, the level waits on one queue at a time.
+#[cfg(feature = "std")]
+struct LevelWake {
+    generation: core::sync::atomic::AtomicU64,
+    thread: std::thread::Thread,
+}
+
+#[cfg(feature = "std")]
+impl crate::fs::ReadWake for LevelWake {
+    fn wake(&self) {
+        self.generation
+            .fetch_add(1, core::sync::atomic::Ordering::Release);
+        self.thread.unpark();
+    }
+}
 
 impl TablePointLookup for TableEntry {
     fn lookup(
@@ -3864,7 +3885,12 @@ impl Tree {
     fn read_level_stages<'a>(tables: &mut [LevelTable<'a, '_>]) {
         // One queue per backend, opened when a table first asks it for a
         // block, so a level answered from the cache opens none.
-        let mut queues: LevelQueues<'a> = Vec::new();
+        let mut queues: Vec<LevelQueue<'a>> = Vec::new();
+        #[cfg(feature = "std")]
+        let wake = Arc::new(LevelWake {
+            generation: core::sync::atomic::AtomicU64::new(0),
+            thread: std::thread::current(),
+        });
         // What each submitted read is for: its tag is its position here.
         let mut asked: Vec<(usize, crate::table::BlockHandle)> = Vec::new();
         // Each table's reads still in flight.
@@ -3905,14 +3931,25 @@ impl Tree {
                     };
                     table.record_batched_read(block_type, need);
                     let slot = if let Some(slot) =
-                        queues.iter().position(|(fs, _)| Arc::ptr_eq(fs, &table.fs))
+                        queues.iter().position(|q| Arc::ptr_eq(q.fs, &table.fs))
                     {
                         slot
                     } else {
-                        queues.push((&table.fs, table.fs.read_queue()));
+                        #[cfg_attr(not(feature = "std"), expect(unused_mut))]
+                        let mut queue = table.fs.read_queue();
+                        #[cfg(feature = "std")]
+                        let wakes =
+                            queue.set_wake(Arc::clone(&wake) as Arc<dyn crate::fs::ReadWake>);
+                        #[cfg(not(feature = "std"))]
+                        let wakes = false;
+                        queues.push(LevelQueue {
+                            fs: &table.fs,
+                            queue,
+                            wakes,
+                        });
                         queues.len() - 1
                     };
-                    let queue = &mut queues[slot].1;
+                    let queue = &mut queues[slot].queue;
                     for (handle, buf) in need.iter().zip(buffers) {
                         queue.submit(crate::fs::QueuedRead {
                             tag: asked.len(),
@@ -3948,20 +3985,44 @@ impl Tree {
                     tables[at].read = None;
                 }
             };
-            // What has finished on any backend, without waiting; when nothing
-            // has, a wait for one read of the first backend still reading.
+            // What has finished on any backend, without waiting. The wake's
+            // generation is taken first, so a read back after this look is
+            // seen by the sleep below.
+            #[cfg(feature = "std")]
+            let seen = wake.generation.load(core::sync::atomic::Ordering::Acquire);
             let mut handed = 0usize;
-            for (_, queue) in &mut queues {
-                queue.wait(0, &mut |done| {
+            for q in &mut queues {
+                q.queue.wait(0, &mut |done| {
                     handed += 1;
                     on_done(done);
                 });
             }
-            if handed == 0 {
-                let Some((_, queue)) = queues.iter_mut().find(|(_, q)| q.outstanding() > 0) else {
-                    return;
-                };
-                queue.wait(1, &mut on_done);
+            if handed > 0 {
+                continue;
+            }
+            // Nothing is back. One backend still reading is waited on itself.
+            // A level whose tables sit on several (after a route change, until
+            // compaction moves them) sleeps until any of them has a read back,
+            // so a fast backend's tables move on while a slow one is still
+            // reading; a queue that cannot wake the level is waited on itself.
+            let mut reading = queues.iter_mut().filter(|q| q.queue.outstanding() > 0);
+            let Some(first) = reading.next() else {
+                return;
+            };
+            let second = reading.next();
+            if second.is_none() || !first.wakes {
+                first.queue.wait(1, &mut on_done);
+                continue;
+            }
+            if let Some(q) = second.into_iter().chain(reading).find(|q| !q.wakes) {
+                q.queue.wait(1, &mut on_done);
+                continue;
+            }
+            // Every queue still reading wakes the level, which only a queue
+            // given the wake under `std` does.
+            #[cfg(feature = "std")]
+            while wake.generation.load(core::sync::atomic::Ordering::Acquire) == seen {
+                std::thread::park();
             }
         }
     }

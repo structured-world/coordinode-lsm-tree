@@ -717,16 +717,36 @@ enum Submission {
         /// Bounded by the batch size, so the ring thread never blocks on it.
         done: mpsc::SyncSender<(usize, i32)>,
     },
-    /// Reads of a [`UringReadQueue`], each reporting on the queue's channel
-    /// with its position in the queue.
+    /// Reads of a [`UringReadQueue`], each reporting to the queue's sink with
+    /// its position in the queue.
     Queued {
         reads: Vec<BatchRead>,
         /// The queue position of the first read; the others follow it.
         first: usize,
-        /// Unbounded: a queue has reads of several submissions in flight at
-        /// once, and the ring thread must never block on a completion.
-        done: mpsc::Sender<(usize, i32)>,
+        sink: Arc<QueueSink>,
     },
+}
+
+/// Where the ring thread reports a [`UringReadQueue`]'s reads.
+struct QueueSink {
+    /// Unbounded: a queue has reads of several submissions in flight at
+    /// once, and the ring thread must never block on a completion.
+    done: mpsc::Sender<(usize, i32)>,
+    /// Woken after each completion is sent, once the queue was given one.
+    wake: Option<Arc<dyn crate::fs::ReadWake>>,
+}
+
+impl QueueSink {
+    /// Hands `result` for the read at `position` to the queue, then wakes
+    /// whoever waits on it: the completion is on the channel by the time the
+    /// wake lands.
+    fn deliver(&self, position: usize, result: i32) {
+        if self.done.send((position, result)).is_ok()
+            && let Some(wake) = &self.wake
+        {
+            wake.wake();
+        }
+    }
 }
 
 /// Where the ring thread delivers one operation's result.
@@ -737,7 +757,7 @@ enum Completion {
         position: usize,
     },
     InQueue {
-        done: mpsc::Sender<(usize, i32)>,
+        sink: Arc<QueueSink>,
         position: usize,
     },
 }
@@ -749,7 +769,10 @@ impl Completion {
         match self {
             Self::One(tx) => tx.send(result).ok(),
             Self::InBatch { done, position } => done.send((position, result)).ok(),
-            Self::InQueue { done, position } => done.send((position, result)).ok(),
+            Self::InQueue { sink, position } => {
+                sink.deliver(position, result);
+                None
+            }
         };
     }
 }
@@ -933,7 +956,7 @@ impl RingThread {
                     Self::enqueue(ring, pending, next_id, kind, completion);
                 }
             }
-            Submission::Queued { reads, first, done } => {
+            Submission::Queued { reads, first, sink } => {
                 for (index, read) in reads.into_iter().enumerate() {
                     let kind = OpKind::Read {
                         fd: read.fd,
@@ -942,7 +965,7 @@ impl RingThread {
                         offset: read.offset,
                     };
                     let completion = Completion::InQueue {
-                        done: done.clone(),
+                        sink: Arc::clone(&sink),
                         position: first + index,
                     };
                     Self::enqueue(ring, pending, next_id, kind, completion);
@@ -1378,7 +1401,9 @@ impl RingThread {
 /// ring thread delivers every completion it was handed.
 struct UringReadQueue<'r> {
     ring: &'r RingThread,
-    done_tx: mpsc::Sender<(usize, i32)>,
+    /// Where the reads it sends report; replaced when the queue is given a
+    /// wake, which reads sent earlier do not ring.
+    sink: Arc<QueueSink>,
     done_rx: mpsc::Receiver<(usize, i32)>,
     /// Submitted since the last wait, not yet on the ring.
     submitted: Vec<QueuedRead>,
@@ -1398,10 +1423,10 @@ struct UringReadQueue<'r> {
 
 impl<'r> UringReadQueue<'r> {
     fn new(ring: &'r RingThread) -> Self {
-        let (done_tx, done_rx) = mpsc::channel();
+        let (done, done_rx) = mpsc::channel();
         Self {
             ring,
-            done_tx,
+            sink: Arc::new(QueueSink { done, wake: None }),
             done_rx,
             submitted: Vec::new(),
             sent: std::collections::VecDeque::new(),
@@ -1464,7 +1489,7 @@ impl<'r> UringReadQueue<'r> {
         let submission = Submission::Queued {
             reads,
             first,
-            done: self.done_tx.clone(),
+            sink: Arc::clone(&self.sink),
         };
         match self.ring.send(submission) {
             Ok(()) => self.on_ring += count,
@@ -1571,6 +1596,14 @@ impl ReadQueue for UringReadQueue<'_> {
                 handed += 1;
             }
         }
+    }
+
+    fn set_wake(&mut self, wake: Arc<dyn crate::fs::ReadWake>) -> bool {
+        self.sink = Arc::new(QueueSink {
+            done: self.sink.done.clone(),
+            wake: Some(wake),
+        });
+        true
     }
 }
 

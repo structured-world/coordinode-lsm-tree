@@ -104,7 +104,7 @@ tree.flush_active_memtable(0)?;
 - 100% stable Rust, MSRV 1.92.
 - `no_std` + `alloc` support: the core engine (read / write / compaction / recovery over the injected `Fs`) compiles without `std`; std-only conveniences (threaded fan-out, system clock, the std filesystem backend) stay behind the `std` feature.
 - No C or C++ dependency: zstd via [`structured-zstd`](https://github.com/structured-world/structured-zstd) (pure-Rust), LZ4 via `lz4_flex`, AES via `aes-gcm`. Nothing to build with `cc`, nothing to bind with `bindgen`.
-- Pluggable `Fs` trait: back the engine on the standard filesystem, on `io_uring`, on an in-memory `MemFs`, or on a custom implementation. A backend that can take reads while others are in flight provides a `ReadQueue`, as `io_uring` does; every other backend gets one that batches through its batched read.
+- Pluggable `Fs` trait: back the engine on the standard filesystem, on `io_uring`, on an in-memory `MemFs`, or on a custom implementation. A backend that can take reads while others are in flight provides a `ReadQueue`, as `io_uring` does; every other backend gets one that batches through its batched read. A queue that wakes a `ReadWake` as its reads come back lets a level spread over several backends move on with whichever answers first.
 - Pluggable `CompressionProvider` for third-party codecs.
 
 ## Comparison
