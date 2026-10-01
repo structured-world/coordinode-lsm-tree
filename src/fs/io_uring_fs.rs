@@ -727,6 +727,15 @@ enum Submission {
     },
 }
 
+/// Why [`RingThread::try_send`] sent nothing.
+enum TrySend {
+    /// The submission channel has no room; the submission was dropped
+    /// unsent, so no read it described reached the kernel.
+    Full,
+    /// The ring thread is gone.
+    Failed(io::Error),
+}
+
 /// Where the ring thread reports a [`UringReadQueue`]'s reads.
 struct QueueSink {
     /// Unbounded: a queue has reads of several submissions in flight at
@@ -1085,6 +1094,34 @@ impl RingThread {
             .ok_or_else(|| io::Error::new(io::ErrorKind::BrokenPipe, "io_uring thread shut down"))?
             .send(submission)
             .map_err(|_| io::Error::new(io::ErrorKind::BrokenPipe, "io_uring thread exited"))
+    }
+
+    /// [`Self::send`] without waiting for room: a full submission channel
+    /// sends nothing, so a caller that must not block keeps its reads for a
+    /// later send.
+    fn try_send(&self, submission: Submission) -> Result<(), TrySend> {
+        #[cfg(test)]
+        self.counts
+            .locks
+            .fetch_add(1, core::sync::atomic::Ordering::Relaxed);
+        let sent = self
+            .tx
+            .lock()
+            .unwrap_or_else(std::sync::PoisonError::into_inner)
+            .as_ref()
+            .map(|tx| tx.try_send(submission));
+        match sent {
+            Some(Ok(())) => Ok(()),
+            Some(Err(mpsc::TrySendError::Full(_))) => Err(TrySend::Full),
+            Some(Err(mpsc::TrySendError::Disconnected(_))) => Err(TrySend::Failed(io::Error::new(
+                io::ErrorKind::BrokenPipe,
+                "io_uring thread exited",
+            ))),
+            None => Err(TrySend::Failed(io::Error::new(
+                io::ErrorKind::BrokenPipe,
+                "io_uring thread shut down",
+            ))),
+        }
     }
 
     /// Submits `reads` as one batch and waits for every one of them; see
@@ -1457,8 +1494,9 @@ impl<'r> UringReadQueue<'r> {
     /// Sends every read submitted since the last wait to the ring in one
     /// message. A read the ring cannot take is finished here or held: an
     /// empty one is read, one without a descriptor is held for a serial read,
-    /// one too long for an SQE fails.
-    fn issue(&mut self) {
+    /// one too long for an SQE fails. Without `block`, a submission channel
+    /// with no room keeps the reads submitted, for the next wait to send.
+    fn issue(&mut self, block: bool) {
         if self.submitted.is_empty() {
             return;
         }
@@ -1503,7 +1541,22 @@ impl<'r> UringReadQueue<'r> {
             first,
             sink: Arc::clone(&self.sink),
         };
-        match self.ring.send(submission) {
+        let sent = if block {
+            self.ring.send(submission)
+        } else {
+            match self.ring.try_send(submission) {
+                Ok(()) => Ok(()),
+                Err(TrySend::Failed(error)) => Err(error),
+                // Not sent, and the submission dropped here, so no buffer is
+                // in the kernel's hands: the reads go back to wait their turn.
+                Err(TrySend::Full) => {
+                    let kept = self.sent.split_off(first - self.base);
+                    self.submitted.extend(kept.into_iter().flatten());
+                    return;
+                }
+            }
+        };
+        match sent {
             Ok(()) => self.on_ring += count,
             // Nothing was queued: the submission went down with the send, so
             // no buffer is in the kernel's hands.
@@ -1590,7 +1643,9 @@ impl ReadQueue for UringReadQueue<'_> {
     }
 
     fn wait(&mut self, min: usize, on_done: &mut dyn FnMut(ReadDone)) {
-        self.issue();
+        // A wait for none only looks at what is ready: it sends what fits
+        // and keeps the rest rather than wait for room on the channel.
+        self.issue(min > 0);
         // A serial read blocks the calling thread, which a wait for none
         // must not.
         if min > 0 {

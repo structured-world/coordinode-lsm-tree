@@ -1896,6 +1896,91 @@ fn a_read_without_a_descriptor_waits_for_a_wait_for_one() -> io::Result<()> {
     Ok(())
 }
 
+/// A wait for none never blocks on the ring's submission channel: with the
+/// ring thread held on a read that has no data yet and the channel full, it
+/// keeps its reads and returns, and a later wait for one sends and reads them.
+#[test]
+fn a_wait_for_none_does_not_wait_for_room_on_the_ring() -> io::Result<()> {
+    // Ring capacity, which bounds the submission channel.
+    const ENTRIES: u32 = 2;
+    let Some(_) = try_io_uring() else {
+        return Ok(());
+    };
+    let fs = IoUringFs::with_ring_size(ENTRIES)?;
+    let dir = tempfile::tempdir()?;
+    let fifo = dir.path().join("fifo");
+    let made = std::process::Command::new("mkfifo").arg(&fifo).status()?;
+    assert!(made.success(), "mkfifo");
+    // Read and write, so the open does not wait for a writer.
+    let pipe: Arc<dyn FsFile> =
+        Arc::from(fs.open(&fifo, &FsOpenOptions::new().read(true).write(true))?);
+    let files: Vec<Arc<dyn FsFile>> = two_files(&fs, dir.path(), 64)?
+        .into_iter()
+        .map(Arc::from)
+        .collect();
+    let read_of = |file: &Arc<dyn FsFile>, len: usize| QueuedRead {
+        tag: 0,
+        file: Arc::clone(file),
+        offset: 0,
+        buf: vec![0; len],
+    };
+
+    // The ring thread takes this read and waits on it.
+    let mut held = fs.read_queue();
+    held.submit(read_of(&pipe, 1));
+    held.wait(0, &mut |_| {});
+    std::thread::sleep(std::time::Duration::from_millis(200));
+    // Nothing drains the channel now: these fill it.
+    let mut filling: Vec<_> = (0..ENTRIES)
+        .map(|_| {
+            let mut queue = fs.read_queue();
+            queue.submit(read_of(&files[0], 64));
+            queue.wait(0, &mut |_| {});
+            queue
+        })
+        .collect();
+
+    // The queue itself, which a thread can take, rather than the trait
+    // object `read_queue` hands out.
+    let mut late = UringReadQueue::new(&fs.inner);
+    late.submit(read_of(&files[1], 64));
+    std::thread::scope(|scope| {
+        let (returned, polled) = std::sync::mpsc::channel();
+        let poll = scope.spawn(move || {
+            late.wait(0, &mut |_| {});
+            returned.send(()).ok();
+            late
+        });
+        let prompt = polled
+            .recv_timeout(std::time::Duration::from_secs(5))
+            .is_ok();
+        // Release the ring thread either way, so the test ends.
+        std::fs::OpenOptions::new()
+            .write(true)
+            .open(&fifo)
+            .and_then(|mut writer| writer.write_all(b"x"))
+            .expect("write to the fifo");
+        let mut late = poll.join().expect("the poll thread");
+        assert!(prompt, "a wait for none waited for room on the ring");
+
+        assert_eq!(late.outstanding(), 1, "the read is kept, not lost");
+        let mut got = Vec::new();
+        while late.outstanding() > 0 {
+            late.wait(1, &mut |done| got.push(done.result.is_ok()));
+        }
+        assert_eq!(got, [true], "a later wait sends and reads it");
+    });
+    for queue in &mut filling {
+        while queue.outstanding() > 0 {
+            queue.wait(1, &mut |done| assert!(done.result.is_ok()));
+        }
+    }
+    while held.outstanding() > 0 {
+        held.wait(1, &mut |done| assert!(done.result.is_ok()));
+    }
+    Ok(())
+}
+
 /// A wake asked for once reads are on the ring is declined: those reads
 /// report to a sink without it, and a caller sleeping on it would not wake.
 #[test]
@@ -1916,7 +2001,7 @@ fn a_wake_asked_for_with_reads_in_flight_is_declined() -> io::Result<()> {
         offset: 0,
         buf: vec![0; 64],
     });
-    queue.issue();
+    queue.issue(true);
     assert!(!queue.set_wake(Arc::clone(&wake) as Arc<dyn crate::fs::ReadWake>));
     while queue.outstanding() > 0 {
         queue.wait(1, &mut |done| assert!(done.result.is_ok()));
