@@ -123,12 +123,13 @@ struct RunResolve {
 }
 
 /// One data block the chunked `multi_get` resolver will read (see
-/// `resolve_level_chunked`): the block, the SST it lives in (`table` + its `file`
-/// handle), the table-local read seqno, whether it needs the special load path
-/// (Page-ECC / columnar), and the ORIGINAL key indices that fall in this block.
+/// `resolve_level_chunked`): the block, the SST it lives in, the table-local
+/// read seqno, whether it needs the special load path (Page-ECC / columnar),
+/// and the ORIGINAL key indices that fall in this block. The table's file is
+/// opened when the block's chunk is read, so a level holds open only the
+/// files of the chunk it is reading.
 struct BlockTask<'a> {
     table: &'a crate::Table,
-    file: Arc<dyn crate::fs::FsFile>,
     handle: crate::table::BlockHandle,
     table_seqno: SeqNo,
     special: bool,
@@ -147,11 +148,10 @@ struct LevelTable<'a, 'k> {
     batch: Vec<(&'k [u8], u64)>,
     batch_idx: Vec<usize>,
     read: Option<crate::table::staged::StagedRead<'a>>,
-    /// The file the first stage opened, held for every later stage and the
-    /// data reads: on a level wider than the descriptor cache, the cache has
-    /// evicted it by then, and opening it again is a cold open per stage. It
-    /// is let go once the table needs no more stages and no data block, so a
-    /// table the filters answered does not keep a descriptor open.
+    /// The file the first stage opened, held for every later stage: on a
+    /// level wider than the descriptor cache, the cache has evicted it by
+    /// then, and opening it again is a cold open per stage. It is let go once
+    /// the table's stages are over.
     file: Option<Arc<dyn crate::fs::FsFile>>,
 }
 
@@ -3837,24 +3837,19 @@ impl Tree {
             batch,
             batch_idx,
             read,
-            file: staged_file,
+            ..
         } in tables
         {
-            // The serial planner hands over the file it opened, which the
-            // blocks are read through; a staged plan hands over the one its
-            // stages read through, and opens it here only when every stage
-            // was answered from the cache.
-            let (planned_file, table_seqno, blocks, tally) = match read {
-                Some(read) if read.is_done() => {
-                    let (table_seqno, blocks, tally) = read.into_plan();
-                    (staged_file, table_seqno, blocks, tally)
-                }
+            let (table_seqno, blocks, tally) = match read {
+                Some(read) if read.is_done() => read.into_plan(),
                 // Served by the serial planner, whose reads are authoritative:
                 // a genuine failure surfaces here instead of letting a lower
-                // level answer a key this table covers.
+                // level answer a key this table covers. The file it opened is
+                // not kept: the data blocks are read through the file their
+                // chunk opens.
                 _ => {
                     let mut tally = PlanCounts::default();
-                    let Some((file, table_seqno, _, blocks)) =
+                    let Some((_, table_seqno, _, blocks)) =
                         table.plan_block_tasks(&batch, seqno, &mut tally)?
                     else {
                         if tally != PlanCounts::default() {
@@ -3862,7 +3857,7 @@ impl Tree {
                         }
                         continue;
                     };
-                    (Some(file), table_seqno, blocks, tally)
+                    (table_seqno, blocks, tally)
                 }
             };
             if tally != PlanCounts::default() {
@@ -3871,16 +3866,11 @@ impl Tree {
             if blocks.is_empty() {
                 continue;
             }
-            let file = match planned_file {
-                Some(file) => file,
-                None => table.open_file()?,
-            };
             let special = table.is_chunk_special();
             for (handle, positions) in blocks {
                 let task_keys: Vec<usize> = positions.iter().map(|&pos| batch_idx[pos]).collect();
                 tasks.push(BlockTask {
                     table,
-                    file: Arc::clone(&file),
                     handle,
                     table_seqno,
                     special,
@@ -3889,6 +3879,18 @@ impl Tree {
             }
         }
         Ok((tasks, probes))
+    }
+
+    /// The most of these `tables` whose files a level read holds open at
+    /// once: what the smallest descriptor cache among them keeps, unbounded
+    /// when their descriptors are pinned and open anyway.
+    fn open_cap<'t>(tables: impl Iterator<Item = &'t Table>) -> usize {
+        tables
+            .filter_map(Table::descriptor_capacity)
+            .min()
+            .map_or(usize::MAX, |cap| {
+                usize::try_from(cap).unwrap_or(usize::MAX).max(1)
+            })
     }
 
     /// Drives the staged reads of a level's `tables` until each is planned. A
@@ -3918,16 +3920,10 @@ impl Tree {
         // At most as many tables hold a file open for their stages as the
         // descriptor cache keeps open: a level wider than that, read stage by
         // stage all at once, would otherwise open a file per table and run
-        // the process out of descriptors. A table whose stages are over no
-        // longer counts, whether it lets its file go or keeps it for its data
-        // blocks, so the tables waiting for a place always get one.
-        let open_cap = tables
-            .iter()
-            .filter_map(|entry| entry.table.descriptor_capacity())
-            .min()
-            .map_or(usize::MAX, |cap| {
-                usize::try_from(cap).unwrap_or(usize::MAX).max(1)
-            });
+        // the process out of descriptors. A table whose stages are over lets
+        // its file go and its place with it, so the tables waiting for a place
+        // always get one.
+        let open_cap = Self::open_cap(tables.iter().map(|entry| entry.table));
         let mut staged: Vec<bool> = vec![false; tables.len()];
         let mut in_stage = 0usize;
 
@@ -4011,25 +4007,21 @@ impl Tree {
                     }
                     break;
                 }
-                // A table whose stages are over and that reads no data block,
-                // or that is left to the serial planner, needs its file no
-                // more: holding it would keep a descriptor per table of the
-                // level open until the whole level is read.
-                if waiting[at] == 0 {
-                    let over = entry
+                // A table whose stages are over, or that is left to the serial
+                // planner, needs its file no more: its data blocks are read
+                // through the file their chunk opens, and holding it would
+                // keep a descriptor per table of the level open until the
+                // whole level is read.
+                if waiting[at] == 0
+                    && entry
                         .read
                         .as_ref()
-                        .is_none_or(crate::table::staged::StagedRead::is_done);
-                    if over && staged[at] {
+                        .is_none_or(crate::table::staged::StagedRead::is_done)
+                {
+                    entry.file = None;
+                    if staged[at] {
                         staged[at] = false;
                         in_stage -= 1;
-                    }
-                    if entry
-                        .read
-                        .as_ref()
-                        .is_none_or(|read| read.is_done() && !read.plans_blocks())
-                    {
-                        entry.file = None;
                     }
                 }
             }
@@ -4201,18 +4193,34 @@ impl Tree {
             .any(|task| task.table.counts_filter_misses())
             .then(Vec::new);
 
+        // A chunk opens the files of the tables it reads blocks of, so it
+        // spans at most as many of them as the descriptor cache keeps. A
+        // table's tasks are consecutive, so a new table is a change of table.
+        let open_cap = Self::open_cap(tasks.iter().map(|task| task.table));
+        // The last table a chunk read, with its file: a table whose blocks
+        // span two chunks is opened once for both.
+        let mut carried: Option<(crate::TableId, Arc<dyn crate::fs::FsFile>)> = None;
+
         let mut start = 0;
         while start < tasks.len() {
             let mut bytes = 0u64;
             let mut end = start;
+            let mut opened = 0usize;
+            let mut last_read: Option<crate::TableId> = None;
             while end < tasks.len() {
-                let sz = if matches!(cached[end], TaskBlock::Read | TaskBlock::Load) {
+                let reads = matches!(cached[end], TaskBlock::Read);
+                let sz = if reads || matches!(cached[end], TaskBlock::Load) {
                     u64::from(tasks[end].handle.size())
                 } else {
                     0
                 };
-                if end > start && bytes + sz > budget {
+                let opens = reads && last_read != Some(tasks[end].table.id());
+                if end > start && (bytes + sz > budget || (opens && opened == open_cap)) {
                     break;
+                }
+                if opens {
+                    opened += 1;
+                    last_read = Some(tasks[end].table.id());
                 }
                 bytes += sz;
                 end += 1;
@@ -4231,6 +4239,7 @@ impl Tree {
                 keys,
                 results,
                 found.as_mut(),
+                &mut carried,
             ) {
                 log::debug!("a batched level read failed, the level is read serially: {error}");
                 for &(idx, _) in still_remaining.iter() {
@@ -4295,6 +4304,7 @@ impl Tree {
         keys: &[K],
         results: &mut [Option<InternalValue>],
         found: Option<&mut Vec<(crate::TableId, usize)>>,
+        carried: &mut Option<(crate::TableId, Arc<dyn crate::fs::FsFile>)>,
     ) -> crate::Result<()> {
         let mut hits: Vec<(usize, usize, InternalValue)> = Vec::new();
         for (index, (task, block)) in chunk.iter().zip(cached).enumerate() {
@@ -4321,6 +4331,31 @@ impl Tree {
             })
             .collect::<crate::Result<_>>()?;
 
+        // The files of the tables whose blocks are read, opened for this chunk
+        // only, once per table: a table's tasks are consecutive. The previous
+        // chunk's last file is taken over when this chunk goes on with its
+        // table, and let go otherwise. Each task to read names its file by
+        // position here.
+        let mut carry = carried.take();
+        let mut files: Vec<(crate::TableId, Arc<dyn crate::fs::FsFile>)> = Vec::new();
+        let mut file_of: Vec<Option<usize>> = Vec::with_capacity(chunk.len());
+        for (task, block) in chunk.iter().zip(cached) {
+            if !matches!(block, TaskBlock::Read) {
+                file_of.push(None);
+                continue;
+            }
+            let id = task.table.id();
+            if files.last().is_none_or(|&(last, _)| last != id) {
+                let file = match carry.take() {
+                    Some((carried_id, file)) if carried_id == id => file,
+                    _ => task.table.open_file()?,
+                };
+                files.push((id, file));
+            }
+            file_of.push(files.len().checked_sub(1));
+        }
+        *carried = files.last().cloned();
+
         // One submission per backend: a table's reads belong to the backend it
         // was opened through, which a reopen with a changed routing map can
         // leave different from the level's current route. Each group
@@ -4337,8 +4372,16 @@ impl Tree {
             if !matches!(block, TaskBlock::Read) {
                 continue;
             }
+            let Some(file) = file_of
+                .get(index)
+                .copied()
+                .flatten()
+                .and_then(|at| files.get(at))
+            else {
+                continue;
+            };
             let req = crate::fs::BlockRead {
-                file: task.file.as_ref(),
+                file: file.1.as_ref(),
                 offset: *task.handle.offset(),
                 buf: crate::fs::BlockBuf::new(&mut buf[..]),
             };

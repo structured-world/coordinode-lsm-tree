@@ -1270,12 +1270,13 @@ impl Fs for OpenCountFs {
     }
 }
 
-/// A level wider than the descriptor cache opens each table's file once for
-/// the whole staged read: its filter, index and data stages share the file the
-/// first of them opened, instead of the cache evicting it between stages and
-/// each stage opening it again.
+/// A level wider than the descriptor cache opens each table's file at most
+/// twice for the whole staged read: once for its filter and index stages,
+/// which share it, and once for its data blocks, read in chunks that open only
+/// their own tables' files; never once per stage.
 #[test]
-fn a_level_wider_than_the_descriptor_cache_opens_each_table_once() -> lsm_tree::Result<()> {
+fn a_level_wider_than_the_descriptor_cache_opens_each_table_at_most_twice() -> lsm_tree::Result<()>
+{
     // Well past the descriptor cache, whose shards keep an entry each.
     const TABLES: u32 = 64;
     let dir = tempfile::tempdir()?;
@@ -1316,7 +1317,7 @@ fn a_level_wider_than_the_descriptor_cache_opens_each_table_once() -> lsm_tree::
     let values = tree.multi_get(&keys, SeqNo::MAX)?;
     let opened = opens.load(std::sync::atomic::Ordering::Relaxed);
     assert!(
-        opened <= TABLES as usize,
+        opened <= 2 * TABLES as usize,
         "{TABLES} tables opened {opened} times for one batch"
     );
     assert_eq!(values, expected);
@@ -1392,20 +1393,31 @@ impl FsFile for Counted {
     }
 }
 
-/// A backend counting the files it has open, and recording that count at each
-/// batched read, delegating to [`StdFs`]. Only its own files are counted, so
-/// other tests running beside it do not move the count.
+/// A backend counting the files it has open, and recording at each batched
+/// read that count and how many distinct files the batch reads, delegating to
+/// [`StdFs`]. Only its own files are counted, so other tests running beside it
+/// do not move the count.
 struct LiveCountFs {
     live: Arc<std::sync::atomic::AtomicUsize>,
-    counts: Arc<Mutex<Vec<usize>>>,
+    /// Per batched read: the files open, and the distinct files it reads.
+    counts: Arc<Mutex<Vec<(usize, usize)>>>,
 }
 
 impl Fs for LiveCountFs {
     fn read_blocks_batched(&self, reqs: &mut [BlockRead<'_>]) -> io::Result<()> {
+        let mut files: Vec<*const ()> = reqs
+            .iter()
+            .map(|req| core::ptr::from_ref(req.file).cast::<()>())
+            .collect();
+        files.sort_unstable();
+        files.dedup();
         self.counts
             .lock()
             .unwrap_or_else(PoisonError::into_inner)
-            .push(self.live.load(std::sync::atomic::Ordering::Relaxed));
+            .push((
+                self.live.load(std::sync::atomic::Ordering::Relaxed),
+                files.len(),
+            ));
         StdFs.read_blocks_batched(reqs)
     }
 
@@ -1451,14 +1463,17 @@ impl Fs for LiveCountFs {
     }
 }
 
-/// A level read stage by stage keeps at most as many tables' files open for
-/// their stages as the descriptor cache keeps, and a table whose filters
-/// answered every key gives its file back: a level far wider than the cache
-/// does not open, or keep, a file per table, and still answers every key.
+/// A level read stage by stage reads at most as many tables' files at once as
+/// the descriptor cache keeps, in its stages and in its data reads alike, and
+/// gives each file back once it is done with it: a level far wider than the
+/// cache does not open, or keep, a file per table, whether the keys end at the
+/// filters or reach a data block in every table, and every key is answered.
 #[test]
 fn a_staged_level_read_opens_no_more_files_than_the_descriptor_cache_holds() -> lsm_tree::Result<()>
 {
     const TABLES: u32 = 64;
+    /// The descriptor cache the tree is opened with.
+    const DESCRIPTORS: usize = 2;
     let dir = tempfile::tempdir()?;
     let counts = Arc::new(Mutex::new(Vec::new()));
     let fs: Arc<dyn Fs> = Arc::new(LiveCountFs {
@@ -1473,7 +1488,7 @@ fn a_staged_level_read_opens_no_more_files_than_the_descriptor_cache_holds() -> 
         )
         .with_shared_fs(Arc::clone(&fs))
         .use_cache(Arc::new(Cache::with_capacity_bytes(0)))
-        .use_descriptor_table(Some(Arc::new(lsm_tree::DescriptorTable::new(2))))
+        .use_descriptor_table(Some(Arc::new(lsm_tree::DescriptorTable::new(DESCRIPTORS))))
         .filter_block_pinning_policy(PinningPolicy::all(false))
         .index_block_pinning_policy(PinningPolicy::all(false))
     };
@@ -1488,29 +1503,49 @@ fn a_staged_level_read_opens_no_more_files_than_the_descriptor_cache_holds() -> 
             tree.flush_active_memtable(0)?;
         }
     }
-    // A key inside each table's range that it does not hold: every table's
-    // filter is read, and none has a data block to read.
-    let keys: Vec<String> = (0..TABLES)
-        .map(|table| format!("t{table:03}r0010x"))
-        .collect();
     let tree = config().open()?;
-    counts
-        .lock()
-        .unwrap_or_else(PoisonError::into_inner)
-        .clear();
+    // A key inside each table's range that it does not hold, which its filter
+    // answers; then a key each table holds, read from a data block of every
+    // table.
+    for (what, row, present) in [("filtered out", "0010x", false), ("found", "0010", true)] {
+        let keys: Vec<String> = (0..TABLES)
+            .map(|table| format!("t{table:03}r{row}"))
+            .collect();
+        let expected = one_by_one(&tree, &keys)?;
+        counts
+            .lock()
+            .unwrap_or_else(PoisonError::into_inner)
+            .clear();
 
-    let values = tree.multi_get(&keys, SeqNo::MAX)?;
-    let counts = counts
-        .lock()
-        .unwrap_or_else(PoisonError::into_inner)
-        .clone();
-    let peak = counts.iter().copied().max().unwrap_or_default();
-    assert!(
-        !counts.is_empty() && peak <= (TABLES as usize) / 2,
-        "{TABLES} tables, peak of {peak} files open at a batch: {counts:?}"
-    );
-    assert!(values.iter().all(Option::is_none));
-    assert_eq!(values, one_by_one(&tree, &keys)?);
+        let values = tree.multi_get(&keys, SeqNo::MAX)?;
+        let counts = counts
+            .lock()
+            .unwrap_or_else(PoisonError::into_inner)
+            .clone();
+        let peak = counts
+            .iter()
+            .map(|&(live, _)| live)
+            .max()
+            .unwrap_or_default();
+        let widest = counts
+            .iter()
+            .map(|&(_, files)| files)
+            .max()
+            .unwrap_or_default();
+        assert!(
+            !counts.is_empty() && peak <= (TABLES as usize) / 2,
+            "{what}: {TABLES} tables, peak of {peak} files open at a batch: {counts:?}"
+        );
+        assert!(
+            widest <= DESCRIPTORS,
+            "{what}: a batch read {widest} files, past the {DESCRIPTORS} the cache keeps: {counts:?}"
+        );
+        assert!(
+            values.iter().all(|value| value.is_some() == present),
+            "{what}"
+        );
+        assert_eq!(values, expected, "{what}");
+    }
     Ok(())
 }
 

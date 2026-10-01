@@ -182,12 +182,6 @@ impl<'t> StagedRead<'t> {
         }
     }
 
-    /// Whether the plan reads any data block, so the table's file is still
-    /// needed once the read is done.
-    pub(crate) fn plans_blocks(&self) -> bool {
-        !self.blocks.is_empty()
-    }
-
     /// The planned data blocks, each with the positions of the keys in it,
     /// and what the filters answered.
     pub(crate) fn into_plan(self) -> (SeqNo, Vec<(BlockHandle, Vec<usize>)>, PlanCounts) {

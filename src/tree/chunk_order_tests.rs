@@ -90,7 +90,15 @@ fn a_chunked_resolve_breaks_an_equal_seqno_tie_by_plan_order() -> crate::Result<
     let mut results: Vec<Option<InternalValue>> = alloc::vec![None];
     // Both blocks read, so the backend decides the order they are back in.
     let uncached = alloc::vec![super::TaskBlock::Read, super::TaskBlock::Read];
-    Tree::resolve_block_task_chunk(&tasks, &uncached, false, &keys, &mut results, None)?;
+    Tree::resolve_block_task_chunk(
+        &tasks,
+        &uncached,
+        false,
+        &keys,
+        &mut results,
+        None,
+        &mut None,
+    )?;
     let Some(single) = tree.get("key", SeqNo::MAX)? else {
         panic!("the key was written");
     };
