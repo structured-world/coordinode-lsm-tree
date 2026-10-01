@@ -90,9 +90,18 @@ fn a_tables_final_sections_are_written_back_as_they_are_written() -> lsm_tree::R
         tree.insert(format!("{key:06}"), b"v", u64::from(key));
     }
     tree.flush_active_memtable(0)?;
+    // The meta section, the table of contents and the trailer come after the
+    // last section boundary; a few steps hold them.
+    assert_tail_within_a_few_steps(&*fs, &injector)
+}
 
+/// Asserts that the one table the flush wrote left at most a few steps to its
+/// final sync, past the end of the last writeback.
+fn assert_tail_within_a_few_steps(fs: &dyn Fs, injector: &FaultInjector) -> lsm_tree::Result<()> {
+    // Absolute as the tree makes its folder (`D:\db` on Windows).
+    let tables = std::path::absolute("/db/tables").expect("absolute tables folder");
     let table = fs
-        .read_dir(std::path::Path::new("/db/tables"))?
+        .read_dir(&tables)?
         .into_iter()
         .find(|entry| !entry.is_dir)
         .expect("the flush wrote a table");
@@ -100,8 +109,6 @@ fn a_tables_final_sections_are_written_back_as_they_are_written() -> lsm_tree::R
     let ranges = injector.writebacks_for("tables");
     let handed = ranges.last().map_or(0, |&(offset, len)| offset + len);
     let tail = size - handed;
-    // The meta section, the table of contents and the trailer come after the
-    // last section boundary; a few steps hold them.
     assert!(
         tail <= 4 * STEP,
         "{tail} of {size} bytes left to the final sync: {ranges:?}"
@@ -134,21 +141,7 @@ fn a_large_index_mirror_is_written_back_before_the_final_sync() -> lsm_tree::Res
         tree.insert(format!("{key:06}"), b"v", u64::from(key));
     }
     tree.flush_active_memtable(0)?;
-
-    let table = fs
-        .read_dir(std::path::Path::new("/db/tables"))?
-        .into_iter()
-        .find(|entry| !entry.is_dir)
-        .expect("the flush wrote a table");
-    let size = fs.metadata(&table.path)?.len;
-    let ranges = injector.writebacks_for("tables");
-    let handed = ranges.last().map_or(0, |&(offset, len)| offset + len);
-    let tail = size - handed;
-    assert!(
-        tail <= 4 * STEP,
-        "{tail} of {size} bytes left to the final sync: {ranges:?}"
-    );
-    Ok(())
+    assert_tail_within_a_few_steps(&*fs, &injector)
 }
 
 /// A writeback is a hint: the final sync still makes the file durable and

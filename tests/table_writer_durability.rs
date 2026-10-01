@@ -5,15 +5,17 @@
 use lsm_tree::fs::{CrashFs, Fs, MemFs};
 use lsm_tree::table::Writer;
 use lsm_tree::{InternalValue, ValueType};
-use std::path::Path;
 use std::sync::Arc;
 
 #[test]
 fn a_finished_standalone_table_survives_a_crash() -> lsm_tree::Result<()> {
     let crash = CrashFs::new(MemFs::new());
     let fs: Arc<dyn Fs> = Arc::new(crash.clone());
-    fs.create_dir_all(Path::new("/tables"))?;
-    let path = std::path::PathBuf::from("/tables/1");
+    // Absolute as the writer makes it (`D:\tables` on Windows), so the folder
+    // made here is the one the table is written to.
+    let folder = std::path::absolute("/tables").expect("absolute folder");
+    fs.create_dir_all(&folder)?;
+    let path = folder.join("1");
 
     let mut writer = Writer::new(path.clone(), 1, 0, Arc::clone(&fs))?;
     for i in 0u64..10 {
