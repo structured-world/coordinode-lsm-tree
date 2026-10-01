@@ -886,6 +886,11 @@ pub trait ReadQueue {
 
 /// Told by a [`ReadQueue`] that one of its reads is back: see
 /// [`ReadQueue::set_wake`]. Called from whatever thread finished the read.
+///
+/// That thread can be a backend's I/O thread (the `io_uring` ring thread), so
+/// an implementation returns promptly and does not panic: a blocking `wake`
+/// stalls every read of the backend, and a panic on the ring thread aborts the
+/// process.
 #[diagnostic::on_unimplemented(
     message = "`{Self}` cannot be woken by a read queue",
     label = "this type does not implement `ReadWake`",

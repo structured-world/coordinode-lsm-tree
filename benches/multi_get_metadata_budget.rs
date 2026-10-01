@@ -17,11 +17,11 @@
 //! backend whose queue overlaps a level's reads; the std backend reads them
 //! one after another.
 //!
-//! Prints, per budget, the median and p99 wall time per batch and the peak of
-//! live heap bytes above the level before the batches, counted by the
-//! allocator, so freed memory the allocator keeps does not count. The grid
-//! runs forward and then backward, so an effect of the order shows as the
-//! two passes disagreeing.
+//! Prints, per budget, the median, p99 and p999 wall time per batch and the
+//! peak of live heap bytes above the level before the batches, counted by the
+//! allocator, so freed memory the allocator keeps does not count. Every budget
+//! reads the same batches, and the grid runs forward and then backward, so an
+//! effect of the order shows as the two passes disagreeing.
 
 use std::alloc::{GlobalAlloc, Layout, System};
 use std::sync::atomic::{AtomicUsize, Ordering};
@@ -64,7 +64,10 @@ fn run() -> Result<(), Box<dyn std::error::Error>> {
     const TABLES: u64 = 32;
     const KEYS_PER_TABLE: u64 = 500_000;
     const BATCH: usize = 1_024;
-    const ROUNDS: usize = 100;
+    /// Enough batches that the p999 is not simply the slowest one;
+    /// `MULTI_GET_ROUNDS` sets fewer for a cold grid, which drops the page
+    /// cache before every batch.
+    const ROUNDS: usize = 1_000;
     const BUDGETS: [u64; 8] = [
         1 << 20,
         2 << 20,
@@ -137,6 +140,10 @@ fn run() -> Result<(), Box<dyn std::error::Error>> {
         // Dirty pages are not dropped; write them out first.
         std::process::Command::new("sync").status()?;
     }
+    let rounds = match std::env::var("MULTI_GET_ROUNDS") {
+        Ok(rounds) => rounds.parse()?,
+        Err(_) => ROUNDS,
+    };
     let mut state = 0x9E37_79B9_7F4A_7C15u64;
     let mut next = move || {
         state ^= state << 13;
@@ -144,18 +151,20 @@ fn run() -> Result<(), Box<dyn std::error::Error>> {
         state ^= state << 17;
         state % (TABLES * KEYS_PER_TABLE)
     };
+    // One set of batches for every budget, so the budget is the only thing
+    // that differs between them.
+    let keys: Vec<Vec<String>> = (0..rounds)
+        .map(|_| (0..BATCH).map(|_| key(next())).collect())
+        .collect();
     for (pass, budgets) in [
         ("forward", BUDGETS.to_vec()),
         ("backward", BUDGETS.iter().rev().copied().collect()),
     ] {
         for budget in budgets {
             let tree = config(budget).open()?;
-            let keys: Vec<Vec<String>> = (0..ROUNDS)
-                .map(|_| (0..BATCH).map(|_| key(next())).collect())
-                .collect();
             let base = LIVE.load(Ordering::Relaxed);
             PEAK.store(base, Ordering::Relaxed);
-            let mut wall = Vec::with_capacity(ROUNDS);
+            let mut wall = Vec::with_capacity(rounds);
             for batch in &keys {
                 if drop_caches {
                     std::fs::write("/proc/sys/vm/drop_caches", "3")?;
@@ -173,9 +182,11 @@ fn run() -> Result<(), Box<dyn std::error::Error>> {
                 format!("{} MiB", budget >> 20)
             };
             println!(
-                "{pass} budget {label}: wall p50 {:?} p99 {:?}; peak heap above the level {} KiB",
+                "{pass} budget {label}: wall p50 {:?} p99 {:?} p999 {:?}; \
+                 peak heap above the level {} KiB",
                 quantile(&mut wall, 0.5),
                 quantile(&mut wall, 0.99),
+                quantile(&mut wall, 0.999),
                 peak / 1_024,
             );
             drop(tree);
