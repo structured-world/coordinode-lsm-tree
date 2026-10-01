@@ -29,6 +29,18 @@ fn table(
     pin_index: bool,
     cache_bytes: u64,
 ) -> Table {
+    table_with(dir, shape, pin_filter, pin_index, cache_bytes, |_| {})
+}
+
+/// [`table`], with `tune` applied to the parameters it is opened with.
+fn table_with(
+    dir: &std::path::Path,
+    shape: impl Fn(Writer) -> Writer,
+    pin_filter: bool,
+    pin_index: bool,
+    cache_bytes: u64,
+    tune: impl FnOnce(&mut RecoverParams),
+) -> Table {
     let file = dir.join("table");
     let fs: Arc<dyn crate::fs::Fs> = Arc::new(StdFs);
     let mut writer = shape(Writer::new(file.clone(), 0, 0, Arc::clone(&fs)).expect("writer"));
@@ -54,6 +66,7 @@ fn table(
     params.descriptor_table = Some(Arc::new(DescriptorTable::new(10)));
     params.pin_filter = pin_filter;
     params.pin_index = pin_index;
+    tune(&mut params);
     Table::recover(params).expect("recover")
 }
 
@@ -346,6 +359,142 @@ fn a_read_answers_from_what_it_holds_when_the_cache_keeps_nothing() {
         offsets.dedup();
         assert_eq!(before, offsets.len(), "{name}: a block was asked for twice");
     }
+}
+
+/// The last key of every other index partition, so the partition after each
+/// holds no key of the batch: a version of such a key may continue past the
+/// partition's end, so the walk steps into a partition the batch never asked
+/// for.
+fn partition_end_batch(table: &Table) -> Vec<(Vec<u8>, u64)> {
+    let BlockIndexImpl::TwoLevel(index) = &*table.block_index else {
+        panic!("a partitioned index");
+    };
+    let ends: Vec<Vec<u8>> = OwnedIndexBlockIter::from_block_with_bounds(
+        index.top_level_index.clone(),
+        table.comparator.clone(),
+        None,
+        None,
+    )
+    .expect("the top-level index decodes")
+    .expect("a top-level index")
+    .map(|handle| handle.end_key().to_vec())
+    .collect();
+    assert!(ends.len() > 4, "many index partitions: {}", ends.len());
+    // The last partition has none after it.
+    let inner = ends.get(..ends.len() - 1).expect("partitions");
+    inner
+        .iter()
+        .step_by(2)
+        .map(|key| (key.clone(), hash64(key)))
+        .collect()
+}
+
+/// A key ending an index partition is read on into the next partition, which
+/// the read asks for once its walk reaches it, cold, and takes from the cache
+/// without a read, warm; both plan what the serial planner plans.
+#[test]
+fn a_key_ending_a_partition_walks_on_into_the_next_one() -> crate::Result<()> {
+    let dir = tempdir()?;
+    let cold = table(dir.path(), many_partitions, true, false, 0);
+    let batch = partition_end_batch(&cold);
+    let keys: Vec<(&[u8], u64)> = batch.iter().map(|(k, h)| (k.as_slice(), *h)).collect();
+    let mut serial_tally = PlanCounts::default();
+    let (_, _, _, serial_blocks) = cold
+        .plan_block_tasks(&keys, SeqNo::MAX, &mut serial_tally)?
+        .expect("keys in range");
+
+    let (_, blocks, _, asked) = drive(&cold, &keys).expect("staged");
+    let partitions = asked.iter().filter(|(t, _)| *t == BlockType::Index).count();
+    assert!(
+        partitions > keys.len(),
+        "{} keys at partition ends asked for {partitions} partitions: {asked:?}",
+        keys.len()
+    );
+    assert_eq!(plan_of(&serial_blocks), plan_of(&blocks), "cold");
+
+    let dir = tempdir()?;
+    let warm = table(dir.path(), many_partitions, true, false, 1_000_000);
+    drive(&warm, &keys).expect("staged");
+    let (_, blocks, _, asked) = drive(&warm, &keys).expect("staged");
+    assert!(asked.is_empty(), "a warm table asked for {asked:?}");
+    assert_eq!(plan_of(&serial_blocks), plan_of(&blocks), "warm");
+    Ok(())
+}
+
+/// A key past the last filter partition is ruled out by the partition index
+/// alone: nothing is read for it and no data block is planned.
+#[test]
+fn a_key_past_the_last_filter_partition_reads_nothing() {
+    let dir = tempdir().expect("dir");
+    let table = table(
+        dir.path(),
+        |w| w.use_partitioned_filter().use_meta_partition_size(8),
+        false,
+        false,
+        0,
+    );
+    let key = b"key999999".as_slice();
+    let (_, blocks, tally, asked) = drive(&table, &[(key, hash64(key))]).expect("staged");
+    assert!(
+        asked.is_empty(),
+        "a key past the partitions asked for {asked:?}"
+    );
+    assert!(blocks.is_empty(), "nothing is planned: {blocks:?}");
+    assert_eq!(
+        1, tally.filter_skips,
+        "the partition index ruled the key out"
+    );
+}
+
+/// A table without a filter rules no key out: its read goes straight to the
+/// index and plans what the serial planner plans.
+#[test]
+fn a_table_without_a_filter_is_planned_from_its_index() -> crate::Result<()> {
+    use crate::config::BloomConstructionPolicy;
+
+    let no_filter = |w: Writer| w.use_bloom_policy(BloomConstructionPolicy::BitsPerKey(0.0));
+    let batch = batch();
+    let keys: Vec<(&[u8], u64)> = batch.iter().map(|(k, h)| (k.as_slice(), *h)).collect();
+    let dir = tempdir()?;
+    let serial_table = table(dir.path(), no_filter, false, false, 0);
+    let mut serial_tally = PlanCounts::default();
+    let (_, _, _, serial_blocks) = serial_table
+        .plan_block_tasks(&keys, SeqNo::MAX, &mut serial_tally)?
+        .expect("keys in range");
+
+    let dir = tempdir()?;
+    let staged_table = table(dir.path(), no_filter, false, false, 0);
+    let (_, blocks, tally, asked) = drive(&staged_table, &keys).expect("staged");
+    assert!(
+        asked.iter().all(|(t, _)| *t != BlockType::Filter),
+        "no filter to read: {asked:?}"
+    );
+    assert_eq!(plan_of(&serial_blocks), plan_of(&blocks));
+    assert_eq!(serial_tally, tally);
+    Ok(())
+}
+
+/// A snapshot below a table's global seqno, as of an ingested table, sees
+/// nothing of it.
+#[test]
+fn a_snapshot_below_the_global_seqno_reads_nothing() {
+    let batch = batch();
+    let keys: Vec<(&[u8], u64)> = batch.iter().map(|(k, h)| (k.as_slice(), *h)).collect();
+    let dir = tempdir().expect("dir");
+    let table = table_with(
+        dir.path(),
+        |w| w,
+        false,
+        false,
+        0,
+        |params| {
+            params.global_seqno = 100;
+        },
+    );
+    assert!(matches!(
+        StagedRead::start(&table, &keys, 50),
+        StagedStart::Nothing
+    ));
 }
 
 /// A table whose blocks need the load path's own recovery or reconstruction is
