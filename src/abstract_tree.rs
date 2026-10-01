@@ -450,12 +450,44 @@ pub trait AbstractTree: sealed::Sealed {
     #[cfg(feature = "std")]
     fn create_checkpoint(&self, target_path: &crate::path::Path) -> crate::Result<CheckpointInfo>;
 
-    /// Seals the active memtable and flushes to table(s).
+    /// Seals the active memtable and flushes it, with every memtable sealed
+    /// before it, to tables: the durability barrier for a caller that keeps
+    /// its own journal of the writes.
     ///
-    /// If there are already other sealed memtables lined up, those will be flushed as well.
+    /// `Ok` means the tables, their directories and the manifest edits that
+    /// name them are persisted under [`Config::sync_mode`](crate::Config::sync_mode)
+    /// for the memtable active at the call and for every memtable sealed before
+    /// it, in sealing order, including one another thread began flushing: the
+    /// call waits for that flush and, should it fail, flushes the memtable
+    /// itself. A caller may release the journal entries those memtables hold
+    /// once the call returns `Ok`.
     ///
-    /// Only used in tests.
-    #[doc(hidden)]
+    /// `gc_watermark` has the meaning documented at
+    /// [`major_compact`](Self::major_compact); pass `0` to collect nothing.
+    ///
+    /// # Errors
+    ///
+    /// Returns the error of [`flush`](Self::flush); the memtables it could not
+    /// persist stay sealed, and the next call flushes them.
+    ///
+    /// # Examples
+    ///
+    /// ```
+    /// use lsm_tree::{AbstractTree, Config, SequenceNumberCounter};
+    ///
+    /// let folder = tempfile::tempdir()?;
+    /// let tree = Config::new(
+    ///     &folder,
+    ///     SequenceNumberCounter::default(),
+    ///     SequenceNumberCounter::default(),
+    /// )
+    /// .open()?;
+    /// tree.insert("key", "value", 0);
+    /// // The write is on disk now: a journal that holds it can drop it.
+    /// tree.flush_active_memtable(0)?;
+    /// assert_eq!(tree.table_count(), 1);
+    /// # Ok::<(), lsm_tree::Error>(())
+    /// ```
     fn flush_active_memtable(&self, gc_watermark: SeqNo) -> crate::Result<()> {
         let lock = self.get_flush_lock();
         self.rotate_memtable();
