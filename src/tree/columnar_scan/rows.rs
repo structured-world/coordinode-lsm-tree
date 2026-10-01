@@ -60,13 +60,20 @@ impl Gather {
     }
 }
 
+/// A table's rows in key order, each key's versions newest first.
+type TableRows = alloc::boxed::Box<dyn Iterator<Item = crate::Result<InternalValue>> + Send>;
+
 /// Where a row source reads from.
 enum RowInput {
     /// A row-oriented table, read by its own range iterator.
     Table {
-        rows: alloc::boxed::Box<dyn Iterator<Item = crate::Result<InternalValue>> + Send>,
-        /// The row read that did not fit the last batch.
-        carry: Option<InternalValue>,
+        table: crate::Table,
+        hi: Bound<UserKey>,
+        rows: TableRows,
+        /// Where the next batch resumes when the last one stopped before a
+        /// row that did not fit: that row's key and seqno. The row is read
+        /// again rather than held, so a cursor between batches holds none.
+        resume: Option<(UserKey, SeqNo)>,
     },
     /// A memtable, read from the entry after the last one read, so the source
     /// holds the memtable rather than a borrow of it.
@@ -104,8 +111,10 @@ impl RowCursor {
     ) -> Self {
         Self {
             input: RowInput::Table {
-                rows: alloc::boxed::Box::new(table.range((lo, hi))),
-                carry: None,
+                rows: alloc::boxed::Box::new(table.range((lo, hi.clone()))),
+                table: table.clone(),
+                hi,
+                resume: None,
             },
             snapshot,
             columns,
@@ -146,20 +155,35 @@ impl RowCursor {
             share: self.share,
         };
         match &mut self.input {
-            RowInput::Table { rows, carry } => {
-                // The row that did not fit the last batch opens this one.
-                if let Some(row) = carry.take() {
-                    gather.push(row);
+            RowInput::Table {
+                table,
+                hi,
+                rows,
+                resume,
+            } => {
+                // The row that did not fit the last batch opens this one: the
+                // table is read again from its key, past the versions of it
+                // the last batch took (a key's versions come newest first).
+                let mut skip = resume.take();
+                if let Some((key, _)) = &skip {
+                    *rows = alloc::boxed::Box::new(
+                        table.range((Bound::Included(key.clone()), hi.clone())),
+                    );
                 }
                 while gather.open() {
                     match rows.next() {
                         // A table read to its end yields what was gathered.
                         None => break,
                         Some(Err(e)) => return Some(Err(e)),
+                        Some(Ok(row))
+                            if skip.as_ref().is_some_and(|(key, seqno)| {
+                                row.key.user_key == *key && row.key.seqno > *seqno
+                            }) => {}
                         // Exclusive MVCC, as every read at a snapshot.
                         Some(Ok(row)) if row.key.seqno < snapshot => {
+                            skip = None;
                             if !gather.fits(&row) {
-                                *carry = Some(row);
+                                *resume = Some((row.key.user_key.clone(), row.key.seqno));
                                 break;
                             }
                             gather.push(row);
@@ -257,10 +281,10 @@ pub(super) fn internal_bounds(
 /// The cursor a scan source is read through: a columnar segment's, or a row
 /// source's.
 pub(super) enum SourceCursor {
-    /// Boxed: a columnar cursor is far larger than a row cursor, and one is
-    /// allocated per source opened, not per row.
+    /// Boxed, as the row cursor is: either is allocated once per source
+    /// opened, not per row, and the enum stays a pointer wide.
     Columnar(alloc::boxed::Box<ColumnarCursor>),
-    Rows(RowCursor),
+    Rows(alloc::boxed::Box<RowCursor>),
 }
 
 impl SourceCursor {

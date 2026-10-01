@@ -299,6 +299,62 @@ fn small_memtable_rows_hold_their_encoding_within_the_scan_budget() {
 }
 
 #[test]
+fn a_row_table_cut_between_versions_resumes_at_the_version_it_stopped_at() {
+    // A share of one row cuts a row table's batch at every row, between the
+    // versions of one key too: each batch reads the table again from where
+    // the last stopped, past the versions it took, and the scan returns at
+    // a snapshot what a point read returns there.
+    // Two versions a key, two rows a share: a batch holds one key's versions
+    // and stops at the next key's newest one.
+    const VERSIONS: u64 = 2;
+    const KEYS: u32 = 40;
+    let folder = get_tmp_folder();
+    let AnyTree::Standard(tree) = Config::new(
+        folder.path(),
+        SequenceNumberCounter::default(),
+        SequenceNumberCounter::default(),
+    )
+    .columnar_scan_budget(64)
+    .open()
+    .expect("open") else {
+        panic!("expected a standard tree");
+    };
+    for i in 0..KEYS {
+        for version in 0..VERSIONS {
+            let seqno = u64::from(i) * VERSIONS + version + 1;
+            tree.insert(key(i), format!("v{version}"), seqno);
+        }
+    }
+    tree.flush_active_memtable(0).expect("flush");
+
+    // A snapshot inside the key range sees the newest versions below it and
+    // the older ones above it.
+    for snapshot in [VERSIONS, u64::from(KEYS / 2) * VERSIONS + 1, SeqNo::MAX] {
+        let mut got = Vec::new();
+        for batch in tree
+            .columnar_scan(&[COL_USER_KEY, COL_VALUE], None, snapshot, ..)
+            .expect("scan")
+        {
+            let batch = batch.expect("batch");
+            for row in 0..batch.row_count {
+                got.push((
+                    bytes_cell(&batch.columns[0].data, batch.row_count, row),
+                    bytes_cell(&batch.columns[1].data, batch.row_count, row),
+                ));
+            }
+        }
+        let expected: Vec<(Vec<u8>, Vec<u8>)> = (0..KEYS)
+            .filter_map(|i| {
+                tree.get(key(i), snapshot)
+                    .expect("get")
+                    .map(|value| (key(i), value.to_vec()))
+            })
+            .collect();
+        assert_eq!(expected, got, "snapshot {snapshot}");
+    }
+}
+
+#[test]
 fn a_memtable_row_larger_than_its_share_is_read_and_counted() {
     // A budget smaller than one memtable row cannot be kept either: each row
     // is read on its own, returned, and counted as a read past the share.

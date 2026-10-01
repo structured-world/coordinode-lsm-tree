@@ -1004,14 +1004,14 @@ impl ColumnarScan {
                 self.hi.clone(),
                 Some(share),
             )?)),
-            Source::RowTable(table) => SourceCursor::Rows(RowCursor::table(
+            Source::RowTable(table) => SourceCursor::Rows(Box::new(RowCursor::table(
                 table,
                 self.lo.clone(),
                 self.hi.clone(),
                 self.seqno,
                 ids,
                 share,
-            )),
+            ))),
             // Within the span its group was formed on: the active memtable
             // stays writable, and a row landing outside that span after the
             // scan was created would be read out of order, or beside a
@@ -1023,14 +1023,14 @@ impl ColumnarScan {
                 let cmp = self.comparator.as_ref();
                 let lo = tighter_lower(Bound::Included(seg.min.clone()), &self.lo, cmp);
                 let hi = tighter_upper(Bound::Included(seg.max.clone()), &self.hi, cmp);
-                SourceCursor::Rows(RowCursor::memtable(
+                SourceCursor::Rows(Box::new(RowCursor::memtable(
                     memtable.clone(),
                     &lo,
                     &hi,
                     self.seqno,
                     ids,
                     share,
-                ))
+                )))
             }
         };
         Ok(SegmentCursor { cursor, whole })
