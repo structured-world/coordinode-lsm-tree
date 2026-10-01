@@ -11,6 +11,12 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 
 ## [Unreleased]
 
+## [5.11.13](https://github.com/structured-world/coordinode-lsm-tree/compare/v5.11.12...v5.11.13) - 2026-10-01
+
+### Fixed
+
+- *(blob)* sync the tree folder after making the blobs folder ([#767](https://github.com/structured-world/coordinode-lsm-tree/pull/767))
+
 ## [5.11.12](https://github.com/structured-world/coordinode-lsm-tree/compare/v5.11.11...v5.11.12) - 2026-10-01
 
 ### Fixed
