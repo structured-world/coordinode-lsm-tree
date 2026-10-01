@@ -3947,6 +3947,13 @@ impl Tree {
                         continue;
                     }
                     let table: &'a Table = entry.table;
+                    // A table with no place under the cap waits before any of
+                    // its stage's buffers is allocated: it is passed over
+                    // again on every pass until a place frees.
+                    if entry.file.is_none() && in_stage >= open_cap {
+                        deferred = true;
+                        break;
+                    }
                     // A size no block can have is refused before any buffer
                     // is allocated for it; the serial planner then reports
                     // the corruption as the load path does.
@@ -3961,10 +3968,6 @@ impl Tree {
                     let file = if let Some(file) = &entry.file {
                         Arc::clone(file)
                     } else {
-                        if in_stage >= open_cap {
-                            deferred = true;
-                            break;
-                        }
                         let Ok(file) = table.open_file() else {
                             entry.read = None;
                             break;
@@ -4348,7 +4351,12 @@ impl Tree {
             if files.last().is_none_or(|&(last, _)| last != id) {
                 let file = match carry.take() {
                     Some((carried_id, file)) if carried_id == id => file,
-                    _ => task.table.open_file()?,
+                    // Another table's file is let go before this one opens:
+                    // a scrutinee left unbound lives to the end of the match.
+                    other => {
+                        drop(other);
+                        task.table.open_file()?
+                    }
                 };
                 files.push((id, file));
             }
@@ -6681,6 +6689,9 @@ mod partition_size_tests;
 
 #[cfg(all(test, feature = "std"))]
 mod chunk_order_tests;
+
+#[cfg(all(test, feature = "std"))]
+mod chunk_file_tests;
 
 #[cfg(all(test, feature = "std"))]
 mod probe_stats_tests;
