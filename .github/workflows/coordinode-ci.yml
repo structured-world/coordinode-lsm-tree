@@ -44,17 +44,18 @@ concurrency:
 env:
   CARGO_TERM_COLOR: always
 
+# Every job reads the repository and writes nothing through the
+# token; a job that needs more says so in its own block.
+permissions:
+  contents: read
+
 jobs:
   # Detect whether the change set touches code we want to validate.
-  # Used to gate the inner steps of `lint` and `test`, so their job
-  # names always surface to GitHub while heavy work is skipped on
-  # docs-only / repo-meta-only PRs. The other downstream jobs
-  # (`fuzz-heal`, `no-std-check`, `cross-matrix`, `cross`,
-  # `codecov`) gate at the job level via `if:` and skip outright
-  # when no code changes. The branch ruleset requires `ci-passed`
-  # (at the end of this file), which accepts a skipped job; a
-  # required check that itself reports "skipped" would be treated
-  # as "not yet satisfied" by the ruleset engine.
+  # Every downstream job gates at the job level via `if:` and skips
+  # outright on docs-only / repo-meta-only PRs. The branch ruleset
+  # requires `ci-passed` (at the end of this file), which accepts a
+  # skipped job; a required check that itself reports "skipped"
+  # would be treated as "not yet satisfied" by the ruleset engine.
   changes:
     runs-on: ubuntu-latest
     # Bumped from the original 2 min — generous timeout so a slow
@@ -568,6 +569,8 @@ jobs:
     if: ${{ always() }}
     timeout-minutes: 5
     runs-on: ubuntu-latest
+    # Reads only the results of the jobs it needs: no token scope at all.
+    permissions: {}
     steps:
       - name: Every job succeeded or was skipped
         env:
