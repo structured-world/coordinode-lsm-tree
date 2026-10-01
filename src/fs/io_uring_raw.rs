@@ -1204,13 +1204,23 @@ impl Fs for IoUringRawFs {
         let Some(target) = readlinkat_raw(&path_to_cstring(path)?)? else {
             return Ok(None);
         };
-        let target = String::from_utf8(target).map_err(|_| {
-            Error::new(
-                ErrorKind::InvalidInput,
-                "readlinkat: symlink target is not valid UTF-8",
-            )
-        })?;
-        Ok(Some(crate::path::PathBuf::from(target)))
+        // A target is any byte string; the std path type holds every one.
+        #[cfg(feature = "std")]
+        {
+            use std::os::unix::ffi::OsStringExt as _;
+            Ok(Some(std::ffi::OsString::from_vec(target).into()))
+        }
+        // The no-std path type is a string, so a target must be UTF-8.
+        #[cfg(not(feature = "std"))]
+        {
+            let target = String::from_utf8(target).map_err(|_| {
+                Error::new(
+                    ErrorKind::InvalidInput,
+                    "readlinkat: symlink target is not valid UTF-8",
+                )
+            })?;
+            Ok(Some(crate::path::PathBuf::from(target)))
+        }
     }
 
     fn metadata(&self, path: &Path) -> crate::io::Result<FsMetadata> {
