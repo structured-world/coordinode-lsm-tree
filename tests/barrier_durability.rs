@@ -167,6 +167,71 @@ impl Fs for NestedFs {
             .push(path.to_path_buf());
         self.inner.sync_device(path)
     }
+    // The rest delegates, so a tight-space compaction runs on it as on its inner.
+    fn create_dir(&self, path: &std::path::Path) -> lsm_tree::io::Result<()> {
+        self.inner.create_dir(path)
+    }
+    fn same_file(&self, a: &std::path::Path, b: &std::path::Path) -> lsm_tree::io::Result<bool> {
+        self.inner.same_file(a, b)
+    }
+    fn read_link(&self, path: &std::path::Path) -> lsm_tree::io::Result<Option<PathBuf>> {
+        self.inner.read_link(path)
+    }
+    fn hard_link(&self, src: &std::path::Path, dst: &std::path::Path) -> lsm_tree::io::Result<()> {
+        self.inner.hard_link(src, dst)
+    }
+    fn backend_id(&self) -> Option<u64> {
+        self.inner.backend_id()
+    }
+    fn capabilities(&self, path: &std::path::Path) -> lsm_tree::fs::FsCapabilities {
+        self.inner.capabilities(path)
+    }
+    fn try_disable_cow(&self, path: &std::path::Path) -> lsm_tree::io::Result<()> {
+        self.inner.try_disable_cow(path)
+    }
+    fn punch_hole(
+        &self,
+        path: &std::path::Path,
+        offset: u64,
+        len: u64,
+    ) -> lsm_tree::io::Result<()> {
+        self.inner.punch_hole(path, offset, len)
+    }
+    fn reflink_file(
+        &self,
+        src: &std::path::Path,
+        dst: &std::path::Path,
+    ) -> lsm_tree::io::Result<()> {
+        self.inner.reflink_file(src, dst)
+    }
+    fn truncate_file(&self, path: &std::path::Path) -> lsm_tree::io::Result<()> {
+        self.inner.truncate_file(path)
+    }
+    fn hard_link_count(&self, path: &std::path::Path) -> lsm_tree::io::Result<u64> {
+        self.inner.hard_link_count(path)
+    }
+    fn available_space(&self, path: &std::path::Path) -> lsm_tree::io::Result<u64> {
+        self.inner.available_space(path)
+    }
+    fn allocated_size(&self, path: &std::path::Path) -> lsm_tree::io::Result<Option<u64>> {
+        self.inner.allocated_size(path)
+    }
+    fn extent_is_hole(
+        &self,
+        path: &std::path::Path,
+        offset: u64,
+        len: u64,
+    ) -> lsm_tree::io::Result<Option<bool>> {
+        self.inner.extent_is_hole(path, offset, len)
+    }
+    fn extent_contains_hole(
+        &self,
+        path: &std::path::Path,
+        offset: u64,
+        len: u64,
+    ) -> lsm_tree::io::Result<Option<bool>> {
+        self.inner.extent_contains_hole(path, offset, len)
+    }
 }
 
 /// A blob tree whose `blobs` folder is on another volume than the tree folder
@@ -282,6 +347,143 @@ fn an_edit_dropping_a_blob_file_on_another_volume_is_synced_in_full() -> lsm_tre
         edit_syncs.last(),
         Some(&SyncMode::Full),
         "the edit dropping the blob file: {edit_syncs:?}"
+    );
+    Ok(())
+}
+
+/// A tight-space compaction restricts its input and punches the consumed
+/// prefix once the restricting edit is installed. With the tables on another
+/// volume than the manifest, a barrier on the manifest's volume would not keep
+/// the punch from reaching the tables' volume first, and a power loss could
+/// reopen the unrestricted version over punched blocks: every edit of the
+/// compaction is synced in full.
+#[test]
+fn a_tight_space_compaction_on_another_volume_syncs_its_edits_in_full() -> lsm_tree::Result<()> {
+    let recorder = lsm_tree::fs::FaultFs::new(MemFs::new());
+    let injector = recorder.injector();
+    let hot = MemFs::with_capacity(u64::MAX);
+    let base = base();
+    let any = Config::new(
+        &base,
+        SequenceNumberCounter::default(),
+        SequenceNumberCounter::default(),
+    )
+    .with_shared_fs(Arc::new(recorder) as Arc<dyn Fs>)
+    .sync_mode(SyncMode::Barrier)
+    .level_routes(vec![LevelRoute {
+        levels: 0..7,
+        path: base.join("hot"),
+        fs: Arc::new(hot.clone()),
+    }])
+    .open()?;
+    let AnyTree::Standard(tree) = any else {
+        panic!("a standard tree");
+    };
+    for i in 0..2_000u64 {
+        tree.insert(format!("key{i:08}"), vec![0xCDu8; 64], i);
+    }
+    tree.flush_active_memtable(0)?;
+    let used = tree.storage_stats()?.used_bytes;
+
+    // Too little room on the tables' volume for a full rewrite of the table:
+    // the merge is sliced, restricting the input and punching what it consumed.
+    hot.set_capacity(used + used / 4);
+    tree.update_runtime_config(|c| {
+        c.storage_admission_check = true;
+        c.storage_limit_bytes = None;
+        c.tight_space_compaction = true;
+    })?;
+    let before = injector.sync_modes_for("edits-").len();
+    tree.major_compact(64 * 1024 * 1024, 0)?;
+    assert!(hot.punched_bytes() > 0, "the compaction punched its input");
+
+    let edits = injector.sync_modes_for("edits-");
+    let compaction_edits = edits.get(before..).unwrap_or_default();
+    assert!(
+        !compaction_edits.is_empty() && compaction_edits.iter().all(|&mode| mode == SyncMode::Full),
+        "the edits of a compaction punching another volume are synced in full: {compaction_edits:?}"
+    );
+    Ok(())
+}
+
+/// The blob-file twin: a tight-space defragmentation moves a stale blob
+/// file's live data start and punches the relocated prefix once the edit is
+/// installed. With the blobs folder on its own volume, every edit of that
+/// compaction is synced in full.
+#[test]
+fn a_tight_space_blob_defrag_on_another_volume_syncs_its_edits_in_full() -> lsm_tree::Result<()> {
+    // High-entropy values, so the relocation transient is real and the gate
+    // slices the merge.
+    let value = |i: u64, generation: u8| -> Vec<u8> {
+        let mut s = (i + 1).wrapping_mul(0x9E37_79B9_7F4A_7C15) ^ (u64::from(generation) << 1);
+        (0..200u32)
+            .map(|_| {
+                s ^= s << 13;
+                s ^= s >> 7;
+                s ^= s << 17;
+                (s >> 24) as u8
+            })
+            .collect()
+    };
+    let mem = MemFs::with_capacity(u64::MAX);
+    let recorder = lsm_tree::fs::FaultFs::new(mem.clone());
+    let injector = recorder.injector();
+    let fs = NestedFs::new(Arc::new(recorder), "blobs");
+    let any = Config::new(
+        base(),
+        SequenceNumberCounter::default(),
+        SequenceNumberCounter::default(),
+    )
+    .with_shared_fs(Arc::clone(&fs) as Arc<dyn Fs>)
+    .sync_mode(SyncMode::Barrier)
+    .with_kv_separation(Some(
+        lsm_tree::KvSeparationOptions::default()
+            .separation_threshold(64)
+            .age_cutoff(1.0)
+            .staleness_threshold(0.1)
+            .file_target_size(48 * 1024),
+    ))
+    .open()?;
+    let AnyTree::Blob(tree) = any else {
+        panic!("a blob tree");
+    };
+    let n = 4_000u64;
+    for i in 0..n {
+        tree.insert(format!("key{i:08}"), value(i, 1), i);
+    }
+    tree.flush_active_memtable(0)?;
+    // Overwriting the even keys leaves every first-generation blob file about
+    // half dead, which a merge learns.
+    for i in (0..n).step_by(2) {
+        tree.insert(format!("key{i:08}"), value(i, 2), n + i);
+    }
+    tree.flush_active_memtable(0)?;
+    let gc_watermark = 4 * n;
+    tree.index.update_runtime_config(|c| {
+        c.storage_admission_check = true;
+        c.storage_limit_bytes = None;
+    })?;
+    tree.major_compact(64 * 1024 * 1024, gc_watermark)?;
+
+    let used = tree.storage_stats()?.used_bytes;
+    mem.set_capacity(used + used / 4);
+    tree.index.update_runtime_config(|c| {
+        c.tight_space_compaction = true;
+    })?;
+    let punched_before = mem.punched_bytes();
+    let before = injector.sync_modes_for("edits-").len();
+    tree.major_compact(64 * 1024 * 1024, gc_watermark)?;
+    assert!(
+        mem.punched_bytes() > punched_before,
+        "the defragmentation punched relocated blob prefixes"
+    );
+
+    let edits = injector.sync_modes_for("edits-");
+    let compaction_edits = edits.get(before..).unwrap_or_default();
+    assert!(
+        !compaction_edits.is_empty() && compaction_edits.iter().all(|&mode| mode == SyncMode::Full),
+        "the edits of a defragmentation punching the blobs volume are synced in full: \
+         {compaction_edits:?}"
     );
     Ok(())
 }

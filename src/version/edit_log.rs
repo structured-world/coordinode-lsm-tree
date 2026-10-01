@@ -75,9 +75,9 @@ pub fn append_edit(
         crate::file::fsync_directory(crate::file::entry_directory(path), fs, sync_mode)?;
     }
     super::framing::write_frame(&mut file, scratch)?;
-    // POSIX fdatasync also flushes the metadata a later read of the data
-    // needs, the file size among it, which is all replay reads; the log's
-    // name is covered by the directory sync above.
+    // `sync_data` persists the file size with the data (its contract, POSIX
+    // `fdatasync`), which is all replay reads; the log's name is covered by
+    // the directory sync above.
     file.sync_data_with(sync_mode).map_err(crate::Error::from)?;
     // The framing header (u32 len + u64 XXH3) precedes the payload on disk.
     let appended = u64::try_from(super::framing::FRAME_HEADER_LEN + scratch.len())

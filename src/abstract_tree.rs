@@ -470,7 +470,10 @@ pub trait AbstractTree: sealed::Sealed {
     /// it, in sealing order, including one another thread began flushing: the
     /// call waits for that flush and, should it fail, flushes the memtable
     /// itself. A caller may release the journal entries those memtables hold
-    /// once the call returns `Ok`.
+    /// once the call returns `Ok`; under
+    /// [`SyncMode::Barrier`](crate::fs::SyncMode::Barrier) the writes are only
+    /// ordered then, and the entries may go once
+    /// [`sync_devices`](Self::sync_devices) has returned `Ok` too.
     ///
     /// `gc_watermark` has the meaning documented at
     /// [`major_compact`](Self::major_compact); pass `0` to collect nothing.
@@ -493,7 +496,8 @@ pub trait AbstractTree: sealed::Sealed {
     /// )
     /// .open()?;
     /// tree.insert("key", "value", 0);
-    /// // The write is on disk now: a journal that holds it can drop it.
+    /// // The write is on disk now (the default sync mode is not `Barrier`): a
+    /// // journal that holds it can drop it.
     /// tree.flush_active_memtable(0)?;
     /// assert_eq!(tree.table_count(), 1);
     /// # Ok::<(), lsm_tree::Error>(())

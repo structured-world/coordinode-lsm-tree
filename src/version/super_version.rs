@@ -77,10 +77,11 @@ fn same_device(fs: &dyn Fs, path: &Path, other_fs: &dyn Fs, other: &Path) -> boo
 
 /// The sync mode the manifest edit from `prior` to `next` is persisted with.
 /// Under [`SyncMode::Barrier`] an edit that drops a table or a blob file on
-/// another device than the manifest at `tree_path` is synced in full: the
-/// dropped file is removed once the edit is installed, and a barrier on the
-/// manifest's device would not keep that removal from reaching its own device
-/// first.
+/// another device than the manifest at `tree_path`, or narrows one there (a
+/// table's restriction, a blob file's live data start), is synced in full: the
+/// file is removed or its consumed prefix punched once the edit is installed,
+/// and a barrier on the manifest's device would not keep that change from
+/// reaching the file's own device first.
 fn manifest_sync_mode(
     prior: &Version,
     next: &Version,
@@ -95,17 +96,24 @@ fn manifest_sync_mode(
         path.parent()
             .is_none_or(|folder| !same_device(fs, folder, manifest_fs, tree_path))
     };
-    let kept: crate::HashSet<crate::TableId> = next.iter_tables().map(crate::Table::id).collect();
-    let drops_table_elsewhere = prior
+    let kept: crate::HashMap<crate::TableId, Option<&crate::UserKey>> = next
         .iter_tables()
-        .any(|table| !kept.contains(&table.id()) && elsewhere(&*table.fs, &table.path));
-    let drops_blob_file_elsewhere = || {
+        .map(|table| (table.id(), table.restrict_lower_bound()))
+        .collect();
+    let mutates_table_elsewhere = prior.iter_tables().any(|table| {
+        kept.get(&table.id())
+            .is_none_or(|&bound| bound != table.restrict_lower_bound())
+            && elsewhere(&*table.fs, &table.path)
+    });
+    let mutates_blob_file_elsewhere = || {
         prior.blob_files.iter().any(|blob_file| {
-            !next.blob_files.contains_key(blob_file.id())
+            next.blob_files
+                .get(blob_file.id())
+                .is_none_or(|kept| kept.live_data_start() != blob_file.live_data_start())
                 && elsewhere(&*blob_file.0.fs, &blob_file.0.path)
         })
     };
-    if drops_table_elsewhere || drops_blob_file_elsewhere() {
+    if mutates_table_elsewhere || mutates_blob_file_elsewhere() {
         SyncMode::Full
     } else {
         sync_mode

@@ -406,7 +406,16 @@ pub(crate) fn salvage_with_context(
     if diverged == MirrorDivergence::Agree {
         // No arbitration: write directly to `dest`. There is no second attempt,
         // so `dest` is never a live intermediate another process could replace.
-        return salvage_attempt(source, dest, fs, comparator, options, false, true);
+        let report = salvage_attempt(source, dest, fs, comparator, options, false, true)?;
+        // No publish follows to sync the new name, so it is synced here, as
+        // the publish does: a failure removes the copy and propagates.
+        if let Some(written) = &report.salvaged_path
+            && let Err(e) = fs.sync_directory_with(entry_directory(written), options.sync_mode)
+        {
+            discard_partial(fs, written);
+            return Err(e.into());
+        }
+        return Ok(report);
     }
     if diverged == MirrorDivergence::NonDerivable {
         // The mirrors disagree in a field the walk cannot re-derive and nothing
@@ -2772,7 +2781,8 @@ fn salvage_blocks(
         for link in links {
             writer.link_blob_file(link);
         }
-        // The publish syncs the destination's directory after its rename.
+        // The caller syncs the destination's directory: the publish after its
+        // rename, or the direct path once the attempt returns.
         writer.finish_deferring_dir_sync()?;
     } else {
         drop(writer);

@@ -421,7 +421,11 @@ pub trait FsFile: Read + Write + Seek + Send + Sync {
     /// Returns an I/O error if the sync operation fails.
     fn sync_all(&self) -> io::Result<()>;
 
-    /// Flushes file data (but not necessarily metadata) to durable storage.
+    /// Flushes file data, and the metadata a later read of that data needs
+    /// (the file size), to durable storage; other metadata (timestamps) need
+    /// not be. This is POSIX `fdatasync` (IEEE Std 1003.1, "synchronized I/O
+    /// data integrity completion"), and the engine relies on it: an appended
+    /// log is synced this way, and a size left behind would lose the append.
     ///
     /// Equivalent to [`sync_data_with`](Self::sync_data_with) with
     /// [`SyncMode::Full`].
@@ -446,7 +450,8 @@ pub trait FsFile: Read + Write + Seek + Send + Sync {
         self.sync_all()
     }
 
-    /// Flushes file data at the requested durability [`SyncMode`].
+    /// Flushes file data, and the file size, at the requested durability
+    /// [`SyncMode`], with the same contract as [`sync_data`](Self::sync_data).
     ///
     /// The default implementation ignores `mode` and delegates to
     /// [`sync_data`](Self::sync_data).
