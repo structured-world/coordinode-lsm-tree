@@ -575,6 +575,75 @@ fn an_unreadable_older_table_behind_a_ceiling_hit_does_not_fail_the_batch() -> l
     Ok(())
 }
 
+/// A level whose batched read fails after an earlier chunk answered some of
+/// its keys is read serially as if nothing had been answered: a key the newer
+/// level-0 table holds at the read's ceiling still skips the older table, so
+/// one unreadable data block there fails neither the key nor the batch.
+#[test]
+fn a_batched_read_failing_after_a_ceiling_hit_was_answered_does_not_fail_the_batch()
+-> lsm_tree::Result<()> {
+    use lsm_tree::fs::{Fault, FaultFs, FaultOp, FaultRule};
+
+    let dir = tempfile::tempdir()?;
+    let config = |fs: Arc<dyn Fs>| {
+        Config::new(
+            dir.path(),
+            SequenceNumberCounter::default(),
+            SequenceNumberCounter::default(),
+        )
+        .with_shared_fs(fs)
+        // A cache that keeps nothing reads every data block in its own chunk.
+        .use_cache(Arc::new(Cache::with_capacity_bytes(0)))
+        .filter_block_pinning_policy(PinningPolicy::all(false))
+        .index_block_pinning_policy(PinningPolicy::all(false))
+    };
+    let older = {
+        let tree = config(Arc::new(StdFs)).open()?;
+        tree.insert("k", "old", 1);
+        tree.flush_active_memtable(0)?;
+        let older = std::fs::read_dir(dir.path().join("tables"))?
+            .filter_map(Result::ok)
+            .map(|entry| entry.path())
+            .find(|path| path.is_file())
+            .expect("the first flush wrote a table");
+        tree.insert("h", "new", 2);
+        tree.insert("j", "new", 3);
+        tree.insert("k", "new", 4);
+        tree.flush_active_memtable(0)?;
+        older
+    };
+    let faulty = FaultFs::new(StdFs);
+    let injector = faulty.injector();
+    let tree = config(Arc::new(faulty)).open()?;
+
+    // Read at the newest version's ceiling: nothing older can beat it.
+    let keys = ["h", "j", "k"];
+    let one: Vec<Option<Slice>> = keys
+        .iter()
+        .map(|key| tree.get(key, 5))
+        .collect::<lsm_tree::Result<_>>()?;
+    assert_eq!(one[2].as_deref(), Some(&b"new"[..]), "a point read answers");
+    // The older table becomes unreadable from each of its reads in turn: its
+    // filter, its index and the data block holding its version of `k`.
+    for skip in 0..4 {
+        injector.arm(
+            FaultRule::new(
+                FaultOp::ReadAt,
+                Fault::Error(io::ErrorKind::PermissionDenied),
+            )
+            .on_path(older.display().to_string())
+            .skip(skip),
+        );
+        let values = tree.multi_get(keys, 5);
+        injector.clear();
+        assert!(
+            values.as_ref().is_ok_and(|values| *values == one),
+            "unreadable from read {skip} of the older table: {values:?}"
+        );
+    }
+    Ok(())
+}
+
 /// A read that fails at any point of a cold level read hands the tables it
 /// was for, or the level, to the serial path, which answers the filters
 /// again: what the filters answered is counted once, as in a batch nothing

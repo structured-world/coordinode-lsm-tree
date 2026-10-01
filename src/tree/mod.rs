@@ -4066,6 +4066,13 @@ impl Tree {
         comparator: &dyn crate::comparator::UserComparator,
         results: &mut [Option<InternalValue>],
     ) -> bool {
+        // The keys still to resolve have no answer yet, so a level handed back
+        // is restored by clearing theirs.
+        debug_assert!(
+            still_remaining
+                .iter()
+                .all(|&(idx, _)| results[idx].is_none())
+        );
         // A table that cannot be planned may be one the serial resolve never
         // reads: a key an earlier level-0 run holds at the read's ceiling skips
         // the later runs. The serial resolve reads the level in that order and
@@ -4148,9 +4155,10 @@ impl Tree {
             // A batch the backend refuses, or reports read without filling,
             // hands the level to the serial resolve, which reads the same
             // blocks one by one and surfaces its own failure: the level is
-            // answered either way, never skipped for a lower one. What this
-            // resolve already found are this level's own versions, which the
-            // serial resolve finds again.
+            // answered either way, never skipped for a lower one. What earlier
+            // chunks answered is cleared first: the serial resolve reads the
+            // level from no answer, and on level 0 a key it finds at the read's
+            // ceiling only skips the older runs when it sets that answer itself.
             if let Err(error) = Self::resolve_block_task_chunk(
                 &tasks[start..end],
                 &cached[start..end],
@@ -4160,6 +4168,9 @@ impl Tree {
                 found.as_mut(),
             ) {
                 log::debug!("a batched level read failed, the level is read serially: {error}");
+                for &(idx, _) in still_remaining.iter() {
+                    results[idx] = None;
+                }
                 return false;
             }
             start = end;
