@@ -11,6 +11,12 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 
 ## [Unreleased]
 
+## [5.11.12](https://github.com/structured-world/coordinode-lsm-tree/compare/v5.11.11...v5.11.12) - 2026-10-01
+
+### Fixed
+
+- *(test-fs)* share durable images across hard links, follow symlinks ([#761](https://github.com/structured-world/coordinode-lsm-tree/pull/761))
+
 ## [5.11.11](https://github.com/structured-world/coordinode-lsm-tree/compare/v5.11.10...v5.11.11) - 2026-10-01
 
 ### Testing
