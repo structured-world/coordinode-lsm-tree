@@ -658,8 +658,13 @@ impl Fs for CrashFs {
         // operation can have made `from` again since the rename, and the
         // inner backend is the disk this simulates, so its answer is the
         // truth: a fault layer composes above the simulator, never below it.
-        // A probe that fails is read as an ordinary rename.
-        if from == to || matches!(self.inner.exists(from), Ok(true)) {
+        // A probe that fails is read as an ordinary rename. A symlink source
+        // is still there when the link itself is, whether or not it points
+        // anywhere, so the entry is asked about before what it points to.
+        if from == to
+            || matches!(self.inner.read_link(from), Ok(Some(_)))
+            || matches!(self.inner.exists(from), Ok(true))
+        {
             return Ok(());
         }
         let (from, to) = (self.name_after(from), self.name_after(to));
