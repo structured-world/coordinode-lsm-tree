@@ -275,6 +275,9 @@ impl Fs for StdFs {
     }
 
     fn read_link(&self, path: &Path) -> io::Result<Option<PathBuf>> {
+        // On Windows `is_symlink` is true for every name-surrogate reparse
+        // point, a junction (`IO_REPARSE_TAG_MOUNT_POINT`) included, and
+        // `std::fs::read_link` reads both tags.
         match std::fs::symlink_metadata(path) {
             Ok(meta) if meta.file_type().is_symlink() => {
                 std::fs::read_link(path).map(Some).map_err(io::Error::from)
