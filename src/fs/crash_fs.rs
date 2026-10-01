@@ -343,19 +343,22 @@ impl CrashFs {
     /// The entry a write through `path` lands on, resolved on the backend.
     fn entry_of(&self, path: &Path) -> io::Result<PathBuf> {
         let mut entry = path.to_path_buf();
-        for _ in 0..MAX_SYMLINKS {
-            let Some(target) = self.inner.read_link(&entry)? else {
-                return Ok(entry);
-            };
+        let mut followed = 0;
+        // MAX_SYMLINKS links are followed; only a link past them is refused.
+        while let Some(target) = self.inner.read_link(&entry)? {
+            if followed == MAX_SYMLINKS {
+                return Err(io::Error::new(
+                    io::ErrorKind::InvalidInput,
+                    "too many levels of symbolic links",
+                ));
+            }
+            followed += 1;
             entry = match entry.parent() {
                 Some(directory) if target.is_relative() => directory.join(target),
                 _ => target,
             };
         }
-        Err(io::Error::new(
-            io::ErrorKind::InvalidInput,
-            "too many levels of symbolic links",
-        ))
+        Ok(entry)
     }
 
     /// Records that `path` got a new directory entry, durable once its parent
@@ -582,9 +585,12 @@ impl Fs for CrashFs {
         // through either name makes the other's bytes durable too; on one
         // where it is a copy (`MemFs`), each name keeps its own image. Asked
         // only while entries are tracked, so the wrapper otherwise makes no
-        // call the backend would not have seen.
+        // call the backend would not have seen. The link is made: a probe
+        // that cannot answer (a dangling symlink linked as itself has no file
+        // to compare) does not turn it into a failure the caller could not
+        // retry, and leaves the names separate.
         let tracking = self.state.lock().track_entries;
-        if tracking && self.inner.same_file(src, dst)? {
+        if tracking && matches!(self.inner.same_file(src, dst), Ok(true)) {
             let mut state = self.state.lock();
             state.link(src, dst);
             // The image `dst` took is the one file's, `src`'s baseline

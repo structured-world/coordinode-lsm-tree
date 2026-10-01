@@ -297,6 +297,55 @@ fn a_linked_pre_existing_file_keeps_its_durable_bytes() {
     assert_eq!(read(&fs, link.to_str().unwrap()), b"durable");
 }
 
+/// A write follows as many symlinks as Linux does, `MAX_SYMLINKS`, and the
+/// chain ends at the entry past the last of them; one more link than that is
+/// refused, as the kernel refuses it with `ELOOP`.
+#[cfg(unix)]
+#[test]
+fn a_write_follows_as_many_symlinks_as_linux_and_no_more() {
+    let dir = tempfile::tempdir().unwrap();
+    let fs = CrashFs::new(crate::fs::StdFs);
+    let target = dir.path().join("target");
+    // link{i} -> link{i+1}, the last of them -> target.
+    let chain = |links: usize| -> std::path::PathBuf {
+        for i in 0..links {
+            let next = if i + 1 == links {
+                String::from("target")
+            } else {
+                format!("link{}-{}", links, i + 1)
+            };
+            std::os::unix::fs::symlink(next, dir.path().join(format!("link{links}-{i}"))).unwrap();
+        }
+        dir.path().join(format!("link{links}-0"))
+    };
+
+    let at_the_limit = chain(MAX_SYMLINKS);
+    assert_eq!(fs.entry_of(&at_the_limit).unwrap(), target);
+    let past_the_limit = chain(MAX_SYMLINKS + 1);
+    let error = fs.entry_of(&past_the_limit).unwrap_err();
+    assert_eq!(error.kind(), ErrorKind::InvalidInput);
+}
+
+/// Hard-linking a dangling symlink links the symlink itself (Linux
+/// `linkat(2)` without `AT_SYMLINK_FOLLOW`): the link the backend made is
+/// reported as made, though no file stands behind it to compare.
+#[cfg(target_os = "linux")]
+#[test]
+fn hard_linking_a_dangling_symlink_succeeds() {
+    let dir = tempfile::tempdir().unwrap();
+    let fs = CrashFs::new(crate::fs::StdFs).tracking_directory_entries();
+    let link = dir.path().join("link");
+    let alias = dir.path().join("alias");
+    std::os::unix::fs::symlink("missing", &link).unwrap();
+    fs.sync_directory(dir.path()).unwrap();
+
+    fs.hard_link(&link, &alias).unwrap();
+    assert!(
+        std::fs::symlink_metadata(&alias).is_ok(),
+        "the backend made it"
+    );
+}
+
 /// An open that creates through a dangling symlink makes the symlink's
 /// target, not the symlink: the target is the new entry, lost on a crash
 /// before its directory is synced, and the symlink, already durable, stays.
