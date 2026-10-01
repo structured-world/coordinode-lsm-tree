@@ -575,6 +575,52 @@ fn an_unreadable_older_table_behind_a_ceiling_hit_does_not_fail_the_batch() -> l
     Ok(())
 }
 
+/// A read that fails at any point of a cold level read hands the tables it
+/// was for, or the level, to the serial path, which answers the filters
+/// again: what the filters answered is counted once, as in a batch nothing
+/// failed in.
+#[cfg(feature = "metrics")]
+#[test]
+fn a_read_failing_at_any_stage_counts_the_filters_once() -> lsm_tree::Result<()> {
+    use lsm_tree::fs::{Fault, FaultFs, FaultOp, FaultRule};
+
+    let counted = |skip: Option<u64>| -> lsm_tree::Result<(usize, usize, usize)> {
+        let dir = tempfile::tempdir()?;
+        let faulty = FaultFs::new(StdFs);
+        let injector = faulty.injector();
+        let fs: Arc<dyn Fs> = Arc::new(faulty);
+        let (tree, keys) = tree_on(dir.path(), Shape::Partitioned, 4, LARGE_CACHE, &fs)?;
+        if let Some(skip) = skip {
+            injector.arm(
+                FaultRule::new(
+                    FaultOp::ReadAt,
+                    Fault::Error(io::ErrorKind::PermissionDenied),
+                )
+                .skip(skip)
+                .once(),
+            );
+        }
+        let metrics = tree.metrics();
+        let (queries, skips) = (metrics.filter_queries(), metrics.io_skipped_by_filter());
+        let reads = injector.read_count();
+        tree.multi_get(&keys, SeqNo::MAX)?;
+        let count = injector.read_count() - reads;
+        injector.clear();
+        Ok((
+            metrics.filter_queries() - queries,
+            metrics.io_skipped_by_filter() - skips,
+            count,
+        ))
+    };
+    let (queries, skips, count) = counted(None)?;
+    assert!(skips > 0, "some key of the batch is filtered out");
+    for skip in 0..count as u64 {
+        let (q, s, _) = counted(Some(skip))?;
+        assert_eq!((q, s), (queries, skips), "read {skip} of {count} failed");
+    }
+    Ok(())
+}
+
 /// A key the filter lets through that the read finds no version of is a
 /// filter query, as a point read counts one: the batch counts the same
 /// queries as the keys read one by one.

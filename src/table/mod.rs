@@ -34,6 +34,8 @@ pub(crate) mod row_group;
 mod scanner;
 pub(crate) mod seqno_bounds;
 pub(crate) mod staged;
+// Reached through the doc-hidden `table` module by the crate's own tools; it
+// carries no stability promise, and its items change with the read path.
 pub mod util;
 pub mod writer;
 pub(crate) mod zone_map;
@@ -6570,11 +6572,12 @@ impl Table {
             .collect())
     }
 
-    /// Loads the filter block (if any) and checks the bloom filter.
+    /// Loads the filter block (if any) and checks the bloom filter, counting
+    /// nothing.
     ///
-    /// Returns `Ok(BloomResult::Skip)` if the bloom filter says the key is definitely absent
-    /// (and updates metrics accordingly), `Ok(BloomResult::Proceed { has_filter })` otherwise.
-    fn check_bloom(&self, key: &[u8], key_hash: u64) -> crate::Result<BloomResult> {
+    /// Returns `Ok(BloomResult::Skip)` if the bloom filter says the key is definitely absent,
+    /// `Ok(BloomResult::Proceed { has_filter })` otherwise.
+    fn judge_bloom(&self, key: &[u8], key_hash: u64) -> crate::Result<BloomResult> {
         debug_assert_eq!(
             key_hash,
             crate::hash::hash64(key),
@@ -6582,8 +6585,8 @@ impl Table {
         );
 
         match self.filter_source(key) {
-            FilterSource::None => self.answer_bloom(None, key_hash),
-            FilterSource::Pinned(block) => self.answer_bloom(Some(block), key_hash),
+            FilterSource::None => Self::answer_bloom(None, key_hash),
+            FilterSource::Pinned(block) => Self::answer_bloom(Some(block), key_hash),
             FilterSource::Block(handle) => {
                 let block = self.load_block(
                     &handle,
@@ -6592,12 +6595,34 @@ impl Table {
                     #[cfg(zstd_any)]
                     None,
                 )?;
-                self.answer_bloom(Some(&FilterBlock::new(block)), key_hash)
+                Self::answer_bloom(Some(&FilterBlock::new(block)), key_hash)
             }
-            FilterSource::PastPartitions => Ok(self.past_partitions()),
+            FilterSource::PastPartitions => Ok(BloomResult::PastPartitions),
             FilterSource::UnpinnedPartitions => {
                 unimplemented!("unpinned filter TLI not supported")
             }
+        }
+    }
+
+    /// [`Self::judge_bloom`], counted at once in the global metrics, as a
+    /// point read counts its filter answers.
+    fn check_bloom(&self, key: &[u8], key_hash: u64) -> crate::Result<BloomResult> {
+        let answer = self.judge_bloom(key, key_hash)?;
+        #[cfg(feature = "metrics")]
+        if answer.should_skip() {
+            use core::sync::atomic::Ordering::Relaxed;
+            self.metrics.filter_queries.fetch_add(1, Relaxed);
+            self.metrics.io_skipped_by_filter.fetch_add(1, Relaxed);
+        }
+        Ok(answer)
+    }
+
+    /// Adds `answer` to `tally`, counted when the plan holding it is.
+    fn tally_bloom(tally: &mut crate::table::probe_stats::PlanCounts, answer: &BloomResult) {
+        tally.probes += answer.probe_counts();
+        if answer.should_skip() {
+            tally.filter_queries += 1;
+            tally.filter_skips += 1;
         }
     }
 
@@ -6629,43 +6654,13 @@ impl Table {
         }
     }
 
-    /// The answer for a key sorting past the last filter partition, counted
-    /// as a filter skip.
-    #[cfg_attr(
-        not(feature = "metrics"),
-        expect(clippy::unused_self, reason = "self carries the metrics-only counters")
-    )]
-    fn past_partitions(&self) -> BloomResult {
-        #[cfg(feature = "metrics")]
-        {
-            use core::sync::atomic::Ordering::Relaxed;
-            self.metrics.filter_queries.fetch_add(1, Relaxed);
-            self.metrics.io_skipped_by_filter.fetch_add(1, Relaxed);
-        }
-        BloomResult::PastPartitions
-    }
-
     /// The answer of `filter` (none: nothing rules the key out) for a key
-    /// hashing to `key_hash`, a skip counted as one.
-    #[cfg_attr(
-        not(feature = "metrics"),
-        expect(clippy::unused_self, reason = "self carries the metrics-only counters")
-    )]
-    fn answer_bloom(
-        &self,
-        filter: Option<&FilterBlock>,
-        key_hash: u64,
-    ) -> crate::Result<BloomResult> {
+    /// hashing to `key_hash`, counting nothing.
+    fn answer_bloom(filter: Option<&FilterBlock>, key_hash: u64) -> crate::Result<BloomResult> {
         let Some(filter) = filter else {
             return Ok(BloomResult::Proceed { has_filter: false });
         };
         if !filter.maybe_contains_hash(key_hash)? {
-            #[cfg(feature = "metrics")]
-            {
-                use core::sync::atomic::Ordering::Relaxed;
-                self.metrics.filter_queries.fetch_add(1, Relaxed);
-                self.metrics.io_skipped_by_filter.fetch_add(1, Relaxed);
-            }
             return Ok(BloomResult::Skip);
         }
         Ok(BloomResult::Proceed { has_filter: true })
@@ -7464,7 +7459,7 @@ impl Table {
         &self,
         sorted_keys: &[(&[u8], u64)],
         seqno: SeqNo,
-        mut tally: Option<&mut crate::table::probe_stats::ProbeCounts>,
+        tally: &mut crate::table::probe_stats::PlanCounts,
     ) -> crate::Result<Option<(Vec<usize>, block_index::BlockIndexIterImpl, SeqNo)>> {
         if sorted_keys.is_empty() {
             return Ok(None);
@@ -7478,10 +7473,10 @@ impl Table {
         }
         let mut passing: Vec<usize> = Vec::with_capacity(sorted_keys.len());
         for (i, (key, hash)) in sorted_keys.iter().enumerate() {
-            let bloom = self.check_bloom(key, *hash)?;
-            if let Some(tally) = tally.as_deref_mut() {
-                *tally += bloom.probe_counts();
-            }
+            // Counted with the plan, not here: a level handed to the serial
+            // resolve is probed and counted there.
+            let bloom = self.judge_bloom(key, *hash)?;
+            Self::tally_bloom(tally, &bloom);
             if !bloom.should_skip() {
                 passing.push(i);
             }
@@ -7494,9 +7489,7 @@ impl Table {
             .forward_reader(sorted_keys[passing[0]].0, table_seqno)
         else {
             // Every passed key lies past the last block: none is held.
-            if let Some(tally) = tally {
-                self.tally_blockless(tally, table_seqno, passing.len());
-            }
+            self.tally_blockless(tally, table_seqno, passing.len());
             return Ok(None);
         };
         Ok(Some((passing, block_iter, table_seqno)))
@@ -7508,19 +7501,16 @@ impl Table {
     /// reached the table, as a point read counts one.
     pub(crate) fn tally_blockless(
         &self,
-        tally: &mut crate::table::probe_stats::ProbeCounts,
+        tally: &mut crate::table::probe_stats::PlanCounts,
         table_seqno: SeqNo,
         keys: usize,
     ) {
         if !self.has_filter() {
             return;
         }
-        #[cfg(feature = "metrics")]
-        self.metrics
-            .filter_queries
-            .fetch_add(keys, core::sync::atomic::Ordering::Relaxed);
+        tally.filter_queries += keys;
         if table_seqno > self.metadata.seqnos.1 {
-            tally.negatives += keys as u64;
+            tally.probes.negatives += keys as u64;
         }
     }
 
@@ -7608,11 +7598,12 @@ impl Table {
     ///
     /// # Errors
     ///
-    /// Propagates a bloom-probe ([`Table::check_bloom`]) or table-open failure.
+    /// Propagates a bloom-probe or table-open failure.
     ///
-    /// The filter answers are added to `tally`: the chunked resolve counts
-    /// them once it answers from its plan, and not when it hands the level to
-    /// the serial resolve, which probes the same filters again.
+    /// The filter answers, and the filter queries and skips they make, are
+    /// added to `tally`: the chunked resolve counts them once it answers from
+    /// its plan, and not when it hands the level to the serial resolve, which
+    /// probes the same filters again.
     #[expect(
         clippy::indexing_slicing,
         reason = "`passing` positions index into `sorted_keys` (< its len); `passing[p]` \
@@ -7622,10 +7613,10 @@ impl Table {
         &self,
         sorted_keys: &[(&[u8], u64)],
         seqno: SeqNo,
-        tally: &mut crate::table::probe_stats::ProbeCounts,
+        tally: &mut crate::table::probe_stats::PlanCounts,
     ) -> crate::Result<Option<BlockTaskPlan>> {
         let Some((passing, mut block_iter, table_seqno)) =
-            self.plan_block_walk_setup(sorted_keys, seqno, Some(tally))?
+            self.plan_block_walk_setup(sorted_keys, seqno, tally)?
         else {
             return Ok(None);
         };
@@ -9860,6 +9851,22 @@ impl Table {
     pub(crate) fn count_probes(&self, counts: crate::table::probe_stats::ProbeCounts) {
         if let Some(stats) = self.probe_stats() {
             stats.add(counts);
+        }
+    }
+
+    /// Counts what a batched read tallied while planning, once it answers
+    /// from that plan: the probes, and the filter queries and skips.
+    pub(crate) fn count_plan(&self, counts: crate::table::probe_stats::PlanCounts) {
+        self.count_probes(counts.probes);
+        #[cfg(feature = "metrics")]
+        {
+            use core::sync::atomic::Ordering::Relaxed;
+            self.metrics
+                .filter_queries
+                .fetch_add(counts.filter_queries, Relaxed);
+            self.metrics
+                .io_skipped_by_filter
+                .fetch_add(counts.filter_skips, Relaxed);
         }
     }
 

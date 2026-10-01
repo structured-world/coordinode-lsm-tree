@@ -13,7 +13,7 @@ type Asked = Vec<(BlockType, u64)>;
 
 /// A staged read's plan (snapshot, data blocks with their keys, filter
 /// answers) and what it asked for.
-type Driven = (SeqNo, Vec<(BlockHandle, Vec<usize>)>, ProbeCounts, Asked);
+type Driven = (SeqNo, Vec<(BlockHandle, Vec<usize>)>, PlanCounts, Asked);
 
 /// A table shape: its name, how the writer is set up, and whether the filter
 /// and the index are pinned.
@@ -173,7 +173,7 @@ fn a_staged_read_plans_what_the_serial_planner_plans() -> crate::Result<()> {
     for (name, shape, pin_filter, pin_index) in shapes() {
         let dir = tempdir()?;
         let serial_table = table(dir.path(), shape, pin_filter, pin_index, 1_000_000);
-        let mut serial_tally = ProbeCounts::default();
+        let mut serial_tally = PlanCounts::default();
         let (_, serial_seqno, _, serial_blocks) = serial_table
             .plan_block_tasks(&keys, SeqNo::MAX, &mut serial_tally)?
             .expect("keys in range");
@@ -266,7 +266,7 @@ fn a_sparse_serial_read_loads_only_the_index_partitions_its_keys_fall_in() -> cr
     let table = table(dir.path(), many_partitions, true, false, 0);
 
     let before = table.metrics.index_block_load_count();
-    table.plan_block_tasks(&keys, SeqNo::MAX, &mut ProbeCounts::default())?;
+    table.plan_block_tasks(&keys, SeqNo::MAX, &mut PlanCounts::default())?;
     let planned = table.metrics.index_block_load_count() - before;
     assert!(
         planned <= 3,
@@ -292,7 +292,7 @@ fn a_sparse_batch_reads_only_the_index_partitions_its_keys_fall_in() -> crate::R
 
     let dir = tempdir()?;
     let serial_table = table(dir.path(), many_partitions, true, false, 0);
-    let mut serial_tally = ProbeCounts::default();
+    let mut serial_tally = PlanCounts::default();
     let (_, _, _, serial_blocks) = serial_table
         .plan_block_tasks(&keys, SeqNo::MAX, &mut serial_tally)?
         .expect("keys in range");

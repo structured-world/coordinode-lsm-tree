@@ -3039,7 +3039,7 @@ fn plan_block_tasks_propagates_a_faulted_bloom_probe() -> crate::Result<()> {
 
     let key = b"key0000".as_slice();
     let sorted = [(key, hash64(key))];
-    let mut tally = crate::table::probe_stats::ProbeCounts::default();
+    let mut tally = crate::table::probe_stats::PlanCounts::default();
     let result = table.plan_block_tasks(&sorted, SeqNo::MAX, &mut tally);
 
     // The serial path propagates a bloom-probe error via `?`; the chunked planner
@@ -3101,7 +3101,7 @@ fn plan_block_tasks_propagates_a_faulted_index_read() -> crate::Result<()> {
 
     let key = b"key000250".as_slice();
     let sorted = [(key, hash64(key))];
-    let mut tally = crate::table::probe_stats::ProbeCounts::default();
+    let mut tally = crate::table::probe_stats::PlanCounts::default();
     let result = table.plan_block_tasks(&sorted, SeqNo::MAX, &mut tally);
 
     // batch_get propagates the same iterator error via `?`; the chunked planner
@@ -3161,7 +3161,7 @@ fn plan_block_tasks_returns_none_for_a_table_above_the_snapshot() -> crate::Resu
     let sorted = [(key, hash64(key))];
     // Read seqno 5 is below the table's lowest seqno (10): entirely above the
     // snapshot. Ok(None) despite the armed read fault proves the no-read path.
-    let mut tally = crate::table::probe_stats::ProbeCounts::default();
+    let mut tally = crate::table::probe_stats::PlanCounts::default();
     assert!(table.plan_block_tasks(&sorted, 5, &mut tally)?.is_none());
     Ok(())
 }

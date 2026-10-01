@@ -18,7 +18,7 @@ use alloc::vec::Vec;
 
 use super::block_index::{BlockIndexImpl, iter::OwnedIndexBlockIter};
 use super::filter::block::FilterBlock;
-use super::probe_stats::ProbeCounts;
+use super::probe_stats::PlanCounts;
 use super::{Block, BlockHandle, BlockType, FilterSource, IndexBlock, KeyedBlockHandle, Table};
 use crate::SeqNo;
 
@@ -58,8 +58,8 @@ pub struct StagedRead<'t> {
     need: Vec<BlockHandle>,
     /// The blocks held, by their offset in the table file.
     held: Vec<(u64, Block)>,
-    /// What the filters answered.
-    tally: ProbeCounts,
+    /// What the filters answered, counted once the plan is.
+    tally: PlanCounts,
     /// Once planned: each data block and the positions of the keys in it.
     blocks: Vec<(BlockHandle, Vec<usize>)>,
 }
@@ -91,7 +91,7 @@ impl<'t> StagedRead<'t> {
             passing: (0..sorted_keys.len()).collect(),
             need: Vec::new(),
             held: Vec::new(),
-            tally: ProbeCounts::default(),
+            tally: PlanCounts::default(),
             blocks: Vec::new(),
         };
         for (key, _) in sorted_keys {
@@ -184,7 +184,7 @@ impl<'t> StagedRead<'t> {
 
     /// The planned data blocks, each with the positions of the keys in it,
     /// and what the filters answered.
-    pub(crate) fn into_plan(self) -> (SeqNo, Vec<(BlockHandle, Vec<usize>)>, ProbeCounts) {
+    pub(crate) fn into_plan(self) -> (SeqNo, Vec<(BlockHandle, Vec<usize>)>, PlanCounts) {
         (self.table_seqno, self.blocks, self.tally)
     }
 
@@ -219,17 +219,16 @@ impl<'t> StagedRead<'t> {
                 continue;
             };
             let answer = match self.table.filter_source(key) {
-                FilterSource::None => self.table.answer_bloom(None, hash)?,
-                FilterSource::Pinned(block) => self.table.answer_bloom(Some(block), hash)?,
+                FilterSource::None => Table::answer_bloom(None, hash)?,
+                FilterSource::Pinned(block) => Table::answer_bloom(Some(block), hash)?,
                 FilterSource::Block(handle) => {
                     let block = self.held(*handle.offset()).ok_or(NOT_HELD)?;
-                    self.table
-                        .answer_bloom(Some(&FilterBlock::new(block.clone())), hash)?
+                    Table::answer_bloom(Some(&FilterBlock::new(block.clone())), hash)?
                 }
-                FilterSource::PastPartitions => self.table.past_partitions(),
+                FilterSource::PastPartitions => super::BloomResult::PastPartitions,
                 FilterSource::UnpinnedPartitions => return Err(NOT_HELD),
             };
-            self.tally += answer.probe_counts();
+            Table::tally_bloom(&mut self.tally, &answer);
             if !answer.should_skip() {
                 passing.push(pos);
             }

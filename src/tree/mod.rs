@@ -23,7 +23,7 @@ use crate::{
     range_tombstone::RangeTombstone,
     scan_since::ScanSinceEvent,
     slice::Slice,
-    table::{Table, probe_stats::ProbeCounts},
+    table::{Table, probe_stats::PlanCounts},
     value::InternalValue,
     version::{SuperVersion, SuperVersions, Version, recovery::recover},
     vlog::BlobFile,
@@ -137,7 +137,7 @@ struct BlockTask<'a> {
 
 /// A level's block tasks, and per table the filter probes planning them took,
 /// not yet counted.
-type LevelTasks<'a> = (Vec<BlockTask<'a>>, Vec<(&'a Table, ProbeCounts)>);
+type LevelTasks<'a> = (Vec<BlockTask<'a>>, Vec<(&'a Table, PlanCounts)>);
 
 /// One table of a level being planned for a key batch: the keys it covers,
 /// their indices in the caller's batch, and its staged read, `None` when it
@@ -3570,9 +3570,10 @@ impl Tree {
             // table's filter blocks in one batch, then its index blocks, then
             // its data blocks, and answered from the blocks read. On io_uring
             // each batch is one submission the kernel fans out across the
-            // underlying devices. A level holding a Page-ECC or columnar table
-            // is handed to the serial resolve below, which loads those blocks
-            // through their format-aware path.
+            // underlying devices. A Page-ECC or columnar table is planned
+            // serially and its data blocks loaded through its format-aware
+            // path, while the level's other tables stay staged. A level whose
+            // plan or batched read fails is handed to the serial resolve below.
             if Self::resolve_level_staged(
                 level,
                 &mut still_remaining,
@@ -3823,7 +3824,7 @@ impl Tree {
         Self::read_level_stages(&mut tables);
 
         let mut tasks: Vec<BlockTask<'a>> = Vec::new();
-        let mut probes: Vec<(&'a Table, ProbeCounts)> = Vec::new();
+        let mut probes: Vec<(&'a Table, PlanCounts)> = Vec::new();
         for LevelTable {
             table,
             batch,
@@ -3842,11 +3843,11 @@ impl Tree {
                 // a genuine failure surfaces here instead of letting a lower
                 // level answer a key this table covers.
                 _ => {
-                    let mut tally = ProbeCounts::default();
+                    let mut tally = PlanCounts::default();
                     let Some((file, table_seqno, _, blocks)) =
                         table.plan_block_tasks(&batch, seqno, &mut tally)?
                     else {
-                        if tally != ProbeCounts::default() {
+                        if tally != PlanCounts::default() {
                             probes.push((table, tally));
                         }
                         continue;
@@ -3854,7 +3855,7 @@ impl Tree {
                     (Some(file), table_seqno, blocks, tally)
                 }
             };
-            if tally != ProbeCounts::default() {
+            if tally != PlanCounts::default() {
                 probes.push((table, tally));
             }
             if blocks.is_empty() {
@@ -4081,7 +4082,7 @@ impl Tree {
             // No key of the batch reaches a block of this level: the filter
             // probes that found so are the level's answer.
             for (table, counts) in probes {
-                table.count_probes(counts);
+                table.count_plan(counts);
             }
             return true;
         };
@@ -4163,10 +4164,11 @@ impl Tree {
             }
             start = end;
         }
-        // Answered from the plan: its filter probes are the level's, where a
-        // level handed back is probed and counted by the serial resolve.
+        // Answered from the plan: its filter probes, queries and skips are
+        // the level's, where a level handed back is probed and counted by the
+        // serial resolve.
         for (table, counts) in probes {
-            table.count_probes(counts);
+            table.count_plan(counts);
         }
         if let Some(found) = found {
             Self::count_chunked_false_positives(&tasks, found);
