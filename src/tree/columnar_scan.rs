@@ -55,9 +55,27 @@
 //! surfacing a row a caller who did not project the value-type column could not
 //! tell from a live one. Only a segment that RECORDS deletions pays for it: one
 //! whose metadata counts none keeps its columns untouched (and its zero-copy
-//! verbatim path). Memtable rows are not consulted —
-//! columnar data lives only in segments — and a visible non-columnar segment
-//! overlapping the range is rejected (a mixed-mode tree is unsupported here).
+//! verbatim path).
+//!
+//! # Row sources
+//!
+//! The memtables and the row-oriented tables in the range are sources too, so
+//! fresh writes are seen before they reach a columnar table. Each is read at
+//! the snapshot into batches of its keys, versions, value types and whole
+//! values, and always merged, since it holds every version of its keys. A
+//! merge operand row, in a tree with a merge operator, is replaced by what a
+//! point read at the snapshot returns for its key, so a chain reads as the read
+//! path resolves it.
+//!
+//! # Projected fields
+//!
+//! What a batch carries is a [`Projection`](projection::Projection): columns by
+//! id, and declared fields with a type and what their absence reads as. A table
+//! that stores each value whole (rows transposed at a flush or a compaction,
+//! and every row source) yields its declared fields through the projection's
+//! [`ValueProjector`](projection::ValueProjector); a table that stores the
+//! value split into fields yields them as its columns, and a field it lacks is
+//! absent. See [`projection`] for the absence rule every source follows.
 
 use core::ops::{Bound, RangeBounds};
 
@@ -77,11 +95,25 @@ use crate::table::columnar_predicate::{
 use crate::{Error, SeqNo, Table, Tree, UserKey};
 
 mod merge;
+pub mod projection;
+mod rows;
 
-/// A visible columnar segment selected for the scan, with its cached key range,
+use rows::{RowCursor, SourceCursor};
+
+/// What a scan source reads: a columnar segment, or a source of rows.
+enum Source {
+    /// A columnar table, read column by column.
+    Columnar(Table),
+    /// A row-oriented table, read row by row.
+    RowTable(Table),
+    /// A memtable, active or sealed.
+    Memtable(alloc::sync::Arc<crate::memtable::Memtable>),
+}
+
+/// A visible source selected for the scan, with its cached key range,
 /// sequence base, and snapshot-visibility class.
 struct Segment {
-    table: Table,
+    source: Source,
     min: UserKey,
     max: UserKey,
     /// The segment's `global_seqno` base; a row's effective seqno is
@@ -102,6 +134,48 @@ struct Segment {
     /// because `group_by_overlap` re-sorts segments by minimum key and the
     /// concatenation order alone says nothing about recency.
     recency_rank: usize,
+    /// Whether the segment stores each value whole, so its declared fields
+    /// are read out of the value through the projector.
+    whole: bool,
+}
+
+impl Segment {
+    /// Whether the source is read row by row.
+    fn is_rows(&self) -> bool {
+        !matches!(self.source, Source::Columnar(_))
+    }
+
+    /// Whether the source can hold a deletion, so the value type is decoded.
+    fn records_deletions(&self) -> bool {
+        match &self.source {
+            Source::Columnar(table) | Source::RowTable(table) => {
+                table.tombstone_count() > 0 || table.weak_tombstone_count() > 0
+            }
+            // A memtable keeps no count; any row of it can be a deletion.
+            Source::Memtable(_) => true,
+        }
+    }
+
+    /// The base the source's range tombstone seqnos are local to. A row
+    /// table's range read already yields effective row seqnos, so its rows
+    /// are merged at base `0`, but its tombstones are stored local.
+    fn rt_base(&self) -> SeqNo {
+        match &self.source {
+            Source::Columnar(_) => self.global,
+            Source::RowTable(table) => table.global_seqno(),
+            Source::Memtable(_) => 0,
+        }
+    }
+
+    /// The source's range tombstones, in its local seqno space.
+    fn range_tombstones(&self) -> Vec<crate::range_tombstone::RangeTombstone> {
+        match &self.source {
+            Source::Columnar(table) | Source::RowTable(table) => {
+                table.visible_range_tombstones().collect()
+            }
+            Source::Memtable(memtable) => memtable.range_tombstones_sorted(),
+        }
+    }
 }
 
 /// One key-disjoint group of segments: either a single segment (streamed
@@ -115,12 +189,15 @@ struct Group {
 impl Tree {
     /// Runs a projected columnar scan across the whole tree.
     ///
-    /// Iterates the columnar segments intersecting `range` and visible at
-    /// `seqno`, applies each segment's positional delete-bitmap and the optional
-    /// `predicate` (zone-map block-skip + row filter), and yields projected
-    /// [`ColumnBatch`]es in ascending key order. Overlapping segments are merged
-    /// with newest-`seqno`-wins semantics so an overwritten key is returned once
-    /// (its newest version); disjoint segments stream without merge overhead.
+    /// Reads every source intersecting `range` at snapshot `seqno`: the
+    /// memtables, the row-oriented tables and the columnar ones. It applies
+    /// deletions and range tombstones from any source to the keys of every
+    /// other, resolves merge chains as a read does, applies the optional
+    /// `predicate` (zone-map block-skip + row filter, after the newest version
+    /// of each key is chosen) and yields projected [`ColumnBatch`]es in
+    /// ascending key order, one row per key: its newest visible version. A
+    /// columnar segment no other source overlaps streams without merge
+    /// overhead.
     ///
     /// `range` bounds the result at row granularity: a segment that only
     /// partially overlaps `range` contributes only the rows whose keys fall
@@ -128,49 +205,78 @@ impl Tree {
     /// fully unbounded range keeps the zero-copy fast path for an all-visible
     /// segment.
     ///
-    /// `projection` lists the column ids to decode (value sub-column ids, plus
-    /// optionally the intrinsic [`COL_USER_KEY`] / seqno / value-type columns);
-    /// every other column is stepped over without decoding. Each yielded batch
-    /// carries exactly the projected columns.
-    ///
-    /// This reads only segments; memtable rows are not consulted (columnar data
-    /// is written directly to segments via
-    /// [`write_columnar_batch`](crate::AnyIngestion::write_columnar_batch)).
+    /// `projection` names the columns each batch carries, in its order: column
+    /// ids (the intrinsic [`COL_USER_KEY`] / seqno / value-type columns, or a
+    /// value column typed by what the tables store), converted from a slice of
+    /// ids, or a [`Projection`](projection::Projection) of declared fields,
+    /// which says what a field a row lacks reads as and carries the projector
+    /// the fields are read out of whole values through. Every other column of a
+    /// columnar table is stepped over without decoding.
     ///
     /// # Errors
     ///
-    /// Returns an error if a visible non-columnar segment overlaps `range` (a
-    /// mixed-mode tree is unsupported here), if the tree carries a merge
-    /// operator (see below), or — lazily, while iterating — on a block read /
-    /// decode failure or a layout mismatch between segments of an overlapping
-    /// group.
+    /// Returns [`Error::Projection`] when the projection names one column id
+    /// twice or the highest id, and, lazily, while iterating, when a row
+    /// returned stores its value whole and no projector is set to read its
+    /// declared fields, or when the data does not satisfy the projection.
+    /// Returns an error on a block read
+    /// or decode failure, or on a failed point read resolving a merge chain.
+    ///
+    /// # Examples
+    ///
+    /// ```
+    /// use lsm_tree::table::columnar::COL_USER_KEY;
+    /// use lsm_tree::{AbstractTree, Config, SeqNo};
+    ///
+    /// let folder = tempfile::tempdir()?;
+    /// let tree = Config::new(folder, Default::default(), Default::default()).open()?;
+    /// // Rows in the memtable are read like any other source.
+    /// tree.insert("a", "1", 0);
+    /// tree.insert("b", "2", 1);
+    /// let rows: u32 = tree
+    ///     .columnar_scan(&[COL_USER_KEY], None, SeqNo::MAX, ..)?
+    ///     .map(|batch| batch.map(|b| b.row_count))
+    ///     .sum::<lsm_tree::Result<u32>>()?;
+    /// assert_eq!(rows, 2);
+    /// # Ok::<(), lsm_tree::Error>(())
+    /// ```
     pub fn columnar_scan<R: RangeBounds<UserKey>>(
         &self,
-        projection: &[u16],
+        projection: impl Into<projection::Projection>,
         predicate: Option<&ColumnRangePredicate>,
         seqno: SeqNo,
         range: R,
     ) -> crate::Result<ColumnarScan> {
-        // A merge chain is not a version chain: its older rows are the merge's
-        // INPUTS, not data the newest row shadows. The newest-version-wins dedup
-        // below would hand back the raw operand where a read hands back the
-        // merged value, and it drops the base row, so the consumer cannot
-        // resolve the chain itself either. Refuse instead of disagreeing with
-        // the read path.
-        //
-        // Gated on the OPERATOR rather than on the rows: without one the read
-        // path returns the newest entry unchanged — the raw operand — which is
-        // exactly what this scan yields, so nothing diverges. With one, no
-        // metadata says whether a segment holds operands, and finding out means
-        // decoding the value-type column of every batch, which would cost the
-        // zero-copy fast path on every scan of every tree that merges.
-        if self.config.merge_operator.is_some() {
-            return Err(Error::FeatureUnsupported(
-                "columnar scan of a tree with a merge operator: merge chains \
-                 would be returned unresolved",
+        let projection = projection.into();
+        // A batch names its columns by id, so one id projected twice (say a
+        // declared field and the raw value by id) would come out as two
+        // columns no reader can tell apart.
+        let fields = projection.fields();
+        if fields.iter().enumerate().any(|(at, f)| {
+            fields
+                .get(..at)
+                .is_some_and(|before| before.iter().any(|b| b.column_id() == f.column_id()))
+        }) {
+            return Err(Error::Projection(
+                "projection: a column id is projected twice",
             ));
         }
-
+        if fields
+            .iter()
+            .any(|f| f.column_id() == merge::COL_WHOLE_VALUE)
+            || predicate.is_some_and(|p| p.column_id == merge::COL_WHOLE_VALUE)
+        {
+            return Err(Error::Projection(
+                "projection: the highest column id is reserved for the scan",
+            ));
+        }
+        // A merge chain is not a version chain: its older rows are the merge's
+        // INPUTS, not data the newest row shadows, and a read hands back the
+        // merged value. An operand row is therefore replaced by what a read at
+        // the snapshot returns for its key, through the same operator, before
+        // anything is projected from it. Without an operator the read path
+        // returns the newest entry unchanged, the raw operand, which is what
+        // the scan yields, so no resolution runs and no value type is decoded.
         let comparator = self.config.comparator.clone();
 
         // Owned bounds keep the returned iterator free of borrows from `range`.
@@ -183,29 +289,109 @@ impl Tree {
         // mid-scan cannot turn a row-major tree columnar (or the reverse)
         // underneath it, and the per-segment recency ranking is the ranking
         // THAT version has.
+        //
+        // The active memtable in that version stays writable, and its span is
+        // taken now while its rows are read later: the snapshot is capped at
+        // what the tree holds now, so a write or deletion that lands after the
+        // scan is created is invisible to it, as it is outside the span and
+        // the groups computed here. The version is the one the requested
+        // snapshot is served by: a compaction can raise the retention floor
+        // past every seqno the tree still holds, and a snapshot at or below the
+        // floor is refused because it may need a version the compaction
+        // collected. The cap never needs one: it lies above every seqno the
+        // version holds, so it reads what the latest snapshot reads. It is
+        // taken from that version, not the live tree: a compaction installed
+        // since may have dropped the newest seqno, and a cap below a version
+        // the pinned tables still hold would surface an older one.
         let super_version = self.get_version_for_snapshot(seqno)?;
+        let highest = super_version
+            .active_memtable
+            .get_highest_seqno()
+            .max(
+                super_version
+                    .sealed_memtables
+                    .iter()
+                    .filter_map(|memtable| memtable.get_highest_seqno())
+                    .max(),
+            )
+            .max(
+                super_version
+                    .version
+                    .iter_tables()
+                    .map(crate::Table::get_highest_seqno)
+                    .max(),
+            );
+        let seqno = match highest {
+            Some(highest) => highest
+                .checked_add(1)
+                .map_or(seqno, |next: SeqNo| seqno.min(next)),
+            None => 0,
+        };
+        // Operands are resolved in that same version, so a version installed
+        // mid-scan changes no row the scan returns.
+        let resolver = self.config.merge_operator.clone().map(|operator| Resolver {
+            version: super_version.clone(),
+            operator,
+        });
+
+        // A declared field of a segment that stores each value whole lies
+        // inside the value, which only the caller's projector reads, and only
+        // for a row the scan returns.
+        let declared = projection.fields().iter().any(projection::is_declared);
 
         let mut segments: Vec<Segment> = Vec::new();
+        // Memtables are newer than every table, the active one newest; the
+        // sealed ones are kept oldest first.
+        let memtables = core::iter::once(super_version.active_memtable.clone())
+            .chain(super_version.sealed_memtables.iter().rev().cloned());
+        let mut recency_rank = 0;
+        for memtable in memtables {
+            if let Some((min, max)) = memtable_span(&memtable, &lo, &hi, comparator.as_ref()) {
+                segments.push(Segment {
+                    min,
+                    max,
+                    // A row source yields effective seqnos, and only the rows
+                    // the snapshot sees.
+                    global: 0,
+                    visibility: SeqnoVisibility::All,
+                    may_dup: true,
+                    recency_rank,
+                    whole: true,
+                    source: Source::Memtable(memtable),
+                });
+            }
+            recency_rank += 1;
+        }
         // `iter_tables` yields newest-first (the same order the sequenced
         // scan sources rely on), so the enumeration index is the recency
-        // rank.
-        for (recency_rank, table) in super_version.version.iter_tables().enumerate() {
+        // rank after the memtables'.
+        for (rank, table) in super_version.version.iter_tables().enumerate() {
+            let recency_rank = recency_rank + rank;
             if !table.check_key_range_overlap_cmp(&bounds_ref, comparator.as_ref()) {
                 continue;
             }
             // Snapshot visibility (exclusive MVCC). `None` segments postdate the
-            // snapshot and are dropped before the columnar check, so an invisible
-            // non-columnar segment never trips the mixed-mode error.
+            // snapshot and are dropped.
             let visibility = table.seqno_visibility(seqno);
             if visibility == SeqnoVisibility::None {
                 continue;
             }
-            if !table.metadata.columnar {
-                return Err(Error::FeatureUnsupported(
-                    "columnar_scan: a non-columnar segment overlaps the range (mixed-mode tree)",
-                ));
-            }
             let key_range = &table.metadata.key_range;
+            if !table.metadata.columnar {
+                segments.push(Segment {
+                    min: key_range.min().clone(),
+                    max: key_range.max().clone(),
+                    // Its range read yields effective seqnos, filtered to the
+                    // snapshot by the row cursor.
+                    global: 0,
+                    visibility: SeqnoVisibility::All,
+                    may_dup: true,
+                    recency_rank,
+                    whole: true,
+                    source: Source::RowTable(table.clone()),
+                });
+                continue;
+            }
             // `key_count == item_count` proves the segment holds one version per
             // key, so the verbatim path can return its rows untouched. The count
             // the writer recorded and the duplicate-free claim read here rest on
@@ -224,7 +410,8 @@ impl Tree {
                 visibility,
                 may_dup,
                 recency_rank,
-                table: table.clone(),
+                whole: table.metadata.value_layout == crate::table::meta::ValueLayout::Whole,
+                source: Source::Columnar(table.clone()),
             });
         }
 
@@ -233,7 +420,13 @@ impl Tree {
         Ok(ColumnarScan {
             groups: groups.into_iter().collect(),
             current: None,
-            projection: projection.to_vec(),
+            projection: projection.column_ids(),
+            fields: projection.fields().to_vec(),
+            projector: declared
+                .then(|| projection.value_projector().cloned())
+                .flatten(),
+            declared,
+            resolver,
             predicate: predicate.cloned(),
             support: PredicateSupport::Exact,
             comparator,
@@ -246,6 +439,92 @@ impl Tree {
             #[cfg(feature = "metrics")]
             metrics: self.0.metrics.clone(),
         })
+    }
+}
+
+/// The span of keys `memtable` holds in `lo..hi`, rows and range tombstones
+/// alike, or `None` when it holds none there.
+fn memtable_span(
+    memtable: &crate::memtable::Memtable,
+    lo: &Bound<UserKey>,
+    hi: &Bound<UserKey>,
+    cmp: &dyn UserComparator,
+) -> Option<(UserKey, UserKey)> {
+    use core::cmp::Ordering;
+
+    let (ilo, ihi) = rows::internal_bounds(lo, hi);
+    let mut rows = memtable.range_internal((ilo, ihi));
+    let first = rows.next().map(|row| row.key.user_key);
+    let last = rows
+        .next_back()
+        .map(|row| row.key.user_key)
+        .or_else(|| first.clone());
+    let mut span = first.zip(last);
+    let bounds = (lo.clone(), hi.clone());
+    for rt in memtable.range_tombstones_sorted() {
+        if !crate::range::range_tombstone_overlaps_bounds(&rt, &bounds, cmp) {
+            continue;
+        }
+        span = Some(match span {
+            None => (rt.start.clone(), rt.end.clone()),
+            Some((min, max)) => (
+                if cmp.compare(&rt.start, &min) == Ordering::Less {
+                    rt.start.clone()
+                } else {
+                    min
+                },
+                if cmp.compare(&rt.end, &max) == Ordering::Greater {
+                    rt.end.clone()
+                } else {
+                    max
+                },
+            ),
+        });
+    }
+    span
+}
+
+/// The tighter of two lower bounds: the greater key, an excluded one when
+/// both name the same key.
+fn tighter_lower(
+    a: Bound<UserKey>,
+    b: &Bound<UserKey>,
+    cmp: &dyn UserComparator,
+) -> Bound<UserKey> {
+    use core::cmp::Ordering;
+
+    match (&a, b) {
+        (_, Bound::Unbounded) => a,
+        (Bound::Unbounded, _) => b.clone(),
+        (Bound::Included(x) | Bound::Excluded(x), Bound::Included(y) | Bound::Excluded(y)) => {
+            match cmp.compare(x, y) {
+                Ordering::Less => b.clone(),
+                Ordering::Equal if matches!(b, Bound::Excluded(_)) => b.clone(),
+                Ordering::Greater | Ordering::Equal => a,
+            }
+        }
+    }
+}
+
+/// The tighter of two upper bounds: the lesser key, an excluded one when
+/// both name the same key.
+fn tighter_upper(
+    a: Bound<UserKey>,
+    b: &Bound<UserKey>,
+    cmp: &dyn UserComparator,
+) -> Bound<UserKey> {
+    use core::cmp::Ordering;
+
+    match (&a, b) {
+        (_, Bound::Unbounded) => a,
+        (Bound::Unbounded, _) => b.clone(),
+        (Bound::Included(x) | Bound::Excluded(x), Bound::Included(y) | Bound::Excluded(y)) => {
+            match cmp.compare(x, y) {
+                Ordering::Greater => b.clone(),
+                Ordering::Equal if matches!(b, Bound::Excluded(_)) => b.clone(),
+                Ordering::Less | Ordering::Equal => a,
+            }
+        }
     }
 }
 
@@ -303,7 +582,8 @@ enum SingletonMode {
 struct DedupState {
     /// The scan's predicate in the segment's local coordinates.
     predicate: Option<ColumnRangePredicate>,
-    rts: Vec<(UserKey, UserKey, SeqNo)>,
+    /// The segment's visible range tombstones.
+    rts: TombstoneSweep,
     /// Whether the snapshot straddles the segment, so rows are masked by
     /// seqno.
     partial: bool,
@@ -322,9 +602,16 @@ struct DedupState {
     last_key: Option<Vec<u8>>,
 }
 
+/// A segment's cursor, and whether it carries each row's whole value to the
+/// rows the scan returns (see [`ColumnarScan::read_late`]).
+pub(super) struct SegmentCursor {
+    cursor: SourceCursor,
+    whole: bool,
+}
+
 /// A singleton group streamed from its table's cursor.
 struct SingletonStream {
-    cursor: crate::table::columnar_cursor::ColumnarCursor,
+    cursor: SourceCursor,
     /// The segment's `global_seqno` base.
     global: SeqNo,
     mode: SingletonMode,
@@ -362,11 +649,160 @@ impl GroupStream {
     }
 }
 
+/// The rows of a batch whose operand was resolved to a value, by key.
+#[derive(Debug, Default)]
+pub(super) struct Resolved {
+    /// The keys resolved, sorted: their declared fields are read out of the
+    /// merged value, not out of the cells the operand carried.
+    keys: Vec<crate::Slice>,
+    /// Among them, sorted, the keys of rows a field projected by id alone
+    /// cannot be read for: returned, such a row fails the scan.
+    unreadable: Vec<crate::Slice>,
+}
+
+impl Resolved {
+    /// Whether any operand was resolved to a value.
+    pub(super) fn any(&self) -> bool {
+        !self.keys.is_empty()
+    }
+
+    /// Whether `key`'s operand was resolved to a value.
+    pub(super) fn holds(&self, key: &[u8]) -> bool {
+        self.keys.binary_search_by(|k| (**k).cmp(key)).is_ok()
+    }
+
+    /// Whether `key`'s row cannot be returned: a field projected by id alone
+    /// cannot be read out of its merged value.
+    pub(super) fn unreadable(&self, key: &[u8]) -> bool {
+        self.unreadable.binary_search_by(|k| (**k).cmp(key)).is_ok()
+    }
+}
+
+/// A returned row's operand was resolved to a value read whole, which a field
+/// projected by id alone cannot be read out of.
+pub(super) const UNREADABLE_BY_ID: Error = Error::Projection(
+    "projection: a merged value is read whole, and a field projected by id alone cannot be \
+     read out of it",
+);
+
+/// A batch lacks a column the scan decoded for itself.
+const MISSING_BATCH_COLUMN: Error =
+    Error::InvalidHeader("columnar_scan: a batch is missing a column the scan decoded");
+
+/// Whether a row of `batch` is a merge operand; `false` for a batch without a
+/// value-type column.
+fn holds_operand(batch: &ColumnBatch) -> bool {
+    operand_rows(batch).into_iter().any(|operand| operand)
+}
+
+/// Whether each row of `batch` is a merge operand; none is when the batch
+/// carries no value type.
+fn operand_rows(batch: &ColumnBatch) -> Vec<bool> {
+    let rows = batch.row_count as usize;
+    batch
+        .columns
+        .iter()
+        .find(|c| c.column_id == COL_VALUE_TYPE)
+        .map_or_else(
+            || vec![false; rows],
+            |types| {
+                let mut operands: Vec<bool> = types
+                    .data
+                    .iter()
+                    .take(rows)
+                    .map(|&byte| {
+                        crate::ValueType::try_from(byte) == Ok(crate::ValueType::MergeOperand)
+                    })
+                    .collect();
+                operands.resize(rows, false);
+                operands
+            },
+        )
+}
+
+/// The visible range tombstones of a group, swept in the ascending key order
+/// its rows are decided in: each tombstone is entered once the keys reach its
+/// start and dropped once they pass its end, so a row is checked against the
+/// newest tombstone over it, not against every tombstone of the group.
+pub(super) struct TombstoneSweep {
+    /// `(start, end, effective seqno)`, by start key.
+    rts: Vec<(UserKey, UserKey, SeqNo)>,
+    /// The first tombstone the keys have not reached yet.
+    next: usize,
+    /// The tombstones entered, newest first, each with its place in `rts`;
+    /// one the keys have passed is dropped when it comes to the top.
+    open: alloc::collections::BinaryHeap<(SeqNo, usize)>,
+}
+
+impl TombstoneSweep {
+    /// The sweep over `rts`, ordered by `cmp`.
+    pub(super) fn new(mut rts: Vec<(UserKey, UserKey, SeqNo)>, cmp: &dyn UserComparator) -> Self {
+        rts.sort_by(|a, b| cmp.compare(&a.0, &b.0));
+        Self {
+            rts,
+            next: 0,
+            open: alloc::collections::BinaryHeap::new(),
+        }
+    }
+
+    /// Whether the group has no visible range tombstone.
+    pub(super) fn is_empty(&self) -> bool {
+        self.rts.is_empty()
+    }
+
+    /// Whether a row at `key`, no lower than any key asked before, at the
+    /// tree-global seqno `eff` is deleted: inside a tombstone's half-open
+    /// `[start, end)` span and older than it.
+    pub(super) fn covers(&mut self, key: &[u8], eff: SeqNo, cmp: &dyn UserComparator) -> bool {
+        use core::cmp::Ordering;
+
+        while let Some((start, _, seqno)) = self.rts.get(self.next)
+            && cmp.compare(start, key) != Ordering::Greater
+        {
+            self.open.push((*seqno, self.next));
+            self.next += 1;
+        }
+        // The newest open tombstone the keys have passed can cover no later
+        // key either; one below it is dropped once it comes to the top.
+        while let Some(&(_, at)) = self.open.peek() {
+            let passed = self
+                .rts
+                .get(at)
+                .is_none_or(|(_, end, _)| cmp.compare(key, end) != Ordering::Less);
+            if !passed {
+                break;
+            }
+            self.open.pop();
+        }
+        self.open.peek().is_some_and(|&(seqno, _)| eff < seqno)
+    }
+}
+
+/// When a scan's predicate judges the rows the dedup decided: see
+/// [`ColumnarScan::predicate_timing`].
+#[derive(Clone, Copy, PartialEq, Eq)]
+pub(super) enum PredicateTiming {
+    /// Before the values are read, every row.
+    BeforeValues,
+    /// Before the values are read for the plain rows, after for the operands
+    /// still to be resolved.
+    BeforeValuesExceptOperands,
+    /// After the values are read.
+    AfterValues,
+}
+
 /// Drops from `batch` the columns decoded only for the scan's own use.
 fn drop_columns(batch: &mut ColumnBatch, dropped: &[u16]) {
     if !dropped.is_empty() {
         batch.columns.retain(|c| !dropped.contains(&c.column_id));
     }
+}
+
+/// Resolves a merge operand row as a point read at the scan's snapshot would,
+/// in the version the scan reads.
+struct Resolver {
+    version: crate::version::SuperVersion,
+    operator: alloc::sync::Arc<dyn crate::merge_operator::MergeOperator>,
 }
 
 /// Iterator over a tree-level projected columnar scan.
@@ -380,7 +816,21 @@ fn drop_columns(batch: &mut ColumnBatch, dropped: &[u16]) {
 pub struct ColumnarScan {
     groups: alloc::collections::VecDeque<Group>,
     current: Option<GroupStream>,
+    /// The projected column ids, in output order.
     projection: Vec<u16>,
+    /// The projected fields, whose declarations every yielded batch is
+    /// brought to.
+    fields: Vec<projection::ProjectedField>,
+    /// The projector the declared fields of a whole-value segment are read
+    /// through; `None` when no field is declared.
+    projector: Option<alloc::sync::Arc<dyn projection::ValueProjector>>,
+    /// Whether a field is declared, so a whole-value segment is read without
+    /// its value column in the declared ids' place even with no projector,
+    /// which only a memtable holding nothing but deletions allows.
+    declared: bool,
+    /// What resolves a merge operand row, when the tree merges; `None` when
+    /// it has no merge operator.
+    resolver: Option<Resolver>,
     predicate: Option<ColumnRangePredicate>,
     /// The weakest [`PredicateSupport`] over the segments read so far.
     support: PredicateSupport,
@@ -491,7 +941,13 @@ impl ColumnarScan {
         support: &mut PredicateSupport,
     ) -> crate::Result<GroupStream> {
         let rts = self.visible_group_range_tombstones(&group.segments)?;
-        if let [seg] = group.segments.as_slice() {
+        // A row source yields every version of its keys, deletions among
+        // them, and its values whole: the merge decides each key. So does a
+        // table whose values are read only for the rows it returns.
+        if let [seg] = group.segments.as_slice()
+            && !seg.is_rows()
+            && !self.reads_late(seg)
+        {
             return self.open_singleton(seg, rts, support);
         }
         Ok(GroupStream::Merge(Box::new(merge::MergeStream::open(
@@ -499,6 +955,14 @@ impl ColumnarScan {
             &group.segments,
             rts,
         )?)))
+    }
+
+    /// Whether `seg` is read through the merge with its values read only for
+    /// the rows the scan returns: every segment of a tree that merges, whose
+    /// operands a returned row resolves, and a whole-value table whose
+    /// declared fields a returned row reads out of its value.
+    fn reads_late(&self, seg: &Segment) -> bool {
+        self.resolver.is_some() || (seg.whole && self.declared)
     }
 
     /// A cursor over `seg`'s table within the scan's key range, decoding
@@ -510,14 +974,247 @@ impl ColumnarScan {
         projection: &[u16],
         predicate: Option<&ColumnRangePredicate>,
         share: u64,
-    ) -> crate::Result<crate::table::columnar_cursor::ColumnarCursor> {
-        seg.table.columnar_cursor(
-            projection,
-            predicate,
-            self.lo.clone(),
-            self.hi.clone(),
-            Some(share),
-        )
+    ) -> crate::Result<SegmentCursor> {
+        // A whole value is carried to the rows the scan returns, for its
+        // declared fields and for the merge operands it may hold.
+        let whole = seg.whole && (self.declared || self.resolver.is_some());
+        // The declared fields of a whole value lie inside it: decode the value
+        // in their place. A declared field's id may be the value column's own,
+        // so no predicate is pushed down; the merge filters after the fields
+        // are read.
+        let mut ids: Vec<u16> = projection.to_vec();
+        if whole {
+            let declared: Vec<u16> = self
+                .fields
+                .iter()
+                .filter(|f| projection::is_declared(f))
+                .map(projection::ProjectedField::column_id)
+                .collect();
+            ids.retain(|id| !declared.contains(id));
+            if !ids.contains(&crate::table::columnar::COL_VALUE) {
+                ids.push(crate::table::columnar::COL_VALUE);
+            }
+        }
+        let predicate = predicate.filter(|_| !whole);
+        let cursor = match &seg.source {
+            Source::Columnar(table) => SourceCursor::Columnar(Box::new(table.columnar_cursor(
+                &ids,
+                predicate,
+                self.lo.clone(),
+                self.hi.clone(),
+                Some(share),
+            )?)),
+            Source::RowTable(table) => SourceCursor::Rows(Box::new(RowCursor::table(
+                table,
+                self.lo.clone(),
+                self.hi.clone(),
+                self.seqno,
+                ids,
+                share,
+            ))),
+            // Within the span its group was formed on: the active memtable
+            // stays writable, and a row landing outside that span after the
+            // scan was created would be read out of order, or beside a
+            // version of its key another group returns. A range tombstone
+            // widens that span past the scan's range, so the cursor reads
+            // only where the two meet: every row beyond is dropped by the
+            // range check anyway.
+            Source::Memtable(memtable) => {
+                let cmp = self.comparator.as_ref();
+                let lo = tighter_lower(Bound::Included(seg.min.clone()), &self.lo, cmp);
+                let hi = tighter_upper(Bound::Included(seg.max.clone()), &self.hi, cmp);
+                SourceCursor::Rows(Box::new(RowCursor::memtable(
+                    memtable.clone(),
+                    &lo,
+                    &hi,
+                    self.seqno,
+                    ids,
+                    share,
+                )))
+            }
+        };
+        Ok(SegmentCursor { cursor, whole })
+    }
+
+    /// The rows a merge returned, `batch`, with their values read: each merge
+    /// operand replaced by what a read at the scan's snapshot returns for its
+    /// key (a key the read finds absent is dropped), then the declared fields
+    /// of each row carrying a whole value read out of it, and the carried
+    /// value column dropped. Only returned rows get here, so a shadowed,
+    /// deleted or invisible version is never resolved or projected. Also
+    /// returns which keys were resolved to a value: such a row holds no cell
+    /// of its own for a column no field declares.
+    pub(super) fn read_late(&self, batch: ColumnBatch) -> crate::Result<(ColumnBatch, Resolved)> {
+        let (batch, resolved) = self.resolve_operands(batch)?;
+        let mut batch = if self.declared {
+            projection::project_decided(
+                batch,
+                &self.fields,
+                self.projector.as_deref(),
+                merge::COL_WHOLE_VALUE,
+            )?
+        } else {
+            batch
+        };
+        drop_columns(&mut batch, &[merge::COL_WHOLE_VALUE]);
+        Ok((batch, resolved))
+    }
+
+    /// `batch` with each merge operand row replaced by what a read at the
+    /// scan's snapshot returns for its key, through the tree's own operator
+    /// exactly as the read path resolves it: that value, carried as the row's
+    /// whole value (and in the value column when it is projected by id), or
+    /// the row dropped when the read finds the key absent. Also returns which
+    /// keys were resolved to a value (see [`Resolved`]).
+    ///
+    /// The value an operand resolves to is read whole, like any row value: a
+    /// value field projected by id alone cannot be read out of it, so such a
+    /// row is named unreadable, and the scan fails as it does for a whole
+    /// value if the row is returned, instead of returning the cell the
+    /// operand itself carried.
+    fn resolve_operands(&self, batch: ColumnBatch) -> crate::Result<(ColumnBatch, Resolved)> {
+        use crate::table::columnar::{COL_VALUE, Column, frame_bytes_column};
+
+        let Some(resolver) = &self.resolver else {
+            return Ok((batch, Resolved::default()));
+        };
+        if !holds_operand(&batch) {
+            return Ok((batch, Resolved::default()));
+        }
+        let row_count = batch.row_count;
+        let rows = row_count as usize;
+        let find = |id: u16| batch.columns.iter().position(|c| c.column_id == id);
+        let (Some(key_at), Some(type_at), Some(whole_at)) = (
+            find(COL_USER_KEY),
+            find(COL_VALUE_TYPE),
+            find(merge::COL_WHOLE_VALUE),
+        ) else {
+            return Err(MISSING_BATCH_COLUMN);
+        };
+        // The raw value, read by id or by the predicate, reads the resolved
+        // value too.
+        let raw_at = find(COL_VALUE).filter(|&at| {
+            batch
+                .columns
+                .get(at)
+                .is_some_and(|c| c.type_tag == TypeTag::Bytes)
+                && self.raw_value_read()
+        });
+        let column = |at: usize| batch.columns.get(at).ok_or(MISSING_BATCH_COLUMN);
+        let (keys, kinds) = (column(key_at)?, column(type_at)?);
+        // Per row: `None` keeps it as read, `Some(None)` drops it, and
+        // `Some(Some(value))` makes it that value.
+        let mut resolved: Vec<Option<Option<crate::Slice>>> = Vec::with_capacity(rows);
+        for row in 0..row_count {
+            let byte = *kinds.data.get(row as usize).ok_or(MISSING_BATCH_COLUMN)?;
+            if crate::ValueType::try_from(byte) != Ok(crate::ValueType::MergeOperand) {
+                resolved.push(None);
+                continue;
+            }
+            // Each key is returned once, so each is read once.
+            let key = bytes_column_row(&keys.data, row_count, row)?;
+            resolved.push(Some(Tree::resolve_or_passthrough(
+                &resolver.version,
+                key,
+                self.seqno,
+                Some(&resolver.operator),
+                self.comparator.as_ref(),
+            )?));
+        }
+        // Only the raw value is rewritten below, and only a row that carried
+        // its value whole holds the raw value under the value column's id: a
+        // row of a table that splits its values carries no whole value, and
+        // its cell under that id is a field like any other.
+        let whole = column(whole_at)?;
+        let by_id: Vec<u16> = self
+            .fields
+            .iter()
+            .filter(|f| {
+                f.type_tag().is_none() && batch.columns.iter().any(|c| c.column_id == f.column_id())
+            })
+            .map(projection::ProjectedField::column_id)
+            .collect();
+        let mut outcome = Resolved::default();
+        for (row, fix) in (0..row_count).zip(&resolved) {
+            if !matches!(fix, Some(Some(_))) {
+                continue;
+            }
+            let key = crate::Slice::from(bytes_column_row(&keys.data, row_count, row)?);
+            let raw_rewritten = raw_at.is_some() && whole.is_valid(row);
+            if by_id.iter().any(|&id| !(id == COL_VALUE && raw_rewritten)) {
+                outcome.unreadable.push(key.clone());
+            }
+            outcome.keys.push(key);
+        }
+        outcome.keys.sort_unstable();
+        outcome.unreadable.sort_unstable();
+
+        // The cells of bytes column `at` with the resolved rows' values in
+        // place: a resolved row's cell is its value, the others as read.
+        let rewrite = |at: usize| -> crate::Result<Column> {
+            let old = column(at)?;
+            let mut cells: Vec<Option<&[u8]>> = Vec::with_capacity(rows);
+            for (row, fix) in (0..row_count).zip(&resolved) {
+                cells.push(match fix {
+                    Some(Some(value)) => Some(&**value),
+                    _ if old.is_valid(row) => Some(bytes_column_row(&old.data, row_count, row)?),
+                    _ => None,
+                });
+            }
+            let validity = cells.iter().any(Option::is_none).then(|| {
+                let mut bits = alloc::vec![0u8; rows.div_ceil(8)];
+                for (row, cell) in cells.iter().enumerate() {
+                    if cell.is_some()
+                        && let Some(byte) = bits.get_mut(row / 8)
+                    {
+                        *byte |= 1 << (row % 8);
+                    }
+                }
+                bits
+            });
+            Ok(Column {
+                column_id: old.column_id,
+                type_tag: TypeTag::Bytes,
+                validity,
+                data: frame_bytes_column(rows, || cells.iter().map(|c| c.unwrap_or(&[])))?,
+            })
+        };
+        let whole = rewrite(whole_at)?;
+        let raw = raw_at.map(rewrite).transpose()?;
+        let types: Vec<u8> = kinds
+            .data
+            .iter()
+            .zip(&resolved)
+            .map(|(&byte, fix)| match fix {
+                Some(_) => u8::from(crate::ValueType::Value),
+                None => byte,
+            })
+            .collect();
+
+        let mut batch = batch;
+        if let Some(slot) = batch.columns.get_mut(whole_at) {
+            *slot = whole;
+        }
+        if let (Some(at), Some(raw)) = (raw_at, raw)
+            && let Some(slot) = batch.columns.get_mut(at)
+        {
+            *slot = raw;
+        }
+        if let Some(slot) = batch.columns.get_mut(type_at) {
+            slot.data = crate::Slice::from(types);
+        }
+        // A key the read finds absent is not returned.
+        let batch = if resolved.iter().any(|fix| matches!(fix, Some(None))) {
+            let keep: Vec<bool> = resolved
+                .iter()
+                .map(|fix| !matches!(fix, Some(None)))
+                .collect();
+            filter_batch(&batch, &keep)?
+        } else {
+            batch
+        };
+        self.record_gather(&batch);
+        Ok((batch, outcome))
     }
 
     /// The next output batch of `stream`, or `None` once it is exhausted.
@@ -540,9 +1237,44 @@ impl ColumnarScan {
                 // held with it would otherwise never be seen.
                 self.observe_payload(singleton.cursor.held_bytes() + batch.data_size() as u64);
                 *support = (*support).min(singleton.cursor.predicate_support());
+                // A segment written without a projected column, or with null
+                // cells in one, reads as the field declares before its rows
+                // are decided, so a predicate after the dedup sees the
+                // declared defaults, as it does on the merge path.
+                let judged = self.predicate.as_ref().map(|p| p.column_id);
+                let (batch, mistyped) =
+                    match projection::conform_lenient(batch, &self.fields, judged) {
+                        Ok(conformed) => conformed,
+                        Err(e) => return Some(Err(e)),
+                    };
                 let SingletonStream { global, mode, .. } = &mut **singleton;
-                match self.shape_singleton_batch(batch, *global, mode, support) {
-                    Ok(Some(batch)) => return Some(Ok(batch)),
+                // A predicate over a column the batch stores under another
+                // type cannot judge its rows: it is set aside for this batch,
+                // so a row the dedup keeps fails the scan below.
+                let unjudged = match mode {
+                    SingletonMode::Dedup(state)
+                        if state
+                            .predicate
+                            .as_ref()
+                            .is_some_and(|p| mistyped.contains(&p.column_id)) =>
+                    {
+                        state.predicate.take()
+                    }
+                    _ => None,
+                };
+                let shaped = self.shape_singleton_batch(batch, *global, mode, support);
+                if let (Some(predicate), SingletonMode::Dedup(state)) = (unjudged, &mut *mode) {
+                    state.predicate = Some(predicate);
+                }
+                match shaped {
+                    // A column's type is the batch's, so any row it returns
+                    // stores the field under the other type.
+                    Ok(Some(_)) if !mistyped.is_empty() => {
+                        return Some(Err(projection::MISTYPED));
+                    }
+                    // The rows returned are decided: each is held to the
+                    // declarations.
+                    Ok(Some(batch)) => return Some(projection::conform(batch, &self.fields)),
                     Ok(None) => {}
                     Err(e) => return Some(Err(e)),
                 }
@@ -576,6 +1308,83 @@ impl ColumnarScan {
                 self.dedup_singleton_batch(&batch, global, state, support)
             }
         }
+    }
+
+    /// Whether the raw value is read by id, beside any declared field read
+    /// out of it: a field projects it by id, or the predicate runs on it and
+    /// no field declares its id.
+    pub(super) fn raw_value_read(&self) -> bool {
+        use crate::table::columnar::COL_VALUE;
+
+        let by_id = self
+            .fields
+            .iter()
+            .any(|f| f.column_id() == COL_VALUE && !projection::is_declared(f));
+        let declared = self
+            .fields
+            .iter()
+            .any(|f| f.column_id() == COL_VALUE && projection::is_declared(f));
+        by_id
+            || (!declared
+                && self
+                    .predicate
+                    .as_ref()
+                    .is_some_and(|p| p.column_id == COL_VALUE))
+    }
+
+    /// When the scan's predicate judges the decided rows of `batch`: before
+    /// their values are read where its column is one reading the values does
+    /// not change. The key and the seqno never change; a column no field
+    /// declares is the row's own physical cell, except on an operand still to
+    /// be resolved into a value read whole, which is judged after. A declared
+    /// field is read out of the value, so a predicate over one runs after.
+    pub(super) fn predicate_timing(&self, batch: &ColumnBatch) -> PredicateTiming {
+        use crate::table::columnar::COL_SEQNO;
+
+        let Some(pred) = &self.predicate else {
+            return PredicateTiming::AfterValues;
+        };
+        // The raw value and the value type are the row's own cells too: a
+        // whole-value source keeps its raw value in place when the predicate
+        // reads it, and only an operand still to be resolved rewrites them.
+        match pred.column_id {
+            COL_USER_KEY | COL_SEQNO => PredicateTiming::BeforeValues,
+            id if self
+                .fields
+                .iter()
+                .any(|f| f.column_id() == id && projection::is_declared(f)) =>
+            {
+                PredicateTiming::AfterValues
+            }
+            _ if self.resolver.is_some() && holds_operand(batch) => {
+                PredicateTiming::BeforeValuesExceptOperands
+            }
+            _ => PredicateTiming::BeforeValues,
+        }
+    }
+
+    /// `batch` without the rows that are not merge operands and fail the
+    /// scan's filtering predicate: the plain rows it judges before their
+    /// values are read, the operands left to it after. How far it ran is
+    /// counted when it runs on every row.
+    pub(super) fn filter_plain_rows(&self, batch: ColumnBatch) -> crate::Result<ColumnBatch> {
+        let Some(pred) = self
+            .predicate
+            .as_ref()
+            .filter(|p| p.apply == PredicateApply::Filter)
+        else {
+            return Ok(batch);
+        };
+        let operands = operand_rows(&batch);
+        let mask: Vec<bool> = pred
+            .matching_rows(&batch)
+            .into_iter()
+            .zip(operands)
+            .map(|(matches, operand)| matches || operand)
+            .collect();
+        let filtered = filter_batch(&batch, &mask)?;
+        self.record_gather(&filtered);
+        Ok(filtered)
     }
 
     /// Applies the scan's predicate to `batch` after the dedup, when it filters,
@@ -613,10 +1422,10 @@ impl ColumnarScan {
     ) -> crate::Result<Vec<(UserKey, UserKey, SeqNo)>> {
         let mut rts = Vec::new();
         for seg in segments {
-            for rt in seg.table.visible_range_tombstones() {
+            for rt in seg.range_tombstones() {
                 let eff = rt
                     .seqno
-                    .checked_add(seg.global)
+                    .checked_add(seg.rt_base())
                     .ok_or(Error::InvalidHeader(
                         "columnar_scan: effective range-tombstone seqno overflows",
                     ))?;
@@ -628,18 +1437,6 @@ impl ColumnarScan {
             }
         }
         Ok(rts)
-    }
-
-    /// Whether a row (`key` at tree-global `eff` seqno) is deleted by one of
-    /// the group's visible range tombstones: inside the half-open
-    /// `[start, end)` span and older than the deletion.
-    fn rt_covered(&self, rts: &[(UserKey, UserKey, SeqNo)], key: &[u8], eff: SeqNo) -> bool {
-        let cmp = self.comparator.as_ref();
-        rts.iter().any(|(start, end, rt_eff)| {
-            eff < *rt_eff
-                && cmp.compare(key, start.as_ref()) != core::cmp::Ordering::Less
-                && cmp.compare(key, end.as_ref()) == core::cmp::Ordering::Less
-        })
     }
 
     /// Whether the requested key range is fully unbounded, so no per-row range
@@ -743,24 +1540,26 @@ impl ColumnarScan {
         // that lives there. A visible RANGE tombstone routes there for the
         // same reason: covered rows must be suppressed, and that needs each
         // row's seqno, which the verbatim path never decodes.
-        if seg.may_dup
-            || seg.table.tombstone_count() > 0
-            || seg.table.weak_tombstone_count() > 0
-            || !rts.is_empty()
-        {
+        // So does a predicate over a declared field: a segment may lack its
+        // column, which reads as its declaration only once the batch is read,
+        // and a table's own predicate would find nothing to run on. A segment
+        // whose values are read late never gets here (see `reads_late`).
+        let predicate_on_declared = self.predicate.as_ref().is_some_and(|p| {
+            self.fields
+                .iter()
+                .any(|f| f.column_id() == p.column_id && projection::is_declared(f))
+        });
+        if seg.may_dup || seg.records_deletions() || predicate_on_declared || !rts.is_empty() {
             return self.open_singleton_dedup(seg, rts, predicate);
         }
         let range_filter = !self.range_is_full();
         if seg.visibility == SeqnoVisibility::All && !range_filter {
             // Pushed down in local coordinates (translated above); the seqno
             // column is globalized only on the way out.
+            let SegmentCursor { cursor, .. } =
+                self.segment_cursor(seg, &self.projection, predicate.as_ref(), self.budget)?;
             return Ok(GroupStream::Singleton(Box::new(SingletonStream {
-                cursor: self.segment_cursor(
-                    seg,
-                    &self.projection,
-                    predicate.as_ref(),
-                    self.budget,
-                )?,
+                cursor,
                 global: seg.global,
                 mode: SingletonMode::Verbatim,
             })));
@@ -779,8 +1578,10 @@ impl ColumnarScan {
         }
         let (augmented, dropped) = self.augment(&needed);
         // Same local-coordinate pushdown as the verbatim path above.
+        let SegmentCursor { cursor, .. } =
+            self.segment_cursor(seg, &augmented, predicate.as_ref(), self.budget)?;
         Ok(GroupStream::Singleton(Box::new(SingletonStream {
-            cursor: self.segment_cursor(seg, &augmented, predicate.as_ref(), self.budget)?,
+            cursor,
             global: seg.global,
             mode: SingletonMode::Masked {
                 partial,
@@ -916,18 +1717,20 @@ impl ColumnarScan {
         // not project the type column cannot tell that row from a live one with
         // an empty value. Decoded only for a segment that RECORDS deletions; one
         // without them keeps its columns untouched.
-        let deletes = seg.table.tombstone_count() > 0 || seg.table.weak_tombstone_count() > 0;
+        let deletes = seg.records_deletions();
         if deletes {
             needed.push(COL_VALUE_TYPE);
         }
         let (augmented, dropped) = self.augment(&needed);
+        // No predicate pushed down: it runs after the dedup (see above).
+        let SegmentCursor { cursor, .. } =
+            self.segment_cursor(seg, &augmented, None, self.budget)?;
         Ok(GroupStream::Singleton(Box::new(SingletonStream {
-            // No predicate pushed down: it runs after the dedup (see above).
-            cursor: self.segment_cursor(seg, &augmented, None, self.budget)?,
+            cursor,
             global: seg.global,
             mode: SingletonMode::Dedup(DedupState {
                 predicate,
-                rts,
+                rts: TombstoneSweep::new(rts, self.comparator.as_ref()),
                 partial,
                 deletes,
                 // Visible iff `local < threshold` (the snapshot in this
@@ -1030,7 +1833,7 @@ impl ColumnarScan {
                             .ok_or(Error::InvalidHeader(
                                 "columnar_scan: effective seqno overflows",
                             ))?;
-                    if self.rt_covered(&state.rts, key, eff) {
+                    if state.rts.covers(key, eff, cmp) {
                         mask.push(false);
                         continue;
                     }

@@ -205,6 +205,194 @@ fn a_wide_overlapping_group_holds_no_more_than_the_scan_budget() {
 }
 
 #[test]
+fn memtable_rows_merged_over_a_segment_hold_no_more_than_the_scan_budget() {
+    // A memtable is a row source: it reads its rows into batches too, and
+    // those batches are held beside the segment's pages within the same
+    // budget, however many of its rows would fit a batch by count.
+    const BUDGET: u64 = 64 * 1_024;
+    let folder = get_tmp_folder();
+    let AnyTree::Standard(tree) = Config::new(
+        folder.path(),
+        SequenceNumberCounter::default(),
+        SequenceNumberCounter::default(),
+    )
+    .columnar_scan_budget(BUDGET)
+    .open()
+    .expect("open") else {
+        panic!("expected a standard tree");
+    };
+    tree.update_runtime_config(|cfg| cfg.columnar = true)
+        .expect("enable columnar");
+    for i in (0..ROWS).step_by(2) {
+        tree.insert(key(i), vec![b'v'; 256], u64::from(i));
+    }
+    tree.flush_active_memtable(0).expect("flush");
+    for i in (1..ROWS).step_by(2) {
+        tree.insert(key(i), vec![b'm'; 1_024], u64::from(i));
+    }
+
+    let mut scan = tree
+        .columnar_scan(&[COL_USER_KEY, COL_VALUE], None, SeqNo::MAX, ..)
+        .expect("scan");
+    let mut rows = 0;
+    for batch in &mut scan {
+        rows += batch.expect("batch").row_count;
+    }
+    assert_eq!(rows, ROWS, "every key once");
+    assert_eq!(scan.oversized_reads(), 0, "every memtable row fits a share");
+    assert!(
+        scan.peak_payload_bytes() <= BUDGET,
+        "the scan held {} B under a {BUDGET} B budget",
+        scan.peak_payload_bytes(),
+    );
+}
+
+#[test]
+fn small_memtable_rows_hold_their_encoding_within_the_scan_budget() {
+    // Rows whose keys and values are small are mostly encoding: each carries
+    // two offsets, a seqno and a value type besides its bytes. The budget
+    // counts the batch as it is held, encoding included.
+    // The same from a memtable and from a row-oriented table.
+    const BUDGET: u64 = 4_096;
+    const SOURCE_ROWS: u32 = 2_000;
+    for flushed in [false, true] {
+        let folder = get_tmp_folder();
+        let AnyTree::Standard(tree) = Config::new(
+            folder.path(),
+            SequenceNumberCounter::default(),
+            SequenceNumberCounter::default(),
+        )
+        .columnar_scan_budget(BUDGET)
+        .open()
+        .expect("open") else {
+            panic!("expected a standard tree");
+        };
+        for i in 0..SOURCE_ROWS {
+            tree.insert(key(i), Vec::new(), u64::from(i));
+        }
+        if flushed {
+            tree.flush_active_memtable(0).expect("flush");
+        }
+
+        let mut scan = tree
+            .columnar_scan(&[COL_USER_KEY, COL_VALUE], None, SeqNo::MAX, ..)
+            .expect("scan");
+        let mut keys = Vec::new();
+        for batch in &mut scan {
+            let batch = batch.expect("batch");
+            for row in 0..batch.row_count {
+                keys.push(bytes_cell(&batch.columns[0].data, batch.row_count, row));
+            }
+        }
+        let expected: Vec<Vec<u8>> = (0..SOURCE_ROWS).map(key).collect();
+        assert_eq!(
+            expected, keys,
+            "every key once, in order (flushed: {flushed})"
+        );
+        assert_eq!(scan.oversized_reads(), 0, "every row fits the share");
+        assert!(
+            scan.peak_payload_bytes() <= BUDGET,
+            "the scan held {} B under a {BUDGET} B budget (flushed: {flushed})",
+            scan.peak_payload_bytes(),
+        );
+    }
+}
+
+#[test]
+fn a_row_table_cut_between_versions_resumes_at_the_version_it_stopped_at() {
+    // A share of one row cuts a row table's batch at every row, between the
+    // versions of one key too: each batch reads the table again from where
+    // the last stopped, past the versions it took, and the scan returns at
+    // a snapshot what a point read returns there.
+    // Two versions a key, two rows a share: a batch holds one key's versions
+    // and stops at the next key's newest one.
+    const VERSIONS: u64 = 2;
+    const KEYS: u32 = 40;
+    let folder = get_tmp_folder();
+    let AnyTree::Standard(tree) = Config::new(
+        folder.path(),
+        SequenceNumberCounter::default(),
+        SequenceNumberCounter::default(),
+    )
+    .columnar_scan_budget(64)
+    .open()
+    .expect("open") else {
+        panic!("expected a standard tree");
+    };
+    for i in 0..KEYS {
+        for version in 0..VERSIONS {
+            let seqno = u64::from(i) * VERSIONS + version + 1;
+            tree.insert(key(i), format!("v{version}"), seqno);
+        }
+    }
+    tree.flush_active_memtable(0).expect("flush");
+
+    // A snapshot inside the key range sees the newest versions below it and
+    // the older ones above it.
+    for snapshot in [VERSIONS, u64::from(KEYS / 2) * VERSIONS + 1, SeqNo::MAX] {
+        let mut got = Vec::new();
+        for batch in tree
+            .columnar_scan(&[COL_USER_KEY, COL_VALUE], None, snapshot, ..)
+            .expect("scan")
+        {
+            let batch = batch.expect("batch");
+            for row in 0..batch.row_count {
+                got.push((
+                    bytes_cell(&batch.columns[0].data, batch.row_count, row),
+                    bytes_cell(&batch.columns[1].data, batch.row_count, row),
+                ));
+            }
+        }
+        let expected: Vec<(Vec<u8>, Vec<u8>)> = (0..KEYS)
+            .filter_map(|i| {
+                tree.get(key(i), snapshot)
+                    .expect("get")
+                    .map(|value| (key(i), value.to_vec()))
+            })
+            .collect();
+        assert_eq!(expected, got, "snapshot {snapshot}");
+    }
+}
+
+#[test]
+fn a_memtable_row_larger_than_its_share_is_read_and_counted() {
+    // A budget smaller than one memtable row cannot be kept either: each row
+    // is read on its own, returned, and counted as a read past the share.
+    const BUDGET: u64 = 1;
+    const MEMTABLE_ROWS: u32 = 16;
+    let folder = get_tmp_folder();
+    let AnyTree::Standard(tree) = Config::new(
+        folder.path(),
+        SequenceNumberCounter::default(),
+        SequenceNumberCounter::default(),
+    )
+    .columnar_scan_budget(BUDGET)
+    .open()
+    .expect("open") else {
+        panic!("expected a standard tree");
+    };
+    tree.update_runtime_config(|cfg| cfg.columnar = true)
+        .expect("enable columnar");
+    for i in 0..MEMTABLE_ROWS {
+        tree.insert(key(i), vec![b'm'; 64], u64::from(i));
+    }
+
+    let mut scan = tree
+        .columnar_scan(&[COL_USER_KEY, COL_VALUE], None, SeqNo::MAX, ..)
+        .expect("scan");
+    let mut rows = 0;
+    for batch in &mut scan {
+        rows += batch.expect("batch").row_count;
+    }
+    assert_eq!(rows, MEMTABLE_ROWS, "every key once");
+    assert_eq!(
+        scan.oversized_reads(),
+        u64::from(MEMTABLE_ROWS),
+        "each row read past a one-byte share is counted",
+    );
+}
+
+#[test]
 fn a_row_page_larger_than_its_share_is_read_and_counted() {
     // A budget smaller than one row page cannot be kept: the scan still reads
     // each page, one at a time, returns every row, and counts every read that

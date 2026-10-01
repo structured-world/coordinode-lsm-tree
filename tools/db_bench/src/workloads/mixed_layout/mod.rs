@@ -609,6 +609,11 @@ fn scenarios(config: &BenchConfig) -> Vec<Scenario> {
             support: Support::Native(verify_point_reads),
         },
         Scenario {
+            name: "row-updates-over-columnar-base-scan",
+            fixture: fixtures::columnar_base_row_updates,
+            support: Support::Scan(scan_columnar),
+        },
+        Scenario {
             name: "versions-deletes-tombstones",
             fixture: fixtures::versions_deletes_tombstones,
             support: Support::Native(verify_point_reads),

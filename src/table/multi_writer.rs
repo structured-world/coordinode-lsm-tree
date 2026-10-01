@@ -153,6 +153,11 @@ pub struct MultiWriter {
     /// flush / compaction uniformly writes columnar (or row-major) data blocks.
     use_columnar: bool,
 
+    /// How the current output of a columnar write stores each value: whole
+    /// after a row, split after an ingested batch, `None` before either. A
+    /// table records one layout, so a write of the other one rotates first.
+    value_layout: Option<crate::table::meta::ValueLayout>,
+
     /// Preserved across writer rotation so every successor [`Writer`] of one
     /// bulk ingest is uniformly flagged bulk-ingested (see
     /// [`Writer::use_bulk_ingested`]).
@@ -309,6 +314,7 @@ impl MultiWriter {
             #[cfg(zstd_any)]
             use_zstd_two_pass_seed: true,
             use_columnar: false,
+            value_layout: None,
             bulk_ingested: false,
             recency: None,
             lineage: None,
@@ -931,6 +937,7 @@ impl MultiWriter {
     fn rotate(&mut self) -> crate::Result<()> {
         log::debug!("Rotating table writer");
         self.output_base = None;
+        self.value_layout = None;
 
         let new_table_id = self.table_id_generator.next();
         let path = self.base_path.join(new_table_id.to_string());
@@ -1220,13 +1227,21 @@ impl MultiWriter {
                 }
             }
 
-            if self.table_full() && self.rotation_sheds(&item.key.user_key, (0, 0)) {
+            // A table records one value layout, so a row after an ingested
+            // batch starts the next table.
+            let layout_changes = self.value_layout == Some(crate::table::meta::ValueLayout::Split);
+            if layout_changes
+                || (self.table_full() && self.rotation_sheds(&item.key.user_key, (0, 0)))
+            {
                 self.rotate()?;
                 self.tombstone_share.open_output(&item.key.user_key);
             }
         }
 
         self.writer.write(item)?;
+        if self.use_columnar {
+            self.value_layout = Some(crate::table::meta::ValueLayout::Whole);
+        }
         self.note_output_base();
 
         // The transform-attribution milestone: verdicts ticked up to a
@@ -1248,14 +1263,18 @@ impl MultiWriter {
         &mut self,
         batch: &crate::table::columnar::ColumnBatch,
     ) -> crate::Result<Option<crate::UserKey>> {
-        if self.table_full() {
+        // A table records one value layout, so a batch after rows starts the
+        // next table.
+        if self.table_full() || self.value_layout == Some(crate::table::meta::ValueLayout::Whole) {
             self.rotate()?;
         }
         // A batch lands whole, so the output's base is what it held before
         // it: closing after the batch sheds all of the batch's state.
         self.note_output_base();
         let comparator = self.comparator.clone();
-        self.writer.write_columnar_batch(batch, &comparator)
+        let last = self.writer.write_columnar_batch(batch, &comparator)?;
+        self.value_layout = Some(crate::table::meta::ValueLayout::Split);
+        Ok(last)
     }
 
     /// Records what the current output carries at its first record, or before

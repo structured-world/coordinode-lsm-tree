@@ -209,6 +209,31 @@ does not get to have both without a decision about which binding is worth its
 cost, and that decision belongs with the page identity scheme, measured — not
 assumed in either direction.
 
+## Which columns a value occupies
+
+A column id does not by itself say what the column holds. A row written
+through the row path and transposed at a flush or a compaction keeps its value
+whole, in the value column `COL_VALUE`; a columnar batch ingested as its
+caller built it keeps the value split into the caller's fields, one column
+each, and a caller's first field may take the same id. A compaction that
+rewrites a split table through the row path folds its fields back into one
+value, framed by type with no column ids, so after it the fields exist only
+inside the whole value.
+
+**So every columnar table records which layout its values use**, in the
+descriptor property `descriptor#value_layout`: `0` whole, `1` split. A table
+without the property stores values whole. A writer fixes the layout with its
+first columnar block and holds one per table; an ingestion that writes rows
+after batches, or batches after rows, starts a new table at the switch. A
+rewrite that re-emits a source's blocks unchanged keeps the source's layout.
+
+A reader asks for a field by id only of a split table. Of a whole one it reads
+the value and hands it to the caller's projector, the only party that knows
+how the value encodes its fields; a missing column of a whole table says
+nothing about whether the field exists. The scan does this only for the rows
+it returns, once the newest visible version of each key is chosen, so a
+shadowed, deleted or too-new version is never read through the projector.
+
 ## What this means for the conversion
 
 The offline converter preserves the logical geometry and changes only the
@@ -217,6 +242,11 @@ ordinals, `block_id` keeps its meaning. The locator is repacked to address the
 same logical units; the delete bitmap's positions are unchanged **because the
 positions are unchanged**, though the lookup that finds them is rebuilt, since
 it was keyed by a file offset that no longer exists.
+
+A converted columnar table records its value layout like any other: whole
+for a table the row path produced, split for one ingested as fields. The 5.x
+format carries no such marker, so the converter decides it per table from how
+the table was written, and stamps it.
 
 A restriction bound is a KEY, not a position, so it converts unchanged. The
 hole punch underneath it does not: it names a byte prefix of a file the

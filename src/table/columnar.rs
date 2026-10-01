@@ -490,6 +490,15 @@ fn check_layout(type_tag: TypeTag, row_count: u32, data: &[u8]) -> Result<()> {
 }
 
 impl Column {
+    /// Whether row `row` holds a cell rather than a null: set in the validity
+    /// bitmap, or the column has none.
+    pub(crate) fn is_valid(&self, row: u32) -> bool {
+        self.validity.as_deref().is_none_or(|bits| {
+            bits.get(row as usize / 8)
+                .is_some_and(|byte| byte >> (row % 8) & 1 == 1)
+        })
+    }
+
     /// Validates that the column is well-formed for `row_count` rows: a nonzero
     /// fixed width with `row_count * width` data bytes, a correctly framed
     /// `Bytes` offset table, and a correctly sized / padded validity bitmap.

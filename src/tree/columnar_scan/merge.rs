@@ -21,24 +21,38 @@
 
 use alloc::vec::Vec;
 
-use super::{ColumnarScan, Segment, drop_columns, key_in_bounds};
+use super::projection::{MISTYPED, ProjectedField, conform, conform_lenient};
+use super::rows::SourceCursor;
+use super::{ColumnarScan, Segment, SegmentCursor, drop_columns, key_in_bounds};
+use super::{PredicateTiming, TombstoneSweep};
+use super::{Resolved, UNREADABLE_BY_ID};
 use crate::table::columnar::{
-    COL_SEQNO, COL_USER_KEY, COL_VALUE_TYPE, ColumnBatch, TypeTag, bytes_column_row,
-    bytes_column_span, fixed_u64_row,
+    COL_SEQNO, COL_USER_KEY, COL_VALUE, COL_VALUE_TYPE, Column, ColumnBatch, TypeTag,
+    bytes_column_row, bytes_column_span, fixed_u64_row, frame_bytes_column,
 };
-use crate::table::columnar_cursor::ColumnarCursor;
 use crate::table::columnar_predicate::PredicateSupport;
 use crate::{Error, SeqNo, UserKey};
 
 /// Rows an output batch of the merge is cut at.
 const TARGET_ROWS: usize = 4_096;
 
+/// The id under which a merge carries each row's whole value from a
+/// whole-value source to the rows it returns, null for a row of a source
+/// that splits its values. It never reaches the caller, and a projection may
+/// not name it.
+pub(super) const COL_WHOLE_VALUE: u16 = u16::MAX;
+
 /// One segment of an overlapping group, read through its cursor.
 struct MergeSource {
-    cursor: ColumnarCursor,
+    cursor: SourceCursor,
+    /// Whether the segment carries each row's whole value (see
+    /// [`COL_WHOLE_VALUE`]).
+    whole: bool,
     /// The batch the source is in, `None` before the first and once the
     /// cursor is exhausted.
     batch: Option<ColumnBatch>,
+    /// How `batch` stores the projected fields.
+    types: FieldTypes,
     /// The next row of `batch` to consider.
     row: u32,
     /// Where `batch` keeps the key and seqno columns.
@@ -60,6 +74,20 @@ struct MergeSource {
     /// Whether a row of `batch` is chosen for the output being built, so the
     /// batch must stay until the output is gathered.
     referenced: bool,
+}
+
+/// How a source's batch stores the projected fields.
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+enum FieldTypes {
+    /// Each under the type its field declares.
+    AsDeclared,
+    /// One under another type: a row of the batch the scan returns fails the
+    /// scan, one shadowed or filtered out does not.
+    Mistyped,
+    /// The predicate's own column under another type: the predicate cannot
+    /// judge a row of the batch, so a row chosen from it fails the scan as a
+    /// returned one would.
+    MistypedUnderPredicate,
 }
 
 impl MergeSource {
@@ -95,10 +123,31 @@ pub(super) struct MergeStream {
     /// Columns decoded only for the merge and the predicate, dropped from each
     /// output batch.
     dropped: Vec<u16>,
+    /// The projected fields followed by the merge's own columns: every batch
+    /// a source loads is brought to them, so the sources agree on their
+    /// columns even where a segment was written without a projected one.
+    fields: Vec<ProjectedField>,
+    /// The columns of no declared type the merge decodes: projected by id, or
+    /// the predicate's when no field names it. A source may be written
+    /// without one, or hold it inside a whole value, and nothing says how
+    /// such a row reads for it, so only the rows chosen are held to it.
+    loose: Vec<u16>,
+    /// The predicate's column when it is loose: rows chosen from batches
+    /// that do not all carry it cannot be judged.
+    loose_predicate: Option<u16>,
+    /// Whether the rows returned have their values read (see
+    /// [`ColumnarScan::read_late`]), so every batch carries the whole-value
+    /// column.
+    late: bool,
+    /// Whether the raw value stays beside the whole value a source carries.
+    raw: RawValue,
+    /// The column the scan's predicate runs on, if it has one.
+    predicate_column: Option<u16>,
     /// Whether a segment of the group records deletions, so the value type is
     /// decoded.
     deletes: bool,
-    rts: Vec<(UserKey, UserKey, SeqNo)>,
+    /// The group's visible range tombstones.
+    rts: TombstoneSweep,
     /// The user key last decided: its remaining rows are shadowed.
     last_key: Option<Vec<u8>>,
     pending: Vec<Pick>,
@@ -122,9 +171,9 @@ impl MergeStream {
         // them; the predicate's column for the filter after the dedup; the
         // value type where a segment records deletions, because the newest
         // version of a key can BE a deletion and then the key yields nothing.
-        let deletes = segments
-            .iter()
-            .any(|s| s.table.tombstone_count() > 0 || s.table.weak_tombstone_count() > 0);
+        // An operand can resolve to a deletion, so a tree that merges decodes
+        // the value type of every source.
+        let deletes = scan.resolver.is_some() || segments.iter().any(Segment::records_deletions);
         let mut needed = alloc::vec![COL_USER_KEY, COL_SEQNO];
         if let Some(pred) = &scan.predicate {
             needed.push(pred.column_id);
@@ -133,6 +182,40 @@ impl MergeStream {
             needed.push(COL_VALUE_TYPE);
         }
         let (augmented, dropped) = scan.augment(&needed);
+        // The merge's own intrinsic columns are always present. An unprojected
+        // predicate column is not a projected field, so no absence rule
+        // applies to it: a segment without it leaves the predicate to report
+        // how far it ran.
+        let fields = scan
+            .fields
+            .iter()
+            .cloned()
+            .chain(
+                dropped
+                    .iter()
+                    .copied()
+                    .map(ProjectedField::by_id)
+                    .filter(|field| field.type_tag().is_some()),
+            )
+            .collect();
+        let mut loose: Vec<u16> = scan
+            .fields
+            .iter()
+            .filter(|f| f.type_tag().is_none())
+            .map(ProjectedField::column_id)
+            .collect();
+        let loose_predicate = scan.predicate.as_ref().map(|p| p.column_id).filter(|&id| {
+            ProjectedField::by_id(id).type_tag().is_none()
+                && scan
+                    .fields
+                    .iter()
+                    .all(|f| f.column_id() != id || f.type_tag().is_none())
+        });
+        if let Some(id) = loose_predicate
+            && !loose.contains(&id)
+        {
+            loose.push(id);
+        }
         // The sources share the scan's budget: each holds its current batch
         // and what its cursor read ahead within an equal part of it.
         let share = scan.budget / (segments.len() as u64).max(1);
@@ -143,9 +226,13 @@ impl MergeStream {
                 // version (including a newest one that fails the predicate but
                 // shadows an older matching version) has to be seen, and the
                 // zone-map skip it would drive is unsafe for the same reason.
+                let SegmentCursor { cursor, whole } =
+                    scan.segment_cursor(seg, &augmented, None, share)?;
                 Ok(MergeSource {
-                    cursor: scan.segment_cursor(seg, &augmented, None, share)?,
+                    cursor,
+                    whole,
                     batch: None,
+                    types: FieldTypes::AsDeclared,
                     row: 0,
                     key_col: 0,
                     seqno_col: 0,
@@ -159,11 +246,22 @@ impl MergeStream {
                 })
             })
             .collect::<crate::Result<Vec<_>>>()?;
+        let late = segments.iter().any(|seg| scan.reads_late(seg));
         Ok(Self {
             sources,
             dropped,
+            fields,
+            loose,
+            loose_predicate,
+            late,
+            raw: if scan.raw_value_read() {
+                RawValue::Kept
+            } else {
+                RawValue::Moved
+            },
+            predicate_column: scan.predicate.as_ref().map(|p| p.column_id),
             deletes,
-            rts,
+            rts: TombstoneSweep::new(rts, scan.comparator.as_ref()),
             last_key: None,
             pending: Vec::new(),
             heap: Vec::with_capacity(segments.len()),
@@ -209,7 +307,7 @@ impl MergeStream {
             let keep = if shadowed {
                 false
             } else {
-                let keep = decide(scan, source, self.deletes, &self.rts, key, eff)?;
+                let keep = decide(scan, source, self.deletes, &mut self.rts, key, eff)?;
                 let last = self.last_key.get_or_insert_with(Vec::new);
                 last.clear();
                 last.extend_from_slice(key);
@@ -321,6 +419,8 @@ impl MergeStream {
         cmp: &dyn crate::comparator::UserComparator,
     ) -> crate::Result<(Position, Option<u64>)> {
         let last_key = self.last_key.as_deref();
+        let (fields, late, raw, predicate_column) =
+            (&self.fields, self.late, self.raw, self.predicate_column);
         let Some(source) = self.sources.get_mut(i) else {
             return Ok((Position::Exhausted, None));
         };
@@ -361,7 +461,20 @@ impl MergeStream {
             match source.cursor.next() {
                 None => return Ok((Position::Exhausted, loaded)),
                 Some(batch) => {
-                    let batch = batch?;
+                    // A whole value moves aside before the conform, where a
+                    // declared field may share the value column's id.
+                    let batch = carry_whole_value(batch?, source.whole, raw);
+                    // Its rows are not decided yet: a shadowed or deleted
+                    // one must not fail the scan, and the predicate after
+                    // the dedup sees the declared defaults.
+                    let (batch, mistyped) = conform_lenient(batch, fields, predicate_column)?;
+                    // Every source then carries the whole value last, null
+                    // where it splits its values, so the sources agree.
+                    let batch = if late {
+                        last_whole_value(batch)?
+                    } else {
+                        batch
+                    };
                     // Keys are read row by row from their framing, which only
                     // a bytes column carries.
                     if batch
@@ -388,6 +501,13 @@ impl MergeStream {
                     source.key_col = place(COL_USER_KEY)?;
                     source.seqno_col = place(COL_SEQNO)?;
                     source.batch = Some(batch);
+                    source.types = if mistyped.is_empty() {
+                        FieldTypes::AsDeclared
+                    } else if predicate_column.is_some_and(|id| mistyped.contains(&id)) {
+                        FieldTypes::MistypedUnderPredicate
+                    } else {
+                        FieldTypes::Mistyped
+                    };
                     source.row = 0;
                     let held = source.held_bytes();
                     loaded = Some(loaded.map_or(held, |peak| peak.max(held)));
@@ -405,7 +525,7 @@ impl MergeStream {
         support: &mut PredicateSupport,
     ) -> crate::Result<Option<ColumnBatch>> {
         let pending = core::mem::take(&mut self.pending);
-        let merged = if pending.is_empty() {
+        let built = if pending.is_empty() {
             None
         } else {
             Some(self.build(&pending)?)
@@ -413,47 +533,337 @@ impl MergeStream {
         for source in &mut self.sources {
             source.referenced = false;
         }
-        let Some(merged) = merged else {
+        let Some((merged, judged, left_out)) = built else {
             return Ok(None);
         };
         scan.record_gather(&merged);
-
         // The row predicate runs AFTER the dedup: each row is the newest
         // visible version of its key, so a key whose newest version fails the
         // predicate is dropped instead of falling back to an older matching
         // version. It runs in the scan's coordinates, on effective seqnos.
-        let mut merged = scan.filter_after_dedup(merged, scan.predicate.as_ref(), support)?;
+        // Rows that do not all carry its column are returned unjudged.
+        //
+        // Over a column reading the values does not change, it runs before
+        // they are read, so a row it drops is never resolved or handed to the
+        // projector; an operand still to be resolved is judged after.
+        let timing = if judged {
+            scan.predicate_timing(&merged)
+        } else {
+            PredicateTiming::AfterValues
+        };
+        let early = timing == PredicateTiming::BeforeValues;
+        let merged = match timing {
+            PredicateTiming::BeforeValues => {
+                scan.filter_after_dedup(merged, scan.predicate.as_ref(), support)?
+            }
+            PredicateTiming::BeforeValuesExceptOperands => scan.filter_plain_rows(merged)?,
+            PredicateTiming::AfterValues => merged,
+        };
+        if merged.row_count == 0 {
+            return Ok(None);
+        }
+        // The rows are decided: their operands are resolved and their fields
+        // read out of their values now, and read as declared before the
+        // predicate sees them.
+        let (merged, resolved) = if self.late {
+            let (merged, resolved) = scan.read_late(merged)?;
+            // Every declared column now holds its declared type: read out of
+            // a value, or conformed when its source was loaded.
+            let (merged, mistyped) = conform_lenient(merged, &scan.fields, self.predicate_column)?;
+            if !mistyped.is_empty() {
+                return Err(MISTYPED);
+            }
+            (merged, resolved)
+        } else {
+            (merged, Resolved::default())
+        };
+        // A row whose predicate column its batch stores under another type
+        // cannot be judged, unless its operand was resolved and the column
+        // read out of the merged value: it is not filtered out, so it fails
+        // the scan as a returned row of its batch would.
+        if pending
+            .iter()
+            .any(|pick| self.source_types(pick) == Some(FieldTypes::MistypedUnderPredicate))
+        {
+            let returned = self.returned_picks(&merged, &pending)?;
+            let keys = merged
+                .columns
+                .iter()
+                .find(|c| c.column_id == COL_USER_KEY)
+                .ok_or(MISSING_COLUMN)?;
+            for (row, pick) in (0..merged.row_count).zip(&returned) {
+                if self.source_types(pick) == Some(FieldTypes::MistypedUnderPredicate)
+                    && !resolved.holds(bytes_column_row(&keys.data, merged.row_count, row)?)
+                {
+                    return Err(MISTYPED);
+                }
+            }
+        }
+        // An operand resolved to a value is read whole, so its cell in a
+        // column no field declares is the operand's own: a loose predicate
+        // cannot judge it.
+        let judged = judged && !(resolved.any() && self.loose_predicate.is_some());
+        let mut merged = if early {
+            merged
+        } else if judged {
+            scan.filter_after_dedup(merged, scan.predicate.as_ref(), support)?
+        } else {
+            *support = (*support).min(PredicateSupport::Unsupported);
+            merged
+        };
+        if merged.row_count == 0 {
+            return Ok(None);
+        }
+        // Only a returned row is held to what its fields can be read as: a
+        // row a field projected by id cannot be read for fails the scan, and
+        // so does one from a batch that stores a projected field under another
+        // type, unless its operand was resolved and its fields read out of the
+        // merged value instead. A shadowed or filtered row did not.
+        if pending.iter().any(|pick| self.taken_from_mistyped(pick)) || resolved.any() {
+            let returned = self.returned_picks(&merged, &pending)?;
+            let keys = merged
+                .columns
+                .iter()
+                .find(|c| c.column_id == COL_USER_KEY)
+                .ok_or(MISSING_COLUMN)?;
+            for (row, pick) in (0..merged.row_count).zip(&returned) {
+                let key = bytes_column_row(&keys.data, merged.row_count, row)?;
+                if resolved.unreadable(key) {
+                    return Err(UNREADABLE_BY_ID);
+                }
+                if self.taken_from_mistyped(pick) && !resolved.holds(key) {
+                    return Err(MISTYPED);
+                }
+            }
+        }
+        // A projected column left out because some chosen row lacked it is
+        // brought back for the rows the predicate kept, when they all have it.
+        if !left_out.is_empty() {
+            self.fill_left_out(&mut merged, &pending, &left_out, &scan.fields)?;
+        }
         // Match the singleton contract: yield exactly the projected columns.
         drop_columns(&mut merged, &self.dropped);
-        Ok((merged.row_count > 0).then_some(merged))
+        // The rows returned are decided: each is held to the declarations.
+        let merged = conform(merged, &scan.fields)?;
+        Ok(Some(merged))
+    }
+
+    /// The chosen row of `pending` each row of `merged`, the rows returned out
+    /// of them, was taken from.
+    fn returned_picks<'p>(
+        &self,
+        merged: &ColumnBatch,
+        pending: &'p [Pick],
+    ) -> crate::Result<Vec<&'p Pick>> {
+        let keys = merged
+            .columns
+            .iter()
+            .find(|c| c.column_id == COL_USER_KEY)
+            .ok_or(MISSING_COLUMN)?;
+        // The returned rows keep the order they were chosen in and their keys
+        // are distinct, so each is the next chosen row with its key.
+        let mut returned: Vec<&Pick> = Vec::with_capacity(merged.row_count as usize);
+        let mut picks = pending.iter();
+        for row in 0..merged.row_count {
+            let key = bytes_column_row(&keys.data, merged.row_count, row)?;
+            let pick = picks
+                .find(|pick| {
+                    self.sources
+                        .get(pick.source)
+                        .and_then(|s| {
+                            let batch = s.batch.as_ref()?;
+                            let column = batch.columns.get(s.key_col)?;
+                            bytes_column_row(&column.data, batch.row_count, pick.row).ok()
+                        })
+                        .is_some_and(|chosen| chosen == key)
+                })
+                .ok_or(Error::InvalidHeader(
+                    "columnar_scan: a returned row is not among the rows chosen",
+                ))?;
+            returned.push(pick);
+        }
+        Ok(returned)
+    }
+
+    /// Whether `pick` was taken from a batch that stores a projected field
+    /// under another type than declared.
+    fn taken_from_mistyped(&self, pick: &Pick) -> bool {
+        self.source_types(pick)
+            .is_some_and(|types| types != FieldTypes::AsDeclared)
+    }
+
+    /// How the batch `pick` was taken from stores the projected fields.
+    fn source_types(&self, pick: &Pick) -> Option<FieldTypes> {
+        self.sources.get(pick.source).map(|s| s.types)
+    }
+
+    /// Adds to `merged`, the rows returned out of the chosen `pending` ones,
+    /// each `left_out` column a field of `fields` projects, gathered from the
+    /// batches those rows come from, when every one of them carries it under
+    /// one type. A column some returned row lacks stays out, and the row
+    /// fails the conform that follows.
+    fn fill_left_out(
+        &self,
+        merged: &mut ColumnBatch,
+        pending: &[Pick],
+        left_out: &[u16],
+        fields: &[ProjectedField],
+    ) -> crate::Result<()> {
+        let returned = self.returned_picks(merged, pending)?;
+        let rows = returned.len();
+        for &id in left_out {
+            if !fields.iter().any(|f| f.column_id() == id) {
+                continue;
+            }
+            // Each returned row's cell in the column, or `None` when its batch
+            // lacks the column.
+            let mut located: Vec<(&Column, u32, u32)> = Vec::with_capacity(rows);
+            for pick in &returned {
+                let Some(batch) = self.sources.get(pick.source).and_then(|s| s.batch.as_ref())
+                else {
+                    break;
+                };
+                let Some(column) = batch.columns.iter().find(|c| c.column_id == id) else {
+                    break;
+                };
+                located.push((column, batch.row_count, pick.row));
+            }
+            let Some(&(first, _, _)) = located.first() else {
+                continue;
+            };
+            let type_tag = first.type_tag;
+            if located.len() != rows || located.iter().any(|(c, _, _)| c.type_tag != type_tag) {
+                continue;
+            }
+            let data = if let Some(width) = type_tag.fixed_width() {
+                let width = usize::from(width);
+                let mut out = Vec::with_capacity(rows * width);
+                for &(column, _, row) in &located {
+                    let start = row as usize * width;
+                    out.extend_from_slice(
+                        column
+                            .data
+                            .get(start..start + width)
+                            .ok_or(MISSING_COLUMN)?,
+                    );
+                }
+                crate::Slice::from(out)
+            } else {
+                let mut cells: Vec<&[u8]> = Vec::with_capacity(rows);
+                for &(column, count, row) in &located {
+                    cells.push(bytes_column_row(&column.data, count, row)?);
+                }
+                frame_bytes_column(rows, || cells.iter().copied())?
+            };
+            let validity = located
+                .iter()
+                .any(|(c, _, _)| c.validity.is_some())
+                .then(|| {
+                    let mut bits = alloc::vec![0u8; rows.div_ceil(8)];
+                    for (at, &(column, _, row)) in located.iter().enumerate() {
+                        if column.is_valid(row)
+                            && let Some(byte) = bits.get_mut(at / 8)
+                        {
+                            *byte |= 1 << (at % 8);
+                        }
+                    }
+                    bits
+                });
+            merged.columns.push(Column {
+                column_id: id,
+                type_tag,
+                validity,
+                data,
+            });
+        }
+        Ok(())
     }
 
     /// The chosen rows as one batch, in the order they were chosen, each column
     /// built straight from the batches its rows sit in: nothing is copied but
     /// the chosen cells. The seqno column is written with each row's effective
     /// seqno, since the rows come from segments with different bases.
-    fn build(&self, pending: &[Pick]) -> crate::Result<ColumnBatch> {
+    ///
+    /// A loose column the chosen rows do not all carry under one type is left
+    /// out and named in the third result, for [`Self::fill_left_out`] to bring
+    /// back for the rows returned. Also returns whether the predicate can
+    /// judge the rows: `false` when its loose column is left out.
+    fn build(&self, pending: &[Pick]) -> crate::Result<(ColumnBatch, bool, Vec<u16>)> {
         use crate::table::columnar::{Column, frame_bytes_column, gather_fixed_column};
 
+        const NOT_KEPT: Error =
+            Error::InvalidHeader("columnar_scan: a chosen row's batch was not kept");
         let batch_of = |pick: &Pick| self.sources.get(pick.source).and_then(|s| s.batch.as_ref());
-        let template = pending
-            .first()
-            .and_then(batch_of)
-            .ok_or(Error::InvalidHeader(
-                "columnar_scan: a chosen row's batch was not kept",
-            ))?;
-        // Every batch a row is taken from carries the template's columns in
-        // its order, so one column index names the same column in each.
-        for source in self.sources.iter().filter(|s| s.referenced) {
-            let batch = source.batch.as_ref().ok_or(Error::InvalidHeader(
-                "columnar_scan: a chosen row's batch was not kept",
-            ))?;
-            let agree = batch.columns.len() == template.columns.len()
-                && batch
+        let template = pending.first().and_then(batch_of).ok_or(NOT_KEPT)?;
+        let type_of = |batch: &ColumnBatch, id: u16| {
+            batch
+                .columns
+                .iter()
+                .find(|c| c.column_id == id)
+                .map(|c| c.type_tag)
+        };
+        let mut left_out: Vec<u16> = Vec::new();
+        for &id in &self.loose {
+            let expected = type_of(template, id);
+            for source in self.sources.iter().filter(|s| s.referenced) {
+                let batch = source.batch.as_ref().ok_or(NOT_KEPT)?;
+                if type_of(batch, id) != expected {
+                    left_out.push(id);
+                    break;
+                }
+            }
+        }
+        let judged = self
+            .loose_predicate
+            .is_none_or(|id| !left_out.contains(&id));
+        let uniform = left_out.is_empty();
+        let kept = |id: u16| !left_out.contains(&id);
+        let heads: Vec<(u16, TypeTag)> = template
+            .columns
+            .iter()
+            .filter(|c| kept(c.column_id))
+            .map(|c| (c.column_id, c.type_tag))
+            .collect();
+        // Every batch a row is taken from carries the kept columns in the
+        // template's order. Where each batch keeps them all, one column index
+        // names the same column in each; otherwise each source's places of
+        // the kept columns are found once.
+        let mut places: Option<Vec<Vec<usize>>> =
+            (!uniform).then(|| alloc::vec![Vec::new(); self.sources.len()]);
+        for (i, source) in self
+            .sources
+            .iter()
+            .enumerate()
+            .filter(|(_, s)| s.referenced)
+        {
+            let batch = source.batch.as_ref().ok_or(NOT_KEPT)?;
+            let agree = if let Some(places) = places.as_mut() {
+                let at: Vec<usize> = batch
                     .columns
                     .iter()
-                    .zip(&template.columns)
-                    .all(|(a, b)| a.column_id == b.column_id && a.type_tag == b.type_tag);
+                    .enumerate()
+                    .filter(|(_, c)| kept(c.column_id))
+                    .map(|(at, _)| at)
+                    .collect();
+                let agree = at.len() == heads.len()
+                    && at.iter().zip(&heads).all(|(&at, &(id, type_tag))| {
+                        batch
+                            .columns
+                            .get(at)
+                            .is_some_and(|c| c.column_id == id && c.type_tag == type_tag)
+                    });
+                if let Some(slot) = places.get_mut(i) {
+                    *slot = at;
+                }
+                agree
+            } else {
+                batch.columns.len() == heads.len()
+                    && batch
+                        .columns
+                        .iter()
+                        .zip(&heads)
+                        .all(|(c, &(id, type_tag))| c.column_id == id && c.type_tag == type_tag)
+            };
             if !agree {
                 return Err(Error::InvalidHeader(
                     "columnar_scan: merged segments disagree on their columns",
@@ -468,17 +878,21 @@ impl MergeStream {
         // Each source batch was validated when it was loaded, so every cell a
         // pick names is there: the fallbacks below are never taken.
         let cell = |pick: &Pick, index: usize| {
-            batch_of(pick).and_then(|b| Some((b.columns.get(index)?, b.row_count)))
+            let at = match &places {
+                None => index,
+                Some(places) => *places.get(pick.source)?.get(index)?,
+            };
+            batch_of(pick).and_then(|b| Some((b.columns.get(at)?, b.row_count)))
         };
-        let mut columns = Vec::with_capacity(template.columns.len());
-        for (index, head) in template.columns.iter().enumerate() {
-            let data = if head.column_id == COL_SEQNO {
+        let mut columns = Vec::with_capacity(heads.len());
+        for (index, &(column_id, type_tag)) in heads.iter().enumerate() {
+            let data = if column_id == COL_SEQNO {
                 let mut out = Vec::with_capacity(count * 8);
                 for pick in pending {
                     out.extend_from_slice(&pick.eff.to_le_bytes());
                 }
                 crate::Slice::from(out)
-            } else if let Some(width) = head.type_tag.fixed_width() {
+            } else if let Some(width) = type_tag.fixed_width() {
                 let width = usize::from(width);
                 gather_fixed_column(
                     width,
@@ -519,14 +933,68 @@ impl MergeStream {
                     bits
                 });
             columns.push(Column {
-                column_id: head.column_id,
-                type_tag: head.type_tag,
+                column_id,
+                type_tag,
                 validity,
                 data,
             });
         }
-        Ok(ColumnBatch { row_count, columns })
+        Ok((ColumnBatch { row_count, columns }, judged, left_out))
     }
+}
+
+/// What becomes of a whole-value source's value column when it moves under
+/// [`COL_WHOLE_VALUE`].
+#[derive(Clone, Copy, PartialEq, Eq)]
+enum RawValue {
+    /// Nothing reads the raw value: the column is renamed.
+    Moved,
+    /// The raw value is read too (see [`ColumnarScan::raw_value_read`]): the
+    /// column is copied and stays.
+    Kept,
+}
+
+/// `batch` of a source that carries whole values (`whole`) with its value
+/// column under [`COL_WHOLE_VALUE`], as `raw` says.
+fn carry_whole_value(mut batch: ColumnBatch, whole: bool, raw: RawValue) -> ColumnBatch {
+    if !whole {
+        return batch;
+    }
+    if let Some(at) = batch.columns.iter().position(|c| c.column_id == COL_VALUE) {
+        if raw == RawValue::Kept {
+            if let Some(value) = batch.columns.get(at).cloned() {
+                batch.columns.push(Column {
+                    column_id: COL_WHOLE_VALUE,
+                    ..value
+                });
+            }
+        } else if let Some(value) = batch.columns.get_mut(at) {
+            value.column_id = COL_WHOLE_VALUE;
+        }
+    }
+    batch
+}
+
+/// `batch` with its whole-value column last, or with a null one appended when
+/// its source splits its values.
+fn last_whole_value(mut batch: ColumnBatch) -> crate::Result<ColumnBatch> {
+    let at = batch
+        .columns
+        .iter()
+        .position(|c| c.column_id == COL_WHOLE_VALUE);
+    let column = if let Some(at) = at {
+        batch.columns.remove(at)
+    } else {
+        let rows = batch.row_count as usize;
+        Column {
+            column_id: COL_WHOLE_VALUE,
+            type_tag: TypeTag::Bytes,
+            validity: Some(alloc::vec![0u8; rows.div_ceil(8)]),
+            data: frame_bytes_column(rows, || core::iter::repeat_n(&[][..], rows))?,
+        }
+    };
+    batch.columns.push(column);
+    Ok(batch)
 }
 
 /// A merge source index that names no source.
@@ -628,7 +1096,7 @@ fn decide(
     scan: &ColumnarScan,
     source: &MergeSource,
     deletes: bool,
-    rts: &[(UserKey, UserKey, SeqNo)],
+    rts: &mut TombstoneSweep,
     key: &[u8],
     eff: SeqNo,
 ) -> crate::Result<bool> {
@@ -655,7 +1123,7 @@ fn decide(
     // A visible range tombstone covering the newest visible version deletes
     // the key (older versions are older still); an uncovered newest version
     // shadows the covered older ones.
-    Ok(!scan.rt_covered(rts, key, eff))
+    Ok(rts.is_empty() || !rts.covers(key, eff, cmp))
 }
 
 /// The data of `batch`'s column `column_id`.
