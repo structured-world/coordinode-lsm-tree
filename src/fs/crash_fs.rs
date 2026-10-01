@@ -30,14 +30,18 @@
 //! on a backend where a hard link is a copy each name keeps its own. Every
 //! name is tracked resolved, as the backend resolves it: a symbolic link,
 //! final or in a directory along the way, and `..` lead to the entry they
-//! reach, so a file written or synced through any spelling is the one file.
+//! reach, so a file written or synced through any spelling of that kind is
+//! the one file. Two names the filesystem alone makes one (a case it
+//! ignores, a bind mount) are tracked as two files.
 //!
 //! A new directory entry (a created file, the destination of a rename, a hard
 //! link or a reflink) is durable only once its parent directory is synced, as
 //! POSIX promises: `crash()` removes a file whose entry was never made durable,
-//! even when its content was synced. Removed entries are not brought back, and
-//! directories themselves are not rolled back. Operations
-//! that make or remove entries, writes, and directory syncs are linearized: each
+//! even when its content was synced. The directory synced is matched by what
+//! the backend reports as the same directory, so any spelling of it covers
+//! its entries. Removed entries are not brought back, and directories
+//! themselves are not rolled back. Opens, operations that make or remove
+//! entries, and directory syncs are linearized: each
 //! happens wholly before or wholly after any other, so an entry is made
 //! either before a sync that then covers it or after one that does not.
 //!
@@ -194,7 +198,8 @@ pub struct CrashFs {
     inner: Arc<dyn Fs>,
     state: Arc<spin::Mutex<CrashState>>,
     /// Linearizes the namespace: every operation that makes or removes a
-    /// directory entry, and every write that resolves the entry it lands on,
+    /// directory entry, every open and every write that resolves the entry it
+    /// lands on,
     /// holds it from its checks through the backend call to the state it
     /// records, and a directory sync holds it from the backend
     /// sync to clearing what that sync made durable. An entry is then made
@@ -472,10 +477,22 @@ impl CrashFs {
         let directory = self
             .entry_of(directory)
             .unwrap_or_else(|_| directory.to_path_buf());
-        self.state
-            .lock()
-            .pending_entries
-            .retain(|entry| crate::file::entry_directory(entry) != directory);
+        // A spelling that resolving does not fold, a case the filesystem
+        // ignores or a bind mount, still reaches the same directory: what
+        // the backend says about identity decides, outside the state lock.
+        // The namespace is held, so the pending set cannot change meanwhile.
+        let pending = self.state.lock().pending_entries.clone();
+        let covered: Vec<PathBuf> = pending
+            .into_iter()
+            .filter(|entry| {
+                let parent = crate::file::entry_directory(entry);
+                parent == directory || matches!(self.inner.same_file(parent, &directory), Ok(true))
+            })
+            .collect();
+        let mut state = self.state.lock();
+        for entry in &covered {
+            state.pending_entries.remove(entry);
+        }
         Ok(())
     }
 
@@ -517,12 +534,13 @@ impl CrashFs {
 impl Fs for CrashFs {
     fn open(&self, path: &Path, opts: &FsOpenOptions) -> io::Result<Box<dyn FsFile>> {
         let writable = opts.write || opts.create || opts.create_new || opts.append || opts.truncate;
-        // A writable open holds the namespace from resolving its entry to the
+        // An open holds the namespace from resolving its entry to the
         // registration: the backend follows the same symlinks to the same
         // file, and whether an open that may create made the entry is what
-        // the open did.
+        // the open did. A handle opened only for reading resolves too, since
+        // a sync through it makes the file it reached durable.
         let may_create = opts.create || opts.create_new;
-        let namespace = writable.then(|| self.namespace.lock());
+        let namespace = self.namespace.lock();
         // An open that may only create (`O_EXCL`) does not follow a final
         // symlink and refuses any existing name: the backend answers whether
         // it can, and if it does the file is new, at the path itself, with no
@@ -542,18 +560,25 @@ impl Fs for CrashFs {
         }
         // A write follows symlinks: through a dangling one it creates the
         // target, so the target is the entry made and the file tracked.
-        let entry = if writable {
-            self.entry_of(path)?
-        } else {
-            path.to_path_buf()
-        };
-        let creates = may_create && !self.inner.exists(&entry)?;
-        if writable {
-            // Capture the pre-existing durable image BEFORE the open (which may
-            // truncate); a brand-new file captures nothing, so a crash before its
-            // first sync removes it.
-            self.capture_first_touch(&entry)?;
+        if !writable {
+            // The open stands, so a probe that cannot answer leaves the
+            // handle tracked under the name it was opened with.
+            let inner = self.inner.open(path, opts)?;
+            let entry = self.entry_of(path).unwrap_or_else(|_| path.to_path_buf());
+            drop(namespace);
+            return Ok(Box::new(CrashFile {
+                inner,
+                path: entry,
+                fs: Arc::clone(&self.inner),
+                state: Arc::clone(&self.state),
+            }));
         }
+        let entry = self.entry_of(path)?;
+        let creates = may_create && !self.inner.exists(&entry)?;
+        // Capture the pre-existing durable image BEFORE the open (which may
+        // truncate); a brand-new file captures nothing, so a crash before its
+        // first sync removes it.
+        self.capture_first_touch(&entry)?;
         let inner = self.inner.open(path, opts)?;
         if creates {
             self.new_entry(&entry);

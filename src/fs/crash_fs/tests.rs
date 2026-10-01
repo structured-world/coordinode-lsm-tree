@@ -642,6 +642,64 @@ fn a_dot_dot_spelling_names_the_file_it_resolves_to() {
     assert_eq!(read(&fs, d.join("link").to_str().unwrap()), b"v2");
 }
 
+/// A sync through a handle opened only for reading is as durable as any:
+/// opened through a symlink, it makes the file the link points to durable,
+/// and removing the link afterwards keeps that.
+#[cfg(unix)]
+#[test]
+fn a_read_only_sync_through_a_symlink_makes_its_target_durable() {
+    let dir = tempfile::tempdir().unwrap();
+    let fs = CrashFs::new(crate::fs::StdFs);
+    let target = dir.path().join("target");
+    let link = dir.path().join("link");
+
+    let mut f = fs
+        .open(&target, &FsOpenOptions::new().write(true).create(true))
+        .unwrap();
+    f.write_all(b"data").unwrap();
+    drop(f);
+    std::os::unix::fs::symlink("target", &link).unwrap();
+    fs.sync_directory(dir.path()).unwrap();
+
+    let f = fs.open(&link, &FsOpenOptions::new().read(true)).unwrap();
+    f.sync_all().unwrap();
+    drop(f);
+    fs.remove_file(&link).unwrap();
+    fs.sync_directory(dir.path()).unwrap();
+
+    fs.crash();
+    assert_eq!(read(&fs, target.to_str().unwrap()), b"data");
+}
+
+/// A directory is the one the backend reaches, whatever the spelling: on a
+/// filesystem that ignores case, a sync of `D` covers an entry made in `d`.
+#[test]
+fn a_sync_of_a_differently_cased_directory_covers_its_entries() {
+    let dir = tempfile::tempdir().unwrap();
+    let lower = dir.path().join("d");
+    let upper = dir.path().join("D");
+    std::fs::create_dir(&lower).unwrap();
+    if !upper.exists() {
+        // A case-sensitive filesystem: `D` is another directory.
+        return;
+    }
+    let fs = CrashFs::new(crate::fs::StdFs);
+
+    let mut f = fs
+        .open(
+            &lower.join("f"),
+            &FsOpenOptions::new().write(true).create(true),
+        )
+        .unwrap();
+    f.write_all(b"data").unwrap();
+    f.sync_all().unwrap();
+    drop(f);
+    fs.sync_directory(&upper).unwrap();
+
+    fs.crash();
+    assert_eq!(read(&fs, lower.join("f").to_str().unwrap()), b"data");
+}
+
 /// A backend that does not resolve `..` keeps a name through it as a name of
 /// its own: `MemFs` holds `/d/../a` apart from `/a`, so the simulator tracks
 /// it under that spelling and a crash makes no file at `/a`.
