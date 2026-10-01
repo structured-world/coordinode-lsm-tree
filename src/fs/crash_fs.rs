@@ -577,28 +577,27 @@ impl Fs for CrashFs {
             return Ok(());
         }
         let mut state = self.state.lock();
-        // The destination is replaced on disk: drop its prior durable image and
-        // write-tracking first, then carry the source's across (the rename is
-        // as durable as the source was). Clearing `to` unconditionally is what
-        // stops a replaced, previously-synced destination from being resurrected
-        // to its stale content on crash.
+        // The source's state moves with its file, under the new name.
         let from_durable = state.durable.remove(from);
-        state.durable.remove(to);
+        let from_touched = state.touched.remove(from);
+        let from_group = state.link_group.remove(from);
+        state.pending_entries.remove(from);
+        // The destination is replaced on disk, as a removal of that name: its
+        // durable image and write-tracking go (so a replaced, previously
+        // synced destination is not resurrected to its stale content on
+        // crash), and what its file went through stays with the file's other
+        // hard links.
+        state.forget_name(to);
+        // The rename is as durable as the source was.
         if let Some(bytes) = from_durable {
             state.durable.insert(to.to_path_buf(), bytes);
         }
-        let from_touched = state.touched.remove(from);
-        state.touched.remove(to);
         if from_touched {
             state.touched.insert(to.to_path_buf());
         }
         // The destination's entry is new until its directory is synced.
-        state.pending_entries.remove(from);
         state.mark_pending(to);
-        // The name moves with its file: `to` stops naming what it named, and
-        // names whatever `from` was linked to.
-        state.link_group.remove(to);
-        if let Some(group) = state.link_group.remove(from) {
+        if let Some(group) = from_group {
             state.link_group.insert(to.to_path_buf(), group);
         }
         Ok(())
