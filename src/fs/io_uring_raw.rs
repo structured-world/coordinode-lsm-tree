@@ -224,13 +224,29 @@ fn errno_to_kind(errno: i32) -> ErrorKind {
     // realistically surface are mapped explicitly; the rest fold into `Other`,
     // and the numeric errno is preserved in the message for diagnosis.
     match errno {
-        1 | 13 => ErrorKind::PermissionDenied, // EPERM / EACCES
-        2 => ErrorKind::NotFound,              // ENOENT
-        4 => ErrorKind::Interrupted,           // EINTR
-        9 | 22 => ErrorKind::InvalidInput,     // EBADF / EINVAL
-        11 => ErrorKind::WouldBlock,           // EAGAIN / EWOULDBLOCK
-        17 => ErrorKind::AlreadyExists,        // EEXIST
-        95 => ErrorKind::Unsupported,          // EOPNOTSUPP
+        1 | 13 => ErrorKind::PermissionDenied,    // EPERM / EACCES
+        2 => ErrorKind::NotFound,                 // ENOENT
+        4 => ErrorKind::Interrupted,              // EINTR
+        9 | 22 => ErrorKind::InvalidInput,        // EBADF / EINVAL
+        11 => ErrorKind::WouldBlock,              // EAGAIN / EWOULDBLOCK
+        12 => ErrorKind::OutOfMemory,             // ENOMEM
+        17 => ErrorKind::AlreadyExists,           // EEXIST
+        18 => ErrorKind::CrossesDevices,          // EXDEV
+        23 | 24 => ErrorKind::TooManyOpenFiles,   // ENFILE / EMFILE
+        28 => ErrorKind::StorageFull,             // ENOSPC
+        30 => ErrorKind::ReadOnlyFilesystem,      // EROFS
+        32 => ErrorKind::BrokenPipe,              // EPIPE
+        95 => ErrorKind::Unsupported,             // EOPNOTSUPP
+        100 => ErrorKind::NetworkDown,            // ENETDOWN
+        101 => ErrorKind::NetworkUnreachable,     // ENETUNREACH
+        103 => ErrorKind::ConnectionAborted,      // ECONNABORTED
+        104 => ErrorKind::ConnectionReset,        // ECONNRESET
+        107 => ErrorKind::NotConnected,           // ENOTCONN
+        110 => ErrorKind::TimedOut,               // ETIMEDOUT
+        111 => ErrorKind::ConnectionRefused,      // ECONNREFUSED
+        113 => ErrorKind::HostUnreachable,        // EHOSTUNREACH
+        116 => ErrorKind::StaleNetworkFileHandle, // ESTALE
+        122 => ErrorKind::QuotaExceeded,          // EDQUOT
         _ => ErrorKind::Other,
     }
 }

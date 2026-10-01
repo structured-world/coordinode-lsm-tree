@@ -44,6 +44,24 @@ fn weight_tracks_resident_bytes() {
     assert_eq!(c.weight(), 200);
 }
 
+/// `clear` drops every resident entry (the descriptor cache closes its files
+/// through it) and leaves a cache that admits entries up to the same capacity.
+#[test]
+fn clear_empties_every_shard_and_keeps_the_capacity() {
+    let c = byte_cache(10_000);
+    for key in 0..64 {
+        c.insert(key, vec![0u8; 100]);
+    }
+    c.clear();
+    assert_eq!(c.len(), 0);
+    assert_eq!(c.weight(), 0);
+    assert_eq!(c.get(&3), None);
+    assert_eq!(c.capacity(), 10_000);
+
+    c.insert(3, vec![1u8; 100]);
+    assert_eq!(c.get(&3), Some(vec![1u8; 100]));
+}
+
 #[test]
 fn replace_adjusts_weight_in_place() {
     let c = byte_cache(10_000);
