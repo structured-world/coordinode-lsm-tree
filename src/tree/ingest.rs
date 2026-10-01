@@ -273,7 +273,7 @@ impl<'a> Ingestion<'a> {
         }
 
         let cloned_key = key.clone();
-        self.writer.write(crate::InternalValue::from_components(
+        self.write_row(crate::InternalValue::from_components(
             key,
             indirection.encode_into_vec(),
             self.seqno,
@@ -301,7 +301,7 @@ impl<'a> Ingestion<'a> {
             );
         }
 
-        self.writer.write(crate::InternalValue::from_components(
+        self.write_row(crate::InternalValue::from_components(
             key.clone(),
             value,
             self.seqno,
@@ -327,7 +327,7 @@ impl<'a> Ingestion<'a> {
             );
         }
 
-        self.writer.write(crate::InternalValue::from_components(
+        self.write_row(crate::InternalValue::from_components(
             key.clone(),
             crate::UserValue::empty(),
             self.seqno,
@@ -353,7 +353,7 @@ impl<'a> Ingestion<'a> {
             );
         }
 
-        self.writer.write(crate::InternalValue::from_components(
+        self.write_row(crate::InternalValue::from_components(
             key.clone(),
             crate::UserValue::empty(),
             self.seqno,
@@ -378,9 +378,10 @@ impl<'a> Ingestion<'a> {
     /// ingested table.
     ///
     /// Requires the columnar layout (enable `columnar` in the runtime config
-    /// before opening the ingestion); a row-mode ingestion rejects the batch. An
-    /// ingestion is either row-oriented (via [`write`](Self::write)) or
-    /// columnar, not both.
+    /// before opening the ingestion); a row-mode ingestion rejects the batch.
+    /// Batches and rows (via [`write`](Self::write)) may follow each other in
+    /// key order: a table holds one value layout, so a switch between them
+    /// starts the next table.
     ///
     /// # Errors
     ///
@@ -458,6 +459,14 @@ impl<'a> Ingestion<'a> {
             self.flush_pending_columnar()?;
         }
         Ok(())
+    }
+
+    /// Writes `item` as a row, after the columnar row group still pending, so
+    /// the tables are written in the order of their keys.
+    fn write_row(&mut self, item: crate::InternalValue) -> crate::Result<()> {
+        #[cfg(feature = "columnar")]
+        self.flush_pending_columnar()?;
+        self.writer.write(item)
     }
 
     /// Writes the accumulated columnar rowgroup as one block, if any is pending.

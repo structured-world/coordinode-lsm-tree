@@ -169,7 +169,7 @@ impl DoubleEndedIterator for TreeIter {
     }
 }
 
-fn range_tombstone_overlaps_bounds(
+pub(crate) fn range_tombstone_overlaps_bounds(
     rt: &RangeTombstone,
     bounds: &(Bound<UserKey>, Bound<UserKey>),
     comparator: &dyn crate::comparator::UserComparator,

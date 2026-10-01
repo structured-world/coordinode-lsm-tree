@@ -555,6 +555,11 @@ pub struct Writer {
     /// the first key is added.
     use_columnar: bool,
 
+    /// How the columnar blocks store each row's value, fixed by the first one
+    /// written (or set up front by a rewrite that mirrors its source): a table
+    /// holds one layout, since its descriptor records one.
+    value_layout: Option<crate::table::meta::ValueLayout>,
+
     /// Whether this SST is written by the bulk-ingest path, which stores every
     /// entry at LOCAL seqno 0 and relies on a manifest-only `global_seqno` for
     /// its effective MVCC ordering. Persisted as `descriptor#bulk_ingested` so
@@ -869,6 +874,7 @@ impl Writer {
             use_seqno_in_index: false,
             use_zone_map: false,
             use_columnar: false,
+            value_layout: None,
             bulk_ingested: Some(false),
             recency: None,
             lineage: None,
@@ -1157,6 +1163,9 @@ impl Writer {
             index_block_restart_interval: self.index_block_restart_interval,
             initial_level: self.initial_level,
             use_columnar: self.use_columnar,
+            value_layout: self
+                .value_layout
+                .unwrap_or(crate::table::meta::ValueLayout::Whole),
             bulk_ingested: self.bulk_ingested,
             recency: self.recency,
             lineage: self.lineage.clone(),
@@ -1783,6 +1792,9 @@ impl Writer {
             // recovered rows back into PAX blocks), rather than degrading to a
             // row-major copy.
             .use_columnar(meta.columnar)
+            // Its blocks are re-emitted as the source stored them, so the
+            // copy stores the value the same way.
+            .use_value_layout(meta.value_layout)
             // A bulk-ingested source stays flagged so a salvaged / re-emitted
             // copy is still recognized by manifest repair as relying on a
             // manifest-only global_seqno offset. A legacy source of unknown
@@ -1921,6 +1933,32 @@ impl Writer {
         // do not have (which would misroute the reader's block identity).
         self.use_columnar = columnar && cfg!(feature = "columnar");
         self
+    }
+
+    /// Sets how the columnar blocks store each row's value, for a rewrite that
+    /// re-emits a source's blocks as they were. Must be set before the first
+    /// key is written.
+    #[must_use]
+    pub(crate) fn use_value_layout(mut self, layout: crate::table::meta::ValueLayout) -> Self {
+        self.assert_not_started("use_value_layout");
+        self.value_layout = Some(layout);
+        self
+    }
+
+    /// Records that a columnar block storing values as `layout` is written:
+    /// the first fixes the table's layout, and one of the other layout is
+    /// refused, since the descriptor records one per table.
+    #[cfg(feature = "columnar")]
+    fn claim_value_layout(&mut self, layout: crate::table::meta::ValueLayout) -> crate::Result<()> {
+        match self.value_layout {
+            Some(fixed) if fixed != layout => Err(crate::Error::FeatureUnsupported(
+                "a columnar table stores every value one way: whole or split into fields",
+            )),
+            _ => {
+                self.value_layout = Some(layout);
+                Ok(())
+            }
+        }
     }
 
     /// Sets the bulk-ingest provenance (see [`Self::bulk_ingested`] field), so
@@ -2431,6 +2469,8 @@ impl Writer {
         item_count: usize,
         zone_block_min: Option<crate::UserKey>,
     ) -> crate::Result<()> {
+        // The transpose keeps each row's value whole, as it was written.
+        self.claim_value_layout(crate::table::meta::ValueLayout::Whole)?;
         let batch = crate::table::columnar::entries_to_column_batch(&self.chunk)?;
         self.encode_columnar_batch_block(
             &batch,
@@ -2850,6 +2890,15 @@ impl Writer {
         } else {
             self.validate_direct_block_order(&entries, comparator)?;
         }
+        // An ingested batch is stored as the caller split it into fields; a
+        // verbatim re-emit stores what its source did, which the rewrite set
+        // up front.
+        self.claim_value_layout(if require_zero_seqno {
+            crate::table::meta::ValueLayout::Split
+        } else {
+            self.value_layout
+                .unwrap_or(crate::table::meta::ValueLayout::Split)
+        })?;
 
         // A batch past the group size is written as groups of that size, cut
         // by the bytes each row adds as flushed rows are: a read bounds what a
@@ -4266,6 +4315,9 @@ struct MetaSectionParams<'a> {
     index_block_restart_interval: u8,
     initial_level: u8,
     use_columnar: bool,
+    /// How the columnar blocks store each row's value; written only for a
+    /// columnar table.
+    value_layout: crate::table::meta::ValueLayout,
     /// Bulk-ingest provenance: `Some(_)` writes `descriptor#bulk_ingested`,
     /// `None` omits it (unknown provenance, preserving a legacy SST's absence).
     bulk_ingested: Option<bool>,
@@ -4547,6 +4599,13 @@ fn encode_meta_payload(
     // of order, then the whole list is sorted below.
     if let Some(flag) = p.bulk_ingested {
         meta_items.push(meta("descriptor#bulk_ingested", &[u8::from(flag)]));
+    }
+
+    // How a columnar table stores each row's value: the whole value and a
+    // caller's first field share a column id, and only the table can say
+    // which one its column is. A row-major table has no value columns.
+    if p.use_columnar {
+        meta_items.push(meta("descriptor#value_layout", &[p.value_layout.to_byte()]));
     }
 
     // L0 recency key: emitted ONLY for a table whose content position differs
