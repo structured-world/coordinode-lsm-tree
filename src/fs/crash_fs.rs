@@ -400,16 +400,24 @@ impl Fs for CrashFs {
 
     fn rename(&self, from: &Path, to: &Path) -> io::Result<()> {
         let _namespace = self.hold_namespace();
-        self.inner.rename(from, to)?;
         // POSIX rename(2): when both names refer to the same file (one path,
         // or two hard links of one inode) the call succeeds and changes
-        // nothing, so `from` is still there and the crash state stays as it
-        // was. Probed only in the directory-entry mode, the one this matters
-        // to, with the namespace held so no other operation can have made
-        // `from` again since the rename; a probe that fails is read as an
-        // ordinary rename.
+        // nothing, so the crash state stays as it was. That is decided from
+        // the files the names refer to before the rename, since afterwards
+        // only a probe of `from` could tell, and a probe can be wrong. Probed
+        // only in the directory-entry mode, the one this matters to: an
+        // absent name is an ordinary rename, and any other probe failure
+        // fails the rename before anything moves.
         let tracking = self.state.lock().track_entries;
-        if from == to || (tracking && matches!(self.inner.exists(from), Ok(true))) {
+        let same = from == to
+            || (tracking
+                && match self.inner.same_file(from, to) {
+                    Ok(same) => same,
+                    Err(error) if error.kind() == io::ErrorKind::NotFound => false,
+                    Err(error) => return Err(error),
+                });
+        self.inner.rename(from, to)?;
+        if same {
             return Ok(());
         }
         let mut state = self.state.lock();

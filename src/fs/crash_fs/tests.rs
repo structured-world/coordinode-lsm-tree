@@ -206,6 +206,43 @@ fn a_rename_between_links_of_one_file_keeps_both_names() {
     assert_eq!(read(&fs, link.to_str().unwrap()), b"durable");
 }
 
+/// Whether a rename between two names is a no-op is known from the files the
+/// names refer to before it runs, not from probing the source afterwards: a
+/// probe that wrongly reports the source gone does not turn the no-op into a
+/// move that leaves the destination's durable name unsynced.
+#[cfg(unix)]
+#[test]
+fn a_no_op_rename_is_known_before_it_runs() {
+    use crate::fs::{Fault, FaultFs, FaultOp, FaultRule};
+
+    let dir = tempfile::tempdir().unwrap();
+    let faulty = FaultFs::new(crate::fs::StdFs);
+    let injector = faulty.injector();
+    let fs = CrashFs::new(faulty).tracking_directory_entries();
+    let src = dir.path().join("src");
+    let link = dir.path().join("link");
+
+    let mut f = fs
+        .open(&src, &FsOpenOptions::new().write(true).create(true))
+        .unwrap();
+    f.write_all(b"durable").unwrap();
+    f.sync_all().unwrap();
+    drop(f);
+    fs.hard_link(&src, &link).unwrap();
+    fs.sync_directory(dir.path()).unwrap();
+    // An existence probe of the source reports it absent.
+    injector.arm(
+        FaultRule::new(FaultOp::Metadata, Fault::Error(crate::io::ErrorKind::Other))
+            .on_path(link.display().to_string()),
+    );
+    fs.rename(&link, &src).unwrap();
+    injector.clear();
+
+    fs.crash();
+    assert_eq!(read(&fs, src.to_str().unwrap()), b"durable");
+    assert_eq!(read(&fs, link.to_str().unwrap()), b"durable");
+}
+
 /// The blob files a flush and an ingestion write survive a power loss once
 /// the write returns: the manifest that names them must not outlive them.
 #[test]
