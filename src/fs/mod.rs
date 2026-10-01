@@ -742,6 +742,195 @@ impl<'a> BlockBuf<'a> {
     }
 }
 
+/// One read handed to a [`ReadQueue`]: `buf.len()` bytes of `file` from
+/// `offset`.
+///
+/// The queue owns the buffer from [`submit`](ReadQueue::submit) until it hands
+/// the read back in a [`ReadDone`], so a read still in flight can never have
+/// its destination freed under it.
+pub struct QueuedRead {
+    /// The caller's name for the read, handed back with its completion.
+    pub tag: usize,
+    /// File to read from.
+    pub file: alloc::sync::Arc<dyn FsFile>,
+    /// Byte offset within `file`.
+    pub offset: u64,
+    /// Destination, exactly as long as the read.
+    pub buf: Vec<u8>,
+}
+
+/// A [`QueuedRead`] the queue is done with: its buffer, and whether every byte
+/// of it arrived.
+pub struct ReadDone {
+    /// The tag the read was submitted with.
+    pub tag: usize,
+    /// The destination; the whole block when `result` is `Ok`.
+    pub buf: Vec<u8>,
+    /// `Ok` once every byte was read; a short read is
+    /// [`io::ErrorKind::UnexpectedEof`].
+    pub result: io::Result<()>,
+}
+
+/// Reads submitted one after another and handed back as they finish, so a
+/// caller can issue a read that depends on a finished one while others are
+/// still in flight. Obtained from [`Fs::read_queue`].
+///
+/// # Examples
+///
+/// ```
+/// use lsm_tree::fs::{Fs, FsFile, FsOpenOptions, MemFs, QueuedRead};
+/// use std::io::Write;
+/// use std::path::Path;
+/// use std::sync::Arc;
+///
+/// let fs = MemFs::new();
+/// fs.create_dir_all(Path::new("/d"))?;
+/// let path = Path::new("/d/f");
+/// fs.open(path, &FsOpenOptions::new().write(true).create(true))?
+///     .write_all(b"hello, world")?;
+/// let file: Arc<dyn FsFile> = Arc::from(fs.open(path, &FsOpenOptions::new().read(true))?);
+///
+/// let mut queue = fs.read_queue();
+/// queue.submit(QueuedRead { tag: 7, file, offset: 7, buf: vec![0; 5] });
+/// let mut read = Vec::new();
+/// queue.wait(1, &mut |done| read.push((done.tag, done.buf, done.result.is_ok())));
+/// assert_eq!(read, [(7, b"world".to_vec(), true)]);
+/// # Ok::<(), lsm_tree::io::Error>(())
+/// ```
+#[diagnostic::on_unimplemented(
+    message = "`{Self}` is not a read queue",
+    label = "this type does not implement `ReadQueue`",
+    note = "`Fs::read_queue` provides one for every backend; implement `ReadQueue` only for a backend that can take reads while others are in flight"
+)]
+pub trait ReadQueue {
+    /// Queues `read`. A backend may issue it at once or hold it until the
+    /// next [`wait`](Self::wait); either way the reads submitted between two
+    /// waits travel together.
+    fn submit(&mut self, read: QueuedRead);
+
+    /// Reads submitted and not yet handed back.
+    fn outstanding(&self) -> usize;
+
+    /// Reads among the [`outstanding`](Self::outstanding) ones that only a
+    /// [`wait`](Self::wait) for at least one read carries out: none of them
+    /// finishes on its own, so a caller does not sleep on a
+    /// [`ReadWake`] for them. The default counts every outstanding read, as
+    /// for a queue that reads only while it is waited on.
+    fn held(&self) -> usize {
+        self.outstanding()
+    }
+
+    /// Issues every read not yet issued, then hands reads to `on_done` as they
+    /// finish, each once, until at least `min` have been handed over in this
+    /// call or none is left outstanding. A read that has finished by then is
+    /// handed over too, so `min = 0` collects what is ready without waiting.
+    fn wait(&mut self, min: usize, on_done: &mut dyn FnMut(ReadDone));
+
+    /// Asks the queue to call `wake` each time a read it issued finishes off
+    /// the calling thread, after the read is ready for [`wait`](Self::wait)
+    /// to hand over, so a caller reading through several queues can sleep
+    /// until any of them has a read back. Returns whether it will, for every
+    /// read it issues: a queue may decline once reads are in flight.
+    ///
+    /// The default declines: a queue that reads only while it is waited on
+    /// has nothing finishing in between.
+    fn set_wake(&mut self, wake: alloc::sync::Arc<dyn ReadWake>) -> bool {
+        drop(wake);
+        false
+    }
+}
+
+/// Told by a [`ReadQueue`] that one of its reads is back: see
+/// [`ReadQueue::set_wake`]. Called from whatever thread finished the read.
+#[diagnostic::on_unimplemented(
+    message = "`{Self}` cannot be woken by a read queue",
+    label = "this type does not implement `ReadWake`",
+    note = "a caller waiting on several `ReadQueue`s implements `ReadWake` to learn that one of them has a read back"
+)]
+pub trait ReadWake: Send + Sync {
+    /// A read is ready to be handed over.
+    fn wake(&self);
+}
+
+/// The [`ReadQueue`] of a backend that cannot take reads while others are in
+/// flight: the reads submitted since the last wait for at least one are read
+/// in one [`Fs::read_blocks_batched_each`] call, which a backend overriding
+/// it still batches.
+struct BatchedReadQueue<'a, F: Fs + ?Sized> {
+    fs: &'a F,
+    submitted: Vec<QueuedRead>,
+}
+
+impl<F: Fs + ?Sized> ReadQueue for BatchedReadQueue<'_, F> {
+    fn submit(&mut self, read: QueuedRead) {
+        self.submitted.push(read);
+    }
+
+    fn outstanding(&self) -> usize {
+        self.submitted.len()
+    }
+
+    fn wait(&mut self, min: usize, on_done: &mut dyn FnMut(ReadDone)) {
+        // Nothing finishes between waits here, so a wait for none has
+        // nothing to hand over, and reading would block the caller polling.
+        if min == 0 || self.submitted.is_empty() {
+            return;
+        }
+        let mut reads = core::mem::take(&mut self.submitted);
+        let mut filled = alloc::vec![false; reads.len()];
+        let outcome = {
+            let mut reqs: Vec<BlockRead<'_>> = reads
+                .iter_mut()
+                .map(|read| BlockRead {
+                    file: read.file.as_ref(),
+                    offset: read.offset,
+                    buf: BlockBuf::new(&mut read.buf[..]),
+                })
+                .collect();
+            self.fs
+                .read_blocks_batched_each(&mut reqs, &mut |index, _| {
+                    if let Some(slot) = filled.get_mut(index) {
+                        *slot = true;
+                    }
+                })
+        };
+        // A read not handed over failed: a failed call leaves the contents of
+        // every buffer it did not hand over unspecified, even one it filled.
+        // The first such read carries the call's error, the others its kind.
+        // With no error, a read not handed over was reported read without
+        // being filled.
+        let (mut failure, kind, message) = match outcome {
+            Ok(()) => (
+                None,
+                io::ErrorKind::UnexpectedEof,
+                "read queue: a read reported done was left unfilled",
+            ),
+            Err(error) => {
+                let kind = error.kind();
+                (
+                    Some(error),
+                    kind,
+                    "read queue: a read of a batch that failed",
+                )
+            }
+        };
+        for (read, filled) in reads.into_iter().zip(filled) {
+            let result = if filled {
+                Ok(())
+            } else {
+                Err(failure
+                    .take()
+                    .unwrap_or_else(|| io::Error::new(kind, message)))
+            };
+            on_done(ReadDone {
+                tag: read.tag,
+                buf: read.buf,
+                result,
+            });
+        }
+    }
+}
+
 /// Pluggable filesystem abstraction.
 ///
 /// Intended to cover all filesystem operations that lsm-tree performs.
@@ -849,6 +1038,22 @@ pub trait Fs: Send + Sync + 'static {
             on_read(index, req);
         }
         Ok(())
+    }
+
+    /// A queue that takes reads one after another and hands each back when it
+    /// finishes, so a read that depends on a finished one can be issued while
+    /// others are still in flight: see [`ReadQueue`].
+    ///
+    /// The default queue reads what was submitted since the last wait in one
+    /// [`read_blocks_batched_each`](Self::read_blocks_batched_each) call, so a
+    /// backend that overrides only the batched read keeps its batching.
+    /// `io_uring` issues each read to its ring as the queue is waited on and
+    /// hands it back the moment it completes.
+    fn read_queue(&self) -> Box<dyn ReadQueue + '_> {
+        Box::new(BatchedReadQueue {
+            fs: self,
+            submitted: Vec::new(),
+        })
     }
 
     /// Recursively creates all directories leading to `path`.
@@ -1519,96 +1724,7 @@ pub(crate) fn copy_file_streamed<F: Fs + ?Sized>(fs: &F, src: &Path, dst: &Path)
 }
 
 #[cfg(test)]
-mod block_buf_tests {
-    use super::BlockBuf;
-    use test_log::test;
+mod block_buf_tests;
 
-    /// An oversized `advance` clamps at the capacity instead of overflowing:
-    /// `filled + n` must not be computed first, or a huge `n` panics in debug
-    /// builds and wraps `filled` BACKWARDS in release builds.
-    #[test]
-    fn advance_with_oversized_n_clamps_at_capacity() {
-        let mut mem = [0u8; 4];
-        let mut buf = BlockBuf::new(&mut mem);
-        buf.append(&[1, 2]);
-        buf.advance(usize::MAX);
-        assert_eq!(buf.filled(), 4, "clamped at capacity, not wrapped");
-        assert!(buf.is_full());
-    }
-
-    /// The count only moves when bytes are written, which is what tells the
-    /// caller the request was actually served.
-    #[test]
-    fn a_fresh_buffer_is_empty_and_not_full() {
-        let mut mem = [0u8; 4];
-        let buf = BlockBuf::new(&mut mem);
-        assert_eq!(buf.capacity(), 4);
-        assert_eq!(buf.filled(), 0);
-        assert!(!buf.is_full(), "nothing has been written yet");
-    }
-
-    /// `append` fills and counts in one step.
-    #[test]
-    fn appending_counts_only_what_it_wrote() {
-        let mut mem = [0u8; 4];
-        let mut buf = BlockBuf::new(&mut mem);
-
-        assert_eq!(buf.append(&[1, 2]), 2);
-        assert_eq!(buf.filled(), 2);
-        assert!(!buf.is_full());
-
-        assert_eq!(buf.append(&[3, 4]), 2);
-        assert!(buf.is_full(), "the request is filled end to end");
-        assert_eq!(mem, [1, 2, 3, 4], "and the bytes landed in order");
-    }
-
-    /// A write past the end takes only what fits, so the count can never claim
-    /// more than the buffer holds.
-    #[test]
-    fn appending_past_the_end_takes_only_what_fits() {
-        let mut mem = [0u8; 3];
-        let mut buf = BlockBuf::new(&mut mem);
-
-        assert_eq!(buf.append(&[1, 2, 3, 4, 5]), 3, "only three bytes fit");
-        assert!(buf.is_full());
-        assert_eq!(buf.append(&[6]), 0, "a full buffer takes nothing more");
-        assert_eq!(buf.filled(), 3);
-    }
-
-    /// The unfilled region shrinks as it is filled, so a reader that takes both
-    /// its pointer and its length from here cannot run past the end. Taking the
-    /// length from `capacity` instead is the mistake this guards against.
-    #[test]
-    fn the_unfilled_region_shrinks_as_it_fills() {
-        let mut mem = [0u8; 8];
-        let mut buf = BlockBuf::new(&mut mem);
-
-        assert_eq!(buf.unfilled_mut().len(), 8);
-        buf.append(&[1, 2, 3]);
-        assert_eq!(buf.unfilled_mut().len(), 5, "three bytes are spoken for");
-
-        buf.unfilled_mut().fill(9);
-        buf.advance(5);
-        assert!(buf.is_full());
-        assert_eq!(mem, [1, 2, 3, 9, 9, 9, 9, 9]);
-    }
-
-    /// The point of the type: an `Fs` implementation is safe code, and safe code
-    /// that reports success without writing anything leaves the request short.
-    /// The caller sees that and refuses the request, rather than decoding a
-    /// block out of whatever the allocation happened to hold.
-    #[test]
-    fn a_request_a_lazy_implementation_ignored_is_not_full() {
-        let mut mem = [0u8; 8];
-        let buf = BlockBuf::new(&mut mem);
-
-        // Everything a safe implementation can do without writing.
-        let _ = buf.capacity();
-        let _ = buf.filled();
-
-        assert!(
-            !buf.is_full(),
-            "a buffer nobody wrote to must never report itself filled",
-        );
-    }
-}
+#[cfg(test)]
+mod read_queue_tests;

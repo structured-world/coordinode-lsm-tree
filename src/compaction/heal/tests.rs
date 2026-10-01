@@ -242,15 +242,15 @@ fn read_healing_single_bit_increments_secded_counter() -> crate::Result<()> {
     Ok(())
 }
 
-/// The prewarm path must never gather an ECC table's blocks: `from_reader`
-/// repairs an ECC-corrected payload silently (no `EccStatus`), so caching a
-/// corrected block as clean would let later `load_block` cache hits skip
-/// `from_file_with_recovery` / `maybe_record_persistent_heal`, leaving the
-/// latent on-disk fault unscheduled for healing. `decode_prewarmed_blocks`
-/// relies on this gate (and pins it with a `debug_assert!(ecc.is_none())`), so
-/// guard the invariant directly: `plan_prewarm` returns `None` for an ECC table.
+/// The staged multi-get read must never gather an ECC table's blocks:
+/// `from_reader` repairs an ECC-corrected payload silently (no `EccStatus`),
+/// so caching a corrected block as clean would let later `load_block` cache
+/// hits skip `from_file_with_recovery` / `maybe_record_persistent_heal`,
+/// leaving the latent on-disk fault unscheduled for healing. The decode it
+/// uses relies on this gate (and pins it with a `debug_assert!`), so guard the
+/// invariant directly: an ECC table is read serially.
 #[test]
-fn plan_prewarm_skips_ecc_tables() -> crate::Result<()> {
+fn a_staged_read_leaves_ecc_tables_to_the_serial_path() -> crate::Result<()> {
     let dir = tempfile::tempdir()?;
     let crate::AnyTree::Standard(tree) = Config::new(
         dir.path(),
@@ -277,9 +277,12 @@ fn plan_prewarm_skips_ecc_tables() -> crate::Result<()> {
         (b"key-001000", crate::hash::hash64(b"key-001000")),
     ];
     assert!(
-        table.plan_prewarm(&sorted_keys, MAX_SEQNO).is_none(),
-        "plan_prewarm must skip an ECC table so a silently-corrected block is \
-         never prewarm-cached as clean",
+        matches!(
+            crate::table::staged::StagedRead::start(table, &sorted_keys, MAX_SEQNO),
+            crate::table::staged::StagedStart::Serial
+        ),
+        "a staged read must leave an ECC table to the serial path so a \
+         silently-corrected block is never cached as clean",
     );
     Ok(())
 }

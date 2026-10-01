@@ -46,6 +46,11 @@ impl DescriptorTable {
         self.inner.len()
     }
 
+    /// The most descriptors the cache keeps open.
+    pub(crate) fn capacity(&self) -> u64 {
+        self.inner.capacity()
+    }
+
     #[must_use]
     pub fn access_for_table(&self, id: &GlobalTableId) -> Option<Arc<dyn FsFile>> {
         let key = CacheKey(TAG_BLOCK, id.tree_id(), id.table_id());

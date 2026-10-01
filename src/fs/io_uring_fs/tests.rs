@@ -1750,3 +1750,428 @@ fn an_empty_request_in_a_batch_is_handed_over() -> io::Result<()> {
     assert_eq!(handed, [0, 1, 2]);
     Ok(())
 }
+
+/// The bytes a [`two_files`] file `f` holds at `offset`, `len` of them.
+fn expected_bytes(f: usize, offset: usize, len: usize) -> Vec<u8> {
+    (offset..offset + len)
+        .map(|i| u8::try_from((i + f) % 251).expect("below 251"))
+        .collect()
+}
+
+/// Reads submitted to the queue across two files come back with their tags
+/// and bytes, and reads submitted after a wait, while earlier ones may still
+/// be on the ring, are told apart from them.
+#[test]
+fn a_read_queue_hands_back_reads_of_several_submissions() -> io::Result<()> {
+    let Some(fs) = try_io_uring() else {
+        return Ok(());
+    };
+    let dir = tempfile::tempdir()?;
+    let files: Vec<Arc<dyn FsFile>> = two_files(&fs, dir.path(), 64 * 64)?
+        .into_iter()
+        .map(Arc::from)
+        .collect();
+    let mut queue = fs.read_queue();
+    let mut got: Vec<(usize, Vec<u8>)> = Vec::new();
+    for round in 0..4usize {
+        for i in 0..16usize {
+            let tag = round * 16 + i;
+            queue.submit(QueuedRead {
+                tag,
+                file: Arc::clone(&files[tag % 2]),
+                offset: (tag * 64) as u64,
+                buf: vec![0; 64],
+            });
+        }
+        // Issues this round's reads and takes whatever has come back.
+        queue.wait(0, &mut |done| {
+            assert!(done.result.is_ok(), "read {} failed", done.tag);
+            got.push((done.tag, done.buf));
+        });
+    }
+    while queue.outstanding() > 0 {
+        queue.wait(1, &mut |done| {
+            assert!(done.result.is_ok(), "read {} failed", done.tag);
+            got.push((done.tag, done.buf));
+        });
+    }
+    got.sort_unstable_by_key(|(tag, _)| *tag);
+    let expected: Vec<(usize, Vec<u8>)> = (0..64)
+        .map(|tag| (tag, expected_bytes(tag % 2, tag * 64, 64)))
+        .collect();
+    assert_eq!(got, expected);
+    Ok(())
+}
+
+/// Counts the wakes a queue gives it.
+struct CountWake(core::sync::atomic::AtomicUsize);
+
+impl crate::fs::ReadWake for CountWake {
+    fn wake(&self) {
+        self.0.fetch_add(1, core::sync::atomic::Ordering::SeqCst);
+    }
+}
+
+/// A queue given a wake rings it once per read the ring finished, and only
+/// once that read is ready: after `n` wakes, a wait that does not block hands
+/// over at least `n` reads in all.
+#[test]
+fn a_read_queue_wakes_once_a_read_is_ready_to_hand_over() -> io::Result<()> {
+    use core::sync::atomic::Ordering::SeqCst;
+
+    let Some(fs) = try_io_uring() else {
+        return Ok(());
+    };
+    let dir = tempfile::tempdir()?;
+    let files: Vec<Arc<dyn FsFile>> = two_files(&fs, dir.path(), 32 * 64)?
+        .into_iter()
+        .map(Arc::from)
+        .collect();
+    let wake = Arc::new(CountWake(core::sync::atomic::AtomicUsize::new(0)));
+    let mut queue = fs.read_queue();
+    assert!(queue.set_wake(Arc::clone(&wake) as Arc<dyn crate::fs::ReadWake>));
+    for tag in 0..32usize {
+        queue.submit(QueuedRead {
+            tag,
+            file: Arc::clone(&files[tag % 2]),
+            offset: (tag * 64) as u64,
+            buf: vec![0; 64],
+        });
+    }
+    let mut handed = 0usize;
+    while queue.outstanding() > 0 {
+        let rung = wake.0.load(SeqCst);
+        queue.wait(0, &mut |done| {
+            assert!(done.result.is_ok(), "read {} failed", done.tag);
+            handed += 1;
+        });
+        assert!(
+            handed >= rung,
+            "{rung} wakes rung but {handed} reads handed over"
+        );
+        std::thread::yield_now();
+    }
+    assert_eq!(handed, 32);
+    assert_eq!(
+        wake.0.load(SeqCst),
+        32,
+        "one wake per read the ring finished"
+    );
+    Ok(())
+}
+
+/// A read of a file the ring cannot take is read serially, which blocks, so
+/// a wait for none leaves it held, and a wait for one reads it.
+#[test]
+fn a_read_without_a_descriptor_waits_for_a_wait_for_one() -> io::Result<()> {
+    use crate::fs::MemFs;
+
+    let Some(fs) = try_io_uring() else {
+        return Ok(());
+    };
+    let mem = MemFs::new();
+    let path = Path::new("/m");
+    mem.open(path, &FsOpenOptions::new().write(true).create(true))?
+        .write_all(b"hello, world")?;
+    let file: Arc<dyn FsFile> = Arc::from(mem.open(path, &FsOpenOptions::new().read(true))?);
+    assert!(
+        file.backing_fd().is_none(),
+        "an in-memory file has no descriptor"
+    );
+
+    let mut queue = fs.read_queue();
+    queue.submit(QueuedRead {
+        tag: 1,
+        file,
+        offset: 7,
+        buf: vec![0; 5],
+    });
+    let mut got = Vec::new();
+    queue.wait(0, &mut |done| got.push(done.buf));
+    assert!(got.is_empty(), "a wait for none reads nothing");
+    assert_eq!((queue.outstanding(), queue.held()), (1, 1));
+    queue.wait(1, &mut |done| got.push(done.buf));
+    assert_eq!(got, [b"world".to_vec()]);
+    assert_eq!((queue.outstanding(), queue.held()), (0, 0));
+    Ok(())
+}
+
+/// A wait for none never blocks on the ring's submission channel: with the
+/// ring thread held on a read that has no data yet and the channel full, it
+/// keeps its reads and returns, and a later wait for one sends and reads them.
+#[test]
+fn a_wait_for_none_does_not_wait_for_room_on_the_ring() -> io::Result<()> {
+    // Ring capacity, which bounds the submission channel.
+    const ENTRIES: u32 = 2;
+    let Some(_) = try_io_uring() else {
+        return Ok(());
+    };
+    let fs = IoUringFs::with_ring_size(ENTRIES)?;
+    let dir = tempfile::tempdir()?;
+    let fifo = dir.path().join("fifo");
+    let made = std::process::Command::new("mkfifo").arg(&fifo).status()?;
+    assert!(made.success(), "mkfifo");
+    // Read and write, so the open does not wait for a writer.
+    let pipe: Arc<dyn FsFile> =
+        Arc::from(fs.open(&fifo, &FsOpenOptions::new().read(true).write(true))?);
+    let files: Vec<Arc<dyn FsFile>> = two_files(&fs, dir.path(), 64)?
+        .into_iter()
+        .map(Arc::from)
+        .collect();
+    let read_of = |file: &Arc<dyn FsFile>, len: usize| QueuedRead {
+        tag: 0,
+        file: Arc::clone(file),
+        offset: 0,
+        buf: vec![0; len],
+    };
+
+    // The ring thread takes this read and waits on it.
+    let mut held = fs.read_queue();
+    held.submit(read_of(&pipe, 1));
+    held.wait(0, &mut |_| {});
+    std::thread::sleep(std::time::Duration::from_millis(200));
+    // Nothing drains the channel now: these fill it.
+    let mut filling: Vec<_> = (0..ENTRIES)
+        .map(|_| {
+            let mut queue = fs.read_queue();
+            queue.submit(read_of(&files[0], 64));
+            queue.wait(0, &mut |_| {});
+            queue
+        })
+        .collect();
+
+    // The queue itself, which a thread can take, rather than the trait
+    // object `read_queue` hands out.
+    let mut late = UringReadQueue::new(&fs.inner);
+    late.submit(read_of(&files[1], 64));
+    std::thread::scope(|scope| {
+        let (returned, polled) = std::sync::mpsc::channel();
+        let poll = scope.spawn(move || {
+            late.wait(0, &mut |_| {});
+            returned.send(()).ok();
+            late
+        });
+        let prompt = polled
+            .recv_timeout(std::time::Duration::from_secs(5))
+            .is_ok();
+        // Release the ring thread either way, so the test ends.
+        std::fs::OpenOptions::new()
+            .write(true)
+            .open(&fifo)
+            .and_then(|mut writer| writer.write_all(b"x"))
+            .expect("write to the fifo");
+        let mut late = poll.join().expect("the poll thread");
+        assert!(prompt, "a wait for none waited for room on the ring");
+
+        assert_eq!(late.outstanding(), 1, "the read is kept, not lost");
+        assert_eq!(
+            late.held(),
+            1,
+            "a read no ring has is one only a wait carries out"
+        );
+        let mut got = Vec::new();
+        while late.outstanding() > 0 {
+            late.wait(1, &mut |done| got.push(done.result.is_ok()));
+        }
+        assert_eq!(got, [true], "a later wait sends and reads it");
+    });
+    for queue in &mut filling {
+        while queue.outstanding() > 0 {
+            queue.wait(1, &mut |done| assert!(done.result.is_ok()));
+        }
+    }
+    while held.outstanding() > 0 {
+        held.wait(1, &mut |done| assert!(done.result.is_ok()));
+    }
+    Ok(())
+}
+
+/// A wait for none does not wait for the submission lock either: while
+/// another sender holds it (blocked on a full channel, say), the wait keeps
+/// its reads, reports them held, and a later wait sends them.
+#[test]
+fn a_wait_for_none_does_not_wait_for_the_submission_lock() -> io::Result<()> {
+    let Some(fs) = try_io_uring() else {
+        return Ok(());
+    };
+    let dir = tempfile::tempdir()?;
+    let files: Vec<Arc<dyn FsFile>> = two_files(&fs, dir.path(), 64)?
+        .into_iter()
+        .map(Arc::from)
+        .collect();
+    let mut queue = UringReadQueue::new(&fs.inner);
+    queue.submit(QueuedRead {
+        tag: 0,
+        file: Arc::clone(&files[0]),
+        offset: 0,
+        buf: vec![0; 64],
+    });
+
+    let lock = fs
+        .inner
+        .tx
+        .lock()
+        .unwrap_or_else(std::sync::PoisonError::into_inner);
+    let mut queue = std::thread::scope(|scope| {
+        let (returned, polled) = std::sync::mpsc::channel();
+        let poll = scope.spawn(move || {
+            queue.wait(0, &mut |_| {});
+            returned.send(()).ok();
+            queue
+        });
+        let prompt = polled
+            .recv_timeout(std::time::Duration::from_secs(5))
+            .is_ok();
+        drop(lock);
+        let queue = poll.join().expect("the poll thread");
+        assert!(prompt, "a wait for none waited for the submission lock");
+        queue
+    });
+    assert_eq!((queue.outstanding(), queue.held()), (1, 1));
+    let mut got = Vec::new();
+    while queue.outstanding() > 0 {
+        queue.wait(1, &mut |done| got.push(done.result.is_ok()));
+    }
+    assert_eq!(got, [true], "a later wait sends and reads it");
+    Ok(())
+}
+
+/// A wake asked for once reads are on the ring is declined: those reads
+/// report to a sink without it, and a caller sleeping on it would not wake.
+#[test]
+fn a_wake_asked_for_with_reads_in_flight_is_declined() -> io::Result<()> {
+    let Some(fs) = try_io_uring() else {
+        return Ok(());
+    };
+    let dir = tempfile::tempdir()?;
+    let files: Vec<Arc<dyn FsFile>> = two_files(&fs, dir.path(), 64)?
+        .into_iter()
+        .map(Arc::from)
+        .collect();
+    let wake = Arc::new(CountWake(core::sync::atomic::AtomicUsize::new(0)));
+    let mut queue = UringReadQueue::new(&fs.inner);
+    queue.submit(QueuedRead {
+        tag: 0,
+        file: Arc::clone(&files[0]),
+        offset: 0,
+        buf: vec![0; 64],
+    });
+    queue.issue(true);
+    assert!(!queue.set_wake(Arc::clone(&wake) as Arc<dyn crate::fs::ReadWake>));
+    while queue.outstanding() > 0 {
+        queue.wait(1, &mut |done| assert!(done.result.is_ok()));
+    }
+    assert!(
+        queue.set_wake(wake as Arc<dyn crate::fs::ReadWake>),
+        "nothing in flight"
+    );
+    Ok(())
+}
+
+/// A read past the end of its file comes back failed as a short read, and
+/// the reads beside it still come back read.
+#[test]
+fn a_read_queue_reports_a_short_read_as_failed() -> io::Result<()> {
+    let Some(fs) = try_io_uring() else {
+        return Ok(());
+    };
+    let dir = tempfile::tempdir()?;
+    let files: Vec<Arc<dyn FsFile>> = two_files(&fs, dir.path(), 256)?
+        .into_iter()
+        .map(Arc::from)
+        .collect();
+    let mut queue = fs.read_queue();
+    for (tag, offset) in [(0usize, 0u64), (1, 1 << 20), (2, 64)] {
+        queue.submit(QueuedRead {
+            tag,
+            file: Arc::clone(&files[0]),
+            offset,
+            buf: vec![0; 64],
+        });
+    }
+    let mut got = Vec::new();
+    while queue.outstanding() > 0 {
+        queue.wait(1, &mut |done| {
+            got.push((done.tag, done.result.map_err(|e| e.kind())));
+        });
+    }
+    got.sort_unstable_by_key(|(tag, _)| *tag);
+    assert_eq!(
+        got,
+        [
+            (0, Ok(())),
+            (1, Err(crate::io::ErrorKind::UnexpectedEof)),
+            (2, Ok(()))
+        ]
+    );
+    Ok(())
+}
+
+/// A queue reused for many rounds keeps no slot for a read it handed back:
+/// its bookkeeping follows the reads in flight, not every read it has sent.
+#[test]
+fn a_reused_read_queue_keeps_no_slot_for_a_read_handed_back() -> io::Result<()> {
+    let Some(fs) = try_io_uring() else {
+        return Ok(());
+    };
+    let dir = tempfile::tempdir()?;
+    let files: Vec<Arc<dyn FsFile>> = two_files(&fs, dir.path(), 8 * 64)?
+        .into_iter()
+        .map(Arc::from)
+        .collect();
+    let mut queue = UringReadQueue::new(&fs.inner);
+    for round in 0..100usize {
+        for i in 0..8usize {
+            queue.submit(QueuedRead {
+                tag: round * 8 + i,
+                file: Arc::clone(&files[i % 2]),
+                offset: (i * 64) as u64,
+                buf: vec![0; 64],
+            });
+        }
+        while queue.outstanding() > 0 {
+            queue.wait(1, &mut |done| {
+                assert!(done.result.is_ok(), "read {} failed", done.tag);
+            });
+        }
+        assert!(
+            queue.sent.is_empty(),
+            "round {round} kept {} slots",
+            queue.sent.len()
+        );
+    }
+    Ok(())
+}
+
+/// Dropping a queue with reads on the ring waits their completions out
+/// before their buffers go, and the backend stays usable after.
+#[test]
+fn dropping_a_read_queue_with_reads_in_flight_leaves_the_backend_usable() -> io::Result<()> {
+    let Some(fs) = try_io_uring() else {
+        return Ok(());
+    };
+    let dir = tempfile::tempdir()?;
+    let files: Vec<Arc<dyn FsFile>> = two_files(&fs, dir.path(), 128 * 64)?
+        .into_iter()
+        .map(Arc::from)
+        .collect();
+    for _ in 0..50 {
+        let mut queue = fs.read_queue();
+        for tag in 0..128usize {
+            queue.submit(QueuedRead {
+                tag,
+                file: Arc::clone(&files[tag % 2]),
+                offset: (tag * 64) as u64,
+                buf: vec![0; 64],
+            });
+        }
+        // Puts every read on the ring without waiting for any.
+        queue.wait(0, &mut |_| {});
+        drop(queue);
+    }
+    let mut buf = [0u8; 64];
+    let n = files[1].read_at(&mut buf, 64)?;
+    assert_eq!(n, 64);
+    assert_eq!(buf.to_vec(), expected_bytes(1, 64, 64));
+    Ok(())
+}

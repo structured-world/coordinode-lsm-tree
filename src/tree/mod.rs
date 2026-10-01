@@ -23,7 +23,7 @@ use crate::{
     range_tombstone::RangeTombstone,
     scan_since::ScanSinceEvent,
     slice::Slice,
-    table::{Table, probe_stats::ProbeCounts},
+    table::{Table, probe_stats::PlanCounts},
     value::InternalValue,
     version::{SuperVersion, SuperVersions, Version, recovery::recover},
     vlog::BlobFile,
@@ -123,12 +123,13 @@ struct RunResolve {
 }
 
 /// One data block the chunked `multi_get` resolver will read (see
-/// `resolve_level_chunked`): the block, the SST it lives in (`table` + its `file`
-/// handle), the table-local read seqno, whether it needs the special load path
-/// (Page-ECC / columnar), and the ORIGINAL key indices that fall in this block.
+/// `resolve_level_chunked`): the block, the SST it lives in, the table-local
+/// read seqno, whether it needs the special load path (Page-ECC / columnar),
+/// and the ORIGINAL key indices that fall in this block. The table's file is
+/// opened when the block's chunk is read, so a level holds open only the
+/// files of the chunk it is reading.
 struct BlockTask<'a> {
     table: &'a crate::Table,
-    file: Arc<dyn crate::fs::FsFile>,
     handle: crate::table::BlockHandle,
     table_seqno: SeqNo,
     special: bool,
@@ -137,7 +138,62 @@ struct BlockTask<'a> {
 
 /// A level's block tasks, and per table the filter probes planning them took,
 /// not yet counted.
-type LevelTasks<'a> = (Vec<BlockTask<'a>>, Vec<(&'a Table, ProbeCounts)>);
+type LevelTasks<'a> = (Vec<BlockTask<'a>>, Vec<(&'a Table, PlanCounts)>);
+
+/// One table of a level being planned for a key batch: the keys it covers,
+/// their indices in the caller's batch, and its staged read, `None` when it
+/// is planned serially.
+struct LevelTable<'a, 'k> {
+    table: &'a Table,
+    batch: Vec<(&'k [u8], u64)>,
+    batch_idx: Vec<usize>,
+    read: Option<crate::table::staged::StagedRead<'a>>,
+    /// The file the first stage opened, held for every later stage: on a
+    /// level wider than the descriptor cache, the cache has evicted it by
+    /// then, and opening it again is a cold open per stage. It is let go once
+    /// the table's stages are over.
+    file: Option<Arc<dyn crate::fs::FsFile>>,
+}
+
+/// A data block task's block before its chunk is read.
+enum TaskBlock {
+    /// At hand: taken from the cache.
+    Held(crate::table::DataBlock),
+    /// To be read in the chunk's batch.
+    Read,
+    /// To be loaded when its chunk is read, through a Page-ECC or columnar
+    /// table's own path, which heals or reconstructs it; held only while its
+    /// keys are read.
+    Load,
+}
+
+/// The read queue of one backend a level's tables were opened through.
+struct LevelQueue<'a> {
+    fs: &'a Arc<dyn crate::fs::Fs>,
+    queue: Box<dyn crate::fs::ReadQueue + 'a>,
+    /// Whether the queue wakes the level's [`LevelWake`] as its reads come
+    /// back, so the level can sleep on all its queues at once.
+    wakes: bool,
+}
+
+/// Woken by any queue of a level when one of its reads is back: each wake
+/// moves the generation on and unparks the thread driving the level, so a
+/// wake landing between its look at the queues and its park is not lost.
+// no-std: without a thread to park, the level waits on one queue at a time.
+#[cfg(feature = "std")]
+struct LevelWake {
+    generation: core::sync::atomic::AtomicU64,
+    thread: std::thread::Thread,
+}
+
+#[cfg(feature = "std")]
+impl crate::fs::ReadWake for LevelWake {
+    fn wake(&self) {
+        self.generation
+            .fetch_add(1, core::sync::atomic::Ordering::Release);
+        self.thread.unpark();
+    }
+}
 
 impl TablePointLookup for TableEntry {
     fn lookup(
@@ -1783,6 +1839,7 @@ impl AbstractTree for Tree {
                 seqno,
                 comparator,
                 &mut internal_entries,
+                self.config.multi_get_metadata_budget,
             )?;
 
             Self::fan_out_duplicates(&duplicates, &mut internal_entries);
@@ -3504,6 +3561,7 @@ impl Tree {
         seqno: SeqNo,
         comparator: &dyn crate::comparator::UserComparator,
         results: &mut [Option<InternalValue>],
+        metadata_budget: u64,
     ) -> crate::Result<()> {
         debug_assert_eq!(results.len(), keys.len());
         debug_assert!(miss_keys.iter().all(|&(i, _)| i < keys.len()));
@@ -3516,27 +3574,23 @@ impl Tree {
                 break;
             }
 
-            // Warm the cold data blocks this level will read across ALL its SSTs
-            // in one cross-file batched read, so the serial resolve below hits the
-            // cache. On io_uring the reads coalesce into one submission and the
-            // kernel fans them out across the underlying devices. When the cold
-            // working set is too large to warm without thrashing the cache, this
-            // signals oversize and warms nothing; the level is then resolved by
-            // reading its blocks in budget-sized chunks into a scratch and
-            // point-reading directly (no cache, no eviction).
-            // Both submit through the backend each TABLE carries, so a tree
-            // reopened with a changed routing map still reads every table
-            // through the backend it was recovered on.
-            if Self::prewarm_level_cross_sst(level, &still_remaining, keys, seqno, comparator)
-                && Self::resolve_level_chunked(
-                    level,
-                    &mut still_remaining,
-                    keys,
-                    seqno,
-                    comparator,
-                    results,
-                )?
-            {
+            // The level is read stage by stage across ALL its SSTs: every
+            // table's filter blocks in one batch, then its index blocks, then
+            // its data blocks, and answered from the blocks read. On io_uring
+            // each batch is one submission the kernel fans out across the
+            // underlying devices. A Page-ECC or columnar table is planned
+            // serially and its data blocks loaded through its format-aware
+            // path, while the level's other tables stay staged. A level whose
+            // plan or batched read fails is handed to the serial resolve below.
+            if Self::resolve_level_staged(
+                level,
+                &mut still_remaining,
+                keys,
+                seqno,
+                comparator,
+                results,
+                metadata_budget,
+            ) {
                 continue;
             }
 
@@ -3710,170 +3764,6 @@ impl Tree {
         })
     }
 
-    /// Warms an entire level's COLD data blocks across ALL its SSTs in one
-    /// cross-file batched read ([`crate::fs::Fs::read_blocks_batched`]), so the
-    /// serial resolve walk that follows hits the cache. On `io_uring` the reads of
-    /// many SSTs (and, on a multi-device filesystem, many physical devices)
-    /// coalesce into one submission and overlap in flight.
-    ///
-    /// Purely best-effort: it never changes a query result (the resolve walk
-    /// re-reads authoritatively), and it is size-bounded to at most half the
-    /// shared cache so the warmed blocks survive until the walk reads them.
-    ///
-    /// Returns `true` when the level's cold working set EXCEEDS that half-cache
-    /// bound: warming would thrash the cache, so nothing is warmed and the caller
-    /// resolves the level with the chunked read-into-scratch path instead
-    /// ([`Tree::resolve_level_chunked`]). Returns `false` when it warmed the
-    /// blocks (or had nothing to warm), i.e. the serial resolve should run.
-    #[expect(
-        clippy::indexing_slicing,
-        reason = "planned[ti] and all_buffers[k..end] indices are built from `planned` itself, so they are in range by construction"
-    )]
-    fn prewarm_level_cross_sst<K: AsRef<[u8]>>(
-        level: &crate::version::Level,
-        remaining: &[(usize, u64)],
-        keys: &[K],
-        seqno: SeqNo,
-        comparator: &dyn crate::comparator::UserComparator,
-    ) -> bool {
-        // Gather per-table prewarm plans across the level's runs (group remaining
-        // keys by covering table, mirroring resolve_run_batched's walk).
-        let mut planned: Vec<(
-            &crate::Table,
-            Arc<dyn crate::fs::FsFile>,
-            Vec<crate::table::BlockHandle>,
-        )> = Vec::new();
-        // Reused across the level's tables, cleared per table: `plan_prewarm`
-        // reads it and returns before the next table fills it.
-        let mut batch: Vec<(&[u8], u64)> = Vec::new();
-        for run in level.iter() {
-            let mut i = 0;
-            while i < remaining.len() {
-                let (idx, _) = remaining[i];
-                let key = keys[idx].as_ref();
-                let Some(table) = run.get_for_key_cmp(key, comparator) else {
-                    i += 1;
-                    continue;
-                };
-                let table_id = table.id();
-                batch.clear();
-                while i < remaining.len() {
-                    let (jdx, jhash) = remaining[i];
-                    let jkey = keys[jdx].as_ref();
-                    match run.get_for_key_cmp(jkey, comparator) {
-                        Some(t) if t.id() == table_id => {
-                            batch.push((jkey, jhash));
-                            i += 1;
-                        }
-                        _ => break,
-                    }
-                }
-                if let Some((file, handles)) = table.plan_prewarm(&batch, seqno) {
-                    planned.push((table, file, handles));
-                }
-            }
-        }
-
-        let total_cold: usize = planned.iter().map(|(_, _, h)| h.len()).sum();
-        if total_cold < 2 {
-            return false;
-        }
-        // Eviction-avoiding bound: warm at most half the (shared) cache.
-        let Some((first_table, _, _)) = planned.first() else {
-            return false;
-        };
-        let cap = first_table.cache_capacity();
-        let total_bytes: u64 = planned
-            .iter()
-            .flat_map(|(_, _, h)| h.iter().map(|x| u64::from(x.size())))
-            .sum();
-        if cap == 0 {
-            return false;
-        }
-        if total_bytes > cap / 2 {
-            // Cold working set too large to warm without thrash: signal the caller
-            // to resolve this level via the chunked read-into-scratch path.
-            return true;
-        }
-
-        // One buffer per cold block, in (table, block) order.
-        //
-        // One buffer per cold block, in (table, block) order.
-        let mut all_buffers: Vec<Vec<u8>> = planned
-            .iter()
-            .flat_map(|(_, _, handles)| handles.iter().map(|h| vec![0u8; h.size() as usize]))
-            .collect();
-
-        {
-            // Grouped by the backend each TABLE was opened through, not by the
-            // level's current route: a tree may be reopened with the routing map
-            // changed, and recovery keeps every table on the backend whose
-            // folder it was found in. Submitting a table's reads anywhere else
-            // forfeits the batching that backend provides.
-            //
-            // Paired with the plan positionally: `all_buffers` is in
-            // (table, block) order, so the walk that fills it is the walk that
-            // built it.
-            let mut groups: Vec<(&Arc<dyn crate::fs::Fs>, Vec<crate::fs::BlockRead<'_>>)> =
-                Vec::new();
-            let mut bufs = all_buffers.iter_mut();
-            for (table, file, handles) in &planned {
-                for handle in handles {
-                    let Some(buf) = bufs.next() else {
-                        // Unreachable: all_buffers was built from these handles.
-                        return false;
-                    };
-                    let req = crate::fs::BlockRead {
-                        file: file.as_ref(),
-                        offset: *handle.offset(),
-                        buf: crate::fs::BlockBuf::new(&mut buf[..]),
-                    };
-                    match groups.iter_mut().find(|(fs, _)| Arc::ptr_eq(fs, &table.fs)) {
-                        Some((_, reqs)) => reqs.push(req),
-                        None => groups.push((&table.fs, vec![req])),
-                    }
-                }
-            }
-            for (fs, reqs) in &mut groups {
-                // Charged as issued: this group's blocks are asked of its
-                // backend now, whether or not the call then succeeds. A group
-                // after a failure is never asked, so it is charged here, just
-                // before its own call, rather than with the whole plan.
-                for (table, _, handles) in &planned {
-                    if Arc::ptr_eq(&table.fs, fs) {
-                        table.record_batched_read(handles);
-                    }
-                }
-                // Best-effort: a batched-read failure just leaves the blocks for
-                // the resolve walk to read normally.
-                if fs.read_blocks_batched(reqs).is_err() {
-                    return false;
-                }
-                // Independently of what the call returned: an implementation
-                // that reported success without filling a request leaves it
-                // short, and a block decoded from a buffer nobody wrote would be
-                // decoded from whatever the allocation held.
-                if !reqs.iter().all(|r| r.buf.is_full()) {
-                    return false;
-                }
-            }
-        }
-
-        // Views, not owned copies: the decode reads these bytes and builds its
-        // own block out of them, so staging them into an owning type would copy
-        // every block a second time.
-        let all_buffers: Vec<&[u8]> = all_buffers.iter().map(Vec::as_slice).collect();
-
-        // Decode each table's blocks (its contiguous slice of all_buffers).
-        let mut k = 0;
-        for (table, _, handles) in &planned {
-            let end = k + handles.len();
-            table.decode_prewarmed(handles, &all_buffers[k..end]);
-            k = end;
-        }
-        false
-    }
-
     /// Plans every data block this level's SSTs will read for `remaining`,
     /// grouping keys by covering table per run (mirrors `resolve_run_batched`'s
     /// walk). Each task carries the ORIGINAL key indices (into `keys`). The
@@ -3888,19 +3778,18 @@ impl Tree {
         clippy::indexing_slicing,
         reason = "i < remaining.len() loop-checked; idx/jdx are valid key indices; batch_idx[pos] is in range (pos came from this table's own plan)"
     )]
-    fn plan_level_block_tasks<'a, K: AsRef<[u8]>>(
+    fn plan_level_block_tasks<'a, 'k, K: AsRef<[u8]>>(
         level: &'a crate::version::Level,
         remaining: &[(usize, u64)],
-        keys: &[K],
+        keys: &'k [K],
         seqno: SeqNo,
         comparator: &dyn crate::comparator::UserComparator,
+        metadata_budget: u64,
     ) -> crate::Result<LevelTasks<'a>> {
-        let mut tasks: Vec<BlockTask<'a>> = Vec::new();
-        let mut probes: Vec<(&'a Table, ProbeCounts)> = Vec::new();
-        // Reused across the level's tables, cleared per table: both are read by
-        // the plan below and are done with before the next table fills them.
-        let mut batch: Vec<(&[u8], u64)> = Vec::new();
-        let mut batch_idx: Vec<usize> = Vec::new();
+        use crate::table::staged::{StagedRead, StagedStart};
+
+        // The level's tables, each with the keys it covers.
+        let mut tables: Vec<LevelTable<'a, 'k>> = Vec::new();
         for run in level.iter() {
             let mut i = 0;
             while i < remaining.len() {
@@ -3911,8 +3800,8 @@ impl Tree {
                     continue;
                 };
                 let table_id = table.id();
-                batch.clear();
-                batch_idx.clear();
+                let mut batch: Vec<(&'k [u8], u64)> = Vec::new();
+                let mut batch_idx: Vec<usize> = Vec::new();
                 while i < remaining.len() {
                     let (jdx, jhash) = remaining[i];
                     let jkey = keys[jdx].as_ref();
@@ -3925,107 +3814,501 @@ impl Tree {
                         _ => break,
                     }
                 }
-                let mut tally = ProbeCounts::default();
-                let plan = table.plan_block_tasks(&batch, seqno, &mut tally)?;
-                if tally != ProbeCounts::default() {
-                    probes.push((table, tally));
+                let read = match StagedRead::start(table, &batch, seqno) {
+                    StagedStart::Nothing => continue,
+                    StagedStart::Serial => None,
+                    StagedStart::Staged(read) => Some(read),
+                };
+                tables.push(LevelTable {
+                    table,
+                    batch,
+                    batch_idx,
+                    read,
+                    file: None,
+                });
+            }
+        }
+
+        // Every table's filter blocks in one batch, then every table's index
+        // blocks in one batch, and so on until each is planned. A table whose
+        // stage fails is planned serially below.
+        Self::read_level_stages(&mut tables, metadata_budget);
+
+        let mut tasks: Vec<BlockTask<'a>> = Vec::new();
+        let mut probes: Vec<(&'a Table, PlanCounts)> = Vec::new();
+        for LevelTable {
+            table,
+            batch,
+            batch_idx,
+            read,
+            ..
+        } in tables
+        {
+            let (table_seqno, blocks, tally) = match read {
+                Some(read) if read.is_done() => read.into_plan(),
+                // Served by the serial planner, whose reads are authoritative:
+                // a genuine failure surfaces here instead of letting a lower
+                // level answer a key this table covers. The file it opened is
+                // not kept: the data blocks are read through the file their
+                // chunk opens.
+                _ => {
+                    let mut tally = PlanCounts::default();
+                    let Some((_, table_seqno, _, blocks)) =
+                        table.plan_block_tasks(&batch, seqno, &mut tally)?
+                    else {
+                        if tally != PlanCounts::default() {
+                            probes.push((table, tally));
+                        }
+                        continue;
+                    };
+                    (table_seqno, blocks, tally)
                 }
-                if let Some((file, table_seqno, special, blocks)) = plan {
-                    for (handle, positions) in blocks {
-                        let task_keys: Vec<usize> =
-                            positions.iter().map(|&pos| batch_idx[pos]).collect();
-                        tasks.push(BlockTask {
-                            table,
-                            file: Arc::clone(&file),
-                            handle,
-                            table_seqno,
-                            special,
-                            keys: task_keys,
-                        });
-                    }
-                }
+            };
+            if tally != PlanCounts::default() {
+                probes.push((table, tally));
+            }
+            if blocks.is_empty() {
+                continue;
+            }
+            let special = table.is_chunk_special();
+            for (handle, positions) in blocks {
+                let task_keys: Vec<usize> = positions.iter().map(|&pos| batch_idx[pos]).collect();
+                tasks.push(BlockTask {
+                    table,
+                    handle,
+                    table_seqno,
+                    special,
+                    keys: task_keys,
+                });
             }
         }
         Ok((tasks, probes))
     }
 
-    /// Resolves an ENTIRE level by reading its blocks in chunks into a scratch and
-    /// point-reading directly (no cache, no eviction). Called after
-    /// [`Tree::prewarm_level_cross_sst`] signals the cold working set is too large
-    /// to warm. Returns `Ok(true)` when it resolved the level (results updated,
-    /// found keys dropped from `still_remaining`); `Ok(false)` when the level has
-    /// no blocks to read for this batch (every key bloom-skips) or holds a
-    /// Page-ECC / columnar table, in which cases the caller falls through to the
-    /// serial resolve.
+    /// The most of these `tables` whose files a level read holds open at
+    /// once: what the smallest descriptor cache among them keeps, unbounded
+    /// when their descriptors are pinned and open anyway.
+    fn open_cap<'t>(tables: impl Iterator<Item = &'t Table>) -> usize {
+        tables
+            .filter_map(Table::descriptor_capacity)
+            .min()
+            .map_or(usize::MAX, |cap| {
+                usize::try_from(cap).unwrap_or(usize::MAX).max(1)
+            })
+    }
+
+    /// Drives the staged reads of a level's `tables` until each is planned. A
+    /// table's blocks go to the read queue of the backend it was opened
+    /// through, and the moment the last of them is back its read moves on and
+    /// asks for its next stage, while other tables' blocks may still be in
+    /// flight: no table waits on the slowest file of the level. A read whose
+    /// block cannot be opened, read or decoded is dropped, leaving its table
+    /// to the serial planner.
+    ///
+    /// The filter and index bytes the tables hold, in flight or read, stay
+    /// within `metadata_budget` past one table's stage: a table whose stage
+    /// would pass it waits while a table before it holds blocks, and the
+    /// first table holding any always goes on, so the level always advances.
+    #[expect(
+        clippy::indexing_slicing,
+        reason = "a tag indexes `asked`, and `asked` entries index `tables` and `waiting`, all by construction"
+    )]
+    fn read_level_stages<'a>(tables: &mut [LevelTable<'a, '_>], metadata_budget: u64) {
+        // One queue per backend, opened when a table first asks it for a
+        // block, so a level answered from the cache opens none.
+        let mut queues: Vec<LevelQueue<'a>> = Vec::new();
+        #[cfg(feature = "std")]
+        let wake = Arc::new(LevelWake {
+            generation: core::sync::atomic::AtomicU64::new(0),
+            thread: std::thread::current(),
+        });
+        // What each submitted read is for: its tag is its position here.
+        let mut asked: Vec<(usize, crate::table::BlockHandle)> = Vec::new();
+        // Each table's reads still in flight.
+        let mut waiting: Vec<usize> = vec![0; tables.len()];
+        // At most as many tables hold a file open for their stages as the
+        // descriptor cache keeps open: a level wider than that, read stage by
+        // stage all at once, would otherwise open a file per table and run
+        // the process out of descriptors. A table whose stages are over lets
+        // its file go and its place with it, so the tables waiting for a place
+        // always get one.
+        let open_cap = Self::open_cap(tables.iter().map(|entry| entry.table));
+        let mut staged: Vec<bool> = vec![false; tables.len()];
+        let mut in_stage = 0usize;
+        // The bytes each table's stages asked for, held until it is planned,
+        // and their sum across the level.
+        let mut meta_held: Vec<u64> = vec![0; tables.len()];
+        let mut meta_total = 0u64;
+
+        loop {
+            // Whether a table waits for a place under the cap, or for room
+            // under the budget, this pass.
+            let mut deferred = false;
+            // Whether a table before the one at hand holds metadata blocks:
+            // the first that does is never held back, so the level advances.
+            let mut held_before = false;
+            // A table with none of its blocks in flight moves on, and asks for
+            // the next stage's blocks once its read lacks some.
+            for (at, entry) in tables.iter_mut().enumerate() {
+                let first_holder = !held_before;
+                if waiting[at] > 0 {
+                    held_before = true;
+                    continue;
+                }
+                while let Some(read) = &mut entry.read
+                    && !read.is_done()
+                {
+                    let (block_type, need) = read.need();
+                    if need.is_empty() {
+                        if read.advance(&entry.batch).is_err() {
+                            entry.read = None;
+                        }
+                        continue;
+                    }
+                    let table: &'a Table = entry.table;
+                    // A table with no place under the cap waits before any of
+                    // its stage's buffers is allocated: it is passed over
+                    // again on every pass until a place frees.
+                    if entry.file.is_none() && in_stage >= open_cap {
+                        deferred = true;
+                        break;
+                    }
+                    // Nor is any allocated for a stage past the budget, unless
+                    // no table before this one holds blocks: then it goes on
+                    // even alone above the budget, or the level would stop.
+                    let asked_bytes: u64 = need.iter().map(|handle| u64::from(handle.size())).sum();
+                    if !first_holder && meta_total + asked_bytes > metadata_budget {
+                        deferred = true;
+                        break;
+                    }
+                    // A size no block can have is refused before any buffer
+                    // is allocated for it; the serial planner then reports
+                    // the corruption as the load path does.
+                    let Ok(buffers) = need
+                        .iter()
+                        .map(|handle| table.block_buffer(handle))
+                        .collect::<crate::Result<Vec<_>>>()
+                    else {
+                        entry.read = None;
+                        break;
+                    };
+                    let file = if let Some(file) = &entry.file {
+                        Arc::clone(file)
+                    } else {
+                        let Ok(file) = table.open_file() else {
+                            entry.read = None;
+                            break;
+                        };
+                        entry.file = Some(Arc::clone(&file));
+                        staged[at] = true;
+                        in_stage += 1;
+                        file
+                    };
+                    table.record_batched_read(block_type, need);
+                    meta_held[at] += asked_bytes;
+                    meta_total += asked_bytes;
+                    let slot = if let Some(slot) =
+                        queues.iter().position(|q| Arc::ptr_eq(q.fs, &table.fs))
+                    {
+                        slot
+                    } else {
+                        #[cfg_attr(not(feature = "std"), expect(unused_mut))]
+                        let mut queue = table.fs.read_queue();
+                        #[cfg(feature = "std")]
+                        let wakes =
+                            queue.set_wake(Arc::clone(&wake) as Arc<dyn crate::fs::ReadWake>);
+                        #[cfg(not(feature = "std"))]
+                        let wakes = false;
+                        queues.push(LevelQueue {
+                            fs: &table.fs,
+                            queue,
+                            wakes,
+                        });
+                        queues.len() - 1
+                    };
+                    let queue = &mut queues[slot].queue;
+                    for (handle, buf) in need.iter().zip(buffers) {
+                        queue.submit(crate::fs::QueuedRead {
+                            tag: asked.len(),
+                            file: Arc::clone(&file),
+                            offset: *handle.offset(),
+                            buf,
+                        });
+                        asked.push((at, *handle));
+                        waiting[at] += 1;
+                    }
+                    break;
+                }
+                // A table whose stages are over, or that is left to the serial
+                // planner, needs its file no more: its data blocks are read
+                // through the file their chunk opens, and holding it would
+                // keep a descriptor per table of the level open until the
+                // whole level is read.
+                if waiting[at] == 0
+                    && entry
+                        .read
+                        .as_ref()
+                        .is_none_or(crate::table::staged::StagedRead::is_done)
+                {
+                    entry.file = None;
+                    if staged[at] {
+                        staged[at] = false;
+                        in_stage -= 1;
+                    }
+                    // Planned, or left to the serial planner: the blocks its
+                    // stages held are its read's no more.
+                    meta_total -= meta_held[at];
+                    meta_held[at] = 0;
+                }
+                held_before |= meta_held[at] > 0;
+            }
+
+            // A block is handed to its read the moment it is back; a read
+            // that loses one is dropped, and its table planned serially.
+            let mut on_done = |done: crate::fs::ReadDone| {
+                let (at, handle) = asked[done.tag];
+                waiting[at] -= 1;
+                let Some(read) = &mut tables[at].read else {
+                    return;
+                };
+                let supplied = match done.result {
+                    Ok(()) => read.supply(handle, &done.buf).is_ok(),
+                    Err(error) => {
+                        log::debug!(
+                            "a staged level read lost a block, its table is planned serially: {error}"
+                        );
+                        false
+                    }
+                };
+                if !supplied {
+                    tables[at].read = None;
+                }
+            };
+            // What has finished on any backend, without waiting. The wake's
+            // generation is taken first, so a read back after this look is
+            // seen by the sleep below.
+            #[cfg(feature = "std")]
+            let seen = wake.generation.load(core::sync::atomic::Ordering::Acquire);
+            let mut handed = 0usize;
+            for q in &mut queues {
+                q.queue.wait(0, &mut |done| {
+                    handed += 1;
+                    on_done(done);
+                });
+            }
+            if handed > 0 {
+                continue;
+            }
+            // Nothing is back. One backend still reading is waited on itself.
+            // A level whose tables sit on several (after a route change, until
+            // compaction moves them) sleeps until any of them has a read back,
+            // so a fast backend's tables move on while a slow one is still
+            // reading. A queue that cannot wake the level, or holds reads only
+            // a wait carries out, is waited on itself.
+            let must_wait = |q: &LevelQueue<'_>| !q.wakes || q.queue.held() > 0;
+            let mut reading = queues.iter_mut().filter(|q| q.queue.outstanding() > 0);
+            let Some(first) = reading.next() else {
+                // Nothing in flight, so every table that held a place has
+                // moved on and given it back: the ones waiting start now.
+                if deferred {
+                    continue;
+                }
+                return;
+            };
+            let second = reading.next();
+            if second.is_none() || must_wait(first) {
+                first.queue.wait(1, &mut on_done);
+                continue;
+            }
+            if let Some(q) = second.into_iter().chain(reading).find(|q| must_wait(q)) {
+                q.queue.wait(1, &mut on_done);
+                continue;
+            }
+            // Every queue still reading wakes the level, which only a queue
+            // given the wake under `std` does.
+            #[cfg(feature = "std")]
+            while wake.generation.load(core::sync::atomic::Ordering::Acquire) == seen {
+                std::thread::park();
+            }
+        }
+    }
+
+    /// Resolves an ENTIRE level from its staged plan: the filter and index
+    /// blocks of all its tables read stage by stage in batches, then its data
+    /// blocks, a cached one taken from the cache and the others read in chunks
+    /// of at most half the cache into a scratch, and every key point-read in
+    /// the blocks read. A cold set that fits in half the cache is kept in it;
+    /// a larger one is not, so it never evicts the cache it would not fit.
+    ///
+    /// A Page-ECC or columnar table is planned serially and its data blocks
+    /// loaded through their own path; the level's other tables stay staged.
+    ///
+    /// Returns `true` when it resolved the level (results updated, found keys
+    /// dropped from `still_remaining`), and `false` when a table it could not
+    /// plan or a block it could not read hands the level to the caller's
+    /// serial resolve, which surfaces a failure only where a key-by-key read
+    /// meets it.
     #[expect(
         clippy::indexing_slicing,
         reason = "start/end stay within tasks by construction"
     )]
-    fn resolve_level_chunked<K: AsRef<[u8]>>(
+    fn resolve_level_staged<K: AsRef<[u8]>>(
         level: &crate::version::Level,
         still_remaining: &mut Vec<(usize, u64)>,
         keys: &[K],
         seqno: SeqNo,
         comparator: &dyn crate::comparator::UserComparator,
         results: &mut [Option<InternalValue>],
-    ) -> crate::Result<bool> {
-        let (tasks, probes) =
-            Self::plan_level_block_tasks(level, still_remaining, keys, seqno, comparator)?;
-        let Some(first) = tasks.first() else {
-            return Ok(false);
+        metadata_budget: u64,
+    ) -> bool {
+        // The keys still to resolve have no answer yet, so a level handed back
+        // is restored by clearing theirs.
+        debug_assert!(
+            still_remaining
+                .iter()
+                .all(|&(idx, _)| results[idx].is_none())
+        );
+        // A table that cannot be planned may be one the serial resolve never
+        // reads: a key an earlier level-0 run holds at the read's ceiling skips
+        // the later runs. The serial resolve reads the level in that order and
+        // fails only where a key-by-key read would.
+        let (tasks, probes) = match Self::plan_level_block_tasks(
+            level,
+            still_remaining,
+            keys,
+            seqno,
+            comparator,
+            metadata_budget,
+        ) {
+            Ok(plan) => plan,
+            Err(error) => {
+                log::debug!("a staged level plan failed, the level is read serially: {error}");
+                return false;
+            }
         };
-        // A Page-ECC / columnar table covers some of these keys (only possible
-        // when the columnar/ECC policy differs between the SSTs in this level).
-        // The scratch decode path is row-format only, so hand the whole level to
-        // the serial resolve, which loads those blocks through their format-aware
-        // path. The scratch fast path stays homogeneous and row-only.
-        if tasks.iter().any(|t| t.special) {
-            return Ok(false);
-        }
-        // This resolve answers the level from its plan: its filter probes are
-        // the level's, where a level handed back is probed and counted by the
-        // serial resolve instead.
-        for (table, counts) in probes {
-            table.count_probes(counts);
-        }
+        let Some(first) = tasks.first() else {
+            // No key of the batch reaches a block of this level: the filter
+            // probes that found so are the level's answer.
+            for (table, counts) in probes {
+                table.count_plan(counts);
+            }
+            return true;
+        };
+        // Each task's block, when the cache holds it; the others are read. A
+        // Page-ECC or columnar table's block is loaded through its own path,
+        // which heals a corrected ECC block and reconstructs a columnar one,
+        // the same load a point read makes: the scratch decode is row-format
+        // only. It is loaded when its chunk is read, so the blocks loaded stay
+        // within the chunk budget too. The level's other tables are read in
+        // batches all the same.
+        let cached: Vec<TaskBlock> = tasks
+            .iter()
+            .map(|task| {
+                if task.special {
+                    TaskBlock::Load
+                } else {
+                    task.table
+                        .cached_data_block(&task.handle)
+                        .map_or(TaskBlock::Read, TaskBlock::Held)
+                }
+            })
+            .collect();
+        let capacity = first.table.cache_capacity();
+        let cold: u64 = tasks
+            .iter()
+            .zip(&cached)
+            .filter(|(_, block)| matches!(block, TaskBlock::Read))
+            .map(|(task, _)| u64::from(task.handle.size()))
+            .sum();
+        // A cold set within half the shared cache is kept in it, for the reads
+        // that follow; a larger one would evict what the cache holds for them.
+        let keep = capacity > 0 && cold <= capacity / 2;
         // Read blocks in chunks of at most half the shared cache, so a chunk's
         // scratch never dwarfs the cache it is meant to spare. `.max(1)` keeps the
         // chunk loop's `end > start` guard the sole progress condition when the
         // cache is disabled (capacity 0).
-        let budget = (first.table.cache_capacity() / 2).max(1);
+        let budget = (capacity / 2).max(1);
         // The (table, key) pairs a read found, when some table counts its
         // filter probes: a key whose version may continue past a block's end
         // is read in that block and the next, so a miss is a pair no read of
         // it found, not one block that came back empty.
         let mut found: Option<Vec<(crate::TableId, usize)>> = tasks
             .iter()
-            .any(|task| task.table.probe_stats().is_some())
+            .any(|task| task.table.counts_filter_misses())
             .then(Vec::new);
+
+        // A chunk opens the files of the tables it reads blocks of, so it
+        // spans at most as many of them as the descriptor cache keeps. A
+        // table's tasks are consecutive, so a new table is a change of table.
+        let open_cap = Self::open_cap(tasks.iter().map(|task| task.table));
+        // The last table a chunk read, with its file: a table whose blocks
+        // span two chunks is opened once for both.
+        let mut carried: Option<(crate::TableId, Arc<dyn crate::fs::FsFile>)> = None;
 
         let mut start = 0;
         while start < tasks.len() {
             let mut bytes = 0u64;
             let mut end = start;
+            let mut opened = 0usize;
+            let mut last_read: Option<crate::TableId> = None;
             while end < tasks.len() {
-                let sz = u64::from(tasks[end].handle.size());
-                if end > start && bytes + sz > budget {
+                let reads = matches!(cached[end], TaskBlock::Read);
+                let sz = if reads || matches!(cached[end], TaskBlock::Load) {
+                    u64::from(tasks[end].handle.size())
+                } else {
+                    0
+                };
+                let opens = reads && last_read != Some(tasks[end].table.id());
+                if end > start && (bytes + sz > budget || (opens && opened == open_cap)) {
                     break;
+                }
+                if opens {
+                    opened += 1;
+                    last_read = Some(tasks[end].table.id());
                 }
                 bytes += sz;
                 end += 1;
             }
-            Self::resolve_block_task_chunk(&tasks[start..end], keys, results, found.as_mut())?;
+            // A batch the backend refuses, or reports read without filling,
+            // hands the level to the serial resolve, which reads the same
+            // blocks one by one and surfaces its own failure: the level is
+            // answered either way, never skipped for a lower one. What earlier
+            // chunks answered is cleared first: the serial resolve reads the
+            // level from no answer, and on level 0 a key it finds at the read's
+            // ceiling only skips the older runs when it sets that answer itself.
+            if let Err(error) = Self::resolve_block_task_chunk(
+                &tasks[start..end],
+                &cached[start..end],
+                keep,
+                keys,
+                results,
+                found.as_mut(),
+                &mut carried,
+            ) {
+                log::debug!("a batched level read failed, the level is read serially: {error}");
+                for &(idx, _) in still_remaining.iter() {
+                    results[idx] = None;
+                }
+                return false;
+            }
             start = end;
+        }
+        // Answered from the plan: its filter probes, queries and skips are
+        // the level's, where a level handed back is probed and counted by the
+        // serial resolve.
+        for (table, counts) in probes {
+            table.count_plan(counts);
         }
         if let Some(found) = found {
             Self::count_chunked_false_positives(&tasks, found);
         }
         still_remaining.retain(|&(idx, _)| results[idx].is_none());
-        Ok(true)
+        true
     }
 
     /// Counts, once per (table, key), the keys a table's filter let through
-    /// that no read of that table found.
+    /// that no read of that table found: a filter query and, where the read
+    /// saw every version, a false positive, as a point read counts them.
     #[expect(
         clippy::indexing_slicing,
         reason = "task indices come from enumerating `tasks`"
@@ -4039,7 +4322,7 @@ impl Tree {
         let mut missed: Vec<(crate::TableId, usize, usize)> = tasks
             .iter()
             .enumerate()
-            .filter(|(_, task)| task.table.probe_stats().is_some() && task.table.has_filter())
+            .filter(|(_, task)| task.table.counts_filter_misses())
             .flat_map(|(at, task)| task.keys.iter().map(move |&key| (task.table.id(), key, at)))
             .filter(|&(table, key, _)| found.binary_search(&(table, key)).is_err())
             .collect();
@@ -4047,39 +4330,107 @@ impl Tree {
         missed.dedup_by_key(|&mut (table, key, _)| (table, key));
         for (_, _, at) in missed {
             let task = &tasks[at];
-            task.table.count_false_positive(task.table_seqno);
+            task.table.count_filter_miss(task.table_seqno);
         }
     }
 
-    /// Reads one chunk of block-tasks in ONE cross-file `read_blocks_batched`,
-    /// decodes each from its scratch buffer, and point-reads its keys, keeping the
-    /// highest-seqno hit per key in `results`. Every task is row-format (the caller
-    /// routes any level with a Page-ECC / columnar table to the serial resolve).
+    /// Resolves one chunk of block-tasks: a task whose block is held is
+    /// point-read in it, a Page-ECC or columnar table's block is loaded
+    /// through its own path and point-read (a columnar block its delete mask
+    /// removes whole holds no key), and the others are read in ONE cross-file
+    /// `read_blocks_batched` per backend, decoded from their scratch buffers
+    /// (and put in the cache when `keep`) and point-read, keeping the
+    /// highest-seqno hit per key in `results`.
     fn resolve_block_task_chunk<K: AsRef<[u8]>>(
         chunk: &[BlockTask<'_>],
+        cached: &[TaskBlock],
+        keep: bool,
         keys: &[K],
         results: &mut [Option<InternalValue>],
         found: Option<&mut Vec<(crate::TableId, usize)>>,
+        carried: &mut Option<(crate::TableId, Arc<dyn crate::fs::FsFile>)>,
     ) -> crate::Result<()> {
+        let mut hits: Vec<(usize, usize, InternalValue)> = Vec::new();
+        for (index, (task, block)) in chunk.iter().zip(cached).enumerate() {
+            match block {
+                TaskBlock::Held(block) => {
+                    Self::read_task_keys(task, index, block, keys, &mut hits)?;
+                }
+                TaskBlock::Load => {
+                    if let Some(block) = task.table.load_data_block(&task.handle)? {
+                        Self::read_task_keys(task, index, &block, keys, &mut hits)?;
+                    }
+                }
+                TaskBlock::Read => {}
+            }
+        }
+        // Scratch for the blocks to be read, empty for the others; a size no
+        // block can have fails the chunk before it is allocated.
         let mut buffers: Vec<Vec<u8>> = chunk
             .iter()
-            .map(|t| vec![0u8; t.handle.size() as usize])
-            .collect();
+            .zip(cached)
+            .map(|(t, block)| match block {
+                TaskBlock::Read => t.table.block_buffer(&t.handle),
+                TaskBlock::Held(_) | TaskBlock::Load => Ok(Vec::new()),
+            })
+            .collect::<crate::Result<_>>()?;
 
-        // One submission per backend, for the reason `prewarm_level_cross_sst`
-        // states: a table's reads belong to the backend it was opened through,
-        // which a reopen with a changed routing map can leave different from
-        // the level's current route. Each group remembers which task each of
-        // its requests reads for.
+        // The files of the tables whose blocks are read, opened for this chunk
+        // only, once per table: a table's tasks are consecutive. The previous
+        // chunk's last file is taken over when this chunk goes on with its
+        // table, and let go otherwise. Each task to read names its file by
+        // position here.
+        let mut carry = carried.take();
+        let mut files: Vec<(crate::TableId, Arc<dyn crate::fs::FsFile>)> = Vec::new();
+        let mut file_of: Vec<Option<usize>> = Vec::with_capacity(chunk.len());
+        for (task, block) in chunk.iter().zip(cached) {
+            if !matches!(block, TaskBlock::Read) {
+                file_of.push(None);
+                continue;
+            }
+            let id = task.table.id();
+            if files.last().is_none_or(|&(last, _)| last != id) {
+                let file = match carry.take() {
+                    Some((carried_id, file)) if carried_id == id => file,
+                    // Another table's file is let go before this one opens:
+                    // a scrutinee left unbound lives to the end of the match.
+                    other => {
+                        drop(other);
+                        task.table.open_file()?
+                    }
+                };
+                files.push((id, file));
+            }
+            file_of.push(files.len().checked_sub(1));
+        }
+        *carried = files.last().cloned();
+
+        // One submission per backend: a table's reads belong to the backend it
+        // was opened through, which a reopen with a changed routing map can
+        // leave different from the level's current route. Each group
+        // remembers which task each of its requests reads for.
         struct BackendReads<'f, 'b> {
             fs: &'f Arc<dyn crate::fs::Fs>,
             reqs: Vec<crate::fs::BlockRead<'b>>,
             tasks: Vec<usize>,
         }
         let mut groups: Vec<BackendReads<'_, '_>> = Vec::new();
-        for (index, (task, buf)) in chunk.iter().zip(buffers.iter_mut()).enumerate() {
+        for (index, ((task, buf), block)) in
+            chunk.iter().zip(buffers.iter_mut()).zip(cached).enumerate()
+        {
+            if !matches!(block, TaskBlock::Read) {
+                continue;
+            }
+            let Some(file) = file_of
+                .get(index)
+                .copied()
+                .flatten()
+                .and_then(|at| files.get(at))
+            else {
+                continue;
+            };
             let req = crate::fs::BlockRead {
-                file: task.file.as_ref(),
+                file: file.1.as_ref(),
                 offset: *task.handle.offset(),
                 buf: crate::fs::BlockBuf::new(&mut buf[..]),
             };
@@ -4108,15 +4459,16 @@ impl Tree {
         // entry is the one a single-key read returns, whatever order the
         // reads completed in.
         let mut decode_failure: Option<(usize, crate::Error)> = None;
-        let mut hits: Vec<(usize, usize, InternalValue)> = Vec::new();
         for BackendReads { fs, reqs, tasks } in &mut groups {
-            // Charged as issued, group by group like the prewarm: these reads
-            // bypass the per-block load path that charges every other read,
-            // and a group after a failure is never asked.
-            for task in chunk {
-                if Arc::ptr_eq(&task.table.fs, fs) {
-                    task.table
-                        .record_batched_read(core::slice::from_ref(&task.handle));
+            // Charged as issued, group by group: these reads bypass the
+            // per-block load path that charges every other read, and a group
+            // after a failure is never asked.
+            for &index in tasks.iter() {
+                if let Some(task) = chunk.get(index) {
+                    task.table.record_batched_read(
+                        crate::table::block::BlockType::Data,
+                        core::slice::from_ref(&task.handle),
+                    );
                 }
             }
             fs.read_blocks_batched_each(reqs, &mut |position, req| {
@@ -4126,11 +4478,16 @@ impl Tree {
                 else {
                     return;
                 };
-                if let Err(e) =
-                    Self::resolve_block_task(task, index, req.buf.filled_bytes(), keys, &mut hits)
-                    && decode_failure
-                        .as_ref()
-                        .is_none_or(|(held, _)| index < *held)
+                if let Err(e) = Self::resolve_block_task(
+                    task,
+                    index,
+                    req.buf.filled_bytes(),
+                    keep,
+                    keys,
+                    &mut hits,
+                ) && decode_failure
+                    .as_ref()
+                    .is_none_or(|(held, _)| index < *held)
                 {
                     decode_failure = Some((index, e));
                 }
@@ -4162,31 +4519,42 @@ impl Tree {
         Ok(())
     }
 
-    /// Decodes the block of task `index` from `bytes` and point-reads its keys,
-    /// adding each hit to `hits` as `(task index, key index, entry)`.
-    #[expect(
-        clippy::indexing_slicing,
-        reason = "the task's key indices are valid (caller's keys aligned)"
-    )]
+    /// Decodes the block of task `index` from `bytes`, keeping it in the cache
+    /// when `keep`, and point-reads its keys, adding each hit to `hits` as
+    /// `(task index, key index, entry)`.
     fn resolve_block_task<K: AsRef<[u8]>>(
         task: &BlockTask<'_>,
         index: usize,
         bytes: &[u8],
+        keep: bool,
         keys: &[K],
         hits: &mut Vec<(usize, usize, InternalValue)>,
     ) -> crate::Result<()> {
-        if let Some(block) = task
+        let block = task
             .table
-            .decode_data_block_from_bytes(bytes, *task.handle.offset())?
-        {
-            for &kidx in &task.keys {
-                if let Some(item) = task.table.point_read_translated(
-                    &block,
-                    keys[kidx].as_ref(),
-                    task.table_seqno,
-                )? {
-                    hits.push((index, kidx, item));
-                }
+            .decode_data_block_keeping(bytes, &task.handle, keep)?;
+        Self::read_task_keys(task, index, &block, keys, hits)
+    }
+
+    /// Point-reads the keys of task `index` in its data `block`, adding each
+    /// hit to `hits` as `(task index, key index, entry)`.
+    #[expect(
+        clippy::indexing_slicing,
+        reason = "the task's key indices are valid (caller's keys aligned)"
+    )]
+    fn read_task_keys<K: AsRef<[u8]>>(
+        task: &BlockTask<'_>,
+        index: usize,
+        block: &crate::table::DataBlock,
+        keys: &[K],
+        hits: &mut Vec<(usize, usize, InternalValue)>,
+    ) -> crate::Result<()> {
+        for &kidx in &task.keys {
+            if let Some(item) =
+                task.table
+                    .point_read_translated(block, keys[kidx].as_ref(), task.table_seqno)?
+            {
+                hits.push((index, kidx, item));
             }
         }
         Ok(())
@@ -6362,6 +6730,9 @@ mod partition_size_tests;
 
 #[cfg(all(test, feature = "std"))]
 mod chunk_order_tests;
+
+#[cfg(all(test, feature = "std"))]
+mod chunk_file_tests;
 
 #[cfg(all(test, feature = "std"))]
 mod probe_stats_tests;

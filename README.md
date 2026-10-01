@@ -44,7 +44,7 @@ tree.flush_active_memtable(0)?;
 
 ### Read path
 
-- Point reads via `get` / `multi_get` (batch-optimized).
+- Point reads via `get` / `multi_get`. A `multi_get` reads each level stage by stage across all its tables: the filter blocks every table needs in one batch, then their index blocks, then their data blocks, and a table moves on to its next stage as soon as its blocks are back. The filter and index bytes it holds at once stay within `Config::multi_get_metadata_budget` (8 MiB by default), independent of the block cache. The answer comes from the blocks read, so a cache eviction mid-query re-reads nothing. Page-ECC and columnar tables, tables with unpinned filter partitions, and a table whose staged read fails are read through the serial path instead, which loads its blocks through the cache.
 - `PinnableSlice` for zero-copy reads.
 - `BurrFilter` AMQ filter (Bumped Ribbon Retrieval, Walzer & Dillinger 2022): ~1% memory overhead vs the information-theoretic minimum: ~30% smaller filter blocks than a same-FPR Bloom filter, or ~10× tighter FPR at the same memory budget. Used for both per-key and per-prefix membership checks.
 - Forward and reverse range / prefix iteration.
@@ -104,7 +104,7 @@ tree.flush_active_memtable(0)?;
 - 100% stable Rust, MSRV 1.92.
 - `no_std` + `alloc` support: the core engine (read / write / compaction / recovery over the injected `Fs`) compiles without `std`; std-only conveniences (threaded fan-out, system clock, the std filesystem backend) stay behind the `std` feature.
 - No C or C++ dependency: zstd via [`structured-zstd`](https://github.com/structured-world/structured-zstd) (pure-Rust), LZ4 via `lz4_flex`, AES via `aes-gcm`. Nothing to build with `cc`, nothing to bind with `bindgen`.
-- Pluggable `Fs` trait: back the engine on the standard filesystem, on `io_uring`, on an in-memory `MemFs`, or on a custom implementation.
+- Pluggable `Fs` trait: back the engine on the standard filesystem, on `io_uring`, on an in-memory `MemFs`, or on a custom implementation. A backend that can take reads while others are in flight provides a `ReadQueue`, as `io_uring` does; every other backend gets one that batches through its batched read. A queue that wakes a `ReadWake` as its reads come back lets a level spread over several backends move on with whichever answers first.
 - Pluggable `CompressionProvider` for third-party codecs.
 
 ## Comparison

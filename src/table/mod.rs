@@ -33,6 +33,9 @@ mod relocate;
 pub(crate) mod row_group;
 mod scanner;
 pub(crate) mod seqno_bounds;
+pub(crate) mod staged;
+// Reached through the doc-hidden `table` module by the crate's own tools; it
+// carries no stability promise, and its items change with the read path.
 pub mod util;
 pub mod writer;
 pub(crate) mod zone_map;
@@ -73,7 +76,6 @@ use crate::{
         writer::LinkedFile,
     },
 };
-use alloc::borrow::Cow;
 use alloc::sync::Arc;
 #[cfg(not(feature = "std"))]
 use alloc::{boxed::Box, vec::Vec};
@@ -352,6 +354,21 @@ enum BloomResult {
         /// Whether a filter was present, for metrics and probe accounting.
         has_filter: bool,
     },
+}
+
+/// Where the filter a key is checked against lives (see
+/// [`Table::filter_source`]).
+pub(crate) enum FilterSource<'a> {
+    /// The table has no filter.
+    None,
+    /// The table's whole filter, pinned in memory.
+    Pinned(&'a FilterBlock),
+    /// The filter block, or the filter partition holding the key, to read.
+    Block(BlockHandle),
+    /// The key sorts past the last filter partition.
+    PastPartitions,
+    /// The filter is partitioned and its partition index is not pinned.
+    UnpinnedPartitions,
 }
 
 /// What a key check of a table's filters found (see
@@ -6555,77 +6572,98 @@ impl Table {
             .collect())
     }
 
-    /// Loads the filter block (if any) and checks the bloom filter.
+    /// Loads the filter block (if any) and checks the bloom filter, counting
+    /// nothing.
     ///
-    /// Returns `Ok(BloomResult::Skip)` if the bloom filter says the key is definitely absent
-    /// (and updates metrics accordingly), `Ok(BloomResult::Proceed { has_filter })` otherwise.
-    fn check_bloom(&self, key: &[u8], key_hash: u64) -> crate::Result<BloomResult> {
+    /// Returns `Ok(BloomResult::Skip)` if the bloom filter says the key is definitely absent,
+    /// `Ok(BloomResult::Proceed { has_filter })` otherwise.
+    fn judge_bloom(&self, key: &[u8], key_hash: u64) -> crate::Result<BloomResult> {
         debug_assert_eq!(
             key_hash,
             crate::hash::hash64(key),
             "key_hash must match the hash of the provided key"
         );
 
-        let filter_block = if let Some(block) = &self.pinned_filter_block {
-            Some(Cow::Borrowed(block))
+        match self.filter_source(key) {
+            FilterSource::None => Self::answer_bloom(None, key_hash),
+            FilterSource::Pinned(block) => Self::answer_bloom(Some(block), key_hash),
+            FilterSource::Block(handle) => {
+                let block = self.load_block(
+                    &handle,
+                    BlockType::Filter,
+                    CompressionType::None,
+                    #[cfg(zstd_any)]
+                    None,
+                )?;
+                Self::answer_bloom(Some(&FilterBlock::new(block)), key_hash)
+            }
+            FilterSource::PastPartitions => Ok(BloomResult::PastPartitions),
+            FilterSource::UnpinnedPartitions => {
+                unimplemented!("unpinned filter TLI not supported")
+            }
+        }
+    }
+
+    /// [`Self::judge_bloom`], counted at once in the global metrics, as a
+    /// point read counts its filter answers.
+    fn check_bloom(&self, key: &[u8], key_hash: u64) -> crate::Result<BloomResult> {
+        let answer = self.judge_bloom(key, key_hash)?;
+        #[cfg(feature = "metrics")]
+        if answer.should_skip() {
+            use core::sync::atomic::Ordering::Relaxed;
+            self.metrics.filter_queries.fetch_add(1, Relaxed);
+            self.metrics.io_skipped_by_filter.fetch_add(1, Relaxed);
+        }
+        Ok(answer)
+    }
+
+    /// Adds `answer` to `tally`, counted when the plan holding it is.
+    fn tally_bloom(tally: &mut crate::table::probe_stats::PlanCounts, answer: &BloomResult) {
+        tally.probes += answer.probe_counts();
+        if answer.should_skip() {
+            tally.filter_queries += 1;
+            tally.filter_skips += 1;
+        }
+    }
+
+    /// Where the filter `key` is checked against lives, found without a read:
+    /// the pinned filter, the block of the filter or of the filter partition
+    /// holding the key, or no filter at all.
+    pub(crate) fn filter_source(&self, key: &[u8]) -> FilterSource<'_> {
+        if let Some(block) = &self.pinned_filter_block {
+            FilterSource::Pinned(block)
         } else if let Some(filter_idx) = &self.pinned_filter_index {
             let mut iter = filter_idx.iter(self.comparator.clone());
             // Filter partitions are written with seqno=0, making the seqno
             // parameter irrelevant to partition selection. Use MAX_SEQNO
             // consistently to match the index-block seek in Table::range().
             iter.seek(key, crate::seqno::MAX_SEQNO);
-
-            if let Some(filter_block_handle) = iter.next() {
-                let filter_block_handle = filter_block_handle.materialize(filter_idx.as_slice());
-
-                let block = self.load_block(
-                    &filter_block_handle.into_inner(),
-                    BlockType::Filter,
-                    CompressionType::None,
-                    #[cfg(zstd_any)]
-                    None,
-                )?;
-                Some(Cow::Owned(FilterBlock::new(block)))
-            } else {
-                // Key sorts past the last filter partition — definite miss.
-                #[cfg(feature = "metrics")]
-                {
-                    use core::sync::atomic::Ordering::Relaxed;
-                    self.metrics.filter_queries.fetch_add(1, Relaxed);
-                    self.metrics.io_skipped_by_filter.fetch_add(1, Relaxed);
+            match iter.next() {
+                Some(handle) => {
+                    FilterSource::Block(handle.materialize(filter_idx.as_slice()).into_inner())
                 }
-                return Ok(BloomResult::PastPartitions);
+                // Key sorts past the last filter partition: a definite miss.
+                None => FilterSource::PastPartitions,
             }
-        } else if let Some(_filter_tli_handle) = &self.regions.filter_tli {
-            unimplemented!("unpinned filter TLI not supported");
-        } else if let Some(filter_block_handle) = &self.regions.filter {
-            let block = self.load_block(
-                filter_block_handle,
-                BlockType::Filter,
-                CompressionType::None,
-                #[cfg(zstd_any)]
-                None,
-            )?;
-            Some(Cow::Owned(FilterBlock::new(block)))
+        } else if self.regions.filter_tli.is_some() {
+            FilterSource::UnpinnedPartitions
+        } else if let Some(handle) = &self.regions.filter {
+            FilterSource::Block(*handle)
         } else {
-            None
+            FilterSource::None
+        }
+    }
+
+    /// The answer of `filter` (none: nothing rules the key out) for a key
+    /// hashing to `key_hash`, counting nothing.
+    fn answer_bloom(filter: Option<&FilterBlock>, key_hash: u64) -> crate::Result<BloomResult> {
+        let Some(filter) = filter else {
+            return Ok(BloomResult::Proceed { has_filter: false });
         };
-
-        let has_filter = filter_block.is_some();
-
-        if let Some(filter_block) = &filter_block
-            && !filter_block.maybe_contains_hash(key_hash)?
-        {
-            #[cfg(feature = "metrics")]
-            {
-                use core::sync::atomic::Ordering::Relaxed;
-                self.metrics.filter_queries.fetch_add(1, Relaxed);
-                self.metrics.io_skipped_by_filter.fetch_add(1, Relaxed);
-            }
+        if !filter.maybe_contains_hash(key_hash)? {
             return Ok(BloomResult::Skip);
         }
-
-        Ok(BloomResult::Proceed { has_filter })
+        Ok(BloomResult::Proceed { has_filter: true })
     }
 
     /// Records a data-consulting point read for per-segment tiering / placement
@@ -7134,9 +7172,11 @@ impl Table {
     ///    partitioned filters amortise loads across keys that
     ///    land in the same partition rather than across the
     ///    whole batch.
-    /// 2. Block-index seek runs once at the smallest passing
-    ///    key, then the iterator walks forward across the
-    ///    sorted input — no re-seek per key.
+    /// 2. Block-index seek runs at the smallest passing key and
+    ///    again only at a passing key past the block before it;
+    ///    keys in the same or the next block share the walk, and
+    ///    a sparse batch over a large table never steps through
+    ///    the entries and partitions between its keys.
     /// 3. Each data block is loaded at most once for the entire
     ///    batch. Multiple input keys that fall in the same block
     ///    share a single load.
@@ -7294,9 +7334,16 @@ impl Table {
             // which case we skip the load.
             let first_in_block = sorted_keys[passing[p]].0;
             if self.comparator.compare(first_in_block, end_key) == core::cmp::Ordering::Greater {
-                // The next passing key is BEYOND this block's
-                // range. Skip the load and advance to the next
-                // block in the index.
+                // The next passing key is BEYOND this block's range: skip
+                // the load and seek the index at that key, so a sparse
+                // batch over a large table reads only the entries and
+                // partitions its keys fall in instead of stepping through
+                // every one between them.
+                let Some(reader) = self.block_index.forward_reader(first_in_block, table_seqno)
+                else {
+                    break;
+                };
+                block_iter = reader;
                 continue;
             }
 
@@ -7412,7 +7459,7 @@ impl Table {
         &self,
         sorted_keys: &[(&[u8], u64)],
         seqno: SeqNo,
-        mut tally: Option<&mut crate::table::probe_stats::ProbeCounts>,
+        tally: &mut crate::table::probe_stats::PlanCounts,
     ) -> crate::Result<Option<(Vec<usize>, block_index::BlockIndexIterImpl, SeqNo)>> {
         if sorted_keys.is_empty() {
             return Ok(None);
@@ -7426,10 +7473,10 @@ impl Table {
         }
         let mut passing: Vec<usize> = Vec::with_capacity(sorted_keys.len());
         for (i, (key, hash)) in sorted_keys.iter().enumerate() {
-            let bloom = self.check_bloom(key, *hash)?;
-            if let Some(tally) = tally.as_deref_mut() {
-                *tally += bloom.probe_counts();
-            }
+            // Counted with the plan, not here: a level handed to the serial
+            // resolve is probed and counted there.
+            let bloom = self.judge_bloom(key, *hash)?;
+            Self::tally_bloom(tally, &bloom);
             if !bloom.should_skip() {
                 passing.push(i);
             }
@@ -7442,9 +7489,7 @@ impl Table {
             .forward_reader(sorted_keys[passing[0]].0, table_seqno)
         else {
             // Every passed key lies past the last block: none is held.
-            if let Some(tally) = tally {
-                self.tally_blockless(tally, table_seqno, passing.len());
-            }
+            self.tally_blockless(tally, table_seqno, passing.len());
             return Ok(None);
         };
         Ok(Some((passing, block_iter, table_seqno)))
@@ -7452,113 +7497,25 @@ impl Table {
 
     /// Counts in `tally` the `keys` the filter let through that no block of
     /// the table can hold, read at `table_seqno`: each a false positive, as
-    /// [`Self::count_false_positive`] counts one.
-    fn tally_blockless(
+    /// [`Self::count_false_positive`] counts one, and a filter query that
+    /// reached the table, as a point read counts one.
+    pub(crate) fn tally_blockless(
         &self,
-        tally: &mut crate::table::probe_stats::ProbeCounts,
+        tally: &mut crate::table::probe_stats::PlanCounts,
         table_seqno: SeqNo,
         keys: usize,
     ) {
-        if self.has_filter() && table_seqno > self.metadata.seqnos.1 {
-            tally.negatives += keys as u64;
+        if !self.has_filter() {
+            return;
+        }
+        tally.filter_queries += keys;
+        if table_seqno > self.metadata.seqnos.1 {
+            tally.probes.negatives += keys as u64;
         }
     }
 
-    /// Plans the COLD (uncached) data blocks [`Table::batch_get`] will read for
-    /// `sorted_keys`, returning this table's file handle alongside them so the
-    /// caller can read the blocks of MANY SSTs in one cross-file batch (see the
-    /// multi-get level prewarm). Returns `None` when there is nothing to prewarm:
-    /// no cold block, or a Page-ECC SST (the serial path observes auto-heal) or a
-    /// columnar SST (its blocks are reconstructed on the load path).
-    ///
-    /// Best-effort: an over- or under-estimate only affects warming, never a
-    /// query result, since `batch_get` re-reads every block authoritatively.
-    #[expect(
-        clippy::indexing_slicing,
-        reason = "`passing` positions index into `sorted_keys` (< its len); `passing[p]` \
-                  is guarded by `p < passing.len()` each iteration."
-    )]
-    pub(crate) fn plan_prewarm(
-        &self,
-        sorted_keys: &[(&[u8], u64)],
-        seqno: SeqNo,
-    ) -> Option<(Arc<dyn crate::fs::FsFile>, Vec<BlockHandle>)> {
-        if self.metadata.ecc_params.is_some() {
-            return None;
-        }
-        #[cfg(feature = "columnar")]
-        if self.metadata.columnar {
-            return None;
-        }
-        // Best-effort warming: a bloom-probe error here just skips this table's
-        // prewarm (`.ok().flatten()` maps it to None; the authoritative resolve
-        // re-probes and surfaces it).
-        let (passing, mut block_iter, _table_seqno) = self
-            // A prewarm probes ahead of the read it warms, which probes again.
-            .plan_block_walk_setup(sorted_keys, seqno, None)
-            .ok()
-            .flatten()?;
-
-        // Conservative block-boundary walk (mirrors batch_get's span-retry),
-        // collecting only the COLD (uncached) blocks.
-        let mut handles: Vec<BlockHandle> = Vec::new();
-        let mut p = 0_usize;
-        while p < passing.len() {
-            let Some(Ok(block_handle)) = block_iter.next() else {
-                break;
-            };
-            let end_key = block_handle.end_key();
-            let first_in_block = sorted_keys[passing[p]].0;
-            if self.comparator.compare(first_in_block, end_key) == core::cmp::Ordering::Greater {
-                continue;
-            }
-            let handle = *block_handle.as_ref();
-            // Presence only: `get_block` would clone the block out to be
-            // dropped a line later, and count a cache hit for a block this
-            // plan is deciding NOT to read.
-            if !self.cache.has_block(self.global_id(), handle.offset()) {
-                handles.push(handle);
-            }
-            while p < passing.len() {
-                let key = sorted_keys[passing[p]].0;
-                match self.comparator.compare(key, end_key) {
-                    core::cmp::Ordering::Greater | core::cmp::Ordering::Equal => break,
-                    core::cmp::Ordering::Less => p += 1,
-                }
-            }
-        }
-        if handles.is_empty() {
-            return None;
-        }
-
-        let (file, _) = self
-            .file_accessor
-            .get_or_open_table(&self.global_id(), &self.path)
-            .ok()?;
-        Some((file, handles))
-    }
-
-    /// Decodes blocks read by the level prewarm into the cache (`buffers[i]` is
-    /// the on-disk bytes of `handles[i]`, both from [`Table::plan_prewarm`]).
-    pub(crate) fn decode_prewarmed(&self, handles: &[BlockHandle], buffers: &[&[u8]]) {
-        crate::table::util::decode_prewarmed_blocks(
-            self.global_id(),
-            &self.cache,
-            handles,
-            buffers,
-            BlockType::Data,
-            self.metadata.data_block_compression,
-            self.encryption.as_deref(),
-            self.metadata.ecc_params,
-            #[cfg(zstd_any)]
-            self.zstd_dictionary.as_deref(),
-            #[cfg(feature = "metrics")]
-            &self.metrics,
-        );
-    }
-
-    /// Charges data blocks a batched multi-get read (prewarm or chunked
-    /// resolve) is about to ask of the filesystem, at the moment it is issued.
+    /// Charges blocks of `block_type` a batched multi-get read is about to ask
+    /// of the filesystem, at the moment it is issued.
     #[cfg_attr(
         not(feature = "metrics"),
         expect(
@@ -7566,23 +7523,54 @@ impl Table {
             reason = "the table's counters are the feature's payload"
         )
     )]
-    pub(crate) fn record_batched_read(&self, handles: &[BlockHandle]) {
+    pub(crate) fn record_batched_read(&self, block_type: BlockType, handles: &[BlockHandle]) {
         #[cfg(feature = "metrics")]
         for handle in handles {
-            crate::table::util::record_block_read(
-                &self.metrics,
-                BlockType::Data,
-                handle.size().into(),
-            );
+            crate::table::util::record_block_read(&self.metrics, block_type, handle.size().into());
         }
         #[cfg(not(feature = "metrics"))]
-        let _ = handles;
+        let _ = (block_type, handles);
     }
 
     /// Capacity in bytes of this table's (shared) block cache, for the level
     /// prewarm's eviction-avoiding size bound.
     pub(crate) fn cache_capacity(&self) -> u64 {
         self.cache.capacity()
+    }
+
+    /// How many files the descriptor cache this table opens through keeps
+    /// open, or `None` when its descriptor is pinned and always open.
+    pub(crate) fn descriptor_capacity(&self) -> Option<u64> {
+        self.file_accessor
+            .as_descriptor_table()
+            .map(crate::descriptor_table::DescriptorTable::capacity)
+    }
+
+    /// This table's file, for a caller that reads its blocks itself.
+    ///
+    /// # Errors
+    ///
+    /// Propagates a failure to open the file.
+    pub(crate) fn open_file(&self) -> crate::Result<Arc<dyn crate::fs::FsFile>> {
+        let (file, cache_event) = self
+            .file_accessor
+            .get_or_open_table(&self.global_id(), &self.path)?;
+        // Counted as the load path counts the file it opens; a pinned
+        // descriptor is no cache event.
+        #[cfg(feature = "metrics")]
+        if let Some(hit) = cache_event {
+            use core::sync::atomic::Ordering::Relaxed;
+            if hit {
+                self.metrics.table_file_opened_cached.fetch_add(1, Relaxed);
+            } else {
+                self.metrics
+                    .table_file_opened_uncached
+                    .fetch_add(1, Relaxed);
+            }
+        }
+        #[cfg(not(feature = "metrics"))]
+        let _ = cache_event;
+        Ok(file)
     }
 
     /// Whether this table's data blocks need the special load path rather than a
@@ -7618,11 +7606,12 @@ impl Table {
     ///
     /// # Errors
     ///
-    /// Propagates a bloom-probe ([`Table::check_bloom`]) or table-open failure.
+    /// Propagates a bloom-probe or table-open failure.
     ///
-    /// The filter answers are added to `tally`: the chunked resolve counts
-    /// them once it answers from its plan, and not when it hands the level to
-    /// the serial resolve, which probes the same filters again.
+    /// The filter answers, and the filter queries and skips they make, are
+    /// added to `tally`: the chunked resolve counts them once it answers from
+    /// its plan, and not when it hands the level to the serial resolve, which
+    /// probes the same filters again.
     #[expect(
         clippy::indexing_slicing,
         reason = "`passing` positions index into `sorted_keys` (< its len); `passing[p]` \
@@ -7632,10 +7621,10 @@ impl Table {
         &self,
         sorted_keys: &[(&[u8], u64)],
         seqno: SeqNo,
-        tally: &mut crate::table::probe_stats::ProbeCounts,
+        tally: &mut crate::table::probe_stats::PlanCounts,
     ) -> crate::Result<Option<BlockTaskPlan>> {
         let Some((passing, mut block_iter, table_seqno)) =
-            self.plan_block_walk_setup(sorted_keys, seqno, Some(tally))?
+            self.plan_block_walk_setup(sorted_keys, seqno, tally)?
         else {
             return Ok(None);
         };
@@ -7654,6 +7643,13 @@ impl Table {
             let end_key = block_handle.end_key();
             let first_in_block = sorted_keys[passing[p]].0;
             if self.comparator.compare(first_in_block, end_key) == core::cmp::Ordering::Greater {
+                // Sought at the next key, as `batch_get` does, instead of
+                // stepped through every entry between.
+                let Some(reader) = self.block_index.forward_reader(first_in_block, table_seqno)
+                else {
+                    break;
+                };
+                block_iter = reader;
                 continue;
             }
             let handle = *block_handle.as_ref();
@@ -7689,39 +7685,121 @@ impl Table {
             return Ok(None);
         }
 
-        let (file, _) = self
-            .file_accessor
-            .get_or_open_table(&self.global_id(), &self.path)?;
+        // Counted as every descriptor lookup is; the blocks are read through
+        // this file, with no second lookup.
+        let file = self.open_file()?;
         Ok(Some((file, table_seqno, self.is_chunk_special(), blocks)))
     }
 
-    /// Decodes a data block from its on-disk bytes (read by the chunked resolver),
-    /// using the same path as [`Table::load_data_block`] for a non-special table
-    /// ([`Block::from_reader`] shares the header / decrypt helpers), so the block
-    /// is byte-identical. Not for Page-ECC / columnar tables ([`is_chunk_special`]).
+    /// Decodes the data block at `handle` from its on-disk `bytes` (read by the
+    /// batched multi-get), using the same path as [`Table::load_data_block`]
+    /// for a non-special table ([`Block::from_reader`] shares the header /
+    /// decrypt helpers), so the block is byte-identical, and puts it in the
+    /// cache when `keep`. Not for Page-ECC / columnar tables
+    /// ([`is_chunk_special`]).
     ///
     /// # Errors
     ///
     /// Propagates a corruption / decode error (the resolver surfaces it).
+    pub(crate) fn decode_data_block_keeping(
+        &self,
+        bytes: &[u8],
+        handle: &BlockHandle,
+        keep: bool,
+    ) -> crate::Result<DataBlock> {
+        let block = self.decode_block_from_bytes(bytes, *handle.offset(), BlockType::Data)?;
+        if keep {
+            self.cache
+                .insert_block(self.global_id(), handle.offset(), block.clone());
+        }
+        let has_kv_footer = self.metadata.kv_checksum_algo.is_some();
+        DataBlock::from_loaded(block, has_kv_footer)
+    }
+
+    /// A zeroed buffer for the on-disk bytes of the block at `handle`,
+    /// refused when its size is one no block of this table can have, as the
+    /// load path refuses it before it allocates.
     ///
-    /// `offset` is where in the table file `bytes` were read from, which the
-    /// block's stored checksum must be bound to.
-    pub(crate) fn decode_data_block_from_bytes(
+    /// # Errors
+    ///
+    /// The size is past the largest block this table can hold.
+    pub(crate) fn block_buffer(&self, handle: &BlockHandle) -> crate::Result<Vec<u8>> {
+        crate::table::block::check_on_disk_size(
+            u64::from(handle.size()),
+            self.encryption.as_deref(),
+            self.metadata.ecc_params,
+        )?;
+        Ok(vec![0u8; handle.size() as usize])
+    }
+
+    /// The data block at `handle`, when the cache holds it, counted as a cache
+    /// hit as the load path counts one.
+    pub(crate) fn cached_data_block(&self, handle: &BlockHandle) -> Option<DataBlock> {
+        let block = self.cached_block(handle, BlockType::Data)?;
+        DataBlock::from_loaded(block, self.metadata.kv_checksum_algo.is_some()).ok()
+    }
+
+    /// The block of `block_type` at `handle`, when the cache holds it, counted
+    /// as a cache hit as the load path counts one.
+    pub(crate) fn cached_block(
+        &self,
+        handle: &BlockHandle,
+        block_type: BlockType,
+    ) -> Option<Block> {
+        let block = self
+            .cache
+            .get_block(self.global_id(), handle.offset())
+            .filter(|block| block.header.block_type == block_type)?;
+        #[cfg(feature = "metrics")]
+        crate::table::util::record_block_load_cached(&self.metrics, block_type);
+        Some(block)
+    }
+
+    /// Decodes the on-disk `bytes` of this table's block of `block_type` read
+    /// at `offset`, with the codec that block type is written with, exactly as
+    /// the load path decodes it; a block of another type is refused. Not for
+    /// Page-ECC tables, whose recovery needs the re-reading load path.
+    ///
+    /// # Errors
+    ///
+    /// Propagates a corruption or decode error.
+    pub(crate) fn decode_block_from_bytes(
         &self,
         bytes: &[u8],
         offset: u64,
-    ) -> crate::Result<Option<DataBlock>> {
+        block_type: BlockType,
+    ) -> crate::Result<Block> {
+        // Never an ECC table's block: `from_reader` repairs an ECC-corrected
+        // payload silently, and a corrected block kept in the cache as clean
+        // would let later cache hits skip the heal scheduling the load path
+        // does, leaving the latent fault on disk.
+        debug_assert!(
+            self.metadata.ecc_params.is_none(),
+            "a Page-ECC table's blocks are read through the load path, which heals"
+        );
+        // Filter blocks are written uncompressed and without the dictionary,
+        // index blocks with the index codec, data blocks with the data codec
+        // and its dictionary: the same choice each block's load makes.
+        let compression = match block_type {
+            BlockType::Filter => CompressionType::None,
+            BlockType::Index => self.metadata.index_block_compression,
+            _ => self.metadata.data_block_compression,
+        };
         let transform = crate::table::util::build_block_transform(
-            self.metadata.data_block_compression,
+            compression,
             self.encryption.as_deref(),
             self.metadata.ecc_params,
             #[cfg(zstd_any)]
-            self.zstd_dictionary.as_deref(),
+            if block_type == BlockType::Data {
+                self.zstd_dictionary.as_deref()
+            } else {
+                None
+            },
         )?;
         let identity = crate::table::block::BlockIdentity {
             table_id: self.global_id().table_id(),
-            block_type: BlockType::Data,
-            dict_id: self.metadata.data_block_compression.dict_id(),
+            block_type,
+            dict_id: compression.dict_id(),
             window_log: 0,
         };
         // The transform runs here, outside the block cache, so its output is
@@ -7733,7 +7811,7 @@ impl Table {
             &mut crate::io::Cursor::new(bytes),
             identity,
             &transform,
-            crate::table::block::ChecksumAt::table(identity.table_id, offset),
+            crate::table::block::ChecksumAt::block(identity.table_id, block_type, offset),
             &mut produced,
         );
         #[cfg(feature = "metrics")]
@@ -7741,14 +7819,17 @@ impl Table {
             .block_bytes_decoded
             .fetch_add(produced as u64, core::sync::atomic::Ordering::Relaxed);
         let block = decoded?;
-        if block.header.block_type != BlockType::Data {
+        if block.header.block_type != block_type {
             return Err(crate::Error::InvalidTag((
                 "BlockType",
                 block.header.block_type.into(),
             )));
         }
-        let has_kv_footer = self.metadata.kv_checksum_algo.is_some();
-        DataBlock::from_loaded(block, has_kv_footer).map(Some)
+        // Loaded from disk, as the load path counts a block once it passed
+        // every check.
+        #[cfg(feature = "metrics")]
+        crate::table::util::record_block_loaded(&self.metrics, block_type);
+        Ok(block)
     }
 
     /// Point-reads `key` in an already-decoded `block`, translating the
@@ -9781,6 +9862,22 @@ impl Table {
         }
     }
 
+    /// Counts what a batched read tallied while planning, once it answers
+    /// from that plan: the probes, and the filter queries and skips.
+    pub(crate) fn count_plan(&self, counts: crate::table::probe_stats::PlanCounts) {
+        self.count_probes(counts.probes);
+        #[cfg(feature = "metrics")]
+        {
+            use core::sync::atomic::Ordering::Relaxed;
+            self.metrics
+                .filter_queries
+                .fetch_add(counts.filter_queries, Relaxed);
+            self.metrics
+                .io_skipped_by_filter
+                .fetch_add(counts.filter_skips, Relaxed);
+        }
+    }
+
     /// Counts a probe the filter let through whose read found no version of
     /// the key.
     ///
@@ -9795,6 +9892,23 @@ impl Table {
         {
             stats.negative();
         }
+    }
+
+    /// Whether a key this table's filter let through and no read found is
+    /// counted: the table has a filter, and the count has somewhere to go.
+    pub(crate) fn counts_filter_misses(&self) -> bool {
+        self.has_filter() && (cfg!(feature = "metrics") || self.probe_stats().is_some())
+    }
+
+    /// Counts a key the filter let through that the read of this table, at
+    /// `table_seqno`, found no version of: a filter query that reached the
+    /// table, and a false positive where [`Self::count_false_positive`] says.
+    pub(crate) fn count_filter_miss(&self, table_seqno: SeqNo) {
+        #[cfg(feature = "metrics")]
+        self.metrics
+            .filter_queries
+            .fetch_add(1, core::sync::atomic::Ordering::Relaxed);
+        self.count_false_positive(table_seqno);
     }
 
     /// The bytes of this table's data section a key range covers, at data

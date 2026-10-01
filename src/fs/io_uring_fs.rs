@@ -14,7 +14,9 @@
 //! Cold-path operations (mkdir, readdir, stat, rename, unlink) delegate
 //! to [`std::fs`] since they do not benefit from `io_uring`.
 
-use super::{BlockRead, Fs, FsDirEntry, FsFile, FsMetadata, FsOpenOptions};
+use super::{
+    BlockRead, Fs, FsDirEntry, FsFile, FsMetadata, FsOpenOptions, QueuedRead, ReadDone, ReadQueue,
+};
 use crate::HashMap;
 use core::sync::atomic::AtomicU64;
 use io_uring::{IoUring, opcode, types};
@@ -307,6 +309,10 @@ impl Fs for IoUringFs {
         on_read: &mut dyn FnMut(usize, &BlockRead<'_>),
     ) -> crate::io::Result<()> {
         self.read_blocks(reqs, Some(on_read))
+    }
+
+    fn read_queue(&self) -> Box<dyn ReadQueue + '_> {
+        Box::new(UringReadQueue::new(&self.inner))
     }
 
     fn create_dir_all(&self, path: &Path) -> crate::io::Result<()> {
@@ -715,6 +721,45 @@ enum Submission {
         /// Bounded by the batch size, so the ring thread never blocks on it.
         done: mpsc::SyncSender<(usize, i32)>,
     },
+    /// Reads of a [`UringReadQueue`], each reporting to the queue's sink with
+    /// its position in the queue.
+    Queued {
+        reads: Vec<BatchRead>,
+        /// The queue position of the first read; the others follow it.
+        first: usize,
+        sink: Arc<QueueSink>,
+    },
+}
+
+/// Why [`RingThread::try_send`] sent nothing.
+enum TrySend {
+    /// The submission channel has no room; the submission was dropped
+    /// unsent, so no read it described reached the kernel.
+    Full,
+    /// The ring thread is gone.
+    Failed(io::Error),
+}
+
+/// Where the ring thread reports a [`UringReadQueue`]'s reads.
+struct QueueSink {
+    /// Unbounded: a queue has reads of several submissions in flight at
+    /// once, and the ring thread must never block on a completion.
+    done: mpsc::Sender<(usize, i32)>,
+    /// Woken after each completion is sent, once the queue was given one.
+    wake: Option<Arc<dyn crate::fs::ReadWake>>,
+}
+
+impl QueueSink {
+    /// Hands `result` for the read at `position` to the queue, then wakes
+    /// whoever waits on it: the completion is on the channel by the time the
+    /// wake lands.
+    fn deliver(&self, position: usize, result: i32) {
+        if self.done.send((position, result)).is_ok()
+            && let Some(wake) = &self.wake
+        {
+            wake.wake();
+        }
+    }
 }
 
 /// Where the ring thread delivers one operation's result.
@@ -722,6 +767,10 @@ enum Completion {
     One(mpsc::SyncSender<i32>),
     InBatch {
         done: mpsc::SyncSender<(usize, i32)>,
+        position: usize,
+    },
+    InQueue {
+        sink: Arc<QueueSink>,
         position: usize,
     },
 }
@@ -733,6 +782,10 @@ impl Completion {
         match self {
             Self::One(tx) => tx.send(result).ok(),
             Self::InBatch { done, position } => done.send((position, result)).ok(),
+            Self::InQueue { sink, position } => {
+                sink.deliver(position, result);
+                None
+            }
         };
     }
 }
@@ -916,6 +969,21 @@ impl RingThread {
                     Self::enqueue(ring, pending, next_id, kind, completion);
                 }
             }
+            Submission::Queued { reads, first, sink } => {
+                for (index, read) in reads.into_iter().enumerate() {
+                    let kind = OpKind::Read {
+                        fd: read.fd,
+                        buf: read.buf,
+                        len: read.len,
+                        offset: read.offset,
+                    };
+                    let completion = Completion::InQueue {
+                        sink: Arc::clone(&sink),
+                        position: first + index,
+                    };
+                    Self::enqueue(ring, pending, next_id, kind, completion);
+                }
+            }
         }
     }
 
@@ -1030,6 +1098,37 @@ impl RingThread {
             .ok_or_else(|| io::Error::new(io::ErrorKind::BrokenPipe, "io_uring thread shut down"))?
             .send(submission)
             .map_err(|_| io::Error::new(io::ErrorKind::BrokenPipe, "io_uring thread exited"))
+    }
+
+    /// [`Self::send`] without waiting for room: a full submission channel
+    /// sends nothing, so a caller that must not block keeps its reads for a
+    /// later send. Nor does it wait for the submission lock, which a blocking
+    /// sender holds while it waits for room: a lock held elsewhere counts as
+    /// no room.
+    fn try_send(&self, submission: Submission) -> Result<(), TrySend> {
+        #[cfg(test)]
+        self.counts
+            .locks
+            .fetch_add(1, core::sync::atomic::Ordering::Relaxed);
+        let guard = match self.tx.try_lock() {
+            Ok(guard) => guard,
+            Err(std::sync::TryLockError::Poisoned(poisoned)) => poisoned.into_inner(),
+            Err(std::sync::TryLockError::WouldBlock) => return Err(TrySend::Full),
+        };
+        let sent = guard.as_ref().map(|tx| tx.try_send(submission));
+        drop(guard);
+        match sent {
+            Some(Ok(())) => Ok(()),
+            Some(Err(mpsc::TrySendError::Full(_))) => Err(TrySend::Full),
+            Some(Err(mpsc::TrySendError::Disconnected(_))) => Err(TrySend::Failed(io::Error::new(
+                io::ErrorKind::BrokenPipe,
+                "io_uring thread exited",
+            ))),
+            None => Err(TrySend::Failed(io::Error::new(
+                io::ErrorKind::BrokenPipe,
+                "io_uring thread shut down",
+            ))),
+        }
     }
 
     /// Submits `reads` as one batch and waits for every one of them; see
@@ -1330,6 +1429,287 @@ impl RingThread {
             Ok(result as u32)
         } else {
             Err(io::Error::from_raw_os_error(-result))
+        }
+    }
+}
+
+/// The [`ReadQueue`] of an [`IoUringFs`]: the reads submitted since the last
+/// wait go to the ring in one message when the queue is waited on, and each
+/// is handed back the moment its completion arrives, while reads submitted
+/// earlier or later may still be in flight.
+///
+/// The queue owns every buffer on the ring until its completion is received,
+/// and dropping it receives the completions still owed first, so no buffer is
+/// freed while the kernel may still write into it. That receive cannot hang:
+/// the queue borrows the backend, which keeps the ring thread alive, and the
+/// ring thread delivers every completion it was handed.
+struct UringReadQueue<'r> {
+    ring: &'r RingThread,
+    /// Where the reads it sends report; replaced when the queue is given a
+    /// wake, which reads sent earlier do not ring.
+    sink: Arc<QueueSink>,
+    done_rx: mpsc::Receiver<(usize, i32)>,
+    /// Not yet on the ring: submitted since the last wait, or kept by a wait
+    /// for none that found no room or no lock to send them.
+    submitted: Vec<QueuedRead>,
+    /// The reads sent to the ring, by the position their completion reports
+    /// less `base`; `None` once handed back. Handed-back reads at either end
+    /// are dropped, so a long-lived queue keeps the span of its reads in
+    /// flight, not one slot per read it ever sent.
+    sent: std::collections::VecDeque<Option<QueuedRead>>,
+    /// The position of `sent`'s first slot.
+    base: usize,
+    /// Reads on the ring whose completion has not arrived.
+    on_ring: usize,
+    /// Reads finished without the ring (empty, read serially, or refused),
+    /// waiting to be handed back.
+    finished: Vec<ReadDone>,
+    /// Reads of a file with no descriptor the ring can take: read serially
+    /// on the calling thread, so only by a wait for at least one read, never
+    /// by a look at what is ready.
+    serial: Vec<QueuedRead>,
+}
+
+impl<'r> UringReadQueue<'r> {
+    fn new(ring: &'r RingThread) -> Self {
+        let (done, done_rx) = mpsc::channel();
+        Self {
+            ring,
+            sink: Arc::new(QueueSink { done, wake: None }),
+            done_rx,
+            submitted: Vec::new(),
+            sent: std::collections::VecDeque::new(),
+            base: 0,
+            on_ring: 0,
+            finished: Vec::new(),
+            serial: Vec::new(),
+        }
+    }
+
+    /// Reads the reads held for a serial read, each into its own buffer.
+    fn read_serial(&mut self) {
+        for mut read in core::mem::take(&mut self.serial) {
+            let want = read.buf.len();
+            let result = match read.file.read_at(&mut read.buf, read.offset) {
+                Ok(n) if n == want => Ok(()),
+                Ok(_) => Err(short_read()),
+                Err(error) => Err(error),
+            };
+            self.finished.push(done(read, result));
+        }
+    }
+
+    /// Sends every read submitted since the last wait to the ring in one
+    /// message. A read the ring cannot take is finished here or held: an
+    /// empty one is read, one without a descriptor is held for a serial read,
+    /// one too long for an SQE fails. Without `block`, a submission channel
+    /// with no room keeps the reads submitted, for the next wait to send.
+    fn issue(&mut self, block: bool) {
+        if self.submitted.is_empty() {
+            return;
+        }
+        let first = self.base + self.sent.len();
+        let mut reads = Vec::with_capacity(self.submitted.len());
+        for mut read in core::mem::take(&mut self.submitted) {
+            if read.buf.is_empty() {
+                self.finished.push(done(read, Ok(())));
+                continue;
+            }
+            let Some(fd) = read.file.backing_fd() else {
+                self.serial.push(read);
+                continue;
+            };
+            let Ok(len) = i32::try_from(read.buf.len()) else {
+                self.finished.push(done(
+                    read,
+                    Err(crate::io::Error::from(io::Error::new(
+                        io::ErrorKind::InvalidInput,
+                        "buffer exceeds i32::MAX",
+                    ))),
+                ));
+                continue;
+            };
+            // The pointer is into the Vec's heap allocation, which moving the
+            // Vec into `sent` does not move; the buffer is not touched again
+            // until its completion is received (see the type's docs).
+            reads.push(BatchRead {
+                fd,
+                buf: UnsafeSendMutPtr(read.buf.as_mut_ptr()),
+                len: len.unsigned_abs(),
+                offset: read.offset,
+            });
+            self.sent.push_back(Some(read));
+        }
+        if reads.is_empty() {
+            return;
+        }
+        let count = reads.len();
+        let submission = Submission::Queued {
+            reads,
+            first,
+            sink: Arc::clone(&self.sink),
+        };
+        let sent = if block {
+            self.ring.send(submission)
+        } else {
+            match self.ring.try_send(submission) {
+                Ok(()) => Ok(()),
+                Err(TrySend::Failed(error)) => Err(error),
+                // Not sent, and the submission dropped here, so no buffer is
+                // in the kernel's hands: the reads go back to wait their turn.
+                Err(TrySend::Full) => {
+                    let kept = self.sent.split_off(first - self.base);
+                    self.submitted.extend(kept.into_iter().flatten());
+                    return;
+                }
+            }
+        };
+        match sent {
+            Ok(()) => self.on_ring += count,
+            // Nothing was queued: the submission went down with the send, so
+            // no buffer is in the kernel's hands.
+            Err(error) => {
+                for slot in self.sent.iter_mut().skip(first - self.base) {
+                    if let Some(read) = slot.take() {
+                        let failure = io::Error::new(error.kind(), error.to_string());
+                        self.finished
+                            .push(done(read, Err(crate::io::Error::from(failure))));
+                    }
+                }
+                self.trim();
+            }
+        }
+    }
+
+    /// Takes the read sent at `position` out of its slot.
+    fn take_sent(&mut self, position: usize) -> Option<QueuedRead> {
+        let read = self
+            .sent
+            .get_mut(position.checked_sub(self.base)?)?
+            .take()?;
+        self.trim();
+        Some(read)
+    }
+
+    /// Drops the handed-back slots at either end, keeping the positions of
+    /// the reads still in flight.
+    fn trim(&mut self) {
+        while self.sent.front().is_some_and(Option::is_none) {
+            self.sent.pop_front();
+            self.base += 1;
+        }
+        while self.sent.back().is_some_and(Option::is_none) {
+            self.sent.pop_back();
+        }
+    }
+
+    /// The read at `position` with the ring's `result` for it.
+    fn complete(&mut self, position: usize, result: i32) -> Option<ReadDone> {
+        let read = self.take_sent(position)?;
+        self.on_ring -= 1;
+        let want = read.buf.len();
+        let result = match usize::try_from(result) {
+            Ok(n) if n == want => Ok(()),
+            Ok(_) => Err(short_read()),
+            // A negative completion is `-errno`, never `i32::MIN`.
+            Err(_) => Err(crate::io::Error::from(io::Error::from_raw_os_error(
+                -result,
+            ))),
+        };
+        Some(done(read, result))
+    }
+}
+
+/// `read` handed back with `result`.
+fn done(read: QueuedRead, result: crate::io::Result<()>) -> ReadDone {
+    ReadDone {
+        tag: read.tag,
+        buf: read.buf,
+        result,
+    }
+}
+
+/// A read that returned fewer bytes than its fixed-size block.
+fn short_read() -> crate::io::Error {
+    crate::io::Error::from(io::Error::new(
+        io::ErrorKind::UnexpectedEof,
+        "io_uring read queue: short read on a fixed-size block",
+    ))
+}
+
+impl ReadQueue for UringReadQueue<'_> {
+    fn submit(&mut self, read: QueuedRead) {
+        self.submitted.push(read);
+    }
+
+    fn outstanding(&self) -> usize {
+        self.submitted.len() + self.on_ring + self.finished.len() + self.serial.len()
+    }
+
+    fn held(&self) -> usize {
+        // Reads not yet on the ring, kept by a wait for none that found no
+        // room or no lock, are sent only by a later wait: no completion
+        // wakes a caller for them.
+        self.serial.len() + self.submitted.len()
+    }
+
+    fn wait(&mut self, min: usize, on_done: &mut dyn FnMut(ReadDone)) {
+        // A wait for none only looks at what is ready: it sends what fits
+        // and keeps the rest rather than wait for room on the channel.
+        self.issue(min > 0);
+        // A serial read blocks the calling thread, which a wait for none
+        // must not.
+        if min > 0 {
+            self.read_serial();
+        }
+        let mut handed = 0usize;
+        for read in core::mem::take(&mut self.finished) {
+            on_done(read);
+            handed += 1;
+        }
+        // What has arrived, then, while fewer than `min` were handed over,
+        // what arrives next.
+        while self.on_ring > 0 {
+            let next = if handed < min {
+                self.done_rx.recv().ok()
+            } else {
+                self.done_rx.try_recv().ok()
+            };
+            let Some((position, result)) = next else {
+                break;
+            };
+            if let Some(read) = self.complete(position, result) {
+                on_done(read);
+                handed += 1;
+            }
+        }
+    }
+
+    fn set_wake(&mut self, wake: Arc<dyn crate::fs::ReadWake>) -> bool {
+        // A read already sent reports to the sink it went with, which has no
+        // wake: declined, so no caller sleeps waiting for it.
+        if self.on_ring > 0 {
+            return false;
+        }
+        self.sink = Arc::new(QueueSink {
+            done: self.sink.done.clone(),
+            wake: Some(wake),
+        });
+        true
+    }
+}
+
+impl Drop for UringReadQueue<'_> {
+    fn drop(&mut self) {
+        // The kernel may still be writing into the buffers of reads on the
+        // ring: receive their completions before `sent` frees them.
+        while self.on_ring > 0 {
+            let Ok((position, _)) = self.done_rx.recv() else {
+                break;
+            };
+            if self.take_sent(position).is_some() {
+                self.on_ring -= 1;
+            }
         }
     }
 }

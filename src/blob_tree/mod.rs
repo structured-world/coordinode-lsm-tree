@@ -1563,6 +1563,7 @@ impl AbstractTree for BlobTree {
                 seqno,
                 comparator,
                 &mut internal_entries,
+                self.index.config.multi_get_metadata_budget,
             )?;
 
             crate::Tree::fan_out_duplicates(&duplicates, &mut internal_entries);
