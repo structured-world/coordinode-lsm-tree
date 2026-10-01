@@ -1323,29 +1323,99 @@ fn a_level_wider_than_the_descriptor_cache_opens_each_table_once() -> lsm_tree::
     Ok(())
 }
 
-/// The descriptors this process has open.
-#[cfg(unix)]
-fn open_descriptors() -> usize {
-    std::fs::read_dir("/dev/fd").map_or(0, Iterator::count)
+/// A [`StdFs`] file counted among the files a [`LiveCountFs`] has open while
+/// it lives.
+struct Counted {
+    inner: Box<dyn FsFile>,
+    live: Arc<std::sync::atomic::AtomicUsize>,
 }
 
-/// A backend recording, at each batched read, how many descriptors the
-/// process has open, delegating to [`StdFs`].
-#[cfg(unix)]
-struct FdCountFs(Arc<Mutex<Vec<usize>>>);
+impl Drop for Counted {
+    fn drop(&mut self) {
+        self.live.fetch_sub(1, std::sync::atomic::Ordering::Relaxed);
+    }
+}
 
-#[cfg(unix)]
-impl Fs for FdCountFs {
+impl std::io::Read for Counted {
+    fn read(&mut self, buf: &mut [u8]) -> std::io::Result<usize> {
+        self.inner.read(buf)
+    }
+}
+
+impl std::io::Write for Counted {
+    fn write(&mut self, buf: &[u8]) -> std::io::Result<usize> {
+        self.inner.write(buf)
+    }
+
+    fn flush(&mut self) -> std::io::Result<()> {
+        self.inner.flush()
+    }
+}
+
+impl std::io::Seek for Counted {
+    fn seek(&mut self, pos: std::io::SeekFrom) -> std::io::Result<u64> {
+        self.inner.seek(pos)
+    }
+}
+
+impl FsFile for Counted {
+    fn sync_all(&self) -> io::Result<()> {
+        self.inner.sync_all()
+    }
+
+    fn sync_data(&self) -> io::Result<()> {
+        self.inner.sync_data()
+    }
+
+    fn metadata(&self) -> io::Result<FsMetadata> {
+        self.inner.metadata()
+    }
+
+    fn hard_link_count(&self) -> io::Result<u64> {
+        self.inner.hard_link_count()
+    }
+
+    fn set_len(&self, size: u64) -> io::Result<()> {
+        self.inner.set_len(size)
+    }
+
+    fn read_at(&self, buf: &mut [u8], offset: u64) -> io::Result<usize> {
+        self.inner.read_at(buf, offset)
+    }
+
+    fn lock_exclusive(&self) -> io::Result<()> {
+        self.inner.lock_exclusive()
+    }
+
+    fn try_lock_exclusive(&self) -> io::Result<bool> {
+        self.inner.try_lock_exclusive()
+    }
+}
+
+/// A backend counting the files it has open, and recording that count at each
+/// batched read, delegating to [`StdFs`]. Only its own files are counted, so
+/// other tests running beside it do not move the count.
+struct LiveCountFs {
+    live: Arc<std::sync::atomic::AtomicUsize>,
+    counts: Arc<Mutex<Vec<usize>>>,
+}
+
+impl Fs for LiveCountFs {
     fn read_blocks_batched(&self, reqs: &mut [BlockRead<'_>]) -> io::Result<()> {
-        self.0
+        self.counts
             .lock()
             .unwrap_or_else(PoisonError::into_inner)
-            .push(open_descriptors());
+            .push(self.live.load(std::sync::atomic::Ordering::Relaxed));
         StdFs.read_blocks_batched(reqs)
     }
 
     fn open(&self, path: &Path, opts: &FsOpenOptions) -> io::Result<Box<dyn FsFile>> {
-        StdFs.open(path, opts)
+        let inner = StdFs.open(path, opts)?;
+        self.live.fetch_add(1, std::sync::atomic::Ordering::Relaxed);
+        Ok(Box::new(Counted {
+            inner,
+            live: Arc::clone(&self.live),
+        }))
     }
 
     fn create_dir_all(&self, path: &Path) -> io::Result<()> {
@@ -1384,14 +1454,16 @@ impl Fs for FdCountFs {
 /// A table whose filters answer every key of the batch gives its file back as
 /// soon as they do: while the one table the batch reads further goes through
 /// its index, the files of the level's other tables are not held open.
-#[cfg(unix)]
 #[test]
 fn a_table_the_filters_answer_lets_its_file_go() -> lsm_tree::Result<()> {
     // Well past the descriptor cache, whose shards keep an entry each.
     const TABLES: u32 = 64;
     let dir = tempfile::tempdir()?;
     let counts = Arc::new(Mutex::new(Vec::new()));
-    let fs: Arc<dyn Fs> = Arc::new(FdCountFs(Arc::clone(&counts)));
+    let fs: Arc<dyn Fs> = Arc::new(LiveCountFs {
+        live: Arc::default(),
+        counts: Arc::clone(&counts),
+    });
     let config = || {
         Config::new(
             dir.path(),

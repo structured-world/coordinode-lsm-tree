@@ -1098,18 +1098,21 @@ impl RingThread {
 
     /// [`Self::send`] without waiting for room: a full submission channel
     /// sends nothing, so a caller that must not block keeps its reads for a
-    /// later send.
+    /// later send. Nor does it wait for the submission lock, which a blocking
+    /// sender holds while it waits for room: a lock held elsewhere counts as
+    /// no room.
     fn try_send(&self, submission: Submission) -> Result<(), TrySend> {
         #[cfg(test)]
         self.counts
             .locks
             .fetch_add(1, core::sync::atomic::Ordering::Relaxed);
-        let sent = self
-            .tx
-            .lock()
-            .unwrap_or_else(std::sync::PoisonError::into_inner)
-            .as_ref()
-            .map(|tx| tx.try_send(submission));
+        let guard = match self.tx.try_lock() {
+            Ok(guard) => guard,
+            Err(std::sync::TryLockError::Poisoned(poisoned)) => poisoned.into_inner(),
+            Err(std::sync::TryLockError::WouldBlock) => return Err(TrySend::Full),
+        };
+        let sent = guard.as_ref().map(|tx| tx.try_send(submission));
+        drop(guard);
         match sent {
             Some(Ok(())) => Ok(()),
             Some(Err(mpsc::TrySendError::Full(_))) => Err(TrySend::Full),
@@ -1442,7 +1445,8 @@ struct UringReadQueue<'r> {
     /// wake, which reads sent earlier do not ring.
     sink: Arc<QueueSink>,
     done_rx: mpsc::Receiver<(usize, i32)>,
-    /// Submitted since the last wait, not yet on the ring.
+    /// Not yet on the ring: submitted since the last wait, or kept by a wait
+    /// for none that found no room or no lock to send them.
     submitted: Vec<QueuedRead>,
     /// The reads sent to the ring, by the position their completion reports
     /// less `base`; `None` once handed back. Handed-back reads at either end
@@ -1639,7 +1643,10 @@ impl ReadQueue for UringReadQueue<'_> {
     }
 
     fn held(&self) -> usize {
-        self.serial.len()
+        // Reads not yet on the ring, kept by a wait for none that found no
+        // room or no lock, are sent only by a later wait: no completion
+        // wakes a caller for them.
+        self.serial.len() + self.submitted.len()
     }
 
     fn wait(&mut self, min: usize, on_done: &mut dyn FnMut(ReadDone)) {

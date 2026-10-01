@@ -1964,6 +1964,11 @@ fn a_wait_for_none_does_not_wait_for_room_on_the_ring() -> io::Result<()> {
         assert!(prompt, "a wait for none waited for room on the ring");
 
         assert_eq!(late.outstanding(), 1, "the read is kept, not lost");
+        assert_eq!(
+            late.held(),
+            1,
+            "a read no ring has is one only a wait carries out"
+        );
         let mut got = Vec::new();
         while late.outstanding() > 0 {
             late.wait(1, &mut |done| got.push(done.result.is_ok()));
@@ -1978,6 +1983,56 @@ fn a_wait_for_none_does_not_wait_for_room_on_the_ring() -> io::Result<()> {
     while held.outstanding() > 0 {
         held.wait(1, &mut |done| assert!(done.result.is_ok()));
     }
+    Ok(())
+}
+
+/// A wait for none does not wait for the submission lock either: while
+/// another sender holds it (blocked on a full channel, say), the wait keeps
+/// its reads, reports them held, and a later wait sends them.
+#[test]
+fn a_wait_for_none_does_not_wait_for_the_submission_lock() -> io::Result<()> {
+    let Some(fs) = try_io_uring() else {
+        return Ok(());
+    };
+    let dir = tempfile::tempdir()?;
+    let files: Vec<Arc<dyn FsFile>> = two_files(&fs, dir.path(), 64)?
+        .into_iter()
+        .map(Arc::from)
+        .collect();
+    let mut queue = UringReadQueue::new(&fs.inner);
+    queue.submit(QueuedRead {
+        tag: 0,
+        file: Arc::clone(&files[0]),
+        offset: 0,
+        buf: vec![0; 64],
+    });
+
+    let lock = fs
+        .inner
+        .tx
+        .lock()
+        .unwrap_or_else(std::sync::PoisonError::into_inner);
+    let mut queue = std::thread::scope(|scope| {
+        let (returned, polled) = std::sync::mpsc::channel();
+        let poll = scope.spawn(move || {
+            queue.wait(0, &mut |_| {});
+            returned.send(()).ok();
+            queue
+        });
+        let prompt = polled
+            .recv_timeout(std::time::Duration::from_secs(5))
+            .is_ok();
+        drop(lock);
+        let queue = poll.join().expect("the poll thread");
+        assert!(prompt, "a wait for none waited for the submission lock");
+        queue
+    });
+    assert_eq!((queue.outstanding(), queue.held()), (1, 1));
+    let mut got = Vec::new();
+    while queue.outstanding() > 0 {
+        queue.wait(1, &mut |done| got.push(done.result.is_ok()));
+    }
+    assert_eq!(got, [true], "a later wait sends and reads it");
     Ok(())
 }
 
