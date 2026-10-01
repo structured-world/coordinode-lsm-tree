@@ -507,10 +507,17 @@ pub struct Writer {
     /// via [`Self::use_ecc`] before the first key is added.
     ecc: Option<crate::table::block::EccParams>,
 
-    /// Durability level for the SST file + folder fsync at finish. Default
+    /// Durability level for the SST file sync at finish. Default
     /// [`SyncMode::Normal`]; caller wires `Config::sync_mode` via
     /// [`Self::use_sync_mode`].
     sync_mode: SyncMode,
+
+    /// Bytes gathered between writebacks the writer starts while writing; `0`
+    /// starts none. Set via [`Self::use_writeback_bytes`].
+    writeback_bytes: u64,
+
+    /// Where the last writeback ended: every byte before it was handed over.
+    written_back: u64,
 
     /// Per-KV checksum policy + algorithm for data blocks. `None` (default)
     /// means no per-KV checksums: data blocks carry no per-KV footer, with
@@ -869,6 +876,8 @@ impl Writer {
 
             ecc: None,
             sync_mode: SyncMode::Normal,
+            writeback_bytes: 0,
+            written_back: 0,
 
             kv_checksum: None,
             use_seqno_in_index: false,
@@ -1836,12 +1845,43 @@ impl Writer {
         self.use_ecc(resolve_ecc(page_ecc, scheme))
     }
 
-    /// Wires the tree's `Config::sync_mode` into this writer's final SST +
-    /// folder fsync.
+    /// Wires the tree's `Config::sync_mode` into this writer's final SST
+    /// sync.
     #[must_use]
     pub fn use_sync_mode(mut self, sync_mode: SyncMode) -> Self {
         self.sync_mode = sync_mode;
         self
+    }
+
+    /// Starts writing back every `bytes` the table gathers while it is
+    /// written ([`FsFile::start_writeback`]), so its final sync is short;
+    /// `0` starts none.
+    #[must_use]
+    pub fn use_writeback_bytes(mut self, bytes: u64) -> Self {
+        self.writeback_bytes = bytes;
+        self
+    }
+
+    /// Starts writing back what the table wrote since the last writeback,
+    /// once at least `writeback_bytes` of it gathered.
+    fn writeback_if_due(&mut self) -> crate::Result<()> {
+        // `written_back` only ever takes a value of `file_pos`, which grows.
+        let pending = *self.meta.file_pos - self.written_back;
+        if self.writeback_bytes == 0 || pending < self.writeback_bytes {
+            return Ok(());
+        }
+        #[cfg(not(feature = "std"))]
+        use crate::io::Write;
+        #[cfg(feature = "std")]
+        use std::io::Write;
+        // The range is in the buffer until it is flushed to the file.
+        let buffered = self.file_writer.get_mut().inner_mut();
+        buffered.flush()?;
+        buffered
+            .get_ref()
+            .start_writeback(self.written_back, pending)?;
+        self.written_back = *self.meta.file_pos;
+        Ok(())
     }
 
     /// Wires the tree's runtime `kv_checksums` policy + algorithm into this
@@ -3118,6 +3158,7 @@ impl Writer {
         self.meta.file_pos += u64::from(bytes_written);
         self.meta.item_count += item_count;
         self.meta.data_block_count += 1;
+        self.writeback_if_due()?;
 
         self.prev_pos.0 = self.prev_pos.1;
         self.prev_pos.1 += u64::from(bytes_written);

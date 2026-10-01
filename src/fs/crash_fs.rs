@@ -1016,6 +1016,11 @@ impl FsFile for CrashFile {
         self.snapshot(mode)
     }
 
+    fn start_writeback(&self, offset: u64, len: u64) -> io::Result<()> {
+        // Writeback makes nothing durable; only a sync does.
+        self.inner.start_writeback(offset, len)
+    }
+
     fn metadata(&self) -> io::Result<FsMetadata> {
         self.inner.metadata()
     }

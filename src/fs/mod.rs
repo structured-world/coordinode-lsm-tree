@@ -622,6 +622,22 @@ pub trait FsFile: Read + Write + Seek + Send + Sync {
     fn hint(&self, _hint: FileHint) -> io::Result<()> {
         Ok(())
     }
+
+    /// Starts writing back the `len` bytes written at `offset` without
+    /// waiting for them: a later sync then has little left to write, and a
+    /// large file does not hold the device for one long flush at its end.
+    ///
+    /// It makes nothing durable; only a sync does. The default is a no-op;
+    /// the std backend issues `sync_file_range(SYNC_FILE_RANGE_WRITE)` on
+    /// Linux.
+    ///
+    /// # Errors
+    ///
+    /// Returns the error of the system call.
+    fn start_writeback(&self, offset: u64, len: u64) -> io::Result<()> {
+        let _ = (offset, len);
+        Ok(())
+    }
 }
 
 /// One block-read request for [`Fs::read_blocks_batched`]: fill `buf` with

@@ -126,6 +126,9 @@ pub struct MultiWriter {
     /// finishes its SST with the same durability level.
     sync_mode: SyncMode,
 
+    /// `Config::writeback_bytes`, preserved for every successor [`Writer`].
+    writeback_bytes: u64,
+
     /// Per-KV checksum policy + algorithm (from the runtime
     /// `kv_checksums` config) — preserved here so the rotation path
     /// stamps the same setting on every successor [`Writer`].
@@ -307,6 +310,7 @@ impl MultiWriter {
 
             ecc: None,
             sync_mode: SyncMode::Normal,
+            writeback_bytes: 0,
 
             kv_checksum: None,
             use_seqno_in_index: false,
@@ -775,6 +779,15 @@ impl MultiWriter {
         self
     }
 
+    /// Wires the tree's `Config::writeback_bytes` through to the inner
+    /// [`Writer`] and every successor.
+    #[must_use]
+    pub fn use_writeback_bytes(mut self, bytes: u64) -> Self {
+        self.writeback_bytes = bytes;
+        self.writer = self.writer.use_writeback_bytes(bytes);
+        self
+    }
+
     /// Wires the runtime `kv_checksums` policy + algorithm through to the
     /// inner [`Writer`] and preserves it across rotations so every
     /// successor writer applies the same per-KV checksum setting. `Off`
@@ -967,7 +980,9 @@ impl MultiWriter {
         new_writer = new_writer.use_prefix_extractor(self.prefix_extractor.clone());
         new_writer = new_writer.use_encryption(self.encryption.clone());
         new_writer = new_writer.use_ecc(self.ecc);
-        new_writer = new_writer.use_sync_mode(self.sync_mode);
+        new_writer = new_writer
+            .use_sync_mode(self.sync_mode)
+            .use_writeback_bytes(self.writeback_bytes);
         if let Some((policy, algo)) = self.kv_checksum {
             new_writer = new_writer.use_kv_checksums(policy, algo);
         }

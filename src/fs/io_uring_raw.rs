@@ -498,6 +498,31 @@ pub fn ftruncate_raw(fd: i32, length: u64) -> Result<(), Error> {
     Ok(())
 }
 
+/// `sync_file_range(fd, offset, len, SYNC_FILE_RANGE_WRITE)`: starts writing
+/// back the range without waiting for it. 64-bit targets only, where each
+/// 64-bit argument is one register.
+///
+/// # Errors
+/// Returns an [`Error`] if the `sync_file_range` syscall fails.
+#[cfg(target_pointer_width = "64")]
+pub fn start_writeback_raw(fd: i32, offset: u64, len: u64) -> Result<(), Error> {
+    /// `SYNC_FILE_RANGE_WRITE` from `<linux/fs.h>`.
+    const SYNC_FILE_RANGE_WRITE: usize = 2;
+    // SAFETY: `fd` is an owned descriptor; offset, length and flags are plain
+    // values the kernel bounds-checks.
+    unsafe {
+        syscall4(
+            Sysno::sync_file_range,
+            fd as usize,
+            offset as usize,
+            len as usize,
+            SYNC_FILE_RANGE_WRITE,
+        )
+    }
+    .map_err(|e| err("sync_file_range", e))?;
+    Ok(())
+}
+
 /// `lseek(fd, offset, whence)` — reposition; returns the resulting absolute
 /// offset. Used to resolve the file size (`SEEK_END`) for append / `Seek::End`.
 ///
@@ -950,6 +975,13 @@ impl FsFile for IoUringRawFile {
 
     fn try_lock_exclusive(&self) -> crate::io::Result<bool> {
         flock_exclusive_raw(self.fd, true)
+    }
+
+    // 32-bit targets keep the no-op default: the call passes its 64-bit
+    // offsets split across register pairs, which this raw layer does not.
+    #[cfg(target_pointer_width = "64")]
+    fn start_writeback(&self, offset: u64, len: u64) -> crate::io::Result<()> {
+        start_writeback_raw(self.fd, offset, len)
     }
 }
 

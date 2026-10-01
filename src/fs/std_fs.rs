@@ -194,6 +194,35 @@ impl FsFile for File {
     fn hint(&self, hint: FileHint) -> io::Result<()> {
         sys::fadvise(self, hint).map_err(io::Error::from)
     }
+
+    fn start_writeback(&self, offset: u64, len: u64) -> io::Result<()> {
+        #[cfg(target_os = "linux")]
+        {
+            use std::os::unix::io::AsRawFd;
+            let (Ok(offset), Ok(len)) = (i64::try_from(offset), i64::try_from(len)) else {
+                return Err(io::Error::new(
+                    io::ErrorKind::InvalidInput,
+                    "writeback range past the largest file offset",
+                ));
+            };
+            // SAFETY: `fd` is a valid open descriptor for the lifetime of `self`.
+            let rc = unsafe {
+                libc::sync_file_range(self.as_raw_fd(), offset, len, libc::SYNC_FILE_RANGE_WRITE)
+            };
+            if rc == -1 {
+                Err(std::io::Error::last_os_error().into())
+            } else {
+                Ok(())
+            }
+        }
+        // Elsewhere there is no call that starts writeback without waiting
+        // for it: the final sync writes everything.
+        #[cfg(not(target_os = "linux"))]
+        {
+            let _ = (offset, len);
+            Ok(())
+        }
+    }
 }
 
 // ---------------------------------------------------------------------------

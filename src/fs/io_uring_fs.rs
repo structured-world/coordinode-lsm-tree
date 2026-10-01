@@ -558,6 +558,10 @@ impl FsFile for IoUringFile {
         Some(self.file.as_raw_fd())
     }
 
+    fn start_writeback(&self, offset: u64, len: u64) -> crate::io::Result<()> {
+        FsFile::start_writeback(&self.file, offset, len)
+    }
+
     fn lock_exclusive(&self) -> crate::io::Result<()> {
         // Delegate to the platform-specific FsFile impl for std::fs::File.
         FsFile::lock_exclusive(&self.file)

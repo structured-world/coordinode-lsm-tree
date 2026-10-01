@@ -62,7 +62,8 @@ impl<'a> BlobIngestion<'a> {
         )?
         .use_target_size(blob_file_size)
         .use_compression(blob_compression)
-        .use_sync_mode(tree.index.config.sync_mode);
+        .use_sync_mode(tree.index.config.sync_mode)
+        .use_writeback_bytes(tree.index.config.writeback_bytes);
 
         // Ingestion writes blob files under the tree's own blob policy, so it
         // needs the dictionary to compress with and the set to pin on what it
