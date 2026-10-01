@@ -503,6 +503,14 @@ impl<F: Fs> Fs for FaultFs<F> {
         self.inner.same_file(a, b)
     }
 
+    fn read_link(&self, path: &Path) -> io::Result<Option<PathBuf>> {
+        // Reading a link inspects the entry, as a stat does.
+        if let Some(Fault::Error(kind)) = self.injector.check(FaultOp::Metadata, Some(path)) {
+            return Err(fault_error(kind, FaultOp::Metadata));
+        }
+        self.inner.read_link(path)
+    }
+
     fn rename(&self, from: &Path, to: &Path) -> io::Result<()> {
         // Rename rules match the destination path: that is the stable name
         // (manifest, version pointer) a test targets.

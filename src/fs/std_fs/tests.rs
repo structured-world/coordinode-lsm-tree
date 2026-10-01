@@ -882,3 +882,23 @@ fn same_file_answers_by_identity_not_spelling() -> io::Result<()> {
     );
     Ok(())
 }
+
+/// A symlink's target is read as stored, without following it, a dangling one
+/// included; a regular file and a missing name are not symlinks.
+#[cfg(unix)]
+#[test]
+fn read_link_reports_only_symlinks() -> io::Result<()> {
+    let dir = tempfile::tempdir().unwrap();
+    let file = dir.path().join("file");
+    let link = dir.path().join("link");
+    std::fs::write(&file, b"payload")?;
+    std::os::unix::fs::symlink("dangling", &link)?;
+
+    assert_eq!(
+        StdFs.read_link(&link)?,
+        Some(crate::path::PathBuf::from("dangling"))
+    );
+    assert_eq!(StdFs.read_link(&file)?, None);
+    assert_eq!(StdFs.read_link(&dir.path().join("missing"))?, None);
+    Ok(())
+}

@@ -4,7 +4,7 @@
 
 use super::{FileHint, Fs, FsDirEntry, FsFile, FsMetadata, FsOpenOptions, SyncMode};
 use crate::io;
-use crate::path::Path;
+use crate::path::{Path, PathBuf};
 #[cfg(not(feature = "std"))]
 use alloc::{boxed::Box, string::String, vec::Vec};
 use std::fs::{File, OpenOptions};
@@ -263,6 +263,17 @@ impl Fs for StdFs {
             let ca = std::fs::canonicalize(a).map_err(io::Error::from)?;
             let cb = std::fs::canonicalize(b).map_err(io::Error::from)?;
             Ok(ca == cb)
+        }
+    }
+
+    fn read_link(&self, path: &Path) -> io::Result<Option<PathBuf>> {
+        match std::fs::symlink_metadata(path) {
+            Ok(meta) if meta.file_type().is_symlink() => {
+                std::fs::read_link(path).map(Some).map_err(io::Error::from)
+            }
+            Ok(_) => Ok(None),
+            Err(e) if e.kind() == std::io::ErrorKind::NotFound => Ok(None),
+            Err(e) => Err(io::Error::from(e)),
         }
     }
 
