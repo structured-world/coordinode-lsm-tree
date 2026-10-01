@@ -37,7 +37,7 @@
 //! POSIX promises: `crash()` removes a file whose entry was never made durable,
 //! even when its content was synced. Removed entries are not brought back, and
 //! directories themselves are not rolled back. Operations
-//! that make or remove entries, and directory syncs, are linearized: each
+//! that make or remove entries, writes, and directory syncs are linearized: each
 //! happens wholly before or wholly after any other, so an entry is made
 //! either before a sync that then covers it or after one that does not.
 //!
@@ -194,8 +194,9 @@ pub struct CrashFs {
     inner: Arc<dyn Fs>,
     state: Arc<spin::Mutex<CrashState>>,
     /// Linearizes the namespace: every operation that makes or removes a
-    /// directory entry holds it from its checks through the backend call to
-    /// the state it records, and a directory sync holds it from the backend
+    /// directory entry, and every write that resolves the entry it lands on,
+    /// holds it from its checks through the backend call to the state it
+    /// records, and a directory sync holds it from the backend
     /// sync to clearing what that sync made durable. An entry is then made
     /// either before a sync, and covered by it, or after, and pending; and
     /// whether an open or a rename made an entry is decided by probes no
@@ -516,10 +517,12 @@ impl CrashFs {
 impl Fs for CrashFs {
     fn open(&self, path: &Path, opts: &FsOpenOptions) -> io::Result<Box<dyn FsFile>> {
         let writable = opts.write || opts.create || opts.create_new || opts.append || opts.truncate;
-        // An open that may create holds the namespace from the probe to the
-        // registration, so whether it made the entry is what the open did.
+        // A writable open holds the namespace from resolving its entry to the
+        // registration: the backend follows the same symlinks to the same
+        // file, and whether an open that may create made the entry is what
+        // the open did.
         let may_create = opts.create || opts.create_new;
-        let namespace = may_create.then(|| self.namespace.lock());
+        let namespace = writable.then(|| self.namespace.lock());
         // An open that may only create (`O_EXCL`) does not follow a final
         // symlink and refuses any existing name: the backend answers whether
         // it can, and if it does the file is new, at the path itself, with no
@@ -732,7 +735,9 @@ impl Fs for CrashFs {
 
     fn punch_hole(&self, path: &Path, offset: u64, len: u64) -> io::Result<()> {
         // Content-mutating: capture the pre-mutation durable image so an
-        // un-synced punch rolls back on crash.
+        // un-synced punch rolls back on crash. The namespace is held so the
+        // backend reaches the file that was resolved.
+        let _namespace = self.namespace.lock();
         self.capture_first_touch(&self.entry_of(path)?)?;
         self.inner.punch_hole(path, offset, len)
     }
@@ -747,7 +752,9 @@ impl Fs for CrashFs {
 
     fn truncate_file(&self, path: &Path) -> io::Result<()> {
         // Content-mutating: capture the pre-truncate image so an un-synced
-        // reclaim rolls back on crash.
+        // reclaim rolls back on crash. The namespace is held so the backend
+        // reaches the file that was resolved.
+        let _namespace = self.namespace.lock();
         self.capture_first_touch(&self.entry_of(path)?)?;
         self.inner.truncate_file(path)
     }

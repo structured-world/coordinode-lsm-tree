@@ -87,8 +87,10 @@ fn a_rename_without_a_directory_sync_is_lost() {
     );
 }
 
-/// Every operation that makes or removes a directory entry, and a directory
-/// sync, runs with the namespace held, so none lands inside another: not a
+/// Every operation that makes or removes a directory entry, every write that
+/// resolves the entry it lands on, and a directory sync, runs with the
+/// namespace held, so none lands inside another: not a write to a file other
+/// than the one it resolved, not a
 /// creation between a sync's backend call and what the sync is credited
 /// with, not a removal between an open's existence probe and the open, not a
 /// new entry at a renamed-away path before the rename checks it. Each waits
@@ -97,7 +99,7 @@ fn a_rename_without_a_directory_sync_is_lost() {
 fn namespace_operations_wait_for_one_in_flight() {
     let fs = CrashFs::new(MemFs::new());
     fs.create_dir_all(Path::new("/d")).unwrap();
-    for name in ["/d/gone", "/d/src", "/d/linked"] {
+    for name in ["/d/gone", "/d/src", "/d/linked", "/d/written"] {
         let mut f = fs
             .open(
                 Path::new(name),
@@ -108,7 +110,7 @@ fn namespace_operations_wait_for_one_in_flight() {
     }
 
     type Operation = (&'static str, fn(&CrashFs));
-    let operations: [Operation; 6] = [
+    let operations: [Operation; 9] = [
         ("directory sync", |fs| {
             fs.sync_directory(Path::new("/d")).unwrap();
         }),
@@ -127,6 +129,19 @@ fn namespace_operations_wait_for_one_in_flight() {
         ("hard link", |fs| {
             fs.hard_link(Path::new("/d/linked"), Path::new("/d/link"))
                 .unwrap();
+        }),
+        // A write resolves the entry it lands on before the backend follows
+        // the same path: a symlink replaced in between would leave the
+        // simulator tracking one file while the bytes went to another.
+        ("write", |fs| {
+            fs.open(Path::new("/d/written"), &FsOpenOptions::new().write(true))
+                .unwrap();
+        }),
+        ("punch hole", |fs| {
+            fs.punch_hole(Path::new("/d/written"), 0, 1).unwrap();
+        }),
+        ("truncate", |fs| {
+            fs.truncate_file(Path::new("/d/written")).unwrap();
         }),
         ("directory removal", |fs| {
             fs.remove_dir_all(Path::new("/d")).unwrap();
