@@ -86,6 +86,42 @@ impl Fs for GateFs {
     }
 }
 
+/// A flush of a memtable holding nothing but a range tombstone persists the
+/// deletion: once the barrier returns `Ok`, the deleted key stays deleted
+/// across a power loss.
+#[test]
+fn a_flush_of_a_lone_range_tombstone_persists_the_deletion() -> lsm_tree::Result<()> {
+    let crash = CrashFs::new(MemFs::new());
+    let db = "/db";
+    let open = |fs: Arc<dyn Fs>| {
+        lsm_tree::Config::new(
+            db,
+            SequenceNumberCounter::default(),
+            SequenceNumberCounter::default(),
+        )
+        .with_shared_fs(fs)
+        .open()
+    };
+
+    {
+        let tree = open(Arc::new(crash.clone()))?;
+        tree.insert("a", "deleted later", 0);
+        tree.flush_active_memtable(0)?;
+        tree.remove_range("a", "b", 1);
+        tree.flush_active_memtable(0)?;
+    }
+
+    crash.crash();
+
+    let tree = open(crash.inner())?;
+    assert_eq!(
+        tree.get("a", u64::MAX)?,
+        None,
+        "the deletion acknowledged as flushed survives the crash"
+    );
+    Ok(())
+}
+
 /// A memtable sealed by a flush that another thread started, and that fails,
 /// is persisted by a later `flush_active_memtable` that returns `Ok`, together
 /// with the memtable active at that call.

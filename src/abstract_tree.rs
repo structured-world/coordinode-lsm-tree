@@ -610,24 +610,16 @@ pub trait AbstractTree: sealed::Sealed {
 
         drop(version_history);
 
-        // Clone needed: flush_to_tables_with_rt consumes the Vec, but on the
-        // RT-only path (no KV data, tables.is_empty()) we re-insert RTs into the
-        // active memtable. Flush is infrequent and RT count is small.
-        if let Some((tables, blob_files, write_pin)) = self.flush_to_tables_with_rt(
-            stream,
-            range_tombstones.clone(),
-            flushed.keys,
-            flushed.hashes,
-        )? {
-            // If no tables were produced (RT-only memtable), re-insert RTs
-            // into active memtable so they aren't lost
-            if tables.is_empty() && !range_tombstones.is_empty() {
-                let active = self.active_memtable();
-                for rt in &range_tombstones {
-                    let _ =
-                        active.insert_range_tombstone(rt.start.clone(), rt.end.clone(), rt.seqno);
-                }
-            }
+        let has_range_tombstones = !range_tombstones.is_empty();
+        if let Some((tables, blob_files, write_pin)) =
+            self.flush_to_tables_with_rt(stream, range_tombstones, flushed.keys, flushed.hashes)?
+        {
+            // A writer given range tombstones and no key writes a table around
+            // them, so a flush that acknowledges a deletion has put it on disk.
+            debug_assert!(
+                !tables.is_empty() || !has_range_tombstones,
+                "a flush of range tombstones wrote no table"
+            );
 
             #[cfg(all(test, feature = "std"))]
             self.tree_config().fire_before_output_install();
