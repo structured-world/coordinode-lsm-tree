@@ -198,7 +198,7 @@ fn a_level_every_key_is_filtered_out_of_is_answered_and_counted_once() -> crate:
         SeqNo::MAX,
         comparator.as_ref(),
         &mut results,
-    )?;
+    );
     assert!(resolved, "the level is answered: nothing in it");
     assert!(results.iter().all(Option::is_none));
     let count = keys.len() as u64;
@@ -277,7 +277,7 @@ fn a_chunked_resolve_counts_a_passed_key_with_no_block() -> crate::Result<()> {
         SeqNo::MAX,
         comparator.as_ref(),
         &mut results,
-    )?;
+    );
     assert!(resolved, "the other table has blocks to read");
     let count = keys.len() as u64;
     assert_eq!(counts(&widened), (count, count), "(probes, negatives)");
@@ -363,7 +363,7 @@ fn a_chunked_resolve_counts_false_positives_once() -> crate::Result<()> {
         SeqNo::MAX,
         comparator.as_ref(),
         &mut results,
-    )?;
+    );
     assert!(resolved, "the level has blocks to read");
     let present = results.iter().filter(|result| result.is_some()).count();
     let absent = keys.len() - present;

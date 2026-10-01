@@ -151,13 +151,14 @@ struct LevelTable<'a, 'k> {
 
 /// A data block task's block before its chunk is read.
 enum TaskBlock {
-    /// At hand: taken from the cache, or loaded through a Page-ECC or
-    /// columnar table's own path.
+    /// At hand: taken from the cache.
     Held(crate::table::DataBlock),
-    /// A columnar block its delete mask removes whole: it holds no key.
-    Empty,
     /// To be read in the chunk's batch.
     Read,
+    /// To be loaded when its chunk is read, through a Page-ECC or columnar
+    /// table's own path, which heals or reconstructs it; held only while its
+    /// keys are read.
+    Load,
 }
 
 /// The read queue of one backend a level's tables were opened through.
@@ -3579,7 +3580,7 @@ impl Tree {
                 seqno,
                 comparator,
                 results,
-            )? {
+            ) {
                 continue;
             }
 
@@ -4037,9 +4038,11 @@ impl Tree {
     /// A Page-ECC or columnar table is planned serially and its data blocks
     /// loaded through their own path; the level's other tables stay staged.
     ///
-    /// Returns `Ok(true)` when it resolved the level (results updated, found
-    /// keys dropped from `still_remaining`), and `Ok(false)` when a batch the
-    /// backend refused hands the level to the caller's serial resolve.
+    /// Returns `true` when it resolved the level (results updated, found keys
+    /// dropped from `still_remaining`), and `false` when a table it could not
+    /// plan or a block it could not read hands the level to the caller's
+    /// serial resolve, which surfaces a failure only where a key-by-key read
+    /// meets it.
     #[expect(
         clippy::indexing_slicing,
         reason = "start/end stay within tasks by construction"
@@ -4051,34 +4054,46 @@ impl Tree {
         seqno: SeqNo,
         comparator: &dyn crate::comparator::UserComparator,
         results: &mut [Option<InternalValue>],
-    ) -> crate::Result<bool> {
+    ) -> bool {
+        // A table that cannot be planned may be one the serial resolve never
+        // reads: a key an earlier level-0 run holds at the read's ceiling skips
+        // the later runs. The serial resolve reads the level in that order and
+        // fails only where a key-by-key read would.
         let (tasks, probes) =
-            Self::plan_level_block_tasks(level, still_remaining, keys, seqno, comparator)?;
+            match Self::plan_level_block_tasks(level, still_remaining, keys, seqno, comparator) {
+                Ok(plan) => plan,
+                Err(error) => {
+                    log::debug!("a staged level plan failed, the level is read serially: {error}");
+                    return false;
+                }
+            };
         let Some(first) = tasks.first() else {
             // No key of the batch reaches a block of this level: the filter
             // probes that found so are the level's answer.
             for (table, counts) in probes {
                 table.count_probes(counts);
             }
-            return Ok(true);
+            return true;
         };
         // Each task's block, when the cache holds it; the others are read. A
         // Page-ECC or columnar table's block is loaded through its own path,
         // which heals a corrected ECC block and reconstructs a columnar one,
         // the same load a point read makes: the scratch decode is row-format
-        // only. The level's other tables are read in batches all the same.
-        let mut cached: Vec<TaskBlock> = Vec::with_capacity(tasks.len());
-        for task in &tasks {
-            cached.push(if task.special {
-                task.table
-                    .load_data_block(&task.handle)?
-                    .map_or(TaskBlock::Empty, TaskBlock::Held)
-            } else {
-                task.table
-                    .cached_data_block(&task.handle)
-                    .map_or(TaskBlock::Read, TaskBlock::Held)
-            });
-        }
+        // only. It is loaded when its chunk is read, so the blocks loaded stay
+        // within the chunk budget too. The level's other tables are read in
+        // batches all the same.
+        let cached: Vec<TaskBlock> = tasks
+            .iter()
+            .map(|task| {
+                if task.special {
+                    TaskBlock::Load
+                } else {
+                    task.table
+                        .cached_data_block(&task.handle)
+                        .map_or(TaskBlock::Read, TaskBlock::Held)
+                }
+            })
+            .collect();
         let capacity = first.table.cache_capacity();
         let cold: u64 = tasks
             .iter()
@@ -4100,7 +4115,7 @@ impl Tree {
         // it found, not one block that came back empty.
         let mut found: Option<Vec<(crate::TableId, usize)>> = tasks
             .iter()
-            .any(|task| task.table.probe_stats().is_some())
+            .any(|task| task.table.counts_filter_misses())
             .then(Vec::new);
 
         let mut start = 0;
@@ -4108,7 +4123,7 @@ impl Tree {
             let mut bytes = 0u64;
             let mut end = start;
             while end < tasks.len() {
-                let sz = if matches!(cached[end], TaskBlock::Read) {
+                let sz = if matches!(cached[end], TaskBlock::Read | TaskBlock::Load) {
                     u64::from(tasks[end].handle.size())
                 } else {
                     0
@@ -4134,7 +4149,7 @@ impl Tree {
                 found.as_mut(),
             ) {
                 log::debug!("a batched level read failed, the level is read serially: {error}");
-                return Ok(false);
+                return false;
             }
             start = end;
         }
@@ -4147,11 +4162,12 @@ impl Tree {
             Self::count_chunked_false_positives(&tasks, found);
         }
         still_remaining.retain(|&(idx, _)| results[idx].is_none());
-        Ok(true)
+        true
     }
 
     /// Counts, once per (table, key), the keys a table's filter let through
-    /// that no read of that table found.
+    /// that no read of that table found: a filter query and, where the read
+    /// saw every version, a false positive, as a point read counts them.
     #[expect(
         clippy::indexing_slicing,
         reason = "task indices come from enumerating `tasks`"
@@ -4165,7 +4181,7 @@ impl Tree {
         let mut missed: Vec<(crate::TableId, usize, usize)> = tasks
             .iter()
             .enumerate()
-            .filter(|(_, task)| task.table.probe_stats().is_some() && task.table.has_filter())
+            .filter(|(_, task)| task.table.counts_filter_misses())
             .flat_map(|(at, task)| task.keys.iter().map(move |&key| (task.table.id(), key, at)))
             .filter(|&(table, key, _)| found.binary_search(&(table, key)).is_err())
             .collect();
@@ -4173,17 +4189,17 @@ impl Tree {
         missed.dedup_by_key(|&mut (table, key, _)| (table, key));
         for (_, _, at) in missed {
             let task = &tasks[at];
-            task.table.count_false_positive(task.table_seqno);
+            task.table.count_filter_miss(task.table_seqno);
         }
     }
 
     /// Resolves one chunk of block-tasks: a task whose block is held is
-    /// point-read in it, one whose block is empty reads nothing, and the
-    /// others are read in ONE cross-file `read_blocks_batched` per backend,
-    /// decoded from their scratch buffers (and put in the cache when `keep`)
-    /// and point-read, keeping the highest-seqno hit per key in `results`. A
-    /// task to be read is row-format: a Page-ECC or columnar table's block is
-    /// held already, loaded through its own path.
+    /// point-read in it, a Page-ECC or columnar table's block is loaded
+    /// through its own path and point-read (a columnar block its delete mask
+    /// removes whole holds no key), and the others are read in ONE cross-file
+    /// `read_blocks_batched` per backend, decoded from their scratch buffers
+    /// (and put in the cache when `keep`) and point-read, keeping the
+    /// highest-seqno hit per key in `results`.
     fn resolve_block_task_chunk<K: AsRef<[u8]>>(
         chunk: &[BlockTask<'_>],
         cached: &[TaskBlock],
@@ -4194,8 +4210,16 @@ impl Tree {
     ) -> crate::Result<()> {
         let mut hits: Vec<(usize, usize, InternalValue)> = Vec::new();
         for (index, (task, block)) in chunk.iter().zip(cached).enumerate() {
-            if let TaskBlock::Held(block) = block {
-                Self::read_task_keys(task, index, block, keys, &mut hits)?;
+            match block {
+                TaskBlock::Held(block) => {
+                    Self::read_task_keys(task, index, block, keys, &mut hits)?;
+                }
+                TaskBlock::Load => {
+                    if let Some(block) = task.table.load_data_block(&task.handle)? {
+                        Self::read_task_keys(task, index, &block, keys, &mut hits)?;
+                    }
+                }
+                TaskBlock::Read => {}
             }
         }
         // Scratch for the blocks to be read, empty for the others; a size no
@@ -4205,7 +4229,7 @@ impl Tree {
             .zip(cached)
             .map(|(t, block)| match block {
                 TaskBlock::Read => t.table.block_buffer(&t.handle),
-                TaskBlock::Held(_) | TaskBlock::Empty => Ok(Vec::new()),
+                TaskBlock::Held(_) | TaskBlock::Load => Ok(Vec::new()),
             })
             .collect::<crate::Result<_>>()?;
 

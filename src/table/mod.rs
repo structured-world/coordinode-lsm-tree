@@ -7504,14 +7504,22 @@ impl Table {
 
     /// Counts in `tally` the `keys` the filter let through that no block of
     /// the table can hold, read at `table_seqno`: each a false positive, as
-    /// [`Self::count_false_positive`] counts one.
-    fn tally_blockless(
+    /// [`Self::count_false_positive`] counts one, and a filter query that
+    /// reached the table, as a point read counts one.
+    pub(crate) fn tally_blockless(
         &self,
         tally: &mut crate::table::probe_stats::ProbeCounts,
         table_seqno: SeqNo,
         keys: usize,
     ) {
-        if self.has_filter() && table_seqno > self.metadata.seqnos.1 {
+        if !self.has_filter() {
+            return;
+        }
+        #[cfg(feature = "metrics")]
+        self.metrics
+            .filter_queries
+            .fetch_add(keys, core::sync::atomic::Ordering::Relaxed);
+        if table_seqno > self.metadata.seqnos.1 {
             tally.negatives += keys as u64;
         }
     }
@@ -9869,6 +9877,23 @@ impl Table {
         {
             stats.negative();
         }
+    }
+
+    /// Whether a key this table's filter let through and no read found is
+    /// counted: the table has a filter, and the count has somewhere to go.
+    pub(crate) fn counts_filter_misses(&self) -> bool {
+        self.has_filter() && (cfg!(feature = "metrics") || self.probe_stats().is_some())
+    }
+
+    /// Counts a key the filter let through that the read of this table, at
+    /// `table_seqno`, found no version of: a filter query that reached the
+    /// table, and a false positive where [`Self::count_false_positive`] says.
+    pub(crate) fn count_filter_miss(&self, table_seqno: SeqNo) {
+        #[cfg(feature = "metrics")]
+        self.metrics
+            .filter_queries
+            .fetch_add(1, core::sync::atomic::Ordering::Relaxed);
+        self.count_false_positive(table_seqno);
     }
 
     /// The bytes of this table's data section a key range covers, at data

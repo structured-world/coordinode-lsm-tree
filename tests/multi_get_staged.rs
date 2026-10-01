@@ -512,6 +512,107 @@ fn a_read_failing_at_any_stage_under_fault_injection_still_answers() -> lsm_tree
     Ok(())
 }
 
+/// A key whose newest version an earlier level-0 run holds at the read's
+/// ceiling needs nothing from the later runs, so a later table that cannot be
+/// read does not fail the batch: a key-by-key read never touches it either.
+#[test]
+fn an_unreadable_older_table_behind_a_ceiling_hit_does_not_fail_the_batch() -> lsm_tree::Result<()>
+{
+    use lsm_tree::fs::{Fault, FaultFs, FaultOp, FaultRule};
+
+    let dir = tempfile::tempdir()?;
+    let config = |fs: Arc<dyn Fs>| {
+        Config::new(
+            dir.path(),
+            SequenceNumberCounter::default(),
+            SequenceNumberCounter::default(),
+        )
+        .with_shared_fs(fs)
+        .use_cache(Arc::new(Cache::with_capacity_bytes(0)))
+        .filter_block_pinning_policy(PinningPolicy::all(false))
+        .index_block_pinning_policy(PinningPolicy::all(false))
+    };
+    let older = {
+        let tree = config(Arc::new(StdFs)).open()?;
+        tree.insert("k", "old", 1);
+        tree.flush_active_memtable(0)?;
+        let older = std::fs::read_dir(dir.path().join("tables"))?
+            .filter_map(Result::ok)
+            .map(|entry| entry.path())
+            .find(|path| path.is_file())
+            .expect("the first flush wrote a table");
+        // Keys the older table's range does not reach, so the batch is large
+        // enough for the batched read.
+        tree.insert("h", "new", 2);
+        tree.insert("j", "new", 3);
+        tree.insert("k", "new", 4);
+        tree.flush_active_memtable(0)?;
+        older
+    };
+    let faulty = FaultFs::new(StdFs);
+    let injector = faulty.injector();
+    let tree = config(Arc::new(faulty)).open()?;
+    injector.arm(
+        FaultRule::new(
+            FaultOp::ReadAt,
+            Fault::Error(io::ErrorKind::PermissionDenied),
+        )
+        .on_path(older.display().to_string()),
+    );
+
+    // Read at the newest version's ceiling: nothing older can beat it.
+    let keys = ["h", "j", "k"];
+    let one: Vec<Option<Slice>> = keys
+        .iter()
+        .map(|key| tree.get(key, 5))
+        .collect::<lsm_tree::Result<_>>()?;
+    assert_eq!(one[2].as_deref(), Some(&b"new"[..]), "a point read answers");
+    assert_eq!(tree.multi_get(keys, 5)?, one);
+    // Above the ceiling the older table may hold a newer version: the batch
+    // fails as the point read does.
+    assert!(tree.get("k", SeqNo::MAX).is_err(), "a point read fails");
+    assert!(tree.multi_get(keys, SeqNo::MAX).is_err(), "the batch fails");
+    Ok(())
+}
+
+/// A key the filter lets through that the read finds no version of is a
+/// filter query, as a point read counts one: the batch counts the same
+/// queries as the keys read one by one.
+#[cfg(feature = "metrics")]
+#[test]
+fn a_batch_counts_the_filter_queries_its_keys_read_one_by_one_count() -> lsm_tree::Result<()> {
+    let dir = tempfile::tempdir()?;
+    let tree = Config::new(
+        dir.path(),
+        SequenceNumberCounter::default(),
+        SequenceNumberCounter::default(),
+    )
+    .use_cache(Arc::new(Cache::with_capacity_bytes(0)))
+    .filter_block_pinning_policy(PinningPolicy::all(false))
+    .index_block_pinning_policy(PinningPolicy::all(false))
+    .open()?;
+    tree.insert("a", "v", 1);
+    tree.insert("b", "v", 2);
+    // Present in the table, but newer than the snapshot read below: the
+    // filter lets it through and the read finds no version it can see.
+    tree.insert("c", "v", 6);
+    tree.flush_active_memtable(0)?;
+    let keys = ["a", "b", "c"];
+    let queries = || tree.metrics().filter_queries();
+
+    let before = queries();
+    for key in keys {
+        tree.get(key, 4)?;
+    }
+    let one_by_one = queries() - before;
+    assert!(one_by_one > 0, "the hidden key is a filter query");
+
+    let before = queries();
+    tree.multi_get(keys, 4)?;
+    assert_eq!(queries() - before, one_by_one);
+    Ok(())
+}
+
 /// What a [`SlowFirstFs`] saw: the reads submitted before its queue was first
 /// waited on, and the reads submitted by the time the first of them finished.
 #[derive(Default)]
