@@ -64,6 +64,51 @@ fn a_blob_file_being_written_starts_writeback_every_step() -> lsm_tree::Result<(
     Ok(())
 }
 
+/// The sections a table writes after its data, a large filter here, are
+/// written back as they are, so the final sync does not flush them in one
+/// burst: what is left unhanded when the file is synced is the last few
+/// sections, not the filter.
+#[test]
+fn a_tables_final_sections_are_written_back_as_they_are_written() -> lsm_tree::Result<()> {
+    use lsm_tree::config::{BloomConstructionPolicy, FilterPolicy, FilterPolicyEntry};
+
+    let fs = FaultFs::new(MemFs::new());
+    let injector = fs.injector();
+    let fs: Arc<dyn Fs> = Arc::new(fs);
+    let tree = Config::new(
+        "/db",
+        SequenceNumberCounter::default(),
+        SequenceNumberCounter::default(),
+    )
+    .with_shared_fs(Arc::clone(&fs))
+    .writeback_bytes(STEP)
+    .filter_policy(FilterPolicy::all(FilterPolicyEntry::Bloom(
+        BloomConstructionPolicy::BitsPerKey(50.0),
+    )))
+    .open()?;
+    for key in 0..20_000u32 {
+        tree.insert(format!("{key:06}"), b"v", u64::from(key));
+    }
+    tree.flush_active_memtable(0)?;
+
+    let table = fs
+        .read_dir(std::path::Path::new("/db/tables"))?
+        .into_iter()
+        .find(|entry| !entry.is_dir)
+        .expect("the flush wrote a table");
+    let size = fs.metadata(&table.path)?.len;
+    let ranges = injector.writebacks_for("tables");
+    let handed = ranges.last().map_or(0, |&(offset, len)| offset + len);
+    let tail = size - handed;
+    // The meta section, the table of contents and the trailer come after the
+    // last section boundary; a few steps hold them.
+    assert!(
+        tail <= 4 * STEP,
+        "{tail} of {size} bytes left to the final sync: {ranges:?}"
+    );
+    Ok(())
+}
+
 #[test]
 fn a_zero_step_starts_no_writeback() -> lsm_tree::Result<()> {
     let injector = flushed(|config| {

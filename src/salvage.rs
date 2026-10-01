@@ -2772,7 +2772,8 @@ fn salvage_blocks(
         for link in links {
             writer.link_blob_file(link);
         }
-        writer.finish()?;
+        // The publish syncs the destination's directory after its rename.
+        writer.finish_deferring_dir_sync()?;
     } else {
         drop(writer);
     }

@@ -1049,7 +1049,8 @@ impl MultiWriter {
             old_writer.link_blob_file(linked);
         }
 
-        if let Some((table_id, checksum)) = old_writer.finish()? {
+        // The install that names the tables syncs their folder once.
+        if let Some((table_id, checksum)) = old_writer.finish_deferring_dir_sync()? {
             self.results.push((table_id, checksum));
         }
 
@@ -1460,7 +1461,7 @@ impl MultiWriter {
             self.writer.link_blob_file(linked);
         }
 
-        if let Some((table_id, checksum)) = self.writer.finish()? {
+        if let Some((table_id, checksum)) = self.writer.finish_deferring_dir_sync()? {
             self.results.push((table_id, checksum));
         }
 
