@@ -32,9 +32,10 @@
 //!
 //! Hard links the backend reports as one file ([`Fs::same_file`]) share one
 //! durable image, since they share their bytes; on a backend where a hard link
-//! is a copy each name keeps its own. A write through a symbolic link is
-//! tracked under the entry the link chain ends at, the one the write creates
-//! or changes.
+//! is a copy each name keeps its own. Every name is tracked resolved, as the
+//! backend resolves it: a symbolic link, final or in a directory along the
+//! way, and `..` lead to the entry they reach, so a file written or synced
+//! through any spelling is the one file.
 //!
 //! This is a test/dev surface: it is gated behind the `std` feature and is not
 //! part of the production storage path.
@@ -59,6 +60,7 @@ use alloc::boxed::Box;
 use alloc::sync::Arc;
 use alloc::vec::Vec;
 use hashbrown::{HashMap, HashSet};
+use std::path::Component;
 
 /// Shared crash state: the durable image of each file plus the set of files
 /// written during the current run (so `crash()` can vanish never-synced ones).
@@ -156,6 +158,38 @@ impl CrashState {
 /// refused: Linux's `MAXSYMLINKS`.
 const MAX_SYMLINKS: usize = 40;
 
+/// The components of `path`, each as a path of its own, last first.
+fn components_reversed(path: &Path) -> Vec<PathBuf> {
+    path.components()
+        .rev()
+        .map(|component| PathBuf::from(component.as_os_str()))
+        .collect()
+}
+
+/// `path` with `.` and `..` folded away by spelling alone; `..` of a root is
+/// the root, a `..` with nothing to climb out of stays, and nothing left is
+/// `.`.
+fn folded(path: &Path) -> PathBuf {
+    let mut out = PathBuf::new();
+    for component in path.components() {
+        match component {
+            Component::CurDir => {}
+            Component::ParentDir => match out.components().next_back() {
+                Some(Component::Normal(_)) => {
+                    out.pop();
+                }
+                Some(Component::RootDir | Component::Prefix(_)) => {}
+                _ => out.push(component.as_os_str()),
+            },
+            other => out.push(other.as_os_str()),
+        }
+    }
+    if out.as_os_str().is_empty() {
+        out.push(".");
+    }
+    out
+}
+
 /// A power-loss crash simulator wrapping an inner [`Fs`].
 ///
 /// See the module-level documentation for the durability model. The inner backend is
@@ -166,13 +200,14 @@ const MAX_SYMLINKS: usize = 40;
 pub struct CrashFs {
     inner: Arc<dyn Fs>,
     state: Arc<spin::Mutex<CrashState>>,
-    /// Linearizes the namespace while directory entries are tracked: every
-    /// operation that makes or removes a directory entry holds it from its
-    /// checks through the backend call to the state it records, and a
-    /// directory sync holds it from the backend sync to clearing what that
-    /// sync made durable. An entry is then made either before a sync, and
-    /// covered by it, or after, and pending. Blocking, not spinning: a
-    /// directory sync holds it across a system call.
+    /// Linearizes the namespace: every operation that makes or removes a
+    /// directory entry, and every write that resolves the entry it lands on,
+    /// holds it from its checks through the backend call to the state it
+    /// records, and a directory sync holds it from the backend sync to
+    /// clearing what that sync made durable. A write then reaches the file it
+    /// resolved, and while entries are tracked an entry is made either before
+    /// a sync, and covered by it, or after, and pending. Blocking, not
+    /// spinning: a directory sync holds it across a system call.
     namespace: Arc<parking_lot::Mutex<()>>,
 }
 
@@ -195,22 +230,13 @@ impl CrashFs {
         }
     }
 
-    /// Holds the namespace while directory entries are tracked; outside that
-    /// mode the wrapper orders nothing it did not before.
-    fn hold_namespace(&self) -> Option<parking_lot::MutexGuard<'_, ()>> {
-        let tracking = self.state.lock().track_entries;
-        tracking.then(|| self.namespace.lock())
-    }
-
     /// Also models directory entries: a created file, a rename's destination,
     /// a hard link or a reflink is durable only once its parent directory is
     /// synced, as POSIX promises, and [`Self::crash`] removes one whose
-    /// directory never was, even when its content was synced. A directory is
-    /// matched by the path it is named with: an entry made through one
-    /// spelling of a directory and synced through another stays pending.
-    /// Operations that make or remove entries, and directory syncs, are then
-    /// linearized, so an entry is made either before a sync that covers it or
-    /// after one that does not.
+    /// directory never was, even when its content was synced. Operations that
+    /// make or remove entries, writes, and directory syncs are linearized, so
+    /// an entry is made either before a sync that covers it or after one that
+    /// does not.
     #[cfg(test)]
     #[must_use]
     pub(crate) fn tracking_directory_entries(self) -> Self {
@@ -347,39 +373,100 @@ impl CrashFs {
         Ok(())
     }
 
-    /// The entry a write through `path` lands on: `path` itself, or the end of
-    /// the symlink chain it starts, which is the entry an open that creates
-    /// makes and the one whose bytes a sync makes durable.
-    fn written_entry(&self, path: &Path) -> io::Result<PathBuf> {
-        // Resolved only while entries are tracked: outside that mode the
-        // wrapper makes no call the backend would not have seen, and a write
-        // is tracked under the name it was made through.
-        if self.state.lock().track_entries {
-            self.entry_of(path)
-        } else {
-            Ok(path.to_path_buf())
-        }
+    /// The entry a write through `path` lands on: `path` with every symlink
+    /// it passes through resolved, the final one included, which is the
+    /// entry an open that creates makes and the one whose bytes a sync makes
+    /// durable.
+    fn entry_of(&self, path: &Path) -> io::Result<PathBuf> {
+        self.resolve(path, true)
     }
 
-    /// The entry a write through `path` lands on, resolved on the backend.
-    fn entry_of(&self, path: &Path) -> io::Result<PathBuf> {
-        let mut entry = path.to_path_buf();
+    /// The entry `path` names itself, as `rename`, `unlink` and `link` see
+    /// it: its directory resolved, its final component kept even when it is
+    /// a symlink.
+    fn name_of(&self, path: &Path) -> io::Result<PathBuf> {
+        self.resolve(path, false)
+    }
+
+    /// [`Self::name_of`] for an operation the backend has already done: the
+    /// operation stands, so a probe that cannot answer leaves the name as it
+    /// was given rather than failing it.
+    fn name_after(&self, path: &Path) -> PathBuf {
+        self.name_of(path).unwrap_or_else(|_| path.to_path_buf())
+    }
+
+    /// `path` spelled the one way every name of its entry is tracked under,
+    /// so a file reached through a symlinked directory or through `..` is the
+    /// file reached through its real directory.
+    ///
+    /// Symlinks are resolved component by component, as the kernel walks a
+    /// path, through at most `MAX_SYMLINKS` links. Then `.` and `..` are
+    /// folded away, which is what the walk would do over a prefix that holds
+    /// no symlink, but only when the backend agrees that the folded directory
+    /// is the one it reaches: a backend that keeps `..` as part of a name
+    /// (`MemFs`) gets the name it was given.
+    fn resolve(&self, path: &Path, follow_final: bool) -> io::Result<PathBuf> {
+        let mut resolved = PathBuf::new();
+        // Components still to walk, the next one last.
+        let mut rest: Vec<PathBuf> = components_reversed(path);
         let mut followed = 0;
-        // MAX_SYMLINKS links are followed; only a link past them is refused.
-        while let Some(target) = self.inner.read_link(&entry)? {
-            if followed == MAX_SYMLINKS {
-                return Err(io::Error::new(
-                    io::ErrorKind::InvalidInput,
-                    "too many levels of symbolic links",
-                ));
+        while let Some(part) = rest.pop() {
+            if !matches!(part.components().next(), Some(Component::Normal(_))) {
+                // A root replaces what was walked, `.` adds nothing, and `..`
+                // is folded below, once the prefix it climbs out of is known
+                // to hold no symlink.
+                if !matches!(part.components().next(), Some(Component::CurDir)) {
+                    resolved.push(part);
+                }
+                continue;
             }
-            followed += 1;
-            entry = match entry.parent() {
-                Some(directory) if target.is_relative() => directory.join(target),
-                _ => target,
-            };
+            let candidate = resolved.join(&part);
+            if rest.is_empty() && !follow_final {
+                resolved = candidate;
+                break;
+            }
+            match self.inner.read_link(&candidate)? {
+                Some(target) => {
+                    // MAX_SYMLINKS links are followed; only a link past them
+                    // is refused.
+                    if followed == MAX_SYMLINKS {
+                        return Err(io::Error::new(
+                            io::ErrorKind::InvalidInput,
+                            "too many levels of symbolic links",
+                        ));
+                    }
+                    followed += 1;
+                    // A relative target continues from the directory holding
+                    // the link; an absolute one starts again at its root.
+                    rest.extend(components_reversed(&target));
+                }
+                None => resolved = candidate,
+            }
         }
-        Ok(entry)
+        if resolved.as_os_str().is_empty() {
+            // `.` alone: the current directory, as the engine names it.
+            resolved.push(".");
+        }
+        let folded = folded(&resolved);
+        if folded == resolved {
+            return Ok(resolved);
+        }
+        // The entry itself may not exist yet (an open that creates), its
+        // directory does: that is what the backend is asked about.
+        let (spelled, plain) = match (resolved.components().next_back(), folded.file_name()) {
+            (Some(Component::Normal(_)), Some(_)) => (
+                crate::file::entry_directory(&resolved).to_path_buf(),
+                crate::file::entry_directory(&folded).to_path_buf(),
+            ),
+            _ => (resolved.clone(), folded.clone()),
+        };
+        Ok(
+            if matches!(self.inner.same_file(&spelled, &plain), Ok(true)) {
+                folded
+            } else {
+                resolved
+            },
+        )
     }
 
     /// Records that `path` got a new directory entry, durable once its parent
@@ -389,19 +476,27 @@ impl CrashFs {
     }
 
     /// Runs the backend sync of `directory` and then makes its pending
-    /// entries durable, with the namespace held throughout while entries are
-    /// tracked: no entry can be made or removed between the backend sync and
-    /// what it is credited with.
+    /// entries durable, with the namespace held throughout: no entry can be
+    /// made or removed between the backend sync and what it is credited with.
     fn sync_entries_of(
         &self,
         directory: &Path,
         sync: impl FnOnce() -> io::Result<()>,
     ) -> io::Result<()> {
-        let _namespace = self.hold_namespace();
+        let _namespace = self.namespace.lock();
         sync()?;
-        // Directories are matched by spelling: an entry made through one
-        // spelling of a directory and synced through another (a symlink,
-        // `..`) stays pending. The engine names both from its tree folder.
+        // Pending entries exist only while entries are tracked; there is
+        // nothing to match otherwise.
+        if !self.state.lock().track_entries {
+            return Ok(());
+        }
+        // Entries are tracked under their resolved names, so the directory
+        // is matched resolved too: a sync through a symlink or `..` covers
+        // the entries of the directory it reaches. The sync is done, so a
+        // probe that cannot answer matches the directory as it was named.
+        let directory = self
+            .entry_of(directory)
+            .unwrap_or_else(|_| directory.to_path_buf());
         self.state
             .lock()
             .pending_entries
@@ -454,28 +549,25 @@ impl CrashFs {
 impl Fs for CrashFs {
     fn open(&self, path: &Path, opts: &FsOpenOptions) -> io::Result<Box<dyn FsFile>> {
         let writable = opts.write || opts.create || opts.create_new || opts.append || opts.truncate;
-        // Probed only while entries are tracked, so the wrapper otherwise
-        // makes no call the backend would not have seen. An open that may
-        // create holds the namespace from the probe to the registration, so
-        // whether it made the entry is what the open did.
+        // A writable open holds the namespace from resolving its entry to the
+        // registration: the backend follows the same symlinks to the same
+        // file, and whether an open that may create made the entry is what
+        // the open did.
         let may_create = opts.create || opts.create_new;
-        let namespace = if may_create {
-            self.hold_namespace()
-        } else {
-            None
-        };
+        let namespace = writable.then(|| self.namespace.lock());
         // An open that may only create (`O_EXCL`) does not follow a final
         // symlink and refuses any existing name: the backend answers whether
         // it can, and if it does the file is new, at the path itself, with no
         // prior image to capture.
         if opts.create_new {
             let inner = self.inner.open(path, opts)?;
-            self.state.lock().touched.insert(path.to_path_buf());
-            self.new_entry(path);
+            let entry = self.name_after(path);
+            self.state.lock().touched.insert(entry.clone());
+            self.new_entry(&entry);
             drop(namespace);
             return Ok(Box::new(CrashFile {
                 inner,
-                path: path.to_path_buf(),
+                path: entry,
                 fs: Arc::clone(&self.inner),
                 state: Arc::clone(&self.state),
             }));
@@ -483,11 +575,14 @@ impl Fs for CrashFs {
         // A write follows symlinks: through a dangling one it creates the
         // target, so the target is the entry made and the file tracked.
         let entry = if writable {
-            self.written_entry(path)?
+            self.entry_of(path)?
         } else {
             path.to_path_buf()
         };
-        let creates = namespace.is_some() && !self.inner.exists(&entry)?;
+        // Whether the open makes an entry matters only while entries are
+        // tracked.
+        let tracking = self.state.lock().track_entries;
+        let creates = tracking && may_create && !self.inner.exists(&entry)?;
         if writable {
             // Capture the pre-existing durable image BEFORE the open (which may
             // truncate); a brand-new file captures nothing, so a crash before its
@@ -520,15 +615,18 @@ impl Fs for CrashFs {
     }
 
     fn remove_file(&self, path: &Path) -> io::Result<()> {
-        let _namespace = self.hold_namespace();
+        let _namespace = self.namespace.lock();
         self.inner.remove_file(path)?;
-        self.state.lock().forget_name(path);
+        let name = self.name_after(path);
+        self.state.lock().forget_name(&name);
         Ok(())
     }
 
     fn remove_dir_all(&self, path: &Path) -> io::Result<()> {
-        let _namespace = self.hold_namespace();
+        let _namespace = self.namespace.lock();
         self.inner.remove_dir_all(path)?;
+        let name = self.name_after(path);
+        let path = name.as_path();
         // Purge crash state for every tracked path under the removed directory,
         // so crash() neither resurrects nor panics recreating a file whose
         // parent is gone.
@@ -559,23 +657,23 @@ impl Fs for CrashFs {
     }
 
     fn rename(&self, from: &Path, to: &Path) -> io::Result<()> {
-        let _namespace = self.hold_namespace();
+        let _namespace = self.namespace.lock();
         self.inner.rename(from, to)?;
         // POSIX rename(2): when both entries are links to one file (one path,
         // or two hard links of one inode) the call succeeds and changes
         // nothing, so `from` is still there and the crash state stays as it
         // was. Whether it is still there is what tells, on every backend: a
         // file-identity probe follows symlinks, which rename does not, and
-        // not every backend can answer one. Probed only in the directory-entry
-        // mode, the one this matters to, with the namespace held so no other
-        // operation can have made `from` again since the rename; the inner
-        // backend is the disk this simulates, so its answer is the truth: a
-        // fault layer composes above the simulator, never below it. A probe
-        // that fails is read as an ordinary rename.
-        let tracking = self.state.lock().track_entries;
-        if from == to || (tracking && matches!(self.inner.exists(from), Ok(true))) {
+        // not every backend can answer one. The namespace is held, so no other
+        // operation can have made `from` again since the rename, and the
+        // inner backend is the disk this simulates, so its answer is the
+        // truth: a fault layer composes above the simulator, never below it.
+        // A probe that fails is read as an ordinary rename.
+        if from == to || matches!(self.inner.exists(from), Ok(true)) {
             return Ok(());
         }
+        let (from, to) = (self.name_after(from), self.name_after(to));
+        let (from, to) = (from.as_path(), to.as_path());
         let mut state = self.state.lock();
         // The source's state moves with its file, under the new name.
         let from_durable = state.durable.remove(from);
@@ -620,39 +718,35 @@ impl Fs for CrashFs {
     }
 
     fn hard_link(&self, src: &Path, dst: &Path) -> io::Result<()> {
-        let _namespace = self.hold_namespace();
+        let _namespace = self.namespace.lock();
         self.inner.hard_link(src, dst)?;
-        // Probed only while entries are tracked, so the wrapper otherwise
-        // makes no call the backend would not have seen.
-        let tracking = self.state.lock().track_entries;
         // A symlink linked as itself (Linux `linkat(2)` without
         // `AT_SYMLINK_FOLLOW`) is a new entry with no bytes of its own: no
         // image is kept under it, and it is grouped with nothing. The link is
         // made, so a probe that cannot answer does not fail it either.
-        if tracking && matches!(self.inner.read_link(dst), Ok(Some(_))) {
-            self.new_entry(dst);
+        let link = self.name_after(dst);
+        if matches!(self.inner.read_link(dst), Ok(Some(_))) {
+            self.new_entry(&link);
             return Ok(());
         }
-        self.track_copy(src, dst)?;
+        // A backend that followed a symlink source made `dst` a name of the
+        // file the link chain ends at, so that file is the one copied and
+        // the name `dst` is grouped with.
+        let file = self.entry_of(src).unwrap_or_else(|_| self.name_after(src));
+        self.track_copy(&file, &link)?;
         // On a backend where a hard link is a second name of one file, a sync
         // through either name makes the other's bytes durable too; on one
         // where it is a copy (`MemFs`), each name keeps its own image. A
-        // backend that followed a symlink source made `dst` a name of the
-        // file the link chain ends at, so that is the name it is grouped
-        // with. A probe that cannot answer leaves the names separate.
-        if !tracking {
-            return Ok(());
-        }
-        let file = self.entry_of(src).unwrap_or_else(|_| src.to_path_buf());
-        if matches!(self.inner.same_file(&file, dst), Ok(true)) {
+        // probe that cannot answer leaves the names separate.
+        if matches!(self.inner.same_file(&file, &link), Ok(true)) {
             let mut state = self.state.lock();
-            state.link(&file, dst);
+            state.link(&file, &link);
             // The image `dst` took is the one file's, `src`'s baseline
             // included: every name holds it, so a later first touch through
             // any of them, which finds the group already touched, still has
             // durable bytes to roll back to.
-            if let Some(bytes) = state.durable.get(dst).cloned() {
-                state.set_durable(dst, bytes);
+            if let Some(bytes) = state.durable.get(&link).cloned() {
+                state.set_durable(&link, bytes);
             }
         }
         Ok(())
@@ -676,22 +770,27 @@ impl Fs for CrashFs {
 
     fn punch_hole(&self, path: &Path, offset: u64, len: u64) -> io::Result<()> {
         // Content-mutating: capture the pre-mutation durable image so an
-        // un-synced punch rolls back on crash.
-        self.capture_first_touch(&self.written_entry(path)?)?;
+        // un-synced punch rolls back on crash. The namespace is held so the
+        // backend reaches the file that was resolved.
+        let _namespace = self.namespace.lock();
+        self.capture_first_touch(&self.entry_of(path)?)?;
         self.inner.punch_hole(path, offset, len)
     }
 
     fn reflink_file(&self, src: &Path, dst: &Path) -> io::Result<()> {
-        let _namespace = self.hold_namespace();
+        let _namespace = self.namespace.lock();
         self.inner.reflink_file(src, dst)?;
-        self.track_copy(src, dst)?;
+        let file = self.entry_of(src).unwrap_or_else(|_| self.name_after(src));
+        self.track_copy(&file, &self.name_after(dst))?;
         Ok(())
     }
 
     fn truncate_file(&self, path: &Path) -> io::Result<()> {
         // Content-mutating: capture the pre-truncate image so an un-synced
-        // reclaim rolls back on crash.
-        self.capture_first_touch(&self.written_entry(path)?)?;
+        // reclaim rolls back on crash. The namespace is held so the backend
+        // reaches the file that was resolved.
+        let _namespace = self.namespace.lock();
+        self.capture_first_touch(&self.entry_of(path)?)?;
         self.inner.truncate_file(path)
     }
 

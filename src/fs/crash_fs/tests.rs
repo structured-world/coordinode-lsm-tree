@@ -68,17 +68,19 @@ fn a_rename_without_a_directory_sync_is_lost() {
     );
 }
 
-/// Every operation that makes or removes a directory entry, and a directory
-/// sync, runs with the namespace held while entries are tracked, so none
-/// lands inside another: not a creation between a sync's backend call and
-/// what the sync is credited with, not a removal between an open's existence
-/// probe and the open, not a new entry at a renamed-away path before the
-/// rename checks it. Each waits while another holds the namespace.
+/// Every operation that makes or removes a directory entry, every write that
+/// resolves the entry it lands on, and a directory sync, runs with the
+/// namespace held, in either mode, so none lands inside another: not a write
+/// to a file other than the one it resolved, not a creation between a sync's
+/// backend call and what the sync is credited with, not a removal between an
+/// open's existence probe and the open, not a new entry at a renamed-away
+/// path before the rename checks it. Each waits while another holds the
+/// namespace.
 #[test]
 fn namespace_operations_wait_for_one_in_flight() {
-    let fs = CrashFs::new(MemFs::new()).tracking_directory_entries();
+    let fs = CrashFs::new(MemFs::new());
     fs.create_dir_all(Path::new("/d")).unwrap();
-    for name in ["/d/gone", "/d/src", "/d/linked"] {
+    for name in ["/d/gone", "/d/src", "/d/linked", "/d/written"] {
         let mut f = fs
             .open(
                 Path::new(name),
@@ -89,7 +91,7 @@ fn namespace_operations_wait_for_one_in_flight() {
     }
 
     type Operation = (&'static str, fn(&CrashFs));
-    let operations: [Operation; 6] = [
+    let operations: [Operation; 9] = [
         ("directory sync", |fs| {
             fs.sync_directory(Path::new("/d")).unwrap();
         }),
@@ -108,6 +110,19 @@ fn namespace_operations_wait_for_one_in_flight() {
         ("hard link", |fs| {
             fs.hard_link(Path::new("/d/linked"), Path::new("/d/link"))
                 .unwrap();
+        }),
+        // A write resolves the entry it lands on before the backend follows
+        // the same path: a symlink replaced in between would leave the
+        // simulator tracking one file while the bytes went to another.
+        ("write", |fs| {
+            fs.open(Path::new("/d/written"), &FsOpenOptions::new().write(true))
+                .unwrap();
+        }),
+        ("punch hole", |fs| {
+            fs.punch_hole(Path::new("/d/written"), 0, 1).unwrap();
+        }),
+        ("truncate", |fs| {
+            fs.truncate_file(Path::new("/d/written")).unwrap();
         }),
         ("directory removal", |fs| {
             fs.remove_dir_all(Path::new("/d")).unwrap();
@@ -135,22 +150,6 @@ fn namespace_operations_wait_for_one_in_flight() {
             .unwrap_or_else(|_| panic!("{name} proceeds once the namespace is free"));
         worker.join().unwrap();
     }
-}
-
-/// Outside the directory-entry mode the wrapper orders nothing: a namespace
-/// operation does not wait for the lock that mode uses.
-#[test]
-fn without_entry_tracking_namespace_operations_do_not_wait() {
-    let fs = CrashFs::new(MemFs::new());
-    fs.create_dir_all(Path::new("/d")).unwrap();
-    let _held = fs.namespace.lock();
-    fs.sync_directory(Path::new("/d")).unwrap();
-    fs.open(
-        Path::new("/d/new"),
-        &FsOpenOptions::new().write(true).create(true),
-    )
-    .unwrap();
-    fs.remove_file(Path::new("/d/new")).unwrap();
 }
 
 /// A rename onto its own path changes nothing on disk (POSIX rename(2): same
@@ -183,7 +182,7 @@ fn a_rename_onto_itself_keeps_a_durable_file() {
 #[test]
 fn a_rename_between_links_of_one_file_keeps_both_names() {
     let dir = tempfile::tempdir().unwrap();
-    let fs = CrashFs::new(crate::fs::StdFs).tracking_directory_entries();
+    let fs = CrashFs::new(crate::fs::StdFs);
     let src = dir.path().join("src");
     let link = dir.path().join("link");
 
@@ -247,7 +246,7 @@ fn a_rename_between_symlinks_to_one_file_moves_the_entry() {
 #[test]
 fn a_sync_through_one_hard_link_is_durable_through_the_other() {
     let dir = tempfile::tempdir().unwrap();
-    let fs = CrashFs::new(crate::fs::StdFs).tracking_directory_entries();
+    let fs = CrashFs::new(crate::fs::StdFs);
     let src = dir.path().join("src");
     let link = dir.path().join("link");
 
@@ -282,7 +281,7 @@ fn a_linked_pre_existing_file_keeps_its_durable_bytes() {
     let src = dir.path().join("src");
     let link = dir.path().join("link");
     std::fs::write(&src, b"durable").unwrap();
-    let fs = CrashFs::new(crate::fs::StdFs).tracking_directory_entries();
+    let fs = CrashFs::new(crate::fs::StdFs);
     fs.hard_link(&src, &link).unwrap();
     fs.sync_directory(dir.path()).unwrap();
 
@@ -308,7 +307,7 @@ fn removing_a_hard_link_keeps_the_file_touched() {
     let src = dir.path().join("src");
     let link = dir.path().join("link");
     std::fs::write(&src, b"durable").unwrap();
-    let fs = CrashFs::new(crate::fs::StdFs).tracking_directory_entries();
+    let fs = CrashFs::new(crate::fs::StdFs);
     fs.hard_link(&src, &link).unwrap();
     fs.sync_directory(dir.path()).unwrap();
 
@@ -340,7 +339,7 @@ fn renaming_over_a_hard_link_keeps_the_file_touched() {
     let link = dir.path().join("link");
     let other = dir.path().join("other");
     std::fs::write(&src, b"durable").unwrap();
-    let fs = CrashFs::new(crate::fs::StdFs).tracking_directory_entries();
+    let fs = CrashFs::new(crate::fs::StdFs);
     fs.hard_link(&src, &link).unwrap();
     let mut f = fs
         .open(&other, &FsOpenOptions::new().write(true).create(true))
@@ -378,7 +377,7 @@ fn a_hard_link_of_a_symlink_keeps_no_image_under_the_symlink() {
     let target = dir.path().join("target");
     let link = dir.path().join("link");
     let alias = dir.path().join("alias");
-    let fs = CrashFs::new(crate::fs::StdFs).tracking_directory_entries();
+    let fs = CrashFs::new(crate::fs::StdFs);
     let mut f = fs
         .open(&target, &FsOpenOptions::new().write(true).create(true))
         .unwrap();
@@ -407,8 +406,11 @@ fn a_hard_link_of_a_symlink_keeps_no_image_under_the_symlink() {
 #[test]
 fn a_write_follows_as_many_symlinks_as_linux_and_no_more() {
     let dir = tempfile::tempdir().unwrap();
+    // Resolved, so that a symlink above the temporary directory (`/var` on
+    // macOS) does not count towards the chain.
+    let base = std::fs::canonicalize(dir.path()).unwrap();
     let fs = CrashFs::new(crate::fs::StdFs);
-    let target = dir.path().join("target");
+    let target = base.join("target");
     // link{i} -> link{i+1}, the last of them -> target.
     let chain = |links: usize| -> std::path::PathBuf {
         for i in 0..links {
@@ -417,9 +419,9 @@ fn a_write_follows_as_many_symlinks_as_linux_and_no_more() {
             } else {
                 format!("link{}-{}", links, i + 1)
             };
-            std::os::unix::fs::symlink(next, dir.path().join(format!("link{links}-{i}"))).unwrap();
+            std::os::unix::fs::symlink(next, base.join(format!("link{links}-{i}"))).unwrap();
         }
-        dir.path().join(format!("link{links}-0"))
+        base.join(format!("link{links}-0"))
     };
 
     let at_the_limit = chain(MAX_SYMLINKS);
@@ -516,6 +518,191 @@ fn a_create_through_a_dangling_symlink_makes_its_target() {
     fs.sync_directory(dir.path()).unwrap();
     fs.crash();
     assert_eq!(read(&fs, target.to_str().unwrap()), b"data");
+}
+
+/// A write through a symlink is a write of the file it points to, in either
+/// mode: an unsynced write through the link is not taken for the baseline by
+/// a later write through the file's own name, and a crash rolls it back.
+#[cfg(unix)]
+#[test]
+fn a_write_through_a_symlink_is_a_write_of_its_target() {
+    for tracking in [false, true] {
+        let dir = tempfile::tempdir().unwrap();
+        let target = dir.path().join("target");
+        let link = dir.path().join("link");
+        std::fs::write(&target, b"v1").unwrap();
+        std::os::unix::fs::symlink("target", &link).unwrap();
+        let fs = CrashFs::new(crate::fs::StdFs);
+        let fs = if tracking {
+            fs.tracking_directory_entries()
+        } else {
+            fs
+        };
+
+        let mut f = fs
+            .open(&link, &FsOpenOptions::new().write(true).truncate(true))
+            .unwrap();
+        f.write_all(b"v2").unwrap();
+        drop(f);
+        let f = fs
+            .open(&target, &FsOpenOptions::new().write(true).append(true))
+            .unwrap();
+        drop(f);
+
+        fs.crash();
+        assert_eq!(
+            read(&fs, target.to_str().unwrap()),
+            b"v1",
+            "tracking: {tracking}"
+        );
+    }
+}
+
+/// A file named through a symlinked directory is the file named through the
+/// real one, in either mode: an entry made through either spelling is made
+/// durable by a sync of the directory under either, and an unsynced write
+/// through one is not taken for the baseline by a later write through the
+/// other.
+#[cfg(unix)]
+#[test]
+fn a_symlinked_directory_names_the_files_of_the_real_one() {
+    for tracking in [false, true] {
+        let dir = tempfile::tempdir().unwrap();
+        let base = std::fs::canonicalize(dir.path()).unwrap();
+        let real = base.join("real");
+        let alias = base.join("alias");
+        std::fs::create_dir(&real).unwrap();
+        std::os::unix::fs::symlink("real", &alias).unwrap();
+        std::fs::write(real.join("old"), b"v1").unwrap();
+        let fs = CrashFs::new(crate::fs::StdFs);
+        let fs = if tracking {
+            fs.tracking_directory_entries()
+        } else {
+            fs
+        };
+
+        let mut f = fs
+            .open(
+                &alias.join("new"),
+                &FsOpenOptions::new().write(true).create(true),
+            )
+            .unwrap();
+        f.write_all(b"data").unwrap();
+        f.sync_all().unwrap();
+        drop(f);
+        fs.sync_directory(&real).unwrap();
+
+        let mut f = fs
+            .open(
+                &alias.join("old"),
+                &FsOpenOptions::new().write(true).truncate(true),
+            )
+            .unwrap();
+        f.write_all(b"v2").unwrap();
+        drop(f);
+        let f = fs
+            .open(
+                &real.join("old"),
+                &FsOpenOptions::new().write(true).append(true),
+            )
+            .unwrap();
+        drop(f);
+        assert_eq!(
+            fs.state
+                .lock()
+                .durable
+                .get(&real.join("old"))
+                .map(Vec::as_slice),
+            Some(&b"v1"[..]),
+            "the unsynced write through the symlinked directory is not a baseline (tracking: {tracking})"
+        );
+
+        fs.crash();
+        assert_eq!(read(&fs, real.join("new").to_str().unwrap()), b"data");
+        assert_eq!(read(&fs, real.join("old").to_str().unwrap()), b"v1");
+    }
+}
+
+/// A path through `..` names the file the backend resolves it to, in either
+/// mode: an entry made as `sub/../d/f` is the entry `d/f`, made durable by a
+/// sync of `d`, and a sync through that spelling is durable under every hard
+/// link of the file.
+#[cfg(unix)]
+#[test]
+fn a_dot_dot_spelling_names_the_file_it_resolves_to() {
+    for tracking in [false, true] {
+        let dir = tempfile::tempdir().unwrap();
+        let base = std::fs::canonicalize(dir.path()).unwrap();
+        let d = base.join("d");
+        let sub = base.join("sub");
+        std::fs::create_dir(&d).unwrap();
+        std::fs::create_dir(&sub).unwrap();
+        let fs = CrashFs::new(crate::fs::StdFs);
+        let fs = if tracking {
+            fs.tracking_directory_entries()
+        } else {
+            fs
+        };
+
+        let mut f = fs
+            .open(
+                &sub.join("../d/f"),
+                &FsOpenOptions::new().write(true).create(true),
+            )
+            .unwrap();
+        f.write_all(b"v1").unwrap();
+        f.sync_all().unwrap();
+        drop(f);
+        fs.hard_link(&d.join("f"), &d.join("link")).unwrap();
+        fs.sync_directory(&d).unwrap();
+
+        let mut f = fs
+            .open(
+                &sub.join("../d/f"),
+                &FsOpenOptions::new().write(true).truncate(true),
+            )
+            .unwrap();
+        f.write_all(b"v2").unwrap();
+        f.sync_all().unwrap();
+        drop(f);
+        assert_eq!(
+            fs.state
+                .lock()
+                .durable
+                .get(&d.join("link"))
+                .map(Vec::as_slice),
+            Some(&b"v2"[..]),
+            "a sync through another spelling is durable under the hard link (tracking: {tracking})"
+        );
+
+        fs.crash();
+        assert_eq!(read(&fs, d.join("f").to_str().unwrap()), b"v2");
+        assert_eq!(read(&fs, d.join("link").to_str().unwrap()), b"v2");
+    }
+}
+
+/// A backend that does not resolve `..` keeps a name through it as a name of
+/// its own: `MemFs` holds `/d/../a` apart from `/a`, so the simulator tracks
+/// it under that spelling and a crash makes no file at `/a`.
+#[test]
+fn a_dot_dot_name_stays_literal_on_a_backend_that_keeps_it() {
+    let fs = CrashFs::new(MemFs::new()).tracking_directory_entries();
+    fs.create_dir_all(Path::new("/d/..")).unwrap();
+
+    let mut f = fs
+        .open(
+            Path::new("/d/../a"),
+            &FsOpenOptions::new().write(true).create(true),
+        )
+        .unwrap();
+    f.write_all(b"data").unwrap();
+    f.sync_all().unwrap();
+    drop(f);
+    fs.sync_directory(Path::new("/d/..")).unwrap();
+
+    fs.crash();
+    assert_eq!(read(&fs, "/d/../a"), b"data");
+    assert!(!fs.exists(Path::new("/a")).unwrap());
 }
 
 /// A fault layer composes above the simulator, so the probes the simulator
