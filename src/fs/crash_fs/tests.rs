@@ -275,6 +275,31 @@ fn a_sync_through_one_hard_link_is_durable_through_the_other() {
     assert_eq!(read(&fs, src.to_str().unwrap()), b"v2");
 }
 
+/// A pre-existing file linked to a new name keeps its durable bytes under its
+/// own name: a write through it that is never synced is rolled back on a
+/// crash, not taken for a new file and removed.
+#[cfg(unix)]
+#[test]
+fn a_linked_pre_existing_file_keeps_its_durable_bytes() {
+    let dir = tempfile::tempdir().unwrap();
+    let src = dir.path().join("src");
+    let link = dir.path().join("link");
+    std::fs::write(&src, b"durable").unwrap();
+    let fs = CrashFs::new(crate::fs::StdFs);
+    fs.hard_link(&src, &link).unwrap();
+    fs.sync_directory(dir.path()).unwrap();
+
+    let mut f = fs
+        .open(&src, &FsOpenOptions::new().write(true).truncate(true))
+        .unwrap();
+    f.write_all(b"unsynced").unwrap();
+    drop(f);
+
+    fs.crash();
+    assert_eq!(read(&fs, src.to_str().unwrap()), b"durable");
+    assert_eq!(read(&fs, link.to_str().unwrap()), b"durable");
+}
+
 /// An open that creates through a dangling symlink makes the symlink's
 /// target, not the symlink: the target is the new entry, lost on a crash
 /// before its directory is synced, and the symlink, already durable, stays.
