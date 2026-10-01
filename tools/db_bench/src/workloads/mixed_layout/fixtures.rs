@@ -386,7 +386,7 @@ pub fn mixed_sizes(
 /// switched off and a third of the keys are rewritten, so the newest version
 /// of those keys lives in a row-major run above a columnar one. A read has to
 /// resolve across both representations, which is the shape a projected scan
-/// has to handle and today refuses.
+/// merges.
 pub fn columnar_base_row_updates(
     config: &BenchConfig,
     seqno: &AtomicU64,
