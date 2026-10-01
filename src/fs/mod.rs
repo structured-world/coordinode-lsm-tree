@@ -640,6 +640,19 @@ pub trait FsFile: Read + Write + Seek + Send + Sync {
     }
 }
 
+/// Asks `file` to start writing back `len` bytes at `offset` for a writer that
+/// writes back every `writeback_bytes`. The request is a hint: a refusal turns
+/// writeback off for the file (`*writeback_bytes = 0`) instead of failing the
+/// write, since the file's final sync still writes it and reports a failed
+/// write. On Linux `sync_file_range` without `SYNC_FILE_RANGE_WAIT_AFTER` does
+/// not consume the file's writeback error, so that sync still sees it.
+pub(crate) fn hint_writeback(file: &dyn FsFile, offset: u64, len: u64, writeback_bytes: &mut u64) {
+    if let Err(error) = file.start_writeback(offset, len) {
+        log::warn!("writeback hint refused, the file is written back by its final sync: {error}");
+        *writeback_bytes = 0;
+    }
+}
+
 /// One block-read request for [`Fs::read_blocks_batched`]: fill `buf` with
 /// `buf.len()` bytes from `file` at `offset`.
 ///

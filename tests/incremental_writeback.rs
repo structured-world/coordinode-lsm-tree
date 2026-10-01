@@ -109,6 +109,92 @@ fn a_tables_final_sections_are_written_back_as_they_are_written() -> lsm_tree::R
     Ok(())
 }
 
+/// The top-level index mirror a table writes near its end can itself exceed a
+/// step on a large partitioned index; it is written back before the closing
+/// sections, not left to the final sync with them.
+#[test]
+fn a_large_index_mirror_is_written_back_before_the_final_sync() -> lsm_tree::Result<()> {
+    use lsm_tree::config::{BlockSizePolicy, PinningPolicy};
+
+    let fs = FaultFs::new(MemFs::new());
+    let injector = fs.injector();
+    let fs: Arc<dyn Fs> = Arc::new(fs);
+    let tree = Config::new(
+        "/db",
+        SequenceNumberCounter::default(),
+        SequenceNumberCounter::default(),
+    )
+    .with_shared_fs(Arc::clone(&fs))
+    .writeback_bytes(STEP)
+    .data_block_size_policy(BlockSizePolicy::all(64))
+    .index_block_partitioning_policy(PinningPolicy::all(true))
+    .index_block_partition_size_policy(BlockSizePolicy::all(64))
+    .open()?;
+    for key in 0..20_000u32 {
+        tree.insert(format!("{key:06}"), b"v", u64::from(key));
+    }
+    tree.flush_active_memtable(0)?;
+
+    let table = fs
+        .read_dir(std::path::Path::new("/db/tables"))?
+        .into_iter()
+        .find(|entry| !entry.is_dir)
+        .expect("the flush wrote a table");
+    let size = fs.metadata(&table.path)?.len;
+    let ranges = injector.writebacks_for("tables");
+    let handed = ranges.last().map_or(0, |&(offset, len)| offset + len);
+    let tail = size - handed;
+    assert!(
+        tail <= 4 * STEP,
+        "{tail} of {size} bytes left to the final sync: {ranges:?}"
+    );
+    Ok(())
+}
+
+/// A writeback is a hint: the final sync still makes the file durable and
+/// reports a failed write. A backend that refuses the hint must not fail the
+/// flush, and a file whose hint was refused is not asked again.
+#[test]
+fn a_refused_writeback_neither_fails_the_flush_nor_is_asked_again() -> lsm_tree::Result<()> {
+    use lsm_tree::fs::{Fault, FaultOp, FaultRule};
+    use lsm_tree::io::ErrorKind;
+
+    let fs = FaultFs::new(MemFs::new());
+    let injector = fs.injector();
+    injector.arm(FaultRule::new(
+        FaultOp::StartWriteback,
+        Fault::Error(ErrorKind::Unsupported),
+    ));
+    let tree = Config::new(
+        "/db",
+        SequenceNumberCounter::default(),
+        SequenceNumberCounter::default(),
+    )
+    .with_shared_fs(Arc::new(fs) as Arc<dyn Fs>)
+    .writeback_bytes(STEP)
+    .with_kv_separation(Some(KvSeparationOptions::default().separation_threshold(1)))
+    .open()?;
+    for key in 0..2_000u32 {
+        tree.insert(format!("{key:06}"), vec![b'v'; 100], u64::from(key));
+    }
+    tree.flush_active_memtable(0)?;
+    assert_eq!(
+        tree.get("001999", u64::MAX)?.as_deref(),
+        Some(&[b'v'; 100][..])
+    );
+    assert_eq!(
+        injector.writebacks_for("tables").len(),
+        1,
+        "one table, asked once"
+    );
+    assert_eq!(
+        injector.writebacks_for("blobs").len(),
+        1,
+        "one blob file, asked once"
+    );
+    Ok(())
+}
+
 #[test]
 fn a_zero_step_starts_no_writeback() -> lsm_tree::Result<()> {
     let injector = flushed(|config| {

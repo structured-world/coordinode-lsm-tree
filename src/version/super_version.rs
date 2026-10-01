@@ -76,10 +76,11 @@ fn same_device(fs: &dyn Fs, path: &Path, other_fs: &dyn Fs, other: &Path) -> boo
 }
 
 /// The sync mode the manifest edit from `prior` to `next` is persisted with.
-/// Under [`SyncMode::Barrier`] an edit that drops a table on another device
-/// than the manifest at `tree_path` is synced in full: the dropped file is
-/// removed once the edit is installed, and a barrier on the manifest's device
-/// would not keep that removal from reaching its own device first.
+/// Under [`SyncMode::Barrier`] an edit that drops a table or a blob file on
+/// another device than the manifest at `tree_path` is synced in full: the
+/// dropped file is removed once the edit is installed, and a barrier on the
+/// manifest's device would not keep that removal from reaching its own device
+/// first.
 fn manifest_sync_mode(
     prior: &Version,
     next: &Version,
@@ -90,15 +91,21 @@ fn manifest_sync_mode(
     if sync_mode != SyncMode::Barrier {
         return sync_mode;
     }
+    let elsewhere = |fs: &dyn Fs, path: &Path| {
+        path.parent()
+            .is_none_or(|folder| !same_device(fs, folder, manifest_fs, tree_path))
+    };
     let kept: crate::HashSet<crate::TableId> = next.iter_tables().map(crate::Table::id).collect();
-    let drops_elsewhere = prior.iter_tables().any(|table| {
-        !kept.contains(&table.id())
-            && table
-                .path
-                .parent()
-                .is_none_or(|folder| !same_device(&*table.fs, folder, manifest_fs, tree_path))
-    });
-    if drops_elsewhere {
+    let drops_table_elsewhere = prior
+        .iter_tables()
+        .any(|table| !kept.contains(&table.id()) && elsewhere(&*table.fs, &table.path));
+    let drops_blob_file_elsewhere = || {
+        prior.blob_files.iter().any(|blob_file| {
+            !next.blob_files.contains_key(blob_file.id())
+                && elsewhere(&*blob_file.0.fs, &blob_file.0.path)
+        })
+    };
+    if drops_table_elsewhere || drops_blob_file_elsewhere() {
         SyncMode::Full
     } else {
         sync_mode

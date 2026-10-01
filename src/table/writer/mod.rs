@@ -1877,9 +1877,12 @@ impl Writer {
         // The range is in the buffer until it is flushed to the file.
         let buffered = self.file_writer.get_mut().inner_mut();
         buffered.flush()?;
-        buffered
-            .get_ref()
-            .start_writeback(self.written_back, pending)?;
+        crate::fs::hint_writeback(
+            &**buffered.get_ref(),
+            self.written_back,
+            pending,
+            &mut self.writeback_bytes,
+        );
         self.written_back = *self.meta.file_pos;
         Ok(())
     }
@@ -3829,7 +3832,7 @@ impl Writer {
             start_section(
                 &mut self.file_writer,
                 &mut self.written_back,
-                self.writeback_bytes,
+                &mut self.writeback_bytes,
                 "block_layout",
             )?;
 
@@ -3874,7 +3877,7 @@ impl Writer {
             start_section(
                 &mut self.file_writer,
                 &mut self.written_back,
-                self.writeback_bytes,
+                &mut self.writeback_bytes,
                 "seqno_bounds",
             )?;
             self.block_buffer.clear();
@@ -3914,7 +3917,7 @@ impl Writer {
             start_section(
                 &mut self.file_writer,
                 &mut self.written_back,
-                self.writeback_bytes,
+                &mut self.writeback_bytes,
                 "zone_map",
             )?;
             self.block_buffer.clear();
@@ -3973,7 +3976,7 @@ impl Writer {
             start_section(
                 &mut self.file_writer,
                 &mut self.written_back,
-                self.writeback_bytes,
+                &mut self.writeback_bytes,
                 "delete_bitmap",
             )?;
             self.block_buffer.clear();
@@ -4015,7 +4018,7 @@ impl Writer {
             start_section(
                 &mut self.file_writer,
                 &mut self.written_back,
-                self.writeback_bytes,
+                &mut self.writeback_bytes,
                 "locator",
             )?;
             let at = next_block_at(self.table_id, &self.file_writer);
@@ -4052,7 +4055,7 @@ impl Writer {
             start_section(
                 &mut self.file_writer,
                 &mut self.written_back,
-                self.writeback_bytes,
+                &mut self.writeback_bytes,
                 "range_tombstones",
             )?;
 
@@ -4186,7 +4189,7 @@ impl Writer {
             start_section(
                 &mut self.file_writer,
                 &mut self.written_back,
-                self.writeback_bytes,
+                &mut self.writeback_bytes,
                 "linked_blob_files",
             )?;
 
@@ -4217,7 +4220,7 @@ impl Writer {
         start_section(
             &mut self.file_writer,
             &mut self.written_back,
-            self.writeback_bytes,
+            &mut self.writeback_bytes,
             "table_version",
         )?;
         self.file_writer.write_all(&[0x3])?;
@@ -4230,7 +4233,7 @@ impl Writer {
         start_section(
             &mut self.file_writer,
             &mut self.written_back,
-            self.writeback_bytes,
+            &mut self.writeback_bytes,
             "meta_separator",
         )?;
         self.file_writer.write_all(&[0u8; META_SEPARATOR_LEN])?;
@@ -4266,7 +4269,7 @@ impl Writer {
         start_section(
             &mut self.file_writer,
             &mut self.written_back,
-            self.writeback_bytes,
+            &mut self.writeback_bytes,
             "tli_tail",
         )?;
         let at = next_block_at(self.table_id, &self.file_writer);
@@ -4315,6 +4318,13 @@ impl Writer {
         // `file_pos` hasn't moved since (no intermediate write touches it), so
         // re-assigning is a no-op. Kept explicit for readability.
         meta_params.file_size = *self.meta.file_pos;
+        // The index mirror above can outgrow a writeback step on a large
+        // partitioned index; what follows it is a few KiB.
+        write_back_tail(
+            &mut self.file_writer,
+            &mut self.written_back,
+            &mut self.writeback_bytes,
+        )?;
         write_meta_section(
             &mut self.file_writer,
             &mut self.block_buffer,
@@ -4363,31 +4373,48 @@ impl Writer {
 }
 
 /// Starts the section `name` of a table's tail on `file_writer`, first
-/// writing back what was written since `written_back` once at least
-/// `writeback_bytes` gathered (`0` writes nothing back). Free-standing so
-/// `finish` can call it while it borrows other fields of the writer.
+/// writing back what was written before it ([`write_back_tail`]).
 fn start_section(
     file_writer: &mut crate::sfa::Writer<ChecksummedWriter<BufWriter<Box<dyn FsFile>>>>,
     written_back: &mut u64,
-    writeback_bytes: u64,
+    writeback_bytes: &mut u64,
     name: &str,
 ) -> crate::Result<()> {
-    if writeback_bytes > 0 {
+    write_back_tail(file_writer, written_back, writeback_bytes)?;
+    file_writer.start(name)?;
+    Ok(())
+}
+
+/// Writes back what a table's tail wrote on `file_writer` since `written_back`
+/// once at least `writeback_bytes` gathered (`0` writes nothing back).
+/// Free-standing so `finish` can call it while it borrows other fields of the
+/// writer.
+fn write_back_tail(
+    file_writer: &mut crate::sfa::Writer<ChecksummedWriter<BufWriter<Box<dyn FsFile>>>>,
+    written_back: &mut u64,
+    writeback_bytes: &mut u64,
+) -> crate::Result<()> {
+    if *writeback_bytes > 0 {
         #[cfg(not(feature = "std"))]
         use crate::io::Seek;
         #[cfg(feature = "std")]
         use std::io::Seek;
         let buffered = file_writer.get_mut().inner_mut();
-        // Flushes the buffer, as the section start below does anyway.
+        // Flushes the buffer, as the section start every call precedes does
+        // anyway.
         let position = buffered.stream_position()?;
         // `written_back` is a position the file already reached.
         let pending = position - *written_back;
-        if pending >= writeback_bytes {
-            buffered.get_ref().start_writeback(*written_back, pending)?;
+        if pending >= *writeback_bytes {
+            crate::fs::hint_writeback(
+                &**buffered.get_ref(),
+                *written_back,
+                pending,
+                writeback_bytes,
+            );
             *written_back = position;
         }
     }
-    file_writer.start(name)?;
     Ok(())
 }
 

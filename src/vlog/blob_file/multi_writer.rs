@@ -517,15 +517,7 @@ impl MultiWriter {
         // files follows: synced once here for every file the write made. The
         // manifest is in the folder above; on another device (a nested mount)
         // a barrier would not order this sync before it, so that is in full.
-        let mode = if self.sync_mode == SyncMode::Barrier
-            && self.folder.parent().is_none_or(|tree| {
-                let here = self.fs.volume_id(&self.folder);
-                here.is_none() || here != self.fs.volume_id(tree)
-            }) {
-            SyncMode::Full
-        } else {
-            self.sync_mode
-        };
+        let mode = crate::file::folder_sync_mode(&*self.fs, &self.folder, self.sync_mode);
         if !self.results.is_empty()
             && let Err(e) = crate::file::fsync_directory(&self.folder, &*self.fs, mode)
         {

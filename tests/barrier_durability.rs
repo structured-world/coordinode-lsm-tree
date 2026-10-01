@@ -72,16 +72,46 @@ fn surviving_prefix(main: &CrashFs, hot: Option<&CrashFs>, what: &str) -> lsm_tr
     Ok(prefix)
 }
 
-/// A backend reporting the `blobs` folder as a volume of its own, as a mount
-/// nested under the tree folder is, and recording the device flushes asked of
-/// it.
-struct NestedBlobsFs {
-    inner: CrashFs,
+/// A backend reporting the folder named `nested` as a volume of its own, as a
+/// mount nested under the tree folder is, and recording the device flushes
+/// asked of it.
+struct NestedFs {
+    inner: Arc<dyn Fs>,
+    nested: &'static str,
     flushed: std::sync::Mutex<Vec<PathBuf>>,
     dir_syncs: std::sync::Mutex<Vec<(PathBuf, SyncMode)>>,
 }
 
-impl Fs for NestedBlobsFs {
+impl NestedFs {
+    fn new(inner: Arc<dyn Fs>, nested: &'static str) -> Arc<Self> {
+        Arc::new(Self {
+            inner,
+            nested,
+            flushed: std::sync::Mutex::default(),
+            dir_syncs: std::sync::Mutex::default(),
+        })
+    }
+
+    fn flushed(&self) -> Vec<PathBuf> {
+        self.flushed
+            .lock()
+            .unwrap_or_else(std::sync::PoisonError::into_inner)
+            .clone()
+    }
+
+    /// The modes the nested folder was synced with.
+    fn nested_dir_syncs(&self) -> Vec<SyncMode> {
+        self.dir_syncs
+            .lock()
+            .unwrap_or_else(std::sync::PoisonError::into_inner)
+            .iter()
+            .filter(|(path, _)| path.ends_with(self.nested))
+            .map(|&(_, mode)| mode)
+            .collect()
+    }
+}
+
+impl Fs for NestedFs {
     fn open(
         &self,
         path: &std::path::Path,
@@ -128,7 +158,7 @@ impl Fs for NestedBlobsFs {
         self.inner.exists(path)
     }
     fn volume_id(&self, path: &std::path::Path) -> Option<u64> {
-        Some(u64::from(path.ends_with("blobs")))
+        Some(u64::from(path.ends_with(self.nested)))
     }
     fn sync_device(&self, path: &std::path::Path) -> lsm_tree::io::Result<()> {
         self.flushed
@@ -144,11 +174,7 @@ impl Fs for NestedBlobsFs {
 /// `sync_devices` returns.
 #[test]
 fn sync_devices_flushes_the_volume_of_the_blobs_folder() -> lsm_tree::Result<()> {
-    let fs = Arc::new(NestedBlobsFs {
-        inner: CrashFs::new(MemFs::new()),
-        flushed: std::sync::Mutex::default(),
-        dir_syncs: std::sync::Mutex::default(),
-    });
+    let fs = NestedFs::new(Arc::new(CrashFs::new(MemFs::new())), "blobs");
     let base = base();
     let tree = Config::new(
         &base,
@@ -170,31 +196,92 @@ fn sync_devices_flushes_the_volume_of_the_blobs_folder() -> lsm_tree::Result<()>
     tree.flush_active_memtable(0)?;
     tree.sync_devices()?;
 
-    let flushed = fs
-        .flushed
-        .lock()
-        .unwrap_or_else(std::sync::PoisonError::into_inner)
-        .clone();
+    let flushed = fs.flushed();
     assert!(
         flushed.iter().any(|path| path.ends_with("blobs")),
         "the blobs volume was not flushed: {flushed:?}"
     );
     // The manifest above is on another volume, so the blob files' folder is
     // synced in full rather than ordered by a barrier it would not respect.
-    let dir_syncs = fs
-        .dir_syncs
-        .lock()
-        .unwrap_or_else(std::sync::PoisonError::into_inner)
-        .clone();
-    let blob_folder_modes: Vec<SyncMode> = dir_syncs
-        .iter()
-        .filter(|(path, _)| path.ends_with("blobs"))
-        .map(|&(_, mode)| mode)
-        .collect();
+    let modes = fs.nested_dir_syncs();
     assert!(
-        !blob_folder_modes.is_empty()
-            && blob_folder_modes.iter().all(|&mode| mode == SyncMode::Full),
-        "the blobs folder on its own volume is synced in full: {dir_syncs:?}"
+        !modes.is_empty() && modes.iter().all(|&mode| mode == SyncMode::Full),
+        "the blobs folder on its own volume is synced in full: {modes:?}"
+    );
+    Ok(())
+}
+
+/// A tree whose `dicts` folder is on another volume than the tree folder
+/// syncs that folder in full when it registers a dictionary, since the
+/// version edit naming it is on the volume above, and flushes that volume in
+/// `sync_devices`: the tables written against the dictionary are readable once
+/// it returns.
+#[cfg(feature = "zstd")]
+#[test]
+fn a_dictionary_on_another_volume_is_durable_once_the_devices_are_flushed() -> lsm_tree::Result<()>
+{
+    let fs = NestedFs::new(Arc::new(CrashFs::new(MemFs::new())), "dicts");
+    let lsm_tree::AnyTree::Standard(tree) = Config::new(
+        base(),
+        SequenceNumberCounter::default(),
+        SequenceNumberCounter::default(),
+    )
+    .with_shared_fs(Arc::clone(&fs) as Arc<dyn Fs>)
+    .sync_mode(SyncMode::Barrier)
+    .open()?
+    else {
+        panic!("a standard tree");
+    };
+    let dict = lsm_tree::ZstdDictionary::new(&b"a dictionary for the nested volume".repeat(40));
+    tree.register_zstd_dictionary(Arc::new(dict))?;
+    tree.sync_devices()?;
+
+    let modes = fs.nested_dir_syncs();
+    assert!(
+        !modes.is_empty() && modes.iter().all(|&mode| mode == SyncMode::Full),
+        "the dicts folder on its own volume is synced in full: {modes:?}"
+    );
+    let flushed = fs.flushed();
+    assert!(
+        flushed.iter().any(|path| path.ends_with("dicts")),
+        "the dicts volume was not flushed: {flushed:?}"
+    );
+    Ok(())
+}
+
+/// An install that drops a blob file on another volume than the manifest
+/// syncs its manifest edit in full: the blob file is removed once the edit is
+/// installed, and a barrier on the manifest's volume would not keep that
+/// removal from reaching the blobs volume first.
+#[test]
+fn an_edit_dropping_a_blob_file_on_another_volume_is_synced_in_full() -> lsm_tree::Result<()> {
+    let recorder = lsm_tree::fs::FaultFs::new(MemFs::new());
+    let injector = recorder.injector();
+    let fs = NestedFs::new(Arc::new(recorder), "blobs");
+    let tree = Config::new(
+        base(),
+        SequenceNumberCounter::default(),
+        SequenceNumberCounter::default(),
+    )
+    .with_shared_fs(Arc::clone(&fs) as Arc<dyn Fs>)
+    .sync_mode(SyncMode::Barrier)
+    .with_kv_separation(Some(
+        lsm_tree::KvSeparationOptions::default().separation_threshold(1),
+    ))
+    .open()?;
+    tree.insert("key", "a blob value", 0);
+    tree.flush_active_memtable(0)?;
+    assert_eq!(tree.blob_file_count(), 1);
+
+    // The tables dropped with it lie on the manifest's volume; only the blob
+    // file is elsewhere.
+    tree.drop_range::<&[u8], _>(..)?;
+    assert_eq!(tree.blob_file_count(), 0, "the drop removed the blob file");
+    let edit_syncs = injector.sync_modes_for("edits-");
+    assert_eq!(
+        edit_syncs.last(),
+        Some(&SyncMode::Full),
+        "the edit dropping the blob file: {edit_syncs:?}"
     );
     Ok(())
 }

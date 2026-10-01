@@ -122,6 +122,9 @@ pub enum FaultOp {
     /// strategy the filesystem admits, without depending on the host's
     /// reflink support. Matched against the DESTINATION path.
     Reflink,
+    /// [`FsFile::start_writeback`] — the writeback hint a writer gives as it
+    /// goes. Failing it models a backend or kernel that refuses the hint.
+    StartWriteback,
 }
 
 /// What a matched [`FaultRule`] does to the operation.
@@ -791,6 +794,12 @@ impl FsFile for FaultFile {
             .writeback_log
             .lock()
             .push((self.path.clone(), offset, len));
+        if let Some(Fault::Error(kind)) = self
+            .injector
+            .check(FaultOp::StartWriteback, Some(&self.path))
+        {
+            return Err(fault_error(kind, FaultOp::StartWriteback));
+        }
         self.inner.start_writeback(offset, len)
     }
 }

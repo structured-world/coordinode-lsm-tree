@@ -266,9 +266,12 @@ impl Writer {
         // The range is in the buffer until it is flushed to the file.
         let buffered = self.writer.get_mut().inner_mut();
         buffered.flush()?;
-        buffered
-            .get_ref()
-            .start_writeback(self.written_back, pending)?;
+        crate::fs::hint_writeback(
+            &**buffered.get_ref(),
+            self.written_back,
+            pending,
+            &mut self.writeback_bytes,
+        );
         self.written_back = self.offset;
         Ok(())
     }

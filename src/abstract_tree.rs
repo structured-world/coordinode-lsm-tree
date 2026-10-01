@@ -506,8 +506,8 @@ pub trait AbstractTree: sealed::Sealed {
     }
 
     /// Makes durable everything this tree synced on each device it lies on:
-    /// the tree folder's, that of every level's tables and, with KV
-    /// separation, that of the blobs folder.
+    /// the tree folder's, that of every level's tables, that of the
+    /// dictionaries folder and, with KV separation, that of the blobs folder.
     ///
     /// Under [`SyncMode::Barrier`](crate::fs::SyncMode::Barrier) a
     /// [`flush_active_memtable`](Self::flush_active_memtable) that returns `Ok`
@@ -533,9 +533,19 @@ pub trait AbstractTree: sealed::Sealed {
                 config.path.join(crate::file::BLOBS_FOLDER),
             )
         });
+        // So may the dictionaries folder, which the tables written against a
+        // dictionary need to be read.
+        #[cfg(zstd_any)]
+        let dicts = Some((
+            Arc::clone(&config.fs),
+            config.path.join(crate::file::DICTS_FOLDER),
+        ));
+        #[cfg(not(zstd_any))]
+        let dicts: Option<(Arc<dyn crate::fs::Fs>, crate::path::PathBuf)> = None;
         for (fs, path) in core::iter::once((Arc::clone(&config.fs), config.path.clone()))
             .chain(levels)
             .chain(blobs)
+            .chain(dicts)
         {
             // One flush per device: a folder on a device already flushed
             // gains nothing from another.

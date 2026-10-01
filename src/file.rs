@@ -511,6 +511,26 @@ pub fn fsync_directory(path: &Path, fs: &dyn Fs, mode: SyncMode) -> crate::io::R
     fs.sync_directory_with(path, mode)
 }
 
+/// The mode of the last sync of `folder` before an edit above names its files.
+///
+/// Under [`SyncMode::Barrier`] a `folder` not
+/// provably on the device of the one above (a nested mount) is synced in full:
+/// a barrier orders writes on its own device only, so the edit could otherwise
+/// outlive the files it names.
+#[must_use]
+pub fn folder_sync_mode(fs: &dyn Fs, folder: &Path, sync_mode: SyncMode) -> SyncMode {
+    if sync_mode == SyncMode::Barrier
+        && folder.parent().is_none_or(|above| {
+            let here = fs.volume_id(folder);
+            here.is_none() || here != fs.volume_id(above)
+        })
+    {
+        SyncMode::Full
+    } else {
+        sync_mode
+    }
+}
+
 /// The directory holding `path`'s entry.
 ///
 /// Its parent, or `.`, the name every backend accepts for the current
