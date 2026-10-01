@@ -503,12 +503,13 @@ pub fn conform(batch: ColumnBatch, fields: &[ProjectedField]) -> crate::Result<C
 /// that is shadowed, deleted or filtered out never fails the scan.
 ///
 /// A column stored under another type than its field declares reads as null
-/// here, and the batch is reported mistyped: a row of it the scan returns
-/// fails it with [`MISTYPED`], one shadowed or filtered out does not.
+/// here, and its id is returned: a row of the batch the scan returns fails it
+/// with [`MISTYPED`], one shadowed or filtered out does not. A predicate over
+/// such a column cannot judge the rows, so none of them is filtered out by it.
 pub fn conform_lenient(
     batch: ColumnBatch,
     fields: &[ProjectedField],
-) -> crate::Result<(ColumnBatch, bool)> {
+) -> crate::Result<(ColumnBatch, Vec<u16>)> {
     conform_with(batch, fields, false)
 }
 
@@ -517,13 +518,13 @@ pub const MISTYPED: Error =
     Error::Projection("projection: a segment stores a projected field under another type");
 
 /// [`conform`], holding the rows that are values to [`Absent::Error`] and a
-/// mistyped column to [`MISTYPED`] only when `strict`; also returns whether a
-/// column was mistyped.
+/// mistyped column to [`MISTYPED`] only when `strict`; also returns the ids
+/// of the columns that were mistyped.
 fn conform_with(
     batch: ColumnBatch,
     fields: &[ProjectedField],
     strict: bool,
-) -> crate::Result<(ColumnBatch, bool)> {
+) -> crate::Result<(ColumnBatch, Vec<u16>)> {
     let ColumnBatch {
         row_count,
         mut columns,
@@ -541,7 +542,7 @@ fn conform_with(
                     .is_some_and(returns_a_value)
             })
     };
-    let mut mistyped = false;
+    let mut mistyped = Vec::new();
     let mut out = Vec::with_capacity(fields.len().max(columns.len()));
     for field in fields {
         let at = columns.iter().position(|c| c.column_id == field.column_id);
@@ -554,7 +555,7 @@ fn conform_with(
                     }
                     // Null under the declared type, so the batch agrees with
                     // the other sources; its rows fail only if returned.
-                    mistyped = true;
+                    mistyped.push(field.column_id);
                     let null = ProjectedField {
                         absent: Absent::Null,
                         ..field.clone()

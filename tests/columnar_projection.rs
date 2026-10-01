@@ -1267,6 +1267,57 @@ fn a_raw_value_the_predicate_drops_is_not_projected() -> lsm_tree::Result<()> {
     Ok(())
 }
 
+/// A predicate over the raw value judges the plain values of a batch before
+/// the projector reads them even when an operand of the same batch is still
+/// to be resolved: only the operand waits, and is returned unjudged, since
+/// its raw cell is the operand's own.
+#[test]
+fn a_raw_value_beside_an_operand_the_predicate_drops_is_not_projected() -> lsm_tree::Result<()> {
+    use lsm_tree::table::columnar::COL_VALUE;
+    use lsm_tree::table::columnar_predicate::{
+        ColumnRangePredicate, PredicateApply, PredicateSupport,
+    };
+
+    let folder = get_tmp_folder();
+    let any = Config::new(
+        folder.path(),
+        SequenceNumberCounter::default(),
+        SequenceNumberCounter::default(),
+    )
+    .with_merge_operator(Some(std::sync::Arc::new(AddToFourth)))
+    .open()?;
+    standard(&any).update_runtime_config(|cfg| cfg.columnar = true)?;
+    let tree = standard(&any);
+    tree.insert(key(0), row_value(10, 40), 0);
+    tree.insert(key(1), REFUSED.to_vec(), 1);
+    tree.merge(key(2), 2u32.to_le_bytes(), 2);
+    let wanted = row_value(10, 40);
+    let predicate = ColumnRangePredicate {
+        column_id: COL_VALUE,
+        lower: Some(wanted.clone()),
+        upper: Some(wanted),
+        apply: PredicateApply::Filter,
+    };
+    let projection = Projection::new()
+        .column(COL_USER_KEY)
+        .field(field(4, Absent::Null))
+        .projector(std::sync::Arc::new(RefusesMarked));
+    let mut scan = tree.columnar_scan(&projection, Some(&predicate), SeqNo::MAX, ..)?;
+    let mut keys = Vec::new();
+    for batch in &mut scan {
+        let batch = batch?;
+        for row in 0..batch.row_count {
+            keys.push(bytes_cell(&batch.columns[0].data, batch.row_count, row));
+        }
+    }
+    assert_eq!(
+        Some(PredicateSupport::Unsupported),
+        scan.predicate_support()
+    );
+    assert_eq!(vec![key(0), key(2)], keys);
+    Ok(())
+}
+
 /// A value [`RefusesMarked`] fails on.
 const REFUSED: &[u8] = b"refused";
 
@@ -1552,6 +1603,47 @@ fn a_column_id_projected_twice_is_refused() {
 
 /// A segment that stores a declared field under another type is refused, not
 /// misread.
+#[test]
+fn a_predicate_over_a_field_stored_under_another_type_fails_the_scan() {
+    use lsm_tree::table::columnar_predicate::{ColumnRangePredicate, PredicateApply};
+
+    // A row whose field is stored under another type cannot be judged by a
+    // predicate over that field: it fails the scan as a returned row would,
+    // instead of reading as a null the predicate drops. On a segment read on
+    // its own, and on segments merged together, for each type a predicate
+    // judges.
+    for declared in [
+        TypeTag::Bytes,
+        TypeTag::Number(lsm_tree::table::columnar::Number::U64_LE),
+    ] {
+        for merged in [false, true] {
+            let folder = get_tmp_folder();
+            let any = open_columnar(folder.path());
+            ingest(&any, &[0], &[(4, &[40])]);
+            if merged {
+                ingest(&any, &[0, 1], &[(4, &[40, 41])]);
+            }
+            let projection = Projection::new()
+                .column(COL_USER_KEY)
+                .field(ProjectedField::new(4, declared, Absent::Null).expect("field"));
+            let wanted = 40u64.to_le_bytes().to_vec();
+            let predicate = ColumnRangePredicate {
+                column_id: 4,
+                lower: Some(wanted.clone()),
+                upper: Some(wanted),
+                apply: PredicateApply::Filter,
+            };
+            let got = standard(&any)
+                .columnar_scan(&projection, Some(&predicate), SeqNo::MAX, ..)
+                .and_then(|scan| scan.collect::<lsm_tree::Result<Vec<_>>>());
+            assert!(
+                matches!(got, Err(Error::Projection(_))),
+                "declared {declared:?}, merged: {merged}, got {got:?}"
+            );
+        }
+    }
+}
+
 #[test]
 fn a_field_stored_under_another_type_fails_the_scan() {
     let folder = get_tmp_folder();

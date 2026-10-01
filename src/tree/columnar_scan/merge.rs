@@ -21,6 +21,7 @@
 
 use alloc::vec::Vec;
 
+use super::PredicateTiming;
 use super::projection::{MISTYPED, ProjectedField, conform, conform_lenient};
 use super::rows::SourceCursor;
 use super::{ColumnarScan, Segment, SegmentCursor, drop_columns, key_in_bounds};
@@ -83,6 +84,10 @@ enum FieldTypes {
     /// One under another type: a row of the batch the scan returns fails the
     /// scan, one shadowed or filtered out does not.
     Mistyped,
+    /// The predicate's own column under another type: the predicate cannot
+    /// judge a row of the batch, so a row chosen from it fails the scan as a
+    /// returned one would.
+    MistypedUnderPredicate,
 }
 
 impl MergeSource {
@@ -136,6 +141,8 @@ pub(super) struct MergeStream {
     late: bool,
     /// Whether the raw value stays beside the whole value a source carries.
     raw: RawValue,
+    /// The column the scan's predicate runs on, if it has one.
+    predicate_column: Option<u16>,
     /// Whether a segment of the group records deletions, so the value type is
     /// decoded.
     deletes: bool,
@@ -251,6 +258,7 @@ impl MergeStream {
             } else {
                 RawValue::Moved
             },
+            predicate_column: scan.predicate.as_ref().map(|p| p.column_id),
             deletes,
             rts,
             last_key: None,
@@ -410,7 +418,8 @@ impl MergeStream {
         cmp: &dyn crate::comparator::UserComparator,
     ) -> crate::Result<(Position, Option<u64>)> {
         let last_key = self.last_key.as_deref();
-        let (fields, late, raw) = (&self.fields, self.late, self.raw);
+        let (fields, late, raw, predicate_column) =
+            (&self.fields, self.late, self.raw, self.predicate_column);
         let Some(source) = self.sources.get_mut(i) else {
             return Ok((Position::Exhausted, None));
         };
@@ -491,10 +500,12 @@ impl MergeStream {
                     source.key_col = place(COL_USER_KEY)?;
                     source.seqno_col = place(COL_SEQNO)?;
                     source.batch = Some(batch);
-                    source.types = if mistyped {
-                        FieldTypes::Mistyped
-                    } else {
+                    source.types = if mistyped.is_empty() {
                         FieldTypes::AsDeclared
+                    } else if predicate_column.is_some_and(|id| mistyped.contains(&id)) {
+                        FieldTypes::MistypedUnderPredicate
+                    } else {
+                        FieldTypes::Mistyped
                     };
                     source.row = 0;
                     let held = source.held_bytes();
@@ -533,12 +544,19 @@ impl MergeStream {
         //
         // Over a column reading the values does not change, it runs before
         // they are read, so a row it drops is never resolved or handed to the
-        // projector.
-        let early = judged && scan.predicate_precedes_values(&merged);
-        let merged = if early {
-            scan.filter_after_dedup(merged, scan.predicate.as_ref(), support)?
+        // projector; an operand still to be resolved is judged after.
+        let timing = if judged {
+            scan.predicate_timing(&merged)
         } else {
-            merged
+            PredicateTiming::AfterValues
+        };
+        let early = timing == PredicateTiming::BeforeValues;
+        let merged = match timing {
+            PredicateTiming::BeforeValues => {
+                scan.filter_after_dedup(merged, scan.predicate.as_ref(), support)?
+            }
+            PredicateTiming::BeforeValuesExceptOperands => scan.filter_plain_rows(merged)?,
+            PredicateTiming::AfterValues => merged,
         };
         if merged.row_count == 0 {
             return Ok(None);
@@ -551,13 +569,35 @@ impl MergeStream {
             // Every declared column now holds its declared type: read out of
             // a value, or conformed when its source was loaded.
             let (merged, mistyped) = conform_lenient(merged, &scan.fields)?;
-            if mistyped {
+            if !mistyped.is_empty() {
                 return Err(MISTYPED);
             }
             (merged, resolved)
         } else {
             (merged, Resolved::default())
         };
+        // A row whose predicate column its batch stores under another type
+        // cannot be judged, unless its operand was resolved and the column
+        // read out of the merged value: it is not filtered out, so it fails
+        // the scan as a returned row of its batch would.
+        if pending
+            .iter()
+            .any(|pick| self.source_types(pick) == Some(FieldTypes::MistypedUnderPredicate))
+        {
+            let returned = self.returned_picks(&merged, &pending)?;
+            let keys = merged
+                .columns
+                .iter()
+                .find(|c| c.column_id == COL_USER_KEY)
+                .ok_or(MISSING_COLUMN)?;
+            for (row, pick) in (0..merged.row_count).zip(&returned) {
+                if self.source_types(pick) == Some(FieldTypes::MistypedUnderPredicate)
+                    && !resolved.holds(bytes_column_row(&keys.data, merged.row_count, row)?)
+                {
+                    return Err(MISTYPED);
+                }
+            }
+        }
         // An operand resolved to a value is read whole, so its cell in a
         // column no field declares is the operand's own: a loose predicate
         // cannot judge it.
@@ -647,9 +687,13 @@ impl MergeStream {
     /// Whether `pick` was taken from a batch that stores a projected field
     /// under another type than declared.
     fn taken_from_mistyped(&self, pick: &Pick) -> bool {
-        self.sources
-            .get(pick.source)
-            .is_some_and(|s| s.types == FieldTypes::Mistyped)
+        self.source_types(pick)
+            .is_some_and(|types| types != FieldTypes::AsDeclared)
+    }
+
+    /// How the batch `pick` was taken from stores the projected fields.
+    fn source_types(&self, pick: &Pick) -> Option<FieldTypes> {
+        self.sources.get(pick.source).map(|s| s.types)
     }
 
     /// Adds to `merged`, the rows returned out of the chosen `pending` ones,

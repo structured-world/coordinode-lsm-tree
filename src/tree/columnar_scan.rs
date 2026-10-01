@@ -299,9 +299,29 @@ impl Tree {
         // past every seqno the tree still holds, and a snapshot at or below the
         // floor is refused because it may need a version the compaction
         // collected. The cap never needs one: it lies above every seqno the
-        // tree holds, so it reads what the latest snapshot reads.
+        // version holds, so it reads what the latest snapshot reads. It is
+        // taken from that version, not the live tree: a compaction installed
+        // since may have dropped the newest seqno, and a cap below a version
+        // the pinned tables still hold would surface an older one.
         let super_version = self.get_version_for_snapshot(seqno)?;
-        let seqno = match crate::AbstractTree::get_highest_seqno(self) {
+        let highest = super_version
+            .active_memtable
+            .get_highest_seqno()
+            .max(
+                super_version
+                    .sealed_memtables
+                    .iter()
+                    .filter_map(|memtable| memtable.get_highest_seqno())
+                    .max(),
+            )
+            .max(
+                super_version
+                    .version
+                    .iter_tables()
+                    .map(crate::Table::get_highest_seqno)
+                    .max(),
+            );
+        let seqno = match highest {
             Some(highest) => highest
                 .checked_add(1)
                 .map_or(seqno, |next: SeqNo| seqno.min(next)),
@@ -671,16 +691,45 @@ const MISSING_BATCH_COLUMN: Error =
 /// Whether a row of `batch` is a merge operand; `false` for a batch without a
 /// value-type column.
 fn holds_operand(batch: &ColumnBatch) -> bool {
+    operand_rows(batch).into_iter().any(|operand| operand)
+}
+
+/// Whether each row of `batch` is a merge operand; none is when the batch
+/// carries no value type.
+fn operand_rows(batch: &ColumnBatch) -> Vec<bool> {
+    let rows = batch.row_count as usize;
     batch
         .columns
         .iter()
         .find(|c| c.column_id == COL_VALUE_TYPE)
-        .is_some_and(|types| {
-            types
-                .data
-                .iter()
-                .any(|&byte| crate::ValueType::try_from(byte) == Ok(crate::ValueType::MergeOperand))
-        })
+        .map_or_else(
+            || vec![false; rows],
+            |types| {
+                let mut operands: Vec<bool> = types
+                    .data
+                    .iter()
+                    .take(rows)
+                    .map(|&byte| {
+                        crate::ValueType::try_from(byte) == Ok(crate::ValueType::MergeOperand)
+                    })
+                    .collect();
+                operands.resize(rows, false);
+                operands
+            },
+        )
+}
+
+/// When a scan's predicate judges the rows the dedup decided: see
+/// [`ColumnarScan::predicate_timing`].
+#[derive(Clone, Copy, PartialEq, Eq)]
+pub(super) enum PredicateTiming {
+    /// Before the values are read, every row.
+    BeforeValues,
+    /// Before the values are read for the plain rows, after for the operands
+    /// still to be resolved.
+    BeforeValuesExceptOperands,
+    /// After the values are read.
+    AfterValues,
 }
 
 /// Drops from `batch` the columns decoded only for the scan's own use.
@@ -1138,10 +1187,30 @@ impl ColumnarScan {
                     Err(e) => return Some(Err(e)),
                 };
                 let SingletonStream { global, mode, .. } = &mut **singleton;
-                match self.shape_singleton_batch(batch, *global, mode, support) {
+                // A predicate over a column the batch stores under another
+                // type cannot judge its rows: it is set aside for this batch,
+                // so a row the dedup keeps fails the scan below.
+                let unjudged = match mode {
+                    SingletonMode::Dedup(state)
+                        if state
+                            .predicate
+                            .as_ref()
+                            .is_some_and(|p| mistyped.contains(&p.column_id)) =>
+                    {
+                        state.predicate.take()
+                    }
+                    _ => None,
+                };
+                let shaped = self.shape_singleton_batch(batch, *global, mode, support);
+                if let (Some(predicate), SingletonMode::Dedup(state)) = (unjudged, &mut *mode) {
+                    state.predicate = Some(predicate);
+                }
+                match shaped {
                     // A column's type is the batch's, so any row it returns
                     // stores the field under the other type.
-                    Ok(Some(_)) if mistyped => return Some(Err(projection::MISTYPED)),
+                    Ok(Some(_)) if !mistyped.is_empty() => {
+                        return Some(Err(projection::MISTYPED));
+                    }
                     // The rows returned are decided: each is held to the
                     // declarations.
                     Ok(Some(batch)) => return Some(projection::conform(batch, &self.fields)),
@@ -1202,33 +1271,59 @@ impl ColumnarScan {
                     .is_some_and(|p| p.column_id == COL_VALUE))
     }
 
-    /// Whether the scan's predicate judges the decided rows of `batch` before
-    /// their values are read: its column is one reading the values does not
-    /// change. The key and the seqno never change; a column no field
-    /// declares is the row's own physical cell, unless an operand of the
-    /// batch is still to be resolved into a value read whole. A declared
-    /// field is read out of the value, and resolving an operand rewrites the
-    /// value column and the value type, so a predicate over those runs after.
-    pub(super) fn predicate_precedes_values(&self, batch: &ColumnBatch) -> bool {
+    /// When the scan's predicate judges the decided rows of `batch`: before
+    /// their values are read where its column is one reading the values does
+    /// not change. The key and the seqno never change; a column no field
+    /// declares is the row's own physical cell, except on an operand still to
+    /// be resolved into a value read whole, which is judged after. A declared
+    /// field is read out of the value, so a predicate over one runs after.
+    pub(super) fn predicate_timing(&self, batch: &ColumnBatch) -> PredicateTiming {
         use crate::table::columnar::COL_SEQNO;
 
         let Some(pred) = &self.predicate else {
-            return false;
+            return PredicateTiming::AfterValues;
         };
         // The raw value and the value type are the row's own cells too: a
         // whole-value source keeps its raw value in place when the predicate
         // reads it, and only an operand still to be resolved rewrites them.
         match pred.column_id {
-            COL_USER_KEY | COL_SEQNO => true,
-            id => {
-                let declared = self
-                    .fields
-                    .iter()
-                    .any(|f| f.column_id() == id && projection::is_declared(f));
-                let unresolved = self.resolver.is_some() && holds_operand(batch);
-                !(declared || unresolved)
+            COL_USER_KEY | COL_SEQNO => PredicateTiming::BeforeValues,
+            id if self
+                .fields
+                .iter()
+                .any(|f| f.column_id() == id && projection::is_declared(f)) =>
+            {
+                PredicateTiming::AfterValues
             }
+            _ if self.resolver.is_some() && holds_operand(batch) => {
+                PredicateTiming::BeforeValuesExceptOperands
+            }
+            _ => PredicateTiming::BeforeValues,
         }
+    }
+
+    /// `batch` without the rows that are not merge operands and fail the
+    /// scan's filtering predicate: the plain rows it judges before their
+    /// values are read, the operands left to it after. How far it ran is
+    /// counted when it runs on every row.
+    pub(super) fn filter_plain_rows(&self, batch: ColumnBatch) -> crate::Result<ColumnBatch> {
+        let Some(pred) = self
+            .predicate
+            .as_ref()
+            .filter(|p| p.apply == PredicateApply::Filter)
+        else {
+            return Ok(batch);
+        };
+        let operands = operand_rows(&batch);
+        let mask: Vec<bool> = pred
+            .matching_rows(&batch)
+            .into_iter()
+            .zip(operands)
+            .map(|(matches, operand)| matches || operand)
+            .collect();
+        let filtered = filter_batch(&batch, &mask)?;
+        self.record_gather(&filtered);
+        Ok(filtered)
     }
 
     /// Applies the scan's predicate to `batch` after the dedup, when it filters,
