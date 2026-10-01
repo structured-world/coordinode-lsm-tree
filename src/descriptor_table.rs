@@ -51,6 +51,11 @@ impl DescriptorTable {
         self.inner.capacity()
     }
 
+    /// Closes every cached descriptor.
+    pub(crate) fn clear(&self) {
+        self.inner.clear();
+    }
+
     #[must_use]
     pub fn access_for_table(&self, id: &GlobalTableId) -> Option<Arc<dyn FsFile>> {
         let key = CacheKey(TAG_BLOCK, id.tree_id(), id.table_id());

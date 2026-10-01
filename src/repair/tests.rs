@@ -15389,6 +15389,53 @@ fn repair_propagates_a_permission_denied_open() -> crate::Result<()> {
     Ok(())
 }
 
+/// Running out of file descriptors fails every open after the limit, whatever
+/// the file holds. Graded unreadable, each of those intact tables would be
+/// left out of the rebuilt manifest; the repair has to stop and say why.
+#[test]
+fn repair_propagates_an_exhausted_descriptor_table() -> crate::Result<()> {
+    use crate::fs::{Fault, FaultFs, FaultOp, FaultRule, MemFs};
+    use crate::io::ErrorKind;
+    use crate::{Config, SequenceNumberCounter};
+    use std::sync::Arc;
+
+    let memfs = Arc::new(MemFs::new());
+    let root = std::path::absolute("/db")?;
+    standard_tree_without_manifest(&memfs, &root)?;
+
+    let fault = FaultFs::new((*memfs).clone());
+    fault.injector().arm(
+        FaultRule::new(FaultOp::Open, Fault::Error(ErrorKind::TooManyOpenFiles))
+            .on_path(root.join("tables").join("0").to_string_lossy()),
+    );
+    let result = Config::new(
+        &root,
+        SequenceNumberCounter::default(),
+        SequenceNumberCounter::default(),
+    )
+    .with_fs(fault)
+    .repair();
+    assert!(
+        matches!(result, Err(crate::Error::Io(ref e)) if e.kind() == ErrorKind::TooManyOpenFiles),
+        "descriptor exhaustion must abort the repair, never grade the file: {:?}",
+        result.map(|r| (r.recovered, r.unreadable)),
+    );
+
+    // With descriptors to spare, the retry recovers the intact file.
+    let report = Config::new(
+        &root,
+        SequenceNumberCounter::default(),
+        SequenceNumberCounter::default(),
+    )
+    .with_shared_fs(memfs)
+    .repair()?;
+    assert_eq!(
+        report.recovered, 1,
+        "the intact table survives the shortage"
+    );
+    Ok(())
+}
+
 /// A salvage replacement write failing with ENOSPC must abort the repair:
 /// the healthy SOURCE is not implicated by a full destination, and grading
 /// it unsalvageable would commit a manifest without it and then remove it —

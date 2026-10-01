@@ -332,6 +332,35 @@ fn errno_maps_to_expected_error_kinds() {
     assert_eq!(errno_to_kind(132), ErrorKind::Other); // unmapped
 }
 
+/// A failure of the environment rather than of the file (no descriptors, no
+/// memory, no space, a dropped network mount) must reach recovery grading as
+/// an environmental kind: read as `Other`, it condemns an intact table.
+#[test]
+fn environment_errnos_map_to_environmental_kinds() {
+    for (errno, kind) in [
+        (libc::ENOMEM, ErrorKind::OutOfMemory),
+        (libc::EMFILE, ErrorKind::TooManyOpenFiles),
+        (libc::ENFILE, ErrorKind::TooManyOpenFiles),
+        (libc::ENOSPC, ErrorKind::StorageFull),
+        (libc::EROFS, ErrorKind::ReadOnlyFilesystem),
+        (libc::EDQUOT, ErrorKind::QuotaExceeded),
+        (libc::EPIPE, ErrorKind::BrokenPipe),
+        (libc::ENETDOWN, ErrorKind::NetworkDown),
+        (libc::ENETUNREACH, ErrorKind::NetworkUnreachable),
+        (libc::ECONNABORTED, ErrorKind::ConnectionAborted),
+        (libc::ECONNRESET, ErrorKind::ConnectionReset),
+        (libc::ENOTCONN, ErrorKind::NotConnected),
+        (libc::ETIMEDOUT, ErrorKind::TimedOut),
+        (libc::ECONNREFUSED, ErrorKind::ConnectionRefused),
+        (libc::EHOSTUNREACH, ErrorKind::HostUnreachable),
+        (libc::ESTALE, ErrorKind::StaleNetworkFileHandle),
+    ] {
+        assert_eq!(errno_to_kind(errno), kind, "errno {errno}");
+        assert!(kind.is_environmental(), "{kind:?} for errno {errno}");
+    }
+    assert_eq!(errno_to_kind(libc::EXDEV), ErrorKind::CrossesDevices);
+}
+
 #[test]
 fn ring_setup_with_zero_entries_is_rejected() {
     // `io_uring_setup` rejects a zero-entry ring with EINVAL; this covers

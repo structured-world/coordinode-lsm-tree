@@ -548,6 +548,14 @@ where
         self.capacity
     }
 
+    /// Drops every entry, keeping each shard's capacity.
+    pub fn clear(&self) {
+        for shard in &self.shards {
+            let mut core = shard.0.write();
+            *core = ShardCore::new(core.capacity, core.ghost_capacity, self.hasher.clone());
+        }
+    }
+
     /// Number of resident entries across all shards (takes each shard's read
     /// lock; intended for diagnostics, not the hot path).
     pub fn len(&self) -> usize {

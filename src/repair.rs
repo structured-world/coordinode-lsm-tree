@@ -4018,13 +4018,19 @@ fn repair_tree(
     // needs it then fails like one whose dictionary was never supplied, which
     // aborts rather than drops it, so a re-run with the right dictionary still
     // recovers it.
+    let mut owned_config = config.clone();
     #[cfg(zstd_any)]
-    let (owned_config, damaged_dictionaries) = {
-        let mut owned = config.clone();
-        let damaged = owned.install_own_zstd_dictionaries_skipping_damaged()?;
-        (owned, damaged)
-    };
-    #[cfg(zstd_any)]
+    let damaged_dictionaries = owned_config.install_own_zstd_dictionaries_skipping_damaged()?;
+    // The scan opens every table it finds, so it keeps their files within a
+    // descriptor cache as an open tree does: holding one descriptor per table
+    // runs out of them on a tree of more tables than the process may open.
+    // Its own cache, closed before the post-commit swaps, so no descriptor of
+    // a file being replaced or removed outlives the scan.
+    owned_config.descriptor_table = config.descriptor_table.as_ref().map(|shared| {
+        Arc::new(crate::DescriptorTable::new(
+            usize::try_from(shared.capacity()).unwrap_or(usize::MAX),
+        ))
+    });
     let config = &owned_config;
 
     if let Some(p) = &config.recovery_progress {
@@ -4580,14 +4586,23 @@ fn scan_table_folders(
             // structural-failure salvage arm below recovers the intact blocks
             // (or records it unreadable with salvage off).
             let recovered = match own_digest {
-                Ok(digest) => Table::recover(repair_recover_params(
-                    config,
-                    table_path.clone(),
-                    digest,
-                    table_id,
-                    folder_fs.clone(),
-                    manifest_global_seqno,
-                )),
+                Ok(digest) => {
+                    let mut params = repair_recover_params(
+                        config,
+                        table_path.clone(),
+                        digest,
+                        table_id,
+                        folder_fs.clone(),
+                        manifest_global_seqno,
+                    );
+                    // Held until the rebuilt manifest is published, so its file
+                    // goes through the descriptor cache. A tree id of its own:
+                    // another copy of this table id, or its salvage replacement,
+                    // must never be handed this file's descriptor.
+                    params.tree_id = crate::tree::inner::get_next_tree_id();
+                    params.descriptor_table.clone_from(&config.descriptor_table);
+                    Table::recover(params)
+                }
                 Err(e) => Err(e),
             };
 
@@ -6540,6 +6555,12 @@ fn publish_repaired_manifest(
     // NOT best-effort: the manifest already names this content, so a swap that
     // does not happen is a tree whose next open finds the damaged file under the
     // manifest's checksum and fails.
+    //
+    // The scan's cached descriptors close first: a file still open cannot be
+    // replaced or removed on Windows, and nothing reads a scanned table again.
+    if let Some(descriptors) = &config.descriptor_table {
+        descriptors.clear();
+    }
     if post_commit_error.is_none() {
         for (fs, tmp_path, table_path, restricted) in swap_after_commit {
             if let Err(e) =
