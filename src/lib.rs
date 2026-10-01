@@ -552,7 +552,10 @@ pub use {
 };
 
 #[cfg(feature = "columnar")]
-pub use tree::columnar_scan::ColumnarScan;
+pub use tree::columnar_scan::{
+    ColumnarScan,
+    projection::{Absent, ProjectedField, ProjectedRow, Projection, ValueProjector},
+};
 
 #[cfg(zstd_any)]
 pub use compression::{ZstdDictionaries, ZstdDictionary};
