@@ -359,7 +359,7 @@ enum BloomResult {
 /// Where the filter a key is checked against lives (see
 /// [`Table::filter_source`]).
 pub(crate) enum FilterSource<'a> {
-    /// The table has no filter.
+    /// The table has no filter, or none it can consult.
     None,
     /// The table's whole filter, pinned in memory.
     Pinned(&'a FilterBlock),
@@ -367,8 +367,6 @@ pub(crate) enum FilterSource<'a> {
     Block(BlockHandle),
     /// The key sorts past the last filter partition.
     PastPartitions,
-    /// The filter is partitioned and its partition index is not pinned.
-    UnpinnedPartitions,
 }
 
 /// What a key check of a table's filters found (see
@@ -6598,9 +6596,6 @@ impl Table {
                 Self::answer_bloom(Some(&FilterBlock::new(block)), key_hash)
             }
             FilterSource::PastPartitions => Ok(BloomResult::PastPartitions),
-            FilterSource::UnpinnedPartitions => {
-                unimplemented!("unpinned filter TLI not supported")
-            }
         }
     }
 
@@ -6646,7 +6641,11 @@ impl Table {
                 None => FilterSource::PastPartitions,
             }
         } else if self.regions.filter_tli.is_some() {
-            FilterSource::UnpinnedPartitions
+            // Partitioned, yet its index is not loaded: a live open always
+            // loads it, so this is a salvage open that found it unreadable.
+            // Without the index no partition can be found, so no key is ruled
+            // out.
+            FilterSource::None
         } else if let Some(handle) = &self.regions.filter {
             FilterSource::Block(*handle)
         } else {

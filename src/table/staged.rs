@@ -28,8 +28,7 @@ pub enum StagedStart<'t> {
     /// empty, or the table lies above the snapshot.
     Nothing,
     /// The table is read serially: its blocks need the load path's own
-    /// recovery (Page-ECC) or reconstruction (columnar), or its filter
-    /// partitions are found only by reading their index.
+    /// recovery (Page-ECC) or reconstruction (columnar).
     Serial,
     /// The table is read in stages.
     Staged(StagedRead<'t>),
@@ -96,7 +95,6 @@ impl<'t> StagedRead<'t> {
         };
         for (key, _) in sorted_keys {
             match table.filter_source(key) {
-                FilterSource::UnpinnedPartitions => return StagedStart::Serial,
                 FilterSource::Block(handle) => read.want(handle, BlockType::Filter),
                 FilterSource::None | FilterSource::Pinned(_) | FilterSource::PastPartitions => {}
             }
@@ -226,7 +224,6 @@ impl<'t> StagedRead<'t> {
                     Table::answer_bloom(Some(&FilterBlock::new(block.clone())), hash)?
                 }
                 FilterSource::PastPartitions => super::BloomResult::PastPartitions,
-                FilterSource::UnpinnedPartitions => return Err(NOT_HELD),
             };
             Table::tally_bloom(&mut self.tally, &answer);
             if !answer.should_skip() {

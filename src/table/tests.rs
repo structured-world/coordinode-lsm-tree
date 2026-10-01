@@ -8127,6 +8127,15 @@ fn recover_salvage_degrades_a_persistent_filter_index_read() -> crate::Result<()
         recovered.salvage_degraded_a_rebuildable_section(),
         "the recovered table must report the degraded rebuildable section",
     );
+    // Without its filter index the table rules no key out, so a point read
+    // goes to the data and finds the key instead of failing on the filter.
+    let key = b"k00010";
+    let found = recovered.get(key, SeqNo::MAX, crate::hash::hash64(key))?;
+    assert_eq!(
+        found.map(|item| item.value.to_vec()),
+        Some(b"v10".to_vec()),
+        "a key the table holds is found without the filter index",
+    );
     Ok(())
 }
 
