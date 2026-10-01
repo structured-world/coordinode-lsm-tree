@@ -83,17 +83,34 @@ impl<'t> StagedRead<'t> {
         if table.metadata.seqnos.0 >= table_seqno {
             return StagedStart::Nothing;
         }
+        // A key below a tight-space restriction is read nowhere here, as a
+        // point read reads it nowhere: its rows live in the table that
+        // superseded the punched-out prefix.
+        let passing: Vec<usize> = sorted_keys
+            .iter()
+            .enumerate()
+            .filter(|(_, (key, _))| !table.is_below_restriction(key))
+            .map(|(pos, _)| pos)
+            .collect();
+        if passing.is_empty() {
+            return StagedStart::Nothing;
+        }
         let mut read = Self {
             table,
             table_seqno,
             stage: Stage::Filter,
-            passing: (0..sorted_keys.len()).collect(),
+            passing,
             need: Vec::new(),
             held: Vec::new(),
             tally: PlanCounts::default(),
             blocks: Vec::new(),
         };
-        for (key, _) in sorted_keys {
+        let passing_keys: Vec<&[u8]> = read
+            .passing
+            .iter()
+            .filter_map(|&pos| sorted_keys.get(pos).map(|(key, _)| *key))
+            .collect();
+        for key in passing_keys {
             match table.filter_source(key) {
                 FilterSource::Block(handle) => read.want(handle, BlockType::Filter),
                 FilterSource::None | FilterSource::Pinned(_) | FilterSource::PastPartitions => {}

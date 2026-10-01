@@ -474,6 +474,45 @@ fn a_table_without_a_filter_is_planned_from_its_index() -> crate::Result<()> {
     Ok(())
 }
 
+/// A table restricted to keys from a bound on, as a tight-space compaction
+/// leaves its input, answers nothing below the bound in any batch read, as a
+/// point read answers nothing there: the blocks below are punched out and
+/// their rows live in the table that superseded them.
+#[test]
+fn a_key_below_a_restriction_is_read_nowhere() -> crate::Result<()> {
+    let dir = tempdir()?;
+    let full = table(dir.path(), |w| w, false, false, 1_000_000);
+    let restricted = full.with_restriction(crate::UserKey::from(b"key000500".as_slice()));
+    let below = b"key000100".as_slice();
+    let above = b"key000600".as_slice();
+    let keys = [(below, hash64(below)), (above, hash64(above))];
+    let planned = |blocks: &[(BlockHandle, Vec<usize>)]| -> Vec<usize> {
+        blocks
+            .iter()
+            .flat_map(|(_, keys)| keys.iter().copied())
+            .collect()
+    };
+
+    assert!(restricted.get(below, SeqNo::MAX, hash64(below))?.is_none());
+
+    let found = restricted.batch_get(&keys, SeqNo::MAX)?;
+    assert_eq!(
+        found.iter().map(Option::is_some).collect::<Vec<_>>(),
+        [false, true],
+        "the batch read"
+    );
+
+    let mut tally = PlanCounts::default();
+    let (_, _, _, serial) = restricted
+        .plan_block_tasks(&keys, SeqNo::MAX, &mut tally)?
+        .expect("a key is in range");
+    assert_eq!(planned(&serial), [1], "the serial planner");
+
+    let (_, staged, _, _) = drive(&restricted, &keys).expect("staged");
+    assert_eq!(planned(&staged), [1], "the staged read");
+    Ok(())
+}
+
 /// A snapshot below a table's global seqno, as of an ingested table, sees
 /// nothing of it.
 #[test]

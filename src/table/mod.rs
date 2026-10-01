@@ -7256,6 +7256,10 @@ impl Table {
         let mut passing: Vec<usize> = Vec::with_capacity(sorted_keys.len());
         let mut had_filter = false;
         for (i, (key, hash)) in sorted_keys.iter().enumerate() {
+            // Below a tight-space restriction, as for a point read.
+            if self.is_below_restriction(key) {
+                continue;
+            }
             let bloom = self.check_bloom(key, *hash)?;
             self.count_probe(&bloom);
             if !bloom.should_skip() {
@@ -7472,6 +7476,10 @@ impl Table {
         }
         let mut passing: Vec<usize> = Vec::with_capacity(sorted_keys.len());
         for (i, (key, hash)) in sorted_keys.iter().enumerate() {
+            // Below a tight-space restriction, as for a point read.
+            if self.is_below_restriction(key) {
+                continue;
+            }
             // Counted with the plan, not here: a level handed to the serial
             // resolve is probed and counted there.
             let bloom = self.judge_bloom(key, *hash)?;
@@ -9394,12 +9402,14 @@ impl Table {
     }
 
     /// True when `key` is below this version's tight-space restriction bound, so
-    /// a point read must miss here and fall through to the output table that
+    /// a read must miss here and fall through to the output table that
     /// superseded the punched-out prefix. Every point-read entry point
     /// ([`get`](Self::get), [`get_value`](Self::get_value),
-    /// [`get_with_block`](Self::get_with_block)) consults this first.
+    /// [`get_with_block`](Self::get_with_block)) and every batch read
+    /// ([`batch_get`](Self::batch_get), the block planners and the staged
+    /// read) consults this first.
     #[inline]
-    fn is_below_restriction(&self, key: &[u8]) -> bool {
+    pub(crate) fn is_below_restriction(&self, key: &[u8]) -> bool {
         self.1
             .as_ref()
             .is_some_and(|bound| self.comparator.compare(key, bound) == core::cmp::Ordering::Less)
