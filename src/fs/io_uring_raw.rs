@@ -1137,7 +1137,7 @@ fn read_dir_entries(fd: i32) -> Result<Vec<(String, bool)>, Error> {
 ///
 /// Opened files share one ring (the hot read / write / fsync path); directory
 /// operations use plain blocking syscalls. Pure syscalls throughout — no
-/// `io-uring` crate and no `std::fs`, unlike the std-bound [`IoUringFs`].
+/// `io-uring` crate and no `std::fs`, unlike the std-bound `IoUringFs`.
 pub struct IoUringRawFs {
     ring: Arc<Mutex<IoUringRaw>>,
 }

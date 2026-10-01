@@ -261,6 +261,13 @@ jobs:
         # that feature is only seen here.
         working-directory: tools/db_bench
         run: cargo clippy --all-targets -- -D warnings
+      - name: Docs
+        # Broken and private intra-doc links fail the docs.rs build of a
+        # release and nothing else catches them. Linux, with every feature,
+        # so the io_uring backends' docs are built too.
+        env:
+          RUSTDOCFLAGS: -D warnings
+        run: cargo doc --no-deps --all-features
 
   test:
     needs: [changes, lint]
