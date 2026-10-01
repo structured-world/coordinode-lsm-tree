@@ -1456,7 +1456,7 @@ mod hard_link_count_sys {
     /// `FILETIME` pairs are flattened to `[u32; 2]` to keep the declaration
     /// dependency-free; the layout is identical.
     #[repr(C)]
-    #[allow(non_snake_case, reason = "Win32 API struct")]
+    #[expect(non_snake_case, reason = "Win32 API struct")]
     #[derive(Default)]
     struct ByHandleFileInformation {
         dwFileAttributes: u32,
@@ -1501,7 +1501,7 @@ mod hard_link_count_sys {
     /// file ID, unique on the volume on `ReFS` too, where the 64-bit index of
     /// `BY_HANDLE_FILE_INFORMATION` is not.
     #[repr(C)]
-    #[allow(non_snake_case, reason = "Win32 API struct")]
+    #[expect(non_snake_case, reason = "Win32 API struct")]
     #[derive(Default)]
     struct FileIdInfo {
         VolumeSerialNumber: u64,
@@ -1520,7 +1520,8 @@ mod hard_link_count_sys {
     // SAFETY (ABI): the signature matches the Win32
     // `GetFileInformationByHandleEx` contract — a handle, an information
     // class, an out buffer and its size, returning a non-zero `BOOL` on
-    // success.
+    // success. `allow`, not `expect`: `non_snake_case` does not fire on a
+    // foreign block, so an expectation would be unfulfilled.
     #[allow(non_snake_case, reason = "Win32 API signature")]
     unsafe extern "system" {
         fn GetFileInformationByHandleEx(

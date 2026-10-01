@@ -332,6 +332,45 @@ fn removing_a_hard_link_keeps_the_file_touched() {
     assert_eq!(read(&fs, src.to_str().unwrap()), b"durable");
 }
 
+/// Renaming another file over one name of a hard-linked file replaces that
+/// name only: an unsynced write the file got through it is still unsynced
+/// under the surviving name, so a crash rolls it back there.
+#[cfg(any(unix, windows))]
+#[test]
+fn renaming_over_a_hard_link_keeps_the_file_touched() {
+    let dir = tempfile::tempdir().unwrap();
+    let src = dir.path().join("src");
+    let link = dir.path().join("link");
+    let other = dir.path().join("other");
+    std::fs::write(&src, b"durable").unwrap();
+    let fs = CrashFs::new(crate::fs::StdFs);
+    fs.hard_link(&src, &link).unwrap();
+    let mut f = fs
+        .open(&other, &FsOpenOptions::new().write(true).create(true))
+        .unwrap();
+    f.write_all(b"other").unwrap();
+    f.sync_all().unwrap();
+    drop(f);
+    fs.sync_directory(dir.path()).unwrap();
+
+    let mut f = fs
+        .open(&link, &FsOpenOptions::new().write(true).truncate(true))
+        .unwrap();
+    f.write_all(b"unsynced").unwrap();
+    drop(f);
+    fs.rename(&other, &link).unwrap();
+    fs.sync_directory(dir.path()).unwrap();
+    // A write through the surviving name, never synced either.
+    let f = fs
+        .open(&src, &FsOpenOptions::new().write(true).append(true))
+        .unwrap();
+    drop(f);
+
+    fs.crash();
+    assert_eq!(read(&fs, src.to_str().unwrap()), b"durable");
+    assert_eq!(read(&fs, link.to_str().unwrap()), b"other");
+}
+
 /// A hard link of a symlink is a second name of the symlink, not of the file
 /// it points to (Linux `linkat(2)` without `AT_SYMLINK_FOLLOW`): the two
 /// names hold no bytes of their own, so no durable image is kept under them.
