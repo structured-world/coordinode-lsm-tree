@@ -243,7 +243,7 @@ fn a_rename_between_symlinks_to_one_file_moves_the_entry() {
 /// makes them durable under the other: with the synced name removed, a crash
 /// leaves the other name holding the synced bytes, not the ones it was linked
 /// with.
-#[cfg(unix)]
+#[cfg(any(unix, windows))]
 #[test]
 fn a_sync_through_one_hard_link_is_durable_through_the_other() {
     let dir = tempfile::tempdir().unwrap();
@@ -275,7 +275,7 @@ fn a_sync_through_one_hard_link_is_durable_through_the_other() {
 /// A pre-existing file linked to a new name keeps its durable bytes under its
 /// own name: a write through it that is never synced is rolled back on a
 /// crash, not taken for a new file and removed.
-#[cfg(unix)]
+#[cfg(any(unix, windows))]
 #[test]
 fn a_linked_pre_existing_file_keeps_its_durable_bytes() {
     let dir = tempfile::tempdir().unwrap();
