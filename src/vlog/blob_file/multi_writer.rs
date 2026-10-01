@@ -498,6 +498,18 @@ impl MultiWriter {
                 }
             }
         }
+        // A new file's directory entry is durable only once its directory is
+        // synced (POSIX `fsync(2)`), and the manifest edit that names these
+        // files follows: synced once here for every file the write made.
+        if !self.results.is_empty()
+            && let Err(e) = crate::file::fsync_directory(&self.folder, &*self.fs, self.sync_mode)
+        {
+            // Not durable, so no version may name them.
+            for file in &self.results {
+                file.mark_as_deleted();
+            }
+            return Err(e.into());
+        }
         Ok(self.results)
     }
 }

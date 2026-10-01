@@ -33,6 +33,11 @@ use std::io::{Seek, SeekFrom};
 /// acknowledges the flush / compaction. `scratch` is reused for payload
 /// assembly across calls (no per-edit heap allocation after warm-up).
 ///
+/// `first` says the log's directory entry is not known durable yet (a log
+/// this append may create, or one no append has synced): its directory is
+/// then synced too, since a new file's entry is durable only once its
+/// directory is, and a log lost with its entry takes every edit in it along.
+///
 /// Returns the appended record's on-disk size in bytes (framing header +
 /// payload), so the caller can keep its cached log size exact without a
 /// re-measuring `open` + `seek` per install. Returns `None`, having written
@@ -51,6 +56,7 @@ pub fn append_edit(
     edit: &VersionEdit,
     scratch: &mut Vec<u8>,
     sync_mode: SyncMode,
+    first: bool,
 ) -> crate::Result<Option<u64>> {
     edit.encode(scratch)?;
     if scratch.len() > super::framing::MAX_FRAME_PAYLOAD as usize {
@@ -62,6 +68,12 @@ pub fn append_edit(
             &FsOpenOptions::new().write(true).create(true).append(true),
         )
         .map_err(crate::Error::from)?;
+    if first {
+        // Before the record: a failed sync then leaves no edit in the log,
+        // where one written first would be made durable by the next append's
+        // sync although the operation it records was reported failed.
+        crate::file::fsync_directory(crate::file::entry_directory(path), fs, sync_mode)?;
+    }
     super::framing::write_frame(&mut file, scratch)?;
     file.sync_all_with(sync_mode).map_err(crate::Error::from)?;
     // The framing header (u32 len + u64 XXH3) precedes the payload on disk.
