@@ -182,6 +182,18 @@ fn raw_fs_read_link_reports_only_symlinks() {
         Some(crate::path::PathBuf::from("dangling"))
     );
     assert_eq!(fs.read_link(&file).expect("read_link"), None);
+    // A target that is not UTF-8 comes back as its bytes.
+    let raw = tmp.path().join("raw");
+    {
+        use std::os::unix::ffi::OsStrExt as _;
+        std::os::unix::fs::symlink(std::ffi::OsStr::from_bytes(b"t\xff"), &raw).expect("symlink");
+        assert_eq!(
+            fs.read_link(&raw).expect("read_link"),
+            Some(std::path::PathBuf::from(std::ffi::OsStr::from_bytes(
+                b"t\xff"
+            )))
+        );
+    }
     assert_eq!(
         fs.read_link(&tmp.path().join("missing"))
             .expect("read_link"),

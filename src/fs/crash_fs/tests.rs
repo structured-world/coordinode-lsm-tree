@@ -297,6 +297,70 @@ fn a_linked_pre_existing_file_keeps_its_durable_bytes() {
     assert_eq!(read(&fs, link.to_str().unwrap()), b"durable");
 }
 
+/// Removing one name of a hard-linked file keeps what the file went through:
+/// an unsynced write made through the removed name is still unsynced under
+/// the surviving one, so a later write through it does not take those bytes
+/// for its baseline, and a crash rolls them back.
+#[cfg(any(unix, windows))]
+#[test]
+fn removing_a_hard_link_keeps_the_file_touched() {
+    let dir = tempfile::tempdir().unwrap();
+    let src = dir.path().join("src");
+    let link = dir.path().join("link");
+    std::fs::write(&src, b"durable").unwrap();
+    let fs = CrashFs::new(crate::fs::StdFs).tracking_directory_entries();
+    fs.hard_link(&src, &link).unwrap();
+    fs.sync_directory(dir.path()).unwrap();
+
+    let mut f = fs
+        .open(&link, &FsOpenOptions::new().write(true).truncate(true))
+        .unwrap();
+    f.write_all(b"unsynced").unwrap();
+    drop(f);
+    fs.remove_file(&link).unwrap();
+    fs.sync_directory(dir.path()).unwrap();
+    // A write through the surviving name, never synced either.
+    let f = fs
+        .open(&src, &FsOpenOptions::new().write(true).append(true))
+        .unwrap();
+    drop(f);
+
+    fs.crash();
+    assert_eq!(read(&fs, src.to_str().unwrap()), b"durable");
+}
+
+/// A hard link of a symlink is a second name of the symlink, not of the file
+/// it points to (Linux `linkat(2)` without `AT_SYMLINK_FOLLOW`): the two
+/// names hold no bytes of their own, so no durable image is kept under them.
+#[cfg(target_os = "linux")]
+#[test]
+fn a_hard_link_of_a_symlink_keeps_no_image_under_the_symlink() {
+    let dir = tempfile::tempdir().unwrap();
+    let target = dir.path().join("target");
+    let link = dir.path().join("link");
+    let alias = dir.path().join("alias");
+    let fs = CrashFs::new(crate::fs::StdFs).tracking_directory_entries();
+    let mut f = fs
+        .open(&target, &FsOpenOptions::new().write(true).create(true))
+        .unwrap();
+    f.write_all(b"v1").unwrap();
+    f.sync_all().unwrap();
+    drop(f);
+    std::os::unix::fs::symlink("target", &link).unwrap();
+    fs.sync_directory(dir.path()).unwrap();
+
+    fs.hard_link(&link, &alias).unwrap();
+    let state = fs.state.lock();
+    assert!(
+        !state.durable.contains_key(&link) && !state.durable.contains_key(&alias),
+        "no image is kept under a symlink's names"
+    );
+    assert!(
+        state.link_group.is_empty(),
+        "the symlink's names are not grouped"
+    );
+}
+
 /// A write follows as many symlinks as Linux does, `MAX_SYMLINKS`, and the
 /// chain ends at the entry past the last of them; one more link than that is
 /// refused, as the kernel refuses it with `ELOOP`.

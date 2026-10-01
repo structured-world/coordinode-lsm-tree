@@ -116,6 +116,27 @@ impl CrashState {
         self.durable.insert(last, bytes);
     }
 
+    /// Forgets the name `path`, removed from the namespace. The file it named
+    /// lives on under its other hard links, and what the file went through
+    /// stays with them: a write through the removed name that was never
+    /// synced is still unsynced under each of them.
+    fn forget_name(&mut self, path: &Path) {
+        self.durable.remove(path);
+        self.pending_entries.remove(path);
+        let touched = self.touched.remove(path);
+        if let Some(group) = self.link_group.remove(path)
+            && touched
+        {
+            let survivors: Vec<PathBuf> = self
+                .link_group
+                .iter()
+                .filter(|&(_, &other)| other == group)
+                .map(|(name, _)| name.clone())
+                .collect();
+            self.touched.extend(survivors);
+        }
+    }
+
     /// Records `dst` as a hard link of the file `src` names.
     fn link(&mut self, src: &Path, dst: &Path) {
         let group = if let Some(&group) = self.link_group.get(src) {
@@ -501,11 +522,7 @@ impl Fs for CrashFs {
     fn remove_file(&self, path: &Path) -> io::Result<()> {
         let _namespace = self.hold_namespace();
         self.inner.remove_file(path)?;
-        let mut state = self.state.lock();
-        state.durable.remove(path);
-        state.touched.remove(path);
-        state.pending_entries.remove(path);
-        state.link_group.remove(path);
+        self.state.lock().forget_name(path);
         Ok(())
     }
 
@@ -516,10 +533,20 @@ impl Fs for CrashFs {
         // so crash() neither resurrects nor panics recreating a file whose
         // parent is gone.
         let mut state = self.state.lock();
+        // A linked name under the directory hands what its file went through
+        // to the names that survive outside it.
+        let linked: Vec<PathBuf> = state
+            .link_group
+            .keys()
+            .filter(|k| k.starts_with(path))
+            .cloned()
+            .collect();
+        for name in &linked {
+            state.forget_name(name);
+        }
         state.durable.retain(|k, _| !k.starts_with(path));
         state.touched.retain(|k| !k.starts_with(path));
         state.pending_entries.retain(|k| !k.starts_with(path));
-        state.link_group.retain(|k, _| !k.starts_with(path));
         Ok(())
     }
 
@@ -596,19 +623,31 @@ impl Fs for CrashFs {
     fn hard_link(&self, src: &Path, dst: &Path) -> io::Result<()> {
         let _namespace = self.hold_namespace();
         self.inner.hard_link(src, dst)?;
+        // Probed only while entries are tracked, so the wrapper otherwise
+        // makes no call the backend would not have seen.
+        let tracking = self.state.lock().track_entries;
+        // A symlink linked as itself (Linux `linkat(2)` without
+        // `AT_SYMLINK_FOLLOW`) is a new entry with no bytes of its own: no
+        // image is kept under it, and it is grouped with nothing. The link is
+        // made, so a probe that cannot answer does not fail it either.
+        if tracking && matches!(self.inner.read_link(dst), Ok(Some(_))) {
+            self.new_entry(dst);
+            return Ok(());
+        }
         self.track_copy(src, dst)?;
         // On a backend where a hard link is a second name of one file, a sync
         // through either name makes the other's bytes durable too; on one
-        // where it is a copy (`MemFs`), each name keeps its own image. Asked
-        // only while entries are tracked, so the wrapper otherwise makes no
-        // call the backend would not have seen. The link is made: a probe
-        // that cannot answer (a dangling symlink linked as itself has no file
-        // to compare) does not turn it into a failure the caller could not
-        // retry, and leaves the names separate.
-        let tracking = self.state.lock().track_entries;
-        if tracking && matches!(self.inner.same_file(src, dst), Ok(true)) {
+        // where it is a copy (`MemFs`), each name keeps its own image. A
+        // backend that followed a symlink source made `dst` a name of the
+        // file the link chain ends at, so that is the name it is grouped
+        // with. A probe that cannot answer leaves the names separate.
+        if !tracking {
+            return Ok(());
+        }
+        let file = self.entry_of(src).unwrap_or_else(|_| src.to_path_buf());
+        if matches!(self.inner.same_file(&file, dst), Ok(true)) {
             let mut state = self.state.lock();
-            state.link(src, dst);
+            state.link(&file, dst);
             // The image `dst` took is the one file's, `src`'s baseline
             // included: every name holds it, so a later first touch through
             // any of them, which finds the group already touched, still has
