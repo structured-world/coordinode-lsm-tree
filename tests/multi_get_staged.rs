@@ -1637,6 +1637,64 @@ fn a_zero_metadata_budget_reads_the_level_one_table_at_a_time() -> lsm_tree::Res
     Ok(())
 }
 
+/// A snapshot older than some tables of the level reads none of them: the
+/// tables written after it take no part in the staged read, and every key is
+/// answered as a key-by-key read at that snapshot answers it.
+#[test]
+fn a_snapshot_older_than_part_of_the_level_reads_only_the_tables_it_sees() -> lsm_tree::Result<()> {
+    const TABLES: u32 = 8;
+    for shape in SHAPES {
+        let dir = tempfile::tempdir()?;
+        let record = Record::default();
+        let (tree, keys) = tree(dir.path(), shape, TABLES, LARGE_CACHE, &record)?;
+        // The tables are written 200 rows apart: this snapshot sees the first
+        // half of them.
+        let snapshot = SeqNo::from(TABLES / 2 * 200);
+
+        let values = tree.multi_get(&keys, snapshot)?;
+        let expected: Vec<Option<Slice>> = keys
+            .iter()
+            .map(|key| tree.get(key, snapshot))
+            .collect::<lsm_tree::Result<_>>()?;
+        assert_eq!(values, expected, "{shape:?}");
+        assert_eq!(
+            values.iter().filter(|v| v.is_some()).count(),
+            TABLES as usize,
+            "{shape:?}: the two present keys of each table the snapshot sees"
+        );
+    }
+    Ok(())
+}
+
+/// A table whose file cannot be opened for its stages is read through the
+/// serial path instead, and the batch answers as a key-by-key read does.
+#[test]
+fn a_table_that_cannot_be_opened_for_its_stages_is_read_serially() -> lsm_tree::Result<()> {
+    use lsm_tree::fs::{Fault, FaultFs, FaultOp, FaultRule};
+
+    const TABLES: u32 = 4;
+    for shape in SHAPES {
+        let dir = tempfile::tempdir()?;
+        let faulty = FaultFs::new(StdFs);
+        let injector = faulty.injector();
+        let fs: Arc<dyn Fs> = Arc::new(faulty);
+        // A descriptor cache of one, so the staged read opens the files itself.
+        let (tree, keys) = tree_tuned(dir.path(), shape, TABLES, LARGE_CACHE, &fs, &|config| {
+            config.use_descriptor_table(Some(Arc::new(lsm_tree::DescriptorTable::new(1))))
+        })?;
+        injector.arm(
+            FaultRule::new(FaultOp::Open, Fault::Error(io::ErrorKind::PermissionDenied))
+                .on_path("tables")
+                .once(),
+        );
+
+        let values = tree.multi_get(&keys, SeqNo::MAX)?;
+        injector.clear();
+        assert_eq!(values, one_by_one(&tree, &keys)?, "{shape:?}");
+    }
+    Ok(())
+}
+
 /// A tree whose level 0 holds two tables on `primary` and two on `routed`, as
 /// after level 0 was routed away from the primary folder, reopened with no
 /// cache; and the keys a batch reads: one present and one absent per table.
