@@ -663,28 +663,32 @@ impl Fs for CrashFs {
 
     fn rename(&self, from: &Path, to: &Path) -> io::Result<()> {
         let _namespace = self.namespace.lock();
-        self.inner.rename(from, to)?;
         // POSIX rename(2): when both entries are links to one file (one path,
         // or two hard links of one inode) the call succeeds and changes
-        // nothing, so `from` is still there and the crash state stays as it
-        // was. Whether it is still there is what tells, on every backend: a
-        // file-identity probe follows symlinks, which rename does not, and
-        // not every backend can answer one. The namespace is held, so no other
-        // operation can have made `from` again since the rename, and the
-        // inner backend is the disk this simulates, so its answer is the
-        // truth: a fault layer composes above the simulator, never below it.
-        // A probe that fails is read as an ordinary rename. A symlink source
-        // is still there when the link itself is, whether or not it points
-        // anywhere, so the entry is asked about before what it points to.
-        // A name a filesystem that ignores case still finds is not proof:
-        // a rename that changed only the case left the entry under the new
-        // spelling, so the source's own spelling is looked for in its
-        // directory too.
-        if from == to
-            || ((matches!(self.inner.read_link(from), Ok(Some(_)))
-                || matches!(self.inner.exists(from), Ok(true)))
-                && self.listed_as_spelled(from))
-        {
+        // nothing, and the crash state stays as it was. Two names the backend
+        // reports as one file may still be two entries (two symlinks to one
+        // file) or one entry under two spellings (a filesystem that ignores
+        // case), so whether the rename changed anything is told by the exact
+        // spellings its directories list, before and after it. The namespace
+        // is held, so nothing else changes them meanwhile, and the inner
+        // backend is the disk this simulates: a fault layer composes above the
+        // simulator, never below it.
+        let spelled = || (self.listed_as_spelled(from), self.listed_as_spelled(to));
+        let before = matches!(self.inner.same_file(from, to), Ok(true)).then(spelled);
+        self.inner.rename(from, to)?;
+        // Without a file identity to go on (a backend that has none, a
+        // dangling symlink), the source still being there, the link itself
+        // rather than what it points to, under its own spelling, is what
+        // tells. A probe that fails is read as an ordinary rename.
+        let unchanged = match before {
+            Some(before) => before == spelled(),
+            None => {
+                (matches!(self.inner.read_link(from), Ok(Some(_)))
+                    || matches!(self.inner.exists(from), Ok(true)))
+                    && self.listed_as_spelled(from)
+            }
+        };
+        if from == to || unchanged {
             return Ok(());
         }
         let (from, to) = (self.name_after(from), self.name_after(to));
