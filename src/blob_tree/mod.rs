@@ -164,6 +164,15 @@ impl BlobTree {
         let blobs_folder = index.config.path.join(BLOBS_FOLDER);
         (*index.config.fs).create_dir_all(&blobs_folder)?;
         fsync_directory(&blobs_folder, &*index.config.fs, index.config.sync_mode)?;
+        // The folder's own name is an entry of the tree folder, durable only
+        // once that is synced: without it, a power loss after the first
+        // acknowledged write could lose the folder, and every blob file in it,
+        // while the manifest still names them.
+        fsync_directory(
+            &index.config.path,
+            &*index.config.fs,
+            index.config.sync_mode,
+        )?;
 
         let blob_file_id_to_continue_with = index
             .current_version()

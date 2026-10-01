@@ -775,6 +775,39 @@ fn a_sync_of_a_differently_cased_directory_covers_its_entries() {
     assert_eq!(read(&fs, lower.join("f").to_str().unwrap()), b"data");
 }
 
+/// A rename that changes only the case of a name is a rename, even where the
+/// filesystem still finds the old spelling: its new entry is lost on a crash
+/// before its directory is synced, as any rename's is.
+#[test]
+fn a_rename_that_changes_only_the_case_is_a_rename() {
+    let dir = tempfile::tempdir().unwrap();
+    let probe = dir.path().join("probe");
+    std::fs::write(&probe, b"").unwrap();
+    if !dir.path().join("PROBE").exists() {
+        // A case-sensitive filesystem: the two spellings are two files.
+        return;
+    }
+    let fs = CrashFs::new(crate::fs::StdFs).tracking_directory_entries();
+    let upper = dir.path().join("Foo");
+    let lower = dir.path().join("foo");
+    let mut f = fs
+        .open(&upper, &FsOpenOptions::new().write(true).create(true))
+        .unwrap();
+    f.write_all(b"data").unwrap();
+    f.sync_all().unwrap();
+    drop(f);
+    fs.sync_directory(dir.path()).unwrap();
+
+    fs.rename(&upper, &lower).unwrap();
+    assert!(
+        fs.state
+            .lock()
+            .pending_entries
+            .contains(&fs.name_of(&lower).unwrap()),
+        "the new spelling is an entry its directory has not made durable"
+    );
+}
+
 /// A backend that does not resolve `..` keeps a name through it as a name of
 /// its own: `MemFs` holds `/d/../a` apart from `/a`, so the simulator tracks
 /// it under that spelling and a crash makes no file at `/a`.

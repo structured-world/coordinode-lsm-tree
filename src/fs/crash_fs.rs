@@ -474,6 +474,21 @@ impl CrashFs {
         )
     }
 
+    /// Whether `path`'s directory lists an entry spelled exactly as its final
+    /// component. A listing that cannot be read answers no.
+    fn listed_as_spelled(&self, path: &Path) -> bool {
+        let Some(name) = path.file_name() else {
+            return false;
+        };
+        self.inner
+            .read_dir(crate::file::entry_directory(path))
+            .is_ok_and(|entries| {
+                entries
+                    .iter()
+                    .any(|entry| std::ffi::OsStr::new(&entry.file_name) == name)
+            })
+    }
+
     /// Records that `path` got a new directory entry, durable once its parent
     /// directory is synced, when entries are tracked.
     fn new_entry(&self, path: &Path) {
@@ -696,9 +711,14 @@ impl Fs for CrashFs {
         // A probe that fails is read as an ordinary rename. A symlink source
         // is still there when the link itself is, whether or not it points
         // anywhere, so the entry is asked about before what it points to.
+        // A name a filesystem that ignores case still finds is not proof:
+        // a rename that changed only the case left the entry under the new
+        // spelling, so the source's own spelling is looked for in its
+        // directory too.
         if from == to
-            || matches!(self.inner.read_link(from), Ok(Some(_)))
-            || matches!(self.inner.exists(from), Ok(true))
+            || ((matches!(self.inner.read_link(from), Ok(Some(_)))
+                || matches!(self.inner.exists(from), Ok(true)))
+                && self.listed_as_spelled(from))
         {
             return Ok(());
         }
