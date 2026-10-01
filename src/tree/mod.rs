@@ -3831,14 +3831,19 @@ impl Tree {
             read,
         } in tables
         {
-            let (table_seqno, blocks, tally) = match read {
-                Some(read) if read.is_done() => read.into_plan(),
+            // The serial planner hands over the file it opened, which the
+            // blocks are read through; a staged plan opens it here.
+            let (planned_file, table_seqno, blocks, tally) = match read {
+                Some(read) if read.is_done() => {
+                    let (table_seqno, blocks, tally) = read.into_plan();
+                    (None, table_seqno, blocks, tally)
+                }
                 // Served by the serial planner, whose reads are authoritative:
                 // a genuine failure surfaces here instead of letting a lower
                 // level answer a key this table covers.
                 _ => {
                     let mut tally = ProbeCounts::default();
-                    let Some((_, table_seqno, _, blocks)) =
+                    let Some((file, table_seqno, _, blocks)) =
                         table.plan_block_tasks(&batch, seqno, &mut tally)?
                     else {
                         if tally != ProbeCounts::default() {
@@ -3846,7 +3851,7 @@ impl Tree {
                         }
                         continue;
                     };
-                    (table_seqno, blocks, tally)
+                    (Some(file), table_seqno, blocks, tally)
                 }
             };
             if tally != ProbeCounts::default() {
@@ -3855,7 +3860,10 @@ impl Tree {
             if blocks.is_empty() {
                 continue;
             }
-            let file = table.open_file()?;
+            let file = match planned_file {
+                Some(file) => file,
+                None => table.open_file()?,
+            };
             let special = table.is_chunk_special();
             for (handle, positions) in blocks {
                 let task_keys: Vec<usize> = positions.iter().map(|&pos| batch_idx[pos]).collect();

@@ -7686,9 +7686,9 @@ impl Table {
             return Ok(None);
         }
 
-        let (file, _) = self
-            .file_accessor
-            .get_or_open_table(&self.global_id(), &self.path)?;
+        // Counted as every descriptor lookup is; the blocks are read through
+        // this file, with no second lookup.
+        let file = self.open_file()?;
         Ok(Some((file, table_seqno, self.is_chunk_special(), blocks)))
     }
 
