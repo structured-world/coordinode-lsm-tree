@@ -392,6 +392,8 @@ const LOCK_NB: i32 = 4;
 const AT_EMPTY_PATH: i32 = 0x1000;
 /// `statx` mask: request the basic stat fields (type, mode, size, …).
 const STATX_BASIC_STATS: u32 = 0x0000_07ff;
+/// `statx` mask bit: `stx_ino` was filled.
+const STATX_INO: u32 = 0x0000_0100;
 /// `st_mode` file-type mask and the regular-file / directory type bits.
 const S_IFMT: u16 = 0o170_000;
 const S_IFDIR: u16 = 0o040_000;
@@ -653,6 +655,77 @@ pub fn statx_path_raw(path: &core::ffi::CStr) -> Result<Option<RawMetadata>, Err
         // ENOENT (2): the path does not exist — a normal "not found" answer.
         Err(e) if e.into_raw() == 2 => Ok(None),
         Err(e) => Err(err("statx", e)),
+    }
+}
+
+/// The file a path names, following symlinks: its device (major, minor) and
+/// inode, from `statx(AT_FDCWD, path, 0, STATX_BASIC_STATS, &buf)`.
+///
+/// # Errors
+/// Returns an [`Error`] if `statx` fails, `ENOENT` included: a name that does
+/// not exist has no identity to compare.
+pub fn statx_identity_raw(path: &core::ffi::CStr) -> Result<(u32, u32, u64), Error> {
+    let mut buf = Statx::default();
+    // SAFETY: `path` is a valid NUL-terminated C string; `buf` is a valid,
+    // writable Statx the kernel fills.
+    unsafe {
+        syscall5(
+            Sysno::statx,
+            AT_FDCWD as usize,
+            path.as_ptr() as usize,
+            0,
+            STATX_BASIC_STATS as usize,
+            &raw mut buf as usize,
+        )
+    }
+    .map_err(|e| err("statx", e))?;
+    // A filesystem that cannot report an inode leaves `stx_ino` zero; two
+    // files would then compare as one, so the identity is not known.
+    if buf.stx_mask & STATX_INO == 0 {
+        return Err(Error::new(
+            ErrorKind::Unsupported,
+            "statx: the filesystem reports no inode",
+        ));
+    }
+    Ok((buf.stx_dev_major, buf.stx_dev_minor, buf.stx_ino))
+}
+
+/// The longest symlink target read: `PATH_MAX` on Linux.
+const PATH_MAX: usize = 4096;
+
+/// `readlinkat(AT_FDCWD, path, buf, PATH_MAX)` — the target of a symlink, read
+/// without following it. Returns [`None`] when `path` does not exist
+/// (`ENOENT`) or is not a symlink (`EINVAL`).
+///
+/// # Errors
+/// Returns an [`Error`] if `readlinkat` fails for another reason, or the
+/// target fills the whole buffer (`ENAMETOOLONG`: it may have been cut).
+pub fn readlinkat_raw(path: &core::ffi::CStr) -> Result<Option<Vec<u8>>, Error> {
+    let mut buf = alloc::vec![0u8; PATH_MAX];
+    // SAFETY: `path` is a valid NUL-terminated C string the kernel reads;
+    // `buf` is a valid, writable buffer of `buf.len()` bytes.
+    let r = unsafe {
+        syscall4(
+            Sysno::readlinkat,
+            AT_FDCWD as usize,
+            path.as_ptr() as usize,
+            buf.as_mut_ptr() as usize,
+            buf.len(),
+        )
+    };
+    match r {
+        // A target that fills the buffer may continue past it.
+        Ok(n) if n >= buf.len() => Err(Error::new(
+            ErrorKind::InvalidInput,
+            "readlinkat: symlink target longer than PATH_MAX",
+        )),
+        Ok(n) => {
+            buf.truncate(n);
+            Ok(Some(buf))
+        }
+        // ENOENT (2): no such entry; EINVAL (22): the entry is not a symlink.
+        Err(e) if matches!(e.into_raw(), 2 | 22) => Ok(None),
+        Err(e) => Err(err("readlinkat", e)),
     }
 }
 
@@ -1116,6 +1189,38 @@ impl Fs for IoUringRawFs {
 
     fn rename(&self, from: &Path, to: &Path) -> crate::io::Result<()> {
         renameat2_raw(&path_to_cstring(from)?, &path_to_cstring(to)?)
+    }
+
+    fn same_file(&self, a: &Path, b: &Path) -> crate::io::Result<bool> {
+        // Filesystem OBJECT identity (device + inode), as the other kernel
+        // backends answer it; a probe failure propagates rather than read as
+        // "distinct".
+        let ia = statx_identity_raw(&path_to_cstring(a)?)?;
+        let ib = statx_identity_raw(&path_to_cstring(b)?)?;
+        Ok(ia == ib)
+    }
+
+    fn read_link(&self, path: &Path) -> crate::io::Result<Option<crate::path::PathBuf>> {
+        let Some(target) = readlinkat_raw(&path_to_cstring(path)?)? else {
+            return Ok(None);
+        };
+        // A target is any byte string; the std path type holds every one.
+        #[cfg(feature = "std")]
+        {
+            use std::os::unix::ffi::OsStringExt as _;
+            Ok(Some(std::ffi::OsString::from_vec(target).into()))
+        }
+        // The no-std path type is a string, so a target must be UTF-8.
+        #[cfg(not(feature = "std"))]
+        {
+            let target = String::from_utf8(target).map_err(|_| {
+                Error::new(
+                    ErrorKind::InvalidInput,
+                    "readlinkat: symlink target is not valid UTF-8",
+                )
+            })?;
+            Ok(Some(crate::path::PathBuf::from(target)))
+        }
     }
 
     fn metadata(&self, path: &Path) -> crate::io::Result<FsMetadata> {

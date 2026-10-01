@@ -511,6 +511,18 @@ pub fn fsync_directory(path: &Path, fs: &dyn Fs, mode: SyncMode) -> crate::io::R
     fs.sync_directory_with(path, mode)
 }
 
+/// The directory holding `path`'s entry.
+///
+/// Its parent, or `.`, the name every backend accepts for the current
+/// directory, when `path` is a bare file name (whose parent is empty, or
+/// absent for the no-std path type).
+#[must_use]
+pub fn entry_directory(path: &Path) -> &Path {
+    path.parent()
+        .filter(|parent| *parent != Path::new(""))
+        .unwrap_or_else(|| Path::new("."))
+}
+
 #[cfg(test)]
 #[allow(
     clippy::unwrap_used,

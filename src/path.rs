@@ -110,11 +110,11 @@ mod nostd {
         }
 
         /// Parent key (everything before the last `/`), or `None` at the root.
+        /// A root-level key's parent is the root `/`, as for
+        /// [`std::path::Path::parent`].
         #[must_use]
         pub fn parent(&self) -> Option<&Self> {
-            self.inner
-                .rfind('/')
-                .map(|idx| Self::new(self.inner.split_at(idx).0))
+            super::parent_len(&self.inner).map(|len| Self::new(self.inner.split_at(len).0))
         }
 
         /// Final `/`-separated component, or `None` if empty.
@@ -272,14 +272,16 @@ mod nostd {
             self.inner.push_str(c);
         }
 
-        /// Removes the last component; returns `false` at the root.
+        /// Removes the last component; returns `false` at the root. A
+        /// root-level key pops to the root `/`, as for
+        /// [`std::path::PathBuf::pop`].
         pub fn pop(&mut self) -> bool {
-            match self.inner.rfind('/') {
-                Some(idx) => {
-                    self.inner.truncate(idx);
+            match super::parent_len(&self.inner) {
+                Some(len) => {
+                    self.inner.truncate(len);
                     true
                 }
-                None if self.inner.is_empty() => false,
+                None if self.inner.is_empty() || self.inner == "/" => false,
                 None => {
                     self.inner.clear();
                     true
@@ -379,3 +381,19 @@ mod nostd {
         }
     }
 }
+
+/// How much of a `/`-separated key its parent keeps, as
+/// [`std::path::Path::parent`] answers for such a key: everything before the
+/// last `/`, the root `/` itself for a root-level key, and `None` for the
+/// root, or a key with no `/` (an object key has no parent there).
+#[cfg(any(test, not(feature = "std")))]
+fn parent_len(key: &str) -> Option<usize> {
+    match key.rfind('/')? {
+        0 if key.len() > 1 => Some(1),
+        0 => None,
+        idx => Some(idx),
+    }
+}
+
+#[cfg(test)]
+mod tests;

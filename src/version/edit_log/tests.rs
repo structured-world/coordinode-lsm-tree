@@ -18,6 +18,51 @@ fn edit(id: u64) -> VersionEdit {
     }
 }
 
+/// A log named by a bare file name lies in the current directory: its first
+/// append syncs that directory as `.`, the name every backend accepts, not
+/// as the empty parent the name has, so its entry survives a crash.
+#[test]
+fn the_first_append_to_a_log_in_the_current_directory_syncs_it() -> crate::Result<()> {
+    let fs = crate::fs::CrashFs::new(crate::fs::MemFs::new());
+    let path = Path::new("edits-0");
+    let mut scratch = Vec::new();
+    append_edit(&fs, path, &edit(1), &mut scratch, SyncMode::Normal, true)?;
+
+    fs.crash();
+    assert_eq!(
+        replay_log(&fs, path, ManifestRecoveryMode::AbsoluteConsistency)?,
+        vec![edit(1)]
+    );
+    Ok(())
+}
+
+/// A first append whose directory sync fails writes no edit: a record left
+/// in the log would be made durable by the next append's sync, though the
+/// operation it records was reported failed.
+#[test]
+fn a_first_append_whose_directory_sync_fails_writes_nothing() -> crate::Result<()> {
+    use crate::fs::{Fault, FaultFs, FaultOp, FaultRule, MemFs};
+
+    let fs = FaultFs::new(MemFs::new());
+    fs.create_dir_all(Path::new("/db"))?;
+    fs.injector().arm(
+        FaultRule::new(
+            FaultOp::SyncDirectory,
+            Fault::Error(crate::io::ErrorKind::Other),
+        )
+        .once(),
+    );
+    let path = Path::new("/db/edits-0");
+    let mut scratch = Vec::new();
+    assert!(append_edit(&fs, path, &edit(1), &mut scratch, SyncMode::Normal, true).is_err());
+    assert_eq!(
+        replay_log(&fs, path, ManifestRecoveryMode::AbsoluteConsistency)?,
+        Vec::new(),
+        "the failed append left no record"
+    );
+    Ok(())
+}
+
 #[test]
 fn append_then_replay_roundtrips_all_edits() {
     let dir = tempfile::tempdir().expect("tempdir");
@@ -25,7 +70,7 @@ fn append_then_replay_roundtrips_all_edits() {
     let mut scratch = Vec::new();
     let edits: Vec<VersionEdit> = (1..=4).map(edit).collect();
     for e in &edits {
-        append_edit(&StdFs, &path, e, &mut scratch, SyncMode::Normal).expect("append");
+        append_edit(&StdFs, &path, e, &mut scratch, SyncMode::Normal, false).expect("append");
     }
     let replayed =
         replay_log(&StdFs, &path, ManifestRecoveryMode::AbsoluteConsistency).expect("replay");
@@ -54,7 +99,7 @@ fn an_edit_too_large_for_one_record_writes_nothing() -> crate::Result<()> {
         ..Default::default()
     };
 
-    let appended = append_edit(&StdFs, &path, &wide, &mut scratch, SyncMode::Normal)?;
+    let appended = append_edit(&StdFs, &path, &wide, &mut scratch, SyncMode::Normal, false)?;
     assert_eq!(appended, None);
     assert!(!path.exists(), "a declined edit must not create the log");
     Ok(())
@@ -79,7 +124,15 @@ fn log_with_torn_tail(dir: &std::path::Path, count: u64) -> std::path::PathBuf {
     let path = dir.join("edits-torn");
     let mut scratch = Vec::new();
     for i in 1..=count {
-        append_edit(&StdFs, &path, &edit(i), &mut scratch, SyncMode::Normal).expect("append");
+        append_edit(
+            &StdFs,
+            &path,
+            &edit(i),
+            &mut scratch,
+            SyncMode::Normal,
+            false,
+        )
+        .expect("append");
     }
     let clean = log_size(&StdFs, &path).expect("size");
     append_edit(
@@ -88,6 +141,7 @@ fn log_with_torn_tail(dir: &std::path::Path, count: u64) -> std::path::PathBuf {
         &edit(count + 1),
         &mut scratch,
         SyncMode::Normal,
+        false,
     )
     .expect("append");
     let f = std::fs::OpenOptions::new()
@@ -144,7 +198,7 @@ fn clean_log_replays_under_strict() {
     let mut scratch = Vec::new();
     let edits: Vec<VersionEdit> = (1..=3).map(edit).collect();
     for e in &edits {
-        append_edit(&StdFs, &path, e, &mut scratch, SyncMode::Normal).expect("append");
+        append_edit(&StdFs, &path, e, &mut scratch, SyncMode::Normal, false).expect("append");
     }
     let replayed = replay_log(&StdFs, &path, ManifestRecoveryMode::AbsoluteConsistency)
         .expect("strict must accept a clean log");
@@ -160,7 +214,15 @@ fn checksum_mismatch_tail_aborts_in_every_mode() {
     let path = dir.path().join("edits-bitrot");
     let mut scratch = Vec::new();
     for i in 1..=3 {
-        append_edit(&StdFs, &path, &edit(i), &mut scratch, SyncMode::Normal).expect("append");
+        append_edit(
+            &StdFs,
+            &path,
+            &edit(i),
+            &mut scratch,
+            SyncMode::Normal,
+            false,
+        )
+        .expect("append");
     }
     // Flip the last payload byte of the final (fully written) record.
     let mut bytes = std::fs::read(&path).expect("read");
@@ -191,9 +253,25 @@ fn log_size_grows_with_appends() {
     let path = dir.path().join("edits-size");
     let mut scratch = Vec::new();
     let s0 = log_size(&StdFs, &path).expect("size");
-    append_edit(&StdFs, &path, &edit(1), &mut scratch, SyncMode::Normal).expect("append");
+    append_edit(
+        &StdFs,
+        &path,
+        &edit(1),
+        &mut scratch,
+        SyncMode::Normal,
+        false,
+    )
+    .expect("append");
     let s1 = log_size(&StdFs, &path).expect("size");
-    append_edit(&StdFs, &path, &edit(2), &mut scratch, SyncMode::Normal).expect("append");
+    append_edit(
+        &StdFs,
+        &path,
+        &edit(2),
+        &mut scratch,
+        SyncMode::Normal,
+        false,
+    )
+    .expect("append");
     let s2 = log_size(&StdFs, &path).expect("size");
     assert_eq!(s0, 0);
     assert!(s1 > s0 && s2 > s1, "log grows with each appended edit");

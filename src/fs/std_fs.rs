@@ -4,7 +4,7 @@
 
 use super::{FileHint, Fs, FsDirEntry, FsFile, FsMetadata, FsOpenOptions, SyncMode};
 use crate::io;
-use crate::path::Path;
+use crate::path::{Path, PathBuf};
 #[cfg(not(feature = "std"))]
 use alloc::{boxed::Box, string::String, vec::Vec};
 use std::fs::{File, OpenOptions};
@@ -256,13 +256,35 @@ impl Fs for StdFs {
             let mb = std::fs::metadata(b).map_err(io::Error::from)?;
             Ok(ma.dev() == mb.dev() && ma.ino() == mb.ino())
         }
-        // No stable file-identity API off Unix: canonical spellings still
-        // resolve symlinks, `..`, and case folding there.
-        #[cfg(not(unix))]
+        // The volume serial number and the 128-bit file ID: two hard links of
+        // one file share them while their canonical paths differ.
+        #[cfg(windows)]
+        {
+            let ia = hard_link_count_sys::file_identity(a).map_err(io::Error::from)?;
+            let ib = hard_link_count_sys::file_identity(b).map_err(io::Error::from)?;
+            Ok(ia == ib)
+        }
+        // No file-identity API elsewhere: canonical spellings still resolve
+        // symlinks, `..`, and case folding.
+        #[cfg(not(any(unix, windows)))]
         {
             let ca = std::fs::canonicalize(a).map_err(io::Error::from)?;
             let cb = std::fs::canonicalize(b).map_err(io::Error::from)?;
             Ok(ca == cb)
+        }
+    }
+
+    fn read_link(&self, path: &Path) -> io::Result<Option<PathBuf>> {
+        // On Windows `is_symlink` is true for every name-surrogate reparse
+        // point, a junction (`IO_REPARSE_TAG_MOUNT_POINT`) included, and
+        // `std::fs::read_link` reads both tags.
+        match std::fs::symlink_metadata(path) {
+            Ok(meta) if meta.file_type().is_symlink() => {
+                std::fs::read_link(path).map(Some).map_err(io::Error::from)
+            }
+            Ok(_) => Ok(None),
+            Err(e) if e.kind() == std::io::ErrorKind::NotFound => Ok(None),
+            Err(e) => Err(io::Error::from(e)),
         }
     }
 
@@ -1437,7 +1459,7 @@ mod hard_link_count_sys {
     /// `FILETIME` pairs are flattened to `[u32; 2]` to keep the declaration
     /// dependency-free; the layout is identical.
     #[repr(C)]
-    #[allow(non_snake_case, reason = "Win32 API struct")]
+    #[expect(non_snake_case, reason = "Win32 API struct")]
     #[derive(Default)]
     struct ByHandleFileInformation {
         dwFileAttributes: u32,
@@ -1476,6 +1498,71 @@ mod hard_link_count_sys {
             return Err(io::Error::last_os_error());
         }
         Ok(u64::from(info.nNumberOfLinks))
+    }
+
+    /// `FILE_ID_INFO` (Win32): the volume serial number and the 128-bit
+    /// file ID, unique on the volume on `ReFS` too, where the 64-bit index of
+    /// `BY_HANDLE_FILE_INFORMATION` is not.
+    #[repr(C)]
+    #[expect(non_snake_case, reason = "Win32 API struct")]
+    #[derive(Default)]
+    struct FileIdInfo {
+        VolumeSerialNumber: u64,
+        FileId: [u8; 16],
+    }
+
+    /// `FILE_INFO_BY_HANDLE_CLASS::FileIdInfo`.
+    const FILE_ID_INFO_CLASS: i32 = 18;
+    /// The size of `FILE_ID_INFO` the call is told, checked against the
+    /// struct at compile time.
+    const FILE_ID_INFO_SIZE: u32 = 24;
+    const _: () = assert!(core::mem::size_of::<FileIdInfo>() == FILE_ID_INFO_SIZE as usize);
+    /// Opens a directory as well as a file, for its attributes only.
+    const FILE_FLAG_BACKUP_SEMANTICS: u32 = 0x0200_0000;
+
+    // SAFETY (ABI): the signature matches the Win32
+    // `GetFileInformationByHandleEx` contract — a handle, an information
+    // class, an out buffer and its size, returning a non-zero `BOOL` on
+    // success. `allow`, not `expect`: `non_snake_case` does not fire on a
+    // foreign block, so an expectation would be unfulfilled.
+    #[allow(non_snake_case, reason = "Win32 API signature")]
+    unsafe extern "system" {
+        fn GetFileInformationByHandleEx(
+            hFile: *mut core::ffi::c_void,
+            FileInformationClass: i32,
+            lpFileInformation: *mut core::ffi::c_void,
+            dwBufferSize: u32,
+        ) -> i32;
+    }
+
+    /// The identity of the file or directory `path` names: its volume and
+    /// file ID. The handle asks for no data access, so a file another
+    /// handle holds open, and a directory, can still be identified.
+    pub(super) fn file_identity(path: &std::path::Path) -> io::Result<(u64, [u8; 16])> {
+        use std::os::windows::fs::OpenOptionsExt as _;
+        let file = std::fs::OpenOptions::new()
+            .access_mode(0)
+            .custom_flags(FILE_FLAG_BACKUP_SEMANTICS)
+            .open(path)?;
+        let mut info = FileIdInfo::default();
+        // SAFETY: the handle comes from a live `File`; `info` is a valid out
+        // buffer of `FILE_ID_INFO_SIZE` bytes; fields are read only on success.
+        #[expect(
+            unsafe_code,
+            reason = "GetFileInformationByHandleEx for the file identity"
+        )]
+        let rc = unsafe {
+            GetFileInformationByHandleEx(
+                file.as_raw_handle(),
+                FILE_ID_INFO_CLASS,
+                (&raw mut info).cast(),
+                FILE_ID_INFO_SIZE,
+            )
+        };
+        if rc == 0 {
+            return Err(io::Error::last_os_error());
+        }
+        Ok((info.VolumeSerialNumber, info.FileId))
     }
 }
 
