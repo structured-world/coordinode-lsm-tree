@@ -2354,27 +2354,30 @@ fn a_read_queue_hands_back_completions_in_any_order() -> io::Result<()> {
     }
     queue.on_ring = 2;
 
-    /// `EBADF` on Linux.
-    const EBADF: i32 = 9;
-    let last = queue.complete(1, -EBADF).expect("the read at 1");
-    let error = last.result.expect_err("a negative result fails the read");
+    /// `EACCES` on Linux.
+    const EACCES: i32 = 13;
+    // Every completion is taken before any assertion, so a failing one leaves
+    // nothing for the queue's drop to wait for.
+    let last = queue.complete(1, -EACCES);
+    let slots_after_last = queue.sent.len();
+    let again = queue.complete(1, 64);
+    let first = queue.complete(0, 64);
+
+    let last = last.expect("the read at 1");
     assert_eq!(
-        io::Error::from(error).raw_os_error(),
-        Some(EBADF),
-        "the read's errno"
+        last.result.map_err(|e| e.kind()),
+        Err(crate::io::ErrorKind::PermissionDenied),
+        "a negative result is the read's errno"
     );
     assert_eq!(
-        queue.sent.len(),
-        1,
+        slots_after_last, 1,
         "the handed-back slot at the end is dropped"
     );
     assert!(
-        queue.complete(1, 64).is_none(),
+        again.is_none(),
         "a completion for a read handed back hands back nothing"
     );
-
-    let first = queue.complete(0, 64).expect("the read at 0");
-    assert!(first.result.is_ok());
+    assert!(first.expect("the read at 0").result.is_ok());
     assert!(queue.sent.is_empty(), "no slot outlives its read");
     assert_eq!(queue.on_ring, 0);
     Ok(())
