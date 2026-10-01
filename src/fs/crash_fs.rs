@@ -585,7 +585,15 @@ impl Fs for CrashFs {
         // call the backend would not have seen.
         let tracking = self.state.lock().track_entries;
         if tracking && self.inner.same_file(src, dst)? {
-            self.state.lock().link(src, dst);
+            let mut state = self.state.lock();
+            state.link(src, dst);
+            // The image `dst` took is the one file's, `src`'s baseline
+            // included: every name holds it, so a later first touch through
+            // any of them, which finds the group already touched, still has
+            // durable bytes to roll back to.
+            if let Some(bytes) = state.durable.get(dst).cloned() {
+                state.set_durable(dst, bytes);
+            }
         }
         Ok(())
     }
