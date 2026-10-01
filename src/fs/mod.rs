@@ -393,6 +393,16 @@ pub enum SyncMode {
     /// [`Self::Normal`]. Slower - opt in only when the workload needs
     /// power-loss durability without an external journal.
     Full,
+
+    /// Ordered durability. On macOS this issues `fcntl(F_BARRIERFSYNC)`
+    /// (about 0.7 ms against `F_FULLFSYNC`'s 5.7 ms): the writes synced on a
+    /// device reach its medium in the order they were synced, and all of them
+    /// are durable once a later [`Fs::sync_device`] of that device returns
+    /// `Ok`. The last sync of a transition on one device before a step on
+    /// another is issued as [`Self::Full`], so a step never outlives one on
+    /// another device it depends on. Elsewhere it is identical to
+    /// [`Self::Normal`], where `fsync` already reaches the medium.
+    Barrier,
 }
 
 /// Filesystem operations on an open file handle.
@@ -1015,6 +1025,20 @@ pub trait Fs: Send + Sync + 'static {
     fn sync_directory_with(&self, path: &Path, mode: SyncMode) -> io::Result<()> {
         let _ = mode;
         self.sync_directory(path)
+    }
+
+    /// Makes durable everything synced on the device holding `path` before
+    /// the call, including what [`SyncMode::Barrier`] synced only in order.
+    ///
+    /// The default is a no-op, for a backend whose syncs already reach the
+    /// medium; the std backend issues one `fcntl(F_FULLFSYNC)` on macOS.
+    ///
+    /// # Errors
+    ///
+    /// Returns an I/O error if `path` cannot be opened or the flush fails.
+    fn sync_device(&self, path: &Path) -> io::Result<()> {
+        let _ = path;
+        Ok(())
     }
 
     /// Returns `Ok(true)` if a file or directory exists at `path`.

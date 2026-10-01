@@ -541,6 +541,10 @@ impl<F: Fs> Fs for FaultFs<F> {
         self.inner.sync_directory_with(path, mode)
     }
 
+    fn sync_device(&self, path: &Path) -> io::Result<()> {
+        self.inner.sync_device(path)
+    }
+
     fn exists(&self, path: &Path) -> io::Result<bool> {
         // A `Metadata` fault on an existence probe models a stat that RACED file
         // creation and saw the path absent (the TOCTOU window `FaultOp::Metadata`

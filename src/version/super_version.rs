@@ -26,9 +26,16 @@ fn remove_if_present(fs: &dyn Fs, path: &Path) -> crate::Result<()> {
 /// manifest edit that names it must not outlive it. The table writers sync
 /// only their files, so a transition writing N tables to one directory syncs
 /// that directory once, not N times.
+///
+/// Under [`SyncMode::Barrier`] a folder on another device than the manifest
+/// at `tree_path` is synced in full: it is the last sync of the transition on
+/// that device, and a barrier orders writes on its own device only, so the
+/// manifest edit on the other one could otherwise outlive the tables it names.
 fn sync_new_table_directories(
     prior: &Version,
     next: &Version,
+    tree_path: &Path,
+    manifest_fs: &dyn Fs,
     sync_mode: SyncMode,
 ) -> crate::Result<()> {
     let known: crate::HashSet<crate::TableId> = prior.iter_tables().map(crate::Table::id).collect();
@@ -46,10 +53,56 @@ fn sync_new_table_directories(
         {
             continue;
         }
-        crate::file::fsync_directory(folder, &*table.fs, sync_mode)?;
+        let mode = if sync_mode == SyncMode::Barrier
+            && !same_device(&*table.fs, folder, manifest_fs, tree_path)
+        {
+            SyncMode::Full
+        } else {
+            sync_mode
+        };
+        crate::file::fsync_directory(folder, &*table.fs, mode)?;
         synced.push((&table.fs, folder));
     }
     Ok(())
+}
+
+/// Whether `path` on `fs` and `other` on `other_fs` provably lie on one
+/// device; a backend that cannot tell answers no.
+fn same_device(fs: &dyn Fs, path: &Path, other_fs: &dyn Fs, other: &Path) -> bool {
+    matches!(
+        (fs.volume_id(path), other_fs.volume_id(other)),
+        (Some(a), Some(b)) if a == b
+    )
+}
+
+/// The sync mode the manifest edit from `prior` to `next` is persisted with.
+/// Under [`SyncMode::Barrier`] an edit that drops a table on another device
+/// than the manifest at `tree_path` is synced in full: the dropped file is
+/// removed once the edit is installed, and a barrier on the manifest's device
+/// would not keep that removal from reaching its own device first.
+fn manifest_sync_mode(
+    prior: &Version,
+    next: &Version,
+    tree_path: &Path,
+    manifest_fs: &dyn Fs,
+    sync_mode: SyncMode,
+) -> SyncMode {
+    if sync_mode != SyncMode::Barrier {
+        return sync_mode;
+    }
+    let kept: crate::HashSet<crate::TableId> = next.iter_tables().map(crate::Table::id).collect();
+    let drops_elsewhere = prior.iter_tables().any(|table| {
+        !kept.contains(&table.id())
+            && table
+                .path
+                .parent()
+                .is_none_or(|folder| !same_device(&*table.fs, folder, manifest_fs, tree_path))
+    });
+    if drops_elsewhere {
+        SyncMode::Full
+    } else {
+        sync_mode
+    }
 }
 
 use alloc::sync::Arc;
@@ -417,7 +470,20 @@ impl SuperVersions {
             next_version.version.set_retention_floor(floor);
         }
 
-        sync_new_table_directories(&prior.version, &next_version.version, self.sync_mode)?;
+        sync_new_table_directories(
+            &prior.version,
+            &next_version.version,
+            tree_path,
+            fs,
+            self.sync_mode,
+        )?;
+        let manifest_mode = manifest_sync_mode(
+            &prior.version,
+            &next_version.version,
+            tree_path,
+            fs,
+            self.sync_mode,
+        );
         self.persist_change(
             tree_path,
             &prior.version,
@@ -425,6 +491,7 @@ impl SuperVersions {
             fs,
             runtime,
             encryption,
+            manifest_mode,
         )?;
         self.append_version(next_version);
 
@@ -449,6 +516,14 @@ impl SuperVersions {
     /// complete and its log is empty (recover new, no edits). A torn trailing edit
     /// from an interrupted append is dropped on replay — the operation that wrote
     /// it was never acknowledged upward.
+    ///
+    /// `sync_mode` is the mode this transition is persisted with (see
+    /// `manifest_sync_mode`).
+    #[expect(
+        clippy::too_many_arguments,
+        reason = "the transition, where it goes, how it is encoded and how durably: \
+                  every parameter is the install's own"
+    )]
     fn persist_change(
         &mut self,
         tree_path: &Path,
@@ -457,6 +532,7 @@ impl SuperVersions {
         fs: &dyn Fs,
         runtime: Arc<crate::runtime_config::RuntimeConfig>,
         encryption: Option<Arc<dyn crate::encryption::EncryptionProvider>>,
+        sync_mode: SyncMode,
     ) -> crate::Result<()> {
         let log_path = tree_path.join(format!("edits-{}", self.snapshot_id));
 
@@ -478,7 +554,7 @@ impl SuperVersions {
                 &log_path,
                 &edit,
                 &mut self.edit_scratch,
-                self.sync_mode,
+                sync_mode,
                 !self.log_entry_synced,
             ) {
                 Ok(Some(appended)) => {
@@ -515,7 +591,7 @@ impl SuperVersions {
             fs,
             runtime,
             encryption,
-            self.sync_mode,
+            sync_mode,
         )?;
         self.snapshot_id = next.id();
         // The new generation starts with an empty log (created lazily on the

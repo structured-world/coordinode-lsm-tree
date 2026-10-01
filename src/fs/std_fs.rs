@@ -34,6 +34,36 @@ fn normal_fsync(file: &File) -> io::Result<()> {
     File::sync_all(file).map_err(io::Error::from)
 }
 
+/// `fcntl(F_BARRIERFSYNC)` for [`SyncMode::Barrier`]: an `fsync` that also
+/// keeps the drive from reordering these writes past later ones.
+#[cfg(target_os = "macos")]
+fn barrier_fsync(file: &File) -> io::Result<()> {
+    use std::os::unix::io::AsRawFd;
+    // SAFETY: `fd` is a valid open descriptor for the lifetime of `file`.
+    let rc = unsafe { libc::fcntl(file.as_raw_fd(), libc::F_BARRIERFSYNC) };
+    if rc == -1 {
+        Err(std::io::Error::last_os_error().into())
+    } else {
+        Ok(())
+    }
+}
+
+#[cfg(not(target_os = "macos"))]
+fn barrier_fsync(file: &File) -> io::Result<()> {
+    // Off macOS `fsync` already reaches the medium in order.
+    normal_fsync(file)
+}
+
+/// The sync `mode` asks of `file`.
+fn sync_file_with(file: &File, mode: SyncMode) -> io::Result<()> {
+    match mode {
+        // `File::sync_all` is `fcntl(F_FULLFSYNC)` on macOS.
+        SyncMode::Full => File::sync_all(file).map_err(io::Error::from),
+        SyncMode::Normal => normal_fsync(file),
+        SyncMode::Barrier => barrier_fsync(file),
+    }
+}
+
 /// Default [`Fs`] implementation backed by [`std::fs`].
 ///
 /// This is a zero-sized type - when used as a monomorphized generic
@@ -56,21 +86,16 @@ impl FsFile for File {
     }
 
     fn sync_all_with(&self, mode: SyncMode) -> io::Result<()> {
-        match mode {
-            // `File::sync_all` is `fcntl(F_FULLFSYNC)` on macOS.
-            SyncMode::Full => Self::sync_all(self).map_err(io::Error::from),
-            SyncMode::Normal => normal_fsync(self),
-        }
+        sync_file_with(self, mode)
     }
 
     fn sync_data_with(&self, mode: SyncMode) -> io::Result<()> {
         match mode {
             SyncMode::Full => Self::sync_data(self).map_err(io::Error::from),
-            // Normal data-sync collapses to plain `fsync`: on macOS
-            // `sync_data` is also `F_FULLFSYNC`, and a plain `fsync` already
-            // covers the data, so there is no cheaper data-only barrier to
-            // issue.
-            SyncMode::Normal => normal_fsync(self),
+            // On macOS `sync_data` is `F_FULLFSYNC` too, and a plain `fsync`
+            // or a barrier already covers the data, so there is no cheaper
+            // data-only sync to issue.
+            SyncMode::Normal | SyncMode::Barrier => sync_file_with(self, mode),
         }
     }
 
@@ -352,16 +377,27 @@ impl Fs for StdFs {
                     "sync_directory: path is not a directory",
                 ));
             }
-            match mode {
-                SyncMode::Full => dir.sync_all().map_err(io::Error::from),
-                SyncMode::Normal => normal_fsync(&dir),
-            }
+            sync_file_with(&dir, mode)
         }
 
         // Windows cannot fsync directories - no-op.
         #[cfg(target_os = "windows")]
         {
             let _ = (path, mode);
+            Ok(())
+        }
+    }
+
+    fn sync_device(&self, path: &Path) -> io::Result<()> {
+        // `F_FULLFSYNC` flushes the whole drive cache, whatever descriptor of
+        // the device it is issued on.
+        #[cfg(target_os = "macos")]
+        {
+            File::open(path)?.sync_all().map_err(io::Error::from)
+        }
+        #[cfg(not(target_os = "macos"))]
+        {
+            let _ = path;
             Ok(())
         }
     }

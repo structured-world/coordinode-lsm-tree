@@ -2096,8 +2096,11 @@ impl Config {
     /// Defaults to [`SyncMode::Normal`] (plain `fsync`, matching `RocksDB` /
     /// `SQLite` defaults). Pass [`SyncMode::Full`] to force `F_FULLFSYNC` on
     /// macOS for power-loss durability without an external journal — at a
-    /// large per-flush cost. On non-macOS platforms both modes are
-    /// identical (plain `fsync`).
+    /// large per-flush cost. Pass [`SyncMode::Barrier`] to keep writes in
+    /// order at a barrier's cost and make them durable with
+    /// [`AbstractTree::sync_devices`](crate::AbstractTree::sync_devices), once
+    /// per batch of flushes. On non-macOS platforms all three are plain
+    /// `fsync`.
     #[must_use]
     pub fn sync_mode(mut self, mode: SyncMode) -> Self {
         self.sync_mode = mode;

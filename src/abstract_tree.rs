@@ -428,6 +428,16 @@ pub trait AbstractTree: sealed::Sealed {
     /// backends (e.g. [`MemFs`](crate::fs::MemFs) → [`StdFs`](crate::fs::StdFs)
     /// in tests).
     ///
+    /// # Durability
+    ///
+    /// `Ok` means the checkpoint's files and directories are persisted under
+    /// [`Config::sync_mode`](crate::Config::sync_mode): durable under
+    /// [`SyncMode::Full`](crate::fs::SyncMode::Full); under
+    /// [`SyncMode::Barrier`](crate::fs::SyncMode::Barrier) synced in order, one
+    /// barrier per file, and durable once a later
+    /// [`Fs::sync_device`](crate::fs::Fs::sync_device) of `target_path` returns
+    /// `Ok`.
+    ///
     /// # Concurrency
     ///
     /// While the checkpoint is being built, compaction continues normally
@@ -492,6 +502,48 @@ pub trait AbstractTree: sealed::Sealed {
         let lock = self.get_flush_lock();
         self.rotate_memtable();
         self.flush(&lock, gc_watermark)?;
+        Ok(())
+    }
+
+    /// Makes durable everything this tree synced on each device it lies on:
+    /// the tree folder's and that of every level's tables.
+    ///
+    /// Under [`SyncMode::Barrier`](crate::fs::SyncMode::Barrier) a
+    /// [`flush_active_memtable`](Self::flush_active_memtable) that returns `Ok`
+    /// has its writes ordered, and they are durable once this returns `Ok`; a
+    /// caller releases its journal after both. Under any other mode the flush
+    /// alone is durable and this only flushes the device caches.
+    ///
+    /// # Errors
+    ///
+    /// Returns the error of a device flush that failed; the devices not yet
+    /// flushed are not.
+    fn sync_devices(&self) -> crate::Result<()> {
+        let config = self.tree_config();
+        let mut flushed: Vec<(Arc<dyn crate::fs::Fs>, crate::path::PathBuf)> = Vec::new();
+        let levels = (0..config.level_count).map(|level| {
+            let (folder, fs) = config.tables_folder_for_level(level);
+            (fs, folder)
+        });
+        for (fs, path) in
+            core::iter::once((Arc::clone(&config.fs), config.path.clone())).chain(levels)
+        {
+            // One flush per device: a folder on a device already flushed
+            // gains nothing from another.
+            let volume = fs.volume_id(&path);
+            if flushed.iter().any(|(done, at)| {
+                (Arc::ptr_eq(done, &fs) && *at == path)
+                    || volume.is_some_and(|volume| done.volume_id(at) == Some(volume))
+            }) {
+                continue;
+            }
+            match fs.sync_device(&path) {
+                Ok(()) => flushed.push((fs, path)),
+                // A folder never made holds nothing to flush.
+                Err(e) if e.kind() == crate::io::ErrorKind::NotFound => {}
+                Err(e) => return Err(e.into()),
+            }
+        }
         Ok(())
     }
 
