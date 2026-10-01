@@ -186,6 +186,28 @@ fn a_read_reported_done_without_being_filled_comes_back_failed() {
     }
 }
 
+/// A wait for none of the reads is a look at what is ready: the default
+/// queue reads only when it is waited on, so it reads nothing and keeps what
+/// it holds, which a wait for one then reads.
+#[test]
+fn a_wait_for_no_read_reads_nothing() {
+    let (fs, file) = backend(Answer::Serve);
+    let mut queue = fs.read_queue();
+    queue.submit(QueuedRead {
+        tag: 5,
+        file: Arc::clone(&file),
+        offset: 0,
+        buf: alloc::vec![0; 4],
+    });
+    let mut handed = 0;
+    queue.wait(0, &mut |_| handed += 1);
+    assert_eq!(handed, 0, "nothing was ready");
+    assert_eq!(queue.outstanding(), 1, "the read is still held");
+    queue.wait(1, &mut |_| handed += 1);
+    assert_eq!(handed, 1);
+    assert_eq!(queue.outstanding(), 0);
+}
+
 /// Waiting on a queue that holds nothing hands nothing over and does not ask
 /// the backend for anything.
 #[test]

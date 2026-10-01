@@ -843,9 +843,9 @@ pub trait ReadWake: Send + Sync {
 }
 
 /// The [`ReadQueue`] of a backend that cannot take reads while others are in
-/// flight: the reads submitted since the last wait are read in one
-/// [`Fs::read_blocks_batched_each`] call, which a backend overriding it still
-/// batches.
+/// flight: the reads submitted since the last wait for at least one are read
+/// in one [`Fs::read_blocks_batched_each`] call, which a backend overriding
+/// it still batches.
 struct BatchedReadQueue<'a, F: Fs + ?Sized> {
     fs: &'a F,
     submitted: Vec<QueuedRead>,
@@ -860,8 +860,10 @@ impl<F: Fs + ?Sized> ReadQueue for BatchedReadQueue<'_, F> {
         self.submitted.len()
     }
 
-    fn wait(&mut self, _min: usize, on_done: &mut dyn FnMut(ReadDone)) {
-        if self.submitted.is_empty() {
+    fn wait(&mut self, min: usize, on_done: &mut dyn FnMut(ReadDone)) {
+        // Nothing finishes between waits here, so a wait for none has
+        // nothing to hand over, and reading would block the caller polling.
+        if min == 0 || self.submitted.is_empty() {
             return;
         }
         let mut reads = core::mem::take(&mut self.submitted);
