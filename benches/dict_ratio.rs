@@ -46,9 +46,7 @@ fn main() -> std::io::Result<()> {
 mod measure {
     use lsm_tree::compression::{CompressionProvider as _, ZstdBackend, ZstdDictionary};
     use std::time::Instant;
-    use structured_zstd::dictionary::{
-        FastCoverOptions, FinalizeOptions, create_fastcover_dict_from_slice,
-    };
+    use structured_zstd::dictionary::{FastCoverOptions, FinalizeOptions, optimize_fastcover_dict};
 
     /// zstd level the engine's default dictionary policy would use.
     const LEVEL: i32 = 3;
@@ -142,12 +140,16 @@ mod measure {
         out
     }
 
-    fn train(corpus: &[u8]) -> (ZstdDictionary, std::time::Duration) {
-        let mut raw = Vec::new();
+    /// Trains on `samples`, one sample per block, the unit a block dictionary
+    /// is later applied to. The default options leave `k` and `d` to the
+    /// trainer's search, as `zstd --train-fastcover` does.
+    fn train(samples: &[Vec<u8>]) -> (ZstdDictionary, std::time::Duration) {
+        let corpus = samples.concat();
+        let sizes: Vec<usize> = samples.iter().map(Vec::len).collect();
         let started = Instant::now();
-        create_fastcover_dict_from_slice(
-            corpus,
-            &mut raw,
+        let (raw, _) = optimize_fastcover_dict(
+            &corpus,
+            &sizes,
             DICT_SIZE,
             &FastCoverOptions::default(),
             FinalizeOptions::default(),
@@ -291,15 +293,15 @@ mod measure {
     fn dump_artifacts(dir: &str) -> std::io::Result<()> {
         std::fs::create_dir_all(dir)?;
         for w in WORKLOADS {
-            let corpus: Vec<u8> = blocks(w, 0..20_000, 64 * 1024).concat();
-            let (dict, _) = train(&corpus);
+            let samples = blocks(w, 0..20_000, 64 * 1024);
+            let (dict, _) = train(&samples);
             let slug: String = w
                 .name
                 .chars()
                 .take_while(|c| c.is_ascii_alphanumeric())
                 .collect();
 
-            std::fs::write(format!("{dir}/{slug}.corpus.bin"), &corpus)?;
+            std::fs::write(format!("{dir}/{slug}.corpus.bin"), samples.concat())?;
             std::fs::write(format!("{dir}/{slug}.dict.bin"), dict.raw())?;
             for block_size in [4 * 1024usize, 16 * 1024, 64 * 1024] {
                 let block = blocks(w, 20_000..40_000, block_size)
@@ -350,8 +352,7 @@ mod measure {
             "workload", "block", "level", "dict", "bytes", "vs best", "write MiB/s", "read MiB/s",
         );
         for w in WORKLOADS {
-            let corpus: Vec<u8> = blocks(w, 0..20_000, 64 * 1024).concat();
-            let (dict, _) = train(&corpus);
+            let (dict, _) = train(&blocks(w, 0..20_000, 64 * 1024));
             let slug = w.name.split_whitespace().next().unwrap_or(w.name);
 
             for block_size in [4 * 1024usize, 16 * 1024] {
@@ -409,8 +410,7 @@ mod measure {
         for w in WORKLOADS {
             // Train on an EARLIER generation than the one measured, so the
             // number is not the flattering "trained on exactly this data".
-            let corpus: Vec<u8> = blocks(w, 0..20_000, 64 * 1024).concat();
-            let (dict, _) = train(&corpus);
+            let (dict, _) = train(&blocks(w, 0..20_000, 64 * 1024));
 
             for block_size in [4 * 1024usize, 16 * 1024, 64 * 1024] {
                 let measured = blocks(w, 20_000..40_000, block_size);
@@ -433,12 +433,12 @@ mod measure {
         println!("{:<32} {:>12} {:>12}", "corpus", "bytes", "train time");
         for w in WORKLOADS {
             for records in [20_000u64, 100_000] {
-                let corpus: Vec<u8> = blocks(w, 0..records, 64 * 1024).concat();
-                let (_, elapsed) = train(&corpus);
+                let samples = blocks(w, 0..records, 64 * 1024);
+                let (_, elapsed) = train(&samples);
                 println!(
                     "{:<32} {:>12} {:>10.1}ms",
                     w.name,
-                    corpus.len(),
+                    samples.iter().map(Vec::len).sum::<usize>(),
                     elapsed.as_secs_f64() * 1000.0,
                 );
             }
@@ -450,8 +450,7 @@ mod measure {
             "workload", "same gen", "10x later", "100x later"
         );
         for w in WORKLOADS {
-            let corpus: Vec<u8> = blocks(w, 0..20_000, 64 * 1024).concat();
-            let (dict, _) = train(&corpus);
+            let (dict, _) = train(&blocks(w, 0..20_000, 64 * 1024));
 
             let mut saved = Vec::new();
             for start in [0u64, 200_000, 2_000_000] {
@@ -471,8 +470,7 @@ mod measure {
             "workload / variant", "mean", "p50", "p99", "p999",
         );
         for w in WORKLOADS {
-            let corpus: Vec<u8> = blocks(w, 0..20_000, 64 * 1024).concat();
-            let (dict, _) = train(&corpus);
+            let (dict, _) = train(&blocks(w, 0..20_000, 64 * 1024));
             let sample = blocks(w, 20_000..21_000, 16 * 1024)
                 .into_iter()
                 .next()
