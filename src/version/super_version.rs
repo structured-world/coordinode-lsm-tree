@@ -20,6 +20,38 @@ fn remove_if_present(fs: &dyn Fs, path: &Path) -> crate::Result<()> {
         Err(e) => Err(e.into()),
     }
 }
+
+/// Syncs, once each, the directories holding the tables `next` adds over
+/// `prior`: a new table's name is durable only once its directory is, and the
+/// manifest edit that names it must not outlive it. The table writers sync
+/// only their files, so a transition writing N tables to one directory syncs
+/// that directory once, not N times.
+fn sync_new_table_directories(
+    prior: &Version,
+    next: &Version,
+    sync_mode: SyncMode,
+) -> crate::Result<()> {
+    let known: crate::HashSet<crate::TableId> = prior.iter_tables().map(crate::Table::id).collect();
+    let mut synced: Vec<(&Arc<dyn Fs>, &Path)> = Vec::new();
+    for table in next.iter_tables() {
+        if known.contains(&table.id()) {
+            continue;
+        }
+        let Some(folder) = table.path.parent() else {
+            continue;
+        };
+        if synced
+            .iter()
+            .any(|&(fs, at)| Arc::ptr_eq(fs, &table.fs) && at == folder)
+        {
+            continue;
+        }
+        crate::file::fsync_directory(folder, &*table.fs, sync_mode)?;
+        synced.push((&table.fs, folder));
+    }
+    Ok(())
+}
+
 use alloc::sync::Arc;
 #[cfg(not(feature = "std"))]
 use alloc::vec::Vec;
@@ -385,6 +417,7 @@ impl SuperVersions {
             next_version.version.set_retention_floor(floor);
         }
 
+        sync_new_table_directories(&prior.version, &next_version.version, self.sync_mode)?;
         self.persist_change(
             tree_path,
             &prior.version,

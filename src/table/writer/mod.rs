@@ -4236,17 +4236,9 @@ impl Writer {
         }
         let checksum = checksum.checksum();
 
-        // IMPORTANT: fsync folder on Unix
-
-        #[expect(
-            clippy::expect_used,
-            reason = "if there's no parent folder, something has gone horribly wrong"
-        )]
-        crate::file::fsync_directory(
-            self.path.parent().expect("should have folder"),
-            &*self.fs,
-            self.sync_mode,
-        )?;
+        // The folder is not synced here: the install that names this table
+        // syncs each folder its new tables went to, once for the whole
+        // transition, before the manifest edit.
 
         log::debug!(
             "Written {} items in {} blocks into new table file #{}, written {} MiB",
