@@ -147,6 +147,12 @@ struct LevelTable<'a, 'k> {
     batch: Vec<(&'k [u8], u64)>,
     batch_idx: Vec<usize>,
     read: Option<crate::table::staged::StagedRead<'a>>,
+    /// The file the first stage opened, held for every later stage and the
+    /// data reads: on a level wider than the descriptor cache, the cache has
+    /// evicted it by then, and opening it again is a cold open per stage. The
+    /// data tasks hold every table's file at once anyway, so holding it from
+    /// the first stage raises no peak of open files.
+    file: Option<Arc<dyn crate::fs::FsFile>>,
 }
 
 /// A data block task's block before its chunk is read.
@@ -3814,6 +3820,7 @@ impl Tree {
                     batch,
                     batch_idx,
                     read,
+                    file: None,
                 });
             }
         }
@@ -3830,14 +3837,17 @@ impl Tree {
             batch,
             batch_idx,
             read,
+            file: staged_file,
         } in tables
         {
             // The serial planner hands over the file it opened, which the
-            // blocks are read through; a staged plan opens it here.
+            // blocks are read through; a staged plan hands over the one its
+            // stages read through, and opens it here only when every stage
+            // was answered from the cache.
             let (planned_file, table_seqno, blocks, tally) = match read {
                 Some(read) if read.is_done() => {
                     let (table_seqno, blocks, tally) = read.into_plan();
-                    (None, table_seqno, blocks, tally)
+                    (staged_file, table_seqno, blocks, tally)
                 }
                 // Served by the serial planner, whose reads are authoritative:
                 // a genuine failure surfaces here instead of letting a lower
@@ -3935,9 +3945,15 @@ impl Tree {
                         entry.read = None;
                         break;
                     };
-                    let Ok(file) = table.open_file() else {
-                        entry.read = None;
-                        break;
+                    let file = if let Some(file) = &entry.file {
+                        Arc::clone(file)
+                    } else {
+                        let Ok(file) = table.open_file() else {
+                            entry.read = None;
+                            break;
+                        };
+                        entry.file = Some(Arc::clone(&file));
+                        file
                     };
                     table.record_batched_read(block_type, need);
                     let slot = if let Some(slot) =

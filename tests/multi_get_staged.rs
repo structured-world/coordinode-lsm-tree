@@ -1226,6 +1226,103 @@ fn a_level_beside_a_queue_that_cannot_wake_it_is_still_read() -> lsm_tree::Resul
     Ok(())
 }
 
+/// A backend counting the opens of table files, delegating to [`StdFs`].
+struct OpenCountFs(Arc<std::sync::atomic::AtomicUsize>);
+
+impl Fs for OpenCountFs {
+    fn open(&self, path: &Path, opts: &FsOpenOptions) -> io::Result<Box<dyn FsFile>> {
+        if path.parent().and_then(Path::file_name) == Some(std::ffi::OsStr::new("tables")) {
+            self.0.fetch_add(1, std::sync::atomic::Ordering::Relaxed);
+        }
+        StdFs.open(path, opts)
+    }
+
+    fn create_dir_all(&self, path: &Path) -> io::Result<()> {
+        StdFs.create_dir_all(path)
+    }
+
+    fn read_dir(&self, path: &Path) -> io::Result<Vec<FsDirEntry>> {
+        StdFs.read_dir(path)
+    }
+
+    fn remove_file(&self, path: &Path) -> io::Result<()> {
+        StdFs.remove_file(path)
+    }
+
+    fn remove_dir_all(&self, path: &Path) -> io::Result<()> {
+        StdFs.remove_dir_all(path)
+    }
+
+    fn rename(&self, from: &Path, to: &Path) -> io::Result<()> {
+        StdFs.rename(from, to)
+    }
+
+    fn metadata(&self, path: &Path) -> io::Result<FsMetadata> {
+        StdFs.metadata(path)
+    }
+
+    fn sync_directory(&self, path: &Path) -> io::Result<()> {
+        StdFs.sync_directory(path)
+    }
+
+    fn exists(&self, path: &Path) -> io::Result<bool> {
+        StdFs.exists(path)
+    }
+}
+
+/// A level wider than the descriptor cache opens each table's file once for
+/// the whole staged read: its filter, index and data stages share the file the
+/// first of them opened, instead of the cache evicting it between stages and
+/// each stage opening it again.
+#[test]
+fn a_level_wider_than_the_descriptor_cache_opens_each_table_once() -> lsm_tree::Result<()> {
+    // Well past the descriptor cache, whose shards keep an entry each.
+    const TABLES: u32 = 64;
+    let dir = tempfile::tempdir()?;
+    let opens = Arc::new(std::sync::atomic::AtomicUsize::new(0));
+    let fs: Arc<dyn Fs> = Arc::new(OpenCountFs(Arc::clone(&opens)));
+    let config = || {
+        Config::new(
+            dir.path(),
+            SequenceNumberCounter::default(),
+            SequenceNumberCounter::default(),
+        )
+        .with_shared_fs(Arc::clone(&fs))
+        // No cache, so every table's index is read in a stage after its
+        // filter, and a descriptor cache far narrower than the level.
+        .use_cache(Arc::new(Cache::with_capacity_bytes(0)))
+        .use_descriptor_table(Some(Arc::new(lsm_tree::DescriptorTable::new(2))))
+        .filter_block_pinning_policy(PinningPolicy::all(false))
+        .index_block_pinning_policy(PinningPolicy::all(false))
+    };
+    {
+        let tree = config().open()?;
+        let mut seqno = 0;
+        for table in 0..TABLES {
+            for row in 0..200u32 {
+                tree.insert(format!("t{table:03}r{row:04}"), vec![b'v'; 64], seqno);
+                seqno += 1;
+            }
+            tree.flush_active_memtable(0)?;
+        }
+    }
+    let keys: Vec<String> = (0..TABLES)
+        .flat_map(|table| [format!("t{table:03}r0010"), format!("t{table:03}r0150")])
+        .collect();
+    let tree = config().open()?;
+    let expected = one_by_one(&tree, &keys)?;
+    opens.store(0, std::sync::atomic::Ordering::Relaxed);
+
+    let values = tree.multi_get(&keys, SeqNo::MAX)?;
+    let opened = opens.load(std::sync::atomic::Ordering::Relaxed);
+    assert!(
+        opened <= TABLES as usize,
+        "{TABLES} tables opened {opened} times for one batch"
+    );
+    assert_eq!(values, expected);
+    Ok(())
+}
+
 /// A tree whose level 0 holds two tables on `primary` and two on `routed`, as
 /// after level 0 was routed away from the primary folder, reopened with no
 /// cache; and the keys a batch reads: one present and one absent per table.
