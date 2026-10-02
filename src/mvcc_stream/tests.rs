@@ -406,6 +406,47 @@ fn mvcc_stream_failed_key_is_skipped_from_the_other_end() {
     assert_eq!(rest, ["x"], "back failure, front drain");
 }
 
+/// What is left of a key that failed at one end is skipped by the other end
+/// before it is resolved: resolving it could only fail again (here the
+/// operator always fails) and report a second error for the same key.
+#[test]
+fn mvcc_stream_failed_key_is_skipped_before_the_other_end_resolves_it() {
+    struct FailMerge;
+    impl crate::merge_operator::MergeOperator for FailMerge {
+        fn merge(
+            &self,
+            _: &[u8],
+            _: Option<&[u8]>,
+            _: &[&[u8]],
+        ) -> crate::Result<crate::UserValue> {
+            Err(crate::Error::MergeOperator)
+        }
+    }
+
+    let source = Scripted::new(vec![
+        kv("a", "op3", 999, ValueType::MergeOperand),
+        named_error("e"),
+        kv("a", "op2", 998, ValueType::MergeOperand),
+        kv("a", "base", 997, ValueType::Value),
+        kv("b", "b", 1, ValueType::Value),
+    ]);
+    let mut stream = MvccStream::new(source, Some(Arc::new(FailMerge)));
+    assert_eq!(stream.next().map(shown).as_deref(), Some("e"));
+    let rest: Vec<String> = stream.rev().map(shown).collect();
+    assert_eq!(rest, ["b"], "front failure, back drain");
+
+    let source = Scripted::new(vec![
+        kv("x", "x", 1, ValueType::Value),
+        kv("a", "op", 999, ValueType::MergeOperand),
+        named_error("e"),
+        kv("a", "base", 997, ValueType::Value),
+    ]);
+    let mut stream = MvccStream::new(source, Some(Arc::new(FailMerge)));
+    assert_eq!(stream.next_back().map(shown).as_deref(), Some("e"));
+    let rest: Vec<String> = stream.map(shown).collect();
+    assert_eq!(rest, ["x"], "back failure, front drain");
+}
+
 /// A reposition starts fresh: what was left to skip at the old position
 /// does not surface at the new one.
 #[test]

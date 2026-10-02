@@ -402,19 +402,83 @@ impl<I: DoubleEndedIterator<Item = crate::Result<InternalValue>>, L: SeparatedBa
     type Item = crate::Result<InternalValue>;
 
     fn next(&mut self) -> Option<Self::Item> {
-        loop {
-            let item = self.step_front()?;
-            // The back failed on this key: what reaches the front of it is
-            // what the failure left, never the key's value. The front has now
-            // taken every remaining version, so the back's skip is done.
-            if let Ok(kv) = &item
-                && let Some(failed) = &self.skip_back
-                && crate::comparator::same_user_key(&kv.key.user_key, failed)
-            {
-                self.skip_back = None;
-                continue;
+        // The back failed on a key: what reaches the front of it is what the
+        // failure left, never the key's value, so it is skipped before it is
+        // resolved (resolving could only fail again).
+        if let Some(failed) = self.skip_back.take() {
+            match self.skip_key_at_front(&failed) {
+                Skipped::Done => {}
+                Skipped::NotReached => self.skip_back = Some(failed),
+                Skipped::Error(e) => {
+                    self.skip_back = Some(failed);
+                    return Some(Err(e));
+                }
             }
-            return Some(item);
+        }
+        self.step_front()
+    }
+}
+
+/// What skipping a failed key at one end found.
+enum Skipped {
+    /// The key's versions were met there and are all behind.
+    Done,
+    /// The key has not reached that end yet.
+    NotReached,
+    /// An error was met among the key's versions; more may follow.
+    Error(crate::Error),
+}
+
+impl<I: DoubleEndedIterator<Item = crate::Result<InternalValue>>, L: SeparatedBase>
+    MvccStream<I, L>
+{
+    // Skips `key`'s versions at the front, up to the first error met.
+    fn skip_key_at_front(&mut self, key: &UserKey) -> Skipped {
+        let mut met = false;
+        loop {
+            let Some(next) = self.inner.next_if(|kv| {
+                if let Ok(kv) = kv {
+                    crate::comparator::same_user_key(&kv.key.user_key, key)
+                } else {
+                    // An error is taken only once the key was met: before
+                    // that it belongs to whatever key comes first.
+                    met
+                }
+            }) else {
+                return if met || self.inner.peek().is_none() {
+                    Skipped::Done
+                } else {
+                    Skipped::NotReached
+                };
+            };
+            match next {
+                Ok(_) => met = true,
+                Err(e) => return Skipped::Error(e),
+            }
+        }
+    }
+
+    // The back counterpart of `skip_key_at_front`.
+    fn skip_key_at_back(&mut self, key: &UserKey) -> Skipped {
+        let mut met = false;
+        while let Some(prev) = self.inner.peek_back() {
+            match prev {
+                Ok(prev) if !crate::comparator::same_user_key(&prev.key.user_key, key) => {
+                    break;
+                }
+                Err(_) if !met => break,
+                _ => {}
+            }
+            match self.inner.next_back() {
+                Some(Err(e)) => return Skipped::Error(e),
+                Some(Ok(_)) => met = true,
+                None => break,
+            }
+        }
+        if met || self.inner.peek_back().is_none() {
+            Skipped::Done
+        } else {
+            Skipped::NotReached
         }
     }
 }
@@ -454,19 +518,19 @@ impl<I: DoubleEndedIterator<Item = crate::Result<InternalValue>>, L: SeparatedBa
     DoubleEndedIterator for MvccStream<I, L>
 {
     fn next_back(&mut self) -> Option<Self::Item> {
-        loop {
-            let item = self.step_back()?;
-            // The mirror of `next`: a key the front failed on yields nothing
-            // here, and the back has now taken every remaining version of it.
-            if let Ok(kv) = &item
-                && let Some(failed) = &self.skip_front
-                && crate::comparator::same_user_key(&kv.key.user_key, failed)
-            {
-                self.skip_front = None;
-                continue;
+        // The mirror of `next`: a key the front failed on is skipped here
+        // before it is resolved.
+        if let Some(failed) = self.skip_front.take() {
+            match self.skip_key_at_back(&failed) {
+                Skipped::Done => {}
+                Skipped::NotReached => self.skip_front = Some(failed),
+                Skipped::Error(e) => {
+                    self.skip_front = Some(failed);
+                    return Some(Err(e));
+                }
             }
-            return Some(item);
         }
+        self.step_back()
     }
 }
 
