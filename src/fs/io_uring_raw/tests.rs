@@ -328,7 +328,8 @@ fn errno_maps_to_expected_error_kinds() {
     assert_eq!(errno_to_kind(13), ErrorKind::PermissionDenied); // EACCES
     assert_eq!(errno_to_kind(17), ErrorKind::AlreadyExists); // EEXIST
     assert_eq!(errno_to_kind(22), ErrorKind::InvalidInput); // EINVAL
-    assert_eq!(errno_to_kind(95), ErrorKind::Unsupported); // EOPNOTSUPP
+    // Arch-specific (95 asm-generic, 122 MIPS, 45 SPARC).
+    assert_eq!(errno_to_kind(libc::EOPNOTSUPP), ErrorKind::Unsupported);
     assert_eq!(errno_to_kind(132), ErrorKind::Other); // unmapped
 }
 

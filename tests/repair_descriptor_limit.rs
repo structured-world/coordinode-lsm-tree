@@ -15,6 +15,47 @@ const TABLES: usize = 1_000;
 /// own, well below one descriptor per table.
 const DESCRIPTOR_LIMIT: u64 = 512;
 
+/// The descriptor limit is the process's, so the tests that lower it take
+/// turns: under a harness that runs them on threads of one process, each
+/// would otherwise repair under the other's limit.
+static LIMIT_TURN: std::sync::Mutex<()> = std::sync::Mutex::new(());
+
+/// A test's turn at the process's descriptor limit, taken before it builds
+/// its tree; the soft limit it found is restored when the turn ends.
+struct DescriptorLimit {
+    soft: u64,
+    hard: u64,
+    _turn: std::sync::MutexGuard<'static, ()>,
+}
+
+impl DescriptorLimit {
+    fn take_turn() -> std::io::Result<Self> {
+        let turn = LIMIT_TURN
+            .lock()
+            .unwrap_or_else(std::sync::PoisonError::into_inner);
+        let (soft, hard) = rlimit::getrlimit(rlimit::Resource::NOFILE)?;
+        Ok(Self {
+            soft,
+            hard,
+            _turn: turn,
+        })
+    }
+
+    fn lower_to(&self, limit: u64) -> std::io::Result<()> {
+        rlimit::setrlimit(rlimit::Resource::NOFILE, limit, self.hard)
+    }
+}
+
+impl Drop for DescriptorLimit {
+    fn drop(&mut self) {
+        // Best effort on the way out: a limit left lowered only narrows what
+        // later tests of this process may open, and they fail loudly if so.
+        if let Err(e) = rlimit::setrlimit(rlimit::Resource::NOFILE, self.soft, self.hard) {
+            eprintln!("restoring the descriptor limit failed: {e}");
+        }
+    }
+}
+
 /// A one-byte table target ends a table per data block, and a value as large
 /// as a block ends a block per key, so one compaction leaves a table per key.
 fn fill_one_table_per_key(tree: &impl AbstractTree) -> lsm_tree::Result<Vec<u8>> {
@@ -32,6 +73,7 @@ fn fill_one_table_per_key(tree: &impl AbstractTree) -> lsm_tree::Result<Vec<u8>>
 
 #[test]
 fn repair_of_more_tables_than_open_descriptors_recovers_every_table() -> lsm_tree::Result<()> {
+    let limit = DescriptorLimit::take_turn()?;
     let dir = tempfile::tempdir()?;
     let config = || {
         Config::new(
@@ -44,9 +86,7 @@ fn repair_of_more_tables_than_open_descriptors_recovers_every_table() -> lsm_tre
     let value = fill_one_table_per_key(&config().open()?)?;
     common::nuke_manifest(dir.path())?;
 
-    let (_, hard) = rlimit::getrlimit(rlimit::Resource::NOFILE)?;
-    rlimit::setrlimit(rlimit::Resource::NOFILE, DESCRIPTOR_LIMIT, hard)?;
-
+    limit.lower_to(DESCRIPTOR_LIMIT)?;
     let report = config().repair()?;
     assert_eq!(
         report.recovered,
@@ -76,6 +116,7 @@ fn repair_of_more_tables_than_open_descriptors_recovers_every_table() -> lsm_tre
 fn salvage_of_more_tables_than_open_descriptors_keeps_every_replacement() -> lsm_tree::Result<()> {
     const DAMAGED: u64 = 300;
     const LIMIT: u64 = 128;
+    let limit = DescriptorLimit::take_turn()?;
     let dir = tempfile::tempdir()?;
     let config = || {
         Config::new(
@@ -104,9 +145,7 @@ fn salvage_of_more_tables_than_open_descriptors_keeps_every_replacement() -> lsm
     }
     common::nuke_manifest(dir.path())?;
 
-    let (_, hard) = rlimit::getrlimit(rlimit::Resource::NOFILE)?;
-    rlimit::setrlimit(rlimit::Resource::NOFILE, LIMIT, hard)?;
-
+    limit.lower_to(LIMIT)?;
     let report = config().repair_with_salvage(true)?;
     assert_eq!(
         (report.recovered, report.salvaged),
