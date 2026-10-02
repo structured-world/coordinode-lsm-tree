@@ -126,6 +126,92 @@ fn drain_blobs_follows_the_tree_comparator() -> crate::Result<()> {
     Ok(())
 }
 
+/// Draining a slice's unclaimed frames takes every frame below the bound,
+/// records the proven ones and leaves the bound key's frames in place.
+#[test]
+#[expect(clippy::unwrap_used, reason = "test assertion")]
+fn drain_unclaimed_below_takes_the_frames_below_the_bound() -> crate::Result<()> {
+    let mut resync = entry(1, b"c", 7)?;
+    resync.0.resynced = true;
+    let mut iter = [
+        entry(0, b"a", 0),
+        entry(1, b"b", 4),
+        Ok(resync),
+        entry(0, b"d", 1),
+    ]
+    .into_iter()
+    .peekable();
+
+    let mut recorded = Vec::new();
+    drain_unclaimed_below(
+        &mut iter,
+        b"d",
+        crate::comparator::default_comparator().as_ref(),
+        &mut |id, frame_end| recorded.push((id, frame_end)),
+        &|| false,
+    )?;
+
+    assert_eq!(
+        recorded,
+        [(0, 1), (1, 5)],
+        "the resynced frame moves nothing"
+    );
+    assert_eq!(entry(0, b"d", 1)?, iter.next().unwrap()?);
+    Ok(())
+}
+
+/// A scan error met while draining ends the drain and is returned, not
+/// skipped: the frontier never moves past a frame that could not be read.
+#[test]
+fn drain_unclaimed_below_returns_a_scan_error() {
+    let mut iter = [
+        entry(0, b"a", 0),
+        Err(crate::Error::Io(crate::io::Error::other(
+            "unreadable frame",
+        ))),
+        entry(0, b"b", 1),
+    ]
+    .into_iter()
+    .peekable();
+
+    let mut recorded = Vec::new();
+    let result = drain_unclaimed_below(
+        &mut iter,
+        b"z",
+        crate::comparator::default_comparator().as_ref(),
+        &mut |id, frame_end| recorded.push((id, frame_end)),
+        &|| false,
+    );
+
+    assert!(
+        matches!(result, Err(crate::Error::Io(_))),
+        "the scan error is returned: {result:?}"
+    );
+    assert_eq!(recorded, [(0, 1)], "only the frame before the error counts");
+}
+
+/// A stop requested while a slice drains its unclaimed frames ends the drain
+/// with the compaction's cancellation error instead of scanning on.
+#[test]
+fn drain_unclaimed_below_stops_on_request() {
+    let mut iter = [entry(0, b"a", 0), entry(0, b"b", 1)]
+        .into_iter()
+        .peekable();
+
+    let mut recorded = 0usize;
+    let result = drain_unclaimed_below(
+        &mut iter,
+        b"z",
+        crate::comparator::default_comparator().as_ref(),
+        &mut |_, _| recorded += 1,
+        &|| true,
+    );
+
+    assert!(result.is_err(), "a stop must end the drain with an error");
+    assert_eq!(recorded, 0, "nothing is drained after the stop");
+    assert!(iter.next().is_some(), "the frames stay unread");
+}
+
 #[test]
 fn drain_blobs_does_not_advance_the_frontier_past_a_resynced_frame() -> crate::Result<()> {
     // A RESYNCED entry's `frame_end` boundary is unproven (see
