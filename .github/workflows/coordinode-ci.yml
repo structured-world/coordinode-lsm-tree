@@ -291,7 +291,9 @@ jobs:
         continue-on-error: true
       - name: Install nextest from crates.io (fallback)
         if: steps.install-nextest.outcome == 'failure'
-        run: cargo install cargo-nextest --locked
+        # --force: a binary already in ~/.cargo/bin (runner image, restored
+        # cache) must not stop the fallback from installing.
+        run: cargo install cargo-nextest --locked --force
       - name: Run tests
         # tools/db_bench is a standalone crate, not in workspace — built separately
         env:
@@ -338,7 +340,9 @@ jobs:
         continue-on-error: true
       - name: Install nextest from crates.io (fallback)
         if: steps.install-nextest.outcome == 'failure'
-        run: cargo install cargo-nextest --locked
+        # --force: a binary already in ~/.cargo/bin (runner image, restored
+        # cache) must not stop the fallback from installing.
+        run: cargo install cargo-nextest --locked --force
       - name: Check db_bench crate
         working-directory: tools/db_bench
         run: cargo check --all-features
@@ -382,7 +386,9 @@ jobs:
         continue-on-error: true
       - name: Install nextest from crates.io (fallback)
         if: steps.install-nextest.outcome == 'failure'
-        run: cargo install cargo-nextest --locked
+        # --force: a binary already in ~/.cargo/bin (runner image, restored
+        # cache) must not stop the fallback from installing.
+        run: cargo install cargo-nextest --locked --force
       - name: Run bitrot heal fuzzer
         # Pin the reproducer directory explicitly so the test's dump location does
         # not depend on the process working directory (robust if the crate ever
@@ -551,7 +557,9 @@ jobs:
         continue-on-error: true
       - name: Install nextest from crates.io (fallback)
         if: steps.install-nextest.outcome == 'failure'
-        run: cargo install cargo-nextest --locked
+        # --force: a binary already in ~/.cargo/bin (runner image, restored
+        # cache) must not stop the fallback from installing.
+        run: cargo install cargo-nextest --locked --force
       - name: Run tests (all-features) with coverage
         env:
           # Same proptest budget as the regular test job — without
