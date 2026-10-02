@@ -3118,15 +3118,17 @@ fn recover_blob_files(
                     &*config.fs,
                     &salvaged_path,
                 )?);
-                let bf = crate::vlog::recover_blob_file_from(
+                let held = held_descriptors(config);
+                let bf = crate::vlog::recover_blob_file_cached(
                     &salvaged_path,
                     new_id,
                     checksum,
-                    0,
+                    held.as_ref().map_or(0, |(_, tree_id)| *tree_id),
                     &config.fs,
                     0,
                     #[cfg(zstd_any)]
                     &config.current_zstd_dictionaries(),
+                    held.as_ref().map(|(cache, _)| cache),
                 )?;
                 Ok(Some((bf, report)))
             })();
@@ -3234,15 +3236,20 @@ fn recover_blob_files(
             }
         };
 
-        match crate::vlog::recover_blob_file_from(
+        // Held until the rebuilt manifest is published, as a recovered table
+        // is, so its descriptor goes through the repair's cache (see
+        // `held_recover_params`).
+        let held = held_descriptors(config);
+        match crate::vlog::recover_blob_file_cached(
             &blob_path,
             blob_id,
             checksum,
-            0,
+            held.as_ref().map_or(0, |(_, tree_id)| *tree_id),
             &config.fs,
             frontier,
             #[cfg(zstd_any)]
             &config.current_zstd_dictionaries(),
+            held.as_ref().map(|(cache, _)| cache),
         ) {
             Ok(bf) => {
                 if frontier > 0 {
@@ -3902,15 +3909,19 @@ struct PublishedBlobReplacements<'a> {
     blobs_folder: PathBuf,
     ids: Vec<crate::vlog::BlobFileId>,
     armed: bool,
+    /// The repair's first tree id: the replacements' descriptors are cached
+    /// under ids from here on (see `HeldDescriptors`).
+    first_tree_id: crate::tree::inner::TreeId,
 }
 
 impl<'a> PublishedBlobReplacements<'a> {
-    fn new(config: &'a Config) -> Self {
+    fn new(config: &'a Config, first_tree_id: crate::tree::inner::TreeId) -> Self {
         Self {
             config,
             blobs_folder: config.path.join(crate::file::BLOBS_FOLDER),
             ids: Vec::new(),
             armed: true,
+            first_tree_id,
         }
     }
 
@@ -3976,6 +3987,13 @@ impl Drop for PublishedBlobReplacements<'_> {
     fn drop(&mut self) {
         if !self.armed || self.ids.is_empty() {
             return;
+        }
+        // The repair is ending: its cached descriptors, the replacements'
+        // among them, close before the files go, or a backend that refuses to
+        // remove an open file keeps them. The repair's own guard sweeps the
+        // same ids later, and only after this one has run.
+        if let Some(cache) = &self.config.descriptor_table {
+            cache.remove_trees_from(self.first_tree_id);
         }
         // Best-effort: the run is already aborting with its own error, and a
         // survivor is an unreferenced file the next open's orphan sweep (or
@@ -5364,7 +5382,7 @@ fn rebuild_from_scan(
     // Fresh-id blob replacements this run publishes; removed on ANY exit —
     // an error, a cancellation — before the manifest commit disarms the
     // guard (see `PublishedBlobReplacements`).
-    let mut published_blob_replacements = PublishedBlobReplacements::new(config);
+    let mut published_blob_replacements = PublishedBlobReplacements::new(config, first_tree_id);
     let blob_files_salvaged: Vec<(PathBuf, String)> = Vec::new();
     let mut blob_frag = crate::blob_tree::FragmentationMap::default();
     // Damaged blob originals whose replacement is in the rebuilt manifest.

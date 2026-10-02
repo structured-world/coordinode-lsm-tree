@@ -7332,7 +7332,8 @@ fn blob_recovery_discards_a_file_whose_metadata_id_disagrees() -> crate::Result<
     memfs.rename(&tmp, &one)?;
 
     let config = blob_validation_config(Arc::clone(&memfs));
-    let mut published = super::PublishedBlobReplacements::new(&config);
+    let mut published =
+        super::PublishedBlobReplacements::new(&config, crate::tree::inner::get_next_tree_id());
     let recovery =
         super::recover_blob_files(&config, &mut published, &(0..10).collect(), None, None)?;
     published.disarm();
@@ -7761,7 +7762,8 @@ fn blob_recovery_derives_the_frontier_of_a_punched_blob_file() -> crate::Result<
     )
     .with_shared_fs(memfs);
 
-    let mut published = super::PublishedBlobReplacements::new(&config);
+    let mut published =
+        super::PublishedBlobReplacements::new(&config, crate::tree::inner::get_next_tree_id());
     let recovery =
         super::recover_blob_files(&config, &mut published, &(0..10).collect(), None, None)?;
     published.disarm();
@@ -8270,7 +8272,8 @@ fn blob_recovery_queues_the_drop_of_a_fully_punched_blob_file() -> crate::Result
     memfs.punch_hole(&consumed_path, data_start, data_end - data_start)?;
 
     let config = blob_validation_config(Arc::clone(&memfs));
-    let mut published = super::PublishedBlobReplacements::new(&config);
+    let mut published =
+        super::PublishedBlobReplacements::new(&config, crate::tree::inner::get_next_tree_id());
     let recovery =
         super::recover_blob_files(&config, &mut published, &(0..10).collect(), None, None)?;
     published.disarm();
@@ -9364,7 +9367,8 @@ fn blob_recovery_keeps_a_file_whose_zeroed_tail_follows_live_frames() -> crate::
     memfs.punch_hole(&path, tail_start, data_end - tail_start)?;
 
     let config = blob_validation_config(Arc::clone(&memfs));
-    let mut replacements_guard = super::PublishedBlobReplacements::new(&config);
+    let mut replacements_guard =
+        super::PublishedBlobReplacements::new(&config, crate::tree::inner::get_next_tree_id());
     let recovery = super::recover_blob_files(
         &config,
         &mut replacements_guard,
@@ -14497,7 +14501,8 @@ fn blob_recovery_discards_a_persistently_unreadable_blob_file() -> crate::Result
     )
     .with_shared_fs(memfs.clone());
 
-    let mut published = super::PublishedBlobReplacements::new(&config);
+    let mut published =
+        super::PublishedBlobReplacements::new(&config, crate::tree::inner::get_next_tree_id());
     let recovery =
         super::recover_blob_files(&config, &mut published, &(0..10).collect(), None, None)?;
     published.disarm();
@@ -14549,7 +14554,8 @@ fn blob_recovery_discards_a_duplicate_blob_id() -> crate::Result<()> {
     )
     .with_shared_fs(memfs.clone());
 
-    let mut published = super::PublishedBlobReplacements::new(&config);
+    let mut published =
+        super::PublishedBlobReplacements::new(&config, crate::tree::inner::get_next_tree_id());
     let recovery =
         super::recover_blob_files(&config, &mut published, &(0..10).collect(), None, None)?;
     published.disarm();
@@ -14642,7 +14648,7 @@ fn blob_recovery_propagates_a_transient_checksum_failure() -> crate::Result<()> 
 
     let result = super::recover_blob_files(
         &config,
-        &mut super::PublishedBlobReplacements::new(&config),
+        &mut super::PublishedBlobReplacements::new(&config, crate::tree::inner::get_next_tree_id()),
         &(0..10).collect(),
         None,
         None,
@@ -15869,8 +15875,22 @@ fn repair_cancel_removes_published_blob_replacements() -> crate::Result<()> {
 /// original AGAIN beside it — under the tight disk space this recovery
 /// targets, exactly the extra copy that fails with ENOSPC.
 #[test]
-#[expect(clippy::expect_used, reason = "test code")]
 fn repair_error_removes_published_blob_replacements() -> crate::Result<()> {
+    assert_repair_error_removes_published_blob_replacements(false)
+}
+
+/// The same abort on a backend that refuses to remove a file with an open
+/// handle: the replacement's descriptor the repair cached must be released
+/// before the abort removes it, or the removal fails and leaves the orphan.
+#[test]
+fn repair_error_releases_cached_descriptors_before_removing_replacements() -> crate::Result<()> {
+    assert_repair_error_removes_published_blob_replacements(true)
+}
+
+#[expect(clippy::expect_used, reason = "test code")]
+fn assert_repair_error_removes_published_blob_replacements(
+    refuse_open_removal: bool,
+) -> crate::Result<()> {
     use crate::fs::{Fault, FaultFs, FaultOp, FaultRule, Fs, MemFs};
     use crate::io::ErrorKind;
     use crate::{AbstractTree, Config, KvSeparationOptions, SequenceNumberCounter};
@@ -15931,6 +15951,9 @@ fn repair_error_removes_published_blob_replacements() -> crate::Result<()> {
         FaultRule::new(FaultOp::Read, Fault::Error(ErrorKind::WouldBlock))
             .on_path(blobs.join("1").to_string_lossy()),
     );
+    if refuse_open_removal {
+        fault.injector().refuse_removing_open_files();
+    }
     let result = Config::new(
         &root,
         SequenceNumberCounter::default(),

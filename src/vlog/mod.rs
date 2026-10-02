@@ -170,10 +170,6 @@ pub fn recover_blob_files(
 
     let mut blob_files = Vec::with_capacity(ids.len());
     let mut orphaned_blob_files = vec![];
-    // Deferred cache inserts — only committed after all blobs parse
-    // successfully, so a partial recovery doesn't leak FDs in the
-    // descriptor table.
-    let mut pending_cache_inserts = Vec::new();
 
     for (idx, dirent) in entries.into_iter().enumerate() {
         let file_name = &dirent.file_name;
@@ -230,23 +226,20 @@ pub fn recover_blob_files(
                 Metadata::from_slice(&metadata_slice)?
             };
 
-            let file: Arc<dyn crate::fs::FsFile> = Arc::from(file);
+            // With a descriptor cache the file is closed once its metadata is
+            // read, and reopened through the cache by its first read: holding
+            // every blob file's descriptor until all are recovered would need
+            // one per file, however few the cache keeps. The first read also
+            // opens the path of the copy deduplication below keeps, never a
+            // discarded sighting of the same id.
             let file_accessor = if let Some(dt) = descriptor_table.cloned() {
-                let global_id = (tree_id, blob_file_id).into();
-                // The path rides along so deduplication can drop the handles of
-                // the sightings it discards.
-                pending_cache_inserts.push((
-                    dt.clone(),
-                    global_id,
-                    blob_file_path.clone(),
-                    file.clone(),
-                ));
+                drop(file);
                 FileAccessor::DescriptorTable {
                     table: dt,
                     fs: fs.clone(),
                 }
             } else {
-                FileAccessor::File(file)
+                FileAccessor::File(Arc::from(file))
             };
 
             blob_files.push(BlobFile(Arc::new(BlobFileInner {
@@ -294,18 +287,6 @@ pub fn recover_blob_files(
 
     if blob_files.len() < ids.len() {
         return Err(crate::Error::Unrecoverable);
-    }
-
-    // All blobs parsed successfully — commit FDs to the descriptor cache. The
-    // pending inserts hold one entry per SIGHTING, all under the same
-    // `GlobalTableId`, so inserting them blindly would leave the cache holding
-    // whichever handle came last — possibly the copy just discarded. Keep only
-    // the handle whose path survived deduplication.
-    let retained: crate::HashSet<PathBuf> = blob_files.iter().map(|bf| bf.0.path.clone()).collect();
-    for (dt, global_id, path, file) in pending_cache_inserts {
-        if retained.contains(&path) {
-            dt.insert_for_blob_file(global_id, file);
-        }
     }
 
     log::debug!("Successfully recovered {} blob files", blob_files.len());
@@ -376,6 +357,50 @@ pub fn recover_blob_file_from(
     live_data_start: u64,
     #[cfg(zstd_any)] zstd_dictionaries: &crate::compression::ZstdDictionaries,
 ) -> crate::Result<BlobFile> {
+    recover_blob_file_cached(
+        path,
+        id,
+        checksum,
+        tree_id,
+        fs,
+        live_data_start,
+        #[cfg(zstd_any)]
+        zstd_dictionaries,
+        None,
+    )
+}
+
+/// As [`recover_blob_file_from`], with the file's descriptor kept in
+/// `descriptors` under `tree_id` instead of by the handle, when given: a
+/// caller holding many blob files at once then needs no descriptor per file.
+///
+/// # Errors
+///
+/// Propagates any error from opening or parsing the blob file.
+#[cfg_attr(
+    not(feature = "std"),
+    allow(
+        dead_code,
+        reason = "cached single-file blob recovery for the std-gated repair surface"
+    )
+)]
+#[cfg_attr(
+    zstd_any,
+    expect(
+        clippy::too_many_arguments,
+        reason = "the single-file recovery's inputs plus where its descriptor is kept"
+    )
+)]
+pub fn recover_blob_file_cached(
+    path: &Path,
+    id: BlobFileId,
+    checksum: Checksum,
+    tree_id: TreeId,
+    fs: &Arc<dyn Fs>,
+    live_data_start: u64,
+    #[cfg(zstd_any)] zstd_dictionaries: &crate::compression::ZstdDictionaries,
+    descriptors: Option<&Arc<DescriptorTable>>,
+) -> crate::Result<BlobFile> {
     let mut file = fs.open(path, &crate::fs::FsOpenOptions::new().read(true))?;
 
     // Same meta-section read as `recover_blob_files`' per-id branch above.
@@ -393,6 +418,16 @@ pub fn recover_blob_file_from(
     };
 
     let file: Arc<dyn crate::fs::FsFile> = Arc::from(file);
+    let file_accessor = match descriptors {
+        Some(table) => {
+            table.insert_for_blob_file((tree_id, id).into(), file);
+            FileAccessor::DescriptorTable {
+                table: Arc::clone(table),
+                fs: fs.clone(),
+            }
+        }
+        None => FileAccessor::File(file),
+    };
     Ok(BlobFile(Arc::new(BlobFileInner {
         id,
         path: path.to_path_buf(),
@@ -413,7 +448,7 @@ pub fn recover_blob_file_from(
         punch_on_drop: portable_atomic::AtomicU64::new(u64::MAX),
         checksum,
         live_data_start,
-        file_accessor: FileAccessor::File(file),
+        file_accessor,
         tree_id,
         fs: fs.clone(),
         deletion_pause: once_cell::race::OnceBox::new(),
