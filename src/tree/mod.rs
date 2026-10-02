@@ -165,8 +165,17 @@ enum LevelRead<'a> {
     Pending,
     /// Read in stages.
     Staged(crate::table::staged::StagedRead<'a>),
-    /// Planned serially: its blocks need the load path, or a stage failed.
+    /// To be planned serially: its blocks need the load path, or a stage
+    /// failed.
     Serial,
+    /// Planned serially: its read seqno, the blocks it reads with the
+    /// positions of their keys in its span, and the filter probes planning
+    /// took.
+    Planned(
+        SeqNo,
+        Vec<(crate::table::BlockHandle, Vec<usize>)>,
+        PlanCounts,
+    ),
     /// No key of the batch reads anything in it.
     Nothing,
 }
@@ -178,7 +187,7 @@ impl LevelRead<'_> {
         match self {
             Self::Pending => false,
             Self::Staged(read) => read.is_done(),
-            Self::Serial | Self::Nothing => true,
+            Self::Serial | Self::Planned(..) | Self::Nothing => true,
         }
     }
 }
@@ -3883,58 +3892,22 @@ impl Tree {
         // Every table's filter blocks in one batch, then every table's index
         // blocks in one batch, and so on until each is planned. A table whose
         // stage fails is planned serially below.
-        Self::read_level_stages(&mut tables, &batch, seqno, metadata_budget);
+        let mut stages =
+            level_stages::LevelStages::new(&mut tables, &batch, seqno, metadata_budget);
+        Self::read_level_stages(&mut stages);
 
-        let mut tasks: Vec<BlockTask<'a>> = Vec::new();
-        let mut probes: Vec<(&'a Table, PlanCounts)> = Vec::new();
-        for LevelTable {
-            table, keys, read, ..
-        } in tables
-        {
-            let table_batch = &batch[keys.clone()];
-            let (table_seqno, blocks, tally) = match read {
-                LevelRead::Nothing => continue,
-                LevelRead::Staged(read) if read.is_done() => read.into_plan(),
-                // Served by the serial planner, whose reads are authoritative:
-                // a genuine failure surfaces here instead of letting a lower
-                // level answer a key this table covers. The file it opened is
-                // not kept: the data blocks are read through the file their
-                // chunk opens.
-                _ => {
-                    let mut tally = PlanCounts::default();
-                    let Some((_, table_seqno, _, blocks)) =
-                        table.plan_block_tasks(table_batch, seqno, &mut tally)?
-                    else {
-                        if tally != PlanCounts::default() {
-                            probes.push((table, tally));
-                        }
-                        continue;
-                    };
-                    (table_seqno, blocks, tally)
-                }
-            };
-            if tally != PlanCounts::default() {
-                probes.push((table, tally));
-            }
-            if blocks.is_empty() {
-                continue;
-            }
-            let special = table.is_chunk_special();
-            for (handle, positions) in blocks {
-                let task_keys: Vec<usize> = positions
-                    .iter()
-                    .map(|&pos| remaining[keys.start + pos].0)
-                    .collect();
-                tasks.push(BlockTask {
-                    table,
-                    handle,
-                    table_seqno,
-                    special,
-                    keys: task_keys,
-                });
-            }
+        // Served by the serial planner, whose reads are authoritative: a
+        // genuine failure surfaces here instead of letting a lower level
+        // answer a key this table covers. The file it opened is not kept: the
+        // data blocks are read through the file their chunk opens.
+        for plan in stages.serial_plans() {
+            let mut tally = PlanCounts::default();
+            let blocks = plan
+                .table
+                .plan_block_tasks(&batch[plan.keys], seqno, &mut tally)?;
+            stages.planned(plan.at, blocks, tally);
         }
-        Ok((tasks, probes))
+        Ok(stages.into_tasks(remaining))
     }
 
     /// The most of these `tables` whose files a level read holds open at
@@ -3965,16 +3938,8 @@ impl Tree {
     /// on-disk size, so stages let in together can pass the budget by what
     /// they grow when decoded.
     ///
-    /// A table's read begins, at the snapshot `seqno`, over its span of
-    /// `batch` once it has a place to read in.
     #[expect(clippy::indexing_slicing, reason = "a slot is a position in `queues`")]
-    fn read_level_stages<'a>(
-        tables: &mut [LevelTable<'a>],
-        batch: &[(&[u8], u64)],
-        seqno: SeqNo,
-        metadata_budget: u64,
-    ) {
-        let mut stages = level_stages::LevelStages::new(tables, batch, seqno, metadata_budget);
+    fn read_level_stages<'a>(stages: &mut level_stages::LevelStages<'a, '_, '_>) {
         // One queue per backend, opened when a table first asks it for a
         // block, so a level answered from the cache opens none.
         let mut queues: Vec<LevelQueue<'a>> = Vec::new();

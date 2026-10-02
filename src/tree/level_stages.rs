@@ -7,11 +7,13 @@
 //! and never submits, reads or waits itself. Whoever drives it carries the
 //! reads out and hands each result back.
 
-use super::{LevelRead, LevelTable, MetaHeld, Tree};
+use super::{BlockTask, LevelRead, LevelTable, LevelTasks, MetaHeld, Tree};
+use crate::table::probe_stats::PlanCounts;
 use crate::table::staged::{StagedRead, StagedStart};
 use crate::{SeqNo, Table, table::BlockHandle};
 use alloc::sync::Arc;
 use alloc::vec::Vec;
+use core::ops::Range;
 
 /// One block read a level asks for: `buf` is to be filled from `file` at
 /// `offset`, and handed back with `tag` through [`LevelStages::complete`].
@@ -28,6 +30,15 @@ pub(super) struct StageRead<'a> {
 pub(super) struct StageOpen<'a> {
     pub(super) at: usize,
     pub(super) table: &'a Table,
+}
+
+/// A table left to the serial planner, which its driver plans over its span
+/// of the batch through [`Table::plan_block_tasks`] and hands back through
+/// [`LevelStages::planned`].
+pub(super) struct StagePlan<'a> {
+    pub(super) at: usize,
+    pub(super) table: &'a Table,
+    pub(super) keys: Range<usize>,
 }
 
 /// What a pass over the level asks its driver to carry out.
@@ -297,5 +308,83 @@ impl<'a, 't, 'b> LevelStages<'a, 't, 'b> {
             self.tables[at].read = LevelRead::Serial;
             self.meta.settle(at, 0);
         }
+    }
+
+    /// The tables the stages left to the serial planner, in level order, once
+    /// no stage is in flight: those a stage gave up on, and any whose stages
+    /// did not finish.
+    pub(super) fn serial_plans(&self) -> Vec<StagePlan<'a>> {
+        self.tables
+            .iter()
+            .enumerate()
+            .filter(|(_, entry)| match &entry.read {
+                LevelRead::Staged(read) => !read.is_done(),
+                LevelRead::Pending | LevelRead::Serial => true,
+                LevelRead::Planned(..) | LevelRead::Nothing => false,
+            })
+            .map(|(at, entry)| StagePlan {
+                at,
+                table: entry.table,
+                keys: entry.keys.clone(),
+            })
+            .collect()
+    }
+
+    /// Takes back the serial plan of the table at `at`: `None` when it covers
+    /// none of its keys, with the filter probes planning took in `tally`.
+    pub(super) fn planned(
+        &mut self,
+        at: usize,
+        plan: Option<crate::table::BlockTaskPlan>,
+        tally: PlanCounts,
+    ) {
+        if let Some(entry) = self.tables.get_mut(at) {
+            let (table_seqno, blocks) =
+                plan.map_or((0, Vec::new()), |(_, seqno, _, blocks)| (seqno, blocks));
+            entry.read = LevelRead::Planned(table_seqno, blocks, tally);
+        }
+    }
+
+    /// The level's data block tasks in level order, each with the indices
+    /// into the caller's keys of the keys it reads, from the positions of
+    /// `remaining` the batch was built from; and per table the filter probes
+    /// planning took, not yet counted.
+    #[expect(
+        clippy::indexing_slicing,
+        reason = "a plan's positions lie in its table's span, which lies in the batch built from `remaining`"
+    )]
+    pub(super) fn into_tasks(self, remaining: &[(usize, u64)]) -> LevelTasks<'a> {
+        let mut tasks: Vec<BlockTask<'a>> = Vec::new();
+        let mut probes: Vec<(&'a Table, PlanCounts)> = Vec::new();
+        for entry in self.tables.iter_mut() {
+            let (table_seqno, blocks, tally) =
+                match core::mem::replace(&mut entry.read, LevelRead::Nothing) {
+                    LevelRead::Staged(read) => read.into_plan(),
+                    LevelRead::Planned(table_seqno, blocks, tally) => (table_seqno, blocks, tally),
+                    LevelRead::Pending | LevelRead::Serial | LevelRead::Nothing => continue,
+                };
+            let table = entry.table;
+            if tally != PlanCounts::default() {
+                probes.push((table, tally));
+            }
+            if blocks.is_empty() {
+                continue;
+            }
+            let special = table.is_chunk_special();
+            for (handle, positions) in blocks {
+                let task_keys: Vec<usize> = positions
+                    .iter()
+                    .map(|&pos| remaining[entry.keys.start + pos].0)
+                    .collect();
+                tasks.push(BlockTask {
+                    table,
+                    handle,
+                    table_seqno,
+                    special,
+                    keys: task_keys,
+                });
+            }
+        }
+        (tasks, probes)
     }
 }
