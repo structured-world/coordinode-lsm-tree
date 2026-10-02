@@ -1876,6 +1876,7 @@ impl AbstractTree for Tree {
             seqno,
             self.config.merge_operator.as_ref(),
             self.config.comparator.as_ref(),
+            || self.blob_source(),
         )
     }
 
@@ -1894,6 +1895,7 @@ impl AbstractTree for Tree {
             seqno,
             self.config.merge_operator.as_ref(),
             self.config.comparator.as_ref(),
+            || self.blob_source(),
         )
     }
 
@@ -1923,6 +1925,7 @@ impl AbstractTree for Tree {
                         seqno,
                         merge_operator,
                         comparator,
+                        || self.blob_source(),
                     )
                 })
                 .collect();
@@ -1934,6 +1937,7 @@ impl AbstractTree for Tree {
             seqno,
             comparator: Arc::clone(&self.config.comparator),
             merge_operator: self.config.merge_operator.clone(),
+            merge_base: self.blob_source(),
             values: read_job::Values::Inline,
             metadata_budget: self.config.multi_get_metadata_budget,
         })
@@ -3118,6 +3122,7 @@ impl Tree {
             seqno,
             comparator: Arc::clone(&self.config.comparator),
             merge_operator: self.config.merge_operator.clone(),
+            merge_base: self.blob_source(),
             values: read_job::Values::Inline,
             metadata_budget: self.config.multi_get_metadata_budget,
         }))
@@ -3158,12 +3163,16 @@ impl Tree {
 
     /// Shared point-read logic for `get()` and `multi_get()`: finds the newest
     /// entry, applies merge resolution or RT suppression, and returns the value.
+    ///
+    /// `blob_source` is asked for only by a merge, for a base kept in the
+    /// value log.
     fn resolve_or_passthrough(
         super_version: &SuperVersion,
         key: &[u8],
         seqno: SeqNo,
         merge_operator: Option<&Arc<dyn crate::merge_operator::MergeOperator>>,
         comparator: &dyn crate::comparator::UserComparator,
+        blob_source: impl FnOnce() -> Option<crate::blob_tree::BlobSource>,
     ) -> crate::Result<Option<UserValue>> {
         let entry = Self::get_value(super_version, key, seqno, comparator)?;
 
@@ -3178,7 +3187,7 @@ impl Tree {
                         key,
                         seqno,
                         Arc::clone(merge_op),
-                        None,
+                        blob_source(),
                     )
                 } else if Self::is_suppressed_by_range_tombstones(
                     super_version,
@@ -3200,6 +3209,10 @@ impl Tree {
     /// Shared post-lookup resolution for `get_pinned` and `multi_get`:
     /// tombstone filter, range-tombstone suppression, merge operand resolution.
     /// Returns `None` if entry is tombstoned or suppressed.
+    #[expect(
+        clippy::too_many_arguments,
+        reason = "each is a separate input of the one resolution"
+    )]
     fn resolve_pinned_entry(
         super_version: &SuperVersion,
         key: &[u8],
@@ -3208,6 +3221,7 @@ impl Tree {
         merge_operator: Option<&Arc<dyn crate::merge_operator::MergeOperator>>,
         comparator: &dyn crate::comparator::UserComparator,
         wrap: impl FnOnce(UserValue) -> crate::PinnableSlice,
+        blob_source: impl FnOnce() -> Option<crate::blob_tree::BlobSource>,
     ) -> crate::Result<Option<crate::PinnableSlice>> {
         use crate::PinnableSlice;
 
@@ -3232,7 +3246,7 @@ impl Tree {
                 key,
                 seqno,
                 Arc::clone(merge_op),
-                None,
+                blob_source(),
             )
             .map(|opt| opt.map(PinnableSlice::owned));
         }
@@ -3247,6 +3261,7 @@ impl Tree {
         seqno: SeqNo,
         merge_operator: Option<&Arc<dyn crate::merge_operator::MergeOperator>>,
         comparator: &dyn crate::comparator::UserComparator,
+        blob_source: impl FnOnce() -> Option<crate::blob_tree::BlobSource>,
     ) -> crate::Result<Option<crate::PinnableSlice>> {
         use crate::PinnableSlice;
 
@@ -3260,6 +3275,7 @@ impl Tree {
                 merge_operator,
                 comparator,
                 PinnableSlice::owned,
+                blob_source,
             );
         }
 
@@ -3275,6 +3291,7 @@ impl Tree {
                 merge_operator,
                 comparator,
                 PinnableSlice::owned,
+                blob_source,
             );
         }
 
@@ -3296,6 +3313,7 @@ impl Tree {
                 merge_operator,
                 comparator,
                 |value| PinnableSlice::pinned(block, value),
+                blob_source,
             );
         }
 
@@ -4081,6 +4099,7 @@ impl Tree {
             seqno: SeqNo::MAX,
             comparator: crate::comparator::default_comparator(),
             merge_operator: None,
+            merge_base: None,
             values: read_job::Values::Inline,
             metadata_budget: crate::config::DEFAULT_MULTI_GET_METADATA_BUDGET,
         };

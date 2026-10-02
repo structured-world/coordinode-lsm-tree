@@ -335,6 +335,7 @@ impl BlobTree {
                 seqno,
                 comparator: Arc::clone(&self.index.config.comparator),
                 merge_operator: self.index.config.merge_operator.clone(),
+                merge_base: Some(self.blob_source()),
                 values: crate::tree::read_job::Values::Blob(self.blob_source()),
                 metadata_budget: self.index.config.multi_get_metadata_budget,
             },
@@ -1622,6 +1623,7 @@ impl AbstractTree for BlobTree {
             seqno,
             comparator: Arc::clone(&self.index.config.comparator),
             merge_operator: self.index.config.merge_operator.clone(),
+            merge_base: Some(self.blob_source()),
             values: crate::tree::read_job::Values::Blob(self.blob_source()),
             metadata_budget: self.index.config.multi_get_metadata_budget,
         })

@@ -10,6 +10,38 @@ use alloc::sync::Arc;
 #[cfg(not(feature = "std"))]
 use alloc::vec::Vec;
 
+/// Reads a merge base kept in the value log, as `RocksDB`'s merge reads a
+/// blob base before merging onto it.
+#[doc(hidden)]
+#[diagnostic::on_unimplemented(
+    message = "`{Self}` cannot read a merge base kept in the value log",
+    label = "not a value log reader",
+    note = "a stream that never meets such a base uses `NoValueLog`"
+)]
+pub trait SeparatedBase {
+    /// The value the indirection `base` points to.
+    ///
+    /// # Errors
+    ///
+    /// Returns an error when the value cannot be read.
+    fn read(&self, base: InternalValue) -> crate::Result<UserValue>;
+}
+
+/// The reader of a stream that is not a blob tree's and cannot read a
+/// separated base: the pointer is refused rather than handed to the operator
+/// as if it were the value.
+#[doc(hidden)]
+#[derive(Clone, Copy, Debug, Default)]
+pub struct NoValueLog;
+
+impl SeparatedBase for NoValueLog {
+    fn read(&self, _base: InternalValue) -> crate::Result<UserValue> {
+        Err(crate::Error::FeatureUnsupported(
+            "merge-onto-separated-base-without-value-log",
+        ))
+    }
+}
+
 /// The value log a merge reads a base from when the base is an indirection:
 /// a blob tree's blob source over the version being read.
 #[derive(Clone, Copy)]
@@ -18,17 +50,28 @@ pub(crate) struct ValueLog<'v> {
     pub(crate) version: &'v crate::version::Version,
 }
 
+/// A stream whose tree may or may not be a blob tree, decided when it is
+/// built.
+impl SeparatedBase for Option<ValueLog<'_>> {
+    fn read(&self, base: InternalValue) -> crate::Result<UserValue> {
+        match self {
+            Some(log) => log.source.value(log.version, base),
+            None => NoValueLog.read(base),
+        }
+    }
+}
+
 /// Consumes a stream of KVs and emits a new stream according to MVCC and tombstone rules
 ///
 /// This iterator is used for read operations.
-pub struct MvccStream<'v, I: DoubleEndedIterator<Item = crate::Result<InternalValue>>> {
+pub struct MvccStream<I: DoubleEndedIterator<Item = crate::Result<InternalValue>>, L = NoValueLog> {
     inner: DoubleEndedPeekable<crate::Result<InternalValue>, I>,
     merge_operator: Option<Arc<dyn MergeOperator>>,
     comparator: SharedComparator,
 
     /// Reads a base the stream finds kept in the value log. Only a blob
-    /// tree's stream meets such a base, and only a blob tree sets this.
-    value_log: Option<ValueLog<'v>>,
+    /// tree's stream meets such a base.
+    value_log: L,
 
     /// Range tombstones with per-source visibility cutoffs. When set, merge
     /// resolution skips entries suppressed by an RT (treats them as a
@@ -40,7 +83,7 @@ pub struct MvccStream<'v, I: DoubleEndedIterator<Item = crate::Result<InternalVa
     key_entries_buf: Vec<InternalValue>,
 }
 
-impl<'v, I: DoubleEndedIterator<Item = crate::Result<InternalValue>>> MvccStream<'v, I> {
+impl<I: DoubleEndedIterator<Item = crate::Result<InternalValue>>> MvccStream<I> {
     /// Initializes a new multi-version-aware iterator.
     #[must_use]
     pub fn new(iter: I, merge_operator: Option<Arc<dyn MergeOperator>>) -> Self {
@@ -62,7 +105,7 @@ impl<'v, I: DoubleEndedIterator<Item = crate::Result<InternalValue>>> MvccStream
             inner: iter.double_ended_peekable(),
             merge_operator,
             comparator,
-            value_log: None,
+            value_log: NoValueLog,
             range_tombstones: Vec::new(),
             key_entries_buf: Vec::new(),
         }
@@ -70,24 +113,24 @@ impl<'v, I: DoubleEndedIterator<Item = crate::Result<InternalValue>>> MvccStream
 
     /// Installs the value log a merge reads a base kept there from.
     #[must_use]
-    pub(crate) fn with_value_log(mut self, value_log: Option<ValueLog<'v>>) -> Self {
-        self.value_log = value_log;
-        self
+    pub(crate) fn with_value_log(
+        self,
+        value_log: Option<ValueLog<'_>>,
+    ) -> MvccStream<I, Option<ValueLog<'_>>> {
+        MvccStream {
+            inner: self.inner,
+            merge_operator: self.merge_operator,
+            comparator: self.comparator,
+            value_log,
+            range_tombstones: self.range_tombstones,
+            key_entries_buf: self.key_entries_buf,
+        }
     }
+}
 
-    /// The value of a base kept in the value log, as `RocksDB`'s merge reads
-    /// a blob base before merging onto it. A stream given no value log is
-    /// not a blob tree's and cannot read one; the pointer is refused rather
-    /// than handed to the operator as if it were the value.
-    fn separated_base(&self, base: InternalValue) -> crate::Result<UserValue> {
-        let Some(value_log) = self.value_log else {
-            return Err(crate::Error::FeatureUnsupported(
-                "merge-onto-separated-base-without-value-log",
-            ));
-        };
-        value_log.source.value(value_log.version, base)
-    }
-
+impl<I: DoubleEndedIterator<Item = crate::Result<InternalValue>>, L: SeparatedBase>
+    MvccStream<I, L>
+{
     /// Installs range tombstones for merge-resolution awareness.
     ///
     /// When set, operands or base values suppressed by a range tombstone are
@@ -152,7 +195,7 @@ impl<'v, I: DoubleEndedIterator<Item = crate::Result<InternalValue>>> MvccStream
                     break;
                 }
                 ValueType::Indirection => {
-                    base_value = Some(self.separated_base(next)?);
+                    base_value = Some(self.value_log.read(next)?);
                     found_base = true;
                     break;
                 }
@@ -218,7 +261,7 @@ impl<'v, I: DoubleEndedIterator<Item = crate::Result<InternalValue>>> MvccStream
                     break;
                 }
                 ValueType::Indirection => {
-                    base_value = Some(self.separated_base(entry)?);
+                    base_value = Some(self.value_log.read(entry)?);
                     break;
                 }
                 ValueType::Tombstone | ValueType::WeakTombstone => {
@@ -259,7 +302,7 @@ impl<'v, I: DoubleEndedIterator<Item = crate::Result<InternalValue>>> MvccStream
     }
 }
 
-impl<I> crate::reseek::Reseekable for MvccStream<'_, I>
+impl<I, L> crate::reseek::Reseekable for MvccStream<I, L>
 where
     I: DoubleEndedIterator<Item = crate::Result<InternalValue>> + crate::reseek::Reseekable,
 {
@@ -274,7 +317,9 @@ where
     }
 }
 
-impl<I: DoubleEndedIterator<Item = crate::Result<InternalValue>>> Iterator for MvccStream<'_, I> {
+impl<I: DoubleEndedIterator<Item = crate::Result<InternalValue>>, L: SeparatedBase> Iterator
+    for MvccStream<I, L>
+{
     type Item = crate::Result<InternalValue>;
 
     fn next(&mut self) -> Option<Self::Item> {
@@ -298,8 +343,8 @@ impl<I: DoubleEndedIterator<Item = crate::Result<InternalValue>>> Iterator for M
     }
 }
 
-impl<I: DoubleEndedIterator<Item = crate::Result<InternalValue>>> DoubleEndedIterator
-    for MvccStream<'_, I>
+impl<I: DoubleEndedIterator<Item = crate::Result<InternalValue>>, L: SeparatedBase>
+    DoubleEndedIterator for MvccStream<I, L>
 {
     fn next_back(&mut self) -> Option<Self::Item> {
         // When a merge operator is configured we must buffer ALL entries

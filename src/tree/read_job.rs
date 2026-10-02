@@ -26,16 +26,6 @@ pub enum Values {
     Blob(crate::blob_tree::BlobSource),
 }
 
-impl Values {
-    /// Where a merge reads a base kept in the value log.
-    fn blob_source(&self) -> Option<crate::blob_tree::BlobSource> {
-        match self {
-            Self::Inline => None,
-            Self::Blob(source) => Some(source.clone()),
-        }
-    }
-}
-
 /// What a read is about: the version it holds for its whole life, its keys,
 /// and how it reads them.
 pub struct ReadCtx<K> {
@@ -44,6 +34,9 @@ pub struct ReadCtx<K> {
     pub seqno: SeqNo,
     pub comparator: SharedComparator,
     pub merge_operator: Option<Arc<dyn MergeOperator>>,
+    /// Where a merge reads a base kept in the value log; set for a blob
+    /// tree and its index.
+    pub merge_base: Option<crate::blob_tree::BlobSource>,
     pub values: Values,
     /// The most filter and index bytes a level's staged read holds.
     pub metadata_budget: u64,
@@ -215,7 +208,7 @@ impl Job {
                         ctx.key(idx),
                         ctx.seqno,
                         Arc::clone(merge_operator),
-                        ctx.values.blob_source(),
+                        ctx.merge_base.clone(),
                     ),
                     None => Err(misplaced()),
                 },

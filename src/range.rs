@@ -1433,7 +1433,12 @@ impl Reseekable for SeekableLeaf<'_> {
 /// MVCC resolution -> drop-resolved-tombstones -> range-tombstone suppression.
 /// Built once over the union range; every reposition reseeks it in place.
 type SeekPipeline<'a> = RangeTombstoneFilter<
-    TombstoneSkip<MvccStream<'a, SeekingMerger<SeekableLeaf<'a>, SharedComparator>>>,
+    TombstoneSkip<
+        MvccStream<
+            SeekingMerger<SeekableLeaf<'a>, SharedComparator>,
+            Option<crate::mvcc_stream::ValueLog<'a>>,
+        >,
+    >,
 >;
 
 /// Phase 2: build the [`SeekPipeline`] for the sub-range `[lower, upper)` from
