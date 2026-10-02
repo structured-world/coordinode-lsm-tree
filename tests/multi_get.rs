@@ -733,6 +733,53 @@ fn multi_get_blob_tree_merge_operands() -> lsm_tree::Result<()> {
     Ok(())
 }
 
+/// A blob tree with a merge operator answers a key's merge operands the same
+/// however the key is read: alone, in a batch of one or two, or in a larger
+/// batch, on disk or in the memtable. An inline base is merged with its
+/// operands; a base in the value log is read as the merge pipeline reads it.
+#[test]
+fn blob_tree_reads_merge_operands_whatever_the_batch_size() -> lsm_tree::Result<()> {
+    for flushed in [false, true] {
+        let folder = get_tmp_folder();
+        let tree = Config::new(
+            &folder,
+            SequenceNumberCounter::default(),
+            SequenceNumberCounter::default(),
+        )
+        .with_kv_separation(Some(KvSeparationOptions {
+            separation_threshold: 100,
+            ..Default::default()
+        }))
+        .with_merge_operator(Some(Arc::new(ConcatMerge)))
+        .open()?;
+        tree.insert("inline", "BASE", 0);
+        tree.merge("inline", "_EXT", 1);
+        tree.insert("blob", b"x".repeat(200).as_slice(), 2);
+        tree.merge("blob", "_EXT", 3);
+        if flushed {
+            tree.flush_active_memtable(0)?;
+        }
+        let what = format!("flushed: {flushed}");
+        let batch = tree.multi_get(["inline", "blob", "absent"], SeqNo::MAX)?;
+        assert_eq!(batch[0].as_deref(), Some(b"BASE_EXT".as_slice()), "{what}");
+        assert_eq!(batch[2], None, "{what}");
+        for (key, value) in [("inline", &batch[0]), ("blob", &batch[1])] {
+            assert_eq!(&tree.get(key, SeqNo::MAX)?, value, "get {key}, {what}");
+            assert_eq!(
+                &tree.multi_get([key], SeqNo::MAX)?[0],
+                value,
+                "batch of one, {key}, {what}"
+            );
+            assert_eq!(
+                &tree.multi_get([key, "absent"], SeqNo::MAX)?[0],
+                value,
+                "batch of two, {key}, {what}"
+            );
+        }
+    }
+    Ok(())
+}
+
 #[test]
 fn multi_get_blob_tree_memtable_hits_skip_sst() -> lsm_tree::Result<()> {
     let folder = get_tmp_folder();
