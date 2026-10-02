@@ -697,9 +697,51 @@ fn held_recover_params(
     global_seqno: Option<SeqNo>,
 ) -> crate::table::RecoverParams {
     let mut params = repair_recover_params(config, file_path, checksum, table_id, fs, global_seqno);
-    params.tree_id = crate::tree::inner::get_next_tree_id();
-    params.descriptor_table.clone_from(&config.descriptor_table);
+    if let Some((cache, tree_id)) = held_descriptors(config) {
+        params.descriptor_table = Some(cache);
+        params.tree_id = tree_id;
+    }
     params
+}
+
+/// The descriptors a repair cached, from its first tree id on, swept from the
+/// cache when the repair ends.
+#[cfg(feature = "std")]
+struct HeldDescriptors {
+    cache: Option<Arc<crate::DescriptorTable>>,
+    first: crate::tree::inner::TreeId,
+}
+
+#[cfg(feature = "std")]
+impl Drop for HeldDescriptors {
+    fn drop(&mut self) {
+        if let Some(cache) = &self.cache {
+            cache.remove_trees_from(self.first);
+        }
+    }
+}
+
+/// Lets go of a table the repair held before its file is removed, its cached
+/// descriptor with it: a backend that refuses to unlink an open file
+/// (Windows) would otherwise fail the removal while the cache keeps it open.
+#[cfg(feature = "std")]
+fn release_held(config: &Config, table: Table) {
+    if let Some(cache) = &config.descriptor_table {
+        cache.remove_for_table(&table.global_id());
+    }
+    drop(table);
+}
+
+/// The descriptor cache a table the repair holds keeps its file in, with a
+/// tree id of its own for it; `None` when the configuration keeps none.
+#[cfg(feature = "std")]
+fn held_descriptors(
+    config: &Config,
+) -> Option<(Arc<crate::DescriptorTable>, crate::tree::inner::TreeId)> {
+    config
+        .descriptor_table
+        .clone()
+        .map(|cache| (cache, crate::tree::inner::get_next_tree_id()))
 }
 
 /// Whether an I/O failure must PROPAGATE out of the repair instead of grading
@@ -1695,7 +1737,7 @@ fn try_salvage_table(
             table.max_local_seqno(),
         )
     {
-        drop(table);
+        release_held(config, table);
         // Remove the rejected replacement, and do NOT swallow the error. A
         // discarded `remove_file` failure would leave the freshly-written
         // numeric SST in `tables/`; repair would still install a manifest that
@@ -2003,7 +2045,7 @@ fn restrict_salvaged_output(
                 &bound,
                 config.sync_mode,
             )
-            .and_then(|()| salvaged.reopen_restricted(bound));
+            .and_then(|()| salvaged.reopen_restricted_with(bound, held_descriptors(config)));
             match restricted {
                 Ok(table) => Ok(table),
                 Err(e) => {
@@ -2011,7 +2053,7 @@ fn restrict_salvaged_output(
                     // backend that refuses to unlink an OPEN file (Windows; the
                     // deletion path closes handles for this same reason) would
                     // fail while `salvaged` still holds it.
-                    drop(salvaged);
+                    release_held(config, salvaged);
                     // Remove on EVERY failure, transient or persistent: the
                     // replacement is unpunched with no valid sidecar, so a run
                     // that adopted it would resurrect the sub-bound rows. The
@@ -4052,6 +4094,14 @@ fn repair_tree(
     // handed out from here on; every id from this one is swept out of the
     // cache before the post-commit swaps (see `held_recover_params`).
     let first_tree_id = crate::tree::inner::get_next_tree_id();
+    // However the repair ends (an abort, a cancellation, a failed commit),
+    // the descriptors it cached close with it: left open, a temp it built
+    // could not be removed by the retry on a backend that refuses to unlink
+    // an open file.
+    let _held = HeldDescriptors {
+        cache: config.descriptor_table.clone(),
+        first: first_tree_id,
+    };
 
     if let Some(p) = &config.recovery_progress {
         p.set_phase(crate::RecoveryPhase::PendingSwaps);
@@ -4726,7 +4776,8 @@ fn scan_table_folders(
                 // `reopen_restricted` reads only from the punch offset up, so a
                 // genuinely unreadable SUFFIX still surfaces its error there.
                 if let Some(bound) = &exact_bound {
-                    break 'restrict table.reopen_restricted(bound.clone());
+                    break 'restrict table
+                        .reopen_restricted_with(bound.clone(), held_descriptors(config));
                 }
 
                 // No trustworthy exact bound. An unpunched table never carried a
@@ -4791,7 +4842,8 @@ fn scan_table_folders(
                         match derived {
                             Ok(DerivedRestriction::Bound(bound)) => {
                                 geometry_lossy = !allow_resurrection;
-                                break 'restrict table.reopen_restricted(bound);
+                                break 'restrict table
+                                    .reopen_restricted_with(bound, held_descriptors(config));
                             }
                             Err(e) => break 'restrict Err(e),
                             Ok(

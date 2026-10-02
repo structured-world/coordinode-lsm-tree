@@ -833,7 +833,7 @@ impl Table {
 
     /// Gets the global table ID.
     #[must_use]
-    fn global_id(&self) -> GlobalTableId {
+    pub(crate) fn global_id(&self) -> GlobalTableId {
         (self.tree_id, self.id()).into()
     }
 
@@ -9457,6 +9457,23 @@ impl Table {
     // reached only from tight-space compaction, which is itself std-gated.
     #[cfg(feature = "std")]
     pub(crate) fn reopen_restricted(&self, lower: UserKey) -> crate::Result<Self> {
+        self.reopen_restricted_with(lower, None)
+    }
+
+    /// [`Self::reopen_restricted`], with the view's file kept in the given
+    /// descriptor cache under the given tree id instead of a handle of its
+    /// own: for a view no other view of this table shares that id with, such
+    /// as the tables a repair holds.
+    ///
+    /// # Errors
+    ///
+    /// Propagates any error from re-opening the SST file.
+    #[cfg(feature = "std")]
+    pub(crate) fn reopen_restricted_with(
+        &self,
+        lower: UserKey,
+        descriptors: Option<(Arc<crate::DescriptorTable>, crate::tree::inner::TreeId)>,
+    ) -> crate::Result<Self> {
         // The restricted view's digest is the LIVE SUFFIX only: its
         // `[0, punch_offset)` prefix is hole-punched right after this view is
         // installed, so a whole-file digest (what `self.checksum()` holds) would
@@ -9480,6 +9497,10 @@ impl Table {
             );
             params.global_seqno = self.global_seqno;
             params.tree_id = self.tree_id;
+            if let Some((cache, tree_id)) = descriptors {
+                params.descriptor_table = Some(cache);
+                params.tree_id = tree_id;
+            }
             params.pin_filter = self.pinned_filter_size() > 0;
             params.pin_index = self.pinned_block_index_size() > 0;
             params.encryption.clone_from(&self.encryption);

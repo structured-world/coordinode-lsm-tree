@@ -1085,6 +1085,50 @@ fn verify_blob_links_rejects_an_undercounted_suffix_id_on_a_restricted_view() ->
     Ok(())
 }
 
+/// A restricted view reopened for a repair keeps its file in the descriptor
+/// cache it is given, under the tree id given with it, so a repair holding many
+/// restricted tables needs no descriptor per table; reopened plainly, it keeps
+/// a handle of its own and the cache stays untouched.
+#[test]
+fn a_restricted_view_reopened_with_a_descriptor_cache_keeps_its_file_there() -> crate::Result<()> {
+    let dir = tempfile::tempdir()?;
+    let file = dir.path().join("table");
+    let checksum = {
+        let mut w = Writer::new(file.clone(), 0, 0, Arc::new(StdFs))?;
+        for i in 0u64..20 {
+            w.write(InternalValue::from_components(
+                format!("key{i:05}").into_bytes(),
+                b"v".to_vec(),
+                i + 1,
+                crate::ValueType::Value,
+            ))?;
+        }
+        w.finish()?.expect("the SST is non-empty").1
+    };
+    let mut params = test_recover_params(file, checksum);
+    params.descriptor_table = None;
+    let table = Table::recover(params)?;
+    let bound = crate::UserKey::from(&b"key00010"[..]);
+
+    let key = b"key00015";
+    let hash = crate::hash::hash64(key);
+
+    let plain = table.reopen_restricted(bound.clone())?;
+    assert!(plain.get(key, crate::SeqNo::MAX, hash)?.is_some());
+    drop(plain);
+
+    let cache = Arc::new(DescriptorTable::new(10));
+    let held = table.reopen_restricted_with(bound, Some((Arc::clone(&cache), 777)))?;
+    assert_eq!(held.global_id().tree_id(), 777);
+    assert!(held.get(key, crate::SeqNo::MAX, hash)?.is_some());
+    assert_eq!(
+        cache.len(),
+        1,
+        "the view's file is in the cache it was given"
+    );
+    Ok(())
+}
+
 /// Verifying a restricted view's blob links walks its live suffix through the
 /// range reader, where the unrestricted check reads the file directly. Both
 /// are verification, not a caller's read: neither is counted, and neither
