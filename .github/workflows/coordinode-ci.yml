@@ -304,6 +304,41 @@ jobs:
         run: cargo nextest run --profile ci --all-features
       - name: Run doc tests
         run: cargo test --doc --features lz4
+
+  tools:
+    # The standalone crates under tools/, checked and tested beside `test`
+    # over the same matrix: each has its own target directory and builds the
+    # library again, which on the slower runners would push one job holding
+    # both past its time limit.
+    needs: [changes, lint]
+    if: ${{ always() && !cancelled() && needs.lint.result == 'success' && needs.changes.outputs.code != 'false' }}
+    timeout-minutes: 20
+    strategy:
+      fail-fast: true
+      matrix:
+        rust: [stable, "1.92.0"]
+        os: [ubuntu-latest, windows-latest, macos-latest]
+    runs-on: ${{ matrix.os }}
+    steps:
+      - uses: actions/checkout@v7
+        with:
+          persist-credentials: false
+      - uses: dtolnay/rust-toolchain@29eef336d9b2848a0b548edc03f92a220660cdb8  # stable
+        with:
+          toolchain: ${{ matrix.rust }}
+      - uses: Swatinem/rust-cache@6323deb102c322ba6fcbdcafc7e3dddab59af2b6  # v2.9.2
+        with:
+          prefix-key: ${{ runner.os }}-cargo-tools
+          workspaces: |
+            tools/db_bench -> target
+            tools/sst-dump -> target
+      # Same fallback as in `test`: the prebuilt installer's CDN can be down.
+      - uses: taiki-e/install-action@1ef5c5f58e85d25baaaa1704478fdd6c2921f2b5  # nextest
+        id: install-nextest
+        continue-on-error: true
+      - name: Install nextest from crates.io (fallback)
+        if: steps.install-nextest.outcome == 'failure'
+        run: cargo install cargo-nextest --locked
       - name: Check db_bench crate
         working-directory: tools/db_bench
         run: cargo check --all-features
@@ -550,7 +585,7 @@ jobs:
   # skip only on docs-only changes or after `lint` failed, and that failure is
   # reported here on its own.
   ci-passed:
-    needs: [changes, lint, test, fuzz-heal, no-std-check, cross-matrix, cross, codecov]
+    needs: [changes, lint, test, tools, fuzz-heal, no-std-check, cross-matrix, cross, codecov]
     if: ${{ always() }}
     timeout-minutes: 5
     runs-on: ubuntu-latest
