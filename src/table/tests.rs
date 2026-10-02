@@ -734,6 +734,46 @@ fn a_batch_read_of_a_restricted_view_finds_nothing_below_the_bound() -> crate::R
     )
 }
 
+/// The block plan behind the multi-get lists no key below a restricted
+/// table's bound, as a point read reads nothing there: a batch of keys all
+/// below it plans no block, and in a mixed batch only the key above is
+/// planned.
+#[test]
+fn a_block_plan_of_a_restricted_view_lists_nothing_below_the_bound() -> crate::Result<()> {
+    let items = [
+        crate::InternalValue::from_components(b"a", b"v", 0, crate::ValueType::Value),
+        crate::InternalValue::from_components(b"b", b"v", 0, crate::ValueType::Value),
+        crate::InternalValue::from_components(b"c", b"v", 0, crate::ValueType::Value),
+        crate::InternalValue::from_components(b"d", b"v", 0, crate::ValueType::Value),
+    ];
+
+    test_with_table(
+        &items,
+        |table| {
+            let restricted = table.with_restriction(crate::UserKey::from(&b"c"[..]));
+
+            let below: [(&[u8], u64); 1] = [(b"a", hash64(b"a"))];
+            assert!(
+                restricted.plan_block_tasks(&below, SeqNo::MAX)?.is_none(),
+                "a batch all below the bound plans no block",
+            );
+
+            let mixed: [(&[u8], u64); 2] = [(b"a", hash64(b"a")), (b"d", hash64(b"d"))];
+            let Some((_, _, _, blocks)) = restricted.plan_block_tasks(&mixed, SeqNo::MAX)? else {
+                panic!("the key above the bound is planned");
+            };
+            let planned: Vec<usize> = blocks
+                .iter()
+                .flat_map(|(_, positions)| positions.iter().copied())
+                .collect();
+            assert_eq!(planned, [1], "only the key above the bound is planned");
+            Ok(())
+        },
+        None,
+        Some(|x| x),
+    )
+}
+
 #[test]
 #[expect(clippy::unwrap_used)]
 fn reopen_restricted_yields_a_distinct_clamped_view() -> crate::Result<()> {
