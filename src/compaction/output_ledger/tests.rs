@@ -214,3 +214,36 @@ fn a_failed_install_leaves_no_output_where_open_files_cannot_be_unlinked() -> cr
     }
     Ok(())
 }
+
+/// A run removes only the files it created itself. Options can be shared by
+/// runs that overlap, and an output another run recorded through them is that
+/// run's to install or remove: here a run with nothing to do must leave it.
+#[test]
+fn a_run_leaves_the_outputs_another_run_recorded() -> crate::Result<()> {
+    use crate::compaction::worker::{Options, do_compaction};
+    use crate::{Config, SequenceNumberCounter};
+
+    let dir = tempfile::tempdir()?;
+    let crate::AnyTree::Standard(tree) = Config::new(
+        dir.path(),
+        SequenceNumberCounter::default(),
+        SequenceNumberCounter::default(),
+    )
+    .open()?
+    else {
+        panic!("a standard tree");
+    };
+    let opts = Options::from_tree(&tree, Arc::new(crate::compaction::Leveled::default()));
+
+    let pending = dir.path().join("another-runs-output");
+    std::fs::write(&pending, b"in flight")?;
+    opts.outputs
+        .record_table(1_000, pending.clone(), Arc::clone(&tree.config.fs));
+
+    do_compaction(&opts)?;
+    assert!(
+        pending.exists(),
+        "a run must not remove an output another run recorded and may still install",
+    );
+    Ok(())
+}
