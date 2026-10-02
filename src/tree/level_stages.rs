@@ -57,9 +57,9 @@ impl StageWork<'_> {
 }
 
 /// The staged read of a level's `tables` for their spans of `batch`.
-pub(super) struct LevelStages<'a, 't, 'b> {
-    tables: &'t mut [LevelTable<'a>],
-    batch: &'b [(&'b [u8], u64)],
+pub(super) struct LevelStages<'a, 'k> {
+    tables: Vec<LevelTable<'a>>,
+    batch: Vec<(&'k [u8], u64)>,
     seqno: SeqNo,
     metadata_budget: u64,
     /// What each read asked for is for: its tag is its position here.
@@ -85,15 +85,56 @@ pub(super) struct LevelStages<'a, 't, 'b> {
     deferred: bool,
 }
 
-impl<'a, 't, 'b> LevelStages<'a, 't, 'b> {
-    /// A table's read begins, at the snapshot `seqno`, over its span of
-    /// `batch` once it has a place to read in.
-    pub(super) fn new(
-        tables: &'t mut [LevelTable<'a>],
-        batch: &'b [(&'b [u8], u64)],
+impl<'a, 'k> LevelStages<'a, 'k> {
+    /// The staged read of `level` for the keys of `remaining` (indices into
+    /// `keys` with their filter hashes, sorted under `comparator`), at the
+    /// snapshot `seqno`. Each table of each run covers a span of the batch;
+    /// its read begins once it has a place to read in.
+    #[expect(
+        clippy::indexing_slicing,
+        reason = "i < batch.len() is loop-checked; remaining's indices are valid key indices"
+    )]
+    pub(super) fn new<K: AsRef<[u8]>>(
+        level: &'a crate::version::Level,
+        remaining: &[(usize, u64)],
+        keys: &'k [K],
+        comparator: &dyn crate::comparator::UserComparator,
         seqno: SeqNo,
         metadata_budget: u64,
     ) -> Self {
+        // The batch the level is read for, once: each table covers a span of
+        // it, in every run alike.
+        let batch: Vec<(&'k [u8], u64)> = remaining
+            .iter()
+            .map(|&(idx, hash)| (keys[idx].as_ref(), hash))
+            .collect();
+
+        // The level's tables, each with the span of keys it covers.
+        let mut tables: Vec<LevelTable<'a>> = Vec::new();
+        for run in level.iter() {
+            let mut i = 0;
+            while i < batch.len() {
+                let Some(table) = run.get_for_key_cmp(batch[i].0, comparator) else {
+                    i += 1;
+                    continue;
+                };
+                let table_id = table.id();
+                let start = i;
+                while i < batch.len() {
+                    match run.get_for_key_cmp(batch[i].0, comparator) {
+                        Some(t) if t.id() == table_id => i += 1,
+                        _ => break,
+                    }
+                }
+                tables.push(LevelTable {
+                    table,
+                    keys: start..i,
+                    read: LevelRead::Pending,
+                    file: None,
+                });
+            }
+        }
+
         let open_cap = Tree::open_cap(tables.iter().map(|entry| entry.table));
         let count = tables.len();
         Self {
@@ -110,6 +151,11 @@ impl<'a, 't, 'b> LevelStages<'a, 't, 'b> {
             opening: alloc::vec![0; count],
             deferred: false,
         }
+    }
+
+    /// The batch the level is read for, which each table's span indexes.
+    pub(super) fn batch(&self) -> &[(&'k [u8], u64)] {
+        &self.batch
     }
 
     /// Whether the last pass left a table waiting: one that will move once a
@@ -356,14 +402,15 @@ impl<'a, 't, 'b> LevelStages<'a, 't, 'b> {
     pub(super) fn into_tasks(self, remaining: &[(usize, u64)]) -> LevelTasks<'a> {
         let mut tasks: Vec<BlockTask<'a>> = Vec::new();
         let mut probes: Vec<(&'a Table, PlanCounts)> = Vec::new();
-        for entry in self.tables.iter_mut() {
-            let (table_seqno, blocks, tally) =
-                match core::mem::replace(&mut entry.read, LevelRead::Nothing) {
-                    LevelRead::Staged(read) => read.into_plan(),
-                    LevelRead::Planned(table_seqno, blocks, tally) => (table_seqno, blocks, tally),
-                    LevelRead::Pending | LevelRead::Serial | LevelRead::Nothing => continue,
-                };
-            let table = entry.table;
+        for LevelTable {
+            table, keys, read, ..
+        } in self.tables
+        {
+            let (table_seqno, blocks, tally) = match read {
+                LevelRead::Staged(read) => read.into_plan(),
+                LevelRead::Planned(table_seqno, blocks, tally) => (table_seqno, blocks, tally),
+                LevelRead::Pending | LevelRead::Serial | LevelRead::Nothing => continue,
+            };
             if tally != PlanCounts::default() {
                 probes.push((table, tally));
             }
@@ -374,7 +421,7 @@ impl<'a, 't, 'b> LevelStages<'a, 't, 'b> {
             for (handle, positions) in blocks {
                 let task_keys: Vec<usize> = positions
                     .iter()
-                    .map(|&pos| remaining[entry.keys.start + pos].0)
+                    .map(|&pos| remaining[keys.start + pos].0)
                     .collect();
                 tasks.push(BlockTask {
                     table,

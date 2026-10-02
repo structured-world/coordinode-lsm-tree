@@ -3846,54 +3846,27 @@ impl Tree {
     /// the resolver surfaces it instead of letting a stale lower level answer.
     #[expect(
         clippy::indexing_slicing,
-        reason = "i < batch.len() loop-checked; remaining's indices are valid key indices; a table's span lies in the batch and a plan's positions in its span"
+        reason = "a serial plan's span lies in the level's batch"
     )]
-    fn plan_level_block_tasks<'a, 'k, K: AsRef<[u8]>>(
+    fn plan_level_block_tasks<'a, K: AsRef<[u8]>>(
         level: &'a crate::version::Level,
         remaining: &[(usize, u64)],
-        keys: &'k [K],
+        keys: &[K],
         seqno: SeqNo,
         comparator: &dyn crate::comparator::UserComparator,
         metadata_budget: u64,
     ) -> crate::Result<LevelTasks<'a>> {
-        // The batch the level is read for, once: each table covers a span of
-        // it, in every run alike.
-        let batch: Vec<(&'k [u8], u64)> = remaining
-            .iter()
-            .map(|&(idx, hash)| (keys[idx].as_ref(), hash))
-            .collect();
-
-        // The level's tables, each with the span of keys it covers.
-        let mut tables: Vec<LevelTable<'a>> = Vec::new();
-        for run in level.iter() {
-            let mut i = 0;
-            while i < batch.len() {
-                let Some(table) = run.get_for_key_cmp(batch[i].0, comparator) else {
-                    i += 1;
-                    continue;
-                };
-                let table_id = table.id();
-                let start = i;
-                while i < batch.len() {
-                    match run.get_for_key_cmp(batch[i].0, comparator) {
-                        Some(t) if t.id() == table_id => i += 1,
-                        _ => break,
-                    }
-                }
-                tables.push(LevelTable {
-                    table,
-                    keys: start..i,
-                    read: LevelRead::Pending,
-                    file: None,
-                });
-            }
-        }
-
         // Every table's filter blocks in one batch, then every table's index
         // blocks in one batch, and so on until each is planned. A table whose
         // stage fails is planned serially below.
-        let mut stages =
-            level_stages::LevelStages::new(&mut tables, &batch, seqno, metadata_budget);
+        let mut stages = level_stages::LevelStages::new(
+            level,
+            remaining,
+            keys,
+            comparator,
+            seqno,
+            metadata_budget,
+        );
         Self::read_level_stages(&mut stages);
 
         // Served by the serial planner, whose reads are authoritative: a
@@ -3902,9 +3875,9 @@ impl Tree {
         // data blocks are read through the file their chunk opens.
         for plan in stages.serial_plans() {
             let mut tally = PlanCounts::default();
-            let blocks = plan
-                .table
-                .plan_block_tasks(&batch[plan.keys], seqno, &mut tally)?;
+            let blocks =
+                plan.table
+                    .plan_block_tasks(&stages.batch()[plan.keys], seqno, &mut tally)?;
             stages.planned(plan.at, blocks, tally);
         }
         Ok(stages.into_tasks(remaining))
@@ -3939,7 +3912,7 @@ impl Tree {
     /// they grow when decoded.
     ///
     #[expect(clippy::indexing_slicing, reason = "a slot is a position in `queues`")]
-    fn read_level_stages<'a>(stages: &mut level_stages::LevelStages<'a, '_, '_>) {
+    fn read_level_stages<'a>(stages: &mut level_stages::LevelStages<'a, '_>) {
         // One queue per backend, opened when a table first asks it for a
         // block, so a level answered from the cache opens none.
         let mut queues: Vec<LevelQueue<'a>> = Vec::new();
