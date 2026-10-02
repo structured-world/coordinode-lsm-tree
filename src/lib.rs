@@ -417,6 +417,8 @@ mod format_version;
 mod time;
 mod tree;
 
+pub use tree::resumable;
+
 pub use time::Clock;
 #[cfg(feature = "std")]
 pub use time::SystemClock;

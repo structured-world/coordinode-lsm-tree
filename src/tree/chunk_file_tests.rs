@@ -1,86 +1,28 @@
 // SPDX-License-Identifier: Apache-2.0
 // Copyright (c) 2026-present, Dmitry Prudnikov
 
-use crate::fs::{Fs, FsDirEntry, FsFile, FsMetadata, FsOpenOptions, StdFs};
-use crate::io;
-use crate::path::Path;
-use crate::table::GlobalTableId;
-use crate::{
-    AbstractTree, Cache, Config, DescriptorTable, SeqNo, SequenceNumberCounter, Tree,
-    value::InternalValue,
-};
-use alloc::sync::{Arc, Weak};
-use std::sync::{Mutex, PoisonError};
-
-/// The file a probe watches, and whether it was still open at each file the
-/// backend opened.
-#[derive(Default)]
-struct Probe {
-    watched: Option<Weak<dyn FsFile>>,
-    alive_at_open: Vec<bool>,
-}
-
-/// A backend recording, at each file it opens, whether the watched file is
-/// still open.
-struct OpenProbeFs {
-    probe: Arc<Mutex<Probe>>,
-}
-
-impl Fs for OpenProbeFs {
-    fn open(&self, path: &Path, opts: &FsOpenOptions) -> io::Result<Box<dyn FsFile>> {
-        let mut probe = self.probe.lock().unwrap_or_else(PoisonError::into_inner);
-        if let Some(watched) = &probe.watched {
-            let alive = watched.upgrade().is_some();
-            probe.alive_at_open.push(alive);
-        }
-        drop(probe);
-        StdFs.open(path, opts)
-    }
-    fn create_dir_all(&self, path: &Path) -> io::Result<()> {
-        StdFs.create_dir_all(path)
-    }
-    fn read_dir(&self, path: &Path) -> io::Result<Vec<FsDirEntry>> {
-        StdFs.read_dir(path)
-    }
-    fn remove_file(&self, path: &Path) -> io::Result<()> {
-        StdFs.remove_file(path)
-    }
-    fn remove_dir_all(&self, path: &Path) -> io::Result<()> {
-        StdFs.remove_dir_all(path)
-    }
-    fn rename(&self, from: &Path, to: &Path) -> io::Result<()> {
-        StdFs.rename(from, to)
-    }
-    fn metadata(&self, path: &Path) -> io::Result<FsMetadata> {
-        StdFs.metadata(path)
-    }
-    fn sync_directory(&self, path: &Path) -> io::Result<()> {
-        StdFs.sync_directory(path)
-    }
-    fn exists(&self, path: &Path) -> io::Result<bool> {
-        StdFs.exists(path)
-    }
-}
+use super::TaskBlock;
+use super::chunk_order_tests::{ctx_for, tasks_for};
+use super::data_stage::ChunkRead;
+use super::read_job::{Job, JobDone, ReadWork};
+use crate::fs::{Fs, FsFile, FsOpenOptions, StdFs};
+use crate::{AbstractTree, Config, SequenceNumberCounter, value::InternalValue};
+use alloc::sync::Arc;
 
 /// A chunk that starts on a table other than the one the previous chunk
-/// carried over lets that file go before it opens its own: the carried file,
-/// held by nothing else, is closed by the time the next file opens, so a chunk
-/// never holds one descriptor past the cap it was sized to.
+/// carried over lets that file go before it asks for its own: the carried
+/// file, held by nothing else, is closed by the time the chunk hands out the
+/// job that opens the next one, so a chunk never holds one descriptor past
+/// the cap it was sized to.
 #[test]
-fn a_chunk_on_another_table_closes_the_carried_file_before_opening() -> crate::Result<()> {
+fn a_chunk_on_another_table_closes_the_carried_file_before_asking_for_its_own() -> crate::Result<()>
+{
     let folder = tempfile::tempdir()?;
-    let probe = Arc::new(Mutex::new(Probe::default()));
-    let descriptors = Arc::new(DescriptorTable::new(4));
     let any = Config::new(
         &folder,
         SequenceNumberCounter::default(),
         SequenceNumberCounter::default(),
     )
-    .with_shared_fs(Arc::new(OpenProbeFs {
-        probe: Arc::clone(&probe),
-    }))
-    .use_cache(Arc::new(Cache::with_capacity_bytes(0)))
-    .use_descriptor_table(Some(Arc::clone(&descriptors)))
     .open()?;
     let crate::AnyTree::Standard(tree) = &any else {
         panic!("a standard tree");
@@ -95,53 +37,52 @@ fn a_chunk_on_another_table_closes_the_carried_file_before_opening() -> crate::R
         panic!("level 0 exists");
     };
     let keys = ["b"];
-    let remaining = [(0, crate::hash::hash64(b"b"))];
-    let comparator = crate::comparator::default_comparator();
-    let (tasks, _) = Tree::plan_level_block_tasks(
-        level,
-        &remaining,
-        &keys,
-        SeqNo::MAX,
-        comparator.as_ref(),
-        crate::config::DEFAULT_MULTI_GET_METADATA_BUDGET,
-    )?;
+    let tasks = tasks_for(level, b"b")?;
     let [task] = tasks.as_slice() else {
         panic!("one block, in the table holding the key");
     };
-    // The table's file is not cached, so the chunk opens it.
-    descriptors.remove_for_table(&GlobalTableId::from((tree.id(), task.table.id())));
 
     // The previous chunk's last file, of another table, held by nothing else.
     let carried_file: Arc<dyn FsFile> = Arc::from(StdFs.open(
         &folder.path().join("carried"),
         &FsOpenOptions::new().write(true).create(true),
     )?);
-    probe.lock().unwrap_or_else(PoisonError::into_inner).watched =
-        Some(Arc::downgrade(&carried_file));
+    let watched = Arc::downgrade(&carried_file);
     // Table ids are small here, so one past the task's names another table.
     let mut carried = Some((task.table.id() + 1, carried_file));
 
-    let mut results: Vec<Option<InternalValue>> = alloc::vec![None];
-    Tree::resolve_block_task_chunk(
-        core::slice::from_ref(task),
-        &[super::TaskBlock::Read],
-        &mut 0,
-        &keys,
-        &mut results,
-        None,
-        &mut carried,
-    )?;
-
-    let alive_at_open = core::mem::take(
-        &mut probe
-            .lock()
-            .unwrap_or_else(PoisonError::into_inner)
-            .alive_at_open,
+    let mut work = ReadWork::new();
+    let (mut chunk, asked) =
+        ChunkRead::start(&tasks, &[TaskBlock::Read], &keys, &mut carried, &mut work)?;
+    assert!(
+        watched.upgrade().is_none(),
+        "the carried file is closed before the chunk asks for its own"
     );
-    assert_eq!(
-        alive_at_open,
-        [false],
-        "the chunk opened its table's file once, after the carried one was closed"
+    assert!(carried.is_none(), "nothing is carried into the chunk");
+    assert_eq!(asked, 1, "one job is counted");
+    let [job] = <[Job; 1]>::try_from(core::mem::take(&mut work.jobs))
+        .unwrap_or_else(|_| panic!("one job: the file of the table read"));
+    let ctx = ctx_for(tree, keys.to_vec())?;
+    let JobDone::Opened { tag, file } = job.run(&ctx) else {
+        panic!("an open job opens a file");
+    };
+    chunk.opened(tag, file?);
+
+    let mut keep_room = 0;
+    let asked = chunk.take_reads(&tasks, &mut carried, &mut work)?;
+    assert_eq!(asked, work.reads.len(), "every read asked for is counted");
+    for mut read in core::mem::take(&mut work.reads) {
+        let filled = read.file.read_at(&mut read.buf, read.offset)?;
+        assert_eq!(filled, read.buf.len(), "the whole block is read");
+        chunk.read(&tasks, read.tag, &read.buf, &mut keep_room);
+    }
+    let mut results: Vec<Option<InternalValue>> = alloc::vec![None];
+    chunk.finish(&tasks, &mut results, None)?;
+    assert!(
+        carried
+            .as_ref()
+            .is_some_and(|(id, _)| *id == task.table.id()),
+        "the chunk carries its table's file over to the next"
     );
     assert!(
         results.first().is_some_and(Option::is_some),

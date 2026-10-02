@@ -27,8 +27,10 @@ pub enum StagedStart<'t> {
     /// The table holds nothing any key of the batch can read: the batch is
     /// empty, or the table lies above the snapshot.
     Nothing,
-    /// The table is read serially: its blocks need the load path's own
-    /// recovery (Page-ECC) or reconstruction (columnar).
+    /// The table is read serially: every block of a Page-ECC table, its
+    /// filter and index blocks too, needs the load path's own recovery. A
+    /// columnar table is staged like a row table: only its data blocks are
+    /// reconstructed, by the load its read hands out for them.
     Serial,
     /// The table is read in stages.
     Staged(StagedRead<'t>),
@@ -71,7 +73,7 @@ impl<'t> StagedRead<'t> {
         sorted_keys: &[(&[u8], u64)],
         seqno: SeqNo,
     ) -> StagedStart<'t> {
-        if table.is_chunk_special() {
+        if table.metadata.ecc_params.is_some() {
             return StagedStart::Serial;
         }
         if sorted_keys.is_empty() {

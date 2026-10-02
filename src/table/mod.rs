@@ -7727,20 +7727,18 @@ impl Table {
         DataBlock::from_loaded(block, has_kv_footer)
     }
 
-    /// A zeroed buffer for the on-disk bytes of the block at `handle`,
-    /// refused when its size is one no block of this table can have, as the
-    /// load path refuses it before it allocates.
+    /// Refuses the block at `handle` when its size is one no block of this
+    /// table can have, without allocating for it.
     ///
     /// # Errors
     ///
     /// The size is past the largest block this table can hold.
-    pub(crate) fn block_buffer(&self, handle: &BlockHandle) -> crate::Result<Vec<u8>> {
+    pub(crate) fn check_block_size(&self, handle: &BlockHandle) -> crate::Result<()> {
         crate::table::block::check_on_disk_size(
             u64::from(handle.size()),
             self.encryption.as_deref(),
             self.metadata.ecc_params,
-        )?;
-        Ok(vec![0u8; handle.size() as usize])
+        )
     }
 
     /// The data block at `handle`, when the cache holds it, counted as a cache

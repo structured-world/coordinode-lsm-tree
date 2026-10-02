@@ -186,20 +186,7 @@ fn a_level_every_key_is_filtered_out_of_is_answered_and_counted_once() -> crate:
         .map(|(index, key)| (index, crate::hash::hash64(key.as_bytes())))
         .collect();
     let mut results: Vec<Option<crate::value::InternalValue>> = alloc::vec![None; keys.len()];
-    let version = tree.current_version();
-    let Some(level) = version.level(0) else {
-        panic!("level 0 exists");
-    };
-    let comparator = crate::comparator::default_comparator();
-    let resolved = crate::Tree::resolve_level_staged(
-        level,
-        &mut remaining,
-        &keys,
-        SeqNo::MAX,
-        comparator.as_ref(),
-        &mut results,
-        crate::config::DEFAULT_MULTI_GET_METADATA_BUDGET,
-    );
+    let resolved = tree.resolve_level_staged(0, &mut remaining, keys.clone(), &mut results)?;
     assert!(resolved, "the level is answered: nothing in it");
     assert!(results.iter().all(Option::is_none));
     let count = keys.len() as u64;
@@ -267,19 +254,7 @@ fn a_chunked_resolve_counts_a_passed_key_with_no_block() -> crate::Result<()> {
         .map(|(index, key)| (index, crate::hash::hash64(key.as_bytes())))
         .collect();
     let mut results: Vec<Option<crate::value::InternalValue>> = alloc::vec![None; keys.len()];
-    let Some(level) = version.level(0) else {
-        panic!("level 0 exists");
-    };
-    let comparator = crate::comparator::default_comparator();
-    let resolved = crate::Tree::resolve_level_staged(
-        level,
-        &mut remaining,
-        &keys,
-        SeqNo::MAX,
-        comparator.as_ref(),
-        &mut results,
-        crate::config::DEFAULT_MULTI_GET_METADATA_BUDGET,
-    );
+    let resolved = tree.resolve_level_staged(0, &mut remaining, keys.clone(), &mut results)?;
     assert!(resolved, "the other table has blocks to read");
     let count = keys.len() as u64;
     assert_eq!(counts(&widened), (count, count), "(probes, negatives)");
@@ -353,20 +328,7 @@ fn a_chunked_resolve_counts_false_positives_once() -> crate::Result<()> {
         .map(|(index, key)| (index, crate::hash::hash64(key.as_bytes())))
         .collect();
     let mut results: Vec<Option<crate::value::InternalValue>> = alloc::vec![None; keys.len()];
-    let version = tree.current_version();
-    let Some(level) = version.level(0) else {
-        panic!("level 0 exists");
-    };
-    let comparator = crate::comparator::default_comparator();
-    let resolved = crate::Tree::resolve_level_staged(
-        level,
-        &mut remaining,
-        &keys,
-        SeqNo::MAX,
-        comparator.as_ref(),
-        &mut results,
-        crate::config::DEFAULT_MULTI_GET_METADATA_BUDGET,
-    );
+    let resolved = tree.resolve_level_staged(0, &mut remaining, keys.clone(), &mut results)?;
     assert!(resolved, "the level has blocks to read");
     let present = results.iter().filter(|result| result.is_some()).count();
     let absent = keys.len() - present;
