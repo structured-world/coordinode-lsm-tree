@@ -6352,6 +6352,10 @@ impl Table {
         #[cfg(feature = "metrics")]
         let mut had_filter = false;
         for (i, (key, hash)) in sorted_keys.iter().enumerate() {
+            // Below a tight-space restriction, as for a point read.
+            if self.is_below_restriction(key) {
+                continue;
+            }
             let bloom = self.check_bloom(key, *hash)?;
             if !bloom.should_skip() {
                 passing.push(i);
@@ -6554,6 +6558,10 @@ impl Table {
         }
         let mut passing: Vec<usize> = Vec::with_capacity(sorted_keys.len());
         for (i, (key, hash)) in sorted_keys.iter().enumerate() {
+            // Below a tight-space restriction, as for a point read.
+            if self.is_below_restriction(key) {
+                continue;
+            }
             if !self.check_bloom(key, *hash)?.should_skip() {
                 passing.push(i);
             }
