@@ -23,6 +23,28 @@ pub(super) struct StageRead<'a> {
     pub(super) buf: Vec<u8>,
 }
 
+/// The file of a table a level asks to have opened before it reads from it;
+/// handed back through [`LevelStages::opened`].
+pub(super) struct StageOpen<'a> {
+    pub(super) at: usize,
+    pub(super) table: &'a Table,
+}
+
+/// What a pass over the level asks its driver to carry out.
+pub(super) struct StageWork<'a> {
+    pub(super) reads: Vec<StageRead<'a>>,
+    pub(super) opens: Vec<StageOpen<'a>>,
+}
+
+impl StageWork<'_> {
+    pub(super) const fn new() -> Self {
+        Self {
+            reads: Vec::new(),
+            opens: Vec::new(),
+        }
+    }
+}
+
 /// The staged read of a level's `tables` for their spans of `batch`.
 pub(super) struct LevelStages<'a, 't, 'b> {
     tables: &'t mut [LevelTable<'a>],
@@ -43,6 +65,10 @@ pub(super) struct LevelStages<'a, 't, 'b> {
     staged: Vec<bool>,
     in_stage: usize,
     meta: MetaHeld,
+    /// The bytes a table whose file is being opened holds for the stage it
+    /// opens it for: counted against the budget as in flight, so the tables
+    /// after it see the level as they would with that stage's reads out.
+    opening: Vec<u64>,
     /// Whether the last pass left a table waiting for a place under the cap,
     /// or for room under the budget.
     deferred: bool,
@@ -70,6 +96,7 @@ impl<'a, 't, 'b> LevelStages<'a, 't, 'b> {
             staged: alloc::vec![false; count],
             in_stage: 0,
             meta: MetaHeld::new(count),
+            opening: alloc::vec![0; count],
             deferred: false,
         }
     }
@@ -83,13 +110,13 @@ impl<'a, 't, 'b> LevelStages<'a, 't, 'b> {
     /// One pass over the level: every table with none of its blocks in flight
     /// moves on as far as the blocks it holds take it, and asks for the next
     /// stage's blocks once its read lacks some, as long as it has a place
-    /// under the cap and room under the budget. The reads asked for are
-    /// appended to `out`.
+    /// under the cap and room under the budget. The files to open and the
+    /// reads asked for are appended to `out`.
     #[expect(
         clippy::indexing_slicing,
         reason = "`at` indexes the level's tables, which every per-table vector is sized to; a table's span lies in `batch`"
     )]
-    pub(super) fn pump(&mut self, out: &mut Vec<StageRead<'a>>) {
+    pub(super) fn pump(&mut self, out: &mut StageWork<'a>) {
         self.deferred = false;
         // Whether a table before the one at hand holds metadata blocks: the
         // first that does is never held back, so the level advances.
@@ -144,35 +171,40 @@ impl<'a, 't, 'b> LevelStages<'a, 't, 'b> {
                     break;
                 }
                 // A size no block can have is refused before any buffer is
-                // allocated for it; the serial planner then reports the
-                // corruption as the load path does.
-                let Ok(buffers) = need
+                // allocated for it, or its file opened; the serial planner then
+                // reports the corruption as the load path does.
+                if need
                     .iter()
-                    .map(|handle| table.block_buffer(handle))
-                    .collect::<crate::Result<Vec<_>>>()
-                else {
+                    .any(|handle| table.check_block_size(handle).is_err())
+                {
                     entry.read = LevelRead::Serial;
                     self.meta.settle(at, 0);
                     break;
-                };
-                let file = if let Some(file) = &entry.file {
-                    Arc::clone(file)
-                } else {
-                    let Ok(file) = table.open_file() else {
-                        entry.read = LevelRead::Serial;
-                        self.meta.settle(at, 0);
-                        break;
-                    };
-                    entry.file = Some(Arc::clone(&file));
+                }
+                // A table's file is opened before its first stage is read, and
+                // held for every later one. The stage's bytes count as in
+                // flight while it is opened, so the tables after it see the
+                // level as they would with its reads out.
+                let Some(file) = &entry.file else {
+                    out.opens.push(StageOpen { at, table });
                     self.staged[at] = true;
                     self.in_stage += 1;
-                    file
+                    self.opening[at] = asked_bytes;
+                    self.meta.in_flight[at] += asked_bytes;
+                    self.meta.settle(at, read.held_bytes());
+                    self.waiting[at] += 1;
+                    break;
                 };
+                let file = Arc::clone(file);
+                let buffers: Vec<Vec<u8>> = need
+                    .iter()
+                    .map(|handle| alloc::vec![0u8; handle.size() as usize])
+                    .collect();
                 table.record_batched_read(block_type, need);
                 self.meta.in_flight[at] += asked_bytes;
                 self.meta.settle(at, read.held_bytes());
                 for (handle, buf) in need.iter().zip(buffers) {
-                    out.push(StageRead {
+                    out.reads.push(StageRead {
                         tag: self.asked.len(),
                         table,
                         file: Arc::clone(&file),
@@ -200,6 +232,37 @@ impl<'a, 't, 'b> LevelStages<'a, 't, 'b> {
                 self.meta.settle(at, 0);
             }
             held_before |= self.meta.held[at] > 0;
+        }
+    }
+
+    /// Takes back the file of the table at `at`, opened for its next stage,
+    /// whose reads the next pass asks for. A table whose file does not open
+    /// is planned serially.
+    #[expect(
+        clippy::indexing_slicing,
+        reason = "`at` came from a `StageOpen` of this level, which indexes its tables"
+    )]
+    pub(super) fn opened(&mut self, at: usize, file: crate::Result<Arc<dyn crate::fs::FsFile>>) {
+        self.waiting[at] -= 1;
+        self.meta.in_flight[at] -= self.opening[at];
+        self.opening[at] = 0;
+        let entry = &mut self.tables[at];
+        match file {
+            Ok(file) => {
+                entry.file = Some(file);
+                let held = match &entry.read {
+                    LevelRead::Staged(read) => read.held_bytes(),
+                    _ => 0,
+                };
+                self.meta.settle(at, held);
+            }
+            Err(error) => {
+                log::debug!(
+                    "a staged level read could not open a table, it is planned serially: {error}"
+                );
+                entry.read = LevelRead::Serial;
+                self.meta.settle(at, 0);
+            }
         }
     }
 

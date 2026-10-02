@@ -3983,17 +3983,22 @@ impl Tree {
             generation: core::sync::atomic::AtomicU64::new(0),
             thread: std::thread::current(),
         });
-        let mut reads: Vec<level_stages::StageRead<'a>> = Vec::new();
+        let mut work = level_stages::StageWork::new();
 
         loop {
-            // Every table moves on as far as it can, and its next stage's
-            // reads go to the queue of the backend it was opened through.
-            stages.pump(&mut reads);
-            #[expect(
-                clippy::iter_with_drain,
-                reason = "the buffer is reused by every pass; into_iter would consume it"
-            )]
-            for read in reads.drain(..) {
+            // Every table moves on as far as it can. The files it asks for are
+            // opened and the level moves on again before any read is
+            // submitted, so a pass's reads go out together.
+            stages.pump(&mut work);
+            if !work.opens.is_empty() {
+                for open in work.opens.drain(..) {
+                    stages.opened(open.at, open.table.open_file());
+                }
+                continue;
+            }
+            // Each read goes to the queue of the backend its table was opened
+            // through.
+            for read in work.reads.drain(..) {
                 let slot = if let Some(slot) = queues
                     .iter()
                     .position(|q| Arc::ptr_eq(q.fs, &read.table.fs))
