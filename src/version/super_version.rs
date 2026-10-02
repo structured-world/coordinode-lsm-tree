@@ -151,16 +151,16 @@ pub struct SuperVersion {
 /// mirror's `arc-swap` load guard keeps it alive without the history lock or a
 /// clone (three `Arc` bumps per call).
 ///
-/// Short-lived by design: a guard held across a long scan would delay the
-/// mirror's writers, so iterators keep cloning; this type serves the point
-/// lookups. The mirror needs `arc-swap`, so under no-std the read clones the
-/// current version out of the locked history instead.
+/// The guard is short-lived by design: held across a long scan it would delay
+/// the mirror's writers, so iterators keep cloning, and so does a read a
+/// caller suspends for as long as it likes. The mirror needs `arc-swap`, so
+/// under no-std a read always clones the current version out of the locked
+/// history.
 pub enum SnapshotRef {
     /// The current snapshot, pinned by the mirror's load guard.
     #[cfg(feature = "std")]
     Latest(arc_swap::Guard<Arc<SuperVersion>>),
-    /// The current snapshot, cloned out of the locked version history.
-    #[cfg(not(feature = "std"))]
+    /// A snapshot of the read's own.
     Owned(SuperVersion),
 }
 
@@ -171,7 +171,6 @@ impl core::ops::Deref for SnapshotRef {
         match self {
             #[cfg(feature = "std")]
             Self::Latest(guard) => guard,
-            #[cfg(not(feature = "std"))]
             Self::Owned(version) => version,
         }
     }

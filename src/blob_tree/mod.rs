@@ -56,7 +56,7 @@ impl IterGuard for Guard {
         if pred(&kv.key.user_key) {
             resolve_value_handle(
                 self.tree.id(),
-                &self.tree.index.config,
+                &self.tree.index.config.cache,
                 &self.version,
                 #[cfg(feature = "metrics")]
                 self.tree.metrics(),
@@ -90,7 +90,7 @@ impl IterGuard for Guard {
         }
         resolve_value_handle(
             self.tree.id(),
-            &self.tree.index.config,
+            &self.tree.index.config.cache,
             &self.version,
             #[cfg(feature = "metrics")]
             self.tree.metrics(),
@@ -99,9 +99,9 @@ impl IterGuard for Guard {
     }
 }
 
-fn resolve_value_handle(
+pub(crate) fn resolve_value_handle(
     tree_id: TreeId,
-    config: &Config,
+    cache: &crate::Cache,
     version: &Version,
     #[cfg(feature = "metrics")] metrics: &crate::metrics::Metrics,
     item: InternalValue,
@@ -119,7 +119,7 @@ fn resolve_value_handle(
             Some(metrics),
         );
 
-        match accessor.get(tree_id, &item.key.user_key, &vptr.vhandle, &config.cache) {
+        match accessor.get(tree_id, &item.key.user_key, &vptr.vhandle, cache) {
             Ok(Some(v)) => {
                 let k = item.key.user_key;
                 Ok((k, v))
@@ -223,10 +223,23 @@ impl BlobTree {
         else {
             return Ok(None);
         };
+        // The newest version is an operand: the key's value is its operands
+        // merged onto its base, as a batch of keys resolves it. Without a
+        // merge operator the operand is the value.
+        if item.key.value_type.is_merge_operand()
+            && let Some(merge_operator) = &self.index.config.merge_operator
+        {
+            return crate::Tree::resolve_merge_via_pipeline(
+                super_version.clone(),
+                key,
+                seqno,
+                Arc::clone(merge_operator),
+            );
+        }
 
         let (_, v) = resolve_value_handle(
             self.id(),
-            &self.index.config,
+            &self.index.config.cache,
             &super_version.version,
             #[cfg(feature = "metrics")]
             self.metrics(),
@@ -263,7 +276,7 @@ impl BlobTree {
                 let seqno = entry.key.seqno;
                 let (key, value) = resolve_value_handle(
                     self.id(),
-                    &self.index.config,
+                    &self.index.config.cache,
                     version,
                     #[cfg(feature = "metrics")]
                     self.metrics(),
@@ -271,6 +284,39 @@ impl BlobTree {
                 )?;
                 Ok(ScanSinceEvent::Insert { key, value, seqno })
             })
+    }
+
+    /// Starts a multi-get of `keys` at `seqno` that its caller drives, as
+    /// [`Tree::start_multi_get`](crate::Tree::start_multi_get) does; a value
+    /// kept in the value log is read by a job the read hands out.
+    ///
+    /// # Errors
+    ///
+    /// Returns [`crate::Error::SnapshotBelowRetention`] when `seqno` is below
+    /// what the tree retains.
+    pub fn start_multi_get<K: Into<UserKey>>(
+        &self,
+        keys: impl IntoIterator<Item = K>,
+        seqno: SeqNo,
+    ) -> crate::Result<crate::resumable::Step> {
+        let snapshot = self.index.snapshot_for_read(seqno)?;
+        let seqno = crate::Tree::read_ceiling(&snapshot, seqno);
+        Ok(crate::resumable::ResumableMultiGet::start(
+            crate::tree::read_job::ReadCtx {
+                super_version: crate::version::SnapshotRef::Owned((*snapshot).clone()),
+                keys: keys.into_iter().map(Into::into).collect(),
+                seqno,
+                comparator: Arc::clone(&self.index.config.comparator),
+                merge_operator: self.index.config.merge_operator.clone(),
+                values: crate::tree::read_job::Values::Blob {
+                    tree_id: self.id(),
+                    cache: Arc::clone(&self.index.config.cache),
+                    #[cfg(feature = "metrics")]
+                    metrics: Arc::clone(self.metrics()),
+                },
+                metadata_budget: self.index.config.multi_get_metadata_budget,
+            },
+        ))
     }
 
     /// Range-scoped variant of [`Self::scan_since_seqno`], with the same
@@ -299,7 +345,7 @@ impl BlobTree {
                 let seqno = entry.key.seqno;
                 let (key, value) = resolve_value_handle(
                     self.id(),
-                    &self.index.config,
+                    &self.index.config.cache,
                     version,
                     #[cfg(feature = "metrics")]
                     self.metrics(),
@@ -1499,10 +1545,6 @@ impl AbstractTree for BlobTree {
         self.resolve_key(&super_version, key.as_ref(), seqno)
     }
 
-    #[expect(
-        clippy::indexing_slicing,
-        reason = "indices are generated from 0..n range, always in bounds"
-    )]
     fn multi_get<K: AsRef<[u8]>>(
         &self,
         keys: impl IntoIterator<Item = K>,
@@ -1519,8 +1561,6 @@ impl AbstractTree for BlobTree {
             return Ok(Vec::new());
         }
 
-        let comparator = self.index.config.comparator.as_ref();
-
         // For small batches, use the simple per-key path
         if n <= 2 {
             return keys
@@ -1529,95 +1569,22 @@ impl AbstractTree for BlobTree {
                 .collect();
         }
 
-        // Phase 1: Check memtables (unsorted — defer sort+hash for SST phase)
-        let mut internal_entries: Vec<Option<crate::value::InternalValue>> = vec![None; n];
-        let mut remaining: Vec<usize> = Vec::with_capacity(n);
-
-        for idx in 0..n {
-            let key = keys[idx].as_ref();
-            if let Some(entry) = super_version.active_memtable.get(key, seqno) {
-                internal_entries[idx] = Some(entry);
-                continue;
-            }
-            if let Some(entry) =
-                crate::Tree::get_internal_entry_from_sealed_memtables(&super_version, key, seqno)
-            {
-                internal_entries[idx] = Some(entry);
-                continue;
-            }
-            remaining.push(idx);
-        }
-
-        // Phase 2: Sort + hash only if memtable misses exist
-        if !remaining.is_empty() {
-            remaining.sort_by(|&a, &b| comparator.compare(keys[a].as_ref(), keys[b].as_ref()));
-
-            // Shared dedup + fan-out with `Tree::multi_get` (see those helpers):
-            // the batched on-disk path needs strictly-sorted-unique input, and
-            // keeping one copy of this logic is what stops the two multi-get
-            // paths from drifting back apart.
-            let (miss_keys, duplicates) =
-                crate::Tree::dedup_sorted_miss_keys(&remaining, &keys, comparator);
-
-            crate::Tree::batch_get_from_tables(
-                &super_version.version,
-                &keys,
-                miss_keys,
-                seqno,
-                comparator,
-                &mut internal_entries,
-                self.index.config.multi_get_metadata_budget,
-            )?;
-
-            crate::Tree::fan_out_duplicates(&duplicates, &mut internal_entries);
-        }
-
-        // Phase 3: Resolve each entry (tombstones, RT suppression, merge, blob indirections)
-        let mut results = vec![None; n];
-        for idx in 0..n {
-            if let Some(item) = internal_entries[idx].take() {
-                if item.is_tombstone() {
-                    continue;
-                }
-                if crate::Tree::is_suppressed_by_range_tombstones(
-                    &super_version,
-                    keys[idx].as_ref(),
-                    item.key.seqno,
-                    seqno,
-                    comparator,
-                ) {
-                    continue;
-                }
-                // Merge operand resolution. Merge operands in BlobTree are stored
-                // inline (not as blob indirection), so the pipeline result is a
-                // plain value. Without a merge operator, return raw operand value
-                // (same as resolve_key / resolve_pinned_entry behavior).
-                if item.key.value_type.is_merge_operand() {
-                    if let Some(merge_op) = &self.index.config.merge_operator {
-                        results[idx] = crate::Tree::resolve_merge_via_pipeline(
-                            super_version.clone(),
-                            keys[idx].as_ref(),
-                            seqno,
-                            Arc::clone(merge_op),
-                        )?;
-                    } else {
-                        results[idx] = Some(item.value);
-                    }
-                    continue;
-                }
-                let (_, v) = resolve_value_handle(
-                    self.id(),
-                    &self.index.config,
-                    &super_version.version,
-                    #[cfg(feature = "metrics")]
-                    self.metrics(),
-                    item,
-                )?;
-                results[idx] = Some(v);
-            }
-        }
-
-        Ok(results)
+        // The read shared with `Tree::multi_get`, which follows a blob
+        // indirection into this version's value log.
+        crate::Tree::read_many(&crate::tree::read_job::ReadCtx {
+            super_version,
+            keys,
+            seqno,
+            comparator: Arc::clone(&self.index.config.comparator),
+            merge_operator: self.index.config.merge_operator.clone(),
+            values: crate::tree::read_job::Values::Blob {
+                tree_id: self.id(),
+                cache: Arc::clone(&self.index.config.cache),
+                #[cfg(feature = "metrics")]
+                metrics: Arc::clone(self.metrics()),
+            },
+            metadata_budget: self.index.config.multi_get_metadata_budget,
+        })
     }
 
     fn merge<K: Into<UserKey>, V: Into<UserValue>>(

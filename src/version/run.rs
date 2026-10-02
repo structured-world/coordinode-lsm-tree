@@ -154,6 +154,16 @@ impl<T: Ranged> Run<T> {
     /// and compaction preserves the ordering. The binary search here must
     /// use the same comparator to maintain the invariant.
     pub fn get_for_key_cmp<C: UserComparator + ?Sized>(&self, key: &[u8], cmp: &C) -> Option<&T> {
+        self.index_for_key_cmp(key, cmp)
+            .and_then(|idx| self.0.get(idx))
+    }
+
+    /// The position of the table [`Self::get_for_key_cmp`] returns.
+    pub fn index_for_key_cmp<C: UserComparator + ?Sized>(
+        &self,
+        key: &[u8],
+        cmp: &C,
+    ) -> Option<usize> {
         let idx = self.partition_point(|x| {
             cmp.compare(x.key_range().max(), key) == core::cmp::Ordering::Less
         });
@@ -161,6 +171,7 @@ impl<T: Ranged> Run<T> {
         self.0
             .get(idx)
             .filter(|x| cmp.compare(x.key_range().min(), key) != core::cmp::Ordering::Greater)
+            .map(|_| idx)
     }
 
     /// Returns the run's key range.

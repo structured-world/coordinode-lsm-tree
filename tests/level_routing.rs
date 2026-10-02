@@ -1890,15 +1890,15 @@ fn split_level(
     Ok(routed)
 }
 
-/// A batched read is charged when it is ISSUED. The prewarm submits one group
-/// per backend and gives up at the first that fails, so the groups after it are
-/// never asked of anything: charging them anyway reports reads that did not
-/// happen, on top of the serial resolve that then reads those same blocks.
+/// A batched read is charged when it is ISSUED, and only then: charging a
+/// read that never went out reports bytes no backend served, on top of the
+/// serial resolve that then reads those same blocks.
 ///
-/// Both backends refuse here, so only the first group is issued. What the
-/// failed run reads beyond a successful one must be exactly what the backends
-/// were asked for: the successful run's data reads all go through the batch,
-/// and the failed run repeats them serially after the refusal.
+/// The level's blocks fit one chunk, which goes out to both backends at once,
+/// one group each, and both refuse here. What the failed run reads beyond a
+/// successful one must be exactly what the backends were asked for: the
+/// successful run's data reads all go through the batch, and the failed run
+/// repeats them serially after the refusal.
 #[cfg(feature = "metrics")]
 #[test]
 fn a_failed_prewarm_charges_only_the_groups_it_submitted() -> lsm_tree::Result<()> {
@@ -1934,8 +1934,8 @@ fn a_failed_prewarm_charges_only_the_groups_it_submitted() -> lsm_tree::Result<(
         "a successful prewarm reads every data block through the batch",
     );
     assert!(
-        primary.calls() + other.calls() == 1 && refused_asked < served_asked,
-        "the refusal stops the prewarm at its first group",
+        primary.calls() == 1 && other.calls() == 1 && refused_asked == served_asked,
+        "the chunk goes out to both backends at once, and nothing after the refusal",
     );
     assert_eq!(
         refused,
@@ -1947,11 +1947,11 @@ fn a_failed_prewarm_charges_only_the_groups_it_submitted() -> lsm_tree::Result<(
     Ok(())
 }
 
-/// A level read in chunks charges its batched reads the same way: per backend
-/// group, when the group is submitted. Its first failure hands the level to
-/// the serial resolve, so a group after it is never asked and must not be
-/// charged; what the failed run reads beyond a successful one is exactly what
-/// the backend was asked for.
+/// A level read in chunks charges its batched reads the same way: when they
+/// are submitted. A chunk goes out to every backend it reads from at once,
+/// and its failure hands the level to the serial resolve, so the chunk after
+/// it is never asked and must not be charged; what the failed run reads
+/// beyond a successful one is exactly what the backends were asked for.
 #[cfg(feature = "metrics")]
 #[test]
 fn a_failed_chunked_resolve_charges_only_the_groups_it_submitted() -> lsm_tree::Result<()> {
@@ -1984,12 +1984,16 @@ fn a_failed_chunked_resolve_charges_only_the_groups_it_submitted() -> lsm_tree::
         ))
     };
 
-    let (served, _) = run(BatchedBehaviour::Serve)?;
+    let (served, served_asked) = run(BatchedBehaviour::Serve)?;
     let (refused, refused_asked) = run(BatchedBehaviour::Fail)?;
     assert_eq!(
-        primary.calls() + other.calls(),
-        1,
-        "the first refusal ends the batched read",
+        (primary.calls(), other.calls()),
+        (1, 1),
+        "the first chunk goes out to both backends at once",
+    );
+    assert!(
+        refused_asked < served_asked,
+        "the refusal ends the batched read before the next chunk",
     );
     assert_eq!(
         refused,
