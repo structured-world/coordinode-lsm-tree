@@ -199,8 +199,16 @@ impl<I: DoubleEndedIterator<Item = crate::Result<InternalValue>>, L: SeparatedBa
                     // it lands on a merged key: the merged value is the item
                     // this stream yields, so there is no pointer left for a
                     // guard to resolve later. Only an unmerged value stays
-                    // lazy.
-                    base_value = Some(self.value_log.read(next)?);
+                    // lazy. A failed read still drains the key, so a caller
+                    // that goes on past the error does not get a version the
+                    // base shadows as the key's value.
+                    match self.value_log.read(next) {
+                        Ok(value) => base_value = Some(value),
+                        Err(e) => {
+                            self.drain_key_min(user_key)?;
+                            return Err(e);
+                        }
+                    }
                     found_base = true;
                     break;
                 }
