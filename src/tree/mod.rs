@@ -254,12 +254,20 @@ impl MetaHeld {
 }
 
 /// Woken by any queue of a level when one of its reads is back: each wake
-/// moves the generation on and unparks the thread driving the level, so a
-/// wake landing between its look at the queues and its park is not lost.
+/// moves the generation on, so a wake landing between the driver's look at
+/// the queues and its park is not lost, and unparks the driving thread only
+/// while it sleeps on the wake. A driver waiting inside one queue is parked
+/// by that queue's own channel, which an unpark of ours would only wake
+/// spuriously, a context switch per read for nothing.
 // no-std: without a thread to park, the level waits on one queue at a time.
 #[cfg(feature = "std")]
 struct LevelWake {
     generation: core::sync::atomic::AtomicU64,
+    /// Whether the driver sleeps on this wake. Set before it looks at the
+    /// generation and read after a wake moves it, both sequentially
+    /// consistent: either the driver sees the new generation and does not
+    /// park, or the wake sees it asleep and unparks it.
+    sleeping: core::sync::atomic::AtomicBool,
     thread: std::thread::Thread,
 }
 
@@ -267,8 +275,10 @@ struct LevelWake {
 impl crate::fs::ReadWake for LevelWake {
     fn wake(&self) {
         self.generation
-            .fetch_add(1, core::sync::atomic::Ordering::Release);
-        self.thread.unpark();
+            .fetch_add(1, core::sync::atomic::Ordering::SeqCst);
+        if self.sleeping.load(core::sync::atomic::Ordering::SeqCst) {
+            self.thread.unpark();
+        }
     }
 }
 
@@ -3828,6 +3838,7 @@ impl Tree {
         #[cfg(feature = "std")]
         let wake = Arc::new(LevelWake {
             generation: core::sync::atomic::AtomicU64::new(0),
+            sleeping: core::sync::atomic::AtomicBool::new(false),
             thread: std::thread::current(),
         });
         let mut work = read_job::ReadWork::new();
@@ -3878,7 +3889,7 @@ impl Tree {
             // generation is taken first, so a read back after this look is
             // seen by the sleep below.
             #[cfg(feature = "std")]
-            let seen = wake.generation.load(core::sync::atomic::Ordering::Acquire);
+            let seen = wake.generation.load(core::sync::atomic::Ordering::SeqCst);
             let mut handed = 0usize;
             for q in &mut queues {
                 q.queue.wait(0, &mut |done| {
@@ -3913,8 +3924,14 @@ impl Tree {
             // Every queue still reading wakes the level, which only a queue
             // given the wake under `std` does.
             #[cfg(feature = "std")]
-            while wake.generation.load(core::sync::atomic::Ordering::Acquire) == seen {
-                std::thread::park();
+            {
+                wake.sleeping
+                    .store(true, core::sync::atomic::Ordering::SeqCst);
+                while wake.generation.load(core::sync::atomic::Ordering::SeqCst) == seen {
+                    std::thread::park();
+                }
+                wake.sleeping
+                    .store(false, core::sync::atomic::Ordering::SeqCst);
             }
         }
     }
