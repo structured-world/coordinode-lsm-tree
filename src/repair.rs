@@ -3118,15 +3118,17 @@ fn recover_blob_files(
                     &*config.fs,
                     &salvaged_path,
                 )?);
-                let bf = crate::vlog::recover_blob_file_from(
+                let held = held_descriptors(config);
+                let bf = crate::vlog::recover_blob_file_cached(
                     &salvaged_path,
                     new_id,
                     checksum,
-                    0,
+                    held.as_ref().map_or(0, |(_, tree_id)| *tree_id),
                     &config.fs,
                     0,
                     #[cfg(zstd_any)]
                     &config.current_zstd_dictionaries(),
+                    held.as_ref().map(|(cache, _)| cache),
                 )?;
                 Ok(Some((bf, report)))
             })();
@@ -3234,15 +3236,20 @@ fn recover_blob_files(
             }
         };
 
-        match crate::vlog::recover_blob_file_from(
+        // Held until the rebuilt manifest is published, as a recovered table
+        // is, so its descriptor goes through the repair's cache (see
+        // `held_recover_params`).
+        let held = held_descriptors(config);
+        match crate::vlog::recover_blob_file_cached(
             &blob_path,
             blob_id,
             checksum,
-            0,
+            held.as_ref().map_or(0, |(_, tree_id)| *tree_id),
             &config.fs,
             frontier,
             #[cfg(zstd_any)]
             &config.current_zstd_dictionaries(),
+            held.as_ref().map(|(cache, _)| cache),
         ) {
             Ok(bf) => {
                 if frontier > 0 {
