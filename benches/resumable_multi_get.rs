@@ -260,9 +260,10 @@ fn run() -> Result<(), Box<dyn std::error::Error>> {
             };
             println!(
                 "{threads} threads, {mode}: {rate:.0} batches/s per thread; \
-                 batch p50 {:?} p99 {:?}; ring depth at wait {ring:.1}",
+                 batch p50 {:?} p99 {:?} p999 {:?}; ring depth at wait {ring:.1}",
                 quantile(&mut wall, 0.5),
                 quantile(&mut wall, 0.99),
+                quantile(&mut wall, 0.999),
             );
         }
     }

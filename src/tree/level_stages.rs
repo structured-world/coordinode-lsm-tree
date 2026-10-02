@@ -126,7 +126,6 @@ impl<'a> LevelStages<'a> {
         }
     }
 
-    /// The keys of the level's batch in `span`.
     /// Whether none of the level's tables waits on a read or an open.
     pub(super) fn idle(&self) -> bool {
         self.waiting.iter().all(|&waiting| waiting == 0)
@@ -191,7 +190,12 @@ impl<'a> LevelStages<'a> {
                 let table: &'a Table = entry.table;
                 // A table with no place under the cap waits before any of its
                 // stage's buffers is allocated: it is passed over again on
-                // every pass until a place frees.
+                // every pass until a place frees. This never holds back the
+                // first table holding blocks while the places are taken by
+                // tables after it: a table starts only with a place free and
+                // asks for its file in the same visit unless it is not the
+                // first holder, and a holder before it gives its place back at
+                // its own visit, earlier in the pass, the moment it is over.
                 if entry.file.is_none() && self.in_stage >= self.open_cap {
                     self.deferred = true;
                     break;

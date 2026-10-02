@@ -452,7 +452,7 @@ fn reads_dropped_mid_flight_under_injected_faults_stay_sound() -> lsm_tree::Resu
         state ^= state << 17;
         state % bound
     };
-    let (mut dropped, mut answered) = (0, 0);
+    let (mut dropped, mut answered, mut checked) = (0, 0, 0);
     for _ in 0..200 {
         injector.clear();
         injector.arm(
@@ -490,7 +490,7 @@ fn reads_dropped_mid_flight_under_injected_faults_stay_sound() -> lsm_tree::Resu
                                         Err(io::ErrorKind::UnexpectedEof.into())
                                     }
                                 });
-                        (block.tag, result, block.buf)
+                        (block.tag, result, block.buf, block.file, block.offset)
                     })
                     .collect::<Vec<_>>()
             });
@@ -500,15 +500,26 @@ fn reads_dropped_mid_flight_under_injected_faults_stay_sound() -> lsm_tree::Resu
                 let finished = pool
                     .join()
                     .unwrap_or_else(|_| panic!("the pool thread panicked"));
-                assert!(
-                    finished
-                        .iter()
-                        .all(|(_, result, buf)| result.is_err() || !buf.is_empty()),
-                    "a read still running finished into its own buffer"
-                );
+                // Each read that went well holds its block's bytes: the read
+                // given up neither freed nor touched a buffer still being
+                // read into.
+                for (_, result, buf, file, offset) in &finished {
+                    if result.is_err() {
+                        continue;
+                    }
+                    let mut block = vec![0u8; buf.len()];
+                    let read = file.read_at(&mut block, *offset);
+                    if read.as_ref().is_ok_and(|&n| n == block.len()) {
+                        assert_eq!(
+                            buf, &block,
+                            "a read still running finished into its own buffer"
+                        );
+                        checked += 1;
+                    }
+                }
                 break None;
             }
-            for (tag, result, buf) in pool
+            for (tag, result, buf, _, _) in pool
                 .join()
                 .unwrap_or_else(|_| panic!("the pool thread panicked"))
             {
@@ -532,8 +543,9 @@ fn reads_dropped_mid_flight_under_injected_faults_stay_sound() -> lsm_tree::Resu
     }
     injector.clear();
     assert!(
-        dropped > 0 && answered > 0,
-        "both outcomes were exercised: {dropped} dropped, {answered} answered"
+        dropped > 0 && answered > 0 && checked > 0,
+        "both outcomes were exercised: {dropped} dropped, {answered} answered, \
+         {checked} buffers of dropped reads checked"
     );
     Ok(())
 }
