@@ -2003,8 +2003,9 @@ impl Config {
         self
     }
 
-    /// Sets the filter and index bytes a multi-get holds at once, in flight
-    /// or read, across the tables of a level it reads stage by stage. A block
+    /// Sets the filter and index bytes a multi-get, blocking or resumable,
+    /// holds at once, in flight or read, across the tables of a level it
+    /// reads stage by stage. A block
     /// in flight counts at the size it is read as, a block read at its decoded
     /// size. A table whose blocks would pass it waits until a table before it
     /// is planned and lets its blocks go; one that alone passes it is read
