@@ -296,6 +296,7 @@ impl<'a, 'b: 'a> StreamFilterAdapter<'a, 'b> {
                 self.shared.opts.config.descriptor_table.clone(),
                 self.shared.opts.config.fs.clone(),
             )?
+            .use_output_ledger(self.shared.opts.outputs.clone())
             .use_target_size(blob_opts.file_target_size)
             .use_compression(rc.blob_compression)
             .use_sync_mode(self.shared.opts.config.sync_mode);

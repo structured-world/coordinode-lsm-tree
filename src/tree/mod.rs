@@ -1011,7 +1011,7 @@ impl AbstractTree for Tree {
             deletion_pause: &self.deletion_pause,
             heal_hints: &self.heal_hints,
             #[cfg(feature = "std")]
-            background_deleter: Some(&self.background_deleter),
+            background_deleter: &self.background_deleter,
         };
         for table in tables {
             table.bind_to_tree(&sinks);
@@ -5241,7 +5241,7 @@ impl Tree {
             deletion_pause: &deletion_pause,
             heal_hints: &heal_hints,
             #[cfg(feature = "std")]
-            background_deleter: Some(&background_deleter),
+            background_deleter: &background_deleter,
         };
         for table in &recovered_tables {
             table.bind_to_tree(&sinks);

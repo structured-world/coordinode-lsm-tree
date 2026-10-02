@@ -242,12 +242,8 @@ pub(crate) struct TableSinks<'a> {
     /// healing rewrite.
     pub heal_hints: &'a Arc<crate::heal_hints::HealHints>,
     /// Moves an obsolete table's `unlink` off the foreground path.
-    ///
-    /// `None` for outputs that can be ROLLED BACK: the tight-space slice loop
-    /// rolls back exactly when free space is scarce, and there the space has
-    /// to come back now rather than when a background pass gets to it.
     #[cfg(feature = "std")]
-    pub background_deleter: Option<&'a Arc<crate::BackgroundDeleter>>,
+    pub background_deleter: &'a Arc<crate::BackgroundDeleter>,
 }
 
 /// Tables can be merged together to improve read performance and free unneeded disk space by removing outdated item versions.
@@ -8789,9 +8785,7 @@ impl Table {
         self.install_deletion_pause(Arc::clone(sinks.deletion_pause));
         self.install_heal_hints(Arc::clone(sinks.heal_hints));
         #[cfg(feature = "std")]
-        if let Some(deleter) = sinks.background_deleter {
-            self.install_background_deleter(Arc::clone(deleter));
-        }
+        self.install_background_deleter(Arc::clone(sinks.background_deleter));
     }
 
     /// The installed heal-hint sink, exposed so tests outside this module can
