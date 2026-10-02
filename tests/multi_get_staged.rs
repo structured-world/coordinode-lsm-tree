@@ -1342,6 +1342,60 @@ fn a_level_wider_than_the_descriptor_cache_opens_each_table_at_most_twice() -> l
     Ok(())
 }
 
+/// A level of overlapping tables, every one of which covers every key, read
+/// through a descriptor cache far narrower than the level: each table begins
+/// its read only once it has a place, and every key is answered with its
+/// newest version, as a key-by-key read answers it.
+#[test]
+fn an_overlapping_level_wider_than_the_descriptor_cache_answers_every_key() -> lsm_tree::Result<()>
+{
+    const TABLES: u32 = 32;
+    let dir = tempfile::tempdir()?;
+    let config = || {
+        Config::new(
+            dir.path(),
+            SequenceNumberCounter::default(),
+            SequenceNumberCounter::default(),
+        )
+        .use_cache(Arc::new(Cache::with_capacity_bytes(0)))
+        .use_descriptor_table(Some(Arc::new(lsm_tree::DescriptorTable::new(4))))
+        .filter_block_pinning_policy(PinningPolicy::all(false))
+        .index_block_pinning_policy(PinningPolicy::all(false))
+    };
+    {
+        let tree = config().open()?;
+        let mut seqno = 0;
+        for table in 0..TABLES {
+            // Every key again in each table, so each run covers the batch.
+            for row in 0..100u32 {
+                tree.insert(format!("k{row:04}"), format!("v{table}"), seqno);
+                seqno += 1;
+            }
+            tree.flush_active_memtable(0)?;
+        }
+    }
+    let keys: Vec<String> = (0..120u32).map(|row| format!("k{row:04}")).collect();
+    let tree = config().open()?;
+    let expected = one_by_one(&tree, &keys)?;
+
+    let values = tree.multi_get(&keys, SeqNo::MAX)?;
+    assert_eq!(values, expected);
+    assert_eq!(
+        values.iter().filter(|value| value.is_some()).count(),
+        100,
+        "every written key is found, the 20 past them are not"
+    );
+    let newest = format!("v{}", TABLES - 1);
+    assert!(
+        values
+            .iter()
+            .flatten()
+            .all(|value| value.as_ref() == newest.as_bytes()),
+        "every key answers with the newest table's version"
+    );
+    Ok(())
+}
+
 /// A [`StdFs`] file counted among the files a [`LiveCountFs`] has open while
 /// it lives.
 struct Counted {

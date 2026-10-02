@@ -141,18 +141,44 @@ struct BlockTask<'a> {
 type LevelTasks<'a> = (Vec<BlockTask<'a>>, Vec<(&'a Table, PlanCounts)>);
 
 /// One table of a level being planned for a key batch: the keys it covers,
-/// their indices in the caller's batch, and its staged read, `None` when it
-/// is planned serially.
-struct LevelTable<'a, 'k> {
+/// and how it is read.
+struct LevelTable<'a> {
     table: &'a Table,
-    batch: Vec<(&'k [u8], u64)>,
-    batch_idx: Vec<usize>,
-    read: Option<crate::table::staged::StagedRead<'a>>,
+    /// Its keys: a span of the level's batch, which every run of the level
+    /// walks in the same order, so no table holds a copy of its keys.
+    keys: core::ops::Range<usize>,
+    read: LevelRead<'a>,
     /// The file the first stage opened, held for every later stage: on a
     /// level wider than the descriptor cache, the cache has evicted it by
     /// then, and opening it again is a cold open per stage. It is let go once
     /// the table's stages are over.
     file: Option<Arc<dyn crate::fs::FsFile>>,
+}
+
+/// How a table of a level is read for its keys.
+enum LevelRead<'a> {
+    /// Not begun: nothing past its span of keys is built until it has a
+    /// place to read in, so a level wider than the descriptor cache holds the
+    /// key positions of no more tables than it holds files.
+    Pending,
+    /// Read in stages.
+    Staged(crate::table::staged::StagedRead<'a>),
+    /// Planned serially: its blocks need the load path, or a stage failed.
+    Serial,
+    /// No key of the batch reads anything in it.
+    Nothing,
+}
+
+impl LevelRead<'_> {
+    /// Whether the table needs no more stages: planned, or left to the
+    /// serial planner, or with nothing to read.
+    fn is_over(&self) -> bool {
+        match self {
+            Self::Pending => false,
+            Self::Staged(read) => read.is_done(),
+            Self::Serial | Self::Nothing => true,
+        }
+    }
 }
 
 /// A data block task's block before its chunk is read.
@@ -3809,7 +3835,7 @@ impl Tree {
     /// the resolver surfaces it instead of letting a stale lower level answer.
     #[expect(
         clippy::indexing_slicing,
-        reason = "i < remaining.len() loop-checked; idx/jdx are valid key indices; batch_idx[pos] is in range (pos came from this table's own plan)"
+        reason = "i < batch.len() loop-checked; remaining's indices are valid key indices; a table's span lies in the batch and a plan's positions in its span"
     )]
     fn plan_level_block_tasks<'a, 'k, K: AsRef<[u8]>>(
         level: &'a crate::version::Level,
@@ -3819,44 +3845,34 @@ impl Tree {
         comparator: &dyn crate::comparator::UserComparator,
         metadata_budget: u64,
     ) -> crate::Result<LevelTasks<'a>> {
-        use crate::table::staged::{StagedRead, StagedStart};
+        // The batch the level is read for, once: each table covers a span of
+        // it, in every run alike.
+        let batch: Vec<(&'k [u8], u64)> = remaining
+            .iter()
+            .map(|&(idx, hash)| (keys[idx].as_ref(), hash))
+            .collect();
 
-        // The level's tables, each with the keys it covers.
-        let mut tables: Vec<LevelTable<'a, 'k>> = Vec::new();
+        // The level's tables, each with the span of keys it covers.
+        let mut tables: Vec<LevelTable<'a>> = Vec::new();
         for run in level.iter() {
             let mut i = 0;
-            while i < remaining.len() {
-                let (idx, _) = remaining[i];
-                let key = keys[idx].as_ref();
-                let Some(table) = run.get_for_key_cmp(key, comparator) else {
+            while i < batch.len() {
+                let Some(table) = run.get_for_key_cmp(batch[i].0, comparator) else {
                     i += 1;
                     continue;
                 };
                 let table_id = table.id();
-                let mut batch: Vec<(&'k [u8], u64)> = Vec::new();
-                let mut batch_idx: Vec<usize> = Vec::new();
-                while i < remaining.len() {
-                    let (jdx, jhash) = remaining[i];
-                    let jkey = keys[jdx].as_ref();
-                    match run.get_for_key_cmp(jkey, comparator) {
-                        Some(t) if t.id() == table_id => {
-                            batch.push((jkey, jhash));
-                            batch_idx.push(jdx);
-                            i += 1;
-                        }
+                let start = i;
+                while i < batch.len() {
+                    match run.get_for_key_cmp(batch[i].0, comparator) {
+                        Some(t) if t.id() == table_id => i += 1,
                         _ => break,
                     }
                 }
-                let read = match StagedRead::start(table, &batch, seqno) {
-                    StagedStart::Nothing => continue,
-                    StagedStart::Serial => None,
-                    StagedStart::Staged(read) => Some(read),
-                };
                 tables.push(LevelTable {
                     table,
-                    batch,
-                    batch_idx,
-                    read,
+                    keys: start..i,
+                    read: LevelRead::Pending,
                     file: None,
                 });
             }
@@ -3865,20 +3881,18 @@ impl Tree {
         // Every table's filter blocks in one batch, then every table's index
         // blocks in one batch, and so on until each is planned. A table whose
         // stage fails is planned serially below.
-        Self::read_level_stages(&mut tables, metadata_budget);
+        Self::read_level_stages(&mut tables, &batch, seqno, metadata_budget);
 
         let mut tasks: Vec<BlockTask<'a>> = Vec::new();
         let mut probes: Vec<(&'a Table, PlanCounts)> = Vec::new();
         for LevelTable {
-            table,
-            batch,
-            batch_idx,
-            read,
-            ..
+            table, keys, read, ..
         } in tables
         {
+            let table_batch = &batch[keys.clone()];
             let (table_seqno, blocks, tally) = match read {
-                Some(read) if read.is_done() => read.into_plan(),
+                LevelRead::Nothing => continue,
+                LevelRead::Staged(read) if read.is_done() => read.into_plan(),
                 // Served by the serial planner, whose reads are authoritative:
                 // a genuine failure surfaces here instead of letting a lower
                 // level answer a key this table covers. The file it opened is
@@ -3887,7 +3901,7 @@ impl Tree {
                 _ => {
                     let mut tally = PlanCounts::default();
                     let Some((_, table_seqno, _, blocks)) =
-                        table.plan_block_tasks(&batch, seqno, &mut tally)?
+                        table.plan_block_tasks(table_batch, seqno, &mut tally)?
                     else {
                         if tally != PlanCounts::default() {
                             probes.push((table, tally));
@@ -3905,7 +3919,10 @@ impl Tree {
             }
             let special = table.is_chunk_special();
             for (handle, positions) in blocks {
-                let task_keys: Vec<usize> = positions.iter().map(|&pos| batch_idx[pos]).collect();
+                let task_keys: Vec<usize> = positions
+                    .iter()
+                    .map(|&pos| remaining[keys.start + pos].0)
+                    .collect();
                 tasks.push(BlockTask {
                     table,
                     handle,
@@ -3938,15 +3955,28 @@ impl Tree {
     /// block cannot be opened, read or decoded is dropped, leaving its table
     /// to the serial planner.
     ///
-    /// The filter and index bytes the tables hold, in flight or read, stay
-    /// within `metadata_budget` past one table's stage: a table whose stage
-    /// would pass it waits while a table before it holds blocks, and the
-    /// first table holding any always goes on, so the level always advances.
+    /// The filter and index bytes the tables hold, in flight at the size they
+    /// are read as and read at their decoded size, are kept within
+    /// `metadata_budget`: a table whose stage would pass it waits while a
+    /// table before it holds blocks, and the first table holding any always
+    /// goes on, so the level always advances. A stage is let in at its
+    /// on-disk size, so stages let in together can pass the budget by what
+    /// they grow when decoded.
+    ///
+    /// A table's read begins, at the snapshot `seqno`, over its span of
+    /// `batch` once it has a place to read in.
     #[expect(
         clippy::indexing_slicing,
-        reason = "a tag indexes `asked`, and `asked` entries index `tables` and `waiting`, all by construction"
+        reason = "a tag indexes `asked`, and `asked` entries index `tables` and `waiting`, all by construction; a table's span lies in `batch`"
     )]
-    fn read_level_stages<'a>(tables: &mut [LevelTable<'a, '_>], metadata_budget: u64) {
+    fn read_level_stages<'a>(
+        tables: &mut [LevelTable<'a>],
+        batch: &[(&[u8], u64)],
+        seqno: SeqNo,
+        metadata_budget: u64,
+    ) {
+        use crate::table::staged::{StagedRead, StagedStart};
+
         // One queue per backend, opened when a table first asks it for a
         // block, so a level answered from the cache opens none.
         let mut queues: Vec<LevelQueue<'a>> = Vec::new();
@@ -3985,16 +4015,28 @@ impl Tree {
                     held_before = true;
                     continue;
                 }
-                while let Some(read) = &mut entry.read
+                let keys = &batch[entry.keys.clone()];
+                if matches!(entry.read, LevelRead::Pending) {
+                    if in_stage >= open_cap {
+                        deferred = true;
+                        continue;
+                    }
+                    entry.read = match StagedRead::start(entry.table, keys, seqno) {
+                        StagedStart::Nothing => LevelRead::Nothing,
+                        StagedStart::Serial => LevelRead::Serial,
+                        StagedStart::Staged(read) => LevelRead::Staged(read),
+                    };
+                }
+                while let LevelRead::Staged(read) = &mut entry.read
                     && !read.is_done()
                 {
                     let (block_type, need) = read.need();
                     if need.is_empty() {
                         // A stage passed lets go of the blocks it alone read.
-                        if read.advance(&entry.batch).is_ok() {
+                        if read.advance(keys).is_ok() {
                             meta.settle(at, read.held_bytes());
                         } else {
-                            entry.read = None;
+                            entry.read = LevelRead::Serial;
                             meta.settle(at, 0);
                         }
                         continue;
@@ -4023,14 +4065,16 @@ impl Tree {
                         .map(|handle| table.block_buffer(handle))
                         .collect::<crate::Result<Vec<_>>>()
                     else {
-                        entry.read = None;
+                        entry.read = LevelRead::Serial;
+                        meta.settle(at, 0);
                         break;
                     };
                     let file = if let Some(file) = &entry.file {
                         Arc::clone(file)
                     } else {
                         let Ok(file) = table.open_file() else {
-                            entry.read = None;
+                            entry.read = LevelRead::Serial;
+                            meta.settle(at, 0);
                             break;
                         };
                         entry.file = Some(Arc::clone(&file));
@@ -4078,12 +4122,7 @@ impl Tree {
                 // through the file their chunk opens, and holding it would
                 // keep a descriptor per table of the level open until the
                 // whole level is read.
-                if waiting[at] == 0
-                    && entry
-                        .read
-                        .as_ref()
-                        .is_none_or(crate::table::staged::StagedRead::is_done)
-                {
+                if waiting[at] == 0 && entry.read.is_over() {
                     entry.file = None;
                     if staged[at] {
                         staged[at] = false;
@@ -4103,7 +4142,7 @@ impl Tree {
                 waiting[at] -= 1;
                 // Back from flight: held from here on decoded, if at all.
                 meta.in_flight[at] -= u64::from(handle.size());
-                let Some(read) = &mut tables[at].read else {
+                let LevelRead::Staged(read) = &mut tables[at].read else {
                     meta.settle(at, 0);
                     return;
                 };
@@ -4119,7 +4158,7 @@ impl Tree {
                 if supplied {
                     meta.settle(at, read.held_bytes());
                 } else {
-                    tables[at].read = None;
+                    tables[at].read = LevelRead::Serial;
                     meta.settle(at, 0);
                 }
             };

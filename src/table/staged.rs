@@ -193,9 +193,11 @@ impl<'t> StagedRead<'t> {
                 }
                 Stage::Index => {
                     if self.walk_index(sorted_keys)? {
-                        // Planned: the index blocks are not walked again.
+                        // Planned: the index blocks are not walked again, and
+                        // the plan holds the keys each data block reads.
                         self.stage = Stage::Done;
                         self.held.clear();
+                        self.passing = Vec::new();
                     }
                 }
                 Stage::Done => return Ok(()),
