@@ -195,6 +195,11 @@ impl<I: DoubleEndedIterator<Item = crate::Result<InternalValue>>, L: SeparatedBa
                     break;
                 }
                 ValueType::Indirection => {
+                    // Read now, as RocksDB's iterator fetches a blob base when
+                    // it lands on a merged key: the merged value is the item
+                    // this stream yields, so there is no pointer left for a
+                    // guard to resolve later. Only an unmerged value stays
+                    // lazy.
                     base_value = Some(self.value_log.read(next)?);
                     found_base = true;
                     break;
