@@ -274,6 +274,19 @@ impl<'a, 'b: 'a> StreamFilterAdapter<'a, 'b> {
             return Ok((ValueType::Value, new_value));
         }
 
+        // The payload goes to the value log below, and the stream emits only
+        // the small pointer, which is all the merge loop's limiter sees; the
+        // write is debited here, before it is issued, as the merge loop
+        // debits an item before writing it. A stop that cuts the wait short
+        // aborts the compaction the way the merge loop does.
+        let opts = self.shared.opts;
+        if opts
+            .rate_limiter
+            .request_interruptible(u64::from(value_size), || opts.stop_signal.is_stopped())
+        {
+            return Err(super::worker::cancelled_compaction());
+        }
+
         let writer = if let Some(writer) = self.blob_writer {
             writer
         } else {
@@ -311,16 +324,6 @@ impl<'a, 'b: 'a> StreamFilterAdapter<'a, 'b> {
         };
 
         let vhandle = writer.write(&prev_key.user_key, prev_key.seqno, &new_value)?;
-
-        // The payload goes to the value log here, and the stream emits only
-        // the small pointer, which is all the merge loop's limiter sees; the
-        // write is debited where it happens. Interruptible so a low limit
-        // cannot stall shutdown; the merge loop observes the stop signal on
-        // its next item, so only the wait is cut short here.
-        let opts = self.shared.opts;
-        let _ = opts
-            .rate_limiter
-            .request_interruptible(u64::from(value_size), || opts.stop_signal.is_stopped());
 
         let indirection = BlobIndirection {
             vhandle,
