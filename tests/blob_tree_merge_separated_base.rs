@@ -421,11 +421,13 @@ fn blob_tree_compaction_writes_no_blob_for_a_filter_rewrite_a_tombstone_deletes(
     Ok(())
 }
 
-/// `contains_key` asks whether the key exists, not what it merges to: it
-/// answers without reading the value log or calling the operator, so an
-/// operator that fails does not make an existing key an error.
+/// The key-only reads (`contains_key`, `contains_prefix`, `is_empty`, `len`)
+/// ask which keys exist, not what they merge to: a merge chain always resolves
+/// to some value, so they answer without reading the value log or calling the
+/// operator, and an operator that fails does not make an existing key an
+/// error. Checked with the base separated and inline.
 #[test]
-fn blob_tree_contains_key_does_not_merge() -> lsm_tree::Result<()> {
+fn blob_tree_key_only_reads_do_not_merge() -> lsm_tree::Result<()> {
     struct FailMerge;
     impl MergeOperator for FailMerge {
         fn merge(&self, _: &[u8], _: Option<&[u8]>, _: &[&[u8]]) -> lsm_tree::Result<UserValue> {
@@ -433,24 +435,41 @@ fn blob_tree_contains_key_does_not_merge() -> lsm_tree::Result<()> {
         }
     }
 
-    let folder = get_tmp_folder();
-    let tree = Config::new(
-        folder.path(),
-        SequenceNumberCounter::default(),
-        SequenceNumberCounter::default(),
-    )
-    .with_kv_separation(Some(KvSeparationOptions {
-        separation_threshold: 100,
-        ..Default::default()
-    }))
-    .with_merge_operator(Some(Arc::new(FailMerge)))
-    .open()?;
-    tree.insert("k", base(), 0);
-    tree.flush_active_memtable(0)?;
-    tree.merge("k", "_A", 1);
+    for separated in [true, false] {
+        let folder = get_tmp_folder();
+        let tree = Config::new(
+            folder.path(),
+            SequenceNumberCounter::default(),
+            SequenceNumberCounter::default(),
+        )
+        .with_kv_separation(separated.then(|| KvSeparationOptions {
+            separation_threshold: 100,
+            ..Default::default()
+        }))
+        .with_merge_operator(Some(Arc::new(FailMerge)))
+        .open()?;
+        tree.insert("k", base(), 0);
+        tree.flush_active_memtable(0)?;
+        tree.merge("k", "_A", 1);
+        tree.insert("z", "small", 2);
 
-    assert!(tree.contains_key("k", SeqNo::MAX)?, "k exists");
-    assert!(!tree.contains_key("absent", SeqNo::MAX)?, "absent does not");
+        let what = if separated { "separated" } else { "inline" };
+        assert!(tree.contains_key("k", SeqNo::MAX)?, "k exists, {what}");
+        assert!(
+            !tree.contains_key("absent", SeqNo::MAX)?,
+            "absent does not, {what}"
+        );
+        assert!(
+            tree.contains_prefix("k", SeqNo::MAX, None)?,
+            "prefix k, {what}"
+        );
+        assert!(
+            !tree.contains_prefix("q", SeqNo::MAX, None)?,
+            "prefix q, {what}"
+        );
+        assert!(!tree.is_empty(SeqNo::MAX, None)?, "is_empty, {what}");
+        assert_eq!(tree.len(SeqNo::MAX, None)?, 2, "len, {what}");
+    }
     Ok(())
 }
 
