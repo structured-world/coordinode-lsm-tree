@@ -218,19 +218,119 @@ struct IoUringCqe {
     flags: u32,
 }
 
-/// Maps a raw `errno` to the crate's `no_std` [`ErrorKind`].
-fn errno_to_kind(errno: i32) -> ErrorKind {
-    // libc errno numbers (Linux generic). Only the ones the I/O paths can
-    // realistically surface are mapped explicitly; the rest fold into `Other`,
-    // and the numeric errno is preserved in the message for diagnosis.
-    match errno {
-        1 | 13 => ErrorKind::PermissionDenied, // EPERM / EACCES
-        2 => ErrorKind::NotFound,              // ENOENT
-        4 => ErrorKind::Interrupted,           // EINTR
-        9 | 22 => ErrorKind::InvalidInput,     // EBADF / EINVAL
-        11 => ErrorKind::WouldBlock,           // EAGAIN / EWOULDBLOCK
-        17 => ErrorKind::AlreadyExists,        // EEXIST
-        95 => ErrorKind::Unsupported,          // EOPNOTSUPP
+/// The Linux `errno` numbers the I/O paths can surface. 1 to 34
+/// (`asm-generic/errno-base.h`) are shared by every architecture; the rest
+/// take their asm-generic values on most, and MIPS and SPARC define their own
+/// (verified against each arch's kernel `<asm/errno.h>`), so those are
+/// selected per `target_arch`, as the open flags above are.
+mod errno {
+    pub(super) const EPERM: i32 = 1;
+    pub(super) const ENOENT: i32 = 2;
+    pub(super) const EINTR: i32 = 4;
+    pub(super) const EBADF: i32 = 9;
+    pub(super) const EAGAIN: i32 = 11;
+    pub(super) const ENOMEM: i32 = 12;
+    pub(super) const EACCES: i32 = 13;
+    pub(super) const EEXIST: i32 = 17;
+    pub(super) const EXDEV: i32 = 18;
+    pub(super) const EINVAL: i32 = 22;
+    pub(super) const ENFILE: i32 = 23;
+    pub(super) const EMFILE: i32 = 24;
+    pub(super) const ENOSPC: i32 = 28;
+    pub(super) const EROFS: i32 = 30;
+    pub(super) const EPIPE: i32 = 32;
+    pub(super) use arch::*;
+
+    /// asm-generic.
+    #[cfg(not(any(
+        target_arch = "mips",
+        target_arch = "mips32r6",
+        target_arch = "mips64",
+        target_arch = "mips64r6",
+        target_arch = "sparc",
+        target_arch = "sparc64"
+    )))]
+    mod arch {
+        pub(in super::super) const EOPNOTSUPP: i32 = 95;
+        pub(in super::super) const ENETDOWN: i32 = 100;
+        pub(in super::super) const ENETUNREACH: i32 = 101;
+        pub(in super::super) const ECONNABORTED: i32 = 103;
+        pub(in super::super) const ECONNRESET: i32 = 104;
+        pub(in super::super) const ENOTCONN: i32 = 107;
+        pub(in super::super) const ETIMEDOUT: i32 = 110;
+        pub(in super::super) const ECONNREFUSED: i32 = 111;
+        pub(in super::super) const EHOSTUNREACH: i32 = 113;
+        pub(in super::super) const ESTALE: i32 = 116;
+        pub(in super::super) const EDQUOT: i32 = 122;
+    }
+
+    /// MIPS.
+    #[cfg(any(
+        target_arch = "mips",
+        target_arch = "mips32r6",
+        target_arch = "mips64",
+        target_arch = "mips64r6"
+    ))]
+    mod arch {
+        pub(in super::super) const EOPNOTSUPP: i32 = 122;
+        pub(in super::super) const ENETDOWN: i32 = 127;
+        pub(in super::super) const ENETUNREACH: i32 = 128;
+        pub(in super::super) const ECONNABORTED: i32 = 130;
+        pub(in super::super) const ECONNRESET: i32 = 131;
+        pub(in super::super) const ENOTCONN: i32 = 134;
+        pub(in super::super) const ETIMEDOUT: i32 = 145;
+        pub(in super::super) const ECONNREFUSED: i32 = 146;
+        pub(in super::super) const EHOSTUNREACH: i32 = 148;
+        pub(in super::super) const ESTALE: i32 = 151;
+        pub(in super::super) const EDQUOT: i32 = 1133;
+    }
+
+    /// SPARC.
+    #[cfg(any(target_arch = "sparc", target_arch = "sparc64"))]
+    mod arch {
+        pub(in super::super) const EOPNOTSUPP: i32 = 45;
+        pub(in super::super) const ENETDOWN: i32 = 50;
+        pub(in super::super) const ENETUNREACH: i32 = 51;
+        pub(in super::super) const ECONNABORTED: i32 = 53;
+        pub(in super::super) const ECONNRESET: i32 = 54;
+        pub(in super::super) const ENOTCONN: i32 = 57;
+        pub(in super::super) const ETIMEDOUT: i32 = 60;
+        pub(in super::super) const ECONNREFUSED: i32 = 61;
+        pub(in super::super) const EHOSTUNREACH: i32 = 65;
+        pub(in super::super) const ESTALE: i32 = 70;
+        pub(in super::super) const EDQUOT: i32 = 69;
+    }
+}
+
+/// Maps a raw `errno` to the crate's `no_std` [`ErrorKind`]. Only the ones the
+/// I/O paths can realistically surface are mapped; the rest fold into
+/// `Other`, and the numeric errno is preserved in the message for diagnosis.
+fn errno_to_kind(code: i32) -> ErrorKind {
+    match code {
+        errno::EPERM | errno::EACCES => ErrorKind::PermissionDenied,
+        errno::ENOENT => ErrorKind::NotFound,
+        errno::EINTR => ErrorKind::Interrupted,
+        errno::EBADF | errno::EINVAL => ErrorKind::InvalidInput,
+        // EWOULDBLOCK is EAGAIN on every Linux architecture.
+        errno::EAGAIN => ErrorKind::WouldBlock,
+        errno::ENOMEM => ErrorKind::OutOfMemory,
+        errno::EEXIST => ErrorKind::AlreadyExists,
+        errno::EXDEV => ErrorKind::CrossesDevices,
+        errno::ENFILE | errno::EMFILE => ErrorKind::TooManyOpenFiles,
+        errno::ENOSPC => ErrorKind::StorageFull,
+        errno::EROFS => ErrorKind::ReadOnlyFilesystem,
+        errno::EPIPE => ErrorKind::BrokenPipe,
+        errno::EOPNOTSUPP => ErrorKind::Unsupported,
+        errno::ENETDOWN => ErrorKind::NetworkDown,
+        errno::ENETUNREACH => ErrorKind::NetworkUnreachable,
+        errno::ECONNABORTED => ErrorKind::ConnectionAborted,
+        errno::ECONNRESET => ErrorKind::ConnectionReset,
+        errno::ENOTCONN => ErrorKind::NotConnected,
+        errno::ETIMEDOUT => ErrorKind::TimedOut,
+        errno::ECONNREFUSED => ErrorKind::ConnectionRefused,
+        errno::EHOSTUNREACH => ErrorKind::HostUnreachable,
+        errno::ESTALE => ErrorKind::StaleNetworkFileHandle,
+        errno::EDQUOT => ErrorKind::QuotaExceeded,
         _ => ErrorKind::Other,
     }
 }

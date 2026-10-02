@@ -44,6 +44,25 @@ fn weight_tracks_resident_bytes() {
     assert_eq!(c.weight(), 200);
 }
 
+/// `remove_where` drops exactly the entries it picks, in every shard (the
+/// descriptor cache closes a repair's files through it), and their weight
+/// with them; the others stay readable.
+#[test]
+fn remove_where_drops_only_the_picked_entries() {
+    let c = byte_cache(10_000);
+    for key in 0..64 {
+        c.insert(key, vec![0u8; 100]);
+    }
+    c.remove_where(|key| *key >= 32);
+    assert_eq!(c.len(), 32);
+    assert_eq!(c.weight(), 3_200);
+    assert_eq!(c.get(&40), None);
+    assert_eq!(c.get(&3), Some(vec![0u8; 100]));
+
+    c.insert(40, vec![1u8; 100]);
+    assert_eq!(c.get(&40), Some(vec![1u8; 100]));
+}
+
 #[test]
 fn replace_adjusts_weight_in_place() {
     let c = byte_cache(10_000);
