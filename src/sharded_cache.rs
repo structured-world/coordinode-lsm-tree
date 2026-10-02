@@ -548,11 +548,21 @@ where
         self.capacity
     }
 
-    /// Drops every entry, keeping each shard's capacity.
-    pub fn clear(&self) {
+    /// Removes every entry whose key `doomed` picks. Walks every shard under
+    /// its write lock: for a sweep, not the hot path.
+    pub fn remove_where(&self, mut doomed: impl FnMut(&K) -> bool) {
         for shard in &self.shards {
             let mut core = shard.0.write();
-            *core = ShardCore::new(core.capacity, core.ghost_capacity, self.hasher.clone());
+            let keys: alloc::vec::Vec<K> = core
+                .map
+                .iter()
+                .map(|(key, _)| key)
+                .filter(|key| doomed(key))
+                .cloned()
+                .collect();
+            for key in keys {
+                core.remove(self.hasher.hash_one(&key), &key);
+            }
         }
     }
 

@@ -683,10 +683,10 @@ fn repair_recover_params(
 }
 
 /// [`repair_recover_params`] for a table the repair holds until it publishes
-/// the rebuilt manifest: its file goes through the repair's descriptor cache,
-/// so the tables held at once need no descriptor each. A tree id of its own:
-/// another copy of this table id, or its salvage replacement, must never be
-/// handed this file's descriptor.
+/// the rebuilt manifest: its file goes through the configured descriptor
+/// cache, within its budget, so the tables held at once need no descriptor
+/// each. A tree id of its own: another copy of this table id, or its salvage
+/// replacement, must never be handed this file's descriptor.
 #[cfg(feature = "std")]
 fn held_recover_params(
     config: &Config,
@@ -4038,20 +4038,20 @@ fn repair_tree(
     // needs it then fails like one whose dictionary was never supplied, which
     // aborts rather than drops it, so a re-run with the right dictionary still
     // recovers it.
-    let mut owned_config = config.clone();
     #[cfg(zstd_any)]
-    let damaged_dictionaries = owned_config.install_own_zstd_dictionaries_skipping_damaged()?;
-    // The scan opens every table it finds, so it keeps their files within a
-    // descriptor cache as an open tree does: holding one descriptor per table
-    // runs out of them on a tree of more tables than the process may open.
-    // Its own cache, closed before the post-commit swaps, so no descriptor of
-    // a file being replaced or removed outlives the scan.
-    owned_config.descriptor_table = config.descriptor_table.as_ref().map(|shared| {
-        Arc::new(crate::DescriptorTable::new(
-            usize::try_from(shared.capacity()).unwrap_or(usize::MAX),
-        ))
-    });
+    let (owned_config, damaged_dictionaries) = {
+        let mut owned = config.clone();
+        let damaged = owned.install_own_zstd_dictionaries_skipping_damaged()?;
+        (owned, damaged)
+    };
+    #[cfg(zstd_any)]
     let config = &owned_config;
+
+    // The tables the repair holds keep their files in the configured
+    // descriptor cache, as an open tree does, each under a tree id of its own
+    // handed out from here on; every id from this one is swept out of the
+    // cache before the post-commit swaps (see `held_recover_params`).
+    let first_tree_id = crate::tree::inner::get_next_tree_id();
 
     if let Some(p) = &config.recovery_progress {
         p.set_phase(crate::RecoveryPhase::PendingSwaps);
@@ -4095,7 +4095,13 @@ fn repair_tree(
     // Phase 2: turn what the scan found into a manifest, commit it, and carry
     // out the removals and swaps that commit authorizes. The directory lock is
     // held by THIS frame for the whole of it.
-    let rebuilt = rebuild_from_scan(config, allow_resurrection, manifest_referenced, scan);
+    let rebuilt = rebuild_from_scan(
+        config,
+        allow_resurrection,
+        manifest_referenced,
+        scan,
+        first_tree_id,
+    );
     #[cfg(zstd_any)]
     let rebuilt = set_aside_damaged_dictionaries(config, damaged_dictionaries, rebuilt);
     rebuilt
@@ -5246,6 +5252,7 @@ fn rebuild_from_scan(
     allow_resurrection: bool,
     manifest_referenced: Option<CommittedManifest>,
     scan: TableScan,
+    first_tree_id: crate::tree::inner::TreeId,
 ) -> crate::Result<RepairReport> {
     let TableScan {
         recovered_by_id,
@@ -6218,6 +6225,7 @@ fn rebuild_from_scan(
             unreferenced_blob_files,
             blob_files_salvaged,
             salvaged,
+            first_tree_id,
         },
     )
 }
@@ -6253,6 +6261,9 @@ struct RepairPublication<'a> {
     unreferenced_blob_files: Vec<PathBuf>,
     blob_files_salvaged: Vec<(PathBuf, String)>,
     salvaged: usize,
+    /// The first tree id the repair handed out: the descriptors cached under
+    /// it and every later id are closed before the post-commit swaps.
+    first_tree_id: crate::tree::inner::TreeId,
 }
 
 /// Phase 3 of [`repair_tree`]: commit the rebuilt manifest, then carry out
@@ -6291,6 +6302,7 @@ fn publish_repaired_manifest(
         unreferenced_blob_files,
         mut blob_files_salvaged,
         salvaged,
+        first_tree_id,
     } = publication;
     // A rebuilt manifest whose highest table id is the LAST one cannot be
     // committed: the next open seeds its id allocator with `highest + 1`,
@@ -6567,10 +6579,12 @@ fn publish_repaired_manifest(
     // does not happen is a tree whose next open finds the damaged file under the
     // manifest's checksum and fails.
     //
-    // The scan's cached descriptors close first: a file still open cannot be
-    // replaced or removed on Windows, and nothing reads a scanned table again.
+    // The descriptors the repair cached close first: a file still open cannot
+    // be replaced or removed on Windows, and nothing reads a held table again.
+    // A tree opened on the shared cache meanwhile has its ids in the same range
+    // and only loses cached descriptors, which it reopens.
     if let Some(descriptors) = &config.descriptor_table {
-        descriptors.clear();
+        descriptors.remove_trees_from(first_tree_id);
     }
     if post_commit_error.is_none() {
         for (fs, tmp_path, table_path, restricted) in swap_after_commit {

@@ -51,9 +51,10 @@ impl DescriptorTable {
         self.inner.capacity()
     }
 
-    /// Closes every cached descriptor.
-    pub(crate) fn clear(&self) {
-        self.inner.clear();
+    /// Closes the cached descriptors of every tree whose id is `first` or
+    /// later, tables and blob files alike.
+    pub(crate) fn remove_trees_from(&self, first: crate::tree::inner::TreeId) {
+        self.inner.remove_where(|key| key.1 >= first);
     }
 
     #[must_use]

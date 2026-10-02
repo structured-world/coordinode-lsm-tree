@@ -44,22 +44,23 @@ fn weight_tracks_resident_bytes() {
     assert_eq!(c.weight(), 200);
 }
 
-/// `clear` drops every resident entry (the descriptor cache closes its files
-/// through it) and leaves a cache that admits entries up to the same capacity.
+/// `remove_where` drops exactly the entries it picks, in every shard (the
+/// descriptor cache closes a repair's files through it), and their weight
+/// with them; the others stay readable.
 #[test]
-fn clear_empties_every_shard_and_keeps_the_capacity() {
+fn remove_where_drops_only_the_picked_entries() {
     let c = byte_cache(10_000);
     for key in 0..64 {
         c.insert(key, vec![0u8; 100]);
     }
-    c.clear();
-    assert_eq!(c.len(), 0);
-    assert_eq!(c.weight(), 0);
-    assert_eq!(c.get(&3), None);
-    assert_eq!(c.capacity(), 10_000);
+    c.remove_where(|key| *key >= 32);
+    assert_eq!(c.len(), 32);
+    assert_eq!(c.weight(), 3_200);
+    assert_eq!(c.get(&40), None);
+    assert_eq!(c.get(&3), Some(vec![0u8; 100]));
 
-    c.insert(3, vec![1u8; 100]);
-    assert_eq!(c.get(&3), Some(vec![1u8; 100]));
+    c.insert(40, vec![1u8; 100]);
+    assert_eq!(c.get(&40), Some(vec![1u8; 100]));
 }
 
 #[test]
