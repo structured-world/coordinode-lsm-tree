@@ -400,6 +400,12 @@ path = "benches/io_uring_cold_multi_get.rs"
 required-features = ["io-uring", "metrics"]
 
 [[bench]]
+name = "resumable_multi_get"
+harness = false
+path = "benches/resumable_multi_get.rs"
+required-features = ["io-uring"]
+
+[[bench]]
 name = "multi_get_metadata_budget"
 harness = false
 path = "benches/multi_get_metadata_budget.rs"
