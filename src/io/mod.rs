@@ -81,6 +81,10 @@ pub enum ErrorKind {
     /// An I/O operation timed out (`ETIMEDOUT` — a slow or wedged network
     /// filesystem); the data underneath is not implicated.
     TimedOut,
+    /// The process or the system ran out of file descriptors (`EMFILE` /
+    /// `ENFILE`, `ERROR_TOO_MANY_OPEN_FILES`); the file itself is not
+    /// implicated.
+    TooManyOpenFiles,
     /// Reader hit end-of-file before satisfying the request.
     UnexpectedEof,
     /// Operation is not supported on this platform / backend / build.
@@ -150,8 +154,9 @@ impl ErrorKind {
     /// [`QuotaExceeded`](Self::QuotaExceeded) and
     /// [`ReadOnlyFilesystem`](Self::ReadOnlyFilesystem) (the salvage OUTPUT
     /// failed, not the source being salvaged), plus
-    /// [`OutOfMemory`](Self::OutOfMemory) (the HOST ran out, not the file's
-    /// bytes). Grading such a file unreadable
+    /// [`OutOfMemory`](Self::OutOfMemory) and
+    /// [`TooManyOpenFiles`](Self::TooManyOpenFiles) (the HOST ran out, not the
+    /// file's bytes). Grading such a file unreadable
     /// commits a manifest that excludes it and then removes it, turning a
     /// recoverable configuration / capacity problem into permanent loss of
     /// intact data; propagating lets the operator fix the environment and
@@ -165,6 +170,7 @@ impl ErrorKind {
                     | Self::QuotaExceeded
                     | Self::ReadOnlyFilesystem
                     | Self::OutOfMemory
+                    | Self::TooManyOpenFiles
             )
     }
 
@@ -192,6 +198,7 @@ impl ErrorKind {
             Self::StaleNetworkFileHandle => "stale network file handle",
             Self::StorageFull => "storage full",
             Self::TimedOut => "operation timed out",
+            Self::TooManyOpenFiles => "too many open files",
             Self::UnexpectedEof => "unexpected end of file",
             Self::Unsupported => "unsupported",
             Self::WouldBlock => "operation would block",
@@ -336,6 +343,17 @@ impl core::error::Error for Error {}
 #[cfg(feature = "std")]
 impl From<std::io::Error> for Error {
     fn from(err: std::io::Error) -> Self {
+        // An error of ours that crossed a `std::io` boundary comes back whole,
+        // including a kind std has no variant for.
+        if let Some(ours) = err.get_ref().and_then(|e| e.downcast_ref::<Self>()) {
+            return Self {
+                kind: ours.kind,
+                message: ours.message.clone(),
+            };
+        }
+        if let Some(kind) = err.raw_os_error().and_then(kind_from_os_error) {
+            return Self::new(kind, alloc::format!("{err}"));
+        }
         let std_kind = err.kind();
         let (kind, kind_is_mapped) = match std_kind {
             std::io::ErrorKind::AlreadyExists => (ErrorKind::AlreadyExists, true),
@@ -405,6 +423,20 @@ impl From<std::io::Error> for Error {
     }
 }
 
+/// The kind of an OS error code std reports as uncategorized.
+#[cfg(feature = "std")]
+fn kind_from_os_error(code: i32) -> Option<ErrorKind> {
+    #[cfg(unix)]
+    let too_many_open_files = code == libc::EMFILE || code == libc::ENFILE;
+    // `ERROR_TOO_MANY_OPEN_FILES` (4) and `WSAEMFILE` (10024), Win32 system
+    // error codes.
+    #[cfg(windows)]
+    let too_many_open_files = code == 4 || code == 10024;
+    #[cfg(not(any(unix, windows)))]
+    let too_many_open_files = false;
+    too_many_open_files.then_some(ErrorKind::TooManyOpenFiles)
+}
+
 /// Bridge back to `std::io::Error` so existing call sites that consume
 /// `std::io::Result<_>` (and where `From` is invoked via `?`) keep
 /// compiling once their input switches to this module.
@@ -434,6 +466,9 @@ impl From<Error> for std::io::Error {
             ErrorKind::StaleNetworkFileHandle => std::io::ErrorKind::StaleNetworkFileHandle,
             ErrorKind::StorageFull => std::io::ErrorKind::StorageFull,
             ErrorKind::TimedOut => std::io::ErrorKind::TimedOut,
+            // std has no such kind: carry ours as the payload so the bridge
+            // back restores it instead of reading `Other`.
+            ErrorKind::TooManyOpenFiles => return Self::other(err),
             ErrorKind::UnexpectedEof => std::io::ErrorKind::UnexpectedEof,
             ErrorKind::Unsupported => std::io::ErrorKind::Unsupported,
             ErrorKind::WouldBlock => std::io::ErrorKind::WouldBlock,

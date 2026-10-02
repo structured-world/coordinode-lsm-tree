@@ -145,6 +145,35 @@ fn storage_kinds_survive_the_bridge_as_environmental() {
     }
 }
 
+/// Running out of file descriptors says nothing about the file being opened,
+/// and std has no kind for it, so the OS code alone tells it apart. Read as
+/// `Other`, recovery grading would condemn every table it fails to open once
+/// the descriptor limit is reached.
+#[cfg(all(feature = "std", unix))]
+#[test]
+fn an_exhausted_descriptor_table_is_an_environmental_kind() {
+    for code in [libc::EMFILE, libc::ENFILE] {
+        let ours: Error = std::io::Error::from_raw_os_error(code).into();
+        assert_eq!(ours.kind(), ErrorKind::TooManyOpenFiles, "errno {code}");
+        assert!(
+            ours.kind().is_environmental(),
+            "errno {code} must abort recovery grading, not condemn the file",
+        );
+    }
+}
+
+/// A kind std has no variant for survives a round trip through
+/// `std::io::Error`, which every std-backed backend path takes.
+#[cfg(feature = "std")]
+#[test]
+fn too_many_open_files_round_trips_through_std_io_error() {
+    let original = Error::new(ErrorKind::TooManyOpenFiles, "open tables/7");
+    let as_std: std::io::Error = original.into();
+    let back: Error = as_std.into();
+    assert_eq!(back.kind(), ErrorKind::TooManyOpenFiles);
+    assert_eq!(back.to_string(), "too many open files: open tables/7");
+}
+
 #[cfg(feature = "std")]
 #[test]
 fn round_trip_through_std_io_error_preserves_writezero() {
