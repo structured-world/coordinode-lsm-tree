@@ -1690,6 +1690,39 @@ impl AbstractTree for Tree {
         .is_some())
     }
 
+    // Key-only like `contains_key`: the scan runs without the merge operator,
+    // which yields a chain's newest operand in place of its merged value, the
+    // same key either way.
+    fn contains_prefix<K: AsRef<[u8]>>(
+        &self,
+        prefix: K,
+        seqno: SeqNo,
+        index: Option<(Arc<Memtable>, SeqNo)>,
+    ) -> crate::Result<bool> {
+        Ok(self
+            .create_internal_prefix(prefix.as_ref(), seqno, index, None, None)?
+            .next()
+            .transpose()?
+            .is_some())
+    }
+
+    fn is_empty(&self, seqno: SeqNo, index: Option<(Arc<Memtable>, SeqNo)>) -> crate::Result<bool> {
+        Ok(self
+            .create_key_only_iter(seqno, index)?
+            .next()
+            .transpose()?
+            .is_none())
+    }
+
+    fn len(&self, seqno: SeqNo, index: Option<(Arc<Memtable>, SeqNo)>) -> crate::Result<usize> {
+        let mut count = 0;
+        for item in self.create_key_only_iter(seqno, index)? {
+            item?;
+            count += 1;
+        }
+        Ok(count)
+    }
+
     fn get_pinned<K: AsRef<[u8]>>(
         &self,
         key: K,
@@ -4860,22 +4893,47 @@ impl Tree {
         seqno: SeqNo,
         ephemeral: Option<(Arc<Memtable>, SeqNo)>,
     ) -> crate::Result<impl DoubleEndedIterator<Item = crate::Result<KvPair>> + 'static> {
+        Ok(self
+            .create_internal_prefix(
+                prefix.as_ref(),
+                seqno,
+                ephemeral,
+                self.config.merge_operator.clone(),
+                self.blob_source(),
+            )?
+            .map(|item| match item {
+                Ok(kv) => Ok((kv.key.user_key, kv.value)),
+                Err(e) => Err(e),
+            }))
+    }
+
+    /// Versions visible at `seqno` under `prefix`, a merge chain resolved by
+    /// `merge_operator` (reading a separated base from `blob_source`) or, with
+    /// none, yielded as its newest operand.
+    fn create_internal_prefix(
+        &self,
+        prefix: &[u8],
+        seqno: SeqNo,
+        ephemeral: Option<(Arc<Memtable>, SeqNo)>,
+        merge_operator: Option<Arc<dyn crate::merge_operator::MergeOperator>>,
+        blob_source: Option<crate::blob_tree::BlobSource>,
+    ) -> crate::Result<
+        impl DoubleEndedIterator<Item = crate::Result<InternalValue>> + 'static + use<>,
+    > {
         use crate::prefix::compute_prefix_hash;
         use crate::range::{IterState, TreeIter, prefix_to_range};
 
-        let prefix_bytes = prefix.as_ref();
+        let prefix_hash = compute_prefix_hash(self.config.prefix_extractor.as_ref(), prefix);
 
-        let prefix_hash = compute_prefix_hash(self.config.prefix_extractor.as_ref(), prefix_bytes);
-
-        let range = prefix_to_range(prefix_bytes);
+        let range = prefix_to_range(prefix);
 
         let super_version = self.get_version_for_snapshot(seqno)?;
 
         let iter_state = IterState {
             version: super_version,
             ephemeral,
-            merge_operator: self.config.merge_operator.clone(),
-            blob_source: self.blob_source(),
+            merge_operator,
+            blob_source,
             comparator: self.config.comparator.clone(),
             prefix_hash,
             key_hash: None,
@@ -4884,12 +4942,29 @@ impl Tree {
             metrics: Some(self.0.metrics.clone()),
         };
 
-        Ok(
-            TreeIter::create_range(iter_state, range, seqno).map(|item| match item {
-                Ok(kv) => Ok((kv.key.user_key, kv.value)),
-                Err(e) => Err(e),
-            }),
-        )
+        Ok(TreeIter::create_range(iter_state, range, seqno))
+    }
+
+    /// The keys visible at `seqno`, each as its newest version with a merge
+    /// chain left unmerged: what the key-only reads walk.
+    fn create_key_only_iter(
+        &self,
+        seqno: SeqNo,
+        ephemeral: Option<(Arc<Memtable>, SeqNo)>,
+    ) -> crate::Result<
+        impl DoubleEndedIterator<Item = crate::Result<InternalValue>> + 'static + use<>,
+    > {
+        let super_version = self.get_version_for_snapshot(seqno)?;
+        Ok(Self::create_internal_range_with_prefix_hash::<UserKey, _>(
+            super_version,
+            &..,
+            seqno,
+            ephemeral,
+            None,
+            self.config.comparator.clone(),
+            None,
+            None,
+        ))
     }
 
     /// Adds an item to the active memtable.
