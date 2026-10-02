@@ -35,6 +35,16 @@ macro_rules! iter_closed {
     };
 }
 
+/// A caller that spells the stream's type out names it by its input alone:
+/// the reader of separated bases has a default.
+#[test]
+fn mvcc_stream_is_named_by_its_input_alone() {
+    type Boxed = Box<dyn DoubleEndedIterator<Item = crate::Result<InternalValue>>>;
+    let iter: Boxed = Box::new(core::iter::empty());
+    let mut stream: MvccStream<Boxed> = MvccStream::new(iter, None);
+    assert!(stream.next().is_none());
+}
+
 /// Tests that the iterator emit the same stuff forwards and backwards, just in reverse
 macro_rules! test_reverse {
     ($v:expr) => {

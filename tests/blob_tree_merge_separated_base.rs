@@ -193,6 +193,41 @@ fn blob_tree_merges_operands_onto_its_base_in_every_layout() -> lsm_tree::Result
     Ok(())
 }
 
+/// The index of a blob tree merges onto a separated base too, through its own
+/// point reads: alone, pinned, and in batches of every size.
+#[test]
+fn blob_tree_index_merges_operands_onto_a_separated_base() -> lsm_tree::Result<()> {
+    let folder = get_tmp_folder();
+    let AnyTree::Blob(tree) = open(folder.path())? else {
+        panic!("a blob tree");
+    };
+    let any = AnyTree::Blob(tree.clone());
+    fill(&any, Layout::BaseFlushed)?;
+    let index = &tree.index;
+    let expected = merged(&[b"_A", b"_B"]);
+    let expected = Some(expected.as_slice());
+    assert_eq!(index.get("k", SeqNo::MAX)?.as_deref(), expected, "get");
+    assert_eq!(
+        index
+            .get_pinned("k", SeqNo::MAX)?
+            .as_ref()
+            .map(AsRef::as_ref),
+        expected,
+        "get_pinned"
+    );
+    assert_eq!(
+        index.multi_get(["k", "absent"], SeqNo::MAX)?[0].as_deref(),
+        expected,
+        "batch of two"
+    );
+    assert_eq!(
+        index.multi_get(["a", "k", "z"], SeqNo::MAX)?[1].as_deref(),
+        expected,
+        "batch of three"
+    );
+    Ok(())
+}
+
 /// A compaction that may not fold the operands (every version is above its
 /// watermark) leaves the key readable as before.
 #[test]
