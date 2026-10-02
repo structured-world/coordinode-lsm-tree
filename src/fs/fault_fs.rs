@@ -288,6 +288,13 @@ pub struct FaultInjector {
     /// several sections of one file can open it once and lend the handle, or
     /// open it per section; only the count tells the two apart.
     opens: core::sync::atomic::AtomicUsize,
+    /// Every handle open now, by id, with the path of the file it holds; a
+    /// rename moves the file under its open handles.
+    open_handles: spin::Mutex<Vec<(u64, PathBuf)>>,
+    next_handle: core::sync::atomic::AtomicU64,
+    /// Whether a removal of a file with an open handle fails, as on a backend
+    /// that refuses to unlink an open file.
+    refuse_open_removal: core::sync::atomic::AtomicBool,
 }
 
 impl FaultInjector {
@@ -295,6 +302,49 @@ impl FaultInjector {
     #[must_use]
     pub fn new() -> Self {
         Self::default()
+    }
+
+    /// Makes a removal of a file that has an open handle fail with
+    /// `PermissionDenied`, as on a backend that refuses to unlink an open file.
+    #[cfg(test)]
+    pub(crate) fn refuse_removing_open_files(&self) {
+        self.refuse_open_removal
+            .store(true, core::sync::atomic::Ordering::Relaxed);
+    }
+
+    /// Whether removing `path` is refused because a handle to it is open.
+    fn removal_refused(&self, path: &Path) -> bool {
+        self.refuse_open_removal
+            .load(core::sync::atomic::Ordering::Relaxed)
+            && self
+                .open_handles
+                .lock()
+                .iter()
+                .any(|(_, open)| open == path)
+    }
+
+    /// Records a handle opened on `path` and returns its id.
+    fn note_opened(&self, path: &Path) -> u64 {
+        let id = self
+            .next_handle
+            .fetch_add(1, core::sync::atomic::Ordering::Relaxed);
+        self.open_handles.lock().push((id, path.to_path_buf()));
+        id
+    }
+
+    fn note_closed(&self, handle: u64) {
+        let mut open = self.open_handles.lock();
+        if let Some(at) = open.iter().position(|(id, _)| *id == handle) {
+            open.swap_remove(at);
+        }
+    }
+
+    fn note_renamed(&self, from: &Path, to: &Path) {
+        for (_, path) in self.open_handles.lock().iter_mut() {
+            if path == from {
+                *path = to.to_path_buf();
+            }
+        }
     }
 
     /// Arms `rule`. Rules are evaluated in arm order; the first rule that
@@ -477,9 +527,11 @@ impl<F: Fs> Fs for FaultFs<F> {
             return Err(fault_error(kind, FaultOp::Open));
         }
         let inner = self.inner.open(path, opts)?;
+        let handle = self.injector.note_opened(path);
         Ok(Box::new(FaultFile {
             inner,
             path: path.to_path_buf(),
+            handle,
             injector: Arc::clone(&self.injector),
         }))
     }
@@ -505,6 +557,12 @@ impl<F: Fs> Fs for FaultFs<F> {
     fn remove_file(&self, path: &Path) -> io::Result<()> {
         if let Some(Fault::Error(kind)) = self.injector.check(FaultOp::RemoveFile, Some(path)) {
             return Err(fault_error(kind, FaultOp::RemoveFile));
+        }
+        if self.injector.removal_refused(path) {
+            return Err(io::Error::new(
+                io::ErrorKind::PermissionDenied,
+                "removal of a file with an open handle",
+            ));
         }
         self.inner.remove_file(path)
     }
@@ -536,7 +594,9 @@ impl<F: Fs> Fs for FaultFs<F> {
         if let Some(Fault::Error(kind)) = self.injector.check(FaultOp::Rename, Some(to)) {
             return Err(fault_error(kind, FaultOp::Rename));
         }
-        self.inner.rename(from, to)
+        self.inner.rename(from, to)?;
+        self.injector.note_renamed(from, to);
+        Ok(())
     }
 
     fn metadata(&self, path: &Path) -> io::Result<FsMetadata> {
@@ -663,7 +723,15 @@ impl<F: Fs> Fs for FaultFs<F> {
 struct FaultFile {
     inner: Box<dyn FsFile>,
     path: PathBuf,
+    /// This handle's id among the injector's open handles.
+    handle: u64,
     injector: Arc<FaultInjector>,
+}
+
+impl Drop for FaultFile {
+    fn drop(&mut self) {
+        self.injector.note_closed(self.handle);
+    }
 }
 
 // `crate::io::{Read, Write, Seek}` are supertrait aliases of the std traits
