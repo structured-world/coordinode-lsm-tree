@@ -100,6 +100,11 @@ pub struct Options {
     /// healing rewrite, so the bitrot stays on disk indefinitely.
     pub heal_hints: Arc<crate::heal_hints::HealHints>,
 
+    /// The tree's background file deleter, installed on every compaction
+    /// output as a flush installs it on its own.
+    #[cfg(feature = "std")]
+    pub background_deleter: Arc<crate::BackgroundDeleter>,
+
     /// Whether the tree's filters exceed their budget, which a compaction's
     /// filter plan reads and updates.
     pub filter_budget: Arc<crate::filter_budget::FilterBudget>,
@@ -123,6 +128,11 @@ pub struct Options {
     /// throttled.
     pub rate_limiter: Arc<crate::rate_limiter::RateLimiter>,
 
+    /// The files this run has created that no installed version names yet,
+    /// removed by [`do_compaction`] when the run returns. One per run: the
+    /// clones a run hands its sub-compactions share it.
+    pub(crate) outputs: super::output_ledger::OutputLedger,
+
     #[cfg(feature = "metrics")]
     pub metrics: Arc<Metrics>,
 }
@@ -144,12 +154,15 @@ impl Options {
             compaction_state: tree.compaction_state.clone(),
             deletion_pause: tree.deletion_pause.clone(),
             heal_hints: tree.heal_hints.clone(),
+            #[cfg(feature = "std")]
+            background_deleter: Arc::clone(&tree.background_deleter),
             filter_budget: tree.filter_budget.clone(),
             runtime_config: tree.runtime_config.clone(),
             encryption: tree.config.encryption.clone(),
             // The tree's one budget, not a fresh one: see
             // `TreeInner::compaction_rate_limiter`.
             rate_limiter: Arc::clone(&tree.compaction_rate_limiter),
+            outputs: super::output_ledger::OutputLedger::default(),
 
             #[cfg(feature = "metrics")]
             metrics: tree.metrics.clone(),
@@ -161,6 +174,16 @@ impl Options {
 ///
 /// This will block until the compactor is fully finished.
 pub fn do_compaction(opts: &Options) -> crate::Result<CompactionResult> {
+    let result = run_compaction(opts);
+    // Every file the run created that it did not install goes now, whichever
+    // writer made it and wherever the run stopped: the handles on them
+    // dropped as the run returned.
+    opts.outputs
+        .remove_uninstalled(opts.tree_id, opts.config.descriptor_table.as_deref());
+    result
+}
+
+fn run_compaction(opts: &Options) -> crate::Result<CompactionResult> {
     let compaction_state = opts.compaction_state.lock();
 
     let version_history_lock = opts.version_history.read();
@@ -1611,28 +1634,23 @@ fn run_tight_space_compaction(
             // checkpoint hard-link, and the heal-hint sink, so a
             // confirmed-persistent ECC correction on a read can queue this
             // SST for a healing rewrite instead of leaving the bitrot on
-            // disk. NOT the background deleter — a rolled-back slice must
-            // return its space immediately, and this loop rolls back exactly
-            // when space is scarce.
+            // disk.
             for table in &outputs {
                 table.bind_to_tree(&crate::table::TableSinks {
                     deletion_pause: &opts.deletion_pause,
                     heal_hints: &opts.heal_hints,
                     read_budget: opts.config.columnar_read_budget,
                     #[cfg(feature = "std")]
-                    background_deleter: None,
+                    background_deleter: &opts.background_deleter,
                     track_filter_probes: opts.config.filter_advisor.is_some(),
                 });
             }
             // KV-separation: blob files this slice relocated live entries into,
             // plus the GC diff of entries it dropped.
+            // The reopened stale views pushed onto it below share the path of a
+            // blob file the current version names; no writer created them, so the
+            // run never counts them among the files it may remove.
             let mut new_blobs: Vec<BlobFile> = produced.created_blob_files().to_vec();
-            // Capture the rollback set NOW, before the reopened stale views are
-            // pushed onto `new_blobs` below: `mark_as_deleted` on a reopened view
-            // unlinks its SHARED path (the still-live stale blob the current version
-            // references), so a rollback must delete only the genuinely-new blob
-            // files this slice created, never the reopened views.
-            let blobs_for_cleanup = new_blobs.clone();
             let frag = produced.blob_frag_map().clone();
             let gc_diff = if frag.is_empty() { None } else { Some(frag) };
 
@@ -1686,47 +1704,26 @@ fn run_tight_space_compaction(
             // remove (fully consumed by this slice). Re-open restricted views as
             // distinct Inners so a prior view drops and punches independently.
             //
-            // `run_subcompaction` above already finalized this slice's output SSTs
-            // and blob files, but the install below is what references them. A
-            // failure between here and the install (a sidecar write or a restricted
-            // reopen) returns before any version points at those outputs, so, like
-            // the install error path below, roll them back now instead of pinning
-            // the space until the next open's orphan sweep. Tight-space runs exactly
-            // when free space is scarce, so an ENOSPC here would otherwise both abort
-            // the reclaim and hold the bytes this slice just consumed.
-            // Pre-install rollback. The slice's finalized outputs/blobs are still
-            // unreferenced (no version points at them), so on any failure before the
-            // install commits they must be retracted or the scarce space stays pinned
-            // until the next orphan sweep. No `.restrict-bound` sidecar is touched
-            // here: the sidecar write is STRICTLY POST-COMMIT (the mark step below the
-            // install), so an aborted slice never publishes one and there is nothing
-            // to retract. That ordering is the crash-safety invariant — a sidecar on
-            // disk always denotes a committed restriction (see the mark step and
+            // `run_subcompaction` above finalized this slice's outputs, which only
+            // the install below names: a failure before it (a probe-count transfer,
+            // a restricted reopen) leaves them to the run, which removes what it
+            // never installed as it returns. No `.restrict-bound` sidecar is written
+            // before the install either: the sidecar write is STRICTLY POST-COMMIT
+            // (the mark step below the install), so an aborted slice never publishes
+            // one. That ordering is the crash-safety invariant: a sidecar on disk
+            // always denotes a committed restriction (see the mark step and
             // `docs/manifest-recovery.md`).
-            let rollback = |e: crate::Error| -> crate::Error {
-                for t in &outputs {
-                    t.mark_as_deleted();
-                }
-                for b in &blobs_for_cleanup {
-                    b.mark_as_deleted();
-                }
-                e
-            };
 
             // The slice's outputs take the share of the probe counts the prefix
             // they rewrote holds; the restricted views keep the suffix's.
-            crate::table::probe_stats::inherit_into(&outputs, &current_views).map_err(rollback)?;
+            crate::table::probe_stats::inherit_into(&outputs, &current_views)?;
 
             // Re-open each stale blob file as a distinct Inner: the re-opened view
             // replaces the original in the new version (same id), and the original
             // — held only by prior snapshots after this — punches its consumed
             // `[data_start, frontier)` prefix when it drains. Mirrors the SST
             // `reopen_restricted` swap. Files with no consumption yet are skipped
-            // (nothing to punch, original stays installed). Sits BELOW the
-            // rollback closure on purpose: this reopen hashes the stale file's
-            // live suffix, and a failure here — like the restricted SST reopen
-            // below — must retract the slice's finalized-but-unreferenced
-            // outputs, not leak them until an orphan sweep.
+            // (nothing to punch, original stays installed).
             let mut prior_to_punch: Vec<(BlobFile, u64)> = Vec::new();
             if relocating {
                 // Test-only failpoint: a restricted-blob reopen failure at this
@@ -1737,7 +1734,7 @@ fn run_tight_space_compaction(
                     .fail_tight_blob_reopen
                     .swap(false, core::sync::atomic::Ordering::SeqCst)
                 {
-                    return Err(rollback(cancelled_compaction()));
+                    return Err(cancelled_compaction());
                 }
                 for sf in &current_stale {
                     if let Some(off) = resume_offsets.get(&sf.id()).copied() {
@@ -1748,7 +1745,7 @@ fn run_tight_space_compaction(
                         // frontier — a whole-file digest would never match the
                         // punched file, and integrity checks hash from the
                         // frontier for exactly this reason.
-                        new_blobs.push(sf.reopen_restricted(off).map_err(rollback)?);
+                        new_blobs.push(sf.reopen_restricted(off)?);
                         prior_to_punch.push((sf.clone(), off));
                     }
                 }
@@ -1792,7 +1789,7 @@ fn run_tight_space_compaction(
                         }
                         _ => boundary.clone(),
                     };
-                    let restricted = view.reopen_restricted(bound).map_err(rollback)?;
+                    let restricted = view.reopen_restricted(bound)?;
                     restricted_pairs.push((view.id(), restricted.clone()));
                     next_views.push(restricted);
                 }
@@ -1810,7 +1807,7 @@ fn run_tight_space_compaction(
                     heal_hints: &opts.heal_hints,
                     read_budget: opts.config.columnar_read_budget,
                     #[cfg(feature = "std")]
-                    background_deleter: None,
+                    background_deleter: &opts.background_deleter,
                     // A blob file has no filter.
                     track_filter_probes: false,
                 });
@@ -1825,7 +1822,10 @@ fn run_tight_space_compaction(
                 sizing.release_replaced();
             }
             // Install one atomic, durable version edit for the slice.
-            let install = opts.version_history.write().upgrade_version(
+            // A failed install commits nothing, so no sidecar was written (the
+            // mark step below is strictly post-commit) and the punches never arm;
+            // the run removes the slice's outputs as it returns.
+            opts.version_history.write().upgrade_version(
                 &opts.config.path,
                 |sv| {
                     let mut copy = sv.clone();
@@ -1849,14 +1849,10 @@ fn run_tight_space_compaction(
                 // A slice is a merge with GC below the watermark, plus the
                 // punched input prefix: older snapshots lose both.
                 crate::version::RetentionEffect::GcBelow(opts.gc_watermark),
-            );
-            if let Err(e) = install {
-                // The install did not commit, so no sidecar was written (the mark
-                // step below is strictly post-commit) and the punches never arm:
-                // retract only the finalized-but-unreferenced outputs so the scarce
-                // space is freed now instead of at the next orphan sweep.
-                return Err(rollback(e));
-            }
+            )?;
+            // The version names this slice's outputs now: a later slice's failure
+            // must not remove them.
+            opts.outputs.installed();
             // The published version counts the outputs' filters now, and the
             // plan's views must not outlive the slice.
             drop(filter_sizing);
@@ -2284,6 +2280,7 @@ fn run_subcompaction(
                 opts.config.descriptor_table.clone(),
                 opts.config.fs.clone(),
             )?
+            .use_output_ledger(opts.outputs.clone())
             .use_target_size(blob_opts.file_target_size)
             .use_passthrough_compression(rc.blob_compression)
             .use_sync_mode(opts.config.sync_mode)
@@ -2363,18 +2360,7 @@ fn run_subcompaction(
         .transpose()?
         .unwrap_or_default();
 
-    // produce() consumes the (already finalized on disk) filter blob files; if
-    // it fails, mark them deleted so they are not orphaned. The parallel caller
-    // rolls back sibling outputs on error but cannot reach this range's own
-    // filter blobs, so clean them up here.
-    let rollback_extra_blob_files = extra_blob_files.clone();
-    let mut produced = compactor
-        .produce(opts, dst_lvl, blob_frag_map, extra_blob_files)
-        .inspect_err(|_| {
-            for blob_file in &rollback_extra_blob_files {
-                blob_file.mark_as_deleted();
-            }
-        })?;
+    let mut produced = compactor.produce(opts, dst_lvl, blob_frag_map, extra_blob_files)?;
     if filter_marker.load(core::sync::atomic::Ordering::Relaxed) > 0 {
         produced.mark_filter_transformed();
     }
@@ -2892,10 +2878,14 @@ fn run_merge_on_read_relocation(
         bitmap,
         opts.config.sync_mode,
     )?;
+    // Recorded once finished: the relocation unlinks its own file on a
+    // failure before that.
+    opts.outputs
+        .record_table(new_id, new_path.clone(), Arc::clone(&level_fs));
 
     let relocated = {
         let mut params = crate::table::RecoverParams::new(
-            new_path.clone(),
+            new_path,
             checksum,
             new_id,
             Arc::clone(&level_fs),
@@ -2917,28 +2907,7 @@ fn run_merge_on_read_relocation(
         {
             params.metrics = opts.metrics.clone();
         }
-        match Table::recover(params) {
-            Ok(table) => table,
-            Err(e) => {
-                // The output is finalized but no manifest names it and no
-                // handle exists to mark it deleted, so nothing else will drop
-                // it before a restart's orphan sweep. Background compaction
-                // retries the same merge, and each attempt would leave another
-                // full-sized copy on the volume this pass was meant to relieve.
-                // The relocation writer already unlinks on a pre-finalization
-                // failure; this closes the window after it.
-                if let Err(rm) = level_fs.remove_file(&new_path)
-                    && rm.kind() != crate::io::ErrorKind::NotFound
-                {
-                    log::error!(
-                        "relocation output {} could not be removed after its reopen failed \
-                         ({rm}); it stays until the next orphan sweep",
-                        new_path.display(),
-                    );
-                }
-                return Err(e);
-            }
-        }
+        Table::recover(params)?
     };
 
     compaction_state
@@ -3205,39 +3174,20 @@ fn merge_tables(
                         .collect()
                 };
 
-            // Collect outputs keeping every successful one, so a single failed
-            // range can roll back the SSTs/blob files its succeeded siblings
-            // already finalized on disk (collecting straight into Result would
-            // drop those Ok outputs and leak their files). On the first error:
-            // mark the committed outputs deleted, un-hide the inputs, propagate.
-            let mut committed = Vec::with_capacity(outputs.len());
-            let mut first_err = None;
-            for out in outputs {
-                match out {
-                    Ok(done) => committed.push(done),
-                    // Keep scanning after an error: ranges complete in any order,
-                    // so a later Ok must still be collected and rolled back (an
-                    // [Ok, Err, Ok] layout would otherwise orphan the trailing
-                    // Ok's finalized files). Keep only the first error to return.
-                    Err(e) => {
-                        first_err.get_or_insert(e);
-                    }
-                }
-            }
-            if let Some(err) = first_err {
-                log::error!("Sub-compaction failed: {err:?}");
-                for done in &committed {
-                    done.rollback_uninstalled();
-                }
-                {
-                    let mut state = opts.compaction_state.lock();
-                    state
+            // One failed range aborts the install. The files its siblings
+            // finished are not named by any version, so the run removes them
+            // with everything else it never installed.
+            let outputs = match outputs.into_iter().collect::<crate::Result<Vec<_>>>() {
+                Ok(outputs) => outputs,
+                Err(err) => {
+                    log::error!("Sub-compaction failed: {err:?}");
+                    opts.compaction_state
+                        .lock()
                         .hidden_set_mut()
                         .show(payload.table_ids.iter().copied());
+                    return Err(err);
                 }
-                return Err(err);
-            }
-            let outputs = committed;
+            };
 
             #[cfg(test)]
             opts.config.fire_before_output_install();
@@ -3249,9 +3199,8 @@ fn merge_tables(
             let tables_out =
                 super::flavour::install_merge(&mut version_history_lock, opts, payload, outputs)
                     .inspect_err(|e| {
-                        // install_merge marks its own created tables/blob files
-                        // deleted if the version edit fails, so the caller only
-                        // restores the hidden inputs here (the outputs are gone).
+                        // The run removes the outputs it failed to install; the
+                        // inputs only need to be shown again.
                         log::error!("Sub-compaction install failed: {e:?}");
                         compaction_state
                             .hidden_set_mut()
@@ -3444,6 +3393,7 @@ fn merge_tables(
                     opts.config.descriptor_table.clone(),
                     opts.config.fs.clone(),
                 )?
+                .use_output_ledger(opts.outputs.clone())
                 .use_target_size(blob_opts.file_target_size)
                 .use_passthrough_compression(rc.blob_compression)
                 .use_sync_mode(opts.config.sync_mode)
@@ -3604,11 +3554,6 @@ fn merge_tables(
         })?
         .unwrap_or_default();
 
-    // Filter-created blob files are already finalized on disk; if `produce`
-    // fails they would be orphaned (produce consumes the Vec, so keep a handle
-    // to mark them deleted on the error path).
-    let rollback_extra_blob_files = extra_blob_files.clone();
-
     // Phase split: `produce` finalizes this compaction's output files (no
     // version touch); `install_merge` commits one atomic version edit. With a
     // single output the result is identical to the old combined `finish`; the
@@ -3624,10 +3569,6 @@ fn merge_tables(
             compaction_state
                 .hidden_set_mut()
                 .show(payload.table_ids.iter().copied());
-
-            for blob_file in &rollback_extra_blob_files {
-                blob_file.mark_as_deleted();
-            }
         })?;
     if filter_marker.load(core::sync::atomic::Ordering::Relaxed) > 0 {
         produce_output.mark_filter_transformed();

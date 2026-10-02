@@ -78,6 +78,10 @@ pub struct MultiWriter {
 
     tree_id: TreeId,
     descriptor_table: Option<Arc<DescriptorTable>>,
+
+    /// Where a compaction learns of every blob file this writer creates, so
+    /// it can remove the ones it never installs. `None` outside compaction.
+    outputs: Option<crate::compaction::output_ledger::OutputLedger>,
 }
 
 impl MultiWriter {
@@ -124,7 +128,24 @@ impl MultiWriter {
             tree_id,
             descriptor_table,
             fs,
+            outputs: None,
         })
+    }
+
+    /// Records the blob file already open and every one this writer creates
+    /// after it in `outputs`.
+    #[must_use]
+    pub(crate) fn use_output_ledger(
+        mut self,
+        outputs: crate::compaction::output_ledger::OutputLedger,
+    ) -> Self {
+        outputs.record_blob_file(
+            self.active_writer.blob_file_id,
+            self.active_writer.path.clone(),
+            self.fs.clone(),
+        );
+        self.outputs = Some(outputs);
+        self
     }
 
     /// Wires the tree's `Config::sync_mode` through to every blob file this
@@ -206,7 +227,12 @@ impl MultiWriter {
     fn fresh_writer(&self, passthrough: CompressionType) -> crate::Result<Writer> {
         let id = self.id_generator.next();
         let path = self.folder.join(id.to_string());
-        let mut w = Writer::new(path, id, self.tree_id, &*self.fs)?
+        let w = Writer::new(path, id, self.tree_id, &*self.fs)?;
+        // Recorded once it exists: a failed constructor created nothing ours.
+        if let Some(outputs) = &self.outputs {
+            outputs.record_blob_file(id, w.path.clone(), self.fs.clone());
+        }
+        let mut w = w
             .use_compression(self.compression)
             .use_sync_mode(self.sync_mode)
             .use_writeback_bytes(self.writeback_bytes);

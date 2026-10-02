@@ -1244,7 +1244,7 @@ impl AbstractTree for Tree {
             heal_hints: &self.heal_hints,
             read_budget: self.config.columnar_read_budget,
             #[cfg(feature = "std")]
-            background_deleter: Some(&self.background_deleter),
+            background_deleter: &self.background_deleter,
             track_filter_probes: self.config.filter_advisor.is_some(),
         };
         for table in tables {
@@ -5373,7 +5373,7 @@ impl Tree {
             heal_hints: &heal_hints,
             read_budget: inner.config.columnar_read_budget,
             #[cfg(feature = "std")]
-            background_deleter: Some(&background_deleter),
+            background_deleter: &background_deleter,
             track_filter_probes: inner.config.filter_advisor.is_some(),
         };
         for table in &recovered_tables {
