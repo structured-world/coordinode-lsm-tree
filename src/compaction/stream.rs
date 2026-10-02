@@ -580,7 +580,12 @@ impl<'a, I: Iterator<Item = Item>, F: StreamFilter + 'a> CompactionStream<'a, I,
                     collected.push(next);
                 }
                 // A base kept in the value log is a base like an inline one,
-                // once its value is read from there.
+                // once its value is read from there. Neither reaches the
+                // compaction filter: the fold consumes the base and the
+                // versions under it, and the filter sees the head of the chain
+                // now and the folded value in the next compaction, as
+                // RocksDB's merge helper filters operands but folds onto the
+                // base (inline or blob) unfiltered.
                 ValueType::Value | ValueType::Indirection => {
                     found_boundary = true;
                     // A covered base is not a base: the tombstone hides it from
