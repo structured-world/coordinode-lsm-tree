@@ -23,7 +23,6 @@ const FD_CACHE_SHARDS: usize = 16;
 /// Caches file descriptors to tables and blob files
 pub struct DescriptorTable {
     inner: ShardedCache<CacheKey, Item, UnitWeighter, rustc_hash::FxBuildHasher>,
-    capacity: usize,
 }
 
 impl DescriptorTable {
@@ -40,21 +39,17 @@ impl DescriptorTable {
             rustc_hash::FxBuildHasher,
         );
 
-        Self { inner, capacity }
+        Self { inner }
     }
 
     pub(crate) fn len(&self) -> usize {
         self.inner.len()
     }
 
-    /// The most descriptors this table keeps open at once.
-    pub(crate) fn capacity(&self) -> usize {
-        self.capacity
-    }
-
-    /// Closes every cached descriptor.
-    pub(crate) fn clear(&self) {
-        self.inner.clear();
+    /// Closes the cached descriptors of every tree whose id is `first` or
+    /// later, tables and blob files alike.
+    pub(crate) fn remove_trees_from(&self, first: crate::tree::inner::TreeId) {
+        self.inner.remove_where(|key| key.1 >= first);
     }
 
     #[must_use]

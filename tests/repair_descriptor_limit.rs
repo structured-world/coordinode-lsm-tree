@@ -108,6 +108,55 @@ fn repair_of_more_tables_than_open_descriptors_recovers_every_table() -> lsm_tre
     Ok(())
 }
 
+/// A descriptor cache shared with an open tree is one budget: the repair of
+/// another tree on it opens its tables within that cache, not beside it, so it
+/// runs under a limit the open tree's descriptors and one cache's worth fit in.
+#[test]
+fn repair_on_a_shared_descriptor_cache_stays_within_its_budget() -> lsm_tree::Result<()> {
+    const CACHE: usize = 128;
+    const LIMIT: u64 = 200;
+    let limit = DescriptorLimit::take_turn()?;
+    let cache = std::sync::Arc::new(lsm_tree::DescriptorTable::new(CACHE));
+    let config = |dir: &std::path::Path| {
+        Config::new(
+            dir,
+            SequenceNumberCounter::default(),
+            SequenceNumberCounter::default(),
+        )
+        .use_descriptor_table(Some(std::sync::Arc::clone(&cache)))
+    };
+
+    // An open tree whose tables fill the shared cache.
+    let open_dir = tempfile::tempdir()?;
+    let open_tree = config(open_dir.path()).open()?;
+    for table in 0..(2 * CACHE as u64) {
+        open_tree.insert(format!("t{table:04}"), b"v", table);
+        open_tree.flush_active_memtable(0)?;
+    }
+    for table in 0..(2 * CACHE as u64) {
+        assert!(
+            open_tree
+                .get(format!("t{table:04}"), lsm_tree::MAX_SEQNO)?
+                .is_some()
+        );
+    }
+
+    let repair_dir = tempfile::tempdir()?;
+    let value = fill_one_table_per_key(&config(repair_dir.path()).open()?)?;
+    common::nuke_manifest(repair_dir.path())?;
+
+    limit.lower_to(LIMIT)?;
+    let report = config(repair_dir.path()).repair()?;
+    assert_eq!(report.recovered, TABLES);
+    let repaired = config(repair_dir.path()).open()?;
+    assert_eq!(
+        repaired.get(b"k00007", lsm_tree::MAX_SEQNO)?.as_deref(),
+        Some(value.as_slice()),
+    );
+    drop(open_tree);
+    Ok(())
+}
+
 /// The replacements a salvaging repair builds are held until it publishes,
 /// like the tables it recovers whole, so they too go through its descriptor
 /// cache: a tree with more damaged tables than the process may open is
