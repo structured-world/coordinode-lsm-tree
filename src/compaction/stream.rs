@@ -845,6 +845,17 @@ impl<'a, I: Iterator<Item = Item>, F: StreamFilter + 'a> CompactionStream<'a, I,
                 ValueType::MergeOperand,
             ));
         }
+        // A result an applicable tombstone deletes is dropped by the caller:
+        // written to the value log first, it would leave a blob no table
+        // references, so it stays inline.
+        if self.covered_and_deletable(user_key.as_ref(), head_seqno) {
+            return Ok(InternalValue::from_components(
+                user_key,
+                merged,
+                head_seqno,
+                ValueType::Value,
+            ));
+        }
         // The value goes where a put of it would go: a value of the tree's
         // separation size into the value log, not inline in the index.
         let mut result = InternalValue::from_components(
@@ -976,7 +987,13 @@ impl<'a, I: Iterator<Item = Item>, F: StreamFilter + 'a> CompactionStream<'a, I,
                 .map_or_else(|| self.inner.next(), |e| Some(Ok(e)));
             let mut head = fail_iter!(next?);
 
-            if !head.is_tombstone() {
+            // An entry an applicable tombstone deletes is dropped below
+            // whatever the filter says, and no snapshot can read it; asking
+            // the filter would only let a rewrite land in the value log as a
+            // blob no table references.
+            if !head.is_tombstone()
+                && !self.covered_and_deletable(head.key.user_key.as_ref(), head.key.seqno)
+            {
                 match fail_iter!(self.filter.filter_item(&head)) {
                     StreamFilterVerdict::Keep => { /* Do nothing */ }
                     StreamFilterVerdict::Replace((new_type, new_value)) => {

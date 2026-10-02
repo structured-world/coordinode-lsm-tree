@@ -308,6 +308,119 @@ fn blob_tree_compaction_separates_a_folded_value_of_separation_size() -> lsm_tre
     Ok(())
 }
 
+/// A fold a deleting compaction drops (a newer range tombstone covers it)
+/// writes nothing to the value log: the operator here makes a value of
+/// separation size even from nothing, and the dropped result must not leave a
+/// blob file no table references.
+#[test]
+fn blob_tree_compaction_writes_no_blob_for_a_fold_a_tombstone_deletes() -> lsm_tree::Result<()> {
+    /// Concatenates, and stands in a value of separation size for nothing.
+    struct FillMerge;
+    impl MergeOperator for FillMerge {
+        fn merge(
+            &self,
+            _key: &[u8],
+            base: Option<&[u8]>,
+            operands: &[&[u8]],
+        ) -> lsm_tree::Result<UserValue> {
+            let mut result = base.unwrap_or_default().to_vec();
+            for op in operands {
+                result.extend_from_slice(op);
+            }
+            if result.is_empty() {
+                result = vec![b'f'; BASE_LEN];
+            }
+            Ok(result.into())
+        }
+    }
+
+    let folder = get_tmp_folder();
+    let tree = Config::new(
+        folder.path(),
+        SequenceNumberCounter::default(),
+        SequenceNumberCounter::default(),
+    )
+    .with_kv_separation(Some(KvSeparationOptions {
+        separation_threshold: 100,
+        ..Default::default()
+    }))
+    .with_merge_operator(Some(Arc::new(FillMerge)))
+    .open()?;
+    tree.insert("k", "BASE", 0);
+    tree.flush_active_memtable(0)?;
+    tree.merge("k", "_A", 1);
+    tree.flush_active_memtable(0)?;
+    tree.remove_range("j", "l", 2);
+    tree.flush_active_memtable(0)?;
+    tree.major_compact(64_000_000, 10)?;
+
+    assert_eq!(
+        tree.get("k", SeqNo::MAX)?,
+        None,
+        "the range tombstone deletes k"
+    );
+    assert_eq!(
+        tree.blob_file_count(),
+        0,
+        "the dropped fold left a blob file behind"
+    );
+    Ok(())
+}
+
+/// A filter rewrite of an entry a deleting compaction then drops (a newer
+/// range tombstone covers it) writes nothing to the value log either.
+#[test]
+fn blob_tree_compaction_writes_no_blob_for_a_filter_rewrite_a_tombstone_deletes()
+-> lsm_tree::Result<()> {
+    use lsm_tree::compaction::filter::{CompactionFilter, Context, Factory, ItemAccessor, Verdict};
+
+    struct Grow;
+    impl CompactionFilter for Grow {
+        fn filter_item(&mut self, _: ItemAccessor<'_>, _: &Context) -> lsm_tree::Result<Verdict> {
+            Ok(Verdict::ReplaceValue(vec![b'r'; BASE_LEN].into()))
+        }
+    }
+    struct GrowFactory;
+    impl Factory for GrowFactory {
+        fn name(&self) -> &str {
+            "grow"
+        }
+        fn make_filter(&self, _: &Context) -> Box<dyn CompactionFilter> {
+            Box::new(Grow)
+        }
+    }
+
+    let folder = get_tmp_folder();
+    let tree = Config::new(
+        folder.path(),
+        SequenceNumberCounter::default(),
+        SequenceNumberCounter::default(),
+    )
+    .with_kv_separation(Some(KvSeparationOptions {
+        separation_threshold: 100,
+        ..Default::default()
+    }))
+    .with_compaction_filter_factory(Some(Arc::new(GrowFactory)))
+    .open()?;
+    tree.insert("k", "small", 0);
+    tree.flush_active_memtable(0)?;
+    tree.remove_range("j", "l", 1);
+    tree.flush_active_memtable(0)?;
+    tree.major_compact(64_000_000, 10)?;
+
+    assert_eq!(
+        tree.get("k", SeqNo::MAX)?,
+        None,
+        "the range tombstone deletes k"
+    );
+    assert_eq!(
+        tree.blob_file_count(),
+        0,
+        "the dropped rewrite left a blob file behind"
+    );
+    Ok(())
+}
+
 /// An operand of separation size stays an operand through a flush: it is
 /// kept inline, and the key still reads as the operand merged onto its base.
 #[test]
