@@ -15358,6 +15358,66 @@ fn repair_propagates_an_exhausted_descriptor_table() -> crate::Result<()> {
     Ok(())
 }
 
+/// A repair that aborts leaves none of the descriptors it cached behind: the
+/// tables it held before the abort keep their files in the shared cache, and
+/// left there, an abandoned temp could not be removed by the retry on a
+/// backend that refuses to unlink an open file.
+#[test]
+fn an_aborted_repair_closes_the_descriptors_it_cached() -> crate::Result<()> {
+    use crate::fs::{Fault, FaultFs, FaultOp, FaultRule, MemFs};
+    use crate::io::ErrorKind;
+    use crate::{AbstractTree, Config, DescriptorTable, SequenceNumberCounter};
+    use std::sync::Arc;
+
+    let memfs = Arc::new(MemFs::new());
+    let root = std::path::absolute("/db")?;
+    let config = || {
+        Config::new(
+            &root,
+            SequenceNumberCounter::default(),
+            SequenceNumberCounter::default(),
+        )
+    };
+    {
+        let tree = config().with_shared_fs(memfs.clone()).open()?;
+        for table in 0..3u64 {
+            tree.insert(format!("k{table}"), b"v", table);
+            tree.flush_active_memtable(0)?;
+        }
+    }
+    {
+        use crate::fs::Fs;
+        for e in memfs.read_dir(&root)? {
+            if e.file_name == "current" || e.file_name.starts_with('v') {
+                memfs.remove_file(&e.path)?;
+            }
+        }
+    }
+
+    // The last table scanned cannot be opened, after the others were.
+    let cache = Arc::new(DescriptorTable::new(16));
+    let fault = FaultFs::new((*memfs).clone());
+    fault.injector().arm(
+        FaultRule::new(FaultOp::Open, Fault::Error(ErrorKind::TooManyOpenFiles))
+            .on_path(root.join("tables").join("2").to_string_lossy()),
+    );
+    let result = config()
+        .with_fs(fault)
+        .use_descriptor_table(Some(Arc::clone(&cache)))
+        .repair();
+    assert!(
+        matches!(result, Err(crate::Error::Io(ref e)) if e.kind() == ErrorKind::TooManyOpenFiles),
+        "the repair aborts: {:?}",
+        result.map(|r| r.recovered),
+    );
+    assert_eq!(
+        cache.len(),
+        0,
+        "every descriptor the repair cached is closed"
+    );
+    Ok(())
+}
+
 /// A salvage replacement write failing with ENOSPC must abort the repair:
 /// the healthy SOURCE is not implicated by a full destination, and grading
 /// it unsalvageable would commit a manifest without it and then remove it —
