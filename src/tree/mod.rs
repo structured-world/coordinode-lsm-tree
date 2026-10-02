@@ -6,6 +6,7 @@
 pub mod columnar_scan;
 pub mod ingest;
 pub mod inner;
+mod level_stages;
 pub mod sealed;
 
 use crate::path::Path;
@@ -3965,18 +3966,14 @@ impl Tree {
     ///
     /// A table's read begins, at the snapshot `seqno`, over its span of
     /// `batch` once it has a place to read in.
-    #[expect(
-        clippy::indexing_slicing,
-        reason = "a tag indexes `asked`, and `asked` entries index `tables` and `waiting`, all by construction; a table's span lies in `batch`"
-    )]
+    #[expect(clippy::indexing_slicing, reason = "a slot is a position in `queues`")]
     fn read_level_stages<'a>(
         tables: &mut [LevelTable<'a>],
         batch: &[(&[u8], u64)],
         seqno: SeqNo,
         metadata_budget: u64,
     ) {
-        use crate::table::staged::{StagedRead, StagedStart};
-
+        let mut stages = level_stages::LevelStages::new(tables, batch, seqno, metadata_budget);
         // One queue per backend, opened when a table first asks it for a
         // block, so a level answered from the cache opens none.
         let mut queues: Vec<LevelQueue<'a>> = Vec::new();
@@ -3985,183 +3982,49 @@ impl Tree {
             generation: core::sync::atomic::AtomicU64::new(0),
             thread: std::thread::current(),
         });
-        // What each submitted read is for: its tag is its position here.
-        let mut asked: Vec<(usize, crate::table::BlockHandle)> = Vec::new();
-        // Each table's reads still in flight.
-        let mut waiting: Vec<usize> = vec![0; tables.len()];
-        // At most as many tables hold a file open for their stages as the
-        // descriptor cache keeps open: a level wider than that, read stage by
-        // stage all at once, would otherwise open a file per table and run
-        // the process out of descriptors. A table whose stages are over lets
-        // its file go and its place with it, so the tables waiting for a place
-        // always get one.
-        let open_cap = Self::open_cap(tables.iter().map(|entry| entry.table));
-        let mut staged: Vec<bool> = vec![false; tables.len()];
-        let mut in_stage = 0usize;
-        let mut meta = MetaHeld::new(tables.len());
+        let mut reads: Vec<level_stages::StageRead<'a>> = Vec::new();
 
         loop {
-            // Whether a table waits for a place under the cap, or for room
-            // under the budget, this pass.
-            let mut deferred = false;
-            // Whether a table before the one at hand holds metadata blocks:
-            // the first that does is never held back, so the level advances.
-            let mut held_before = false;
-            // A table with none of its blocks in flight moves on, and asks for
-            // the next stage's blocks once its read lacks some.
-            for (at, entry) in tables.iter_mut().enumerate() {
-                let first_holder = !held_before;
-                if waiting[at] > 0 {
-                    held_before = true;
-                    continue;
-                }
-                let keys = &batch[entry.keys.clone()];
-                if matches!(entry.read, LevelRead::Pending) {
-                    if in_stage >= open_cap {
-                        deferred = true;
-                        continue;
-                    }
-                    entry.read = match StagedRead::start(entry.table, keys, seqno) {
-                        StagedStart::Nothing => LevelRead::Nothing,
-                        StagedStart::Serial => LevelRead::Serial,
-                        StagedStart::Staged(read) => LevelRead::Staged(read),
-                    };
-                }
-                while let LevelRead::Staged(read) = &mut entry.read
-                    && !read.is_done()
+            // Every table moves on as far as it can, and its next stage's
+            // reads go to the queue of the backend it was opened through.
+            stages.pump(&mut reads);
+            #[expect(
+                clippy::iter_with_drain,
+                reason = "the buffer is reused by every pass; into_iter would consume it"
+            )]
+            for read in reads.drain(..) {
+                let slot = if let Some(slot) = queues
+                    .iter()
+                    .position(|q| Arc::ptr_eq(q.fs, &read.table.fs))
                 {
-                    let (block_type, need) = read.need();
-                    if need.is_empty() {
-                        // A stage passed lets go of the blocks it alone read.
-                        if read.advance(keys).is_ok() {
-                            meta.settle(at, read.held_bytes());
-                        } else {
-                            entry.read = LevelRead::Serial;
-                            meta.settle(at, 0);
-                        }
-                        continue;
-                    }
-                    let table: &'a Table = entry.table;
-                    // A table with no place under the cap waits before any of
-                    // its stage's buffers is allocated: it is passed over
-                    // again on every pass until a place frees.
-                    if entry.file.is_none() && in_stage >= open_cap {
-                        deferred = true;
-                        break;
-                    }
-                    // Nor is any allocated for a stage past the budget, unless
-                    // no table before this one holds blocks: then it goes on
-                    // even alone above the budget, or the level would stop.
-                    let asked_bytes: u64 = need.iter().map(|handle| u64::from(handle.size())).sum();
-                    if !first_holder && meta.total + asked_bytes > metadata_budget {
-                        deferred = true;
-                        break;
-                    }
-                    // A size no block can have is refused before any buffer
-                    // is allocated for it; the serial planner then reports
-                    // the corruption as the load path does.
-                    let Ok(buffers) = need
-                        .iter()
-                        .map(|handle| table.block_buffer(handle))
-                        .collect::<crate::Result<Vec<_>>>()
-                    else {
-                        entry.read = LevelRead::Serial;
-                        meta.settle(at, 0);
-                        break;
-                    };
-                    let file = if let Some(file) = &entry.file {
-                        Arc::clone(file)
-                    } else {
-                        let Ok(file) = table.open_file() else {
-                            entry.read = LevelRead::Serial;
-                            meta.settle(at, 0);
-                            break;
-                        };
-                        entry.file = Some(Arc::clone(&file));
-                        staged[at] = true;
-                        in_stage += 1;
-                        file
-                    };
-                    table.record_batched_read(block_type, need);
-                    meta.in_flight[at] += asked_bytes;
-                    meta.settle(at, read.held_bytes());
-                    let slot = if let Some(slot) =
-                        queues.iter().position(|q| Arc::ptr_eq(q.fs, &table.fs))
-                    {
-                        slot
-                    } else {
-                        #[cfg_attr(not(feature = "std"), expect(unused_mut))]
-                        let mut queue = table.fs.read_queue();
-                        #[cfg(feature = "std")]
-                        let wakes =
-                            queue.set_wake(Arc::clone(&wake) as Arc<dyn crate::fs::ReadWake>);
-                        #[cfg(not(feature = "std"))]
-                        let wakes = false;
-                        queues.push(LevelQueue {
-                            fs: &table.fs,
-                            queue,
-                            wakes,
-                        });
-                        queues.len() - 1
-                    };
-                    let queue = &mut queues[slot].queue;
-                    for (handle, buf) in need.iter().zip(buffers) {
-                        queue.submit(crate::fs::QueuedRead {
-                            tag: asked.len(),
-                            file: Arc::clone(&file),
-                            offset: *handle.offset(),
-                            buf,
-                        });
-                        asked.push((at, *handle));
-                        waiting[at] += 1;
-                    }
-                    break;
-                }
-                // A table whose stages are over, or that is left to the serial
-                // planner, needs its file no more: its data blocks are read
-                // through the file their chunk opens, and holding it would
-                // keep a descriptor per table of the level open until the
-                // whole level is read.
-                if waiting[at] == 0 && entry.read.is_over() {
-                    entry.file = None;
-                    if staged[at] {
-                        staged[at] = false;
-                        in_stage -= 1;
-                    }
-                    // Planned, or left to the serial planner: the blocks its
-                    // stages held are its read's no more.
-                    meta.settle(at, 0);
-                }
-                held_before |= meta.held[at] > 0;
+                    slot
+                } else {
+                    #[cfg_attr(not(feature = "std"), expect(unused_mut))]
+                    let mut queue = read.table.fs.read_queue();
+                    #[cfg(feature = "std")]
+                    let wakes = queue.set_wake(Arc::clone(&wake) as Arc<dyn crate::fs::ReadWake>);
+                    #[cfg(not(feature = "std"))]
+                    let wakes = false;
+                    queues.push(LevelQueue {
+                        fs: &read.table.fs,
+                        queue,
+                        wakes,
+                    });
+                    queues.len() - 1
+                };
+                queues[slot].queue.submit(crate::fs::QueuedRead {
+                    tag: read.tag,
+                    file: read.file,
+                    offset: read.offset,
+                    buf: read.buf,
+                });
             }
 
-            // A block is handed to its read the moment it is back; a read
-            // that loses one is dropped, and its table planned serially.
-            let mut on_done = |done: crate::fs::ReadDone| {
-                let (at, handle) = asked[done.tag];
-                waiting[at] -= 1;
-                // Back from flight: held from here on decoded, if at all.
-                meta.in_flight[at] -= u64::from(handle.size());
-                let LevelRead::Staged(read) = &mut tables[at].read else {
-                    meta.settle(at, 0);
-                    return;
-                };
-                let supplied = match done.result {
-                    Ok(()) => read.supply(handle, &done.buf).is_ok(),
-                    Err(error) => {
-                        log::debug!(
-                            "a staged level read lost a block, its table is planned serially: {error}"
-                        );
-                        false
-                    }
-                };
-                if supplied {
-                    meta.settle(at, read.held_bytes());
-                } else {
-                    tables[at].read = LevelRead::Serial;
-                    meta.settle(at, 0);
-                }
-            };
+            // Whether this pass left a table waiting for a place or for room.
+            let deferred = stages.deferred();
+            // A block is handed to its read the moment it is back.
+            let mut on_done =
+                |done: crate::fs::ReadDone| stages.complete(done.tag, done.result, &done.buf);
             // What has finished on any backend, without waiting. The wake's
             // generation is taken first, so a read back after this look is
             // seen by the sleep below.
