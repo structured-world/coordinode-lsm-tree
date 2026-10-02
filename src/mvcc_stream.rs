@@ -402,6 +402,13 @@ impl<I: DoubleEndedIterator<Item = crate::Result<InternalValue>>, L: SeparatedBa
     type Item = crate::Result<InternalValue>;
 
     fn next(&mut self) -> Option<Self::Item> {
+        // The front's own failed key first: only once it is behind can the
+        // next key be checked against the back's.
+        if self.skip_front.is_some()
+            && let Some(e) = self.resume_skip_front()
+        {
+            return Some(Err(e));
+        }
         // The back failed on a key: what reaches the front of it is what the
         // failure left, never the key's value, so it is skipped before it is
         // resolved (resolving could only fail again).
@@ -486,14 +493,8 @@ impl<I: DoubleEndedIterator<Item = crate::Result<InternalValue>>, L: SeparatedBa
 impl<I: DoubleEndedIterator<Item = crate::Result<InternalValue>>, L: SeparatedBase>
     MvccStream<I, L>
 {
-    // One forward item, before the check against a key the back failed on.
+    // One forward item, once `next` has dealt with both ends' failed keys.
     fn step_front(&mut self) -> Option<crate::Result<InternalValue>> {
-        if self.skip_front.is_some()
-            && let Some(e) = self.resume_skip_front()
-        {
-            return Some(Err(e));
-        }
-
         let head = fail_iter!(self.inner.next()?);
 
         if head.key.value_type.is_merge_operand() {
@@ -518,8 +519,13 @@ impl<I: DoubleEndedIterator<Item = crate::Result<InternalValue>>, L: SeparatedBa
     DoubleEndedIterator for MvccStream<I, L>
 {
     fn next_back(&mut self) -> Option<Self::Item> {
-        // The mirror of `next`: a key the front failed on is skipped here
-        // before it is resolved.
+        // The mirror of `next`: the back's own failed key first, then a key
+        // the front failed on is skipped here before it is resolved.
+        if self.skip_back.is_some()
+            && let Some(e) = self.resume_skip_back()
+        {
+            return Some(Err(e));
+        }
         if let Some(failed) = self.skip_front.take() {
             match self.skip_key_at_back(&failed) {
                 Skipped::Done => {}
@@ -537,7 +543,7 @@ impl<I: DoubleEndedIterator<Item = crate::Result<InternalValue>>, L: SeparatedBa
 impl<I: DoubleEndedIterator<Item = crate::Result<InternalValue>>, L: SeparatedBase>
     MvccStream<I, L>
 {
-    // One backward item, before the check against a key the front failed on.
+    // One backward item, once `next_back` has dealt with both ends' failed keys.
     fn step_back(&mut self) -> Option<crate::Result<InternalValue>> {
         // When a merge operator is configured we must buffer ALL entries
         // for a key (not just MergeOperands) because we only learn that
@@ -549,12 +555,6 @@ impl<I: DoubleEndedIterator<Item = crate::Result<InternalValue>>, L: SeparatedBa
         // incorrect — reverse iteration visits the oldest (base) entry first,
         // so deferring allocation until a MergeOperand is found would lose
         // the base Value needed by the merge function.
-        if self.skip_back.is_some()
-            && let Some(e) = self.resume_skip_back()
-        {
-            return Some(Err(e));
-        }
-
         let has_merge_op = self.merge_operator.is_some();
         self.key_entries_buf.clear();
 
