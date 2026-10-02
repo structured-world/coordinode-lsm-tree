@@ -1,61 +1,44 @@
 // SPDX-License-Identifier: Apache-2.0
 // Copyright (c) 2026-present, Dmitry Prudnikov
 
-use crate::fs::{BlockRead, Fs, FsDirEntry, FsFile, FsMetadata, FsOpenOptions, StdFs};
-use crate::io;
-use crate::path::Path;
-use crate::{AbstractTree, Config, SeqNo, SequenceNumberCounter, Tree, value::InternalValue};
-use alloc::sync::Arc;
+use super::data_stage::ChunkRead;
+use super::level_resolve::{JobDone, LevelJob};
+use super::{BlockTask, TaskBlock};
+use crate::{AbstractTree, Config, SeqNo, SequenceNumberCounter, value::InternalValue};
 
-/// A backend that hands each batch's reads over last to first, as a ring may
-/// when the later reads of a batch complete first.
-struct ReverseCompletionFs;
-
-impl Fs for ReverseCompletionFs {
-    fn read_blocks_batched_each(
-        &self,
-        reqs: &mut [BlockRead<'_>],
-        on_read: &mut dyn FnMut(usize, &BlockRead<'_>),
-    ) -> io::Result<()> {
-        self.read_blocks_batched(reqs)?;
-        for (index, req) in reqs.iter().enumerate().rev() {
-            on_read(index, req);
+/// The data block tasks of every table of `level` that holds `key`, in level
+/// order, each reading `key` as key index 0.
+pub(super) fn tasks_for<'a>(
+    level: &'a crate::version::Level,
+    key: &[u8],
+) -> crate::Result<Vec<BlockTask<'a>>> {
+    let batch = [(key, crate::hash::hash64(key))];
+    let mut tasks = Vec::new();
+    for run in level.iter() {
+        for table in run.iter() {
+            let mut tally = crate::table::probe_stats::PlanCounts::default();
+            let Some((_, table_seqno, _, blocks)) =
+                table.plan_block_tasks(&batch, SeqNo::MAX, &mut tally)?
+            else {
+                continue;
+            };
+            for (handle, positions) in blocks {
+                tasks.push(BlockTask {
+                    table,
+                    handle,
+                    table_seqno,
+                    special: table.is_chunk_special(),
+                    keys: positions.iter().map(|_| 0).collect(),
+                });
+            }
         }
-        Ok(())
     }
-
-    fn open(&self, path: &Path, opts: &FsOpenOptions) -> io::Result<Box<dyn FsFile>> {
-        StdFs.open(path, opts)
-    }
-    fn create_dir_all(&self, path: &Path) -> io::Result<()> {
-        StdFs.create_dir_all(path)
-    }
-    fn read_dir(&self, path: &Path) -> io::Result<Vec<FsDirEntry>> {
-        StdFs.read_dir(path)
-    }
-    fn remove_file(&self, path: &Path) -> io::Result<()> {
-        StdFs.remove_file(path)
-    }
-    fn remove_dir_all(&self, path: &Path) -> io::Result<()> {
-        StdFs.remove_dir_all(path)
-    }
-    fn rename(&self, from: &Path, to: &Path) -> io::Result<()> {
-        StdFs.rename(from, to)
-    }
-    fn metadata(&self, path: &Path) -> io::Result<FsMetadata> {
-        StdFs.metadata(path)
-    }
-    fn sync_directory(&self, path: &Path) -> io::Result<()> {
-        StdFs.sync_directory(path)
-    }
-    fn exists(&self, path: &Path) -> io::Result<bool> {
-        StdFs.exists(path)
-    }
+    Ok(tasks)
 }
 
 /// Two level-0 tables holding one key at one seqno: the chunked resolve keeps
-/// the value a single-key read returns, whatever order the backend hands the
-/// two blocks over in. At an equal seqno the task earlier in the plan wins, as
+/// the value a single-key read returns, whatever order its driver hands the
+/// two blocks back in. At an equal seqno the task earlier in the plan wins, as
 /// it does when the blocks are decoded in plan order.
 #[test]
 fn a_chunked_resolve_breaks_an_equal_seqno_tie_by_plan_order() -> crate::Result<()> {
@@ -65,7 +48,6 @@ fn a_chunked_resolve_breaks_an_equal_seqno_tie_by_plan_order() -> crate::Result<
         SequenceNumberCounter::default(),
         SequenceNumberCounter::default(),
     )
-    .with_shared_fs(Arc::new(ReverseCompletionFs))
     .open()?;
     let crate::AnyTree::Standard(tree) = &any else {
         panic!("a standard tree");
@@ -81,30 +63,34 @@ fn a_chunked_resolve_breaks_an_equal_seqno_tie_by_plan_order() -> crate::Result<
     };
     assert_eq!(level.len(), 2, "one run per flush");
     let keys = ["key"];
-    let remaining = [(0, crate::hash::hash64(b"key"))];
-    let comparator = crate::comparator::default_comparator();
-    let (tasks, _) = Tree::plan_level_block_tasks(
-        level,
-        &remaining,
-        &keys,
-        SeqNo::MAX,
-        comparator.as_ref(),
-        crate::config::DEFAULT_MULTI_GET_METADATA_BUDGET,
-    )?;
+    let tasks = tasks_for(level, b"key")?;
     assert_eq!(tasks.len(), 2, "one block per table");
 
+    // Both blocks read, so the driver decides the order they are back in.
+    let uncached = [TaskBlock::Read, TaskBlock::Read];
+    let (mut chunk, jobs) = ChunkRead::start(&tasks, &uncached, &keys, &mut None)?;
+    for job in jobs {
+        let LevelJob::Open { .. } = &job else {
+            panic!("a row table's block needs only its file");
+        };
+        let JobDone::Opened { tag, file } = job.run() else {
+            panic!("an open job opens a file");
+        };
+        chunk.opened(tag, file?);
+    }
+    let mut reads = chunk.take_reads(&tasks, &mut None)?;
+    // Handed back last to first, as a ring may when the later reads of a
+    // batch complete first.
+    reads.reverse();
+    let mut keep_room = 0;
+    for mut read in reads {
+        let filled = read.file.read_at(&mut read.buf, read.offset)?;
+        assert_eq!(filled, read.buf.len(), "the whole block is read");
+        chunk.read(&tasks, read.tag, &read.buf, &mut keep_room);
+    }
     let mut results: Vec<Option<InternalValue>> = alloc::vec![None];
-    // Both blocks read, so the backend decides the order they are back in.
-    let uncached = alloc::vec![super::TaskBlock::Read, super::TaskBlock::Read];
-    Tree::resolve_block_task_chunk(
-        &tasks,
-        &uncached,
-        &mut 0,
-        &keys,
-        &mut results,
-        None,
-        &mut None,
-    )?;
+    chunk.finish(&tasks, &mut results, None)?;
+
     let Some(single) = tree.get("key", SeqNo::MAX)? else {
         panic!("the key was written");
     };

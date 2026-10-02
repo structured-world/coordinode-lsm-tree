@@ -7,6 +7,7 @@
 //! and never submits, reads or waits itself. Whoever drives it carries the
 //! reads out and hands each result back.
 
+use super::level_resolve::{BlockRequest, LevelJob, LevelWork};
 use super::{BlockTask, LevelRead, LevelTable, LevelTasks, MetaHeld, Tree};
 use crate::table::probe_stats::PlanCounts;
 use crate::table::staged::{StagedRead, StagedStart};
@@ -15,45 +16,12 @@ use alloc::sync::Arc;
 use alloc::vec::Vec;
 use core::ops::Range;
 
-/// One block read a level asks for: `buf` is to be filled from `file` at
-/// `offset`, and handed back with `tag` through [`LevelStages::complete`].
-pub(super) struct StageRead<'a> {
-    pub(super) tag: usize,
-    pub(super) table: &'a Table,
-    pub(super) file: Arc<dyn crate::fs::FsFile>,
-    pub(super) offset: u64,
-    pub(super) buf: Vec<u8>,
-}
-
-/// The file of a table a level asks to have opened before it reads from it;
-/// handed back through [`LevelStages::opened`].
-pub(super) struct StageOpen<'a> {
-    pub(super) at: usize,
-    pub(super) table: &'a Table,
-}
-
-/// A table left to the serial planner, which its driver plans over its span
-/// of the batch through [`Table::plan_block_tasks`] and hands back through
-/// [`LevelStages::planned`].
+/// A table left to the serial planner, which is planned over its span of the
+/// batch and handed back through [`LevelStages::planned`].
 pub(super) struct StagePlan<'a> {
     pub(super) at: usize,
     pub(super) table: &'a Table,
     pub(super) keys: Range<usize>,
-}
-
-/// What a pass over the level asks its driver to carry out.
-pub(super) struct StageWork<'a> {
-    pub(super) reads: Vec<StageRead<'a>>,
-    pub(super) opens: Vec<StageOpen<'a>>,
-}
-
-impl StageWork<'_> {
-    pub(super) const fn new() -> Self {
-        Self {
-            reads: Vec::new(),
-            opens: Vec::new(),
-        }
-    }
 }
 
 /// The staged read of a level's `tables` for their spans of `batch`.
@@ -153,9 +121,14 @@ impl<'a, 'k> LevelStages<'a, 'k> {
         }
     }
 
-    /// The batch the level is read for, which each table's span indexes.
-    pub(super) fn batch(&self) -> &[(&'k [u8], u64)] {
-        &self.batch
+    /// The keys of the level's batch in `span`.
+    pub(super) fn span(&self, span: Range<usize>) -> &[(&'k [u8], u64)] {
+        self.batch.get(span).unwrap_or_default()
+    }
+
+    /// Whether none of the level's tables waits on a read or an open.
+    pub(super) fn idle(&self) -> bool {
+        self.waiting.iter().all(|&waiting| waiting == 0)
     }
 
     /// Whether the last pass left a table waiting: one that will move once a
@@ -173,7 +146,7 @@ impl<'a, 'k> LevelStages<'a, 'k> {
         clippy::indexing_slicing,
         reason = "`at` indexes the level's tables, which every per-table vector is sized to; a table's span lies in `batch`"
     )]
-    pub(super) fn pump(&mut self, out: &mut StageWork<'a>) {
+    pub(super) fn pump(&mut self, out: &mut LevelWork<'a, '_>) {
         self.deferred = false;
         // Whether a table before the one at hand holds metadata blocks: the
         // first that does is never held back, so the level advances.
@@ -243,7 +216,7 @@ impl<'a, 'k> LevelStages<'a, 'k> {
                 // flight while it is opened, so the tables after it see the
                 // level as they would with its reads out.
                 let Some(file) = &entry.file else {
-                    out.opens.push(StageOpen { at, table });
+                    out.jobs.push(LevelJob::Open { tag: at, table });
                     self.staged[at] = true;
                     self.in_stage += 1;
                     self.opening[at] = asked_bytes;
@@ -261,7 +234,7 @@ impl<'a, 'k> LevelStages<'a, 'k> {
                 self.meta.in_flight[at] += asked_bytes;
                 self.meta.settle(at, read.held_bytes());
                 for (handle, buf) in need.iter().zip(buffers) {
-                    out.reads.push(StageRead {
+                    out.reads.push(BlockRequest {
                         tag: self.asked.len(),
                         table,
                         file: Arc::clone(&file),
@@ -297,7 +270,7 @@ impl<'a, 'k> LevelStages<'a, 'k> {
     /// is planned serially.
     #[expect(
         clippy::indexing_slicing,
-        reason = "`at` came from a `StageOpen` of this level, which indexes its tables"
+        reason = "`at` tagged an open job of this level, which indexes its tables"
     )]
     pub(super) fn opened(&mut self, at: usize, file: crate::Result<Arc<dyn crate::fs::FsFile>>) {
         self.waiting[at] -= 1;
