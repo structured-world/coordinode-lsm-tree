@@ -10,13 +10,25 @@ use alloc::sync::Arc;
 #[cfg(not(feature = "std"))]
 use alloc::vec::Vec;
 
+/// The value log a merge reads a base from when the base is an indirection:
+/// a blob tree's blob source over the version being read.
+#[derive(Clone, Copy)]
+pub(crate) struct ValueLog<'v> {
+    pub(crate) source: &'v crate::blob_tree::BlobSource,
+    pub(crate) version: &'v crate::version::Version,
+}
+
 /// Consumes a stream of KVs and emits a new stream according to MVCC and tombstone rules
 ///
 /// This iterator is used for read operations.
-pub struct MvccStream<I: DoubleEndedIterator<Item = crate::Result<InternalValue>>> {
+pub struct MvccStream<'v, I: DoubleEndedIterator<Item = crate::Result<InternalValue>>> {
     inner: DoubleEndedPeekable<crate::Result<InternalValue>, I>,
     merge_operator: Option<Arc<dyn MergeOperator>>,
     comparator: SharedComparator,
+
+    /// Reads a base the stream finds kept in the value log. Only a blob
+    /// tree's stream meets such a base, and only a blob tree sets this.
+    value_log: Option<ValueLog<'v>>,
 
     /// Range tombstones with per-source visibility cutoffs. When set, merge
     /// resolution skips entries suppressed by an RT (treats them as a
@@ -28,7 +40,7 @@ pub struct MvccStream<I: DoubleEndedIterator<Item = crate::Result<InternalValue>
     key_entries_buf: Vec<InternalValue>,
 }
 
-impl<I: DoubleEndedIterator<Item = crate::Result<InternalValue>>> MvccStream<I> {
+impl<'v, I: DoubleEndedIterator<Item = crate::Result<InternalValue>>> MvccStream<'v, I> {
     /// Initializes a new multi-version-aware iterator.
     #[must_use]
     pub fn new(iter: I, merge_operator: Option<Arc<dyn MergeOperator>>) -> Self {
@@ -50,9 +62,30 @@ impl<I: DoubleEndedIterator<Item = crate::Result<InternalValue>>> MvccStream<I> 
             inner: iter.double_ended_peekable(),
             merge_operator,
             comparator,
+            value_log: None,
             range_tombstones: Vec::new(),
             key_entries_buf: Vec::new(),
         }
+    }
+
+    /// Installs the value log a merge reads a base kept there from.
+    #[must_use]
+    pub(crate) fn with_value_log(mut self, value_log: Option<ValueLog<'v>>) -> Self {
+        self.value_log = value_log;
+        self
+    }
+
+    /// The value of a base kept in the value log, as `RocksDB`'s merge reads
+    /// a blob base before merging onto it. A stream given no value log is
+    /// not a blob tree's and cannot read one; the pointer is refused rather
+    /// than handed to the operator as if it were the value.
+    fn separated_base(&self, base: InternalValue) -> crate::Result<UserValue> {
+        let Some(value_log) = self.value_log else {
+            return Err(crate::Error::FeatureUnsupported(
+                "merge-onto-separated-base-without-value-log",
+            ));
+        };
+        value_log.source.value(value_log.version, base)
     }
 
     /// Installs range tombstones for merge-resolution awareness.
@@ -87,7 +120,6 @@ impl<I: DoubleEndedIterator<Item = crate::Result<InternalValue>>> MvccStream<I> 
         let mut operands: Vec<UserValue> = vec![head.value.clone()];
         let mut base_value: Option<UserValue> = None;
         let mut found_base = false;
-        let mut saw_indirection_base = false;
 
         // Collect remaining same-key entries
         loop {
@@ -120,11 +152,8 @@ impl<I: DoubleEndedIterator<Item = crate::Result<InternalValue>>> MvccStream<I> 
                     break;
                 }
                 ValueType::Indirection => {
-                    // Indirection payloads are internal blob pointers and must not be
-                    // used as a merge base user value. Remember that we saw an
-                    // indirection base so we can skip merge resolution for this key.
+                    base_value = Some(self.separated_base(next)?);
                     found_base = true;
-                    saw_indirection_base = true;
                     break;
                 }
                 ValueType::Tombstone | ValueType::WeakTombstone => {
@@ -138,12 +167,6 @@ impl<I: DoubleEndedIterator<Item = crate::Result<InternalValue>>> MvccStream<I> 
         // Drain any remaining same-key entries
         if found_base {
             self.drain_key_min(user_key)?;
-        }
-
-        // If the base would be an indirection, do not attempt to resolve the merge;
-        // just return the newest entry unchanged.
-        if saw_indirection_base {
-            return Ok(head.clone());
         }
 
         // Reverse to chronological order (ascending seqno)
@@ -180,40 +203,28 @@ impl<I: DoubleEndedIterator<Item = crate::Result<InternalValue>>> MvccStream<I> 
         let result_key = newest.key.user_key.clone();
 
         // Process in descending seqno order (newest first) to match forward merge semantics
-        let mut saw_indirection = false;
-
-        for entry in entries.iter().rev() {
+        for entry in entries.into_iter().rev() {
             // RT-suppressed entries are logically deleted — treat as tombstone.
-            if self.is_rt_suppressed(entry) {
+            if self.is_rt_suppressed(&entry) {
                 break;
             }
 
             match entry.key.value_type {
                 ValueType::MergeOperand => {
-                    operands.push(entry.value.clone());
+                    operands.push(entry.value);
                 }
                 ValueType::Value => {
-                    base_value = Some(entry.value.clone());
+                    base_value = Some(entry.value);
                     break;
                 }
                 ValueType::Indirection => {
-                    // Do not use indirection bytes as a merge base; stop scanning
-                    // older versions.
-                    saw_indirection = true;
+                    base_value = Some(self.separated_base(entry)?);
                     break;
                 }
                 ValueType::Tombstone | ValueType::WeakTombstone => {
                     break;
                 }
             }
-        }
-
-        // If the base is an indirection, return the newest entry unchanged.
-        if saw_indirection {
-            return entries
-                .into_iter()
-                .last()
-                .ok_or(crate::Error::Unrecoverable);
         }
 
         // Reverse operands to chronological order (ascending seqno)
@@ -248,7 +259,7 @@ impl<I: DoubleEndedIterator<Item = crate::Result<InternalValue>>> MvccStream<I> 
     }
 }
 
-impl<I> crate::reseek::Reseekable for MvccStream<I>
+impl<I> crate::reseek::Reseekable for MvccStream<'_, I>
 where
     I: DoubleEndedIterator<Item = crate::Result<InternalValue>> + crate::reseek::Reseekable,
 {
@@ -263,7 +274,7 @@ where
     }
 }
 
-impl<I: DoubleEndedIterator<Item = crate::Result<InternalValue>>> Iterator for MvccStream<I> {
+impl<I: DoubleEndedIterator<Item = crate::Result<InternalValue>>> Iterator for MvccStream<'_, I> {
     type Item = crate::Result<InternalValue>;
 
     fn next(&mut self) -> Option<Self::Item> {
@@ -288,7 +299,7 @@ impl<I: DoubleEndedIterator<Item = crate::Result<InternalValue>>> Iterator for M
 }
 
 impl<I: DoubleEndedIterator<Item = crate::Result<InternalValue>>> DoubleEndedIterator
-    for MvccStream<I>
+    for MvccStream<'_, I>
 {
     fn next_back(&mut self) -> Option<Self::Item> {
         // When a merge operator is configured we must buffer ALL entries

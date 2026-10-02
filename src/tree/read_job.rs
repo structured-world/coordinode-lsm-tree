@@ -23,12 +23,17 @@ pub enum Values {
     /// Stored inline: the version is the value.
     Inline,
     /// A blob tree's: an indirection is followed into the value log.
-    Blob {
-        tree_id: crate::TreeId,
-        cache: Arc<crate::Cache>,
-        #[cfg(feature = "metrics")]
-        metrics: Arc<crate::metrics::Metrics>,
-    },
+    Blob(crate::blob_tree::BlobSource),
+}
+
+impl Values {
+    /// Where a merge reads a base kept in the value log.
+    fn blob_source(&self) -> Option<crate::blob_tree::BlobSource> {
+        match self {
+            Self::Inline => None,
+            Self::Blob(source) => Some(source.clone()),
+        }
+    }
 }
 
 /// What a read is about: the version it holds for its whole life, its keys,
@@ -210,6 +215,7 @@ impl Job {
                         ctx.key(idx),
                         ctx.seqno,
                         Arc::clone(merge_operator),
+                        ctx.values.blob_source(),
                     ),
                     None => Err(misplaced()),
                 },
@@ -217,20 +223,7 @@ impl Job {
             Self::Blob { idx, item } => JobDone::Value {
                 idx,
                 value: match &ctx.values {
-                    Values::Blob {
-                        tree_id,
-                        cache,
-                        #[cfg(feature = "metrics")]
-                        metrics,
-                    } => crate::blob_tree::resolve_value_handle(
-                        *tree_id,
-                        cache,
-                        version,
-                        #[cfg(feature = "metrics")]
-                        metrics,
-                        item,
-                    )
-                    .map(|(_, value)| Some(value)),
+                    Values::Blob(source) => source.value(version, item).map(Some),
                     Values::Inline => Ok(Some(item.value)),
                 },
             },
