@@ -8,10 +8,17 @@
 //! the work out.
 
 use super::{BlockTask, TaskBlock, Tree};
-use crate::{InternalValue, Table, table::BlockHandle};
+use crate::{InternalValue, Table, TableId, fs::FsFile, table::BlockHandle};
+use alloc::sync::Arc;
 use alloc::vec::Vec;
 
-/// A block a chunk lacks.
+/// A table file a chunk's reads go through, by table.
+pub(super) type ChunkFile = (TableId, Arc<dyn FsFile>);
+
+/// A chunk's file of a table, `None` while it is being opened.
+pub(super) type ChunkSlot = (TableId, Option<Arc<dyn FsFile>>);
+
+/// Work a chunk asks for before its blocks can be read.
 pub(super) enum ChunkWork<'a> {
     /// A Page-ECC or columnar table's block, loaded through the table's own
     /// path, which heals a corrected ECC block and reconstructs a columnar
@@ -21,20 +28,30 @@ pub(super) enum ChunkWork<'a> {
         table: &'a Table,
         handle: BlockHandle,
     },
-    /// A block to read from its table's file into `buf`, the whole of it at
-    /// the handle's offset; handed back through [`ChunkRead::read`].
-    Read {
-        index: usize,
-        table: &'a Table,
-        handle: BlockHandle,
-        buf: Vec<u8>,
-    },
+    /// The file of `table`, opened before the chunk's reads from it; handed
+    /// back through [`ChunkRead::opened`].
+    Open { slot: usize, table: &'a Table },
+}
+
+/// A block to read whole at the handle's offset into `buf`, from the file in
+/// `slot` of the chunk's files; handed back through [`ChunkRead::read`].
+pub(super) struct ChunkFill<'a> {
+    pub(super) index: usize,
+    pub(super) table: &'a Table,
+    pub(super) handle: BlockHandle,
+    pub(super) slot: usize,
+    pub(super) buf: Vec<u8>,
 }
 
 /// The read of one chunk of block tasks for `keys`.
 pub(super) struct ChunkRead<'c, 'a, 'k, K> {
     chunk: &'c [BlockTask<'a>],
     keys: &'k [K],
+    /// The reads of the blocks the chunk lacks, in task order.
+    fills: Vec<ChunkFill<'a>>,
+    /// The files those reads go through, once per table: a table's tasks are
+    /// consecutive.
+    files: Vec<ChunkSlot>,
     /// `(task index, key index, entry)` for every key found so far.
     hits: Vec<(usize, usize, InternalValue)>,
     /// The lowest task whose block failed to decode, and why: held rather than
@@ -45,8 +62,12 @@ pub(super) struct ChunkRead<'c, 'a, 'k, K> {
 
 impl<'c, 'a, 'k, K: AsRef<[u8]>> ChunkRead<'c, 'a, 'k, K> {
     /// Point-reads every task whose block is held, and returns the work the
-    /// others need, a Page-ECC or columnar table's load and every read in task
-    /// order.
+    /// others need: a Page-ECC or columnar table's load, and the files to open
+    /// for the reads [`Self::take_reads`] then hands out.
+    ///
+    /// `carried` is the previous chunk's last file: taken over when this
+    /// chunk's first read is from its table, and let go otherwise, before any
+    /// file of this chunk is asked for.
     ///
     /// # Errors
     ///
@@ -56,20 +77,23 @@ impl<'c, 'a, 'k, K: AsRef<[u8]>> ChunkRead<'c, 'a, 'k, K> {
         chunk: &'c [BlockTask<'a>],
         cached: &[TaskBlock],
         keys: &'k [K],
+        carried: &mut Option<ChunkFile>,
     ) -> crate::Result<(Self, Vec<ChunkWork<'a>>)> {
         let mut read = Self {
             chunk,
             keys,
+            fills: Vec::new(),
+            files: Vec::new(),
             hits: Vec::new(),
             decode_failure: None,
         };
-        let mut loads = Vec::new();
+        let mut work = Vec::new();
         for (index, (task, block)) in chunk.iter().zip(cached).enumerate() {
             match block {
                 TaskBlock::Held(block) => {
                     Tree::read_task_keys(task, index, block, keys, &mut read.hits)?;
                 }
-                TaskBlock::Load => loads.push(ChunkWork::Load {
+                TaskBlock::Load => work.push(ChunkWork::Load {
                     index,
                     table: task.table,
                     handle: task.handle,
@@ -77,18 +101,55 @@ impl<'c, 'a, 'k, K: AsRef<[u8]>> ChunkRead<'c, 'a, 'k, K> {
                 TaskBlock::Read => {}
             }
         }
-        let mut work = loads;
+        let mut carry = carried.take();
         for (index, (task, block)) in chunk.iter().zip(cached).enumerate() {
-            if matches!(block, TaskBlock::Read) {
-                work.push(ChunkWork::Read {
-                    index,
-                    table: task.table,
-                    handle: task.handle,
-                    buf: task.table.block_buffer(&task.handle)?,
-                });
+            if !matches!(block, TaskBlock::Read) {
+                continue;
             }
+            let buf = task.table.block_buffer(&task.handle)?;
+            let id = task.table.id();
+            if read.files.last().is_none_or(|&(last, _)| last != id) {
+                let file = match carry.take() {
+                    Some((carried_id, file)) if carried_id == id => Some(file),
+                    // Another table's file is let go before this one is asked
+                    // for: a scrutinee left unbound lives to the end of the
+                    // match.
+                    other => {
+                        drop(other);
+                        work.push(ChunkWork::Open {
+                            slot: read.files.len(),
+                            table: task.table,
+                        });
+                        None
+                    }
+                };
+                read.files.push((id, file));
+            }
+            read.fills.push(ChunkFill {
+                index,
+                table: task.table,
+                handle: task.handle,
+                slot: read.files.len() - 1,
+                buf,
+            });
         }
         Ok((read, work))
+    }
+
+    /// Takes back the file opened for `slot`.
+    pub(super) fn opened(&mut self, slot: usize, file: Arc<dyn FsFile>) {
+        if let Some((_, held)) = self.files.get_mut(slot) {
+            *held = Some(file);
+        }
+    }
+
+    /// Hands out the chunk's reads in task order and the files they go
+    /// through, once every file asked for is back.
+    pub(super) fn take_reads(&mut self) -> (Vec<ChunkFill<'a>>, Vec<ChunkSlot>) {
+        (
+            core::mem::take(&mut self.fills),
+            core::mem::take(&mut self.files),
+        )
     }
 
     /// Takes back the load of task `index`: `None` when the table holds no

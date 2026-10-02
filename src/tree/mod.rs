@@ -4291,13 +4291,13 @@ impl Tree {
         keys: &[K],
         results: &mut [Option<InternalValue>],
         found: Option<&mut Vec<(crate::TableId, usize)>>,
-        carried: &mut Option<(crate::TableId, Arc<dyn crate::fs::FsFile>)>,
+        carried: &mut Option<data_stage::ChunkFile>,
     ) -> crate::Result<()> {
-        let (mut chunk_read, work) = data_stage::ChunkRead::start(chunk, cached, keys)?;
+        let (mut chunk_read, work) = data_stage::ChunkRead::start(chunk, cached, keys, carried)?;
 
-        // A Page-ECC or columnar table's block is loaded through its own path;
-        // the others are read below.
-        let mut reads: Vec<(usize, &Table, crate::table::BlockHandle, Vec<u8>)> = Vec::new();
+        // A Page-ECC or columnar table's block is loaded through its own path,
+        // and the files of the tables whose blocks are read are opened for
+        // this chunk only.
         for item in work {
             match item {
                 data_stage::ChunkWork::Load {
@@ -4305,39 +4305,12 @@ impl Tree {
                     table,
                     handle,
                 } => chunk_read.loaded(index, table.load_data_block(&handle)?)?,
-                data_stage::ChunkWork::Read {
-                    index,
-                    table,
-                    handle,
-                    buf,
-                } => reads.push((index, table, handle, buf)),
+                data_stage::ChunkWork::Open { slot, table } => {
+                    chunk_read.opened(slot, table.open_file()?);
+                }
             }
         }
-
-        // The files of the tables whose blocks are read, opened for this chunk
-        // only, once per table: a table's tasks are consecutive. The previous
-        // chunk's last file is taken over when this chunk goes on with its
-        // table, and let go otherwise. Each read names its file by position.
-        let mut carry = carried.take();
-        let mut files: Vec<(crate::TableId, Arc<dyn crate::fs::FsFile>)> = Vec::new();
-        let mut file_of: Vec<usize> = Vec::with_capacity(reads.len());
-        for &(_, table, _, _) in &reads {
-            let id = table.id();
-            if files.last().is_none_or(|&(last, _)| last != id) {
-                let file = match carry.take() {
-                    Some((carried_id, file)) if carried_id == id => file,
-                    // Another table's file is let go before this one opens:
-                    // a scrutinee left unbound lives to the end of the match.
-                    other => {
-                        drop(other);
-                        table.open_file()?
-                    }
-                };
-                files.push((id, file));
-            }
-            file_of.push(files.len() - 1);
-        }
-        *carried = files.last().cloned();
+        let (mut reads, files) = chunk_read.take_reads();
 
         // One submission per backend: a table's reads belong to the backend it
         // was opened through, which a reopen with a changed routing map can
@@ -4349,12 +4322,22 @@ impl Tree {
             tasks: Vec<(usize, crate::table::BlockHandle)>,
         }
         let mut groups: Vec<BackendReads<'_, '_>> = Vec::new();
-        for ((index, table, handle, buf), &at) in reads.iter_mut().zip(&file_of) {
-            let Some(file) = files.get(at) else {
-                continue;
+        for data_stage::ChunkFill {
+            index,
+            table,
+            handle,
+            slot,
+            buf,
+        } in &mut reads
+        {
+            let Some((_, Some(file))) = files.get(*slot) else {
+                return Err(crate::Error::Io(crate::io::Error::new(
+                    crate::io::ErrorKind::Other,
+                    "a chunk read was handed out before its file was opened",
+                )));
             };
             let req = crate::fs::BlockRead {
-                file: file.1.as_ref(),
+                file: file.as_ref(),
                 offset: *handle.offset(),
                 buf: crate::fs::BlockBuf::new(&mut buf[..]),
             };
@@ -4403,6 +4386,13 @@ impl Tree {
                 )));
             }
         }
+        drop(groups);
+        // The last file is carried over to the next chunk, which takes it when
+        // it goes on with the same table.
+        *carried = files
+            .into_iter()
+            .last()
+            .and_then(|(id, file)| Some((id, file?)));
         chunk_read.finish(results, found)
     }
 
