@@ -379,6 +379,33 @@ fn mvcc_stream_front_error_stays_at_the_front() {
     assert!(stream.next().is_none());
 }
 
+/// A key that failed at one end yields nothing when the other end reaches
+/// it: the versions left are the ones the failure shadows.
+#[test]
+fn mvcc_stream_failed_key_is_skipped_from_the_other_end() {
+    let source = Scripted::new(vec![
+        kv("a", "new", 999, ValueType::Value),
+        named_error("e"),
+        kv("a", "old", 998, ValueType::Value),
+        kv("b", "b", 1, ValueType::Value),
+    ]);
+    let mut stream = MvccStream::new(source, None);
+    assert_eq!(stream.next().map(shown).as_deref(), Some("e"));
+    let rest: Vec<String> = stream.rev().map(shown).collect();
+    assert_eq!(rest, ["b"], "front failure, back drain");
+
+    let source = Scripted::new(vec![
+        kv("x", "x", 1, ValueType::Value),
+        kv("a", "new", 999, ValueType::Value),
+        named_error("e"),
+        kv("a", "old", 998, ValueType::Value),
+    ]);
+    let mut stream = MvccStream::new(source, None);
+    assert_eq!(stream.next_back().map(shown).as_deref(), Some("e"));
+    let rest: Vec<String> = stream.map(shown).collect();
+    assert_eq!(rest, ["x"], "back failure, front drain");
+}
+
 /// A reposition starts fresh: what was left to skip at the old position
 /// does not surface at the new one.
 #[test]
