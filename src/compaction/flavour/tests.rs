@@ -160,6 +160,36 @@ fn drain_unclaimed_below_takes_the_frames_below_the_bound() -> crate::Result<()>
     Ok(())
 }
 
+/// A scan error met while draining ends the drain and is returned, not
+/// skipped: the frontier never moves past a frame that could not be read.
+#[test]
+fn drain_unclaimed_below_returns_a_scan_error() {
+    let mut iter = [
+        entry(0, b"a", 0),
+        Err(crate::Error::Io(crate::io::Error::other(
+            "unreadable frame",
+        ))),
+        entry(0, b"b", 1),
+    ]
+    .into_iter()
+    .peekable();
+
+    let mut recorded = Vec::new();
+    let result = drain_unclaimed_below(
+        &mut iter,
+        b"z",
+        crate::comparator::default_comparator().as_ref(),
+        &mut |id, frame_end| recorded.push((id, frame_end)),
+        &|| false,
+    );
+
+    assert!(
+        matches!(result, Err(crate::Error::Io(_))),
+        "the scan error is returned: {result:?}"
+    );
+    assert_eq!(recorded, [(0, 1)], "only the frame before the error counts");
+}
+
 /// A stop requested while a slice drains its unclaimed frames ends the drain
 /// with the compaction's cancellation error instead of scanning on.
 #[test]
