@@ -125,8 +125,9 @@ pub struct Options {
     pub rate_limiter: Arc<crate::rate_limiter::RateLimiter>,
 
     /// The files this run has created that no installed version names yet,
-    /// removed by [`do_compaction`] when the run returns. One per run: the
-    /// clones a run hands its sub-compactions share it.
+    /// removed by [`do_compaction`] when the run returns. [`do_compaction`]
+    /// gives each run its own; the clones a run hands its sub-compactions
+    /// share it.
     pub(crate) outputs: super::output_ledger::OutputLedger,
 
     #[cfg(feature = "metrics")]
@@ -169,6 +170,12 @@ impl Options {
 ///
 /// This will block until the compactor is fully finished.
 pub fn do_compaction(opts: &Options) -> crate::Result<CompactionResult> {
+    // A ledger of this run's own: the caller may share its options with runs
+    // that overlap this one, and their outputs are theirs to install.
+    let opts = &Options {
+        outputs: super::output_ledger::OutputLedger::default(),
+        ..opts.clone()
+    };
     let result = run_compaction(opts);
     // Every file the run created that it did not install goes now, whichever
     // writer made it and wherever the run stopped: the handles on them
