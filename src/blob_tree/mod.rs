@@ -141,6 +141,32 @@ pub(crate) fn resolve_value_handle(
     }
 }
 
+/// Where a blob tree's values kept in the value log are read from: the tree
+/// they belong to and the cache their blocks go through.
+#[derive(Clone)]
+pub(crate) struct BlobSource {
+    pub(crate) tree_id: TreeId,
+    pub(crate) cache: Arc<crate::Cache>,
+    #[cfg(feature = "metrics")]
+    pub(crate) metrics: Arc<crate::metrics::Metrics>,
+}
+
+impl BlobSource {
+    /// The value `item` stands for in `version`: read from the value log when
+    /// it is an indirection, its own bytes otherwise.
+    pub(crate) fn value(&self, version: &Version, item: InternalValue) -> crate::Result<UserValue> {
+        resolve_value_handle(
+            self.tree_id,
+            &self.cache,
+            version,
+            #[cfg(feature = "metrics")]
+            &self.metrics,
+            item,
+        )
+        .map(|(_, value)| value)
+    }
+}
+
 /// A key-value-separated log-structured merge tree
 ///
 /// This tree is a composite structure, consisting of an
@@ -234,6 +260,7 @@ impl BlobTree {
                 key,
                 seqno,
                 Arc::clone(merge_operator),
+                Some(self.blob_source()),
             );
         }
 
@@ -308,15 +335,21 @@ impl BlobTree {
                 seqno,
                 comparator: Arc::clone(&self.index.config.comparator),
                 merge_operator: self.index.config.merge_operator.clone(),
-                values: crate::tree::read_job::Values::Blob {
-                    tree_id: self.id(),
-                    cache: Arc::clone(&self.index.config.cache),
-                    #[cfg(feature = "metrics")]
-                    metrics: Arc::clone(self.metrics()),
-                },
+                merge_base: Some(self.blob_source()),
+                values: crate::tree::read_job::Values::Blob(self.blob_source()),
                 metadata_budget: self.index.config.multi_get_metadata_budget,
             },
         ))
+    }
+
+    /// Where this tree's values kept in the value log are read from.
+    fn blob_source(&self) -> BlobSource {
+        BlobSource {
+            tree_id: self.id(),
+            cache: Arc::clone(&self.index.config.cache),
+            #[cfg(feature = "metrics")]
+            metrics: Arc::clone(self.metrics()),
+        }
     }
 
     /// Range-scoped variant of [`Self::scan_since_seqno`], with the same
@@ -880,9 +913,10 @@ impl AbstractTree for BlobTree {
                 &range,
                 seqno,
                 index,
-                None, // BlobTree does not use merge operators for prefix scans
+                self.index.config.merge_operator.clone(),
                 self.index.config.comparator.clone(),
                 prefix_hash,
+                Some(self.blob_source()),
             ),
             buf: alloc::collections::VecDeque::new(),
             inner_back_done: false,
@@ -910,13 +944,15 @@ impl AbstractTree for BlobTree {
         let state = self.scan_prefetch_state();
 
         Box::new(PrefetchScan {
-            inner: crate::Tree::create_internal_range(
+            inner: crate::Tree::create_internal_range_with_prefix_hash(
                 super_version.clone(),
                 &range,
                 seqno,
                 index,
-                None,
+                self.index.config.merge_operator.clone(),
                 self.index.config.comparator.clone(),
+                None,
+                Some(self.blob_source()),
             ),
             buf: alloc::collections::VecDeque::new(),
             inner_back_done: false,
@@ -1078,6 +1114,13 @@ impl AbstractTree for BlobTree {
         let Some(item) = self.index.get_internal_entry(key.as_ref(), seqno)? else {
             return Ok(None);
         };
+
+        // An operand's size is not the key's: the value is the operands
+        // merged onto the base, which only the merge itself knows.
+        if item.key.value_type.is_merge_operand() && self.index.config.merge_operator.is_some() {
+            #[expect(clippy::cast_possible_truncation, reason = "values are u32 length max")]
+            return Ok(self.get(key, seqno)?.map(|value| value.len() as u32));
+        }
 
         Ok(Some(if item.key.value_type.is_indirection() {
             let mut cursor = crate::io::Cursor::new(item.value);
@@ -1311,7 +1354,10 @@ impl AbstractTree for BlobTree {
             #[expect(clippy::cast_possible_truncation, reason = "values are u32 length max")]
             let value_size = value.len() as u32;
 
-            if value_size >= separation_threshold {
+            // Only a value is separated: an indirection reads as a put, so an
+            // operand stored as one would stop merging onto its base.
+            if item.key.value_type == crate::ValueType::Value && value_size >= separation_threshold
+            {
                 let vhandle = blob_writer.write(&item.key.user_key, item.key.seqno, &value)?;
 
                 let indirection = BlobIndirection {
@@ -1577,12 +1623,8 @@ impl AbstractTree for BlobTree {
             seqno,
             comparator: Arc::clone(&self.index.config.comparator),
             merge_operator: self.index.config.merge_operator.clone(),
-            values: crate::tree::read_job::Values::Blob {
-                tree_id: self.id(),
-                cache: Arc::clone(&self.index.config.cache),
-                #[cfg(feature = "metrics")]
-                metrics: Arc::clone(self.metrics()),
-            },
+            merge_base: Some(self.blob_source()),
+            values: crate::tree::read_job::Values::Blob(self.blob_source()),
             metadata_budget: self.index.config.multi_get_metadata_budget,
         })
     }

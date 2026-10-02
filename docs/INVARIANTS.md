@@ -328,6 +328,16 @@ matching entry (and add one for a new subsystem).
   lose the value. Enforced in `src/blob_tree` / `src/vlog` (GC in
   `src/blob_tree/gc.rs`).
 
+- **Only a value is separated, and a separated base merges like an inline one.**
+  An indirection reads as a put, so merge operands stay inline whatever their size
+  (flush and compaction-filter rewrites alike), or the key would stop merging onto
+  its base. A merge whose base is an indirection reads the base from the value log
+  of the version it reads and merges onto that, in every read form; a compaction
+  folding such a chain reads it the same way, writes the result where a put of its
+  size would go, and reports the replaced pointer to the fragmentation map.
+  Enforced in `src/mvcc_stream.rs`, `src/compaction/stream.rs` and
+  `src/compaction/filter.rs`.
+
 ## Columnar (PAX) / delete-bitmap
 
 > `columnar` feature.

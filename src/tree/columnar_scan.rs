@@ -332,6 +332,7 @@ impl Tree {
         let resolver = self.config.merge_operator.clone().map(|operator| Resolver {
             version: super_version.clone(),
             operator,
+            blob_source: self.blob_source(),
         });
 
         // A declared field of a segment that stores each value whole lies
@@ -803,6 +804,8 @@ fn drop_columns(batch: &mut ColumnBatch, dropped: &[u16]) {
 struct Resolver {
     version: crate::version::SuperVersion,
     operator: alloc::sync::Arc<dyn crate::merge_operator::MergeOperator>,
+    /// Where a merge reads a base kept in the value log.
+    blob_source: Option<crate::blob_tree::BlobSource>,
 }
 
 /// Iterator over a tree-level projected columnar scan.
@@ -1119,6 +1122,7 @@ impl ColumnarScan {
                 self.seqno,
                 Some(&resolver.operator),
                 self.comparator.as_ref(),
+                || resolver.blob_source.clone(),
             )?));
         }
         // Only the raw value is rewritten below, and only a row that carried

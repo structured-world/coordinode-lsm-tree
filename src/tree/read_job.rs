@@ -23,12 +23,7 @@ pub enum Values {
     /// Stored inline: the version is the value.
     Inline,
     /// A blob tree's: an indirection is followed into the value log.
-    Blob {
-        tree_id: crate::TreeId,
-        cache: Arc<crate::Cache>,
-        #[cfg(feature = "metrics")]
-        metrics: Arc<crate::metrics::Metrics>,
-    },
+    Blob(crate::blob_tree::BlobSource),
 }
 
 /// What a read is about: the version it holds for its whole life, its keys,
@@ -39,6 +34,9 @@ pub struct ReadCtx<K> {
     pub seqno: SeqNo,
     pub comparator: SharedComparator,
     pub merge_operator: Option<Arc<dyn MergeOperator>>,
+    /// Where a merge reads a base kept in the value log; set for a blob
+    /// tree and its index.
+    pub merge_base: Option<crate::blob_tree::BlobSource>,
     pub values: Values,
     /// The most filter and index bytes a level's staged read holds.
     pub metadata_budget: u64,
@@ -210,6 +208,7 @@ impl Job {
                         ctx.key(idx),
                         ctx.seqno,
                         Arc::clone(merge_operator),
+                        ctx.merge_base.clone(),
                     ),
                     None => Err(misplaced()),
                 },
@@ -217,20 +216,7 @@ impl Job {
             Self::Blob { idx, item } => JobDone::Value {
                 idx,
                 value: match &ctx.values {
-                    Values::Blob {
-                        tree_id,
-                        cache,
-                        #[cfg(feature = "metrics")]
-                        metrics,
-                    } => crate::blob_tree::resolve_value_handle(
-                        *tree_id,
-                        cache,
-                        version,
-                        #[cfg(feature = "metrics")]
-                        metrics,
-                        item,
-                    )
-                    .map(|(_, value)| Some(value)),
+                    Values::Blob(source) => source.value(version, item).map(Some),
                     Values::Inline => Ok(Some(item.value)),
                 },
             },

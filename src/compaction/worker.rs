@@ -1232,7 +1232,7 @@ fn ranges_from_boundaries(
 /// output. The install swaps every input table for what was written, so a
 /// truncated commit drops the unread tail out of the tree; both the serial and
 /// the parallel path refuse for that reason.
-fn cancelled_compaction() -> crate::Error {
+pub(super) fn cancelled_compaction() -> crate::Error {
     crate::Error::from(crate::io::Error::new(
         crate::io::ErrorKind::Interrupted,
         "compaction cancelled by stop signal",

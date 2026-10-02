@@ -14,6 +14,7 @@ pub(super) fn ctx_for<K>(tree: &Tree, keys: Vec<K>) -> crate::Result<ReadCtx<K>>
         seqno: SeqNo::MAX,
         comparator: crate::comparator::default_comparator(),
         merge_operator: None,
+        merge_base: None,
         values: Values::Inline,
         metadata_budget: crate::config::DEFAULT_MULTI_GET_METADATA_BUDGET,
     })

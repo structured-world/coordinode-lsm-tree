@@ -126,7 +126,7 @@ impl<'a, K: AsRef<[u8]>> MultiGetRead<'a, K> {
                 }
                 continue;
             }
-            if matches!(ctx.values, Values::Blob { .. }) && entry.key.value_type.is_indirection() {
+            if matches!(ctx.values, Values::Blob(_)) && entry.key.value_type.is_indirection() {
                 out.job(Job::Blob { idx, item: entry });
                 self.jobs += 1;
             } else {
