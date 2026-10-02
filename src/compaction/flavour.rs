@@ -64,6 +64,35 @@ fn drain_blobs<I: Iterator<Item = crate::Result<(ScanEntry, BlobFileId)>>>(
     Ok(())
 }
 
+/// Drains the frames of keys below `bound`, recording each proven frame's end
+/// through `record_consumed` as `drain_blobs` does; a resynchronized frame is
+/// consumed without moving the frontier. `is_stopped` is polled before every
+/// frame: the drain can cover a whole dead prefix after the merge loop's last
+/// cancellation check, so a stop must not wait for it.
+fn drain_unclaimed_below<I: Iterator<Item = crate::Result<(ScanEntry, BlobFileId)>>>(
+    scanner: &mut Peekable<I>,
+    bound: &[u8],
+    comparator: &dyn crate::comparator::UserComparator,
+    record_consumed: &mut dyn FnMut(BlobFileId, u64),
+    is_stopped: &dyn Fn() -> bool,
+) -> crate::Result<()> {
+    loop {
+        if is_stopped() {
+            return Err(super::worker::cancelled_compaction());
+        }
+        let Some(next) = scanner.next_if(|x| match x {
+            Ok((entry, _)) => comparator.compare(&entry.key, bound) == core::cmp::Ordering::Less,
+            Err(_) => true,
+        }) else {
+            return Ok(());
+        };
+        let (entry, blob_file_id) = next?;
+        if !entry.resynced {
+            record_consumed(blob_file_id, entry.frame_end);
+        }
+    }
+}
+
 pub(super) fn prepare_table_writer(
     version: &Version,
     opts: &Options,
@@ -653,23 +682,19 @@ impl RelocatingCompaction {
             blob_scanner,
             consumed_through,
             comparator,
+            stop_signal,
             ..
         } = self;
-        loop {
-            let Some(next) = blob_scanner.next_if(|x| match x {
-                Ok((entry, _)) => {
-                    comparator.compare(&entry.key, bound) == core::cmp::Ordering::Less
-                }
-                Err(_) => true,
-            }) else {
-                return Ok(());
-            };
-            let (entry, blob_file_id) = next?;
-            if !entry.resynced {
-                let slot = consumed_through.entry(blob_file_id).or_insert(0);
-                *slot = (*slot).max(entry.frame_end);
-            }
-        }
+        drain_unclaimed_below(
+            blob_scanner,
+            bound,
+            comparator.as_ref(),
+            &mut |id, frame_end| {
+                let slot = consumed_through.entry(id).or_insert(0);
+                *slot = (*slot).max(frame_end);
+            },
+            &|| stop_signal.is_stopped(),
+        )
     }
 
     /// Advances the per-file frontier for `blob_file_id` to the max of its
