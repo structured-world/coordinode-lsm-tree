@@ -447,6 +447,46 @@ fn mvcc_stream_failed_key_is_skipped_before_the_other_end_resolves_it() {
     assert_eq!(rest, ["x"], "back failure, front drain");
 }
 
+/// With a failed key pending at each end, an end first finishes its own skip
+/// and then still skips the key the other end failed on, rather than
+/// resolving it.
+#[test]
+fn mvcc_stream_skips_both_failed_keys_when_both_ends_failed() {
+    let source = Scripted::new(vec![
+        kv("a", "a_new", 999, ValueType::Value),
+        named_error("ea"),
+        kv("a", "a_old", 998, ValueType::Value),
+        kv("b", "b_new", 999, ValueType::Value),
+        named_error("eb"),
+        kv("b", "b_old", 998, ValueType::Value),
+    ]);
+    let mut stream = MvccStream::new(source, None);
+    assert_eq!(stream.next().map(shown).as_deref(), Some("ea"));
+    assert_eq!(stream.next_back().map(shown).as_deref(), Some("eb"));
+    assert_eq!(
+        stream.next().map(shown),
+        None,
+        "front: a skipped, b skipped"
+    );
+
+    let source = Scripted::new(vec![
+        kv("x", "x_new", 999, ValueType::Value),
+        named_error("ex"),
+        kv("x", "x_old", 998, ValueType::Value),
+        kv("y", "y_new", 999, ValueType::Value),
+        named_error("ey"),
+        kv("y", "y_old", 998, ValueType::Value),
+    ]);
+    let mut stream = MvccStream::new(source, None);
+    assert_eq!(stream.next_back().map(shown).as_deref(), Some("ey"));
+    assert_eq!(stream.next().map(shown).as_deref(), Some("ex"));
+    assert_eq!(
+        stream.next_back().map(shown),
+        None,
+        "back: y skipped, x skipped"
+    );
+}
+
 /// A reposition starts fresh: what was left to skip at the old position
 /// does not surface at the new one.
 #[test]
