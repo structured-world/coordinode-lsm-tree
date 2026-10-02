@@ -47,9 +47,17 @@ fn files(folder: &Path) -> std::io::Result<BTreeSet<String>> {
     }
 }
 
-/// The table and the blob files of the tree at `root`.
-fn on_disk(root: &Path) -> std::io::Result<(BTreeSet<String>, BTreeSet<String>)> {
-    Ok((files(&root.join("tables"))?, files(&root.join("blobs"))?))
+/// The table and the blob files of the tree at `root`, as `folder/name`.
+fn on_disk(root: &Path) -> std::io::Result<BTreeSet<String>> {
+    let mut all = BTreeSet::new();
+    for folder in ["tables", "blobs"] {
+        all.extend(
+            files(&root.join(folder))?
+                .into_iter()
+                .map(|name| format!("{folder}/{name}")),
+        );
+    }
+    Ok(all)
 }
 
 struct Fixture {
@@ -86,9 +94,10 @@ fn io_error(op: FaultOp, folder: &str, skip: u64) -> FaultRule {
         .skip(skip)
 }
 
-/// Arms `rules`, runs a major compaction that must fail, and checks that the
-/// table and blob folders hold exactly what they held before it and that every
-/// key still reads `expected`, all without reopening the tree.
+/// Arms `rules`, runs a major compaction that must fail, and checks that no
+/// table or blob file appeared that was not there before it and that every key
+/// still reads `expected`, all without reopening the tree. A file can only go
+/// meanwhile: an input an earlier merge retired is unlinked in the background.
 fn assert_fails_cleanly(
     f: &Fixture,
     rules: impl IntoIterator<Item = FaultRule>,
@@ -106,10 +115,13 @@ fn assert_fails_cleanly(
         result.is_err(),
         "the injected fault must fail the compaction: {result:?}"
     );
-    assert_eq!(
-        on_disk(f.dir.path())?,
-        before,
-        "the failed compaction must leave none of its files behind",
+    let left_behind: BTreeSet<String> = on_disk(f.dir.path())?
+        .difference(&before)
+        .cloned()
+        .collect();
+    assert!(
+        left_behind.is_empty(),
+        "the failed compaction must leave none of its files behind: {left_behind:?}",
     );
     for i in 0..KEYS {
         assert_eq!(

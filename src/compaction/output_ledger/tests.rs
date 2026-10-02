@@ -134,10 +134,16 @@ fn a_failed_install_leaves_no_output_where_open_files_cannot_be_unlinked() -> cr
     use crate::fs::{Fault, FaultOp, FaultRule, StdFs};
     use crate::{AbstractTree, Config, KvSeparationOptions, SequenceNumberCounter};
 
-    fn listing(folder: &std::path::Path) -> crate::Result<std::collections::BTreeSet<String>> {
-        Ok(std::fs::read_dir(folder)?
-            .map(|e| e.map(|e| e.file_name().to_string_lossy().into_owned()))
-            .collect::<Result<_, _>>()?)
+    /// The table and blob files under `root`, as `folder/name`.
+    fn listing(root: &std::path::Path) -> crate::Result<std::collections::BTreeSet<String>> {
+        let mut all = std::collections::BTreeSet::new();
+        for folder in [crate::file::TABLES_FOLDER, crate::file::BLOBS_FOLDER] {
+            for entry in std::fs::read_dir(root.join(folder))? {
+                let name = entry?.file_name().to_string_lossy().into_owned();
+                all.insert(alloc::format!("{folder}/{name}"));
+            }
+        }
+        Ok(all)
     }
     let value = |i: u64, generation: u64| {
         let mut v = alloc::format!("gen{generation}-{i}-").into_bytes();
@@ -177,9 +183,7 @@ fn a_failed_install_leaves_no_output_where_open_files_cannot_be_unlinked() -> cr
     let past_every_version = 10_000;
     tree.major_compact(u64::MAX, past_every_version)?;
 
-    let tables = dir.path().join(crate::file::TABLES_FOLDER);
-    let blobs = dir.path().join(crate::file::BLOBS_FOLDER);
-    let before = (listing(&tables)?, listing(&blobs)?);
+    let before = listing(dir.path())?;
     injector.refuse_removing_open_files();
     // The edit log append is the install's commit point.
     injector.arm(
@@ -192,10 +196,12 @@ fn a_failed_install_leaves_no_output_where_open_files_cannot_be_unlinked() -> cr
         result.is_err(),
         "the refused version install must fail the merge: {result:?}"
     );
-    assert_eq!(
-        (listing(&tables)?, listing(&blobs)?),
-        before,
-        "every output of the failed install must be removed",
+    // Only new files count: the inputs the first merge retired may still be
+    // on their way out, unlinked in the background.
+    let left_behind: Vec<String> = listing(dir.path())?.difference(&before).cloned().collect();
+    assert!(
+        left_behind.is_empty(),
+        "every output of the failed install must be removed: {left_behind:?}",
     );
     for i in 0..1_000 {
         let generation = u64::from(i % 2 == 0);
