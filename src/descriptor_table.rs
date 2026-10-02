@@ -46,6 +46,12 @@ impl DescriptorTable {
         self.inner.len()
     }
 
+    /// Closes the cached descriptors of every tree whose id is `first` or
+    /// later, tables and blob files alike.
+    pub(crate) fn remove_trees_from(&self, first: crate::tree::inner::TreeId) {
+        self.inner.remove_where(|key| key.1 >= first);
+    }
+
     #[must_use]
     pub fn access_for_table(&self, id: &GlobalTableId) -> Option<Arc<dyn FsFile>> {
         let key = CacheKey(TAG_BLOCK, id.tree_id(), id.table_id());
