@@ -139,6 +139,12 @@ impl Default for ReadBudget {
 /// the default [`ReadBudget`] fetches.
 pub const DEFAULT_COLUMNAR_SCAN_BUDGET: u64 = 1 << 20;
 
+/// The default of [`Config::multi_get_metadata_budget`].
+///
+/// Room for the filters of a few large tables in flight together, which is
+/// all the overlap the reads of a level gain from.
+pub const DEFAULT_MULTI_GET_METADATA_BUDGET: u64 = 8 << 20;
+
 /// Per-level filesystem routing entry for tiered storage.
 ///
 /// Maps a range of LSM levels to a base directory and filesystem backend.
@@ -546,6 +552,11 @@ pub struct Config {
     /// the segments it merges; see [`Self::columnar_scan_budget`].
     pub columnar_scan_budget: u64,
 
+    /// The filter and index bytes a multi-get holds at once across the tables
+    /// of a level it reads stage by stage; see
+    /// [`Self::multi_get_metadata_budget`].
+    pub multi_get_metadata_budget: u64,
+
     /// Whether to pin index blocks
     pub index_block_pinning_policy: PinningPolicy,
 
@@ -889,6 +900,7 @@ impl Default for Config {
 
             columnar_read_budget: ReadBudget::default(),
             columnar_scan_budget: DEFAULT_COLUMNAR_SCAN_BUDGET,
+            multi_get_metadata_budget: DEFAULT_MULTI_GET_METADATA_BUDGET,
 
             index_block_pinning_policy: PinningPolicy::new([true, true, false]),
             filter_block_pinning_policy: PinningPolicy::new([true, false]),
@@ -1988,6 +2000,38 @@ impl Config {
     #[must_use]
     pub fn columnar_scan_budget(mut self, bytes: u64) -> Self {
         self.columnar_scan_budget = bytes;
+        self
+    }
+
+    /// Sets the filter and index bytes a multi-get holds at once, in flight
+    /// or read, across the tables of a level it reads stage by stage. A block
+    /// in flight counts at the size it is read as, a block read at its decoded
+    /// size. A table whose blocks would pass it waits until a table before it
+    /// is planned and lets its blocks go; one that alone passes it is read
+    /// when no other is in flight. A stage is let in at its on-disk size, so
+    /// with compressed index blocks the read can go past the budget by what
+    /// the stages let in together grow when decoded; no further stage is let
+    /// in until it is back under. Independent of the block cache, so a small
+    /// cache does not make the tables of a level wait for each other. A reader
+    /// setting: the values returned are the same under any budget. The
+    /// default is [`DEFAULT_MULTI_GET_METADATA_BUDGET`].
+    ///
+    /// # Examples
+    ///
+    /// ```
+    /// use lsm_tree::{Config, SequenceNumberCounter};
+    /// # let folder = tempfile::tempdir()?;
+    /// let config = Config::new(
+    ///     folder.path(),
+    ///     SequenceNumberCounter::default(),
+    ///     SequenceNumberCounter::default(),
+    /// )
+    /// .multi_get_metadata_budget(8 * 1_024 * 1_024);
+    /// # Ok::<(), Box<dyn std::error::Error>>(())
+    /// ```
+    #[must_use]
+    pub fn multi_get_metadata_budget(mut self, bytes: u64) -> Self {
+        self.multi_get_metadata_budget = bytes;
         self
     }
 

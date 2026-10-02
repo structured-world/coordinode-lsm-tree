@@ -85,6 +85,20 @@ impl core::ops::AddAssign for ProbeCounts {
     }
 }
 
+/// What planning a batched read counts for one table, counted once the level
+/// it plans is answered: a level handed to the serial resolve is probed and
+/// counted again there, so nothing planning saw is counted twice.
+#[derive(Clone, Copy, Debug, Default, PartialEq, Eq)]
+pub struct PlanCounts {
+    /// The table's filter probes.
+    pub probes: ProbeCounts,
+    /// Lookups a filter answered for that found no version: the filter's
+    /// skips and the keys it let through that no block holds.
+    pub filter_queries: usize,
+    /// Lookups a filter answered absent, which read nothing.
+    pub filter_skips: usize,
+}
+
 /// The counts a table covering `first..=last` inherits from `inputs`, the
 /// tables a compaction rewrote into it.
 ///

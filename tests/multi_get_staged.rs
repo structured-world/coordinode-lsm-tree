@@ -1,0 +1,1839 @@
+// A multi-get reads a level stage by stage across its tables: the filter blocks
+// of every table in one batch, then their index blocks, then their data
+// blocks, instead of walking each table's filter and index before the next.
+
+use lsm_tree::{
+    AbstractTree, AnyTree, Cache, Config, SeqNo, SequenceNumberCounter, Slice,
+    config::{BlockSizePolicy, CompressionPolicy, LocatorPolicy, PinningPolicy},
+    fs::{
+        BlockRead, Fs, FsDirEntry, FsFile, FsMetadata, FsOpenOptions, QueuedRead, ReadDone,
+        ReadQueue, ReadWake, StdFs,
+    },
+    io,
+    runtime_config::RuntimeConfig,
+};
+use std::path::Path;
+use std::sync::{Arc, Mutex, PoisonError};
+
+/// The batched reads a backend was asked for, per call: its request count and
+/// the bytes those requests asked for.
+#[derive(Default)]
+struct Batches {
+    calls: Vec<(usize, u64)>,
+    /// The largest single request any call asked for.
+    largest: u64,
+    /// The call, counted from the last reset, the backend refuses.
+    refuse: Option<usize>,
+}
+
+/// A shared handle on a [`StageFs`]'s record.
+#[derive(Clone, Default)]
+struct Record(Arc<Mutex<Batches>>);
+
+impl Record {
+    fn lock(&self) -> std::sync::MutexGuard<'_, Batches> {
+        self.0.lock().unwrap_or_else(PoisonError::into_inner)
+    }
+
+    /// Forgets the calls so far and sets which call from now on is refused.
+    fn reset(&self, refuse: Option<usize>) {
+        let mut batches = self.lock();
+        batches.calls.clear();
+        batches.largest = 0;
+        batches.refuse = refuse;
+    }
+
+    fn calls(&self) -> Vec<(usize, u64)> {
+        self.lock().calls.clone()
+    }
+}
+
+/// A backend recording every batched read, delegating to [`StdFs`].
+struct StageFs(Record);
+
+impl Fs for StageFs {
+    fn read_blocks_batched(&self, reqs: &mut [BlockRead<'_>]) -> io::Result<()> {
+        let refused = {
+            let mut batches = self.0.lock();
+            let bytes = reqs.iter().map(|r| r.buf.capacity() as u64).sum();
+            batches.calls.push((reqs.len(), bytes));
+            let largest = reqs.iter().map(|r| r.buf.capacity() as u64).max();
+            batches.largest = batches.largest.max(largest.unwrap_or_default());
+            batches.refuse == Some(batches.calls.len() - 1)
+        };
+        if refused {
+            return Err(io::Error::new(
+                io::ErrorKind::PermissionDenied,
+                "batched read refused by the test backend",
+            ));
+        }
+        StdFs.read_blocks_batched(reqs)
+    }
+
+    fn open(&self, path: &Path, opts: &FsOpenOptions) -> io::Result<Box<dyn FsFile>> {
+        StdFs.open(path, opts)
+    }
+
+    fn create_dir_all(&self, path: &Path) -> io::Result<()> {
+        StdFs.create_dir_all(path)
+    }
+
+    fn read_dir(&self, path: &Path) -> io::Result<Vec<FsDirEntry>> {
+        StdFs.read_dir(path)
+    }
+
+    fn remove_file(&self, path: &Path) -> io::Result<()> {
+        StdFs.remove_file(path)
+    }
+
+    fn remove_dir_all(&self, path: &Path) -> io::Result<()> {
+        StdFs.remove_dir_all(path)
+    }
+
+    fn rename(&self, from: &Path, to: &Path) -> io::Result<()> {
+        StdFs.rename(from, to)
+    }
+
+    fn metadata(&self, path: &Path) -> io::Result<FsMetadata> {
+        StdFs.metadata(path)
+    }
+
+    fn sync_directory(&self, path: &Path) -> io::Result<()> {
+        StdFs.sync_directory(path)
+    }
+
+    fn exists(&self, path: &Path) -> io::Result<bool> {
+        StdFs.exists(path)
+    }
+}
+
+/// How a table lays out the blocks a point read goes through.
+#[derive(Clone, Copy, Debug)]
+enum Shape {
+    /// One filter block and one index block per table.
+    Whole,
+    /// Partitioned filter and index, with small partitions and no locator, so
+    /// a read goes through a filter partition and an index partition.
+    Partitioned,
+}
+
+const SHAPES: [Shape; 2] = [Shape::Whole, Shape::Partitioned];
+
+const LARGE_CACHE: u64 = 64 * 1_024 * 1_024;
+
+/// A tree of `tables` level-0 tables, each holding its own key range, with
+/// filters and indexes read on demand rather than pinned, reopened cold with a
+/// cache of `cache_bytes`; and the keys a batch reads: two present and one
+/// absent per table.
+fn tree(
+    dir: &Path,
+    shape: Shape,
+    tables: u32,
+    cache_bytes: u64,
+    record: &Record,
+) -> lsm_tree::Result<(AnyTree, Vec<String>)> {
+    tree_on(
+        dir,
+        shape,
+        tables,
+        cache_bytes,
+        &(Arc::new(StageFs(record.clone())) as Arc<dyn Fs>),
+    )
+}
+
+/// [`tree`] on the backend `fs`.
+fn tree_on(
+    dir: &Path,
+    shape: Shape,
+    tables: u32,
+    cache_bytes: u64,
+    fs: &Arc<dyn Fs>,
+) -> lsm_tree::Result<(AnyTree, Vec<String>)> {
+    tree_tuned(dir, shape, tables, cache_bytes, fs, &|config| config)
+}
+
+/// [`tree_on`], with `tune` applied to the configuration it opens with.
+fn tree_tuned(
+    dir: &Path,
+    shape: Shape,
+    tables: u32,
+    cache_bytes: u64,
+    fs: &Arc<dyn Fs>,
+    tune: &dyn Fn(Config) -> Config,
+) -> lsm_tree::Result<(AnyTree, Vec<String>)> {
+    let config = || {
+        let config = Config::new(
+            dir,
+            SequenceNumberCounter::default(),
+            SequenceNumberCounter::default(),
+        )
+        .with_shared_fs(Arc::clone(fs))
+        .use_cache(Arc::new(Cache::with_capacity_bytes(cache_bytes)))
+        .filter_block_pinning_policy(PinningPolicy::all(false))
+        .index_block_pinning_policy(PinningPolicy::all(false))
+        .data_block_compression_policy(CompressionPolicy::all(lsm_tree::CompressionType::None))
+        .index_block_compression_policy(CompressionPolicy::all(lsm_tree::CompressionType::None));
+        let config = tune(config);
+        match shape {
+            Shape::Whole => config,
+            Shape::Partitioned => config
+                // The index partitions from its first entry, not only past the
+                // default size.
+                .with_runtime_config({
+                    let mut runtime = RuntimeConfig::default();
+                    runtime.index_partition_spill_threshold = 0;
+                    runtime
+                })
+                .filter_block_partitioning_policy(PinningPolicy::all(true))
+                .index_block_partitioning_policy(PinningPolicy::all(true))
+                .filter_block_partition_size_policy(BlockSizePolicy::all(128))
+                .index_block_partition_size_policy(BlockSizePolicy::all(128))
+                .data_block_size_policy(BlockSizePolicy::all(1_024))
+                .locator_policy(LocatorPolicy::disabled()),
+        }
+    };
+    {
+        let tree = config().open()?;
+        let mut seqno = 0;
+        for table in 0..tables {
+            for row in 0..200u32 {
+                tree.insert(format!("t{table:03}r{row:04}"), vec![b'v'; 64], seqno);
+                seqno += 1;
+            }
+            tree.flush_active_memtable(0)?;
+        }
+    }
+    let keys = (0..tables)
+        .flat_map(|table| {
+            [
+                format!("t{table:03}r0010"),
+                format!("t{table:03}r0150"),
+                format!("t{table:03}r0150x"),
+            ]
+        })
+        .collect();
+    Ok((config().open()?, keys))
+}
+
+/// The values a key-by-key read returns for `keys`.
+fn one_by_one(tree: &AnyTree, keys: &[String]) -> lsm_tree::Result<Vec<Option<Slice>>> {
+    keys.iter().map(|key| tree.get(key, SeqNo::MAX)).collect()
+}
+
+/// Every block byte the read charged went through a batch: nothing was read
+/// table by table on the side, and no block twice.
+#[cfg(feature = "metrics")]
+fn assert_batches_carry_every_read(tree: &AnyTree, calls: &[(usize, u64)], what: &str) {
+    let metrics = tree.metrics();
+    let charged = metrics.filter_block_io() + metrics.index_block_io() + metrics.data_block_io();
+    let batched: u64 = calls.iter().map(|&(_, bytes)| bytes).sum();
+    assert_eq!(charged, batched, "{what}: block bytes read outside a batch");
+}
+
+/// A cold level is read in as many batches whatever its table count: each
+/// stage asks for the blocks of every table in one batch. A per-table walk
+/// makes its filter and index reads one table after another, so its count
+/// grows with the tables.
+#[test]
+fn a_cold_level_is_read_in_as_many_batches_whatever_its_table_count() -> lsm_tree::Result<()> {
+    for shape in SHAPES {
+        let mut depth = None;
+        for tables in [1u32, 4, 16] {
+            let dir = tempfile::tempdir()?;
+            let record = Record::default();
+            let (tree, keys) = tree(dir.path(), shape, tables, LARGE_CACHE, &record)?;
+            record.reset(None);
+
+            let values = tree.multi_get(&keys, SeqNo::MAX)?;
+            let calls = record.calls();
+            let what = format!("{shape:?}, {tables} tables");
+            #[cfg(feature = "metrics")]
+            {
+                assert_batches_carry_every_read(&tree, &calls, &what);
+                assert!(tree.metrics().filter_block_io() > 0, "{what}: filters read");
+                if let Shape::Partitioned = shape {
+                    assert!(tree.metrics().index_block_io() > 0, "{what}: indexes read");
+                }
+            }
+            assert!(
+                calls.len() >= 2,
+                "{what}: a metadata stage and data, got {calls:?}"
+            );
+            assert!(
+                calls[0].0 >= tables as usize,
+                "{what}: the first stage asks every table at once, got {calls:?}"
+            );
+            match depth {
+                None => depth = Some(calls.len()),
+                Some(depth) => assert_eq!(calls.len(), depth, "{what}: {calls:?}"),
+            }
+
+            assert_eq!(values, one_by_one(&tree, &keys)?, "{what}");
+            assert_eq!(
+                values.iter().filter(|v| v.is_some()).count(),
+                2 * tables as usize,
+                "{what}: the present keys resolve, the absent ones do not"
+            );
+        }
+    }
+    Ok(())
+}
+
+/// The partitioned shape reads its index by partition: one key reads less of
+/// the index than keys spread over the whole table. A whole index is one
+/// block, read in full for any key, and would read the same for both; the
+/// partitioned cases above would then not reach an index partition at all.
+#[cfg(feature = "metrics")]
+#[test]
+fn the_partitioned_shape_reads_its_index_by_partition() -> lsm_tree::Result<()> {
+    let dir = tempfile::tempdir()?;
+    let record = Record::default();
+    let (tree, _) = tree(dir.path(), Shape::Partitioned, 1, 0, &record)?;
+    let index_read = |keys: &[String]| -> lsm_tree::Result<u64> {
+        let before = tree.metrics().index_block_io();
+        tree.multi_get(keys, SeqNo::MAX)?;
+        Ok(tree.metrics().index_block_io() - before)
+    };
+    let one = index_read(&["t000r0100".to_owned()])?;
+    let spread: Vec<String> = (0..200)
+        .step_by(10)
+        .map(|row| format!("t000r{row:04}"))
+        .collect();
+    let many = index_read(&spread)?;
+    assert!(one > 0, "the index was read");
+    assert!(
+        many > one,
+        "one key read {one} index bytes, keys over the whole table {many}"
+    );
+    Ok(())
+}
+
+/// The load counters see a staged read as they see a block loaded on its own:
+/// each block the batches read counts one load from disk, and each block a
+/// warm read takes from the cache counts one cache hit, so the hit rates stay
+/// true on the multi-get path.
+#[cfg(feature = "metrics")]
+#[test]
+fn a_staged_read_counts_its_loads_and_cache_hits() -> lsm_tree::Result<()> {
+    for shape in SHAPES {
+        let dir = tempfile::tempdir()?;
+        let record = Record::default();
+        let (tree, keys) = tree(dir.path(), shape, 4, LARGE_CACHE, &record)?;
+        record.reset(None);
+
+        let metrics = tree.metrics();
+        let io = metrics.block_load_io_count();
+        tree.multi_get(&keys, SeqNo::MAX)?;
+        let read: usize = record.calls().iter().map(|&(requests, _)| requests).sum();
+        assert_eq!(
+            read,
+            metrics.block_load_io_count() - io,
+            "{shape:?}: a load per block read"
+        );
+
+        let (io, cached_cold) = (
+            metrics.block_load_io_count(),
+            metrics.block_load_cached_count(),
+        );
+        tree.multi_get(&keys, SeqNo::MAX)?;
+        assert_eq!(
+            io,
+            metrics.block_load_io_count(),
+            "{shape:?}: a warm read loads nothing"
+        );
+        assert!(
+            metrics.block_load_cached_count() > cached_cold,
+            "{shape:?}: a warm read counts its cache hits"
+        );
+    }
+    Ok(())
+}
+
+/// A Page-ECC table in a level leaves only itself to its own load path: the
+/// level's other tables are still read stage by stage in batches, and the
+/// answer is the key-by-key one.
+#[cfg(feature = "page_ecc")]
+#[test]
+fn a_page_ecc_table_leaves_the_rest_of_its_level_staged() -> lsm_tree::Result<()> {
+    use lsm_tree::runtime_config::EccScheme;
+
+    let dir = tempfile::tempdir()?;
+    let record = Record::default();
+    let config = |ecc: bool| {
+        Config::new(
+            dir.path(),
+            SequenceNumberCounter::default(),
+            SequenceNumberCounter::default(),
+        )
+        .with_shared_fs(Arc::new(StageFs(record.clone())))
+        .use_cache(Arc::new(Cache::with_capacity_bytes(0)))
+        .filter_block_pinning_policy(PinningPolicy::all(false))
+        .index_block_pinning_policy(PinningPolicy::all(false))
+        .page_ecc(ecc)
+        .ecc_scheme(EccScheme::Secded)
+    };
+    for (table, ecc) in [(0u32, false), (1, true), (2, false)] {
+        let tree = config(ecc).open()?;
+        for row in 0..200u32 {
+            tree.insert(
+                format!("t{table:03}r{row:04}"),
+                vec![b'v'; 64],
+                u64::from(table * 1_000 + row),
+            );
+        }
+        tree.flush_active_memtable(0)?;
+    }
+    let tree = config(false).open()?;
+    let keys: Vec<String> = (0..3u32)
+        .flat_map(|table| [format!("t{table:03}r0010"), format!("t{table:03}r0150")])
+        .collect();
+    record.reset(None);
+
+    let values = tree.multi_get(&keys, SeqNo::MAX)?;
+    let calls = record.calls();
+    assert!(
+        calls.first().is_some_and(|&(requests, _)| requests >= 2),
+        "the plain tables' filters are read in one batch, got {calls:?}"
+    );
+    // Past the filter and index batches, the plain tables' data blocks are
+    // read in batches too, rather than the level handed to the serial path.
+    assert!(
+        calls.len() > 2,
+        "the plain tables' data blocks are read in batches, got {calls:?}"
+    );
+    assert_eq!(values, one_by_one(&tree, &keys)?);
+    assert!(values.iter().all(Option::is_some));
+    Ok(())
+}
+
+/// A warm level reads nothing: the filter and index blocks the first read
+/// fetched, and the data blocks it kept, are all taken from the cache.
+#[test]
+fn a_warm_level_reads_nothing() -> lsm_tree::Result<()> {
+    for shape in SHAPES {
+        let dir = tempfile::tempdir()?;
+        let record = Record::default();
+        let (tree, keys) = tree(dir.path(), shape, 4, LARGE_CACHE, &record)?;
+        let cold = tree.multi_get(&keys, SeqNo::MAX)?;
+        record.reset(None);
+
+        let warm = tree.multi_get(&keys, SeqNo::MAX)?;
+        let calls = record.calls();
+        assert!(
+            calls.is_empty(),
+            "{shape:?}: a warm level asked for {calls:?}"
+        );
+        assert_eq!(cold, warm, "{shape:?}");
+    }
+    Ok(())
+}
+
+/// With a cache that keeps nothing, the read answers from the blocks its
+/// stages fetched, each read once: going back to the cache for a block the
+/// read just fetched would find it gone and read it again.
+#[test]
+fn a_level_is_answered_from_what_it_read_when_the_cache_keeps_nothing() -> lsm_tree::Result<()> {
+    for shape in SHAPES {
+        let dir = tempfile::tempdir()?;
+        let record = Record::default();
+        let (tree, keys) = tree(dir.path(), shape, 4, 0, &record)?;
+        record.reset(None);
+
+        let values = tree.multi_get(&keys, SeqNo::MAX)?;
+        let calls = record.calls();
+        assert!(
+            calls.first().is_some_and(|&(requests, _)| requests >= 4),
+            "{shape:?}: the first stage asks every table at once, got {calls:?}"
+        );
+        #[cfg(feature = "metrics")]
+        assert_batches_carry_every_read(&tree, &calls, &format!("{shape:?}"));
+
+        assert_eq!(values, one_by_one(&tree, &keys)?, "{shape:?}");
+    }
+    Ok(())
+}
+
+/// A batch the backend refuses, at any stage, leaves the tables it was for to
+/// the serial path, which reads the same blocks one by one: the answer is
+/// unchanged.
+#[test]
+fn a_refused_stage_still_answers_the_query() -> lsm_tree::Result<()> {
+    for shape in SHAPES {
+        let depth = {
+            let dir = tempfile::tempdir()?;
+            let record = Record::default();
+            let (tree, keys) = tree(dir.path(), shape, 4, LARGE_CACHE, &record)?;
+            record.reset(None);
+            tree.multi_get(&keys, SeqNo::MAX)?;
+            record.calls().len()
+        };
+        for refused in 0..depth {
+            let dir = tempfile::tempdir()?;
+            let record = Record::default();
+            let (tree, keys) = tree(dir.path(), shape, 4, LARGE_CACHE, &record)?;
+            record.reset(Some(refused));
+
+            let values = tree.multi_get(&keys, SeqNo::MAX)?;
+            let what = format!("{shape:?}, batch {refused} of {depth} refused");
+            assert!(
+                record.calls().len() > refused,
+                "{what}: the batch was asked"
+            );
+            assert_eq!(values, one_by_one(&tree, &keys)?, "{what}");
+            assert_eq!(
+                values.iter().filter(|v| v.is_some()).count(),
+                8,
+                "{what}: every present key resolves"
+            );
+        }
+    }
+    Ok(())
+}
+
+/// A read that fails at any point of a cold level read, in the filter, the
+/// index or the data stage, leaves the tables it was for to the serial path,
+/// which reads them again: under the fault-injection filesystem, one failed
+/// read at every position in turn, the answer is always the key-by-key one.
+#[test]
+fn a_read_failing_at_any_stage_under_fault_injection_still_answers() -> lsm_tree::Result<()> {
+    use lsm_tree::fs::{Fault, FaultFs, FaultOp, FaultRule};
+
+    let reads = |skip: Option<u64>| -> lsm_tree::Result<(usize, bool)> {
+        let dir = tempfile::tempdir()?;
+        let faulty = FaultFs::new(StdFs);
+        let injector = faulty.injector();
+        let fs: Arc<dyn Fs> = Arc::new(faulty);
+        let (tree, keys) = tree_on(dir.path(), Shape::Partitioned, 4, LARGE_CACHE, &fs)?;
+        if let Some(skip) = skip {
+            injector.arm(
+                FaultRule::new(
+                    FaultOp::ReadAt,
+                    Fault::Error(io::ErrorKind::PermissionDenied),
+                )
+                .skip(skip)
+                .once(),
+            );
+        }
+        let before = injector.read_count();
+        let values = tree.multi_get(&keys, SeqNo::MAX)?;
+        let count = injector.read_count() - before;
+        injector.clear();
+        Ok((count, values == one_by_one(&tree, &keys)?))
+    };
+    let (count, agree) = reads(None)?;
+    assert!(agree);
+    assert!(count > 2, "a cold level read reads its stages, got {count}");
+    for skip in 0..count as u64 {
+        let (_, agree) = reads(Some(skip))?;
+        assert!(agree, "read {skip} of {count} failed");
+    }
+    Ok(())
+}
+
+/// A key whose newest version an earlier level-0 run holds at the read's
+/// ceiling needs nothing from the later runs, so a later table that cannot be
+/// read does not fail the batch: a key-by-key read never touches it either.
+#[test]
+fn an_unreadable_older_table_behind_a_ceiling_hit_does_not_fail_the_batch() -> lsm_tree::Result<()>
+{
+    use lsm_tree::fs::{Fault, FaultFs, FaultOp, FaultRule};
+
+    let dir = tempfile::tempdir()?;
+    let config = |fs: Arc<dyn Fs>| {
+        Config::new(
+            dir.path(),
+            SequenceNumberCounter::default(),
+            SequenceNumberCounter::default(),
+        )
+        .with_shared_fs(fs)
+        .use_cache(Arc::new(Cache::with_capacity_bytes(0)))
+        .filter_block_pinning_policy(PinningPolicy::all(false))
+        .index_block_pinning_policy(PinningPolicy::all(false))
+    };
+    let older = {
+        let tree = config(Arc::new(StdFs)).open()?;
+        tree.insert("k", "old", 1);
+        tree.flush_active_memtable(0)?;
+        let older = std::fs::read_dir(dir.path().join("tables"))?
+            .filter_map(Result::ok)
+            .map(|entry| entry.path())
+            .find(|path| path.is_file())
+            .expect("the first flush wrote a table");
+        // Keys the older table's range does not reach, so the batch is large
+        // enough for the batched read.
+        tree.insert("h", "new", 2);
+        tree.insert("j", "new", 3);
+        tree.insert("k", "new", 4);
+        tree.flush_active_memtable(0)?;
+        older
+    };
+    let faulty = FaultFs::new(StdFs);
+    let injector = faulty.injector();
+    let tree = config(Arc::new(faulty)).open()?;
+    injector.arm(
+        FaultRule::new(
+            FaultOp::ReadAt,
+            Fault::Error(io::ErrorKind::PermissionDenied),
+        )
+        .on_path(older.display().to_string()),
+    );
+
+    // Read at the newest version's ceiling: nothing older can beat it.
+    let keys = ["h", "j", "k"];
+    let one: Vec<Option<Slice>> = keys
+        .iter()
+        .map(|key| tree.get(key, 5))
+        .collect::<lsm_tree::Result<_>>()?;
+    assert_eq!(one[2].as_deref(), Some(&b"new"[..]), "a point read answers");
+    assert_eq!(tree.multi_get(keys, 5)?, one);
+    // Above the ceiling the older table may hold a newer version: the batch
+    // fails as the point read does.
+    assert!(tree.get("k", SeqNo::MAX).is_err(), "a point read fails");
+    assert!(tree.multi_get(keys, SeqNo::MAX).is_err(), "the batch fails");
+    Ok(())
+}
+
+/// A level whose batched read fails after an earlier chunk answered some of
+/// its keys is read serially as if nothing had been answered: a key the newer
+/// level-0 table holds at the read's ceiling still skips the older table, so
+/// one unreadable data block there fails neither the key nor the batch.
+#[test]
+fn a_batched_read_failing_after_a_ceiling_hit_was_answered_does_not_fail_the_batch()
+-> lsm_tree::Result<()> {
+    use lsm_tree::fs::{Fault, FaultFs, FaultOp, FaultRule};
+
+    let dir = tempfile::tempdir()?;
+    let config = |fs: Arc<dyn Fs>| {
+        Config::new(
+            dir.path(),
+            SequenceNumberCounter::default(),
+            SequenceNumberCounter::default(),
+        )
+        .with_shared_fs(fs)
+        // A cache that keeps nothing reads every data block in its own chunk.
+        .use_cache(Arc::new(Cache::with_capacity_bytes(0)))
+        .filter_block_pinning_policy(PinningPolicy::all(false))
+        .index_block_pinning_policy(PinningPolicy::all(false))
+    };
+    let older = {
+        let tree = config(Arc::new(StdFs)).open()?;
+        tree.insert("k", "old", 1);
+        tree.flush_active_memtable(0)?;
+        let older = std::fs::read_dir(dir.path().join("tables"))?
+            .filter_map(Result::ok)
+            .map(|entry| entry.path())
+            .find(|path| path.is_file())
+            .expect("the first flush wrote a table");
+        tree.insert("h", "new", 2);
+        tree.insert("j", "new", 3);
+        tree.insert("k", "new", 4);
+        tree.flush_active_memtable(0)?;
+        older
+    };
+    let faulty = FaultFs::new(StdFs);
+    let injector = faulty.injector();
+    let tree = config(Arc::new(faulty)).open()?;
+
+    // Read at the newest version's ceiling: nothing older can beat it.
+    let keys = ["h", "j", "k"];
+    let one: Vec<Option<Slice>> = keys
+        .iter()
+        .map(|key| tree.get(key, 5))
+        .collect::<lsm_tree::Result<_>>()?;
+    assert_eq!(one[2].as_deref(), Some(&b"new"[..]), "a point read answers");
+    // The older table becomes unreadable from each of its reads in turn: its
+    // filter, its index and the data block holding its version of `k`.
+    for skip in 0..4 {
+        injector.arm(
+            FaultRule::new(
+                FaultOp::ReadAt,
+                Fault::Error(io::ErrorKind::PermissionDenied),
+            )
+            .on_path(older.display().to_string())
+            .skip(skip),
+        );
+        let values = tree.multi_get(keys, 5);
+        injector.clear();
+        assert!(
+            values.as_ref().is_ok_and(|values| *values == one),
+            "unreadable from read {skip} of the older table: {values:?}"
+        );
+    }
+    Ok(())
+}
+
+/// A read that fails at any point of a cold level read hands the tables it
+/// was for, or the level, to the serial path, which answers the filters
+/// again: what the filters answered is counted once, as in a batch nothing
+/// failed in.
+#[cfg(feature = "metrics")]
+#[test]
+fn a_read_failing_at_any_stage_counts_the_filters_once() -> lsm_tree::Result<()> {
+    use lsm_tree::fs::{Fault, FaultFs, FaultOp, FaultRule};
+
+    let counted = |skip: Option<u64>| -> lsm_tree::Result<(usize, usize, usize)> {
+        let dir = tempfile::tempdir()?;
+        let faulty = FaultFs::new(StdFs);
+        let injector = faulty.injector();
+        let fs: Arc<dyn Fs> = Arc::new(faulty);
+        let (tree, keys) = tree_on(dir.path(), Shape::Partitioned, 4, LARGE_CACHE, &fs)?;
+        if let Some(skip) = skip {
+            injector.arm(
+                FaultRule::new(
+                    FaultOp::ReadAt,
+                    Fault::Error(io::ErrorKind::PermissionDenied),
+                )
+                .skip(skip)
+                .once(),
+            );
+        }
+        let metrics = tree.metrics();
+        let (queries, skips) = (metrics.filter_queries(), metrics.io_skipped_by_filter());
+        let reads = injector.read_count();
+        tree.multi_get(&keys, SeqNo::MAX)?;
+        let count = injector.read_count() - reads;
+        injector.clear();
+        Ok((
+            metrics.filter_queries() - queries,
+            metrics.io_skipped_by_filter() - skips,
+            count,
+        ))
+    };
+    let (queries, skips, count) = counted(None)?;
+    assert!(skips > 0, "some key of the batch is filtered out");
+    for skip in 0..count as u64 {
+        let (q, s, _) = counted(Some(skip))?;
+        assert_eq!((q, s), (queries, skips), "read {skip} of {count} failed");
+    }
+    Ok(())
+}
+
+/// A key the filter lets through that the read finds no version of is a
+/// filter query, as a point read counts one: the batch counts the same
+/// queries as the keys read one by one.
+#[cfg(feature = "metrics")]
+#[test]
+fn a_batch_counts_the_filter_queries_its_keys_read_one_by_one_count() -> lsm_tree::Result<()> {
+    let dir = tempfile::tempdir()?;
+    let tree = Config::new(
+        dir.path(),
+        SequenceNumberCounter::default(),
+        SequenceNumberCounter::default(),
+    )
+    .use_cache(Arc::new(Cache::with_capacity_bytes(0)))
+    .filter_block_pinning_policy(PinningPolicy::all(false))
+    .index_block_pinning_policy(PinningPolicy::all(false))
+    .open()?;
+    tree.insert("a", "v", 1);
+    tree.insert("b", "v", 2);
+    // Present in the table, but newer than the snapshot read below: the
+    // filter lets it through and the read finds no version it can see.
+    tree.insert("c", "v", 6);
+    tree.flush_active_memtable(0)?;
+    let keys = ["a", "b", "c"];
+    let queries = || tree.metrics().filter_queries();
+
+    let before = queries();
+    for key in keys {
+        tree.get(key, 4)?;
+    }
+    let one_by_one = queries() - before;
+    assert!(one_by_one > 0, "the hidden key is a filter query");
+
+    let before = queries();
+    tree.multi_get(keys, 4)?;
+    assert_eq!(queries() - before, one_by_one);
+    Ok(())
+}
+
+/// What a [`SlowFirstFs`] saw: the reads submitted before its queue was first
+/// waited on, and the reads submitted by the time the first of them finished.
+#[derive(Default)]
+struct SlowFirst {
+    initial: Option<usize>,
+    submitted_when_first_finished: Option<usize>,
+}
+
+/// A backend whose read queue holds the first read it is given until no other
+/// read is left, and finishes the others one per wait, newest first: a slow
+/// file in the same stage as fast ones.
+struct SlowFirstFs(Arc<Mutex<SlowFirst>>);
+
+/// The queue of a [`SlowFirstFs`].
+struct SlowFirstQueue {
+    seen: Arc<Mutex<SlowFirst>>,
+    /// Reads not yet finished, each with its submission number.
+    pending: Vec<(usize, QueuedRead)>,
+    submitted: usize,
+}
+
+impl ReadQueue for SlowFirstQueue {
+    fn submit(&mut self, read: QueuedRead) {
+        self.pending.push((self.submitted, read));
+        self.submitted += 1;
+    }
+
+    fn outstanding(&self) -> usize {
+        self.pending.len()
+    }
+
+    fn wait(&mut self, min: usize, on_done: &mut dyn FnMut(ReadDone)) {
+        {
+            let mut seen = self.seen.lock().unwrap_or_else(PoisonError::into_inner);
+            seen.initial.get_or_insert(self.submitted);
+        }
+        let mut handed = 0;
+        while handed < min && !self.pending.is_empty() {
+            let pick = self
+                .pending
+                .iter()
+                .rposition(|&(number, _)| number != 0)
+                .unwrap_or(0);
+            let (number, mut read) = self.pending.remove(pick);
+            if number == 0 {
+                let mut seen = self.seen.lock().unwrap_or_else(PoisonError::into_inner);
+                seen.submitted_when_first_finished = Some(self.submitted);
+            }
+            let want = read.buf.len();
+            let result = match read.file.read_at(&mut read.buf, read.offset) {
+                Ok(n) if n == want => Ok(()),
+                Ok(_) => Err(io::Error::new(io::ErrorKind::UnexpectedEof, "short read")),
+                Err(error) => Err(error),
+            };
+            on_done(ReadDone {
+                tag: read.tag,
+                buf: read.buf,
+                result,
+            });
+            handed += 1;
+        }
+    }
+}
+
+impl Fs for SlowFirstFs {
+    fn read_queue(&self) -> Box<dyn ReadQueue + '_> {
+        Box::new(SlowFirstQueue {
+            seen: Arc::clone(&self.0),
+            pending: Vec::new(),
+            submitted: 0,
+        })
+    }
+
+    fn open(&self, path: &Path, opts: &FsOpenOptions) -> io::Result<Box<dyn FsFile>> {
+        StdFs.open(path, opts)
+    }
+
+    fn create_dir_all(&self, path: &Path) -> io::Result<()> {
+        StdFs.create_dir_all(path)
+    }
+
+    fn read_dir(&self, path: &Path) -> io::Result<Vec<FsDirEntry>> {
+        StdFs.read_dir(path)
+    }
+
+    fn remove_file(&self, path: &Path) -> io::Result<()> {
+        StdFs.remove_file(path)
+    }
+
+    fn remove_dir_all(&self, path: &Path) -> io::Result<()> {
+        StdFs.remove_dir_all(path)
+    }
+
+    fn rename(&self, from: &Path, to: &Path) -> io::Result<()> {
+        StdFs.rename(from, to)
+    }
+
+    fn metadata(&self, path: &Path) -> io::Result<FsMetadata> {
+        StdFs.metadata(path)
+    }
+
+    fn sync_directory(&self, path: &Path) -> io::Result<()> {
+        StdFs.sync_directory(path)
+    }
+
+    fn exists(&self, path: &Path) -> io::Result<bool> {
+        StdFs.exists(path)
+    }
+}
+
+/// A table whose blocks are back asks for its next stage while a slower file
+/// of the same stage is still being read: the first stage's reads are not a
+/// barrier the whole level waits behind.
+#[test]
+fn a_table_moves_on_while_a_slower_file_of_its_stage_is_read() -> lsm_tree::Result<()> {
+    let dir = tempfile::tempdir()?;
+    let seen = Arc::new(Mutex::new(SlowFirst::default()));
+    let fs: Arc<dyn Fs> = Arc::new(SlowFirstFs(Arc::clone(&seen)));
+    // No cache, so every table's index is read in a stage after its filter.
+    let (tree, keys) = tree_on(dir.path(), Shape::Whole, 4, 0, &fs)?;
+    *seen.lock().unwrap_or_else(PoisonError::into_inner) = SlowFirst::default();
+
+    let values = tree.multi_get(&keys, SeqNo::MAX)?;
+    let seen = seen.lock().unwrap_or_else(PoisonError::into_inner);
+    let initial = seen.initial.expect("the level was read through the queue");
+    let submitted = seen
+        .submitted_when_first_finished
+        .expect("the held read finished");
+    assert!(
+        submitted > initial,
+        "the tables whose first stage was back waited for the slow file: \
+         {initial} reads before the first wait, still {submitted} when it finished"
+    );
+    drop(seen);
+    assert_eq!(values, one_by_one(&tree, &keys)?);
+    Ok(())
+}
+
+/// What the backends of a [`WakeFs`] pair share: how many queues they opened,
+/// whether the fast one took a read after one of its reads was back, and
+/// whether the slow one's first read was let go by that or by its timeout.
+#[derive(Default)]
+struct Pair {
+    /// Whether the first queue opened is slow.
+    slow_first: bool,
+    queues: usize,
+    fast_moved_on: bool,
+    slow_released_by_progress: Option<bool>,
+}
+
+#[derive(Default)]
+struct PairState {
+    pair: Mutex<Pair>,
+    moved: std::sync::Condvar,
+}
+
+impl PairState {
+    fn lock(&self) -> std::sync::MutexGuard<'_, Pair> {
+        self.pair.lock().unwrap_or_else(PoisonError::into_inner)
+    }
+}
+
+/// How long the slow queue holds its first read when nothing moves on.
+const SLOW_HOLD: std::time::Duration = std::time::Duration::from_secs(2);
+
+/// A backend whose queue reads on a thread of its own and wakes its waker
+/// after each read. With [`Pair::slow_first`], the first queue opened is
+/// slow: it holds its first read
+/// until the other queue takes a read after one of its own was back, or until
+/// [`SLOW_HOLD`] passes. The others read each block after a short delay.
+struct WakeFs(Arc<PairState>);
+
+/// The queue of a [`WakeFs`].
+struct WakeQueue {
+    slow: bool,
+    state: Arc<PairState>,
+    to_worker: Option<std::sync::mpsc::Sender<QueuedRead>>,
+    from_worker: std::sync::mpsc::Receiver<ReadDone>,
+    wake: Arc<Mutex<Option<Arc<dyn ReadWake>>>>,
+    worker: Option<std::thread::JoinHandle<()>>,
+    outstanding: usize,
+    handed_any: bool,
+}
+
+impl WakeQueue {
+    fn new(state: Arc<PairState>) -> Self {
+        let slow = {
+            let mut pair = state.lock();
+            pair.queues += 1;
+            pair.slow_first && pair.queues == 1
+        };
+        let (to_worker, reads) = std::sync::mpsc::channel::<QueuedRead>();
+        let (done, from_worker) = std::sync::mpsc::channel();
+        let wake: Arc<Mutex<Option<Arc<dyn ReadWake>>>> = Arc::default();
+        let worker = {
+            let state = Arc::clone(&state);
+            let wake = Arc::clone(&wake);
+            std::thread::spawn(move || {
+                let mut first = true;
+                for mut read in reads {
+                    if slow && first {
+                        let pair = state.lock();
+                        let (mut pair, _) = state
+                            .moved
+                            .wait_timeout_while(pair, SLOW_HOLD, |pair| !pair.fast_moved_on)
+                            .unwrap_or_else(PoisonError::into_inner);
+                        pair.slow_released_by_progress = Some(pair.fast_moved_on);
+                    } else if !slow {
+                        std::thread::sleep(std::time::Duration::from_millis(20));
+                    }
+                    first = false;
+                    let want = read.buf.len();
+                    let result = match read.file.read_at(&mut read.buf, read.offset) {
+                        Ok(n) if n == want => Ok(()),
+                        Ok(_) => Err(io::Error::new(io::ErrorKind::UnexpectedEof, "short read")),
+                        Err(error) => Err(error),
+                    };
+                    if done
+                        .send(ReadDone {
+                            tag: read.tag,
+                            buf: read.buf,
+                            result,
+                        })
+                        .is_err()
+                    {
+                        return;
+                    }
+                    let waker = wake.lock().unwrap_or_else(PoisonError::into_inner).clone();
+                    if let Some(waker) = waker {
+                        waker.wake();
+                    }
+                }
+            })
+        };
+        Self {
+            slow,
+            state,
+            to_worker: Some(to_worker),
+            from_worker,
+            wake,
+            worker: Some(worker),
+            outstanding: 0,
+            handed_any: false,
+        }
+    }
+}
+
+impl ReadQueue for WakeQueue {
+    fn submit(&mut self, read: QueuedRead) {
+        if !self.slow && self.handed_any {
+            self.state.lock().fast_moved_on = true;
+            self.state.moved.notify_all();
+        }
+        if let Some(to_worker) = &self.to_worker
+            && to_worker.send(read).is_ok()
+        {
+            self.outstanding += 1;
+        }
+    }
+
+    fn outstanding(&self) -> usize {
+        self.outstanding
+    }
+
+    fn wait(&mut self, min: usize, on_done: &mut dyn FnMut(ReadDone)) {
+        let mut handed = 0;
+        while self.outstanding > 0 {
+            let next = if handed < min {
+                self.from_worker.recv().ok()
+            } else {
+                self.from_worker.try_recv().ok()
+            };
+            let Some(done) = next else {
+                break;
+            };
+            self.outstanding -= 1;
+            self.handed_any = true;
+            handed += 1;
+            on_done(done);
+        }
+    }
+
+    fn held(&self) -> usize {
+        // Its worker reads every read on its own.
+        0
+    }
+
+    fn set_wake(&mut self, wake: Arc<dyn ReadWake>) -> bool {
+        *self.wake.lock().unwrap_or_else(PoisonError::into_inner) = Some(wake);
+        true
+    }
+}
+
+/// A backend whose queue takes a wake but reads only while waited on for a
+/// read: every read it holds is one only a wait carries out.
+struct HoldingFs;
+
+/// The queue of a [`HoldingFs`].
+struct HoldingQueue(Vec<QueuedRead>);
+
+impl ReadQueue for HoldingQueue {
+    fn submit(&mut self, read: QueuedRead) {
+        self.0.push(read);
+    }
+
+    fn outstanding(&self) -> usize {
+        self.0.len()
+    }
+
+    fn wait(&mut self, min: usize, on_done: &mut dyn FnMut(ReadDone)) {
+        if min == 0 {
+            return;
+        }
+        for mut read in core::mem::take(&mut self.0) {
+            let want = read.buf.len();
+            let result = match read.file.read_at(&mut read.buf, read.offset) {
+                Ok(n) if n == want => Ok(()),
+                Ok(_) => Err(io::Error::new(io::ErrorKind::UnexpectedEof, "short read")),
+                Err(error) => Err(error),
+            };
+            on_done(ReadDone {
+                tag: read.tag,
+                buf: read.buf,
+                result,
+            });
+        }
+    }
+
+    fn set_wake(&mut self, _wake: Arc<dyn ReadWake>) -> bool {
+        true
+    }
+}
+
+impl Fs for HoldingFs {
+    fn read_queue(&self) -> Box<dyn ReadQueue + '_> {
+        Box::new(HoldingQueue(Vec::new()))
+    }
+
+    fn open(&self, path: &Path, opts: &FsOpenOptions) -> io::Result<Box<dyn FsFile>> {
+        StdFs.open(path, opts)
+    }
+
+    fn create_dir_all(&self, path: &Path) -> io::Result<()> {
+        StdFs.create_dir_all(path)
+    }
+
+    fn read_dir(&self, path: &Path) -> io::Result<Vec<FsDirEntry>> {
+        StdFs.read_dir(path)
+    }
+
+    fn remove_file(&self, path: &Path) -> io::Result<()> {
+        StdFs.remove_file(path)
+    }
+
+    fn remove_dir_all(&self, path: &Path) -> io::Result<()> {
+        StdFs.remove_dir_all(path)
+    }
+
+    fn rename(&self, from: &Path, to: &Path) -> io::Result<()> {
+        StdFs.rename(from, to)
+    }
+
+    fn metadata(&self, path: &Path) -> io::Result<FsMetadata> {
+        StdFs.metadata(path)
+    }
+
+    fn sync_directory(&self, path: &Path) -> io::Result<()> {
+        StdFs.sync_directory(path)
+    }
+
+    fn exists(&self, path: &Path) -> io::Result<bool> {
+        StdFs.exists(path)
+    }
+}
+
+/// A level on two backends whose queues take a wake but hold their reads for
+/// a wait is waited on through them: the level does not sleep on a wake no
+/// read of theirs gives.
+#[test]
+fn a_level_on_queues_holding_their_reads_for_a_wait_is_read() -> lsm_tree::Result<()> {
+    let dir = tempfile::tempdir()?;
+    let primary: Arc<dyn Fs> = Arc::new(HoldingFs);
+    let routed: Arc<dyn Fs> = Arc::new(HoldingFs);
+    let (tree, keys) = two_backend_tree(dir.path(), &primary, &routed)?;
+    let expected = one_by_one(&tree, &keys)?;
+
+    let (answer, answered) = std::sync::mpsc::channel();
+    std::thread::spawn(move || {
+        answer.send(tree.multi_get(&keys, SeqNo::MAX)).ok();
+    });
+    let values = answered
+        .recv_timeout(std::time::Duration::from_secs(20))
+        .expect("the batch was answered, not left sleeping")?;
+    assert_eq!(values, expected);
+    Ok(())
+}
+
+impl Drop for WakeQueue {
+    fn drop(&mut self) {
+        self.to_worker = None;
+        if let Some(worker) = self.worker.take() {
+            worker.join().expect("the queue's worker panicked");
+        }
+    }
+}
+
+impl Fs for WakeFs {
+    fn read_queue(&self) -> Box<dyn ReadQueue + '_> {
+        Box::new(WakeQueue::new(Arc::clone(&self.0)))
+    }
+
+    fn open(&self, path: &Path, opts: &FsOpenOptions) -> io::Result<Box<dyn FsFile>> {
+        StdFs.open(path, opts)
+    }
+
+    fn create_dir_all(&self, path: &Path) -> io::Result<()> {
+        StdFs.create_dir_all(path)
+    }
+
+    fn read_dir(&self, path: &Path) -> io::Result<Vec<FsDirEntry>> {
+        StdFs.read_dir(path)
+    }
+
+    fn remove_file(&self, path: &Path) -> io::Result<()> {
+        StdFs.remove_file(path)
+    }
+
+    fn remove_dir_all(&self, path: &Path) -> io::Result<()> {
+        StdFs.remove_dir_all(path)
+    }
+
+    fn rename(&self, from: &Path, to: &Path) -> io::Result<()> {
+        StdFs.rename(from, to)
+    }
+
+    fn metadata(&self, path: &Path) -> io::Result<FsMetadata> {
+        StdFs.metadata(path)
+    }
+
+    fn sync_directory(&self, path: &Path) -> io::Result<()> {
+        StdFs.sync_directory(path)
+    }
+
+    fn exists(&self, path: &Path) -> io::Result<bool> {
+        StdFs.exists(path)
+    }
+}
+
+/// A level whose tables sit on two backends, as after its route moved and
+/// before compaction rewrote them: the blocks back from the fast backend move
+/// their tables on while the slow one still holds its first read, instead of
+/// the level waiting on the slow backend.
+#[test]
+fn a_level_on_two_backends_moves_on_with_the_faster_one() -> lsm_tree::Result<()> {
+    let dir = tempfile::tempdir()?;
+    let state = Arc::new(PairState::default());
+    let primary: Arc<dyn Fs> = Arc::new(WakeFs(Arc::clone(&state)));
+    let routed: Arc<dyn Fs> = Arc::new(WakeFs(Arc::clone(&state)));
+    let (tree, keys) = two_backend_tree(dir.path(), &primary, &routed)?;
+    *state.lock() = Pair {
+        slow_first: true,
+        ..Pair::default()
+    };
+
+    let values = tree.multi_get(&keys, SeqNo::MAX)?;
+    let pair = state.lock();
+    assert_eq!(pair.queues, 2, "the level is read through both backends");
+    assert_eq!(
+        pair.slow_released_by_progress,
+        Some(true),
+        "the fast backend's tables waited for the slow backend's first read"
+    );
+    drop(pair);
+    assert_eq!(values, one_by_one(&tree, &keys)?);
+    Ok(())
+}
+
+/// A level on two backends, one whose queue cannot wake the level and reads
+/// only when waited on, is waited on through that queue: the level neither
+/// sleeps on a wake that queue never gives nor loses its reads.
+#[test]
+fn a_level_beside_a_queue_that_cannot_wake_it_is_still_read() -> lsm_tree::Result<()> {
+    let dir = tempfile::tempdir()?;
+    let state = Arc::new(PairState::default());
+    let record = Record::default();
+    let primary: Arc<dyn Fs> = Arc::new(StageFs(record.clone()));
+    let routed: Arc<dyn Fs> = Arc::new(WakeFs(Arc::clone(&state)));
+    let (tree, keys) = two_backend_tree(dir.path(), &primary, &routed)?;
+    *state.lock() = Pair::default();
+    record.reset(None);
+
+    let values = tree.multi_get(&keys, SeqNo::MAX)?;
+    assert_eq!(state.lock().queues, 1, "the waking backend was read");
+    assert!(!record.calls().is_empty(), "the other backend was read");
+    assert_eq!(values, one_by_one(&tree, &keys)?);
+    Ok(())
+}
+
+/// A backend counting the opens of table files, delegating to [`StdFs`].
+struct OpenCountFs(Arc<std::sync::atomic::AtomicUsize>);
+
+impl Fs for OpenCountFs {
+    fn open(&self, path: &Path, opts: &FsOpenOptions) -> io::Result<Box<dyn FsFile>> {
+        if path.parent().and_then(Path::file_name) == Some(std::ffi::OsStr::new("tables")) {
+            self.0.fetch_add(1, std::sync::atomic::Ordering::Relaxed);
+        }
+        StdFs.open(path, opts)
+    }
+
+    fn create_dir_all(&self, path: &Path) -> io::Result<()> {
+        StdFs.create_dir_all(path)
+    }
+
+    fn read_dir(&self, path: &Path) -> io::Result<Vec<FsDirEntry>> {
+        StdFs.read_dir(path)
+    }
+
+    fn remove_file(&self, path: &Path) -> io::Result<()> {
+        StdFs.remove_file(path)
+    }
+
+    fn remove_dir_all(&self, path: &Path) -> io::Result<()> {
+        StdFs.remove_dir_all(path)
+    }
+
+    fn rename(&self, from: &Path, to: &Path) -> io::Result<()> {
+        StdFs.rename(from, to)
+    }
+
+    fn metadata(&self, path: &Path) -> io::Result<FsMetadata> {
+        StdFs.metadata(path)
+    }
+
+    fn sync_directory(&self, path: &Path) -> io::Result<()> {
+        StdFs.sync_directory(path)
+    }
+
+    fn exists(&self, path: &Path) -> io::Result<bool> {
+        StdFs.exists(path)
+    }
+}
+
+/// A level wider than the descriptor cache opens each table's file at most
+/// twice for the whole staged read: once for its filter and index stages,
+/// which share it, and once for its data blocks, read in chunks that open only
+/// their own tables' files; never once per stage.
+#[test]
+fn a_level_wider_than_the_descriptor_cache_opens_each_table_at_most_twice() -> lsm_tree::Result<()>
+{
+    // Well past the descriptor cache, whose shards keep an entry each.
+    const TABLES: u32 = 64;
+    let dir = tempfile::tempdir()?;
+    let opens = Arc::new(std::sync::atomic::AtomicUsize::new(0));
+    let fs: Arc<dyn Fs> = Arc::new(OpenCountFs(Arc::clone(&opens)));
+    let config = || {
+        Config::new(
+            dir.path(),
+            SequenceNumberCounter::default(),
+            SequenceNumberCounter::default(),
+        )
+        .with_shared_fs(Arc::clone(&fs))
+        // No cache, so every table's index is read in a stage after its
+        // filter, and a descriptor cache far narrower than the level.
+        .use_cache(Arc::new(Cache::with_capacity_bytes(0)))
+        .use_descriptor_table(Some(Arc::new(lsm_tree::DescriptorTable::new(2))))
+        .filter_block_pinning_policy(PinningPolicy::all(false))
+        .index_block_pinning_policy(PinningPolicy::all(false))
+    };
+    {
+        let tree = config().open()?;
+        let mut seqno = 0;
+        for table in 0..TABLES {
+            for row in 0..200u32 {
+                tree.insert(format!("t{table:03}r{row:04}"), vec![b'v'; 64], seqno);
+                seqno += 1;
+            }
+            tree.flush_active_memtable(0)?;
+        }
+    }
+    let keys: Vec<String> = (0..TABLES)
+        .flat_map(|table| [format!("t{table:03}r0010"), format!("t{table:03}r0150")])
+        .collect();
+    let tree = config().open()?;
+    let expected = one_by_one(&tree, &keys)?;
+    opens.store(0, std::sync::atomic::Ordering::Relaxed);
+
+    let values = tree.multi_get(&keys, SeqNo::MAX)?;
+    let opened = opens.load(std::sync::atomic::Ordering::Relaxed);
+    assert!(
+        opened <= 2 * TABLES as usize,
+        "{TABLES} tables opened {opened} times for one batch"
+    );
+    assert_eq!(values, expected);
+    Ok(())
+}
+
+/// A level of overlapping tables, every one of which covers every key, read
+/// through a descriptor cache far narrower than the level: each table begins
+/// its read only once it has a place, and every key is answered with its
+/// newest version, as a key-by-key read answers it.
+#[test]
+fn an_overlapping_level_wider_than_the_descriptor_cache_answers_every_key() -> lsm_tree::Result<()>
+{
+    const TABLES: u32 = 32;
+    let dir = tempfile::tempdir()?;
+    let config = || {
+        Config::new(
+            dir.path(),
+            SequenceNumberCounter::default(),
+            SequenceNumberCounter::default(),
+        )
+        .use_cache(Arc::new(Cache::with_capacity_bytes(0)))
+        .use_descriptor_table(Some(Arc::new(lsm_tree::DescriptorTable::new(4))))
+        .filter_block_pinning_policy(PinningPolicy::all(false))
+        .index_block_pinning_policy(PinningPolicy::all(false))
+    };
+    {
+        let tree = config().open()?;
+        let mut seqno = 0;
+        for table in 0..TABLES {
+            // Every key again in each table, so each run covers the batch.
+            for row in 0..100u32 {
+                tree.insert(format!("k{row:04}"), format!("v{table}"), seqno);
+                seqno += 1;
+            }
+            tree.flush_active_memtable(0)?;
+        }
+    }
+    let keys: Vec<String> = (0..120u32).map(|row| format!("k{row:04}")).collect();
+    let tree = config().open()?;
+    let expected = one_by_one(&tree, &keys)?;
+
+    let values = tree.multi_get(&keys, SeqNo::MAX)?;
+    assert_eq!(values, expected);
+    assert_eq!(
+        values.iter().filter(|value| value.is_some()).count(),
+        100,
+        "every written key is found, the 20 past them are not"
+    );
+    let newest = format!("v{}", TABLES - 1);
+    assert!(
+        values
+            .iter()
+            .flatten()
+            .all(|value| value.as_ref() == newest.as_bytes()),
+        "every key answers with the newest table's version"
+    );
+    Ok(())
+}
+
+/// A [`StdFs`] file counted among the files a [`LiveCountFs`] has open while
+/// it lives.
+struct Counted {
+    inner: Box<dyn FsFile>,
+    live: Arc<std::sync::atomic::AtomicUsize>,
+}
+
+impl Drop for Counted {
+    fn drop(&mut self) {
+        self.live.fetch_sub(1, std::sync::atomic::Ordering::Relaxed);
+    }
+}
+
+impl std::io::Read for Counted {
+    fn read(&mut self, buf: &mut [u8]) -> std::io::Result<usize> {
+        self.inner.read(buf)
+    }
+}
+
+impl std::io::Write for Counted {
+    fn write(&mut self, buf: &[u8]) -> std::io::Result<usize> {
+        self.inner.write(buf)
+    }
+
+    fn flush(&mut self) -> std::io::Result<()> {
+        self.inner.flush()
+    }
+}
+
+impl std::io::Seek for Counted {
+    fn seek(&mut self, pos: std::io::SeekFrom) -> std::io::Result<u64> {
+        self.inner.seek(pos)
+    }
+}
+
+impl FsFile for Counted {
+    fn sync_all(&self) -> io::Result<()> {
+        self.inner.sync_all()
+    }
+
+    fn sync_data(&self) -> io::Result<()> {
+        self.inner.sync_data()
+    }
+
+    fn metadata(&self) -> io::Result<FsMetadata> {
+        self.inner.metadata()
+    }
+
+    fn hard_link_count(&self) -> io::Result<u64> {
+        self.inner.hard_link_count()
+    }
+
+    fn set_len(&self, size: u64) -> io::Result<()> {
+        self.inner.set_len(size)
+    }
+
+    fn read_at(&self, buf: &mut [u8], offset: u64) -> io::Result<usize> {
+        self.inner.read_at(buf, offset)
+    }
+
+    fn lock_exclusive(&self) -> io::Result<()> {
+        self.inner.lock_exclusive()
+    }
+
+    fn try_lock_exclusive(&self) -> io::Result<bool> {
+        self.inner.try_lock_exclusive()
+    }
+}
+
+/// A backend counting the files it has open, and recording at each batched
+/// read that count and how many distinct files the batch reads, delegating to
+/// [`StdFs`]. Only its own files are counted, so other tests running beside it
+/// do not move the count.
+struct LiveCountFs {
+    live: Arc<std::sync::atomic::AtomicUsize>,
+    /// Per batched read: the files open, and the distinct files it reads.
+    counts: Arc<Mutex<Vec<(usize, usize)>>>,
+}
+
+impl Fs for LiveCountFs {
+    fn read_blocks_batched(&self, reqs: &mut [BlockRead<'_>]) -> io::Result<()> {
+        let mut files: Vec<*const ()> = reqs
+            .iter()
+            .map(|req| core::ptr::from_ref(req.file).cast::<()>())
+            .collect();
+        files.sort_unstable();
+        files.dedup();
+        self.counts
+            .lock()
+            .unwrap_or_else(PoisonError::into_inner)
+            .push((
+                self.live.load(std::sync::atomic::Ordering::Relaxed),
+                files.len(),
+            ));
+        StdFs.read_blocks_batched(reqs)
+    }
+
+    fn open(&self, path: &Path, opts: &FsOpenOptions) -> io::Result<Box<dyn FsFile>> {
+        let inner = StdFs.open(path, opts)?;
+        self.live.fetch_add(1, std::sync::atomic::Ordering::Relaxed);
+        Ok(Box::new(Counted {
+            inner,
+            live: Arc::clone(&self.live),
+        }))
+    }
+
+    fn create_dir_all(&self, path: &Path) -> io::Result<()> {
+        StdFs.create_dir_all(path)
+    }
+
+    fn read_dir(&self, path: &Path) -> io::Result<Vec<FsDirEntry>> {
+        StdFs.read_dir(path)
+    }
+
+    fn remove_file(&self, path: &Path) -> io::Result<()> {
+        StdFs.remove_file(path)
+    }
+
+    fn remove_dir_all(&self, path: &Path) -> io::Result<()> {
+        StdFs.remove_dir_all(path)
+    }
+
+    fn rename(&self, from: &Path, to: &Path) -> io::Result<()> {
+        StdFs.rename(from, to)
+    }
+
+    fn metadata(&self, path: &Path) -> io::Result<FsMetadata> {
+        StdFs.metadata(path)
+    }
+
+    fn sync_directory(&self, path: &Path) -> io::Result<()> {
+        StdFs.sync_directory(path)
+    }
+
+    fn exists(&self, path: &Path) -> io::Result<bool> {
+        StdFs.exists(path)
+    }
+}
+
+/// A level read stage by stage reads at most as many tables' files at once as
+/// the descriptor cache keeps, in its stages and in its data reads alike, and
+/// gives each file back once it is done with it: a level far wider than the
+/// cache does not open, or keep, a file per table, whether the keys end at the
+/// filters or reach a data block in every table, and every key is answered.
+#[test]
+fn a_staged_level_read_opens_no_more_files_than_the_descriptor_cache_holds() -> lsm_tree::Result<()>
+{
+    const TABLES: u32 = 64;
+    /// The descriptor cache the tree is opened with.
+    const DESCRIPTORS: usize = 2;
+    let dir = tempfile::tempdir()?;
+    let counts = Arc::new(Mutex::new(Vec::new()));
+    let fs: Arc<dyn Fs> = Arc::new(LiveCountFs {
+        live: Arc::default(),
+        counts: Arc::clone(&counts),
+    });
+    let config = || {
+        Config::new(
+            dir.path(),
+            SequenceNumberCounter::default(),
+            SequenceNumberCounter::default(),
+        )
+        .with_shared_fs(Arc::clone(&fs))
+        .use_cache(Arc::new(Cache::with_capacity_bytes(0)))
+        .use_descriptor_table(Some(Arc::new(lsm_tree::DescriptorTable::new(DESCRIPTORS))))
+        .filter_block_pinning_policy(PinningPolicy::all(false))
+        .index_block_pinning_policy(PinningPolicy::all(false))
+    };
+    {
+        let tree = config().open()?;
+        let mut seqno = 0;
+        for table in 0..TABLES {
+            for row in 0..200u32 {
+                tree.insert(format!("t{table:03}r{row:04}"), vec![b'v'; 64], seqno);
+                seqno += 1;
+            }
+            tree.flush_active_memtable(0)?;
+        }
+    }
+    let tree = config().open()?;
+    // A key inside each table's range that it does not hold, which its filter
+    // answers; then a key each table holds, read from a data block of every
+    // table.
+    for (what, row, present) in [("filtered out", "0010x", false), ("found", "0010", true)] {
+        let keys: Vec<String> = (0..TABLES)
+            .map(|table| format!("t{table:03}r{row}"))
+            .collect();
+        let expected = one_by_one(&tree, &keys)?;
+        counts
+            .lock()
+            .unwrap_or_else(PoisonError::into_inner)
+            .clear();
+
+        let values = tree.multi_get(&keys, SeqNo::MAX)?;
+        let counts = counts
+            .lock()
+            .unwrap_or_else(PoisonError::into_inner)
+            .clone();
+        let peak = counts
+            .iter()
+            .map(|&(live, _)| live)
+            .max()
+            .unwrap_or_default();
+        let widest = counts
+            .iter()
+            .map(|&(_, files)| files)
+            .max()
+            .unwrap_or_default();
+        assert!(
+            !counts.is_empty() && peak <= (TABLES as usize) / 2,
+            "{what}: {TABLES} tables, peak of {peak} files open at a batch: {counts:?}"
+        );
+        assert!(
+            widest <= DESCRIPTORS,
+            "{what}: a batch read {widest} files, past the {DESCRIPTORS} the cache keeps: {counts:?}"
+        );
+        assert!(
+            values.iter().all(|value| value.is_some() == present),
+            "{what}"
+        );
+        assert_eq!(values, expected, "{what}");
+    }
+    Ok(())
+}
+
+/// The filter and index blocks a level read stage by stage holds are bounded
+/// by `Config::multi_get_metadata_budget`, not by the block cache: under a
+/// cache far larger than the budget, a batch of keys every filter answers
+/// asks for at most the budget past one request, so a level far wider than
+/// the budget does not read every table's filter into memory at once, and
+/// every key is answered.
+#[test]
+fn a_staged_level_read_holds_no_more_metadata_than_its_budget() -> lsm_tree::Result<()> {
+    const TABLES: u32 = 64;
+    const BUDGET: u64 = 2 * 1_024;
+    for shape in SHAPES {
+        let dir = tempfile::tempdir()?;
+        let record = Record::default();
+        let fs: Arc<dyn Fs> = Arc::new(StageFs(record.clone()));
+        let (tree, _) = tree_tuned(dir.path(), shape, TABLES, LARGE_CACHE, &fs, &|config| {
+            config.multi_get_metadata_budget(BUDGET)
+        })?;
+        // A key inside each table's range that it does not hold: the filters
+        // answer the batch, so what it reads is their blocks.
+        let keys: Vec<String> = (0..TABLES)
+            .map(|table| format!("t{table:03}r0010x"))
+            .collect();
+        record.reset(None);
+
+        let values = tree.multi_get(&keys, SeqNo::MAX)?;
+        let (calls, largest) = {
+            let batches = record.lock();
+            (batches.calls.clone(), batches.largest)
+        };
+        let widest = calls
+            .iter()
+            .map(|&(_, bytes)| bytes)
+            .max()
+            .unwrap_or_default();
+        assert!(
+            calls.len() > 1 && widest <= BUDGET + largest,
+            "{shape:?}: a batch asked for {widest} bytes, past the {BUDGET}-byte budget and \
+             its largest request of {largest}: {calls:?}"
+        );
+        assert_eq!(values, one_by_one(&tree, &keys)?, "{shape:?}");
+    }
+    Ok(())
+}
+
+/// The data blocks a level read leaves in the shared cache weigh at most half
+/// of it, weighed decoded as the cache weighs them: compressed blocks that fit
+/// in half the cache as they are read can decode to far more than all of it,
+/// and keeping them would evict what the cache holds for other reads.
+#[cfg(feature = "lz4")]
+#[test]
+fn a_level_read_keeps_its_data_blocks_within_half_the_cache_decoded() -> lsm_tree::Result<()> {
+    const TABLES: u32 = 64;
+    // A shard of it holds a data block: one too small for a block refuses it.
+    const CACHE: u64 = 1_024 * 1_024;
+    let dir = tempfile::tempdir()?;
+    // Rows are kept out, so the cache holds only the blocks the read put in.
+    let cache = Arc::new(Cache::with_capacity_bytes(CACHE).with_row_cache(false));
+    let fs: Arc<dyn Fs> = Arc::new(StdFs);
+    let (tree, _) = tree_tuned(dir.path(), Shape::Whole, TABLES, CACHE, &fs, &|config| {
+        config
+            .use_cache(Arc::clone(&cache))
+            .data_block_compression_policy(CompressionPolicy::all(lsm_tree::CompressionType::Lz4))
+    })?;
+    // Every row of every table: the level's whole data, many times the cache
+    // decoded, little of it on disk.
+    let keys: Vec<String> = (0..TABLES)
+        .flat_map(|table| (0..200u32).map(move |row| format!("t{table:03}r{row:04}")))
+        .collect();
+
+    let values = tree.multi_get(&keys, SeqNo::MAX)?;
+    assert!(values.iter().all(Option::is_some));
+    assert!(
+        // Half the cache for the data blocks, and room for the filter and
+        // index blocks the stages put in (about 14 KiB here).
+        cache.size() <= CACHE / 2 + 64 * 1_024,
+        "the read filled {} of the {CACHE}-byte cache, past half of it and what its \
+         stages hold",
+        cache.size(),
+    );
+    Ok(())
+}
+
+/// A zero budget does not stop the read: a table alone above it is read when
+/// no other holds blocks, so the tables go one at a time and every key, found
+/// or not, is answered as a key-by-key read answers it.
+#[test]
+fn a_zero_metadata_budget_reads_the_level_one_table_at_a_time() -> lsm_tree::Result<()> {
+    const TABLES: u32 = 8;
+    for shape in SHAPES {
+        let dir = tempfile::tempdir()?;
+        let record = Record::default();
+        let fs: Arc<dyn Fs> = Arc::new(StageFs(record.clone()));
+        let (tree, keys) = tree_tuned(dir.path(), shape, TABLES, LARGE_CACHE, &fs, &|config| {
+            config.multi_get_metadata_budget(0)
+        })?;
+        record.reset(None);
+
+        let values = tree.multi_get(&keys, SeqNo::MAX)?;
+        let calls = record.calls();
+        assert!(
+            calls.len() >= TABLES as usize,
+            "{shape:?}: each table's stages in a batch of their own: {calls:?}"
+        );
+        assert_eq!(values, one_by_one(&tree, &keys)?, "{shape:?}");
+    }
+    Ok(())
+}
+
+/// A snapshot older than some tables of the level reads none of them: the
+/// tables written after it take no part in the staged read, and every key is
+/// answered as a key-by-key read at that snapshot answers it.
+#[test]
+fn a_snapshot_older_than_part_of_the_level_reads_only_the_tables_it_sees() -> lsm_tree::Result<()> {
+    const TABLES: u32 = 8;
+    for shape in SHAPES {
+        let dir = tempfile::tempdir()?;
+        let record = Record::default();
+        let (tree, keys) = tree(dir.path(), shape, TABLES, LARGE_CACHE, &record)?;
+        // The tables are written 200 rows apart: this snapshot sees the first
+        // half of them.
+        let snapshot = SeqNo::from(TABLES / 2 * 200);
+
+        let values = tree.multi_get(&keys, snapshot)?;
+        let expected: Vec<Option<Slice>> = keys
+            .iter()
+            .map(|key| tree.get(key, snapshot))
+            .collect::<lsm_tree::Result<_>>()?;
+        assert_eq!(values, expected, "{shape:?}");
+        assert_eq!(
+            values.iter().filter(|v| v.is_some()).count(),
+            TABLES as usize,
+            "{shape:?}: the two present keys of each table the snapshot sees"
+        );
+    }
+    Ok(())
+}
+
+/// A table whose file cannot be opened for its stages is read through the
+/// serial path instead, and the batch answers as a key-by-key read does.
+#[test]
+fn a_table_that_cannot_be_opened_for_its_stages_is_read_serially() -> lsm_tree::Result<()> {
+    use lsm_tree::fs::{Fault, FaultFs, FaultOp, FaultRule};
+
+    const TABLES: u32 = 4;
+    for shape in SHAPES {
+        let dir = tempfile::tempdir()?;
+        let faulty = FaultFs::new(StdFs);
+        let injector = faulty.injector();
+        let fs: Arc<dyn Fs> = Arc::new(faulty);
+        // A descriptor cache of one, so the staged read opens the files itself.
+        let (tree, keys) = tree_tuned(dir.path(), shape, TABLES, LARGE_CACHE, &fs, &|config| {
+            config.use_descriptor_table(Some(Arc::new(lsm_tree::DescriptorTable::new(1))))
+        })?;
+        injector.arm(
+            FaultRule::new(FaultOp::Open, Fault::Error(io::ErrorKind::PermissionDenied))
+                .on_path("tables")
+                .once(),
+        );
+
+        let values = tree.multi_get(&keys, SeqNo::MAX)?;
+        injector.clear();
+        assert_eq!(values, one_by_one(&tree, &keys)?, "{shape:?}");
+    }
+    Ok(())
+}
+
+/// A tree whose level 0 holds two tables on `primary` and two on `routed`, as
+/// after level 0 was routed away from the primary folder, reopened with no
+/// cache; and the keys a batch reads: one present and one absent per table.
+fn two_backend_tree(
+    dir: &Path,
+    primary: &Arc<dyn Fs>,
+    routed: &Arc<dyn Fs>,
+) -> lsm_tree::Result<(AnyTree, Vec<String>)> {
+    let config = |route: bool| {
+        let config = Config::new(
+            dir.join("primary"),
+            SequenceNumberCounter::default(),
+            SequenceNumberCounter::default(),
+        )
+        .with_shared_fs(Arc::clone(primary))
+        // No cache, so every table's index is read in a stage after its
+        // filter.
+        .use_cache(Arc::new(Cache::with_capacity_bytes(0)))
+        .filter_block_pinning_policy(PinningPolicy::all(false))
+        .index_block_pinning_policy(PinningPolicy::all(false));
+        if route {
+            config.level_routes(vec![lsm_tree::config::LevelRoute {
+                levels: 0..7,
+                path: dir.join("routed"),
+                fs: Arc::clone(routed),
+            }])
+        } else {
+            config
+        }
+    };
+    let write = |tree: &AnyTree, tables: core::ops::Range<u32>| -> lsm_tree::Result<()> {
+        for table in tables {
+            for row in 0..200u32 {
+                tree.insert(
+                    format!("t{table:03}r{row:04}"),
+                    vec![b'v'; 64],
+                    u64::from(table * 200 + row),
+                );
+            }
+            tree.flush_active_memtable(0)?;
+        }
+        Ok(())
+    };
+    write(&config(false).open()?, 0..2)?;
+    write(&config(true).open()?, 2..4)?;
+    let keys = (0..4)
+        .flat_map(|table| [format!("t{table:03}r0010"), format!("t{table:03}r0150x")])
+        .collect();
+    Ok((config(true).open()?, keys))
+}

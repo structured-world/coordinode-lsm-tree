@@ -3039,7 +3039,7 @@ fn plan_block_tasks_propagates_a_faulted_bloom_probe() -> crate::Result<()> {
 
     let key = b"key0000".as_slice();
     let sorted = [(key, hash64(key))];
-    let mut tally = crate::table::probe_stats::ProbeCounts::default();
+    let mut tally = crate::table::probe_stats::PlanCounts::default();
     let result = table.plan_block_tasks(&sorted, SeqNo::MAX, &mut tally);
 
     // The serial path propagates a bloom-probe error via `?`; the chunked planner
@@ -3101,7 +3101,7 @@ fn plan_block_tasks_propagates_a_faulted_index_read() -> crate::Result<()> {
 
     let key = b"key000250".as_slice();
     let sorted = [(key, hash64(key))];
-    let mut tally = crate::table::probe_stats::ProbeCounts::default();
+    let mut tally = crate::table::probe_stats::PlanCounts::default();
     let result = table.plan_block_tasks(&sorted, SeqNo::MAX, &mut tally);
 
     // batch_get propagates the same iterator error via `?`; the chunked planner
@@ -3161,7 +3161,7 @@ fn plan_block_tasks_returns_none_for_a_table_above_the_snapshot() -> crate::Resu
     let sorted = [(key, hash64(key))];
     // Read seqno 5 is below the table's lowest seqno (10): entirely above the
     // snapshot. Ok(None) despite the armed read fault proves the no-read path.
-    let mut tally = crate::table::probe_stats::ProbeCounts::default();
+    let mut tally = crate::table::probe_stats::PlanCounts::default();
     assert!(table.plan_block_tasks(&sorted, 5, &mut tally)?.is_none());
     Ok(())
 }
@@ -4350,7 +4350,7 @@ fn a_block_refused_for_its_declared_length_counts_what_its_transform_decoded() -
         coding::{Decode, Encode},
         table::{
             block::{BlockType, Header},
-            util::{decode_prewarmed_blocks, load_block},
+            util::load_block,
         },
     };
     use std::io::{Seek, Write};
@@ -4395,31 +4395,23 @@ fn a_block_refused_for_its_declared_length_counts_what_its_transform_decoded() -
         "the file read's transform ran, so its output must be counted",
     );
 
-    let cache = Cache::with_capacity_bytes(10_000_000);
     let decoded_before = metrics.bytes_decoded();
-    decode_prewarmed_blocks(
-        table.global_id(),
-        &cache,
-        &[table.regions.tli],
-        &[&tampered],
-        BlockType::Index,
-        CompressionType::None,
-        None,
-        None,
-        #[cfg(zstd_any)]
-        None,
-        &metrics,
+    assert!(
+        table
+            .decode_block_from_bytes(&tampered, table.regions.tli.offset().0, BlockType::Index)
+            .is_err(),
+        "the staged read refuses the block too",
     );
     assert_eq!(
         metrics.bytes_decoded() - decoded_before,
         produced,
-        "the prewarm's transform ran, so its output must be counted",
+        "the staged read's transform ran, so its output must be counted",
     );
 
     let decoded_before = metrics.bytes_decoded();
     assert!(
         table
-            .decode_data_block_from_bytes(&tampered, table.regions.tli.offset().0)
+            .decode_data_block_keeping(&tampered, &table.regions.tli, &mut 0)
             .is_err(),
         "the chunked resolver refuses the block too",
     );
@@ -4635,42 +4627,22 @@ fn a_handle_refused_before_reading_counts_no_bytes() -> crate::Result<()> {
     Ok(())
 }
 
-/// A batched prewarm decodes each block before checking its role, so a block it
-/// then refuses to cache still counts what its transform produced; the read
-/// walk that falls back to reading it again counts its own decode on top.
+/// A staged read decodes each block before checking its role, so a block it
+/// then refuses still counts what its transform produced.
 #[cfg(feature = "metrics")]
 #[test]
-fn a_prewarmed_block_rejected_for_its_role_counts_what_its_transform_decoded() -> crate::Result<()>
-{
-    use crate::{
-        CompressionType,
-        cache::Cache,
-        table::{block::BlockType, util::decode_prewarmed_blocks},
-    };
+fn a_staged_block_rejected_for_its_role_counts_what_its_transform_decoded() -> crate::Result<()> {
+    use crate::table::block::BlockType;
 
     let dir = tempdir()?;
     let (table, metrics, frame) = one_row_table_and_its_index_frame(&dir)?;
-    let cache = Cache::with_capacity_bytes(10_000_000);
 
     let decoded_before = metrics.bytes_decoded();
-    decode_prewarmed_blocks(
-        table.global_id(),
-        &cache,
-        &[table.regions.tli],
-        &[&frame],
-        BlockType::Data,
-        CompressionType::None,
-        None,
-        None,
-        #[cfg(zstd_any)]
-        None,
-        &metrics,
-    );
+    let result =
+        table.decode_block_from_bytes(&frame, table.regions.tli.offset().0, BlockType::Filter);
     assert!(
-        cache
-            .get_block(table.global_id(), table.regions.tli.offset())
-            .is_none(),
-        "the index block must not be cached as a data block",
+        matches!(&result, Err(crate::Error::InvalidTag(("BlockType", _)))),
+        "the index block must be refused as a filter block",
     );
     assert_eq!(
         metrics.bytes_decoded() - decoded_before,
@@ -4691,7 +4663,7 @@ fn a_chunk_decoded_block_rejected_for_its_role_counts_what_its_transform_decoded
     let (table, metrics, frame) = one_row_table_and_its_index_frame(&dir)?;
 
     let decoded_before = metrics.bytes_decoded();
-    let result = table.decode_data_block_from_bytes(&frame, table.regions.tli.offset().0);
+    let result = table.decode_data_block_keeping(&frame, &table.regions.tli, &mut 0);
     assert!(
         matches!(&result, Err(crate::Error::InvalidTag(("BlockType", _)))),
         "the index block must be refused as a data block",
@@ -8154,6 +8126,15 @@ fn recover_salvage_degrades_a_persistent_filter_index_read() -> crate::Result<()
     assert!(
         recovered.salvage_degraded_a_rebuildable_section(),
         "the recovered table must report the degraded rebuildable section",
+    );
+    // Without its filter index the table rules no key out, so a point read
+    // goes to the data and finds the key instead of failing on the filter.
+    let key = b"k00010";
+    let found = recovered.get(key, SeqNo::MAX, crate::hash::hash64(key))?;
+    assert_eq!(
+        found.map(|item| item.value.to_vec()),
+        Some(b"v10".to_vec()),
+        "a key the table holds is found without the filter index",
     );
     Ok(())
 }
