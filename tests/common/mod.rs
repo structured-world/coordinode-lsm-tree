@@ -78,6 +78,53 @@ pub fn nuke_manifest(dir: &std::path::Path) -> std::io::Result<()> {
     Ok(())
 }
 
+/// Returns the SST file paths under `<dir>/tables/`, sorted by id.
+pub fn sorted_sst_paths(dir: &std::path::Path) -> Vec<std::path::PathBuf> {
+    let mut v: Vec<std::path::PathBuf> = std::fs::read_dir(dir.join("tables"))
+        .expect("tables dir exists")
+        .filter_map(Result::ok)
+        .map(|e| e.path())
+        .filter(|p| {
+            p.file_name()
+                .is_some_and(|n| n.to_string_lossy().parse::<u64>().is_ok())
+        })
+        .collect();
+    v.sort();
+    v
+}
+
+/// Flips a byte a fixed depth into the SST's `data` section, so the SST still
+/// opens but one data block fails its checksum.
+pub fn corrupt_data_region(path: &std::path::Path) -> std::io::Result<()> {
+    // Locate the `data` section through the SFA trailer TOC rather than assuming
+    // it begins at offset 0: a byte a fixed depth into the section's payload is
+    // stable against tail growth (the index / filter / meta / trailer that follow
+    // can change size, e.g. a new meta key) AND correct even if the data section
+    // ever stops being written first.
+    const DEPTH: u64 = 512;
+    let pos = {
+        let mut f = std::fs::File::open(path)?;
+        let reader = lsm_tree::sfa::Reader::from_reader(&mut f)
+            .map_err(|e| std::io::Error::other(format!("read SFA TOC: {e}")))?;
+        let entry = reader
+            .toc()
+            .iter()
+            .find(|e| e.name() == b"data")
+            .expect("the SST carries a data section");
+        assert!(
+            entry.len() > DEPTH,
+            "data section (len {}) is too small to corrupt a block at depth {DEPTH}",
+            entry.len(),
+        );
+        usize::try_from(entry.pos() + DEPTH).expect("position fits usize")
+    };
+    let mut bytes = std::fs::read(path)?;
+    *bytes
+        .get_mut(pos)
+        .expect("corruption offset within the SST") ^= 0xFF;
+    std::fs::write(path, &bytes)
+}
+
 /// Convert an iterator guard into owned `(key, value)` byte vectors.
 ///
 /// Returns `Err` on I/O failure (e.g. BlobTree indirection read) instead

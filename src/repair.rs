@@ -682,6 +682,26 @@ fn repair_recover_params(
     params
 }
 
+/// [`repair_recover_params`] for a table the repair holds until it publishes
+/// the rebuilt manifest: its file goes through the repair's descriptor cache,
+/// so the tables held at once need no descriptor each. A tree id of its own:
+/// another copy of this table id, or its salvage replacement, must never be
+/// handed this file's descriptor.
+#[cfg(feature = "std")]
+fn held_recover_params(
+    config: &Config,
+    file_path: PathBuf,
+    checksum: crate::Checksum,
+    table_id: TableId,
+    fs: Arc<dyn crate::fs::Fs>,
+    global_seqno: Option<SeqNo>,
+) -> crate::table::RecoverParams {
+    let mut params = repair_recover_params(config, file_path, checksum, table_id, fs, global_seqno);
+    params.tree_id = crate::tree::inner::get_next_tree_id();
+    params.descriptor_table.clone_from(&config.descriptor_table);
+    params
+}
+
 /// Whether an I/O failure must PROPAGATE out of the repair instead of grading
 /// the file it came from — either UNAMBIGUOUSLY TRANSIENT, or an
 /// ENVIRONMENTAL access failure that does not implicate the bytes on disk.
@@ -1637,7 +1657,7 @@ fn try_salvage_table(
     // ingest offset applies to the copy unchanged (the salvage preserves
     // local seqnos), so it is reused here just like on the whole-recover path.
     let checksum = crate::Checksum::from_raw(compute_table_checksum(&**fs, table_path)?);
-    let table = match Table::recover(repair_recover_params(
+    let table = match Table::recover(held_recover_params(
         config,
         table_path.to_path_buf(),
         checksum,
@@ -4586,23 +4606,14 @@ fn scan_table_folders(
             // structural-failure salvage arm below recovers the intact blocks
             // (or records it unreadable with salvage off).
             let recovered = match own_digest {
-                Ok(digest) => {
-                    let mut params = repair_recover_params(
-                        config,
-                        table_path.clone(),
-                        digest,
-                        table_id,
-                        folder_fs.clone(),
-                        manifest_global_seqno,
-                    );
-                    // Held until the rebuilt manifest is published, so its file
-                    // goes through the descriptor cache. A tree id of its own:
-                    // another copy of this table id, or its salvage replacement,
-                    // must never be handed this file's descriptor.
-                    params.tree_id = crate::tree::inner::get_next_tree_id();
-                    params.descriptor_table.clone_from(&config.descriptor_table);
-                    Table::recover(params)
-                }
+                Ok(digest) => Table::recover(held_recover_params(
+                    config,
+                    table_path.clone(),
+                    digest,
+                    table_id,
+                    folder_fs.clone(),
+                    manifest_global_seqno,
+                )),
                 Err(e) => Err(e),
             };
 
