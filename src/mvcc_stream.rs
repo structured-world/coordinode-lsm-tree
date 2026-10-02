@@ -10,13 +10,68 @@ use alloc::sync::Arc;
 #[cfg(not(feature = "std"))]
 use alloc::vec::Vec;
 
+/// Reads a merge base kept in the value log, as `RocksDB`'s merge reads a
+/// blob base before merging onto it.
+#[doc(hidden)]
+#[diagnostic::on_unimplemented(
+    message = "`{Self}` cannot read a merge base kept in the value log",
+    label = "not a value log reader",
+    note = "a stream that never meets such a base uses `NoValueLog`"
+)]
+pub trait SeparatedBase {
+    /// The value the indirection `base` points to.
+    ///
+    /// # Errors
+    ///
+    /// Returns an error when the value cannot be read.
+    fn read(&self, base: InternalValue) -> crate::Result<UserValue>;
+}
+
+/// The reader of a stream that is not a blob tree's and cannot read a
+/// separated base: the pointer is refused rather than handed to the operator
+/// as if it were the value.
+#[doc(hidden)]
+#[derive(Clone, Copy, Debug, Default)]
+pub struct NoValueLog;
+
+impl SeparatedBase for NoValueLog {
+    fn read(&self, _base: InternalValue) -> crate::Result<UserValue> {
+        Err(crate::Error::FeatureUnsupported(
+            "merge-onto-separated-base-without-value-log",
+        ))
+    }
+}
+
+/// The value log a merge reads a base from when the base is an indirection:
+/// a blob tree's blob source over the version being read.
+#[derive(Clone, Copy)]
+pub(crate) struct ValueLog<'v> {
+    pub(crate) source: &'v crate::blob_tree::BlobSource,
+    pub(crate) version: &'v crate::version::Version,
+}
+
+/// A stream whose tree may or may not be a blob tree, decided when it is
+/// built.
+impl SeparatedBase for Option<ValueLog<'_>> {
+    fn read(&self, base: InternalValue) -> crate::Result<UserValue> {
+        match self {
+            Some(log) => log.source.value(log.version, base),
+            None => NoValueLog.read(base),
+        }
+    }
+}
+
 /// Consumes a stream of KVs and emits a new stream according to MVCC and tombstone rules
 ///
 /// This iterator is used for read operations.
-pub struct MvccStream<I: DoubleEndedIterator<Item = crate::Result<InternalValue>>> {
+pub struct MvccStream<I: DoubleEndedIterator<Item = crate::Result<InternalValue>>, L = NoValueLog> {
     inner: DoubleEndedPeekable<crate::Result<InternalValue>, I>,
     merge_operator: Option<Arc<dyn MergeOperator>>,
     comparator: SharedComparator,
+
+    /// Reads a base the stream finds kept in the value log. Only a blob
+    /// tree's stream meets such a base.
+    value_log: L,
 
     /// Range tombstones with per-source visibility cutoffs. When set, merge
     /// resolution skips entries suppressed by an RT (treats them as a
@@ -26,6 +81,15 @@ pub struct MvccStream<I: DoubleEndedIterator<Item = crate::Result<InternalValue>
     /// Reusable buffer for reverse-iteration merge resolution. Avoids
     /// allocating a fresh `Vec` on every `next_back()` call.
     key_entries_buf: Vec<InternalValue>,
+
+    /// The key whose resolution from the front ended in an error, and whose
+    /// remaining versions the next forward call skips before anything else:
+    /// they are older than the failed one and never stand for the key.
+    skip_front: Option<UserKey>,
+
+    /// The same for the back: the newer versions of a key whose older ones
+    /// went with an error, which never resolve without them.
+    skip_back: Option<UserKey>,
 }
 
 impl<I: DoubleEndedIterator<Item = crate::Result<InternalValue>>> MvccStream<I> {
@@ -50,11 +114,36 @@ impl<I: DoubleEndedIterator<Item = crate::Result<InternalValue>>> MvccStream<I> 
             inner: iter.double_ended_peekable(),
             merge_operator,
             comparator,
+            value_log: NoValueLog,
             range_tombstones: Vec::new(),
             key_entries_buf: Vec::new(),
+            skip_front: None,
+            skip_back: None,
         }
     }
 
+    /// Installs the value log a merge reads a base kept there from.
+    #[must_use]
+    pub(crate) fn with_value_log(
+        self,
+        value_log: Option<ValueLog<'_>>,
+    ) -> MvccStream<I, Option<ValueLog<'_>>> {
+        MvccStream {
+            inner: self.inner,
+            merge_operator: self.merge_operator,
+            comparator: self.comparator,
+            value_log,
+            range_tombstones: self.range_tombstones,
+            key_entries_buf: self.key_entries_buf,
+            skip_front: self.skip_front,
+            skip_back: self.skip_back,
+        }
+    }
+}
+
+impl<I: DoubleEndedIterator<Item = crate::Result<InternalValue>>, L: SeparatedBase>
+    MvccStream<I, L>
+{
     /// Installs range tombstones for merge-resolution awareness.
     ///
     /// When set, operands or base values suppressed by a range tombstone are
@@ -87,7 +176,6 @@ impl<I: DoubleEndedIterator<Item = crate::Result<InternalValue>>> MvccStream<I> 
         let mut operands: Vec<UserValue> = vec![head.value.clone()];
         let mut base_value: Option<UserValue> = None;
         let mut found_base = false;
-        let mut saw_indirection_base = false;
 
         // Collect remaining same-key entries
         loop {
@@ -101,7 +189,13 @@ impl<I: DoubleEndedIterator<Item = crate::Result<InternalValue>>> MvccStream<I> 
                 break;
             };
 
-            let next = next?;
+            let next = match next {
+                Ok(next) => next,
+                Err(e) => {
+                    self.skip_front = Some(user_key.clone());
+                    return Err(e);
+                }
+            };
 
             // Range tombstone suppression: an RT-suppressed entry is logically
             // deleted — treat it as a tombstone boundary (no base value).
@@ -120,11 +214,21 @@ impl<I: DoubleEndedIterator<Item = crate::Result<InternalValue>>> MvccStream<I> 
                     break;
                 }
                 ValueType::Indirection => {
-                    // Indirection payloads are internal blob pointers and must not be
-                    // used as a merge base user value. Remember that we saw an
-                    // indirection base so we can skip merge resolution for this key.
+                    // Read now, as RocksDB's iterator fetches a blob base when
+                    // it lands on a merged key: the merged value is the item
+                    // this stream yields, so there is no pointer left for a
+                    // guard to resolve later. Only an unmerged value stays
+                    // lazy. After a failed read the key's remaining versions
+                    // are skipped, so a caller that goes on past the error
+                    // does not get one the base shadows as the key's value.
+                    match self.value_log.read(next) {
+                        Ok(value) => base_value = Some(value),
+                        Err(e) => {
+                            self.skip_front = Some(user_key.clone());
+                            return Err(e);
+                        }
+                    }
                     found_base = true;
-                    saw_indirection_base = true;
                     break;
                 }
                 ValueType::Tombstone | ValueType::WeakTombstone => {
@@ -138,12 +242,6 @@ impl<I: DoubleEndedIterator<Item = crate::Result<InternalValue>>> MvccStream<I> 
         // Drain any remaining same-key entries
         if found_base {
             self.drain_key_min(user_key)?;
-        }
-
-        // If the base would be an indirection, do not attempt to resolve the merge;
-        // just return the newest entry unchanged.
-        if saw_indirection_base {
-            return Ok(head.clone());
         }
 
         // Reverse to chronological order (ascending seqno)
@@ -180,40 +278,28 @@ impl<I: DoubleEndedIterator<Item = crate::Result<InternalValue>>> MvccStream<I> 
         let result_key = newest.key.user_key.clone();
 
         // Process in descending seqno order (newest first) to match forward merge semantics
-        let mut saw_indirection = false;
-
-        for entry in entries.iter().rev() {
+        for entry in entries.into_iter().rev() {
             // RT-suppressed entries are logically deleted — treat as tombstone.
-            if self.is_rt_suppressed(entry) {
+            if self.is_rt_suppressed(&entry) {
                 break;
             }
 
             match entry.key.value_type {
                 ValueType::MergeOperand => {
-                    operands.push(entry.value.clone());
+                    operands.push(entry.value);
                 }
                 ValueType::Value => {
-                    base_value = Some(entry.value.clone());
+                    base_value = Some(entry.value);
                     break;
                 }
                 ValueType::Indirection => {
-                    // Do not use indirection bytes as a merge base; stop scanning
-                    // older versions.
-                    saw_indirection = true;
+                    base_value = Some(self.value_log.read(entry)?);
                     break;
                 }
                 ValueType::Tombstone | ValueType::WeakTombstone => {
                     break;
                 }
             }
-        }
-
-        // If the base is an indirection, return the newest entry unchanged.
-        if saw_indirection {
-            return entries
-                .into_iter()
-                .last()
-                .ok_or(crate::Error::Unrecoverable);
         }
 
         // Reverse operands to chronological order (ascending seqno)
@@ -231,6 +317,10 @@ impl<I: DoubleEndedIterator<Item = crate::Result<InternalValue>>> MvccStream<I> 
     }
 
     // Drains all entries for the given user key from the front of the iterator.
+    //
+    // An error ends the drain and is returned at once; the key is remembered
+    // in `skip_front` so the next call skips its remaining versions instead of
+    // yielding the next older one as the key's value.
     fn drain_key_min(&mut self, key: &UserKey) -> crate::Result<()> {
         loop {
             let Some(next) = self.inner.next_if(|kv| {
@@ -243,30 +333,168 @@ impl<I: DoubleEndedIterator<Item = crate::Result<InternalValue>>> MvccStream<I> 
                 return Ok(());
             };
 
-            next?;
+            if let Err(e) = next {
+                self.skip_front = Some(key.clone());
+                return Err(e);
+            }
         }
+    }
+
+    // Goes on skipping the front key a failed resolution left. Yields the
+    // next error met on the way, one per call, and clears the skip once the
+    // key is behind.
+    fn resume_skip_front(&mut self) -> Option<crate::Error> {
+        let key = self.skip_front.take()?;
+        loop {
+            let next = self.inner.next_if(|kv| {
+                if let Ok(kv) = kv {
+                    crate::comparator::same_user_key(&kv.key.user_key, &key)
+                } else {
+                    true
+                }
+            })?;
+            if let Err(e) = next {
+                self.skip_front = Some(key);
+                return Some(e);
+            }
+        }
+    }
+
+    // The back counterpart of `resume_skip_front`.
+    fn resume_skip_back(&mut self) -> Option<crate::Error> {
+        let key = self.skip_back.take()?;
+        while let Some(prev) = self.inner.peek_back() {
+            if let Ok(prev) = prev
+                && !crate::comparator::same_user_key(&prev.key.user_key, &key)
+            {
+                return None;
+            }
+            if let Some(Err(e)) = self.inner.next_back() {
+                self.skip_back = Some(key);
+                return Some(e);
+            }
+        }
+        None
     }
 }
 
-impl<I> crate::reseek::Reseekable for MvccStream<I>
+impl<I, L> crate::reseek::Reseekable for MvccStream<I, L>
 where
     I: DoubleEndedIterator<Item = crate::Result<InternalValue>> + crate::reseek::Reseekable,
 {
-    /// Clear the lookahead peek buffers and the reverse-merge scratch buffer,
-    /// then forward the reposition to the inner merger. The installed range
-    /// tombstones and merge operator are position-independent and stay as-is.
+    /// Clear the lookahead peek buffers, the reverse-merge scratch buffer and
+    /// the keys left to skip after an error, then forward the reposition to
+    /// the inner merger. The installed range tombstones and merge operator are
+    /// position-independent and stay as-is.
     fn reseek(&mut self, ctx: &crate::reseek::ReseekCtx) {
         self.inner.reset_front_peeked();
         self.inner.reset_back_peeked();
         self.key_entries_buf.clear();
+        self.skip_front = None;
+        self.skip_back = None;
         self.inner.inner_mut().reseek(ctx);
     }
 }
 
-impl<I: DoubleEndedIterator<Item = crate::Result<InternalValue>>> Iterator for MvccStream<I> {
+impl<I: DoubleEndedIterator<Item = crate::Result<InternalValue>>, L: SeparatedBase> Iterator
+    for MvccStream<I, L>
+{
     type Item = crate::Result<InternalValue>;
 
     fn next(&mut self) -> Option<Self::Item> {
+        // The front's own failed key first: only once it is behind can the
+        // next key be checked against the back's.
+        if self.skip_front.is_some()
+            && let Some(e) = self.resume_skip_front()
+        {
+            return Some(Err(e));
+        }
+        // The back failed on a key: what reaches the front of it is what the
+        // failure left, never the key's value, so it is skipped before it is
+        // resolved (resolving could only fail again).
+        if let Some(failed) = self.skip_back.take() {
+            match self.skip_key_at_front(&failed) {
+                Skipped::Done => {}
+                Skipped::NotReached => self.skip_back = Some(failed),
+                Skipped::Error(e) => {
+                    self.skip_back = Some(failed);
+                    return Some(Err(e));
+                }
+            }
+        }
+        self.step_front()
+    }
+}
+
+/// What skipping a failed key at one end found.
+enum Skipped {
+    /// The key's versions were met there and are all behind.
+    Done,
+    /// The key has not reached that end yet.
+    NotReached,
+    /// An error was met among the key's versions; more may follow.
+    Error(crate::Error),
+}
+
+impl<I: DoubleEndedIterator<Item = crate::Result<InternalValue>>, L: SeparatedBase>
+    MvccStream<I, L>
+{
+    // Skips `key`'s versions at the front, up to the first error met.
+    fn skip_key_at_front(&mut self, key: &UserKey) -> Skipped {
+        let mut met = false;
+        loop {
+            let Some(next) = self.inner.next_if(|kv| {
+                if let Ok(kv) = kv {
+                    crate::comparator::same_user_key(&kv.key.user_key, key)
+                } else {
+                    // An error is taken only once the key was met: before
+                    // that it belongs to whatever key comes first.
+                    met
+                }
+            }) else {
+                return if met || self.inner.peek().is_none() {
+                    Skipped::Done
+                } else {
+                    Skipped::NotReached
+                };
+            };
+            match next {
+                Ok(_) => met = true,
+                Err(e) => return Skipped::Error(e),
+            }
+        }
+    }
+
+    // The back counterpart of `skip_key_at_front`.
+    fn skip_key_at_back(&mut self, key: &UserKey) -> Skipped {
+        let mut met = false;
+        while let Some(prev) = self.inner.peek_back() {
+            match prev {
+                Ok(prev) if !crate::comparator::same_user_key(&prev.key.user_key, key) => {
+                    break;
+                }
+                Err(_) if !met => break,
+                _ => {}
+            }
+            match self.inner.next_back() {
+                Some(Err(e)) => return Skipped::Error(e),
+                Some(Ok(_)) => met = true,
+                None => break,
+            }
+        }
+        if met || self.inner.peek_back().is_none() {
+            Skipped::Done
+        } else {
+            Skipped::NotReached
+        }
+    }
+}
+
+impl<I: DoubleEndedIterator<Item = crate::Result<InternalValue>>, L: SeparatedBase>
+    MvccStream<I, L>
+{
+    // One forward item, once `next` has dealt with both ends' failed keys.
+    fn step_front(&mut self) -> Option<crate::Result<InternalValue>> {
         let head = fail_iter!(self.inner.next()?);
 
         if head.key.value_type.is_merge_operand() {
@@ -287,10 +515,36 @@ impl<I: DoubleEndedIterator<Item = crate::Result<InternalValue>>> Iterator for M
     }
 }
 
-impl<I: DoubleEndedIterator<Item = crate::Result<InternalValue>>> DoubleEndedIterator
-    for MvccStream<I>
+impl<I: DoubleEndedIterator<Item = crate::Result<InternalValue>>, L: SeparatedBase>
+    DoubleEndedIterator for MvccStream<I, L>
 {
     fn next_back(&mut self) -> Option<Self::Item> {
+        // The mirror of `next`: the back's own failed key first, then a key
+        // the front failed on is skipped here before it is resolved.
+        if self.skip_back.is_some()
+            && let Some(e) = self.resume_skip_back()
+        {
+            return Some(Err(e));
+        }
+        if let Some(failed) = self.skip_front.take() {
+            match self.skip_key_at_back(&failed) {
+                Skipped::Done => {}
+                Skipped::NotReached => self.skip_front = Some(failed),
+                Skipped::Error(e) => {
+                    self.skip_front = Some(failed);
+                    return Some(Err(e));
+                }
+            }
+        }
+        self.step_back()
+    }
+}
+
+impl<I: DoubleEndedIterator<Item = crate::Result<InternalValue>>, L: SeparatedBase>
+    MvccStream<I, L>
+{
+    // One backward item, once `next_back` has dealt with both ends' failed keys.
+    fn step_back(&mut self) -> Option<crate::Result<InternalValue>> {
         // When a merge operator is configured we must buffer ALL entries
         // for a key (not just MergeOperands) because we only learn that
         // merge is needed when we reach the newest entry (last in
@@ -314,11 +568,17 @@ impl<I: DoubleEndedIterator<Item = crate::Result<InternalValue>>> DoubleEndedIte
                         clippy::expect_used,
                         reason = "we just asserted, the peeked value is an error"
                     )]
-                    return Some(Err(self
+                    let error = self
                         .inner
                         .next_back()
                         .expect("should exist")
-                        .expect_err("should be error")));
+                        .expect_err("should be error");
+                    // The versions of `tail`'s key buffered so far are gone
+                    // with the error; its newer ones are skipped too, so none
+                    // resolves without them (a merge without its base).
+                    self.key_entries_buf.clear();
+                    self.skip_back = Some(tail.key.user_key);
+                    return Some(Err(error));
                 }
                 None => {
                     // Last item — resolve merge only if newest entry is a MergeOperand

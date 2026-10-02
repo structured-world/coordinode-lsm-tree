@@ -733,6 +733,51 @@ fn multi_get_blob_tree_merge_operands() -> lsm_tree::Result<()> {
     Ok(())
 }
 
+/// A blob tree with a merge operator merges a key's operands onto an inline
+/// base however the key is read: alone, in a batch of one or two, or in a
+/// larger batch, on disk or in the memtable.
+#[test]
+fn blob_tree_reads_merge_operands_whatever_the_batch_size() -> lsm_tree::Result<()> {
+    for flushed in [false, true] {
+        let folder = get_tmp_folder();
+        let tree = Config::new(
+            &folder,
+            SequenceNumberCounter::default(),
+            SequenceNumberCounter::default(),
+        )
+        .with_kv_separation(Some(KvSeparationOptions {
+            separation_threshold: 100,
+            ..Default::default()
+        }))
+        .with_merge_operator(Some(Arc::new(ConcatMerge)))
+        .open()?;
+        tree.insert("k", "BASE", 0);
+        tree.merge("k", "_EXT", 1);
+        if flushed {
+            tree.flush_active_memtable(0)?;
+        }
+        let what = format!("flushed: {flushed}");
+        let merged = Some(b"BASE_EXT".as_slice());
+        assert_eq!(tree.get("k", SeqNo::MAX)?.as_deref(), merged, "get, {what}");
+        assert_eq!(
+            tree.multi_get(["k"], SeqNo::MAX)?[0].as_deref(),
+            merged,
+            "batch of one, {what}"
+        );
+        assert_eq!(
+            tree.multi_get(["k", "absent"], SeqNo::MAX)?[0].as_deref(),
+            merged,
+            "batch of two, {what}"
+        );
+        assert_eq!(
+            tree.multi_get(["k", "absent", "other"], SeqNo::MAX)?[0].as_deref(),
+            merged,
+            "batch of three, {what}"
+        );
+    }
+    Ok(())
+}
+
 #[test]
 fn multi_get_blob_tree_memtable_hits_skip_sst() -> lsm_tree::Result<()> {
     let folder = get_tmp_folder();

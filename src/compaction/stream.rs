@@ -130,6 +130,26 @@ pub trait StreamFilter {
     fn keeps_everything(&self) -> bool {
         false
     }
+
+    /// The value of `base`, an indirection a merge chain ends on, read from
+    /// the value log it points into, so the operands fold onto it as
+    /// `RocksDB`'s compaction folds them onto a blob base.
+    ///
+    /// `None` means this stream cannot read the value log; the chain is then
+    /// left as it is and folds where it can be read.
+    fn read_separated_base(&mut self, _base: &InternalValue) -> crate::Result<Option<UserValue>> {
+        Ok(None)
+    }
+
+    /// Where a value a merge produced is written: separated into the value
+    /// log when the tree separates values of its size, inline otherwise.
+    fn place_merged_value(
+        &mut self,
+        _key: &crate::key::InternalKey,
+        value: UserValue,
+    ) -> crate::Result<(ValueType, UserValue)> {
+        Ok((ValueType::Value, value))
+    }
 }
 
 /// A [`StreamFilter`] that does not modify anything
@@ -169,8 +189,9 @@ pub struct CompactionStream<'a, I: Iterator<Item = Item>, F: StreamFilter = NoFi
     /// Merge operator for collapsing merge operands during compaction
     merge_operator: Option<Arc<dyn MergeOperator>>,
 
-    /// Entries that could not be merged (e.g., Indirection base) and need
-    /// to be re-emitted unchanged on subsequent `next()` calls.
+    /// Entries that could not be merged here (no proven base, or a base this
+    /// stream cannot read) and are re-emitted unchanged on subsequent
+    /// `next()` calls.
     pending: VecDeque<InternalValue>,
 
     /// Range tombstones strictly below the watermark (`seqno < gc_watermark`)
@@ -531,8 +552,8 @@ impl<'a, I: Iterator<Item = Item>, F: StreamFilter + 'a> CompactionStream<'a, I,
         let user_key = head.key.user_key.clone();
         let head_seqno = head.key.seqno;
 
-        // Store full entries so we can re-emit them unchanged if we hit an
-        // Indirection base and cannot resolve the merge.
+        // Store full entries so we can re-emit them unchanged if the chain
+        // cannot be folded here.
         let mut collected: Vec<InternalValue> = vec![head];
         let mut base_value: Option<UserValue> = None;
         let mut found_boundary = false;
@@ -551,26 +572,6 @@ impl<'a, I: Iterator<Item = Item>, F: StreamFilter + 'a> CompactionStream<'a, I,
                 break;
             }
 
-            // Check for Indirection BEFORE consuming — the indirection entry
-            // stays in the stream and will be emitted normally by next().
-            let is_indirection = self.inner.peek().is_some_and(
-                |peeked| matches!(peeked, Ok(p) if p.key.value_type == ValueType::Indirection),
-            );
-
-            if is_indirection {
-                // Cannot merge with a blob-pointer base. Re-emit all consumed
-                // entries unchanged via the pending buffer to avoid data loss.
-                // The first entry is returned immediately; the rest are buffered
-                // for subsequent next() calls.
-                let mut iter = collected.into_iter();
-                #[expect(clippy::expect_used, reason = "collected always has head")]
-                let first = iter
-                    .next()
-                    .expect("collected should contain at least one element");
-                self.pending.extend(iter);
-                return Ok(first);
-            }
-
             #[expect(clippy::expect_used, reason = "we just checked peek is Some")]
             let next = self.inner.next().expect("peeked value should exist")?;
 
@@ -578,7 +579,20 @@ impl<'a, I: Iterator<Item = Item>, F: StreamFilter + 'a> CompactionStream<'a, I,
                 ValueType::MergeOperand => {
                     collected.push(next);
                 }
-                ValueType::Value => {
+                // A base kept in the value log is a base like an inline one,
+                // once its value is read from there. Neither reaches the
+                // compaction filter: the fold consumes the base and the
+                // versions under it, and the filter sees the head of the chain
+                // now and the folded value in the next compaction, as
+                // RocksDB's merge helper filters operands but folds onto the
+                // base (inline or blob) unfiltered.
+                //
+                // An indirection is a put even where an earlier release
+                // separated an operand on flush: the record keeps no value
+                // type, so nothing tells the two apart, and that release
+                // already read it as a put when it was the newest version and
+                // collected the versions under it in its own compaction.
+                ValueType::Value | ValueType::Indirection => {
                     found_boundary = true;
                     // A covered base is not a base: the tombstone hides it from
                     // every reader. Where this compaction may delete it, it
@@ -612,15 +626,34 @@ impl<'a, I: Iterator<Item = Item>, F: StreamFilter + 'a> CompactionStream<'a, I,
                             watcher.on_dropped(&next);
                         }
                         self.note_transform();
+                    } else if next.key.value_type == ValueType::Indirection {
+                        let Some(value) = self.filter.read_separated_base(&next)? else {
+                            // This stream cannot read the value log: the chain
+                            // and its base go back unchanged, in order.
+                            collected.push(next);
+                            let mut iter = collected.into_iter();
+                            #[expect(clippy::expect_used, reason = "collected always has head")]
+                            let first = iter
+                                .next()
+                                .expect("collected should contain at least one element");
+                            self.pending.extend(iter);
+                            return Ok(first);
+                        };
+                        // The fold replaces the pointer, so the blob it named
+                        // loses this reference. Like every pointer a compaction
+                        // drops, it never reaches a relocating flavour's
+                        // `write`, so it does not move a tight-space slice's
+                        // frontier by itself: its frame is reclaimed once a
+                        // later relocated pointer drains past it.
+                        if let Some(watcher) = &mut self.dropped_callback {
+                            watcher.on_dropped(&next);
+                        }
+                        base_value = Some(value);
                     } else {
                         base_value = Some(next.value);
                     }
                     self.drain_key(&user_key)?;
                     break;
-                }
-                ValueType::Indirection => {
-                    // Unreachable: handled by the peek check above.
-                    unreachable!("Indirection should be caught by peek check");
                 }
                 ValueType::Tombstone | ValueType::WeakTombstone => {
                     // Tombstone kills base — merge with no base. The tombstone
@@ -670,8 +703,8 @@ impl<'a, I: Iterator<Item = Item>, F: StreamFilter + 'a> CompactionStream<'a, I,
         // re-emitted unchanged instead, each with its own seqno and order, and
         // the fold happens where the base is.
         //
-        // Re-emission goes through `pending`, as the Indirection bail-out
-        // above does: those entries re-enter the pipeline one at a time, so
+        // Re-emission goes through `pending`, as the bail-outs above do:
+        // those entries re-enter the pipeline one at a time, so
         // each settles itself against the balance and the run reports no
         // collected history for this key. Nothing re-collects them into
         // another attempt either, since they are no longer in `inner`.
@@ -814,15 +847,39 @@ impl<'a, I: Iterator<Item = Item>, F: StreamFilter + 'a> CompactionStream<'a, I,
         // instead of carrying its operands forever. Composed without a proven
         // base it stays an operand, and folds onto the real base when a later
         // compaction reaches it.
-        let value_type = if compose_only {
-            ValueType::MergeOperand
-        } else {
-            ValueType::Value
-        };
-
-        Ok(InternalValue::from_components(
-            user_key, merged, head_seqno, value_type,
-        ))
+        if compose_only {
+            return Ok(InternalValue::from_components(
+                user_key,
+                merged,
+                head_seqno,
+                ValueType::MergeOperand,
+            ));
+        }
+        // A result an applicable tombstone deletes is dropped by the caller:
+        // written to the value log first, it would leave a blob no table
+        // references, so it stays inline.
+        if self.covered_and_deletable(user_key.as_ref(), head_seqno) {
+            return Ok(InternalValue::from_components(
+                user_key,
+                merged,
+                head_seqno,
+                ValueType::Value,
+            ));
+        }
+        // The value goes where a put of it would go: a value of the tree's
+        // separation size into the value log, not inline in the index. If the
+        // compaction later fails, this blob is an output like its tables:
+        // removing it belongs to the compaction's error path, not to this fold.
+        let mut result = InternalValue::from_components(
+            user_key,
+            UserValue::empty(),
+            head_seqno,
+            ValueType::Value,
+        );
+        let (value_type, value) = self.filter.place_merged_value(&result.key, merged)?;
+        result.key.value_type = value_type;
+        result.value = value;
+        Ok(result)
     }
 
     /// Records one visibility-changing drop (see the `transform_marker`
@@ -935,14 +992,20 @@ impl<'a, I: Iterator<Item = Item>, F: StreamFilter + 'a> Iterator for Compaction
 impl<'a, I: Iterator<Item = Item>, F: StreamFilter + 'a> CompactionStream<'a, I, F> {
     fn next_inner(&mut self) -> Option<Item> {
         loop {
-            // Pending entries (from Indirection bailout) go through the same pipeline.
+            // Pending entries (from a declined fold) go through the same pipeline.
             let next = self
                 .pending
                 .pop_front()
                 .map_or_else(|| self.inner.next(), |e| Some(Ok(e)));
             let mut head = fail_iter!(next?);
 
-            if !head.is_tombstone() {
+            // An entry an applicable tombstone deletes is dropped below
+            // whatever the filter says, and no snapshot can read it; asking
+            // the filter would only let a rewrite land in the value log as a
+            // blob no table references.
+            if !head.is_tombstone()
+                && !self.covered_and_deletable(head.key.user_key.as_ref(), head.key.seqno)
+            {
                 match fail_iter!(self.filter.filter_item(&head)) {
                     StreamFilterVerdict::Keep => { /* Do nothing */ }
                     StreamFilterVerdict::Replace((new_type, new_value)) => {
