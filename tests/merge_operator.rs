@@ -751,28 +751,22 @@ fn merge_range_with_snapshot_isolation() -> lsm_tree::Result<()> {
     Ok(())
 }
 
-/// BlobTree with large values triggers Indirection — merge falls back to latest operand.
+/// A blob tree hands a base separated into the value log to the operator as
+/// the value it is: the counter refuses a 2 KiB base, and the read reports it.
 #[test]
-fn merge_blob_tree_indirection_fallback() -> lsm_tree::Result<()> {
+fn merge_blob_tree_hands_the_separated_base_to_the_operator() -> lsm_tree::Result<()> {
     let folder = tempfile::tempdir()?;
     let tree = open_blob_tree_with_counter(&folder);
 
-    // Write a large base value (>1 KiB) to trigger blob separation
-    let large_base = vec![0u8; 2048];
-    tree.insert("big", &large_base, 0);
+    // Large enough (> 1 KiB) to be separated on flush.
+    tree.insert("big", vec![0u8; 2048], 0);
     tree.flush_active_memtable(0)?;
-
-    // Add merge operand on top
     tree.merge("big", 5_i64.to_le_bytes(), 1);
 
-    // get should return the raw operand bytes (fallback when base is Indirection)
-    let result = tree.get("big", 2)?;
-    assert_eq!(
-        result,
-        Some(5_i64.to_le_bytes().to_vec().into()),
-        "BlobTree indirection fallback must return latest operand bytes"
-    );
-
+    assert!(matches!(
+        tree.get("big", 2),
+        Err(lsm_tree::Error::MergeOperator)
+    ));
     Ok(())
 }
 

@@ -321,6 +321,23 @@ impl<'a, 'b: 'a> StreamFilter for StreamFilterAdapter<'a, 'b> {
         self.filter.is_none()
     }
 
+    fn read_separated_base(&mut self, base: &InternalValue) -> crate::Result<Option<UserValue>> {
+        ItemAccessor {
+            item: base,
+            shared: &self.shared,
+        }
+        .value()
+        .map(Some)
+    }
+
+    fn place_merged_value(
+        &mut self,
+        key: &InternalKey,
+        value: UserValue,
+    ) -> crate::Result<(ValueType, UserValue)> {
+        self.handle_write(key, value)
+    }
+
     fn filter_item(&mut self, item: &InternalValue) -> crate::Result<StreamFilterVerdict> {
         let Some(filter) = self.filter.as_mut() else {
             return Ok(StreamFilterVerdict::Keep);
@@ -352,6 +369,12 @@ impl<'a, 'b: 'a> StreamFilter for StreamFilterAdapter<'a, 'b> {
                 ValueType::WeakTombstone,
                 UserValue::empty(),
             ))),
+            // An operand stays inline: an indirection reads as a put, so an
+            // operand stored as one would stop merging onto its base. The
+            // stream keeps the operand type for a `Value` replacement.
+            Verdict::ReplaceValue(new_value) if item.key.value_type.is_merge_operand() => {
+                Ok(StreamFilterVerdict::Replace((ValueType::Value, new_value)))
+            }
             Verdict::ReplaceValue(new_value) => self
                 .handle_write(&item.key, new_value)
                 .map(StreamFilterVerdict::Replace),
