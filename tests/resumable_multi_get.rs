@@ -172,6 +172,69 @@ fn a_suspended_read_answers_at_its_snapshot_across_a_compaction() -> lsm_tree::R
     Ok(())
 }
 
+/// A read started at a ceiling above every write answers what the tree held
+/// when it started, whatever is written while it is suspended: a range
+/// deletion over its keys and a merge operand on one of them, both landing
+/// in the memtable its snapshot shares, are newer than the read and change
+/// nothing of its answer.
+#[test]
+fn a_suspended_read_at_a_ceiling_ignores_what_is_written_after_it_started() -> lsm_tree::Result<()>
+{
+    for blob in [false, true] {
+        let folder = tempfile::tempdir()?;
+        let mut config = Config::new(
+            folder.path(),
+            SequenceNumberCounter::default(),
+            SequenceNumberCounter::default(),
+        )
+        .use_cache(Arc::new(Cache::with_capacity_bytes(0)))
+        .with_merge_operator(Some(Arc::new(Concat)));
+        if blob {
+            config = config
+                .with_kv_separation(Some(KvSeparationOptions::default().separation_threshold(1)));
+        }
+        let tree = config.open()?;
+        for i in 0..200u32 {
+            tree.insert(format!("k{i:05}"), format!("v{i}"), u64::from(i));
+        }
+        tree.merge("m", "a", 200);
+        tree.flush_active_memtable(0)?;
+        let mut keys: Vec<String> = (0..200u32).step_by(7).map(|i| format!("k{i:05}")).collect();
+        keys.push("m".into());
+        let before = tree.multi_get(&keys, SeqNo::MAX)?;
+
+        let Step::Pending(read) =
+            tree.start_multi_get(keys.iter().map(String::as_str), SeqNo::MAX)?
+        else {
+            panic!("a cold read has work to hand out");
+        };
+        // Written while the read is parked, at seqnos above everything it saw.
+        tree.remove_range("k00000", "k99999", 1_000);
+        tree.merge("m", "b", 1_001);
+
+        assert_eq!(drive(Step::Pending(read))?, before, "blob tree: {blob}");
+    }
+    Ok(())
+}
+
+/// Concatenates a key's operands onto its base.
+struct Concat;
+
+impl lsm_tree::MergeOperator for Concat {
+    fn merge(
+        &self,
+        _key: &[u8],
+        base: Option<&[u8]>,
+        operands: &[&[u8]],
+    ) -> lsm_tree::Result<UserValue> {
+        let mut out = base.unwrap_or_default().to_vec();
+        for operand in operands {
+            out.extend_from_slice(operand);
+        }
+        Ok(out.into())
+    }
+}
+
 /// A blob tree's read parked across a compaction that rewrites every value
 /// and leaves the blob files it read from unreferenced by the tree still
 /// reads its snapshot's values from them.

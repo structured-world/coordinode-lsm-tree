@@ -3062,7 +3062,9 @@ impl Tree {
     /// Starts a multi-get of `keys` at `seqno` that its caller drives: the
     /// read hands out its block reads and jobs instead of carrying them out,
     /// so the calling thread is never parked inside it. It answers what
-    /// [`AbstractTree::multi_get`] answers.
+    /// [`AbstractTree::multi_get`] answers at the moment it starts: what is
+    /// written while it is suspended is not part of its answer, even at a
+    /// ceiling such as [`SeqNo::MAX`](crate::SeqNo).
     ///
     /// # Errors
     ///
@@ -3109,6 +3111,7 @@ impl Tree {
         seqno: SeqNo,
     ) -> crate::Result<resumable::Step> {
         let snapshot = self.snapshot_for_read(seqno)?;
+        let seqno = Self::read_ceiling(&snapshot, seqno);
         Ok(resumable::ResumableMultiGet::start(read_job::ReadCtx {
             super_version: crate::version::SnapshotRef::Owned((*snapshot).clone()),
             keys: keys.into_iter().map(Into::into).collect(),
@@ -3118,6 +3121,39 @@ impl Tree {
             values: read_job::Values::Inline,
             metadata_budget: self.config.multi_get_metadata_budget,
         }))
+    }
+
+    /// The seqno a read started at `seqno` on `snapshot` reads at for its whole
+    /// life: at most one past the newest seqno the snapshot holds. The active
+    /// memtable the snapshot shares keeps taking writes, and a read that is
+    /// suspended still checks range deletions and merges against it after
+    /// it started; what lands there at a higher seqno is then not part of its
+    /// answer, which stays what the tree held when it started.
+    pub(crate) fn read_ceiling(snapshot: &SuperVersion, seqno: SeqNo) -> SeqNo {
+        // Past the newest seqno; nothing is newer than the largest one.
+        let next = |newest: SeqNo| newest.checked_add(1).unwrap_or(SeqNo::MAX);
+        let memtables = snapshot.active_memtable.get_highest_seqno().max(
+            snapshot
+                .sealed_memtables
+                .iter()
+                .map(|mt| mt.get_highest_seqno())
+                .max()
+                .flatten(),
+        );
+        // A ceiling the memtables already reach admits nothing newer: the
+        // tables need not be looked at.
+        if memtables.is_some_and(|newest| next(newest) >= seqno) {
+            return seqno;
+        }
+        let tables = snapshot
+            .version
+            .iter_tables()
+            .map(Table::get_highest_seqno)
+            .max();
+        // An empty snapshot holds nothing a read could see.
+        memtables
+            .max(tables)
+            .map_or(0, |newest| seqno.min(next(newest)))
     }
 
     /// Shared point-read logic for `get()` and `multi_get()`: finds the newest

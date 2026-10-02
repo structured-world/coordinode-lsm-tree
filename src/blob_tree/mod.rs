@@ -223,6 +223,19 @@ impl BlobTree {
         else {
             return Ok(None);
         };
+        // The newest version is an operand: the key's value is its operands
+        // merged onto its base, as a batch of keys resolves it. Without a
+        // merge operator the operand is the value.
+        if item.key.value_type.is_merge_operand()
+            && let Some(merge_operator) = &self.index.config.merge_operator
+        {
+            return crate::Tree::resolve_merge_via_pipeline(
+                super_version.clone(),
+                key,
+                seqno,
+                Arc::clone(merge_operator),
+            );
+        }
 
         let (_, v) = resolve_value_handle(
             self.id(),
@@ -287,6 +300,7 @@ impl BlobTree {
         seqno: SeqNo,
     ) -> crate::Result<crate::resumable::Step> {
         let snapshot = self.index.snapshot_for_read(seqno)?;
+        let seqno = crate::Tree::read_ceiling(&snapshot, seqno);
         Ok(crate::resumable::ResumableMultiGet::start(
             crate::tree::read_job::ReadCtx {
                 super_version: crate::version::SnapshotRef::Owned((*snapshot).clone()),
