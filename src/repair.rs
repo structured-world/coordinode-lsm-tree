@@ -682,6 +682,68 @@ fn repair_recover_params(
     params
 }
 
+/// [`repair_recover_params`] for a table the repair holds until it publishes
+/// the rebuilt manifest: its file goes through the configured descriptor
+/// cache, within its budget, so the tables held at once need no descriptor
+/// each. A tree id of its own: another copy of this table id, or its salvage
+/// replacement, must never be handed this file's descriptor.
+#[cfg(feature = "std")]
+fn held_recover_params(
+    config: &Config,
+    file_path: PathBuf,
+    checksum: crate::Checksum,
+    table_id: TableId,
+    fs: Arc<dyn crate::fs::Fs>,
+    global_seqno: Option<SeqNo>,
+) -> crate::table::RecoverParams {
+    let mut params = repair_recover_params(config, file_path, checksum, table_id, fs, global_seqno);
+    if let Some((cache, tree_id)) = held_descriptors(config) {
+        params.descriptor_table = Some(cache);
+        params.tree_id = tree_id;
+    }
+    params
+}
+
+/// The descriptors a repair cached, from its first tree id on, swept from the
+/// cache when the repair ends.
+#[cfg(feature = "std")]
+struct HeldDescriptors {
+    cache: Option<Arc<crate::DescriptorTable>>,
+    first: crate::tree::inner::TreeId,
+}
+
+#[cfg(feature = "std")]
+impl Drop for HeldDescriptors {
+    fn drop(&mut self) {
+        if let Some(cache) = &self.cache {
+            cache.remove_trees_from(self.first);
+        }
+    }
+}
+
+/// Lets go of a table the repair held before its file is removed, its cached
+/// descriptor with it: a backend that refuses to unlink an open file
+/// (Windows) would otherwise fail the removal while the cache keeps it open.
+#[cfg(feature = "std")]
+fn release_held(config: &Config, table: Table) {
+    if let Some(cache) = &config.descriptor_table {
+        cache.remove_for_table(&table.global_id());
+    }
+    drop(table);
+}
+
+/// The descriptor cache a table the repair holds keeps its file in, with a
+/// tree id of its own for it; `None` when the configuration keeps none.
+#[cfg(feature = "std")]
+fn held_descriptors(
+    config: &Config,
+) -> Option<(Arc<crate::DescriptorTable>, crate::tree::inner::TreeId)> {
+    config
+        .descriptor_table
+        .clone()
+        .map(|cache| (cache, crate::tree::inner::get_next_tree_id()))
+}
+
 /// Whether an I/O failure must PROPAGATE out of the repair instead of grading
 /// the file it came from — either UNAMBIGUOUSLY TRANSIENT, or an
 /// ENVIRONMENTAL access failure that does not implicate the bytes on disk.
@@ -1637,7 +1699,7 @@ fn try_salvage_table(
     // ingest offset applies to the copy unchanged (the salvage preserves
     // local seqnos), so it is reused here just like on the whole-recover path.
     let checksum = crate::Checksum::from_raw(compute_table_checksum(&**fs, table_path)?);
-    let table = match Table::recover(repair_recover_params(
+    let table = match Table::recover(held_recover_params(
         config,
         table_path.to_path_buf(),
         checksum,
@@ -1675,7 +1737,7 @@ fn try_salvage_table(
             table.max_local_seqno(),
         )
     {
-        drop(table);
+        release_held(config, table);
         // Remove the rejected replacement, and do NOT swallow the error. A
         // discarded `remove_file` failure would leave the freshly-written
         // numeric SST in `tables/`; repair would still install a manifest that
@@ -1983,7 +2045,7 @@ fn restrict_salvaged_output(
                 &bound,
                 config.sync_mode,
             )
-            .and_then(|()| salvaged.reopen_restricted(bound));
+            .and_then(|()| salvaged.reopen_restricted_with(bound, held_descriptors(config)));
             match restricted {
                 Ok(table) => Ok(table),
                 Err(e) => {
@@ -1991,7 +2053,7 @@ fn restrict_salvaged_output(
                     // backend that refuses to unlink an OPEN file (Windows; the
                     // deletion path closes handles for this same reason) would
                     // fail while `salvaged` still holds it.
-                    drop(salvaged);
+                    release_held(config, salvaged);
                     // Remove on EVERY failure, transient or persistent: the
                     // replacement is unpunched with no valid sidecar, so a run
                     // that adopted it would resurrect the sub-bound rows. The
@@ -3056,15 +3118,17 @@ fn recover_blob_files(
                     &*config.fs,
                     &salvaged_path,
                 )?);
-                let bf = crate::vlog::recover_blob_file_from(
+                let held = held_descriptors(config);
+                let bf = crate::vlog::recover_blob_file_cached(
                     &salvaged_path,
                     new_id,
                     checksum,
-                    0,
+                    held.as_ref().map_or(0, |(_, tree_id)| *tree_id),
                     &config.fs,
                     0,
                     #[cfg(zstd_any)]
                     &config.current_zstd_dictionaries(),
+                    held.as_ref().map(|(cache, _)| cache),
                 )?;
                 Ok(Some((bf, report)))
             })();
@@ -3172,15 +3236,20 @@ fn recover_blob_files(
             }
         };
 
-        match crate::vlog::recover_blob_file_from(
+        // Held until the rebuilt manifest is published, as a recovered table
+        // is, so its descriptor goes through the repair's cache (see
+        // `held_recover_params`).
+        let held = held_descriptors(config);
+        match crate::vlog::recover_blob_file_cached(
             &blob_path,
             blob_id,
             checksum,
-            0,
+            held.as_ref().map_or(0, |(_, tree_id)| *tree_id),
             &config.fs,
             frontier,
             #[cfg(zstd_any)]
             &config.current_zstd_dictionaries(),
+            held.as_ref().map(|(cache, _)| cache),
         ) {
             Ok(bf) => {
                 if frontier > 0 {
@@ -4027,6 +4096,20 @@ fn repair_tree(
     #[cfg(zstd_any)]
     let config = &owned_config;
 
+    // The tables the repair holds keep their files in the configured
+    // descriptor cache, as an open tree does, each under a tree id of its own
+    // handed out from here on; every id from this one is swept out of the
+    // cache before the post-commit swaps (see `held_recover_params`).
+    let first_tree_id = crate::tree::inner::get_next_tree_id();
+    // However the repair ends (an abort, a cancellation, a failed commit),
+    // the descriptors it cached close with it: left open, a temp it built
+    // could not be removed by the retry on a backend that refuses to unlink
+    // an open file.
+    let _held = HeldDescriptors {
+        cache: config.descriptor_table.clone(),
+        first: first_tree_id,
+    };
+
     if let Some(p) = &config.recovery_progress {
         p.set_phase(crate::RecoveryPhase::PendingSwaps);
     }
@@ -4069,7 +4152,13 @@ fn repair_tree(
     // Phase 2: turn what the scan found into a manifest, commit it, and carry
     // out the removals and swaps that commit authorizes. The directory lock is
     // held by THIS frame for the whole of it.
-    let rebuilt = rebuild_from_scan(config, allow_resurrection, manifest_referenced, scan);
+    let rebuilt = rebuild_from_scan(
+        config,
+        allow_resurrection,
+        manifest_referenced,
+        scan,
+        first_tree_id,
+    );
     #[cfg(zstd_any)]
     let rebuilt = set_aside_damaged_dictionaries(config, damaged_dictionaries, rebuilt);
     rebuilt
@@ -4580,7 +4669,7 @@ fn scan_table_folders(
             // structural-failure salvage arm below recovers the intact blocks
             // (or records it unreadable with salvage off).
             let recovered = match own_digest {
-                Ok(digest) => Table::recover(repair_recover_params(
+                Ok(digest) => Table::recover(held_recover_params(
                     config,
                     table_path.clone(),
                     digest,
@@ -4694,7 +4783,8 @@ fn scan_table_folders(
                 // `reopen_restricted` reads only from the punch offset up, so a
                 // genuinely unreadable SUFFIX still surfaces its error there.
                 if let Some(bound) = &exact_bound {
-                    break 'restrict table.reopen_restricted(bound.clone());
+                    break 'restrict table
+                        .reopen_restricted_with(bound.clone(), held_descriptors(config));
                 }
 
                 // No trustworthy exact bound. An unpunched table never carried a
@@ -4759,7 +4849,8 @@ fn scan_table_folders(
                         match derived {
                             Ok(DerivedRestriction::Bound(bound)) => {
                                 geometry_lossy = !allow_resurrection;
-                                break 'restrict table.reopen_restricted(bound);
+                                break 'restrict table
+                                    .reopen_restricted_with(bound, held_descriptors(config));
                             }
                             Err(e) => break 'restrict Err(e),
                             Ok(
@@ -5220,6 +5311,7 @@ fn rebuild_from_scan(
     allow_resurrection: bool,
     manifest_referenced: Option<CommittedManifest>,
     scan: TableScan,
+    first_tree_id: crate::tree::inner::TreeId,
 ) -> crate::Result<RepairReport> {
     let TableScan {
         recovered_by_id,
@@ -6192,6 +6284,7 @@ fn rebuild_from_scan(
             unreferenced_blob_files,
             blob_files_salvaged,
             salvaged,
+            first_tree_id,
         },
     )
 }
@@ -6227,6 +6320,9 @@ struct RepairPublication<'a> {
     unreferenced_blob_files: Vec<PathBuf>,
     blob_files_salvaged: Vec<(PathBuf, String)>,
     salvaged: usize,
+    /// The first tree id the repair handed out: the descriptors cached under
+    /// it and every later id are closed before the post-commit swaps.
+    first_tree_id: crate::tree::inner::TreeId,
 }
 
 /// Phase 3 of [`repair_tree`]: commit the rebuilt manifest, then carry out
@@ -6265,6 +6361,7 @@ fn publish_repaired_manifest(
         unreferenced_blob_files,
         mut blob_files_salvaged,
         salvaged,
+        first_tree_id,
     } = publication;
     // A rebuilt manifest whose highest table id is the LAST one cannot be
     // committed: the next open seeds its id allocator with `highest + 1`,
@@ -6540,6 +6637,14 @@ fn publish_repaired_manifest(
     // NOT best-effort: the manifest already names this content, so a swap that
     // does not happen is a tree whose next open finds the damaged file under the
     // manifest's checksum and fails.
+    //
+    // The descriptors the repair cached close first: a file still open cannot
+    // be replaced or removed on Windows, and nothing reads a held table again.
+    // A tree opened on the shared cache meanwhile has its ids in the same range
+    // and only loses cached descriptors, which it reopens.
+    if let Some(descriptors) = &config.descriptor_table {
+        descriptors.remove_trees_from(first_tree_id);
+    }
     if post_commit_error.is_none() {
         for (fs, tmp_path, table_path, restricted) in swap_after_commit {
             if let Err(e) =

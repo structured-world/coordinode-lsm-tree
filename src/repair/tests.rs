@@ -15389,6 +15389,142 @@ fn repair_propagates_a_permission_denied_open() -> crate::Result<()> {
     Ok(())
 }
 
+/// Running out of file descriptors fails every open after the limit, whatever
+/// the file holds. Graded unreadable, each of those intact tables would be
+/// left out of the rebuilt manifest; the repair has to stop and say why.
+#[test]
+fn repair_propagates_an_exhausted_descriptor_table() -> crate::Result<()> {
+    use crate::fs::{Fault, FaultFs, FaultOp, FaultRule, MemFs};
+    use crate::io::ErrorKind;
+    use crate::{Config, SequenceNumberCounter};
+    use std::sync::Arc;
+
+    let memfs = Arc::new(MemFs::new());
+    let root = std::path::absolute("/db")?;
+    standard_tree_without_manifest(&memfs, &root)?;
+
+    // The manifest files of the tree and the bytes of every table.
+    let tree_state = || -> crate::Result<Vec<(String, Vec<u8>)>> {
+        use crate::fs::Fs;
+        let mut state = Vec::new();
+        for e in memfs.read_dir(&root)? {
+            let manifest = e.file_name == "current"
+                || e.file_name.starts_with("edits-")
+                || e.file_name
+                    .strip_prefix('v')
+                    .is_some_and(|rest| rest.parse::<u64>().is_ok());
+            if manifest {
+                state.push((e.file_name, Vec::new()));
+            }
+        }
+        for e in memfs.read_dir(&root.join("tables"))? {
+            let file = memfs.open(&e.path, &crate::fs::FsOpenOptions::new().read(true))?;
+            let len = crate::fs::FsFile::metadata(&*file)?.len;
+            let bytes = crate::file::read_exact(&*file, 0, usize::try_from(len).unwrap_or(0))?;
+            state.push((e.file_name, bytes.to_vec()));
+        }
+        state.sort();
+        Ok(state)
+    };
+    let before = tree_state()?;
+
+    let fault = FaultFs::new((*memfs).clone());
+    fault.injector().arm(
+        FaultRule::new(FaultOp::Open, Fault::Error(ErrorKind::TooManyOpenFiles))
+            .on_path(root.join("tables").join("0").to_string_lossy()),
+    );
+    let result = Config::new(
+        &root,
+        SequenceNumberCounter::default(),
+        SequenceNumberCounter::default(),
+    )
+    .with_fs(fault)
+    .repair();
+    assert!(
+        matches!(result, Err(crate::Error::Io(ref e)) if e.kind() == ErrorKind::TooManyOpenFiles),
+        "descriptor exhaustion must abort the repair, never grade the file: {:?}",
+        result.map(|r| (r.recovered, r.unreadable)),
+    );
+    assert!(
+        tree_state()? == before,
+        "the aborted repair published no manifest and left every table as it was"
+    );
+
+    // With descriptors to spare, the retry recovers the intact file.
+    let report = Config::new(
+        &root,
+        SequenceNumberCounter::default(),
+        SequenceNumberCounter::default(),
+    )
+    .with_shared_fs(memfs)
+    .repair()?;
+    assert_eq!(
+        report.recovered, 1,
+        "the intact table survives the shortage"
+    );
+    Ok(())
+}
+
+/// A repair that aborts leaves none of the descriptors it cached behind: the
+/// tables it held before the abort keep their files in the shared cache, and
+/// left there, an abandoned temp could not be removed by the retry on a
+/// backend that refuses to unlink an open file.
+#[test]
+fn an_aborted_repair_closes_the_descriptors_it_cached() -> crate::Result<()> {
+    use crate::fs::{Fault, FaultFs, FaultOp, FaultRule, MemFs};
+    use crate::io::ErrorKind;
+    use crate::{AbstractTree, Config, DescriptorTable, SequenceNumberCounter};
+    use std::sync::Arc;
+
+    let memfs = Arc::new(MemFs::new());
+    let root = std::path::absolute("/db")?;
+    let config = || {
+        Config::new(
+            &root,
+            SequenceNumberCounter::default(),
+            SequenceNumberCounter::default(),
+        )
+    };
+    {
+        let tree = config().with_shared_fs(memfs.clone()).open()?;
+        for table in 0..3u64 {
+            tree.insert(format!("k{table}"), b"v", table);
+            tree.flush_active_memtable(0)?;
+        }
+    }
+    {
+        use crate::fs::Fs;
+        for e in memfs.read_dir(&root)? {
+            if e.file_name == "current" || e.file_name.starts_with('v') {
+                memfs.remove_file(&e.path)?;
+            }
+        }
+    }
+
+    // The last table scanned cannot be opened, after the others were.
+    let cache = Arc::new(DescriptorTable::new(16));
+    let fault = FaultFs::new((*memfs).clone());
+    fault.injector().arm(
+        FaultRule::new(FaultOp::Open, Fault::Error(ErrorKind::TooManyOpenFiles))
+            .on_path(root.join("tables").join("2").to_string_lossy()),
+    );
+    let result = config()
+        .with_fs(fault)
+        .use_descriptor_table(Some(Arc::clone(&cache)))
+        .repair();
+    assert!(
+        matches!(result, Err(crate::Error::Io(ref e)) if e.kind() == ErrorKind::TooManyOpenFiles),
+        "the repair aborts: {:?}",
+        result.map(|r| r.recovered),
+    );
+    assert_eq!(
+        cache.len(),
+        0,
+        "every descriptor the repair cached is closed"
+    );
+    Ok(())
+}
+
 /// A salvage replacement write failing with ENOSPC must abort the repair:
 /// the healthy SOURCE is not implicated by a full destination, and grading
 /// it unsalvageable would commit a manifest without it and then remove it —

@@ -548,6 +548,24 @@ where
         self.capacity
     }
 
+    /// Removes every entry whose key `doomed` picks. Walks every shard under
+    /// its write lock: for a sweep, not the hot path.
+    pub fn remove_where(&self, mut doomed: impl FnMut(&K) -> bool) {
+        for shard in &self.shards {
+            let mut core = shard.0.write();
+            let keys: alloc::vec::Vec<K> = core
+                .map
+                .iter()
+                .map(|(key, _)| key)
+                .filter(|key| doomed(key))
+                .cloned()
+                .collect();
+            for key in keys {
+                core.remove(self.hasher.hash_one(&key), &key);
+            }
+        }
+    }
+
     /// Number of resident entries across all shards (takes each shard's read
     /// lock; intended for diagnostics, not the hot path).
     pub fn len(&self) -> usize {
