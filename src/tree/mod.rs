@@ -4,6 +4,7 @@
 
 #[cfg(feature = "columnar")]
 pub mod columnar_scan;
+mod data_stage;
 pub mod ingest;
 pub mod inner;
 mod level_stages;
@@ -4287,45 +4288,36 @@ impl Tree {
         found: Option<&mut Vec<(crate::TableId, usize)>>,
         carried: &mut Option<(crate::TableId, Arc<dyn crate::fs::FsFile>)>,
     ) -> crate::Result<()> {
-        let mut hits: Vec<(usize, usize, InternalValue)> = Vec::new();
-        for (index, (task, block)) in chunk.iter().zip(cached).enumerate() {
-            match block {
-                TaskBlock::Held(block) => {
-                    Self::read_task_keys(task, index, block, keys, &mut hits)?;
-                }
-                TaskBlock::Load => {
-                    if let Some(block) = task.table.load_data_block(&task.handle)? {
-                        Self::read_task_keys(task, index, &block, keys, &mut hits)?;
-                    }
-                }
-                TaskBlock::Read => {}
+        let (mut chunk_read, work) = data_stage::ChunkRead::start(chunk, cached, keys)?;
+
+        // A Page-ECC or columnar table's block is loaded through its own path;
+        // the others are read below.
+        let mut reads: Vec<(usize, &Table, crate::table::BlockHandle, Vec<u8>)> = Vec::new();
+        for item in work {
+            match item {
+                data_stage::ChunkWork::Load {
+                    index,
+                    table,
+                    handle,
+                } => chunk_read.loaded(index, table.load_data_block(&handle)?)?,
+                data_stage::ChunkWork::Read {
+                    index,
+                    table,
+                    handle,
+                    buf,
+                } => reads.push((index, table, handle, buf)),
             }
         }
-        // Scratch for the blocks to be read, empty for the others; a size no
-        // block can have fails the chunk before it is allocated.
-        let mut buffers: Vec<Vec<u8>> = chunk
-            .iter()
-            .zip(cached)
-            .map(|(t, block)| match block {
-                TaskBlock::Read => t.table.block_buffer(&t.handle),
-                TaskBlock::Held(_) | TaskBlock::Load => Ok(Vec::new()),
-            })
-            .collect::<crate::Result<_>>()?;
 
         // The files of the tables whose blocks are read, opened for this chunk
         // only, once per table: a table's tasks are consecutive. The previous
         // chunk's last file is taken over when this chunk goes on with its
-        // table, and let go otherwise. Each task to read names its file by
-        // position here.
+        // table, and let go otherwise. Each read names its file by position.
         let mut carry = carried.take();
         let mut files: Vec<(crate::TableId, Arc<dyn crate::fs::FsFile>)> = Vec::new();
-        let mut file_of: Vec<Option<usize>> = Vec::with_capacity(chunk.len());
-        for (task, block) in chunk.iter().zip(cached) {
-            if !matches!(block, TaskBlock::Read) {
-                file_of.push(None);
-                continue;
-            }
-            let id = task.table.id();
+        let mut file_of: Vec<usize> = Vec::with_capacity(reads.len());
+        for &(_, table, _, _) in &reads {
+            let id = table.id();
             if files.last().is_none_or(|&(last, _)| last != id) {
                 let file = match carry.take() {
                     Some((carried_id, file)) if carried_id == id => file,
@@ -4333,12 +4325,12 @@ impl Tree {
                     // a scrutinee left unbound lives to the end of the match.
                     other => {
                         drop(other);
-                        task.table.open_file()?
+                        table.open_file()?
                     }
                 };
                 files.push((id, file));
             }
-            file_of.push(files.len().checked_sub(1));
+            file_of.push(files.len() - 1);
         }
         *carried = files.last().cloned();
 
@@ -4349,84 +4341,51 @@ impl Tree {
         struct BackendReads<'f, 'b> {
             fs: &'f Arc<dyn crate::fs::Fs>,
             reqs: Vec<crate::fs::BlockRead<'b>>,
-            tasks: Vec<usize>,
+            tasks: Vec<(usize, crate::table::BlockHandle)>,
         }
         let mut groups: Vec<BackendReads<'_, '_>> = Vec::new();
-        for (index, ((task, buf), block)) in
-            chunk.iter().zip(buffers.iter_mut()).zip(cached).enumerate()
-        {
-            if !matches!(block, TaskBlock::Read) {
-                continue;
-            }
-            let Some(file) = file_of
-                .get(index)
-                .copied()
-                .flatten()
-                .and_then(|at| files.get(at))
-            else {
+        for ((index, table, handle, buf), &at) in reads.iter_mut().zip(&file_of) {
+            let Some(file) = files.get(at) else {
                 continue;
             };
             let req = crate::fs::BlockRead {
                 file: file.1.as_ref(),
-                offset: *task.handle.offset(),
+                offset: *handle.offset(),
                 buf: crate::fs::BlockBuf::new(&mut buf[..]),
             };
             match groups
                 .iter_mut()
-                .find(|group| Arc::ptr_eq(group.fs, &task.table.fs))
+                .find(|group| Arc::ptr_eq(group.fs, &table.fs))
             {
                 Some(group) => {
                     group.reqs.push(req);
-                    group.tasks.push(index);
+                    group.tasks.push((*index, *handle));
                 }
                 None => groups.push(BackendReads {
-                    fs: &task.table.fs,
+                    fs: &table.fs,
                     reqs: vec![req],
-                    tasks: vec![index],
+                    tasks: vec![(*index, *handle)],
                 }),
             }
         }
 
-        // A block is decoded the moment its read completes, while the rest of
-        // its group may still be in flight. A decode failure is held rather
-        // than returned: it must not abandon reads still in flight, and when
-        // several fail the lowest task wins, as a decode in task order would.
-        // Hits are applied in task order once every read is back: tasks follow
-        // the level's runs newest first, and at an equal seqno the first task's
-        // entry is the one a single-key read returns, whatever order the
-        // reads completed in.
-        let mut decode_failure: Option<(usize, crate::Error)> = None;
+        // A block is handed to the chunk the moment its read completes, while
+        // the rest of its group may still be in flight.
         for BackendReads { fs, reqs, tasks } in &mut groups {
             // Charged as issued, group by group: these reads bypass the
             // per-block load path that charges every other read, and a group
             // after a failure is never asked.
-            for &index in tasks.iter() {
+            for &(index, handle) in tasks.iter() {
                 if let Some(task) = chunk.get(index) {
                     task.table.record_batched_read(
                         crate::table::block::BlockType::Data,
-                        core::slice::from_ref(&task.handle),
+                        core::slice::from_ref(&handle),
                     );
                 }
             }
             fs.read_blocks_batched_each(reqs, &mut |position, req| {
-                let Some((index, task)) = tasks
-                    .get(position)
-                    .and_then(|&index| chunk.get(index).map(|task| (index, task)))
-                else {
-                    return;
-                };
-                if let Err(e) = Self::resolve_block_task(
-                    task,
-                    index,
-                    req.buf.filled_bytes(),
-                    keep_room,
-                    keys,
-                    &mut hits,
-                ) && decode_failure
-                    .as_ref()
-                    .is_none_or(|(held, _)| index < *held)
-                {
-                    decode_failure = Some((index, e));
+                if let Some(&(index, _)) = tasks.get(position) {
+                    chunk_read.read(index, req.buf.filled_bytes(), keep_room);
                 }
             })?;
             // An implementation that reported success without filling a
@@ -4439,21 +4398,7 @@ impl Tree {
                 )));
             }
         }
-        if let Some((_, e)) = decode_failure {
-            return Err(e);
-        }
-        // A task holds each key once, so only the order across tasks matters.
-        hits.sort_unstable_by_key(|&(task, _, _)| task);
-        if let Some(found) = found {
-            found.extend(
-                hits.iter()
-                    .filter_map(|&(task, kidx, _)| Some((chunk.get(task)?.table.id(), kidx))),
-            );
-        }
-        for (_, kidx, item) in hits {
-            Self::keep_highest(results, kidx, item);
-        }
-        Ok(())
+        chunk_read.finish(results, found)
     }
 
     /// Decodes the block of task `index` from `bytes`, keeping it in the cache
