@@ -586,6 +586,12 @@ impl<'a, I: Iterator<Item = Item>, F: StreamFilter + 'a> CompactionStream<'a, I,
                 // now and the folded value in the next compaction, as
                 // RocksDB's merge helper filters operands but folds onto the
                 // base (inline or blob) unfiltered.
+                //
+                // An indirection is a put even where an earlier release
+                // separated an operand on flush: the record keeps no value
+                // type, so nothing tells the two apart, and that release
+                // already read it as a put when it was the newest version and
+                // collected the versions under it in its own compaction.
                 ValueType::Value | ValueType::Indirection => {
                     found_boundary = true;
                     // A covered base is not a base: the tombstone hides it from
