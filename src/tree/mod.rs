@@ -174,8 +174,8 @@ enum LevelRead<'a> {
     Pending,
     /// Read in stages.
     Staged(crate::table::staged::StagedRead<'a>),
-    /// To be planned serially: its blocks need the load path, or a stage
-    /// failed.
+    /// To be planned serially: a Page-ECC table, whose every block needs the
+    /// load path's recovery, or a table a stage of which failed.
     Serial,
     /// Planned serially: its read seqno, the blocks it reads with the
     /// positions of their keys in its span, and the filter probes planning

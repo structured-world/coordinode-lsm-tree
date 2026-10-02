@@ -172,6 +172,47 @@ fn a_suspended_read_answers_at_its_snapshot_across_a_compaction() -> lsm_tree::R
     Ok(())
 }
 
+/// A blob tree's read parked across a compaction that rewrites every value
+/// and leaves the blob files it read from unreferenced by the tree still
+/// reads its snapshot's values from them.
+#[test]
+fn a_suspended_blob_read_answers_at_its_snapshot_across_blob_gc() -> lsm_tree::Result<()> {
+    let folder = tempfile::tempdir()?;
+    let tree = layered_tree(folder.path(), true, 0)?;
+    tree.flush_active_memtable(0)?;
+    let keys = batch();
+    let before = tree.multi_get(&keys, SeqNo::MAX)?;
+
+    let Step::Pending(mut read) =
+        tree.start_multi_get(keys.iter().map(String::as_str), SeqNo::MAX)?
+    else {
+        panic!("a cold read has work to hand out");
+    };
+    let jobs = read.take_jobs();
+    let reads = read.take_reads();
+    let files_before = tree.blob_file_count();
+    for key in &keys {
+        tree.insert(key.as_str(), "rewritten", 2_000_000);
+    }
+    tree.flush_active_memtable(0)?;
+    tree.major_compact(u64::MAX, SeqNo::MAX)?;
+    assert!(
+        tree.stale_blob_bytes() > 0 || tree.blob_file_count() != files_before,
+        "the compaction left the old values' blob files stale or dropped"
+    );
+
+    for job in jobs {
+        let outcome = job.run();
+        read.complete_job(outcome);
+    }
+    for mut block in reads {
+        let result = block.file.read_at(&mut block.buf, block.offset).map(|_| ());
+        read.complete_read(block.tag, result, block.buf);
+    }
+    assert_eq!(drive(read.resume())?, before);
+    Ok(())
+}
+
 /// A read and the jobs it hands out move to other threads: a caller's
 /// scheduler holds the read, and a blocking pool runs the jobs.
 #[test]
