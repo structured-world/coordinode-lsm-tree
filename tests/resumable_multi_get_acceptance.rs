@@ -413,6 +413,131 @@ fn no_block_is_read_twice_when_the_cache_keeps_nothing() -> lsm_tree::Result<()>
     Ok(())
 }
 
+/// Reads under injected read failures, some dropped while their block reads
+/// are still running on another thread: a dropped read never blocks the
+/// thread dropping it, the reads still running finish into the buffers they
+/// own, and a read that is not dropped answers what the tree holds, the
+/// failure taken around rather than reported as a wrong answer.
+#[test]
+fn reads_dropped_mid_flight_under_injected_faults_stay_sound() -> lsm_tree::Result<()> {
+    use lsm_tree::fs::{Fault, FaultFs, FaultOp, FaultRule};
+
+    let folder = tempfile::tempdir()?;
+    let fs = FaultFs::new(StdFs);
+    let injector = fs.injector();
+    let tree = Config::new(
+        folder.path(),
+        SequenceNumberCounter::default(),
+        SequenceNumberCounter::default(),
+    )
+    .with_shared_fs(Arc::new(fs))
+    .use_cache(Arc::new(Cache::with_capacity_bytes(0)))
+    .filter_block_pinning_policy(PinningPolicy::all(false))
+    .index_block_pinning_policy(PinningPolicy::all(false))
+    .open()?;
+    for table in 0..4u32 {
+        for i in (table..1_200).step_by(4) {
+            tree.insert(format!("k{i:05}"), format!("v{i}"), u64::from(i));
+        }
+        tree.flush_active_memtable(0)?;
+    }
+    let keys: Vec<String> = (0..1_300).step_by(9).map(|i| format!("k{i:05}")).collect();
+    let expected = tree.multi_get(&keys, SeqNo::MAX)?;
+
+    // A fixed xorshift sequence, so a failure replays.
+    let mut state = 0x9E37_79B9_7F4A_7C15_u64;
+    let mut next = move |bound: u64| {
+        state ^= state << 13;
+        state ^= state >> 7;
+        state ^= state << 17;
+        state % bound
+    };
+    let (mut dropped, mut answered) = (0, 0);
+    for _ in 0..200 {
+        injector.clear();
+        injector.arm(
+            FaultRule::new(FaultOp::ReadAt, Fault::Error(io::ErrorKind::Other))
+                .on_path("tables")
+                .skip(next(40))
+                .once(),
+        );
+        // Half the reads run to their answer; the others are given up at a
+        // round of their own, each with a chance of one in eight.
+        let may_drop = next(2) == 0;
+        let mut step = tree.start_multi_get(keys.iter().map(String::as_str), SeqNo::MAX)?;
+        let answer = loop {
+            let mut read = match step {
+                Step::Done(values) => break Some(values),
+                Step::Pending(read) => read,
+            };
+            for job in read.take_jobs() {
+                let outcome = job.run();
+                read.complete_job(outcome);
+            }
+            let reads = read.take_reads();
+            let pool = std::thread::spawn(move || {
+                reads
+                    .into_iter()
+                    .map(|mut block| {
+                        let result =
+                            block
+                                .file
+                                .read_at(&mut block.buf, block.offset)
+                                .and_then(|n| {
+                                    if n == block.buf.len() {
+                                        Ok(())
+                                    } else {
+                                        Err(io::ErrorKind::UnexpectedEof.into())
+                                    }
+                                });
+                        (block.tag, result, block.buf)
+                    })
+                    .collect::<Vec<_>>()
+            });
+            if may_drop && next(8) == 0 {
+                // Given up while its reads are still running.
+                drop(read);
+                let finished = pool
+                    .join()
+                    .unwrap_or_else(|_| panic!("the pool thread panicked"));
+                assert!(
+                    finished
+                        .iter()
+                        .all(|(_, result, buf)| result.is_err() || !buf.is_empty()),
+                    "a read still running finished into its own buffer"
+                );
+                break None;
+            }
+            for (tag, result, buf) in pool
+                .join()
+                .unwrap_or_else(|_| panic!("the pool thread panicked"))
+            {
+                read.complete_read(tag, result, buf);
+            }
+            step = read.resume();
+        };
+        if answer.is_none() {
+            dropped += 1;
+        }
+        if let Some(answer) = answer {
+            answered += 1;
+            match answer {
+                Ok(values) => assert_eq!(values, expected),
+                // A fault a key-by-key resolve meets too is reported, not
+                // turned into a wrong answer.
+                Err(lsm_tree::Error::Io(_)) => {}
+                Err(error) => panic!("an injected read failure surfaced as {error:?}"),
+            }
+        }
+    }
+    injector.clear();
+    assert!(
+        dropped > 0 && answered > 0,
+        "both outcomes were exercised: {dropped} dropped, {answered} answered"
+    );
+    Ok(())
+}
+
 /// Dropping a read with its work out neither blocks nor takes back the
 /// buffers it handed out: they are the caller's, and reading into them after
 /// the drop is sound.
