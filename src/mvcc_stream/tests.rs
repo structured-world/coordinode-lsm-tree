@@ -112,6 +112,131 @@ fn mvcc_stream_error() -> crate::Result<()> {
     Ok(())
 }
 
+fn io_error() -> crate::Error {
+    crate::Error::Io(crate::io::Error::other("test error"))
+}
+
+/// The items a forward pass yields: `Ok` keys as text, errors as `"err"`.
+fn forward_items<I: DoubleEndedIterator<Item = crate::Result<InternalValue>>>(
+    stream: MvccStream<I>,
+) -> Vec<String> {
+    stream
+        .map(|item| match item {
+            Ok(kv) => String::from_utf8_lossy(&kv.value).into_owned(),
+            Err(_) => "err".to_owned(),
+        })
+        .collect()
+}
+
+/// An error met while draining a key does not stop the drain: the older
+/// versions of that key never surface as its value, and every error a source
+/// raised is still yielded once.
+#[test]
+fn mvcc_stream_error_while_draining_skips_the_rest_of_the_key() {
+    let vec = [
+        Ok(InternalValue::from_components(
+            "a",
+            "new",
+            999,
+            ValueType::Value,
+        )),
+        Err(io_error()),
+        Err(io_error()),
+        Ok(InternalValue::from_components(
+            "a",
+            "old",
+            998,
+            ValueType::Value,
+        )),
+        Ok(InternalValue::from_components(
+            "b",
+            "b",
+            1,
+            ValueType::Value,
+        )),
+    ];
+    let stream = MvccStream::new(Box::new(vec.into_iter()), None);
+    assert_eq!(forward_items(stream), ["err", "err", "b"]);
+}
+
+/// The same while collecting a merge chain: an error among the operands drains
+/// the key, so its base never surfaces as the key's value.
+#[test]
+fn mvcc_stream_error_while_merging_skips_the_rest_of_the_key() {
+    struct Concat;
+    impl crate::merge_operator::MergeOperator for Concat {
+        fn merge(
+            &self,
+            _key: &[u8],
+            base: Option<&[u8]>,
+            operands: &[&[u8]],
+        ) -> crate::Result<crate::UserValue> {
+            let mut out = base.unwrap_or_default().to_vec();
+            for op in operands {
+                out.extend_from_slice(op);
+            }
+            Ok(out.into())
+        }
+    }
+
+    let vec = [
+        Ok(InternalValue::from_components(
+            "a",
+            "op",
+            999,
+            ValueType::MergeOperand,
+        )),
+        Err(io_error()),
+        Err(io_error()),
+        Ok(InternalValue::from_components(
+            "a",
+            "old",
+            998,
+            ValueType::Value,
+        )),
+        Ok(InternalValue::from_components(
+            "b",
+            "b",
+            1,
+            ValueType::Value,
+        )),
+    ];
+    let stream = MvccStream::new(Box::new(vec.into_iter()), Some(Arc::new(Concat)));
+    assert_eq!(forward_items(stream), ["err", "err", "b"]);
+
+    // Backward, an error after the base has been buffered drains the newer
+    // versions of the key too: they never merge without their base.
+    let vec = [
+        Ok(InternalValue::from_components(
+            "a",
+            "op",
+            999,
+            ValueType::MergeOperand,
+        )),
+        Err(io_error()),
+        Ok(InternalValue::from_components(
+            "a",
+            "old",
+            998,
+            ValueType::Value,
+        )),
+        Ok(InternalValue::from_components(
+            "b",
+            "b",
+            1,
+            ValueType::Value,
+        )),
+    ];
+    let backward: Vec<String> = MvccStream::new(Box::new(vec.into_iter()), Some(Arc::new(Concat)))
+        .rev()
+        .map(|item| match item {
+            Ok(kv) => String::from_utf8_lossy(&kv.value).into_owned(),
+            Err(_) => "err".to_owned(),
+        })
+        .collect();
+    assert_eq!(backward, ["b", "err"]);
+}
+
 #[test]
 #[expect(clippy::unwrap_used, reason = "test assertion")]
 fn mvcc_queue_reverse_almost_gone() -> crate::Result<()> {
