@@ -6,6 +6,7 @@ use crate::double_ended_peekable::{DoubleEndedPeekable, DoubleEndedPeekableExt};
 use crate::merge_operator::MergeOperator;
 use crate::range_tombstone::RangeTombstone;
 use crate::{InternalValue, SeqNo, UserKey, UserValue, ValueType, comparator::SharedComparator};
+use alloc::collections::VecDeque;
 use alloc::sync::Arc;
 #[cfg(not(feature = "std"))]
 use alloc::vec::Vec;
@@ -81,6 +82,10 @@ pub struct MvccStream<I: DoubleEndedIterator<Item = crate::Result<InternalValue>
     /// Reusable buffer for reverse-iteration merge resolution. Avoids
     /// allocating a fresh `Vec` on every `next_back()` call.
     key_entries_buf: Vec<InternalValue>,
+
+    /// Errors met while draining a key after the one already returned for
+    /// it, yielded before the next item so none is lost.
+    deferred_errors: VecDeque<crate::Error>,
 }
 
 impl<I: DoubleEndedIterator<Item = crate::Result<InternalValue>>> MvccStream<I> {
@@ -108,6 +113,7 @@ impl<I: DoubleEndedIterator<Item = crate::Result<InternalValue>>> MvccStream<I> 
             value_log: NoValueLog,
             range_tombstones: Vec::new(),
             key_entries_buf: Vec::new(),
+            deferred_errors: VecDeque::new(),
         }
     }
 
@@ -124,6 +130,7 @@ impl<I: DoubleEndedIterator<Item = crate::Result<InternalValue>>> MvccStream<I> 
             value_log,
             range_tombstones: self.range_tombstones,
             key_entries_buf: self.key_entries_buf,
+            deferred_errors: self.deferred_errors,
         }
     }
 }
@@ -176,7 +183,13 @@ impl<I: DoubleEndedIterator<Item = crate::Result<InternalValue>>, L: SeparatedBa
                 break;
             };
 
-            let next = next?;
+            let next = match next {
+                Ok(next) => next,
+                Err(e) => {
+                    self.drain_key_min_after(user_key, e);
+                    return Err(self.take_deferred_error());
+                }
+            };
 
             // Range tombstone suppression: an RT-suppressed entry is logically
             // deleted — treat it as a tombstone boundary (no base value).
@@ -205,8 +218,8 @@ impl<I: DoubleEndedIterator<Item = crate::Result<InternalValue>>, L: SeparatedBa
                     match self.value_log.read(next) {
                         Ok(value) => base_value = Some(value),
                         Err(e) => {
-                            self.drain_key_min(user_key)?;
-                            return Err(e);
+                            self.drain_key_min_after(user_key, e);
+                            return Err(self.take_deferred_error());
                         }
                     }
                     found_base = true;
@@ -298,7 +311,13 @@ impl<I: DoubleEndedIterator<Item = crate::Result<InternalValue>>, L: SeparatedBa
     }
 
     // Drains all entries for the given user key from the front of the iterator.
+    //
+    // An error does not stop the drain: stopping would leave older versions
+    // of the key to surface as its value on the next call. Each source yields
+    // at most one error before it ends, so the drain is bounded. The first
+    // error is returned, any later one is deferred.
     fn drain_key_min(&mut self, key: &UserKey) -> crate::Result<()> {
+        let mut first = None;
         loop {
             let Some(next) = self.inner.next_if(|kv| {
                 if let Ok(kv) = kv {
@@ -307,11 +326,58 @@ impl<I: DoubleEndedIterator<Item = crate::Result<InternalValue>>, L: SeparatedBa
                     true
                 }
             }) else {
-                return Ok(());
+                return match first {
+                    None => Ok(()),
+                    Some(e) => Err(e),
+                };
             };
 
-            next?;
+            if let Err(e) = next {
+                if first.is_none() {
+                    first = Some(e);
+                } else {
+                    self.deferred_errors.push_back(e);
+                }
+            }
         }
+    }
+
+    // Drains the rest of `key` from the front after `error` ended its
+    // resolution, queueing that error first and any met while draining after
+    // it, so the caller returns them in order.
+    fn drain_key_min_after(&mut self, key: &UserKey, error: crate::Error) {
+        self.deferred_errors.push_back(error);
+        if let Err(e) = self.drain_key_min(key) {
+            self.deferred_errors.push_back(e);
+        }
+    }
+
+    // Drains the rest of `key` from the back after `error` ended its
+    // resolution, as `drain_key_min_after` does from the front: the newer
+    // versions of a key whose older ones are gone never resolve without them.
+    fn drain_key_max_after(&mut self, key: &UserKey, error: crate::Error) {
+        self.deferred_errors.push_back(error);
+        while let Some(prev) = self.inner.peek_back() {
+            if let Ok(prev) = prev
+                && !crate::comparator::same_user_key(&prev.key.user_key, key)
+            {
+                return;
+            }
+            if let Some(Err(e)) = self.inner.next_back() {
+                self.deferred_errors.push_back(e);
+            }
+        }
+    }
+
+    // The oldest deferred error; called only right after one was queued.
+    fn take_deferred_error(&mut self) -> crate::Error {
+        #[expect(
+            clippy::expect_used,
+            reason = "called only right after an error was queued"
+        )]
+        self.deferred_errors
+            .pop_front()
+            .expect("an error was just queued")
     }
 }
 
@@ -336,6 +402,10 @@ impl<I: DoubleEndedIterator<Item = crate::Result<InternalValue>>, L: SeparatedBa
     type Item = crate::Result<InternalValue>;
 
     fn next(&mut self) -> Option<Self::Item> {
+        if let Some(e) = self.deferred_errors.pop_front() {
+            return Some(Err(e));
+        }
+
         let head = fail_iter!(self.inner.next()?);
 
         if head.key.value_type.is_merge_operand() {
@@ -370,6 +440,10 @@ impl<I: DoubleEndedIterator<Item = crate::Result<InternalValue>>, L: SeparatedBa
         // incorrect — reverse iteration visits the oldest (base) entry first,
         // so deferring allocation until a MergeOperand is found would lose
         // the base Value needed by the merge function.
+        if let Some(e) = self.deferred_errors.pop_front() {
+            return Some(Err(e));
+        }
+
         let has_merge_op = self.merge_operator.is_some();
         self.key_entries_buf.clear();
 
@@ -383,11 +457,17 @@ impl<I: DoubleEndedIterator<Item = crate::Result<InternalValue>>, L: SeparatedBa
                         clippy::expect_used,
                         reason = "we just asserted, the peeked value is an error"
                     )]
-                    return Some(Err(self
+                    let error = self
                         .inner
                         .next_back()
                         .expect("should exist")
-                        .expect_err("should be error")));
+                        .expect_err("should be error");
+                    // The versions of `tail`'s key buffered so far are gone
+                    // with the error; its newer ones are drained too, so none
+                    // resolves without them (a merge without its base).
+                    self.key_entries_buf.clear();
+                    self.drain_key_max_after(&tail.key.user_key, error);
+                    return Some(Err(self.take_deferred_error()));
                 }
                 None => {
                     // Last item — resolve merge only if newest entry is a MergeOperand
