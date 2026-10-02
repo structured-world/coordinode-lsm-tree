@@ -174,7 +174,10 @@ jobs:
           fi
           release-plz update --no-changelog --config .release-plz.toml
           id="$(cargo pkgid)"
-          version="${id##*@}"
+          # The version follows the last `#` or `@`: cargo spells the id
+          # `<url>#<name>@<version>`, or `<url>#<version>` when the package is
+          # named as its directory is, as on the bench runner.
+          version="${id##*[#@]}"
           # The update rewrites the manifest's version; the measured tree is
           # the commit as it is.
           git restore --source=HEAD --worktree -- Cargo.toml
