@@ -2,9 +2,9 @@
 // Copyright (c) 2026-present, Dmitry Prudnikov
 
 use super::TaskBlock;
-use super::chunk_order_tests::tasks_for;
+use super::chunk_order_tests::{ctx_for, tasks_for};
 use super::data_stage::ChunkRead;
-use super::level_resolve::{JobDone, LevelJob};
+use super::read_job::{Job, JobDone};
 use crate::fs::{Fs, FsFile, FsOpenOptions, StdFs};
 use crate::{AbstractTree, Config, SequenceNumberCounter, value::InternalValue};
 use alloc::sync::Arc;
@@ -57,9 +57,10 @@ fn a_chunk_on_another_table_closes_the_carried_file_before_asking_for_its_own() 
         "the carried file is closed before the chunk asks for its own"
     );
     assert!(carried.is_none(), "nothing is carried into the chunk");
-    let [job] = <[LevelJob<'_, '_>; 1]>::try_from(jobs)
+    let [job] = <[Job; 1]>::try_from(jobs)
         .unwrap_or_else(|_| panic!("one job: the file of the table read"));
-    let JobDone::Opened { tag, file } = job.run() else {
+    let ctx = ctx_for(tree, keys.to_vec())?;
+    let JobDone::Opened { tag, file } = job.run(&ctx) else {
         panic!("an open job opens a file");
     };
     chunk.opened(tag, file?);

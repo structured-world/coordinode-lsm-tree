@@ -2,11 +2,24 @@
 // Copyright (c) 2026-present, Dmitry Prudnikov
 
 use super::data_stage::ChunkRead;
-use super::level_resolve::{JobDone, LevelJob};
+use super::read_job::{Job, JobDone, ReadCtx, TableAt, Values};
 use super::{BlockTask, TaskBlock};
-use crate::{AbstractTree, Config, SeqNo, SequenceNumberCounter, value::InternalValue};
+use crate::{AbstractTree, Config, SeqNo, SequenceNumberCounter, Tree, value::InternalValue};
 
-/// The data block tasks of every table of `level` that holds `key`, in level
+/// The context of a read of `keys` in `tree`'s current version.
+pub(super) fn ctx_for<K>(tree: &Tree, keys: Vec<K>) -> crate::Result<ReadCtx<K>> {
+    Ok(ReadCtx {
+        super_version: tree.snapshot_for_read(SeqNo::MAX)?,
+        keys,
+        seqno: SeqNo::MAX,
+        comparator: crate::comparator::default_comparator(),
+        merge_operator: None,
+        values: Values::Inline,
+        metadata_budget: crate::config::DEFAULT_MULTI_GET_METADATA_BUDGET,
+    })
+}
+
+/// The data block tasks of every table of level 0 that holds `key`, in level
 /// order, each reading `key` as key index 0.
 pub(super) fn tasks_for<'a>(
     level: &'a crate::version::Level,
@@ -14,8 +27,8 @@ pub(super) fn tasks_for<'a>(
 ) -> crate::Result<Vec<BlockTask<'a>>> {
     let batch = [(key, crate::hash::hash64(key))];
     let mut tasks = Vec::new();
-    for run in level.iter() {
-        for table in run.iter() {
+    for (run_idx, run) in level.iter().enumerate() {
+        for (pos, table) in run.iter().enumerate() {
             let mut tally = crate::table::probe_stats::PlanCounts::default();
             let Some((_, table_seqno, _, blocks)) =
                 table.plan_block_tasks(&batch, SeqNo::MAX, &mut tally)?
@@ -25,6 +38,11 @@ pub(super) fn tasks_for<'a>(
             for (handle, positions) in blocks {
                 tasks.push(BlockTask {
                     table,
+                    at: TableAt {
+                        level: 0,
+                        run: run_idx,
+                        pos,
+                    },
                     handle,
                     table_seqno,
                     special: table.is_chunk_special(),
@@ -68,12 +86,13 @@ fn a_chunked_resolve_breaks_an_equal_seqno_tie_by_plan_order() -> crate::Result<
 
     // Both blocks read, so the driver decides the order they are back in.
     let uncached = [TaskBlock::Read, TaskBlock::Read];
+    let ctx = ctx_for(tree, keys.to_vec())?;
     let (mut chunk, jobs) = ChunkRead::start(&tasks, &uncached, &keys, &mut None)?;
     for job in jobs {
-        let LevelJob::Open { .. } = &job else {
+        let Job::Open { .. } = &job else {
             panic!("a row table's block needs only its file");
         };
-        let JobDone::Opened { tag, file } = job.run() else {
+        let JobDone::Opened { tag, file } = job.run(&ctx) else {
             panic!("an open job opens a file");
         };
         chunk.opened(tag, file?);

@@ -11,216 +11,11 @@
 
 use super::data_stage::{ChunkFile, ChunkRead};
 use super::level_stages::LevelStages;
+use super::read_job::{Job, JobDone, ReadWork};
 use super::{BlockTask, TaskBlock, Tree};
 use crate::table::probe_stats::PlanCounts;
-use crate::table::{BlockHandle, BlockTaskPlan, DataBlock};
-use crate::{InternalValue, SeqNo, Table, TableId, fs::FsFile};
-use alloc::sync::Arc;
+use crate::{InternalValue, SeqNo, Table, TableId};
 use alloc::vec::Vec;
-
-/// A block read: `buf` filled whole from `file` at `offset`, and handed back
-/// with `tag` through [`LevelResolve::read_done`].
-pub(super) struct BlockRequest<'a> {
-    pub(super) tag: usize,
-    pub(super) table: &'a Table,
-    pub(super) file: Arc<dyn FsFile>,
-    pub(super) offset: u64,
-    pub(super) buf: Vec<u8>,
-}
-
-/// Work a level asks for that is not one block read: it may block, so its
-/// driver runs it wherever it likes and hands back what [`Self::run`]
-/// returns through [`LevelResolve::job_done`].
-pub(super) enum LevelJob<'a, 'k> {
-    /// Opens `table`'s file.
-    Open { tag: usize, table: &'a Table },
-    /// Plans `table` serially for its `keys`, at the snapshot `seqno`: its
-    /// blocks need the load path, or a stage of it failed.
-    Plan {
-        at: usize,
-        table: &'a Table,
-        keys: Vec<(&'k [u8], u64)>,
-        seqno: SeqNo,
-    },
-    /// Loads a Page-ECC or columnar table's data block through the table's
-    /// own path, which heals a corrected ECC block and reconstructs a
-    /// columnar one.
-    Load {
-        index: usize,
-        table: &'a Table,
-        handle: BlockHandle,
-    },
-    /// Resolves the keys of `remaining` against `level` key by key, run by
-    /// run: the level's staged resolve could not plan a table of it or read
-    /// a block of its plan. `keys` holds every key of the batch by index.
-    Serial {
-        level_zero: bool,
-        level: &'a crate::version::Level,
-        remaining: Vec<(usize, u64)>,
-        keys: Vec<&'k [u8]>,
-        seqno: SeqNo,
-        comparator: &'a dyn crate::comparator::UserComparator,
-    },
-    /// Resolves the merge operands of the key at `idx` in `super_version` at
-    /// the snapshot `seqno`, reading every version of it below the newest.
-    Merge {
-        idx: usize,
-        key: &'k [u8],
-        super_version: &'a crate::version::SuperVersion,
-        seqno: SeqNo,
-        merge_operator: &'a Arc<dyn crate::merge_operator::MergeOperator>,
-    },
-    /// Reads the value the indirection `item` (the newest version of the key
-    /// at `idx`) points to in the value log of `version`.
-    Blob {
-        idx: usize,
-        item: InternalValue,
-        tree_id: crate::TreeId,
-        config: &'a crate::Config,
-        version: &'a crate::version::Version,
-        #[cfg(feature = "metrics")]
-        metrics: &'a crate::metrics::Metrics,
-    },
-}
-
-/// A finished [`LevelJob`].
-pub(super) enum JobDone {
-    Opened {
-        tag: usize,
-        file: crate::Result<Arc<dyn FsFile>>,
-    },
-    Planned {
-        at: usize,
-        plan: crate::Result<Option<BlockTaskPlan>>,
-        tally: PlanCounts,
-    },
-    Loaded {
-        index: usize,
-        block: crate::Result<Option<DataBlock>>,
-    },
-    Serial {
-        result: crate::Result<super::tables_read::SerialLevel>,
-    },
-    /// The value of the key at `idx`, from a merge or a blob read.
-    Value {
-        idx: usize,
-        value: crate::Result<Option<crate::UserValue>>,
-    },
-}
-
-impl LevelJob<'_, '_> {
-    /// Carries the job out on the calling thread.
-    pub(super) fn run(self) -> JobDone {
-        match self {
-            Self::Open { tag, table } => JobDone::Opened {
-                tag,
-                file: table.open_file(),
-            },
-            Self::Plan {
-                at,
-                table,
-                keys,
-                seqno,
-            } => {
-                let mut tally = PlanCounts::default();
-                let plan = table.plan_block_tasks(&keys, seqno, &mut tally);
-                JobDone::Planned { at, plan, tally }
-            }
-            Self::Load {
-                index,
-                table,
-                handle,
-            } => JobDone::Loaded {
-                index,
-                block: table.load_data_block(&handle),
-            },
-            Self::Serial {
-                level_zero,
-                level,
-                remaining,
-                keys,
-                seqno,
-                comparator,
-            } => JobDone::Serial {
-                result: Tree::resolve_level_serially(
-                    level_zero, level, remaining, &keys, seqno, comparator,
-                ),
-            },
-            Self::Merge {
-                idx,
-                key,
-                super_version,
-                seqno,
-                merge_operator,
-            } => JobDone::Value {
-                idx,
-                value: Tree::resolve_merge_via_pipeline(
-                    super_version.clone(),
-                    key,
-                    seqno,
-                    Arc::clone(merge_operator),
-                ),
-            },
-            Self::Blob {
-                idx,
-                item,
-                tree_id,
-                config,
-                version,
-                #[cfg(feature = "metrics")]
-                metrics,
-            } => JobDone::Value {
-                idx,
-                value: crate::blob_tree::resolve_value_handle(
-                    tree_id,
-                    config,
-                    version,
-                    #[cfg(feature = "metrics")]
-                    metrics,
-                    item,
-                )
-                .map(|(_, value)| Some(value)),
-            },
-        }
-    }
-}
-
-/// A read the caller drives: it asks for work through `pump`, and takes each
-/// piece back as it finishes, until `pump` hands out its answer.
-pub(super) trait ReadMachine<'a, 'k> {
-    /// What the read answers once it is over.
-    type Output;
-
-    /// Moves the read on as far as what is back takes it, asking `out` for
-    /// the work it needs next; `Some` once the read is over and nothing of it
-    /// is out.
-    fn pump(&mut self, out: &mut LevelWork<'a, 'k>) -> Option<Self::Output>;
-
-    /// Takes back a finished job.
-    fn job_done(&mut self, done: JobDone);
-
-    /// Takes back a finished block read.
-    fn read_done(&mut self, done: crate::fs::ReadDone);
-}
-
-/// What a level asks its driver to carry out: jobs first, then reads.
-pub(super) struct LevelWork<'a, 'k> {
-    pub(super) jobs: Vec<LevelJob<'a, 'k>>,
-    pub(super) reads: Vec<BlockRequest<'a>>,
-}
-
-impl LevelWork<'_, '_> {
-    pub(super) const fn new() -> Self {
-        Self {
-            jobs: Vec::new(),
-            reads: Vec::new(),
-        }
-    }
-
-    fn is_empty(&self) -> bool {
-        self.jobs.is_empty() && self.reads.is_empty()
-    }
-}
 
 /// Where a level's resolve stands after a [`LevelResolve::pump`].
 #[derive(Debug, PartialEq, Eq)]
@@ -235,7 +30,7 @@ pub(super) enum LevelStep {
 }
 
 /// The data block phase: the level's tasks read chunk by chunk.
-struct Chunks<'a, 'k, K> {
+struct Chunks<'a, K> {
     tasks: Vec<BlockTask<'a>>,
     probes: Vec<(&'a Table, PlanCounts)>,
     cached: Vec<TaskBlock>,
@@ -258,13 +53,13 @@ struct Chunks<'a, 'k, K> {
     /// two chunks is opened once for both.
     carried: Option<ChunkFile>,
     start: usize,
-    current: Option<Current<'k, K>>,
+    current: Option<Current<'a, K>>,
 }
 
 /// The chunk in flight.
-struct Current<'k, K> {
+struct Current<'a, K> {
     end: usize,
-    read: ChunkRead<'k, K>,
+    read: ChunkRead<'a, K>,
     /// Its jobs not yet back.
     jobs: usize,
     /// Whether its reads were handed out, and how many are not yet back.
@@ -275,44 +70,51 @@ struct Current<'k, K> {
     failed: bool,
 }
 
-enum Phase<'a, 'k, K> {
-    Stages(LevelStages<'a, 'k>),
+enum Phase<'a, K> {
+    Stages(LevelStages<'a>),
     Plans {
-        stages: LevelStages<'a, 'k>,
+        stages: LevelStages<'a>,
         asked: bool,
         left: usize,
         failed: bool,
     },
-    Chunks(Chunks<'a, 'k, K>),
+    Chunks(Chunks<'a, K>),
     Over,
 }
 
 /// The resolve of one level for the keys of `remaining`.
-pub(super) struct LevelResolve<'a, 'k, K> {
-    keys: &'k [K],
-    seqno: SeqNo,
+pub(super) struct LevelResolve<'a, K> {
+    keys: &'a [K],
     /// `(key index, filter hash)` of the keys still to resolve, sorted.
     remaining: Vec<(usize, u64)>,
-    phase: Phase<'a, 'k, K>,
+    phase: Phase<'a, K>,
 }
 
-impl<'a, 'k, K: AsRef<[u8]>> LevelResolve<'a, 'k, K> {
-    /// The resolve of `level` at the snapshot `seqno` for the keys of
-    /// `remaining` (indices into `keys` with their filter hashes, sorted
-    /// under `comparator`), whose filter and index blocks the tables hold
-    /// within `metadata_budget`.
+impl<'a, K: AsRef<[u8]>> LevelResolve<'a, K> {
+    /// The resolve of `level`, the version's level `level_idx`, at the
+    /// snapshot `seqno` for the keys of `remaining` (indices into `keys` with
+    /// their filter hashes, sorted under `comparator`), whose filter and
+    /// index blocks the tables hold within `metadata_budget`.
     pub(super) fn new(
         level: &'a crate::version::Level,
+        level_idx: usize,
         remaining: Vec<(usize, u64)>,
-        keys: &'k [K],
+        keys: &'a [K],
         comparator: &dyn crate::comparator::UserComparator,
         seqno: SeqNo,
         metadata_budget: u64,
     ) -> Self {
-        let stages = LevelStages::new(level, &remaining, keys, comparator, seqno, metadata_budget);
+        let stages = LevelStages::new(
+            level,
+            level_idx,
+            &remaining,
+            keys,
+            comparator,
+            seqno,
+            metadata_budget,
+        );
         Self {
             keys,
-            seqno,
             remaining,
             phase: Phase::Stages(stages),
         }
@@ -328,10 +130,14 @@ impl<'a, 'k, K: AsRef<[u8]>> LevelResolve<'a, 'k, K> {
     /// the work it needs next. An answer is kept in `results` (the
     /// highest-seqno version per key); a level handed to the serial resolve
     /// clears the answers of its keys first.
+    #[expect(
+        clippy::indexing_slicing,
+        reason = "a serial plan's span lies in the batch built from `remaining`"
+    )]
     pub(super) fn pump(
         &mut self,
         results: &mut [Option<InternalValue>],
-        out: &mut LevelWork<'a, 'k>,
+        out: &mut ReadWork<'a>,
     ) -> LevelStep {
         loop {
             match &mut self.phase {
@@ -365,11 +171,10 @@ impl<'a, 'k, K: AsRef<[u8]>> LevelResolve<'a, 'k, K> {
                     if !*asked {
                         *asked = true;
                         for plan in stages.serial_plans() {
-                            out.jobs.push(LevelJob::Plan {
+                            out.jobs.push(Job::Plan {
                                 at: plan.at,
                                 table: plan.table,
-                                keys: stages.span(plan.keys).to_vec(),
-                                seqno: self.seqno,
+                                keys: self.remaining[plan.keys].to_vec(),
                             });
                             *left += 1;
                         }
@@ -478,7 +283,7 @@ enum ChunkStep {
     Over,
 }
 
-impl<'a, 'k, K: AsRef<[u8]>> Chunks<'a, 'k, K> {
+impl<'a, K: AsRef<[u8]>> Chunks<'a, K> {
     /// The data block phase of `tasks`, or `None` when there are none.
     fn new(tasks: Vec<BlockTask<'a>>, probes: Vec<(&'a Table, PlanCounts)>) -> Option<Self> {
         let Some(first) = tasks.first() else {
@@ -564,9 +369,9 @@ impl<'a, 'k, K: AsRef<[u8]>> Chunks<'a, 'k, K> {
     )]
     fn pump(
         &mut self,
-        keys: &'k [K],
+        keys: &'a [K],
         results: &mut [Option<InternalValue>],
-        out: &mut LevelWork<'a, 'k>,
+        out: &mut ReadWork<'a>,
     ) -> ChunkStep {
         loop {
             let Some(current) = &mut self.current else {

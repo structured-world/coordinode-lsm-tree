@@ -11,9 +11,9 @@
 //! key by key. Like the level it drives, it never opens, reads or waits
 //! itself.
 
-use super::level_resolve::{JobDone, LevelJob, LevelResolve, LevelStep, LevelWork};
-use crate::version::Version;
-use crate::{InternalValue, SeqNo};
+use super::level_resolve::{LevelResolve, LevelStep};
+use super::read_job::{Job, JobDone, ReadCtx, ReadWork};
+use crate::InternalValue;
 use alloc::vec::Vec;
 
 /// What resolving a level key by key gives: the versions found, by key
@@ -31,42 +31,27 @@ enum State {
     Over,
 }
 
-/// The read of the keys of `remaining` through the levels of a version, at
-/// the snapshot `seqno`, keeping per key the newest version the first level
-/// holding it has.
-pub(super) struct TablesRead<'a, 'k, K> {
-    version: &'a Version,
-    keys: &'k [K],
-    seqno: SeqNo,
-    comparator: &'a dyn crate::comparator::UserComparator,
-    metadata_budget: u64,
+/// The read of the keys of `remaining` through the levels of the read's
+/// version, keeping per key the newest version the first level holding it
+/// has.
+pub(super) struct TablesRead<'a, K> {
+    ctx: &'a ReadCtx<K>,
     /// The next level to read.
     next: usize,
     /// `(key index, filter hash)` of the keys no level above answered, sorted
-    /// under `comparator`; held by the level being read while it is.
+    /// under the read's comparator; held by the level being read while it is.
     remaining: Vec<(usize, u64)>,
     state: State,
     /// The level resolved from its staged plan, while one is.
-    staged: Option<LevelResolve<'a, 'k, K>>,
+    staged: Option<LevelResolve<'a, K>>,
 }
 
-impl<'a, 'k, K: AsRef<[u8]>> TablesRead<'a, 'k, K> {
-    /// The read of the keys of `remaining` (indices into `keys` with their
-    /// filter hashes, sorted under `comparator`) through `version`.
-    pub(super) fn new(
-        version: &'a Version,
-        keys: &'k [K],
-        remaining: Vec<(usize, u64)>,
-        seqno: SeqNo,
-        comparator: &'a dyn crate::comparator::UserComparator,
-        metadata_budget: u64,
-    ) -> Self {
+impl<'a, K: AsRef<[u8]>> TablesRead<'a, K> {
+    /// The read of the keys of `remaining` (indices into the read's keys with
+    /// their filter hashes, sorted under its comparator).
+    pub(super) const fn new(ctx: &'a ReadCtx<K>, remaining: Vec<(usize, u64)>) -> Self {
         Self {
-            version,
-            keys,
-            seqno,
-            comparator,
-            metadata_budget,
+            ctx,
             next: 0,
             remaining,
             state: State::Between,
@@ -83,12 +68,12 @@ impl<'a, 'k, K: AsRef<[u8]>> TablesRead<'a, 'k, K> {
     pub(super) fn pump(
         &mut self,
         results: &mut [Option<InternalValue>],
-        out: &mut LevelWork<'a, 'k>,
+        out: &mut ReadWork<'a>,
     ) -> Option<crate::Result<()>> {
         loop {
             match &mut self.state {
                 State::Between => {
-                    let level = match self.version.level(self.next) {
+                    let level = match self.ctx.version().level(self.next) {
                         Some(level) if !self.remaining.is_empty() => level,
                         _ => {
                             self.state = State::Over;
@@ -102,15 +87,16 @@ impl<'a, 'k, K: AsRef<[u8]>> TablesRead<'a, 'k, K> {
                             .iter()
                             .all(|&(idx, _)| results.get(idx).is_some_and(Option::is_none))
                     );
-                    self.next += 1;
                     self.staged = Some(LevelResolve::new(
                         level,
+                        self.next,
                         core::mem::take(&mut self.remaining),
-                        self.keys,
-                        self.comparator,
-                        self.seqno,
-                        self.metadata_budget,
+                        &self.ctx.keys,
+                        self.ctx.comparator.as_ref(),
+                        self.ctx.seqno,
+                        self.ctx.metadata_budget,
                     ));
+                    self.next += 1;
                     self.state = State::Staged;
                 }
                 State::Staged => {
@@ -135,17 +121,9 @@ impl<'a, 'k, K: AsRef<[u8]>> TablesRead<'a, 'k, K> {
                         // the read's ceiling skips the later runs), so it fails
                         // only where a key-by-key read would; either way the
                         // level is answered, never skipped for a lower one.
-                        let level_zero = self.next == 1;
-                        let Some(level) = self.version.level(self.next - 1) else {
-                            unreachable!("the level was just read");
-                        };
-                        out.jobs.push(LevelJob::Serial {
-                            level_zero,
-                            level,
+                        out.jobs.push(Job::Serial {
+                            level: self.next - 1,
                             remaining: core::mem::take(&mut self.remaining),
-                            keys: self.keys.iter().map(AsRef::as_ref).collect(),
-                            seqno: self.seqno,
-                            comparator: self.comparator,
                         });
                         self.state = State::Serial(None);
                         return None;

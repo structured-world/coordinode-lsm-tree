@@ -17,3 +17,23 @@ pub enum AnyTree {
 }
 
 impl crate::abstract_tree::sealed::Sealed for AnyTree {}
+
+impl AnyTree {
+    /// Starts a multi-get of `keys` at `seqno` that its caller drives: see
+    /// [`Tree::start_multi_get`].
+    ///
+    /// # Errors
+    ///
+    /// Returns [`crate::Error::SnapshotBelowRetention`] when `seqno` is below
+    /// what the tree retains.
+    pub fn start_multi_get<K: Into<crate::UserKey>>(
+        &self,
+        keys: impl IntoIterator<Item = K>,
+        seqno: crate::SeqNo,
+    ) -> crate::Result<crate::resumable::Step> {
+        match self {
+            Self::Standard(tree) => tree.start_multi_get(keys, seqno),
+            Self::Blob(tree) => tree.start_multi_get(keys, seqno),
+        }
+    }
+}

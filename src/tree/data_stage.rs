@@ -7,7 +7,7 @@
 //! arrives. It never opens, reads or waits itself; whoever drives it carries
 //! the work out.
 
-use super::level_resolve::{BlockRequest, LevelJob};
+use super::read_job::{BlockRequest, Job};
 use super::{BlockTask, TaskBlock, Tree};
 use crate::{InternalValue, TableId, fs::FsFile};
 use alloc::sync::Arc;
@@ -57,12 +57,12 @@ impl<'k, K: AsRef<[u8]>> ChunkRead<'k, K> {
     ///
     /// A held block's point read fails, or a block to read has a size no block
     /// of its table can have (refused before its buffer is allocated).
-    pub(super) fn start<'a, 'x>(
-        chunk: &[BlockTask<'a>],
+    pub(super) fn start(
+        chunk: &[BlockTask<'_>],
         cached: &[TaskBlock],
         keys: &'k [K],
         carried: &mut Option<ChunkFile>,
-    ) -> crate::Result<(Self, Vec<LevelJob<'a, 'x>>)> {
+    ) -> crate::Result<(Self, Vec<Job>)> {
         let mut read = Self {
             keys,
             fills: Vec::new(),
@@ -76,9 +76,9 @@ impl<'k, K: AsRef<[u8]>> ChunkRead<'k, K> {
                 TaskBlock::Held(block) => {
                     Tree::read_task_keys(task, index, block, keys, &mut read.hits)?;
                 }
-                TaskBlock::Load => jobs.push(LevelJob::Load {
+                TaskBlock::Load => jobs.push(Job::Load {
                     index,
-                    table: task.table,
+                    table: task.at,
                     handle: task.handle,
                 }),
                 TaskBlock::Read => {}
@@ -99,9 +99,9 @@ impl<'k, K: AsRef<[u8]>> ChunkRead<'k, K> {
                     // match.
                     other => {
                         drop(other);
-                        jobs.push(LevelJob::Open {
+                        jobs.push(Job::Open {
                             tag: read.files.len(),
-                            table: task.table,
+                            table: task.at,
                         });
                         None
                     }

@@ -9,7 +9,9 @@ pub mod ingest;
 pub mod inner;
 mod level_resolve;
 mod level_stages;
-pub mod multi_get_read;
+mod multi_get_read;
+pub mod read_job;
+pub mod resumable;
 pub mod sealed;
 mod tables_read;
 
@@ -135,6 +137,8 @@ struct RunResolve {
 /// files of the chunk it is reading.
 struct BlockTask<'a> {
     table: &'a crate::Table,
+    /// The table's place in the version, by which a job names it.
+    at: read_job::TableAt,
     handle: crate::table::BlockHandle,
     table_seqno: SeqNo,
     special: bool,
@@ -149,6 +153,8 @@ type LevelTasks<'a> = (Vec<BlockTask<'a>>, Vec<(&'a Table, PlanCounts)>);
 /// and how it is read.
 struct LevelTable<'a> {
     table: &'a Table,
+    /// The table's place in the version, by which a job names it.
+    at: read_job::TableAt,
     /// Its keys: a span of the level's batch, which every run of the level
     /// walks in the same order, so no table holds a copy of its keys.
     keys: core::ops::Range<usize>,
@@ -1863,15 +1869,15 @@ impl AbstractTree for Tree {
                 .collect();
         }
 
-        Self::read_many(
-            &super_version,
-            &keys,
+        Self::read_many(&read_job::ReadCtx {
+            super_version,
+            keys,
             seqno,
-            comparator,
-            merge_operator,
-            multi_get_read::Values::Inline,
-            self.config.multi_get_metadata_budget,
-        )
+            comparator: Arc::clone(&self.config.comparator),
+            merge_operator: self.config.merge_operator.clone(),
+            values: read_job::Values::Inline,
+            metadata_budget: self.config.multi_get_metadata_budget,
+        })
     }
 
     fn apply_batch(&self, batch: crate::WriteBatch, seqno: SeqNo) -> crate::Result<(u64, u64)> {
@@ -2994,6 +3000,67 @@ impl Tree {
         Arc::clone(&self.0.heal_hints)
     }
 
+    /// Starts a multi-get of `keys` at `seqno` that its caller drives: the
+    /// read hands out its block reads and jobs instead of carrying them out,
+    /// so the calling thread is never parked inside it. It answers what
+    /// [`AbstractTree::multi_get`] answers.
+    ///
+    /// # Errors
+    ///
+    /// Returns [`crate::Error::SnapshotBelowRetention`] when `seqno` is below
+    /// what the tree retains.
+    ///
+    /// # Examples
+    ///
+    /// Driving the read on the calling thread:
+    ///
+    /// ```
+    /// use lsm_tree::resumable::Step;
+    /// use lsm_tree::{AbstractTree, Config, SequenceNumberCounter};
+    ///
+    /// # let folder = tempfile::tempdir()?;
+    /// let tree = Config::new(&folder, SequenceNumberCounter::default(), SequenceNumberCounter::default()).open()?;
+    /// tree.insert("a", "1", 0);
+    /// tree.flush_active_memtable(0)?;
+    ///
+    /// let mut step = tree.start_multi_get(["a", "b"], 1)?;
+    /// let values = loop {
+    ///     let mut read = match step {
+    ///         Step::Done(values) => break values?,
+    ///         Step::Pending(read) => read,
+    ///     };
+    ///     for job in read.take_jobs() {
+    ///         let outcome = job.run();
+    ///         read.complete_job(outcome);
+    ///     }
+    ///     for mut block in read.take_reads() {
+    ///         let result = block.file.read_at(&mut block.buf, block.offset).and_then(|n| {
+    ///             if n == block.buf.len() { Ok(()) } else { Err(lsm_tree::io::ErrorKind::UnexpectedEof.into()) }
+    ///         });
+    ///         read.complete_read(block.tag, result, block.buf);
+    ///     }
+    ///     step = read.resume();
+    /// };
+    /// assert_eq!(values, [Some("1".as_bytes().into()), None]);
+    /// # Ok::<(), lsm_tree::Error>(())
+    /// ```
+    pub fn start_multi_get<K: Into<UserKey>>(
+        &self,
+        keys: impl IntoIterator<Item = K>,
+        seqno: SeqNo,
+    ) -> crate::Result<resumable::Step> {
+        let snapshot = self.snapshot_for_read(seqno)?;
+        Ok(resumable::ResumableMultiGet::start(read_job::ReadCtx {
+            super_version: crate::version::SnapshotRef::Owned((*snapshot).clone()),
+            keys: keys.into_iter().map(Into::into).collect(),
+            seqno,
+            comparator: Arc::clone(&self.config.comparator),
+            merge_operator: self.config.merge_operator.clone(),
+            values: read_job::Values::Inline,
+            metadata_budget: self.config.multi_get_metadata_budget,
+        }))
+    }
+
     /// Shared point-read logic for `get()` and `multi_get()`: finds the newest
     /// entry, applies merge resolution or RT suppression, and returns the value.
     fn resolve_or_passthrough(
@@ -3727,45 +3794,34 @@ impl Tree {
             })
     }
 
-    /// Reads `keys` at the snapshot `seqno` of `super_version` on the calling
-    /// thread, through the memtables and the levels, and turns each key's
-    /// newest version into its value as `values` says: the multi-get of a
-    /// standard tree and of a blob tree alike.
+    /// Reads the keys of `ctx` on the calling thread, through the memtables
+    /// and the levels of its version, and turns each key's newest version
+    /// into its value as its value source says: the multi-get of a standard
+    /// tree and of a blob tree alike.
     ///
     /// # Errors
     ///
     /// The first failure of a level resolved key by key, or of the lowest
     /// key whose merge or blob read failed.
     pub(crate) fn read_many<K: AsRef<[u8]>>(
-        super_version: &SuperVersion,
-        keys: &[K],
-        seqno: SeqNo,
-        comparator: &dyn crate::comparator::UserComparator,
-        merge_operator: Option<&Arc<dyn crate::merge_operator::MergeOperator>>,
-        values: multi_get_read::Values<'_>,
-        metadata_budget: u64,
+        ctx: &read_job::ReadCtx<K>,
     ) -> crate::Result<Vec<Option<UserValue>>> {
-        let mut read = multi_get_read::MultiGetRead::new(
-            super_version,
-            keys,
-            seqno,
-            comparator,
-            merge_operator,
-            values,
-            metadata_budget,
-        );
-        Self::drive(&mut read)
+        let mut read = multi_get_read::MultiGetRead::new(ctx);
+        Self::drive(&mut read, ctx)
     }
 
-    /// Drives a read to its end on the calling thread, and returns its
-    /// answer. Its jobs are run as they are asked for, and the read moves on
+    /// Drives a read of `ctx` to its end on the calling thread, and returns
+    /// its answer. Its jobs are run as they are asked for, and the read moves on
     /// again before any block read is submitted, so the reads of a pass go
     /// out together. A block read goes to the read queue of the backend its
     /// table was opened through, and is handed back the moment it is in,
     /// while others may still be in flight: no table waits on the slowest
     /// file of the level.
     #[expect(clippy::indexing_slicing, reason = "a slot is a position in `queues`")]
-    fn drive<'a, 'k, M: level_resolve::ReadMachine<'a, 'k>>(level: &mut M) -> M::Output {
+    fn drive<'a, K: AsRef<[u8]>, M: read_job::ReadMachine<'a>>(
+        level: &mut M,
+        ctx: &read_job::ReadCtx<K>,
+    ) -> M::Output {
         // One queue per backend, opened when a table first asks it for a
         // block, so a level answered from the cache opens none.
         let mut queues: Vec<LevelQueue<'a>> = Vec::new();
@@ -3774,7 +3830,7 @@ impl Tree {
             generation: core::sync::atomic::AtomicU64::new(0),
             thread: std::thread::current(),
         });
-        let mut work = level_resolve::LevelWork::new();
+        let mut work = read_job::ReadWork::new();
 
         loop {
             if let Some(answer) = level.pump(&mut work) {
@@ -3782,7 +3838,7 @@ impl Tree {
             }
             if !work.jobs.is_empty() {
                 for job in work.jobs.drain(..) {
-                    level.job_done(job.run());
+                    level.job_done(job.run(ctx));
                 }
                 continue;
             }
@@ -3863,30 +3919,29 @@ impl Tree {
         }
     }
 
-    /// Resolves one level from its staged plan on the calling thread: `true`
-    /// when it answered the level (results updated, found keys dropped from
-    /// `still_remaining`), `false` when it hands the level to the serial
-    /// resolve.
+    /// Resolves the current version's level `level_idx` from its staged plan
+    /// for `keys` on the calling thread, with the default comparator and
+    /// metadata budget: `true` when it answered the level (results updated,
+    /// found keys dropped from `still_remaining`), `false` when it hands the
+    /// level to the serial resolve.
     #[cfg(test)]
     fn resolve_level_staged<K: AsRef<[u8]>>(
-        level: &crate::version::Level,
+        &self,
+        level_idx: usize,
         still_remaining: &mut Vec<(usize, u64)>,
-        keys: &[K],
-        seqno: SeqNo,
-        comparator: &dyn crate::comparator::UserComparator,
+        keys: Vec<K>,
         results: &mut [Option<InternalValue>],
-        metadata_budget: u64,
-    ) -> bool {
+    ) -> crate::Result<bool> {
         /// One level's resolve, answering into the caller's `results`.
-        struct OneLevel<'a, 'k, 'r, K> {
-            level: level_resolve::LevelResolve<'a, 'k, K>,
+        struct OneLevel<'a, 'r, K> {
+            level: level_resolve::LevelResolve<'a, K>,
             results: &'r mut [Option<InternalValue>],
         }
 
-        impl<'a, 'k, K: AsRef<[u8]>> level_resolve::ReadMachine<'a, 'k> for OneLevel<'a, 'k, '_, K> {
+        impl<'a, K: AsRef<[u8]>> read_job::ReadMachine<'a> for OneLevel<'a, '_, K> {
             type Output = bool;
 
-            fn pump(&mut self, out: &mut level_resolve::LevelWork<'a, 'k>) -> Option<bool> {
+            fn pump(&mut self, out: &mut read_job::ReadWork<'a>) -> Option<bool> {
                 match self.level.pump(self.results, out) {
                     level_resolve::LevelStep::Pending => None,
                     level_resolve::LevelStep::Resolved => Some(true),
@@ -3894,7 +3949,7 @@ impl Tree {
                 }
             }
 
-            fn job_done(&mut self, done: level_resolve::JobDone) {
+            fn job_done(&mut self, done: read_job::JobDone) {
                 self.level.job_done(done);
             }
 
@@ -3903,20 +3958,33 @@ impl Tree {
             }
         }
 
+        let ctx = read_job::ReadCtx {
+            super_version: self.snapshot_for_read(SeqNo::MAX)?,
+            keys,
+            seqno: SeqNo::MAX,
+            comparator: crate::comparator::default_comparator(),
+            merge_operator: None,
+            values: read_job::Values::Inline,
+            metadata_budget: crate::config::DEFAULT_MULTI_GET_METADATA_BUDGET,
+        };
+        let Some(level) = ctx.version().level(level_idx) else {
+            return Ok(true);
+        };
         let mut one = OneLevel {
             level: level_resolve::LevelResolve::new(
                 level,
+                level_idx,
                 core::mem::take(still_remaining),
-                keys,
-                comparator,
-                seqno,
-                metadata_budget,
+                &ctx.keys,
+                ctx.comparator.as_ref(),
+                ctx.seqno,
+                ctx.metadata_budget,
             ),
             results,
         };
-        let resolved = Self::drive(&mut one);
+        let resolved = Self::drive(&mut one, &ctx);
         *still_remaining = one.level.into_remaining();
-        resolved
+        Ok(resolved)
     }
 
     /// Counts, once per (table, key), the keys a table's filter let through

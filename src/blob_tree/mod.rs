@@ -56,7 +56,7 @@ impl IterGuard for Guard {
         if pred(&kv.key.user_key) {
             resolve_value_handle(
                 self.tree.id(),
-                &self.tree.index.config,
+                &self.tree.index.config.cache,
                 &self.version,
                 #[cfg(feature = "metrics")]
                 self.tree.metrics(),
@@ -90,7 +90,7 @@ impl IterGuard for Guard {
         }
         resolve_value_handle(
             self.tree.id(),
-            &self.tree.index.config,
+            &self.tree.index.config.cache,
             &self.version,
             #[cfg(feature = "metrics")]
             self.tree.metrics(),
@@ -101,7 +101,7 @@ impl IterGuard for Guard {
 
 pub(crate) fn resolve_value_handle(
     tree_id: TreeId,
-    config: &Config,
+    cache: &crate::Cache,
     version: &Version,
     #[cfg(feature = "metrics")] metrics: &crate::metrics::Metrics,
     item: InternalValue,
@@ -119,7 +119,7 @@ pub(crate) fn resolve_value_handle(
             Some(metrics),
         );
 
-        match accessor.get(tree_id, &item.key.user_key, &vptr.vhandle, &config.cache) {
+        match accessor.get(tree_id, &item.key.user_key, &vptr.vhandle, cache) {
             Ok(Some(v)) => {
                 let k = item.key.user_key;
                 Ok((k, v))
@@ -226,7 +226,7 @@ impl BlobTree {
 
         let (_, v) = resolve_value_handle(
             self.id(),
-            &self.index.config,
+            &self.index.config.cache,
             &super_version.version,
             #[cfg(feature = "metrics")]
             self.metrics(),
@@ -263,7 +263,7 @@ impl BlobTree {
                 let seqno = entry.key.seqno;
                 let (key, value) = resolve_value_handle(
                     self.id(),
-                    &self.index.config,
+                    &self.index.config.cache,
                     version,
                     #[cfg(feature = "metrics")]
                     self.metrics(),
@@ -271,6 +271,38 @@ impl BlobTree {
                 )?;
                 Ok(ScanSinceEvent::Insert { key, value, seqno })
             })
+    }
+
+    /// Starts a multi-get of `keys` at `seqno` that its caller drives, as
+    /// [`Tree::start_multi_get`](crate::Tree::start_multi_get) does; a value
+    /// kept in the value log is read by a job the read hands out.
+    ///
+    /// # Errors
+    ///
+    /// Returns [`crate::Error::SnapshotBelowRetention`] when `seqno` is below
+    /// what the tree retains.
+    pub fn start_multi_get<K: Into<UserKey>>(
+        &self,
+        keys: impl IntoIterator<Item = K>,
+        seqno: SeqNo,
+    ) -> crate::Result<crate::resumable::Step> {
+        let snapshot = self.index.snapshot_for_read(seqno)?;
+        Ok(crate::resumable::ResumableMultiGet::start(
+            crate::tree::read_job::ReadCtx {
+                super_version: crate::version::SnapshotRef::Owned((*snapshot).clone()),
+                keys: keys.into_iter().map(Into::into).collect(),
+                seqno,
+                comparator: Arc::clone(&self.index.config.comparator),
+                merge_operator: self.index.config.merge_operator.clone(),
+                values: crate::tree::read_job::Values::Blob {
+                    tree_id: self.id(),
+                    cache: Arc::clone(&self.index.config.cache),
+                    #[cfg(feature = "metrics")]
+                    metrics: Arc::clone(self.metrics()),
+                },
+                metadata_budget: self.index.config.multi_get_metadata_budget,
+            },
+        ))
     }
 
     /// Range-scoped variant of [`Self::scan_since_seqno`], with the same
@@ -299,7 +331,7 @@ impl BlobTree {
                 let seqno = entry.key.seqno;
                 let (key, value) = resolve_value_handle(
                     self.id(),
-                    &self.index.config,
+                    &self.index.config.cache,
                     version,
                     #[cfg(feature = "metrics")]
                     self.metrics(),
@@ -1515,8 +1547,6 @@ impl AbstractTree for BlobTree {
             return Ok(Vec::new());
         }
 
-        let comparator = self.index.config.comparator.as_ref();
-
         // For small batches, use the simple per-key path
         if n <= 2 {
             return keys
@@ -1527,20 +1557,20 @@ impl AbstractTree for BlobTree {
 
         // The read shared with `Tree::multi_get`, which follows a blob
         // indirection into this version's value log.
-        crate::Tree::read_many(
-            &super_version,
-            &keys,
+        crate::Tree::read_many(&crate::tree::read_job::ReadCtx {
+            super_version,
+            keys,
             seqno,
-            comparator,
-            self.index.config.merge_operator.as_ref(),
-            crate::tree::multi_get_read::Values::Blob {
+            comparator: Arc::clone(&self.index.config.comparator),
+            merge_operator: self.index.config.merge_operator.clone(),
+            values: crate::tree::read_job::Values::Blob {
                 tree_id: self.id(),
-                config: &self.index.config,
+                cache: Arc::clone(&self.index.config.cache),
                 #[cfg(feature = "metrics")]
-                metrics: self.metrics(),
+                metrics: Arc::clone(self.metrics()),
             },
-            self.index.config.multi_get_metadata_budget,
-        )
+            metadata_budget: self.index.config.multi_get_metadata_budget,
+        })
     }
 
     fn merge<K: Into<UserKey>, V: Into<UserValue>>(

@@ -7,7 +7,7 @@
 //! and never submits, reads or waits itself. Whoever drives it carries the
 //! reads out and hands each result back.
 
-use super::level_resolve::{BlockRequest, LevelJob, LevelWork};
+use super::read_job::{BlockRequest, Job, ReadWork, TableAt};
 use super::{BlockTask, LevelRead, LevelTable, LevelTasks, MetaHeld, Tree};
 use crate::table::probe_stats::PlanCounts;
 use crate::table::staged::{StagedRead, StagedStart};
@@ -18,16 +18,16 @@ use core::ops::Range;
 
 /// A table left to the serial planner, which is planned over its span of the
 /// batch and handed back through [`LevelStages::planned`].
-pub(super) struct StagePlan<'a> {
+pub(super) struct StagePlan {
     pub(super) at: usize,
-    pub(super) table: &'a Table,
+    pub(super) table: TableAt,
     pub(super) keys: Range<usize>,
 }
 
 /// The staged read of a level's `tables` for their spans of `batch`.
-pub(super) struct LevelStages<'a, 'k> {
+pub(super) struct LevelStages<'a> {
     tables: Vec<LevelTable<'a>>,
-    batch: Vec<(&'k [u8], u64)>,
+    batch: Vec<(&'a [u8], u64)>,
     seqno: SeqNo,
     metadata_budget: u64,
     /// What each read asked for is for: its tag is its position here.
@@ -53,49 +53,54 @@ pub(super) struct LevelStages<'a, 'k> {
     deferred: bool,
 }
 
-impl<'a, 'k> LevelStages<'a, 'k> {
-    /// The staged read of `level` for the keys of `remaining` (indices into
-    /// `keys` with their filter hashes, sorted under `comparator`), at the
-    /// snapshot `seqno`. Each table of each run covers a span of the batch;
-    /// its read begins once it has a place to read in.
+impl<'a> LevelStages<'a> {
+    /// The staged read of `level`, the version's level `level_idx`, for the
+    /// keys of `remaining` (indices into `keys` with their filter hashes,
+    /// sorted under `comparator`), at the snapshot `seqno`. Each table of
+    /// each run covers a span of the batch; its read begins once it has a
+    /// place to read in.
     #[expect(
         clippy::indexing_slicing,
-        reason = "i < batch.len() is loop-checked; remaining's indices are valid key indices"
+        reason = "i < batch.len() is loop-checked; remaining's indices are valid key indices; a position from the run's lookup lies in the run"
     )]
     pub(super) fn new<K: AsRef<[u8]>>(
         level: &'a crate::version::Level,
+        level_idx: usize,
         remaining: &[(usize, u64)],
-        keys: &'k [K],
+        keys: &'a [K],
         comparator: &dyn crate::comparator::UserComparator,
         seqno: SeqNo,
         metadata_budget: u64,
     ) -> Self {
         // The batch the level is read for, once: each table covers a span of
         // it, in every run alike.
-        let batch: Vec<(&'k [u8], u64)> = remaining
+        let batch: Vec<(&'a [u8], u64)> = remaining
             .iter()
             .map(|&(idx, hash)| (keys[idx].as_ref(), hash))
             .collect();
 
-        // The level's tables, each with the span of keys it covers.
+        // The level's tables, each with the span of keys it covers and its
+        // place in the version.
         let mut tables: Vec<LevelTable<'a>> = Vec::new();
-        for run in level.iter() {
+        for (run_idx, run) in level.iter().enumerate() {
             let mut i = 0;
             while i < batch.len() {
-                let Some(table) = run.get_for_key_cmp(batch[i].0, comparator) else {
+                let Some(pos) = run.index_for_key_cmp(batch[i].0, comparator) else {
                     i += 1;
                     continue;
                 };
-                let table_id = table.id();
                 let start = i;
-                while i < batch.len() {
-                    match run.get_for_key_cmp(batch[i].0, comparator) {
-                        Some(t) if t.id() == table_id => i += 1,
-                        _ => break,
-                    }
+                while i < batch.len() && run.index_for_key_cmp(batch[i].0, comparator) == Some(pos)
+                {
+                    i += 1;
                 }
                 tables.push(LevelTable {
-                    table,
+                    table: &run[pos],
+                    at: TableAt {
+                        level: level_idx,
+                        run: run_idx,
+                        pos,
+                    },
                     keys: start..i,
                     read: LevelRead::Pending,
                     file: None,
@@ -122,10 +127,6 @@ impl<'a, 'k> LevelStages<'a, 'k> {
     }
 
     /// The keys of the level's batch in `span`.
-    pub(super) fn span(&self, span: Range<usize>) -> &[(&'k [u8], u64)] {
-        self.batch.get(span).unwrap_or_default()
-    }
-
     /// Whether none of the level's tables waits on a read or an open.
     pub(super) fn idle(&self) -> bool {
         self.waiting.iter().all(|&waiting| waiting == 0)
@@ -146,7 +147,7 @@ impl<'a, 'k> LevelStages<'a, 'k> {
         clippy::indexing_slicing,
         reason = "`at` indexes the level's tables, which every per-table vector is sized to; a table's span lies in `batch`"
     )]
-    pub(super) fn pump(&mut self, out: &mut LevelWork<'a, '_>) {
+    pub(super) fn pump(&mut self, out: &mut ReadWork<'a>) {
         self.deferred = false;
         // Whether a table before the one at hand holds metadata blocks: the
         // first that does is never held back, so the level advances.
@@ -216,7 +217,10 @@ impl<'a, 'k> LevelStages<'a, 'k> {
                 // flight while it is opened, so the tables after it see the
                 // level as they would with its reads out.
                 let Some(file) = &entry.file else {
-                    out.jobs.push(LevelJob::Open { tag: at, table });
+                    out.jobs.push(Job::Open {
+                        tag: at,
+                        table: entry.at,
+                    });
                     self.staged[at] = true;
                     self.in_stage += 1;
                     self.opening[at] = asked_bytes;
@@ -332,7 +336,7 @@ impl<'a, 'k> LevelStages<'a, 'k> {
     /// The tables the stages left to the serial planner, in level order, once
     /// no stage is in flight: those a stage gave up on, and any whose stages
     /// did not finish.
-    pub(super) fn serial_plans(&self) -> Vec<StagePlan<'a>> {
+    pub(super) fn serial_plans(&self) -> Vec<StagePlan> {
         self.tables
             .iter()
             .enumerate()
@@ -343,7 +347,7 @@ impl<'a, 'k> LevelStages<'a, 'k> {
             })
             .map(|(at, entry)| StagePlan {
                 at,
-                table: entry.table,
+                table: entry.at,
                 keys: entry.keys.clone(),
             })
             .collect()
@@ -376,7 +380,11 @@ impl<'a, 'k> LevelStages<'a, 'k> {
         let mut tasks: Vec<BlockTask<'a>> = Vec::new();
         let mut probes: Vec<(&'a Table, PlanCounts)> = Vec::new();
         for LevelTable {
-            table, keys, read, ..
+            table,
+            at,
+            keys,
+            read,
+            ..
         } in self.tables
         {
             let (table_seqno, blocks, tally) = match read {
@@ -398,6 +406,7 @@ impl<'a, 'k> LevelStages<'a, 'k> {
                     .collect();
                 tasks.push(BlockTask {
                     table,
+                    at,
                     handle,
                     table_seqno,
                     special,
