@@ -9,6 +9,7 @@ pub mod ingest;
 pub mod inner;
 mod level_resolve;
 mod level_stages;
+pub mod multi_get_read;
 pub mod sealed;
 mod tables_read;
 
@@ -1831,10 +1832,6 @@ impl AbstractTree for Tree {
         )
     }
 
-    #[expect(
-        clippy::indexing_slicing,
-        reason = "indices are generated from 0..n range, always in bounds"
-    )]
     fn multi_get<K: AsRef<[u8]>>(
         &self,
         keys: impl IntoIterator<Item = K>,
@@ -1844,7 +1841,6 @@ impl AbstractTree for Tree {
         let comparator = self.config.comparator.as_ref();
         let merge_operator = self.config.merge_operator.as_ref();
 
-        // Collect keys up front; bloom hashes computed lazily in Phase 2
         let keys: Vec<_> = keys.into_iter().collect();
         let n = keys.len();
         if n == 0 {
@@ -1867,71 +1863,15 @@ impl AbstractTree for Tree {
                 .collect();
         }
 
-        // Phase 1: Check active + sealed memtables (unsorted — memtable lookup
-        // is O(log n) per key regardless of order, skip sort+hash overhead for
-        // memtable-only batches).
-        let mut internal_entries: Vec<Option<InternalValue>> = vec![None; n];
-        let mut remaining: Vec<usize> = Vec::with_capacity(n);
-
-        for idx in 0..n {
-            let key = keys[idx].as_ref();
-
-            // Active memtable
-            if let Some(entry) = super_version.active_memtable.get(key, seqno) {
-                internal_entries[idx] = Some(entry);
-                continue;
-            }
-
-            // Sealed memtables (newest first)
-            if let Some(entry) =
-                Self::get_internal_entry_from_sealed_memtables(&super_version, key, seqno)
-            {
-                internal_entries[idx] = Some(entry);
-                continue;
-            }
-
-            remaining.push(idx);
-        }
-
-        // Phase 2: Sort remaining keys + compute bloom hashes only if needed
-        // (memtable-only batches skip this entirely).
-        if !remaining.is_empty() {
-            remaining.sort_by(|&a, &b| comparator.compare(keys[a].as_ref(), keys[b].as_ref()));
-
-            // De-duplicate equal query keys (the batched on-disk path requires
-            // strictly-sorted-unique input) and resolve the misses. Shared with
-            // the BlobTree path via these helpers so the two cannot drift.
-            let (miss_keys, duplicates) =
-                Self::dedup_sorted_miss_keys(&remaining, &keys, comparator);
-
-            Self::batch_get_from_tables(
-                &super_version.version,
-                &keys,
-                miss_keys,
-                seqno,
-                comparator,
-                &mut internal_entries,
-                self.config.multi_get_metadata_budget,
-            )?;
-
-            Self::fan_out_duplicates(&duplicates, &mut internal_entries);
-        }
-
-        // Phase 3: Resolve entries (tombstones, RT suppression, merge operands)
-        let mut results = vec![None; n];
-        for idx in 0..n {
-            let entry = internal_entries[idx].take();
-            results[idx] = Self::resolve_entry(
-                &super_version,
-                keys[idx].as_ref(),
-                entry,
-                seqno,
-                merge_operator,
-                comparator,
-            )?;
-        }
-
-        Ok(results)
+        Self::read_many(
+            &super_version,
+            &keys,
+            seqno,
+            comparator,
+            merge_operator,
+            multi_get_read::Values::Inline,
+            self.config.multi_get_metadata_budget,
+        )
     }
 
     fn apply_batch(&self, batch: crate::WriteBatch, seqno: SeqNo) -> crate::Result<(u64, u64)> {
@@ -3532,34 +3472,6 @@ impl Tree {
         false
     }
 
-    /// Resolves a single internal entry into a user value, handling tombstones,
-    /// range tombstone suppression, and merge operand resolution.
-    /// Resolves an entry for `multi_get`: tombstone filter, RT suppression,
-    /// merge operand resolution. Delegates to [`Self::resolve_pinned_entry`] with
-    /// `Owned` wrapping, then extracts the value.
-    fn resolve_entry(
-        super_version: &SuperVersion,
-        key: &[u8],
-        entry: Option<InternalValue>,
-        seqno: SeqNo,
-        merge_operator: Option<&Arc<dyn crate::merge_operator::MergeOperator>>,
-        comparator: &dyn crate::comparator::UserComparator,
-    ) -> crate::Result<Option<UserValue>> {
-        let Some(entry) = entry else {
-            return Ok(None);
-        };
-        Self::resolve_pinned_entry(
-            super_version,
-            key,
-            entry,
-            seqno,
-            merge_operator,
-            comparator,
-            crate::PinnableSlice::owned,
-        )
-        .map(|opt| opt.map(crate::PinnableSlice::into_value))
-    }
-
     /// De-duplicates equal query keys in a comparator-sorted `remaining` index
     /// list, returning the `(key_index, bloom_hash)` pairs for the batched
     /// on-disk resolver (which requires strictly-sorted-unique input) and a
@@ -3612,44 +3524,6 @@ impl Tree {
             let resolved = internal_entries[rep_idx].clone();
             internal_entries[dup_idx] = resolved;
         }
-    }
-
-    /// Queries tables for multiple keys, level by level from the top, and
-    /// keeps in `results` (aligned with `keys`) the newest version the first
-    /// level holding a key has.
-    ///
-    /// `miss_keys` contains `(key_index, bloom_hash)` pairs for keys not yet
-    /// found, in comparator-sorted order; the hash is reused across every
-    /// table's filter.
-    pub(crate) fn batch_get_from_tables<K: AsRef<[u8]>>(
-        version: &Version,
-        keys: &[K],
-        miss_keys: Vec<(usize, u64)>,
-        seqno: SeqNo,
-        comparator: &dyn crate::comparator::UserComparator,
-        results: &mut [Option<InternalValue>],
-        metadata_budget: u64,
-    ) -> crate::Result<()> {
-        debug_assert_eq!(results.len(), keys.len());
-        debug_assert!(miss_keys.iter().all(|&(i, _)| i < keys.len()));
-
-        // Each level is read stage by stage across ALL its SSTs: every
-        // table's filter blocks in one batch, then its index blocks, then its
-        // data blocks, and answered from the blocks read. On io_uring each
-        // batch is one submission the kernel fans out across the underlying
-        // devices. A Page-ECC or columnar table is planned serially and its
-        // data blocks loaded through its format-aware path, while the level's
-        // other tables stay staged. A level whose plan or batched read fails
-        // is resolved serially, key by key.
-        let mut read = tables_read::TablesRead::new(
-            version,
-            keys,
-            miss_keys,
-            seqno,
-            comparator,
-            metadata_budget,
-        );
-        Self::drive(&mut read, results)
     }
 
     /// Resolves the keys of `remaining` (sorted under `comparator`) against
@@ -3853,6 +3727,36 @@ impl Tree {
             })
     }
 
+    /// Reads `keys` at the snapshot `seqno` of `super_version` on the calling
+    /// thread, through the memtables and the levels, and turns each key's
+    /// newest version into its value as `values` says: the multi-get of a
+    /// standard tree and of a blob tree alike.
+    ///
+    /// # Errors
+    ///
+    /// The first failure of a level resolved key by key, or of the lowest
+    /// key whose merge or blob read failed.
+    pub(crate) fn read_many<K: AsRef<[u8]>>(
+        super_version: &SuperVersion,
+        keys: &[K],
+        seqno: SeqNo,
+        comparator: &dyn crate::comparator::UserComparator,
+        merge_operator: Option<&Arc<dyn crate::merge_operator::MergeOperator>>,
+        values: multi_get_read::Values<'_>,
+        metadata_budget: u64,
+    ) -> crate::Result<Vec<Option<UserValue>>> {
+        let mut read = multi_get_read::MultiGetRead::new(
+            super_version,
+            keys,
+            seqno,
+            comparator,
+            merge_operator,
+            values,
+            metadata_budget,
+        );
+        Self::drive(&mut read)
+    }
+
     /// Drives a read to its end on the calling thread, and returns its
     /// answer. Its jobs are run as they are asked for, and the read moves on
     /// again before any block read is submitted, so the reads of a pass go
@@ -3861,10 +3765,7 @@ impl Tree {
     /// while others may still be in flight: no table waits on the slowest
     /// file of the level.
     #[expect(clippy::indexing_slicing, reason = "a slot is a position in `queues`")]
-    fn drive<'a, 'k, M: level_resolve::ReadMachine<'a, 'k>>(
-        level: &mut M,
-        results: &mut [Option<InternalValue>],
-    ) -> M::Output {
+    fn drive<'a, 'k, M: level_resolve::ReadMachine<'a, 'k>>(level: &mut M) -> M::Output {
         // One queue per backend, opened when a table first asks it for a
         // block, so a level answered from the cache opens none.
         let mut queues: Vec<LevelQueue<'a>> = Vec::new();
@@ -3876,7 +3777,7 @@ impl Tree {
         let mut work = level_resolve::LevelWork::new();
 
         loop {
-            if let Some(answer) = level.pump(results, &mut work) {
+            if let Some(answer) = level.pump(&mut work) {
                 return answer;
             }
             if !work.jobs.is_empty() {
@@ -3976,16 +3877,45 @@ impl Tree {
         results: &mut [Option<InternalValue>],
         metadata_budget: u64,
     ) -> bool {
-        let mut resolve = level_resolve::LevelResolve::new(
-            level,
-            core::mem::take(still_remaining),
-            keys,
-            comparator,
-            seqno,
-            metadata_budget,
-        );
-        let resolved = Self::drive(&mut resolve, results);
-        *still_remaining = resolve.into_remaining();
+        /// One level's resolve, answering into the caller's `results`.
+        struct OneLevel<'a, 'k, 'r, K> {
+            level: level_resolve::LevelResolve<'a, 'k, K>,
+            results: &'r mut [Option<InternalValue>],
+        }
+
+        impl<'a, 'k, K: AsRef<[u8]>> level_resolve::ReadMachine<'a, 'k> for OneLevel<'a, 'k, '_, K> {
+            type Output = bool;
+
+            fn pump(&mut self, out: &mut level_resolve::LevelWork<'a, 'k>) -> Option<bool> {
+                match self.level.pump(self.results, out) {
+                    level_resolve::LevelStep::Pending => None,
+                    level_resolve::LevelStep::Resolved => Some(true),
+                    level_resolve::LevelStep::Serial => Some(false),
+                }
+            }
+
+            fn job_done(&mut self, done: level_resolve::JobDone) {
+                self.level.job_done(done);
+            }
+
+            fn read_done(&mut self, done: crate::fs::ReadDone) {
+                self.level.read_done(done);
+            }
+        }
+
+        let mut one = OneLevel {
+            level: level_resolve::LevelResolve::new(
+                level,
+                core::mem::take(still_remaining),
+                keys,
+                comparator,
+                seqno,
+                metadata_budget,
+            ),
+            results,
+        };
+        let resolved = Self::drive(&mut one);
+        *still_remaining = one.level.into_remaining();
         resolved
     }
 

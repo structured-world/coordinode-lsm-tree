@@ -3,11 +3,15 @@
 // (found in the LICENSE-APACHE file in the repository)
 
 //! The read of a key batch through a version's levels as a machine: each
-//! level is resolved from its staged plan, top down, and a level that cannot
-//! be is handed out whole as a job that resolves it key by key. Like the
-//! level it drives, it never opens, reads or waits itself.
+//! level is resolved from its staged plan, top down: every table's filter
+//! blocks in one batch, then its index blocks, then its data blocks, and
+//! answered from the blocks read, so on `io_uring` each batch is one
+//! submission the kernel fans out across the underlying devices. A level
+//! that cannot be resolved so is handed out whole as a job that resolves it
+//! key by key. Like the level it drives, it never opens, reads or waits
+//! itself.
 
-use super::level_resolve::{JobDone, LevelJob, LevelResolve, LevelWork, ReadMachine};
+use super::level_resolve::{JobDone, LevelJob, LevelResolve, LevelStep, LevelWork};
 use crate::version::Version;
 use crate::{InternalValue, SeqNo};
 use alloc::vec::Vec;
@@ -69,14 +73,14 @@ impl<'a, 'k, K: AsRef<[u8]>> TablesRead<'a, 'k, K> {
             staged: None,
         }
     }
-}
 
-impl<'a, 'k, K: AsRef<[u8]>> ReadMachine<'a, 'k> for TablesRead<'a, 'k, K> {
-    /// The first failure of a level resolved key by key: the staged resolve
-    /// hands its own failures to that resolve rather than reporting them.
-    type Output = crate::Result<()>;
-
-    fn pump(
+    /// Moves the read on as far as what is back takes it, keeping in
+    /// `results` the newest version per key the first level holding it has,
+    /// and asking `out` for the work it needs next; `Some` once every level
+    /// is read and nothing is out, with the first failure of a level resolved
+    /// key by key (the staged resolve hands its own failures to that resolve
+    /// rather than reporting them).
+    pub(super) fn pump(
         &mut self,
         results: &mut [Option<InternalValue>],
         out: &mut LevelWork<'a, 'k>,
@@ -113,7 +117,11 @@ impl<'a, 'k, K: AsRef<[u8]>> ReadMachine<'a, 'k> for TablesRead<'a, 'k, K> {
                     let Some(level) = &mut self.staged else {
                         unreachable!("a staged level is held while it is read");
                     };
-                    let resolved = ReadMachine::pump(level, results, out)?;
+                    let resolved = match level.pump(results, out) {
+                        LevelStep::Pending => return None,
+                        LevelStep::Resolved => true,
+                        LevelStep::Serial => false,
+                    };
                     let Some(level) = self.staged.take() else {
                         unreachable!("matched above");
                     };
@@ -169,7 +177,8 @@ impl<'a, 'k, K: AsRef<[u8]>> ReadMachine<'a, 'k> for TablesRead<'a, 'k, K> {
         }
     }
 
-    fn job_done(&mut self, done: JobDone) {
+    /// Takes back a finished job.
+    pub(super) fn job_done(&mut self, done: JobDone) {
         match (&mut self.state, &mut self.staged, done) {
             (State::Serial(slot @ None), _, JobDone::Serial { result }) => *slot = Some(result),
             (State::Staged, Some(level), done) => level.job_done(done),
@@ -177,7 +186,8 @@ impl<'a, 'k, K: AsRef<[u8]>> ReadMachine<'a, 'k> for TablesRead<'a, 'k, K> {
         }
     }
 
-    fn read_done(&mut self, done: crate::fs::ReadDone) {
+    /// Takes back a finished block read.
+    pub(super) fn read_done(&mut self, done: crate::fs::ReadDone) {
         if let Some(level) = &mut self.staged {
             level.read_done(done);
         } else {

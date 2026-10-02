@@ -61,6 +61,26 @@ pub(super) enum LevelJob<'a, 'k> {
         seqno: SeqNo,
         comparator: &'a dyn crate::comparator::UserComparator,
     },
+    /// Resolves the merge operands of the key at `idx` in `super_version` at
+    /// the snapshot `seqno`, reading every version of it below the newest.
+    Merge {
+        idx: usize,
+        key: &'k [u8],
+        super_version: &'a crate::version::SuperVersion,
+        seqno: SeqNo,
+        merge_operator: &'a Arc<dyn crate::merge_operator::MergeOperator>,
+    },
+    /// Reads the value the indirection `item` (the newest version of the key
+    /// at `idx`) points to in the value log of `version`.
+    Blob {
+        idx: usize,
+        item: InternalValue,
+        tree_id: crate::TreeId,
+        config: &'a crate::Config,
+        version: &'a crate::version::Version,
+        #[cfg(feature = "metrics")]
+        metrics: &'a crate::metrics::Metrics,
+    },
 }
 
 /// A finished [`LevelJob`].
@@ -80,6 +100,11 @@ pub(super) enum JobDone {
     },
     Serial {
         result: crate::Result<super::tables_read::SerialLevel>,
+    },
+    /// The value of the key at `idx`, from a merge or a blob read.
+    Value {
+        idx: usize,
+        value: crate::Result<Option<crate::UserValue>>,
     },
 }
 
@@ -121,6 +146,41 @@ impl LevelJob<'_, '_> {
                     level_zero, level, remaining, &keys, seqno, comparator,
                 ),
             },
+            Self::Merge {
+                idx,
+                key,
+                super_version,
+                seqno,
+                merge_operator,
+            } => JobDone::Value {
+                idx,
+                value: Tree::resolve_merge_via_pipeline(
+                    super_version.clone(),
+                    key,
+                    seqno,
+                    Arc::clone(merge_operator),
+                ),
+            },
+            Self::Blob {
+                idx,
+                item,
+                tree_id,
+                config,
+                version,
+                #[cfg(feature = "metrics")]
+                metrics,
+            } => JobDone::Value {
+                idx,
+                value: crate::blob_tree::resolve_value_handle(
+                    tree_id,
+                    config,
+                    version,
+                    #[cfg(feature = "metrics")]
+                    metrics,
+                    item,
+                )
+                .map(|(_, value)| Some(value)),
+            },
         }
     }
 }
@@ -131,46 +191,16 @@ pub(super) trait ReadMachine<'a, 'k> {
     /// What the read answers once it is over.
     type Output;
 
-    /// Moves the read on as far as what is back takes it, keeping answers in
-    /// `results` and asking `out` for the work it needs next; `Some` once the
-    /// read is over and nothing of it is out.
-    fn pump(
-        &mut self,
-        results: &mut [Option<InternalValue>],
-        out: &mut LevelWork<'a, 'k>,
-    ) -> Option<Self::Output>;
+    /// Moves the read on as far as what is back takes it, asking `out` for
+    /// the work it needs next; `Some` once the read is over and nothing of it
+    /// is out.
+    fn pump(&mut self, out: &mut LevelWork<'a, 'k>) -> Option<Self::Output>;
 
     /// Takes back a finished job.
     fn job_done(&mut self, done: JobDone);
 
     /// Takes back a finished block read.
     fn read_done(&mut self, done: crate::fs::ReadDone);
-}
-
-impl<'a, 'k, K: AsRef<[u8]>> ReadMachine<'a, 'k> for LevelResolve<'a, 'k, K> {
-    /// Whether the level was answered from its plan; `false` hands it to the
-    /// serial resolve.
-    type Output = bool;
-
-    fn pump(
-        &mut self,
-        results: &mut [Option<InternalValue>],
-        out: &mut LevelWork<'a, 'k>,
-    ) -> Option<bool> {
-        match Self::pump(self, results, out) {
-            LevelStep::Pending => None,
-            LevelStep::Resolved => Some(true),
-            LevelStep::Serial => Some(false),
-        }
-    }
-
-    fn job_done(&mut self, done: JobDone) {
-        Self::job_done(self, done);
-    }
-
-    fn read_done(&mut self, done: crate::fs::ReadDone) {
-        Self::read_done(self, done);
-    }
 }
 
 /// What a level asks its driver to carry out: jobs first, then reads.
@@ -628,7 +658,7 @@ impl<'a, 'k, K: AsRef<[u8]>> Chunks<'a, 'k, K> {
             JobDone::Loaded { index, block } => {
                 block.and_then(|block| current.read.loaded(chunk, index, block))
             }
-            JobDone::Planned { .. } | JobDone::Serial { .. } => {
+            JobDone::Planned { .. } | JobDone::Serial { .. } | JobDone::Value { .. } => {
                 debug_assert!(false, "a job handed back to the data block phase");
                 Ok(())
             }
