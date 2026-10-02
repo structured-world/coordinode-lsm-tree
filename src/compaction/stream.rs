@@ -867,7 +867,9 @@ impl<'a, I: Iterator<Item = Item>, F: StreamFilter + 'a> CompactionStream<'a, I,
             ));
         }
         // The value goes where a put of it would go: a value of the tree's
-        // separation size into the value log, not inline in the index.
+        // separation size into the value log, not inline in the index. If the
+        // compaction later fails, this blob is an output like its tables:
+        // removing it belongs to the compaction's error path, not to this fold.
         let mut result = InternalValue::from_components(
             user_key,
             UserValue::empty(),
