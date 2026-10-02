@@ -15296,6 +15296,31 @@ fn repair_propagates_an_exhausted_descriptor_table() -> crate::Result<()> {
     let root = std::path::absolute("/db")?;
     standard_tree_without_manifest(&memfs, &root)?;
 
+    // The manifest files of the tree and the bytes of every table.
+    let tree_state = || -> crate::Result<Vec<(String, Vec<u8>)>> {
+        use crate::fs::Fs;
+        let mut state = Vec::new();
+        for e in memfs.read_dir(&root)? {
+            let manifest = e.file_name == "current"
+                || e.file_name.starts_with("edits-")
+                || e.file_name
+                    .strip_prefix('v')
+                    .is_some_and(|rest| rest.parse::<u64>().is_ok());
+            if manifest {
+                state.push((e.file_name, Vec::new()));
+            }
+        }
+        for e in memfs.read_dir(&root.join("tables"))? {
+            let file = memfs.open(&e.path, &crate::fs::FsOpenOptions::new().read(true))?;
+            let len = crate::fs::FsFile::metadata(&*file)?.len;
+            let bytes = crate::file::read_exact(&*file, 0, usize::try_from(len).unwrap_or(0))?;
+            state.push((e.file_name, bytes.to_vec()));
+        }
+        state.sort();
+        Ok(state)
+    };
+    let before = tree_state()?;
+
     let fault = FaultFs::new((*memfs).clone());
     fault.injector().arm(
         FaultRule::new(FaultOp::Open, Fault::Error(ErrorKind::TooManyOpenFiles))
@@ -15312,6 +15337,10 @@ fn repair_propagates_an_exhausted_descriptor_table() -> crate::Result<()> {
         matches!(result, Err(crate::Error::Io(ref e)) if e.kind() == ErrorKind::TooManyOpenFiles),
         "descriptor exhaustion must abort the repair, never grade the file: {:?}",
         result.map(|r| (r.recovered, r.unreadable)),
+    );
+    assert!(
+        tree_state()? == before,
+        "the aborted repair published no manifest and left every table as it was"
     );
 
     // With descriptors to spare, the retry recovers the intact file.

@@ -67,3 +67,53 @@ fn repair_of_more_tables_than_open_descriptors_recovers_every_table() -> lsm_tre
     }
     Ok(())
 }
+
+/// The replacements a salvaging repair builds are held until it publishes,
+/// like the tables it recovers whole, so they too go through its descriptor
+/// cache: a tree with more damaged tables than the process may open is
+/// salvaged whole.
+#[test]
+fn salvage_of_more_tables_than_open_descriptors_keeps_every_replacement() -> lsm_tree::Result<()> {
+    const DAMAGED: u64 = 300;
+    const LIMIT: u64 = 128;
+    let dir = tempfile::tempdir()?;
+    let config = || {
+        Config::new(
+            dir.path(),
+            SequenceNumberCounter::default(),
+            SequenceNumberCounter::default(),
+        )
+        .use_descriptor_table(Some(std::sync::Arc::new(lsm_tree::DescriptorTable::new(
+            16,
+        ))))
+    };
+    {
+        let tree = config().open()?;
+        let mut seqno = 0;
+        for table in 0..DAMAGED {
+            // Several data blocks, so one corrupt block leaves the rest.
+            for row in 0..500u32 {
+                tree.insert(format!("t{table:03}r{row:04}"), [b'v'; 64], seqno);
+                seqno += 1;
+            }
+            tree.flush_active_memtable(0)?;
+        }
+    }
+    for sst in common::sorted_sst_paths(dir.path()) {
+        common::corrupt_data_region(&sst)?;
+    }
+    common::nuke_manifest(dir.path())?;
+
+    let (_, hard) = rlimit::getrlimit(rlimit::Resource::NOFILE)?;
+    rlimit::setrlimit(rlimit::Resource::NOFILE, LIMIT, hard)?;
+
+    let report = config().repair_with_salvage(true)?;
+    assert_eq!(
+        (report.recovered, report.salvaged),
+        (DAMAGED as usize, DAMAGED as usize),
+        "every damaged table is salvaged: {:?}",
+        report.unreadable_files.first(),
+    );
+    assert_eq!(config().open()?.table_count(), DAMAGED as usize);
+    Ok(())
+}
