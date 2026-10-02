@@ -98,13 +98,13 @@ fn run() -> Result<(), Box<dyn std::error::Error>> {
 
         // Moves a read on: its jobs inline, its block reads onto the ring, and
         // back into its slot unless it answered.
-        let mut settle = |slot: usize,
-                          step: Step,
-                          since: Instant,
-                          slots: &mut Vec<Option<(ResumableMultiGet, Instant)>>,
-                          tags: &mut Vec<(usize, ReadTag)>,
-                          queue: &mut Box<dyn lsm_tree::fs::ReadQueue + '_>,
-                          wall: &mut Vec<Duration>|
+        let settle = |slot: usize,
+                      step: Step,
+                      since: Instant,
+                      slots: &mut Vec<Option<(ResumableMultiGet, Instant)>>,
+                      tags: &mut Vec<(usize, ReadTag)>,
+                      queue: &mut Box<dyn lsm_tree::fs::ReadQueue + '_>,
+                      wall: &mut Vec<Duration>|
          -> lsm_tree::Result<()> {
             let mut step = step;
             loop {
