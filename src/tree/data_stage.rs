@@ -43,9 +43,10 @@ pub(super) struct ChunkFill<'a> {
     pub(super) buf: Vec<u8>,
 }
 
-/// The read of one chunk of block tasks for `keys`.
-pub(super) struct ChunkRead<'c, 'a, 'k, K> {
-    chunk: &'c [BlockTask<'a>],
+/// The read of one chunk of block tasks for `keys`. The chunk's tasks are
+/// not held: every call takes them again, and the indices it takes and hands
+/// out are positions in them.
+pub(super) struct ChunkRead<'a, 'k, K> {
     keys: &'k [K],
     /// The reads of the blocks the chunk lacks, in task order.
     fills: Vec<ChunkFill<'a>>,
@@ -60,7 +61,7 @@ pub(super) struct ChunkRead<'c, 'a, 'k, K> {
     decode_failure: Option<(usize, crate::Error)>,
 }
 
-impl<'c, 'a, 'k, K: AsRef<[u8]>> ChunkRead<'c, 'a, 'k, K> {
+impl<'a, 'k, K: AsRef<[u8]>> ChunkRead<'a, 'k, K> {
     /// Point-reads every task whose block is held, and returns the work the
     /// others need: a Page-ECC or columnar table's load, and the files to open
     /// for the reads [`Self::take_reads`] then hands out.
@@ -74,13 +75,12 @@ impl<'c, 'a, 'k, K: AsRef<[u8]>> ChunkRead<'c, 'a, 'k, K> {
     /// A held block's point read fails, or a block to read has a size no block
     /// of its table can have (refused before its buffer is allocated).
     pub(super) fn start(
-        chunk: &'c [BlockTask<'a>],
+        chunk: &[BlockTask<'a>],
         cached: &[TaskBlock],
         keys: &'k [K],
         carried: &mut Option<ChunkFile>,
     ) -> crate::Result<(Self, Vec<ChunkWork<'a>>)> {
         let mut read = Self {
-            chunk,
             keys,
             fills: Vec::new(),
             files: Vec::new(),
@@ -152,27 +152,35 @@ impl<'c, 'a, 'k, K: AsRef<[u8]>> ChunkRead<'c, 'a, 'k, K> {
         )
     }
 
-    /// Takes back the load of task `index`: `None` when the table holds no
-    /// key there (a columnar block its delete mask removes whole).
+    /// Takes back the load of task `index` of `chunk`: `None` when the table
+    /// holds no key there (a columnar block its delete mask removes whole).
     ///
     /// # Errors
     ///
     /// The point read of the block fails.
     pub(super) fn loaded(
         &mut self,
+        chunk: &[BlockTask<'a>],
         index: usize,
         block: Option<crate::table::DataBlock>,
     ) -> crate::Result<()> {
-        let (Some(block), Some(task)) = (block, self.chunk.get(index)) else {
+        let (Some(block), Some(task)) = (block, chunk.get(index)) else {
             return Ok(());
         };
         Tree::read_task_keys(task, index, &block, self.keys, &mut self.hits)
     }
 
-    /// Takes back the read of task `index` as its on-disk `bytes`: decoded,
-    /// kept in the cache while it fits in `keep_room`, and point-read.
-    pub(super) fn read(&mut self, index: usize, bytes: &[u8], keep_room: &mut u64) {
-        let Some(task) = self.chunk.get(index) else {
+    /// Takes back the read of task `index` of `chunk` as its on-disk `bytes`:
+    /// decoded, kept in the cache while it fits in `keep_room`, and
+    /// point-read.
+    pub(super) fn read(
+        &mut self,
+        chunk: &[BlockTask<'a>],
+        index: usize,
+        bytes: &[u8],
+        keep_room: &mut u64,
+    ) {
+        let Some(task) = chunk.get(index) else {
             return;
         };
         if let Err(e) =
@@ -186,7 +194,7 @@ impl<'c, 'a, 'k, K: AsRef<[u8]>> ChunkRead<'c, 'a, 'k, K> {
         }
     }
 
-    /// Applies what the chunk found once every block is back, keeping the
+    /// Applies what `chunk` found once every block is back, keeping the
     /// highest-seqno hit per key in `results`, and adds the `(table, key)`
     /// pairs a read found to `found` when it is kept.
     ///
@@ -199,11 +207,11 @@ impl<'c, 'a, 'k, K: AsRef<[u8]>> ChunkRead<'c, 'a, 'k, K> {
     /// The lowest task whose block failed to decode.
     pub(super) fn finish(
         self,
+        chunk: &[BlockTask<'a>],
         results: &mut [Option<InternalValue>],
         found: Option<&mut Vec<(crate::TableId, usize)>>,
     ) -> crate::Result<()> {
         let Self {
-            chunk,
             mut hits,
             decode_failure,
             ..

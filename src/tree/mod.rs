@@ -4242,7 +4242,7 @@ impl Tree {
                     index,
                     table,
                     handle,
-                } => chunk_read.loaded(index, table.load_data_block(&handle)?)?,
+                } => chunk_read.loaded(chunk, index, table.load_data_block(&handle)?)?,
                 data_stage::ChunkWork::Open { slot, table } => {
                     chunk_read.opened(slot, table.open_file()?);
                 }
@@ -4311,7 +4311,7 @@ impl Tree {
             }
             fs.read_blocks_batched_each(reqs, &mut |position, req| {
                 if let Some(&(index, _)) = tasks.get(position) {
-                    chunk_read.read(index, req.buf.filled_bytes(), keep_room);
+                    chunk_read.read(chunk, index, req.buf.filled_bytes(), keep_room);
                 }
             })?;
             // An implementation that reported success without filling a
@@ -4331,7 +4331,7 @@ impl Tree {
             .into_iter()
             .last()
             .and_then(|(id, file)| Some((id, file?)));
-        chunk_read.finish(results, found)
+        chunk_read.finish(chunk, results, found)
     }
 
     /// Decodes the block of task `index` from `bytes`, keeping it in the cache
