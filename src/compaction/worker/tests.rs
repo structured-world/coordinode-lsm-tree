@@ -1665,6 +1665,108 @@ fn tight_space_blob_relocation_crash_after_first_slice_recovers_all_keys() -> cr
     Ok(())
 }
 
+/// A tight-space slice whose share of a stale blob file is all dead (the
+/// pointers to those frames were folded away before the pass) still reclaims
+/// it: every version of the slice's keys went through the slice, so a frame
+/// no emitted pointer claimed is free. The first slice must advance the
+/// file's frontier past those frames, not leave them to a later slice.
+#[test]
+#[expect(clippy::expect_used, reason = "test assertion")]
+fn a_tight_space_slice_reclaims_stale_frames_no_pointer_claims() -> crate::Result<()> {
+    use core::sync::atomic::Ordering;
+
+    let dir = tempfile::tempdir()?;
+    let mem = crate::fs::MemFs::with_capacity(u64::MAX);
+    // One blob file per generation, so the first generation is a single
+    // stale file whose head is dead and whose tail is live.
+    let kv_options = || blob_reloc_kv_options().file_target_size(64 * 1024 * 1024);
+    let config = Config::new(
+        dir.path(),
+        SequenceNumberCounter::default(),
+        SequenceNumberCounter::default(),
+    )
+    .data_block_size_policy(BlockSizePolicy::all(512))
+    .with_shared_fs(Arc::new(mem.clone()))
+    .with_kv_separation(Some(kv_options()));
+    let failpoint = config.fail_tight_after_first_slice.clone();
+    let tree = match config.open()? {
+        crate::AnyTree::Blob(t) => t,
+        crate::AnyTree::Standard(_) => panic!("expected Blob tree"),
+    };
+
+    for i in 0..BLOB_RELOC_KEYS {
+        tree.insert(blob_reloc_key(i).as_bytes(), blob_reloc_value(i, 1), i);
+    }
+    tree.flush_active_memtable(0)?;
+    // Overwrite the first three quarters: their first-generation frames die,
+    // the last quarter keeps the file live.
+    let overwritten = BLOB_RELOC_KEYS * 3 / 4;
+    for i in 0..overwritten {
+        tree.insert(
+            blob_reloc_key(i).as_bytes(),
+            blob_reloc_value(i, 2),
+            BLOB_RELOC_KEYS + i,
+        );
+    }
+    tree.flush_active_memtable(0)?;
+
+    // Fold the shadowed pointers away and learn the file's dead share.
+    tree.index.update_runtime_config(|c| {
+        c.storage_admission_check = true;
+        c.storage_limit_bytes = None;
+    })?;
+    tree.major_compact(64 * 1024 * 1024, BLOB_RELOC_WATERMARK)?;
+    let stale = {
+        let version = tree.index.current_version();
+        let mut gen1: Vec<_> = version
+            .blob_files
+            .iter()
+            .map(crate::vlog::BlobFile::id)
+            .collect();
+        gen1.sort_unstable();
+        *gen1.first().expect("the first generation's blob file")
+    };
+
+    let used = tree.storage_stats()?.used_bytes;
+    mem.set_capacity(used + used / 4);
+    tree.index.update_runtime_config(|c| {
+        c.tight_space_compaction = true;
+    })?;
+    failpoint.store(true, Ordering::SeqCst);
+    assert!(
+        tree.major_compact(64 * 1024 * 1024, BLOB_RELOC_WATERMARK)
+            .is_err(),
+        "the crash failpoint must stop the pass after its first slice",
+    );
+    assert!(
+        !failpoint.load(Ordering::SeqCst),
+        "the failpoint should have fired",
+    );
+
+    let version = tree.index.current_version();
+    let file = version
+        .blob_files
+        .get(stale)
+        .expect("the stale file still holds the live last quarter");
+    assert!(
+        file.live_data_start() > 0,
+        "the first slice must advance the stale file's frontier past the dead \
+         frames of its keys",
+    );
+    drop(version);
+
+    for i in 0..BLOB_RELOC_KEYS {
+        let expected = blob_reloc_value(i, u8::from(i < overwritten) + 1);
+        assert_eq!(
+            tree.get(blob_reloc_key(i).as_bytes(), crate::MAX_SEQNO)?
+                .as_deref(),
+            Some(expected.as_slice()),
+            "key {i} after the first slice",
+        );
+    }
+    Ok(())
+}
+
 /// A relocation that committed a slice and then aborted leaves the stale blob
 /// file RESTRICTED: its consumed prefix is punched and its view carries the
 /// committed frontier. A retry must resume the scan THERE. Starting at the data

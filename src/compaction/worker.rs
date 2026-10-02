@@ -2118,6 +2118,14 @@ fn run_subcompaction(
     // Declared before the stream that borrows it, so it outlives it.
     let completeness = input_completeness_for(version, &payload.table_ids, &opts.config);
 
+    // A relocating slice ends at an exclusive key: its frames below that key
+    // that no written pointer claimed are drained into the frontier once the
+    // slice is written (see `RelocatingCompaction::drain_unclaimed_below`).
+    let drain_below = match (&relocation, &bounds.1) {
+        (Some(_), core::ops::Bound::Excluded(upper)) => Some(upper.clone()),
+        _ => None,
+    };
+
     let Some(mut merge_iter) = create_bounded_compaction_stream(
         version,
         &payload.table_ids,
@@ -2292,15 +2300,18 @@ fn run_subcompaction(
             let writer = writer.use_zstd_dictionaries(opts.config.current_zstd_dictionaries());
 
             let inner = StandardCompaction::new(table_writer, tables_for_deletion);
-            Box::new(RelocatingCompaction::new(
-                inner,
-                scanner.peekable(),
-                writer,
-                reloc.stale_files,
-                opts.rate_limiter.clone(),
-                opts.stop_signal.clone(),
-                opts.config.comparator.clone(),
-            ))
+            Box::new(
+                RelocatingCompaction::new(
+                    inner,
+                    scanner.peekable(),
+                    writer,
+                    reloc.stale_files,
+                    opts.rate_limiter.clone(),
+                    opts.stop_signal.clone(),
+                    opts.config.comparator.clone(),
+                )
+                .with_drain_below(drain_below),
+            )
         }
         _ => Box::new(StandardCompaction::new(table_writer, tables_for_deletion)),
     };

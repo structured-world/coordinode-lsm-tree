@@ -642,9 +642,8 @@ impl<'a, I: Iterator<Item = Item>, F: StreamFilter + 'a> CompactionStream<'a, I,
                         // The fold replaces the pointer, so the blob it named
                         // loses this reference. Like every pointer a compaction
                         // drops, it never reaches a relocating flavour's
-                        // `write`, so it does not move a tight-space slice's
-                        // frontier by itself: its frame is reclaimed once a
-                        // later relocated pointer drains past it.
+                        // `write`; a tight-space slice drains its frame into the
+                        // frontier once the slice is written.
                         if let Some(watcher) = &mut self.dropped_callback {
                             watcher.on_dropped(&next);
                         }
