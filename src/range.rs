@@ -113,6 +113,10 @@ pub struct IterState {
     pub(crate) ephemeral: Option<(Arc<Memtable>, SeqNo)>,
     pub(crate) merge_operator: Option<Arc<dyn MergeOperator>>,
 
+    /// Where a merge reads a base kept in the value log; set for a blob
+    /// tree's index only.
+    pub(crate) blob_source: Option<crate::blob_tree::BlobSource>,
+
     /// User key comparator for merge ordering.
     pub(crate) comparator: crate::comparator::SharedComparator,
 
@@ -142,6 +146,19 @@ pub struct IterState {
     /// independent of whether the iterator uses a prefix.
     #[cfg(feature = "metrics")]
     pub(crate) metrics: Option<Arc<crate::Metrics>>,
+}
+
+impl IterState {
+    /// The value log a merge reads a separated base from: this state's blob
+    /// source over the version it holds.
+    fn value_log(&self) -> Option<crate::mvcc_stream::ValueLog<'_>> {
+        self.blob_source
+            .as_ref()
+            .map(|source| crate::mvcc_stream::ValueLog {
+                source,
+                version: &self.version.version,
+            })
+    }
 }
 
 type BoxedMerge<'a> = Box<dyn DoubleEndedIterator<Item = crate::Result<InternalValue>> + Send + 'a>;
@@ -450,6 +467,7 @@ impl TreeIter {
                 lock.merge_operator.clone(),
                 lock.comparator.clone(),
             )
+            .with_value_log(lock.value_log())
             .with_range_tombstones(range_tombstones.clone());
 
             // Post-merge RT suppression: unlike create_range which uses
@@ -829,6 +847,7 @@ impl TreeIter {
                 lock.merge_operator.clone(),
                 lock.comparator.clone(),
             )
+            .with_value_log(lock.value_log())
             .with_range_tombstones(all_range_tombstones.clone());
 
             let iter = iter.filter(|x| match x {
@@ -1254,7 +1273,12 @@ impl Reseekable for SeekableLeaf<'_> {
 /// MVCC resolution -> drop-resolved-tombstones -> range-tombstone suppression.
 /// Built once over the union range; every reposition reseeks it in place.
 type SeekPipeline<'a> = RangeTombstoneFilter<
-    TombstoneSkip<MvccStream<SeekingMerger<SeekableLeaf<'a>, SharedComparator>>>,
+    TombstoneSkip<
+        MvccStream<
+            SeekingMerger<SeekableLeaf<'a>, SharedComparator>,
+            Option<crate::mvcc_stream::ValueLog<'a>>,
+        >,
+    >,
 >;
 
 /// Phase 2: build the [`SeekPipeline`] for the sub-range `[lower, upper)` from
@@ -1323,6 +1347,7 @@ fn build_seek_pipeline<'a>(
         state.merge_operator.clone(),
         state.comparator.clone(),
     )
+    .with_value_log(state.value_log())
     .with_range_tombstones(collected.range_tombstones.clone());
     let skip = TombstoneSkip { inner: mvcc };
     // Always wrap in the range-tombstone filter: with an empty or all-invisible

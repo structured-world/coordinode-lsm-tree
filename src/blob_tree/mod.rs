@@ -54,8 +54,13 @@ impl IterGuard for Guard {
         // selective scan into a full read of the value log. A caller that
         // wants every value uses `into_inner`, and that is what arms it.
         if pred(&kv.key.user_key) {
-            resolve_value_handle(self.tree.id(), &self.tree.index.config, &self.version, kv)
-                .map(|(k, v)| (k, Some(v)))
+            resolve_value_handle(
+                self.tree.id(),
+                &self.tree.index.config.cache,
+                &self.version,
+                kv,
+            )
+            .map(|(k, v)| (k, Some(v)))
         } else {
             Ok((kv.key.user_key, None))
         }
@@ -83,7 +88,7 @@ impl IterGuard for Guard {
         }
         resolve_value_handle(
             self.tree.id(),
-            &self.tree.index.config,
+            &self.tree.index.config.cache,
             &self.version,
             self.kv?,
         )
@@ -92,7 +97,7 @@ impl IterGuard for Guard {
 
 fn resolve_value_handle(
     tree_id: TreeId,
-    config: &Config,
+    cache: &crate::Cache,
     version: &Version,
     item: InternalValue,
 ) -> RangeItem {
@@ -105,7 +110,7 @@ fn resolve_value_handle(
         // this version keeps the file alive.
         let accessor = Accessor::new(&version.blob_files);
 
-        match accessor.get(tree_id, &item.key.user_key, &vptr.vhandle, &config.cache) {
+        match accessor.get(tree_id, &item.key.user_key, &vptr.vhandle, cache) {
             Ok(Some(v)) => {
                 let k = item.key.user_key;
                 Ok((k, v))
@@ -124,6 +129,22 @@ fn resolve_value_handle(
         let k = item.key.user_key;
         let v = item.value;
         Ok((k, v))
+    }
+}
+
+/// Where a blob tree's values kept in the value log are read from: the tree
+/// they belong to and the cache their blocks go through.
+#[derive(Clone)]
+pub(crate) struct BlobSource {
+    pub(crate) tree_id: TreeId,
+    pub(crate) cache: Arc<crate::Cache>,
+}
+
+impl BlobSource {
+    /// The value `item` stands for in `version`: read from the value log when
+    /// it is an indirection, its own bytes otherwise.
+    pub(crate) fn value(&self, version: &Version, item: InternalValue) -> crate::Result<UserValue> {
+        resolve_value_handle(self.tree_id, &self.cache, version, item).map(|(_, value)| value)
     }
 }
 
@@ -220,11 +241,16 @@ impl BlobTree {
                 key,
                 seqno,
                 Arc::clone(merge_operator),
+                Some(self.blob_source()),
             );
         }
 
-        let (_, v) =
-            resolve_value_handle(self.id(), &self.index.config, &super_version.version, item)?;
+        let (_, v) = resolve_value_handle(
+            self.id(),
+            &self.index.config.cache,
+            &super_version.version,
+            item,
+        )?;
 
         Ok(Some(v))
     }
@@ -255,9 +281,17 @@ impl BlobTree {
             .scan_since_seqno_with(target_seqno, true, |version, entry| {
                 let seqno = entry.key.seqno;
                 let (key, value) =
-                    resolve_value_handle(self.id(), &self.index.config, version, entry)?;
+                    resolve_value_handle(self.id(), &self.index.config.cache, version, entry)?;
                 Ok(ScanSinceEvent::Insert { key, value, seqno })
             })
+    }
+
+    /// Where this tree's values kept in the value log are read from.
+    fn blob_source(&self) -> BlobSource {
+        BlobSource {
+            tree_id: self.id(),
+            cache: Arc::clone(&self.index.config.cache),
+        }
     }
 
     /// Range-scoped variant of [`Self::scan_since_seqno`], with the same
@@ -285,7 +319,7 @@ impl BlobTree {
             |version, entry| {
                 let seqno = entry.key.seqno;
                 let (key, value) =
-                    resolve_value_handle(self.id(), &self.index.config, version, entry)?;
+                    resolve_value_handle(self.id(), &self.index.config.cache, version, entry)?;
                 Ok(ScanSinceEvent::Insert { key, value, seqno })
             },
             Some(&bounds),
@@ -811,9 +845,10 @@ impl AbstractTree for BlobTree {
                 &range,
                 seqno,
                 index,
-                None, // BlobTree does not use merge operators for prefix scans
+                self.index.config.merge_operator.clone(),
                 self.index.config.comparator.clone(),
                 prefix_hash,
+                Some(self.blob_source()),
             ),
             buf: alloc::collections::VecDeque::new(),
             inner_back_done: false,
@@ -841,13 +876,15 @@ impl AbstractTree for BlobTree {
         let state = self.scan_prefetch_state();
 
         Box::new(PrefetchScan {
-            inner: crate::Tree::create_internal_range(
+            inner: crate::Tree::create_internal_range_with_prefix_hash(
                 super_version.clone(),
                 &range,
                 seqno,
                 index,
-                None,
+                self.index.config.merge_operator.clone(),
                 self.index.config.comparator.clone(),
+                None,
+                Some(self.blob_source()),
             ),
             buf: alloc::collections::VecDeque::new(),
             inner_back_done: false,
@@ -1009,6 +1046,13 @@ impl AbstractTree for BlobTree {
         let Some(item) = self.index.get_internal_entry(key.as_ref(), seqno)? else {
             return Ok(None);
         };
+
+        // An operand's size is not the key's: the value is the operands
+        // merged onto the base, which only the merge itself knows.
+        if item.key.value_type.is_merge_operand() && self.index.config.merge_operator.is_some() {
+            #[expect(clippy::cast_possible_truncation, reason = "values are u32 length max")]
+            return Ok(self.get(key, seqno)?.map(|value| value.len() as u32));
+        }
 
         Ok(Some(if item.key.value_type.is_indirection() {
             let mut cursor = crate::io::Cursor::new(item.value);
@@ -1223,7 +1267,10 @@ impl AbstractTree for BlobTree {
             #[expect(clippy::cast_possible_truncation, reason = "values are u32 length max")]
             let value_size = value.len() as u32;
 
-            if value_size >= separation_threshold {
+            // Only a value is separated: an indirection reads as a put, so an
+            // operand stored as one would stop merging onto its base.
+            if item.key.value_type == crate::ValueType::Value && value_size >= separation_threshold
+            {
                 let vhandle = blob_writer.write(&item.key.user_key, item.key.seqno, &value)?;
 
                 let indirection = BlobIndirection {
@@ -1540,10 +1587,10 @@ impl AbstractTree for BlobTree {
                 ) {
                     continue;
                 }
-                // Merge operand resolution. Merge operands in BlobTree are stored
-                // inline (not as blob indirection), so the pipeline result is a
-                // plain value. Without a merge operator, return raw operand value
-                // (same as resolve_key / resolve_pinned_entry behavior).
+                // Merge operand resolution. Operands are stored inline, and a
+                // base kept in the value log is read from there. Without a
+                // merge operator, return raw operand value (same as
+                // resolve_key / resolve_pinned_entry behavior).
                 if item.key.value_type.is_merge_operand() {
                     if let Some(merge_op) = &self.index.config.merge_operator {
                         results[idx] = crate::Tree::resolve_merge_via_pipeline(
@@ -1551,6 +1598,7 @@ impl AbstractTree for BlobTree {
                             keys[idx].as_ref(),
                             seqno,
                             Arc::clone(merge_op),
+                            Some(self.blob_source()),
                         )?;
                     } else {
                         results[idx] = Some(item.value);
@@ -1559,7 +1607,7 @@ impl AbstractTree for BlobTree {
                 }
                 let (_, v) = resolve_value_handle(
                     self.id(),
-                    &self.index.config,
+                    &self.index.config.cache,
                     &super_version.version,
                     item,
                 )?;

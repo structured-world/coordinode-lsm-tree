@@ -1672,6 +1672,7 @@ impl AbstractTree for Tree {
             seqno,
             self.config.merge_operator.as_ref(),
             self.config.comparator.as_ref(),
+            || self.blob_source(),
         )
     }
 
@@ -1690,6 +1691,7 @@ impl AbstractTree for Tree {
             seqno,
             self.config.merge_operator.as_ref(),
             self.config.comparator.as_ref(),
+            || self.blob_source(),
         )
     }
 
@@ -1724,6 +1726,7 @@ impl AbstractTree for Tree {
                         seqno,
                         merge_operator,
                         comparator,
+                        || self.blob_source(),
                     )
                 })
                 .collect();
@@ -1789,6 +1792,7 @@ impl AbstractTree for Tree {
                 seqno,
                 merge_operator,
                 comparator,
+                || self.blob_source(),
             )?;
         }
 
@@ -2877,12 +2881,16 @@ impl Tree {
 
     /// Shared point-read logic for `get()` and `multi_get()`: finds the newest
     /// entry, applies merge resolution or RT suppression, and returns the value.
+    ///
+    /// `blob_source` is asked for only by a merge, for a base kept in the
+    /// value log.
     fn resolve_or_passthrough(
         super_version: &SuperVersion,
         key: &[u8],
         seqno: SeqNo,
         merge_operator: Option<&Arc<dyn crate::merge_operator::MergeOperator>>,
         comparator: &dyn crate::comparator::UserComparator,
+        blob_source: impl FnOnce() -> Option<crate::blob_tree::BlobSource>,
     ) -> crate::Result<Option<UserValue>> {
         let entry = Self::get_value(super_version, key, seqno, comparator)?;
 
@@ -2897,6 +2905,7 @@ impl Tree {
                         key,
                         seqno,
                         Arc::clone(merge_op),
+                        blob_source(),
                     )
                 } else if Self::is_suppressed_by_range_tombstones(
                     super_version,
@@ -2918,6 +2927,10 @@ impl Tree {
     /// Shared post-lookup resolution for `get_pinned` and `multi_get`:
     /// tombstone filter, range-tombstone suppression, merge operand resolution.
     /// Returns `None` if entry is tombstoned or suppressed.
+    #[expect(
+        clippy::too_many_arguments,
+        reason = "each is a separate input of the one resolution"
+    )]
     fn resolve_pinned_entry(
         super_version: &SuperVersion,
         key: &[u8],
@@ -2926,6 +2939,7 @@ impl Tree {
         merge_operator: Option<&Arc<dyn crate::merge_operator::MergeOperator>>,
         comparator: &dyn crate::comparator::UserComparator,
         wrap: impl FnOnce(UserValue) -> crate::PinnableSlice,
+        blob_source: impl FnOnce() -> Option<crate::blob_tree::BlobSource>,
     ) -> crate::Result<Option<crate::PinnableSlice>> {
         use crate::PinnableSlice;
 
@@ -2950,6 +2964,7 @@ impl Tree {
                 key,
                 seqno,
                 Arc::clone(merge_op),
+                blob_source(),
             )
             .map(|opt| opt.map(PinnableSlice::owned));
         }
@@ -2964,6 +2979,7 @@ impl Tree {
         seqno: SeqNo,
         merge_operator: Option<&Arc<dyn crate::merge_operator::MergeOperator>>,
         comparator: &dyn crate::comparator::UserComparator,
+        blob_source: impl FnOnce() -> Option<crate::blob_tree::BlobSource>,
     ) -> crate::Result<Option<crate::PinnableSlice>> {
         use crate::PinnableSlice;
 
@@ -2977,6 +2993,7 @@ impl Tree {
                 merge_operator,
                 comparator,
                 PinnableSlice::owned,
+                blob_source,
             );
         }
 
@@ -2992,6 +3009,7 @@ impl Tree {
                 merge_operator,
                 comparator,
                 PinnableSlice::owned,
+                blob_source,
             );
         }
 
@@ -3013,6 +3031,7 @@ impl Tree {
                 merge_operator,
                 comparator,
                 |value| PinnableSlice::pinned(block, value),
+                blob_source,
             );
         }
 
@@ -3031,6 +3050,18 @@ impl Tree {
         Self::find_in_tables::<TableEntryWithBlock>(version, key, seqno, key_hash, comparator)
     }
 
+    /// Where this tree's values kept in the value log are read from; only the
+    /// index of a blob tree has any.
+    pub(crate) fn blob_source(&self) -> Option<crate::blob_tree::BlobSource> {
+        self.config
+            .kv_separation_opts
+            .is_some()
+            .then(|| crate::blob_tree::BlobSource {
+                tree_id: self.id,
+                cache: Arc::clone(&self.config.cache),
+            })
+    }
+
     /// Resolves merge operands for a point read via a bloom-filtered iterator pipeline.
     ///
     /// Builds a single-key range (`key..=key`) with bloom pre-filtering, wraps
@@ -3040,11 +3071,15 @@ impl Tree {
     ///
     /// Bloom pre-filtering can reject many disk tables at the filter level,
     /// which typically improves point-read performance on deep LSM trees.
+    ///
+    /// `blob_source` reads a base kept in the value log, which only a blob
+    /// tree's index holds.
     pub(crate) fn resolve_merge_via_pipeline(
         version: SuperVersion,
         key: &[u8],
         seqno: SeqNo,
         merge_operator: Arc<dyn crate::merge_operator::MergeOperator>,
+        blob_source: Option<crate::blob_tree::BlobSource>,
     ) -> crate::Result<Option<UserValue>> {
         use crate::range::{IterState, TreeIter};
 
@@ -3059,6 +3094,7 @@ impl Tree {
             version,
             ephemeral: None,
             merge_operator: Some(merge_operator),
+            blob_source,
             comparator,
             prefix_hash: None,
             key_hash: Some(key_hash),
@@ -3096,12 +3132,18 @@ impl Tree {
             merge_operator,
             comparator,
             None,
+            None,
         )
     }
 
     /// Like [`Tree::create_internal_range`], but with an optional prefix hash
-    /// for prefix bloom filter skipping during prefix scans.
+    /// for prefix bloom filter skipping during prefix scans, and the
+    /// `blob_source` a merge reads a base kept in the value log from.
     #[doc(hidden)]
+    #[expect(
+        clippy::too_many_arguments,
+        reason = "each is a separate input of the iterator it builds"
+    )]
     pub(crate) fn create_internal_range_with_prefix_hash<
         'a,
         K: AsRef<[u8]> + 'a,
@@ -3114,6 +3156,7 @@ impl Tree {
         merge_operator: Option<Arc<dyn crate::merge_operator::MergeOperator>>,
         comparator: crate::comparator::SharedComparator,
         prefix_hash: Option<u64>,
+        blob_source: Option<crate::blob_tree::BlobSource>,
     ) -> impl DoubleEndedIterator<Item = crate::Result<InternalValue>> + 'static {
         use crate::range::{IterState, TreeIter};
         use core::ops::Bound::{self, Excluded, Included, Unbounded};
@@ -3136,6 +3179,7 @@ impl Tree {
             version,
             ephemeral,
             merge_operator,
+            blob_source,
             comparator,
             prefix_hash,
             key_hash: None,
@@ -3365,6 +3409,7 @@ impl Tree {
         seqno: SeqNo,
         merge_operator: Option<&Arc<dyn crate::merge_operator::MergeOperator>>,
         comparator: &dyn crate::comparator::UserComparator,
+        blob_source: impl FnOnce() -> Option<crate::blob_tree::BlobSource>,
     ) -> crate::Result<Option<UserValue>> {
         let Some(entry) = entry else {
             return Ok(None);
@@ -3377,6 +3422,7 @@ impl Tree {
             merge_operator,
             comparator,
             crate::PinnableSlice::owned,
+            blob_source,
         )
         .map(|opt| opt.map(crate::PinnableSlice::into_value))
     }
@@ -4726,13 +4772,15 @@ impl Tree {
     ) -> crate::Result<impl DoubleEndedIterator<Item = crate::Result<KvPair>> + 'static> {
         let super_version = self.get_version_for_snapshot(seqno)?;
 
-        Ok(Self::create_internal_range(
+        Ok(Self::create_internal_range_with_prefix_hash(
             super_version,
             range,
             seqno,
             ephemeral,
             self.config.merge_operator.clone(),
             self.config.comparator.clone(),
+            None,
+            self.blob_source(),
         )
         .map(|item| match item {
             Ok(kv) => Ok((kv.key.user_key, kv.value)),
@@ -4768,6 +4816,7 @@ impl Tree {
             version: super_version,
             ephemeral,
             merge_operator: self.config.merge_operator.clone(),
+            blob_source: self.blob_source(),
             comparator: self.config.comparator.clone(),
             prefix_hash: None,
             key_hash: None,
@@ -4812,6 +4861,7 @@ impl Tree {
             version: super_version,
             ephemeral,
             merge_operator: self.config.merge_operator.clone(),
+            blob_source: self.blob_source(),
             comparator: self.config.comparator.clone(),
             prefix_hash,
             key_hash: None,

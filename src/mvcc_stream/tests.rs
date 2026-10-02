@@ -35,6 +35,16 @@ macro_rules! iter_closed {
     };
 }
 
+/// A caller that spells the stream's type out names it by its input alone:
+/// the reader of separated bases has a default.
+#[test]
+fn mvcc_stream_is_named_by_its_input_alone() {
+    type Boxed = Box<dyn DoubleEndedIterator<Item = crate::Result<InternalValue>>>;
+    let iter: Boxed = Box::new(core::iter::empty());
+    let mut stream: MvccStream<Boxed> = MvccStream::new(iter, None);
+    assert!(stream.next().is_none());
+}
+
 /// Tests that the iterator emit the same stuff forwards and backwards, just in reverse
 macro_rules! test_reverse {
     ($v:expr) => {
@@ -872,12 +882,12 @@ mod merge_operator_tests {
         Ok(())
     }
 
-    /// Forward: MergeOperand above an Indirection base must return the
-    /// MergeOperand unchanged — indirection bytes are internal blob
-    /// pointers, not user data.
+    /// Forward: a stream with no value log refuses to merge onto a base kept
+    /// there, instead of answering with an operand or handing the pointer
+    /// bytes to the operator as the value.
     #[test]
     #[expect(clippy::unwrap_used, reason = "test assertion")]
-    fn merge_forward_indirection_base_returns_head() -> crate::Result<()> {
+    fn merge_forward_onto_indirection_without_value_log_is_refused() {
         let vec = vec![
             InternalValue::from_components("a", "op2", 3, ValueType::MergeOperand),
             InternalValue::from_components("a", "op1", 2, ValueType::MergeOperand),
@@ -887,21 +897,16 @@ mod merge_operator_tests {
         let iter = Box::new(vec.into_iter().map(Ok));
         let mut iter = MvccStream::new(iter, Some(merge_op()));
 
-        let item = iter.next().unwrap()?;
-        assert_eq!(&*item.key.user_key, b"a");
-        // Must return head MergeOperand unchanged, NOT merged with blob pointer
-        assert_eq!(item.key.value_type, ValueType::MergeOperand);
-        assert_eq!(&*item.value, b"op2");
-
-        assert!(iter.next().is_none());
-        Ok(())
+        assert!(matches!(
+            iter.next().unwrap(),
+            Err(crate::Error::FeatureUnsupported(_))
+        ));
     }
 
-    /// Reverse: MergeOperand above an Indirection base must return the
-    /// newest MergeOperand unchanged.
+    /// Reverse: the same refusal.
     #[test]
     #[expect(clippy::unwrap_used, reason = "test assertion")]
-    fn merge_reverse_indirection_base_returns_newest() -> crate::Result<()> {
+    fn merge_reverse_onto_indirection_without_value_log_is_refused() {
         let vec = vec![
             InternalValue::from_components("a", "op2", 3, ValueType::MergeOperand),
             InternalValue::from_components("a", "op1", 2, ValueType::MergeOperand),
@@ -911,14 +916,10 @@ mod merge_operator_tests {
         let iter = Box::new(vec.into_iter().map(Ok));
         let mut iter = MvccStream::new(iter, Some(merge_op()));
 
-        let item = iter.next_back().unwrap()?;
-        assert_eq!(&*item.key.user_key, b"a");
-        // Must return newest MergeOperand unchanged
-        assert_eq!(item.key.value_type, ValueType::MergeOperand);
-        assert_eq!(&*item.value, b"op2");
-
-        assert!(iter.next_back().is_none());
-        Ok(())
+        assert!(matches!(
+            iter.next_back().unwrap(),
+            Err(crate::Error::FeatureUnsupported(_))
+        ));
     }
 
     /// Merge operator error must propagate through forward iteration.
