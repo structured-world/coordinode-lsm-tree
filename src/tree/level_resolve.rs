@@ -50,6 +50,17 @@ pub(super) enum LevelJob<'a, 'k> {
         table: &'a Table,
         handle: BlockHandle,
     },
+    /// Resolves the keys of `remaining` against `level` key by key, run by
+    /// run: the level's staged resolve could not plan a table of it or read
+    /// a block of its plan. `keys` holds every key of the batch by index.
+    Serial {
+        level_zero: bool,
+        level: &'a crate::version::Level,
+        remaining: Vec<(usize, u64)>,
+        keys: Vec<&'k [u8]>,
+        seqno: SeqNo,
+        comparator: &'a dyn crate::comparator::UserComparator,
+    },
 }
 
 /// A finished [`LevelJob`].
@@ -66,6 +77,9 @@ pub(super) enum JobDone {
     Loaded {
         index: usize,
         block: crate::Result<Option<DataBlock>>,
+    },
+    Serial {
+        result: crate::Result<super::tables_read::SerialLevel>,
     },
 }
 
@@ -95,7 +109,67 @@ impl LevelJob<'_, '_> {
                 index,
                 block: table.load_data_block(&handle),
             },
+            Self::Serial {
+                level_zero,
+                level,
+                remaining,
+                keys,
+                seqno,
+                comparator,
+            } => JobDone::Serial {
+                result: Tree::resolve_level_serially(
+                    level_zero, level, remaining, &keys, seqno, comparator,
+                ),
+            },
         }
+    }
+}
+
+/// A read the caller drives: it asks for work through `pump`, and takes each
+/// piece back as it finishes, until `pump` hands out its answer.
+pub(super) trait ReadMachine<'a, 'k> {
+    /// What the read answers once it is over.
+    type Output;
+
+    /// Moves the read on as far as what is back takes it, keeping answers in
+    /// `results` and asking `out` for the work it needs next; `Some` once the
+    /// read is over and nothing of it is out.
+    fn pump(
+        &mut self,
+        results: &mut [Option<InternalValue>],
+        out: &mut LevelWork<'a, 'k>,
+    ) -> Option<Self::Output>;
+
+    /// Takes back a finished job.
+    fn job_done(&mut self, done: JobDone);
+
+    /// Takes back a finished block read.
+    fn read_done(&mut self, done: crate::fs::ReadDone);
+}
+
+impl<'a, 'k, K: AsRef<[u8]>> ReadMachine<'a, 'k> for LevelResolve<'a, 'k, K> {
+    /// Whether the level was answered from its plan; `false` hands it to the
+    /// serial resolve.
+    type Output = bool;
+
+    fn pump(
+        &mut self,
+        results: &mut [Option<InternalValue>],
+        out: &mut LevelWork<'a, 'k>,
+    ) -> Option<bool> {
+        match Self::pump(self, results, out) {
+            LevelStep::Pending => None,
+            LevelStep::Resolved => Some(true),
+            LevelStep::Serial => Some(false),
+        }
+    }
+
+    fn job_done(&mut self, done: JobDone) {
+        Self::job_done(self, done);
+    }
+
+    fn read_done(&mut self, done: crate::fs::ReadDone) {
+        Self::read_done(self, done);
     }
 }
 
@@ -554,8 +628,8 @@ impl<'a, 'k, K: AsRef<[u8]>> Chunks<'a, 'k, K> {
             JobDone::Loaded { index, block } => {
                 block.and_then(|block| current.read.loaded(chunk, index, block))
             }
-            JobDone::Planned { .. } => {
-                debug_assert!(false, "a plan handed back to the data block phase");
+            JobDone::Planned { .. } | JobDone::Serial { .. } => {
+                debug_assert!(false, "a job handed back to the data block phase");
                 Ok(())
             }
         };

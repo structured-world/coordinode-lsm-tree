@@ -10,6 +10,7 @@ pub mod inner;
 mod level_resolve;
 mod level_stages;
 pub mod sealed;
+mod tables_read;
 
 use crate::path::Path;
 use crate::{
@@ -3613,18 +3614,13 @@ impl Tree {
         }
     }
 
-    /// Queries tables for multiple keys using sorted access order.
+    /// Queries tables for multiple keys, level by level from the top, and
+    /// keeps in `results` (aligned with `keys`) the newest version the first
+    /// level holding a key has.
     ///
     /// `miss_keys` contains `(key_index, bloom_hash)` pairs for keys not yet
-    /// found, in comparator-sorted order. Keys are looked up individually via
-    /// `Table::get`, but sorted order improves I/O locality. The precomputed
-    /// bloom hash in each pair is reused across all table probes, but each key
-    /// is probed on its own: a table is walked once per key, not once per
-    /// batch.
-    #[expect(
-        clippy::indexing_slicing,
-        reason = "miss_keys entries carry batch-local indices; callers must pass a results slice aligned with keys"
-    )]
+    /// found, in comparator-sorted order; the hash is reused across every
+    /// table's filter.
     pub(crate) fn batch_get_from_tables<K: AsRef<[u8]>>(
         version: &Version,
         keys: &[K],
@@ -3637,113 +3633,123 @@ impl Tree {
         debug_assert_eq!(results.len(), keys.len());
         debug_assert!(miss_keys.iter().all(|&(i, _)| i < keys.len()));
 
-        // Consume the caller's Vec directly — no allocation+copy.
-        let mut still_remaining = miss_keys;
+        // Each level is read stage by stage across ALL its SSTs: every
+        // table's filter blocks in one batch, then its index blocks, then its
+        // data blocks, and answered from the blocks read. On io_uring each
+        // batch is one submission the kernel fans out across the underlying
+        // devices. A Page-ECC or columnar table is planned serially and its
+        // data blocks loaded through its format-aware path, while the level's
+        // other tables stay staged. A level whose plan or batched read fails
+        // is resolved serially, key by key.
+        let mut read = tables_read::TablesRead::new(
+            version,
+            keys,
+            miss_keys,
+            seqno,
+            comparator,
+            metadata_budget,
+        );
+        Self::drive(&mut read, results)
+    }
 
-        for (level_idx, level) in version.iter_levels().enumerate() {
-            if still_remaining.is_empty() {
-                break;
-            }
+    /// Resolves the keys of `remaining` (sorted under `comparator`) against
+    /// `level` key by key, run by run, and returns the versions found by key
+    /// index and the keys left for the levels below, still sorted.
+    ///
+    /// On level 0 every run is checked and the highest seqno per key kept; a
+    /// key found at the read's ceiling skips the later runs, which cannot
+    /// beat it. On a deeper level the runs do not overlap, so a covering run
+    /// answers a key for the whole level.
+    ///
+    /// # Errors
+    ///
+    /// The first read of a table that fails.
+    #[expect(
+        clippy::indexing_slicing,
+        reason = "remaining's indices are valid key indices, and `found` and `at_ceiling` are as long as `keys`"
+    )]
+    fn resolve_level_serially<K: AsRef<[u8]>>(
+        level_zero: bool,
+        level: &crate::version::Level,
+        mut remaining: Vec<(usize, u64)>,
+        keys: &[K],
+        seqno: SeqNo,
+        comparator: &dyn crate::comparator::UserComparator,
+    ) -> crate::Result<tables_read::SerialLevel> {
+        if level_zero {
+            // L0: must check ALL runs, keep highest seqno per key. Track keys
+            // at the seqno ceiling (seqno + 1 == read_seqno): no other L0 run
+            // can beat them, so skip them in subsequent runs. Both are dense
+            // over 0..keys.len().
+            let mut found: Vec<Option<InternalValue>> = vec![None; keys.len()];
+            let mut at_ceiling = vec![false; keys.len()];
 
-            // The level is read stage by stage across ALL its SSTs: every
-            // table's filter blocks in one batch, then its index blocks, then
-            // its data blocks, and answered from the blocks read. On io_uring
-            // each batch is one submission the kernel fans out across the
-            // underlying devices. A Page-ECC or columnar table is planned
-            // serially and its data blocks loaded through its format-aware
-            // path, while the level's other tables stay staged. A level whose
-            // plan or batched read fails is handed to the serial resolve below.
-            if Self::resolve_level_staged(
-                level,
-                &mut still_remaining,
-                keys,
-                seqno,
-                comparator,
-                results,
-                metadata_budget,
-            ) {
-                continue;
-            }
-
-            if level_idx == 0 {
-                // L0: must check ALL runs, keep highest seqno per key. Track keys
-                // at the seqno ceiling (seqno + 1 == read_seqno): no other L0 run
-                // can beat them, so skip them in subsequent runs. The bitmap is
-                // dense over 0..keys.len().
-                let mut at_ceiling = vec![false; keys.len()];
-
-                for run in level.iter() {
-                    // `at_ceiling` is read as this run's skip set (a key is visited
-                    // once per run, so the updates below only affect later runs)
-                    // and mutated from the returned outcomes: never both at once.
-                    let resolved = Self::resolve_run_batched(
-                        run,
-                        &still_remaining,
-                        keys,
-                        seqno,
-                        comparator,
-                        |idx| at_ceiling[idx],
-                    )?;
-                    for (idx, _hash, item) in resolved.covered {
-                        let Some(item) = item else { continue };
-                        match &results[idx] {
-                            Some(current) if current.key.seqno >= item.key.seqno => {}
-                            _ => {
-                                if item.key.seqno.checked_add(1) == Some(seqno) {
-                                    at_ceiling[idx] = true;
-                                }
-                                results[idx] = Some(item);
+            for run in level.iter() {
+                // `at_ceiling` is read as this run's skip set (a key is visited
+                // once per run, so the updates below only affect later runs)
+                // and mutated from the returned outcomes: never both at once.
+                let resolved =
+                    Self::resolve_run_batched(run, &remaining, keys, seqno, comparator, |idx| {
+                        at_ceiling[idx]
+                    })?;
+                for (idx, _hash, item) in resolved.covered {
+                    let Some(item) = item else { continue };
+                    match &found[idx] {
+                        Some(current) if current.key.seqno >= item.key.seqno => {}
+                        _ => {
+                            if item.key.seqno.checked_add(1) == Some(seqno) {
+                                at_ceiling[idx] = true;
                             }
+                            found[idx] = Some(item);
                         }
                     }
-                    // Uncovered keys stay in `still_remaining`; the retain below
-                    // prunes the ones any run resolved.
                 }
-
-                // Remove found keys (both values and tombstones)
-                still_remaining.retain(|&(idx, _)| results[idx].is_none());
-            } else {
-                // L1+ runs have non-overlapping key ranges within a level. A
-                // covering run resolves a key definitively: a hit sets the result,
-                // a covering miss drops it to lower levels (`covered_miss`), and an
-                // uncovered key tries the next run in this level (`not_covered`).
-                let mut covered_miss: Vec<(usize, u64)> = Vec::new();
-
-                for run in level.iter() {
-                    let resolved = Self::resolve_run_batched(
-                        run,
-                        &still_remaining,
-                        keys,
-                        seqno,
-                        comparator,
-                        |_| false,
-                    )?;
-                    for (idx, hash, item) in resolved.covered {
-                        if let Some(item) = item {
-                            results[idx] = Some(item);
-                        } else {
-                            // Covering run found, key absent: no other run in this
-                            // level can have it. Keep for lower levels.
-                            covered_miss.push((idx, hash));
-                        }
-                    }
-                    still_remaining = resolved.not_covered;
-                }
-
-                // Merge back: keys without a covering run + keys with a covering
-                // miss both proceed to lower levels. Re-sort to preserve
-                // comparator order for the next level's sequential scan.
-                let needs_sort = !covered_miss.is_empty();
-                still_remaining.extend(covered_miss);
-                if needs_sort {
-                    still_remaining.sort_by(|&(a, _), &(b, _)| {
-                        comparator.compare(keys[a].as_ref(), keys[b].as_ref())
-                    });
-                }
+                // Uncovered keys stay in `remaining`; the retain below prunes
+                // the ones any run resolved.
             }
+
+            // Remove found keys (both values and tombstones)
+            remaining.retain(|&(idx, _)| found[idx].is_none());
+            let found = found
+                .into_iter()
+                .enumerate()
+                .filter_map(|(idx, item)| Some((idx, item?)))
+                .collect();
+            return Ok((found, remaining));
         }
 
-        Ok(())
+        // L1+ runs have non-overlapping key ranges within a level. A covering
+        // run resolves a key definitively: a hit is found, a covering miss
+        // drops it to lower levels (`covered_miss`), and an uncovered key
+        // tries the next run in this level (`not_covered`).
+        let mut found: Vec<(usize, InternalValue)> = Vec::new();
+        let mut covered_miss: Vec<(usize, u64)> = Vec::new();
+
+        for run in level.iter() {
+            let resolved =
+                Self::resolve_run_batched(run, &remaining, keys, seqno, comparator, |_| false)?;
+            for (idx, hash, item) in resolved.covered {
+                if let Some(item) = item {
+                    found.push((idx, item));
+                } else {
+                    // Covering run found, key absent: no other run in this
+                    // level can have it. Keep for lower levels.
+                    covered_miss.push((idx, hash));
+                }
+            }
+            remaining = resolved.not_covered;
+        }
+
+        // Merge back: keys without a covering run + keys with a covering miss
+        // both proceed to lower levels. Re-sort to preserve comparator order
+        // for the next level's sequential scan.
+        let needs_sort = !covered_miss.is_empty();
+        remaining.extend(covered_miss);
+        if needs_sort {
+            remaining
+                .sort_by(|&(a, _), &(b, _)| comparator.compare(keys[a].as_ref(), keys[b].as_ref()));
+        }
+        Ok((found, remaining))
     }
 
     /// Resolves `remaining` (sorted ascending under `comparator`) against a
@@ -3847,18 +3853,18 @@ impl Tree {
             })
     }
 
-    /// Drives a level's resolve to its end on the calling thread, and returns
-    /// whether the level was answered from its plan. Its jobs are run as
-    /// they are asked for, and the level moves on again before any read is
-    /// submitted, so the reads of a pass go out together. A block read goes
-    /// to the read queue of the backend its table was opened through, and is
-    /// handed back the moment it is in, while others may still be in flight:
-    /// no table waits on the slowest file of the level.
+    /// Drives a read to its end on the calling thread, and returns its
+    /// answer. Its jobs are run as they are asked for, and the read moves on
+    /// again before any block read is submitted, so the reads of a pass go
+    /// out together. A block read goes to the read queue of the backend its
+    /// table was opened through, and is handed back the moment it is in,
+    /// while others may still be in flight: no table waits on the slowest
+    /// file of the level.
     #[expect(clippy::indexing_slicing, reason = "a slot is a position in `queues`")]
-    fn drive_level<'a, 'k, K: AsRef<[u8]>>(
-        level: &mut level_resolve::LevelResolve<'a, 'k, K>,
+    fn drive<'a, 'k, M: level_resolve::ReadMachine<'a, 'k>>(
+        level: &mut M,
         results: &mut [Option<InternalValue>],
-    ) -> bool {
+    ) -> M::Output {
         // One queue per backend, opened when a table first asks it for a
         // block, so a level answered from the cache opens none.
         let mut queues: Vec<LevelQueue<'a>> = Vec::new();
@@ -3870,10 +3876,8 @@ impl Tree {
         let mut work = level_resolve::LevelWork::new();
 
         loop {
-            match level.pump(results, &mut work) {
-                level_resolve::LevelStep::Resolved => return true,
-                level_resolve::LevelStep::Serial => return false,
-                level_resolve::LevelStep::Pending => {}
+            if let Some(answer) = level.pump(results, &mut work) {
+                return answer;
             }
             if !work.jobs.is_empty() {
                 for job in work.jobs.drain(..) {
@@ -3958,25 +3962,11 @@ impl Tree {
         }
     }
 
-    /// Resolves an ENTIRE level from its staged plan: the filter and index
-    /// blocks of all its tables read stage by stage in batches, then its data
-    /// blocks, a cached one taken from the cache and the others read in chunks
-    /// of at most half the cache into a scratch, and every key point-read in
-    /// the blocks read. A cold set that fits in half the cache is kept in it;
-    /// a larger one is not, so it never evicts the cache it would not fit.
-    ///
-    /// A Page-ECC or columnar table is planned serially and its data blocks
-    /// loaded through their own path; the level's other tables stay staged.
-    ///
-    /// Returns `true` when it resolved the level (results updated, found keys
-    /// dropped from `still_remaining`), and `false` when a table it could not
-    /// plan or a block it could not read hands the level to the caller's
-    /// serial resolve, which surfaces a failure only where a key-by-key read
-    /// meets it.
-    #[expect(
-        clippy::indexing_slicing,
-        reason = "remaining's indices are valid key indices"
-    )]
+    /// Resolves one level from its staged plan on the calling thread: `true`
+    /// when it answered the level (results updated, found keys dropped from
+    /// `still_remaining`), `false` when it hands the level to the serial
+    /// resolve.
+    #[cfg(test)]
     fn resolve_level_staged<K: AsRef<[u8]>>(
         level: &crate::version::Level,
         still_remaining: &mut Vec<(usize, u64)>,
@@ -3986,20 +3976,6 @@ impl Tree {
         results: &mut [Option<InternalValue>],
         metadata_budget: u64,
     ) -> bool {
-        // The keys still to resolve have no answer yet, so a level handed back
-        // is restored by clearing theirs.
-        debug_assert!(
-            still_remaining
-                .iter()
-                .all(|&(idx, _)| results[idx].is_none())
-        );
-        // A table that cannot be planned may be one the serial resolve never
-        // reads: a key an earlier level-0 run holds at the read's ceiling skips
-        // the later runs. The serial resolve reads the level in that order and
-        // fails only where a key-by-key read would. A batch the backend
-        // refuses, or reports read without filling, hands the level over the
-        // same way: the level is answered either way, never skipped for a
-        // lower one.
         let mut resolve = level_resolve::LevelResolve::new(
             level,
             core::mem::take(still_remaining),
@@ -4008,7 +3984,7 @@ impl Tree {
             seqno,
             metadata_budget,
         );
-        let resolved = Self::drive_level(&mut resolve, results);
+        let resolved = Self::drive(&mut resolve, results);
         *still_remaining = resolve.into_remaining();
         resolved
     }
