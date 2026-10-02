@@ -7702,7 +7702,8 @@ impl Table {
     /// batched multi-get), using the same path as [`Table::load_data_block`]
     /// for a non-special table ([`Block::from_reader`] shares the header /
     /// decrypt helpers), so the block is byte-identical, and puts it in the
-    /// cache when `keep`. Not for Page-ECC / columnar tables
+    /// cache when its weight fits in `room`, taking it out of `room`. Not for
+    /// Page-ECC / columnar tables
     /// ([`is_chunk_special`]).
     ///
     /// # Errors
@@ -7712,10 +7713,13 @@ impl Table {
         &self,
         bytes: &[u8],
         handle: &BlockHandle,
-        keep: bool,
+        room: &mut u64,
     ) -> crate::Result<DataBlock> {
         let block = self.decode_block_from_bytes(bytes, *handle.offset(), BlockType::Data)?;
-        if keep {
+        // Weighed as the cache weighs it: decoded, not as it was read.
+        let weight = crate::cache::block_weight(&block);
+        if weight <= *room {
+            *room -= weight;
             self.cache
                 .insert_block(self.global_id(), handle.offset(), block.clone());
         }

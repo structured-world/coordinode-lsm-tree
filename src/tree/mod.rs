@@ -4253,15 +4253,11 @@ impl Tree {
             })
             .collect();
         let capacity = first.table.cache_capacity();
-        let cold: u64 = tasks
-            .iter()
-            .zip(&cached)
-            .filter(|(_, block)| matches!(block, TaskBlock::Read))
-            .map(|(task, _)| u64::from(task.handle.size()))
-            .sum();
-        // A cold set within half the shared cache is kept in it, for the reads
-        // that follow; a larger one would evict what the cache holds for them.
-        let keep = capacity > 0 && cold <= capacity / 2;
+        // The blocks read are kept in the shared cache, for the reads that
+        // follow, until they weigh half of it: more would evict what the cache
+        // holds for them. Weighed decoded, as the cache weighs them, which a
+        // block's size on disk does not tell before it is read.
+        let mut keep_room = capacity / 2;
         // Read blocks in chunks of at most half the shared cache, so a chunk's
         // scratch never dwarfs the cache it is meant to spare. `.max(1)` keeps the
         // chunk loop's `end > start` guard the sole progress condition when the
@@ -4318,7 +4314,7 @@ impl Tree {
             if let Err(error) = Self::resolve_block_task_chunk(
                 &tasks[start..end],
                 &cached[start..end],
-                keep,
+                &mut keep_room,
                 keys,
                 results,
                 found.as_mut(),
@@ -4378,12 +4374,12 @@ impl Tree {
     /// through its own path and point-read (a columnar block its delete mask
     /// removes whole holds no key), and the others are read in ONE cross-file
     /// `read_blocks_batched` per backend, decoded from their scratch buffers
-    /// (and put in the cache when `keep`) and point-read, keeping the
-    /// highest-seqno hit per key in `results`.
+    /// (and put in the cache while they fit in `keep_room`) and point-read,
+    /// keeping the highest-seqno hit per key in `results`.
     fn resolve_block_task_chunk<K: AsRef<[u8]>>(
         chunk: &[BlockTask<'_>],
         cached: &[TaskBlock],
-        keep: bool,
+        keep_room: &mut u64,
         keys: &[K],
         results: &mut [Option<InternalValue>],
         found: Option<&mut Vec<(crate::TableId, usize)>>,
@@ -4521,7 +4517,7 @@ impl Tree {
                     task,
                     index,
                     req.buf.filled_bytes(),
-                    keep,
+                    keep_room,
                     keys,
                     &mut hits,
                 ) && decode_failure
@@ -4559,19 +4555,19 @@ impl Tree {
     }
 
     /// Decodes the block of task `index` from `bytes`, keeping it in the cache
-    /// when `keep`, and point-reads its keys, adding each hit to `hits` as
-    /// `(task index, key index, entry)`.
+    /// when it fits in `keep_room`, and point-reads its keys, adding each hit
+    /// to `hits` as `(task index, key index, entry)`.
     fn resolve_block_task<K: AsRef<[u8]>>(
         task: &BlockTask<'_>,
         index: usize,
         bytes: &[u8],
-        keep: bool,
+        keep_room: &mut u64,
         keys: &[K],
         hits: &mut Vec<(usize, usize, InternalValue)>,
     ) -> crate::Result<()> {
         let block = task
             .table
-            .decode_data_block_keeping(bytes, &task.handle, keep)?;
+            .decode_data_block_keeping(bytes, &task.handle, keep_room)?;
         Self::read_task_keys(task, index, &block, keys, hits)
     }
 

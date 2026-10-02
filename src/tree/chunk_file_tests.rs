@@ -125,7 +125,7 @@ fn a_chunk_on_another_table_closes_the_carried_file_before_opening() -> crate::R
     Tree::resolve_block_task_chunk(
         core::slice::from_ref(task),
         &[super::TaskBlock::Read],
-        false,
+        &mut 0,
         &keys,
         &mut results,
         None,

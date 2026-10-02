@@ -103,6 +103,12 @@ const fn row_weight(key_len: usize, value_len: usize) -> u64 {
     key_len as u64 + value_len as u64 + 16
 }
 
+/// What a block weighs in the cache: its header and its decoded payload.
+pub fn block_weight(block: &crate::table::Block) -> u64 {
+    (Header::header_len(block.header.block_type) as u64)
+        + u64::from(block.header.uncompressed_length)
+}
+
 #[derive(Clone)]
 struct BlockWeighter;
 
@@ -111,10 +117,7 @@ impl Weighter<CacheKey, Item> for BlockWeighter {
         use Item::{Blob, Block};
 
         match item {
-            Block(b) => {
-                (Header::header_len(b.header.block_type) as u64)
-                    + u64::from(b.header.uncompressed_length)
-            }
+            Block(b) => block_weight(b),
             // Key + value; the size field is an inline scalar. The prefetch's
             // admission budget charges itself the same way, so the two agree.
             Blob(key, _, b) => (key.len() + b.len()) as u64,

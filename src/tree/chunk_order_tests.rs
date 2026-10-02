@@ -99,7 +99,7 @@ fn a_chunked_resolve_breaks_an_equal_seqno_tie_by_plan_order() -> crate::Result<
     Tree::resolve_block_task_chunk(
         &tasks,
         &uncached,
-        false,
+        &mut 0,
         &keys,
         &mut results,
         None,

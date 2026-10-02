@@ -4411,7 +4411,7 @@ fn a_block_refused_for_its_declared_length_counts_what_its_transform_decoded() -
     let decoded_before = metrics.bytes_decoded();
     assert!(
         table
-            .decode_data_block_keeping(&tampered, &table.regions.tli, false)
+            .decode_data_block_keeping(&tampered, &table.regions.tli, &mut 0)
             .is_err(),
         "the chunked resolver refuses the block too",
     );
@@ -4663,7 +4663,7 @@ fn a_chunk_decoded_block_rejected_for_its_role_counts_what_its_transform_decoded
     let (table, metrics, frame) = one_row_table_and_its_index_frame(&dir)?;
 
     let decoded_before = metrics.bytes_decoded();
-    let result = table.decode_data_block_keeping(&frame, &table.regions.tli, false);
+    let result = table.decode_data_block_keeping(&frame, &table.regions.tli, &mut 0);
     assert!(
         matches!(&result, Err(crate::Error::InvalidTag(("BlockType", _)))),
         "the index block must be refused as a data block",

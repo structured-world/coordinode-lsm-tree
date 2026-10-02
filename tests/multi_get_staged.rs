@@ -1611,6 +1611,44 @@ fn a_staged_level_read_holds_no_more_metadata_than_its_budget() -> lsm_tree::Res
     Ok(())
 }
 
+/// The data blocks a level read leaves in the shared cache weigh at most half
+/// of it, weighed decoded as the cache weighs them: compressed blocks that fit
+/// in half the cache as they are read can decode to far more than all of it,
+/// and keeping them would evict what the cache holds for other reads.
+#[cfg(feature = "lz4")]
+#[test]
+fn a_level_read_keeps_its_data_blocks_within_half_the_cache_decoded() -> lsm_tree::Result<()> {
+    const TABLES: u32 = 64;
+    // A shard of it holds a data block: one too small for a block refuses it.
+    const CACHE: u64 = 1_024 * 1_024;
+    let dir = tempfile::tempdir()?;
+    // Rows are kept out, so the cache holds only the blocks the read put in.
+    let cache = Arc::new(Cache::with_capacity_bytes(CACHE).with_row_cache(false));
+    let fs: Arc<dyn Fs> = Arc::new(StdFs);
+    let (tree, _) = tree_tuned(dir.path(), Shape::Whole, TABLES, CACHE, &fs, &|config| {
+        config
+            .use_cache(Arc::clone(&cache))
+            .data_block_compression_policy(CompressionPolicy::all(lsm_tree::CompressionType::Lz4))
+    })?;
+    // Every row of every table: the level's whole data, many times the cache
+    // decoded, little of it on disk.
+    let keys: Vec<String> = (0..TABLES)
+        .flat_map(|table| (0..200u32).map(move |row| format!("t{table:03}r{row:04}")))
+        .collect();
+
+    let values = tree.multi_get(&keys, SeqNo::MAX)?;
+    assert!(values.iter().all(Option::is_some));
+    assert!(
+        // Half the cache for the data blocks, and room for the filter and
+        // index blocks the stages put in (about 14 KiB here).
+        cache.size() <= CACHE / 2 + 64 * 1_024,
+        "the read filled {} of the {CACHE}-byte cache, past half of it and what its \
+         stages hold",
+        cache.size(),
+    );
+    Ok(())
+}
+
 /// A zero budget does not stop the read: a table alone above it is read when
 /// no other holds blocks, so the tables go one at a time and every key, found
 /// or not, is answered as a key-by-key read answers it.
