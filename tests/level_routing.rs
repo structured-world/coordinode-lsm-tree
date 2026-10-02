@@ -1774,11 +1774,12 @@ fn a_failed_prewarm_still_answers_the_query() -> lsm_tree::Result<()> {
     Ok(())
 }
 
-/// The chunked resolve is authoritative, so the same two misbehaviours are
-/// errors there rather than a silent fall-through: a backend that refuses, and
-/// one that claims success without writing the bytes.
+/// A level too large to keep in the cache, read in chunks, is answered all the
+/// same when the backend misbehaves: one that refuses the batched read, and one
+/// that claims success without writing the bytes. The level is read serially
+/// then, block by block, and never skipped for a lower one.
 #[test]
-fn the_chunked_resolve_refuses_a_misbehaving_backend() -> lsm_tree::Result<()> {
+fn a_misbehaving_backend_on_a_large_level_still_answers_the_query() -> lsm_tree::Result<()> {
     let dir = tempfile::tempdir()?;
     let primary = CountingFs::handles();
 
@@ -1803,34 +1804,24 @@ fn the_chunked_resolve_refuses_a_misbehaving_backend() -> lsm_tree::Result<()> {
         tree.flush_active_memtable(0)?;
     }
 
-    let tree = config().open()?;
     let keys: Vec<String> = (0..64).map(|i| format!("key{:05}", i * 31)).collect();
-
-    primary.behave(BatchedBehaviour::Fail);
-    let refused = tree
-        .multi_get(&keys, lsm_tree::SeqNo::MAX)
-        .expect_err("a refused read on the authoritative path must surface");
-    assert!(
-        matches!(
-            &refused,
-            lsm_tree::Error::Io(io_err)
-                if io_err.kind() == lsm_tree::io::ErrorKind::PermissionDenied,
-        ),
-        "expected the backend's own refusal, got {refused:?}",
-    );
-
-    primary.behave(BatchedBehaviour::ClaimSuccessWithoutFilling);
-    let unfilled = tree
-        .multi_get(&keys, lsm_tree::SeqNo::MAX)
-        .expect_err("bytes nobody wrote must not be decoded as a block");
-    assert!(
-        matches!(
-            &unfilled,
-            lsm_tree::Error::Io(io_err)
-                if io_err.kind() == lsm_tree::io::ErrorKind::UnexpectedEof,
-        ),
-        "expected the short-request guard, got {unfilled:?}",
-    );
+    for behaviour in [
+        BatchedBehaviour::Fail,
+        BatchedBehaviour::ClaimSuccessWithoutFilling,
+    ] {
+        let tree = config().open()?;
+        primary.behave(behaviour);
+        primary.reset();
+        let values = tree.multi_get(&keys, lsm_tree::SeqNo::MAX)?;
+        assert!(
+            values.iter().all(Option::is_some),
+            "a {behaviour:?} batched read must not change the answer",
+        );
+        assert!(
+            primary.calls() > 0,
+            "the batched read was attempted ({behaviour:?})",
+        );
+    }
     Ok(())
 }
 
@@ -1956,9 +1947,11 @@ fn a_failed_prewarm_charges_only_the_groups_it_submitted() -> lsm_tree::Result<(
     Ok(())
 }
 
-/// The chunked resolve charges its batched reads the same way: per backend
-/// group, when the group is submitted. Its first failure is returned to the
-/// caller, so a group after it is never read and must not be charged.
+/// A level read in chunks charges its batched reads the same way: per backend
+/// group, when the group is submitted. Its first failure hands the level to
+/// the serial resolve, so a group after it is never asked and must not be
+/// charged; what the failed run reads beyond a successful one is exactly what
+/// the backend was asked for.
 #[cfg(feature = "metrics")]
 #[test]
 fn a_failed_chunked_resolve_charges_only_the_groups_it_submitted() -> lsm_tree::Result<()> {
@@ -1975,24 +1968,35 @@ fn a_failed_chunked_resolve_charges_only_the_groups_it_submitted() -> lsm_tree::
         .map(String::from)
         .to_vec();
 
-    let tree = config().open()?;
-    primary.behave(BatchedBehaviour::Fail);
-    other.behave(BatchedBehaviour::Fail);
-    primary.reset();
-    other.reset();
-    let before = tree.metrics().bytes_read();
-    tree.multi_get(&keys, lsm_tree::SeqNo::MAX)
-        .expect_err("a refused read on the authoritative path must surface");
+    let run = |how: BatchedBehaviour| -> lsm_tree::Result<(u64, u64)> {
+        // A fresh tree per run: nothing cached from the run before.
+        let tree = config().open()?;
+        primary.behave(how);
+        other.behave(how);
+        primary.reset();
+        other.reset();
+        let before = tree.metrics().bytes_read();
+        let values = tree.multi_get(&keys, lsm_tree::SeqNo::MAX)?;
+        assert!(values.iter().all(Option::is_some), "every key resolves");
+        Ok((
+            tree.metrics().bytes_read() - before,
+            primary.asked() + other.asked(),
+        ))
+    };
 
+    let (served, _) = run(BatchedBehaviour::Serve)?;
+    let (refused, refused_asked) = run(BatchedBehaviour::Fail)?;
     assert_eq!(
         primary.calls() + other.calls(),
         1,
-        "the first refusal ends the resolve",
+        "the first refusal ends the batched read",
     );
     assert_eq!(
-        tree.metrics().bytes_read() - before,
-        primary.asked() + other.asked(),
-        "only the submitted group was read",
+        refused,
+        served + refused_asked,
+        "the failed run charged {} B beyond the serial reads, but the backends \
+         were asked for {refused_asked} B",
+        refused - served,
     );
     Ok(())
 }
