@@ -402,6 +402,28 @@ impl<I: DoubleEndedIterator<Item = crate::Result<InternalValue>>, L: SeparatedBa
     type Item = crate::Result<InternalValue>;
 
     fn next(&mut self) -> Option<Self::Item> {
+        loop {
+            let item = self.step_front()?;
+            // The back failed on this key: what reaches the front of it is
+            // what the failure left, never the key's value. The front has now
+            // taken every remaining version, so the back's skip is done.
+            if let Ok(kv) = &item
+                && let Some(failed) = &self.skip_back
+                && crate::comparator::same_user_key(&kv.key.user_key, failed)
+            {
+                self.skip_back = None;
+                continue;
+            }
+            return Some(item);
+        }
+    }
+}
+
+impl<I: DoubleEndedIterator<Item = crate::Result<InternalValue>>, L: SeparatedBase>
+    MvccStream<I, L>
+{
+    // One forward item, before the check against a key the back failed on.
+    fn step_front(&mut self) -> Option<crate::Result<InternalValue>> {
         if self.skip_front.is_some()
             && let Some(e) = self.resume_skip_front()
         {
@@ -432,6 +454,27 @@ impl<I: DoubleEndedIterator<Item = crate::Result<InternalValue>>, L: SeparatedBa
     DoubleEndedIterator for MvccStream<I, L>
 {
     fn next_back(&mut self) -> Option<Self::Item> {
+        loop {
+            let item = self.step_back()?;
+            // The mirror of `next`: a key the front failed on yields nothing
+            // here, and the back has now taken every remaining version of it.
+            if let Ok(kv) = &item
+                && let Some(failed) = &self.skip_front
+                && crate::comparator::same_user_key(&kv.key.user_key, failed)
+            {
+                self.skip_front = None;
+                continue;
+            }
+            return Some(item);
+        }
+    }
+}
+
+impl<I: DoubleEndedIterator<Item = crate::Result<InternalValue>>, L: SeparatedBase>
+    MvccStream<I, L>
+{
+    // One backward item, before the check against a key the front failed on.
+    fn step_back(&mut self) -> Option<crate::Result<InternalValue>> {
         // When a merge operator is configured we must buffer ALL entries
         // for a key (not just MergeOperands) because we only learn that
         // merge is needed when we reach the newest entry (last in
