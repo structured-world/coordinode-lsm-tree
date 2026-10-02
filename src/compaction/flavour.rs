@@ -64,6 +64,35 @@ fn drain_blobs<I: Iterator<Item = crate::Result<(ScanEntry, BlobFileId)>>>(
     Ok(())
 }
 
+/// Drains the frames of keys below `bound`, recording each proven frame's end
+/// through `record_consumed` as `drain_blobs` does; a resynchronized frame is
+/// consumed without moving the frontier. `is_stopped` is polled before every
+/// frame: the drain can cover a whole dead prefix after the merge loop's last
+/// cancellation check, so a stop must not wait for it.
+fn drain_unclaimed_below<I: Iterator<Item = crate::Result<(ScanEntry, BlobFileId)>>>(
+    scanner: &mut Peekable<I>,
+    bound: &[u8],
+    comparator: &dyn crate::comparator::UserComparator,
+    record_consumed: &mut dyn FnMut(BlobFileId, u64),
+    is_stopped: &dyn Fn() -> bool,
+) -> crate::Result<()> {
+    loop {
+        if is_stopped() {
+            return Err(super::worker::cancelled_compaction());
+        }
+        let Some(next) = scanner.next_if(|x| match x {
+            Ok((entry, _)) => comparator.compare(&entry.key, bound) == core::cmp::Ordering::Less,
+            Err(_) => true,
+        }) else {
+            return Ok(());
+        };
+        let (entry, blob_file_id) = next?;
+        if !entry.resynced {
+            record_consumed(blob_file_id, entry.frame_end);
+        }
+    }
+}
+
 /// The filter policy of a compaction's destination level: none at the last
 /// level when point reads are expected to hit.
 fn output_bloom_policy(
@@ -711,6 +740,12 @@ pub struct RelocatingCompaction {
     /// The tree's key order: the table stream and the blob scan both advance
     /// in it, and draining compares keys by it.
     comparator: crate::comparator::SharedComparator,
+    /// A tight-space slice's exclusive upper key. Every version of a key below
+    /// it went through this slice, so once the slice is written its frames that
+    /// no emitted pointer claimed belong to dropped pointers and are drained
+    /// into the frontier. `None` for a whole-file relocation, which drops the
+    /// stale files outright and has no frontier to move.
+    drain_below: Option<crate::UserKey>,
 }
 
 impl RelocatingCompaction {
@@ -736,7 +771,46 @@ impl RelocatingCompaction {
             stop_signal,
             consumed_through: crate::HashMap::default(),
             comparator,
+            drain_below: None,
         }
+    }
+
+    /// Marks this as a tight-space slice ending (exclusively) at `bound`; see
+    /// the `drain_below` field.
+    #[must_use]
+    pub fn with_drain_below(mut self, bound: Option<crate::UserKey>) -> Self {
+        self.drain_below = bound;
+        self
+    }
+
+    /// Drains the frames of keys below `bound` that no emitted pointer claimed,
+    /// advancing the frontier past them as `drain_blobs` does: a pointer this
+    /// slice dropped (a version the GC fold collected, an entry a range
+    /// tombstone deletes, a base a merge fold consumed) never reaches `write`,
+    /// so its frame is accounted here. No table outside the compaction
+    /// references these frames: a file is relocated only when every table
+    /// referencing it is an input, and the inputs' versions of these keys all
+    /// went through this slice. A resynchronized frame is consumed without
+    /// moving the frontier, so a resumed scan re-reads from the last proven
+    /// boundary.
+    fn drain_unclaimed_below(&mut self, bound: &[u8]) -> crate::Result<()> {
+        let Self {
+            blob_scanner,
+            consumed_through,
+            comparator,
+            stop_signal,
+            ..
+        } = self;
+        drain_unclaimed_below(
+            blob_scanner,
+            bound,
+            comparator.as_ref(),
+            &mut |id, frame_end| {
+                let slot = consumed_through.entry(id).or_insert(0);
+                *slot = (*slot).max(frame_end);
+            },
+            &|| stop_signal.is_stopped(),
+        )
     }
 
     /// Advances the per-file frontier for `blob_file_id` to the max of its
@@ -924,6 +998,10 @@ impl CompactionFlavour for RelocatingCompaction {
             "Relocating compaction done in {:?}",
             self.inner.start.elapsed(),
         );
+
+        if let Some(bound) = self.drain_below.take() {
+            self.drain_unclaimed_below(&bound)?;
+        }
 
         let tables_to_delete = core::mem::take(&mut self.inner.tables_to_rewrite);
 
