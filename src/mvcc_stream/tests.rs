@@ -112,6 +112,405 @@ fn mvcc_stream_error() -> crate::Result<()> {
     Ok(())
 }
 
+fn io_error() -> crate::Error {
+    crate::Error::Io(crate::io::Error::other("test error"))
+}
+
+/// The items a forward pass yields: `Ok` keys as text, errors as `"err"`.
+fn forward_items<I: DoubleEndedIterator<Item = crate::Result<InternalValue>>>(
+    stream: MvccStream<I>,
+) -> Vec<String> {
+    stream
+        .map(|item| match item {
+            Ok(kv) => String::from_utf8_lossy(&kv.value).into_owned(),
+            Err(_) => "err".to_owned(),
+        })
+        .collect()
+}
+
+/// An error met while draining a key does not stop the drain: the older
+/// versions of that key never surface as its value, and every error a source
+/// raised is still yielded once.
+#[test]
+fn mvcc_stream_error_while_draining_skips_the_rest_of_the_key() {
+    let vec = [
+        Ok(InternalValue::from_components(
+            "a",
+            "new",
+            999,
+            ValueType::Value,
+        )),
+        Err(io_error()),
+        Err(io_error()),
+        Ok(InternalValue::from_components(
+            "a",
+            "old",
+            998,
+            ValueType::Value,
+        )),
+        Ok(InternalValue::from_components(
+            "b",
+            "b",
+            1,
+            ValueType::Value,
+        )),
+    ];
+    let stream = MvccStream::new(Box::new(vec.into_iter()), None);
+    assert_eq!(forward_items(stream), ["err", "err", "b"]);
+}
+
+/// The same while collecting a merge chain: an error among the operands drains
+/// the key, so its base never surfaces as the key's value.
+#[test]
+fn mvcc_stream_error_while_merging_skips_the_rest_of_the_key() {
+    struct Concat;
+    impl crate::merge_operator::MergeOperator for Concat {
+        fn merge(
+            &self,
+            _key: &[u8],
+            base: Option<&[u8]>,
+            operands: &[&[u8]],
+        ) -> crate::Result<crate::UserValue> {
+            let mut out = base.unwrap_or_default().to_vec();
+            for op in operands {
+                out.extend_from_slice(op);
+            }
+            Ok(out.into())
+        }
+    }
+
+    let vec = [
+        Ok(InternalValue::from_components(
+            "a",
+            "op",
+            999,
+            ValueType::MergeOperand,
+        )),
+        Err(io_error()),
+        Err(io_error()),
+        Ok(InternalValue::from_components(
+            "a",
+            "old",
+            998,
+            ValueType::Value,
+        )),
+        Ok(InternalValue::from_components(
+            "b",
+            "b",
+            1,
+            ValueType::Value,
+        )),
+    ];
+    let stream = MvccStream::new(Box::new(vec.into_iter()), Some(Arc::new(Concat)));
+    assert_eq!(forward_items(stream), ["err", "err", "b"]);
+
+    // Backward, an error after the base has been buffered drains the newer
+    // versions of the key too: they never merge without their base.
+    let vec = [
+        Ok(InternalValue::from_components(
+            "a",
+            "op",
+            999,
+            ValueType::MergeOperand,
+        )),
+        Err(io_error()),
+        Ok(InternalValue::from_components(
+            "a",
+            "old",
+            998,
+            ValueType::Value,
+        )),
+        Ok(InternalValue::from_components(
+            "b",
+            "b",
+            1,
+            ValueType::Value,
+        )),
+    ];
+    let backward: Vec<String> = MvccStream::new(Box::new(vec.into_iter()), Some(Arc::new(Concat)))
+        .rev()
+        .map(|item| match item {
+            Ok(kv) => String::from_utf8_lossy(&kv.value).into_owned(),
+            Err(_) => "err".to_owned(),
+        })
+        .collect();
+    assert_eq!(backward, ["b", "err"]);
+}
+
+/// A source that plays back a script, counts how often it is pulled and
+/// switches to a second script when repositioned.
+struct Scripted {
+    items: std::collections::VecDeque<crate::Result<InternalValue>>,
+    after_reseek: Vec<crate::Result<InternalValue>>,
+    pulls: std::rc::Rc<std::cell::Cell<usize>>,
+}
+
+impl Scripted {
+    fn new(items: Vec<crate::Result<InternalValue>>) -> Self {
+        Self {
+            items: items.into(),
+            after_reseek: Vec::new(),
+            pulls: std::rc::Rc::default(),
+        }
+    }
+}
+
+impl Iterator for Scripted {
+    type Item = crate::Result<InternalValue>;
+    fn next(&mut self) -> Option<Self::Item> {
+        self.pulls.set(self.pulls.get() + 1);
+        self.items.pop_front()
+    }
+}
+
+impl DoubleEndedIterator for Scripted {
+    fn next_back(&mut self) -> Option<Self::Item> {
+        self.pulls.set(self.pulls.get() + 1);
+        self.items.pop_back()
+    }
+}
+
+impl crate::reseek::Reseekable for Scripted {
+    fn reseek(&mut self, _ctx: &crate::reseek::ReseekCtx) {
+        self.items = core::mem::take(&mut self.after_reseek).into();
+    }
+}
+
+fn named_error(name: &str) -> crate::Result<InternalValue> {
+    Err(crate::Error::Io(crate::io::Error::other(name.to_owned())))
+}
+
+#[expect(
+    clippy::unnecessary_wraps,
+    reason = "a script step is an item, Ok or Err, as the stream reads it"
+)]
+fn kv(key: &str, value: &str, seqno: SeqNo, value_type: ValueType) -> crate::Result<InternalValue> {
+    Ok(InternalValue::from_components(
+        key.as_bytes(),
+        value.as_bytes(),
+        seqno,
+        value_type,
+    ))
+}
+
+/// What an item shows: the value, or the error's message.
+fn shown(item: crate::Result<InternalValue>) -> String {
+    match item {
+        Ok(kv) => String::from_utf8_lossy(&kv.value).into_owned(),
+        Err(crate::Error::Io(e)) => {
+            let text = e.to_string();
+            text.strip_prefix("other error: ")
+                .unwrap_or(&text)
+                .to_owned()
+        }
+        Err(e) => format!("{e:?}"),
+    }
+}
+
+/// An error ends the key's resolution at once: the call returns without
+/// pulling the rest of a long run of errors, which later calls yield one by
+/// one.
+#[test]
+fn mvcc_stream_error_is_returned_without_draining_the_run_behind_it() {
+    let mut items = vec![kv("a", "new", 999, ValueType::Value)];
+    for _ in 0..1_000 {
+        items.push(named_error("e"));
+    }
+    let source = Scripted::new(items);
+    let pulls = std::rc::Rc::clone(&source.pulls);
+    let mut stream = MvccStream::new(source, None);
+
+    assert_eq!(stream.next().map(shown).as_deref(), Some("e"));
+    assert!(pulls.get() < 10, "pulled {} times", pulls.get());
+    assert_eq!(stream.next().map(shown).as_deref(), Some("e"));
+}
+
+/// Errors met while skipping a failed key come out in the order they were
+/// met.
+#[test]
+fn mvcc_stream_errors_of_a_failed_key_keep_their_order() {
+    struct Concat;
+    impl crate::merge_operator::MergeOperator for Concat {
+        fn merge(
+            &self,
+            _: &[u8],
+            base: Option<&[u8]>,
+            ops: &[&[u8]],
+        ) -> crate::Result<crate::UserValue> {
+            let mut out = base.unwrap_or_default().to_vec();
+            for op in ops {
+                out.extend_from_slice(op);
+            }
+            Ok(out.into())
+        }
+    }
+
+    let source = Scripted::new(vec![
+        kv("a", "op", 999, ValueType::MergeOperand),
+        named_error("e1"),
+        named_error("e2"),
+        named_error("e3"),
+        kv("a", "old", 998, ValueType::Value),
+        kv("b", "b", 1, ValueType::Value),
+    ]);
+    let stream = MvccStream::new(source, Some(Arc::new(Concat)));
+    let items: Vec<String> = stream.map(shown).collect();
+    assert_eq!(items, ["e1", "e2", "e3", "b"]);
+}
+
+/// A key skipped after an error at the front does not hold up the back: the
+/// back yields its own items, not the front's errors.
+#[test]
+fn mvcc_stream_front_error_stays_at_the_front() {
+    let source = Scripted::new(vec![
+        kv("a", "new", 999, ValueType::Value),
+        named_error("e1"),
+        named_error("e2"),
+        kv("a", "old", 998, ValueType::Value),
+        kv("b", "b", 1, ValueType::Value),
+        kv("c", "c", 1, ValueType::Value),
+    ]);
+    let mut stream = MvccStream::new(source, None);
+
+    assert_eq!(stream.next().map(shown).as_deref(), Some("e1"));
+    assert_eq!(stream.next_back().map(shown).as_deref(), Some("c"));
+    assert_eq!(stream.next().map(shown).as_deref(), Some("e2"));
+    assert_eq!(stream.next().map(shown).as_deref(), Some("b"));
+    assert!(stream.next().is_none());
+}
+
+/// A key that failed at one end yields nothing when the other end reaches
+/// it: the versions left are the ones the failure shadows.
+#[test]
+fn mvcc_stream_failed_key_is_skipped_from_the_other_end() {
+    let source = Scripted::new(vec![
+        kv("a", "new", 999, ValueType::Value),
+        named_error("e"),
+        kv("a", "old", 998, ValueType::Value),
+        kv("b", "b", 1, ValueType::Value),
+    ]);
+    let mut stream = MvccStream::new(source, None);
+    assert_eq!(stream.next().map(shown).as_deref(), Some("e"));
+    let rest: Vec<String> = stream.rev().map(shown).collect();
+    assert_eq!(rest, ["b"], "front failure, back drain");
+
+    let source = Scripted::new(vec![
+        kv("x", "x", 1, ValueType::Value),
+        kv("a", "new", 999, ValueType::Value),
+        named_error("e"),
+        kv("a", "old", 998, ValueType::Value),
+    ]);
+    let mut stream = MvccStream::new(source, None);
+    assert_eq!(stream.next_back().map(shown).as_deref(), Some("e"));
+    let rest: Vec<String> = stream.map(shown).collect();
+    assert_eq!(rest, ["x"], "back failure, front drain");
+}
+
+/// What is left of a key that failed at one end is skipped by the other end
+/// before it is resolved: resolving it could only fail again (here the
+/// operator always fails) and report a second error for the same key.
+#[test]
+fn mvcc_stream_failed_key_is_skipped_before_the_other_end_resolves_it() {
+    struct FailMerge;
+    impl crate::merge_operator::MergeOperator for FailMerge {
+        fn merge(
+            &self,
+            _: &[u8],
+            _: Option<&[u8]>,
+            _: &[&[u8]],
+        ) -> crate::Result<crate::UserValue> {
+            Err(crate::Error::MergeOperator)
+        }
+    }
+
+    let source = Scripted::new(vec![
+        kv("a", "op3", 999, ValueType::MergeOperand),
+        named_error("e"),
+        kv("a", "op2", 998, ValueType::MergeOperand),
+        kv("a", "base", 997, ValueType::Value),
+        kv("b", "b", 1, ValueType::Value),
+    ]);
+    let mut stream = MvccStream::new(source, Some(Arc::new(FailMerge)));
+    assert_eq!(stream.next().map(shown).as_deref(), Some("e"));
+    let rest: Vec<String> = stream.rev().map(shown).collect();
+    assert_eq!(rest, ["b"], "front failure, back drain");
+
+    let source = Scripted::new(vec![
+        kv("x", "x", 1, ValueType::Value),
+        kv("a", "op", 999, ValueType::MergeOperand),
+        named_error("e"),
+        kv("a", "base", 997, ValueType::Value),
+    ]);
+    let mut stream = MvccStream::new(source, Some(Arc::new(FailMerge)));
+    assert_eq!(stream.next_back().map(shown).as_deref(), Some("e"));
+    let rest: Vec<String> = stream.map(shown).collect();
+    assert_eq!(rest, ["x"], "back failure, front drain");
+}
+
+/// With a failed key pending at each end, an end first finishes its own skip
+/// and then still skips the key the other end failed on, rather than
+/// resolving it.
+#[test]
+fn mvcc_stream_skips_both_failed_keys_when_both_ends_failed() {
+    let source = Scripted::new(vec![
+        kv("a", "a_new", 999, ValueType::Value),
+        named_error("ea"),
+        kv("a", "a_old", 998, ValueType::Value),
+        kv("b", "b_new", 999, ValueType::Value),
+        named_error("eb"),
+        kv("b", "b_old", 998, ValueType::Value),
+    ]);
+    let mut stream = MvccStream::new(source, None);
+    assert_eq!(stream.next().map(shown).as_deref(), Some("ea"));
+    assert_eq!(stream.next_back().map(shown).as_deref(), Some("eb"));
+    assert_eq!(
+        stream.next().map(shown),
+        None,
+        "front: a skipped, b skipped"
+    );
+
+    let source = Scripted::new(vec![
+        kv("x", "x_new", 999, ValueType::Value),
+        named_error("ex"),
+        kv("x", "x_old", 998, ValueType::Value),
+        kv("y", "y_new", 999, ValueType::Value),
+        named_error("ey"),
+        kv("y", "y_old", 998, ValueType::Value),
+    ]);
+    let mut stream = MvccStream::new(source, None);
+    assert_eq!(stream.next_back().map(shown).as_deref(), Some("ey"));
+    assert_eq!(stream.next().map(shown).as_deref(), Some("ex"));
+    assert_eq!(
+        stream.next_back().map(shown),
+        None,
+        "back: y skipped, x skipped"
+    );
+}
+
+/// A reposition starts fresh: what was left to skip at the old position
+/// does not surface at the new one.
+#[test]
+fn mvcc_stream_reseek_forgets_the_failed_key() {
+    use crate::reseek::Reseekable;
+
+    let mut source = Scripted::new(vec![
+        kv("a", "new", 999, ValueType::Value),
+        named_error("e1"),
+        named_error("e2"),
+        kv("a", "old", 998, ValueType::Value),
+    ]);
+    source.after_reseek = vec![kv("x", "x", 1, ValueType::Value)];
+    let mut stream = MvccStream::new(source, None);
+
+    assert_eq!(stream.next().map(shown).as_deref(), Some("e1"));
+    stream.reseek(&crate::reseek::ReseekCtx {
+        user: (core::ops::Bound::Unbounded, core::ops::Bound::Unbounded),
+        internal: (core::ops::Bound::Unbounded, core::ops::Bound::Unbounded),
+    });
+    assert_eq!(stream.next().map(shown).as_deref(), Some("x"));
+    assert!(stream.next().is_none());
+}
+
 #[test]
 #[expect(clippy::unwrap_used, reason = "test assertion")]
 fn mvcc_queue_reverse_almost_gone() -> crate::Result<()> {

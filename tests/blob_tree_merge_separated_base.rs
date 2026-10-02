@@ -473,6 +473,52 @@ fn blob_tree_key_only_reads_do_not_merge() -> lsm_tree::Result<()> {
     Ok(())
 }
 
+/// A scan that cannot read a merge's separated base reports the error once
+/// for the key and moves past it: the older version the base shadows is never
+/// yielded as the key's value, in either direction.
+#[test]
+fn blob_tree_scan_skips_the_shadowed_versions_of_a_key_whose_base_fails() -> lsm_tree::Result<()> {
+    for reverse in [false, true] {
+        let folder = get_tmp_folder();
+        let tree = open(folder.path())?;
+        tree.insert("k", "old", 0);
+        tree.flush_active_memtable(0)?;
+        tree.insert("k", base(), 1);
+        tree.flush_active_memtable(0)?;
+        tree.merge("k", "_A", 2);
+        tree.insert("z", "small", 3);
+        for blob in std::fs::read_dir(folder.path().join("blobs"))? {
+            std::fs::OpenOptions::new()
+                .write(true)
+                .truncate(true)
+                .open(blob?.path())?;
+        }
+
+        let items: Vec<_> = if reverse {
+            tree.iter(SeqNo::MAX, None)
+                .rev()
+                .map(Guard::into_inner)
+                .collect()
+        } else {
+            tree.iter(SeqNo::MAX, None).map(Guard::into_inner).collect()
+        };
+        let what = if reverse { "reverse" } else { "forward" };
+        assert_eq!(items.len(), 2, "one error for k and z, {what}: {items:?}");
+        assert_eq!(
+            items.iter().filter(|item| item.is_err()).count(),
+            1,
+            "k fails, {what}"
+        );
+        let ok: Vec<_> = items
+            .into_iter()
+            .filter_map(Result::ok)
+            .map(|(k, v)| (k.to_vec(), v.to_vec()))
+            .collect();
+        assert_eq!(ok, [(b"z".to_vec(), b"small".to_vec())], "{what}");
+    }
+    Ok(())
+}
+
 /// A compaction's rate limit covers the bytes a fold writes to the value log,
 /// not only the small pointer it emits: 40 KiB of folded values under a
 /// 20 KiB/s limit take about a second past the one-second burst.
