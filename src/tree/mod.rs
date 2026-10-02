@@ -1880,6 +1880,20 @@ impl AbstractTree for Tree {
         )
     }
 
+    // Existence needs the newest visible version, not its value: a merge
+    // chain always resolves to some value, so its operands are not merged and
+    // a separated base is not read.
+    fn contains_key<K: AsRef<[u8]>>(&self, key: K, seqno: SeqNo) -> crate::Result<bool> {
+        let super_version = self.snapshot_for_read(seqno)?;
+        Ok(Self::get_value(
+            &super_version,
+            key.as_ref(),
+            seqno,
+            self.config.comparator.as_ref(),
+        )?
+        .is_some())
+    }
+
     fn get_pinned<K: AsRef<[u8]>>(
         &self,
         key: K,

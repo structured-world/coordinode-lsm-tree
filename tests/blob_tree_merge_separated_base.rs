@@ -421,6 +421,79 @@ fn blob_tree_compaction_writes_no_blob_for_a_filter_rewrite_a_tombstone_deletes(
     Ok(())
 }
 
+/// `contains_key` asks whether the key exists, not what it merges to: it
+/// answers without reading the value log or calling the operator, so an
+/// operator that fails does not make an existing key an error.
+#[test]
+fn blob_tree_contains_key_does_not_merge() -> lsm_tree::Result<()> {
+    struct FailMerge;
+    impl MergeOperator for FailMerge {
+        fn merge(&self, _: &[u8], _: Option<&[u8]>, _: &[&[u8]]) -> lsm_tree::Result<UserValue> {
+            Err(lsm_tree::Error::MergeOperator)
+        }
+    }
+
+    let folder = get_tmp_folder();
+    let tree = Config::new(
+        folder.path(),
+        SequenceNumberCounter::default(),
+        SequenceNumberCounter::default(),
+    )
+    .with_kv_separation(Some(KvSeparationOptions {
+        separation_threshold: 100,
+        ..Default::default()
+    }))
+    .with_merge_operator(Some(Arc::new(FailMerge)))
+    .open()?;
+    tree.insert("k", base(), 0);
+    tree.flush_active_memtable(0)?;
+    tree.merge("k", "_A", 1);
+
+    assert!(tree.contains_key("k", SeqNo::MAX)?, "k exists");
+    assert!(!tree.contains_key("absent", SeqNo::MAX)?, "absent does not");
+    Ok(())
+}
+
+/// A compaction's rate limit covers the bytes a fold writes to the value log,
+/// not only the small pointer it emits: 40 KiB of folded values under a
+/// 20 KiB/s limit take about a second past the one-second burst.
+#[test]
+fn blob_tree_compaction_charges_separated_folds_to_the_rate_limit() -> lsm_tree::Result<()> {
+    let folder = get_tmp_folder();
+    let tree = Config::new(
+        folder.path(),
+        SequenceNumberCounter::default(),
+        SequenceNumberCounter::default(),
+    )
+    .with_kv_separation(Some(KvSeparationOptions {
+        separation_threshold: 100,
+        ..Default::default()
+    }))
+    .with_merge_operator(Some(Arc::new(ConcatMerge)))
+    .compaction_rate_limit(20_000)
+    .open()?;
+    let operand = vec![b'o'; 1_000];
+    for i in 0..40u64 {
+        tree.insert(format!("k{i:02}"), "B", i);
+    }
+    tree.flush_active_memtable(0)?;
+    for i in 0..40u64 {
+        tree.merge(format!("k{i:02}"), operand.as_slice(), 40 + i);
+    }
+    tree.flush_active_memtable(0)?;
+
+    let started = std::time::Instant::now();
+    tree.major_compact(64_000_000, 100)?;
+    let took = started.elapsed();
+
+    assert!(tree.blob_file_count() > 0, "the folds were separated");
+    assert!(
+        took >= std::time::Duration::from_millis(800),
+        "the folded payload was throttled, took {took:?}"
+    );
+    Ok(())
+}
+
 /// An operand of separation size stays an operand through a flush: it is
 /// kept inline, and the key still reads as the operand merged onto its base.
 #[test]
