@@ -21,6 +21,10 @@ use test_log::test;
 
 const KEYS: u64 = 2_000;
 
+/// Above every seqno the fixtures write, so a merge may collect the versions
+/// it shadows and fold operands onto their base.
+const PAST_EVERY_VERSION: u64 = 10 * KEYS;
+
 fn key(i: u64) -> String {
     format!("key_{i:08}")
 }
@@ -95,7 +99,7 @@ fn assert_fails_cleanly(
     for rule in rules {
         f.injector.arm(rule);
     }
-    let result = f.tree.major_compact(target_size, 0);
+    let result = f.tree.major_compact(target_size, PAST_EVERY_VERSION);
     f.injector.clear();
 
     assert!(
@@ -194,11 +198,13 @@ fn a_failed_relocation_leaves_none_of_its_blob_files() -> lsm_tree::Result<()> {
         f.tree.insert(key(i), value(i, 0), i);
     }
     f.tree.flush_active_memtable(0)?;
-    // Half of the first generation goes stale, so the merge relocates the rest.
+    // Half of the first generation goes stale. The first merge drops it and
+    // records the dead half, so the next one relocates the rest.
     for i in (0..KEYS).step_by(2) {
         f.tree.insert(key(i), value(i, 1), KEYS + i);
     }
     f.tree.flush_active_memtable(0)?;
+    f.tree.major_compact(u64::MAX, PAST_EVERY_VERSION)?;
 
     assert_fails_cleanly(&f, [io_error(FaultOp::Write, "blobs", 4)], u64::MAX, |i| {
         value(i, u64::from(i % 2 == 0))

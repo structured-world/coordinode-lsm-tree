@@ -97,7 +97,8 @@ fn cached_descriptors_are_evicted_before_the_unlink() -> crate::Result<()> {
     create(&*fs, &blob)?;
 
     let tree_id = 9;
-    let descriptors = DescriptorTable::new(8);
+    // Room for both entries in every shard, so neither is evicted on insert.
+    let descriptors = DescriptorTable::new(1_000);
     let open = |path: &PathBuf| -> crate::Result<Arc<dyn crate::fs::FsFile>> {
         Ok(Arc::from(fs.open(path, &FsOpenOptions::new().read(true))?))
     };
@@ -166,20 +167,26 @@ fn a_failed_install_leaves_no_output_where_open_files_cannot_be_unlinked() -> cr
         tree.insert(alloc::format!("key_{i:06}"), value(i, 0), i);
     }
     tree.flush_active_memtable(0)?;
-    // Half of the first generation goes stale, so the merge relocates the rest
-    // and writes blob files as well as tables.
+    // Half of the first generation goes stale. The first merge drops it and
+    // records the dead half, so the second relocates the rest and writes blob
+    // files as well as tables.
     for i in (0..1_000).step_by(2) {
         tree.insert(alloc::format!("key_{i:06}"), value(i, 1), 1_000 + i);
     }
     tree.flush_active_memtable(0)?;
+    let past_every_version = 10_000;
+    tree.major_compact(u64::MAX, past_every_version)?;
 
     let tables = dir.path().join(crate::file::TABLES_FOLDER);
     let blobs = dir.path().join(crate::file::BLOBS_FOLDER);
     let before = (listing(&tables)?, listing(&blobs)?);
     injector.refuse_removing_open_files();
-    injector.arm(FaultRule::new(FaultOp::Rename, Fault::Error(crate::io::ErrorKind::Other)).once());
+    // The edit log append is the install's commit point.
+    injector.arm(
+        FaultRule::new(FaultOp::Write, Fault::Error(crate::io::ErrorKind::Other)).on_path("edits-"),
+    );
 
-    let result = tree.major_compact(16 * 1024, 0);
+    let result = tree.major_compact(16 * 1024, past_every_version);
     injector.clear();
     assert!(
         result.is_err(),
