@@ -56,6 +56,29 @@ struct Chunks<'a, K> {
     current: Option<Current<'a, K>>,
 }
 
+impl<'a, K: AsRef<[u8]>> Current<'a, K> {
+    /// Asks `out` for the chunk's reads once every job it asked for is back,
+    /// and only once; a chunk that failed asks for none.
+    fn ask_reads(
+        &mut self,
+        chunk: &[BlockTask<'a>],
+        carried: &mut Option<ChunkFile>,
+        out: &mut impl ReadSink<'a>,
+    ) {
+        if self.jobs > 0 || self.failed || self.reads_asked {
+            return;
+        }
+        self.reads_asked = true;
+        match self.read.take_reads(chunk, carried, out) {
+            Ok(reads) => self.reads = reads,
+            Err(error) => {
+                log::debug!("a batched level read failed, the level is read serially: {error}");
+                self.failed = true;
+            }
+        }
+    }
+}
+
 /// The chunk in flight.
 struct Current<'a, K> {
     end: usize,
@@ -233,10 +256,12 @@ impl<'a, K: AsRef<[u8]>> LevelResolve<'a, K> {
         LevelStep::Serial
     }
 
-    /// Takes back a finished job.
-    pub(super) fn job_done(&mut self, done: JobDone) {
+    /// Takes back a finished job, asking `out` for the work it unblocks.
+    pub(super) fn job_done(&mut self, done: JobDone, out: &mut impl ReadSink<'a>) {
         match (&mut self.phase, done) {
-            (Phase::Stages(stages), JobDone::Opened { tag, file }) => stages.opened(tag, file),
+            (Phase::Stages(stages), JobDone::Opened { tag, file }) => {
+                stages.opened(tag, file, out);
+            }
             (
                 Phase::Plans {
                     stages,
@@ -257,7 +282,7 @@ impl<'a, K: AsRef<[u8]>> LevelResolve<'a, K> {
                     }
                 }
             }
-            (Phase::Chunks(chunks), done) => chunks.job_done(done),
+            (Phase::Chunks(chunks), done) => chunks.job_done(done, out),
             _ => debug_assert!(
                 false,
                 "a job handed back to a phase that did not ask for it"
@@ -410,19 +435,7 @@ impl<'a, K: AsRef<[u8]>> Chunks<'a, K> {
             if current.jobs > 0 {
                 return ChunkStep::Pending;
             }
-            if !current.failed && !current.reads_asked {
-                current.reads_asked = true;
-                let chunk = &self.tasks[self.start..current.end];
-                match current.read.take_reads(chunk, &mut self.carried, out) {
-                    Ok(reads) => current.reads = reads,
-                    Err(error) => {
-                        log::debug!(
-                            "a batched level read failed, the level is read serially: {error}"
-                        );
-                        current.failed = true;
-                    }
-                }
-            }
+            current.ask_reads(&self.tasks[self.start..current.end], &mut self.carried, out);
             if current.reads > 0 {
                 return ChunkStep::Pending;
             }
@@ -449,7 +462,9 @@ impl<'a, K: AsRef<[u8]>> Chunks<'a, K> {
         clippy::indexing_slicing,
         reason = "a chunk's start..end lies within `tasks`"
     )]
-    fn job_done(&mut self, done: JobDone) {
+    /// Takes back a finished job of the chunk out, and asks `out` for the
+    /// chunk's reads once it was the last.
+    fn job_done(&mut self, done: JobDone, out: &mut impl ReadSink<'a>) {
         let Some(current) = &mut self.current else {
             debug_assert!(false, "a job handed back with no chunk out");
             return;
@@ -470,6 +485,7 @@ impl<'a, K: AsRef<[u8]>> Chunks<'a, K> {
             log::debug!("a batched level read failed, the level is read serially: {error}");
             current.failed = true;
         }
+        current.ask_reads(chunk, &mut self.carried, out);
     }
 
     #[expect(

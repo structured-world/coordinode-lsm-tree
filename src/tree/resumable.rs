@@ -195,9 +195,13 @@ impl ResumableMultiGet {
         });
     }
 
-    /// Hands back a finished job.
+    /// Hands back a finished job. The work it unblocks, such as the reads
+    /// through a file it opened, is handed out at once: the next
+    /// [`take_reads`](Self::take_reads) and [`take_jobs`](Self::take_jobs)
+    /// return it.
     pub fn complete_job(&mut self, outcome: JobOutcome) {
-        self.cell
-            .with_dependent_mut(|_, machine| machine.read.job_done(outcome.0));
+        self.cell.with_dependent_mut(|_, machine| {
+            machine.read.job_done(outcome.0, &mut machine.work);
+        });
     }
 }

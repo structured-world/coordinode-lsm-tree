@@ -286,8 +286,9 @@ pub(super) trait ReadMachine<'a> {
     /// is out.
     fn pump<S: ReadSink<'a>>(&mut self, out: &mut S) -> Option<Self::Output>;
 
-    /// Takes back a finished job.
-    fn job_done(&mut self, done: JobDone);
+    /// Takes back a finished job, asking `out` for the work it unblocks: a
+    /// file back is read through at once, without waiting for the next pump.
+    fn job_done<S: ReadSink<'a>>(&mut self, done: JobDone, out: &mut S);
 
     /// Takes back a finished block read.
     fn read_done(&mut self, done: crate::fs::ReadDone);

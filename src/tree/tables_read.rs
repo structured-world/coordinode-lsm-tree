@@ -155,11 +155,11 @@ impl<'a, K: AsRef<[u8]>> TablesRead<'a, K> {
         }
     }
 
-    /// Takes back a finished job.
-    pub(super) fn job_done(&mut self, done: JobDone) {
+    /// Takes back a finished job, asking `out` for the work it unblocks.
+    pub(super) fn job_done(&mut self, done: JobDone, out: &mut impl ReadSink<'a>) {
         match (&mut self.state, &mut self.staged, done) {
             (State::Serial(slot @ None), _, JobDone::Serial { result }) => *slot = Some(result),
-            (State::Staged, Some(level), done) => level.job_done(done),
+            (State::Staged, Some(level), done) => level.job_done(done, out),
             _ => debug_assert!(false, "a job handed back to a read that did not ask for it"),
         }
     }

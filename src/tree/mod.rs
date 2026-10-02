@@ -3891,14 +3891,22 @@ impl Tree {
             }),
             jobs: Vec::new(),
         };
+        // The jobs being run; those their results ask for collect in the
+        // sink meanwhile.
+        let mut running: Vec<read_job::Job> = Vec::new();
 
         loop {
             if let Some(answer) = level.pump(&mut sink) {
                 return answer;
             }
             if !sink.jobs.is_empty() {
-                for job in sink.jobs.drain(..) {
-                    level.job_done(job.run(ctx));
+                core::mem::swap(&mut running, &mut sink.jobs);
+                #[expect(
+                    clippy::iter_with_drain,
+                    reason = "the two job lists trade places on every pass and keep their allocations; into_iter would consume one"
+                )]
+                for job in running.drain(..) {
+                    level.job_done(job.run(ctx), &mut sink);
                 }
                 continue;
             }
@@ -3989,8 +3997,12 @@ impl Tree {
                 }
             }
 
-            fn job_done(&mut self, done: read_job::JobDone) {
-                self.level.job_done(done);
+            fn job_done<S: read_job::ReadSink<'a>>(
+                &mut self,
+                done: read_job::JobDone,
+                out: &mut S,
+            ) {
+                self.level.job_done(done, out);
             }
 
             fn read_done(&mut self, done: crate::fs::ReadDone) {

@@ -162,7 +162,7 @@ impl<'a, K: AsRef<[u8]>> ReadMachine<'a> for MultiGetRead<'a, K> {
         Some(Ok(core::mem::take(&mut self.results)))
     }
 
-    fn job_done(&mut self, done: JobDone) {
+    fn job_done<S: ReadSink<'a>>(&mut self, done: JobDone, out: &mut S) {
         match done {
             JobDone::Value { idx, value } => {
                 self.jobs -= 1;
@@ -181,7 +181,7 @@ impl<'a, K: AsRef<[u8]>> ReadMachine<'a> for MultiGetRead<'a, K> {
             }
             done => {
                 if let Some(tables) = &mut self.tables {
-                    tables.job_done(done);
+                    tables.job_done(done, out);
                 } else {
                     debug_assert!(false, "a job handed back to a read that did not ask for it");
                 }
