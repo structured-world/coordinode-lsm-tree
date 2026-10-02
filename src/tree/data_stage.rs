@@ -7,7 +7,7 @@
 //! arrives. It never opens, reads or waits itself; whoever drives it carries
 //! the work out.
 
-use super::read_job::{BlockRequest, Job};
+use super::read_job::{BlockRequest, Job, ReadSink};
 use super::{BlockTask, TaskBlock, Tree};
 use crate::{InternalValue, TableId, fs::FsFile};
 use alloc::sync::Arc;
@@ -43,11 +43,11 @@ pub(super) struct ChunkRead<'k, K> {
 }
 
 impl<'k, K: AsRef<[u8]>> ChunkRead<'k, K> {
-    /// Point-reads every task of `chunk` whose block is held, and returns the
-    /// jobs the others need first: a Page-ECC or columnar table's load,
-    /// handed back through [`Self::loaded`], and the files to open for the
-    /// reads [`Self::take_reads`] then hands out, handed back through
-    /// [`Self::opened`].
+    /// Point-reads every task of `chunk` whose block is held, and asks `out`
+    /// for the jobs the others need first: a Page-ECC or columnar table's
+    /// load, handed back through [`Self::loaded`], and the files to open for
+    /// the reads [`Self::take_reads`] then hands out, handed back through
+    /// [`Self::opened`]. Returns the read and how many jobs it asked for.
     ///
     /// `carried` is the previous chunk's last file: taken over when this
     /// chunk's first read is from its table, and let go otherwise, before any
@@ -56,13 +56,15 @@ impl<'k, K: AsRef<[u8]>> ChunkRead<'k, K> {
     /// # Errors
     ///
     /// A held block's point read fails, or a block to read has a size no block
-    /// of its table can have (refused before its buffer is allocated).
-    pub(super) fn start(
+    /// of its table can have (refused before its buffer is allocated). A chunk
+    /// that fails has asked for nothing.
+    pub(super) fn start<'s>(
         chunk: &[BlockTask<'_>],
         cached: &[TaskBlock],
         keys: &'k [K],
         carried: &mut Option<ChunkFile>,
-    ) -> crate::Result<(Self, Vec<Job>)> {
+        out: &mut impl ReadSink<'s>,
+    ) -> crate::Result<(Self, usize)> {
         let mut read = Self {
             keys,
             fills: Vec::new(),
@@ -70,18 +72,25 @@ impl<'k, K: AsRef<[u8]>> ChunkRead<'k, K> {
             hits: Vec::new(),
             decode_failure: None,
         };
-        let mut jobs = Vec::new();
+        // Whatever can fail comes first, so a failed chunk hands out no job.
         for (index, (task, block)) in chunk.iter().zip(cached).enumerate() {
             match block {
                 TaskBlock::Held(block) => {
                     Tree::read_task_keys(task, index, block, keys, &mut read.hits)?;
                 }
-                TaskBlock::Load => jobs.push(Job::Load {
+                TaskBlock::Read => task.table.check_block_size(&task.handle)?,
+                TaskBlock::Load => {}
+            }
+        }
+        let mut jobs = 0usize;
+        for (index, (task, block)) in chunk.iter().zip(cached).enumerate() {
+            if matches!(block, TaskBlock::Load) {
+                out.job(Job::Load {
                     index,
                     table: task.at,
                     handle: task.handle,
-                }),
-                TaskBlock::Read => {}
+                });
+                jobs += 1;
             }
         }
         let mut carry = carried.take();
@@ -89,7 +98,8 @@ impl<'k, K: AsRef<[u8]>> ChunkRead<'k, K> {
             if !matches!(block, TaskBlock::Read) {
                 continue;
             }
-            let buf = task.table.block_buffer(&task.handle)?;
+            // Its size is checked above.
+            let buf = alloc::vec![0u8; task.handle.size() as usize];
             let id = task.table.id();
             if read.files.last().is_none_or(|&(last, _)| last != id) {
                 let file = match carry.take() {
@@ -99,10 +109,11 @@ impl<'k, K: AsRef<[u8]>> ChunkRead<'k, K> {
                     // match.
                     other => {
                         drop(other);
-                        jobs.push(Job::Open {
+                        out.job(Job::Open {
                             tag: read.files.len(),
                             table: task.at,
                         });
+                        jobs += 1;
                         None
                     }
                 };
@@ -124,27 +135,36 @@ impl<'k, K: AsRef<[u8]>> ChunkRead<'k, K> {
         }
     }
 
-    /// Hands out the reads of `chunk`'s blocks in task order, each tagged
+    /// Hands `out` the reads of `chunk`'s blocks in task order, each tagged
     /// with its task's index, once every file asked for is back, and charges
-    /// them as issued. The last file is left in `carried` for the next chunk,
-    /// which takes it when it goes on with the same table.
+    /// them as issued; returns how many. The last file is left in `carried`
+    /// for the next chunk, which takes it when it goes on with the same table.
     ///
     /// # Errors
     ///
-    /// A file a read goes through was never handed back.
+    /// A file a read goes through was never handed back; then no read is
+    /// handed out.
     pub(super) fn take_reads<'a>(
         &mut self,
         chunk: &[BlockTask<'a>],
         carried: &mut Option<ChunkFile>,
-    ) -> crate::Result<Vec<BlockRequest<'a>>> {
-        let mut reads = Vec::with_capacity(self.fills.len());
+        out: &mut impl ReadSink<'a>,
+    ) -> crate::Result<usize> {
+        let unopened = self.fills.iter().any(|fill| {
+            chunk.get(fill.index).is_none()
+                || !matches!(self.files.get(fill.slot), Some((_, Some(_))))
+        });
+        if unopened {
+            return Err(crate::Error::Io(crate::io::Error::new(
+                crate::io::ErrorKind::Other,
+                "a chunk read was handed out before its file was opened",
+            )));
+        }
+        let count = self.fills.len();
         for Fill { index, slot, buf } in core::mem::take(&mut self.fills) {
             let (Some(task), Some((_, Some(file)))) = (chunk.get(index), self.files.get(slot))
             else {
-                return Err(crate::Error::Io(crate::io::Error::new(
-                    crate::io::ErrorKind::Other,
-                    "a chunk read was handed out before its file was opened",
-                )));
+                unreachable!("every fill's task and file are checked above");
             };
             // These reads bypass the per-block load path that charges every
             // other read.
@@ -152,7 +172,7 @@ impl<'k, K: AsRef<[u8]>> ChunkRead<'k, K> {
                 crate::table::block::BlockType::Data,
                 core::slice::from_ref(&task.handle),
             );
-            reads.push(BlockRequest {
+            out.read(BlockRequest {
                 tag: index,
                 table: task.table,
                 file: Arc::clone(file),
@@ -164,7 +184,7 @@ impl<'k, K: AsRef<[u8]>> ChunkRead<'k, K> {
             .into_iter()
             .last()
             .and_then(|(id, file)| Some((id, file?)));
-        Ok(reads)
+        Ok(count)
     }
 
     /// Takes back the load of task `index` of `chunk`: `None` when the table

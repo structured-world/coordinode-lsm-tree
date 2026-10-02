@@ -12,7 +12,7 @@
 //! itself.
 
 use super::level_resolve::{LevelResolve, LevelStep};
-use super::read_job::{Job, JobDone, ReadCtx, ReadWork};
+use super::read_job::{Job, JobDone, ReadCtx, ReadSink};
 use crate::InternalValue;
 use alloc::vec::Vec;
 
@@ -68,7 +68,7 @@ impl<'a, K: AsRef<[u8]>> TablesRead<'a, K> {
     pub(super) fn pump(
         &mut self,
         results: &mut [Option<InternalValue>],
-        out: &mut ReadWork<'a>,
+        out: &mut impl ReadSink<'a>,
     ) -> Option<crate::Result<()>> {
         loop {
             match &mut self.state {
@@ -121,7 +121,7 @@ impl<'a, K: AsRef<[u8]>> TablesRead<'a, K> {
                         // the read's ceiling skips the later runs), so it fails
                         // only where a key-by-key read would; either way the
                         // level is answered, never skipped for a lower one.
-                        out.jobs.push(Job::Serial {
+                        out.job(Job::Serial {
                             level: self.next - 1,
                             remaining: core::mem::take(&mut self.remaining),
                         });

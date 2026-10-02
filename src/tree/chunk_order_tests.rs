@@ -2,7 +2,7 @@
 // Copyright (c) 2026-present, Dmitry Prudnikov
 
 use super::data_stage::ChunkRead;
-use super::read_job::{Job, JobDone, ReadCtx, TableAt, Values};
+use super::read_job::{Job, JobDone, ReadCtx, ReadWork, TableAt, Values};
 use super::{BlockTask, TaskBlock};
 use crate::{AbstractTree, Config, SeqNo, SequenceNumberCounter, Tree, value::InternalValue};
 
@@ -87,8 +87,10 @@ fn a_chunked_resolve_breaks_an_equal_seqno_tie_by_plan_order() -> crate::Result<
     // Both blocks read, so the driver decides the order they are back in.
     let uncached = [TaskBlock::Read, TaskBlock::Read];
     let ctx = ctx_for(tree, keys.to_vec())?;
-    let (mut chunk, jobs) = ChunkRead::start(&tasks, &uncached, &keys, &mut None)?;
-    for job in jobs {
+    let mut work = ReadWork::new();
+    let (mut chunk, asked) = ChunkRead::start(&tasks, &uncached, &keys, &mut None, &mut work)?;
+    assert_eq!(asked, work.jobs.len(), "every job asked for is counted");
+    for job in core::mem::take(&mut work.jobs) {
         let Job::Open { .. } = &job else {
             panic!("a row table's block needs only its file");
         };
@@ -97,7 +99,9 @@ fn a_chunked_resolve_breaks_an_equal_seqno_tie_by_plan_order() -> crate::Result<
         };
         chunk.opened(tag, file?);
     }
-    let mut reads = chunk.take_reads(&tasks, &mut None)?;
+    let asked = chunk.take_reads(&tasks, &mut None, &mut work)?;
+    let mut reads = core::mem::take(&mut work.reads);
+    assert_eq!(asked, reads.len(), "every read asked for is counted");
     // Handed back last to first, as a ring may when the later reads of a
     // batch complete first.
     reads.reverse();

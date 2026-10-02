@@ -269,24 +269,25 @@ fn a_staged_read_plans_what_the_serial_planner_plans() -> crate::Result<()> {
     Ok(())
 }
 
-/// A handle whose size no block of the table can have is refused before a
-/// buffer is allocated for it, as the load path refuses it: a corrupt size
-/// is an error, not a request for gigabytes of memory.
+/// A handle whose size no block of the table can have is refused by the check
+/// a staged read makes before it allocates a buffer, as the load path refuses
+/// it: a corrupt size is an error, not a request for gigabytes of memory.
 #[test]
-fn a_block_buffer_is_refused_for_a_size_no_block_can_have() {
+fn a_block_size_no_block_can_have_is_refused() {
     use crate::table::block::BlockOffset;
 
     let dir = tempdir().expect("dir");
     let table = table(dir.path(), |w| w, false, false, 0);
     assert!(
         table
-            .block_buffer(&BlockHandle::new(BlockOffset(0), u32::MAX))
+            .check_block_size(&BlockHandle::new(BlockOffset(0), u32::MAX))
             .is_err()
     );
-    let buf = table
-        .block_buffer(&BlockHandle::new(BlockOffset(0), 4_096))
-        .expect("a block's size");
-    assert_eq!(4_096, buf.len());
+    assert!(
+        table
+            .check_block_size(&BlockHandle::new(BlockOffset(0), 4_096))
+            .is_ok()
+    );
 }
 
 /// A table file a staged read opens is counted in the descriptor cache's

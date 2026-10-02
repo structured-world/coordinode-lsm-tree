@@ -11,7 +11,7 @@
 
 use super::data_stage::{ChunkFile, ChunkRead};
 use super::level_stages::LevelStages;
-use super::read_job::{Job, JobDone, ReadWork};
+use super::read_job::{Job, JobDone, ReadSink};
 use super::{BlockTask, TaskBlock, Tree};
 use crate::table::probe_stats::PlanCounts;
 use crate::{InternalValue, SeqNo, Table, TableId};
@@ -137,13 +137,15 @@ impl<'a, K: AsRef<[u8]>> LevelResolve<'a, K> {
     pub(super) fn pump(
         &mut self,
         results: &mut [Option<InternalValue>],
-        out: &mut ReadWork<'a>,
+        out: &mut impl ReadSink<'a>,
     ) -> LevelStep {
         loop {
             match &mut self.phase {
                 Phase::Stages(stages) => {
                     stages.pump(out);
-                    if !out.is_empty() || !stages.idle() {
+                    // Every file open and read the stages ask for keeps its
+                    // table waiting until it is back.
+                    if !stages.idle() {
                         return LevelStep::Pending;
                     }
                     // Nothing out: a table that waited for a place gets one
@@ -171,7 +173,7 @@ impl<'a, K: AsRef<[u8]>> LevelResolve<'a, K> {
                     if !*asked {
                         *asked = true;
                         for plan in stages.serial_plans() {
-                            out.jobs.push(Job::Plan {
+                            out.job(Job::Plan {
                                 at: plan.at,
                                 table: plan.table,
                                 keys: self.remaining[plan.keys].to_vec(),
@@ -371,7 +373,7 @@ impl<'a, K: AsRef<[u8]>> Chunks<'a, K> {
         &mut self,
         keys: &'a [K],
         results: &mut [Option<InternalValue>],
-        out: &mut ReadWork<'a>,
+        out: &mut impl ReadSink<'a>,
     ) -> ChunkStep {
         loop {
             let Some(current) = &mut self.current else {
@@ -380,11 +382,12 @@ impl<'a, K: AsRef<[u8]>> Chunks<'a, K> {
                 }
                 let end = self.chunk_end();
                 let chunk = &self.tasks[self.start..end];
-                let (read, jobs) = match ChunkRead::start(
+                let (read, count) = match ChunkRead::start(
                     chunk,
                     &self.cached[self.start..end],
                     keys,
                     &mut self.carried,
+                    out,
                 ) {
                     Ok(started) => started,
                     Err(error) => {
@@ -394,8 +397,6 @@ impl<'a, K: AsRef<[u8]>> Chunks<'a, K> {
                         return ChunkStep::Failed;
                     }
                 };
-                let count = jobs.len();
-                out.jobs.extend(jobs);
                 self.current = Some(Current {
                     end,
                     read,
@@ -412,11 +413,8 @@ impl<'a, K: AsRef<[u8]>> Chunks<'a, K> {
             if !current.failed && !current.reads_asked {
                 current.reads_asked = true;
                 let chunk = &self.tasks[self.start..current.end];
-                match current.read.take_reads(chunk, &mut self.carried) {
-                    Ok(reads) => {
-                        current.reads = reads.len();
-                        out.reads.extend(reads);
-                    }
+                match current.read.take_reads(chunk, &mut self.carried, out) {
+                    Ok(reads) => current.reads = reads,
                     Err(error) => {
                         log::debug!(
                             "a batched level read failed, the level is read serially: {error}"

@@ -4,7 +4,7 @@
 use super::TaskBlock;
 use super::chunk_order_tests::{ctx_for, tasks_for};
 use super::data_stage::ChunkRead;
-use super::read_job::{Job, JobDone};
+use super::read_job::{Job, JobDone, ReadWork};
 use crate::fs::{Fs, FsFile, FsOpenOptions, StdFs};
 use crate::{AbstractTree, Config, SequenceNumberCounter, value::InternalValue};
 use alloc::sync::Arc;
@@ -51,13 +51,16 @@ fn a_chunk_on_another_table_closes_the_carried_file_before_asking_for_its_own() 
     // Table ids are small here, so one past the task's names another table.
     let mut carried = Some((task.table.id() + 1, carried_file));
 
-    let (mut chunk, jobs) = ChunkRead::start(&tasks, &[TaskBlock::Read], &keys, &mut carried)?;
+    let mut work = ReadWork::new();
+    let (mut chunk, asked) =
+        ChunkRead::start(&tasks, &[TaskBlock::Read], &keys, &mut carried, &mut work)?;
     assert!(
         watched.upgrade().is_none(),
         "the carried file is closed before the chunk asks for its own"
     );
     assert!(carried.is_none(), "nothing is carried into the chunk");
-    let [job] = <[Job; 1]>::try_from(jobs)
+    assert_eq!(asked, 1, "one job is counted");
+    let [job] = <[Job; 1]>::try_from(core::mem::take(&mut work.jobs))
         .unwrap_or_else(|_| panic!("one job: the file of the table read"));
     let ctx = ctx_for(tree, keys.to_vec())?;
     let JobDone::Opened { tag, file } = job.run(&ctx) else {
@@ -66,7 +69,9 @@ fn a_chunk_on_another_table_closes_the_carried_file_before_asking_for_its_own() 
     chunk.opened(tag, file?);
 
     let mut keep_room = 0;
-    for mut read in chunk.take_reads(&tasks, &mut carried)? {
+    let asked = chunk.take_reads(&tasks, &mut carried, &mut work)?;
+    assert_eq!(asked, work.reads.len(), "every read asked for is counted");
+    for mut read in core::mem::take(&mut work.reads) {
         let filled = read.file.read_at(&mut read.buf, read.offset)?;
         assert_eq!(filled, read.buf.len(), "the whole block is read");
         chunk.read(&tasks, read.tag, &read.buf, &mut keep_room);

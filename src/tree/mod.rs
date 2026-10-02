@@ -222,6 +222,55 @@ struct LevelQueue<'a> {
     wakes: bool,
 }
 
+/// Where the blocking driver takes a read's asks: a block read straight into
+/// the queue of its backend, so no list stands between the read and the
+/// queue; a job until the pass that asked for it is over, since running it
+/// hands its result back to the read.
+struct DriveSink<'a> {
+    /// One queue per backend, opened when a table first asks it for a block,
+    /// so a read answered from the cache opens none.
+    queues: Vec<LevelQueue<'a>>,
+    #[cfg(feature = "std")]
+    wake: Arc<LevelWake>,
+    jobs: Vec<read_job::Job>,
+}
+
+impl<'a> read_job::ReadSink<'a> for DriveSink<'a> {
+    fn job(&mut self, job: read_job::Job) {
+        self.jobs.push(job);
+    }
+
+    #[expect(clippy::indexing_slicing, reason = "a slot is a position in `queues`")]
+    fn read(&mut self, read: read_job::BlockRequest<'a>) {
+        let slot = if let Some(slot) = self
+            .queues
+            .iter()
+            .position(|q| Arc::ptr_eq(q.fs, &read.table.fs))
+        {
+            slot
+        } else {
+            #[cfg_attr(not(feature = "std"), expect(unused_mut))]
+            let mut queue = read.table.fs.read_queue();
+            #[cfg(feature = "std")]
+            let wakes = queue.set_wake(Arc::clone(&self.wake) as Arc<dyn crate::fs::ReadWake>);
+            #[cfg(not(feature = "std"))]
+            let wakes = false;
+            self.queues.push(LevelQueue {
+                fs: &read.table.fs,
+                queue,
+                wakes,
+            });
+            self.queues.len() - 1
+        };
+        self.queues[slot].queue.submit(crate::fs::QueuedRead {
+            tag: read.tag,
+            file: read.file,
+            offset: read.offset,
+            buf: read.buf,
+        });
+    }
+}
+
 /// The filter and index bytes each table of a staged level read holds, and
 /// their sum: the buffers of its blocks in flight, at the size they are read
 /// as, and the blocks its read holds, at their decoded size.
@@ -3821,77 +3870,51 @@ impl Tree {
     }
 
     /// Drives a read of `ctx` to its end on the calling thread, and returns
-    /// its answer. Its jobs are run as they are asked for, and the read moves on
-    /// again before any block read is submitted, so the reads of a pass go
-    /// out together. A block read goes to the read queue of the backend its
-    /// table was opened through, and is handed back the moment it is in,
-    /// while others may still be in flight: no table waits on the slowest
+    /// its answer. A block read goes to the read queue of the backend its
+    /// table was opened through as it is asked for, and the queues hold the
+    /// reads of a pass until the driver waits on them, so they go out
+    /// together; jobs are run after the pass that asked for them, and the read
+    /// moves on again before any wait. A read is handed back the moment it is
+    /// in, while others may still be in flight: no table waits on the slowest
     /// file of the level.
-    #[expect(clippy::indexing_slicing, reason = "a slot is a position in `queues`")]
     fn drive<'a, K: AsRef<[u8]>, M: read_job::ReadMachine<'a>>(
         level: &mut M,
         ctx: &read_job::ReadCtx<K>,
     ) -> M::Output {
-        // One queue per backend, opened when a table first asks it for a
-        // block, so a level answered from the cache opens none.
-        let mut queues: Vec<LevelQueue<'a>> = Vec::new();
-        #[cfg(feature = "std")]
-        let wake = Arc::new(LevelWake {
-            generation: core::sync::atomic::AtomicU64::new(0),
-            sleeping: core::sync::atomic::AtomicBool::new(false),
-            thread: std::thread::current(),
-        });
-        let mut work = read_job::ReadWork::new();
+        let mut sink = DriveSink {
+            queues: Vec::new(),
+            #[cfg(feature = "std")]
+            wake: Arc::new(LevelWake {
+                generation: core::sync::atomic::AtomicU64::new(0),
+                sleeping: core::sync::atomic::AtomicBool::new(false),
+                thread: std::thread::current(),
+            }),
+            jobs: Vec::new(),
+        };
 
         loop {
-            if let Some(answer) = level.pump(&mut work) {
+            if let Some(answer) = level.pump(&mut sink) {
                 return answer;
             }
-            if !work.jobs.is_empty() {
-                for job in work.jobs.drain(..) {
+            if !sink.jobs.is_empty() {
+                for job in sink.jobs.drain(..) {
                     level.job_done(job.run(ctx));
                 }
                 continue;
             }
-            // Each read goes to the queue of the backend its table was opened
-            // through.
-            for read in work.reads.drain(..) {
-                let slot = if let Some(slot) = queues
-                    .iter()
-                    .position(|q| Arc::ptr_eq(q.fs, &read.table.fs))
-                {
-                    slot
-                } else {
-                    #[cfg_attr(not(feature = "std"), expect(unused_mut))]
-                    let mut queue = read.table.fs.read_queue();
-                    #[cfg(feature = "std")]
-                    let wakes = queue.set_wake(Arc::clone(&wake) as Arc<dyn crate::fs::ReadWake>);
-                    #[cfg(not(feature = "std"))]
-                    let wakes = false;
-                    queues.push(LevelQueue {
-                        fs: &read.table.fs,
-                        queue,
-                        wakes,
-                    });
-                    queues.len() - 1
-                };
-                queues[slot].queue.submit(crate::fs::QueuedRead {
-                    tag: read.tag,
-                    file: read.file,
-                    offset: read.offset,
-                    buf: read.buf,
-                });
-            }
 
             // A block is handed to its read the moment it is back.
             let mut on_done = |done: crate::fs::ReadDone| level.read_done(done);
+            let queues = &mut sink.queues;
+            #[cfg(feature = "std")]
+            let wake = &sink.wake;
             // What has finished on any backend, without waiting. The wake's
             // generation is taken first, so a read back after this look is
             // seen by the sleep below.
             #[cfg(feature = "std")]
             let seen = wake.generation.load(core::sync::atomic::Ordering::SeqCst);
             let mut handed = 0usize;
-            for q in &mut queues {
+            for q in queues.iter_mut() {
                 q.queue.wait(0, &mut |done| {
                     handed += 1;
                     on_done(done);
@@ -3958,7 +3981,7 @@ impl Tree {
         impl<'a, K: AsRef<[u8]>> read_job::ReadMachine<'a> for OneLevel<'a, '_, K> {
             type Output = bool;
 
-            fn pump(&mut self, out: &mut read_job::ReadWork<'a>) -> Option<bool> {
+            fn pump<S: read_job::ReadSink<'a>>(&mut self, out: &mut S) -> Option<bool> {
                 match self.level.pump(self.results, out) {
                     level_resolve::LevelStep::Pending => None,
                     level_resolve::LevelStep::Resolved => Some(true),

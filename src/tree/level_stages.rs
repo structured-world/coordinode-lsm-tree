@@ -7,7 +7,7 @@
 //! and never submits, reads or waits itself. Whoever drives it carries the
 //! reads out and hands each result back.
 
-use super::read_job::{BlockRequest, Job, ReadWork, TableAt};
+use super::read_job::{BlockRequest, Job, ReadSink, TableAt};
 use super::{BlockTask, LevelRead, LevelTable, LevelTasks, MetaHeld, Tree};
 use crate::table::probe_stats::PlanCounts;
 use crate::table::staged::{StagedRead, StagedStart};
@@ -147,7 +147,7 @@ impl<'a> LevelStages<'a> {
         clippy::indexing_slicing,
         reason = "`at` indexes the level's tables, which every per-table vector is sized to; a table's span lies in `batch`"
     )]
-    pub(super) fn pump(&mut self, out: &mut ReadWork<'a>) {
+    pub(super) fn pump<S: ReadSink<'a>>(&mut self, out: &mut S) {
         self.deferred = false;
         // Whether a table before the one at hand holds metadata blocks: the
         // first that does is never held back, so the level advances.
@@ -217,7 +217,7 @@ impl<'a> LevelStages<'a> {
                 // flight while it is opened, so the tables after it see the
                 // level as they would with its reads out.
                 let Some(file) = &entry.file else {
-                    out.jobs.push(Job::Open {
+                    out.job(Job::Open {
                         tag: at,
                         table: entry.at,
                     });
@@ -229,21 +229,16 @@ impl<'a> LevelStages<'a> {
                     self.waiting[at] += 1;
                     break;
                 };
-                let file = Arc::clone(file);
-                let buffers: Vec<Vec<u8>> = need
-                    .iter()
-                    .map(|handle| alloc::vec![0u8; handle.size() as usize])
-                    .collect();
                 table.record_batched_read(block_type, need);
                 self.meta.in_flight[at] += asked_bytes;
                 self.meta.settle(at, read.held_bytes());
-                for (handle, buf) in need.iter().zip(buffers) {
-                    out.reads.push(BlockRequest {
+                for handle in need {
+                    out.read(BlockRequest {
                         tag: self.asked.len(),
                         table,
-                        file: Arc::clone(&file),
+                        file: Arc::clone(file),
                         offset: *handle.offset(),
-                        buf,
+                        buf: alloc::vec![0u8; handle.size() as usize],
                     });
                     self.asked.push((at, *handle));
                     self.waiting[at] += 1;

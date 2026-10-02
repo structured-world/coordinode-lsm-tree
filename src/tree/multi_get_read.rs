@@ -9,7 +9,7 @@
 //! and never opens, reads or waits itself.
 
 use super::Tree;
-use super::read_job::{Job, JobDone, ReadCtx, ReadMachine, ReadWork, Values};
+use super::read_job::{Job, JobDone, ReadCtx, ReadMachine, ReadSink, Values};
 use super::tables_read::TablesRead;
 use crate::{InternalValue, UserValue};
 use alloc::vec::Vec;
@@ -96,7 +96,7 @@ impl<'a, K: AsRef<[u8]>> MultiGetRead<'a, K> {
         clippy::indexing_slicing,
         reason = "indices are generated from 0..n, always in bounds"
     )]
-    fn resolve(&mut self, out: &mut ReadWork<'a>) {
+    fn resolve(&mut self, out: &mut impl ReadSink<'a>) {
         let ctx = self.ctx;
         for idx in 0..self.entries.len() {
             let Some(entry) = self.entries[idx].take() else {
@@ -119,7 +119,7 @@ impl<'a, K: AsRef<[u8]>> MultiGetRead<'a, K> {
                 // single-key read returns it. Operands are stored inline in a
                 // blob tree too, so the merge result is a plain value.
                 if ctx.merge_operator.is_some() {
-                    out.jobs.push(Job::Merge { idx });
+                    out.job(Job::Merge { idx });
                     self.jobs += 1;
                 } else {
                     self.results[idx] = Some(entry.value);
@@ -127,7 +127,7 @@ impl<'a, K: AsRef<[u8]>> MultiGetRead<'a, K> {
                 continue;
             }
             if matches!(ctx.values, Values::Blob { .. }) && entry.key.value_type.is_indirection() {
-                out.jobs.push(Job::Blob { idx, item: entry });
+                out.job(Job::Blob { idx, item: entry });
                 self.jobs += 1;
             } else {
                 self.results[idx] = Some(entry.value);
@@ -140,7 +140,7 @@ impl<'a, K: AsRef<[u8]>> ReadMachine<'a> for MultiGetRead<'a, K> {
     /// Each key's value, in the order the keys were asked.
     type Output = crate::Result<Vec<Option<UserValue>>>;
 
-    fn pump(&mut self, out: &mut ReadWork<'a>) -> Option<Self::Output> {
+    fn pump<S: ReadSink<'a>>(&mut self, out: &mut S) -> Option<Self::Output> {
         if let Some(tables) = &mut self.tables {
             let read = tables.pump(&mut self.entries, out)?;
             self.tables = None;

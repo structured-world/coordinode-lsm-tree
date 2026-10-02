@@ -238,7 +238,19 @@ impl Job {
     }
 }
 
-/// What a read asks its driver to carry out: jobs first, then reads.
+/// Where a read's asks go as it makes them. A driver that submits a block
+/// read the moment it is asked for takes it here directly, with no list in
+/// between; a job is carried out only after the pass that asked for it,
+/// since it hands its result back to the read.
+pub(super) trait ReadSink<'a> {
+    /// Takes a job the read asks for.
+    fn job(&mut self, job: Job);
+
+    /// Takes a block read the read asks for.
+    fn read(&mut self, read: BlockRequest<'a>);
+}
+
+/// What a read asks for, kept until its driver takes it: jobs, then reads.
 pub(super) struct ReadWork<'a> {
     pub(super) jobs: Vec<Job>,
     pub(super) reads: Vec<BlockRequest<'a>>,
@@ -251,9 +263,15 @@ impl ReadWork<'_> {
             reads: Vec::new(),
         }
     }
+}
 
-    pub(super) fn is_empty(&self) -> bool {
-        self.jobs.is_empty() && self.reads.is_empty()
+impl<'a> ReadSink<'a> for ReadWork<'a> {
+    fn job(&mut self, job: Job) {
+        self.jobs.push(job);
+    }
+
+    fn read(&mut self, read: BlockRequest<'a>) {
+        self.reads.push(read);
     }
 }
 
@@ -266,7 +284,7 @@ pub(super) trait ReadMachine<'a> {
     /// Moves the read on as far as what is back takes it, asking `out` for
     /// the work it needs next; `Some` once the read is over and nothing of it
     /// is out.
-    fn pump(&mut self, out: &mut ReadWork<'a>) -> Option<Self::Output>;
+    fn pump<S: ReadSink<'a>>(&mut self, out: &mut S) -> Option<Self::Output>;
 
     /// Takes back a finished job.
     fn job_done(&mut self, done: JobDone);
