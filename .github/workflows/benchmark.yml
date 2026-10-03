@@ -31,12 +31,6 @@ on:
   # workflow_dispatch requires actions:write on the repo, so only
   # owner / maintainers can fire it — fork PR authors cannot.
   workflow_dispatch:
-    inputs:
-      full-matrix:
-        description: "Also run the head-to-head arms the per-push run leaves out for time (zstd-22 cold writes at 70k, ~20 min more)"
-        type: boolean
-        default: false
-        required: false
 
 # Strict serialisation across the entire repo: the self-hosted
 # bench host is shared with future cross-engine benches (RocksDB
@@ -151,17 +145,14 @@ jobs:
     # The whole job, every bench in it, fits in 30 minutes on a warm cache:
     # the three builds side by side, the db_bench pass, the head-to-head
     # matrix and the publishing. Each bench step has its own limit below, so
-    # an overrun fails at the bench that caused it. The full matrix (a manual
-    # dispatch with `full-matrix`) adds RocksDB's zstd-22 cold writes at 70k,
-    # ~50 s an iteration at Criterion's floor of eleven, and gets its own
-    # limit.
+    # an overrun fails at the bench that caused it.
     #
     # On a cold cache the librocksdb-sys C++ compile (RocksDB built from
     # source via bindgen) takes 15-25 min by itself, which leaves too little
     # of the budget for the benches, so that run fails at its limit. The
     # build is saved to the cache as soon as it finishes, before any bench,
     # so the next run is warm again whatever happens to this one.
-    timeout-minutes: ${{ inputs.full-matrix && 60 || 30 }}
+    timeout-minutes: 30
     defaults:
       run:
         # Every step below is written in POSIX shell. Windows would otherwise
@@ -362,7 +353,8 @@ jobs:
             !tools/compare-rocksdb/target/criterion
           key: ${{ steps.compare-cache.outputs.cache-primary-key }}
 
-      # The db_bench pass measures for ~2.5 min on the bench runner.
+      # The db_bench pass: under a minute on an idle host, ~3 min on a loaded
+      # one.
       - name: Run benchmarks
         id: dbbench
         timeout-minutes: 6
@@ -386,16 +378,14 @@ jobs:
       # short warm-up + measurement window per scenario still yields a
       # stable median. An arm whose single iteration outlasts the window runs
       # at Criterion's floor of ten samples regardless, so what bounds the
-      # matrix is its sizes: the per-push matrix leaves out the arms that
-      # cannot fit (`cold_write_sizes` in the harness), and a dispatch with
-      # `full-matrix` runs them too.
+      # matrix is its sizes.
       - name: Run compare-rocksdb head-to-head benches
         id: compare
         # Runs whatever the db_bench pass did, so a host that cannot build
         # RocksDB still reaches the db_bench publishing below.
         if: ${{ !cancelled() }}
-        # ~12 min on the bench runner per push; the full matrix adds ~20.
-        timeout-minutes: ${{ inputs.full-matrix && 45 || 20 }}
+        # ~4 min on an idle host; the limit leaves room for a loaded one.
+        timeout-minutes: 15
         # Pin the published dashboard to the RocksDbParity preset (the apples-to-
         # apples comparison): every lsm-tree-only on-disk opt-in is OFF so the
         # numbers are not paying for protection RocksDB has no equivalent for.
@@ -404,7 +394,6 @@ jobs:
         # docs/BENCHMARKING.md.
         env:
           LSM_BENCH_PRESET: rocksdb-parity
-          COMPARE_FULL_MATRIX: ${{ inputs.full-matrix && '1' || '0' }}
           LIBCLANG_OUTCOME: ${{ steps.libclang.outcome }}
         # A workspace left by an earlier run on this runner may still hold
         # Criterion's results under target/criterion, and the summary the

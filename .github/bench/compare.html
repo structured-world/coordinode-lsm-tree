@@ -94,7 +94,7 @@
       a.href = "https://github.com/" + meta.repo + "/commit/" + meta.sha;
       a.textContent = meta.sha.slice(0, 9);
       m.appendChild(a);
-      m.appendChild(document.createTextNode(", runner " + meta.runner + ", preset " + summary.preset + ", " + summary.matrix + " matrix."));
+      m.appendChild(document.createTextNode(", runner " + meta.runner + ", preset " + summary.preset + "."));
     }
     const notes = {};
     summary.groups.forEach(function (g) { notes[g.name] = g.note; });

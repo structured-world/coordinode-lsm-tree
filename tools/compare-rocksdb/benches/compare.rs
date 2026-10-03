@@ -35,22 +35,19 @@
 //!
 //! Sample count, warm-up and measurement window are NOT set in code: the
 //! groups inherit whatever the Criterion CLI passes (the benchmark workflow
-//! runs `--sample-size 10 --warm-up-time 0.5 --measurement-time 0.5`). A
-//! group-level `sample_size(..)` silently overrides the CLI, and with the
-//! cold-write arms costing seconds per iteration (RocksDB at zstd-22 writes
-//! 10k rows in ~10 s) a 100-sample default turns a two-minute arm into
-//! twenty.
+//! runs `--sample-size 10 --warm-up-time 0.5 --measurement-time 0.5
+//! --noplot`). A group-level `sample_size(..)` silently overrides the CLI,
+//! and with the cold-write arms costing seconds per iteration a 100-sample
+//! default would multiply them tenfold.
 //!
 //! Ten samples is Criterion's floor, so an arm whose single iteration
 //! outlasts the window costs eleven iterations (the samples plus the
 //! warm-up) whatever the window says, and Criterion warns that it could not
-//! fit them. What bounds such an arm is its size, which is why the per-push
-//! matrix leaves out the arms that cannot fit (see [`cold_write_sizes`]).
-//! `COMPARE_FULL_MATRIX=1` runs them too:
+//! fit them; for those arms the cost is set by their size alone.
 //!
-//! ```text
-//! cd tools/compare-rocksdb && COMPARE_FULL_MATRIX=1 cargo bench
-//! ```
+//! After the run the harness writes `summary.json` next to Criterion's
+//! results (see [`write_summary`]): every arm's mean and confidence interval
+//! and what each group measures, which the published page is drawn from.
 //!
 //! Warm read arms open their on-disk state ONCE per arm (see
 //! [`WarmEngine`]): Criterion re-enters a `bench_with_input` routine
@@ -116,9 +113,8 @@
 //!
 //! Each of the above also has a `_zstd22` sibling. The read siblings run 70k
 //! only, the one size whose working set overflows the block cache so a read
-//! decodes a block at all (see [`read_sizes`]); `write_throughput_zstd22`
-//! and `overwrite_zstd22` run 1k and 10k, and 70k in the full matrix (see
-//! [`cold_write_sizes`]).
+//! decodes a block at all (see [`read_sizes`]); the write siblings run every
+//! size.
 //!
 //! Values carry the compressibility RocksDB's own `db_bench` gives its values
 //! by default (see [`ValuePool`]), and every RocksDB read borrows the value
@@ -398,38 +394,6 @@ fn active_preset() -> Preset {
         );
         p
     })
-}
-
-/// Whether this run measures the full matrix, including the arms the
-/// per-push dashboard run leaves out for time (see [`cold_write_sizes`]).
-/// Set by `COMPARE_FULL_MATRIX=1`; resolved once and logged like the preset.
-fn full_matrix() -> bool {
-    static FULL: std::sync::OnceLock<bool> = std::sync::OnceLock::new();
-    *FULL.get_or_init(|| {
-        let full = std::env::var("COMPARE_FULL_MATRIX").as_deref() == Ok("1");
-        eprintln!(
-            "compare-rocksdb: matrix = {} (set COMPARE_FULL_MATRIX=1 for the full one)",
-            if full { "full" } else { "per-push" }
-        );
-        full
-    })
-}
-
-/// Element counts of a cold-write group (`write_throughput`, `overwrite`),
-/// whose every iteration writes and flushes the whole key set.
-///
-/// At zstd-22 RocksDB writes 1.0-1.4 Kelem/s at every size, so one 70k
-/// iteration takes ~50 s on the bench runner and, at Criterion's floor of
-/// eleven iterations, its two 70k arms cost ~18 min between them: more than
-/// half of the benchmark workflow's 30-minute budget. The per-push run therefore
-/// stops these two groups at 10k, where both engines' zstd-22 write path is
-/// still compared on the same chart, and runs 70k only in the full matrix.
-/// Uncompressed, an iteration is a fraction of a second and every size runs.
-fn cold_write_sizes(compression: Compression) -> &'static [u64] {
-    match compression {
-        Compression::Zstd22 if !full_matrix() => &[1_000, 10_000],
-        Compression::None | Compression::Zstd22 => &[1_000, 10_000, 70_000],
-    }
 }
 
 /// Applies the active [`Preset`]'s on-disk feature toggles to our engine config.
@@ -854,7 +818,7 @@ fn write_throughput_variant(c: &mut Criterion, group_name: &str, compression: Co
         Compression::None => Some(skv_runtime().expect("surrealkv: tokio runtime")),
         Compression::Zstd22 => None,
     };
-    for &n in cold_write_sizes(compression) {
+    for &n in &[1_000_u64, 10_000, 70_000] {
         // Precompute the keys + values ONCE per `n` (outside the
         // criterion warmup / measurement loop), so the timed body
         // does no per-iteration allocation.
@@ -1644,7 +1608,7 @@ fn overwrite_variant(
     seeds: &mut SeedStates,
 ) {
     let mut group = c.benchmark_group(group_name);
-    for &n in cold_write_sizes(compression) {
+    for &n in &[1_000_u64, 10_000, 70_000] {
         let inputs = WorkloadInputs::build(n);
         group.throughput(Throughput::Elements(n));
         for &engine in engines_for(compression) {
@@ -2173,9 +2137,9 @@ fn collect_estimates(
     Ok(())
 }
 
-/// Writes `summary.json` beside Criterion's results: the run's preset and
-/// matrix, what each group measures, and the mean time (with its confidence
-/// interval) of every arm that ran. The published page is drawn from it.
+/// Writes `summary.json` beside Criterion's results: the run's preset, what
+/// each group measures, and the mean time (with its confidence interval) of
+/// every arm that ran. The published page is drawn from it.
 fn write_summary() -> std::io::Result<()> {
     let home = criterion_home();
     let mut results = Vec::new();
@@ -2188,7 +2152,6 @@ fn write_summary() -> std::io::Result<()> {
         .collect();
     let summary = serde_json::json!({
         "preset": active_preset().label(),
-        "matrix": if full_matrix() { "full" } else { "per-push" },
         "groups": groups,
         "results": results,
     });
