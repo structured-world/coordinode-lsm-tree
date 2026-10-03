@@ -192,6 +192,30 @@ fn a_reference_of_another_type_than_its_column_is_kept_whole() {
     );
 }
 
+/// A group whose whole-value or references column is not a byte column, or
+/// that holds a column no field and no reserved id names, is not one a writer
+/// produced, and is refused.
+#[test]
+fn value_columns_a_writer_never_produces_are_refused() {
+    let written = [
+        (STATUS, TypeTag::Bytes),
+        (SCORE, u32_le()),
+        (CELL_REFS_COLUMN, TypeTag::Bytes),
+        (WHOLE_VALUE_COLUMN, TypeTag::Bytes),
+    ];
+    assert!(check_value_columns(&written).is_ok());
+    for column in [
+        (WHOLE_VALUE_COLUMN, u32_le()),
+        (CELL_REFS_COLUMN, TypeTag::Fixed(8)),
+        (crate::table::columnar::COL_VALUE, TypeTag::Bytes),
+    ] {
+        assert!(
+            matches!(check_value_columns(&[column]), Err(Error::InvalidHeader(_))),
+            "{column:?} accepted"
+        );
+    }
+}
+
 /// A cell row that does not decode is kept whole, as written, rather than
 /// dropped or refused: the group stores what it was given.
 #[test]

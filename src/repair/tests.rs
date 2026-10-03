@@ -13600,6 +13600,140 @@ fn repair_salvages_a_frame_corrupt_blob_and_remaps_handles() -> crate::Result<()
     Ok(())
 }
 
+/// A table that is itself a salvaged replacement and also references a
+/// salvaged blob is rewritten a second time, from the replacement. That
+/// rewrite must take over the replacement's pending swap: queued as a second
+/// swap onto the replacement's own name, it would run after the first and
+/// leave the un-remapped bytes under the name the manifest gives the rewrite.
+#[test]
+#[expect(clippy::expect_used, reason = "test code")]
+fn a_salvaged_table_referencing_a_salvaged_blob_publishes_its_remapped_rewrite() -> crate::Result<()>
+{
+    use crate::config::BlockSizePolicy;
+    use crate::fs::{Fs, MemFs};
+    use crate::{AbstractTree, Config, KvSeparationOptions, SequenceNumberCounter};
+    use std::io::{Seek, SeekFrom, Write};
+    use std::sync::Arc;
+
+    let memfs = Arc::new(MemFs::new());
+    let fs_dyn: Arc<dyn Fs> = memfs.clone();
+    let root = std::path::absolute("/db")?;
+    let value = |i: u32| alloc::vec![b'a' + u8::try_from(i % 26).expect("small i"); 64];
+    let config = || {
+        Config::new(
+            &root,
+            SequenceNumberCounter::default(),
+            SequenceNumberCounter::default(),
+        )
+        .with_shared_fs(memfs.clone())
+        .data_block_size_policy(BlockSizePolicy::all(128))
+        .with_kv_separation(Some(
+            KvSeparationOptions::default().separation_threshold(16),
+        ))
+    };
+    let n = 40u32;
+
+    {
+        let crate::AnyTree::Blob(tree) = config().open()? else {
+            panic!("expected blob tree");
+        };
+        for i in 0..n {
+            tree.insert(format!("k{i:04}").as_bytes(), value(i), u64::from(i));
+        }
+        tree.flush_active_memtable(0)?;
+    }
+
+    // Damage the FIRST data block of the table, so phase one salvages it into
+    // a replacement holding the later blocks.
+    let table_path = memfs
+        .read_dir(&root.join(crate::file::TABLES_FOLDER))?
+        .into_iter()
+        .find(|e| !e.is_dir)
+        .expect("one table")
+        .path;
+    let block_offsets = recover_table(table_path.clone(), &fs_dyn)?
+        .data_block_handles()
+        .filter_map(Result::ok)
+        .map(|kh| *kh.as_ref().offset())
+        .collect::<Vec<_>>();
+    assert!(
+        block_offsets.len() > 2,
+        "the table spans several data blocks"
+    );
+    let flip_table_at = block_offsets.first().expect("a first block") + 16;
+
+    // Damage the LAST blob frame, so the blob stage salvages the blob file and
+    // every surviving reference has to be remapped.
+    let blob_path = memfs
+        .read_dir(&root.join(crate::file::BLOBS_FOLDER))?
+        .into_iter()
+        .find(|e| !e.is_dir)
+        .expect("one blob file")
+        .path;
+    let frames: Vec<_> = crate::vlog::BlobFileScanner::new(&blob_path, &*fs_dyn, 0)?
+        .collect::<crate::Result<Vec<_>>>()?;
+    let flip_blob_at = frames.last().expect("last frame").frame_end - 8;
+
+    for (path, at) in [(&table_path, flip_table_at), (&blob_path, flip_blob_at)] {
+        let mut file = memfs.open(
+            path,
+            &crate::fs::FsOpenOptions::new().read(true).write(true),
+        )?;
+        let byte = crate::file::read_exact(&*file, at, 1)?;
+        file.seek(SeekFrom::Start(at))?;
+        file.write_all(&[byte.first().expect("one byte") ^ 0xFF])?;
+    }
+    for e in memfs.read_dir(&root)? {
+        let is_version = e
+            .file_name
+            .strip_prefix('v')
+            .is_some_and(|rest| rest.parse::<u64>().is_ok());
+        if is_version || e.file_name == "current" {
+            memfs.remove_file(&e.path)?;
+        }
+    }
+
+    let report = config().repair_with_salvage(true)?;
+    assert_eq!(
+        report.salvaged, 1,
+        "the damaged table is salvaged: {report:?}"
+    );
+    assert_eq!(
+        report.blob_files_salvaged.len(),
+        1,
+        "the damaged blob is salvaged: {report:?}",
+    );
+    assert_eq!(report.recovered, 1, "one table is published: {report:?}");
+
+    // Every surviving key reads its own value: the published table is the
+    // remapped rewrite, not the replacement it was rewritten from.
+    let crate::AnyTree::Blob(tree) = config().open()? else {
+        panic!("expected blob tree");
+    };
+    let mut readable = 0u32;
+    for i in 0..n {
+        if let Some(v) = tree.get(format!("k{i:04}").as_bytes(), crate::MAX_SEQNO)? {
+            assert_eq!(&*v, value(i).as_slice(), "k{i:04} reads its own value");
+            readable += 1;
+        }
+    }
+    assert_eq!(
+        tree.get(b"k0000", crate::MAX_SEQNO)?,
+        None,
+        "the damaged first block is lost",
+    );
+    assert_eq!(
+        tree.get(format!("k{:04}", n - 1).as_bytes(), crate::MAX_SEQNO)?,
+        None,
+        "the record in the damaged frame is lost",
+    );
+    assert!(
+        readable > n / 2,
+        "the later blocks survive: {readable} of {n} keys read",
+    );
+    Ok(())
+}
+
 /// A repair that fails part-way must leave the tree byte-for-byte as it was
 /// found, so the retry re-derives everything from the untouched originals.
 /// This is what makes recovery safe without a journal: the salvaged

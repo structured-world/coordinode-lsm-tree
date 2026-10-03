@@ -959,6 +959,44 @@ fn ingested_fields_separate_per_field() -> lsm_tree::Result<()> {
     Ok(())
 }
 
+/// Rows written as cells are ingested in key order, each read back with its
+/// own fields.
+#[test]
+fn ingested_cell_rows_read_back_in_key_order() -> lsm_tree::Result<()> {
+    let folder = get_tmp_folder();
+    let tree = open(folder.path(), KvSeparationOptions::default())?;
+    let body = vec![b'b'; 1_000];
+    let mut ingestion = lsm_tree::blob_tree::ingest::BlobIngestion::new(&tree)?;
+    for key in ["a", "b", "c"] {
+        ingestion.write_cells(key.into(), &bytes(&[key.as_bytes(), &body]))?;
+    }
+    ingestion.finish()?;
+    for key in ["a", "b", "c"] {
+        assert_eq!(
+            tree.get(key, SeqNo::MAX)?.as_deref(),
+            Some(&framed(&[key.as_bytes(), &body])[..])
+        );
+    }
+    Ok(())
+}
+
+/// A row ingested out of key order is a caller's bug, refused before any of
+/// its fields reaches a blob file.
+#[test]
+#[should_panic(expected = "next key in ingestion must be ordered")]
+fn a_cell_row_ingested_out_of_order_panics() {
+    let folder = get_tmp_folder();
+    let tree = open(folder.path(), KvSeparationOptions::default()).expect("open");
+    let mut ingestion =
+        lsm_tree::blob_tree::ingest::BlobIngestion::new(&tree).expect("an ingestion");
+    ingestion
+        .write_cells("b".into(), &bytes(&[b"second"]))
+        .expect("the first row");
+    ingestion
+        .write_cells("a".into(), &bytes(&[b"first"]))
+        .expect("the out-of-order write panics before it returns");
+}
+
 /// An ingested key has no earlier version, so a reference in an ingested
 /// row would name an object no version of the key holds: it is refused.
 #[test]
