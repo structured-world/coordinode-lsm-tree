@@ -716,6 +716,56 @@ fn the_payload_of_rows_the_predicate_drops_is_not_read() -> lsm_tree::Result<()>
     Ok(())
 }
 
+/// A field a page stores under another type than declared fails the scan of
+/// the rows returned from it when the page is read late too, not only when it
+/// is decoded with the rest.
+#[test]
+fn a_mistyped_field_read_late_fails_the_rows_returned() -> lsm_tree::Result<()> {
+    let folder = get_tmp_folder();
+    let (any, tree) = open_paged(folder.path())?;
+    for i in 0..2_000u32 {
+        let price = i.to_le_bytes();
+        let body = (i ^ 0xA5A5).to_le_bytes();
+        tree.insert_cells(
+            format!("k{i:05}"),
+            &[
+                Field {
+                    column: PRICE,
+                    tag: u32_le(),
+                    cell: Cell::Value(&price),
+                },
+                // The note, stored as a number.
+                Field {
+                    column: BODY,
+                    tag: u32_le(),
+                    cell: Cell::Value(&body),
+                },
+            ],
+            u64::from(i),
+        )?;
+    }
+    tree.flush_active_memtable(0)?;
+
+    let sparse = ColumnRangePredicate {
+        column_id: PRICE,
+        lower: Some(0u32.to_be_bytes().to_vec()),
+        upper: Some(19u32.to_be_bytes().to_vec()),
+        apply: PredicateApply::Filter,
+    };
+    let notes = Projection::new()
+        .column(COL_USER_KEY)
+        .field(field(PRICE, u32_le()))
+        .field(field(BODY, TypeTag::Bytes));
+    let result: lsm_tree::Result<Vec<ColumnBatch>> = any
+        .columnar_scan(notes, Some(&sparse), SeqNo::MAX, ..)?
+        .collect();
+    assert!(
+        matches!(result, Err(lsm_tree::Error::Projection(_))),
+        "{result:?}"
+    );
+    Ok(())
+}
+
 /// A sparse predicate on a field kept in a blob file reads each row's object
 /// to judge it, but the notes beside it only from the pages that hold a row
 /// it keeps: the pages of the rows it drops give it their references alone.

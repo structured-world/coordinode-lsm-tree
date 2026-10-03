@@ -14920,6 +14920,163 @@ fn repair_hands_an_object_whose_owner_is_lost_to_the_oldest_borrower_left() -> c
     Ok(())
 }
 
+/// Of several rows left that borrow an object whose owner was lost, the one
+/// with the oldest seqno becomes its owner, wherever the tables holding them
+/// fall in the scan. An object whose owner survived is handed to no one, and
+/// tables with no reference into the lost owner's files, or rows with no blob
+/// reference at all, change nothing.
+#[test]
+#[expect(clippy::expect_used, reason = "test code")]
+fn repair_hands_a_lost_owners_object_to_its_oldest_borrower_across_tables() -> crate::Result<()> {
+    use crate::blob_tree::field_row::{FIRST_FIELD_COLUMN, Field};
+    use crate::fs::{Fs, MemFs};
+    use crate::{AbstractTree, Config, KvSeparationOptions, SequenceNumberCounter};
+    use std::sync::Arc;
+
+    const STATUS: u16 = FIRST_FIELD_COLUMN;
+    const BODY: u16 = FIRST_FIELD_COLUMN + 1;
+    let memfs = Arc::new(MemFs::new());
+    let root = std::path::absolute("/db")?;
+    let config = || {
+        Config::new(
+            &root,
+            SequenceNumberCounter::default(),
+            SequenceNumberCounter::default(),
+        )
+        .with_shared_fs(Arc::clone(&memfs) as Arc<dyn Fs>)
+        .with_kv_separation(Some(
+            KvSeparationOptions::default().separation_threshold(16),
+        ))
+        .blob_compression(crate::CompressionType::None)
+    };
+    let open = || -> crate::Result<crate::BlobTree> {
+        match config().open()? {
+            crate::AnyTree::Blob(t) => Ok(t),
+            crate::AnyTree::Standard(_) => panic!("expected blob tree"),
+        }
+    };
+    let body = vec![b'b'; 4_096];
+    let kept_body = vec![b'k'; 4_096];
+    let held_body = |tree: &crate::BlobTree,
+                     key: &str|
+     -> crate::Result<crate::blob_tree::field_row::RowCells> {
+        Ok(tree.get_cells(key, crate::MAX_SEQNO)?.expect("the row"))
+    };
+
+    {
+        let tree = open()?;
+        // The owner of `doc`'s body, in the table the manifest loss takes.
+        tree.insert_cells(
+            "doc",
+            &[Field::bytes(STATUS, b"draft"), Field::bytes(BODY, &body)],
+            0,
+        )?;
+        tree.flush_active_memtable(0)?;
+
+        // The NEWER borrower first, in an older table, beside an inline value
+        // and `kept`, whose owner stays.
+        let doc = held_body(&tree, "doc")?;
+        let doc_body = doc
+            .fields()?
+            .into_iter()
+            .find(|f| f.column == BODY)
+            .expect("the body");
+        tree.insert_cells("doc", &[Field::bytes(STATUS, b"third"), doc_body], 3)?;
+        tree.insert("note", "x", 3);
+        tree.insert_cells(
+            "kept",
+            &[
+                Field::bytes(STATUS, b"draft"),
+                Field::bytes(BODY, &kept_body),
+            ],
+            3,
+        )?;
+        drop(doc);
+        tree.flush_active_memtable(0)?;
+
+        // The OLDER borrower, in a newer table, with `kept`'s borrower.
+        let doc = held_body(&tree, "doc")?;
+        let doc_body = doc
+            .fields()?
+            .into_iter()
+            .find(|f| f.column == BODY)
+            .expect("the body");
+        let kept = held_body(&tree, "kept")?;
+        let kept_ref = kept
+            .fields()?
+            .into_iter()
+            .find(|f| f.column == BODY)
+            .expect("the body");
+        tree.insert_cells("doc", &[Field::bytes(STATUS, b"second"), doc_body], 2)?;
+        tree.insert_cells("kept", &[Field::bytes(STATUS, b"final"), kept_ref], 4)?;
+        drop((doc, kept));
+        tree.flush_active_memtable(0)?;
+
+        // A table whose only reference is into a file of its own.
+        tree.insert("other", vec![b'o'; 4_096], 5);
+        tree.flush_active_memtable(0)?;
+    }
+
+    for e in memfs.read_dir(&root)? {
+        let is_version = e
+            .file_name
+            .strip_prefix('v')
+            .is_some_and(|rest| rest.parse::<u64>().is_ok());
+        if is_version || e.file_name == "current" {
+            memfs.remove_file(&e.path)?;
+        }
+    }
+    let tables = root.join(crate::file::TABLES_FOLDER);
+    let owner = memfs
+        .read_dir(&tables)?
+        .into_iter()
+        .filter(|e| !e.is_dir)
+        .filter_map(|e| e.file_name.parse::<u64>().ok().map(|id| (id, e.path)))
+        .min_by_key(|(id, _)| *id)
+        .expect("the owner's table")
+        .1;
+    memfs.remove_file(&owner)?;
+
+    let report = config().repair()?;
+    assert_eq!(report.recovered, 3, "{report:?}");
+
+    let tree = open()?;
+    let framed = |cells: &[&[u8]]| {
+        let mut out = Vec::new();
+        for cell in cells {
+            out.extend_from_slice(&u32::try_from(cell.len()).expect("small").to_le_bytes());
+            out.extend_from_slice(cell);
+        }
+        out
+    };
+    assert_eq!(
+        tree.get("doc", crate::MAX_SEQNO)?.as_deref(),
+        Some(&framed(&[b"third", &body])[..])
+    );
+    assert_eq!(
+        tree.get("note", crate::MAX_SEQNO)?.as_deref(),
+        Some(&b"x"[..])
+    );
+    assert_eq!(
+        tree.get("kept", crate::MAX_SEQNO)?.as_deref(),
+        Some(&framed(&[b"final", &kept_body])[..])
+    );
+
+    // Overwritten, `doc`'s body is charged once, by the one row that owns it,
+    // and its file goes; `kept`'s body, owned as before, is not charged.
+    tree.insert("doc", "gone", 10);
+    tree.flush_active_memtable(0)?;
+    tree.major_compact(64_000_000, crate::MAX_SEQNO)?;
+    assert_eq!(tree.stale_blob_bytes(), 4_096, "the object is charged once");
+    tree.major_compact(64_000_000, crate::MAX_SEQNO)?;
+    assert_eq!(
+        tree.blob_file_count(),
+        2,
+        "the file that held only the object goes; `kept`'s and `other`'s stay"
+    );
+    Ok(())
+}
+
 /// A persistently unreadable blob file is left OUT of the rebuilt manifest and
 /// queued for removal: a file both omitted and left in place is an orphan the
 /// next open must sweep, and an open that cannot sweep it fails. The scan does
