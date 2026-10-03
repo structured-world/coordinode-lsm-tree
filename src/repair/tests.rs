@@ -17454,3 +17454,99 @@ fn repair_propagates_a_transport_failure() -> crate::Result<()> {
     }
     Ok(())
 }
+
+/// A salvage that loses a table's first data block re-emits the next one row
+/// by row and copies the rest verbatim. Every block it publishes must pass its
+/// own checksum: a verbatim copy carries a checksum bound to its offset, and it
+/// has to be bound to where it lands, after the re-emitted block.
+#[test]
+#[expect(clippy::expect_used, reason = "test code")]
+fn repair_with_salvage_keeps_every_block_after_a_lost_first_block_readable() -> crate::Result<()> {
+    use crate::config::BlockSizePolicy;
+    use crate::fs::{Fs, MemFs};
+    use crate::{AbstractTree, Config, SequenceNumberCounter};
+    use std::io::{Seek, SeekFrom, Write};
+    use std::sync::Arc;
+
+    let memfs = Arc::new(MemFs::new());
+    let fs_dyn: Arc<dyn Fs> = memfs.clone();
+    let root = std::path::absolute("/db")?;
+    let value = |i: u32| alloc::vec![b'a' + u8::try_from(i % 26).expect("small i"); 64];
+    let config = || {
+        Config::new(
+            &root,
+            SequenceNumberCounter::default(),
+            SequenceNumberCounter::default(),
+        )
+        .with_shared_fs(memfs.clone())
+        .data_block_size_policy(BlockSizePolicy::all(128))
+    };
+    let n = 40u32;
+    {
+        let tree = config().open()?;
+        for i in 0..n {
+            tree.insert(format!("k{i:04}").as_bytes(), value(i), u64::from(i));
+        }
+        tree.flush_active_memtable(0)?;
+    }
+    let table_path = memfs
+        .read_dir(&root.join(crate::file::TABLES_FOLDER))?
+        .into_iter()
+        .find(|e| !e.is_dir)
+        .expect("one table")
+        .path;
+    let block_offsets = recover_table(table_path.clone(), &fs_dyn)?
+        .data_block_handles()
+        .filter_map(Result::ok)
+        .map(|kh| *kh.as_ref().offset())
+        .collect::<Vec<_>>();
+    assert!(
+        block_offsets.len() > 2,
+        "the table spans several data blocks"
+    );
+    let at = block_offsets.first().expect("a first block") + 16;
+    {
+        let mut file = memfs.open(
+            &table_path,
+            &crate::fs::FsOpenOptions::new().read(true).write(true),
+        )?;
+        let byte = crate::file::read_exact(&*file, at, 1)?;
+        file.seek(SeekFrom::Start(at))?;
+        file.write_all(&[byte.first().expect("one byte") ^ 0xFF])?;
+    }
+    for e in memfs.read_dir(&root)? {
+        let is_version = e
+            .file_name
+            .strip_prefix('v')
+            .is_some_and(|rest| rest.parse::<u64>().is_ok());
+        if is_version || e.file_name == "current" {
+            memfs.remove_file(&e.path)?;
+        }
+    }
+
+    let report = config().repair_with_salvage(true)?;
+    assert_eq!(
+        report.salvaged, 1,
+        "the damaged table is salvaged: {report:?}"
+    );
+
+    // Every key reads without an error; the ones past the lost block read
+    // their values, as a suffix of the keys.
+    let tree = config().open()?;
+    let mut first_read = None;
+    for i in 0..n {
+        match tree.get(format!("k{i:04}").as_bytes(), crate::MAX_SEQNO)? {
+            Some(v) => {
+                assert_eq!(&*v, value(i).as_slice(), "k{i:04} reads its own value");
+                first_read.get_or_insert(i);
+            }
+            None => assert!(first_read.is_none(), "k{i:04} is lost after a key read"),
+        }
+    }
+    let first_read = first_read.expect("the blocks after the lost one survive");
+    assert!(
+        first_read < n / 2,
+        "only the first block is lost: k{first_read:04}"
+    );
+    Ok(())
+}
