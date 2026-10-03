@@ -1481,22 +1481,53 @@ fn overlapping_segments() -> lsm_tree::Result<(TempDir, Tree)> {
     Ok((folder, tree))
 }
 
-/// Scans `tree` with `projection` and `pred` at `seqno`, returning the rows
-/// and the bytes of the batches it yields.
+/// Scans `tree` with `projection` and `pred` at `seqno`, returning the rows,
+/// the bytes of the batches it yields, and the batches.
 fn scan_cost(
     tree: &Tree,
     projection: &[u16],
     pred: Option<&ColumnRangePredicate>,
     seqno: SeqNo,
-) -> lsm_tree::Result<(u64, u64)> {
+) -> lsm_tree::Result<(u64, u64, Vec<ColumnBatch>)> {
     let mut rows = 0_u64;
     let mut returned = 0;
+    let mut batches = Vec::new();
     for batch in tree.columnar_scan(projection, pred, seqno, ..)? {
         let batch = batch?;
         rows += u64::from(batch.row_count);
         returned += batch_bytes(&batch);
+        batches.push(batch);
     }
-    Ok((rows, returned))
+    Ok((rows, returned, batches))
+}
+
+/// The cells of column `id` across `batches`, in order: a bytes column's
+/// values, or a fixed-width column's cells.
+fn cells(batches: &[ColumnBatch], id: u16) -> Vec<Vec<u8>> {
+    let mut out = Vec::new();
+    for batch in batches {
+        let col = batch
+            .columns
+            .iter()
+            .find(|c| c.column_id == id)
+            .expect("the column is returned");
+        let rows = batch.row_count as usize;
+        if let Some(width) = col.type_tag.fixed_width() {
+            out.extend(
+                col.data
+                    .chunks_exact(usize::from(width))
+                    .map(<[u8]>::to_vec),
+            );
+            continue;
+        }
+        let off = |i: usize| {
+            let b: [u8; 4] = col.data[i * 4..i * 4 + 4].try_into().expect("an offset");
+            u32::from_le_bytes(b) as usize
+        };
+        let payload = &col.data[(rows + 1) * 4..];
+        out.extend((0..rows).map(|i| payload[off(i)..off(i + 1)].to_vec()));
+    }
+    out
 }
 
 #[test]
@@ -1515,13 +1546,18 @@ fn a_merged_scan_with_a_selective_predicate_copies_only_the_rows_it_keeps() -> l
     let m = tree.metrics();
     let before = m.bytes_copied();
 
-    let (rows, returned) = scan_cost(
+    let (rows, returned, batches) = scan_cost(
         &tree,
         &[COL_USER_KEY, COL_SEQNO, COL_VALUE],
         Some(&pred),
         SeqNo::MAX,
     )?;
     assert_eq!(rows, 15, "the predicate keeps keys 700 to 714");
+    assert_eq!(
+        cells(&batches, COL_USER_KEY),
+        (700..=714).map(key).collect::<Vec<_>>(),
+        "the rows kept are exactly the keys the predicate selects",
+    );
     assert_eq!(
         m.bytes_copied() - before,
         returned,
@@ -1545,10 +1581,18 @@ fn a_merged_scan_with_a_seqno_predicate_judges_the_effective_seqnos() -> lsm_tre
     let m = tree.metrics();
     let before = m.bytes_copied();
 
-    let (rows, returned) = scan_cost(&tree, &[COL_SEQNO, COL_VALUE], Some(&pred), SeqNo::MAX)?;
+    let (rows, returned, batches) =
+        scan_cost(&tree, &[COL_SEQNO, COL_VALUE], Some(&pred), SeqNo::MAX)?;
     assert_eq!(
         rows, 800,
         "keys 700 to 1499 were written at seqno 2_700 or later"
+    );
+    assert_eq!(
+        cells(&batches, COL_SEQNO),
+        (2_700_u64..3_500)
+            .map(|s| s.to_le_bytes().to_vec())
+            .collect::<Vec<_>>(),
+        "each kept row is the newest version of its key, at its effective seqno",
     );
     assert_eq!(
         m.bytes_copied() - before,
@@ -1582,7 +1626,7 @@ fn a_deduped_segment_scan_with_a_selective_predicate_copies_only_the_rows_it_kee
     let m = tree.metrics();
     let before = m.bytes_copied();
 
-    let (rows, returned) = scan_cost(&tree, &[COL_VALUE], Some(&pred), SeqNo::MAX)?;
+    let (rows, returned, _) = scan_cost(&tree, &[COL_VALUE], Some(&pred), SeqNo::MAX)?;
     assert_eq!(rows, 15, "the predicate keeps keys 500 to 514");
     assert_eq!(
         m.bytes_copied() - before,
@@ -1603,7 +1647,7 @@ fn a_snapshot_straddling_one_segment_copies_only_the_projected_rows_it_sees() ->
     let m = tree.metrics();
     let before = m.bytes_copied();
 
-    let (rows, returned) = scan_cost(&tree, &[COL_VALUE], None, 500)?;
+    let (rows, returned, _) = scan_cost(&tree, &[COL_VALUE], None, 500)?;
     assert_eq!(rows, 500, "the rows written below seqno 500 are visible");
     assert_eq!(
         m.bytes_copied() - before,
