@@ -11,6 +11,12 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 
 ## [Unreleased]
 
+## [5.11.15](https://github.com/structured-world/coordinode-lsm-tree/compare/v5.11.14...v5.11.15) - 2026-10-03
+
+### Fixed
+
+- *(blob_tree)* report a dangling indirection as an error (5.x.x) ([#812](https://github.com/structured-world/coordinode-lsm-tree/pull/812))
+
 ## [5.11.14](https://github.com/structured-world/coordinode-lsm-tree/compare/v5.11.13...v5.11.14) - 2026-10-03
 
 ### Fixed
