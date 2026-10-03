@@ -2217,12 +2217,101 @@ impl SstLayout {
     };
 }
 
-/// Waits until `limiter`, when there is one, admits a read of `bytes`.
-fn pace(limiter: Option<&RateLimiter>, bytes: u64) {
-    if let Some(limiter) = limiter {
-        // A scrub has no stop signal, so the wait always ends in a read.
-        let stopped = limiter.request_interruptible(bytes, || false);
-        debug_assert!(!stopped, "a scrub is never stopped midway");
+/// What the section walks read an SST through: a seekable byte reader.
+#[cfg(feature = "std")]
+trait ScanRead: std::io::Read + std::io::Seek {}
+#[cfg(feature = "std")]
+impl<T: std::io::Read + std::io::Seek> ScanRead for T {}
+/// What the section walks read an SST through: a seekable byte reader.
+#[cfg(not(feature = "std"))]
+trait ScanRead: io::Read + io::Seek {}
+#[cfg(not(feature = "std"))]
+impl<T: io::Read + io::Seek> ScanRead for T {}
+
+/// An SST opened for a scan whose every read of the file is charged to the
+/// limiter, when there is one, before it is made: the bytes the buffered
+/// walk pulls in, trailer and TOC included, never a length a header or the
+/// TOC declares.
+struct PacedFile<'a> {
+    inner: Box<dyn crate::fs::FsFile>,
+    limiter: Option<&'a RateLimiter>,
+    /// Where the next read starts, and where the file ends.
+    pos: u64,
+    len: u64,
+}
+
+impl<'a> PacedFile<'a> {
+    fn new(
+        mut inner: Box<dyn crate::fs::FsFile>,
+        limiter: Option<&'a RateLimiter>,
+    ) -> io::Result<Self> {
+        #[cfg(not(feature = "std"))]
+        use io::{Seek, SeekFrom};
+        #[cfg(feature = "std")]
+        use std::io::{Seek, SeekFrom};
+
+        let len = inner.seek(SeekFrom::End(0))?;
+        let pos = inner.seek(SeekFrom::Start(0))?;
+        Ok(Self {
+            inner,
+            limiter,
+            pos,
+            len,
+        })
+    }
+}
+
+#[cfg(feature = "std")]
+impl std::io::Read for PacedFile<'_> {
+    fn read(&mut self, buf: &mut [u8]) -> std::io::Result<usize> {
+        self.pace(buf.len());
+        let read = self.inner.read(buf)?;
+        self.pos += read as u64;
+        Ok(read)
+    }
+}
+
+#[cfg(not(feature = "std"))]
+impl io::Read for PacedFile<'_> {
+    fn read(&mut self, buf: &mut [u8]) -> io::Result<usize> {
+        self.pace(buf.len());
+        let read = self.inner.read(buf)?;
+        self.pos += read as u64;
+        Ok(read)
+    }
+}
+
+#[cfg(feature = "std")]
+impl std::io::Seek for PacedFile<'_> {
+    fn seek(&mut self, to: std::io::SeekFrom) -> std::io::Result<u64> {
+        self.pos = self.inner.seek(to)?;
+        Ok(self.pos)
+    }
+}
+
+#[cfg(not(feature = "std"))]
+impl io::Seek for PacedFile<'_> {
+    fn seek(&mut self, to: io::SeekFrom) -> io::Result<u64> {
+        self.pos = self.inner.seek(to)?;
+        Ok(self.pos)
+    }
+}
+
+impl PacedFile<'_> {
+    /// Waits until the limiter admits a read of up to `want` bytes, counted
+    /// only up to the file's end, which a read never goes past.
+    fn pace(&self, want: usize) {
+        let Some(limiter) = self.limiter else {
+            return;
+        };
+        // Zero past the end, where a seek may land: no byte is left to read.
+        let left = self.len.saturating_sub(self.pos);
+        let bytes = (want as u64).min(left);
+        if bytes > 0 {
+            // A scrub has no stop signal, so the wait always ends in a read.
+            let stopped = limiter.request_interruptible(bytes, || false);
+            debug_assert!(!stopped, "a scrub is never stopped midway");
+        }
     }
 }
 
@@ -2255,7 +2344,10 @@ fn scan_sst_blocks(
     #[cfg(feature = "std")]
     use std::io::{Seek, SeekFrom};
 
-    let mut file = fs.open(path, &crate::fs::FsOpenOptions::new().read(true))?;
+    let mut file = PacedFile::new(
+        fs.open(path, &crate::fs::FsOpenOptions::new().read(true))?,
+        limiter,
+    )?;
 
     // The SFA trailer + TOC live at the tail of the file.
     // crate::sfa::Reader::from_reader leaves the cursor at an undefined
@@ -2353,7 +2445,6 @@ fn scan_sst_blocks(
             // blob-link list would launder it. Rot INSIDE a structurally
             // valid payload (a flipped id byte) remains undetectable here —
             // these sections have no integrity bytes to check against.
-            pace(limiter, entry.len());
             match raw_section_shape_error(&mut reader, entry.name(), entry.pos(), entry.len()) {
                 Ok(Some(reason)) => {
                     errors.push(BlockVerifyError::TocCorrupted {
@@ -2452,7 +2543,6 @@ fn scan_sst_blocks(
             ecc,
             ecc_unrecognized,
             expected_roles,
-            limiter,
         };
         walk_block_region(&mut ctx, start, end);
     }
@@ -2665,16 +2755,16 @@ pub(crate) fn toc_may_hide_deletion_section(toc: &crate::sfa::Toc, toc_pos: u64)
 /// `Err` is a TRANSIENT read/seek fault (retryable I/O), kept distinct from a
 /// structural shape defect (`Ok(Some(reason))`) so the caller can route it to an
 /// I/O finding the repair verdict treats as retryable rather than as corruption.
-fn raw_section_shape_error(
-    reader: &mut io::BufReader<Box<dyn crate::fs::FsFile>>,
+fn raw_section_shape_error<R: ScanRead>(
+    reader: &mut R,
     name: &[u8],
     pos: u64,
     len: u64,
 ) -> Result<Option<String>, io::Error> {
     #[cfg(not(feature = "std"))]
-    use io::{Read as _, Seek as _, SeekFrom};
+    use io::SeekFrom;
     #[cfg(feature = "std")]
-    use std::io::{Read as _, Seek as _, SeekFrom};
+    use std::io::SeekFrom;
 
     match name {
         b"linked_blob_files" => {
@@ -2763,8 +2853,8 @@ fn block_data_length_cap(max_enc_overhead: u32) -> u64 {
 /// Bundles the per-walk accumulators (file cursor, reused data
 /// buffer, counters, error sink) into one borrow so the function
 /// signature stays under clippy's argument-count cap.
-struct WalkCtx<'a> {
-    reader: &'a mut io::BufReader<Box<dyn crate::fs::FsFile>>,
+struct WalkCtx<'a, 'l> {
+    reader: &'a mut io::BufReader<PacedFile<'l>>,
     table_id: TableId,
     path: &'a Path,
     data_buf: &'a mut Vec<u8>,
@@ -2801,11 +2891,9 @@ struct WalkCtx<'a> {
     /// `block_type` is not in the list is reported — see the helper's docs
     /// for why this check is load-bearing.
     expected_roles: &'static [crate::table::block::BlockType],
-    /// Charged each block's on-disk bytes before its payload is read.
-    limiter: Option<&'a RateLimiter>,
 }
 
-fn walk_block_region(ctx: &mut WalkCtx<'_>, start_offset: u64, end_offset: u64) {
+fn walk_block_region(ctx: &mut WalkCtx<'_, '_>, start_offset: u64, end_offset: u64) {
     #[cfg(not(feature = "std"))]
     use io::Read;
     #[cfg(feature = "std")]
@@ -3024,9 +3112,6 @@ fn walk_block_region(ctx: &mut WalkCtx<'_>, start_offset: u64, end_offset: u64) 
             return;
         }
 
-        // The header and the bounded payload and parity: what the block holds
-        // on disk.
-        pace(ctx.limiter, header_len + on_disk_payload);
         let data_length = header.data_length as usize;
         ctx.data_buf.resize(data_length, 0);
         // `as_mut_slice` returns the whole `Vec` (exactly `data_length`

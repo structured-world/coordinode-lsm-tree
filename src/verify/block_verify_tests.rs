@@ -1063,6 +1063,67 @@ fn walk_block_region_reports_data_read_error_on_truncated_data_segment() -> crat
     Ok(())
 }
 
+/// A rated scan is charged the bytes it reads, never a length the TOC
+/// declares: a re-stamped TOC that gives a raw section a terabyte must not
+/// make the scan wait out that terabyte before it reports the TOC corrupt.
+#[test]
+#[expect(
+    clippy::indexing_slicing,
+    clippy::cast_possible_truncation,
+    reason = "synthetic SFA forgery: the offsets are in bounds by construction and the \
+              archive is under 1 KiB"
+)]
+fn a_rated_scan_charges_the_bytes_read_not_a_forged_section_length() -> crate::Result<()> {
+    use crate::fs::{Fs, FsOpenOptions, StdFs};
+
+    const TRAILER_LEN: usize = 4 + 1 + 1 + 16 + 8 + 8;
+    let mut archive_bytes: Vec<u8> = Vec::new();
+    {
+        let mut writer = crate::sfa::Writer::from_writer(std::io::Cursor::new(&mut archive_bytes));
+        writer.start("meta_separator").unwrap();
+        writer.write_all(&[0u8; 16]).unwrap();
+        writer.finish().unwrap();
+    }
+    let trailer_start = archive_bytes.len() - TRAILER_LEN;
+    let field = |at: usize| -> usize {
+        u64::from_le_bytes(archive_bytes[at..at + 8].try_into().unwrap()) as usize
+    };
+    let (toc_pos, toc_len) = (field(trailer_start + 22), field(trailer_start + 30));
+    // The only entry's length, past `TOC!`, the entry count and its position.
+    let len_at = toc_pos + 4 + 4 + 8;
+    archive_bytes[len_at..len_at + 8].copy_from_slice(&(1u64 << 40).to_le_bytes());
+    let checksum = crate::hash::hash128(&archive_bytes[toc_pos..toc_pos + toc_len]);
+    let checksum_at = trailer_start + 4 + 1 + 1;
+    archive_bytes[checksum_at..checksum_at + 16].copy_from_slice(&checksum.to_le_bytes());
+
+    let dir = tempfile::tempdir()?;
+    let path = dir.path().join("forged.sst");
+    {
+        let mut f = StdFs.open(
+            &path,
+            &FsOpenOptions::new().write(true).create(true).truncate(true),
+        )?;
+        f.write_all(&archive_bytes)?;
+    }
+
+    let limiter = crate::rate_limiter::RateLimiter::new(1 << 20);
+    let start = std::time::Instant::now();
+    let scan = scan_sst_blocks(&StdFs, &path, 9, SstLayout::PLAIN, Some(&limiter))?;
+    let elapsed = start.elapsed();
+    assert!(
+        elapsed < std::time::Duration::from_secs(2),
+        "the scan waited {elapsed:?} on a forged section length"
+    );
+    assert!(
+        scan.errors
+            .iter()
+            .any(|e| matches!(e, BlockVerifyError::TocCorrupted { .. })),
+        "the forged length is still reported: {:?}",
+        scan.errors,
+    );
+    Ok(())
+}
+
 /// The parity-trailer drain reports a truncated read when an SST whose ECC
 /// descriptor claims per-block parity is missing those trailer bytes. Forges
 /// a `data` section of header + its full payload (so the data read and its
