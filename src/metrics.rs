@@ -127,6 +127,23 @@ pub struct Metrics {
     /// same terms as `blob_bytes_io_requested`.
     pub(crate) blob_read_io: AtomicUsize,
 
+    /// The share of `blob_bytes_io_requested` read ahead of being asked for:
+    /// the coalesced spans a scan or a projected scan reads at once, gaps
+    /// between their records included.
+    pub(crate) blob_bytes_prefetched: AtomicU64,
+
+    /// Bytes of the batches a projected columnar scan handed to its caller:
+    /// the values it materialised, per row it returned.
+    pub(crate) bytes_materialized: AtomicU64,
+
+    /// Of the payload pages a projected scan read for its chosen rows only,
+    /// the bytes of those rows' cells, as decoded.
+    pub(crate) payload_bytes_useful: AtomicU64,
+
+    /// Of the same pages, the bytes of the other rows' cells: what a page
+    /// holding a chosen row brings along.
+    pub(crate) payload_bytes_incidental: AtomicU64,
+
     /// Blob value bytes produced after decompression, decryption and
     /// validation — the blob-side twin of `block_bytes_decoded`, summed into
     /// [`Metrics::bytes_decoded`] for the same reason.
@@ -303,6 +320,54 @@ impl Metrics {
     /// across interleaved files need a request per file per stretch.
     pub fn blob_read_count(&self) -> usize {
         self.blob_read_io.load(Relaxed)
+    }
+
+    /// The share of [`Self::blob_bytes_read`] read ahead: the coalesced spans
+    /// a scan reads before it asks for each value in them, the gaps it reads
+    /// to merge two records into one request included.
+    pub fn blob_bytes_prefetched(&self) -> u64 {
+        self.blob_bytes_prefetched.load(Relaxed)
+    }
+
+    /// Bytes of the batches projected columnar scans handed out: what they
+    /// materialised for the rows they returned, and nothing for a row they
+    /// dropped.
+    pub fn bytes_materialized(&self) -> u64 {
+        self.bytes_materialized.load(Relaxed)
+    }
+
+    /// Of the payload pages projected scans read for their chosen rows only,
+    /// the decoded bytes of those rows' cells: the useful part of what was
+    /// read, beside [`Self::payload_bytes_incidental`].
+    pub fn payload_bytes_useful(&self) -> u64 {
+        self.payload_bytes_useful.load(Relaxed)
+    }
+
+    /// Of the same pages, the decoded bytes of the rows not chosen: a page
+    /// holding one chosen row is read whole, and this is what came with it.
+    /// It reports where the chosen rows sit, one per page or together, apart
+    /// from how many there are.
+    pub fn payload_bytes_incidental(&self) -> u64 {
+        self.payload_bytes_incidental.load(Relaxed)
+    }
+
+    /// Records what a projected scan handed out.
+    #[inline]
+    pub(crate) fn record_materialized(&self, bytes: usize) {
+        self.bytes_materialized.fetch_add(bytes as u64, Relaxed);
+    }
+
+    /// Records the chosen rows' cells taken from payload pages read for them.
+    #[inline]
+    pub(crate) fn record_payload_useful(&self, bytes: u64) {
+        self.payload_bytes_useful.fetch_add(bytes, Relaxed);
+    }
+
+    /// Records what payload pages read for chosen rows held besides their
+    /// cells, once the pages are done with.
+    #[inline]
+    pub(crate) fn record_payload_incidental(&self, bytes: u64) {
+        self.payload_bytes_incidental.fetch_add(bytes, Relaxed);
     }
 
     /// Bytes moved by a gather — accumulation, filtering, row gathering and

@@ -2328,7 +2328,12 @@ impl Tree {
     where
         F: Fn(&Version, InternalValue) -> crate::Result<ScanSinceEvent>,
     {
-        if entry.key.value_type == ValueType::Indirection {
+        // A cell row may reference blob objects, so it resolves where an
+        // indirection does.
+        if matches!(
+            entry.key.value_type,
+            ValueType::Indirection | ValueType::CellRow
+        ) {
             return resolve_indirection(version, entry);
         }
         let seqno = entry.key.seqno;
@@ -2352,7 +2357,9 @@ impl Tree {
             // diverge from the source.
             ValueType::Tombstone => ScanSinceEvent::PointTombstone { key, seqno },
             ValueType::WeakTombstone => ScanSinceEvent::WeakTombstone { key, seqno },
-            ValueType::Indirection => unreachable!("Indirection handled above"),
+            ValueType::Indirection | ValueType::CellRow => {
+                unreachable!("Indirection and CellRow handled above")
+            }
         })
     }
 
@@ -5101,6 +5108,80 @@ impl Tree {
     #[doc(hidden)]
     #[must_use]
     pub fn append_entry(&self, value: InternalValue) -> (u64, u64) {
+        let kv_digest = self.insert_digest(&value);
+
+        // The `.read()` guard is a temporary that lives until the end of this
+        // statement, so the insert runs under the version-history read lock:
+        // `value` + its digest land in the current active memtable atomically,
+        // and a concurrent `rotate_memtable()` cannot seal it mid-insert.
+        self.version_history
+            .read()
+            .latest_version_ref()
+            .active_memtable
+            .insert_with_kv_digest(value, kv_digest)
+    }
+
+    /// Adds a cell row whose references are `refs` to the active memtable,
+    /// once each reference is shown to name a frame the current version still
+    /// holds.
+    ///
+    /// The check and the insert run under the version-history read lock, the
+    /// lock a version install takes for writing: an install that removes or
+    /// punches a blob file sees this row's registration in the memtable, or
+    /// this check sees the file gone.
+    ///
+    /// # Errors
+    ///
+    /// [`crate::Error::BlobRef`] when a reference names a blob file the current
+    /// version no longer holds, or a frame before that file's live start: a
+    /// relocation has moved it, and the key's latest version names the copy.
+    /// Also when its object was released after the version it was read from
+    /// (each reference comes with that version's id).
+    pub(crate) fn append_cell_row(
+        &self,
+        value: InternalValue,
+        refs: &[(crate::blob_tree::handle::BlobIndirection, u64)],
+    ) -> crate::Result<(u64, u64)> {
+        let kv_digest = self.insert_digest(&value);
+        let history = self.version_history.read();
+        let latest = history.latest_version_ref();
+        for (reference, source) in refs {
+            let held = latest
+                .version
+                .blob_files
+                .get(reference.vhandle.blob_file_id)
+                .is_some_and(|file| reference.vhandle.offset >= file.live_data_start());
+            if !held {
+                return Err(crate::Error::BlobRef(
+                    "stale reference: the object has moved, read the key again",
+                ));
+            }
+            // An object let go of since the read: writing it back would make
+            // this row hold what the accounting already charged as garbage.
+            if history
+                .released()
+                .released_since(*source, &reference.vhandle)
+            {
+                return Err(crate::Error::BlobRef(
+                    "stale reference: the object was released, read the key again",
+                ));
+            }
+        }
+        let inserted = latest
+            .active_memtable
+            .insert_with_kv_digest(value, kv_digest);
+        // Held through the insert: the check above is only as good as the
+        // version it read staying the latest until the row is in.
+        drop(history);
+        Ok(inserted)
+    }
+
+    /// The insert-time per-KV digest of `value`, when the runtime config asks
+    /// for one.
+    fn insert_digest(
+        &self,
+        value: &InternalValue,
+    ) -> Option<(u32, crate::runtime_config::ChecksumAlgorithm)> {
         // Per-KV residence digest (KvChecksumComputePoint::AtInsert): compute
         // the entry's 4-byte logical-content digest now, so a RAM bit-flip
         // while it sits in the memtable is caught at flush. The digest covers
@@ -5115,8 +5196,8 @@ impl Tree {
             .0
             .kv_digest_at_insert
             .load(core::sync::atomic::Ordering::Relaxed);
-        let kv_digest = inner::kv_digest_algo_from_gate(gate).and_then(|algo| {
-            crate::table::block::kv_checksum::kv_digest(&value, algo).map(|d| {
+        inner::kv_digest_algo_from_gate(gate).and_then(|algo| {
+            crate::table::block::kv_checksum::kv_digest(value, algo).map(|d| {
                 #[expect(
                     clippy::cast_possible_truncation,
                     reason = "AtInsert is config-validated to a 4-byte algorithm; the digest fits u32"
@@ -5124,17 +5205,7 @@ impl Tree {
                 let lo = d as u32;
                 (lo, algo)
             })
-        });
-
-        // The `.read()` guard is a temporary that lives until the end of this
-        // statement, so the insert runs under the version-history read lock:
-        // `value` + its digest land in the current active memtable atomically,
-        // and a concurrent `rotate_memtable()` cannot seal it mid-insert.
-        self.version_history
-            .read()
-            .latest_version_ref()
-            .active_memtable
-            .insert_with_kv_digest(value, kv_digest)
+        })
     }
 
     /// Adds multiple items to the active memtable in bulk.

@@ -134,19 +134,30 @@ impl LinkedBlobFiles {
     /// Records that the table's entry at `key` points at a value of `bytes`
     /// (`on_disk_bytes` stored) in `blob_file_id`. Keys arrive in order, so
     /// the first key seen for a file is its first and the latest its last.
+    ///
+    /// Only an `owned` reference adds to the counts: the counts are what
+    /// dropping the table charges to the file, and an object is charged
+    /// through its owner alone. A borrowed one still links the file, which is
+    /// what keeps it from being removed or relocated under this table.
     pub(crate) fn register(
         &mut self,
         blob_file_id: BlobFileId,
         bytes: u64,
         on_disk_bytes: u64,
         key: &UserKey,
+        owned: bool,
     ) {
+        let (len, bytes, on_disk_bytes) = if owned {
+            (1, bytes, on_disk_bytes)
+        } else {
+            (0, 0, 0)
+        };
         match self.files.entry(blob_file_id) {
             hashbrown::hash_map::Entry::Occupied(mut entry) => {
                 let link = entry.get_mut();
                 link.bytes += bytes;
                 link.on_disk_bytes += on_disk_bytes;
-                link.len += 1;
+                link.len += len;
                 // The record grows or shrinks by the change in its last key.
                 self.records_len = self.records_len - link.last_key.len() as u64 + key.len() as u64;
                 link.last_key.clone_from(key);
@@ -157,7 +168,7 @@ impl LinkedBlobFiles {
                     blob_file_id,
                     bytes,
                     on_disk_bytes,
-                    len: 1,
+                    len,
                     first_key: key.clone(),
                     last_key: key.clone(),
                 });
@@ -280,13 +291,19 @@ struct DirectBlockInputs {
     zone_block_min: Option<UserKey>,
 }
 
-/// One blob file a table references: how many of its values the table points
-/// at, their bytes, and the span of the table's keys that point there.
+/// One blob file a table references: how many of its objects the table owns,
+/// their bytes, and the span of the table's keys that point there.
+///
+/// A table whose rows only borrow objects of the file (cell-row references
+/// whose owner lives in another version) links it with zero counts.
 #[derive(Clone, PartialEq, Eq, Debug, core::hash::Hash)]
 pub struct LinkedFile {
     pub blob_file_id: BlobFileId,
+    /// Bytes of the objects the table owns, before compression.
     pub bytes: u64,
+    /// Bytes of the objects the table owns, as stored.
     pub on_disk_bytes: u64,
+    /// Objects of the file the table owns.
     pub len: usize,
     /// The table's first key whose value lives in this blob file.
     pub first_key: UserKey,
@@ -1988,6 +2005,19 @@ impl Writer {
         self
     }
 
+    /// Sets up a columnar table of a tree whose rows may be written as cells
+    /// ([`ValueLayout::Cells`](crate::table::meta::ValueLayout::Cells)): its
+    /// blocks split each cell row into the columns of its fields. Must be set
+    /// before the first key is written; `false` leaves the writer as it is.
+    #[must_use]
+    pub(crate) fn use_cell_rows(self, cell_rows: bool) -> Self {
+        if cell_rows {
+            self.use_value_layout(crate::table::meta::ValueLayout::Cells)
+        } else {
+            self
+        }
+    }
+
     /// Records that a columnar block storing values as `layout` is written:
     /// the first fixes the table's layout, and one of the other layout is
     /// refused, since the descriptor records one per table.
@@ -2512,9 +2542,15 @@ impl Writer {
         item_count: usize,
         zone_block_min: Option<crate::UserKey>,
     ) -> crate::Result<()> {
-        // The transpose keeps each row's value whole, as it was written.
-        self.claim_value_layout(crate::table::meta::ValueLayout::Whole)?;
-        let batch = crate::table::columnar::entries_to_column_batch(&self.chunk)?;
+        // The transpose keeps each row's value whole, as it was written, or,
+        // in a table set up for cell rows, splits each cell row into its
+        // fields and keeps every other value whole.
+        let batch = if self.value_layout == Some(crate::table::meta::ValueLayout::Cells) {
+            crate::table::columnar::entries_to_cells_batch(&self.chunk)?
+        } else {
+            self.claim_value_layout(crate::table::meta::ValueLayout::Whole)?;
+            crate::table::columnar::entries_to_column_batch(&self.chunk)?
+        };
         self.encode_columnar_batch_block(
             &batch,
             last_key,
@@ -2898,6 +2934,12 @@ impl Writer {
         // Validate the batch shape and obtain per-row keys / seqnos / value-types.
         // The framed values feed the shape accounting; the block stores the
         // consumer's sub-columns (not a re-transpose).
+        // An ingested batch names only field ids: one the engine keeps would
+        // make the group read as rows written as cells.
+        if require_zero_seqno {
+            let value_cols = batch.columns.get(3..).unwrap_or_default();
+            crate::table::columnar::check_ingested_field_ids(value_cols)?;
+        }
         let entries = crate::table::columnar::column_batch_to_entries(batch)?;
 
         // Ingest contract. Unsorted keys would corrupt the sorted block index /

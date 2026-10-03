@@ -76,6 +76,14 @@
 //! [`ValueProjector`](projection::ValueProjector); a table that stores the
 //! value split into fields yields them as its columns, and a field it lacks is
 //! absent. See [`projection`] for the absence rule every source follows.
+//!
+//! # Blob trees
+//!
+//! The index of a blob tree holds rows written as cells, whose fields sit
+//! inline or in blob files, and whole values, inline or in a blob file. Every
+//! source of it is merged and its rows decided on their keys, seqnos and value
+//! types; only the rows the scan returns have their fields read, and a blob
+//! object only when a projected field needs it. See [`cells`].
 
 use core::ops::{Bound, RangeBounds};
 
@@ -95,6 +103,7 @@ use crate::table::columnar_predicate::{
 };
 use crate::{Error, SeqNo, Table, Tree, UserKey};
 
+mod cells;
 mod merge;
 pub mod projection;
 mod rows;
@@ -138,6 +147,10 @@ struct Segment {
     /// Whether the segment stores each value whole, so its declared fields
     /// are read out of the value through the projector.
     whole: bool,
+    /// Whether the segment is a blob tree's columnar table, which splits rows
+    /// written as cells into the columns of their fields and keeps every
+    /// other value whole beside them.
+    cells: bool,
 }
 
 impl Segment {
@@ -335,6 +348,33 @@ impl Tree {
             operator,
             blob_source: self.blob_source(),
         });
+        // The index of a blob tree: its rows' fields are read by the engine,
+        // out of rows written as cells and the objects they reference, and
+        // out of whole values through the projector, a whole value kept in a
+        // blob file read first. Every value column is a field: one projected
+        // by id alone, or a predicate on one no field declares, would read a
+        // stored representation (a cell row, an indirection) rather than a
+        // value, so a field is declared with its type.
+        let cells = self.blob_source().map(|source| cells::CellSource {
+            version: super_version.clone(),
+            source,
+        });
+        if cells.is_some() {
+            let intrinsic = |id: u16| matches!(id, COL_USER_KEY | COL_SEQNO | COL_VALUE_TYPE);
+            let loose = |id: u16| {
+                !intrinsic(id)
+                    && fields
+                        .iter()
+                        .all(|f| f.column_id() != id || !projection::is_declared(f))
+            };
+            if fields.iter().any(|f| loose(f.column_id()))
+                || predicate.is_some_and(|p| loose(p.column_id))
+            {
+                return Err(Error::Projection(
+                    "projection: a blob tree's fields are projected as declared fields",
+                ));
+            }
+        }
 
         // A declared field of a segment that stores each value whole lies
         // inside the value, which only the caller's projector reads, and only
@@ -359,6 +399,7 @@ impl Tree {
                     may_dup: true,
                     recency_rank,
                     whole: true,
+                    cells: false,
                     source: Source::Memtable(memtable),
                 });
             }
@@ -390,6 +431,7 @@ impl Tree {
                     may_dup: true,
                     recency_rank,
                     whole: true,
+                    cells: false,
                     source: Source::RowTable(table.clone()),
                 });
                 continue;
@@ -413,6 +455,7 @@ impl Tree {
                 may_dup,
                 recency_rank,
                 whole: table.metadata.value_layout == crate::table::meta::ValueLayout::Whole,
+                cells: table.metadata.value_layout == crate::table::meta::ValueLayout::Cells,
                 source: Source::Columnar(table.clone()),
             });
         }
@@ -429,6 +472,7 @@ impl Tree {
                 .flatten(),
             declared,
             resolver,
+            cells,
             predicate: predicate.cloned(),
             support: PredicateSupport::Exact,
             comparator,
@@ -609,6 +653,8 @@ struct DedupState {
 pub(super) struct SegmentCursor {
     cursor: SourceCursor,
     whole: bool,
+    /// The columns the cursor decodes.
+    ids: Vec<u16>,
 }
 
 /// A singleton group streamed from its table's cursor.
@@ -831,6 +877,10 @@ pub struct ColumnarScan {
     /// What resolves a merge operand row, when the tree merges; `None` when
     /// it has no merge operator.
     resolver: Option<Resolver>,
+    /// Where the objects of a blob tree's rows are read, when the tree is a
+    /// blob tree's index: every row returned has its fields read late (see
+    /// [`cells`]).
+    cells: Option<cells::CellSource>,
     predicate: Option<ColumnRangePredicate>,
     /// The weakest [`PredicateSupport`] over the segments read so far.
     support: PredicateSupport,
@@ -926,6 +976,42 @@ impl ColumnarScan {
         #[cfg(not(feature = "metrics"))]
         let _ = batch;
     }
+
+    /// Records `useful` bytes of chosen rows' cells taken from payload pages
+    /// read for them, and `incidental` bytes those pages held besides.
+    #[inline]
+    #[cfg_attr(
+        not(feature = "metrics"),
+        expect(
+            clippy::unused_self,
+            reason = "the scan's metrics exist only with the feature"
+        )
+    )]
+    fn record_payload(&self, useful: u64, incidental: u64) {
+        #[cfg(feature = "metrics")]
+        {
+            self.metrics.record_payload_useful(useful);
+            self.metrics.record_payload_incidental(incidental);
+        }
+        #[cfg(not(feature = "metrics"))]
+        let _ = (useful, incidental);
+    }
+
+    /// Records `bytes` a read copied out of the pages it decoded.
+    #[inline]
+    #[cfg_attr(
+        not(feature = "metrics"),
+        expect(
+            clippy::unused_self,
+            reason = "the scan's metrics exist only with the feature"
+        )
+    )]
+    fn record_copied(&self, bytes: usize) {
+        #[cfg(feature = "metrics")]
+        self.metrics.record_gather(bytes);
+        #[cfg(not(feature = "metrics"))]
+        let _ = bytes;
+    }
 }
 
 impl ColumnarScan {
@@ -962,6 +1048,10 @@ impl ColumnarScan {
     /// operands a returned row resolves, and a whole-value table whose
     /// declared fields a returned row reads out of its value.
     fn reads_late(&self, seg: &Segment) -> bool {
+        // A blob tree reads every returned row's fields late.
+        if self.cells.is_some() {
+            return true;
+        }
         self.resolver.is_some() || (seg.whole && self.declared)
     }
 
@@ -976,14 +1066,27 @@ impl ColumnarScan {
         share: u64,
     ) -> crate::Result<SegmentCursor> {
         // A whole value is carried to the rows the scan returns, for its
-        // declared fields and for the merge operands it may hold.
-        let whole = seg.whole && (self.declared || self.resolver.is_some());
+        // declared fields and for the merge operands it may hold; a scan of
+        // intrinsic columns alone reads no value.
+        let needs_values = self.declared || self.resolver.is_some();
+        let whole = seg.whole && needs_values;
         // The declared fields of a whole value lie inside it: decode the value
         // in their place. A declared field's id may be the value column's own,
         // so no predicate is pushed down; the merge filters after the fields
         // are read.
         let mut ids: Vec<u16> = projection.to_vec();
-        if whole {
+        if seg.cells && needs_values {
+            // A blob tree's columnar table keeps each field of a split row in
+            // its own column, the row's references beside them, and every
+            // other value whole under the id the merge carries whole values
+            // in: no column moves.
+            use crate::blob_tree::field_row::CELL_REFS_COLUMN;
+            for id in [CELL_REFS_COLUMN, merge::COL_WHOLE_VALUE] {
+                if !ids.contains(&id) {
+                    ids.push(id);
+                }
+            }
+        } else if whole {
             let declared: Vec<u16> = self
                 .fields
                 .iter()
@@ -1009,7 +1112,7 @@ impl ColumnarScan {
                 self.lo.clone(),
                 self.hi.clone(),
                 self.seqno,
-                ids,
+                ids.clone(),
                 share,
             ))),
             // Within the span its group was formed on: the active memtable
@@ -1028,12 +1131,53 @@ impl ColumnarScan {
                     &lo,
                     &hi,
                     self.seqno,
-                    ids,
+                    ids.clone(),
                     share,
                 )))
             }
         };
-        Ok(SegmentCursor { cursor, whole })
+        Ok(SegmentCursor { cursor, whole, ids })
+    }
+
+    /// The columns of `seg` a merge reads for its chosen rows only, as the
+    /// pairs of the id a table stores each under and the id the merge carries
+    /// it under: the fields the projection declares, but the predicate's,
+    /// and the columns a whole value or a blob tree's references are carried
+    /// in. Empty for a source read row by row, and while operands are
+    /// resolved or the raw value is read as well, whose values are needed
+    /// whole.
+    fn late_payload(&self, seg: &Segment) -> Vec<(u16, u16)> {
+        use crate::blob_tree::field_row::CELL_REFS_COLUMN;
+        use crate::table::columnar::COL_VALUE;
+
+        if seg.is_rows() || self.resolver.is_some() || self.raw_value_read() {
+            return Vec::new();
+        }
+        let predicate = self.predicate.as_ref().map(|p| p.column_id);
+        let fields = self
+            .fields
+            .iter()
+            .filter(|f| projection::is_declared(f) && Some(f.column_id()) != predicate)
+            .map(|f| (f.column_id(), f.column_id()));
+        // Without a declared field no value is read at all, a blob tree's
+        // included (a returned row's value type reads as a value regardless).
+        if seg.cells && self.declared {
+            fields
+                .chain([
+                    (CELL_REFS_COLUMN, CELL_REFS_COLUMN),
+                    (merge::COL_WHOLE_VALUE, merge::COL_WHOLE_VALUE),
+                ])
+                .collect()
+        } else if seg.whole {
+            // The declared fields lie inside the whole value.
+            if self.declared {
+                alloc::vec![(COL_VALUE, merge::COL_WHOLE_VALUE)]
+            } else {
+                Vec::new()
+            }
+        } else {
+            fields.collect()
+        }
     }
 
     /// The rows a merge returned, `batch`, with their values read: each merge
@@ -1043,9 +1187,17 @@ impl ColumnarScan {
     /// value column dropped. Only returned rows get here, so a shadowed,
     /// deleted or invisible version is never resolved or projected. Also
     /// returns which keys were resolved to a value: such a row holds no cell
-    /// of its own for a column no field declares.
-    pub(super) fn read_late(&self, batch: ColumnBatch) -> crate::Result<(ColumnBatch, Resolved)> {
+    /// of its own for a column no field declares. `judged` says the merge
+    /// already gave every row its final verdict on the predicate.
+    pub(super) fn read_late(
+        &self,
+        batch: ColumnBatch,
+        judged: bool,
+    ) -> crate::Result<(ColumnBatch, Resolved)> {
         let (batch, resolved) = self.resolve_operands(batch)?;
+        if let Some(cells) = &self.cells {
+            return Ok((cells::materialize(self, cells, batch, judged)?, resolved));
+        }
         let mut batch = if self.declared {
             projection::project_decided(
                 batch,
@@ -1367,6 +1519,11 @@ impl ColumnarScan {
         // reads it, and only an operand still to be resolved rewrites them.
         match pred.column_id {
             COL_USER_KEY | COL_SEQNO => PredicateTiming::BeforeValues,
+            // The value type is an opaque fixed-width column, which a range
+            // predicate does not judge (its support is reported unsupported
+            // and every row kept), so a blob tree's stored types (an
+            // indirection, a cell row) never decide a row before it is
+            // returned as a value.
             id if self
                 .fields
                 .iter()
@@ -1397,6 +1554,11 @@ impl ColumnarScan {
             return Ok(batch);
         }
         let mask = pred.matching_rows(&batch);
+        // Rows judged on their stored column before the gather all pass
+        // again: the batch goes on as gathered, not copied once more.
+        if mask.iter().all(|&keep| keep) {
+            return Ok(batch);
+        }
         let filtered = filter_batch(&batch, &mask)?;
         self.record_gather(&filtered);
         Ok(filtered)
@@ -1504,7 +1666,8 @@ impl ColumnarScan {
 
     /// The rows of `batch` that `mask` keeps, as the batch a singleton group
     /// yields, or `None` when it keeps none: every column but the `dropped`
-    /// ones the scan decoded for itself, gathered once, with the seqno column
+    /// ones the scan decoded for itself, gathered once (shared as decoded when
+    /// it keeps every row), with the seqno column
     /// written in the tree's global space as it is gathered (see
     /// [`Self::globalize_seqnos`]). The gather is charged.
     fn gather_kept(
@@ -1524,13 +1687,17 @@ impl ColumnarScan {
             return Ok(None);
         }
         let rows = batch.row_count as usize;
+        // Every row kept: a column goes on as decoded, shared rather than
+        // gathered, and only the seqno column is written anew.
+        let all = kept.len() == rows;
+        let mut copied = 0usize;
         let mut columns = Vec::with_capacity(batch.columns.len());
         for col in batch
             .columns
             .iter()
             .filter(|c| !dropped.contains(&c.column_id))
         {
-            columns.push(if col.column_id == COL_SEQNO && global != 0 {
+            let written = if col.column_id == COL_SEQNO && global != 0 {
                 let mut data = Vec::with_capacity(kept.len() * 8);
                 for &row in &kept {
                     let effective = fixed_u64_row(&col.data, row)?.checked_add(global).ok_or(
@@ -1547,14 +1714,22 @@ impl ColumnarScan {
                         .map(|bits| take_validity(bits, &kept)),
                     data: crate::Slice::from(data),
                 }
+            } else if all {
+                columns.push(col.clone());
+                continue;
             } else {
                 take_column(col, rows, &kept)?
-            });
+            };
+            copied += written.data.len() + written.validity.as_ref().map_or(0, Vec::len);
+            columns.push(written);
         }
         // A subset of the batch's rows, whose count is a u32.
         let row_count = u32::try_from(kept.len()).unwrap_or(batch.row_count);
         let out = ColumnBatch { row_count, columns };
-        self.record_gather(&out);
+        #[cfg(feature = "metrics")]
+        self.metrics.record_gather(copied);
+        #[cfg(not(feature = "metrics"))]
+        let _ = copied;
         Ok(Some(out))
     }
 
@@ -1729,7 +1904,8 @@ impl ColumnarScan {
     /// invisible too-new versions come first and the first visible row is the
     /// newest visible version; a run can span batch boundaries, so the last
     /// kept key carries across batches. The predicate runs AFTER dedup
-    /// (mirroring [`Self::merge_group`]): a key whose newest version fails the
+    /// (mirroring the merge of an overlapping group, [`merge::MergeStream`]): a
+    /// key whose newest version fails the
     /// predicate is dropped, never served from an older matching version —
     /// which also rules out predicate-driven zone-map block-skip here.
     ///
@@ -1985,6 +2161,8 @@ impl Iterator for ColumnarScan {
                 match next {
                     Some(Ok(batch)) => {
                         self.current = Some(stream);
+                        #[cfg(feature = "metrics")]
+                        self.metrics.record_materialized(batch.data_size());
                         return Some(Ok(batch));
                     }
                     // A failed group yields its error and is dropped; the next

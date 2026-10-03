@@ -14568,6 +14568,115 @@ fn repair_rewrites_tables_with_handles_below_a_blob_frontier() -> crate::Result<
     Ok(())
 }
 
+/// The same for rows written as cells: a recovered table whose cell row
+/// references an object below a punched blob file's frontier is rewritten,
+/// the row dropped and every other row kept.
+#[test]
+#[expect(clippy::expect_used, reason = "test code")]
+fn repair_rewrites_cell_rows_with_references_below_a_blob_frontier() -> crate::Result<()> {
+    use crate::blob_tree::field_row::{FIRST_FIELD_COLUMN, Field};
+    use crate::fs::{Fs, MemFs};
+    use crate::{AbstractTree, Config, KvSeparationOptions, SequenceNumberCounter};
+    use std::sync::Arc;
+
+    let memfs = Arc::new(MemFs::new());
+    let fs_dyn: Arc<dyn Fs> = memfs.clone();
+    let root = std::path::absolute("/db")?;
+    let open = || -> crate::Result<crate::BlobTree> {
+        match Config::new(
+            &root,
+            SequenceNumberCounter::default(),
+            SequenceNumberCounter::default(),
+        )
+        .with_shared_fs(Arc::clone(&memfs) as Arc<dyn Fs>)
+        .with_kv_separation(Some(
+            KvSeparationOptions::default().separation_threshold(16),
+        ))
+        .open()?
+        {
+            crate::AnyTree::Blob(t) => Ok(t),
+            crate::AnyTree::Standard(_) => panic!("expected blob tree"),
+        }
+    };
+
+    {
+        let tree = open()?;
+        for i in 0..8u32 {
+            tree.insert_cells(
+                format!("k{i:04}"),
+                &[
+                    Field::bytes(FIRST_FIELD_COLUMN, b"s"),
+                    Field::bytes(FIRST_FIELD_COLUMN + 1, &[b'v'; 64]),
+                ],
+                u64::from(i),
+            )?;
+        }
+        tree.flush_active_memtable(0)?;
+    }
+
+    let blobs = root.join(crate::file::BLOBS_FOLDER);
+    let blob_path = memfs
+        .read_dir(&blobs)?
+        .into_iter()
+        .find(|e| !e.is_dir)
+        .expect("one blob file")
+        .path;
+    let entries: Vec<_> = crate::vlog::BlobFileScanner::new(&blob_path, &*fs_dyn, 0)?
+        .collect::<crate::Result<Vec<_>>>()?;
+    assert!(entries.len() >= 2, "several frames written");
+    let frontier = entries.first().expect("first frame").frame_end;
+    let data_start = {
+        let mut file = fs_dyn.open(&blob_path, &crate::fs::FsOpenOptions::new().read(true))?;
+        let reader = crate::sfa::Reader::from_reader(&mut file)?;
+        reader
+            .toc()
+            .section(b"data")
+            .expect("blob file has a data section")
+            .pos()
+    };
+    memfs.punch_hole(&blob_path, data_start, frontier - data_start)?;
+    for e in memfs.read_dir(&root)? {
+        let is_version = e
+            .file_name
+            .strip_prefix('v')
+            .is_some_and(|rest| rest.parse::<u64>().is_ok());
+        if is_version || e.file_name == "current" {
+            memfs.remove_file(&e.path)?;
+        }
+    }
+
+    let report = Config::new(
+        &root,
+        SequenceNumberCounter::default(),
+        SequenceNumberCounter::default(),
+    )
+    .with_shared_fs(Arc::clone(&memfs) as Arc<dyn Fs>)
+    .with_kv_separation(Some(
+        KvSeparationOptions::default().separation_threshold(16),
+    ))
+    .repair()?;
+    assert_eq!(
+        report.recovered, 1,
+        "the table survives, rewritten: {report:?}"
+    );
+    assert_eq!(report.salvaged, 1, "{report:?}");
+
+    let tree = open()?;
+    assert_eq!(
+        tree.get(b"k0000", crate::MAX_SEQNO)?,
+        None,
+        "the row referencing the punched record reads as absent"
+    );
+    for i in 1..8u32 {
+        assert!(
+            tree.get(format!("k{i:04}").as_bytes(), crate::MAX_SEQNO)?
+                .is_some(),
+            "row k{i:04} above the frontier must survive the rewrite",
+        );
+    }
+    Ok(())
+}
+
 /// A persistently unreadable blob file is left OUT of the rebuilt manifest and
 /// queued for removal: a file both omitted and left in place is an orphan the
 /// next open must sweep, and an open that cannot sweep it fails. The scan does

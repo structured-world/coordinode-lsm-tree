@@ -9,7 +9,6 @@ use crate::tree::inner::{CompactionGuard, VersionsReadGuard};
 use crate::{
     BlobFile, Config, HashSet, InternalValue, SeqNo, SequenceNumberCounter,
     SharedSequenceNumberGenerator, Table, TableId, UserKey,
-    blob_tree::FragmentationMap,
     compaction::{
         Choice,
         filter::{Context, FilterBlobOutput, StreamFilterAdapter, TransformCounters},
@@ -1660,6 +1659,7 @@ fn run_tight_space_compaction(
             let mut new_blobs: Vec<BlobFile> = produced.created_blob_files().to_vec();
             let frag = produced.blob_frag_map().clone();
             let gc_diff = if frag.is_empty() { None } else { Some(frag) };
+            let released_objects = produced.released_objects().to_vec();
 
             // Advance the cumulative frontier from this slice's relocation, then
             // release `produced` (and its clones of the stale Inners) so the prior
@@ -1828,13 +1828,30 @@ fn run_tight_space_compaction(
             if let Some(sizing) = &filter_sizing {
                 sizing.release_replaced();
             }
+            // A stale file a memtable row still references keeps its whole
+            // view and is not punched: the row borrows an object the slice
+            // copied, and links the file from no table until it is flushed.
+            // Decided under the install's version lock, which orders the
+            // writes of such rows against this edit.
+            let mut unpunched: crate::HashSet<BlobFileId> = crate::HashSet::default();
             // Install one atomic, durable version edit for the slice.
             // A failed install commits nothing, so no sidecar was written (the
             // mark step below is strictly post-commit) and the punches never arm;
             // the run removes the slice's outputs as it returns.
-            opts.version_history.write().upgrade_version(
+            let mut history = opts.version_history.write();
+            history.upgrade_version(
                 &opts.config.path,
                 |sv| {
+                    unpunched.extend(
+                        prior_to_punch
+                            .iter()
+                            .map(|(bf, _)| bf.id())
+                            .filter(|id| sv.memtables_reference_blob_file(*id)),
+                    );
+                    let new_blobs: Vec<BlobFile> = new_blobs
+                        .into_iter()
+                        .filter(|bf| !unpunched.contains(&bf.id()))
+                        .collect();
                     let mut copy = sv.clone();
                     let ctx = crate::version::TransformContext::new(comparator.as_ref());
                     copy.version = copy.version.with_tight_slice(
@@ -1857,6 +1874,13 @@ fn run_tight_space_compaction(
                 // punched input prefix: older snapshots lose both.
                 crate::version::RetentionEffect::GcBelow(opts.gc_watermark),
             )?;
+            // Still under the write lock that published the slice: a reference
+            // read from an older version names an object the slice let go of.
+            if !released_objects.is_empty() {
+                let published = history.latest_version().version.id();
+                history.released().record(published, released_objects, []);
+            }
+            drop(history);
             // The version names this slice's outputs now: a later slice's failure
             // must not remove them.
             opts.outputs.installed();
@@ -1945,7 +1969,9 @@ fn run_tight_space_compaction(
             // Arm each re-opened stale blob file's prior view to punch its
             // relocated `[data_start, frontier)` prefix once it drains.
             for (bf, off) in &prior_to_punch {
-                bf.mark_punch_on_drop(*off);
+                if !unpunched.contains(&bf.id()) {
+                    bf.mark_punch_on_drop(*off);
+                }
             }
 
             tables_out += outputs.len();
@@ -2116,7 +2142,15 @@ fn run_subcompaction(
         return Err(cancelled_compaction());
     }
 
-    let mut blob_frag_map = FragmentationMap::default();
+    // The blob accounting of the dropped versions, shared by the stream that
+    // reports them and the loop that settles a key's ownership before its
+    // kept rows are written (see `ownership`).
+    let ledger = core::cell::RefCell::new(super::ownership::OwnershipLedger::default());
+    let ledger_error = core::cell::RefCell::new(None);
+    let mut ledger_hook = super::ownership::LedgerHook {
+        ledger: &ledger,
+        error: &ledger_error,
+    };
 
     // Declared before the stream that borrows it, so it outlives it.
     let completeness = input_completeness_for(version, &payload.table_ids, &opts.config);
@@ -2202,7 +2236,7 @@ fn run_subcompaction(
     // KV separation (no relocation on this path): track fragmentation from
     // dropped/GC'd entries so the merged install updates blob GC stats.
     if opts.config.kv_separation_opts.is_some() {
-        merge_iter = merge_iter.with_drop_callback(&mut blob_frag_map);
+        merge_iter = merge_iter.with_drop_callback(&mut ledger_hook);
     }
 
     // Versions that go in and do not come out: read after `produce` to tell a
@@ -2313,6 +2347,7 @@ fn run_subcompaction(
                     opts.rate_limiter.clone(),
                     opts.stop_signal.clone(),
                     opts.config.comparator.clone(),
+                    opts.tree_id,
                 )
                 .with_drain_below(drain_below),
             )
@@ -2351,7 +2386,12 @@ fn run_subcompaction(
             return Err(cancelled_compaction());
         }
 
-        compactor.write(item)?;
+        ledger
+            .borrow_mut()
+            .admit(item, &mut |row| compactor.write(row))?;
+        if let Some(e) = ledger_error.borrow_mut().take() {
+            return Err(e);
+        }
 
         if idx % 1_000_000 == 0 && opts.stop_signal.is_stopped() {
             return Err(cancelled_compaction());
@@ -2367,7 +2407,14 @@ fn run_subcompaction(
         .transpose()?
         .unwrap_or_default();
 
+    let (blob_frag_map, released_objects) = ledger
+        .into_inner()
+        .finish(&mut |row| compactor.write(row))?;
+    if let Some(e) = ledger_error.into_inner() {
+        return Err(e);
+    }
     let mut produced = compactor.produce(opts, dst_lvl, blob_frag_map, extra_blob_files)?;
+    produced.set_released_objects(released_objects);
     if filter_marker.load(core::sync::atomic::Ordering::Relaxed) > 0 {
         produced.mark_filter_transformed();
     }
@@ -3235,7 +3282,15 @@ fn merge_tables(
         }
     }
 
-    let mut blob_frag_map = FragmentationMap::default();
+    // The blob accounting of the dropped versions, shared by the stream that
+    // reports them and the loop that settles a key's ownership before its
+    // kept rows are written (see `ownership`).
+    let ledger = core::cell::RefCell::new(super::ownership::OwnershipLedger::default());
+    let ledger_error = core::cell::RefCell::new(None);
+    let mut ledger_hook = super::ownership::LedgerHook {
+        ledger: &ledger,
+        error: &ledger_error,
+    };
 
     // Declared before the stream that borrows it, so it outlives it.
     let completeness = input_completeness_for(
@@ -3369,7 +3424,7 @@ fn merge_tables(
 
     let mut compactor = match &opts.config.kv_separation_opts {
         Some(blob_opts) => {
-            merge_iter = merge_iter.with_drop_callback(&mut blob_frag_map);
+            merge_iter = merge_iter.with_drop_callback(&mut ledger_hook);
 
             if blob_files_to_rewrite.is_empty() {
                 log::debug!("No blob relocation needed");
@@ -3422,6 +3477,7 @@ fn merge_tables(
                     opts.rate_limiter.clone(),
                     opts.stop_signal.clone(),
                     opts.config.comparator.clone(),
+                    opts.tree_id,
                 ))
             }
         }
@@ -3507,7 +3563,12 @@ fn merge_tables(
                 return Err(cancelled_compaction());
             }
 
-            compactor.write(item)?;
+            ledger
+                .borrow_mut()
+                .admit(item, &mut |row| compactor.write(row))?;
+            if let Some(e) = ledger_error.borrow_mut().take() {
+                return Err(e);
+            }
 
             // Test-only failpoint: raise the stop signal after the first written
             // item, so the interrupted-merge path below is reachable without
@@ -3533,6 +3594,18 @@ fn merge_tables(
         }
 
         Ok(())
+    })?;
+
+    // The rows the ledger still holds go out before the outputs are finished,
+    // guarded like the merge: a failure here shows the inputs again.
+    let (blob_frag_map, released_objects) = hidden_guard(payload, opts, || {
+        let settled = ledger
+            .into_inner()
+            .finish(&mut |row| compactor.write(row))?;
+        if let Some(e) = ledger_error.into_inner() {
+            return Err(e);
+        }
+        Ok(settled)
     })?;
 
     if let Some(filter) = compaction_filter {
@@ -3577,6 +3650,7 @@ fn merge_tables(
                 .hidden_set_mut()
                 .show(payload.table_ids.iter().copied());
         })?;
+    produce_output.set_released_objects(released_objects);
     if filter_marker.load(core::sync::atomic::Ordering::Relaxed) > 0 {
         produce_output.mark_filter_transformed();
     }
@@ -3670,6 +3744,19 @@ fn drop_tables(
 
     let mut dropped_blob_files = vec![];
 
+    // The files the dropped tables charged the objects they owned to, read
+    // before the edit: nothing that can fail may run once the drop is
+    // published, or an error would report a drop that happened and leave its
+    // files unmarked.
+    let mut released_files = Vec::new();
+    for table in &tables {
+        for link in table.blob_links()? {
+            if link.len > 0 && !released_files.contains(&link.blob_file_id) {
+                released_files.push(link.blob_file_id);
+            }
+        }
+    }
+
     // IMPORTANT: Write the manifest with the removed tables first
     // Otherwise the table files are deleted, but are still referenced!
     version_history_lock.upgrade_version(
@@ -3678,9 +3765,12 @@ fn drop_tables(
             let mut copy = current.clone();
 
             let ctx = crate::version::TransformContext::new(opts.config.comparator.as_ref());
-            copy.version = copy
-                .version
-                .with_dropped(ids_to_drop, &mut dropped_blob_files, &ctx)?;
+            copy.version = copy.version.with_dropped(
+                ids_to_drop,
+                &mut dropped_blob_files,
+                &|id| current.memtables_reference_blob_file(id),
+                &ctx,
+            )?;
 
             Ok(copy)
         },
@@ -3694,6 +3784,16 @@ fn drop_tables(
         // install is servable.
         crate::version::RetentionEffect::DropsData,
     )?;
+
+    // Still under the write lock that published the drop: the dropped tables
+    // charged the objects they owned, by file, so a reference into one of
+    // those files read before the drop is stale.
+    if !released_files.is_empty() {
+        let published = version_history_lock.latest_version().version.id();
+        version_history_lock
+            .released()
+            .record(published, [], released_files);
+    }
 
     drop(version_history_lock);
 

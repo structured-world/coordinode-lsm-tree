@@ -1178,6 +1178,7 @@ fn run_dump(
                 lsm_tree::ValueType::WeakTombstone => "\t# weak-tombstone",
                 lsm_tree::ValueType::MergeOperand => "\t# merge-operand",
                 lsm_tree::ValueType::Indirection => "\t# indirection",
+                lsm_tree::ValueType::CellRow => "\t# cell-row",
             };
             writeln!(
                 out,

@@ -296,6 +296,36 @@ impl SourceCursor {
         }
     }
 
+    /// The next batch with the row page a columnar segment read it from, so
+    /// other columns of its rows can be read later; a row source's batch has
+    /// none.
+    pub(super) fn next_located(
+        &mut self,
+    ) -> Option<crate::Result<(ColumnBatch, Option<crate::table::columnar_cursor::PageAt>)>> {
+        match self {
+            Self::Columnar(cursor) => cursor
+                .next_located()
+                .map(|located| located.map(|(batch, at)| (batch, Some(at)))),
+            Self::Rows(rows) => rows.next_batch().map(|batch| batch.map(|b| (b, None))),
+        }
+    }
+
+    /// The table a columnar segment's cursor reads; `None` for a row source.
+    pub(super) fn table(&self) -> Option<&crate::Table> {
+        match self {
+            Self::Columnar(cursor) => Some(cursor.table()),
+            Self::Rows(_) => None,
+        }
+    }
+
+    /// Reads `projection` from the next row group on; only a columnar
+    /// segment's cursor takes it, a row source reads its rows whole.
+    pub(super) fn set_projection(&mut self, projection: &[u16]) {
+        if let Self::Columnar(cursor) = self {
+            cursor.set_projection(projection);
+        }
+    }
+
     /// Page bytes the source holds besides the batch it handed out.
     pub(super) fn held_bytes(&self) -> u64 {
         match self {

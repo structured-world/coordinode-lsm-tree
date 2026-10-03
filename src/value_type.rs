@@ -25,6 +25,11 @@ pub enum ValueType {
     ///
     /// Points to a blob in a blob file.
     Indirection = 4,
+
+    /// A row written as cells, some of which may keep their bytes in a blob
+    /// file (see [`crate::blob_tree::field_row`]). Reads as a put, like a
+    /// value, with each referenced cell resolved to its object.
+    CellRow = 5,
 }
 
 impl ValueType {
@@ -36,6 +41,11 @@ impl ValueType {
 
     pub(crate) fn is_indirection(self) -> bool {
         self == Self::Indirection
+    }
+
+    /// Whether the entry is a row written as cells.
+    pub(crate) fn is_cell_row(self) -> bool {
+        self == Self::CellRow
     }
 
     /// Returns `true` if the type is a merge operand.
@@ -55,6 +65,7 @@ impl TryFrom<u8> for ValueType {
             2 => Ok(Self::WeakTombstone),
             3 => Ok(Self::MergeOperand),
             4 => Ok(Self::Indirection),
+            5 => Ok(Self::CellRow),
             _ => Err(()),
         }
     }
@@ -68,6 +79,7 @@ impl From<ValueType> for u8 {
             ValueType::WeakTombstone => 2,
             ValueType::MergeOperand => 3,
             ValueType::Indirection => 4,
+            ValueType::CellRow => 5,
         }
     }
 }
