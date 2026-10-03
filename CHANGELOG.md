@@ -11,6 +11,18 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 
 ## [Unreleased]
 
+## [5.11.14](https://github.com/structured-world/coordinode-lsm-tree/compare/v5.11.13...v5.11.14) - 2026-10-03
+
+### Fixed
+
+- *(compaction)* remove every output of a run that fails before install ([#804](https://github.com/structured-world/coordinode-lsm-tree/pull/804))
+- *(compaction)* stop a slice's unclaimed-frame drain on request ([#802](https://github.com/structured-world/coordinode-lsm-tree/pull/802))
+- *(compaction)* advance the tight-space blob frontier past dropped pointers ([#801](https://github.com/structured-world/coordinode-lsm-tree/pull/801))
+- *(blob_tree)* merge operands onto inline and separated bases in every read ([#783](https://github.com/structured-world/coordinode-lsm-tree/pull/783))
+- *(repair)* keep held blob files within the descriptor cache ([#788](https://github.com/structured-world/coordinode-lsm-tree/pull/788))
+- *(table)* batch reads honour a tight-space restriction ([#777](https://github.com/structured-world/coordinode-lsm-tree/pull/777))
+- *(repair)* stop on descriptor exhaustion and scan within the fd cache ([#779](https://github.com/structured-world/coordinode-lsm-tree/pull/779))
+
 ## [5.11.13](https://github.com/structured-world/coordinode-lsm-tree/compare/v5.11.12...v5.11.13) - 2026-10-01
 
 ### Fixed
