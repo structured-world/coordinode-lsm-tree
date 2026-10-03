@@ -448,6 +448,59 @@ fn an_interrupted_publication_loses_and_leaks_no_object() -> lsm_tree::Result<()
     Ok(())
 }
 
+/// Per-field references multiply the references per row without breaking
+/// the locality accounting: rows of three heavy cells, then a metadata-only
+/// update of every row borrowing all three, then a compaction, keep one blob
+/// file read in one run, and nothing in it is garbage.
+#[test]
+fn per_field_references_keep_the_locality_accounting() -> lsm_tree::Result<()> {
+    let folder = get_tmp_folder();
+    let tree = open(folder.path(), KvSeparationOptions::default())?;
+    let fields: Vec<Vec<u8>> = (0..3u8).map(|f| vec![b'a' + f; 1_000]).collect();
+    let one_run = lsm_tree::BlobReferenceStats { count: 1, depth: 1 };
+
+    for i in 0..10u64 {
+        tree.insert_cells(
+            format!("k{i:02}"),
+            &[
+                Cell::Value(b"draft"),
+                Cell::Value(&fields[0]),
+                Cell::Value(&fields[1]),
+                Cell::Value(&fields[2]),
+            ],
+            i,
+        )?;
+    }
+    tree.flush_active_memtable(0)?;
+    assert_eq!(tree.storage_stats()?.blob_references, one_run);
+
+    for i in 0..10u64 {
+        let key = format!("k{i:02}");
+        let row = tree.get_cells(&key, SeqNo::MAX)?.expect("row exists");
+        let mut cells = row.cells()?;
+        cells[0] = Cell::Value(b"final");
+        tree.insert_cells(key, &cells, 10 + i)?;
+    }
+    tree.flush_active_memtable(0)?;
+    assert_eq!(tree.blob_file_count(), 1, "the update wrote no blob file");
+    assert_eq!(tree.storage_stats()?.blob_references, one_run);
+
+    tree.major_compact(64_000_000, SeqNo::MAX)?;
+    assert_eq!(tree.storage_stats()?.blob_references, one_run);
+    assert_eq!(
+        tree.stale_blob_bytes(),
+        0,
+        "every object passed to its update"
+    );
+    for i in 0..10u64 {
+        assert_eq!(
+            tree.get(format!("k{i:02}"), SeqNo::MAX)?.as_deref(),
+            Some(&framed(&[b"final", &fields[0], &fields[1], &fields[2]])[..])
+        );
+    }
+    Ok(())
+}
+
 /// Ingestion separates each heavy cell on its own, as a flush does.
 #[test]
 fn ingested_cells_separate_per_cell() -> lsm_tree::Result<()> {
