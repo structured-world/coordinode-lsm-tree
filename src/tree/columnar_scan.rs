@@ -1500,6 +1500,12 @@ impl ColumnarScan {
                     .is_some_and(|p| p.column_id == COL_VALUE))
     }
 
+    /// Whether `pred` is on the value type of a blob tree, whose stored types
+    /// (an indirection, a cell row) read as a value once the row is returned.
+    pub(super) fn judges_returned_type(&self, pred: &ColumnRangePredicate) -> bool {
+        self.cells.is_some() && pred.column_id == COL_VALUE_TYPE
+    }
+
     /// When the scan's predicate judges the decided rows: before their values
     /// are read where its column is one reading the values does not change.
     /// The key and the seqno never change; a column no field declares is the
@@ -1519,6 +1525,10 @@ impl ColumnarScan {
         // reads it, and only an operand still to be resolved rewrites them.
         match pred.column_id {
             COL_USER_KEY | COL_SEQNO => PredicateTiming::BeforeValues,
+            // A blob tree stores a value kept in a blob file or written as
+            // cells under its own type, and returns it as a value: the
+            // predicate judges the type returned, once the values are read.
+            _ if self.judges_returned_type(pred) => PredicateTiming::AfterValues,
             id if self
                 .fields
                 .iter()

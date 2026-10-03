@@ -1786,6 +1786,10 @@ fn reconstruct_row_value(
     row: u32,
     value_type: ValueType,
 ) -> Result<Slice> {
+    // The whole-value column's id is the engine's in every table this format
+    // reads: an ingested batch may not use it, and nothing else writes caller
+    // sub-columns. A table of the previous format that used it as a caller id
+    // is renumbered by the converter, never read here.
     if cells::holds_cells(value_cols.iter().map(|c| &c.column_id)) {
         let mut row_cells = Vec::with_capacity(value_cols.len());
         for col in value_cols {

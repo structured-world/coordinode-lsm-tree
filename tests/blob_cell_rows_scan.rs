@@ -369,6 +369,55 @@ fn a_key_only_scan_reads_no_value() -> lsm_tree::Result<()> {
     Ok(())
 }
 
+/// A predicate on the value type sees what the scan returns: a value kept in
+/// a blob file and a row written as cells read as values, so selecting values
+/// keeps them and selecting the stored forms keeps none.
+#[test]
+fn a_value_type_predicate_judges_the_type_returned() -> lsm_tree::Result<()> {
+    use lsm_tree::table::columnar::COL_VALUE_TYPE;
+
+    for columnar in [false, true] {
+        let folder = get_tmp_folder();
+        let (any, tree) = open(folder.path(), columnar)?;
+        tree.insert("a", vec![b'v'; 500], 0);
+        insert(&tree, "b", b"cell", 2, &[b'b'; 500], 1);
+        tree.insert("c", b"small".to_vec(), 2);
+        tree.flush_active_memtable(0)?;
+
+        let of_type = |value_type: lsm_tree::ValueType| -> lsm_tree::Result<Vec<Vec<u8>>> {
+            let tag = vec![u8::from(value_type)];
+            let predicate = ColumnRangePredicate {
+                column_id: COL_VALUE_TYPE,
+                lower: Some(tag.clone()),
+                upper: Some(tag),
+                apply: PredicateApply::Filter,
+            };
+            let keys = Projection::new().column(COL_USER_KEY);
+            Ok(
+                rows(any.columnar_scan(keys, Some(&predicate), SeqNo::MAX, ..)?)?
+                    .into_iter()
+                    .map(|(key, _)| key)
+                    .collect(),
+            )
+        };
+        assert_eq!(
+            of_type(lsm_tree::ValueType::Value)?,
+            [b"a".to_vec(), b"b".to_vec(), b"c".to_vec()],
+            "columnar={columnar}"
+        );
+        for stored in [
+            lsm_tree::ValueType::Indirection,
+            lsm_tree::ValueType::CellRow,
+        ] {
+            assert!(
+                of_type(stored)?.is_empty(),
+                "columnar={columnar}: {stored:?} is never a returned type"
+            );
+        }
+    }
+    Ok(())
+}
+
 /// A predicate on a field with a default judges a value written whole by the
 /// field the projector reads out of it, not by the default its empty cell in
 /// the field's column would read as: neither drops a whole value that
