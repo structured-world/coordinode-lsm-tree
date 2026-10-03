@@ -223,8 +223,23 @@ jobs:
         env:
           BINSTALL_VERSION: 1.23.0
 
+      # The self-hosted runner keeps CARGO_HOME between runs, and binstall
+      # trusts its install record there: a record whose binary is gone reports
+      # "already installed" and installs nothing. The binary that runs decides,
+      # so a missing or other version is installed over the record.
       - name: Install release-plz
-        run: cargo binstall release-plz@0.3.169 --strategies crate-meta-data,compile --no-confirm
+        run: |
+          set -euo pipefail
+          want="release-plz 0.3.169"
+          have="$(release-plz --version 2>/dev/null || true)"
+          if [ "$have" != "$want" ]; then
+            cargo binstall release-plz@0.3.169 --strategies crate-meta-data,compile --no-confirm --force
+          fi
+          have="$(release-plz --version 2>/dev/null || true)"
+          if [ "$have" != "$want" ]; then
+            echo "::error::release-plz is not runnable after the install (got '$have')"
+            exit 1
+          fi
 
       - name: Version line of the measured commit
         id: line
