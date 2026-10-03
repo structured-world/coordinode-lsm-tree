@@ -1,282 +1,327 @@
-<!DOCTYPE html>
-<html>
-  <head>
-    <meta charset="utf-8" />
-    <meta name="viewport" content="width=device-width, minimum-scale=1.0, initial-scale=1, user-scalable=yes" />
-    <style>
-      html {
-        font-family: BlinkMacSystemFont,-apple-system,"Segoe UI",Roboto,Oxygen,Ubuntu,Cantarell,"Fira Sans","Droid Sans","Helvetica Neue",Helvetica,Arial,sans-serif;
-        -webkit-font-smoothing: antialiased;
-        background-color: #fff;
-        font-size: 16px;
+<!doctype html>
+<html lang="en">
+<head>
+<meta charset="utf-8">
+<meta name="viewport" content="width=device-width, initial-scale=1">
+<title>lsm-tree benchmarks</title>
+<style>
+  :root { --bg: #0d1117; --panel: #161b22; --fg: #c9d1d9; --muted: #8b949e; --line: #30363d; --link: #58a6ff; }
+  * { box-sizing: border-box; }
+  body { margin: 0; background: var(--bg); color: var(--fg); font-family: system-ui, -apple-system, sans-serif; }
+  main { max-width: 1280px; margin: 0 auto; padding: 1.25rem 1rem 3rem; }
+  h1 { font-size: 1.35rem; margin: 0 0 .25rem; }
+  p.lead { color: var(--muted); line-height: 1.5; margin: 0 0 1rem; max-width: 70rem; }
+  a { color: var(--link); text-decoration: none; }
+  a:hover { text-decoration: underline; }
+  .controls { position: sticky; top: 0; z-index: 2; display: flex; flex-wrap: wrap; gap: .75rem 1.5rem; align-items: center;
+    background: var(--bg); padding: .75rem 0; border-bottom: 1px solid var(--line); margin-bottom: 1rem; }
+  .controls label { color: var(--muted); font-size: .9rem; display: flex; gap: .5rem; align-items: center; }
+  select { background: var(--panel); color: var(--fg); border: 1px solid var(--line); border-radius: 6px; padding: .3rem .5rem; font-size: .9rem; }
+  .status { color: var(--muted); font-size: .85rem; }
+  h2 { font-size: 1.1rem; margin: 1.5rem 0 .25rem; }
+  p.group-note { color: var(--muted); margin: 0 0 .75rem; font-size: .9rem; }
+  .grid { display: grid; grid-template-columns: repeat(2, minmax(0, 1fr)); gap: 1rem; }
+  @media (max-width: 900px) { .grid { grid-template-columns: 1fr; } }
+  .card { background: var(--panel); border: 1px solid var(--line); border-radius: 8px; padding: .75rem .9rem; }
+  .card h3 { font-size: .95rem; margin: 0 0 .2rem; }
+  .card p { color: var(--muted); font-size: .82rem; margin: 0 0 .5rem; line-height: 1.4; }
+  .chart { position: relative; height: 240px; }
+  #empty { display: none; }
+</style>
+</head>
+<body>
+<main>
+  <h1>lsm-tree benchmarks</h1>
+  <p class="lead">
+    The single-engine trend: one point per merge to main, measured by <code>db_bench</code> on the bench runner.
+    Each version line has its own series, and a rate is only comparable within one runner.
+    Click a point to open its commit.
+    &middot; <a href="../compare/">RocksDB head-to-head &rarr;</a>
+  </p>
+  <div class="controls">
+    <label>Branch <select id="line"></select></label>
+    <label>Runner <select id="runner"></select></label>
+    <label>Show <select id="suite">
+      <option value="rates">Throughput (higher is better)</option>
+      <option value="costs">Read cost per row (lower is better)</option>
+    </select></label>
+    <span class="status" id="status"></span>
+  </div>
+  <p id="empty">No benchmark data has been published yet.</p>
+  <div id="charts"></div>
+</main>
+<script src="https://cdn.jsdelivr.net/npm/chart.js@4.4.4/dist/chart.umd.min.js"></script>
+<script src="data.js"></script>
+<script>
+(function () {
+  "use strict";
+  // Rate suites: one per version line and runner. Cost suites: one per line,
+  // bytes counted by the engine, the same on every runner.
+  const RATE = /^lsm-tree db_bench (\d+)\.x · (.+)$/;
+  const COST = /^lsm-tree db_bench costs (\d+)\.x$/;
+  const ALL = "*";
+  const PALETTE = ["#58a6ff", "#f78166", "#3fb950", "#d2a8ff", "#e3b341", "#79c0ff", "#ff7b72"];
+
+  // What each db_bench workload measures, grouped by the question it answers.
+  const RATE_GROUPS = [
+    { title: "Writes", note: "Inserting keys into the tree.", items: {
+      fillseq: ["Sequential fill", "Keys inserted in ascending order into an empty tree."],
+      fillrandom: ["Random fill", "Keys inserted in random order into an empty tree."],
+      overwrite: ["Overwrite", "Every existing key written again over a prefilled tree."],
+      mergerandom: ["Merge operands", "Counter merge operands applied to a set of hot keys; the final counter is verified."],
+    } },
+    { title: "Reads", note: "Reading from a prefilled, flushed tree.", items: {
+      readrandom: ["Random point reads", "One get per key in random order; every read is a hit."],
+      readseq: ["Sequential scan", "A full forward scan over every key."],
+      seekrandom: ["Random seeks", "A seek to a random key, reading the entry under the cursor."],
+      prefixscan: ["Prefix scans", "Up to 10 keys read under a random 2-byte prefix, with prefix bloom filters."],
+    } },
+    { title: "Whole lifecycle", note: "Stages that only cost something when they meet.", items: {
+      "lifecycle-zstd22": ["Write → rewrite → delete → compact → read, zstd-22", "One tree through the sequence a deployment walks, at maximum compression, timed end to end. Every read checks what it must see."],
+    } },
+    { title: "Concurrency", note: "Readers while a writer runs.", items: {
+      readwhilewriting: ["Reads while writing", "Random point reads on one thread while a second thread keeps writing."],
+    } },
+  ];
+
+  // The mixed-layout scenarios, read through the engine's byte counters.
+  const COST_NOTES = {
+    "narrow-records": "A few small fields per row: the control no projection can beat.",
+    "wide-records-full-read": "Small fields plus a 4 KiB payload, read whole: the baseline a projection is measured against.",
+    "mixed-value-sizes": "Short and long values in one key space.",
+    "row-updates-over-columnar-base": "A third of the keys rewritten row-major over a columnar base, read by point reads.",
+    "row-updates-over-columnar-base-scan": "The same fixture read by the projected columnar scan.",
+    "versions-deletes-tombstones": "Several versions per key, point deletes and a range tombstone.",
+    "selective-scan-sparse": "A predicate matching about 1% of rows, pushed into the columnar scan.",
+    "selective-scan-near-full": "A predicate matching about 90% of rows.",
+    "columnar-scan-one-segment": "A projected columnar scan of one flushed segment.",
+    "columnar-scan-overlap-8": "The same rows in eight overlapping segments, merged by the scan.",
+    "blobs-well-placed": "Large values stored as blobs, written in key order.",
+    "blobs-scattered": "The same blobs scattered across files by strided rewrites.",
+  };
+
+  const data = window.BENCHMARK_DATA;
+  const suites = data ? Object.keys(data.entries) : [];
+  if (suites.length === 0) {
+    document.getElementById("empty").style.display = "block";
+    return;
+  }
+  const repo = data.repoUrl || "";
+  const rateSuites = suites.filter(function (s) { return RATE.test(s); });
+  const costSuites = suites.filter(function (s) { return COST.test(s); });
+  const lineOf = function (s) { return Number((RATE.exec(s) || COST.exec(s))[1]); };
+  const runnerOf = function (s) { return RATE.exec(s)[2]; };
+  const lastDate = function (s) {
+    const entries = data.entries[s];
+    return entries.length ? entries[entries.length - 1].date : 0;
+  };
+
+  // The default view is whatever was measured last: its line and its runner.
+  const latest = rateSuites.slice().sort(function (a, b) { return lastDate(b) - lastDate(a); })[0];
+  const lines = suites.map(lineOf).filter(function (v, i, all) { return all.indexOf(v) === i; })
+    .sort(function (a, b) { return b - a; });
+  const runners = rateSuites.map(runnerOf).filter(function (v, i, all) { return all.indexOf(v) === i; });
+  const colorOf = function (runner) { return PALETTE[runners.indexOf(runner) % PALETTE.length]; };
+
+  const lineSel = document.getElementById("line");
+  const runnerSel = document.getElementById("runner");
+  const suiteSel = document.getElementById("suite");
+  lines.forEach(function (line) {
+    lineSel.add(new Option(line + ".x" + (line === lines[0] ? " (main)" : ""), String(line)));
+  });
+  if (latest) {
+    lineSel.value = String(lineOf(latest));
+  }
+
+  const fillRunners = function () {
+    const line = Number(lineSel.value);
+    const keep = runnerSel.value;
+    runnerSel.innerHTML = "";
+    const here = rateSuites.filter(function (s) { return lineOf(s) === line; })
+      .sort(function (a, b) { return lastDate(b) - lastDate(a); });
+    here.forEach(function (s, i) {
+      runnerSel.add(new Option(runnerOf(s) + (i === 0 ? " (latest)" : ""), runnerOf(s)));
+    });
+    if (here.length > 1) {
+      runnerSel.add(new Option("All runners on one chart", ALL));
+    }
+    const names = here.map(runnerOf);
+    runnerSel.value = names.indexOf(keep) >= 0 || keep === ALL ? keep : (names[0] || "");
+  };
+
+  const day = function (ms) { return new Date(ms).toISOString().slice(0, 10); };
+  const charts = [];
+  const container = document.getElementById("charts");
+
+  // One dataset per series: (suite, bench name) -> points over commit time.
+  const series = function (suite, bench, label, color) {
+    const points = [];
+    data.entries[suite].forEach(function (entry) {
+      const found = entry.benches.find(function (b) { return b.name === bench; });
+      if (found) {
+        points.push({ x: Date.parse(entry.commit.timestamp), y: found.value, commit: entry.commit });
       }
-      body {
-        color: #4a4a4a;
-        margin: 8px;
-        font-size: 1em;
-        font-weight: 400;
+    });
+    points.sort(function (a, b) { return a.x - b.x; });
+    return { label: label, data: points, borderColor: color, backgroundColor: color, pointRadius: 2, borderWidth: 1.5, tension: 0 };
+  };
+
+  const card = function (grid, title, note, unit, datasets) {
+    const live = datasets.filter(function (d) { return d.data.length > 0; });
+    if (live.length === 0) {
+      return;
+    }
+    const box = document.createElement("div");
+    box.className = "card";
+    const h = document.createElement("h3");
+    h.textContent = title + " (" + unit + ")";
+    const p = document.createElement("p");
+    p.textContent = note;
+    const wrap = document.createElement("div");
+    wrap.className = "chart";
+    const canvas = document.createElement("canvas");
+    wrap.appendChild(canvas);
+    box.appendChild(h);
+    box.appendChild(p);
+    box.appendChild(wrap);
+    grid.appendChild(box);
+    charts.push(new Chart(canvas, {
+      type: "line",
+      data: { datasets: live },
+      options: {
+        responsive: true, maintainAspectRatio: false, animation: false, parsing: false,
+        interaction: { mode: "nearest", intersect: false },
+        scales: {
+          x: { type: "linear", ticks: { color: "#8b949e", maxTicksLimit: 6, callback: function (v) { return day(v); } }, grid: { color: "#21262d" } },
+          y: { beginAtZero: false, ticks: { color: "#8b949e" }, grid: { color: "#21262d" } },
+        },
+        plugins: {
+          legend: { display: live.length > 1, labels: { color: "#c9d1d9", boxWidth: 12 } },
+          tooltip: { callbacks: {
+            title: function (items) { return items[0].raw.commit.id.slice(0, 9) + "  " + day(items[0].raw.x); },
+            afterTitle: function (items) { return items[0].raw.commit.message.split("\n")[0]; },
+          } },
+        },
+        onClick: function (_e, elements, chart) {
+          if (!elements.length || !repo) { return; }
+          const point = chart.data.datasets[elements[0].datasetIndex].data[elements[0].index];
+          window.open(repo + "/commit/" + point.commit.id, "_blank", "noopener");
+        },
+      },
+    }));
+  };
+
+  const section = function (title, note) {
+    const h = document.createElement("h2");
+    h.textContent = title;
+    const p = document.createElement("p");
+    p.className = "group-note";
+    p.textContent = note;
+    const grid = document.createElement("div");
+    grid.className = "grid";
+    container.appendChild(h);
+    container.appendChild(p);
+    container.appendChild(grid);
+    return grid;
+  };
+
+  // The benches a suite measured in its latest entry: a series that stopped
+  // being measured is history, not part of the current picture.
+  const current = function (suite) {
+    const entries = data.entries[suite];
+    if (!entries.length) { return {}; }
+    const out = {};
+    entries[entries.length - 1].benches.forEach(function (b) { out[b.name] = b.unit; });
+    return out;
+  };
+
+  const drawRates = function (line, runner) {
+    const here = rateSuites.filter(function (s) {
+      return lineOf(s) === line && (runner === ALL || runnerOf(s) === runner);
+    });
+    const live = {};
+    here.forEach(function (s) { Object.assign(live, current(s)); });
+    const known = {};
+    RATE_GROUPS.forEach(function (group) {
+      const names = Object.keys(group.items).filter(function (n) { return n in live; });
+      if (!names.length) { return; }
+      const grid = section(group.title, group.note);
+      names.forEach(function (name) {
+        known[name] = true;
+        const sets = here.map(function (s) { return series(s, name, runnerOf(s), colorOf(runnerOf(s))); });
+        card(grid, group.items[name][0], group.items[name][1] + "  [" + name + "]", live[name], sets);
+      });
+    });
+    // Anything measured that this page has no description for yet still shows.
+    const rest = Object.keys(live).filter(function (n) { return !known[n]; });
+    if (rest.length) {
+      const grid = section("Other", "Workloads without a description on this page yet.");
+      rest.forEach(function (name) {
+        const sets = here.map(function (s) { return series(s, name, runnerOf(s), colorOf(runnerOf(s))); });
+        card(grid, name, "", live[name], sets);
+      });
+    }
+  };
+
+  const drawCosts = function (line) {
+    const suite = costSuites.filter(function (s) { return lineOf(s) === line; })[0];
+    if (!suite) {
+      section("No cost series", "This line has no byte-counter results.");
+      return;
+    }
+    const live = current(suite);
+    // "mixed-layout / <scenario> <metric>": one chart per scenario and unit,
+    // one line per metric, so read / decoded / copied sit together.
+    const NAME = /^(.+?) \/ (\S+) (.+)$/;
+    const charts = {};
+    const order = [];
+    Object.keys(live).forEach(function (name) {
+      const m = NAME.exec(name);
+      const workload = m ? m[1] : name;
+      const scenario = m ? m[2] : name;
+      const metric = m ? m[3] : name;
+      const key = workload + "|" + scenario + "|" + live[name];
+      if (!(key in charts)) {
+        charts[key] = { workload: workload, scenario: scenario, unit: live[name], metrics: [] };
+        order.push(key);
       }
-      header {
-        margin-bottom: 8px;
-        display: flex;
-        flex-direction: column;
+      charts[key].metrics.push({ metric: metric, name: name });
+    });
+    const grids = {};
+    order.forEach(function (key) {
+      const c = charts[key];
+      if (!(c.workload in grids)) {
+        grids[c.workload] = section(
+          "Read cost per emitted row: " + c.workload,
+          "Bytes the engine read, decoded and copied for every row a scenario returned, counted by the engine. Lower is better.");
       }
-      main {
-        width: 100%;
-        display: flex;
-        flex-direction: column;
-      }
-      a {
-        color: #3273dc;
-        cursor: pointer;
-        text-decoration: none;
-      }
-      a:hover {
-        color: #000;
-      }
-      button {
-        color: #fff;
-        background-color: #3298dc;
-        border-color: transparent;
-        cursor: pointer;
-        text-align: center;
-      }
-      button:hover {
-        background-color: #2793da;
-        flex: none;
-      }
-      .spacer {
-        flex: auto;
-      }
-      .small {
-        font-size: 0.75rem;
-      }
-      footer {
-        margin-top: 16px;
-        display: flex;
-        align-items: center;
-      }
-      .header-label {
-        margin-right: 4px;
-      }
-      .benchmark-set {
-        margin: 8px 0;
-        width: 100%;
-        display: flex;
-        flex-direction: column;
-      }
-      .benchmark-title {
-        font-size: 3rem;
-        font-weight: 600;
-        word-break: break-word;
-        text-align: center;
-      }
-      .benchmark-graphs {
-        display: flex;
-        flex-direction: row;
-        justify-content: space-around;
-        align-items: center;
-        flex-wrap: wrap;
-        width: 100%;
-      }
-      .benchmark-chart {
-        max-width: 1000px;
-      }
-    </style>
-    <title>Benchmarks</title>
-  </head>
+      const sets = c.metrics.map(function (m, i) {
+        return series(suite, m.name, m.metric, PALETTE[i % PALETTE.length]);
+      });
+      card(grids[c.workload], c.scenario, COST_NOTES[c.scenario] || "", c.unit, sets);
+    });
+  };
 
-  <body>
-<div id="bench-nav-banner" style="padding:8px 14px;background:#0d1117;color:#c9d1d9;font-family:system-ui,sans-serif;border-bottom:1px solid #30363d;font-size:14px">&#128202; <strong>lsm-tree benchmarks</strong> &nbsp;&middot;&nbsp; per-host dashboards &nbsp;&middot;&nbsp; <a href="overlay.html" style="color:#58a6ff;font-weight:600">every host on one chart &rarr;</a> &nbsp;&middot;&nbsp; <a href="../compare/" style="color:#58a6ff;font-weight:600">RocksDB head-to-head &rarr;</a></div>
-    <header id="header">
-      <div class="header-item">
-        <strong class="header-label">Last Update:</strong>
-        <span id="last-update"></span>
-      </div>
-      <div class="header-item">
-        <strong class="header-label">Repository:</strong>
-        <a id="repository-link" rel="noopener"></a>
-      </div>
-    </header>
-    <main id="main"></main>
-    <footer>
-      <button id="dl-button">Download data as JSON</button>
-      <div class="spacer"></div>
-      <div class="small">Powered by <a rel="noopener" href="https://github.com/marketplace/actions/continuous-benchmark">github-action-benchmark</a></div>
-    </footer>
+  const draw = function () {
+    charts.splice(0).forEach(function (c) { c.destroy(); });
+    container.innerHTML = "";
+    const line = Number(lineSel.value);
+    runnerSel.disabled = suiteSel.value === "costs";
+    if (suiteSel.value === "costs") {
+      drawCosts(line);
+    } else {
+      drawRates(line, runnerSel.value);
+    }
+    const shown = container.querySelectorAll(".card").length;
+    document.getElementById("status").textContent = shown + " charts";
+  };
 
-    <script src="https://cdn.jsdelivr.net/npm/chart.js@2.9.2/dist/Chart.min.js"></script>
-    <script src="data.js"></script>
-    <script id="main-script">
-      'use strict';
-      (function() {
-        // Colors from https://github.com/github/linguist/blob/master/lib/linguist/languages.yml
-        const toolColors = {
-          cargo: '#dea584',
-          go: '#00add8',
-          benchmarkjs: '#f1e05a',
-          benchmarkluau: '#000080',
-          pytest: '#3572a5',
-          googlecpp: '#f34b7d',
-          catch2: '#f34b7d',
-          julia: '#a270ba',
-          jmh: '#b07219',
-          benchmarkdotnet: '#178600',
-          customBiggerIsBetter: '#38ff38',
-          customSmallerIsBetter: '#ff3838',
-          _: '#333333'
-        };
-
-        function init() {
-          function collectBenchesPerTestCase(entries) {
-            const map = new Map();
-            for (const entry of entries) {
-              const {commit, date, tool, benches} = entry;
-              for (const bench of benches) {
-                const result = { commit, date, tool, bench };
-                const arr = map.get(bench.name);
-                if (arr === undefined) {
-                  map.set(bench.name, [result]);
-                } else {
-                  arr.push(result);
-                }
-              }
-            }
-            return map;
-          }
-
-          const data = window.BENCHMARK_DATA;
-
-          // Render header
-          document.getElementById('last-update').textContent = new Date(data.lastUpdate).toString();
-          const repoLink = document.getElementById('repository-link');
-          repoLink.href = data.repoUrl;
-          repoLink.textContent = data.repoUrl;
-
-          // Render footer
-          document.getElementById('dl-button').onclick = () => {
-            const dataUrl = 'data:,' + JSON.stringify(data, null, 2);
-            const a = document.createElement('a');
-            a.href = dataUrl;
-            a.download = 'benchmark_data.json';
-            a.click();
-          };
-
-          // Prepare data points for charts
-          return Object.keys(data.entries).map(name => ({
-            name,
-            dataSet: collectBenchesPerTestCase(data.entries[name]),
-          }));
-        }
-
-        function renderAllChars(dataSets) {
-
-          function renderGraph(parent, name, dataset) {
-            const canvas = document.createElement('canvas');
-            canvas.className = 'benchmark-chart';
-            parent.appendChild(canvas);
-
-            const color = toolColors[dataset.length > 0 ? dataset[0].tool : '_'];
-            const data = {
-              labels: dataset.map(d => d.commit.id.slice(0, 7)),
-              datasets: [
-                {
-                  label: name,
-                  data: dataset.map(d => d.bench.value),
-                  borderColor: color,
-                  backgroundColor: color + '60', // Add alpha for #rrggbbaa
-                }
-              ],
-            };
-            const options = {
-              scales: {
-                xAxes: [
-                  {
-                    scaleLabel: {
-                      display: true,
-                      labelString: 'commit',
-                    },
-                  }
-                ],
-                yAxes: [
-                  {
-                    scaleLabel: {
-                      display: true,
-                      labelString: dataset.length > 0 ? dataset[0].bench.unit : '',
-                    },
-                    ticks: {
-                      beginAtZero: true,
-                    }
-                  }
-                ],
-              },
-              tooltips: {
-                callbacks: {
-                  afterTitle: items => {
-                    const {index} = items[0];
-                    const data = dataset[index];
-                    return '\n' + data.commit.message + '\n\n' + data.commit.timestamp + ' committed by @' + data.commit.committer.username + '\n';
-                  },
-                  label: item => {
-                    let label = item.value;
-                    const { range, unit } = dataset[item.index].bench;
-                    label += ' ' + unit;
-                    if (range) {
-                      label += ' (' + range + ')';
-                    }
-                    return label;
-                  },
-                  afterLabel: item => {
-                    const { extra } = dataset[item.index].bench;
-                    return extra ? '\n' + extra : '';
-                  }
-                }
-              },
-              onClick: (_mouseEvent, activeElems) => {
-                if (activeElems.length === 0) {
-                  return;
-                }
-                // XXX: Undocumented. How can we know the index?
-                const index = activeElems[0]._index;
-                const url = dataset[index].commit.url;
-                window.open(url, '_blank');
-              },
-            };
-
-            new Chart(canvas, {
-              type: 'line',
-              data,
-              options,
-            });
-          }
-
-          function renderBenchSet(name, benchSet, main) {
-            const setElem = document.createElement('div');
-            setElem.className = 'benchmark-set';
-            main.appendChild(setElem);
-
-            const nameElem = document.createElement('h1');
-            nameElem.className = 'benchmark-title';
-            nameElem.textContent = name;
-            setElem.appendChild(nameElem);
-
-            const graphsElem = document.createElement('div');
-            graphsElem.className = 'benchmark-graphs';
-            setElem.appendChild(graphsElem);
-
-            for (const [benchName, benches] of benchSet.entries()) {
-              renderGraph(graphsElem, benchName, benches)
-            }
-          }
-
-          const main = document.getElementById('main');
-          for (const {name, dataSet} of dataSets) {
-            renderBenchSet(name, dataSet, main);
-          }
-        }
-
-        renderAllChars(init()); // Start
-      })();
-    </script>
-  </body>
+  fillRunners();
+  lineSel.addEventListener("change", function () { fillRunners(); draw(); });
+  runnerSel.addEventListener("change", draw);
+  suiteSel.addEventListener("change", draw);
+  draw();
+})();
+</script>
+</body>
 </html>
