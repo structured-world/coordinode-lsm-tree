@@ -10653,6 +10653,7 @@ fn salvage_remaps_the_references_of_a_columnar_cells_table() -> crate::Result<()
 /// The same rewrite over a cells table whose delete bitmap masks a row: the
 /// masked row stays gone, the live ones are remapped, and a row whose record
 /// is gone is dropped, all through the masked columnar arm.
+#[cfg(feature = "columnar")]
 #[test]
 #[expect(clippy::expect_used, reason = "test code")]
 fn salvage_remaps_the_references_of_a_delete_masked_columnar_cells_table() -> crate::Result<()> {
