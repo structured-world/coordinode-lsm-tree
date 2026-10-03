@@ -22,10 +22,7 @@ on:
   # series (auto-push gating below is push+main only), so they
   # can't contaminate the trend.
   push:
-    # TEMPORARY: the second branch runs this workflow on every push to it,
-    # to measure the 30-minute budget on the bench runner. Remove before
-    # merge, together with the matching clauses of the compare publish.
-    branches: [main, "perf/#678-bench-budget"]
+    branches: [main]
   # Manual dispatch from any branch when a contributor explicitly
   # wants to measure their PR against main before merging.
   # workflow_dispatch requires actions:write on the repo, so only
@@ -591,15 +588,12 @@ jobs:
         # overlays on demand (e.g. right after a runner fix) without waiting for
         # the next merge to main. The db_bench trend (benchmark-action auto-push /
         # save-data above) stays push+main only.
-        # TEMPORARY: the branch clause publishes this branch's runs like a
-        # dispatch does. Remove before merge.
         if: >
           !cancelled() &&
           steps.compare.outcome == 'success' &&
           steps.bot-token.outputs.token != '' &&
           (
             (github.event_name == 'push' && github.ref == 'refs/heads/main') ||
-            (github.event_name == 'push' && github.ref == 'refs/heads/perf/#678-bench-budget') ||
             github.event_name == 'workflow_dispatch'
           )
         env:
