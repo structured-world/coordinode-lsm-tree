@@ -3176,6 +3176,22 @@ impl Writer {
         Ok(())
     }
 
+    /// Writes out every block the writer still holds, so the file position is
+    /// where a direct block lands: the row chunk buffered by prior `write()`
+    /// calls (its block and locator ordinal registered first, keeping block and
+    /// index order), and every block still being compressed on worker threads,
+    /// which would otherwise be written over the direct block's bytes.
+    /// `spill_block` only drains down to the parallel cap, so the full drain is
+    /// separate. A no-op when nothing is pending.
+    fn settle_pending_blocks(&mut self) -> crate::Result<()> {
+        self.spill_block()?;
+        #[cfg(feature = "std")]
+        while self.parallel.as_ref().map_or(0, BlockCompressor::pending) > 0 {
+            self.drain_one_parallel()?;
+        }
+        Ok(())
+    }
+
     /// Validates key order against prior writes, flushes any pending row chunk to
     /// keep block order, and folds the per-row shape / seqno / filter / locator
     /// accounting for a block written *directly* (not via the row chunk) —
@@ -3214,24 +3230,9 @@ impl Writer {
             .then(|| entries.first().map(|e| e.key.user_key.clone()))
             .flatten();
 
-        // Flush any row chunk buffered by prior `write()` calls before this
-        // direct block, so its block (and locator ordinal) is registered first
-        // and the sorted block / index order is preserved. The validation above
-        // ran first, so an invalid batch never forces a spill. A no-op when the
-        // chunk is empty (the columnar-only ingest / salvage path).
-        self.spill_block()?;
-
-        // Drain any blocks still being compressed on worker threads BEFORE the
-        // direct block appends its raw bytes: a direct write lands at the current
-        // file position, so a submitted-but-unwritten parallel block would
-        // otherwise be written at an overlapping offset and register a wrong
-        // handle. `spill_block` only drains down to the parallel cap, so an
-        // explicit full drain is required here (a no-op without parallel
-        // compression, mirroring the finish path).
-        #[cfg(feature = "std")]
-        while self.parallel.as_ref().map_or(0, BlockCompressor::pending) > 0 {
-            self.drain_one_parallel()?;
-        }
+        // The validation above ran first, so an invalid batch never forces a
+        // spill.
+        self.settle_pending_blocks()?;
 
         // Per-row shape / seqno / key accounting, mirroring `write()` minus the
         // chunk push (the direct block holds all rows already). The locator
@@ -3520,6 +3521,9 @@ impl Writer {
         // checksum-repatched) block; `account_direct_block` trusts their order,
         // so validate it before any state mutation.
         self.validate_direct_block_order(entries, comparator)?;
+        // The extent is stamped for the file position, so whatever the writer
+        // still holds goes out first; a refused extent then counts no rows.
+        self.settle_pending_blocks()?;
         let restamped = self.restamp_extent(raw, source)?;
         let Some(inputs) = self.account_direct_block(entries)? else {
             return Ok(None);
