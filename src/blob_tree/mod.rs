@@ -494,6 +494,56 @@ impl BlobTree {
         )
     }
 
+    /// The cells of `key` as of `seqno`, references included as references:
+    /// the read a metadata-only update starts from. No blob object is read.
+    ///
+    /// Returns `None` when the key is absent at `seqno`. References to write
+    /// back must come from the key's latest version; a reference read at an
+    /// older `seqno` may name an object a newer version already let go of.
+    ///
+    /// # Errors
+    ///
+    /// Returns [`crate::Error::SnapshotBelowRetention`] when `seqno` is below
+    /// what the tree retains, and [`crate::Error::BlobRef`] when the key's
+    /// version at `seqno` was not written as cells.
+    ///
+    /// # Examples
+    ///
+    /// ```
+    /// # use lsm_tree::{AbstractTree, Config, KvSeparationOptions, SequenceNumberCounter};
+    /// # use lsm_tree::blob_tree::field_row::Cell;
+    /// # let folder = lsm_tree::get_tmp_folder();
+    /// # let tree = Config::new(folder.path(), SequenceNumberCounter::default(), SequenceNumberCounter::default())
+    /// #     .with_kv_separation(Some(KvSeparationOptions::default().separation_threshold(16)))
+    /// #     .open()?;
+    /// # let lsm_tree::AnyTree::Blob(tree) = tree else { unreachable!() };
+    /// let body = vec![b'x'; 1_000];
+    /// tree.insert_cells("doc", &[Cell::Value(b"draft"), Cell::Value(&body)], 0)?;
+    /// tree.flush_active_memtable(0)?;
+    ///
+    /// // Change the status, keep the body where it is.
+    /// let row = tree.get_cells("doc", 1)?.expect("written");
+    /// let Cell::Ref(body_ref) = row.cells()?[1].clone() else { unreachable!() };
+    /// tree.insert_cells("doc", &[Cell::Value(b"final"), Cell::Ref(body_ref)], 1)?;
+    /// # Ok::<(), lsm_tree::Error>(())
+    /// ```
+    pub fn get_cells<K: AsRef<[u8]>>(
+        &self,
+        key: K,
+        seqno: SeqNo,
+    ) -> crate::Result<Option<field_row::RowCells>> {
+        let Some(item) = self.index.get_internal_entry(key.as_ref(), seqno)? else {
+            return Ok(None);
+        };
+        if !item.key.value_type.is_cell_row() {
+            return Err(crate::Error::BlobRef("the key's version is not a cell row"));
+        }
+        Ok(Some(field_row::RowCells {
+            key: item.key.user_key,
+            row: item.value,
+        }))
+    }
+
     /// Updates the live [`RuntimeConfig`](crate::runtime_config::RuntimeConfig),
     /// as [`Tree::update_runtime_config`](crate::Tree::update_runtime_config)
     /// does for the index tree.

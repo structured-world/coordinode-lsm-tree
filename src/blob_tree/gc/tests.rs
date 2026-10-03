@@ -136,3 +136,48 @@ fn compaction_stream_gc_count_drops() -> crate::Result<()> {
 
     Ok(())
 }
+
+/// A dropped cell row charges only the objects it owns: a borrowed object is
+/// charged through its owner, once, or a file holding it would be charged
+/// twice its share and could reach its size while other objects in it live.
+#[test]
+fn a_dropped_cell_row_charges_only_its_owned_objects() -> crate::Result<()> {
+    use crate::blob_tree::field_row::{RowCell, encode_row};
+
+    let at = |offset, size| BlobIndirection {
+        vhandle: ValueHandle {
+            blob_file_id: 3,
+            offset,
+            on_disk_size: size,
+        },
+        size,
+    };
+    let row = encode_row(&[
+        RowCell::Ref {
+            indirection: at(0, 100),
+            owner: true,
+        },
+        RowCell::Value(b"status"),
+        RowCell::Ref {
+            indirection: at(100, 40),
+            owner: false,
+        },
+    ])?;
+
+    let mut map = FragmentationMap::default();
+    map.on_dropped(&InternalValue::from_components(
+        "k",
+        row,
+        5,
+        ValueType::CellRow,
+    ));
+    assert_eq!(
+        map.0.get(&3),
+        Some(&FragmentationEntry {
+            len: 1,
+            bytes: 100,
+            on_disk_bytes: 100,
+        })
+    );
+    Ok(())
+}

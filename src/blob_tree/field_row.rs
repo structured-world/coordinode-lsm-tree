@@ -121,6 +121,37 @@ pub enum Cell<'a> {
     Ref(BlobRef),
 }
 
+/// A stored row's cells as written: value cells with their bytes, and every
+/// reference as a [`BlobRef`], without reading any object.
+///
+/// Returned by [`BlobTree::get_cells`](crate::BlobTree::get_cells).
+#[derive(Clone, Debug)]
+pub struct RowCells {
+    pub(crate) key: UserKey,
+    pub(crate) row: crate::Slice,
+}
+
+impl RowCells {
+    /// The row's cells in order, each a [`Cell::Value`] or a [`Cell::Ref`]
+    /// bound to the row's key, ready to be written back in a newer version.
+    ///
+    /// # Errors
+    ///
+    /// Returns an error if the stored row is malformed.
+    pub fn cells(&self) -> crate::Result<Vec<Cell<'_>>> {
+        Ok(decode_row(&self.row)?
+            .into_iter()
+            .map(|cell| match cell {
+                RowCell::Value(bytes) => Cell::Value(bytes),
+                RowCell::Ref { indirection, .. } => Cell::Ref(BlobRef {
+                    indirection,
+                    key: self.key.clone(),
+                }),
+            })
+            .collect())
+    }
+}
+
 /// A cell of an encoded row: its bytes, or the indirection of its object and
 /// whether this row owns it.
 #[derive(Clone, Copy, Debug)]

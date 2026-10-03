@@ -1,0 +1,367 @@
+// Rows written as cells, each heavy cell kept in a blob file on its own, and
+// metadata-only updates that keep a heavy cell without rewriting it.
+
+use lsm_tree::{
+    AbstractTree, AnyTree, BlobTree, Config, KvSeparationOptions, SeqNo, SequenceNumberCounter,
+    blob_tree::field_row::Cell, get_tmp_folder,
+};
+use test_log::test;
+
+/// Cells at or above this many bytes go to a blob file at flush.
+const THRESHOLD: u32 = 64;
+
+fn open(path: &std::path::Path, opts: KvSeparationOptions) -> lsm_tree::Result<BlobTree> {
+    let tree = Config::new(
+        path,
+        SequenceNumberCounter::default(),
+        SequenceNumberCounter::default(),
+    )
+    .with_kv_separation(Some(opts.separation_threshold(THRESHOLD)))
+    .blob_compression(lsm_tree::CompressionType::None)
+    .open()?;
+    let AnyTree::Blob(tree) = tree else {
+        panic!("a tree with kv separation opens as a blob tree");
+    };
+    Ok(tree)
+}
+
+/// The logical value a plain read returns for a row: every cell as a
+/// little-endian `u32` length and its bytes.
+fn framed(cells: &[&[u8]]) -> Vec<u8> {
+    let mut out = Vec::new();
+    for cell in cells {
+        out.extend_from_slice(&u32::try_from(cell.len()).expect("small cell").to_le_bytes());
+        out.extend_from_slice(cell);
+    }
+    out
+}
+
+/// The reference a row holds in cell `index`.
+fn reference(tree: &BlobTree, key: &str, index: usize) -> lsm_tree::Result<Cell<'static>> {
+    let row = tree.get_cells(key, SeqNo::MAX)?.expect("row exists");
+    match row.cells()?.swap_remove(index) {
+        Cell::Ref(reference) => Ok(Cell::Ref(reference)),
+        Cell::Value(_) => panic!("cell {index} of {key} is not a reference"),
+    }
+}
+
+/// A row reads back as its cells before and after the flush that moves its
+/// heavy cell into a blob file, and only the heavy cell moves.
+#[test]
+fn a_cell_row_reads_back_before_and_after_flush() -> lsm_tree::Result<()> {
+    let folder = get_tmp_folder();
+    let tree = open(folder.path(), KvSeparationOptions::default())?;
+    let body = vec![b'b'; 1_000];
+
+    tree.insert_cells("doc", &[Cell::Value(b"draft"), Cell::Value(&body)], 0)?;
+    assert_eq!(
+        tree.get("doc", SeqNo::MAX)?.as_deref(),
+        Some(&framed(&[b"draft", &body])[..])
+    );
+
+    tree.flush_active_memtable(0)?;
+    assert_eq!(tree.blob_file_count(), 1);
+    assert_eq!(
+        tree.get("doc", SeqNo::MAX)?.as_deref(),
+        Some(&framed(&[b"draft", &body])[..])
+    );
+    assert_eq!(
+        tree.size_of("doc", SeqNo::MAX)?,
+        Some(u32::try_from(framed(&[b"draft", &body]).len()).expect("small row"))
+    );
+
+    // Only the body became a reference; the status stayed in the row.
+    let row = tree.get_cells("doc", SeqNo::MAX)?.expect("row exists");
+    let cells = row.cells()?;
+    assert!(matches!(cells[0], Cell::Value(b"draft")));
+    assert!(matches!(&cells[1], Cell::Ref(r) if r.size() == 1_000));
+    Ok(())
+}
+
+/// A metadata-only update keeps the heavy cell where it is: flushing it writes
+/// no blob bytes, and the old and new versions both read back.
+#[test]
+fn a_metadata_only_update_writes_no_blob_bytes() -> lsm_tree::Result<()> {
+    let folder = get_tmp_folder();
+    let tree = open(folder.path(), KvSeparationOptions::default())?;
+    let body = vec![b'b'; 4_096];
+
+    tree.insert_cells("doc", &[Cell::Value(b"draft"), Cell::Value(&body)], 0)?;
+    tree.flush_active_memtable(0)?;
+    let blob_bytes = tree.current_version().blob_files.on_disk_size();
+
+    let body_ref = reference(&tree, "doc", 1)?;
+    tree.insert_cells("doc", &[Cell::Value(b"final"), body_ref], 1)?;
+    tree.flush_active_memtable(0)?;
+
+    assert_eq!(tree.blob_file_count(), 1, "the update wrote no blob file");
+    assert_eq!(
+        tree.current_version().blob_files.on_disk_size(),
+        blob_bytes,
+        "the update wrote no blob bytes"
+    );
+    assert_eq!(
+        tree.get("doc", SeqNo::MAX)?.as_deref(),
+        Some(&framed(&[b"final", &body])[..])
+    );
+    assert_eq!(
+        tree.get("doc", 1)?.as_deref(),
+        Some(&framed(&[b"draft", &body])[..]),
+        "the older version still reads at its snapshot"
+    );
+    Ok(())
+}
+
+/// Two versions share one object; collecting the older one leaves the object
+/// uncharged and readable through the newer one. Only when no version holds
+/// it is it charged, once, and its file goes.
+#[test]
+fn a_shared_object_is_charged_once_when_its_last_holder_goes() -> lsm_tree::Result<()> {
+    let folder = get_tmp_folder();
+    let tree = open(folder.path(), KvSeparationOptions::default())?;
+    let body = vec![b'b'; 4_096];
+
+    tree.insert_cells("doc", &[Cell::Value(b"draft"), Cell::Value(&body)], 0)?;
+    tree.flush_active_memtable(0)?;
+    let body_ref = reference(&tree, "doc", 1)?;
+    tree.insert_cells("doc", &[Cell::Value(b"final"), body_ref], 1)?;
+    tree.flush_active_memtable(0)?;
+
+    // The owner is collected, the borrower survives: nothing is garbage.
+    tree.major_compact(64_000_000, SeqNo::MAX)?;
+    assert_eq!(
+        tree.stale_blob_bytes(),
+        0,
+        "a borrowed object is not charged"
+    );
+    assert_eq!(tree.blob_file_count(), 1);
+    assert_eq!(
+        tree.get("doc", SeqNo::MAX)?.as_deref(),
+        Some(&framed(&[b"final", &body])[..])
+    );
+
+    // A plain overwrite lets go of the object: it is charged once and the
+    // file, holding nothing else, goes.
+    tree.insert("doc", "gone", 2);
+    tree.flush_active_memtable(0)?;
+    tree.major_compact(64_000_000, SeqNo::MAX)?;
+    assert_eq!(tree.blob_file_count(), 0, "the file held only the object");
+    assert_eq!(tree.get("doc", SeqNo::MAX)?.as_deref(), Some(&b"gone"[..]));
+    Ok(())
+}
+
+/// A reference read from one key is refused under another, and one object in
+/// two cells is refused: either would let an object outlive its accounting.
+#[test]
+fn a_reference_is_refused_under_another_key_or_twice_in_a_row() -> lsm_tree::Result<()> {
+    let folder = get_tmp_folder();
+    let tree = open(folder.path(), KvSeparationOptions::default())?;
+    let body = vec![b'b'; 1_000];
+    tree.insert_cells("a", &[Cell::Value(&body)], 0)?;
+    tree.flush_active_memtable(0)?;
+    let body_ref = reference(&tree, "a", 0)?;
+
+    let foreign = tree.insert_cells("b", std::slice::from_ref(&body_ref), 1);
+    assert!(
+        matches!(foreign, Err(lsm_tree::Error::BlobRef(_))),
+        "{foreign:?}"
+    );
+    let twice = tree.insert_cells("a", &[body_ref.clone(), body_ref], 1);
+    assert!(
+        matches!(twice, Err(lsm_tree::Error::BlobRef(_))),
+        "{twice:?}"
+    );
+    assert!(tree.get("b", SeqNo::MAX)?.is_none(), "nothing was written");
+    Ok(())
+}
+
+/// A version not written as cells has no cells to hand out.
+#[test]
+fn get_cells_refuses_a_plain_value() -> lsm_tree::Result<()> {
+    let folder = get_tmp_folder();
+    let tree = open(folder.path(), KvSeparationOptions::default())?;
+    tree.insert("plain", "value", 0);
+    assert!(matches!(
+        tree.get_cells("plain", SeqNo::MAX),
+        Err(lsm_tree::Error::BlobRef(_))
+    ));
+    assert!(tree.get_cells("absent", SeqNo::MAX)?.is_none());
+    Ok(())
+}
+
+/// Builds a blob file holding `doc`'s body and a garbage value, so a major
+/// compaction relocates the body.
+fn stale_file_with_a_body(tree: &BlobTree, body: &[u8]) -> lsm_tree::Result<()> {
+    let filler = vec![b'f'; 8_192];
+    tree.insert_cells("doc", &[Cell::Value(b"draft"), Cell::Value(body)], 0)?;
+    tree.insert("filler", &filler, 0);
+    tree.flush_active_memtable(0)?;
+    tree.insert("filler", "small", 1);
+    tree.flush_active_memtable(0)?;
+    Ok(())
+}
+
+/// A relocation moves the body; the reference read before it is refused as
+/// stale, and a fresh read hands out the moved one.
+#[test]
+fn a_reference_moved_by_relocation_is_refused_as_stale() -> lsm_tree::Result<()> {
+    let folder = get_tmp_folder();
+    let tree = open(
+        folder.path(),
+        KvSeparationOptions::default().age_cutoff(1.0),
+    )?;
+    let body = vec![b'b'; 4_096];
+    stale_file_with_a_body(&tree, &body)?;
+
+    let before = reference(&tree, "doc", 1)?;
+    tree.major_compact(64_000_000, SeqNo::MAX)?;
+
+    let stale = tree.insert_cells("doc", &[Cell::Value(b"final"), before], 2);
+    assert!(
+        matches!(stale, Err(lsm_tree::Error::BlobRef(_))),
+        "{stale:?}"
+    );
+
+    let after = reference(&tree, "doc", 1)?;
+    tree.insert_cells("doc", &[Cell::Value(b"final"), after], 2)?;
+    assert_eq!(
+        tree.get("doc", SeqNo::MAX)?.as_deref(),
+        Some(&framed(&[b"final", &body])[..])
+    );
+    Ok(())
+}
+
+/// A row in the memtable that borrows an object keeps its blob file through a
+/// relocation that moves every table's reference out of it: no table links
+/// the file for that row until it is flushed.
+#[test]
+fn a_memtable_reference_keeps_its_file_through_relocation() -> lsm_tree::Result<()> {
+    let folder = get_tmp_folder();
+    let tree = open(
+        folder.path(),
+        KvSeparationOptions::default().age_cutoff(1.0),
+    )?;
+    let body = vec![b'b'; 4_096];
+    stale_file_with_a_body(&tree, &body)?;
+
+    let body_ref = reference(&tree, "doc", 1)?;
+    tree.insert_cells("doc", &[Cell::Value(b"final"), body_ref], 2)?;
+    tree.major_compact(64_000_000, SeqNo::MAX)?;
+    assert_eq!(
+        tree.get("doc", SeqNo::MAX)?.as_deref(),
+        Some(&framed(&[b"final", &body])[..]),
+        "the memtable row still reads its object"
+    );
+
+    // Once the row is in a table and that table is compacted, the old file
+    // can go and the row still reads.
+    tree.flush_active_memtable(0)?;
+    tree.major_compact(64_000_000, SeqNo::MAX)?;
+    tree.major_compact(64_000_000, SeqNo::MAX)?;
+    assert_eq!(
+        tree.get("doc", SeqNo::MAX)?.as_deref(),
+        Some(&framed(&[b"final", &body])[..])
+    );
+    Ok(())
+}
+
+/// Dropping the table that owns an object keeps the file while a memtable row
+/// borrows the object.
+#[test]
+fn drop_range_keeps_a_file_a_memtable_row_borrows_from() -> lsm_tree::Result<()> {
+    let folder = get_tmp_folder();
+    let tree = open(folder.path(), KvSeparationOptions::default())?;
+    let body = vec![b'b'; 4_096];
+    tree.insert_cells("doc", &[Cell::Value(b"draft"), Cell::Value(&body)], 0)?;
+    tree.flush_active_memtable(0)?;
+
+    let body_ref = reference(&tree, "doc", 1)?;
+    tree.insert_cells("doc", &[Cell::Value(b"final"), body_ref], 1)?;
+    tree.drop_range::<&str, _>(..)?;
+    assert_eq!(tree.table_count(), 0, "the owner's table is gone");
+    assert_eq!(
+        tree.blob_file_count(),
+        1,
+        "the borrowed object's file stays"
+    );
+    assert_eq!(
+        tree.get("doc", SeqNo::MAX)?.as_deref(),
+        Some(&framed(&[b"final", &body])[..])
+    );
+    Ok(())
+}
+
+/// Rows, their references and the blob accounting are what the tables say:
+/// after a reopen the rows read back, hand out working references, and the
+/// shared object is still charged once.
+#[test]
+fn cell_rows_survive_a_reopen() -> lsm_tree::Result<()> {
+    let folder = get_tmp_folder();
+    let body = vec![b'b'; 4_096];
+    {
+        let tree = open(folder.path(), KvSeparationOptions::default())?;
+        tree.insert_cells("doc", &[Cell::Value(b"draft"), Cell::Value(&body)], 0)?;
+        tree.flush_active_memtable(0)?;
+        let body_ref = reference(&tree, "doc", 1)?;
+        tree.insert_cells("doc", &[Cell::Value(b"final"), body_ref], 1)?;
+        tree.flush_active_memtable(0)?;
+    }
+    let tree = open(folder.path(), KvSeparationOptions::default())?;
+    assert_eq!(
+        tree.get("doc", SeqNo::MAX)?.as_deref(),
+        Some(&framed(&[b"final", &body])[..])
+    );
+    let body_ref = reference(&tree, "doc", 1)?;
+    tree.insert_cells("doc", &[Cell::Value(b"done"), body_ref], 2)?;
+    tree.flush_active_memtable(0)?;
+    tree.major_compact(64_000_000, SeqNo::MAX)?;
+    assert_eq!(tree.stale_blob_bytes(), 0);
+    assert_eq!(
+        tree.get("doc", SeqNo::MAX)?.as_deref(),
+        Some(&framed(&[b"done", &body])[..])
+    );
+    Ok(())
+}
+
+/// A snapshot held below a compaction's watermark keeps the versions it reads
+/// and the objects they hold.
+#[test]
+fn a_held_snapshot_keeps_the_objects_it_reads() -> lsm_tree::Result<()> {
+    let folder = get_tmp_folder();
+    let tree = open(folder.path(), KvSeparationOptions::default())?;
+    let first = vec![b'1'; 4_096];
+    let second = vec![b'2'; 4_096];
+    tree.insert_cells("doc", &[Cell::Value(&first)], 0)?;
+    tree.flush_active_memtable(0)?;
+    tree.insert_cells("doc", &[Cell::Value(&second)], 1)?;
+    tree.flush_active_memtable(0)?;
+
+    // A reader at seqno 1 still sees the first version: the watermark keeps it.
+    tree.major_compact(64_000_000, 1)?;
+    assert_eq!(tree.get("doc", 1)?.as_deref(), Some(&framed(&[&first])[..]));
+    assert_eq!(
+        tree.get("doc", SeqNo::MAX)?.as_deref(),
+        Some(&framed(&[&second])[..])
+    );
+    Ok(())
+}
+
+/// Ingestion separates each heavy cell on its own, as a flush does.
+#[test]
+fn ingested_cells_separate_per_cell() -> lsm_tree::Result<()> {
+    let folder = get_tmp_folder();
+    let tree = open(folder.path(), KvSeparationOptions::default())?;
+    let body = vec![b'b'; 1_000];
+    let mut ingestion = lsm_tree::blob_tree::ingest::BlobIngestion::new(&tree)?;
+    ingestion.write_cells("doc".into(), &[b"draft", &body])?;
+    ingestion.finish()?;
+
+    assert_eq!(tree.blob_file_count(), 1);
+    assert_eq!(
+        tree.get("doc", SeqNo::MAX)?.as_deref(),
+        Some(&framed(&[b"draft", &body])[..])
+    );
+    let row = tree.get_cells("doc", SeqNo::MAX)?.expect("row exists");
+    assert!(matches!(row.cells()?[1], Cell::Ref(_)));
+    Ok(())
+}
