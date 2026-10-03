@@ -5862,7 +5862,9 @@ fn rebuild_from_scan(
             // A table rewritten only to hand ownership loses nothing: it stays
             // as it was, its owners unchanged, if the rewrite cannot be made.
             let kept_as_is = if needs_rewrite {
-                drop(table); // release the handle before reading the source again
+                // Its descriptor too: a replacement may be renamed over below,
+                // which a backend refuses for an open file (Windows).
+                release_held(config, table);
                 None
             } else {
                 Some(table)
@@ -5887,7 +5889,9 @@ fn rebuild_from_scan(
                 },
             ) {
                 Ok(SalvageOutcome::Salvaged(rewritten)) => {
-                    drop(kept_as_is);
+                    if let Some(table) = kept_as_is {
+                        release_held(config, table);
+                    }
                     let rewritten = restrict_salvaged_output(
                         &*fs,
                         config,
@@ -5897,28 +5901,42 @@ fn rebuild_from_scan(
                         allow_resurrection,
                     )?;
                     let restricted = rewritten.restrict_lower_bound().is_some();
-                    // A source that is itself a replacement this repair built
-                    // is superseded by the copy: its pending swap carries the
-                    // copy onto the name the source was to take, and the
-                    // source, published nowhere, goes once the repair closes
-                    // its files. A second swap onto the source's own name
-                    // would run after the first and leave the older bytes
-                    // where the manifest names these.
                     if let Some(pending) = swap_after_commit
                         .iter_mut()
                         .find(|(_, tmp, ..)| *tmp == path)
                     {
-                        pending.1.clone_from(&output_path);
-                        pending.3 = restricted;
-                        discard_after_commit.push((
+                        // A source that is itself a replacement this repair
+                        // built is superseded by the copy, which takes the
+                        // replacement's name before the manifest can name it:
+                        // a crash between the commit and the swap then leaves
+                        // the copy the manifest names where the next open
+                        // finishes swaps from, not under a name no scan reads.
+                        // The replacement is no longer needed: a failed commit
+                        // is retried from the untouched original.
+                        let checksum = rewritten.checksum();
+                        let bound = rewritten.restrict_lower_bound().cloned();
+                        release_held(config, rewritten);
+                        commit_repair_tmp(&*fs, &output_path, &path, config.sync_mode, restricted)?;
+                        let published = Table::recover(held_recover_params(
+                            config,
+                            path.clone(),
+                            checksum,
+                            source_id,
                             Arc::clone(&fs),
-                            path,
-                            "a replacement superseded by its rewrite".into(),
-                        ));
+                            Some(source_global_seqno),
+                        ))?;
+                        let published = match bound {
+                            Some(bound) => {
+                                published.reopen_restricted_with(bound, held_descriptors(config))?
+                            }
+                            None => published,
+                        };
+                        pending.3 = restricted;
+                        kept.push((published, fidelity, source_path, source_fs));
                     } else {
                         swap_after_commit.push((Arc::clone(&fs), output_path, path, restricted));
+                        kept.push((rewritten, fidelity, source_path, source_fs));
                     }
-                    kept.push((rewritten, fidelity, source_path, source_fs));
                 }
                 // A retryable failure leaves the source where it was found, so
                 // the retry re-derives the same rewrite from it; nothing to

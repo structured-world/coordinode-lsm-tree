@@ -1147,9 +1147,19 @@ fn a_scan_reads_its_objects_through_a_compaction_that_moves_them() -> lsm_tree::
         // The documents only: the filler is stored whole, with no projector.
         let documents = ..lsm_tree::UserKey::from("zz");
         let scan = any.columnar_scan(projection, None, SeqNo::MAX, documents)?;
-        let files_before = tree.blob_file_count();
+        // The filler is charged, and nothing has moved the bodies yet.
+        assert!(
+            tree.stale_blob_bytes() > 0,
+            "columnar={columnar}: the bodies' file holds garbage when the scan is made"
+        );
         tree.major_compact(64_000_000, SeqNo::MAX)?;
         tree.major_compact(64_000_000, SeqNo::MAX)?;
+        // The bodies moved and their old file went, under the scan.
+        assert_eq!(
+            tree.stale_blob_bytes(),
+            0,
+            "columnar={columnar}: the compactions relocated the bodies"
+        );
 
         let got = rows(scan)?;
         assert_eq!(got.len(), 50, "columnar={columnar}");
@@ -1160,10 +1170,6 @@ fn a_scan_reads_its_objects_through_a_compaction_that_moves_them() -> lsm_tree::
                 .expect("a number");
             assert_eq!(cells[0], Some(body(i)), "columnar={columnar}");
         }
-        assert!(
-            tree.blob_file_count() <= files_before,
-            "columnar={columnar}: the compactions ran"
-        );
     }
     Ok(())
 }

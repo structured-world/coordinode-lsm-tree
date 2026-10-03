@@ -647,12 +647,34 @@ pub(super) fn install_merge(
             let Some(file) = current_version.version.blob_files.get(id) else {
                 continue;
             };
-            let charged = |map: &FragmentationMap| map.get(&id).map_or(0, |entry| entry.bytes);
-            let total = file.0.meta.total_uncompressed_bytes;
-            let so_far = charged(current_version.version.gc_stats()) + charged(&blob_frag_map);
-            if let Some(rest) = total.checked_sub(so_far).filter(|rest| *rest > 0) {
+            // What the stats and this pass charged so far, as objects,
+            // uncompressed bytes and bytes on disk.
+            let charged = |map: &FragmentationMap| {
+                map.get(&id)
+                    .map_or((0, 0, 0), |e| (e.len, e.bytes, e.on_disk_bytes))
+            };
+            let (stats, pass) = (
+                charged(current_version.version.gc_stats()),
+                charged(&blob_frag_map),
+            );
+            let meta = &file.0.meta;
+            // The rest of each counter, so the file reads as fully charged
+            // for what it frees on disk too. A counter already at its total
+            // adds nothing.
+            let rest = |total: u64, a: u64, b: u64| total.saturating_sub(a + b);
+            // A file of more objects than a `usize` counts is not one this
+            // build wrote.
+            let len = usize::try_from(meta.item_count)
+                .unwrap_or(usize::MAX)
+                .saturating_sub(stats.0 + pass.0);
+            let bytes = rest(meta.total_uncompressed_bytes, stats.1, pass.1);
+            let on_disk = rest(meta.total_compressed_bytes, stats.2, pass.2);
+            if bytes > 0 {
                 let mut fill = FragmentationMap::default();
-                fill.insert(id, crate::blob_tree::FragmentationEntry::new(0, rest, 0));
+                fill.insert(
+                    id,
+                    crate::blob_tree::FragmentationEntry::new(len, bytes, on_disk),
+                );
                 fill.merge_into(&mut blob_frag_map);
             }
         }

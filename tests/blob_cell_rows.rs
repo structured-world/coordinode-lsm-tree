@@ -671,6 +671,13 @@ fn a_memtable_reference_keeps_its_file_through_relocation() -> lsm_tree::Result<
         Some(&framed(&[b"final", &body])[..]),
         "the memtable row still reads its object"
     );
+    // The relocated file stays for that row, all of it garbage: the body was
+    // copied out and the filler was dead, and the stale bytes say so.
+    assert_eq!(
+        tree.stale_blob_bytes(),
+        (body.len() + 8_192) as u64,
+        "the whole relocated file is stale"
+    );
 
     // Once the row is in a table and that table is compacted, the old file
     // can go and the row still reads.
