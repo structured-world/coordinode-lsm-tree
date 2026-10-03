@@ -96,7 +96,9 @@ rounds it overlaps and divides out of their ratio. Each group reports, per
 engine, the median over the rounds of its time over RocksDB's in the same
 round and its median time per operation, each with a distribution-free 95%
 confidence interval. An arm runs as many iterations per sample as fill 20 ms,
-and a group as many rounds as fit a 4-second budget, between ten and forty.
+and a group as many rounds as fit a 4-second budget, between ten and forty,
+rounded to a multiple of the group's engine count so every engine takes every
+position equally often.
 Two runs of one commit on one quiet host agreed on the ratio to within 2% on
 the median arm and 7% on nine arms in ten, so a ratio within a few percent of
 1 is parity. `cargo bench --bench compare -- --help` lists the flags that

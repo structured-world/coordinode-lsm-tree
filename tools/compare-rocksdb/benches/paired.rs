@@ -42,7 +42,8 @@ pub struct Settings {
     pub budget: Duration,
     /// Rounds run however long they take.
     pub min_rounds: usize,
-    /// Rounds never exceeded, however cheap the arms.
+    /// Rounds not exceeded, however cheap the arms, unless the floor rounded
+    /// up to a multiple of the arm count passes it.
     pub max_rounds: usize,
 }
 
@@ -119,9 +120,21 @@ pub fn run(
         .zip(&iters)
         .map(|(t, &k)| t.as_nanos().max(1) * u128::from(k))
         .sum();
-    let rounds = usize::try_from(settings.budget.as_nanos() / round_cost)
+    let fit = usize::try_from(settings.budget.as_nanos() / round_cost)
         .unwrap_or(usize::MAX)
         .clamp(settings.min_rounds, settings.max_rounds);
+    // A multiple of the arm count, so the rotation gives every arm every
+    // position equally often: up to the next multiple, or down to the one
+    // below when the next would pass the ceiling and the one below still
+    // reaches the floor.
+    let k = arms.len();
+    let up = fit.div_ceil(k) * k;
+    let down = fit / k * k;
+    let rounds = if up > settings.max_rounds && down >= settings.min_rounds {
+        down
+    } else {
+        up
+    };
 
     // samples[arm][round], nanoseconds per operation.
     let mut samples = vec![Vec::with_capacity(rounds); arms.len()];
