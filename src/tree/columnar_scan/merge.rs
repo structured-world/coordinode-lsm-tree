@@ -74,6 +74,76 @@ struct MergeSource {
     /// Whether a row of `batch` is chosen for the output being built, so the
     /// batch must stay until the output is gathered.
     referenced: bool,
+    /// The columns of the segment read for its chosen rows only.
+    late: LatePayload,
+}
+
+/// The columns of a columnar segment a merge reads only for the rows it
+/// chooses, and how dense its choices are.
+///
+/// The key, seqno and value type of every row are read to decide it; the
+/// payload (the projected fields but the predicate's, a whole value, a blob
+/// tree's references) is read afterwards, from the row page of each batch a
+/// row was chosen from, and only from those: a page none of whose rows is
+/// chosen is never requested, and only the chosen rows' cells are gathered.
+/// When most of a segment's row pages hold a chosen row anyway, reading the
+/// payload page by page would only add requests for the same pages, so the
+/// segment's cursor reads it with the rest from its next row group on, and
+/// goes back once the choices thin out again.
+#[derive(Default)]
+struct LatePayload {
+    /// Each column as the table stores it and as the merge carries it.
+    columns: Vec<(u16, u16)>,
+    /// The columns the cursor decodes with the payload; empty without one.
+    eager_ids: Vec<u16>,
+    /// The columns it decodes without it.
+    lean_ids: Vec<u16>,
+    /// Whether the cursor reads the payload with the rest, the choices
+    /// being dense.
+    eager: bool,
+    /// Whether the current batch was read without its payload.
+    batch_late: bool,
+    /// The row page the current batch was read from.
+    batch_at: Option<crate::table::columnar_cursor::PageAt>,
+    /// Rows chosen from the current batch.
+    batch_picks: u32,
+    /// Row pages loaded so far, and how many of them held a chosen row.
+    pages: u32,
+    pages_hit: u32,
+}
+
+/// Row pages a segment is judged dense or sparse over, at the least.
+const DENSITY_WINDOW: u32 = 4;
+
+impl LatePayload {
+    /// Records the batch just spent, and returns the columns the cursor is to
+    /// decode from now on when the choices turned dense or sparse.
+    fn spent(&mut self) -> Option<&[u16]> {
+        if self.columns.is_empty() {
+            return None;
+        }
+        self.pages += 1;
+        if self.batch_picks > 0 {
+            self.pages_hit += 1;
+        }
+        self.batch_picks = 0;
+        if self.pages < DENSITY_WINDOW {
+            return None;
+        }
+        // Dense from three in four pages holding a chosen row, sparse again
+        // from one in four: the gap keeps a segment near either from flipping
+        // back and forth.
+        let (hit, all) = (u64::from(self.pages_hit), u64::from(self.pages));
+        if !self.eager && hit * 4 >= all * 3 {
+            self.eager = true;
+            return Some(&self.eager_ids);
+        }
+        if self.eager && hit * 4 <= all {
+            self.eager = false;
+            return Some(&self.lean_ids);
+        }
+        None
+    }
 }
 
 /// How a source's batch stores the projected fields.
@@ -242,11 +312,33 @@ impl MergeStream {
                 // version (including a newest one that fails the predicate but
                 // shadows an older matching version) has to be seen, and the
                 // zone-map skip it would drive is unsafe for the same reason.
-                let SegmentCursor { cursor, whole } =
-                    scan.segment_cursor(seg, &augmented, None, share)?;
+                let SegmentCursor {
+                    mut cursor,
+                    whole,
+                    ids,
+                } = scan.segment_cursor(seg, &augmented, None, share)?;
+                let columns = scan.late_payload(seg);
+                let late = if columns.is_empty() {
+                    LatePayload::default()
+                } else {
+                    let lean_ids: Vec<u16> = ids
+                        .iter()
+                        .copied()
+                        .filter(|id| columns.iter().all(|&(stored, _)| stored != *id))
+                        .collect();
+                    // Set before the cursor reads anything.
+                    cursor.set_projection(&lean_ids);
+                    LatePayload {
+                        columns,
+                        eager_ids: ids,
+                        lean_ids,
+                        ..LatePayload::default()
+                    }
+                };
                 Ok(MergeSource {
                     cursor,
                     whole,
+                    late,
                     batch: None,
                     types: FieldTypes::AsDeclared,
                     row: 0,
@@ -339,6 +431,7 @@ impl MergeStream {
             source.row += 1;
             if keep {
                 source.referenced = true;
+                source.late.batch_picks += 1;
                 self.pending.push(Pick {
                     source: winner,
                     row,
@@ -478,14 +571,29 @@ impl MergeStream {
                 }
             }
             // The spent batch goes before the cursor reads on, so the source
-            // never holds it and a new run at once.
-            source.batch = None;
-            match source.cursor.next() {
+            // never holds it and a new run at once. How dense its choices were
+            // decides how the next row group's payload is read.
+            if source.batch.take().is_some()
+                && let Some(ids) = source.late.spent()
+            {
+                source.cursor.set_projection(ids);
+            }
+            match source.cursor.next_located() {
                 None => return Ok((Position::Exhausted, loaded)),
-                Some(batch) => {
+                Some(located) => {
+                    let (batch, at) = located?;
+                    // Read without its payload when the cursor decoded none
+                    // of it: a row group read before a switch to dense reads
+                    // still comes as it was read.
+                    source.late.batch_late = at.is_some()
+                        && !source.late.columns.is_empty()
+                        && source.late.columns.iter().all(|&(stored, _)| {
+                            batch.columns.iter().all(|c| c.column_id != stored)
+                        });
+                    source.late.batch_at = at;
                     // A whole value moves aside before the conform, where a
                     // declared field may share the value column's id.
-                    let batch = carry_whole_value(batch?, source.whole, raw);
+                    let batch = carry_whole_value(batch, source.whole, raw);
                     // Its rows are not decided yet: a shadowed or deleted
                     // one must not fail the scan, and the predicate after
                     // the dedup sees the declared defaults.
@@ -798,7 +906,7 @@ impl MergeStream {
     /// to the projector; an operand still to be resolved is judged after its
     /// value is read.
     fn judge_and_build(
-        &self,
+        &mut self,
         scan: &ColumnarScan,
         pending: Vec<Pick>,
         support: &mut PredicateSupport,
@@ -826,11 +934,15 @@ impl MergeStream {
             PredicateTiming::BeforeValuesExceptOperands => {
                 self.judge(scan, pending, Some(&types), &layout, support)?
             }
+            PredicateTiming::AfterValues if layout.judged => self.prejudge(scan, pending),
             PredicateTiming::AfterValues => pending,
         };
         if pending.is_empty() {
             return Ok(None);
         }
+        // The rows are chosen, and judged where the predicate could judge
+        // them yet: only now is their payload read, from their row pages.
+        self.fill_late(scan, &pending)?;
         let early = timing == PredicateTiming::BeforeValues;
         // The columns the merge decoded for itself leave the output once its
         // rows are decided. Read again after the gather only to read the
@@ -855,6 +967,110 @@ impl MergeStream {
             early,
             left_out: layout.left_out,
         }))
+    }
+
+    /// The chosen rows of `pending` a predicate judged after the values could
+    /// already be dropped by, before any payload is read: a row whose batch
+    /// stores the predicate's field as a column of its declared type, with a
+    /// cell for the row, holds there the value its field reads as, so the
+    /// predicate's verdict on that cell is final. Every other row is kept,
+    /// for the predicate to judge once its value is read; the predicate runs
+    /// over every row again then, so what it drops here it drops anyway.
+    fn prejudge(&self, scan: &ColumnarScan, pending: Vec<Pick>) -> Vec<Pick> {
+        let Some(pred) = scan
+            .predicate
+            .as_ref()
+            .filter(|p| p.apply == PredicateApply::Filter)
+        else {
+            return pending;
+        };
+        // An operand reads as the value it resolves to, not as its own
+        // cells; and with no payload read late, there is nothing to spare.
+        if scan.resolver.is_some() || !self.sources.iter().any(|s| s.late.batch_late) {
+            return pending;
+        }
+        let matchers: Vec<Option<(RowMatcher<'_>, &Column)>> = self
+            .sources
+            .iter()
+            .map(|s| {
+                if s.whole || !s.referenced || s.types != FieldTypes::AsDeclared {
+                    return None;
+                }
+                let batch = s.batch.as_ref()?;
+                let column = batch
+                    .columns
+                    .iter()
+                    .find(|c| c.column_id == pred.column_id)?;
+                Some((pred.matcher(batch), column))
+            })
+            .collect();
+        pending
+            .into_iter()
+            .filter(
+                |pick| match matchers.get(pick.source).and_then(Option::as_ref) {
+                    Some((matcher, column)) if column.is_valid(pick.row) => {
+                        matcher.matches(pick.row)
+                    }
+                    _ => true,
+                },
+            )
+            .collect()
+    }
+
+    /// Reads the payload of each batch a row of `pending` was chosen from and
+    /// that was read without it, from that batch's row page alone, into the
+    /// columns that stood in for it. A column the row group does not store
+    /// stays as it stood, absent; one stored under another type than the
+    /// field declares stays too, and the rows of the batch returned fail the
+    /// scan as any row of a mistyped batch does.
+    fn fill_late(&mut self, scan: &ColumnarScan, pending: &[Pick]) -> crate::Result<()> {
+        let mut copied = 0usize;
+        let result = (|| {
+            for (index, source) in self.sources.iter_mut().enumerate() {
+                let MergeSource {
+                    cursor,
+                    batch,
+                    late,
+                    types,
+                    ..
+                } = source;
+                if !late.batch_late || !pending.iter().any(|pick| pick.source == index) {
+                    continue;
+                }
+                let (Some(at), Some(table), Some(batch)) =
+                    (late.batch_at.as_ref(), cursor.table(), batch.as_mut())
+                else {
+                    continue;
+                };
+                let stored: Vec<u16> = late.columns.iter().map(|&(id, _)| id).collect();
+                for column in table.columns_at(at, &stored, &mut copied)? {
+                    let Some(&(_, carried)) =
+                        late.columns.iter().find(|&&(id, _)| id == column.column_id)
+                    else {
+                        continue;
+                    };
+                    column.validate(batch.row_count)?;
+                    let Some(slot) = batch.columns.iter_mut().find(|c| c.column_id == carried)
+                    else {
+                        continue;
+                    };
+                    if slot.type_tag != column.type_tag {
+                        if *types == FieldTypes::AsDeclared {
+                            *types = FieldTypes::Mistyped;
+                        }
+                        continue;
+                    }
+                    *slot = Column {
+                        column_id: carried,
+                        ..column
+                    };
+                }
+                late.batch_late = false;
+            }
+            Ok(())
+        })();
+        scan.record_copied(copied);
+        result
     }
 
     /// The chosen rows of `pending` the scan's filtering predicate keeps,

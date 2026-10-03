@@ -653,6 +653,8 @@ struct DedupState {
 pub(super) struct SegmentCursor {
     cursor: SourceCursor,
     whole: bool,
+    /// The columns the cursor decodes.
+    ids: Vec<u16>,
 }
 
 /// A singleton group streamed from its table's cursor.
@@ -974,6 +976,22 @@ impl ColumnarScan {
         #[cfg(not(feature = "metrics"))]
         let _ = batch;
     }
+
+    /// Records `bytes` a read copied out of the pages it decoded.
+    #[inline]
+    #[cfg_attr(
+        not(feature = "metrics"),
+        expect(
+            clippy::unused_self,
+            reason = "the scan's metrics exist only with the feature"
+        )
+    )]
+    fn record_copied(&self, bytes: usize) {
+        #[cfg(feature = "metrics")]
+        self.metrics.record_gather(bytes);
+        #[cfg(not(feature = "metrics"))]
+        let _ = bytes;
+    }
 }
 
 impl ColumnarScan {
@@ -1072,7 +1090,7 @@ impl ColumnarScan {
                 self.lo.clone(),
                 self.hi.clone(),
                 self.seqno,
-                ids,
+                ids.clone(),
                 share,
             ))),
             // Within the span its group was formed on: the active memtable
@@ -1091,12 +1109,51 @@ impl ColumnarScan {
                     &lo,
                     &hi,
                     self.seqno,
-                    ids,
+                    ids.clone(),
                     share,
                 )))
             }
         };
-        Ok(SegmentCursor { cursor, whole })
+        Ok(SegmentCursor { cursor, whole, ids })
+    }
+
+    /// The columns of `seg` a merge reads for its chosen rows only, as the
+    /// pairs of the id a table stores each under and the id the merge carries
+    /// it under: the fields the projection declares, but the predicate's,
+    /// and the columns a whole value or a blob tree's references are carried
+    /// in. Empty for a source read row by row, and while operands are
+    /// resolved or the raw value is read as well, whose values are needed
+    /// whole.
+    fn late_payload(&self, seg: &Segment) -> Vec<(u16, u16)> {
+        use crate::blob_tree::field_row::CELL_REFS_COLUMN;
+        use crate::table::columnar::COL_VALUE;
+
+        if seg.is_rows() || self.resolver.is_some() || self.raw_value_read() {
+            return Vec::new();
+        }
+        let predicate = self.predicate.as_ref().map(|p| p.column_id);
+        let fields = self
+            .fields
+            .iter()
+            .filter(|f| projection::is_declared(f) && Some(f.column_id()) != predicate)
+            .map(|f| (f.column_id(), f.column_id()));
+        if seg.cells {
+            fields
+                .chain([
+                    (CELL_REFS_COLUMN, CELL_REFS_COLUMN),
+                    (merge::COL_WHOLE_VALUE, merge::COL_WHOLE_VALUE),
+                ])
+                .collect()
+        } else if seg.whole {
+            // The declared fields lie inside the whole value.
+            if self.declared || self.cells.is_some() {
+                alloc::vec![(COL_VALUE, merge::COL_WHOLE_VALUE)]
+            } else {
+                Vec::new()
+            }
+        } else {
+            fields.collect()
+        }
     }
 
     /// The rows a merge returned, `batch`, with their values read: each merge

@@ -308,6 +308,132 @@ fn a_mistyped_field_or_a_field_by_id_is_refused() -> lsm_tree::Result<()> {
     Ok(())
 }
 
+/// A tree whose columnar tables cut rows into small pages and keep every
+/// field inline, so a field is read page by page.
+fn open_paged(path: &std::path::Path) -> lsm_tree::Result<(AnyTree, BlobTree)> {
+    let any = Config::new(
+        path,
+        SequenceNumberCounter::default(),
+        SequenceNumberCounter::default(),
+    )
+    .with_kv_separation(Some(
+        KvSeparationOptions::default().separation_threshold(1 << 20),
+    ))
+    .columnar_row_group_size_policy(lsm_tree::config::BlockSizePolicy::all(64 * 1_024))
+    .columnar_page_size_policy(lsm_tree::config::BlockSizePolicy::all(1_024))
+    .open()?;
+    let AnyTree::Blob(tree) = &any else {
+        panic!("a tree with kv separation opens as a blob tree");
+    };
+    let tree = tree.clone();
+    tree.index.update_runtime_config(|rc| rc.columnar = true)?;
+    Ok((any, tree))
+}
+
+/// Two overlapping columnar tables of rows with a price and a 200-byte note,
+/// merged by the scan; each key's price is its number.
+fn paged_notes(tree: &BlobTree, rows: u32) -> lsm_tree::Result<()> {
+    let note = |i: u32, round: u8| vec![b'a' + round + (i % 20) as u8; 200];
+    for round in 0..2u8 {
+        for i in (0..rows).filter(|i| round == 0 || i % 3 == 0) {
+            insert(
+                tree,
+                &format!("k{i:05}"),
+                b"s",
+                i,
+                &note(i, round),
+                u64::from(round) * u64::from(rows) + u64::from(i),
+            );
+        }
+        tree.flush_active_memtable(0)?;
+    }
+    Ok(())
+}
+
+/// A sparse predicate on a compact field reads the note only from the pages
+/// that hold a row it keeps: the note's other pages are read by a scan that
+/// keeps every row, after, and that is most of them.
+#[test]
+fn the_payload_of_rows_the_predicate_drops_is_not_read() -> lsm_tree::Result<()> {
+    let folder = get_tmp_folder();
+    let (any, tree) = open_paged(folder.path())?;
+    let rows = 2_000;
+    paged_notes(&tree, rows)?;
+    let m = any.metrics();
+    let cheap = ColumnRangePredicate {
+        column_id: PRICE,
+        lower: Some(0u32.to_be_bytes().to_vec()),
+        upper: Some(19u32.to_be_bytes().to_vec()),
+        apply: PredicateApply::Filter,
+    };
+    let metadata = Projection::new()
+        .column(COL_USER_KEY)
+        .field(field(PRICE, u32_le()));
+    let notes = Projection::new()
+        .column(COL_USER_KEY)
+        .field(field(PRICE, u32_le()))
+        .field(field(BODY, TypeTag::Bytes));
+
+    // The keys and prices first, so what follows reads only notes.
+    rows_of_scan(&any, metadata, None)?;
+
+    let before = m.bytes_read();
+    let sparse = rows_of_scan(&any, notes.clone(), Some(&cheap))?;
+    let sparse_read = m.bytes_read() - before;
+    assert_eq!(sparse.len(), 20);
+    for (key, cells) in &sparse {
+        let i: u32 = std::str::from_utf8(&key[1..])
+            .expect("utf8")
+            .parse()
+            .expect("a number");
+        let round = u8::from(i.is_multiple_of(3));
+        assert_eq!(cells[1], Some(vec![b'a' + round + (i % 20) as u8; 200]));
+    }
+
+    let before = m.bytes_read();
+    let dense = rows_of_scan(&any, notes, None)?;
+    let dense_read = m.bytes_read() - before;
+    assert_eq!(dense.len(), rows as usize);
+    assert!(
+        sparse_read * 10 < dense_read,
+        "the sparse scan read {sparse_read} bytes of notes, the rest of them took {dense_read}"
+    );
+    Ok(())
+}
+
+/// A predicate keeping one row per page needs every page of the note: the
+/// scan reads it with the rest once it sees its choices are dense, and
+/// returns the same rows as one that reads every note.
+#[test]
+fn a_dense_choice_reads_the_payload_with_the_rest() -> lsm_tree::Result<()> {
+    let folder = get_tmp_folder();
+    let (any, tree) = open_paged(folder.path())?;
+    let rows = 2_000;
+    paged_notes(&tree, rows)?;
+    let every_fourth_price = Projection::new()
+        .column(COL_USER_KEY)
+        .field(field(PRICE, u32_le()))
+        .field(field(BODY, TypeTag::Bytes));
+    let all = rows_of_scan(&any, every_fourth_price.clone(), None)?;
+    // Prices 0..=rows: every row kept, the densest choice there is.
+    let kept = ColumnRangePredicate {
+        column_id: PRICE,
+        lower: Some(0u32.to_be_bytes().to_vec()),
+        upper: Some(rows.to_be_bytes().to_vec()),
+        apply: PredicateApply::Filter,
+    };
+    assert_eq!(rows_of_scan(&any, every_fourth_price, Some(&kept))?, all);
+    Ok(())
+}
+
+fn rows_of_scan(
+    any: &AnyTree,
+    projection: Projection,
+    predicate: Option<&ColumnRangePredicate>,
+) -> lsm_tree::Result<Rows> {
+    rows(any.columnar_scan(projection, predicate, SeqNo::MAX, ..)?)
+}
+
 /// The scan returns, for every key, the fields a point read of it returns,
 /// across updates, deletions, flushes and compactions.
 #[test]
