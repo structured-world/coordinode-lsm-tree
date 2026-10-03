@@ -8,6 +8,9 @@
 # Single working-set sweep at NUM (default 500k). The head-to-head size sweep
 # (1k/10k/70k vs RocksDB + SurrealKV) lives in the separate `compare-rocksdb`
 # harness, not here — this dashboard tracks the single-engine trend only.
+#
+# Builds what it runs if it is not built yet; the workflow builds it first with
+# build-benchmarks.sh, so here `cargo run` finds both binaries fresh.
 
 set -e
 
@@ -24,8 +27,10 @@ cargo run --release --manifest-path tools/db_bench/Cargo.toml -- \
 # atomics on every read path, so it runs from a separate `counters` build
 # rather than slowing the rates above. Its series are costs, bytes per emitted
 # row, and are the whole of the other suite; any yield it publishes is
-# appended to the rate suite rather than replacing it.
-cargo run --release --manifest-path tools/db_bench/Cargo.toml --features counters -- \
+# appended to the rate suite rather than replacing it. It lives in its own
+# target directory, the one build-benchmarks.sh builds it in.
+cargo run --release --manifest-path tools/db_bench/Cargo.toml --features counters \
+  --target-dir tools/db_bench/target/counters -- \
   --benchmark mixed-layout --num "$NUM" --iterations "$ITERATIONS" \
   --github-json \
   --github-json-append benchmark-results.json \

@@ -38,12 +38,26 @@
 //! runs `--sample-size 10 --warm-up-time 0.5 --measurement-time 0.5`). A
 //! group-level `sample_size(..)` silently overrides the CLI, and with the
 //! cold-write arms costing seconds per iteration (RocksDB at zstd-22 writes
-//! 10k rows in ~5 s) a 100-sample default turns a one-minute arm into ten.
+//! 10k rows in ~10 s) a 100-sample default turns a two-minute arm into
+//! twenty.
 //!
-//! Warm read arms build their on-disk state ONCE per arm (see
+//! Ten samples is Criterion's floor, so an arm whose single iteration
+//! outlasts the window costs eleven iterations (the samples plus the
+//! warm-up) whatever the window says, and Criterion warns that it could not
+//! fit them. What bounds such an arm is its size, which is why the per-push
+//! matrix leaves out the arms that cannot fit (see [`cold_write_sizes`]).
+//! `COMPARE_FULL_MATRIX=1` runs them too:
+//!
+//! ```text
+//! cd tools/compare-rocksdb && COMPARE_FULL_MATRIX=1 cargo bench
+//! ```
+//!
+//! Warm read arms open their on-disk state ONCE per arm (see
 //! [`WarmEngine`]): Criterion re-enters a `bench_with_input` routine
 //! closure for the warm-up pass and for every sample, so anything built
-//! inside the closure is rebuilt once per sample.
+//! inside the closure is rebuilt once per sample. The state itself is
+//! written once per engine, codec and size and copied for each arm and
+//! each overwrite iteration that starts from it (see [`SeedStates`]).
 //!
 //! ## Engine matrix
 //!
@@ -100,10 +114,13 @@
 //!   timed window). Overwrite cost (memtable churn over existing keys +
 //!   a superseding flush), distinct from cold first-insert.
 //!
-//! Each of the above also has a `_zstd22` sibling. Not yet portable
+//! Each of the above also has a `_zstd22` sibling, at the same sizes except
+//! `write_throughput_zstd22` and `overwrite_zstd22`, which run 70k only in
+//! the full matrix (see [`cold_write_sizes`]). Not yet portable
 //! head-to-head: `readwhilewriting` (concurrency) and `mergerandom`
 //! (merge-operator semantics differ across engines) from [#244]'s list.
 
+use std::collections::HashMap;
 use std::time::Duration;
 
 use criterion::{BenchmarkId, Criterion, Throughput, criterion_group, criterion_main};
@@ -122,7 +139,7 @@ use lsm_tree::{
 };
 
 /// In-block index strategy overlaid as a separate `point_read` series.
-#[derive(Clone, Copy, PartialEq, Eq)]
+#[derive(Clone, Copy, PartialEq, Eq, Hash)]
 enum IndexStrategy {
     /// Binary search over the restart array (the engine default).
     Binary,
@@ -224,7 +241,7 @@ fn setup_surrealkv_warm(
 /// variant and emits per-engine timings under the same criterion
 /// `BenchmarkGroup`, so the gh-pages dashboard can plot them
 /// side-by-side.
-#[derive(Debug, Clone, Copy)]
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Hash)]
 enum Engine {
     Ours,
     RocksDb,
@@ -308,7 +325,7 @@ fn scan_series(compression: Compression) -> Vec<(&'static str, Engine, bool)> {
 /// variant so the dashboard plots the `None` baseline and the
 /// high-ratio zstd path side-by-side, with both engines configured the
 /// same way per variant (apples-to-apples).
-#[derive(Debug, Clone, Copy)]
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Hash)]
 enum Compression {
     /// No block compression — the `None`-policy baseline.
     None,
@@ -379,6 +396,38 @@ fn active_preset() -> Preset {
         );
         p
     })
+}
+
+/// Whether this run measures the full matrix, including the arms the
+/// per-push dashboard run leaves out for time (see [`cold_write_sizes`]).
+/// Set by `COMPARE_FULL_MATRIX=1`; resolved once and logged like the preset.
+fn full_matrix() -> bool {
+    static FULL: std::sync::OnceLock<bool> = std::sync::OnceLock::new();
+    *FULL.get_or_init(|| {
+        let full = std::env::var("COMPARE_FULL_MATRIX").as_deref() == Ok("1");
+        eprintln!(
+            "compare-rocksdb: matrix = {} (set COMPARE_FULL_MATRIX=1 for the full one)",
+            if full { "full" } else { "per-push" }
+        );
+        full
+    })
+}
+
+/// Element counts of a cold-write group (`write_throughput`, `overwrite`),
+/// whose every iteration writes and flushes the whole key set.
+///
+/// At zstd-22 RocksDB writes 1.0-1.4 Kelem/s at every size, so one 70k
+/// iteration takes ~50 s on the bench runner and, at Criterion's floor of
+/// eleven iterations, its two 70k arms cost ~18 min between them: more than
+/// half of the benchmark workflow's 30-minute budget. The per-push run therefore
+/// stops these two groups at 10k, where both engines' zstd-22 write path is
+/// still compared on the same chart, and runs 70k only in the full matrix.
+/// Uncompressed, an iteration is a fraction of a second and every size runs.
+fn cold_write_sizes(compression: Compression) -> &'static [u64] {
+    match compression {
+        Compression::Zstd22 if !full_matrix() => &[1_000, 10_000],
+        Compression::None | Compression::Zstd22 => &[1_000, 10_000, 70_000],
+    }
 }
 
 /// Applies the active [`Preset`]'s on-disk feature toggles to our engine config.
@@ -750,7 +799,7 @@ fn write_throughput_variant(c: &mut Criterion, group_name: &str, compression: Co
         Compression::None => Some(skv_runtime().expect("surrealkv: tokio runtime")),
         Compression::Zstd22 => None,
     };
-    for &n in &[1_000_u64, 10_000_u64, 70_000_u64] {
+    for &n in cold_write_sizes(compression) {
         // Precompute the keys + values ONCE per `n` (outside the
         // criterion warmup / measurement loop), so the timed body
         // does no per-iteration allocation.
@@ -792,11 +841,11 @@ fn write_throughput_variant(c: &mut Criterion, group_name: &str, compression: Co
 /// `inputs.keys.len()` keys and flushed to disk.
 ///
 /// In contrast to [`run_write_throughput`]'s cold-start measurement,
-/// the engine here is opened, populated and flushed ONCE — outside
-/// the criterion timing window — and kept warm for the whole
-/// benchmark. The timed body issues one `get` per stored key, so the
-/// number reflects warm steady-state read latency (lookup path +
-/// bloom filter + block decode), NOT the open / write / flush setup
+/// the engine here is opened ONCE on a copy of its populated and flushed
+/// seed state ([`SeedStates`]), outside the criterion timing window, and
+/// kept warm for the whole benchmark. The timed body issues one `get` per
+/// stored key, so the number reflects warm steady-state read latency (lookup
+/// path + bloom filter + block decode), NOT the open / write / flush setup
 /// cost.
 ///
 /// Note this is a CACHE-WARM read: the engine stays open across the
@@ -828,21 +877,12 @@ fn write_throughput_variant(c: &mut Criterion, group_name: &str, compression: Co
 /// is present" invariant is checked ONCE before the timed window (so
 /// a broken setup fails loudly) and the timed loop itself stays a
 /// bare `get` + `black_box` with no per-read branch.
-fn bench_point_read(c: &mut Criterion) {
-    // `None` baseline + `Zstd22` high-ratio variant in sibling groups,
-    // mirroring `bench_write_throughput`. The `point_read` group ADDS the
-    // hash-index series (`ours-hash-index`, `rocksdb-hash-index`) as extra
-    // overlays ON THE SAME chart alongside the binary-search `ours` / `rocksdb`
-    // lines, so one chart shows both index strategies head-to-head.
-    point_read_variant(c, "point_read", Compression::None, true);
-    point_read_variant(c, "point_read_zstd22", Compression::Zstd22, false);
-}
-
 fn point_read_variant(
     c: &mut Criterion,
     group_name: &str,
     compression: Compression,
     hash_overlays: bool,
+    seeds: &mut SeedStates,
 ) {
     // Series overlaid on this ONE chart: every base engine with binary-search
     // data-block index, plus — when `hash_overlays` is set — the data-block
@@ -884,7 +924,8 @@ fn point_read_variant(
             let mut warm: Option<WarmEngine> = None;
             group.bench_with_input(BenchmarkId::new(label, n), &n, |b, _| {
                 let warm = warm.get_or_insert_with(|| {
-                    let warm = WarmEngine::build(engine, compression, strategy, row_cache, &inputs);
+                    let warm =
+                        WarmEngine::build(engine, compression, strategy, row_cache, &inputs, seeds);
                     // One-time hit check OUTSIDE the timed window: enforce the
                     // workload contract ("read every stored key") so a
                     // setup/flush regression can't silently become a miss-read
@@ -972,17 +1013,10 @@ fn point_read_variant(
     group.finish();
 }
 
-/// Opens a RocksDB instance at `dir` with the matched options, populates
-/// it with `inputs` (WAL disabled, matching the untimed populate phase of
-/// our warm read scenarios), and flushes. Used by the warm read groups
-/// (`range_scan`, `seek_random`) so their per-engine setup lives in one
-/// place rather than being copy-pasted per scenario.
-fn populate_rocksdb(
-    dir: &std::path::Path,
-    compression: Compression,
-    hash_index: bool,
-    inputs: &WorkloadInputs,
-) -> rocksdb::DB {
+/// Opens the RocksDB instance at `dir`, new or seeded, with the matched
+/// options. The one open path for every arm that reads or overwrites a seeded
+/// state, so a seed is reopened exactly as it was written.
+fn open_rocksdb(dir: &std::path::Path, compression: Compression, hash_index: bool) -> rocksdb::DB {
     let opts = rocksdb_options(compression, hash_index);
     // Open through a column-family descriptor that carries the SAME options:
     // the default CF is what every read hits, and the descriptor form is what
@@ -992,7 +1026,19 @@ fn populate_rocksdb(
     // to the data.
     let default_cf =
         rocksdb::ColumnFamilyDescriptor::new(rocksdb::DEFAULT_COLUMN_FAMILY_NAME, opts.clone());
-    let db = rocksdb::DB::open_cf_descriptors(&opts, dir, [default_cf]).expect("rocksdb: open");
+    rocksdb::DB::open_cf_descriptors(&opts, dir, [default_cf]).expect("rocksdb: open")
+}
+
+/// Opens a RocksDB instance at `dir` with the matched options, populates
+/// it with `inputs` (WAL disabled, matching the untimed populate phase of
+/// our seeded scenarios), and flushes. Writes RocksDB's [`SeedStates`].
+fn populate_rocksdb(
+    dir: &std::path::Path,
+    compression: Compression,
+    hash_index: bool,
+    inputs: &WorkloadInputs,
+) -> rocksdb::DB {
+    let db = open_rocksdb(dir, compression, hash_index);
     let mut write_opts = rocksdb::WriteOptions::default();
     write_opts.disable_wal(true);
     for (key, value) in inputs.keys.iter().zip(inputs.values.iter()) {
@@ -1002,8 +1048,8 @@ fn populate_rocksdb(
     db
 }
 
-/// Populates our engine at `dir` and flushes, returning the warm handle.
-/// Companion to [`populate_rocksdb`] for the warm read groups. `kv_separated`
+/// Populates our engine at `dir` and flushes, returning the handle.
+/// Companion to [`populate_rocksdb`] for our [`SeedStates`]. `kv_separated`
 /// selects the `blob_tree` (KV-separated) configuration; `strategy` /
 /// `row_cache` select the `point_read` index-strategy series.
 fn populate_ours(
@@ -1022,16 +1068,127 @@ fn populate_ours(
     tree
 }
 
+/// What one seeded on-disk state is written with: the engine, the codec, the
+/// index strategy and the key count. The row cache is not part of it: it lives
+/// in memory only, so the arms with and without it start from the same files.
+#[derive(Clone, Copy, PartialEq, Eq, Hash)]
+struct SeedKey {
+    engine: Engine,
+    compression: Compression,
+    strategy: IndexStrategy,
+    n: usize,
+}
+
+/// The key set written once and flushed, per [`SeedKey`], closed, and copied
+/// into a fresh directory for every read arm and every overwrite iteration
+/// that starts from it.
+///
+/// Every read group and `overwrite` starts from that same state, and writing
+/// it is the expensive part at zstd-22: RocksDB takes ~47 s to write 70k rows
+/// and ~9 s for 10k on the bench runner, against well under a second for the
+/// reads that follow. Written per arm, the four read groups would pay it four
+/// times and `overwrite` once per iteration, eleven times per arm. A copy
+/// reopens the files the engine flushed and closed, so a timed read or
+/// overwrite acts on the same on-disk state as on the engine that wrote it;
+/// the caches it starts with differ, and Criterion's warm-up pass fills them
+/// before any sample is taken.
+///
+/// SurrealKV is not seeded. It runs only in the uncompressed groups, where
+/// writing the key set takes a fraction of a second, and a reopened SurrealKV
+/// starts from whatever its recovery rebuilds rather than from the state its
+/// writer left, which would change what its arms measure.
+#[derive(Default)]
+struct SeedStates {
+    dirs: HashMap<SeedKey, tempfile::TempDir>,
+}
+
+impl SeedStates {
+    /// A fresh directory holding a copy of the state `inputs` seeds for this
+    /// engine, codec and index strategy, written on first use.
+    fn checkout(
+        &mut self,
+        engine: Engine,
+        compression: Compression,
+        strategy: IndexStrategy,
+        inputs: &WorkloadInputs,
+    ) -> tempfile::TempDir {
+        let key = SeedKey {
+            engine,
+            compression,
+            strategy,
+            n: inputs.keys.len(),
+        };
+        let seed = self
+            .dirs
+            .entry(key)
+            .or_insert_with(|| write_seed(key, inputs));
+        let dir = tempfile::tempdir().expect("tempdir");
+        copy_dir(seed.path(), dir.path()).expect("copy seed state");
+        dir
+    }
+}
+
+/// Writes the seed state for `key` into a new directory and closes the engine
+/// before returning, so the files are complete before anything copies them.
+fn write_seed(key: SeedKey, inputs: &WorkloadInputs) -> tempfile::TempDir {
+    let dir = tempfile::tempdir().expect("seed tempdir");
+    match key.engine {
+        Engine::Ours | Engine::BlobTree => drop(populate_ours(
+            dir.path(),
+            key.compression,
+            inputs,
+            key.engine.kv_separated(),
+            key.strategy,
+            false,
+        )),
+        Engine::RocksDb => drop(populate_rocksdb(
+            dir.path(),
+            key.compression,
+            key.strategy == IndexStrategy::HashIndex,
+            inputs,
+        )),
+        Engine::SurrealKv => unreachable!("surrealkv writes its own state per arm"),
+    }
+    dir
+}
+
+/// The groups that start from a written and flushed key set: the warm reads
+/// and `overwrite`. They share one [`SeedStates`], so each state is written
+/// once for all of them. Each runs a `None` baseline and a `Zstd22` sibling
+/// group.
+fn bench_seeded(c: &mut Criterion) {
+    let mut seeds = SeedStates::default();
+    // The `point_read` group ADDS the hash-index series (`ours-hash-index`,
+    // `rocksdb-hash-index`) as extra overlays ON THE SAME chart alongside the
+    // binary-search `ours` / `rocksdb` lines, so one chart shows both index
+    // strategies head-to-head.
+    point_read_variant(c, "point_read", Compression::None, true, &mut seeds);
+    point_read_variant(
+        c,
+        "point_read_zstd22",
+        Compression::Zstd22,
+        false,
+        &mut seeds,
+    );
+    multi_get_variant(c, "multi_get", Compression::None, &mut seeds);
+    multi_get_variant(c, "multi_get_zstd22", Compression::Zstd22, &mut seeds);
+    range_scan_variant(c, "range_scan", Compression::None, &mut seeds);
+    range_scan_variant(c, "range_scan_zstd22", Compression::Zstd22, &mut seeds);
+    seek_random_variant(c, "seek_random", Compression::None, &mut seeds);
+    seek_random_variant(c, "seek_random_zstd22", Compression::Zstd22, &mut seeds);
+    overwrite_variant(c, "overwrite", Compression::None, &mut seeds);
+    overwrite_variant(c, "overwrite_zstd22", Compression::Zstd22, &mut seeds);
+}
+
 /// Warm on-disk state for one read arm (`point_read`, `multi_get`,
-/// `range_scan`, `seek_random`): the populated + flushed engine and the
-/// directory holding it.
+/// `range_scan`, `seek_random`): the engine opened on a copy of its seed
+/// state and the directory holding the copy.
 ///
 /// Criterion re-enters a `bench_with_input` routine closure for the warm-up
 /// pass and again for EVERY sample, so state built inside the closure is
-/// rebuilt once per sample (a RocksDB zstd-22 populate of 10k rows is ~5 s, so
-/// that alone was minutes per arm). Each arm keeps one `Option<WarmEngine>`
-/// outside its closure and fills it on the first entry, so the closure only
-/// ever times reads.
+/// rebuilt once per sample. Each arm keeps one `Option<WarmEngine>` outside
+/// its closure and fills it on the first entry, so the closure only ever
+/// times reads.
 ///
 /// Field order is drop order: the engine closes before its directory is
 /// removed, and the SurrealKV runtime outlives the tree so the background
@@ -1062,30 +1219,32 @@ impl WarmEngine {
         strategy: IndexStrategy,
         row_cache: bool,
         inputs: &WorkloadInputs,
+        seeds: &mut SeedStates,
     ) -> Self {
-        let dir = tempfile::tempdir().expect("tempdir");
         match engine {
             Engine::Ours | Engine::BlobTree => {
-                let tree = populate_ours(
+                let dir = seeds.checkout(engine, compression, strategy, inputs);
+                let tree = open_ours(
                     dir.path(),
                     compression,
-                    inputs,
                     engine.kv_separated(),
                     strategy,
                     row_cache,
-                );
+                )
+                .expect("ours: open");
                 Self::Ours { tree, _dir: dir }
             }
             Engine::RocksDb => {
-                let db = populate_rocksdb(
+                let dir = seeds.checkout(engine, compression, strategy, inputs);
+                let db = open_rocksdb(
                     dir.path(),
                     compression,
                     strategy == IndexStrategy::HashIndex,
-                    inputs,
                 );
                 Self::RocksDb { db, _dir: dir }
             }
             Engine::SurrealKv => {
+                let dir = tempfile::tempdir().expect("tempdir");
                 let (rt, tree) = setup_surrealkv_warm(dir.path(), inputs)
                     .unwrap_or_else(|e| panic!("surrealkv: warm setup: {e}"));
                 Self::SurrealKv {
@@ -1106,17 +1265,17 @@ impl WarmEngine {
 /// working set exceeds the 16 MiB block cache, so the batch's blocks are cold.
 ///
 /// Apples-to-apples matches [`point_read_variant`]: identical [`WorkloadInputs`],
-/// the same matched compression / bloom / 16 MiB cache via [`populate_ours`] /
-/// [`populate_rocksdb`]. The only difference from `point_read` is one batched
+/// the same seeded state and matched compression / bloom / 16 MiB cache
+/// ([`SeedStates`]). The only difference from `point_read` is one batched
 /// call instead of an N-iteration `get` loop. SurrealKV has no batch-get API, so
 /// it is omitted here (its sequential cost is already on the `point_read` chart);
 /// the series is `ours` vs `rocksdb` (plus `blob_tree` on the None variant).
-fn bench_multi_get(c: &mut Criterion) {
-    multi_get_variant(c, "multi_get", Compression::None);
-    multi_get_variant(c, "multi_get_zstd22", Compression::Zstd22);
-}
-
-fn multi_get_variant(c: &mut Criterion, group_name: &str, compression: Compression) {
+fn multi_get_variant(
+    c: &mut Criterion,
+    group_name: &str,
+    compression: Compression,
+    seeds: &mut SeedStates,
+) {
     // Only engines with a real batch-get API overlay here (SurrealKV has none).
     let series: Vec<(&str, Engine)> = engines_for(compression)
         .iter()
@@ -1131,11 +1290,12 @@ fn multi_get_variant(c: &mut Criterion, group_name: &str, compression: Compressi
         group.throughput(Throughput::Elements(n));
         for &(label, engine) in &series {
             // This measures WARM steady-state batched-MultiGet throughput, NOT
-            // cold first-touch latency: every engine populates + probes once
-            // per arm outside the timed window (see `WarmEngine`), so all arms
-            // (ours, blob_tree, rocksdb) enter the loop equally warmed. That
-            // symmetry is the point of the comparison. Cold fan-out latency is
-            // a separate, OS-cache-dropping measurement, not this bench.
+            // cold first-touch latency: every engine opens its seed and probes
+            // once per arm outside the timed window (see `WarmEngine`), so all
+            // arms (ours, blob_tree, rocksdb) enter the loop equally warmed.
+            // That symmetry is the point of the comparison. Cold fan-out
+            // latency is a separate, OS-cache-dropping measurement, not this
+            // bench.
             let mut warm: Option<WarmEngine> = None;
             group.bench_with_input(BenchmarkId::new(label, n), &n, |b, _| {
                 let warm = warm.get_or_insert_with(|| {
@@ -1145,6 +1305,7 @@ fn multi_get_variant(c: &mut Criterion, group_name: &str, compression: Compressi
                         IndexStrategy::Binary,
                         false,
                         &inputs,
+                        seeds,
                     );
                     // One-time "every key present" contract check OUTSIDE the
                     // timed window (mirrors point_read), so a setup regression
@@ -1205,7 +1366,7 @@ fn multi_get_variant(c: &mut Criterion, group_name: &str, compression: Compressi
                         // `batched_multi_get_cf` is RocksDB's OPTIMIZED batched
                         // MultiGet (batched bloom probes + coalesced block reads,
                         // NOT the legacy per-key `multi_get`); it needs the CF
-                        // handle `populate_rocksdb`'s descriptor open provides.
+                        // handle `open_rocksdb`'s descriptor open provides.
                         // `sorted_input = false`: keys arrive in insertion order
                         // and RocksDB sorts internally, exactly as ours does.
                         let cf = db
@@ -1230,18 +1391,18 @@ fn multi_get_variant(c: &mut Criterion, group_name: &str, compression: Compressi
     group.finish();
 }
 
-fn bench_range_scan(c: &mut Criterion) {
-    range_scan_variant(c, "range_scan", Compression::None);
-    range_scan_variant(c, "range_scan_zstd22", Compression::Zstd22);
-}
-
 /// Workload: full forward scan reading every value. The engine is
-/// populated + flushed ONCE outside the timed window (warm, like
+/// opened ONCE on its seed state outside the timed window (warm, like
 /// [`point_read_variant`]); the timed body iterates the whole keyspace
 /// front-to-back and touches each value, so the number reflects
 /// steady-state sequential-scan throughput (block decode + iterator
 /// advance), not setup cost.
-fn range_scan_variant(c: &mut Criterion, group_name: &str, compression: Compression) {
+fn range_scan_variant(
+    c: &mut Criterion,
+    group_name: &str,
+    compression: Compression,
+    seeds: &mut SeedStates,
+) {
     let mut group = c.benchmark_group(group_name);
     for &n in &[1_000_u64, 10_000_u64, 70_000_u64] {
         let inputs = WorkloadInputs::build(n);
@@ -1257,6 +1418,7 @@ fn range_scan_variant(c: &mut Criterion, group_name: &str, compression: Compress
                         IndexStrategy::Binary,
                         row_cache,
                         &inputs,
+                        seeds,
                     )
                 });
                 match warm {
@@ -1309,18 +1471,18 @@ fn range_scan_variant(c: &mut Criterion, group_name: &str, compression: Compress
     group.finish();
 }
 
-fn bench_seek_random(c: &mut Criterion) {
-    seek_random_variant(c, "seek_random", Compression::None);
-    seek_random_variant(c, "seek_random_zstd22", Compression::Zstd22);
-}
-
 /// Workload: seek to each key (in insertion order, i.e. scattered across
 /// the sorted keyspace) and read the single value the cursor lands on.
-/// Warm: the engine is populated + flushed ONCE outside the timed window.
-/// This measures seek-then-read latency (index descent + block decode +
-/// cursor positioning), the closest head-to-head analogue of a
+/// Warm: the engine is opened ONCE on its seed state outside the timed
+/// window. This measures seek-then-read latency (index descent + block
+/// decode + cursor positioning), the closest head-to-head analogue of a
 /// `seekrandom` workload.
-fn seek_random_variant(c: &mut Criterion, group_name: &str, compression: Compression) {
+fn seek_random_variant(
+    c: &mut Criterion,
+    group_name: &str,
+    compression: Compression,
+    seeds: &mut SeedStates,
+) {
     let mut group = c.benchmark_group(group_name);
     for &n in &[1_000_u64, 10_000_u64, 70_000_u64] {
         let inputs = WorkloadInputs::build(n);
@@ -1336,6 +1498,7 @@ fn seek_random_variant(c: &mut Criterion, group_name: &str, compression: Compres
                         IndexStrategy::Binary,
                         row_cache,
                         &inputs,
+                        seeds,
                     )
                 });
                 match warm {
@@ -1402,21 +1565,21 @@ fn seek_random_variant(c: &mut Criterion, group_name: &str, compression: Compres
     group.finish();
 }
 
-fn bench_overwrite(c: &mut Criterion) {
-    overwrite_variant(c, "overwrite", Compression::None);
-    overwrite_variant(c, "overwrite_zstd22", Compression::Zstd22);
-}
-
 /// Workload: rewrite the entire keyspace into an engine that already
-/// holds one copy of it. The first populate + flush happens OUTSIDE the
-/// timed window; the timed body writes every key a second time and
-/// flushes, so the number reflects overwrite cost (memtable churn over
-/// existing keys + a flush that supersedes prior versions) rather than
-/// cold first-insert cost. A fresh engine is built per timed iteration
-/// so each measurement starts from the same one-copy state.
-fn overwrite_variant(c: &mut Criterion, group_name: &str, compression: Compression) {
+/// holds one copy of it. The first copy is the seed state ([`SeedStates`]),
+/// written OUTSIDE the timed window; the timed body writes every key a
+/// second time and flushes, so the number reflects overwrite cost (memtable
+/// churn over existing keys + a flush that supersedes prior versions) rather
+/// than cold first-insert cost. Every timed iteration opens a fresh copy of
+/// the seed, so each measurement starts from the same one-copy state.
+fn overwrite_variant(
+    c: &mut Criterion,
+    group_name: &str,
+    compression: Compression,
+    seeds: &mut SeedStates,
+) {
     let mut group = c.benchmark_group(group_name);
-    for &n in &[1_000_u64, 10_000_u64, 70_000_u64] {
+    for &n in cold_write_sizes(compression) {
         let inputs = WorkloadInputs::build(n);
         group.throughput(Throughput::Elements(n));
         for &engine in engines_for(compression) {
@@ -1424,19 +1587,24 @@ fn overwrite_variant(c: &mut Criterion, group_name: &str, compression: Compressi
                 b.iter_custom(|iters| {
                     let mut total = Duration::ZERO;
                     for _ in 0..iters {
-                        let dir = tempfile::tempdir().expect("tempdir");
                         match engine {
                             Engine::Ours | Engine::BlobTree => {
-                                // First copy (untimed): populate + flush so the
-                                // timed pass overwrites existing keys.
-                                let tree = populate_ours(
+                                // First copy (untimed): the seed, so the timed
+                                // pass overwrites existing keys.
+                                let dir = seeds.checkout(
+                                    engine,
+                                    compression,
+                                    IndexStrategy::Binary,
+                                    &inputs,
+                                );
+                                let tree = open_ours(
                                     dir.path(),
                                     compression,
-                                    &inputs,
                                     engine.kv_separated(),
                                     IndexStrategy::Binary,
                                     false,
-                                );
+                                )
+                                .expect("ours: open");
                                 let start = std::time::Instant::now();
                                 // Second seqno range so the overwrite produces a
                                 // newer version of every key.
@@ -1450,7 +1618,13 @@ fn overwrite_variant(c: &mut Criterion, group_name: &str, compression: Compressi
                                 total += start.elapsed();
                             }
                             Engine::RocksDb => {
-                                let db = populate_rocksdb(dir.path(), compression, false, &inputs);
+                                let dir = seeds.checkout(
+                                    engine,
+                                    compression,
+                                    IndexStrategy::Binary,
+                                    &inputs,
+                                );
+                                let db = open_rocksdb(dir.path(), compression, false);
                                 let mut write_opts = rocksdb::WriteOptions::default();
                                 write_opts.disable_wal(true);
                                 let start = std::time::Instant::now();
@@ -1463,7 +1637,9 @@ fn overwrite_variant(c: &mut Criterion, group_name: &str, compression: Compressi
                             }
                             Engine::SurrealKv => {
                                 // First copy (untimed) so the timed pass
-                                // overwrites existing keys.
+                                // overwrites existing keys; SurrealKV is not
+                                // seeded (see `SeedStates`).
+                                let dir = tempfile::tempdir().expect("tempdir");
                                 let (rt, tree) = setup_surrealkv_warm(dir.path(), &inputs)
                                     .unwrap_or_else(|e| panic!("surrealkv: warm setup: {e}"));
                                 let start = std::time::Instant::now();
@@ -1977,11 +2153,7 @@ fn bench_subcompaction(c: &mut Criterion) {
 criterion_group!(
     benches,
     bench_write_throughput,
-    bench_point_read,
-    bench_multi_get,
-    bench_range_scan,
-    bench_seek_random,
-    bench_overwrite,
+    bench_seeded,
     bench_compaction,
     bench_subcompaction,
     bench_subcompaction_clean

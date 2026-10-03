@@ -28,6 +28,12 @@ on:
   # workflow_dispatch requires actions:write on the repo, so only
   # owner / maintainers can fire it — fork PR authors cannot.
   workflow_dispatch:
+    inputs:
+      full-matrix:
+        description: "Also run the head-to-head arms the per-push run leaves out for time (zstd-22 cold writes at 70k, ~20 min more)"
+        type: boolean
+        default: false
+        required: false
 
 # Strict serialisation across the entire repo: the self-hosted
 # bench host is shared with future cross-engine benches (RocksDB
@@ -139,16 +145,20 @@ jobs:
     runs-on:
       group: Default
       labels: [self-hosted]
-    # The db_bench pass is a couple of minutes. The compare-rocksdb criterion
-    # matrix runs ~40 min on a warm cache: the bulk is RocksDB's cold zstd-22
-    # writes (write_throughput_zstd22 / overwrite_zstd22 at 70k rows cost
-    # ~30-60 s per iteration on that engine, times the 10-sample floor), the
-    # rest of the matrix is minutes. On a cold rust-cache the librocksdb-sys
-    # C++ compile (RocksDB built from source via bindgen) adds 15-25 min on
-    # top, so the cap leaves room for a cold build plus the full matrix while
-    # still catching a runaway run (a group-level sample_size override in the
-    # harness once pushed the matrix past an hour by itself).
-    timeout-minutes: 90
+    # The whole job, every bench in it, fits in 30 minutes on a warm cache:
+    # the three builds side by side, the db_bench pass, the head-to-head
+    # matrix and the publishing. Each bench step has its own limit below, so
+    # an overrun fails at the bench that caused it. The full matrix (a manual
+    # dispatch with `full-matrix`) adds RocksDB's zstd-22 cold writes at 70k,
+    # ~50 s an iteration at Criterion's floor of eleven, and gets its own
+    # limit.
+    #
+    # On a cold cache the librocksdb-sys C++ compile (RocksDB built from
+    # source via bindgen) takes 15-25 min by itself, which leaves too little
+    # of the budget for the benches, so that run fails at its limit. The
+    # rust-cache step saves the compiled RocksDB on failure too, so the next
+    # run is warm again.
+    timeout-minutes: ${{ inputs.full-matrix && 60 || 30 }}
     defaults:
       run:
         # Every step below is written in POSIX shell. Windows would otherwise
@@ -176,34 +186,6 @@ jobs:
         with:
           persist-credentials: false
           fetch-depth: 0
-
-      - name: Generate bot token
-        id: bot-token
-        # `push` and `workflow_dispatch` are both trusted contexts on
-        # this repo (workflow_dispatch requires actions:write, which
-        # only owner/maintainers hold — fork PRs can't trigger it).
-        # The `pull_request` clause exists for paranoia: if the
-        # trigger list is ever expanded to include `pull_request`,
-        # only same-repo PRs get the token (fork PRs would still be
-        # blocked). On `workflow_dispatch` the `github.event.pull_request`
-        # context is absent, so the `pull_request` branch is gated by
-        # `github.event_name == 'pull_request'` to avoid evaluating
-        # a missing context.
-        if: >
-          github.event_name == 'push' ||
-          github.event_name == 'workflow_dispatch' ||
-          (github.event_name == 'pull_request' &&
-           github.event.pull_request.head.repo.full_name == github.repository)
-        uses: actions/create-github-app-token@v3
-        with:
-          app-id: ${{ secrets.RELEASER_APP_ID }}
-          private-key: ${{ secrets.RELEASER_APP_PRIVATE_KEY }}
-          # Least-privilege scope: benchmark-action/github-action-benchmark
-          # needs contents:write (push results to gh-pages branch on main),
-          # pull-requests:write (comment on PRs with comparison alerts).
-          # No other scopes are exercised by this workflow.
-          permission-contents: write
-          permission-pull-requests: write
 
       - uses: dtolnay/rust-toolchain@29eef336d9b2848a0b548edc03f92a220660cdb8  # stable
         with:
@@ -277,14 +259,120 @@ jobs:
       # tools/compare-rocksdb's, which compiles RocksDB from C++ source
       # (15-25 minutes): it is the only workspace cached here, restored after
       # the checkout and saved when the job ends. The engine and db_bench build
-      # in minutes and are removed by the last step instead.
+      # in minutes and are removed by the last step instead. Saved when the job
+      # fails as well: a cold RocksDB compile does not fit the job's budget,
+      # and a cache saved only on success would keep every later run cold.
       - uses: Swatinem/rust-cache@6323deb102c322ba6fcbdcafc7e3dddab59af2b6  # v2.9.2
         with:
           prefix-key: bench
           workspaces: tools/compare-rocksdb -> target
+          cache-on-failure: true
 
+      # librocksdb-sys builds C bindings via bindgen -> clang-sys, which needs
+      # libclang on the host. When it is absent the raw failure is a deep,
+      # cryptic clang-sys build-script panic, so fail early with an actionable
+      # message naming what to install on the self-hosted runner instead. On
+      # Linux bindgen finds the distro libclang.so without env-var help; on
+      # Windows it loads libclang.dll, which has no standard search path, so
+      # the step also exports LIBCLANG_PATH when it locates an LLVM install.
+      # Its failure fails the head-to-head step, not this one, so a host that
+      # cannot build RocksDB still measures and publishes the db_bench trend.
+      - name: Verify libclang toolchain (compare-rocksdb prerequisite)
+        id: libclang
+        continue-on-error: true
+        run: |
+          if [ "$RUNNER_OS" = "Windows" ]; then
+            # bindgen needs libclang.dll. An explicit LIBCLANG_PATH wins;
+            # otherwise probe the default LLVM install locations and export
+            # what we find, since nothing on Windows searches for it.
+            if [ -n "${LIBCLANG_PATH:-}" ]; then
+              exit 0
+            fi
+            # Probed through the shell's own path form, but EXPORTED as a
+            # native path: everything downstream (the linker's DLL search,
+            # clang-sys) is a Windows process, and a `/c/...` string means
+            # nothing to it.
+            for dir in "/c/Program Files/LLVM/bin" "/c/Program Files (x86)/LLVM/bin"; do
+              if [ -f "$dir/libclang.dll" ]; then
+                native="$(cd "$dir" && pwd -W)"
+                echo "LIBCLANG_PATH=$native" >> "$GITHUB_ENV"
+                # LIBCLANG_PATH only tells clang-sys where to look. The build
+                # script links against libclang, so Windows resolves the DLL
+                # itself at process start and searches PATH: without this the
+                # script dies as STATUS_DLL_NOT_FOUND before running a line.
+                echo "$native" >> "$GITHUB_PATH"
+                echo "libclang: $native"
+                exit 0
+              fi
+            done
+            echo "::error::libclang.dll not found on the bench runner. compare-rocksdb (librocksdb-sys -> bindgen -> clang-sys) cannot build. Install LLVM on the runner host ('winget install LLVM.LLVM' or 'choco install llvm'), or set LIBCLANG_PATH to the directory holding libclang.dll."
+            exit 1
+          fi
+
+          # Linux detection covers: llvm-config on PATH (Fedora/most), explicit
+          # LIBCLANG_PATH, direct lib dirs (/usr/lib64 on Fedora), Debian/Ubuntu
+          # multiarch (/usr/lib/x86_64-linux-gnu) + llvm-* dirs via the nested
+          # glob, and finally ldconfig -p (the robust Linux probe that finds
+          # libclang wherever the dynamic linker registered it).
+          if ! command -v llvm-config >/dev/null 2>&1 \
+             && [ -z "${LLVM_CONFIG_PATH:-}" ] \
+             && [ -z "${LIBCLANG_PATH:-}" ] \
+             && ! ls /usr/lib*/libclang.so* /usr/lib*/*/libclang.so* >/dev/null 2>&1 \
+             && ! { command -v ldconfig >/dev/null 2>&1 && ldconfig -p | grep -q libclang; }; then
+            echo "::error::libclang/llvm-config not found on the bench runner. compare-rocksdb (librocksdb-sys -> bindgen -> clang-sys) cannot build. Install LLVM dev tools on the runner host: Fedora 'dnf install -y clang clang-devel llvm llvm-devel', Debian/Ubuntu 'apt-get install -y clang libclang-dev llvm-dev', or set LIBCLANG_PATH/LLVM_CONFIG_PATH."
+            exit 1
+          fi
+
+      # Every binary the benches below run, built side by side before any of
+      # them measures: one after another the three builds take ~9 min of the
+      # 30. Bounded by the job's limit only, since a cold RocksDB compile (see
+      # the cache step) is the one build that cannot fit.
+      #
+      # A failed build fails the step that runs its binary, not this one: each
+      # bench step runs through cargo, which builds again what is missing and
+      # stops on the same error there. So a host that cannot build RocksDB
+      # still measures and publishes the db_bench trend before the head-to-head
+      # fails the job.
+      - name: Build the benchmark binaries
+        continue-on-error: true
+        run: bash .github/scripts/build-benchmarks.sh
+
+      # The db_bench pass measures for ~2.5 min on the bench runner.
       - name: Run benchmarks
+        timeout-minutes: 6
         run: bash .github/scripts/run-benchmarks.sh 200000
+
+      # Issued after the benches, right before its first use: an installation
+      # token lives one hour, so one issued at the start of the job would let
+      # the job's length decide whether its results publish. The compare
+      # publish below takes its own for the same reason.
+      - name: Generate bot token
+        id: bot-token
+        # `push` and `workflow_dispatch` are both trusted contexts on
+        # this repo (workflow_dispatch requires actions:write, which
+        # only owner/maintainers hold; fork PRs can't trigger it).
+        # The `pull_request` clause exists for paranoia: if the
+        # trigger list is ever expanded to include `pull_request`,
+        # only same-repo PRs get the token (fork PRs would still be
+        # blocked). On `workflow_dispatch` the `github.event.pull_request`
+        # context is absent, so the `pull_request` branch is gated by
+        # `github.event_name == 'pull_request'` to avoid evaluating
+        # a missing context.
+        if: >
+          github.event_name == 'push' ||
+          github.event_name == 'workflow_dispatch' ||
+          (github.event_name == 'pull_request' &&
+           github.event.pull_request.head.repo.full_name == github.repository)
+        uses: actions/create-github-app-token@v3
+        with:
+          app-id: ${{ secrets.RELEASER_APP_ID }}
+          private-key: ${{ secrets.RELEASER_APP_PRIVATE_KEY }}
+          # Least-privilege scope: benchmark-action/github-action-benchmark
+          # needs contents:write (push results to gh-pages branch on main),
+          # pull-requests:write (comment on PRs with comparison alerts).
+          # No other scopes are exercised by this workflow.
+          permission-contents: write
+          permission-pull-requests: write
 
       # The bench runner is self-hosted, so its workspace survives between runs
       # (a GitHub-hosted runner starts each job on an empty disk, which is why
@@ -437,67 +525,14 @@ jobs:
       # Bounded criterion settings keep the harness fast: this is a
       # ratio comparison (both engines in one process per scenario), so a
       # short warm-up + measurement window per scenario still yields a
-      # stable median while keeping the whole matrix (5 workloads x sizes x
-      # engines) well under the timeout. The default 100-sample, multi-second
-      # sweep ran for ~60 min across the matrix and timed out, producing no
-      # dashboard at all; a half-second window per scenario brings it to a
-      # few minutes.
-      #
-      # Runner requirement: librocksdb-sys builds from source via bindgen,
-      # so the host must have a C/C++ toolchain + libclang. On Linux
-      # bindgen finds the distro libclang.so without env-var help; on Windows
-      # it loads libclang.dll, which has no standard search path, so the step
-      # below also exports LIBCLANG_PATH when it locates an LLVM install.
-      # Pre-flight: librocksdb-sys builds C bindings via bindgen -> clang-sys,
-      # which needs libclang on the host. When it is absent the raw failure is a
-      # deep, cryptic clang-sys build-script panic. Fail early with an
-      # actionable message naming what to install on the self-hosted runner
-      # instead.
-      - name: Verify libclang toolchain (compare-rocksdb prerequisite)
-        run: |
-          if [ "$RUNNER_OS" = "Windows" ]; then
-            # bindgen needs libclang.dll. An explicit LIBCLANG_PATH wins;
-            # otherwise probe the default LLVM install locations and export
-            # what we find, since nothing on Windows searches for it.
-            if [ -n "${LIBCLANG_PATH:-}" ]; then
-              exit 0
-            fi
-            # Probed through the shell's own path form, but EXPORTED as a
-            # native path: everything downstream (the linker's DLL search,
-            # clang-sys) is a Windows process, and a `/c/...` string means
-            # nothing to it.
-            for dir in "/c/Program Files/LLVM/bin" "/c/Program Files (x86)/LLVM/bin"; do
-              if [ -f "$dir/libclang.dll" ]; then
-                native="$(cd "$dir" && pwd -W)"
-                echo "LIBCLANG_PATH=$native" >> "$GITHUB_ENV"
-                # LIBCLANG_PATH only tells clang-sys where to look. The build
-                # script links against libclang, so Windows resolves the DLL
-                # itself at process start and searches PATH: without this the
-                # script dies as STATUS_DLL_NOT_FOUND before running a line.
-                echo "$native" >> "$GITHUB_PATH"
-                echo "libclang: $native"
-                exit 0
-              fi
-            done
-            echo "::error::libclang.dll not found on the bench runner. compare-rocksdb (librocksdb-sys -> bindgen -> clang-sys) cannot build. Install LLVM on the runner host ('winget install LLVM.LLVM' or 'choco install llvm'), or set LIBCLANG_PATH to the directory holding libclang.dll."
-            exit 1
-          fi
-
-          # Linux detection covers: llvm-config on PATH (Fedora/most), explicit
-          # LIBCLANG_PATH, direct lib dirs (/usr/lib64 on Fedora), Debian/Ubuntu
-          # multiarch (/usr/lib/x86_64-linux-gnu) + llvm-* dirs via the nested
-          # glob, and finally ldconfig -p (the robust Linux probe that finds
-          # libclang wherever the dynamic linker registered it).
-          if ! command -v llvm-config >/dev/null 2>&1 \
-             && [ -z "${LLVM_CONFIG_PATH:-}" ] \
-             && [ -z "${LIBCLANG_PATH:-}" ] \
-             && ! ls /usr/lib*/libclang.so* /usr/lib*/*/libclang.so* >/dev/null 2>&1 \
-             && ! { command -v ldconfig >/dev/null 2>&1 && ldconfig -p | grep -q libclang; }; then
-            echo "::error::libclang/llvm-config not found on the bench runner. compare-rocksdb (librocksdb-sys -> bindgen -> clang-sys) cannot build. Install LLVM dev tools on the runner host: Fedora 'dnf install -y clang clang-devel llvm llvm-devel', Debian/Ubuntu 'apt-get install -y clang libclang-dev llvm-dev', or set LIBCLANG_PATH/LLVM_CONFIG_PATH."
-            exit 1
-          fi
-
+      # stable median. An arm whose single iteration outlasts the window runs
+      # at Criterion's floor of ten samples regardless, so what bounds the
+      # matrix is its sizes: the per-push matrix leaves out the arms that
+      # cannot fit (`cold_write_sizes` in the harness), and a dispatch with
+      # `full-matrix` runs them too.
       - name: Run compare-rocksdb head-to-head benches
+        # ~12 min on the bench runner per push; the full matrix adds ~20.
+        timeout-minutes: ${{ inputs.full-matrix && 45 || 20 }}
         # Pin the published dashboard to the RocksDbParity preset (the apples-to-
         # apples comparison): every lsm-tree-only on-disk opt-in is OFF so the
         # numbers are not paying for protection RocksDB has no equivalent for.
@@ -506,26 +541,44 @@ jobs:
         # docs/BENCHMARKING.md.
         env:
           LSM_BENCH_PRESET: rocksdb-parity
+          COMPARE_FULL_MATRIX: ${{ inputs.full-matrix && '1' || '0' }}
+          LIBCLANG_OUTCOME: ${{ steps.libclang.outcome }}
         # The restored cache carries the previous run's reports under
         # target/criterion, and Criterion never removes a group's directory once
         # the group is renamed or deleted. The publish step copies every
         # directory there, so the stale ones go before the run; the compiled
         # RocksDB beside them stays.
         run: |
+          if [ "$LIBCLANG_OUTCOME" != success ]; then
+            echo "::error::compare-rocksdb cannot build without libclang; see the 'Verify libclang toolchain' step"
+            exit 1
+          fi
           cd tools/compare-rocksdb
           rm -rf target/criterion
           cargo bench --bench compare -- \
             --sample-size 10 --warm-up-time 0.5 --measurement-time 0.5
 
+      # The compare publish gets its own token, issued once the head-to-head
+      # has finished: the one above was issued before the head-to-head ran.
+      # Same trusted contexts as the publish step below.
+      - name: Generate bot token for the compare publish
+        id: compare-token
+        if: >
+          (github.event_name == 'push' && github.ref == 'refs/heads/main') ||
+          github.event_name == 'workflow_dispatch'
+        uses: actions/create-github-app-token@v3
+        with:
+          app-id: ${{ secrets.RELEASER_APP_ID }}
+          private-key: ${{ secrets.RELEASER_APP_PRIVATE_KEY }}
+          # Pushes the report tree to gh-pages; nothing else.
+          permission-contents: write
+
       # Publish the criterion HTML report tree (per-group overlay charts)
       # to gh-pages under dev/compare, alongside the db_bench dashboard at
       # dev/bench. Manual git push (rather than a third-party publish
       # action) keeps the workflow's "every `uses:` pinned to a SHA"
-      # hardening policy intact and reuses the same App-scoped token the
-      # benchmark-action step uses. Only publishes on main pushes; on PR /
-      # workflow_dispatch runs the previous step still generates the report
-      # tree in the workspace, but this step is skipped (no artifact upload,
-      # no gh-pages mutation).
+      # hardening policy intact, with the App-scoped token issued right
+      # above.
       - name: Publish compare-rocksdb overlay reports to gh-pages
         # Publish on main pushes AND on manual workflow_dispatch. The overlay is
         # a ratio SNAPSHOT (dev/compare is replaced wholesale each run), not the
@@ -535,13 +588,13 @@ jobs:
         # the next merge to main. The db_bench trend (benchmark-action auto-push /
         # save-data above) stays push+main only.
         if: >
-          steps.bot-token.outputs.token != '' &&
+          steps.compare-token.outputs.token != '' &&
           (
             (github.event_name == 'push' && github.ref == 'refs/heads/main') ||
             github.event_name == 'workflow_dispatch'
           )
         env:
-          GH_TOKEN: ${{ steps.bot-token.outputs.token }}
+          GH_TOKEN: ${{ steps.compare-token.outputs.token }}
           REPO: ${{ github.repository }}
           LINE_MAJOR: ${{ steps.line.outputs.major }}
           MEASURED_REF: ${{ github.ref_name }}
