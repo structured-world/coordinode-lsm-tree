@@ -125,14 +125,12 @@ macro_rules! define_workloads {
     };
 }
 
-// Order is the dashboard's order: the JSON entries are emitted in this
-// sequence and github-action-benchmark renders the charts in the order it
-// receives them. `mixed` leads because it is the only series that walks a
-// whole write / compact / read cycle, so it is the one to read first when
-// asking whether a change helped or hurt overall; the single-operation
-// workloads below then say where.
+// Order is the order the JSON entries are emitted in. `lifecycle-zstd22`
+// leads because it is the only series that walks a whole write / compact /
+// read cycle, so it is the one to read first when asking whether a change
+// helped or hurt overall; the single-operation workloads below then say where.
 define_workloads! {
-    "mixed" => mixed::Mixed,
+    "lifecycle-zstd22" => mixed::Mixed,
     "fillseq" => fillseq::FillSeq,
     "fillrandom" => fillrandom::FillRandom,
     "readrandom" => readrandom::ReadRandom,

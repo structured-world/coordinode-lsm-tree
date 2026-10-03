@@ -10,16 +10,16 @@ pub fn prefill_sequential(
 ) -> lsm_tree::Result<()> {
     let batch_size = 10_000u64;
 
-    // One key buffer and one value for the whole prefill: the engine copies
-    // the bytes it keeps, so a fresh `Vec` per op would only add two heap
-    // round-trips of harness overhead to every insert.
+    // One key buffer and one value pool for the whole prefill: the engine
+    // copies the bytes it keeps, so a fresh `Vec` per op would only add two
+    // heap round-trips of harness overhead to every insert.
     let mut key = vec![0u8; config.key_size];
-    let value = make_value(config.value_size);
+    let values = ValuePool::new(config.value_size);
 
     for i in 0..config.num {
         fill_sequential_key(&mut key, i);
         let seq = seqno.fetch_add(1, Ordering::Relaxed);
-        tree.insert(&key[..], &value[..], seq);
+        tree.insert(&key[..], values.value(i), seq);
 
         // Flush every batch_size ops to build SSTs on disk.
         if (i + 1) % batch_size == 0 {
@@ -54,6 +54,7 @@ pub fn prefill_prefix_keys(
     let remainder = config.num % prefix_count;
     let batch_size = 10_000u64;
     let mut total = 0u64;
+    let values = ValuePool::new(config.value_size);
 
     for prefix in 0..num_prefixes {
         if total >= config.num {
@@ -83,9 +84,8 @@ pub fn prefill_prefix_keys(
             key.extend_from_slice(&suffix_bytes);
             key.resize(config.key_size, 0);
 
-            let value = make_value(config.value_size);
             let seq = seqno.fetch_add(1, Ordering::Relaxed);
-            tree.insert(key, value, seq);
+            tree.insert(key, values.value(total), seq);
 
             total += 1;
             if total.is_multiple_of(batch_size) {
@@ -181,10 +181,57 @@ pub fn fill_random_key(buf: &mut [u8]) {
     rand::rng().fill(buf);
 }
 
-/// Create a deterministic value of the given size.
-#[inline]
-pub fn make_value(value_size: usize) -> Vec<u8> {
-    vec![0x42u8; value_size]
+/// Value bytes with the compressibility RocksDB's own `db_bench` writes by
+/// default (`--compression_ratio=0.5`): a pool of 100-byte pieces, each 50
+/// random printable bytes written twice, out of which consecutive values are
+/// cut in turn. A codec does real work on them and roughly halves them. A
+/// constant fill would let any codec collapse every block, and a compressed
+/// workload would measure little beyond the codec's per-block setup.
+///
+/// Built once, before any timer starts, and shared by reference: handing out a
+/// value is a slice, no allocation.
+pub struct ValuePool {
+    bytes: Vec<u8>,
+    value_size: usize,
+}
+
+impl ValuePool {
+    const MIN_SIZE: usize = 1 << 20;
+    const PIECE: usize = 100;
+
+    pub fn new(value_size: usize) -> Self {
+        let size = Self::MIN_SIZE.max(value_size);
+        // xorshift64 from a fixed seed: the same bytes on every run and host.
+        let mut state: u64 = 0x2545_F491_4F6C_DD1D;
+        let mut bytes = Vec::with_capacity(size + Self::PIECE);
+        while bytes.len() < size {
+            let mut half = [0_u8; Self::PIECE / 2];
+            for byte in &mut half {
+                state ^= state << 13;
+                state ^= state >> 7;
+                state ^= state << 17;
+                // Printable ASCII, the alphabet RocksDB draws its pieces from;
+                // `state % 95` is below 95, so the cast cannot truncate.
+                *byte = b' ' + (state % 95) as u8;
+            }
+            bytes.extend_from_slice(&half);
+            bytes.extend_from_slice(&half);
+        }
+        bytes.truncate(size);
+        Self { bytes, value_size }
+    }
+
+    /// The value for the `index`-th write: the pool's `index`-th slice of the
+    /// value size, wrapping at its end as RocksDB's generator does.
+    #[inline]
+    pub fn value(&self, index: u64) -> &[u8] {
+        if self.value_size == 0 {
+            return &[];
+        }
+        let slots = (self.bytes.len() / self.value_size) as u64;
+        let start = (index % slots) as usize * self.value_size;
+        &self.bytes[start..start + self.value_size]
+    }
 }
 
 /// Read the current seqno for point reads (must see all prefilled data).

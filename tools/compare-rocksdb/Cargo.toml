@@ -54,7 +54,12 @@ surrealkv = "=0.21.4"
 # criterion harness is sync, so each surrealkv arm owns a multi-thread
 # runtime and drives open / commit through `rt.block_on`.
 tokio = { version = "1", features = ["rt-multi-thread"] }
-criterion = { version = "0.8", features = ["html_reports"] }
+# No HTML reports and no plots (the workflow passes `--noplot`): the published
+# page draws its charts from the `summary.json` the harness writes after the
+# run, so Criterion only measures and keeps its JSON estimates.
+criterion = { version = "0.8", default-features = false, features = ["cargo_bench_support", "rayon"] }
+# Reads Criterion's per-benchmark estimates for that summary.
+serde_json = "1"
 tempfile = "3"
 
 [[bench]]

@@ -1,5 +1,5 @@
 use crate::config::{BenchConfig, Compression, create_tree};
-use crate::db::{fill_sequential_key, make_value};
+use crate::db::{ValuePool, fill_sequential_key};
 use crate::reporter::Reporter;
 use crate::workloads::Workload;
 use lsm_tree::{AbstractTree, AnyTree};
@@ -24,12 +24,13 @@ use std::time::Instant;
 pub struct Mixed;
 
 /// The workload's own name, so the reporting path can ask about it without
-/// hardcoding the string in two places.
-pub const NAME: &str = "mixed";
+/// hardcoding the string in two places. It says what the series is: the
+/// whole lifecycle, at zstd-22.
+pub const NAME: &str = "lifecycle-zstd22";
 
 /// The codec a given workload actually runs with.
 ///
-/// Everything reads `--compression`; `mixed` overrides it. The reporting path
+/// Everything reads `--compression`; `lifecycle-zstd22` overrides it. The reporting path
 /// asks here so the JSON report names the codec that ran rather than the one on
 /// the command line, which would otherwise be a quiet mislabel in exactly the
 /// series that is meant to be comparable across runs.
@@ -63,7 +64,7 @@ impl Workload for Mixed {
                 return Err(std::io::Error::new(
                     std::io::ErrorKind::InvalidInput,
                     format!(
-                        "the mixed workload needs one key per index, but --key-size {} encodes \
+                        "the lifecycle-zstd22 workload needs one key per index, but --key-size {} encodes \
                          only {} distinct keys for --num {}; raise --key-size or lower --num",
                         config.key_size, distinct, config.num,
                     ),
@@ -84,7 +85,7 @@ impl Workload for Mixed {
         let tree = create_tree(dir.path(), &pinned)?;
 
         let mut key = vec![0u8; config.key_size];
-        let value = make_value(config.value_size);
+        let values = ValuePool::new(config.value_size);
         let n = config.num;
 
         // The tree is opened outside the timer: the cycle is what is being
@@ -98,7 +99,7 @@ impl Workload for Mixed {
             fill_sequential_key(&mut key, idx);
             let seq = seqno.fetch_add(1, Ordering::Relaxed);
             let t = Instant::now();
-            tree.insert(&key[..], &value[..], seq);
+            tree.insert(&key[..], values.value(idx), seq);
             reporter.record_duration(t.elapsed());
         }
         tree.flush_active_memtable(0)?;
@@ -106,11 +107,13 @@ impl Workload for Mixed {
         // Stage 2: rewrite every third key and delete every fifth, then flush.
         // The second SST now disagrees with the first about those keys, which
         // is what gives the merge in stage 4 real version resolution to do.
+        // A rewrite carries a different value than the key's first one, as a
+        // real update does: the pool's next slice after the first pass.
         for idx in (0..n).step_by(3) {
             fill_sequential_key(&mut key, idx);
             let seq = seqno.fetch_add(1, Ordering::Relaxed);
             let t = Instant::now();
-            tree.insert(&key[..], &value[..], seq);
+            tree.insert(&key[..], values.value(n + idx), seq);
             reporter.record_duration(t.elapsed());
         }
         for idx in (0..n).step_by(5) {
@@ -127,7 +130,7 @@ impl Workload for Mixed {
             fill_sequential_key(&mut key, idx);
             let seq = seqno.fetch_add(1, Ordering::Relaxed);
             let t = Instant::now();
-            tree.insert(&key[..], &value[..], seq);
+            tree.insert(&key[..], values.value(2 * n + idx), seq);
             reporter.record_duration(t.elapsed());
         }
         tree.flush_active_memtable(0)?;

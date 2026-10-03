@@ -1,5 +1,5 @@
 use crate::config::BenchConfig;
-use crate::db::{fill_sequential_key, make_value, prefill_sequential};
+use crate::db::{ValuePool, fill_sequential_key, prefill_sequential};
 use crate::reporter::Reporter;
 use crate::workloads::{Workload, run_threaded};
 use lsm_tree::{AbstractTree, AnyTree};
@@ -20,22 +20,23 @@ impl Workload for Overwrite {
         // Prefill the tree with sequential keys.
         prefill_sequential(tree, config, seqno)?;
 
+        let values = ValuePool::new(config.value_size);
         // All threads overwrite random existing keys — contention is intentional.
-        run_threaded(config, reporter, |_t, my_ops, _start| {
+        run_threaded(config, reporter, |_t, my_ops, start| {
             let mut local = Reporter::new();
             let mut rng = rand::rng();
-            // One key buffer and one value per thread: the engine copies what
-            // it keeps, so per-op `Vec`s would only add harness overhead.
+            // One key buffer per thread and the shared value pool: the engine
+            // copies what it keeps, so per-op `Vec`s would only add harness
+            // overhead.
             let mut key = vec![0u8; config.key_size];
-            let value = make_value(config.value_size);
 
-            for _ in 0..my_ops {
+            for i in start..(start + my_ops) {
                 let idx: u64 = rng.random_range(0..config.num);
                 fill_sequential_key(&mut key, idx);
                 let seq = seqno.fetch_add(1, Ordering::Relaxed);
 
                 let t = Instant::now();
-                tree.insert(&key[..], &value[..], seq);
+                tree.insert(&key[..], values.value(i), seq);
                 local.record_duration(t.elapsed());
             }
 

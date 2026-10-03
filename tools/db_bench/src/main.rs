@@ -402,7 +402,7 @@ fn run_single(
             value_size: cli.value_size,
             entry_size,
             threads: cli.threads,
-            // The mixed workload pins its own codec so its series means one
+            // The lifecycle workload pins its own codec so its series means one
             // thing across runs, so the report has to name the codec that ran
             // rather than the one on the command line.
             compression: crate::workloads::mixed::effective_compression(
