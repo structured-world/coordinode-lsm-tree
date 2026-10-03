@@ -1085,13 +1085,18 @@ impl MergeStream {
         // read: what the density is counted on. A row still to be judged
         // counts now when its payload is read for it, and once the predicate
         // after the values keeps it when its batch was read with its payload.
+        let filters_after = scan
+            .predicate
+            .as_ref()
+            .is_some_and(|p| p.apply == PredicateApply::Filter);
         let mut deferred = Vec::with_capacity(pending.len());
         for (pick, open) in pending.iter().zip(open) {
             let Some(source) = self.sources.get_mut(pick.source) else {
                 deferred.push(false);
                 continue;
             };
-            let defer = open && !source.late.batch_late;
+            let defer =
+                open && filters_after && !source.late.columns.is_empty() && !source.late.batch_late;
             if !defer {
                 source.late.batch_picks += 1;
             }
