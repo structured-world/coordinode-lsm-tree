@@ -716,6 +716,177 @@ fn the_payload_of_rows_the_predicate_drops_is_not_read() -> lsm_tree::Result<()>
     Ok(())
 }
 
+/// A sparse predicate on a field kept in a blob file reads each row's object
+/// to judge it, but the notes beside it only from the pages that hold a row
+/// it keeps: the pages of the rows it drops give it their references alone.
+#[test]
+fn a_predicate_on_a_referenced_field_reads_no_note_of_a_row_it_drops() -> lsm_tree::Result<()> {
+    let folder = get_tmp_folder();
+    let any = Config::new(
+        folder.path(),
+        SequenceNumberCounter::default(),
+        SequenceNumberCounter::default(),
+    )
+    .with_kv_separation(Some(
+        KvSeparationOptions::default()
+            .separation_threshold(1 << 20)
+            .cell_separation_threshold(PRICE, 0),
+    ))
+    .columnar_row_group_size_policy(lsm_tree::config::BlockSizePolicy::all(64 * 1_024))
+    .columnar_page_size_policy(lsm_tree::config::BlockSizePolicy::all(1_024))
+    .open()?;
+    let AnyTree::Blob(tree) = &any else {
+        panic!("a tree with kv separation opens as a blob tree");
+    };
+    tree.index.update_runtime_config(|rc| rc.columnar = true)?;
+    let rows = 2_000u32;
+    for i in 0..rows {
+        insert(
+            tree,
+            &format!("k{i:05}"),
+            b"s",
+            i,
+            &[b'n'; 200],
+            u64::from(i),
+        );
+    }
+    tree.flush_active_memtable(0)?;
+
+    let m = any.metrics();
+    let first_20 = ColumnRangePredicate {
+        column_id: PRICE,
+        lower: Some(0u32.to_be_bytes().to_vec()),
+        upper: Some(19u32.to_be_bytes().to_vec()),
+        apply: PredicateApply::Filter,
+    };
+    // The same predicate without the notes first: what judging the rows
+    // reads (their references and objects), read again below from the cache.
+    let prices = Projection::new()
+        .column(COL_USER_KEY)
+        .field(field(PRICE, u32_le()));
+    let before = m.bytes_read();
+    assert_eq!(rows_of_scan(&any, prices, Some(&first_20))?.len(), 20);
+    let judging = m.bytes_read() - before;
+
+    let notes = Projection::new()
+        .column(COL_USER_KEY)
+        .field(field(PRICE, u32_le()))
+        .field(field(BODY, TypeTag::Bytes));
+    let before = m.bytes_read();
+    let kept = rows_of_scan(&any, notes, Some(&first_20))?;
+    let read = m.bytes_read() - before;
+    assert_eq!(kept.len(), 20);
+    for (i, (_, cells)) in (0u32..).zip(&kept) {
+        assert_eq!(cells[0], Some(i.to_le_bytes().to_vec()));
+        assert_eq!(cells[1], Some(vec![b'n'; 200]));
+    }
+    let all_notes = u64::from(rows) * 200;
+    assert!(
+        read < judging + all_notes / 4,
+        "{read} bytes read with the notes, {judging} without, out of {all_notes} bytes of notes"
+    );
+    Ok(())
+}
+
+/// `len` bytes no block compression shrinks, the same for one `seed`: what
+/// the pages of a note cost to read then shows in the bytes read.
+fn noise(seed: u32, len: usize) -> Vec<u8> {
+    // xorshift32; a zero state would stay zero.
+    let mut state = seed.wrapping_mul(0x9E37_79B9) | 1;
+    (0..len)
+        .map(|_| {
+            state ^= state << 13;
+            state ^= state >> 17;
+            state ^= state << 5;
+            state.to_le_bytes()[0]
+        })
+        .collect()
+}
+
+/// A predicate on a field kept in a blob file whose rows it keeps all at the
+/// start of a table turns the scan to reading the notes with the rest, and
+/// the rows it drops after them turn it back: rows read with the rest count
+/// toward the density by the predicate's verdict too, not as candidates.
+#[test]
+fn a_dense_start_of_a_referenced_predicate_gives_way_to_its_sparse_tail() -> lsm_tree::Result<()> {
+    let folder = get_tmp_folder();
+    let any = Config::new(
+        folder.path(),
+        SequenceNumberCounter::default(),
+        SequenceNumberCounter::default(),
+    )
+    .with_kv_separation(Some(
+        KvSeparationOptions::default()
+            .separation_threshold(1 << 20)
+            .cell_separation_threshold(PRICE, 0),
+    ))
+    .columnar_row_group_size_policy(lsm_tree::config::BlockSizePolicy::all(64 * 1_024))
+    .columnar_page_size_policy(lsm_tree::config::BlockSizePolicy::all(1_024))
+    .open()?;
+    let AnyTree::Blob(tree) = &any else {
+        panic!("a tree with kv separation opens as a blob tree");
+    };
+    tree.index.update_runtime_config(|rc| rc.columnar = true)?;
+    // Enough row groups that the few a turn back to late reads takes, each
+    // read whole, stay a small part of the table.
+    let rows = 12_000u32;
+    for i in 0..rows {
+        insert(
+            tree,
+            &format!("k{i:05}"),
+            b"s",
+            i,
+            &noise(i, 200),
+            u64::from(i),
+        );
+    }
+    tree.flush_active_memtable(0)?;
+
+    let m = any.metrics();
+    let first_third = ColumnRangePredicate {
+        column_id: PRICE,
+        lower: Some(0u32.to_be_bytes().to_vec()),
+        upper: Some((rows / 3 - 1).to_be_bytes().to_vec()),
+        apply: PredicateApply::Filter,
+    };
+    let read_with = |projection: Projection| -> lsm_tree::Result<u64> {
+        let before = m.bytes_read();
+        assert_eq!(
+            rows_of_scan(&any, projection, Some(&first_third))?.len(),
+            (rows / 3) as usize
+        );
+        Ok(m.bytes_read() - before)
+    };
+    // What judging the rows reads, every row's reference and object, whether
+    // or not the notes are read too: the first pass brings the references
+    // into the cache, the second costs what judging costs again.
+    let prices = || {
+        Projection::new()
+            .column(COL_USER_KEY)
+            .field(field(PRICE, u32_le()))
+    };
+    read_with(prices())?;
+    let judging = read_with(prices())?;
+    let with_notes = read_with(
+        Projection::new()
+            .column(COL_USER_KEY)
+            .field(field(PRICE, u32_le()))
+            .field(field(BODY, TypeTag::Bytes)),
+    )?;
+    let notes_read = with_notes
+        .checked_sub(judging)
+        .expect("the notes add to what judging reads");
+    // A third of the notes is kept; the rest read is the row groups the scan
+    // reads with the rest while it sees its choices thin out, a row group
+    // being one batch of a cursor reading everything.
+    let all_notes = u64::from(rows) * 200;
+    assert!(
+        notes_read * 5 < all_notes * 3,
+        "{notes_read} bytes of notes read for a third of the rows, out of {all_notes}"
+    );
+    Ok(())
+}
+
 /// Rows the predicate keeps all at the start of a table turn the scan to
 /// reading the note with the rest, and the long run of rows it drops after
 /// them turns it back: most of the notes are never read.
@@ -758,6 +929,58 @@ fn a_dense_start_does_not_keep_a_sparse_scan_reading_everything() -> lsm_tree::R
     assert!(
         read * 2 < all_notes,
         "{read} bytes read for 200 notes out of {all_notes} bytes of them"
+    );
+    Ok(())
+}
+
+/// The density of the choices is judged over the last pages read, not the
+/// whole segment so far: after a dense third of the table the scan turns back
+/// to reading only the kept rows' notes within a few pages, instead of waiting
+/// for three times as many sparse pages as it saw dense ones.
+#[test]
+fn a_long_dense_start_gives_way_to_a_sparse_tail_within_a_few_pages() -> lsm_tree::Result<()> {
+    let folder = get_tmp_folder();
+    let (any, tree) = open_paged(folder.path())?;
+    let rows = 3_000u32;
+    for i in 0..rows {
+        insert(
+            &tree,
+            &format!("k{i:05}"),
+            b"s",
+            i,
+            &[b'n'; 200],
+            u64::from(i),
+        );
+    }
+    tree.flush_active_memtable(0)?;
+    let m = any.metrics();
+    let metadata = Projection::new()
+        .column(COL_USER_KEY)
+        .field(field(PRICE, u32_le()));
+    rows_of_scan(&any, metadata, None)?;
+
+    let first_third = ColumnRangePredicate {
+        column_id: PRICE,
+        lower: Some(0u32.to_be_bytes().to_vec()),
+        upper: Some((rows / 3 - 1).to_be_bytes().to_vec()),
+        apply: PredicateApply::Filter,
+    };
+    let notes = Projection::new()
+        .column(COL_USER_KEY)
+        .field(field(PRICE, u32_le()))
+        .field(field(BODY, TypeTag::Bytes));
+    let before = m.bytes_read();
+    assert_eq!(
+        rows_of_scan(&any, notes, Some(&first_third))?.len(),
+        (rows / 3) as usize
+    );
+    let read = m.bytes_read() - before;
+    let all_notes = u64::from(rows) * 200;
+    // A third of the notes is kept; the rest read is the few pages the scan
+    // needs to see the choices thinned out.
+    assert!(
+        read * 2 < all_notes,
+        "{read} bytes read for a third of the notes out of {all_notes} bytes of them"
     );
     Ok(())
 }

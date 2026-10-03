@@ -39,6 +39,12 @@ impl ValueType {
         self == Self::Tombstone || self == Self::WeakTombstone
     }
 
+    /// Whether the entry is a put in any of its physical forms: a value, a
+    /// value kept in a blob file, or a row written as cells.
+    pub(crate) fn is_put(self) -> bool {
+        matches!(self, Self::Value | Self::Indirection | Self::CellRow)
+    }
+
     pub(crate) fn is_indirection(self) -> bool {
         self == Self::Indirection
     }

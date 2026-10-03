@@ -95,7 +95,65 @@ pub(super) fn materialize(
         .as_ref()
         .filter(|p| !judged && p.apply == PredicateApply::Filter)
         .and_then(|p| declared.iter().position(|f| f.column_id() == p.column_id));
+    read_fields(scan, cells, batch, &declared, judged)
+}
 
+/// Whether the scan's filtering predicate keeps each row of `batch`, rows of
+/// a blob tree it could not judge on a cell their segment stores: the
+/// predicate's field is read for each, out of the object it references or
+/// its whole value, and no other field is. A row the predicate does not
+/// apply to is kept.
+///
+/// # Errors
+///
+/// As [`materialize`], for the predicate's field alone.
+pub(super) fn judge(
+    scan: &ColumnarScan,
+    cells: &CellSource,
+    batch: ColumnBatch,
+) -> crate::Result<Vec<bool>> {
+    let rows = batch.row_count as usize;
+    let Some((predicate, field)) = scan
+        .predicate
+        .as_ref()
+        .filter(|p| p.apply == PredicateApply::Filter)
+        .and_then(|p| {
+            let field = scan
+                .fields
+                .iter()
+                .find(|f| projection::is_declared(f) && f.column_id() == p.column_id)?;
+            Some((p, field.clone()))
+        })
+    else {
+        return Ok(alloc::vec![true; rows]);
+    };
+    let read = read_fields(scan, cells, batch, core::slice::from_ref(&field), None)?;
+    let column = read
+        .columns
+        .into_iter()
+        .find(|c| c.column_id == field.column_id())
+        .ok_or(MISSING_BATCH_COLUMN)?;
+    let probe = ColumnBatch {
+        row_count: read.row_count,
+        columns: alloc::vec![column],
+    };
+    let (probe, _) = projection::conform_lenient(
+        probe,
+        core::slice::from_ref(&field),
+        Some(field.column_id()),
+    )?;
+    Ok(predicate.matching_rows(&probe))
+}
+
+/// [`materialize`] for the `declared` fields, the predicate run on the one at
+/// `judged`, when given, before any object of another field is read.
+fn read_fields(
+    scan: &ColumnarScan,
+    cells: &CellSource,
+    batch: ColumnBatch,
+    declared: &[ProjectedField],
+    judged: Option<usize>,
+) -> crate::Result<ColumnBatch> {
     let row_count = batch.row_count as usize;
     let find = |id: u16| batch.columns.iter().find(|c| c.column_id == id);
     let (Some(keys), Some(types)) = (find(COL_USER_KEY), find(COL_VALUE_TYPE)) else {
@@ -109,7 +167,7 @@ pub(super) fn materialize(
         cells: Vec::with_capacity(declared.len()),
         whole: Vec::new(),
     };
-    for field in &declared {
+    for field in declared {
         let column = find(field.column_id());
         let mut cells = Vec::with_capacity(row_count);
         for row in 0..batch.row_count {
@@ -225,7 +283,7 @@ pub(super) fn materialize(
     }
 
     read_objects(cells, &mut rows, now)?;
-    project(scan, &declared, &mut rows)?;
+    project(scan, declared, &mut rows)?;
 
     // The predicate drops what it rejects before the rest is read.
     let mut kept: Option<Vec<u32>> = None;
@@ -257,9 +315,9 @@ pub(super) fn materialize(
     }
 
     read_objects(cells, &mut rows, later)?;
-    project(scan, &declared, &mut rows)?;
+    project(scan, declared, &mut rows)?;
 
-    build(batch, &declared, &rows, &out_types, kept.as_deref())
+    build(batch, declared, &rows, &out_types, kept.as_deref())
 }
 
 /// `batch` for a projection that declares no field: no value or object is

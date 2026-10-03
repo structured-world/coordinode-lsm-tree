@@ -751,6 +751,30 @@ fn cells_near_full_eager(fixture: &Fixture) -> lsm_tree::Result<u64> {
     cells_dense(fixture, Filter::Caller)
 }
 
+/// ~1% of a cell-row tree whose predicate field is kept in a blob file,
+/// filtered by `filter`: every row's object is read to judge it, and the
+/// inline payload of the rows dropped is what the engine spares.
+fn cells_ref_filtered(fixture: &Fixture, filter: Filter) -> lsm_tree::Result<u64> {
+    verify_cells_scan(
+        fixture,
+        Some(&field_range(fixtures::CELL_CLUSTER, 0, 0)),
+        filter,
+        |seed| fixtures::cluster_of(seed) == 0,
+        true,
+    )
+}
+
+/// A predicate on a field kept in a blob file, filtered in the engine.
+fn cells_ref_filtered_late(fixture: &Fixture) -> lsm_tree::Result<u64> {
+    cells_ref_filtered(fixture, Filter::Engine)
+}
+
+/// A predicate on a field kept in a blob file, every row read whole and
+/// filtered by the caller.
+fn cells_ref_filtered_eager(fixture: &Fixture) -> lsm_tree::Result<u64> {
+    cells_ref_filtered(fixture, Filter::Caller)
+}
+
 /// The header field of every wide cell row, without its payload: no blob is
 /// read at all.
 fn cells_projected(fixture: &Fixture) -> lsm_tree::Result<u64> {
@@ -1037,6 +1061,16 @@ fn scenarios(config: &BenchConfig) -> Vec<Scenario> {
             name: "cells-scan-near-full-eager",
             fixture: fixtures::cells_inline,
             support: Support::Native(cells_near_full_eager),
+        },
+        Scenario {
+            name: "cells-scan-ref-filtered",
+            fixture: fixtures::cells_ref_filter,
+            support: Support::Native(cells_ref_filtered_late),
+        },
+        Scenario {
+            name: "cells-scan-ref-filtered-eager",
+            fixture: fixtures::cells_ref_filter,
+            support: Support::Native(cells_ref_filtered_eager),
         },
         Scenario {
             name: "cells-scan-under-compaction",
